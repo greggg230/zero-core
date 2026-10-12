@@ -3,7 +3,8 @@
 
   python tools/selfplay_digest.py --root <checkout> --package grz [--game glassroad --spec '{"intro": false}']
       [--net uniform | --net random | --model runs/x/models/iter_0040.pt] [--games 24 --sims 32 --sims-fast 8
-      --p-full 0.25 --chance-k 2 --temp-moves 30 --threads 2 --seed 2026 --targets visits,cq --match-games 16]
+      --p-full 0.25 --chance-k 2 --temp-moves 30 --threads 2 --seed 2026 --targets visits,cq --match-games 16
+      --redet 1 --seat-opts '{"psample": false}']
 
 Works on a game checkout from before zero-core (its `<pkg>.az.games` / `.infer` / `.net` modules)
 and after (the same names are shims of the core), and on zero-core itself (`--root
@@ -82,7 +83,10 @@ def main(argv=None):
     ap.add_argument('--targets', default='visits,cq')
     ap.add_argument('--match-games', type=int, default=16)
     ap.add_argument('--max-steps', type=int, default=5000)
+    ap.add_argument('--redet', type=int, default=1, help='0: one determinized world per decision')
+    ap.add_argument('--seat-opts', default=None, help='JSON: extra network-seat settings (e.g. {"psample": false})')
     a = ap.parse_args(argv)
+    seat_extra = json.loads(a.seat_opts) if a.seat_opts else {}
     sys.path.insert(0, os.path.abspath(a.root))
     importlib.import_module(a.package)
     import numpy as np
@@ -108,12 +112,13 @@ def main(argv=None):
         out['evaluator'] = a.net
     spec = a.spec if a.spec is not None else ''
     out.update(game=game, spec=spec, games=a.games, sims=a.sims, sims_fast=a.sims_fast, p_full=a.p_full,
-               chance_k=a.chance_k, seed=a.seed, targets={})
+               chance_k=a.chance_k, seed=a.seed, redet=a.redet, seat_opts=seat_extra, targets={})
     for target in [t for t in a.targets.split(',') if t]:
         kw = dict(selfplay=True, temp_moves=a.temp_moves, sims_fast=a.sims_fast, p_full=a.p_full, chance_k=a.chance_k)
         if target != 'visits':
             kw.update(policy_target=target, cq_c_visit=50.0, cq_c_scale=1.0)
         seat = G.nn_seat('m', a.sims, **kw)
+        seat.update(redet=bool(a.redet), **seat_extra)
         drv = G.Driver(game, [[seat, seat]] * a.games, spec=spec, concurrency=a.games, seed=a.seed, record=True,
                        threads=a.threads, groups=a.groups, max_steps=a.max_steps)
         parts = []
@@ -124,6 +129,7 @@ def main(argv=None):
         out['targets'][target] = {'samples': n, 'records': d, 'results': results_digest(res), 'games': len(res)}
     if a.match_games:
         nn = G.nn_seat('m', a.sims, chance_k=a.chance_k)
+        nn.update(redet=bool(a.redet), **seat_extra)
         bot = {'bot': 'random'}
         seats = [[nn, bot] if g % 2 == 0 else [bot, nn] for g in range(a.match_games)]
         drv = G.Driver(game, seats, spec=spec, concurrency=a.match_games, seed=a.seed + 1, threads=a.threads,
