@@ -1,0 +1,4 @@
+2026-10-09 08:31:40 supervisor 105076 starting: runs/az5 --iters 100000
+2026-10-09 08:31:40 started stpz.run pid 71688
+2026-10-11 23:38:05 stpz.run exited with code 0; killed 0 orphaned workers
+2026-10-11 23:38:05 clean exit (finished or STOP file); supervisor done

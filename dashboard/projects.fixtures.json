@@ -1,0 +1,77 @@
+{
+  "title": "Zero dashboard (fixtures)",
+  "refresh_s": 15,
+  "hide_after_days": 3,
+  "stale_after_min": 45,
+  "disks": [
+    {
+      "path": "C:/",
+      "label": "C:",
+      "warn_below_gb": 15
+    },
+    {
+      "path": "E:/",
+      "label": "E:"
+    }
+  ],
+  "mac": {
+    "ssh": "greggkeithley@100.95.248.116",
+    "label": "Mac"
+  },
+  "projects": [
+    {
+      "id": "stpete",
+      "name": "St. Pete Zero",
+      "dashboard": "http://desktop-j05412i:5230",
+      "roots": [
+        "fixtures/stpete/runs"
+      ],
+      "pause": "auto",
+      "pause_note": "no pause (STOP only)",
+      "yardstick": {
+        "key": "eval_shrewd",
+        "label": "Shrewd"
+      },
+      "remote_runs": []
+    },
+    {
+      "id": "dominion",
+      "name": "Dominion Zero",
+      "dashboard": "http://desktop-j05412i:5240",
+      "roots": [
+        "fixtures/dominion/runs"
+      ],
+      "pause": true,
+      "yardstick": {
+        "key": "eval_bmu",
+        "label": "BMU"
+      }
+    },
+    {
+      "id": "caverna",
+      "name": "Caverna Zero",
+      "dashboard": "http://desktop-j05412i:5260",
+      "roots": [
+        "fixtures/caverna/runs"
+      ],
+      "pause": true,
+      "yardstick": {
+        "key": "eval_yard",
+        "label": "JS bot"
+      }
+    },
+    {
+      "id": "glassroad",
+      "name": "Glass Road Zero",
+      "dashboard": "http://desktop-j05412i:5280",
+      "roots": [
+        "fixtures/glassroad/runs"
+      ],
+      "pause": true,
+      "yardstick": {
+        "key": "eval_yard",
+        "label": "JS bot"
+      }
+    }
+  ]
+}

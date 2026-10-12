@@ -1,0 +1,20 @@
+2026-10-10 13:31:50 supervisor 122508 starting: C:/Users/Gregg Keithley/caverna-zero/runs/cvz2p --preset caverna-2p; open-file limit n/a (soft, hard)
+2026-10-10 13:31:50 started cvz.az.run pid 136116
+2026-10-10 13:51:57 cvz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-10 13:51:57 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-10 13:52:05 supervisor 132604 starting: C:/Users/Gregg Keithley/caverna-zero/runs/cvz2p --train-device cuda --eval-every 3; open-file limit n/a (soft, hard)
+2026-10-10 13:52:05 started cvz.az.run pid 77604
+2026-10-10 23:24:31 cvz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-10 23:24:31 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-11 07:30:02 PAUSE removed after 8.1 h paused: resuming the run
+2026-10-11 07:30:02 started cvz.az.run pid 93432
+2026-10-11 16:14:01 cvz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-11 16:14:01 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-11 19:03:00 PAUSE removed after 2.8 h paused: resuming the run
+2026-10-11 19:03:00 started cvz.az.run pid 152392
+2026-10-11 23:38:28 cvz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-11 23:38:28 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-12 00:18:13 PAUSE removed after 39.8 min paused: resuming the run
+2026-10-12 00:18:13 started cvz.az.run pid 42352
+2026-10-12 08:06:28 cvz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-12 08:06:28 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)

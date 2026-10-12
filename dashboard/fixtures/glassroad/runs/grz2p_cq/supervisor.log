@@ -1,0 +1,8 @@
+2026-10-11 21:08:36 supervisor 147636 starting: C:/Users/Gregg Keithley/glassroad-zero/runs/grz2p_cq ; open-file limit n/a (soft, hard)
+2026-10-11 21:08:36 started grz.az.run pid 76848
+2026-10-11 23:34:05 grz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-11 23:34:05 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-12 00:18:12 PAUSE removed after 44.1 min paused: resuming the run
+2026-10-12 00:18:12 started grz.az.run pid 141044
+2026-10-12 08:54:49 grz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-12 08:54:49 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)

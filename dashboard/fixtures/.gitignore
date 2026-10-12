@@ -1,0 +1,2 @@
+# the run snapshots include supervisor.log tails (the repo ignores *.log)
+!supervisor.log
