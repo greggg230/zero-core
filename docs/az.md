@@ -307,6 +307,19 @@ exploration games, behaviour cloning. Where they plug in:
 * New run settings go into `run.DEFAULTS` (saved in every run's config.json: a missing key in an
   old run's config takes the default, so defaults must keep old behaviour).
 
+Browser players (Caverna Zero's `wasm/` + `web/`, docs/wasm.md and docs/web.md there): the
+game-independent network moved into the core - crate `crates/webnet` (`zero_webnet`: the
+`zero.net` forward pass over float16 `.bin` weights, deterministic, native = wasm32 bit for bit)
+and `zero.webexport` (checkpoint -> `.bin`); Caverna re-exports them (`cvz_wasm::net`,
+`tools/export_web.py`). Still Caverna's, for a later step: the single-game search jobs
+(`wasm/src/search.rs`: choose / analyze / rate in slices over `zero_search::tree::Tree`), the JSON
+command API and the wasm ABI (`api.rs`, `lib.rs`: `cvz_*` exports), the Web Worker / `neural.js`,
+and the ladder tooling (`tools/ladder_calibrate.py`, `export_ladder.py`, `rated_js_check.py`).
+They are coupled to Caverna's `WebAz` (a decision = several AZ picks, JS response -> AZ picks in
+`decompose.rs`) and to the JS state format; generalising them means a `WebGame` trait (JS state
+in, decision boundaries, picks -> JS response) that each game implements, with the jobs, API,
+exports (renamed `zero_*`), worker and ladder calibration in the core.
+
 ## 9. Policy targets: visits vs completed Q
 
 `policy_target='cq'` trains the policy head on Gumbel AlphaZero's completed-Q target instead of
