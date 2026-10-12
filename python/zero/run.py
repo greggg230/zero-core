@@ -648,7 +648,9 @@ def main(argv=None):
     runctl.write_state(run, 'run', state='done')
 
 
-if __name__ == '__main__':
+def cli():
+    """`python -m zero.run` / `python -m <pkg>.az.run`: main(); a pause exits at once with status
+    75 (os._exit: no waiting for non-daemon threads)."""
     try:
         main()
     except SystemExit as e:
@@ -657,3 +659,7 @@ if __name__ == '__main__':
             sys.stderr.flush()
             os._exit(EXIT_PAUSED)
         raise
+
+
+if __name__ == '__main__':
+    cli()
