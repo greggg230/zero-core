@@ -1,0 +1,4 @@
+2026-10-11 12:50:13 supervisor 101524 starting: C:/Users/Gregg Keithley/dominion-zero/runs/rand6 --preset base-1 --sets all --net mid --rust-threads 16 --rolling 1 --games 8192 --window 32 --keep-data 40 --lr-halve-every 80 --value-q-warmup 20 --eval-every 3 --eval-games 200 --eval-heuristic-games 200 --eval-random-games 0 --elo-games 100 --eval-kingdom-games 0 --remote mac --remote-eval 1 --remote-share off --kingdoms docs/focus6_boards.json --eval-board-games 100 --eval-board-opps ref --eval-board-ref models/iter_0224.pt --rand-frac 0.25 --rand-buys 6 --rand-mode tiers --xp-targets keep_policy; open-file limit n/a (soft, hard)
+2026-10-11 12:50:13 started domz.az.run pid 141148
+2026-10-11 15:12:17 domz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-11 15:12:17 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)

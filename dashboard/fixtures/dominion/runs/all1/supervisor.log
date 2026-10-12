@@ -1,0 +1,48 @@
+2026-10-08 15:51:14 supervisor 79272 starting: C:/Users/Gregg Keithley/dominion-zero/runs/all1 --preset base-1 --sets all --net mid --rust-threads 16 --rolling 1 --games 8192 --window 32 --keep-data 40 --lr-halve-every 80 --value-q-warmup 20 --eval-every 3 --eval-kingdom-games 0 --remote mac --remote-eval 1 --remote-share off
+2026-10-08 15:51:14 started domz.az.run pid 68704
+2026-10-08 17:09:43 supervisor 84152 starting: C:/Users/Gregg Keithley/dominion-zero/runs/all1 --preset base-1 --sets all --net mid --rust-threads 16 --rolling 1 --games 8192 --window 32 --keep-data 40 --lr-halve-every 80 --value-q-warmup 20 --eval-every 3 --eval-kingdom-games 0 --remote mac --remote-eval 1 --remote-share off
+2026-10-08 17:09:43 started domz.az.run pid 77040
+2026-10-08 17:25:37 supervisor 79912 starting: C:/Users/Gregg Keithley/dominion-zero/runs/all1 --preset base-1 --sets all --net mid --rust-threads 16 --rolling 1 --games 8192 --window 32 --keep-data 40 --lr-halve-every 80 --value-q-warmup 20 --eval-every 1 --eval-games 200 --eval-heuristic-games 200 --eval-random-games 50 --elo-games 100 --eval-kingdom-games 0 --remote mac --remote-eval 1 --remote-share off
+2026-10-08 17:25:37 started domz.az.run pid 68780
+2026-10-08 17:26:35 supervisor 20112 starting: C:/Users/Gregg Keithley/dominion-zero/runs/all1 --preset base-1 --sets all --net mid --rust-threads 16 --rolling 1 --games 8192 --window 32 --keep-data 40 --lr-halve-every 80 --value-q-warmup 20 --eval-every 3 --eval-games 400 --eval-heuristic-games 400 --eval-random-games 100 --elo-games 200 --eval-kingdom-games 0 --remote mac --remote-eval 1 --remote-share off
+2026-10-08 17:26:35 started domz.az.run pid 84084
+2026-10-09 01:17:53 domz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-09 01:17:53 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-09 01:40:59 PAUSE removed after 23.1 min paused: resuming the run
+2026-10-09 01:40:59 started domz.az.run pid 101372
+2026-10-09 09:35:36 domz.az.run exited with code 1; killed 0 orphaned workers
+2026-10-09 09:35:36 crash #1 in the last hour; restarting in 60.0s
+2026-10-09 09:36:36 started domz.az.run pid 108828
+2026-10-09 11:36:44 domz.az.run exited with code 1; killed 0 orphaned workers
+2026-10-09 11:36:44 crash #1 in the last hour; restarting in 60.0s
+2026-10-09 11:37:44 started domz.az.run pid 113796
+2026-10-09 11:39:13 domz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-09 11:39:13 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-09 11:39:20 STOP file present while paused: supervisor done (the run stays paused; relaunching the supervisor waits for PAUSE to be removed)
+2026-10-09 11:45:15 supervisor 112148 starting: C:/Users/Gregg Keithley/dominion-zero/runs/all1 --preset base-1 --sets all --net mid --rust-threads 16 --rolling 1 --games 8192 --window 32 --keep-data 40 --lr-halve-every 80 --value-q-warmup 20 --eval-every 3 --eval-games 400 --eval-heuristic-games 400 --eval-random-games 100 --elo-games 200 --eval-kingdom-games 0 --remote mac --remote-eval 1 --remote-share off
+2026-10-09 11:45:15 moved a STOP file left from an earlier stop to STOP.old
+2026-10-09 11:45:15 PAUSE file present: the run stays paused until it is removed
+2026-10-09 11:45:17 PAUSE removed after 6.1 min paused: resuming the run
+2026-10-09 11:45:17 started domz.az.run pid 123596
+2026-10-09 17:19:34 domz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-09 17:19:34 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-09 19:34:43 PAUSE removed after 2.3 h paused: resuming the run
+2026-10-09 19:34:43 started domz.az.run pid 77304
+2026-10-10 00:35:22 domz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-10 00:35:22 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-10 01:25:07 PAUSE removed after 49.8 min paused: resuming the run
+2026-10-10 01:25:08 started domz.az.run pid 103708
+2026-10-10 12:28:25 domz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-10 12:28:25 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-10 12:28:26 STOP file present while paused: supervisor done (the run stays paused; relaunching the supervisor waits for PAUSE to be removed)
+2026-10-10 12:28:29 supervisor 28856 starting: C:/Users/Gregg Keithley/dominion-zero/runs\all1 --preset base-1 --sets all --net mid --rust-threads 16 --rolling 1 --games 8192 --window 32 --keep-data 40 --lr-halve-every 80 --value-q-warmup 20 --eval-every 3 --eval-games 400 --eval-heuristic-games 400 --eval-random-games 100 --elo-games 200 --eval-kingdom-games 0 --remote mac --remote-eval 1 --remote-share off; open-file limit n/a (soft, hard)
+2026-10-10 12:28:29 moved a STOP file left from an earlier stop to STOP.old
+2026-10-10 12:28:29 PAUSE file present: the run stays paused until it is removed
+2026-10-10 12:28:31 PAUSE removed after 9s paused: resuming the run
+2026-10-10 12:28:31 started domz.az.run pid 98168
+2026-10-10 13:29:20 domz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-10 13:29:20 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
+2026-10-10 23:37:55 PAUSE removed after 10.1 h paused: resuming the run
+2026-10-10 23:37:55 started domz.az.run pid 146528
+2026-10-11 09:20:07 domz.az.run exited with code 75; killed 0 orphaned workers
+2026-10-11 09:20:07 run paused (exit code 75): waiting for the PAUSE file to be removed (polling every 1s)
