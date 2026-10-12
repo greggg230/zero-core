@@ -26,7 +26,9 @@ pub const MAX_SEATS: usize = 8;
 ///   viewer cannot see, consistently with what it has seen. It must never change revealed
 ///   facts nor the viewer's own legal actions at the current decision. The search calls it
 ///   with `viewer` = the root decider (`to_move()`) only; other viewers must still be valid
-///   (tests, analysis).
+///   (tests, analysis). `determinize_oracle` (analysis only) keeps the game's hidden cards at
+///   their true value; a seat's `oracle` mask selects the decision classes where its search
+///   uses it (`Tree::oracle`).
 /// * **Values**: `result()` per seat (only meaningful once over) sums to 1 with ties split;
 ///   `margin(seat)` is the auxiliary target (score - best other score, scaled so typical
 ///   values are O(1)); `score` is for reports only.
@@ -36,6 +38,14 @@ pub const MAX_SEATS: usize = 8;
 /// * **External seats** (a player outside the AZ action layer, e.g. the JS bot through the
 ///   Node bridge): `export_state()` describes the state for that player, `apply_external`
 ///   applies its answer (any number of moves); afterwards the driver re-reads everything.
+/// * **Optional hooks, all defaulted** (docs/search.md 10; each behind a network-seat option
+///   that is off by default, so a game without them behaves exactly as before):
+///   decision classes (`DECISION_CLASSES`, `decision_class`: per-class seat options), the oracle
+///   (`HAS_ORACLE`, `determinize_oracle`: analysis of what hidden information is worth),
+///   policy-sampled simultaneous choices (`HAS_PSAMPLE`, `policy_sampled`,
+///   `uncommit_simultaneous`: seat option `psample`) and the belief prior (`HAS_BELIEF`,
+///   `belief_start`, `belief_particle`, `belief_target`, `belief_consistent`,
+///   `determinize_particle`: seat options `belief_*`).
 pub trait SearchGame: Clone + Send + Sync + 'static {
     /// Settings shared by all games of one driver, parsed from a JSON string.
     type Spec: Clone + Send + Sync + 'static;
@@ -84,6 +94,103 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
         let _ = (spec, name, seed);
         None
     }
+
+    // ------------------------------------------------------------ decision classes, oracle
+
+    /// Names of the game's decision classes, for per-class options of network seats (oracle
+    /// determinization, simulation counts; `NnSeat::oracle`, `NnSeat::class_sims`). Empty: one
+    /// unnamed class 0.
+    const DECISION_CLASSES: &'static [&'static str] = &[];
+    /// The class of the pending decision (an index into `DECISION_CLASSES`; 0 without classes).
+    fn decision_class(&self) -> usize {
+        0
+    }
+    /// Does the game implement `determinize_oracle`?
+    const HAS_ORACLE: bool = false;
+    /// **Oracle determinization (analysis only: what is the hidden information worth?).** Like
+    /// `determinize`, but the hidden information the game's oracle covers keeps its true value
+    /// (Glass Road: the other seat's hidden cards; the building stacks are still reshuffled).
+    /// The network input stays honest (`encode` never reads hidden information); only the
+    /// search's worlds change. Never used for training data or real play. The driver calls it
+    /// only for games with `HAS_ORACLE` (checked when a driver is built).
+    fn determinize_oracle(&mut self, viewer: usize, rng: &mut Rng) {
+        let _ = (viewer, rng);
+        unreachable!("{}: no oracle determinization (HAS_ORACLE is false)", Self::NAME)
+    }
+
+    // ------------------------------------------------------------ policy-sampled simultaneous choices
+
+    /// Does the game have sequentialised simultaneous choices (`policy_sampled`)? Seat option
+    /// `psample` is refused for games without them (it would silently do nothing).
+    const HAS_PSAMPLE: bool = false;
+    /// **Policy-sampled simultaneous choices** (seat option `psample`, docs/search.md 10.2): is
+    /// the pending decision part of a simultaneous choice that the game sequentialised (Glass
+    /// Road: every `select` pick)? With `psample`, a search treats such decisions of seats other
+    /// than its root decider as chance nodes: the option is drawn from the network's prior at
+    /// the node (P0, never noised) instead of chosen by PUCT, so the opponent's simultaneous
+    /// choice is modelled as its policy, never as a best response to our own hidden choice made
+    /// earlier in the same tree (in-tree clairvoyance). Must depend only on the decision (its
+    /// node), not on hidden information.
+    fn policy_sampled(&self) -> bool {
+        false
+    }
+    /// With `psample`, applied to every root world after `determinize(viewer)`: take back the
+    /// hidden simultaneous choices that other seats committed before the viewer's pending one
+    /// in the same step, and let them choose after it (the game's per-world order; Glass Road:
+    /// the earlier chooser's `select` pick), so the viewer's search draws them from the policy
+    /// after its own choice instead of from a uniform determinization. Must not change the
+    /// viewer's decider / legal actions nor any seat's features (the choice was hidden). Default:
+    /// nothing to take back.
+    fn uncommit_simultaneous(&mut self, viewer: usize) {
+        let _ = viewer;
+    }
+
+    // ------------------------------------------------------------ belief prior
+
+    /// Does the game implement the belief hooks below? Seat option `belief_mix` > 0 is refused
+    /// otherwise.
+    const HAS_BELIEF: bool = false;
+    /// **Belief prior** (seat options `belief_mix`, `belief_temp`, `belief_particles`;
+    /// docs/search.md 10.3): Some(key) when the pending decision starts a hidden choice of the
+    /// seat to move (one the other seats will not see: Glass Road, the first `select` pick of a
+    /// period, key = the period). The driver keeps a copy of the real state here per (chooser,
+    /// key): the root from which it later samples that choice with the network's own policy, as
+    /// the chooser saw it (its features never show other seats' hidden information).
+    fn belief_start(&self) -> Option<u64> {
+        None
+    }
+    /// The completed hidden choice of `chooser` in a state reached from its `belief_start` (a
+    /// particle, e.g. a card set as a bit mask), None while the chooser is still choosing (the
+    /// driver keeps sampling its decisions from the policy).
+    fn belief_particle(&self, chooser: usize) -> Option<u64> {
+        let _ = chooser;
+        None
+    }
+    /// The hidden choice of another seat that `determinize(viewer)` resamples at the pending
+    /// decision and a belief can model: (chooser, key of its `belief_start`). None: determinize
+    /// as usual (Glass Road: Some during a period's card play).
+    fn belief_target(&self, viewer: usize) -> Option<(usize, u64)> {
+        let _ = viewer;
+        None
+    }
+    /// Is `particle` (the target chooser's hidden choice) consistent with everything `viewer`
+    /// has observed (Glass Road: the cards the opponent played / followed are in it, none it
+    /// failed to follow)?
+    fn belief_consistent(&self, viewer: usize, particle: u64) -> bool {
+        let _ = (viewer, particle);
+        false
+    }
+    /// `determinize(viewer, rng)` with the target chooser's hidden choice set to `particle`
+    /// (which `belief_consistent` accepted); everything else resampled as `determinize` does.
+    fn determinize_particle(&mut self, viewer: usize, particle: u64, rng: &mut Rng) {
+        let _ = (viewer, particle, rng);
+        unreachable!("{}: no belief determinization (HAS_BELIEF is false)", Self::NAME)
+    }
+}
+
+/// Number of decision classes of a game (at least 1: class 0 without names).
+pub fn n_classes<G: SearchGame>() -> usize {
+    G::DECISION_CLASSES.len().max(1)
 }
 
 /// A built-in (Rust) player. `legal` = the decision's legal actions (>= 2 of them).

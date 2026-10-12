@@ -30,6 +30,12 @@ Simulation (one network evaluation each, strictly sequential within a tree)
 
 Policy target of a recorded decision (docs/search.md 3.1): the root visit distribution, or
 the completed-Q target of Gumbel AlphaZero (`cq_target`, `completed_q_policy`).
+
+Policy-sampled simultaneous choices (`psample`, docs/search.md 10.2): every root world goes
+through `g.uncommit_simultaneous(viewer)` after `determinize`, and at an expanded node of
+another seat whose decision is `g.policy_sampled`, the option is drawn from the node's P0
+instead of `select` (the Rust tree's `TreeOpts::psample`). The oracle and the belief prior
+(docs/search.md 10.1, 10.3) exist in the Rust tree only.
 """
 import math
 
@@ -66,13 +72,16 @@ class Node:
 
 
 class Tree:
-    """The search for one decision of `viewer` (the decider at the root)."""
-    __slots__ = ('base', 'root', 'viewer', 'redet', 'n')
+    """The search for one decision of `viewer` (the decider at the root). psample: policy-sampled
+    simultaneous choices (module docs)."""
+    __slots__ = ('base', 'root', 'viewer', 'redet', 'n', 'psample', 'sampled')
 
-    def __init__(self, game, redet=True, rng=None):
+    def __init__(self, game, redet=True, rng=None, psample=False):
         self.viewer = game.to_move
         self.redet = redet
         self.n = game.n_players
+        self.psample = psample
+        self.sampled = 0
         self.root = Node(self.viewer, list(game.legal()))
         self.set_base(game, rng)
 
@@ -82,6 +91,8 @@ class Tree:
         else:
             g = game.clone()
             g.determinize(self.viewer, rng.getrandbits(63))
+            if self.psample:
+                g.uncommit_simultaneous(self.viewer)
             self.base = g
 
 
@@ -114,6 +125,17 @@ def select(node, c_puct):
         if u > best:
             best_i, best = i, u
     return best_i
+
+
+def sample_p0(node, rng):
+    """An option drawn from the node's noise-free priors P0 (policy-sampled nodes)."""
+    P0 = node.P0
+    r = rng.random() * sum(P0)
+    for i, p in enumerate(P0):
+        r -= p
+        if r < 0:
+            return i
+    return max(i for i, p in enumerate(P0) if p > 0) if any(p > 0 for p in P0) else len(P0) - 1
 
 
 def backup(path, util, win):
@@ -158,6 +180,8 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
     g = tree.base.clone()
     if tree.redet:
         g.determinize(tree.viewer, rng.getrandbits(63))
+        if tree.psample:
+            g.uncommit_simultaneous(tree.viewer)
         if g.legal() != tree.root.acts or g.to_move != tree.root.player:
             raise RuntimeError(f"determinize() changed the root decision: {tree.root.acts} -> {g.legal()}")
     node = tree.root
@@ -165,7 +189,11 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
     while True:
         if node.P is None:
             return node, g, path
-        i = select(node, c_puct)
+        if tree.psample and node.player != tree.viewer and g.policy_sampled:
+            i = sample_p0(node, rng)
+            tree.sampled += 1
+        else:
+            i = select(node, c_puct)
         path.append((node, i))
         edge = node.kids[i]
         if edge is None:

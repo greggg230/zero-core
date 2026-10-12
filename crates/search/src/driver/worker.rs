@@ -82,6 +82,12 @@ struct Tally {
     lost: u64,
     restarts: u64,
     recorded: u64,
+    psampled: u64,
+    belief_rows: u64,
+    belief_jobs: u64,
+    belief_searches: u64,
+    belief_missing: u64,
+    belief_worlds: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -130,6 +136,13 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
                     };
                     slot.ext_payload = Some(payloads[(bases[c] + local) as usize].clone());
                 }
+                Some(Pending::Belief { key, local, rows }) => {
+                    let Some(Eval::Nn { opt_off, priors, bases, .. }) = evals[key as usize].as_ref() else {
+                        return Err("internal: missing network evaluation of belief rows".into());
+                    };
+                    let b = (bases[c] + local) as usize;
+                    apply_belief(cfg, slot, &opt_off[b..=b + rows as usize], priors, &mut n)?;
+                }
                 None => {}
             }
             advance_slot(sh, slot, &mut ch.bufs, &mut ch.results, &mut ch.samples, scratch, &mut n)
@@ -145,6 +158,12 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     k.restart_sims.fetch_add(n.lost, Ordering::Relaxed);
     k.restarts.fetch_add(n.restarts, Ordering::Relaxed);
     k.recorded.fetch_add(n.recorded, Ordering::Relaxed);
+    k.psampled.fetch_add(n.psampled, Ordering::Relaxed);
+    k.belief_rows.fetch_add(n.belief_rows, Ordering::Relaxed);
+    k.belief_jobs.fetch_add(n.belief_jobs, Ordering::Relaxed);
+    k.belief_searches.fetch_add(n.belief_searches, Ordering::Relaxed);
+    k.belief_missing.fetch_add(n.belief_missing, Ordering::Relaxed);
+    k.belief_worlds.fetch_add(n.belief_worlds, Ordering::Relaxed);
     Ok(())
 }
 
@@ -168,12 +187,13 @@ fn is_external(cfg: &DriverCfg, gid: u32, p: usize) -> bool {
 }
 
 /// A new search epoch began (`Driver::resume` with another network): drop the slot's trees
-/// and pending leaf and restart the search of its current decision from an empty tree,
-/// keeping that decision's playout-cap draw. -> simulations thrown away.
+/// and pending leaf (or belief rows: they are sampled again with the new network) and restart
+/// the search of its current decision from an empty tree, keeping that decision's playout-cap
+/// draw. Cached belief particles are kept. -> simulations thrown away.
 fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<u64, String> {
     let leaf = matches!(slot.pending, Some(Pending::Leaf { .. }));
     let lost = slot.sims as u64 + leaf as u64;
-    if leaf {
+    if leaf || matches!(slot.pending, Some(Pending::Belief { .. })) {
         slot.pending = None;
     }
     slot.drop_trees();
@@ -183,11 +203,23 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
         let game = slot.game.as_ref().unwrap();
         let p = game.to_move().ok_or("internal: search target set on a finished game")?;
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: search target set for a non-network seat")?;
+        let particles = belief_particles(&slot.bcache, game, seat, p);
         let mut t = slot.spare.pop().unwrap_or_default();
-        t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
+        t.reset_with(game, p, &slot.legal, &seat.tree_opts(), particles, &mut slot.search_rng);
         slot.trees[p] = Some(t);
     }
     Ok(lost)
+}
+
+/// The cached belief particles for seat `p`'s pending decision (its `belief_target`), or none.
+fn belief_particles<'a, G: SearchGame>(bcache: &'a [Option<Belief>], game: &G, seat: &NnSeat, p: usize) -> &'a [u64] {
+    if !seat.belief() {
+        return &[];
+    }
+    match game.belief_target(p) {
+        Some((q, key)) => bcache.get(p).and_then(|b| b.as_ref()).filter(|b| b.0 == q && b.1 == key).map(|b| b.2.as_slice()).unwrap_or(&[]),
+        None => &[],
+    }
 }
 
 /// Start game `gid` in `slot`: every random stream derives from (driver seed, gid).
@@ -196,8 +228,11 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     let mut base = Rng::new(split64(cfg.seed ^ split64(gid as u64 + 1)));
     let seats = game_seats(cfg, gid);
     let n = seats.len();
-    let game = G::new_game(&sh.spec, n, base.next_u64())?;
+    let seed = base.next_u64();
+    let game = G::new_game(&sh.spec, n, seed)?;
     slot.gid = gid;
+    slot.seed = seed;
+    slot.actions.clear();
     slot.n = n;
     slot.rng = Rng::new(base.next_u64());
     slot.noise_rng = Rng::new(base.next_u64());
@@ -212,6 +247,13 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
             _ => None,
         })
         .collect();
+    // drawn after every other stream: those do not depend on the belief options
+    slot.belief_rng = Rng::new(base.next_u64());
+    slot.bsnap.clear();
+    slot.bsnap.resize_with(n, || None);
+    slot.bcache.clear();
+    slot.bcache.resize_with(n, || None);
+    slot.bjob = None;
     slot.drop_trees();
     slot.game = Some(game);
     slot.legal_ok = false;
@@ -256,6 +298,14 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             finish(cfg, slot, results, samples);
             return Ok(());
         };
+        if sh.belief {
+            // the real state where seat p starts a hidden choice: the root of its belief
+            if let Some(k) = g.belief_start() {
+                if slot.bsnap[p].as_ref().map(|s| s.0) != Some(k) {
+                    slot.bsnap[p] = Some((k, g.clone()));
+                }
+            }
+        }
         if let SeatCfg::External(key) = seat_cfg(cfg, slot.gid, p) {
             if let Some(pl) = slot.ext_payload.take() {
                 apply_external(slot, &pl, &mut scratch.sim.key)?;
@@ -287,7 +337,10 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         }
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: a seat without a player")?;
         if slot.target.is_none() {
-            start(slot, seat, p);
+            if seat.belief() && belief_wait(slot, seat, p, bufs, n)? {
+                return Ok(());
+            }
+            start(slot, seat, p, n);
         }
         if slot.sims >= slot.target.unwrap() {
             n.recorded += decide(cfg, slot, seat, p, &mut scratch.sim.key)? as u64;
@@ -297,9 +350,12 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         let live = slot.game.as_ref().unwrap();
         let sg = scratch.game.get_or_insert_with(|| live.clone());
         let tree = slot.trees[p].as_mut().unwrap();
+        let (sampled, bworlds) = (tree.sampled, tree.belief_worlds);
         std::mem::swap(&mut slot.path, &mut scratch.sim.path);
         let r = tree.simulate(live, sg, &mut slot.search_rng, &walk, &mut scratch.sim);
         std::mem::swap(&mut slot.path, &mut scratch.sim.path);
+        n.psampled += tree.sampled - sampled;
+        n.belief_worlds += tree.belief_worlds - bworlds;
         match r? {
             Sim::Terminal => {
                 slot.sims += 1;
@@ -311,6 +367,9 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 let off = buf.x.len();
                 buf.x.resize(off + G::NUM_FEATURES, 0.0);
                 sg.encode(player, &mut buf.x[off..]);
+                for &i in &seat.mask_features {
+                    buf.x[off + i as usize] = 0.0;
+                }
                 let acts = tree.acts(node);
                 buf.nopt.push(acts.len() as i32);
                 buf.opt_action.extend(acts.iter().map(|&a| a as i32));
@@ -326,24 +385,106 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
 }
 
 /// Start the search for the pending decision of seat `p` (legal actions in `slot.legal`).
-fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
+fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize, n: &mut Tally) {
     slot.full = seat.sims_fast.is_none() || slot.rng.unit() < seat.p_full;
-    slot.target = Some(if slot.full { seat.sims } else { seat.sims_fast.unwrap() });
     let game = slot.game.as_ref().unwrap();
-    match slot.trees[p].as_mut() {
+    slot.target = Some(if !slot.full {
+        seat.sims_fast.unwrap()
+    } else if seat.class_sims.is_empty() {
+        seat.sims
+    } else {
+        seat.class_sims.get(game.decision_class()).copied().filter(|&s| s > 0).unwrap_or(seat.sims)
+    });
+    let particles = belief_particles(&slot.bcache, game, seat, p);
+    let t = match slot.trees[p].as_mut() {
         None => {
             let mut t = slot.spare.pop().unwrap_or_default();
-            t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
-            slot.trees[p] = Some(t);
+            t.reset_with(game, p, &slot.legal, &seat.tree_opts(), particles, &mut slot.search_rng);
+            slot.trees[p].insert(t)
         }
         Some(t) => {
+            if seat.belief() {
+                t.set_belief(game, particles);
+            }
             t.set_base(game, &mut slot.search_rng);
             if seat.selfplay && slot.full && t.expanded(t.root) {
                 let r = t.root;
                 t.add_noise(r, seat.alpha, seat.eps, &mut slot.noise_rng);
             }
+            t
         }
+    };
+    n.belief_searches += !t.belief().is_empty() as u64;
+}
+
+/// Belief prior, before seat `p`'s search starts: if its decision has a `belief_target` whose
+/// particles are not cached yet, sample them (start a `BeliefJob` from the chooser's snapshot,
+/// or continue it) and emit the job's current level as belief rows. -> true = waiting for
+/// their evaluation. Without a snapshot the belief is empty (uniform worlds, counted).
+fn belief_wait<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize, bufs: &mut [LeafBuf], n: &mut Tally) -> Result<bool, String> {
+    let Some((q, key)) = slot.game.as_ref().unwrap().belief_target(p) else { return Ok(false) };
+    if slot.bcache[p].as_ref().is_some_and(|b| b.0 == q && b.1 == key) {
+        return Ok(false);
     }
+    if !slot.bjob.as_ref().is_some_and(|(s, j)| *s == p && j.chooser == q && j.key == key) {
+        let Some(root) = slot.bsnap.get(q).and_then(|s| s.as_ref()).filter(|s| s.0 == key).map(|s| s.1.clone()) else {
+            n.belief_missing += 1;
+            slot.bcache[p] = Some((q, key, Vec::new()));
+            return Ok(false);
+        };
+        let job = BeliefJob::new(root, q, key, seat.belief_particles)?;
+        if job.is_done() {
+            n.belief_jobs += 1;
+            slot.bcache[p] = Some((q, key, job.into_particles()));
+            return Ok(false);
+        }
+        slot.pending = None;
+        slot.bjob = Some((p, job));
+    }
+    if slot.pending.is_none() {
+        let job = &slot.bjob.as_ref().unwrap().1;
+        let buf = &mut bufs[seat.key as usize];
+        let local = buf.len() as u32;
+        let mut legal = Vec::new();
+        for (st, _) in job.level() {
+            let off = buf.x.len();
+            buf.x.resize(off + G::NUM_FEATURES, 0.0);
+            st.encode(q, &mut buf.x[off..]);
+            for &i in &seat.mask_features {
+                buf.x[off + i as usize] = 0.0;
+            }
+            legal.clear();
+            st.legal_actions(&mut legal);
+            buf.nopt.push(legal.len() as i32);
+            buf.opt_action.extend(legal.iter().map(|&a| a as i32));
+            buf.player.push(q as i32);
+            buf.n_players.push(slot.n as i32);
+            buf.gid.push(slot.gid as i64);
+        }
+        let rows = job.level().len() as u32;
+        n.belief_rows += rows as u64;
+        slot.pending = Some(Pending::Belief { key: seat.key, local, rows });
+    }
+    Ok(true)
+}
+
+/// The evaluation of a belief job's level (`opt_off`: its rows' option offsets into `priors`);
+/// a finished job is cached for its seat.
+fn apply_belief<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, opt_off: &[i32], priors: &[f32], n: &mut Tally) -> Result<(), String> {
+    let (p, mut job) = slot.bjob.take().ok_or("internal: belief rows without a belief job")?;
+    let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: belief job of a non-network seat")?;
+    if job.level().len() + 1 != opt_off.len() {
+        return Err(format!("internal: belief job with {} states got {} rows", job.level().len(), opt_off.len() - 1));
+    }
+    job.apply(|r| &priors[opt_off[r] as usize..opt_off[r + 1] as usize], seat.belief_temp, &mut slot.belief_rng)?;
+    if job.is_done() {
+        n.belief_jobs += 1;
+        let (q, key) = (job.chooser, job.key);
+        slot.bcache[p] = Some((q, key, job.into_particles()));
+    } else {
+        slot.bjob = Some((p, job));
+    }
+    Ok(())
 }
 
 /// Choose the move after the search. -> whether a training record was made.
@@ -387,6 +528,9 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         };
         let mut x = vec![0.0f32; G::NUM_FEATURES];
         slot.game.as_ref().unwrap().encode(p, &mut x);
+        for &i in &seat.mask_features {
+            x[i as usize] = 0.0;
+        }
         slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net });
         slot.rq.push(tree.win(root));
     }
@@ -399,6 +543,9 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
 /// auto-stepped, as in the search), then tree reuse.
 fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut Vec<u64>) -> Result<(), String> {
     let gid = slot.gid;
+    if cfg.trace {
+        slot.actions.push(a);
+    }
     let g = slot.game.as_mut().unwrap();
     let p = g.to_move().ok_or("internal: move in a finished game")?;
     transition_with(g, a, None, key, &mut slot.legal, |q| !is_external(cfg, gid, q)).map_err(|e| format!("move {a} failed: {e}"))?;
@@ -457,6 +604,8 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
         ext_moves: slot.ext_moves,
         rounds: g.rounds(),
         samples: if emit { slot.records.len() as u32 } else { 0 },
+        seed: if cfg.trace { slot.seed } else { 0 },
+        actions: std::mem::take(&mut slot.actions),
     });
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();
@@ -476,6 +625,9 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
     slot.records.clear();
     slot.rq.clear();
     slot.drop_trees();
+    slot.bsnap.clear();
+    slot.bcache.clear();
+    slot.bjob = None;
     slot.gid = NO_GAME;
     slot.pending = None;
     slot.ext_payload = None;

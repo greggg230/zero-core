@@ -21,6 +21,7 @@ use pyo3::types::{PyDict, PyList};
 
 use zero_search::driver::{sample_arrays, Batch, DriverCfg, KeyKind, NnSeat, PolicyTarget, SeatCfg};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
+use zero_search::tree::TreeOpts;
 use zero_search::{SearchGame, MAX_SEATS};
 
 /// For `engine_module!` (the game crate needs its own `pyo3` dependency too: the PyO3 macros
@@ -140,7 +141,70 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale"];
+const SEAT_KEYS: &[&str] = &[
+    "key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale",
+    // analysis (docs/search.md 10.1)
+    "oracle_hands", "oracle_p", "class_sims", "mask_features",
+    // opponent models (docs/search.md 10.2, 10.3)
+    "psample", "belief_mix", "belief_temp", "belief_particles",
+];
+
+/// Index of a decision class by name (`SearchGame::DECISION_CLASSES`).
+fn class_index(info: &GameInfo, name: &str) -> PyResult<usize> {
+    info.classes.iter().position(|c| *c == name).ok_or_else(|| PyValueError::new_err(format!("{}: unknown decision class {name:?} (classes: {:?})", info.name, info.classes)))
+}
+
+/// Seat setting `oracle_hands` (analysis only) -> the oracle mask over decision classes:
+/// False / None -> 0 (honest), True or 'all' -> every class, a class name, a '+'-joined list
+/// of names ('select+play') or a list of names -> those classes.
+fn oracle_mask(d: &Bound<'_, PyDict>, info: &GameInfo) -> PyResult<u32> {
+    let Some(v) = d.get_item("oracle_hands")? else { return Ok(0) };
+    if v.is_none() {
+        return Ok(0);
+    }
+    let nc = info.classes.len().max(1);
+    let all = if nc >= 32 { u32::MAX } else { (1u32 << nc) - 1 };
+    let names: Vec<String> = if let Ok(b) = v.downcast::<pyo3::types::PyBool>() {
+        if !b.is_true() {
+            return Ok(0);
+        }
+        vec!["all".into()]
+    } else if let Ok(t) = v.extract::<String>() {
+        t.split('+').map(|x| x.trim().to_string()).collect()
+    } else {
+        v.extract()?
+    };
+    if !info.oracle {
+        return Err(PyValueError::new_err(format!("oracle_hands: {} has no oracle determinization", info.name)));
+    }
+    let mut m = 0u32;
+    for n in names {
+        m |= if n == "all" { all } else { 1u32 << class_index(info, &n)? };
+    }
+    Ok(m)
+}
+
+/// Seat setting `class_sims`: {class name: simulations of full searches at decisions of that
+/// class} (others: `sims`) -> per-class list (0 = `sims`).
+fn class_sims(d: &Bound<'_, PyDict>, info: &GameInfo) -> PyResult<Vec<u32>> {
+    let Some(v) = d.get_item("class_sims")? else { return Ok(Vec::new()) };
+    if v.is_none() {
+        return Ok(Vec::new());
+    }
+    let m: std::collections::BTreeMap<String, u32> = v.extract()?;
+    let mut out = Vec::new();
+    for (name, n) in m {
+        let i = class_index(info, &name)?;
+        if n == 0 {
+            return Err(PyValueError::new_err(format!("class_sims[{name:?}]: needs >= 1 simulation")));
+        }
+        if out.len() <= i {
+            out.resize(i + 1, 0);
+        }
+        out[i] = n;
+    }
+    Ok(out)
+}
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -153,8 +217,9 @@ fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> 
     }
 }
 
-/// Seat dict: {'bot': name} | {'external': key} | network seat settings (SEAT_KEYS).
-fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyResult<SeatCfg> {
+/// Seat dict: {'bot': name} | {'external': key} | network seat settings (SEAT_KEYS; `info`:
+/// the game's decision classes for `oracle_hands` / `class_sims`).
+fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>, info: &GameInfo) -> PyResult<SeatCfg> {
     if let Some(b) = d.get_item("bot")? {
         return Ok(SeatCfg::Bot(b.extract()?));
     }
@@ -188,6 +253,14 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         margin_w: get(d, "margin_w", 0.0f64)?,
         redet: flag(d, "redet", true)?,
         policy_target,
+        oracle: oracle_mask(d, info)?,
+        oracle_p: get(d, "oracle_p", 1.0f64)?,
+        class_sims: class_sims(d, info)?,
+        mask_features: get(d, "mask_features", Vec::<u32>::new())?,
+        psample: flag(d, "psample", false)?,
+        belief_mix: get(d, "belief_mix", 0.0f64)?,
+        belief_temp: get(d, "belief_temp", 1.0f64)?,
+        belief_particles: get(d, "belief_particles", 64u32)?,
     }))
 }
 
@@ -199,6 +272,10 @@ fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>>
     d.set_item("min_players", i.min_players)?;
     d.set_item("max_players", i.max_players)?;
     d.set_item("bots", i.bots.clone())?;
+    d.set_item("classes", i.classes.clone())?;
+    d.set_item("oracle", i.oracle)?;
+    d.set_item("psample", i.psample)?;
+    d.set_item("belief", i.belief)?;
     d.set_item("max_seats", MAX_SEATS)?;
     Ok(d)
 }
@@ -209,7 +286,8 @@ fn game_names() -> Vec<&'static str> {
     registered().iter().map(|g| g.name).collect()
 }
 
-/// {name, num_actions, num_features, min_players, max_players, bots, max_seats}.
+/// {name, num_actions, num_features, min_players, max_players, bots, classes, oracle, psample,
+/// belief, max_seats}.
 #[pyfunction]
 fn game_info_of<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyDict>> {
     info_dict(py, &info_of(name).map_err(verr)?)
@@ -283,8 +361,48 @@ impl PyGame {
     fn rounds(&self) -> u32 {
         self.g.rounds()
     }
-    fn determinize(&mut self, viewer: usize, seed: u64) {
-        self.g.determinize(viewer, seed)
+    /// Resample what `viewer` cannot see; `oracle=True`: the game's oracle determinization
+    /// (analysis: the true hidden cards are kept).
+    #[pyo3(signature = (viewer, seed, oracle=false))]
+    fn determinize(&mut self, viewer: usize, seed: u64, oracle: bool) -> PyResult<()> {
+        if oracle {
+            self.g.determinize_oracle(viewer, seed).map_err(verr)
+        } else {
+            self.g.determinize(viewer, seed);
+            Ok(())
+        }
+    }
+    /// The pending decision's class (index into `info()['classes']`).
+    #[getter]
+    fn decision_class(&self) -> usize {
+        self.g.decision_class()
+    }
+    /// Is the pending decision a sequentialised simultaneous choice (`SearchGame::policy_sampled`)?
+    #[getter]
+    fn policy_sampled(&self) -> bool {
+        self.g.policy_sampled()
+    }
+    /// `SearchGame::uncommit_simultaneous` (a root world of `viewer` under `psample`).
+    fn uncommit_simultaneous(&mut self, viewer: usize) {
+        self.g.uncommit_simultaneous(viewer)
+    }
+    /// Belief hooks (docs/search.md 10.3): the key of a hidden choice starting now, or None.
+    fn belief_start(&self) -> Option<u64> {
+        self.g.belief_start()
+    }
+    fn belief_particle(&self, chooser: usize) -> Option<u64> {
+        self.g.belief_particle(chooser)
+    }
+    /// (chooser, key) of the hidden choice `determinize(viewer)` resamples now, or None.
+    fn belief_target(&self, viewer: usize) -> Option<(usize, u64)> {
+        self.g.belief_target(viewer)
+    }
+    fn belief_consistent(&self, viewer: usize, particle: u64) -> bool {
+        self.g.belief_consistent(viewer, particle)
+    }
+    /// `determinize(viewer, seed)` with the target chooser's hidden choice = `particle`.
+    fn determinize_particle(&mut self, viewer: usize, particle: u64, seed: u64) -> PyResult<()> {
+        self.g.determinize_particle(viewer, particle, seed).map_err(verr)
     }
     fn encode<'py>(&self, py: Python<'py>, viewer: usize) -> Bound<'py, numpy::PyArray1<f32>> {
         self.g.encode(viewer).into_pyarray(py)
@@ -295,10 +413,14 @@ impl PyGame {
     fn apply_external(&mut self, payload: &str) -> PyResult<Vec<u64>> {
         self.g.apply_external(payload).map_err(verr)
     }
-    /// A Rust search tree for the pending decision.
-    #[pyo3(signature = (redet=true, seed=0))]
-    fn search_tree(&self, redet: bool, seed: u64) -> PyResult<PySearchTree> {
-        Ok(PySearchTree { t: self.g.new_tree(redet, seed).map_err(verr)? })
+    /// A Rust search tree for the pending decision. Options (docs/search.md 10): `oracle` mask
+    /// over decision classes and `oracle_p` (analysis), `psample` (policy-sampled simultaneous
+    /// choices), `belief` particles with `belief_mix` (their share of the root worlds).
+    #[pyo3(signature = (redet=true, seed=0, oracle=0, oracle_p=1.0, psample=false, belief=None, belief_mix=0.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn search_tree(&self, redet: bool, seed: u64, oracle: u32, oracle_p: f64, psample: bool, belief: Option<Vec<u64>>, belief_mix: f64) -> PyResult<PySearchTree> {
+        let o = TreeOpts { redet, oracle, oracle_p, psample, belief_mix };
+        Ok(PySearchTree { t: self.g.new_tree(&o, belief.as_deref().unwrap_or(&[]), seed).map_err(verr)? })
     }
 }
 
@@ -314,6 +436,26 @@ pub struct PySearchTree {
 impl PySearchTree {
     fn set_base(&mut self, game: &PyGame) -> PyResult<()> {
         self.t.set_base(&*game.g).map_err(verr)
+    }
+    /// The belief particles for the decision of `game` (before `set_base`; the consistent ones
+    /// are kept).
+    fn set_belief(&mut self, game: &PyGame, particles: Vec<u64>) -> PyResult<()> {
+        self.t.set_belief(&*game.g, &particles).map_err(verr)
+    }
+    /// The consistent belief particles of the root.
+    #[getter]
+    fn belief(&self) -> Vec<u64> {
+        self.t.belief()
+    }
+    /// Selections drawn from P0 at policy-sampled nodes.
+    #[getter]
+    fn sampled(&self) -> u64 {
+        self.t.sampled()
+    }
+    /// Root worlds built from a belief particle.
+    #[getter]
+    fn belief_worlds(&self) -> u64 {
+        self.t.belief_worlds()
     }
     /// One simulation: None if it ended in a terminal state (backed up), else
     /// (decider, features, legal actions) of the leaf - call `expand` with its evaluation.
@@ -404,15 +546,19 @@ impl PySearchTree {
 pub struct PySearchDriver {
     d: Box<dyn DynDriver>,
     nfeat: usize,
+    trace: bool,
 }
 
 #[pymethods]
 impl PySearchDriver {
+    /// `trace`: every result also carries the game's `seed` and real `actions` (a replay:
+    /// `Game(game, spec, n, seed)`, then per action `step(a)` and single-option auto-steps).
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, trace=false))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32) -> PyResult<Self> {
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, trace: bool) -> PyResult<Self> {
         let spec = spec_json(spec)?;
+        let info = info_of(game).map_err(verr)?;
         let mut keys = Vec::new();
         let mut table: Vec<SeatCfg> = Vec::new();
         let mut games = Vec::with_capacity(seats.len());
@@ -420,7 +566,7 @@ impl PySearchDriver {
             let row: Vec<Bound<'_, PyDict>> = g.extract()?;
             let mut ix = Vec::with_capacity(row.len());
             for s in row {
-                let sc = parse_seat(&s, &mut keys)?;
+                let sc = parse_seat(&s, &mut keys, &info)?;
                 let i = match table.iter().position(|x| *x == sc) {
                     Some(i) => i,
                     None => {
@@ -432,10 +578,10 @@ impl PySearchDriver {
             }
             games.push(ix);
         }
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net };
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, trace };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
-        Ok(PySearchDriver { d, nfeat })
+        Ok(PySearchDriver { d, nfeat, trace })
     }
 
     /// (id, key, kind, arrays) with kind 'nn' | 'ext', or None when every game has finished
@@ -506,6 +652,10 @@ impl PySearchDriver {
             d.set_item("ext_moves", r.ext_moves)?;
             d.set_item("rounds", r.rounds)?;
             d.set_item("samples", r.samples)?;
+            if self.trace {
+                d.set_item("seed", r.seed)?;
+                d.set_item("actions", r.actions)?;
+            }
             out.append(d)?;
         }
         Ok(out)
@@ -560,6 +710,12 @@ impl PySearchDriver {
         d.set_item("emitted", s.emitted)?;
         d.set_item("epoch", s.epoch)?;
         d.set_item("net", s.net)?;
+        d.set_item("psampled", s.psampled)?;
+        d.set_item("belief_rows", s.belief_rows)?;
+        d.set_item("belief_jobs", s.belief_jobs)?;
+        d.set_item("belief_searches", s.belief_searches)?;
+        d.set_item("belief_missing", s.belief_missing)?;
+        d.set_item("belief_worlds", s.belief_worlds)?;
         Ok(d)
     }
 

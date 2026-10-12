@@ -20,6 +20,13 @@
 //!
 //! Policy targets of recorded decisions (`driver::PolicyTarget`): the root visit distribution,
 //! or the completed-Q target of Gumbel AlphaZero (`completed_q_policy`, `Tree::cq_target`).
+//!
+//! Options beyond plain PUCT (`TreeOpts`, all off by default; docs/search.md 10): the oracle
+//! (analysis: some root worlds keep the true hidden information), policy-sampled simultaneous
+//! choices (`psample`: other seats' sequentialised simultaneous choices are drawn from the
+//! network's prior instead of searched; their earlier hidden commits are taken back in the root
+//! worlds) and the belief prior (`belief_mix`: that share of root worlds takes the other seat's
+//! hidden choice from particles sampled from its policy, `Tree::set_belief`).
 use std::hash::{Hash, Hasher};
 
 use crate::game::{SearchGame, MAX_SEATS};
@@ -219,11 +226,58 @@ pub fn terminal_values<G: SearchGame>(g: &G, margin_w: f64) -> ([f64; MAX_SEATS]
     (util, win)
 }
 
+/// Options of a search tree (docs/search.md 10). `TreeOpts::default()` (= `plain(true)`) is the
+/// plain search of `Tree::new`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TreeOpts {
+    /// A fresh determinized world per simulation (default) or one per decision.
+    pub redet: bool,
+    /// Oracle mask over decision classes (analysis only): at a root decision of class c
+    /// (`SearchGame::decision_class`) with bit c set, the root world comes from
+    /// `determinize_oracle` (the true hidden information) instead of `determinize`.
+    pub oracle: u32,
+    /// Share of the root worlds of masked classes that are oracle worlds (each simulation
+    /// independently; the others honest). 1 = all.
+    pub oracle_p: f64,
+    /// Policy-sampled simultaneous choices (`SearchGame::policy_sampled`): at such nodes of other
+    /// seats the option is drawn from P0 instead of PUCT; root worlds are passed through
+    /// `uncommit_simultaneous`.
+    pub psample: bool,
+    /// Share of the root worlds whose target hidden choice is a belief particle (uniform over
+    /// the consistent particles given by `set_belief`; the rest `determinize`). 0 = off.
+    pub belief_mix: f64,
+}
+
+impl TreeOpts {
+    /// The plain search (no oracle, no policy sampling, no belief).
+    pub const fn plain(redet: bool) -> TreeOpts {
+        TreeOpts { redet, oracle: 0, oracle_p: 1.0, psample: false, belief_mix: 0.0 }
+    }
+}
+
+impl Default for TreeOpts {
+    fn default() -> Self {
+        TreeOpts::plain(true)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Tree<G: SearchGame> {
     /// The root decider (whose information set the tree searches).
     pub viewer: usize,
     pub redet: bool,
+    /// `TreeOpts::oracle`, `oracle_p`, `psample`, `belief_mix` of this search.
+    pub oracle: u32,
+    pub oracle_p: f64,
+    pub psample: bool,
+    pub belief_mix: f64,
+    /// The belief particles consistent with the current root (`set_belief`; repeats kept, so
+    /// a uniform draw follows the particles' frequencies).
+    belief: Vec<u64>,
+    /// Counters (reports): selections drawn from P0 at policy-sampled nodes, root worlds built
+    /// from a belief particle.
+    pub sampled: u64,
+    pub belief_worlds: u64,
     /// Players in the game.
     pub n: usize,
     pub root: u32,
@@ -238,7 +292,25 @@ pub struct Tree<G: SearchGame> {
 
 impl<G: SearchGame> Default for Tree<G> {
     fn default() -> Self {
-        Tree { viewer: 0, redet: true, n: 0, root: 0, nodes: Vec::new(), stats: Vec::new(), acts: Vec::new(), keys: Vec::new(), outs: Vec::new(), base: None }
+        Tree {
+            viewer: 0,
+            redet: true,
+            oracle: 0,
+            oracle_p: 1.0,
+            psample: false,
+            belief_mix: 0.0,
+            belief: Vec::new(),
+            sampled: 0,
+            belief_worlds: 0,
+            n: 0,
+            root: 0,
+            nodes: Vec::new(),
+            stats: Vec::new(),
+            acts: Vec::new(),
+            keys: Vec::new(),
+            outs: Vec::new(),
+            base: None,
+        }
     }
 }
 
@@ -252,8 +324,24 @@ impl<G: SearchGame> Tree<G> {
 
     /// Reuse this tree's buffers for a fresh search (see `new`).
     pub fn reset(&mut self, game: &G, viewer: usize, legal: &[u16], redet: bool, rng: &mut Rng) {
+        self.reset_with(game, viewer, legal, &TreeOpts::plain(redet), &[], rng)
+    }
+
+    /// `reset` with search options and belief particles (`set_belief`; ignored unless
+    /// `o.belief_mix > 0`).
+    pub fn reset_with(&mut self, game: &G, viewer: usize, legal: &[u16], o: &TreeOpts, particles: &[u64], rng: &mut Rng) {
         self.viewer = viewer;
-        self.redet = redet;
+        self.redet = o.redet;
+        self.oracle = o.oracle;
+        self.oracle_p = o.oracle_p;
+        self.psample = o.psample;
+        self.belief_mix = o.belief_mix;
+        self.sampled = 0;
+        self.belief_worlds = 0;
+        self.belief.clear();
+        if o.belief_mix > 0.0 {
+            self.set_belief(game, particles);
+        }
         self.n = game.num_players();
         self.nodes.clear();
         self.stats.clear();
@@ -277,9 +365,60 @@ impl<G: SearchGame> Tree<G> {
                 }
                 None => game.clone(),
             };
-            g.determinize(self.viewer, rng);
+            self.determinize_root(&mut g, rng);
             self.base = Some(g);
         }
+    }
+
+    /// The belief particles for the decision of `game` (the viewer's root; call before
+    /// `set_base`): keeps those `belief_consistent` with what the viewer observed (repeats kept).
+    /// No consistent particle (or none given): root worlds come from `determinize`.
+    pub fn set_belief(&mut self, game: &G, particles: &[u64]) {
+        self.belief.clear();
+        self.belief.extend(particles.iter().copied().filter(|&x| game.belief_consistent(self.viewer, x)));
+    }
+
+    /// Consistent belief particles of the current root.
+    pub fn belief(&self) -> &[u64] {
+        &self.belief
+    }
+
+    /// A world for the root decider: `determinize_oracle` at a decision whose class is in the
+    /// oracle mask (with probability `oracle_p`); otherwise `determinize_particle` with a
+    /// consistent belief particle (with probability `belief_mix`) or `determinize`, then (with
+    /// `psample`) `uncommit_simultaneous`. All off: exactly `determinize` (same random draws).
+    #[inline]
+    fn determinize_root(&mut self, g: &mut G, rng: &mut Rng) {
+        if self.oracle != 0 && (self.oracle >> g.decision_class().min(31)) & 1 != 0 && (self.oracle_p >= 1.0 || rng.unit() < self.oracle_p) {
+            // the oracle sees the committed choices too: nothing to take back
+            g.determinize_oracle(self.viewer, rng);
+            return;
+        }
+        if !self.belief.is_empty() && (self.belief_mix >= 1.0 || rng.unit() < self.belief_mix) {
+            let k = rng.below(self.belief.len() as u32) as usize;
+            g.determinize_particle(self.viewer, self.belief[k], rng);
+            self.belief_worlds += 1;
+        } else {
+            g.determinize(self.viewer, rng);
+        }
+        if self.psample {
+            g.uncommit_simultaneous(self.viewer);
+        }
+    }
+
+    /// An option of `node` drawn from its noise-free priors P0 (policy-sampled nodes).
+    fn sample_p0(&self, node: u32, rng: &mut Rng) -> usize {
+        let st = self.stats_of(node);
+        let tot: f64 = st.iter().map(|s| s.p0 as f64).sum();
+        let mut r = rng.unit() * tot;
+        for (i, s) in st.iter().enumerate() {
+            r -= s.p0 as f64;
+            if r < 0.0 {
+                return i;
+            }
+        }
+        // rounding: the last option with a positive prior
+        st.iter().rposition(|s| s.p0 > 0.0).unwrap_or(st.len() - 1)
     }
 
     fn push_node(&mut self, key: &[u64], player: usize, acts: &[u16], hash: u64) -> u32 {
@@ -475,6 +614,8 @@ impl<G: SearchGame> Tree<G> {
     /// node, g)` (g = the scratch game at that node) may return an option index to take
     /// instead of the PUCT choice (web analysis: forced minimum visits per candidate).
     /// `simulate` is this with a hook that never overrides (monomorphized away).
+    /// With `psample`, a node of another seat whose decision is `policy_sampled` takes an
+    /// option drawn from its P0 instead of PUCT (the hook still has precedence).
     pub fn simulate_with<H>(&mut self, live: &G, g: &mut G, rng: &mut Rng, w: &Walk, sc: &mut Scratch, mut hook: H) -> Result<Sim, String>
     where
         H: FnMut(&Self, u32, &G) -> Option<usize>,
@@ -482,7 +623,7 @@ impl<G: SearchGame> Tree<G> {
         sc.path.clear();
         g.clone_from(self.base.as_ref().unwrap_or(live));
         if self.redet {
-            g.determinize(self.viewer, rng);
+            self.determinize_root(g, rng);
             sc.legal.clear();
             g.legal_actions(&mut sc.legal);
             if g.to_move() != Some(self.player(self.root)) || sc.legal.as_slice() != self.acts(self.root) {
@@ -496,6 +637,10 @@ impl<G: SearchGame> Tree<G> {
             }
             let i = match hook(self, node, g) {
                 Some(i) => i,
+                None if self.psample && self.player(node) != self.viewer && g.policy_sampled() => {
+                    self.sampled += 1;
+                    self.sample_p0(node, rng)
+                }
                 None => self.select(node, w.c_puct),
             };
             sc.path.push((node, i as u32));
@@ -617,7 +762,21 @@ impl<G: SearchGame> Tree<G> {
 
     /// Copy the subtree under `root` into fresh arrays (drops the garbage above it).
     pub fn compact(&mut self) {
-        let mut t: Tree<G> = Tree { viewer: self.viewer, redet: self.redet, n: self.n, root: 0, base: self.base.take(), ..Default::default() };
+        let mut t: Tree<G> = Tree {
+            viewer: self.viewer,
+            redet: self.redet,
+            oracle: self.oracle,
+            oracle_p: self.oracle_p,
+            psample: self.psample,
+            belief_mix: self.belief_mix,
+            belief: std::mem::take(&mut self.belief),
+            sampled: self.sampled,
+            belief_worlds: self.belief_worlds,
+            n: self.n,
+            root: 0,
+            base: self.base.take(),
+            ..Default::default()
+        };
         let mut map = std::collections::HashMap::new();
         let mut order = vec![self.root];
         let mut k = 0;

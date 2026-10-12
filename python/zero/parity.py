@@ -10,8 +10,11 @@
   Python formula on a Rust root's statistics gives the Rust target.
 * `h2h`: games between a Rust-tree seat and a Python-tree seat (`play.PyDriver`, seats
   alternating), both searching with the same network and settings: ~50% within error.
+* `psample` (docs/search.md 10.2): `positions(..., psample=True)` on positions whose search
+  reaches policy-sampled decisions of the other seat (`sample_positions(..., where=...)`, e.g.
+  the secret game's or Glass Road's hand choices).
 
-  python -m zero.parity positions [--sims 128 --reps 32 --chance-k 0 --cq-c-scale 1.0]
+  python -m zero.parity positions [--sims 128 --reps 32 --chance-k 0 --cq-c-scale 1.0 --psample]
   python -m zero.parity h2h --model runs/toy1/models/iter_0010.pt [--games 2000 --sims 32]
   (or python -m <pkg>.az.parity ... in a game repo)
 """
@@ -49,10 +52,10 @@ class LinearEval:
         return pri, v, [0.0] * MAX_SEATS
 
 
-def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False):
+def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, psample=False):
     """-> (root visits, root win[, completed-Q target with cq = (c_visit, c_scale)][, the tree])."""
     rng = random.Random(seed)
-    t = mcts.Tree(g, redet, rng)
+    t = mcts.Tree(g, redet, rng, psample=psample)
     for _ in range(sims):
         r = mcts.simulate(t, rng, c_puct, chance_k)
         if r is None:
@@ -66,9 +69,9 @@ def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
     return out + (t,) if tree else out
 
 
-def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False):
+def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, psample=False):
     """`search_py` with the Rust tree (`<package>._engine.SearchTree`)."""
-    t = g.search_tree(redet, seed)
+    t = g.search_tree(redet, seed, psample=psample)
     for _ in range(sims):
         r = t.simulate(g, c_puct, chance_k)
         if r is None:
@@ -82,21 +85,24 @@ def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
     return out + (t,) if tree else out
 
 
-def sample_positions(game='toy', n=12, seed=0, players=2):
-    """Positions from random play at varying depths (the decider has >= 3 options)."""
+def sample_positions(game='toy', n=12, seed=0, players=2, depth=(5, 60), where=None, spec=None):
+    """Positions from random play at varying depths (the decider has >= 3 options; `where(g)`:
+    an extra condition)."""
     E = engine()
     rng = random.Random(seed)
     out = []
     k = 0
     while len(out) < n:
-        g = E.Game(game, None, players, 10_000 + seed * 1000 + k)
+        g = E.Game(game, spec, players, 10_000 + seed * 1000 + k)
         k += 1
-        depth = rng.randrange(5, 60)
-        for _ in range(depth):
+        if k > 1000 * n:
+            raise RuntimeError(f'sample_positions: {len(out)} of {n} positions in {k} games')
+        d = rng.randrange(*depth)
+        for _ in range(d):
             if g.over:
                 break
             g.step(rng.choice(g.legal()))
-        if not g.over and len(g.legal()) >= 3:
+        if not g.over and len(g.legal()) >= 3 and (where is None or where(g)):
             out.append(g)
     return out
 
@@ -106,16 +112,20 @@ def tv(a, b):
 
 
 def positions(game="toy", n=12, sims=96, reps=24, chance_k=0, c_puct_rs=1.0, seed=0, verbose=False, scale=0.15,
-              cq=(50.0, 1.0)):
+              cq=(50.0, 1.0), psample=False, poss=None):
     """-> dict(tv_rs_py, tv_py_py, win_diff, tv_cq_rs_py, tv_cq_py_py) averaged over the
-    positions (tv_cq_*: the same for the mean completed-Q targets with cq = (c_visit, c_scale))."""
+    positions (tv_cq_*: the same for the mean completed-Q targets with cq = (c_visit, c_scale)).
+    psample: both trees with policy-sampled simultaneous choices; poss: the positions (default
+    `sample_positions(game, n, seed)`)."""
     info = engine().game_info_of(game)
     ev = LinearEval(info["num_features"], info["num_actions"], seed=1, scale=scale)
     res = {'tv_rs_py': [], 'tv_py_py': [], 'win_diff': [], 'tv_cq_rs_py': [], 'tv_cq_py_py': []}
-    for i, g in enumerate(sample_positions(game, n, seed)):
-        rs = [search_rs(g, ev, sims, 1000 + r, c_puct_rs, chance_k, cq=cq) for r in range(reps)]
-        pa = [search_py(g, ev, sims, 2000 + r, 1.0, chance_k, cq=cq) for r in range(reps)]
-        pb = [search_py(g, ev, sims, 3000 + r, 1.0, chance_k, cq=cq) for r in range(reps)]
+    poss = sample_positions(game, n, seed) if poss is None else poss
+    n = len(poss)
+    for i, g in enumerate(poss):
+        rs = [search_rs(g, ev, sims, 1000 + r, c_puct_rs, chance_k, cq=cq, psample=psample) for r in range(reps)]
+        pa = [search_py(g, ev, sims, 2000 + r, 1.0, chance_k, cq=cq, psample=psample) for r in range(reps)]
+        pb = [search_py(g, ev, sims, 3000 + r, 1.0, chance_k, cq=cq, psample=psample) for r in range(reps)]
         mr, ma, mb = (np.mean([x[0] for x in s], 0) for s in (rs, pa, pb))
         res['tv_rs_py'].append(tv(mr, ma))
         res['tv_py_py'].append(tv(ma, mb))
@@ -184,6 +194,7 @@ def main(argv=None):
     p.add_argument('--game', default='toy')
     p.add_argument('--cq-c-visit', type=float, default=50.0)
     p.add_argument('--cq-c-scale', type=float, default=1.0)
+    p.add_argument('--psample', action='store_true', help='policy-sampled simultaneous choices in both trees')
     h = sub.add_parser('h2h')
     h.add_argument('--model', required=True)
     h.add_argument('--games', type=int, default=2000)
@@ -193,7 +204,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == 'positions':
         print(json.dumps(positions(a.game, n=a.positions, sims=a.sims, reps=a.reps, chance_k=a.chance_k,
-                                   c_puct_rs=a.c_puct_rs, verbose=True, cq=(a.cq_c_visit, a.cq_c_scale))))
+                                   c_puct_rs=a.c_puct_rs, verbose=True, cq=(a.cq_c_visit, a.cq_c_scale),
+                                   psample=a.psample)))
     else:
         h2h(a.model, a.games, a.sims, a.chance_k, seed=a.seed)
 

@@ -6,7 +6,7 @@ use std::any::Any;
 use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record};
 use crate::game::{bot_names, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
-use crate::tree::{leaf_values, Scratch, Sim, Tree, Walk};
+use crate::tree::{leaf_values, Scratch, Sim, Tree, TreeOpts, Walk};
 
 /// Static facts about a game type.
 #[derive(Clone, Debug)]
@@ -17,10 +17,27 @@ pub struct GameInfo {
     pub min_players: usize,
     pub max_players: usize,
     pub bots: Vec<&'static str>,
+    /// `SearchGame::DECISION_CLASSES` (per-class seat options), `HAS_ORACLE`, `HAS_PSAMPLE`,
+    /// `HAS_BELIEF` (docs/search.md 10).
+    pub classes: Vec<&'static str>,
+    pub oracle: bool,
+    pub psample: bool,
+    pub belief: bool,
 }
 
 pub fn game_info<G: SearchGame>() -> GameInfo {
-    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>() }
+    GameInfo {
+        name: G::NAME,
+        num_actions: G::NUM_ACTIONS,
+        num_features: G::NUM_FEATURES,
+        min_players: G::MIN_PLAYERS,
+        max_players: G::MAX_PLAYERS.min(MAX_SEATS),
+        bots: bot_names::<G>(),
+        classes: G::DECISION_CLASSES.to_vec(),
+        oracle: G::HAS_ORACLE,
+        psample: G::HAS_PSAMPLE,
+        belief: G::HAS_BELIEF,
+    }
 }
 
 /// One game, any type.
@@ -37,12 +54,25 @@ pub trait DynGame: Send + Sync {
     fn margin(&self, seat: usize) -> f32;
     fn score(&self, seat: usize) -> f32;
     fn determinize(&mut self, viewer: usize, seed: u64);
+    /// `SearchGame::determinize_oracle` (analysis; an error for games without an oracle).
+    fn determinize_oracle(&mut self, viewer: usize, seed: u64) -> Result<(), String>;
+    fn decision_class(&self) -> usize;
+    fn policy_sampled(&self) -> bool;
+    fn uncommit_simultaneous(&mut self, viewer: usize);
+    fn belief_start(&self) -> Option<u64>;
+    fn belief_particle(&self, chooser: usize) -> Option<u64>;
+    fn belief_target(&self, viewer: usize) -> Option<(usize, u64)>;
+    fn belief_consistent(&self, viewer: usize, particle: u64) -> bool;
+    /// `SearchGame::determinize_particle` (an error for games without belief hooks or an
+    /// inconsistent particle).
+    fn determinize_particle(&mut self, viewer: usize, particle: u64, seed: u64) -> Result<(), String>;
     fn encode(&self, viewer: usize) -> Vec<f32>;
     fn rounds(&self) -> u32;
     fn export_state(&self) -> String;
     fn apply_external(&mut self, payload: &str) -> Result<Vec<u64>, String>;
-    /// A search tree for this game's pending decision.
-    fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String>;
+    /// A search tree for this game's pending decision (options `TreeOpts`; belief particles
+    /// used with `belief_mix` > 0).
+    fn new_tree(&self, opts: &TreeOpts, particles: &[u64], seed: u64) -> Result<Box<dyn DynTree>, String>;
 }
 
 impl<G: SearchGame> DynGame for G {
@@ -86,6 +116,44 @@ impl<G: SearchGame> DynGame for G {
     fn determinize(&mut self, viewer: usize, seed: u64) {
         SearchGame::determinize(self, viewer, &mut Rng::new(seed))
     }
+    fn determinize_oracle(&mut self, viewer: usize, seed: u64) -> Result<(), String> {
+        if !G::HAS_ORACLE {
+            return Err(format!("{} has no oracle determinization", G::NAME));
+        }
+        SearchGame::determinize_oracle(self, viewer, &mut Rng::new(seed));
+        Ok(())
+    }
+    fn decision_class(&self) -> usize {
+        SearchGame::decision_class(self)
+    }
+    fn policy_sampled(&self) -> bool {
+        SearchGame::policy_sampled(self)
+    }
+    fn uncommit_simultaneous(&mut self, viewer: usize) {
+        SearchGame::uncommit_simultaneous(self, viewer)
+    }
+    fn belief_start(&self) -> Option<u64> {
+        SearchGame::belief_start(self)
+    }
+    fn belief_particle(&self, chooser: usize) -> Option<u64> {
+        SearchGame::belief_particle(self, chooser)
+    }
+    fn belief_target(&self, viewer: usize) -> Option<(usize, u64)> {
+        SearchGame::belief_target(self, viewer)
+    }
+    fn belief_consistent(&self, viewer: usize, particle: u64) -> bool {
+        SearchGame::belief_consistent(self, viewer, particle)
+    }
+    fn determinize_particle(&mut self, viewer: usize, particle: u64, seed: u64) -> Result<(), String> {
+        if !G::HAS_BELIEF {
+            return Err(format!("{} has no belief hooks", G::NAME));
+        }
+        if !SearchGame::belief_consistent(self, viewer, particle) {
+            return Err(format!("particle {particle:#x} is not consistent with what seat {viewer} observed"));
+        }
+        SearchGame::determinize_particle(self, viewer, particle, &mut Rng::new(seed));
+        Ok(())
+    }
     fn encode(&self, viewer: usize) -> Vec<f32> {
         let mut v = vec![0.0; G::NUM_FEATURES];
         SearchGame::encode(self, viewer, &mut v);
@@ -102,11 +170,21 @@ impl<G: SearchGame> DynGame for G {
         SearchGame::apply_external(self, payload, &mut k)?;
         Ok(k)
     }
-    fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String> {
+    fn new_tree(&self, opts: &TreeOpts, particles: &[u64], seed: u64) -> Result<Box<dyn DynTree>, String> {
         let viewer = SearchGame::to_move(self).ok_or("the game is over")?;
+        if opts.oracle != 0 && !G::HAS_ORACLE {
+            return Err(format!("{} has no oracle determinization", G::NAME));
+        }
+        if opts.psample && !G::HAS_PSAMPLE {
+            return Err(format!("{} has no policy-sampled simultaneous choices", G::NAME));
+        }
+        if opts.belief_mix > 0.0 && !G::HAS_BELIEF {
+            return Err(format!("{} has no belief hooks", G::NAME));
+        }
         let mut rng = Rng::new(seed);
         let legal = DynGame::legal(self);
-        let t = Tree::new(self, viewer, &legal, redet, &mut rng);
+        let mut t = Tree::default();
+        t.reset_with(self, viewer, &legal, opts, particles, &mut rng);
         Ok(Box::new(TreeBox { t, rng, scratch: None, sc: Scratch::default(), leaf: None }))
     }
 }
@@ -125,6 +203,12 @@ pub struct Leaf {
 /// One search tree driven from Python (parity tests, mixed Rust-vs-Python matches).
 pub trait DynTree: Send + Sync {
     fn set_base(&mut self, live: &dyn DynGame) -> Result<(), String>;
+    /// `Tree::set_belief` (before `set_base`).
+    fn set_belief(&mut self, live: &dyn DynGame, particles: &[u64]) -> Result<(), String>;
+    /// The consistent belief particles; the counters `Tree::sampled`, `Tree::belief_worlds`.
+    fn belief(&self) -> Vec<u64>;
+    fn sampled(&self) -> u64;
+    fn belief_worlds(&self) -> u64;
     /// One simulation: None if it ended in a terminal state (backed up), else the leaf to
     /// evaluate (then `expand`).
     fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64) -> Result<Option<Leaf>, String>;
@@ -167,6 +251,20 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
         let g = downcast::<G>(live)?;
         self.t.set_base(g, &mut self.rng);
         Ok(())
+    }
+    fn set_belief(&mut self, live: &dyn DynGame, particles: &[u64]) -> Result<(), String> {
+        let g = downcast::<G>(live)?;
+        self.t.set_belief(g, particles);
+        Ok(())
+    }
+    fn belief(&self) -> Vec<u64> {
+        self.t.belief().to_vec()
+    }
+    fn sampled(&self) -> u64 {
+        self.t.sampled
+    }
+    fn belief_worlds(&self) -> u64 {
+        self.t.belief_worlds
     }
     fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64) -> Result<Option<Leaf>, String> {
         if self.leaf.is_some() {

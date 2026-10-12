@@ -68,6 +68,12 @@ DEFAULTS = dict(
     # distribution) | 'cq' (Gumbel AlphaZero's completed-Q target softmax(ln P0 + (cq_c_visit +
     # max N) cq_c_scale completedQ), docs/search.md 3.1); the search itself is the same
     policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0,
+    # opponent models of the network's searches (self-play and evaluation seats alike;
+    # docs/search.md 10.2-10.3; off by default): psample (other seats' sequentialised
+    # simultaneous choices drawn from the network's prior, Glass Road `select`), belief_mix (share
+    # of root worlds whose other seat's hidden choice is a particle from the network's own policy,
+    # 0 = off) with belief_temp / belief_particles
+    psample=0, belief_mix=0.0, belief_temp=1.0, belief_particles=64,
     # network (only when the run's first network is created)
     hidden=256, blocks=4,
     # training: steps = new samples * reuse / batch (at least min_steps); AdamW; LR halving
@@ -224,11 +230,15 @@ class Run:
 
     def nn_seat(self, key, sims, selfplay=False):
         c = self.cfg
+        om = dict(psample=bool(c.get('psample', 0)), belief_mix=c.get('belief_mix', 0.0),
+                  belief_temp=c.get('belief_temp', 1.0), belief_particles=c.get('belief_particles', 64))
         if selfplay:
             return G.nn_seat(key, sims, c['c_puct'], True, c['alpha'], c['eps'], c['temp_moves'], c['sims_fast'],
                              c['p_full'], c['chance_k'], c['margin_w'], bool(c['redet']),
-                             c.get('policy_target', 'visits'), c.get('cq_c_visit', 50.0), c.get('cq_c_scale', 1.0))
-        return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']))
+                             c.get('policy_target', 'visits'), c.get('cq_c_visit', 50.0), c.get('cq_c_scale', 1.0),
+                             **om)
+        return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
+                         **om)
 
     def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None):
         c = self.cfg

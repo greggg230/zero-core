@@ -26,6 +26,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         max_steps: 10_000,
         rolling: false,
         net: 0,
+        trace: false,
     }
 }
 
@@ -301,4 +302,220 @@ fn completed_q_changes_only_the_policy_targets() {
     assert!(Driver::<ToyGame>::new(cfg(vec![bad], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_err());
     assert!(PolicyTarget::parse("cq", 50.0, -1.0).is_err() && PolicyTarget::parse("argmax", 50.0, 1.0).is_err());
     assert_eq!(PolicyTarget::parse("visits", 0.0, 0.0), Ok(PolicyTarget::Visits));
+}
+
+// ------------------------------------------------------------ analysis options, opponent models
+
+fn with_seat(seat: SeatCfg, f: impl FnOnce(&mut NnSeat)) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            f(&mut s);
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+#[test]
+fn oracle_and_class_sims_settings() {
+    let one = |seat: SeatCfg| Driver::<ToyGame>::new(cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)]));
+    // the toy has no oracle and one decision class
+    assert!(!ToyGame::HAS_ORACLE && crate::game::n_classes::<ToyGame>() == 1);
+    assert!(one(with_seat(nn(0, 8, false), |s| s.oracle = 1)).is_err(), "no oracle determinization");
+    assert!(one(with_seat(nn(0, 8, false), |s| s.class_sims = vec![8, 8])).is_err(), "two classes");
+    for p in [0.0, -1.0, 1.5, f64::NAN] {
+        assert!(one(with_seat(nn(0, 8, false), |s| s.oracle_p = p)).is_err(), "oracle_p {p}");
+    }
+    assert!(one(with_seat(nn(0, 8, false), |s| s.class_sims = vec![8])).is_ok());
+    // class_sims equal to sims (or 0 = sims) and oracle 0 reproduce the golden records
+    for cs in [vec![16], vec![0]] {
+        let (_, recs) = golden_selfplay(with_seat(nn(0, 16, true), |s| s.class_sims = cs.clone()));
+        assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS, "class_sims {cs:?}");
+    }
+    // mask_features: the masked inputs are zero in every record; out-of-range indices rejected
+    let (_, recs) = golden_selfplay(with_seat(nn(0, 16, true), |s| s.mask_features = vec![0, 3]));
+    assert!(!recs.is_empty() && recs.iter().all(|r| r.x[0] == 0.0 && r.x[3] == 0.0));
+    let (_, gold) = golden_selfplay(nn(0, 16, true));
+    assert!(gold.iter().any(|r| r.x[0] != 0.0 || r.x[3] != 0.0), "the toy's features 0 and 3 are not always zero");
+    assert!(one(with_seat(nn(0, 8, false), |s| s.mask_features = vec![ToyGame::NUM_FEATURES as u32])).is_err());
+    // class_sims applies to full searches: fewer simulations, other records
+    let (_, recs) = golden_selfplay(with_seat(nn(0, 16, true), |s| s.class_sims = vec![12]));
+    assert_ne!(records_digest(&recs), GOLDEN_RECORDS.1);
+}
+
+#[test]
+fn trace_replays_every_game() {
+    let mut c = cfg(vec![nn(0, 16, true), SeatCfg::Bot("random".into())], (0..12).map(|g| if g % 3 == 0 { vec![1, 0] } else { vec![0, 0] }).collect(), &[("m", KeyKind::Nn)]);
+    c.trace = true;
+    let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
+    let (res, recs) = run(&mut d);
+    assert_eq!(res.len(), 12);
+    let spec = ToyGame::parse_spec(&c.spec).unwrap();
+    for r in &res {
+        assert!(!r.actions.is_empty());
+        let mut g = ToyGame::new_game(&spec, r.n, r.seed).unwrap();
+        let mut key = Vec::new();
+        let mut legal = Vec::new();
+        for &a in &r.actions {
+            crate::tree::transition(&mut g, a, None, &mut key, &mut legal).unwrap();
+        }
+        assert!(g.to_move().is_none(), "game {} replayed to its end", r.gid);
+        assert_eq!((0..r.n).map(|i| g.score(i)).collect::<Vec<_>>(), r.scores);
+    }
+    // tracing changes nothing else
+    let mut c2 = c.clone();
+    c2.trace = false;
+    let (res2, recs2) = run(&mut Driver::<ToyGame>::new(c2).unwrap());
+    assert_eq!(records_digest(&recs), records_digest(&recs2));
+    assert!(res2.iter().all(|r| r.actions.is_empty() && r.seed == 0));
+    assert_eq!(res.iter().map(|r| (&r.scores, r.steps)).collect::<Vec<_>>(), res2.iter().map(|r| (&r.scores, r.steps)).collect::<Vec<_>>());
+    // games with external seats cannot be traced
+    let mut c3 = cfg(vec![SeatCfg::External(0), nn(1, 8, false)], vec![vec![0, 1]], &[("e", KeyKind::External), ("m", KeyKind::Nn)]);
+    c3.trace = true;
+    assert!(Driver::<ToyGame>::new(c3).is_err());
+}
+
+use crate::secret::SecretGame;
+
+/// Card preferences of the secret game's stand-in policy.
+const SECRET_W: [f32; 5] = [0.2, 0.6, 1.0, 3.0, 0.5];
+
+/// Any game: priors ~ SECRET_W[action % 5] (the secret game's card preferences), value by a hash
+/// of the features. -> (results, records, rows evaluated).
+fn run_any<G: SearchGame>(d: &mut Driver<G>) -> (Vec<GameResult>, Vec<Record>, u64) {
+    let f = G::NUM_FEATURES;
+    let (mut res, mut smp, mut rows) = (Vec::new(), Vec::new(), 0u64);
+    while let Some(b) = d.next_batch(true).unwrap() {
+        let mut pri = Vec::new();
+        for r in 0..b.b {
+            let acts = &b.opt_action[b.opt_off[r] as usize..b.opt_off[r + 1] as usize];
+            let s: f32 = acts.iter().map(|&a| SECRET_W[a as usize % 5]).sum();
+            pri.extend(acts.iter().map(|&a| SECRET_W[a as usize % 5] / s));
+        }
+        let mut v = vec![0.0; b.b * MAX_SEATS];
+        for r in 0..b.b {
+            let h: f32 = b.x[r * f..(r + 1) * f].iter().enumerate().map(|(i, x)| x * ((i * 7 % 13) as f32 - 6.0)).sum();
+            let w = 1.0 / (1.0 + (-h * 0.1).exp());
+            v[r * MAX_SEATS] = w;
+            v[r * MAX_SEATS + 1] = 1.0 - w;
+        }
+        rows += b.b as u64;
+        d.submit(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS]).unwrap();
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+    }
+    res.extend(d.take_results());
+    smp.extend(d.take_samples());
+    res.sort_by_key(|r| r.gid);
+    (res, smp, rows)
+}
+
+fn secret_cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>) -> DriverCfg {
+    let mut c = cfg(seats, games, &[("m", KeyKind::Nn)]);
+    c.seed = 11;
+    c
+}
+
+#[test]
+fn opponent_model_settings_are_checked() {
+    let toy = |seat: SeatCfg| Driver::<ToyGame>::new(cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)]));
+    let sec = |seat: SeatCfg| Driver::<SecretGame>::new(secret_cfg(vec![seat], vec![vec![0, 0]]));
+    const { assert!(!ToyGame::HAS_PSAMPLE && !ToyGame::HAS_BELIEF) };
+    // a game without the hooks refuses the options (they would silently do nothing)
+    assert!(toy(with_seat(nn(0, 8, false), |s| s.psample = true)).is_err());
+    assert!(toy(with_seat(nn(0, 8, false), |s| s.belief_mix = 0.5)).is_err());
+    assert!(sec(with_seat(nn(0, 8, false), |s| s.psample = true)).is_ok());
+    for (mix, temp, k) in [(1.5, 1.0, 64), (-0.1, 1.0, 64), (f64::NAN, 1.0, 64), (0.5, 0.0, 64), (0.5, f64::INFINITY, 64), (0.5, 1.0, 0)] {
+        assert!(sec(with_seat(nn(0, 8, false), |s| (s.belief_mix, s.belief_temp, s.belief_particles) = (mix, temp, k))).is_err(), "{mix} {temp} {k}");
+    }
+    assert!(sec(with_seat(nn(0, 8, false), |s| (s.belief_mix, s.belief_temp, s.belief_particles) = (1.0, 0.5, 1))).is_ok());
+    // the defaults are the plain search
+    assert_eq!(NnSeat::eval(0, 8).tree_opts(), crate::tree::TreeOpts::plain(true));
+}
+
+#[test]
+fn psample_and_belief_in_secret_selfplay() {
+    let base = nn(0, 24, true);
+    let games = vec![vec![0, 0]; 40];
+    let mk = |seat: SeatCfg, threads: usize, groups: usize| {
+        let mut c = secret_cfg(vec![seat], games.clone());
+        (c.threads, c.groups) = (threads, groups);
+        let mut d = Driver::<SecretGame>::new(c).unwrap();
+        let r = run_any(&mut d);
+        (r, d.stats())
+    };
+    // plain search: none of the opponent-model counters move
+    let ((r0, s0, rows0), st0) = mk(base.clone(), 2, 2);
+    assert_eq!((st0.psampled, st0.belief_rows, st0.belief_jobs, st0.belief_worlds), (0, 0, 0, 0));
+    assert_eq!(rows0, st0.leaves);
+    // both options on: reproducible across threads / groups, every counter moves
+    let both = with_seat(base.clone(), |s| (s.psample, s.belief_mix) = (true, 1.0));
+    let ((r1, s1, rows1), st1) = mk(both.clone(), 1, 1);
+    let ((r3, s3, _), _) = mk(both.clone(), 3, 2);
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples);
+    assert_eq!(r1.iter().map(key).collect::<Vec<_>>(), r3.iter().map(key).collect::<Vec<_>>());
+    assert_eq!(records_digest(&s1), records_digest(&s3));
+    assert_ne!(records_digest(&s0), records_digest(&s1));
+    assert!(r1.iter().all(|r| r.over) && r0.len() == r1.len());
+    assert!(st1.psampled > 0, "{st1:?}");
+    // at most one belief per game and seat (the other seat's hand; sampled from its snapshot at
+    // the first searched card play of the seat)
+    assert!(st1.belief_jobs > 20 && st1.belief_jobs <= 80 && st1.belief_missing == 0, "{st1:?}");
+    assert!(st1.belief_searches > 0 && st1.belief_worlds > 0, "{st1:?}");
+    // belief rows ride in the network batches: at most 1 + 4 rows per belief (2 picks; 4
+    // distinct first picks), counted apart from the search's leaves
+    assert_eq!(rows1, st1.leaves + st1.belief_rows);
+    assert!(st1.belief_rows >= 2 * st1.belief_jobs && st1.belief_rows <= 5 * st1.belief_jobs, "{st1:?}");
+    // the options separately
+    let ((_, sp, _), stp) = mk(with_seat(base.clone(), |s| s.psample = true), 2, 2);
+    assert!(stp.psampled > 0 && stp.belief_rows == 0);
+    let ((_, sb, _), stb) = mk(with_seat(base.clone(), |s| s.belief_mix = 0.5), 2, 2);
+    assert!(stb.psampled == 0 && stb.belief_jobs > 20 && stb.belief_worlds > 0);
+    assert!(stb.belief_worlds * 3 < st1.belief_worlds * 2, "belief_mix 0.5 uses about half as many particle worlds");
+    assert!(records_digest(&sp) != records_digest(&s0) && records_digest(&sb) != records_digest(&s0));
+}
+
+#[test]
+fn belief_of_a_bot_opponent_and_mask_features() {
+    // seat 1 is a random bot: its hand's snapshot is taken all the same; the belief rows carry
+    // the masked inputs too
+    let seat = with_seat(nn(0, 16, false), |s| (s.belief_mix, s.mask_features) = (1.0, vec![3]));
+    let games: Vec<Vec<u16>> = (0..20).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+    let mut d = Driver::<SecretGame>::new(secret_cfg(vec![seat, SeatCfg::Bot("random".into())], games)).unwrap();
+    let mut masked = true;
+    let f = SecretGame::NUM_FEATURES;
+    while let Some(b) = d.next_batch(true).unwrap() {
+        masked &= (0..b.b).all(|r| b.x[r * f + 3] == 0.0);
+        let k: Vec<f32> = (0..b.b)
+            .flat_map(|r| {
+                let n = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+                std::iter::repeat_n(1.0 / n as f32, n)
+            })
+            .collect();
+        let mut v = vec![0.0; b.b * MAX_SEATS];
+        for r in 0..b.b {
+            (v[r * MAX_SEATS], v[r * MAX_SEATS + 1]) = (0.5, 0.5);
+        }
+        d.submit(b.id, &k, &v, &vec![0.0; b.b * MAX_SEATS]).unwrap();
+    }
+    let st = d.stats();
+    assert!(masked);
+    assert!(st.belief_jobs > 10 && st.belief_jobs <= 20 && st.belief_missing == 0, "{st:?}");
+    assert!(st.belief_searches > 0, "{st:?}");
+    assert_eq!(d.take_results().len(), 20);
+}
+
+#[test]
+fn belief_survives_rolling_epochs() {
+    let seat = with_seat(nn(0, 16, true), |s| (s.psample, s.belief_mix) = (true, 1.0));
+    let mut c = secret_cfg(vec![seat], vec![vec![0, 0]]);
+    (c.rolling, c.concurrency) = (true, 12);
+    let mut d = Driver::<SecretGame>::new(c).unwrap();
+    for (k, net) in [(0u64, 0u32), (1, 1), (2, 1), (3, 2)] {
+        d.resume(10 + k, net).unwrap();
+        let _ = run_any(&mut d);
+        assert!(d.paused());
+    }
+    let st = d.stats();
+    assert!(st.games_finished >= 46 && st.belief_jobs > 0 && st.restarts > 0, "{st:?}");
 }

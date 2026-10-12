@@ -28,6 +28,17 @@
 //! their state. A `resume` with a new network id starts a new search epoch: every slot drops
 //! its trees and pending leaf and searches its current decision again from an empty tree
 //! (keeping that decision's playout-cap draw), so no search mixes two networks.
+//!
+//! **Opponent models and analysis options** of network seats (docs/search.md 10; all off by
+//! default): the oracle (`oracle`, `oracle_p`), per-class simulations (`class_sims`), input
+//! ablation (`mask_features`), policy-sampled simultaneous choices (`psample`) and the belief
+//! prior (`belief_mix`, `belief_temp`, `belief_particles`). The belief prior samples particles
+//! of another seat's hidden choice with the network's own policy: the driver keeps the real state
+//! where that choice began (`SearchGame::belief_start`), and when a seat's search needs the
+//! belief it replays the choice from there K times with sampled options; the policy evaluations
+//! ride in the seat's ordinary network batches as **belief rows** (same layout as leaves; only
+//! their priors are used), one level of the choice per batch, identical prefixes evaluated once.
+//! The particles are cached per (seat, chooser, key) for the rest of the game.
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -35,9 +46,10 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::game::{make_bot, Bot, SearchGame, MAX_SEATS};
+use crate::belief::BeliefJob;
+use crate::game::{make_bot, n_classes, Bot, SearchGame, MAX_SEATS};
 use crate::rng::{split64, Rng};
-use crate::tree::Tree;
+use crate::tree::{Tree, TreeOpts};
 
 mod worker;
 use worker::worker;
@@ -88,12 +100,66 @@ pub struct NnSeat {
     pub redet: bool,
     /// Training target of the seat's recorded decisions (self-play, full searches).
     pub policy_target: PolicyTarget,
+    /// **Analysis only**: oracle mask over the game's decision classes
+    /// (`SearchGame::DECISION_CLASSES`): at a decision of class c with bit c set the search
+    /// determinizes with `determinize_oracle` (the true hidden cards; `TreeOpts::oracle`). 0 =
+    /// honest (the default; everything else unchanged).
+    pub oracle: u32,
+    /// Share of oracle worlds at masked decisions (each simulation independently; the rest
+    /// honest): a belief that puts this much weight on the truth. 1 = always (the default).
+    pub oracle_p: f64,
+    /// Simulations of full searches per decision class (index = class; 0 or missing = `sims`).
+    /// Empty (the default) = `sims` everywhere.
+    pub class_sims: Vec<u32>,
+    /// **Analysis only** (input ablation): feature indices zeroed in every network input this
+    /// seat sends (its search's leaves of any decider, belief rows, its records). Empty = none.
+    pub mask_features: Vec<u32>,
+    /// Policy-sampled simultaneous choices (`TreeOpts::psample`, `SearchGame::policy_sampled`).
+    pub psample: bool,
+    /// Belief prior: share of the root worlds whose target hidden choice is a particle drawn
+    /// from the network's own policy (`SearchGame::belief_target`; 0 = off, the default).
+    pub belief_mix: f64,
+    /// Temperature of the belief particles' policy draws (each atomic choice from p^(1/temp)).
+    pub belief_temp: f64,
+    /// Particles per belief (K).
+    pub belief_particles: u32,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits }
+        NnSeat {
+            key,
+            sims,
+            c_puct: 1.0,
+            selfplay: false,
+            alpha: 0.3,
+            eps: 0.25,
+            temp_moves: 30,
+            sims_fast: None,
+            p_full: 1.0,
+            chance_k: 0,
+            margin_w: 0.0,
+            redet: true,
+            policy_target: PolicyTarget::Visits,
+            oracle: 0,
+            oracle_p: 1.0,
+            class_sims: Vec::new(),
+            mask_features: Vec::new(),
+            psample: false,
+            belief_mix: 0.0,
+            belief_temp: 1.0,
+            belief_particles: 64,
+        }
+    }
+
+    /// The seat's tree options.
+    pub fn tree_opts(&self) -> TreeOpts {
+        TreeOpts { redet: self.redet, oracle: self.oracle, oracle_p: self.oracle_p, psample: self.psample, belief_mix: self.belief_mix }
+    }
+
+    fn belief(&self) -> bool {
+        self.belief_mix > 0.0
     }
 }
 
@@ -132,6 +198,10 @@ pub struct DriverCfg {
     pub rolling: bool,
     /// Network id stored with the samples until a `resume` sets another.
     pub net: u32,
+    /// Keep every game's new-game seed and real moves in its result (`GameResult::seed`,
+    /// `actions`): a replay is `new_game(spec, n, seed)` then, per action, `step(a)` and
+    /// auto-steps of single-option decisions (analysis; no external seats).
+    pub trace: bool,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -150,6 +220,9 @@ pub struct GameResult {
     pub rounds: u32,
     /// Training samples this game emitted.
     pub samples: u32,
+    /// `DriverCfg::trace`: the `new_game` seed and the real moves (otherwise 0 / empty).
+    pub seed: u64,
+    pub actions: Vec<u16>,
 }
 
 /// One recorded root decision with its targets.
@@ -222,7 +295,12 @@ enum Eval {
 enum Pending {
     Leaf { key: u16, local: u32, seat: usize, node: u32 },
     Ext { key: u16, local: u32 },
+    /// `rows` belief rows from `local` on (the slot's `BeliefJob`, one per state of its level).
+    Belief { key: u16, local: u32, rows: u32 },
 }
+
+/// A belief: (chooser, key, particles); empty particles = none could be sampled (no snapshot).
+type Belief = (usize, u64, Vec<u64>);
 
 struct Slot<G: SearchGame> {
     gid: u32,
@@ -252,6 +330,15 @@ struct Slot<G: SearchGame> {
     legal_ok: bool,
     epoch: u32,
     net: u32,
+    /// `DriverCfg::trace`: the game's new-game seed and real moves.
+    seed: u64,
+    actions: Vec<u16>,
+    /// Belief prior: per chooser seat, (key, the real state at its `belief_start`); per network
+    /// seat, its last belief and the belief being sampled; the particles' random stream.
+    bsnap: Vec<Option<(u64, G)>>,
+    bcache: Vec<Option<Belief>>,
+    bjob: Option<(usize, BeliefJob<G>)>,
+    belief_rng: Rng,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -282,6 +369,12 @@ impl<G: SearchGame> Slot<G> {
             legal_ok: false,
             epoch: 0,
             net: 0,
+            seed: 0,
+            actions: Vec::new(),
+            bsnap: Vec::new(),
+            bcache: Vec::new(),
+            bjob: None,
+            belief_rng: Rng::new(0),
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -370,6 +463,12 @@ struct Counters {
     restart_sims: AtomicU64,
     restarts: AtomicU64,
     recorded: AtomicU64,
+    psampled: AtomicU64,
+    belief_rows: AtomicU64,
+    belief_jobs: AtomicU64,
+    belief_searches: AtomicU64,
+    belief_missing: AtomicU64,
+    belief_worlds: AtomicU64,
 }
 
 struct Shared<G: SearchGame> {
@@ -385,6 +484,8 @@ struct Shared<G: SearchGame> {
     counters: Counters,
     epoch: AtomicU32,
     net: AtomicU32,
+    /// Some network seat uses the belief prior (the slots keep `belief_start` snapshots).
+    belief: bool,
 }
 
 impl<G: SearchGame> Shared<G> {
@@ -428,6 +529,15 @@ pub struct DriverStats {
     pub emitted: u64,
     pub epoch: u32,
     pub net: u32,
+    /// Opponent models (docs/search.md 10): selections drawn from P0 at policy-sampled nodes;
+    /// belief rows evaluated, beliefs sampled, searches started with >= 1 consistent particle,
+    /// belief targets without a snapshot (uniform instead), root worlds from a particle.
+    pub psampled: u64,
+    pub belief_rows: u64,
+    pub belief_jobs: u64,
+    pub belief_searches: u64,
+    pub belief_missing: u64,
+    pub belief_worlds: u64,
 }
 
 /// The games in progress.
@@ -484,6 +594,7 @@ impl<G: SearchGame> Driver<G> {
                     if let PolicyTarget::CompletedQ { c_visit, c_scale } = n.policy_target {
                         PolicyTarget::parse("cq", c_visit, c_scale)?;
                     }
+                    check_seat_options::<G>(n)?;
                 }
                 SeatCfg::External(k) => {
                     if cfg.keys.get(*k as usize).map(|k| k.1) != Some(KeyKind::External) {
@@ -496,6 +607,9 @@ impl<G: SearchGame> Driver<G> {
                     }
                 }
             }
+        }
+        if cfg.trace && cfg.seats.iter().any(|s| matches!(s, SeatCfg::External(_))) {
+            return Err("trace: games with external seats cannot be replayed from their actions".into());
         }
         if cfg.rolling && cfg.games.is_empty() {
             return Err("rolling mode needs at least one game's seats".into());
@@ -526,6 +640,7 @@ impl<G: SearchGame> Driver<G> {
         }
         let rolling = cfg.rolling;
         let net = cfg.net;
+        let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if n.belief()));
         let cfg = DriverCfg { threads, groups, ..cfg };
         let sh = Arc::new(Shared {
             cfg,
@@ -540,6 +655,7 @@ impl<G: SearchGame> Driver<G> {
             counters: Counters::default(),
             epoch: AtomicU32::new(0),
             net: AtomicU32::new(net),
+            belief,
         });
         let mut workers = Vec::new();
         for k in 0..threads {
@@ -811,6 +927,12 @@ impl<G: SearchGame> Driver<G> {
             emitted: self.emitted,
             epoch: self.sh.epoch.load(Ordering::Relaxed),
             net: self.sh.net.load(Ordering::Relaxed),
+            psampled: c.psampled.load(Ordering::Relaxed),
+            belief_rows: c.belief_rows.load(Ordering::Relaxed),
+            belief_jobs: c.belief_jobs.load(Ordering::Relaxed),
+            belief_searches: c.belief_searches.load(Ordering::Relaxed),
+            belief_missing: c.belief_missing.load(Ordering::Relaxed),
+            belief_worlds: c.belief_worlds.load(Ordering::Relaxed),
         }
     }
 
@@ -844,6 +966,44 @@ impl<G: SearchGame> Drop for Driver<G> {
             let _ = h.join();
         }
     }
+}
+
+/// Validate a network seat's opponent-model / analysis options against the game.
+fn check_seat_options<G: SearchGame>(n: &NnSeat) -> Result<(), String> {
+    let nc = n_classes::<G>();
+    if n.oracle != 0 && !G::HAS_ORACLE {
+        return Err(format!("network seat: {} has no oracle determinization", G::NAME));
+    }
+    if nc < 32 && n.oracle >> nc != 0 {
+        return Err(format!("network seat: oracle mask {:#x} beyond {} decision classes {:?}", n.oracle, nc, G::DECISION_CLASSES));
+    }
+    if !(n.oracle_p > 0.0 && n.oracle_p <= 1.0) {
+        return Err(format!("network seat: oracle_p {} not in (0, 1]", n.oracle_p));
+    }
+    if let Some(&i) = n.mask_features.iter().find(|&&i| i as usize >= G::NUM_FEATURES) {
+        return Err(format!("network seat: mask_features index {i} >= {} features", G::NUM_FEATURES));
+    }
+    if n.class_sims.len() > nc {
+        return Err(format!("network seat: class_sims for {} classes, {} has {} {:?}", n.class_sims.len(), G::NAME, nc, G::DECISION_CLASSES));
+    }
+    if n.psample && !G::HAS_PSAMPLE {
+        return Err(format!("network seat: psample, but {} has no policy-sampled simultaneous choices", G::NAME));
+    }
+    if !(0.0..=1.0).contains(&n.belief_mix) {
+        return Err(format!("network seat: belief_mix {} not in [0, 1]", n.belief_mix));
+    }
+    if n.belief() {
+        if !G::HAS_BELIEF {
+            return Err(format!("network seat: belief_mix {}, but {} has no belief hooks", n.belief_mix, G::NAME));
+        }
+        if !(n.belief_temp.is_finite() && n.belief_temp > 0.0) {
+            return Err(format!("network seat: belief_temp {} must be > 0", n.belief_temp));
+        }
+        if n.belief_particles == 0 {
+            return Err("network seat: belief_particles must be >= 1".into());
+        }
+    }
+    Ok(())
 }
 
 /// Training sample arrays (docs/search.md 2.4) of `records`.

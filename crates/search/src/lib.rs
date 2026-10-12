@@ -9,13 +9,16 @@
 //!   priors / values in; one leaf per game per batch - no virtual loss, no in-tree batching),
 //!   playout-cap randomisation, temperature, training records, rolling mode, arena (several
 //!   network keys), external seats.
-//! * `toy`: "Mini Cavern", the toy game the stack is proven on.
+//! * `toy`: "Mini Cavern", the toy game the stack is proven on; `secret`: a tiny game with a
+//!   hidden simultaneous hand choice (the opponent-model options' test bed, docs/search.md 10).
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
+pub mod belief;
 pub mod driver;
 pub mod dynapi;
 pub mod game;
 pub mod noise;
 pub mod rng;
+pub mod secret;
 pub mod toy;
 pub mod tree;
 

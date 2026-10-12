@@ -34,7 +34,9 @@ def engine():
 
 
 def info(game):
-    """{name, num_actions, num_features, min_players, max_players, bots, max_seats}."""
+    """{name, num_actions, num_features, min_players, max_players, bots, classes, oracle, psample,
+    belief, max_seats} (classes: the decision classes of per-class seat options; oracle / psample
+    / belief: the game implements those hooks, docs/search.md 10)."""
     return dict(engine().game_info_of(game))
 
 
@@ -95,14 +97,48 @@ def is_external(seat):
 
 
 def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20, sims_fast=None,
-            p_full=1.0, chance_k=0, margin_w=0.0, redet=True, policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0):
+            p_full=1.0, chance_k=0, margin_w=0.0, redet=True, policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0,
+            oracle_hands=False, oracle_p=1.0, class_sims=None, mask_features=None, psample=False, belief_mix=0.0,
+            belief_temp=1.0, belief_particles=64):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
-    cq_c_scale; docs/search.md 3.1). The target keys are only set when not the default."""
+    cq_c_scale; docs/search.md 3.1). The target keys are only set when not the default.
+
+    Opponent models (docs/search.md 10.2-10.3; set only when not the default, refused by games
+    without the hooks):
+      psample:      the game's sequentialised simultaneous choices (Glass Road: `select`) of the
+                    other seats are drawn from the network's prior inside the search, and their
+                    earlier hidden commits are taken back in the root worlds.
+      belief_mix:   share of the search's root worlds whose other seat's hidden choice is a
+                    particle sampled from the network's own policy at the start of that choice
+                    (restricted to the consistent ones; the rest uniform); 0 = off.
+      belief_temp, belief_particles: temperature of the particles' draws (p^(1/temp) per atomic
+                    choice) and their number K.
+    Analysis-only options (docs/search.md 10.1):
+      oracle_hands: the search determinizes with the game's TRUE hidden cards at decisions of
+                    the given classes (True / 'all', a class name, 'select+play', a list);
+                    the network input stays honest. Glass Road classes: 'play' (every decision
+                    outside select), 'select' (the select picks).
+      oracle_p:     the share of the search's root worlds at those decisions that are true
+                    (each simulation independently; the rest honest).
+      class_sims:   {class name: simulations} for full searches at decisions of that class.
+      mask_features: feature indices zeroed in every network input of the seat (ablation)."""
     d = dict(key=key, sims=sims, c_puct=c_puct, selfplay=selfplay, alpha=alpha, eps=eps, temp_moves=temp_moves,
              sims_fast=sims_fast, p_full=p_full, chance_k=chance_k, margin_w=margin_w, redet=redet)
     if policy_target != 'visits':
         d.update(policy_target=policy_target, cq_c_visit=float(cq_c_visit), cq_c_scale=float(cq_c_scale))
+    if oracle_hands:
+        d['oracle_hands'] = oracle_hands
+        if oracle_p != 1.0:
+            d['oracle_p'] = float(oracle_p)
+    if class_sims:
+        d['class_sims'] = {str(k): int(v) for k, v in class_sims.items()}
+    if mask_features:
+        d['mask_features'] = [int(i) for i in mask_features]
+    if psample:
+        d['psample'] = True
+    if belief_mix:
+        d.update(belief_mix=float(belief_mix), belief_temp=float(belief_temp), belief_particles=int(belief_particles))
     return d
 
 

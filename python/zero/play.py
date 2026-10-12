@@ -8,7 +8,9 @@ gets `sims` and becomes a training sample, the rest `sims_fast`), root Dirichlet
 self-play searches, temperature sampling by visit count for the first `temp_moves` searched
 decisions of a game, argmax (N, P0) otherwise, tree reuse when the same seat decides again.
 Recorded decisions carry the seat's policy target: the visit distribution ('visits') or the
-completed-Q target ('cq', docs/search.md 3.1).
+completed-Q target ('cq', docs/search.md 3.1). Policy-sampled simultaneous choices (`psample`,
+docs/search.md 10.2) work in both trees; the belief prior and the analysis options (oracle,
+class_sims, mask_features) only in the Rust driver.
 """
 import random
 
@@ -24,13 +26,14 @@ POLICY_TARGETS = ('visits', 'cq')
 class NNSeat:
     """Search settings of a network seat. impl: 'py' (reference tree) | 'rs' (Rust tree).
     policy_target: training target of recorded decisions, 'visits' | 'cq' (completed Q with
-    cq_c_visit, cq_c_scale)."""
+    cq_c_visit, cq_c_scale). psample: policy-sampled simultaneous choices (docs/search.md 10.2)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
-                 policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0):
+                 policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0, psample=False):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
+        self.psample = psample
         self.key, self.sims, self.c_puct, self.selfplay = key, sims, c_puct, selfplay
         self.alpha, self.eps, self.temp_moves = alpha, eps, temp_moves
         self.sims_fast, self.p_full, self.chance_k, self.margin_w = sims_fast, p_full, chance_k, margin_w
@@ -40,7 +43,7 @@ class NNSeat:
 
 class PySearch:
     def __init__(self, game, seat, rng):
-        self.t = mcts.Tree(game, seat.redet, rng)
+        self.t = mcts.Tree(game, seat.redet, rng, psample=seat.psample)
         self.pending = None
 
     def set_base(self, game, rng):
@@ -93,7 +96,7 @@ class RsSearch:
     """The Rust tree (`<package>._engine.SearchTree`) behind the same interface."""
 
     def __init__(self, game, seat, rng):
-        self.t = game.search_tree(seat.redet, rng.getrandbits(63))
+        self.t = game.search_tree(seat.redet, rng.getrandbits(63), psample=seat.psample)
 
     def set_base(self, game, rng):
         self.t.set_base(game)
@@ -184,7 +187,10 @@ class PyDriver:
     """seat_fn(game_index) -> list of seats (NNSeat or a bot name), one per player."""
 
     def __init__(self, game, n_games, seat_fn, spec=None, concurrency=64, seed=0, record=False, max_steps=100_000):
-        from .games import spec_json
+        from .games import info, spec_json
+        if any(isinstance(s, NNSeat) and s.psample for g in range(min(n_games, 16)) for s in seat_fn(g)) \
+                and not info(game)['psample']:
+            raise ValueError(f'psample: {game} has no policy-sampled simultaneous choices')
         self.game = game
         self.spec = spec_json(spec)
         self.n_games = n_games

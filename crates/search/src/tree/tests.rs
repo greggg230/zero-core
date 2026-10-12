@@ -316,3 +316,183 @@ fn cq_target_of_a_searched_root() {
     let t = Tree::new(&g, g.to_move().unwrap(), &legal_of(&g), true, &mut rng);
     assert!(t.cq_target(t.root, 50.0, 1.0).is_empty());
 }
+
+// ------------------------------------------------------------ opponent models (the secret game)
+
+use crate::secret::{SecretGame, PHASE_PICK, PHASE_PLAY};
+
+const SW: [f32; 5] = [0.2, 0.6, 1.0, 3.0, 0.5];
+
+/// Search the secret game: priors ~ SW over the legal cards, value from the point lead; `leaf`
+/// sees every leaf state.
+fn search_secret(t: &mut Tree<SecretGame>, live: &SecretGame, sims: usize, rng: &mut Rng, mut leaf: impl FnMut(&SecretGame)) {
+    let mut g = live.clone();
+    let mut sc = Scratch::default();
+    for _ in 0..sims {
+        if let Sim::Leaf { node, player } = t.simulate(live, &mut g, rng, &W, &mut sc).unwrap() {
+            leaf(&g);
+            let acts = t.acts(node);
+            let s: f32 = acts.iter().map(|&a| SW[a as usize]).sum();
+            let pri: Vec<f32> = acts.iter().map(|&a| SW[a as usize] / s).collect();
+            let lead = g.points[player] as f32 - g.points[1 - player] as f32 + if g.phase == PHASE_PLAY { (g.hands[player] as f32 - 8.0) / 8.0 } else { 0.0 };
+            let w = 1.0 / (1.0 + (-lead / 2.0).exp());
+            let mut v = [0.0; MAX_SEATS];
+            (v[0], v[1]) = (w, 1.0 - w);
+            let (util, win) = leaf_values(&v, &[0.0; MAX_SEATS], player, 2, 0.0);
+            t.expand(node, &pri, &util);
+            t.backup(&sc.path, &util, &win);
+        }
+    }
+}
+
+fn secret_after(acts: &[u16]) -> SecretGame {
+    let mut g = SecretGame::new();
+    let (mut k, mut l) = (Vec::new(), Vec::new());
+    for &a in acts {
+        transition(&mut g, a, None, &mut k, &mut l).unwrap();
+    }
+    g
+}
+
+fn most_visited(t: &Tree<SecretGame>, node: u32) -> usize {
+    let v = t.visits(node);
+    (0..v.len()).max_by_key(|&i| v[i]).unwrap()
+}
+
+/// The child of (node, option i) (one child: no chance in the pick phase).
+fn kid(t: &Tree<SecretGame>, node: u32, i: usize) -> u32 {
+    let k = t.kids(node, i);
+    assert_eq!(k.len(), 1);
+    k[0].1
+}
+
+#[test]
+fn psample_draws_the_opponents_simultaneous_choice_from_its_prior() {
+    let g = SecretGame::new();
+    let legal = legal_of_g(&g);
+    let mut tvs = Vec::new();
+    for psample in [false, true] {
+        let mut rng = Rng::new(5);
+        let mut t = Tree::default();
+        t.reset_with(&g, 0, &legal, &TreeOpts { psample, ..TreeOpts::default() }, &[], &mut rng);
+        search_secret(&mut t, &g, 4000, &mut rng, |_| {});
+        // seat 0's most visited hand, then seat 1's first pick below it
+        let a = t.root;
+        let mut c = kid(&t, a, most_visited(&t, a));
+        if t.player(c) == 0 {
+            c = kid(&t, c, most_visited(&t, c));
+        }
+        assert_eq!((t.player(c), t.acts(c).len()), (1, 4));
+        let nv = t.visits(c);
+        let tot: u32 = nv.iter().sum();
+        let p0 = t.priors0(c);
+        tvs.push(0.5 * nv.iter().zip(&p0).map(|(&n, &p)| (n as f64 / tot as f64 - p as f64).abs()).sum::<f64>());
+        assert!(tot > 400, "{tot}");
+        assert_eq!(t.sampled > 0, psample);
+        // seat 0's own choices (the root decider) are searched either way
+        assert!(t.visits(a).iter().filter(|&&n| n > 0).count() >= 2);
+    }
+    // PUCT best-responds to seat 0's hand in the same tree; the sampled opponent follows P0
+    assert!(tvs[1] < 0.05 && tvs[0] > 2.0 * tvs[1], "TV(visits, P0): PUCT {:.3}, sampled {:.3}", tvs[0], tvs[1]);
+}
+
+fn legal_of_g<G: SearchGame>(g: &G) -> Vec<u16> {
+    let mut l = Vec::new();
+    g.legal_actions(&mut l);
+    l
+}
+
+#[test]
+fn psample_uncommits_an_earlier_simultaneous_choice() {
+    // seat 0 has chosen {1, 3}; seat 1 searches its own choice
+    let g = secret_after(&[1, 3]);
+    assert_eq!(g.to_move(), Some(1));
+    for psample in [false, true] {
+        let mut rng = Rng::new(8);
+        let mut t = Tree::default();
+        t.reset_with(&g, 1, &legal_of_g(&g), &TreeOpts { psample, ..TreeOpts::default() }, &[], &mut rng);
+        let mut picks_of_0 = 0;
+        let mut worlds = std::collections::HashSet::new();
+        search_secret(&mut t, &g, 600, &mut rng, |w| {
+            picks_of_0 += (w.phase == PHASE_PICK && w.to_move() == Some(0)) as usize;
+            if w.phase == PHASE_PLAY {
+                worlds.insert(w.chosen[0]);
+            }
+        });
+        if psample {
+            // seat 0 picks again after seat 1, drawn from its prior: several hands, every one
+            // sampled inside the tree
+            assert!(picks_of_0 > 0 && t.sampled > 0);
+            assert!(worlds.len() >= 3, "{worlds:?}");
+        } else {
+            // uniform committed hands, never picked inside the tree
+            assert_eq!((picks_of_0, t.sampled), (0, 0));
+            assert!(worlds.len() >= 5, "{worlds:?}");
+        }
+    }
+}
+
+#[test]
+fn belief_particles_determinize_the_target_hand() {
+    // seat 0 {1, 3} leads; seat 1 holds {0, 4}
+    let g = secret_after(&[1, 3, 0, 4]);
+    assert_eq!((g.phase, g.to_move(), g.belief_target(0)), (PHASE_PLAY, Some(0), Some((1, 0))));
+    let hands = |mix: f64, particles: &[u64]| {
+        let mut rng = Rng::new(3);
+        let mut t = Tree::default();
+        t.reset_with(&g, 0, &legal_of_g(&g), &TreeOpts { belief_mix: mix, ..TreeOpts::default() }, particles, &mut rng);
+        let mut seen: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+        let mut n = 0;
+        for _ in 0..400 {
+            let mut w = g.clone();
+            t.determinize_root(&mut w, &mut rng);
+            *seen.entry(w.chosen[1]).or_insert(0) += 1;
+            n += 1;
+        }
+        (seen, n, t.belief().to_vec(), t.belief_worlds)
+    };
+    // every particle consistent (nothing observed yet): mix 1 = only particle hands
+    let (seen, _, kept, bw) = hands(1.0, &[0b00110, 0b00110, 0b11000]);
+    assert_eq!(kept.len(), 3);
+    assert!(seen.keys().all(|&h| h == 0b00110 || h == 0b11000) && bw == 400);
+    assert!(seen[&0b00110] > seen[&0b11000], "frequencies follow the particles' repeats");
+    // mix 0.5: about half the worlds; mix 0 or no particle: uniform
+    let (seen, n, _, bw) = hands(0.5, &[0b00110]);
+    assert!(bw > 150 && bw < 250 && seen.len() >= 5 && seen[&0b00110] >= bw as usize, "{bw} {n}");
+    let (seen, _, kept, bw) = hands(0.0, &[0b00110]);
+    assert!(kept.is_empty() && bw == 0 && seen.len() >= 8);
+    // inconsistent particles are dropped: seat 0 leads 3, seat 1 does not follow -> no 3
+    let mut h = g.clone();
+    let (mut k, mut l) = (Vec::new(), Vec::new());
+    transition(&mut h, 3, None, &mut k, &mut l).unwrap();
+    assert_eq!(h.excl[1], 0b01000);
+    assert!(!h.belief_consistent(0, 0b01001) && h.belief_consistent(0, 0b10001));
+    let mut t = Tree::default();
+    let mut rng = Rng::new(1);
+    let hl = legal_of_g(&h);
+    if h.to_move() == Some(0) {
+        t.reset_with(&h, 0, &hl, &TreeOpts { belief_mix: 1.0, ..TreeOpts::default() }, &[0b01001, 0b10001], &mut rng);
+        assert_eq!(t.belief(), &[0b10001]);
+    }
+}
+
+#[test]
+fn opponent_model_options_off_are_the_plain_search() {
+    // TreeOpts::default() with any particles = Tree::new: the same visits, bit for bit
+    for s in 0..6 {
+        let g = mid_game(s, 12 + s as usize);
+        if g.over {
+            continue;
+        }
+        let p = g.to_move().unwrap();
+        let mut r1 = Rng::new(s);
+        let mut a = Tree::new(&g, p, &legal_of(&g), true, &mut r1);
+        search(&mut a, &g, 300, &mut r1, &W);
+        let mut r2 = Rng::new(s);
+        let mut b = Tree::default();
+        b.reset_with(&g, p, &legal_of(&g), &TreeOpts::default(), &[1, 2, 3], &mut r2);
+        search(&mut b, &g, 300, &mut r2, &W);
+        assert_eq!(a.visits(a.root), b.visits(b.root));
+        assert_eq!(a.n_nodes(), b.n_nodes());
+    }
+}
