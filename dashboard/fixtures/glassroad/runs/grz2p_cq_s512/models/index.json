@@ -1,0 +1,15 @@
+{
+ "anchor": "ext:jsbot=1000",
+ "best": null,
+ "references": {
+  "ext:jsbot": {
+   "elo": 1000.0,
+   "se": 0.0
+  },
+  "random": {
+   "elo": -135.3,
+   "se": 40.9
+  }
+ },
+ "checkpoints": []
+}

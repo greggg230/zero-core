@@ -1,0 +1,400 @@
+05:53:06 iter 21 elo 2279 ±201; best iter_0011.pt 2308
+06:33:57 iter 22 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169219, 'decisions_per_game': 169.85375, 'rounds': 6.6755, 'avg_score': 111.13175, 'seconds': 2450.1978380680084, 'device': 'cpu'}
+06:34:16 iter 22 train: {'policy': 1.4534896314144137, 'value': 0.2739055596292018, 'score': 0.08739730361849066, 'entropy': 1.4537254351377487, 'steps': 992, 'window_samples': 1345871, 'seconds': 13.853454113006592, 'lr': 0.00025, 'device': 'cuda'}
+06:37:11 iter 22 vs shrewd (sims 64): {'win': 0.99, 'se': 0.007, 'margin': 71.32, 'games': 200, 'score': 198.0}
+06:45:44 iter 22 vs reference runs/az4/models/iter_0035.pt: {'win': 0.485, 'se': 0.025, 'margin': -0.39, 'games': 400, 'score': 194.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+06:54:02 elo match iter_0022 vs iter_0021: 104.0/200
+06:54:02 elo match iter_0022 vs iter_0020: 96.0/200
+06:54:02 elo match iter_0022 vs iter_0018: 95.0/200
+06:54:02 elo match iter_0022 vs iter_0014: 102.0/200
+06:54:02 elo match iter_0022 vs iter_0006: 99.0/200
+06:54:03 iter 22 elo 2198 ±156; best iter_0011.pt 2219
+07:36:56 iter 23 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 168172, 'decisions_per_game': 168.149, 'rounds': 6.62625, 'avg_score': 107.849, 'seconds': 2572.6301505565643, 'device': 'cpu'}
+07:37:22 iter 23 train: {'policy': 1.4537518703937524, 'value': 0.2749599218368531, 'score': 0.08723376803100115, 'entropy': 1.4537907105684291, 'steps': 986, 'window_samples': 1345245, 'seconds': 19.357980966567993, 'lr': 0.00025, 'device': 'cuda'}
+07:40:27 iter 23 vs shrewd (sims 64): {'win': 0.995, 'se': 0.005, 'margin': 66.53, 'games': 200, 'score': 199.0}
+07:51:21 iter 23 vs reference runs/az4/models/iter_0035.pt: {'win': 0.49, 'se': 0.025, 'margin': -0.74, 'games': 400, 'score': 196.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+08:00:38 elo match iter_0023 vs iter_0022: 103.0/200
+08:00:38 elo match iter_0023 vs iter_0021: 102.0/200
+08:00:38 elo match iter_0023 vs iter_0019: 97.0/200
+08:00:38 elo match iter_0023 vs iter_0015: 87.0/200
+08:00:38 elo match iter_0023 vs iter_0007: 103.0/200
+08:00:40 iter 23 elo 2163 ±142; best iter_0011.pt 2191
+08:37:03 iter 24 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 167092, 'decisions_per_game': 167.2625, 'rounds': 6.6565, 'avg_score': 109.100125, 'seconds': 2182.6636583805084, 'device': 'cpu'}
+08:39:23 iter 24 train: {'policy': 1.4543555909395216, 'value': 0.2741459086537361, 'score': 0.08667605262249707, 'entropy': 1.455479525327683, 'steps': 980, 'window_samples': 1342945, 'seconds': 123.08019137382507, 'lr': 0.00025, 'device': 'cuda'}
+08:42:24 iter 24 vs shrewd (sims 64): {'win': 0.995, 'se': 0.005, 'margin': 72.93, 'games': 200, 'score': 199.0}
+08:52:38 iter 24 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4725, 'se': 0.025, 'margin': -1.28, 'games': 400, 'score': 189.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+09:02:45 elo match iter_0024 vs iter_0023: 100.5/200
+09:02:45 elo match iter_0024 vs iter_0022: 98.0/200
+09:02:45 elo match iter_0024 vs iter_0020: 99.0/200
+09:02:45 elo match iter_0024 vs iter_0016: 95.0/200
+09:02:45 elo match iter_0024 vs iter_0008: 95.0/200
+09:02:48 iter 24 elo 2139 ±131; best iter_0011.pt 2168
+10:25:10 iter 25 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 168544, 'decisions_per_game': 168.5615, 'rounds': 6.6405, 'avg_score': 109.072125, 'seconds': 4941.980038166046, 'device': 'cpu'}
+10:25:57 iter 25 train: {'policy': 1.4518592524528506, 'value': 0.27483876734972, 'score': 0.08563068483024834, 'entropy': 1.4521187233924875, 'steps': 988, 'window_samples': 1343264, 'seconds': 29.604376792907715, 'lr': 0.00025, 'device': 'cuda'}
+10:31:39 iter 25 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 67.47, 'games': 200, 'score': 200.0}
+10:47:01 iter 25 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4725, 'se': 0.025, 'margin': -1.5, 'games': 400, 'score': 189.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+11:02:12 elo match iter_0025 vs iter_0024: 105.0/200
+11:02:12 elo match iter_0025 vs iter_0023: 105.0/200
+11:02:12 elo match iter_0025 vs iter_0021: 98.0/200
+11:02:12 elo match iter_0025 vs iter_0017: 95.0/200
+11:02:12 elo match iter_0025 vs iter_0009: 101.0/200
+11:02:15 iter 25 elo 2149 ±130; best iter_0011.pt 2172
+12:12:05 iter 26 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 170885, 'decisions_per_game': 170.5365, 'rounds': 6.70825, 'avg_score': 112.202625, 'seconds': 4189.461732387543, 'device': 'cpu'}
+12:12:49 iter 26 train: {'policy': 1.45297092139721, 'value': 0.2717091675102711, 'score': 0.0858138579875231, 'entropy': 1.4533358687162394, 'steps': 1002, 'window_samples': 1345553, 'seconds': 26.72231888771057, 'lr': 0.00025, 'device': 'cuda'}
+12:17:22 iter 26 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 69.91, 'games': 200, 'score': 200.0}
+12:30:33 iter 26 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5088, 'se': 0.025, 'margin': -0.28, 'games': 400, 'score': 203.5, 'ref': 'runs/az4/models/iter_0035.pt'}
+12:42:48 elo match iter_0026 vs iter_0025: 100.0/200
+12:42:48 elo match iter_0026 vs iter_0024: 101.5/200
+12:42:48 elo match iter_0026 vs iter_0022: 94.0/200
+12:42:48 elo match iter_0026 vs iter_0018: 99.0/200
+12:42:48 elo match iter_0026 vs iter_0010: 99.5/200
+12:42:52 iter 26 elo 2153 ±129; best iter_0011.pt 2176
+13:32:54 iter 27 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 167473, 'decisions_per_game': 167.5905, 'rounds': 6.61275, 'avg_score': 107.35425, 'seconds': 3002.032696723938, 'device': 'cpu'}
+13:33:13 iter 27 train: {'policy': 1.4558847093582157, 'value': 0.2716228140890598, 'score': 0.08738254763185982, 'entropy': 1.4562385511398324, 'steps': 982, 'window_samples': 1345366, 'seconds': 10.010831832885742, 'lr': 0.00025, 'device': 'cuda'}
+13:37:04 iter 27 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 68.92, 'games': 200, 'score': 200.0}
+13:47:07 iter 27 vs reference runs/az4/models/iter_0035.pt: {'win': 0.49, 'se': 0.025, 'margin': -0.29, 'games': 400, 'score': 196.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+13:55:13 elo match iter_0027 vs iter_0026: 96.0/200
+13:55:13 elo match iter_0027 vs iter_0025: 99.0/200
+13:55:13 elo match iter_0027 vs iter_0023: 82.5/200
+13:55:13 elo match iter_0027 vs iter_0019: 99.0/200
+13:55:13 elo match iter_0027 vs iter_0011: 107.5/200
+13:55:15 iter 27 elo 2152 ±127; best iter_0005.pt 2176
+14:38:51 iter 28 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 167856, 'decisions_per_game': 168.2955, 'rounds': 6.61325, 'avg_score': 107.193375, 'seconds': 2616.2729754447937, 'device': 'cpu'}
+14:39:09 iter 28 train: {'policy': 1.455202744007111, 'value': 0.26990665227174776, 'score': 0.08524534814059735, 'entropy': 1.4557376080751425, 'steps': 984, 'window_samples': 1345135, 'seconds': 11.233949899673462, 'lr': 0.00025, 'device': 'cuda'}
+14:42:06 iter 28 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 68.61, 'games': 200, 'score': 200.0}
+14:50:11 iter 28 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5075, 'se': 0.025, 'margin': -0.04, 'games': 400, 'score': 203.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+14:58:56 elo match iter_0028 vs iter_0027: 116.0/200
+14:58:56 elo match iter_0028 vs iter_0026: 101.0/200
+14:58:56 elo match iter_0028 vs iter_0024: 92.0/200
+14:58:56 elo match iter_0028 vs iter_0020: 99.5/200
+14:58:56 elo match iter_0028 vs iter_0012: 95.0/200
+14:58:58 iter 28 elo 2164 ±126; best iter_0005.pt 2180
+15:39:50 iter 29 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 170448, 'decisions_per_game': 170.96075, 'rounds': 6.71375, 'avg_score': 112.958875, 'seconds': 2452.544730901718, 'device': 'cpu'}
+15:40:02 iter 29 train: {'policy': 1.4551189291477198, 'value': 0.269570662304759, 'score': 0.08577096682041888, 'entropy': 1.4554479837417602, 'steps': 999, 'window_samples': 1349689, 'seconds': 7.392221927642822, 'lr': 0.00025, 'device': 'cuda'}
+15:42:32 iter 29 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 71.36, 'games': 200, 'score': 200.0}
+15:52:44 iter 29 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4925, 'se': 0.025, 'margin': -0.6, 'games': 400, 'score': 197.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+16:01:55 elo match iter_0029 vs iter_0028: 83.0/200
+16:01:55 elo match iter_0029 vs iter_0027: 104.0/200
+16:01:55 elo match iter_0029 vs iter_0025: 103.0/200
+16:01:55 elo match iter_0029 vs iter_0021: 106.5/200
+16:01:55 elo match iter_0029 vs iter_0013: 110.0/200
+16:01:57 iter 29 elo 2167 ±125; best iter_0005.pt 2182
+16:41:51 iter 30 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169574, 'decisions_per_game': 169.75275, 'rounds': 6.6805, 'avg_score': 111.602125, 'seconds': 2393.888363599777, 'device': 'cpu'}
+16:42:04 iter 30 train: {'policy': 1.4516174340248105, 'value': 0.2688845697790383, 'score': 0.08124891405925155, 'entropy': 1.4523219144344326, 'steps': 994, 'window_samples': 1350044, 'seconds': 8.548556327819824, 'lr': 0.000125, 'device': 'cuda'}
+16:44:35 iter 30 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 69.82, 'games': 200, 'score': 200.0}
+16:52:32 iter 30 vs reference runs/az4/models/iter_0035.pt: {'win': 0.475, 'se': 0.025, 'margin': 0.02, 'games': 400, 'score': 190.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+16:59:18 elo match iter_0030 vs iter_0029: 98.0/200
+16:59:18 elo match iter_0030 vs iter_0028: 96.0/200
+16:59:18 elo match iter_0030 vs iter_0026: 90.5/200
+16:59:18 elo match iter_0030 vs iter_0022: 92.0/200
+16:59:18 elo match iter_0030 vs iter_0014: 88.0/200
+16:59:20 iter 30 elo 2150 ±124; best iter_0005.pt 2185
+17:36:41 iter 31 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 168729, 'decisions_per_game': 168.928, 'rounds': 6.629, 'avg_score': 108.6975, 'seconds': 2241.666520833969, 'device': 'cpu'}
+17:36:57 iter 31 train: {'policy': 1.4496830695867542, 'value': 0.2699263820052146, 'score': 0.08216403737664231, 'entropy': 1.4503521156311039, 'steps': 989, 'window_samples': 1350601, 'seconds': 8.618987798690796, 'lr': 0.000125, 'device': 'cuda'}
+17:39:37 iter 31 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 73.15, 'games': 200, 'score': 200.0}
+17:47:43 iter 31 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4975, 'se': 0.025, 'margin': -0.27, 'games': 400, 'score': 199.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+17:54:36 elo match iter_0031 vs iter_0030: 90.0/200
+17:54:36 elo match iter_0031 vs iter_0029: 88.0/200
+17:54:36 elo match iter_0031 vs iter_0027: 88.0/200
+17:54:36 elo match iter_0031 vs iter_0023: 88.0/200
+17:54:36 elo match iter_0031 vs iter_0015: 96.0/200
+17:54:38 iter 31 elo 2130 ±123; best iter_0010.pt 2190
+18:33:21 iter 32 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169469, 'decisions_per_game': 169.45975, 'rounds': 6.67025, 'avg_score': 111.184375, 'seconds': 2323.0792791843414, 'device': 'cpu'}
+18:33:40 iter 32 train: {'policy': 1.4493522351980213, 'value': 0.2714493459463119, 'score': 0.08310638224706055, 'entropy': 1.4504803538322444, 'steps': 993, 'window_samples': 1352978, 'seconds': 9.117562770843506, 'lr': 0.000125, 'device': 'cuda'}
+18:36:27 iter 32 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 69.25, 'games': 200, 'score': 200.0}
+18:44:36 iter 32 vs reference runs/az4/models/iter_0035.pt: {'win': 0.445, 'se': 0.0248, 'margin': -1.46, 'games': 400, 'score': 178.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+18:52:20 elo match iter_0032 vs iter_0031: 97.0/200
+18:52:20 elo match iter_0032 vs iter_0030: 98.0/200
+18:52:20 elo match iter_0032 vs iter_0028: 99.5/200
+18:52:20 elo match iter_0032 vs iter_0024: 100.0/200
+18:52:20 elo match iter_0032 vs iter_0016: 100.0/200
+18:52:20 elo match iter_0032 vs iter_0000: 97.0/200
+18:52:22 iter 32 elo 2165 ±122; best iter_0010.pt 2192
+19:31:35 iter 33 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169923, 'decisions_per_game': 169.28675, 'rounds': 6.651, 'avg_score': 109.539625, 'seconds': 2353.630809545517, 'device': 'cpu'}
+19:31:51 iter 33 train: {'policy': 1.4505281788110735, 'value': 0.2729944446682928, 'score': 0.08360100574791433, 'entropy': 1.4513074207305907, 'steps': 996, 'window_samples': 1354357, 'seconds': 9.61669373512268, 'lr': 0.000125, 'device': 'cuda'}
+19:34:35 iter 33 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 73.44, 'games': 200, 'score': 200.0}
+19:43:25 iter 33 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5, 'se': 0.025, 'margin': -0.95, 'games': 400, 'score': 200.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+19:52:00 elo match iter_0033 vs iter_0032: 84.0/200
+19:52:00 elo match iter_0033 vs iter_0031: 100.0/200
+19:52:00 elo match iter_0033 vs iter_0029: 91.0/200
+19:52:00 elo match iter_0033 vs iter_0025: 93.0/200
+19:52:00 elo match iter_0033 vs iter_0017: 104.5/200
+19:52:00 elo match iter_0033 vs iter_0001: 98.0/200
+19:52:01 iter 33 elo 2157 ±121; best iter_0010.pt 2195
+20:35:13 iter 34 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169838, 'decisions_per_game': 169.99675, 'rounds': 6.68575, 'avg_score': 111.891625, 'seconds': 2591.1870057582855, 'device': 'cpu'}
+20:35:32 iter 34 train: {'policy': 1.4478634721040724, 'value': 0.27286144040524957, 'score': 0.08417243689298629, 'entropy': 1.4490193182229993, 'steps': 996, 'window_samples': 1353310, 'seconds': 12.716706037521362, 'lr': 0.000125, 'device': 'cuda'}
+20:38:48 iter 34 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 69.53, 'games': 200, 'score': 200.0}
+20:48:40 iter 34 vs reference runs/az4/models/iter_0035.pt: {'win': 0.47, 'se': 0.025, 'margin': -1.23, 'games': 400, 'score': 188.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+20:58:14 elo match iter_0034 vs iter_0033: 90.0/200
+20:58:14 elo match iter_0034 vs iter_0032: 110.0/200
+20:58:14 elo match iter_0034 vs iter_0030: 97.0/200
+20:58:14 elo match iter_0034 vs iter_0026: 93.0/200
+20:58:14 elo match iter_0034 vs iter_0018: 108.0/200
+20:58:14 elo match iter_0034 vs iter_0002: 99.0/200
+20:58:16 iter 34 elo 2175 ±120; best iter_0010.pt 2197
+21:43:57 iter 35 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169577, 'decisions_per_game': 169.77425, 'rounds': 6.69925, 'avg_score': 111.787875, 'seconds': 2741.1359288692474, 'device': 'cpu'}
+21:44:16 iter 35 train: {'policy': 1.4498269516229634, 'value': 0.2764498385787009, 'score': 0.0844831732660532, 'entropy': 1.450944494605064, 'steps': 994, 'window_samples': 1355414, 'seconds': 12.205560445785522, 'lr': 0.000125, 'device': 'cuda'}
+21:47:24 iter 35 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 63.64, 'games': 200, 'score': 200.0}
+21:57:38 iter 35 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5225, 'se': 0.025, 'margin': 0.01, 'games': 400, 'score': 209.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+22:07:23 elo match iter_0035 vs iter_0034: 107.5/200
+22:07:23 elo match iter_0035 vs iter_0033: 115.0/200
+22:07:23 elo match iter_0035 vs iter_0031: 100.0/200
+22:07:23 elo match iter_0035 vs iter_0027: 99.0/200
+22:07:23 elo match iter_0035 vs iter_0019: 90.0/200
+22:07:23 elo match iter_0035 vs iter_0003: 98.0/200
+22:07:25 iter 35 elo 2183 ±119; best iter_0010.pt 2200
+22:50:59 iter 36 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 171409, 'decisions_per_game': 170.9475, 'rounds': 6.70025, 'avg_score': 112.58825, 'seconds': 2614.319284439087, 'device': 'cpu'}
+22:51:14 iter 36 train: {'policy': 1.449842863082885, 'value': 0.2759768874943257, 'score': 0.08505222257226709, 'entropy': 1.4500583183765416, 'steps': 1005, 'window_samples': 1358967, 'seconds': 9.24311876296997, 'lr': 0.000125, 'device': 'cuda'}
+22:53:55 iter 36 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 69.25, 'games': 200, 'score': 200.0}
+23:02:53 iter 36 vs reference runs/az4/models/iter_0035.pt: {'win': 0.435, 'se': 0.0248, 'margin': -1.86, 'games': 400, 'score': 174.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+23:12:05 elo match iter_0036 vs iter_0035: 99.0/200
+23:12:05 elo match iter_0036 vs iter_0034: 111.5/200
+23:12:05 elo match iter_0036 vs iter_0032: 98.0/200
+23:12:05 elo match iter_0036 vs iter_0028: 105.0/200
+23:12:05 elo match iter_0036 vs iter_0020: 97.0/200
+23:12:05 elo match iter_0036 vs iter_0004: 104.0/200
+23:12:08 iter 36 elo 2197 ±118; best iter_0010.pt 2201
+23:54:21 iter 37 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169768, 'decisions_per_game': 170.29075, 'rounds': 6.68575, 'avg_score': 111.447875, 'seconds': 2533.4274456501007, 'device': 'cpu'}
+23:55:22 iter 37 train: {'policy': 1.4533333212137218, 'value': 0.27536389254033566, 'score': 0.08384012598544359, 'entropy': 1.454148750305175, 'steps': 995, 'window_samples': 1358287, 'seconds': 44.4919536113739, 'lr': 0.000125, 'device': 'cuda'}
+23:58:37 iter 37 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 65.13, 'games': 200, 'score': 200.0}
+00:09:38 iter 37 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4988, 'se': 0.025, 'margin': -0.11, 'games': 400, 'score': 199.5, 'ref': 'runs/az4/models/iter_0035.pt'}
+00:20:41 elo match iter_0037 vs iter_0036: 94.5/200
+00:20:41 elo match iter_0037 vs iter_0035: 100.0/200
+00:20:41 elo match iter_0037 vs iter_0033: 111.5/200
+00:20:41 elo match iter_0037 vs iter_0029: 104.0/200
+00:20:41 elo match iter_0037 vs iter_0021: 111.0/200
+00:20:41 elo match iter_0037 vs iter_0005: 95.5/200
+00:20:46 iter 37 elo 2198 ±118; best iter_0005.pt 2204
+01:09:46 iter 38 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 170268, 'decisions_per_game': 170.09475, 'rounds': 6.6955, 'avg_score': 111.76525, 'seconds': 2939.8799154758453, 'device': 'cpu'}
+01:10:09 iter 38 train: {'policy': 1.4524808430671683, 'value': 0.27495639309287073, 'score': 0.08532077662646771, 'entropy': 1.4534104073047642, 'steps': 998, 'window_samples': 1358981, 'seconds': 14.817293643951416, 'lr': 0.000125, 'device': 'cuda'}
+01:13:34 iter 38 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 58.73, 'games': 200, 'score': 200.0}
+01:24:22 iter 38 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4713, 'se': 0.025, 'margin': -0.75, 'games': 400, 'score': 188.5, 'ref': 'runs/az4/models/iter_0035.pt'}
+01:36:25 elo match iter_0038 vs iter_0037: 93.0/200
+01:36:25 elo match iter_0038 vs iter_0036: 105.0/200
+01:36:25 elo match iter_0038 vs iter_0034: 94.0/200
+01:36:25 elo match iter_0038 vs iter_0030: 93.5/200
+01:36:25 elo match iter_0038 vs iter_0022: 85.5/200
+01:36:25 elo match iter_0038 vs iter_0006: 108.0/200
+01:36:28 iter 38 elo 2180 ±117; best iter_0005.pt 2206
+02:20:42 iter 39 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 171588, 'decisions_per_game': 171.58225, 'rounds': 6.72525, 'avg_score': 114.14925, 'seconds': 2653.704708814621, 'device': 'cpu'}
+02:20:57 iter 39 train: {'policy': 1.4501081991195672, 'value': 0.2754803228378298, 'score': 0.08418803937733174, 'entropy': 1.4512297630310065, 'steps': 1006, 'window_samples': 1361840, 'seconds': 7.652639150619507, 'lr': 0.000125, 'device': 'cuda'}
+02:23:37 iter 39 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 70.35, 'games': 200, 'score': 200.0}
+02:32:18 iter 39 vs reference runs/az4/models/iter_0035.pt: {'win': 0.465, 'se': 0.0249, 'margin': -1.5, 'games': 400, 'score': 186.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+02:42:17 elo match iter_0039 vs iter_0038: 99.0/200
+02:42:17 elo match iter_0039 vs iter_0037: 101.5/200
+02:42:17 elo match iter_0039 vs iter_0035: 90.0/200
+02:42:17 elo match iter_0039 vs iter_0031: 100.0/200
+02:42:17 elo match iter_0039 vs iter_0023: 101.0/200
+02:42:17 elo match iter_0039 vs iter_0007: 91.5/200
+02:42:20 iter 39 elo 2181 ±116; best iter_0010.pt 2208
+03:25:39 iter 40 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 170289, 'decisions_per_game': 170.628, 'rounds': 6.65575, 'avg_score': 111.187375, 'seconds': 2599.1094875335693, 'device': 'cpu'}
+03:26:02 iter 40 train: {'policy': 1.4513007473945612, 'value': 0.2752747085690498, 'score': 0.08327641710639001, 'entropy': 1.4516077703237522, 'steps': 998, 'window_samples': 1362660, 'seconds': 14.471778154373169, 'lr': 0.000125, 'device': 'cuda'}
+03:29:02 iter 40 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 61.31, 'games': 200, 'score': 200.0}
+03:38:09 iter 40 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5025, 'se': 0.025, 'margin': 0.92, 'games': 400, 'score': 201.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+03:48:18 elo match iter_0040 vs iter_0039: 83.0/200
+03:48:18 elo match iter_0040 vs iter_0038: 98.0/200
+03:48:18 elo match iter_0040 vs iter_0036: 109.0/200
+03:48:18 elo match iter_0040 vs iter_0032: 99.5/200
+03:48:18 elo match iter_0040 vs iter_0024: 104.0/200
+03:48:18 elo match iter_0040 vs iter_0008: 86.0/200
+03:48:21 iter 40 elo 2182 ±115; best iter_0005.pt 2210
+04:32:00 iter 41 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 170269, 'decisions_per_game': 169.8235, 'rounds': 6.67725, 'avg_score': 111.52025, 'seconds': 2618.984867811203, 'device': 'cpu'}
+04:32:13 iter 41 train: {'policy': 1.4491887402534476, 'value': 0.2758388115465643, 'score': 0.08371381994336848, 'entropy': 1.4500952583551399, 'steps': 998, 'window_samples': 1363006, 'seconds': 7.738672494888306, 'lr': 0.000125, 'device': 'cuda'}
+04:34:19 iter 41 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 61.7, 'games': 200, 'score': 200.0}
+04:43:30 iter 41 vs reference runs/az4/models/iter_0035.pt: {'win': 0.515, 'se': 0.025, 'margin': 0.43, 'games': 400, 'score': 206.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+04:53:09 elo match iter_0041 vs iter_0040: 112.5/200
+04:53:09 elo match iter_0041 vs iter_0039: 88.0/200
+04:53:09 elo match iter_0041 vs iter_0037: 99.0/200
+04:53:09 elo match iter_0041 vs iter_0033: 101.0/200
+04:53:09 elo match iter_0041 vs iter_0025: 107.0/200
+04:53:09 elo match iter_0041 vs iter_0009: 91.0/200
+04:53:12 iter 41 elo 2190 ±114; best iter_0005.pt 2213
+05:36:47 iter 42 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169435, 'decisions_per_game': 169.963, 'rounds': 6.6615, 'avg_score': 110.744625, 'seconds': 2615.3390061855316, 'device': 'cpu'}
+05:37:01 iter 42 train: {'policy': 1.4509142345190047, 'value': 0.2760039734840393, 'score': 0.08181941282004118, 'entropy': 1.4514610147476192, 'steps': 993, 'window_samples': 1362603, 'seconds': 7.8702075481414795, 'lr': 0.000125, 'device': 'cuda'}
+05:39:48 iter 42 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 72.56, 'games': 200, 'score': 200.0}
+05:49:05 iter 42 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5162, 'se': 0.025, 'margin': 0.34, 'games': 400, 'score': 206.5, 'ref': 'runs/az4/models/iter_0035.pt'}
+05:59:08 elo match iter_0042 vs iter_0041: 93.0/200
+05:59:08 elo match iter_0042 vs iter_0040: 98.0/200
+05:59:08 elo match iter_0042 vs iter_0038: 102.0/200
+05:59:08 elo match iter_0042 vs iter_0034: 96.0/200
+05:59:08 elo match iter_0042 vs iter_0026: 100.0/200
+05:59:08 elo match iter_0042 vs iter_0010: 94.0/200
+05:59:12 iter 42 elo 2185 ±113; best iter_0005.pt 2215
+06:42:13 iter 43 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 171432, 'decisions_per_game': 171.33175, 'rounds': 6.68975, 'avg_score': 113.12, 'seconds': 2581.5895919799805, 'device': 'cpu'}
+06:42:47 iter 43 train: {'policy': 1.4485837823152539, 'value': 0.2769887597858905, 'score': 0.08060786478221417, 'entropy': 1.4493946307897572, 'steps': 1005, 'window_samples': 1364458, 'seconds': 27.885258674621582, 'lr': 0.000125, 'device': 'cuda'}
+06:45:31 iter 43 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 67.11, 'games': 200, 'score': 200.0}
+06:54:30 iter 43 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5262, 'se': 0.025, 'margin': 0.93, 'games': 400, 'score': 210.5, 'ref': 'runs/az4/models/iter_0035.pt'}
+07:04:30 elo match iter_0043 vs iter_0042: 93.0/200
+07:04:30 elo match iter_0043 vs iter_0041: 101.0/200
+07:04:30 elo match iter_0043 vs iter_0039: 106.0/200
+07:04:30 elo match iter_0043 vs iter_0035: 115.0/200
+07:04:30 elo match iter_0043 vs iter_0027: 94.0/200
+07:04:30 elo match iter_0043 vs iter_0011: 102.0/200
+07:04:33 iter 43 elo 2207 ±113; best iter_0005.pt 2216
+07:48:01 iter 44 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 171173, 'decisions_per_game': 171.06225, 'rounds': 6.69125, 'avg_score': 112.01, 'seconds': 2608.184309720993, 'device': 'cpu'}
+07:48:27 iter 44 train: {'policy': 1.4498394662141805, 'value': 0.2774040910601616, 'score': 0.0821858072280884, 'entropy': 1.4503120982646942, 'steps': 1003, 'window_samples': 1364222, 'seconds': 16.473763465881348, 'lr': 0.000125, 'device': 'cuda'}
+07:51:32 iter 44 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 62.82, 'games': 200, 'score': 200.0}
+08:00:59 iter 44 vs reference runs/az4/models/iter_0035.pt: {'win': 0.505, 'se': 0.025, 'margin': -0.09, 'games': 400, 'score': 202.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+08:10:29 elo match iter_0044 vs iter_0043: 98.5/200
+08:10:29 elo match iter_0044 vs iter_0042: 87.0/200
+08:10:29 elo match iter_0044 vs iter_0040: 107.0/200
+08:10:29 elo match iter_0044 vs iter_0036: 95.0/200
+08:10:29 elo match iter_0044 vs iter_0028: 95.0/200
+08:10:29 elo match iter_0044 vs iter_0012: 98.0/200
+08:10:32 iter 44 elo 2192 ±112; best iter_0010.pt 2218
+08:55:06 iter 45 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169311, 'decisions_per_game': 169.851, 'rounds': 6.68075, 'avg_score': 112.37125, 'seconds': 2674.231784105301, 'device': 'cpu'}
+08:55:30 iter 45 train: {'policy': 1.4439092189073568, 'value': 0.2789132992923261, 'score': 0.08175131648778919, 'entropy': 1.444722684025764, 'steps': 993, 'window_samples': 1363765, 'seconds': 15.19578742980957, 'lr': 0.000125, 'device': 'cuda'}
+08:57:48 iter 45 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 67.31, 'games': 200, 'score': 200.0}
+09:06:42 iter 45 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4925, 'se': 0.025, 'margin': -0.37, 'games': 400, 'score': 197.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+09:15:53 elo match iter_0045 vs iter_0044: 103.5/200
+09:15:53 elo match iter_0045 vs iter_0043: 92.0/200
+09:15:53 elo match iter_0045 vs iter_0041: 112.0/200
+09:15:53 elo match iter_0045 vs iter_0037: 110.0/200
+09:15:53 elo match iter_0045 vs iter_0029: 103.0/200
+09:15:53 elo match iter_0045 vs iter_0013: 105.0/200
+09:15:56 iter 45 elo 2219 ±111; best iter_0010.pt 2219
+09:53:04 iter 46 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169716, 'decisions_per_game': 169.7505, 'rounds': 6.66625, 'avg_score': 111.4855, 'seconds': 2227.705983877182, 'device': 'cpu'}
+09:53:21 iter 46 train: {'policy': 1.4454784166812895, 'value': 0.2806373466551304, 'score': 0.081755313295871, 'entropy': 1.4462816548347472, 'steps': 995, 'window_samples': 1363213, 'seconds': 9.020662307739258, 'lr': 0.000125, 'device': 'cuda'}
+09:55:46 iter 46 vs shrewd (sims 64): {'win': 0.995, 'se': 0.005, 'margin': 74.11, 'games': 200, 'score': 199.0}
+10:03:56 iter 46 vs reference runs/az4/models/iter_0035.pt: {'win': 0.45, 'se': 0.0249, 'margin': -2.29, 'games': 400, 'score': 180.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+10:12:17 elo match iter_0046 vs iter_0045: 96.0/200
+10:12:17 elo match iter_0046 vs iter_0044: 99.0/200
+10:12:17 elo match iter_0046 vs iter_0042: 95.0/200
+10:12:17 elo match iter_0046 vs iter_0038: 104.0/200
+10:12:17 elo match iter_0046 vs iter_0030: 98.5/200
+10:12:17 elo match iter_0046 vs iter_0014: 103.0/200
+10:12:20 iter 46 elo 2185 ±106; best iter_0010.pt 2204
+10:48:00 iter 47 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 170533, 'decisions_per_game': 170.432, 'rounds': 6.6635, 'avg_score': 110.87575, 'seconds': 2139.885864019394, 'device': 'cpu'}
+10:48:14 iter 47 train: {'policy': 1.444428750872611, 'value': 0.279580974727869, 'score': 0.08189817283302545, 'entropy': 1.445318080186844, 'steps': 1000, 'window_samples': 1362158, 'seconds': 7.295880079269409, 'lr': 0.000125, 'device': 'cuda'}
+10:50:13 iter 47 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 68.66, 'games': 200, 'score': 200.0}
+10:57:26 iter 47 vs reference runs/az4/models/iter_0035.pt: {'win': 0.495, 'se': 0.025, 'margin': -0.52, 'games': 400, 'score': 198.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+11:06:11 elo match iter_0047 vs iter_0046: 100.0/200
+11:06:11 elo match iter_0047 vs iter_0045: 93.0/200
+11:06:11 elo match iter_0047 vs iter_0043: 103.5/200
+11:06:11 elo match iter_0047 vs iter_0039: 95.0/200
+11:06:11 elo match iter_0047 vs iter_0031: 97.0/200
+11:06:11 elo match iter_0047 vs iter_0015: 85.0/200
+11:06:14 iter 47 elo 2173 ±105; best iter_0010.pt 2206
+11:41:39 iter 48 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 171196, 'decisions_per_game': 171.8025, 'rounds': 6.708, 'avg_score': 113.612125, 'seconds': 2124.4090824127197, 'device': 'cpu'}
+11:41:57 iter 48 train: {'policy': 1.4454341566562652, 'value': 0.27632997721433655, 'score': 0.0821755889803171, 'entropy': 1.446219747662544, 'steps': 1004, 'window_samples': 1363065, 'seconds': 9.349281787872314, 'lr': 0.000125, 'device': 'cuda'}
+11:44:34 iter 48 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 68.06, 'games': 200, 'score': 200.0}
+11:51:56 iter 48 vs reference runs/az4/models/iter_0035.pt: {'win': 0.47, 'se': 0.025, 'margin': 0.62, 'games': 400, 'score': 188.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+12:00:06 elo match iter_0048 vs iter_0047: 106.5/200
+12:00:06 elo match iter_0048 vs iter_0046: 94.0/200
+12:00:06 elo match iter_0048 vs iter_0044: 95.0/200
+12:00:06 elo match iter_0048 vs iter_0040: 100.0/200
+12:00:06 elo match iter_0048 vs iter_0032: 100.5/200
+12:00:06 elo match iter_0048 vs iter_0016: 93.0/200
+12:00:09 iter 48 elo 2177 ±105; best iter_0010.pt 2208
+12:43:09 iter 49 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169533, 'decisions_per_game': 169.654, 'rounds': 6.6435, 'avg_score': 110.174125, 'seconds': 2579.6722807884216, 'device': 'cpu'}
+12:43:32 iter 49 train: {'policy': 1.4466251146793367, 'value': 0.2778631055355074, 'score': 0.08263726010918616, 'entropy': 1.4474161815643316, 'steps': 994, 'window_samples': 1362329, 'seconds': 12.258607149124146, 'lr': 0.000125, 'device': 'cuda'}
+12:46:17 iter 49 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 65.33, 'games': 200, 'score': 200.0}
+12:56:52 iter 49 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5, 'se': 0.025, 'margin': -0.94, 'games': 400, 'score': 200.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+13:07:28 elo match iter_0049 vs iter_0048: 109.5/200
+13:07:28 elo match iter_0049 vs iter_0047: 109.0/200
+13:07:28 elo match iter_0049 vs iter_0045: 91.0/200
+13:07:28 elo match iter_0049 vs iter_0041: 90.5/200
+13:07:28 elo match iter_0049 vs iter_0033: 96.0/200
+13:07:28 elo match iter_0049 vs iter_0017: 98.0/200
+13:07:32 iter 49 elo 2182 ±104; best iter_0010.pt 2210
+13:54:21 iter 50 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 170386, 'decisions_per_game': 170.59075, 'rounds': 6.6845, 'avg_score': 112.48775, 'seconds': 2809.0719945430756, 'device': 'cpu'}
+13:54:47 iter 50 train: {'policy': 1.4468490517139438, 'value': 0.2780485920608044, 'score': 0.08121386690065263, 'entropy': 1.4472207003831863, 'steps': 999, 'window_samples': 1363280, 'seconds': 17.12638807296753, 'lr': 0.000125, 'device': 'cuda'}
+13:58:34 iter 50 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 68.36, 'games': 200, 'score': 200.0}
+14:09:09 iter 50 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4725, 'se': 0.025, 'margin': -1.09, 'games': 400, 'score': 189.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+14:19:36 elo match iter_0050 vs iter_0049: 98.0/200
+14:19:36 elo match iter_0050 vs iter_0048: 103.0/200
+14:19:36 elo match iter_0050 vs iter_0046: 96.0/200
+14:19:36 elo match iter_0050 vs iter_0042: 98.0/200
+14:19:36 elo match iter_0050 vs iter_0034: 99.0/200
+14:19:36 elo match iter_0050 vs iter_0018: 92.0/200
+14:19:40 iter 50 elo 2181 ±103; best iter_0010.pt 2212
+15:18:09 iter 51 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 170327, 'decisions_per_game': 170.6075, 'rounds': 6.67725, 'avg_score': 111.9585, 'seconds': 3508.79283118248, 'device': 'cpu'}
+15:18:40 iter 51 train: {'policy': 1.4439124518632895, 'value': 0.2780664624273777, 'score': 0.0818886609375477, 'entropy': 1.4444543719291687, 'steps': 999, 'window_samples': 1362175, 'seconds': 20.889629364013672, 'lr': 0.000125, 'device': 'cuda'}
+15:21:59 iter 51 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 65.78, 'games': 200, 'score': 200.0}
+15:32:39 iter 51 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4725, 'se': 0.025, 'margin': -1.51, 'games': 400, 'score': 189.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+15:43:14 elo match iter_0051 vs iter_0050: 92.0/200
+15:43:14 elo match iter_0051 vs iter_0049: 102.0/200
+15:43:14 elo match iter_0051 vs iter_0047: 107.0/200
+15:43:14 elo match iter_0051 vs iter_0043: 96.0/200
+15:43:14 elo match iter_0051 vs iter_0035: 97.0/200
+15:43:14 elo match iter_0051 vs iter_0019: 104.0/200
+15:43:18 iter 51 elo 2191 ±103; best iter_0010.pt 2214
+16:26:37 iter 52 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 170155, 'decisions_per_game': 170.74825, 'rounds': 6.6595, 'avg_score': 110.988375, 'seconds': 2598.992050409317, 'device': 'cpu'}
+16:27:01 iter 52 train: {'policy': 1.4455851072072978, 'value': 0.2761622931808233, 'score': 0.08058474533259867, 'entropy': 1.4458441144227976, 'steps': 998, 'window_samples': 1361157, 'seconds': 12.109970808029175, 'lr': 0.000125, 'device': 'cuda'}
+16:29:53 iter 52 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 67.82, 'games': 200, 'score': 200.0}
+16:39:42 iter 52 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4775, 'se': 0.025, 'margin': -0.74, 'games': 400, 'score': 191.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+16:49:34 elo match iter_0052 vs iter_0051: 102.0/200
+16:49:34 elo match iter_0052 vs iter_0050: 87.0/200
+16:49:34 elo match iter_0052 vs iter_0048: 107.0/200
+16:49:34 elo match iter_0052 vs iter_0044: 99.0/200
+16:49:34 elo match iter_0052 vs iter_0036: 99.0/200
+16:49:34 elo match iter_0052 vs iter_0020: 99.0/200
+16:49:37 iter 52 elo 2190 ±102; best iter_0010.pt 2215
+17:30:55 iter 53 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169916, 'decisions_per_game': 169.78225, 'rounds': 6.659, 'avg_score': 109.955875, 'seconds': 2478.374781847, 'device': 'cpu'}
+17:31:11 iter 53 train: {'policy': 1.4447309577465053, 'value': 0.27688748210668557, 'score': 0.08105037692934274, 'entropy': 1.4449560761451714, 'steps': 996, 'window_samples': 1361762, 'seconds': 10.109795331954956, 'lr': 0.000125, 'device': 'cuda'}
+17:33:32 iter 53 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 69.73, 'games': 200, 'score': 200.0}
+17:40:50 iter 53 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4375, 'se': 0.0248, 'margin': -1.4, 'games': 400, 'score': 175.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+17:49:28 elo match iter_0053 vs iter_0052: 91.0/200
+17:49:28 elo match iter_0053 vs iter_0051: 93.0/200
+17:49:28 elo match iter_0053 vs iter_0049: 97.0/200
+17:49:28 elo match iter_0053 vs iter_0045: 98.0/200
+17:49:28 elo match iter_0053 vs iter_0037: 101.0/200
+17:49:28 elo match iter_0053 vs iter_0021: 100.0/200
+17:49:30 iter 53 elo 2186 ±102; best iter_0010.pt 2217
+18:26:36 iter 54 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 171479, 'decisions_per_game': 171.024, 'rounds': 6.6815, 'avg_score': 111.873625, 'seconds': 2225.418213367462, 'device': 'cpu'}
+18:26:53 iter 54 train: {'policy': 1.4469279450178152, 'value': 0.2743608060479165, 'score': 0.08086765747517348, 'entropy': 1.4473654305934907, 'steps': 1005, 'window_samples': 1363525, 'seconds': 9.5237717628479, 'lr': 0.000125, 'device': 'cuda'}
+18:29:25 iter 54 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 66.08, 'games': 200, 'score': 200.0}
+18:36:55 iter 54 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5175, 'se': 0.025, 'margin': 0.3, 'games': 400, 'score': 207.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+18:45:31 elo match iter_0054 vs iter_0053: 106.0/200
+18:45:31 elo match iter_0054 vs iter_0052: 89.5/200
+18:45:31 elo match iter_0054 vs iter_0050: 107.0/200
+18:45:31 elo match iter_0054 vs iter_0046: 96.0/200
+18:45:31 elo match iter_0054 vs iter_0038: 97.0/200
+18:45:31 elo match iter_0054 vs iter_0022: 89.5/200
+18:45:34 iter 54 elo 2189 ±101; best iter_0010.pt 2218
+19:28:35 iter 55 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169829, 'decisions_per_game': 169.85325, 'rounds': 6.64525, 'avg_score': 109.52125, 'seconds': 2580.527100086212, 'device': 'cpu'}
+19:29:26 iter 55 train: {'policy': 1.4469975137710573, 'value': 0.2751039977371693, 'score': 0.08082977384328845, 'entropy': 1.447768447995185, 'steps': 996, 'window_samples': 1362821, 'seconds': 30.106360912322998, 'lr': 0.000125, 'device': 'cuda'}
+19:34:31 iter 55 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 71.81, 'games': 200, 'score': 200.0}
+19:51:05 iter 55 vs reference runs/az4/models/iter_0035.pt: {'win': 0.505, 'se': 0.025, 'margin': -0.06, 'games': 400, 'score': 202.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+20:12:08 elo match iter_0055 vs iter_0054: 100.0/200
+20:12:08 elo match iter_0055 vs iter_0053: 98.5/200
+20:12:08 elo match iter_0055 vs iter_0051: 97.0/200
+20:12:08 elo match iter_0055 vs iter_0047: 89.0/200
+20:12:08 elo match iter_0055 vs iter_0039: 97.0/200
+20:12:08 elo match iter_0055 vs iter_0023: 104.0/200
+20:12:14 iter 55 elo 2186 ±101; best iter_0010.pt 2220
+21:01:20 iter 56 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 172413, 'decisions_per_game': 172.134, 'rounds': 6.66275, 'avg_score': 111.487125, 'seconds': 2946.408360004425, 'device': 'cpu'}
+21:01:38 iter 56 train: {'policy': 1.4470618891716003, 'value': 0.2746032598614692, 'score': 0.0809901867061853, 'entropy': 1.44755102455616, 'steps': 1011, 'window_samples': 1364038, 'seconds': 10.318126201629639, 'lr': 0.000125, 'device': 'cuda'}
+21:04:20 iter 56 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 69.21, 'games': 200, 'score': 200.0}
+21:13:46 iter 56 vs reference runs/az4/models/iter_0035.pt: {'win': 0.4825, 'se': 0.025, 'margin': -0.21, 'games': 400, 'score': 193.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+21:24:18 elo match iter_0056 vs iter_0055: 104.0/200
+21:24:18 elo match iter_0056 vs iter_0054: 101.0/200
+21:24:18 elo match iter_0056 vs iter_0052: 107.0/200
+21:24:18 elo match iter_0056 vs iter_0048: 103.0/200
+21:24:18 elo match iter_0056 vs iter_0040: 97.0/200
+21:24:18 elo match iter_0056 vs iter_0024: 106.5/200
+21:24:23 iter 56 elo 2204 ±100; best iter_0010.pt 2221
+22:11:58 iter 57 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169162, 'decisions_per_game': 169.69375, 'rounds': 6.6635, 'avg_score': 109.958625, 'seconds': 2855.605493545532, 'device': 'cpu'}
+22:12:18 iter 57 train: {'policy': 1.448021990060807, 'value': 0.27320677354931805, 'score': 0.07978563264012335, 'entropy': 1.4482798683643343, 'steps': 992, 'window_samples': 1363667, 'seconds': 10.931878089904785, 'lr': 0.000125, 'device': 'cuda'}
+22:15:13 iter 57 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 70.92, 'games': 200, 'score': 200.0}
+22:25:26 iter 57 vs reference runs/az4/models/iter_0035.pt: {'win': 0.505, 'se': 0.025, 'margin': 0.01, 'games': 400, 'score': 202.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+22:36:35 elo match iter_0057 vs iter_0056: 93.0/200
+22:36:35 elo match iter_0057 vs iter_0055: 111.0/200
+22:36:35 elo match iter_0057 vs iter_0053: 113.0/200
+22:36:35 elo match iter_0057 vs iter_0049: 92.5/200
+22:36:35 elo match iter_0057 vs iter_0041: 99.5/200
+22:36:35 elo match iter_0057 vs iter_0025: 92.5/200
+22:36:40 iter 57 elo 2199 ±100; best iter_0010.pt 2223
+23:19:42 iter 58 selfplay: {'games': 4000, 'unfinished': 0, 'samples': 169494, 'decisions_per_game': 169.98975, 'rounds': 6.66475, 'avg_score': 110.533, 'seconds': 2582.2893018722534, 'device': 'cpu'}
+23:20:00 iter 58 train: {'policy': 1.449043325185776, 'value': 0.2706273181736469, 'score': 0.08105278916656966, 'entropy': 1.450090121626854, 'steps': 994, 'window_samples': 1362775, 'seconds': 9.251287698745728, 'lr': 0.000125, 'device': 'cuda'}
+23:22:29 iter 58 vs shrewd (sims 64): {'win': 1.0, 'se': 0.0, 'margin': 66.36, 'games': 200, 'score': 200.0}
+23:29:47 iter 58 vs reference runs/az4/models/iter_0035.pt: {'win': 0.5175, 'se': 0.025, 'margin': 1.19, 'games': 400, 'score': 207.0, 'ref': 'runs/az4/models/iter_0035.pt'}
+23:37:50 elo match iter_0058 vs iter_0057: 108.0/200
+23:37:50 elo match iter_0058 vs iter_0056: 101.0/200
+23:37:50 elo match iter_0058 vs iter_0054: 99.0/200
+23:37:50 elo match iter_0058 vs iter_0050: 105.5/200
+23:37:50 elo match iter_0058 vs iter_0042: 99.0/200
+23:37:50 elo match iter_0058 vs iter_0026: 97.0/200
+23:37:53 iter 58 elo 2210 ±99; best iter_0010.pt 2224
+23:37:53 STOP file found; exiting
+23:37:54 done

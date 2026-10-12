@@ -68,3 +68,18 @@ PAUSE contract (as in Glass Road / Caverna / Dominion `runctl.py`): `<run>/PAUSE
 `{"time": <epoch>, "by": "<who>"}`; the run notices it within seconds, stops at its next pause
 point, exits with status 75; the supervisor waits and relaunches the run when PAUSE is
 removed (it resumes from its newest checkpoint).
+
+## 4. Process
+
+* Repos are private on GitHub (`greggg230/zero-core`, `greggg230/glassroad-zero`,
+  `greggg230/caverna-zero`); the desktop checkouts track them as `origin`. Cloud agents
+  (Claude Code on the web) work on branches and push them; the orchestrator (desktop) fetches,
+  runs the checks that need the desktop (live checkpoints, the E: parity traces, the GPU, live
+  run dirs, the Mac), merges into `main`, and switches games at restart points of their runs.
+* Cloud agents can't reach the desktop, its runs, E: or the Mac. Anything needing local data
+  gets a script the orchestrator runs locally (e.g. checkpoint-compatibility checks).
+* `dashboard/fixtures/` holds a snapshot of real run files from each project (configs, metrics
+  tails, logs, run state, PAUSE files) and `reference_code/` copies of each game's dashboard /
+  runctl / supervisor, so the dashboard can be built and tested without the desktop.
+* Commit messages end with a blank line then
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.

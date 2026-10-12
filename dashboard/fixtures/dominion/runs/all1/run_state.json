@@ -1,0 +1,1 @@
+{"pid": 146528, "started": 1791700675.1706576, "since": 1791735606.1217139, "state": "paused", "updated": 1791735606.121716, "pause_requested": 1791735604.7387724, "pause_noticed": 1791735604.8636236, "workers_stopped": 1791735606.080285, "exited": 1791735606.1131487, "why": "rolling self-play: the phase ended 0.2s after the end request"}

@@ -1,0 +1,79 @@
+{
+ "fork": {
+  "source": "C:\\Users\\Gregg Keithley\\dominion-zero\\experiments\\focus6\\fork",
+  "iter": 224,
+  "source_latest": 224,
+  "checkpoint": {
+   "file": "iter_0224.pt",
+   "bytes": 11647719,
+   "weights_digest": "111351a8ec3bd6088c3a24e8c1545527"
+  },
+  "optimizer": {
+   "copied": false,
+   "why_not": "the source has no optimizer state",
+   "bytes": 0
+  },
+  "data": {
+   "iters": [
+    223,
+    224
+   ],
+   "requested_iters": 2,
+   "shards": 10,
+   "rows": 565626,
+   "bytes": 379392768,
+   "how": {
+    "link": 10
+   }
+  },
+  "elo_checkpoints": [
+   129,
+   132,
+   135,
+   138,
+   141,
+   144,
+   147,
+   150,
+   153,
+   156,
+   177,
+   180,
+   183,
+   186,
+   189,
+   192,
+   195,
+   198,
+   201,
+   204,
+   207,
+   210,
+   213,
+   216,
+   219,
+   222
+  ],
+  "metrics_records": 225,
+  "time": 1791748204.0062232
+ },
+ "overrides": {
+  "kingdoms": "docs/focus6_boards.json",
+  "eval_board_games": 100,
+  "eval_board_opps": "ref",
+  "eval_board_ref": "models/iter_0224.pt",
+  "eval_every": 3,
+  "eval_games": 200,
+  "eval_heuristic_games": 200,
+  "eval_random_games": 0,
+  "elo_games": 100,
+  "rand_frac": 0.25,
+  "rand_buys": 6,
+  "rand_mode": "tiers",
+  "xp_targets": "keep_policy"
+ },
+ "widen": null,
+ "created": 1791748204.4151018,
+ "optimizer": "fresh: the source has no optimizer state",
+ "checkpoint_digest": "111351a8ec3bd6088c3a24e8c1545527"
+}

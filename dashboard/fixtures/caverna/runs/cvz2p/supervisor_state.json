@@ -1,0 +1,1 @@
+{"pid": 132604, "started": 1791665524.9266224, "since": 1791817588.9201918, "state": "paused", "run_pid": null, "args": ["--train-device", "cuda", "--eval-every", "3"], "updated": 1791817588.920197, "paused_since": 1791817587.8711002}

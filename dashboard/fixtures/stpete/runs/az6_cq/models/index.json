@@ -1,0 +1,75 @@
+{
+ "anchor": "shrewd=1000",
+ "best": {
+  "iter": 26,
+  "file": "iter_0026.pt",
+  "elo": 2214.7,
+  "se": 50.1,
+  "games": 2400
+ },
+ "references": {
+  "shrewd": {
+   "elo": 1000.0,
+   "se": 0.0
+  },
+  "casual": {
+   "elo": 841.5,
+   "se": 8.6
+  },
+  "random": {
+   "elo": 367.3,
+   "se": 24.6
+  }
+ },
+ "checkpoints": [
+  {
+   "iter": 26,
+   "file": "iter_0026.pt",
+   "elo": 2214.7,
+   "se": 50.1,
+   "games": 2400
+  },
+  {
+   "iter": 42,
+   "file": "iter_0042.pt",
+   "elo": 2209.6,
+   "se": 50.1,
+   "games": 2400
+  },
+  {
+   "iter": 50,
+   "file": "iter_0050.pt",
+   "elo": 2201.0,
+   "se": 50.2,
+   "games": 2200
+  },
+  {
+   "iter": 54,
+   "file": "iter_0054.pt",
+   "elo": 2195.7,
+   "se": 50.3,
+   "games": 2000
+  },
+  {
+   "iter": 56,
+   "file": "iter_0056.pt",
+   "elo": 2207.7,
+   "se": 50.4,
+   "games": 1800
+  },
+  {
+   "iter": 57,
+   "file": "iter_0057.pt",
+   "elo": 2196.9,
+   "se": 50.5,
+   "games": 1600
+  },
+  {
+   "iter": 58,
+   "file": "iter_0058.pt",
+   "elo": 2209.8,
+   "se": 50.6,
+   "games": 1400
+  }
+ ]
+}

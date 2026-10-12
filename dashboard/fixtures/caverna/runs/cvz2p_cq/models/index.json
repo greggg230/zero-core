@@ -1,0 +1,85 @@
+{
+ "anchor": "ext:jsbot=1000",
+ "best": {
+  "iter": 177,
+  "file": "iter_0177.pt",
+  "elo": 2597.4,
+  "se": 31.5,
+  "games": 600
+ },
+ "references": {
+  "ext:jsbot": {
+   "elo": 1000.0,
+   "se": 0.0
+  },
+  "random": {
+   "elo": -897.0,
+   "se": 243.0
+  }
+ },
+ "checkpoints": [
+  {
+   "iter": 75,
+   "file": "iter_0075.pt",
+   "elo": 1876.4,
+   "se": 20.1,
+   "games": 1400
+  },
+  {
+   "iter": 123,
+   "file": "iter_0123.pt",
+   "elo": 2251.2,
+   "se": 22.0,
+   "games": 1400
+  },
+  {
+   "iter": 147,
+   "file": "iter_0147.pt",
+   "elo": 2412.7,
+   "se": 23.0,
+   "games": 1300
+  },
+  {
+   "iter": 159,
+   "file": "iter_0159.pt",
+   "elo": 2496.7,
+   "se": 23.8,
+   "games": 1200
+  },
+  {
+   "iter": 165,
+   "file": "iter_0165.pt",
+   "elo": 2527.8,
+   "se": 24.3,
+   "games": 1200
+  },
+  {
+   "iter": 168,
+   "file": "iter_0168.pt",
+   "elo": 2500.5,
+   "se": 24.8,
+   "games": 1100
+  },
+  {
+   "iter": 171,
+   "file": "iter_0171.pt",
+   "elo": 2552.5,
+   "se": 25.6,
+   "games": 1100
+  },
+  {
+   "iter": 174,
+   "file": "iter_0174.pt",
+   "elo": 2519.3,
+   "se": 31.4,
+   "games": 600
+  },
+  {
+   "iter": 177,
+   "file": "iter_0177.pt",
+   "elo": 2597.4,
+   "se": 31.5,
+   "games": 600
+  }
+ ]
+}
