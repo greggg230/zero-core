@@ -41,6 +41,7 @@ case "$(uname -s)" in
   *) WIN=0; SMOKE_DIR="${SMOKE_DIR:-/tmp/zero-smoke}"; TBASE="" ;;
 esac
 mkdir -p "$SMOKE_DIR"
+winpath() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
 STAMP="$(date +%Y%m%d-%H%M%S)"
 FAILED=0
 SUMMARY=()
@@ -57,18 +58,18 @@ step() {   # step <label> <command...>
   fi
 }
 
-winpath() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
 
 if [ "${SKIP_CORE:-0}" != 1 ]; then
   CTGT="${CARGO_TARGET_DIR:-${TBASE:+$TBASE/zero-core/smoke}}"
   [ "${SKIP_CARGO:-0}" != 1 ] && step "core: cargo test" \
     env ${CTGT:+CARGO_TARGET_DIR=$CTGT} cargo test --release --manifest-path "$CORE/Cargo.toml" -q
   step "core: build zero._engine" bash "$CORE/tools/build_py.sh"
-  step "core: pytest" bash -c "cd '$CORE' && '$PY' -m pytest tests -q -p no:cacheprovider -W ignore::pytest.PytestWarning"
+  step "core: pytest" bash -c "cd '$CORE' && '$PY' -m pytest tests -q -p no:cacheprovider -W ignore::pytest.PytestWarning --basetemp='$(winpath "$SMOKE_DIR/$STAMP-pytest-core")'"
 fi
 
 smoke_run() {   # smoke_run <root> <pkg> <preset>
-  local root="$1" pkg="$2" preset="$3" run="$SMOKE_DIR/$STAMP-$pkg-smoke"
+  local root="$1" pkg="$2" preset="$3"
+  local run="$SMOKE_DIR/$STAMP-$pkg-smoke"
   (cd "$root" && "$PY" -m "$pkg.az.run" --run "$(winpath "$run")" --preset "$preset" > "$run.out" 2>&1) || {
     echo "smoke run failed: $run.out"; tail -20 "$run.out"; return 1; }
   "$PY" - "$(winpath "$run")" <<'EOF'
@@ -85,7 +86,8 @@ for G in "${GAMES[@]}"; do
   ROOT="$G"
   PKG="$(cd "$G" && ls -d */az/__init__.py 2>/dev/null | grep -v '^third_party' | head -1 | cut -d/ -f1)"
   if [ -z "$PKG" ]; then echo "$G: no <pkg>/az/__init__.py - skipped"; SUMMARY+=("skip  $G"); continue; fi
-  NAME="$(basename "$G")"
+  # the repo's name (a worktree's too: the main repo's directory)
+  NAME="$(basename "$(dirname "$(git -C "$G" rev-parse --path-format=absolute --git-common-dir)")")"
   WT=""
   if [ "$WITH_CORE" = 1 ]; then
     WT="$SMOKE_DIR/$STAMP-$NAME-wt"
@@ -100,7 +102,7 @@ for G in "${GAMES[@]}"; do
   step "$NAME: build $PKG._engine" env ZERO_CORE_UNPINNED="$WITH_CORE" ${TGT:+CARGO_TARGET_DIR=$TGT} bash "$ROOT/tools/build_py.sh"
   [ "${SKIP_CARGO:-0}" != 1 ] && step "$NAME: cargo test" \
     env ${TGT:+CARGO_TARGET_DIR=$TGT} cargo test --release --manifest-path "$ROOT/Cargo.toml" -q
-  step "$NAME: pytest" bash -c "cd '$ROOT' && '$PY' -m pytest tests -q -p no:cacheprovider -W ignore::pytest.PytestWarning"
+  step "$NAME: pytest" bash -c "cd '$ROOT' && '$PY' -m pytest tests -q -p no:cacheprovider -W ignore::pytest.PytestWarning --basetemp='$(winpath "$SMOKE_DIR/$STAMP-pytest-$NAME")'"
   [ "${SKIP_SMOKE:-0}" != 1 ] && step "$NAME: smoke run ($GAME-smoke)" smoke_run "$ROOT" "$PKG" "$GAME-smoke"
   if [ -n "$WT" ]; then
     git -C "$G" worktree remove --force "$WT" >/dev/null 2>&1 || echo "note: remove $WT by hand (git worktree remove --force)"
