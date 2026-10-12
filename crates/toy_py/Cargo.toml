@@ -1,0 +1,17 @@
+[package]
+name = "zero_toy_py"
+version = "0.1.0"
+edition = "2021"
+description = "Zero Core's own Python module zero._engine: the toy game only (the core's tests, toy runs)"
+publish = false
+
+[lib]
+name = "zero_toy_py"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+zero_py = { path = "../py" }
+zero_search = { path = "../search" }
+pyo3 = { version = "0.23", features = ["extension-module"] }

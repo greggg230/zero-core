@@ -1,0 +1,369 @@
+"""The Python reference driver: many games side by side in one process, every network seat
+searching with the reference MCTS (`mcts.py`) - or, for mixed parity matches, with the Rust
+tree through the bindings - speaking the same leaf-batch protocol as the Rust driver
+(`protocol.py`), so `infer.drive` runs either.
+
+Per decision (docs/search.md 3.4): playout-cap randomisation (a `p_full` share of decisions
+gets `sims` and becomes a training sample, the rest `sims_fast`), root Dirichlet noise on full
+self-play searches, temperature sampling by visit count for the first `temp_moves` searched
+decisions of a game, argmax (N, P0) otherwise, tree reuse when the same seat decides again.
+Recorded decisions carry the seat's policy target: the visit distribution ('visits') or the
+completed-Q target ('cq', docs/search.md 3.1).
+"""
+import random
+
+import numpy as np
+
+from . import mcts
+from .protocol import LeafBatch, MAX_SEATS, concat_samples
+
+
+POLICY_TARGETS = ('visits', 'cq')
+
+
+class NNSeat:
+    """Search settings of a network seat. impl: 'py' (reference tree) | 'rs' (Rust tree).
+    policy_target: training target of recorded decisions, 'visits' | 'cq' (completed Q with
+    cq_c_visit, cq_c_scale)."""
+
+    def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
+                 sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
+                 policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0):
+        if policy_target not in POLICY_TARGETS:
+            raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
+        self.key, self.sims, self.c_puct, self.selfplay = key, sims, c_puct, selfplay
+        self.alpha, self.eps, self.temp_moves = alpha, eps, temp_moves
+        self.sims_fast, self.p_full, self.chance_k, self.margin_w = sims_fast, p_full, chance_k, margin_w
+        self.redet, self.impl = redet, impl
+        self.policy_target, self.cq_c_visit, self.cq_c_scale = policy_target, cq_c_visit, cq_c_scale
+
+
+class PySearch:
+    def __init__(self, game, seat, rng):
+        self.t = mcts.Tree(game, seat.redet, rng)
+        self.pending = None
+
+    def set_base(self, game, rng):
+        self.t.set_base(game, rng)
+
+    @property
+    def expanded(self):
+        return self.t.root.P is not None
+
+    @property
+    def redet(self):
+        return self.t.redet
+
+    def simulate(self, game, rng, seat):
+        r = mcts.simulate(self.t, rng, seat.c_puct, seat.chance_k, seat.margin_w)
+        if r is None:
+            return None
+        node, leaf, path = r
+        self.pending = (node, path)
+        return node.player, leaf.encode(node.player), node.acts
+
+    def expand(self, priors, value, margin, seat):
+        node, path = self.pending
+        self.pending = None
+        mcts.expand_and_backup(node, path, priors, value, margin, self.t.n, seat.margin_w)
+        return node is self.t.root
+
+    def add_noise(self, seat, np_rng):
+        mcts.add_noise(self.t.root, seat.alpha, seat.eps, np_rng)
+
+    def stats(self):
+        r = self.t.root
+        return r.acts, r.Nv, r.P0, mcts.root_win(r)
+
+    def target(self, seat):
+        """The seat's policy target at the root."""
+        if seat.policy_target == 'cq':
+            return mcts.cq_target(self.t.root, seat.cq_c_visit, seat.cq_c_scale)
+        return mcts.visits_target(self.t.root)
+
+    def advance(self, a, key, game):
+        child = mcts.advance(self.t.root, a, key, game.to_move, game.legal())
+        if child is None:
+            return False
+        self.t.root = child
+        return True
+
+
+class RsSearch:
+    """The Rust tree (`<package>._engine.SearchTree`) behind the same interface."""
+
+    def __init__(self, game, seat, rng):
+        self.t = game.search_tree(seat.redet, rng.getrandbits(63))
+
+    def set_base(self, game, rng):
+        self.t.set_base(game)
+
+    @property
+    def expanded(self):
+        return self.t.root_expanded
+
+    @property
+    def redet(self):
+        return self.t.redet
+
+    def simulate(self, game, rng, seat):
+        r = self.t.simulate(game, seat.c_puct, seat.chance_k, seat.margin_w)
+        if r is None:
+            return None
+        return r[0], r[1], r[2]
+
+    def expand(self, priors, value, margin, seat):
+        was = self.t.root_expanded
+        self.t.expand(list(map(float, priors)), list(map(float, value)), list(map(float, margin)), seat.margin_w)
+        return not was
+
+    def add_noise(self, seat, np_rng):
+        self.t.add_noise(seat.alpha, seat.eps, int(np_rng.integers(1 << 62)))
+
+    def stats(self):
+        return self.t.root_acts, self.t.root_visits, self.t.root_priors0, self.t.root_win()
+
+    def target(self, seat):
+        if seat.policy_target == 'cq':
+            return self.t.root_cq_target(seat.cq_c_visit, seat.cq_c_scale)
+        nv = self.t.root_visits
+        tot = sum(nv)
+        return [n / tot for n in nv] if tot else list(self.t.root_priors0)
+
+    def advance(self, a, key, game):
+        if game.over:
+            return False
+        return self.t.advance(a, list(key), game)
+
+
+SEARCH = {'py': PySearch, 'rs': RsSearch}
+
+
+class RandomBot:
+    def __init__(self, rng):
+        self.rng = rng
+
+    def choose(self, g):
+        return self.rng.choice(g.legal())
+
+
+def make_bot(game, name, rng):
+    if name == 'random':
+        return RandomBot(rng)
+    if game == 'toy' and name == 'heuristic':
+        from .toybots import HeuristicBot
+        return HeuristicBot(rng)
+    raise ValueError(f'the Python driver has no bot {name!r} for {game}')
+
+
+class Slot:
+    __slots__ = ('gid', 'rng', 'np_rng', 'search_rng', 'game', 'n', 'seats', 'bots', 'trees', 'sims', 'target',
+                 'full', 'records', 'decisions', 'steps')
+
+    def __init__(self, gid, game, spec, seats, rng):
+        from .games import engine
+        self.gid = gid
+        self.rng = rng
+        self.np_rng = np.random.default_rng(rng.randrange(1 << 30))
+        self.search_rng = random.Random(rng.randrange(1 << 30))
+        self.game = engine().Game(game, spec, len(seats), rng.getrandbits(63))
+        self.n = len(seats)
+        self.seats = seats
+        self.bots = {i: make_bot(game, s, random.Random(rng.randrange(1 << 30)))
+                     for i, s in enumerate(seats) if isinstance(s, str)}
+        self.trees = {}
+        self.sims = 0
+        self.target = None
+        self.full = True
+        self.records = []
+        self.decisions = 0
+        self.steps = 0
+
+
+class PyDriver:
+    """seat_fn(game_index) -> list of seats (NNSeat or a bot name), one per player."""
+
+    def __init__(self, game, n_games, seat_fn, spec=None, concurrency=64, seed=0, record=False, max_steps=100_000):
+        from .games import spec_json
+        self.game = game
+        self.spec = spec_json(spec)
+        self.n_games = n_games
+        self.seat_fn = seat_fn
+        self.concurrency = concurrency
+        self.rng = random.Random(seed)
+        self.record = record
+        self.max_steps = max_steps
+        self.active = []
+        self.next_gid = 0
+        self.queue = []
+        self.outstanding = {}
+        self.next_bid = 0
+        self.results = []
+        self.samples = []
+        self.sims = 0
+        self._refill()
+
+    # ---- protocol ---------------------------------------------------------------------------
+    @property
+    def finished(self):
+        return not self.active and not self.queue and not self.outstanding
+
+    def next_batch(self):
+        while not self.queue:
+            if self.outstanding:
+                raise RuntimeError('submit the outstanding batches before asking for more')
+            if not self.active:
+                return None
+            self._round()
+        return self.queue.pop(0)
+
+    def submit(self, bid, priors, value, margin):
+        lb, items = self.outstanding.pop(bid)
+        off = lb.opt_off
+        for b, (slot, seat, tree) in enumerate(items):
+            is_root = tree.expand(priors[off[b]:off[b + 1]].tolist(), value[b], margin[b], seat)
+            if is_root and seat.selfplay and slot.full:
+                tree.add_noise(seat, slot.np_rng)
+            slot.sims += 1
+        self.sims += len(items)
+
+    def take_results(self):
+        r, self.results = self.results, []
+        return r
+
+    def take_samples(self):
+        s, self.samples = self.samples, []
+        return concat_samples(s)
+
+    # ---- internals --------------------------------------------------------------------------
+    def _refill(self):
+        while len(self.active) < self.concurrency and self.next_gid < self.n_games:
+            seats = self.seat_fn(self.next_gid)
+            self.active.append(Slot(self.next_gid, self.game, self.spec, seats, random.Random(self.rng.randrange(1 << 30))))
+            self.next_gid += 1
+
+    def _round(self):
+        need = {}
+        finished = []
+        for slot in self.active:
+            while True:
+                g = slot.game
+                if g.over or slot.steps >= self.max_steps:
+                    finished.append(slot)
+                    break
+                legal = g.legal()
+                if len(legal) == 1:
+                    self._apply(slot, legal[0])
+                    continue
+                p = g.to_move
+                seat = slot.seats[p]
+                if not isinstance(seat, NNSeat):
+                    self._apply(slot, slot.bots[p].choose(g))
+                    continue
+                if slot.target is None:
+                    self._start(slot, seat, p)
+                tree = slot.trees[p]
+                if slot.sims >= slot.target:
+                    self._decide(slot, seat, tree, p)
+                    continue
+                r = tree.simulate(g, slot.search_rng, seat)
+                if r is None:
+                    slot.sims += 1
+                    continue
+                player, x, acts = r
+                need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts))
+                break
+        for slot in finished:
+            self.active.remove(slot)
+            self._finish(slot)
+        self._refill()
+        for key, items in need.items():
+            off = np.zeros(len(items) + 1, np.int32)
+            off[1:] = np.cumsum([len(it[5]) for it in items])
+            a = {'x': np.ascontiguousarray(np.stack([it[4] for it in items]).astype(np.float32)),
+                 'opt_off': off,
+                 'opt_action': np.asarray([x for it in items for x in it[5]], np.int32),
+                 'player': np.asarray([it[3] for it in items], np.int32),
+                 'n_players': np.asarray([it[0].n for it in items], np.int32),
+                 'gid': np.asarray([it[0].gid for it in items], np.int64)}
+            lb = LeafBatch(self.next_bid, key, 'nn', a)
+            self.outstanding[self.next_bid] = (lb, [it[:3] for it in items])
+            self.next_bid += 1
+            self.queue.append(lb)
+
+    def _start(self, slot, seat, p):
+        slot.full = seat.sims_fast is None or slot.rng.random() < seat.p_full
+        slot.target = seat.sims if slot.full else seat.sims_fast
+        tree = slot.trees.get(p)
+        if tree is None:
+            slot.trees[p] = SEARCH[seat.impl](slot.game, seat, slot.search_rng)
+        else:
+            tree.set_base(slot.game, slot.search_rng)
+            if seat.selfplay and slot.full and tree.expanded:
+                tree.add_noise(seat, slot.np_rng)
+
+    def _decide(self, slot, seat, tree, p):
+        acts, Nv, P0, rw = tree.stats()
+        tot = sum(Nv)
+        if seat.selfplay and slot.decisions < seat.temp_moves and tot > 0:
+            r = slot.rng.random() * tot
+            i = len(Nv) - 1
+            for k, n in enumerate(Nv):
+                r -= n
+                if r < 0:
+                    i = k
+                    break
+        else:
+            i = max(range(len(Nv)), key=lambda k: (Nv[k], P0[k]))
+        if self.record and seat.selfplay and slot.full:
+            pi = tree.target(seat)
+            slot.records.append((slot.game.encode(p), list(acts), pi, p, rw))
+        slot.decisions += 1
+        self._apply(slot, acts[i])
+
+    def _apply(self, slot, a):
+        g = slot.game
+        p = g.to_move
+        key, legal = mcts.transition(g, a)
+        slot.steps += 1
+        for q in list(slot.trees):
+            tree = slot.trees[q]
+            if not (q == p and not g.over and g.to_move == p and tree.redet and tree.advance(a, key, g)):
+                del slot.trees[q]
+        slot.sims = 0
+        slot.target = None
+
+    def _finish(self, slot):
+        g = slot.game
+        n = slot.n
+        over = g.over
+        res = list(g.result()) if over else [1.0 / n] * n
+        self.results.append({'gid': slot.gid, 'n': n, 'over': over, 'result': res, 'scores': g.scores(),
+                             'steps': slot.steps, 'decisions': slot.decisions, 'ext_moves': 0,
+                             'rounds': g.rounds, 'samples': len(slot.records) if self.record and over else 0})
+        if self.record and over and slot.records:
+            margins = [g.margin(i) for i in range(n)]
+            self.samples.append(_sample_arrays(slot.records, res, margins, n))
+
+
+def _sample_arrays(records, res, margins, n):
+    N = len(records)
+    z = np.zeros((N, MAX_SEATS), np.float32)
+    q = np.zeros((N, MAX_SEATS), np.float32)
+    sc = np.zeros((N, MAX_SEATS), np.float32)
+    off = np.zeros(N + 1, np.int64)
+    acts, pis = [], []
+    for k, (_, a, pi, mover, rq) in enumerate(records):
+        acts.extend(a)
+        pis.extend(pi)
+        off[k + 1] = len(acts)
+        for j in range(n):
+            s = (mover + j) % n
+            z[k, j] = res[s]
+            q[k, j] = rq[s] if rq is not None else res[s]
+            sc[k, j] = margins[s]
+    return {'x': np.stack([r[0] for r in records]).astype(np.float32),
+            'player': np.asarray([r[3] for r in records], np.int32),
+            'n_players': np.full(N, n, np.int32), 'opt_off': off,
+            'opt_action': np.asarray(acts, np.int32), 'pi': np.asarray(pis, np.float32),
+            'z': z, 'q': q, 'sc': sc, 'net': np.zeros(N, np.uint32)}

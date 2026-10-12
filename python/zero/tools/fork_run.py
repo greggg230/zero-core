@@ -1,0 +1,133 @@
+"""Start a run from another run's checkpoint.
+
+  python tools/fork_run.py <src.pt> <new run dir> [--game toy]
+      A NEW run whose iteration 0 is the source network widened to the game's current
+      feature / action counts (new inputs get zero weights: it computes what the source did).
+      Settings: the new run's own flags when it is started.
+
+  python tools/fork_run.py --source runs/a --dest runs/b [--iter K] [--set reuse=8 ...] [--copy]
+      A CONTINUATION of a (possibly live) run at its checkpoint K (default: the newest): the
+      checkpoints <= K that its Elo matches need, the optimizer state when it belongs to K, the
+      window's sample shards (hard links on the same volume, --copy to copy), Elo results,
+      metrics up to K and the source's config.json with the --set overrides. The source is only
+      read. Then: python tools/supervise.py runs/b (the run resumes after K).
+"""
+import argparse
+import glob
+import json
+import os
+import shutil
+import sys
+
+
+def parse_value(v):
+    try:
+        return json.loads(v)
+    except ValueError:
+        return v
+
+
+def new_run(src, run, game=None):
+    import torch  # noqa: F401
+    from .. import games
+    from ..net import load, save, widen
+    old, extra = load(src)
+    info = games.info(game or old.config.get('game', 'toy'))
+    new = widen(old, info['num_features'], info['num_actions'])
+    os.makedirs(os.path.join(run, 'models'), exist_ok=True)
+    out = os.path.join(run, 'models', 'iter_0000.pt')
+    save(new, out, {'iter': 0, 'forked_from': os.path.abspath(src), 'source_extra': extra})
+    print(f'{src} ({old.config["features"]} features, {old.config["actions"]} actions) -> {out} '
+          f'({new.config["features"]} features, {new.config["actions"]} actions)')
+
+
+def _link(src, dst, copy):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if not copy:
+        try:
+            os.link(src, dst)
+            return
+        except OSError:
+            pass
+    shutil.copy2(src, dst)
+
+
+def continuation(source, dest, it=None, overrides=None, copy=False):
+    from .. import elo
+    from ..run import DEFAULTS, latest_iter, model_path, read_metrics, window_iters
+    if os.path.exists(os.path.join(dest, 'config.json')):
+        raise SystemExit(f'{dest} already holds a run')
+    with open(os.path.join(source, 'config.json')) as f:
+        cfg = json.load(f)
+    for k in overrides or {}:
+        if k not in DEFAULTS:
+            raise SystemExit(f'--set {k}: unknown setting')
+    it = latest_iter(source) if it is None else it
+    if it is None or not os.path.exists(model_path(source, it)):
+        raise SystemExit(f'{source}: no checkpoint {it}')
+    e = max(1, int(cfg.get('eval_every', 1)))
+    need = {it} | {it - off * e for off in elo.OFFSETS if it - off * e >= 0}
+    for j in sorted(need):
+        if os.path.exists(model_path(source, j)):
+            _link(model_path(source, j), model_path(dest, j), True)
+    opt = os.path.join(source, 'models', 'opt_latest.pt')
+    if os.path.exists(opt):
+        import torch
+        o = torch.load(opt, map_location='cpu', weights_only=False)
+        if o.get('iter') == it:
+            shutil.copy2(opt, os.path.join(dest, 'models', 'opt_latest.pt'))
+    dirs = sorted(glob.glob(os.path.join(source, 'data', 'iter_*')), reverse=True)
+    dirs = [d for d in dirs if int(os.path.basename(d)[5:9]) <= it][:max(window_iters(cfg, it + 1), 1) + 1]
+    for d in dirs:
+        for p in glob.glob(os.path.join(d, '*.npz')):
+            _link(p, os.path.join(dest, 'data', os.path.basename(d), os.path.basename(p)), copy)
+    for f in ('results.json', 'ratings.json'):
+        p = os.path.join(source, 'elo', f)
+        if os.path.exists(p):
+            os.makedirs(os.path.join(dest, 'elo'), exist_ok=True)
+            shutil.copy2(p, os.path.join(dest, 'elo', f))
+    rows = [m for m in read_metrics(source) if m['iter'] <= it]
+    with open(os.path.join(dest, 'metrics.jsonl'), 'w', encoding='utf-8') as f:
+        for m in rows:
+            f.write(json.dumps(m) + '\n')
+    cfg.update(overrides or {})
+    with open(os.path.join(dest, 'config.json'), 'w') as f:
+        json.dump(cfg, f, indent=1)
+    print(f'{source} @ iter {it} -> {dest}: {len(need)} checkpoints, {len(dirs)} data iterations, {len(rows)} metrics rows')
+    print(f'next: python tools/supervise.py {dest}   (resumes after iteration {it})')
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and not argv[0].startswith('-'):
+        ap = argparse.ArgumentParser()
+        ap.add_argument('src')
+        ap.add_argument('run')
+        ap.add_argument('--game', default=None)
+        a = ap.parse_args(argv)
+        new_run(a.src, a.run, a.game)
+        return 0
+    ap = argparse.ArgumentParser(description='continue a run at one of its checkpoints (module docstring)')
+    ap.add_argument('--source', required=True)
+    ap.add_argument('--dest', required=True)
+    ap.add_argument('--iter', type=int, default=None)
+    ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE')
+    ap.add_argument('--copy', action='store_true', help='copy shards instead of hard-linking them')
+    a = ap.parse_args(argv)
+    over = {}
+    for kv in a.set:
+        k, _, v = kv.partition('=')
+        over[k.strip().replace('-', '_')] = parse_value(v)
+    continuation(a.source, a.dest, a.iter, over, a.copy)
+    return 0
+
+
+def cli():
+    """The command line (`tools/fork_run.py`): CPU only."""
+    if not os.environ.get('CUDA_VISIBLE_DEVICES'):
+        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+    sys.exit(main())
+
+
+if __name__ == '__main__':
+    cli()

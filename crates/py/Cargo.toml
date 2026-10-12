@@ -1,0 +1,18 @@
+[package]
+name = "zero_py"
+version = "0.1.0"
+edition = "2021"
+description = "Zero Core: the PyO3 classes behind every game's Python module <package>._engine (search driver, trees, game objects); a game's cdylib is one engine_module! call"
+publish = false
+
+[lib]
+name = "zero_py"
+test = false
+doctest = false
+
+[dependencies]
+zero_search = { path = "../search" }
+# no `extension-module` feature here: the game's cdylib crate enables it (features unify)
+pyo3 = "0.23"
+numpy = "0.23"
+serde_json = "1"
