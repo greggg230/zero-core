@@ -119,3 +119,22 @@ def test_elo_fit_recovers_ratings():
         assert abs(r[k][0] - v) < 40, (k, r[k])
     assert r['yard'][0] == 1000
     assert elo.has(res, 'b', 'a') and not elo.has(res, 'a', 'zz')
+
+
+def test_webexport_bin_format(tmp_path):
+    """zero.webexport: the .bin weight file the browser players' zero_webnet reads."""
+    import json
+    import struct
+
+    from zero.webexport import export_model
+    torch.manual_seed(0)
+    path = str(tmp_path / 'm.pt')
+    save(Net(INFO['num_features'], INFO['num_actions'], hidden=32, blocks=1, game='toy').eval(), path, {'iter': 3})
+    n, worst = export_model(path, str(tmp_path / 'm.bin'))
+    b = open(tmp_path / 'm.bin', 'rb').read()
+    assert b[:4] == b'CVZW' and struct.unpack('<II', b[4:12])[0] == 1
+    hl = struct.unpack('<II', b[4:12])[1]
+    h = json.loads(b[12:12 + hl])
+    assert (12 + hl) % 2 == 0 and h['iter'] == 3 and h['hidden'] == 32 and h['game'] == 'toy'
+    assert not any(t['name'].startswith('mar.') for t in h['tensors'])
+    assert len(b) == 12 + hl + 2 * n and worst < 1e-3

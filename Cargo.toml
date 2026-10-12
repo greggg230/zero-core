@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/search", "crates/py", "crates/toy_py"]
-# `cargo test` / `cargo build` at the root: the search crate only (the PyO3 crates are built by
+members = ["crates/search", "crates/py", "crates/toy_py", "crates/webnet"]
+# `cargo test` / `cargo build` at the root: search + webnet (the PyO3 crates are built by
 # tools/build_py.sh; a game builds them through its own workspace, docs/new_game.md)
-default-members = ["crates/search"]
+default-members = ["crates/search", "crates/webnet"]
 
 [profile.release]
 debug = 1

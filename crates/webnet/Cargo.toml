@@ -1,0 +1,9 @@
+[package]
+name = "zero_webnet"
+version = "0.1.0"
+edition = "2021"
+description = "Zero Core: the zero.net network as a plain, deterministic Rust forward pass over float16 weights (.bin) - native and wasm32 bit-identical (browser players)"
+publish = false
+
+[dependencies]
+serde_json = "1"
