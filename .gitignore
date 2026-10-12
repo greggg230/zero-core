@@ -1,0 +1,10 @@
+/target/
+__pycache__/
+*.pyc
+*.pyd
+*.so
+/runs/
+/traces/
+*.log
+node_modules/
+.pytest_cache/
