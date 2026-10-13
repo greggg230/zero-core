@@ -467,6 +467,7 @@ struct Counters {
     belief_rows: AtomicU64,
     belief_jobs: AtomicU64,
     belief_searches: AtomicU64,
+    belief_targets: AtomicU64,
     belief_missing: AtomicU64,
     belief_worlds: AtomicU64,
 }
@@ -530,12 +531,14 @@ pub struct DriverStats {
     pub epoch: u32,
     pub net: u32,
     /// Opponent models (docs/search.md 10): selections drawn from P0 at policy-sampled nodes;
-    /// belief rows evaluated, beliefs sampled, searches started with >= 1 consistent particle,
-    /// belief targets without a snapshot (uniform instead), root worlds from a particle.
+    /// belief rows evaluated, beliefs sampled, searches started with >= 1 consistent particle
+    /// (of `belief_targets` searches at a decision with a belief target), belief targets
+    /// without a snapshot (uniform instead), root worlds from a particle.
     pub psampled: u64,
     pub belief_rows: u64,
     pub belief_jobs: u64,
     pub belief_searches: u64,
+    pub belief_targets: u64,
     pub belief_missing: u64,
     pub belief_worlds: u64,
 }
@@ -931,6 +934,7 @@ impl<G: SearchGame> Driver<G> {
             belief_rows: c.belief_rows.load(Ordering::Relaxed),
             belief_jobs: c.belief_jobs.load(Ordering::Relaxed),
             belief_searches: c.belief_searches.load(Ordering::Relaxed),
+            belief_targets: c.belief_targets.load(Ordering::Relaxed),
             belief_missing: c.belief_missing.load(Ordering::Relaxed),
             belief_worlds: c.belief_worlds.load(Ordering::Relaxed),
         }

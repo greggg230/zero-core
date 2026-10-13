@@ -41,6 +41,11 @@ Elo, dashboard, tools - comes from the pinned core (docs/pinning.md).
 3. Check the trait contract with the toy-style tests (features invariant under `determinize`,
    legal actions unchanged, chance keys canonical) and the core's parity tools:
    `python -m <pkg>.az.parity positions --game mygame` (Rust vs Python search statistics).
+4. Optional hooks (docs/search.md 10, all defaulted): decision classes and an oracle
+   determinization (analysis), policy-sampled simultaneous choices (`psample`: a game that
+   sequentialises a simultaneous hidden choice) and the belief prior (`belief_*`: a hidden
+   choice made by a policy, e.g. a secret hand). Glass Road Zero implements all of them
+   (`engine/src/az/mod.rs`, `knowledge.rs`; tests `engine/tests/az_opponent.rs`).
 
 ## 3. Python
 

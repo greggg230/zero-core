@@ -91,6 +91,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `c_puct`, `alpha`, `eps`, `temp_moves` | 1.0, 0.3, 0.25, 20 | PUCT constant (values in [0, 1]), root Dirichlet noise, sampled moves per game |
 | `chance_k`, `margin_w`, `redet`, `max_steps` | 0, 0, 1, 100000 | sampled chance outcomes kept per edge (0 = resample every visit), utility margin credit, fresh determinization per simulation, abandon a game after this many moves |
 | `policy_target`, `cq_c_visit`, `cq_c_scale` | visits, 50, 1.0 | training target of the recorded decisions: the root visit distribution, or Gumbel AlphaZero's completed-Q target (docs/search.md 3.1, section 9); the search is the same |
+| `psample` | 0 | opponent model: the other seats' sequentialised simultaneous choices (Glass Road `select`) are drawn from the network's prior inside every search of the run's network seats (self-play and evaluation), their earlier hidden commits taken back (docs/search.md 10.2) |
+| `belief_mix`, `belief_temp`, `belief_particles` | 0, 1.0, 64 | opponent model: that share of the root worlds takes the other seat's hidden choice from K particles sampled with the network's own policy (temperature per atomic choice), restricted to the consistent ones; 0 = off (docs/search.md 10.3) |
 | `hidden`, `blocks` | 256, 4 | network size (only when the run's first network is created) |
 | `batch`, `reuse`, `lr`, `wd`, `min_steps` | 512, 4, 1e-3, 1e-4, 50 | steps = new samples x reuse / batch (at least min_steps); AdamW, grad-norm clip 5 |
 | `lr_halve_every`, `lr_min`, `lr_warmup_steps` | 30, 1e-4, 100 | step decay; linear warmup while the optimizer state is fresh |

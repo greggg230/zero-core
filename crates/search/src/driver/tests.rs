@@ -461,7 +461,7 @@ fn psample_and_belief_in_secret_selfplay() {
     // at most one belief per game and seat (the other seat's hand; sampled from its snapshot at
     // the first searched card play of the seat)
     assert!(st1.belief_jobs > 20 && st1.belief_jobs <= 80 && st1.belief_missing == 0, "{st1:?}");
-    assert!(st1.belief_searches > 0 && st1.belief_worlds > 0, "{st1:?}");
+    assert!(st1.belief_searches > 0 && st1.belief_worlds > 0 && st1.belief_targets >= st1.belief_searches, "{st1:?}");
     // belief rows ride in the network batches: at most 1 + 4 rows per belief (2 picks; 4
     // distinct first picks), counted apart from the search's leaves
     assert_eq!(rows1, st1.leaves + st1.belief_rows);

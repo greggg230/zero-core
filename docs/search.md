@@ -16,6 +16,8 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 | `crates/search/src/tree.rs` | One search tree: PUCT, chance children, determinization, noise, reuse, `compact`, completed-Q targets |
 | `crates/search/src/driver.rs`, `driver/worker.rs` | Batched multi-threaded driver: groups, chunks, parallel batch assembly, playout cap, temperature, records, rolling phases, arena keys, external seats |
 | `crates/search/src/toy.rs` | "Mini Cavern", the toy game (section 5) + its heuristic bot |
+| `crates/search/src/belief.rs` | Belief particles: another seat's hidden choice sampled with the network's policy (section 10.3) |
+| `crates/search/src/secret.rs` | "Secret hands", a tiny hidden simultaneous-choice game: the test bed of section 10 (`zero._engine` game "secret") |
 | `crates/search/src/dynapi.rs` | Object-safe wrappers (`DynGame`, `DynTree`, `DynDriver`) so the bindings hold any game |
 | `crates/search/src/rng.rs`, `noise.rs` | xoshiro256++ / splitmix64, Gamma / Dirichlet |
 | `crates/py/src/lib.rs` | `zero_py`: `Game`, `SearchTree`, `SearchDriver`, `game_names()`, `game_info_of()`, the `engine_module!` macro (section 4) |
@@ -27,8 +29,8 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 Build: `bash tools/build_py.sh` (the toy module: release cdylib copied to
 `python/zero/_engine.pyd`; target dir `$CARGO_TARGET_DIR` or `E:/cargo-target/zero-core/<branch>`
 on Windows). A game builds its own `<pkg>._engine` with its `tools/build_py.sh` (docs/pinning.md).
-Tests: `cargo test` (the `zero_search` crate: 28 tests, < 1 s in release), `python -m pytest
-tests` (48 tests on the toy, ~1.5 min on the loaded desktop).
+Tests: `cargo test` (the `zero_search` crate: 42 tests, < 1 s in release), `python -m pytest
+tests` (57 tests on the toy and the secret game, ~1 min on the loaded desktop).
 
 ## 1. The trait (final version)
 
@@ -60,6 +62,20 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn apply_external(&mut self, payload: &str, chance: &mut Vec<u64>) -> Result<(), String> { Err(..) }
     fn bot_names() -> &'static [&'static str] { &[] }               // built-in bots ('random' is generic)
     fn make_bot(spec: &Self::Spec, name: &str, seed: u64) -> Option<Box<dyn Bot<Self>>> { None }
+    // optional hooks of the opponent models and analysis options (section 10), all defaulted:
+    const DECISION_CLASSES: &'static [&'static str] = &[];         // per-class seat options
+    fn decision_class(&self) -> usize { 0 }
+    const HAS_ORACLE: bool = false;                                 // analysis: the true hidden information
+    fn determinize_oracle(&mut self, viewer: usize, rng: &mut Rng) { unreachable!() }
+    const HAS_PSAMPLE: bool = false;                                // policy-sampled simultaneous choices
+    fn policy_sampled(&self) -> bool { false }
+    fn uncommit_simultaneous(&mut self, viewer: usize) {}
+    const HAS_BELIEF: bool = false;                                 // belief prior
+    fn belief_start(&self) -> Option<u64> { None }
+    fn belief_particle(&self, chooser: usize) -> Option<u64> { None }
+    fn belief_target(&self, viewer: usize) -> Option<(usize, u64)> { None }
+    fn belief_consistent(&self, viewer: usize, particle: u64) -> bool { false }
+    fn determinize_particle(&mut self, viewer: usize, particle: u64, rng: &mut Rng) { unreachable!() }
 }
 pub trait Bot<G>: Send { fn choose(&mut self, g: &G, legal: &[u16]) -> u16; }
 ```
@@ -131,7 +147,10 @@ One list of seat dicts per game (players = its length):
 `{'bot': 'random' | 'heuristic' | ...}`, `{'external': '<key>'}`, or a network seat
 `{'key': 'm', 'sims', 'c_puct', 'selfplay', 'alpha', 'eps', 'temp_moves', 'sims_fast',
 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale'}`
-(`games.nn_seat`; the last three only matter for recorded decisions, section 3.1). Evaluator keys: every distinct
+(`games.nn_seat`; the last three only matter for recorded decisions, section 3.1), plus the
+opponent-model and analysis options of section 10 (`psample`, `belief_mix`, `belief_temp`,
+`belief_particles`, `oracle_hands`, `oracle_p`, `class_sims`, `mask_features`; all off by
+default, refused by games without the hooks). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
 
@@ -181,7 +200,12 @@ samples are emitted when it ends.
 ### 2.5 Results (`take_results`)
 
 `{gid, n, over, result, scores, steps, decisions, ext_moves, rounds, samples}`; a game cut at
-`max_steps` has `over` False and result 1/n each.
+`max_steps` has `over` False and result 1/n each. With `SearchDriver(..., trace=True)` each row
+also has `seed` and `actions` (the game's `new_game` seed and real moves: a replay is
+`Game(game, spec, n, seed)`, then per action `step(a)` and auto-steps of single-option
+decisions; refused with external seats). `stats()` counts the options of section 10 too
+(`psampled`, `belief_rows`, `belief_jobs`, `belief_targets`, `belief_searches`, `belief_missing`,
+`belief_worlds`).
 
 ### 2.6 Rolling mode
 
@@ -400,3 +424,152 @@ external players, defaults), pin the core (docs/pinning.md). The game-specific a
 with each game: Caverna Zero docs/search.md 8 (what its AZ layer provides), Glass Road Zero
 docs/search.md 8-9 (chance and revelation keys, determinization and the viewer, hidden hands in
 the tree, simultaneous choices, cost).
+
+## 10. Opponent models and analysis options (network-seat options, all off by default)
+
+Hidden simultaneous choices need more than a uniform determinization (Glass Road Zero
+docs/hidden_info.md: its 5-of-15 hand choice `select`, sequentialised with seat 0 first, decided
+self-play games; perfect knowledge of the opponent's hand was worth ~+100 Elo at 128
+simulations). The core offers two opponent models and the analysis options that measured the
+problem, each a network-seat option off by default, each behind trait hooks a game opts into
+(`HAS_*` constants: a seat option for a game without the hooks is refused - it would silently
+do nothing). With every option off the search is bit-identical to the plain one: tested
+(the toy's golden records; `tree::tests::opponent_model_options_off_are_the_plain_search`;
+Glass Road self-play digests - uniform / random / real network, visits and completed-Q targets,
+`redet` on and off, `intro` both, and with every new option given explicitly off:
+`tools/selfplay_digest.py --seat-opts`).
+
+| seat option (`games.nn_seat` key) | trait hooks | what |
+|---|---|---|
+| `psample` | `HAS_PSAMPLE`, `policy_sampled`, `uncommit_simultaneous` | other seats' sequentialised simultaneous choices are drawn from the network's prior inside the search (10.2) |
+| `belief_mix`, `belief_temp`, `belief_particles` | `HAS_BELIEF`, `belief_start`, `belief_particle`, `belief_target`, `belief_consistent`, `determinize_particle` | that share of the root worlds takes another seat's hidden choice from particles sampled with the network's own policy (10.3) |
+| `oracle_hands`, `oracle_p` | `DECISION_CLASSES`, `decision_class`, `HAS_ORACLE`, `determinize_oracle` | analysis: root worlds keep the true hidden information at decisions of the given classes (10.1) |
+| `class_sims` | `DECISION_CLASSES` | full-search simulations per decision class (10.1) |
+| `mask_features` | - | input ablation: feature indices zeroed in every network input of the seat (10.1) |
+| driver `trace` | - | results carry the game's seed and real moves (section 2.5) |
+
+`run.py` settings `psample`, `belief_mix`, `belief_temp`, `belief_particles` (docs/az.md 1.2)
+pass the opponent models to the run's self-play and evaluation seats alike (the agent's search),
+so a training fork switches them on with `tools/fork_run.py --set psample=1 --set
+belief_mix=...`. `zero.h2h` measures them: one checkpoint under two seat settings
+(`--a-opts` / `--b-opts`), or against an external player (`ext:jsbot`), with A's score by seat,
+the seat-adjusted Elo edge and the driver's counters.
+
+### 10.1 Analysis options (ported from Glass Road Zero's branch `oracle`)
+
+* **Decision classes**: `DECISION_CLASSES` names the game's classes, `decision_class()` gives the
+  pending decision's (Glass Road: `play` = everything outside `select`, `select` = the hand
+  picks). Seat keys taking class names: `oracle_hands`, `class_sims`.
+* **Oracle** (`oracle_hands`: False / True / 'all' / a class name / 'select+play' / a list ->
+  `TreeOpts::oracle`, a mask over classes; `oracle_p` in (0, 1]): at a root decision of a masked
+  class the root world comes from `determinize_oracle` (the true hidden information; the game
+  still reshuffles what nobody knows, e.g. Glass Road's building stacks) in an `oracle_p` share
+  of the simulations, `determinize` in the rest. The network input stays honest (`encode` never
+  reads hidden information). Analysis only: what is the hidden information worth?
+* **`class_sims`** ({class: simulations}): full searches at decisions of that class use that
+  many simulations (others `sims`).
+* **`mask_features`**: the listed inputs are zeroed in every leaf, belief row and record of the
+  seat (Glass Road: `[1697]` = `opp_selected`, the role-blind select before FEATURE_VERSION 1
+  made it constant).
+* **Traces** (`trace=True`): replayable games for offline probes (Glass Road
+  `grz.az.handprobe`).
+
+### 10.2 Policy-sampled simultaneous choices (`psample`)
+
+A simultaneous choice that the game sequentialises (Glass Road `select`: seat 0 picks its hand,
+then seat 1; each hand as 5 ascending atomic picks) puts the later chooser's decision below the
+earlier chooser's edge in every tree. Two wrong opponent models follow: when the root decider
+chooses first, the opponent's later choice is a PUCT node whose statistics are conditioned on
+the decider's hidden choice in the same tree (in-tree clairvoyance: it counter-picks our actual
+hand); when the root decider chooses second, `determinize` resamples the earlier choice
+uniformly (a random opponent). With `psample`:
+
+* **Walk**: at an expanded node whose decider is not the root decider and whose decision is
+  `policy_sampled()`, the option is drawn from the node's P0 (the network's noise-free prior,
+  evaluated from that seat's view - which never shows the root decider's hidden choice) instead
+  of PUCT. N / W / backups as usual (reports, reuse); the root is never sampled; a `simulate_with`
+  hook still has precedence. No extra network calls: those nodes are expanded as leaves anyway.
+* **Root worlds**: after `determinize(viewer)`, `uncommit_simultaneous(viewer)` takes back the
+  other seats' hidden commits of the same step (Glass Road: the earlier chooser's `select`
+  pick), which are then made after the viewer's choice, sampled as above. Not in oracle worlds.
+* So every search models the opponent's simultaneous choice the same way - a draw from the
+  network's own (role-blind) policy, never seeing our choice - and best-responds to it. Inside
+  the tree, later rounds' choices of the other seat are sampled whether it chooses first or
+  second there; the root decider's own later choices there stay PUCT (they may see the other
+  seat's sampled choice: a mild optimistic leak deep in the tree).
+* **Contract**: `policy_sampled` depends only on the decision (the node); `uncommit_simultaneous`
+  keeps the viewer's decider and legal actions (the root check of every simulation enforces it)
+  and its features. It needs features that do not reveal whether the other seat has committed
+  (Glass Road: `opp_selected` is always 0 since 2026-10-12): otherwise the network would see a
+  different decision in the un-committed worlds.
+* **Records**: the search changes, so the policy targets of the simultaneous choices change
+  (best responses to the policy instead of to a clairvoyant / uniform opponent): a training
+  fork, not a live switch.
+* **Reference and parity**: `zero/mcts.py` (`Tree(psample=True)`) implements the same rule;
+  `python -m zero.parity positions --psample` / `parity.positions(..., psample=True, poss=...)`.
+  On the secret game's hand-choice positions (`tests/test_opponent_models.py`, 6 positions, 96
+  simulations, 24 repetitions) and Glass Road's `select` positions of both choosers (its
+  `tests/test_opponent_models.py`, 6 positions, 64 simulations, 16 repetitions, stand-in scale
+  0.05), TV(Rust, Python) stays within 1.6x the Python-Python floor, and the check has power
+  (Rust with `psample` vs without: > 3x the floor).
+
+### 10.3 Belief prior (`belief_mix`, `belief_temp`, `belief_particles`)
+
+`determinize` samples another seat's hidden choice uniformly among the ones consistent with what
+the viewer observed, but the choice was made by a policy - in self-play, the network's own. The
+belief prior samples it from that policy, restricted to the consistent choices, with a uniform
+floor:
+
+* **Snapshot** (driver): whenever a seat starts a hidden choice (`belief_start()` = Some(key) at
+  its first decision of it; Glass Road: a seat's first `select` pick, key = the period), the
+  driver keeps a copy of the real state per (chooser, key) - whatever the chooser's seat kind
+  (network, bot, external: the JS bot's hands get a snapshot too). Only when some seat uses the
+  belief.
+* **Particles** (`zero_search::belief::BeliefJob`): when a belief seat's search starts at a
+  decision whose `belief_target(seat)` is (q, key) and no particles are cached for it, the driver
+  replays q's choice from the snapshot `belief_particles` (K) times, drawing every atomic option
+  of q from the network's prior at q's state (encoded from q's view, the seat's `mask_features`
+  applied), tempered p^(1/`belief_temp`), single-option decisions auto-stepped, until
+  `belief_particle(q)` gives the finished choice. One level (one decision of q) per network
+  batch: the distinct states of the level go into the seat's ordinary network batch as **belief
+  rows** (the leaf layout; the evaluator cannot tell them apart; only their priors are used);
+  identical prefixes are evaluated once, so a sharp policy costs few rows. The particles are
+  cached per (seat, chooser, key) for the rest of the game; a rolling epoch drops pending belief
+  rows (re-sampled with the new network) but keeps the cache.
+* **Worlds** (`TreeOpts::belief_mix`, `Tree::set_belief`): at every search start (and a reused
+  tree's restart) the particles `belief_consistent` with the root state are kept, repeats
+  included, so a uniform draw among them samples the policy prior conditioned on the observations
+  (exact restriction, as the consistent set is exact). Each root world: with probability
+  `belief_mix` `determinize_particle` with a uniformly drawn consistent particle, else
+  `determinize` (the uniform floor). No consistent particle: `determinize`. The oracle has
+  precedence; `psample`'s un-commit applies after.
+* **Counters** (`SearchDriver.stats()`): `belief_rows` (evaluated), `belief_jobs` (beliefs
+  sampled), `belief_targets` (searches at a decision with a belief target), `belief_searches`
+  (of those, with >= 1 consistent particle), `belief_missing`
+  (targets without a snapshot: uniform worlds instead, never silently), `belief_worlds` (root
+  worlds from a particle).
+* **Cost**: K x (choice length) rows at most per belief, far fewer with identical prefixes
+  (Glass Road, K = 64, 5 picks: measured in 10.5).
+* **Approximations**: tempering per atomic choice is not the tempered joint distribution; K is
+  finite (a choice the policy gives < 1/K is usually absent, which the uniform floor covers);
+  the floor's weight is fixed (not re-weighted by how well each component predicted the
+  observations).
+* The Python reference driver (`play.PyDriver`) has no belief prior (nor the analysis options).
+
+### 10.4 For a game: what to implement
+
+* `psample`: `HAS_PSAMPLE = true`; `policy_sampled()` true at every atomic decision of a
+  sequentialised simultaneous choice whose options do not depend on the other seats' hidden
+  choices of the same step; `uncommit_simultaneous(viewer)` in a determinized world where the
+  viewer is a later chooser: clear the earlier choosers' hidden commits and order the step so the
+  viewer decides first (no-op otherwise). The features must not reveal commits.
+* Belief: `HAS_BELIEF = true`; `belief_start` at the first decision of a hidden choice (a key the
+  target can name: e.g. the round); `belief_particle(q)` = the finished choice as a u64 (a bit
+  mask of cards); `belief_target(viewer)` = (q, key) while `determinize(viewer)` resamples that
+  choice; `belief_consistent` = the exact consistency test (the true choice always passes);
+  `determinize_particle` = `determinize` with the choice set to the particle.
+* Tests as Glass Road's `engine/tests/az_opponent.rs`: un-committed worlds play on to the end and
+  keep the viewer's options and features; the true choice is always consistent; particle worlds
+  keep the viewer's view; and the Python parity with `psample` at the simultaneous decisions.
+* The core's test bed is `zero_search::secret::SecretGame` (Rust tests in `secret.rs`,
+  `belief.rs`, `tree/tests.rs`, `driver/tests.rs`; Python `tests/test_opponent_models.py`).

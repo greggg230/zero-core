@@ -714,6 +714,7 @@ impl PySearchDriver {
         d.set_item("belief_rows", s.belief_rows)?;
         d.set_item("belief_jobs", s.belief_jobs)?;
         d.set_item("belief_searches", s.belief_searches)?;
+        d.set_item("belief_targets", s.belief_targets)?;
         d.set_item("belief_missing", s.belief_missing)?;
         d.set_item("belief_worlds", s.belief_worlds)?;
         Ok(d)

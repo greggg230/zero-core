@@ -86,6 +86,7 @@ struct Tally {
     belief_rows: u64,
     belief_jobs: u64,
     belief_searches: u64,
+    belief_targets: u64,
     belief_missing: u64,
     belief_worlds: u64,
 }
@@ -162,6 +163,7 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     k.belief_rows.fetch_add(n.belief_rows, Ordering::Relaxed);
     k.belief_jobs.fetch_add(n.belief_jobs, Ordering::Relaxed);
     k.belief_searches.fetch_add(n.belief_searches, Ordering::Relaxed);
+    k.belief_targets.fetch_add(n.belief_targets, Ordering::Relaxed);
     k.belief_missing.fetch_add(n.belief_missing, Ordering::Relaxed);
     k.belief_worlds.fetch_add(n.belief_worlds, Ordering::Relaxed);
     Ok(())
@@ -396,6 +398,7 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize, n: &mut Tal
         seat.class_sims.get(game.decision_class()).copied().filter(|&s| s > 0).unwrap_or(seat.sims)
     });
     let particles = belief_particles(&slot.bcache, game, seat, p);
+    n.belief_targets += (seat.belief() && game.belief_target(p).is_some()) as u64;
     let t = match slot.trees[p].as_mut() {
         None => {
             let mut t = slot.spare.pop().unwrap_or_default();

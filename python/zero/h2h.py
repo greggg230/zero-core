@@ -50,7 +50,8 @@ def _score(rs, seat_of_a):
     return w, math.sqrt(max(w * (1 - w), 1e-9) / n)
 
 
-STAT_KEYS = ('leaves', 'psampled', 'belief_rows', 'belief_jobs', 'belief_searches', 'belief_missing', 'belief_worlds')
+STAT_KEYS = ('leaves', 'psampled', 'belief_rows', 'belief_jobs', 'belief_targets', 'belief_searches', 'belief_missing',
+             'belief_worlds')
 
 
 def match(a, b=None, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None,
