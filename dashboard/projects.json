@@ -46,6 +46,15 @@
       "roots": ["C:/Users/Gregg Keithley/glassroad-zero/runs"],
       "pause": true,
       "yardstick": {"key": "eval_yard", "label": "JS bot"}
+    },
+    {
+      "id": "kingdombuilder",
+      "name": "Kingdom Builder Zero",
+      "repo": "C:/Users/Gregg Keithley/kingdombuilder-zero",
+      "dashboard": "http://desktop-j05412i:5300",
+      "roots": ["C:/Users/Gregg Keithley/kingdombuilder-zero/runs"],
+      "pause": true,
+      "yardstick": {"key": "eval_yard", "label": "JS bot"}
     }
   ]
 }
