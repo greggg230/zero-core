@@ -40,11 +40,15 @@ class GamePackage:
     presets         run presets added to zero.run.PRESETS ({'glassroad-2p': {...}})
     externals       external players: name -> factory(seed) or 'module:attr' (imported lazily)
     decision_kinds  game -> fn(sample dict) -> {kind: mask} or 'module:attr' (zero.targets)
+    replay_url      the game app's base URL for `zero.replay --upload` (docs/replays.md)
+    replay_hint     the external asked what it would do at each recorded network decision
+                    ('ext:jsbot'; None: no hints)
+    replay_opp      the default opponent of `zero.replay` ('ext:jsbot'; None: 'self')
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
-                 externals=None, decision_kinds=None):
+                 externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -59,6 +63,9 @@ class GamePackage:
         self.presets = dict(presets or {})
         self.externals = dict(externals or {})
         self.decision_kinds = dict(decision_kinds or {})
+        self.replay_url = replay_url
+        self.replay_hint = replay_hint
+        self.replay_opp = replay_opp
 
     def spec_of(self, game):
         """The default spec of `game` ('' if none)."""
