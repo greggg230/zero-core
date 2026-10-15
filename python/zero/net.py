@@ -202,17 +202,58 @@ def load(path, device='cpu'):
     return m, ck.get('extra', {})
 
 
-def widen(old, features=None, actions=None):
+def _grid_index(cfg):
+    """(plane feature indices in channel order, global feature indices) of a GridNet config."""
+    g = cfg['grid']
+    cells = g['h'] * g['w']
+    segs = g.get('segments') or [[g.get('offset', 0), g['planes']]]
+    planes = [o + i for o, k in segs for i in range(k * cells)]
+    inplane = set(planes)
+    return planes, [i for i in range(cfg['features']) if i not in inplane]
+
+
+def widen(old, features=None, actions=None, grid=None):
     """A copy of `old` with `features` inputs / `actions` policy outputs (>= the old ones):
     new input columns get zero weights (the old outputs are unchanged), new actions zero
-    weights and bias (logit 0)."""
+    weights and bias (logit 0). GridNet: `grid` = the new board grid (the game package's) when
+    it adds planes (the old planes must come first, in the same order): the new planes get zero
+    input weights in the first conv."""
     cfg = dict(old.config)
     cfg['features'] = features or cfg['features']
     cfg['actions'] = actions or cfg['actions']
     if cfg['features'] < old.config['features'] or cfg['actions'] < old.config['actions']:
         raise ValueError('widen only grows a network')
+    if grid is not None and cfg.get('arch') == 'grid':
+        cfg['grid'] = dict(grid)
     new = build(cfg)
     st = new.state_dict()
+    if cfg.get('arch') == 'grid' and new.config['grid'] != old.config['grid']:
+        op, og = _grid_index(old.config)
+        npl, ng = _grid_index(new.config)
+        if npl[:len(op)] != op:
+            raise ValueError('widen: the new grid must keep the old planes first, in order')
+        if set(og) - set(ng):
+            raise ValueError('widen: an old global became a plane')
+        P0, P1 = old.config['grid']['planes'], new.config['grid']['planes']
+        pos = {f: k for k, f in enumerate(og)}
+        for k, v in old.state_dict().items():
+            if k == 'stem.weight':                   # [ch, planes (+ parity), 3, 3]
+                st[k].zero_()
+                st[k][:, :P0] = v[:, :P0]
+                if v.shape[1] > P0:                  # the row-parity plane comes last
+                    st[k][:, P1:] = v[:, P0:]
+            elif k == 'g.0.weight':
+                st[k].zero_()
+                for j, f in enumerate(ng):
+                    if f in pos:
+                        st[k][:, j] = v[:, pos[f]]
+            elif k in ('other.weight', 'other.bias'):
+                st[k].zero_()
+                st[k][:v.shape[0]] = v
+            else:
+                st[k] = v
+        new.load_state_dict(st)
+        return new.eval()
     if cfg.get('arch') == 'grid':
         # new features come after the board planes: new globals columns; new actions come
         # after the cell block: new rows of the `other` head

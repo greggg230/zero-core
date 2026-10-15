@@ -259,3 +259,26 @@ def test_graph_runner_matches_eager_and_follows_new_weights():
 def copy_of(m):
     import copy
     return copy.deepcopy(m)
+
+
+def test_gridnet_widen_adds_planes():
+    """A grid with a new plane block after the old ones: the widened net computes what the old
+    one did, whatever the new plane holds (its first-conv weights are zero)."""
+    from zero.net import GridNet
+    torch.manual_seed(8)
+    cells = 4 * 5
+    feats = 3 + 2 * cells + 7
+    old = GridNet(feats, 2 + cells + 4, GRID, ch=8, blocks=1, head=16, ghid=16).eval()
+    feats2 = feats + cells + 2                       # + one plane, + 2 globals
+    grid2 = dict(GRID, planes=3, segments=[[3, 2], [feats, 1]])
+    w = widen(old, feats2, grid=grid2)
+    assert w.config['grid']['planes'] == 3
+    x = torch.randn(4, feats)
+    n = torch.full((4,), 2)
+    x2 = torch.cat([x, torch.randn(4, cells + 2)], 1)
+    with torch.no_grad():
+        a, b = old(x, n), w(x2, n)
+    assert all(torch.allclose(u, v, atol=1e-5) for u, v in zip(a, b))
+    import pytest
+    with pytest.raises(ValueError):
+        widen(old, feats2, grid=dict(GRID, planes=3, segments=[[feats, 1], [3, 2]]))

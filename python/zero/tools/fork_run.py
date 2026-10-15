@@ -31,9 +31,11 @@ def new_run(src, run, game=None):
     import torch  # noqa: F401
     from .. import games
     from ..net import load, save, widen
+    from .. import package
     old, extra = load(src)
     info = games.info(game or old.config.get('game', 'toy'))
-    new = widen(old, info['num_features'], info['num_actions'])
+    grid = package.active().grids.get(game) if game and old.config.get('arch') == 'grid' else None
+    new = widen(old, info['num_features'], info['num_actions'], grid=grid)
     os.makedirs(os.path.join(run, 'models'), exist_ok=True)
     out = os.path.join(run, 'models', 'iter_0000.pt')
     save(new, out, {'iter': 0, 'forked_from': os.path.abspath(src), 'source_extra': extra})
