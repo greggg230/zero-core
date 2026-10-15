@@ -130,10 +130,13 @@ class RemoteEval:
 
     # ---- queue
     def done_iters(self):
+        """Iterations evaluated already: here before eval_remote (metrics rows with an evaluation)
+        or remotely (evals.jsonl)."""
+        from .run import read_metrics
+        out = {m['iter'] for m in read_metrics(self.R.run) if m.get('eval_yard')}
         p = os.path.join(self.R.run, 'evals.jsonl')
         if not os.path.exists(p):
-            return set()
-        out = set()
+            return out
         with open(p, encoding='utf-8') as f:
             for line in f:
                 try:
@@ -189,13 +192,22 @@ class RemoteEval:
         if self.shipped is None:
             self.t.mkdirs(self.rdir + '/models', self.rdir + '/elo')
             self.shipped = set(self.t.listdir(self.rdir + '/models'))
+            if 'results.json' not in self.t.listdir(self.rdir + '/elo'):
+                # a new mirror: the run's Elo so far (results incl. the evaluations logged here
+                # before eval_remote) and its metrics, so the remote continues them
+                for src, dst in ((os.path.join(self.R.run, 'elo', 'results.json'), '/elo/results.json'),
+                                 (os.path.join(self.R.run, 'metrics.jsonl'), '/metrics.jsonl')):
+                    if os.path.exists(src):
+                        self.t.put(src, self.rdir + dst)
         cfg = dict(c, eval_remote='', **self.spec.get('overrides', {}))
         tmp = os.path.join(self.R.run, '.remote_config.json')
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, indent=1)
         self.t.put(tmp, self.rdir + '/config.json')
         e = max(1, int(c['eval_every']))
-        need = [it] + [it - off * e for off in elo.OFFSETS if it - off * e >= 0]
+        # every checkpoint Run.elo_update may play up to `it` (each evaluated one and its offsets)
+        need = sorted({j for k in [0, *range(e, it + 1, e)] for j in [k] + [k - off * e for off in elo.OFFSETS]
+                       if 0 <= j <= it})
         for k in need:
             fn = elo.ckpt_name(k) + '.pt'
             if fn not in self.shipped and os.path.exists(model_path(self.R.run, k)):
@@ -244,7 +256,13 @@ class _Lock:
                 return self
             except FileExistsError:
                 try:
-                    if time.time() - os.path.getmtime(self.path) > LOCK_STALE_S:
+                    with open(os.path.join(self.path, 'owner')) as f:
+                        pid = int(f.read().split()[0])
+                    alive = _alive(pid)
+                except (OSError, ValueError, IndexError):
+                    alive = True                       # being created: wait
+                try:
+                    if not alive or time.time() - os.path.getmtime(self.path) > LOCK_STALE_S:
                         shutil.rmtree(self.path, ignore_errors=True)
                         continue
                 except OSError:
@@ -253,6 +271,16 @@ class _Lock:
 
     def __exit__(self, *a):
         shutil.rmtree(self.path, ignore_errors=True)
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
 
 
 def evaluate_mirror(rdir, it):

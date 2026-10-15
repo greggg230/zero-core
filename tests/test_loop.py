@@ -209,3 +209,23 @@ def test_remote_evaluation_local(tmp_path):
     from zero import dashboard
     rows = dashboard._metrics(str(run))
     assert rows[2]['eval_yard'] == next(e for e in ev if e['iter'] == 2)['eval_yard'] and 'elo' in rows[2]
+
+
+def test_remote_evaluation_continues_a_local_run(tmp_path):
+    """Switching eval_remote on for a run evaluated here so far: nothing evaluated again, the
+    remote continues the run's Elo (the local matches are kept)."""
+    run = tmp_path / 'sw'
+    p = run_loop(run, '--iters', '2', '--yardstick', 'ext:toyheur')
+    assert p.returncode == 0, p.stdout + p.stderr
+    before = json.load(open(run / 'elo' / 'results.json'))
+    p = run_loop(run, '--iters', '4', '--yardstick', 'ext:toyheur', '--eval-remote', 'local',
+                 env={'ZERO_REMOTE_WORKDIR': str(tmp_path / 'mirror')})
+    assert p.returncode == 0, p.stdout + p.stderr
+    ev = [json.loads(line) for line in open(run / 'evals.jsonl')]
+    assert sorted(e['iter'] for e in ev) == [3, 4]
+    after = json.load(open(run / 'elo' / 'results.json'))
+    pairs = lambda r: {json.dumps(x, sort_keys=True) for x in (r['pairs'].items() if isinstance(r['pairs'], dict) else r['pairs'])}  # noqa: E731
+    assert before['pairs'] and pairs(before) <= pairs(after), 'the local Elo matches are kept'
+    assert set(before['logged']) <= set(after['logged'])
+    r = json.load(open(run / 'elo' / 'ratings.json'))['ratings']
+    assert {'iter_0001', 'iter_0004'} <= set(r)
