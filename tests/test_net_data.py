@@ -183,3 +183,30 @@ def test_gridnet_rejects_a_grid_that_does_not_fit():
     from zero.net import GridNet
     with pytest.raises(ValueError):
         GridNet(10, 30, GRID)
+
+
+def test_gridnet_plane_segments():
+    """Planes in two blocks (a layout appending planes after its globals) = the same network as
+    one block over the planes gathered in that order."""
+    from zero.net import GridNet
+    torch.manual_seed(4)
+    cells = 4 * 5
+    feats = 3 + 2 * cells + 7 + 1 * cells            # globals 3, planes 2, globals 7, plane 1
+    grid = {'h': 4, 'w': 5, 'segments': [[3, 2], [3 + 2 * cells + 7, 1]], 'cell_action0': 2, 'planes': 3}
+    m = GridNet(feats, 2 + cells + 4, grid, ch=8, blocks=1, head=16, ghid=16).eval()
+    assert m.config['grid']['planes'] == 3 and m.config['grid']['offset'] == 3
+    x = torch.randn(5, feats)
+    n = torch.full((5,), 2)
+    # the same weights on the reordered input: [3 globals, planes 0-1, plane 2, 7 globals]
+    one = GridNet(feats, 2 + cells + 4, {'h': 4, 'w': 5, 'planes': 3, 'offset': 3, 'cell_action0': 2}, ch=8, blocks=1,
+                  head=16, ghid=16).eval()
+    one.load_state_dict(m.state_dict())
+    o2 = 3 + 2 * cells
+    xr = torch.cat([x[:, :o2], x[:, o2 + 7:], x[:, o2:o2 + 7]], 1)
+    with torch.no_grad():
+        a, b = m(x, n), one(xr, n)
+    assert all(torch.allclose(u, v, atol=1e-5) for u, v in zip(a, b))
+    w = widen(m, feats + 6)
+    with torch.no_grad():
+        c = w(torch.cat([x, torch.randn(5, 6)], 1), n)
+    assert all(torch.allclose(u, v, atol=1e-5) for u, v in zip(a, c))

@@ -93,13 +93,17 @@ class GridBlock(nn.Module):
 
 class GridNet(nn.Module):
     """grid: {planes, h, w, offset (first plane feature), cell_action0 (the action of cell 0;
-    cells are row-major, as the planes), hex ('odd-r' adds a row-parity plane, or none)}."""
+    cells are row-major, as the planes), hex ('odd-r' adds a row-parity plane, or none),
+    segments (optional: [[offset, planes], ...] when the planes sit in several blocks of the
+    features, e.g. a layout that appends planes after its globals; default [[offset, planes]])}.
+    Every feature outside the plane blocks is a global."""
 
     def __init__(self, features, actions, grid, ch=64, blocks=6, seats=MAX_SEATS, game='toy', head=128, ghid=128,
                  arch='grid'):
         super().__init__()
-        grid = {'planes': int(grid['planes']), 'h': int(grid['h']), 'w': int(grid['w']), 'offset': int(grid.get('offset', 0)),
-                'cell_action0': int(grid.get('cell_action0', 0)), 'hex': grid.get('hex', 'odd-r')}
+        segs = [[int(o), int(k)] for o, k in grid.get('segments') or [[grid.get('offset', 0), grid['planes']]]]
+        grid = {'planes': sum(k for _, k in segs), 'h': int(grid['h']), 'w': int(grid['w']), 'offset': segs[0][0],
+                'cell_action0': int(grid.get('cell_action0', 0)), 'hex': grid.get('hex', 'odd-r'), 'segments': segs}
         self.config = {'arch': 'grid', 'features': features, 'actions': actions, 'grid': grid, 'ch': ch, 'blocks': blocks,
                        'seats': seats, 'game': game, 'head': head, 'ghid': ghid}
         self.features = features
@@ -107,8 +111,16 @@ class GridNet(nn.Module):
         P, H, W = grid['planes'], grid['h'], grid['w']
         self.P, self.H, self.W, self.off, self.a0 = P, H, W, grid['offset'], grid['cell_action0']
         self.n = P * H * W
-        if self.off + self.n > features or self.a0 + H * W > actions:
+        cells = H * W
+        pidx = [o + i for o, k in segs for i in range(k * cells)]
+        if max(pidx) >= features or len(set(pidx)) != len(pidx) or self.a0 + cells > actions:
             raise ValueError(f'grid {grid} does not fit {features} features / {actions} actions')
+        # one block: slices; several: gathers (the globals in feature order, so widen appends)
+        self.contig = len(segs) == 1
+        inplane = set(pidx)
+        self.register_buffer('pidx', torch.tensor(pidx, dtype=torch.long), persistent=False)
+        self.register_buffer('gidx', torch.tensor([i for i in range(features) if i not in inplane], dtype=torch.long),
+                             persistent=False)
         extra = 1 if grid['hex'] == 'odd-r' else 0
         par = torch.zeros(1, extra, H, W)
         if extra:
@@ -130,8 +142,12 @@ class GridNet(nn.Module):
         B = x.shape[0]
         x = x[:, :self.features]
         o, n = self.off, self.n
-        p = x[:, o:o + n].reshape(B, self.P, self.H, self.W)
-        g = self.g(torch.cat([x[:, :o], x[:, o + n:]], 1))
+        if self.contig:
+            p = x[:, o:o + n].reshape(B, self.P, self.H, self.W)
+            g = self.g(torch.cat([x[:, :o], x[:, o + n:]], 1))
+        else:
+            p = x.index_select(1, self.pidx).reshape(B, self.P, self.H, self.W)
+            g = self.g(x.index_select(1, self.gidx))
         if self.par.shape[1]:
             p = torch.cat([p, self.par.expand(B, -1, -1, -1)], 1)
         h = F.relu(self.stem_n(self.stem(p)) + self.stem_g(g)[:, :, None, None])
