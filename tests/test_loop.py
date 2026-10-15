@@ -188,3 +188,24 @@ def test_dashboard(smoke_run, tmp_path):
     r = c.post('/api/run/smoke/resume', json={})
     assert r.status_code == 200 and not os.path.exists(smoke_run / 'PAUSE')
     assert c.post('/api/run/smoke/explode', json={}).status_code == 404
+
+
+def test_remote_evaluation_local(tmp_path):
+    """eval_remote: the loop trains without evaluating; every evaluated checkpoint is evaluated on
+    the remote (here 'local': a mirror dir and a subprocess) into evals.jsonl + elo/, which the
+    dashboard merges into the iterations' rows."""
+    run = tmp_path / 'rem'
+    p = run_loop(run, '--iters', '2', '--yardstick', 'ext:toyheur', '--eval-remote', 'local',
+                 env={'ZERO_REMOTE_WORKDIR': str(tmp_path / 'mirror')})
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    assert [r['iter'] for r in m] == [0, 1, 2] and not any('eval_yard' in r for r in m)
+    ev = [json.loads(line) for line in open(run / 'evals.jsonl')]
+    assert sorted(e['iter'] for e in ev) == [0, 1, 2]
+    assert all(e['eval_yard']['games'] == 8 and e['eval_yard']['opp'] == 'ext:toyheur' and e['host'] == 'local' for e in ev)
+    r = json.load(open(run / 'elo' / 'ratings.json'))
+    assert {'iter_0000', 'iter_0002', 'random'} <= set(r['ratings'])
+    assert (tmp_path / 'mirror' / 'rem' / 'models' / 'iter_0002.pt').exists()
+    from zero import dashboard
+    rows = dashboard._metrics(str(run))
+    assert rows[2]['eval_yard'] == next(e for e in ev if e['iter'] == 2)['eval_yard'] and 'elo' in rows[2]

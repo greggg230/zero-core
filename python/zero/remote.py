@@ -1,0 +1,286 @@
+"""Remote evaluation (docs/az.md 5.2): a run's checkpoint evaluations - the yardstick and random
+games, the Elo matches against older checkpoints - played on another machine while the run keeps
+training (run setting `eval_remote` = a name in the game package's `remotes`).
+
+Local side (`RemoteEval`, a thread of the run process): each evaluated iteration is shipped to
+the remote's mirror of the run (`<workdir>/<run name>`: config.json with the remote's overrides,
+the checkpoints the evaluation needs), evaluated there with `python -m <pkg>.az.remote eval
+<mirror> <iter>`, and its result appended to the run's `evals.jsonl` ({iter, eval_yard,
+eval_random, elo, time, host, seconds}); the mirror's elo/ files and models/index.json are copied
+back (the remote owns the run's Elo while `eval_remote` is on). The dashboards merge evals.jsonl
+into the iterations' rows. Evaluations missing after a restart are queued again; a failure (the
+remote asleep or offline) is retried every `RETRY_S`.
+
+Remote side (`main`): the run's own `Run.evaluate` + `Run.elo_update` on the mirror, one
+evaluation at a time per remote workdir (a lock directory), the result printed as one line
+`ZERO_REMOTE_RESULT {json}`.
+
+A remote: {host: 'user@host' (or 'local': this machine, the tests), repo: the game repo there
+(same code as the run's checkout), python, workdir, env: {...}, overrides: run settings for the
+remote ({'infer_device': 'mps', 'threads': 12})}.
+"""
+import json
+import os
+import queue
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+from . import elo, package
+
+RETRY_S = 300
+RESULT = 'ZERO_REMOTE_RESULT '
+LOCK_STALE_S = 4 * 3600
+
+
+def remote_spec(name):
+    pkg = package.active()
+    if name == 'local':
+        return dict({'host': 'local', 'repo': pkg.root, 'python': sys.executable,
+                     'workdir': os.environ.get('ZERO_REMOTE_WORKDIR', os.path.join(tempfile.gettempdir(), 'zero-remote')),
+                     'env': {}, 'overrides': {}}, **pkg.remotes.get('local', {}))
+    if name not in pkg.remotes:
+        raise SystemExit(f'eval_remote {name!r}: not in the game package remotes ({sorted(pkg.remotes)})')
+    return dict({'env': {}, 'overrides': {}}, **pkg.remotes[name])
+
+
+class Transport:
+    """Files and commands on a remote ('local': this machine)."""
+
+    def __init__(self, spec):
+        self.s = spec
+        self.local = spec['host'] == 'local'
+
+    def _ssh(self, sh, timeout):
+        return subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', self.s['host'], sh],
+                              capture_output=True, text=True, timeout=timeout)
+
+    def mkdirs(self, *paths):
+        if self.local:
+            for p in paths:
+                os.makedirs(p, exist_ok=True)
+            return
+        r = self._ssh('mkdir -p ' + ' '.join(shlex.quote(p) for p in paths), 60)
+        if r.returncode:
+            raise RuntimeError(f'mkdir on {self.s["host"]}: {r.stderr.strip()[-300:]}')
+
+    def put(self, src, dst):
+        if self.local:
+            shutil.copyfile(src, dst)
+            return
+        r = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', src, f'{self.s["host"]}:{dst}'],
+                           capture_output=True, text=True, timeout=600)
+        if r.returncode:
+            raise RuntimeError(f'scp {src} -> {self.s["host"]}: {r.stderr.strip()[-300:]}')
+
+    def get(self, src, dst):
+        """Copy a remote file here (False if it does not exist)."""
+        if self.local:
+            if not os.path.exists(src):
+                return False
+            shutil.copyfile(src, dst + '.tmp')
+            os.replace(dst + '.tmp', dst)
+            return True
+        r = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', f'{self.s["host"]}:{src}', dst + '.tmp'],
+                           capture_output=True, text=True, timeout=600)
+        if r.returncode:
+            return False
+        os.replace(dst + '.tmp', dst)
+        return True
+
+    def listdir(self, d):
+        if self.local:
+            return os.listdir(d) if os.path.isdir(d) else []
+        r = self._ssh(f'ls {shlex.quote(d)} 2>/dev/null', 60)
+        return r.stdout.split()
+
+    def run_module(self, module, args, timeout):
+        env = {k: str(v) for k, v in self.s.get('env', {}).items()}
+        if self.local:
+            env.setdefault('PYTHONPATH', os.pathsep.join(p for p in sys.path if p))
+            return subprocess.run([self.s['python'], '-m', module, *args], cwd=self.s['repo'], capture_output=True,
+                                  text=True, timeout=timeout, env=dict(os.environ, **env))
+        exports = ' '.join(f'{k}={shlex.quote(v)}' for k, v in env.items())
+        sh = (f'cd {shlex.quote(self.s["repo"])} && {exports} {shlex.quote(self.s["python"])} -m {module} '
+              + ' '.join(shlex.quote(a) for a in args))
+        return self._ssh(sh, timeout)
+
+
+class RemoteEval:
+    """The run's evaluations on the remote `name` (see the module docstring)."""
+
+    def __init__(self, R, name):
+        self.R = R
+        self.name = name
+        self.spec = remote_spec(name)
+        self.t = Transport(self.spec)
+        run_name = os.path.basename(os.path.normpath(R.run))
+        self.rdir = self.spec['workdir'].rstrip('/') + '/' + run_name
+        self.module = f'{package.active().name}.az.remote' if package.active().name != 'zero' else 'zero.remote'
+        self.q = queue.Queue()
+        self.queued = set()
+        self.shipped = None
+        self.lock = threading.Lock()
+        self.th = threading.Thread(target=self._loop, name='zero-remote-eval', daemon=True)
+        self.th.start()
+
+    # ---- queue
+    def done_iters(self):
+        p = os.path.join(self.R.run, 'evals.jsonl')
+        if not os.path.exists(p):
+            return set()
+        out = set()
+        with open(p, encoding='utf-8') as f:
+            for line in f:
+                try:
+                    out.add(json.loads(line)['iter'])
+                except (ValueError, KeyError):
+                    pass
+        return out
+
+    def enqueue(self, it):
+        with self.lock:
+            if it in self.queued:
+                return
+            self.queued.add(it)
+        self.q.put(it)
+
+    def backfill(self, latest):
+        """Queue the evaluation iterations up to `latest` without a result (after a restart)."""
+        from .run import model_path
+        e = max(1, int(self.R.cfg['eval_every']))
+        done = self.done_iters()
+        for k in sorted({0, *range(e, latest + 1, e)}):
+            if k not in done and os.path.exists(model_path(self.R.run, k)):
+                self.enqueue(k)
+
+    def drain(self, timeout=6 * 3600):
+        """Wait until every queued evaluation has a result (the run finished its iterations)."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self.lock:
+                if not self.queued:
+                    return True
+            time.sleep(2)
+        return False
+
+    # ---- the worker
+    def _loop(self):
+        while True:
+            it = self.q.get()
+            while True:
+                try:
+                    self._evaluate(it)
+                    break
+                except Exception as ex:                # noqa: BLE001 (logged, retried)
+                    self.R.log(f'remote eval {self.name} iter {it}: {type(ex).__name__}: {str(ex)[-400:]}; retry in {RETRY_S}s')
+                    self.shipped = None
+                    time.sleep(RETRY_S)
+            with self.lock:
+                self.queued.discard(it)
+
+    def _ship(self, it):
+        from .run import model_path
+        c = self.R.cfg
+        if self.shipped is None:
+            self.t.mkdirs(self.rdir + '/models', self.rdir + '/elo')
+            self.shipped = set(self.t.listdir(self.rdir + '/models'))
+        cfg = dict(c, eval_remote='', **self.spec.get('overrides', {}))
+        tmp = os.path.join(self.R.run, '.remote_config.json')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=1)
+        self.t.put(tmp, self.rdir + '/config.json')
+        e = max(1, int(c['eval_every']))
+        need = [it] + [it - off * e for off in elo.OFFSETS if it - off * e >= 0]
+        for k in need:
+            fn = elo.ckpt_name(k) + '.pt'
+            if fn not in self.shipped and os.path.exists(model_path(self.R.run, k)):
+                self.t.put(model_path(self.R.run, k), self.rdir + '/models/' + fn)
+                self.shipped.add(fn)
+
+    def _evaluate(self, it):
+        t0 = time.time()
+        self._ship(it)
+        r = self.t.run_module(self.module, ['eval', self.rdir, str(it)], timeout=4 * 3600)
+        lines = [ln for ln in (r.stdout or '').splitlines() if ln.startswith(RESULT)]
+        if r.returncode or not lines:
+            raise RuntimeError(f'exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[-600:]}')
+        m = json.loads(lines[-1][len(RESULT):])
+        row = {'iter': it, 'time': time.time(), 'host': self.name, 'seconds': round(time.time() - t0, 1)}
+        for k in ('eval_yard', 'eval_random', 'elo'):
+            if k in m:
+                row[k] = m[k]
+        os.makedirs(os.path.join(self.R.run, 'elo'), exist_ok=True)
+        for fn in ('results.json', 'ratings.json'):
+            self.t.get(self.rdir + '/elo/' + fn, os.path.join(self.R.run, 'elo', fn))
+        self.t.get(self.rdir + '/models/index.json', os.path.join(self.R.run, 'models', 'index.json'))
+        with open(os.path.join(self.R.run, 'evals.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(row) + '\n')
+        ey = row.get('eval_yard')
+        if ey:
+            self.R.log(f'iter {it} vs {ey.get("opp", self.R.yard)} (remote {self.name}, {row["seconds"]:.0f}s): {ey}')
+        if row.get('elo'):
+            self.R.log(f'iter {it} elo {row["elo"]["elo"]:.0f} +-{1.96 * row["elo"]["se"]:.0f} (remote {self.name})')
+
+
+# ------------------------------------------------------------------ the remote side
+
+class _Lock:
+    """One remote evaluation at a time per workdir (a lock directory; stale after LOCK_STALE_S)."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        while True:
+            try:
+                os.mkdir(self.path)
+                with open(os.path.join(self.path, 'owner'), 'w') as f:
+                    f.write(f'{os.getpid()} {time.time()}')
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(self.path) > LOCK_STALE_S:
+                        shutil.rmtree(self.path, ignore_errors=True)
+                        continue
+                except OSError:
+                    continue
+                time.sleep(5)
+
+    def __exit__(self, *a):
+        shutil.rmtree(self.path, ignore_errors=True)
+
+
+def evaluate_mirror(rdir, it):
+    """Run.evaluate + Run.elo_update of iteration `it` on the mirror `rdir`. -> the metrics row."""
+    from .run import Run, append_metrics
+    with open(os.path.join(rdir, 'config.json'), encoding='utf-8') as f:
+        cfg = json.load(f)
+    R = Run(rdir, cfg)
+    m = {'iter': it}
+    R.evaluate(it, m)
+    ratings, best = R.elo_update(it, m)
+    me = ratings.get(elo.ckpt_name(it))
+    if me:
+        m['elo'] = {'elo': round(me[0], 1), 'se': round(me[1], 1)}
+    m['time'] = time.time()
+    append_metrics(rdir, m)
+    return m
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 3 or argv[0] != 'eval':
+        raise SystemExit('usage: python -m <pkg>.az.remote eval MIRROR_DIR ITER')
+    rdir, it = argv[1], int(argv[2])
+    with _Lock(os.path.join(os.path.dirname(os.path.normpath(rdir)), '.eval.lock')):
+        m = evaluate_mirror(rdir, it)
+    print(RESULT + json.dumps(m), flush=True)
+
+
+if __name__ == '__main__':
+    main()

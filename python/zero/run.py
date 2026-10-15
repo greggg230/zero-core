@@ -84,6 +84,9 @@ DEFAULTS = dict(
     # evaluation: the yardstick (Elo anchor = 1000): a built-in bot or 'ext:<name>'
     yardstick='heuristic', eval_games=200, eval_sims=32, eval_random_games=50, eval_every=1, elo_games=100,
     ref_games=400,
+    # evaluation on another machine (a name in the game package's `remotes`, 'local' for tests;
+    # '' = here): the loop queues each evaluated checkpoint and keeps training (zero.remote)
+    eval_remote='',
     infer_device='cpu', train_device='cpu', seed=0,
 )
 
@@ -204,6 +207,7 @@ class Run:
         self.run, self.cfg, self.pw = run, cfg, pause
         self.info = G.info(cfg['game'])
         self.yard = cfg['yardstick']
+        self.remote = None                         # zero.remote.RemoteEval when eval_remote is set
         self.roll = None                           # rolling driver + its evaluator
         self.roll_ev = None
 
@@ -509,16 +513,20 @@ class Run:
         """The checkpoint exists: evaluation, Elo, metrics."""
         c = self.cfg
         _write_json(os.path.join(self.run, 'progress.json'), {'iter': it, 'phase': 'eval', 'time': time.time()})
-        if it % max(1, int(c['eval_every'])) == 0 or it == 0:
-            self.evaluate(it, m)
-        ratings, best = self.elo_update(it, m)
-        me = ratings.get(elo.ckpt_name(it))
-        if me:
-            m['elo'] = {'elo': round(me[0], 1), 'se': round(me[1], 1)}
-            self.log(f'iter {it} elo {me[0]:.0f} +-{1.96 * me[1]:.0f}; best {best["file"]} {best["elo"]:.0f}')
+        evaluated = it % max(1, int(c['eval_every'])) == 0 or it == 0
+        if self.remote is None:
+            if evaluated:
+                self.evaluate(it, m)
+            ratings, best = self.elo_update(it, m)
+            me = ratings.get(elo.ckpt_name(it))
+            if me:
+                m['elo'] = {'elo': round(me[0], 1), 'se': round(me[1], 1)}
+                self.log(f'iter {it} elo {me[0]:.0f} +-{1.96 * me[1]:.0f}; best {best["file"]} {best["elo"]:.0f}')
         m['seconds'] = time.time() - t0 + m.get('resumed_seconds', 0)
         m['time'] = time.time()
         append_metrics(self.run, m)
+        if self.remote is not None and evaluated:
+            self.remote.enqueue(it)
         try:
             os.remove(self.partial_path(it))
         except OSError:
@@ -539,6 +547,11 @@ class Run:
             start = 0
         done = {m['iter'] for m in read_metrics(run)}
         self.log(f'run {run} starting after iter {start}; cfg {json.dumps(c)}')
+        if c.get('eval_remote'):
+            from .remote import RemoteEval
+            self.remote = RemoteEval(self, c['eval_remote'])
+            self.remote.backfill(start if start in done else start - 1)
+            self.log(f'evaluations on the remote {c["eval_remote"]!r} ({self.remote.spec["host"]})')
         if start not in done:                      # iteration 0, or a checkpoint whose evaluation was interrupted
             t0 = time.time()
             m = {'iter': start}
@@ -563,6 +576,9 @@ class Run:
                  'resumed_seconds': 0}
             _write_json(self.partial_path(it), dict(m, resumed_seconds=time.time() - t0))
             self.finish_iter(it, m, t0)
+        if self.remote is not None and not os.path.exists(stop):
+            _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
+            self.remote.drain()
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})
 
 

@@ -41,9 +41,8 @@ def _json(path, default=None):
         return default
 
 
-def _metrics(d):
+def _jsonl(p):
     rows = []
-    p = os.path.join(d, 'metrics.jsonl')
     if os.path.exists(p):
         with open(p, encoding='utf-8') as f:
             for line in f:
@@ -53,6 +52,21 @@ def _metrics(d):
                         rows.append(json.loads(line))
                     except ValueError:
                         pass                      # a line being written right now
+    return rows
+
+
+def _metrics(d):
+    """metrics.jsonl, with the remote evaluations (evals.jsonl, zero.remote) merged into their
+    iterations' rows."""
+    rows = _jsonl(os.path.join(d, 'metrics.jsonl'))
+    evals = {e['iter']: e for e in _jsonl(os.path.join(d, 'evals.jsonl')) if 'iter' in e}
+    if evals:
+        for m in rows:
+            e = evals.get(m.get('iter'))
+            if e:
+                for k in ('eval_yard', 'eval_random', 'elo'):
+                    if k in e:
+                        m[k] = e[k]
     return rows
 
 

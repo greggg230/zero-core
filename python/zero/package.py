@@ -46,12 +46,14 @@ class GamePackage:
     replay_opp      the default opponent of `zero.replay` ('ext:jsbot'; None: 'self')
     grids           game -> its board planes for arch 'grid' networks (net.GridNet):
                     {planes, h, w, offset, cell_action0, hex: 'odd-r' | None}
+    remotes         name -> a machine for remote evaluation (run setting eval_remote; zero.remote):
+                    {host, repo, python, workdir, env, overrides}
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
-                 grids=None):
+                 grids=None, remotes=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -70,6 +72,7 @@ class GamePackage:
         self.replay_hint = replay_hint
         self.replay_opp = replay_opp
         self.grids = dict(grids or {})
+        self.remotes = dict(remotes or {})
 
     def spec_of(self, game):
         """The default spec of `game` ('' if none)."""
