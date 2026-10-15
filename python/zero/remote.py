@@ -288,6 +288,12 @@ def evaluate_mirror(rdir, it):
     from .run import Run, append_metrics
     with open(os.path.join(rdir, 'config.json'), encoding='utf-8') as f:
         cfg = json.load(f)
+    # the remote machine's own settings for every run it evaluates (<workdir>/overrides.json, e.g.
+    # {"groups": 1, "elo_games": 50}: fewer, larger inference batches suit a slower GPU)
+    ov = os.path.join(os.path.dirname(os.path.normpath(rdir)), 'overrides.json')
+    if os.path.exists(ov):
+        with open(ov, encoding='utf-8') as f:
+            cfg.update(json.load(f))
     R = Run(rdir, cfg)
     m = {'iter': it}
     R.evaluate(it, m)
