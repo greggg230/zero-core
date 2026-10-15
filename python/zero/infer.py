@@ -13,6 +13,12 @@ one download per batch, and the legal options' softmax on the CPU (numpy). Kingd
 batch 512 on a shared RTX 5090: 13.6 ms per call eager (7.3 forward, 2.1 upload, ~4 gathers,
 softmax and three downloads).
 
+`drive` keeps up to two network batches in flight when the evaluators can (`launch` /
+`result`) and the driver can be polled (`poll_batch`): the next batch is uploaded and replayed
+while the previous one's results come back and are softmaxed on the CPU (one CUDA stream keeps
+the graphs' static inputs in order; the pinned host buffers alternate between two slots).
+ZERO_INFLIGHT=1: one batch at a time, as before.
+
 `drive(driver, evaluators, externals)` runs any driver to the end (or to the end of a rolling
 phase): network batches go to `evaluators[key]`, external batches to `externals[key]` (one
 payload string per request). `check()` is called after every batch (PAUSE: raises).
@@ -76,7 +82,9 @@ class GraphRunner:
         self.S = model.seats
         self.graphs = {}
         self.pool = torch.cuda.graph_pool_handle()
-        self.pin_in = self.pin_out = None
+        self.slots = [None, None]                    # per slot: pinned in / n / out buffers
+        self.busy = [None, None]                     # per slot: its launch not yet collected
+        self.turn = 0
 
     def refresh(self):
         new = _fold(self.base).state_dict()
@@ -84,12 +92,14 @@ class GraphRunner:
             for k, t in self.net.state_dict().items():
                 t.copy_(new[k])
 
-    def _buffers(self, Bp):
-        if self.pin_in is None or self.pin_in.shape[0] < Bp:
+    def _buffers(self, slot, Bp):
+        b = self.slots[slot]
+        if b is None or b[0].shape[0] < Bp:
             n = max(Bp, 1024)
-            self.pin_in = torch.empty((n, self.F), dtype=torch.float32).pin_memory()
-            self.pin_n = torch.empty(n, dtype=torch.int64).pin_memory()
-            self.pin_out = torch.empty((n, self.A + 2 * self.S), dtype=torch.float32).pin_memory()
+            b = self.slots[slot] = (torch.empty((n, self.F), dtype=torch.float32).pin_memory(),
+                                    torch.empty(n, dtype=torch.int64).pin_memory(),
+                                    torch.empty((n, self.A + 2 * self.S), dtype=torch.float32).pin_memory())
+        return b
 
     def _run(self, x, n):
         with torch.autocast('cuda', dtype=torch.bfloat16):
@@ -113,21 +123,34 @@ class GraphRunner:
             g = self.graphs[Bp] = (graph, x, n, out)
         return g
 
-    def evaluate(self, x, n_players, opt_off, opt_action):
+    def launch(self, x, n_players, opt_off, opt_action):
+        """Upload a batch and queue its graph and download; -> a handle for `result` (at most two
+        launches outstanding: a third waits for the oldest)."""
         B = x.shape[0]
         Bp = -(-B // ROW_STEP) * ROW_STEP
-        self._buffers(Bp)
+        slot = self.turn
+        self.turn ^= 1
+        if self.busy[slot] is not None:              # the slot's buffers are still in use
+            self.busy[slot].synchronize()
+        pin_in, pin_n, pin_out = self._buffers(slot, Bp)
         graph, xs, ns, out = self._graph(Bp)
-        pin_x = self.pin_in[:B]
-        pin_x.numpy()[:] = x[:, :self.F] if x.shape[1] >= self.F else np.pad(x, ((0, 0), (0, self.F - x.shape[1])))
-        self.pin_n[:B].numpy()[:] = n_players
-        xs[:B].copy_(pin_x, non_blocking=True)
-        ns[:B].copy_(self.pin_n[:B], non_blocking=True)
+        pin_in[:B].numpy()[:] = x[:, :self.F] if x.shape[1] >= self.F else np.pad(x, ((0, 0), (0, self.F - x.shape[1])))
+        pin_n[:B].numpy()[:] = n_players
+        xs[:B].copy_(pin_in[:B], non_blocking=True)
+        ns[:B].copy_(pin_n[:B], non_blocking=True)
         graph.replay()
-        host = self.pin_out[:B]
-        host.copy_(out[:B], non_blocking=True)
-        torch.cuda.current_stream().synchronize()
-        o = host.numpy()
+        pin_out[:B].copy_(out[:B], non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self.busy[slot] = ev
+        return (ev, slot, B, n_players, opt_off, opt_action)
+
+    def result(self, h):
+        ev, slot, B, n_players, opt_off, opt_action = h
+        ev.synchronize()
+        if self.busy[slot] is ev:
+            self.busy[slot] = None
+        o = self.slots[slot][2][:B].numpy()
         A, S = self.A, self.S
         rows = np.repeat(np.arange(B), np.diff(opt_off))
         pri = segment_softmax_np(o[rows, opt_action], opt_off)
@@ -135,8 +158,11 @@ class GraphRunner:
         margin = np.zeros((B, MAX_SEATS), np.float32)
         value[:, :S] = o[:, A:A + S]
         margin[:, :S] = o[:, A + S:A + 2 * S]
-        value[np.arange(MAX_SEATS)[None, :] >= n_players[:, None]] = 0.0
+        value[np.arange(MAX_SEATS)[None, :] >= np.asarray(n_players)[:, None]] = 0.0
         return pri, value, margin
+
+    def evaluate(self, x, n_players, opt_off, opt_action):
+        return self.result(self.launch(x, n_players, opt_off, opt_action))
 
 
 def use_amp(model, device):
@@ -167,7 +193,7 @@ class NetEvaluator:
     def evaluate(self, x, n_players, opt_off, opt_action):
         """numpy in -> (priors [options], value [B, MAX_SEATS], margin [B, MAX_SEATS]) numpy."""
         t0 = time.perf_counter()
-        if self.fast is not None and len(opt_off) > 1 and np.all(np.diff(opt_off) > 0):
+        if self._graphable(opt_off):
             r = self.fast.evaluate(x, n_players, opt_off, opt_action)
             self.calls += 1
             self.leaves += x.shape[0]
@@ -202,6 +228,31 @@ class NetEvaluator:
     def __call__(self, lb):
         return self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action)
 
+    def _graphable(self, opt_off):
+        return self.fast is not None and len(opt_off) > 1 and bool(np.all(np.diff(opt_off) > 0))
+
+    def launch(self, lb):
+        """Start evaluating a LeafBatch; `result(handle)` -> what `ev(lb)` returns. Eager
+        evaluators compute at once."""
+        t0 = time.perf_counter()
+        if self._graphable(lb.opt_off):
+            h = ('g', self.fast.launch(lb.x, lb.n_players, lb.opt_off, lb.opt_action), lb.B)
+        else:
+            h = ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action), 0)
+        self.seconds += time.perf_counter() - t0
+        return h
+
+    def result(self, h):
+        kind, v, B = h
+        if kind == 'd':
+            return v
+        t0 = time.perf_counter()
+        r = self.fast.result(v)
+        self.calls += 1
+        self.leaves += B
+        self.seconds += time.perf_counter() - t0
+        return r
+
 
 class UniformEvaluator:
     """Uniform priors, value 1/n for every seat present, margin 0."""
@@ -221,6 +272,9 @@ def drive(driver, evaluators, externals=None, check=None, on_batch=None, ext_thr
     externals = externals or {}
     if externals and hasattr(driver, 'poll_batch'):
         return _drive_async(driver, evaluators, externals, check, on_batch, ext_threads)
+    inflight = int(os.environ.get('ZERO_INFLIGHT', '2'))
+    if inflight > 1 and hasattr(driver, 'poll_batch') and evaluators and all(hasattr(e, 'launch') for e in evaluators.values()):
+        return _drive_pipelined(driver, evaluators, check, on_batch, inflight)
     nb = 0
     while True:
         lb = driver.next_batch()
@@ -235,6 +289,38 @@ def drive(driver, evaluators, externals=None, check=None, on_batch=None, ext_thr
             on_batch(lb)
         if check is not None:
             check()
+
+
+def _drive_pipelined(driver, evaluators, check, on_batch, inflight):
+    """`drive` with up to `inflight` network batches launched before the oldest is collected
+    (no external players). Results are submitted in launch order."""
+    from collections import deque
+    pending = deque()                              # (batch, evaluator, handle)
+    nb = 0
+
+    def finish():
+        nonlocal nb
+        lb, ev, h = pending.popleft()
+        driver.submit(lb.id, *ev.result(h))
+        nb += 1
+        if on_batch is not None:
+            on_batch(lb)
+        if check is not None:
+            check()
+
+    while True:
+        lb = driver.poll_batch() if pending else driver.next_batch()
+        if lb is None:
+            if not pending:
+                return nb
+            finish()                               # nothing new ready: the oldest's results
+            continue
+        if lb.external:
+            raise RuntimeError('external batch in a drive without external players')
+        ev = evaluators[lb.key]
+        pending.append((lb, ev, ev.launch(lb)))
+        if len(pending) >= inflight:
+            finish()
 
 
 def _external(externals, lb):
