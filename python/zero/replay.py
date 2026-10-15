@@ -89,7 +89,7 @@ class RecordingDriver(PyDriver):
     # ---- protocol additions -----------------------------------------------------------------
     def submit_external(self, bid, payloads):
         lb, items = self.ext_out.pop(bid)
-        for (slot, p, kind, frame), payload in zip(items, payloads):
+        for (slot, p, kind, frame, _), payload in zip(items, payloads):
             x = json.loads(payload)
             if kind == 'hint':
                 frame['hint'] = {'by': f'ext:{self.hint}', 'x': x}
@@ -129,7 +129,7 @@ class RecordingDriver(PyDriver):
         return len(slot.states) - 1
 
     def _ext_batch(self, key, items):
-        a = {'states': [it[0].game.export_state() for it in items],
+        a = {'states': [it[4] for it in items],
              'player': np.asarray([it[1] for it in items], np.int32),
              'n_players': np.asarray([it[0].n for it in items], np.int32),
              'gid': np.asarray([it[0].gid for it in items], np.int64)}
@@ -167,7 +167,8 @@ class RecordingDriver(PyDriver):
                 seat = slot.seats[p]
                 if isinstance(seat, ExtSeat):
                     slot.waiting = True
-                    ext.setdefault(seat.name, []).append((slot, p, 'move', {'s': self._state(slot), 'p': p, 'k': 'ext'}))
+                    ext.setdefault(seat.name, []).append((slot, p, 'move', {'s': self._state(slot), 'p': p, 'k': 'ext'},
+                                                          slot.last_state))
                     break
                 if not isinstance(seat, NNSeat):
                     slot.frame = {'s': self._state(slot), 'p': p, 'k': 'bot'}
@@ -179,7 +180,7 @@ class RecordingDriver(PyDriver):
                     slot.frame = {'s': s, 'p': p, 'k': 'nn'}
                     if self.hint and s != slot.hinted:
                         slot.hinted = s
-                        hints.append((slot, p, 'hint', slot.frame))
+                        hints.append((slot, p, 'hint', slot.frame, slot.last_state))
                 tree = slot.trees[p]
                 if slot.sims >= slot.target:
                     self._decide(slot, seat, tree, p)
