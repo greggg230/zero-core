@@ -150,6 +150,8 @@ class GridNet(nn.Module):
             g = self.g(x.index_select(1, self.gidx))
         if self.par.shape[1]:
             p = torch.cat([p, self.par.expand(B, -1, -1, -1)], 1)
+        if getattr(self, 'channels_last', False):        # infer.GraphRunner's folded copy
+            p = p.contiguous(memory_format=torch.channels_last)
         h = F.relu(self.stem_n(self.stem(p)) + self.stem_g(g)[:, :, None, None])
         for b in self.blocks:
             h = b(h, g)

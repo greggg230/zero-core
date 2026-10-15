@@ -210,3 +210,52 @@ def test_gridnet_plane_segments():
     with torch.no_grad():
         c = w(torch.cat([x, torch.randn(5, 6)], 1), n)
     assert all(torch.allclose(u, v, atol=1e-5) for u, v in zip(a, c))
+
+
+def test_segment_softmax_np_matches_the_reference():
+    from zero.infer import segment_softmax_np
+    rng = np.random.default_rng(5)
+    cnt = rng.integers(1, 9, size=50)
+    off = np.concatenate([[0], np.cumsum(cnt)]).astype(np.int64)
+    lg = rng.normal(size=off[-1]).astype(np.float32) * 5
+    assert np.allclose(segment_softmax_np(lg, off), protocol.segment_softmax(lg, off), atol=1e-6)
+
+
+def test_graph_runner_matches_eager_and_follows_new_weights():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA graphs need CUDA')
+    from zero.net import GridNet
+    torch.manual_seed(6)
+    feats, acts = 3 + 2 * 4 * 5 + 7, 2 + 20 + 4
+    m = GridNet(feats, acts, GRID, ch=16, blocks=2, head=16, ghid=16)
+    m.train()
+    with torch.no_grad():                             # non-trivial BatchNorm statistics
+        for _ in range(3):
+            m(torch.randn(64, feats), torch.full((64,), 2))
+    m.eval()
+    rng = np.random.default_rng(7)
+    B = 70                                            # padded to 128 inside
+    x = rng.normal(size=(B, feats)).astype(np.float32)
+    npl = np.array([2, 3] * 35, np.int32)
+    cnt = rng.integers(1, 6, size=B)
+    off = np.concatenate([[0], np.cumsum(cnt)]).astype(np.int32)
+    opt = np.concatenate([np.sort(rng.choice(acts, size=c, replace=False)) for c in cnt]).astype(np.int32)
+    eager = NetEvaluator(m, 'cuda', graphs=False)
+    fast = NetEvaluator(copy_of(m), 'cuda', graphs=True)
+    assert fast.fast is not None and eager.fast is None
+    for _ in range(2):
+        pe, ve, me = eager.evaluate(x, npl, off, opt)
+        pf, vf, mf = fast.evaluate(x, npl, off, opt)
+        assert np.abs(pe - pf).max() < 0.03 and np.abs(ve - vf).max() < 0.03 and np.abs(me - mf).max() < 0.1
+        assert np.all(vf[npl == 2][:, 2:] == 0)
+        # new weights (rolling self-play): both evaluators take them; the graphs read them in place
+        new = {k: (v + 0.05 * torch.randn_like(v) if v.is_floating_point() and 'running' not in k else v)
+               for k, v in m.state_dict().items()}
+        eager.set_weights(new)
+        fast.set_weights(new)
+
+
+def copy_of(m):
+    import copy
+    return copy.deepcopy(m)
