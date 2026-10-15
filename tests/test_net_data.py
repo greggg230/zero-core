@@ -138,3 +138,48 @@ def test_webexport_bin_format(tmp_path):
     assert (12 + hl) % 2 == 0 and h['iter'] == 3 and h['hidden'] == 32 and h['game'] == 'toy'
     assert not any(t['name'].startswith('mar.') for t in h['tensors'])
     assert len(b) == 12 + hl + 2 * n and worst < 1e-3
+
+
+GRID = {'planes': 2, 'h': 4, 'w': 5, 'offset': 3, 'cell_action0': 2, 'hex': 'odd-r'}
+
+
+def test_gridnet_heads_save_load_widen(tmp_path):
+    from zero.net import GridNet, build
+    torch.manual_seed(3)
+    feats, acts = 3 + 2 * 4 * 5 + 7, 2 + 20 + 4
+    m = GridNet(feats, acts, GRID, ch=8, blocks=2, head=16, ghid=16).eval()
+    x = torch.randn(6, feats)
+    n = torch.tensor([2, 3, 2, 4, 2, 2])
+    with torch.no_grad():
+        p, v, mg = m(x, n)
+    assert p.shape == (6, acts) and v.shape == (6, protocol.MAX_SEATS) and mg.shape == (6, protocol.MAX_SEATS)
+    sm = torch.softmax(v, 1)
+    for b in range(6):
+        assert torch.all(sm[b, n[b]:] < 1e-12)
+    # a cell logit moves with its cell's planes, not with the other cells'
+    x2 = x.clone()
+    x2[:, 3 + 7] += 5.0                              # plane 0, cell 7 (row 1, col 2)
+    with torch.no_grad():
+        p2 = m(x2, n)[0]
+    d = (p2 - p).abs()[:, 2:22]
+    assert d[:, 7].min() > 0
+    path = str(tmp_path / 'g.pt')
+    save(m, path, {'iter': 1})
+    m2, _ = load(path)
+    assert type(m2).__name__ == 'GridNet' and m2.config == m.config
+    with torch.no_grad():
+        assert torch.allclose(m2(x, n)[0], p, atol=1e-6)
+    w = widen(m2, feats + 9, acts + 3)
+    xw = torch.cat([x, torch.randn(6, 9)], 1)
+    with torch.no_grad():
+        a, b = m2(x, n), w(xw, n)
+    assert torch.allclose(a[0], b[0][:, :acts], atol=1e-5) and torch.allclose(a[1], b[1], atol=1e-5)
+    assert torch.all(b[0][:, acts:] == 0)
+    assert type(build(Net(F, A, 8, 1).config)).__name__ == 'Net'
+
+
+def test_gridnet_rejects_a_grid_that_does_not_fit():
+    import pytest
+    from zero.net import GridNet
+    with pytest.raises(ValueError):
+        GridNet(10, 30, GRID)

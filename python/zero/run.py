@@ -35,8 +35,8 @@ import torch.nn.functional as F
 
 from . import elo, games as G, package, runctl
 from .data import ShardWriter, TargetStats, Window, shard_paths
-from .infer import NetEvaluator, drive
-from .net import Net, load, save
+from .infer import NetEvaluator, drive, use_amp
+from .net import GridNet, Net, load, save
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, Paused
 
@@ -68,8 +68,10 @@ DEFAULTS = dict(
     # distribution) | 'cq' (Gumbel AlphaZero's completed-Q target softmax(ln P0 + (cq_c_visit +
     # max N) cq_c_scale completedQ), docs/search.md 3.1); the search itself is the same
     policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0,
-    # network (only when the run's first network is created)
-    hidden=256, blocks=4,
+    # network (only when the run's first network is created): arch 'mlp' (hidden x blocks) or
+    # 'grid' (a conv tower of `ch` channels x blocks over the game package's board planes,
+    # GamePackage.grids; net.GridNet)
+    hidden=256, blocks=4, arch='mlp', ch=64,
     # training: steps = new samples * reuse / batch (at least min_steps); AdamW; LR halving
     # every lr_halve_every iterations (floor lr_min), linear warmup while the optimizer state
     # is fresh
@@ -215,6 +217,12 @@ class Run:
     # ---------------------------------------------------------------- models
     def new_model(self):
         torch.manual_seed(self.cfg['seed'])
+        if self.cfg.get('arch', 'mlp') == 'grid':
+            grid = package.active().grids.get(self.cfg['game'])
+            if not grid:
+                raise SystemExit(f"arch 'grid': the game package has no grid for {self.cfg['game']!r} (GamePackage.grids)")
+            return GridNet(self.info['num_features'], self.info['num_actions'], grid, self.cfg['ch'], self.cfg['blocks'],
+                           game=self.cfg['game']).eval()
         return Net(self.info['num_features'], self.info['num_actions'], self.cfg['hidden'], self.cfg['blocks'],
                    game=self.cfg['game']).eval()
 
@@ -357,6 +365,7 @@ class Run:
         steps = max(c['min_steps'], math.ceil(new_samples * c['reuse'] / c['batch']))
         vq = value_q_at(c, it)
         mw = c['margin_loss_w']
+        amp = use_amp(model, dev)
         rng = np.random.default_rng(c['seed'] * 31 + it)
         acc = {'policy': 0.0, 'value': 0.0, 'margin': 0.0, 'entropy': 0.0, 'value_acc': 0.0}
         last = min(steps, 200)
@@ -367,7 +376,9 @@ class Run:
             for g in opt.param_groups:
                 g['lr'] = g_lr
             b = W.batch(rng.integers(W.N, size=c['batch']), dev)
-            plog, vlog, mp = model(b['x'], b['n_players'])
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
+                plog, vlog, mp = model(b['x'], b['n_players'])
+            plog, vlog, mp = plog.float(), vlog.float(), mp.float()
             logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)
             lp = -(b['pi'] * logp).sum(1).mean()
             zt = ((1 - vq) * b['z'] + vq * b['q'])[:, :S]

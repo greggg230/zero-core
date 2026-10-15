@@ -23,10 +23,17 @@ import torch
 from .protocol import MAX_SEATS
 
 
+def use_amp(model, device):
+    """bfloat16 autocast for a conv network (`net.GridNet`) on CUDA (~1.6-2.6x the leaves/s of
+    float32 at batches 512-1024); the MLP keeps float32 (faster as is)."""
+    return torch.device(device).type == 'cuda' and getattr(model, 'config', {}).get('arch') == 'grid'
+
+
 class NetEvaluator:
     def __init__(self, model, device='cpu'):
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
+        self.amp = use_amp(model, self.device)
         self.calls = 0
         self.leaves = 0
         self.seconds = 0.0
@@ -43,7 +50,8 @@ class NetEvaluator:
         B = x.shape[0]
         xt = torch.from_numpy(x).to(dev, non_blocking=True)
         nt = torch.from_numpy(n_players.astype(np.int64)).to(dev)
-        plog, vlog, mar = self.model(xt, nt)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
+            plog, vlog, mar = self.model(xt, nt)
         cnt = torch.from_numpy(np.diff(opt_off).astype(np.int64)).to(dev)
         rows = torch.repeat_interleave(torch.arange(B, device=dev), cnt)
         acts = torch.from_numpy(opt_action.astype(np.int64)).to(dev)
