@@ -93,7 +93,9 @@ def play_turn(game, searcher, max_steps=200):
         else:
             tree, st = searcher.search(game, tree)
             a = best_action(tree)
+            rw = tree.root_win()
             st['options'] = len(legal)
+            st['win'] = None if rw is None else float(rw[seat])      # the search's P(win) of the seat
             stats.append(st)
         keys, done = game.step_external(a)
         moves.extend(done)
