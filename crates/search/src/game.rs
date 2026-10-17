@@ -76,6 +76,20 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
         let _ = (payload, chance);
         Err(format!("{}: external seats are not supported", Self::NAME))
     }
+    /// A game from an external state description (the format of `export_state`): serving a
+    /// live game the network plays in (e.g. a web app asks it for a move). The state may hold
+    /// information hidden from the seat to move; the search determinizes it away.
+    fn import_state(spec: &Self::Spec, state: &str) -> Result<Self, String> {
+        let _ = (spec, state);
+        Err(format!("{}: importing an external state is not supported", Self::NAME))
+    }
+    /// `step`, also pushing the external-format moves (JSON, what `apply_external` / the
+    /// external app accepts) this action completed: an AZ action may complete none (a pick of a
+    /// multi-pick move), one or several of the game's own moves. Default: none.
+    fn step_external(&mut self, a: u16, chance: &mut Vec<u64>, moves: &mut Vec<String>) -> Result<(), String> {
+        let _ = moves;
+        self.step(a, chance)
+    }
     /// Game-specific built-in bots (`random` is always available).
     fn bot_names() -> &'static [&'static str] {
         &[]

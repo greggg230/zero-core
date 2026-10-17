@@ -20,7 +20,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use zero_search::driver::{sample_arrays, Batch, DriverCfg, KeyKind, NnSeat, PolicyTarget, SeatCfg};
-use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
+use zero_search::dynapi::{boxed_driver, boxed_game, boxed_import, game_info, DynDriver, DynGame, DynTree, GameInfo};
 use zero_search::{SearchGame, MAX_SEATS};
 
 /// For `engine_module!` (the game crate needs its own `pyo3` dependency too: the PyO3 macros
@@ -33,11 +33,13 @@ pub struct GameEntry {
     pub new_game: fn(&str, usize, u64) -> Result<Box<dyn DynGame>, String>,
     pub new_driver: fn(DriverCfg) -> Result<Box<dyn DynDriver>, String>,
     pub info: fn() -> GameInfo,
+    /// (spec, external state) -> a game (`SearchGame::import_state`)
+    pub from_state: fn(&str, &str) -> Result<Box<dyn DynGame>, String>,
 }
 
 impl GameEntry {
     pub const fn of<G: SearchGame>(name: &'static str) -> GameEntry {
-        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G> }
+        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G>, from_state: boxed_import::<G> }
     }
 }
 
@@ -231,6 +233,14 @@ impl PyGame {
         let s = spec_json(spec)?;
         Ok(PyGame { g: new_game(game, &s, players, seed).map_err(verr)? })
     }
+    /// A game from an external state (the format of `export_state`, e.g. a web app's game):
+    /// `Game.from_state('kingdombuilder', state_json, spec=None)`.
+    #[staticmethod]
+    #[pyo3(signature = (game, state, spec=None))]
+    fn from_state(game: &str, state: &str, spec: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let s = spec_json(spec)?;
+        Ok(PyGame { g: (entry(game).map_err(verr)?.from_state)(&s, state).map_err(verr)? })
+    }
     fn clone(&self) -> PyGame {
         PyGame { g: self.g.clone_box() }
     }
@@ -295,6 +305,10 @@ impl PyGame {
     fn apply_external(&mut self, payload: &str) -> PyResult<Vec<u64>> {
         self.g.apply_external(payload).map_err(verr)
     }
+    /// `step` -> (chance keys, the external-format moves (JSON strings) the action completed).
+    fn step_external(&mut self, a: u16) -> PyResult<(Vec<u64>, Vec<String>)> {
+        self.g.step_external(a).map_err(verr)
+    }
     /// A Rust search tree for the pending decision.
     #[pyo3(signature = (redet=true, seed=0))]
     fn search_tree(&self, redet: bool, seed: u64) -> PyResult<PySearchTree> {
@@ -327,6 +341,19 @@ impl PySearchTree {
     #[pyo3(signature = (priors, value, margin, margin_w=0.0))]
     fn expand(&mut self, priors: Vec<f32>, value: Vec<f32>, margin: Vec<f32>, margin_w: f64) -> PyResult<()> {
         self.t.expand(&priors, &value, &margin, margin_w).map_err(rerr)
+    }
+    /// Up to k simulations evaluated together (virtual loss `vloss` on each walk's path) ->
+    /// ([(decider, features, legal actions)] of the distinct leaves, simulations done); then
+    /// `expand_batch` with their evaluations in order.
+    #[pyo3(signature = (game, k, c_puct, chance_k=0, margin_w=0.0, vloss=0.0))]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn simulate_batch<'py>(&mut self, py: Python<'py>, game: &PyGame, k: usize, c_puct: f64, chance_k: u32, margin_w: f64, vloss: f64) -> PyResult<(Vec<(usize, Bound<'py, numpy::PyArray1<f32>>, Vec<u16>)>, u32)> {
+        let (leaves, done) = self.t.simulate_batch(&*game.g, k, c_puct, chance_k, margin_w, vloss).map_err(rerr)?;
+        Ok((leaves.into_iter().map(|l| (l.player, l.x.into_pyarray(py), l.acts)).collect(), done))
+    }
+    #[pyo3(signature = (priors, value, margin, margin_w=0.0))]
+    fn expand_batch(&mut self, priors: Vec<Vec<f32>>, value: Vec<Vec<f32>>, margin: Vec<Vec<f32>>, margin_w: f64) -> PyResult<()> {
+        self.t.expand_batch(&priors, &value, &margin, margin_w).map_err(rerr)
     }
     #[pyo3(signature = (alpha, eps, seed=None))]
     fn add_noise(&mut self, alpha: f64, eps: f64, seed: Option<u64>) {

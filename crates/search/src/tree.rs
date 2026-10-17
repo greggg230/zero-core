@@ -581,6 +581,33 @@ impl<G: SearchGame> Tree<G> {
         }
     }
 
+    /// Virtual loss for a batched search (several leaves of one tree evaluated in one network
+    /// call): along a walk to a leaf awaiting evaluation, N_i += 1, W_i += `vl` (a pessimistic
+    /// utility for each node's decider, e.g. 0 = a loss) and tot += 1, so the next walks of the
+    /// batch spread out. `revert_vloss` with the same path and `vl` undoes it exactly (before
+    /// the leaf's real `backup`); win sums are untouched.
+    pub fn apply_vloss(&mut self, path: &[(u32, u32)], vl: f64) {
+        for &(node, i) in path {
+            let nd = &mut self.nodes[node as usize];
+            let si = nd.stat_off as usize + i as usize;
+            nd.tot += 1;
+            let s = &mut self.stats[si];
+            s.n += 1;
+            s.w += vl;
+        }
+    }
+
+    pub fn revert_vloss(&mut self, path: &[(u32, u32)], vl: f64) {
+        for &(node, i) in path {
+            let nd = &mut self.nodes[node as usize];
+            let si = nd.stat_off as usize + i as usize;
+            nd.tot -= 1;
+            let s = &mut self.stats[si];
+            s.n -= 1;
+            s.w -= vl;
+        }
+    }
+
     /// Root Dirichlet noise: P = (1 - eps) P0 + eps Dir(alpha), if >= 2 options.
     pub fn add_noise(&mut self, node: u32, alpha: f64, eps: f64, rng: &mut Rng) {
         let n = self.nodes[node as usize].nacts as usize;
