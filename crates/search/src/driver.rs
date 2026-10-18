@@ -596,6 +596,11 @@ impl<G: SearchGame> Driver<G> {
         &self.sh.cfg
     }
 
+    /// The pool of the network batches' feature buffers (`XPool::donate`).
+    pub fn x_pool(&self) -> &Arc<XPool> {
+        &self.sh.x_pool
+    }
+
     fn pausing(&self) -> bool {
         self.sh.cfg.rolling && self.phase_games >= self.quota
     }

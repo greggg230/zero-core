@@ -4,6 +4,8 @@
 use std::any::Any;
 
 use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record};
+use crate::xbuf::XPool;
+use std::sync::Arc;
 use crate::game::{bot_names, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
 use crate::tree::{leaf_values, Scratch, Sim, Tree, Walk};
@@ -280,6 +282,8 @@ pub trait DynDriver: Send + Sync {
     fn in_flight(&self) -> InFlight;
     /// Evaluator keys in index order, and whether each is external.
     fn keys(&self) -> Vec<(String, bool)>;
+    /// The feature buffer pool (docs/search.md 2.2).
+    fn x_pool(&self) -> Arc<XPool>;
 }
 
 impl<G: SearchGame> DynDriver for Driver<G> {
@@ -321,6 +325,9 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     }
     fn keys(&self) -> Vec<(String, bool)> {
         self.cfg().keys.iter().map(|(k, t)| (k.clone(), *t == KeyKind::External)).collect()
+    }
+    fn x_pool(&self) -> Arc<XPool> {
+        Driver::x_pool(self).clone()
     }
 }
 

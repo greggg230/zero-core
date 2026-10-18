@@ -10,6 +10,12 @@
 //! conversion runs in the parallel fill jobs). Training shards store features as float16, so
 //! the network already learns from float16-rounded inputs; float32 stays the default and is
 //! bit-exact with the game's encoding.
+//!
+//! The caller may donate buffers of its own (`XPool::donate`, e.g. pinned host memory from
+//! torch: the fill jobs then write the features where the GPU upload reads them, and the feed
+//! thread copies nothing). A donated buffer's owner (an opaque object, e.g. the Python array)
+//! is kept alive as long as the pool or a batch holds the buffer.
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 /// Element type of a network batch's features.
@@ -42,6 +48,30 @@ impl XDtype {
 enum XData {
     F32(Vec<f32>),
     F16(Vec<u16>),
+    Ext(ExtBuf),
+}
+
+/// A buffer owned by someone else (`XPool::donate`): `elems` elements of `dtype` at `ptr`,
+/// valid while `owner` lives.
+pub struct ExtBuf {
+    ptr: *mut u8,
+    elems: usize,
+    dtype: XDtype,
+    _owner: Box<dyn Any + Send + Sync>,
+}
+
+// SAFETY: the memory belongs to `_owner` (Send + Sync) and is only accessed through the pool's
+// discipline: one XBuf at a time, the fill jobs writing disjoint rows.
+unsafe impl Send for ExtBuf {}
+unsafe impl Sync for ExtBuf {}
+
+impl ExtBuf {
+    /// # Safety
+    /// `ptr` points to `elems` writable, suitably aligned elements of `dtype` that stay valid
+    /// and are not accessed by anyone else while `owner` lives and the pool has the buffer.
+    pub unsafe fn new(ptr: *mut u8, elems: usize, dtype: XDtype, owner: Box<dyn Any + Send + Sync>) -> ExtBuf {
+        ExtBuf { ptr, elems, dtype, _owner: owner }
+    }
 }
 
 impl XData {
@@ -55,32 +85,60 @@ impl XData {
         match self {
             XData::F32(_) => XDtype::F32,
             XData::F16(_) => XDtype::F16,
+            XData::Ext(e) => e.dtype,
         }
     }
     fn cap(&self) -> usize {
         match self {
             XData::F32(v) => v.len(),
             XData::F16(v) => v.len(),
+            XData::Ext(e) => e.elems,
         }
     }
 }
 
 /// Spare buffers of one driver: `elems` elements each (the largest batch: a group's slots x F),
-/// at most `keep` of them (more are freed when returned).
+/// at most `keep` own ones plus every donated one (more own ones are freed when returned).
 pub struct XPool {
     dtype: XDtype,
     elems: usize,
     keep: usize,
-    free: Mutex<Vec<XData>>,
+    st: Mutex<PoolState>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    free: Vec<XData>,
+    donated: usize,
 }
 
 impl XPool {
     pub fn new(dtype: XDtype, elems: usize, keep: usize) -> Arc<XPool> {
-        Arc::new(XPool { dtype, elems, keep, free: Mutex::new(Vec::new()) })
+        Arc::new(XPool { dtype, elems, keep, st: Mutex::new(PoolState::default()) })
     }
 
     pub fn dtype(&self) -> XDtype {
         self.dtype
+    }
+    /// Elements per buffer.
+    pub fn elems(&self) -> usize {
+        self.elems
+    }
+    /// Buffers worth donating: `keep` minus those donated so far.
+    pub fn wanted(&self) -> usize {
+        self.keep.saturating_sub(self.st.lock().unwrap().donated)
+    }
+
+    /// Add a buffer of the caller's (at least `elems` elements of the pool's dtype); batches
+    /// prefer donated buffers.
+    pub fn donate(&self, b: ExtBuf) -> Result<(), String> {
+        if b.dtype != self.dtype || b.elems < self.elems {
+            return Err(format!("donated feature buffer: {} x {} elements, the pool needs {} x {}", b.dtype.name(), b.elems, self.dtype.name(), self.elems));
+        }
+        let mut st = self.st.lock().unwrap();
+        st.donated += 1;
+        st.free.push(XData::Ext(b));
+        Ok(())
     }
 
     /// A buffer for `len` elements (contents unspecified: the caller writes all of them).
@@ -88,22 +146,32 @@ impl XPool {
         if len > self.elems {
             return XBuf { data: XData::alloc(self.dtype, len), len, pool: None };
         }
-        let data = self.free.lock().unwrap().pop().unwrap_or_else(|| XData::alloc(self.dtype, self.elems));
+        let data = {
+            let mut st = self.st.lock().unwrap();
+            match st.free.iter().rposition(|d| matches!(d, XData::Ext(_))) {
+                Some(i) => Some(st.free.swap_remove(i)),
+                None => st.free.pop(),
+            }
+        };
+        let data = data.unwrap_or_else(|| XData::alloc(self.dtype, self.elems));
         XBuf { data, len, pool: Some(self.clone()) }
     }
 
     fn put(&self, data: XData) {
         if data.dtype() == self.dtype && data.cap() >= self.elems {
-            let mut f = self.free.lock().unwrap();
-            if f.len() < self.keep {
-                f.push(data);
+            let mut st = self.st.lock().unwrap();
+            let own = st.free.iter().filter(|d| !matches!(d, XData::Ext(_))).count();
+            if matches!(data, XData::Ext(_)) || own < self.keep {
+                st.free.push(data);
+                return;
             }
         }
+        drop(data); // outside the lock (a donated owner may take a while to drop)
     }
 
     /// Spare buffers now (tests).
     pub fn spare(&self) -> usize {
-        self.free.lock().unwrap().len()
+        self.st.lock().unwrap().free.len()
     }
 }
 
@@ -132,28 +200,41 @@ impl XBuf {
     pub fn as_f32(&self) -> Option<&[f32]> {
         match &self.data {
             XData::F32(v) => Some(&v[..self.len]),
-            XData::F16(_) => None,
+            // SAFETY: see ExtBuf::new (the buffer is this XBuf's while it lives)
+            XData::Ext(e) if e.dtype == XDtype::F32 => Some(unsafe { std::slice::from_raw_parts(e.ptr as *const f32, self.len) }),
+            _ => None,
         }
     }
     /// The float16 bit patterns.
     pub fn as_f16_bits(&self) -> Option<&[u16]> {
         match &self.data {
             XData::F16(v) => Some(&v[..self.len]),
-            XData::F32(_) => None,
+            // SAFETY: as in as_f32
+            XData::Ext(e) if e.dtype == XDtype::F16 => Some(unsafe { std::slice::from_raw_parts(e.ptr as *const u16, self.len) }),
+            _ => None,
         }
     }
     /// The values as float32 (float16 widened exactly).
     pub fn to_f32(&self) -> Vec<f32> {
-        match &self.data {
-            XData::F32(v) => v[..self.len].to_vec(),
-            XData::F16(v) => v[..self.len].iter().map(|&h| f16_to_f32(h)).collect(),
+        match (self.as_f32(), self.as_f16_bits()) {
+            (Some(v), _) => v.to_vec(),
+            (_, Some(v)) => v.iter().map(|&h| f16_to_f32(h)).collect(),
+            _ => unreachable!(),
         }
+    }
+    /// In a donated buffer.
+    pub fn donated(&self) -> bool {
+        matches!(self.data, XData::Ext(_))
     }
     /// Raw destination for the fill jobs.
     pub(crate) fn ptr(&mut self) -> XPtr {
         match &mut self.data {
             XData::F32(v) => XPtr::F32(v.as_mut_ptr()),
             XData::F16(v) => XPtr::F16(v.as_mut_ptr()),
+            XData::Ext(e) => match e.dtype {
+                XDtype::F32 => XPtr::F32(e.ptr as *mut f32),
+                XDtype::F16 => XPtr::F16(e.ptr as *mut u16),
+            },
         }
     }
 }
@@ -167,9 +248,10 @@ impl Default for XBuf {
 impl Clone for XBuf {
     /// A copy outside the pool.
     fn clone(&self) -> XBuf {
-        let data = match &self.data {
-            XData::F32(v) => XData::F32(v[..self.len].to_vec()),
-            XData::F16(v) => XData::F16(v[..self.len].to_vec()),
+        let data = match (self.as_f32(), self.as_f16_bits()) {
+            (Some(v), _) => XData::F32(v.to_vec()),
+            (_, Some(v)) => XData::F16(v.to_vec()),
+            _ => unreachable!(),
         };
         XBuf { data, len: self.len, pool: None }
     }
@@ -177,7 +259,7 @@ impl Clone for XBuf {
 
 impl std::fmt::Debug for XBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "XBuf({}, {} elements, pooled {})", self.dtype().name(), self.len, self.pool.is_some())
+        write!(f, "XBuf({}, {} elements, pooled {}, donated {})", self.dtype().name(), self.len, self.pool.is_some(), self.donated())
     }
 }
 
@@ -388,5 +470,39 @@ mod tests {
         let e = p.take(5).clone();          // a clone is outside the pool
         drop(e);
         assert_eq!(p.spare(), 2);
+    }
+
+    #[test]
+    fn donated_buffers_are_preferred_and_kept() {
+        let p = XPool::new(XDtype::F32, 8, 1);
+        assert_eq!(p.wanted(), 1);
+        let mut mem: Vec<Box<[f32; 12]>> = (0..3).map(|_| Box::new([0.0f32; 12])).collect();
+        let ptrs: Vec<usize> = mem.iter_mut().map(|b| b.as_mut_ptr() as usize).collect();
+        let owners = Arc::new(());
+        for (i, b) in mem.into_iter().enumerate() {
+            let ptr = ptrs[i] as *mut u8;
+            // SAFETY: the box (the owner) holds 12 f32s, nobody else touches them
+            let e = unsafe { ExtBuf::new(ptr, if i == 2 { 4 } else { 12 }, XDtype::F32, Box::new((b, owners.clone()))) };
+            let r = p.donate(e);
+            assert_eq!(r.is_ok(), i < 2, "buffer {i}");
+        }
+        assert_eq!((p.wanted(), p.spare()), (0, 2));
+        assert_eq!(Arc::strong_count(&owners), 3); // the too-small one was dropped
+        let mut a = p.take(8);
+        let mut b = p.take(8);
+        let mut c = p.take(8); // no donated one left: an own buffer
+        assert!(a.donated() && b.donated() && !c.donated());
+        for (k, x) in [&mut a, &mut b, &mut c].into_iter().enumerate() {
+            let src: Vec<f32> = (0..8).map(|i| (k * 10 + i) as f32).collect();
+            // SAFETY: 8 elements fit every buffer
+            unsafe { x.ptr().write(0, &src) };
+            assert_eq!(x.to_f32(), src);
+        }
+        assert!(matches!(a.ptr(), XPtr::F32(q) if ptrs.contains(&(q as usize))));
+        drop((a, b, c));
+        assert_eq!(p.spare(), 3); // donated ones always come back
+        assert!(p.take(8).donated());
+        drop(p);
+        assert_eq!(Arc::strong_count(&owners), 1); // the pool released its owners
     }
 }

@@ -15,14 +15,14 @@
 use std::sync::OnceLock;
 
 use numpy::ndarray::ArrayView2;
-use numpy::{Element, IntoPyArray, PyArray2, PyArrayDescr, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{Element, IntoPyArray, PyArray2, PyArrayDescr, PyArrayDescrMethods, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use zero_search::driver::{sample_arrays, Batch, DriverCfg, KeyKind, NnSeat, PolicyTarget, SeatCfg};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
-use zero_search::xbuf::{XBuf, XDtype};
+use zero_search::xbuf::{ExtBuf, XBuf, XDtype};
 use zero_search::{SearchGame, MAX_SEATS};
 
 /// For `engine_module!` (the game crate needs its own `pyo3` dependency too: the PyO3 macros
@@ -491,6 +491,48 @@ impl PySearchDriver {
     #[getter]
     fn x_dtype(&self) -> &'static str {
         self.x_dtype.name()
+    }
+
+    /// The feature buffers `donate_x` takes: {'dtype': 'f32' | 'f16', 'rows', 'features',
+    /// 'wanted' (how many more are worth donating)}.
+    fn x_pool_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let p = self.d.x_pool();
+        let d = PyDict::new(py);
+        d.set_item("dtype", p.dtype().name())?;
+        d.set_item("rows", p.elems() / self.nfeat.max(1))?;
+        d.set_item("features", self.nfeat)?;
+        d.set_item("wanted", p.wanted())?;
+        Ok(d)
+    }
+
+    /// Give the driver buffers for its network batches' features (e.g. pinned host memory, so
+    /// the GPU upload reads the features where the search threads wrote them; docs/search.md
+    /// 2.2): each a writable C-contiguous numpy array of the driver's `x_dtype` with at least
+    /// rows x features elements (`x_pool_info`). The driver keeps a reference to each array and
+    /// writes batches into it; the caller must not touch them. -> the number donated.
+    fn donate_x(&mut self, arrays: Vec<Bound<'_, PyUntypedArray>>) -> PyResult<usize> {
+        let p = self.d.x_pool();
+        let want = if self.x_dtype == XDtype::F16 { b'e' } else { b'f' };
+        for a in &arrays {
+            let dt = a.dtype();
+            if dt.char() != want || dt.is_native_byteorder() == Some(false) {
+                return Err(PyValueError::new_err(format!("donate_x: dtype {} for x_dtype {}", dt, self.x_dtype.name())));
+            }
+            // SAFETY: a valid array object
+            let (data, flags) = unsafe { ((*a.as_array_ptr()).data, (*a.as_array_ptr()).flags) };
+            if !a.is_c_contiguous() || flags & numpy::npyffi::NPY_ARRAY_WRITEABLE == 0 {
+                return Err(PyValueError::new_err("donate_x: arrays must be writable and C-contiguous"));
+            }
+            let align = if self.x_dtype == XDtype::F16 { 2 } else { 4 };
+            if (data as usize) % align != 0 {
+                return Err(PyValueError::new_err("donate_x: misaligned array"));
+            }
+            // SAFETY: `data` holds a.len() writable, aligned elements of the pool's dtype; the
+            // driver keeps the array alive (the owner) and the caller promises not to use it.
+            let e = unsafe { ExtBuf::new(data.cast(), a.len(), self.x_dtype, Box::new(a.clone().into_any().unbind())) };
+            p.donate(e).map_err(verr)?;
+        }
+        Ok(arrays.len())
     }
 
     /// (id, key, kind, arrays) with kind 'nn' | 'ext', or None when every game has finished

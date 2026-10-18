@@ -19,12 +19,17 @@ while the previous one's results come back and are softmaxed on the CPU (one CUD
 the graphs' static inputs in order; the pinned host buffers alternate between two slots).
 ZERO_INFLIGHT=1: one batch at a time, as before.
 
-Features may come as float32 or float16 (the driver's `x_dtype`, run setting `feed_dtype`):
-float16 batches are copied and uploaded as they are and widened to float32 on the device (in
-the graph), so the network sees exactly `x.astype(np.float16).astype(np.float32)` - the inputs
-it is trained on (shards store float16). Kingdom Builder xst (19,870 features, batch 256): the
-feed thread spent ~7 ms per batch copying 20 MB of float32 into the pinned buffer and ~3.7 ms
-freeing the driver's buffer (now pooled), ~2 ms on the stream uploading it.
+The feed (docs/search.md 2.2): `drive` donates pinned host buffers to the driver
+(`SearchDriver.donate_x`, from `NetEvaluator.feed_buffers`; ZERO_PINNED_FEED=0: off), so the
+search threads write each batch's features where the upload reads them and the feed thread
+copies nothing (a batch in another buffer is copied into the slot's pinned buffer first, as
+before). Features may be float32 or float16 (the driver's `x_dtype`, run setting
+`feed_dtype`): float16 batches are uploaded as they are and widened to float32 on the device in
+the graph, so the network sees exactly `x.astype(np.float16).astype(np.float32)` - the inputs
+it is trained on (shards store float16). Kingdom Builder xst (19,870 features, batch 256, one
+of 3 self-play workers on the shared desktop): the feed thread spent ~6.8 ms per batch copying
+20 MB of float32 into the pinned buffer and ~3.7 ms freeing the driver's (unpooled) buffer, of
+~20 ms per batch; the upload took ~2 ms on the stream (float16: ~1).
 
 `drive(driver, evaluators, externals)` runs any driver to the end (or to the end of a rolling
 phase): network batches go to `evaluators[key]`, external batches to `externals[key]` (one
@@ -89,7 +94,8 @@ class GraphRunner:
         self.S = model.seats
         self.graphs = {}
         self.pool = torch.cuda.graph_pool_handle()
-        self.slots = [None, None]                    # per slot: pinned in / n / out buffers
+        self.slots = [None, None]                    # per slot: pinned n / out buffers
+        self.pin_x = [None, None]                    # per slot: pinned features (copied batches)
         self.busy = [None, None]                     # per slot: its launch not yet collected
         self.turn = 0
 
@@ -99,13 +105,18 @@ class GraphRunner:
             for k, t in self.net.state_dict().items():
                 t.copy_(new[k])
 
-    def _buffers(self, slot, Bp, dt):
+    def _buffers(self, slot, Bp):
         b = self.slots[slot]
-        if b is None or b[0].shape[0] < Bp or b[0].dtype != dt:
+        if b is None or b[0].shape[0] < Bp:
             n = max(Bp, 1024)
-            b = self.slots[slot] = (torch.empty((n, self.F), dtype=dt).pin_memory(),
-                                    torch.empty(n, dtype=torch.int64).pin_memory(),
-                                    torch.empty((n, self.A + 2 * self.S), dtype=torch.float32).pin_memory())
+            b = self.slots[slot] = (torch.empty(n, dtype=torch.int64, pin_memory=True),
+                                    torch.empty((n, self.A + 2 * self.S), dtype=torch.float32, pin_memory=True))
+        return b
+
+    def _pin_x(self, slot, Bp, dt):
+        b = self.pin_x[slot]
+        if b is None or b.shape[0] < Bp or b.dtype != dt:
+            b = self.pin_x[slot] = torch.empty((max(Bp, 1024), self.F), dtype=dt, pin_memory=True)
         return b
 
     def _run(self, x, n):
@@ -142,25 +153,33 @@ class GraphRunner:
         if self.busy[slot] is not None:              # the slot's buffers are still in use
             self.busy[slot].synchronize()
         dt = torch.float16 if x.dtype == np.float16 else torch.float32
-        pin_in, pin_n, pin_out = self._buffers(slot, Bp, dt)
+        pin_n, pin_out = self._buffers(slot, Bp)
         graph, xs, ns, out = self._graph(Bp, dt)
-        pin_in[:B].numpy()[:] = x[:, :self.F] if x.shape[1] >= self.F else np.pad(x, ((0, 0), (0, self.F - x.shape[1])))
+        src = None
+        if x.shape[1] == self.F and x.flags.c_contiguous and x.flags.writeable:
+            t = torch.from_numpy(x)
+            if t.is_pinned():                        # a donated buffer: upload it in place
+                src = t
+        if src is None:
+            pin_x = self._pin_x(slot, Bp, dt)
+            pin_x[:B].numpy()[:] = x[:, :self.F] if x.shape[1] >= self.F else np.pad(x, ((0, 0), (0, self.F - x.shape[1])))
+            src = pin_x[:B]
         pin_n[:B].numpy()[:] = n_players
-        xs[:B].copy_(pin_in[:B], non_blocking=True)
+        xs[:B].copy_(src, non_blocking=True)
         ns[:B].copy_(pin_n[:B], non_blocking=True)
         graph.replay()
         pin_out[:B].copy_(out[:B], non_blocking=True)
         ev = torch.cuda.Event()
         ev.record()
         self.busy[slot] = ev
-        return (ev, slot, B, n_players, opt_off, opt_action)
+        return (ev, slot, B, n_players, opt_off, opt_action, x)   # x: alive until the upload is done
 
     def result(self, h):
-        ev, slot, B, n_players, opt_off, opt_action = h
+        ev, slot, B, n_players, opt_off, opt_action, _x = h
         ev.synchronize()
         if self.busy[slot] is ev:
             self.busy[slot] = None
-        o = self.slots[slot][2][:B].numpy()
+        o = self.slots[slot][1][:B].numpy()
         A, S = self.A, self.S
         rows = np.repeat(np.arange(B), np.diff(opt_off))
         pri = segment_softmax_np(o[rows, opt_action], opt_off)
@@ -192,6 +211,15 @@ class NetEvaluator:
         self.calls = 0
         self.leaves = 0
         self.seconds = 0.0
+
+    def feed_buffers(self, n, rows, features, dtype):
+        """`n` pinned host arrays [rows, features] of `dtype` ('f32' | 'f16') for a driver's
+        `donate_x` (the CUDA graph path uploads them in place), or [] (no graphs, or the model
+        reads a different number of features)."""
+        if self.fast is None or features != self.fast.F or n <= 0:
+            return []
+        dt = torch.float16 if dtype == 'f16' else torch.float32
+        return [torch.empty((rows, features), dtype=dt, pin_memory=True).numpy() for _ in range(n)]
 
     def set_weights(self, state_dict):
         self.model.load_state_dict(state_dict)
@@ -279,9 +307,28 @@ class UniformEvaluator:
         return pri, value, np.zeros((B, MAX_SEATS), np.float32)
 
 
+def pin_feed(driver, evaluators):
+    """Donate pinned host buffers for the driver's network batches (see the module docstring)
+    from the first evaluator that offers them (`feed_buffers`), once per driver (`x_pool_info`
+    'wanted'). ZERO_PINNED_FEED=0, a driver without `donate_x` or no such evaluator: nothing.
+    -> the number donated."""
+    if os.environ.get('ZERO_PINNED_FEED', '1') == '0' or not evaluators or not hasattr(driver, 'donate_x'):
+        return 0
+    info = driver.x_pool_info()
+    if info['wanted'] <= 0:
+        return 0
+    for ev in evaluators.values():
+        fb = getattr(ev, 'feed_buffers', None)
+        bufs = fb(info['wanted'], info['rows'], info['features'], info['dtype']) if fb is not None else []
+        if bufs:
+            return driver.donate_x(bufs)
+    return 0
+
+
 def drive(driver, evaluators, externals=None, check=None, on_batch=None, ext_threads=16):
     """Run `driver` until next_batch() returns None. -> number of batches."""
     externals = externals or {}
+    pin_feed(driver, evaluators)
     if externals and hasattr(driver, 'poll_batch'):
         return _drive_async(driver, evaluators, externals, check, on_batch, ext_threads)
     inflight = int(os.environ.get('ZERO_INFLIGHT', '2'))
