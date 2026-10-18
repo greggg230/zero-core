@@ -38,6 +38,7 @@ use std::time::Instant;
 use crate::game::{make_bot, Bot, SearchGame, MAX_SEATS};
 use crate::rng::{split64, Rng};
 use crate::tree::Tree;
+use crate::xbuf::{XBuf, XDtype, XPool, XPtr};
 
 mod worker;
 use worker::worker;
@@ -132,6 +133,10 @@ pub struct DriverCfg {
     pub rolling: bool,
     /// Network id stored with the samples until a `resume` sets another.
     pub net: u32,
+    /// Element type of the network batches' features (`Batch::x`): F32 = the game's encoding
+    /// as is; F16 = rounded to half precision by the fill jobs (half the bytes to copy and
+    /// upload; docs/search.md 2.2).
+    pub x_dtype: XDtype,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -175,8 +180,9 @@ pub struct Batch {
     pub external: bool,
     group: usize,
     pub b: usize,
-    /// Network batches: features [b * F], legal actions as segments of `opt_action`.
-    pub x: Vec<f32>,
+    /// Network batches: features [b * F] (`DriverCfg::x_dtype`; a pooled buffer: dropping the
+    /// batch recycles it), legal actions as segments of `opt_action`.
+    pub x: XBuf,
     pub opt_off: Vec<i32>,
     pub opt_action: Vec<i32>,
     /// Deciding seat (absolute), players, game id per row.
@@ -321,7 +327,7 @@ struct GroupOut {
 /// fill jobs, each its own rows / options.
 #[derive(Clone, Copy)]
 struct Dest {
-    x: *mut f32,
+    x: XPtr,
     player: *mut i32,
     n_players: *mut i32,
     gid: *mut i64,
@@ -385,6 +391,8 @@ struct Shared<G: SearchGame> {
     counters: Counters,
     epoch: AtomicU32,
     net: AtomicU32,
+    /// Spare feature buffers (network batches).
+    x_pool: Arc<XPool>,
 }
 
 impl<G: SearchGame> Shared<G> {
@@ -505,8 +513,10 @@ impl<G: SearchGame> Driver<G> {
         let threads = cfg.threads.max(1);
         let nkeys = cfg.keys.len();
         let mut gv = Vec::new();
+        let mut max_ns = 0;
         for g in 0..groups {
             let ns = (g + 1) * conc / groups - g * conc / groups;
+            max_ns = max_ns.max(ns);
             let nchunks = ns.min(threads * 4).max(1);
             let mut chunks = Vec::new();
             for c in 0..nchunks {
@@ -526,6 +536,10 @@ impl<G: SearchGame> Driver<G> {
         }
         let rolling = cfg.rolling;
         let net = cfg.net;
+        // a batch has at most one row per slot of its group; at most one batch per network key
+        // and group is outstanding (+2 spare: buffers dropped late)
+        let nn_keys = cfg.keys.iter().filter(|k| k.1 == KeyKind::Nn).count();
+        let x_pool = XPool::new(cfg.x_dtype, max_ns * G::NUM_FEATURES, groups * nn_keys + 2);
         let cfg = DriverCfg { threads, groups, ..cfg };
         let sh = Arc::new(Shared {
             cfg,
@@ -540,6 +554,7 @@ impl<G: SearchGame> Driver<G> {
             counters: Counters::default(),
             epoch: AtomicU32::new(0),
             net: AtomicU32::new(net),
+            x_pool,
         });
         let mut workers = Vec::new();
         for k in 0..threads {

@@ -57,6 +57,10 @@ DEFAULTS = dict(
     # its own CUDA context, evaluator and driver with conc / N games in flight and threads / N
     # search threads; zero/selfplay_procs.py, docs/az.md 7.1); 1 = in this process
     selfplay_procs=1,
+    # self-play feature dtype handed to the network: 'f32' (the game's encoding as is) | 'f16'
+    # (rounded to half precision by the driver's fill jobs: half the bytes to copy and upload,
+    # the inputs the network trains on - shards store float16; infer.py, docs/search.md 2.2)
+    feed_dtype='f32',
     # groups for matches with an external player: its batches are answered on threads while
     # the other groups search (infer.drive), so more groups hide more of a slow player's latency
     # but shrink the network batches. Caverna's JS bot is fast (~18 ms per decision) and CUDA
@@ -259,11 +263,12 @@ class Run:
                              c.get('policy_target', 'visits'), c.get('cq_c_visit', 50.0), c.get('cq_c_scale', 1.0))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']))
 
-    def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None):
+    def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None, x_dtype='f32'):
         c = self.cfg
+        kw = {} if x_dtype == 'f32' else {'x_dtype': x_dtype}   # (an older engine has no x_dtype)
         return G.Driver(c['game'], seats, spec=c['spec'], concurrency=conc or c['conc'], seed=seed, record=record,
                         threads=c['threads'], groups=groups or c['groups'], max_steps=c['max_steps'], rolling=rolling,
-                        net=net)
+                        net=net, **kw)
 
     def match_groups(self, ext):
         return self.cfg.get('ext_groups', DEFAULTS['ext_groups']) if ext else None
@@ -313,7 +318,7 @@ class Run:
         if c['rolling']:
             if self.roll is None:
                 table = [[seat] * p for p in c['players']]
-                self.roll = self.driver(table, seed=seed, record=True, rolling=True, net=it - 1)
+                self.roll = self.driver(table, seed=seed, record=True, rolling=True, net=it - 1, x_dtype=c.get('feed_dtype', 'f32'))
                 self.roll_ev = self.evaluator(model_path(self.run, it - 1))
             else:
                 m, _ = load(model_path(self.run, it - 1), 'cpu')
@@ -322,7 +327,7 @@ class Run:
             st0 = drv.stats()
             drv.resume(games, it - 1)
         else:
-            drv = self.driver([[seat] * int(p) for p in counts], seed=seed, record=True)
+            drv = self.driver([[seat] * int(p) for p in counts], seed=seed, record=True, x_dtype=c.get('feed_dtype', 'f32'))
             ev = self.evaluator(model_path(self.run, it - 1))
             st0 = None
         writer = ShardWriter(d, prefix, rows=c['shard_rows'], meta=meta)

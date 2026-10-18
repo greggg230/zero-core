@@ -11,6 +11,7 @@
 //!   network keys), external seats.
 //! * `toy`: "Mini Cavern", the toy game the stack is proven on.
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
+//! * `xbuf`: network batches' feature buffers (float32 / float16, pooled).
 pub mod driver;
 pub mod dynapi;
 pub mod game;
@@ -18,6 +19,7 @@ pub mod noise;
 pub mod rng;
 pub mod toy;
 pub mod tree;
+pub mod xbuf;
 
 pub use game::{Bot, SearchGame, MAX_SEATS};
 pub use rng::Rng;

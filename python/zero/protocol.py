@@ -5,7 +5,7 @@ A network batch ('nn') holds B leaves:
 
 | field | dtype / shape | content |
 |---|---|---|
-| `x` | f32 [B, F] | features of the leaf state from the decider's view (`SearchGame::encode`) |
+| `x` | f32 [B, F] (f16 with the driver's `x_dtype='f16'`) | features of the leaf state from the decider's view (`SearchGame::encode`) |
 | `opt_off` | i32 [B+1] | leaf b's legal actions are `opt_action[opt_off[b]:opt_off[b+1]]` |
 | `opt_action` | i32 [sum] | global action ids, in the game's legal order |
 | `player` | i32 [B] | deciding seat (absolute) |
@@ -62,7 +62,7 @@ def validate_batch(lb, num_features=None, num_actions=None):
         assert len(a['states']) == B and all(isinstance(s, str) for s in a['states'])
         return
     x, off, act = a['x'], a['opt_off'], a['opt_action']
-    assert x.dtype == np.float32 and x.ndim == 2 and x.shape[0] == B and x.flags.c_contiguous
+    assert x.dtype in (np.float32, np.float16) and x.ndim == 2 and x.shape[0] == B and x.flags.c_contiguous
     if num_features is not None:
         assert x.shape[1] == num_features
     assert off.dtype == np.int32 and off.shape == (B + 1,) and off[0] == 0 and off[-1] == len(act)

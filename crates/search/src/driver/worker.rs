@@ -517,14 +517,14 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
             asm.batches.push(bt);
             continue;
         }
-        bt.x = vec![0.0; b * f];
+        bt.x = sh.x_pool.take(b * f);         // every row is written by its chunk's fill job
         bt.player = vec![0; b];
         bt.n_players = vec![0; b];
         bt.gid = vec![0; b];
         bt.opt_off = vec![0; b + 1];
         bt.opt_action = vec![0; nopt];
         let dest = Dest {
-            x: bt.x.as_mut_ptr(),
+            x: bt.x.ptr(),
             player: bt.player.as_mut_ptr(),
             n_players: bt.n_players.as_mut_ptr(),
             gid: bt.gid.as_mut_ptr(),
@@ -560,7 +560,7 @@ fn fill_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize) {
         // SAFETY: rows rb..rb + n and options ob..ob + no belong to this chunk alone (the plan's
         // prefix sums) and lie inside the batch's buffers (sized for all rows / options); see Dest.
         unsafe {
-            std::slice::from_raw_parts_mut(d.x.add(rb * f), n * f).copy_from_slice(&x.x);
+            d.x.write(rb * f, &x.x);
             std::slice::from_raw_parts_mut(d.player.add(rb), n).copy_from_slice(&x.player);
             std::slice::from_raw_parts_mut(d.n_players.add(rb), n).copy_from_slice(&x.n_players);
             std::slice::from_raw_parts_mut(d.gid.add(rb), n).copy_from_slice(&x.gid);

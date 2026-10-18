@@ -26,6 +26,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         max_steps: 10_000,
         rolling: false,
         net: 0,
+        x_dtype: XDtype::F32,
     }
 }
 
@@ -45,6 +46,7 @@ fn answer(d: &mut Driver<ToyGame>, b: &Batch) {
         return;
     }
     let f = ToyGame::NUM_FEATURES;
+    let x = b.x.to_f32();
     let mut pri = Vec::new();
     for r in 0..b.b {
         let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
@@ -54,7 +56,7 @@ fn answer(d: &mut Driver<ToyGame>, b: &Batch) {
     let m = vec![0.0; b.b * MAX_SEATS];
     for r in 0..b.b {
         let n = b.n_players[r] as usize;
-        let h: f32 = b.x[r * f..(r + 1) * f].iter().enumerate().map(|(i, x)| x * ((i * 7 % 13) as f32 - 6.0)).sum();
+        let h: f32 = x[r * f..(r + 1) * f].iter().enumerate().map(|(i, x)| x * ((i * 7 % 13) as f32 - 6.0)).sum();
         let w = 1.0 / (1.0 + (-h * 0.1).exp());
         v[r * MAX_SEATS] = w;
         for j in 1..n {
@@ -301,4 +303,56 @@ fn completed_q_changes_only_the_policy_targets() {
     assert!(Driver::<ToyGame>::new(cfg(vec![bad], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_err());
     assert!(PolicyTarget::parse("cq", 50.0, -1.0).is_err() && PolicyTarget::parse("argmax", 50.0, 1.0).is_err());
     assert_eq!(PolicyTarget::parse("visits", 0.0, 0.0), Ok(PolicyTarget::Visits));
+}
+
+/// Uniform priors and even values whatever the features (two drivers stay in lockstep).
+fn answer_flat(d: &mut Driver<ToyGame>, b: &Batch) {
+    let pri: Vec<f32> = (0..b.b).flat_map(|r| {
+        let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+        std::iter::repeat_n(1.0 / k as f32, k)
+    }).collect();
+    let mut v = vec![0.0; b.b * MAX_SEATS];
+    for r in 0..b.b {
+        let n = b.n_players[r] as usize;
+        for j in 0..n {
+            v[r * MAX_SEATS + j] = 1.0 / n as f32;
+        }
+    }
+    let m = vec![0.0; b.b * MAX_SEATS];
+    d.submit(b.id, &pri, &v, &m).unwrap();
+}
+
+#[test]
+fn f16_features_are_the_rounded_f32_features() {
+    let mk = |dt: XDtype| {
+        let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]; 12], &[("m", KeyKind::Nn)]);
+        c.x_dtype = dt;
+        c.groups = 3;
+        Driver::<ToyGame>::new(c).unwrap()
+    };
+    let (mut a, mut h) = (mk(XDtype::F32), mk(XDtype::F16));
+    let f = ToyGame::NUM_FEATURES;
+    let mut nb = 0;
+    loop {
+        let (ba, bh) = (a.next_batch(true).unwrap(), h.next_batch(true).unwrap());
+        let (Some(ba), Some(bh)) = (ba, bh) else {
+            assert!(a.finished() && h.finished());
+            break;
+        };
+        assert_eq!((ba.b, &ba.opt_off, &ba.opt_action, &ba.gid), (bh.b, &bh.opt_off, &bh.opt_action, &bh.gid));
+        let (xa, xh) = (ba.x.as_f32().unwrap(), bh.x.as_f16_bits().unwrap());
+        assert_eq!((xa.len(), xh.len()), (ba.b * f, ba.b * f));
+        let mut want = vec![0u16; xa.len()];
+        crate::xbuf::f32_to_f16_soft(xa, &mut want);
+        assert_eq!(xh, &want[..]);
+        answer_flat(&mut a, &ba);
+        answer_flat(&mut h, &bh);
+        nb += 1;
+    }
+    assert!(nb > 10);
+    // the buffers came back to the pools (at most groups x keys + 2 are kept)
+    for d in [&a, &h] {
+        let s = d.sh.x_pool.spare();
+        assert!((1..=5).contains(&s), "{s} spare buffers");
+    }
 }

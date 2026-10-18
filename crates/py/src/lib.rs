@@ -14,13 +14,15 @@
 //! `SearchTree`, `SearchDriver`, `game_names()`, `game_info_of(name)` and `MAX_SEATS`.
 use std::sync::OnceLock;
 
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::ndarray::ArrayView2;
+use numpy::{Element, IntoPyArray, PyArray2, PyArrayDescr, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use zero_search::driver::{sample_arrays, Batch, DriverCfg, KeyKind, NnSeat, PolicyTarget, SeatCfg};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
+use zero_search::xbuf::{XBuf, XDtype};
 use zero_search::{SearchGame, MAX_SEATS};
 
 /// For `engine_module!` (the game crate needs its own `pyo3` dependency too: the PyO3 macros
@@ -399,19 +401,66 @@ impl PySearchTree {
 
 // ------------------------------------------------------------------------ SearchDriver
 
-/// The batched driver (docs/search.md 2). `seats` = per game a list of seat dicts.
+/// The batched driver (docs/search.md 2). `seats` = per game a list of seat dicts;
+/// `x_dtype` = 'f32' | 'f16': the dtype of the network batches' features `x`.
 #[pyclass(name = "SearchDriver")]
 pub struct PySearchDriver {
     d: Box<dyn DynDriver>,
     nfeat: usize,
+    x_dtype: XDtype,
+}
+
+/// The owner of a network batch's feature array (its numpy base object): when the array is
+/// freed, the buffer goes back to the driver's pool (zero_search::xbuf).
+#[pyclass(name = "FeatureBuffer", frozen)]
+struct PyFeatureBuffer {
+    x: XBuf,
+}
+
+/// numpy float16 elements as their bit patterns (no `half` dependency).
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct F16Bits(u16);
+
+// SAFETY: F16Bits is a plain 2-byte value with numpy's float16 layout (IEEE binary16 bits).
+unsafe impl Element for F16Bits {
+    const IS_COPY: bool = true;
+    fn get_dtype(py: Python<'_>) -> Bound<'_, PyArrayDescr> {
+        PyArrayDescr::new(py, "float16").expect("numpy float16 dtype")
+    }
+    fn clone_ref(&self, _py: Python<'_>) -> Self {
+        *self
+    }
+}
+
+/// `x` as a [n, f] numpy array (float32 or float16) viewing its buffer.
+fn x_array(py: Python<'_>, x: XBuf, n: usize, f: usize) -> PyResult<PyObject> {
+    if x.len() != n * f {
+        return Err(PyRuntimeError::new_err(format!("internal: batch features {} != {n} x {f}", x.len())));
+    }
+    let owner = Bound::new(py, PyFeatureBuffer { x })?;
+    let b = owner.get();
+    // SAFETY: the array's base object is `owner`, which owns the buffer and never reallocates
+    // it; the buffer is recycled only when `owner` is dropped, i.e. after the array.
+    let arr = unsafe {
+        if let Some(v) = b.x.as_f32() {
+            PyArray2::<f32>::borrow_from_array(&ArrayView2::from_shape((n, f), v).map_err(|e| PyRuntimeError::new_err(e.to_string()))?, owner.clone().into_any()).into_any()
+        } else {
+            let v = b.x.as_f16_bits().unwrap();
+            let v: &[F16Bits] = std::slice::from_raw_parts(v.as_ptr().cast(), v.len());
+            PyArray2::<F16Bits>::borrow_from_array(&ArrayView2::from_shape((n, f), v).map_err(|e| PyRuntimeError::new_err(e.to_string()))?, owner.clone().into_any()).into_any()
+        }
+    };
+    Ok(arr.unbind())
 }
 
 #[pymethods]
 impl PySearchDriver {
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, x_dtype="f32"))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32) -> PyResult<Self> {
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, x_dtype: &str) -> PyResult<Self> {
+        let x_dtype = XDtype::parse(x_dtype).map_err(verr)?;
         let spec = spec_json(spec)?;
         let mut keys = Vec::new();
         let mut table: Vec<SeatCfg> = Vec::new();
@@ -432,10 +481,16 @@ impl PySearchDriver {
             }
             games.push(ix);
         }
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net };
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, x_dtype };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
-        Ok(PySearchDriver { d, nfeat })
+        Ok(PySearchDriver { d, nfeat, x_dtype })
+    }
+
+    /// The dtype of the network batches' features: 'f32' | 'f16'.
+    #[getter]
+    fn x_dtype(&self) -> &'static str {
+        self.x_dtype.name()
     }
 
     /// (id, key, kind, arrays) with kind 'nn' | 'ext', or None when every game has finished
@@ -587,7 +642,7 @@ impl PySearchDriver {
             a.set_item("states", b.states)?;
             return Ok(Some((b.id, key, "ext", a).into_pyobject(py)?.into_any().unbind()));
         }
-        a.set_item("x", b.x.into_pyarray(py).reshape([n, self.nfeat])?)?;
+        a.set_item("x", x_array(py, b.x, n, self.nfeat)?)?;
         a.set_item("opt_off", b.opt_off.into_pyarray(py))?;
         a.set_item("opt_action", b.opt_action.into_pyarray(py))?;
         Ok(Some((b.id, key, "nn", a).into_pyobject(py)?.into_any().unbind()))

@@ -19,6 +19,13 @@ while the previous one's results come back and are softmaxed on the CPU (one CUD
 the graphs' static inputs in order; the pinned host buffers alternate between two slots).
 ZERO_INFLIGHT=1: one batch at a time, as before.
 
+Features may come as float32 or float16 (the driver's `x_dtype`, run setting `feed_dtype`):
+float16 batches are copied and uploaded as they are and widened to float32 on the device (in
+the graph), so the network sees exactly `x.astype(np.float16).astype(np.float32)` - the inputs
+it is trained on (shards store float16). Kingdom Builder xst (19,870 features, batch 256): the
+feed thread spent ~7 ms per batch copying 20 MB of float32 into the pinned buffer and ~3.7 ms
+freeing the driver's buffer (now pooled), ~2 ms on the stream uploading it.
+
 `drive(driver, evaluators, externals)` runs any driver to the end (or to the end of a rolling
 phase): network batches go to `evaluators[key]`, external batches to `externals[key]` (one
 payload string per request). `check()` is called after every batch (PAUSE: raises).
@@ -92,24 +99,26 @@ class GraphRunner:
             for k, t in self.net.state_dict().items():
                 t.copy_(new[k])
 
-    def _buffers(self, slot, Bp):
+    def _buffers(self, slot, Bp, dt):
         b = self.slots[slot]
-        if b is None or b[0].shape[0] < Bp:
+        if b is None or b[0].shape[0] < Bp or b[0].dtype != dt:
             n = max(Bp, 1024)
-            b = self.slots[slot] = (torch.empty((n, self.F), dtype=torch.float32).pin_memory(),
+            b = self.slots[slot] = (torch.empty((n, self.F), dtype=dt).pin_memory(),
                                     torch.empty(n, dtype=torch.int64).pin_memory(),
                                     torch.empty((n, self.A + 2 * self.S), dtype=torch.float32).pin_memory())
         return b
 
     def _run(self, x, n):
+        if x.dtype != torch.float32:
+            x = x.float()                            # float16 features: widened exactly
         with torch.autocast('cuda', dtype=torch.bfloat16):
             plog, vlog, mar = self.net(x, n)
         return torch.cat([plog.float(), torch.softmax(vlog.float(), 1), mar.float()], 1)
 
-    def _graph(self, Bp):
-        g = self.graphs.get(Bp)
+    def _graph(self, Bp, dt):
+        g = self.graphs.get((Bp, dt))
         if g is None:
-            x = torch.zeros((Bp, self.F), device=self.dev)
+            x = torch.zeros((Bp, self.F), device=self.dev, dtype=dt)
             n = torch.full((Bp,), 2, dtype=torch.int64, device=self.dev)
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
@@ -120,7 +129,7 @@ class GraphRunner:
             graph = torch.cuda.CUDAGraph()
             with torch.no_grad(), torch.cuda.graph(graph, pool=self.pool):
                 out = self._run(x, n)
-            g = self.graphs[Bp] = (graph, x, n, out)
+            g = self.graphs[(Bp, dt)] = (graph, x, n, out)
         return g
 
     def launch(self, x, n_players, opt_off, opt_action):
@@ -132,8 +141,9 @@ class GraphRunner:
         self.turn ^= 1
         if self.busy[slot] is not None:              # the slot's buffers are still in use
             self.busy[slot].synchronize()
-        pin_in, pin_n, pin_out = self._buffers(slot, Bp)
-        graph, xs, ns, out = self._graph(Bp)
+        dt = torch.float16 if x.dtype == np.float16 else torch.float32
+        pin_in, pin_n, pin_out = self._buffers(slot, Bp, dt)
+        graph, xs, ns, out = self._graph(Bp, dt)
         pin_in[:B].numpy()[:] = x[:, :self.F] if x.shape[1] >= self.F else np.pad(x, ((0, 0), (0, self.F - x.shape[1])))
         pin_n[:B].numpy()[:] = n_players
         xs[:B].copy_(pin_in[:B], non_blocking=True)
@@ -202,6 +212,8 @@ class NetEvaluator:
         dev = self.device
         B = x.shape[0]
         xt = torch.from_numpy(x).to(dev, non_blocking=True)
+        if xt.dtype != torch.float32:
+            xt = xt.float()                          # float16 features (see the module docstring)
         nt = torch.from_numpy(n_players.astype(np.int64)).to(dev)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
             plog, vlog, mar = self.model(xt, nt)
