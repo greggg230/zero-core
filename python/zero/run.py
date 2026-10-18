@@ -19,6 +19,9 @@ with status 75; tools/supervise.py relaunches the run when PAUSE is removed.
 
 --rolling 1: one persistent driver keeps --conc games in flight across iterations; an
 iteration's self-play ends when --games games have FINISHED (docs/search.md 2.6).
+
+--selfplay-procs N (> 1): self-play in N worker processes instead of this one (each with its
+own evaluator and driver, rolling or not; zero/selfplay_procs.py, docs/az.md 7.1).
 """
 import argparse
 import glob
@@ -50,6 +53,10 @@ DEFAULTS = dict(
     # saturated CPU every torch op with > 1 thread waits for preempted threads - measured
     # 10-1000x slower on the shared desktop, docs/az.md 7)
     iters=40, games=1000, rolling=0, conc=256, threads=4, groups=2, torch_threads=1,
+    # self-play processes: N > 1 plays each iteration's games in N local worker processes (each
+    # its own CUDA context, evaluator and driver with conc / N games in flight and threads / N
+    # search threads; zero/selfplay_procs.py, docs/az.md 7.1); 1 = in this process
+    selfplay_procs=1,
     # groups for matches with an external player: its batches are answered on threads while
     # the other groups search (infer.drive), so more groups hide more of a slow player's latency
     # but shrink the network batches. Caverna's JS bot is fast (~18 ms per decision) and CUDA
@@ -210,6 +217,16 @@ class Run:
         self.remote = None                         # zero.remote.RemoteEval when eval_remote is set
         self.roll = None                           # rolling driver + its evaluator
         self.roll_ev = None
+        self.pool = None                           # selfplay_procs > 1: zero.selfplay_procs.Pool
+
+    def close(self):
+        """Stop the self-play worker processes (if any); never raises."""
+        pool, self.pool = self.pool, None
+        if pool is not None:
+            try:
+                pool.close()
+            except Exception as e:                 # noqa: BLE001
+                self.log(f'self-play workers: close failed ({type(e).__name__}: {e})')
 
     def check(self, where=''):
         if self.pw is not None:
@@ -253,36 +270,64 @@ class Run:
 
     # ---------------------------------------------------------------- self-play
     def selfplay(self, it):
+        """Self-play of iteration `it` (checkpoint it - 1) into data/iter_NNNN/ -> its metrics: in
+        this process, or with selfplay_procs > 1 in that many worker processes (zero.selfplay_procs)."""
         c = self.cfg
         d = os.path.join(self.run, 'data', f'iter_{it:04d}')
         if os.path.exists(d):
             shutil.rmtree(d)                       # an interrupted iteration is replayed
+        if int(c.get('selfplay_procs', 1)) > 1:
+            from .selfplay_procs import Pool
+            if self.pool is None:
+                self.pool = Pool(self)
+            try:
+                return self.pool.selfplay(it, d)
+            except BaseException:
+                self.close()                       # PAUSE or a failure: no worker outlives the phase
+                raise
+        prog = os.path.join(self.run, 'progress.json')
+        if c['rolling']:
+            seed, counts, prefix = c['seed'] * 7919 + it, None, 'r00'
+        else:
+            rng = np.random.default_rng(c['seed'] * 1_000_003 + it)
+            counts = rng.choice(c['players'], size=c['games'])
+            seed, prefix = c['seed'] * 1_000_003 + it, 'c00'
+
+        def progress(games):
+            _write_json(prog, {'iter': it, 'phase': 'selfplay', 'games': games, 'target': c['games'], 'time': time.time()})
+        out, _ = self.play_selfplay(it, d, c['games'], seed, prefix, counts=counts, progress=progress)
+        _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
+        return out
+
+    def play_selfplay(self, it, d, games, seed, prefix, counts=None, progress=None, meta_extra=None):
+        """One self-play phase in this process with checkpoint it - 1: rolling, until `games` more
+        games have finished on the persistent driver (created with `seed` at its first phase);
+        classic, a driver (`seed`) of len(counts) games of counts[g] players. Samples are streamed
+        into the shards `<d>/<prefix>_SSS.npz`; `progress(games so far)` every ~2 s.
+        -> (metrics, raw sums for zero.selfplay_procs.merge)."""
+        c = self.cfg
         t0 = time.time()
         seat = self.nn_seat('m', c['sims'], selfplay=True)
-        rng = np.random.default_rng(c['seed'] * 1_000_003 + it)
         meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it}
+        meta.update(meta_extra or {})
         if c['rolling']:
             if self.roll is None:
                 table = [[seat] * p for p in c['players']]
-                self.roll = self.driver(table, seed=c['seed'] * 7919 + it, record=True, rolling=True, net=it - 1)
+                self.roll = self.driver(table, seed=seed, record=True, rolling=True, net=it - 1)
                 self.roll_ev = self.evaluator(model_path(self.run, it - 1))
             else:
                 m, _ = load(model_path(self.run, it - 1), 'cpu')
                 self.roll_ev.set_weights(m.state_dict())
             drv, ev = self.roll, self.roll_ev
             st0 = drv.stats()
-            drv.resume(c['games'], it - 1)
-            prefix = 'r00'
+            drv.resume(games, it - 1)
         else:
-            counts = rng.choice(c['players'], size=c['games'])
-            drv = self.driver([[seat] * int(p) for p in counts], seed=c['seed'] * 1_000_003 + it, record=True)
+            drv = self.driver([[seat] * int(p) for p in counts], seed=seed, record=True)
             ev = self.evaluator(model_path(self.run, it - 1))
             st0 = None
-            prefix = 'c00'
         writer = ShardWriter(d, prefix, rows=c['shard_rows'], meta=meta)
         results = []
         state = {'n': 0, 't': time.time()}
-        prog = os.path.join(self.run, 'progress.json')
         tstats = TargetStats()
 
         def take():
@@ -295,15 +340,13 @@ class Run:
             if state['n'] % 32 == 0:
                 take()
                 results.extend(drv.take_results())
-            if time.time() - state['t'] > 2:
+            if progress is not None and time.time() - state['t'] > 2:
                 state['t'] = time.time()
-                _write_json(prog, {'iter': it, 'phase': 'selfplay', 'games': len(results), 'target': c['games'],
-                                   'time': time.time()})
+                progress(len(results))
         drive(drv, {'m': ev}, check=lambda: self.check('self-play'), on_batch=on_batch)
         take()
         results.extend(drv.take_results())
         ws = writer.close()
-        _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
         st = drv.stats()
         secs = time.time() - t0
         fin = [r for r in results if r['over']]
@@ -318,13 +361,17 @@ class Run:
                'games_per_h': len(results) / max(secs, 1e-9) * 3600, 'seconds': secs,
                'infer_s': ev.seconds, 'avg_batch': ev.leaves / max(1, ev.calls),
                'target': tstats.summary(c.get('policy_target', 'visits'))}
+        raw = {'fin': len(fin), 'decisions': sum(r['decisions'] for r in results),
+               'steps': sum(r['steps'] for r in results), 'rounds': sum(r['rounds'] for r in fin),
+               'score': sum(sum(r['scores']) / r['n'] for r in fin), 'ev_calls': ev.calls, 'ev_leaves': ev.leaves,
+               'target': (tstats.n, tstats.opts, tstats.h, tstats.mx)}
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if c['rolling']:
             inf = drv.in_flight()
             out['rolling'] = {'in_flight': inf['games'], 'restarts': st['restarts'] - st0['restarts'],
                               'restart_sims': st['restart_sims'] - st0['restart_sims'],
                               'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves']}
-        return out
+        return out, raw
 
     # ---------------------------------------------------------------- training
     def window_shards(self, it):
@@ -576,6 +623,7 @@ class Run:
                  'resumed_seconds': 0}
             _write_json(self.partial_path(it), dict(m, resumed_seconds=time.time() - t0))
             self.finish_iter(it, m, t0)
+        self.close()
         if self.remote is not None and not os.path.exists(stop):
             _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
             self.remote.drain()
@@ -625,6 +673,11 @@ def resolve_config(args, saved):
     cfg['preset'] = preset
     if cfg.get('policy_target', 'visits') not in ('visits', 'cq'):
         raise SystemExit(f"policy_target {cfg['policy_target']!r}: 'visits' or 'cq'")
+    sp = cfg.get('selfplay_procs', 1)
+    if not isinstance(sp, int) or sp < 1:
+        raise SystemExit(f'selfplay_procs {sp!r}: an integer >= 1')
+    if sp > 1 and (cfg['games'] < sp or cfg['conc'] < sp):
+        raise SystemExit(f"selfplay_procs {sp}: needs games ({cfg['games']}) and conc ({cfg['conc']}) >= {sp}")
     return cfg
 
 
@@ -659,6 +712,7 @@ def main(argv=None):
     try:
         R.loop()
     except Paused as e:
+        R.close()                                  # self-play worker processes (selfplay_procs > 1)
         pw.close()
         now = time.time()
         log(run, f'PAUSED ({e}); exit status {EXIT_PAUSED}: the supervisor relaunches the run when PAUSE is removed')
@@ -666,6 +720,7 @@ def main(argv=None):
                            workers_stopped=now, exited=now)
         raise SystemExit(EXIT_PAUSED)
     except BaseException as e:
+        R.close()
         pw.close()
         log(run, f'run aborted: {type(e).__name__}: {e}')
         runctl.write_state(run, 'run', state='aborted', error=f'{type(e).__name__}: {e}'[:500])

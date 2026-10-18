@@ -37,6 +37,10 @@ def test_iterations_metrics_and_elo(smoke_run):
     m = read_metrics(str(smoke_run))
     assert [r['iter'] for r in m] == [0, 1, 2]
     assert m[1]['selfplay']['games'] == 24 and m[1]['selfplay']['samples'] > 0
+    # selfplay_procs 1 (the default): self-play in the run process, as before
+    assert 'procs' not in m[1]['selfplay'] and not list(smoke_run.glob('selfplay_w*.txt'))
+    assert [p.name for p in (smoke_run / 'data' / 'iter_0001').glob('*.npz')] == ['c00_000.npz']
+    assert 'selfplay_workers' not in runctl.read_state(str(smoke_run), 'run')
     assert m[2]['train']['steps'] >= 10 and m[2]['eval_yard']['opp'] == 'ext:toyheur'
     r = json.load(open(smoke_run / 'elo' / 'ratings.json'))
     assert r['anchor'] == 'ext:toyheur' and r['ratings']['ext:toyheur']['elo'] == 1000

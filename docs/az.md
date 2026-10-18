@@ -15,9 +15,10 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | File (`python/zero/`) | What |
 |---|---|
 | `package.py` | The game package registry: `GamePackage` (name, root, engine module, run module, presets, DEFAULTS overrides, external players, specs, decision kinds, dashboard title / port, env prefix), `register`, `active` |
-| `run.py` | The loop: `DEFAULTS`, `PRESETS` (the toy's + the package's), self-play (classic or rolling), training, evaluation, Elo, resume, STOP / PAUSE |
+| `run.py` | The loop: `DEFAULTS`, `PRESETS` (the toy's + the package's), self-play (classic or rolling; in the run process or in `selfplay_procs` workers), training, evaluation, Elo, resume, STOP / PAUSE |
 | `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; both: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen` |
 | `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place), `UniformEvaluator`, `drive()` (external batches answered on threads) |
+| `selfplay_procs.py` | Self-play in N local worker processes (run setting `selfplay_procs`, section 7.1): `Pool` (spawn, one pipe per worker, PAUSE / failure / orphan handling), the workers' quotas and seeds, the metrics merge |
 | `data.py` | Sample shards (`ShardWriter`, atomic npz), the RAM-bounded training `Window`, `TargetStats` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
 | `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
@@ -86,6 +87,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `iters`, `games` | 40, 1000 | iterations; self-play games per iteration (rolling: games FINISHED per iteration) |
 | `rolling` | 0 | 1 = one persistent driver keeps `conc` games in flight across iterations (docs/search.md 2.6) |
 | `conc`, `threads`, `groups`, `torch_threads` | 256, 4, 2, 1 | games in flight, search threads, batches in flight, torch intra-op threads (keep 1, section 7) |
+| `selfplay_procs` | 1 | N > 1: self-play in N worker processes, each with `conc` / N games in flight and max(1, `threads` / N) search threads (section 7.1); 1 = in the run process |
 | `ext_groups` | 2 (Glass Road Zero: 8) | groups for matches with an external player (section 5) |
 | `sims`, `sims_fast`, `p_full` | 64, 16, 0.25 | playout-cap randomisation (only `p_full` decisions are training samples) |
 | `c_puct`, `alpha`, `eps`, `temp_moves` | 1.0, 0.3, 0.25, 20 | PUCT constant (values in [0, 1]), root Dirichlet noise, sampled moves per game |
@@ -112,7 +114,9 @@ settings a run has not stored yet; a run directory keeps its settings across cod
   step - writes `run_state.json` (state `paused`) and exits with status **75**. The
   supervisor then polls PAUSE every second and relaunches the run the moment it is removed
   (not a crash: no delay, no back-off); a run started while PAUSE exists exits 75 at once.
-  Measured in `tests/test_loop.py`: paused mid self-play and exited in a few seconds.
+  Measured in `tests/test_loop.py`: paused mid self-play and exited in a few seconds. With
+  `selfplay_procs` > 1 the run process notices PAUSE while it waits for its self-play workers,
+  tells them to quit and exits 75 the same way (`tests/test_selfplay_procs.py`).
 * **Resume semantics**: an iteration interrupted before its checkpoint is replayed from the
   start (its data directory is cleared); one interrupted after the checkpoint was written
   (`models/iter_N.json` holds its self-play / training stats) finishes its evaluation and Elo
@@ -128,12 +132,13 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; with `selfplay_procs` > 1 also `procs`, `workers` and `startup_s`, section 7.1), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated; `index.json` = every checkpoint's Elo; `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`); the newest `keep_data` iterations are kept |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor) and the current fit |
 | `progress.json` | self-play progress of the iteration in flight (dashboard) |
-| `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control |
+| `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control (`run_state.json` `selfplay_workers`: pid + creation time of each self-play worker) |
+| `selfplay_w{k}.txt` | console output of self-play worker k (`selfplay_procs` > 1): start / stop lines, tracebacks, faulthandler dumps |
 
 ## 4. Training
 
@@ -283,11 +288,60 @@ the Rust search threads are independent (no barriers inside a group's work) and 
 Toy self-play is inference-bound (~40-65k leaves/s on one torch thread, depending on the
 load); a toy iteration of 600 games takes ~30-60 s including evaluation and Elo matches.
 
+### 7.1 Self-play in several processes (`selfplay_procs`)
+
+`selfplay_procs N` (default 1) plays each iteration's self-play in N local worker processes
+instead of the run process (`zero/selfplay_procs.py`). Why: one process's self-play is limited
+by its single Python drive loop. Kingdom Builder Zero (GridNet through CUDA graphs on the RTX
+5090): one process tops out at ~51k network leaves/s whatever `conc` / `groups` / `threads` -
+the loop waits ~55% of its time on CUDA graph replay and ~30% on the next search batch; two
+independent processes with half the games each reached **64-65k leaves/s together
+(+25-28%)**. Two drive loops as threads of one process deadlocked (both in
+`GraphRunner.result`'s `Event.synchronize`), hence processes.
+
+* The run process starts the workers (multiprocessing, spawn context) at its first self-play
+  phase and keeps them until it exits (they idle during training and evaluation). Each has its
+  own CUDA context, `NetEvaluator` with the iteration's checkpoint and Rust `SearchDriver`:
+  `conc` / N games in flight and max(1, `threads` / N) search threads (remainders to the first
+  workers), the run's `groups`, `torch_threads`, `infer_device`, sims etc.
+* Worker k plays quota_k = `games` / N games (remainder to the first workers). Rolling: until
+  quota_k more games have finished on its own persistent rolling driver (new weights in place
+  each iteration; games carried over keep their older networks' samples, as with one
+  process). Classic: its slice of the player counts the run process samples. Its shards are
+  `data/iter_NNNN/r{k:02d}_SSS.npz` (classic `c{k:02d}_SSS.npz`; shard meta `worker`,
+  `procs`): the names never collide and the training window reads every shard of an iteration
+  directory, so training is unchanged. Seeds: the single process's driver seed (rolling:
+  seed x 7919 + the iteration that creates the driver; classic: seed x 1000003 + iteration) +
+  k x 2^40, deterministic per worker.
+* Metrics: the same `selfplay` keys - counts summed, per-game means weighted, `leaves_per_s` /
+  `games_per_h` over the phase's wall time (all workers together), `infer_s` summed over the
+  workers - plus `procs`, `workers` (per worker: pid, games, samples, leaves, leaves/s,
+  seconds, infer_s, avg_batch) and `startup_s` in the iteration that started them.
+* PAUSE exits 75 within seconds (the run process tells its workers to quit; they check their
+  pipe after every batch). Failures are loud: a worker's exception (its traceback), a dead
+  worker or closed pipe, `ZERO_SELFPLAY_STALL_S` (600) seconds without a message, fewer games
+  than its quota, missing shards or no samples abort the run with `WorkerError` (the supervisor
+  restarts it; the iteration is replayed) - never a partial iteration. No orphans: a worker
+  exits when its pipe closes or its parent process dies (a watch thread), so killing the run
+  process leaves no workers behind. All of this is in `tests/test_selfplay_procs.py`.
+* `selfplay_procs` 1 is the old in-process path (no subprocesses, same seeds, shards `r00_` /
+  `c00_`, same metrics).
+
+When it pays: GPU inference whose batches stay large per worker, when one drive loop
+saturates before the GPU does (Kingdom Builder: 2 processes, `conc` 1024 = 512 per worker). It
+does not pay where the per-call cost dominates: the toy's MLP on CUDA (eager, ~2 ms per call
+on the GPU shared with KBZ's run; toy-1 network and sims, 600 games, conc 300, threads 4,
+rolling): 1 process 36k leaves/s, 2 processes 32k (half the batch, twice the calls). CPU
+inference (one torch thread per process), same settings: 1 process ~100k, 2 ~141k (+40%), 4
+~130k (batches of 37) - 2026-10-17 on the shared desktop. Each worker costs a CUDA context +
+its graphs in GPU memory.
+
 ## 8. Not in the core yet (step 2 extension points)
 
 From Dominion Zero (their code is in `~/dominion-zero`, not in the repos the core was extracted
-from): worker processes for self-play / evaluation and resuming a crashed self-play phase from
-its complete shards (`workers.py`; here everything runs in the run process: the Rust driver is
+from): worker processes for evaluation, remote self-play workers and resuming a crashed
+self-play phase from its complete shards (`workers.py`; here evaluation runs in the run process
+and self-play in it or in local worker processes, section 7.1: the Rust driver is
 multi-threaded, a crash costs the iteration in progress, the supervisor restarts it), the
 CUDA-graph evaluator / pinned staging buffers / two batches in flight (`infer.py`; eager CUDA
 inference works here), the remote (Mac) workers and evaluator, rented-GPU experiments (Vast),
@@ -297,10 +351,12 @@ exploration games, behaviour cloning. Where they plug in:
   `set_weights(state_dict)` can replace `infer.NetEvaluator`; `Run.evaluator(path)` is the one
   place the loop builds it (a `zero.infer` factory keyed by a run setting is the natural
   switch, e.g. `infer_impl='cudagraph'`).
-* **Remote / worker self-play**: `Run.selfplay(it)` produces shards under `data/iter_NNNN/`
-  through `ShardWriter` and returns the metrics dict; a remote or multi-process implementation
-  only has to write the same shards (any prefix: `c00`, `r00`, a host name) and the same
-  metrics keys. The window (`Run.window_shards`) reads every shard of an iteration directory.
+* **Remote self-play**: `Run.selfplay(it)` produces shards under `data/iter_NNNN/` through
+  `ShardWriter` and returns the metrics dict; a remote implementation only has to write the
+  same shards (any prefix: `c00`, `r00`, a host name) and the same metrics keys. The window
+  (`Run.window_shards`) reads every shard of an iteration directory. The local multi-process
+  version (section 7.1) is the template: `Run.play_selfplay` is one process's phase (metrics +
+  raw sums), `zero.selfplay_procs.merge` combines several.
 * **Remote evaluation**: `Run.evaluate(it, m)` / `Run.elo_update` fill `m['eval_yard']`,
   `m['eval_random']` and the Elo results; an asynchronous evaluator can write the same keys
   later (Dominion's `--remote-eval`).
