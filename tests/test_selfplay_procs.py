@@ -240,6 +240,41 @@ def test_killed_run_leaves_no_workers(tmp_path):
     assert any('the run process is gone' in (run / f'selfplay_w{k}.txt').read_text(encoding='utf-8') for k in range(2))
 
 
+FAKE_AZ = '''import os
+from zero.package import GamePackage, register
+PACKAGE = register(GamePackage('fakepkg', 'Fake Zero', os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                               engine='fakepkg._engine', game='toy'))
+'''
+FAKE_RUN = '''import sys
+import fakepkg.az  # noqa: F401  (registers the game package)
+from zero import run as _core
+if __name__ == '__main__':
+    _core.cli()
+else:
+    sys.modules[__name__] = _core
+'''
+
+
+def test_game_package_workers(tmp_path):
+    """A game package's run (`python -m <pkg>.az.run`, a shim that IS zero.run, as in the game
+    repos): the workers activate the package (its engine module) through its run module."""
+    pkg = tmp_path / 'fakepkg'
+    (pkg / 'az').mkdir(parents=True)
+    (pkg / '__init__.py').write_text('')
+    (pkg / '_engine.py').write_text('from zero._engine import *  # noqa: F401,F403\n')
+    (pkg / 'az' / '__init__.py').write_text(FAKE_AZ)
+    (pkg / 'az' / 'run.py').write_text(FAKE_RUN)
+    run = tmp_path / 'runs' / 'g'
+    env = dict(ENV, PYTHONPATH=os.pathsep.join([str(tmp_path), PYPATH]))
+    p = subprocess.run([sys.executable, '-m', 'fakepkg.az.run', '--run', str(run), *SMOKE, '--iters', '1', '--rolling', '1',
+                        '--selfplay-procs', '2'], cwd=str(tmp_path), capture_output=True, text=True, timeout=300, env=env)
+    assert p.returncode == 0, p.stdout + p.stderr
+    sp = read_metrics(str(run))[1]['selfplay']
+    assert sp['procs'] == 2 and sp['games'] >= 24
+    for k in range(2):
+        assert 'package fakepkg (engine fakepkg._engine)' in (run / f'selfplay_w{k}.txt').read_text(encoding='utf-8')
+
+
 def test_worker_error_fails_the_run(tmp_path):
     """A worker's exception (here: the driver refuses 9-player games) ends the run with the
     worker's traceback; nothing of the iteration is kept as done."""

@@ -161,8 +161,10 @@ def worker_main(conn, init):
     try:
         _activate(init['package'], init['run_module'])
         import torch
-        from . import run as zrun
+        from . import games as G, run as zrun
         cfg = init['cfg']
+        print(f'package {package.active().name} (engine {G.engine().__name__}), game {cfg["game"]}, conc {cfg["conc"]}, '
+              f'threads {cfg["threads"]}, groups {cfg["groups"]}, infer_device {cfg["infer_device"]}', flush=True)
         torch.set_num_threads(max(1, int(cfg['torch_threads'])))
         zrun.below_normal()
         link = _Link(conn)
