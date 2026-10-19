@@ -16,7 +16,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 |---|---|
 | `package.py` | The game package registry: `GamePackage` (name, root, engine module, run module, presets, DEFAULTS overrides, external players, specs, decision kinds, dashboard title / port, env prefix), `register`, `active` |
 | `run.py` | The loop: `DEFAULTS`, `PRESETS` (the toy's + the package's), self-play (classic or rolling; in the run process or in `selfplay_procs` workers), training, evaluation, Elo, resume, STOP / PAUSE |
-| `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; both: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen` |
+| `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; both: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; optional auxiliary-target heads (config `aux`, section 4.1: `add_aux`, `strip_aux`); atomic `save`, `load` (by the checkpoint's arch), `widen` |
 | `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place), `UniformEvaluator`, `drive()` (external batches answered on threads) |
 | `selfplay_procs.py` | Self-play in N local worker processes (run setting `selfplay_procs`, section 7.1): `Pool` (spawn, one pipe per worker, PAUSE / failure / orphan handling), the workers' quotas and seeds, the metrics merge |
 | `data.py` | Sample shards (`ShardWriter`, atomic npz), the RAM-bounded training `Window`, `TargetStats` |
@@ -101,6 +101,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `window`, `window_grow`, `min_window_samples` | 8, 1, 20000 | newest iterations trained on (1 + iter // 2 with window_grow), more until min samples |
 | `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
+| `aux_own_w`, `aux_score_w` | 0, 0 | auxiliary targets (section 4.1): loss weights of the final-ownership segment and of the other ('score') segments; either > 0 turns them on (recorded in self-play, heads added, losses trained); 0 = off |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
 | `eval_games`, `eval_sims`, `eval_random_games`, `eval_every` | 200, 32, 50, 1 | evaluation vs the yardstick and vs random |
 | `elo_games`, `ref_games` | 100, 400 | games per Elo match (checkpoints 1, 2, 4 ... 32 iterations back); random vs yardstick reference games |
@@ -133,9 +134,9 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; with `selfplay_procs` > 1 also `procs`, `workers` and `startup_s`, section 7.1), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; with `selfplay_procs` > 1 also `procs`, `workers` and `startup_s`, section 7.1), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with auxiliary targets `aux_own` / `aux_score` and `aux`: window rows with targets and their share, `own_zero` / `score_zero` = the loss of predicting 0, `heads_added` on the iteration that added the heads), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated; `index.json` = every checkpoint's Elo; `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
-| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`); the newest `keep_data` iterations are kept |
+| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; `aux` float16 [N, W] with auxiliary targets); the newest `keep_data` iterations are kept |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor) and the current fit |
 | `progress.json` | self-play progress of the iteration in flight (dashboard) |
 | `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control (`run_state.json` `selfplay_workers`: pid + creation time of each self-play worker) |
@@ -152,6 +153,50 @@ actions only) + value cross-entropy against `(1 - q) z + q q_root` (softmax over
 present) + `margin_loss_w` x 0.5 x squared margin error over the seats present. AdamW, grad
 clip 5, step-decay LR, warmup while the optimizer state is fresh. Feature-width changes are
 handled by prefix reads (an older network reads the first columns) and `widen` (fork_run).
+
+### 4.1 Auxiliary targets (`aux_own_w`, `aux_score_w`; KataGo-style)
+
+A game outcome teaches one value and one margin per position; KataGo's auxiliary targets -
+the final ownership of every point, the score - add hundreds of signals per position that
+shape the shared trunk (Wu 2019, "Accelerating Self-Play Learning in Go"). At play time the
+heads are ignored: inference (`infer.NetEvaluator`, its CUDA graphs, the play servers) runs the
+same forward pass, so self-play speed is unchanged.
+
+* **Targets**: the game's `SearchGame::AUX` / `aux_targets` (docs/search.md 1), filled in when a
+  game ends, from each sample's decider's view (`take_samples()['aux']`, docs/search.md 2.4);
+  shards store them as `aux` float16 [N, W]. Kingdom Builder: `own` 400 cells (+1 / -1 / 0),
+  `score` 12 = per seat (the decider first) the 3 cards, castles, the sets' scoring, gold / 20.
+* **Heads** (`net.py`, config key `aux` = the layout, e.g. `[['own', 400], ['score', 12]]`):
+  GridNet: `own` = a 1x1 conv on the tower -> tanh per cell (like the policy's cell logits),
+  the other segments = an MLP (256 -> head -> k) on the pooled trunk `e`; Net: one MLP on the
+  trunk (tanh on `own`). Registered after every other module (a fresh network's other weights
+  are initialised exactly as without heads); their last layers start at zero, so new heads
+  predict 0 and send the trunk no gradient until they have learned something. Returned only by
+  `forward(x, n, aux=True)`; `add_aux(model, layout, seed)` adds them to a network without
+  (every other weight copied: identical outputs), `strip_aux` removes them (code from before
+  this feature cannot build a network whose config has `aux`, e.g. a play server pinned to an
+  older core: give it `strip_aux(load(path)[0])` saved with `save`).
+* **Training** (`Run.train`): the window loads the targets (`Window(aux_width=W)`); rows of
+  shards without them (a fork's older window, a run that switched them on) are zeros with
+  `aux_mask` 0. Loss += `aux_own_w` x mean over the batch rows with targets of the mean squared
+  error over the cells (tanh output vs +1 / -1 / 0) + `aux_score_w` x the same over the score
+  values. A checkpoint without heads gets them in `train` (log line `auxiliary heads ... added`);
+  the optimizer then has two parameter groups (trunk + old heads, auxiliary heads) and an
+  optimizer state from before the heads is kept for the trunk (the heads start fresh; no LR
+  warmup). Evaluators take states with or without heads (`set_weights`: a rolling self-play
+  evaluator built before the heads existed takes the next checkpoints). Weights 0 (the default):
+  nothing is recorded or loaded, the checkpoints and stats are exactly those of a run without
+  the feature (`tests/test_aux.py`).
+* **Weights**: the losses' scales - own MSE ~0.3-0.6 at the start of a Kingdom Builder game
+  (an empty board predicts 0 and most cells end empty), score MSE ~0.1 - make `aux_own_w` 1.0 and
+  `aux_score_w` 0.5 a reasonable first setting (the policy loss is ~1.3, the value ~0.45 there);
+  KataGo weights ownership at 1.5 / (board area) of a summed cross-entropy, of the same order as
+  this mean.
+* **A/B as a fork**: `tools/fork_run.py --source runs/a --dest runs/a_aux --iter K --set
+  aux_own_w=1.0 --set aux_score_w=0.5`, run from a checkout with this code (and the remote
+  evaluator's checkout too: the new checkpoints have heads). The fork's first iteration adds the
+  heads to checkpoint K; its window (hard-linked shards without targets) is masked for the
+  auxiliary losses and fills with targets as new iterations come in.
 
 ## 5. Evaluation and Elo
 

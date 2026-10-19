@@ -60,6 +60,9 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn apply_external(&mut self, payload: &str, chance: &mut Vec<u64>) -> Result<(), String> { Err(..) }
     fn bot_names() -> &'static [&'static str] { &[] }               // built-in bots ('random' is generic)
     fn make_bot(spec: &Self::Spec, name: &str, seed: u64) -> Option<Box<dyn Bot<Self>>> { None }
+    const AUX: &'static [(&'static str, usize)] = &[];             // auxiliary target segments (none)
+    fn aux_width() -> usize { /* sum of AUX widths */ }
+    fn aux_targets(&self, seat: usize, out: &mut [f32]) {}          // finished game, seat's view
 }
 pub trait Bot<G>: Send { fn choose(&mut self, g: &G, legal: &[u16]) -> u16; }
 ```
@@ -80,6 +83,16 @@ Changes from the original sketch (Caverna Zero DESIGN.md 5), and why:
   add a Rust port of the JS bot later, Glass Road Zero DESIGN.md 6).
 * NUM_ACTIONS / NUM_FEATURES / players stay associated constants (one Rust type per game; the
   bindings expose them through `game_info_of`).
+* `AUX` / `aux_targets` (optional, 2026-10-19): KataGo-style auxiliary training targets, many
+  signals per position besides the one outcome and margin (docs/az.md 4.1). `AUX` names the
+  segments of the vector `aux_targets(seat, out)` writes for a finished game from `seat`'s view:
+  `("own", cells)` = final ownership per board cell in [-1, 1] (+1 the viewer's, -1 another
+  seat's, 0 nobody's; for a grid network cells = its h x w, row-major as the planes), any other
+  name = regression values scaled to O(1) (`("score", k)`). The toy: `own` = who holds each of
+  the 13 action spaces at the end, `score` = each relative seat's score parts / 10 (4 x 6);
+  Kingdom Builder: the 400 cells' settlements and per seat the 3 cards, castles, the sets'
+  scoring and the gold collected / 20 (2 x 6). `game_info_of` reports `aux_layout` /
+  `aux_width`, `Game.aux_targets(seat)` reads them.
 
 Contract details a game must honour (the toy's tests check each):
 
@@ -113,7 +126,7 @@ Contract details a game must honour (the toy's tests check each):
 ```python
 from zero import games as G       # in a game repo: from <pkg>.az import games as G
 drv = G.Driver('toy', seats, spec=None, concurrency=256, seed=0, record=False, threads=4,
-               groups=2, max_steps=100_000, rolling=False, net=0)
+               groups=2, max_steps=100_000, rolling=False, net=0, x_dtype='f32', aux=False)
 lb = drv.next_batch()            # LeafBatch (kind 'nn' | 'ext') or None when every game finished
 drv.submit(lb.id, priors, value, margin)        # network batch
 drv.submit_external(lb.id, payloads)            # external batch: one str per request
@@ -192,8 +205,12 @@ state: `x` [N, F], `player`, `n_players`, `opt_off` (i64 [N+1]), `opt_action`, `
 seat's policy target over the options: the visit distribution, or the completed-Q target with
 `policy_target='cq'`, section 3.1), `z` [N, 8] (final `result()` relative to the decider), `q`
 [N, 8] (root search win estimate `wsum / tot`, relative; = z if no backups), `sc` [N, 8]
-(`margin()` per relative seat), `net` (network id of the search, rolling mode). A game's
-samples are emitted when it ends.
+(`margin()` per relative seat), `net` (network id of the search, rolling mode), and with
+`aux=True` (the driver records the game's auxiliary targets; an error for a game without
+`AUX`) `aux` f32 [N, W]: `aux_targets(player)` of the finished game, i.e. every sample of a seat
+carries that seat's view of the final state (computed once per seat at the game's end; the
+games, moves and other fields are identical to `aux=False`). A game's samples are emitted when
+it ends.
 
 ### 2.5 Results (`take_results`)
 

@@ -210,3 +210,37 @@ fn enc(g: &ToyGame, viewer: usize) -> Vec<f32> {
     SearchGame::encode(g, viewer, &mut v);
     v
 }
+
+#[test]
+fn aux_targets_follow_the_viewer() {
+    // a finished game's auxiliary targets from each seat: own = +1 its spaces, -1 the others',
+    // score parts relative to the viewer that sum to every seat's score / 10
+    let mut rng = Rng::new(5);
+    let w = <ToyGame as SearchGame>::aux_width();
+    assert_eq!(w, N_SPACES + MAXP * 6);
+    for n in 2..=MAXP {
+        for seed in 0..10 {
+            let (g, _) = random_game(n, 100 * n as u64 + seed, &mut rng);
+            let sc = g.scores();
+            assert!(g.occ.iter().any(|&o| o != FREE));
+            for v in 0..n {
+                let mut a = vec![0.0f32; w];
+                g.aux_targets(v, &mut a);
+                for s in 0..N_SPACES {
+                    let want = if g.occ[s] == FREE { 0.0 } else if g.occ[s] as usize == v { 1.0 } else { -1.0 };
+                    assert_eq!(a[s], want);
+                }
+                for j in 0..MAXP {
+                    let part = &a[N_SPACES + 6 * j..N_SPACES + 6 * j + 6];
+                    if j < n {
+                        let tot: f32 = part.iter().sum();
+                        assert!((tot * 10.0 - sc[(v + j) % n] as f32).abs() < 1e-4, "seat {v} rel {j}: {part:?} vs {}", sc[(v + j) % n]);
+                        assert_eq!(part[0], 3.0 * g.players[(v + j) % n].workers as f32 / 10.0);
+                    } else {
+                        assert!(part.iter().all(|&x| x == 0.0));
+                    }
+                }
+            }
+        }
+    }
+}

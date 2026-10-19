@@ -224,7 +224,14 @@ class NetEvaluator:
         return [torch.empty((rows, features), dtype=dt, pin_memory=True).numpy() for _ in range(n)]
 
     def set_weights(self, state_dict):
-        self.model.load_state_dict(state_dict)
+        """New weights in place. The auxiliary heads' weights (net.add_aux: training only) are
+        optional both ways: a network built without them takes a newer checkpoint's state (a
+        rolling evaluator created before a run turned its auxiliary targets on) and vice versa."""
+        own = self.model.state_dict()
+        sd = {k: v for k, v in state_dict.items() if k in own or not k.startswith('aux_')}
+        missing, unexpected = self.model.load_state_dict(sd, strict=False)
+        if unexpected or any(not k.startswith('aux_') for k in missing):
+            raise RuntimeError(f'set_weights: state mismatch (missing {missing}, unexpected {unexpected})')
         self.model.eval()
         if self.fast is not None:
             self.fast.refresh()

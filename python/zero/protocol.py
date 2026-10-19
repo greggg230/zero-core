@@ -24,6 +24,9 @@ import numpy as np
 
 MAX_SEATS = 8
 SAMPLE_KEYS = ('x', 'player', 'n_players', 'opt_off', 'opt_action', 'pi', 'z', 'q', 'sc', 'net')
+# present in some sample dicts only: 'aux' [N, W] = the game's auxiliary targets (drivers
+# created with aux=True; docs/search.md 2.4)
+OPTIONAL_SAMPLE_KEYS = ('aux',)
 
 
 class LeafBatch:
@@ -95,6 +98,8 @@ def validate_samples(s, num_features=None):
     assert len(s['pi']) == len(s['opt_action']) == s['opt_off'][-1]
     for k in ('z', 'q', 'sc'):
         assert s[k].shape == (N, MAX_SEATS)
+    if 'aux' in s:
+        assert s['aux'].ndim == 2 and s['aux'].shape[0] == N and s['aux'].dtype == np.float32
     off = s['opt_off']
     for b in range(N):
         assert abs(s['pi'][off[b]:off[b + 1]].sum() - 1) < 1e-3
@@ -110,7 +115,7 @@ def concat_samples(parts):
     if len(parts) == 1:
         return parts[0]
     out = {}
-    for k in SAMPLE_KEYS:
+    for k in SAMPLE_KEYS + OPTIONAL_SAMPLE_KEYS:
         if k == 'opt_off':
             offs, base = [np.zeros(1, np.int64)], 0
             for p in parts:
@@ -118,6 +123,8 @@ def concat_samples(parts):
                 base += int(p['opt_off'][-1])
             out[k] = np.concatenate(offs)
         elif k in parts[0]:
+            if any(k not in p for p in parts):
+                raise ValueError(f'concat_samples: {k!r} in some parts only')
             out[k] = np.concatenate([p[k] for p in parts])
     return out
 

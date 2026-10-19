@@ -387,7 +387,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         };
         let mut x = vec![0.0f32; G::NUM_FEATURES];
         slot.game.as_ref().unwrap().encode(p, &mut x);
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net });
+        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux: Vec::new() });
         slot.rq.push(tree.win(root));
     }
     slot.decisions += 1;
@@ -460,7 +460,22 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
     });
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();
+        // auxiliary targets of the final state, once per seat (each sample takes its decider's)
+        let aux: Vec<Vec<f32>> = if cfg.aux {
+            (0..n)
+                .map(|s| {
+                    let mut v = vec![0.0f32; G::aux_width()];
+                    g.aux_targets(s, &mut v);
+                    v
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         for (mut r, rq) in slot.records.drain(..).zip(slot.rq.drain(..)) {
+            if cfg.aux {
+                r.aux.clone_from(&aux[r.player as usize]);
+            }
             for j in 0..n {
                 let s = (r.player as usize + j) % n;
                 r.z[j] = res[s];

@@ -826,6 +826,30 @@ impl SearchGame for ToyGame {
             _ => None,
         }
     }
+
+    /// "own": who holds each action space at the end (the last round's placements: +1 the
+    /// viewer, -1 another seat, 0 free); "score": per relative seat (viewer first, MAXP slots,
+    /// absent seats 0) the score's parts / 10: 3 x workers, rooms beyond 2, plowed fields,
+    /// grain / 2, stone, -3 x begging markers (they sum to `score / 10`).
+    const AUX: &'static [(&'static str, usize)] = &[("own", N_SPACES), ("score", MAXP * 6)];
+
+    fn aux_targets(&self, seat: usize, out: &mut [f32]) {
+        let n = self.n as usize;
+        for s in 0..N_SPACES {
+            out[s] = match self.occ[s] {
+                FREE => 0.0,
+                o if o as usize == seat => 1.0,
+                _ => -1.0,
+            };
+        }
+        for j in 0..n {
+            let p = &self.players[(seat + j) % n];
+            let parts = [3 * p.workers as i32, p.rooms as i32 - 2, p.plowed as i32, (p.grain + p.field_grain()) as i32 / 2, p.stone as i32, -3 * p.beg as i32];
+            for (k, v) in parts.iter().enumerate() {
+                out[N_SPACES + 6 * j + k] = *v as f32 / 10.0;
+            }
+        }
+    }
 }
 
 /// `ToyGame::heuristic` as a driver bot.

@@ -137,6 +137,9 @@ pub struct DriverCfg {
     /// as is; F16 = rounded to half precision by the fill jobs (half the bytes to copy and
     /// upload; docs/search.md 2.2).
     pub x_dtype: XDtype,
+    /// Record the game's auxiliary targets (`SearchGame::aux_targets`, at game end) with every
+    /// sample (`Record::aux`); the game must have some (`SearchGame::AUX`).
+    pub aux: bool,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -170,6 +173,9 @@ pub struct Record {
     pub q: [f32; MAX_SEATS],
     pub sc: [f32; MAX_SEATS],
     pub net: u32,
+    /// Auxiliary targets from the decider's perspective (`SearchGame::aux_targets` of the
+    /// finished game; `DriverCfg::aux`), else empty.
+    pub aux: Vec<f32>,
 }
 
 /// A batch for one evaluator key (docs/search.md 2.2).
@@ -507,6 +513,9 @@ impl<G: SearchGame> Driver<G> {
         }
         if cfg.rolling && cfg.games.is_empty() {
             return Err("rolling mode needs at least one game's seats".into());
+        }
+        if cfg.aux && G::aux_width() == 0 {
+            return Err(format!("aux: {} has no auxiliary targets (SearchGame::AUX)", G::NAME));
         }
         let conc = if cfg.rolling { cfg.concurrency.max(1) } else { cfg.concurrency.max(1).min(cfg.games.len().max(1)) };
         let groups = cfg.groups.max(1).min(conc);
@@ -880,10 +889,14 @@ pub struct SampleArrays {
     pub q: Vec<f32>,
     pub sc: Vec<f32>,
     pub net: Vec<u32>,
+    /// Auxiliary targets [n * aw] (aw = 0: none recorded).
+    pub aw: usize,
+    pub aux: Vec<f32>,
 }
 
 pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
     let n = recs.len();
+    let aw = recs.first().map_or(0, |r| r.aux.len());
     let mut s = SampleArrays {
         n,
         f,
@@ -897,6 +910,8 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         q: Vec::with_capacity(n * MAX_SEATS),
         sc: Vec::with_capacity(n * MAX_SEATS),
         net: Vec::with_capacity(n),
+        aw,
+        aux: Vec::with_capacity(n * aw),
     };
     for r in recs {
         debug_assert_eq!(r.x.len(), f);
@@ -910,6 +925,8 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         s.q.extend_from_slice(&r.q);
         s.sc.extend_from_slice(&r.sc);
         s.net.push(r.net);
+        assert_eq!(r.aux.len(), aw, "records with different auxiliary target widths");
+        s.aux.extend_from_slice(&r.aux);
     }
     s
 }

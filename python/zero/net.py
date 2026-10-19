@@ -17,6 +17,15 @@ Heads:
   value  : logits over MAX_SEATS relative seats (seat j = (decider + j) % n), masked to the
            seats present -> softmax = P(seat wins)
   margin : each relative seat's margin target (`SearchGame::margin`), regression
+  aux    : optional (config key `aux` = the game's auxiliary target segments, `SearchGame::AUX`,
+           e.g. [['own', 400], ['score', 12]]; KataGo-style auxiliary targets, docs/az.md 4.1):
+           only returned by `forward(x, n, aux=True)` (training), so inference - `infer`,
+           its CUDA graphs - is unchanged. Segment 'own' = final ownership per cell, tanh
+           (GridNet: a 1x1 conv on the tower, one value per board cell; the grid's h x w cells);
+           the other segments are regression values (GridNet: an MLP on the pooled trunk). The
+           heads' last layers start at zero (they predict 0); `add_aux` adds them to a network
+           without (an older checkpoint: everything else copied, its outputs unchanged),
+           `strip_aux` removes them (older code cannot build a network with `aux`).
 
 Checkpoints (`save`, atomic): {config, state, extra}; `load` rebuilds the network from the
 config; `widen` maps a checkpoint onto a larger feature / action space (new inputs get zero
@@ -32,6 +41,17 @@ import torch.nn.functional as F
 from .protocol import MAX_SEATS
 
 
+def aux_segments(aux):
+    """An auxiliary target layout ([(name, width), ...], a game's `aux_layout` or a config's
+    `aux`; None = none) -> [[name, width], ...]."""
+    return [[str(n), int(w)] for n, w in (aux or [])]
+
+
+def _zero(layer):
+    nn.init.zeros_(layer.weight)
+    nn.init.zeros_(layer.bias)
+
+
 class Block(nn.Module):
     def __init__(self, h):
         super().__init__()
@@ -44,7 +64,7 @@ class Block(nn.Module):
 
 
 class Net(nn.Module):
-    def __init__(self, features, actions, hidden=256, blocks=4, seats=MAX_SEATS, game='toy', head=128):
+    def __init__(self, features, actions, hidden=256, blocks=4, seats=MAX_SEATS, game='toy', head=128, aux=None):
         super().__init__()
         self.config = {'features': features, 'actions': actions, 'hidden': hidden, 'blocks': blocks,
                        'seats': seats, 'game': game, 'head': head}
@@ -56,17 +76,31 @@ class Net(nn.Module):
         self.pol = nn.Linear(hidden, actions)
         self.val = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
+        # auxiliary heads last: the other parameters are initialised as without them
+        self.aux_layout = aux_segments(aux)
+        if self.aux_layout:
+            self.config['aux'] = self.aux_layout
+            width = sum(w for _, w in self.aux_layout)
+            self.aux_head = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, width))
+            _zero(self.aux_head[2])
+            tanh = torch.cat([torch.full((w,), n == 'own') for n, w in self.aux_layout])
+            self.register_buffer('aux_tanh', tanh, persistent=False)
 
-    def forward(self, x, n_players):
+    def forward(self, x, n_players, aux=False):
         """x [B, >= features] (an older, narrower network reads a prefix), n_players [B]
         -> policy logits [B, actions], value logits [B, seats] (absent seats -1e9),
-        margin [B, seats]."""
+        margin [B, seats] (+ with aux=True the auxiliary predictions [B, aux width])."""
         h = F.relu(self.inp(x[:, :self.features]))
         for b in self.blocks:
             h = b(h)
         h = F.relu(self.ln(h))
         present = torch.arange(self.seats, device=x.device)[None, :] < n_players[:, None]
         vlog = self.val(h).masked_fill(~present, -1e9)
+        if aux:
+            if not self.aux_layout:
+                raise ValueError('forward(aux=True): the network has no auxiliary heads (net.add_aux)')
+            a = self.aux_head(h)
+            return self.pol(h), vlog, self.mar(h), torch.where(self.aux_tanh, torch.tanh(a), a)
         return self.pol(h), vlog, self.mar(h)
 
     def n_params(self):
@@ -99,7 +133,7 @@ class GridNet(nn.Module):
     Every feature outside the plane blocks is a global."""
 
     def __init__(self, features, actions, grid, ch=64, blocks=6, seats=MAX_SEATS, game='toy', head=128, ghid=128,
-                 arch='grid'):
+                 arch='grid', aux=None):
         super().__init__()
         segs = [[int(o), int(k)] for o, k in grid.get('segments') or [[grid.get('offset', 0), grid['planes']]]]
         grid = {'planes': sum(k for _, k in segs), 'h': int(grid['h']), 'w': int(grid['w']), 'offset': segs[0][0],
@@ -136,8 +170,22 @@ class GridNet(nn.Module):
         self.other = nn.Linear(256, actions - H * W)
         self.val = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, seats))
+        # auxiliary heads last: the other parameters are initialised as without them
+        self.aux_layout = aux_segments(aux)
+        self.aux_k = sum(w for n, w in self.aux_layout if n != 'own')
+        if self.aux_layout:
+            names = [n for n, _ in self.aux_layout]
+            if names.count('own') > 1 or any(w != cells for n, w in self.aux_layout if n == 'own'):
+                raise ValueError(f"aux {self.aux_layout}: at most one 'own' segment, of the grid's {cells} cells")
+            self.config['aux'] = self.aux_layout
+            if 'own' in names:
+                self.aux_own = nn.Conv2d(ch, 1, 1)
+                _zero(self.aux_own)
+            if self.aux_k:
+                self.aux_score = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, self.aux_k))
+                _zero(self.aux_score[2])
 
-    def forward(self, x, n_players):
+    def forward(self, x, n_players, aux=False):
         """As `Net.forward`."""
         B = x.shape[0]
         x = x[:, :self.features]
@@ -161,6 +209,18 @@ class GridNet(nn.Module):
         pol = torch.cat([rest[:, :self.a0], cell, rest[:, self.a0:]], 1)
         present = torch.arange(self.seats, device=x.device)[None, :] < n_players[:, None]
         vlog = self.val(e).masked_fill(~present, -1e9)
+        if aux:
+            if not self.aux_layout:
+                raise ValueError('forward(aux=True): the network has no auxiliary heads (net.add_aux)')
+            sc = self.aux_score(e) if self.aux_k else None
+            parts, k = [], 0
+            for name, w in self.aux_layout:
+                if name == 'own':
+                    parts.append(torch.tanh(self.aux_own(h).reshape(B, self.H * self.W)))
+                else:
+                    parts.append(sc[:, k:k + w])
+                    k += w
+            return pol, vlog, self.mar(e), torch.cat(parts, 1)
         return pol, vlog, self.mar(e)
 
     def n_params(self):
@@ -174,6 +234,39 @@ def build(config):
         return GridNet(**cfg)
     cfg.pop('arch', None)
     return Net(**cfg)
+
+
+def add_aux(model, aux, seed=0):
+    """`model` with auxiliary heads for the layout `aux` (`aux_segments`): a network without
+    heads (an older checkpoint) -> a copy with every weight kept and new heads (initialised from
+    `seed`; their last layers zero: they predict 0 and send the trunk no gradient until they
+    have learned something), whose policy / value / margin outputs are unchanged. A network
+    with that layout already: `model` itself; with another layout: ValueError."""
+    aux = aux_segments(aux)
+    have = aux_segments(model.config.get('aux'))
+    if have == aux:
+        return model
+    if have or not aux:
+        raise ValueError(f'add_aux: the network has auxiliary heads {have}, wanted {aux}')
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        new = build(dict(model.config, aux=aux))
+    missing, unexpected = new.load_state_dict(model.state_dict(), strict=False)
+    if unexpected or not missing or any(not k.startswith('aux_') for k in missing):
+        raise RuntimeError(f'add_aux: state mismatch (missing {missing}, unexpected {unexpected})')
+    dev = next(model.parameters()).device
+    return new.to(dev).train(model.training)
+
+
+def strip_aux(model):
+    """A copy of `model` without auxiliary heads (config and state; the same policy / value /
+    margin): for code that predates them (e.g. a play server pinned to an older core)."""
+    if not model.config.get('aux'):
+        return model
+    new = build({k: v for k, v in model.config.items() if k != 'aux'})
+    new.load_state_dict({k: v for k, v in model.state_dict().items() if not k.startswith('aux_')})
+    dev = next(model.parameters()).device
+    return new.to(dev).train(model.training)
 
 
 def _replace(tmp, dst, tries=40):

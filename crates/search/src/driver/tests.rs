@@ -1,5 +1,5 @@
 use super::*;
-use crate::toy::ToyGame;
+use crate::toy::{ToyGame, N_SPACES};
 
 fn nn(key: u16, sims: u32, selfplay: bool) -> SeatCfg {
     let mut s = NnSeat::eval(key, sims);
@@ -27,6 +27,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         rolling: false,
         net: 0,
         x_dtype: XDtype::F32,
+        aux: false,
     }
 }
 
@@ -355,4 +356,62 @@ fn f16_features_are_the_rounded_f32_features() {
         let s = d.sh.x_pool.spare();
         assert!((1..=5).contains(&s), "{s} spare buffers");
     }
+}
+
+#[test]
+fn aux_targets_recorded_per_sample_at_game_end() {
+    // the same self-play with and without aux: identical games and records but the aux
+    // targets; with aux every sample carries its decider's view of the final state
+    let mk = |aux: bool| {
+        let mut c = cfg(vec![nn(0, 16, true)], vec![vec![0, 0]; 16], &[("m", KeyKind::Nn)]);
+        c.aux = aux;
+        c.threads = 3;
+        let mut d = Driver::<ToyGame>::new(c).unwrap();
+        // results and samples in emission order (a game's samples follow each other)
+        let (mut res, mut smp) = (Vec::new(), Vec::new());
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer(&mut d, &b);
+            res.extend(d.take_results());
+            smp.extend(d.take_samples());
+        }
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+        (res, smp)
+    };
+    let (r0, s0) = mk(false);
+    let (r1, s1) = mk(true);
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples);
+    assert_eq!(r0.iter().map(key).collect::<Vec<_>>(), r1.iter().map(key).collect::<Vec<_>>());
+    assert_eq!(records_digest(&s0), records_digest(&s1));
+    assert!(s0.iter().all(|r| r.aux.is_empty()));
+    let w = <ToyGame as SearchGame>::aux_width();
+    assert!(!s1.is_empty() && s1.iter().all(|r| r.aux.len() == w));
+    let mut k = 0;
+    for r in &r1 {
+        let recs = &s1[k..k + r.samples as usize];
+        k += r.samples as usize;
+        let mut seen = [None::<&Vec<f32>>; 2];
+        for s in recs {
+            let p = s.player as usize;
+            // the score parts: the decider's first, each summing to that seat's final score
+            for j in 0..2 {
+                let tot: f32 = s.aux[N_SPACES + 6 * j..N_SPACES + 6 * j + 6].iter().sum();
+                assert!((tot * 10.0 - r.scores[(p + j) % 2]).abs() < 1e-4);
+            }
+            // one final state: the same targets for every sample of a seat
+            if let Some(a) = seen[p] {
+                assert_eq!(a, &s.aux);
+            }
+            seen[p] = Some(&s.aux);
+        }
+        if let (Some(a), Some(b)) = (seen[0], seen[1]) {
+            // 2 players: ownership flips sign, the score blocks swap
+            assert!((0..N_SPACES).all(|c| a[c] == -b[c]));
+            assert_eq!(a[N_SPACES..N_SPACES + 6], b[N_SPACES + 6..N_SPACES + 12]);
+        }
+    }
+    assert_eq!(k, s1.len());
+    let arr = sample_arrays(&s1, ToyGame::NUM_FEATURES);
+    assert_eq!((arr.aw, arr.aux.len()), (w, s1.len() * w));
+    assert_eq!(sample_arrays(&s0, ToyGame::NUM_FEATURES).aw, 0);
 }

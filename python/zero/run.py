@@ -39,7 +39,7 @@ import torch.nn.functional as F
 from . import elo, games as G, package, runctl
 from .data import ShardWriter, TargetStats, Window, shard_paths
 from .infer import NetEvaluator, drive, use_amp
-from .net import GridNet, Net, load, save
+from .net import GridNet, Net, add_aux, aux_segments, load, save
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, Paused
 
@@ -92,6 +92,13 @@ DEFAULTS = dict(
     window=8, window_grow=1, min_window_samples=20_000, keep_data=12, ram_budget_gb=4.0, shard_rows=65536,
     # value target = (1 - q) z + q root-search estimate, q = value_q * min(1, iter / warmup)
     value_q=0.5, value_q_warmup=5, margin_loss_w=0.5,
+    # auxiliary targets (KataGo-style; the game's `SearchGame::AUX`, docs/az.md 4.1): loss weights
+    # of the final-ownership segment ('own': MSE of tanh per cell, averaged over the cells) and
+    # of the other segments ('score': MSE averaged over the values). Either > 0: self-play
+    # records the targets (shard key `aux`), the network gets the heads (`net.add_aux`, added to
+    # a checkpoint without them) and training adds the losses; rows without targets (older
+    # shards) are masked out. 0 = off (the default: everything as before)
+    aux_own_w=0.0, aux_score_w=0.0,
     # evaluation: the yardstick (Elo anchor = 1000): a built-in bot or 'ext:<name>'
     yardstick='heuristic', eval_games=200, eval_sims=32, eval_random_games=50, eval_every=1, elo_games=100,
     ref_games=400,
@@ -222,6 +229,16 @@ class Run:
         self.roll = None                           # rolling driver + its evaluator
         self.roll_ev = None
         self.pool = None                           # selfplay_procs > 1: zero.selfplay_procs.Pool
+        # auxiliary targets: the game's segments when a weight is on, else [] (off)
+        self.aux_w = {'own': float(cfg.get('aux_own_w') or 0.0), 'score': float(cfg.get('aux_score_w') or 0.0)}
+        self.aux = []
+        if any(w > 0 for w in self.aux_w.values()):
+            self.aux = aux_segments(self.info.get('aux_layout'))
+            kinds = {'own' if n == 'own' else 'score' for n, _ in self.aux}
+            for k, w in self.aux_w.items():
+                if w > 0 and k not in kinds:
+                    raise SystemExit(f"aux_{k}_w {w}: game {cfg['game']!r} has no {k!r} auxiliary targets "
+                                     f"(its layout: {self.aux}; SearchGame::AUX)")
 
     def close(self):
         """Stop the self-play worker processes (if any); never raises."""
@@ -247,9 +264,9 @@ class Run:
             if not grid:
                 raise SystemExit(f"arch 'grid': the game package has no grid for {self.cfg['game']!r} (GamePackage.grids)")
             return GridNet(self.info['num_features'], self.info['num_actions'], grid, self.cfg['ch'], self.cfg['blocks'],
-                           game=self.cfg['game']).eval()
+                           game=self.cfg['game'], aux=self.aux or None).eval()
         return Net(self.info['num_features'], self.info['num_actions'], self.cfg['hidden'], self.cfg['blocks'],
-                   game=self.cfg['game']).eval()
+                   game=self.cfg['game'], aux=self.aux or None).eval()
 
     def evaluator(self, path):
         m, _ = load(path, self.cfg['infer_device'])
@@ -263,9 +280,11 @@ class Run:
                              c.get('policy_target', 'visits'), c.get('cq_c_visit', 50.0), c.get('cq_c_scale', 1.0))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']))
 
-    def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None, x_dtype='f32'):
+    def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None, x_dtype='f32', aux=False):
         c = self.cfg
         kw = {} if x_dtype == 'f32' else {'x_dtype': x_dtype}   # (an older engine has no x_dtype)
+        if aux:
+            kw['aux'] = True                       # record the auxiliary targets (an older engine has no aux)
         return G.Driver(c['game'], seats, spec=c['spec'], concurrency=conc or c['conc'], seed=seed, record=record,
                         threads=c['threads'], groups=groups or c['groups'], max_steps=c['max_steps'], rolling=rolling,
                         net=net, **kw)
@@ -318,7 +337,8 @@ class Run:
         if c['rolling']:
             if self.roll is None:
                 table = [[seat] * p for p in c['players']]
-                self.roll = self.driver(table, seed=seed, record=True, rolling=True, net=it - 1, x_dtype=c.get('feed_dtype', 'f32'))
+                self.roll = self.driver(table, seed=seed, record=True, rolling=True, net=it - 1, x_dtype=c.get('feed_dtype', 'f32'),
+                                        aux=bool(self.aux))
                 self.roll_ev = self.evaluator(model_path(self.run, it - 1))
             else:
                 m, _ = load(model_path(self.run, it - 1), 'cpu')
@@ -327,7 +347,8 @@ class Run:
             st0 = drv.stats()
             drv.resume(games, it - 1)
         else:
-            drv = self.driver([[seat] * int(p) for p in counts], seed=seed, record=True, x_dtype=c.get('feed_dtype', 'f32'))
+            drv = self.driver([[seat] * int(p) for p in counts], seed=seed, record=True, x_dtype=c.get('feed_dtype', 'f32'),
+                              aux=bool(self.aux))
             ev = self.evaluator(model_path(self.run, it - 1))
             st0 = None
         writer = ShardWriter(d, prefix, rows=c['shard_rows'], meta=meta)
@@ -399,31 +420,60 @@ class Run:
             dev = 'cpu'
         t0 = time.time()
         model, _ = load(model_path(self.run, it - 1), dev)
+        added = False
+        if self.aux and not model.config.get('aux'):
+            # a checkpoint without auxiliary heads (a fork of a run without them): new heads
+            model = add_aux(model, self.aux, seed=c['seed'] * 7919 + it)
+            added = True
+            self.log(f'iter {it}: auxiliary heads {self.aux} added to checkpoint {it - 1}')
         model.train()
-        opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'])
+        aux_params = [p for n, p in model.named_parameters() if n.startswith('aux_')]
+        base_params = [p for n, p in model.named_parameters() if not n.startswith('aux_')]
+        if aux_params:                             # two groups: the trunk + heads, the auxiliary heads
+            opt = torch.optim.AdamW([{'params': base_params}, {'params': aux_params}], lr=c['lr'], weight_decay=c['wd'])
+        else:
+            opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'])
         opt_path = os.path.join(self.run, 'models', 'opt_latest.pt')
         fresh = True
         if os.path.exists(opt_path):
             try:
                 o = torch.load(opt_path, map_location=dev, weights_only=False)
                 if o.get('iter') == it - 1:
-                    opt.load_state_dict(o['state'])
+                    groups = o['state'].get('param_groups', [])
+                    if aux_params and len(groups) == 1 and len(groups[0]['params']) == len(base_params):
+                        # the state of the network before its auxiliary heads: kept for the
+                        # trunk and the old heads, the new heads start fresh
+                        opt = torch.optim.AdamW(base_params, lr=c['lr'], weight_decay=c['wd'])
+                        opt.load_state_dict(o['state'])
+                        opt.add_param_group({'params': aux_params})
+                    else:
+                        opt.load_state_dict(o['state'])
                     fresh = False
             except Exception as e:                 # noqa: BLE001
                 self.log(f'iter {it}: optimizer state not loaded ({e}); fresh optimizer')
         lr = lr_at(c, it)
         paths = self.window_shards(it)
-        bpr = model.features * 2 + 8 * 16 + 3 * MAX_SEATS * 4
+        aw = sum(w for _, w in self.aux)
+        bpr = model.features * 2 + 8 * 16 + 3 * MAX_SEATS * 4 + (2 * aw + 1 if aw else 0)
         budget = int(c['ram_budget_gb'] * 1e9 / bpr)
         t1 = time.time()
-        W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it)
+        W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it, aux_width=aw)
         load_s = time.time() - t1
+        if aw:
+            # column indices of the 'own' segment and of the other ('score') segments
+            kinds, k = {'own': [], 'score': []}, 0
+            for name, w in self.aux:
+                kinds['own' if name == 'own' else 'score'].extend(range(k, k + w))
+                k += w
+            cols = {kk: torch.tensor(v, dtype=torch.long, device=dev) for kk, v in kinds.items() if v}
         steps = max(c['min_steps'], math.ceil(new_samples * c['reuse'] / c['batch']))
         vq = value_q_at(c, it)
         mw = c['margin_loss_w']
         amp = use_amp(model, dev)
         rng = np.random.default_rng(c['seed'] * 31 + it)
         acc = {'policy': 0.0, 'value': 0.0, 'margin': 0.0, 'entropy': 0.0, 'value_acc': 0.0}
+        if aw:
+            acc.update({f'aux_{kk}': 0.0 for kk in cols})
         last = min(steps, 200)
         S = model.seats
         for step in range(steps):
@@ -433,7 +483,10 @@ class Run:
                 g['lr'] = g_lr
             b = W.batch(rng.integers(W.N, size=c['batch']), dev)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
-                plog, vlog, mp = model(b['x'], b['n_players'])
+                if aw:
+                    plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True)
+                else:
+                    plog, vlog, mp = model(b['x'], b['n_players'])
             plog, vlog, mp = plog.float(), vlog.float(), mp.float()
             logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)
             lp = -(b['pi'] * logp).sum(1).mean()
@@ -442,6 +495,14 @@ class Run:
             present = (torch.arange(S, device=b['x'].device)[None, :] < b['n_players'][:, None]).float()
             lm = (((mp - b['sc'][:, :S]) ** 2) * present).sum(1).mean() / 2
             loss = lp + lv + mw * lm
+            if aw:
+                # mean squared error per row over each kind's columns, averaged over the rows that
+                # have targets (aux_mask)
+                am = b['aux_mask']
+                err = (ap.float() - b['aux']) ** 2
+                la = {kk: (err.index_select(1, ix).mean(1) * am).sum() / am.sum().clamp(min=1.0) for kk, ix in cols.items()}
+                for kk, v in la.items():
+                    loss = loss + self.aux_w[kk] * v
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -456,15 +517,23 @@ class Run:
                 acc['margin'] += lm.item() / last
                 acc['entropy'] += ent.item() / last
                 acc['value_acc'] += vacc.item() / last
+                if aw:
+                    for kk, v in la.items():
+                        acc[f'aux_{kk}'] += v.item() / last
         model.eval()
         save(model, model_path(self.run, it), {'iter': it})
         tmp = opt_path + '.tmp'
         torch.save({'iter': it, 'state': opt.state_dict()}, tmp)
         os.replace(tmp, opt_path)
         secs = time.time() - t0
-        return dict({k: round(v, 5) for k, v in acc.items()}, steps=steps, window_samples=W.N, window_loaded=W.loaded,
-                    window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
-                    value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
+        out = dict({k: round(v, 5) for k, v in acc.items()}, steps=steps, window_samples=W.N, window_loaded=W.loaded,
+                   window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
+                   value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
+        if aw:
+            out['aux'] = aux_window_stats(W, kinds)
+            if added:
+                out['aux']['heads_added'] = True
+        return out
 
     # ---------------------------------------------------------------- evaluation
     def opp_seat(self, opp, sims):
@@ -635,6 +704,21 @@ class Run:
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})
 
 
+def aux_window_stats(W, kinds, rows=20_000, seed=0):
+    """The training window's auxiliary targets: rows that have them (share), and per kind the
+    loss of predicting 0 (the heads' initial output: a reference for the aux losses), on up to
+    `rows` of those rows."""
+    have = np.nonzero(W.aux_mask)[0]
+    out = {'rows': int(len(have)), 'share': round(len(have) / max(1, W.N), 4)}
+    if len(have):
+        pick = have if len(have) <= rows else np.random.default_rng(seed).choice(have, rows, replace=False)
+        a = W.aux[pick].astype(np.float32)
+        for kk, ix in kinds.items():
+            if ix:
+                out[f'{kk}_zero'] = round(float((a[:, ix] ** 2).mean()), 5)
+    return out
+
+
 def _fmt(d):
     return json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in d.items()})
 
@@ -678,6 +762,10 @@ def resolve_config(args, saved):
     cfg['preset'] = preset
     if cfg.get('policy_target', 'visits') not in ('visits', 'cq'):
         raise SystemExit(f"policy_target {cfg['policy_target']!r}: 'visits' or 'cq'")
+    for k in ('aux_own_w', 'aux_score_w'):
+        w = cfg.get(k, 0.0)
+        if not isinstance(w, (int, float)) or not w >= 0:
+            raise SystemExit(f'{k} {w!r}: a number >= 0')
     sp = cfg.get('selfplay_procs', 1)
     if not isinstance(sp, int) or sp < 1:
         raise SystemExit(f'selfplay_procs {sp!r}: an integer >= 1')

@@ -19,10 +19,12 @@ pub struct GameInfo {
     pub min_players: usize,
     pub max_players: usize,
     pub bots: Vec<&'static str>,
+    /// Auxiliary target segments (`SearchGame::AUX`).
+    pub aux: Vec<(&'static str, usize)>,
 }
 
 pub fn game_info<G: SearchGame>() -> GameInfo {
-    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>() }
+    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>(), aux: G::AUX.to_vec() }
 }
 
 /// One game, any type.
@@ -43,6 +45,8 @@ pub trait DynGame: Send + Sync {
     fn rounds(&self) -> u32;
     fn export_state(&self) -> String;
     fn apply_external(&mut self, payload: &str) -> Result<Vec<u64>, String>;
+    /// `SearchGame::aux_targets` from `seat`'s perspective (`aux_width()` floats).
+    fn aux_targets(&self, seat: usize) -> Vec<f32>;
     /// A search tree for this game's pending decision.
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String>;
 }
@@ -103,6 +107,11 @@ impl<G: SearchGame> DynGame for G {
         let mut k = Vec::new();
         SearchGame::apply_external(self, payload, &mut k)?;
         Ok(k)
+    }
+    fn aux_targets(&self, seat: usize) -> Vec<f32> {
+        let mut v = vec![0.0; G::aux_width()];
+        SearchGame::aux_targets(self, seat, &mut v);
+        v
     }
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String> {
         let viewer = SearchGame::to_move(self).ok_or("the game is over")?;

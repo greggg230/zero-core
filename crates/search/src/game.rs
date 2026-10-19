@@ -36,6 +36,13 @@ pub const MAX_SEATS: usize = 8;
 /// * **External seats** (a player outside the AZ action layer, e.g. the JS bot through the
 ///   Node bridge): `export_state()` describes the state for that player, `apply_external`
 ///   applies its answer (any number of moves); afterwards the driver re-reads everything.
+/// * **Auxiliary targets** (optional, KataGo-style; docs/search.md 2.4): `AUX` names the
+///   segments of a per-sample vector of `aux_width()` floats that `aux_targets(seat, out)`
+///   writes for a FINISHED game from `seat`'s perspective (the driver records it with every
+///   sample of that seat when the driver's `aux` is on). Segment `("own", cells)`: final
+///   ownership per board cell in [-1, 1] (+1 the viewer's, -1 another seat's, 0 nobody's; a
+///   grid network predicts it per cell, so cells = the grid's h x w, row-major as its planes);
+///   any other name (e.g. `("score", k)`): regression values scaled to O(1). Default: none.
 pub trait SearchGame: Clone + Send + Sync + 'static {
     /// Settings shared by all games of one driver, parsed from a JSON string.
     type Spec: Clone + Send + Sync + 'static;
@@ -83,6 +90,18 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn make_bot(spec: &Self::Spec, name: &str, seed: u64) -> Option<Box<dyn Bot<Self>>> {
         let _ = (spec, name, seed);
         None
+    }
+    /// Segments (name, width) of the auxiliary targets, in vector order (see the trait docs);
+    /// empty: the game has none.
+    const AUX: &'static [(&'static str, usize)] = &[];
+    /// Width of the auxiliary target vector (the segments' sum).
+    fn aux_width() -> usize {
+        Self::AUX.iter().map(|s| s.1).sum()
+    }
+    /// The auxiliary targets of the finished game from `seat`'s perspective into `out`
+    /// (`aux_width()` floats, zeroed by the caller).
+    fn aux_targets(&self, seat: usize, out: &mut [f32]) {
+        let _ = (seat, out);
     }
 }
 

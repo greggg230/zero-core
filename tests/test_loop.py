@@ -183,6 +183,36 @@ def test_fork_run_policy_target_ab(smoke_run, tmp_path):
     assert sc['target']['h_norm'] < sv['target']['h_norm'] and sc['target']['max_share'] > sv['target']['max_share']
 
 
+def test_fork_run_aux_targets(smoke_run, tmp_path):
+    """The aux A/B procedure (docs/az.md 4.1): a continuation fork of a run without auxiliary
+    targets with the aux weights on. Its first iteration adds the heads to the forked checkpoint
+    and trains on a window whose older shards have no targets (masked); rolling self-play's
+    evaluator, built from the checkpoint without heads, takes the next one's weights."""
+    import numpy as np
+    import torch
+    sys.path.insert(0, os.path.join(ROOT, 'tools'))
+    import fork_run
+    run = tmp_path / 'aux'
+    assert fork_run.main(['--source', str(smoke_run), '--dest', str(run), '--iter', '2', '--set', 'aux_own_w=1.0',
+                          '--set', 'aux_score_w=0.5']) == 0
+    p = run_loop(run, '--iters', '4', '--rolling', '1')
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    assert [r['iter'] for r in m] == [0, 1, 2, 3, 4] and 'aux' not in m[2]['train']
+    t3, t4 = m[3]['train'], m[4]['train']
+    assert t3['aux']['heads_added'] and 0 < t3['aux']['share'] < 1 and 'heads_added' not in t4['aux']
+    assert all(t[k] > 0 for t in (t3, t4) for k in ('aux_own', 'aux_score'))
+    assert m[4]['eval_yard']['games'] > 0
+    for it in (3, 4):
+        for sh in (run / 'data' / f'iter_{it:04d}').glob('*.npz'):
+            with np.load(sh) as z:
+                assert z['aux'].shape == (z['x'].shape[0], 37) and z['aux'].dtype == np.float16
+    with np.load(next((run / 'data' / 'iter_0002').glob('*.npz'))) as z:
+        assert 'aux' not in z.files
+    assert torch.load(run / 'models' / 'iter_0004.pt', weights_only=False)['config']['aux'] == [['own', 13], ['score', 24]]
+    assert 'aux' not in torch.load(run / 'models' / 'iter_0002.pt', weights_only=False)['config']
+
+
 def test_dashboard(smoke_run, tmp_path):
     from zero import dashboard
     app = dashboard.app

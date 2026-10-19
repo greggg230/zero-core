@@ -3,15 +3,20 @@
 Shards: `data/iter_NNNN/<task>_SSS.npz` (uncompressed npz, written to a temporary name and
 renamed: a crash never leaves a half-written shard). Arrays: `x` float16 [N, F], `player`,
 `n_players` int8, `opt_off` int32 [N+1], `opt_action` int16/int32, `pi` float16, `z` / `q` /
-`sc` float16 [N, P] (P = most players in the shard), `net` int32, and `meta` (a JSON string:
-game, features, actions, rows, task info). Float16 targets are renormalised on load.
+`sc` float16 [N, P] (P = most players in the shard), `net` int32, optionally `aux` float16
+[N, W] (the game's auxiliary targets, `SearchGame::AUX`; self-play with aux targets on), and
+`meta` (a JSON string: game, features, actions, rows, task info). Float16 targets are
+renormalised on load.
 
 `TargetStats`: sharpness of the recorded policy targets (self-play metrics).
 
 Window: the newest iterations' shards loaded into RAM (`Window(paths, ...)`), every shard
 subsampled at the same rate when the total exceeds the RAM budget; `batch(idx)` builds
 torch tensors: features cut / zero-padded to the network's width, dense legal masks and
-policy targets over the actions, value / margin targets over MAX_SEATS.
+policy targets over the actions, value / margin targets over MAX_SEATS; with `aux_width` W > 0
+also the auxiliary targets `aux` [B, W] and `aux_mask` [B] (1 = the row has them: rows of
+shards written without aux targets - e.g. a fork's older window - are zeros with mask 0, so
+the auxiliary losses skip them).
 """
 import glob
 import json
@@ -41,7 +46,8 @@ def compact(s):
             'n_players': n.astype(np.int8), 'opt_off': s['opt_off'].astype(np.int32),
             'opt_action': _narrow_int(s['opt_action']), 'pi': s['pi'].astype(np.float16),
             'z': s['z'][:, :P].astype(np.float16), 'q': s['q'][:, :P].astype(np.float16),
-            'sc': s['sc'][:, :P].astype(np.float16), 'net': s['net'].astype(np.int32)}
+            'sc': s['sc'][:, :P].astype(np.float16), 'net': s['net'].astype(np.int32),
+            **({'aux': s['aux'].astype(np.float16)} if 'aux' in s else {})}
 
 
 def write_shard(path, s, meta):
@@ -163,15 +169,18 @@ def _ranges(starts, lens):
 
 class Window:
     """The training window in RAM. paths: shard files; `budget_rows`: keep at most this many
-    samples (a uniform random share of every shard)."""
+    samples (a uniform random share of every shard); `aux_width` > 0: load the auxiliary
+    targets (a shard's `aux` must have that width; shards without them give masked rows)."""
 
-    def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0):
+    def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, aux_width=0):
         self.F, self.A = num_features, num_actions
+        self.AW = int(aux_width)
         rng = np.random.default_rng(seed)
         parts = [read_shard(p) for p in paths]
         total = sum(len(p['player']) for p in parts)
         keep = 1.0 if not budget_rows or total <= budget_rows else budget_rows / total
         xs, pl, npl, offs, acts, pis, zs, qs, scs = [], [], [], [np.zeros(1, np.int64)], [], [], [], [], []
+        auxs, amask = [], []
         base = 0
         for p in parts:
             N = len(p['player'])
@@ -196,6 +205,15 @@ class Window:
                 v = p[k][idx].astype(np.float32)
                 a[:, :v.shape[1]] = v
                 dst.append(a)
+            if self.AW:
+                if 'aux' in p:
+                    if p['aux'].shape[1] != self.AW:
+                        raise ValueError(f'shard aux targets of width {p["aux"].shape[1]}, the window wants {self.AW}')
+                    auxs.append(p['aux'][idx].astype(np.float16))
+                    amask.append(np.ones(len(idx), bool))
+                else:
+                    auxs.append(np.zeros((len(idx), self.AW), np.float16))
+                    amask.append(np.zeros(len(idx), bool))
         self.N = sum(len(x) for x in xs)
         if self.N == 0:
             raise ValueError('empty training window')
@@ -211,8 +229,12 @@ class Window:
         self.q = np.concatenate(qs)
         self.sc = np.concatenate(scs)
         self.loaded = total
+        self.aux = np.concatenate(auxs) if self.AW else None
+        self.aux_mask = np.concatenate(amask) if self.AW else None
+        # rows with auxiliary targets
+        self.aux_rows = int(self.aux_mask.sum()) if self.AW else 0
         self.nbytes = sum(a.nbytes for a in (self.x, self.player, self.n_players, self.opt_off, self.opt_action,
-                                             self.pi, self.z, self.q, self.sc))
+                                             self.pi, self.z, self.q, self.sc) + ((self.aux, self.aux_mask) if self.AW else ()))
 
     def batch(self, idx, device='cpu'):
         B = len(idx)
@@ -231,6 +253,10 @@ class Window:
         def norm(a):
             return a / np.maximum(a.sum(1, keepdims=True), 1e-8)
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device)
-        return {'x': t(self.x[idx].astype(np.float32)), 'mask': t(mask), 'pi': t(pi),
-                'z': t(norm(self.z[idx])), 'q': t(norm(self.q[idx])), 'sc': t(self.sc[idx]),
-                'n_players': t(self.n_players[idx])}
+        out = {'x': t(self.x[idx].astype(np.float32)), 'mask': t(mask), 'pi': t(pi),
+               'z': t(norm(self.z[idx])), 'q': t(norm(self.q[idx])), 'sc': t(self.sc[idx]),
+               'n_players': t(self.n_players[idx])}
+        if self.AW:
+            out['aux'] = t(self.aux[idx].astype(np.float32))
+            out['aux_mask'] = t(self.aux_mask[idx].astype(np.float32))
+        return out
