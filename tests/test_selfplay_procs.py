@@ -285,3 +285,17 @@ def test_worker_error_fails_the_run(tmp_path):
     assert 'WorkerError: self-play worker' in p.stderr and '9 seats' in p.stderr, p.stderr
     assert [r['iter'] for r in read_metrics(str(run))] == [0] and latest_iter(str(run)) == 0
     assert all_gone(workers_of(run))
+
+
+def test_two_procs_record_aux_targets(tmp_path):
+    """Auxiliary targets on (docs/az.md 4.1): every worker records them, training reads them."""
+    run = tmp_path / 'aux'
+    p = run_loop(run, '--iters', '2', '--rolling', '1', '--selfplay-procs', '2', '--aux-own-w', '1.0',
+                 '--aux-score-w', '0.5')
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    for r in m[1:]:
+        d = run / 'data' / f'iter_{r["iter"]:04d}'
+        shards = [read_shard(q) for q in shard_paths(str(d))]
+        assert len(shards) == 2 and all(s['aux'].shape == (s['x'].shape[0], 37) for s in shards)
+        assert r['train']['aux']['share'] == 1.0 and r['train']['aux_own'] > 0 and r['train']['aux_score'] > 0

@@ -187,11 +187,14 @@ same forward pass, so self-play speed is unchanged.
   evaluator built before the heads existed takes the next checkpoints). Weights 0 (the default):
   nothing is recorded or loaded, the checkpoints and stats are exactly those of a run without
   the feature (`tests/test_aux.py`).
-* **Weights**: the losses' scales - own MSE ~0.3-0.6 at the start of a Kingdom Builder game
-  (an empty board predicts 0 and most cells end empty), score MSE ~0.1 - make `aux_own_w` 1.0 and
-  `aux_score_w` 0.5 a reasonable first setting (the policy loss is ~1.3, the value ~0.45 there);
-  KataGo weights ownership at 1.5 / (board area) of a summed cross-entropy, of the same order as
-  this mean.
+* **Weights**: Kingdom Builder smoke (kingdombuilder-xst, a fresh 32 x 3 GridNet, 300 games per
+  iteration, `aux_own_w` 1, `aux_score_w` 0.5; 2026-10-19): predicting 0 costs own 0.19 (about
+  a fifth of the cells end with a settlement) and score 0.2-0.4 (it grows with the scores);
+  on the same 120 held-out games checkpoints 0-3 scored own 0.190 / 0.137 / 0.126 / 0.121 and
+  score 0.404 / 0.194 / 0.181 / 0.154 (policy loss ~1.6, value ~0.55 there). A first setting:
+  `aux_own_w` 1.0, `aux_score_w` 0.5 (KataGo weights ownership 1.5 x the mean cross-entropy
+  over the board, the same order). The heads cost nothing at play time; training computes
+  them (+34.5k parameters on the 96 x 8 net).
 * **A/B as a fork**: `tools/fork_run.py --source runs/a --dest runs/a_aux --iter K --set
   aux_own_w=1.0 --set aux_score_w=0.5`, run from a checkout with this code (and the remote
   evaluator's checkout too: the new checkpoints have heads). The fork's first iteration adds the
