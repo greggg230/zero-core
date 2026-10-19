@@ -180,3 +180,60 @@ def test_rolling_driver_phases():
         assert drv.paused and drv.in_flight()['games'] > 0
     st = drv.stats()
     assert st['games_finished'] == fin >= 15 and st['epoch'] == 1
+
+
+def _flat_answer(drv, lb):
+    cnt = np.diff(lb.opt_off)
+    v = np.zeros((lb.B, protocol.MAX_SEATS), np.float32)
+    v[:, :2] = 0.5
+    drv.submit(lb.id, np.repeat((1.0 / cnt).astype(np.float32), cnt), v, np.zeros_like(v))
+
+
+def test_f16_features_and_donated_buffers():
+    """x_dtype='f16': the same batches with the features rounded as numpy rounds them; donated
+    buffers (donate_x) receive the batches and are checked; float32 stays the default."""
+    seat = selfplay_seat(8)
+
+    def mk(dt=None):
+        kw = {} if dt is None else {'x_dtype': dt}
+        return G.Driver('toy', [[seat, seat]] * 16, concurrency=16, seed=3, threads=2, groups=2, **kw)
+    a, h = mk(), mk('f16')
+    assert (a.x_dtype, h.x_dtype) == ('f32', 'f16')
+    info = h.x_pool_info()
+    assert info == {'dtype': 'f16', 'rows': 8, 'features': INFO['num_features'], 'wanted': 4}
+    bufs = [np.zeros((info['rows'], info['features']), np.float16) for _ in range(info['wanted'])]
+    ptrs = {b.ctypes.data for b in bufs}
+    assert h.donate_x(bufs) == 4 and h.x_pool_info()['wanted'] == 0
+    for bad in (np.zeros((8, info['features']), np.float32), np.zeros((1, 3), np.float16),
+                np.zeros((8, 2 * info['features']), np.float16)[:, ::2]):
+        with pytest.raises(ValueError):
+            h.donate_x([bad])
+    del bufs
+    nb = donated = 0
+    while True:
+        la, lh = a.next_batch(), h.next_batch()
+        if la is None:
+            assert lh is None and a.finished and h.finished
+            break
+        protocol.validate_batch(lh, INFO['num_features'], INFO['num_actions'])
+        assert la.x.dtype == np.float32 and lh.x.dtype == np.float16
+        assert np.array_equal(la.x.astype(np.float16).view(np.uint16), lh.x.view(np.uint16))
+        assert np.array_equal(la.opt_action, lh.opt_action) and np.array_equal(la.gid, lh.gid)
+        donated += lh.x.ctypes.data in ptrs
+        _flat_answer(a, la)
+        _flat_answer(h, lh)
+        nb += 1
+    assert nb > 20 and donated >= nb - 2      # the batches planned before the donation: own buffers
+    with pytest.raises(ValueError):
+        mk('f64')
+
+
+def test_batch_features_outlive_their_driver():
+    """A batch's x keeps its (pooled) buffer alive after the driver is gone."""
+    drv = G.Driver('toy', [[selfplay_seat(8), selfplay_seat(8)]] * 4, concurrency=4, threads=1, x_dtype='f16')
+    lb = drv.next_batch()
+    x, want = lb.x, lb.x.copy()
+    del drv, lb
+    import gc
+    gc.collect()
+    assert np.array_equal(x, want)

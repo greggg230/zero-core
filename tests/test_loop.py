@@ -63,6 +63,18 @@ def test_resume_continues_and_stop_file(smoke_run, tmp_path):
     assert latest_iter(str(run)) == 3
 
 
+def test_feed_dtype_f16_iteration(smoke_run, tmp_path):
+    """--feed-dtype f16: self-play with float16 features (the run's network sees them widened)."""
+    import shutil
+    run = tmp_path / 'f16'
+    shutil.copytree(smoke_run, run)
+    p = run_loop(run, '--iters', '3', '--feed-dtype', 'f16')
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    assert [r['iter'] for r in m] == [0, 1, 2, 3] and m[3]['selfplay']['games'] == 24 and m[3]['selfplay']['samples'] > 0
+    assert json.load(open(run / 'config.json'))['feed_dtype'] == 'f16'
+
+
 def test_pause_exits_75_and_resume_finishes(tmp_path):
     run = tmp_path / 'p'
     run.mkdir()

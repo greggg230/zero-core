@@ -261,6 +261,54 @@ def copy_of(m):
     return copy.deepcopy(m)
 
 
+def test_graph_runner_f16_features_and_pinned_uploads():
+    """float16 features = float32 features rounded to float16, exactly (graph and eager paths);
+    a batch in pinned memory (feed_buffers, donated to a driver) is uploaded in place with the
+    same results."""
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA graphs need CUDA')
+    from zero.net import GridNet
+    torch.manual_seed(8)
+    feats, acts = 3 + 2 * 4 * 5 + 7, 2 + 20 + 4
+    m = GridNet(feats, acts, GRID, ch=16, blocks=2, head=16, ghid=16).eval()
+    rng = np.random.default_rng(9)
+    B = 70
+    x = rng.normal(size=(B, feats)).astype(np.float32)
+    npl = np.array([2, 3] * 35, np.int32)
+    cnt = rng.integers(1, 6, size=B)
+    off = np.concatenate([[0], np.cumsum(cnt)]).astype(np.int32)
+    opt = np.concatenate([np.sort(rng.choice(acts, size=c, replace=False)) for c in cnt]).astype(np.int32)
+    x16 = x.astype(np.float16)
+    xr = x16.astype(np.float32)
+    assert not np.array_equal(x, xr)
+    for ev in (NetEvaluator(copy_of(m), 'cuda', graphs=True), NetEvaluator(copy_of(m), 'cuda', graphs=False)):
+        for _ in range(2):
+            r16, rr = ev.evaluate(x16, npl, off, opt), ev.evaluate(xr, npl, off, opt)
+            if ev.fast is not None:
+                assert all(np.array_equal(a, b) for a, b in zip(r16, rr))
+            else:                                     # eager priors: atomic sums on the device
+                assert np.abs(r16[0] - rr[0]).max() < 1e-6 and all(np.array_equal(a, b) for a, b in zip(r16[1:], rr[1:]))
+    fast = NetEvaluator(copy_of(m), 'cuda', graphs=True)
+    assert fast.feed_buffers(2, 8, feats + 1, 'f32') == [] and NetEvaluator(copy_of(m), 'cuda', graphs=False).feed_buffers(2, 8, feats, 'f32') == []
+    for dt, xs in (('f32', x), ('f16', x16)):
+        bufs = fast.feed_buffers(2, 128, feats, dt)
+        assert len(bufs) == 2 and bufs[0].shape == (128, feats) and bufs[0].dtype == xs.dtype
+        assert torch.from_numpy(bufs[0]).is_pinned()
+        bufs[0][:B] = xs
+        want = fast.evaluate(xs.copy(), npl, off, opt)
+        with torch.inference_mode():                            # (the graphs were made in it)
+            h1 = fast.launch(_LB(bufs[0][:B], npl, off, opt))   # in place
+            h2 = fast.launch(_LB(xs.copy(), npl, off, opt))      # copied
+            got1, got2 = fast.result(h1), fast.result(h2)
+        assert all(np.array_equal(a, b) and np.array_equal(a, c) for a, b, c in zip(want, got1, got2))
+
+
+class _LB:
+    def __init__(self, x, n_players, opt_off, opt_action):
+        self.x, self.n_players, self.opt_off, self.opt_action, self.B = x, n_players, opt_off, opt_action, len(x)
+
+
 def test_gridnet_widen_adds_planes():
     """A grid with a new plane block after the old ones: the widened net computes what the old
     one did, whatever the new plane holds (its first-conv weights are zero)."""

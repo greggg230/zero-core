@@ -88,6 +88,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `rolling` | 0 | 1 = one persistent driver keeps `conc` games in flight across iterations (docs/search.md 2.6) |
 | `conc`, `threads`, `groups`, `torch_threads` | 256, 4, 2, 1 | games in flight, search threads, batches in flight, torch intra-op threads (keep 1, section 7) |
 | `selfplay_procs` | 1 | N > 1: self-play in N worker processes, each with `conc` / N games in flight and max(1, `threads` / N) search threads (section 7.1); 1 = in the run process |
+| `feed_dtype` | 'f32' | self-play features handed to the network: 'f32' (the encoding as is) or 'f16' (rounded by the driver's fill jobs: half the bytes to write and upload; the inputs the network trains on, shards store float16; section 7.2) |
 | `ext_groups` | 2 (Glass Road Zero: 8) | groups for matches with an external player (section 5) |
 | `sims`, `sims_fast`, `p_full` | 64, 16, 0.25 | playout-cap randomisation (only `p_full` decisions are training samples) |
 | `c_puct`, `alpha`, `eps`, `temp_moves` | 1.0, 0.3, 0.25, 20 | PUCT constant (values in [0, 1]), root Dirichlet noise, sampled moves per game |
@@ -335,6 +336,25 @@ rolling): 1 process 36k leaves/s, 2 processes 32k (half the batch, twice the cal
 inference (one torch thread per process), same settings: 1 process ~100k, 2 ~141k (+40%), 4
 ~130k (batches of 37) - 2026-10-17 on the shared desktop. Each worker costs a CUDA context +
 its graphs in GPU memory.
+
+### 7.2 The feed: pooled, pinned, optionally float16 features (`feed_dtype`)
+
+The driver writes each network batch's features into a recycled buffer, and `infer.drive`
+donates pinned host buffers (docs/search.md 2.2), so the CUDA graph path uploads a batch
+where the search threads wrote it: the feed thread no longer copies the features or frees
+them. `feed_dtype` 'f16' also rounds them to float16 in the fill jobs (uploaded as is,
+widened on the device). Kingdom Builder xst (19,870 features, batch 256), one self-play
+worker (conc 1024, groups 4, 10 threads) next to the live 3-worker run, before: per batch
+~20 ms of which the feed thread spent 6.8 ms copying 20 MB into its pinned buffer, 3.7 ms
+freeing the driver's buffer, 5 ms waiting for the search, 1.8 ms for the GPU; the upload
+took ~2 ms on the stream (float16: ~1). After: nothing copied or freed, the feed thread waits
+on the search most of the time. A/B (5 alternating rounds during the live run's self-play
+phases, leaves/s): 11.8k +- 0.7k before, 13.8k +- 0.5k pooled + pinned float32 (+16%), 14.4k
++- 0.4k with float16 (+22%); CPU cycles per leaf -18% / -22%. Two such workers with 5 threads
+each: 18.6k before, 24-32k after. float16 vs float32 on 3,072 real leaves (bf16 graph):
+policy KL 5e-5, |value diff| 1e-3 on average - half the bfloat16-vs-float32 compute
+difference of the same graph (KL 1e-4, 2e-3); 0.55% of the feature values change, by at
+most 2^-11 relative.
 
 ## 8. Not in the core yet (step 2 extension points)
 

@@ -139,7 +139,7 @@ key one external player. A key cannot be both.
 
 | field | dtype / shape | content |
 |---|---|---|
-| `x` | f32 [B, F] | `encode(decider)` of the (determinized) leaf state |
+| `x` | f32 [B, F] (f16: `x_dtype`) | `encode(decider)` of the (determinized) leaf state |
 | `opt_off` | i32 [B+1] | leaf b's legal actions = `opt_action[opt_off[b]:opt_off[b+1]]` (>= 2) |
 | `opt_action` | i32 [sum] | global action ids in the game's order |
 | `player`, `n_players`, `gid` | i32, i32, i64 [B] | decider (absolute), players, game index |
@@ -148,6 +148,23 @@ Answer: `priors` f32 [sum] (softmax over each leaf's legal actions), `value` f32
 P(win) per seat **relative to the decider** (column j = seat (player + j) % n; columns >= n
 are 0), `margin` f32 [B, 8] (same order). `NetEvaluator` does the gather + segment softmax on
 the device.
+
+**The feature buffers** (`crates/search/src/xbuf.rs`). `x` views a buffer of the driver's pool
+(the numpy array's base is a `FeatureBuffer`; dropping the batch recycles it), not a fresh
+allocation per batch. `SearchDriver(..., x_dtype='f16')` (run setting `feed_dtype`, default
+'f32') makes the fill jobs round the features to float16 (round to nearest even, as numpy's
+`astype(np.float16)`; F16C on x86-64); training shards store float16 anyway, so the network
+then sees exactly its training inputs (`infer.GraphRunner` widens them on the device). The
+caller may donate its own buffers: `x_pool_info()` -> {dtype, rows, features, wanted},
+`donate_x([arrays])` (writable C-contiguous numpy arrays of the dtype with >= rows x features
+elements; the driver keeps them and writes batches into them). `infer.drive` donates pinned
+host memory from `NetEvaluator.feed_buffers` (CUDA graph path; ZERO_PINNED_FEED=0: off), so
+the search threads write each batch where its upload reads it. Why, Kingdom Builder xst
+(19,870 features, batches of 256 = 20 MB of float32), one self-play worker on the shared
+desktop: the feed thread spent ~6.8 ms per batch copying the features into its pinned buffer
+and ~3.7 ms freeing the driver's buffer (~20 ms per batch in all), and the fill jobs ~33 ms
+(thread time) faulting in the fresh pages; with the pool and the donated pinned buffers the
+feed thread copies and frees nothing (docs/az.md 7.2).
 
 ### 2.3 Rules of the exchange
 
