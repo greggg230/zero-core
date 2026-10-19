@@ -114,9 +114,11 @@ class GraphRunner:
         return b
 
     def _pin_x(self, slot, Bp, dt):
+        """The slot's pinned buffer for copied batches (sized to the batch: with donated buffers
+        only the first few batches of a driver are copied)."""
         b = self.pin_x[slot]
         if b is None or b.shape[0] < Bp or b.dtype != dt:
-            b = self.pin_x[slot] = torch.empty((max(Bp, 1024), self.F), dtype=dt, pin_memory=True)
+            b = self.pin_x[slot] = torch.empty((Bp, self.F), dtype=dt, pin_memory=True)
         return b
 
     def _run(self, x, n):
