@@ -1,6 +1,9 @@
 """Training dashboard: python -m <pkg>.az.dashboard [--host 0.0.0.0] [--port PORT] [--runs DIR]
 
-Reads <runs>/*/metrics.jsonl, config.json, log.txt, supervisor.log, progress.json and elo/.
+Reads <runs>/*/metrics.jsonl, config.json, log.txt, supervisor.log, progress.json and elo/, plus
+deep_evals.jsonl when a run has one: occasional strength points with a long search, written by a job
+outside the loop (one JSON row per point: iter, sims, opponent, games, win, se, margin; a later row
+for the same iter and sims replaces an earlier one), charted per sims value.
 Binds 0.0.0.0 by default so it is reachable over Tailscale (the game package's hub project and
 port: Caverna Zero caverna_zero :5260, Glass Road Zero glassroad_zero :5280; `zero.package`).
 The runs directory defaults to <game repo>/runs. Works with no runs yet (shows how to start
@@ -70,6 +73,16 @@ def _metrics(d):
     return rows
 
 
+def _deep(d):
+    """deep_evals.jsonl: the run's long-search strength points, by iteration (the last row of each
+    iter and sims)."""
+    rows = {}
+    for e in _jsonl(os.path.join(d, 'deep_evals.jsonl')):
+        if isinstance(e.get('iter'), int) and isinstance(e.get('sims'), int) and isinstance(e.get('win'), (int, float)):
+            rows[(e['iter'], e['sims'])] = e
+    return [rows[k] for k in sorted(rows)]
+
+
 def _tail(path, n):
     if not os.path.exists(path):
         return []
@@ -125,6 +138,7 @@ def run(name):
     return jsonify({
         'config': _json(os.path.join(d, 'config.json'), {}),
         'metrics': _metrics(d),
+        'deep': _deep(d),
         'log': _tail(lp, 60),
         'supervisor': _tail(os.path.join(d, 'supervisor.log'), 12),
         'ratings': _json(os.path.join(d, 'elo', 'ratings.json'), {}),
@@ -242,6 +256,9 @@ details summary{cursor:pointer;font-weight:600;font-size:14px}
 <div class="cap">Each checkpoint against the yardstick and the random bot, seats alternating, the network searching with the eval sims. Band = 95% interval.</div>
 <div class="legend" id="win-leg"></div>
 <svg id="win" style="height:260px" role="img" aria-label="Win rate by iteration"></svg></div>
+<div class="card" id="deep-card" hidden><h2 id="deep-t">Win rate with a long search</h2>
+<div class="cap" id="deep-cap"></div><div class="legend" id="deep-leg"></div>
+<svg id="deep" style="height:240px" role="img" aria-label="Win rate with a long search by iteration"></svg></div>
 <div class="card"><h2>Each checkpoint against the one before it</h2>
 <div class="cap">Each rated checkpoint vs the previous rated one (N&minus;1, or N&minus;eval_every when evaluation runs every few iterations), both networks searching with the eval sims, seats alternated. Above 50%: the newer network is stronger. Band = 95% interval.</div>
 <svg id="prev" style="height:220px" role="img" aria-label="Win rate against the previous iteration"></svg></div>
@@ -274,7 +291,7 @@ function chart(svg,series,opt){
   svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
   const all=series.flatMap(s=>s.pts);
   if(!all.length){const t=ns('text',{x:W/2,y:H/2,'text-anchor':'middle'});t.textContent='No data yet';svg.appendChild(t);return}
-  const xs=all.map(p=>p.x),x0=Math.min(...xs),x1=Math.max(...xs,x0+1);
+  const xs=all.map(p=>p.x),x0=Math.min(opt.x0??Infinity,...xs),x1=Math.max(opt.x1??-Infinity,...xs,x0+1);
   let y0=opt.y0,y1=opt.y1;
   if(y0==null||y1==null){const ys=all.flatMap(p=>p.lo!=null?[p.lo,p.hi]:[p.y]).concat((opt.refs||[]).map(r=>r.y));const lo=Math.min(...ys),hi=Math.max(...ys);const pad=(hi-lo)*.12||Math.abs(hi)*.1||1;y0=y0??lo-pad;y1=y1??hi+pad}
   const X=x=>L+(x-x0)/(x1-x0)*(W-L-R),Y=y=>T+(1-(y-y0)/(y1-y0))*(H-T-B);
@@ -285,7 +302,8 @@ function chart(svg,series,opt){
     const t=ns('text',{x:L+4,y:Y(r.y)-4,'text-anchor':'start'});t.textContent=r.label;svg.appendChild(t)}
   for(const s of series){
     const pts=s.pts;if(!pts.length)continue;const col=css(s.color);
-    if(pts[0].lo!=null){let d='';pts.forEach((p,i)=>d+=(i?'L':'M')+X(p.x)+','+Y(p.hi));for(let i=pts.length-1;i>=0;i--)d+='L'+X(pts[i].x)+','+Y(pts[i].lo);svg.appendChild(ns('path',{d:d+'Z',fill:col,opacity:.12}))}
+    if(pts.length===1&&pts[0].lo!=null)svg.appendChild(ns('line',{x1:X(pts[0].x),x2:X(pts[0].x),y1:Y(pts[0].lo),y2:Y(pts[0].hi),stroke:col,'stroke-width':2,opacity:.35}));
+    else if(pts[0].lo!=null){let d='';pts.forEach((p,i)=>d+=(i?'L':'M')+X(p.x)+','+Y(p.hi));for(let i=pts.length-1;i>=0;i--)d+='L'+X(pts[i].x)+','+Y(pts[i].lo);svg.appendChild(ns('path',{d:d+'Z',fill:col,opacity:.12}))}
     let d='';pts.forEach((p,i)=>d+=(i?'L':'M')+X(p.x)+','+Y(p.y));
     svg.appendChild(ns('path',{d,fill:'none',stroke:col,'stroke-width':2,'stroke-linejoin':'round','stroke-linecap':'round'}));
     const last=pts[pts.length-1];svg.appendChild(ns('circle',{cx:X(last.x),cy:Y(last.y),r:4,fill:col,stroke:css('--surface-1'),'stroke-width':2}));
@@ -335,6 +353,9 @@ function render(){
   const rec=(a,b)=>{const k=a<b?a+'|'+b:b+'|'+a,p=P[k];if(!p||!p[1])return null;const s=a<b?p[0]:p[1]-p[0],w=s/p[1];return {win:w,n:p[1],se:Math.sqrt(Math.max(w*(1-w),1e-6)/p[1])}};
   const prevPts=eloPts.map((p,i)=>i?{x:p.x,px:eloPts[i-1].x,r:rec(nm(p.x),nm(eloPts[i-1].x))}:{x:p.x,r:null}).filter(p=>p.r).map(p=>({x:p.x,px:p.px,y:p.r.win,lo:Math.max(0,p.r.win-1.96*p.r.se),hi:Math.min(1,p.r.win+1.96*p.r.se),r:p.r}));
   const lsp=sp[sp.length-1];
+  const D=DATA.deep||[],dsims=[...new Set(D.map(r=>r.sims))].sort((a,b)=>a-b);
+  const dmain=dsims.reduce((b,s)=>D.filter(r=>r.sims===s).length>D.filter(r=>r.sims===b).length?s:b,dsims[0]);
+  const dl=D.filter(r=>r.sims===dmain).pop();
   $('sub').textContent=`Run ${RUN} · ${cfg.game||''} ${(cfg.players||[]).join('/')}-player · self-play ${cfg.sims}/${cfg.sims_fast} sims${cfg.rolling?' (rolling)':''} · eval ${cfg.eval_sims} sims · yardstick ${yard} = Elo 1000`;
   const pr=DATA.progress,st=DATA.status;let s=[];
   const live=DATA.control&&['running','stopping'].includes(DATA.control.state);
@@ -349,6 +370,7 @@ function render(){
     tile('Best Elo',bestElo?Math.round(bestElo.y):'–',bestElo?`iteration ${bestElo.x} · ${yard} = 1000`:'')+
     tile('vs '+yard,ly?pct(ly.y):'–',ly?`±${(196*ly.e.se).toFixed(1)} pts · margin ${ly.e.margin>0?'+':''}${ly.e.margin}`:'')+
     tile('vs random',lr?pct(lr.y):'–',lr?`±${(196*lr.e.se).toFixed(1)} pts · ${lr.e.games} games`:'')+
+    (dl?tile(`vs ${dl.opponent||yard} · ${dl.sims} sims`,pct(dl.win),`±${(196*dl.se).toFixed(1)} pts · iteration ${dl.iter}`):'')+
     tile('Self-play games',games.toLocaleString(),`${((tl-t0)/3600).toFixed(1)} h elapsed`)+
     tile('Leaves / s',lsp?Math.round(lsp.selfplay.leaves_per_s).toLocaleString():'–',lsp?`${Math.round(lsp.selfplay.games_per_h).toLocaleString()} games/h`:'');
   const refs=[{y:1000,label:yard+' 1000'}];
@@ -358,6 +380,15 @@ function render(){
   $('win-t').textContent='Win rate against '+yard+' and the random bot';
   const ws=[{pts:wy,color:'--series-1',label:yard,tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)} · margin ${p.e.margin}`},{pts:wr,color:'--series-2',label:'random',tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)}`}];
   legend($('win-leg'),ws);chart($('win'),ws,{y0:0,y1:1,fmt:v=>Math.round(v*100)+'%',refs:[{y:.5,label:'even'}]});
+  $('deep-card').hidden=!D.length;
+  if(D.length){
+    const dopp=[...new Set(D.map(r=>r.opponent||yard))].join(', '),cols=['--series-1','--series-2','--series-3'];
+    const ds=dsims.map((n,i)=>({pts:D.filter(r=>r.sims===n).map(r=>({x:r.iter,y:r.win,lo:Math.max(0,r.win-1.96*r.se),hi:Math.min(1,r.win+1.96*r.se),r})),color:cols[i%3],label:n+' sims',
+      tip:p=>`${pct(p.y)} ±${(196*p.r.se).toFixed(1)} · ${p.r.games} games · margin ${p.r.margin>0?'+':''}${p.r.margin}`}));
+    $('deep-t').textContent=`Win rate against ${dopp} with a long search`;
+    $('deep-cap').textContent=`Occasional checkpoints against ${dopp}, the network searching with ${dsims.join(' or ')} sims (the charts above use the eval sims, ${cfg.eval_sims}), on the same boards each time. Band = 95% interval.`;
+    legend($('deep-leg'),ds);chart($('deep'),ds,{fmt:v=>Math.round(v*100)+'%',x1:M.length?M[M.length-1].iter:null});
+  }
   chart($('prev'),[{pts:prevPts,color:'--series-3',label:'vs previous',tip:p=>`vs iter ${p.px}: ${pct(p.y)} ±${(196*p.r.se).toFixed(1)} (${p.r.n} games)`}],{y0:0,y1:1,fmt:v=>Math.round(v*100)+'%',refs:[{y:.5,label:'even'}]});
   const newest=lastElo?lastElo.x:null;
   if(newest!==null){

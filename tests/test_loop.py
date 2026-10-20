@@ -190,6 +190,25 @@ def test_dashboard(smoke_run, tmp_path):
     assert c.post('/api/run/smoke/explode', json={}).status_code == 404
 
 
+def test_dashboard_deep_evals(tmp_path):
+    """deep_evals.jsonl (long-search strength points from a job outside the loop): served by
+    /api/run as 'deep', the last row of each iter and sims, sorted; a half-written line skipped."""
+    from zero import dashboard
+    run = tmp_path / 'runs' / 'deep'
+    run.mkdir(parents=True)
+    (run / 'config.json').write_text('{}')
+    dashboard.app.config['RUNS'] = str(tmp_path / 'runs')
+    c = dashboard.app.test_client()
+    assert c.get('/api/run/deep').get_json()['deep'] == [] and b'deep-card' in c.get('/').data
+    rows = [{'iter': 2, 'sims': 1024, 'opponent': 'jsbot', 'games': 40, 'win': 0.5, 'se': 0.08, 'margin': 1.0},
+            {'iter': 1, 'sims': 2048, 'opponent': 'jsbot', 'games': 40, 'win': 0.6, 'se': 0.08, 'margin': 2.0},
+            {'iter': 2, 'sims': 1024, 'opponent': 'jsbot', 'games': 40, 'win': 0.7, 'se': 0.07, 'margin': 3.0},
+            {'iter': 3, 'sims': 1024}]
+    (run / 'deep_evals.jsonl').write_text('\n'.join(json.dumps(r) for r in rows) + '\n{"iter": 4, "sims"\n')
+    deep = c.get('/api/run/deep').get_json()['deep']
+    assert [(e['iter'], e['sims'], e['win']) for e in deep] == [(1, 2048, 0.6), (2, 1024, 0.7)]
+
+
 def test_remote_evaluation_local(tmp_path):
     """eval_remote: the loop trains without evaluating; every evaluated checkpoint is evaluated on
     the remote (here 'local': a mirror dir and a subprocess) into evals.jsonl + elo/, which the
