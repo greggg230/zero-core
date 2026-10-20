@@ -237,8 +237,11 @@ def test_train_with_aux_weights_0_is_unchanged(tmp_path):
     (a, ta, oa), (b, tb, ob) = outs
     assert a['config'] == b['config'] and 'aux' not in a['config']
     assert all(torch.equal(a['state'][k], b['state'][k]) for k in a['state'])
-    drop = ('seconds', 'samples_per_s', 'load_s')
+    drop = ('seconds', 'samples_per_s', 'load_s', 'window')
     assert {k: v for k, v in ta.items() if k not in drop} == {k: v for k, v in tb.items() if k not in drop}
+    timing = ('read_s', 'assemble_s')
+    assert {k: v for k, v in ta['window'].items() if k not in timing} == \
+        {k: v for k, v in tb['window'].items() if k not in timing}
     sa, sb = oa['state']['state'], ob['state']['state']
     assert sa.keys() == sb.keys() and all(torch.equal(sa[i]['exp_avg'], sb[i]['exp_avg']) for i in sa)
 

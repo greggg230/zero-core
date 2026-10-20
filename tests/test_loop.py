@@ -42,6 +42,13 @@ def test_iterations_metrics_and_elo(smoke_run):
     assert [p.name for p in (smoke_run / 'data' / 'iter_0001').glob('*.npz')] == ['c00_000.npz']
     assert 'selfplay_workers' not in runctl.read_state(str(smoke_run), 'run')
     assert m[2]['train']['steps'] >= 10 and m[2]['eval_yard']['opp'] == 'ext:toyheur'
+    # window_load 'prefetch' (the default): iteration 2's window = iteration 1's rows, read during
+    # its self-play, + iteration 2's, read when training started
+    w = m[2]['train']['window']
+    assert w['mode'] == 'prefetch' and 'prefetch_error' not in w and w['keep'] == 1.0
+    assert w['prefetch_rows'] == m[1]['selfplay']['samples'] == w['prefetch_used_rows']
+    assert w['read_rows'] == m[2]['selfplay']['samples'] and w['prefetch_spare_rows'] == 0
+    assert m[1]['train']['window']['prefetch_rows'] == 0
     r = json.load(open(smoke_run / 'elo' / 'ratings.json'))
     assert r['anchor'] == 'ext:toyheur' and r['ratings']['ext:toyheur']['elo'] == 1000
     assert {'iter_0000', 'iter_0001', 'iter_0002', 'random'} <= set(r['ratings'])
@@ -79,7 +86,7 @@ def test_pause_exits_75_and_resume_finishes(tmp_path):
     run = tmp_path / 'p'
     run.mkdir()
     proc = subprocess.Popen([sys.executable, '-m', 'zero.run', '--run', str(run), *SMOKE, '--iters', '3',
-                             '--games', '600', '--conc', '64'], cwd=ROOT, stdout=subprocess.PIPE,
+                             '--games', '50000', '--conc', '64'], cwd=ROOT, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
                             env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH))
     deadline = time.time() + 120
@@ -100,6 +107,41 @@ def test_pause_exits_75_and_resume_finishes(tmp_path):
     p = run_loop(run, '--iters', '1', '--games', '24')
     assert p.returncode == 0, p.stdout + p.stderr
     assert [r['iter'] for r in read_metrics(str(run))] == [0, 1]
+
+
+def test_pause_with_a_window_prefetch_and_resume(smoke_run, tmp_path):
+    """PAUSE in iteration 3's self-play, while the run process holds the window prefetch (window
+    1 + 3 // 2 = 2 iterations: iteration 2's shards): exit 75 as before; the resumed run replays
+    iteration 3 with a new prefetch."""
+    import shutil
+    run = tmp_path / 'pp'
+    shutil.copytree(smoke_run, run)
+    proc = subprocess.Popen([sys.executable, '-m', 'zero.run', '--run', str(run), *SMOKE, '--iters', '3',
+                             '--games', '50000', '--conc', '64'], cwd=ROOT, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH))
+
+    def phase():
+        try:
+            return json.load(open(run / 'progress.json'))
+        except (OSError, ValueError):
+            return {}
+    deadline = time.time() + 120
+    while not (phase().get('iter') == 3 and phase().get('phase') == 'selfplay') and time.time() < deadline:
+        time.sleep(0.1)
+    runctl.request_pause(str(run), by='test')
+    out, _ = proc.communicate(timeout=120)
+    assert proc.returncode == runctl.EXIT_PAUSED, out
+    assert 'PREFETCH FAILED' not in out and 'Traceback' not in out
+    assert [r['iter'] for r in read_metrics(str(run))] == [0, 1, 2]
+    runctl.request_resume(str(run))
+    p = run_loop(run, '--iters', '3', '--games', '24')
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    assert [r['iter'] for r in m] == [0, 1, 2, 3]
+    w = m[3]['train']['window']
+    assert w['mode'] == 'prefetch' and w['prefetch_rows'] == m[2]['selfplay']['samples'] and w['prefetch_shards'] == 1
+    assert w['read_rows'] == m[3]['selfplay']['samples']
 
 
 FAKE_RUN = '''import os, sys

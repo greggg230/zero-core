@@ -19,7 +19,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; both: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; optional auxiliary-target heads (config `aux`, section 4.1: `add_aux`, `strip_aux`); atomic `save`, `load` (by the checkpoint's arch), `widen` |
 | `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place), `UniformEvaluator`, `drive()` (external batches answered on threads) |
 | `selfplay_procs.py` | Self-play in N local worker processes (run setting `selfplay_procs`, section 7.1): `Pool` (spawn, one pipe per worker, PAUSE / failure / orphan handling), the workers' quotas and seeds, the metrics merge |
-| `data.py` | Sample shards (`ShardWriter`, atomic npz), the RAM-bounded training `Window`, `TargetStats` |
+| `data.py` | Sample shards (`ShardWriter`, atomic npz), the RAM-bounded training window (`Window`: the original whole-shard reads; `ShardFile` / `WindowCache` / `ShardWindow` / `WindowPrefetch`: direct reads of the kept rows, prefetched during self-play, section 4.2), `TargetStats` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
 | `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
 | `elo.py` | Bradley-Terry Elo over all results, the run's yardstick = 1000 |
@@ -100,6 +100,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `lr_halve_every`, `lr_min`, `lr_warmup_steps` | 30, 1e-4, 100 | step decay; linear warmup while the optimizer state is fresh |
 | `window`, `window_grow`, `min_window_samples` | 8, 1, 20000 | newest iterations trained on (1 + iter // 2 with window_grow), more until min samples |
 | `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
+| `window_load` | 'prefetch' | how the window is read (section 4.2): 'prefetch' = the kept rows only, read directly; the older iterations' on a background thread during self-play, the new iteration's when it ends; 'direct' = the same window, all read when training starts; 'legacy' = the original `Window` (every shard read whole, then subsampled) |
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
 | `aux_own_w`, `aux_score_w` | 0, 0 | auxiliary targets (section 4.1): loss weights of the final-ownership segment and of the other ('score') segments; either > 0 turns them on (recorded in self-play, heads added, losses trained); 0 = off |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
@@ -134,7 +135,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; with `selfplay_procs` > 1 also `procs`, `workers` and `startup_s`, section 7.1), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with auxiliary targets `aux_own` / `aux_score` and `aux`: window rows with targets and their share, `own_zero` / `score_zero` = the loss of predicting 0, `heads_added` on the iteration that added the heads), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; with `selfplay_procs` > 1 also `procs`, `workers` and `startup_s`, section 7.1), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time (`load_s`: from the start of training to the window in RAM), lr, value_q, samples/s; `window`: how it was read - `mode`, `keep` (the share of every shard), `read_rows` / `read_s` (read when training started), `assemble_s`, with a prefetch `prefetch_s` (its time on the background thread), `prefetch_wait_s` (training waited for it), `prefetch_rows` / `prefetch_mb`, `prefetch_used_rows` / `prefetch_spare_rows`, the plan (`prefetch_new_rows_est`, `prefetch_keep`, `prefetch_shards`) and `prefetch_error` / `prefetch_stopped` (section 4.2); with auxiliary targets `aux_own` / `aux_score` and `aux`: window rows with targets and their share, `own_zero` / `score_zero` = the loss of predicting 0, `heads_added` on the iteration that added the heads), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated; `index.json` = every checkpoint's Elo; `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; `aux` float16 [N, W] with auxiliary targets); the newest `keep_data` iterations are kept |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor) and the current fit |
@@ -145,7 +146,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 ## 4. Training
 
 Each iteration trains the previous checkpoint on the window (newest iterations' shards,
-loaded into RAM; uniformly subsampled per shard beyond `ram_budget_gb`) for
+loaded into RAM; uniformly subsampled per shard beyond `ram_budget_gb`; read as in section 4.2) for
 `max(min_steps, new samples x reuse / batch)` minibatch steps (uniform with replacement).
 Loss = policy cross-entropy against the recorded policy target - the visit distribution, or
 the completed-Q target with `policy_target='cq'` (section 9) - (log-softmax over the legal
@@ -200,6 +201,70 @@ same forward pass, so self-play speed is unchanged.
   evaluator's checkout too: the new checkpoints have heads). The fork's first iteration adds the
   heads to checkpoint K; its window (hard-linked shards without targets) is masked for the
   auxiliary losses and fills with targets as new iterations come in.
+
+### 4.2 Reading the window (`window_load`: prefetch, direct, legacy)
+
+**What it cost.** Kingdom Builder Zero's kbz2p_xstbig (kingdombuilder-xst: 19,870 features,
+~40 KB per sample as float16): the window spans the newest 8 iterations (~830k samples, 16
+shards of ~2 GB, ~33 GB) and keeps ~200k of them (the 8 GB budget: 24% of every shard). The
+original `Window(paths)` reads every shard whole with `np.load` - numpy reads an npz member
+through zipfile in 256 KB chunks with a CRC32, ~300-500 MB/s of shard whatever the disk (an NVMe
+here) - and holds all of them before subsampling: `load_s` 134-170 s per iteration (iterations
+157-160) out of a ~545 s iteration (solo), and a ~40 GB peak in the run process (two such runs on
+the 64 GB desktop: paging).
+
+**Direct reads** ('direct' and 'prefetch'). A shard is an uncompressed zip (np.savez), so each
+array's bytes sit at a fixed offset (`data.npz_layout`: the zip directory, each member's local
+header and its .npy header); `ShardFile.read_rows` reads only the kept rows of `x` (and `aux`)
+straight into the window, one read per run of consecutive rows; the other arrays (~4 MB per
+shard) are read whole. A compressed shard falls back to np.load. Which rows:
+`data.sample_rows(n, keep, seed=iteration, key='iter_NNNN/<file>')` = the first max(1, round(n x
+keep)) of a random permutation of the shard's rows - Window's count per shard, uniform without
+replacement (the same distribution as before; other rows than the legacy draw), and nested: the
+rows for a smaller share are among those for a larger one. `ShardWindow` (a `Window`) leaves the
+features in their per-shard chunks (no 8 GB concatenation): a batch gathers its rows chunk by
+chunk, cut / zero-padded to the network's width - the same tensors as `Window.batch` for the
+same rows (`tests/test_window.py`, and on real shards with and without auxiliary targets); ~100
+ms per 1024-row Kingdom Builder batch either way.
+
+**Prefetch** ('prefetch', the default). `Run.selfplay(it)` starts a `data.WindowPrefetch` thread
+in the run process when iteration it's self-play starts (after clearing an interrupted
+iteration's directory). It plans iteration it's window before its shards exist - the same rule
+(`Run.window_rows`: window_iters(it) iterations, more until min_window_samples) with the new
+iteration counted as `PREFETCH_NEW_SHARE` = 0.97 x the previous iteration's samples (Kingdom
+Builder's vary by ~1-2%), the budget from checkpoint it - 1's width - and reads those rows of the
+older shards. When self-play has ended, `Run.load_window` makes the exact plan (the shards on
+disk, the exact share) and reads what is missing on 4 threads: the new iteration's kept rows,
+plus the older shards' extra rows if the estimate was high (fewer new samples than 0.97 x the
+previous: a higher share). Rows read but not kept (a lower share: ~0.3% spare) are ignored, the
+shards of iterations no longer in the window dropped. The window equals the 'direct' one (the
+same rows in the same order: `tests/test_window.py`). The thread only reads; it stops before its
+next read (at most `READ_MB` = 64 MB) once PAUSE is noticed (the run's `PauseWatch`), and
+`Run.close()` (PAUSE, a failure, the run's end) stops and joins it; every file it opened is
+closed on any exit. A failed prefetch logs `WINDOW PREFETCH FAILED` with its traceback and
+`prefetch_error`, and training reads the window itself (as 'direct'). With `selfplay_procs` > 1
+the run process only waits during self-play; with self-play in the run process the thread's reads
+release the GIL (its Python work: one seek + read per run of kept rows). The `train` metrics'
+`window` dict shows both sides (`load_s` = the part training waits for; `prefetch_s` = the part
+moved into self-play).
+
+**RAM.** The window (at most `ram_budget_gb`, + the spare rows) is held from early in self-play
+until training ends instead of during training only - but without every shard whole on top:
+peak working set 8.6 GB for the kbz2p_xstbig window ('direct' or 'prefetch'), where `Window`
+read 7.1 GB for one iteration (2 of the 16 shards) and ~40 GB for the 8.
+
+**Measured** (2026-10-19, the desktop with both Kingdom Builder runs self-playing; a hard-linked
+snapshot of kbz2p_xstbig's iterations 153-160, training iteration 160: the run's own window, 16
+shards, 834,332 samples, keep 0.2399 -> 200,178 rows, 8.0 GB):
+
+| window_load | self-play end -> window in RAM | on the prefetch thread | peak working set |
+|---|---|---|---|
+| legacy | 134-170 s (the run's own `load_s`, iterations 157-160) | - | ~40 GB (7.1 GB for 1 of 8 iterations) |
+| direct | 19.5 s (files read for the first time) | - | 8.6 GB |
+| prefetch | **0.69 s**: the new iteration's 24,896 rows (0.48 s; its shards in the file cache, as just written) + assembly 0.17 s | 5.8 s (175,839 rows, 7.0 GB; ~19 s from disk) | 8.6 GB |
+
+One 2 GB shard, 24% of its rows: np.load + subsample 6.2 s (3.5 s cached), direct reads 1.7 s
+(0.5 s cached). 'legacy' is the original code, untouched.
 
 ## 5. Evaluation and Elo
 

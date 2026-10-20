@@ -141,6 +141,10 @@ def test_rolling_two_procs(rolling_run):
     assert m[1]['train']['window_shards'] == 2 and m[1]['train']['window_samples'] == m[1]['selfplay']['samples']
     assert m[2]['train']['window_shards'] == 4
     assert m[2]['train']['window_samples'] == m[1]['selfplay']['samples'] + m[2]['selfplay']['samples']
+    # the window prefetch (run process) read iteration 1's shards while the workers played 2
+    w = m[2]['train']['window']
+    assert w['mode'] == 'prefetch' and w['prefetch_rows'] == m[1]['selfplay']['samples'] and w['prefetch_shards'] == 2
+    assert w['read_rows'] == m[2]['selfplay']['samples']
     assert 'startup_s' in m[1]['selfplay'] and 'startup_s' not in m[2]['selfplay']   # the same workers
     assert runctl.read_state(str(run), 'run')['state'] == 'done'
     assert all_gone(ws), 'the workers exit with the run'

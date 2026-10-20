@@ -5,7 +5,8 @@
 
 Iteration i self-plays with models/iter_{i-1}.pt (the Rust driver in this process, CPU or
 CUDA inference; samples streamed into shards under data/iter_NNNN/), trains on the newest
-iterations' data (a RAM-bounded window), writes models/iter_i.pt (atomic), evaluates it
+iterations' data (a RAM-bounded window; window_load 'prefetch': the older iterations' rows read
+on a background thread during the self-play, docs/az.md 4.2), writes models/iter_i.pt (atomic), evaluates it
 against the yardstick (the run's anchor at Elo 1000: a built-in bot, or an external player
 such as 'ext:toyheur' / a game's 'ext:jsbot') and the random bot, plays Elo matches against
 the checkpoints i-1, i-2, i-4 ... i-32, refits the ratings and appends a line to
@@ -37,7 +38,8 @@ import torch
 import torch.nn.functional as F
 
 from . import elo, games as G, package, runctl
-from .data import ShardWriter, TargetStats, Window, shard_paths
+from .data import (ShardWriter, Stopped, TargetStats, Window, WindowCache, WindowPrefetch, keep_share, sample_rows,
+                   shard_key, shard_paths, shard_rows)
 from .infer import NetEvaluator, drive, use_amp
 from .net import GridNet, Net, add_aux, aux_segments, load, save
 from .protocol import MAX_SEATS
@@ -90,6 +92,13 @@ DEFAULTS = dict(
     # window: newest `window` iterations (growing 1 + iter // 2 with window_grow), more until
     # min_window_samples; data kept keep_data iterations; RAM budget; samples per shard
     window=8, window_grow=1, min_window_samples=20_000, keep_data=12, ram_budget_gb=4.0, shard_rows=65536,
+    # how the window is read (docs/az.md 4.2): 'prefetch' = only the kept rows of each shard, read
+    # directly (zero.data.ShardFile); the older iterations' rows on a background thread while
+    # this iteration self-plays, so only the new iteration's rows are read when it ends; 'direct' =
+    # the same window (the same rows), all read when training starts; 'legacy' = the original
+    # Window(paths): every shard read whole through np.load, then subsampled (other random rows,
+    # the same distribution)
+    window_load='prefetch',
     # value target = (1 - q) z + q root-search estimate, q = value_q * min(1, iter / warmup)
     value_q=0.5, value_q_warmup=5, margin_loss_w=0.5,
     # auxiliary targets (KataGo-style; the game's `SearchGame::AUX`, docs/az.md 4.1): loss weights
@@ -209,6 +218,16 @@ def window_iters(cfg, it):
     return min(cfg['window'], 1 + it // 2) if cfg['window_grow'] else cfg['window']
 
 
+WINDOW_LOADS = ('prefetch', 'direct', 'legacy')
+# the prefetch plans the window before the new iteration's samples exist: it counts them as this
+# share of the previous iteration's (a slight underestimate: the share kept of the older shards
+# comes out a little high, so the prefetched rows contain the final ones and no older shard is
+# read again after self-play; the spare rows - ~0.3% of the window - are ignored)
+PREFETCH_NEW_SHARE = 0.97
+# threads reading shards when training starts (the new iteration's, anything not prefetched)
+READ_THREADS = 4
+
+
 def summarize(rows):
     """rows: (score, margin, rounds, over) of the evaluated player."""
     n = len(rows)
@@ -229,6 +248,7 @@ class Run:
         self.roll = None                           # rolling driver + its evaluator
         self.roll_ev = None
         self.pool = None                           # selfplay_procs > 1: zero.selfplay_procs.Pool
+        self.prefetch = None                       # window_load 'prefetch': zero.data.WindowPrefetch (.it, .info)
         # auxiliary targets: the game's segments when a weight is on, else [] (off)
         self.aux_w = {'own': float(cfg.get('aux_own_w') or 0.0), 'score': float(cfg.get('aux_score_w') or 0.0)}
         self.aux = []
@@ -241,7 +261,8 @@ class Run:
                                      f"(its layout: {self.aux}; SearchGame::AUX)")
 
     def close(self):
-        """Stop the self-play worker processes (if any); never raises."""
+        """Stop the window prefetch and the self-play worker processes (if any); never raises."""
+        self.stop_prefetch()
         pool, self.pool = self.pool, None
         if pool is not None:
             try:
@@ -300,6 +321,7 @@ class Run:
         d = os.path.join(self.run, 'data', f'iter_{it:04d}')
         if os.path.exists(d):
             shutil.rmtree(d)                       # an interrupted iteration is replayed
+        self.start_prefetch(it)                    # window_load 'prefetch': the older shards, meanwhile
         if int(c.get('selfplay_procs', 1)) > 1:
             from .selfplay_procs import Pool
             if self.pool is None:
@@ -400,18 +422,130 @@ class Run:
         return out, raw
 
     # ---------------------------------------------------------------- training
-    def window_shards(self, it):
+    def window_rows(self, it, new_rows=None):
+        """The shards of iteration it's training window -> [(path, samples)], newest iteration first:
+        window_iters(it) iterations, more while the window has fewer than min_window_samples.
+        new_rows: the plan before iteration it's own shards exist (the prefetch): its directory is
+        skipped and counted as one iteration of `new_rows` samples."""
+        c = self.cfg
         dirs = sorted(glob.glob(os.path.join(self.run, 'data', 'iter_*')), reverse=True)
         dirs = [d for d in dirs if int(os.path.basename(d)[5:9]) <= it]
-        out, n = [], 0
-        for k, d in enumerate(dirs):
-            if k >= window_iters(self.cfg, it) and n >= self.cfg['min_window_samples']:
+        k0, n = 0, 0
+        if new_rows is not None:
+            dirs = [d for d in dirs if int(os.path.basename(d)[5:9]) < it]
+            k0, n = 1, int(new_rows)
+        out = []
+        for k, d in enumerate(dirs, k0):
+            if k >= window_iters(c, it) and n >= c['min_window_samples']:
                 break
             for p in shard_paths(d):
-                out.append(p)
-                with np.load(p) as z:
-                    n += int(json.loads(str(z['meta']))['rows'])
+                r = shard_rows(p)
+                out.append((p, r))
+                n += r
         return out
+
+    def window_shards(self, it):
+        return [p for p, _ in self.window_rows(it)]
+
+    def window_budget(self, features):
+        """The window's rows within ram_budget_gb for a network of `features` inputs."""
+        aw = sum(w for _, w in self.aux)
+        bpr = features * 2 + 8 * 16 + 3 * MAX_SEATS * 4 + (2 * aw + 1 if aw else 0)
+        return int(self.cfg['ram_budget_gb'] * 1e9 / bpr)
+
+    def _paused(self):
+        return self.pw is not None and getattr(self.pw, 'is_set', lambda: False)()
+
+    def start_prefetch(self, it):
+        """window_load 'prefetch': read the window of iteration it's training from the shards that
+        exist (iterations < it) on a background thread, while iteration it self-plays (Run.selfplay
+        calls this). The plan counts the new iteration as PREFETCH_NEW_SHARE of the previous one's
+        samples; Run.load_window completes it with the exact plan. PAUSE stops it (its PauseWatch),
+        so does Run.close."""
+        self.stop_prefetch()
+        if self.cfg.get('window_load', 'prefetch') != 'prefetch':
+            return
+        info = {}
+
+        def plan():
+            prev = sorted(d for d in glob.glob(os.path.join(self.run, 'data', 'iter_*'))
+                          if int(os.path.basename(d)[5:9]) < it)
+            if not prev:
+                return []
+            est = PREFETCH_NEW_SHARE * sum(shard_rows(p) for p in shard_paths(prev[-1]))
+            last = [m for m in read_metrics(self.run) if m.get('iter') == int(os.path.basename(prev[-1])[5:9])]
+            g = (last[-1].get('selfplay') or {}).get('games') if last else None
+            if g:                                  # games per iteration changed (a relaunch with --games)
+                est *= self.cfg['games'] / g
+            est = int(est)
+            ck = torch.load(model_path(self.run, it - 1), map_location='cpu', weights_only=False)
+            rows = self.window_rows(it, new_rows=est)
+            keep = keep_share(est + sum(n for _, n in rows), self.window_budget(ck['config']['features']))
+            info.update(new_rows_est=est, keep=keep, shards=len(rows))
+            return [(p, sample_rows(n, keep, it, shard_key(p))) for p, n in rows]
+        self.prefetch = WindowPrefetch(plan, sum(w for _, w in self.aux), stop_also=self._paused)
+        self.prefetch.it, self.prefetch.info = it, info
+
+    def stop_prefetch(self):
+        """Stop a running prefetch and drop what it read; never raises."""
+        pf, self.prefetch = self.prefetch, None
+        if pf is None:
+            return
+        try:
+            if not pf.stop(30.0):
+                self.log(f'iter {pf.it}: the window prefetch did not stop within 30 s (a daemon thread: it ends '
+                         f'with the process)')
+        except Exception as e:                     # noqa: BLE001
+            self.log(f'window prefetch: stop failed ({type(e).__name__}: {e})')
+
+    def load_window(self, it, features, actions):
+        """The training window of iteration it (window_load 'prefetch' / 'direct'): the exact plan
+        (the shards on disk now, the budget's share, `sample_rows`), the rows a prefetch for this
+        iteration has read, the rest read now on READ_THREADS threads -> (ShardWindow, shards, stats)."""
+        c = self.cfg
+        aw = sum(w for _, w in self.aux)
+        st = {'mode': c.get('window_load', 'prefetch')}
+        pf, self.prefetch = self.prefetch, None
+        cache = None
+        if pf is not None and getattr(pf, 'it', None) != it:
+            pf.stop(30.0)                          # (another iteration's: never expected)
+            pf = None
+        if pf is not None:
+            st['prefetch_wait_s'] = round(pf.wait(), 2)
+            st['prefetch_s'] = round(pf.seconds, 2)
+            st['prefetch_rows'] = pf.cache.read_rows
+            st['prefetch_mb'] = round(pf.cache.read_bytes / 1e6, 1)
+            st.update({f'prefetch_{k}': (round(v, 6) if isinstance(v, float) else v) for k, v in pf.info.items()})
+            if pf.stopped:
+                st['prefetch_stopped'] = True
+            if pf.error:
+                st['prefetch_error'] = pf.error.strip().splitlines()[-1][:300]
+                self.log(f'iter {it}: WINDOW PREFETCH FAILED - reading the whole window now instead:\n{pf.error}')
+            cache = pf.cache
+        if cache is None:
+            cache = WindowCache(aw)
+        entries = self.window_rows(it)
+        keep = keep_share(sum(n for _, n in entries), self.window_budget(features))
+        plan = [(p, n, sample_rows(n, keep, it, shard_key(p))) for p, n in entries]
+        dropped = cache.keep_only({p for p, _, _ in plan})
+        held = cache.held_rows()
+        t = time.time()
+        try:
+            read = cache.fetch_all([(p, r) for p, _, r in plan], threads=READ_THREADS, stop=self._paused)
+        except Stopped:
+            self.check('reading the training window')
+            raise
+        st['read_s'] = round(time.time() - t, 2)
+        st['read_rows'] = read
+        t = time.time()
+        W = cache.window(plan, features, actions)
+        st['assemble_s'] = round(time.time() - t, 2)
+        st['keep'] = round(keep, 6)
+        if pf is not None:
+            # rows the prefetch read that the window uses / does not use (other shards, a lower share)
+            st['prefetch_used_rows'] = W.N - read
+            st['prefetch_spare_rows'] = held - (W.N - read) + dropped
+        return W, len(plan), st
 
     def train(self, it, new_samples):
         c = self.cfg
@@ -452,12 +586,15 @@ class Run:
             except Exception as e:                 # noqa: BLE001
                 self.log(f'iter {it}: optimizer state not loaded ({e}); fresh optimizer')
         lr = lr_at(c, it)
-        paths = self.window_shards(it)
         aw = sum(w for _, w in self.aux)
-        bpr = model.features * 2 + 8 * 16 + 3 * MAX_SEATS * 4 + (2 * aw + 1 if aw else 0)
-        budget = int(c['ram_budget_gb'] * 1e9 / bpr)
         t1 = time.time()
-        W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it, aux_width=aw)
+        if c.get('window_load', 'prefetch') == 'legacy':
+            paths = self.window_shards(it)
+            W = Window(paths, model.features, model.config['actions'], budget_rows=self.window_budget(model.features),
+                       seed=it, aux_width=aw)
+            n_shards, wst = len(paths), {'mode': 'legacy'}
+        else:
+            W, n_shards, wst = self.load_window(it, model.features, model.config['actions'])
         load_s = time.time() - t1
         if aw:
             # column indices of the 'own' segment and of the other ('score') segments
@@ -527,8 +664,9 @@ class Run:
         os.replace(tmp, opt_path)
         secs = time.time() - t0
         out = dict({k: round(v, 5) for k, v in acc.items()}, steps=steps, window_samples=W.N, window_loaded=W.loaded,
-                   window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
-                   value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
+                   window_shards=n_shards, window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
+                   value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev,
+                   window=wst)
         if aw:
             out['aux'] = aux_window_stats(W, kinds)
             if added:
@@ -766,6 +904,8 @@ def resolve_config(args, saved):
         w = cfg.get(k, 0.0)
         if not isinstance(w, (int, float)) or not w >= 0:
             raise SystemExit(f'{k} {w!r}: a number >= 0')
+    if cfg.get('window_load', 'prefetch') not in WINDOW_LOADS:
+        raise SystemExit(f"window_load {cfg['window_load']!r}: one of {', '.join(WINDOW_LOADS)}")
     sp = cfg.get('selfplay_procs', 1)
     if not isinstance(sp, int) or sp < 1:
         raise SystemExit(f'selfplay_procs {sp!r}: an integer >= 1')
