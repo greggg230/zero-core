@@ -69,13 +69,20 @@ class Transport:
             raise RuntimeError(f'mkdir on {self.s["host"]}: {r.stderr.strip()[-300:]}')
 
     def put(self, src, dst):
+        """Copy a file to the remote under a temporary name, then rename it: an interrupted copy
+        (the run stopped mid-transfer) never leaves a partial file under the real name, where it
+        would count as shipped and every evaluation that loads it would fail."""
         if self.local:
-            shutil.copyfile(src, dst)
+            shutil.copyfile(src, dst + '.tmp')
+            os.replace(dst + '.tmp', dst)
             return
-        r = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', src, f'{self.s["host"]}:{dst}'],
+        r = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', src, f'{self.s["host"]}:{dst}.tmp'],
                            capture_output=True, text=True, timeout=600)
         if r.returncode:
             raise RuntimeError(f'scp {src} -> {self.s["host"]}: {r.stderr.strip()[-300:]}')
+        r = self._ssh(f'mv -f {shlex.quote(dst + ".tmp")} {shlex.quote(dst)}', 60)
+        if r.returncode:
+            raise RuntimeError(f'mv {dst} on {self.s["host"]}: {r.stderr.strip()[-300:]}')
 
     def get(self, src, dst):
         """Copy a remote file here (False if it does not exist)."""
