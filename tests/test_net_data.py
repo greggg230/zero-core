@@ -318,10 +318,24 @@ def tok_x(B, seed=0):
     return x
 
 
-def tok_net(seed=0, **kw):
+def tok_net(seed=0, policy=True, **kw):
+    """A small TokenNet; policy: random policy output layers (they start at zero: a uniform prior)."""
     from zero.net import TokenNet
     torch.manual_seed(seed)
-    return TokenNet(TOK_F, TOK_A, TOK_LAYOUT, **dict(dict(d=16, layers=2, heads=2, ff=32, head=16), **kw)).eval()
+    m = TokenNet(TOK_F, TOK_A, TOK_LAYOUT, **dict(dict(d=16, layers=2, heads=2, ff=32, head=16), **kw)).eval()
+    if policy:
+        with torch.no_grad():
+            for lin in (m.gen, m.ptr):
+                lin.weight.normal_(0, 0.3)
+                lin.bias.normal_(0, 0.3)
+    return m
+
+
+def test_tokennet_policy_starts_uniform():
+    m = tok_net(16, policy=False)
+    with torch.no_grad():
+        p = m(tok_x(5, 6), torch.full((5,), 2))[0]
+    assert torch.all(p == 0)
 
 
 def test_tokennet_heads_masks_and_chunks():

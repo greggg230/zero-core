@@ -319,6 +319,13 @@ class TokenNet(nn.Module):
         self.register_buffer('tok_acts', acts, persistent=False)
         self.val = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
+        # the policy starts uniform: with random output layers the generic logit of a frequent
+        # action (MTG's PASS) and the pointer logits of a segment are a few random constants, so
+        # one of them can dominate every position (MTG run mtg2a: the untrained network put 55%
+        # on PASS where 25% is uniform, and its self-play games ran into the turn cap)
+        for lin in (self.gen, self.ptr):
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
 
     def _identity(self, sl, idspec):
         """Identity index [N] of slot rows [N, width] from their one-hot digits (vocab = none)."""
