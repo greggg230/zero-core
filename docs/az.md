@@ -16,8 +16,8 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 |---|---|
 | `package.py` | The game package registry: `GamePackage` (name, root, engine module, run module, presets, DEFAULTS overrides, external players, specs, decision kinds, dashboard title / port, env prefix), `register`, `active` |
 | `run.py` | The loop: `DEFAULTS`, `PRESETS` (the toy's + the package's), self-play (classic or rolling), training, evaluation, Elo, resume, STOP / PAUSE |
-| `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; both: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen` |
-| `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place), `UniformEvaluator`, `drive()` (external batches answered on threads) |
+| `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions; all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
+| `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place; `workers`: eager batches on threads), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
 | `data.py` | Sample shards (`ShardWriter`, atomic npz), the RAM-bounded training `Window`, `TargetStats` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
 | `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
@@ -88,11 +88,13 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `conc`, `threads`, `groups`, `torch_threads` | 256, 4, 2, 1 | games in flight, search threads, batches in flight, torch intra-op threads (keep 1, section 7) |
 | `ext_groups` | 2 (Glass Road Zero: 8) | groups for matches with an external player (section 5) |
 | `sims`, `sims_fast`, `p_full` | 64, 16, 0.25 | playout-cap randomisation (only `p_full` decisions are training samples) |
+| `sims_minor` | 0 | simulations of the game's minor decisions in self-play (`SearchGame::minor_decision`, MTG: the land to tap), never recorded; 0 = searched like the others (docs/search.md 1, 3) |
 | `c_puct`, `alpha`, `eps`, `temp_moves` | 1.0, 0.3, 0.25, 20 | PUCT constant (values in [0, 1]), root Dirichlet noise, sampled moves per game |
 | `chance_k`, `margin_w`, `redet`, `max_steps` | 0, 0, 1, 100000 | sampled chance outcomes kept per edge (0 = resample every visit), utility margin credit, fresh determinization per simulation, abandon a game after this many moves |
 | `policy_target`, `cq_c_visit`, `cq_c_scale` | visits, 50, 1.0 | training target of the recorded decisions: the root visit distribution, or Gumbel AlphaZero's completed-Q target (docs/search.md 3.1, section 9); the search is the same |
 | `hidden`, `blocks` | 256, 4 | network size (only when the run's first network is created) |
-| `arch`, `ch` | 'mlp', 64 | 'grid': a `GridNet` of `ch` channels x `blocks` over the package's board grid (Kingdom Builder: 16 planes x 20 x 20; bfloat16 autocast on CUDA for inference and training; not in zero.webexport) |
+| `arch`, `ch` | 'mlp', 64 | 'grid': a `GridNet` of `ch` channels x `blocks` over the package's board grid (Kingdom Builder: 16 planes x 20 x 20; bfloat16 autocast on CUDA for inference and training; not in zero.webexport); 'tokens': a `TokenNet` of width `hidden`, `blocks` layers over the package's object layout (section 10; not in zero.webexport) |
+| `heads`, `ff` | 4, 0 | arch 'tokens': attention heads, feed-forward width (0 = 2 x hidden) |
 | `batch`, `reuse`, `lr`, `wd`, `min_steps` | 512, 4, 1e-3, 1e-4, 50 | steps = new samples x reuse / batch (at least min_steps); AdamW, grad-norm clip 5 |
 | `lr_halve_every`, `lr_min`, `lr_warmup_steps` | 30, 1e-4, 100 | step decay; linear warmup while the optimizer state is fresh |
 | `window`, `window_grow`, `min_window_samples` | 8, 1, 20000 | newest iterations trained on (1 + iter // 2 with window_grow), more until min samples |
@@ -101,7 +103,10 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
 | `eval_games`, `eval_sims`, `eval_random_games`, `eval_every` | 200, 32, 50, 1 | evaluation vs the yardstick and vs random |
 | `elo_games`, `ref_games` | 100, 400 | games per Elo match (checkpoints 1, 2, 4 ... 32 iterations back); random vs yardstick reference games |
+| `elo_opponents`, `elo_sims`, `elo_together` | 0, 0, 0 | cheaper Elo (CPU runs): play only the first k of the offsets 1, 2, 4 ... 32 (0 = all); Elo matches at elo_sims (0 = eval_sims); 1 = an iteration's Elo matches in one driver (one evaluator key per opponent: the checkpoint's batches hold the leaves of every match; other seeds than separate matches) |
+| `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
+| `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
 
 ## 2. Run control (`runctl.py`)
 
@@ -379,3 +384,76 @@ vs 16: 77.2%, +211); cq-1 24 vs cq-0.3 24: 66.4% (+119).
 * **c_scale 0.3 is worse than 1** throughout (it collapses as well, only later, with smaller
   gains early).
 * Cost: none (the target is computed once per recorded decision from the root statistics).
+
+## 10. The token network (arch 'tokens', `net.TokenNet`; MTG Zero M5b, 2026-10-22)
+
+A transformer over the game's objects for games whose state is a variable set of things (MTG:
+permanents, hand cards, stack objects, cards of a searched library), read from the same
+fixed-width features as the MLP: the `SearchGame` trait, the driver, the leaf batches and the
+shards are unchanged. The game package describes where the objects are (`GamePackage.tokens`,
+game -> layout; stored in the checkpoint's config):
+
+```
+{"vocab": V,                                   # identities: V embedding rows + 1 (none / unknown)
+ "segments": [{"name", "offset", "count", "width",   # count object slots of width floats at offset
+               "present": i | null,           # slot float i > 0.5 = the slot holds an object (null: always)
+               "id": {"at": j, "radix": [16, 16]} | null,   # identity as mixed-radix one-hot digits
+               "actions": [[base, stride], ...]}, ...],    # slot s scores actions base + s * stride
+ "bags": [{"name", "offset", "count", "width"}]}  # count multisets of identities (width <= V counts)
+```
+
+Every feature outside the segments and bags is a global. The network:
+
+* **Tokens**: the global token (a linear map of the globals, plus one linear map of the bags:
+  each bag pooled as the count-weighted sum of the identity embeddings and its total), and one
+  token per present slot = its identity's embedding (shared by every segment and the bags) + a
+  linear map of the slot's floats (per segment) + a learned (segment, slot) embedding (slot
+  orders mean something: timestamps, the top of the stack, whose library).
+* **Packing**: only present slots are embedded and attended to. A batch's rows hold their
+  tokens first (layout order, the global token at 0); rows are sorted by token count and run
+  in chunks of 64, each padded to its own longest row (padding masked out of the attention). A
+  row's outputs do not depend on the batch or the chunking (tested). MTG's positions hold 21
+  tokens on average (p99 39, max 53) of the 153 slots.
+* **Trunk**: `blocks` pre-norm blocks of width `hidden` (multi-head attention with `heads`
+  heads, GELU feed-forward of width `ff`), a final LayerNorm.
+* **Heads** read z = [the global token's output, the mean of the row's tokens]: value / margin
+  as `Net`, generic policy logits for every action (`Linear(2 hidden, actions)`); a slot's own
+  actions (`actions` pairs) are scored from its token conditioned on z (pointer logits:
+  `Linear(gelu(W_k t + W_q z))`, one output per action pair of the segment) and replace the
+  generic logits of those ids. An empty slot's actions keep the generic logits (they are not
+  legal anyway).
+* `widen`: new actions get zero generic weights, new features (after the old ones) are new
+  globals with zero weights; the layout stays. Not in `zero.webexport`. CUDA: float32 eager
+  (no autocast, no CUDA graphs; not measured: the GPU was busy).
+
+Tests: `tests/test_net_data.py` (masking of absent slots, chunking / batch independence, the
+pointer logits land on the slot actions, identity digits, save / load / widen, a training step
+reaches every part, layout validation, the toy's layout `package.TOY_TOKENS` through the
+evaluator), `tests/test_loop.py` (the loop with arch 'tokens' on the toy).
+
+### 10.1 CPU cost (MTG, 13,532 features; desktop 2026-10-22, the GPU busy with other runs)
+
+Inference on real MTG positions (runs/mtg1 iteration 9 shards; `python -m <pkg>.az.bench infer
+--arch tokens --shard ...`), leaves per second, one inference thread:
+
+| network | parameters | 2 torch threads, batch 192 / 384 | 6 threads, 192 / 384 |
+|---|---:|---:|---:|
+| MLP 256 x 3 (mtg1's) | 4.19M | 11.9k / 11.8k | 24.0k / 19.5k |
+| tokens 64 x 3 (ff 128) | 0.42M | 4.3k / 4.8k | 3.8k / 6.4k |
+| tokens 96 x 3 (ff 192) | 0.76M | 3.2k / 3.2k | 3.2k / 4.3k |
+| tokens 128 x 3 (ff 256) | 1.17M | 2.0k / 2.3k | 2.6k / 3.4k |
+
+The token network does as much matrix work per leaf as the MLP at 64 x 3 (the MLP's cost is
+its 13,532 x 256 input layer) but spends it in many small ops (attention over ~25 tokens per
+row, layer norms, gathers): it does not scale with intra-op threads. Several batches evaluated
+concurrently on Python threads with few intra-op threads each do (`infer_workers`; tokens 96 x 3,
+batch 384, 8 batches each): 1 x 6 threads 4.7k leaves/s, 2 x 3 6.3k, 3 x 2 7.2k, 4 x 2 7.7k.
+In MTG self-play (rolling, 64 / 16 sims, 8 search threads; another job using 6 cores):
+the MLP 256 x 3 at 1 x 6 threads 9.0k leaves/s, tokens 96 x 3 at 1 x 6 threads 2.8k, at 4
+workers x 2 threads (4 groups, 768 games in flight) 4.6k.
+
+**The 13.5k-float feed is not the bottleneck**: the search threads were busy 14 s of 60 in
+that self-play measurement (encoding included), the rest of the time they waited for the
+network; the feature copy is one memcpy per chunk in the driver. A sparse feed (the present
+slots only, ~5% of the floats) would save memory bandwidth and shard space (27 KB per sample)
+but not inference time; not built.

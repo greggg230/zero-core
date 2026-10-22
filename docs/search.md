@@ -56,6 +56,7 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn determinize(&mut self, viewer: usize, rng: &mut Rng);        // resample everything hidden from viewer
     fn encode(&self, viewer: usize, out: &mut [f32]);               // out is zeroed by the caller
     fn rounds(&self) -> u32 { 0 }                                   // reports
+    fn minor_decision(&self) -> bool { false }                      // the pending decision is minor (sims_minor)
     fn export_state(&self) -> String { .. }                         // external seats: the state (JSON)
     fn apply_external(&mut self, payload: &str, chance: &mut Vec<u64>) -> Result<(), String> { Err(..) }
     fn bot_names() -> &'static [&'static str] { &[] }               // built-in bots ('random' is generic)
@@ -76,6 +77,12 @@ Changes from the original sketch (Caverna Zero DESIGN.md 5), and why:
   **actual** outcome (children are keyed by it). Games without it just never force.
 * `result()` returns a fixed `[f32; MAX_SEATS]` (no allocation on the hot path).
 * `score`, `rounds`: reports. `export_state` / `apply_external`: external seats (section 2.7).
+* `minor_decision` (2026-10-22, MTG Zero M5b): the pending decision matters little (MTG: which
+  mana source to tap next while paying). A self-play network seat with `sims_minor` (run
+  setting, 0 = off) searches it with that many simulations and never records it (section 3).
+  Games that do not implement it (every game but MTG) are unaffected, as are seats without the
+  setting (`driver::tests::minor_decisions_get_their_own_budget_and_no_records`: the golden
+  records are unchanged).
 * `bot_names` / `make_bot`: game-specific built-in bots (the toy heuristic; Glass Road could
   add a Rust port of the JS bot later, Glass Road Zero DESIGN.md 6).
 * NUM_ACTIONS / NUM_FEATURES / players stay associated constants (one Rust type per game; the
@@ -130,7 +137,7 @@ network batches go to `evaluators[key](lb)`, external batches to `externals[key]
 One list of seat dicts per game (players = its length):
 `{'bot': 'random' | 'heuristic' | ...}`, `{'external': '<key>'}`, or a network seat
 `{'key': 'm', 'sims', 'c_puct', 'selfplay', 'alpha', 'eps', 'temp_moves', 'sims_fast',
-'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale'}`
+'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale'}`
 (`games.nn_seat`; the last three only matter for recorded decisions, section 3.1). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
@@ -243,7 +250,9 @@ call and answers `{"actions", "h"}`.
 * **Backup** along the path: N_i += 1, W_i += util[decider], tot += 1, wsum += win;
   util = win + margin_w * tanh(margin) (network margin, or `margin()` at terminals).
 * **Per decision**: single-option decisions are not searched; playout cap (`p_full` share
-  gets `sims` and is recorded, the rest `sims_fast`); root Dirichlet noise on full self-play
+  gets `sims` and is recorded, the rest `sims_fast`; a minor decision of a self-play seat with
+  `sims_minor` gets `sims_minor` and is never recorded, the playout-cap draw being made all the
+  same); root Dirichlet noise on full self-play
   searches (also on a reused, already expanded root); self-play samples moves by visit count
   for the first `temp_moves` searched decisions of the game, otherwise (and in evaluation)
   argmax (N, P0) with the first maximum on ties; tree reuse: after a real move the tree
