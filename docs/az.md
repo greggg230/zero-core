@@ -421,11 +421,14 @@ Every feature outside the segments and bags is a global. The network:
   actions (`actions` pairs) are scored from its token conditioned on z (pointer logits:
   `Linear(gelu(W_k t + W_q z))`, one output per action pair of the segment) and replace the
   generic logits of those ids. An empty slot's actions keep the generic logits (they are not
-  legal anyway). Both policy output layers start at zero (a uniform prior): with random ones the
-  generic logit of a frequent action and a segment's pointer logits are a few random constants,
-  and MTG's first token run (mtg2a) started with 55% of the prior on PASS where 25% is uniform -
-  its self-play games ran into the turn cap (draws, no signal) and its first checkpoint lost
-  100/100 to the heuristic.
+  legal anyway). The network starts neutral: the policy, value and margin output layers are
+  zero (a uniform prior, value 1 / seats). With random ones the generic logit of a frequent
+  action and a segment's pointer logits are a few random constants: MTG's first token run
+  (mtg2a) started with 55% of the prior on PASS where 25% is uniform, its self-play games ran
+  into the turn cap (draws, no signal) and its first checkpoint lost 100/100 to the heuristic.
+  A random value head steers the first searches the same way (mtg2b, uniform policy: the cq
+  targets of its first games put 49% on PASS against 36% uniform with seed 0, 33% / 40% with
+  seed 1; with the value head at zero 38% / 38%).
 * `widen`: new actions get zero generic weights, new features (after the old ones) are new
   globals with zero weights; the layout stays. Not in `zero.webexport`. CUDA: float32 eager
   (no autocast, no CUDA graphs; not measured: the GPU was busy).

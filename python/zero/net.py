@@ -319,11 +319,14 @@ class TokenNet(nn.Module):
         self.register_buffer('tok_acts', acts, persistent=False)
         self.val = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
-        # the policy starts uniform: with random output layers the generic logit of a frequent
-        # action (MTG's PASS) and the pointer logits of a segment are a few random constants, so
-        # one of them can dominate every position (MTG run mtg2a: the untrained network put 55%
-        # on PASS where 25% is uniform, and its self-play games ran into the turn cap)
-        for lin in (self.gen, self.ptr):
+        # a neutral start: uniform policy, value 1 / seats, margin 0. With random output layers
+        # the generic logit of a frequent action (MTG's PASS) and a segment's pointer logits are
+        # a few random constants, so one of them can dominate every position (MTG run mtg2a:
+        # 55% of the prior on PASS where 25% is uniform; its self-play games ran into the turn
+        # cap), and a random value head steers the first searches the same way (mtg2b, uniform
+        # policy: the searches' targets put 49% on PASS against 36% uniform, seed 0; 33% / 40%
+        # with seed 1; 38% / 38% with these heads at zero)
+        for lin in (self.gen, self.ptr, self.val[-1], self.mar[-1]):
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
 
