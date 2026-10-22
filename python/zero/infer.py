@@ -19,6 +19,13 @@ while the previous one's results come back and are softmaxed on the CPU (one CUD
 the graphs' static inputs in order; the pinned host buffers alternate between two slots).
 ZERO_INFLIGHT=1: one batch at a time, as before.
 
+`NetEvaluator(..., workers=k)` (k > 1; run setting `infer_workers`): eager batches are evaluated
+on k Python threads (torch releases the GIL), and `drive` keeps up to k batches in flight (the
+driver needs as many `groups`). For small networks on a CPU, where one batch cannot keep the
+cores busy (a token network's many small ops: docs/az.md 10), several concurrent batches with
+few intra-op threads each go faster than one batch with many. The answers are the same as
+evaluating inline (each batch is computed alone; results are submitted in launch order).
+
 `drive(driver, evaluators, externals)` runs any driver to the end (or to the end of a rolling
 phase): network batches go to `evaluators[key]`, external batches to `externals[key]` (one
 payload string per request). `check()` is called after every batch (PAUSE: raises).
@@ -172,7 +179,7 @@ def use_amp(model, device):
 
 
 class NetEvaluator:
-    def __init__(self, model, device='cpu', graphs=None):
+    def __init__(self, model, device='cpu', graphs=None, workers=1):
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
         self.amp = use_amp(model, self.device)
@@ -182,6 +189,14 @@ class NetEvaluator:
         self.calls = 0
         self.leaves = 0
         self.seconds = 0.0
+        # eager batches on worker threads (module docstring); None: computed in launch()
+        self.workers = max(1, int(workers)) if self.fast is None else 1
+        self.pool = None
+        if self.workers > 1:
+            import threading
+            from concurrent.futures import ThreadPoolExecutor
+            self.pool = ThreadPoolExecutor(self.workers, thread_name_prefix='zero-infer')
+            self.lock = threading.Lock()
 
     def set_weights(self, state_dict):
         self.model.load_state_dict(state_dict)
@@ -220,9 +235,15 @@ class NetEvaluator:
         value[:, :seats] = val.cpu().numpy()
         margin[:, :seats] = mar.float().cpu().numpy()
         value[np.arange(MAX_SEATS)[None, :] >= n_players[:, None]] = 0.0
-        self.calls += 1
-        self.leaves += B
-        self.seconds += time.perf_counter() - t0
+        if self.pool is not None:
+            with self.lock:
+                self.calls += 1
+                self.leaves += B
+                self.seconds += time.perf_counter() - t0
+        else:
+            self.calls += 1
+            self.leaves += B
+            self.seconds += time.perf_counter() - t0
         return pri, value, margin
 
     def __call__(self, lb):
@@ -233,7 +254,9 @@ class NetEvaluator:
 
     def launch(self, lb):
         """Start evaluating a LeafBatch; `result(handle)` -> what `ev(lb)` returns. Eager
-        evaluators compute at once."""
+        evaluators compute at once (or on a worker thread, `workers` > 1)."""
+        if self.pool is not None:
+            return ('f', self.pool.submit(self.evaluate, lb.x, lb.n_players, lb.opt_off, lb.opt_action), 0)
         t0 = time.perf_counter()
         if self._graphable(lb.opt_off):
             h = ('g', self.fast.launch(lb.x, lb.n_players, lb.opt_off, lb.opt_action), lb.B)
@@ -244,6 +267,8 @@ class NetEvaluator:
 
     def result(self, h):
         kind, v, B = h
+        if kind == 'f':
+            return v.result()
         if kind == 'd':
             return v
         t0 = time.perf_counter()
@@ -273,6 +298,8 @@ def drive(driver, evaluators, externals=None, check=None, on_batch=None, ext_thr
     if externals and hasattr(driver, 'poll_batch'):
         return _drive_async(driver, evaluators, externals, check, on_batch, ext_threads)
     inflight = int(os.environ.get('ZERO_INFLIGHT', '2'))
+    if inflight > 1:
+        inflight = max([inflight] + [getattr(e, 'workers', 1) for e in evaluators.values()])
     if inflight > 1 and hasattr(driver, 'poll_batch') and evaluators and all(hasattr(e, 'launch') for e in evaluators.values()):
         return _drive_pipelined(driver, evaluators, check, on_batch, inflight)
     nb = 0

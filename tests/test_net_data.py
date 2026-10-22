@@ -459,3 +459,21 @@ def test_tokennet_toy_layout_evaluator():
     drv, lb = a_batch(n=20, seed=3)
     pri, val, mar = ev(lb)
     protocol.validate_evaluation(lb, pri, val, mar)
+
+
+def test_threaded_evaluator_plays_the_same_games():
+    """NetEvaluator(workers=3): batches evaluated on threads, three in flight (drive), the same
+    games and records as evaluating inline."""
+    torch.manual_seed(15)
+    m = Net(F, A, hidden=32, blocks=1).eval()
+    seat = G.nn_seat('m', 8, selfplay=True, sims_fast=4, p_full=0.5)
+    out = []
+    for workers in (1, 3):
+        drv = G.Driver('toy', [[seat, seat]] * 24, concurrency=24, threads=2, groups=3, seed=9, record=True)
+        ev = NetEvaluator(m, workers=workers)
+        drive(drv, {'m': ev})
+        res = sorted(drv.take_results(), key=lambda r: r['gid'])
+        smp = drv.take_samples()
+        out.append(([(r['gid'], r['steps'], r['scores']) for r in res], smp['pi'].tobytes(), smp['x'].tobytes()))
+        assert ev.calls > 0 and ev.leaves > 0
+    assert out[0] == out[1]

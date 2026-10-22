@@ -100,6 +100,9 @@ DEFAULTS = dict(
     # '' = here): the loop queues each evaluated checkpoint and keeps training (zero.remote)
     eval_remote='',
     infer_device='cpu', train_device='cpu', seed=0,
+    # network batches evaluated concurrently on this many Python threads (CPU: small networks
+    # whose ops cannot keep the cores busy; give the driver as many `groups`); 1 = inline
+    infer_workers=1,
 )
 
 PRESETS = {
@@ -239,7 +242,7 @@ class Run:
 
     def evaluator(self, path):
         m, _ = load(path, self.cfg['infer_device'])
-        return NetEvaluator(m, self.cfg['infer_device'])
+        return NetEvaluator(m, self.cfg['infer_device'], workers=self.cfg.get('infer_workers', 1))
 
     def nn_seat(self, key, sims, selfplay=False):
         c = self.cfg
