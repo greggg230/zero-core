@@ -67,6 +67,12 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn rounds(&self) -> u32 {
         0
     }
+    /// The pending decision is minor (MTG: which land to tap for mana): a self-play network
+    /// seat with `sims_minor` searches it with that many simulations and never records it
+    /// (docs/search.md 3). Default: no decision is minor.
+    fn minor_decision(&self) -> bool {
+        false
+    }
     /// State description for an external seat (JSON).
     fn export_state(&self) -> String {
         String::new()

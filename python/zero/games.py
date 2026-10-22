@@ -95,14 +95,19 @@ def is_external(seat):
 
 
 def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20, sims_fast=None,
-            p_full=1.0, chance_k=0, margin_w=0.0, redet=True, policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0):
+            p_full=1.0, chance_k=0, margin_w=0.0, redet=True, policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0,
+            sims_minor=None):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
-    cq_c_scale; docs/search.md 3.1). The target keys are only set when not the default."""
+    cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
+    (`SearchGame::minor_decision`) in self-play, never recorded (None: searched like the
+    others). The target and minor keys are only set when not the default."""
     d = dict(key=key, sims=sims, c_puct=c_puct, selfplay=selfplay, alpha=alpha, eps=eps, temp_moves=temp_moves,
              sims_fast=sims_fast, p_full=p_full, chance_k=chance_k, margin_w=margin_w, redet=redet)
     if policy_target != 'visits':
         d.update(policy_target=policy_target, cq_c_visit=float(cq_c_visit), cq_c_scale=float(cq_c_scale))
+    if sims_minor:
+        d['sims_minor'] = int(sims_minor)
     return d
 
 

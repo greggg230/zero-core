@@ -31,7 +31,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
 
 /// Answer every batch: uniform priors, value by a hash of the features (deterministic), the
 /// external seat plays the first legal action of the exported state.
-fn answer(d: &mut Driver<ToyGame>, b: &Batch) {
+fn answer<G: SearchGame>(d: &mut Driver<G>, b: &Batch) {
     if b.external {
         let pl: Vec<String> = b
             .states
@@ -44,7 +44,7 @@ fn answer(d: &mut Driver<ToyGame>, b: &Batch) {
         d.submit_external(b.id, pl).unwrap();
         return;
     }
-    let f = ToyGame::NUM_FEATURES;
+    let f = G::NUM_FEATURES;
     let mut pri = Vec::new();
     for r in 0..b.b {
         let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
@@ -64,7 +64,7 @@ fn answer(d: &mut Driver<ToyGame>, b: &Batch) {
     d.submit(b.id, &pri, &v, &m).unwrap();
 }
 
-fn run(d: &mut Driver<ToyGame>) -> (Vec<GameResult>, Vec<Record>) {
+fn run<G: SearchGame>(d: &mut Driver<G>) -> (Vec<GameResult>, Vec<Record>) {
     let mut res = Vec::new();
     let mut smp = Vec::new();
     while let Some(b) = d.next_batch(true).unwrap() {
@@ -301,4 +301,98 @@ fn completed_q_changes_only_the_policy_targets() {
     assert!(Driver::<ToyGame>::new(cfg(vec![bad], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_err());
     assert!(PolicyTarget::parse("cq", 50.0, -1.0).is_err() && PolicyTarget::parse("argmax", 50.0, 1.0).is_err());
     assert_eq!(PolicyTarget::parse("visits", 0.0, 0.0), Ok(PolicyTarget::Visits));
+}
+
+/// The toy with its two-option decisions marked minor (`SearchGame::minor_decision`).
+#[derive(Clone)]
+struct MinorToy(ToyGame);
+
+impl SearchGame for MinorToy {
+    type Spec = <ToyGame as SearchGame>::Spec;
+    const NAME: &'static str = "minortoy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    fn parse_spec(json: &str) -> Result<Self::Spec, String> {
+        ToyGame::parse_spec(json)
+    }
+    fn new_game(spec: &Self::Spec, players: usize, seed: u64) -> Result<Self, String> {
+        ToyGame::new_game(spec, players, seed).map(MinorToy)
+    }
+    fn num_players(&self) -> usize {
+        self.0.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)
+    }
+    fn force_chance(&mut self, forced: &[u64]) {
+        self.0.force_chance(forced)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.0.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.0.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn minor_decision(&self) -> bool {
+        let mut v = Vec::new();
+        self.0.legal_actions(&mut v);
+        v.len() == 2
+    }
+}
+
+fn with_minor(seat: SeatCfg, m: Option<u32>) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.sims_minor = m;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+#[test]
+fn minor_decisions_get_their_own_budget_and_no_records() {
+    let golden = |seat: SeatCfg| {
+        let mut c = cfg(vec![seat], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+        c.seed = 2026;
+        let mut d = Driver::<MinorToy>::new(c).unwrap();
+        let (r, s) = run(&mut d);
+        (r, s, d.stats())
+    };
+    // without sims_minor the hook is never consulted: the golden records
+    let (_, recs, st) = golden(nn(0, 16, true));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    assert_eq!(st.minor, 0);
+    // a game without minor decisions is unchanged by the setting
+    let (_, recs) = golden_selfplay(with_minor(nn(0, 16, true), Some(1)));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    // with it: two-option decisions take 1 simulation (the prior's choice) and are never recorded
+    let (res, recs, st) = golden(with_minor(nn(0, 16, true), Some(1)));
+    assert!(st.minor > 0 && !recs.is_empty());
+    assert!(recs.iter().all(|r| r.opts.len() != 2), "a minor decision was recorded");
+    assert_eq!(res.len(), 24);
+    assert!(res.iter().all(|r| r.over));
+    let (_, _, st0) = golden(nn(0, 16, true));
+    assert!(st.leaves < st0.leaves, "{} leaves with sims_minor vs {}", st.leaves, st0.leaves);
+    // evaluation seats ignore it; zero is rejected
+    let (_, _, se) = golden(with_minor(nn(0, 16, false), Some(1)));
+    assert_eq!(se.minor, 0);
+    assert!(Driver::<MinorToy>::new(cfg(vec![with_minor(nn(0, 8, true), Some(0))], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_err());
 }

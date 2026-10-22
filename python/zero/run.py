@@ -36,7 +36,7 @@ import torch.nn.functional as F
 from . import elo, games as G, package, runctl
 from .data import ShardWriter, TargetStats, Window, shard_paths
 from .infer import NetEvaluator, drive, use_amp
-from .net import GridNet, Net, load, save
+from .net import load, make_net, save
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, Paused
 
@@ -64,14 +64,19 @@ DEFAULTS = dict(
     # simulation)
     sims=64, sims_fast=16, p_full=0.25, c_puct=1.0, alpha=0.3, eps=0.25, temp_moves=20,
     chance_k=0, margin_w=0.0, redet=1, max_steps=100_000,
+    # simulations of the game's minor decisions in self-play (SearchGame::minor_decision, e.g.
+    # MTG's choice of the land to tap), never recorded; 0 = searched like the others
+    sims_minor=0,
     # policy target of the recorded (full-search) decisions: 'visits' (the root visit
     # distribution) | 'cq' (Gumbel AlphaZero's completed-Q target softmax(ln P0 + (cq_c_visit +
     # max N) cq_c_scale completedQ), docs/search.md 3.1); the search itself is the same
     policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0,
-    # network (only when the run's first network is created): arch 'mlp' (hidden x blocks) or
+    # network (only when the run's first network is created): arch 'mlp' (hidden x blocks),
     # 'grid' (a conv tower of `ch` channels x blocks over the game package's board planes,
-    # GamePackage.grids; net.GridNet)
-    hidden=256, blocks=4, arch='mlp', ch=64,
+    # GamePackage.grids; net.GridNet) or 'tokens' (a transformer over the game package's
+    # objects, GamePackage.tokens; net.TokenNet: width `hidden`, `blocks` layers, `heads`
+    # attention heads, feed-forward width `ff`, 0 = 2 x hidden)
+    hidden=256, blocks=4, arch='mlp', ch=64, heads=4, ff=0,
     # training: steps = new samples * reuse / batch (at least min_steps); AdamW; LR halving
     # every lr_halve_every iterations (floor lr_min), linear warmup while the optimizer state
     # is fresh
@@ -84,6 +89,13 @@ DEFAULTS = dict(
     # evaluation: the yardstick (Elo anchor = 1000): a built-in bot or 'ext:<name>'
     yardstick='heuristic', eval_games=200, eval_sims=32, eval_random_games=50, eval_every=1, elo_games=100,
     ref_games=400,
+    # the game spec of every match that records nothing (vs the yardstick, vs random, Elo, the
+    # reference games); '' = the self-play spec (MTG: a fixed deck set, self-play random decks)
+    eval_spec='',
+    # cheaper Elo (CPU runs): each checkpoint plays the first `elo_opponents` of the checkpoints
+    # 1, 2, 4 ... 32 iterations back (0 = all), at elo_sims (0 = eval_sims); elo_together = 1
+    # plays an iteration's Elo matches in one driver (larger network batches, other seeds)
+    elo_opponents=0, elo_sims=0, elo_together=0,
     # evaluation on another machine (a name in the game package's `remotes`, 'local' for tests;
     # '' = here): the loop queues each evaluated checkpoint and keeps training (zero.remote)
     eval_remote='',
@@ -220,15 +232,10 @@ class Run:
 
     # ---------------------------------------------------------------- models
     def new_model(self):
-        torch.manual_seed(self.cfg['seed'])
-        if self.cfg.get('arch', 'mlp') == 'grid':
-            grid = package.active().grids.get(self.cfg['game'])
-            if not grid:
-                raise SystemExit(f"arch 'grid': the game package has no grid for {self.cfg['game']!r} (GamePackage.grids)")
-            return GridNet(self.info['num_features'], self.info['num_actions'], grid, self.cfg['ch'], self.cfg['blocks'],
-                           game=self.cfg['game']).eval()
-        return Net(self.info['num_features'], self.info['num_actions'], self.cfg['hidden'], self.cfg['blocks'],
-                   game=self.cfg['game']).eval()
+        c = self.cfg
+        torch.manual_seed(c['seed'])
+        return make_net(self.info, c['game'], c.get('arch', 'mlp'), c['hidden'], c['blocks'], c['ch'], c.get('heads', 4),
+                        c.get('ff', 0))
 
     def evaluator(self, path):
         m, _ = load(path, self.cfg['infer_device'])
@@ -239,12 +246,15 @@ class Run:
         if selfplay:
             return G.nn_seat(key, sims, c['c_puct'], True, c['alpha'], c['eps'], c['temp_moves'], c['sims_fast'],
                              c['p_full'], c['chance_k'], c['margin_w'], bool(c['redet']),
-                             c.get('policy_target', 'visits'), c.get('cq_c_visit', 50.0), c.get('cq_c_scale', 1.0))
+                             c.get('policy_target', 'visits'), c.get('cq_c_visit', 50.0), c.get('cq_c_scale', 1.0),
+                             sims_minor=c.get('sims_minor', 0) or None)
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']))
 
     def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None):
+        """A driver for self-play (`record`: the run's spec) or a match (eval_spec, if set)."""
         c = self.cfg
-        return G.Driver(c['game'], seats, spec=c['spec'], concurrency=conc or c['conc'], seed=seed, record=record,
+        spec = c['spec'] if record else (c.get('eval_spec') or c['spec'])
+        return G.Driver(c['game'], seats, spec=spec, concurrency=conc or c['conc'], seed=seed, record=record,
                         threads=c['threads'], groups=groups or c['groups'], max_steps=c['max_steps'], rolling=rolling,
                         net=net)
 
@@ -317,6 +327,7 @@ class Run:
                'leaves': leaves, 'leaves_per_s': leaves / max(secs, 1e-9),
                'games_per_h': len(results) / max(secs, 1e-9) * 3600, 'seconds': secs,
                'infer_s': ev.seconds, 'avg_batch': ev.leaves / max(1, ev.calls),
+               'minor_per_game': (st.get('minor', 0) - (st0.get('minor', 0) if st0 else 0)) / max(1, len(results)),
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if c['rolling']:
@@ -444,6 +455,32 @@ class Run:
             rows.append((r['result'][me], sc[me] - max(sc[j] for j in range(len(sc)) if j != me), r['rounds'], r['over']))
         return rows
 
+    def play_matches(self, it, opps, n_games, sims, seed):
+        """Checkpoint `it` against each of the checkpoints `opps` (n_games each, seats alternating
+        within each match) in ONE driver: every opponent is its own evaluator key, so the
+        checkpoint's network batches hold the leaves of all the matches. -> {opp: rows} as
+        play_match."""
+        P = 2
+        a = self.nn_seat('m', sims)
+        evs = {'m': self.evaluator(model_path(self.run, it))}
+        seats = []
+        for t, j in enumerate(opps):
+            o = self.nn_seat(f'o{t}', sims)
+            evs[f'o{t}'] = self.evaluator(model_path(self.run, j))
+            seats += [[a if s == g % P else o for s in range(P)] for g in range(n_games)]
+        if not seats:
+            return {}
+        drv = self.driver(seats, seed=seed, conc=min(self.cfg['conc'], len(seats)))
+        drive(drv, evs, check=lambda: self.check('evaluation'))
+        out = {j: [] for j in opps}
+        for r in sorted(drv.take_results(), key=lambda r: r['gid']):
+            t, g = divmod(r['gid'], n_games)
+            me = g % P
+            sc = r['scores']
+            out[opps[t]].append((r['result'][me], sc[me] - max(sc[q] for q in range(len(sc)) if q != me), r['rounds'],
+                                 r['over']))
+        return out
+
     def bots_match(self, a, b, n_games, seed):
         """Two non-network players (Elo reference games). -> score of a."""
         seats = [[G.seat_dict(a), G.seat_dict(b)] if g % 2 == 0 else [G.seat_dict(b), G.seat_dict(a)] for g in range(n_games)]
@@ -487,17 +524,27 @@ class Run:
                 logged.append(name)
         elo.save_results(self.run, res)
         e = max(1, int(c['eval_every']))
-        todo = [(k, k - off * e) for k in range(e, latest + 1, e) for off in elo.OFFSETS
+        offsets = elo.OFFSETS[:c['elo_opponents']] if c.get('elo_opponents') else elo.OFFSETS
+        todo = [(k, k - off * e) for k in range(e, latest + 1, e) for off in offsets
                 if k - off * e >= 0 and os.path.exists(model_path(self.run, k - off * e))
                 and os.path.exists(model_path(self.run, k))
                 and not elo.has(res, elo.ckpt_name(k), elo.ckpt_name(k - off * e))]
-        for k, j in todo:
-            rows = self.play_match(k, 'nn', c['elo_games'], c['eval_sims'], seed=31 + 7919 * k + 101 * j,
-                                   opp_model=model_path(self.run, j))
+        sims = c.get('elo_sims') or c['eval_sims']
+
+        def record(k, j, rows):
             sc = sum(r[0] for r in rows)
             elo.add(res, elo.ckpt_name(k), elo.ckpt_name(j), sc, len(rows))
             elo.save_results(self.run, res)
             self.log(f'elo match {elo.ckpt_name(k)} vs {elo.ckpt_name(j)}: {sc:.1f}/{len(rows)}')
+        if c.get('elo_together'):
+            for k in sorted({k for k, _ in todo}):
+                js = [j for kk, j in todo if kk == k]
+                for j, rows in self.play_matches(k, js, c['elo_games'], sims, seed=31 + 7919 * k).items():
+                    record(k, j, rows)
+        else:
+            for k, j in todo:
+                record(k, j, self.play_match(k, 'nn', c['elo_games'], sims, seed=31 + 7919 * k + 101 * j,
+                                             opp_model=model_path(self.run, j)))
         ratings = elo.fit(res, anchor=self.yard)
         elo.write_ratings(self.run, ratings, self.yard)
         best = elo.tag_checkpoints(self.run, ratings, latest, self.yard)

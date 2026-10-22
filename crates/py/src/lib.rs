@@ -140,7 +140,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -172,6 +172,10 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         Some(v) if !v.is_none() => Some(v.extract()?),
         _ => None,
     };
+    let sims_minor: Option<u32> = match d.get_item("sims_minor")? {
+        Some(v) if !v.is_none() => Some(v.extract()?),
+        _ => None,
+    };
     // training target of recorded decisions: 'visits' (default) | 'cq' (docs/search.md 3.1)
     let policy_target = PolicyTarget::parse(&get(d, "policy_target", "visits".to_string())?, get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?).map_err(verr)?;
     Ok(SeatCfg::Nn(NnSeat {
@@ -184,6 +188,7 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         temp_moves: get(d, "temp_moves", 30u32)?,
         sims_fast,
         p_full: get(d, "p_full", 1.0f64)?,
+        sims_minor,
         chance_k: get(d, "chance_k", 0u32)?,
         margin_w: get(d, "margin_w", 0.0f64)?,
         redet: flag(d, "redet", true)?,
@@ -557,6 +562,7 @@ impl PySearchDriver {
         d.set_item("restart_sims", s.restart_sims)?;
         d.set_item("restarts", s.restarts)?;
         d.set_item("recorded", s.recorded)?;
+        d.set_item("minor", s.minor)?;
         d.set_item("emitted", s.emitted)?;
         d.set_item("epoch", s.epoch)?;
         d.set_item("net", s.net)?;

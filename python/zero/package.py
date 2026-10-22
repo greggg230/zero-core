@@ -48,12 +48,14 @@ class GamePackage:
                     {planes, h, w, offset, cell_action0, hex: 'odd-r' | None}
     remotes         name -> a machine for remote evaluation (run setting eval_remote; zero.remote):
                     {host, repo, python, workdir, env, overrides}
+    tokens          game -> its object layout for arch 'tokens' networks (net.TokenNet: {vocab,
+                    segments, bags}), or 'module:attr' (resolved when first used)
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
-                 grids=None, remotes=None):
+                 grids=None, remotes=None, tokens=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -73,6 +75,14 @@ class GamePackage:
         self.replay_opp = replay_opp
         self.grids = dict(grids or {})
         self.remotes = dict(remotes or {})
+        self.tokens = dict(tokens or {})
+
+    def tokens_of(self, game):
+        """The object layout of `game` for arch 'tokens' (None if the package has none)."""
+        t = self.tokens.get(game)
+        if isinstance(t, str):
+            t = self.tokens[game] = resolve(t)
+        return t
 
     def spec_of(self, game):
         """The default spec of `game` ('' if none)."""
@@ -86,9 +96,19 @@ class GamePackage:
         return f'GamePackage({self.name!r}, root={self.root!r}, engine={self.engine!r})'
 
 
+# The toy's objects for arch 'tokens' (crates/search/src/toy.rs `encode`, 195 features): the 13
+# action spaces (7 floats each from feature 31: present, occupied, by whom, goods; space s is
+# action s) and the 4 players (16 floats each from 122, the viewer first), the revealed round
+# cards as a bag (6 from 25); the rest (round, players, start seat, markers, sub-decision) are
+# globals.
+TOY_TOKENS = {'vocab': 8,
+              'segments': [{'name': 'spaces', 'offset': 31, 'count': 13, 'width': 7, 'present': 0, 'actions': [[0, 1]]},
+                           {'name': 'players', 'offset': 122, 'count': 4, 'width': 16, 'present': 0}],
+              'bags': [{'name': 'cards', 'offset': 25, 'count': 1, 'width': 6}]}
+
 # the core's own package: the toy game, zero._engine (crates/toy_py, tools/build_py.sh)
 CORE = GamePackage('zero', 'Zero Core', CORE_ROOT, engine='zero._engine', run_module='zero.run', game='toy',
-                   dashboard_port=None, hub_id=None, env_prefix='ZERO')
+                   dashboard_port=None, hub_id=None, env_prefix='ZERO', tokens={'toy': TOY_TOKENS})
 
 _ACTIVE = None
 

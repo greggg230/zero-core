@@ -83,6 +83,9 @@ pub struct NnSeat {
     pub temp_moves: u32,
     pub sims_fast: Option<u32>,
     pub p_full: f64,
+    /// Simulations of a minor decision (`SearchGame::minor_decision`; never recorded). None:
+    /// minor decisions are searched like the others.
+    pub sims_minor: Option<u32>,
     pub chance_k: u32,
     pub margin_w: f64,
     pub redet: bool,
@@ -93,7 +96,7 @@ pub struct NnSeat {
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits }
     }
 }
 
@@ -238,6 +241,8 @@ struct Slot<G: SearchGame> {
     sims: u32,
     target: Option<u32>,
     full: bool,
+    /// The current decision is minor (searched with `sims_minor`).
+    minor: bool,
     decisions: u32,
     ext_moves: u32,
     steps: u64,
@@ -270,6 +275,7 @@ impl<G: SearchGame> Slot<G> {
             sims: 0,
             target: None,
             full: true,
+            minor: false,
             decisions: 0,
             ext_moves: 0,
             steps: 0,
@@ -370,6 +376,7 @@ struct Counters {
     restart_sims: AtomicU64,
     restarts: AtomicU64,
     recorded: AtomicU64,
+    minor: AtomicU64,
 }
 
 struct Shared<G: SearchGame> {
@@ -425,6 +432,8 @@ pub struct DriverStats {
     pub restart_sims: u64,
     pub restarts: u64,
     pub recorded: u64,
+    /// Minor decisions decided by network seats with `sims_minor`.
+    pub minor: u64,
     pub emitted: u64,
     pub epoch: u32,
     pub net: u32,
@@ -475,7 +484,7 @@ impl<G: SearchGame> Driver<G> {
         for s in &cfg.seats {
             match s {
                 SeatCfg::Nn(n) => {
-                    if n.sims == 0 || n.sims_fast == Some(0) {
+                    if n.sims == 0 || n.sims_fast == Some(0) || n.sims_minor == Some(0) {
                         return Err("network seats need sims >= 1".into());
                     }
                     if cfg.keys.get(n.key as usize).map(|k| k.1) != Some(KeyKind::Nn) {
@@ -808,6 +817,7 @@ impl<G: SearchGame> Driver<G> {
             restart_sims: c.restart_sims.load(Ordering::Relaxed),
             restarts: c.restarts.load(Ordering::Relaxed),
             recorded: c.recorded.load(Ordering::Relaxed),
+            minor: c.minor.load(Ordering::Relaxed),
             emitted: self.emitted,
             epoch: self.sh.epoch.load(Ordering::Relaxed),
             net: self.sh.net.load(Ordering::Relaxed),

@@ -82,6 +82,7 @@ struct Tally {
     lost: u64,
     restarts: u64,
     recorded: u64,
+    minor: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -145,6 +146,7 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     k.restart_sims.fetch_add(n.lost, Ordering::Relaxed);
     k.restarts.fetch_add(n.restarts, Ordering::Relaxed);
     k.recorded.fetch_add(n.recorded, Ordering::Relaxed);
+    k.minor.fetch_add(n.minor, Ordering::Relaxed);
     Ok(())
 }
 
@@ -218,6 +220,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.sims = 0;
     slot.target = None;
     slot.full = true;
+    slot.minor = false;
     slot.decisions = 0;
     slot.ext_moves = 0;
     slot.steps = 0;
@@ -290,6 +293,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             start(slot, seat, p);
         }
         if slot.sims >= slot.target.unwrap() {
+            n.minor += slot.minor as u64;
             n.recorded += decide(cfg, slot, seat, p, &mut scratch.sim.key)? as u64;
             continue;
         }
@@ -330,6 +334,13 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     slot.full = seat.sims_fast.is_none() || slot.rng.unit() < seat.p_full;
     slot.target = Some(if slot.full { seat.sims } else { seat.sims_fast.unwrap() });
     let game = slot.game.as_ref().unwrap();
+    // a minor decision (self-play seats with sims_minor): its own budget, never recorded (the
+    // playout-cap draw above is made all the same, so the streams do not depend on it)
+    slot.minor = seat.selfplay && seat.sims_minor.is_some() && game.minor_decision();
+    if slot.minor {
+        slot.full = false;
+        slot.target = seat.sims_minor;
+    }
     match slot.trees[p].as_mut() {
         None => {
             let mut t = slot.spare.pop().unwrap_or_default();

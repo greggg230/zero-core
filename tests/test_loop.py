@@ -248,3 +248,43 @@ def test_remote_evaluation_continues_a_local_run(tmp_path):
     assert set(before['logged']) <= set(after['logged'])
     r = json.load(open(run / 'elo' / 'ratings.json'))['ratings']
     assert {'iter_0001', 'iter_0004'} <= set(r)
+
+
+def test_tokens_arch_cheap_elo_and_minor_settings(tmp_path):
+    """arch 'tokens' (the toy's object layout) through the whole loop; Elo against the previous
+    checkpoint only, at its own sims, all of an iteration's matches in one driver; sims_minor
+    (the toy has no minor decisions: nothing changes)."""
+    run = tmp_path / 'tok'
+    p = run_loop(run, '--iters', '2', '--arch', 'tokens', '--hidden', '16', '--blocks', '1', '--heads', '2',
+                 '--elo-opponents', '1', '--elo-sims', '4', '--elo-together', '1', '--sims-minor', '2')
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    assert [r['iter'] for r in m] == [0, 1, 2]
+    assert m[2]['selfplay']['minor_per_game'] == 0 and m[2]['train']['steps'] >= 10
+    from zero.net import load
+    net, _ = load(str(run / 'models' / 'iter_0002.pt'))
+    assert net.config['arch'] == 'tokens' and net.config['d'] == 16 and net.config['ff'] == 32
+    pairs = json.load(open(run / 'elo' / 'results.json'))['pairs']
+    games = {k: v[1] for k, v in pairs.items() if k.startswith('iter_') and '|iter_' in k}
+    assert games == {'iter_0000|iter_0001': 4, 'iter_0001|iter_0002': 4}, pairs
+    cfg = json.load(open(run / 'config.json'))
+    assert (cfg['elo_opponents'], cfg['elo_sims'], cfg['elo_together'], cfg['sims_minor']) == (1, 4, 1, 2)
+
+
+def test_eval_spec_is_the_spec_of_every_match(monkeypatch, tmp_path):
+    """Drivers that record (self-play) get `spec`; every match gets `eval_spec` when set."""
+    from zero import run as R
+    seen = []
+
+    class Fake:
+        def __init__(self, game, seats, spec=None, **kw):
+            seen.append((spec, kw['record']))
+    monkeypatch.setattr(R.G, 'Driver', Fake)
+    cfg = dict(R.DEFAULTS, spec='{"a": 1}', eval_spec='{"b": 2}')
+    r = R.Run(str(tmp_path), cfg)
+    r.driver([[{'bot': 'random'}] * 2], seed=1, record=True)
+    r.driver([[{'bot': 'random'}] * 2], seed=1)
+    r.cfg['eval_spec'] = ''
+    r.driver([[{'bot': 'random'}] * 2], seed=1)
+    assert seen == [('{"a": 1}', True), ('{"b": 2}', False), ('{"a": 1}', False)]
+    assert R.DEFAULTS['eval_spec'] == '' and R.DEFAULTS['elo_opponents'] == 0 and R.DEFAULTS['sims_minor'] == 0

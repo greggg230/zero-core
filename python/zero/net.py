@@ -22,6 +22,7 @@ Checkpoints (`save`, atomic): {config, state, extra}; `load` rebuilds the networ
 config; `widen` maps a checkpoint onto a larger feature / action space (new inputs get zero
 weights, new actions zero logits), so a widened network computes what the source did.
 """
+import math
 import os
 import time
 
@@ -167,11 +168,256 @@ class GridNet(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+def tokens_layout(layout, features, actions):
+    """The normalised object layout of a `TokenNet` (validated against the feature / action
+    widths; module docstring of TokenNet). -> a plain dict (stored in the checkpoint config)."""
+    vocab = int(layout['vocab'])
+    segs, bags, used, acts = [], [], set(), {}
+
+    def claim(name, lo, n):
+        if lo < 0 or lo + n > features:
+            raise ValueError(f'tokens layout: {name} [{lo}, {lo + n}) does not fit {features} features')
+        r = set(range(lo, lo + n))
+        if r & used:
+            raise ValueError(f'tokens layout: {name} overlaps another segment')
+        used.update(r)
+
+    for s in layout.get('segments', []):
+        seg = {'name': str(s['name']), 'offset': int(s['offset']), 'count': int(s['count']), 'width': int(s['width']),
+               'present': None if s.get('present') is None else int(s['present']), 'id': None,
+               'actions': [[int(b), int(k)] for b, k in s.get('actions', [])]}
+        if seg['count'] < 1 or seg['width'] < 1:
+            raise ValueError(f'tokens layout: segment {seg["name"]} has no slots')
+        if seg['present'] is not None and not 0 <= seg['present'] < seg['width']:
+            raise ValueError(f'tokens layout: segment {seg["name"]}: present flag outside the slot')
+        if s.get('id') is not None:
+            radix = [int(r) for r in s['id']['radix']]
+            at = int(s['id']['at'])
+            if at < 0 or at + sum(radix) > seg['width'] or math.prod(radix) > vocab:
+                raise ValueError(f'tokens layout: segment {seg["name"]}: identity {s["id"]} does not fit')
+            seg['id'] = {'at': at, 'radix': radix}
+        claim(seg['name'], seg['offset'], seg['count'] * seg['width'])
+        for j, (base, stride) in enumerate(seg['actions']):
+            for slot in range(seg['count']):
+                a = base + slot * stride
+                if not 0 <= a < actions:
+                    raise ValueError(f'tokens layout: segment {seg["name"]}: action {a} outside {actions}')
+                if a in acts:
+                    raise ValueError(f'tokens layout: action {a} belongs to {acts[a]} and {seg["name"]}')
+                acts[a] = seg['name']
+        segs.append(seg)
+    for b in layout.get('bags', []):
+        bag = {'name': str(b['name']), 'offset': int(b['offset']), 'count': int(b['count']), 'width': int(b['width'])}
+        if bag['width'] > vocab or bag['count'] < 1:
+            raise ValueError(f'tokens layout: bag {bag["name"]} wider than the vocabulary {vocab}')
+        claim(bag['name'], bag['offset'], bag['count'] * bag['width'])
+        bags.append(bag)
+    return {'vocab': vocab, 'segments': segs, 'bags': bags}
+
+
+class TBlock(nn.Module):
+    """Pre-norm transformer block (multi-head self-attention over the present tokens, GELU MLP)."""
+
+    def __init__(self, d, heads, ff):
+        super().__init__()
+        self.h = heads
+        self.ln1 = nn.LayerNorm(d)
+        self.qkv = nn.Linear(d, 3 * d)
+        self.out = nn.Linear(d, d)
+        self.ln2 = nn.LayerNorm(d)
+        self.ff1 = nn.Linear(d, ff)
+        self.ff2 = nn.Linear(ff, d)
+
+    def forward(self, h, keep):
+        """h [B, T, d], keep [B, 1, 1, T] bool (False = padding: never attended to)."""
+        B, T, D = h.shape
+        q, k, v = self.qkv(self.ln1(h)).view(B, T, 3, self.h, D // self.h).permute(2, 0, 3, 1, 4)
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
+        h = h + self.out(a.transpose(1, 2).reshape(B, T, D))
+        return h + self.ff2(F.gelu(self.ff1(self.ln2(h))))
+
+
+class TokenNet(nn.Module):
+    """arch 'tokens': a transformer over the game's objects, read from its fixed-width features
+    through a layout descriptor (the game package's `tokens[game]`, stored in the config), so the
+    `SearchGame` trait, the driver and the shards stay as they are.
+
+    layout = {vocab, segments: [...], bags: [...]}:
+      * segment {name, offset, count, width, present, id, actions}: `count` object slots of
+        `width` floats from feature `offset` (slot s at offset + s * width). A slot is a token
+        when its `present` float (index in the slot) is > 0.5 (present None: always). `id`
+        {at, radix: [r0, r1, ...]}: the slot's identity as mixed-radix one-hot digits at `at`
+        (index = sum digit_k * prod(r_{k+1}...)), embedded from a table of `vocab` + 1 rows
+        shared by every segment and bag (the last row: no / unknown identity, e.g. a face-down
+        card). `actions` [[base, stride], ...]: slot s scores the actions base + s * stride
+        (one logit per pair, from the slot's token); every other action gets its logit from the
+        pooled state.
+      * bag {name, offset, count, width}: `count` multisets over the identities (`width` <=
+        vocab counts each, e.g. the cards of a zone by identity); each is pooled as the
+        count-weighted sum of the identity embeddings, and the pools feed the global token.
+      * every feature outside the segments and bags is a global (the global token's input).
+
+    Token = identity embedding + a linear map of the slot's floats + a learned embedding of
+    (segment, slot) (the slot order means something: timestamps, top of the stack, whose
+    library). Only present slots are embedded and attended to: the batch is packed (each row's
+    tokens in layout order, the global token first), its rows sorted by token count and run in
+    chunks of `chunk` rows, each padded to its own longest row, padding masked out of the
+    attention. `layers` pre-norm blocks of width `d`. Heads read the global token's output and
+    the mean of the row's tokens: value / margin as `Net`, and the generic policy logits; a
+    slot's own actions are scored from its token, conditioned on the pooled state (pointer
+    logits). An empty slot's actions fall back to the generic logits.
+    """
+
+    def __init__(self, features, actions, layout, d=128, layers=3, heads=4, ff=256, seats=MAX_SEATS, game='toy',
+                 head=128, arch='tokens'):
+        super().__init__()
+        lay = tokens_layout(layout, features, actions)
+        self.config = {'arch': 'tokens', 'features': features, 'actions': actions, 'layout': lay, 'd': d,
+                       'layers': layers, 'heads': heads, 'ff': ff, 'seats': seats, 'game': game, 'head': head}
+        if d % heads:
+            raise ValueError(f'tokens: d {d} is not a multiple of heads {heads}')
+        self.features, self.seats, self.actions, self.d = features, seats, actions, d
+        self.segs, self.bags, self.vocab = lay['segments'], lay['bags'], lay['vocab']
+        self.chunk = 64                      # rows per packed chunk (an execution detail, not saved)
+        inside = set()
+        for s in self.segs:
+            inside.update(range(s['offset'], s['offset'] + s['count'] * s['width']))
+        for b in self.bags:
+            inside.update(range(b['offset'], b['offset'] + b['count'] * b['width']))
+        gidx = [i for i in range(features) if i not in inside]
+        self.register_buffer('gidx', torch.tensor(gidx, dtype=torch.long), persistent=False)
+        self.emb = nn.Embedding(self.vocab + 1, d)
+        nn.init.normal_(self.emb.weight, std=0.1)
+        self.g = nn.Linear(max(1, len(gidx)), d)
+        nbag = sum(b['count'] for b in self.bags)
+        self.bag = nn.Linear(nbag * (d + 1), d) if nbag else None
+        self.seg_in = nn.ModuleList(nn.Linear(s['width'], d) for s in self.segs)
+        self.n_tok = 1 + sum(s['count'] for s in self.segs)
+        self.pos = nn.Parameter(torch.randn(self.n_tok, d) * 0.02)  # (segment, slot) embeddings; 0 = global
+        self.blocks = nn.ModuleList(TBlock(d, heads, ff) for _ in range(layers))
+        self.ln = nn.LayerNorm(d)
+        self.gen = nn.Linear(2 * d, actions)
+        self.pk = nn.Linear(d, d)
+        self.pq = nn.Linear(2 * d, d, bias=False)
+        # pointer head: one output column per (segment, action pair); per position in the full
+        # token axis (0 = global, then the segments' slots) its columns and action ids (-1 /
+        # `actions` = none: scattered into a dummy column)
+        ncol = sum(len(s['actions']) for s in self.segs)
+        self.ptr = nn.Linear(d, max(1, ncol))
+        K = max([len(s['actions']) for s in self.segs] + [1])
+        cols = torch.full((self.n_tok, K), -1, dtype=torch.long)
+        acts = torch.full((self.n_tok, K), actions, dtype=torch.long)
+        start, c0 = 1, 0
+        for s in self.segs:
+            for slot in range(s['count']):
+                for j, (base, stride) in enumerate(s['actions']):
+                    cols[start + slot, j] = c0 + j
+                    acts[start + slot, j] = base + slot * stride
+            start += s['count']
+            c0 += len(s['actions'])
+        self.register_buffer('tok_cols', cols, persistent=False)
+        self.register_buffer('tok_acts', acts, persistent=False)
+        self.val = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
+        self.mar = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
+
+    def _identity(self, sl, idspec):
+        """Identity index [N] of slot rows [N, width] from their one-hot digits (vocab = none)."""
+        at, idx, ok = idspec['at'], None, None
+        for r in idspec['radix']:
+            blk = sl[:, at:at + r]
+            dig = (blk @ torch.arange(r, dtype=sl.dtype, device=sl.device)).round().long()
+            has = blk.sum(1) > 0.5
+            idx = dig if idx is None else idx * r + dig
+            ok = has if ok is None else ok & has
+            at += r
+        return torch.where(ok & (idx < self.vocab), idx, torch.full_like(idx, self.vocab))
+
+    def pack(self, x):
+        """The packed tokens: (h [B, T, d] (row b's n[b] tokens first, in layout order; the
+        global token at 0), n [B], full [B, T] = each packed token's position in the full token
+        axis (0 = global, then the segments' slots))."""
+        B, dev = x.shape[0], x.device
+        segs, pres = [], [torch.ones(B, 1, dtype=torch.bool, device=dev)]
+        for s in self.segs:
+            o, k, w = s['offset'], s['count'], s['width']
+            sl = x[:, o:o + k * w].reshape(B, k, w)
+            segs.append(sl)
+            pres.append(sl[..., s['present']] > 0.5 if s['present'] is not None
+                        else torch.ones(B, k, dtype=torch.bool, device=dev))
+        pres = torch.cat(pres, 1)                                     # [B, n_tok]
+        n = pres.sum(1)
+        T = int(n.max())
+        cpos = pres.long().cumsum(1) - 1                             # packed index of a present token
+        full = torch.zeros(B, T, dtype=torch.long, device=dev)
+        g = self.g(x.index_select(1, self.gidx))
+        if self.bag is not None:
+            pools = []
+            for b in self.bags:
+                o, k, w = b['offset'], b['count'], b['width']
+                c = x[:, o:o + k * w].reshape(B, k, w)
+                pools.append(torch.cat([c @ self.emb.weight[:w], c.sum(-1, keepdim=True)], -1))
+            g = g + self.bag(torch.cat(pools, 1).flatten(1))
+        h = torch.cat([(g + self.pos[0])[:, None], g.new_zeros(B, T - 1, self.d)], 1)
+        start = 1
+        for s, sl, lin in zip(self.segs, segs, self.seg_in):
+            bi, si = pres[:, start:start + s['count']].nonzero(as_tuple=True)
+            if len(bi):
+                rows = sl[bi, si]                                     # [N, width]
+                t = lin(rows) + self.pos[start + si]
+                if s['id'] is not None:
+                    t = t + self.emb(self._identity(rows, s['id']))
+                pi = cpos[bi, start + si]
+                h = h.index_put((bi, pi), t)
+                full[bi, pi] = start + si
+            start += s['count']
+        return h, n, full
+
+    def forward(self, x, n_players):
+        """As `Net.forward`."""
+        x = x[:, :self.features]
+        h, n, full = self.pack(x)
+        B, T, D = h.shape
+        dev = x.device
+        rows = torch.argsort(n, stable=True) if B > self.chunk else torch.arange(B, device=dev)
+        z = h.new_zeros(B, 2 * D)
+        pol = h.new_zeros(B, self.actions + 1)
+        for c0 in range(0, B, self.chunk):
+            r = rows[c0:c0 + self.chunk]
+            nr = n[r]
+            Tc = int(nr.max())
+            hc = h[r, :Tc]
+            keep = torch.arange(Tc, device=dev)[None, :] < nr[:, None]
+            k4 = keep[:, None, None, :]
+            for blk in self.blocks:
+                hc = blk(hc, k4)
+            hc = self.ln(hc) * keep[..., None]
+            zc = torch.cat([hc[:, 0], hc.sum(1) / nr[:, None].to(hc.dtype)], 1)
+            pc = F.pad(self.gen(zc), (0, 1))
+            fc = full[r, :Tc]
+            cols = self.tok_cols[fc]                                  # [Bc, Tc, K]
+            acts = torch.where(keep[..., None] & (cols >= 0), self.tok_acts[fc], self.actions)
+            lg = self.ptr(F.gelu(self.pk(hc) + self.pq(zc)[:, None])).gather(2, cols.clamp(min=0))
+            pc = pc.scatter(1, acts.flatten(1), lg.flatten(1))
+            z = z.index_copy(0, r, zc)
+            pol = pol.index_copy(0, r, pc)
+        present = torch.arange(self.seats, device=dev)[None, :] < n_players[:, None]
+        vlog = self.val(z).masked_fill(~present, -1e9)
+        return pol[:, :self.actions], vlog, self.mar(z)
+
+    def n_params(self):
+        return sum(p.numel() for p in self.parameters())
+
+
+ARCHS = {'grid': GridNet, 'tokens': TokenNet}
+
+
 def build(config):
-    """A network from its config (a checkpoint's): `GridNet` for arch 'grid', else `Net`."""
+    """A network from its config (a checkpoint's): `GridNet` for arch 'grid', `TokenNet` for
+    'tokens', else `Net`."""
     cfg = dict(config)
-    if cfg.get('arch', 'mlp') == 'grid':
-        return GridNet(**cfg)
+    arch = cfg.get('arch', 'mlp')
+    if arch in ARCHS:
+        return ARCHS[arch](**cfg)
     cfg.pop('arch', None)
     return Net(**cfg)
 
@@ -212,17 +458,53 @@ def _grid_index(cfg):
     return planes, [i for i in range(cfg['features']) if i not in inplane]
 
 
+def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0):
+    """A new network for `game` (info = games.info(game)): 'mlp' (`Net`, hidden x blocks), 'grid'
+    (`GridNet` over the game package's board planes, ch x blocks) or 'tokens' (`TokenNet` over
+    the game package's object layout: d = hidden, layers = blocks, heads, ff (0: 2 x hidden))."""
+    from . import package
+    F_, A_ = info['num_features'], info['num_actions']
+    if arch == 'grid':
+        grid = package.active().grids.get(game)
+        if not grid:
+            raise SystemExit(f"arch 'grid': the game package has no grid for {game!r} (GamePackage.grids)")
+        return GridNet(F_, A_, grid, ch, blocks, game=game).eval()
+    if arch == 'tokens':
+        layout = package.active().tokens_of(game)
+        if not layout:
+            raise SystemExit(f"arch 'tokens': the game package has no object layout for {game!r} (GamePackage.tokens)")
+        return TokenNet(F_, A_, layout, d=hidden, layers=blocks, heads=heads, ff=ff or 2 * hidden, game=game).eval()
+    if arch != 'mlp':
+        raise SystemExit(f"unknown arch {arch!r} ('mlp', 'grid', 'tokens')")
+    return Net(F_, A_, hidden, blocks, game=game).eval()
+
+
 def widen(old, features=None, actions=None, grid=None):
     """A copy of `old` with `features` inputs / `actions` policy outputs (>= the old ones):
     new input columns get zero weights (the old outputs are unchanged), new actions zero
     weights and bias (logit 0). GridNet: `grid` = the new board grid (the game package's) when
     it adds planes (the old planes must come first, in the same order): the new planes get zero
-    input weights in the first conv."""
+    input weights in the first conv. TokenNet: its layout stays; new features (after the old
+    ones) are new globals."""
     cfg = dict(old.config)
     cfg['features'] = features or cfg['features']
     cfg['actions'] = actions or cfg['actions']
     if cfg['features'] < old.config['features'] or cfg['actions'] < old.config['actions']:
         raise ValueError('widen only grows a network')
+    if cfg.get('arch') == 'tokens':
+        new = build(cfg)
+        st = new.state_dict()
+        for k, v in old.state_dict().items():
+            if k == 'g.weight':                      # globals in feature order: new ones come last
+                st[k].zero_()
+                st[k][:, :v.shape[1]] = v
+            elif k in ('gen.weight', 'gen.bias'):
+                st[k].zero_()
+                st[k][:v.shape[0]] = v
+            else:
+                st[k] = v
+        new.load_state_dict(st)
+        return new.eval()
     if grid is not None and cfg.get('arch') == 'grid':
         cfg['grid'] = dict(grid)
     new = build(cfg)

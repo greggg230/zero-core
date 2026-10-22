@@ -282,3 +282,180 @@ def test_gridnet_widen_adds_planes():
     import pytest
     with pytest.raises(ValueError):
         widen(old, feats2, grid=dict(GRID, planes=3, segments=[[feats, 1], [3, 2]]))
+
+
+# ---------------------------------------------------------------- arch 'tokens' (net.TokenNet)
+# A synthetic object layout: 5 globals, a context slot (always present, identity one-hot of 12
+# at 1), 2 bags of 12, 4 "units" (width 9: present at 0, identity as digits radix [3, 4] at 1,
+# actions 3 + slot and 20 + 2 * slot), 3 "cards" (width 4: present at 3, no identity, action
+# 30 + slot), then 2 more globals.
+TOK_LAYOUT = {'vocab': 12,
+              'segments': [{'name': 'ctx', 'offset': 5, 'count': 1, 'width': 14, 'present': None,
+                            'id': {'at': 1, 'radix': [12]}},
+                           {'name': 'units', 'offset': 19 + 24, 'count': 4, 'width': 9, 'present': 0,
+                            'id': {'at': 1, 'radix': [3, 4]}, 'actions': [[3, 1], [20, 2]]},
+                           {'name': 'cards', 'offset': 19 + 24 + 36, 'count': 3, 'width': 4, 'present': 3,
+                            'actions': [[30, 1]]}],
+              'bags': [{'name': 'zones', 'offset': 19, 'count': 2, 'width': 12}]}
+TOK_F, TOK_A = 19 + 24 + 36 + 12 + 2, 40
+
+
+def tok_x(B, seed=0):
+    """Random features with valid presence flags and identity digits."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(B, TOK_F, generator=g)
+    x[:, 6:18] = 0
+    x[torch.arange(B), 6 + torch.randint(12, (B,), generator=g)] = 1.0           # context identity
+    x[:, 19:43] = torch.randint(0, 3, (B, 24), generator=g).float() * 0.25        # bag counts
+    for s in range(4):
+        o = 43 + 9 * s
+        x[:, o] = (torch.rand(B, generator=g) < 0.6).float()
+        x[:, o + 1:o + 8] = 0
+        x[torch.arange(B), o + 1 + torch.randint(3, (B,), generator=g)] = 1.0
+        x[torch.arange(B), o + 4 + torch.randint(4, (B,), generator=g)] = 1.0
+    for s in range(3):
+        x[:, 79 + 4 * s + 3] = (torch.rand(B, generator=g) < 0.5).float()
+    return x
+
+
+def tok_net(seed=0, **kw):
+    from zero.net import TokenNet
+    torch.manual_seed(seed)
+    return TokenNet(TOK_F, TOK_A, TOK_LAYOUT, **dict(dict(d=16, layers=2, heads=2, ff=32, head=16), **kw)).eval()
+
+
+def test_tokennet_heads_masks_and_chunks():
+    m = tok_net(10)
+    x = tok_x(37, 1)
+    n = torch.tensor([2, 3, 4] * 12 + [2])
+    with torch.no_grad():
+        p, v, mg = m(x, n)
+        assert p.shape == (37, TOK_A) and v.shape == (37, protocol.MAX_SEATS) and mg.shape == (37, protocol.MAX_SEATS)
+        sm = torch.softmax(v, 1)
+        assert all(torch.all(sm[b, n[b]:] < 1e-12) for b in range(37))
+        # rows are independent of the batch and of the chunking (packing, sorting, padding)
+        m.chunk = 5
+        p5 = m(x, n)
+        m.chunk = 1000
+        p1 = m(x, n)
+        one = [m(x[b:b + 1], n[b:b + 1]) for b in range(37)]
+    for a, b in zip(p5, p1):
+        assert torch.allclose(a, b, atol=1e-5)
+    for k in range(3):
+        assert torch.allclose(torch.cat([o[k] for o in one]), p1[k], atol=1e-5)
+    # an absent slot is masked: its floats (all but the present flag) change nothing
+    x2 = x.clone()
+    for s in range(4):
+        absent = x[:, 43 + 9 * s] < 0.5
+        x2[absent, 43 + 9 * s + 1:43 + 9 * s + 9] = torch.randn(int(absent.sum()), 8)
+    for s in range(3):
+        absent = x[:, 79 + 4 * s + 3] < 0.5
+        x2[absent, 79 + 4 * s:79 + 4 * s + 3] += 3.0
+    with torch.no_grad():
+        q = m(x2, n)
+    assert all(torch.allclose(a, b, atol=1e-5) for a, b in zip(p1, q))
+    # a present slot is read
+    x3 = x.clone()
+    x3[:, 43 + 7] += 2.0
+    with torch.no_grad():
+        assert not torch.allclose(m(x3, n)[1], p1[1])
+
+
+def test_tokennet_pointer_logits_land_on_the_slot_actions():
+    m = tok_net(11)
+    with torch.no_grad():
+        m.gen.weight.zero_()
+        m.gen.bias.zero_()
+        m.ptr.weight.zero_()
+        m.ptr.bias.copy_(torch.tensor([1.0, 2.0, 3.0]))   # columns: units (3 + s), units (20 + 2 s), cards (30 + s)
+        x = tok_x(9, 2)
+        p = m(x, torch.full((9,), 2))[0]
+    for b in range(9):
+        want = torch.zeros(TOK_A)
+        for s in range(4):
+            if x[b, 43 + 9 * s] > 0.5:
+                want[3 + s], want[20 + 2 * s] = 1.0, 2.0
+        for s in range(3):
+            if x[b, 79 + 4 * s + 3] > 0.5:
+                want[30 + s] = 3.0
+        assert torch.equal(p[b], want), (b, p[b], want)
+
+
+def test_tokennet_identity_digits():
+    m = tok_net(12)
+    rows = torch.zeros(5, 9)
+    for k, (a, b) in enumerate([(0, 0), (2, 3), (1, 2), (2, 0)]):
+        rows[k, 1 + a] = 1.0
+        rows[k, 4 + b] = 1.0
+    rows[4, 1] = 1.0                                      # a missing digit: no identity
+    ids = m._identity(rows, TOK_LAYOUT['segments'][1]['id'])
+    assert ids.tolist() == [0, 11, 6, 8, 12]
+    # the identity is read through the shared embedding: two slots with the same identity and
+    # the same floats get the same token
+    x = tok_x(1, 3)
+    x[0, 43:91] = 0
+    for s in (0, 1):
+        o = 43 + 9 * s
+        x[0, o], x[0, o + 2], x[0, o + 5] = 1.0, 1.0, 1.0
+    with torch.no_grad():
+        h, n, full = m.pack(x)
+    assert int(n[0]) == 4 and full[0, :4].tolist() == [0, 1, 2, 3]
+    assert torch.allclose(h[0, 2] - m.pos[2], h[0, 3] - m.pos[3], atol=1e-6)
+
+
+def test_tokennet_save_load_widen_train_step(tmp_path):
+    from zero.net import build
+    m = tok_net(13)
+    x = tok_x(8, 4)
+    n = torch.full((8,), 2)
+    with torch.no_grad():
+        p = m(x, n)
+    path = str(tmp_path / 't.pt')
+    save(m, path, {'iter': 2})
+    m2, extra = load(path)
+    assert type(m2).__name__ == 'TokenNet' and m2.config == m.config and extra['iter'] == 2
+    assert type(build(m.config)).__name__ == 'TokenNet'
+    with torch.no_grad():
+        assert all(torch.allclose(a, b, atol=1e-6) for a, b in zip(m2(x, n), p))
+        w = widen(m2, TOK_F + 3, TOK_A + 5)
+        q = w(torch.cat([x, torch.randn(8, 3)], 1), n)
+    assert torch.allclose(q[0][:, :TOK_A], p[0], atol=1e-5) and torch.all(q[0][:, TOK_A:] == 0)
+    assert torch.allclose(q[1], p[1], atol=1e-5) and torch.allclose(q[2], p[2], atol=1e-5)
+    # a training step moves every parameter group that the batch reaches
+    m.train()
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-2)
+    plog, vlog, mp = m(x, n)
+    loss = plog.logsumexp(1).mean() + vlog.logsumexp(1).mean() + mp.pow(2).mean()
+    loss.backward()
+    for k in ('emb.weight', 'g.weight', 'bag.weight', 'seg_in.1.weight', 'pos', 'blocks.0.qkv.weight', 'ptr.weight'):
+        assert dict(m.named_parameters())[k].grad.abs().sum() > 0, k
+    opt.step()
+
+
+def test_tokennet_layout_validation():
+    import pytest
+    from zero.net import TokenNet, tokens_layout
+    lay = tokens_layout(TOK_LAYOUT, TOK_F, TOK_A)
+    assert [s['name'] for s in lay['segments']] == ['ctx', 'units', 'cards'] and lay['bags'][0]['count'] == 2
+    bad = [dict(TOK_LAYOUT, segments=TOK_LAYOUT['segments'] + [{'name': 'x', 'offset': 50, 'count': 1, 'width': 3}]),
+           dict(TOK_LAYOUT, segments=[dict(TOK_LAYOUT['segments'][2], actions=[[3, 1]])] + TOK_LAYOUT['segments'][1:2]),
+           dict(TOK_LAYOUT, segments=[dict(TOK_LAYOUT['segments'][2], actions=[[38, 1]])]),
+           dict(TOK_LAYOUT, segments=[dict(TOK_LAYOUT['segments'][1], id={'at': 4, 'radix': [3, 4]})]),
+           dict(TOK_LAYOUT, bags=[{'name': 'z', 'offset': 19, 'count': 2, 'width': 13}])]
+    for b in bad:
+        with pytest.raises(ValueError):
+            tokens_layout(b, TOK_F, TOK_A)
+    with pytest.raises(ValueError):
+        TokenNet(TOK_F, TOK_A, TOK_LAYOUT, d=10, heads=4)
+
+
+def test_tokennet_toy_layout_evaluator():
+    """The core's toy layout (package.TOY_TOKENS) through the evaluator: a valid answer."""
+    from zero.net import make_net
+    torch.manual_seed(14)
+    m = make_net(INFO, 'toy', 'tokens', hidden=16, blocks=1, heads=2)
+    assert m.config['arch'] == 'tokens' and m.config['ff'] == 32
+    ev = NetEvaluator(m)
+    drv, lb = a_batch(n=20, seed=3)
+    pri, val, mar = ev(lb)
+    protocol.validate_evaluation(lb, pri, val, mar)
