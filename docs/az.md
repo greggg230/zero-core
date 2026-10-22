@@ -466,3 +466,26 @@ that self-play measurement (encoding included), the rest of the time they waited
 network; the feature copy is one memcpy per chunk in the driver. A sparse feed (the present
 slots only, ~5% of the floats) would save memory bandwidth and shard space (27 KB per sample)
 but not inference time; not built.
+
+### 10.2 First result: MTG Zero's run mtg2 against an MLP control (2026-10-22)
+
+MTG Zero docs/ENGINE.md 22.4 has the details. Same settings (64 / 16 sims, cq targets, value_q
+0.9, reuse 2, minor decisions at 4 sims, 600 games per iteration), CPU only on a machine whose
+32 threads other runs kept busy: tokens 96 x 3 (0.76M parameters, `infer_workers` 4 x 2 torch
+threads) against the MLP 256 x 3 (4.19M).
+
+* **Per self-play game the token network is the stronger player**: head to head at 32 sims it
+  scores 65.8% +-6.1 (iteration 3 vs 3, 60 games) and 57.0% +-5.0 (iteration 5 vs 5, 100
+  games); its value head predicts unseen games better (67% vs 62% accuracy on the same held-out
+  games at iteration 3) with the same policy cross-entropy per decision kind.
+* **Per hour it is not**: 3.3-5.4k leaves/s in self-play against the MLP's 8.9-17.6k, and
+  evaluation on tiny batches is slow (12 minutes for one 20-game Elo match between two token
+  networks): 5 iterations in 3 h 35 min against the MLP's 10 in 3 h 4 min, and the MLP's
+  iteration 10 beats the token network's iteration 5 63.5% +-4.8.
+* Against MTG's rule-based yardstick both stay flat in these few iterations (tokens 2-6%, MLP
+  5.5-17%): the yardstick and head to head disagree (non-transitive styles), so a token run
+  needs Elo matches against fixed checkpoints too.
+* Initialisation matters with completed-Q targets and argmax play: random policy output layers
+  made one action dominate (55% PASS), a zero value head made every search a tie (ties play the
+  first option); the policy output layers now start at zero and the value head stays random
+  (section 10).
