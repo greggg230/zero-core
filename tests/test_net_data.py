@@ -319,7 +319,7 @@ def tok_x(B, seed=0):
 
 
 def tok_net(seed=0, policy=True, **kw):
-    """A small TokenNet; policy: random output layers (they start at zero: a neutral network)."""
+    """A small TokenNet; policy: random policy output layers (they start at zero: a uniform prior)."""
     from zero.net import TokenNet
     torch.manual_seed(seed)
     m = TokenNet(TOK_F, TOK_A, TOK_LAYOUT, **dict(dict(d=16, layers=2, heads=2, ff=32, head=16), **kw)).eval()
@@ -331,14 +331,13 @@ def tok_net(seed=0, policy=True, **kw):
     return m
 
 
-def test_tokennet_starts_neutral():
-    """A new TokenNet: uniform policy, value 1 / seats, margin 0 (its output layers start at zero)."""
+def test_tokennet_policy_starts_uniform():
+    """A new TokenNet's policy is uniform (its output layers start at zero); its value is not."""
     m = tok_net(16, policy=False)
     with torch.no_grad():
         p, v, mg = m(tok_x(5, 6), torch.tensor([2, 3, 2, 4, 2]))
-    assert torch.all(p == 0) and torch.all(mg == 0)
-    sm = torch.softmax(v, 1)
-    assert torch.allclose(sm[0, :2], torch.full((2,), 0.5)) and torch.allclose(sm[3, :4], torch.full((4,), 0.25))
+    assert torch.all(p == 0)
+    assert v[:, :2].std() > 0 and mg.abs().sum() > 0
 
 
 def test_tokennet_heads_masks_and_chunks():
