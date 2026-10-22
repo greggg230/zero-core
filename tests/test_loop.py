@@ -286,5 +286,14 @@ def test_eval_spec_is_the_spec_of_every_match(monkeypatch, tmp_path):
     r.driver([[{'bot': 'random'}] * 2], seed=1)
     r.cfg['eval_spec'] = ''
     r.driver([[{'bot': 'random'}] * 2], seed=1)
-    assert seen == [('{"a": 1}', True), ('{"b": 2}', False), ('{"a": 1}', False)]
+    from zero import package
+    pkg = package.active()
+    pkg.eval_specs['toy'] = lambda s: s + ' (eval)'          # a game package's evaluation spec
+    try:
+        r.driver([[{'bot': 'random'}] * 2], seed=1)
+        r.driver([[{'bot': 'random'}] * 2], seed=1, record=True)
+    finally:
+        pkg.eval_specs.pop('toy')
+    assert seen == [('{"a": 1}', True), ('{"b": 2}', False), ('{"a": 1}', False), ('{"a": 1} (eval)', False),
+                    ('{"a": 1}', True)]
     assert R.DEFAULTS['eval_spec'] == '' and R.DEFAULTS['elo_opponents'] == 0 and R.DEFAULTS['sims_minor'] == 0

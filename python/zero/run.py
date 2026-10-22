@@ -90,7 +90,8 @@ DEFAULTS = dict(
     yardstick='heuristic', eval_games=200, eval_sims=32, eval_random_games=50, eval_every=1, elo_games=100,
     ref_games=400,
     # the game spec of every match that records nothing (vs the yardstick, vs random, Elo, the
-    # reference games); '' = the self-play spec (MTG: a fixed deck set, self-play random decks)
+    # reference games); '' = the game package's evaluation spec for the self-play spec
+    # (GamePackage.eval_specs; MTG: a fixed deck set, self-play random decks), else the spec
     eval_spec='',
     # cheaper Elo (CPU runs): each checkpoint plays the first `elo_opponents` of the checkpoints
     # 1, 2, 4 ... 32 iterations back (0 = all), at elo_sims (0 = eval_sims); elo_together = 1
@@ -256,7 +257,7 @@ class Run:
     def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None):
         """A driver for self-play (`record`: the run's spec) or a match (eval_spec, if set)."""
         c = self.cfg
-        spec = c['spec'] if record else (c.get('eval_spec') or c['spec'])
+        spec = c['spec'] if record else (c.get('eval_spec') or package.active().eval_spec_of(c['game'], c['spec']))
         return G.Driver(c['game'], seats, spec=spec, concurrency=conc or c['conc'], seed=seed, record=record,
                         threads=c['threads'], groups=groups or c['groups'], max_steps=c['max_steps'], rolling=rolling,
                         net=net)

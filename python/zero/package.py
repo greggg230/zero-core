@@ -50,12 +50,15 @@ class GamePackage:
                     {host, repo, python, workdir, env, overrides}
     tokens          game -> its object layout for arch 'tokens' networks (net.TokenNet: {vocab,
                     segments, bags}), or 'module:attr' (resolved when first used)
+    eval_specs      game -> fn(spec) -> the spec of evaluation matches (a run's `eval_spec`
+                    setting overrides it), or 'module:attr'; e.g. MTG: self-play on random
+                    decks, evaluation on a fixed deck set. Default: the self-play spec
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
-                 grids=None, remotes=None, tokens=None):
+                 grids=None, remotes=None, tokens=None, eval_specs=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -76,6 +79,7 @@ class GamePackage:
         self.grids = dict(grids or {})
         self.remotes = dict(remotes or {})
         self.tokens = dict(tokens or {})
+        self.eval_specs = dict(eval_specs or {})
 
     def tokens_of(self, game):
         """The object layout of `game` for arch 'tokens' (None if the package has none)."""
@@ -83,6 +87,15 @@ class GamePackage:
         if isinstance(t, str):
             t = self.tokens[game] = resolve(t)
         return t
+
+    def eval_spec_of(self, game, spec):
+        """The spec of `game`'s evaluation matches when self-play uses `spec` (eval_specs)."""
+        f = self.eval_specs.get(game)
+        if f is None:
+            return spec
+        if isinstance(f, str):
+            f = self.eval_specs[game] = resolve(f)
+        return f(spec)
 
     def spec_of(self, game):
         """The default spec of `game` ('' if none)."""
