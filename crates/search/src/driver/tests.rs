@@ -396,3 +396,114 @@ fn minor_decisions_get_their_own_budget_and_no_records() {
     assert_eq!(se.minor, 0);
     assert!(Driver::<MinorToy>::new(cfg(vec![with_minor(nn(0, 8, true), Some(0))], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_err());
 }
+
+/// The toy with an engine bug: game `PANIC_GID` of a driver seeded `PANIC_SEED` panics at its
+/// `PANIC_STEP`-th transition (a real move or one inside a search simulation), after sleeping
+/// the spec's milliseconds (the spec is that number: a delay makes the caller wait for the
+/// panicking group).
+#[derive(Clone)]
+struct PanicToy {
+    g: ToyGame,
+    boom: bool,
+    steps: u32,
+    sleep_ms: u64,
+}
+
+const PANIC_SEED: u64 = 4242;
+const PANIC_GID: u32 = 3;
+const PANIC_STEP: u32 = 12;
+
+impl SearchGame for PanicToy {
+    type Spec = u64;
+    const NAME: &'static str = "panictoy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    fn parse_spec(json: &str) -> Result<u64, String> {
+        json.trim().parse().map_err(|e| format!("panictoy spec: {e}"))
+    }
+    fn new_game(spec: &u64, players: usize, seed: u64) -> Result<Self, String> {
+        // the game seed init_slot derives for (PANIC_SEED, PANIC_GID)
+        let target = Rng::new(split64(PANIC_SEED ^ split64(PANIC_GID as u64 + 1))).next_u64();
+        Ok(PanicToy { g: ToyGame::new_game(&Default::default(), players, seed)?, boom: seed == target, steps: 0, sleep_ms: *spec })
+    }
+    fn num_players(&self) -> usize {
+        self.g.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.g.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.g.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.steps += 1;
+        if self.boom && self.steps == PANIC_STEP {
+            std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
+            panic!("toy engine bug at step {PANIC_STEP}");
+        }
+        self.g.step(a, chance)
+    }
+    fn force_chance(&mut self, forced: &[u64]) {
+        self.g.force_chance(forced)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.g.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.g.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.g.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.g.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.g.encode(viewer, out)
+    }
+}
+
+/// Drive a `PanicToy` self-play run (`groups` groups, the game sleeping `sleep_ms` before its
+/// panic, the caller sleeping `answer_ms` before each answer) on a thread; its outcome must come
+/// back within 30 s (a hang fails the test instead of hanging it).
+fn panicking_run(groups: usize, sleep_ms: u64, answer_ms: u64) -> String {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]; 8], &[("m", KeyKind::Nn)]);
+        c.spec = sleep_ms.to_string();
+        c.seed = PANIC_SEED;
+        c.concurrency = 8;
+        c.threads = 2;
+        c.groups = groups;
+        let mut d = Driver::<PanicToy>::new(c).unwrap();
+        let r = loop {
+            match d.next_batch(true) {
+                Ok(Some(b)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(answer_ms));
+                    answer(&mut d, &b);
+                }
+                Ok(None) => break Err("the run finished without the panic".to_string()),
+                Err(e) => break Ok(e),
+            }
+        };
+        drop(d);
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(r) => r.unwrap(),
+        Err(_) => panic!("next_batch hung after a game panicked (groups {groups}, game sleep {sleep_ms} ms, caller delay {answer_ms} ms)"),
+    }
+}
+
+#[test]
+fn a_panicking_game_fails_the_run_instead_of_hanging_it() {
+    // the caller already waiting for the panicking group (the game sleeps first), the caller
+    // busy when it panics (answers delayed), and both with two groups
+    for (groups, sleep_ms, answer_ms) in [(1, 300, 0), (1, 0, 20), (2, 300, 0), (2, 0, 20), (1, 0, 0)] {
+        let e = panicking_run(groups, sleep_ms, answer_ms);
+        let want = format!("game {PANIC_GID} (driver seed {PANIC_SEED}): search worker panicked: toy engine bug at step {PANIC_STEP}");
+        assert!(e.contains(&want), "groups {groups}, sleep {sleep_ms}, delay {answer_ms}: {e}");
+    }
+}

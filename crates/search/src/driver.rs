@@ -31,7 +31,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -43,6 +43,21 @@ mod worker;
 use worker::worker;
 
 const NO_GAME: u32 = u32::MAX;
+
+// The driver's locks are taken poison-tolerant: a panic is recorded as the driver's error
+// (`Shared::fail`) and the group it hit must still be wound up (`finish_assembly`), so a
+// poisoned lock must neither kill a worker thread nor the caller.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn read<T>(m: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write<T>(m: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Policy target of a recorded decision (docs/search.md 3.1).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -388,6 +403,8 @@ struct Shared<G: SearchGame> {
     done: Mutex<Vec<bool>>,
     done_cv: Condvar,
     error: Mutex<Option<String>>,
+    /// `error` is set (read under the `done` lock by `next_batch`'s wait).
+    failed: AtomicBool,
     stop: AtomicBool,
     counters: Counters,
     epoch: AtomicU32,
@@ -395,11 +412,20 @@ struct Shared<G: SearchGame> {
 }
 
 impl<G: SearchGame> Shared<G> {
+    /// Record the driver's error (the first one sticks) and wake a caller waiting in
+    /// `next_batch`: it returns the error at once, whatever the state of the groups.
     fn fail(&self, msg: String) {
-        let mut e = self.error.lock().unwrap();
-        if e.is_none() {
-            *e = Some(msg);
+        {
+            let mut e = lock(&self.error);
+            if e.is_none() {
+                *e = Some(msg);
+            }
         }
+        self.failed.store(true, Ordering::SeqCst);
+        // the waiter checks `failed` under the `done` lock: taking it here orders this notify
+        // after its check (no lost wakeup)
+        drop(lock(&self.done));
+        self.done_cv.notify_all();
     }
 }
 
@@ -545,6 +571,7 @@ impl<G: SearchGame> Driver<G> {
             done: Mutex::new(vec![false; groups]),
             done_cv: Condvar::new(),
             error: Mutex::new(None),
+            failed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             counters: Counters::default(),
             epoch: AtomicU32::new(0),
@@ -599,7 +626,7 @@ impl<G: SearchGame> Driver<G> {
         let n_games = if self.sh.cfg.rolling { u32::MAX } else { self.sh.cfg.games.len() as u32 };
         let mut busy = false;
         for ch in &grp.chunks {
-            let mut ch = ch.lock().unwrap();
+            let mut ch = lock(ch);
             for s in ch.slots.iter_mut() {
                 if s.game.is_none() && s.start.is_none() && self.next_gid < n_games {
                     s.start = Some(self.next_gid);
@@ -613,9 +640,9 @@ impl<G: SearchGame> Driver<G> {
             return;
         }
         self.gstate[g] = GState::Working;
-        self.sh.done.lock().unwrap()[g] = false;
+        lock(&self.sh.done)[g] = false;
         grp.remaining.store(grp.chunks.len(), Ordering::SeqCst);
-        let mut q = self.sh.queue.lock().unwrap();
+        let mut q = lock(&self.sh.queue);
         for c in 0..grp.chunks.len() {
             q.push_back((g as u32, c as u32));
         }
@@ -624,7 +651,7 @@ impl<G: SearchGame> Driver<G> {
     }
 
     fn check_error(&self) -> Result<(), String> {
-        match &*self.sh.error.lock().unwrap() {
+        match &*lock(&self.sh.error) {
             Some(e) => Err(e.clone()),
             None => Ok(()),
         }
@@ -693,17 +720,18 @@ impl<G: SearchGame> Driver<G> {
             };
             let t = Instant::now();
             {
-                let mut done = self.sh.done.lock().unwrap();
-                if !block && !done[g] {
+                let failed = || self.sh.failed.load(Ordering::SeqCst);
+                let mut done = lock(&self.sh.done);
+                if !block && !done[g] && !failed() {
                     return Ok(None);
                 }
-                while !done[g] {
-                    done = self.sh.done_cv.wait(done).unwrap();
+                while !done[g] && !failed() {
+                    done = self.sh.done_cv.wait(done).unwrap_or_else(PoisonError::into_inner);
                 }
             }
             self.wait_ns += t.elapsed().as_nanos() as u64;
             self.check_error()?;
-            let out = self.sh.groups[g].out.lock().unwrap().take().unwrap_or_default();
+            let out = lock(&self.sh.groups[g].out).take().unwrap_or_default();
             let nfin = out.results.len() as u64;
             self.finished_games += nfin;
             self.phase_games += nfin;
@@ -718,7 +746,7 @@ impl<G: SearchGame> Driver<G> {
                 }
                 if !out.batches.is_empty() {
                     for ch in &self.sh.groups[g].chunks {
-                        for s in ch.lock().unwrap().slots.iter_mut() {
+                        for s in lock(ch).slots.iter_mut() {
                             s.pending = None;
                         }
                     }
@@ -764,8 +792,8 @@ impl<G: SearchGame> Driver<G> {
         }
         let (_, _, _, opt_off) = self.outstanding.remove(&id).unwrap();
         let grp = &self.sh.groups[g];
-        let bases = std::mem::take(&mut grp.bases.lock().unwrap()[key as usize]);
-        grp.evals.write().unwrap()[key as usize] = Some(Eval::Nn { opt_off, priors: priors.to_vec(), value: value.to_vec(), margin: margin.to_vec(), bases });
+        let bases = std::mem::take(&mut lock(&grp.bases)[key as usize]);
+        write(&grp.evals)[key as usize] = Some(Eval::Nn { opt_off, priors: priors.to_vec(), value: value.to_vec(), margin: margin.to_vec(), bases });
         self.answered(g)
     }
 
@@ -782,8 +810,8 @@ impl<G: SearchGame> Driver<G> {
         }
         self.outstanding.remove(&id);
         let grp = &self.sh.groups[g];
-        let bases = std::mem::take(&mut grp.bases.lock().unwrap()[key as usize]);
-        grp.evals.write().unwrap()[key as usize] = Some(Eval::Ext { payloads, bases });
+        let bases = std::mem::take(&mut lock(&grp.bases)[key as usize]);
+        write(&grp.evals)[key as usize] = Some(Eval::Ext { payloads, bases });
         self.answered(g)
     }
 
@@ -829,7 +857,7 @@ impl<G: SearchGame> Driver<G> {
         let mut oldest = u64::MAX;
         for grp in &self.sh.groups {
             for ch in &grp.chunks {
-                let ch = ch.lock().unwrap();
+                let ch = lock(ch);
                 for s in &ch.slots {
                     let Some(g) = s.game.as_ref() else { continue };
                     r.games += 1;

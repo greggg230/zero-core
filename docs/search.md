@@ -174,6 +174,9 @@ the device.
   `groups` (tested).
 * Errors (an illegal move, a determinization that changed the root decision, a bad external
   payload, a worker panic) stop the driver: `next_batch` raises with the game index and seed.
+  A panic inside a game (an engine bug) is caught per game ("game G (driver seed S): search
+  worker panicked: <message>"; the panic's location is on stderr); recording an error wakes a
+  caller already waiting in `next_batch`, which raises at once (it never waits forever).
 
 ### 2.4 Training samples (`take_samples`)
 

@@ -120,6 +120,32 @@ def test_supervisor_with_fake_run(tmp_path):
     assert 'crash #1' in log and 'run paused' in log and 'clean exit' in log
 
 
+STALLED_RUN = '''import os, sys, time
+run = sys.argv[sys.argv.index("--run") + 1]
+p = os.path.join(run, "count")
+k = open(p).read() if os.path.exists(p) else ""
+open(p, "w").write(k + "x")
+if len(k) == 0:
+    time.sleep(120)
+'''
+
+
+def test_supervisor_stall_watchdog(tmp_path):
+    # run 1 hangs (no progress files change), run 2 finishes
+    run = tmp_path / 'stall'
+    run.mkdir()
+    (run / 'config.json').write_text('{}')
+    fake = tmp_path / 'fake.py'
+    fake.write_text(STALLED_RUN)
+    env = dict(os.environ, ZERO_SUPERVISE_WAIT='0.2', ZERO_SUPERVISE_POLL='0.1', ZERO_SUPERVISE_STALL='1',
+               ZERO_SUPERVISE_CMD=json.dumps([sys.executable, str(fake)]))
+    sup = subprocess.Popen([sys.executable, 'tools/supervise.py', str(run)], cwd=ROOT, env=env)
+    assert sup.wait(timeout=60) == 0
+    assert (run / 'count').read_text() == 'xx'
+    log = (run / 'supervisor.log').read_text()
+    assert 'stall watchdog: no progress' in log and 'crash #1' in log and 'clean exit' in log
+
+
 def test_kill_run_finds_nothing_and_pause_tool(tmp_path):
     run = tmp_path / 'k'
     run.mkdir()

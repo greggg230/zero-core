@@ -13,7 +13,13 @@
   a STOP file appearing while it waits ends the supervisor (the run stays paused);
 * asks Windows not to sleep while it is running (also while paused: Resume from a phone
   needs the desktop awake);
-* stops when the run exits cleanly (finished, or a STOP file in the run dir).
+* stops when the run exits cleanly (finished, or a STOP file in the run dir);
+* optional stall watchdog (<P>_SUPERVISE_STALL seconds, default 0 = off): a run whose progress
+  files (progress.json, log.txt, stdout.txt) have not changed for that long while no PAUSE is
+  requested is killed (with its workers) and restarted like a crash - a hung run (e.g. a
+  deadlocked search driver) otherwise stays alive forever. Self-play rewrites progress.json
+  every few seconds but training and evaluation phases may write nothing for a long time:
+  pick a limit well above the longest of those (e.g. 3600).
 A STOP file left over from an earlier stop is moved to STOP.old when the supervisor starts
 (starting it again means: run); a PAUSE file is kept (the run stays paused until it goes).
 The run's console output goes to <run>/stdout.txt in UTF-8. Logs to <run>/supervisor.log;
@@ -70,6 +76,41 @@ def ago(s):
     return f'{s:.0f}s' if s < 120 else f'{s / 60:.1f} min' if s < 7200 else f'{s / 3600:.1f} h'
 
 
+def last_activity(run, since):
+    """Newest modification time of the run's progress files, at least `since`."""
+    t = since
+    for f in ('progress.json', 'log.txt', 'stdout.txt'):
+        try:
+            t = max(t, os.path.getmtime(os.path.join(run, f)))
+        except OSError:
+            pass
+    return t
+
+
+def wait_run(run, p, stall_s):
+    """Wait for the run process `p` to exit -> its exit code. With stall_s > 0 a run without
+    progress for stall_s seconds (no PAUSE requested) is killed with its children first."""
+    if stall_s <= 0:
+        return p.wait()
+    t0 = time.time()
+    while True:
+        try:
+            return p.wait(timeout=min(max(stall_s / 10, 0.05), 30))
+        except subprocess.TimeoutExpired:
+            pass
+        idle = time.time() - last_activity(run, t0)
+        if idle > stall_s and not runctl.pause_requested(run):
+            log(run, f'stall watchdog: no progress for {ago(idle)} (limit {ago(stall_s)}): killing pid {p.pid}')
+            try:
+                for k in psutil.Process(p.pid).children(recursive=True):
+                    k.kill()
+            except psutil.NoSuchProcess:
+                pass
+            p.kill()
+            code = p.wait()
+            return code if code else 1
+
+
 def wait_resume(run, poll_s):
     """The run is paused: wait until its PAUSE file is removed -> True (relaunch now), or
     False if a STOP file appears meanwhile (the supervisor ends; the run stays paused)."""
@@ -116,6 +157,7 @@ def main(argv=None):
     wait_s = float(pkg.env('SUPERVISE_WAIT', 60))
     backoff_s = float(pkg.env('SUPERVISE_BACKOFF', 900))
     poll_s = float(pkg.env('SUPERVISE_POLL', 1))
+    stall_s = float(pkg.env('SUPERVISE_STALL', 0))
     cmd = json.loads(pkg.env('SUPERVISE_CMD')) if pkg.env('SUPERVISE_CMD') else \
         [sys.executable, '-m', pkg.run_module]
     name = pkg.run_module
@@ -133,7 +175,7 @@ def main(argv=None):
         p = subprocess.Popen(cmd + ['--run', run] + extra, cwd=pkg.root, stdout=out, stderr=subprocess.STDOUT, env=env)
         log(run, f'started {name} pid {p.pid}')
         runctl.write_state(run, 'supervisor', state='running', run_pid=p.pid)
-        code = p.wait()
+        code = wait_run(run, p, stall_s)
         out.close()
         killed = kill_orphans(p.pid)
         log(run, f'{name} exited with code {code}; killed {killed} orphaned workers')

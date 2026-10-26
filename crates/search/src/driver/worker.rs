@@ -19,7 +19,7 @@ pub(super) fn worker<G: SearchGame>(sh: Arc<Shared<G>>) {
     let mut scratch = WScratch { game: None, sim: SimScratch::default() };
     loop {
         let job = {
-            let mut q = sh.queue.lock().unwrap();
+            let mut q = lock(&sh.queue);
             loop {
                 if sh.stop.load(Ordering::SeqCst) {
                     return;
@@ -27,7 +27,7 @@ pub(super) fn worker<G: SearchGame>(sh: Arc<Shared<G>>) {
                 if let Some(j) = q.pop_front() {
                     break j;
                 }
-                q = sh.queue_cv.wait(q).unwrap();
+                q = sh.queue_cv.wait(q).unwrap_or_else(PoisonError::into_inner);
             }
         };
         let (g, c) = (job.0 as usize, job.1 as usize);
@@ -43,6 +43,7 @@ pub(super) fn worker<G: SearchGame>(sh: Arc<Shared<G>>) {
             continue;
         }
         let t = Instant::now();
+        // a game's panic is caught per game inside (`run_chunk`): this catches the rest
         match catch_unwind(AssertUnwindSafe(|| run_chunk(&sh, g, c, &mut scratch))) {
             Ok(Ok(())) => {}
             Ok(Err(e)) => sh.fail(e),
@@ -57,13 +58,20 @@ pub(super) fn worker<G: SearchGame>(sh: Arc<Shared<G>>) {
             // the group's last chunk: lay out its batches, then fill them in parallel (fill
             // jobs go to the front of the queue: the caller is waiting for this group)
             let t = Instant::now();
-            let n = if sh.error.lock().unwrap().is_none() { plan_assembly(&sh, g) } else { 0 };
+            let n = if sh.failed.load(Ordering::SeqCst) {
+                0
+            } else {
+                catch_unwind(AssertUnwindSafe(|| plan_assembly(&sh, g))).unwrap_or_else(|p| {
+                    sh.fail(format!("batch assembly panicked: {}", panic_msg(p)));
+                    0
+                })
+            };
             sh.counters.assemble_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if n == 0 {
                 finish_assembly(&sh, g);
             } else {
                 grp.fill_remaining.store(n, Ordering::SeqCst);
-                let mut q = sh.queue.lock().unwrap();
+                let mut q = lock(&sh.queue);
                 for c in (0..n).rev() {
                     q.push_front((g as u32, (c | FILL) as u32));
                 }
@@ -88,18 +96,20 @@ struct Tally {
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
     let cfg = &sh.cfg;
     let grp = &sh.groups[g];
-    let mut ch = grp.chunks[c].lock().unwrap();
+    let mut ch = lock(&grp.chunks[c]);
     let ch = &mut *ch;
     for b in ch.bufs.iter_mut() {
         b.clear();
     }
-    let evals = grp.evals.read().unwrap();
+    let evals = read(&grp.evals);
     let epoch = sh.epoch.load(Ordering::SeqCst);
     let net = sh.net.load(Ordering::SeqCst);
     let mut n = Tally::default();
     for slot in ch.slots.iter_mut() {
         let gid = slot.start.or(Some(slot.gid)).filter(|&x| x != NO_GAME);
-        let r = (|| -> Result<(), String> {
+        // a panic inside the game (an engine bug) is caught here, per game, so the message
+        // names the game to replay and the chunk's lock is never poisoned
+        let r = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
             if let Some(gid) = slot.start.take() {
                 init_slot(sh, slot, gid)?;
                 slot.epoch = epoch;
@@ -134,7 +144,12 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
                 None => {}
             }
             advance_slot(sh, slot, &mut ch.bufs, &mut ch.results, &mut ch.samples, scratch, &mut n)
-        })();
+        }))
+        .unwrap_or_else(|p| {
+            // the scratch world may be mid-transition
+            scratch.game = None;
+            Err(format!("search worker panicked: {}", panic_msg(p)))
+        });
         if let Err(e) = r {
             return Err(format!("game {} (driver seed {}): {e}", gid.map(|x| x as i64).unwrap_or(-1), cfg.seed));
         }
@@ -499,9 +514,9 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
 fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
     let grp = &sh.groups[g];
     let f = G::NUM_FEATURES;
-    let mut chunks: Vec<_> = grp.chunks.iter().map(|c| c.lock().unwrap()).collect();
+    let mut chunks: Vec<_> = grp.chunks.iter().map(lock).collect();
     let mut asm = Asm::default();
-    let mut bases_all = grp.bases.lock().unwrap();
+    let mut bases_all = lock(&grp.bases);
     for (k, (_, kind)) in sh.cfg.keys.iter().enumerate() {
         let (mut b, mut nopt) = (0usize, 0usize);
         let mut row_base = Vec::with_capacity(chunks.len());
@@ -548,7 +563,7 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
     drop(bases_all);
     let n = if asm.keys.is_empty() { 0 } else { chunks.len() };
     drop(chunks);
-    *grp.asm.lock().unwrap() = Some(asm);
+    *lock(&grp.asm) = Some(asm);
     n
 }
 
@@ -557,10 +572,10 @@ fn fill_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize) {
     let grp = &sh.groups[g];
     let f = G::NUM_FEATURES;
     let parts: Vec<(usize, Dest, usize, usize)> = {
-        let a = grp.asm.lock().unwrap();
+        let a = lock(&grp.asm);
         a.as_ref().map(|a| a.keys.iter().map(|k| (k.key, k.dest, k.row_base[c], k.opt_base[c])).collect()).unwrap_or_default()
     };
-    let ch = grp.chunks[c].lock().unwrap();
+    let ch = lock(&grp.chunks[c]);
     for (k, d, rb, ob) in parts {
         let x = &ch.bufs[k];
         let n = x.len();
@@ -587,17 +602,18 @@ fn fill_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize) {
 }
 
 /// After the last fill job (or with nothing to fill): publish the group's batches, results and
-/// samples and wake `next_batch`.
+/// samples and wake `next_batch`. Never panics on a poisoned lock (the group is always marked
+/// done: a caller waiting for it must wake up, to see the driver's error if there is one).
 fn finish_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) {
     let grp = &sh.groups[g];
-    let asm = grp.asm.lock().unwrap().take().unwrap_or_default();
+    let asm = lock(&grp.asm).take().unwrap_or_default();
     let mut out = GroupOut { batches: asm.batches, ..Default::default() };
     for c in &grp.chunks {
-        let mut c = c.lock().unwrap();
+        let mut c = lock(c);
         out.results.append(&mut c.results);
         out.samples.append(&mut c.samples);
     }
-    *grp.out.lock().unwrap() = Some(out);
-    sh.done.lock().unwrap()[g] = true;
+    *lock(&grp.out) = Some(out);
+    lock(&sh.done)[g] = true;
     sh.done_cv.notify_all();
 }
