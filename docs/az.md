@@ -18,7 +18,8 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `run.py` | The loop: `DEFAULTS`, `PRESETS` (the toy's + the package's), self-play (classic or rolling), training, evaluation, Elo, resume, STOP / PAUSE |
 | `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions; all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
 | `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place; `workers`: eager batches on threads), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
-| `data.py` | Sample shards (`ShardWriter`, atomic npz), the RAM-bounded training `Window`, `TargetStats` |
+| `data.py` | Sample shards (`ShardWriter`, atomic npz; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (checks every shard; row provenance), `TargetStats` |
+| `finite.py` | The non-finite guard (section 4.1): vectorised NaN / inf checks, `NonFinite` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
 | `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
 | `elo.py` | Bradley-Terry Elo over all results, the run's yardstick = 1000 |
@@ -136,6 +137,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated; `index.json` = every checkpoint's Elo; `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`); the newest `keep_data` iterations are kept |
+| `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor) and the current fit |
 | `progress.json` | self-play progress of the iteration in flight (dashboard) |
 | `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control |
@@ -151,6 +153,38 @@ actions only) + value cross-entropy against `(1 - q) z + q q_root` (softmax over
 present) + `margin_loss_w` x 0.5 x squared margin error over the seats present. AdamW, grad
 clip 5, step-decay LR, warmup while the optimizer state is fresh. Feature-width changes are
 handled by prefix reads (an older network reads the first columns) and `widen` (fork_run).
+
+### 4.1 The non-finite guard (`zero/finite.py`)
+
+A NaN or inf anywhere between self-play and a checkpoint fails the run instead of poisoning it.
+MTG Zero's run mtg4 (2026-10-27) took one NaN training step at iteration 30 (bfloat16 autocast,
+clip 5; the trigger is unknown: that iteration's shard had been rotated out), saved a checkpoint
+whose 93 float tensors were all NaN (iteration 29's were clean, max |w| 1.23) and ran on for 10
+iterations of turn-capped self-play with NaN targets and all-draw Elo matches: nothing checked.
+
+| Where | What is checked | On failure |
+|---|---|---|
+| `write_shard` (self-play) | `x`, `pi`, `z`, `q`, `sc` after the float16 cast (an encoder value above 65504 becomes inf) | the shard is written to `<run>/debug/iter_NNNN_<task>_SSS.bad.npz` (meta + `nonfinite`), not to `data/`; `NonFinite` names the arrays, rows (pi: the sample rows of its option entries), columns (x; z / q / sc: seats), NaN / +inf / -inf counts and the shard's meta |
+| `Window` (training) | the same arrays of every shard it loads, before subsampling: shards written before the guard too | `NonFinite` naming the shard path and the same details; nothing is moved (move the shard out of `data/`, or rename it `*.bad.npz`, to train without it) |
+| every training step | the policy, value and margin losses and the total gradient norm returned by `clip_grad_norm_`, before `optimizer.step()` | the batch is saved to `<run>/debug/nonfinite_iter_NNNN_step_SSSS.pt` (the tensors fed to the model, window rows, shard paths + rows of every batch row, per-sample losses, the weights before the step, lr, value_q, amp); `NonFinite` names the iteration, the step, the non-finite terms, whether the batch inputs and the weights are finite, and the shard rows of the batch rows whose per-sample loss is non-finite (all of the batch's shards when only the gradient is) |
+| `net.save`, the optimizer state | every float tensor (one device sync) | `NonFinite` before either file is written (the optimizer state is checked first) |
+
+`NonFinite` is an uncaught exception: the run logs `run aborted: NonFinite: ...` to `log.txt`,
+writes `run_state.json` state `aborted` and exits with status 1 (traceback on stderr). The
+supervisor treats it as a crash: it restarts the run after 60 s (15 minutes once 5 crashes fall
+within an hour), and the restart replays the failed iteration from its self-play (no checkpoint
+was written), so a deterministic cause fails again, once per replayed iteration, until someone
+looks. A quarantined shard and the debug batches stay in `debug/`: `keep_data` rotation and an
+iteration replay never delete `debug/`, and they move a `*.bad.npz` found in a data directory
+there instead of deleting it. The window never loads `*.bad.npz` (`shard_paths` skips it).
+
+Cost (desktop, 2026-10-27): the shard check runs on the float16 bits in 1M-element chunks, about
+6.5 GB/s on one core: 0.70 s for a real-sized MTG shard (65,536 rows x 33,750 features, 4.43 GB;
+about 11 us per sample) on top of a 5.7 s write, and 0.72 s on top of a 3.3 s read (the Window
+loads that shard in 6.5 s). The step check is one device sync: about 12 us on the CPU, about
+0.1-0.2 ms on CUDA (+2.4% of a 9 ms MLP step on the shared GPU; less for larger networks). A
+normal run is bit-identical (toy-smoke, 3 iterations: the same losses, checkpoints and optimizer
+state as before the guard). Tests: `tests/test_nonfinite.py`.
 
 ## 5. Evaluation and Elo
 
