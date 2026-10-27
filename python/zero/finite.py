@@ -104,14 +104,17 @@ def _walk(obj, prefix=''):
 
 def nonfinite_tensors(state):
     """(names of the float tensors holding a NaN / inf, number of float tensors) in a (nested)
-    state dict. One device sync when all are finite."""
+    state dict. One sync per device (an optimizer state mixes devices: AdamW keeps `step` on
+    the CPU, its moments on the GPU)."""
     ts = [(n, t) for n, t in _walk(state) if t.is_floating_point() and t.numel()]
-    if not ts:
-        return [], 0
-    ok = torch.stack([torch.isfinite(t).all() for _, t in ts])
-    if bool(ok.all()):
-        return [], len(ts)
-    return [n for (n, _), g in zip(ts, ok.tolist()) if not g], len(ts)
+    by_dev = {}
+    for n, t in ts:
+        by_dev.setdefault(t.device, []).append((n, torch.isfinite(t).all()))
+    bad = []
+    for flags in by_dev.values():
+        ok = torch.stack([f for _, f in flags]).tolist()
+        bad += [n for (n, _), g in zip(flags, ok) if not g]
+    return bad, len(ts)
 
 
 def check_state(state, what):

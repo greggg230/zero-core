@@ -14,7 +14,7 @@ import torch
 from zero import _engine as E
 from zero import games as G
 from zero.data import ShardWriter, Window, compact, read_shard, shard_paths, write_shard
-from zero.finite import NonFinite, nonfinite_rows
+from zero.finite import NonFinite, check_state, nonfinite_rows
 from zero.infer import UniformEvaluator, drive
 from zero.net import Net, save
 from zero.run import DEFAULTS, Run
@@ -108,6 +108,22 @@ def test_checkpoint_refuses_nonfinite(tmp_path):
     with pytest.raises(NonFinite, match=r'refusing to save .*bad\.pt: 1 of \d+ float tensors hold NaN / inf'):
         save(m, str(tmp_path / 'bad.pt'))
     assert not glob.glob(str(tmp_path / 'bad.pt*'))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='no CUDA')
+def test_checkpoint_check_on_cuda_optimizer_state():
+    """AdamW on CUDA keeps `step` on the CPU and its moments on the GPU: one state, two devices."""
+    m = Net(F, A, hidden=16, blocks=1).cuda()
+    opt = torch.optim.AdamW(m.parameters())
+    m(torch.zeros(2, F, device='cuda'), torch.full((2,), 2, device='cuda'))[1].sum().backward()
+    opt.step()
+    st = opt.state_dict()
+    assert {t.device.type for s in st['state'].values() for t in s.values()} == {'cpu', 'cuda'}
+    check_state(st, 'opt.pt')
+    next(iter(st['state'].values()))['exp_avg_sq'][0] = float('inf')
+    with pytest.raises(NonFinite, match=r'refusing to save opt\.pt: 1 of \d+ float tensors hold NaN / inf '
+                                         r'\[state\.0\.exp_avg_sq\]'):
+        check_state(st, 'opt.pt')
 
 
 def test_prune_keeps_quarantined_shards_and_debug(tmp_path):
@@ -224,12 +240,16 @@ def test_loop_fails_on_nonfinite_gradient(tmp_path):
     assert (run / 'debug' / 'nonfinite_iter_0001_step_0003.pt').exists()
 
 
-def test_normal_run_has_no_debug_dir(tmp_path):
+@pytest.mark.parametrize('dev', ['cpu', 'cuda'])
+def test_normal_run_has_no_debug_dir(tmp_path, dev):
+    if dev == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('no CUDA')
     run = tmp_path / 'ok'
     script = tmp_path / 'inject.py'
     script.write_text(RUNNER)
     e = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH)
-    p = subprocess.run([sys.executable, str(script), 'none', '--run', str(run), *SMOKE, '--iters', '1'], cwd=ROOT,
-                       capture_output=True, text=True, timeout=300, env=e)
+    p = subprocess.run([sys.executable, str(script), 'none', '--run', str(run), *SMOKE, '--iters', '1',
+                        '--train-device', dev], cwd=ROOT, capture_output=True, text=True, timeout=300, env=e)
     assert p.returncode == 0, p.stdout + p.stderr
-    assert (run / 'models' / 'iter_0001.pt').exists() and not (run / 'debug').exists()
+    assert (run / 'models' / 'iter_0001.pt').exists() and (run / 'models' / 'opt_latest.pt').exists()
+    assert not (run / 'debug').exists()
