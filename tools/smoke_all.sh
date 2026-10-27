@@ -16,7 +16,10 @@
 #
 # Env: SMOKE_DIR (scratch runs / worktrees; default E:/zero-smoke on Windows, /tmp/zero-smoke),
 # SKIP_CORE=1 (games only), SKIP_CARGO=1, SKIP_SMOKE=1, CARGO_BUILD_JOBS (default 8),
-# PYTHON (default python). Exit status: the number of failed steps (0 = green).
+# PYTHON (default python), SMOKE_TARGET (the cargo target dirs' last component on Windows,
+# E:/cargo-target/<repo>/<SMOKE_TARGET>; default smoke: give concurrent or scratch smokes their
+# own, a target dir shared by two checkouts can silently reuse the other's build).
+# Exit status: the number of failed steps (0 = green).
 set -uo pipefail
 CORE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PYTHON:-python}"
@@ -60,7 +63,7 @@ step() {   # step <label> <command...>
 
 
 if [ "${SKIP_CORE:-0}" != 1 ]; then
-  CTGT="${CARGO_TARGET_DIR:-${TBASE:+$TBASE/zero-core/smoke}}"
+  CTGT="${CARGO_TARGET_DIR:-${TBASE:+$TBASE/zero-core/${SMOKE_TARGET:-smoke}}}"
   [ "${SKIP_CARGO:-0}" != 1 ] && step "core: cargo test" \
     env ${CTGT:+CARGO_TARGET_DIR=$CTGT} cargo test --release --manifest-path "$CORE/Cargo.toml" -q
   step "core: build zero._engine" bash "$CORE/tools/build_py.sh"
@@ -97,7 +100,7 @@ for G in "${GAMES[@]}"; do
     ROOT="$WT"
     echo "=== $NAME: worktree $WT with zero-core $(git -C "$CORE" rev-parse --short HEAD)"
   fi
-  TGT="${TBASE:+$TBASE/$NAME/smoke}"
+  TGT="${TBASE:+$TBASE/$NAME/${SMOKE_TARGET:-smoke}}"
   GAME="$(cd "$ROOT" && "$PY" -c "import $PKG.az as a; print(a.PACKAGE.game)" 2>/dev/null)"
   step "$NAME: build $PKG._engine" env ZERO_CORE_UNPINNED="$WITH_CORE" ${TGT:+CARGO_TARGET_DIR=$TGT} bash "$ROOT/tools/build_py.sh"
   [ "${SKIP_CARGO:-0}" != 1 ] && step "$NAME: cargo test" \
