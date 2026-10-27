@@ -645,8 +645,10 @@ and the resolver at 32 / 8 simulations, 2 iterations:
   its `resolve` is a fraction of a millisecond (the primary resolves after every batch).
 * Single-game runs are untouched: toy-smoke (rolling, and classic with margin_w, chance_k and
   cq targets) gives the same metrics, checkpoints, optimizer states and shards byte for byte as
-  zero-core 681ba8d; the toy golden digests (`check_checkpoint_compat`, random and uniform
-  evaluators) are identical.
+  zero-core 681ba8d; the golden digests (`check_checkpoint_compat` against 681ba8d, random and
+  uniform evaluators: the toy, and Glass Road Zero c1f56dc built with each core) are identical;
+  `smoke_all.sh --with-this-core` with Glass Road, Caverna, Kingdom Builder and MTG Zero: green
+  (b890655).
 
 Tests: `tests/test_deferred.py` (the toy team game through the bindings, deferred leaves Rust vs
 Python exactly and statistically, team utilities, empty option segments in the evaluators, the
