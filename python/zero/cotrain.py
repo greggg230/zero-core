@@ -1,0 +1,607 @@
+"""Co-training (docs/az.md 11): a **primary** game whose episodes end at deferred terminals (MTG
+Zero: `team_draft`, an event drafted and built by teams) and a **resolver** game whose episodes
+decide them (MTG Zero: `mtg`, the event's matches), one network each, in one run. Nothing here
+names a game: the run's game package says how a deferred payload becomes resolver specs and how
+their results go back (`GamePackage.deferred`, defaults in `zero.package`).
+
+The run directory holds the primary as a single-game run does (`models/`, `data/`, `elo/`,
+`metrics.jsonl`, `progress.json`: the dashboards and tools work unchanged) and the resolver in
+`<run>/resolver/` with the same layout (iteration numbers shared; its resolved settings in
+`resolver/config.json`). Iteration `i`:
+
+* **Self-play**: two rolling drivers in this process - the primary's (net i-1, recording) on the
+  main thread and the resolver's (net i-1, recording, `queue_only`) on a worker thread - joined
+  by a `Coordinator`: each parked primary game's episodes go into the resolver's queue (tag
+  `gid/k`), their result rows come back by tag, and once all are in the primary game is resolved
+  (its samples emitted with the real outcome). The phase ends when `games` primary games have
+  been resolved in it (exactly: further ready ones wait for the next phase); games still playing
+  or waiting for episodes carry over in the drivers' memory. Backpressure: the primary waits while
+  `pending_max` resolver episodes are queued or playing. Samples: `data/iter_i/` and
+  `resolver/data/iter_i/`.
+* **Training**: the primary net on its window, then the resolver's on its own; both checked by
+  the non-finite guard (zero/finite.py: shards on write and load, every step, both checkpoints
+  and optimizer states before either is written; `NonFinite` names the net; quarantine in
+  `<run>/debug/` and `<run>/resolver/debug/`).
+* **Evaluation**: the resolver as a single-game run (its yardstick, random, Elo between its
+  checkpoints: `resolver/metrics.jsonl`, `resolver/elo/`); the primary by games against its
+  yardstick, random and its earlier checkpoints, team seats alternating between the two players
+  (`team_size`: seat s in team s % (n / team_size)), whose episodes a second resolver driver plays
+  with the resolver's yardstick (every evaluated iteration: `eval_yard`, `eval_random`, the Elo
+  matches) and with the resolver's network every `draft_eval_net_every` (`eval_yard_net`).
+* **Resume**: an iteration interrupted before both checkpoints is replayed from its start (both
+  data directories cleared); one interrupted after them finishes its evaluations. PAUSE / STOP /
+  the supervisor / kill / fork work on the one process.
+"""
+import json
+import os
+import threading
+import time
+from collections import deque
+
+import numpy as np
+
+from . import games as G
+from . import package
+from .data import ShardWriter, TargetStats
+from .finite import NonFinite, check_state
+from .infer import drive
+from .net import load, save, widen
+from .run import (DEFAULTS, PRESETS, Run, _fmt, _write_json, latest_iter, log, model_path, read_metrics,
+                  summarize)
+
+BIG = 1 << 62                                      # a resolver driver's quota: its phases end by end_phase()
+CO_KEYS = ('resolver', 'resolver_cfg', 'resolver_init', 'resolver_conc', 'pending_max', 'draft_eval_net_every')
+
+
+def resolver_config(cfg):
+    """The resolver's settings: DEFAULTS (+ the package's) < its preset < `resolver_cfg`; its game is
+    `cfg['resolver']`. Unknown or co-training keys in `resolver_cfg` are errors."""
+    rc = dict(cfg.get('resolver_cfg') or {})
+    bad = sorted(set(rc) - set(DEFAULTS))
+    if bad:
+        raise SystemExit(f'resolver_cfg: unknown settings {bad}')
+    nested = sorted(k for k in CO_KEYS if k in rc)
+    if nested:
+        raise SystemExit(f'resolver_cfg: {nested} are the primary run\'s settings')
+    preset = rc.get('preset') or ''
+    if preset and preset not in PRESETS:
+        raise SystemExit(f'resolver_cfg: unknown preset {preset!r} ({sorted(PRESETS)})')
+    if rc.get('game') not in (None, cfg['resolver']):
+        raise SystemExit(f"resolver_cfg: game {rc['game']!r} is not the resolver {cfg['resolver']!r}")
+    out = dict(DEFAULTS)
+    out.update(PRESETS.get(preset, {}))
+    out.update(rc)
+    out.update(game=cfg['resolver'], preset=preset, resolver='', resolver_cfg={}, resolver_init='')
+    if out.get('policy_target', 'visits') not in ('visits', 'cq'):
+        raise SystemExit(f"resolver_cfg: policy_target {out['policy_target']!r}: 'visits' or 'cq'")
+    if out.get('eval_remote'):
+        raise SystemExit('resolver_cfg: eval_remote is not supported in co-training runs')
+    return out
+
+
+class _Stop(BaseException):
+    """Ends the resolver thread (pause, an error on the main thread)."""
+
+
+class Coordinator:
+    """Moves a primary driver's deferred episodes into a resolver driver's queue and the resolver's
+    results back. Each driver is only ever touched by its own thread (a driver's methods must not
+    run concurrently: `next_batch` holds it while it waits); the shared state is under `cv`.
+
+    Primary thread: `take_events(drv)` (parked games -> queued episodes), `resolve_ready(drv)`.
+    Resolver thread: `feed(drv)` (enqueue), `collect(drv)` (result rows by tag -> ready games)."""
+
+    def __init__(self, episodes, results):
+        self.episodes_of, self.results_of = episodes, results
+        self.cv = threading.Condition()
+        self.events = {}                           # primary gid -> {payload, n, rows, t}
+        self.to_queue = deque()                    # (tag, spec) for the resolver
+        self.ready = deque()                       # (gid, results JSON, t ready, t parked)
+        self.outstanding = 0                       # resolver episodes queued or playing
+        self.done_rows = []                        # the resolver's result rows (taken by its owner)
+        self.error = None
+        self.stop = False                          # the resolver thread ends now
+        self.closing = False                       # the primary's phase is over: the resolver's too
+        self.snapshot = {}                         # the resolver driver's counters (its thread)
+        self.resolved_phase = 0
+        self.lat = []                              # per resolved game: (parked -> resolved s, ready -> resolved s)
+        self.waited = 0.0                          # seconds the primary waited for backpressure
+
+    # ---- primary thread
+    def take_events(self, drv):
+        new = drv.take_deferred()
+        if not new:
+            return 0
+        items = [(gid, payload, self.episodes_of(payload)) for gid, payload in new]
+        now = time.time()
+        with self.cv:
+            for gid, payload, eps in items:
+                if not eps:
+                    raise ValueError(f'deferred game {gid}: no episodes in its payload {payload[:300]}')
+                self.events[gid] = {'payload': payload, 'n': len(eps), 'rows': {}, 't': now}
+                for k, spec in enumerate(eps):
+                    self.to_queue.append((f'{gid}/{k}', spec))
+                self.outstanding += len(eps)
+            self.cv.notify_all()
+        return len(new)
+
+    def resolve_ready(self, drv, limit=None):
+        n = 0
+        while limit is None or n < limit:
+            with self.cv:
+                if not self.ready:
+                    break
+                gid, res, t_ready, t_park = self.ready.popleft()
+            drv.resolve(gid, res)
+            now = time.time()
+            self.lat.append((now - t_park, now - t_ready))
+            n += 1
+        self.resolved_phase += n
+        return n
+
+    # ---- resolver thread
+    def feed(self, drv):
+        with self.cv:
+            items = list(self.to_queue)
+            self.to_queue.clear()
+        for tag, spec in items:
+            drv.enqueue(tag, spec)
+        return len(items)
+
+    def collect(self, drv):
+        rows = drv.take_results()
+        if not rows:
+            return 0
+        done = []
+        with self.cv:
+            for r in rows:
+                tag = r.get('tag')
+                g, _, k = (tag or '').partition('/')
+                ev = self.events.get(int(g)) if g.isdigit() else None
+                if ev is None or not k.isdigit():
+                    raise RuntimeError(f'a resolver result row with an unknown tag {tag!r}: {r}')
+                ev['rows'][int(k)] = r
+                self.outstanding -= 1
+                if len(ev['rows']) == ev['n']:
+                    done.append((int(g), self.events.pop(int(g))))
+            self.done_rows.extend(rows)
+        out = [(g, self.results_of(ev['payload'], [ev['rows'][k] for k in range(ev['n'])]), time.time(), ev['t'])
+               for g, ev in done]
+        if out:
+            with self.cv:
+                self.ready.extend(out)
+                self.cv.notify_all()
+        return len(rows)
+
+    def take_rows(self):
+        with self.cv:
+            rows, self.done_rows = self.done_rows, []
+        return rows
+
+
+def _resolver_loop(co, drv, evs, ext, resume, on_batch):
+    """The resolver thread: play queued episodes until the primary's phase is over (`co.closing`),
+    then end the resolver's phase (games in flight are kept) and drain."""
+    def pump(lb=None):
+        if co.stop:
+            raise _Stop()
+        co.feed(drv)
+        co.collect(drv)
+        if on_batch is not None:
+            on_batch(drv)
+        if co.closing:
+            drv.end_phase()
+    try:
+        if resume is not None:
+            drv.resume(*resume)
+        while True:
+            pump()
+            drive(drv, evs, ext, on_batch=pump)
+            if co.closing:
+                break
+            with co.cv:                            # idle: nothing queued
+                co.cv.wait_for(lambda: co.to_queue or co.closing or co.stop, timeout=0.5)
+        pump()
+    except _Stop:
+        pass
+    except BaseException as e:                     # noqa: BLE001 - re-raised on the main thread
+        co.error = e
+        with co.cv:
+            co.cv.notify_all()
+
+
+def run_pair(co, pdrv, pevs, rdrv, revs, pext=None, rext=None, check=None, quota=None, pending_max=0,
+             on_primary=None, on_resolver=None, resume=None):
+    """Play a primary driver on this thread and a resolver driver on a worker thread through `co`:
+    a rolling primary until `quota` of its games have been resolved in this phase, a finite one
+    until every game finished or was resolved. `resume`: (quota, net) of the resolver's phase."""
+    co.closing = False
+    co.stop = False
+    co.resolved_phase = 0
+    limit = (lambda: max(0, quota - co.resolved_phase)) if quota is not None else (lambda: None)
+    done = (lambda: co.resolved_phase >= quota) if quota is not None else (lambda: False)
+
+    def raise_error():
+        if co.error is not None:
+            raise co.error
+
+    def pump(lb=None):
+        raise_error()
+        co.take_events(pdrv)
+        co.resolve_ready(pdrv, limit())
+        if on_primary is not None:
+            on_primary(pdrv)
+        t0 = time.time()
+        while pending_max and co.outstanding >= pending_max and not done():
+            raise_error()
+            if check is not None:
+                check()
+            with co.cv:
+                co.cv.wait_for(lambda: co.ready or co.error is not None, timeout=0.2)
+            co.resolve_ready(pdrv, limit())
+            if on_primary is not None:
+                on_primary(pdrv)
+        co.waited += time.time() - t0
+
+    th = threading.Thread(target=_resolver_loop, args=(co, rdrv, revs, rext, resume, on_resolver),
+                          name='zero-resolver', daemon=True)
+    th.start()
+    try:
+        drive(pdrv, pevs, pext, check=check, on_batch=pump)
+        if quota is None:                          # a finite primary: wait for the last resolutions
+            while True:
+                pump()
+                if not pdrv.pending:
+                    break
+                if check is not None:
+                    check()
+                with co.cv:
+                    co.cv.wait_for(lambda: co.ready or co.error is not None, timeout=0.5)
+        pump()
+    except BaseException:
+        co.stop = True
+        with co.cv:
+            co.cv.notify_all()
+        th.join()
+        raise
+    with co.cv:
+        co.closing = True
+        co.cv.notify_all()
+    while th.is_alive():
+        th.join(0.5)
+        if check is not None and co.error is None:
+            try:
+                check()
+            except BaseException:
+                co.stop = True
+                th.join()
+                raise
+    raise_error()
+
+
+class PrimaryRun(Run):
+    """The primary network's `Run`: its matches (evaluation, Elo, reference games) are games whose
+    deferred episodes the resolver plays (`CoRun.event_match`)."""
+
+    def __init__(self, run, cfg, pause, co):
+        super().__init__(run, cfg, pause)
+        self.co = co
+
+    def play_match(self, it, opp, n_games, sims, seed, opp_model=None):
+        return self.co.event_match(it, opp, n_games, sims, seed, opp_model)
+
+    def play_matches(self, it, opps, n_games, sims, seed):
+        return {j: self.co.event_match(it, 'nn', n_games, sims, seed + 101 * j, model_path(self.run, j)) for j in opps}
+
+    def bots_match(self, a, b, n_games, seed):
+        return sum(r[0] for r in self.co.event_match(None, b, n_games, None, seed, a=a))
+
+    def evaluate(self, it, m):
+        super().evaluate(it, m)
+        c = self.cfg
+        k = int(c.get('draft_eval_net_every') or 0)
+        if k and it % k == 0 and c['eval_games']:
+            t0 = time.time()
+            m['eval_yard_net'] = summarize(self.co.event_match(it, self.yard, c['eval_games'], c['eval_sims'],
+                                                               seed=7919 * it + 3, play='net'))
+            m['eval_yard_net']['opp'] = self.yard
+            self.log(f'iter {it} vs {self.yard} (episodes by the resolver net): {m["eval_yard_net"]}')
+            m.setdefault('phases', {})['eval_net_s'] = time.time() - t0
+
+
+class CoRun:
+    """A co-training run (module docs). `loop()` replaces `Run.loop` when the setting `resolver` is
+    set."""
+
+    def __init__(self, run, cfg, pause=None):
+        self.run, self.cfg, self.pw = run, cfg, pause
+        if cfg.get('eval_remote'):
+            raise SystemExit('eval_remote is not supported in co-training runs')
+        if len(set(cfg['players'])) != 1:
+            raise SystemExit(f"co-training: one player count for the primary game (players {cfg['players']})")
+        self.rcfg = resolver_config(cfg)
+        if len(set(self.rcfg['players'])) != 1:
+            raise SystemExit(f"co-training: one player count for the resolver game (players {self.rcfg['players']})")
+        self.P = PrimaryRun(run, cfg, pause, self)
+        self.R = Run(os.path.join(run, 'resolver'), self.rcfg, pause)
+        self.R.log = lambda msg: log(run, f'[resolver] {msg}')
+        self.deferred = package.active().deferred_of(cfg['game'])
+        n = cfg['players'][0]
+        self.team = int(G.engine().Game(cfg['game'], G.spec_json(cfg['spec']), n, 0).team_size)
+        if self.team < 1 or n % self.team:
+            raise SystemExit(f"{cfg['game']}: team size {self.team} does not divide {n} players")
+        self.nteams = n // self.team
+        self.sp = None                             # the persistent self-play drivers
+
+    def log(self, msg):
+        log(self.run, msg)
+
+    def check(self, where=''):
+        if self.pw is not None:
+            self.pw.check(where)
+
+    # ---------------------------------------------------------------- checkpoints
+    def latest(self):
+        """The newest iteration with both checkpoints (None: none)."""
+        a, b = latest_iter(self.run), latest_iter(self.R.run)
+        if a is None or b is None:
+            return None
+        k = min(a, b)
+        while k >= 0 and not (os.path.exists(model_path(self.run, k)) and os.path.exists(model_path(self.R.run, k))):
+            k -= 1
+        return k if k >= 0 else None
+
+    def init_resolver(self, path):
+        """The resolver's iteration 0 from a checkpoint (a single-game run's works): widened to the
+        game's features / actions if the game grew; its architecture is the checkpoint's."""
+        info = G.info(self.rcfg['game'])
+        old, extra = load(path, 'cpu')
+        game = old.config.get('game')
+        if game not in (None, self.rcfg['game']):
+            raise SystemExit(f"resolver_init {path}: a {game!r} network, the resolver is {self.rcfg['game']!r}")
+        if old.config['features'] > info['num_features'] or old.config['actions'] > info['num_actions']:
+            raise SystemExit(f"resolver_init {path}: {old.config['features']} features / {old.config['actions']} actions, "
+                             f"the game has {info['num_features']} / {info['num_actions']}")
+        grid = package.active().grids.get(self.rcfg['game']) if old.config.get('arch') == 'grid' else None
+        new = old
+        if old.config['features'] < info['num_features'] or old.config['actions'] < info['num_actions']:
+            new = widen(old, info['num_features'], info['num_actions'], grid=grid)
+        save(new, model_path(self.R.run, 0), {'iter': 0, 'init_from': os.path.abspath(path), 'source_extra': extra})
+        self.log(f'resolver iteration 0 = {path} ({old.config.get("arch", "mlp")}, {old.config["features"]} features, '
+                 f'{old.config["actions"]} actions; extra {json.dumps(extra, default=str)[:200]})')
+
+    # ---------------------------------------------------------------- matches of the primary
+    def event_match(self, it, opp, n_games, sims, seed, opp_model=None, play='bot', a=None):
+        """Primary checkpoint `it` (or the player `a`: a bot or 'ext:<name>') against `opp` ('nn' +
+        opp_model, a bot or 'ext:<name>'), team seats alternating, each game's episodes played by
+        the resolver's yardstick (`play` 'bot') or its network at checkpoint `it` ('net', evaluation
+        settings). -> rows (score, margin, rounds, over) of the first player: its team's outcome, its
+        team's score less the best other team's."""
+        if n_games <= 0:
+            return []
+        P, R, c, rc = self.P, self.R, self.cfg, self.rcfg
+        n, nt = c['players'][0], self.nteams
+        if a is None:
+            sa, evs = P.nn_seat('m', sims), {'m': P.evaluator(model_path(P.run, it))}
+        else:
+            sa, evs = G.seat_dict(a), {}
+        so = P.opp_seat(opp, sims)
+        if opp == 'nn':
+            evs['o'] = P.evaluator(opp_model)
+        pext = {s[4:]: G.external(s[4:], seed) for s in (a, opp) if G.is_external(s)}
+        seats = [[sa if s % nt == g % nt else so for s in range(n)] for g in range(n_games)]
+        pdrv = P.driver(seats, seed=seed, conc=min(c['conc'], n_games), groups=P.match_groups(pext))
+        if play == 'net':
+            rs, revs, rext = R.nn_seat('m', rc['eval_sims']), {'m': R.evaluator(model_path(R.run, it))}, {}
+        else:
+            rs, revs = G.seat_dict(R.yard), {}
+            rext = {R.yard[4:]: G.external(R.yard[4:], seed + 1)} if G.is_external(R.yard) else {}
+        rdrv = R.driver([[rs] * rc['players'][0]], seed=seed + 1, conc=rc['conc'], rolling=True, queue_only=True,
+                        groups=R.match_groups(rext))
+        co = Coordinator(*self.deferred)
+        run_pair(co, pdrv, evs, rdrv, revs, pext=pext, rext=rext, check=lambda: self.check('evaluation'),
+                 resume=(BIG, 0))
+        rows = []
+        for r in sorted(pdrv.take_results(), key=lambda r: r['gid']):
+            me = r['gid'] % nt
+            sc = r['scores']
+            rows.append((sum(r['result'][s] for s in range(n) if s % nt == me),
+                         sc[me] - max(sc[s] for s in range(n) if s % nt != me), r['rounds'], r['over']))
+        return rows
+
+    # ---------------------------------------------------------------- self-play
+    def selfplay(self, it):
+        P, R, c, rc = self.P, self.R, self.cfg, self.rcfg
+        for X in (P, R):
+            d = os.path.join(X.run, 'data', f'iter_{it:04d}')
+            if os.path.exists(d):
+                X.drop_data(d, strict=True)        # an interrupted iteration is replayed
+        t0 = time.time()
+        rconc = c.get('resolver_conc') or rc['conc']
+        pending_max = c.get('pending_max') or 2 * rconc
+        if self.sp is None:
+            pseat = P.nn_seat('m', c['sims'], selfplay=True)
+            rseat = R.nn_seat('m', rc['sims'], selfplay=True)
+            pdrv = P.driver([[pseat] * p for p in c['players']], seed=c['seed'] * 7919 + it, record=True, rolling=True,
+                            net=it - 1)
+            rdrv = R.driver([[rseat] * rc['players'][0]], seed=rc['seed'] * 7919 + it + 104729, record=True,
+                            rolling=True, net=it - 1, conc=rconc, queue_only=True)
+            self.sp = {'p': pdrv, 'r': rdrv, 'pev': P.evaluator(model_path(P.run, it - 1)),
+                       'rev': R.evaluator(model_path(R.run, it - 1)), 'co': Coordinator(*self.deferred)}
+        else:
+            for k, X in (('pev', P), ('rev', R)):
+                m, _ = load(model_path(X.run, it - 1), 'cpu')
+                self.sp[k].set_weights(m.state_dict())
+        sp = self.sp
+        pdrv, rdrv, pev, rev, co = sp['p'], sp['r'], sp['pev'], sp['rev'], sp['co']
+        pst0, rst0 = pdrv.stats(), rdrv.stats()
+        pdrv.resume(c['games'], it - 1)
+        writers, tstats = {}, {}
+        for k, X in (('p', P), ('r', R)):
+            meta = {'game': X.cfg['game'], 'features': X.info['num_features'], 'actions': X.info['num_actions'],
+                    'iter': it, 'net': 'primary' if k == 'p' else 'resolver'}
+            writers[k] = ShardWriter(os.path.join(X.run, 'data', f'iter_{it:04d}'), 'r00', rows=X.cfg['shard_rows'],
+                                     meta=meta, bad_dir=X.debug_dir())
+            tstats[k] = TargetStats()
+        events = []
+        state = {'t': 0.0, 'parked_max': 0, 'tr': 0.0}
+        prog = os.path.join(self.run, 'progress.json')
+        co.take_rows()
+        co.lat = []
+        co.waited = 0.0
+
+        def add(k, s):
+            try:
+                writers[k].add(s)
+            except NonFinite as e:
+                raise NonFinite(f'{self.label(k)}: {e}') from e
+            tstats[k].add(s)
+
+        def on_primary(drv):
+            add('p', drv.take_samples())
+            events.extend(drv.take_results())
+            now = time.time()
+            if now - state['t'] > 2:
+                state['t'] = now
+                st = drv.stats()
+                state['parked_max'] = max(state['parked_max'], st['parked_bytes'])
+                r = co.snapshot
+                _write_json(prog, {'iter': it, 'phase': 'selfplay', 'events_resolved': len(events), 'target': c['games'],
+                                   'games': len(events), 'drafting': drv.in_flight()['games'], 'pending_events': st['parked'],
+                                   'matches_queued': r.get('queued', 0) + len(co.to_queue),
+                                   'matches_in_flight': r.get('in_flight', 0), 'matches_done': r.get('done', 0),
+                                   'time': now})
+
+        def on_resolver(drv):
+            add('r', drv.take_samples())
+            now = time.time()
+            if now - state['tr'] > 0.5:
+                state['tr'] = now
+                st = drv.stats()
+                co.snapshot = {'queued': st['queued'], 'in_flight': drv.in_flight()['games'],
+                               'done': st['games_finished'] - rst0['games_finished']}
+
+        run_pair(co, pdrv, {'m': pev}, rdrv, {'m': rev}, check=lambda: self.check('self-play'), quota=c['games'],
+                 pending_max=pending_max, on_primary=on_primary, on_resolver=on_resolver, resume=(BIG, it - 1))
+        on_primary(pdrv)
+        add('r', rdrv.take_samples())
+        matches = co.take_rows()
+        ws = {}
+        for k in ('p', 'r'):
+            try:
+                ws[k] = writers[k].close()
+            except NonFinite as e:
+                raise NonFinite(f'{self.label(k)}: {e}') from e
+        _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
+        secs = time.time() - t0
+        pst, rst = pdrv.stats(), rdrv.stats()
+        lat = np.array(co.lat) if co.lat else np.zeros((0, 2))
+
+        def summary(rows, st, st0, ev, w, ts, X):
+            fin = [r for r in rows if r['over']]
+            leaves = st['leaves'] - st0['leaves']
+            out = {'games': len(rows), 'unfinished': len(rows) - len(fin), 'samples': w['samples'], 'shards': w['shards'],
+                   'bytes': w['bytes'], 'decisions_per_game': sum(r['decisions'] for r in rows) / max(1, len(rows)),
+                   'steps_per_game': sum(r['steps'] for r in rows) / max(1, len(rows)),
+                   'rounds': sum(r['rounds'] for r in fin) / max(1, len(fin)),
+                   'avg_score': sum(sum(r['scores']) / r['n'] for r in fin) / max(1, len(fin)),
+                   'leaves': leaves, 'leaves_per_s': leaves / max(secs, 1e-9),
+                   'games_per_h': len(rows) / max(secs, 1e-9) * 3600, 'seconds': secs,
+                   'infer_s': ev.seconds, 'avg_batch': ev.leaves / max(1, ev.calls),
+                   'minor_per_game': (st.get('minor', 0) - st0.get('minor', 0)) / max(1, len(rows)),
+                   'target': ts.summary(X.cfg.get('policy_target', 'visits')),
+                   'rolling': {'in_flight': 0, 'restarts': st['restarts'] - st0['restarts'],
+                               'restart_sims': st['restart_sims'] - st0['restart_sims'],
+                               'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves']}}
+            ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
+            return out
+        mp = summary(events, pst, pst0, pev, ws['p'], tstats['p'], P)
+        mr = summary(matches, rst, rst0, rev, ws['r'], tstats['r'], R)
+        mp['rolling']['in_flight'] = pdrv.in_flight()['games']
+        mr['rolling']['in_flight'] = rdrv.in_flight()['games']
+        mp['cotrain'] = {'events': len(events), 'episodes': len(matches), 'episodes_per_h': len(matches) / max(secs, 1e-9) * 3600,
+                         'pending_events': pst['parked'], 'episodes_queued': rst['queued'] + len(co.to_queue),
+                         'episodes_waiting': co.outstanding,
+                         'parked_mb_max': round(max(state['parked_max'], pst['parked_bytes']) / 1e6, 3),
+                         'event_latency_s': [round(float(lat[:, 0].mean()), 3), round(float(lat[:, 0].max()), 3)] if len(lat) else None,
+                         'resolve_delay_ms': [round(float(lat[:, 1].mean()) * 1e3, 2), round(float(lat[:, 1].max()) * 1e3, 2)] if len(lat) else None,
+                         'backpressure_s': round(co.waited, 2), 'pending_max': pending_max, 'resolver_conc': rconc}
+        return mp, mr
+
+    def label(self, k):
+        return f"primary net ({self.cfg['game']})" if k == 'p' else f"resolver net ({self.rcfg['game']})"
+
+    # ---------------------------------------------------------------- training
+    def train(self, it, sp_p, sp_r):
+        """Both networks, then the guard on both checkpoints and optimizer states, then both saves."""
+        out = {}
+        for k, X, n in (('p', self.P, sp_p['samples']), ('r', self.R, sp_r['samples'])):
+            try:
+                out[k] = X.train_model(it, n)
+            except NonFinite as e:
+                raise NonFinite(f'{self.label(k)}: {e}') from e
+        for k, X in (('p', self.P), ('r', self.R)):
+            model, ost, _ = out[k]
+            try:
+                check_state(ost, X.opt_path())
+                check_state(model.state_dict(), model_path(X.run, it))
+            except NonFinite as e:
+                raise NonFinite(f'{self.label(k)}: {e}') from e
+        self.R.save_trained(it, out['r'][0], out['r'][1])
+        self.P.save_trained(it, out['p'][0], out['p'][1])
+        return out['p'][2](), out['r'][2]()
+
+    # ---------------------------------------------------------------- the loop
+    def finish_iter(self, it, t0):
+        """Both checkpoints exist: the resolver's evaluation (a single-game run's), then the
+        primary's (its matches need the resolver's checkpoint), each from its partial stats."""
+        for X in (self.R, self.P):
+            if it in {m['iter'] for m in read_metrics(X.run)}:
+                continue
+            m = {'iter': it}
+            if os.path.exists(X.partial_path(it)):
+                with open(X.partial_path(it)) as f:
+                    m = json.load(f)
+            X.finish_iter(it, m, t0)
+
+    def loop(self):
+        c, rc, run = self.cfg, self.rcfg, self.run
+        P, R = self.P, self.R
+        os.makedirs(os.path.join(R.run, 'models'), exist_ok=True)
+        with open(os.path.join(R.run, 'config.json'), 'w') as f:
+            json.dump(rc, f, indent=1)
+        start = self.latest()
+        if start is None:
+            save(P.new_model(), model_path(run, 0), {'iter': 0})
+            if c.get('resolver_init'):
+                self.init_resolver(c['resolver_init'])
+            else:
+                save(R.new_model(), model_path(R.run, 0), {'iter': 0})
+            start = 0
+        self.log(f'co-training run {run} starting after iter {start}: primary {c["game"]} (team size {self.team}), '
+                 f'resolver {rc["game"]}; resolver cfg {json.dumps(rc)}')
+        if any(start not in {m['iter'] for m in read_metrics(X.run)} for X in (P, R)):
+            if os.path.exists(P.partial_path(start)) or os.path.exists(R.partial_path(start)):
+                self.log(f'iter {start}: finishing its evaluations (interrupted)')
+            self.finish_iter(start, time.time())
+        stop = os.path.join(run, 'STOP')
+        for it in range(start + 1, c['iters'] + 1):
+            self.check('between iterations')
+            if os.path.exists(stop):
+                self.log('STOP file found; exiting')
+                break
+            t0 = time.time()
+            sp_p, sp_r = self.selfplay(it)
+            self.log(f'iter {it} selfplay: {_fmt(sp_p)}')
+            self.log(f'[resolver] iter {it} selfplay: {_fmt(sp_r)}')
+            t1 = time.time()
+            tr_p, tr_r = self.train(it, sp_p, sp_r)
+            self.log(f'iter {it} train: {_fmt(tr_p)}')
+            self.log(f'[resolver] iter {it} train: {_fmt(tr_r)}')
+            t2 = time.time()
+            for X, sp, tr in ((P, sp_p, tr_p), (R, sp_r, tr_r)):
+                m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': t1 - t0, 'train_s': t2 - t1},
+                     'resumed_seconds': time.time() - t0}
+                _write_json(X.partial_path(it), m)
+            self.finish_iter(it, time.time())
+        _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})

@@ -10,7 +10,9 @@
       checkpoints <= K that its Elo matches need, the optimizer state when it belongs to K, the
       window's sample shards (hard links on the same volume, --copy to copy), Elo results,
       metrics up to K and the source's config.json with the --set overrides. The source is only
-      read. Then: python tools/supervise.py runs/b (the run resumes after K).
+      read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
+      (setting `resolver`, docs/az.md 11) is copied with its resolver network: the same of
+      <source>/resolver/ into <dest>/resolver/ (K: an iteration where both have a checkpoint).
 """
 import argparse
 import glob
@@ -55,8 +57,7 @@ def _link(src, dst, copy):
 
 
 def continuation(source, dest, it=None, overrides=None, copy=False):
-    from .. import elo
-    from ..run import DEFAULTS, latest_iter, model_path, read_metrics, window_iters
+    from ..run import DEFAULTS, latest_iter, model_path
     if os.path.exists(os.path.join(dest, 'config.json')):
         raise SystemExit(f'{dest} already holds a run')
     with open(os.path.join(source, 'config.json')) as f:
@@ -64,9 +65,39 @@ def continuation(source, dest, it=None, overrides=None, copy=False):
     for k in overrides or {}:
         if k not in DEFAULTS:
             raise SystemExit(f'--set {k}: unknown setting')
-    it = latest_iter(source) if it is None else it
+    co = bool(cfg.get('resolver'))
+    rsrc = os.path.join(source, 'resolver')
+    if it is None:
+        it = latest_iter(source)
+        if co and it is not None:
+            r = latest_iter(rsrc)
+            it = min(it, r) if r is not None else None
     if it is None or not os.path.exists(model_path(source, it)):
         raise SystemExit(f'{source}: no checkpoint {it}')
+    if co:
+        if not os.path.exists(model_path(rsrc, it)):
+            raise SystemExit(f'{rsrc}: no checkpoint {it} (a co-training run forks where both networks have one)')
+        rcfg = cfg
+        if os.path.exists(os.path.join(rsrc, 'config.json')):
+            with open(os.path.join(rsrc, 'config.json')) as f:
+                rcfg = json.load(f)
+        _copy_run(rsrc, os.path.join(dest, 'resolver'), it, rcfg, copy)
+        if os.path.exists(os.path.join(rsrc, 'config.json')):
+            shutil.copy2(os.path.join(rsrc, 'config.json'), os.path.join(dest, 'resolver', 'config.json'))
+    need, dirs, rows = _copy_run(source, dest, it, cfg, copy)
+    cfg.update(overrides or {})
+    with open(os.path.join(dest, 'config.json'), 'w') as f:
+        json.dump(cfg, f, indent=1)
+    print(f'{source} @ iter {it} -> {dest}: {len(need)} checkpoints, {len(dirs)} data iterations, {len(rows)} metrics rows'
+          + (' (and its resolver network)' if co else ''))
+    print(f'next: python tools/supervise.py {dest}   (resumes after iteration {it})')
+
+
+def _copy_run(source, dest, it, cfg, copy):
+    """Checkpoint `it` and those its Elo matches need, its optimizer state, the window's shards,
+    Elo results, metrics up to `it` -> (checkpoints, data dirs, metrics rows)."""
+    from .. import elo
+    from ..run import model_path, read_metrics, window_iters
     e = max(1, int(cfg.get('eval_every', 1)))
     need = {it} | {it - off * e for off in elo.OFFSETS if it - off * e >= 0}
     for j in sorted(need):
@@ -92,11 +123,7 @@ def continuation(source, dest, it=None, overrides=None, copy=False):
     with open(os.path.join(dest, 'metrics.jsonl'), 'w', encoding='utf-8') as f:
         for m in rows:
             f.write(json.dumps(m) + '\n')
-    cfg.update(overrides or {})
-    with open(os.path.join(dest, 'config.json'), 'w') as f:
-        json.dump(cfg, f, indent=1)
-    print(f'{source} @ iter {it} -> {dest}: {len(need)} checkpoints, {len(dirs)} data iterations, {len(rows)} metrics rows')
-    print(f'next: python tools/supervise.py {dest}   (resumes after iteration {it})')
+    return need, dirs, rows
 
 
 def main(argv=None):

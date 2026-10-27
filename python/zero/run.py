@@ -19,6 +19,10 @@ with status 75; tools/supervise.py relaunches the run when PAUSE is removed.
 
 --rolling 1: one persistent driver keeps --conc games in flight across iterations; an
 iteration's self-play ends when --games games have FINISHED (docs/search.md 2.6).
+
+--resolver <game>: a co-training run (zero/cotrain.py, docs/az.md 11): this run's game ends at
+deferred terminals whose results come from episodes of the resolver game, played by a second
+network trained in the same run (<run>/resolver/); --resolver-cfg holds its settings.
 """
 import argparse
 import glob
@@ -105,6 +109,16 @@ DEFAULTS = dict(
     # network batches evaluated concurrently on this many Python threads (CPU: small networks
     # whose ops cannot keep the cores busy; give the driver as many `groups`); 1 = inline
     infer_workers=1,
+    # co-training (zero/cotrain.py, docs/az.md 11): the resolver game whose episodes decide this
+    # game's deferred terminals ('' = a single-game run: the loop of this module), its settings
+    # (a dict of these same settings - game, spec, network, search, training, evaluation; 'preset'
+    # names one - saved nested in config.json), the checkpoint its network starts from ('' =
+    # fresh; a single-game run's checkpoint works), its episodes in flight in self-play (0 = its
+    # `conc`), the backpressure (resolver episodes queued or playing at which this game's
+    # self-play waits; 0 = 2 x in flight), and how often this game's evaluation also plays its
+    # episodes with the resolver's network (evaluated iterations that are multiples of it; the
+    # others play them with the resolver's yardstick; 0 = never)
+    resolver='', resolver_cfg={}, resolver_init='', resolver_conc=0, pending_max=0, draft_eval_net_every=4,
 )
 
 PRESETS = {
@@ -118,6 +132,14 @@ PRESETS = {
                   hidden=128, blocks=3, batch=512, reuse=4.0, lr=1e-3, lr_warmup_steps=100,
                   window=6, window_grow=1, min_window_samples=10_000, yardstick='ext:toyheur',
                   eval_games=400, eval_sims=32, eval_random_games=100, elo_games=100, ref_games=1000, threads=4),
+    # co-training on the toys (docs/az.md 11): 2v2 toy_team events (games = events resolved per
+    # iteration) whose four matches are toy games played by the toy network, both trained here
+    'toy-cotrain-smoke': dict(game='toy_team', players=[4], yardstick='greedy', iters=2, games=8, conc=16, sims=8,
+                              sims_fast=4, hidden=32, blocks=1, batch=64, eval_games=8, eval_sims=4,
+                              eval_random_games=4, elo_games=4, ref_games=8, min_window_samples=0, threads=2,
+                              min_steps=10, lr_warmup_steps=0, resolver='toy', resolver_conc=16,
+                              resolver_cfg={'preset': 'toy-smoke', 'yardstick': 'heuristic', 'conc': 16,
+                                            'eval_games': 8, 'eval_random_games': 4, 'elo_games': 4, 'ref_games': 8}),
 }
 # The core's toy presets; a game package adds its own (GamePackage.presets: caverna-smoke /
 # caverna-2p / caverna-2p-cq, glassroad-smoke / glassroad-2p / glassroad-2p-cq) and may override
@@ -255,13 +277,15 @@ class Run:
                              sims_minor=c.get('sims_minor', 0) or None)
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']))
 
-    def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None):
-        """A driver for self-play (`record`: the run's spec) or a match (eval_spec, if set)."""
+    def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None, queue_only=False):
+        """A driver for self-play (`record`: the run's spec) or a match (eval_spec, if set).
+        `queue_only`: a rolling driver that plays only queued setups (co-training)."""
         c = self.cfg
         spec = c['spec'] if record else (c.get('eval_spec') or package.active().eval_spec_of(c['game'], c['spec']))
+        kw = {'queue_only': True} if queue_only else {}
         return G.Driver(c['game'], seats, spec=spec, concurrency=conc or c['conc'], seed=seed, record=record,
                         threads=c['threads'], groups=groups or c['groups'], max_steps=c['max_steps'], rolling=rolling,
-                        net=net)
+                        net=net, **kw)
 
     def match_groups(self, ext):
         return self.cfg.get('ext_groups', DEFAULTS['ext_groups']) if ext else None
@@ -357,6 +381,14 @@ class Run:
         return out
 
     def train(self, it, new_samples):
+        """Train checkpoint it - 1 on the window into checkpoint it (and the optimizer state)."""
+        model, ost, stats = self.train_model(it, new_samples)
+        self.save_trained(it, model, ost)
+        return stats()
+
+    def train_model(self, it, new_samples):
+        """`train` without saving -> (model, optimizer state, stats(): the metrics dict, timed when
+        called). Co-training trains both networks before either is saved (zero/cotrain.py)."""
         c = self.cfg
         dev = c['train_device']
         if dev == 'cuda' and not torch.cuda.is_available():
@@ -431,15 +463,25 @@ class Run:
                 acc['value_acc'] += vacc.item() / last
         model.eval()
         ost = opt.state_dict()
+
+        def stats():
+            secs = time.time() - t0
+            return dict({k: round(v, 5) for k, v in acc.items()}, steps=steps, window_samples=W.N, window_loaded=W.loaded,
+                        window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
+                        value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
+        return model, ost, stats
+
+    def opt_path(self):
+        return os.path.join(self.run, 'models', 'opt_latest.pt')
+
+    def save_trained(self, it, model, ost):
+        """Checkpoint `it` and the optimizer state (atomic; NonFinite before either is written)."""
+        opt_path = self.opt_path()
         check_state(ost, opt_path)                 # NonFinite before either file is written
         save(model, model_path(self.run, it), {'iter': it})
         tmp = opt_path + '.tmp'
         torch.save({'iter': it, 'state': ost}, tmp)
         os.replace(tmp, opt_path)
-        secs = time.time() - t0
-        return dict({k: round(v, 5) for k, v in acc.items()}, steps=steps, window_samples=W.N, window_loaded=W.loaded,
-                    window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
-                    value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
 
     def debug_dir(self):
         return os.path.join(self.run, 'debug')
@@ -713,6 +755,8 @@ def parse(argv=None):
         flag = '--' + k.replace('_', '-')
         if isinstance(v, list):
             ap.add_argument(flag, type=int, nargs='+', default=None)
+        elif isinstance(v, dict):
+            ap.add_argument(flag, type=json.loads, default=None, help='JSON object')
         elif isinstance(v, bool):
             ap.add_argument(flag, type=int, default=None)
         else:
@@ -763,7 +807,11 @@ def main(argv=None):
         log(run, f'PAUSE file noticed ({pw.seen - pw.requested:.1f}s after it was created): stopping at the next '
                  f'pause point')
     pw = runctl.PauseWatch(run, on_pause=on_pause)
-    R = Run(run, cfg, pw)
+    if cfg.get('resolver'):
+        from .cotrain import CoRun
+        R = CoRun(run, cfg, pw)
+    else:
+        R = Run(run, cfg, pw)
     try:
         R.loop()
     except Paused as e:
