@@ -34,7 +34,8 @@ import torch
 import torch.nn.functional as F
 
 from . import elo, games as G, package, runctl
-from .data import ShardWriter, TargetStats, Window, shard_paths
+from .data import BAD, ShardWriter, TargetStats, Window, shard_paths
+from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
 from .net import load, make_net, save
 from .protocol import MAX_SEATS
@@ -270,7 +271,7 @@ class Run:
         c = self.cfg
         d = os.path.join(self.run, 'data', f'iter_{it:04d}')
         if os.path.exists(d):
-            shutil.rmtree(d)                       # an interrupted iteration is replayed
+            self.drop_data(d, strict=True)         # an interrupted iteration is replayed
         t0 = time.time()
         seat = self.nn_seat('m', c['sims'], selfplay=True)
         rng = np.random.default_rng(c['seed'] * 1_000_003 + it)
@@ -293,7 +294,7 @@ class Run:
             ev = self.evaluator(model_path(self.run, it - 1))
             st0 = None
             prefix = 'c00'
-        writer = ShardWriter(d, prefix, rows=c['shard_rows'], meta=meta)
+        writer = ShardWriter(d, prefix, rows=c['shard_rows'], meta=meta, bad_dir=self.debug_dir())
         results = []
         state = {'n': 0, 't': time.time()}
         prog = os.path.join(self.run, 'progress.json')
@@ -394,7 +395,8 @@ class Run:
             g_lr = lr * min(1.0, (step + 1) / c['lr_warmup_steps']) if fresh and c['lr_warmup_steps'] else lr
             for g in opt.param_groups:
                 g['lr'] = g_lr
-            b = W.batch(rng.integers(W.N, size=c['batch']), dev)
+            idx = rng.integers(W.N, size=c['batch'])
+            b = W.batch(idx, dev)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
                 plog, vlog, mp = model(b['x'], b['n_players'])
             plog, vlog, mp = plog.float(), vlog.float(), mp.float()
@@ -407,7 +409,15 @@ class Run:
             loss = lp + lv + mw * lm
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            # the non-finite guard (docs/az.md 4.1): one device sync per step, before the step
+            if not bool(torch.isfinite(torch.stack([lp.detach(), lv.detach(), lm.detach(), gnorm.float()])).all()):
+                with torch.no_grad():
+                    per = {'policy': -(b['pi'] * logp).sum(1),
+                           'value': -(zt * F.log_softmax(vlog, dim=1).clamp(min=-1e4)).sum(1),
+                           'margin': (((mp - b['sc'][:, :S]) ** 2) * present).sum(1) / 2}
+                self.nonfinite_step(it, step, steps, b, idx, W, model, {'policy': lp, 'value': lv, 'margin': lm},
+                                    gnorm, per, dict(lr=g_lr, value_q=vq, margin_loss_w=mw, amp=amp, device=dev))
             opt.step()
             if step >= steps - last:
                 with torch.no_grad():
@@ -420,14 +430,61 @@ class Run:
                 acc['entropy'] += ent.item() / last
                 acc['value_acc'] += vacc.item() / last
         model.eval()
+        ost = opt.state_dict()
+        check_state(ost, opt_path)                 # NonFinite before either file is written
         save(model, model_path(self.run, it), {'iter': it})
         tmp = opt_path + '.tmp'
-        torch.save({'iter': it, 'state': opt.state_dict()}, tmp)
+        torch.save({'iter': it, 'state': ost}, tmp)
         os.replace(tmp, opt_path)
         secs = time.time() - t0
         return dict({k: round(v, 5) for k, v in acc.items()}, steps=steps, window_samples=W.N, window_loaded=W.loaded,
                     window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
                     value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
+
+    def debug_dir(self):
+        return os.path.join(self.run, 'debug')
+
+    def nonfinite_step(self, it, step, steps, b, idx, W, model, terms, gnorm, per, info):
+        """Training step `step` of iteration `it` produced a NaN / inf loss term or gradient norm:
+        save the batch (the tensors fed to the model, where its rows came from, the per-sample
+        losses, the weights before the step) to <run>/debug/nonfinite_iter_NNNN_step_SSSS.pt and
+        raise NonFinite before optimizer.step()."""
+        terms = {k: float(v) for k, v in terms.items()}
+        gn = float(gnorm)
+        bad = [k for k, v in terms.items() if not math.isfinite(v)] + ([] if math.isfinite(gn) else ['grad_norm'])
+        per = {k: v.detach().float().cpu() for k, v in per.items()}
+        rows = np.flatnonzero(~torch.isfinite(torch.stack(list(per.values()))).all(0).numpy())
+        ins = [k for k in ('x', 'pi', 'z', 'q', 'sc') if not bool(torch.isfinite(b[k]).all())]
+        wbad = [n for n, t in model.state_dict().items() if t.is_floating_point() and not bool(torch.isfinite(t).all())]
+        src = W.provenance(idx[rows] if len(rows) else idx)
+        prov = '; '.join(f'{os.path.relpath(p, self.run)} rows {head(r, 8)}' for p, r in src[:6])
+        if len(src) > 6:
+            prov += f'; ... (+{len(src) - 6} more shards)'
+        path = os.path.join(self.debug_dir(), f'nonfinite_iter_{it:04d}_step_{step + 1:04d}.pt')
+        os.makedirs(self.debug_dir(), exist_ok=True)
+        tmp = path + f'.{os.getpid()}.tmp'
+        torch.save({'iter': it, 'step': step + 1, 'steps': steps, 'terms': terms, 'grad_norm': gn, 'nonfinite': bad,
+                    'batch': {k: v.detach().cpu() for k, v in b.items()}, 'window_rows': idx, 'shards': W.paths,
+                    'shard_of_row': np.searchsorted(W.starts, idx, side='right') - 1, 'row_in_shard': W.src_row[idx],
+                    'bad_batch_rows': rows, 'per_sample': per, 'model_config': model.config,
+                    'model_state': {k: v.detach().cpu() for k, v in model.state_dict().items()}, **info}, tmp)
+        os.replace(tmp, path)
+        what = (f'{len(rows)} of {len(idx)} batch rows have a non-finite per-sample loss, from: {prov}' if len(rows)
+                else f'every per-sample loss is finite (the gradient is not); the batch came from: {prov}')
+        raise NonFinite(
+            f'iter {it} training step {step + 1} of {steps}: non-finite {", ".join(bad)} before optimizer.step() '
+            f'(policy {terms["policy"]:.5g}, value {terms["value"]:.5g}, margin {terms["margin"]:.5g}, '
+            f'grad norm {gn:.5g}); batch inputs {"non-finite: " + ", ".join(ins) if ins else "finite"}; weights '
+            f'{"non-finite: " + head(wbad, 6) if wbad else "finite"}; {what}. Batch, per-sample losses and '
+            f'weights saved to {path}')
+
+    def drop_data(self, d, strict=False):
+        """Delete data directory `d`, keeping any quarantined shard in it (*.bad.npz, moved to
+        <run>/debug/)."""
+        for p in glob.glob(os.path.join(d, '*' + BAD)):
+            os.makedirs(self.debug_dir(), exist_ok=True)
+            os.replace(p, os.path.join(self.debug_dir(), f'{os.path.basename(d)}_{os.path.basename(p)}'))
+        shutil.rmtree(d, ignore_errors=not strict)
 
     # ---------------------------------------------------------------- evaluation
     def opp_seat(self, opp, sims):
@@ -587,7 +644,7 @@ class Run:
     def prune(self, it):
         for d in glob.glob(os.path.join(self.run, 'data', 'iter_*')):
             if int(os.path.basename(d)[5:9]) <= it - self.cfg['keep_data']:
-                shutil.rmtree(d, ignore_errors=True)
+                self.drop_data(d)                  # never <run>/debug/ (quarantined shards, debug batches)
 
     def loop(self):
         c = self.cfg
