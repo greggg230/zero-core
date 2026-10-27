@@ -20,6 +20,14 @@
 //!
 //! Policy targets of recorded decisions (`driver::PolicyTarget`): the root visit distribution,
 //! or the completed-Q target of Gumbel AlphaZero (`completed_q_policy`, `Tree::cq_target`).
+//!
+//! **Deferred terminals** (`SearchGame::deferred`, docs/search.md 3.2): a walk that ends the
+//! game at a deferred terminal reaches a child node of no options decided by the tree's viewer
+//! (keyed like any child: chance key, viewer, no actions). Unexpanded, it is a leaf the network
+//! evaluates (`encode(viewer)`, no priors); `expand_leaf` stores its utility in `vec` and its win
+//! vector in `wsum` (`tot` = 1), and every later walk that reaches it backs that value up
+//! again. `result()` is never called there. **Teams** (`SearchGame::team_size` = T, `Tree::team`):
+//! utilities are `T x win[seat]` (+ the margin term), win vectors stay as `result()` (sum 1).
 use std::hash::{Hash, Hasher};
 
 use crate::game::{SearchGame, MAX_SEATS};
@@ -71,9 +79,12 @@ struct Node {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sim {
     /// The walk reached an unexpanded node: the scratch game holds the leaf state; the caller
-    /// evaluates `encode(player)` and calls `expand` + `backup`.
+    /// evaluates `encode(player)` and calls `expand_leaf` + `backup` with `leaf_values_team`
+    /// (`expand` + `leaf_values` for a game without teams or deferred terminals). A deferred
+    /// terminal's node has no options (no priors).
     Leaf { node: u32, player: usize },
-    /// The walk ended the game; the result was backed up.
+    /// The walk ended the game (or reached an evaluated deferred terminal); its value was
+    /// backed up.
     Terminal,
 }
 
@@ -138,15 +149,25 @@ pub fn transition<G: SearchGame>(g: &mut G, a: u16, forced: Option<&[u64]>, key:
     transition_with(g, a, forced, key, legal, |_| true)
 }
 
-/// Network output (relative to the decider) -> (util, win) over absolute seats.
+/// Network output (relative to the decider) -> (util, win) over absolute seats (a game of
+/// single-seat teams: `leaf_values_team` with team 1).
 pub fn leaf_values(value_rel: &[f32], margin_rel: &[f32], player: usize, n: usize, margin_w: f64) -> ([f64; MAX_SEATS], [f64; MAX_SEATS]) {
+    leaf_values_team(value_rel, margin_rel, player, n, margin_w, 1)
+}
+
+/// Network output (relative to the decider) -> (util, win) over absolute seats, for teams of
+/// `team` seats (`SearchGame::team_size`): util = team x win (+ margin_w tanh(margin)), win =
+/// the network's value (sums to 1). Team 1 is `leaf_values` bit for bit.
+pub fn leaf_values_team(value_rel: &[f32], margin_rel: &[f32], player: usize, n: usize, margin_w: f64, team: usize) -> ([f64; MAX_SEATS], [f64; MAX_SEATS]) {
+    let t = team.max(1) as f64;
     let mut win = [0.0; MAX_SEATS];
     let mut util = [0.0; MAX_SEATS];
     for j in 0..n {
         let s = (player + j) % n;
         let w = value_rel[j] as f64;
         win[s] = w;
-        util[s] = if margin_w != 0.0 { w + margin_w * (margin_rel[j] as f64).tanh() } else { w };
+        let tw = t * w;
+        util[s] = if margin_w != 0.0 { tw + margin_w * (margin_rel[j] as f64).tanh() } else { tw };
     }
     (util, win)
 }
@@ -201,20 +222,21 @@ pub fn completed_q_policy(p0: &[f32], n: &[u32], w: &[f64], v: f64, c_visit: f64
     lg.iter().map(|&x| (x / s) as f32).collect()
 }
 
-/// (util, win) of a finished game.
+/// (util, win) of a finished game (util = team_size x win (+ margin_w tanh(margin))).
 pub fn terminal_values<G: SearchGame>(g: &G, margin_w: f64) -> ([f64; MAX_SEATS], [f64; MAX_SEATS]) {
     let r = g.result();
     let n = g.num_players();
+    let t = g.team_size().max(1) as f64;
     let mut win = [0.0; MAX_SEATS];
     for i in 0..n {
         win[i] = r[i] as f64;
     }
-    if margin_w == 0.0 {
+    if margin_w == 0.0 && t == 1.0 {
         return (win, win);
     }
     let mut util = [0.0; MAX_SEATS];
     for i in 0..n {
-        util[i] = win[i] + margin_w * (g.margin(i) as f64).tanh();
+        util[i] = if margin_w != 0.0 { t * win[i] + margin_w * (g.margin(i) as f64).tanh() } else { t * win[i] };
     }
     (util, win)
 }
@@ -226,6 +248,8 @@ pub struct Tree<G: SearchGame> {
     pub redet: bool,
     /// Players in the game.
     pub n: usize,
+    /// Seats per team (`SearchGame::team_size`): utilities are team x win.
+    pub team: usize,
     pub root: u32,
     nodes: Vec<Node>,
     stats: Vec<Stat>,
@@ -238,7 +262,7 @@ pub struct Tree<G: SearchGame> {
 
 impl<G: SearchGame> Default for Tree<G> {
     fn default() -> Self {
-        Tree { viewer: 0, redet: true, n: 0, root: 0, nodes: Vec::new(), stats: Vec::new(), acts: Vec::new(), keys: Vec::new(), outs: Vec::new(), base: None }
+        Tree { viewer: 0, redet: true, n: 0, team: 1, root: 0, nodes: Vec::new(), stats: Vec::new(), acts: Vec::new(), keys: Vec::new(), outs: Vec::new(), base: None }
     }
 }
 
@@ -255,6 +279,7 @@ impl<G: SearchGame> Tree<G> {
         self.viewer = viewer;
         self.redet = redet;
         self.n = game.num_players();
+        self.team = game.team_size().max(1);
         self.nodes.clear();
         self.stats.clear();
         self.acts.clear();
@@ -533,6 +558,28 @@ impl<G: SearchGame> Tree<G> {
                 s.nouts += 1;
             }
             let Some(p) = g.to_move() else {
+                if g.deferred() {
+                    // a deferred terminal: a no-option node of the viewer, evaluated once by the
+                    // network, its stored value backed up on every later visit (module docs)
+                    let v = self.viewer;
+                    let h = sig_hash(&sc.key, v, &[]);
+                    let k = match self.find_kid(node, i, &sc.key, v, &[], h) {
+                        Some(k) => k,
+                        None => {
+                            let k = self.push_node(&sc.key, v, &[], h);
+                            self.nodes[k as usize].next = self.stats[si].kid;
+                            self.stats[si].kid = k;
+                            k
+                        }
+                    };
+                    if !self.expanded(k) {
+                        return Ok(Sim::Leaf { node: k, player: v });
+                    }
+                    let nd = &self.nodes[k as usize];
+                    let (util, win) = (nd.vec, nd.wsum);
+                    self.backup(&sc.path, &util, &win);
+                    return Ok(Sim::Terminal);
+                }
                 let (util, win) = terminal_values(g, w.margin_w);
                 self.backup(&sc.path, &util, &win);
                 return Ok(Sim::Terminal);
@@ -563,6 +610,22 @@ impl<G: SearchGame> Tree<G> {
         nd.stat_off = off;
         nd.vec = *util;
         nd.wsum = [0.0; MAX_SEATS];
+    }
+
+    /// `expand` that also keeps the leaf's win vector: a deferred terminal's node (no options)
+    /// stores it (`wsum`, `tot` = 1) to back it up on later visits (module docs).
+    pub fn expand_leaf(&mut self, node: u32, priors: &[f32], util: &[f64; MAX_SEATS], win: &[f64; MAX_SEATS]) {
+        self.expand(node, priors, util);
+        let nd = &mut self.nodes[node as usize];
+        if nd.nacts == 0 {
+            nd.wsum = *win;
+            nd.tot = 1;
+        }
+    }
+
+    /// The node is a deferred terminal's (no options).
+    pub fn is_deferred_leaf(&self, node: u32) -> bool {
+        self.nodes[node as usize].nacts == 0
     }
 
     /// N_i += 1, W_i += util[decider], tot += 1, wsum += win along the path.
@@ -617,7 +680,7 @@ impl<G: SearchGame> Tree<G> {
 
     /// Copy the subtree under `root` into fresh arrays (drops the garbage above it).
     pub fn compact(&mut self) {
-        let mut t: Tree<G> = Tree { viewer: self.viewer, redet: self.redet, n: self.n, root: 0, base: self.base.take(), ..Default::default() };
+        let mut t: Tree<G> = Tree { viewer: self.viewer, redet: self.redet, n: self.n, team: self.team, root: 0, base: self.base.take(), ..Default::default() };
         let mut map = std::collections::HashMap::new();
         let mut order = vec![self.root];
         let mut k = 0;

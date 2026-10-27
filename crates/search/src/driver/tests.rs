@@ -26,6 +26,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         max_steps: 10_000,
         rolling: false,
         net: 0,
+        queue_only: false,
     }
 }
 
@@ -506,4 +507,197 @@ fn a_panicking_game_fails_the_run_instead_of_hanging_it() {
         let want = format!("game {PANIC_GID} (driver seed {PANIC_SEED}): search worker panicked: toy engine bug at step {PANIC_STEP}");
         assert!(e.contains(&want), "groups {groups}, sleep {sleep_ms}, delay {answer_ms}: {e}");
     }
+}
+
+// ------------------------------------------------------------------ deferred results, queued setups
+
+use crate::toy_team::ToyTeam;
+
+#[test]
+fn f16_round_trip_and_rounding() {
+    // every finite half value survives f16 -> f32 -> f16; NaN stays NaN
+    for h in 0..=u16::MAX {
+        let x = f16_to_f32(h);
+        if x.is_nan() {
+            assert!(f32_to_f16(x) & 0x7c00 == 0x7c00 && f32_to_f16(x) & 0x3ff != 0);
+            continue;
+        }
+        assert_eq!(f32_to_f16(x), h, "{h:#06x} -> {x}");
+        // halfway to the next value (same sign) rounds to the even one, just below it down
+        if h & 0x7fff < 0x7bff {
+            let y = f16_to_f32(h + 1);
+            let mid = (x as f64 + y as f64) / 2.0;
+            let m = mid as f32;
+            assert_eq!(m as f64, mid, "the midpoint is an f32");
+            let even = if h & 1 == 0 { h } else { h + 1 };
+            assert_eq!(f32_to_f16(m), even, "midpoint of {h:#06x}");
+            let below = f32::from_bits(m.to_bits() - 1);
+            if below.abs() < m.abs() && m != 0.0 {
+                assert_eq!(f32_to_f16(below), h, "just below the midpoint of {h:#06x}");
+            }
+        }
+    }
+    assert_eq!(f32_to_f16(1e6), 0x7c00);
+    assert_eq!(f32_to_f16(-1e6), 0xfc00);
+    assert_eq!(f32_to_f16(1e-9), 0);
+    assert_eq!(f32_to_f16(65504.0), 0x7bff);
+    assert_eq!(f32_to_f16(65520.0), 0x7c00, "half-way to 65536 rounds to inf (even)");
+    assert_eq!(f16_to_f32(f32_to_f16(0.1)), 0.099975586);
+}
+
+/// Play every deferred event's matches with the toy heuristic in a second (queue_only) driver,
+/// fed by `enqueue` with tags "gid/k", and resolve the events.
+fn play_and_resolve(d: &mut Driver<ToyTeam>, m: &mut Driver<ToyGame>, parked_seen: &mut usize) {
+    let deferred = d.take_deferred();
+    *parked_seen += deferred.len();
+    let mut want = HashMap::new();
+    for (gid, payload) in &deferred {
+        assert!(d.parked_game(*gid).unwrap().deferred());
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let eps = v["episodes"].as_array().unwrap();
+        want.insert(*gid, eps.len());
+        for (k, e) in eps.iter().enumerate() {
+            m.enqueue(&format!("{gid}/{k}"), &e.to_string()).unwrap();
+        }
+    }
+    let mut rows: HashMap<u32, Vec<(usize, GameResult)>> = HashMap::new();
+    while let Some(b) = m.next_batch(true).unwrap() {
+        answer(m, &b);
+    }
+    for r in m.take_results() {
+        let tag = r.tag.clone().expect("a queued game's row carries its tag");
+        let (g, k) = tag.split_once('/').unwrap();
+        rows.entry(g.parse().unwrap()).or_default().push((k.parse().unwrap(), r));
+    }
+    for (gid, mut rs) in rows {
+        assert_eq!(rs.len(), want[&gid]);
+        rs.sort_by_key(|x| x.0);
+        let res: Vec<serde_json::Value> = rs.iter().map(|(_, r)| serde_json::json!({"result": r.result, "scores": r.scores})).collect();
+        d.resolve(gid, &serde_json::Value::Array(res).to_string()).unwrap();
+    }
+}
+
+fn match_driver() -> Driver<ToyGame> {
+    let mut mc = cfg(vec![SeatCfg::Bot("heuristic".into())], vec![vec![0, 0]], &[]);
+    mc.rolling = true;
+    mc.queue_only = true;
+    mc.record = false;
+    mc.concurrency = 8;
+    let mut m = Driver::<ToyGame>::new(mc).unwrap();
+    m.resume(u64::MAX, 0).unwrap();
+    m
+}
+
+#[test]
+fn deferred_games_park_and_resolve_with_their_samples() {
+    let mut c = cfg(vec![nn(0, 16, true)], vec![vec![0, 0, 0, 0]; 6], &[("m", KeyKind::Nn)]);
+    c.concurrency = 6;
+    let mut d = Driver::<ToyTeam>::new(c).unwrap();
+    let mut m = match_driver();
+    assert!(m.next_batch(true).unwrap().is_none(), "queue_only: idle while the queue is empty");
+    // the events: every batch answered, nothing finishes before its matches
+    let (res, smp) = run(&mut d);
+    assert!(res.is_empty() && smp.is_empty());
+    assert_eq!(d.pending(), 6);
+    assert!(!d.finished());
+    let st = d.stats();
+    assert_eq!((st.parked, st.deferred, st.resolved), (6, 6, 0));
+    assert!(st.parked_bytes > 0);
+    // a malformed result is refused and the event stays parked; an unknown game is an error
+    let first = d.take_deferred();
+    assert_eq!(first.len(), 6);
+    assert!(d.resolve(first[0].0, "[[1, 0]]").is_err());
+    assert!(d.resolve(999, "[]").is_err());
+    assert_eq!(d.pending(), 6);
+    d.deferred_out = first;
+    let mut seen = 0;
+    play_and_resolve(&mut d, &mut m, &mut seen);
+    assert_eq!((seen, d.pending()), (6, 0));
+    assert!(d.finished());
+    let rows = d.take_results();
+    let smp = d.take_samples();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.iter().map(|r| r.samples as usize).sum::<usize>(), smp.len());
+    assert!(!smp.is_empty());
+    for r in &rows {
+        assert!(r.over && r.tag.is_none());
+        assert!((r.result.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        // a team's seats share the outcome: 1/2, 0 or 1/4 each
+        assert_eq!((r.result[0], r.result[1]), (r.result[2], r.result[3]));
+        assert!([0.0, 0.25, 0.5].contains(&r.result[0]));
+    }
+    for s in &smp {
+        // z = the event's outcome relative to the decider, q the root search's estimate (both
+        // sum to 1), sc = the team's match difference / matches; the features float16 values
+        assert!((s.z[..4].iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((s.q[..4].iter().sum::<f32>() - 1.0).abs() < 1e-3);
+        assert_eq!((s.z[0], s.sc[0]), (s.z[2], s.sc[2]));
+        assert!((s.sc[0] + s.sc[1]).abs() < 1e-6);
+        assert!(s.x.iter().all(|&v| f16_to_f32(f32_to_f16(v)) == v));
+    }
+    let st = d.stats();
+    assert_eq!((st.parked, st.parked_bytes, st.resolved, st.games_finished), (0, 0, 6, 6));
+    let ms = m.stats();
+    assert_eq!((ms.queued, ms.games_finished), (0, 24));
+    assert!(m.next_batch(true).unwrap().is_none());
+}
+
+#[test]
+fn rolling_quotas_count_resolved_games() {
+    let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    c.concurrency = 8;
+    let mut d = Driver::<ToyTeam>::new(c).unwrap();
+    let mut m = match_driver();
+    let mut seen = 0;
+    for phase in 0..3u32 {
+        d.resume(5, phase).unwrap();
+        let mut resolved = 0;
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer(&mut d, &b);
+            play_and_resolve(&mut d, &mut m, &mut seen);
+            resolved += d.take_results().len();
+            let _ = d.take_samples();
+        }
+        resolved += d.take_results().len();
+        assert!(d.paused());
+        assert!(resolved >= 5, "phase {phase}: {resolved} resolved");
+    }
+    let st = d.stats();
+    assert_eq!(st.games_finished, st.resolved);
+    seen += d.take_deferred().len();
+    assert_eq!(st.resolved as usize + d.pending(), seen);
+}
+
+#[test]
+fn queued_setups_replace_the_spec_and_carry_their_tags() {
+    let mut c = cfg(vec![SeatCfg::Bot("heuristic".into())], vec![vec![0, 0]; 6], &[]);
+    c.record = false;
+    let mut plain = Driver::<ToyGame>::new(c.clone()).unwrap();
+    assert!(plain.enqueue("bad", r#"{"food": "x"}"#).is_err(), "a bad spec is refused at enqueue");
+    assert!(plain.enqueue("bad", r#"{"nope": 1}"#).is_err());
+    let (base, _) = run(&mut plain);
+    let mut c2 = c.clone();
+    c2.rolling = true;
+    c2.queue_only = true;
+    c2.concurrency = 3;
+    let mut q = Driver::<ToyGame>::new(c2).unwrap();
+    q.resume(u64::MAX, 0).unwrap();
+    for k in 0..4 {
+        q.enqueue(&format!("t{k}"), &format!(r#"{{"food": [{}, 0]}}"#, 20 * (k % 2))).unwrap();
+    }
+    let (rows, _) = run(&mut q);
+    assert_eq!(q.queued(), 0);
+    let tags: Vec<_> = rows.iter().map(|r| (r.gid, r.tag.clone().unwrap())).collect();
+    assert_eq!(tags, (0..4).map(|k| (k, format!("t{k}"))).collect::<Vec<_>>());
+    // game g with no extra food is the driver's game g (the same streams); 20 food changes it
+    for r in rows.iter().filter(|r| r.gid % 2 == 0) {
+        let b = &base[r.gid as usize];
+        assert_eq!((r.steps, &r.scores), (b.steps, &b.scores));
+    }
+    assert!(rows.iter().filter(|r| r.gid % 2 == 1).any(|r| r.scores != base[r.gid as usize].scores));
+    // queue_only needs a rolling driver
+    let mut bad = c;
+    bad.queue_only = true;
+    assert!(Driver::<ToyGame>::new(bad).is_err());
 }

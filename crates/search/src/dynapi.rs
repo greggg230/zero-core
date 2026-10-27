@@ -6,7 +6,7 @@ use std::any::Any;
 use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record};
 use crate::game::{bot_names, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
-use crate::tree::{leaf_values, Scratch, Sim, Tree, Walk};
+use crate::tree::{leaf_values_team, Scratch, Sim, Tree, Walk};
 
 /// Static facts about a game type.
 #[derive(Clone, Debug)]
@@ -41,6 +41,12 @@ pub trait DynGame: Send + Sync {
     fn rounds(&self) -> u32;
     fn export_state(&self) -> String;
     fn apply_external(&mut self, payload: &str) -> Result<Vec<u64>, String>;
+    /// Deferred results and teams (`SearchGame::deferred`, `deferred_payload`, `resolve`,
+    /// `team_size`).
+    fn deferred(&self) -> bool;
+    fn deferred_payload(&self) -> Result<String, String>;
+    fn resolve(&mut self, results: &str) -> Result<(), String>;
+    fn team_size(&self) -> usize;
     /// A search tree for this game's pending decision.
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String>;
 }
@@ -101,6 +107,18 @@ impl<G: SearchGame> DynGame for G {
         let mut k = Vec::new();
         SearchGame::apply_external(self, payload, &mut k)?;
         Ok(k)
+    }
+    fn deferred(&self) -> bool {
+        SearchGame::to_move(self).is_none() && SearchGame::deferred(self)
+    }
+    fn deferred_payload(&self) -> Result<String, String> {
+        SearchGame::deferred_payload(self)
+    }
+    fn resolve(&mut self, results: &str) -> Result<(), String> {
+        SearchGame::resolve(self, results)
+    }
+    fn team_size(&self) -> usize {
+        SearchGame::team_size(self)
     }
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String> {
         let viewer = SearchGame::to_move(self).ok_or("the game is over")?;
@@ -199,8 +217,8 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
         for (i, x) in margin.iter().take(MAX_SEATS).enumerate() {
             m[i] = *x;
         }
-        let (util, win) = leaf_values(&v, &m, player, self.t.n, margin_w);
-        self.t.expand(node, priors, &util);
+        let (util, win) = leaf_values_team(&v, &m, player, self.t.n, margin_w, self.t.team);
+        self.t.expand_leaf(node, priors, &util, &win);
         self.t.backup(&self.sc.path, &util, &win);
         Ok(())
     }
@@ -276,6 +294,13 @@ pub trait DynDriver: Send + Sync {
     fn end_phase(&mut self);
     fn take_results(&mut self) -> Vec<GameResult>;
     fn take_samples(&mut self) -> Vec<Record>;
+    /// Deferred results and queued setups (`Driver::take_deferred`, `resolve`, `pending`,
+    /// `enqueue`, `queued`).
+    fn take_deferred(&mut self) -> Vec<(u32, String)>;
+    fn resolve(&mut self, gid: u32, results: &str) -> Result<(), String>;
+    fn pending(&self) -> usize;
+    fn enqueue(&mut self, tag: &str, spec: &str) -> Result<(), String>;
+    fn queued(&self) -> usize;
     fn stats(&self) -> DriverStats;
     fn in_flight(&self) -> InFlight;
     /// Evaluator keys in index order, and whether each is external.
@@ -312,6 +337,21 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     }
     fn take_samples(&mut self) -> Vec<Record> {
         Driver::take_samples(self)
+    }
+    fn take_deferred(&mut self) -> Vec<(u32, String)> {
+        Driver::take_deferred(self)
+    }
+    fn resolve(&mut self, gid: u32, results: &str) -> Result<(), String> {
+        Driver::resolve(self, gid, results)
+    }
+    fn pending(&self) -> usize {
+        Driver::pending(self)
+    }
+    fn enqueue(&mut self, tag: &str, spec: &str) -> Result<(), String> {
+        Driver::enqueue(self, tag, spec)
+    }
+    fn queued(&self) -> usize {
+        Driver::queued(self)
     }
     fn stats(&self) -> DriverStats {
         Driver::stats(self)

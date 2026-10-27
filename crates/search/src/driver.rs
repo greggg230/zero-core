@@ -28,6 +28,20 @@
 //! their state. A `resume` with a new network id starts a new search epoch: every slot drops
 //! its trees and pending leaf and searches its current decision again from an empty tree
 //! (keeping that decision's playout-cap draw), so no search mixes two networks.
+//!
+//! **Deferred results** (`SearchGame::deferred`, docs/search.md 2.8): a game that ends at a
+//! deferred terminal is **parked** with its training records (features as float16) and root
+//! values; its slot starts the next game. `take_deferred()` hands out `(gid, payload)` once per
+//! parked game, `resolve(gid, results)` gives the game its outcome and emits its result row and
+//! samples exactly as a finished game's (`z` from `result()`, `q` from the root values, `sc`
+//! from `margin()`); `pending()` counts parked games. Rolling quotas count finished and
+//! resolved games, never parked ones.
+//!
+//! **Queued setups** (docs/search.md 2.9): `enqueue(tag, spec)` makes the next game a free slot
+//! starts use that spec instead of the driver's (the seats stay the driver's); with
+//! `DriverCfg::queue_only` (rolling drivers) slots only start queued games and stay idle while
+//! the queue is empty (`next_batch` returns None when nothing is left to play; `enqueue` wakes
+//! the idle groups). A game started from the queue carries its tag into its result row.
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -150,6 +164,9 @@ pub struct DriverCfg {
     pub rolling: bool,
     /// Network id stored with the samples until a `resume` sets another.
     pub net: u32,
+    /// Rolling mode: slots start only queued setups (`Driver::enqueue`), idle while the queue
+    /// is empty.
+    pub queue_only: bool,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -168,6 +185,8 @@ pub struct GameResult {
     pub rounds: u32,
     /// Training samples this game emitted.
     pub samples: u32,
+    /// The tag of the queued setup the game was started from (`Driver::enqueue`).
+    pub tag: Option<String>,
 }
 
 /// One recorded root decision with its targets.
@@ -232,6 +251,112 @@ impl LeafBuf {
     }
 }
 
+/// A queued game setup (`Driver::enqueue`): the spec of the next game a free slot starts.
+struct Setup<G: SearchGame> {
+    tag: String,
+    spec: G::Spec,
+}
+
+/// f32 -> IEEE half precision bits, rounding to nearest even (numpy's `astype(float16)`); NaN
+/// stays NaN, overflow becomes inf.
+pub fn f32_to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 | (man >> 13) as u16 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = 1u32 << (shift - 1);
+        let rem = m & ((1u32 << shift) - 1);
+        let mut r = m >> shift;
+        if rem > half || (rem == half && r & 1 == 1) {
+            r += 1;
+        }
+        return sign | r as u16;
+    }
+    let mut r = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && r & 1 == 1) {
+        r += 1;
+    }
+    sign | r as u16
+}
+
+/// IEEE half precision bits -> f32 (exact).
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let man = (h & 0x3ff) as u32;
+    let bits = if exp == 0 {
+        if man == 0 {
+            sign
+        } else {
+            let mut e = 127 - 15 + 1;
+            let mut m = man;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            sign | (e << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 0x1f {
+        sign | 0x7f80_0000 | (man << 13)
+    } else {
+        sign | ((exp + 127 - 15) << 23) | (man << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// A parked game's training record: the features as float16 (what the sample shards store
+/// anyway: the round trip changes nothing written).
+struct ParkedRecord {
+    x: Vec<u16>,
+    player: u8,
+    n_players: u8,
+    opts: Vec<u16>,
+    pi: Vec<f32>,
+    net: u32,
+}
+
+impl ParkedRecord {
+    fn park(r: Record) -> ParkedRecord {
+        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net }
+    }
+    fn unpark(self) -> Record {
+        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net }
+    }
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.x.len() * 2 + self.opts.len() * 2 + self.pi.len() * 4
+    }
+}
+
+/// A game waiting at its deferred terminal for `Driver::resolve`.
+struct Parked<G: SearchGame> {
+    gid: u32,
+    tag: Option<String>,
+    game: G,
+    n: usize,
+    records: Vec<ParkedRecord>,
+    rq: Vec<Option<[f64; MAX_SEATS]>>,
+    steps: u64,
+    decisions: u32,
+    ext_moves: u32,
+    payload: String,
+    /// Memory held by the records (`DriverStats::parked_bytes`).
+    bytes: u64,
+}
+
 enum Eval {
     Nn { opt_off: Vec<i32>, priors: Vec<f32>, value: Vec<f32>, margin: Vec<f32>, bases: Vec<u32> },
     Ext { payloads: Vec<String>, bases: Vec<u32> },
@@ -245,6 +370,10 @@ enum Pending {
 struct Slot<G: SearchGame> {
     gid: u32,
     start: Option<u32>,
+    /// The queued setup of the game `start` begins.
+    setup: Option<Setup<G>>,
+    /// The tag of the game's queued setup.
+    tag: Option<String>,
     game: Option<G>,
     n: usize,
     rng: Rng,
@@ -279,6 +408,8 @@ impl<G: SearchGame> Slot<G> {
         Slot {
             gid: NO_GAME,
             start: None,
+            setup: None,
+            tag: None,
             game: None,
             n: 0,
             rng: Rng::new(0),
@@ -329,13 +460,20 @@ struct Chunk<G: SearchGame> {
     bufs: Vec<LeafBuf>,
     results: Vec<GameResult>,
     samples: Vec<Record>,
+    parked: Vec<Parked<G>>,
 }
 
-#[derive(Default)]
-struct GroupOut {
+struct GroupOut<G: SearchGame> {
     batches: Vec<Batch>,
     results: Vec<GameResult>,
     samples: Vec<Record>,
+    parked: Vec<Parked<G>>,
+}
+
+impl<G: SearchGame> Default for GroupOut<G> {
+    fn default() -> Self {
+        GroupOut { batches: Vec::new(), results: Vec::new(), samples: Vec::new(), parked: Vec::new() }
+    }
 }
 
 /// Raw destination of one network batch (its Vecs' heap buffers), written by the group's
@@ -376,7 +514,7 @@ struct Group<G: SearchGame> {
     asm: Mutex<Option<Asm>>,
     fill_remaining: AtomicUsize,
     evals: RwLock<Vec<Option<Eval>>>,
-    out: Mutex<Option<GroupOut>>,
+    out: Mutex<Option<GroupOut<G>>>,
     /// Per key: row offset of every chunk in the last assembled batch.
     bases: Mutex<Vec<Vec<u32>>>,
 }
@@ -463,6 +601,13 @@ pub struct DriverStats {
     pub emitted: u64,
     pub epoch: u32,
     pub net: u32,
+    /// Games parked at a deferred terminal now, the memory their records hold, games parked
+    /// so far, games resolved so far, setups queued now.
+    pub parked: u64,
+    pub parked_bytes: u64,
+    pub deferred: u64,
+    pub resolved: u64,
+    pub queued: u64,
 }
 
 /// The games in progress.
@@ -494,6 +639,14 @@ pub struct Driver<G: SearchGame> {
     quota: u64,
     dropped_leaves: u64,
     emitted: u64,
+    /// Games at a deferred terminal waiting for `resolve`, by gid.
+    parked: HashMap<u32, Parked<G>>,
+    parked_bytes: u64,
+    /// (gid, payload) of games parked since the last `take_deferred`.
+    deferred_out: Vec<(u32, String)>,
+    deferred: u64,
+    resolved: u64,
+    queue: VecDeque<Setup<G>>,
 }
 
 impl<G: SearchGame> Driver<G> {
@@ -535,6 +688,9 @@ impl<G: SearchGame> Driver<G> {
         if cfg.rolling && cfg.games.is_empty() {
             return Err("rolling mode needs at least one game's seats".into());
         }
+        if cfg.queue_only && !cfg.rolling {
+            return Err("queue_only needs a rolling driver".into());
+        }
         let conc = if cfg.rolling { cfg.concurrency.max(1) } else { cfg.concurrency.max(1).min(cfg.games.len().max(1)) };
         let groups = cfg.groups.max(1).min(conc);
         let threads = cfg.threads.max(1);
@@ -547,7 +703,7 @@ impl<G: SearchGame> Driver<G> {
             for c in 0..nchunks {
                 let a = c * ns / nchunks;
                 let b = (c + 1) * ns / nchunks;
-                chunks.push(Mutex::new(Chunk { slots: (a..b).map(|_| Slot::empty()).collect(), bufs: (0..nkeys).map(|_| LeafBuf::default()).collect(), results: Vec::new(), samples: Vec::new() }));
+                chunks.push(Mutex::new(Chunk { slots: (a..b).map(|_| Slot::empty()).collect(), bufs: (0..nkeys).map(|_| LeafBuf::default()).collect(), results: Vec::new(), samples: Vec::new(), parked: Vec::new() }));
             }
             gv.push(Group {
                 chunks,
@@ -602,6 +758,12 @@ impl<G: SearchGame> Driver<G> {
             quota: 0,
             dropped_leaves: 0,
             emitted: 0,
+            parked: HashMap::new(),
+            parked_bytes: 0,
+            deferred_out: Vec::new(),
+            deferred: 0,
+            resolved: 0,
+            queue: VecDeque::new(),
         };
         for g in 0..groups {
             if rolling {
@@ -624,12 +786,14 @@ impl<G: SearchGame> Driver<G> {
     fn dispatch(&mut self, g: usize) {
         let grp = &self.sh.groups[g];
         let n_games = if self.sh.cfg.rolling { u32::MAX } else { self.sh.cfg.games.len() as u32 };
+        let queue_only = self.sh.cfg.queue_only;
         let mut busy = false;
         for ch in &grp.chunks {
             let mut ch = lock(ch);
             for s in ch.slots.iter_mut() {
-                if s.game.is_none() && s.start.is_none() && self.next_gid < n_games {
+                if s.game.is_none() && s.start.is_none() && self.next_gid < n_games && !(queue_only && self.queue.is_empty()) {
                     s.start = Some(self.next_gid);
+                    s.setup = self.queue.pop_front();
                     self.next_gid += 1;
                 }
                 busy |= s.game.is_some() || s.start.is_some();
@@ -664,9 +828,9 @@ impl<G: SearchGame> Driver<G> {
         }
     }
 
-    /// Every game finished and every batch answered (never for a rolling driver).
+    /// Every game finished (or resolved) and every batch answered (never for a rolling driver).
     pub fn finished(&self) -> bool {
-        self.ready.is_empty() && self.outstanding.is_empty() && self.gstate.iter().all(|s| *s == GState::Idle)
+        self.ready.is_empty() && self.outstanding.is_empty() && self.gstate.iter().all(|s| *s == GState::Idle) && self.parked.is_empty()
     }
 
     /// Rolling mode: the phase ended (or none began).
@@ -737,6 +901,12 @@ impl<G: SearchGame> Driver<G> {
             self.phase_games += nfin;
             self.results.extend(out.results);
             self.samples.extend(out.samples);
+            for mut p in out.parked {
+                self.deferred += 1;
+                self.parked_bytes += p.bytes;
+                self.deferred_out.push((p.gid, std::mem::take(&mut p.payload)));
+                self.parked.insert(p.gid, p);
+            }
             self.cursor = (g + 1) % ng;
             if self.pausing() {
                 // the phase is over: this group's leaves are not evaluated (nothing was backed
@@ -819,6 +989,85 @@ impl<G: SearchGame> Driver<G> {
         std::mem::take(&mut self.results)
     }
 
+    /// Games parked at a deferred terminal since the last call: (gid, `deferred_payload()`).
+    pub fn take_deferred(&mut self) -> Vec<(u32, String)> {
+        std::mem::take(&mut self.deferred_out)
+    }
+
+    /// Games parked at a deferred terminal, waiting for `resolve`.
+    pub fn pending(&self) -> usize {
+        self.parked.len()
+    }
+
+    /// A parked game (tests, analysis).
+    pub fn parked_game(&self, gid: u32) -> Option<&G> {
+        self.parked.get(&gid).map(|p| &p.game)
+    }
+
+    /// The outcome of parked game `gid` (`SearchGame::resolve(results)`, JSON): its result row
+    /// and training samples are emitted as a finished game's, and it counts toward the rolling
+    /// quota. An unknown game, a result the game refuses or a game still deferred afterwards is
+    /// an error (the game stays parked when it refused the result).
+    pub fn resolve(&mut self, gid: u32, results: &str) -> Result<(), String> {
+        self.check_error()?;
+        let seed = self.sh.cfg.seed;
+        let Some(mut p) = self.parked.remove(&gid) else {
+            return Err(format!("resolve: game {gid} is not waiting for a deferred result ({} parked)", self.parked.len()));
+        };
+        let short = |s: &str| if s.len() > 300 { format!("{}...", &s[..s.char_indices().nth(300).map_or(s.len(), |(i, _)| i)]) } else { s.to_string() };
+        match catch_unwind(AssertUnwindSafe(|| p.game.resolve(results))) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let msg = format!("game {gid} (driver seed {seed}): resolve refused {}: {e}", short(results));
+                self.parked.insert(gid, p);
+                return Err(msg);
+            }
+            Err(pn) => {
+                self.parked_bytes -= p.bytes;
+                return Err(format!("game {gid} (driver seed {seed}): resolve panicked: {}", worker::panic_msg(pn)));
+            }
+        }
+        self.parked_bytes -= p.bytes;
+        if p.game.deferred() || p.game.to_move().is_some() {
+            return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
+        }
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves };
+        let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
+        let cfg = &self.sh.cfg;
+        let mut samples = Vec::new();
+        let row = catch_unwind(AssertUnwindSafe(|| worker::emit(cfg.record, &p.game, true, done, records, p.rq, &mut samples)))
+            .map_err(|pn| format!("game {gid} (driver seed {seed}): its outcome after resolve panicked: {}", worker::panic_msg(pn)))?;
+        self.results.push(row);
+        self.samples.append(&mut samples);
+        self.finished_games += 1;
+        self.phase_games += 1;
+        self.resolved += 1;
+        Ok(())
+    }
+
+    /// Queue a game setup: the next game a free slot starts uses `spec` (JSON, the game's
+    /// `parse_spec`; an error here) instead of the driver's, and its result row carries `tag`.
+    /// Idle groups (a `queue_only` driver whose queue ran dry) start again unless the phase
+    /// ended.
+    pub fn enqueue(&mut self, tag: &str, spec: &str) -> Result<(), String> {
+        self.check_error()?;
+        let s = G::parse_spec(spec).map_err(|e| format!("enqueue {tag:?}: {e}"))?;
+        self.queue.push_back(Setup { tag: tag.to_string(), spec: s });
+        if !self.pausing() {
+            for g in 0..self.gstate.len() {
+                if self.gstate[g] == GState::Idle {
+                    self.dispatch(g);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Setups queued and not started yet.
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
     pub fn take_samples(&mut self) -> Vec<Record> {
         self.emitted += self.samples.len() as u64;
         std::mem::take(&mut self.samples)
@@ -849,6 +1098,11 @@ impl<G: SearchGame> Driver<G> {
             emitted: self.emitted,
             epoch: self.sh.epoch.load(Ordering::Relaxed),
             net: self.sh.net.load(Ordering::Relaxed),
+            parked: self.parked.len() as u64,
+            parked_bytes: self.parked_bytes,
+            deferred: self.deferred,
+            resolved: self.resolved,
+            queued: self.queue.len() as u64,
         }
     }
 

@@ -53,12 +53,18 @@ class GamePackage:
     eval_specs      game -> fn(spec) -> the spec of evaluation matches (a run's `eval_spec`
                     setting overrides it), or 'module:attr'; e.g. MTG: self-play on random
                     decks, evaluation on a fixed deck set. Default: the self-play spec
+    deferred        game -> its deferred results' glue for co-training runs (docs/az.md 11), a
+                    dict or 'module:attr': {'episodes': fn(payload) -> [spec JSON of the
+                    resolver game, ...] (default: the payload's "episodes" list), 'results':
+                    fn(payload, rows) -> the results JSON for `resolve` (rows: the episodes'
+                    result rows in order; default `[{"result": [...], "scores": [...]}, ...]`)}.
+                    Nothing in the core knows what an episode is.
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
-                 grids=None, remotes=None, tokens=None, eval_specs=None):
+                 grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -80,6 +86,16 @@ class GamePackage:
         self.remotes = dict(remotes or {})
         self.tokens = dict(tokens or {})
         self.eval_specs = dict(eval_specs or {})
+        self.deferred = dict(deferred or {})
+
+    def deferred_of(self, game):
+        """`game`'s deferred-result glue: (episodes(payload) -> [spec JSON], results(payload, rows)
+        -> results JSON) - the package's, else the defaults (`default_episodes`,
+        `default_results`)."""
+        d = self.deferred.get(game) or {}
+        if isinstance(d, str):
+            d = self.deferred[game] = resolve(d)
+        return (resolve(d.get('episodes')) or default_episodes, resolve(d.get('results')) or default_results)
 
     def tokens_of(self, game):
         """The object layout of `game` for arch 'tokens' (None if the package has none)."""
@@ -122,6 +138,26 @@ TOY_TOKENS = {'vocab': 8,
 # the core's own package: the toy game, zero._engine (crates/toy_py, tools/build_py.sh)
 CORE = GamePackage('zero', 'Zero Core', CORE_ROOT, engine='zero._engine', run_module='zero.run', game='toy',
                    dashboard_port=None, hub_id=None, env_prefix='ZERO', tokens={'toy': TOY_TOKENS})
+
+def default_episodes(payload):
+    """The resolver specs of a deferred terminal: its payload's "episodes" (each a JSON string,
+    or an object serialised here). No episodes is an error."""
+    import json
+    try:
+        v = json.loads(payload)
+        eps = v['episodes']
+    except (ValueError, KeyError, TypeError) as e:
+        raise ValueError(f'deferred payload without an "episodes" list ({e!r}): {payload[:300]}') from None
+    if not isinstance(eps, list) or not eps:
+        raise ValueError(f'deferred payload: "episodes" must be a non-empty list: {payload[:300]}')
+    return [e if isinstance(e, str) else json.dumps(e) for e in eps]
+
+
+def default_results(payload, rows):
+    """The `resolve` JSON from the episodes' result rows (in the payload's order)."""
+    import json
+    return json.dumps([{'result': [float(x) for x in r['result']], 'scores': [float(x) for x in r['scores']]} for r in rows])
+
 
 _ACTIVE = None
 

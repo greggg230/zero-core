@@ -36,6 +36,12 @@ pub const MAX_SEATS: usize = 8;
 /// * **External seats** (a player outside the AZ action layer, e.g. the JS bot through the
 ///   Node bridge): `export_state()` describes the state for that player, `apply_external`
 ///   applies its answer (any number of moves); afterwards the driver re-reads everything.
+/// * **Deferred results** (docs/search.md 1.1): a game whose terminal result comes from outside
+///   (MTG Zero's team draft: the matches of the drafted decks) is over (`to_move()` None) with
+///   `deferred()` true until `resolve(results)`; the search evaluates such a terminal with the
+///   network, the driver parks it until the results come (docs/search.md 2.8). `result()` and
+///   `margin()` are never called on it. **Teams**: `team_size()` seats per team, seat `s` in
+///   team `s % (num_players() / team_size())`; `result()` = the team's outcome / team_size.
 pub trait SearchGame: Clone + Send + Sync + 'static {
     /// Settings shared by all games of one driver, parsed from a JSON string.
     type Spec: Clone + Send + Sync + 'static;
@@ -72,6 +78,34 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     /// (docs/search.md 3). Default: no decision is minor.
     fn minor_decision(&self) -> bool {
         false
+    }
+    /// The game is over (`to_move()` None) but its result comes from outside: episodes of
+    /// another game decide it (docs/search.md 1.1). Until `resolve`, the search treats this
+    /// terminal as a leaf the network evaluates and the driver parks the game; nothing calls
+    /// `result()` or `margin()` on it. Default: never.
+    fn deferred(&self) -> bool {
+        false
+    }
+    /// What must be played to resolve the deferred terminal (JSON; by convention
+    /// `{"episodes": [<a spec of the resolver game>, ...], ...}`, read by the run's game
+    /// package, docs/az.md 11). Called once, when the driver parks the game.
+    fn deferred_payload(&self) -> Result<String, String> {
+        Ok(String::new())
+    }
+    /// The outcome of a deferred terminal from its episodes' results (JSON, in the payload's
+    /// order; the run's convention `[{"result": [...], "scores": [...]}, ...]`). Afterwards
+    /// `deferred()` is false and `result()` / `margin()` / `score()` hold the outcome. A
+    /// malformed or impossible result is an error, never a default.
+    fn resolve(&mut self, results: &str) -> Result<(), String> {
+        let _ = results;
+        Err(format!("{}: no deferred result to resolve", Self::NAME))
+    }
+    /// Seats per team (it divides `num_players()`; seat `s` is in team `s % (num_players() /
+    /// team_size())`): `result()[s]` = the team's outcome / team_size, so the vector still sums
+    /// to 1, and the search's utility is `team_size x result[s]` (+ the margin term): Q stays in
+    /// [0, 1], `c_puct` and `cq_c_scale` keep their meaning (docs/search.md 3). Default 1.
+    fn team_size(&self) -> usize {
+        1
     }
     /// State description for an external seat (JSON).
     fn export_state(&self) -> String {
@@ -114,6 +148,12 @@ pub fn make_bot<G: SearchGame>(spec: &G::Spec, name: &str, seed: u64) -> Option<
         return Some(Box::new(RandomBot { rng: Rng::new(seed) }));
     }
     G::make_bot(spec, name, seed)
+}
+
+/// The team of `seat` in a game of `n` seats with `team_size` seats per team (the
+/// `SearchGame::team_size` convention: seat `s` is in team `s % (n / team_size)`).
+pub fn team_of(seat: usize, n: usize, team_size: usize) -> usize {
+    seat % (n / team_size.max(1)).max(1)
 }
 
 /// Bot names a game accepts.

@@ -26,6 +26,9 @@
 //! food (a newborn 1); feed-only: every adult eats 1 food. Missing food is paid with grain,
 //! then 1 begging marker per missing food. Score: 3 per worker, 1 per room beyond 2, 1 per
 //! plowed field, 1 per 2 grain (supply + fields), 1 per stone, -3 per begging marker.
+//!
+//! Spec: `{}`, or `{"food": [a, b, ...]}`: extra starting food per seat (the matches of the
+//! team toy game `toy_team`, whose drafted cards are food; `toy_team.rs`).
 use crate::game::{Bot, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
 
@@ -126,7 +129,10 @@ impl Player {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ToySpec {}
+pub struct ToySpec {
+    /// Extra starting food per seat (`{"food": [...]}`; empty: none).
+    pub food: Vec<i16>,
+}
 
 #[derive(Clone, Debug)]
 pub struct ToyGame {
@@ -641,17 +647,34 @@ impl SearchGame for ToyGame {
     fn parse_spec(json: &str) -> Result<ToySpec, String> {
         let v: serde_json::Value = if json.trim().is_empty() { serde_json::json!({}) } else { serde_json::from_str(json).map_err(|e| format!("toy spec: {e}"))? };
         let o = v.as_object().ok_or("toy spec: a JSON object")?;
-        if let Some(k) = o.keys().next() {
-            return Err(format!("toy spec: unknown key {k:?}"));
+        let mut spec = ToySpec::default();
+        for (k, x) in o {
+            match k.as_str() {
+                "food" => {
+                    let a = x.as_array().filter(|a| (1..=MAXP).contains(&a.len())).ok_or("toy spec: food is a list of 1-4 numbers")?;
+                    for f in a {
+                        let f = f.as_i64().filter(|f| (0..=99).contains(f)).ok_or("toy spec: food values are integers 0..99")?;
+                        spec.food.push(f as i16);
+                    }
+                }
+                _ => return Err(format!("toy spec: unknown key {k:?}")),
+            }
         }
-        Ok(ToySpec {})
+        Ok(spec)
     }
 
-    fn new_game(_spec: &ToySpec, players: usize, seed: u64) -> Result<Self, String> {
+    fn new_game(spec: &ToySpec, players: usize, seed: u64) -> Result<Self, String> {
         if !(2..=MAXP).contains(&players) {
             return Err(format!("toy: {players} players (2..4)"));
         }
-        Ok(ToyGame::new(players, seed))
+        if spec.food.len() > players {
+            return Err(format!("toy: food for {} seats, {players} players", spec.food.len()));
+        }
+        let mut g = ToyGame::new(players, seed);
+        for (i, &f) in spec.food.iter().enumerate() {
+            g.players[i].food += f;
+        }
+        Ok(g)
     }
 
     fn num_players(&self) -> usize {

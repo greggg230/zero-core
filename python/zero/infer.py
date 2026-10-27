@@ -48,10 +48,15 @@ ROW_STEP = 64                    # CUDA graphs are captured for batch sizes padd
 
 
 def segment_softmax_np(logits, off):
-    """Softmax of a flat float array over the segments of `off` (every segment non-empty);
-    vectorized (protocol.segment_softmax is the per-segment reference)."""
+    """Softmax of a flat float array over the segments of `off` (empty segments - deferred
+    terminals - hold nothing); vectorized (protocol.segment_softmax is the per-segment reference)."""
     cnt = np.diff(off)
     starts = off[:-1]
+    if len(cnt) and cnt.min() == 0:
+        keep = cnt > 0
+        cnt, starts = cnt[keep], starts[keep]
+        if not len(cnt):
+            return np.zeros(0, np.float32)
     lg = logits.astype(np.float32, copy=False)
     mx = np.maximum.reduceat(lg, starts)
     e = np.exp(lg - np.repeat(mx, cnt))
@@ -250,7 +255,7 @@ class NetEvaluator:
         return self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action)
 
     def _graphable(self, opt_off):
-        return self.fast is not None and len(opt_off) > 1 and bool(np.all(np.diff(opt_off) > 0))
+        return self.fast is not None and len(opt_off) > 1
 
     def launch(self, lb):
         """Start evaluating a LeafBatch; `result(handle)` -> what `ev(lb)` returns. Eager
@@ -285,7 +290,7 @@ class UniformEvaluator:
     def __call__(self, lb):
         off = lb.opt_off
         cnt = np.diff(off)
-        pri = np.repeat((1.0 / cnt).astype(np.float32), cnt)
+        pri = np.repeat((1.0 / np.maximum(cnt, 1)).astype(np.float32), cnt)
         B = lb.B
         n = lb.n_players.astype(np.float32)[:, None]
         value = ((np.arange(MAX_SEATS)[None, :] < n) / n).astype(np.float32)

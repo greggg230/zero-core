@@ -9,7 +9,8 @@
 //!   priors / values in; one leaf per game per batch - no virtual loss, no in-tree batching),
 //!   playout-cap randomisation, temperature, training records, rolling mode, arena (several
 //!   network keys), external seats.
-//! * `toy`: "Mini Cavern", the toy game the stack is proven on.
+//! * `toy`: "Mini Cavern", the toy game the stack is proven on; `toy_team`: a two-team game
+//!   with a deferred result decided by toy matches (deferred terminals, teams, co-training).
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
 pub mod driver;
 pub mod dynapi;
@@ -17,7 +18,8 @@ pub mod game;
 pub mod noise;
 pub mod rng;
 pub mod toy;
+pub mod toy_team;
 pub mod tree;
 
-pub use game::{Bot, SearchGame, MAX_SEATS};
+pub use game::{team_of, Bot, SearchGame, MAX_SEATS};
 pub use rng::Rng;

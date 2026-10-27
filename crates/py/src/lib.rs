@@ -272,11 +272,34 @@ impl PyGame {
     fn force_chance(&mut self, keys: Vec<u64>) {
         self.g.force_chance(&keys)
     }
-    fn result(&self) -> Vec<f32> {
-        self.g.result()
+    /// The result per seat (once over); refused at a deferred terminal before `resolve`.
+    fn result(&self) -> PyResult<Vec<f32>> {
+        self.not_deferred("result")?;
+        Ok(self.g.result())
     }
-    fn margin(&self, seat: usize) -> f32 {
-        self.g.margin(seat)
+    fn margin(&self, seat: usize) -> PyResult<f32> {
+        self.not_deferred("margin")?;
+        Ok(self.g.margin(seat))
+    }
+    /// Over at a deferred terminal, waiting for `resolve` (docs/search.md 1.1).
+    #[getter]
+    fn deferred(&self) -> bool {
+        self.g.deferred()
+    }
+    /// What must be played to resolve the deferred terminal (JSON string).
+    fn deferred_payload(&self) -> PyResult<String> {
+        self.g.deferred_payload().map_err(verr)
+    }
+    /// The deferred terminal's outcome from its episodes' results: a JSON string, or a list
+    /// (serialised with `json.dumps`).
+    fn resolve(&mut self, results: &Bound<'_, PyAny>) -> PyResult<()> {
+        let r = spec_json(Some(results))?;
+        self.g.resolve(&r).map_err(verr)
+    }
+    /// Seats per team (seat s is in team s % (n_players / team_size)).
+    #[getter]
+    fn team_size(&self) -> usize {
+        self.g.team_size()
     }
     fn score(&self, seat: usize) -> f32 {
         self.g.score(seat)
@@ -304,6 +327,18 @@ impl PyGame {
     #[pyo3(signature = (redet=true, seed=0))]
     fn search_tree(&self, redet: bool, seed: u64) -> PyResult<PySearchTree> {
         Ok(PySearchTree { t: self.g.new_tree(redet, seed).map_err(verr)? })
+    }
+}
+
+impl PyGame {
+    fn not_deferred(&self, what: &str) -> PyResult<()> {
+        if self.g.deferred() {
+            return Err(PyValueError::new_err(format!(
+                "{}: {what}() at a deferred terminal: the result comes from its episodes (deferred_payload, then resolve)",
+                self.g.info().name
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -414,9 +449,9 @@ pub struct PySearchDriver {
 #[pymethods]
 impl PySearchDriver {
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32) -> PyResult<Self> {
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool) -> PyResult<Self> {
         let spec = spec_json(spec)?;
         let mut keys = Vec::new();
         let mut table: Vec<SeatCfg> = Vec::new();
@@ -437,7 +472,7 @@ impl PySearchDriver {
             }
             games.push(ix);
         }
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net };
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
         Ok(PySearchDriver { d, nfeat })
@@ -487,6 +522,32 @@ impl PySearchDriver {
     fn end_phase(&mut self) {
         self.d.end_phase()
     }
+    /// Games parked at a deferred terminal since the last call: [(gid, payload JSON)].
+    fn take_deferred(&mut self) -> Vec<(u32, String)> {
+        self.d.take_deferred()
+    }
+    /// The outcome of parked game `gid` from its episodes' results (a JSON string, or a list
+    /// serialised with `json.dumps`): its result row and samples are emitted.
+    fn resolve(&mut self, gid: u32, results: &Bound<'_, PyAny>) -> PyResult<()> {
+        let r = spec_json(Some(results))?;
+        self.d.resolve(gid, &r).map_err(verr)
+    }
+    /// Games parked at a deferred terminal.
+    #[getter]
+    fn pending(&self) -> usize {
+        self.d.pending()
+    }
+    /// Queue a setup: the next game a free slot starts uses `spec` (a JSON string or a dict) and
+    /// its result row carries `tag`.
+    fn enqueue(&mut self, tag: &str, spec: &Bound<'_, PyAny>) -> PyResult<()> {
+        let s = spec_json(Some(spec))?;
+        self.d.enqueue(tag, &s).map_err(verr)
+    }
+    /// Setups queued and not started yet.
+    #[getter]
+    fn queued(&self) -> usize {
+        self.d.queued()
+    }
     /// Evaluator keys in index order: [(name, external)].
     #[getter]
     fn keys(&self) -> Vec<(String, bool)> {
@@ -511,6 +572,7 @@ impl PySearchDriver {
             d.set_item("ext_moves", r.ext_moves)?;
             d.set_item("rounds", r.rounds)?;
             d.set_item("samples", r.samples)?;
+            d.set_item("tag", r.tag)?;
             out.append(d)?;
         }
         Ok(out)
@@ -566,6 +628,11 @@ impl PySearchDriver {
         d.set_item("emitted", s.emitted)?;
         d.set_item("epoch", s.epoch)?;
         d.set_item("net", s.net)?;
+        d.set_item("parked", s.parked)?;
+        d.set_item("parked_bytes", s.parked_bytes)?;
+        d.set_item("deferred", s.deferred)?;
+        d.set_item("resolved", s.resolved)?;
+        d.set_item("queued", s.queued)?;
         Ok(d)
     }
 

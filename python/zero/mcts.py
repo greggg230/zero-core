@@ -1,7 +1,7 @@
 """Reference MCTS (docs/search.md 3). The Rust search (`crates/search/src/tree.rs`)
 implements these semantics; parity is checked statistically (`zero/parity.py`). Game access
 only through the `<package>._engine.Game` API (clone, determinize, step, force_chance, legal,
-to_move, over, result, margin).
+to_move, over, result, margin, deferred, team_size).
 
 Tree
 * A **Node** is one decision as the search sees it: decider seat, legal options (fixed for
@@ -26,7 +26,13 @@ Simulation (one network evaluation each, strictly sequential within a tree)
    non-empty). Terminal -> back up the result; else descend to (or create) the child.
 3. Unexpanded node -> leaf: the network evaluates `g.encode(decider)`; the reply expands the
    node and is backed up: N_i += 1, W_i += util[decider of that node], tot += 1, wsum += win.
-   util = win + margin_w * tanh(margin).
+   util = team_size * win + margin_w * tanh(margin) (`team_size`: seats per team, 1 but for
+   team games; win = the value / result, summing to 1).
+4. A **deferred terminal** (`g.over and g.deferred`: the result comes from outside, docs/search.md
+   3.2) is a node of no options of the tree's viewer, keyed like any child: unexpanded, it is a
+   leaf the network evaluates (`g.encode(viewer)`, no priors) and it keeps its utility (`vec`)
+   and win vector (`wsum`, tot 1); every later visit backs that value up again. `result()` is
+   never called there.
 
 Policy target of a recorded decision (docs/search.md 3.1): the root visit distribution, or
 the completed-Q target of Gumbel AlphaZero (`cq_target`, `completed_q_policy`).
@@ -67,12 +73,13 @@ class Node:
 
 class Tree:
     """The search for one decision of `viewer` (the decider at the root)."""
-    __slots__ = ('base', 'root', 'viewer', 'redet', 'n')
+    __slots__ = ('base', 'root', 'viewer', 'redet', 'n', 'team')
 
     def __init__(self, game, redet=True, rng=None):
         self.viewer = game.to_move
         self.redet = redet
         self.n = game.n_players
+        self.team = max(1, getattr(game, 'team_size', 1))
         self.root = Node(self.viewer, list(game.legal()))
         self.set_base(game, rng)
 
@@ -133,23 +140,26 @@ def root_win(root):
     return [w / root.tot for w in root.wsum]
 
 
-def leaf_values(value_rel, margin_rel, player, n, margin_w):
-    """Network output (relative to the decider) -> (util, win) over absolute seats."""
+def leaf_values(value_rel, margin_rel, player, n, margin_w, team=1):
+    """Network output (relative to the decider) -> (util, win) over absolute seats (util = team
+    x win + margin_w tanh(margin))."""
     win = [0.0] * n
     util = [0.0] * n
     for j in range(n):
         s = (player + j) % n
         w = float(value_rel[j])
         win[s] = w
-        util[s] = w + margin_w * math.tanh(float(margin_rel[j])) if margin_w else w
+        util[s] = team * w + margin_w * math.tanh(float(margin_rel[j])) if margin_w else team * w
     return util, win
 
 
-def terminal_values(g, margin_w):
+def terminal_values(g, margin_w, team=1):
     win = list(g.result())
-    if not margin_w:
+    if not margin_w and team == 1:
         return win, win
-    return [win[i] + margin_w * math.tanh(g.margin(i)) for i in range(len(win))], win
+    if not margin_w:
+        return [team * w for w in win], win
+    return [team * win[i] + margin_w * math.tanh(g.margin(i)) for i in range(len(win))], win
 
 
 def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
@@ -176,8 +186,18 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
         key, legal = transition(g, node.acts[i], forced)
         if key and forced is None:
             edge.outs.append(key)
+        if g.over and g.deferred:
+            # a deferred terminal: evaluated once by the network, then its value backed up
+            sk = (key, tree.viewer, ())
+            child = edge.kids.get(sk)
+            if child is None:
+                child = edge.kids[sk] = Node(tree.viewer, [])
+            if child.P is None:
+                return child, g, path
+            backup(path, child.vec, child.wsum)
+            return None
         if g.over:
-            backup(path, *terminal_values(g, margin_w))
+            backup(path, *terminal_values(g, margin_w, tree.team))
             return None
         sk = (key, g.to_move, tuple(legal))
         child = edge.kids.get(sk)
@@ -186,9 +206,12 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
         node = child
 
 
-def expand_and_backup(node, path, priors, value_rel, margin_rel, n, margin_w=0.0):
-    util, win = leaf_values(value_rel, margin_rel, node.player, n, margin_w)
+def expand_and_backup(node, path, priors, value_rel, margin_rel, n, margin_w=0.0, team=1):
+    util, win = leaf_values(value_rel, margin_rel, node.player, n, margin_w, team)
     node.expand(priors, util, n)
+    if not node.acts:                       # a deferred terminal keeps its win vector
+        node.wsum = list(win)
+        node.tot = 1
     backup(path, util, win)
 
 

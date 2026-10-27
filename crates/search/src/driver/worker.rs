@@ -1,7 +1,7 @@
 //! The driver's worker threads: advancing games (search, bots, external requests), batch
 //! assembly, finished games and training records.
 use super::*;
-use crate::tree::{leaf_values, transition_with, Scratch as SimScratch, Sim, Walk};
+use crate::tree::{leaf_values_team, transition_with, Scratch as SimScratch, Sim, Walk};
 
 struct WScratch<G: SearchGame> {
     game: Option<G>,
@@ -11,7 +11,7 @@ struct WScratch<G: SearchGame> {
 /// Queue-job flag: fill job of chunk `c & !FILL` (else: search job of chunk c).
 const FILL: usize = 1 << 30;
 
-fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
+pub(super) fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
     p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "?".into())
 }
 
@@ -143,7 +143,7 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
                 }
                 None => {}
             }
-            advance_slot(sh, slot, &mut ch.bufs, &mut ch.results, &mut ch.samples, scratch, &mut n)
+            advance_slot(sh, slot, &mut ch.bufs, &mut ch.results, &mut ch.samples, &mut ch.parked, scratch, &mut n)
         }))
         .unwrap_or_else(|p| {
             // the scratch world may be mid-transition
@@ -151,7 +151,8 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
             Err(format!("search worker panicked: {}", panic_msg(p)))
         });
         if let Err(e) = r {
-            return Err(format!("game {} (driver seed {}): {e}", gid.map(|x| x as i64).unwrap_or(-1), cfg.seed));
+            let tag = slot.tag.as_ref().or(slot.setup.as_ref().map(|s| &s.tag)).map(|t| format!(" (queued setup {t:?})")).unwrap_or_default();
+            return Err(format!("game {}{tag} (driver seed {}): {e}", gid.map(|x| x as i64).unwrap_or(-1), cfg.seed));
         }
     }
     let k = &sh.counters;
@@ -207,13 +208,23 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
     Ok(lost)
 }
 
-/// Start game `gid` in `slot`: every random stream derives from (driver seed, gid).
+/// Start game `gid` in `slot` (with the spec of its queued setup, if any): every random
+/// stream derives from (driver seed, gid).
 fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Result<(), String> {
     let cfg = &sh.cfg;
+    let setup = slot.setup.take();
+    let spec = setup.as_ref().map_or(&sh.spec, |s| &s.spec);
     let mut base = Rng::new(split64(cfg.seed ^ split64(gid as u64 + 1)));
     let seats = game_seats(cfg, gid);
     let n = seats.len();
-    let game = G::new_game(&sh.spec, n, base.next_u64())?;
+    slot.tag = setup.as_ref().map(|s| s.tag.clone());
+    let game = G::new_game(spec, n, base.next_u64())?;
+    let team = game.team_size();
+    #[allow(clippy::manual_is_multiple_of)] // (rustc < 1.87 on other machines)
+    let divides = team != 0 && n % team == 0;
+    if !divides {
+        return Err(format!("{}: team_size {team} does not divide {n} players", G::NAME));
+    }
     slot.gid = gid;
     slot.n = n;
     slot.rng = Rng::new(base.next_u64());
@@ -225,7 +236,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
         .iter()
         .zip(seeds)
         .map(|(&s, seed)| match &cfg.seats[s as usize] {
-            SeatCfg::Bot(name) => make_bot::<G>(&sh.spec, name, seed),
+            SeatCfg::Bot(name) => make_bot::<G>(spec, name, seed),
             _ => None,
         })
         .collect();
@@ -253,8 +264,8 @@ fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, n
     if priors.len() != tree.acts(node).len() {
         return Err("internal: evaluation option count mismatch".into());
     }
-    let (util, win) = leaf_values(value, margin, tree.player(node), slot.n, s.margin_w);
-    tree.expand(node, priors, &util);
+    let (util, win) = leaf_values_team(value, margin, tree.player(node), slot.n, s.margin_w, tree.team);
+    tree.expand_leaf(node, priors, &util, &win);
     tree.backup(&slot.path, &util, &win);
     if node == tree.root && s.selfplay && slot.full {
         let r = tree.root;
@@ -265,14 +276,14 @@ fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, n
 }
 
 /// Play the slot's game until its search needs a network evaluation, an external seat is to
-/// move, or the game ends.
-fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [LeafBuf], results: &mut Vec<GameResult>, samples: &mut Vec<Record>, scratch: &mut WScratch<G>, n: &mut Tally) -> Result<(), String> {
+/// move, or the game ends (or parks at a deferred terminal).
+#[allow(clippy::too_many_arguments)]
+fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [LeafBuf], results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>, scratch: &mut WScratch<G>, n: &mut Tally) -> Result<(), String> {
     let cfg = &sh.cfg;
     loop {
         let g = slot.game.as_ref().unwrap();
         let Some(p) = g.to_move().filter(|_| slot.steps < cfg.max_steps) else {
-            finish(cfg, slot, results, samples);
-            return Ok(());
+            return finish(cfg, slot, results, samples, parked);
         };
         if let SeatCfg::External(key) = seat_cfg(cfg, slot.gid, p) {
             if let Some(pl) = slot.ext_payload.take() {
@@ -459,11 +470,48 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
     Ok(())
 }
 
-/// The game ended (or hit max_steps): result row and training samples.
-fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>) {
+/// The game ended (or hit max_steps): result row and training samples; a game over at a
+/// deferred terminal is parked instead (its records, root values and payload; `Driver::resolve`
+/// emits them later).
+fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>) -> Result<(), String> {
     let g = slot.game.take().unwrap();
-    let n = slot.n;
     let over = g.to_move().is_none();
+    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves };
+    let records = std::mem::take(&mut slot.records);
+    let rq = std::mem::take(&mut slot.rq);
+    slot.drop_trees();
+    slot.gid = NO_GAME;
+    slot.pending = None;
+    slot.ext_payload = None;
+    slot.legal_ok = false;
+    if over && g.deferred() {
+        let payload = g.deferred_payload().map_err(|e| format!("deferred_payload: {e}"))?;
+        let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(ParkedRecord::park).collect() } else { Vec::new() };
+        let bytes = records.iter().map(|r| r.bytes()).sum::<usize>() as u64;
+        let Done { gid, tag, n, steps, decisions, ext_moves } = done;
+        parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes });
+        return Ok(());
+    }
+    results.push(emit(cfg.record, &g, over, done, records, rq, samples));
+    Ok(())
+}
+
+/// What a finished game's result row needs besides the game.
+pub(super) struct Done {
+    pub gid: u32,
+    pub tag: Option<String>,
+    pub n: usize,
+    pub steps: u64,
+    pub decisions: u32,
+    pub ext_moves: u32,
+}
+
+/// A finished (or resolved) game's result row; its records become samples (`record`, the game
+/// over and records made): `z` = `result()`, `q` = the root search's win estimate (`z` without
+/// one), `sc` = `margin()`, each relative to the record's decider. A game cut at max_steps
+/// (`over` false) is a draw and emits nothing.
+pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, records: Vec<Record>, rq: Vec<Option<[f64; MAX_SEATS]>>, samples: &mut Vec<Record>) -> GameResult {
+    let n = d.n;
     let res: [f32; MAX_SEATS] = if over {
         g.result()
     } else {
@@ -471,22 +519,23 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
         r[..n].fill(1.0 / n as f32);
         r
     };
-    let emit = cfg.record && over && !slot.records.is_empty();
-    results.push(GameResult {
-        gid: slot.gid,
+    let emit = record && over && !records.is_empty();
+    let row = GameResult {
+        gid: d.gid,
         n,
         over,
         result: res[..n].to_vec(),
         scores: (0..n).map(|i| g.score(i)).collect(),
-        steps: slot.steps,
-        decisions: slot.decisions,
-        ext_moves: slot.ext_moves,
+        steps: d.steps,
+        decisions: d.decisions,
+        ext_moves: d.ext_moves,
         rounds: g.rounds(),
-        samples: if emit { slot.records.len() as u32 } else { 0 },
-    });
+        samples: if emit { records.len() as u32 } else { 0 },
+        tag: d.tag,
+    };
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();
-        for (mut r, rq) in slot.records.drain(..).zip(slot.rq.drain(..)) {
+        for (mut r, rq) in records.into_iter().zip(rq) {
             for j in 0..n {
                 let s = (r.player as usize + j) % n;
                 r.z[j] = res[s];
@@ -499,13 +548,7 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
             samples.push(r);
         }
     }
-    slot.records.clear();
-    slot.rq.clear();
-    slot.drop_trees();
-    slot.gid = NO_GAME;
-    slot.pending = None;
-    slot.ext_payload = None;
-    slot.legal_ok = false;
+    row
 }
 
 /// Lay out the group's batches (one per key with rows): external batches are complete here,
@@ -612,6 +655,7 @@ fn finish_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) {
         let mut c = lock(c);
         out.results.append(&mut c.results);
         out.samples.append(&mut c.samples);
+        out.parked.append(&mut c.parked);
     }
     *lock(&grp.out) = Some(out);
     lock(&sh.done)[g] = true;

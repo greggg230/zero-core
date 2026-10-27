@@ -316,3 +316,117 @@ fn cq_target_of_a_searched_root() {
     let t = Tree::new(&g, g.to_move().unwrap(), &legal_of(&g), true, &mut rng);
     assert!(t.cq_target(t.root, 50.0, 1.0).is_empty());
 }
+
+// ------------------------------------------------------------------ deferred terminals, teams
+
+use crate::toy_team::ToyTeam;
+
+/// A toy_team position `left` picks before the deferred terminal (4 players, 2 rounds).
+fn team_position(seed: u64, left: usize) -> ToyTeam {
+    let mut rng = Rng::new(seed);
+    let mut g = ToyTeam::new(4, 2, seed);
+    let mut keys = Vec::new();
+    let mut legal = Vec::new();
+    for _ in 0..8 - left {
+        legal.clear();
+        g.legal_actions(&mut legal);
+        g.step(legal[rng.below(legal.len() as u32) as usize], &mut keys).unwrap();
+    }
+    g
+}
+
+/// Stand-in evaluation of a toy_team leaf: uniform priors, the decider's value from its team's
+/// drafted food lead (relative seats; it sums to 1 over the 4 seats).
+fn team_eval(g: &ToyTeam, player: usize, nacts: usize) -> (Vec<f32>, [f32; MAX_SEATS]) {
+    let lead: i16 = (0..4).map(|s| if s % 2 == player % 2 { g.bonus(s) } else { -g.bonus(s) }).sum();
+    let w = 0.5 / (1.0 + (-(lead as f32) / 3.0).exp());
+    let mut v = [0.0; MAX_SEATS];
+    for (j, x) in v.iter_mut().enumerate().take(4) {
+        *x = if j % 2 == 0 { w } else { 0.5 - w };
+    }
+    (vec![1.0 / nacts.max(1) as f32; nacts], v)
+}
+
+fn legal_of_team(g: &ToyTeam) -> Vec<u16> {
+    let mut l = Vec::new();
+    g.legal_actions(&mut l);
+    l
+}
+
+#[test]
+fn deferred_terminals_are_leaves_evaluated_once() {
+    let mut rng = Rng::new(7);
+    for seed in 0..12 {
+        for left in [2usize, 3] {
+            let g = team_position(seed, left);
+            let p = g.to_move().unwrap();
+            let mut t = Tree::new(&g, p, &legal_of_team(&g), true, &mut rng);
+            assert_eq!(t.team, 2);
+            let mut sg = g.clone();
+            let mut sc = Scratch::default();
+            let (mut deferred_leaves, mut revisits) = (0, 0);
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..300 {
+                // ToyTeam::result() panics at the deferred terminal: the search never calls it
+                match t.simulate(&g, &mut sg, &mut rng, &W, &mut sc).unwrap() {
+                    Sim::Leaf { node, player } => {
+                        let nacts = t.acts(node).len();
+                        if sg.to_move().is_none() {
+                            assert!(sg.deferred() && nacts == 0 && t.is_deferred_leaf(node));
+                            assert_eq!(player, p, "a deferred leaf is evaluated from the viewer's view");
+                            assert!(seen.insert(node), "a deferred node is evaluated once");
+                            deferred_leaves += 1;
+                        }
+                        let (pri, v) = team_eval(&sg, player, nacts);
+                        let (util, win) = leaf_values_team(&v, &[0.0; MAX_SEATS], player, 4, 0.0, t.team);
+                        // utilities are team x win: Q in [0, 1]
+                        assert!((util[p] - 2.0 * win[p]).abs() < 1e-12 && util[p] <= 1.0);
+                        t.expand_leaf(node, &pri, &util, &win);
+                        t.backup(&sc.path, &util, &win);
+                        if nacts == 0 {
+                            assert_eq!(t.win(node).unwrap()[..4], win[..4]);
+                        }
+                    }
+                    Sim::Terminal => revisits += 1,
+                }
+            }
+            assert!(deferred_leaves > 0 && revisits > 0, "seed {seed} left {left}: {deferred_leaves} deferred leaves, {revisits} revisits");
+            let tot: u32 = t.visits(t.root).iter().sum();
+            assert_eq!(tot, 299);
+            let w = t.win(t.root).unwrap();
+            assert!((w[..4].iter().sum::<f64>() - 1.0).abs() < 1e-6);
+            for i in 0..t.acts(t.root).len() {
+                let n = t.n_of(t.root, i);
+                if n > 0 {
+                    let q = t.w_of(t.root, i) / n as f64;
+                    assert!((0.0..=1.0).contains(&q), "Q {q}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn team_utilities_and_terminal_values() {
+    // leaf values: team 1 is leaf_values bit for bit; team T scales the utility, not the win
+    let v = [0.3f32, 0.2, 0.3, 0.2, 0.0, 0.0, 0.0, 0.0];
+    let m = [0.5f32, -0.5, 0.5, -0.5, 0.0, 0.0, 0.0, 0.0];
+    for mw in [0.0, 0.2] {
+        assert_eq!(leaf_values(&v, &m, 1, 4, mw), leaf_values_team(&v, &m, 1, 4, mw, 1));
+        let (u2, w2) = leaf_values_team(&v, &m, 1, 4, mw, 2);
+        let (u1, w1) = leaf_values(&v, &m, 1, 4, mw);
+        assert_eq!(w1, w2);
+        for s in 0..4 {
+            assert!((u2[s] - (u1[s] + w1[s])).abs() < 1e-12);
+        }
+    }
+    // a resolved toy_team terminal: util = 2 x result
+    let mut g = team_position(1, 0);
+    assert!(g.deferred());
+    g.resolve("[[1, 0], [1, 0], [0.5, 0.5], [0, 1]]").unwrap();
+    let (u, w) = terminal_values(&g, 0.0);
+    assert_eq!(&w[..4], &[0.5, 0.0, 0.5, 0.0]);
+    assert_eq!(&u[..4], &[1.0, 0.0, 1.0, 0.0]);
+    let (u, _) = terminal_values(&g, 0.5);
+    assert!((u[0] - (1.0 + 0.5 * (0.25f64).tanh())).abs() < 1e-6);
+}

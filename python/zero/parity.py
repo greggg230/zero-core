@@ -12,6 +12,7 @@
   alternating), both searching with the same network and settings: ~50% within error.
 
   python -m zero.parity positions [--sims 128 --reps 32 --chance-k 0 --cq-c-scale 1.0]
+  python -m zero.parity positions --game toy_team --players 4     (deferred leaves, teams of 2)
   python -m zero.parity h2h --model runs/toy1/models/iter_0010.pt [--games 2000 --sims 32]
   (or python -m <pkg>.az.parity ... in a game repo)
 """
@@ -38,9 +39,12 @@ class LinearEval:
         self.wv = r.normal(0, scale, num_features)
 
     def __call__(self, x, acts, n):
-        lg = x.astype(np.float64) @ self.Wp[:, acts]
-        e = np.exp(lg - lg.max())
-        pri = (e / e.sum()).tolist()
+        if len(acts):
+            lg = x.astype(np.float64) @ self.Wp[:, acts]
+            e = np.exp(lg - lg.max())
+            pri = (e / e.sum()).tolist()
+        else:                                      # a deferred terminal: a value, no priors
+            pri = []
         w = 1.0 / (1.0 + math.exp(-float(x.astype(np.float64) @ self.wv)))
         v = [0.0] * MAX_SEATS
         v[0] = w
@@ -59,7 +63,7 @@ def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
             continue
         node, leaf, path = r
         pri, v, m = ev(leaf.encode(node.player), node.acts, g.n_players)
-        mcts.expand_and_backup(node, path, pri, v, m, g.n_players)
+        mcts.expand_and_backup(node, path, pri, v, m, g.n_players, team=t.team)
     out = (np.asarray(t.root.Nv, float), mcts.root_win(t.root))
     if cq is not None:
         out += (np.asarray(mcts.cq_target(t.root, *cq)),)
@@ -82,16 +86,17 @@ def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
     return out + (t,) if tree else out
 
 
-def sample_positions(game='toy', n=12, seed=0, players=2):
+def sample_positions(game='toy', n=12, seed=0, players=2, depth=(5, 60)):
     """Positions from random play at varying depths (the decider has >= 3 options)."""
     E = engine()
     rng = random.Random(seed)
     out = []
     k = 0
+    lo, hi = depth
     while len(out) < n:
         g = E.Game(game, None, players, 10_000 + seed * 1000 + k)
         k += 1
-        depth = rng.randrange(5, 60)
+        depth = rng.randrange(lo, hi)
         for _ in range(depth):
             if g.over:
                 break
@@ -106,13 +111,15 @@ def tv(a, b):
 
 
 def positions(game="toy", n=12, sims=96, reps=24, chance_k=0, c_puct_rs=1.0, seed=0, verbose=False, scale=0.15,
-              cq=(50.0, 1.0)):
+              cq=(50.0, 1.0), players=2, depth=(5, 60)):
     """-> dict(tv_rs_py, tv_py_py, win_diff, tv_cq_rs_py, tv_cq_py_py) averaged over the
-    positions (tv_cq_*: the same for the mean completed-Q targets with cq = (c_visit, c_scale))."""
+    positions (tv_cq_*: the same for the mean completed-Q targets with cq = (c_visit, c_scale)).
+    `players` / `depth`: the positions' player count and random-play depth range (toy_team: 4
+    players, depth 0-8, so that searches reach its deferred terminals)."""
     info = engine().game_info_of(game)
     ev = LinearEval(info["num_features"], info["num_actions"], seed=1, scale=scale)
     res = {'tv_rs_py': [], 'tv_py_py': [], 'win_diff': [], 'tv_cq_rs_py': [], 'tv_cq_py_py': []}
-    for i, g in enumerate(sample_positions(game, n, seed)):
+    for i, g in enumerate(sample_positions(game, n, seed, players, depth)):
         rs = [search_rs(g, ev, sims, 1000 + r, c_puct_rs, chance_k, cq=cq) for r in range(reps)]
         pa = [search_py(g, ev, sims, 2000 + r, 1.0, chance_k, cq=cq) for r in range(reps)]
         pb = [search_py(g, ev, sims, 3000 + r, 1.0, chance_k, cq=cq) for r in range(reps)]
@@ -182,6 +189,8 @@ def main(argv=None):
     p.add_argument('--chance-k', type=int, default=0)
     p.add_argument('--c-puct-rs', type=float, default=1.0, help='a deliberately different Rust c_puct (power check)')
     p.add_argument('--game', default='toy')
+    p.add_argument('--players', type=int, default=2)
+    p.add_argument('--depth', type=int, nargs=2, default=[5, 60], help='random-play depth range of the positions')
     p.add_argument('--cq-c-visit', type=float, default=50.0)
     p.add_argument('--cq-c-scale', type=float, default=1.0)
     h = sub.add_parser('h2h')
@@ -193,7 +202,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == 'positions':
         print(json.dumps(positions(a.game, n=a.positions, sims=a.sims, reps=a.reps, chance_k=a.chance_k,
-                                   c_puct_rs=a.c_puct_rs, verbose=True, cq=(a.cq_c_visit, a.cq_c_scale))))
+                                   c_puct_rs=a.c_puct_rs, verbose=True, cq=(a.cq_c_visit, a.cq_c_scale),
+                                   players=a.players, depth=tuple(a.depth))))
     else:
         h2h(a.model, a.games, a.sims, a.chance_k, seed=a.seed)
 
