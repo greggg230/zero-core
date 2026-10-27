@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .finite import check_state
 from .protocol import MAX_SEATS
 
 
@@ -444,8 +445,12 @@ def _replace(tmp, dst, tries=40):
 
 
 def save(model, path, extra=None):
-    tmp = path + f'.{os.getpid()}.tmp'          # atomic: a crash never leaves a half-written checkpoint
-    torch.save({'config': model.config, 'state': model.state_dict(), 'extra': extra or {}}, tmp)
+    """Atomic (a crash never leaves a half-written checkpoint); a NaN / inf in any float tensor
+    raises finite.NonFinite instead of writing it (docs/az.md 4.1)."""
+    state = model.state_dict()
+    check_state(state, path)
+    tmp = path + f'.{os.getpid()}.tmp'
+    torch.save({'config': model.config, 'state': state, 'extra': extra or {}}, tmp)
     _replace(tmp, path)
 
 

@@ -5,6 +5,10 @@ renamed: a crash never leaves a half-written shard). Arrays: `x` float16 [N, F],
 `n_players` int8, `opt_off` int32 [N+1], `opt_action` int16/int32, `pi` float16, `z` / `q` /
 `sc` float16 [N, P] (P = most players in the shard), `net` int32, and `meta` (a JSON string:
 game, features, actions, rows, task info). Float16 targets are renormalised on load.
+Non-finite guard (zero/finite.py, docs/az.md 4.1): `write_shard` checks x, pi, z, q, sc after the
+float16 cast; a shard with a NaN / inf is written as `*.bad.npz` instead (the window never loads
+it: `shard_paths` skips it) and the run fails (`NonFinite`). The `Window` checks every shard it
+loads the same way, and remembers where each row came from (`provenance`).
 
 `TargetStats`: sharpness of the recorded policy targets (self-play metrics).
 
@@ -20,9 +24,11 @@ import os
 import numpy as np
 import torch
 
+from .finite import NonFinite, shard_problems
 from .protocol import MAX_SEATS, concat_samples
 
 EXT = '.npz'
+BAD = '.bad.npz'                  # a quarantined shard (non-finite values): never loaded
 
 
 def _narrow_int(a):
@@ -44,9 +50,25 @@ def compact(s):
             'sc': s['sc'][:, :P].astype(np.float16), 'net': s['net'].astype(np.int32)}
 
 
-def write_shard(path, s, meta):
+def write_shard(path, s, meta, bad_path=None):
+    """Write the samples `s` to `path` (atomic) -> (rows, bytes). Non-finite values after the
+    float16 cast: the shard goes to `bad_path` (default: `path` as *.bad.npz) and NonFinite is
+    raised naming the arrays, rows, columns and the meta."""
     c = compact(s)
     meta = dict(meta, rows=int(len(c['player'])))
+    probs = shard_problems(c)
+    if probs:
+        bad = bad_path or path[:-len(EXT)] + BAD
+        os.makedirs(os.path.dirname(os.path.abspath(bad)), exist_ok=True)
+        _save_npz(bad, c, dict(meta, nonfinite=probs, shard=path))
+        raise NonFinite(f'non-finite sample values in shard {os.path.basename(path)} (meta {json.dumps(meta)}): '
+                        + '; '.join(probs) + f'. The samples were kept in {bad} (never loaded by the window); '
+                        f'the run stops here')
+    _save_npz(path, c, meta)
+    return meta['rows'], os.path.getsize(path)
+
+
+def _save_npz(path, c, meta):
     tmp = path + f'.{os.getpid()}.tmp.npz'
     np.savez(tmp, meta=np.array(json.dumps(meta)), **c)
     for k in range(40):
@@ -58,7 +80,6 @@ def write_shard(path, s, meta):
                 raise
             import time
             time.sleep(0.25)
-    return meta['rows'], os.path.getsize(path)
 
 
 def read_shard(path):
@@ -69,15 +90,18 @@ def read_shard(path):
 
 
 def shard_paths(d):
-    return sorted(glob.glob(os.path.join(d, '*' + EXT)))
+    """The loadable shards of a data directory (not *.bad.npz, not *.tmp.npz)."""
+    return sorted(p for p in glob.glob(os.path.join(d, '*' + EXT)) if not p.endswith((BAD, '.tmp' + EXT)))
 
 
 class ShardWriter:
-    """Collects driver sample dicts and writes a shard every `rows` samples (and at close)."""
+    """Collects driver sample dicts and writes a shard every `rows` samples (and at close).
+    `bad_dir`: where a shard with non-finite values is quarantined, as
+    `<data dir name>_<prefix>_SSS.bad.npz` (default: next to the good ones, `*.bad.npz`)."""
 
-    def __init__(self, d, prefix, rows=65536, meta=None):
+    def __init__(self, d, prefix, rows=65536, meta=None, bad_dir=None):
         os.makedirs(d, exist_ok=True)
-        self.d, self.prefix, self.rows, self.meta = d, prefix, rows, dict(meta or {})
+        self.d, self.prefix, self.rows, self.meta, self.bad_dir = d, prefix, rows, dict(meta or {}), bad_dir
         self.buf = []
         self.nbuf = 0
         self.k = 0
@@ -98,8 +122,11 @@ class ShardWriter:
         self.buf, self.nbuf = [], 0
         if s is None:
             return
-        path = os.path.join(self.d, f'{self.prefix}_{self.k:03d}{EXT}')
-        rows, nbytes = write_shard(path, s, self.meta)
+        name = f'{self.prefix}_{self.k:03d}'
+        bad = None
+        if self.bad_dir:
+            bad = os.path.join(self.bad_dir, f'{os.path.basename(os.path.normpath(self.d))}_{name}{BAD}')
+        rows, nbytes = write_shard(os.path.join(self.d, name + EXT), s, self.meta, bad)
         self.k += 1
         self.samples += rows
         self.bytes += nbytes
@@ -163,19 +190,29 @@ def _ranges(starts, lens):
 
 class Window:
     """The training window in RAM. paths: shard files; `budget_rows`: keep at most this many
-    samples (a uniform random share of every shard)."""
+    samples (a uniform random share of every shard). A shard with a NaN / inf raises NonFinite."""
 
     def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0):
         self.F, self.A = num_features, num_actions
+        self.paths = list(paths)
         rng = np.random.default_rng(seed)
-        parts = [read_shard(p) for p in paths]
+        parts = []
+        for p in self.paths:
+            parts.append(read_shard(p))
+            probs = shard_problems(parts[-1])
+            if probs:
+                raise NonFinite(f'non-finite sample values in shard {p} (meta {json.dumps(parts[-1]["meta"])}): '
+                                + '; '.join(probs) + '. Move it out of the data directory (or rename it to '
+                                '*.bad.npz) to train without it')
         total = sum(len(p['player']) for p in parts)
         keep = 1.0 if not budget_rows or total <= budget_rows else budget_rows / total
         xs, pl, npl, offs, acts, pis, zs, qs, scs = [], [], [], [np.zeros(1, np.int64)], [], [], [], [], []
+        src = []
         base = 0
         for p in parts:
             N = len(p['player'])
             idx = np.arange(N) if keep >= 1.0 else np.sort(rng.choice(N, size=max(1, int(round(N * keep))), replace=False))
+            src.append(idx.astype(np.int32))
             x = p['x'][idx]
             if x.shape[1] > self.F:
                 x = x[:, :self.F]
@@ -199,6 +236,8 @@ class Window:
         self.N = sum(len(x) for x in xs)
         if self.N == 0:
             raise ValueError('empty training window')
+        self.src_row = np.concatenate(src)                     # window row -> its row in its shard
+        self.starts = np.concatenate([[0], np.cumsum([len(i) for i in src])])
         self.x = np.concatenate(xs)
         self.player = np.concatenate(pl)
         self.n_players = np.concatenate(npl)
@@ -213,6 +252,12 @@ class Window:
         self.loaded = total
         self.nbytes = sum(a.nbytes for a in (self.x, self.player, self.n_players, self.opt_off, self.opt_action,
                                              self.pi, self.z, self.q, self.sc))
+
+    def provenance(self, idx):
+        """Window rows -> [(shard path, its rows in that shard, sorted)]."""
+        idx = np.asarray(idx, np.int64)
+        sh = np.searchsorted(self.starts, idx, side='right') - 1
+        return [(self.paths[k], np.unique(self.src_row[idx[sh == k]])) for k in np.unique(sh)]
 
     def batch(self, idx, device='cpu'):
         B = len(idx)
