@@ -14,8 +14,9 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 
 | File (`python/zero/`) | What |
 |---|---|
-| `package.py` | The game package registry: `GamePackage` (name, root, engine module, run module, presets, DEFAULTS overrides, external players, specs, decision kinds, dashboard title / port, env prefix), `register`, `active` |
+| `package.py` | The game package registry: `GamePackage` (name, root, engine module, run module, presets, DEFAULTS overrides, external players, specs, decision kinds, dashboard title / port, env prefix, deferred-result glue), `register`, `active` |
 | `run.py` | The loop: `DEFAULTS`, `PRESETS` (the toy's + the package's), self-play (classic or rolling), training, evaluation, Elo, resume, STOP / PAUSE |
+| `cotrain.py` | Co-training (section 11): a primary game whose deferred terminals the episodes of a resolver game decide, one network each in one run: `CoRun` (the loop), `Coordinator` (parked games -> queued episodes -> results by tag -> `resolve`), `run_pair` (two drivers on two threads), `PrimaryRun` (team events as matches) |
 | `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions; all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
 | `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place; `workers`: eager batches on threads), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
 | `data.py` | Sample shards (`ShardWriter`, atomic npz; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (checks every shard; row provenance), `TargetStats` |
@@ -75,6 +76,10 @@ settings a run has not stored yet; a run directory keeps its settings across cod
   5), yardstick `ext:toyheur` (the toy heuristic through the external-seat path, as the JS bots
   play the games), 400 evaluation games at 32 sims, 100 against random, 100 games per Elo
   match, 4 search threads.
+* `toy-cotrain-smoke`: co-training on the toys (section 11): 2v2 `toy_team` events (8 resolved
+  per iteration, yardstick `greedy`) whose four matches each are toy games played by the toy
+  network (`resolver` 'toy', its settings the `toy-smoke` preset with the `heuristic` yardstick),
+  2 iterations (~30 s).
 * Game presets come with the game package (`GamePackage.presets`): Caverna Zero
   `caverna-smoke`, `caverna-2p`, `caverna-2p-cq`; Glass Road Zero `glassroad-smoke`,
   `glassroad-2p`, `glassroad-2p-cq` (each repo's docs/az.md).
@@ -108,6 +113,11 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
+| `resolver` | '' | co-training (section 11): the resolver game, whose episodes decide this game's deferred terminals ('' = a single-game run: this loop, line for line) |
+| `resolver_cfg` | {} | the resolver's settings (a JSON object of these same settings: spec, players, network, search, training, evaluation; `preset` names one), saved nested in config.json; resolved into `<run>/resolver/config.json` |
+| `resolver_init` | '' | the checkpoint the resolver's network starts from ('' = fresh); a single-game run's checkpoint works (widened if the game grew) |
+| `resolver_conc`, `pending_max` | 0, 0 | resolver episodes in flight in self-play (0 = its `conc`); the backpressure: resolver episodes queued or playing at which the primary's self-play waits (0 = 2 x in flight) |
+| `draft_eval_net_every` | 4 | the primary's evaluation also plays its episodes with the resolver's network on evaluated iterations that are multiples of it (`eval_yard_net`; 0 = never); the rest of its evaluation plays them with the resolver's yardstick |
 
 ## 2. Run control (`runctl.py`)
 
@@ -139,7 +149,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor) and the current fit |
-| `progress.json` | self-play progress of the iteration in flight (dashboard) |
+| `progress.json` | self-play progress of the iteration in flight (dashboard); a co-training run's also has `events_resolved`, `target`, `drafting`, `pending_events`, `matches_queued`, `matches_in_flight`, `matches_done` (section 11) |
+| `resolver/` | a co-training run's resolver network (section 11): the same layout (`config.json`, `metrics.jsonl`, `models/`, `data/`, `elo/`, `debug/`, `progress.json`), iteration numbers shared |
 | `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control |
 
 ## 4. Training
@@ -523,3 +534,125 @@ threads) against the MLP 256 x 3 (4.19M).
   made one action dominate (55% PASS), a zero value head made every search a tie (ties play the
   first option); the policy output layers now start at zero and the value head stays random
   (section 10).
+
+## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
+
+MTG Zero's team cube draft (its DESIGN.md 2.3, 5.1) is a game whose result is decided outside
+it: a `team_draft` event (two teams draft and build decks) ends at a **deferred terminal**, and
+its outcome is that of the event's `mtg` matches, which are themselves the self-play of the
+play network. So one run trains two networks: the **primary** (`team_draft`, the draft network)
+and the **resolver** (`mtg`, the play network). The core knows neither: the trait hook
+(`deferred`, `deferred_payload`, `resolve`, `team_size`; docs/search.md 1.1), the search's
+deferred leaf (docs/search.md 3.2), the driver's parking and queued setups (docs/search.md
+2.8-2.9), and this loop. The toys play both roles in the tests (`toy_team` events whose matches
+are toy games; preset `toy-cotrain-smoke`).
+
+### 11.1 Settings and directories
+
+`--resolver <game>` turns a run into a co-training run; the resolver's settings are
+`resolver_cfg` (a dict of the run settings; `DEFAULTS` + the package's < its `preset` < the dict;
+co-training keys inside it are errors, as are unknown ones), saved nested in `config.json` and
+resolved into `<run>/resolver/config.json`; `resolver_init`, `resolver_conc`, `pending_max`,
+`draft_eval_net_every` (section 1.2). The primary keeps the run directory as a single-game run
+does (`models/`, `data/`, `elo/`, `metrics.jsonl`, `progress.json`: the dashboard and the tools
+work unchanged); the resolver has `<run>/resolver/` with the same layout. One player count per
+game (`players`). Its `iters`, `games`, `rolling` and `eval_remote` are not used (`eval_remote`
+is refused).
+
+**The game package's glue** (`GamePackage.deferred`, game -> `{'episodes': fn(payload) ->
+[resolver spec JSON, ...], 'results': fn(payload, rows) -> results JSON}`): the defaults read
+the payload's `"episodes"` list and send `[{"result": [...], "scores": [...]}, ...]` in order
+(an episode cut at `max_steps` arrives as a draw). An empty episode list is an error.
+
+### 11.2 An iteration
+
+* **Self-play** (`CoRun.selfplay`): two rolling drivers in the run process - the primary's
+  (network i - 1, recording) on the main thread and the resolver's (network i - 1, recording,
+  `queue_only`, `resolver_conc` games in flight) on a worker thread (`infer.drive` on each; a
+  driver is only ever called from its own thread: its `next_batch` holds it while it waits), joined
+  by a `Coordinator`. Each game the primary parks becomes queued episodes (tags `<gid>/<k>`);
+  their result rows come back by tag; when all are in, the game is resolved (its samples, with
+  the real outcome, go to `data/iter_i/`; the episodes' samples to `resolver/data/iter_i/`). The
+  phase ends when `games` primary games have been **resolved** in it - exactly: ready ones
+  beyond the quota wait for the next phase - and the resolver's phase ends with it
+  (`end_phase`). Games still playing, parked, queued or ready carry over in memory; the next
+  iteration's networks restart their searches (a new epoch in both drivers).
+  **Backpressure**: while `pending_max` resolver episodes are queued or playing, the primary
+  stops taking batches (its in-flight games wait) and resolves what comes back.
+* **Training** (`CoRun.train`): the primary's network on its window, then the resolver's on its
+  own (`Run.train_model`, each with its own settings), then the non-finite guard on both
+  checkpoints and optimizer states, then both are saved (`Run.save_trained`): a NaN in either
+  network writes neither.
+* **Evaluation** (`CoRun.finish_iter`): the resolver as a single-game run (its yardstick,
+  random, Elo between its checkpoints: `resolver/metrics.jsonl`, `resolver/elo/`), then the
+  primary (`PrimaryRun`): its matches are **events** (`CoRun.event_match`), team seats
+  alternating between the two players (seat s in team s % (n / team_size): game g gives team g %
+  teams to the first player), each event's episodes played by a second, non-recording resolver
+  driver - with the resolver's **yardstick** on every seat (`eval_yard` vs the primary's
+  yardstick, `eval_random`, the Elo matches against earlier primary checkpoints, the reference
+  games random vs the yardstick: the primary's Elo pool in `elo/`, one play agent) and, on
+  evaluated iterations that are multiples of `draft_eval_net_every`, with the resolver's
+  **network** of the same iteration (`eval_yard_net`: in metrics.jsonl, not in the Elo fit, a
+  different play agent). A row's score is its team's outcome, its margin the team's score less
+  the best other team's.
+* **progress.json** during self-play: `{iter, phase, events_resolved, target, drafting,
+  pending_events, matches_queued, matches_in_flight, matches_done, games, time}` (`games` =
+  `events_resolved`, for the dashboard).
+* **metrics.jsonl**: the primary's rows as a single-game run's (`selfplay.games` = games
+  resolved) plus `selfplay.cotrain` (`events`, `episodes` and `episodes_per_h`, `pending_events`,
+  `episodes_queued`, `episodes_waiting`, `parked_mb_max`, `event_latency_s` [mean, max] from park
+  to resolve, `resolve_delay_ms` [mean, max] from the last episode's result to `resolve`,
+  `backpressure_s`, `pending_max`, `resolver_conc`) and `eval_yard_net`;
+  `resolver/metrics.jsonl` as a single-game run's (`selfplay.games` = episodes finished).
+
+### 11.3 Resume, control, tools
+
+* **Resume**: the newest iteration with both checkpoints; an iteration interrupted before both
+  is replayed from its start (both data directories cleared; games in flight are gone, and the
+  episodes already played for them stay only in the replayed iteration's data if it completes);
+  one interrupted after them finishes its evaluations from each network's
+  `models/iter_NNNN.json` (tested: PAUSE mid self-play, then resume; an iteration with both
+  checkpoints and no metrics).
+* **PAUSE / STOP / the supervisor / kill_run** work on the one process (a PAUSE noticed on the
+  main thread stops the resolver thread first). `fork_run --source` copies a co-training run with
+  both networks (at an iteration where both have a checkpoint). **Bootstrap**: iteration 0 = a
+  fresh primary network and a fresh resolver network, or `resolver_init`.
+* **NonFinite names the network** (`primary net (<game>): ...`, `resolver net (<game>): ...`);
+  quarantined shards and failing batches go to `<run>/debug/` or `<run>/resolver/debug/`.
+
+### 11.4 Measured (desktop, 2026-10-27, other projects' runs on the machine)
+
+`toy-cotrain-smoke` with `--games 300 --conc 64 --sims 32 --sims-fast 8 --resolver-conc 128`
+and the resolver at 32 / 8 simulations, 2 iterations:
+
+| | CPU (both networks) | CUDA (both networks) |
+|---|---|---|
+| resolver (toy matches) leaves/s, iterations 1 / 2 | 134k / 140k | 30.5k / 27.5k |
+| resolver alone (a single-game rolling run, same settings) | | 27.8k / 31.6k |
+| primary leaves/s; its time waiting for backpressure | 9.5k / 8.6k; 3.2 of 3.9 s | 2.2k / 1.6k; 13.7 of 17.2 s |
+| event latency, park -> resolve (mean / max) | 0.77 / 1.0 s | |
+| coordinator delay, last result -> resolve (mean / max) | 0.11 / 2.4 ms | |
+| parked memory (max) | 32 KB (70 events of 64 features) | |
+
+* **GPU sharing**: the two drivers on two threads, each with its own evaluator on the same GPU,
+  do not slow each other measurably on the toy (the resolver's leaves/s with the primary
+  alongside are within the run-to-run spread of it alone; the toy's tiny network is per-call
+  bound on CUDA, slower than the CPU). The primary is ~7% of the leaves and waits for the
+  episodes most of the time - MTG's budget (its DESIGN.md 2.3.9) expects ~11-13%.
+* **Parking**: records are float16 (2 bytes per feature): MTG's 4v4 event, ~185 records of 14,488
+  features, ~5.4 MB parked. MTG Zero measures `team_draft`'s (its ENGINE.md 43).
+* **The coordinator** costs nothing measurable: the delay between an event's last episode and
+  its `resolve` is a fraction of a millisecond (the primary resolves after every batch).
+* Single-game runs are untouched: toy-smoke (rolling, and classic with margin_w, chance_k and
+  cq targets) gives the same metrics, checkpoints, optimizer states and shards byte for byte as
+  zero-core 681ba8d; the toy golden digests (`check_checkpoint_compat`, random and uniform
+  evaluators) are identical.
+
+Tests: `tests/test_deferred.py` (the toy team game through the bindings, deferred leaves Rust vs
+Python exactly and statistically, team utilities, empty option segments in the evaluators, the
+driver's parking, `resolve`, queued setups, `queue_only`, tags), `tests/test_cotrain.py` (two
+iterations of `toy-cotrain-smoke`, PAUSE mid self-play and resume, resume after the
+checkpoints, NonFinite in each network, `resolver_init` from a single-game checkpoint,
+`fork_run`, settings checks), the crate's `toy_team`, `tree` and `driver` tests (deferred leaves
+evaluated once and backed up, team utilities, parking and resolving with samples, rolling
+quotas counting resolved games, queued setups, float16 rounding).

@@ -16,10 +16,11 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 | `crates/search/src/tree.rs` | One search tree: PUCT, chance children, determinization, noise, reuse, `compact`, completed-Q targets |
 | `crates/search/src/driver.rs`, `driver/worker.rs` | Batched multi-threaded driver: groups, chunks, parallel batch assembly, playout cap, temperature, records, rolling phases, arena keys, external seats |
 | `crates/search/src/toy.rs` | "Mini Cavern", the toy game (section 5) + its heuristic bot |
+| `crates/search/src/toy_team.rs` | "Toy team", a two-team game with a deferred result decided by toy games (section 5.1) |
 | `crates/search/src/dynapi.rs` | Object-safe wrappers (`DynGame`, `DynTree`, `DynDriver`) so the bindings hold any game |
 | `crates/search/src/rng.rs`, `noise.rs` | xoshiro256++ / splitmix64, Gamma / Dirichlet |
 | `crates/py/src/lib.rs` | `zero_py`: `Game`, `SearchTree`, `SearchDriver`, `game_names()`, `game_info_of()`, the `engine_module!` macro (section 4) |
-| `crates/toy_py/src/lib.rs` | the core's own module `zero._engine` (the toy only) |
+| `crates/toy_py/src/lib.rs` | the core's own module `zero._engine` (`toy`, `toy_team`) |
 | `python/zero/mcts.py`, `play.py` | Python reference MCTS and driver (`PyDriver`, seats searching with the Python or the Rust tree) |
 | `python/zero/protocol.py` | Leaf-batch protocol: `LeafBatch`, validators, `MAX_SEATS` |
 | `python/zero/parity.py` | Rust-vs-Python statistical parity (section 6) |
@@ -27,8 +28,8 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 Build: `bash tools/build_py.sh` (the toy module: release cdylib copied to
 `python/zero/_engine.pyd`; target dir `$CARGO_TARGET_DIR` or `E:/cargo-target/zero-core/<branch>`
 on Windows). A game builds its own `<pkg>._engine` with its `tools/build_py.sh` (docs/pinning.md).
-Tests: `cargo test` (the `zero_search` crate: 28 tests, < 1 s in release), `python -m pytest
-tests` (48 tests on the toy, ~1.5 min on the loaded desktop).
+Tests: `cargo test` (the `zero_search` crate: 40 tests, ~5 s in release), `python -m pytest
+tests` (101 tests on the toys, ~2.5 min on the loaded desktop).
 
 ## 1. The trait (final version)
 
@@ -57,6 +58,10 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn encode(&self, viewer: usize, out: &mut [f32]);               // out is zeroed by the caller
     fn rounds(&self) -> u32 { 0 }                                   // reports
     fn minor_decision(&self) -> bool { false }                      // the pending decision is minor (sims_minor)
+    fn deferred(&self) -> bool { false }                            // over, the result from outside (1.1)
+    fn deferred_payload(&self) -> Result<String, String> { Ok(String::new()) } // what decides it (JSON)
+    fn resolve(&mut self, results: &str) -> Result<(), String> { Err(..) }     // the outside's results
+    fn team_size(&self) -> usize { 1 }                              // seats per team (1.1)
     fn export_state(&self) -> String { .. }                         // external seats: the state (JSON)
     fn apply_external(&mut self, payload: &str, chance: &mut Vec<u64>) -> Result<(), String> { Err(..) }
     fn bot_names() -> &'static [&'static str] { &[] }               // built-in bots ('random' is generic)
@@ -83,6 +88,11 @@ Changes from the original sketch (Caverna Zero DESIGN.md 5), and why:
   Games that do not implement it (every game but MTG) are unaffected, as are seats without the
   setting (`driver::tests::minor_decisions_get_their_own_budget_and_no_records`: the golden
   records are unchanged).
+* `deferred`, `deferred_payload`, `resolve`, `team_size` (2026-10-27, MTG Zero M6 part 2:
+  section 1.1). Games that do not implement them (every game but MTG Zero's `team_draft` and the
+  core's `toy_team`) are unaffected: the golden records are unchanged, and a single-game run
+  (toy-smoke, rolling and classic, with margin_w / chance_k / cq) produces the same metrics,
+  checkpoints, optimizer state and sample shards byte for byte as zero-core 681ba8d.
 * `bot_names` / `make_bot`: game-specific built-in bots (the toy heuristic; Glass Road could
   add a Rust port of the JS bot later, Glass Road Zero DESIGN.md 6).
 * NUM_ACTIONS / NUM_FEATURES / players stay associated constants (one Rust type per game; the
@@ -115,6 +125,32 @@ Contract details a game must honour (the toy's tests check each):
   per decision on the path calls `step` and `legal_actions` (cache legality inside the game
   if it is expensive - Caverna's exact-legality layer).
 
+### 1.1 Deferred results and teams (MTG Zero M6, 2026-10-27)
+
+A game whose result is decided **outside** it: MTG Zero's `team_draft` (an event drafted and
+built by two teams) ends when the decks are built, and its result is the outcome of the event's
+`mtg` matches, played later by another network (co-training: docs/az.md 11). Such a game is
+over (`to_move()` None) at a **deferred terminal**: `deferred()` is true until `resolve(results)`.
+
+* `deferred_payload()` (JSON) says what must be played: by the run's convention
+  `{"episodes": [<a spec of the resolver game>, ...], ...}` (the run's game package may read
+  another format: `GamePackage.deferred`, docs/az.md 11). The driver calls it once, when it
+  parks the game (an error there stops the driver, naming the game).
+* `resolve(results)` takes the episodes' results (JSON, in the payload's order; the run sends
+  `[{"result": [...], "scores": [...]}, ...]`) and sets the outcome; afterwards `deferred()` is
+  false and `result()`, `margin()`, `score()` hold it. A malformed or impossible result is an
+  error, never a default (the driver keeps the game parked and reports it).
+* While deferred, **nothing reads `result()` or `margin()`**: the search evaluates the terminal
+  with the network (section 3.2), the driver parks the game (2.8), the bindings refuse
+  `Game.result()` / `margin()` (ValueError). A game should make them fail loudly there
+  (`toy_team` and `team_draft` panic).
+* `team_size()` = T: seats per team, seat `s` in team `s % (num_players() / T)` (MTG Zero's A1
+  B1 A2 B2 ... seating: team `s % 2`). `result()[s]` is the team's outcome divided by T (the
+  vector still sums to 1: the value head stays a softmax over seats), and the search's utility
+  is `T x win[s]` (+ the margin term, section 3), so Q stays in [0, 1] and `c_puct`,
+  `cq_c_scale` keep their meaning. Evaluation seats teams alternately with this rule
+  (docs/az.md 11). Default 1: every seat alone, the utility as before (bit for bit).
+
 ## 2. The driver protocol (Python <-> Rust)
 
 ```python
@@ -126,6 +162,8 @@ drv.submit(lb.id, priors, value, margin)        # network batch
 drv.submit_external(lb.id, payloads)            # external batch: one str per request
 drv.take_results(); drv.take_samples(); drv.stats(); drv.in_flight()
 drv.resume(quota, net); drv.end_phase(); drv.paused; drv.finished; drv.keys
+drv.take_deferred(); drv.resolve(gid, results); drv.pending     # deferred games (2.8)
+drv.enqueue(tag, spec); drv.queued                              # queued setups (2.9; queue_only=True)
 ```
 
 `infer.drive(drv, evaluators, externals, check=..., on_batch=...)` is the loop:
@@ -147,14 +185,16 @@ key one external player. A key cannot be both.
 | field | dtype / shape | content |
 |---|---|---|
 | `x` | f32 [B, F] | `encode(decider)` of the (determinized) leaf state |
-| `opt_off` | i32 [B+1] | leaf b's legal actions = `opt_action[opt_off[b]:opt_off[b+1]]` (>= 2) |
+| `opt_off` | i32 [B+1] | leaf b's legal actions = `opt_action[opt_off[b]:opt_off[b+1]]` (>= 2; none at a deferred terminal, 3.2) |
 | `opt_action` | i32 [sum] | global action ids in the game's order |
 | `player`, `n_players`, `gid` | i32, i32, i64 [B] | decider (absolute), players, game index |
 
 Answer: `priors` f32 [sum] (softmax over each leaf's legal actions), `value` f32 [B, 8] =
 P(win) per seat **relative to the decider** (column j = seat (player + j) % n; columns >= n
 are 0), `margin` f32 [B, 8] (same order). `NetEvaluator` does the gather + segment softmax on
-the device.
+the device. A row with an empty option segment is a deferred terminal's leaf: its value and
+margin are used, it has no priors (`NetEvaluator`, the CUDA-graph path and `UniformEvaluator`
+handle empty segments; `protocol.validate_batch` allows 0 or >= 2 options).
 
 ### 2.3 Rules of the exchange
 
@@ -190,8 +230,9 @@ samples are emitted when it ends.
 
 ### 2.5 Results (`take_results`)
 
-`{gid, n, over, result, scores, steps, decisions, ext_moves, rounds, samples}`; a game cut at
-`max_steps` has `over` False and result 1/n each.
+`{gid, n, over, result, scores, steps, decisions, ext_moves, rounds, samples, tag}`; a game cut
+at `max_steps` has `over` False and result 1/n each; `tag` is the tag of the queued setup the
+game started from (2.9), else None. A deferred game's row comes when it is resolved (2.8).
 
 ### 2.6 Rolling mode
 
@@ -231,6 +272,33 @@ of ours: the check must then be skipped (or done on a projection both sides shar
 Zero's `ext:jsbot` (`cvz.az.games.JsBotExternal`) sends a batch's states in one `decide_many`
 call and answers `{"actions", "h"}`.
 
+### 2.8 Deferred games: parking and `resolve`
+
+A game that ends at a deferred terminal (1.1) is **parked**: its training records (features
+stored as float16: the shards store them so anyway, so nothing written changes; `Record` ->
+`ParkedRecord`), root-search win estimates (`q`), steps and counters, and its slot starts the
+next game (rolling) at once. `take_deferred()` -> `[(gid, payload)]` hands each parked game out
+once; `resolve(gid, results)` calls the game's `resolve` and then emits its result row and
+samples **exactly as a finished game's** (`z` from `result()`, `q` from the root values, `sc` from
+`margin()`, relative to each record's decider; the shared `worker::emit`). `pending` counts parked
+games; `parked_game(gid)` (Rust) shows one. Rolling quotas (2.6) count finished and **resolved**
+games, never parked ones, so a phase ends when enough games have been resolved; parked games
+survive phases. `finished` is false while games are parked. A game the driver did not park, a
+result the game refuses (it stays parked) or a game still deferred after `resolve` is an error.
+Stats: `parked`, `parked_bytes` (the records' memory), `deferred` (parked so far), `resolved`.
+The Python reference driver (`play.PyDriver`) does not park: it raises at a deferred terminal.
+
+### 2.9 Queued setups (`enqueue`, `queue_only`)
+
+`enqueue(tag, spec)` queues a game setup: the next game a free slot starts takes that spec (JSON
+or a dict; parsed at once, an invalid spec is an error at `enqueue`) instead of the driver's,
+with the driver's seats and its (seed, gid) streams; its result row carries `tag`.
+`queue_only=True` (rolling drivers only) makes slots start nothing but queued setups: with the
+queue empty they stay idle, and `next_batch` returns None once nothing is left to play (the
+phase has not ended: `enqueue` wakes the idle groups unless the phase ended). Co-training's
+resolver driver is one (docs/az.md 11): it plays the episodes of parked games, tagged
+`<gid>/<k>`, with the play network on every seat.
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),
@@ -251,7 +319,8 @@ call and answers `{"actions", "h"}`.
   `encode(decider)`; the reply expands the node; the leaf itself gets no visit from its own
   evaluation).
 * **Backup** along the path: N_i += 1, W_i += util[decider], tot += 1, wsum += win;
-  util = win + margin_w * tanh(margin) (network margin, or `margin()` at terminals).
+  util = T x win + margin_w * tanh(margin) (network margin, or `margin()` at terminals; T =
+  `team_size`, 1 but in team games: section 1.1, `leaf_values_team`, `Tree::team`).
 * **Per decision**: single-option decisions are not searched; playout cap (`p_full` share
   gets `sims` and is recorded, the rest `sims_fast`; a minor decision of a self-play seat with
   `sims_minor` gets `sims_minor` and is never recorded, the playout-cap draw being made all the
@@ -310,6 +379,23 @@ recorded decision (self-play network seat, full search) differs:
   `cq_c_scale` (`run.py` passes them to the self-play seat only; evaluation seats record
   nothing). Measured on Glass Road and the toy: docs/az.md 9.
 
+### 3.2 Deferred terminals in the tree
+
+A walk whose transition ends the game at a deferred terminal (1.1) does not read a result:
+it reaches a child node of **no options decided by the tree's viewer**, keyed like any child
+(chance key of the transition, the viewer, no actions; it cannot meet a decision node, whose
+options are never empty). Unexpanded, it is a **leaf** like any other (`Sim::Leaf { node, player:
+viewer }`): the network evaluates `encode(viewer)` of the (determinized) terminal state - its own
+estimate of the outcome, the quantity it learns from the resolved results - with an empty
+option segment (no priors). `expand_leaf` stores the utility in `vec` and the win vector in
+`wsum` (`tot` = 1); every later walk that reaches the node backs that stored value up
+(`Sim::Terminal`) instead of evaluating again. Worlds that reach the terminal through the same
+actions and keys share the node, as decisions do; the encoding is the viewer's knowledge, so it
+is the same in all of them. The Python reference (`mcts.simulate`) does the same with
+`Node(viewer, [])`; Rust and Python agree exactly where nothing is left to chance and
+statistically elsewhere (section 6). `ToyTeam::result()` panics at the terminal, so the tests
+prove the search never calls it.
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:
@@ -346,7 +432,24 @@ ones, `force_chance` replays a reveal); integer **scores with ties** (~5-10% of 
 Rules in the module docs. 18 actions (13 spaces + PLOW, SKIP, INC0, INC1, DONE), 195
 features (viewer-relative seats). Bots: `random`, `heuristic` (food planning with a buffer,
 growth only with food to spare, rooms to grow, farming, points in the last round: 96% vs
-random). Chance keys `round << 16 | card << 8 | marker`.
+random). Chance keys `round << 16 | card << 8 | marker`. Spec `{}` or `{"food": [a, b, ...]}`
+(extra starting food per seat: `toy_team`'s matches; the default spec plays as before).
+
+### 5.1 The toy team game: "Toy team" (`crates/search/src/toy_team.rs`, `toy_team`)
+
+The core's test bed for deferred results, teams and co-training, shaped like MTG Zero's
+`team_draft`: 2 or 4 seats, seat `s` in team `s % 2` (team size n / 2). Each of `rounds` rounds
+(spec `{"rounds": 1-3}`, default 2) deals an offer of n + 1 cards from a shuffled deck of 16
+(card c is worth c % 4 food), every seat picks one (round r starts at seat r % n), the last card
+is discarded. Then the game is at its **deferred terminal**: the payload lists toy matches,
+A player i (seat 2i) against B player (i + d) mod T for every rotation d (1v1: one match, 2v2:
+four), each player with its picks' total as extra starting food (`{"episodes": [{"food": [a,
+b]}, ...], "pairs": [...]}`); `resolve` takes their results (1/0, 0/1, 0.5/0.5 each): a team wins
+with more match wins (`result` 1/T or 0 per seat, 1/2T each on a draw), margin = (team match wins
+- opponent match wins) / matches. Hidden information: the undealt deck (`determinize`
+reshuffles it); each later offer is a chance key `round << 32 | mask` (`force_chance` deals a
+queued offer if its cards are undealt). `result()` / `margin()` panic before `resolve`. 16
+actions (card ids), 64 features. Bots: `random`, `greedy` (the most food).
 
 ## 6. Parity: Rust search vs Python reference
 
@@ -382,6 +485,20 @@ result). The c_scale 1 targets' noise floor is ~10x the visit distributions' (a 
 moves its mass between options whose Q are close), on Glass Road at 64 simulations most of all.
 `tests/test_mcts.py` asserts both TVs, `tests/test_policy_target.py` the formula, the drivers
 (Rust and Python: only `pi` changes) and the settings.
+
+**Deferred leaves and teams** (`python -m zero.parity positions --game toy_team --players 4
+--depth 0 8`; `tests/test_deferred.py`), 2026-10-27, 96 simulations: positions in the last round
+(nothing left to chance) search identically in Rust and Python - the same visit counts, root
+win (1e-9) and completed-Q targets (1e-6), with deferred leaves evaluated once per node (12 of
+12 positions, 200 simulations) - and over the whole game the statistics sit at the noise floor:
+
+| setting | TV(Rust, Python) | TV(Python, Python) floor | root win \|Rust - Python\| | cq TV (floor) |
+|---|---|---|---|---|
+| 2v2, 12 positions, 32 reps | 0.0066 | 0.0072 | 0.0006 | 0.037 (0.032) |
+| 1v1, 12 positions, 32 reps | 0.0033 | 0.0034 | 0.0005 | 0.023 (0.031) |
+| 2v2, Rust c_puct 1.3 (power check) | 0.029 | 0.0029 | 0.0017 | 0.037 (0.016) |
+
+(Positions whose search is deterministic count as 0 for both; the others carry the noise.)
 
 `python -m zero.parity h2h --model M --games 6000 --sims 32`: Rust-tree seat vs Python-tree
 seat in `PyDriver`, the same network, seats alternating (docs/az.md 6.2): **49.94% +-1.04**
