@@ -390,6 +390,20 @@ def test_unknown_selfplay_remote_is_refused(tmp_path):
     assert p.returncode != 0 and "selfplay_remote 'nowhere': not in the game package remotes" in p.stdout + p.stderr
 
 
+def test_a_workdir_that_is_not_a_remote_path_is_refused(tmp_path):
+    """Git Bash turns ZERO_SELFPLAY_WORKDIR=/Users/... into C:/Program Files/Git/Users/... for a
+    Windows process: refused at start (ssh would create it under the remote's home)."""
+    script = tmp_path / 'dead.py'
+    script.write_text(DEAD)
+    p = subprocess.run([sys.executable, str(script), '--run', str(tmp_path / 'w'), '--preset', 'toy-smoke', '--iters', '1',
+                        '--selfplay-remote', 'dead'], cwd=ROOT, capture_output=True, text=True, timeout=300,
+                       env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH,
+                                ZERO_SELFPLAY_WORKDIR='C:/Program Files/Git/Users/u/mtgz-selfplay'))
+    assert p.returncode != 0
+    assert "the remote self-play workdir 'C:/Program Files/Git/Users/u/mtgz-selfplay' is not an absolute path" in \
+        p.stdout + p.stderr
+
+
 # ---------------------------------------------------------------- units
 
 class FakeDrv:

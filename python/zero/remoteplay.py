@@ -36,7 +36,7 @@ except in `end`, bounded by `selfplay_remote_wait`):
   own rolling driver's do) and flush their shards; `end` waits for the shards announced in phase
   i at most `selfplay_remote_wait` s: what is not back by then is dropped (a shard of phase i
   never enters another iteration);
-* a fetch thread copies each announced shard (a temporary name), checks it (the non-finite guard,
+* fetch threads (one per worker) copy each announced shard (a temporary name), check it (the non-finite guard,
   zero/finite.py, and the run's game / features / actions) and renames it into `data/iter_i/` -
   only while phase i accepts. A non-finite shard is quarantined to `<run>/debug/` and the run
   fails with NonFinite at the end of the phase, as a local one would (the window never sees it);
@@ -246,6 +246,12 @@ class RemotePlay:
         sp = dict(self.spec.get('selfplay') or {})
         self.t = Transport(self.spec)
         self.workdir = (os.environ.get('ZERO_SELFPLAY_WORKDIR') or sp.get('workdir') or self.spec['workdir']).rstrip('/\\')
+        if not self.t.local and not self.workdir.startswith('/'):
+            # e.g. Git Bash turned $ZERO_SELFPLAY_WORKDIR=/Users/... into C:/Program Files/Git/Users/...:
+            # ssh and scp would create that relative to the remote's home
+            raise SystemExit(f'selfplay_remote {name!r}: the remote self-play workdir {self.workdir!r} is not an '
+                             f'absolute path on the remote (a Windows shell converted $ZERO_SELFPLAY_WORKDIR? Git '
+                             f'Bash: MSYS2_ENV_CONV_EXCL=ZERO_SELFPLAY_WORKDIR)')
         self.mirror = mirror or os.path.basename(os.path.normpath(R.run))
         self.rdir = self.workdir + '/' + self.mirror
         self.procs = max(1, int(c.get('selfplay_remote_procs') or sp.get('procs') or 1))
@@ -283,9 +289,13 @@ class RemotePlay:
         self.late_reported = 0
         self.fq = queue.Queue()
         self.mth = threading.Thread(target=self._loop, name='zero-rsp', daemon=True)
-        self.fth = threading.Thread(target=self._fetcher, name='zero-rsp-fetch', daemon=True)
+        # one fetch thread per worker: the workers' last shards of a phase come back side by side (each
+        # copy is an scp with its own ssh handshake, ~1-2 s, then the check)
+        self.fths = [threading.Thread(target=self._fetcher, name=f'zero-rsp-fetch{k}', daemon=True)
+                     for k in range(max(2, self.procs))]
         self.mth.start()
-        self.fth.start()
+        for th in self.fths:
+            th.start()
 
     def log(self, msg):
         self.R.log(f'remote self-play {self.name}: {msg}')
@@ -399,7 +409,8 @@ class RemotePlay:
             th.start()
         for th in ths:
             th.join(15)
-        self.fq.put(None)
+        for _ in self.fths:
+            self.fq.put(None)
 
     # ---------------------------------------------------------------- events (reader threads)
     def _event(self, s, ev):

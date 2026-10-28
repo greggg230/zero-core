@@ -568,6 +568,7 @@ class CoRun:
                 ws[k] = writers[k].close()
             except NonFinite as e:
                 raise NonFinite(f'{self.label(k)}: {e}') from e
+        secs = time.time() - t0                    # this machine's phase (the remote's wait not counted)
         rem = None
         if rsp is not None:
             _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
@@ -577,7 +578,6 @@ class CoRun:
                 raise NonFinite(f'{self.label("r")}: {e}') from e
         rrows = co.take_remote_rows()
         _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
-        secs = time.time() - t0
         pst, rst = pdrv.stats(), rdrv.stats()
         lat = np.array(co.lat) if co.lat else np.zeros((0, 2))
 

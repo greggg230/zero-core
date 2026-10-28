@@ -359,13 +359,13 @@ class Run:
         take()
         results.extend(drv.take_results())
         ws = writer.close()
+        secs = time.time() - t0                    # this machine's phase (the remote's wait not counted)
         rem = None
         if self.rsp is not None:
             _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
             rem = self.rsp.end(it)                 # at most selfplay_remote_wait s
         _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
         st = drv.stats()
-        secs = time.time() - t0
         fin = [r for r in results if r['over']]
         leaves = st['leaves'] - (st0['leaves'] if st0 else 0)
         out = {'games': len(results), 'unfinished': len(results) - len(fin), 'samples': ws['samples'],
