@@ -28,6 +28,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements |
 | `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B) |
+| `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`), `Transport` (ssh / scp, or `local`) |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`) | Unattended runs, control, forks; each repo's `tools/<name>.py` activates its package and calls `main()` |
@@ -111,6 +112,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `elo_games`, `ref_games` | 100, 400 | games per Elo match (checkpoints 1, 2, 4 ... 32 iterations back); random vs yardstick reference games |
 | `elo_opponents`, `elo_sims`, `elo_together` | 0, 0, 0 | cheaper Elo (CPU runs): play only the first k of the offsets 1, 2, 4 ... 32 (0 = all); Elo matches at elo_sims (0 = eval_sims); 1 = an iteration's Elo matches in one driver (one evaluator key per opponent: the checkpoint's batches hold the leaves of every match; other seeds than separate matches) |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
+| `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
 | `resolver` | '' | co-training (section 11): the resolver game, whose episodes decide this game's deferred terminals ('' = a single-game run: this loop, line for line) |
@@ -149,6 +151,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor) and the current fit |
+| `evals.jsonl` | with `eval_remote` (section 5.2): one line per remote evaluation `{iter, eval_yard, eval_random, elo, time, host, seconds}`, merged into the iterations' rows by the dashboard; a co-training run's resolver: `resolver/evals.jsonl` (11.5) |
 | `progress.json` | self-play progress of the iteration in flight (dashboard); a co-training run's also has `events_resolved`, `target`, `drafting`, `pending_events`, `matches_queued`, `matches_in_flight`, `matches_done` (section 11) |
 | `resolver/` | a co-training run's resolver network (section 11): the same layout (`config.json`, `metrics.jsonl`, `models/`, `data/`, `elo/`, `debug/`, `progress.json`), iteration numbers shared |
 | `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control |
@@ -241,7 +244,48 @@ tails. With no runs it shows how to start one. Endpoints: `GET /api/runs`,
 (JSON body required; only plain names of run directories under `--runs`). A co-training run
 (section 11.3a): a tab per network (`/api/run/<name>` adds `resolver`: its config, metrics, Elo),
 the co-training progress and tiles; a run whose metrics hold `extras` (`GamePackage.evals`):
-an "Other yardsticks" chart. Single-game runs render as before.
+an "Other yardsticks" chart. Single-game runs render as before. Remote evaluations (5.2): each
+network's `evals.jsonl` is merged into its rows (`resolver/evals.jsonl` into the resolver's tab).
+
+### 5.2 Remote evaluation (`zero/remote.py`, run setting `eval_remote`)
+
+`eval_remote <name>` (a remote of the game package, `GamePackage.remotes`; `local` = this machine,
+the tests) moves a run's evaluations - the yardstick and random matches, the package's other
+yardsticks, the Elo matches and reference games - to another machine while the run trains
+(Kingdom Builder Zero's and MTG Zero's runs evaluate on the MacBook this way).
+
+* **Local side** (`RemoteEval`, a thread of the run process): `finish_iter` appends the
+  iteration's metrics row without an evaluation and queues each evaluated iteration
+  (`eval_every`); the thread ships what the evaluation needs to the remote's **mirror** of the
+  run, `<workdir>/<run name>` (config.json: the run's settings with `eval_remote` '' and the
+  remote's `overrides`; every checkpoint the Elo matches may play, each copied under a temporary
+  name and renamed; for a new mirror the run's `elo/results.json` and `metrics.jsonl`, so the
+  remote continues a run evaluated here so far), runs `python -m <pkg>.az.remote eval <mirror>
+  <iter>` in the remote's `repo` (ssh, `BatchMode`), appends the result to the run's
+  **`evals.jsonl`** (`{iter, eval_yard, eval_random, elo, time, host, seconds}`) and copies the
+  mirror's `elo/results.json`, `elo/ratings.json` and `models/index.json` back: the remote owns
+  the run's Elo while `eval_remote` is on (`models/best.pt` is not copied back).
+* **Remote side** (`zero.remote.main`): `Run.evaluate` + `Run.elo_update` on the mirror (the
+  run's own code), with the remote's `<workdir>/overrides.json` (if any) over the mirror's config;
+  **one evaluation at a time per workdir** (the lock directory `<workdir>/.eval.lock`, freed when
+  its owner is dead or after 4 hours); the result printed as one line `ZERO_REMOTE_RESULT {json}`.
+* **A failure never blocks training**: an evaluation that fails (the remote asleep or
+  unreachable, its checkout refused) is logged (`remote eval <name> iter N: ...; retry in 300s`)
+  and retried every `RETRY_S` (300 s) on the thread; later iterations queue behind it.
+* **Restart**: the evaluated iterations without a result (no `eval_yard` in metrics.jsonl, no row
+  in evals.jsonl) are queued again. A run that has finished its iterations waits for its queue
+  (progress phase `remote evaluations`, at most 6 hours) unless STOP exists.
+* **On or off at a restart**: `--eval-remote <name>` (the evaluations made here so far are kept:
+  a new mirror starts from them) or `--eval-remote ''` (the run evaluates here again, from its
+  `elo/` as the remote last left it).
+* **A remote**: `{host: 'user@host' | 'local', repo, python, workdir, env: {...}, overrides: {run
+  settings}}`; a package may give a Mapping that resolves when the run starts (MTG Zero's
+  `RunCommitRemote`: the remote's checkout of exactly the run's commit, checked before every
+  evaluation).
+* **Co-training runs**: the resolver's evaluation on a remote, section 11.5.
+
+Tests: `tests/test_loop.py` (`test_remote_evaluation_local`, `..._continues_a_local_run`) and
+`tests/test_cotrain.py` (11.5).
 
 ## 6. Learning: the toy proof run (Glass Road Zero 2026-10-11; Caverna Zero 2026-10-10)
 
@@ -570,8 +614,8 @@ resolved into `<run>/resolver/config.json`; `resolver_init`, `resolver_conc`, `p
 `draft_eval_net_every` (section 1.2). The primary keeps the run directory as a single-game run
 does (`models/`, `data/`, `elo/`, `metrics.jsonl`, `progress.json`: the dashboard and the tools
 work unchanged); the resolver has `<run>/resolver/` with the same layout. One player count per
-game (`players`). Its `iters`, `games`, `rolling` and `eval_remote` are not used (`eval_remote`
-is refused).
+game (`players`). Its `iters`, `games` and `rolling` are not used; its `eval_remote` sends its
+evaluations to a remote (11.5). The run's own `eval_remote` (the primary's) is refused.
 
 **The game package's glue** (`GamePackage.deferred`, game -> `{'episodes': fn(payload) ->
 [resolver spec JSON, ...], 'results': fn(payload, rows) -> results JSON}`): the defaults read
@@ -598,7 +642,8 @@ the payload's `"episodes"` list and send `[{"result": [...], "scores": [...]}, .
   checkpoints and optimizer states, then both are saved (`Run.save_trained`): a NaN in either
   network writes neither.
 * **Evaluation** (`CoRun.finish_iter`): the resolver as a single-game run (its yardstick,
-  random, Elo between its checkpoints: `resolver/metrics.jsonl`, `resolver/elo/`), then the
+  random, Elo between its checkpoints: `resolver/metrics.jsonl`, `resolver/elo/`; on a remote
+  with `resolver_cfg['eval_remote']`, 11.5), then the
   primary (`PrimaryRun`): its matches are **events** (`CoRun.event_match`), team seats
   alternating between the two players (seat s in team s % (n / team_size): game g gives team g %
   teams to the first player), each event's episodes played by a second, non-recording resolver
@@ -698,3 +743,57 @@ checkpoints, NonFinite in each network, `resolver_init` from a single-game check
 `fork_run`, settings checks), the crate's `toy_team`, `tree` and `driver` tests (deferred leaves
 evaluated once and backed up, team utilities, parking and resolving with samples, rolling
 quotas counting resolved games, queued setups, float16 rounding).
+
+### 11.5 The resolver's evaluation on a remote (`resolver_cfg['eval_remote']`; MTG Zero, 2026-10-27)
+
+The resolver's evaluation is a single-game run's (11.2), and so is its remote: `eval_remote` in
+`resolver_cfg` (a remote of the game package, section 5.2; `local` in the tests) sends the
+resolver's yardstick, random and Elo matches there while both networks train. MTG Zero: the
+MacBook plays the `mtg` play network's evaluation of its 4v4 team-draft run (~9 min there against
+~30-70 on the shared desktop; its ENGINE.md 48).
+
+* **The setting** is the resolver's own `eval_remote`, saved in `<run>/resolver/config.json`: it
+  means there what it means for a single-game run (no new run setting). The run's top-level
+  `eval_remote` would be the primary's and is refused: the primary's matches are events whose
+  episodes the resolver's drivers play in the run process. A name the package does not have is
+  refused at start.
+* **The mirror** is `<workdir>/<run name>.resolver`: a sibling of the single-game runs' mirrors
+  in the remote's workdir, so the lock (one evaluation at a time per workdir: a co-training run's
+  resolver and a single-game run on the same remote queue behind each other) and
+  `<workdir>/overrides.json` apply unchanged. Its config.json is the resolver's settings, a
+  single-game run's, so the remote side (`python -m <pkg>.az.remote eval`) is unchanged.
+* **Results**: `resolver/evals.jsonl` (5.2's rows), the mirror's Elo copied back to
+  `resolver/elo/` and `resolver/models/index.json`; `resolver/metrics.jsonl` rows carry no
+  evaluation. Log lines: `[resolver] evaluations on the remote 'mac' (host, mirror ...)`,
+  `[resolver] iter N vs heuristic (remote mac, 560s): ...`, `[resolver] iter N elo ... (remote mac)`.
+* **The primary's evaluation stays here**, unchanged: its yardstick-played events every evaluated
+  iteration and its resolver-network events (`eval_yard_net`) every `draft_eval_net_every`, which
+  load the resolver's checkpoint of the iteration here. They do not wait for the remote.
+* **Resume**: the resolver's evaluated iterations without a result are queued again at start
+  (`RemoteEval.backfill`); nothing else is replayed. **An unreachable remote** is retried every
+  5 minutes on its thread: both networks keep training and the primary keeps being evaluated; at
+  the end of its iterations the run waits for the queue (progress phase `remote evaluations`),
+  where PAUSE stops it (exit 75; the restart queues what is missing again). The co-training wait
+  checks PAUSE; a single-game run's does not (unchanged).
+* **On or off for a run** at a restart: `--resolver-cfg` with the whole dict (a flag replaces the
+  saved dict), e.g. `--resolver-cfg '{"preset": "mtg-4", "eval_every": 2, "eval_remote": ""}'`.
+* **The dashboard** (5.1): the resolver's tab merges `resolver/evals.jsonl` into its rows as a
+  single-game run's view does; its Elo, win rates and head-to-head come from the copied-back
+  `resolver/elo/`.
+* **Not remote: the primary's resolver-network events** (`eval_yard_net`). They could go to the
+  same remote at moderate cost - a second remote command that rebuilds `CoRun.event_match` from a
+  mirror holding both networks' checkpoints and the run's settings (the drivers, the coordinator
+  and the package's glue are all core code); the commit check and the lock would apply as they
+  are - but they are the largest single evaluation of MTG Zero's 4v4 run (32 events, 384
+  play-network matches every 4th iteration: more than the play network's own evaluation), so
+  the remote would hold its lock that much longer. Not done.
+
+Tests (`tests/test_cotrain.py`): two iterations of `toy-cotrain-smoke` with the resolver's
+`eval_remote` 'local' (the resolver's evaluations in `resolver/evals.jsonl` from the mirror
+`<run>.resolver`, its Elo copied back, no evaluation in its metrics rows, the primary evaluated
+here with `eval_yard_net`, the dashboard's merge); a restart with two evaluations pending (both
+queued again and evaluated once, nothing retrained, the primary not evaluated again); an
+unreachable remote (ssh to a host that does not resolve, retried every second: both networks
+train and the primary is evaluated through every iteration, the run waits for the queue at the
+end, PAUSE exits 75 there; restarted with a reachable remote, the three missing evaluations land);
+the run's own `eval_remote` and an unknown remote name refused.
