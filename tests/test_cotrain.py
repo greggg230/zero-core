@@ -288,7 +288,172 @@ def test_fork_run_copies_both_nets(co_run, tmp_path):
 
 @pytest.mark.parametrize('bad, msg', [('{"bogus": 1}', "unknown settings ['bogus']"),
                                       ('{"pending_max": 3}', "['pending_max'] are the primary run's settings"),
-                                      ('{"game": "toy_team"}', "game 'toy_team' is not the resolver 'toy'")])
+                                      ('{"game": "toy_team"}', "game 'toy_team' is not the resolver 'toy'"),
+                                      ('{"eval_remote": "nowhere"}', "eval_remote 'nowhere': not in the game package remotes")])
 def test_cotrain_settings_are_checked(tmp_path, bad, msg):
     p = co_loop(tmp_path / 'x', '--iters', '1', '--resolver-cfg', bad)
     assert p.returncode != 0 and msg in p.stdout + p.stderr, p.stdout + p.stderr
+
+
+def test_cotrain_top_level_eval_remote_is_refused(tmp_path):
+    """eval_remote at the run's top level would be the primary's: refused, pointing at the resolver's."""
+    p = co_loop(tmp_path / 'x', '--iters', '1', '--eval-remote', 'local')
+    assert p.returncode != 0 and "resolver_cfg's eval_remote" in p.stdout + p.stderr, p.stdout + p.stderr
+    assert not (tmp_path / 'x' / 'models' / 'iter_0000.pt').exists()
+
+
+# ---------------------------------------------------------------- the resolver's evaluations on a remote
+
+def remote_rcfg(name):
+    """toy-cotrain-smoke's resolver settings with eval_remote `name` (--resolver-cfg replaces the
+    preset's dict: the whole dict is given)."""
+    from zero.run import PRESETS
+    return json.dumps(dict(PRESETS['toy-cotrain-smoke']['resolver_cfg'], eval_remote=name))
+
+
+def evals_of(d):
+    p = d / 'evals.jsonl'
+    return [json.loads(line) for line in open(p, encoding='utf-8')] if p.exists() else []
+
+
+def mtimes(run, its):
+    return {p: os.path.getmtime(p) for i in its for p in (run / 'models' / f'iter_{i:04d}.pt',
+                                                           run / 'resolver' / 'models' / f'iter_{i:04d}.pt')}
+
+
+@pytest.fixture(scope='module')
+def remote_run(tmp_path_factory):
+    base = tmp_path_factory.mktemp('remote')
+    run = base / 'rem'
+    p = co_loop(run, '--iters', '2', '--draft-eval-net-every', '2', '--resolver-cfg', remote_rcfg('local'),
+                env={'ZERO_REMOTE_WORKDIR': str(base / 'mirror')})
+    assert p.returncode == 0, p.stdout + p.stderr
+    return run, base / 'mirror'
+
+
+def test_cotrain_resolver_evaluated_on_the_remote(remote_run):
+    """resolver_cfg eval_remote 'local' (a mirror directory and a subprocess, as remote.py's tests):
+    the resolver's evaluations (yardstick, random, Elo) ran on the mirror <workdir>/<run>.resolver
+    and landed in resolver/evals.jsonl with its Elo copied back; its metrics rows have none; the
+    primary evaluated here as before (its yardstick, random, Elo, eval_yard_net); the dashboard
+    merges resolver/evals.jsonl into the resolver's tab."""
+    run, mirror = remote_run
+    res = run / 'resolver'
+    mp, mr = read_metrics(str(run)), read_metrics(str(res))
+    assert [r['iter'] for r in mp] == [0, 1, 2] and [r['iter'] for r in mr] == [0, 1, 2]
+    assert not any('eval_yard' in r or 'elo' in r for r in mr)
+    assert all(mp[i]['eval_yard']['opp'] == 'greedy' and mp[i]['eval_yard']['games'] == 8 for i in (0, 1, 2))
+    assert 'eval_yard_net' in mp[0] and 'eval_yard_net' not in mp[1] and mp[2]['eval_yard_net']['games'] == 8
+    assert not (run / 'evals.jsonl').exists()
+    ev = evals_of(res)
+    assert sorted(e['iter'] for e in ev) == [0, 1, 2]
+    assert all(e['host'] == 'local' and e['eval_yard']['opp'] == 'heuristic' and e['eval_yard']['games'] == 8
+               and e['eval_random']['games'] == 4 and 'elo' in e for e in ev), ev
+    rr = json.load(open(res / 'elo' / 'ratings.json'))
+    assert rr['anchor'] == 'heuristic' and {'iter_0000', 'iter_0001', 'iter_0002', 'random'} <= set(rr['ratings'])
+    pairs = json.load(open(res / 'elo' / 'results.json'))['pairs']
+    assert pairs['iter_0001|iter_0002'][1] == 4 and pairs['iter_0000|iter_0002'][1] == 4
+    assert json.load(open(res / 'models' / 'index.json'))['best']
+    rp = json.load(open(run / 'elo' / 'ratings.json'))
+    assert rp['anchor'] == 'greedy' and {'iter_0000', 'iter_0002'} <= set(rp['ratings'])
+    m = mirror / 'rem.resolver'
+    assert {'iter_0000.pt', 'iter_0001.pt', 'iter_0002.pt', 'index.json'} <= set(os.listdir(m / 'models'))
+    mc = json.load(open(m / 'config.json'))
+    assert mc['game'] == 'toy' and mc['eval_remote'] == '' and mc['resolver'] == ''
+    assert json.load(open(res / 'config.json'))['eval_remote'] == 'local'
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert "[resolver] evaluations on the remote 'local'" in log and '(remote local' in log
+    assert json.load(open(run / 'progress.json'))['phase'] == 'idle'
+    from zero import dashboard
+    dashboard.app.config['RUNS'] = str(run.parent)
+    d = dashboard.app.test_client().get('/api/run/rem').get_json()
+    rows = d['resolver']['metrics']
+    for e in ev:
+        r = next(r for r in rows if r['iter'] == e['iter'])
+        assert r['eval_yard'] == e['eval_yard'] and r['eval_random'] == e['eval_random'] and r['elo'] == e['elo']
+    assert all('eval_yard' in r for r in d['metrics']) and 'iter_0002' in d['resolver']['ratings']['ratings']
+
+
+def test_cotrain_resume_requeues_pending_remote_evaluations(remote_run, tmp_path):
+    """A restart after the iterations with evaluations 1 and 2 still pending (no rows in
+    resolver/evals.jsonl): both queued again and evaluated once, 0 not again; nothing retrained,
+    the primary not evaluated again."""
+    src, mirror = remote_run
+    run = tmp_path / 'rem'
+    shutil.copytree(src, run)
+    res = run / 'resolver'
+    ev = evals_of(res)
+    (res / 'evals.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in ev if e['iter'] == 0))
+    before, mp0 = mtimes(run, (1, 2)), read_metrics(str(run))
+    p = co_loop(run, '--iters', '2', env={'ZERO_REMOTE_WORKDIR': str(tmp_path / 'mirror')})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert sorted(e['iter'] for e in evals_of(res)) == [0, 1, 2]
+    assert read_metrics(str(run)) == mp0 and len(read_metrics(str(res))) == 3
+    assert mtimes(run, (1, 2)) == before, 'no retraining'
+
+
+DEAD = textwrap.dedent('''
+    from zero import package, remote
+    import zero.run as R
+    # a remote that cannot be reached (ssh: no such host; no ssh at all fails the same way)
+    package.active().remotes['dead'] = {'host': 'nobody@unreachable.invalid', 'repo': '/nowhere', 'python': 'python3',
+                                        'workdir': '/nowhere/zero-remote'}
+    remote.RETRY_S = 1
+    R.cli()
+''')
+
+
+def test_cotrain_unreachable_remote_never_blocks_then_resume(tmp_path):
+    """resolver_cfg eval_remote = an unreachable remote: every attempt fails and is retried (logged),
+    both networks train and the primary is evaluated through every iteration; at the end the run
+    waits for the remote's evaluations (progress 'remote evaluations'), where PAUSE exits 75.
+    Restarted with a reachable remote: the three missing evaluations are queued again and land in
+    resolver/evals.jsonl; nothing is replayed."""
+    run = tmp_path / 'dead'
+    script = tmp_path / 'dead.py'
+    script.write_text(DEAD)
+    # the console to a file: a pipe read only at the end fills with the retries' lines and blocks
+    # the run's prints
+    with open(tmp_path / 'dead.out', 'w', encoding='utf-8') as out:
+        proc = subprocess.Popen([sys.executable, str(script), '--run', str(run), *CO, '--iters', '2',
+                                 '--resolver-cfg', remote_rcfg('dead')], cwd=ROOT, stdout=out,
+                                stderr=subprocess.STDOUT, text=True,
+                                env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH))
+        try:
+            deadline = time.time() + 600
+            prog = {}
+            while time.time() < deadline and proc.poll() is None:
+                try:
+                    prog = json.load(open(run / 'progress.json'))
+                except (OSError, ValueError):
+                    pass
+                if prog.get('phase') == 'remote evaluations':
+                    break
+                time.sleep(0.2)
+            assert prog.get('phase') == 'remote evaluations', prog
+            time.sleep(3)                          # still waiting, still retrying
+            assert proc.poll() is None
+            runctl.request_pause(str(run), by='test')
+            proc.wait(timeout=120)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    assert proc.returncode == runctl.EXIT_PAUSED, (tmp_path / 'dead.out').read_text(encoding='utf-8')[-3000:]
+    res = run / 'resolver'
+    mp, mr = read_metrics(str(run)), read_metrics(str(res))
+    assert [r['iter'] for r in mp] == [0, 1, 2] and [r['iter'] for r in mr] == [0, 1, 2]
+    assert all('eval_yard' in r for r in mp) and not any('eval_yard' in r for r in mr)
+    assert not (res / 'evals.jsonl').exists()
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert '[resolver] remote eval dead iter 0: RuntimeError: mkdir on nobody@unreachable.invalid' in log
+    assert '; retry in 1s' in log and '[resolver] iter 2 train' in log
+    before = mtimes(run, (0, 1, 2))
+    runctl.request_resume(str(run))
+    p = co_loop(run, '--iters', '2', '--resolver-cfg', remote_rcfg('local'),
+                env={'ZERO_REMOTE_WORKDIR': str(tmp_path / 'mirror')})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert 'starting after iter 2' in p.stdout
+    ev = evals_of(res)
+    assert sorted(e['iter'] for e in ev) == [0, 1, 2] and all(e['host'] == 'local' for e in ev)
+    assert {'iter_0000', 'iter_0001', 'iter_0002'} <= set(json.load(open(res / 'elo' / 'ratings.json'))['ratings'])
+    assert read_metrics(str(run)) == mp and mtimes(run, (0, 1, 2)) == before

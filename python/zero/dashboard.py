@@ -14,9 +14,11 @@ Co-training runs (zero/cotrain.py, docs/az.md 11: a `resolver/` directory in the
 run's own metrics are the primary network's, `<run>/resolver/` holds the resolver network's with
 the same layout; the page shows a tab per network (each with its Elo, win rates, losses,
 throughput and head-to-head table), the co-training progress (games resolved, in play and parked,
-episodes queued, in flight and done) and throughput. Other yardsticks of a checkpoint
-(`GamePackage.evals`, metrics `extras`) are charted when a run has them. Single-game runs render
-as before.
+episodes queued, in flight and done) and throughput. Each network's remote evaluations
+(`evals.jsonl` in its directory, zero.remote: a single-game run's `eval_remote`, a co-training
+run's `resolver_cfg['eval_remote']` -> `resolver/evals.jsonl`) are merged into its rows. Other
+yardsticks of a checkpoint (`GamePackage.evals`, metrics `extras`) are charted when a run has
+them. Single-game runs render as before.
 
 Run control (zero/runctl.py): each run's state and Pause / Resume buttons: POST
 /api/run/<name>/pause creates <run>/PAUSE, POST /api/run/<name>/resume removes it (JSON body
@@ -68,7 +70,7 @@ def _jsonl(p):
 
 def _metrics(d):
     """metrics.jsonl, with the remote evaluations (evals.jsonl, zero.remote) merged into their
-    iterations' rows."""
+    iterations' rows (`d`: a run directory or a co-training run's resolver/)."""
     rows = _jsonl(os.path.join(d, 'metrics.jsonl'))
     evals = {e['iter']: e for e in _jsonl(os.path.join(d, 'evals.jsonl')) if 'iter' in e}
     if evals:

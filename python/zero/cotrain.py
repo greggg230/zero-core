@@ -28,9 +28,14 @@ The run directory holds the primary as a single-game run does (`models/`, `data/
   (`team_size`: seat s in team s % (n / team_size)), whose episodes a second resolver driver plays
   with the resolver's yardstick (every evaluated iteration: `eval_yard`, `eval_random`, the Elo
   matches) and with the resolver's network every `draft_eval_net_every` (`eval_yard_net`).
+  `resolver_cfg['eval_remote']` (a remote of the game package, as a single-game run's
+  `eval_remote`): the resolver's own evaluations run there (zero.remote, mirror `<run
+  name>.resolver`; results in `resolver/evals.jsonl`, its Elo copied back to `resolver/elo/`)
+  while the run trains; the primary's stay here.
 * **Resume**: an iteration interrupted before both checkpoints is replayed from its start (both
-  data directories cleared); one interrupted after them finishes its evaluations. PAUSE / STOP /
-  the supervisor / kill / fork work on the one process.
+  data directories cleared); one interrupted after them finishes its evaluations; the resolver's
+  remote evaluations without a result are queued again. PAUSE / STOP / the supervisor / kill /
+  fork work on the one process.
 """
 import json
 import os
@@ -74,8 +79,10 @@ def resolver_config(cfg):
     out.update(game=cfg['resolver'], preset=preset, resolver='', resolver_cfg={}, resolver_init='')
     if out.get('policy_target', 'visits') not in ('visits', 'cq'):
         raise SystemExit(f"resolver_cfg: policy_target {out['policy_target']!r}: 'visits' or 'cq'")
-    if out.get('eval_remote'):
-        raise SystemExit('resolver_cfg: eval_remote is not supported in co-training runs')
+    rem = out.get('eval_remote') or ''
+    if rem and rem != 'local' and rem not in package.active().remotes:
+        raise SystemExit(f'resolver_cfg: eval_remote {rem!r}: not in the game package remotes '
+                         f'({sorted(package.active().remotes)})')
     return out
 
 
@@ -316,7 +323,9 @@ class CoRun:
     def __init__(self, run, cfg, pause=None):
         self.run, self.cfg, self.pw = run, cfg, pause
         if cfg.get('eval_remote'):
-            raise SystemExit('eval_remote is not supported in co-training runs')
+            raise SystemExit("eval_remote: a co-training run evaluates its primary network here (its matches' "
+                             "episodes need the resolver's drivers); the resolver's evaluations go to a remote "
+                             "with resolver_cfg's eval_remote")
         if len(set(cfg['players'])) != 1:
             raise SystemExit(f"co-training: one player count for the primary game (players {cfg['players']})")
         self.rcfg = resolver_config(cfg)
@@ -580,6 +589,14 @@ class CoRun:
             start = 0
         self.log(f'co-training run {run} starting after iter {start}: primary {c["game"]} (team size {self.team}), '
                  f'resolver {rc["game"]}; resolver cfg {json.dumps(rc)}')
+        if rc.get('eval_remote'):
+            # the resolver's evaluations on a remote, as a single-game run's (zero.remote): queued
+            # by its finish_iter, the missing ones again now (a restart)
+            from .remote import RemoteEval
+            R.remote = RemoteEval(R, rc['eval_remote'], mirror=os.path.basename(os.path.normpath(run)) + '.resolver')
+            rdone = {m['iter'] for m in read_metrics(R.run)}
+            R.remote.backfill(start if start in rdone else start - 1)
+            R.log(f'evaluations on the remote {rc["eval_remote"]!r} ({R.remote.spec["host"]}, mirror {R.remote.rdir})')
         if any(start not in {m['iter'] for m in read_metrics(X.run)} for X in (P, R)):
             if os.path.exists(P.partial_path(start)) or os.path.exists(R.partial_path(start)):
                 self.log(f'iter {start}: finishing its evaluations (interrupted)')
@@ -604,4 +621,7 @@ class CoRun:
                      'resumed_seconds': time.time() - t0}
                 _write_json(X.partial_path(it), m)
             self.finish_iter(it, time.time())
+        if R.remote is not None and not os.path.exists(stop):
+            _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
+            R.remote.drain(check=lambda: self.check('remote evaluations'))
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})

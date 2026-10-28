@@ -15,6 +15,13 @@ Remote side (`main`): the run's own `Run.evaluate` + `Run.elo_update` on the mir
 evaluation at a time per remote workdir (a lock directory), the result printed as one line
 `ZERO_REMOTE_RESULT {json}`.
 
+Co-training runs (zero/cotrain.py, docs/az.md 11.5): the resolver's own evaluations go to the
+remote named by `resolver_cfg['eval_remote']`, exactly as a single-game run's: `RemoteEval` of the
+resolver's `Run` (`<run>/resolver/`: its evals.jsonl, elo/, models/index.json), the mirror
+`<workdir>/<run name>.resolver` (a sibling of the single-game mirrors: the same lock and
+overrides.json), the resolver's config.json there (a single-game run's settings: the remote side
+needs nothing else). The primary's evaluation stays local.
+
 A remote: {host: 'user@host' (or 'local': this machine, the tests), repo: the game repo there
 (same code as the run's checkout), python, workdir, env: {...}, overrides: run settings for the
 remote ({'infer_device': 'mps', 'threads': 12})}.
@@ -118,14 +125,16 @@ class Transport:
 
 
 class RemoteEval:
-    """The run's evaluations on the remote `name` (see the module docstring)."""
+    """The run's evaluations on the remote `name` (see the module docstring). `mirror`: the
+    mirror's directory name in the remote's workdir (default the run directory's name; a
+    co-training run's resolver: '<run name>.resolver')."""
 
-    def __init__(self, R, name):
+    def __init__(self, R, name, mirror=None):
         self.R = R
         self.name = name
         self.spec = remote_spec(name)
         self.t = Transport(self.spec)
-        run_name = os.path.basename(os.path.normpath(R.run))
+        run_name = mirror or os.path.basename(os.path.normpath(R.run))
         self.rdir = self.spec['workdir'].rstrip('/') + '/' + run_name
         self.module = f'{package.active().name}.az.remote' if package.active().name != 'zero' else 'zero.remote'
         self.q = queue.Queue()
@@ -168,13 +177,17 @@ class RemoteEval:
             if k not in done and os.path.exists(model_path(self.R.run, k)):
                 self.enqueue(k)
 
-    def drain(self, timeout=6 * 3600):
-        """Wait until every queued evaluation has a result (the run finished its iterations)."""
+    def drain(self, timeout=6 * 3600, check=None):
+        """Wait until every queued evaluation has a result (the run finished its iterations).
+        `check`: called every poll (a co-training run's pause check: PAUSE ends the wait, the
+        restart queues the missing evaluations again)."""
         t0 = time.time()
         while time.time() - t0 < timeout:
             with self.lock:
                 if not self.queued:
                     return True
+            if check is not None:
+                check()
             time.sleep(2)
         return False
 
