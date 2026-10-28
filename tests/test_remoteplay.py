@@ -193,22 +193,21 @@ def test_backs_off_while_an_evaluation_holds_its_lock(tmp_path):
     released = {}
 
     def release():
-        # the lock goes away once iteration 2's self-play has run a while with it held
-        t = time.time() + 240
+        # the lock goes away once iteration 2 is done with it held throughout (its metrics row; not
+        # progress.json, written every 2 s: the toy's phases are shorter than that on a fast machine)
+        t = time.time() + 300
         while time.time() < t:
             try:
-                prog = json.load(open(run / 'progress.json'))
-            except (OSError, ValueError):
-                prog = {}
-            if prog.get('iter') == 2 and prog.get('phase') == 'selfplay' and \
-                    (prog.get('remote') or {}).get('state') == 'backing off':
-                busy = glob.glob(str(wd / '.busy-*'))
-                released['busy_while_held'] = busy
+                done = any(r['iter'] == 2 for r in read_metrics(str(run)))
+            except (OSError, ValueError, KeyError):
+                done = False
+            if done:
+                released['busy_while_held'] = glob.glob(str(wd / '.busy-*'))
                 holder.kill()
                 holder.wait()
                 released['t'] = time.time()
                 return
-            time.sleep(0.1)
+            time.sleep(0.05)
     th = threading.Thread(target=release, daemon=True)
     th.start()
     try:
@@ -218,7 +217,7 @@ def test_backs_off_while_an_evaluation_holds_its_lock(tmp_path):
         holder.kill()
         holder.wait()
     assert p.returncode == 0, p.stdout + p.stderr
-    assert 't' in released, 'iteration 2 never showed the remote backing off'
+    assert 't' in released, 'iteration 2 never finished'
     assert released['busy_while_held'] == []
     m = read_metrics(str(run))
     rem = {r['iter']: r['selfplay']['remote'] for r in m[1:]}
