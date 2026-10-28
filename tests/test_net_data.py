@@ -465,6 +465,83 @@ def test_tokennet_layout_validation():
         TokenNet(TOK_F, TOK_A, TOK_LAYOUT, d=10, heads=4)
 
 
+# The same layout with actions by identity: a unit slot also scores action 7 + its identity
+# ([7, 19) holds no slot action of the layout).
+TOK_LAYOUT_ID = dict(TOK_LAYOUT, segments=[TOK_LAYOUT['segments'][0], dict(TOK_LAYOUT['segments'][1], id_actions=7),
+                                           TOK_LAYOUT['segments'][2]])
+
+
+def test_tokennet_actions_by_identity():
+    """`id_actions` (MTG Zero's team draft: a card's pick is its identity): a present slot scores
+    base + its identity from its token; the other actions are unchanged; a layout without the key
+    builds the network it did before (no identity column, the normalised layout unchanged)."""
+    import pytest
+    from zero.net import TokenNet, tokens_layout
+    plain = tokens_layout(TOK_LAYOUT, TOK_F, TOK_A)
+    assert all('id_actions' not in sg for sg in plain['segments'])
+    m0 = tok_net(21)
+    assert m0.n_id == 0 and m0.ptr.out_features == 3 and not hasattr(m0, 'tok_isid')
+    lay = tokens_layout(TOK_LAYOUT_ID, TOK_F, TOK_A)
+    assert [sg.get('id_actions') for sg in lay['segments']] == [None, 7, None]
+    torch.manual_seed(21)
+    m = TokenNet(TOK_F, TOK_A, TOK_LAYOUT_ID, d=16, layers=2, heads=2, ff=32, head=16).eval()
+    assert m.n_id == 1 and m.ptr.out_features == 4 and m.config['layout']['segments'][1]['id_actions'] == 7
+    x = tok_x(11, 5)
+    n = torch.full((11,), 2)
+    with torch.no_grad():
+        m.gen.weight.zero_()
+        m.gen.bias.zero_()
+        m.ptr.weight.zero_()
+        m.ptr.bias.copy_(torch.tensor([1.0, 2.0, 4.0, 3.0]))   # units (3 + s), units (20 + 2 s), units by identity, cards
+        p = m(x, n)[0]
+        m.chunk = 3
+        p3 = m(x, n)[0]
+    assert torch.equal(p, p3)
+    seg = TOK_LAYOUT['segments'][1]
+    for b in range(11):
+        want = torch.zeros(TOK_A)
+        for sl in range(4):
+            o = 43 + 9 * sl
+            if x[b, o] > 0.5:
+                want[3 + sl], want[20 + 2 * sl] = 1.0, 2.0
+                want[7 + int(m._identity(x[b, o:o + 9][None], seg['id'])[0])] = 4.0
+        for sl in range(3):
+            if x[b, 79 + 4 * sl + 3] > 0.5:
+                want[30 + sl] = 3.0
+        assert torch.equal(p[b], want), (b, p[b], want)
+    # the identity column learns (its pointer weights get a gradient through the actions)
+    m.train()
+    plog = m(x, n)[0]
+    plog[:, 7:19].logsumexp(1).sum().backward()
+    assert m.ptr.weight.grad[2].abs().sum() > 0 and m.ptr.weight.grad[0].abs().sum() == 0
+    # validation: an identity is needed, the base inside the actions, no slot action in its range
+    for bad in (dict(TOK_LAYOUT, segments=[dict(TOK_LAYOUT['segments'][2], id_actions=0)]),
+                dict(TOK_LAYOUT, segments=[dict(TOK_LAYOUT['segments'][1], id_actions=TOK_A)]),
+                dict(TOK_LAYOUT, segments=[dict(TOK_LAYOUT['segments'][1], id_actions=0)]),
+                dict(TOK_LAYOUT, segments=TOK_LAYOUT_ID['segments'][1:2] + [dict(TOK_LAYOUT['segments'][2], actions=[[10, 1]])])):
+        with pytest.raises(ValueError):
+            tokens_layout(bad, TOK_F, TOK_A)
+
+
+def test_tokennet_actions_by_identity_save_load_widen(tmp_path):
+    from zero.net import TokenNet
+    torch.manual_seed(22)
+    m = TokenNet(TOK_F, TOK_A, TOK_LAYOUT_ID, d=16, layers=1, heads=2, ff=32, head=16).eval()
+    with torch.no_grad():
+        m.ptr.weight.normal_(0, 0.3)
+        m.ptr.bias.normal_(0, 0.3)
+    x, n = tok_x(6, 7), torch.full((6,), 2)
+    path = str(tmp_path / 'id.pt')
+    save(m, path, {'iter': 1})
+    m2, _ = load(path)
+    with torch.no_grad():
+        assert all(torch.equal(a, b) for a, b in zip(m(x, n), m2(x, n)))
+        w = widen(m2, TOK_F + 2, TOK_A + 4)
+        q = w(torch.cat([x, torch.zeros(6, 2)], 1), n)
+        p = m(x, n)
+    assert torch.allclose(q[0][:, :TOK_A], p[0], atol=1e-5)
+
+
 def test_tokennet_toy_layout_evaluator():
     """The core's toy layout (package.TOY_TOKENS) through the evaluator: a valid answer."""
     from zero.net import make_net

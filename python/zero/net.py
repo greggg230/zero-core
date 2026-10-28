@@ -173,7 +173,7 @@ def tokens_layout(layout, features, actions):
     """The normalised object layout of a `TokenNet` (validated against the feature / action
     widths; module docstring of TokenNet). -> a plain dict (stored in the checkpoint config)."""
     vocab = int(layout['vocab'])
-    segs, bags, used, acts = [], [], set(), {}
+    segs, bags, used, acts, ids = [], [], set(), {}, []
 
     def claim(name, lo, n):
         if lo < 0 or lo + n > features:
@@ -206,7 +206,23 @@ def tokens_layout(layout, features, actions):
                 if a in acts:
                     raise ValueError(f'tokens layout: action {a} belongs to {acts[a]} and {seg["name"]}')
                 acts[a] = seg['name']
+        if s.get('id_actions') is not None:
+            # (the key only when set: the normalised layouts of networks without it, stored in
+            # their checkpoints, stay as they were)
+            base = int(s['id_actions'])
+            if seg['id'] is None:
+                raise ValueError(f'tokens layout: segment {seg["name"]}: id_actions without an identity')
+            if not 0 <= base < actions:
+                raise ValueError(f'tokens layout: segment {seg["name"]}: id_actions {base} outside {actions}')
+            seg['id_actions'] = base
+            ids.append(seg)
         segs.append(seg)
+    for seg in ids:
+        lo, hi = seg['id_actions'], seg['id_actions'] + vocab
+        clash = sorted(a for a in acts if lo <= a < hi)
+        if clash:
+            raise ValueError(f'tokens layout: segment {seg["name"]}: id_actions [{lo}, {hi}) holds action {clash[0]} '
+                             f'of {acts[clash[0]]}')
     for b in layout.get('bags', []):
         bag = {'name': str(b['name']), 'offset': int(b['offset']), 'count': int(b['count']), 'width': int(b['width'])}
         if bag['width'] > vocab or bag['count'] < 1:
@@ -244,15 +260,19 @@ class TokenNet(nn.Module):
     `SearchGame` trait, the driver and the shards stay as they are.
 
     layout = {vocab, segments: [...], bags: [...]}:
-      * segment {name, offset, count, width, present, id, actions}: `count` object slots of
-        `width` floats from feature `offset` (slot s at offset + s * width). A slot is a token
-        when its `present` float (index in the slot) is > 0.5 (present None: always). `id`
-        {at, radix: [r0, r1, ...]}: the slot's identity as mixed-radix one-hot digits at `at`
-        (index = sum digit_k * prod(r_{k+1}...)), embedded from a table of `vocab` + 1 rows
+      * segment {name, offset, count, width, present, id, actions, id_actions}: `count` object
+        slots of `width` floats from feature `offset` (slot s at offset + s * width). A slot is
+        a token when its `present` float (index in the slot) is > 0.5 (present None: always).
+        `id` {at, radix: [r0, r1, ...]}: the slot's identity as mixed-radix one-hot digits at
+        `at` (index = sum digit_k * prod(r_{k+1}...)), embedded from a table of `vocab` + 1 rows
         shared by every segment and bag (the last row: no / unknown identity, e.g. a face-down
         card). `actions` [[base, stride], ...]: slot s scores the actions base + s * stride
-        (one logit per pair, from the slot's token); every other action gets its logit from the
-        pooled state.
+        (one logit per pair, from the slot's token). `id_actions` base (optional; needs `id`):
+        the slot also scores the action base + its identity (actions by identity: MTG Zero's
+        team draft, where a card's pick is its identity wherever it sits), one more logit from
+        the token; an identity whose action is outside the action space scores nothing, and of
+        two tokens of a row with the same identity one scores it (a layout keeps identities
+        distinct within a row). Every other action gets its logit from the pooled state.
       * bag {name, offset, count, width}: `count` multisets over the identities (`width` <=
         vocab counts each, e.g. the cards of a zone by identity); each is pooled as the
         count-weighted sum of the identity embeddings, and the pools feed the global token.
@@ -266,7 +286,8 @@ class TokenNet(nn.Module):
     attention. `layers` pre-norm blocks of width `d`. Heads read the global token's output and
     the mean of the row's tokens: value / margin as `Net`, and the generic policy logits; a
     slot's own actions are scored from its token, conditioned on the pooled state (pointer
-    logits). An empty slot's actions fall back to the generic logits.
+    logits), and so is its identity's action in a segment with `id_actions`. An empty slot's
+    actions fall back to the generic logits.
     """
 
     def __init__(self, features, actions, layout, d=128, layers=3, heads=4, ff=256, seats=MAX_SEATS, game='toy',
@@ -300,24 +321,36 @@ class TokenNet(nn.Module):
         self.gen = nn.Linear(2 * d, actions)
         self.pk = nn.Linear(d, d)
         self.pq = nn.Linear(2 * d, d, bias=False)
-        # pointer head: one output column per (segment, action pair); per position in the full
-        # token axis (0 = global, then the segments' slots) its columns and action ids (-1 /
-        # `actions` = none: scattered into a dummy column)
-        ncol = sum(len(s['actions']) for s in self.segs)
-        self.ptr = nn.Linear(d, max(1, ncol))
-        K = max([len(s['actions']) for s in self.segs] + [1])
+        # pointer head: one output column per (segment, action pair) and per segment with
+        # id_actions; per position in the full token axis (0 = global, then the segments' slots)
+        # its columns and action ids (-1 / `actions` = none: scattered into a dummy column); an
+        # identity column's action is its base + the token's identity (`tok_isid`, `tok_idbase`)
+        nk = [len(s['actions']) + ('id_actions' in s) for s in self.segs]
+        self.n_id = sum('id_actions' in s for s in self.segs)
+        self.ptr = nn.Linear(d, max(1, sum(nk)))
+        K = max(nk + [1])
         cols = torch.full((self.n_tok, K), -1, dtype=torch.long)
         acts = torch.full((self.n_tok, K), actions, dtype=torch.long)
+        isid = torch.zeros((self.n_tok, K), dtype=torch.bool)
+        idbase = torch.zeros(self.n_tok, dtype=torch.long)
         start, c0 = 1, 0
-        for s in self.segs:
+        for s, k in zip(self.segs, nk):
             for slot in range(s['count']):
                 for j, (base, stride) in enumerate(s['actions']):
                     cols[start + slot, j] = c0 + j
                     acts[start + slot, j] = base + slot * stride
+                if 'id_actions' in s:
+                    j = len(s['actions'])
+                    cols[start + slot, j] = c0 + j
+                    isid[start + slot, j] = True
+                    idbase[start + slot] = s['id_actions']
             start += s['count']
-            c0 += len(s['actions'])
+            c0 += k
         self.register_buffer('tok_cols', cols, persistent=False)
         self.register_buffer('tok_acts', acts, persistent=False)
+        if self.n_id:
+            self.register_buffer('tok_isid', isid, persistent=False)
+            self.register_buffer('tok_idbase', idbase, persistent=False)
         self.val = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
         # the policy starts uniform: with random output layers the generic logit of a frequent
@@ -342,10 +375,11 @@ class TokenNet(nn.Module):
             at += r
         return torch.where(ok & (idx < self.vocab), idx, torch.full_like(idx, self.vocab))
 
-    def pack(self, x):
+    def pack(self, x, ident=False):
         """The packed tokens: (h [B, T, d] (row b's n[b] tokens first, in layout order; the
         global token at 0), n [B], full [B, T] = each packed token's position in the full token
-        axis (0 = global, then the segments' slots))."""
+        axis (0 = global, then the segments' slots)); with `ident`, also each packed token's
+        identity [B, T] (vocab: none)."""
         B, dev = x.shape[0], x.device
         segs, pres = [], [torch.ones(B, 1, dtype=torch.bool, device=dev)]
         for s in self.segs:
@@ -368,24 +402,33 @@ class TokenNet(nn.Module):
                 pools.append(torch.cat([c @ self.emb.weight[:w], c.sum(-1, keepdim=True)], -1))
             g = g + self.bag(torch.cat(pools, 1).flatten(1))
         h = torch.cat([(g + self.pos[0])[:, None], g.new_zeros(B, T - 1, self.d)], 1)
+        idt = torch.full((B, T), self.vocab, dtype=torch.long, device=dev) if ident else None
         start = 1
         for s, sl, lin in zip(self.segs, segs, self.seg_in):
             bi, si = pres[:, start:start + s['count']].nonzero(as_tuple=True)
             if len(bi):
                 rows = sl[bi, si]                                     # [N, width]
                 t = lin(rows) + self.pos[start + si]
-                if s['id'] is not None:
-                    t = t + self.emb(self._identity(rows, s['id']))
                 pi = cpos[bi, start + si]
+                if s['id'] is not None:
+                    i = self._identity(rows, s['id'])
+                    t = t + self.emb(i)
+                    if idt is not None:
+                        idt[bi, pi] = i
                 h = h.index_put((bi, pi), t)
                 full[bi, pi] = start + si
             start += s['count']
+        if ident:
+            return h, n, full, idt
         return h, n, full
 
     def forward(self, x, n_players):
         """As `Net.forward`."""
         x = x[:, :self.features]
-        h, n, full = self.pack(x)
+        if self.n_id:
+            h, n, full, idt = self.pack(x, ident=True)
+        else:
+            h, n, full = self.pack(x)
         B, T, D = h.shape
         dev = x.device
         rows = torch.argsort(n, stable=True) if B > self.chunk else torch.arange(B, device=dev)
@@ -405,7 +448,13 @@ class TokenNet(nn.Module):
             pc = F.pad(self.gen(zc), (0, 1))
             fc = full[r, :Tc]
             cols = self.tok_cols[fc]                                  # [Bc, Tc, K]
-            acts = torch.where(keep[..., None] & (cols >= 0), self.tok_acts[fc], self.actions)
+            acts = self.tok_acts[fc]
+            if self.n_id:                                             # actions by identity
+                ic = idt[r, :Tc]
+                ia = self.tok_idbase[fc] + ic
+                ia = torch.where((ic < self.vocab) & (ia < self.actions), ia, self.actions)
+                acts = torch.where(self.tok_isid[fc], ia[..., None], acts)
+            acts = torch.where(keep[..., None] & (cols >= 0), acts, self.actions)
             lg = self.ptr(F.gelu(self.pk(hc) + self.pq(zc)[:, None])).gather(2, cols.clamp(min=0))
             pc = pc.scatter(1, acts.flatten(1), lg.flatten(1))
             z = z.index_copy(0, r, zc)
