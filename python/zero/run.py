@@ -307,7 +307,7 @@ class Run:
     def selfplay(self, it):
         c = self.cfg
         d = os.path.join(self.run, 'data', f'iter_{it:04d}')
-        if os.path.exists(d):
+        if os.path.exists(d) and not (self.rsp is not None and self.rsp.began(it)):
             self.drop_data(d, strict=True)         # an interrupted iteration is replayed
         t0 = time.time()
         seat = self.nn_seat('m', c['sims'], selfplay=True)
@@ -759,6 +759,14 @@ class Run:
             if self.rsp is not None:
                 self.rsp.close()
 
+    def early_remote(self, nxt):
+        """Checkpoint nxt - 1 is written: the remote starts iteration nxt's self-play with it now,
+        while this machine evaluates (docs/az.md 5.3: on-policy, the checkpoint this machine's
+        phase nxt will use). Not after the last iteration, nor when STOP or PAUSE is there."""
+        if self.rsp is not None and nxt <= self.cfg['iters'] and not runctl.stop_requested(self.run) \
+                and not runctl.pause_requested(self.run):
+            self.rsp.begin(nxt)
+
     def _iterations(self, start, done):
         c = self.cfg
         run = self.run
@@ -785,6 +793,7 @@ class Run:
             m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': t1 - t0, 'train_s': time.time() - t1},
                  'resumed_seconds': 0}
             _write_json(self.partial_path(it), dict(m, resumed_seconds=time.time() - t0))
+            self.early_remote(it + 1)
             self.finish_iter(it, m, t0)
         if self.rsp is not None:
             self.rsp.close()                       # no more self-play: the remote's workers quit
@@ -802,7 +811,8 @@ def _fmt_remote(r):
     """The remote's share of a self-play phase in one log line."""
     s = (f"{r['workers']} worker(s), {r['games']} games, {r['samples']} samples in {r['shards']} shards "
          f"({r['bytes'] / 1e6:.1f} MB), {r['leaves_per_s']:.0f} leaves/s ({r['leaves_per_running_s']:.0f} running), "
-         f"{r['seconds']:.0f}s ({r['backoff_s']:.0f}s backing off), waited {r['wait_s']:.1f}s")
+         f"{r['seconds']:.0f}s ({r['backoff_s']:.0f}s backing off, started {r.get('lead_s', 0):.0f}s before this "
+         f"machine's phase), waited {r['wait_s']:.1f}s")
     if 'matches' in r:
         s += (f"; matches {r['matches']} back, {r['assigned']} assigned, {r['outstanding']} outstanding, "
               f"{r['requeued']} + {r['requeued_timeout']} requeued, {r['duplicates_dropped']} duplicates dropped")

@@ -109,9 +109,23 @@ def lock_held(locks):
             except OSError:
                 pass
             continue
-        if pid != os.getpid() and _alive(pid):
+        if pid != os.getpid() and _owner_alive(pid):
             return d
     return None
+
+
+def _owner_alive(pid):
+    """A lock owner is alive: its process exists and is not a zombie (a dead child its parent has
+    not reaped still answers kill(pid, 0) on POSIX)."""
+    if not _alive(pid):
+        return False
+    try:
+        import psutil
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except ImportError:
+        return True
+    except Exception:                              # noqa: BLE001 - gone meanwhile
+        return False
 
 
 # ================================================================== the local side
@@ -317,17 +331,29 @@ class RemotePlay:
         return self.procs * self.cap
 
     # ---------------------------------------------------------------- the main thread's API
+    def began(self, it):
+        """The remote's phase `it` has begun already (started early: right after checkpoint it - 1
+        was written, while the run evaluated it)."""
+        with self.mu:
+            return self.want == it and self.accepting == it
+
     def begin(self, it, co=None):
-        """Iteration `it`'s self-play starts here: the remote's starts as soon as it can (never
-        waited for)."""
+        """Iteration `it`'s self-play starts: the remote's as soon as it can (never waited for).
+        The run calls it as soon as checkpoint it - 1 is written (before its evaluation) and again
+        when its own phase starts (then a no-op)."""
         with self.mu:
             if self.fatal is not None:
                 raise self.fatal
+            if self.want == it and self.accepting == it:
+                if co is not None:
+                    self.co = co
+                self.cur['t_local'] = _now()           # this machine's phase starts now
+                return
             self.want = it
             self.accepting = it
             if co is not None:
                 self.co = co
-            self.cur = {'it': it, 't0': _now(), 'announced': 0, 'accepted': 0, 'rows': 0, 'bytes': 0, 'pending': 0,
+            self.cur = {'it': it, 't0': _now(), 't_local': _now(), 'announced': 0, 'accepted': 0, 'rows': 0, 'bytes': 0, 'pending': 0,
                         'rejected': 0, 'quarantined': 0, 'failed': 0, 'fetch_s': 0.0, 'assigned': 0, 'matches': 0,
                         'dup': 0, 'requeued': 0, 'requeued_timeout': 0, 'errors': 0}
             self.mu.notify_all()
@@ -366,7 +392,8 @@ class RemotePlay:
                    backoff_s=round(max([e['backoff_s'] for e in ends], default=0.0), 1),
                    in_flight=sum(e.get('in_flight', 0) for e in ends), late=late, late_prev=late_prev,
                    rejected=cur['rejected'], quarantined=cur['quarantined'], fetch_failed=cur['failed'],
-                   fetch_s=round(cur['fetch_s'], 1), wait_s=round(_now() - t0, 2), session_errors=cur['errors'])
+                   fetch_s=round(cur['fetch_s'], 1), wait_s=round(_now() - t0, 2), session_errors=cur['errors'],
+                   lead_s=round(cur['t_local'] - cur['t0'], 1))
         if self.mode == 'matches':
             with self.mu:
                 outstanding = sum(len(s.assigned) for s in self.sess if s is not None)
@@ -622,7 +649,7 @@ class RemotePlay:
     # ---------------------------------------------------------------- co-training
     def _assign(self, s):
         co = self.co
-        if co is None or co.closing or s.hello is None:
+        if co is None or s.hello is None:
             return
         room = self.cap - len(s.assigned)
         if room <= 0:

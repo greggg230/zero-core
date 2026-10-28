@@ -95,6 +95,8 @@ def test_remote_shards_join_the_iteration_and_its_training(rsp_run):
         assert rem['bytes'] == sum(os.path.getsize(f) for f in files)
     r = contributed[-1]['selfplay']['remote']
     assert r['games'] > 0 and r['leaves'] > 0 and r['leaves_per_s'] > 0 and r['workers'] == 1
+    # the remote's phase i starts as soon as checkpoint i - 1 is written, before its evaluation here
+    assert m[1]['selfplay']['remote']['lead_s'] == 0 and all(x['selfplay']['remote']['lead_s'] > 0 for x in m[2:])
     rd = mirror / 'sp'
     assert json.load(open(rd / 'config.json'))['selfplay_remote'] == ''
     assert json.load(open(rd / 'selfplay.json'))['mode'] == 'selfplay'
@@ -203,6 +205,7 @@ def test_backs_off_while_an_evaluation_holds_its_lock(tmp_path):
                 busy = glob.glob(str(wd / '.busy-*'))
                 released['busy_while_held'] = busy
                 holder.kill()
+                holder.wait()
                 released['t'] = time.time()
                 return
             time.sleep(0.1)
@@ -213,6 +216,7 @@ def test_backs_off_while_an_evaluation_holds_its_lock(tmp_path):
                      env=env_for(tmp_path))
     finally:
         holder.kill()
+        holder.wait()
     assert p.returncode == 0, p.stdout + p.stderr
     assert 't' in released, 'iteration 2 never showed the remote backing off'
     assert released['busy_while_held'] == []
@@ -252,6 +256,7 @@ def test_background_backoff(tmp_path):
                            env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH, **env_for(tmp_path)))
     finally:
         holder.kill()
+        holder.wait()
     assert p.returncode == 0, p.stdout + p.stderr
     assert json.load(open(wd / 'bg' / 'selfplay.json'))['backoff'] == 'background'
     rem = [r['selfplay']['remote'] for r in read_metrics(str(run))[1:]]
@@ -340,6 +345,7 @@ def test_cotrain_resolver_episodes_on_the_remote(tmp_path):
     mp, mr = check_cotrain(run)
     rem = [r['selfplay']['remote'] for r in mr[1:]]
     assert sum(r['matches'] for r in rem) > 0 and sum(r['samples'] for r in rem) > 0, rem
+    assert rem[0]['lead_s'] == 0 and all(r['lead_s'] > 0 for r in rem[1:]), rem   # it plays on during evaluations
     assert all(r['duplicates_dropped'] == 0 and r['requeued'] == 0 for r in rem), rem
     assert mp[1]['selfplay']['cotrain']['pending_max'] == 2 * 16 + (16 + 4)
     assert json.load(open(tmp_path / 'mirror' / 'co.resolver' / 'selfplay.json'))['mode'] == 'matches'
@@ -468,6 +474,7 @@ def test_lock_held(tmp_path):
         assert lock_held([str(tmp_path / 'none'), str(d)]) == str(d)
     finally:
         holder.kill()
+        holder.wait()
         holder.wait()
     assert lock_held([str(d)]) is None, 'a dead owner does not count'
 

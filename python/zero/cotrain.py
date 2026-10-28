@@ -480,7 +480,7 @@ class CoRun:
         P, R, c, rc = self.P, self.R, self.cfg, self.rcfg
         for X in (P, R):
             d = os.path.join(X.run, 'data', f'iter_{it:04d}')
-            if os.path.exists(d):
+            if os.path.exists(d) and not (X.rsp is not None and X.rsp.began(it)):
                 X.drop_data(d, strict=True)        # an interrupted iteration is replayed
         t0 = time.time()
         rconc = c.get('resolver_conc') or rc['conc']
@@ -517,7 +517,8 @@ class CoRun:
         state = {'t': 0.0, 'parked_max': 0, 'tr': 0.0}
         prog = os.path.join(self.run, 'progress.json')
         co.take_rows()
-        co.take_remote_rows()
+        if rsp is None or not rsp.began(it):
+            co.take_remote_rows()                  # (begun early: the rows of its head start are this phase's)
         co.lat = []
         co.waited = 0.0
         dup0 = co.dup_dropped
@@ -718,6 +719,11 @@ class CoRun:
                 m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': t1 - t0, 'train_s': t2 - t1},
                      'resumed_seconds': time.time() - t0}
                 _write_json(X.partial_path(it), m)
+            if R.rsp is not None and self.sp is not None and it < c['iters'] and not os.path.exists(stop) \
+                    and not os.path.exists(os.path.join(run, 'PAUSE')):
+                # both checkpoints are written: the remote goes on with the queued episodes with the
+                # resolver's checkpoint it (iteration it + 1's) while the networks are evaluated here
+                R.rsp.begin(it + 1, self.sp['co'])
             self.finish_iter(it, time.time())
         if R.rsp is not None:
             R.rsp.close()                          # no more self-play: the remote's workers quit
