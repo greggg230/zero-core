@@ -442,7 +442,8 @@ function render(){
     const xs=xn.map((k,i)=>({pts:X.filter(m=>m.extras[k]&&typeof m.extras[k].value==='number').map(m=>({x:m.iter,y:m.extras[k].value,e:m.extras[k]})),color:cols[i%3],label:(last[k]&&last[k].label)||k,
       tip:p=>(p.e.pct?pct(p.y):autoFmt(p.y,1))+(p.e.n?` · ${p.e.n.toLocaleString()} positions`:'')}));
     const refs=xn.flatMap(k=>Object.entries((last[k]&&last[k].refs)||{}).map(([n,v])=>({y:v,label:`${n} ${pc(k)?pct(v):autoFmt(v,1)}`})));
-    $('extra-cap').textContent=xn.map(k=>(last[k]&&last[k].caption)||'').filter(Boolean).join(' ')||'Measured on every evaluated checkpoint; never a training signal. Dashed lines: references on the same positions.';
+    $('extra-cap').textContent=(xn.map(k=>(last[k]&&last[k].caption)||'').filter(Boolean).join(' ')||'Measured on every evaluated checkpoint; never a training signal. Dashed lines: references on the same positions.')+
+      xn.filter(k=>last[k]&&last[k].error).map(k=>` ${k} failed at iteration ${X[X.length-1].iter}: ${last[k].error}`).join('');
     legend($('extra-leg'),xs);chart($('extra'),xs,xn.every(pc)?{y0:0,y1:1,fmt:v=>Math.round(v*100)+'%',refs}:{refs});
   }
   chart($('prev'),[{pts:prevPts,color:'--series-3',label:'vs previous',tip:p=>`vs iter ${p.px}: ${pct(p.y)} ±${(196*p.r.se).toFixed(1)} (${p.r.n} games)`}],{y0:0,y1:1,fmt:v=>Math.round(v*100)+'%',refs:[{y:.5,label:'even'}]});

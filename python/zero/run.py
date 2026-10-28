@@ -609,10 +609,19 @@ class Run:
 
     def extra_evals(self, it, m):
         """The game package's other yardsticks of checkpoint `it` (GamePackage.evals): measured
-        and logged under m['extras'][name], never fed back."""
+        and logged under m['extras'][name], never fed back. One that raises does not stop the
+        run (a yardstick, not the loop): its error is logged (EXTRA EVAL FAILED) and recorded as
+        m['extras'][name] = {'error': ...}."""
         for name, fn in package.active().evals_of(self.cfg['game']).items():
             t0 = time.time()
-            r = fn(self, it)
+            try:
+                r = fn(self, it)
+            except Paused:
+                raise
+            except Exception as e:                 # noqa: BLE001 - recorded, loudly
+                m.setdefault('extras', {})[name] = {'error': f'{type(e).__name__}: {e}'[:500]}
+                self.log(f'iter {it} {name}: EXTRA EVAL FAILED: {type(e).__name__}: {e}')
+                continue
             if r is None:
                 self.log(f'iter {it} {name}: skipped')
                 continue

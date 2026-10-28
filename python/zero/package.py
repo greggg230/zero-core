@@ -63,7 +63,8 @@ class GamePackage:
                     checkpoint outside its matches (MTG Zero: the draft network's agreement with
                     held-out human picks), run on every evaluated iteration after the matches
                     (`run`: the `zero.run.Run`, `it`: the checkpoint) and logged in metrics.jsonl
-                    under `extras.<name>` (None: skipped); measuring only, never a training
+                    under `extras.<name>` (None: skipped; an exception is logged and recorded
+                    as {"error": ...}, the run goes on); measuring only, never a training
                     signal. By convention the dict holds `value` (the dashboard's series),
                     optional `label`, `pct` (a share: shown as a percentage) and `refs`
                     ({name: value}: reference lines, e.g. baselines on the same positions)

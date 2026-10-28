@@ -109,14 +109,15 @@ def test_extra_evals_are_logged_and_skipped(tmp_path):
     old = dict(pkg.evals)
     try:
         pkg.evals['toy'] = {'probe': lambda r, it: seen.append(it) or {'value': 0.25, 'pct': True, 'refs': {'random': 0.1}},
-                            'off': lambda r, it: None}
+                            'off': lambda r, it: None, 'boom': lambda r, it: 1 / 0}
         R.extra_evals(3, m)
     finally:
         pkg.evals.clear()
         pkg.evals.update(old)
-    assert seen == [3] and set(m['extras']) == {'probe'} and m['extras']['probe']['value'] == 0.25
+    assert seen == [3] and set(m['extras']) == {'probe', 'boom'} and m['extras']['probe']['value'] == 0.25
+    assert m['extras']['boom'] == {'error': 'ZeroDivisionError: division by zero'}
     log = (run / 'log.txt').read_text(encoding='utf-8')
-    assert 'iter 3 probe: ' in log and 'iter 3 off: skipped' in log
+    assert 'iter 3 probe: ' in log and 'iter 3 off: skipped' in log and 'iter 3 boom: EXTRA EVAL FAILED' in log
 
 
 def test_cotrain_pause_mid_iteration_replays_it(tmp_path):
