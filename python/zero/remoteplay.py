@@ -582,6 +582,10 @@ class RemotePlay:
                     self.cur['errors'] += 1
             requeue = [(tag, spec) for tag, (_t, spec) in s.assigned.items()]
             s.assigned.clear()
+            # the next session starts from a mirror prepared again (it may be what failed: removed,
+            # half-written) and gets its checkpoint again (6 MB)
+            self.mirror_ready = False
+            self.model_shipped = None
         if requeue and self.co is not None:
             self.co.requeue(requeue)
             with self.mu:
