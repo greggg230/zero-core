@@ -28,7 +28,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements |
 | `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B) |
-| `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
+| `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; co-training: a share of the resolver's queued episodes, rows back by tag, requeue), `Worker` (the remote side: a rolling driver across iterations, back-off while an evaluation holds its lock, busy markers) |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
@@ -123,6 +123,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `resolver_init` | '' | the checkpoint the resolver's network starts from ('' = fresh); a single-game run's checkpoint works (widened if the game grew) |
 | `resolver_conc`, `pending_max` | 0, 0 | resolver episodes in flight in self-play (0 = its `conc`); the backpressure: resolver episodes queued or playing at which the primary's self-play waits (0 = 2 x in flight) |
 | `draft_eval_net_every` | 4 | the primary's evaluation also plays its episodes with the resolver's network on evaluated iterations that are multiples of it (`eval_yard_net`; 0 = never); the rest of its evaluation plays them with the resolver's yardstick |
+| `draft_eval_net_remote` | '' | those events (`eval_yard_net`) on another machine while the run trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 11.7); their results in the run's `evals.jsonl` |
 
 ## 2. Run control (`runctl.py`)
 
@@ -154,7 +155,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor) and the current fit |
-| `evals.jsonl` | with `eval_remote` (section 5.2): one line per remote evaluation `{iter, eval_yard, eval_random, elo, time, host, seconds}`, merged into the iterations' rows by the dashboard; a co-training run's resolver: `resolver/evals.jsonl` (11.5) |
+| `evals.jsonl` | with `eval_remote` (section 5.2): one line per remote evaluation `{iter, eval_yard, eval_random, elo, time, host, seconds}`, merged into the iterations' rows by the dashboard; a co-training run's resolver: `resolver/evals.jsonl` (11.5); a co-training run's primary with `draft_eval_net_remote`: `{iter, eval_yard_net, time, host, seconds, remote_s}` (11.7) |
 | `progress.json` | self-play progress of the iteration in flight (dashboard); a co-training run's also has `events_resolved`, `target`, `drafting`, `pending_events`, `matches_queued`, `matches_in_flight`, `matches_done` (section 11); with `selfplay_remote`: `remote` (single-game) or `matches_remote` (co-training), sections 5.3, 11.6 |
 | `resolver/` | a co-training run's resolver network (section 11): the same layout (`config.json`, `metrics.jsonl`, `models/`, `data/`, `elo/`, `debug/`, `progress.json`), iteration numbers shared |
 | `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control |
@@ -740,12 +741,13 @@ are toy games; preset `toy-cotrain-smoke`).
 `resolver_cfg` (a dict of the run settings; `DEFAULTS` + the package's < its `preset` < the dict;
 co-training keys inside it are errors, as are unknown ones), saved nested in `config.json` and
 resolved into `<run>/resolver/config.json`; `resolver_init`, `resolver_conc`, `pending_max`,
-`draft_eval_net_every` (section 1.2). The primary keeps the run directory as a single-game run
+`draft_eval_net_every`, `draft_eval_net_remote` (section 1.2). The primary keeps the run directory as a single-game run
 does (`models/`, `data/`, `elo/`, `metrics.jsonl`, `progress.json`: the dashboard and the tools
 work unchanged); the resolver has `<run>/resolver/` with the same layout. One player count per
 game (`players`). Its `iters`, `games` and `rolling` are not used; its `eval_remote` sends its
 evaluations to a remote (11.5), its `selfplay_remote` a share of its episodes (11.6). The run's
-own `eval_remote` and `selfplay_remote` (the primary's) are refused.
+own `eval_remote` and `selfplay_remote` (the primary's) are refused; `draft_eval_net_remote` sends
+the primary's resolver-network events to a remote (11.7).
 
 **The game package's glue** (`GamePackage.deferred`, game -> `{'episodes': fn(payload) ->
 [resolver spec JSON, ...], 'results': fn(payload, rows) -> results JSON}`): the defaults read
@@ -898,7 +900,8 @@ MacBook plays the `mtg` play network's evaluation of its 4v4 team-draft run (~9 
   `[resolver] iter N vs heuristic (remote mac, 560s): ...`, `[resolver] iter N elo ... (remote mac)`.
 * **The primary's evaluation stays here**, unchanged: its yardstick-played events every evaluated
   iteration and its resolver-network events (`eval_yard_net`) every `draft_eval_net_every`, which
-  load the resolver's checkpoint of the iteration here. They do not wait for the remote.
+  load the resolver's checkpoint of the iteration here (or on a remote of their own with
+  `draft_eval_net_remote`, 11.7). They do not wait for the remote.
 * **Resume**: the resolver's evaluated iterations without a result are queued again at start
   (`RemoteEval.backfill`); nothing else is replayed. **An unreachable remote** is retried every
   5 minutes on its thread: both networks keep training and the primary keeps being evaluated; at
@@ -910,13 +913,8 @@ MacBook plays the `mtg` play network's evaluation of its 4v4 team-draft run (~9 
 * **The dashboard** (5.1): the resolver's tab merges `resolver/evals.jsonl` into its rows as a
   single-game run's view does; its Elo, win rates and head-to-head come from the copied-back
   `resolver/elo/`.
-* **Not remote: the primary's resolver-network events** (`eval_yard_net`). They could go to the
-  same remote at moderate cost - a second remote command that rebuilds `CoRun.event_match` from a
-  mirror holding both networks' checkpoints and the run's settings (the drivers, the coordinator
-  and the package's glue are all core code); the commit check and the lock would apply as they
-  are - but they are the largest single evaluation of MTG Zero's 4v4 run (32 events, 384
-  play-network matches every 4th iteration: more than the play network's own evaluation), so
-  the remote would hold its lock that much longer. Not done.
+* **The primary's resolver-network events** (`eval_yard_net`) are not this setting's: the run
+  setting `draft_eval_net_remote` sends them to a remote (11.7).
 
 Tests (`tests/test_cotrain.py`): two iterations of `toy-cotrain-smoke` with the resolver's
 `eval_remote` 'local' (the resolver's evaluations in `resolver/evals.jsonl` from the mirror
@@ -983,3 +981,139 @@ Tests (`tests/test_remoteplay.py`): toy-cotrain-smoke with the resolver's `selfp
 'local' (exact quotas, the remote's rows and shards counted, the backpressure's room), a slow
 worker whose episodes time out and are requeued (duplicates dropped, quotas exact), a worker that
 dies mid-phase every time (its episodes requeued, the worker restarted), the settings refused.
+
+### 11.7 The primary's resolver-network events on a remote (`draft_eval_net_remote`; MTG Zero, 2026-10-28)
+
+`eval_yard_net` (11.2) - the primary's checkpoint against its yardstick with every event's
+episodes played by the resolver's **network** of the same iteration - is the largest single
+evaluation of a co-training run (MTG Zero's 4v4 run: 32 events, 384 play-network matches every 4th
+iteration, 51-88 minutes on the desktop, its ENGINE.md 52.5 and 53), and its matches are played by
+one driver whose last few matches each need tens of thousands of sequential network calls (11.8).
+The run setting **`draft_eval_net_remote`** (a remote of the game package, 5.2; `local` in the
+tests; '' = here, the default) plays it on another machine while both networks train. The rest
+of the primary's evaluation (its yardstick- and random-played events, its Elo, the package's other
+yardsticks) stays here; the resolver's own evaluation has its own setting (11.5).
+
+* **Generic**: nothing game-specific - the remote rebuilds `CoRun` from a mirror of the run and
+  calls `CoRun.eval_net(it)`, the function that plays the events here (`PrimaryRun.evaluate` calls
+  it when the setting is off): the same drivers, coordinator, the package's deferred glue, seeds
+  (`7919 * it + 3`) and settings (the remote's overrides aside).
+* **Local side** (`zero.remote.RemoteNetEval`, a `RemoteEval` - its queue, thread, retries and
+  drain): `CoRun.finish_iter` appends the primary's metrics row without `eval_yard_net` (and
+  without `phases.eval_net_s`) and queues the iteration when its `eval_yard_net` is due
+  (`CoRun.eval_net_due`: an evaluated iteration that is a multiple of `draft_eval_net_every`, with
+  `eval_games`). The thread ships the **mirror** `<workdir>/<run name>`, laid out as the run:
+  `config.json` (the run's settings with every remote setting off - `eval_remote`,
+  `selfplay_remote`, `draft_eval_net_remote`, and the resolver's `eval_remote` and
+  `selfplay_remote` - and the remote's `overrides` on both networks' settings: the top level and
+  `resolver_cfg`), `models/iter_NNNN.pt` and `resolver/models/iter_NNNN.pt` of that iteration
+  only (each under a temporary name, then renamed); runs `python -m <pkg>.az.remote evalnet
+  <mirror> <iter>` in the remote's `repo`; appends `{iter, eval_yard_net, time, host, seconds,
+  remote_s}` (`seconds`: from the queue, shipping included; `remote_s`: the events' own) to the
+  run's **`evals.jsonl`** and logs `iter N vs <yardstick> (episodes by the resolver net; remote
+  mac, 812s): {...}`. Nothing is copied back: `eval_yard_net` is not in the Elo fit.
+* **Remote side** (`zero.remote.evaluate_net_mirror`): `CoRun(mirror, config)` (both networks'
+  directories in the mirror; the remote's `<workdir>/overrides.json` on both networks' settings),
+  `CoRun.eval_net(it)`, the result printed as `ZERO_REMOTE_RESULT {json}` and appended to the
+  mirror's `metrics.jsonl`. **One evaluation at a time per workdir**: the same `.eval.lock` as
+  `eval`, so the resolver's evaluation (11.5) and these events queue behind each other on the
+  remote, and remote self-play there backs off while either runs (5.3). MTG Zero's commit check
+  applies unchanged (`python -m mtgz.az.remote` checks the checkout before any subcommand).
+* **A failure never blocks training**: an attempt that fails (the remote asleep, unreachable, its
+  checkout refused) is logged (`remote eval mac iter 8: ...; retry in 300s`) and retried every
+  `RETRY_S` on its thread; later iterations queue behind it. **Restart**: the due iterations up to
+  the newest finished one without `eval_yard_net` in their metrics row or in `evals.jsonl` are
+  queued again (`RemoteNetEval.backfill`); nothing is replayed. At the end of the iterations the
+  run waits for both remote queues (progress phase `remote evaluations`; PAUSE ends the wait, the
+  restart queues what is missing again).
+* **The dashboard** (5.1) merges `eval_yard_net` from the root's `evals.jsonl` into the primary's
+  rows (the win-rate chart's resolver-network line), as it merges a remote's `eval_yard`.
+* **On or off at a restart**: `--draft-eval-net-remote mac` / `--draft-eval-net-remote ''`
+  (saved in config.json; a top-level co-training setting, so no `--resolver-cfg` is needed; inside
+  `resolver_cfg` it is refused, as is an unknown remote name at start). Turned off, the iterations
+  evaluated remotely keep their `evals.jsonl` rows; nothing is played again here.
+* **`ZERO_EVAL_WORKDIR`** (environment): another evaluation workdir on a named remote - its own
+  mirrors and its own `.eval.lock` (an end-to-end test beside a live run's workdir); an absolute
+  path on the remote (Git Bash rewrites `/Users/...` in a Windows process's environment:
+  `MSYS2_ENV_CONV_EXCL=ZERO_EVAL_WORKDIR`). Remote self-play then backs off for that lock.
+
+Tests (`tests/test_cotrain.py`, the remote 'local'): two iterations of `toy-cotrain-smoke` with
+`draft_eval_net_remote` (iterations 0 and 2's `eval_yard_net` in `evals.jsonl`, none in the metrics
+rows, the mirror holding the run's settings with every remote setting off and both networks'
+checkpoints of those iterations only, the lock released, the dashboard's merge); a restart with
+one missing (played again alone, nothing retrained); an unreachable remote (retried every second,
+both networks trained and evaluated here through every iteration, PAUSE in the final wait; then
+with a reachable remote both land); the setting refused inside `resolver_cfg` and with an unknown
+name; `ZERO_EVAL_WORKDIR`. MTG Zero's `tests/test_mac_remote.py`: its `evalnet` refused at another
+commit before anything is evaluated or locked; a team_draft mirror evaluated by the remote side.
+
+### 11.8 One slow game step held up the whole driver (MTG Zero, 2026-10-28)
+
+**The symptom** (MTG Zero's ENGINE.md 52.8, 53): `team_draft-smoke --iters 3 --games 8` (CPU) sat
+~10 minutes in iteration 2's self-play - 6 of 8 events resolved, 16 matches in flight, the resolver
+thread waiting in the driver's `next_batch`, the primary on backpressure, the process idle - and
+then went on; the same at an older core, at the same point (both runs had played identical games
+up to it). Separately, MTG Zero's 4v4 run td1 spent 51 and 88 minutes on its iterations 0 and 4's
+`eval_yard_net` with its process mostly idle.
+
+**Root cause, the stall.** A group's batch is assembled when every game of the group has made its
+step (its search and moves up to its next leaf; docs/search.md 2.3), and `next_batch` served the
+groups in **strict round-robin order**. So one game whose step takes long - an engine's slow path
+(52.8's runs used engines that still had MTG Zero's exponential payment search, its ENGINE.md 51.3;
+which step it was is not known) - stopped **every game of the driver**: its own group waits for it
+by design, and the other
+group, its batch answered and its next one ready, waited for its turn behind it. In co-training
+the resolver's episode player is that driver: no episode finishes, the episodes outstanding stay
+at `pending_max`, the primary waits on its backpressure, and the process idles (one search
+thread in the slow step) until the step ends. Two things made it worse:
+* `in_flight()` (co-training's progress snapshot, every half second on the resolver's thread)
+  locked every chunk of the driver **holding the GIL** (the binding does not release it), so when
+  it met the chunk of the slow game it blocked every Python thread of the process - the primary's
+  backpressure loop and progress.json included - until the step ended;
+* a `queue_only` driver's first group re-dispatched took the whole queue: an evaluation's matches,
+  queued at once, started 383 / 1 in td1's `eval_yard_net` (768 slots, 384 matches), so its two
+  groups' search and inference no longer overlapped.
+
+What made the step slow in 52.8's runs could not be reproduced: 16 runs of the smoke since (69
+iterations, ~2,400 drafted matches; 27 of the iterations on 692a52c's engine, the 52.8 runs') did
+not idle; the slow-step counters below now say it when it happens.
+
+**The fix** (zero-core 9714be3):
+* A `queue_only` driver (co-training's episode players - the resolver's self-play driver,
+  `event_match`'s, a remote matches worker's - whose results depend on timing anyway) serves the
+  **first of its working groups that is ready**, in round-robin order from the cursor: a slow game
+  holds up its own group only; the others play on (with `groups` 2, half the episodes in flight).
+  Every other driver keeps the strict order (a run reproducible from its seed).
+* `queue_share`: a group dispatched starts its share of everything in flight or queued, never fewer
+  than the other groups' free slots cannot take (no free slot idles while setups wait; a setup's
+  gid is still its place in the queue): the evaluation's 384 matches start 192 / 192.
+* `in_flight()` try-locks each chunk; a chunk being searched counts its games as of its group's
+  last dispatch (exact once the phase is paused).
+* `DriverStats`: `step_max_s`, `step_max_gid` (the longest step of a game so far) and `slow_steps`
+  (steps over 10 s); `CoRun` logs `iter N self-play (resolver driver): K game step(s) took over 10 s
+  (the longest so far S s, game G): an engine slow path?` (and the same after each event match) and
+  counts them in the rolling stats (`slow_steps`).
+* Not changed: the step itself (a game's search is one thread's), and the end of a phase - a group
+  in a slow step pauses when it ends - so a slow step still delays its own group's games and an
+  iteration's end; it no longer stops everything else for its duration.
+
+**Regression tests** (the crate's `driver` tests): `a_slow_step_holds_up_its_own_group_only` - a
+`queue_only` driver of 2 groups x 4 with 8 queued toy games, one of which sleeps 1.5 s in one
+step: the other group plays on to its last batch while it sleeps (in strict order it got one
+batch: the test fails on the old code), the step counted (`step_max_s`, `step_max_gid`), and
+`in_flight()` returns at once while a search thread sleeps; `queued_setups_are_shared_between_the_groups`
+(8 setups for 2 x 8 slots: 4 / 4, was 7 / 1; the same games as with one group);
+`queued_setups_fill_every_free_slot_when_the_queue_is_long`.
+
+**The evaluation's time** (`eval_yard_net`; MTG Zero's ENGINE.md 53.2 measures td1's): its
+events are drafted first (all at once, a few rows per network call), then their matches all start
+in one `queue_only` driver, and the evaluation lasts as long as its **longest match**: one leaf per
+game per call, so the last matches' tens of thousands of calls follow one another with a handful of
+rows each. A call costs about the same whatever its rows on a GPU shared with training (MTG Zero's
+token networks on the desktop's RTX 5090, td1 training beside: ~9-11 ms for 1-32 rows, 14 / 21 /
+49 ms for 96 / 192 / 384; on 2 CPU threads 3.0 / 4.3 / 6.6 ms for 1 / 8 / 32 rows, 15 / 27 / 50 for
+96 / 192 / 384), and the evaluating thread is busy with calls all the time (the search threads
+idle: the process looks idle): the phase is latency-bound, not stalled, and the fixes above do not
+shorten it (the 383 / 1 start cost nothing measurable there: one thread evaluates both groups'
+batches in turn either way). The levers are the remote (11.7: its CPU), CPU inference for the
+evaluation's small batches, and fewer or shorter calls.

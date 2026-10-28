@@ -214,7 +214,12 @@ handle empty segments; `protocol.validate_batch` allows 0 or >= 2 options).
 * The games are split into `groups`; each group's batches (one per key) must be answered
   before that group advances again; with 2 groups the search threads work on group B while
   Python evaluates group A. `next_batch` releases the GIL while waiting; groups are served in
-  a fixed round-robin order.
+  a fixed round-robin order, except by a `queue_only` driver (2.9), which serves the first of its
+  groups that is ready: a game whose step takes long (an engine's slow path) then holds up its
+  own group only, not every game of the driver (docs/az.md 11.8). `stats()` reports the longest
+  step of a game so far (`step_max_s`, `step_max_gid`) and the steps over 10 s (`slow_steps`).
+  `in_flight()` never waits for a search thread (a chunk being searched counts its games as of
+  its group's last dispatch).
 * Batch assembly: every group is split into chunks (<= 4 x threads); the last chunk's worker
   lays out the batches and queues one fill job per chunk at the front of the queue, so all
   threads copy rows in parallel (fixed-width rows: one memcpy per chunk).
@@ -304,7 +309,11 @@ or a dict; parsed at once, an invalid spec is an error at `enqueue`) instead of 
 with the driver's seats and its (seed, gid) streams; its result row carries `tag`.
 `queue_only=True` (rolling drivers only) makes slots start nothing but queued setups: with the
 queue empty they stay idle, and `next_batch` returns None once nothing is left to play (the
-phase has not ended: `enqueue` wakes the idle groups unless the phase ended). Co-training's
+phase has not ended: `enqueue` wakes the idle groups unless the phase ended). The groups share
+the queued setups: a group dispatched starts its share of everything in flight or queued, never
+fewer than the other groups' free slots cannot take (so the groups' search and inference overlap
+when fewer setups than slots arrive at once - an evaluation's matches - and no slot idles while
+setups wait); a setup's gid is its place in the queue. Co-training's
 resolver driver is one (docs/az.md 11): it plays the episodes of parked games, tagged
 `<gid>/<k>`, with the play network on every seat.
 
