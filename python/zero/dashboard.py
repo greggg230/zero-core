@@ -10,6 +10,14 @@ The runs directory defaults to <game repo>/runs. Works with no runs yet (shows h
 one). Charts are drawn at the element's real pixel width (redrawn on resize), so text is never
 stretched on phones.
 
+Co-training runs (zero/cotrain.py, docs/az.md 11: a `resolver/` directory in the run): the
+run's own metrics are the primary network's, `<run>/resolver/` holds the resolver network's with
+the same layout; the page shows a tab per network (each with its Elo, win rates, losses,
+throughput and head-to-head table), the co-training progress (games resolved, in play and parked,
+episodes queued, in flight and done) and throughput. Other yardsticks of a checkpoint
+(`GamePackage.evals`, metrics `extras`) are charted when a run has them. Single-game runs render
+as before.
+
 Run control (zero/runctl.py): each run's state and Pause / Resume buttons: POST
 /api/run/<name>/pause creates <run>/PAUSE, POST /api/run/<name>/resume removes it (JSON body
 required; only plain names of run directories under --runs); GET /api/run/<name>/control is
@@ -128,27 +136,38 @@ def runs():
     return jsonify(out)
 
 
+def _net(d):
+    """One network's view of a run directory: its settings, metrics, long-search points and Elo."""
+    res = _json(os.path.join(d, 'elo', 'results.json'), {}) or {}
+    return {'config': _json(os.path.join(d, 'config.json'), {}), 'metrics': _metrics(d), 'deep': _deep(d),
+            'ratings': _json(os.path.join(d, 'elo', 'ratings.json'), {}), 'pairs': res.get('pairs', {}),
+            'anchor': res.get('anchor')}
+
+
+def _resolver_dir(d):
+    """A co-training run's resolver directory (zero/cotrain.py), else None."""
+    r = os.path.join(d, 'resolver')
+    return r if any(os.path.exists(os.path.join(r, f)) for f in ('config.json', 'metrics.jsonl')) else None
+
+
 @app.route('/api/run/<name>')
 def run(name):
     d = _run_dir(name)
     if d is None:
         return jsonify({'error': f'no run named {name!r}'}), 404
     lp = os.path.join(d, 'log.txt')
-    res = _json(os.path.join(d, 'elo', 'results.json'), {}) or {}
-    return jsonify({
-        'config': _json(os.path.join(d, 'config.json'), {}),
-        'metrics': _metrics(d),
-        'deep': _deep(d),
+    out = dict(_net(d), **{
         'log': _tail(lp, 60),
         'supervisor': _tail(os.path.join(d, 'supervisor.log'), 12),
-        'ratings': _json(os.path.join(d, 'elo', 'ratings.json'), {}),
-        'pairs': res.get('pairs', {}),
-        'anchor': res.get('anchor'),
         'progress': _json(os.path.join(d, 'progress.json')),
         'status': {'log_age_s': time.time() - os.path.getmtime(lp) if os.path.exists(lp) else None, 'now': time.time()},
         'stopping': os.path.exists(os.path.join(d, 'STOP')),
         'control': _control(d),
     })
+    rd = _resolver_dir(d)
+    if rd is not None:
+        out['resolver'] = _net(rd)
+    return jsonify(out)
 
 
 @app.route('/api/run/<name>/control')
@@ -235,6 +254,9 @@ details summary{cursor:pointer;font-weight:600;font-size:14px}
 .btn.pause{background:var(--act-pause)}
 .btn:disabled{opacity:.55;cursor:default}
 @media (max-width:520px){.btn{flex:1 1 100%}}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+.tab{font:inherit;font-size:14px;font-weight:600;min-height:40px;padding:8px 14px;border-radius:10px;border:1px solid var(--line);background:var(--surface-1);color:var(--text-secondary);cursor:pointer;touch-action:manipulation}
+.tab.on{background:var(--text-primary);color:var(--bg);border-color:var(--text-primary)}
 .empty{padding:28px 18px;text-align:center}
 .empty p{margin:6px 0;color:var(--text-secondary)}
 </style></head><body><div class="wrap">
@@ -247,6 +269,7 @@ details summary{cursor:pointer;font-weight:600;font-size:14px}
 <div id="main" hidden>
 <div class="ctl" id="ctl" hidden><div class="ctl-state"><span class="dot" id="ctl-dot"></span><b id="ctl-label"></b><span class="ctl-detail" id="ctl-detail"></span></div>
 <button type="button" class="btn" id="ctl-btn" hidden></button></div>
+<div class="tabs" id="tabs" role="tablist" hidden></div>
 <div class="status" id="status"></div>
 <div class="tiles" id="tiles"></div>
 <div class="card"><h2>Elo by iteration</h2>
@@ -259,6 +282,9 @@ details summary{cursor:pointer;font-weight:600;font-size:14px}
 <div class="card" id="deep-card" hidden><h2 id="deep-t">Win rate with a long search</h2>
 <div class="cap" id="deep-cap"></div><div class="legend" id="deep-leg"></div>
 <svg id="deep" style="height:240px" role="img" aria-label="Win rate with a long search by iteration"></svg></div>
+<div class="card" id="extra-card" hidden><h2>Other yardsticks</h2>
+<div class="cap" id="extra-cap"></div><div class="legend" id="extra-leg"></div>
+<svg id="extra" style="height:220px" role="img" aria-label="Other yardsticks by iteration"></svg></div>
 <div class="card"><h2>Each checkpoint against the one before it</h2>
 <div class="cap">Each rated checkpoint vs the previous rated one (N&minus;1, or N&minus;eval_every when evaluation runs every few iterations), both networks searching with the eval sims, seats alternated. Above 50%: the newer network is stronger. Band = 95% interval.</div>
 <svg id="prev" style="height:220px" role="img" aria-label="Win rate against the previous iteration"></svg></div>
@@ -278,7 +304,7 @@ details summary{cursor:pointer;font-weight:600;font-size:14px}
 <script>
 const $=id=>document.getElementById(id);
 const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-let RUN=null, DATA=null;
+let RUN=null, DATA=null, VIEW='primary';
 function ns(t,a){const e=document.createElementNS('http://www.w3.org/2000/svg',t);for(const k in a)e.setAttribute(k,a[k]);return e}
 const pct=x=>(100*x).toFixed(1)+'%';
 const ago=s=>s<90?Math.round(s)+' s':s<5400?Math.round(s/60)+' min':(s/3600).toFixed(1)+' h';
@@ -338,28 +364,39 @@ $('ctl-btn').onclick=async()=>{
   try{const r=await fetch('api/run/'+encodeURIComponent(run)+'/'+act,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:act})});
     const j=await r.json();if(!r.ok){alert(j.error||('HTTP '+r.status));b.disabled=false;return}
     renderCtl(j.control);setTimeout(load,2000)}catch(e){alert('Request failed: '+e);b.disabled=false}};
+function renderTabs(){
+  const tb=$('tabs'),co=!!DATA.resolver;tb.hidden=!co;if(!co){tb.innerHTML='';return}
+  const pg=(DATA.config||{}).game||'primary',rg=(DATA.resolver.config||{}).game||'resolver';
+  tb.innerHTML=[['primary',`${pg} network`],['resolver',`${rg} network (resolver)`]].map(([k,l])=>`<button type="button" role="tab" aria-selected="${VIEW===k}" class="tab${VIEW===k?' on':''}" data-v="${k}">${l}</button>`).join('');
+  tb.querySelectorAll('button').forEach(b=>b.onclick=()=>{VIEW=b.dataset.v;render()});
+}
+const newestElo=V=>{const R=(V&&V.ratings&&V.ratings.ratings)||{};const k=Object.keys(R).filter(k=>k.startsWith('iter_')).sort().pop();return k?{x:+k.slice(5),y:R[k].elo,se:R[k].se}:null};
 function render(){
-  const M=DATA.metrics,cfg=DATA.config;
+  const co=!!DATA.resolver,rv=co&&VIEW==='resolver';
+  const V=rv?Object.assign({},DATA,DATA.resolver):DATA;
+  const M=V.metrics,cfg=V.config;
   renderCtl(DATA.control);
-  const yard=DATA.anchor||cfg.yardstick||'yardstick';
-  const R=(DATA.ratings&&DATA.ratings.ratings)||{};
+  renderTabs();
+  const yard=V.anchor||cfg.yardstick||'yardstick';
+  const R=(V.ratings&&V.ratings.ratings)||{};
   const sp=M.filter(m=>m.selfplay),tr=M.filter(m=>m.train);
   const games=sp.reduce((s,m)=>s+m.selfplay.games,0);
   const t0=M.length?M[0].time:0,tl=M.length?M[M.length-1].time:0;
   const eloPts=Object.keys(R).filter(k=>k.startsWith('iter_')).map(k=>({x:+k.slice(5),y:R[k].elo,lo:R[k].elo-1.96*R[k].se,hi:R[k].elo+1.96*R[k].se,r:R[k]})).sort((a,b)=>a.x-b.x);
   const bestElo=eloPts.reduce((b,p)=>!b||p.y>b.y?p:b,null),lastElo=eloPts[eloPts.length-1];
   const wy=winPts(M,'eval_yard'),wr=winPts(M,'eval_random');const ly=wy[wy.length-1],lr=wr[wr.length-1];
-  const P=DATA.pairs||{},nm=i=>'iter_'+String(i).padStart(4,'0');
+  const P=V.pairs||{},nm=i=>'iter_'+String(i).padStart(4,'0');
   const rec=(a,b)=>{const k=a<b?a+'|'+b:b+'|'+a,p=P[k];if(!p||!p[1])return null;const s=a<b?p[0]:p[1]-p[0],w=s/p[1];return {win:w,n:p[1],se:Math.sqrt(Math.max(w*(1-w),1e-6)/p[1])}};
   const prevPts=eloPts.map((p,i)=>i?{x:p.x,px:eloPts[i-1].x,r:rec(nm(p.x),nm(eloPts[i-1].x))}:{x:p.x,r:null}).filter(p=>p.r).map(p=>({x:p.x,px:p.px,y:p.r.win,lo:Math.max(0,p.r.win-1.96*p.r.se),hi:Math.min(1,p.r.win+1.96*p.r.se),r:p.r}));
   const lsp=sp[sp.length-1];
-  const D=DATA.deep||[],dsims=[...new Set(D.map(r=>r.sims))].sort((a,b)=>a-b);
+  const D=V.deep||[],dsims=[...new Set(D.map(r=>r.sims))].sort((a,b)=>a-b);
   const dmain=dsims.reduce((b,s)=>D.filter(r=>r.sims===s).length>D.filter(r=>r.sims===b).length?s:b,dsims[0]);
   const dl=D.filter(r=>r.sims===dmain).pop();
   $('sub').textContent=`Run ${RUN} · ${cfg.game||''} ${(cfg.players||[]).join('/')}-player · self-play ${cfg.sims}/${cfg.sims_fast} sims${cfg.rolling?' (rolling)':''} · eval ${cfg.eval_sims} sims · yardstick ${yard} = Elo 1000`;
   const pr=DATA.progress,st=DATA.status;let s=[];
   const live=DATA.control&&['running','stopping'].includes(DATA.control.state);
-  if(pr&&live&&pr.phase==='selfplay')s.push(`Iteration ${pr.iter}: self-play ${pr.games}/${pr.target} games`);
+  if(pr&&live&&pr.phase==='selfplay'&&pr.events_resolved!=null)s.push(`Iteration ${pr.iter}: self-play ${pr.events_resolved}/${pr.target} events resolved · ${pr.drafting} drafting · ${pr.pending_events} waiting for their matches · matches ${pr.matches_queued} queued, ${pr.matches_in_flight} in flight, ${pr.matches_done} done`);
+  else if(pr&&live&&pr.phase==='selfplay')s.push(`Iteration ${pr.iter}: self-play ${pr.games}/${pr.target} games`);
   else if(pr&&live&&pr.phase==='train')s.push(`Iteration ${pr.iter}: training`);
   else if(pr&&live&&pr.phase==='eval')s.push(`Iteration ${pr.iter}: evaluation and Elo matches`);
   if(st.log_age_s!=null)s.push(`last log line ${ago(st.log_age_s)} ago`);
@@ -373,12 +410,21 @@ function render(){
     (dl?tile(`vs ${dl.opponent||yard} · ${dl.sims} sims`,pct(dl.win),`±${(196*dl.se).toFixed(1)} pts · iteration ${dl.iter}`):'')+
     tile('Self-play games',games.toLocaleString(),`${((tl-t0)/3600).toFixed(1)} h elapsed`)+
     tile('Leaves / s',lsp?Math.round(lsp.selfplay.leaves_per_s).toLocaleString():'–',lsp?`${Math.round(lsp.selfplay.games_per_h).toLocaleString()} games/h`:'');
+  if(co){
+    const oe=newestElo(rv?DATA:DATA.resolver),og=((rv?DATA.config:DATA.resolver.config)||{}).game||'';
+    const ct=(rv?DATA.metrics:M).filter(m=>m.selfplay&&m.selfplay.cotrain).pop(),c=ct&&ct.selfplay.cotrain;
+    $('tiles').innerHTML+=tile(`${og} network Elo`,oe?Math.round(oe.y):'–',oe?`±${Math.round(1.96*oe.se)} · iteration ${oe.x}`:'the other tab')+
+      (c?tile('Matches / h',Math.round(c.episodes_per_h).toLocaleString(),`${c.episodes.toLocaleString()} matches, ${c.events} events · iteration ${ct.iter}`)+
+        tile('Event latency',c.event_latency_s?ago(c.event_latency_s[0]):'–',`park to resolve, mean · ${c.pending_events} pending · parked ${c.parked_mb_max} MB max`):'');
+  }
   const refs=[{y:1000,label:yard+' 1000'}];
   if(R.random&&yard!=='random')refs.push({y:R.random.elo,label:'random '+Math.round(R.random.elo)});
   $('elo-cap').textContent=`The yardstick (${yard}) is fixed at 1000. Each checkpoint plays the yardstick, the random bot and the checkpoints 1, 2, 4, 8, 16 and 32 iterations before it; all games are refit together after every iteration (Bradley-Terry). Band = 95% interval.`;
   chart($('elo'),[{pts:eloPts,color:'--series-1',label:'Elo',tip:p=>`${Math.round(p.y)} ±${Math.round(1.96*p.r.se)} (${p.r.games} games)`}],{refs});
   $('win-t').textContent='Win rate against '+yard+' and the random bot';
   const ws=[{pts:wy,color:'--series-1',label:yard,tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)} · margin ${p.e.margin}`},{pts:wr,color:'--series-2',label:'random',tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)}`}];
+  const wn=winPts(M,'eval_yard_net');
+  if(wn.length)ws.push({pts:wn,color:'--series-3',label:`${yard} (episodes played by the resolver network)`,tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)} · margin ${p.e.margin}`});
   legend($('win-leg'),ws);chart($('win'),ws,{y0:0,y1:1,fmt:v=>Math.round(v*100)+'%',refs:[{y:.5,label:'even'}]});
   $('deep-card').hidden=!D.length;
   if(D.length){
@@ -388,6 +434,16 @@ function render(){
     $('deep-t').textContent=`Win rate against ${dopp} with a long search`;
     $('deep-cap').textContent=`Occasional checkpoints against ${dopp}, the network searching with ${dsims.join(' or ')} sims (the charts above use the eval sims, ${cfg.eval_sims}), on the same boards each time. Band = 95% interval.`;
     legend($('deep-leg'),ds);chart($('deep'),ds,{fmt:v=>Math.round(v*100)+'%',x1:M.length?M[M.length-1].iter:null});
+  }
+  const X=M.filter(m=>m.extras),xn=[...new Set(X.flatMap(m=>Object.keys(m.extras)))];
+  $('extra-card').hidden=!xn.length;
+  if(xn.length){
+    const last=X[X.length-1].extras,cols=['--series-1','--series-2','--series-3'],pc=k=>!!(last[k]&&last[k].pct);
+    const xs=xn.map((k,i)=>({pts:X.filter(m=>m.extras[k]&&typeof m.extras[k].value==='number').map(m=>({x:m.iter,y:m.extras[k].value,e:m.extras[k]})),color:cols[i%3],label:(last[k]&&last[k].label)||k,
+      tip:p=>(p.e.pct?pct(p.y):autoFmt(p.y,1))+(p.e.n?` · ${p.e.n.toLocaleString()} positions`:'')}));
+    const refs=xn.flatMap(k=>Object.entries((last[k]&&last[k].refs)||{}).map(([n,v])=>({y:v,label:`${n} ${pc(k)?pct(v):autoFmt(v,1)}`})));
+    $('extra-cap').textContent=xn.map(k=>(last[k]&&last[k].caption)||'').filter(Boolean).join(' ')||'Measured on every evaluated checkpoint; never a training signal. Dashed lines: references on the same positions.';
+    legend($('extra-leg'),xs);chart($('extra'),xs,xn.every(pc)?{y0:0,y1:1,fmt:v=>Math.round(v*100)+'%',refs}:{refs});
   }
   chart($('prev'),[{pts:prevPts,color:'--series-3',label:'vs previous',tip:p=>`vs iter ${p.px}: ${pct(p.y)} ±${(196*p.r.se).toFixed(1)} (${p.r.n} games)`}],{y0:0,y1:1,fmt:v=>Math.round(v*100)+'%',refs:[{y:.5,label:'even'}]});
   const newest=lastElo?lastElo.x:null;

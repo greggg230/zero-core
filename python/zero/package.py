@@ -59,12 +59,20 @@ class GamePackage:
                     fn(payload, rows) -> the results JSON for `resolve` (rows: the episodes'
                     result rows in order; default `[{"result": [...], "scores": [...]}, ...]`)}.
                     Nothing in the core knows what an episode is.
+    evals           game -> {name: fn(run, it) -> dict or None} or 'module:attr': yardsticks of a
+                    checkpoint outside its matches (MTG Zero: the draft network's agreement with
+                    held-out human picks), run on every evaluated iteration after the matches
+                    (`run`: the `zero.run.Run`, `it`: the checkpoint) and logged in metrics.jsonl
+                    under `extras.<name>` (None: skipped); measuring only, never a training
+                    signal. By convention the dict holds `value` (the dashboard's series),
+                    optional `label`, `pct` (a share: shown as a percentage) and `refs`
+                    ({name: value}: reference lines, e.g. baselines on the same positions)
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
-                 grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None):
+                 grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -87,6 +95,7 @@ class GamePackage:
         self.tokens = dict(tokens or {})
         self.eval_specs = dict(eval_specs or {})
         self.deferred = dict(deferred or {})
+        self.evals = dict(evals or {})
 
     def deferred_of(self, game):
         """`game`'s deferred-result glue: (episodes(payload) -> [spec JSON], results(payload, rows)
@@ -96,6 +105,13 @@ class GamePackage:
         if isinstance(d, str):
             d = self.deferred[game] = resolve(d)
         return (resolve(d.get('episodes')) or default_episodes, resolve(d.get('results')) or default_results)
+
+    def evals_of(self, game):
+        """`game`'s extra evaluations {name: fn(run, it) -> dict or None} (none: {})."""
+        e = self.evals.get(game) or {}
+        if isinstance(e, str):
+            e = self.evals[game] = resolve(e)
+        return {k: resolve(f) for k, f in e.items()}
 
     def tokens_of(self, game):
         """The object layout of `game` for arch 'tokens' (None if the package has none)."""

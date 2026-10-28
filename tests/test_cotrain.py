@@ -70,6 +70,55 @@ def test_cotrain_iterations_both_nets(co_run):
     assert 'co-training run' in log and '[resolver] iter 2 train' in log
 
 
+def test_dashboard_shows_both_networks(co_run, tmp_path):
+    """The dashboard of a co-training run: the primary's view as a single-game run's plus the
+    resolver's (`resolver`: its metrics, Elo and settings); a single-game run has no `resolver`;
+    the page has the tabs and the other-yardsticks card."""
+    from zero import dashboard
+    c = dashboard.app.test_client()
+    dashboard.app.config['RUNS'] = str(co_run.parent)
+    d = c.get('/api/run/co').get_json()
+    assert [m['iter'] for m in d['metrics']] == [0, 1, 2] and d['anchor'] == 'greedy'
+    assert d['metrics'][1]['selfplay']['cotrain']['events'] == 8
+    r = d['resolver']
+    assert [m['iter'] for m in r['metrics']] == [0, 1, 2] and r['anchor'] == 'heuristic'
+    assert r['config']['game'] == 'toy' and 'iter_0002' in r['ratings']['ratings'] and r['pairs']
+    assert d['progress']['phase'] == 'idle'
+    single = tmp_path / 'runs' / 'single'
+    single.mkdir(parents=True)
+    (single / 'config.json').write_text('{}')
+    dashboard.app.config['RUNS'] = str(tmp_path / 'runs')
+    assert 'resolver' not in c.get('/api/run/single').get_json()
+    page = c.get('/').data
+    assert b'id="tabs"' in page and b'id="extra-card"' in page and b'events_resolved' in page
+
+
+def test_extra_evals_are_logged_and_skipped(tmp_path):
+    """GamePackage.evals: a checkpoint's other yardsticks, logged under metrics' `extras` (None:
+    skipped); a package without them adds nothing."""
+    from zero import package
+    from zero.run import DEFAULTS, Run
+    run = tmp_path / 'x'
+    run.mkdir()
+    R = Run(str(run), dict(DEFAULTS, game='toy'))
+    m = {}
+    R.extra_evals(3, m)
+    assert m == {}
+    seen = []
+    pkg = package.active()
+    old = dict(pkg.evals)
+    try:
+        pkg.evals['toy'] = {'probe': lambda r, it: seen.append(it) or {'value': 0.25, 'pct': True, 'refs': {'random': 0.1}},
+                            'off': lambda r, it: None}
+        R.extra_evals(3, m)
+    finally:
+        pkg.evals.clear()
+        pkg.evals.update(old)
+    assert seen == [3] and set(m['extras']) == {'probe'} and m['extras']['probe']['value'] == 0.25
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert 'iter 3 probe: ' in log and 'iter 3 off: skipped' in log
+
+
 def test_cotrain_pause_mid_iteration_replays_it(tmp_path):
     """PAUSE during iteration 1's self-play (many events): exit 75 before either checkpoint;
     resumed, the iteration is replayed from its start (both data directories cleared)."""

@@ -604,7 +604,20 @@ class Run:
         if c['eval_random_games'] and self.yard != 'random':
             m['eval_random'] = summarize(self.play_match(it, 'random', c['eval_random_games'], c['eval_sims'], seed=7919 * it + 2))
             self.log(f'iter {it} vs random: {m["eval_random"]}')
+        self.extra_evals(it, m)
         m.setdefault('phases', {})['eval_s'] = time.time() - t0
+
+    def extra_evals(self, it, m):
+        """The game package's other yardsticks of checkpoint `it` (GamePackage.evals): measured
+        and logged under m['extras'][name], never fed back."""
+        for name, fn in package.active().evals_of(self.cfg['game']).items():
+            t0 = time.time()
+            r = fn(self, it)
+            if r is None:
+                self.log(f'iter {it} {name}: skipped')
+                continue
+            m.setdefault('extras', {})[name] = dict(r, seconds=round(time.time() - t0, 2))
+            self.log(f'iter {it} {name}: {_fmt(r)}')
 
     def elo_update(self, latest, current=None):
         c = self.cfg
