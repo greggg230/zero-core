@@ -16,7 +16,8 @@ the same layout; the page shows a tab per network (each with its Elo, win rates,
 throughput and head-to-head table), the co-training progress (games resolved, in play and parked,
 episodes queued, in flight and done) and throughput. Each network's remote evaluations
 (`evals.jsonl` in its directory, zero.remote: a single-game run's `eval_remote`, a co-training
-run's `resolver_cfg['eval_remote']` -> `resolver/evals.jsonl`) are merged into its rows. Other
+run's `resolver_cfg['eval_remote']` -> `resolver/evals.jsonl`, its `draft_eval_net_remote` ->
+the root's `evals.jsonl`, eval_yard_net) are merged into its rows. Other
 yardsticks of a checkpoint (`GamePackage.evals`, metrics `extras`) are charted when a run has
 them. Single-game runs render as before.
 
@@ -70,14 +71,15 @@ def _jsonl(p):
 
 def _metrics(d):
     """metrics.jsonl, with the remote evaluations (evals.jsonl, zero.remote) merged into their
-    iterations' rows (`d`: a run directory or a co-training run's resolver/)."""
+    iterations' rows (`d`: a run directory or a co-training run's resolver/; a co-training run's
+    root: its remote eval_yard_net, draft_eval_net_remote)."""
     rows = _jsonl(os.path.join(d, 'metrics.jsonl'))
     evals = {e['iter']: e for e in _jsonl(os.path.join(d, 'evals.jsonl')) if 'iter' in e}
     if evals:
         for m in rows:
             e = evals.get(m.get('iter'))
             if e:
-                for k in ('eval_yard', 'eval_random', 'elo'):
+                for k in ('eval_yard', 'eval_random', 'elo', 'eval_yard_net'):
                     if k in e:
                         m[k] = e[k]
     return rows

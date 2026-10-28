@@ -31,7 +31,10 @@ The run directory holds the primary as a single-game run does (`models/`, `data/
   `resolver_cfg['eval_remote']` (a remote of the game package, as a single-game run's
   `eval_remote`): the resolver's own evaluations run there (zero.remote, mirror `<run
   name>.resolver`; results in `resolver/evals.jsonl`, its Elo copied back to `resolver/elo/`)
-  while the run trains; the primary's stay here.
+  while the run trains; the primary's stay here, except, with `draft_eval_net_remote` (docs/az.md
+  11.7), its resolver-network events (`eval_yard_net`): played on that remote from a mirror holding
+  both networks' checkpoints (zero.remote's `evalnet`, `CoRun.eval_net` there), their results in the
+  run's `evals.jsonl`.
 * **Resume**: an iteration interrupted before both checkpoints is replayed from its start (both
   data directories cleared); one interrupted after them finishes its evaluations; the resolver's
   remote evaluations without a result are queued again. PAUSE / STOP / the supervisor / kill /
@@ -62,7 +65,8 @@ from .run import (DEFAULTS, PRESETS, Run, _fmt, _fmt_remote, _write_json, latest
                   read_metrics, summarize)
 
 BIG = 1 << 62                                      # a resolver driver's quota: its phases end by end_phase()
-CO_KEYS = ('resolver', 'resolver_cfg', 'resolver_init', 'resolver_conc', 'pending_max', 'draft_eval_net_every')
+CO_KEYS = ('resolver', 'resolver_cfg', 'resolver_init', 'resolver_conc', 'pending_max', 'draft_eval_net_every',
+           'draft_eval_net_remote')
 
 
 def resolver_config(cfg):
@@ -358,13 +362,9 @@ class PrimaryRun(Run):
 
     def evaluate(self, it, m):
         super().evaluate(it, m)
-        c = self.cfg
-        k = int(c.get('draft_eval_net_every') or 0)
-        if k and it % k == 0 and c['eval_games']:
+        if self.co.eval_net_due(it) and self.co.netremote is None:   # (with a remote: CoRun.finish_iter queues it)
             t0 = time.time()
-            m['eval_yard_net'] = summarize(self.co.event_match(it, self.yard, c['eval_games'], c['eval_sims'],
-                                                               seed=7919 * it + 3, play='net'))
-            m['eval_yard_net']['opp'] = self.yard
+            m['eval_yard_net'] = self.co.eval_net(it)
             self.log(f'iter {it} vs {self.yard} (episodes by the resolver net): {m["eval_yard_net"]}')
             m.setdefault('phases', {})['eval_net_s'] = time.time() - t0
 
@@ -398,6 +398,13 @@ class CoRun:
             raise SystemExit(f"{cfg['game']}: team size {self.team} does not divide {n} players")
         self.nteams = n // self.team
         self.sp = None                             # the persistent self-play drivers
+        # the primary's resolver-network events (eval_yard_net) on a remote (docs/az.md 11.7):
+        # zero.remote.RemoteNetEval, set up by loop()
+        self.netremote = None
+        rem = cfg.get('draft_eval_net_remote') or ''
+        if rem and rem != 'local' and rem not in package.active().remotes:
+            raise SystemExit(f'draft_eval_net_remote {rem!r}: not in the game package remotes '
+                             f'({sorted(package.active().remotes)})')
 
     def log(self, msg):
         log(self.run, msg)
@@ -437,6 +444,24 @@ class CoRun:
                  f'{old.config["actions"]} actions; extra {json.dumps(extra, default=str)[:200]})')
 
     # ---------------------------------------------------------------- matches of the primary
+    def eval_net_due(self, it):
+        """Iteration `it`'s evaluation includes the events played by the resolver's network
+        (`eval_yard_net`): an evaluated iteration that is a multiple of draft_eval_net_every."""
+        c = self.cfg
+        k = int(c.get('draft_eval_net_every') or 0)
+        evaluated = it % max(1, int(c['eval_every'])) == 0 or it == 0
+        return bool(k and evaluated and it % k == 0 and c['eval_games'])
+
+    def eval_net(self, it):
+        """`eval_yard_net` of iteration `it`: the primary's checkpoint against its yardstick, each
+        event's episodes played by the resolver's checkpoint of the same iteration at its evaluation
+        settings. -> the summary (+ 'opp'). The same code here and on a remote (zero.remote's
+        `evalnet`, docs/az.md 11.7)."""
+        c, P = self.cfg, self.P
+        s = summarize(self.event_match(it, P.yard, c['eval_games'], c['eval_sims'], seed=7919 * it + 3, play='net'))
+        s['opp'] = P.yard
+        return s
+
     def event_match(self, it, opp, n_games, sims, seed, opp_model=None, play='bot', a=None):
         """Primary checkpoint `it` (or the player `a`: a bot or 'ext:<name>') against `opp` ('nn' +
         opp_model, a bot or 'ext:<name>'), team seats alternating, each game's episodes played by
@@ -669,6 +694,8 @@ class CoRun:
                 with open(X.partial_path(it)) as f:
                     m = json.load(f)
             X.finish_iter(it, m, t0)
+            if X is self.P and self.netremote is not None and self.eval_net_due(it):
+                self.netremote.enqueue(it)         # eval_yard_net on the remote (its row: evals.jsonl)
 
     def loop(self):
         c, rc, run = self.cfg, self.rcfg, self.run
@@ -694,6 +721,15 @@ class CoRun:
             rdone = {m['iter'] for m in read_metrics(R.run)}
             R.remote.backfill(start if start in rdone else start - 1)
             R.log(f'evaluations on the remote {rc["eval_remote"]!r} ({R.remote.spec["host"]}, mirror {R.remote.rdir})')
+        if c.get('draft_eval_net_remote'):
+            # the primary's resolver-network events (eval_yard_net) on a remote (docs/az.md 11.7):
+            # queued by finish_iter, the missing ones again now (a restart)
+            from .remote import RemoteNetEval
+            self.netremote = RemoteNetEval(self, c['draft_eval_net_remote'])
+            pdone = {m['iter'] for m in read_metrics(run)}
+            self.netremote.backfill(start if start in pdone else start - 1)
+            self.log(f'eval_yard_net on the remote {c["draft_eval_net_remote"]!r} ({self.netremote.spec["host"]}, '
+                     f'mirror {self.netremote.rdir})')
         if rc.get('selfplay_remote'):
             # a share of the resolver's queued episodes on a remote (zero.remoteplay, docs/az.md 11.6)
             from .remoteplay import RemotePlay
@@ -741,7 +777,9 @@ class CoRun:
             self.finish_iter(it, time.time())
         if R.rsp is not None:
             R.rsp.close()                          # no more self-play: the remote's workers quit
-        if R.remote is not None and not os.path.exists(stop):
+        waits = [q for q in (R.remote, self.netremote) if q is not None]
+        if waits and not os.path.exists(stop):
             _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
-            R.remote.drain(check=lambda: self.check('remote evaluations'))
+            for q in waits:
+                q.drain(check=lambda: self.check('remote evaluations'))
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})

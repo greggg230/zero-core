@@ -20,7 +20,11 @@ remote named by `resolver_cfg['eval_remote']`, exactly as a single-game run's: `
 resolver's `Run` (`<run>/resolver/`: its evals.jsonl, elo/, models/index.json), the mirror
 `<workdir>/<run name>.resolver` (a sibling of the single-game mirrors: the same lock and
 overrides.json), the resolver's config.json there (a single-game run's settings: the remote side
-needs nothing else). The primary's evaluation stays local.
+needs nothing else). The primary's evaluation stays local, except its events played by the
+resolver's network (`eval_yard_net`) with the run setting `draft_eval_net_remote` (docs/az.md 11.7):
+`RemoteNetEval`, the mirror `<workdir>/<run name>` laid out as the run (both networks' checkpoints),
+`python -m <pkg>.az.remote evalnet <mirror> <iter>` there (`CoRun.eval_net` under the same lock), the
+result in the run's `evals.jsonl` ({iter, eval_yard_net, ...}).
 
 A remote: {host: 'user@host' (or 'local': this machine, the tests), repo: the game repo there
 (same code as the run's checkout), python, workdir, env: {...}, overrides: run settings for the
@@ -29,6 +33,7 @@ workdir, worker processes, niceness, locks to back off for, its own overrides; z
 docs/az.md 5.3)}.
 
 `python -m <pkg>.az.remote selfplay MIRROR WORKER`: a remote self-play worker (zero/remoteplay.py).
+`python -m <pkg>.az.remote evalnet MIRROR ITER`: a co-training run's eval_yard_net (above).
 """
 import json
 import os
@@ -59,7 +64,17 @@ def remote_spec(name, setting='eval_remote'):
                      'env': {}, 'overrides': {}}, **pkg.remotes.get('local', {}))
     if name not in pkg.remotes:
         raise SystemExit(f'{setting} {name!r}: not in the game package remotes ({sorted(pkg.remotes)})')
-    return dict({'env': {}, 'overrides': {}}, **pkg.remotes[name])
+    spec = dict({'env': {}, 'overrides': {}}, **pkg.remotes[name])
+    # another evaluation workdir on the remote (an end-to-end test beside a live run's workdir: its
+    # own mirrors and its own .eval.lock); an absolute path there (Git Bash rewrites /Users/... in a
+    # Windows process's environment: MSYS2_ENV_CONV_EXCL=ZERO_EVAL_WORKDIR)
+    wd = os.environ.get('ZERO_EVAL_WORKDIR')
+    if wd:
+        if not wd.startswith('/'):
+            raise SystemExit(f'ZERO_EVAL_WORKDIR {wd!r}: not an absolute path on the remote {name!r} (a Windows '
+                             f'shell converted it? Git Bash: MSYS2_ENV_CONV_EXCL=ZERO_EVAL_WORKDIR)')
+        spec['workdir'] = wd.rstrip('/')
+    return spec
 
 
 class Transport:
@@ -266,6 +281,88 @@ class RemoteEval:
             self.R.log(f'iter {it} elo {row["elo"]["elo"]:.0f} +-{1.96 * row["elo"]["se"]:.0f} (remote {self.name})')
 
 
+class RemoteNetEval(RemoteEval):
+    """A co-training run's primary evaluated with its episodes played by the resolver's network
+    (`eval_yard_net`, docs/az.md 11.7) on the remote `name` (run setting `draft_eval_net_remote`):
+    the mirror `<workdir>/<run name>` is laid out as the run (config.json: the run's settings with
+    the remote's overrides on both networks' settings and every remote setting off; models/ and
+    resolver/models/: both networks' checkpoints of each such iteration); `python -m <pkg>.az.remote
+    evalnet <mirror> <iter>` plays the events there (`CoRun.eval_net`, the code that plays them here)
+    under the workdir's evaluation lock; the result is appended to the run's `evals.jsonl` ({iter,
+    eval_yard_net, time, host, seconds, remote_s}), which the dashboard merges into the primary's
+    rows. The queue, the thread, the retries (an unreachable remote never blocks training) and the
+    end-of-run drain are RemoteEval's. `co`: the run's `CoRun`."""
+
+    def __init__(self, co, name):
+        self.co = co
+        super().__init__(co.P, name)
+
+    def done_iters(self):
+        """Iterations whose eval_yard_net exists: played here (metrics rows) or remotely (evals.jsonl)."""
+        from .run import read_metrics
+        out = {m['iter'] for m in read_metrics(self.R.run) if m.get('eval_yard_net')}
+        p = os.path.join(self.R.run, 'evals.jsonl')
+        if os.path.exists(p):
+            with open(p, encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    if e.get('eval_yard_net') and 'iter' in e:
+                        out.add(e['iter'])
+        return out
+
+    def backfill(self, latest):
+        """Queue the iterations up to `latest` whose eval_yard_net is due and missing (a restart)."""
+        from .run import model_path
+        done = self.done_iters()
+        for k in range(0, latest + 1):
+            if self.co.eval_net_due(k) and k not in done and os.path.exists(model_path(self.R.run, k)) \
+                    and os.path.exists(model_path(self.co.R.run, k)):
+                self.enqueue(k)
+
+    def _ship(self, it):
+        from .run import DEFAULTS, model_path
+        if self.shipped is None:
+            self.t.mkdirs(self.rdir + '/models', self.rdir + '/resolver/models')
+            self.shipped = ({'models/' + f for f in self.t.listdir(self.rdir + '/models')}
+                            | {'resolver/models/' + f for f in self.t.listdir(self.rdir + '/resolver/models')})
+        c = self.R.cfg
+        ov = dict(self.spec.get('overrides', {}))
+        off = {'eval_remote': '', 'selfplay_remote': ''}
+        rc = dict(c.get('resolver_cfg') or {}, **off, **{k: v for k, v in ov.items() if k in DEFAULTS})
+        cfg = dict(c, **off, draft_eval_net_remote='', **ov)
+        cfg['resolver_cfg'] = rc
+        tmp = os.path.join(self.R.run, '.remote_evalnet_config.json')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=1)
+        self.t.put(tmp, self.rdir + '/config.json')
+        fn = elo.ckpt_name(it) + '.pt'
+        for sub, run in (('models/', self.R.run), ('resolver/models/', self.co.R.run)):
+            if sub + fn not in self.shipped:
+                self.t.put(model_path(run, it), self.rdir + '/' + sub + fn)
+                self.shipped.add(sub + fn)
+
+    def _evaluate(self, it):
+        t0 = time.time()
+        self._ship(it)
+        r = self.t.run_module(self.module, ['evalnet', self.rdir, str(it)], timeout=4 * 3600)
+        lines = [ln for ln in (r.stdout or '').splitlines() if ln.startswith(RESULT)]
+        if r.returncode or not lines:
+            raise RuntimeError(f'exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[-600:]}')
+        m = json.loads(lines[-1][len(RESULT):])
+        if not m.get('eval_yard_net'):
+            raise RuntimeError(f'no eval_yard_net in the result: {lines[-1][:300]}')
+        row = {'iter': it, 'eval_yard_net': m['eval_yard_net'], 'time': time.time(), 'host': self.name,
+               'seconds': round(time.time() - t0, 1), 'remote_s': m.get('seconds')}
+        with open(os.path.join(self.R.run, 'evals.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(row) + '\n')
+        e = row['eval_yard_net']
+        self.R.log(f'iter {it} vs {e.get("opp", self.R.yard)} (episodes by the resolver net; remote {self.name}, '
+                   f'{row["seconds"]:.0f}s): {e}')
+
+
 # ------------------------------------------------------------------ the remote side
 
 class _Lock:
@@ -324,10 +421,7 @@ def evaluate_mirror(rdir, it):
         cfg = json.load(f)
     # the remote machine's own settings for every run it evaluates (<workdir>/overrides.json, e.g.
     # {"groups": 1, "elo_games": 50}: fewer, larger inference batches suit a slower GPU)
-    ov = os.path.join(os.path.dirname(os.path.normpath(rdir)), 'overrides.json')
-    if os.path.exists(ov):
-        with open(ov, encoding='utf-8') as f:
-            cfg.update(json.load(f))
+    cfg.update(_overrides(rdir))
     R = Run(rdir, cfg)
     m = {'iter': it}
     R.evaluate(it, m)
@@ -340,17 +434,49 @@ def evaluate_mirror(rdir, it):
     return m
 
 
+def _overrides(rdir):
+    """The remote machine's own settings for every run it evaluates (<workdir>/overrides.json)."""
+    ov = os.path.join(os.path.dirname(os.path.normpath(rdir)), 'overrides.json')
+    if not os.path.exists(ov):
+        return {}
+    with open(ov, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def evaluate_net_mirror(rdir, it):
+    """A co-training run's `eval_yard_net` of iteration `it` on the mirror `rdir` (RemoteNetEval's:
+    the run's settings, both networks' checkpoints): `CoRun.eval_net`, the run's own code. The
+    remote's overrides.json applies to both networks' settings. -> {iter, eval_yard_net, seconds,
+    time} (also appended to the mirror's metrics.jsonl)."""
+    from .cotrain import CO_KEYS, CoRun
+    from .run import DEFAULTS, append_metrics
+    with open(os.path.join(rdir, 'config.json'), encoding='utf-8') as f:
+        cfg = json.load(f)
+    ov = _overrides(rdir)
+    cfg.update(ov)
+    cfg['resolver_cfg'] = dict(cfg.get('resolver_cfg') or {},
+                               **{k: v for k, v in ov.items() if k in DEFAULTS and k not in CO_KEYS})
+    co = CoRun(rdir, cfg)
+    t0 = time.time()
+    m = {'iter': it, 'eval_yard_net': co.eval_net(it)}
+    m['seconds'] = round(time.time() - t0, 1)
+    m['time'] = time.time()
+    append_metrics(rdir, m)
+    return m
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['selfplay']:
         # remote self-play (docs/az.md 5.3): a worker serving the run over its stdin / stdout
         from .remoteplay import serve
         return serve(argv[1:])
-    if len(argv) != 3 or argv[0] != 'eval':
-        raise SystemExit('usage: python -m <pkg>.az.remote eval MIRROR_DIR ITER | selfplay MIRROR_DIR WORKER')
+    if len(argv) != 3 or argv[0] not in ('eval', 'evalnet'):
+        raise SystemExit('usage: python -m <pkg>.az.remote eval MIRROR_DIR ITER | evalnet MIRROR_DIR ITER | '
+                         'selfplay MIRROR_DIR WORKER')
     rdir, it = argv[1], int(argv[2])
     with _Lock(os.path.join(os.path.dirname(os.path.normpath(rdir)), '.eval.lock')):
-        m = evaluate_mirror(rdir, it)
+        m = (evaluate_net_mirror if argv[0] == 'evalnet' else evaluate_mirror)(rdir, it)
     print(RESULT + json.dumps(m), flush=True)
 
 

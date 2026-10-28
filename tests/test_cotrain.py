@@ -457,3 +457,151 @@ def test_cotrain_unreachable_remote_never_blocks_then_resume(tmp_path):
     assert sorted(e['iter'] for e in ev) == [0, 1, 2] and all(e['host'] == 'local' for e in ev)
     assert {'iter_0000', 'iter_0001', 'iter_0002'} <= set(json.load(open(res / 'elo' / 'ratings.json'))['ratings'])
     assert read_metrics(str(run)) == mp and mtimes(run, (0, 1, 2)) == before
+
+
+# ---------------------------------------------------------------- the primary's eval_yard_net on a remote (11.7)
+
+def net_rows(run):
+    return [e for e in evals_of(run) if 'eval_yard_net' in e]
+
+
+@pytest.fixture(scope='module')
+def net_remote_run(tmp_path_factory):
+    base = tmp_path_factory.mktemp('netremote')
+    run = base / 'nr'
+    p = co_loop(run, '--iters', '2', '--draft-eval-net-every', '2', '--draft-eval-net-remote', 'local',
+                env={'ZERO_REMOTE_WORKDIR': str(base / 'mirror')})
+    assert p.returncode == 0, p.stdout + p.stderr
+    return run, base / 'mirror'
+
+
+def test_cotrain_eval_net_on_the_remote(net_remote_run):
+    """draft_eval_net_remote 'local' (a mirror directory and a subprocess): the primary's events played
+    by the resolver's network (eval_yard_net, iterations 0 and 2) ran on the mirror <workdir>/<run>,
+    which holds the run's settings (every remote setting off) and both networks' checkpoints of those
+    iterations only; their results are in the run's evals.jsonl, not in its metrics rows; the rest of
+    the primary's evaluation (yardstick, random, Elo) and the resolver's ran here as before; the
+    dashboard merges eval_yard_net into the rows; the evaluation lock is released."""
+    run, mirror = net_remote_run
+    mp, mr = read_metrics(str(run)), read_metrics(str(run / 'resolver'))
+    assert [r['iter'] for r in mp] == [0, 1, 2] and [r['iter'] for r in mr] == [0, 1, 2]
+    assert not any('eval_yard_net' in r or 'eval_net_s' in r.get('phases', {}) for r in mp)
+    assert all(r['eval_yard']['opp'] == 'greedy' and r['eval_yard']['games'] == 8 for r in mp)
+    assert all(r['eval_yard']['opp'] == 'heuristic' for r in mr) and 'elo' in mp[2]
+    ev = net_rows(run)
+    assert sorted(e['iter'] for e in ev) == [0, 2], ev
+    assert all(e['host'] == 'local' and e['eval_yard_net']['games'] == 8 and e['eval_yard_net']['opp'] == 'greedy'
+               and e['eval_yard_net']['unfinished'] == 0 and e['remote_s'] > 0 for e in ev), ev
+    m = mirror / 'nr'
+    assert sorted(os.listdir(m / 'models')) == ['iter_0000.pt', 'iter_0002.pt']
+    assert sorted(os.listdir(m / 'resolver' / 'models')) == ['iter_0000.pt', 'iter_0002.pt']
+    mc = json.load(open(m / 'config.json'))
+    assert mc['resolver'] == 'toy' and mc['draft_eval_net_remote'] == '' and mc['resolver_cfg']['eval_remote'] == ''
+    assert [r['iter'] for r in read_metrics(str(m))] == [0, 2]
+    assert not (mirror / '.eval.lock').exists()
+    assert json.load(open(run / 'config.json'))['draft_eval_net_remote'] == 'local'
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert "eval_yard_net on the remote 'local'" in log
+    assert 'iter 2 vs greedy (episodes by the resolver net; remote local' in log
+    assert json.load(open(run / 'progress.json'))['phase'] == 'idle'
+    from zero import dashboard
+    rows = dashboard._metrics(str(run))
+    for e in ev:
+        assert next(r for r in rows if r['iter'] == e['iter'])['eval_yard_net'] == e['eval_yard_net']
+    assert 'eval_yard_net' not in rows[1]
+
+
+def test_cotrain_eval_net_resume_requeues_the_missing_one(net_remote_run, tmp_path):
+    """A restart after the iterations with iteration 2's eval_yard_net missing (no row in evals.jsonl):
+    it alone is played on the remote again; nothing retrained, nothing else evaluated again."""
+    src, _ = net_remote_run
+    run = tmp_path / 'nr'
+    shutil.copytree(src, run)
+    keep = [e for e in evals_of(run) if e['iter'] == 0]
+    (run / 'evals.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in keep))
+    before, mp0, mr0 = mtimes(run, (1, 2)), read_metrics(str(run)), read_metrics(str(run / 'resolver'))
+    p = co_loop(run, '--iters', '2', env={'ZERO_REMOTE_WORKDIR': str(tmp_path / 'mirror')})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert sorted(e['iter'] for e in net_rows(run)) == [0, 2]
+    assert read_metrics(str(run)) == mp0 and read_metrics(str(run / 'resolver')) == mr0
+    assert mtimes(run, (1, 2)) == before, 'no retraining'
+    assert sorted(os.listdir(tmp_path / 'mirror' / 'nr' / 'models')) == ['iter_0002.pt']
+
+
+def test_cotrain_eval_net_unreachable_remote_never_blocks_then_resume(tmp_path):
+    """draft_eval_net_remote = an unreachable remote: every attempt fails and is retried (logged), both
+    networks train and are evaluated here through every iteration; at the end the run waits for the
+    remote (progress 'remote evaluations'), where PAUSE exits 75. Restarted with a reachable remote:
+    both missing eval_yard_net land in evals.jsonl; nothing is replayed."""
+    run = tmp_path / 'dead'
+    script = tmp_path / 'dead.py'
+    script.write_text(DEAD)
+    with open(tmp_path / 'dead.out', 'w', encoding='utf-8') as out:
+        proc = subprocess.Popen([sys.executable, str(script), '--run', str(run), *CO, '--iters', '2',
+                                 '--draft-eval-net-every', '2', '--draft-eval-net-remote', 'dead'], cwd=ROOT,
+                                stdout=out, stderr=subprocess.STDOUT, text=True,
+                                env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH))
+        try:
+            deadline = time.time() + 600
+            prog = {}
+            while time.time() < deadline and proc.poll() is None:
+                try:
+                    prog = json.load(open(run / 'progress.json'))
+                except (OSError, ValueError):
+                    pass
+                if prog.get('phase') == 'remote evaluations':
+                    break
+                time.sleep(0.2)
+            assert prog.get('phase') == 'remote evaluations', prog
+            time.sleep(3)
+            assert proc.poll() is None
+            runctl.request_pause(str(run), by='test')
+            proc.wait(timeout=120)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    assert proc.returncode == runctl.EXIT_PAUSED, (tmp_path / 'dead.out').read_text(encoding='utf-8')[-3000:]
+    mp, mr = read_metrics(str(run)), read_metrics(str(run / 'resolver'))
+    assert [r['iter'] for r in mp] == [0, 1, 2] and [r['iter'] for r in mr] == [0, 1, 2]
+    assert all('eval_yard' in r and 'eval_yard_net' not in r for r in mp) and all('eval_yard' in r for r in mr)
+    assert not (run / 'evals.jsonl').exists()
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert 'remote eval dead iter 0: RuntimeError: mkdir on nobody@unreachable.invalid' in log
+    assert '; retry in 1s' in log and '[resolver] iter 2 train' in log
+    before = mtimes(run, (0, 1, 2))
+    runctl.request_resume(str(run))
+    p = co_loop(run, '--iters', '2', '--draft-eval-net-remote', 'local',
+                env={'ZERO_REMOTE_WORKDIR': str(tmp_path / 'mirror')})
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert 'starting after iter 2' in p.stdout
+    ev = net_rows(run)
+    assert sorted(e['iter'] for e in ev) == [0, 2] and all(e['host'] == 'local' for e in ev)
+    assert read_metrics(str(run)) == mp and mtimes(run, (0, 1, 2)) == before
+
+
+def test_cotrain_eval_net_remote_settings_are_checked(tmp_path):
+    """An unknown remote name is refused at start; inside resolver_cfg the setting is the primary's."""
+    p = co_loop(tmp_path / 'x', '--iters', '1', '--draft-eval-net-remote', 'nowhere')
+    out = p.stdout + p.stderr
+    assert p.returncode != 0 and "draft_eval_net_remote 'nowhere': not in the game package remotes" in out, out
+    assert not (tmp_path / 'x' / 'models' / 'iter_0000.pt').exists()
+    p = co_loop(tmp_path / 'y', '--iters', '1', '--resolver-cfg', '{"draft_eval_net_remote": "local"}')
+    out = p.stdout + p.stderr
+    assert p.returncode != 0 and "['draft_eval_net_remote'] are the primary run's settings" in out, out
+
+
+def test_eval_workdir_override(monkeypatch):
+    """ZERO_EVAL_WORKDIR: another evaluation workdir on a named remote (an end-to-end test beside a
+    live run's workdir); a path that is not absolute there (Git Bash's rewrite) is refused."""
+    from zero import package, remote
+    package.active().remotes['fake'] = {'host': 'u@h', 'repo': '/r', 'python': 'python3', 'workdir': '/w'}
+    try:
+        monkeypatch.setenv('ZERO_EVAL_WORKDIR', '/elsewhere/')
+        assert remote.remote_spec('fake')['workdir'] == '/elsewhere'
+        monkeypatch.setenv('ZERO_EVAL_WORKDIR', 'C:/Program Files/Git/Users/u/x')
+        with pytest.raises(SystemExit, match='not an absolute path'):
+            remote.remote_spec('fake')
+        monkeypatch.delenv('ZERO_EVAL_WORKDIR')
+        assert remote.remote_spec('fake')['workdir'] == '/w'
+    finally:
+        del package.active().remotes['fake']

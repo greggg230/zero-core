@@ -129,8 +129,11 @@ DEFAULTS = dict(
     # `conc`), the backpressure (resolver episodes queued or playing at which this game's
     # self-play waits; 0 = 2 x in flight), and how often this game's evaluation also plays its
     # episodes with the resolver's network (evaluated iterations that are multiples of it; the
-    # others play them with the resolver's yardstick; 0 = never)
+    # others play them with the resolver's yardstick; 0 = never), and where those events are played
+    # (draft_eval_net_remote: a name in the game package's `remotes`, 'local' for tests; '' = here;
+    # zero.remote's `evalnet`, docs/az.md 11.7)
     resolver='', resolver_cfg={}, resolver_init='', resolver_conc=0, pending_max=0, draft_eval_net_every=4,
+    draft_eval_net_remote='',
 )
 
 PRESETS = {
