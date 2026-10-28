@@ -19,7 +19,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `cotrain.py` | Co-training (section 11): a primary game whose deferred terminals the episodes of a resolver game decide, one network each in one run: `CoRun` (the loop), `Coordinator` (parked games -> queued episodes -> results by tag -> `resolve`), `run_pair` (two drivers on two threads), `PrimaryRun` (team events as matches) |
 | `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions; all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
 | `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place; `workers`: eager batches on threads), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
-| `data.py` | Sample shards (`ShardWriter`, atomic npz; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (checks every shard; row provenance), `TargetStats` |
+| `data.py` | Sample shards (`ShardWriter`, atomic npz, optionally compressed - remote self-play's; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (each shard subsampled as it is loaded; checks every shard; row provenance), `TargetStats` |
 | `finite.py` | The non-finite guard (section 4.1): vectorised NaN / inf checks, `NonFinite` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
 | `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
@@ -28,7 +28,8 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements |
 | `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B) |
-| `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`), `Transport` (ssh / scp, or `local`) |
+| `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
+| `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; co-training: a share of the resolver's queued episodes, rows back by tag, requeue), `Worker` (the remote side: a rolling driver across iterations, back-off while an evaluation holds its lock, busy markers) |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`) | Unattended runs, control, forks; each repo's `tools/<name>.py` activates its package and calls `main()` |
@@ -113,6 +114,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `elo_opponents`, `elo_sims`, `elo_together` | 0, 0, 0 | cheaper Elo (CPU runs): play only the first k of the offsets 1, 2, 4 ... 32 (0 = all); Elo matches at elo_sims (0 = eval_sims); 1 = an iteration's Elo matches in one driver (one evaluator key per opponent: the checkpoint's batches hold the leaves of every match; other seeds than separate matches) |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
+| `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint, while this one plays its quota; its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6); its own is refused |
+| `selfplay_remote_procs`, `selfplay_remote_wait`, `selfplay_remote_timeout` | 0, 30, 3600 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); seconds the end of a phase waits for the remote's last shards (later ones are dropped); co-training: seconds of a worker's running time after which an episode it has not finished is requeued here |
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
 | `resolver` | '' | co-training (section 11): the resolver game, whose episodes decide this game's deferred terminals ('' = a single-game run: this loop, line for line) |
@@ -146,20 +149,22 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, section 5.3), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated; `index.json` = every checkpoint's Elo; `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
-| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`); the newest `keep_data` iterations are kept |
-| `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
+| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
+| `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor) and the current fit |
 | `evals.jsonl` | with `eval_remote` (section 5.2): one line per remote evaluation `{iter, eval_yard, eval_random, elo, time, host, seconds}`, merged into the iterations' rows by the dashboard; a co-training run's resolver: `resolver/evals.jsonl` (11.5) |
-| `progress.json` | self-play progress of the iteration in flight (dashboard); a co-training run's also has `events_resolved`, `target`, `drafting`, `pending_events`, `matches_queued`, `matches_in_flight`, `matches_done` (section 11) |
+| `progress.json` | self-play progress of the iteration in flight (dashboard); a co-training run's also has `events_resolved`, `target`, `drafting`, `pending_events`, `matches_queued`, `matches_in_flight`, `matches_done` (section 11); with `selfplay_remote`: `remote` (single-game) or `matches_remote` (co-training), sections 5.3, 11.6 |
 | `resolver/` | a co-training run's resolver network (section 11): the same layout (`config.json`, `metrics.jsonl`, `models/`, `data/`, `elo/`, `debug/`, `progress.json`), iteration numbers shared |
 | `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control |
 
 ## 4. Training
 
 Each iteration trains the previous checkpoint on the window (newest iterations' shards,
-loaded into RAM; uniformly subsampled per shard beyond `ram_budget_gb`) for
+loaded into RAM; uniformly subsampled per shard beyond `ram_budget_gb` - the rate from the shards'
+row counts, each shard subsampled as it is read, so loading needs the window plus one shard:
+before 2026-10-28 every shard was read first, a peak of the whole window's size) for
 `max(min_steps, new samples x reuse / batch)` minibatch steps (uniform with replacement).
 Loss = policy cross-entropy against the recorded policy target - the visit distribution, or
 the completed-Q target with `policy_target='cq'` (section 9) - (log-softmax over the legal
@@ -287,6 +292,129 @@ yardsticks, the Elo matches and reference games - to another machine while the r
 Tests: `tests/test_loop.py` (`test_remote_evaluation_local`, `..._continues_a_local_run`) and
 `tests/test_cotrain.py` (11.5).
 
+### 5.3 Remote self-play (`zero/remoteplay.py`, run setting `selfplay_remote`)
+
+`selfplay_remote <name>` (a remote of the game package, the same `GamePackage.remotes` entry as
+`eval_remote`; `local` = this machine, the tests) gives a run a second producer of each
+iteration's samples: while the run self-plays iteration i here with checkpoint i-1, the remote
+self-plays with the **same checkpoint** and its sample shards come back into `data/iter_i/`. MTG
+Zero's MacBook self-plays 3-6 times as fast as the shared desktop (its ENGINE.md 50.3, 52). A
+co-training run gives its resolver's queued episodes to the remote instead (11.6).
+
+* **The quota stays this machine's.** An iteration's self-play ends when the run has played its
+  `games` here, exactly as without the remote; the remote adds whatever it finished in that time.
+  An iteration never waits for the remote except for its last shards, at most
+  `selfplay_remote_wait` s (default 30) after the phase; a remote that is asleep, unreachable,
+  slow or backing off leaves an iteration that is exactly a local one. Training's steps follow the
+  new samples of both (`new samples x reuse / batch`): more samples per iteration, more steps.
+* **Sessions** (local side, `RemotePlay`: a manager thread, a fetch thread, three pipe threads per
+  session; the main thread only calls `begin(it)` and `end(it)`): `procs` persistent worker
+  processes on the remote, each a session `ssh host 'cd repo && <env> exec python -m
+  <pkg>.az.remote selfplay MIRROR K'` (BatchMode, ConnectTimeout 20, ServerAliveInterval 15 x 4;
+  'local': a subprocess). The worker's stdin is the control channel (JSON lines: `phase`, `end`,
+  `enqueue`, `fetched`, `ping`, `quit`), its stdout its events (lines `ZERO_SP {json}`: `hello`,
+  `status`, `shard`, `row`, `end`, `error`). The mirror `<selfplay workdir>/<run name>` gets
+  `config.json` (the run's settings + the remote's self-play `overrides`; shards of at most 8192
+  samples unless they set `shard_rows`) and `selfplay.json` (mode, locks, niceness, the run's id)
+  at each session start, and `models/iter_{i-1}.pt` at each phase start (a temporary name, then
+  renamed). A session that fails is started again after `RETRY_S` (60 s) - immediately if it ran
+  for more than 2 minutes - one that is silent for `STALL_S` (300 s) is killed; failures are
+  logged the first three times in a row, then every 10 minutes. The workers live as long as the
+  run's process: PAUSE, STOP, an error and the end of the iterations close them (`quit`, stdin
+  closed, killed after 10 s); a run killed hard closes their stdin by dying, and a worker that
+  hears nothing for `watchdog_s` (180 s; the run pings every 20 s) exits by itself.
+* **A phase**: `begin(it)` -> each live worker gets `phase it` (after checkpoint i-1 is in the
+  mirror): its rolling driver - persistent across iterations, like `--rolling 1`'s: games in
+  flight carry over a phase boundary, a new search epoch per checkpoint, every sample stamped
+  with its search's `net` - resumes with the new weights. **The remote's phase i starts as soon
+  as checkpoint i-1 is written** - right after training, before this machine evaluates it - and
+  this machine's own phase i calls `begin(it)` again (a no-op; `lead_s` records the head start):
+  the remote plays through the evaluation phase (MTG Zero's 4v4 run evaluates 13-23 minutes per
+  iteration) with the checkpoint of the next self-play, on-policy; not after the last iteration,
+  nor with STOP or PAUSE there, and a restart replays the iteration from an empty data directory
+  as before. `end(it)` -> `end it`: the worker ends
+  its phase (`end_phase`; games in flight wait for the next phase), flushes its last shard and
+  reports its counters. Shards are written by a background thread of the worker
+  (`data/iter_i/m<KK>-<sid>_SSS.npz`, `sid` the session's id), **compressed** (zlib level 1,
+  `data.savez_level`: MTG's sparse features ~58x, so a remote's samples cross a slow link), each
+  announced on stdout as soon as it is written.
+* **Arrival**: fetch threads (one per worker) copy each announced shard of the running phase under a
+  temporary name (`*.tmp.npz`: never a loadable shard name), checks it - **the non-finite
+  guard** (4.1) and the run's game / features / actions - and renames it into `data/iter_i/`
+  beside the run's own `c00` / `r00` shards, then tells the worker to delete its copy. Only
+  while phase i accepts: a shard announced or still in flight after `end(it)`'s deadline is
+  dropped (`late`, or `late_prev` when it was announced after the phase closed), never moved
+  into another iteration. **Staleness: same checkpoint only** - a shard of phase i holds what the
+  worker played between its `phase i` and `end i`, the samples of checkpoint i-1 and of the
+  carried-over games' earlier decisions, exactly what the run's own rolling driver puts into
+  `data/iter_i/`; accepting older phases' shards would mix in checkpoint i-2's games for no
+  gain (they are a few seconds of the remote's work). A **non-finite shard** is quarantined to
+  `<run>/debug/iter_NNNN_<name>.bad.npz` and the run fails with NonFinite at the end of the
+  phase (before training: the window never sees it), as for a local one; a worker whose own
+  write check fails (its ShardWriter quarantines the shard in the mirror's `debug/`) reports it,
+  the run fetches that copy into `<run>/debug/remote_*.bad.npz` and fails the same way. A shard
+  of another game or encoder width (not the run's code) is rejected and logged.
+* **Remote evaluation comes first**: a worker looks at its locks every 2 s - its remote's own
+  `<workdir>/.eval.lock` (zero.remote's, 5.2) always, and the `locks` of the remote's `selfplay`
+  dict (MTG Zero: the other games' evaluation locks on the Mac) - and while one is held by a live
+  process (or is being created) it asks for no leaf batches, so its search and inference threads
+  idle; control lines are still answered (an `end` ends the phase at once). With the remote's
+  `selfplay.backoff` 'background' (macOS) it plays on instead under the Darwin background policy
+  (`setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`: the lowest CPU band, the efficiency
+  cores; the process sets and clears it itself) and leaves it when the lock is gone: an evaluation
+  of minutes then costs the self-play phase it overlaps only part of the remote's share (MTG Zero
+  measured both, its ENGINE.md 52.4); elsewhere 'background' is 'stop'. Its running time
+  (`active_s`, the timeout clock of 11.6) stops meanwhile either way; `backoff_s` is reported per
+  phase.
+  While a phase runs and it is not backing off, a worker holds a **busy marker**
+  `<workdir>/.busy-<mirror>-w<K>` (an `owner` file "<pid> <time>" like the eval lock's), so that
+  lower-priority jobs on the remote can yield to self-play (MTG Zero's fuzz farm and studies:
+  `tools/mac_backoff.py`).
+* **One worker per slot**: a worker takes `<mirror>/.w<K>.lock` (owner "<pid> <time> <run id>");
+  a live previous worker of the same run (an orphan of a broken session) is stopped first
+  (SIGTERM, then SIGKILL after 10 s), another run's is refused (two runs with the same mirror
+  name). At each phase start a worker deletes its slot's leftover shards (late, dropped, or an
+  earlier session's) and checkpoints older than i-3.
+* **The remote spec** (`GamePackage.remotes[name]`, 5.2) may carry `selfplay`: `{workdir`
+  (default the remote's `workdir`; `$ZERO_SELFPLAY_WORKDIR` on the run's machine overrides it),
+  `procs` (default 1; the run setting `selfplay_remote_procs` overrides it), `nice` (the workers'
+  niceness, default 0), `locks` (lock directories to back off for), `backoff` ('stop', the
+  default, or 'background'), `env` (over the remote's),
+  `overrides` (run settings for the workers: `conc`, `threads`, `groups`, `infer_workers`,
+  `torch_threads`, `infer_device`, `shard_rows`)`}`. A spec that is a Mapping resolving at run
+  start (MTG Zero's `RunCommitRemote`: the remote's checkout of exactly the run's commit) is read
+  when the run starts, and the remote command checks it again (MTG Zero: `python -m
+  mtgz.az.remote selfplay` refuses other code than the run's, as `eval` does).
+* **Metrics**: `selfplay.remote` in metrics.jsonl = `{host, procs, workers` (live at the end),
+  `in_phase, ended, games, samples` (accepted), `samples_played` (the workers' count), `shards,
+  bytes` (compressed, shipped), `leaves, leaves_per_s` (per worker: leaves / its phase's wall time,
+  summed), `leaves_per_running_s` (back-offs excluded), `seconds, running_s, backoff_s,
+  in_flight, late, late_prev, rejected, quarantined, fetch_failed, fetch_s, wait_s` (how long
+  `end` waited), `session_errors, lead_s` (how long the remote's phase ran before this machine's)`}`; `selfplay.samples` stays this machine's (training uses the
+  sum). The log: `iter N remote self-play: 2 worker(s), 812 games, 113680 samples in 14 shards
+  (98.3 MB), 33010 leaves/s ...`. progress.json during self-play: `remote` = `{host, workers,
+  state` (playing / backing off / idle / connecting / offline), `games, in_flight, samples,
+  shards}` (the dashboard's status line shows it); phase `remote shards` while `end` waits.
+* **A remote workdir must be an absolute path there**: a relative one (Git Bash turns
+  `ZERO_SELFPLAY_WORKDIR=/Users/...` into `C:/Program Files/Git/Users/...` for a Windows process;
+  set `MSYS2_ENV_CONV_EXCL=ZERO_SELFPLAY_WORKDIR`) is refused at start, before ssh or scp could
+  create it under the remote's home.
+* **Determinism**: none beyond the run's own. A worker's driver seed is `seed x 7919 + i0 +
+  7,777,777 x (K + 1)` (i0: the iteration its session started in), so its games' setups and
+  search streams are reproducible per session, but what it contributes to an iteration depends
+  on timing (when its session started, how long the run's phase lasted, back-offs), and a
+  remote's arithmetic may differ from this machine's at float rounding (other games then). The
+  data of a run with a remote depends on the remote's load; evaluations stay comparable (fixed
+  pools, the same players). A replay of a remote game: its sample rows carry `net`, its shard's
+  meta the worker and session; the game itself is not recorded (as for local self-play).
+* **On or off at a restart**: `--selfplay-remote <name>` / `--selfplay-remote ''` (saved).
+
+Tests: `tests/test_remoteplay.py` (single-game: shards in `data/iter_i/` and training's steps,
+late shards dropped, an unreachable remote, a non-finite shard quarantined, the back-off while
+`.eval.lock` is held, PAUSE mid-phase and resume with no worker left; co-training 11.6; the
+coordinator's second consumer, `lock_held`, compressed shards), `tests/test_net_data.py`
+(the streamed window).
+
 ## 6. Learning: the toy proof run (Glass Road Zero 2026-10-11; Caverna Zero 2026-10-10)
 
 ### 6.1 The run
@@ -387,17 +515,18 @@ from): worker processes for self-play / evaluation and resuming a crashed self-p
 its complete shards (`workers.py`; here everything runs in the run process: the Rust driver is
 multi-threaded, a crash costs the iteration in progress, the supervisor restarts it), the
 CUDA-graph evaluator / pinned staging buffers / two batches in flight (`infer.py`; eager CUDA
-inference works here), the remote (Mac) workers and evaluator, rented-GPU experiments (Vast),
+inference works here), rented-GPU experiments (Vast),
 exploration games, behaviour cloning. Where they plug in:
 
 * **Evaluator**: anything with `__call__(LeafBatch) -> (priors, value, margin)` and
   `set_weights(state_dict)` can replace `infer.NetEvaluator`; `Run.evaluator(path)` is the one
   place the loop builds it (a `zero.infer` factory keyed by a run setting is the natural
   switch, e.g. `infer_impl='cudagraph'`).
-* **Remote / worker self-play**: `Run.selfplay(it)` produces shards under `data/iter_NNNN/`
-  through `ShardWriter` and returns the metrics dict; a remote or multi-process implementation
-  only has to write the same shards (any prefix: `c00`, `r00`, a host name) and the same
-  metrics keys. The window (`Run.window_shards`) reads every shard of an iteration directory.
+* **Remote / worker self-play**: in the core since 2026-10-28 (sections 5.3, 11.6: workers on
+  another machine whose shards join `data/iter_NNNN/` under their own prefix). Local worker
+  processes would plug in the same way: `Run.selfplay(it)` produces shards under
+  `data/iter_NNNN/` through `ShardWriter` and returns the metrics dict; the window
+  (`Run.window_shards`) reads every shard of an iteration directory.
 * **Remote evaluation**: `Run.evaluate(it, m)` / `Run.elo_update` fill `m['eval_yard']`,
   `m['eval_random']` and the Elo results; an asynchronous evaluator can write the same keys
   later (Dominion's `--remote-eval`).
@@ -615,7 +744,8 @@ resolved into `<run>/resolver/config.json`; `resolver_init`, `resolver_conc`, `p
 does (`models/`, `data/`, `elo/`, `metrics.jsonl`, `progress.json`: the dashboard and the tools
 work unchanged); the resolver has `<run>/resolver/` with the same layout. One player count per
 game (`players`). Its `iters`, `games` and `rolling` are not used; its `eval_remote` sends its
-evaluations to a remote (11.5). The run's own `eval_remote` (the primary's) is refused.
+evaluations to a remote (11.5), its `selfplay_remote` a share of its episodes (11.6). The run's
+own `eval_remote` and `selfplay_remote` (the primary's) are refused.
 
 **The game package's glue** (`GamePackage.deferred`, game -> `{'episodes': fn(payload) ->
 [resolver spec JSON, ...], 'results': fn(payload, rows) -> results JSON}`): the defaults read
@@ -797,3 +927,59 @@ unreachable remote (ssh to a host that does not resolve, retried every second: b
 train and the primary is evaluated through every iteration, the run waits for the queue at the
 end, PAUSE exits 75 there; restarted with a reachable remote, the three missing evaluations land);
 the run's own `eval_remote` and an unknown remote name refused.
+
+### 11.6 The resolver's episodes on a remote (`resolver_cfg['selfplay_remote']`; MTG Zero, 2026-10-28)
+
+The resolver's self-play is the coordinator's queued episodes (11.2), so its remote self-play is a
+**second consumer of that queue**: `selfplay_remote` in `resolver_cfg` (5.3's setting, the
+resolver's own) starts remote workers in mode `matches` - each a rolling `queue_only` driver of
+the resolver's seats, persistent across iterations - that play episodes the run hands them with
+the resolver's checkpoint i-1. MTG Zero: the MacBook plays a share of the 4v4 run's drafted
+matches with the play network (its ENGINE.md 52).
+
+* **The split**: with a remote, the local resolver driver's `feed` keeps at most `local_cap` =
+  max(16, resolver_conc / 4) episodes queued in its driver; the rest stay in the coordinator's
+  queue, from which the remote's manager thread takes up to `cap` = conc + conc / 4 (the remote's
+  `conc`) outstanding per worker, oldest first, and sends them as `enqueue` lines (tag, spec). So
+  each consumer takes work as it has room, in the queue's order. Without a remote, `feed` takes
+  everything as before. **Backpressure**: `pending_max` 0 means 2 x resolver_conc + the remote's
+  room (procs x cap). The remote's phase starts when both checkpoints are written (5.3): while
+  the networks are evaluated here it finishes its outstanding episodes and takes what is queued
+  (the primary drafts nothing then); the events those rows complete wait, ready, for the next
+  phase, and its rows from the head start count for that phase.
+* **Results**: a worker answers each finished episode with its result row (`row` events, by tag);
+  the run puts it into the coordinator (`collect_rows`) as the local driver's rows go in: an event
+  is resolved when all its episodes' rows are in, from either machine. Its samples come back as
+  5.3's compressed shards into `resolver/data/iter_i/`. The quota and the events are untouched:
+  an iteration still ends when `games` primary games are resolved here; the remote's episodes in
+  flight at a phase's end carry over, as the local driver's do.
+* **Requeue**: episodes a worker cannot deliver go back to the **front** of the queue, where the
+  local driver (or another worker) takes them: all of a worker's outstanding episodes when its
+  session ends (its stdout closed: every row it sent has been taken) or stalls (killed after
+  `STALL_S`), and any episode not finished within `selfplay_remote_timeout` s (default 3600) of
+  that worker's **running time** - its `active_s`, which stops between phases and while it backs
+  off, so a long evaluation phase here or an evaluation on the remote does not time episodes out.
+  A requeued episode may still finish on the worker: whichever copy's row comes second is dropped
+  (`Coordinator.dupe_ok`; `duplicates_dropped`), so an episode is counted once and played at worst
+  twice (its second copy's samples are kept: valid self-play of the same checkpoint). A row of an
+  unknown tag that was never requeued is still an error.
+* **The primary stays here**: the run's top-level `selfplay_remote` (the primary's) is refused:
+  its parked games live in the run process's driver, and their coordinator with them. Offloading
+  the drafting would mean a whole co-training loop on the remote (both networks, both drivers, the
+  coordinator), events resolved there and both kinds of shards shipped back: not a small change,
+  not done.
+* **Metrics**: the resolver's `selfplay.remote` (5.3's keys, plus `matches` (rows taken),
+  `assigned`, `requeued` (lost sessions), `requeued_timeout`, `duplicates_dropped`,
+  `outstanding`); its `selfplay.games` stays the local driver's; the primary's
+  `selfplay.cotrain.episodes` counts both, `episodes_remote` the remote's share,
+  `duplicates_dropped`. progress.json: `matches_remote` = 5.3's `remote` + `outstanding`,
+  `matches`. Log lines `[resolver] episodes also on the remote 'mac' (...)`, `[resolver] iter N
+  remote self-play: ...; matches 412 back, 960 assigned, 1920 outstanding, 0 + 0 requeued, 0
+  duplicates dropped`.
+* **On or off at a restart**: `--resolver-cfg` with the whole dict, e.g. `--resolver-cfg
+  '{"preset": "mtg-4", "eval_every": 2, "eval_remote": "mac", "selfplay_remote": "mac"}'`.
+
+Tests (`tests/test_remoteplay.py`): toy-cotrain-smoke with the resolver's `selfplay_remote`
+'local' (exact quotas, the remote's rows and shards counted, the backpressure's room), a slow
+worker whose episodes time out and are requeued (duplicates dropped, quotas exact), a worker that
+dies mid-phase every time (its episodes requeued, the worker restarted), the settings refused.
