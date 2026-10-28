@@ -467,6 +467,8 @@ class CoRun:
         co = Coordinator(*self.deferred)
         run_pair(co, pdrv, evs, rdrv, revs, pext=pext, rext=rext, check=lambda: self.check('evaluation'),
                  resume=(BIG, 0))
+        for name, drv in (('primary', pdrv), ('resolver', rdrv)):
+            self.log_slow(drv.stats(), {}, f'evaluation iter {it} vs {opp} ({name} driver)')
         rows = []
         for r in sorted(pdrv.take_results(), key=lambda r: r['gid']):
             me = r['gid'] % nt
@@ -597,11 +599,14 @@ class CoRun:
                    'target': ts.summary(X.cfg.get('policy_target', 'visits')),
                    'rolling': {'in_flight': 0, 'restarts': st['restarts'] - st0['restarts'],
                                'restart_sims': st['restart_sims'] - st0['restart_sims'],
-                               'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves']}}
+                               'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves'],
+                               'slow_steps': st.get('slow_steps', 0) - st0.get('slow_steps', 0)}}
             ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
             return out
         mp = summary(events, pst, pst0, pev, ws['p'], tstats['p'], P)
         mr = summary(matches, rst, rst0, rev, ws['r'], tstats['r'], R)
+        self.log_slow(pst, pst0, f'iter {it} self-play (primary driver)')
+        self.log_slow(rst, rst0, f'iter {it} self-play (resolver driver)')
         mp['rolling']['in_flight'] = pdrv.in_flight()['games']
         mr['rolling']['in_flight'] = rdrv.in_flight()['games']
         nep = len(matches) + len(rrows)
@@ -618,6 +623,15 @@ class CoRun:
             mr['remote'] = rem
             R.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
         return mp, mr
+
+    def log_slow(self, st, st0, where):
+        """Log the game steps (one game's search and moves between two of its leaves) that took
+        over 10 s since `st0` (the driver's `slow_steps`; zero/search: SLOW_STEP_NS): an engine's
+        slow path holds up its driver group that long (docs/az.md 11.8)."""
+        n = st.get('slow_steps', 0) - st0.get('slow_steps', 0)
+        if n > 0:
+            self.log(f'{where}: {n} game step(s) took over 10 s (the longest so far {st.get("step_max_s", 0):.0f} s, '
+                     f'game {st.get("step_max_gid")}): an engine slow path?')
 
     def label(self, k):
         return f"primary net ({self.cfg['game']})" if k == 'p' else f"resolver net ({self.rcfg['game']})"

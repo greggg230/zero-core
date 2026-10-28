@@ -790,3 +790,204 @@ fn queued_setups_replace_the_spec_and_carry_their_tags() {
     bad.queue_only = true;
     assert!(Driver::<ToyGame>::new(bad).is_err());
 }
+
+#[test]
+fn queued_setups_are_shared_between_the_groups() {
+    // a queue_only driver of 2 groups x 8 slots fed 8 setups (as an evaluation's matches arrive):
+    // each group gets 4 of them, so the groups' batches alternate at full size (the first group
+    // re-dispatched used to take every queued setup: 7 / 1); the same games as one at a time
+    let mut c = cfg(vec![nn(0, 8, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    c.queue_only = true;
+    c.record = false;
+    c.concurrency = 16;
+    let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
+    d.resume(u64::MAX, 0).unwrap();
+    for k in 0..8 {
+        d.enqueue(&format!("t{k}"), "{}").unwrap();
+    }
+    let mut sizes = Vec::new();
+    let mut rows = Vec::new();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        sizes.push((b.group, b.b));
+        answer(&mut d, &b);
+        rows.extend(d.take_results());
+    }
+    rows.extend(d.take_results());
+    assert_eq!(rows.len(), 8);
+    assert_eq!(&sizes[..2], &[(0, 1), (1, 1)], "one setup each as they arrive: {sizes:?}");
+    assert_eq!(&sizes[2..4], &[(0, 4), (1, 4)], "then 4 and 4: {sizes:?}");
+    assert!(sizes.iter().all(|&(_, b)| b <= 4), "{sizes:?}");
+    // a game's play depends on its setup and gid only: the same rows with one group
+    let mut c1 = c;
+    c1.groups = 1;
+    let mut d1 = Driver::<ToyGame>::new(c1).unwrap();
+    d1.resume(u64::MAX, 0).unwrap();
+    for k in 0..8 {
+        d1.enqueue(&format!("t{k}"), "{}").unwrap();
+    }
+    let (rows1, _) = run(&mut d1);
+    rows.sort_by_key(|r| r.gid);
+    let key = |r: &GameResult| (r.gid, r.tag.clone(), r.steps, r.scores.clone());
+    assert_eq!(rows.iter().map(key).collect::<Vec<_>>(), rows1.iter().map(key).collect::<Vec<_>>());
+}
+
+#[test]
+fn queued_setups_fill_every_free_slot_when_the_queue_is_long() {
+    // 24 setups for 16 slots: every slot plays (the groups' shares never leave a free slot idle
+    // while setups wait), 8 + 8 games in the first full batches
+    let mut c = cfg(vec![nn(0, 8, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    c.queue_only = true;
+    c.record = false;
+    c.concurrency = 16;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    d.resume(u64::MAX, 0).unwrap();
+    for k in 0..24 {
+        d.enqueue(&format!("t{k}"), "{}").unwrap();
+    }
+    let mut sizes = Vec::new();
+    let mut n = 0;
+    while let Some(b) = d.next_batch(true).unwrap() {
+        sizes.push(b.b);
+        answer(&mut d, &b);
+        n += d.take_results().len();
+    }
+    n += d.take_results().len();
+    assert_eq!(n, 24);
+    assert_eq!(&sizes[2..4], &[8, 8], "{sizes:?}");
+}
+
+// ------------------------------------------------------------------ a slow step holds up its group only
+
+/// The toy game whose step `at` sleeps `ms` once (the spec "<at> <ms>"; the clones a search
+/// makes share the flag, so the real game's step or a simulation's sleeps, once): an engine's
+/// slow path (MTG Zero: a castability check that ran for minutes, its ENGINE.md 51.3, 53).
+#[derive(Clone)]
+struct SlowToy {
+    g: ToyGame,
+    steps: u32,
+    at: u32,
+    ms: u64,
+    slept: std::sync::Arc<AtomicBool>,
+}
+
+impl SearchGame for SlowToy {
+    type Spec = (u32, u64);
+    const NAME: &'static str = "slowtoy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    fn parse_spec(json: &str) -> Result<(u32, u64), String> {
+        let v: Vec<u64> = json.split_whitespace().map(|x| x.parse().map_err(|e| format!("slowtoy spec: {e}"))).collect::<Result<_, _>>()?;
+        Ok(if v.len() == 2 { (v[0] as u32, v[1]) } else { (0, 0) })
+    }
+    fn new_game(spec: &(u32, u64), players: usize, seed: u64) -> Result<Self, String> {
+        Ok(SlowToy { g: ToyGame::new_game(&Default::default(), players, seed)?, steps: 0, at: spec.0, ms: spec.1, slept: Default::default() })
+    }
+    fn num_players(&self) -> usize {
+        self.g.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.g.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.g.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.steps += 1;
+        if self.ms > 0 && self.steps == self.at && !self.slept.swap(true, Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(self.ms));
+        }
+        self.g.step(a, chance)
+    }
+    fn force_chance(&mut self, forced: &[u64]) {
+        self.g.force_chance(forced)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.g.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.g.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.g.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.g.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.g.encode(viewer, out)
+    }
+}
+
+#[test]
+fn a_slow_step_holds_up_its_own_group_only() {
+    // co-training's episode player (a queue_only driver, 2 groups of 4) with 8 queued games, the
+    // first of which sleeps 1.5 s in one step: the other group's 4 games are searched, evaluated
+    // and finished meanwhile. (Served in strict round-robin order, every game of the driver waited
+    // for the slow one - and in co-training the draft network behind them: MTG Zero's smoke idled
+    // ~10 minutes, its ENGINE.md 53.) The slow step is counted.
+    const MS: u64 = 1500;
+    let mut c = cfg(vec![nn(0, 8, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.spec = String::new();
+    c.rolling = true;
+    c.queue_only = true;
+    c.record = false;
+    c.concurrency = 8;
+    let mut d = Driver::<SlowToy>::new(c).unwrap();
+    d.resume(u64::MAX, 0).unwrap();
+    for k in 0..8 {
+        d.enqueue(&format!("t{k}"), if k == 0 { "10 1500" } else { "" }).unwrap();
+    }
+    let t0 = Instant::now();
+    let mut last = [t0; 2];
+    let mut stalled = None;
+    let mut done = Vec::new();
+    let mut members = [std::collections::BTreeSet::new(), std::collections::BTreeSet::new()];
+    let mut served = Vec::new();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        let now = Instant::now();
+        members[b.group].extend(b.gid.iter().copied());
+        served.push((b.group, now));
+        if stalled.is_none() && now.duration_since(last[b.group]).as_millis() as u64 >= MS * 2 / 3 {
+            stalled = Some((b.group, last[b.group], now));
+        }
+        last[b.group] = now;
+        answer(&mut d, &b);
+        done.extend(d.take_results().into_iter().map(|r| (r.gid, Instant::now())));
+    }
+    done.extend(d.take_results().into_iter().map(|r| (r.gid, Instant::now())));
+    assert_eq!(done.len(), 8);
+    let (g, t_before, t_back) = stalled.expect("the slow step");
+    assert!(members[g].contains(&0), "the slow game (gid 0) is in the group that stalled: {members:?}");
+    assert!(members[1 - g].len() >= 2 && members[0].len() + members[1].len() == 8, "{members:?}");
+    // while the slow game slept, the other group went on to its last batch (in strict
+    // round-robin order it got one batch at most)
+    let during = served.iter().filter(|&&(h, t)| h != g && t > t_before && t < t_back).count();
+    let last_other = served.iter().filter(|x| x.0 != g).map(|x| x.1).max().unwrap();
+    assert!(during >= 10 && last_other < t_back, "the other group: {during} batches while the slow game slept, its last {:?} before the slow group came back", t_back.saturating_duration_since(last_other));
+    let st = d.stats();
+    assert!(st.step_max_s >= MS as f64 * 1e-3 && st.step_max_gid == 0, "{} s, game {}", st.step_max_s, st.step_max_gid);
+    assert_eq!(st.slow_steps, 0, "under SLOW_STEP_NS");
+    // in_flight never waits for the sleeping search thread
+    let mut c2 = cfg(vec![nn(0, 8, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c2.spec = String::new();
+    c2.rolling = true;
+    c2.queue_only = true;
+    c2.record = false;
+    c2.concurrency = 2;
+    c2.groups = 1;
+    let mut d2 = Driver::<SlowToy>::new(c2).unwrap();
+    d2.resume(u64::MAX, 0).unwrap();
+    d2.enqueue("slow", "1 1500").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let t = Instant::now();
+    let f = d2.in_flight();
+    assert!(t.elapsed().as_millis() < 500, "in_flight waited {:?} for a search thread", t.elapsed());
+    assert_eq!(f.games, 1);
+    while let Some(b) = d2.next_batch(true).unwrap() {
+        answer(&mut d2, &b);
+    }
+}

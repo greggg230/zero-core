@@ -107,6 +107,7 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     let mut n = Tally::default();
     for slot in ch.slots.iter_mut() {
         let gid = slot.start.or(Some(slot.gid)).filter(|&x| x != NO_GAME);
+        let t0 = Instant::now();
         // a panic inside the game (an engine bug) is caught here, per game, so the message
         // names the game to replay and the chunk's lock is never poisoned
         let r = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
@@ -150,6 +151,16 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
             scratch.game = None;
             Err(format!("search worker panicked: {}", panic_msg(p)))
         });
+        if let Some(gid) = gid {
+            let ns = t0.elapsed().as_nanos() as u64;
+            let k = &sh.counters;
+            if ns > k.step_max_ns.load(Ordering::Relaxed) && k.step_max_ns.fetch_max(ns, Ordering::Relaxed) < ns {
+                k.step_max_gid.store(gid as u64, Ordering::Relaxed);
+            }
+            if ns > SLOW_STEP_NS {
+                k.slow_steps.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if let Err(e) = r {
             let tag = slot.tag.as_ref().or(slot.setup.as_ref().map(|s| &s.tag)).map(|t| format!(" (queued setup {t:?})")).unwrap_or_default();
             return Err(format!("game {}{tag} (driver seed {}): {e}", gid.map(|x| x as i64).unwrap_or(-1), cfg.seed));

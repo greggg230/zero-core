@@ -633,6 +633,9 @@ impl PySearchDriver {
         d.set_item("deferred", s.deferred)?;
         d.set_item("resolved", s.resolved)?;
         d.set_item("queued", s.queued)?;
+        d.set_item("step_max_s", s.step_max_s)?;
+        d.set_item("step_max_gid", s.step_max_gid)?;
+        d.set_item("slow_steps", s.slow_steps)?;
         Ok(d)
     }
 

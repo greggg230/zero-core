@@ -11,7 +11,9 @@
 //! When every chunk of a group is done, its leaves are assembled into one batch per evaluator
 //! key (network keys: a [B, F] feature matrix + legal-action lists; external keys: the
 //! games' exported states). The caller takes batches with `next_batch` (groups in fixed
-//! round-robin order, so a run is reproducible from its seed and the evaluator outputs) and
+//! round-robin order, so a run is reproducible from its seed and the evaluator outputs; a
+//! `queue_only` driver serves whichever group is ready first, so a slow game holds up its own
+//! group only) and
 //! answers with `submit` (priors / values / margins) or `submit_external` (one payload per
 //! request, applied to the game by `SearchGame::apply_external`); once all batches of a group
 //! are answered the group is dispatched again (finished games are replaced then). With
@@ -41,7 +43,9 @@
 //! starts use that spec instead of the driver's (the seats stay the driver's); with
 //! `DriverCfg::queue_only` (rolling drivers) slots only start queued games and stay idle while
 //! the queue is empty (`next_batch` returns None when nothing is left to play; `enqueue` wakes
-//! the idle groups). A game started from the queue carries its tag into its result row.
+//! the idle groups). A game started from the queue carries its tag into its result row. The
+//! groups share the queued setups (`queue_share`): each starts its part of everything in flight
+//! or queued, never leaving a free slot idle while the other groups are full.
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -530,7 +534,16 @@ struct Counters {
     restarts: AtomicU64,
     recorded: AtomicU64,
     minor: AtomicU64,
+    /// The longest a game's step took (one slot's advance between two of its leaves: its search
+    /// and moves, ns), that game's gid, and the steps over SLOW_STEP_NS.
+    step_max_ns: AtomicU64,
+    step_max_gid: AtomicU64,
+    slow_steps: AtomicU64,
 }
+
+/// A game's step longer than this counts as slow (`DriverStats::slow_steps`): an engine's slow
+/// path holds up every game of its group (and the caller) that long.
+pub const SLOW_STEP_NS: u64 = 10_000_000_000;
 
 struct Shared<G: SearchGame> {
     cfg: DriverCfg,
@@ -608,6 +621,10 @@ pub struct DriverStats {
     pub deferred: u64,
     pub resolved: u64,
     pub queued: u64,
+    /// The longest step of a game so far (s) and that game's gid; steps over `SLOW_STEP_NS`.
+    pub step_max_s: f64,
+    pub step_max_gid: u64,
+    pub slow_steps: u64,
 }
 
 /// The games in progress.
@@ -647,6 +664,11 @@ pub struct Driver<G: SearchGame> {
     deferred: u64,
     resolved: u64,
     queue: VecDeque<Setup<G>>,
+    /// Per group: its slots, and its slots with a game as of its last dispatch (`queue_share`);
+    /// per group and chunk: the latter (`in_flight` of a chunk being searched).
+    gslots: Vec<usize>,
+    gbusy: Vec<usize>,
+    cbusy: Vec<Vec<usize>>,
 }
 
 impl<G: SearchGame> Driver<G> {
@@ -764,7 +786,12 @@ impl<G: SearchGame> Driver<G> {
             deferred: 0,
             resolved: 0,
             queue: VecDeque::new(),
+            gslots: Vec::new(),
+            gbusy: vec![0; groups],
+            cbusy: Vec::new(),
         };
+        d.cbusy = d.sh.groups.iter().map(|grp| vec![0; grp.chunks.len()]).collect();
+        d.gslots = d.sh.groups.iter().map(|grp| grp.chunks.iter().map(|c| lock(c).slots.len()).sum()).collect();
         for g in 0..groups {
             if rolling {
                 d.gstate[g] = GState::Paused;
@@ -787,18 +814,29 @@ impl<G: SearchGame> Driver<G> {
         let grp = &self.sh.groups[g];
         let n_games = if self.sh.cfg.rolling { u32::MAX } else { self.sh.cfg.games.len() as u32 };
         let queue_only = self.sh.cfg.queue_only;
+        // queue_only: this group's share of the queued setups (`queue_share`), so that the groups'
+        // batches pipeline; any other driver fills every free slot
+        let mut take = if queue_only { self.queue_share(g) } else { usize::MAX };
         let mut busy = false;
-        for ch in &grp.chunks {
+        let mut nbusy = 0;
+        for (c, ch) in grp.chunks.iter().enumerate() {
             let mut ch = lock(ch);
+            let mut cb = 0;
             for s in ch.slots.iter_mut() {
-                if s.game.is_none() && s.start.is_none() && self.next_gid < n_games && !(queue_only && self.queue.is_empty()) {
+                if s.game.is_none() && s.start.is_none() && self.next_gid < n_games && !(queue_only && (self.queue.is_empty() || take == 0)) {
                     s.start = Some(self.next_gid);
                     s.setup = self.queue.pop_front();
                     self.next_gid += 1;
+                    take = take.saturating_sub(1);
                 }
-                busy |= s.game.is_some() || s.start.is_some();
+                let b = s.game.is_some() || s.start.is_some();
+                busy |= b;
+                cb += b as usize;
             }
+            self.cbusy[g][c] = cb;
+            nbusy += cb;
         }
+        self.gbusy[g] = nbusy;
         if !busy {
             self.gstate[g] = GState::Idle;
             return;
@@ -812,6 +850,26 @@ impl<G: SearchGame> Driver<G> {
         }
         drop(q);
         self.sh.queue_cv.notify_all();
+    }
+
+    /// How many queued setups group `g` starts now (a `queue_only` driver): its share of every
+    /// game in flight or queued (the groups' games as of their last dispatch), but never fewer than
+    /// the queue holds beyond the other groups' free slots - so the groups stay balanced (each has
+    /// games to search while the caller evaluates another's batch) and no free slot idles while
+    /// the others are full. Without it the first group re-dispatched took the whole queue: an
+    /// evaluation's 384 matches started 383 / 1, one group's search and inference in turn.
+    fn queue_share(&self, g: usize) -> usize {
+        let grp = &self.sh.groups[g];
+        let mut busy = 0;
+        for ch in &grp.chunks {
+            busy += lock(ch).slots.iter().filter(|s| s.game.is_some() || s.start.is_some()).count();
+        }
+        let ng = self.gstate.len();
+        let others_busy: usize = (0..ng).filter(|&h| h != g).map(|h| self.gbusy[h]).sum();
+        let others_room: usize = (0..ng).filter(|&h| h != g).map(|h| self.gslots[h].saturating_sub(self.gbusy[h])).sum();
+        let q = self.queue.len();
+        let target = (others_busy + busy + q).div_ceil(ng);
+        target.saturating_sub(busy).max(q.saturating_sub(others_room))
     }
 
     fn check_error(&self) -> Result<(), String> {
@@ -876,23 +934,36 @@ impl<G: SearchGame> Driver<G> {
                 return Ok(None);
             }
             let ng = self.gstate.len();
-            let Some(g) = (0..ng).map(|k| (self.cursor + k) % ng).find(|&g| self.gstate[g] == GState::Working) else {
+            let order: Vec<usize> = (0..ng).map(|k| (self.cursor + k) % ng).filter(|&g| self.gstate[g] == GState::Working).collect();
+            if order.is_empty() {
                 if !block {
                     return Ok(None);
                 }
                 return Err("submit the outstanding batches before asking for more".into());
-            };
+            }
+            // the group served next: the next one in round-robin order (a run reproducible from
+            // its seed); a queue_only driver serves the first of its working groups that is ready,
+            // so a game whose step takes long (an engine's slow path) holds up its own group only,
+            // never every game of the driver (docs/search.md 2.3)
+            let any = self.sh.cfg.queue_only;
             let t = Instant::now();
-            {
+            let g = {
                 let failed = || self.sh.failed.load(Ordering::SeqCst);
                 let mut done = lock(&self.sh.done);
-                if !block && !done[g] && !failed() {
-                    return Ok(None);
-                }
-                while !done[g] && !failed() {
+                loop {
+                    let ready = if any { order.iter().copied().find(|&g| done[g]) } else { Some(order[0]).filter(|&g| done[g]) };
+                    if let Some(g) = ready {
+                        break g;
+                    }
+                    if failed() {
+                        break order[0];
+                    }
+                    if !block {
+                        return Ok(None);
+                    }
                     done = self.sh.done_cv.wait(done).unwrap_or_else(PoisonError::into_inner);
                 }
-            }
+            };
             self.wait_ns += t.elapsed().as_nanos() as u64;
             self.check_error()?;
             let out = lock(&self.sh.groups[g].out).take().unwrap_or_default();
@@ -1103,21 +1174,35 @@ impl<G: SearchGame> Driver<G> {
             deferred: self.deferred,
             resolved: self.resolved,
             queued: self.queue.len() as u64,
+            step_max_s: c.step_max_ns.load(Ordering::Relaxed) as f64 * 1e-9,
+            step_max_gid: c.step_max_gid.load(Ordering::Relaxed),
+            slow_steps: c.slow_steps.load(Ordering::Relaxed),
         }
     }
 
+    /// The games in progress. Never waits for a search thread: a chunk being searched right now
+    /// counts its games as of its group's last dispatch and is left out of the other fields (a
+    /// game whose step takes minutes must not hold the caller - and with it Python's GIL - that
+    /// long).
     pub fn in_flight(&self) -> InFlight {
         let mut r = InFlight::default();
         let mut oldest = u64::MAX;
-        for grp in &self.sh.groups {
-            for ch in &grp.chunks {
-                let ch = lock(ch);
+        for (g, grp) in self.sh.groups.iter().enumerate() {
+            for (c, ch) in grp.chunks.iter().enumerate() {
+                let ch = match ch.try_lock() {
+                    Ok(ch) => ch,
+                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        r.games += self.cbusy[g][c] as u64;
+                        continue;
+                    }
+                };
                 for s in &ch.slots {
-                    let Some(g) = s.game.as_ref() else { continue };
+                    let Some(game) = s.game.as_ref() else { continue };
                     r.games += 1;
                     oldest = oldest.min(s.gid as u64);
                     r.max_steps = r.max_steps.max(s.steps);
-                    r.max_rounds = r.max_rounds.max(g.rounds());
+                    r.max_rounds = r.max_rounds.max(game.rounds());
                 }
             }
         }
