@@ -24,7 +24,11 @@ needs nothing else). The primary's evaluation stays local.
 
 A remote: {host: 'user@host' (or 'local': this machine, the tests), repo: the game repo there
 (same code as the run's checkout), python, workdir, env: {...}, overrides: run settings for the
-remote ({'infer_device': 'mps', 'threads': 12})}.
+remote ({'infer_device': 'mps', 'threads': 12}), selfplay: {...} (optional: remote self-play's
+workdir, worker processes, niceness, locks to back off for, its own overrides; zero/remoteplay.py,
+docs/az.md 5.3)}.
+
+`python -m <pkg>.az.remote selfplay MIRROR WORKER`: a remote self-play worker (zero/remoteplay.py).
 """
 import json
 import os
@@ -44,14 +48,17 @@ RESULT = 'ZERO_REMOTE_RESULT '
 LOCK_STALE_S = 4 * 3600
 
 
-def remote_spec(name):
+def remote_spec(name, setting='eval_remote'):
+    """The game package's remote `name` as a dict (a Mapping such as MTG Zero's RunCommitRemote
+    resolves here: its checks run now). 'local': this machine (the tests). `setting`: the run
+    setting that names it (the error message)."""
     pkg = package.active()
     if name == 'local':
         return dict({'host': 'local', 'repo': pkg.root, 'python': sys.executable,
                      'workdir': os.environ.get('ZERO_REMOTE_WORKDIR', os.path.join(tempfile.gettempdir(), 'zero-remote')),
                      'env': {}, 'overrides': {}}, **pkg.remotes.get('local', {}))
     if name not in pkg.remotes:
-        raise SystemExit(f'eval_remote {name!r}: not in the game package remotes ({sorted(pkg.remotes)})')
+        raise SystemExit(f'{setting} {name!r}: not in the game package remotes ({sorted(pkg.remotes)})')
     return dict({'env': {}, 'overrides': {}}, **pkg.remotes[name])
 
 
@@ -294,6 +301,13 @@ class _Lock:
 
 
 def _alive(pid):
+    """Is process `pid` alive? (On Windows `os.kill(pid, 0)` would TERMINATE it: psutil there.)"""
+    if os.name == 'nt':
+        try:
+            import psutil
+            return psutil.pid_exists(pid)
+        except ImportError:
+            return True                            # unknown: treat as alive (a lock then waits)
     try:
         os.kill(pid, 0)
         return True
@@ -328,8 +342,12 @@ def evaluate_mirror(rdir, it):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['selfplay']:
+        # remote self-play (docs/az.md 5.3): a worker serving the run over its stdin / stdout
+        from .remoteplay import serve
+        return serve(argv[1:])
     if len(argv) != 3 or argv[0] != 'eval':
-        raise SystemExit('usage: python -m <pkg>.az.remote eval MIRROR_DIR ITER')
+        raise SystemExit('usage: python -m <pkg>.az.remote eval MIRROR_DIR ITER | selfplay MIRROR_DIR WORKER')
     rdir, it = argv[1], int(argv[2])
     with _Lock(os.path.join(os.path.dirname(os.path.normpath(rdir)), '.eval.lock')):
         m = evaluate_mirror(rdir, it)

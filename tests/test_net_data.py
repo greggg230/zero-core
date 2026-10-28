@@ -103,6 +103,52 @@ def test_shards_and_window_roundtrip(tmp_path):
     assert Window(shard_paths(str(tmp_path / 'iter_0001')), F - 5, A).x.shape[1] == F - 5
 
 
+def _window_loading_everything_first(paths, nf, budget, seed):
+    """The window as it was built before it streamed (every shard in RAM, then subsampled): the
+    rows, in order, of each shard that it keeps."""
+    rng = np.random.default_rng(seed)
+    parts = [read_shard(p) for p in paths]
+    total = sum(len(p['player']) for p in parts)
+    keep = 1.0 if not budget or total <= budget else budget / total
+    out = []
+    for p in parts:
+        N = len(p['player'])
+        idx = np.arange(N) if keep >= 1.0 else np.sort(rng.choice(N, size=max(1, int(round(N * keep))), replace=False))
+        x = p['x'][idx][:, :nf]
+        out.append((idx, np.pad(x, ((0, 0), (0, nf - x.shape[1]))), p['pi'], p['opt_off'], p['z'][idx]))
+    return out
+
+
+def test_window_streams_shards_with_the_same_rows(tmp_path):
+    """The window subsamples each shard as it loads it (the rate from the shards' metas: the peak
+    is the window plus one shard) and keeps exactly the rows of loading everything first; plain
+    and compressed shards (remote self-play's) alike."""
+    from zero.data import shard_rows
+    rng = np.random.default_rng(5)
+    paths = []
+    for k, N in enumerate([300, 1, 777, 50, 1200]):
+        nopt = rng.integers(2, 6, size=N)
+        off = np.concatenate([[0], np.cumsum(nopt)])
+        s = {'x': rng.standard_normal((N, F)).astype(np.float32), 'player': rng.integers(0, 2, N),
+             'n_players': np.full(N, 2), 'opt_off': off, 'opt_action': rng.integers(0, A, off[-1]),
+             'pi': rng.random(off[-1]).astype(np.float32), 'z': rng.random((N, 8)).astype(np.float32),
+             'q': rng.random((N, 8)).astype(np.float32), 'sc': rng.random((N, 8)).astype(np.float32),
+             'net': np.zeros(N, np.int32)}
+        w = ShardWriter(str(tmp_path), f's{k}', rows=10 ** 6, meta={'game': 'toy'}, compress=k % 2)
+        w.add(s)
+        w.close()
+        paths.append(str(tmp_path / f's{k}_000.npz'))
+        assert shard_rows(paths[-1]) == N
+    for budget in (None, 10 ** 6, 1000, 333, 2):
+        for nf in (F, F - 7, F + 3):
+            win = Window(paths, nf, A, budget_rows=budget, seed=3)
+            ref = _window_loading_everything_first(paths, nf, budget, seed=3)
+            assert np.array_equal(win.src_row, np.concatenate([r[0] for r in ref]))
+            assert np.array_equal(win.x, np.concatenate([r[1] for r in ref]).astype(np.float16))
+            assert np.array_equal(win.z[:, :2], np.concatenate([r[4] for r in ref]).astype(np.float32)[:, :2])
+            assert win.loaded == 2328 and win.N == len(win.src_row)
+
+
 def test_elo_fit_recovers_ratings():
     rng = np.random.default_rng(0)
     true = {'yard': 1000, 'a': 1200, 'b': 800, 'c': 1500}

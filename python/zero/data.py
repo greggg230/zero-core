@@ -1,7 +1,9 @@
 """Training data (docs/az.md 3): sample shards and the RAM-bounded training window.
 
 Shards: `data/iter_NNNN/<task>_SSS.npz` (uncompressed npz, written to a temporary name and
-renamed: a crash never leaves a half-written shard). Arrays: `x` float16 [N, F], `player`,
+renamed: a crash never leaves a half-written shard; remote self-play's shards, `m<KK>-<sid>_SSS.npz`,
+are compressed npz - zlib level 1, ~58x for MTG's sparse features - which `np.load` reads alike:
+docs/az.md 5.3). Arrays: `x` float16 [N, F], `player`,
 `n_players` int8, `opt_off` int32 [N+1], `opt_action` int16/int32, `pi` float16, `z` / `q` /
 `sc` float16 [N, P] (P = most players in the shard), `net` int32, and `meta` (a JSON string:
 game, features, actions, rows, task info). Float16 targets are renormalised on load.
@@ -13,13 +15,17 @@ loads the same way, and remembers where each row came from (`provenance`).
 `TargetStats`: sharpness of the recorded policy targets (self-play metrics).
 
 Window: the newest iterations' shards loaded into RAM (`Window(paths, ...)`), every shard
-subsampled at the same rate when the total exceeds the RAM budget; `batch(idx)` builds
-torch tensors: features cut / zero-padded to the network's width, dense legal masks and
-policy targets over the actions, value / margin targets over MAX_SEATS.
+subsampled at the same rate when the total exceeds the RAM budget - the rate from the shards'
+row counts (their meta), each shard subsampled as it is loaded, so the peak is the window plus
+one shard (remote self-play triples a run's samples per iteration; the rows kept are those of
+loading every shard first); `batch(idx)` builds torch tensors: features cut / zero-padded to the
+network's width, dense legal masks and policy targets over the actions, value / margin targets
+over MAX_SEATS.
 """
 import glob
 import json
 import os
+import zipfile
 
 import numpy as np
 import torch
@@ -50,27 +56,40 @@ def compact(s):
             'sc': s['sc'][:, :P].astype(np.float16), 'net': s['net'].astype(np.int32)}
 
 
-def write_shard(path, s, meta, bad_path=None):
+def write_shard(path, s, meta, bad_path=None, compress=0):
     """Write the samples `s` to `path` (atomic) -> (rows, bytes). Non-finite values after the
     float16 cast: the shard goes to `bad_path` (default: `path` as *.bad.npz) and NonFinite is
-    raised naming the arrays, rows, columns and the meta."""
+    raised naming the arrays, rows, columns and the meta. `compress`: 0 = a plain npz (np.savez),
+    1-9 = a compressed npz at that zlib level (remote self-play: 1)."""
     c = compact(s)
     meta = dict(meta, rows=int(len(c['player'])))
     probs = shard_problems(c)
     if probs:
         bad = bad_path or path[:-len(EXT)] + BAD
         os.makedirs(os.path.dirname(os.path.abspath(bad)), exist_ok=True)
-        _save_npz(bad, c, dict(meta, nonfinite=probs, shard=path))
+        _save_npz(bad, c, dict(meta, nonfinite=probs, shard=path), compress)
         raise NonFinite(f'non-finite sample values in shard {os.path.basename(path)} (meta {json.dumps(meta)}): '
                         + '; '.join(probs) + f'. The samples were kept in {bad} (never loaded by the window); '
                         f'the run stops here')
-    _save_npz(path, c, meta)
+    _save_npz(path, c, meta, compress)
     return meta['rows'], os.path.getsize(path)
 
 
-def _save_npz(path, c, meta):
+def savez_level(path, level, arrays):
+    """np.savez_compressed at zlib level `level` (numpy's own uses zlib's default, 6: several times
+    slower on MTG's shards for a few percent of size). Readable by np.load."""
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED, compresslevel=int(level)) as zf:
+        for k, a in arrays.items():
+            with zf.open(k + '.npy', 'w', force_zip64=True) as f:
+                np.lib.format.write_array(f, np.asanyarray(a), allow_pickle=False)
+
+
+def _save_npz(path, c, meta, compress=0):
     tmp = path + f'.{os.getpid()}.tmp.npz'
-    np.savez(tmp, meta=np.array(json.dumps(meta)), **c)
+    if compress:
+        savez_level(tmp, compress, dict(meta=np.array(json.dumps(meta)), **c))
+    else:
+        np.savez(tmp, meta=np.array(json.dumps(meta)), **c)
     for k in range(40):
         try:
             os.replace(tmp, path)
@@ -94,14 +113,25 @@ def shard_paths(d):
     return sorted(p for p in glob.glob(os.path.join(d, '*' + EXT)) if not p.endswith((BAD, '.tmp' + EXT)))
 
 
+def shard_rows(path):
+    """A shard's sample count from its meta (only that member is read; a shard without `rows` in
+    its meta: its arrays are counted)."""
+    with np.load(path) as z:
+        rows = json.loads(str(z['meta'])).get('rows')
+        return int(rows) if rows is not None else int(len(z['player']))
+
+
 class ShardWriter:
     """Collects driver sample dicts and writes a shard every `rows` samples (and at close).
     `bad_dir`: where a shard with non-finite values is quarantined, as
-    `<data dir name>_<prefix>_SSS.bad.npz` (default: next to the good ones, `*.bad.npz`)."""
+    `<data dir name>_<prefix>_SSS.bad.npz` (default: next to the good ones, `*.bad.npz`).
+    `compress`: zlib level of the shards (0 = plain npz). `on_write(path, rows, bytes)`: called
+    after each shard is written (remote self-play announces its shards so)."""
 
-    def __init__(self, d, prefix, rows=65536, meta=None, bad_dir=None):
+    def __init__(self, d, prefix, rows=65536, meta=None, bad_dir=None, compress=0, on_write=None):
         os.makedirs(d, exist_ok=True)
         self.d, self.prefix, self.rows, self.meta, self.bad_dir = d, prefix, rows, dict(meta or {}), bad_dir
+        self.compress, self.on_write = compress, on_write
         self.buf = []
         self.nbuf = 0
         self.k = 0
@@ -126,11 +156,15 @@ class ShardWriter:
         bad = None
         if self.bad_dir:
             bad = os.path.join(self.bad_dir, f'{os.path.basename(os.path.normpath(self.d))}_{name}{BAD}')
-        rows, nbytes = write_shard(os.path.join(self.d, name + EXT), s, self.meta, bad)
+        path = os.path.join(self.d, name + EXT)
+        kw = {'compress': self.compress} if self.compress else {}     # local shards: the call as it was
+        rows, nbytes = write_shard(path, s, self.meta, bad, **kw)
         self.k += 1
         self.samples += rows
         self.bytes += nbytes
         self.shards += 1
+        if self.on_write is not None:
+            self.on_write(path, rows, nbytes)
 
     def close(self):
         self.flush()
@@ -196,20 +230,18 @@ class Window:
         self.F, self.A = num_features, num_actions
         self.paths = list(paths)
         rng = np.random.default_rng(seed)
-        parts = []
-        for p in self.paths:
-            parts.append(read_shard(p))
-            probs = shard_problems(parts[-1])
-            if probs:
-                raise NonFinite(f'non-finite sample values in shard {p} (meta {json.dumps(parts[-1]["meta"])}): '
-                                + '; '.join(probs) + '. Move it out of the data directory (or rename it to '
-                                '*.bad.npz) to train without it')
-        total = sum(len(p['player']) for p in parts)
+        total = sum(shard_rows(p) for p in self.paths)
         keep = 1.0 if not budget_rows or total <= budget_rows else budget_rows / total
         xs, pl, npl, offs, acts, pis, zs, qs, scs = [], [], [], [np.zeros(1, np.int64)], [], [], [], [], []
         src = []
         base = 0
-        for p in parts:
+        for path in self.paths:
+            p = read_shard(path)                   # one shard in RAM at a time: subsampled now
+            probs = shard_problems(p)
+            if probs:
+                raise NonFinite(f'non-finite sample values in shard {path} (meta {json.dumps(p["meta"])}): '
+                                + '; '.join(probs) + '. Move it out of the data directory (or rename it to '
+                                '*.bad.npz) to train without it')
             N = len(p['player'])
             idx = np.arange(N) if keep >= 1.0 else np.sort(rng.choice(N, size=max(1, int(round(N * keep))), replace=False))
             src.append(idx.astype(np.int32))
@@ -233,6 +265,7 @@ class Window:
                 v = p[k][idx].astype(np.float32)
                 a[:, :v.shape[1]] = v
                 dst.append(a)
+            del p
         self.N = sum(len(x) for x in xs)
         if self.N == 0:
             raise ValueError('empty training window')

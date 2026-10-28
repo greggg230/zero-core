@@ -36,6 +36,13 @@ The run directory holds the primary as a single-game run does (`models/`, `data/
   data directories cleared); one interrupted after them finishes its evaluations; the resolver's
   remote evaluations without a result are queued again. PAUSE / STOP / the supervisor / kill /
   fork work on the one process.
+* `resolver_cfg['selfplay_remote']` (docs/az.md 11.6, zero/remoteplay.py): another machine plays a
+  share of the queued episodes with the resolver's checkpoint i-1 - a second consumer of the
+  coordinator's queue next to the resolver's driver here (which then keeps at most `local_cap`
+  episodes queued in its driver, so the rest stay takeable); their rows come back by tag, their
+  samples as shards into `resolver/data/iter_i/`; episodes the remote loses (its session broke) or
+  does not finish in time are requeued here, and a duplicate row is dropped. The primary's own
+  self-play (the drafting) stays here: the run's top-level `selfplay_remote` is refused.
 """
 import json
 import os
@@ -51,8 +58,8 @@ from .data import ShardWriter, TargetStats
 from .finite import NonFinite, check_state
 from .infer import drive
 from .net import load, save, widen
-from .run import (DEFAULTS, PRESETS, Run, _fmt, _write_json, latest_iter, log, model_path, read_metrics,
-                  summarize)
+from .run import (DEFAULTS, PRESETS, Run, _fmt, _fmt_remote, _write_json, latest_iter, log, model_path,
+                  read_metrics, summarize)
 
 BIG = 1 << 62                                      # a resolver driver's quota: its phases end by end_phase()
 CO_KEYS = ('resolver', 'resolver_cfg', 'resolver_init', 'resolver_conc', 'pending_max', 'draft_eval_net_every')
@@ -79,10 +86,11 @@ def resolver_config(cfg):
     out.update(game=cfg['resolver'], preset=preset, resolver='', resolver_cfg={}, resolver_init='')
     if out.get('policy_target', 'visits') not in ('visits', 'cq'):
         raise SystemExit(f"resolver_cfg: policy_target {out['policy_target']!r}: 'visits' or 'cq'")
-    rem = out.get('eval_remote') or ''
-    if rem and rem != 'local' and rem not in package.active().remotes:
-        raise SystemExit(f'resolver_cfg: eval_remote {rem!r}: not in the game package remotes '
-                         f'({sorted(package.active().remotes)})')
+    for k in ('eval_remote', 'selfplay_remote'):
+        rem = out.get(k) or ''
+        if rem and rem != 'local' and rem not in package.active().remotes:
+            raise SystemExit(f'resolver_cfg: {k} {rem!r}: not in the game package remotes '
+                             f'({sorted(package.active().remotes)})')
     return out
 
 
@@ -96,7 +104,11 @@ class Coordinator:
     run concurrently: `next_batch` holds it while it waits); the shared state is under `cv`.
 
     Primary thread: `take_events(drv)` (parked games -> queued episodes), `resolve_ready(drv)`.
-    Resolver thread: `feed(drv)` (enqueue), `collect(drv)` (result rows by tag -> ready games)."""
+    Resolver thread: `feed(drv)` (enqueue), `collect(drv)` (result rows by tag -> ready games).
+    A remote consumer (zero.remoteplay, its threads): `take_for_remote(n)`, `collect_rows(rows)`,
+    `requeue(items)`; with one, `local_cap` bounds the episodes `feed` puts into the local driver's
+    queue (the rest stay here for whichever consumer has room). A requeued tag may come back twice
+    (the remote finishes it after all): the second row is dropped (`dup_dropped`)."""
 
     def __init__(self, episodes, results):
         self.episodes_of, self.results_of = episodes, results
@@ -113,6 +125,10 @@ class Coordinator:
         self.resolved_phase = 0
         self.lat = []                              # per resolved game: (parked -> resolved s, ready -> resolved s)
         self.waited = 0.0                          # seconds the primary waited for backpressure
+        self.local_cap = None                      # a remote consumer: the local driver's queue at most this long
+        self.remote_rows = []                      # the remote's accepted rows (taken by the run)
+        self.dupe_ok = set()                       # requeued tags: a second row for them is dropped
+        self.dup_dropped = 0
 
     # ---- primary thread
     def take_events(self, drv):
@@ -148,9 +164,13 @@ class Coordinator:
 
     # ---- resolver thread
     def feed(self, drv):
+        room = None if self.local_cap is None else max(0, self.local_cap - drv.queued)
         with self.cv:
-            items = list(self.to_queue)
-            self.to_queue.clear()
+            if room is None:
+                items = list(self.to_queue)
+                self.to_queue.clear()
+            else:
+                items = [self.to_queue.popleft() for _ in range(min(room, len(self.to_queue)))]
         for tag, spec in items:
             drv.enqueue(tag, spec)
         return len(items)
@@ -159,30 +179,63 @@ class Coordinator:
         rows = drv.take_results()
         if not rows:
             return 0
-        done = []
+        return self._accept(rows, self.done_rows)
+
+    def _accept(self, rows, sink):
+        """Result rows (any consumer's) into their events; an event with all its rows is ready."""
+        done, kept = [], []
         with self.cv:
             for r in rows:
                 tag = r.get('tag')
                 g, _, k = (tag or '').partition('/')
                 ev = self.events.get(int(g)) if g.isdigit() else None
+                if tag in self.dupe_ok and (ev is None or (k.isdigit() and int(k) in ev['rows'])):
+                    self.dupe_ok.discard(tag)      # the second copy of a requeued episode
+                    self.dup_dropped += 1
+                    continue
                 if ev is None or not k.isdigit():
                     raise RuntimeError(f'a resolver result row with an unknown tag {tag!r}: {r}')
                 ev['rows'][int(k)] = r
                 self.outstanding -= 1
+                kept.append(r)
                 if len(ev['rows']) == ev['n']:
                     done.append((int(g), self.events.pop(int(g))))
-            self.done_rows.extend(rows)
+            sink.extend(kept)
         out = [(g, self.results_of(ev['payload'], [ev['rows'][k] for k in range(ev['n'])]), time.time(), ev['t'])
                for g, ev in done]
         if out:
             with self.cv:
                 self.ready.extend(out)
                 self.cv.notify_all()
-        return len(rows)
+        return len(kept)
 
     def take_rows(self):
         with self.cv:
             rows, self.done_rows = self.done_rows, []
+        return rows
+
+    # ---- a remote consumer (zero.remoteplay's threads)
+    def take_for_remote(self, n):
+        """Up to `n` queued episodes (tag, spec) for the remote, oldest first."""
+        with self.cv:
+            return [self.to_queue.popleft() for _ in range(min(n, len(self.to_queue)))]
+
+    def collect_rows(self, rows):
+        """The remote's result rows -> how many were taken (the rest: duplicates dropped)."""
+        return self._accept(rows, self.remote_rows)
+
+    def requeue(self, items):
+        """Episodes the remote lost or did not finish in time, back at the front of the queue (a
+        later row of the remote's copy, or of this one, is dropped)."""
+        with self.cv:
+            for tag, spec in reversed(items):
+                self.to_queue.appendleft((tag, spec))
+            self.dupe_ok.update(tag for tag, _ in items)
+            self.cv.notify_all()
+
+    def take_remote_rows(self):
+        with self.cv:
+            rows, self.remote_rows = self.remote_rows, []
         return rows
 
 
@@ -326,6 +379,10 @@ class CoRun:
             raise SystemExit("eval_remote: a co-training run evaluates its primary network here (its matches' "
                              "episodes need the resolver's drivers); the resolver's evaluations go to a remote "
                              "with resolver_cfg's eval_remote")
+        if cfg.get('selfplay_remote'):
+            raise SystemExit("selfplay_remote: a co-training run's primary self-play (its parked games and their "
+                             "coordinator) stays here; the resolver's episodes go to a remote with resolver_cfg's "
+                             "selfplay_remote")
         if len(set(cfg['players'])) != 1:
             raise SystemExit(f"co-training: one player count for the primary game (players {cfg['players']})")
         self.rcfg = resolver_config(cfg)
@@ -427,7 +484,9 @@ class CoRun:
                 X.drop_data(d, strict=True)        # an interrupted iteration is replayed
         t0 = time.time()
         rconc = c.get('resolver_conc') or rc['conc']
-        pending_max = c.get('pending_max') or 2 * rconc
+        rsp = R.rsp
+        # backpressure: twice the local episodes in flight (and the remote's room, with a remote)
+        pending_max = c.get('pending_max') or 2 * rconc + (rsp.capacity() if rsp is not None else 0)
         if self.sp is None:
             pseat = P.nn_seat('m', c['sims'], selfplay=True)
             rseat = R.nn_seat('m', rc['sims'], selfplay=True)
@@ -444,6 +503,8 @@ class CoRun:
         sp = self.sp
         pdrv, rdrv, pev, rev, co = sp['p'], sp['r'], sp['pev'], sp['rev'], sp['co']
         pst0, rst0 = pdrv.stats(), rdrv.stats()
+        if rsp is not None:
+            co.local_cap = max(16, rconc // 4)     # the rest of the queue: whichever consumer has room
         pdrv.resume(c['games'], it - 1)
         writers, tstats = {}, {}
         for k, X in (('p', P), ('r', R)):
@@ -456,8 +517,12 @@ class CoRun:
         state = {'t': 0.0, 'parked_max': 0, 'tr': 0.0}
         prog = os.path.join(self.run, 'progress.json')
         co.take_rows()
+        co.take_remote_rows()
         co.lat = []
         co.waited = 0.0
+        dup0 = co.dup_dropped
+        if rsp is not None:
+            rsp.begin(it, co)                      # the remote takes queued episodes as it has room
 
         def add(k, s):
             try:
@@ -475,11 +540,13 @@ class CoRun:
                 st = drv.stats()
                 state['parked_max'] = max(state['parked_max'], st['parked_bytes'])
                 r = co.snapshot
-                _write_json(prog, {'iter': it, 'phase': 'selfplay', 'events_resolved': len(events), 'target': c['games'],
-                                   'games': len(events), 'drafting': drv.in_flight()['games'], 'pending_events': st['parked'],
-                                   'matches_queued': r.get('queued', 0) + len(co.to_queue),
-                                   'matches_in_flight': r.get('in_flight', 0), 'matches_done': r.get('done', 0),
-                                   'time': now})
+                p = {'iter': it, 'phase': 'selfplay', 'events_resolved': len(events), 'target': c['games'],
+                     'games': len(events), 'drafting': drv.in_flight()['games'], 'pending_events': st['parked'],
+                     'matches_queued': r.get('queued', 0) + len(co.to_queue),
+                     'matches_in_flight': r.get('in_flight', 0), 'matches_done': r.get('done', 0), 'time': now}
+                if rsp is not None:
+                    p['matches_remote'] = rsp.progress()
+                _write_json(prog, p)
 
         def on_resolver(drv):
             add('r', drv.take_samples())
@@ -501,6 +568,14 @@ class CoRun:
                 ws[k] = writers[k].close()
             except NonFinite as e:
                 raise NonFinite(f'{self.label(k)}: {e}') from e
+        rem = None
+        if rsp is not None:
+            _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
+            try:
+                rem = rsp.end(it)                  # at most selfplay_remote_wait s
+            except NonFinite as e:
+                raise NonFinite(f'{self.label("r")}: {e}') from e
+        rrows = co.take_remote_rows()
         _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
         secs = time.time() - t0
         pst, rst = pdrv.stats(), rdrv.stats()
@@ -528,13 +603,19 @@ class CoRun:
         mr = summary(matches, rst, rst0, rev, ws['r'], tstats['r'], R)
         mp['rolling']['in_flight'] = pdrv.in_flight()['games']
         mr['rolling']['in_flight'] = rdrv.in_flight()['games']
-        mp['cotrain'] = {'events': len(events), 'episodes': len(matches), 'episodes_per_h': len(matches) / max(secs, 1e-9) * 3600,
+        nep = len(matches) + len(rrows)
+        mp['cotrain'] = {'events': len(events), 'episodes': nep, 'episodes_per_h': nep / max(secs, 1e-9) * 3600,
                          'pending_events': pst['parked'], 'episodes_queued': rst['queued'] + len(co.to_queue),
                          'episodes_waiting': co.outstanding,
                          'parked_mb_max': round(max(state['parked_max'], pst['parked_bytes']) / 1e6, 3),
                          'event_latency_s': [round(float(lat[:, 0].mean()), 3), round(float(lat[:, 0].max()), 3)] if len(lat) else None,
                          'resolve_delay_ms': [round(float(lat[:, 1].mean()) * 1e3, 2), round(float(lat[:, 1].max()) * 1e3, 2)] if len(lat) else None,
                          'backpressure_s': round(co.waited, 2), 'pending_max': pending_max, 'resolver_conc': rconc}
+        if rem is not None:
+            mp['cotrain']['episodes_remote'] = len(rrows)
+            mp['cotrain']['duplicates_dropped'] = co.dup_dropped - dup0
+            mr['remote'] = rem
+            R.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
         return mp, mr
 
     def label(self, k):
@@ -544,7 +625,8 @@ class CoRun:
     def train(self, it, sp_p, sp_r):
         """Both networks, then the guard on both checkpoints and optimizer states, then both saves."""
         out = {}
-        for k, X, n in (('p', self.P, sp_p['samples']), ('r', self.R, sp_r['samples'])):
+        n_r = sp_r['samples'] + sp_r.get('remote', {}).get('samples', 0)
+        for k, X, n in (('p', self.P, sp_p['samples']), ('r', self.R, n_r)):
             try:
                 out[k] = X.train_model(it, n)
             except NonFinite as e:
@@ -597,6 +679,22 @@ class CoRun:
             rdone = {m['iter'] for m in read_metrics(R.run)}
             R.remote.backfill(start if start in rdone else start - 1)
             R.log(f'evaluations on the remote {rc["eval_remote"]!r} ({R.remote.spec["host"]}, mirror {R.remote.rdir})')
+        if rc.get('selfplay_remote'):
+            # a share of the resolver's queued episodes on a remote (zero.remoteplay, docs/az.md 11.6)
+            from .remoteplay import RemotePlay
+            R.rsp = RemotePlay(R, rc['selfplay_remote'], mode='matches',
+                               mirror=os.path.basename(os.path.normpath(run)) + '.resolver')
+            R.log(f'episodes also on the remote {rc["selfplay_remote"]!r} ({R.rsp.spec["host"]}, {R.rsp.procs} '
+                  f'worker(s), mirror {R.rsp.rdir})')
+        try:
+            self._iterations(start)
+        finally:
+            if R.rsp is not None:
+                R.rsp.close()
+
+    def _iterations(self, start):
+        c, run = self.cfg, self.run
+        P, R = self.P, self.R
         if any(start not in {m['iter'] for m in read_metrics(X.run)} for X in (P, R)):
             if os.path.exists(P.partial_path(start)) or os.path.exists(R.partial_path(start)):
                 self.log(f'iter {start}: finishing its evaluations (interrupted)')
@@ -621,6 +719,8 @@ class CoRun:
                      'resumed_seconds': time.time() - t0}
                 _write_json(X.partial_path(it), m)
             self.finish_iter(it, time.time())
+        if R.rsp is not None:
+            R.rsp.close()                          # no more self-play: the remote's workers quit
         if R.remote is not None and not os.path.exists(stop):
             _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
             R.remote.drain(check=lambda: self.check('remote evaluations'))

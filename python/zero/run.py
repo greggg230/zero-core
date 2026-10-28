@@ -23,6 +23,11 @@ iteration's self-play ends when --games games have FINISHED (docs/search.md 2.6)
 --resolver <game>: a co-training run (zero/cotrain.py, docs/az.md 11): this run's game ends at
 deferred terminals whose results come from episodes of the resolver game, played by a second
 network trained in the same run (<run>/resolver/); --resolver-cfg holds its settings.
+
+--selfplay-remote <name>: another machine (a remote of the game package) self-plays too, with the
+same checkpoint, while this one plays its quota; its shards come back into data/iter_i/
+(zero/remoteplay.py, docs/az.md 5.3). A co-training run: the resolver's --resolver-cfg
+'{"selfplay_remote": ...}' (the remote plays a share of the queued episodes, 11.6).
 """
 import argparse
 import glob
@@ -105,6 +110,13 @@ DEFAULTS = dict(
     # evaluation on another machine (a name in the game package's `remotes`, 'local' for tests;
     # '' = here): the loop queues each evaluated checkpoint and keeps training (zero.remote)
     eval_remote='',
+    # self-play on another machine too (a name in the game package's `remotes`, 'local' for tests;
+    # '' = off; zero.remoteplay, docs/az.md 5.3): it plays with the same checkpoint while this one
+    # plays its quota, its shards join data/iter_i/; worker processes there (0 = the remote's
+    # `procs`), seconds the end of a phase waits for its last shards, and (co-training: the
+    # resolver's setting) seconds of a worker's running time after which an episode it has not
+    # finished is requeued here
+    selfplay_remote='', selfplay_remote_procs=0, selfplay_remote_wait=30.0, selfplay_remote_timeout=3600.0,
     infer_device='cpu', train_device='cpu', seed=0,
     # network batches evaluated concurrently on this many Python threads (CPU: small networks
     # whose ops cannot keep the cores busy; give the driver as many `groups`); 1 = inline
@@ -247,6 +259,7 @@ class Run:
         self.info = G.info(cfg['game'])
         self.yard = cfg['yardstick']
         self.remote = None                         # zero.remote.RemoteEval when eval_remote is set
+        self.rsp = None                            # zero.remoteplay.RemotePlay when selfplay_remote is set
         self.roll = None                           # rolling driver + its evaluator
         self.roll_ev = None
 
@@ -323,6 +336,8 @@ class Run:
         state = {'n': 0, 't': time.time()}
         prog = os.path.join(self.run, 'progress.json')
         tstats = TargetStats()
+        if self.rsp is not None:
+            self.rsp.begin(it)                     # the remote self-plays with the same checkpoint
 
         def take():
             s = drv.take_samples()
@@ -336,12 +351,18 @@ class Run:
                 results.extend(drv.take_results())
             if time.time() - state['t'] > 2:
                 state['t'] = time.time()
-                _write_json(prog, {'iter': it, 'phase': 'selfplay', 'games': len(results), 'target': c['games'],
-                                   'time': time.time()})
+                p = {'iter': it, 'phase': 'selfplay', 'games': len(results), 'target': c['games'], 'time': time.time()}
+                if self.rsp is not None:
+                    p['remote'] = self.rsp.progress()
+                _write_json(prog, p)
         drive(drv, {'m': ev}, check=lambda: self.check('self-play'), on_batch=on_batch)
         take()
         results.extend(drv.take_results())
         ws = writer.close()
+        rem = None
+        if self.rsp is not None:
+            _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
+            rem = self.rsp.end(it)                 # at most selfplay_remote_wait s
         _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
         st = drv.stats()
         secs = time.time() - t0
@@ -364,6 +385,9 @@ class Run:
             out['rolling'] = {'in_flight': inf['games'], 'restarts': st['restarts'] - st0['restarts'],
                               'restart_sims': st['restart_sims'] - st0['restart_sims'],
                               'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves']}
+        if rem is not None:
+            out['remote'] = rem
+            self.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
         return out
 
     # ---------------------------------------------------------------- training
@@ -724,6 +748,20 @@ class Run:
             self.remote = RemoteEval(self, c['eval_remote'])
             self.remote.backfill(start if start in done else start - 1)
             self.log(f'evaluations on the remote {c["eval_remote"]!r} ({self.remote.spec["host"]})')
+        if c.get('selfplay_remote'):
+            from .remoteplay import RemotePlay
+            self.rsp = RemotePlay(self, c['selfplay_remote'])
+            self.log(f'self-play also on the remote {c["selfplay_remote"]!r} ({self.rsp.spec["host"]}, '
+                     f'{self.rsp.procs} worker(s), mirror {self.rsp.rdir})')
+        try:
+            self._iterations(start, done)
+        finally:
+            if self.rsp is not None:
+                self.rsp.close()
+
+    def _iterations(self, start, done):
+        c = self.cfg
+        run = self.run
         if start not in done:                      # iteration 0, or a checkpoint whose evaluation was interrupted
             t0 = time.time()
             m = {'iter': start}
@@ -742,12 +780,14 @@ class Run:
             sp = self.selfplay(it)
             self.log(f'iter {it} selfplay: {_fmt(sp)}')
             t1 = time.time()
-            tr = self.train(it, sp['samples'])
+            tr = self.train(it, sp['samples'] + sp.get('remote', {}).get('samples', 0))
             self.log(f'iter {it} train: {_fmt(tr)}')
             m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': t1 - t0, 'train_s': time.time() - t1},
                  'resumed_seconds': 0}
             _write_json(self.partial_path(it), dict(m, resumed_seconds=time.time() - t0))
             self.finish_iter(it, m, t0)
+        if self.rsp is not None:
+            self.rsp.close()                       # no more self-play: the remote's workers quit
         if self.remote is not None and not os.path.exists(stop):
             _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
             self.remote.drain()
@@ -756,6 +796,20 @@ class Run:
 
 def _fmt(d):
     return json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in d.items()})
+
+
+def _fmt_remote(r):
+    """The remote's share of a self-play phase in one log line."""
+    s = (f"{r['workers']} worker(s), {r['games']} games, {r['samples']} samples in {r['shards']} shards "
+         f"({r['bytes'] / 1e6:.1f} MB), {r['leaves_per_s']:.0f} leaves/s ({r['leaves_per_running_s']:.0f} running), "
+         f"{r['seconds']:.0f}s ({r['backoff_s']:.0f}s backing off), waited {r['wait_s']:.1f}s")
+    if 'matches' in r:
+        s += (f"; matches {r['matches']} back, {r['assigned']} assigned, {r['outstanding']} outstanding, "
+              f"{r['requeued']} + {r['requeued_timeout']} requeued, {r['duplicates_dropped']} duplicates dropped")
+    for k in ('late', 'late_prev', 'rejected', 'quarantined', 'fetch_failed', 'session_errors'):
+        if r.get(k):
+            s += f', {k} {r[k]}'
+    return s
 
 
 def _write_json(path, obj):
