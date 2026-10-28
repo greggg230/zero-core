@@ -224,6 +224,46 @@ def test_backs_off_while_an_evaluation_holds_its_lock(tmp_path):
     assert 'backing off:' in wl and '.eval.lock is held' in wl and 'continuing after' in wl
 
 
+BACKGROUND = textwrap.dedent('''
+    from zero import package
+    import zero.run as R
+    package.active().remotes['local'] = {'selfplay': {'backoff': 'background'}}
+    R.cli()
+''')
+
+
+def test_background_backoff(tmp_path):
+    """The remote's `selfplay.backoff` 'background': on macOS the worker plays on under the Darwin
+    background policy while the lock is held (its games go on; its running time stops); elsewhere
+    (no such policy) it stops as 'stop' does."""
+    wd = tmp_path / 'mirror'
+    lock = wd / '.eval.lock'
+    lock.mkdir(parents=True)
+    holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
+    (lock / 'owner').write_text(f'{holder.pid} {time.time()}')
+    script = tmp_path / 'bg.py'
+    script.write_text(BACKGROUND)
+    run = tmp_path / 'bg'
+    try:
+        p = subprocess.run([sys.executable, str(script), '--run', str(run), '--preset', 'toy-smoke', '--iters', '3',
+                            '--conc', '64', '--games', '1500', '--eval-games', '8', '--eval-random-games', '4',
+                            '--elo-games', '4', '--ref-games', '8', '--selfplay-remote', 'local'], cwd=ROOT,
+                           capture_output=True, text=True, timeout=600,
+                           env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH, **env_for(tmp_path)))
+    finally:
+        holder.kill()
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert json.load(open(wd / 'bg' / 'selfplay.json'))['backoff'] == 'background'
+    rem = [r['selfplay']['remote'] for r in read_metrics(str(run))[1:]]
+    wl = (wd / 'bg' / 'w00.log').read_text(encoding='utf-8')
+    if sys.platform == 'darwin':
+        assert 'playing on in the background' in wl and 'background policy not' not in wl, wl
+        assert rem[-1]['games'] > 0 and rem[-1]['backoff_s'] > 0, rem
+    else:
+        assert 'backing off:' in wl and 'playing on in the background' not in wl
+        assert sum(r['games'] for r in rem) == 0, rem
+
+
 def test_pause_mid_phase_then_resume(tmp_path):
     """PAUSE while the remote plays: the run exits 75 and its worker with it; the restart replays
     the iteration (its data directory cleared: no shard of the old session in it) with a new

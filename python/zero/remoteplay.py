@@ -13,7 +13,10 @@ episode it has not finished is requeued here). A co-training run: `resolver_cfg[
 The remote spec's optional `selfplay` dict: {workdir (default the remote's `workdir`; the
 environment's ZERO_SELFPLAY_WORKDIR overrides it), procs (default 1), nice (the workers'
 niceness, default 0), locks ([lock directories]: a worker backs off while one is held by a live
-process; the remote's own `<workdir>/.eval.lock` always: remote evaluation comes first),
+process; the remote's own `<workdir>/.eval.lock` always: remote evaluation comes first), backoff
+('stop', the default: no leaf batches while a lock is held; 'background': macOS only, the worker
+plays on under the Darwin background policy - the lowest CPU band, the efficiency cores - and
+leaves it once the lock is gone; elsewhere 'stop'),
 overrides (run settings for the workers: concurrency, threads, groups, inference; the shards
 default to at most 8192 rows), env}.
 
@@ -253,6 +256,9 @@ class RemotePlay:
         self.overrides = dict(sp.get('overrides') or {})
         self.locks = [self.spec['workdir'].rstrip('/\\') + '/.eval.lock'] + list(sp.get('locks') or [])
         self.nice = int(sp.get('nice', 0))
+        self.backoff = sp.get('backoff', 'stop')
+        if self.backoff not in ('stop', 'background'):
+            raise SystemExit(f"selfplay_remote {name!r}: backoff {self.backoff!r}: 'stop' or 'background'")
         pkg = package.active()
         self.module = f'{pkg.name}.az.remote' if pkg.name != 'zero' else 'zero.remote'
         self.run_id = f'{socket.gethostname()}:{os.path.abspath(R.run)}'
@@ -366,8 +372,9 @@ class RemotePlay:
             live = [s for s in self.sess if s is not None and s.alive()]
             st = [s.status for s in live if s.status]
             back = any(x.get('backoff') for x in st)
-            state = ('backing off' if back else 'playing') if any(x.get('phase') for x in st) else \
-                ('idle' if live else ('connecting' if any(s is not None for s in self.sess) else 'offline'))
+            bg = any(x.get('background') for x in st)
+            state = ('background' if bg else 'backing off' if back else 'playing') if any(x.get('phase') for x in st) \
+                else ('idle' if live else ('connecting' if any(s is not None for s in self.sess) else 'offline'))
             out = {'host': self.name, 'workers': len(live), 'state': state,
                    'games': sum(x.get('games', 0) for x in st), 'in_flight': sum(x.get('in_flight', 0) for x in st),
                    'samples': self.cur['rows'] if self.cur else 0, 'shards': self.cur['accepted'] if self.cur else 0}
@@ -506,7 +513,7 @@ class RemotePlay:
             test = json.loads(os.environ.get('ZERO_RSP_TEST') or '{}')
         except ValueError:
             test = {}
-        spj = {'mode': self.mode, 'locks': self.locks, 'nice': self.nice, 'run_id': self.run_id,
+        spj = {'mode': self.mode, 'locks': self.locks, 'nice': self.nice, 'backoff': self.backoff, 'run_id': self.run_id,
                'workdir': self.workdir, 'mirror': self.mirror, 'watchdog_s': WATCHDOG_S, 'test': test}
         for name, obj in (('config.json', cfg), ('selfplay.json', spj)):
             tmp = os.path.join(self.R.run, f'.remote_selfplay_{name}')
@@ -769,6 +776,9 @@ class Worker:
         self.sid = '%04x' % random.SystemRandom().getrandbits(16)
         self.prefix = f'm{k:02d}-{self.sid}'
         self.locks = list(self.sp.get('locks') or [])
+        # 'background': play on under the Darwin background policy while a lock is held (macOS);
+        # elsewhere, or if the policy cannot be set, 'stop'
+        self.bg_mode = self.sp.get('backoff') == 'background' and hasattr(os, 'PRIO_DARWIN_BG')
         self.watchdog_s = float(self.sp.get('watchdog_s', WATCHDOG_S))
         self.status_s = float(self.test.get('status_s', STATUS_S))
         self.slot = os.path.join(rdir, f'.w{k:02d}.lock')
@@ -1020,7 +1030,17 @@ class Worker:
         self.emit('status', phase=ph['it'], games=ph['games'], samples=ph['samples'], leaves=st['leaves'] - ph['leaves0'],
                   in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
                   active_s=round(self.active_s + (now - ph['t0']) - bo, 1), phase_s=round(now - ph['t0'], 1),
-                  backoff=backoff)
+                  backoff=backoff or ph.get('bg'), background=bool(ph.get('bg')))
+
+    def _background(self, on):
+        """The Darwin background policy for the whole process (its Rust and torch threads too):
+        the lowest CPU band, the efficiency cores. -> True if it was set / cleared."""
+        try:
+            os.setpriority(os.PRIO_DARWIN_PROCESS, 0, os.PRIO_DARWIN_BG if on else 0)
+            return True
+        except (AttributeError, OSError) as e:
+            self.note(f'background policy not {"set" if on else "cleared"}: {e}')
+            return False
 
     def _backoff(self, ph):
         now = _now()
@@ -1028,7 +1048,25 @@ class Worker:
             return
         ph['t_lock'] = now
         why = lock_held(self.locks)
+        if ph.get('bg'):                           # in the background: leave it once the lock is gone
+            if not why:
+                self._background(False)
+                took = now - ph['bo_t0']
+                ph['backoff'] += took
+                ph['bo_t0'] = 0.0
+                ph['bg'] = None
+                self.note(f'out of the background after {took:.0f}s')
+                self._busy(True)
+                self._status(ph, force=True)
+            return
         if not why:
+            return
+        if self.bg_mode and self._background(True):
+            self.note(f'{why} is held: playing on in the background (efficiency cores, lowest priority)')
+            self._busy(False)
+            ph['bo_t0'] = now
+            ph['bg'] = why
+            self._status(ph, force=True, backoff=why)
             return
         self.note(f'backing off: {why} is held')
         self._busy(False)
@@ -1112,6 +1150,11 @@ class Worker:
                 self._end_phase(ph)
             self._status(ph)
         pump()
+        if ph.get('bg'):
+            self._background(False)
+            ph['backoff'] += _now() - ph['bo_t0']
+            ph['bo_t0'] = 0.0
+            ph['bg'] = None
         w = bw.close()
         st = drv.stats()
         now = _now()
@@ -1122,7 +1165,7 @@ class Worker:
                   leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - ph['backoff'], 2),
                   backoff_s=round(ph['backoff'], 2), in_flight=drv.in_flight()['games'], queued=drv.queued)
         self.note(f'phase {it}: {ph["games"]} games, {ph["samples"]} samples in {w["shards"]} shards '
-                  f'({w["bytes"] / 1e6:.1f} MB), {(st["leaves"] - ph["leaves0"]) / max(secs - ph["backoff"], 1e-9):.0f} '
+                  f'({w["bytes"] / 1e6:.1f} MB), {(st["leaves"] - ph["leaves0"]) / max(secs - ph["backoff"], 1.0):.0f} '
                   f'leaves/s running, {secs:.0f}s ({ph["backoff"]:.0f}s backing off)')
 
     def main(self):
