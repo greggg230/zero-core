@@ -307,8 +307,8 @@ co-training run gives its resolver's queued episodes to the remote instead (11.6
   `selfplay_remote_wait` s (default 30) after the phase; a remote that is asleep, unreachable,
   slow or backing off leaves an iteration that is exactly a local one. Training's steps follow the
   new samples of both (`new samples x reuse / batch`): more samples per iteration, more steps.
-* **Sessions** (local side, `RemotePlay`: a manager thread, a fetch thread, three pipe threads per
-  session; the main thread only calls `begin(it)` and `end(it)`): `procs` persistent worker
+* **Sessions** (local side, `RemotePlay`: a manager thread, a fetch thread per worker, three pipe
+  threads per session; the main thread only calls `begin(it)` and `end(it)`): `procs` persistent worker
   processes on the remote, each a session `ssh host 'cd repo && <env> exec python -m
   <pkg>.az.remote selfplay MIRROR K'` (BatchMode, ConnectTimeout 20, ServerAliveInterval 15 x 4;
   'local': a subprocess). The worker's stdin is the control channel (JSON lines: `phase`, `end`,
@@ -339,9 +339,9 @@ co-training run gives its resolver's queued episodes to the remote instead (11.6
   `data.savez_level`: MTG's sparse features ~58x, so a remote's samples cross a slow link), each
   announced on stdout as soon as it is written.
 * **Arrival**: fetch threads (one per worker) copy each announced shard of the running phase under a
-  temporary name (`*.tmp.npz`: never a loadable shard name), checks it - **the non-finite
-  guard** (4.1) and the run's game / features / actions - and renames it into `data/iter_i/`
-  beside the run's own `c00` / `r00` shards, then tells the worker to delete its copy. Only
+  temporary name (`*.tmp.npz`: never a loadable shard name), check it - **the non-finite guard**
+  (4.1) and the run's game / features / actions - and rename it into `data/iter_i/` beside the
+  run's own `c00` / `r00` shards, then tell the worker to delete its copy. Only
   while phase i accepts: a shard announced or still in flight after `end(it)`'s deadline is
   dropped (`late`, or `late_prev` when it was announced after the phase closed), never moved
   into another iteration. **Staleness: same checkpoint only** - a shard of phase i holds what the
