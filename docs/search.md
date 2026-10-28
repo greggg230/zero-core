@@ -58,6 +58,7 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn encode(&self, viewer: usize, out: &mut [f32]);               // out is zeroed by the caller
     fn rounds(&self) -> u32 { 0 }                                   // reports
     fn minor_decision(&self) -> bool { false }                      // the pending decision is minor (sims_minor)
+    fn sims_divisor(&self) -> u32 { 1 }                             // the pending decision's simulations divided
     fn deferred(&self) -> bool { false }                            // over, the result from outside (1.1)
     fn deferred_payload(&self) -> Result<String, String> { Ok(String::new()) } // what decides it (JSON)
     fn resolve(&mut self, results: &str) -> Result<(), String> { Err(..) }     // the outside's results
@@ -88,6 +89,14 @@ Changes from the original sketch (Caverna Zero DESIGN.md 5), and why:
   Games that do not implement it (every game but MTG) are unaffected, as are seats without the
   setting (`driver::tests::minor_decisions_get_their_own_budget_and_no_records`: the golden
   records are unchanged).
+* `sims_divisor` (2026-10-27, MTG Zero M6 part 3): a lighter class of decisions. Every network
+  seat (self-play or evaluation) searches the pending decision with its drawn budget (`sims`,
+  `sims_fast` or `sims_minor`) divided by it, at least one simulation; the decision is recorded
+  as usual (a full search stays a sample). MTG Zero's `team_draft` returns its spec's
+  `build_sims_div` (2 in its run presets) during deckbuilding: picks at 64 / 16, deckbuilding
+  at 32 / 8 (its DESIGN.md 2.3.9). Default 1: every game but `team_draft` is unaffected
+  (`driver::tests::light_decisions_divide_the_simulations_and_are_recorded`: the golden records
+  with divisor 1).
 * `deferred`, `deferred_payload`, `resolve`, `team_size` (2026-10-27, MTG Zero M6 part 2:
   section 1.1). Games that do not implement them (every game but MTG Zero's `team_draft` and the
   core's `toy_team`) are unaffected: the golden records are unchanged, and a single-game run
@@ -324,7 +333,8 @@ resolver driver is one (docs/az.md 11): it plays the episodes of parked games, t
 * **Per decision**: single-option decisions are not searched; playout cap (`p_full` share
   gets `sims` and is recorded, the rest `sims_fast`; a minor decision of a self-play seat with
   `sims_minor` gets `sims_minor` and is never recorded, the playout-cap draw being made all the
-  same); root Dirichlet noise on full self-play
+  same; the budget is then divided by the game's `sims_divisor`, at least one); root Dirichlet
+  noise on full self-play
   searches (also on a reused, already expanded root); self-play samples moves by visit count
   for the first `temp_moves` searched decisions of the game, otherwise (and in evaluation)
   argmax (N, P0) with the first maximum on ties; tree reuse: after a real move the tree

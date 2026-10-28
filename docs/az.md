@@ -238,7 +238,10 @@ one, losses, self-play average score, leaves/s, minutes per iteration by phase; 
 table of the newest checkpoint with the Elo prediction; iteration table; log and supervisor
 tails. With no runs it shows how to start one. Endpoints: `GET /api/runs`,
 `GET /api/run/<name>`, `GET /api/run/<name>/control`, `POST /api/run/<name>/pause|resume`
-(JSON body required; only plain names of run directories under `--runs`).
+(JSON body required; only plain names of run directories under `--runs`). A co-training run
+(section 11.3a): a tab per network (`/api/run/<name>` adds `resolver`: its config, metrics, Elo),
+the co-training progress and tiles; a run whose metrics hold `extras` (`GamePackage.evals`):
+an "Other yardsticks" chart. Single-game runs render as before.
 
 ## 6. Learning: the toy proof run (Glass Road Zero 2026-10-11; Caverna Zero 2026-10-10)
 
@@ -476,6 +479,16 @@ Every feature outside the segments and bags is a global. The network:
   is worse: every search is then a tie and the search's tie rule (the first maximum) plays the
   first option, PASS (mtg2n: 3 self-play games finished in 15 minutes). MTG's token run uses
   seed 1.
+* **Actions by identity** (`id_actions`, 2026-10-27, MTG Zero M6 part 3): a segment with
+  `id_actions: base` (and an identity) also scores the action base + each present slot's
+  identity, one more pointer column per segment: in MTG Zero's team draft a card's pick, or
+  putting it in the deck, is its identity wherever the card sits (layout `draft_v1`: the pack's
+  and the pool's slots, base 0). Its range [base, base + vocab) may hold no slot action of the
+  layout; two segments may share it (their identities are distinct within a row; were one
+  repeated, one of its tokens would score it). Layouts without the key build exactly the
+  network they did (no identity column; the normalised layout stored in a checkpoint keeps no
+  `id_actions` key): MTG Zero's runs/mtg5 checkpoints load and play identically
+  (`check_checkpoint_compat`, its ENGINE.md 45).
 * `widen`: new actions get zero generic weights, new features (after the old ones) are new
   globals with zero weights; the layout stays. Not in `zero.webexport`. CUDA: float32 eager
   (no autocast, no CUDA graphs; not measured: the GPU was busy).
@@ -483,7 +496,8 @@ Every feature outside the segments and bags is a global. The network:
 Tests: `tests/test_net_data.py` (masking of absent slots, chunking / batch independence, the
 pointer logits land on the slot actions, identity digits, save / load / widen, a training step
 reaches every part, layout validation, the toy's layout `package.TOY_TOKENS` through the
-evaluator), `tests/test_loop.py` (the loop with arch 'tokens' on the toy).
+evaluator, actions by identity: the logits, the validation, save / load / widen),
+`tests/test_loop.py` (the loop with arch 'tokens' on the toy).
 
 ### 10.1 CPU cost (MTG, 13,532 features; desktop 2026-10-22, the GPU busy with other runs)
 
@@ -619,6 +633,32 @@ the payload's `"episodes"` list and send `[{"result": [...], "scores": [...]}, .
   fresh primary network and a fresh resolver network, or `resolver_init`.
 * **NonFinite names the network** (`primary net (<game>): ...`, `resolver net (<game>): ...`);
   quarantined shards and failing batches go to `<run>/debug/` or `<run>/resolver/debug/`.
+
+### 11.3a The pieces MTG Zero's part 3 added (2026-10-27, MTG Zero M6 part 3, its ENGINE.md 45)
+
+* **The game package's glue** in use: `GamePackage.deferred['team_draft']` (mtgz/az/drafted.py)
+  maps an event's payload to `mtg` specs (the drafted decks, the rest of the pools as
+  sideboards, the real first picks, what each player knows is elsewhere, the match seed) and the
+  matches' rows back, refusing a malformed result (ValueError: the coordinator's thread raises
+  it on the main thread, the run aborts).
+* **`SearchGame::sims_divisor`** (docs/search.md 1): `team_draft`'s deckbuilding at half a pick's
+  simulations.
+* **`TokenNet` actions by identity** (layout key `id_actions`, section 10): a segment's slot
+  scores the action base + its identity (the team draft's pick, or putting a card in the deck,
+  is the card's identity wherever it sits); layouts and checkpoints without the key are
+  unchanged (MTG Zero: runs/mtg5's checkpoints play identically, `check_checkpoint_compat`).
+* **`GamePackage.evals`**: a checkpoint's other yardsticks (game -> {name: fn(run, it) -> dict
+  or None}), run on every evaluated iteration after the matches (`Run.extra_evals`, also for a
+  co-training run's primary) and logged under `extras.<name>` in metrics.jsonl; measuring only.
+  MTG Zero: the draft network's top-1 agreement with held-out human picks.
+* **The dashboard** (section 5.1): a co-training run shows a tab per network (the primary's
+  metrics at the run root, the resolver's from `<run>/resolver/`, each with its Elo chart, win
+  rates, head-to-head table, losses and throughput), the co-training progress line (events
+  resolved of the target, drafting, waiting for their matches, matches queued, in flight and
+  done), tiles for the other network's Elo, matches per hour and the event latency, the primary's
+  `eval_yard_net` in its win-rate chart, and an "Other yardsticks" chart of `extras`. A
+  single-game run renders exactly as before (checked: the same page DOM for a copy of MTG
+  Zero's runs/mtg5 with the old and the new dashboard).
 
 ### 11.4 Measured (desktop, 2026-10-27, other projects' runs on the machine)
 
