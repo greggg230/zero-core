@@ -367,6 +367,11 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
         slot.full = false;
         slot.target = seat.sims_minor;
     }
+    // a lighter decision class (`SearchGame::sims_divisor`): the drawn budget divided
+    let div = game.sims_divisor();
+    if div > 1 {
+        slot.target = slot.target.map(|t| (t / div).max(1));
+    }
     match slot.trees[p].as_mut() {
         None => {
             let mut t = slot.spare.pop().unwrap_or_default();

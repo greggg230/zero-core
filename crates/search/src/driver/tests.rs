@@ -398,6 +398,95 @@ fn minor_decisions_get_their_own_budget_and_no_records() {
     assert!(Driver::<MinorToy>::new(cfg(vec![with_minor(nn(0, 8, true), Some(0))], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_err());
 }
 
+/// The toy whose two-option decisions are light (`SearchGame::sims_divisor` 4).
+#[derive(Clone)]
+struct DivToy(ToyGame, u32);
+
+impl SearchGame for DivToy {
+    type Spec = <ToyGame as SearchGame>::Spec;
+    const NAME: &'static str = "divtoy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    fn parse_spec(json: &str) -> Result<Self::Spec, String> {
+        ToyGame::parse_spec(json)
+    }
+    fn new_game(spec: &Self::Spec, players: usize, seed: u64) -> Result<Self, String> {
+        ToyGame::new_game(spec, players, seed).map(|g| DivToy(g, DIV.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+    fn num_players(&self) -> usize {
+        self.0.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)
+    }
+    fn force_chance(&mut self, forced: &[u64]) {
+        self.0.force_chance(forced)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.0.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.0.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn sims_divisor(&self) -> u32 {
+        let mut v = Vec::new();
+        self.0.legal_actions(&mut v);
+        if v.len() == 2 {
+            self.1
+        } else {
+            1
+        }
+    }
+}
+
+/// The divisor of `DivToy`'s two-option decisions, read by its new games (only the test below
+/// plays `DivToy`, one driver at a time).
+static DIV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+#[test]
+fn light_decisions_divide_the_simulations_and_are_recorded() {
+    let go = |div: u32, seat: SeatCfg| {
+        DIV.store(div, std::sync::atomic::Ordering::Relaxed);
+        let mut c = cfg(vec![seat], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+        c.seed = 2026;
+        c.threads = 1;
+        let mut d = Driver::<DivToy>::new(c).unwrap();
+        let (r, s) = run(&mut d);
+        (r, s, d.stats())
+    };
+    // divisor 1: the toy's golden self-play records
+    let (_, recs, st1) = go(1, nn(0, 16, true));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    // divisor 4: two-option decisions searched with a quarter of the simulations, still recorded
+    let (res, recs4, st4) = go(4, nn(0, 16, true));
+    assert_eq!(res.len(), 24);
+    assert!(res.iter().all(|r| r.over));
+    assert!(recs4.iter().any(|r| r.opts.len() == 2), "light decisions are recorded");
+    assert!(st4.leaves < st1.leaves, "{} leaves with divisor 4 vs {}", st4.leaves, st1.leaves);
+    assert!(st4.sims < st1.sims);
+    // evaluation seats too
+    let (_, _, e1) = go(1, nn(0, 16, false));
+    let (_, _, e4) = go(4, nn(0, 16, false));
+    assert!(e4.sims < e1.sims);
+}
+
 /// The toy with an engine bug: game `PANIC_GID` of a driver seeded `PANIC_SEED` panics at its
 /// `PANIC_STEP`-th transition (a real move or one inside a search simulation), after sleeping
 /// the spec's milliseconds (the spec is that number: a delay makes the caller wait for the

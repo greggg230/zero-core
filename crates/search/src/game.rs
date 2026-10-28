@@ -79,6 +79,14 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn minor_decision(&self) -> bool {
         false
     }
+    /// The pending decision is searched with the seat's simulations (`sims`, `sims_fast` or
+    /// `sims_minor`, as drawn) divided by this, at least one: a lighter class of decisions,
+    /// recorded as usual (MTG Zero's `team_draft`: deckbuilding at half a pick's simulations,
+    /// its DESIGN.md 2.3.9). Every network seat, self-play or evaluation (docs/search.md 3).
+    /// Default 1: every decision gets the seat's budget.
+    fn sims_divisor(&self) -> u32 {
+        1
+    }
     /// The game is over (`to_move()` None) but its result comes from outside: episodes of
     /// another game decide it (docs/search.md 1.1). Until `resolve`, the search treats this
     /// terminal as a leaf the network evaluates and the driver parks the game; nothing calls
