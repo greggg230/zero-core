@@ -744,3 +744,222 @@ fn without_redet_the_belief_deals_the_decisions_one_world_again() {
     }
     assert!(hits > 195, "{hits} of 200 worlds dealt the believed card");
 }
+
+// ------------------------------------------------------------------ the Gumbel root search
+
+/// The visit counts sequential halving leaves on `m` considered options after `n` walks of its
+/// schedule (walk j raises one option holding `seq[j]` walks), sorted, largest first.
+fn halving_counts(m: u32, n: u32) -> Vec<u32> {
+    let mut c = vec![0u32; m as usize];
+    for v in gumbel_sequence(m, n) {
+        let i = c.iter().position(|&x| x == v).expect("the schedule asks for a count no option holds");
+        c[i] += 1;
+    }
+    c.sort_unstable_by(|a, b| b.cmp(a));
+    c
+}
+
+#[test]
+fn gumbel_sequence_is_mctxs() {
+    // mctx get_sequence_of_considered_visits (seq_halving.py), worked by hand
+    assert_eq!(gumbel_sequence(4, 8), vec![0, 0, 0, 0, 1, 1, 2, 2]);
+    assert_eq!(gumbel_sequence(2, 8), vec![0, 0, 1, 1, 2, 2, 3, 3]);
+    assert_eq!(gumbel_sequence(3, 7), vec![0, 0, 0, 1, 1, 2, 2]);
+    assert_eq!(gumbel_sequence(1, 4), vec![0, 1, 2, 3]);
+    assert_eq!(gumbel_sequence(0, 3), vec![0, 1, 2]);
+    assert_eq!(gumbel_sequence(16, 4), vec![0; 4]);
+    assert!(gumbel_sequence(5, 0).is_empty());
+    for (m, n) in [(16, 64), (16, 63), (4, 63), (2, 63), (5, 16), (16, 15), (7, 200)] {
+        assert_eq!(gumbel_sequence(m, n).len(), n as usize);
+    }
+    // 16 options, 64 walks: rounds of 1, 2, 4, 8 walks per option on 16, 8, 4, 2 options
+    let mut want = vec![15, 15, 7, 7, 3, 3, 3, 3];
+    want.extend([1; 8]);
+    assert_eq!(halving_counts(16, 64), want);
+    // 2 options (the mulligan): 63 walks split 32 / 31
+    assert_eq!(halving_counts(2, 63), vec![32, 31]);
+}
+
+/// A Gumbel search of `sims` simulations (a fresh root: `sims - 1` root walks).
+fn gumbel_tree(g: &ToyGame, sims: usize, m: u32, noise: &[f64], seed: u64) -> Tree<ToyGame> {
+    let mut rng = Rng::new(seed);
+    let p = g.to_move().unwrap();
+    let mut t = Tree::new(g, p, &legal_of(g), true, &mut rng);
+    t.set_gumbel(m, sims as u32 - 1, noise, 50.0, 0.3);
+    search(&mut t, g, sims, &mut rng, &W);
+    t
+}
+
+#[test]
+fn gumbel_root_walks_follow_sequential_halving() {
+    // toy roots of 3-12 options, 64 simulations, m 4 and 16: the root's walks are exactly the
+    // schedule's counts (the first round on the top options by g + ln P0: the Gumbel-top-k sample),
+    // the move is the best score among the most walked options, and nothing but the root changed
+    // (the tree's own walks below it are PUCT's)
+    let mut rng = Rng::new(5);
+    let mut checked = 0;
+    for s in 0..60u64 {
+        let g = mid_game(300 + s, 4 + (s as usize % 40));
+        if g.over || legal_of(&g).len() < 3 {
+            continue;
+        }
+        let k = legal_of(&g).len();
+        for m in [4u32, 16] {
+            let noise: Vec<f64> = (0..k).map(|_| crate::noise::gumbel(&mut rng)).collect();
+            let t = gumbel_tree(&g, 64, m, &noise, s);
+            let r = t.root;
+            let nv = t.visits(r);
+            assert_eq!(t.gumbel_visits(), nv.as_slice(), "a fresh root: every visit is this search's");
+            assert_eq!(nv.iter().sum::<u32>(), 63);
+            let c = m.min(k as u32);
+            let mut sorted = nv.clone();
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            assert_eq!(sorted[..c as usize], halving_counts(c, 63)[..], "m {m}, {k} options: {nv:?}");
+            assert!(sorted[c as usize..].iter().all(|&x| x == 0));
+            // the considered options: the top c by g + ln P0
+            let p0 = t.priors0(r);
+            let mut by: Vec<usize> = (0..k).collect();
+            by.sort_by(|&a, &b| (noise[b] + (p0[b] as f64).ln()).partial_cmp(&(noise[a] + (p0[a] as f64).ln())).unwrap());
+            let mut top: Vec<usize> = by[..c as usize].to_vec();
+            top.sort_unstable();
+            let visited: Vec<usize> = (0..k).filter(|&i| nv[i] > 0).collect();
+            assert_eq!(visited, top, "m {m}: the first round visits the Gumbel-top-{c}");
+            // the move: the best g + completed-Q logit among the most walked
+            let lg = completed_q_logits(&p0, &nv, &t.values(r), t.value0(r), 50.0, 0.3);
+            let mx = *nv.iter().max().unwrap();
+            let a = t.gumbel_choose().unwrap();
+            assert_eq!(nv[a], mx);
+            assert!((0..k).filter(|&i| nv[i] == mx).all(|i| lg[i] + noise[i] <= lg[a] + noise[a]));
+            // the root value: the improved policy's over the walked options
+            let pi = completed_q_policy(&p0, &nv, &t.values(r), t.value0(r), 50.0, 0.3);
+            let q = t.gumbel_q().unwrap();
+            let gw = t.gumbel_win();
+            let tot: f64 = (0..k).filter(|&i| nv[i] > 0).map(|i| pi[i] as f64).sum();
+            for j in 0..2 {
+                let want: f64 = (0..k).filter(|&i| nv[i] > 0).map(|i| pi[i] as f64 * gw[i][j] / nv[i] as f64).sum::<f64>() / tot;
+                assert!((q[j] - want).abs() < 1e-6, "q {q:?} want {want}");
+            }
+            assert!((q[0] + q[1] - 1.0).abs() < 1e-6, "{q:?}");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 30, "{checked} roots");
+}
+
+#[test]
+fn gumbel_off_changes_no_walk_and_reuse_budgets_this_search() {
+    // clear_gumbel (and never setting it) is the tree of before; advance and reset turn it off
+    let mut checked = 0;
+    for s in 0..12u64 {
+        let g = mid_game(500 + s, 8 + s as usize);
+        if g.over {
+            continue;
+        }
+        let p = g.to_move().unwrap();
+        let (mut ra, mut rb) = (Rng::new(s), Rng::new(s));
+        let mut a = Tree::new(&g, p, &legal_of(&g), true, &mut ra);
+        let mut b = Tree::new(&g, p, &legal_of(&g), true, &mut rb);
+        b.set_gumbel(16, 79, &[], 50.0, 1.0);
+        b.clear_gumbel();
+        search(&mut a, &g, 80, &mut ra, &W);
+        search(&mut b, &g, 80, &mut rb, &W);
+        assert_eq!((a.visits(a.root), a.values(a.root), a.win(a.root)), (b.visits(b.root), b.values(b.root), b.win(b.root)));
+        assert!(!b.gumbel_on() && b.gumbel_choose().is_none() && b.gumbel_q().is_none());
+        checked += 1;
+    }
+    assert!(checked > 5);
+    // a reused root: its earlier visits stay (Q, sigma) and the schedule counts this search's walks
+    let mut rng = Rng::new(77);
+    let mut reused = 0;
+    for s in 0..80u64 {
+        let g = mid_game(700 + s, 3 + (s as usize % 30));
+        if g.over || legal_of(&g).len() < 2 {
+            continue;
+        }
+        let mut t = gumbel_tree(&g, 64, 16, &[], s);
+        let (r, nv) = (t.root, t.visits(t.root));
+        let i = t.gumbel_choose().unwrap();
+        let a = legal_of(&g)[i];
+        // the same seat deciding again after the move, with the child's chance key
+        for (key, kid) in t.kids(r, i) {
+            if t.player(kid) != t.viewer || !t.expanded(kid) || t.acts(kid).len() < 2 {
+                continue;
+            }
+            let (pl, acts) = (t.player(kid), t.acts(kid).to_vec());
+            assert!(t.advance(a, &key, pl, &acts));
+            assert!(!t.gumbel_on(), "advance turns the Gumbel search off");
+            let before = t.visits(t.root);
+            assert!(before.iter().sum::<u32>() > 0);
+            // replay the game to the child: the toy's step with the key forced
+            let mut h = g.clone();
+            let mut keys = Vec::new();
+            let mut legal = Vec::new();
+            crate::tree::transition(&mut h, a, Some(&key), &mut keys, &mut legal).unwrap();
+            if keys != key || h.to_move() != Some(pl) || legal != acts {
+                break;
+            }
+            t.set_gumbel(16, 32, &[], 50.0, 0.3);
+            search(&mut t, &h, 32, &mut rng, &W);
+            let after = t.visits(t.root);
+            let gv = t.gumbel_visits().to_vec();
+            assert_eq!(gv.iter().sum::<u32>(), 32, "an expanded root: every simulation is a root walk");
+            for j in 0..after.len() {
+                assert_eq!(after[j], before[j] + gv[j]);
+            }
+            let c = 16.min(acts.len() as u32);
+            let mut sorted = gv.clone();
+            sorted.sort_unstable_by(|x, y| y.cmp(x));
+            assert_eq!(sorted[..c as usize], halving_counts(c, 32)[..]);
+            reused += 1;
+            break;
+        }
+        let _ = nv;
+    }
+    assert!(reused >= 3, "{reused} reused roots");
+    let g = mid_game(3, 10);
+    let mut t = gumbel_tree(&g, 20, 4, &[], 1);
+    assert!(t.gumbel_on());
+    t.reset(&g, g.to_move().unwrap(), &legal_of(&g), true, &mut rng);
+    assert!(!t.gumbel_on());
+}
+
+#[test]
+fn gumbel_measures_the_starved_mulligan() {
+    // the keep-or-mulligan root at 64 simulations, KEEP's prior 0.999: PUCT never visits MULL; the
+    // Gumbel root (2 options <= m) walks both, 32 / 31, so Q decides: with sigma (50 + 32) x 1.0, a
+    // bad hand's +0.16 outweighs the log-prior gap ln 999 = 6.9 - the move and the 'cq' target go to
+    // MULL - and a good hand's -0.14 keeps; at c_scale 0.3 (24.6 logits per unit of Q) neither moves:
+    // the Delver line's scale needs a Q gap of 0.28 against this prior
+    let (i_keep, i_mull) = (KEEP as usize, MULL as usize);
+    for seed in 0..6u64 {
+        for (h0, h1) in [(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
+            for cs in [1.0, 0.3] {
+                let g = Mull::with_hands(h0, h1, seed);
+                let mut rng = Rng::new(seed);
+                let mut t = Tree::new(&g, 0, &[KEEP, MULL], true, &mut rng);
+                t.set_gumbel(16, 63, &[], 50.0, cs);
+                mull_search(&mut t, &g, 64, &mut rng);
+                let r = t.root;
+                let mut nv = t.visits(r);
+                nv.sort_unstable();
+                assert_eq!(nv, vec![31, 32]);
+                let q = |i: usize| t.w_of(r, i) / t.n_of(r, i) as f64;
+                let cq = t.cq_target(r, 50.0, cs);
+                let mv = t.gumbel_choose().unwrap();
+                if h0 == 0 && cs == 1.0 {
+                    assert!(q(i_mull) > q(i_keep) + 0.08);
+                    assert!(cq[i_mull] > 0.9 && mv == i_mull, "a bad hand: {cq:?}, move {mv}");
+                } else {
+                    assert!(mv == i_keep, "hands {h0} {h1}, c_scale {cs}: move {mv}, cq {cq:?}");
+                }
+                if h0 == 1 {
+                    // a good hand: pi' is all KEEP, so the root value is KEEP's (the raw root mean mixes
+                    // 31 MULL walks in)
+                    let w = t.gumbel_q().unwrap();
+                    assert!((w[0] - q(i_keep)).abs() < 1e-4, "{} vs {}", w[0], q(i_keep));
+                    assert!(t.win(r).unwrap()[0] < w[0] - 0.04);
+                }
+            }
+        }
+    }
+}

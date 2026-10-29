@@ -19,7 +19,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
 use zero_search::{SearchGame, MAX_SEATS};
 
@@ -77,6 +77,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(root_floor_of, m)?)?;
     m.add_function(wrap_pyfunction!(view_pick_of, m)?)?;
     m.add_function(wrap_pyfunction!(belief_weight_of, m)?)?;
+    m.add_function(wrap_pyfunction!(gumbel_sequence_of, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
     m.add("BELIEF_CLIP", BELIEF_CLIP)?;
     Ok(())
@@ -144,7 +145,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -189,6 +190,15 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
             return Err(PyValueError::new_err(format!("{k}: a setting of select 'cq' ('visits' has no completed-Q transform)")));
         }
     }
+    // the root search: 'puct' (default) | 'gumbel' with its settings (docs/search.md 3.7; sigma's
+    // transform absent: the seat's cq_c_visit, cq_c_scale)
+    let root_search: String = get(d, "root_search", "puct".to_string())?;
+    for k in ["gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale"] {
+        if root_search != "gumbel" && matches!(d.get_item(k)?, Some(v) if !v.is_none()) {
+            return Err(PyValueError::new_err(format!("{k}: a setting of root_search 'gumbel'")));
+        }
+    }
+    let root_search = RootSearch::parse(&root_search, get(d, "gumbel_m", 16u32)?, get(d, "gumbel_scale", 1.0f64)?, get(d, "gumbel_c_visit", cq_c_visit)?, get(d, "gumbel_c_scale", cq_c_scale)?).map_err(verr)?;
     Ok(SeatCfg::Nn(NnSeat {
         key,
         sims: get(d, "sims", 100u32)?,
@@ -226,6 +236,7 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         belief_clip: get(d, "belief_clip", BELIEF_CLIP)?,
         belief_mix: get(d, "belief_mix", 0.0f64)?,
         belief_fast: flag(d, "belief_fast", false)?,
+        root_search,
     }))
 }
 
@@ -265,6 +276,15 @@ fn view_pick_of(seed: u64, gid: u32, decision: u32, share: f64) -> bool {
 #[pyo3(name = "belief_weight")]
 fn belief_weight_of(pred: f64, uniform: f64, tilt: f64, clip: f64) -> f64 {
     zero_search::belief_weight(pred, uniform, tilt, clip)
+}
+
+/// Sequential halving's schedule (`tree::gumbel_sequence`, docs/search.md 3.7): per root walk of a
+/// search of `n` root walks over `m` considered options, the visits (of that search) an option needs
+/// to be taken.
+#[pyfunction]
+#[pyo3(name = "gumbel_sequence")]
+fn gumbel_sequence_of(m: u32, n: u32) -> Vec<u32> {
+    zero_search::tree::gumbel_sequence(m, n)
 }
 
 /// Registered game names.
@@ -558,6 +578,47 @@ impl PySearchTree {
     /// The root's search win vector without the forced walks (None: no other backup).
     fn root_win_pruned(&self) -> Option<Vec<f64>> {
         self.t.root_win_pruned()
+    }
+    /// The Gumbel root search from now on (docs/search.md 3.7): sequential halving over `min(m,
+    /// options)` root options for `budget` root walks, `noise` the Gumbel noise per root option
+    /// (None or []: none), sigma's completed-Q transform `c_visit` / `c_scale`. Off: `clear_gumbel`.
+    #[pyo3(signature = (m=16, budget=64, noise=None, c_visit=50.0, c_scale=1.0))]
+    fn set_gumbel(&mut self, m: u32, budget: u32, noise: Option<Vec<f64>>, c_visit: f64, c_scale: f64) -> PyResult<()> {
+        self.t.set_gumbel(m, budget, &noise.unwrap_or_default(), c_visit, c_scale).map_err(verr)
+    }
+    fn clear_gumbel(&mut self) {
+        self.t.clear_gumbel()
+    }
+    #[getter]
+    fn gumbel_on(&self) -> bool {
+        self.t.gumbel_on()
+    }
+    /// The Gumbel search's move (an option index; None when it is off): the driver's own code.
+    fn gumbel_choose(&self) -> Option<usize> {
+        self.t.gumbel_choose()
+    }
+    /// The Gumbel search's root value: the improved policy's win vector over the options this search
+    /// walked (absolute seats; None before any walk or when off).
+    fn gumbel_q(&self) -> Option<Vec<f64>> {
+        self.t.gumbel_q()
+    }
+    /// Per root option: this Gumbel search's walks ([] when off).
+    #[getter]
+    fn gumbel_visits(&self) -> Vec<u32> {
+        self.t.gumbel_visits()
+    }
+    #[getter]
+    fn gumbel_noise(&self) -> Vec<f64> {
+        self.t.gumbel_noise()
+    }
+    #[getter]
+    fn gumbel_schedule(&self) -> Vec<u32> {
+        self.t.gumbel_schedule()
+    }
+    /// Per root option: the win vectors this Gumbel search's walks backed up, summed ([] when off).
+    #[getter]
+    fn gumbel_win(&self) -> Vec<Vec<f64>> {
+        self.t.gumbel_win()
     }
     /// Children of root option i: [(chance key, decider)].
     fn edge_kids(&self, i: usize) -> Vec<(Vec<u64>, usize)> {

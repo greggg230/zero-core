@@ -25,6 +25,12 @@
   card) dealing their worlds: the mean visit distributions, completed-Q targets and root win agree at
   the noise floor (Python vs Python), the believed card's share of the leaves' worlds is the deal's
   in both, and the searches differ from the uniform deal's of the same positions (a power check).
+* `gumbel`: the Gumbel root search (docs/search.md 3.7) - positions searched by both trees with the
+  same Gumbel noise per repetition (only the trees' determinization / chance streams differ): the
+  mean visit distributions, the mean walks of the searches themselves, the completed-Q targets, the
+  moves (`gumbel_choose`) and the root values (`gumbel_q`) agree at the noise floor (Python vs
+  Python with the same noise); `gumbel_formula`: the Python `gumbel_choose` / `gumbel_q` / next
+  root walk on Rust roots' statistics against the Rust tree's own, exactly.
 * `h2h`: games between a Rust-tree seat and a Python-tree seat (`play.PyDriver`, seats
   alternating), both searching with the same network and settings (and move rule): ~50% within
   error.
@@ -34,6 +40,7 @@
   python -m zero.parity forced [--k 4 --sims 96 --reps 24]         (root minimum visits)
   python -m zero.parity root_view [--sims 96 --reps 24]            (root-view leaf values)
   python -m zero.parity belief [--sims 96 --reps 24 --tilt 1]       (the root's belief)
+  python -m zero.parity gumbel [--sims 64 --reps 32 --m 16 --scale 1]  (the Gumbel root search)
   python -m zero.parity h2h --model runs/toy1/models/iter_0010.pt [--games 2000 --sims 32 --select cq]
   (or python -m <pkg>.az.parity ... in a game repo)
 """
@@ -75,18 +82,21 @@ class LinearEval:
 
 
 def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0,
-              root_view=False, belief=None, worlds=None):
+              root_view=False, belief=None, worlds=None, gumbel=None):
     """-> (root visits, root win[, completed-Q target with cq = (c_visit, c_scale)][, the tree]);
     `root_min`: the root minimum visits of the search (docs/search.md 3.5; 0 = off); `root_view`:
     another seat's leaves take their value from the viewer's features (docs/search.md 3.6); `belief` =
     (predictions, tilt, clip, mix): the root's belief dealing the worlds (docs/search.md 3.8); `worlds`:
     a list that gets each leaf's world's auxiliary targets for the viewer (`Game.aux_target`) when the
-    leaf is in the root's round."""
+    leaf is in the root's round; `gumbel` = (m, noise, c_visit, c_scale): a Gumbel root search (docs/search.md
+    3.7; the schedule of `sims` simulations, as the driver's: a fresh root's walks are its first sims - 1)."""
     rng = random.Random(seed)
     t = mcts.Tree(g, redet, rng)
     t.set_root_min(root_min)
     if belief is not None:
         t.set_belief((np.asarray(belief[0], np.float32), belief[1], belief[2]), belief[3], g, rng)
+    if gumbel is not None:
+        t.set_gumbel(gumbel[0], sims, gumbel[1], gumbel[2], gumbel[3])
     for _ in range(sims):
         r = mcts.simulate(t, rng, c_puct, chance_k)
         if r is None:
@@ -107,12 +117,14 @@ def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
 
 
 def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0,
-              root_view=False, belief=None):
-    """`search_py` with the Rust tree (`<package>._engine.SearchTree`)."""
+              root_view=False, belief=None, gumbel=None):
+    """`search_py` with the Rust tree (`<package>._engine.SearchTree`; `gumbel`: as there)."""
     t = g.search_tree(redet, seed)
     t.set_root_min(root_min)
     if belief is not None:
         t.set_belief(np.asarray(belief[0], np.float32), g, belief[1], belief[2], belief[3])
+    if gumbel is not None:
+        t.set_gumbel(gumbel[0], sims, list(gumbel[1]), gumbel[2], gumbel[3])
     for _ in range(sims):
         r = t.simulate(g, c_puct, chance_k, root_view=True) if root_view else t.simulate(g, c_puct, chance_k)
         if r is None:
@@ -378,6 +390,117 @@ def belief(n=8, sims=96, reps=24, seed=0, scale=0.15, cq=(50.0, 1.0), tilt=1.0, 
                                                               'clip': clip, 'mix': mix}
 
 
+def gumbel(game='toy', n=10, sims=64, reps=32, m=16, scale=1.0, seed=0, ev_scale=0.15, cq=(50.0, 0.3), eps=None,
+           verbose=False, m_rs=None):
+    """The Gumbel root search in both trees (docs/search.md 3.7): positions of random play, the
+    stand-in `LinearEval` (`eps`: its lopsided `SkewEval`), repetition r of every tree with the same
+    Gumbel noise (`scale` x Gumbel(0, 1) per root option from seed r), sigma's transform `cq`. -> dict:
+    TVs Rust-Python and Python-Python (another tree stream, the same noise) of the mean root visit
+    distributions (`tv_*`), of the mean walks of the searches (`tv_walks_*`), of the mean completed-Q
+    targets (`tv_cq_*`) and of the move distributions (`tv_move_*`), |Rust - Python| of the decider's
+    mean root value (`gumbel_q`, `q_diff`), the share of repetitions whose moves agree (`agree_*`);
+    `budget_ok`: every search walked exactly sims - 1 root walks over min(m, options) options. `m_rs`:
+    another m for the Rust tree (a power check)."""
+    info = engine().game_info_of(game)
+    ev = LinearEval(info['num_features'], info['num_actions'], seed=1, scale=ev_scale)
+    if eps is not None:
+        ev = SkewEval(ev, eps)
+    names = ('tv', 'tv_walks', 'tv_cq', 'tv_move')
+    res = {f'{a}_{b}': [] for a in names for b in ('rs_py', 'py_py')}
+    res.update(q_diff=[], agree_rs_py=[], agree_py_py=[])
+    ok = True
+    for i, g in enumerate(sample_positions(game, n, seed)):
+        k = len(g.legal())
+        noise = [list(scale * np.random.default_rng(10_000 + r).gumbel(size=k)) for r in range(reps)]
+
+        def runs(fn, base, mm):
+            out = []
+            for r in range(reps):
+                nv, w, c, t = fn(g, ev, sims, base + r, cq=cq, tree=True, gumbel=(mm, noise[r], *cq))
+                if fn is search_rs:
+                    walks, mv, q = np.asarray(t.gumbel_visits, float), t.gumbel_choose(), t.gumbel_q()
+                else:
+                    walks, mv, q = np.asarray(t.gumbel.n, float), mcts.gumbel_choose(t), mcts.gumbel_q(t)
+                out.append((nv, walks, c, mv, q))
+            return out
+        rs = runs(search_rs, 1000, m if m_rs is None else m_rs)
+        pa = runs(search_py, 2000, m)
+        pb = runs(search_py, 3000, m)
+        for s_ in (rs, pa, pb):
+            ok &= all(x[1].sum() == sims - 1 and (x[1] > 0).sum() == min(m, k, sims - 1) for x in s_) or s_ is rs and m_rs
+        for name, idx in (('tv', 0), ('tv_walks', 1), ('tv_cq', 2)):
+            mr, ma, mb = (np.mean([x[idx] for x in s_], 0) for s_ in (rs, pa, pb))
+            res[f'{name}_rs_py'].append(tv(mr, ma))
+            res[f'{name}_py_py'].append(tv(ma, mb))
+        mr, ma, mb = (np.bincount([x[3] for x in s_], minlength=k).astype(float) for s_ in (rs, pa, pb))
+        res['tv_move_rs_py'].append(tv(mr, ma))
+        res['tv_move_py_py'].append(tv(ma, mb))
+        res['agree_rs_py'].append(float(np.mean([a[3] == b[3] for a, b in zip(rs, pa)])))
+        res['agree_py_py'].append(float(np.mean([a[3] == b[3] for a, b in zip(pb, pa)])))
+        p = g.to_move
+        res['q_diff'].append(abs(np.mean([x[4][p] for x in rs]) - np.mean([x[4][p] for x in pa])))
+        if verbose:
+            print(f'position {i}: {k} options, TV rs-py {res["tv_rs_py"][-1]:.4f} (py-py {res["tv_py_py"][-1]:.4f}), '
+                  f'walks {res["tv_walks_rs_py"][-1]:.4f} ({res["tv_walks_py_py"][-1]:.4f}), cq '
+                  f'{res["tv_cq_rs_py"][-1]:.4f} ({res["tv_cq_py_py"][-1]:.4f}), moves {res["tv_move_rs_py"][-1]:.3f} '
+                  f'({res["tv_move_py_py"][-1]:.3f}), agree {res["agree_rs_py"][-1]:.2f} ({res["agree_py_py"][-1]:.2f}), '
+                  f'q diff {res["q_diff"][-1]:.4f}', flush=True)
+    return {kk: float(np.mean(v)) for kk, v in res.items()} | {'budget_ok': bool(ok), 'positions': n, 'sims': sims,
+                                                                 'reps': reps, 'm': m, 'scale': scale, 'cq': list(cq)}
+
+
+def gumbel_formula(game='toy', n=8, sims=(2, 5, 17, 64), ms=(1, 2, 4, 16), seed=0, scale=0.15, eps=1e-9):
+    """The Python Gumbel formulas (`mcts.gumbel_choose`, `gumbel_q`, `gumbel_select`) on Rust roots'
+    statistics (P0, N, W, network value, the search's walks, win sums, noise, schedule) against the
+    Rust tree's move and root value - and the next root walk: the Rust tree's next simulation's root
+    option (its path, `edge_outs` / visits) - exactly but on near-ties. -> {checked, agree, near_ties,
+    q_max_diff, mismatches}."""
+    info = engine().game_info_of(game)
+    ev = LinearEval(info['num_features'], info['num_actions'], seed=1, scale=scale)
+    out = {'checked': 0, 'agree': 0, 'near_ties': 0, 'q_max_diff': 0.0, 'mismatches': []}
+    for k, g in enumerate(sample_positions(game, n, seed)):
+        for ns in sims:
+            for m in ms:
+                noise = list(np.random.default_rng(31 * k + ns + m).gumbel(size=len(g.legal())))
+                *_, t = search_rs(g, ev, ns, 900 + 31 * k + ns, tree=True, gumbel=(m, noise, 50.0, 0.3))
+                # a Python tree holding the Rust root's statistics
+                pt = mcts.Tree(g, True, random.Random(0))
+                r = pt.root
+                r.expand(t.root_priors0, [0.0] * g.n_players, g.n_players)
+                r.Nv, r.W = list(t.root_visits), list(t.root_values)
+                r.vec = [0.0] * g.n_players
+                r.vec[r.player] = t.root_value0
+                pt.set_gumbel(m, ns, noise, 50.0, 0.3)
+                pt.gumbel.n = list(t.gumbel_visits)
+                pt.gumbel.win = [list(w) for w in t.gumbel_win]
+                pt.gumbel.walks = sum(pt.gumbel.n)
+                out['checked'] += 2
+                py, rs = mcts.gumbel_choose(pt), t.gumbel_choose()
+                qp, qr = mcts.gumbel_q(pt), t.gumbel_q()
+                if (qp is None) != (qr is None):
+                    out['mismatches'].append({'position': k, 'sims': ns, 'm': m, 'q': [qp, qr]})
+                    continue
+                if qp is not None:
+                    out['q_max_diff'] = max(out['q_max_diff'], float(np.abs(np.asarray(qp) - np.asarray(qr)).max()))
+                # the next root walk: the Python rule on these statistics vs the option the Rust tree's next
+                # simulation takes (its walks per option before and after)
+                nxt = mcts.gumbel_select(pt)
+                before = list(t.gumbel_visits)
+                leaf = t.simulate(g, 1.0)
+                if leaf is not None:
+                    t.expand(*ev(leaf[1], leaf[2], g.n_players))
+                took = [i for i, (a, b) in enumerate(zip(before, t.gumbel_visits)) if b != a]
+                sc = mcts.gumbel_scores(pt)
+                for what, a, b in (('move', py, rs), ('walk', nxt, took[0] if took else -1)):
+                    if a == b:
+                        out['agree'] += 1
+                    elif b >= 0 and abs(sc[a] - sc[b]) < eps:
+                        out['near_ties'] += 1
+                    else:
+                        out['mismatches'].append({'position': k, 'sims': ns, 'm': m, what: [a, b]})
+    return out
+
+
 def cq_formula(game='toy', n=8, sims=64, seed=0, cq_settings=((50.0, 1.0), (50.0, 0.1), (10.0, 3.0)), scale=0.15):
     """The Python `completed_q_policy` on Rust roots' statistics (P0, N, W, network value) vs
     the Rust tree's own target. -> max |difference|."""
@@ -501,6 +624,15 @@ def main(argv=None):
     rv.add_argument('--positions', type=int, default=10)
     rv.add_argument('--sims', type=int, default=96)
     rv.add_argument('--reps', type=int, default=24)
+    gp = sub.add_parser('gumbel')
+    gp.add_argument('--game', default='toy')
+    gp.add_argument('--positions', type=int, default=10)
+    gp.add_argument('--sims', type=int, default=64)
+    gp.add_argument('--reps', type=int, default=32)
+    gp.add_argument('--m', type=int, default=16)
+    gp.add_argument('--scale', type=float, default=1.0, help='the Gumbel noise scale (0: none)')
+    gp.add_argument('--eps', type=float, default=None, help="a lopsided prior (SkewEval's eps)")
+    gp.add_argument('--cq-c-scale', type=float, default=0.3)
     a = ap.parse_args(argv)
     if a.cmd == 'positions':
         print(json.dumps(positions(a.game, n=a.positions, sims=a.sims, reps=a.reps, chance_k=a.chance_k,
@@ -513,6 +645,10 @@ def main(argv=None):
                                 verbose=True)))
     elif a.cmd == 'root_view':
         print(json.dumps(root_view(a.game, n=a.positions, sims=a.sims, reps=a.reps, verbose=True)))
+    elif a.cmd == 'gumbel':
+        print(json.dumps(gumbel(a.game, n=a.positions, sims=a.sims, reps=a.reps, m=a.m, scale=a.scale, eps=a.eps,
+                                cq=(50.0, a.cq_c_scale), verbose=True)))
+        print(json.dumps(gumbel_formula(a.game)))
     elif a.cmd == 'forced':
         print(json.dumps(forced(a.game, n=a.positions, sims=a.sims, reps=a.reps, k=a.k, eps=a.eps,
                                 cq=(50.0, a.cq_c_scale), verbose=True)))

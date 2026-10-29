@@ -28,6 +28,14 @@ The root's belief (docs/search.md 3.8): each side deals its search's worlds as i
 with a tilt needs a checkpoint with the auxiliary head (refused before the match: net.HeadMissing).
 `A A --a-belief-tilt 1 --b-belief-tilt 0` is the evaluation-only A/B of the belief on one checkpoint.
 Each side's rule name carries it ('-b1', 'select_a').
+Root search (docs/search.md 3.7): each side searches as its checkpoint's run's evaluation does
+(eval_root_search, whatever --select says: a run trained and evaluated with the Gumbel root search
+plays its side with it), or --a-root-search / --b-root-search puct | gumbel. A Gumbel side's sigma is
+its 'cq' rule's transform when it has one (the --*-cq-c-* flags, or its run's), else its run's
+evaluation transform (eval_select_c_* / cq_c_*); its considered options --gumbel-m (default: its
+run's gumbel_m, 16) and its noise --a-gumbel-scale / --b-gumbel-scale (default: its run's
+eval_gumbel_scale, 0 = none). The side's move rule is then the Gumbel search's (`select_*`:
+'gumbel-m16-v50-s0.3').
 """
 import argparse
 import json
@@ -37,9 +45,41 @@ import time
 
 from . import games as G, package
 from .infer import NetEvaluator, drive
-from .mcts import (belief_settings, belief_tag, check_belief, check_select, check_select_transform, forced_tag,
-                   select_settings, select_tag, select_transform, view_tag)
+from .mcts import (belief_settings, belief_tag, check_belief, check_root_search, check_select, check_select_transform,
+                   forced_tag, gumbel_tag, select_settings, select_tag, select_transform, view_tag)
 from .net import check_belief_head, load
+
+
+def run_config(ckpt):
+    """The config.json of a checkpoint runs/<run>/models/<file>.pt's run ({} without one)."""
+    d = os.path.dirname(os.path.dirname(os.path.abspath(ckpt)))
+    try:
+        with open(os.path.join(d, 'config.json'), encoding='utf-8') as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return c if isinstance(c, dict) else {}
+
+
+def root_keys(ckpt, keys, root=None, m=None, scale=None):
+    """A side's seat settings `keys` with its root search (docs/search.md 3.7): `root` 'puct' | 'gumbel'
+    (None: its checkpoint's run's eval_root_search). A Gumbel side: gumbel_m `m` (None: its run's, 16),
+    noise scale `scale` (None: its run's eval_gumbel_scale, 0), sigma = its 'cq' rule's transform in
+    `keys` (cq_c_visit / cq_c_scale) when it has one, else its run's evaluation transform."""
+    c = run_config(ckpt)
+    root = root or c.get('eval_root_search', 'puct')
+    keys = {k: v for k, v in keys.items() if not (k == 'root_search' or k.startswith('gumbel_'))}
+    if root == 'puct':
+        return keys
+    m = int(c.get('gumbel_m', 16) if m is None else m)
+    scale = float(c.get('eval_gumbel_scale', 0.0) if scale is None else scale)
+    check_root_search(root, m, scale, what='--root-search')
+    if keys.get('select', 'visits') == 'cq':
+        cv, cs = keys['cq_c_visit'], keys['cq_c_scale']
+    else:
+        _, _, cv, cs = select_settings(c, 'eval_select')
+    return dict(keys, root_search='gumbel', gumbel_m=m, gumbel_scale=scale, gumbel_c_visit=float(cv),
+                gumbel_c_scale=float(cs))
 
 
 def run_rule(ckpt):
@@ -47,8 +87,9 @@ def run_rule(ckpt):
     and the rule's completed-Q transform, `mcts.select_settings`; {} = the default) for a
     checkpoint runs/<run>/models/<file>.pt. An evaluation seat has no 'cq' target, so the rule's
     transform goes in as cq_c_visit / cq_c_scale (as `games.nn_seat` writes it). The run's
-    evaluation root minimum visits (eval_root_min_visits, docs/search.md 3.5) and leaf values' view
-    (eval_leaf_value_view, docs/search.md 3.6) come with it."""
+    evaluation root minimum visits (eval_root_min_visits, docs/search.md 3.5), leaf values' view
+    (eval_leaf_value_view, docs/search.md 3.6) and root search (eval_root_search, `root_keys`,
+    docs/search.md 3.7) come with it."""
     d = os.path.dirname(os.path.dirname(os.path.abspath(ckpt)))
     try:
         with open(os.path.join(d, 'config.json'), encoding='utf-8') as f:
@@ -67,9 +108,9 @@ def run_rule(ckpt):
     if tilt:
         out.update(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast)
     if c.get('eval_select', 'visits') == 'visits':
-        return out
+        return root_keys(ckpt, out)
     rule, mv, cv, cs = select_settings(c, 'eval_select')
-    return dict({'select': rule, 'select_min_visits': mv, 'cq_c_visit': cv, 'cq_c_scale': cs}, **out)
+    return root_keys(ckpt, dict({'select': rule, 'select_min_visits': mv, 'cq_c_visit': cv, 'cq_c_scale': cs}, **out))
 
 
 def rule_keys(select=None, min_visits=0, c_visit=50.0, c_scale=1.0):
@@ -102,6 +143,10 @@ def side_keys(ckpt, select=None, min_visits=0, c_visit=None, c_scale=None):
 
 
 def _tag(seat):
+    if seat.get('root_search', 'puct') == 'gumbel':
+        return gumbel_tag(seat.get('gumbel_m', 16), seat.get('gumbel_c_visit', 50.0), seat.get('gumbel_c_scale', 1.0),
+                          seat.get('gumbel_scale', 1.0)) + view_tag(seat.get('leaf_value_view', 'mover')) + belief_tag(
+            seat.get('belief_tilt', 0.0), seat.get('belief_clip'), seat.get('belief_mix', 0.0), seat.get('belief_fast', False))
     cv, cs = select_transform(seat.get('cq_c_visit', 50.0), seat.get('cq_c_scale', 1.0), seat.get('select_c_visit'),
                               seat.get('select_c_scale'))
     return select_tag(seat.get('select', 'visits'), seat.get('select_min_visits', 0), cv, cs) + forced_tag(
@@ -217,6 +262,14 @@ def main(argv=None):
         ap.add_argument(f'--{side}-belief-mix', type=float, default=None)
         ap.add_argument(f'--{side}-belief-fast', type=int, default=None, choices=[0, 1])
     ap.add_argument('--torch-threads', type=int, default=1, help='torch intra-op threads (default 1)')
+    for side in ('a', 'b'):
+        ap.add_argument(f'--{side}-root-search', default=None, choices=['puct', 'gumbel'],
+                        help=f"side {side.upper()}'s root search (docs/search.md 3.7; default: its checkpoint's run's "
+                             f"eval_root_search)")
+        ap.add_argument(f'--{side}-gumbel-scale', type=float, default=None,
+                        help=f"side {side.upper()}'s Gumbel noise scale (default: its run's eval_gumbel_scale, 0)")
+    ap.add_argument('--gumbel-m', type=int, default=None,
+                    help="a Gumbel side's considered options (default: its run's gumbel_m, 16)")
     a = ap.parse_args(argv)
     import torch
     torch.set_num_threads(max(1, a.torch_threads))
@@ -256,6 +309,14 @@ def main(argv=None):
                  for s, k, ckpt in zip(('a', 'b'), sides, (a.a, a.b))]
     except ValueError as e:
         ap.error(str(e))
+    for k, (side, ckpt) in enumerate((('a', a.a), ('b', a.b))):
+        try:
+            sides[k] = root_keys(ckpt, sides[k], getattr(a, f'{side}_root_search'), a.gumbel_m,
+                                 getattr(a, f'{side}_gumbel_scale'))
+        except ValueError as e:
+            ap.error(f'side {side.upper()}: {e}')
+        if getattr(a, f'{side}_gumbel_scale') is not None and sides[k].get('root_search') != 'gumbel':
+            ap.error(f"--{side}-gumbel-scale: side {side.upper()} searches with PUCT")
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
                            spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log)), flush=True)
 

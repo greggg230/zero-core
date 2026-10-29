@@ -177,6 +177,20 @@ DEFAULTS = dict(
     # change: the Elo pool's name gets '-b<tilt>...'). Needs the auxiliary head (a checkpoint without it
     # is refused: net.HeadMissing). 0 = off (the default: today's searches, bit for bit)
     selfplay_belief_tilt=0.0, eval_belief_tilt=0.0, belief_clip=20.0, belief_mix=0.0, belief_fast=0,
+    # the root search (docs/search.md 3.7, docs/az.md 19): 'puct' (the default: today's searches, bit
+    # for bit) | 'gumbel' = Gumbel AlphaZero's root (Danihelka et al. 2022) - Gumbel noise per root
+    # option and sequential halving over the gumbel_m options of highest noise + log-prior, the
+    # completed-Q sigma of the 'cq' target; the move is the halving's winner (it replaces root Dirichlet
+    # noise, temperature sampling and the move rule *_select; PUCT stays below the root). Every search
+    # of the seat is one (full, fast, minor). selfplay_root_search: self-play's seat (needs
+    # policy_target 'cq': the target shares its sigma, cq_c_visit / cq_c_scale); its first temp_moves
+    # searched decisions of a game get noise of scale selfplay_gumbel_scale (1 = sampling from the
+    # improved policy, the paper's), later ones none. eval_root_search: every evaluation seat (sigma =
+    # the evaluation rule's transform, eval_select_c_* else cq_c_*; noise eval_gumbel_scale, 0 =
+    # deterministic, the default) - its moves change, so its Elo pool is 'gumbel-m<m>...'. Exclusive with
+    # the root minimum visits of the same side (sequential halving already visits every considered option)
+    selfplay_root_search='puct', eval_root_search='puct', gumbel_m=16, selfplay_gumbel_scale=1.0,
+    eval_gumbel_scale=0.0,
     # the game spec of every match that records nothing (vs the yardstick, vs random, Elo, the
     # reference games); '' = the game package's evaluation spec for the self-play spec
     # (GamePackage.eval_specs; MTG: a fixed deck set, self-play random decks), else the spec
@@ -429,14 +443,18 @@ class Run:
                              root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4),
                              leaf_value_view=c.get('selfplay_leaf_value_view', 'mover'),
                              view_samples=c.get('selfplay_view_samples', 0.0),
-                             view_sample_target=c.get('view_sample_target', 'next_q'), **belief_keys(c, 'selfplay'))
+                             view_sample_target=c.get('view_sample_target', 'next_q'),
+                             root_search=c.get('selfplay_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
+                             gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), **belief_keys(c, 'selfplay'))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
                          select_c_visit=c.get('eval_select_c_visit'), select_c_scale=c.get('eval_select_c_scale'),
                          root_min_visits=c.get('eval_root_min_visits', 0),
                          root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4),
-                         leaf_value_view=c.get('eval_leaf_value_view', 'mover'), **belief_keys(c, 'eval'))
+                         leaf_value_view=c.get('eval_leaf_value_view', 'mover'),
+                         root_search=c.get('eval_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
+                         gumbel_scale=c.get('eval_gumbel_scale', 0.0), **belief_keys(c, 'eval'))
 
     def check_belief_heads(self, path):
         """With a root belief on (selfplay_ / eval_belief_tilt > 0, docs/az.md 18) the checkpoint at
@@ -1468,6 +1486,20 @@ def check_eval_settings(cfg, where=''):
             check_belief(tilt, clip, mix, what=f'{pre}_belief_tilt')
     except ValueError as e:
         raise SystemExit(f'{where}{e}') from None
+    from .mcts import check_root_search
+    for side, scale_d in (('selfplay', 1.0), ('eval', 0.0)):
+        try:
+            rs = cfg.get(f'{side}_root_search', 'puct')
+            check_root_search(rs, cfg.get('gumbel_m', 16), cfg.get(f'{side}_gumbel_scale', scale_d),
+                              what=f'{side}_root_search')
+        except ValueError as e:
+            raise SystemExit(f'{where}{e}') from None
+        if rs == 'gumbel' and cfg.get(f'{side}_root_min_visits', 0):
+            raise SystemExit(f"{where}{side}_root_min_visits with {side}_root_search 'gumbel': exclusive (sequential "
+                             f"halving already visits every considered option; docs/search.md 3.7)")
+    if cfg.get('selfplay_root_search', 'puct') == 'gumbel' and cfg.get('policy_target', 'visits') != 'cq':
+        raise SystemExit(f"{where}selfplay_root_search 'gumbel' needs policy_target 'cq' (sequential halving's visit "
+                         f"counts are its schedule, not a policy; docs/search.md 3.7)")
     try:
         elo.parse_offsets(cfg.get('elo_offsets', ''))
     except ValueError as e:

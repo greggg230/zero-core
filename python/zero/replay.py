@@ -61,7 +61,7 @@ import numpy as np
 
 from . import games as G, package
 from .infer import NetEvaluator, drive
-from .mcts import belief_settings, select_settings
+from .mcts import belief_settings, gumbel_tag, select_settings
 from .net import load
 from .play import NNSeat, PyDriver, Slot
 from .protocol import LeafBatch
@@ -219,12 +219,17 @@ class RecordingDriver(PyDriver):
         t = tree.t
         acts, nv, p0 = list(t.root_acts), list(t.root_visits), list(t.root_priors0)
         wsum = list(t.root_values)
-        win = t.root_win()
+        # (a Gumbel search, docs/search.md 3.7: its root value is the improved policy's, and its move is
+        # sampled when its noise is on - a self-play seat's first temp_moves decisions, an evaluation
+        # seat's at a positive gumbel_scale)
+        win = t.gumbel_q() if t.gumbel_on else t.root_win()
+        noisy = seat.gumbel_scale > 0 and (not seat.selfplay or slot.decisions < seat.temp_moves)
+        sampled = noisy if seat.gumbel else seat.selfplay and slot.decisions < seat.temp_moves
         f = slot.frame
         f.update(acts=acts, n=nv, p0=[round(float(x), 4) for x in p0],
                  q=[round(w / n, 4) if n else None for w, n in zip(wsum, nv)],
                  v=round(float(t.root_value0), 4), w=[round(float(x), 4) for x in win] if win else None,
-                 sims=int(sum(nv)), sampled=bool(seat.selfplay and slot.decisions < seat.temp_moves and sum(nv) > 0))
+                 sims=int(sum(nv)), sampled=bool(sampled and sum(nv) > 0))
         ev = self.aux.get(seat.key)
         if ev is not None:
             # the auxiliary head at the root, for the decider: one forward pass of the root's features
@@ -288,8 +293,10 @@ def _nn(key, sims, cfg, selfplay, chance_k, select=None):
     selfplay_select with `selfplay`, with the rule's completed-Q transform: `mcts.select_settings`)
     unless `select` = (rule, min_visits) or (rule, min_visits, c_visit, c_scale) says otherwise (a
     rule None: the run's rule and guard; a transform None or left out: the run's rule's). Its leaf
-    values' view is the run's (selfplay_ / eval_leaf_value_view, docs/search.md 3.6), and so is its
-    root's belief (selfplay_ / eval_belief_tilt, belief_clip, belief_mix, belief_fast; docs/search.md 3.8)."""
+    values' view is the run's (selfplay_ / eval_leaf_value_view, docs/search.md 3.6), and so are its
+    root's belief (selfplay_ / eval_belief_tilt, belief_clip, belief_mix, belief_fast; docs/search.md 3.8)
+    and its root search (selfplay_ / eval_root_search, docs/search.md 3.7: sigma the target's in
+    self-play, the rule's transform in evaluation)."""
     pre = 'selfplay_select' if selfplay else 'eval_select'
     rule, mv, cv, cs = select_settings(cfg, pre)
     if select:
@@ -305,7 +312,7 @@ def _nn(key, sims, cfg, selfplay, chance_k, select=None):
                   cq_c_scale=cfg.get('cq_c_scale', 1.0), select=rule, select_min_visits=int(mv),
                   select_c_visit=None if rule == 'visits' else cv, select_c_scale=None if rule == 'visits' else cs,
                   leaf_value_view=cfg.get(('selfplay' if selfplay else 'eval') + '_leaf_value_view', 'mover'),
-                  **belief_kw(cfg, 'selfplay' if selfplay else 'eval'))
+                  **belief_kw(cfg, 'selfplay' if selfplay else 'eval'), **_gumbel_keys(cfg, selfplay, cv, cs))
 
 
 def belief_kw(cfg, pre):
@@ -314,8 +321,23 @@ def belief_kw(cfg, pre):
     return dict(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast) if tilt else {}
 
 
+def _gumbel_keys(cfg, selfplay, cv, cs):
+    """NNSeat's root-search keyword arguments at the run's settings (`cv`, `cs`: the move rule's
+    transform, an evaluation's sigma; self-play's is the 'cq' target's)."""
+    side = 'selfplay' if selfplay else 'eval'
+    if cfg.get(side + '_root_search', 'puct') != 'gumbel':
+        return {}
+    if selfplay:
+        cv, cs = cfg.get('cq_c_visit', 50.0), cfg.get('cq_c_scale', 1.0)
+    return dict(root_search='gumbel', gumbel_m=int(cfg.get('gumbel_m', 16)),
+                gumbel_scale=float(cfg.get(side + '_gumbel_scale', 1.0 if selfplay else 0.0)), gumbel_c_visit=cv,
+                gumbel_c_scale=cs)
+
+
 def _with_rule(info, seat):
-    if seat.select != 'visits':
+    if seat.gumbel:                                   # the Gumbel search's move (docs/search.md 3.7)
+        info['select'] = gumbel_tag(seat.gumbel_m, seat.gumbel_c_visit, seat.gumbel_c_scale, seat.gumbel_scale)
+    elif seat.select != 'visits':
         info['select'] = seat.select_tag
     return info
 

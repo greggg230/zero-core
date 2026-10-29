@@ -219,6 +219,18 @@ pub trait DynTree: Send + Sync {
     fn root_forced(&self) -> Vec<u32>;
     fn root_visits_pruned(&self) -> Vec<u32>;
     fn root_win_pruned(&self) -> Option<Vec<f64>>;
+    /// The Gumbel root search from now on (`Tree::set_gumbel`, docs/search.md 3.7) or off
+    /// (`clear_gumbel`); its move (`gumbel_choose`: None when off), root value (`gumbel_q`), this
+    /// search's walks per root option, its noise and its schedule.
+    fn set_gumbel(&mut self, m: u32, budget: u32, noise: &[f64], c_visit: f64, c_scale: f64) -> Result<(), String>;
+    fn clear_gumbel(&mut self);
+    fn gumbel_on(&self) -> bool;
+    fn gumbel_choose(&self) -> Option<usize>;
+    fn gumbel_q(&self) -> Option<Vec<f64>>;
+    fn gumbel_visits(&self) -> Vec<u32>;
+    fn gumbel_noise(&self) -> Vec<f64>;
+    fn gumbel_schedule(&self) -> Vec<u32>;
+    fn gumbel_win(&self) -> Vec<Vec<f64>>;
     fn redet(&self) -> bool;
     /// The tree's viewer (the root decider).
     fn viewer(&self) -> usize;
@@ -363,6 +375,39 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     }
     fn root_win_pruned(&self) -> Option<Vec<f64>> {
         self.t.root_win_pruned().map(|w| w[..self.t.n].to_vec())
+    }
+    fn set_gumbel(&mut self, m: u32, budget: u32, noise: &[f64], c_visit: f64, c_scale: f64) -> Result<(), String> {
+        let k = self.t.acts(self.t.root).len();
+        if !noise.is_empty() && noise.len() != k {
+            return Err(format!("set_gumbel: {} noise values for {k} root options", noise.len()));
+        }
+        crate::driver::RootSearch::parse("gumbel", m, 0.0, c_visit, c_scale)?;
+        self.t.set_gumbel(m, budget, noise, c_visit, c_scale);
+        Ok(())
+    }
+    fn clear_gumbel(&mut self) {
+        self.t.clear_gumbel()
+    }
+    fn gumbel_on(&self) -> bool {
+        self.t.gumbel_on()
+    }
+    fn gumbel_choose(&self) -> Option<usize> {
+        self.t.gumbel_choose()
+    }
+    fn gumbel_q(&self) -> Option<Vec<f64>> {
+        self.t.gumbel_q().map(|w| w[..self.t.n].to_vec())
+    }
+    fn gumbel_visits(&self) -> Vec<u32> {
+        self.t.gumbel_visits().to_vec()
+    }
+    fn gumbel_noise(&self) -> Vec<f64> {
+        self.t.gumbel_noise().to_vec()
+    }
+    fn gumbel_schedule(&self) -> Vec<u32> {
+        self.t.gumbel_schedule().to_vec()
+    }
+    fn gumbel_win(&self) -> Vec<Vec<f64>> {
+        self.t.gumbel_win().iter().map(|w| w[..self.t.n].to_vec()).collect()
     }
     fn viewer(&self) -> usize {
         self.t.viewer

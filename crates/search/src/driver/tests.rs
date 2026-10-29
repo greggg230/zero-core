@@ -2083,3 +2083,216 @@ fn rolling_phases_ask_the_belief_again_of_a_new_network() {
     assert!(st.restarts > 0);
     assert!(st.belief_rows >= st.recorded && st.recorded > 0, "belief rows {}, recorded {}", st.belief_rows, st.recorded);
 }
+
+// ------------------------------------------------------------------ the Gumbel root search (docs/search.md 3.7)
+
+/// `seat` with the Gumbel root search (m, noise scale, sigma's scale; c_visit 50); a self-play seat
+/// records the 'cq' target with the same sigma.
+fn with_gumbel(seat: SeatCfg, m: u32, scale: f64, c_scale: f64) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.root_search = RootSearch::Gumbel { m, scale, c_visit: 50.0, c_scale };
+            if s.selfplay {
+                s.policy_target = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale };
+            }
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+#[test]
+fn gumbel_settings_are_checked() {
+    assert_eq!(RootSearch::parse("puct", 0, f64::NAN, 0.0, 0.0), Ok(RootSearch::Puct));
+    assert_eq!(RootSearch::parse("gumbel", 16, 1.0, 50.0, 0.3), Ok(RootSearch::Gumbel { m: 16, scale: 1.0, c_visit: 50.0, c_scale: 0.3 }));
+    for (m, scale, cv, cs) in [(0, 1.0, 50.0, 1.0), (16, -1.0, 50.0, 1.0), (16, f64::INFINITY, 50.0, 1.0), (16, 1.0, f64::NAN, 1.0), (16, 1.0, 50.0, -0.1)] {
+        assert!(RootSearch::parse("gumbel", m, scale, cv, cs).is_err(), "{m} {scale} {cv} {cs}");
+    }
+    assert!(RootSearch::parse("mcts", 16, 1.0, 50.0, 1.0).is_err());
+    let one = |seat: SeatCfg, record: bool| {
+        let mut c = cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+        c.record = record;
+        Driver::<ToyGame>::new(c).err()
+    };
+    // exclusive with the root minimum visits
+    let e = one(with_floor(with_gumbel(nn(0, 16, true), 16, 1.0, 1.0), 4, 4), true).unwrap();
+    assert!(e.contains("exclusive"), "{e}");
+    // a recording seat records the 'cq' target (sequential halving's counts are no policy) ...
+    let visits = match with_gumbel(nn(0, 16, true), 16, 1.0, 1.0) {
+        SeatCfg::Nn(mut s) => {
+            s.policy_target = PolicyTarget::Visits;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    };
+    assert!(one(visits.clone(), true).unwrap().contains("policy_target 'cq'"));
+    // ... but a driver that records nothing, or an evaluation seat, may have any target
+    assert!(one(visits, false).is_none());
+    assert!(one(with_gumbel(nn(0, 16, false), 16, 0.0, 1.0), true).is_none());
+}
+
+#[test]
+fn gumbel_selfplay_is_reproducible_and_its_records_valid() {
+    // toy self-play with fast searches (every search of the seat is a Gumbel one): the same records
+    // whatever the threads and groups; valid targets and root values; other records than PUCT's
+    let mk = |threads: usize, groups: usize, m: u32| {
+        let mut c = cfg(vec![with_gumbel(nn(0, 16, true), m, 1.0, 1.0)], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+        c.threads = threads;
+        c.groups = groups;
+        c.seed = 2026;
+        run(&mut Driver::<ToyGame>::new(c).unwrap())
+    };
+    let (r1, s1) = mk(1, 1, 16);
+    let (r4, s4) = mk(4, 3, 16);
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples, r.decisions);
+    assert_eq!(r1.iter().map(key).collect::<Vec<_>>(), r4.iter().map(key).collect::<Vec<_>>());
+    assert_eq!(records_digest(&s1), records_digest(&s4));
+    assert!(!s1.is_empty());
+    assert_ne!(records_digest(&s1), GOLDEN_RECORDS.1, "the Gumbel search's records are its own");
+    for s in &s1 {
+        assert_eq!(s.pi.len(), s.opts.len());
+        assert!((s.pi.iter().sum::<f32>() - 1.0).abs() < 1e-4 && s.pi.iter().all(|x| x.is_finite() && *x >= 0.0));
+        assert!((s.q[0] + s.q[1] - 1.0).abs() < 1e-4 && s.q.iter().all(|x| x.is_finite()));
+    }
+    // m 2 considers fewer options: other games
+    let (_, s2) = mk(2, 2, 2);
+    assert_ne!(records_digest(&s1), records_digest(&s2));
+}
+
+#[test]
+fn gumbel_noise_only_within_temp_moves() {
+    // the Gumbel noise is the temperature: a self-play seat past its temp_moves searches without it -
+    // a self-play seat with temp_moves 0 plays the games of an evaluation seat with noise scale 0 (no
+    // Dirichlet noise either: the Gumbel seat has none), move for move; with temp_moves it does not
+    let games = |seat: SeatCfg| {
+        let mut c = cfg(vec![seat], vec![vec![0, 0]; 30], &[("m", KeyKind::Nn)]);
+        c.seed = 99;
+        c.record = false;
+        c.move_log = 1000;
+        let (res, _) = run(&mut Driver::<ToyGame>::new(c).unwrap());
+        res.iter().map(|r| r.moves.clone()).collect::<Vec<_>>()
+    };
+    let sp = |temp: u32| match with_gumbel(SeatCfg::Nn(NnSeat::eval(0, 24)), 16, 1.0, 1.0) {
+        SeatCfg::Nn(mut s) => {
+            s.selfplay = true;
+            s.temp_moves = temp;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    };
+    let eval0 = games(with_gumbel(SeatCfg::Nn(NnSeat::eval(0, 24)), 16, 0.0, 1.0));
+    assert_eq!(games(sp(0)), eval0, "past temp_moves: no noise");
+    assert_ne!(games(sp(1000)), eval0, "within temp_moves: noise");
+    // an evaluation seat with noise samples its moves too
+    assert_ne!(games(with_gumbel(SeatCfg::Nn(NnSeat::eval(0, 24)), 16, 1.0, 1.0)), eval0);
+}
+
+#[test]
+fn gumbel_mulligan_selfplay_and_evaluation() {
+    // The Delver mulligan in miniature (KEEP's prior 0.999): PUCT never visits MULL; the Gumbel root
+    // walks both options of every search (2 <= m), 32 / 31 of 63. Self-play with sigma (50, 1.0): the
+    // 'cq' target follows Q - MULL with a bad hand, KEEP with a good one -, the moves are sampled from
+    // it (the Gumbel noise) and a good hand's root value q is KEEP's (the improved policy's value, not
+    // the halving's 50/50 mix). An evaluation seat without noise plays MULL with the bad hands; at the
+    // Delver line's sigma scale 0.3 the prior still wins.
+    let gumbel_mull = |selfplay: bool, scale: f64, cs: f64| match mull_seat(0, selfplay, PolicyTarget::Visits, Select::Visits) {
+        SeatCfg::Nn(s) => with_gumbel(SeatCfg::Nn(s), 16, scale, cs),
+        s => s,
+    };
+    let (rs, ss, hands) = mull_run(gumbel_mull(true, 1.0, 1.0), 160, true);
+    assert_eq!(ss.len(), 320);
+    let bad = |r: &Record| r.x[0] == 0.0 && r.x[3] == 0.0;
+    let i_mull = MULL as usize;
+    let (mut nb, mut high) = (0, 0);
+    for r in &ss {
+        if bad(r) {
+            nb += 1;
+            high += (r.pi[i_mull] > 0.9) as usize;
+        } else {
+            assert!(r.pi[i_mull] < 1e-3, "a good hand's cq target: {:?}", r.pi);
+            let want = 0.5 + 0.3 * (r.x[0] - r.x[1]);
+            assert!((r.q[0] - want).abs() < 1e-5, "a good hand's q {} (KEEP's value {want})", r.q[0]);
+        }
+    }
+    assert!(nb > 40 && high * 10 >= nb * 9, "{high} of {nb} bad-hand targets on MULL");
+    let (m, all) = mull_moves(&rs, &hands);
+    assert_eq!(m[1], 0, "MULL sampled with a good hand");
+    assert!(m[0] * 10 >= all[0] * 8, "MULL sampled with {} of {} bad hands", m[0], all[0]);
+    eprintln!("gumbel mull selfplay: cq targets > 0.9 on MULL for {high} of {nb} bad hands; MULL played with {} of {} bad hands, {} of {} good", m[0], all[0], m[1], all[1]);
+    // evaluation seats, no noise
+    let (re, _, he) = mull_run(gumbel_mull(false, 0.0, 1.0), 200, false);
+    let (me, ae) = mull_moves(&re, &he);
+    assert_eq!(me[1], 0);
+    assert!(me[0] * 10 >= ae[0] * 9, "eval: MULL with {} of {} bad hands", me[0], ae[0]);
+    let (r3, _, h3) = mull_run(gumbel_mull(false, 0.0, 0.3), 200, false);
+    let (m3, a3) = mull_moves(&r3, &h3);
+    assert_eq!(m3, [0, 0], "sigma scale 0.3 against a 0.999 prior: KEEP ({a3:?} decisions)");
+    eprintln!("gumbel mull eval: MULL with {} of {} bad hands at sigma scale 1.0, {} at 0.3", me[0], ae[0], m3[0]);
+}
+
+#[test]
+fn gumbel_with_root_view_leaves_and_rolling_restarts() {
+    // root-view leaf values are orthogonal: the hidden-hand mulligan with both - the value-only rows go
+    // out as before and a bad hand's KEEP is valued from the keeper's own hand
+    let seat = match hmull_seat(64, LeafView::Root, 0.0, ViewTarget::NextQ) {
+        SeatCfg::Nn(s) => with_gumbel(SeatCfg::Nn(s), 16, 1.0, 1.0),
+        s => s,
+    };
+    // (each search of seat 0 meets seat 1's decision after KEEP and after each redraw: ~3 leaves of the
+    // other seat, every later walk a terminal)
+    let (recs, vrows, st) = hmull_run(seat, 100, 5);
+    assert!(vrows >= 250 && vrows as u64 == st.view_rows, "{vrows} value-only rows");
+    assert!(recs.iter().all(|r| (r.pi.iter().sum::<f32>() - 1.0).abs() < 1e-4));
+    // a rolling driver whose network changes restarts its Gumbel searches (the decision's noise kept)
+    let mut c = cfg(vec![with_gumbel(nn(0, 8, true), 16, 1.0, 1.0)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    c.concurrency = 12;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    for phase in 0..4u32 {
+        d.resume(10, phase / 2).unwrap();
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer(&mut d, &b);
+            for s in d.take_samples() {
+                assert!((s.pi.iter().sum::<f32>() - 1.0).abs() < 1e-4 && (s.q[0] + s.q[1] - 1.0).abs() < 1e-4);
+            }
+        }
+    }
+    let st = d.stats();
+    assert!(st.restarts > 0 && st.games_finished >= 40);
+}
+
+#[test]
+fn gumbel_with_a_root_belief() {
+    // the Gumbel root and the root's belief together (docs/search.md 3.7, 3.8): toy self-play with
+    // fast searches, the belief on every search (belief_fast) - a fresh root's belief row rides with
+    // its own leaf, a reused root's waits alone, inside a Gumbel search whose schedule is its
+    // simulations' either way: games finish, records valid, reproducible across threads; the belief
+    // changes the Gumbel searches' worlds (other records than the Gumbel search without it)
+    let pred = [0.9f32, 0.02, 0.02, 0.02, 0.02, 0.02];
+    let mk = |threads: usize, groups: usize, tilt: f64| {
+        let seat = with_belief(with_gumbel(nn(0, 16, true), 16, 1.0, 1.0), tilt, 20.0, 0.0, true);
+        let mut c = cfg(vec![seat], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+        c.threads = threads;
+        c.groups = groups;
+        c.seed = 2026;
+        let mut d = Driver::<ToyGame>::new(c).unwrap();
+        let (res, smp, rows) = run_belief(&mut d, &pred);
+        (res, smp, rows, d.stats())
+    };
+    let (r1, s1, rows1, st1) = mk(1, 1, 1.0);
+    let (r4, s4, rows4, _) = mk(3, 2, 1.0);
+    assert_eq!(r1.len(), 24);
+    assert!(r1.iter().all(|r| r.over));
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples, r.decisions);
+    assert_eq!(r1.iter().map(key).collect::<Vec<_>>(), r4.iter().map(key).collect::<Vec<_>>());
+    assert_eq!((records_digest(&s1), rows1), (records_digest(&s4), rows4));
+    assert!(rows1.0 > 0 && rows1.1 > 0, "belief rows after a fresh root's leaf {} and alone {}", rows1.0, rows1.1);
+    assert_eq!(st1.belief_rows as usize, rows1.0 + rows1.1);
+    for s in &s1 {
+        assert!((s.pi.iter().sum::<f32>() - 1.0).abs() < 1e-4 && s.pi.iter().all(|x| x.is_finite() && *x >= 0.0));
+        assert!((s.q[0] + s.q[1] - 1.0).abs() < 1e-4);
+    }
+    let (_, s0, rows0, _) = mk(1, 1, 0.0);
+    assert_eq!(rows0, (0, 0));
+    assert_ne!(records_digest(&s0), records_digest(&s1), "the belief changed nothing in the Gumbel searches");
+}

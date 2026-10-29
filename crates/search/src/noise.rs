@@ -1,4 +1,5 @@
-//! Gamma / Dirichlet sampling for root noise (no external crates; port of domz).
+//! Gamma / Dirichlet sampling for root noise (no external crates; port of domz), and the standard
+//! Gumbel noise of the Gumbel root search (docs/search.md 3.7).
 use crate::rng::Rng;
 
 /// Standard normal (Marsaglia polar method).
@@ -61,6 +62,14 @@ pub fn dirichlet(alpha: f64, n: usize, rng: &mut Rng) -> Vec<f64> {
     x
 }
 
+/// A standard Gumbel(0, 1) sample, `-ln(-ln U)` with U uniform in the open interval (0, 1) (the
+/// Gumbel root search's noise, docs/search.md 3.7: argmax of `g + logits` over options is a sample
+/// of `softmax(logits)`, the Gumbel-max trick).
+pub fn gumbel(rng: &mut Rng) -> f64 {
+    let u = ((rng.next_u64() >> 11) as f64 + 0.5) * (1.0 / (1u64 << 53) as f64);
+    -(-u.ln()).ln()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +100,28 @@ mod tests {
         }
         for a in acc {
             assert!((a / 20_000.0 - 0.25).abs() < 0.01, "{acc:?}");
+        }
+    }
+
+    #[test]
+    fn gumbel_moments_and_the_max_trick() {
+        // mean = Euler's gamma 0.5772, variance pi^2 / 6; argmax(g + ln p) samples p
+        let mut r = Rng::new(11);
+        let n = 200_000;
+        let xs: Vec<f64> = (0..n).map(|_| gumbel(&mut r)).collect();
+        assert!(xs.iter().all(|x| x.is_finite()));
+        let m = xs.iter().sum::<f64>() / n as f64;
+        let v = xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n as f64;
+        assert!((m - 0.5772).abs() < 0.01, "mean {m}");
+        assert!((v - std::f64::consts::PI.powi(2) / 6.0).abs() < 0.03, "var {v}");
+        let p = [0.6f64, 0.3, 0.1];
+        let mut c = [0u32; 3];
+        for _ in 0..60_000 {
+            let k = (0..3).map(|i| p[i].ln() + gumbel(&mut r)).enumerate().fold((0, f64::MIN), |b, (i, x)| if x > b.1 { (i, x) } else { b }).0;
+            c[k] += 1;
+        }
+        for i in 0..3 {
+            assert!((c[i] as f64 / 60_000.0 - p[i]).abs() < 0.01, "{c:?}");
         }
     }
 }

@@ -26,6 +26,9 @@
 //! docs/search.md 3.5), the opt-in root's belief (`NnSeat::belief_tilt`, docs/search.md 3.8: one
 //! flagged `ROW_BELIEF` row per searched decision, whose auxiliary output `submit_aux` returns; the
 //! search's worlds are then dealt by it).
+//! docs/search.md 3.5), and the opt-in Gumbel root search (`NnSeat::root_search`, docs/search.md
+//! 3.7: Gumbel noise and sequential halving at the root instead of PUCT, Dirichlet noise and
+//! temperature; its move and root value from the tree's `gumbel_choose` / `gumbel_q`).
 //!
 //! **Rolling mode** (`DriverCfg::rolling`): games never run out - game `gid` takes the seats
 //! `games[gid % games.len()]` - and play is divided into phases. `resume(quota, net)` runs
@@ -161,6 +164,54 @@ impl Select {
                 best.unwrap_or(0)
             }
         }
+    }
+}
+
+/// How a network seat's searches choose their root walks and their move (docs/search.md 3.7, seat
+/// key `root_search`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RootSearch {
+    /// PUCT at the root, root Dirichlet noise on full self-play searches, temperature sampling for
+    /// the first `temp_moves` decisions, then the seat's move rule (`select`): the default, the
+    /// search of before bit for bit.
+    Puct,
+    /// Gumbel AlphaZero's root (Danihelka et al. 2022; `Tree::set_gumbel`): Gumbel noise of scale
+    /// `scale` per root option (a self-play seat's: on its first `temp_moves` searched decisions
+    /// only, later ones without; an evaluation seat's: on every decision), sequential halving over
+    /// `min(m, options)` options, sigma's transform `c_visit`, `c_scale`; the move is the halving's
+    /// winner (`Tree::gumbel_choose`: no Dirichlet noise, no temperature, `select` unused), the root
+    /// value `Tree::gumbel_q`. Every search of the seat - full, fast and minor - is one. PUCT below
+    /// the root.
+    Gumbel { m: u32, scale: f64, c_visit: f64, c_scale: f64 },
+}
+
+impl RootSearch {
+    /// From the seat settings `root_search` ('puct' | 'gumbel'), `gumbel_m`, `gumbel_scale`,
+    /// `gumbel_c_visit`, `gumbel_c_scale` (the last four: Gumbel's only).
+    pub fn parse(name: &str, m: u32, scale: f64, c_visit: f64, c_scale: f64) -> Result<RootSearch, String> {
+        match name {
+            "puct" => Ok(RootSearch::Puct),
+            "gumbel" => {
+                let r = RootSearch::Gumbel { m, scale, c_visit, c_scale };
+                r.check()?;
+                Ok(r)
+            }
+            _ => Err(format!("root_search {name:?}: 'puct' or 'gumbel'")),
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if let RootSearch::Gumbel { m, scale, c_visit, c_scale } = *self {
+            if m < 1 {
+                return Err(format!("gumbel_m {m}: at least 1 (the options sequential halving considers)"));
+            }
+            for (k, x) in [("gumbel_scale", scale), ("gumbel_c_visit", c_visit), ("gumbel_c_scale", c_scale)] {
+                if !(x.is_finite() && x >= 0.0) {
+                    return Err(format!("{k} {x}: a finite number >= 0"));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -308,12 +359,14 @@ pub struct NnSeat {
     /// false: full searches only - every search of an evaluation seat, a self-play seat's recorded
     /// ones).
     pub belief_fast: bool,
+    /// The root search (docs/search.md 3.7; default `RootSearch::Puct`).
+    pub root_search: RootSearch,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct }
     }
 
     /// The belief settings' check (`Driver::new`; the bindings' messages): tilt finite >= 0, clip
@@ -664,6 +717,9 @@ struct Slot<G: SearchGame> {
     net: u32,
     /// The logged real moves (`DriverCfg::move_log`).
     moves: Vec<(u8, u16, Vec<u16>)>,
+    /// The current decision's Gumbel noise per root option (`RootSearch::Gumbel`; empty: none),
+    /// kept for a restarted search of the same decision.
+    gnoise: Vec<f64>,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -700,6 +756,7 @@ impl<G: SearchGame> Slot<G> {
             epoch: 0,
             net: 0,
             moves: Vec::new(),
+            gnoise: Vec::new(),
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -982,6 +1039,16 @@ impl<G: SearchGame> Driver<G> {
                     NnSeat::check_belief(n.belief_tilt, n.belief_clip, n.belief_mix)?;
                     if n.belief_tilt > 0.0 && G::aux_width() == 0 {
                         return Err(format!("belief_tilt {}: {} has no auxiliary targets (SearchGame::AUX) for a belief to predict", n.belief_tilt, G::NAME));
+                    }
+                    n.root_search.check()?;
+                    if matches!(n.root_search, RootSearch::Gumbel { .. }) {
+                        // (docs/search.md 3.7: sequential halving already visits every considered option)
+                        if n.root_min_visits > 0 {
+                            return Err(format!("root_min_visits {} with root_search 'gumbel': exclusive (sequential halving already gives every considered option its visits)", n.root_min_visits));
+                        }
+                        if cfg.record && n.selfplay && n.record && n.policy_target == PolicyTarget::Visits {
+                            return Err("root_search 'gumbel' records the policy_target 'cq' (its visit counts are sequential halving's schedule, not a policy)".into());
+                        }
                     }
                 }
                 SeatCfg::External(k) => {

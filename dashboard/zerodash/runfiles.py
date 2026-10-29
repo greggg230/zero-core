@@ -178,10 +178,24 @@ def elo_pool(run_dir):
     / _c_scale, unset: cq_c_visit / cq_c_scale - when other than 50 / 1; then '-f<k>' ('-f<k>a<m>')
     for the evaluation's root minimum visits eval_root_min_visits, root_min_visits_max_actions m when
     not 4: 'visits-f4', 'cq-n4-v50-s0.3-f4'; then '-rv' for eval_leaf_value_view 'root': 'visits-rv',
-    'cq-n4-v50-s0.3-rv')."""
+    'cq-n4-v50-s0.3-rv'). With eval_root_search 'gumbel' (docs/search.md 3.7) the move is the Gumbel
+    search's: 'gumbel-m<gumbel_m>', the rule's transform when other than 50 / 1, '-g<s>' for an
+    eval_gumbel_scale s > 0, then '-rv': 'gumbel-m16-v50-s0.3'."""
     c = read_json(os.path.join(run_dir, 'config.json'))
     c = c if isinstance(c, dict) else {}
     rule = c.get('eval_select') or 'visits'
+    if c.get('eval_root_search', 'puct') == 'gumbel':
+        cv, cs = c.get('eval_select_c_visit'), c.get('eval_select_c_scale')
+        cv = float(c.get('cq_c_visit', 50.0) if cv is None else cv)
+        cs = float(c.get('cq_c_scale', 1.0) if cs is None else cs)
+        tag = f"gumbel-m{int(c.get('gumbel_m', 16))}"
+        if (cv, cs) != (50.0, 1.0):
+            tag += f'-v{cv:g}-s{cs:g}'
+        if float(c.get('eval_gumbel_scale', 0.0) or 0.0):
+            tag += f"-g{float(c['eval_gumbel_scale']):g}"
+        if c.get('eval_leaf_value_view', 'mover') == 'root':
+            tag += '-rv'
+        return os.path.join(run_dir, 'elo', tag)
     forced = ''
     if c.get('eval_root_min_visits'):
         mx = int(c.get('root_min_visits_max_actions', 4))

@@ -61,6 +61,13 @@ ties), a forced walk. The tree counts the forced walks per root option and sums 
 win vectors: the visit-based outputs leave them out (`root_visits_pruned`, `root_win_pruned`), the
 Q-based ones (Q, the 'cq' target and rule) use them. `root_floor` decides which searches take it
 (the Rust driver's `driver::root_floor`).
+
+Gumbel root search (docs/search.md 3.7; `Tree.set_gumbel`, off by default): Gumbel AlphaZero's root
+(Danihelka et al. 2022; mctx's arithmetic). Root walk j of a search may only take an option whose
+walks of THIS search equal `gumbel_sequence(min(m, options), budget)[j]` (sequential halving), the
+highest `g + completed_q_logits` among them (g: the search's Gumbel noise). The move is
+`gumbel_choose` (that score among the options this search walked most), the root value `gumbel_q`
+(the improved policy's value over this search's walked options). PUCT below the root.
 """
 import math
 
@@ -96,13 +103,27 @@ class Node:
         self.wsum = [0.0] * n
 
 
+class GumbelRoot:
+    """The Gumbel root search of a tree's current search (`Tree.set_gumbel`): the schedule `seq`, the
+    noise `g` per root option, sigma's transform, this search's walks `n` and backed-up win vector
+    sums `win` per root option, `walks` = sum(n)."""
+    __slots__ = ('seq', 'g', 'c_visit', 'c_scale', 'n', 'win', 'walks')
+
+    def __init__(self, seq, g, c_visit, c_scale, k, players):
+        self.seq, self.g, self.c_visit, self.c_scale = seq, g, float(c_visit), float(c_scale)
+        self.n = [0] * k
+        self.win = [[0.0] * players for _ in range(k)]
+        self.walks = 0
+
+
 class Tree:
     """The search for one decision of `viewer` (the decider at the root). `root_min`: the root
     minimum visits of the current search (`set_root_min`; 0 = off), `forced` the forced walks per
     root option, `forced_win` / `forced_n` their backed-up win vectors' sum and number,
-    `walk_forced` the root option of the walk in flight if it is forced (None)."""
+    `walk_forced` the root option of the walk in flight if it is forced (None). `gumbel`: the Gumbel
+    root search of the current search (`set_gumbel`; None = PUCT at the root)."""
     __slots__ = ('base', 'root', 'viewer', 'redet', 'n', 'team', 'root_min', 'forced', 'forced_win', 'forced_n',
-                 'walk_forced', 'belief', 'belief_mix')
+                 'walk_forced', 'belief', 'belief_mix', 'gumbel')
 
     def __init__(self, game, redet=True, rng=None):
         self.viewer = game.to_move
@@ -111,6 +132,7 @@ class Tree:
         self.team = max(1, getattr(game, 'team_size', 1))
         self.root = Node(self.viewer, list(game.legal()))
         self.belief, self.belief_mix = None, 0.0
+        self.gumbel = None
         self.set_root_min(0)
         self.set_base(game, rng)
 
@@ -132,6 +154,18 @@ class Tree:
         self.forced_win = [0.0] * self.n
         self.forced_n = 0
         self.walk_forced = None
+
+    def set_gumbel(self, m, budget, noise=None, c_visit=50.0, c_scale=1.0):
+        """The Gumbel root search for the search starting now (the Rust tree's `set_gumbel`): sequential
+        halving over min(m, options) root options, the schedule of `budget` root walks (the driver: the
+        search's simulations; a fresh root's walks follow its first budget - 1), `noise` the Gumbel noise per
+        root option (None / []: none), sigma's transform (c_visit, c_scale); the floor goes off."""
+        k = len(self.root.acts)
+        if noise and len(noise) != k:
+            raise ValueError(f'set_gumbel: {len(noise)} noise values for {k} root options')
+        self.set_root_min(0)
+        g = [float(x) for x in noise] if noise else [0.0] * k
+        self.gumbel = GumbelRoot(gumbel_sequence(min(int(m), k), int(budget)), g, c_visit, c_scale, k, self.n)
 
     def set_base(self, game, rng=None):
         if self.redet:
@@ -186,7 +220,8 @@ def select(node, c_puct):
 
 def backup(path, util, win, tree=None):
     """N_i += 1, W_i += util[decider], tot += 1, wsum += win along the path; with `tree`, the
-    backup of its forced walk in flight is also counted as forced (root minimum visits)."""
+    backup of its forced walk in flight is also counted as forced (root minimum visits), and a Gumbel
+    search counts its own root walks (`GumbelRoot.n`, `win`)."""
     if tree is not None and tree.walk_forced is not None:
         i = tree.walk_forced
         tree.walk_forced = None
@@ -195,6 +230,13 @@ def backup(path, util, win, tree=None):
         fw = tree.forced_win
         for j in range(len(fw)):
             fw[j] += win[j]
+    if tree is not None and tree.gumbel is not None and path and path[0][0] is tree.root:
+        gr, i = tree.gumbel, path[0][1]
+        gr.n[i] += 1
+        gr.walks += 1
+        gw = gr.win[i]
+        for j in range(len(gw)):
+            gw[j] += win[j]
     for node, i in path:
         node.Nv[i] += 1
         node.W[i] += util[node.player]
@@ -373,9 +415,12 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
     while True:
         if node.P is None:
             return node, g, path
-        i = select(node, c_puct)
-        if tree.root_min and node is tree.root:
-            i = force_root(tree, i)
+        if tree.gumbel is not None and node is tree.root:
+            i = gumbel_select(tree)             # sequential halving at the root (docs/search.md 3.7)
+        else:
+            i = select(node, c_puct)
+            if tree.root_min and node is tree.root:
+                i = force_root(tree, i)
         path.append((node, i))
         edge = node.kids[i]
         if edge is None:
@@ -576,4 +621,117 @@ def select_tag(rule='visits', min_visits=0, c_visit=50.0, c_scale=1.0):
         t += f'-n{int(min_visits)}'
     if (float(c_visit), float(c_scale)) != (50.0, 1.0):
         t += f'-v{float(c_visit):g}-s{float(c_scale):g}'
+    return t
+
+
+# ------------------------------------------------------------------ the Gumbel root search (docs/search.md 3.7)
+
+ROOT_SEARCHES = ('puct', 'gumbel')
+
+
+def gumbel_sequence(m, n):
+    """Sequential halving's schedule (mctx `get_sequence_of_considered_visits`; the Rust
+    `tree::gumbel_sequence`): per root walk of a search of n root walks over m considered options, the
+    visits (of that search) an option needs to be taken."""
+    if m <= 1:
+        return list(range(n))
+    log2max = int(math.ceil(math.log2(m)))
+    seq, visits, nc = [], [0] * m, m
+    while len(seq) < n:
+        extra = max(1, n // (log2max * nc))
+        for _ in range(extra):
+            seq.extend(visits[:nc])
+            for i in range(nc):
+                visits[i] += 1
+        nc = max(2, nc // 2)
+    return seq[:n]
+
+
+def _first_max(score, ok):
+    best = None
+    for i, x in enumerate(score):
+        if ok(i) and (best is None or x > score[best]):
+            best = i
+    return best
+
+
+def gumbel_scores(tree):
+    """g + completed_q_logits per root option (every visit of the root: a reused root's too)."""
+    r, gr = tree.root, tree.gumbel
+    lg = completed_q_logits(r.P0, r.Nv, r.W, r.vec[r.player], gr.c_visit, gr.c_scale)
+    return [x + g for x, g in zip(lg, gr.g)]
+
+
+def gumbel_select(tree):
+    """The root option of a Gumbel search's next walk: among the options whose walks of this search
+    equal the schedule's entry (past it: the most walked ones), the highest score (first maximum)."""
+    gr = tree.gumbel
+    want = gr.seq[gr.walks] if gr.walks < len(gr.seq) else max(gr.n)
+    sc = gumbel_scores(tree)
+    i = _first_max(sc, lambda k: gr.n[k] == want)
+    return _first_max(sc, lambda k: True) if i is None else i
+
+
+def gumbel_choose(tree):
+    """The Gumbel search's move (the Rust tree's `gumbel_choose`): among the root options this search
+    walked most, the highest g + ln P0 + sigma(completedQ) (first maximum); 0 without statistics."""
+    gr = tree.gumbel
+    if tree.root.P is None:
+        return 0
+    top = max(gr.n)
+    i = _first_max(gumbel_scores(tree), lambda k: gr.n[k] == top)
+    return 0 if i is None else i
+
+
+def gumbel_q(tree):
+    """The Gumbel search's root value (absolute seats; the Rust tree's `gumbel_q`): sum pi'_i Wv_i /
+    sum pi'_i over the root options this search walked, pi' = the completed-Q policy with the
+    search's transform, Wv_i = this search's mean backed-up win vector through option i; None when it
+    walked none."""
+    gr, r = tree.gumbel, tree.root
+    if not gr.walks or r.P is None:
+        return None
+    lg = completed_q_logits(r.P0, r.Nv, r.W, r.vec[r.player], gr.c_visit, gr.c_scale)
+    m = max(lg)
+    tot, q = 0.0, [0.0] * len(gr.win[0])
+    for i, x in enumerate(lg):
+        if not gr.n[i]:
+            continue
+        p = math.exp(x - m)
+        tot += p
+        for j in range(len(q)):
+            q[j] += p * gr.win[i][j] / gr.n[i]
+    return [x / tot for x in q]
+
+
+def check_root_search(name='puct', m=16, scale=1.0, c_visit=None, c_scale=None, what='root_search'):
+    """The root search's settings ('puct' | 'gumbel'; gumbel_m an integer >= 1; the noise scale and
+    sigma's transform finite numbers >= 0, None = unset) -> None, else ValueError (`what`: the
+    setting's name in the message)."""
+    if name not in ROOT_SEARCHES:
+        raise ValueError(f'{what} {name!r}: one of {ROOT_SEARCHES}')
+    if isinstance(m, bool) or not isinstance(m, int) or m < 1:
+        raise ValueError(f'gumbel_m {m!r}: an integer >= 1')
+    for k, x in (('gumbel_scale', scale), ('gumbel_c_visit', c_visit), ('gumbel_c_scale', c_scale)):
+        if x is None:
+            continue
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
+            raise ValueError(f'{k} {x!r}: a finite number >= 0')
+
+
+def gumbel_noise_scale(selfplay, decisions, temp_moves, scale):
+    """The noise scale of a Gumbel search: a self-play seat's first `temp_moves` searched decisions of a
+    game get `scale`, later ones none (the Gumbel noise is the temperature); an evaluation seat's
+    every decision `scale` (the Rust driver's `worker::start`)."""
+    return 0.0 if selfplay and decisions >= temp_moves else float(scale)
+
+
+def gumbel_tag(m=16, c_visit=50.0, c_scale=1.0, scale=0.0):
+    """The name of a Gumbel search's move rule: 'gumbel-m16' (+ '-v50-s0.3' for a transform other than
+    50 / 1, + '-g1' with noise): an evaluation's moves are its, so its Elo pool is (docs/az.md 5.4)."""
+    t = f'gumbel-m{int(m)}'
+    if (float(c_visit), float(c_scale)) != (50.0, 1.0):
+        t += f'-v{float(c_visit):g}-s{float(c_scale):g}'
+    if float(scale):
+        t += f'-g{float(scale):g}'
     return t

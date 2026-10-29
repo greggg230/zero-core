@@ -259,6 +259,10 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
         let mut t = slot.spare.pop().unwrap_or_default();
         t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
         t.set_root_min(root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap()));
+        if let RootSearch::Gumbel { m, c_visit, c_scale, .. } = seat.root_search {
+            // the decision's Gumbel search again, its noise kept (as its playout-cap draw)
+            t.set_gumbel(m, slot.target.unwrap(), &slot.gnoise, c_visit, c_scale);
+        }
         slot.trees[p] = Some(t);
     }
     Ok(lost)
@@ -330,7 +334,8 @@ fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, n
     let (util, win) = leaf_values_team(value, margin, vp, slot.n, s.margin_w, tree.team);
     tree.expand_leaf(node, priors, &util, &win);
     tree.backup(&slot.path, &util, &win);
-    if node == tree.root && s.selfplay && slot.full {
+    // (root Dirichlet noise: PUCT's; a Gumbel search has its Gumbel noise instead, docs/search.md 3.7)
+    if node == tree.root && s.selfplay && slot.full && s.root_search == RootSearch::Puct {
         let r = tree.root;
         tree.add_noise(r, s.alpha, s.eps, &mut slot.noise_rng);
     }
@@ -494,7 +499,7 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
         }
         Some(t) => {
             t.set_base(game, &mut slot.search_rng);
-            if seat.selfplay && slot.full && t.expanded(t.root) {
+            if seat.selfplay && slot.full && t.expanded(t.root) && seat.root_search == RootSearch::Puct {
                 let r = t.root;
                 t.add_noise(r, seat.alpha, seat.eps, &mut slot.noise_rng);
             }
@@ -503,7 +508,24 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     // the root minimum visits of this search (docs/search.md 3.5; 0 = off: the tree's walks
     // are PUCT's alone; a reused root's visits count toward the floor)
     let k = root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap());
-    slot.trees[p].as_mut().unwrap().set_root_min(k);
+    let t = slot.trees[p].as_mut().unwrap();
+    t.set_root_min(k);
+    // the Gumbel root search (docs/search.md 3.7): every search of the seat (full, fast, minor). Its
+    // noise replaces the root Dirichlet noise and the temperature: a self-play seat's first
+    // `temp_moves` searched decisions are searched with it, later ones (and an evaluation seat's
+    // with scale 0) without. The schedule is that of the search's simulations (a fresh root's own
+    // evaluation takes its first one: its walks are the schedule's first target - 1); a reused root's
+    // earlier visits are not in it.
+    if let RootSearch::Gumbel { m, scale, c_visit, c_scale } = seat.root_search {
+        let s = if seat.selfplay && slot.decisions >= seat.temp_moves { 0.0 } else { scale };
+        slot.gnoise.clear();
+        if s > 0.0 {
+            for _ in 0..slot.legal.len() {
+                slot.gnoise.push(s * crate::noise::gumbel(&mut slot.noise_rng));
+            }
+        }
+        t.set_gumbel(m, slot.target.unwrap(), &slot.gnoise, c_visit, c_scale);
+    }
 }
 
 /// Choose the move after the search; the training record (`n.recorded`) and value-only records
@@ -513,8 +535,15 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     let root = tree.root;
     // value-only records waiting for this seat's next search (`ViewTarget::NextQ`, docs/search.md
     // 3.6) take its root value (without forced walks, as a record's q); a minor search is too small
+    let gumbel = tree.gumbel_on();
     if !slot.view_wait.is_empty() && !slot.minor && slot.view_wait.iter().any(|w| w.1 as usize == p) {
-        let w = if tree.root_min() > 0 { tree.root_win_pruned() } else { tree.win(root) };
+        let w = if gumbel {
+            tree.gumbel_q()
+        } else if tree.root_min() > 0 {
+            tree.root_win_pruned()
+        } else {
+            tree.win(root)
+        };
         let rq = &mut slot.rq;
         slot.view_wait.retain(|&(i, o)| {
             if o as usize != p {
@@ -535,6 +564,9 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     let tot: u64 = nv.iter().map(|&x| x as u64).sum();
     let i = if nv.is_empty() {
         0
+    } else if let Some(i) = tree.gumbel_choose() {
+        // the Gumbel search's move (docs/search.md 3.7): its noise did the sampling
+        i
     } else if seat.selfplay && slot.decisions < seat.temp_moves && tot > 0 {
         let mut r = slot.rng.unit() * tot as f64;
         let mut i = nv.len() - 1;
@@ -573,7 +605,13 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             g.aux_target(p, &mut aux);
         }
         slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux });
-        slot.rq.push(if pruned.is_some() { tree.root_win_pruned() } else { tree.win(root) });
+        slot.rq.push(if gumbel {
+            tree.gumbel_q()
+        } else if pruned.is_some() {
+            tree.root_win_pruned()
+        } else {
+            tree.win(root)
+        });
         n.recorded += 1;
         // value-only samples (docs/search.md 3.6): the real state from every other recording
         // seat's view, in its perspective, no options; q per the seat's view_target

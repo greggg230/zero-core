@@ -43,8 +43,15 @@ def eval_tag(cfg):
     the rule's completed-Q transform: eval_select_c_visit / _c_scale, unset = cq_c_visit /
     cq_c_scale; then `mcts.forced_tag` of eval_root_min_visits, '' when off; then `mcts.view_tag` of
     eval_leaf_value_view, '-rv' for 'root'; then `mcts.belief_tag` of the evaluations' root belief,
-    '-b<tilt>...' when eval_belief_tilt > 0): its evaluations' 'select' and its pool."""
-    from .mcts import belief_settings, belief_tag, forced_tag, select_settings, select_tag, view_tag
+    '-b<tilt>...' when eval_belief_tilt > 0): its evaluations' 'select' and its pool. With
+    eval_root_search 'gumbel' the move is the Gumbel search's: `mcts.gumbel_tag` (gumbel_m, the rule's
+    transform, eval_gumbel_scale) instead of the rule's name, then the view's and the belief's suffixes
+    ('gumbel-m16-v50-s0.3'; docs/search.md 3.7)."""
+    from .mcts import belief_settings, belief_tag, forced_tag, gumbel_tag, select_settings, select_tag, view_tag
+    if cfg.get('eval_root_search', 'puct') == 'gumbel':
+        _, _, cv, cs = select_settings(cfg, 'eval_select')
+        return gumbel_tag(cfg.get('gumbel_m', 16), cv, cs, cfg.get('eval_gumbel_scale', 0.0)) + view_tag(
+            cfg.get('eval_leaf_value_view', 'mover')) + belief_tag(*belief_settings(cfg, 'eval'))
     return select_tag(*select_settings(cfg, 'eval_select')) + forced_tag(
         cfg.get('eval_root_min_visits', 0), cfg.get('root_min_visits_max_actions', 4)) + view_tag(
         cfg.get('eval_leaf_value_view', 'mover')) + belief_tag(*belief_settings(cfg, 'eval'))

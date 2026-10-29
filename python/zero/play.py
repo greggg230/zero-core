@@ -20,6 +20,11 @@ docs/search.md 3.8): a search that takes it (full searches; every one with `beli
 `ROW_BELIEF` row of the root's features - after the fresh root's own leaf row, or alone (a reused
 root: its simulations wait) - and deals its worlds by the batch's auxiliary answer for it (`submit`'s
 `aux`) from then on.
+= that seat's next search's root value ('next_q') or z. The Gumbel root search (`root_search`
+'gumbel', docs/search.md 3.7): every search of the seat has Gumbel noise (a self-play seat's first
+temp_moves decisions; an evaluation seat's at `gumbel_scale`, every decision) and sequential halving
+at the root instead of Dirichlet noise, temperature and the move rule; its move is the halving's
+winner, its root value the improved policy's (`mcts.gumbel_choose`, `gumbel_q`).
 """
 import random
 
@@ -64,14 +69,17 @@ class NNSeat:
     3.5). leaf_value_view: 'mover' | 'root' (whose view a leaf's value comes from), view_samples: the
     share of its recorded decisions that also record value-only samples (0 = off), view_sample_target:
     their q, 'next_q' | 'z' (docs/search.md 3.6). belief_tilt (0 = off), belief_clip (None: 20),
-    belief_mix, belief_fast: the root's belief of its searches (docs/search.md 3.8)."""
+    belief_mix, belief_fast: the root's belief of its searches (docs/search.md 3.8). root_search: 'puct' |
+    'gumbel' (docs/search.md 3.7), gumbel_m the options sequential halving considers, gumbel_scale its
+    noise's scale, gumbel_c_visit / gumbel_c_scale sigma's transform (None: cq_c_visit / cq_c_scale)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
                  policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0, select='visits', select_min_visits=0,
                  select_c_visit=None, select_c_scale=None, record=True, root_min_visits=0,
                  root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
-                 view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False):
+                 view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
+                 root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
         mcts.check_select(select, select_min_visits)
@@ -79,6 +87,9 @@ class NNSeat:
         mcts.check_root_min(root_min_visits, root_min_visits_max_actions)
         mcts.check_leaf_view(leaf_value_view, view_samples, view_sample_target)
         mcts.check_belief(belief_tilt, belief_clip, belief_mix)
+        mcts.check_root_search(root_search, gumbel_m, gumbel_scale, gumbel_c_visit, gumbel_c_scale)
+        if root_search == 'gumbel' and root_min_visits:
+            raise ValueError("root_min_visits with root_search 'gumbel': exclusive (docs/search.md 3.7)")
         self.key, self.sims, self.c_puct, self.selfplay = key, sims, c_puct, selfplay
         self.alpha, self.eps, self.temp_moves = alpha, eps, temp_moves
         self.sims_fast, self.p_full, self.chance_k, self.margin_w = sims_fast, p_full, chance_k, margin_w
@@ -92,10 +103,17 @@ class NNSeat:
         self.view_sample_target = view_sample_target
         self.belief_tilt, self.belief_mix, self.belief_fast = float(belief_tilt), float(belief_mix), bool(belief_fast)
         self.belief_clip = float(mcts.BELIEF_CLIP if belief_clip is None else belief_clip)
+        self.root_search, self.gumbel_m, self.gumbel_scale = root_search, int(gumbel_m), float(gumbel_scale)
+        self.gumbel_c_visit = float(cq_c_visit if gumbel_c_visit is None else gumbel_c_visit)
+        self.gumbel_c_scale = float(cq_c_scale if gumbel_c_scale is None else gumbel_c_scale)
 
     def takes_belief(self, full):
         """Whether its search of a decision takes the root's belief (`full`: a full search)."""
         return self.belief_tilt > 0 and (full or self.belief_fast)
+
+    @property
+    def gumbel(self):
+        return self.root_search == 'gumbel'
 
     @property
     def select_transform(self):
@@ -155,9 +173,18 @@ class PySearch:
     def set_belief(self, pred, seat, game, rng):
         self.t.set_belief((np.asarray(pred, np.float32), seat.belief_tilt, seat.belief_clip), seat.belief_mix, game, rng)
 
+    def set_gumbel(self, m, budget, noise, c_visit, c_scale):
+        self.t.set_gumbel(m, budget, noise, c_visit, c_scale)
+
+    def gumbel_choose(self):
+        return mcts.gumbel_choose(self.t)
+
     def stats(self):
-        """acts, visit counts, P0, root win vector - without the forced walks (root minimum visits)."""
+        """acts, visit counts, P0, root win vector - without the forced walks (root minimum visits); a
+        Gumbel search's root value is its own (`mcts.gumbel_q`)."""
         r = self.t.root
+        if self.t.gumbel is not None:
+            return r.acts, r.Nv, r.P0, mcts.gumbel_q(self.t)
         if self.t.root_min:
             return r.acts, mcts.root_visits_pruned(self.t), r.P0, mcts.root_win_pruned(self.t)
         return r.acts, r.Nv, r.P0, mcts.root_win(r)
@@ -183,6 +210,7 @@ class PySearch:
         self.t.root = child
         self.t.set_root_min(0)
         self.t.belief, self.t.belief_mix = None, 0.0          # (a belief is one decision's)
+        self.t.gumbel = None
         return True
 
 
@@ -229,7 +257,15 @@ class RsSearch:
     def set_belief(self, pred, seat, game, rng):
         self.t.set_belief(np.asarray(pred, np.float32), game, seat.belief_tilt, seat.belief_clip, seat.belief_mix)
 
+    def set_gumbel(self, m, budget, noise, c_visit, c_scale):
+        self.t.set_gumbel(m, budget, [float(x) for x in noise], c_visit, c_scale)
+
+    def gumbel_choose(self):
+        return self.t.gumbel_choose()
+
     def stats(self):
+        if self.t.gumbel_on:
+            return self.t.root_acts, self.t.root_visits, self.t.root_priors0, self.t.gumbel_q()
         if self.t.root_min:
             return self.t.root_acts, self.t.root_visits_pruned, self.t.root_priors0, self.t.root_win_pruned()
         return self.t.root_acts, self.t.root_visits, self.t.root_priors0, self.t.root_win()
@@ -362,7 +398,7 @@ class PyDriver:
             if b is not None:
                 # (a root-view leaf: the value of its value-only row vb, the priors of its own row b)
                 is_root = tree.expand(priors[off[b]:off[b + 1]].tolist(), value[vb], margin[vb], seat)
-                if is_root and seat.selfplay and slot.full:
+                if is_root and seat.selfplay and slot.full and not seat.gumbel:
                     tree.add_noise(seat, slot.np_rng)
                 slot.sims += 1
                 n += 1
@@ -476,6 +512,9 @@ class PyDriver:
             self.queue.append(lb)
 
     def _start(self, slot, seat, p):
+        if seat.gumbel and self.record and seat.selfplay and seat.record and seat.policy_target == 'visits':
+            raise ValueError("root_search 'gumbel' records the policy_target 'cq' (its visit counts are sequential "
+                             "halving's schedule, not a policy)")
         slot.full = seat.sims_fast is None or slot.rng.random() < seat.p_full
         slot.target = seat.sims if slot.full else seat.sims_fast
         slot.belief = seat.takes_belief(slot.full)          # (docs/search.md 3.8)
@@ -484,11 +523,19 @@ class PyDriver:
             tree = slot.trees[p] = SEARCH[seat.impl](slot.game, seat, slot.search_rng)
         else:
             tree.set_base(slot.game, slot.search_rng)
-            if seat.selfplay and slot.full and tree.expanded:
+            if seat.selfplay and slot.full and tree.expanded and not seat.gumbel:
                 tree.add_noise(seat, slot.np_rng)
         # the root minimum visits of this search (docs/search.md 3.5; 0 = off)
         tree.set_root_min(mcts.root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full,
                                           len(slot.game.legal()), slot.target))
+        if seat.gumbel:
+            # the Gumbel root search (docs/search.md 3.7): every search of the seat; its noise (drawn from
+            # the slot's noise stream) replaces Dirichlet noise and temperature; the schedule is that of the
+            # search's simulations (a fresh root's own evaluation takes the first)
+            sc = mcts.gumbel_noise_scale(seat.selfplay, slot.decisions, seat.temp_moves, seat.gumbel_scale)
+            k = len(slot.game.legal())
+            noise = list(sc * slot.np_rng.gumbel(size=k)) if sc > 0 else []
+            tree.set_gumbel(seat.gumbel_m, slot.target, noise, seat.gumbel_c_visit, seat.gumbel_c_scale)
 
     def _decide(self, slot, seat, tree, p):
         acts, Nv, P0, rw = tree.stats()
@@ -503,7 +550,9 @@ class PyDriver:
                     keep.append((i, o))
             slot.view_wait = keep
         tot = sum(Nv)
-        if seat.selfplay and slot.decisions < seat.temp_moves and tot > 0:
+        if seat.gumbel:
+            i = tree.gumbel_choose()                   # the Gumbel search's move: its noise sampled
+        elif seat.selfplay and slot.decisions < seat.temp_moves and tot > 0:
             r = slot.rng.random() * tot
             i = len(Nv) - 1
             for k, n in enumerate(Nv):

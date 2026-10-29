@@ -43,6 +43,17 @@
 //! `SearchGame::determinize_with` instead of `determinize` - but a `belief_mix` share, dealt
 //! uniformly as before. `None` (the default, and after `reset` / `advance`) is the tree of before,
 //! bit for bit.
+//! **Gumbel root search** (`Tree::set_gumbel`, docs/search.md 3.7; off by default): Gumbel
+//! AlphaZero's root (Danihelka et al. 2022, "Policy improvement by planning with Gumbel"; the
+//! arithmetic of DeepMind's mctx `gumbel_muzero_policy`). The search's root walks follow
+//! sequential halving (`gumbel_sequence`): walk j may only take a root option whose visits of THIS
+//! search equal the schedule's `seq[j]`, and among those the one maximising `g + ln P0 +
+//! sigma(completedQ)` (`completed_q_logits`, the 'cq' target's arithmetic; g = the search's Gumbel
+//! noise per option). The first `min(m, options)` walks visit the top options by `g + ln P0` (the
+//! Gumbel-top-k sample), then the field is halved until two remain. Below the root PUCT is
+//! unchanged. The final move is `gumbel_choose` (the same score among the options this search
+//! visited most), the root value `gumbel_q` (the improved policy's value). A reused root's earlier
+//! visits count in Q and sigma but not in the schedule (this search's walks are counted apart).
 use std::hash::{Hash, Hasher};
 
 use crate::game::{Belief, SearchGame, MAX_SEATS};
@@ -263,6 +274,63 @@ pub fn terminal_values<G: SearchGame>(g: &G, margin_w: f64) -> ([f64; MAX_SEATS]
     (util, win)
 }
 
+/// Sequential halving's schedule (mctx `get_sequence_of_considered_visits`): for each of a search's
+/// `n` root walks, the visit count (this search's) a root option must have to be taken by it, with
+/// `m` options considered (`min(gumbel_m, options)`). Rounds of `max(1, n / (ceil(log2 m) x
+/// considered))` walks per considered option, the considered halved after each round (at least 2);
+/// `m <= 1`: 0, 1, 2, ... (one option takes every walk). Its length is `n`.
+pub fn gumbel_sequence(m: u32, n: u32) -> Vec<u32> {
+    let n = n as usize;
+    if m <= 1 {
+        return (0..n as u32).collect();
+    }
+    let log2max = m.next_power_of_two().trailing_zeros();
+    let mut seq = Vec::with_capacity(n + m as usize);
+    let mut visits = vec![0u32; m as usize];
+    let mut nc = m as usize;
+    while seq.len() < n {
+        let extra = (n / (log2max as usize * nc)).max(1);
+        for _ in 0..extra {
+            seq.extend_from_slice(&visits[..nc]);
+            for v in visits[..nc].iter_mut() {
+                *v += 1;
+            }
+        }
+        nc = (nc / 2).max(2);
+    }
+    seq.truncate(n);
+    seq
+}
+
+/// The index of the highest `score` among the indices `ok` admits (the first maximum on exact ties),
+/// None when it admits none.
+fn best_of(score: &[f64], ok: impl Fn(usize) -> bool) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, &x) in score.iter().enumerate() {
+        if ok(i) && best.is_none_or(|b| x > score[b]) {
+            best = Some(i);
+        }
+    }
+    best
+}
+
+/// The Gumbel root search of the current search (`Tree::set_gumbel`).
+#[derive(Clone, Debug)]
+struct GumbelRoot {
+    /// Sequential halving's schedule over this search's root walks (`gumbel_sequence`).
+    seq: Vec<u32>,
+    /// The Gumbel noise per root option (0 without noise).
+    g: Vec<f64>,
+    /// sigma's completed-Q transform (`completed_q_logits`).
+    c_visit: f64,
+    c_scale: f64,
+    /// Per root option: this search's walks and the sum of their backed-up win vectors.
+    n: Vec<u32>,
+    win: Vec<[f64; MAX_SEATS]>,
+    /// This search's root walks so far (sum of `n`).
+    walks: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Tree<G: SearchGame> {
     /// The root decider (whose information set the tree searches).
@@ -293,6 +361,8 @@ pub struct Tree<G: SearchGame> {
     /// and the share of its simulations still dealt uniformly.
     belief: Option<Belief>,
     belief_mix: f64,
+    /// The Gumbel root search of the current search (`set_gumbel`; None = PUCT at the root).
+    gumbel: Option<Box<GumbelRoot>>,
 }
 
 /// Deal a world for `viewer` (docs/search.md 3.8): `determinize_with` the belief, but a `mix` share
@@ -325,6 +395,7 @@ impl<G: SearchGame> Default for Tree<G> {
             walk_forced: NIL,
             belief: None,
             belief_mix: 0.0,
+            gumbel: None,
         }
     }
 }
@@ -352,6 +423,7 @@ impl<G: SearchGame> Tree<G> {
         self.set_root_min(0);
         self.belief = None;
         self.belief_mix = 0.0;
+        self.gumbel = None;
         self.set_base(game, rng);
     }
 
@@ -452,6 +524,136 @@ impl<G: SearchGame> Tree<G> {
         }
         self.walk_forced = j as u32;
         j
+    }
+
+    /// The Gumbel root search for the search starting now (docs/search.md 3.7): sequential halving
+    /// over `min(m, options)` considered root options, its schedule that of `budget` root walks (the
+    /// driver: the search's simulations - a fresh root's own evaluation takes the first, so its walks
+    /// follow the schedule's first `budget - 1` entries; walks past it take the most walked), Gumbel noise
+    /// `noise` per root option (empty: none, g = 0; else one per option), sigma's transform
+    /// `c_visit`, `c_scale` (the 'cq' target's arithmetic). Exclusive with the root minimum visits
+    /// (the floor is turned off). `reset` and `advance` turn it off.
+    pub fn set_gumbel(&mut self, m: u32, budget: u32, noise: &[f64], c_visit: f64, c_scale: f64) {
+        let k = self.nodes[self.root as usize].nacts as usize;
+        assert!(noise.is_empty() || noise.len() == k, "set_gumbel: {} noise values for {k} root options", noise.len());
+        self.set_root_min(0);
+        let considered = m.min(k as u32);
+        self.gumbel = Some(Box::new(GumbelRoot {
+            seq: gumbel_sequence(considered, budget),
+            g: if noise.is_empty() { vec![0.0; k] } else { noise.to_vec() },
+            c_visit,
+            c_scale,
+            n: vec![0; k],
+            win: vec![[0.0; MAX_SEATS]; k],
+            walks: 0,
+        }));
+    }
+
+    /// Back to PUCT at the root (the Gumbel root search off).
+    pub fn clear_gumbel(&mut self) {
+        self.gumbel = None;
+    }
+
+    /// The current search's root is a Gumbel root search's (`set_gumbel`).
+    pub fn gumbel_on(&self) -> bool {
+        self.gumbel.is_some()
+    }
+
+    /// Per root option: the current Gumbel search's walks (empty when off).
+    pub fn gumbel_visits(&self) -> &[u32] {
+        self.gumbel.as_ref().map_or(&[], |g| &g.n)
+    }
+
+    /// Per root option: the current Gumbel search's noise (empty when off).
+    pub fn gumbel_noise(&self) -> &[f64] {
+        self.gumbel.as_ref().map_or(&[], |g| &g.g)
+    }
+
+    /// Per root option: the sum of the win vectors the current Gumbel search's walks backed up
+    /// (absolute seats; empty when off).
+    pub fn gumbel_win(&self) -> &[[f64; MAX_SEATS]] {
+        self.gumbel.as_ref().map_or(&[], |g| &g.win)
+    }
+
+    /// The current Gumbel search's schedule (empty when off).
+    pub fn gumbel_schedule(&self) -> &[u32] {
+        self.gumbel.as_ref().map_or(&[], |g| &g.seq)
+    }
+
+    /// `g + completed_q_logits` per root option (sigma from every visit of the root, a reused root's
+    /// too): the score of the root walks and of the final move.
+    fn gumbel_scores(&self, gr: &GumbelRoot) -> Vec<f64> {
+        let st = self.stats_of(self.root);
+        let p0: Vec<f32> = st.iter().map(|s| s.p0).collect();
+        let n: Vec<u32> = st.iter().map(|s| s.n).collect();
+        let w: Vec<f64> = st.iter().map(|s| s.w).collect();
+        let mut lg = completed_q_logits(&p0, &n, &w, self.value0(self.root), gr.c_visit, gr.c_scale);
+        for (x, g) in lg.iter_mut().zip(&gr.g) {
+            *x += g;
+        }
+        lg
+    }
+
+    /// The root option of the next walk: among the options whose walks of this search equal the
+    /// schedule's entry for it (past the schedule: the most walked ones), the highest score, the
+    /// first maximum on exact ties (mctx `gumbel_muzero_root_action_selection`).
+    fn gumbel_select(&self) -> usize {
+        let gr = self.gumbel.as_ref().unwrap();
+        let want = match gr.seq.get(gr.walks as usize) {
+            Some(&v) => v,
+            None => gr.n.iter().copied().max().unwrap_or(0),
+        };
+        let sc = self.gumbel_scores(gr);
+        best_of(&sc, |i| gr.n[i] == want).unwrap_or_else(|| best_of(&sc, |_| true).unwrap_or(0))
+    }
+
+    /// The Gumbel search's move (docs/search.md 3.7; mctx `gumbel_muzero_policy`'s action): among the
+    /// root options this search walked most (the last survivors of sequential halving; every option
+    /// when it walked none), the highest `g + ln P0 + sigma(completedQ)`, the first maximum on exact
+    /// ties. 0 when the root has no statistics; None when the Gumbel search is off.
+    pub fn gumbel_choose(&self) -> Option<usize> {
+        let gr = self.gumbel.as_ref()?;
+        if !self.expanded(self.root) {
+            return Some(0);
+        }
+        let top = gr.n.iter().copied().max().unwrap_or(0);
+        let sc = self.gumbel_scores(gr);
+        Some(best_of(&sc, |i| gr.n[i] == top).unwrap_or(0))
+    }
+
+    /// The Gumbel search's root value (absolute seats; docs/search.md 3.7): the improved policy's
+    /// value, `sum_i pi'_i Wv_i / sum_i pi'_i` over the root options this search walked, pi' =
+    /// `completed_q_policy` with the search's transform (the 'cq' target when the transforms agree),
+    /// Wv_i = this search's mean backed-up win vector through option i. Sequential halving spends its
+    /// first round on every considered option, so the mean of the root's backups (`win`) would mix
+    /// the options it ruled out into the value; pi' is the policy the search's move samples (the
+    /// Gumbel-max trick). None when this search walked no root option (or the Gumbel search is off).
+    pub fn gumbel_q(&self) -> Option<[f64; MAX_SEATS]> {
+        let gr = self.gumbel.as_ref()?;
+        if gr.walks == 0 || !self.expanded(self.root) {
+            return None;
+        }
+        let st = self.stats_of(self.root);
+        let p0: Vec<f32> = st.iter().map(|s| s.p0).collect();
+        let n: Vec<u32> = st.iter().map(|s| s.n).collect();
+        let w: Vec<f64> = st.iter().map(|s| s.w).collect();
+        let lg = completed_q_logits(&p0, &n, &w, self.value0(self.root), gr.c_visit, gr.c_scale);
+        let m = lg.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let (mut tot, mut q) = (0.0, [0.0; MAX_SEATS]);
+        for i in 0..lg.len() {
+            if gr.n[i] == 0 {
+                continue;
+            }
+            let p = (lg[i] - m).exp();
+            tot += p;
+            for j in 0..MAX_SEATS {
+                q[j] += p * gr.win[i][j] / gr.n[i] as f64;
+            }
+        }
+        for x in q.iter_mut() {
+            *x /= tot;
+        }
+        Some(q)
     }
 
     /// Start a search from `game` (the live game): with `redet` every simulation clones and
@@ -687,6 +889,8 @@ impl<G: SearchGame> Tree<G> {
             }
             let i = match hook(self, node, g) {
                 Some(i) => i,
+                // (the Gumbel root search, docs/search.md 3.7: sequential halving at the root, PUCT below)
+                None if node == self.root && self.gumbel.is_some() => self.gumbel_select(),
                 None => {
                     let i = self.select(node, w.c_puct);
                     if self.root_min > 0 && node == self.root {
@@ -814,6 +1018,19 @@ impl<G: SearchGame> Tree<G> {
             }
             self.forced_n += 1;
         }
+        if let Some(gr) = self.gumbel.as_mut() {
+            // (a Gumbel search counts its own root walks: the schedule and the root value)
+            if let Some(&(node, i)) = path.first() {
+                if node == self.root {
+                    let i = i as usize;
+                    gr.n[i] += 1;
+                    gr.walks += 1;
+                    for j in 0..MAX_SEATS {
+                        gr.win[i][j] += win[j];
+                    }
+                }
+            }
+        }
         for &(node, i) in path {
             let nd = &mut self.nodes[node as usize];
             let si = nd.stat_off as usize + i as usize;
@@ -856,6 +1073,7 @@ impl<G: SearchGame> Tree<G> {
                 self.set_root_min(0);
                 self.belief = None;
                 self.belief_mix = 0.0;
+                self.gumbel = None;
                 if self.nodes.len() > COMPACT_AT {
                     self.compact();
                 }
@@ -881,6 +1099,7 @@ impl<G: SearchGame> Tree<G> {
             walk_forced: self.walk_forced,
             belief: self.belief.take(),
             belief_mix: self.belief_mix,
+            gumbel: self.gumbel.take(),
             ..Default::default()
         };
         let mut map = std::collections::HashMap::new();
