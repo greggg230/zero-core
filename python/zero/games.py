@@ -96,7 +96,8 @@ def is_external(seat):
 
 def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20, sims_fast=None,
             p_full=1.0, chance_k=0, margin_w=0.0, redet=True, policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0,
-            sims_minor=None, select='visits', select_min_visits=0, select_c_visit=None, select_c_scale=None):
+            sims_minor=None, select='visits', select_min_visits=0, select_c_visit=None, select_c_scale=None,
+            root_min_visits=0, root_min_visits_max_actions=4):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
@@ -109,10 +110,12 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     target carries it as cq_c_visit / cq_c_scale (nothing else reads them there), one with a 'cq'
     target adds the keys select_c_visit / select_c_scale only where the rule's transform differs
     from the target's - so a transform given equal to the target's is the seat of before, key for
-    key."""
-    from .mcts import check_select, check_select_transform, select_transform
+    key. root_min_visits: the root minimum visits of its full searches on roots of up to
+    root_min_visits_max_actions options (docs/search.md 3.5; 0 = off: no key, the seat of before)."""
+    from .mcts import check_root_min, check_select, check_select_transform, select_transform
     check_select(select, select_min_visits)
     check_select_transform(select, select_c_visit, select_c_scale)
+    check_root_min(root_min_visits, root_min_visits_max_actions)
     d = dict(key=key, sims=sims, c_puct=c_puct, selfplay=selfplay, alpha=alpha, eps=eps, temp_moves=temp_moves,
              sims_fast=sims_fast, p_full=p_full, chance_k=chance_k, margin_w=margin_w, redet=redet)
     sel = select_transform(cq_c_visit, cq_c_scale, select_c_visit, select_c_scale)
@@ -126,6 +129,8 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             d.update(select_c_visit=sel[0], select_c_scale=sel[1])
     if sims_minor:
         d['sims_minor'] = int(sims_minor)
+    if root_min_visits:
+        d.update(root_min_visits=int(root_min_visits), root_min_visits_max_actions=int(root_min_visits_max_actions))
     return d
 
 

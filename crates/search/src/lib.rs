@@ -21,5 +21,9 @@ pub mod toy;
 pub mod toy_team;
 pub mod tree;
 
+// a test game for the root minimum visits (docs/search.md 3.5)
+#[cfg(test)]
+pub(crate) mod mull_game;
+
 pub use game::{team_of, Bot, SearchGame, MAX_SEATS};
 pub use rng::Rng;

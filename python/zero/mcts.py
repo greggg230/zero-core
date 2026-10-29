@@ -42,6 +42,14 @@ The move of a decision that is not sampled (docs/search.md 3.3; `select_index`):
 `completed_q_logits`) among the options with at least `min_visits` visits, with the rule's own
 completed-Q transform where set (`select_transform`; else the target's). `select_tag` names a
 rule (its evaluations' Elo pool, docs/az.md 5.4), `select_settings` reads one from run settings.
+
+Root minimum visits (docs/search.md 3.5; `Tree.set_root_min`, off by default): every root option
+of a search gets at least k visits. A walk keeps PUCT's root option unless that option already has
+k visits and another has fewer: then it takes the least-visited root option (the lowest index on
+ties), a forced walk. The tree counts the forced walks per root option and sums their backed-up
+win vectors: the visit-based outputs leave them out (`root_visits_pruned`, `root_win_pruned`), the
+Q-based ones (Q, the 'cq' target and rule) use them. `root_floor` decides which searches take it
+(the Rust driver's `driver::root_floor`).
 """
 import math
 
@@ -78,8 +86,12 @@ class Node:
 
 
 class Tree:
-    """The search for one decision of `viewer` (the decider at the root)."""
-    __slots__ = ('base', 'root', 'viewer', 'redet', 'n', 'team')
+    """The search for one decision of `viewer` (the decider at the root). `root_min`: the root
+    minimum visits of the current search (`set_root_min`; 0 = off), `forced` the forced walks per
+    root option, `forced_win` / `forced_n` their backed-up win vectors' sum and number,
+    `walk_forced` the root option of the walk in flight if it is forced (None)."""
+    __slots__ = ('base', 'root', 'viewer', 'redet', 'n', 'team', 'root_min', 'forced', 'forced_win', 'forced_n',
+                 'walk_forced')
 
     def __init__(self, game, redet=True, rng=None):
         self.viewer = game.to_move
@@ -87,7 +99,17 @@ class Tree:
         self.n = game.n_players
         self.team = max(1, getattr(game, 'team_size', 1))
         self.root = Node(self.viewer, list(game.legal()))
+        self.set_root_min(0)
         self.set_base(game, rng)
+
+    def set_root_min(self, k):
+        """Root minimum visits for the search starting now (0 = off); clears the forced walks'
+        accounting (the Rust tree's `set_root_min`; a new root after `advance` needs it again)."""
+        self.root_min = int(k)
+        self.forced = [0] * len(self.root.acts) if k else []
+        self.forced_win = [0.0] * self.n
+        self.forced_n = 0
+        self.walk_forced = None
 
     def set_base(self, game, rng=None):
         if self.redet:
@@ -129,7 +151,17 @@ def select(node, c_puct):
     return best_i
 
 
-def backup(path, util, win):
+def backup(path, util, win, tree=None):
+    """N_i += 1, W_i += util[decider], tot += 1, wsum += win along the path; with `tree`, the
+    backup of its forced walk in flight is also counted as forced (root minimum visits)."""
+    if tree is not None and tree.walk_forced is not None:
+        i = tree.walk_forced
+        tree.walk_forced = None
+        tree.forced[i] += 1
+        tree.forced_n += 1
+        fw = tree.forced_win
+        for j in range(len(fw)):
+            fw[j] += win[j]
     for node, i in path:
         node.Nv[i] += 1
         node.W[i] += util[node.player]
@@ -144,6 +176,71 @@ def root_win(root):
     if not root.tot:
         return None
     return [w / root.tot for w in root.wsum]
+
+
+def root_win_pruned(tree):
+    """`root_win` without the current search's forced walks (= root_win when nothing was forced;
+    None when no other backup went through the root)."""
+    r = tree.root
+    if not tree.forced_n:
+        return root_win(r)
+    t = r.tot - tree.forced_n
+    if t <= 0:
+        return None
+    return [(w - f) / t for w, f in zip(r.wsum, tree.forced_win)]
+
+
+def root_visits_pruned(tree):
+    """The root's visit counts without the current search's forced walks (N - forced; the visit
+    counts when the floor is off)."""
+    nv = list(tree.root.Nv)
+    for i, f in enumerate(tree.forced):
+        nv[i] -= f
+    return nv
+
+
+def force_root(tree, i0):
+    """The root option a walk takes under the floor given PUCT's choice i0: i0 unless it has at
+    least root_min visits and another root option has fewer - then the least-visited one (the
+    lowest index on ties), recorded as the walk's forced option."""
+    nv = tree.root.Nv
+    k = tree.root_min
+    if nv[i0] < k:
+        return i0
+    m = min(nv)
+    if m >= k:
+        return i0
+    j = nv.index(m)
+    tree.walk_forced = j
+    return j
+
+
+def root_floor(k, max_actions, full, m, target):
+    """The root minimum visits a search takes (the Rust driver's `root_floor`, docs/search.md
+    3.5): k for a full search (a self-play seat's recorded ones, every search of an evaluation seat;
+    never a fast or minor one) of m options, 2 <= m <= max_actions, with 2 m k <= target simulations;
+    else 0."""
+    if not k or not full or m < 2 or m > max_actions or 2 * m * k > target:
+        return 0
+    return int(k)
+
+
+def check_root_min(k=0, max_actions=4, what='root_min_visits'):
+    """The root minimum visits' settings (`what`: the setting's name; k an integer >= 0, max_actions
+    an integer >= 2) -> None, else ValueError."""
+    if isinstance(k, bool) or not isinstance(k, int) or k < 0:
+        raise ValueError(f'{what} {k!r}: an integer >= 0 (0 = off)')
+    if isinstance(max_actions, bool) or not isinstance(max_actions, int) or max_actions < 2:
+        raise ValueError(f'root_min_visits_max_actions {max_actions!r}: an integer >= 2')
+
+
+def forced_tag(k=0, max_actions=4):
+    """The suffix of a move rule's name for the root minimum visits of its searches: '' (off),
+    '-f4' (k 4, the default max_actions 4), '-f4a6' (another max_actions) - an evaluation's moves
+    change with it, so its Elo pool does (docs/az.md 5.4)."""
+    if not k:
+        return ''
+    return f'-f{int(k)}' + (f'a{int(max_actions)}' if int(max_actions) != 4 else '')
 
 
 def leaf_values(value_rel, margin_rel, player, n, margin_w, team=1):
@@ -171,6 +268,7 @@ def terminal_values(g, margin_w, team=1):
 def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
     """One simulation -> (leaf node, leaf game, path) when the leaf needs a network
     evaluation, or None after backing up a terminal state."""
+    tree.walk_forced = None
     g = tree.base.clone()
     if tree.redet:
         g.determinize(tree.viewer, rng.getrandbits(63))
@@ -182,6 +280,8 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
         if node.P is None:
             return node, g, path
         i = select(node, c_puct)
+        if tree.root_min and node is tree.root:
+            i = force_root(tree, i)
         path.append((node, i))
         edge = node.kids[i]
         if edge is None:
@@ -200,10 +300,10 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
                 child = edge.kids[sk] = Node(tree.viewer, [])
             if child.P is None:
                 return child, g, path
-            backup(path, child.vec, child.wsum)
+            backup(path, child.vec, child.wsum, tree)
             return None
         if g.over:
-            backup(path, *terminal_values(g, margin_w, tree.team))
+            backup(path, *terminal_values(g, margin_w, tree.team), tree)
             return None
         sk = (key, g.to_move, tuple(legal))
         child = edge.kids.get(sk)
@@ -212,13 +312,15 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
         node = child
 
 
-def expand_and_backup(node, path, priors, value_rel, margin_rel, n, margin_w=0.0, team=1):
+def expand_and_backup(node, path, priors, value_rel, margin_rel, n, margin_w=0.0, team=1, tree=None):
+    """Expand the leaf `node` with its evaluation and back it up along `path` (`tree`: the tree of
+    the walk, for the root minimum visits' accounting of a forced walk)."""
     util, win = leaf_values(value_rel, margin_rel, node.player, n, margin_w, team)
     node.expand(priors, util, n)
     if not node.acts:                       # a deferred terminal keeps its win vector
         node.wsum = list(win)
         node.tot = 1
-    backup(path, util, win)
+    backup(path, util, win, tree)
 
 
 def add_noise(node, alpha, eps, np_rng):

@@ -135,6 +135,16 @@ DEFAULTS = dict(
     # leaves the evaluation's moves (and its Elo pool, named after the rule's transform) alone. The
     # recorded targets never read them; only with the rule 'cq'. On the command line 'none' unsets one.
     eval_select_c_visit=None, eval_select_c_scale=None, selfplay_select_c_visit=None, selfplay_select_c_scale=None,
+    # root minimum visits ("forced playouts", docs/search.md 3.5, docs/az.md 5.5): a full search
+    # (self-play: the recorded ones, sims; evaluation: every search) whose root has 2 ..
+    # root_min_visits_max_actions options gives each at least k visits when its budget allows (2 x
+    # options x k <= its simulations), so a near-one-hot prior cannot starve an option of the Q its
+    # completed-Q target and rule need. The forced walks come out of the same budget; the visit
+    # counts (the 'visits' target, temperature sampling, the 'visits' rule) and the root value
+    # target leave them out. selfplay_root_min_visits: self-play's seat; eval_root_min_visits: every
+    # evaluation seat (its moves change: the Elo pool's name gets '-f<k>'). 0 = off (the default:
+    # today's searches, bit for bit)
+    selfplay_root_min_visits=0, eval_root_min_visits=0, root_min_visits_max_actions=4,
     # the game spec of every match that records nothing (vs the yardstick, vs random, Elo, the
     # reference games); '' = the game package's evaluation spec for the self-play spec
     # (GamePackage.eval_specs; MTG: a fixed deck set, self-play random decks), else the spec
@@ -377,11 +387,15 @@ class Run:
                              c.get('policy_target', 'visits'), c.get('cq_c_visit', 50.0), c.get('cq_c_scale', 1.0),
                              sims_minor=c.get('sims_minor', 0) or None, select=c.get('selfplay_select', 'visits'),
                              select_min_visits=c.get('selfplay_select_min_visits', 0),
-                             select_c_visit=c.get('selfplay_select_c_visit'), select_c_scale=c.get('selfplay_select_c_scale'))
+                             select_c_visit=c.get('selfplay_select_c_visit'), select_c_scale=c.get('selfplay_select_c_scale'),
+                             root_min_visits=c.get('selfplay_root_min_visits', 0),
+                             root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
-                         select_c_visit=c.get('eval_select_c_visit'), select_c_scale=c.get('eval_select_c_scale'))
+                         select_c_visit=c.get('eval_select_c_visit'), select_c_scale=c.get('eval_select_c_scale'),
+                         root_min_visits=c.get('eval_root_min_visits', 0),
+                         root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4))
 
     def eval_tag(self):
         """The name of the evaluation seats' move rule ('visits', 'cq', 'cq-n2' ...): the evaluations'
@@ -1249,13 +1263,18 @@ def resolve_config(args, saved):
 
 def check_eval_settings(cfg, where=''):
     """The move-rule and Elo-offset settings (eval_select, selfplay_select, their guards and their
-    completed-Q transforms, elo_offsets) -> None, else SystemExit (`where`: a prefix, e.g.
-    'resolver_cfg: ')."""
-    from .mcts import check_select, check_select_transform
+    completed-Q transforms, the root minimum visits, elo_offsets) -> None, else SystemExit (`where`:
+    a prefix, e.g. 'resolver_cfg: ')."""
+    from .mcts import check_root_min, check_select, check_select_transform
     for k in ('eval_select', 'selfplay_select'):
         try:
             check_select(cfg.get(k, 'visits'), cfg.get(k + '_min_visits', 0), what=k)
             check_select_transform(cfg.get(k, 'visits'), cfg.get(k + '_c_visit'), cfg.get(k + '_c_scale'), what=k)
+        except ValueError as e:
+            raise SystemExit(f'{where}{e}') from None
+    for k in ('selfplay_root_min_visits', 'eval_root_min_visits'):
+        try:
+            check_root_min(cfg.get(k, 0), cfg.get('root_min_visits_max_actions', 4), what=k)
         except ValueError as e:
             raise SystemExit(f'{where}{e}') from None
     try:

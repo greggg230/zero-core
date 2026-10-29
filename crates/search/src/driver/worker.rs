@@ -214,6 +214,7 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: search target set for a non-network seat")?;
         let mut t = slot.spare.pop().unwrap_or_default();
         t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
+        t.set_root_min(root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap()));
         slot.trees[p] = Some(t);
     }
     Ok(lost)
@@ -398,13 +399,22 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
             }
         }
     }
+    // the root minimum visits of this search (docs/search.md 3.5; 0 = off: the tree's walks
+    // are PUCT's alone; a reused root's visits count toward the floor)
+    let k = root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap());
+    slot.trees[p].as_mut().unwrap().set_root_min(k);
 }
 
 /// Choose the move after the search. -> whether a training record was made.
 fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize, key: &mut Vec<u64>) -> Result<bool, String> {
     let tree = slot.trees[p].as_ref().unwrap();
     let root = tree.root;
-    let nv = tree.visits(root);
+    let nv_all = tree.visits(root);
+    // with the root minimum visits (docs/search.md 3.5) the visit-based outputs - temperature
+    // sampling, the 'visits' rule, the 'visits' target, the root value q - leave the forced walks
+    // out; the 'cq' rule and target read Q from every visit
+    let pruned = if tree.root_min() > 0 { Some(tree.root_visits_pruned()) } else { None };
+    let nv: &[u32] = pruned.as_deref().unwrap_or(&nv_all);
     let p0 = tree.priors0(root);
     let acts = tree.acts(root);
     let tot: u64 = nv.iter().map(|&x| x as u64).sum();
@@ -425,8 +435,8 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         // the seat's rule (docs/search.md 3.3): argmax (N, P0) by default, or the completed-Q
         // logits' argmax (Select::choose, the code SearchTree.root_select runs)
         match seat.select {
-            Select::Visits => argmax_visits(&nv, &p0),
-            sel => sel.choose(&p0, &nv, &tree.values(root), tree.value0(root)),
+            Select::Visits => argmax_visits(nv, &p0),
+            sel => sel.choose(&p0, &nv_all, &tree.values(root), tree.value0(root)),
         }
     };
     let a = acts[i];
@@ -441,7 +451,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         let mut x = vec![0.0f32; G::NUM_FEATURES];
         slot.game.as_ref().unwrap().encode(p, &mut x);
         slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net });
-        slot.rq.push(tree.win(root));
+        slot.rq.push(if pruned.is_some() { tree.root_win_pruned() } else { tree.win(root) });
     }
     slot.decisions += 1;
     apply(cfg, slot, a, key)?;

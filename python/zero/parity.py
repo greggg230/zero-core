@@ -11,12 +11,18 @@
 * `select_formula`: the move rule (docs/search.md 3.3) - the Python `mcts.select_index` on Rust
   roots' statistics against the Rust driver's own choice (`SearchTree.root_select`, the code of a
   driver's non-sampled moves), exactly (but on near-ties of the logits, ulps apart).
+* `forced`: the root minimum visits (docs/search.md 3.5) - positions searched by both trees
+  with the floor k and a lopsided stand-in prior (0.999 on one option): every option reaches k
+  visits in both, and the mean visit distributions with and without the forced walks, the forced
+  walks per option, the completed-Q targets and the root win without the forced walks agree at the
+  noise floor (Python vs Python).
 * `h2h`: games between a Rust-tree seat and a Python-tree seat (`play.PyDriver`, seats
   alternating), both searching with the same network and settings (and move rule): ~50% within
   error.
 
   python -m zero.parity positions [--sims 128 --reps 32 --chance-k 0 --cq-c-scale 1.0]
   python -m zero.parity positions --game toy_team --players 4     (deferred leaves, teams of 2)
+  python -m zero.parity forced [--k 4 --sims 96 --reps 24]         (root minimum visits)
   python -m zero.parity h2h --model runs/toy1/models/iter_0010.pt [--games 2000 --sims 32 --select cq]
   (or python -m <pkg>.az.parity ... in a game repo)
 """
@@ -57,26 +63,29 @@ class LinearEval:
         return pri, v, [0.0] * MAX_SEATS
 
 
-def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False):
-    """-> (root visits, root win[, completed-Q target with cq = (c_visit, c_scale)][, the tree])."""
+def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0):
+    """-> (root visits, root win[, completed-Q target with cq = (c_visit, c_scale)][, the tree]);
+    `root_min`: the root minimum visits of the search (docs/search.md 3.5; 0 = off)."""
     rng = random.Random(seed)
     t = mcts.Tree(g, redet, rng)
+    t.set_root_min(root_min)
     for _ in range(sims):
         r = mcts.simulate(t, rng, c_puct, chance_k)
         if r is None:
             continue
         node, leaf, path = r
         pri, v, m = ev(leaf.encode(node.player), node.acts, g.n_players)
-        mcts.expand_and_backup(node, path, pri, v, m, g.n_players, team=t.team)
+        mcts.expand_and_backup(node, path, pri, v, m, g.n_players, team=t.team, tree=t)
     out = (np.asarray(t.root.Nv, float), mcts.root_win(t.root))
     if cq is not None:
         out += (np.asarray(mcts.cq_target(t.root, *cq)),)
     return out + (t,) if tree else out
 
 
-def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False):
+def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0):
     """`search_py` with the Rust tree (`<package>._engine.SearchTree`)."""
     t = g.search_tree(redet, seed)
+    t.set_root_min(root_min)
     for _ in range(sims):
         r = t.simulate(g, c_puct, chance_k)
         if r is None:
@@ -142,6 +151,97 @@ def positions(game="toy", n=12, sims=96, reps=24, chance_k=0, c_puct_rs=1.0, see
                   f'{res["tv_cq_py_py"][-1]:.3f}, root win rs {wr:.3f} py {wa:.3f}', flush=True)
     return {k: float(np.mean(v)) for k, v in res.items()} | {'positions': n, 'sims': sims, 'reps': reps,
                                                                'cq': list(cq)}
+
+
+class SkewEval:
+    """`LinearEval` with a lopsided prior: 1 - eps on the option its priors favour, eps shared by the
+    others in proportion (MTG Zero's Delver mulligan: >= 0.98 on KEEP in 433 of 444 decisions)."""
+
+    def __init__(self, base, eps=0.001):
+        self.base, self.eps = base, eps
+
+    def __call__(self, x, acts, n):
+        pri, v, m = self.base(x, acts, n)
+        if len(pri) >= 2:
+            b = int(np.argmax(pri))
+            rest = sum(p for i, p in enumerate(pri) if i != b)
+            pri = [1 - self.eps if i == b else self.eps * p / rest for i, p in enumerate(pri)]
+        return pri, v, m
+
+
+def _py_pruned(t):
+    return np.asarray(mcts.root_visits_pruned(t), float), np.asarray(t.forced, float), mcts.root_win_pruned(t)
+
+
+def _rs_pruned(t):
+    return np.asarray(t.root_visits_pruned, float), np.asarray(t.root_forced, float), t.root_win_pruned()
+
+
+def forced(game='toy', n=10, sims=96, reps=24, k=4, seed=0, scale=0.15, eps=0.001, cq=(50.0, 1.0), max_options=6,
+           verbose=False, k_rs=None):
+    """The root minimum visits in both trees (docs/search.md 3.5): positions of 2..max_options options
+    (2 k options <= sims), the lopsided `SkewEval`, the floor `k`. -> dict: `floor_met` (every option
+    has >= k visits in every search of both trees), the TVs Rust-Python and Python-Python of the mean
+    visit distributions (`tv_*`), of the mean distributions without the forced walks (`tv_pruned_*`),
+    of the mean forced walks per option (`tv_forced_*`), of the mean completed-Q targets (`tv_cq_*`),
+    the mean forced walks per search (`forced_rs`, `forced_py`), |Rust - Python| of the decider's
+    mean root win without the forced walks (`win_diff`), averaged over the positions; `starved_k0`:
+    the share of options without a visit at k 0 (Rust). `k_rs`: another floor for the Rust tree (a
+    power check)."""
+    info = engine().game_info_of(game)
+    ev = SkewEval(LinearEval(info['num_features'], info['num_actions'], seed=1, scale=scale), eps)
+    E = engine()
+    rng = random.Random(seed)
+    pos = []
+    i = 0
+    while len(pos) < n:
+        g = E.Game(game, None, 2, 20_000 + seed * 1000 + i)
+        i += 1
+        for _ in range(rng.randrange(3, 60)):
+            if g.over:
+                break
+            g.step(rng.choice(g.legal()))
+        if not g.over and 2 <= len(g.legal()) <= max_options and 2 * len(g.legal()) * k <= sims:
+            pos.append(g)
+    names = ('tv', 'tv_pruned', 'tv_forced', 'tv_cq')
+    res = {f'{a}_{b}': [] for a in names for b in ('rs_py', 'py_py')}
+    res.update(win_diff=[], forced_rs=[], forced_py=[], starved_k0=[])
+    met = True
+    for j, g in enumerate(pos):
+        def runs(fn, pruned, base, kk=k):
+            out = []
+            for r in range(reps):
+                nv, _, cqt, t = fn(g, ev, sims, base + r, cq=cq, tree=True, root_min=kk)
+                pv, fv, pw = pruned(t)
+                out.append((nv, pv, fv, cqt, pw))
+            return out
+        rs = runs(search_rs, _rs_pruned, 1000, k if k_rs is None else k_rs)
+        pa = runs(search_py, _py_pruned, 2000)
+        pb = runs(search_py, _py_pruned, 3000)
+        met &= all(x[0].min() >= k for s in (rs, pa, pb) for x in s)
+        for name, idx in zip(names, range(4)):
+            mr, ma, mb = (np.mean([x[idx] for x in s], 0) for s in (rs, pa, pb))
+            if name == 'tv_forced' and min(mr.sum(), ma.sum(), mb.sum()) == 0:
+                res[f'{name}_rs_py'].append(0.0)
+                res[f'{name}_py_py'].append(0.0)
+                continue
+            res[f'{name}_rs_py'].append(tv(mr, ma))
+            res[f'{name}_py_py'].append(tv(ma, mb))
+        res['forced_rs'].append(float(np.mean([x[2].sum() for x in rs])))
+        res['forced_py'].append(float(np.mean([x[2].sum() for x in pa])))
+        wr = np.mean([x[4][g.to_move] for x in rs])
+        wa = np.mean([x[4][g.to_move] for x in pa])
+        res['win_diff'].append(abs(wr - wa))
+        k0 = [search_rs(g, ev, sims, 4000 + r)[0] for r in range(4)]
+        res['starved_k0'].append(float(np.mean([(x == 0).mean() for x in k0])))
+        if verbose:
+            print(f'position {j}: {len(g.legal())} options, forced rs {res["forced_rs"][-1]:.2f} py '
+                  f'{res["forced_py"][-1]:.2f}, TV rs-py {res["tv_rs_py"][-1]:.3f} (py-py {res["tv_py_py"][-1]:.3f}), '
+                  f'pruned {res["tv_pruned_rs_py"][-1]:.3f} ({res["tv_pruned_py_py"][-1]:.3f}), cq '
+                  f'{res["tv_cq_rs_py"][-1]:.3f} ({res["tv_cq_py_py"][-1]:.3f}), starved at k 0 '
+                  f'{res["starved_k0"][-1]:.2f}', flush=True)
+    return {kk: float(np.mean(v)) for kk, v in res.items()} | {'floor_met': bool(met), 'positions': n, 'sims': sims,
+                                                                 'reps': reps, 'k': k}
 
 
 def cq_formula(game='toy', n=8, sims=64, seed=0, cq_settings=((50.0, 1.0), (50.0, 0.1), (10.0, 3.0)), scale=0.15):
@@ -247,6 +347,14 @@ def main(argv=None):
     sf = sub.add_parser('select')
     sf.add_argument('--game', default='toy')
     sf.add_argument('--positions', type=int, default=8)
+    fo = sub.add_parser('forced')
+    fo.add_argument('--game', default='toy')
+    fo.add_argument('--positions', type=int, default=10)
+    fo.add_argument('--sims', type=int, default=96)
+    fo.add_argument('--reps', type=int, default=24)
+    fo.add_argument('--k', type=int, default=4)
+    fo.add_argument('--eps', type=float, default=0.001, help='the prior left to the options but the favourite')
+    fo.add_argument('--cq-c-scale', type=float, default=1.0)
     a = ap.parse_args(argv)
     if a.cmd == 'positions':
         print(json.dumps(positions(a.game, n=a.positions, sims=a.sims, reps=a.reps, chance_k=a.chance_k,
@@ -254,6 +362,9 @@ def main(argv=None):
                                    players=a.players, depth=tuple(a.depth))))
     elif a.cmd == 'select':
         print(json.dumps(select_formula(a.game, n=a.positions)))
+    elif a.cmd == 'forced':
+        print(json.dumps(forced(a.game, n=a.positions, sims=a.sims, reps=a.reps, k=a.k, eps=a.eps,
+                                cq=(50.0, a.cq_c_scale), verbose=True)))
     else:
         h2h(a.model, a.games, a.sims, a.chance_k, seed=a.seed, select=a.select, select_min_visits=a.select_min_visits,
             select_c_visit=a.select_c_visit, select_c_scale=a.select_c_scale)

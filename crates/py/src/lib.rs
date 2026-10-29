@@ -19,7 +19,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{sample_arrays, Batch, DriverCfg, KeyKind, NnSeat, PolicyTarget, SeatCfg, Select};
+use zero_search::driver::{root_floor, sample_arrays, Batch, DriverCfg, KeyKind, NnSeat, PolicyTarget, SeatCfg, Select};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
 use zero_search::{SearchGame, MAX_SEATS};
 
@@ -74,6 +74,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_class::<PySearchDriver>()?;
     m.add_function(wrap_pyfunction!(game_names, m)?)?;
     m.add_function(wrap_pyfunction!(game_info_of, m)?)?;
+    m.add_function(wrap_pyfunction!(root_floor_of, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
     Ok(())
 }
@@ -140,7 +141,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -207,6 +208,10 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         // whether its full searches are recorded (absent: true; false: a league opponent, a
         // past checkpoint whose moves are not the current policy's, docs/az.md 14)
         record: flag(d, "record", true)?,
+        // root minimum visits of its full searches (0 = off) on roots of up to
+        // root_min_visits_max_actions options (docs/search.md 3.5)
+        root_min_visits: get(d, "root_min_visits", 0u32)?,
+        root_min_visits_max_actions: get(d, "root_min_visits_max_actions", 4u32)?,
     }))
 }
 
@@ -220,6 +225,14 @@ fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>>
     d.set_item("bots", i.bots.clone())?;
     d.set_item("max_seats", MAX_SEATS)?;
     Ok(d)
+}
+
+/// The root minimum visits a search takes (`driver::root_floor`, docs/search.md 3.5): `k` for a
+/// full search of `m` options, 2 <= m <= max_actions, 2 m k <= target simulations; else 0.
+#[pyfunction]
+#[pyo3(name = "root_floor")]
+fn root_floor_of(k: u32, max_actions: u32, full: bool, m: usize, target: u32) -> u32 {
+    root_floor(k, max_actions, full, m, target)
 }
 
 /// Registered game names.
@@ -445,6 +458,29 @@ impl PySearchTree {
     fn root_select(&self, select: &str, min_visits: u32, c_visit: f64, c_scale: f64) -> PyResult<usize> {
         let sel = Select::parse(select, min_visits, c_visit, c_scale).map_err(verr)?;
         Ok(self.t.root_select(&sel))
+    }
+    /// Root minimum visits from now on (docs/search.md 3.5; 0 = off; clears the forced walks'
+    /// accounting): the floor of the driver's full searches (`root_floor`).
+    fn set_root_min(&mut self, k: u32) {
+        self.t.set_root_min(k)
+    }
+    #[getter]
+    fn root_min(&self) -> u32 {
+        self.t.root_min()
+    }
+    /// Per root option: this search's forced walks ([] when the floor is off).
+    #[getter]
+    fn root_forced(&self) -> Vec<u32> {
+        self.t.root_forced()
+    }
+    /// The root's visit counts without the forced walks (= root_visits when the floor is off).
+    #[getter]
+    fn root_visits_pruned(&self) -> Vec<u32> {
+        self.t.root_visits_pruned()
+    }
+    /// The root's search win vector without the forced walks (None: no other backup).
+    fn root_win_pruned(&self) -> Option<Vec<f64>> {
+        self.t.root_win_pruned()
     }
     /// Children of root option i: [(chance key, decider)].
     fn edge_kids(&self, i: usize) -> Vec<(Vec<u64>, usize)> {

@@ -1317,3 +1317,220 @@ fn an_unrecorded_seat_plays_the_same_games_and_records_nothing() {
     assert_eq!(res.len(), 8);
     assert!(smp.is_empty() && res.iter().all(|r| r.samples == 0));
 }
+
+// ------------------------------------------------------------------ root minimum visits
+
+use crate::mull_game::{mull_eval, Mull, MULL};
+
+fn with_floor(seat: SeatCfg, k: u32, max_actions: u32) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.root_min_visits = k;
+            s.root_min_visits_max_actions = max_actions;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+#[test]
+fn root_floor_takes_full_searches_of_few_options_with_the_budget() {
+    assert_eq!(root_floor(4, 4, true, 2, 64), 4);
+    assert_eq!(root_floor(4, 4, true, 4, 64), 4);
+    assert_eq!(root_floor(4, 4, true, 2, 16), 4, "2 x 2 x 4 = 16: half the budget");
+    assert_eq!(root_floor(4, 4, true, 2, 15), 0, "the floor would take more than half");
+    assert_eq!(root_floor(4, 4, true, 5, 64), 0, "a wider root than max_actions");
+    assert_eq!(root_floor(4, 6, true, 5, 64), 4);
+    assert_eq!(root_floor(4, 4, false, 2, 64), 0, "a fast or minor search");
+    assert_eq!(root_floor(0, 4, true, 2, 64), 0, "off");
+    assert_eq!(root_floor(4, 4, true, 1, 64), 0);
+    assert_eq!(root_floor(u32::MAX, u32::MAX, true, 2, u32::MAX), 0, "no overflow");
+    // a seat with the floor on and no root it could apply to is refused
+    let bad = cfg(vec![with_floor(nn(0, 16, true), 4, 1)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    assert!(Driver::<ToyGame>::new(bad).err().unwrap().contains("root_min_visits_max_actions"));
+}
+
+#[test]
+fn root_min_visits_off_or_unpayable_change_nothing() {
+    // the golden records and the golden match (zero-core edf4b89's, computed before the setting
+    // existed) with the floor at 0 and with one no search can pay (2 x options x k > sims: off)
+    for k in [0, 1000] {
+        let (_, recs) = golden_selfplay(with_floor(nn(0, 16, true), k, 4));
+        assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS, "k {k}");
+        let seats = vec![with_floor(nn(0, 16, false), k, 4), with_floor(nn(1, 16, false), k, 4)];
+        let games = (0..40).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+        let mut c = cfg(seats, games, &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+        c.seed = 2026;
+        c.record = false;
+        assert_eq!(results_digest(&run(&mut Driver::<ToyGame>::new(c).unwrap()).0), GOLDEN_MATCH_VISITS, "k {k}");
+    }
+    // a payable floor changes the toy's full searches (roots of <= 4 options at 16 simulations)
+    let (_, recs) = golden_selfplay(with_floor(nn(0, 16, true), 2, 4));
+    assert_ne!(records_digest(&recs), GOLDEN_RECORDS.1);
+}
+
+/// Answer a keep-or-mulligan batch with the stand-in network (`mull_eval`: KEEP 0.999).
+fn answer_mull(d: &mut Driver<Mull>, b: &Batch) {
+    let f = Mull::NUM_FEATURES;
+    let mut pri = Vec::new();
+    let mut v = vec![0.0; b.b * MAX_SEATS];
+    for r in 0..b.b {
+        let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+        let (p, val) = mull_eval(&b.x[r * f..(r + 1) * f], k);
+        pri.extend(p);
+        v[r * MAX_SEATS..(r + 1) * MAX_SEATS].copy_from_slice(&val);
+    }
+    d.submit(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS]).unwrap();
+}
+
+/// A keep-or-mulligan network seat: 64 simulations, every search full; self-play without root
+/// noise (eps 0: what the floor does is then the only way MULL is ever visited) and sampled by
+/// visit count at both decisions.
+fn mull_seat(k: u32, selfplay: bool, target: PolicyTarget, select: Select) -> SeatCfg {
+    let mut s = NnSeat::eval(0, 64);
+    s.selfplay = selfplay;
+    s.eps = 0.0;
+    s.temp_moves = 10;
+    s.policy_target = target;
+    s.select = select;
+    s.root_min_visits = k;
+    SeatCfg::Nn(s)
+}
+
+/// `games` keep-or-mulligan games of `seat` on both sides (move log on): result rows, records,
+/// and per game the dealt hands.
+fn mull_run(seat: SeatCfg, games: usize, record: bool) -> (Vec<GameResult>, Vec<Record>, Vec<[u8; 2]>) {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
+    c.seed = 31;
+    c.record = record;
+    c.move_log = 4;
+    let seed = c.seed;
+    let mut d = Driver::<Mull>::new(c).unwrap();
+    let (mut res, mut smp) = (Vec::new(), Vec::new());
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer_mull(&mut d, &b);
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+    }
+    res.extend(d.take_results());
+    smp.extend(d.take_samples());
+    res.sort_by_key(|r| r.gid);
+    // the deal of game gid (the driver's stream: worker::init_slot)
+    let hands = (0..games as u64)
+        .map(|gid| {
+            let mut base = Rng::new(split64(seed ^ split64(gid + 1)));
+            Mull::new_game(&(), 2, base.next_u64()).unwrap().hand
+        })
+        .collect();
+    (res, smp, hands)
+}
+
+/// MULL moves per (seat's hand bad, good) and decisions per (bad, good).
+fn mull_moves(res: &[GameResult], hands: &[[u8; 2]]) -> ([u32; 2], [u32; 2]) {
+    let (mut mull, mut all) = ([0u32; 2], [0u32; 2]);
+    for r in res {
+        assert_eq!(r.moves.len(), 2);
+        for &(seat, a, _) in &r.moves {
+            let h = hands[r.gid as usize][seat as usize] as usize;
+            all[h] += 1;
+            mull[h] += (a == MULL) as u32;
+        }
+    }
+    (mull, all)
+}
+
+#[test]
+fn root_min_visits_selfplay_targets_and_moves() {
+    // The Delver mulligan in miniature: KEEP's prior 0.999 at every hand, 64 simulations.
+    let cq = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: 1.0 };
+    let (r0, s0, hands) = mull_run(mull_seat(0, true, cq, Select::Visits), 160, true);
+    let (r4, s4, hands4) = mull_run(mull_seat(4, true, cq, Select::Visits), 160, true);
+    assert_eq!(hands, hands4);
+    assert_eq!((s0.len(), s4.len()), (320, 320));
+    let bad = |r: &Record| r.x[0] == 0.0 && r.x[3] == 0.0;
+    let i_mull = MULL as usize;
+    // without the floor MULL is never visited: its completed-Q target stays at its prior
+    assert!(s0.iter().all(|r| r.pi[i_mull] < 0.01), "k 0: a MULL target above its prior");
+    // with it the target follows Q: MULL with a bad hand, KEEP with a good one
+    let (nb, ng) = (s4.iter().filter(|r| bad(r)).count(), s4.iter().filter(|r| !bad(r)).count());
+    assert!(nb > 40 && ng > 40, "{nb} bad hands, {ng} good ones");
+    // (a bad hand's MULL Q rests on 4 draws at least: 4 unlucky ones (a bad hand again, 1 in 4 each)
+    // leave it no better than KEEP, so not every bad-hand target is high)
+    let mut high = 0;
+    for r in &s4 {
+        if bad(r) {
+            high += (r.pi[i_mull] > 0.9) as usize;
+        } else {
+            assert!(r.pi[i_mull] < 1e-3, "a good hand's cq target: {:?}", r.pi);
+            // a good hand's root value q: KEEP's walks alone (deterministic here: the value of
+            // keeping), the forced MULL walks (worth ~0.14 less) left out
+            let want = 0.5 + 0.3 * (r.x[0] - r.x[1]);
+            assert!((r.q[0] - want).abs() < 1e-5, "a good hand's q {} (KEEP's value {want})", r.q[0]);
+        }
+    }
+    assert!(high * 10 >= nb * 8, "{high} of {nb} bad-hand targets on MULL");
+    eprintln!("root_min_visits selfplay: cq targets > 0.9 on MULL for {high} of {nb} bad hands, < 1e-3 for all {ng} good ones");
+    // The moves are sampled by visit count without the forced walks: never MULL with a good hand
+    // (PUCT never chose it) - with or without the floor; with a bad hand MULL is sampled once PUCT
+    // follows the Q the forced walks found (without the floor: never).
+    let (m0, a0) = mull_moves(&r0, &hands);
+    let (m4, a4) = mull_moves(&r4, &hands);
+    assert_eq!(a0, a4);
+    assert_eq!((m0, m4[1]), ([0, 0], 0), "MULL played: k 0 {m0:?}, k 4 good hands {}", m4[1]);
+    assert!(m4[0] > 0, "the floor's Q never moved PUCT to MULL with a bad hand");
+    eprintln!("root_min_visits selfplay: MULL sampled with {} of {} bad hands, {} of {} good ones (k 0: {m0:?})", m4[0], a4[0], m4[1], a4[1]);
+    // 'visits' targets: the forced walks are not in the visit distribution - a good hand's MULL
+    // target is exactly 0 (the raw counts would give it 4 / 63)
+    let (_, sv, _) = mull_run(mull_seat(4, true, PolicyTarget::Visits, Select::Visits), 160, true);
+    for r in &sv {
+        assert!(r.pi.iter().all(|x| x.is_finite()) && (r.pi.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        if !bad(r) {
+            assert_eq!(r.pi[i_mull], 0.0, "a good hand's visits target holds forced visits: {:?}", r.pi);
+        }
+    }
+}
+
+#[test]
+fn root_min_visits_and_the_move_rules() {
+    // Evaluation seats (no temperature): the 'visits' rule never plays a forced move - it needs
+    // the most visits without the forced walks; the guarded 'cq' rule plays what Q says once the
+    // floor gives every option its k visits, and never an unvisited one without it.
+    let cq4 = Select::Cq { c_visit: 50.0, c_scale: 1.0, min_visits: 4 };
+    let t = PolicyTarget::Visits;
+    let games = 200;
+    let (rv0, _, hands) = mull_run(mull_seat(0, false, t, Select::Visits), games, false);
+    let (rv4, _, _) = mull_run(mull_seat(4, false, t, Select::Visits), games, false);
+    let (rc0, _, _) = mull_run(mull_seat(0, false, t, cq4), games, false);
+    let (rc4, _, _) = mull_run(mull_seat(4, false, t, cq4), games, false);
+    let (mv0, all) = mull_moves(&rv0, &hands);
+    let (mv4, _) = mull_moves(&rv4, &hands);
+    let (mc0, _) = mull_moves(&rc0, &hands);
+    let (mc4, _) = mull_moves(&rc4, &hands);
+    assert!(all[0] > 100 && all[1] > 100, "{all:?}");
+    assert_eq!((mv0, mc0), ([0, 0], [0, 0]), "without the floor MULL is never played");
+    assert_eq!(mv4, [0, 0], "the 'visits' rule played a move the floor forced");
+    assert_eq!(mc4[1], 0, "the 'cq' rule played MULL with a good hand");
+    // (but where 4 unlucky draws hid MULL's worth: 1 bad hand in ~20)
+    assert!(mc4[0] * 10 >= all[0] * 9, "the 'cq' rule took MULL with {} of {} bad hands", mc4[0], all[0]);
+    eprintln!("root_min_visits rules: visits k0 {mv0:?} k4 {mv4:?}, cq-n4 k0 {mc0:?} k4 {mc4:?} MULL moves of [bad, good] {all:?}");
+}
+
+#[test]
+fn root_min_visits_never_touch_fast_searches() {
+    // a self-play seat whose every search is fast (p_full 0) plays the same games with and without
+    // the floor (fast and minor searches never take it, like root noise)
+    let fast = |k: u32| match mull_seat(k, true, PolicyTarget::Visits, Select::Visits) {
+        SeatCfg::Nn(mut s) => {
+            s.sims_fast = Some(64);
+            s.p_full = 0.0;
+            s.eps = 0.25;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    };
+    let (ra, sa, _) = mull_run(fast(0), 80, true);
+    let (rb, sb, _) = mull_run(fast(4), 80, true);
+    assert!(sa.is_empty() && sb.is_empty());
+    assert_eq!(results_digest(&ra), results_digest(&rb));
+    assert_eq!(ra.iter().map(|r| r.moves.clone()).collect::<Vec<_>>(), rb.iter().map(|r| r.moves.clone()).collect::<Vec<_>>());
+}

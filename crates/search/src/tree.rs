@@ -28,6 +28,14 @@
 //! vector in `wsum` (`tot` = 1), and every later walk that reaches it backs that value up
 //! again. `result()` is never called there. **Teams** (`SearchGame::team_size` = T, `Tree::team`):
 //! utilities are `T x win[seat]` (+ the margin term), win vectors stay as `result()` (sum 1).
+//!
+//! **Root minimum visits** (`Tree::set_root_min`, docs/search.md 3.5; off by default): a search
+//! may give every root option at least k visits. A walk whose root option PUCT chose is never
+//! changed; when PUCT's choice already has k visits and another root option has fewer, the walk
+//! takes the least-visited root option instead (the lowest index on ties) - a **forced walk**.
+//! The tree counts the forced walks per root option and sums their backed-up win vectors, so the
+//! search's visit-based outputs can leave them out (`root_visits_pruned`, `root_win_pruned`)
+//! while its Q-based ones use them (Q, `cq_target`).
 use std::hash::{Hash, Hasher};
 
 use crate::game::{SearchGame, MAX_SEATS};
@@ -265,11 +273,37 @@ pub struct Tree<G: SearchGame> {
     outs: Vec<Out>,
     /// `redet == false`: the one determinized world every simulation clones.
     base: Option<G>,
+    /// Root minimum visits of the current search (`set_root_min`; 0 = off).
+    root_min: u32,
+    /// Per root option: this search's forced walks backed up through it.
+    forced: Vec<u32>,
+    /// The sum of the forced walks' backed-up win vectors (absolute seats) and their number.
+    forced_win: [f64; MAX_SEATS],
+    forced_n: u32,
+    /// The root option of the walk in flight if the floor forced it (NIL: not forced).
+    walk_forced: u32,
 }
 
 impl<G: SearchGame> Default for Tree<G> {
     fn default() -> Self {
-        Tree { viewer: 0, redet: true, n: 0, team: 1, root: 0, nodes: Vec::new(), stats: Vec::new(), acts: Vec::new(), keys: Vec::new(), outs: Vec::new(), base: None }
+        Tree {
+            viewer: 0,
+            redet: true,
+            n: 0,
+            team: 1,
+            root: 0,
+            nodes: Vec::new(),
+            stats: Vec::new(),
+            acts: Vec::new(),
+            keys: Vec::new(),
+            outs: Vec::new(),
+            base: None,
+            root_min: 0,
+            forced: Vec::new(),
+            forced_win: [0.0; MAX_SEATS],
+            forced_n: 0,
+            walk_forced: NIL,
+        }
     }
 }
 
@@ -293,7 +327,84 @@ impl<G: SearchGame> Tree<G> {
         self.keys.clear();
         self.outs.clear();
         self.root = self.push_node(&[], viewer, legal, 0);
+        self.set_root_min(0);
         self.set_base(game, rng);
+    }
+
+    /// Root minimum visits for the search starting now (docs/search.md 3.5): every root option
+    /// gets at least `k` visits (0 = off: the search of before, bit for bit). Clears the forced
+    /// walks' accounting; `reset` and `advance` turn it off. The caller decides whether a search
+    /// takes it (`driver::root_floor`: full searches of a few options with the budget for it).
+    pub fn set_root_min(&mut self, k: u32) {
+        self.root_min = k;
+        self.forced.clear();
+        if k > 0 {
+            self.forced.resize(self.nodes[self.root as usize].nacts as usize, 0);
+        }
+        self.forced_win = [0.0; MAX_SEATS];
+        self.forced_n = 0;
+        self.walk_forced = NIL;
+    }
+
+    /// The root minimum visits of the current search (0 = off).
+    pub fn root_min(&self) -> u32 {
+        self.root_min
+    }
+
+    /// Per root option: the forced walks of this search (empty when the floor is off).
+    pub fn root_forced(&self) -> &[u32] {
+        &self.forced
+    }
+
+    /// The root's visit counts without this search's forced walks (N_i - forced_i; the visit
+    /// counts when the floor is off): the visit distribution PUCT chose, for the visit-based
+    /// outputs (the 'visits' target, temperature sampling, the 'visits' move rule).
+    pub fn root_visits_pruned(&self) -> Vec<u32> {
+        let mut v = self.visits(self.root);
+        for (x, &f) in v.iter_mut().zip(&self.forced) {
+            *x -= f;
+        }
+        v
+    }
+
+    /// The search's average win vector at the root without this search's forced walks (`win`
+    /// when nothing was forced; None when no other backup went through the root).
+    pub fn root_win_pruned(&self) -> Option<[f64; MAX_SEATS]> {
+        if self.forced_n == 0 {
+            return self.win(self.root);
+        }
+        let nd = &self.nodes[self.root as usize];
+        let t = nd.tot.saturating_sub(self.forced_n);
+        if t == 0 {
+            return None;
+        }
+        let mut w = [0.0; MAX_SEATS];
+        for j in 0..self.n {
+            w[j] = (nd.wsum[j] - self.forced_win[j]) / t as f64;
+        }
+        Some(w)
+    }
+
+    /// The root option a walk takes under the floor, given PUCT's choice `i0`: `i0` unless it has
+    /// at least `root_min` visits and another root option has fewer - then the least-visited root
+    /// option (the lowest index on ties): a forced walk.
+    fn force_root(&mut self, i0: usize) -> usize {
+        let k = self.root_min;
+        let st = self.stats_of(self.root);
+        if st[i0].n < k {
+            return i0;
+        }
+        let mut j = 0;
+        for (i, s) in st.iter().enumerate() {
+            if s.n < st[j].n {
+                j = i;
+            }
+        }
+        if st[j].n >= k {
+            return i0;
+        }
+        self.walk_forced = j as u32;
+        j
     }
 
     /// Start a search from `game` (the live game): with `redet` every simulation clones and
@@ -512,6 +623,7 @@ impl<G: SearchGame> Tree<G> {
         H: FnMut(&Self, u32, &G) -> Option<usize>,
     {
         sc.path.clear();
+        self.walk_forced = NIL;
         g.clone_from(self.base.as_ref().unwrap_or(live));
         if self.redet {
             g.determinize(self.viewer, rng);
@@ -528,7 +640,14 @@ impl<G: SearchGame> Tree<G> {
             }
             let i = match hook(self, node, g) {
                 Some(i) => i,
-                None => self.select(node, w.c_puct),
+                None => {
+                    let i = self.select(node, w.c_puct);
+                    if self.root_min > 0 && node == self.root {
+                        self.force_root(i)
+                    } else {
+                        i
+                    }
+                }
             };
             sc.path.push((node, i as u32));
             let si = self.nodes[node as usize].stat_off as usize + i;
@@ -635,8 +754,19 @@ impl<G: SearchGame> Tree<G> {
         self.nodes[node as usize].nacts == 0
     }
 
-    /// N_i += 1, W_i += util[decider], tot += 1, wsum += win along the path.
+    /// N_i += 1, W_i += util[decider], tot += 1, wsum += win along the path. The backup of a
+    /// forced walk (the last `simulate`'s, `set_root_min`) is also counted as forced.
     pub fn backup(&mut self, path: &[(u32, u32)], util: &[f64; MAX_SEATS], win: &[f64; MAX_SEATS]) {
+        if self.walk_forced != NIL {
+            let i = self.walk_forced as usize;
+            self.walk_forced = NIL;
+            debug_assert_eq!(path.first().copied(), Some((self.root, i as u32)), "a forced walk's backup");
+            self.forced[i] += 1;
+            for j in 0..MAX_SEATS {
+                self.forced_win[j] += win[j];
+            }
+            self.forced_n += 1;
+        }
         for &(node, i) in path {
             let nd = &mut self.nodes[node as usize];
             let si = nd.stat_off as usize + i as usize;
@@ -676,6 +806,7 @@ impl<G: SearchGame> Tree<G> {
             Some(k) => {
                 self.root = k;
                 self.viewer = player;
+                self.set_root_min(0);
                 if self.nodes.len() > COMPACT_AT {
                     self.compact();
                 }
@@ -687,7 +818,20 @@ impl<G: SearchGame> Tree<G> {
 
     /// Copy the subtree under `root` into fresh arrays (drops the garbage above it).
     pub fn compact(&mut self) {
-        let mut t: Tree<G> = Tree { viewer: self.viewer, redet: self.redet, n: self.n, team: self.team, root: 0, base: self.base.take(), ..Default::default() };
+        let mut t: Tree<G> = Tree {
+            viewer: self.viewer,
+            redet: self.redet,
+            n: self.n,
+            team: self.team,
+            root: 0,
+            base: self.base.take(),
+            root_min: self.root_min,
+            forced: std::mem::take(&mut self.forced),
+            forced_win: self.forced_win,
+            forced_n: self.forced_n,
+            walk_forced: self.walk_forced,
+            ..Default::default()
+        };
         let mut map = std::collections::HashMap::new();
         let mut order = vec![self.root];
         let mut k = 0;

@@ -7,9 +7,11 @@ Per decision (docs/search.md 3.4): playout-cap randomisation (a `p_full` share o
 gets `sims` and becomes a training sample, the rest `sims_fast`), root Dirichlet noise on full
 self-play searches, temperature sampling by visit count for the first `temp_moves` searched
 decisions of a game, otherwise the seat's move rule (`select`: argmax (N, P0) by default, or the
-completed-Q logits' argmax 'cq', docs/search.md 3.3), tree reuse when the same seat decides again.
-Recorded decisions carry the seat's policy target: the visit distribution ('visits') or the
-completed-Q target ('cq', docs/search.md 3.1).
+completed-Q logits' argmax 'cq', docs/search.md 3.3), tree reuse when the same seat decides again,
+the opt-in root minimum visits of full searches (`root_min_visits`, docs/search.md 3.5: the
+visit-based outputs without the forced walks, the 'cq' ones with them). Recorded decisions carry
+the seat's policy target: the visit distribution ('visits') or the completed-Q target ('cq',
+docs/search.md 3.1).
 """
 import random
 
@@ -28,16 +30,20 @@ class NNSeat:
     cq_c_visit, cq_c_scale). select, select_min_visits: the rule of the moves it does not sample
     ('visits' | 'cq'; docs/search.md 3.3) and its completed-Q transform select_c_visit,
     select_c_scale (None: the target's cq_c_visit, cq_c_scale). record: whether its full searches
-    are recorded (False: a league opponent, docs/az.md 14; the Rust seat key `record`)."""
+    are recorded (False: a league opponent, docs/az.md 14; the Rust seat key `record`). root_min_visits,
+    root_min_visits_max_actions: the root minimum visits of its full searches (0 = off; docs/search.md
+    3.5)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
                  policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0, select='visits', select_min_visits=0,
-                 select_c_visit=None, select_c_scale=None, record=True):
+                 select_c_visit=None, select_c_scale=None, record=True, root_min_visits=0,
+                 root_min_visits_max_actions=4):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
         mcts.check_select(select, select_min_visits)
         mcts.check_select_transform(select, select_c_visit, select_c_scale)
+        mcts.check_root_min(root_min_visits, root_min_visits_max_actions)
         self.key, self.sims, self.c_puct, self.selfplay = key, sims, c_puct, selfplay
         self.alpha, self.eps, self.temp_moves = alpha, eps, temp_moves
         self.sims_fast, self.p_full, self.chance_k, self.margin_w = sims_fast, p_full, chance_k, margin_w
@@ -46,6 +52,7 @@ class NNSeat:
         self.select, self.select_min_visits = select, select_min_visits
         self.select_c_visit, self.select_c_scale = select_c_visit, select_c_scale
         self.record = record
+        self.root_min_visits, self.root_min_visits_max_actions = root_min_visits, root_min_visits_max_actions
 
     @property
     def select_transform(self):
@@ -84,20 +91,30 @@ class PySearch:
     def expand(self, priors, value, margin, seat):
         node, path = self.pending
         self.pending = None
-        mcts.expand_and_backup(node, path, priors, value, margin, self.t.n, seat.margin_w, self.t.team)
+        mcts.expand_and_backup(node, path, priors, value, margin, self.t.n, seat.margin_w, self.t.team, self.t)
         return node is self.t.root
 
     def add_noise(self, seat, np_rng):
         mcts.add_noise(self.t.root, seat.alpha, seat.eps, np_rng)
 
+    def set_root_min(self, k):
+        self.t.set_root_min(k)
+
     def stats(self):
+        """acts, visit counts, P0, root win vector - without the forced walks (root minimum visits)."""
         r = self.t.root
+        if self.t.root_min:
+            return r.acts, mcts.root_visits_pruned(self.t), r.P0, mcts.root_win_pruned(self.t)
         return r.acts, r.Nv, r.P0, mcts.root_win(r)
 
     def target(self, seat):
-        """The seat's policy target at the root."""
+        """The seat's policy target at the root (the visits target without the forced walks)."""
         if seat.policy_target == 'cq':
             return mcts.cq_target(self.t.root, seat.cq_c_visit, seat.cq_c_scale)
+        if self.t.root_min:
+            nv = mcts.root_visits_pruned(self.t)
+            tot = sum(nv)
+            return [n / tot for n in nv] if tot else list(self.t.root.P0)
         return mcts.visits_target(self.t.root)
 
     def choose(self, seat):
@@ -109,6 +126,7 @@ class PySearch:
         if child is None:
             return False
         self.t.root = child
+        self.t.set_root_min(0)
         return True
 
 
@@ -143,13 +161,18 @@ class RsSearch:
     def add_noise(self, seat, np_rng):
         self.t.add_noise(seat.alpha, seat.eps, int(np_rng.integers(1 << 62)))
 
+    def set_root_min(self, k):
+        self.t.set_root_min(k)
+
     def stats(self):
+        if self.t.root_min:
+            return self.t.root_acts, self.t.root_visits_pruned, self.t.root_priors0, self.t.root_win_pruned()
         return self.t.root_acts, self.t.root_visits, self.t.root_priors0, self.t.root_win()
 
     def target(self, seat):
         if seat.policy_target == 'cq':
             return self.t.root_cq_target(seat.cq_c_visit, seat.cq_c_scale)
-        nv = self.t.root_visits
+        nv = self.t.root_visits_pruned if self.t.root_min else self.t.root_visits
         tot = sum(nv)
         return [n / tot for n in nv] if tot else list(self.t.root_priors0)
 
@@ -323,11 +346,14 @@ class PyDriver:
         slot.target = seat.sims if slot.full else seat.sims_fast
         tree = slot.trees.get(p)
         if tree is None:
-            slot.trees[p] = SEARCH[seat.impl](slot.game, seat, slot.search_rng)
+            tree = slot.trees[p] = SEARCH[seat.impl](slot.game, seat, slot.search_rng)
         else:
             tree.set_base(slot.game, slot.search_rng)
             if seat.selfplay and slot.full and tree.expanded:
                 tree.add_noise(seat, slot.np_rng)
+        # the root minimum visits of this search (docs/search.md 3.5; 0 = off)
+        tree.set_root_min(mcts.root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full,
+                                          len(slot.game.legal()), slot.target))
 
     def _decide(self, slot, seat, tree, p):
         acts, Nv, P0, rw = tree.stats()

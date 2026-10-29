@@ -21,7 +21,9 @@
 //!
 //! Per decision (docs/search.md 3.4): playout-cap randomisation, root Dirichlet noise,
 //! temperature sampling for the first `temp_moves` searched decisions, training records of
-//! full searches (policy target: visits or completed Q, `PolicyTarget`), tree reuse.
+//! full searches (policy target: visits or completed Q, `PolicyTarget`), tree reuse, and the
+//! opt-in root minimum visits of full searches (`NnSeat::root_min_visits`, `root_floor`,
+//! docs/search.md 3.5).
 //!
 //! **Rolling mode** (`DriverCfg::rolling`): games never run out - game `gid` takes the seats
 //! `games[gid % games.len()]` - and play is divided into phases. `resume(quota, net)` runs
@@ -160,6 +162,19 @@ impl Select {
     }
 }
 
+/// The root minimum visits a search takes (docs/search.md 3.5): the seat's `k`
+/// (`NnSeat::root_min_visits`) for a full search (`full`: a self-play seat's recorded searches,
+/// every search of an evaluation seat; never a fast or minor one, like root noise) of `m` options
+/// with `2 <= m <= max_actions` and the budget for it (`2 m k <= target`, the search's simulations:
+/// the floor takes at most half of them); else 0 (the search of before, bit for bit).
+pub fn root_floor(k: u32, max_actions: u32, full: bool, m: usize, target: u32) -> u32 {
+    let m = m as u64;
+    if k == 0 || !full || m < 2 || m > max_actions as u64 || 2 * m * k as u64 > target as u64 {
+        return 0;
+    }
+    k
+}
+
 /// max by (N, P0), the first maximum on exact ties (`Select::Visits`); 0 without options.
 pub fn argmax_visits(n: &[u32], p0: &[f32]) -> usize {
     let mut best = 0;
@@ -199,12 +214,20 @@ pub struct NnSeat {
     /// playout cap exactly as a recorded one but records nothing - a league opponent, a past
     /// checkpoint playing the current network (zero's run setting `selfplay_league`, docs/az.md 14).
     pub record: bool,
+    /// Root minimum visits (docs/search.md 3.5; 0 = off, the default): a full search whose root
+    /// has 2..=`root_min_visits_max_actions` options gives each at least this many visits, when
+    /// its budget allows (`root_floor`). The forced walks are left out of the visit counts the
+    /// targets, temperature sampling and the 'visits' rule read, and out of the root value `q`;
+    /// Q, the 'cq' target and the 'cq' rule use them.
+    pub root_min_visits: u32,
+    /// The largest root (number of options) the floor applies to (default 4).
+    pub root_min_visits_max_actions: u32,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4 }
     }
 }
 
@@ -778,6 +801,9 @@ impl<G: SearchGame> Driver<G> {
                     }
                     if let PolicyTarget::CompletedQ { c_visit, c_scale } = n.policy_target {
                         PolicyTarget::parse("cq", c_visit, c_scale)?;
+                    }
+                    if n.root_min_visits > 0 && n.root_min_visits_max_actions < 2 {
+                        return Err(format!("root_min_visits_max_actions {}: at least 2 (a root of one option is not searched)", n.root_min_visits_max_actions));
                     }
                 }
                 SeatCfg::External(k) => {

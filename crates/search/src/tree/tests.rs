@@ -430,3 +430,166 @@ fn team_utilities_and_terminal_values() {
     let (u, _) = terminal_values(&g, 0.5);
     assert!((u[0] - (1.0 + 0.5 * (0.25f64).tanh())).abs() < 1e-6);
 }
+
+// ------------------------------------------------------------------ root minimum visits
+
+use crate::mull_game::{mull_eval, Mull, KEEP, MULL, P_MULL};
+
+/// `search` on the keep-or-mulligan game with its stand-in network (`mull_eval`).
+fn mull_search(t: &mut Tree<Mull>, live: &Mull, sims: usize, rng: &mut Rng) {
+    let mut g = live.clone();
+    let mut sc = Scratch::default();
+    for _ in 0..sims {
+        if let Sim::Leaf { node, player } = t.simulate(live, &mut g, rng, &W, &mut sc).unwrap() {
+            let mut x = [0.0f32; 4];
+            g.encode(player, &mut x);
+            let (pri, v) = mull_eval(&x, t.acts(node).len());
+            let (util, win) = leaf_values(&v, &[0.0; MAX_SEATS], player, 2, 0.0);
+            t.expand(node, &pri, &util);
+            t.backup(&sc.path, &util, &win);
+        }
+    }
+}
+
+fn mull_tree(h0: u8, h1: u8, k: u32, seed: u64) -> Tree<Mull> {
+    let g = Mull::with_hands(h0, h1, seed);
+    let mut rng = Rng::new(seed);
+    let mut t = Tree::new(&g, 0, &[KEEP, MULL], true, &mut rng);
+    t.set_root_min(k);
+    mull_search(&mut t, &g, 64, &mut rng);
+    t
+}
+
+#[test]
+fn root_min_visits_reach_a_starved_option() {
+    // A 2-option root with priors 0.999 / 0.001 (the Delver mirror's mulligan at 64 simulations):
+    // without the floor the 0.001 option gets no visit, its Q is never estimated and the 'cq'
+    // target keeps it at its prior; with k = 4 both options get >= 4 visits, the 4 forced walks
+    // are counted, and the target moves to what Q says - toward MULL with a bad hand (worth ~0.16
+    // more), away from it with a good one.
+    let (i_keep, i_mull) = (KEEP as usize, MULL as usize);
+    for seed in 0..6u64 {
+        for (h0, h1) in [(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
+            let t0 = mull_tree(h0, h1, 0, seed);
+            let r = t0.root;
+            assert_eq!(t0.priors0(r), vec![1.0 - P_MULL, P_MULL]);
+            assert_eq!(t0.visits(r), vec![63, 0], "hands {h0} {h1}: the floor off starves MULL");
+            assert!(t0.root_forced().is_empty() && t0.root_visits_pruned() == t0.visits(r));
+            assert_eq!(t0.root_win_pruned(), t0.win(r));
+            let cq0 = t0.cq_target(r, 50.0, 1.0);
+            assert!((cq0[i_mull] - P_MULL).abs() < 1e-4, "an unvisited option's target stays at its prior: {cq0:?}");
+
+            let t = mull_tree(h0, h1, 4, seed);
+            let r = t.root;
+            let nv = t.visits(r);
+            assert_eq!(nv.iter().sum::<u32>(), 63);
+            assert!(nv.iter().all(|&n| n >= 4), "hands {h0} {h1}: {nv:?}");
+            // forced walks only ever go to the option below the floor, at most k of them
+            let f = t.root_forced().to_vec();
+            assert_eq!(f[i_keep], 0);
+            assert_eq!(f[i_mull], 4, "PUCT never picks MULL before its Q is known: all 4 forced");
+            assert_eq!(t.forced_n, 4);
+            assert_eq!(t.root_visits_pruned(), vec![nv[0], nv[1] - 4]);
+            let q = |i: usize| t.w_of(r, i) / t.n_of(r, i) as f64;
+            let cq = t.cq_target(r, 50.0, 1.0);
+            assert!((cq.iter().sum::<f32>() - 1.0).abs() < 1e-5 && cq.iter().all(|x| x.is_finite()));
+            // every option visited: the target is the softmax of ln P0 + sigma Q (no v_mix)
+            let sigma = 50.0 + *nv.iter().max().unwrap() as f64;
+            let want = completed_q_policy(&t.priors0(r), &nv, &t.values(r), t.value0(r), 50.0, 1.0);
+            assert_eq!(cq, want);
+            let l = |i: usize| (t.p0_of(r, i) as f64).ln() + sigma * q(i);
+            let e = (l(i_mull) - l(i_keep)).exp();
+            assert!((cq[i_mull] as f64 - e / (1.0 + e)).abs() < 1e-5);
+            if h0 == 0 {
+                assert!(q(i_mull) > q(i_keep) + 0.08, "a bad hand: MULL is better ({} vs {})", q(i_mull), q(i_keep));
+                assert!(cq[i_mull] > 0.9, "a bad hand: the target follows Q to MULL: {cq:?}");
+            } else {
+                assert!(q(i_mull) < q(i_keep) - 0.08, "a good hand: MULL is worse ({} vs {})", q(i_mull), q(i_keep));
+                assert!(cq[i_mull] < 1e-3, "a good hand: the target stays on KEEP: {cq:?}");
+                // PUCT never chose the worse MULL itself: no visit is left once the forced are
+                // pruned, and the root value without the forced walks is KEEP's mean (util = win)
+                assert_eq!(t.root_visits_pruned(), vec![nv[0], 0]);
+                let w = t.root_win_pruned().unwrap();
+                assert!((w[0] - q(i_keep)).abs() < 1e-12, "{} vs {}", w[0], q(i_keep));
+                assert!((w[0] + w[1] - 1.0).abs() < 1e-12);
+                // ... while the raw root value mixes the 4 forced MULL walks in
+                assert!(t.win(r).unwrap()[0] < w[0]);
+            }
+        }
+    }
+}
+
+#[test]
+fn root_min_visits_on_wider_roots_and_their_accounting() {
+    // toy roots of up to 6 options, the hashed priors of `eval`: with k = 3 every option gets
+    // >= 3 of 96 visits; the forced walks are at most k per option and add up; advance and reset
+    // turn the floor off (the next search sets its own).
+    let mut rng = Rng::new(21);
+    let mut checked = 0;
+    let mut advanced = 0;
+    for s in 0..80 {
+        let g = mid_game(100 + s, 6 + (s as usize % 30));
+        if g.over {
+            continue;
+        }
+        let l = legal_of(&g);
+        if !(2..=6).contains(&l.len()) {
+            continue;
+        }
+        let p = g.to_move().unwrap();
+        let mut t = Tree::new(&g, p, &l, true, &mut rng);
+        t.set_root_min(3);
+        search(&mut t, &g, 96, &mut rng, &W);
+        let nv = t.visits(t.root);
+        assert!(nv.iter().all(|&n| n >= 3), "{nv:?}");
+        let f = t.root_forced().to_vec();
+        assert_eq!(f.len(), l.len());
+        assert!(f.iter().all(|&x| x <= 3));
+        assert_eq!(f.iter().sum::<u32>(), t.forced_n);
+        let pr = t.root_visits_pruned();
+        assert_eq!(pr.iter().sum::<u32>() + t.forced_n, t.tot(t.root));
+        assert!(t.walk_forced == NIL, "no walk in flight");
+        let i = (0..nv.len()).max_by_key(|&i| nv[i]).unwrap();
+        if let Some((key, kid)) = t.kids(t.root, i).into_iter().next() {
+            let (pl, acts) = (t.player(kid), t.acts(kid).to_vec());
+            if t.advance(l[i], &key, pl, &acts) {
+                assert_eq!((t.root_min(), t.root_forced().len(), t.forced_n), (0, 0, 0));
+                assert_eq!(t.root_visits_pruned(), t.visits(t.root));
+                advanced += 1;
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked >= 10 && advanced >= 3, "{checked} positions, {advanced} advanced");
+    let g = mid_game(3, 10);
+    let mut t = Tree::new(&g, g.to_move().unwrap(), &legal_of(&g), true, &mut rng);
+    t.set_root_min(2);
+    search(&mut t, &g, 30, &mut rng, &W);
+    t.reset(&g, g.to_move().unwrap(), &legal_of(&g), true, &mut rng);
+    assert_eq!((t.root_min(), t.root_forced().len(), t.forced_n), (0, 0, 0));
+}
+
+#[test]
+fn root_min_visits_off_changes_no_walk() {
+    // set_root_min(0) (what the driver calls for every search the floor does not apply to) is the
+    // tree of before: the same visits, values and root win as a tree that never heard of it
+    let mut checked = 0;
+    for s in 0..12u64 {
+        let g = mid_game(200 + s, 8 + s as usize);
+        if g.over {
+            continue;
+        }
+        let p = g.to_move().unwrap();
+        let (mut ra, mut rb) = (Rng::new(s), Rng::new(s));
+        let mut a = Tree::new(&g, p, &legal_of(&g), true, &mut ra);
+        let mut b = Tree::new(&g, p, &legal_of(&g), true, &mut rb);
+        b.set_root_min(0);
+        search(&mut a, &g, 80, &mut ra, &W);
+        search(&mut b, &g, 80, &mut rb, &W);
+        assert_eq!(a.visits(a.root), b.visits(b.root));
+        assert_eq!(a.values(a.root), b.values(b.root));
+        assert_eq!(a.win(a.root), b.root_win_pruned());
+        checked += 1;
+    }
+    assert!(checked > 5);
+}

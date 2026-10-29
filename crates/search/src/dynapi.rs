@@ -169,6 +169,14 @@ pub trait DynTree: Send + Sync {
     /// The option the driver's move rule `sel` chooses at the root (`Select::choose`; 0 before
     /// expansion): the same code as a driver's non-sampled moves.
     fn root_select(&self, sel: &Select) -> usize;
+    /// Root minimum visits from now on (`Tree::set_root_min`, docs/search.md 3.5; 0 = off) and
+    /// the forced walks' accounting: per root option, the visit counts without them, the root
+    /// win vector without them.
+    fn set_root_min(&mut self, k: u32);
+    fn root_min(&self) -> u32;
+    fn root_forced(&self) -> Vec<u32>;
+    fn root_visits_pruned(&self) -> Vec<u32>;
+    fn root_win_pruned(&self) -> Option<Vec<f64>>;
     fn redet(&self) -> bool;
     fn edge_kids(&self, i: usize) -> Vec<(Vec<u64>, usize)>;
     fn edge_outs(&self, i: usize) -> Vec<Vec<u64>>;
@@ -274,6 +282,21 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     fn root_select(&self, sel: &Select) -> usize {
         let r = self.t.root;
         sel.choose(&self.t.priors0(r), &self.t.visits(r), &self.t.values(r), self.t.value0(r))
+    }
+    fn set_root_min(&mut self, k: u32) {
+        self.t.set_root_min(k)
+    }
+    fn root_min(&self) -> u32 {
+        self.t.root_min()
+    }
+    fn root_forced(&self) -> Vec<u32> {
+        self.t.root_forced().to_vec()
+    }
+    fn root_visits_pruned(&self) -> Vec<u32> {
+        self.t.root_visits_pruned()
+    }
+    fn root_win_pruned(&self) -> Option<Vec<f64>> {
+        self.t.root_win_pruned().map(|w| w[..self.t.n].to_vec())
     }
     fn redet(&self) -> bool {
         self.t.redet
