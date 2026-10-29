@@ -42,6 +42,13 @@ pub const MAX_SEATS: usize = 8;
 ///   network, the driver parks it until the results come (docs/search.md 2.8). `result()` and
 ///   `margin()` are never called on it. **Teams**: `team_size()` seats per team, seat `s` in
 ///   team `s % (num_players() / team_size())`; `result()` = the team's outcome / team_size.
+/// * **Auxiliary targets** (optional; docs/search.md 1.2, docs/az.md 15): `AUX` names the
+///   segments (name, width) of a per-decision label vector of `aux_width()` floats that
+///   `aux_target(viewer, out)` writes for the pending decision from the TRUE state - it may
+///   read what `viewer` cannot see (MTG Zero's belief target: the opponent's actual hand), since
+///   it is a training label, never an input: `encode` stays blind to it. A driver created with
+///   `aux` on records it with every sample (`Record::aux`); off (the default) nothing changes.
+///   The loss of each segment is the game package's (zero/package.py `aux`).
 pub trait SearchGame: Clone + Send + Sync + 'static {
     /// Settings shared by all games of one driver, parsed from a JSON string.
     type Spec: Clone + Send + Sync + 'static;
@@ -131,6 +138,20 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn make_bot(spec: &Self::Spec, name: &str, seed: u64) -> Option<Box<dyn Bot<Self>>> {
         let _ = (spec, name, seed);
         None
+    }
+    /// Segments (name, width) of the auxiliary targets, in vector order (see the trait docs);
+    /// empty: the game has none.
+    const AUX: &'static [(&'static str, usize)] = &[];
+    /// Width of the auxiliary target vector (the segments' sum).
+    fn aux_width() -> usize {
+        Self::AUX.iter().map(|s| s.1).sum()
+    }
+    /// The auxiliary targets of the pending decision for `viewer` (its decider) into `out`
+    /// (`aux_width()` floats, zeroed by the caller), read from the true state: a training label
+    /// that may hold what `viewer` cannot see (never fed to the network). A segment left all zero
+    /// is "no target here" for a multinomial loss (docs/az.md 15.2).
+    fn aux_target(&self, viewer: usize, out: &mut [f32]) {
+        let _ = (viewer, out);
     }
 }
 

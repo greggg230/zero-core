@@ -18,7 +18,7 @@ import torch
 
 F16_EXP = 0x7C00                  # float16 exponent bits: all ones = inf or NaN
 CHUNK = 1 << 20                   # elements per vectorised chunk (bounded temporaries)
-SHARD_FLOATS = ('x', 'pi', 'z', 'q', 'sc')
+SHARD_FLOATS = ('x', 'pi', 'z', 'q', 'sc', 'aux')       # ('aux': only in shards with auxiliary targets)
 
 
 class NonFinite(RuntimeError):

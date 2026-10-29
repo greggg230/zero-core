@@ -17,6 +17,17 @@ Heads:
   value  : logits over MAX_SEATS relative seats (seat j = (decider + j) % n), masked to the
            seats present -> softmax = P(seat wins)
   margin : each relative seat's margin target (`SearchGame::margin`), regression
+  aux    : optional (config key `aux` = the game's auxiliary targets [[name, width, loss], ...], the
+           game package's `aux`; docs/az.md 15): one MLP from the trunk's pooled state (where value
+           and margin read it) to the targets' raw outputs, returned only by `forward(x, n,
+           aux=True)` - training, `infer.NetEvaluator.aux` -, so the search's inference and its CUDA
+           graphs are unchanged. `aux_predict` turns the raw outputs into predictions by each
+           target's loss ('multinomial': a softmax over the segment; 'poisson': exp, the rates;
+           'mse': as they are). Built after every other parameter (a network with the head
+           initialises the rest as one without), its last layer zero; `add_aux` gives a network
+           without the head (an older checkpoint) a fresh one, everything else copied exactly
+           (its policy / value / margin outputs unchanged), `strip_aux` removes it. The encoding
+           guard ignores it: the head reads no input.
 
 Checkpoints (`save`, atomic): {config, state, extra}; `load` rebuilds the network from the
 config; `widen` maps a checkpoint onto a larger feature / action space (new inputs get zero
@@ -44,6 +55,62 @@ import torch.nn.functional as F
 from .finite import check_state
 from .protocol import MAX_SEATS
 
+AUX_LOSSES = ('multinomial', 'poisson', 'mse')
+
+
+def aux_layout(aux):
+    """Auxiliary targets ([[name, width, loss], ...], (name, width, loss) tuples or {name, width,
+    loss} dicts: a config's `aux`, the game package's `aux_of`; None = none) -> [[name, width, loss],
+    ...] (checked: names distinct, widths >= 1, a loss of AUX_LOSSES)."""
+    out = []
+    for t in aux or []:
+        name, width, loss = (t['name'], t['width'], t.get('loss', 'mse')) if isinstance(t, dict) else t
+        name, width, loss = str(name), int(width), str(loss)
+        if width < 1 or loss not in AUX_LOSSES or any(o[0] == name for o in out):
+            raise ValueError(f'auxiliary target {name!r} (width {width}, loss {loss!r}): a new name, width >= 1, '
+                             f'a loss of {AUX_LOSSES}')
+        out.append([name, width, loss])
+    return out
+
+
+def _aux_head(dim, head, layout):
+    """The auxiliary head: an MLP dim -> head -> the targets' total width, its last layer zero."""
+    m = nn.Sequential(nn.Linear(dim, head), nn.ReLU(), nn.Linear(head, sum(w for _, w, _ in layout)))
+    nn.init.zeros_(m[2].weight)
+    nn.init.zeros_(m[2].bias)
+    return m
+
+
+def _with_aux(model, dim, head, aux):
+    """Give `model` its auxiliary head (config 'aux') when `aux` names targets (built last)."""
+    model.aux_layout = aux_layout(aux)
+    if model.aux_layout:
+        model.config['aux'] = model.aux_layout
+        model.aux_head = _aux_head(dim, head, model.aux_layout)
+
+
+def _aux_out(model, z):
+    if not model.aux_layout:
+        raise ValueError('forward(aux=True): the network has no auxiliary head (net.add_aux)')
+    return model.aux_head(z)
+
+
+def aux_predict(layout, raw):
+    """Raw auxiliary outputs [B, W] (`forward(..., aux=True)`'s fourth) -> {name: predictions [B, w]}
+    by each target's loss: 'multinomial' the softmax over its segment (a distribution: MTG Zero's
+    belief, x the hand size = expected counts), 'poisson' exp (rates = expected counts), 'mse' raw."""
+    out, k = {}, 0
+    for name, w, loss in aux_layout(layout):
+        r = raw[:, k:k + w].float()
+        if loss == 'multinomial':
+            out[name] = torch.softmax(r, 1)
+        elif loss == 'poisson':
+            out[name] = torch.exp(r.clamp(max=30.0))
+        else:
+            out[name] = r
+        k += w
+    return out
+
 
 class Block(nn.Module):
     def __init__(self, h):
@@ -57,7 +124,7 @@ class Block(nn.Module):
 
 
 class Net(nn.Module):
-    def __init__(self, features, actions, hidden=256, blocks=4, seats=MAX_SEATS, game='toy', head=128):
+    def __init__(self, features, actions, hidden=256, blocks=4, seats=MAX_SEATS, game='toy', head=128, aux=None):
         super().__init__()
         self.config = {'features': features, 'actions': actions, 'hidden': hidden, 'blocks': blocks,
                        'seats': seats, 'game': game, 'head': head}
@@ -69,17 +136,21 @@ class Net(nn.Module):
         self.pol = nn.Linear(hidden, actions)
         self.val = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
+        _with_aux(self, hidden, head, aux)
 
-    def forward(self, x, n_players):
+    def forward(self, x, n_players, aux=False):
         """x [B, >= features] (a narrower network reads a prefix: the evaluator refuses that
         unless told otherwise, docs/az.md 10.4), n_players [B] -> policy logits [B, actions],
-        value logits [B, seats] (absent seats -1e9), margin [B, seats]."""
+        value logits [B, seats] (absent seats -1e9), margin [B, seats] (+ with `aux` the raw
+        auxiliary outputs [B, aux width])."""
         h = F.relu(self.inp(x[:, :self.features]))
         for b in self.blocks:
             h = b(h)
         h = F.relu(self.ln(h))
         present = torch.arange(self.seats, device=x.device)[None, :] < n_players[:, None]
         vlog = self.val(h).masked_fill(~present, -1e9)
+        if aux:
+            return self.pol(h), vlog, self.mar(h), _aux_out(self, h)
         return self.pol(h), vlog, self.mar(h)
 
     def n_params(self):
@@ -120,7 +191,7 @@ class GridNet(nn.Module):
     Every feature outside the plane blocks is a global."""
 
     def __init__(self, features, actions, grid, ch=64, blocks=6, seats=MAX_SEATS, game='toy', head=128, ghid=128,
-                 arch='grid'):
+                 arch='grid', aux=None):
         super().__init__()
         grid = grid_spec(grid)
         segs = grid['segments']
@@ -156,8 +227,9 @@ class GridNet(nn.Module):
         self.other = nn.Linear(256, actions - H * W)
         self.val = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, seats))
+        _with_aux(self, 256, head, aux)
 
-    def forward(self, x, n_players):
+    def forward(self, x, n_players, aux=False):
         """As `Net.forward`."""
         B = x.shape[0]
         x = x[:, :self.features]
@@ -181,6 +253,8 @@ class GridNet(nn.Module):
         pol = torch.cat([rest[:, :self.a0], cell, rest[:, self.a0:]], 1)
         present = torch.arange(self.seats, device=x.device)[None, :] < n_players[:, None]
         vlog = self.val(e).masked_fill(~present, -1e9)
+        if aux:
+            return pol, vlog, self.mar(e), _aux_out(self, e)
         return pol, vlog, self.mar(e)
 
     def n_params(self):
@@ -340,7 +414,7 @@ class TokenNet(nn.Module):
     """
 
     def __init__(self, features, actions, layout, d=128, layers=3, heads=4, ff=256, seats=MAX_SEATS, game='toy',
-                 head=128, arch='tokens'):
+                 head=128, arch='tokens', aux=None):
         super().__init__()
         lay = tokens_layout(layout, features, actions)
         self.config = {'arch': 'tokens', 'features': features, 'actions': actions, 'layout': lay, 'd': d,
@@ -411,6 +485,7 @@ class TokenNet(nn.Module):
         for lin in (self.gen, self.ptr):
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
+        _with_aux(self, 2 * d, head, aux)
 
     def _identity(self, sl, idspec):
         """Identity index [N] of slot rows [N, width] from their one-hot digits (vocab = none)."""
@@ -471,7 +546,7 @@ class TokenNet(nn.Module):
             return h, n, full, idt
         return h, n, full
 
-    def forward(self, x, n_players):
+    def forward(self, x, n_players, aux=False):
         """As `Net.forward`."""
         x = x[:, :self.features]
         if self.n_id:
@@ -510,6 +585,8 @@ class TokenNet(nn.Module):
             pol = pol.index_copy(0, r, pc)
         present = torch.arange(self.seats, device=dev)[None, :] < n_players[:, None]
         vlog = self.val(z).masked_fill(~present, -1e9)
+        if aux:
+            return pol[:, :self.actions], vlog, self.mar(z), _aux_out(self, z)
         return pol[:, :self.actions], vlog, self.mar(z)
 
     def n_params(self):
@@ -528,6 +605,40 @@ def build(config):
         return ARCHS[arch](**cfg)
     cfg.pop('arch', None)
     return Net(**cfg)
+
+
+def add_aux(model, aux, seed=0):
+    """`model` with the auxiliary head for the targets `aux` (`aux_layout`): a network without one
+    (an older checkpoint) -> a copy with every other parameter and buffer exactly as they were, its
+    policy / value / margin outputs unchanged, and a fresh head (initialised from `seed`, the global
+    torch RNG untouched; its last layer zero: it predicts the uniform / unit / zero output and sends
+    the trunk no gradient until it has learned something). A network with that head already: `model`
+    itself; with another one: ValueError (strip_aux first)."""
+    aux = aux_layout(aux)
+    have = aux_layout(model.config.get('aux'))
+    if have == aux:
+        return model
+    if have or not aux:
+        raise ValueError(f'add_aux: the network has the auxiliary head {have}, wanted {aux} (strip_aux first)')
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        new = build(dict(model.config, aux=aux))
+    missing, unexpected = new.load_state_dict(model.state_dict(), strict=False)
+    if unexpected or not missing or any(not k.startswith('aux_') for k in missing):
+        raise RuntimeError(f'add_aux: state mismatch (missing {missing}, unexpected {unexpected})')
+    dev = next(model.parameters()).device
+    return new.to(dev).train(model.training)
+
+
+def strip_aux(model):
+    """A copy of `model` without its auxiliary head (config and state; the same policy / value /
+    margin), e.g. for code that predates the head."""
+    if not model.config.get('aux'):
+        return model
+    new = build({k: v for k, v in model.config.items() if k != 'aux'})
+    new.load_state_dict({k: v for k, v in model.state_dict().items() if not k.startswith('aux_')})
+    dev = next(model.parameters()).device
+    return new.to(dev).train(model.training)
 
 
 def _replace(tmp, dst, tries=40):
@@ -729,25 +840,28 @@ def _grid_index(cfg):
     return planes, [i for i in range(cfg['features']) if i not in inplane]
 
 
-def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0):
+def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0, aux=None):
     """A new network for `game` (info = games.info(game)): 'mlp' (`Net`, hidden x blocks), 'grid'
     (`GridNet` over the game package's board planes, ch x blocks) or 'tokens' (`TokenNet` over
-    the game package's object layout: d = hidden, layers = blocks, heads, ff (0: 2 x hidden))."""
+    the game package's object layout: d = hidden, layers = blocks, heads, ff (0: 2 x hidden)); `aux`:
+    its auxiliary targets (`aux_layout`; None: no auxiliary head, the network of before)."""
+    kw = {'aux': aux} if aux else {}
     from . import package
     F_, A_ = info['num_features'], info['num_actions']
     if arch == 'grid':
         grid = package.active().grids.get(game)
         if not grid:
             raise SystemExit(f"arch 'grid': the game package has no grid for {game!r} (GamePackage.grids)")
-        return GridNet(F_, A_, grid, ch, blocks, game=game).eval()
+        return GridNet(F_, A_, grid, ch, blocks, game=game, **kw).eval()
     if arch == 'tokens':
         layout = package.active().tokens_of(game)
         if not layout:
             raise SystemExit(f"arch 'tokens': the game package has no object layout for {game!r} (GamePackage.tokens)")
-        return TokenNet(F_, A_, layout, d=hidden, layers=blocks, heads=heads, ff=ff or 2 * hidden, game=game).eval()
+        return TokenNet(F_, A_, layout, d=hidden, layers=blocks, heads=heads, ff=ff or 2 * hidden, game=game,
+                        **kw).eval()
     if arch != 'mlp':
         raise SystemExit(f"unknown arch {arch!r} ('mlp', 'grid', 'tokens')")
-    return Net(F_, A_, hidden, blocks, game=game).eval()
+    return Net(F_, A_, hidden, blocks, game=game, **kw).eval()
 
 
 def _global_blocks(lay, features):

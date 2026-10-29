@@ -50,7 +50,7 @@ import math
 
 import numpy as np
 
-from .protocol import SAMPLE_KEYS
+from .protocol import ALL_SAMPLE_KEYS
 
 EWMA = 0.5                         # weight of a phase's measurement in a consumer's rate
 MIN_RUN_S = 0.2                    # a phase shorter than this (running) measures nothing (the toys': ~1 s)
@@ -76,7 +76,7 @@ def split_games(rows, s):
             raise RuntimeError(f'split_games: game {r.get("gid")} has {k} samples, {n - a} left in the batch')
         lo, hi = int(off[a]), int(off[b])
         part = {}
-        for key in SAMPLE_KEYS:
+        for key in ALL_SAMPLE_KEYS:
             if key not in s:
                 continue
             v = s[key]

@@ -31,6 +31,11 @@ network trained in the same run (<run>/resolver/); --resolver-cfg holds its sett
 --selfplay-league-pool, raw offsets back) in one seat; only the current network's decisions are
 recorded (zero/league.py, docs/az.md 14).
 
+--aux-<name>-w 0.5: an auxiliary training target of the game (the game package's `aux`, e.g. MTG Zero's
+`belief`, the opponent's hand): self-play records it with every sample, the network gets an auxiliary
+head (added to a checkpoint without one, everything else as it was) and training adds its loss x the
+weight (zero/auxtarget.py, docs/az.md 15). 0 (the default): the run of before.
+
 --selfplay-remote <name>: another machine (a remote of the game package) self-plays too, with the
 same checkpoint: both machines pull the iteration's --games (the total) from one shared queue, each
 with at most its throughput's share in flight; its shards come back into data/iter_i/
@@ -51,11 +56,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import elo, games as G, league as L, package, runctl
+from . import auxtarget as AUX, elo, games as G, league as L, package, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
-from .net import EncodingMismatch, check_checkpoint, load, make_net, save
+from .net import EncodingMismatch, add_aux, aux_layout, check_checkpoint, load, make_net, save
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
 
@@ -237,16 +242,18 @@ _CORE_PRESETS = dict(PRESETS)
 
 def apply_package(pkg):
     """The game package's run presets and DEFAULTS overrides (zero.package.register calls this;
-    so does importing this module). Unknown setting names are an error."""
-    bad = sorted(set(pkg.defaults) - set(_CORE_DEFAULTS))
+    so does importing this module), and the weight setting of each of its auxiliary targets
+    (`aux_<name>_w`, default 0 = off; docs/az.md 15). Unknown setting names are an error."""
+    known = dict(_CORE_DEFAULTS, **pkg.aux_settings())
+    bad = sorted(set(pkg.defaults) - set(known))
     if bad:
         raise ValueError(f'{pkg.name}: unknown run settings in defaults: {bad}')
     for name, p in pkg.presets.items():
-        bad = sorted(set(p) - set(_CORE_DEFAULTS))
+        bad = sorted(set(p) - set(known))
         if bad:
             raise ValueError(f'{pkg.name}: preset {name!r} has unknown settings {bad}')
     DEFAULTS.clear()
-    DEFAULTS.update(_CORE_DEFAULTS)
+    DEFAULTS.update(known)
     DEFAULTS.update(pkg.defaults)
     PRESETS.clear()
     PRESETS.update(_CORE_PRESETS)
@@ -312,11 +319,11 @@ def value_q_at(cfg, it):
     return cfg['value_q'] * (min(1.0, it / w) if w else 1.0)
 
 
-def opt_state_mismatch(model, state):
-    """An optimizer state dict (AdamW's) that does not fit `model` -> why (the first parameter
-    whose moments have another shape, or the parameter count), else None. torch's own
-    load_state_dict checks the counts only."""
-    params = list(model.parameters())
+def opt_state_mismatch(model, state, params=None):
+    """An optimizer state dict (AdamW's) that does not fit `model` (or the parameter list `params`)
+    -> why (the first parameter whose moments have another shape, or the parameter count), else
+    None. torch's own load_state_dict checks the counts only."""
+    params = list(model.parameters()) if params is None else list(params)
     groups = state.get('param_groups') or []
     n = sum(len(g.get('params', [])) for g in groups)
     if n != len(params):
@@ -358,6 +365,9 @@ class Run:
         self.league = L.League(self) if L.enabled(cfg) else None
         self.roll_kinds = None                     # the rolling driver's table: each entry's league game
         self.roll_evs = None                       # ... and its evaluators by key (m, L0, ...)
+        # auxiliary targets (docs/az.md 15): the game's layout [[name, width, loss], ...] when one of
+        # their weights is on, else [] (off: nothing recorded, built or trained)
+        self.aux_w, self.aux = aux_settings(cfg, self.info)
 
     def check(self, where=''):
         if self.pw is not None:
@@ -371,7 +381,7 @@ class Run:
         c = self.cfg
         torch.manual_seed(c['seed'])
         return make_net(self.info, c['game'], c.get('arch', 'mlp'), c['hidden'], c['blocks'], c['ch'], c.get('heads', 4),
-                        c.get('ff', 0))
+                        c.get('ff', 0), aux=self.aux or None)
 
     def evaluator(self, path):
         m, _ = load(path, self.cfg['infer_device'], game=self.cfg['game'])
@@ -408,6 +418,8 @@ class Run:
         c = self.cfg
         spec = c['spec'] if record else (c.get('eval_spec') or package.active().eval_spec_of(c['game'], c['spec']))
         kw = {'queue_only': True} if queue_only else {}
+        if record and self.aux:
+            kw['aux'] = True                       # self-play records the auxiliary targets (docs/az.md 15)
         return G.Driver(c['game'], seats, spec=spec, concurrency=conc or c['conc'], seed=seed, record=record,
                         threads=c['threads'], groups=groups or c['groups'], max_steps=c['max_steps'], rolling=rolling,
                         net=net, **kw)
@@ -705,32 +717,58 @@ class Run:
             dev = 'cpu'
         t0 = time.time()
         model, _ = load(model_path(self.run, it - 1), dev, game=c['game'])
+        added = False
+        if self.aux and aux_layout(model.config.get('aux')) != self.aux:
+            if model.config.get('aux'):
+                raise SystemExit(f'iter {it}: checkpoint {it - 1} has the auxiliary head {model.config["aux"]}, this run '
+                                 f'trains {self.aux} (net.strip_aux, then fork the run)')
+            # a checkpoint without the head (a fork of a run without it): a fresh head, the rest as it was
+            model = add_aux(model, self.aux, seed=c['seed'] * 7919 + it)
+            added = True
+            self.log(f'iter {it}: auxiliary head {self.aux} added to checkpoint {it - 1} (its other outputs unchanged)')
         model.train()
-        opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'])
+        heads = [p for n, p in model.named_parameters() if n.startswith('aux_')]
+        trunk = [p for n, p in model.named_parameters() if not n.startswith('aux_')]
+        if heads:                                  # two groups: the network of before, its auxiliary head
+            opt = torch.optim.AdamW([{'params': trunk}, {'params': heads}], lr=c['lr'], weight_decay=c['wd'])
+        else:
+            opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'])
         opt_path = os.path.join(self.run, 'models', 'opt_latest.pt')
         fresh = True
         if os.path.exists(opt_path):
             try:
                 o = torch.load(opt_path, map_location=dev, weights_only=False)
                 if o.get('iter') == it - 1:
-                    # (the state of this network: its moments as its parameters; another network's,
-                    # e.g. of another encoding, would load and fail at the first step, docs/az.md 10.4)
-                    bad = opt_state_mismatch(model, o['state'])
-                    if bad:
-                        raise ValueError(f'it belongs to another network ({bad})')
-                    opt.load_state_dict(o['state'])
+                    groups = o['state'].get('param_groups') or []
+                    if heads and len(groups) == 1 and len(groups[0].get('params', [])) == len(trunk):
+                        # the state of the network before its head: kept for it, the head starts fresh
+                        bad = opt_state_mismatch(model, o['state'], params=trunk)
+                        if bad:
+                            raise ValueError(f'it belongs to another network ({bad})')
+                        opt = torch.optim.AdamW(trunk, lr=c['lr'], weight_decay=c['wd'])
+                        opt.load_state_dict(o['state'])
+                        opt.add_param_group({'params': heads})
+                    else:
+                        # (the state of this network: its moments as its parameters; another network's,
+                        # e.g. of another encoding, would load and fail at the first step, docs/az.md 10.4)
+                        bad = opt_state_mismatch(model, o['state'])
+                        if bad:
+                            raise ValueError(f'it belongs to another network ({bad})')
+                        opt.load_state_dict(o['state'])
                     fresh = False
             except Exception as e:                 # noqa: BLE001
                 self.log(f'iter {it}: optimizer state not loaded ({e}); fresh optimizer')
         lr = lr_at(c, it)
         paths = self.window_shards(it)
-        bpr = model.features * 2 + 8 * 16 + 3 * MAX_SEATS * 4
+        aw = sum(w for _, w, _ in self.aux)
+        bpr = model.features * 2 + 8 * 16 + 3 * MAX_SEATS * 4 + (2 * aw + 1 if aw else 0)
         budget = int(c['ram_budget_gb'] * 1e9 / bpr)
         t1 = time.time()
         if c.get('window_cache') and self.wcache is None:
             self.wcache = WindowCache()
+        kw = {'aux_width': aw} if aw else {}
         W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it,
-                   cache=self.wcache if c.get('window_cache') else None)
+                   cache=self.wcache if c.get('window_cache') else None, **kw)
         load_s = time.time() - t1
         steps = max(c['min_steps'], math.ceil(new_samples * c['reuse'] / c['batch']))
         vq = value_q_at(c, it)
@@ -738,6 +776,11 @@ class Run:
         amp = use_amp(model, dev)
         rng = np.random.default_rng(c['seed'] * 31 + it)
         acc = {'policy': 0.0, 'value': 0.0, 'margin': 0.0, 'entropy': 0.0, 'value_acc': 0.0}
+        if aw:
+            for name, _, loss in self.aux:
+                acc[f'aux_{name}'] = 0.0
+                if loss == 'multinomial':
+                    acc[f'aux_{name}_hit'] = 0.0
         last = min(steps, 200)
         S = model.seats
         feed = batches(W, rng, steps, c['batch'], dev, c.get('train_prefetch', 0))
@@ -748,7 +791,10 @@ class Run:
                 g['lr'] = g_lr
             idx, b = next(feed)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
-                plog, vlog, mp = model(b['x'], b['n_players'])
+                if aw:
+                    plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True)
+                else:
+                    plog, vlog, mp = model(b['x'], b['n_players'])
             plog, vlog, mp = plog.float(), vlog.float(), mp.float()
             logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)
             lp = -(b['pi'] * logp).sum(1).mean()
@@ -757,16 +803,26 @@ class Run:
             present = (torch.arange(S, device=b['x'].device)[None, :] < b['n_players'][:, None]).float()
             lm = (((mp - b['sc'][:, :S]) ** 2) * present).sum(1).mean() / 2
             loss = lp + lv + mw * lm
+            terms = [lp.detach(), lv.detach(), lm.detach()]
+            if aw:
+                la = AUX.losses(self.aux, ap.float(), b['aux'], b['aux_mask'])
+                for name, v in la.items():
+                    if self.aux_w[name] > 0:
+                        loss = loss + self.aux_w[name] * v['loss']
+                    terms.append(v['loss'].detach())
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             # the non-finite guard (docs/az.md 4.1): one device sync per step, before the step
-            if not bool(torch.isfinite(torch.stack([lp.detach(), lv.detach(), lm.detach(), gnorm.float()])).all()):
+            if not bool(torch.isfinite(torch.stack(terms + [gnorm.float()])).all()):
                 with torch.no_grad():
                     per = {'policy': -(b['pi'] * logp).sum(1),
                            'value': -(zt * F.log_softmax(vlog, dim=1).clamp(min=-1e4)).sum(1),
                            'margin': (((mp - b['sc'][:, :S]) ** 2) * present).sum(1) / 2}
-                self.nonfinite_step(it, step, steps, b, idx, W, model, {'policy': lp, 'value': lv, 'margin': lm},
+                named = {'policy': lp, 'value': lv, 'margin': lm}
+                if aw:
+                    named.update({f'aux_{name}': v['loss'] for name, v in la.items()})
+                self.nonfinite_step(it, step, steps, b, idx, W, model, named,
                                     gnorm, per, dict(lr=g_lr, value_q=vq, margin_loss_w=mw, amp=amp, device=dev))
             opt.step()
             if step >= steps - last:
@@ -779,16 +835,26 @@ class Run:
                 acc['margin'] += lm.item() / last
                 acc['entropy'] += ent.item() / last
                 acc['value_acc'] += vacc.item() / last
+                if aw:
+                    for name, v in la.items():
+                        acc[f'aux_{name}'] += v['loss'].item() / last
+                        if 'hit' in v:
+                            acc[f'aux_{name}_hit'] += v['hit'].item() / last
         feed.close()
         model.eval()
         ost = opt.state_dict()
 
         def stats():
             secs = time.time() - t0
-            return dict({k: round(v, 5) for k, v in acc.items()}, steps=steps, window_samples=W.N, window_loaded=W.loaded,
-                        window_reused=W.reused,
-                        window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
-                        value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
+            out = dict({k: round(v, 5) for k, v in acc.items()}, steps=steps, window_samples=W.N, window_loaded=W.loaded,
+                       window_reused=W.reused,
+                       window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
+                       value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
+            if aw:
+                out['aux'] = dict(AUX.window_stats(W, self.aux), weights=dict(self.aux_w))
+                if added:
+                    out['aux']['head_added'] = True
+            return out
         return model, ost, stats
 
     def opt_path(self):
@@ -1132,6 +1198,23 @@ class Run:
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})
 
 
+def aux_settings(cfg, info):
+    """(weights {name: aux_<name>_w}, layout) of a run's auxiliary targets (docs/az.md 15): the game
+    package's targets for the run's game; the layout [[name, width, loss], ...] when a weight is > 0,
+    else []. On, the engine's targets must be the package's (names and widths in order: the engine
+    computes them, `SearchGame::AUX`), else SystemExit."""
+    targets = package.active().aux_of(cfg['game'])
+    w = {name: float(cfg.get(f'aux_{name}_w') or 0.0) for name, _, _ in targets}
+    if not any(v > 0 for v in w.values()):
+        return w, []
+    eng = [(str(n), int(k)) for n, k in info.get('aux_layout') or []]
+    want = [(n, k) for n, k, _ in targets]
+    if eng != want:
+        raise SystemExit(f"auxiliary targets of {cfg['game']!r}: the game package declares {want}, this build's engine "
+                         f"computes {eng} (SearchGame::AUX)")
+    return w, targets
+
+
 def _fmt(d):
     return json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in d.items()})
 
@@ -1256,6 +1339,10 @@ def resolve_config(args, saved):
         raise SystemExit(f"policy_target {cfg['policy_target']!r}: 'visits' or 'cq'")
     check_eval_settings(cfg)
     L.check_settings(cfg)
+    for k in package.active().aux_settings():
+        w = cfg.get(k, 0.0)
+        if not isinstance(w, (int, float)) or isinstance(w, bool) or not w >= 0:
+            raise SystemExit(f'{k} {w!r}: a number >= 0 (an auxiliary target weight; 0 = off, docs/az.md 15)')
     if isinstance(cfg.get('resolver_cfg'), dict) and L.enabled(cfg['resolver_cfg']):
         raise SystemExit('resolver_cfg: selfplay_league: single-game runs only (not a co-training resolver)')
     return cfg

@@ -224,6 +224,8 @@ fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>>
     d.set_item("max_players", i.max_players)?;
     d.set_item("bots", i.bots.clone())?;
     d.set_item("max_seats", MAX_SEATS)?;
+    d.set_item("aux_layout", i.aux.clone())?;
+    d.set_item("aux_width", i.aux.iter().map(|s| s.1).sum::<usize>())?;
     Ok(d)
 }
 
@@ -241,7 +243,8 @@ fn game_names() -> Vec<&'static str> {
     registered().iter().map(|g| g.name).collect()
 }
 
-/// {name, num_actions, num_features, min_players, max_players, bots, max_seats}.
+/// {name, num_actions, num_features, min_players, max_players, bots, max_seats, aux_layout
+/// ([(segment, width)]: `SearchGame::AUX`), aux_width}.
 #[pyfunction]
 fn game_info_of<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyDict>> {
     info_dict(py, &info_of(name).map_err(verr)?)
@@ -337,6 +340,14 @@ impl PyGame {
     #[getter]
     fn rounds(&self) -> u32 {
         self.g.rounds()
+    }
+    /// The auxiliary targets of the pending decision for `viewer` (f32 [aux_width], from the true
+    /// state: a training label, `SearchGame::aux_target`; docs/search.md 1.2).
+    fn aux_target<'py>(&self, py: Python<'py>, viewer: usize) -> PyResult<Bound<'py, numpy::PyArray1<f32>>> {
+        if viewer >= self.g.num_players() {
+            return Err(PyValueError::new_err(format!("viewer {viewer}: the game has {} players", self.g.num_players())));
+        }
+        Ok(self.g.aux_target(viewer).into_pyarray(py))
     }
     fn determinize(&mut self, viewer: usize, seed: u64) {
         self.g.determinize(viewer, seed)
@@ -497,7 +508,8 @@ impl PySearchTree {
 
 // ------------------------------------------------------------------------ SearchDriver
 
-/// The batched driver (docs/search.md 2). `seats` = per game a list of seat dicts.
+/// The batched driver (docs/search.md 2). `seats` = per game a list of seat dicts; `aux`: record
+/// the game's auxiliary targets with the samples (`take_samples()['aux']`, docs/search.md 1.2).
 #[pyclass(name = "SearchDriver")]
 pub struct PySearchDriver {
     d: Box<dyn DynDriver>,
@@ -507,9 +519,9 @@ pub struct PySearchDriver {
 #[pymethods]
 impl PySearchDriver {
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32) -> PyResult<Self> {
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool) -> PyResult<Self> {
         let spec = spec_json(spec)?;
         let mut keys = Vec::new();
         let mut table: Vec<SeatCfg> = Vec::new();
@@ -530,7 +542,7 @@ impl PySearchDriver {
             }
             games.push(ix);
         }
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log };
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
         Ok(PySearchDriver { d, nfeat })
@@ -661,6 +673,10 @@ impl PySearchDriver {
         a.set_item("q", s.q.into_pyarray(py).reshape([n, MAX_SEATS])?)?;
         a.set_item("sc", s.sc.into_pyarray(py).reshape([n, MAX_SEATS])?)?;
         a.set_item("net", s.net.into_pyarray(py))?;
+        if s.aw > 0 {
+            // the auxiliary targets (a driver created with aux=True; docs/search.md 1.2)
+            a.set_item("aux", s.aux.into_pyarray(py).reshape([n, s.aw])?)?;
+        }
         Ok(Some(a.into_any().unbind()))
     }
 

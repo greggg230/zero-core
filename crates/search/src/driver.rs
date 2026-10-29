@@ -273,6 +273,10 @@ pub struct DriverCfg {
     /// its result row (`GameResult::moves`, a diagnostic: zero.h2h's `--move-log`); 0 = off
     /// (nothing changes).
     pub move_log: u32,
+    /// Record the game's auxiliary targets (`SearchGame::aux_target`, the decider's at each
+    /// recorded decision) with every sample (`Record::aux`, `take_samples()['aux']`; docs/search.md
+    /// 1.2); the game must have some (`SearchGame::AUX`). Off: nothing changes.
+    pub aux: bool,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -311,6 +315,8 @@ pub struct Record {
     pub q: [f32; MAX_SEATS],
     pub sc: [f32; MAX_SEATS],
     pub net: u32,
+    /// The decider's auxiliary targets at this decision (`DriverCfg::aux`), else empty.
+    pub aux: Vec<f32>,
 }
 
 /// A batch for one evaluator key (docs/search.md 2.2).
@@ -436,17 +442,18 @@ struct ParkedRecord {
     opts: Vec<u16>,
     pi: Vec<f32>,
     net: u32,
+    aux: Vec<f32>,
 }
 
 impl ParkedRecord {
     fn park(r: Record) -> ParkedRecord {
-        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net }
+        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux }
     }
     fn unpark(self) -> Record {
-        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net }
+        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux }
     }
     fn bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.x.len() * 2 + self.opts.len() * 2 + self.pi.len() * 4
+        std::mem::size_of::<Self>() + self.x.len() * 2 + self.opts.len() * 2 + self.pi.len() * 4 + self.aux.len() * 4
     }
 }
 
@@ -823,6 +830,9 @@ impl<G: SearchGame> Driver<G> {
         }
         if cfg.queue_only && !cfg.rolling {
             return Err("queue_only needs a rolling driver".into());
+        }
+        if cfg.aux && G::aux_width() == 0 {
+            return Err(format!("aux: {} has no auxiliary targets (SearchGame::AUX)", G::NAME));
         }
         let conc = if cfg.rolling { cfg.concurrency.max(1) } else { cfg.concurrency.max(1).min(cfg.games.len().max(1)) };
         let groups = cfg.groups.max(1).min(conc);
@@ -1348,10 +1358,14 @@ pub struct SampleArrays {
     pub q: Vec<f32>,
     pub sc: Vec<f32>,
     pub net: Vec<u32>,
+    /// Auxiliary targets [n * aw] (`DriverCfg::aux`; aw = 0: none recorded).
+    pub aw: usize,
+    pub aux: Vec<f32>,
 }
 
 pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
     let n = recs.len();
+    let aw = recs.first().map_or(0, |r| r.aux.len());
     let mut s = SampleArrays {
         n,
         f,
@@ -1365,6 +1379,8 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         q: Vec::with_capacity(n * MAX_SEATS),
         sc: Vec::with_capacity(n * MAX_SEATS),
         net: Vec::with_capacity(n),
+        aw,
+        aux: Vec::with_capacity(n * aw),
     };
     for r in recs {
         debug_assert_eq!(r.x.len(), f);
@@ -1378,6 +1394,8 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         s.q.extend_from_slice(&r.q);
         s.sc.extend_from_slice(&r.sc);
         s.net.push(r.net);
+        assert_eq!(r.aux.len(), aw, "records with different auxiliary target widths");
+        s.aux.extend_from_slice(&r.aux);
     }
     s
 }

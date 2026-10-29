@@ -17,10 +17,12 @@ pub struct GameInfo {
     pub min_players: usize,
     pub max_players: usize,
     pub bots: Vec<&'static str>,
+    /// Auxiliary target segments (name, width) (`SearchGame::AUX`; empty: none).
+    pub aux: Vec<(&'static str, usize)>,
 }
 
 pub fn game_info<G: SearchGame>() -> GameInfo {
-    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>() }
+    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>(), aux: G::AUX.to_vec() }
 }
 
 /// One game, any type.
@@ -47,6 +49,8 @@ pub trait DynGame: Send + Sync {
     fn deferred_payload(&self) -> Result<String, String>;
     fn resolve(&mut self, results: &str) -> Result<(), String>;
     fn team_size(&self) -> usize;
+    /// `SearchGame::aux_target` for `viewer` (`aux_width()` floats; none: empty).
+    fn aux_target(&self, viewer: usize) -> Vec<f32>;
     /// A search tree for this game's pending decision.
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String>;
 }
@@ -119,6 +123,11 @@ impl<G: SearchGame> DynGame for G {
     }
     fn team_size(&self) -> usize {
         SearchGame::team_size(self)
+    }
+    fn aux_target(&self, viewer: usize) -> Vec<f32> {
+        let mut v = vec![0.0; G::aux_width()];
+        SearchGame::aux_target(self, viewer, &mut v);
+        v
     }
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String> {
         let viewer = SearchGame::to_move(self).ok_or("the game is over")?;

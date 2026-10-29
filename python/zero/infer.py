@@ -19,6 +19,13 @@ while the previous one's results come back and are softmaxed on the CPU (one CUD
 the graphs' static inputs in order; the pinned host buffers alternate between two slots).
 ZERO_INFLIGHT=1: one batch at a time, as before.
 
+Auxiliary heads (docs/az.md 15): the search's evaluations never compute them (`forward` without
+`aux`); `NetEvaluator.aux(x, n_players)` is the inference API for them - one forward pass of the given
+rows (e.g. a decision's root, MTG Zero's belief of the opponent's hand) -> each target's predictions
+(`net.aux_predict`). `set_weights` takes a state with or without the head either way (a rolling
+evaluator built before a run turned its auxiliary target on, or one with the head given an older
+state).
+
 `NetEvaluator(..., workers=k)` (k > 1; run setting `infer_workers`): eager batches are evaluated
 on k Python threads (torch releases the GIL), and `drive` keeps up to k batches in flight (the
 driver needs as many `groups`). For small networks on a CPU, where one batch cannot keep the
@@ -210,7 +217,14 @@ class NetEvaluator:
             self.lock = threading.Lock()
 
     def set_weights(self, state_dict):
-        self.model.load_state_dict(state_dict)
+        """New weights in place. The auxiliary head's (training only, `net.add_aux`) are optional both
+        ways: a network built without the head takes a state with it (they are dropped) and one with
+        the head keeps its own when the state has none; everything else must match."""
+        own = self.model.state_dict()
+        sd = {k: v for k, v in state_dict.items() if k in own or not k.startswith('aux_')}
+        missing, unexpected = self.model.load_state_dict(sd, strict=False)
+        if unexpected or any(not k.startswith('aux_') for k in missing):
+            raise RuntimeError(f'set_weights: state mismatch (missing {missing}, unexpected {unexpected})')
         self.model.eval()
         if self.fast is not None:
             self.fast.refresh()
@@ -268,6 +282,27 @@ class NetEvaluator:
 
     def __call__(self, lb):
         return self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action)
+
+    @property
+    def aux_layout(self):
+        """The network's auxiliary targets [[name, width, loss], ...] ([]: no auxiliary head)."""
+        return list(getattr(self.model, 'aux_layout', None) or [])
+
+    @torch.inference_mode()
+    def aux(self, x, n_players):
+        """The auxiliary head's predictions for rows `x` [B, F] (numpy; n_players [B]) -> {name: float32
+        numpy [B, width]} (`net.aux_predict`: a multinomial target's distribution, a poisson target's
+        rates, an mse target's values); {} for a network without the head. One forward pass, outside
+        the search's batches (its evaluations never compute the head)."""
+        if not self.aux_layout:
+            return {}
+        from .net import aux_predict
+        self._check_width(x)
+        xt = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).to(self.device)
+        nt = torch.from_numpy(np.asarray(n_players, np.int64)).to(self.device)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
+            raw = self.model(xt, nt, aux=True)[3]
+        return {k: v.float().cpu().numpy() for k, v in aux_predict(self.aux_layout, raw).items()}
 
     def _graphable(self, opt_off):
         return self.fast is not None and len(opt_off) > 1

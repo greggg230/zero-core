@@ -68,12 +68,23 @@ class GamePackage:
                     signal. By convention the dict holds `value` (the dashboard's series),
                     optional `label`, `pct` (a share: shown as a percentage) and `refs`
                     ({name: value}: reference lines, e.g. baselines on the same positions)
+    aux             game -> its auxiliary training targets (docs/az.md 15): [{name, width, loss}, ...]
+                    in the order of the game's `SearchGame::AUX` segments (the engine computes
+                    them: a run checks the names and widths against it), loss 'multinomial' |
+                    'poisson' | 'mse' (net.AUX_LOSSES). Each target gets the run setting
+                    `aux_<name>_w` (default 0 = off: nothing recorded, no head, the run of before)
+    replay_aux      game -> fn(predictions, state, seat, frame) -> {field: JSON} or 'module:attr':
+                    what a replay frame of a network decision shows of a checkpoint's auxiliary
+                    head (zero.replay; predictions {name: numpy [w]} = `net.aux_predict` at the
+                    root, state = the frame's parsed export_state, seat = the decider). Default:
+                    {'aux': {name: [[column, value], ...]}}, each target's 12 largest values
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
-                 grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None):
+                 grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
+                 replay_aux=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -97,6 +108,30 @@ class GamePackage:
         self.eval_specs = dict(eval_specs or {})
         self.deferred = dict(deferred or {})
         self.evals = dict(evals or {})
+        self.aux = dict(aux or {})
+        self.replay_aux = dict(replay_aux or {})
+
+    def aux_of(self, game):
+        """`game`'s auxiliary targets [[name, width, loss], ...] (none: [])."""
+        from .net import aux_layout
+        return aux_layout(self.aux.get(game))
+
+    def aux_settings(self):
+        """The run settings of the package's auxiliary targets: {'aux_<name>_w': 0.0} for every
+        target of every game (zero.run adds them to DEFAULTS)."""
+        out = {}
+        for targets in self.aux.values():
+            for t in targets:
+                name = t['name'] if isinstance(t, dict) else t[0]
+                out[f'aux_{name}_w'] = 0.0
+        return out
+
+    def replay_aux_of(self, game):
+        """`game`'s replay rendering of auxiliary predictions (`replay_aux`; None: zero.replay's default)."""
+        f = self.replay_aux.get(game)
+        if isinstance(f, str):
+            f = self.replay_aux[game] = resolve(f)
+        return f
 
     def deferred_of(self, game):
         """`game`'s deferred-result glue: (episodes(payload) -> [spec JSON], results(payload, rows)
@@ -152,9 +187,15 @@ TOY_TOKENS = {'vocab': 8,
                            {'name': 'players', 'offset': 122, 'count': 4, 'width': 16, 'present': 0}],
               'bags': [{'name': 'cards', 'offset': 25, 'count': 1, 'width': 6}]}
 
+# The toy's auxiliary target (crates/search/src/toy.rs `aux_target`, docs/az.md 15): the next round's
+# card, hidden until its round - a one-hot over the 6 cards (none in the last round), learned as a
+# distribution (the best from public information: uniform over the next stage's unrevealed cards).
+TOY_AUX = [{'name': 'next_card', 'width': 6, 'loss': 'multinomial'}]
+
 # the core's own package: the toy game, zero._engine (crates/toy_py, tools/build_py.sh)
 CORE = GamePackage('zero', 'Zero Core', CORE_ROOT, engine='zero._engine', run_module='zero.run', game='toy',
-                   dashboard_port=None, hub_id=None, env_prefix='ZERO', tokens={'toy': TOY_TOKENS})
+                   dashboard_port=None, hub_id=None, env_prefix='ZERO', tokens={'toy': TOY_TOKENS},
+                   aux={'toy': TOY_AUX})
 
 def default_episodes(payload):
     """The resolver specs of a deferred terminal: its payload's "episodes" (each a JSON string,

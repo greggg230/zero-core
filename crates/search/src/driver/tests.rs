@@ -28,6 +28,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         net: 0,
         queue_only: false,
         move_log: 0,
+        aux: false,
     }
 }
 
@@ -1533,4 +1534,80 @@ fn root_min_visits_never_touch_fast_searches() {
     assert!(sa.is_empty() && sb.is_empty());
     assert_eq!(results_digest(&ra), results_digest(&rb));
     assert_eq!(ra.iter().map(|r| r.moves.clone()).collect::<Vec<_>>(), rb.iter().map(|r| r.moves.clone()).collect::<Vec<_>>());
+}
+
+/// `DriverCfg::aux` (docs/search.md 1.2): the same games and records with the auxiliary targets
+/// added to each record (the decider's `aux_target` at that decision: the toy's next round card,
+/// one-hot or all zero in the last round), the golden records unchanged; off, every record's `aux`
+/// is empty; a game without targets refuses `aux`.
+#[test]
+fn aux_records_the_decider_targets_and_changes_nothing_else() {
+    let run_aux = |aux: bool| {
+        let mut c = cfg(vec![nn(0, 16, true)], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+        c.seed = 2026;
+        c.aux = aux;
+        let mut d = Driver::<ToyGame>::new(c).unwrap();
+        run(&mut d)
+    };
+    let (r0, s0) = run_aux(false);
+    let (r1, s1) = run_aux(true);
+    assert_eq!(s0.len(), GOLDEN_RECORDS.0);
+    assert_eq!(records_digest(&s0), GOLDEN_RECORDS.1, "aux off: the golden records");
+    assert_eq!(records_digest(&s1), GOLDEN_RECORDS.1, "aux on: the same records besides aux");
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples);
+    assert_eq!(r0.iter().map(key).collect::<Vec<_>>(), r1.iter().map(key).collect::<Vec<_>>());
+    assert!(s0.iter().all(|r| r.aux.is_empty()));
+    let (mut hot, mut none) = (0, 0);
+    for r in &s1 {
+        assert_eq!(r.aux.len(), ToyGame::aux_width());
+        let s: f32 = r.aux.iter().sum();
+        assert!(r.aux.iter().all(|&v| v == 0.0 || v == 1.0));
+        if s == 1.0 {
+            hot += 1;
+        } else {
+            assert_eq!(s, 0.0);
+            none += 1;
+        }
+    }
+    assert!(hot > 200 && none > 0, "one-hot {hot}, last-round {none}");
+    let a = sample_arrays(&s1, ToyGame::NUM_FEATURES);
+    assert_eq!((a.aw, a.aux.len()), (ToyGame::aux_width(), s1.len() * ToyGame::aux_width()));
+    assert_eq!(sample_arrays(&s0, ToyGame::NUM_FEATURES).aw, 0);
+    // replay one recorded game move for move: each record's target is its own decision's
+    let mut c = cfg(vec![nn(0, 16, true)], vec![vec![0, 0]; 1], &[("m", KeyKind::Nn)]);
+    c.aux = true;
+    c.move_log = 10_000;
+    let seed = c.seed;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (res, smp) = run(&mut d);
+    assert!(res[0].over && !smp.is_empty());
+    let mut g = ToyGame::new_game(&ToyGame::parse_spec("{}").unwrap(), 2, Rng::new(split64(seed ^ split64(1))).next_u64()).unwrap();
+    let mut at = std::collections::HashMap::new();
+    let mut keys = Vec::new();
+    for (p, a, _) in &res[0].moves {
+        let mut x = vec![0.0f32; ToyGame::NUM_FEATURES];
+        g.encode(*p as usize, &mut x);
+        let mut t = vec![0.0f32; ToyGame::aux_width()];
+        g.aux_target(*p as usize, &mut t);
+        at.insert(x.iter().map(|v| v.to_bits()).collect::<Vec<u32>>(), t);
+        g.step(*a, &mut keys).unwrap();
+        // (the driver steps single-option decisions itself: not in the move log)
+        let mut legal = Vec::new();
+        while g.to_move().is_some() {
+            legal.clear();
+            g.legal_actions(&mut legal);
+            if legal.len() != 1 {
+                break;
+            }
+            g.step(legal[0], &mut keys).unwrap();
+        }
+    }
+    for r in &smp {
+        let t = at.get(&r.x.iter().map(|v| v.to_bits()).collect::<Vec<u32>>()).expect("a recorded decision of the game");
+        assert_eq!(&r.aux, t, "a record's target is the decider's at that decision");
+    }
+    // a game without auxiliary targets refuses aux
+    let mut c = cfg(vec![SeatCfg::Bot("random".into())], vec![vec![0, 0, 0, 0]; 1], &[]);
+    c.aux = true;
+    assert!(Driver::<crate::toy_team::ToyTeam>::new(c).is_err());
 }

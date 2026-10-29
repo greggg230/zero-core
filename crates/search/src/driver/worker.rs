@@ -448,9 +448,16 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             PolicyTarget::Visits => p0.clone(),
             PolicyTarget::CompletedQ { c_visit, c_scale } => tree.cq_target(root, c_visit, c_scale),
         };
+        let g = slot.game.as_ref().unwrap();
         let mut x = vec![0.0f32; G::NUM_FEATURES];
-        slot.game.as_ref().unwrap().encode(p, &mut x);
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net });
+        g.encode(p, &mut x);
+        // the decider's auxiliary targets from the true state (a label only: never in `x`)
+        let mut aux = Vec::new();
+        if cfg.aux {
+            aux.resize(G::aux_width(), 0.0);
+            g.aux_target(p, &mut aux);
+        }
+        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux });
         slot.rq.push(if pruned.is_some() { tree.root_win_pruned() } else { tree.win(root) });
     }
     slot.decisions += 1;

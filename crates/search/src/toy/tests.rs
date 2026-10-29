@@ -210,3 +210,62 @@ fn enc(g: &ToyGame, viewer: usize) -> Vec<f32> {
     SearchGame::encode(g, viewer, &mut v);
     v
 }
+
+fn aux(g: &ToyGame, viewer: usize) -> Vec<f32> {
+    let mut v = vec![0.0; ToyGame::aux_width()];
+    SearchGame::aux_target(g, viewer, &mut v);
+    v
+}
+
+/// The auxiliary target (the next round's card, docs/search.md 1.2) is the true hidden card:
+/// worlds determinized for the decider encode the same while their targets follow their own
+/// hidden order, and the target is never in the features.
+#[test]
+fn aux_target_is_the_hidden_next_card_and_never_an_input() {
+    assert_eq!(ToyGame::AUX, &[("next_card", N_CARDS)]);
+    assert_eq!(ToyGame::aux_width(), N_CARDS);
+    let mut rng = Rng::new(11);
+    let mut legal = Vec::new();
+    let (mut differ, mut last) = (0, 0);
+    for s in 0..200 {
+        let mut g = ToyGame::new(2 + (s as usize % 3), s);
+        let mut keys = Vec::new();
+        for _ in 0..rng.below(70) {
+            if g.over {
+                break;
+            }
+            legal.clear();
+            g.legal(&mut legal);
+            g.apply(legal[rng.below(legal.len() as u32) as usize], &mut keys).unwrap();
+        }
+        if g.over {
+            continue;
+        }
+        let me = g.cur as usize;
+        let t = aux(&g, me);
+        let r = g.round as usize;
+        if r == ROUNDS as usize {
+            assert!(t.iter().all(|&v| v == 0.0), "the last round has no next card");
+            last += 1;
+            continue;
+        }
+        let mut want = vec![0.0; N_CARDS];
+        want[g.order[r] as usize] = 1.0;
+        assert_eq!(t, want);
+        // the next card is not revealed: it is one of its stage's cards not seen yet
+        assert!(!(0..r).any(|i| g.order[i] == g.order[r]));
+        let x0 = enc(&g, me);
+        for _ in 0..4 {
+            let mut d = g.clone();
+            SearchGame::determinize(&mut d, me, &mut rng);
+            assert_eq!(enc(&d, me), x0, "the encoding never sees the hidden next card");
+            let td = aux(&d, me);
+            let mut wd = vec![0.0; N_CARDS];
+            wd[d.order[r] as usize] = 1.0;
+            assert_eq!(td, wd, "the target is the world's own hidden card");
+            differ += (td != t) as u32;
+        }
+    }
+    assert!(differ > 100, "worlds with another next card: {differ}");
+    assert!(last > 0);
+}

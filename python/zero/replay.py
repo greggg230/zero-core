@@ -28,7 +28,8 @@ Each game -> one JSON object (format 'zero-replay/1'), written gzipped to `--out
   format   'zero-replay/1'
   game, spec, seed, created (unix s), title, group, source {checkpoint, run, iter}
   seats    [{name, kind: 'nn' | 'bot' | 'ext', checkpoint?, run?, iter?, sims?, select? (the move
-           rule, absent = 'visits')}]
+           rule, absent = 'visits'), aux? (the names of its checkpoint's auxiliary targets: its
+           frames show the head's predictions)}]
   states   [the game's export_state(), parsed]   (a state is stored once per change)
   frames   one per step, in order:
            {s: state index before the step, p: seat to move, k: 'nn' | 'bot' | 'ext' | 'forced',
@@ -37,7 +38,12 @@ Each game -> one JSON object (format 'zero-replay/1'), written gzipped to `--out
                    option for the mover, null if unvisited), v (network utility of the root for
                    the mover), w (search P(win) per seat), sims, sampled (a temperature pick)
             'ext': x (the external's answer, parsed JSON)
-            hint:  {by: 'ext:<name>', x: its answer at this state} (network decisions)}
+            hint:  {by: 'ext:<name>', x: its answer at this state} (network decisions)
+            the auxiliary head (a checkpoint with one, docs/az.md 15; absent otherwise): what the
+                   game package's `replay_aux` makes of the head's predictions at the decision's root
+                   for the decider (one forward pass of the root's features after its search; MTG
+                   Zero: `belief` {for, n, cards: [[name, expected count], ...]}), by default
+                   aux: {<target>: [[column, value], ...]} (its 12 largest values)}
   final    index of the final state; result (per seat), scores, rounds, over
 """
 import argparse
@@ -86,8 +92,13 @@ class RecordingDriver(PyDriver):
     (impl 'rs'), a built-in bot name, or ExtSeat. `hint`: an external name asked (not applied)
     at network decisions. Finished games: `take_replays()` (dicts without the header fields)."""
 
-    def __init__(self, game, n_games, seat_fn, spec=None, concurrency=8, seed=0, max_steps=100_000, hint=None):
+    def __init__(self, game, n_games, seat_fn, spec=None, concurrency=8, seed=0, max_steps=100_000, hint=None,
+                 aux=None, aux_render=None):
         self.hint = hint
+        # evaluator key -> its NetEvaluator, for the network seats whose checkpoint has an auxiliary
+        # head (docs/az.md 15): each of their decisions' frames shows the head's predictions at the root
+        self.aux = dict(aux or {})
+        self.aux_render = aux_render or default_aux_render
         self.ext_out = {}
         self.replays = []
         super().__init__(game, n_games, seat_fn, spec=spec, concurrency=concurrency, seed=seed, record=False,
@@ -231,6 +242,14 @@ class RecordingDriver(PyDriver):
                  q=[round(w / n, 4) if n else None for w, n in zip(wsum, nv)],
                  v=round(float(t.root_value0), 4), w=[round(float(x), 4) for x in win] if win else None,
                  sims=int(sum(nv)), sampled=bool(seat.selfplay and slot.decisions < seat.temp_moves and sum(nv) > 0))
+        ev = self.aux.get(seat.key)
+        if ev is not None:
+            # the auxiliary head at the root, for the decider: one forward pass of the root's features
+            # (the search's own evaluations never compute the head, and a reused tree's root was
+            # evaluated during an earlier search)
+            x = np.asarray(slot.game.encode(p), np.float32)[None]
+            pred = {k: v[0] for k, v in ev.aux(x, np.asarray([slot.n], np.int64)).items()}
+            f.update(self.aux_render(pred, slot.states[f['s']], p, f))
         super()._decide(slot, seat, tree, p)
 
     def _apply(self, slot, a):
@@ -250,6 +269,17 @@ class RecordingDriver(PyDriver):
             'frames': slot.frames, 'result': [float(x) for x in g.result()] if over else None,
             'scores': [float(x) for x in g.scores()], 'rounds': int(g.rounds), 'over': bool(over)})
         self.replays[-1]['final'] = len(self.replays[-1]['states']) - 1
+
+
+def default_aux_render(pred, state, seat, frame, top=12):
+    """A frame's auxiliary predictions when the game package has no `replay_aux`: {'aux': {name:
+    [[column, value], ...]}}, each target's `top` largest values (rounded to 4 places)."""
+    out = {}
+    for name, v in pred.items():
+        v = np.asarray(v, np.float64)
+        idx = np.argsort(-v, kind='stable')[:top]
+        out[name] = [[int(i), round(float(v[i]), 4)] for i in idx]
+    return {'aux': out}
 
 
 # ------------------------------------------------------------------------------ recording
@@ -341,10 +371,16 @@ def record(ckpt, opp='self', games=6, sims=128, opp_sims=None, spec=None, selfpl
     hname = hint[4:] if hint and hint.startswith('ext:') else None
     if hname:
         externals.setdefault(hname, G.external(hname, seed + 1))
+    # checkpoints with an auxiliary head: their frames show its predictions (docs/az.md 15)
+    aux = {k: ev for k, ev in evaluators.items() if ev.aux_layout}
+    for s in (me, other):
+        if s.get('key') in aux:
+            s['aux'] = [n for n, _, _ in aux[s['key']].aux_layout]
     seats = lambda k: [seat_a, seat_b] if k % 2 == 0 else [seat_b, seat_a]  # noqa: E731
     names = lambda k: [me, other] if k % 2 == 0 else [other, me]  # noqa: E731
+    kw = {'aux': aux, 'aux_render': package.active().replay_aux_of(game)} if aux else {}
     drv = RecordingDriver(game, games, seats, spec=spec, concurrency=min(conc, games), seed=seed, max_steps=5000,
-                          hint=hname)
+                          hint=hname, **kw)
     t0 = time.time()
     drive(drv, evaluators, externals)
     vs = 'itself' if opp == 'self' else other['name']

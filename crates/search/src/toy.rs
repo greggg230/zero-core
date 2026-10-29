@@ -849,6 +849,20 @@ impl SearchGame for ToyGame {
             _ => None,
         }
     }
+
+    /// One auxiliary target (docs/search.md 1.2): the next round's card, hidden until its round
+    /// (`order[round]`, a one-hot over the 6 cards; all zero in the last round: no target). The
+    /// toy's analogue of MTG Zero's belief target - hidden information the encoding never shows,
+    /// whose best prediction from public information is uniform over the unrevealed cards of the
+    /// next round's stage (the order is random within each stage).
+    const AUX: &'static [(&'static str, usize)] = &[("next_card", N_CARDS)];
+
+    fn aux_target(&self, _viewer: usize, out: &mut [f32]) {
+        let r = self.round as usize;
+        if !self.over && r < ROUNDS as usize {
+            out[self.order[r] as usize] = 1.0;
+        }
+    }
 }
 
 /// `ToyGame::heuristic` as a driver bot.

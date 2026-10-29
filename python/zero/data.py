@@ -5,8 +5,9 @@ renamed: a crash never leaves a half-written shard; remote self-play's shards, `
 are compressed npz - zlib level 1, ~58x for MTG's sparse features - which `np.load` reads alike:
 docs/az.md 5.3). Arrays: `x` float16 [N, F], `player`,
 `n_players` int8, `opt_off` int32 [N+1], `opt_action` int16/int32, `pi` float16, `z` / `q` /
-`sc` float16 [N, P] (P = most players in the shard), `net` int32, and `meta` (a JSON string:
-game, features, actions, rows, task info). Float16 targets are renormalised on load.
+`sc` float16 [N, P] (P = most players in the shard), `net` int32, optionally `aux` float16 [N, W]
+(the deciders' auxiliary targets: self-play with an auxiliary loss on, docs/az.md 15), and `meta` (a
+JSON string: game, features, actions, rows, task info). Float16 targets are renormalised on load.
 Non-finite guard (zero/finite.py, docs/az.md 4.1): `write_shard` checks x, pi, z, q, sc after the
 float16 cast; a shard with a NaN / inf is written as `*.bad.npz` instead (the window never loads
 it: `shard_paths` skips it) and the run fails (`NonFinite`). The `Window` checks every shard it
@@ -19,7 +20,10 @@ subsampled at the same rate when the total exceeds the RAM budget - the rate fro
 row counts (their meta), each shard subsampled as it is loaded (remote self-play triples a run's
 samples per iteration; the rows kept are those of loading every shard first); `batch(idx)` builds
 torch tensors: features cut / zero-padded to the network's width, dense legal masks and policy
-targets over the actions, value / margin targets over MAX_SEATS. The shards load in parallel
+targets over the actions, value / margin targets over MAX_SEATS; a window with `aux_width` W > 0 also
+`aux` [B, W] and `aux_mask` [B] (1 = the row's shard has auxiliary targets; a shard written without
+them - before the targets were on, e.g. a fork's older window - gives zeros with mask 0, so the
+auxiliary losses skip its rows and the shards stay usable). The shards load in parallel
 (`threads`, default `WINDOW_THREADS`): inflating a compressed shard, its CRC and the copies
 release the GIL, so the window of MTG's Delver run (40 shards, 265k rows, 17.9 GB) loads in a
 fraction of the 41 s it took one shard at a time. Each shard's rows are drawn in path order
@@ -77,7 +81,8 @@ def compact(s):
             'n_players': n.astype(np.int8), 'opt_off': s['opt_off'].astype(np.int32),
             'opt_action': _narrow_int(s['opt_action']), 'pi': s['pi'].astype(np.float16),
             'z': s['z'][:, :P].astype(np.float16), 'q': s['q'][:, :P].astype(np.float16),
-            'sc': s['sc'][:, :P].astype(np.float16), 'net': s['net'].astype(np.int32)}
+            'sc': s['sc'][:, :P].astype(np.float16), 'net': s['net'].astype(np.int32),
+            **({'aux': s['aux'].astype(np.float16)} if 'aux' in s else {})}
 
 
 def write_shard(path, s, meta, bad_path=None, compress=0):
@@ -251,9 +256,10 @@ def _file_key(path):
     return st.st_size, st.st_mtime_ns
 
 
-def _load_part(path, N, idx, F, xdst=None):
+def _load_part(path, N, idx, F, xdst=None, AW=0):
     """One shard's part of a window: rows `idx` (None = all N), features cut / zero-padded to F
-    written into `xdst` (a fresh array when None: then also returned as 'x')."""
+    written into `xdst` (a fresh array when None: then also returned as 'x'); `AW` > 0: the auxiliary
+    targets too ('aux' float16 [rows, AW] and 'aux_mask': zeros and False for a shard without them)."""
     p = read_shard(path)
     probs = shard_problems(p)
     if probs:
@@ -285,6 +291,15 @@ def _load_part(path, N, idx, F, xdst=None):
         v = p[key][sel].astype(np.float32)
         a[:, :v.shape[1]] = v
         out[key] = a
+    if AW:
+        if 'aux' in p:
+            if p['aux'].shape[1] != AW:
+                raise ValueError(f'shard {path}: auxiliary targets of width {p["aux"].shape[1]}, the window wants {AW}')
+            out['aux'] = p['aux'][sel].astype(np.float16)
+            out['aux_mask'] = np.ones(len(idx), bool)
+        else:
+            out['aux'] = np.zeros((len(idx), AW), np.float16)
+            out['aux_mask'] = np.zeros(len(idx), bool)
     return out
 
 
@@ -376,10 +391,13 @@ class Window:
     samples (a uniform random share of every shard). A shard with a NaN / inf raises NonFinite.
     `threads`: shards loaded at once (default WINDOW_THREADS); the result does not depend on it.
     `cache`: a WindowCache (module docstring): used while the window fits its budget; `reused` =
-    the rows it supplied."""
+    the rows it supplied. `aux_width` W > 0: the auxiliary targets too (module docstring; `aux_rows`
+    = the rows that have them)."""
 
-    def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, threads=None, cache=None):
+    def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, threads=None, cache=None,
+                 aux_width=0):
         self.F, self.A = num_features, num_actions
+        self.AW = AW = int(aux_width)
         self.paths = list(paths)
         self.reused = 0
         self._x = self._xs = None
@@ -396,12 +414,14 @@ class Window:
         if self.N == 0:
             raise ValueError('empty training window')
         if cache is not None and keep >= 1.0:
-            keys = {path: (_file_key(path), self.F) for path in self.paths}
+            # (the auxiliary width only when on: the keys of before otherwise)
+            keys = {path: (_file_key(path), (self.F, AW) if AW else self.F) for path in self.paths}
             for path in list(cache.parts):         # gone from the window, rewritten, another width
                 if path not in keys or cache.parts[path][:2] != keys[path]:
                     del cache.parts[path]
             todo = [k for k, path in enumerate(self.paths) if path not in cache.parts]
-            loaded = _run_all(lambda j: _load_part(self.paths[todo[j]], rows[todo[j]], None, self.F), len(todo), threads)
+            loaded = _run_all(lambda j: _load_part(self.paths[todo[j]], rows[todo[j]], None, self.F, AW=AW), len(todo),
+                              threads)
             for k, part in zip(todo, loaded):
                 cache.parts[self.paths[k]] = keys[self.paths[k]] + (part,)
             self.reused = self.N - sum(rows[k] for k in todo)
@@ -412,7 +432,8 @@ class Window:
                 cache.clear()                      # over budget: subsampled shards are not cached
             self._x = np.empty((self.N, self.F), np.float16)
             parts = _run_all(lambda k: _load_part(self.paths[k], rows[k], picks[k], self.F,
-                                                  self._x[self.starts[k]:self.starts[k + 1]]), len(self.paths), threads)
+                                                  self._x[self.starts[k]:self.starts[k + 1]], AW=AW), len(self.paths),
+                             threads)
         self.src_row = np.concatenate([q['src'] for q in parts])     # window row -> its row in its shard
         self.player = np.concatenate([q['player'] for q in parts])
         self.n_players = np.concatenate([q['n_players'] for q in parts])
@@ -425,9 +446,13 @@ class Window:
         self.q = np.concatenate([q['q'] for q in parts])
         self.sc = np.concatenate([q['sc'] for q in parts])
         self.loaded = total
+        self.aux = np.concatenate([q['aux'] for q in parts]) if AW else None
+        self.aux_mask = np.concatenate([q['aux_mask'] for q in parts]) if AW else None
+        self.aux_rows = int(self.aux_mask.sum()) if AW else 0
         xbytes = self._x.nbytes if self._x is not None else sum(a.nbytes for a in self._xs)
         self.nbytes = xbytes + sum(a.nbytes for a in (self.player, self.n_players, self.opt_off, self.opt_action,
-                                                      self.pi, self.z, self.q, self.sc))
+                                                      self.pi, self.z, self.q, self.sc)
+                                   + ((self.aux, self.aux_mask) if AW else ()))
 
     @property
     def x(self):
@@ -471,6 +496,10 @@ class Window:
         def norm(a):
             return a / np.maximum(a.sum(1, keepdims=True), 1e-8)
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device)
-        return {'x': t(self.features(idx).astype(np.float32)), 'mask': t(mask), 'pi': t(pi),
-                'z': t(norm(self.z[idx])), 'q': t(norm(self.q[idx])), 'sc': t(self.sc[idx]),
-                'n_players': t(self.n_players[idx])}
+        out = {'x': t(self.features(idx).astype(np.float32)), 'mask': t(mask), 'pi': t(pi),
+               'z': t(norm(self.z[idx])), 'q': t(norm(self.q[idx])), 'sc': t(self.sc[idx]),
+               'n_players': t(self.n_players[idx])}
+        if self.AW:
+            out['aux'] = t(self.aux[idx].astype(np.float32))
+            out['aux_mask'] = t(self.aux_mask[idx].astype(np.float32))
+        return out

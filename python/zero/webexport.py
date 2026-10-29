@@ -4,7 +4,7 @@ it; moved from Caverna Zero's tools/export_web.py, whose wasm player uses it).
 Format (little endian): b"CVZW", u32 version 1, u32 header length, the JSON header (features,
 actions, hidden, blocks, head, seats, game, source, iter, tensors = [{name, shape, offset (f16
 elements)}]), spaces to an even length, the float16 data. The margin head is not exported
-(unused by the browser search).
+(unused by the browser search), nor is an auxiliary head (training and analysis only).
 
   python -m zero.webexport runs/x/models/iter_0040.pt out.bin
 """
@@ -24,7 +24,7 @@ def export_model(ckpt, out):
     cfg = model.config
     tensors, chunks, off, worst = [], [], 0, 0.0
     for name, t in model.state_dict().items():
-        if name.startswith('mar.'):
+        if name.startswith('mar.') or name.startswith('aux_'):
             continue
         a32 = t.detach().cpu().numpy().astype(np.float32)
         a = a32.astype('<f2')
