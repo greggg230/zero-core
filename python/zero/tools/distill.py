@@ -183,6 +183,7 @@ def main(argv=None):
     else:
         student = D.new_student(teacher, size['arch'], size['hidden'], size['blocks'], size['heads'], size['ff'], size['ch'],
                                 a.seed, game)
+    student.to(a.device)
     check_encoding(student.config, game, 'the student')
     paths = shard_list(a.data)
     if a.heldout == ['none']:

@@ -69,10 +69,14 @@ def _option_index(W, rows):
 
 
 @torch.inference_mode()
-def outputs(model, W, device='cpu', batch=1024):
+def outputs(model, W, device=None, batch=1024):
     """`model`'s answers on every row of window `W` -> {'pi': float32 [options] (the policy over each
     row's legal actions, softmax of its logits there: aligned with W.opt_action), 'v': float32 [N,
-    MAX_SEATS] (P(win) per seat, 0 for absent seats), 'm': float32 [N, MAX_SEATS] (margin)}."""
+    MAX_SEATS] (P(win) per seat, 0 for absent seats), 'm': float32 [N, MAX_SEATS] (margin)}. The
+    model is moved to `device` when one is given; the rows go to the model's device."""
+    if device is not None:
+        model.to(device)
+    device = next(model.parameters()).device
     model.eval()
     N = W.N
     pi = np.zeros(len(W.opt_action), np.float32)

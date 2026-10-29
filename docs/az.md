@@ -1972,14 +1972,17 @@ optimizer state, the size in config.json, K's Elo pairs gone from the fork and k
 then one more iteration trains the student; a network of another game is refused by `--net`. MTG
 Zero: `test_a_bigger_network_distilled_on_delver_shards_reads_layout_v5`.
 
-**Checks** (c539d8f + 907bad6 on main edf4b89; desktop 2026-10-29, CPU only - MTG Zero's round-2
+**Checks** (c539d8f + 907bad6 on main edf4b89, and the GPU device fix after them; desktop 2026-10-29, CPU only - MTG Zero's round-2
 A/B held the GPU and the Mac). Tier "opt-in core feature with byte-identical defaults": nothing on the
 run path changed (`run.py`, `net.py`, `data.py`, `infer.py`, `cotrain.py`, the Rust crates untouched;
 the diff is `distill.py`, `tools/distill.py`, `bench.py`, `fork_run.py`'s `--net`, the tests, these
 docs).
 
 * `cargo test --release`: zero_search 50 passed, zero_webnet 3; `pytest tests`: **208 passed** and the
-  2 CUDA tests skipped (12 min 53 s; the 8 above among them). Run with `CUDA_VISIBLE_DEVICES=` (empty)
+  2 CUDA tests skipped (12 min 53 s; the 8 above among them). A fix found in review, after these: `outputs` sends
+  the rows to the model's device and the tool moves a fresh (CPU-built) student to `--device` before
+  its first held-out evaluation (on CUDA the step-0 evaluation would have met a CPU network);
+  `tests/test_distill.py` again 8 passed. Run with `CUDA_VISIBLE_DEVICES=` (empty)
   those 2 fail - torch then sees the driver but no device - and they fail alike on edf4b89; with
   `CUDA_VISIBLE_DEVICES=-1` they skip.
 * **Byte identity** against edf4b89 (its worktree zero-core-wt/ckpt-guard): `fork_run --source --iter 1
