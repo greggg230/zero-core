@@ -107,6 +107,8 @@ LOCK_POLL_S = 2.0                 # how often a worker looks at its locks
 SHARD_ROWS = 8192                 # a worker's shard size unless the remote's overrides set shard_rows
 COMPRESS = 1                      # zlib level of the remote shards (data.savez_level)
 OVERDUE_MIN_S = 120.0             # co-training: an episode is never overdue sooner (env ZERO_RSP_OVERDUE_MIN_S)
+PROVISIONAL_S = 10.0              # an unmeasured worker's first rate after this much of its running time
+                                  # in a phase (its status lines; env ZERO_RSP_PROVISIONAL_S)
 
 
 def _now():
@@ -315,6 +317,7 @@ class RemotePlay:
         self.overdue = float(setting('selfplay_remote_overdue'))
         self.linger = bool(int(setting('selfplay_remote_linger') or 0))
         self.overdue_min = float(os.environ.get('ZERO_RSP_OVERDUE_MIN_S', OVERDUE_MIN_S))
+        self.provisional_s = float(os.environ.get('ZERO_RSP_PROVISIONAL_S', PROVISIONAL_S))
         self.retry_s = float(os.environ.get('ZERO_RSP_RETRY_S', RETRY_S))
         self.env = dict(self.spec.get('env') or {}, **(sp.get('env') or {}))
         self.overrides = dict(sp.get('overrides') or {})
@@ -333,7 +336,7 @@ class RemotePlay:
         self.cap = conc + max(1, conc // 4) if mode == 'matches' else conc
         self.shares = Shares(self.inflight)
         for k in range(self.procs):
-            self.shares.consumer(f'w{k}', max(2, groups), self.cap)
+            self.shares.consumer(f'w{k}', max(2, groups), self.cap, cautious=True)
         self.capv = {}                             # the caps now (the manager's last computation)
         self.events = None                         # co-training: events per iteration (the primary's games)
         self.q = None                              # single-game: the open phase's quota
@@ -413,11 +416,17 @@ class RemotePlay:
         return max(1, round(self.events * co.ep_total / co.ev_total))
 
     def _refresh(self):
-        """(mu held) Who takes work now, the caps, and the local driver's cap in the coordinator."""
+        """(mu held) Who takes work now, the caps, and the local driver's cap in the coordinator. A
+        worker not measured yet gets its first rate from its status lines once it has run for
+        `provisional_s` in a phase."""
         sh = self.shares
         for k in range(self.procs):
             s = self.sess[k]
             sh.set_active(f'w{k}', s is not None and s.alive() and s.hello is not None and not s.backing_off())
+            st = s.status if s is not None else {}
+            if st.get('phase') is not None and st.get('run_s', 0) >= self.provisional_s                     and sh.provisional(f'w{k}', st.get('leaves'), st['run_s']):
+                self.log(f'worker {k}: first measured at {st["leaves"] / st["run_s"]:.0f} leaves/s in '
+                         f'{st["run_s"]:.0f}s of its phase')
         sh.units = self._units()
         self.capv = sh.caps()
         if self.co is not None and 'local' in self.capv:
@@ -547,16 +556,17 @@ class RemotePlay:
                 util = (s.util[0] / s.util[1]) if (self.mode == 'matches' and s.util[1]) else 1.0
                 # its head start (single-game: its running time before this machine's phase began;
                 # co-training: none - the matches come with the drafting)
-                lead = max(0.0, cur['t_local'] - cur['t0'] - e.get('backoff_s', 0.0)) if self.mode == 'selfplay' \
-                    else 0.0
-                r = self.shares.observe(s.name, e.get('games', 0), e.get('active_s', 0.0), util, lead=lead)
-                meas[s.name] = {'units': e.get('games', 0), 'run_s': round(e.get('active_s', 0.0), 1),
-                                'util': round(util, 3), 'rate_measured': None if r is None else round(r, 4)}
+                lead = max(0.0, cur['t_local'] - cur['t0'] - e.get('backoff_s', 0.0)) if self.mode == 'selfplay'                     else 0.0
+                meas[s.name] = {'units': e.get('games', 0), 'run_s': e.get('active_s', 0.0), 'util': util, 'lead': lead,
+                                'leaves': e.get('leaves')}
             if local is not None:
-                r = self.shares.observe('local', local.get('units', 0), local.get('run_s', 0.0), local.get('util'))
-                meas['local'] = {'units': local.get('units', 0), 'run_s': round(local.get('run_s', 0.0), 1),
-                                 'util': None if local.get('util') is None else round(local['util'], 3),
-                                 'rate_measured': None if r is None else round(r, 4)}
+                meas['local'] = {'units': local.get('units', 0), 'run_s': local.get('run_s', 0.0),
+                                 'util': local.get('util'), 'leaves': local.get('leaves')}
+            got = self.shares.observe_phase(meas)
+            for n, m in meas.items():
+                m['run_s'] = round(m['run_s'], 1)
+                m['util'] = None if m.get('util') is None else round(m['util'], 3)
+                m['rate_measured'] = None if got.get(n) is None else round(got[n], 4)
             self._refresh()
             rates = self.shares.rates()
             consumers = {}
@@ -1465,6 +1475,7 @@ class Worker:
                   in_flight=self.drv.in_flight()['games'], queued=self.drv.queued, held=len(self.held),
                   outstanding=self.outstanding(), cap=self.cap, linger=ph['closed'],
                   active_s=round(self.active_s + (now - ph['t0']) - bo, 1), phase_s=round(now - ph['t0'], 1),
+                  run_s=round(now - ph['t0'] - bo, 1),
                   backoff=backoff or ph.get('bg'), background=bool(ph.get('bg')))
 
     def _background(self, on):

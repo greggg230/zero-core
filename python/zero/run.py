@@ -494,7 +494,8 @@ class Run:
         secs = time.time() - t0                    # this machine's phase (the remote's wait not counted)
         _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
         util = acc['util'][0] / acc['util'][1] if acc['util'][1] else None
-        rem = rsp.end(it, local={'units': acc['finished'], 'run_s': secs, 'util': util})
+        rem = rsp.end(it, local={'units': acc['finished'], 'run_s': secs, 'util': util,
+                                 'leaves': drv.stats()['leaves'] - st0['leaves']})
         _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
         results = acc['results']
         st = drv.stats()
@@ -994,11 +995,23 @@ def _fmt_queue(q):
 
 def last_rates(rows):
     """The shared queue's consumer rates of the newest metrics row that has them (a restart's first
-    caps follow them)."""
+    caps follow them); a row of a run that had a remote before the shared queue (its
+    `selfplay.remote`, no `queue`): this machine's games per second and each worker's share of the
+    remote's games per running second, the leaves per game this machine's."""
     for m in reversed(rows):
-        q = (m.get('selfplay') or {}).get('queue')
+        sp = m.get('selfplay') or {}
+        q = sp.get('queue')
         if q and q.get('rates'):
             return q['rates']
+        rem = sp.get('remote')
+        if rem and rem.get('games') and rem.get('running_s') and sp.get('games') and sp.get('seconds'):
+            out = {'local': {'rate': sp['games'] / sp['seconds']}}
+            if sp.get('leaves'):
+                out['_leaves_per_unit'] = sp['leaves'] / sp['games']
+            w = max(1, int(rem.get('workers') or rem.get('procs') or 1))
+            for k in range(w):
+                out[f'w{k}'] = {'rate': rem['games'] / rem['running_s'] / w}
+            return out
     return None
 
 

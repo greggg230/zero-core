@@ -1,11 +1,16 @@
-"""Remote self-play (zero/remoteplay.py, docs/az.md 5.3 and 11.6) end to end on the toys with the
-remote 'local' (a mirror directory and worker subprocesses, as remote.py's tests): a single-game
-run's remote shards joining data/iter_i/ and its training, late shards dropped, an unreachable
-remote never blocking, a non-finite shard quarantined (the run fails as for a local one), the
-back-off while an evaluation holds its lock, PAUSE mid-phase and resume (no worker outlives the
-run); a co-training run's resolver episodes played by the remote (exact event quotas), episodes
-requeued on a timeout and when a worker dies, the settings refused; the coordinator's second
-consumer, the compressed shards and the streamed window as units."""
+"""Remote self-play (zero/remoteplay.py, zero/workqueue.py, docs/az.md 5.3 and 11.6) end to end on
+the toys with the remote 'local' (a mirror directory and worker subprocesses, as remote.py's tests):
+a single-game run's shared quota (exact, across both machines, games beyond it held for the next
+iteration), its remote shards joining data/iter_i/ and its training, the caps following the
+measured throughput of a slow / fast pair and keeping the rows within about one checkpoint, a worker
+slower than a phase capped at its floor, the quota moving to this machine while the remote backs
+off, a worker dying with accepted games not in a shard yet, lingering through training, late shards
+dropped, an unreachable remote never blocking, a non-finite shard quarantined (the run fails as for
+a local one), the back-off while an evaluation holds its lock, PAUSE mid-phase and resume (no worker
+outlives the run); a co-training run's resolver episodes played by the remote (exact event quotas,
+the local driver never starved), episodes requeued on a timeout, given back by a worker backing off
+and requeued when a worker dies, the settings refused; the coordinator's second consumer, the
+compressed shards and the streamed window as units."""
 import glob
 import json
 import os
@@ -65,10 +70,20 @@ def rsp_run(tmp_path_factory):
     return run, base / 'mirror'
 
 
+def check_quota(m, games):
+    """Every iteration exactly `games` games, this machine's and the remote's, none short."""
+    for r in m[1:]:
+        sp, q = r['selfplay'], r['selfplay']['queue']
+        assert q['quota'] == q['games'] == games and q['short'] == 0, q
+        assert sp['games'] + sp['remote']['games'] == games, (sp['games'], sp['remote'])
+        assert sum(c.get('games', 0) for c in q['consumers'].values()) == games, q['consumers']
+
+
 def test_remote_shards_join_the_iteration_and_its_training(rsp_run):
-    """The remote's compressed shards land in data/iter_i/ next to the run's own, every one checked
-    and counted; training's steps follow the local + remote samples; the mirror keeps nothing it
-    shipped; no worker, slot or busy marker outlives the run."""
+    """The shared quota: exactly `games` games per iteration between the two machines (the games
+    beyond it held for the next); the remote's compressed shards land in data/iter_i/ next to the
+    run's own, every one checked and counted; training's steps follow the local + remote samples;
+    the mirror keeps nothing it shipped; no worker, slot or busy marker outlives the run."""
     run, mirror = rsp_run
     m = read_metrics(str(run))
     assert [r['iter'] for r in m] == [0, 1, 2, 3]
@@ -86,8 +101,8 @@ def test_remote_shards_join_the_iteration_and_its_training(rsp_run):
                 assert len(z['player']) == meta['rows']
                 rows += meta['rows']
                 assert int(z['net'].max()) <= it - 1
-        assert rows == rem['samples'] == rem['samples_played'] if rem['samples'] else rows == 0
-        assert rem['late'] == 0 and rem['quarantined'] == 0 and rem['rejected'] == 0
+        assert rows == rem['samples'] and (rem['samples_played'] > 0 or not rem['samples'])
+        assert rem['late'] == 0 and rem['quarantined'] == 0 and rem['rejected'] == 0 and rem['lost'] == 0
         assert rem['wait_s'] < 10
         steps = max(10, int(np.ceil((sp['samples'] + rem['samples']) * 4.0 / 64)))
         assert r['train']['steps'] == steps
@@ -95,6 +110,10 @@ def test_remote_shards_join_the_iteration_and_its_training(rsp_run):
         assert rem['bytes'] == sum(os.path.getsize(f) for f in files)
     r = contributed[-1]['selfplay']['remote']
     assert r['games'] > 0 and r['leaves'] > 0 and r['leaves_per_s'] > 0 and r['workers'] == 1
+    check_quota(m, 600)
+    q = m[3]['selfplay']['queue']
+    assert set(q['consumers']) == {'local', 'w0'} and q['consumers']['w0']['games'] == m[3]['selfplay']['remote']['games']
+    assert q['staleness']['summary']['rows'] == m[3]['selfplay']['samples'] + m[3]['selfplay']['remote']['samples']
     # the remote's phase i starts as soon as checkpoint i - 1 is written, before its evaluation here
     assert m[1]['selfplay']['remote']['lead_s'] == 0 and all(x['selfplay']['remote']['lead_s'] > 0 for x in m[2:])
     rd = mirror / 'sp'
@@ -105,6 +124,145 @@ def test_remote_shards_join_the_iteration_and_its_training(rsp_run):
     assert gone(worker_pids(run))
     log = (run / 'log.txt').read_text(encoding='utf-8')
     assert "self-play also on the remote 'local'" in log and 'iter 3 remote self-play: 1 worker(s)' in log
+    assert 'iter 3 shared queue: quota 600: 600 games (local ' in log
+
+
+# phases of ~1-2 s on the toy (64 / 32 simulations, half of the decisions full): long enough for the
+# caps to be measured; 256 slots for this machine and the worker each, a quota of 192 games
+PAIR = ['--conc', '256', '--games', '192', '--sims', '64', '--sims-fast', '32', '--p-full', '0.5']
+
+
+def pair_env(tmp_path, test=None, **extra):
+    """Status lines every 0.2 s and a worker's first rate after 0.5 s of its phase (the toys' phases
+    are seconds, MTG's minutes)."""
+    return env_for(tmp_path, dict({'status_s': 0.2}, **(test or {})), ZERO_RSP_PROVISIONAL_S='0.5', **extra)
+
+
+def model_caps(q):
+    """The caps the shared queue's model gives for a metrics row's rates, head starts and units."""
+    from zero.workqueue import Shares
+    sh = Shares(q['inflight'])
+    sh.restore(q['rates'])
+    for n, st in q['rates'].items():
+        if not n.startswith('_'):
+            sh.consumer(n, st['lo'], st['hi'], cautious=n != 'local')
+    sh.units = q['units']
+    return sh.caps()
+
+
+def test_caps_follow_throughput_and_rows_stay_within_one_checkpoint(tmp_path):
+    """A slow / fast pair (the worker process plays at about half this machine's driver's rate):
+    every iteration exactly its 192 games; the next caps are the model's (inflight x rate x (head
+    start + the joint phase)), the slower consumer the smaller share; once the caps are measured the
+    rows are within one checkpoint of the iteration's (at 768 slots each, every slot full - the old
+    behaviour - drifts to a mean lag of 2 and more, docs/az.md 5.3)."""
+    run = tmp_path / 'pair'
+    p = run_loop(run, '--iters', '5', *PAIR, '--selfplay-remote', 'local', env=pair_env(tmp_path))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    check_quota(m, 192)
+    for r in m[1:]:
+        q = r['selfplay']['queue']
+        assert {n: c['cap_next'] for n, c in q['consumers'].items()} == model_caps(q), q
+    for r in m[3:]:
+        q = r['selfplay']['queue']
+        c = q['consumers']
+        assert c['w0']['rate'] < c['local']['rate'] and 0 < c['w0']['games'] < c['local']['games'], c
+        assert sum(min(v['cap'], 256) for v in c.values()) <= 1.15 * 192 + 4, c
+        st = q['staleness']['summary']
+        assert st['le1'] >= 0.95 and st['mean'] <= 0.8, q['staleness']
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert 'iter 5 shared queue: quota 192: 192 games (local ' in log and 'staleness: mean' in log
+
+
+def test_a_worker_slower_than_a_phase_is_capped_at_its_floor(tmp_path):
+    """A worker whose games take several phases (here 10 ms more per batch) is measured by its
+    leaves per second - it finishes nothing to count - so its cap falls to a few games, and this
+    machine plays (nearly) the whole quota with its own cap at the quota."""
+    run = tmp_path / 'slow'
+    p = run_loop(run, '--iters', '4', *PAIR, '--selfplay-remote', 'local', env=pair_env(tmp_path, {'slow_s': 0.01}))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    check_quota(m, 192)
+    for r in m[2:]:
+        c = r['selfplay']['queue']['consumers']
+        assert c['w0']['cap_next'] <= 10 and c['local']['cap_next'] >= 170, c
+        assert c['local']['games'] >= 170, c
+
+
+def test_backoff_moves_the_quota_to_this_machine(tmp_path):
+    """While the worker backs off (an evaluation's lock) it takes no new games: its cap is 0 and this
+    machine's is the whole quota at once, so the iteration never waits for it; once the lock is gone
+    the shares come back."""
+    wd = tmp_path / 'mirror'
+    lock = wd / '.eval.lock'
+    lock.mkdir(parents=True)
+    holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
+    (lock / 'owner').write_text(f'{holder.pid} {time.time()}')
+    run = tmp_path / 'bq'
+
+    def release():
+        t = time.time() + 300
+        while time.time() < t:
+            try:
+                if any(r['iter'] == 2 for r in read_metrics(str(run))):
+                    break
+            except (OSError, ValueError, KeyError):
+                pass
+            time.sleep(0.05)
+        holder.kill()
+        holder.wait()
+    th = threading.Thread(target=release, daemon=True)
+    th.start()
+    try:
+        p = run_loop(run, '--iters', '5', *PAIR, '--selfplay-remote', 'local', env=pair_env(tmp_path))
+    finally:
+        holder.kill()
+        holder.wait()
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    check_quota(m, 192)
+    held, back = m[2]['selfplay'], m[5]['selfplay']
+    assert held['remote']['backoff_s'] > 0.3 and held['remote']['games'] == 0, held['remote']
+    assert held['queue']['consumers']['local']['cap'] >= 185 and held['queue']['consumers']['w0']['cap'] == 0, held['queue']
+    assert back['remote']['games'] > 0 and back['queue']['consumers']['local']['cap'] < 185, back['queue']
+
+
+def test_a_dying_worker_gives_its_accepted_games_back(tmp_path):
+    """A worker that dies with accepted games whose samples never reached a shard (here after 30, every
+    session): the quota needs them again and this machine plays them; every iteration is exact."""
+    run = tmp_path / 'dg'
+    p = run_loop(run, '--iters', '3', *PAIR, '--selfplay-remote', 'local',
+                 env=pair_env(tmp_path, {'die_after_accepts': 30}))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    check_quota(m, 192)
+    rem = [r['selfplay']['remote'] for r in m[1:]]
+    assert sum(r['lost'] for r in rem) >= 30 and sum(r['session_errors'] for r in rem) > 0, rem
+    assert all(r['games'] == 0 for r in rem), 'none of its games arrived'
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert re.search(r'worker 0 ended \(exit 9, .*30 accepted games lost with it \(the quota needs them again\)', log), \
+        log[-3000:]
+
+
+def test_linger_plays_through_training(tmp_path):
+    """selfplay_remote_linger 1: between phases (the run trains, evaluates) the worker plays on with
+    its checkpoint; the games it finishes then count for the next iteration (its quota takes them
+    first) and their rows are one checkpoint behind it; quotas stay exact."""
+    run = tmp_path / 'lg'
+    p = run_loop(run, '--iters', '4', *PAIR, '--selfplay-remote', 'local', '--selfplay-remote-linger', '1',
+                 env=pair_env(tmp_path))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    check_quota(m, 192)
+    assert json.load(open(tmp_path / 'mirror' / 'lg' / 'selfplay.json'))['linger'] is True
+    lingered = [r['selfplay']['remote'].get('linger') for r in m[2:]]
+    assert any(x and x['games'] > 0 and x['seconds'] > 0 for x in lingered), lingered
+    for r in m[3:]:
+        st = r['selfplay']['queue']['staleness']
+        assert st['remote'].get('1', 0) > 0 and st['summary']['mean'] <= 1.0, st
+    wl = (tmp_path / 'mirror' / 'lg' / 'w00.log').read_text(encoding='utf-8')
+    assert 'lingering between phases' in wl and '; lingering' in wl
 
 
 def test_late_shards_are_dropped(tmp_path):
@@ -349,9 +507,87 @@ def test_cotrain_resolver_episodes_on_the_remote(tmp_path):
     assert mp[1]['selfplay']['cotrain']['pending_max'] == 2 * 16 + (16 + 4)
     assert json.load(open(tmp_path / 'mirror' / 'co.resolver' / 'selfplay.json'))['mode'] == 'matches'
     assert not remote_shards(run), 'the primary self-plays here only'
+    for a, b in zip(mp[1:], mr[1:]):           # the shared queue: both consumers, the local one never idle
+        q = b['selfplay']['queue']
+        assert set(q['consumers']) == {'local', 'w0'} and b['selfplay']['games'] > 0, q
+        assert q['consumers']['local']['games'] == b['selfplay']['games'] and q['units'] in (None, 160), q
+        assert q['staleness']['summary']['rows'] == b['selfplay']['samples'] + b['selfplay']['remote']['samples']
+        assert 'staleness' in a['selfplay']['cotrain']
     log = (run / 'log.txt').read_text(encoding='utf-8')
     assert "[resolver] episodes also on the remote 'local'" in log and '[resolver] iter 3 remote self-play:' in log
+    assert '[resolver] iter 3 shared queue: caps local ' in log
     assert gone(worker_pids(run))
+
+
+BIGREMOTE = textwrap.dedent('''
+    from zero import package
+    import zero.run as R
+    package.active().remotes['local'] = {'selfplay': {'overrides': {'conc': 64}}}
+    R.cli()
+''')
+
+
+def test_cotrain_the_local_driver_is_never_starved(tmp_path):
+    """A remote with four times the local resolver driver's room (64 slots + 16 queued against 16 +
+    16): the coordinator keeps the local driver's share in reserve, so it plays matches every
+    iteration however fast the remote takes them (td1's iteration 7: the desktop played none of
+    1,812)."""
+    script = tmp_path / 'big.py'
+    script.write_text(BIGREMOTE)
+    run = tmp_path / 'big'
+    p = subprocess.run([sys.executable, str(script), '--run', str(run), '--preset', 'toy-cotrain-smoke', '--iters', '3',
+                        '--games', '40', '--resolver-cfg', rcfg()], cwd=ROOT, capture_output=True, text=True,
+                       timeout=600, env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH,
+                                            **env_for(tmp_path)))
+    assert p.returncode == 0, p.stdout + p.stderr
+    mp, mr = check_cotrain(run)
+    for b in mr[1:]:
+        q = b['selfplay']['queue']
+        tot = b['selfplay']['games'] + b['selfplay']['remote']['matches']
+        assert b['selfplay']['games'] >= 0.15 * tot, (b['selfplay']['games'], tot, q['consumers'])
+        assert q['consumers']['w0']['cap'] <= 80 and q['local_cap'] <= 32, q
+
+
+def test_cotrain_backoff_gives_matches_back(tmp_path):
+    """A worker that backs off (an evaluation's lock) for longer than selfplay_remote_giveback (here
+    1 s) takes no new matches and gives its outstanding ones back: requeued here at the front, the
+    local driver plays them, a late copy of the worker's is dropped; the quotas stay exact."""
+    wd = tmp_path / 'mirror'
+    run = tmp_path / 'gb'
+    state = {}
+
+    def hold():
+        t = time.time() + 300
+        while time.time() < t:
+            try:
+                prog = json.load(open(run / 'progress.json'))
+            except (OSError, ValueError):
+                prog = {}
+            mr = prog.get('matches_remote') or {}
+            if prog.get('iter', 0) >= 2 and mr.get('outstanding', 0) >= 4:
+                lock = wd / '.eval.lock'
+                lock.mkdir(parents=True, exist_ok=True)
+                h = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])
+                (lock / 'owner').write_text(f'{h.pid} {time.time()}')
+                state['held'] = mr['outstanding']
+                time.sleep(6)
+                h.kill()
+                h.wait()
+                return
+            time.sleep(0.05)
+    th = threading.Thread(target=hold, daemon=True)
+    th.start()
+    p = co_loop(run, '--iters', '3', '--games', '40', '--resolver-cfg', rcfg(selfplay_remote_giveback=1.0),
+                env=env_for(tmp_path, {'slow_s': 0.02, 'status_s': 0.2}))
+    th.join(5)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert state.get('held'), 'the worker never had matches outstanding'
+    mp, mr = check_cotrain(run)
+    rem = [r['selfplay']['remote'] for r in mr[1:]]
+    assert sum(r['requeued_backoff'] for r in rem) > 0 and sum(r['backoff_s'] for r in rem) > 1, rem
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert re.search(r'worker 0: backing off for \d+s \(.*\.eval\.lock\): its \d+ outstanding episodes requeued here',
+                     log), log[-3000:]
 
 
 def test_cotrain_episodes_requeued_on_timeout(tmp_path):

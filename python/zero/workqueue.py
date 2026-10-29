@@ -18,7 +18,10 @@ out, so the others' shares grow at once), `inflight` = the run setting `selfplay
 (default 1: each consumer holds one iteration's worth of its own throughput, so a game or match it
 starts finishes within about one iteration of its running time), `lo` / `hi` its bounds (a few
 games per driver group / its driver's slots). Before a consumer is measured its rate is assumed
-proportional to its slots (`hi`). The caps' sum is `inflight x units` (no bound binding).
+proportional to its slots (`hi`), and a remote's cap is a quarter of what that gives (`BOOT`: a
+remote slower than its slots say would otherwise start games that finish iterations later) until a
+first measurement - its phase's end, or a few seconds of its status lines (zero.remoteplay). The
+caps' sum is `inflight x units` (no bound binding).
 
 `Shares` is that model; `split_games` cuts a driver's sample dict into its finished games (the
 rows and the samples come out of the driver in the same order, each row counting its own
@@ -35,6 +38,7 @@ from .protocol import SAMPLE_KEYS
 EWMA = 0.5                         # weight of a phase's measurement in a consumer's rate
 MIN_RUN_S = 0.2                    # a phase shorter than this (running) measures nothing (the toys': ~1 s)
 MIN_UTIL = 0.25                    # a consumer below this share of its cap: measured as if at 25%
+BOOT = 0.25                        # an unmeasured remote's cap: this share of its slot-proportional one
 
 
 def split_games(rows, s):
@@ -111,12 +115,16 @@ class Shares:
     def __init__(self, inflight=1.0):
         self.f = float(inflight)
         self.units = None                          # units per iteration (None: caps = hi)
+        self.lpu = None                            # leaves per unit (an EWMA over the phases' finished units)
         self.c = {}                                # name -> {lo, hi, rate, active}
 
-    def consumer(self, name, lo, hi):
+    def consumer(self, name, lo, hi, cautious=False):
+        """Consumer `name` with cap bounds [lo, hi]; `cautious` (a remote): a quarter of its guessed
+        share until it is measured."""
         c = self.c.setdefault(name, {'rate': None, 'active': True, 'lead': 0.0})
         c['hi'] = max(1, int(hi))
         c['lo'] = max(1, min(int(lo), c['hi']))
+        c['cautious'] = bool(cautious)
         return c
 
     def set_active(self, name, on):
@@ -128,7 +136,7 @@ class Shares:
         by the measured consumers' rate per slot (all unmeasured: the slots themselves)."""
         meas = [(c['rate'], c['hi']) for c in self.c.values() if c['rate']]
         per_slot = sum(r for r, _ in meas) / sum(h for _, h in meas) if meas else 1.0
-        return {n: (c['rate'] if c['rate'] else per_slot * c['hi']) for n, c in self.c.items()}
+        return {n: (c['rate'] if c['rate'] is not None else per_slot * c['hi']) for n, c in self.c.items()}
 
     def horizon(self):
         """P (seconds): the phase the active consumers play together after their head starts (None:
@@ -150,14 +158,40 @@ class Shares:
             elif p is None:
                 out[n] = c['hi']
             else:
-                want = math.ceil(self.f * r[n] * (c['lead'] + p))
-                out[n] = max(c['lo'], min(c['hi'], want))
+                want = self.f * r[n] * (c['lead'] + p)
+                if c['rate'] is None and c.get('cautious'):
+                    want *= BOOT
+                out[n] = max(c['lo'], min(c['hi'], math.ceil(want)))
         return out
 
-    def observe(self, name, units, run_s, util, lead=None):
-        """A phase of consumer `name`: `units` finished in `run_s` seconds of its running time, its
-        outstanding work `util` of its cap on average, `lead` seconds of that before this machine's
-        phase began. -> the rate measured (None: too short a phase)."""
+    def provisional(self, name, leaves, run_s):
+        """An unmeasured consumer's first rate, from `leaves` in `run_s` seconds of its running time
+        so far (its status lines; the leaves per unit known): True if set."""
+        c = self.c.get(name)
+        if c is None or c['rate'] is not None or not self.lpu or run_s <= 0 or not leaves:
+            return False
+        c['rate'] = leaves / run_s / self.lpu
+        return True
+
+    def observe_phase(self, meas):
+        """A phase's measurements {name: {units, run_s, util, lead, leaves}}: first the leaves per
+        unit (every consumer's finished units together), then each consumer's rate. -> {name: the
+        rate measured or None}."""
+        tl = sum(m['leaves'] for m in meas.values() if m.get('units', 0) > 0 and m.get('leaves'))
+        tu = sum(m['units'] for m in meas.values() if m.get('units', 0) > 0 and m.get('leaves'))
+        if tu > 0 and tl > 0:
+            v = tl / tu
+            self.lpu = v if self.lpu is None else (1 - EWMA) * self.lpu + EWMA * v
+        return {n: self.observe(n, m.get('units', 0), m.get('run_s', 0.0), m.get('util'), lead=m.get('lead'),
+                                leaves=m.get('leaves')) for n, m in meas.items()}
+
+    def observe(self, name, units, run_s, util, lead=None, leaves=None):
+        """A phase of consumer `name`: `units` finished in `run_s` seconds of its running time (and
+        `leaves` searched), its outstanding work `util` of its cap on average, `lead` seconds of that
+        before this machine's phase began. The rate is its leaves per second over the leaves per
+        unit (known once any consumer finished units: a consumer whose games are longer than a phase
+        is measured too - slow, so its cap falls to `lo`), else its units per second. -> the rate
+        measured (None: too short a phase, nothing to measure)."""
         c = self.c.get(name)
         if c is None:
             return None
@@ -165,21 +199,34 @@ class Shares:
             v = max(0.0, float(lead))
             c['lead'] = v if not c.get('led') else (1 - EWMA) * c['lead'] + EWMA * v
             c['led'] = True
-        if run_s < MIN_RUN_S or units <= 0:
+        if run_s < MIN_RUN_S:
+            return None
+        if leaves is not None and self.lpu:
+            r = leaves / run_s / self.lpu
+        elif units > 0:
+            r = units / run_s
+        else:
             return None
         u = max(MIN_UTIL, min(1.0, float(util))) if util is not None else 1.0
-        r = units / run_s / u
-        c['rate'] = r if not c['rate'] else (1 - EWMA) * c['rate'] + EWMA * r
+        r /= u
+        c['rate'] = r if c['rate'] is None else (1 - EWMA) * c['rate'] + EWMA * r
         return r
 
     def state(self):
-        return {n: {'rate': None if c['rate'] is None else round(c['rate'], 6), 'lead': round(c['lead'], 2),
-                    'lo': c['lo'], 'hi': c['hi']} for n, c in self.c.items()}
+        out = {n: {'rate': None if c['rate'] is None else round(c['rate'], 6), 'lead': round(c['lead'], 2),
+                   'lo': c['lo'], 'hi': c['hi']} for n, c in self.c.items()}
+        if self.lpu:
+            out['_leaves_per_unit'] = round(self.lpu, 1)
+        return out
 
     def restore(self, state):
         """Rates and head starts from an earlier run of the same run directory (its last metrics
         row): the caps of its first phase follow them instead of the slots."""
-        for n, st in (state or {}).items():
+        state = dict(state or {})
+        lpu = state.pop('_leaves_per_unit', None)
+        if lpu:
+            self.lpu = float(lpu)
+        for n, st in state.items():
             if isinstance(st, dict) and st.get('rate'):
                 c = self.c.setdefault(n, {'rate': None, 'active': True, 'lead': 0.0, 'lo': 1, 'hi': 1})
                 c['rate'] = float(st['rate'])

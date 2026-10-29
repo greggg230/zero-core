@@ -635,7 +635,8 @@ class CoRun:
         if rsp is not None:
             _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
             try:                                   # at most selfplay_remote_wait s
-                rem = rsp.end(it, local={'units': len(matches), 'run_s': secs, 'util': co.take_util()})
+                rem = rsp.end(it, local={'units': len(matches), 'run_s': secs, 'util': co.take_util(),
+                                         'leaves': rdrv.stats()['leaves'] - rst0['leaves']})
             except NonFinite as e:
                 raise NonFinite(f'{self.label("r")}: {e}') from e
         rrows = co.take_remote_rows()
