@@ -47,7 +47,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import elo, games as G, package, runctl
+from . import elo, games as G, league as L, package, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
@@ -184,6 +184,13 @@ DEFAULTS = dict(
     # zero.remote's `evalnet`, docs/az.md 11.7)
     resolver='', resolver_cfg={}, resolver_init='', resolver_conc=0, pending_max=0, draft_eval_net_every=4,
     draft_eval_net_remote='',
+    # the self-play league (zero/league.py, docs/az.md 13): this share of the self-play games puts a
+    # past checkpoint of the run in one seat (0 = off: every game the current network's mirror, as
+    # before); the pool it is picked from (raw iteration offsets back from the network that
+    # self-plays, those that exist, or 'all'), past checkpoints per iteration (one evaluator key
+    # each) and how they are picked ('uniform' | 'pfsp': weighted by how often each still beats the
+    # current network). Only the current network's decisions become samples. Single-game runs only
+    selfplay_league=0.0, selfplay_league_pool=L.DEFAULT_POOL, selfplay_league_slots=1, selfplay_league_pick='uniform',
 )
 
 PRESETS = {
@@ -333,6 +340,10 @@ class Run:
         self.roll = None                           # rolling driver + its evaluator
         self.roll_ev = None
         self.wcache = None                         # zero.data.WindowCache with window_cache
+        # the self-play league (zero/league.py): None when selfplay_league is 0 (nothing changes)
+        self.league = L.League(self) if L.enabled(cfg) else None
+        self.roll_kinds = None                     # the rolling driver's table: each entry's league game
+        self.roll_evs = None                       # ... and its evaluators by key (m, L0, ...)
 
     def check(self, where=''):
         if self.pw is not None:
@@ -398,24 +409,38 @@ class Run:
         seat = self.nn_seat('m', c['sims'], selfplay=True)
         rng = np.random.default_rng(c['seed'] * 1_000_003 + it)
         meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it}
+        lg = self.league
         if c['rolling']:
             if self.roll is None:
-                table = [[seat] * p for p in c['players']]
+                if lg is not None:
+                    table, self.roll_kinds = L.rolling_table(c, seat)
+                else:
+                    table = [[seat] * p for p in c['players']]
                 self.roll = self.driver(table, seed=c['seed'] * 7919 + it, record=True, rolling=True, net=it - 1)
                 self.roll_ev = self.evaluator(model_path(self.run, it - 1))
+                self.roll_evs = {'m': self.roll_ev}
             else:
                 m, _ = load(model_path(self.run, it - 1), 'cpu', game=c['game'])
                 self.roll_ev.set_weights(m.state_dict())
             drv, ev = self.roll, self.roll_ev
+            evs, kinds = self.roll_evs, self.roll_kinds
             st0 = drv.stats()
             drv.resume(c['games'], it - 1)
             prefix = 'r00'
         else:
             counts = rng.choice(c['players'], size=c['games'])
-            drv = self.driver([[seat] * int(p) for p in counts], seed=c['seed'] * 1_000_003 + it, record=True)
+            if lg is not None:
+                games, kinds = L.table(c, seat, counts)
+            else:
+                games, kinds = [[seat] * int(p) for p in counts], None
+            drv = self.driver(games, seed=c['seed'] * 1_000_003 + it, record=True)
             ev = self.evaluator(model_path(self.run, it - 1))
+            evs = {'m': ev}
             st0 = None
             prefix = 'c00'
+        if lg is not None:
+            plan = lg.plan(it)
+            lg.evaluators(it, evs)                 # the slots' past checkpoints (guarded)
         writer = ShardWriter(d, prefix, rows=c['shard_rows'], meta=meta, bad_dir=self.debug_dir())
         results = []
         state = {'n': 0, 't': time.time()}
@@ -436,7 +461,7 @@ class Run:
                 state['t'] = time.time()
                 p = {'iter': it, 'phase': 'selfplay', 'games': len(results), 'target': c['games'], 'time': time.time()}
                 _write_json(prog, p)
-        drive(drv, {'m': ev}, check=lambda: self.check('self-play'), on_batch=on_batch)
+        drive(drv, evs, check=lambda: self.check('self-play'), on_batch=on_batch)
         take()
         results.extend(drv.take_results())
         ws = writer.close()
@@ -457,6 +482,9 @@ class Run:
                'minor_per_game': (st.get('minor', 0) - (st0.get('minor', 0) if st0 else 0)) / max(1, len(results)),
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
+        if lg is not None:
+            out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
+                                                None, len(results), evs)
         if c['rolling']:
             inf = drv.in_flight()
             out['rolling'] = {'in_flight': inf['games'], 'restarts': st['restarts'] - st0['restarts'],
@@ -483,17 +511,25 @@ class Run:
         if os.path.exists(d) and not rsp.began(it):
             self.drop_data(d, strict=True)         # an interrupted iteration is replayed
         t0 = time.time()
+        lg = self.league
         if self.roll is None:
             seat = self.nn_seat('m', c['sims'], selfplay=True)
-            table = [[seat] * p for p in c['players']]
+            if lg is not None:
+                table, self.roll_kinds = L.rolling_table(c, seat)
+            else:
+                table = [[seat] * p for p in c['players']]
             self.roll = self.driver(table, seed=c['seed'] * 7919 + it, record=True, rolling=True, net=it - 1,
                                     queue_only=True)
             self.roll_ev = self.evaluator(model_path(self.run, it - 1))
+            self.roll_evs = {'m': self.roll_ev}
             self.held, self.enq, self.taken = deque(), 0, 0
         else:
             m, _ = load(model_path(self.run, it - 1), 'cpu', game=c['game'])
             self.roll_ev.set_weights(m.state_dict())
-        drv, ev = self.roll, self.roll_ev
+        drv, ev, evs = self.roll, self.roll_ev, self.roll_evs
+        if lg is not None:
+            plan = lg.plan(it)
+            lg.evaluators(it, evs)                 # the slots' past checkpoints (guarded)
         st0 = drv.stats()
         meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it}
         writer = ShardWriter(d, 'r00', rows=c['shard_rows'], meta=meta, bad_dir=self.debug_dir())
@@ -501,7 +537,7 @@ class Run:
         spec = G.spec_json(c['spec'])
         rsp.begin(it)                              # (a no-op if the remote began it early)
         prog = os.path.join(self.run, 'progress.json')
-        acc = {'results': [], 'stale': {}, 'finished': 0, 'util': [0.0, 0], 't': 0.0}
+        acc = {'results': [], 'stale': {}, 'finished': 0, 'util': [0.0, 0], 't': 0.0, 'league': {}}
 
         def accept():
             """The held games, oldest first, as many as the quota takes."""
@@ -509,6 +545,8 @@ class Run:
             for _ in range(a):
                 row, sd = self.held.popleft()
                 acc['results'].append(row)
+                if lg is not None:
+                    L.tally([row], acc['league'])
                 if sd is not None:
                     tstats.add(sd)
                     writer.add(sd)
@@ -517,6 +555,8 @@ class Run:
         def pump(lb=None):
             rows = drv.take_results()
             s = drv.take_samples()
+            if rows and lg is not None:
+                L.League.attribute(rows, self.roll_kinds, plan['slots'])   # (the slots' checkpoints now)
             if rows:
                 self.taken += len(rows)
                 acc['finished'] += len(rows)
@@ -546,14 +586,16 @@ class Run:
             if drv.paused:
                 drv.resume(BIG, it - 1)            # (again if a lost worker's games reopened the quota)
             pump()
-            drive(drv, {'m': ev}, check=lambda: self.check('self-play'), on_batch=pump)
+            drive(drv, evs, check=lambda: self.check('self-play'), on_batch=pump)
             pump()
             if rsp.need(it) > 0 and drv.in_flight()['games'] == 0 and not drv.queued:
                 time.sleep(0.05)                   # nothing to play (a cap of 0): wait for the quota
         if not drv.paused:
             drv.end_phase()
-            drive(drv, {'m': ev}, check=lambda: self.check('self-play'), on_batch=lambda lb: None)
+            drive(drv, evs, check=lambda: self.check('self-play'), on_batch=lambda lb: None)
         rows = drv.take_results()                  # finished while the phase ended: the next iteration's
+        if rows and lg is not None:
+            L.League.attribute(rows, self.roll_kinds, plan['slots'])
         if rows:
             self.taken += len(rows)
             acc['finished'] += len(rows)
@@ -593,7 +635,10 @@ class Run:
                 v['games'] = (qb.get('quota') or {}).get('by', {}).get(n, 0)
         for v in cons.values():
             v['share'] = round(v.get('games', 0) / max(1, total), 4)
+        rem_league = rem.pop('league', None)
         out['remote'] = rem
+        if lg is not None:
+            out['league'] = self.league_metrics(it, plan, acc['league'], rem_league, total, evs)
         out['queue'] = {'quota': c['games'], 'games': total, 'short': max(0, c['games'] - total),
                         'held': {'local': len(self.held), 'remote': qb.get('held_remote', 0)},
                         'inflight': qb['inflight'], 'batch_inflight': qb['batch_inflight'], 'units': qb['units'],
@@ -601,6 +646,17 @@ class Run:
         self.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
         self.log(f'iter {it} shared queue: {_fmt_queue(out["queue"])}')
         return out
+
+    def league_metrics(self, it, plan, local, remote, games, evs):
+        """The iteration's `selfplay.league` (zero/league.py: the share, the current network's score
+        against the past checkpoints, which ones), logged; the slots' inference time."""
+        lg = L.metrics(plan, local, remote, games, self.league.pick)
+        lg['infer_s'] = round(sum(evs[k].seconds for k in self.league.keys() if k in evs), 2)
+        for k in self.league.keys():
+            if k in evs:
+                evs[k].seconds, evs[k].calls, evs[k].leaves = 0.0, 0, 0
+        self.log(f'iter {it} league: {L.fmt(lg)}')
+        return lg
 
     # ---------------------------------------------------------------- training
     def window_shards(self, it):
@@ -1018,6 +1074,8 @@ class Run:
         phase nxt will use). Not after the last iteration, nor when STOP or PAUSE is there."""
         if self.rsp is not None and nxt <= self.cfg['iters'] and not runctl.stop_requested(self.run) \
                 and not runctl.pause_requested(self.run):
+            if self.league is not None:
+                self.league.plan(nxt)              # (made here, on the main thread; shipped with the phase)
             self.rsp.begin(nxt)
 
     def _iterations(self, start, done):
@@ -1179,6 +1237,9 @@ def resolve_config(args, saved):
     if cfg.get('policy_target', 'visits') not in ('visits', 'cq'):
         raise SystemExit(f"policy_target {cfg['policy_target']!r}: 'visits' or 'cq'")
     check_eval_settings(cfg)
+    L.check_settings(cfg)
+    if isinstance(cfg.get('resolver_cfg'), dict) and L.enabled(cfg['resolver_cfg']):
+        raise SystemExit('resolver_cfg: selfplay_league: single-game runs only (not a co-training resolver)')
     return cfg
 
 

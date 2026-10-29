@@ -1250,3 +1250,70 @@ fn select_transform_moves_only_the_moves_never_the_targets() {
     assert!(checked * 2 > sa.len(), "{checked} of {} records checked", sa.len());
     assert!(worst < 1e-3, "the targets are not c_scale 1.0's of the same roots: spread {worst}");
 }
+
+#[test]
+fn an_unrecorded_seat_plays_the_same_games_and_records_nothing() {
+    // A league game (zero's run setting selfplay_league, docs/az.md 13): the current network's
+    // self-play seat (key m) against a past checkpoint's (key L), seats alternating. With L's
+    // `record` false the games are the same move for move (its search, noise, temperature and
+    // playout-cap draws are a recorded seat's) and the records are exactly the m seat's of the
+    // same games recorded on both sides: z, q and sc from the m seat's view.
+    let unrecorded = |key: u16, record: bool| match nn(key, 16, true) {
+        SeatCfg::Nn(mut s) => {
+            s.record = record;
+            SeatCfg::Nn(s)
+        }
+        _ => unreachable!(),
+    };
+    let play = |l_record: bool| {
+        let l = unrecorded(1, l_record);
+        let games: Vec<Vec<u16>> = (0..24).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+        let c = cfg(vec![nn(0, 16, true), l], games, &[("m", KeyKind::Nn), ("L", KeyKind::Nn)]);
+        let mut d = Driver::<ToyGame>::new(c).unwrap();
+        let (mut res, mut smp) = (Vec::new(), Vec::new());
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer(&mut d, &b);
+            res.extend(d.take_results());
+            smp.extend(d.take_samples());
+        }
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+        // each game's records, in the order the games were emitted
+        let mut per: Vec<(u32, Vec<Record>)> = Vec::new();
+        let mut it = smp.into_iter();
+        for r in &res {
+            per.push((r.gid, it.by_ref().take(r.samples as usize).collect()));
+        }
+        assert!(it.next().is_none());
+        per.sort_by_key(|p| p.0);
+        res.sort_by_key(|r| r.gid);
+        (res, per)
+    };
+    let (ra, pa) = play(true);
+    let (rb, pb) = play(false);
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.decisions, r.result.clone(), r.over);
+    assert_eq!(ra.iter().map(key).collect::<Vec<_>>(), rb.iter().map(key).collect::<Vec<_>>());
+    let (mut kept, mut dropped) = (0, 0);
+    for ((g, a), (_, b)) in pa.iter().zip(&pb) {
+        let me = (*g % 2) as u8;                           // the m seat of game g
+        let want: Vec<&Record> = a.iter().filter(|r| r.player == me).collect();
+        assert_eq!(want.len(), b.len(), "game {g}");
+        for (x, y) in want.iter().zip(b) {
+            assert_eq!((&x.x, x.player, x.n_players, &x.opts, &x.pi, x.z, x.q, x.sc, x.net), (&y.x, y.player, y.n_players, &y.opts, &y.pi, y.z, y.q, y.sc, y.net));
+        }
+        kept += b.len();
+        dropped += a.len() - b.len();
+        let rb_g = &rb[*g as usize];
+        assert_eq!(rb_g.samples as usize, b.len());
+        // z from the m seat's view: its result in the game
+        for y in b {
+            assert_eq!(y.z[0], rb_g.result[me as usize]);
+        }
+    }
+    assert!(kept > 0 && dropped > 0, "kept {kept}, dropped {dropped}");
+    // an unrecorded seat alone: nothing at all
+    let mut d = Driver::<ToyGame>::new(cfg(vec![unrecorded(0, false)], vec![vec![0, 0]; 8], &[("m", KeyKind::Nn)])).unwrap();
+    let (res, smp) = run(&mut d);
+    assert_eq!(res.len(), 8);
+    assert!(smp.is_empty() && res.iter().all(|r| r.samples == 0));
+}

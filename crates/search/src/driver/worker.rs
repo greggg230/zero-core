@@ -430,7 +430,8 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         }
     };
     let a = acts[i];
-    let rec = cfg.record && seat.selfplay && slot.full;
+    // (a seat with `record` false - a league opponent - records nothing; the move is the same)
+    let rec = cfg.record && seat.selfplay && seat.record && slot.full;
     if rec {
         let pi: Vec<f32> = match seat.policy_target {
             PolicyTarget::Visits if tot > 0 => nv.iter().map(|&c| (c as f64 / tot as f64) as f32).collect(),

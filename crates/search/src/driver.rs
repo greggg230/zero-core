@@ -194,12 +194,17 @@ pub struct NnSeat {
     pub policy_target: PolicyTarget,
     /// How a move that is not sampled is chosen (`Select`; default `Select::Visits`).
     pub select: Select,
+    /// Whether the seat's full searches become training records (with `DriverCfg::record` and
+    /// `selfplay`; default true). False: a self-play seat that searches, samples and draws its
+    /// playout cap exactly as a recorded one but records nothing - a league opponent, a past
+    /// checkpoint playing the current network (zero's run setting `selfplay_league`, docs/az.md 13).
+    pub record: bool,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true }
     }
 }
 

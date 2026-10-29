@@ -27,12 +27,13 @@ class NNSeat:
     policy_target: training target of recorded decisions, 'visits' | 'cq' (completed Q with
     cq_c_visit, cq_c_scale). select, select_min_visits: the rule of the moves it does not sample
     ('visits' | 'cq'; docs/search.md 3.3) and its completed-Q transform select_c_visit,
-    select_c_scale (None: the target's cq_c_visit, cq_c_scale)."""
+    select_c_scale (None: the target's cq_c_visit, cq_c_scale). record: whether its full searches
+    are recorded (False: a league opponent, docs/az.md 13; the Rust seat key `record`)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
                  policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0, select='visits', select_min_visits=0,
-                 select_c_visit=None, select_c_scale=None):
+                 select_c_visit=None, select_c_scale=None, record=True):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
         mcts.check_select(select, select_min_visits)
@@ -44,6 +45,7 @@ class NNSeat:
         self.policy_target, self.cq_c_visit, self.cq_c_scale = policy_target, cq_c_visit, cq_c_scale
         self.select, self.select_min_visits = select, select_min_visits
         self.select_c_visit, self.select_c_scale = select_c_visit, select_c_scale
+        self.record = record
 
     @property
     def select_transform(self):
@@ -342,7 +344,7 @@ class PyDriver:
             i = max(range(len(Nv)), key=lambda k: (Nv[k], P0[k]))
         else:
             i = tree.choose(seat)
-        if self.record and seat.selfplay and slot.full:
+        if self.record and seat.selfplay and seat.record and slot.full:
             pi = tree.target(seat)
             slot.records.append((slot.game.encode(p), list(acts), pi, p, rw))
         slot.decisions += 1

@@ -150,7 +150,7 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
         _copy_run(rsrc, os.path.join(dest, 'resolver'), it, rcfg, copy)
         if os.path.exists(os.path.join(rsrc, 'config.json')):
             shutil.copy2(os.path.join(rsrc, 'config.json'), os.path.join(dest, 'resolver', 'config.json'))
-    need, dirs, rows = _copy_run(source, dest, it, cfg, copy)
+    need, dirs, rows = _copy_run(source, dest, it, cfg, copy, settings=dict(cfg, **(overrides or {})))
     size = install_net(dest, it, net, cfg.get('game', 'toy')) if net else None
     if size:
         cfg.update(size)
@@ -165,16 +165,19 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
     print(f'next: python tools/supervise.py {dest}   (resumes after iteration {it})')
 
 
-def _copy_run(source, dest, it, cfg, copy):
-    """Checkpoint `it` and those its Elo matches need, its optimizer state, the window's shards,
-    Elo results, metrics up to `it` -> (checkpoints, data dirs, metrics rows)."""
-    from .. import elo
+def _copy_run(source, dest, it, cfg, copy, settings=None):
+    """Checkpoint `it` and those its Elo matches need (and, with the self-play league in `settings` -
+    the fork's: the source's config with the --set overrides -, every past checkpoint its league may
+    play, zero/league.py), its optimizer state, the window's shards, Elo results, metrics up to `it`
+    -> (checkpoints, data dirs, metrics rows)."""
+    from .. import elo, league
     from ..run import model_path, read_metrics, window_iters
     e = max(1, int(cfg.get('eval_every', 1)))
     need = {it} | {it - off * e for off in elo.OFFSETS if it - off * e >= 0}
     if cfg.get('elo_offsets'):
         # raw Elo offsets (docs/az.md 5.4): the opponents of K and of the fork's next evaluation
         need |= {j for k in (it, it + e) for j in elo.opponents(k, e, cfg['elo_offsets']) if 0 <= j <= it}
+    need |= league.fork_needs(settings if settings is not None else cfg, it)
     for j in sorted(need):
         if os.path.exists(model_path(source, j)):
             _link(model_path(source, j), model_path(dest, j), True)

@@ -653,6 +653,12 @@ class RemotePlay:
                    lead_s=round(cur['t_local'] - cur['t0'], 1), caps=phase_caps)
         if self.mode == 'selfplay':
             out.update(accepted=sum(e.get('accepted', 0) for e in ends), held=qblock['held_remote'], lost=cur['lost'])
+            if any('league' in e for e in ends):       # the self-play league: its accepted games' (league.tally)
+                from .league import merge
+                lg = {}
+                for e in ends:
+                    lg = merge(lg, e.get('league'))
+                out['league'] = lg
         if self.mode == 'matches':
             with self.mu:
                 outstanding = sum(len(s.assigned) for s in self.sess if s is not None)
@@ -718,6 +724,10 @@ class RemotePlay:
             if kind == 'hello':
                 s.hello = ev
                 self.streak = 0
+                if self.R.league is not None and self.mode == 'selfplay' and not ev.get('league'):
+                    # a checkout without the self-play league would play mirror games and record both
+                    # seats of the league's games: never used (zero/league.py)
+                    s.no_league = True
                 if self.fails or s.k == 0:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
@@ -818,6 +828,12 @@ class RemotePlay:
                 self.log(f'worker {k} silent for {now - s.last:.0f}s: killed')
                 s.kill()
                 continue
+            if getattr(s, 'no_league', False):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.fail_log(f'worker {k} REFUSED: its checkout has no self-play league (the run plays one, '
+                              f'selfplay_league {self.R.cfg["selfplay_league"]}); killed, retried in 10 minutes')
+                s.kill()
+                continue
             if now - s.pinged > PING_S:
                 s.pinged = now
                 s.send({'cmd': 'ping'})
@@ -834,7 +850,10 @@ class RemotePlay:
             if go and self._ship_model(want):
                 with self.mu:
                     if self.want == want and s.alive():
-                        s.send({'cmd': 'phase', 'iter': want, 'model': f'models/iter_{want - 1:04d}.pt'})
+                        msg = {'cmd': 'phase', 'iter': want, 'model': f'models/iter_{want - 1:04d}.pt'}
+                        if self.R.league is not None and self.mode == 'selfplay':
+                            msg['league'] = self.R.league.files(want)   # {key: models/iter_j.pt} (shipped)
+                        s.send(msg)
                         s.phase = want
                         s.acc_ph = s.ship_ph = 0
                         if self.mode == 'selfplay':
@@ -884,17 +903,24 @@ class RemotePlay:
             self.sess[k] = s
 
     def _ship_model(self, want):
+        """Checkpoint want - 1 into the mirror (once per phase); with the self-play league
+        (zero/league.py) also the past checkpoints of the phase's slots (every phase: a worker deletes
+        the checkpoints older than its phase - 3 that its phase does not name)."""
         from .run import model_path
         if self.model_shipped == want - 1:
             return True
         if _now() < self.ship_retry:
             return False
-        try:
-            self.t.put(model_path(self.R.run, want - 1), f'{self.rdir}/models/iter_{want - 1:04d}.pt')
-        except Exception as e:                         # noqa: BLE001 - retried
-            self.ship_retry = _now() + 30
-            self.log(f'checkpoint {want - 1} not shipped: {type(e).__name__}: {str(e)[-300:]}; retry in 30s')
-            return False
+        names = [want - 1]
+        if self.R.league is not None and self.mode == 'selfplay':
+            names += sorted(set(self.R.league.plan(want)['slots']) - {want - 1})
+        for j in names:
+            try:
+                self.t.put(model_path(self.R.run, j), f'{self.rdir}/models/iter_{j:04d}.pt')
+            except Exception as e:                     # noqa: BLE001 - retried
+                self.ship_retry = _now() + 30
+                self.log(f'checkpoint {j} not shipped: {type(e).__name__}: {str(e)[-300:]}; retry in 30s')
+                return False
         self.model_shipped = want - 1
         return True
 
@@ -1229,6 +1255,12 @@ class Worker:
         self.enq = 0
         self.taken = 0
         self.held_samples = []                     # co-training, lingering: rows sent, samples for the next phase
+        # the self-play league (zero/league.py): its table's kinds, its slots' evaluators and checkpoints
+        from . import league as L
+        self.lg_on = self.mode == 'selfplay' and L.enabled(self.cfg)
+        self.lg_kinds = None
+        self.lg_evs = {}
+        self.lg_slots = None
         from .games import spec_json
         self.spec = spec_json(self.cfg.get('spec'))
 
@@ -1400,10 +1432,11 @@ class Worker:
         import torch
         torch.set_num_threads(max(1, int(self.cfg.get('torch_threads', 1))))
 
-    def _load(self, it, model):
+    def _load(self, it, model, league=None):
         from .infer import NetEvaluator
         from .net import load
         from .run import Run
+        from . import league as L
         c = self.cfg
         # (the encoding guard: a checkpoint of another encoding than this checkout's raises
         # EncodingMismatch, reported to the run as an 'encoding' error; docs/az.md 10.4. The
@@ -1417,6 +1450,8 @@ class Worker:
             # both modes play queued setups only: the run's episodes (co-training), or a setup of the
             # run's spec for every game the worker may start under its cap (self-play)
             table = [[seat] * c['players'][0]] if self.mode == 'matches' else [[seat] * p for p in c['players']]
+            if self.lg_on:
+                table, self.lg_kinds = L.rolling_table(c, seat)    # the run's league table
             self.drv = R.driver(table, seed=seed, record=True, rolling=True, net=it - 1, queue_only=True)
             for tag, spec in self.backlog:
                 self.drv.enqueue(tag, spec)
@@ -1424,9 +1459,18 @@ class Worker:
             self.info = R.info
         else:
             self.evr.set_weights(m.state_dict())
+        keep = set()
+        if self.lg_on:
+            # the phase's league slots: {key: models/iter_j.pt}, shipped by the run (zero/league.py)
+            if not league or set(league) != {L.key(t) for t in range(int(c.get('selfplay_league_slots', 1)))}:
+                raise SystemExit(f'remote self-play: the run plays a league but its phase names the slots {league!r}')
+            for k, rel in league.items():
+                self.lg_evs[k] = L.load_into(self.lg_evs.get(k), os.path.join(self.rdir, *rel.split('/')), c)
+                keep.add(os.path.basename(rel))
+            self.lg_slots = [int(os.path.basename(league[L.key(t)])[5:9]) for t in range(len(league))]
         for p in glob.glob(os.path.join(self.rdir, 'models', 'iter_*.pt')):
             try:
-                if int(os.path.basename(p)[5:9]) < it - 3:
+                if int(os.path.basename(p)[5:9]) < it - 3 and os.path.basename(p) not in keep:
                     os.remove(p)
             except (OSError, ValueError):
                 pass
@@ -1495,6 +1539,9 @@ class Worker:
             row, sd = self.held.popleft()
             ph['bw'].add(sd, 1)
             ph['accepted'] += 1
+            if self.lg_on:
+                from .league import tally
+                tally([row], ph['league'])
         die = int(self.test.get('die_after_accepts') or 0)
         if die and ph['accepted'] >= die:
             self.note('test: dying with accepted games in no shard yet')
@@ -1503,6 +1550,9 @@ class Worker:
     def _finished(self, ph, rows, s):
         """Games the driver finished: self-play - held for the run's accept (`fin`); co-training - the
         rows to the run at once, the samples into this phase's shards (lingering: the next one's)."""
+        if self.lg_on:
+            from .league import League
+            League.attribute(rows, self.lg_kinds, self.lg_slots)     # (the slots' checkpoints now)
         games = split_games(rows, s)
         self.taken += len(games)
         if ph['closed']:
@@ -1629,11 +1679,12 @@ class Worker:
         ph['closed'] = True
         ph['t_close'] = now
         ph['leaves_close'] = st['leaves']
+        extra = {'league': ph['league']} if self.lg_on else {}
         self.emit('end', iter=ph['it'], games=ph['games'], samples=ph['samples'], shards=w['shards'], bytes=w['bytes'],
                   leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - bo, 2),
                   backoff_s=round(bo, 2), in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
                   accepted=ph['accepted'], unshipped=unshipped, held=len(self.held),
-                  linger=ph.get('linger_prev'))
+                  linger=ph.get('linger_prev'), **extra)
         self.note(f'phase {ph["it"]}: {ph["games"]} games ({ph["accepted"]} accepted, {len(self.held)} held), '
                   f'{ph["samples"]} samples in {w["shards"]} shards ({w["bytes"] / 1e6:.1f} MB), '
                   f'{(st["leaves"] - ph["leaves0"]) / max(secs - bo, 1.0):.0f} leaves/s running, {secs:.0f}s '
@@ -1643,7 +1694,7 @@ class Worker:
         from .data import ShardWriter
         from .infer import drive
         it = int(msg['iter'])
-        self._load(it, msg['model'])
+        self._load(it, msg['model'], msg.get('league'))
         self._cleanup()
         c = self.cfg
         drv = self.drv
@@ -1658,7 +1709,8 @@ class Worker:
         drv.resume(BIG, it - 1)
         ph = {'it': it, 'games': 0, 'samples': 0, 't0': _now(), 'backoff': 0.0, 'bo_t0': 0.0, 'ending': False,
               't_lock': 0.0, 'leaves0': st0['leaves'], 'bw': bw, 'closed': False, 'accepted': 0,
-              'linger_games': 0, 'linger_prev': getattr(self, 'linger_prev', None)}
+              'linger_games': 0, 'linger_prev': getattr(self, 'linger_prev', None), 'league': {}}
+        evs = {'m': self.evr, **self.lg_evs} if self.lg_on else {'m': self.evr}
         self.linger_prev = None
         for sd in self.held_samples:               # co-training: rows finished while lingering, sent already
             bw.add(sd, 1)
@@ -1689,7 +1741,7 @@ class Worker:
 
         while True:
             pump()
-            drive(drv, {'m': self.evr}, on_batch=pump)
+            drive(drv, evs, on_batch=pump)
             if ph['ending']:
                 break
             msg = self._get(0.5) if self.stash is None else None   # queue_only, nothing to play: wait
@@ -1721,7 +1773,7 @@ class Worker:
                       f'torch threads {self.cfg.get("torch_threads", 1)}, nice {self.sp.get("nice", 0)}'
                       + (', lingering between phases' if self.linger else ''))
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
-                      mode=self.mode)
+                      mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}))   # (the tests: an older checkout)
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None
