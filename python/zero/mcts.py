@@ -36,6 +36,11 @@ Simulation (one network evaluation each, strictly sequential within a tree)
 
 Policy target of a recorded decision (docs/search.md 3.1): the root visit distribution, or
 the completed-Q target of Gumbel AlphaZero (`cq_target`, `completed_q_policy`).
+
+The move of a decision that is not sampled (docs/search.md 3.3; `select_index`): argmax (N, P0)
+('visits', the default), or the argmax of the completed-Q target's logits ('cq',
+`completed_q_logits`) among the options with at least `min_visits` visits. `select_tag` names a
+rule (its evaluations' Elo pool, docs/az.md 5.4).
 """
 import math
 
@@ -238,14 +243,9 @@ def advance(root, a, key, player, legal):
     return edge.kids.get((tuple(key), player, tuple(legal)))
 
 
-def completed_q_policy(P0, Nv, W, v, c_visit=50.0, c_scale=1.0):
-    """Gumbel AlphaZero's policy-improvement target (Danihelka et al. 2022; mctx
-    `qtransform_completed_by_mix_value` without per-node min-max rescaling):
-    softmax(ln P0 + (c_visit + max N) * c_scale * completedQ), completedQ = W / N for visited
-    options and v_mix = (v + sum N * sum_{N>0} P0 Q / sum_{N>0} P0) / (1 + sum N) for unvisited
-    ones (their eq. 33; v = the network's value of the node for its decider). Q is the
-    decider's utility (P(win) in [0, 1] with margin_w 0). Same arithmetic as the Rust tree's
-    `completed_q_policy` (f64)."""
+def completed_q_logits(P0, Nv, W, v, c_visit=50.0, c_scale=1.0):
+    """The logits of `completed_q_policy`: ln max(P0, PRIOR_FLOOR) + (c_visit + max N) c_scale
+    completedQ per option (the Rust tree's `completed_q_logits`, f64)."""
     k = len(P0)
     sum_n = 0.0
     max_n = 0
@@ -260,8 +260,19 @@ def completed_q_policy(P0, Nv, W, v, c_visit=50.0, c_scale=1.0):
             sum_pq += p * (W[i] / Nv[i])
     v_mix = (v + sum_n * (sum_pq / sum_p)) / (1.0 + sum_n) if sum_n > 0 else v
     scale = (c_visit + max_n) * c_scale
-    lg = [math.log(max(float(P0[i]), PRIOR_FLOOR)) + scale * (W[i] / Nv[i] if Nv[i] > 0 else v_mix)
-          for i in range(k)]
+    return [math.log(max(float(P0[i]), PRIOR_FLOOR)) + scale * (W[i] / Nv[i] if Nv[i] > 0 else v_mix)
+            for i in range(k)]
+
+
+def completed_q_policy(P0, Nv, W, v, c_visit=50.0, c_scale=1.0):
+    """Gumbel AlphaZero's policy-improvement target (Danihelka et al. 2022; mctx
+    `qtransform_completed_by_mix_value` without per-node min-max rescaling):
+    softmax(ln P0 + (c_visit + max N) * c_scale * completedQ), completedQ = W / N for visited
+    options and v_mix = (v + sum N * sum_{N>0} P0 Q / sum_{N>0} P0) / (1 + sum N) for unvisited
+    ones (their eq. 33; v = the network's value of the node for its decider). Q is the
+    decider's utility (P(win) in [0, 1] with margin_w 0). Same arithmetic as the Rust tree's
+    `completed_q_policy` (f64)."""
+    lg = completed_q_logits(P0, Nv, W, v, c_visit, c_scale)
     m = max(lg)
     e = [math.exp(x - m) for x in lg]
     s = sum(e)
@@ -278,3 +289,60 @@ def visits_target(node):
     """The visit distribution at an expanded node (P0 if nothing was visited)."""
     tot = sum(node.Nv)
     return [n / tot for n in node.Nv] if tot else list(node.P0)
+
+
+# ------------------------------------------------------------------ the move rule (docs/search.md 3.3)
+
+SELECT_RULES = ('visits', 'cq')
+
+
+def check_select(rule, min_visits=0, what='select'):
+    """A move rule's settings ('visits' | 'cq', the guard `min_visits` >= 0, cq's only) -> None,
+    else ValueError (`what`: the setting's name in the message)."""
+    if rule not in SELECT_RULES:
+        raise ValueError(f'{what} {rule!r}: one of {SELECT_RULES}')
+    if isinstance(min_visits, bool) or not isinstance(min_visits, int) or min_visits < 0:
+        raise ValueError(f'{what}_min_visits {min_visits!r}: an integer >= 0')
+    if rule == 'visits' and min_visits:
+        raise ValueError(f"{what}_min_visits {min_visits}: a guard of {what} 'cq' ('visits' has none)")
+
+
+def select_index(P0, Nv, W, v, rule='visits', min_visits=0, c_visit=50.0, c_scale=1.0):
+    """The chosen option of a searched decision that is not sampled (the Rust driver's
+    `Select::choose`): 'visits' = argmax (N, P0); 'cq' = argmax of `completed_q_logits` among the
+    options with at least min(min_visits, max N) visits (0: every option, an unvisited one at
+    v_mix). The first maximum on exact ties; 0 without options. `v`: the network's utility of the
+    node for its decider."""
+    k = len(Nv)
+    if not k:
+        return 0
+    if rule == 'visits':
+        return max(range(k), key=lambda i: (Nv[i], P0[i]))
+    if rule != 'cq':
+        raise ValueError(f'select {rule!r}: one of {SELECT_RULES}')
+    lg = completed_q_logits(P0, Nv, W, v, c_visit, c_scale)
+    m = min(min_visits, max(Nv))
+    best = None
+    for i in range(k):
+        if Nv[i] >= m and (best is None or lg[i] > lg[best]):
+            best = i
+    return 0 if best is None else best
+
+
+def select_node(node, rule='visits', min_visits=0, c_visit=50.0, c_scale=1.0):
+    """`select_index` at an expanded node (its P0, N, W and its decider's network utility)."""
+    return select_index(node.P0, node.Nv, node.W, node.vec[node.player], rule, min_visits, c_visit, c_scale)
+
+
+def select_tag(rule='visits', min_visits=0, c_visit=50.0, c_scale=1.0):
+    """The name of a move rule: 'visits', 'cq', 'cq-n2' (the guard), 'cq-v25-s0.5' (a completed-Q
+    transform other than c_visit 50, c_scale 1). Evaluations record it (absent = 'visits') and
+    each rule has its own Elo pool (docs/az.md 5.4)."""
+    if rule == 'visits':
+        return 'visits'
+    t = rule
+    if min_visits:
+        t += f'-n{int(min_visits)}'
+    if (float(c_visit), float(c_scale)) != (50.0, 1.0):
+        t += f'-v{float(c_visit):g}-s{float(c_scale):g}'
+    return t

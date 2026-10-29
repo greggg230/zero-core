@@ -27,6 +27,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         rolling: false,
         net: 0,
         queue_only: false,
+        move_log: 0,
     }
 }
 
@@ -990,4 +991,162 @@ fn a_slow_step_holds_up_its_own_group_only() {
     while let Some(b) = d2.next_batch(true).unwrap() {
         answer(&mut d2, &b);
     }
+}
+
+// ------------------------------------------------------------------ the move rule (Select) and the move log
+
+fn with_select(seat: SeatCfg, sel: Select) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.select = sel;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+const CQ: Select = Select::Cq { c_visit: 50.0, c_scale: 1.0, min_visits: 0 };
+const CQ2: Select = Select::Cq { c_visit: 50.0, c_scale: 1.0, min_visits: 2 };
+
+/// FNV-1a over result rows (gid, steps, decisions, result, scores, over): a match's games.
+fn results_digest(rows: &[GameResult]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut eat = |b: &[u8]| {
+        for &x in b {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    for r in rows {
+        eat(&r.gid.to_le_bytes());
+        eat(&r.steps.to_le_bytes());
+        eat(&r.decisions.to_le_bytes());
+        for v in r.result.iter().chain(&r.scores) {
+            eat(&v.to_bits().to_le_bytes());
+        }
+        eat(&[r.over as u8]);
+    }
+    h
+}
+
+/// An evaluation match of the deterministic evaluator: key m (rule `a`) vs key o (rule `b`),
+/// 40 toy games at 16 simulations, seats alternating.
+fn golden_match(a: Select, b: Select) -> Vec<GameResult> {
+    let seats = vec![with_select(nn(0, 16, false), a), with_select(nn(1, 16, false), b)];
+    let games = (0..40).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+    let mut c = cfg(seats, games, &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.record = false;
+    run(&mut Driver::<ToyGame>::new(c).unwrap()).0
+}
+
+#[test]
+fn select_visits_and_the_move_log_change_nothing() {
+    // the explicit default rule and a move log reproduce the golden records bit for bit
+    let (r0, recs) = golden_selfplay(with_select(nn(0, 16, true), Select::Visits));
+    assert_eq!(records_digest(&recs), GOLDEN_RECORDS.1);
+    let mut c = cfg(vec![nn(0, 16, true)], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.move_log = 1000;
+    let (r1, recs1) = run(&mut Driver::<ToyGame>::new(c).unwrap());
+    assert_eq!(records_digest(&recs1), GOLDEN_RECORDS.1);
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples, r.decisions);
+    assert_eq!(r0.iter().map(key).collect::<Vec<_>>(), r1.iter().map(key).collect::<Vec<_>>());
+    assert!(r0.iter().all(|r| r.moves.is_empty()));
+    // every real move is logged (no external seats here), each legal and from its decider's list
+    for r in &r1 {
+        assert_eq!(r.moves.len() as u64, r.steps.min(1000));
+        assert!(r.moves.iter().all(|(p, a, legal)| (*p as usize) < r.n && legal.contains(a)));
+    }
+    // an evaluation match at the default rule: the games of zero-core before the rule existed
+    assert_eq!(results_digest(&golden_match(Select::Visits, Select::Visits)), GOLDEN_MATCH_VISITS);
+}
+// `golden_match(Visits, Visits)`: the same digest on zero-core 3c26d9f (the driver before
+// `Select`, the same match without the select field)
+const GOLDEN_MATCH_VISITS: u64 = 12492034373733022939;
+
+#[test]
+fn select_cq_golden_records_and_matches() {
+    // the 'cq' rule's self-play records and evaluation matches, recorded when the rule was
+    // productionized: a change of its moves (or of the cq logits) shows here
+    let (_, recs) = golden_selfplay(with_select(nn(0, 16, true), CQ));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_SELECT_CQ_RECORDS);
+    assert_eq!(results_digest(&golden_match(CQ, Select::Visits)), GOLDEN_MATCH_CQ);
+    assert_eq!(results_digest(&golden_match(CQ2, CQ2)), GOLDEN_MATCH_CQ2);
+}
+const GOLDEN_SELECT_CQ_RECORDS: (usize, u64) = (329, 8716559848855127382);
+const GOLDEN_MATCH_CQ: u64 = 10451580073337998459;
+const GOLDEN_MATCH_CQ2: u64 = 2225760264326051811;
+
+#[test]
+fn select_rules_change_only_moves_after_temp_moves() {
+    // the first temp_moves searched decisions are sampled whatever the rule, so the games agree
+    // up to there; the other rules then play differently somewhere, and every game still ends
+    let log = |sel: Select| {
+        let mut c = cfg(vec![with_select(nn(0, 16, true), sel)], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+        c.seed = 2026;
+        c.move_log = 1000;
+        run(&mut Driver::<ToyGame>::new(c).unwrap()).0
+    };
+    let base = log(Select::Visits);
+    for sel in [CQ, CQ2] {
+        let other = log(sel);
+        assert_eq!(other.len(), base.len());
+        assert!(other.iter().all(|r| r.over));
+        let mut differ = 0;
+        for (a, b) in base.iter().zip(&other) {
+            // the games' first moves (setup + the sampled opening) agree
+            let k = a.moves.iter().zip(&b.moves).take_while(|(x, y)| x == y).count();
+            assert!(k >= 10.min(a.moves.len()), "{sel:?}: game {} differs at move {k}", a.gid);
+            differ += (a.moves != b.moves) as usize;
+        }
+        assert!(differ > 0, "{sel:?} never changed a move");
+    }
+    // evaluation seats never sample: every move follows the rule, so 'cq' vs 'visits' plays other
+    // games than 'visits' vs 'visits'
+    assert_ne!(results_digest(&golden_match(CQ, Select::Visits)), results_digest(&golden_match(Select::Visits, Select::Visits)));
+}
+
+#[test]
+fn select_choose_by_hand() {
+    // sigma = (50 + 27) x Q dwarfs ln P0: the one-visit option with the best Q wins the plain cq
+    // argmax; a guard of 2 visits takes option 1 (4 visits, the better logit of the two left), a
+    // guard above every count the most visited option; the visits rule option 0
+    let p0 = [0.9f32, 0.08, 0.02];
+    let n = [27u32, 4, 1];
+    let w = [27.0 * 0.40, 4.0 * 0.47, 1.0 * 0.60];
+    let v = 0.45;
+    let lg = crate::tree::completed_q_logits(&p0, &n, &w, v, 50.0, 1.0);
+    let pi = crate::tree::completed_q_policy(&p0, &n, &w, v, 50.0, 1.0);
+    let am = |x: &[f64]| (0..x.len()).fold(0, |b, k| if x[k] > x[b] { k } else { b });
+    assert_eq!(am(&lg), am(&pi.iter().map(|&x| x as f64).collect::<Vec<_>>()));
+    assert_eq!(Select::Visits.choose(&p0, &n, &w, v), 0);
+    assert_eq!(CQ.choose(&p0, &n, &w, v), 2);
+    assert_eq!(Select::Cq { c_visit: 50.0, c_scale: 1.0, min_visits: 1 }.choose(&p0, &n, &w, v), 2);
+    assert_eq!(CQ2.choose(&p0, &n, &w, v), 1);
+    assert_eq!(Select::Cq { c_visit: 50.0, c_scale: 1.0, min_visits: 5 }.choose(&p0, &n, &w, v), 0);
+    assert_eq!(Select::Cq { c_visit: 50.0, c_scale: 1.0, min_visits: 1000 }.choose(&p0, &n, &w, v), 0);
+    // c_scale 0: the logits are ln P0, so the prior's favourite
+    assert_eq!(Select::Cq { c_visit: 50.0, c_scale: 0.0, min_visits: 0 }.choose(&p0, &n, &w, v), 0);
+    // an unvisited option is completed at v_mix: with a high prior and no guard it can win
+    let (p0u, nu, wu) = ([0.5f32, 0.5], [3u32, 0], [3.0 * 0.2, 0.0]);
+    assert_eq!(CQ.choose(&p0u, &nu, &wu, 0.9), 1, "v_mix = (0.9 + 3 x 0.2) / 4 > 0.2");
+    assert_eq!(Select::Cq { c_visit: 50.0, c_scale: 1.0, min_visits: 1 }.choose(&p0u, &nu, &wu, 0.9), 0);
+    // nothing visited: both rules take the prior's argmax; exact ties the first
+    assert_eq!(CQ.choose(&[0.2, 0.7, 0.1], &[0, 0, 0], &[0.0; 3], 0.5), 1);
+    assert_eq!(CQ2.choose(&[0.2, 0.7, 0.1], &[0, 0, 0], &[0.0; 3], 0.5), 1);
+    assert_eq!(CQ.choose(&[0.5, 0.5], &[2, 2], &[1.0, 1.0], 0.5), 0);
+    assert_eq!(CQ.choose(&[], &[], &[], 0.5), 0);
+    assert_eq!(Select::Visits.choose(&[], &[], &[], 0.5), 0);
+}
+
+#[test]
+fn select_settings_are_parsed() {
+    assert_eq!(Select::parse("visits", 0, 50.0, 1.0), Ok(Select::Visits));
+    assert_eq!(Select::parse("cq", 0, 50.0, 1.0), Ok(CQ));
+    assert_eq!(Select::parse("cq", 2, 25.0, 0.5), Ok(Select::Cq { c_visit: 25.0, c_scale: 0.5, min_visits: 2 }));
+    assert!(Select::parse("visits", 2, 50.0, 1.0).is_err(), "the guard is cq's");
+    assert!(Select::parse("q", 0, 50.0, 1.0).is_err());
+    assert!(Select::parse("cq", 0, f64::NAN, 1.0).is_err());
+    assert!(Select::parse("cq", 0, 50.0, -1.0).is_err());
 }

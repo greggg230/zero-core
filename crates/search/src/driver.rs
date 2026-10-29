@@ -103,6 +103,73 @@ impl PolicyTarget {
     }
 }
 
+/// How a network seat chooses a move it does not sample (docs/search.md 3.3): every move of an
+/// evaluation seat, and a self-play seat's after its first `temp_moves` searched decisions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Select {
+    /// argmax (N, P0), the first maximum on exact ties: AlphaZero's rule, the default.
+    Visits,
+    /// argmax of the completed-Q improved policy's logits `ln max(P0, PRIOR_FLOOR) + (c_visit +
+    /// max N) c_scale completedQ` (`tree::completed_q_logits`, the logits of the 'cq' training
+    /// target; Gumbel AlphaZero's final-move rule) among the options with at least `min_visits`
+    /// visits (0: every option, an unvisited one at v_mix; when no option has that many, the
+    /// most visited ones), the first maximum on exact ties.
+    Cq { c_visit: f64, c_scale: f64, min_visits: u32 },
+}
+
+impl Select {
+    /// From the seat settings `select` ('visits' | 'cq'), `select_min_visits` (of 'cq' only),
+    /// `cq_c_visit`, `cq_c_scale` (the completed-Q transform's, shared with the 'cq' target).
+    pub fn parse(name: &str, min_visits: u32, c_visit: f64, c_scale: f64) -> Result<Select, String> {
+        match name {
+            "visits" if min_visits == 0 => Ok(Select::Visits),
+            "visits" => Err(format!("select_min_visits {min_visits}: a guard of select 'cq' (select 'visits' has none)")),
+            "cq" => {
+                if !(c_visit.is_finite() && c_visit >= 0.0 && c_scale.is_finite() && c_scale >= 0.0) {
+                    return Err(format!("select 'cq' needs finite cq_c_visit >= 0 and cq_c_scale >= 0 (got {c_visit}, {c_scale})"));
+                }
+                Ok(Select::Cq { c_visit, c_scale, min_visits })
+            }
+            _ => Err(format!("select {name:?}: 'visits' or 'cq'")),
+        }
+    }
+
+    /// The chosen option of a searched decision from its root statistics: priors before noise
+    /// `p0`, visits `n`, value sums `w` (the decider's utility), the network's utility `v` of
+    /// the root for its decider. 0 for a decision without options. The driver's moves and
+    /// `SearchTree.root_select` (the Python parity tests) both come from here.
+    pub fn choose(&self, p0: &[f32], n: &[u32], w: &[f64], v: f64) -> usize {
+        match *self {
+            Select::Visits => argmax_visits(n, p0),
+            Select::Cq { c_visit, c_scale, min_visits } => {
+                if n.is_empty() {
+                    return 0;
+                }
+                let lg = crate::tree::completed_q_logits(p0, n, w, v, c_visit, c_scale);
+                let m = min_visits.min(n.iter().copied().max().unwrap_or(0));
+                let mut best: Option<usize> = None;
+                for k in 0..lg.len() {
+                    if n[k] >= m && best.is_none_or(|b| lg[k] > lg[b]) {
+                        best = Some(k);
+                    }
+                }
+                best.unwrap_or(0)
+            }
+        }
+    }
+}
+
+/// max by (N, P0), the first maximum on exact ties (`Select::Visits`); 0 without options.
+pub fn argmax_visits(n: &[u32], p0: &[f32]) -> usize {
+    let mut best = 0;
+    for k in 1..n.len() {
+        if (n[k], p0[k]) > (n[best], p0[best]) {
+            best = k;
+        }
+    }
+    best
+}
+
 /// Search settings of a network seat.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NnSeat {
@@ -124,12 +191,14 @@ pub struct NnSeat {
     pub redet: bool,
     /// Training target of the seat's recorded decisions (self-play, full searches).
     pub policy_target: PolicyTarget,
+    /// How a move that is not sampled is chosen (`Select`; default `Select::Visits`).
+    pub select: Select,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits }
     }
 }
 
@@ -171,6 +240,10 @@ pub struct DriverCfg {
     /// Rolling mode: slots start only queued setups (`Driver::enqueue`), idle while the queue
     /// is empty.
     pub queue_only: bool,
+    /// Log the first `move_log` real moves of every game (seat, action, legal actions) into
+    /// its result row (`GameResult::moves`, a diagnostic: zero.h2h's `--move-log`); 0 = off
+    /// (nothing changes).
+    pub move_log: u32,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -191,6 +264,9 @@ pub struct GameResult {
     pub samples: u32,
     /// The tag of the queued setup the game was started from (`Driver::enqueue`).
     pub tag: Option<String>,
+    /// `DriverCfg::move_log`: the game's first real moves (seat, action, legal
+    /// actions), the external seats' answers excluded; empty when off.
+    pub moves: Vec<(u8, u16, Vec<u16>)>,
 }
 
 /// One recorded root decision with its targets.
@@ -405,6 +481,8 @@ struct Slot<G: SearchGame> {
     legal_ok: bool,
     epoch: u32,
     net: u32,
+    /// The logged real moves (`DriverCfg::move_log`).
+    moves: Vec<(u8, u16, Vec<u16>)>,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -438,6 +516,7 @@ impl<G: SearchGame> Slot<G> {
             legal_ok: false,
             epoch: 0,
             net: 0,
+            moves: Vec::new(),
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -1102,7 +1181,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new() };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();

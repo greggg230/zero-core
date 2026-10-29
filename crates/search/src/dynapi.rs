@@ -3,7 +3,7 @@
 //! behind one class each: registering a game is one line in the game's `zero_py::engine_module!`.
 use std::any::Any;
 
-use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record};
+use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record, Select};
 use crate::game::{bot_names, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
 use crate::tree::{leaf_values_team, Scratch, Sim, Tree, Walk};
@@ -166,6 +166,9 @@ pub trait DynTree: Send + Sync {
     /// The completed-Q policy target at the root (`tree::completed_q_policy`; empty before
     /// expansion).
     fn root_cq_target(&self, c_visit: f64, c_scale: f64) -> Vec<f32>;
+    /// The option the driver's move rule `sel` chooses at the root (`Select::choose`; 0 before
+    /// expansion): the same code as a driver's non-sampled moves.
+    fn root_select(&self, sel: &Select) -> usize;
     fn redet(&self) -> bool;
     fn edge_kids(&self, i: usize) -> Vec<(Vec<u64>, usize)>;
     fn edge_outs(&self, i: usize) -> Vec<Vec<u64>>;
@@ -267,6 +270,10 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     }
     fn root_cq_target(&self, c_visit: f64, c_scale: f64) -> Vec<f32> {
         self.t.cq_target(self.t.root, c_visit, c_scale)
+    }
+    fn root_select(&self, sel: &Select) -> usize {
+        let r = self.t.root;
+        sel.choose(&self.t.priors0(r), &self.t.visits(r), &self.t.values(r), self.t.value0(r))
     }
     fn redet(&self) -> bool {
         self.t.redet

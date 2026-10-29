@@ -8,12 +8,16 @@
   with other seeds), and the root win estimates must agree. The same for the completed-Q
   policy targets (docs/search.md 3.1) of the searched roots; `cq_formula` checks that the
   Python formula on a Rust root's statistics gives the Rust target.
+* `select_formula`: the move rule (docs/search.md 3.3) - the Python `mcts.select_index` on Rust
+  roots' statistics against the Rust driver's own choice (`SearchTree.root_select`, the code of a
+  driver's non-sampled moves), exactly (but on near-ties of the logits, ulps apart).
 * `h2h`: games between a Rust-tree seat and a Python-tree seat (`play.PyDriver`, seats
-  alternating), both searching with the same network and settings: ~50% within error.
+  alternating), both searching with the same network and settings (and move rule): ~50% within
+  error.
 
   python -m zero.parity positions [--sims 128 --reps 32 --chance-k 0 --cq-c-scale 1.0]
   python -m zero.parity positions --game toy_team --players 4     (deferred leaves, teams of 2)
-  python -m zero.parity h2h --model runs/toy1/models/iter_0010.pt [--games 2000 --sims 32]
+  python -m zero.parity h2h --model runs/toy1/models/iter_0010.pt [--games 2000 --sims 32 --select cq]
   (or python -m <pkg>.az.parity ... in a game repo)
 """
 import argparse
@@ -154,8 +158,42 @@ def cq_formula(game='toy', n=8, sims=64, seed=0, cq_settings=((50.0, 1.0), (50.0
     return worst
 
 
-def h2h(model, games=2000, sims=32, chance_k=0, conc=128, seed=0, game='toy', verbose=True):
-    """Rust-tree seat vs Python-tree seat, same network, seats alternating. -> summary."""
+SELECT_RULES = (('visits', 0, 50.0, 1.0), ('cq', 0, 50.0, 1.0), ('cq', 1, 50.0, 1.0), ('cq', 2, 50.0, 1.0),
+                ('cq', 4, 10.0, 3.0), ('cq', 0, 50.0, 0.1))
+
+
+def select_formula(game='toy', n=8, sims=(4, 8, 24, 64), seed=0, rules=SELECT_RULES, scale=0.15, eps=1e-9):
+    """The Python `select_index` on Rust roots' statistics (P0, N, W, network value) vs the Rust
+    tree's own `root_select` for each rule (rule, min_visits, c_visit, c_scale). -> {checked,
+    agree, near_ties, mismatches}: a disagreement counts as a near-tie when the two options'
+    logits are within `eps` (f64 rounding of ln / exp between the platforms' libm), else it is a
+    mismatch (listed)."""
+    info = engine().game_info_of(game)
+    ev = LinearEval(info["num_features"], info["num_actions"], seed=1, scale=scale)
+    out = {'checked': 0, 'agree': 0, 'near_ties': 0, 'mismatches': []}
+    for k, g in enumerate(sample_positions(game, n, seed)):
+        for ns in sims:
+            *_, t = search_rs(g, ev, ns, 700 + 31 * k + ns, tree=True)
+            P0, Nv, W, v = t.root_priors0, t.root_visits, t.root_values, t.root_value0
+            for rule, mv, cv, cs in rules:
+                py = mcts.select_index(P0, Nv, W, v, rule, mv, cv, cs)
+                rs = t.root_select(rule, mv, cv, cs)
+                out['checked'] += 1
+                if py == rs:
+                    out['agree'] += 1
+                    continue
+                lg = mcts.completed_q_logits(P0, Nv, W, v, cv, cs) if rule == 'cq' else None
+                if lg is not None and abs(lg[py] - lg[rs]) < eps:
+                    out['near_ties'] += 1
+                else:
+                    out['mismatches'].append({'position': k, 'sims': ns, 'rule': [rule, mv, cv, cs], 'py': py, 'rs': rs})
+    return out
+
+
+def h2h(model, games=2000, sims=32, chance_k=0, conc=128, seed=0, game='toy', verbose=True, select='visits',
+        select_min_visits=0):
+    """Rust-tree seat vs Python-tree seat, same network and move rule, seats alternating. ->
+    summary."""
     import torch
     from .infer import NetEvaluator, drive
     from .net import load
@@ -163,8 +201,8 @@ def h2h(model, games=2000, sims=32, chance_k=0, conc=128, seed=0, game='toy', ve
     torch.set_num_threads(1)
     m, _ = load(model)
     ev = NetEvaluator(m)
-    rs = NNSeat('m', sims, chance_k=chance_k, impl='rs')
-    py = NNSeat('m', sims, chance_k=chance_k, impl='py')
+    rs = NNSeat('m', sims, chance_k=chance_k, impl='rs', select=select, select_min_visits=select_min_visits)
+    py = NNSeat('m', sims, chance_k=chance_k, impl='py', select=select, select_min_visits=select_min_visits)
     t0 = time.time()
     drv = PyDriver(game, games, lambda g: [rs, py] if g % 2 == 0 else [py, rs], concurrency=conc, seed=seed)
     drive(drv, {'m': ev})
@@ -173,7 +211,8 @@ def h2h(model, games=2000, sims=32, chance_k=0, conc=128, seed=0, game='toy', ve
     w = float(np.mean(sc))
     se = float(np.std(sc) / math.sqrt(len(sc)))
     out = {'rust_score': round(w, 4), 'se': round(se, 4), 'ci95': round(1.96 * se, 4), 'games': len(rows),
-           'sims': sims, 'chance_k': chance_k, 'seconds': round(time.time() - t0, 1), 'model': model}
+           'sims': sims, 'chance_k': chance_k, 'seconds': round(time.time() - t0, 1), 'model': model,
+           'select': rs.select_tag}
     if verbose:
         print(json.dumps(out))
     return out
@@ -199,13 +238,20 @@ def main(argv=None):
     h.add_argument('--sims', type=int, default=32)
     h.add_argument('--chance-k', type=int, default=0)
     h.add_argument('--seed', type=int, default=0)
+    h.add_argument('--select', default='visits', choices=['visits', 'cq'])
+    h.add_argument('--select-min-visits', type=int, default=0)
+    sf = sub.add_parser('select')
+    sf.add_argument('--game', default='toy')
+    sf.add_argument('--positions', type=int, default=8)
     a = ap.parse_args(argv)
     if a.cmd == 'positions':
         print(json.dumps(positions(a.game, n=a.positions, sims=a.sims, reps=a.reps, chance_k=a.chance_k,
                                    c_puct_rs=a.c_puct_rs, verbose=True, cq=(a.cq_c_visit, a.cq_c_scale),
                                    players=a.players, depth=tuple(a.depth))))
+    elif a.cmd == 'select':
+        print(json.dumps(select_formula(a.game, n=a.positions)))
     else:
-        h2h(a.model, a.games, a.sims, a.chance_k, seed=a.seed)
+        h2h(a.model, a.games, a.sims, a.chance_k, seed=a.seed, select=a.select, select_min_visits=a.select_min_visits)
 
 
 if __name__ == '__main__':

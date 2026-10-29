@@ -190,6 +190,20 @@ pub const PRIOR_FLOOR: f64 = f32::MIN_POSITIVE as f64;
 /// so Q is P(win) in [0, 1] with `margin_w` 0: no further normalisation), `v`: the decider's
 /// network utility. Computed in f64; the result sums to 1 (f32).
 pub fn completed_q_policy(p0: &[f32], n: &[u32], w: &[f64], v: f64, c_visit: f64, c_scale: f64) -> Vec<f32> {
+    let mut lg = completed_q_logits(p0, n, w, v, c_visit, c_scale);
+    let m = lg.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut s = 0.0;
+    for x in lg.iter_mut() {
+        *x = (*x - m).exp();
+        s += *x;
+    }
+    lg.iter().map(|&x| (x / s) as f32).collect()
+}
+
+/// The logits of `completed_q_policy`: `ln max(P0, PRIOR_FLOOR) + (c_visit + max N) c_scale
+/// completedQ` per option (f64; the policy is their softmax). Their argmax among the options a
+/// guard admits is the `driver::Select::Cq` move (docs/search.md 3.3).
+pub fn completed_q_logits(p0: &[f32], n: &[u32], w: &[f64], v: f64, c_visit: f64, c_scale: f64) -> Vec<f64> {
     let k = p0.len();
     assert!(n.len() == k && w.len() == k, "completed_q_policy: {k} priors, {} visit counts, {} value sums", n.len(), w.len());
     let mut sum_n = 0.0;
@@ -207,19 +221,12 @@ pub fn completed_q_policy(p0: &[f32], n: &[u32], w: &[f64], v: f64, c_visit: f64
     }
     let v_mix = if sum_n > 0.0 { (v + sum_n * (sum_pq / sum_p)) / (1.0 + sum_n) } else { v };
     let scale = (c_visit + max_n as f64) * c_scale;
-    let mut lg: Vec<f64> = (0..k)
+    (0..k)
         .map(|i| {
             let q = if n[i] > 0 { w[i] / n[i] as f64 } else { v_mix };
             (p0[i] as f64).max(PRIOR_FLOOR).ln() + scale * q
         })
-        .collect();
-    let m = lg.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let mut s = 0.0;
-    for x in lg.iter_mut() {
-        *x = (*x - m).exp();
-        s += *x;
-    }
-    lg.iter().map(|&x| (x / s) as f32).collect()
+        .collect()
 }
 
 /// (util, win) of a finished game (util = team_size x win (+ margin_w tanh(margin))).
