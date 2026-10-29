@@ -480,31 +480,62 @@ def test_background_backoff(tmp_path):
         assert sum(r['games'] for r in rem) == 0, rem
 
 
+def wait_for_remote_progress(run, proc, out_path, min_games=50, stall_s=90, max_s=900, poll=0.1):
+    """Poll progress.json until the CURRENT self-play phase's remote worker has started more than
+    `min_games` games. Robust to: progress.json showing another phase's shape mid-iteration
+    (train/eval/idle write no 'remote' key - treated as 0, not a failure, since those are normal
+    between a run's self-play phases); a torn read while progress.json is being rewritten
+    (OSError/ValueError - the previous good reading is kept, not reset to {}); and a run that has
+    already exited (fails at once with its output instead of spinning out the rest of the
+    window). Unlike a single fixed deadline, the wait extends for as long as the remote's game
+    count keeps climbing (a loaded machine is simply slower, not stuck) and only gives up once
+    progress has stalled for `stall_s`, or the hard ceiling `max_s` is reached."""
+    t0 = last_move = time.time()
+    seen_iter = object()
+    best = 0
+    prog = {}
+    while True:
+        if proc.poll() is not None:
+            raise AssertionError(f'the run exited ({proc.returncode}) before a self-play phase reached '
+                                  f'{min_games} remote games; last progress: {prog}\n' +
+                                  open(out_path, encoding='utf-8').read()[-3000:])
+        try:
+            prog = json.load(open(run / 'progress.json'))
+        except (OSError, ValueError):
+            pass                                        # a torn write mid-save: keep the last good reading
+        if prog.get('iter') != seen_iter:
+            seen_iter, best = prog.get('iter'), 0          # a new iteration: its remote count starts over
+        games = (prog.get('remote') or {}).get('games', 0)
+        now = time.time()
+        if games > best:
+            best, last_move = games, now
+        if best > min_games:
+            return prog
+        if now - t0 > max_s:
+            raise AssertionError(f'no self-play phase reached {min_games} remote games within {max_s}s '
+                                  f'(best {best}); last progress: {prog}')
+        if now - last_move > stall_s:
+            raise AssertionError(f'remote games stalled at {best} for {stall_s}s; last progress: {prog}')
+        time.sleep(poll)
+
+
 def test_pause_mid_phase_then_resume(tmp_path):
     """PAUSE while the remote plays: the run exits 75 and its worker with it; the restart replays
     the iteration (its data directory cleared: no shard of the old session in it) with a new
     worker, and finishes."""
     run = tmp_path / 'pz'
+    out_path = tmp_path / 'pz.out'
     e = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH, **env_for(tmp_path))
-    with open(tmp_path / 'pz.out', 'w', encoding='utf-8') as out:
+    with open(out_path, 'w', encoding='utf-8') as out:
         proc = subprocess.Popen([sys.executable, '-m', 'zero.run', '--run', str(run), '--preset', 'toy-smoke',
                                  '--iters', '3', '--conc', '64', '--games', '4000', '--eval-games', '8',
                                  '--eval-random-games', '4', '--elo-games', '4', '--ref-games', '8',
                                  '--selfplay-remote', 'local'], cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, env=e)
         try:
-            t = time.time() + 180
-            while time.time() < t:
-                try:
-                    prog = json.load(open(run / 'progress.json'))
-                except (OSError, ValueError):
-                    prog = {}
-                if (prog.get('remote') or {}).get('games', 0) > 50:
-                    break
-                time.sleep(0.1)
-            assert (prog.get('remote') or {}).get('games', 0) > 50, prog
+            prog = wait_for_remote_progress(run, proc, out_path)
             it = prog['iter']
             runctl.request_pause(str(run), by='test')
-            proc.wait(timeout=120)
+            proc.wait(timeout=180)
         finally:
             if proc.poll() is None:
                 proc.kill()

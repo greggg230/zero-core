@@ -817,15 +817,25 @@ fn queued_setups_are_shared_between_the_groups() {
     }
     rows.extend(d.take_results());
     assert_eq!(rows.len(), 8);
-    // (in either order: a queue_only driver serves whichever group is ready first - on a loaded
-    // machine group 1's first search can finish before group 0's)
-    let pair = |a: &[(usize, usize)]| {
-        let mut v = a.to_vec();
-        v.sort();
+    // Each `next_batch` call reports one group's CURRENTLY active game count, so the same size
+    // repeats across many calls while those games play out their turns (a batch per ply, not per
+    // dispatch); `sizes`' overall interleaving between the two groups is thread-scheduling order
+    // (which group's worker thread gets to report next) and is not deterministic under load - a
+    // loaded machine can give group 1 several consecutive reports before group 0's first one, so
+    // asserting on absolute positions in the combined `sizes` vector is flaky (seen empirically:
+    // group 1 reporting (1, 4) three times running before group 0's first (0, 4)). What IS
+    // deterministic (`queue_share`, not thread scheduling) is each GROUP's own sequence of
+    // distinct sizes: one setup as it arrives, then a fair share of 4 once the rest of the queue
+    // is split between the two groups (the regression this guards: the first group re-dispatched
+    // used to take the whole queue, 7 / 1).
+    let own_sequence = |g: usize| -> Vec<usize> {
+        let mut v: Vec<usize> = sizes.iter().filter(|&&(gg, _)| gg == g).map(|&(_, b)| b).collect();
+        v.dedup();
+        v.truncate(2);
         v
     };
-    assert_eq!(pair(&sizes[..2]), vec![(0, 1), (1, 1)], "one setup each as they arrive: {sizes:?}");
-    assert_eq!(pair(&sizes[2..4]), vec![(0, 4), (1, 4)], "then 4 and 4: {sizes:?}");
+    assert_eq!(own_sequence(0), vec![1, 4], "group 0's own dispatch sizes: {sizes:?}");
+    assert_eq!(own_sequence(1), vec![1, 4], "group 1's own dispatch sizes: {sizes:?}");
     assert!(sizes.iter().all(|&(_, b)| b <= 4), "{sizes:?}");
     // a game's play depends on its setup and gid only: the same rows with one group
     let mut c1 = c;

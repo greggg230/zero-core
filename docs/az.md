@@ -2469,3 +2469,45 @@ of mulligan searches: 0.11 on average, 73% by more than 0.05); root-view values 
 Q on the draw down to the mulligan's (0.485 -> 0.378 against 0.37 after the fine-tune) but the keep
 rates barely move (the prior holds the visits), and a replay's upkeep Pass the opponent's view valued
 at 0.51 is worth 0.64 with root-view leaves - the move (Brainstorm, prior 0.93) stays.
+
+## 17. Tooling for the tiered verification gates (MTG Zero's `tools/gate.py`, 2026-10-29)
+
+MTG Zero's policy (its ENGINE.md 70, memory `feedback_tiered_gates`) tiers its verification gates
+by change type instead of running the full search smoke before every merge; two zero-core-side
+pieces support it directly:
+
+**`tools/smoke_all.sh --build-only`**: per game, run `tools/build_py.sh` only - no `cargo test`,
+`pytest` or smoke training run. For the tier "an opt-in core feature with byte-identical
+defaults" the question is narrower than the full cross-game smoke answers: does the OTHER games'
+build still compile against this core commit, nothing about their behaviour (the feature is off
+by default there; MTG Zero's own suite already covers whether it changed anything). Combine with
+`--with-this-core` to build the games against THIS checkout's HEAD rather than their own pin.
+Default game discovery (no explicit paths) now also looks for `../kingdombuilder-zero`, alongside
+`../glassroad-zero` and `../caverna-zero` - it was missing from the list before this.
+
+**De-flaked `crates/search/src/driver/tests.rs::queued_setups_are_shared_between_the_groups`**:
+asserted the exact POSITION of each group's dispatch size in the combined `sizes` vector it
+collects across every `next_batch` call (`sizes[..2]`, `sizes[2..4]`). Reproduced reliably under
+real thread contention (ten copies of the test binary running at once, roughly 1 run in 300): the
+two groups' batches are reported in THREAD-SCHEDULING order (which group's worker happens to call
+back first), not in the order `queue_share`'s fairness logic (the thing under test) actually
+assigns work - under load one group can report several batches before the other's first. Fixed by
+asserting each group's OWN sequence of distinct sizes (deduplicated: a size repeats across many
+calls while that wave of games plays out its turns) is `[1, 4]`, which does not depend on how the
+two groups' reports interleave; verified against the original (still reproduced the failure) and
+the fix (480/480 passed) under the same contention. The sibling test
+`queued_setups_fill_every_free_slot_when_the_queue_is_long` and the rest of the module (36 tests)
+were unaffected and still pass.
+
+**De-flaked `tests/test_remoteplay.py::test_pause_mid_phase_then_resume`**: waited for
+`progress.json`'s `remote.games > 50` inside a flat 180 s window, which occasionally saw
+`{'phase': 'idle'}` (a different phase's progress shape, no `remote` key) for long enough under
+load to miss the window - not because anything was stuck, but because a loaded machine is simply
+slower. The new `wait_for_remote_progress` polls with a stall-based deadline instead of a flat
+one (it keeps extending as long as the remote's game count keeps climbing, and gives up only once
+that count has been flat for `stall_s`, or a hard ceiling `max_s` is hit), resets what counts as
+"progress" on an iteration boundary (so a stale high-water mark from an already-finished phase
+cannot short-circuit the wait for a new one), tolerates a torn read of `progress.json` (keeps the
+last good reading instead of resetting to `{}`), and fails immediately with the run's own output
+if the subprocess has already exited, rather than spinning out the rest of the window on a run
+that is never coming back.
