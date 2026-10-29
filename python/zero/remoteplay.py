@@ -457,7 +457,7 @@ class RemotePlay:
             self.cur = {'it': it, 't0': _now(), 't_local': _now(), 'announced': 0, 'accepted': 0, 'rows': 0, 'bytes': 0,
                         'pending': 0, 'rejected': 0, 'quarantined': 0, 'failed': 0, 'fetch_s': 0.0, 'assigned': 0,
                         'matches': 0, 'dup': 0, 'requeued': 0, 'requeued_timeout': 0, 'requeued_backoff': 0, 'errors': 0,
-                        'games': 0, 'lost': 0, 'stale': {}, 'capsum': {}, 'capn': 0}
+                        'games': 0, 'lost': 0, 'stale': {}, 'capsum': {}, 'capmax': {}, 'capn': 0}
             for s in self.sess:
                 if s is not None:
                     s.acc_ph = s.ship_ph = 0
@@ -478,11 +478,12 @@ class RemotePlay:
         """This machine finished `n` more games (oldest first): how many count for iteration `it`
         (the rest wait for the next one)."""
         with self.mu:
-            return self._take(it, 'local', n)
+            a = self._take(it, 'local', n)
+            self._close_if_met()
+            return a
 
     def _take(self, it, who, n):
-        """(mu held) Up to `n` games of `who` into iteration `it`'s quota; the quota met: closed,
-        the workers told to end their phase."""
+        """(mu held) Up to `n` games of `who` into iteration `it`'s quota."""
         q = self.q
         if n <= 0 or q is None or q['it'] != it or not q['open']:
             return 0
@@ -491,9 +492,28 @@ class RemotePlay:
             return 0
         q['done'] += a
         q['by'][who] = q['by'].get(who, 0) + a
-        if q['done'] >= q['need']:
-            self._close_quota()
         return a
+
+    def _close_if_met(self):
+        """(mu held) The quota met: closed, the workers told to end their phase (after any `accept`
+        sent for it: a worker takes its control lines in order)."""
+        q = self.q
+        if q is not None and q['open'] and q['done'] >= q['need']:
+            self._close_quota()
+
+    def _give_back(self, s, it, n):
+        """(mu held) `n` games counted for worker `s` in iteration `it` will not arrive: the quota
+        needs them again, while this machine still plays the phase (then reopened: the workers have
+        ended theirs, this machine plays the rest). -> False if too late (the iteration is short)."""
+        q = self.q
+        if n <= 0 or q is None or q['it'] != it or self.want != it:
+            return False
+        q['done'] -= n
+        q['by'][s.name] = q['by'].get(s.name, 0) - n
+        if not q['open'] and q['done'] < q['need']:
+            q['open'] = True
+        self.mu.notify_all()
+        return True
 
     def _close_quota(self):
         """(mu held) The quota is met: every worker in the phase ends it now (its later games wait)."""
@@ -515,6 +535,7 @@ class RemotePlay:
             s.acc += a
             s.acc_ph += a
             s.send({'cmd': 'accept', 'iter': q['it'], 'n': a})
+            self._close_if_met()
 
     def end(self, it, local=None):
         """Iteration `it`'s self-play ended here: the remote's phase ends too; waits at most
@@ -571,7 +592,8 @@ class RemotePlay:
             rates = self.shares.rates()
             consumers = {}
             for n in self.shares.c:
-                consumers[n] = dict(meas.get(n, {}), cap=phase_caps.get(n), cap_next=self.capv.get(n),
+                m = {k: v for k, v in meas.get(n, {}).items() if k not in ('leaves', 'lead')}
+                consumers[n] = dict(m, cap=phase_caps.get(n), cap_max=cur['capmax'].get(n), cap_next=self.capv.get(n),
                                     rate=round(rates.get(n, 0.0), 4))
             quota = None
             if self.q is not None and self.q['it'] == it:
@@ -677,6 +699,11 @@ class RemotePlay:
             elif kind == 'fin':                        # single-game: games finished there, held until accepted
                 s.fin += int(ev.get('n', 0))
                 self._accept_remote(s)
+            elif kind == 'unaccepted':                 # an accept it could not take (should not happen)
+                n = int(ev.get('n', 0))
+                s.acc -= n
+                s.acc_ph -= n
+                self._give_back(s, ev.get('iter'), n)
             elif kind == 'shard':
                 if self.cur is not None and ev.get('iter') == self.accepting == self.cur['it']:
                     self.cur['pending'] += 1
@@ -737,6 +764,7 @@ class RemotePlay:
                 self.cur['capn'] += 1
                 for n, v in self.capv.items():
                     self.cur['capsum'][n] = self.cur['capsum'].get(n, 0) + v
+                    self.cur['capmax'][n] = max(self.cur['capmax'].get(n, 0), v)
         for k in range(self.procs):
             s = self.sess[k]
             if s is not None and not s.alive() and not s.handled:
@@ -865,13 +893,9 @@ class RemotePlay:
             # single-game: games it had accepted whose samples never reached a shard are not this
             # iteration's after all - the quota needs them again (while this machine still plays)
             q = self.q
-            if q is not None and s.phase == q['it'] and self.want == q['it']:
+            if q is not None and s.phase == q['it']:
                 lost = max(0, s.acc_ph - s.ship_ph)
-                if lost:
-                    q['done'] -= lost
-                    q['by'][s.name] = q['by'].get(s.name, 0) - lost
-                    if not q['open'] and q['done'] < q['need']:
-                        q['open'] = True               # this machine plays the rest (the workers ended)
+                if lost and self._give_back(s, q['it'], lost):
                     self.cur['lost'] += lost
             # the next session starts from a mirror prepared again (it may be what failed: removed,
             # half-written) and gets its checkpoint again (6 MB)
@@ -1417,7 +1441,8 @@ class Worker:
         phase's shards (oldest first)."""
         n = int(msg.get('n', 0))
         if ph is None or ph['it'] != msg.get('iter') or ph['closed']:
-            self.note(f'accept {msg} with no open phase {msg.get("iter")} here: ignored')
+            self.note(f'accept {msg} with no open phase {msg.get("iter")} here: given back')
+            self.emit('unaccepted', iter=msg.get('iter'), n=n)    # the run counts them again
             return
         n = min(n, len(self.held))
         for _ in range(n):

@@ -224,8 +224,9 @@ def test_backoff_moves_the_quota_to_this_machine(tmp_path):
     check_quota(m, 192)
     held, back = m[2]['selfplay'], m[5]['selfplay']
     assert held['remote']['backoff_s'] > 0.3 and held['remote']['games'] == 0, held['remote']
-    assert held['queue']['consumers']['local']['cap'] >= 185 and held['queue']['consumers']['w0']['cap'] == 0, held['queue']
-    assert back['remote']['games'] > 0 and back['queue']['consumers']['local']['cap'] < 185, back['queue']
+    hc, bc = held['queue']['consumers'], back['queue']['consumers']
+    assert hc['local']['games'] == 192 and hc['local']['cap_max'] == 192 and hc['w0']['games'] == 0, hc
+    assert back['remote']['games'] > 0 and bc['local']['cap_max'] < 185 and bc['w0']['cap'] > 0, bc
 
 
 def test_a_dying_worker_gives_its_accepted_games_back(tmp_path):
@@ -239,7 +240,7 @@ def test_a_dying_worker_gives_its_accepted_games_back(tmp_path):
     check_quota(m, 192)
     rem = [r['selfplay']['remote'] for r in m[1:]]
     assert sum(r['lost'] for r in rem) >= 30 and sum(r['session_errors'] for r in rem) > 0, rem
-    assert all(r['games'] == 0 for r in rem), 'none of its games arrived'
+    assert all(r['games'] < 30 for r in rem), 'a session dies at its 30th accepted game: none of those arrive'
     log = (run / 'log.txt').read_text(encoding='utf-8')
     assert re.search(r'worker 0 ended \(exit 9, .*30 accepted games lost with it \(the quota needs them again\)', log), \
         log[-3000:]
