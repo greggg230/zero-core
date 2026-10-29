@@ -16,6 +16,7 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 | `crates/search/src/tree.rs` | One search tree: PUCT, chance children, determinization, noise, reuse, `compact`, completed-Q targets |
 | `crates/search/src/driver.rs`, `driver/worker.rs` | Batched multi-threaded driver: groups, chunks, parallel batch assembly, playout cap, temperature, records, rolling phases, arena keys, external seats |
 | `crates/search/src/toy.rs` | "Mini Cavern", the toy game (section 5) + its heuristic bot |
+| `crates/search/src/mull_game.rs` | Test games (cfg(test)): keep-or-mulligan (`Mull`, section 3.5) and its private-hand variant (`HiddenMull`, section 3.6) |
 | `crates/search/src/toy_team.rs` | "Toy team", a two-team game with a deferred result decided by toy games (section 5.1) |
 | `crates/search/src/dynapi.rs` | Object-safe wrappers (`DynGame`, `DynTree`, `DynDriver`) so the bindings hold any game |
 | `crates/search/src/rng.rs`, `noise.rs` | xoshiro256++ / splitmix64, Gamma / Dirichlet |
@@ -199,14 +200,16 @@ One list of seat dicts per game (players = its length):
 `{'bot': 'random' | 'heuristic' | ...}`, `{'external': '<key>'}`, or a network seat
 `{'key': 'm', 'sims', 'c_puct', 'selfplay', 'alpha', 'eps', 'temp_moves', 'sims_fast',
 'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale',
-'select', 'select_min_visits', 'record', 'root_min_visits', 'root_min_visits_max_actions'}`
+'select', 'select_min_visits', 'record', 'root_min_visits', 'root_min_visits_max_actions',
+'leaf_value_view', 'view_samples', 'view_sample_target'}`
 (`games.nn_seat`; `policy_target` only matters for recorded decisions, section 3.1; `select` and its
 guard for the moves the seat does not sample, section 3.3; `cq_c_visit` / `cq_c_scale` are the
 completed-Q transform of both; `record` false - absent: true - a self-play seat whose full searches
 are not recorded: it searches, samples its moves and draws its playout cap exactly as a recorded
 seat, so its games are the same move for move, and emits no records; zero's self-play league,
 docs/az.md 14, puts a past checkpoint there; `root_min_visits` the floor of its full searches' root
-visits, section 3.5). Evaluator keys: every distinct
+visits, section 3.5; `leaf_value_view` whose view its leaves' values come from, `view_samples` /
+`view_sample_target` its value-only samples, section 3.6). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
 
@@ -218,6 +221,7 @@ key one external player. A key cannot be both.
 | `opt_off` | i32 [B+1] | leaf b's legal actions = `opt_action[opt_off[b]:opt_off[b+1]]` (>= 2; none at a deferred terminal, 3.2) |
 | `opt_action` | i32 [sum] | global action ids in the game's order |
 | `player`, `n_players`, `gid` | i32, i32, i64 [B] | decider (absolute), players, game index |
+| `extra` | u8 [B] | the row's kind: `ROW_LEAF` (0) a leaf's own row, else an extra row of the closest leaf row before it (same game): `ROW_VALUE` (1) its tree viewer's value-only row (no options; root-view leaf values, section 3.6). Evaluators may ignore it |
 
 Answer: `priors` f32 [sum] (softmax over each leaf's legal actions), `value` f32 [B, 8] =
 P(win) per seat **relative to the decider** (column j = seat (player + j) % n; columns >= n
@@ -261,7 +265,9 @@ seat's policy target over the options: the visit distribution, or the completed-
 `policy_target='cq'`, section 3.1), `z` [N, 8] (final `result()` relative to the decider), `q`
 [N, 8] (root search win estimate `wsum / tot`, relative; = z if no backups), `sc` [N, 8]
 (`margin()` per relative seat), `net` (network id of the search, rolling mode). A game's
-samples are emitted when it ends. A driver created with `aux=True` (`DriverCfg::aux`; the game must
+samples are emitted when it ends. With value-only samples (section 3.6) a recorded decision's row
+can be followed by rows of other seats' views of the same state with an empty option segment and no
+`pi` entries. A driver created with `aux=True` (`DriverCfg::aux`; the game must
 have targets, else the driver refuses) adds `aux` f32 [N, W]: each row's decider's
 `aux_target` at that decision (section 1.2), computed when the decision is recorded; every other
 array is the same with it on or off (tested: the golden records).
@@ -573,6 +579,100 @@ pruned counts), `dynapi.rs` / the bindings (`SearchTree.set_root_min`, `root_min
 seats), `games.nn_seat`. Tests: `tree::tests::root_min_visits_*`, `driver::tests::root_floor_*`,
 `driver::tests::root_min_visits_*`, `tests/test_root_min_visits.py`.
 
+### 3.6 Root-view leaf values (`leaf_value_view`, value-only samples; 2026-10-29)
+
+**Why.** The search determinizes the hidden information from the root decider's view (a fresh
+world every simulation) and, before this setting, valued every leaf with the network on
+`encode(decider)` of the leaf - the view of **the player to move there**. At a leaf where another
+seat is to move that value is wrong twice for the root decider: it is blind to the root decider's
+own hidden cards (which the root decider knows), and it reads the other seat's **sampled** hidden
+cards as known (a guess of the root decider's, not that seat's real hand). MTG Zero's Delver mirror
+(its ENGINE.md 64.4, 67): after a kept landless hand, the next decider's view values the keeper at
+0.51, the keeper's own view at 0.36; roughly every other leaf of a two-player search is another
+seat's.
+
+**The setting** (seat key `leaf_value_view`: `'mover'` default | `'root'`). With `'root'` a leaf whose
+decider is not the tree's viewer is evaluated twice, in the **same batch**: its **priors** from its
+own row `encode(decider)` (they model that seat, which cannot see our hidden cards either) and its
+**value and margin** from a second, value-only row `encode(viewer)` of the same (sampled) state -
+the root decider's information: its own cards as they are, everything it cannot see unknown. The
+value is relative to the viewer and backed up as any (`leaf_values_team(..., viewer, ...)`); the
+node's stored utility vector (`vec`, first-play urgency, v_mix of a cq target) is that one. A leaf of
+the root decider, a deferred terminal (already `encode(viewer)`, 3.2) and a terminal are as before.
+Tree reuse keeps a subtree only for the same seat, so a reused tree's values are its viewer's too.
+
+**The batch** (2.2): the value-only row follows its leaf's row, with no options (an empty option
+segment, as a deferred terminal's), `player` = the viewer, the same `gid`, and the row flag
+`extra` = `ROW_VALUE` (1; a leaf's own row is `ROW_LEAF`, 0). The flags are generic: a row of kind > 0
+belongs to the closest leaf row before it, so other features can add kinds (MTG Zero's belief
+head, stage 2). An evaluator answers every row alike and can ignore the flags - `NetEvaluator`, the
+CUDA-graph path and `UniformEvaluator` are unchanged; the driver takes the priors of the leaf's row
+and the value of the row after it (`Pending::Leaf::vrow`). `stats()['view_rows']` counts the extra
+rows (`leaves` still counts leaves).
+
+**Leaks.** The value-only row is safe only if `encode(v)` of a state another seat decides holds
+nothing of that seat's hidden cards - including its options (legal actions derived from its hand)
+and anything a payment of its pins. The contract (section 1: `encode` reads no hidden information)
+covers it; a game must test it for non-deciding viewers: the same encoding in every world that
+deals the decider's hidden cards again, whatever the decider's options there (MTG Zero: its
+ENGINE.md 67.2, tests/hidden.rs and tests/az.rs; the toy and `mull_game::HiddenMull` here).
+
+**Value-only samples** (seat keys `view_samples`: a share in [0, 1], 0 = off; `view_sample_target`:
+`'next_q'` default | `'z'`). A network trained on `encode(decider)` only is asked, by root-view
+leaves, for the value of a state from a seat that does not decide it. To train that view, a share
+of the recorded decisions (`driver::view_pick`: a hash of the driver seed, the game and the decision
+index - no random stream changes; the Python driver's `play.view_pick` is the same arithmetic) also
+records, for every other seat of the game that records (a self-play network seat with `record`), a
+sample of the real state from that seat's view: `x` = `encode(other)`, `player` = the other seat, no
+options and no policy target (an empty segment: the training's policy loss and entropy skip it, docs/az.md 16),
+`z` = the result in its perspective, `sc` its margin. Its `q` (the value target's search part, the
+run's `value_q` blend):
+
+* `'next_q'`: the root win estimate of that seat's **own next search** in the game (full or fast; a
+  minor search is too small; without its forced walks, 3.5), `z` if it never searches again. That
+  seat only learns more until its next search, so that search's value is an estimate of the outcome
+  given what it knows at the sample - the tower property: unbiased up to the search's own error, and
+  of lower variance than z. A decider's sample's q is its own search's at the same state; this is the
+  nearest search of the observer's.
+* `'z'`: the outcome only (unbiased, noisier).
+* Not offered: the decider's root q negated (zero-sum). It is computed from the decider's information
+  set - with the observer's hand sampled, the decider's own known - so it takes the observer's
+  private information out of the target and the decider's in: the bias the setting removes, the other
+  way round. And not the observer's previous search's q: it predates what happened since.
+
+With auxiliary targets on (`DriverCfg::aux`) a value-only record carries its observer's targets
+(`aux_target(observer)`), so a game's records keep one width.
+
+**Cost.** One extra network row per leaf of another seat: about half the leaves of a two-player
+game. A batch-bound evaluator (CUDA, MPS: bigger batches nearly free) pays less than proportionally;
+an inference-bound CPU pays it in full: MTG Zero's Delver network on the desktop CPU, 64 games, 4
+torch threads: 1,313 leaves/s with mover-view values, 887 with root-view values (0.51 value rows per
+leaf), the same 1,313 / 1,342 rows/s (its ENGINE.md 67.6). Value-only samples add `view_samples` x
+(players - 1) samples per recorded decision: more rows in the window and, since training steps follow
+the new samples, as many more training steps.
+
+**Settings.** Run settings `selfplay_leaf_value_view` (the self-play seat; a league opponent's
+unrecorded seat is the self-play seat and takes it too), `eval_leaf_value_view` (every evaluation
+seat: its moves change, so its Elo pool's name gets `-rv`: `mcts.view_tag`, docs/az.md 5.4),
+`selfplay_view_samples` and `view_sample_target` (docs/az.md 1.2, 16). Off (`mover`, 0) is the search
+and the run of before bit for bit (the golden records and match; toy runs byte for byte).
+
+**Measured** on the hidden-hand keep-or-mulligan test game (`mull_game::HiddenMull`: a seat sees its
+own hand only; the stand-in network values the viewer's information; 200 games,
+`driver::tests::root_view_values_read_the_root_deciders_hand`): after two simulations a bad hand's
+Keep is worth 0.500 to the search with mover-view leaves (the other seat's sampled hand, average)
+and exactly 0.350 with root-view leaves (the keeper's own hand, every world). MTG Zero's Delver
+positions: its ENGINE.md 67.
+
+Code: `driver.rs` (`LeafView`, `ViewTarget`, `view_pick`, `ROW_LEAF` / `ROW_VALUE`, `Batch::extra`,
+`NnSeat::leaf_value_view` / `view_samples` / `view_target`), `driver/worker.rs` (`advance_slot`'s
+value-only row, `apply_eval`'s `vrow`, `decide`'s value-only records and the `view_wait` fill),
+`dynapi.rs` / the bindings (`SearchTree.simulate(root_view=True)` -> a 4th item, the viewer's
+features or None; `SearchTree.viewer`; the module's `view_pick`); Python `mcts.py`
+(`expand_and_backup(value_player=)`, `check_leaf_view`, `view_tag`), `play.py` (`NNSeat`,
+`PyDriver._leaf_batches`, `view_pick`), `replay.py`, `parity.root_view`. Tests:
+`driver::tests::leaf_view_*`, `root_view_*`, `value_only_*`, `tests/test_root_view.py`.
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:
@@ -709,6 +809,18 @@ Power check: a Rust floor of 5 against Python's 4 is seen at once (the test). Th
 the targets' mass off the prior's favourite is 0.0304 / 0.0305 / 0.0307 with the floor and 0.0296 /
 0.0296 / 0.0288 without it for the Python driver's 'py' seats, its 'rs' seats and the Rust driver -
 the forced walks pruned alike (kept, they would add at least 2 / 23).
+
+**Root-view leaf values** (section 3.6; `python -m zero.parity root_view`, `parity.root_view`,
+`tests/test_root_view.py`), 2026-10-29: 10 toy positions, 96 simulations, 24 repetitions per position
+and tree, both trees with root-view values and the stand-in `LinearEval` (its value reads the row's
+features, so the viewer's features give other values than the decider's): visits TV Rust-Python
+0.0049 (Python-Python floor 0.0037), cq target TV 0.0162 (0.0088), root win |rs - py| 0.0004; the
+positions where nothing is left to chance search identically. The setting matters: the Python
+tree's root-view vs mover-view searches of the same positions differ by TV 0.096, and a Rust tree
+searching mover-view against the Python root view is seen at once (TV 0.096, power check). The
+drivers ('py' and 'rs' seats of `PyDriver`, the Rust driver): the same batch layout (a value-only
+row after its leaf's, flagged `ROW_VALUE`), the same value-only samples and targets
+(`test_value_only_samples_and_their_targets`).
 
 `python -m zero.parity h2h --model M --games 6000 --sims 32`: Rust-tree seat vs Python-tree
 seat in `PyDriver`, the same network, seats alternating (docs/az.md 6.2): **49.94% +-1.04**

@@ -1206,7 +1206,8 @@ impl<G: SearchGame> Driver<G> {
                 // the phase is over: this group's leaves are not evaluated (nothing was backed
                 // up yet, the next phase walks again)
                 for b in &out.batches {
-                    self.dropped_leaves += b.b as u64;
+                    // (leaves: a leaf's extra rows are not leaves of their own)
+                    self.dropped_leaves += if b.external { b.b } else { b.extra.iter().filter(|&&e| e == ROW_LEAF).count() } as u64;
                 }
                 if !out.batches.is_empty() {
                     for ch in &self.sh.groups[g].chunks {

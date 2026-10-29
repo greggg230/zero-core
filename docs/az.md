@@ -123,6 +123,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `eval_select_c_visit`, `eval_select_c_scale` | unset (None) | the evaluation 'cq' rule's own completed-Q transform: unset = `cq_c_visit` / `cq_c_scale`, the training target's (one knob for both, the behaviour before these settings, bit for bit); a number >= 0 = the rule's own, so a training A/B of `cq_c_scale` no longer changes how the evaluations choose their moves. The rule's name and Elo pool carry the effective value (`cq-n4-v50-s0.3`, `cq-n4` at 50 / 1), so a run with the scale pinned keeps its pool when only `cq_c_scale` changes. The rule 'cq' only (an error with 'visits', as the guard); `none` on the command line unsets a saved value. Every evaluation path follows it (`Run.nn_seat`: yardstick, random, Elo, the `eval_remote`, co-training's evaluations, `eval_yard_net`), and `zero.h2h` / `zero.replay` of the run's checkpoints (sections 5.4, 12.5) |
 | `selfplay_select_c_visit`, `selfplay_select_c_scale` | unset (None) | the same for `selfplay_select` 'cq' (self-play's moves after `temp_moves`, remote self-play too: its checkout must have the setting); the recorded targets keep `cq_c_visit` / `cq_c_scale` whatever these are |
 | `selfplay_root_min_visits`, `eval_root_min_visits`, `root_min_visits_max_actions` | 0, 0, 4 | root minimum visits ("forced playouts", docs/search.md 3.5, section 9.2): a full search whose root has 2 .. `root_min_visits_max_actions` options gives each at least k visits when its budget allows (2 x options x k <= its simulations): the self-play seat's recorded searches (never its fast or minor ones) / every evaluation seat. The forced walks come out of the same budget and are left out of the visit counts (the 'visits' target, temperature sampling, the 'visits' rule) and of the root value target; Q, the 'cq' target and the 'cq' rule use them. The evaluation's floor names its Elo pool (`visits-f4`, `cq-n4-v50-s0.3-f4`; `-f4a6` with max_actions 6), self-play's does not. 0 = off: today's searches bit for bit |
+| `selfplay_leaf_value_view`, `eval_leaf_value_view` | mover, mover | whose view a search leaf's value comes from (docs/search.md 3.6, section 16): 'mover' = the network on the leaf's decider's view (today's searches bit for bit); 'root' = a leaf of another seat than the root decider also sends a value-only row of the root decider's view of the same sampled state (same batch, flagged `ROW_VALUE`), whose value and margin it takes (the priors stay the decider's). The self-play seat (remote self-play too: its checkout must have this core) / every evaluation seat; the evaluation's names its Elo pool (`-rv`), self-play's does not |
+| `selfplay_view_samples`, `view_sample_target` | 0.0, next_q | value-only samples (section 16): this share of self-play's recorded decisions also records the real state from each other recording seat's view - its perspective, no options (no policy loss), z its result - with q = that seat's next search's root value ('next_q'; z if none) or z ('z'). 0 = off |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6); its own is refused |
@@ -172,7 +174,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15), `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
@@ -192,7 +194,7 @@ before 2026-10-28 every shard was read first, a peak of the whole window's size)
 `max(min_steps, new samples x reuse / batch)` minibatch steps (uniform with replacement).
 Loss = policy cross-entropy against the recorded policy target - the visit distribution, or
 the completed-Q target with `policy_target='cq'` (section 9) - (log-softmax over the legal
-actions only) + value cross-entropy against `(1 - q) z + q q_root` (softmax over the seats
+actions only; a value-only sample, section 16, has none and is left out of its mean) + value cross-entropy against `(1 - q) z + q q_root` (softmax over the seats
 present) + `margin_loss_w` x 0.5 x squared margin error over the seats present. AdamW, grad
 clip 5, step-decay LR, warmup while the optimizer state is fresh. Feature-width changes are
 handled by prefix reads (an older network reads the first columns) and `widen` (fork_run; a token
@@ -2377,3 +2379,93 @@ with the belief loss a fresh head reads 2.28 from the trunk against 2.54 after t
 it: the auxiliary loss shapes the trunk, at +0.008 nats of held-out policy loss. Stage 2 - dealing the
 search's determinizations from the head's prediction (a `SearchGame::determinize_with` hook, flagged
 belief rows in the leaf batch) - is designed there (66.8), not built.
+
+## 16. Root-view leaf values (MTG Zero's Delver mirror, 2026-10-29)
+
+### 16.1 Why
+
+The search values a leaf with the network on the view of the player to move there (docs/search.md
+3): at a leaf where the opponent decides, the root player's value is read from a view that cannot see
+the root player's hidden cards and that treats the opponent's sampled ones as known. MTG Zero
+measured the bias on its Delver mirror (its ENGINE.md 64.4): a kept landless hand on the draw is
+worth 0.36 to the keeper's own view and 0.51 to the next decider's, and every other leaf of a
+two-player search is the opponent's.
+
+### 16.2 What it does (docs/search.md 3.6)
+
+* **Root-view values** (`selfplay_leaf_value_view` / `eval_leaf_value_view` = 'root'): a leaf of
+  another seat than the tree's root decider takes its priors from its own row, `encode(decider)`, and
+  its value and margin from a second, value-only row `encode(viewer)` in the same batch (flagged
+  `ROW_VALUE` in the batch's `extra`). Evaluators are unchanged.
+* **Value-only samples** (`selfplay_view_samples` = a share of the recorded decisions,
+  `view_sample_target` = 'next_q' | 'z'): the real state from each other recording seat's view, in its
+  perspective, with an empty option segment (no policy target); z its result, q its own next search's
+  root value (or z). They teach the value head the views root-view leaves ask it for: before them it
+  only ever saw `encode(decider)`.
+* **Training** (section 4): a window holding value-only rows takes the policy loss and the policy
+  entropy over the decision rows of each batch only (a mean over the batch's rows with options);
+  the value and margin losses over every row. Metrics `train.value_view` / `value_decision` (the value
+  loss on each kind of row, the last 200 steps) and `window_view_samples`; self-play's `view` (`rows`:
+  value-only rows sent with leaves, `rows_per_leaf`, `samples`: value-only samples recorded). A window
+  without value-only rows trains as before, bit for bit.
+* **Evaluation and tools**: `eval_leaf_value_view` names the Elo pool (`visits-rv`,
+  `cq-n4-v50-s0.3-rv`; after a floor: `-f4-rv`); `zero.h2h` and `zero.replay` follow a run's
+  `eval_leaf_value_view` (`zero.h2h --a-leaf-value-view / --b-leaf-value-view mover | root`
+  override it per side: the same checkpoint with both views is the cheapest test of the search alone).
+
+### 16.3 Off by default
+
+All four settings at their defaults (`mover`, `mover`, 0, `next_q`) are the run of before, byte for
+byte: no seat key is added (`games.nn_seat`), the batches carry `extra` all zero, no row is added, no
+sample recorded, the losses are computed as before. config.json gains the four keys.
+
+### 16.4 Costs
+
+* **Inference**: one extra row per leaf of another seat (about half the leaves of a two-player
+  game). On a CPU (inference-bound) leaves/s drop by a third (MTG Zero's Delver network, 64 games: 1,313
+  -> 887 leaves/s, the same rows/s); a GPU or MPS evaluator, whose cost grows less than its batch, pays
+  less. Not measured on the GPU (A/B round 2 holds it).
+* **Samples**: `selfplay_view_samples` x (players - 1) extra samples per recorded decision - as many
+  more rows in the shards and the window (`ram_budget_gb` holds fewer iterations) and, since the
+  training's steps follow the new samples (`new samples x reuse / batch`), as many more steps.
+* **Remote self-play / evaluation**: the seat keys `leaf_value_view`, `view_samples`,
+  `view_sample_target` go to the remote's driver: its checkout must have this core (an older one
+  refuses an unknown seat key - a visible error, never a silent off).
+
+### 16.5 Tests and checks
+
+Rust: `leaf_view_settings_and_view_pick`, `root_view_off_and_value_samples_leave_the_searches_alone`
+(the golden records and match with the settings at their defaults; value-only samples change nothing
+but add records), `root_view_values_read_the_root_deciders_hand` (`mull_game::HiddenMull`, a
+private-hand keep-or-mulligan: the batch layout, the value from the keeper's own hand in every world),
+`value_only_samples_and_their_targets`, `value_only_samples_carry_the_observers_auxiliary_targets`.
+`tests/test_root_view.py` (12): settings and names (the pool, zerodash, h2h), `view_pick` = the
+Rust hash, Rust vs Python trees at the noise floor with a power check, the binding's 4-tuple, the
+drivers' ('py', 'rs', Rust) samples and targets and flags, toy runs (below).
+
+Checks (tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal; A/B round 2 live on the GPU and the Mac), on main a560448:
+`cargo test --release --workspace` 65 + 3 passed and `queued_setups_are_shared_between_the_groups`
+failed under the machine's load (timing-dependent: it failed 2 of 3 times on the base b486d36 under the
+same load, 14.5; alone it passes 8 of 8); the feature's 5 Rust tests in a debug build too; `pytest tests`
+258 passed, 3 skipped (CUDA); `python -m zero.parity root_view` (docs/search.md 6); toy-smoke runs
+byte for byte against a560448 (its own worktree and target, `ZERO_INFLIGHT=1`), the settings left out
+and given at their defaults - classic, rolling, margin_w 0.2 + chance_k 2 + cq targets + eval_every 2:
+every shard, checkpoint (zip members), optimizer state, Elo file (`updated` aside), models/index.json,
+the metrics without timings; `check_checkpoint_compat --package zero` (random, uniform, a toy
+checkpoint) identical; Glass Road Zero c1f56dc, Caverna Zero a6fad73 and Kingdom Builder Zero 4202a4a
+build against it. MTG Zero (branch `root-view-values`, its ENGINE.md 67): its suites, behaviour
+digests unchanged, `check_checkpoint_compat --package mtgz` with delver2's iteration 41 identical.
+
+### 16.6 What it measured on MTG Zero (its ENGINE.md 67)
+
+On delver2's networks (CPU): the two views of the same real self-play states disagree by 0.077 on
+average (p90 0.21) but neither is biased (the decider's own value minus the other view's: -0.002 over
+13,442 pairs of 192 games), and the value head is about as calibrated on the never-trained other view
+(log loss 0.367, ECE 0.014) as on the decider's (0.358, 0.025): the distribution shift is real but
+small. A 300-step fine-tune with value-only samples improves the other view's held-out log loss
+0.349 -> 0.330, a control without them to 0.334. In searches the views differ more (opponent leaves
+of mulligan searches: 0.11 on average, 73% by more than 0.05); root-view values bring a 0-land keep's
+Q on the draw down to the mulligan's (0.485 -> 0.378 against 0.37 after the fine-tune) but the keep
+rates barely move (the prior holds the visits), and a replay's upkeep Pass the opponent's view valued
+at 0.51 is worth 0.64 with root-view leaves - the move (Brainstorm, prior 0.93) stays.
