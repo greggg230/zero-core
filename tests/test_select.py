@@ -233,6 +233,16 @@ def test_a_cq_run_from_the_start_and_selfplay_select(tmp_path):
     assert (cfg['eval_select'], cfg['eval_select_min_visits'], cfg['selfplay_select']) == ('cq', 2, 'cq')
     p = run_loop(run, '--iters', '2', '--eval-select', 'q')
     assert p.returncode != 0 and "eval_select 'q'" in (p.stdout + p.stderr)
+    # a fork (the self-play A/B, docs/az.md 12.4) takes every pool along and continues the rule's
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools'))
+    import fork_run
+    fk = tmp_path / 'fork'
+    assert fork_run.main(['--source', str(run), '--dest', str(fk), '--iter', '2', '--set', 'selfplay_select="visits"']) == 0
+    assert json.load(open(fk / 'elo' / 'cq-n2' / 'results.json')) == res
+    p = run_loop(fk, '--iters', '3')
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert _pairs(fk, 'cq-n2')['logged'][-1] == 'iter_0003' and not (fk / 'elo' / 'results.json').exists()
 
 
 def test_remote_evaluation_plays_the_runs_rule(tmp_path):
