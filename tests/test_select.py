@@ -194,6 +194,8 @@ def test_a_run_changes_its_eval_rule(tmp_path):
     assert r['select'] == 'cq' and set(r['ratings']) == names
     idx = json.load(open(run / 'models' / 'index.json'))
     assert idx['select'] == 'cq' and {c['iter'] for c in idx['checkpoints']} == {1, 2, 3}
+    assert {c['iter']: c.get('evaluated', True) for c in idx['checkpoints']} == {1: False, 2: False, 3: True}
+    assert idx['best']['iter'] == 3, 'only a checkpoint evaluated with the rule can be best'
     log = open(run / 'log.txt', encoding='utf-8').read()
     assert '(pool cq)' in log and "'select': 'cq'" in log
     from zero import dashboard

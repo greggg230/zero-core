@@ -154,7 +154,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
 | `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, section 5.3), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
-| `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool; with `elo_offsets` an evaluated one); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through raw-offset Elo matches); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
+| `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool; with `elo_offsets` an evaluated one); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
@@ -463,7 +463,8 @@ other pools' files are never written again - nothing to filter, nothing to migra
   (`since`): its Elo matches are those of checkpoints evaluated from then on, against their
   usual opponents (older checkpoints, rated in the new pool through those games only) - no
   replay of the history. `models/index.json` and `best.pt` follow the current rule's pool (the
-  best checkpoint *under the rule the run evaluates with*), and so do the dashboards
+  best checkpoint *evaluated with the rule the run evaluates with*: the older opponents are listed
+  `"evaluated": false` and never best), and so do the dashboards
   (`elo.active_pool`: config.json's rule; zerodash's `runfiles.elo_pool`). The metrics rows'
   `elo` of the earlier iterations keep their old pool's ratings; Elo is comparable within one
   pool only. Back to a rule used before: its pool continues (and plays the Elo matches it lacks
@@ -1237,7 +1238,14 @@ h2h and replays. The experiment's 'q' rule (C) lost to B and was not kept; its m
   visits match 10451580073337998459, a guarded cq-n2 vs cq-n2 match 2225760264326051811).
 * Parity: docs/search.md 6 (the Python rule on Rust roots = the Rust driver's move on all 192
   cases checked; Rust-tree vs Python-tree 'cq' seats in games).
-* Toy-smoke byte for byte against 3c26d9f: SMOKE_IDENT_PLACEHOLDER
+* Toy-smoke byte for byte against 3c26d9f (3 iterations each: classic; rolling; margin_w 0.2 +
+  chance_k 2 + cq targets + eval_every 2), the new settings left out and given at their
+  defaults: metrics.jsonl (timing fields aside), the optimizer state, every shard, elo/results.json,
+  elo/ratings.json (its `updated` aside) and models/index.json identical; every checkpoint's zip
+  members byte for byte (the files themselves differ in the archive's folder name only: torch.save
+  takes it from the temporary file name, which holds the writer's pid). config.json gains the five
+  new keys at their defaults. 85 existing run configs of the game repos (runs/*/config.json and
+  resolvers') pass the new checks and resolve to the rule 'visits'.
 * MTG Zero (its ENGINE.md 57): the production evaluation path (`Run.evaluate`) of delver1's
   newest checkpoint reproduces the experiment's direction; the guard's effect is measured there.
 
