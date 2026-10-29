@@ -2351,3 +2351,29 @@ and predictions; `NetEvaluator.aux` and `set_weights` either way; a toy run with
 heads from iteration 0, two parameter groups, the loss below ln 6), a run off (nothing), a fork of it
 with the target on (the head added at its first training, the trunk's optimizer state kept, the window
 partly masked), replays with and without a head.
+
+Checks (tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal; MTG Zero's A/B round live on the GPU and the Mac), on main
+b486d36: `cargo test --release --workspace` 61 + 3 passed; `pytest tests` 246 passed, 2 skipped (the
+CUDA graph-runner test deselected: it fails without a visible device, as on the base); byte identity
+against b486d36 (its own worktree and target dir), the settings left out and given at their default,
+`ZERO_INFLIGHT=1`: toy-smoke MLP vs `ext:toyheur`, tokens (classic, 3 iterations), cq targets +
+`eval_select cq` guard 2 (rolling, 3), the Delver line's shape (rolling, cq 0.3, guard 4 at 0.3, raw Elo
+offsets, no random games, value_q 0.6, window_cache, train_prefetch; 4) - every shard,
+`elo/results.json`, `ratings.json` (`updated` aside), `models/index.json`, every checkpoint and
+optimizer state tensor for tensor, the metrics without timings, config.json = the base's +
+`aux_next_card_w` 0.0; `check_checkpoint_compat --package zero` (random, uniform, a toy MLP and a toy
+token checkpoint) identical; Glass Road Zero c1f56dc, Caverna Zero a6fad73 and Kingdom Builder Zero
+4202a4a build against it (build_py, every test compiled, the package imported). MTG Zero (branch
+`belief`, its ENGINE.md 66.9): its suites, behaviour digests unchanged, `check_checkpoint_compat
+--package mtgz` with delver2's iteration 41 identical.
+
+### 15.7 What it measured on MTG Zero (its ENGINE.md 66.6)
+
+On 80 held-out Delver games (CPU), a head on delver2's FROZEN trunk predicts the opponent's hand at
+2.60 nats per card against 2.81 for the uniform deal the search uses today and 2.71 for a static
+per-card bias (count-matching); over that bias (a residual head) 2.44. After 400 joint training steps
+with the belief loss a fresh head reads 2.28 from the trunk against 2.54 after the same steps without
+it: the auxiliary loss shapes the trunk, at +0.008 nats of held-out policy loss. Stage 2 - dealing the
+search's determinizations from the head's prediction (a `SearchGame::determinize_with` hook, flagged
+belief rows in the leaf batch) - is designed there (66.8), not built.
