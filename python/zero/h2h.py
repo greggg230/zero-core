@@ -164,6 +164,10 @@ def main(argv=None):
                         help=f"side {side.upper()}'s 'cq' transform (over --cq-c-visit / --cq-c-scale)")
         ap.add_argument(f'--{side}-cq-c-scale', type=float, default=None)
     ap.add_argument('--move-log', type=int, default=0, help='log the first N moves of every game (with --rows)')
+    for side in ('a', 'b'):
+        ap.add_argument(f'--{side}-leaf-value-view', default=None, choices=['mover', 'root'],
+                        help=f"side {side.upper()}'s leaf values' view (docs/search.md 3.6; default: its checkpoint's "
+                             f"run's eval_leaf_value_view)")
     a = ap.parse_args(argv)
     import torch
     torch.set_num_threads(1)
@@ -189,6 +193,12 @@ def main(argv=None):
         sides.append(side_keys(ckpt, rule, mv, cv, cs))
     if (a.cq_c_visit, a.cq_c_scale) != (None, None) and not any(s.get('select') == 'cq' for s in sides):
         ap.error("--cq-c-visit / --cq-c-scale: no side plays 'cq'")
+    for side, keys in zip(('a', 'b'), sides):
+        view = getattr(a, f'{side}_leaf_value_view')
+        if view == 'mover':
+            keys.pop('leaf_value_view', None)
+        elif view == 'root':
+            keys['leaf_value_view'] = 'root'
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
                            spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log)), flush=True)
 

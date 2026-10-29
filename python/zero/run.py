@@ -150,7 +150,7 @@ DEFAULTS = dict(
     # evaluation seat (its moves change: the Elo pool's name gets '-f<k>'). 0 = off (the default:
     # today's searches, bit for bit)
     selfplay_root_min_visits=0, eval_root_min_visits=0, root_min_visits_max_actions=4,
-    # root-view leaf values (docs/search.md 3.6, docs/az.md 5.6): 'mover' = a search leaf's value
+    # root-view leaf values (docs/search.md 3.6, docs/az.md 9.3): 'mover' = a search leaf's value
     # comes from the network on its decider's view (the default: today's searches, bit for bit);
     # 'root' = from the root decider's view of the same (sampled) state - its own hidden cards as
     # they are, the other seats' unknown - in a second, value-only row of the same batch (the priors
@@ -542,7 +542,7 @@ class Run:
         return out
 
     def view_metrics(self, out, st, st0, leaves):
-        """Self-play's root-view metrics (docs/az.md 5.6), only when a setting is on (the metrics of
+        """Self-play's root-view metrics (docs/az.md 9.3), only when a setting is on (the metrics of
         before otherwise): `view` = {rows: value-only rows sent with leaves, rows_per_leaf, samples:
         value-only samples recorded} by this machine's driver."""
         c = self.cfg
@@ -802,7 +802,7 @@ class Run:
                    cache=self.wcache if c.get('window_cache') else None, **kw)
         load_s = time.time() - t1
         steps = max(c['min_steps'], math.ceil(new_samples * c['reuse'] / c['batch']))
-        # value-only samples (no options, docs/az.md 5.6): no policy loss; the policy loss and the
+        # value-only samples (no options, docs/az.md 9.3): no policy loss; the policy loss and the
         # entropy are means over the decisions of a batch. A window without them: the losses of before
         nview = int(np.count_nonzero(np.diff(W.opt_off) == 0))
         vq = value_q_at(c, it)

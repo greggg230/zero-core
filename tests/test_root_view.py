@@ -1,4 +1,4 @@
-"""Root-view leaf values (docs/search.md 3.6, docs/az.md 5.6): run settings selfplay_leaf_value_view /
+"""Root-view leaf values (docs/search.md 3.6, docs/az.md 9.3): run settings selfplay_leaf_value_view /
 eval_leaf_value_view / selfplay_view_samples / view_sample_target, seat keys leaf_value_view /
 view_samples / view_sample_target, `play.view_pick` (= the Rust driver's), the Python reference tree
 and driver against the Rust ones, the value-only samples and their targets, the Elo pool's name, toy
