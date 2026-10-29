@@ -159,7 +159,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
 | `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
-| `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool; with `elo_offsets` an evaluated one); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
+| `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
@@ -250,9 +250,11 @@ latency: `ext_groups` 2, the core default. (Glass Road Zero's bot takes ~0.1 s p
 
 One per game (hub projects `caverna_zero` :5260, `glassroad_zero` :5280: the package's
 `dashboard_port`; title from the package; runs from `<repo>/runs` or `--runs`). Run selector; run state with Pause / Resume; status line
-(self-play progress, last log line age, STOP); tiles (iteration, newest / best Elo, win rate vs
-the yardstick and vs random, self-play games, leaves/s); charts: Elo by iteration (yardstick
-and random reference lines), win rate vs yardstick and random, each checkpoint vs the previous
+(self-play progress, last log line age, STOP); tiles (iteration, newest / best Elo - the best an
+evaluated checkpoint's -, win rate vs the yardstick and vs random, self-play games, leaves/s);
+charts: Elo by iteration (yardstick and random reference lines; the current evaluation rule's
+pool, and the run's other pools as their own lines: section 5.4), win rate vs yardstick and
+random, each checkpoint vs the previous
 one, losses, self-play average score, leaves/s, minutes per iteration by phase; head-to-head
 table of the newest checkpoint with the Elo prediction; iteration table; log and supervisor
 tails. With no runs it shows how to start one. Endpoints: `GET /api/runs`,
@@ -618,11 +620,16 @@ other pools' files are never written again - nothing to filter, nothing to migra
   usual opponents (older checkpoints, rated in the new pool through those games only) - no
   replay of the history. `models/index.json` and `best.pt` follow the current rule's pool (the
   best checkpoint *evaluated with the rule the run evaluates with*: the older opponents are listed
-  `"evaluated": false` and never best), and so do the dashboards
-  (`elo.active_pool`: config.json's rule; zerodash's `runfiles.elo_pool`). The metrics rows'
-  `elo` of the earlier iterations keep their old pool's ratings; Elo is comparable within one
-  pool only. Back to a rule used before: its pool continues (and plays the Elo matches it lacks
-  for the iterations evaluated meanwhile - k >= its `since` -, at the old rule).
+  `"evaluated": false` - in the pool's ratings.json too - and never best), and so do the
+  dashboards (`elo.active_pool`: config.json's rule; zerodash's `runfiles.elo_pool`; both take
+  their "best" among the evaluated checkpoints). zero's dashboard draws the run's other pools
+  (`elo.other_pools`) as their own lines next to the current one, with a legend - one chart, never
+  one fit: the lines share the yardstick's 1000 but are refit apart. The metrics rows' `elo` of
+  the earlier iterations keep their old pool's ratings; Elo is comparable within one pool only.
+  Back to a rule used before: its pool continues (and plays the Elo matches it lacks for the
+  iterations evaluated meanwhile - k >= its `since` -, at the old rule); the checkpoints those
+  matches rate were evaluated with the other rule, so this pool flags them too (`"evaluated":
+  false` whenever the run has another pool) and none of them becomes `best.pt`.
 * **On a remote**: the remote plays the run's rule and owns its pool (`elo/<rule>/` on the
   mirror, copied back); a result naming another rule is refused (5.2).
 
@@ -634,19 +641,30 @@ between (MTG Zero's delver1: iteration 12, evaluated at `eval_every` 4, never pl
 every iteration writes a checkpoint) whatever `eval_every`, and `elo_opponents` is not used.
 The opponents that were never evaluated join the pool as players rated only through these games
 (the fit needs no yardstick games for them; `logged` lists the evaluated ones only), are listed
-in `models/index.json` with `"evaluated": false`, and are never `best.pt` (nor the dashboard's
-"best"); the remote ships them (5.2). '' (the default) keeps the evaluations-back offsets
-exactly.
+in the pool's `ratings.json` and in `models/index.json` with `"evaluated": false`, and are never
+`best.pt` (nor either dashboard's "best"); the remote ships them (5.2). '' (the default) keeps
+the evaluations-back offsets exactly, and a default run's pool flags nothing (its ratings.json
+and index.json as before the flag).
 
 **No random games** (`eval_random_games` 0): no match against the random bot (no `eval_random`
-row: the Elo code, the dashboards and the remote work without it; the dashboards show no "vs
-random" value). The reference games still rate the random bot against the yardstick (bots only,
+row: the Elo code, the dashboards and the remote work without it). A run that turns it off at a
+restart keeps its older rows: the dashboard's "vs random" tile then names the iteration of its
+newest value. The reference games still rate the random bot against the yardstick (bots only,
 `ref_games` once per pool; 0 = not at all).
 
 Default runs are unchanged: toy-smoke (classic; rolling; margin_w + chance_k + cq targets with
 `eval_every` 2) gives the same metrics (timing aside), checkpoints, optimizer states, shards, Elo
 files and models/index.json byte for byte as zero-core 3c26d9f, with the settings left out or
 given explicitly at their defaults (section 12.3). Tests: `tests/test_select.py`.
+
+**Changing a live run's rule** (MTG Zero's delver1 at its re-pin, its ENGINE.md 57): stop it at
+an iteration boundary, re-pin, restart with `--eval-select cq --eval-select-min-visits N` (and,
+if wanted, `--eval-random-games 0 --elo-offsets 1,2,4,8`). The next evaluation (here or on the
+`eval_remote`, whose checkout must have the rule: a remote without it is refused, 5.2) begins
+the rule's pool `elo/<rule>/` at that iteration: 100-ish reference games once (`ref_games`), the
+checkpoint's yardstick games, its Elo matches against its raw offsets; `elo/` and the metrics'
+older `elo` rows are left as they were. A toy rehearsal of exactly this (a remotely evaluated run
+re-pinned with those flags): section 12.3.
 
 ## 6. Learning: the toy proof run (Glass Road Zero 2026-10-11; Caverna Zero 2026-10-10)
 
@@ -1401,6 +1419,21 @@ worse, so argmax visits mostly plays the prior; B lets Q overrule it. The user's
 (2026-10-28): B as an opt-in setting with today's rule the default everywhere; delver1's
 evaluation switches to B at its next re-pin; self-play later, by a forked A/B run.
 
+Then on the production path (`Run.evaluate` with `eval_select`, MTG Zero's tools/select_eval.py,
+its ENGINE.md 57; 200 games a cell against the heuristic at `eval_sims` 32, paired deals):
+
+| checkpoint | visits | cq | cq, >= 2 visits | cq, >= 4 visits |
+|---|---|---|---|---|
+| iter 12 | 46.0% | **61.5%** | - | - |
+| iter 26 | 71.0% | 77.0% | **77.5%** | 76.5% |
+| iter 27 | 71.0% | 73.0% | 73.5% | **76.5%** |
+
+Paired against visits, iterations 26 + 27 (400 games): cq +4.0 +- 2.6 points, cq-n2 +4.5 +- 2.6,
+cq-n4 +5.5 +- 2.5; between the guards within 1.5 +- 2.0. Head to head at iteration 27 (the same
+checkpoint, cq vs visits, 200 games): 51.0 +- 3.5%. The gain shrinks as the network improves
+(+15.5 points at iteration 12, +2 to +6 at 26-27); the recommended re-pin of delver1 uses the guard 4 (MTG Zero
+ENGINE.md 57.4).
+
 ### 12.2 What was built
 
 `driver::Select` (docs/search.md 3.3: 'visits' | 'cq' + the guard), seat keys `select` /
@@ -1426,8 +1459,21 @@ h2h and replays. The experiment's 'q' rule (C) lost to B and was not kept; its m
   takes it from the temporary file name, which holds the writer's pid). config.json gains the five
   new keys at their defaults. 85 existing run configs of the game repos (runs/*/config.json and
   resolvers') pass the new checks and resolve to the rule 'visits'.
+* The same byte-for-byte comparison again after the "evaluated" flags (a167ee2; and on
+  feat/select-rule-on-queue against 9453e18): a default run's ratings.json and index.json carry
+  no flag; `tools/check_checkpoint_compat.py --package zero` (random, uniform and a checkpoint's
+  evaluator: self-play records and results for both targets, the match vs random) identical.
+* A toy rehearsal of delver1's re-pin: a run evaluated by the remote 'local' at the default rule
+  (iterations 0-4, `eval_every` 2), restarted with `--eval-select cq --eval-select-min-visits 4
+  --eval-random-games 0 --elo-offsets 1,2,4,8 --elo-games 25` (iterations 5-8): the run's and
+  the mirror's `elo/` byte for byte as before, `elo/cq-n4/` since 6 with iterations 6 and 8
+  logged and their raw-offset matches (k-1, k-2, k-4, k-8) of 25 games, the reference games once,
+  the other checkpoints flagged, evals.jsonl rows tagged, no random games, both dashboards on
+  the new pool (zero's with the 'visits' line).
 * MTG Zero (its ENGINE.md 57): the production evaluation path (`Run.evaluate`) of delver1's
-  newest checkpoint reproduces the experiment's direction; the guard's effect is measured there.
+  checkpoints reproduces the experiment's direction (12.1); the guard's effect is measured there;
+  its engine tests and pytest at the pin; the other games (Glass Road, Caverna, Kingdom Builder)
+  build against the core.
 
 ### 12.4 A self-play A/B (not run)
 
