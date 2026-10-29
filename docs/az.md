@@ -954,6 +954,17 @@ Python driver's 'py' and 'rs' seats and the Rust driver prune alike; toy runs: t
 defaults byte for byte, self-play's floor changes the shards and not the pool, the evaluation's floor
 changes the pool and not the training).
 
+Checks (5ce50d4, on main f57ee57; CPU only): `cargo test --release --workspace` 59 + 3 passed (the
+feature's 9 also in a debug build); `pytest tests` 228 passed, the 3 CUDA tests skipped; toy-smoke runs
+byte for byte against f57ee57 (classic; rolling; margin_w 0.2 + chance_k 2 + cq targets + eval_every
+2), the settings left out and given at their defaults (config.json gains the three keys); the golden
+records and match unchanged; `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy
+checkpoint) identical; Glass Road Zero, Caverna Zero (and its wasm crate) and Kingdom Builder Zero
+build against it; MTG Zero: its `az` tests and pytest, and delver2's checkpoint plays identically on
+its main's build and this one (its ENGINE.md 64.7). With feat/league (this branch is rebased on it):
+the seat keys, `NnSeat`'s fields, the Python `NNSeat` and the driver tests met textually, both sides
+kept; a league opponent's unrecorded seat is the self-play seat, so it takes the self-play floor too.
+
 ## 10. The token network (arch 'tokens', `net.TokenNet`; MTG Zero M5b, 2026-10-22)
 
 A transformer over the game's objects for games whose state is a variable set of things (MTG:
