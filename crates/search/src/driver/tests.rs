@@ -815,8 +815,15 @@ fn queued_setups_are_shared_between_the_groups() {
     }
     rows.extend(d.take_results());
     assert_eq!(rows.len(), 8);
-    assert_eq!(&sizes[..2], &[(0, 1), (1, 1)], "one setup each as they arrive: {sizes:?}");
-    assert_eq!(&sizes[2..4], &[(0, 4), (1, 4)], "then 4 and 4: {sizes:?}");
+    // (in either order: a queue_only driver serves whichever group is ready first - on a loaded
+    // machine group 1's first search can finish before group 0's)
+    let pair = |a: &[(usize, usize)]| {
+        let mut v = a.to_vec();
+        v.sort();
+        v
+    };
+    assert_eq!(pair(&sizes[..2]), vec![(0, 1), (1, 1)], "one setup each as they arrive: {sizes:?}");
+    assert_eq!(pair(&sizes[2..4]), vec![(0, 4), (1, 4)], "then 4 and 4: {sizes:?}");
     assert!(sizes.iter().all(|&(_, b)| b <= 4), "{sizes:?}");
     // a game's play depends on its setup and gid only: the same rows with one group
     let mut c1 = c;
