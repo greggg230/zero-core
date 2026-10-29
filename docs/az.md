@@ -142,6 +142,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_league` | 0.0 | the self-play league (section 14): this share of the self-play games (exactly, over each driver's started games) puts a past checkpoint of the run in one seat; only the current network's decisions become samples. 0 = off (every game the current network's mirror, as before). Single-game runs (co-training refuses it) |
 | `selfplay_league_pool` | '2,4,8,16,32' | the past checkpoints it may play: raw iteration offsets back from the network that self-plays (iteration i self-plays with i-1: offset 2 = checkpoint i-3), those that exist; 'all' = every earlier checkpoint (fictitious self-play) |
 | `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
+| `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
 
 ## 2. Run control (`runctl.py`)
 
@@ -171,9 +172,9 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15), `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
-| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
+| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
 | `elo/<rule>/results.json`, `elo/<rule>/ratings.json` | the pool of another evaluation move rule ('cq', 'cq-n2', ...; section 5.4): the same files, plus `select` (the rule) and `since` (the first iteration it rated) |
@@ -2245,3 +2246,108 @@ read it with an h2h of the two K + N checkpoints at the same move rule (as the p
 selection A/Bs, 9 and 12.5). Watch `selfplay.league.win` (the network's score against its own past:
 a mirror run's policy that drifts in a cycle shows it falling against some checkpoints) and
 `train.entropy`. MTG Zero's flags: its ENGINE.md 63.
+
+## 15. Auxiliary training targets (`zero/auxtarget.py`; MTG Zero's belief head, 2026-10-29)
+
+### 15.1 Why
+
+A network trained on self-play learns what wins; whether its trunk also tracks what it cannot see is
+another question. MTG Zero's Delver mirror (its ENGINE.md 66) wants a head that predicts the
+opponent's hidden hand from public information - "they left blue open and passed: likely Daze or
+Force of Will" - first as a measurement (does the trunk carry it?) and as an auxiliary loss that may
+shape the trunk (KataGo's ownership and score targets are the precedent), later as the prior of the
+search's determinization (stage 2, its ENGINE.md 66.8: designed, not built). The core part is
+generic: a game declares per-decision labels computed from the TRUE state, the driver records them,
+the network predicts them, training adds their loss. An unmerged branch had end-of-game targets
+(`aux-targets`: Kingdom Builder's ownership and score); these are per decision and may be hidden
+information.
+
+### 15.2 What it does
+
+* **The game** (docs/search.md 1.2): `SearchGame::AUX` = segments `(name, width)`,
+  `aux_target(viewer, out)` = the label vector of the pending decision for its decider, from the true
+  state (a label, never an input: `encode` stays blind; each game tests that worlds determinized for
+  the decider encode alike while their targets differ). The toy: `next_card`, the next round's hidden
+  card (one-hot over 6; none in the last round).
+* **The game package** (zero/package.py `aux`): `{game: [{name, width, loss}]}` in the engine's
+  segment order; loss 'multinomial' | 'poisson' | 'mse' (`net.AUX_LOSSES`). A run checks the names and
+  widths against the engine's (`aux_layout` of `game_info_of`). Each target gets the run setting
+  `aux_<name>_w` (DEFAULTS, default 0.0); `replay_aux` renders a checkpoint's head in replays (15.5).
+* **Recording**: a weight > 0 creates every self-play driver with `aux=True` (this machine's, rolling,
+  the shared queue's, remote workers': `Run.driver(record=True)`); each recorded decision gets its
+  decider's target (`Record::aux`, also through parked deferred games), `take_samples()['aux']` f32
+  [N, W], shards `aux` float16 [N, W] (the non-finite guard checks it). A remote shard without targets
+  in a run that wants them is accepted and logged (its checkout predates the run's targets).
+* **Windows**: `Window(aux_width=W)` loads `aux` and `aux_mask` per row; a shard without targets (a
+  fork's older window, a run before the targets) gives zeros with mask 0, so its rows still train the
+  policy / value / margin and the auxiliary losses skip them. The window cache keys its shards by the
+  width too. Budget: 2 W + 1 more bytes per row (MTG Zero's 1,024-wide belief: +2.7% of a Delver row).
+* **The head** (zero/net.py): config key `aux` = `[[name, width, loss], ...]`; ONE MLP from the trunk's
+  pooled state - where value and margin read it: `Net`'s h, `GridNet`'s e, `TokenNet`'s z (the global
+  token and the tokens' mean) - to `head` (128) to W, built after every other parameter (a network
+  with the head initialises the rest exactly as one without), its last layer zero. Only
+  `forward(x, n, aux=True)` returns it (a fourth output: the raw values), so self-play's and the
+  evaluations' inference - eager, CUDA graphs, remote - is the network of before. `aux_predict` turns
+  the raw values into predictions: 'multinomial' a softmax over the segment, 'poisson' exp (rates),
+  'mse' as is.
+* **Losses** (zero/auxtarget.py), per row, averaged over the rows that have a target: 'multinomial' =
+  cross-entropy against the counts normalised to sum 1 (-sum_k t_k / n log p_k): the head learns the
+  composition, and n x p is the expected count given the total - right when the total is public (a
+  hand's size), and what stage 2 needs (an urn's weights). A row whose segment is all zero has no
+  target (an empty hand). 'poisson' = mean_k exp(o_k) - t_k o_k (counts without a known total); 'mse'.
+  The training loss adds `aux_<name>_w` x each; metrics `train.aux_<name>`, `aux_<name>_hit` (a
+  multinomial target's most likely column is in the target), `train.aux` (rows with targets, their
+  share, the mean total and non-empty share, the weights, `head_added`); the non-finite guard checks
+  the auxiliary losses too.
+* **Inference API** (zero/infer.py): `NetEvaluator.aux(x, n_players)` -> `{name: predictions [B, w]}`,
+  one forward pass of the given rows (a decision's root); `{}` without a head. The search's own
+  batches never compute the head (an additive method: `evaluate`, `launch` / `result` and the leaf
+  batch protocol are unchanged). `set_weights` takes a state with or without the head either way (a
+  rolling evaluator built from a checkpoint without the head, a run that turned it on later).
+
+### 15.3 Off by default
+
+Every weight 0 (the default): no driver records, no network has the head, `Window` loads nothing more,
+the optimizer and the losses are the code of before line for line; config.json gains one key per
+declared target (0.0). Checked byte for byte (15.6).
+
+### 15.4 Carry-over: a checkpoint without the head
+
+`net.add_aux(model, layout, seed)` returns a copy with a fresh head (seeded; the global torch RNG
+untouched) and every other parameter and buffer exactly the checkpoint's, so its policy, value and
+margin are unchanged (tested on the three archs: outputs equal, states equal); a network with that
+head is returned as is, one with another head refused (`strip_aux` first). The run does it itself: a
+run with a weight on whose checkpoint has no head - a fork of a run without one, `tools/fork_run.py
+--source <run> --dest <fork> --iter K --set aux_<name>_w=0.5` - adds the head at its first training
+(logged; `train.aux.head_added`), keeps the optimizer's AdamW moments for the trunk (the saved state
+of one parameter group fits the trunk's parameters: it is loaded, and the head joins as a second
+group with fresh moments) and trains on the window whose older shards have no targets (masked). Every
+later checkpoint has the head and two parameter groups. The encoding guard (10.4) ignores the head (it
+reads no input): such a checkpoint loads, resumes and is checked like any. A new run with a weight on
+builds its first network with the head.
+
+### 15.5 Replays (`zero.replay`, format 'zero-replay/1' extended)
+
+A network seat whose checkpoint has a head lists its targets (`seats[i].aux`) and each of its
+decisions' frames gets the game package's `replay_aux(predictions, state, seat, frame)` fields - the
+head at the decision's root for the decider: one forward pass of the root's features after its search
+(the search's evaluations do not compute the head, and a reused tree's root was evaluated during an
+earlier search, so the root's own pass is the one that exists for every decision) - by default
+`aux: {name: [[column, value], ...]}` (each target's 12 largest). MTG Zero renders `belief: {for, n,
+cards: [[name, expected count], ...]}` (its ENGINE.md 66.5). A checkpoint without a head: the frames of
+before. Readers of the format that do not know the fields ignore them.
+
+### 15.6 Tests and checks
+
+Rust: `aux_target_is_the_hidden_next_card_and_never_an_input` (the toy's target is its hidden card;
+determinized worlds encode alike, their targets their own), `aux_records_the_decider_targets_and_
+changes_nothing_else` (the golden records with aux on and off; each record's target its decision's,
+replayed move for move; a game without targets refuses aux). `tests/test_aux.py` (18): the package's
+declaration and setting, off by default, a negative weight refused; the binding's target and
+determinize; the driver's records (every other array identical); shards and windows (old shards masked,
+the cache, a wrong width refused); the head on the three archs (built last, outputs unchanged, last layer
+zero), `add_aux` / `strip_aux` exact; a checkpoint with the head through the encoding guard; the losses
+and predictions; `NetEvaluator.aux` and `set_weights` either way; a toy run with the target on (shards,
+heads from iteration 0, two parameter groups, the loss below ln 6), a run off (nothing), a fork of it
+with the target on (the head added at its first training, the trunk's optimizer state kept, the window
+partly masked), replays with and without a head.

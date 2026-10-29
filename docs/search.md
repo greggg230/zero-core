@@ -160,6 +160,20 @@ over (`to_move()` None) at a **deferred terminal**: `deferred()` is true until `
   `cq_c_scale` keep their meaning. Evaluation seats teams alternately with this rule
   (docs/az.md 11). Default 1: every seat alone, the utility as before (bit for bit).
 
+### 1.2 Auxiliary targets (opt-in; MTG Zero's belief head, 2026-10-29)
+
+A game may declare per-decision **auxiliary targets** (docs/az.md 15): `const AUX` names the
+segments `(name, width)` of a label vector of `aux_width()` floats, and `aux_target(viewer, out)`
+writes it for the pending decision from the **true** state. Unlike everything else the search
+reads, it may hold what `viewer` cannot see - MTG Zero's `belief` is the opponent's actual hand by
+card identity - because it is a training label, never an input: `encode` stays blind to it (a
+game tests that worlds determinized for the decider encode alike while their targets differ: the
+toy's `aux_target_is_the_hidden_next_card_and_never_an_input`, MTG Zero's
+`the_belief_target_is_the_true_opponent_hand_and_never_an_input`). The toy's target `next_card` is
+the next round's card, hidden until its round (a one-hot over the 6 cards; zero in the last round).
+Default: no targets (`AUX` empty). The loss of each segment is the game package's (zero/package.py
+`aux`). A driver created with `aux` records it (2.4); `Game.aux_target(viewer)` returns it.
+
 ## 2. The driver protocol (Python <-> Rust)
 
 ```python
@@ -247,7 +261,10 @@ seat's policy target over the options: the visit distribution, or the completed-
 `policy_target='cq'`, section 3.1), `z` [N, 8] (final `result()` relative to the decider), `q`
 [N, 8] (root search win estimate `wsum / tot`, relative; = z if no backups), `sc` [N, 8]
 (`margin()` per relative seat), `net` (network id of the search, rolling mode). A game's
-samples are emitted when it ends.
+samples are emitted when it ends. A driver created with `aux=True` (`DriverCfg::aux`; the game must
+have targets, else the driver refuses) adds `aux` f32 [N, W]: each row's decider's
+`aux_target` at that decision (section 1.2), computed when the decision is recorded; every other
+array is the same with it on or off (tested: the golden records).
 
 ### 2.5 Results (`take_results`)
 

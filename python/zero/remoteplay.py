@@ -1154,6 +1154,11 @@ class RemotePlay:
             with self.mu:
                 self.fatal = NonFinite(msg)
             return 'quarantined', 0, None
+        if getattr(self.R, 'aux', None) and 'aux' not in sh:
+            # (accepted - its policy / value rows train as any - but its auxiliary rows are masked:
+            # the remote's checkout predates the run's auxiliary targets, docs/az.md 15)
+            self.log(f'shard {name} of iteration {it} has NO auxiliary targets (the run trains {self.R.aux}): '
+                     f"is the remote's checkout the run's?")
         return 'ok', int(meta.get('rows', len(sh['player']))), sh.get('net')
 
 
