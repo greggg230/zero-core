@@ -22,7 +22,7 @@ import random
 import numpy as np
 
 from . import mcts
-from .protocol import LeafBatch, MAX_SEATS, concat_samples
+from .protocol import LeafBatch, MAX_SEATS, ROW_LEAF, ROW_VALUE, concat_samples
 
 
 POLICY_TARGETS = ('visits', 'cq')
@@ -379,9 +379,9 @@ class PyDriver:
             for it in items:
                 slot, seat, tree, player, x, acts, vx = it
                 b = len(rows)
-                rows.append((x, acts, player, slot))
+                rows.append((x, acts, player, slot, ROW_LEAF))
                 if vx is not None:
-                    rows.append((vx, [], tree.t.viewer, slot))
+                    rows.append((vx, [], tree.t.viewer, slot, ROW_VALUE))
                 refs.append((slot, seat, tree, b, len(rows) - 1))
             off = np.zeros(len(rows) + 1, np.int32)
             off[1:] = np.cumsum([len(r[1]) for r in rows])
@@ -390,7 +390,8 @@ class PyDriver:
                  'opt_action': np.asarray([x for r in rows for x in r[1]], np.int32),
                  'player': np.asarray([r[2] for r in rows], np.int32),
                  'n_players': np.asarray([r[3].n for r in rows], np.int32),
-                 'gid': np.asarray([r[3].gid for r in rows], np.int64)}
+                 'gid': np.asarray([r[3].gid for r in rows], np.int64),
+                 'extra': np.asarray([r[4] for r in rows], np.uint8)}
             lb = LeafBatch(self.next_bid, key, 'nn', a)
             self.outstanding[self.next_bid] = (lb, refs)
             self.next_bid += 1

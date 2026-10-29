@@ -391,6 +391,14 @@ pub struct Record {
     pub aux: Vec<f32>,
 }
 
+/// The kind of a network batch row (`Batch::extra`, docs/search.md 2.2): a leaf's own row (or a
+/// deferred terminal's).
+pub const ROW_LEAF: u8 = 0;
+/// An extra row of the leaf row before it: its tree viewer's value-only row (no options;
+/// `LeafView::Root`, docs/search.md 3.6). Extra rows are flagged by kind so that other features can
+/// add their own (a kind > 0 always belongs to the closest leaf row before it, of the same game).
+pub const ROW_VALUE: u8 = 1;
+
 /// A batch for one evaluator key (docs/search.md 2.2).
 #[derive(Clone, Debug, Default)]
 pub struct Batch {
@@ -407,6 +415,8 @@ pub struct Batch {
     pub player: Vec<i32>,
     pub n_players: Vec<i32>,
     pub gid: Vec<i64>,
+    /// Network batches: the kind of every row (`ROW_LEAF`, or an extra row's kind: `ROW_VALUE`).
+    pub extra: Vec<u8>,
     /// External batches: the exported state per row.
     pub states: Vec<String>,
 }
@@ -420,6 +430,7 @@ struct LeafBuf {
     gid: Vec<i64>,
     nopt: Vec<i32>,
     opt_action: Vec<i32>,
+    extra: Vec<u8>,
     states: Vec<String>,
 }
 
@@ -431,6 +442,7 @@ impl LeafBuf {
         self.gid.clear();
         self.nopt.clear();
         self.opt_action.clear();
+        self.extra.clear();
         self.states.clear();
     }
     fn len(&self) -> usize {
@@ -683,6 +695,7 @@ struct Dest {
     gid: *mut i64,
     opt_off: *mut i32,
     opt_action: *mut i32,
+    extra: *mut u8,
 }
 
 // SAFETY: a Dest points into the heap buffers of a batch owned by the group's `Asm`, which

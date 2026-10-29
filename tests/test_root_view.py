@@ -1,4 +1,4 @@
-"""Root-view leaf values (docs/search.md 3.6, docs/az.md 9.3): run settings selfplay_leaf_value_view /
+"""Root-view leaf values (docs/search.md 3.6, docs/az.md 16): run settings selfplay_leaf_value_view /
 eval_leaf_value_view / selfplay_view_samples / view_sample_target, seat keys leaf_value_view /
 view_samples / view_sample_target, `play.view_pick` (= the Rust driver's), the Python reference tree
 and driver against the Rust ones, the value-only samples and their targets, the Elo pool's name, toy
@@ -15,7 +15,7 @@ import pytest
 
 from zero import elo, games as G, h2h, mcts, parity
 from zero.play import NNSeat, PyDriver, view_pick
-from zero.protocol import concat_samples, validate_samples
+from zero.protocol import ROW_LEAF, ROW_VALUE, concat_samples, validate_batch, validate_samples
 from zero.run import DEFAULTS, Run, check_eval_settings, read_metrics
 
 from test_select import _Rand
@@ -145,6 +145,8 @@ def _rows_checked(ev):
     def f(lb):
         off, a = lb.opt_off, lb.a
         cnt = np.diff(off)
+        validate_batch(lb, G.info('toy')['num_features'], G.info('toy')['num_actions'])
+        assert np.array_equal(a['extra'], np.where(cnt == 0, ROW_VALUE, ROW_LEAF).astype(np.uint8))
         for b in np.where(cnt == 0)[0]:
             assert b > 0 and cnt[b - 1] >= 2 and a['gid'][b] == a['gid'][b - 1] and a['player'][b] != a['player'][b - 1]
         f.view_rows += int((cnt == 0).sum())

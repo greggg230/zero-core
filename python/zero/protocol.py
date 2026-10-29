@@ -11,9 +11,12 @@ A network batch ('nn') holds B leaves:
 | `player` | i32 [B] | deciding seat (absolute) |
 | `n_players` | i32 [B] | players in that game |
 | `gid` | i64 [B] | game index |
+| `extra` | u8 [B] | the row's kind: `ROW_LEAF` (0) a leaf's own row, else an extra row of the closest leaf row before it (same game): `ROW_VALUE` (1) = its tree viewer's value-only row, no options (root-view leaf values, docs/search.md 3.6) |
 
 A deferred terminal (`SearchGame::deferred`, docs/search.md 3.2) is a leaf with an empty option
-segment: the evaluator returns its value and margin and no priors.
+segment: the evaluator returns its value and margin and no priors. So is a `ROW_VALUE` row; an
+evaluator answers every row alike (the driver reads what it needs from each), so it can ignore
+`extra`.
 
 The answer: `priors` f32 [sum] (softmax over each leaf's legal actions), `value` f32 [B, 8]
 (P(win) per seat RELATIVE to the decider: column j = seat (player + j) % n_players; columns
@@ -26,6 +29,7 @@ An external batch ('ext') holds B requests: `states` (list of str: the game's
 import numpy as np
 
 MAX_SEATS = 8
+ROW_LEAF, ROW_VALUE = 0, 1                 # `extra`: a leaf's own row / its tree viewer's value-only row
 SAMPLE_KEYS = ('x', 'player', 'n_players', 'opt_off', 'opt_action', 'pi', 'z', 'q', 'sc', 'net')
 # in some sample dicts only: 'aux' f32 [N, W] = the deciders' auxiliary targets (a driver created with
 # aux=True: `SearchGame::aux_target`, docs/search.md 1.2, docs/az.md 15); per sample row, like `x`
@@ -82,6 +86,18 @@ def validate_batch(lb, num_features=None, num_actions=None):
         seg = act[off[b]:off[b + 1]]
         assert len(set(seg.tolist())) == len(seg), 'duplicate legal action'
     assert np.all((a['player'] >= 0) & (a['player'] < a['n_players']))
+    ex = a.get('extra')
+    if ex is None:                          # (a batch made by hand: every row a leaf's)
+        return
+    assert ex.dtype == np.uint8 and ex.shape == (B,)
+    for b in np.flatnonzero(ex):
+        lead = b - 1
+        while lead >= 0 and ex[lead]:
+            lead -= 1
+        assert lead >= 0 and a['gid'][lead] == a['gid'][b], 'an extra row without its leaf row before it'
+        if ex[b] == ROW_VALUE:
+            assert cnt[b] == 0 and a['player'][b] != a['player'][lead], 'a value-only row: no options, the viewer'
+
 
 
 def validate_evaluation(lb, priors, value, margin):

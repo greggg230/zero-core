@@ -771,6 +771,7 @@ impl PySearchDriver {
         a.set_item("x", b.x.into_pyarray(py).reshape([n, self.nfeat])?)?;
         a.set_item("opt_off", b.opt_off.into_pyarray(py))?;
         a.set_item("opt_action", b.opt_action.into_pyarray(py))?;
+        a.set_item("extra", b.extra.into_pyarray(py))?;
         Ok(Some((b.id, key, "nn", a).into_pyobject(py)?.into_any().unbind()))
     }
 }

@@ -1692,6 +1692,8 @@ fn answer_hmull(d: &mut Driver<HiddenMull>, b: &Batch) -> usize {
     let mut vrows = 0;
     for r in 0..b.b {
         let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+        // (no deferred terminals here: a row without options is a flagged value-only row)
+        assert_eq!(b.extra[r], if k == 0 { ROW_VALUE } else { ROW_LEAF }, "row {r}'s kind");
         if k == 0 {
             vrows += 1;
             let leaf_before = r > 0 && b.gid[r] == b.gid[r - 1] && b.player[r] != b.player[r - 1] && b.opt_off[r] > b.opt_off[r - 1];
@@ -1790,4 +1792,18 @@ fn value_only_samples_and_their_targets() {
     assert!((150..250).contains(&st.view_recorded), "{}", st.view_recorded);
     let dec: Vec<Record> = half.iter().filter(|r| !r.opts.is_empty()).cloned().collect();
     assert_eq!(records_digest(&dec), records_digest(&all));
+}
+
+#[test]
+fn value_only_samples_carry_the_observers_auxiliary_targets() {
+    // with auxiliary targets on (`DriverCfg::aux`) a value-only record gets its observer's targets
+    // (`aux_target(observer)` of the real state: a label only), so every record has the same width
+    let mut c = cfg(vec![with_view(nn(0, 16, true), LeafView::Root, 1.0, ViewTarget::NextQ)], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.aux = true;
+    let (_, recs) = run(&mut Driver::<ToyGame>::new(c).unwrap());
+    let w = ToyGame::aux_width();
+    assert!(recs.iter().any(|r| r.opts.is_empty()) && recs.iter().all(|r| r.aux.len() == w));
+    let a = sample_arrays(&recs, ToyGame::NUM_FEATURES);
+    assert_eq!((a.aw, a.aux.len()), (w, recs.len() * w));
 }

@@ -374,6 +374,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 buf.player.push(player as i32);
                 buf.n_players.push(slot.n as i32);
                 buf.gid.push(slot.gid as i64);
+                buf.extra.push(ROW_LEAF);
                 // root-view leaf values (docs/search.md 3.6): another seat's leaf also sends a
                 // value-only row (no options) of the tree's viewer, the root decider, right after it
                 let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
@@ -385,6 +386,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                     buf.player.push(tree.viewer as i32);
                     buf.n_players.push(slot.n as i32);
                     buf.gid.push(slot.gid as i64);
+                    buf.extra.push(ROW_VALUE);
                     n.view_rows += 1;
                 }
                 slot.pending = Some(Pending::Leaf { key: seat.key, local, seat: p, node, vrow });
@@ -698,6 +700,7 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
         bt.gid = vec![0; b];
         bt.opt_off = vec![0; b + 1];
         bt.opt_action = vec![0; nopt];
+        bt.extra = vec![ROW_LEAF; b];
         let dest = Dest {
             x: bt.x.as_mut_ptr(),
             player: bt.player.as_mut_ptr(),
@@ -705,6 +708,7 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
             gid: bt.gid.as_mut_ptr(),
             opt_off: bt.opt_off.as_mut_ptr(),
             opt_action: bt.opt_action.as_mut_ptr(),
+            extra: bt.extra.as_mut_ptr(),
         };
         asm.keys.push(AsmKey { key: k, dest, row_base, opt_base });
         asm.batches.push(bt);
@@ -740,6 +744,7 @@ fn fill_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize) {
             std::slice::from_raw_parts_mut(d.n_players.add(rb), n).copy_from_slice(&x.n_players);
             std::slice::from_raw_parts_mut(d.gid.add(rb), n).copy_from_slice(&x.gid);
             std::slice::from_raw_parts_mut(d.opt_action.add(ob), no).copy_from_slice(&x.opt_action);
+            std::slice::from_raw_parts_mut(d.extra.add(rb), n).copy_from_slice(&x.extra);
             let oo = std::slice::from_raw_parts_mut(d.opt_off.add(rb + 1), n);
             let mut o = ob;
             for l in 0..n {
