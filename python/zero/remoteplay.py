@@ -1,14 +1,30 @@
-"""Remote self-play (docs/az.md 5.3; co-training 11.6): another machine self-plays for a run with
-the run's checkpoint i-1 while the run self-plays iteration i here, and its sample shards come
-back into `data/iter_i/`; in a co-training run it plays a share of the resolver's queued episodes
-instead, their result rows going back into the coordinator by tag.
+"""Remote self-play (docs/az.md 5.3; co-training 11.6): another machine self-plays for a run, and
+both machines pull an iteration's work from one shared queue (zero/workqueue.py).
+
+* **A single-game run**: iteration i needs `games` finished games in total, across this machine
+  and the remote's workers, all searched with checkpoint i-1 (the remote's sample shards come back
+  into `data/iter_i/`). Every machine starts games as it has room under its in-flight cap (its
+  measured throughput's share of the iteration's games x `selfplay_remote_inflight`), and a finished
+  game counts only once the run **accepts** it: this machine's at once, a worker's when the run
+  answers its `fin` line. The iteration ends when `games` are accepted - exactly; games finishing
+  beyond the quota wait, held with their samples, for the next iteration (its quota takes them
+  first). A worker never holds a share of the quota: a remote that backs off, sleeps or dies leaves
+  the rest of the iteration to this machine (whose share grows at once).
+* **A co-training run** (`resolver_cfg['selfplay_remote']`): the resolver's matches are the
+  coordinator's queue (zero/cotrain.py); this machine's resolver driver takes its share first (the
+  coordinator keeps it in reserve), the workers take theirs as they have room under their caps;
+  rows come back by tag. A worker backing off takes no new matches, and after
+  `selfplay_remote_giveback` s gives its outstanding ones back (requeued here, the second copy of a
+  row dropped); a match outstanding longer than `selfplay_remote_overdue` x its worker's expected
+  latency (at most `selfplay_remote_timeout` s) of that worker's running time is requeued too.
 
 Run settings: `selfplay_remote` (a name in the game package's `remotes`; 'local' = this machine,
 the tests; '' = off), `selfplay_remote_procs` (worker processes; 0 = the remote's `procs`),
 `selfplay_remote_wait` (seconds the end of a phase waits for the remote's last shards),
-`selfplay_remote_timeout` (co-training: seconds of a worker's running time after which an
-episode it has not finished is requeued here). A co-training run: `resolver_cfg['selfplay_remote']`
-(the resolver's episodes); the primary's own self-play (the drafting) stays here.
+`selfplay_remote_inflight` (each machine's in-flight cap, in iterations of its throughput),
+`selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` (co-training),
+`selfplay_remote_linger` (0/1: the workers keep playing with their checkpoint while the run trains;
+those games and rows count for the next iteration, at most one checkpoint stale).
 
 The remote spec's optional `selfplay` dict: {workdir (default the remote's `workdir`; the
 environment's ZERO_SELFPLAY_WORKDIR overrides it), procs (default 1), nice (the workers'
@@ -25,37 +41,39 @@ except in `end`, bounded by `selfplay_remote_wait`):
 
 * a manager thread keeps `procs` persistent **sessions**: `ssh host 'cd repo && python -m
   <pkg>.az.remote selfplay MIRROR K'` (or a local subprocess), one worker each; its stdin is the
-  control channel (JSON lines: phase, end, enqueue, fetched, ping, quit), its stdout the worker's
-  events (lines `ZERO_SP {json}`: hello, status, shard, row, end, error). A session that fails or
-  stays silent for `STALL_S` is killed and started again after `RETRY_S`. The mirror
-  `<workdir>/<mirror>` gets config.json (the run's settings + the remote's selfplay overrides) and
-  selfplay.json (the worker's mode, locks, niceness, the run's id) at each session start, and
-  checkpoint i-1 at each phase start;
-* `begin(it)`: the sessions get `phase it` (their drivers' new search epoch with checkpoint
-  i-1); `end(it)`: they get `end it`, finish their phase (games in flight carry over, as the run's
-  own rolling driver's do) and flush their shards; `end` waits for the shards announced in phase
-  i at most `selfplay_remote_wait` s: what is not back by then is dropped (a shard of phase i
-  never enters another iteration);
-* fetch threads (one per worker) copy each announced shard (a temporary name), check it (the non-finite guard,
-  zero/finite.py, and the run's game / features / actions) and renames it into `data/iter_i/` -
-  only while phase i accepts. A non-finite shard is quarantined to `<run>/debug/` and the run
-  fails with NonFinite at the end of the phase, as a local one would (the window never sees it);
+  control channel (JSON lines: phase, end, cap, accept, enqueue, fetched, ping, quit), its stdout
+  the worker's events (lines `ZERO_SP {json}`: hello, status, fin, shard, row, end, error). A
+  session that fails or stays silent for `STALL_S` is killed and started again after `RETRY_S`.
+  The mirror `<workdir>/<mirror>` gets config.json (the run's settings + the remote's selfplay
+  overrides) and selfplay.json (the worker's mode, locks, niceness, linger, the run's id) at each
+  session start, and checkpoint i-1 at each phase start; it computes the caps (`Shares`) every tick
+  and sends a worker its own (`cap`, single-game) or assigns it matches under it (co-training);
+* `begin(it)`: the sessions get `phase it` (their drivers' new search epoch with checkpoint i-1);
+  `end(it)` (or the quota met, single-game): they get `end it`, finish their phase (games in flight
+  carry over, as the run's own rolling driver's do) and flush their shards; `end` waits for the
+  shards announced in phase i at most `selfplay_remote_wait` s: what is not back by then is dropped
+  (a shard of phase i never enters another iteration);
+* fetch threads (one per worker) copy each announced shard (a temporary name), check it (the
+  non-finite guard, zero/finite.py, and the run's game / features / actions) and rename it into
+  `data/iter_i/` - only while phase i accepts. A non-finite shard is quarantined to `<run>/debug/`
+  and the run fails with NonFinite at the end of the phase, as a local one would (the window never
+  sees it). Every arrived shard's rows go into the iteration's staleness histogram;
 * co-training (`co`, the Coordinator): the manager takes queued episodes from the coordinator (at
-  most `cap` outstanding per session) and sends them to a worker; its rows go into the coordinator
-  by tag; a session that dies or stalls has its outstanding episodes requeued here (at the front);
-  an episode not finished within `selfplay_remote_timeout` s of its worker's running time (its
-  back-offs not counted) is requeued too, and whichever copy finishes second is dropped (at worst
-  played twice).
+  most its cap outstanding per session) and sends them to a worker; its rows go into the
+  coordinator by tag; a session that dies or stalls has its outstanding episodes requeued here (at
+  the front), as has one backing off for longer than the give-back delay or an episode overdue;
+  whichever copy finishes second is dropped (at worst played twice).
 
-Remote side (`serve` -> `Worker`): one rolling driver (self-play: the run's seats; co-training:
-queue_only, the queued episodes) persistent across the run's iterations. It backs off - stops
-asking for leaf batches, so its threads idle - while one of its locks is held, marks itself busy
-for lower-priority jobs (`<workdir>/.busy-<mirror>-w<K>`: an owner file "<pid> <time>" as the eval
-lock's) while a phase runs, writes compressed shards (`data/iter_i/m<KK>-<sid>_SSS.npz`, zlib level
-1, on a background thread) and exits when its stdin closes, on `quit`, or when no control line
-came for `watchdog_s` (an orphan never outlives its run by long). A worker started for a slot
-(mirror, K) that a live worker of the same run still holds stops that one first; another run's
-is refused.
+Remote side (`serve` -> `Worker`): one rolling `queue_only` driver (self-play: the run's seats and
+spec, a setup queued for every game the worker may start under its cap; co-training: the queued
+episodes) persistent across the run's iterations. It backs off - stops asking for leaf batches, so
+its threads idle - while one of its locks is held, marks itself busy for lower-priority jobs
+(`<workdir>/.busy-<mirror>-w<K>`: an owner file "<pid> <time>" as the eval lock's) while a phase
+runs, writes compressed shards (`data/iter_i/m<KK>-<sid>_SSS.npz`, zlib level 1, on a background
+thread) of the games the run accepted and exits when its stdin closes, on `quit`, or when no
+control line came for `watchdog_s` (an orphan never outlives its run by long). A worker started for
+a slot (mirror, K) that a live worker of the same run still holds stops that one first; another
+run's is refused.
 """
 import glob
 import json
@@ -75,6 +93,7 @@ from collections import deque
 
 from . import package
 from .remote import Transport, _alive, remote_spec
+from .workqueue import Shares, lag_hist, merge_hist, split_games
 
 TAG = 'ZERO_SP '
 BIG = 1 << 62                     # a remote driver's quota: its phases end by end_phase()
@@ -87,6 +106,7 @@ IDLE_STATUS_S = 30.0              # ... and between phases
 LOCK_POLL_S = 2.0                 # how often a worker looks at its locks
 SHARD_ROWS = 8192                 # a worker's shard size unless the remote's overrides set shard_rows
 COMPRESS = 1                      # zlib level of the remote shards (data.savez_level)
+OVERDUE_MIN_S = 120.0             # co-training: an episode is never overdue sooner (env ZERO_RSP_OVERDUE_MIN_S)
 
 
 def _now():
@@ -136,12 +156,14 @@ class Session:
 
     def __init__(self, rp, k):
         self.rp, self.k = rp, k
+        self.name = f'w{k}'
         self.proc = None
         self.wq = queue.Queue()
         self.err = deque(maxlen=60)
         self.eof = threading.Event()
         self.hello = None
         self.phase = None                          # the iteration whose phase was sent
+        self.end_sent = None                       # ... and whose end was sent
         self.ended = {}                            # iteration -> the worker's end event
         self.status = {}
         self.error = None
@@ -150,6 +172,15 @@ class Session:
         self.pinged = _now()
         self.assigned = {}                         # co-training: tag -> (worker active_s then, spec)
         self.handled = False
+        # single-game: games the worker reported finished (it holds them until accepted), accepted
+        self.fin = 0
+        self.acc = 0
+        self.acc_ph = 0                            # accepted in the open phase, and of those in announced shards
+        self.ship_ph = 0
+        self.bo_since = None                       # its back-off began (a status line said so)
+        self.gave_back = False
+        self.sent_cap = None
+        self.util = [0.0, 0]                       # co-training: outstanding / cap, sampled while active
 
     def start(self):
         rp = self.rp
@@ -178,6 +209,9 @@ class Session:
 
     def alive(self):
         return self.proc is not None and not self.eof.is_set() and self.proc.poll() is None
+
+    def backing_off(self):
+        return bool(self.status.get('backoff'))
 
     def _read(self):
         try:
@@ -247,10 +281,11 @@ class Session:
 
 class RemotePlay:
     """A run's self-play on the remote `name` (module docstring). `mode` 'selfplay' (a single-game
-    run's self-play: shards) or 'matches' (a co-training run's resolver episodes from the
-    coordinator given to `begin`: rows and shards). `mirror`: the mirror's name in the remote's
-    selfplay workdir (default the run directory's name; a co-training run's resolver:
-    '<run name>.resolver')."""
+    run's self-play: the shared quota of games, shards) or 'matches' (a co-training run's resolver
+    episodes from the coordinator given to `begin`: rows and shards). `mirror`: the mirror's name in
+    the remote's selfplay workdir (default the run directory's name; a co-training run's resolver:
+    '<run name>.resolver'). The run's own driver is the consumer 'local' (`local(lo, hi)`), whose
+    cap `local_cap()` gives."""
 
     def __init__(self, R, name, mode='selfplay', mirror=None):
         from .run import DEFAULTS
@@ -269,8 +304,17 @@ class RemotePlay:
         self.mirror = mirror or os.path.basename(os.path.normpath(R.run))
         self.rdir = self.workdir + '/' + self.mirror
         self.procs = max(1, int(c.get('selfplay_remote_procs') or sp.get('procs') or 1))
-        self.wait_s = float(c.get('selfplay_remote_wait', DEFAULTS.get('selfplay_remote_wait', 30.0)))
-        self.timeout_s = float(c.get('selfplay_remote_timeout', DEFAULTS.get('selfplay_remote_timeout', 3600.0)))
+
+        def setting(k):
+            v = c.get(k)
+            return DEFAULTS.get(k) if v is None else v
+        self.wait_s = float(setting('selfplay_remote_wait'))
+        self.timeout_s = float(setting('selfplay_remote_timeout'))
+        self.inflight = float(setting('selfplay_remote_inflight'))
+        self.giveback_s = float(setting('selfplay_remote_giveback'))
+        self.overdue = float(setting('selfplay_remote_overdue'))
+        self.linger = bool(int(setting('selfplay_remote_linger') or 0))
+        self.overdue_min = float(os.environ.get('ZERO_RSP_OVERDUE_MIN_S', OVERDUE_MIN_S))
         self.retry_s = float(os.environ.get('ZERO_RSP_RETRY_S', RETRY_S))
         self.env = dict(self.spec.get('env') or {}, **(sp.get('env') or {}))
         self.overrides = dict(sp.get('overrides') or {})
@@ -283,7 +327,16 @@ class RemotePlay:
         self.module = f'{pkg.name}.az.remote' if pkg.name != 'zero' else 'zero.remote'
         self.run_id = f'{socket.gethostname()}:{os.path.abspath(R.run)}'
         conc = int(self.overrides.get('conc') or c['conc'])
-        self.cap = conc + max(1, conc // 4)        # co-training: episodes outstanding per worker
+        groups = int(self.overrides.get('groups') or c['groups'])
+        # a worker's most outstanding: its driver's slots (self-play: it starts its own games), plus a
+        # queue in its driver (co-training: matches travel to it, so its slots never wait for them)
+        self.cap = conc + max(1, conc // 4) if mode == 'matches' else conc
+        self.shares = Shares(self.inflight)
+        for k in range(self.procs):
+            self.shares.consumer(f'w{k}', max(2, groups), self.cap)
+        self.capv = {}                             # the caps now (the manager's last computation)
+        self.events = None                         # co-training: events per iteration (the primary's games)
+        self.q = None                              # single-game: the open phase's quota
         self.mu = threading.Condition()
         self.sess = [None] * self.procs
         self.next_try = [0.0] * self.procs
@@ -330,6 +383,46 @@ class RemotePlay:
         """Episodes outstanding on the remote at most (co-training: the backpressure's share)."""
         return self.procs * self.cap
 
+    # ---------------------------------------------------------------- the shared queue's model
+    def local(self, lo, hi):
+        """The run's own driver as a consumer of the queue: its cap's bounds (a few games per group;
+        its driver's slots)."""
+        with self.mu:
+            self.shares.consumer('local', lo, hi)
+            self._refresh()
+
+    def restore(self, rates):
+        """The consumers' rates from the run's last metrics row (a restart: the first caps follow
+        them, not the slots)."""
+        with self.mu:
+            self.shares.restore(rates)
+            self._refresh()
+
+    def local_cap(self):
+        with self.mu:
+            return self.capv.get('local', 1)
+
+    def _units(self):
+        """An iteration's units: a single-game run's games; a co-training run's matches (its events x
+        their mean matches, once events have parked; None before: caps = the consumers' slots)."""
+        if self.mode == 'selfplay':
+            return int(self.R.cfg['games'])
+        co = self.co
+        if co is None or not self.events or not getattr(co, 'ev_total', 0):
+            return None
+        return max(1, round(self.events * co.ep_total / co.ev_total))
+
+    def _refresh(self):
+        """(mu held) Who takes work now, the caps, and the local driver's cap in the coordinator."""
+        sh = self.shares
+        for k in range(self.procs):
+            s = self.sess[k]
+            sh.set_active(f'w{k}', s is not None and s.alive() and s.hello is not None and not s.backing_off())
+        sh.units = self._units()
+        self.capv = sh.caps()
+        if self.co is not None and 'local' in self.capv:
+            self.co.local_cap = self.capv['local']
+
     # ---------------------------------------------------------------- the main thread's API
     def began(self, it):
         """The remote's phase `it` has begun already (started early: right after checkpoint it - 1
@@ -340,33 +433,95 @@ class RemotePlay:
     def begin(self, it, co=None):
         """Iteration `it`'s self-play starts: the remote's as soon as it can (never waited for).
         The run calls it as soon as checkpoint it - 1 is written (before its evaluation) and again
-        when its own phase starts (then a no-op)."""
+        when its own phase starts (then a no-op). Single-game: the iteration's quota opens."""
         with self.mu:
             if self.fatal is not None:
                 raise self.fatal
+            if co is not None:
+                self.co = co
             if self.want == it and self.accepting == it:
-                if co is not None:
-                    self.co = co
                 self.cur['t_local'] = _now()           # this machine's phase starts now
+                self._refresh()
                 return
             self.want = it
             self.accepting = it
-            if co is not None:
-                self.co = co
-            self.cur = {'it': it, 't0': _now(), 't_local': _now(), 'announced': 0, 'accepted': 0, 'rows': 0, 'bytes': 0, 'pending': 0,
-                        'rejected': 0, 'quarantined': 0, 'failed': 0, 'fetch_s': 0.0, 'assigned': 0, 'matches': 0,
-                        'dup': 0, 'requeued': 0, 'requeued_timeout': 0, 'errors': 0}
+            self.cur = {'it': it, 't0': _now(), 't_local': _now(), 'announced': 0, 'accepted': 0, 'rows': 0, 'bytes': 0,
+                        'pending': 0, 'rejected': 0, 'quarantined': 0, 'failed': 0, 'fetch_s': 0.0, 'assigned': 0,
+                        'matches': 0, 'dup': 0, 'requeued': 0, 'requeued_timeout': 0, 'requeued_backoff': 0, 'errors': 0,
+                        'games': 0, 'lost': 0, 'stale': {}, 'capsum': {}, 'capn': 0}
+            for s in self.sess:
+                if s is not None:
+                    s.acc_ph = s.ship_ph = 0
+                    s.util = [0.0, 0]
+            if self.mode == 'selfplay':
+                self.q = {'it': it, 'need': int(self.R.cfg['games']), 'done': 0, 'by': {}, 'open': True}
+            self._refresh()
             self.mu.notify_all()
 
-    def end(self, it):
+    # ---- single-game: the quota
+    def need(self, it):
+        """Games iteration `it` still needs (single-game)."""
+        with self.mu:
+            q = self.q
+            return max(0, q['need'] - q['done']) if q is not None and q['it'] == it and q['open'] else 0
+
+    def accept_local(self, it, n):
+        """This machine finished `n` more games (oldest first): how many count for iteration `it`
+        (the rest wait for the next one)."""
+        with self.mu:
+            return self._take(it, 'local', n)
+
+    def _take(self, it, who, n):
+        """(mu held) Up to `n` games of `who` into iteration `it`'s quota; the quota met: closed,
+        the workers told to end their phase."""
+        q = self.q
+        if n <= 0 or q is None or q['it'] != it or not q['open']:
+            return 0
+        a = min(n, q['need'] - q['done'])
+        if a <= 0:
+            return 0
+        q['done'] += a
+        q['by'][who] = q['by'].get(who, 0) + a
+        if q['done'] >= q['need']:
+            self._close_quota()
+        return a
+
+    def _close_quota(self):
+        """(mu held) The quota is met: every worker in the phase ends it now (its later games wait)."""
+        q = self.q
+        q['open'] = False
+        for s in self.sess:
+            if s is not None and s.alive() and s.phase == q['it'] and s.end_sent != q['it']:
+                s.send({'cmd': 'end', 'iter': q['it']})
+                s.end_sent = q['it']
+        self.mu.notify_all()
+
+    def _accept_remote(self, s):
+        """(mu held) Worker `s`'s finished games, as many as the quota still needs."""
+        q = self.q
+        if q is None or s.phase != q['it'] or s.end_sent == q['it'] or not s.alive():
+            return
+        a = self._take(q['it'], s.name, s.fin - s.acc)
+        if a:
+            s.acc += a
+            s.acc_ph += a
+            s.send({'cmd': 'accept', 'iter': q['it'], 'n': a})
+
+    def end(self, it, local=None):
         """Iteration `it`'s self-play ended here: the remote's phase ends too; waits at most
-        `selfplay_remote_wait` s for its last shards. -> the remote's share (metrics)."""
+        `selfplay_remote_wait` s for its last shards. `local`: this machine's phase ({units, run_s,
+        util}: the shared queue's measurement). -> the remote's share (metrics), with `queue`: the
+        consumers' caps, rates and the remote rows' staleness."""
         t0 = _now()
         with self.mu:
             self.want = None
+            if self.q is not None and self.q['it'] == it:
+                self.q['open'] = False
             targets = [s for s in self.sess if s is not None and s.alive() and s.phase == it]
             for s in targets:
-                s.send({'cmd': 'end', 'iter': it})
+                if s.end_sent != it:
+                    s.send({'cmd': 'end', 'iter': it})
+                    s.end_sent = it
             deadline = t0 + self.wait_s
             while True:
                 done = all(it in s.ended or not s.alive() for s in targets) and self.cur['pending'] == 0
@@ -381,10 +536,44 @@ class RemotePlay:
             live = sum(1 for s in self.sess if s is not None and s.alive())
             out = {'host': self.name, 'procs': self.procs, 'workers': live, 'in_phase': len(targets),
                    'ended': sum(1 for e in ends if e)}
+            # the shared queue: each consumer's phase measured, the next caps
+            ncap = max(1, cur['capn'])
+            phase_caps = {n: round(v / ncap, 1) for n, v in cur['capsum'].items()}
+            meas = {}
+            for s in self.sess:
+                e = s.ended.get(it) if s is not None else None
+                if not e:
+                    continue
+                util = (s.util[0] / s.util[1]) if (self.mode == 'matches' and s.util[1]) else 1.0
+                r = self.shares.observe(s.name, e.get('games', 0), e.get('active_s', 0.0), util)
+                meas[s.name] = {'units': e.get('games', 0), 'run_s': round(e.get('active_s', 0.0), 1),
+                                'util': round(util, 3), 'rate_measured': None if r is None else round(r, 4)}
+            if local is not None:
+                r = self.shares.observe('local', local.get('units', 0), local.get('run_s', 0.0), local.get('util'))
+                meas['local'] = {'units': local.get('units', 0), 'run_s': round(local.get('run_s', 0.0), 1),
+                                 'util': None if local.get('util') is None else round(local['util'], 3),
+                                 'rate_measured': None if r is None else round(r, 4)}
+            self._refresh()
+            rates = self.shares.rates()
+            consumers = {}
+            for n in self.shares.c:
+                consumers[n] = dict(meas.get(n, {}), cap=phase_caps.get(n), cap_next=self.capv.get(n),
+                                    rate=round(rates.get(n, 0.0), 4))
+            quota = None
+            if self.q is not None and self.q['it'] == it:
+                quota = {'need': self.q['need'], 'accepted': self.q['done'], 'by': dict(self.q['by'])}
+            held = sum(max(0, s.fin - s.acc) for s in self.sess if s is not None and s.alive())
+            qblock = {'units': self.shares.units, 'inflight': self.inflight, 'consumers': consumers,
+                      'rates': self.shares.state(), 'stale': dict(cur['stale']), 'quota': quota, 'held_remote': held}
         ends = [e for e in ends if e]
         secs = max([e['seconds'] for e in ends], default=0.0)
         leaves = sum(e['leaves'] for e in ends)
-        out.update(games=sum(e['games'] for e in ends), samples=cur['rows'], samples_played=sum(e['samples'] for e in ends),
+        # single-game: the games whose samples arrived (accepted shards' games, and accepted games with
+        # no samples - cut at max_steps - that are in no shard); co-training: the matches it played
+        games = cur['games'] + sum(e.get('unshipped', 0) for e in ends) if self.mode == 'selfplay' \
+            else sum(e['games'] for e in ends)
+        out.update(games=games, games_played=sum(e['games'] for e in ends), samples=cur['rows'],
+                   samples_played=sum(e['samples'] for e in ends),
                    shards=cur['accepted'], bytes=cur['bytes'], leaves=leaves,
                    leaves_per_s=round(sum(e['leaves'] / max(e['seconds'], 1e-9) for e in ends), 1),
                    leaves_per_running_s=round(sum(e['leaves'] / max(e['active_s'], 1e-9) for e in ends), 1),
@@ -393,12 +582,19 @@ class RemotePlay:
                    in_flight=sum(e.get('in_flight', 0) for e in ends), late=late, late_prev=late_prev,
                    rejected=cur['rejected'], quarantined=cur['quarantined'], fetch_failed=cur['failed'],
                    fetch_s=round(cur['fetch_s'], 1), wait_s=round(_now() - t0, 2), session_errors=cur['errors'],
-                   lead_s=round(cur['t_local'] - cur['t0'], 1))
+                   lead_s=round(cur['t_local'] - cur['t0'], 1), caps=phase_caps)
+        if self.mode == 'selfplay':
+            out.update(accepted=sum(e.get('accepted', 0) for e in ends), held=qblock['held_remote'], lost=cur['lost'])
         if self.mode == 'matches':
             with self.mu:
                 outstanding = sum(len(s.assigned) for s in self.sess if s is not None)
             out.update(matches=cur['matches'], assigned=cur['assigned'], requeued=cur['requeued'],
-                       requeued_timeout=cur['requeued_timeout'], duplicates_dropped=cur['dup'], outstanding=outstanding)
+                       requeued_timeout=cur['requeued_timeout'], requeued_backoff=cur['requeued_backoff'],
+                       duplicates_dropped=cur['dup'], outstanding=outstanding)
+        if any(e.get('linger') for e in ends):
+            out['linger'] = {'games': sum((e.get('linger') or {}).get('games', 0) for e in ends),
+                             'seconds': round(max((e.get('linger') or {}).get('seconds', 0.0) for e in ends), 1)}
+        out['queue'] = qblock
         if self.fatal is not None:
             raise self.fatal
         return out
@@ -414,7 +610,12 @@ class RemotePlay:
                 else ('idle' if live else ('connecting' if any(s is not None for s in self.sess) else 'offline'))
             out = {'host': self.name, 'workers': len(live), 'state': state,
                    'games': sum(x.get('games', 0) for x in st), 'in_flight': sum(x.get('in_flight', 0) for x in st),
-                   'samples': self.cur['rows'] if self.cur else 0, 'shards': self.cur['accepted'] if self.cur else 0}
+                   'samples': self.cur['rows'] if self.cur else 0, 'shards': self.cur['accepted'] if self.cur else 0,
+                   'caps': dict(self.capv)}
+            if self.mode == 'selfplay' and self.q is not None:
+                out['games'] = sum(v for k, v in self.q['by'].items() if k != 'local')
+                out['quota'] = {'need': self.q['need'], 'accepted': self.q['done'], 'open': self.q['open']}
+                out['held'] = sum(max(0, s.fin - s.acc) for s in live)
             if self.mode == 'matches':
                 out['outstanding'] = sum(len(s.assigned) for s in self.sess if s is not None)
                 out['matches'] = self.cur['matches'] if self.cur else 0
@@ -429,6 +630,8 @@ class RemotePlay:
             self.closed = True
             self.want = None
             self.accepting = None
+            if self.q is not None:
+                self.q['open'] = False
             sess = [s for s in self.sess if s is not None]
             self.mu.notify_all()
         ths = [threading.Thread(target=s.close, daemon=True) for s in sess]
@@ -451,10 +654,20 @@ class RemotePlay:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
                 s.status = ev
+                if ev.get('backoff'):
+                    if s.bo_since is None:
+                        s.bo_since = _now()
+                else:
+                    s.bo_since = None
+                    s.gave_back = False
+            elif kind == 'fin':                        # single-game: games finished there, held until accepted
+                s.fin += int(ev.get('n', 0))
+                self._accept_remote(s)
             elif kind == 'shard':
                 if self.cur is not None and ev.get('iter') == self.accepting == self.cur['it']:
                     self.cur['pending'] += 1
                     self.cur['announced'] += 1
+                    s.ship_ph += int(ev.get('games', 0))
                     self.fq.put((s, ev))
                 else:
                     self.late_total += 1               # its phase is over: dropped
@@ -504,6 +717,12 @@ class RemotePlay:
 
     def _tick(self, want):
         now = _now()
+        with self.mu:
+            self._refresh()
+            if self.cur is not None and want is not None and self.cur['it'] == want:
+                self.cur['capn'] += 1
+                for n, v in self.capv.items():
+                    self.cur['capsum'][n] = self.cur['capsum'].get(n, 0) + v
         for k in range(self.procs):
             s = self.sess[k]
             if s is not None and not s.alive() and not s.handled:
@@ -528,16 +747,34 @@ class RemotePlay:
             if now - s.pinged > PING_S:
                 s.pinged = now
                 s.send({'cmd': 'ping'})
-            if want is not None and s.hello is not None and s.phase != want:
-                if self._ship_model(want):
-                    with self.mu:
-                        if self.want == want and s.alive():
-                            s.send({'cmd': 'phase', 'iter': want, 'model': f'models/iter_{want - 1:04d}.pt'})
-                            s.phase = want
+            if s.hello is not None and self.mode == 'selfplay':
+                with self.mu:
+                    cap = self.capv.get(s.name, 0)
+                    if cap != s.sent_cap:
+                        s.send({'cmd': 'cap', 'n': cap})
+                        s.sent_cap = cap
+            go = want is not None and s.hello is not None and s.phase != want
+            if go and self.mode == 'selfplay':
+                with self.mu:                          # the quota met already: nothing to play for
+                    go = self.q is not None and self.q['it'] == want and self.q['open']
+            if go and self._ship_model(want):
+                with self.mu:
+                    if self.want == want and s.alive():
+                        s.send({'cmd': 'phase', 'iter': want, 'model': f'models/iter_{want - 1:04d}.pt'})
+                        s.phase = want
+                        s.acc_ph = s.ship_ph = 0
+                        if self.mode == 'selfplay':
+                            self._accept_remote(s)     # the games it held from the last phase count first
             if self.mode == 'matches':
+                self._giveback(s)
                 self._timeouts(s)
                 if want is not None and s.phase == want:
                     self._assign(s)
+                    with self.mu:
+                        cap = self.capv.get(s.name, 0)
+                        if cap > 0 and not s.backing_off():
+                            s.util[0] += min(1.0, len(s.assigned) / cap)
+                            s.util[1] += 1
 
     def _prepare_mirror(self):
         if self.mirror_ready:
@@ -552,7 +789,8 @@ class RemotePlay:
         except ValueError:
             test = {}
         spj = {'mode': self.mode, 'locks': self.locks, 'nice': self.nice, 'backoff': self.backoff, 'run_id': self.run_id,
-               'workdir': self.workdir, 'mirror': self.mirror, 'watchdog_s': WATCHDOG_S, 'test': test}
+               'workdir': self.workdir, 'mirror': self.mirror, 'watchdog_s': WATCHDOG_S, 'linger': self.linger,
+               'test': test}
         for name, obj in (('config.json', cfg), ('selfplay.json', spj)):
             tmp = os.path.join(self.R.run, f'.remote_selfplay_{name}')
             with open(tmp, 'w', encoding='utf-8') as f:
@@ -599,6 +837,7 @@ class RemotePlay:
         why = (s.error or {}).get('msg') or s.tail()
         lived = _now() - s.started
         requeue = []
+        lost = 0
         with self.mu:
             if self.sess[s.k] is s:
                 self.sess[s.k] = None
@@ -609,10 +848,22 @@ class RemotePlay:
                     self.cur['errors'] += 1
             requeue = [(tag, spec) for tag, (_t, spec) in s.assigned.items()]
             s.assigned.clear()
+            # single-game: games it had accepted whose samples never reached a shard are not this
+            # iteration's after all - the quota needs them again (while this machine still plays)
+            q = self.q
+            if q is not None and s.phase == q['it'] and self.want == q['it']:
+                lost = max(0, s.acc_ph - s.ship_ph)
+                if lost:
+                    q['done'] -= lost
+                    q['by'][s.name] = q['by'].get(s.name, 0) - lost
+                    if not q['open'] and q['done'] < q['need']:
+                        q['open'] = True               # this machine plays the rest (the workers ended)
+                    self.cur['lost'] += lost
             # the next session starts from a mirror prepared again (it may be what failed: removed,
             # half-written) and gets its checkpoint again (6 MB)
             self.mirror_ready = False
             self.model_shipped = None
+            self._refresh()
         if requeue and self.co is not None:
             self.co.requeue(requeue)
             with self.mu:
@@ -622,6 +873,7 @@ class RemotePlay:
             return
         self.fail_log(f'worker {s.k} ended (exit {rc}, after {lived:.0f}s): {str(why)[-500:]}'
                       + (f'; {len(requeue)} episodes requeued here' if requeue else '')
+                      + (f'; {lost} accepted games lost with it (the quota needs them again)' if lost else '')
                       + f'; restart in {max(0.0, self.next_try[s.k] - _now()):.0f}s')
         err = s.error or {}
         if err.get('kind') == 'nonfinite':
@@ -651,7 +903,9 @@ class RemotePlay:
         co = self.co
         if co is None or s.hello is None:
             return
-        room = self.cap - len(s.assigned)
+        with self.mu:
+            cap = self.capv.get(s.name, 0)
+        room = cap - len(s.assigned)
         if room <= 0:
             return
         items = co.take_for_remote(room)
@@ -665,12 +919,42 @@ class RemotePlay:
             if self.cur is not None:
                 self.cur['assigned'] += len(items)
 
+    def _giveback(self, s):
+        """A worker backing off for `selfplay_remote_giveback` s gives its outstanding episodes back
+        (requeued here; whichever copy finishes second is dropped)."""
+        if self.co is None or s.bo_since is None or s.gave_back or _now() - s.bo_since < self.giveback_s:
+            return
+        with self.mu:
+            back = [(tag, spec) for tag, (_t, spec) in s.assigned.items()]
+            s.assigned.clear()
+            s.gave_back = True
+        if back:
+            self.co.requeue(back)
+            with self.mu:
+                if self.cur is not None:
+                    self.cur['requeued_backoff'] += len(back)
+            self.log(f'worker {s.k}: backing off for {_now() - s.bo_since:.0f}s ({s.status.get("backoff")}): its '
+                     f'{len(back)} outstanding episodes requeued here (a second result is dropped)')
+
+    def overdue_s(self, s):
+        """How long (its running time) an episode may stay outstanding on worker `s`: at most
+        `selfplay_remote_timeout`; with `selfplay_remote_overdue` k, k x its expected latency (its cap
+        over its measured throughput), never less than OVERDUE_MIN_S."""
+        lim = self.timeout_s
+        with self.mu:
+            c = self.shares.c.get(s.name)
+            cap = self.capv.get(s.name, 0)
+        if self.overdue > 0 and c is not None and c['rate'] and cap > 0:
+            lim = min(lim, max(self.overdue_min, self.overdue * cap / c['rate']))
+        return lim
+
     def _timeouts(self, s):
         if self.co is None or 'active_s' not in s.status:
             return
         act = float(s.status['active_s'])
+        lim = self.overdue_s(s)
         with self.mu:
-            late = [(tag, spec) for tag, (t, spec) in s.assigned.items() if act - t > self.timeout_s]
+            late = [(tag, spec) for tag, (t, spec) in s.assigned.items() if act - t > lim]
             for tag, _ in late:
                 del s.assigned[tag]
         if late:
@@ -678,7 +962,7 @@ class RemotePlay:
             with self.mu:
                 if self.cur is not None:
                     self.cur['requeued_timeout'] += len(late)
-            self.log(f'worker {s.k}: {len(late)} episodes not finished within {self.timeout_s:g}s of its running '
+            self.log(f'worker {s.k}: {len(late)} episodes not finished within {lim:g}s of its running '
                      f'time: requeued here (a second result is dropped)')
 
     # ---------------------------------------------------------------- shards (the fetch thread)
@@ -694,7 +978,7 @@ class RemotePlay:
             final = os.path.join(d, name)
             tmp = final[:-len('.npz')] + '.tmp.npz'   # never a loadable shard name (data.shard_paths)
             t0 = _now()
-            res, rows = 'failed', 0
+            res, rows, net = 'failed', 0, None
             try:
                 with self.mu:
                     go = self.accepting == it
@@ -702,7 +986,7 @@ class RemotePlay:
                     os.makedirs(d, exist_ok=True)
                     if not self.t.get(ev['path'], tmp):
                         raise RuntimeError(f'copy of {ev["path"]} failed')
-                    res, rows = self._check(tmp, it, name)
+                    res, rows, net = self._check(tmp, it, name)
                     if res == 'ok':
                         with self.mu:
                             if self.accepting == it:
@@ -729,6 +1013,8 @@ class RemotePlay:
                         c['accepted'] += 1
                         c['rows'] += rows
                         c['bytes'] += int(ev.get('bytes', 0))
+                        c['games'] += int(ev.get('games', 0))
+                        lag_hist(net, it, c['stale'])
                     elif res in ('rejected', 'quarantined'):
                         c[res] += 1
                     elif res == 'failed':
@@ -736,8 +1022,8 @@ class RemotePlay:
                 self.mu.notify_all()
 
     def _check(self, path, it, name):
-        """A fetched shard -> ('ok', rows) | ('rejected', 0) (another game's or encoder's: logged)
-        | ('quarantined', 0) (non-finite: moved to <run>/debug/, the run fails at end())."""
+        """A fetched shard -> ('ok', rows, net) | ('rejected', 0, None) (another game's or encoder's:
+        logged) | ('quarantined', 0, None) (non-finite: moved to <run>/debug/, the run fails at end())."""
         from .data import read_shard
         from .finite import NonFinite, shard_problems
         sh = read_shard(path)
@@ -748,7 +1034,7 @@ class RemotePlay:
         if got != want:
             self.log(f'shard {name} of iteration {it} REJECTED: game / features / actions {got}, the run\'s {want} '
                      f'(the remote\'s code is not the run\'s?)')
-            return 'rejected', 0
+            return 'rejected', 0, None
         probs = shard_problems(sh)
         if probs:
             os.makedirs(self.R.debug_dir(), exist_ok=True)
@@ -760,38 +1046,53 @@ class RemotePlay:
             self.log(msg)
             with self.mu:
                 self.fatal = NonFinite(msg)
-            return 'quarantined', 0
-        return 'ok', int(meta.get('rows', len(sh['player'])))
+            return 'quarantined', 0, None
+        return 'ok', int(meta.get('rows', len(sh['player']))), sh.get('net')
+
+
+def staleness(local, remote):
+    """The iteration's staleness block: the histograms of this machine's rows, the remote's and all
+    of them (zero/workqueue.py: rows by checkpoint lag)."""
+    from .workqueue import hist_summary
+    allh = merge_hist(local, remote)
+    return {'local': merge_hist(local), 'remote': merge_hist(remote), 'all': allh, 'summary': hist_summary(allh)}
 
 
 # ================================================================== the remote side
 
 class _BgWriter:
     """A ShardWriter on a thread of its own: the driver's thread hands it sample dicts and never
-    waits for a shard's compression."""
+    waits for a shard's compression. `games`: the games added since its last shard (a shard holds
+    whole games: the writer writes its whole buffer)."""
 
     def __init__(self, writer):
         self.w = writer
         self.q = queue.Queue()
         self.error = None
+        self.games = 0
         self.th = threading.Thread(target=self._run, name='zero-rsp-writer', daemon=True)
         self.th.start()
 
     def _run(self):
         while True:
-            s = self.q.get()
-            if s is None:
+            item = self.q.get()
+            if item is None:
                 return
             if self.error is not None:
                 continue
+            s, g = item
             try:
-                self.w.add(s)
+                self.games += g
+                if s is not None:
+                    self.w.add(s)
             except BaseException as e:                 # noqa: BLE001 - raised on the driver's thread
                 self.error = e
 
-    def add(self, s):
-        if s is not None and len(s['player']):
-            self.q.put(s)
+    def add(self, s, games=0):
+        if s is not None and not len(s['player']):
+            s = None
+        if s is not None or games:
+            self.q.put((s, games))
 
     def check(self):
         if self.error is not None:
@@ -814,6 +1115,7 @@ class Worker:
         with open(os.path.join(rdir, 'selfplay.json'), encoding='utf-8') as f:
             self.sp = json.load(f)
         self.mode = self.sp.get('mode', 'selfplay')
+        self.linger = bool(self.sp.get('linger'))
         self.test = self.sp.get('test') or {}
         self.sid = '%04x' % random.SystemRandom().getrandbits(16)
         self.prefix = f'm{k:02d}-{self.sid}'
@@ -838,6 +1140,16 @@ class Worker:
         self.rows_out = 0
         self.shards_out = 0
         self.mine = False
+        # self-play: the games this worker may have in flight (the run's `cap`; its slots until it
+        # says), the games it finished that wait for the run's `accept` (with their samples), the
+        # setups it queued in its driver and the games it took back out
+        self.cap = None
+        self.held = deque()
+        self.enq = 0
+        self.taken = 0
+        self.held_samples = []                     # co-training, lingering: rows sent, samples for the next phase
+        from .games import spec_json
+        self.spec = spec_json(self.cfg.get('spec'))
 
     # ---- output
     def emit(self, ev, **kw):
@@ -886,16 +1198,25 @@ class Worker:
     def _control(self, msg, ph):
         cmd = msg.get('cmd')
         if cmd == 'enqueue':
+            self.enq += 1
             if self.drv is None:
                 self.backlog.append((msg['tag'], msg['spec']))
             else:
                 self.drv.enqueue(msg['tag'], msg['spec'])
+        elif cmd == 'cap':
+            self.cap = max(0, int(msg.get('n', 0)))
+        elif cmd == 'accept':
+            self._accept(msg, ph)
         elif cmd == 'end':
             if ph is not None:
-                self._end_phase(ph)
+                if ph['it'] == msg.get('iter') and not ph['closed']:
+                    if self.linger and not self.closing:
+                        self._close(ph)            # the phase's shards are done; play on into the next
+                    else:
+                        self._end_phase(ph)
             else:                                  # nothing running: answer at once
                 self.emit('end', iter=msg.get('iter'), games=0, samples=0, shards=0, bytes=0, leaves=0, seconds=0.0,
-                          active_s=0.0, backoff_s=0.0, in_flight=0)
+                          active_s=0.0, backoff_s=0.0, in_flight=0, accepted=0, unshipped=0)
         elif cmd in ('quit', 'eof'):
             self.closing = True
             if ph is not None:
@@ -903,14 +1224,14 @@ class Worker:
         elif cmd in ('fetched', 'drop'):
             self._rm(msg.get('path'))
         elif cmd == 'phase':
-            if ph is not None:                     # the run moved on while this phase ends
+            if ph is not None:                     # the run moved on while this phase ends (or lingers)
                 self.stash = msg
                 self._end_phase(ph)
             else:
                 self._phase(msg)
 
     def _controls(self, ph):
-        while True:
+        while self.stash is None:                  # after a stashed `phase`, the rest is the new phase's
             try:
                 msg = self.ctl.get_nowait()
             except queue.Empty:
@@ -1009,11 +1330,10 @@ class Worker:
             self.evr = NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1))
             seat = R.nn_seat('m', c['sims'], selfplay=True)
             seed = int(c['seed']) * 7919 + it + 7_777_777 * (self.k + 1)
-            if self.mode == 'matches':
-                self.drv = R.driver([[seat] * c['players'][0]], seed=seed, record=True, rolling=True, net=it - 1,
-                                    queue_only=True)
-            else:
-                self.drv = R.driver([[seat] * p for p in c['players']], seed=seed, record=True, rolling=True, net=it - 1)
+            # both modes play queued setups only: the run's episodes (co-training), or a setup of the
+            # run's spec for every game the worker may start under its cap (self-play)
+            table = [[seat] * c['players'][0]] if self.mode == 'matches' else [[seat] * p for p in c['players']]
+            self.drv = R.driver(table, seed=seed, record=True, rolling=True, net=it - 1, queue_only=True)
             for tag, spec in self.backlog:
                 self.drv.enqueue(tag, spec)
             self.backlog = []
@@ -1041,14 +1361,18 @@ class Worker:
             except OSError:
                 pass
 
-    def _on_shard(self, it):
+    def _on_shard(self, it, box):
         def cb(path, rows, nbytes):
+            bw = box.get('bw')
+            games = 0
+            if bw is not None:
+                games, bw.games = bw.games, 0
             self.shards_out += 1
             if self.test.get('corrupt') and self.shards_out == 1:
                 _corrupt(path)                     # the tests: a bad file the arrival check must catch
             if self.test.get('delay_shard_s'):
                 time.sleep(float(self.test['delay_shard_s']))
-            self.emit('shard', iter=it, path=path, rows=rows, bytes=nbytes)
+            self.emit('shard', iter=it, path=path, rows=rows, bytes=nbytes, games=games)
             if self.test.get('die_after_shards') and self.shards_out >= int(self.test['die_after_shards']):
                 self.note('test: dying after a shard')
                 os._exit(9)
@@ -1059,18 +1383,83 @@ class Worker:
             ph['ending'] = True
             self.drv.end_phase()
 
+    def outstanding(self):
+        """Setups queued in the driver or playing (queue_only: every setup comes back as one row)."""
+        return self.enq - self.taken
+
+    def _topup(self, ph):
+        """Self-play: queue a setup of the run's spec for every game this worker may still start -
+        under its cap; between phases (lingering) also counting the games it holds."""
+        if ph['ending']:
+            return
+        cap = self.cap if self.cap is not None else int(self.cfg['conc'])
+        room = cap - self.outstanding() - (len(self.held) if ph['closed'] else 0)
+        for _ in range(max(0, room)):
+            self.drv.enqueue(f'{self.sid}:{self.enq}', self.spec)
+            self.enq += 1
+
+    def _accept(self, msg, ph):
+        """The run counts `n` more of the held games for its iteration: their samples go into this
+        phase's shards (oldest first)."""
+        n = int(msg.get('n', 0))
+        if ph is None or ph['it'] != msg.get('iter') or ph['closed']:
+            self.note(f'accept {msg} with no open phase {msg.get("iter")} here: ignored')
+            return
+        n = min(n, len(self.held))
+        for _ in range(n):
+            row, sd = self.held.popleft()
+            ph['bw'].add(sd, 1)
+            ph['accepted'] += 1
+        die = int(self.test.get('die_after_accepts') or 0)
+        if die and ph['accepted'] >= die:
+            self.note('test: dying with accepted games in no shard yet')
+            os._exit(9)
+
+    def _finished(self, ph, rows, s):
+        """Games the driver finished: self-play - held for the run's accept (`fin`); co-training - the
+        rows to the run at once, the samples into this phase's shards (lingering: the next one's)."""
+        games = split_games(rows, s)
+        self.taken += len(games)
+        if ph['closed']:
+            ph['linger_games'] += len(games)
+        else:
+            ph['games'] += len(games)
+        if self.mode == 'matches':
+            die_rows = int(self.test.get('die_after_rows') or 0)
+            for row, sd in games:
+                self.emit('row', row=row)
+                self.rows_out += 1
+                if sd is not None:
+                    ph['samples'] += len(sd['player'])
+                    if ph['closed']:
+                        self.held_samples.append(sd)
+                    else:
+                        ph['bw'].add(sd, 1)
+                elif not ph['closed']:
+                    ph['bw'].add(None, 1)
+                if die_rows and self.rows_out >= die_rows:
+                    self.note('test: dying after a row')
+                    os._exit(9)
+        else:
+            self.held.extend(games)
+            ph['samples'] += sum(len(sd['player']) for _, sd in games if sd is not None)
+            if games:
+                self.emit('fin', iter=ph['it'], n=len(games))
+
     def _status(self, ph, force=False, backoff=None):
         now = _now()
         if not force and now - self.t_status < (self.status_s if ph is not None else IDLE_STATUS_S):
             return
         self.t_status = now
         if ph is None:
-            self.emit('status', phase=None, active_s=round(self.active_s, 1), in_flight=0, games=0)
+            self.emit('status', phase=None, active_s=round(self.active_s, 1), in_flight=0, games=0, held=len(self.held),
+                      outstanding=self.outstanding(), cap=self.cap)
             return
         bo = ph['backoff'] + (now - ph['bo_t0'] if ph['bo_t0'] else 0.0)
         st = self.drv.stats()
         self.emit('status', phase=ph['it'], games=ph['games'], samples=ph['samples'], leaves=st['leaves'] - ph['leaves0'],
-                  in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
+                  in_flight=self.drv.in_flight()['games'], queued=self.drv.queued, held=len(self.held),
+                  outstanding=self.outstanding(), cap=self.cap, linger=ph['closed'],
                   active_s=round(self.active_s + (now - ph['t0']) - bo, 1), phase_s=round(now - ph['t0'], 1),
                   backoff=backoff or ph.get('bg'), background=bool(ph.get('bg')))
 
@@ -1132,6 +1521,37 @@ class Worker:
             self._busy(True)
         if self.closing:
             self._end_phase(ph)
+        self._status(ph, force=True)
+
+    def _close(self, ph):
+        """The phase's accounting ends: its last shard, the `end` line with its counters. Without
+        linger the driver's phase has ended too; lingering, it plays on (into the next phase)."""
+        if ph['closed']:
+            return
+        if ph.get('bg'):
+            self._background(False)
+            ph['backoff'] += _now() - ph['bo_t0']
+            ph['bo_t0'] = 0.0
+            ph['bg'] = None
+        bw = ph['bw']
+        w = bw.close()
+        unshipped = bw.games                       # games added after the last shard: no samples (no shard)
+        st = self.drv.stats()
+        now = _now()
+        secs = now - ph['t0']
+        bo = ph['backoff'] + (now - ph['bo_t0'] if ph['bo_t0'] else 0.0)
+        ph['closed'] = True
+        ph['t_close'] = now
+        ph['leaves_close'] = st['leaves']
+        self.emit('end', iter=ph['it'], games=ph['games'], samples=ph['samples'], shards=w['shards'], bytes=w['bytes'],
+                  leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - bo, 2),
+                  backoff_s=round(bo, 2), in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
+                  accepted=ph['accepted'], unshipped=unshipped, held=len(self.held),
+                  linger=ph.get('linger_prev'))
+        self.note(f'phase {ph["it"]}: {ph["games"]} games ({ph["accepted"]} accepted, {len(self.held)} held), '
+                  f'{ph["samples"]} samples in {w["shards"]} shards ({w["bytes"] / 1e6:.1f} MB), '
+                  f'{(st["leaves"] - ph["leaves0"]) / max(secs - bo, 1.0):.0f} leaves/s running, {secs:.0f}s '
+                  f'({bo:.0f}s backing off)' + ('; lingering' if self.linger and not ph['ending'] else ''))
 
     def _phase(self, msg):
         from .data import ShardWriter
@@ -1143,40 +1563,42 @@ class Worker:
         drv = self.drv
         meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'],
                 'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid}
+        box = {}
         writer = ShardWriter(os.path.join(self.rdir, 'data', f'iter_{it:04d}'), self.prefix, rows=int(c['shard_rows']),
                              meta=meta, bad_dir=os.path.join(self.rdir, 'debug'), compress=COMPRESS,
-                             on_write=self._on_shard(it))
-        bw = _BgWriter(writer)
+                             on_write=self._on_shard(it, box))
+        bw = box['bw'] = _BgWriter(writer)
         st0 = drv.stats()
         drv.resume(BIG, it - 1)
         ph = {'it': it, 'games': 0, 'samples': 0, 't0': _now(), 'backoff': 0.0, 'bo_t0': 0.0, 'ending': False,
-              't_lock': 0.0, 'leaves0': st0['leaves']}
+              't_lock': 0.0, 'leaves0': st0['leaves'], 'bw': bw, 'closed': False, 'accepted': 0,
+              'linger_games': 0, 'linger_prev': getattr(self, 'linger_prev', None)}
+        self.linger_prev = None
+        for sd in self.held_samples:               # co-training: rows finished while lingering, sent already
+            bw.add(sd, 1)
+        self.held_samples = []
         self._busy(True)
         slow = float(self.test.get('slow_s') or 0)
-        die_rows = int(self.test.get('die_after_rows') or 0)
 
         def pump(lb=None):
             self._controls(ph)
             self._watchdog()
             if self.closing:
                 self._end_phase(ph)
+            rows = drv.take_results()
             s = drv.take_samples()
-            if s is not None:
-                ph['samples'] += len(s['player'])
-                bw.add(s)
-            bw.check()
-            for r in drv.take_results():
-                ph['games'] += 1
-                if self.mode == 'matches':
-                    self.emit('row', row=r)
-                    self.rows_out += 1
-                    if die_rows and self.rows_out >= die_rows:
-                        self.note('test: dying after a row')
-                        os._exit(9)
+            if rows:
+                self._finished(ph, rows, s)
+            elif s is not None:
+                raise RuntimeError('remote self-play: samples without finished games')
+            if not ph['closed']:
+                bw.check()
             if slow:
                 time.sleep(slow)
             if not ph['ending']:
                 self._backoff(ph)
+            if self.mode == 'selfplay':
+                self._topup(ph)
             self._status(ph)
 
         while True:
@@ -1184,7 +1606,7 @@ class Worker:
             drive(drv, {'m': self.evr}, on_batch=pump)
             if ph['ending']:
                 break
-            msg = self._get(0.5)               # queue_only with nothing to play: wait for episodes
+            msg = self._get(0.5) if self.stash is None else None   # queue_only, nothing to play: wait
             if msg is not None:
                 self._control(msg, ph)
             self._watchdog()
@@ -1192,23 +1614,13 @@ class Worker:
                 self._end_phase(ph)
             self._status(ph)
         pump()
-        if ph.get('bg'):
-            self._background(False)
-            ph['backoff'] += _now() - ph['bo_t0']
-            ph['bo_t0'] = 0.0
-            ph['bg'] = None
-        w = bw.close()
-        st = drv.stats()
+        if ph['closed']:                           # lingered: those games are the next phase's
+            now = _now()
+            self.linger_prev = {'games': ph['linger_games'], 'seconds': round(now - ph['t_close'], 1)}
+        self._close(ph)
         now = _now()
-        secs = now - ph['t0']
-        self.active_s += secs - ph['backoff']
+        self.active_s += (now - ph['t0']) - ph['backoff']
         self._busy(False)
-        self.emit('end', iter=it, games=ph['games'], samples=ph['samples'], shards=w['shards'], bytes=w['bytes'],
-                  leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - ph['backoff'], 2),
-                  backoff_s=round(ph['backoff'], 2), in_flight=drv.in_flight()['games'], queued=drv.queued)
-        self.note(f'phase {it}: {ph["games"]} games, {ph["samples"]} samples in {w["shards"]} shards '
-                  f'({w["bytes"] / 1e6:.1f} MB), {(st["leaves"] - ph["leaves0"]) / max(secs - ph["backoff"], 1.0):.0f} '
-                  f'leaves/s running, {secs:.0f}s ({ph["backoff"]:.0f}s backing off)')
 
     def main(self):
         from .finite import NonFinite
@@ -1218,7 +1630,8 @@ class Worker:
             threading.Thread(target=self._stdin, name='zero-rsp-stdin', daemon=True).start()
             self.note(f'started: mode {self.mode}, mirror {self.rdir}, conc {self.cfg["conc"]}, threads '
                       f'{self.cfg["threads"]}, groups {self.cfg["groups"]}, infer_workers {self.cfg.get("infer_workers", 1)}, '
-                      f'torch threads {self.cfg.get("torch_threads", 1)}, nice {self.sp.get("nice", 0)}')
+                      f'torch threads {self.cfg.get("torch_threads", 1)}, nice {self.sp.get("nice", 0)}'
+                      + (', lingering between phases' if self.linger else ''))
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
                       mode=self.mode)
             while not self.closing:

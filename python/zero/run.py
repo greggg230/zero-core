@@ -25,9 +25,10 @@ deferred terminals whose results come from episodes of the resolver game, played
 network trained in the same run (<run>/resolver/); --resolver-cfg holds its settings.
 
 --selfplay-remote <name>: another machine (a remote of the game package) self-plays too, with the
-same checkpoint, while this one plays its quota; its shards come back into data/iter_i/
-(zero/remoteplay.py, docs/az.md 5.3). A co-training run: the resolver's --resolver-cfg
-'{"selfplay_remote": ...}' (the remote plays a share of the queued episodes, 11.6).
+same checkpoint: both machines pull the iteration's --games (the total) from one shared queue, each
+with at most its throughput's share in flight; its shards come back into data/iter_i/
+(zero/remoteplay.py, zero/workqueue.py, docs/az.md 5.3). A co-training run: the resolver's
+--resolver-cfg '{"selfplay_remote": ...}' (the remote plays a share of the queued episodes, 11.6).
 """
 import argparse
 import glob
@@ -37,6 +38,7 @@ import os
 import shutil
 import sys
 import time
+from collections import deque
 
 import numpy as np
 import torch
@@ -49,6 +51,8 @@ from .infer import NetEvaluator, drive, use_amp
 from .net import load, make_net, save
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, Paused
+
+BIG = 1 << 62                                      # a rolling driver's quota when its phases end by end_phase()
 
 DEFAULTS = dict(
     preset='',
@@ -111,12 +115,21 @@ DEFAULTS = dict(
     # '' = here): the loop queues each evaluated checkpoint and keeps training (zero.remote)
     eval_remote='',
     # self-play on another machine too (a name in the game package's `remotes`, 'local' for tests;
-    # '' = off; zero.remoteplay, docs/az.md 5.3): it plays with the same checkpoint while this one
-    # plays its quota, its shards join data/iter_i/; worker processes there (0 = the remote's
-    # `procs`), seconds the end of a phase waits for its last shards, and (co-training: the
-    # resolver's setting) seconds of a worker's running time after which an episode it has not
-    # finished is requeued here
+    # '' = off; zero.remoteplay, docs/az.md 5.3): both machines pull the iteration's games (`games`
+    # in total) from one shared queue with the same checkpoint, its shards join data/iter_i/; worker
+    # processes there (0 = the remote's `procs`), seconds the end of a phase waits for its last
+    # shards, and (co-training: the resolver's setting) seconds of a worker's running time after
+    # which an episode it has not finished is requeued here at the latest
     selfplay_remote='', selfplay_remote_procs=0, selfplay_remote_wait=30.0, selfplay_remote_timeout=3600.0,
+    # the shared queue (zero/workqueue.py): each machine's in-flight cap in iterations of its own
+    # throughput (its measured share of the iteration's games or matches x this: 1 = a game it starts
+    # finishes within about one iteration); co-training: a worker backing off this many seconds
+    # gives its outstanding matches back (requeued here), and a match outstanding on a worker longer
+    # than this many of its expected latencies is requeued (at least 120 s, at most
+    # selfplay_remote_timeout; 0 = the timeout only); linger 1 = the workers keep playing with their
+    # checkpoint while the run trains (those games count for the next iteration, one checkpoint stale)
+    selfplay_remote_inflight=1.0, selfplay_remote_giveback=30.0, selfplay_remote_overdue=3.0,
+    selfplay_remote_linger=0,
     infer_device='cpu', train_device='cpu', seed=0,
     # network batches evaluated concurrently on this many Python threads (CPU: small networks
     # whose ops cannot keep the cores busy; give the driver as many `groups`); 1 = inline
@@ -308,9 +321,11 @@ class Run:
 
     # ---------------------------------------------------------------- self-play
     def selfplay(self, it):
+        if self.rsp is not None:
+            return self.selfplay_shared(it)        # with a remote: the shared queue (docs/az.md 5.3)
         c = self.cfg
         d = os.path.join(self.run, 'data', f'iter_{it:04d}')
-        if os.path.exists(d) and not (self.rsp is not None and self.rsp.began(it)):
+        if os.path.exists(d):
             self.drop_data(d, strict=True)         # an interrupted iteration is replayed
         t0 = time.time()
         seat = self.nn_seat('m', c['sims'], selfplay=True)
@@ -339,8 +354,6 @@ class Run:
         state = {'n': 0, 't': time.time()}
         prog = os.path.join(self.run, 'progress.json')
         tstats = TargetStats()
-        if self.rsp is not None:
-            self.rsp.begin(it)                     # the remote self-plays with the same checkpoint
 
         def take():
             s = drv.take_samples()
@@ -355,18 +368,12 @@ class Run:
             if time.time() - state['t'] > 2:
                 state['t'] = time.time()
                 p = {'iter': it, 'phase': 'selfplay', 'games': len(results), 'target': c['games'], 'time': time.time()}
-                if self.rsp is not None:
-                    p['remote'] = self.rsp.progress()
                 _write_json(prog, p)
         drive(drv, {'m': ev}, check=lambda: self.check('self-play'), on_batch=on_batch)
         take()
         results.extend(drv.take_results())
         ws = writer.close()
-        secs = time.time() - t0                    # this machine's phase (the remote's wait not counted)
-        rem = None
-        if self.rsp is not None:
-            _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
-            rem = self.rsp.end(it)                 # at most selfplay_remote_wait s
+        secs = time.time() - t0
         _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
         st = drv.stats()
         fin = [r for r in results if r['over']]
@@ -388,9 +395,142 @@ class Run:
             out['rolling'] = {'in_flight': inf['games'], 'restarts': st['restarts'] - st0['restarts'],
                               'restart_sims': st['restart_sims'] - st0['restart_sims'],
                               'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves']}
-        if rem is not None:
-            out['remote'] = rem
-            self.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
+        return out
+
+    def selfplay_shared(self, it):
+        """Iteration `it`'s self-play with a remote (docs/az.md 5.3; zero/remoteplay.py,
+        zero/workqueue.py): `games` finished games in total, this machine's and the remote's, every
+        one searched with checkpoint it - 1. This machine's driver is a rolling `queue_only` one
+        (whatever `rolling` says): a setup of the run's spec is queued for every game it may start
+        under its cap - its throughput's share of the iteration x selfplay_remote_inflight - so its
+        games finish within about an iteration. A finished game counts once the shared quota accepts
+        it; the games beyond the quota (finished while it filled) wait, with their samples, for the
+        next iteration, whose quota takes them first. The phase ends when the quota is met; the
+        games in flight carry over."""
+        from .workqueue import lag_hist, split_games
+        from .remoteplay import staleness
+        c = self.cfg
+        rsp = self.rsp
+        d = os.path.join(self.run, 'data', f'iter_{it:04d}')
+        if os.path.exists(d) and not rsp.began(it):
+            self.drop_data(d, strict=True)         # an interrupted iteration is replayed
+        t0 = time.time()
+        if self.roll is None:
+            seat = self.nn_seat('m', c['sims'], selfplay=True)
+            table = [[seat] * p for p in c['players']]
+            self.roll = self.driver(table, seed=c['seed'] * 7919 + it, record=True, rolling=True, net=it - 1,
+                                    queue_only=True)
+            self.roll_ev = self.evaluator(model_path(self.run, it - 1))
+            self.held, self.enq, self.taken = deque(), 0, 0
+        else:
+            m, _ = load(model_path(self.run, it - 1), 'cpu')
+            self.roll_ev.set_weights(m.state_dict())
+        drv, ev = self.roll, self.roll_ev
+        st0 = drv.stats()
+        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it}
+        writer = ShardWriter(d, 'r00', rows=c['shard_rows'], meta=meta, bad_dir=self.debug_dir())
+        tstats = TargetStats()
+        spec = G.spec_json(c['spec'])
+        rsp.begin(it)                              # (a no-op if the remote began it early)
+        prog = os.path.join(self.run, 'progress.json')
+        acc = {'results': [], 'stale': {}, 'finished': 0, 'util': [0.0, 0], 't': 0.0}
+
+        def accept():
+            """The held games, oldest first, as many as the quota takes."""
+            a = rsp.accept_local(it, len(self.held))
+            for _ in range(a):
+                row, sd = self.held.popleft()
+                acc['results'].append(row)
+                if sd is not None:
+                    tstats.add(sd)
+                    writer.add(sd)
+                    lag_hist(sd['net'], it, acc['stale'])
+
+        def pump(lb=None):
+            rows = drv.take_results()
+            s = drv.take_samples()
+            if rows:
+                self.taken += len(rows)
+                acc['finished'] += len(rows)
+                self.held.extend(split_games(rows, s))
+            if self.held:
+                accept()
+            if rsp.need(it) <= 0:
+                drv.end_phase()                    # the quota is met: the games in flight carry over
+            else:
+                cap = rsp.local_cap()
+                for _ in range(max(0, cap - (self.enq - self.taken))):
+                    drv.enqueue(f'L{self.enq}', spec)
+                    self.enq += 1
+                acc['util'][0] += min(1.0, (self.enq - self.taken) / max(1, cap))
+                acc['util'][1] += 1
+            now = time.time()
+            if now - acc['t'] > 2:
+                acc['t'] = now
+                rp = rsp.progress()
+                q = rp.get('quota') or {}
+                _write_json(prog, {'iter': it, 'phase': 'selfplay', 'games': q.get('accepted', len(acc['results'])),
+                                   'target': c['games'], 'local': len(acc['results']), 'remote': rp, 'time': now})
+
+        accept()                                   # the last iteration's leftovers come first
+        while rsp.need(it) > 0:
+            self.check('self-play')
+            if drv.paused:
+                drv.resume(BIG, it - 1)            # (again if a lost worker's games reopened the quota)
+            pump()
+            drive(drv, {'m': ev}, check=lambda: self.check('self-play'), on_batch=pump)
+            pump()
+            if rsp.need(it) > 0 and drv.in_flight()['games'] == 0 and not drv.queued:
+                time.sleep(0.05)                   # nothing to play (a cap of 0): wait for the quota
+        if not drv.paused:
+            drv.end_phase()
+            drive(drv, {'m': ev}, check=lambda: self.check('self-play'), on_batch=lambda lb: None)
+        rows = drv.take_results()                  # finished while the phase ended: the next iteration's
+        if rows:
+            self.taken += len(rows)
+            acc['finished'] += len(rows)
+            self.held.extend(split_games(rows, drv.take_samples()))
+        ws = writer.close()
+        secs = time.time() - t0                    # this machine's phase (the remote's wait not counted)
+        _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
+        util = acc['util'][0] / acc['util'][1] if acc['util'][1] else None
+        rem = rsp.end(it, local={'units': acc['finished'], 'run_s': secs, 'util': util})
+        _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
+        results = acc['results']
+        st = drv.stats()
+        fin = [r for r in results if r['over']]
+        leaves = st['leaves'] - st0['leaves']
+        out = {'games': len(results), 'unfinished': len(results) - len(fin), 'samples': ws['samples'],
+               'shards': ws['shards'], 'bytes': ws['bytes'],
+               'decisions_per_game': sum(r['decisions'] for r in results) / max(1, len(results)),
+               'steps_per_game': sum(r['steps'] for r in results) / max(1, len(results)),
+               'rounds': sum(r['rounds'] for r in fin) / max(1, len(fin)),
+               'avg_score': sum(sum(r['scores']) / r['n'] for r in fin) / max(1, len(fin)),
+               'leaves': leaves, 'leaves_per_s': leaves / max(secs, 1e-9),
+               'games_per_h': len(results) / max(secs, 1e-9) * 3600, 'seconds': secs,
+               'infer_s': ev.seconds, 'avg_batch': ev.leaves / max(1, ev.calls),
+               'minor_per_game': (st.get('minor', 0) - st0.get('minor', 0)) / max(1, len(results)),
+               'target': tstats.summary(c.get('policy_target', 'visits'))}
+        ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
+        out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
+                          'restart_sims': st['restart_sims'] - st0['restart_sims'],
+                          'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves']}
+        qb = rem.pop('queue')
+        total = len(results) + rem['games']
+        cons = qb['consumers']
+        cons.setdefault('local', {})['games'] = len(results)
+        for n, v in cons.items():
+            if n != 'local':
+                v['games'] = (qb.get('quota') or {}).get('by', {}).get(n, 0)
+        for v in cons.values():
+            v['share'] = round(v.get('games', 0) / max(1, total), 4)
+        out['remote'] = rem
+        out['queue'] = {'quota': c['games'], 'games': total, 'short': max(0, c['games'] - total),
+                        'held': {'local': len(self.held), 'remote': qb.get('held_remote', 0)},
+                        'inflight': qb['inflight'], 'units': qb['units'], 'consumers': cons, 'rates': qb['rates'],
+                        'staleness': staleness(acc['stale'], qb['stale'])}
+        self.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
+        self.log(f'iter {it} shared queue: {_fmt_queue(out["queue"])}')
         return out
 
     # ---------------------------------------------------------------- training
@@ -754,8 +894,12 @@ class Run:
         if c.get('selfplay_remote'):
             from .remoteplay import RemotePlay
             self.rsp = RemotePlay(self, c['selfplay_remote'])
+            self.rsp.local(max(2, int(c['groups'])), int(c['conc']))
+            self.rsp.restore(last_rates(read_metrics(run)))
             self.log(f'self-play also on the remote {c["selfplay_remote"]!r} ({self.rsp.spec["host"]}, '
-                     f'{self.rsp.procs} worker(s), mirror {self.rsp.rdir})')
+                     f'{self.rsp.procs} worker(s), mirror {self.rsp.rdir}): {c["games"]} games per iteration in '
+                     f'total, in flight per machine its throughput share x {self.rsp.inflight:g}'
+                     + (', lingering while the run trains' if self.rsp.linger else ''))
         try:
             self._iterations(start, done)
         finally:
@@ -818,11 +962,44 @@ def _fmt_remote(r):
          f"machine's phase), waited {r['wait_s']:.1f}s")
     if 'matches' in r:
         s += (f"; matches {r['matches']} back, {r['assigned']} assigned, {r['outstanding']} outstanding, "
-              f"{r['requeued']} + {r['requeued_timeout']} requeued, {r['duplicates_dropped']} duplicates dropped")
-    for k in ('late', 'late_prev', 'rejected', 'quarantined', 'fetch_failed', 'session_errors'):
+              f"{r['requeued']} + {r['requeued_timeout']} + {r.get('requeued_backoff', 0)} requeued (lost, overdue, "
+              f"backing off), {r['duplicates_dropped']} duplicates dropped")
+    if 'held' in r:
+        s += f"; {r.get('games_played', 0)} played, {r['held']} held for the next iteration"
+    for k in ('late', 'late_prev', 'rejected', 'quarantined', 'fetch_failed', 'session_errors', 'lost'):
         if r.get(k):
             s += f', {k} {r[k]}'
+    if r.get('linger'):
+        s += f", lingered {r['linger']['seconds']:.0f}s before it ({r['linger']['games']} games)"
     return s
+
+
+def _fmt_queue(q):
+    """The shared queue of a self-play phase in one log line (zero/workqueue.py)."""
+    cons = q.get('consumers') or {}
+    names = sorted(cons, key=lambda n: (n != 'local', n))
+    s = ''
+    if 'quota' in q:
+        s = f"quota {q['quota']}: {q['games']} games (" + ', '.join(f"{n} {cons[n].get('games', 0)}" for n in names) + ')'
+        if q.get('short'):
+            s += f", SHORT {q['short']}"
+        s += '; '
+    s += ('caps ' + ', '.join(f"{n} {cons[n].get('cap')} -> {cons[n].get('cap_next')}" for n in names)
+          + '; rates/s ' + ', '.join(f"{n} {cons[n].get('rate', 0):.3g}" for n in names))
+    st = (q.get('staleness') or {}).get('summary')
+    if st:
+        s += f"; staleness: mean {st['mean']:.2f}, max {st['max']}, {100 * st['le1']:.1f}% <= 1 ({st['rows']} rows)"
+    return s
+
+
+def last_rates(rows):
+    """The shared queue's consumer rates of the newest metrics row that has them (a restart's first
+    caps follow them)."""
+    for m in reversed(rows):
+        q = (m.get('selfplay') or {}).get('queue')
+        if q and q.get('rates'):
+            return q['rates']
+    return None
 
 
 def _write_json(path, obj):
