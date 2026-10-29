@@ -1157,3 +1157,96 @@ fn select_settings_are_parsed() {
     assert!(Select::parse("cq", 0, f64::NAN, 1.0).is_err());
     assert!(Select::parse("cq", 0, 50.0, -1.0).is_err());
 }
+
+/// `answer` with skewed priors (a hash of the features and the action; `answer`'s are uniform,
+/// and under uniform priors the cq rule's argmax is the same at every c_scale > 0).
+fn answer_skewed<G: SearchGame>(d: &mut Driver<G>, b: &Batch) {
+    let f = G::NUM_FEATURES;
+    let mut pri = Vec::new();
+    for r in 0..b.b {
+        let h: f32 = b.x[r * f..(r + 1) * f].iter().enumerate().map(|(i, x)| x * ((i * 5 % 11) as f32 - 5.0)).sum();
+        let (lo, hi) = (b.opt_off[r] as usize, b.opt_off[r + 1] as usize);
+        let e: Vec<f32> = b.opt_action[lo..hi].iter().map(|&a| (1.5 * (a as f32 * 1.7 + h * 0.3).sin()).exp()).collect();
+        let t: f32 = e.iter().sum();
+        pri.extend(e.iter().map(|x| x / t));
+    }
+    let mut v = vec![0.0; b.b * MAX_SEATS];
+    let m = vec![0.0; b.b * MAX_SEATS];
+    for r in 0..b.b {
+        let n = b.n_players[r] as usize;
+        let h: f32 = b.x[r * f..(r + 1) * f].iter().enumerate().map(|(i, x)| x * ((i * 7 % 13) as f32 - 6.0)).sum();
+        let w = 1.0 / (1.0 + (-h * 0.1).exp());
+        v[r * MAX_SEATS] = w;
+        for j in 1..n {
+            v[r * MAX_SEATS + j] = (1.0 - w) / (n - 1) as f32;
+        }
+    }
+    d.submit(b.id, &pri, &v, &m).unwrap();
+}
+
+#[test]
+fn select_transform_moves_only_the_moves_never_the_targets() {
+    // A self-play seat's 'cq' rule with its own completed-Q transform (the bindings' seat keys
+    // select_c_visit / select_c_scale, run settings *_select_c_scale) next to a 'cq' target at
+    // another one: the moves follow the rule's transform alone, the targets the target's alone.
+    // A: target c_scale 1.0, rule RS; B: target RS, rule RS (one shared knob, as before the
+    // keys); E: target 0.0 (= the floored prior), rule RS; C: target 1.0, rule 1.0. Skewed priors
+    // (`answer_skewed`), so that the rule's c_scale matters.
+    const RS: f64 = 0.3;
+    let seat = |target: f64, rule: f64| {
+        let s = with_target(nn(0, 16, true), PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: target });
+        with_select(s, Select::Cq { c_visit: 50.0, c_scale: rule, min_visits: 0 })
+    };
+    let play = |s: SeatCfg| {
+        let mut c = cfg(vec![s], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+        c.seed = 2026;
+        let mut d = Driver::<ToyGame>::new(c).unwrap();
+        let (mut res, mut smp) = (Vec::new(), Vec::new());
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer_skewed(&mut d, &b);
+            res.extend(d.take_results());
+            smp.extend(d.take_samples());
+        }
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+        res.sort_by_key(|r| r.gid);
+        (res, smp)
+    };
+    let (ra, sa) = play(seat(1.0, RS));
+    let (rb, sb) = play(seat(RS, RS));
+    let (re, se) = play(seat(0.0, RS));
+    let (rc, _) = play(seat(1.0, 1.0));
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples, r.decisions);
+    let keys = |rs: &[GameResult]| rs.iter().map(key).collect::<Vec<_>>();
+    // the same rule: the same games and the same records but for pi
+    assert_eq!(keys(&ra), keys(&rb));
+    assert_eq!(keys(&ra), keys(&re));
+    assert!(sa.len() == sb.len() && sa.len() == se.len() && !sa.is_empty());
+    // another rule transform: other games (the rule's transform reaches the moves)
+    assert_ne!(keys(&ra), keys(&rc), "the rule's c_scale never changed a game");
+    let (mut differ, mut checked, mut worst) = (0, 0, 0.0f64);
+    for ((a, b), e) in sa.iter().zip(&sb).zip(&se) {
+        for r in [b, e] {
+            assert_eq!((&a.x, a.player, a.n_players, &a.opts, a.z, a.q, a.sc, a.net), (&r.x, r.player, r.n_players, &r.opts, r.z, r.q, r.sc, r.net));
+        }
+        differ += (a.pi != b.pi) as usize;
+        // ln pi_s = ln P0 + s (c_visit + max N) completedQ - ln Z_s, so per option
+        // (ln pi_A - ln pi_E) - (1.0 / RS) (ln pi_B - ln pi_E) is one constant: A's target is the
+        // c_scale 1.0 one of the same root, whatever the rule's RS
+        let d: Vec<f64> = (0..a.pi.len())
+            .filter(|&k| a.pi[k] > 1e-30 && b.pi[k] > 1e-30 && e.pi[k] > 1e-30)
+            .map(|k| {
+                let l = |p: &[f32]| (p[k] as f64).ln();
+                (l(&a.pi) - l(&e.pi)) - (1.0 / RS) * (l(&b.pi) - l(&e.pi))
+            })
+            .collect();
+        if d.len() >= 2 {
+            checked += 1;
+            let (lo, hi) = d.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+            worst = worst.max(hi - lo);
+        }
+    }
+    assert!(differ * 10 > sa.len() * 9, "{differ} of {} targets differ between target c_scale 1.0 and {RS}", sa.len());
+    assert!(checked * 2 > sa.len(), "{checked} of {} records checked", sa.len());
+    assert!(worst < 1e-3, "the targets are not c_scale 1.0's of the same roots: spread {worst}");
+}

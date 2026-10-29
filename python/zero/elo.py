@@ -40,10 +40,10 @@ def pool_dir(run, tag='visits'):
 
 def eval_tag(cfg):
     """The name of a run's evaluation move rule (`mcts.select_tag` of eval_select, its guard and
-    the completed-Q transform): its evaluations' 'select' and its pool."""
-    from .mcts import select_tag
-    return select_tag(cfg.get('eval_select', 'visits'), cfg.get('eval_select_min_visits', 0),
-                      cfg.get('cq_c_visit', 50.0), cfg.get('cq_c_scale', 1.0))
+    the rule's completed-Q transform: eval_select_c_visit / _c_scale, unset = cq_c_visit /
+    cq_c_scale): its evaluations' 'select' and its pool."""
+    from .mcts import select_settings, select_tag
+    return select_tag(*select_settings(cfg, 'eval_select'))
 
 
 def active_pool(run):

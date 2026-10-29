@@ -121,6 +121,13 @@ DEFAULTS = dict(
     # selfplay_select: self-play's moves after its first temp_moves searched decisions of a game (the
     # recorded targets stay policy_target's)
     eval_select='visits', eval_select_min_visits=0, selfplay_select='visits', selfplay_select_min_visits=0,
+    # the 'cq' rule's own completed-Q transform (docs/az.md 5.4): eval_select_c_visit / _c_scale for
+    # every evaluation seat, selfplay_select_c_visit / _c_scale for self-play's moves after temp_moves.
+    # None (unset, the default) = cq_c_visit / cq_c_scale, the training target's (one knob for both,
+    # as before these settings); a number = the rule's own, so that a training A/B of cq_c_scale
+    # leaves the evaluation's moves (and its Elo pool, named after the rule's transform) alone. The
+    # recorded targets never read them; only with the rule 'cq'. On the command line 'none' unsets one.
+    eval_select_c_visit=None, eval_select_c_scale=None, selfplay_select_c_visit=None, selfplay_select_c_scale=None,
     # the game spec of every match that records nothing (vs the yardstick, vs random, Elo, the
     # reference games); '' = the game package's evaluation spec for the self-play spec
     # (GamePackage.eval_specs; MTG: a fixed deck set, self-play random decks), else the spec
@@ -334,10 +341,12 @@ class Run:
                              c['p_full'], c['chance_k'], c['margin_w'], bool(c['redet']),
                              c.get('policy_target', 'visits'), c.get('cq_c_visit', 50.0), c.get('cq_c_scale', 1.0),
                              sims_minor=c.get('sims_minor', 0) or None, select=c.get('selfplay_select', 'visits'),
-                             select_min_visits=c.get('selfplay_select_min_visits', 0))
+                             select_min_visits=c.get('selfplay_select_min_visits', 0),
+                             select_c_visit=c.get('selfplay_select_c_visit'), select_c_scale=c.get('selfplay_select_c_scale'))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
-                         select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0))
+                         select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
+                         select_c_visit=c.get('eval_select_c_visit'), select_c_scale=c.get('eval_select_c_scale'))
 
     def eval_tag(self):
         """The name of the evaluation seats' move rule ('visits', 'cq', 'cq-n2' ...): the evaluations'
@@ -1094,12 +1103,28 @@ def _write_json(path, obj):
             time.sleep(0.05)
 
 
+UNSET = 'none'
+
+
+def _opt_float(s):
+    """A setting whose default is None (unset): a number, or 'none' = unset (`UNSET`, given as
+    such: it replaces a saved value)."""
+    if s.strip().lower() in (UNSET, ''):
+        return UNSET
+    try:
+        return float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{s!r}: a number or 'none' (unset)") from None
+
+
 def parse(argv=None):
     ap = argparse.ArgumentParser(description=f'{package.active().title} AlphaZero loop (docs/az.md)')
     ap.add_argument('--run', required=True)
     for k, v in DEFAULTS.items():
         flag = '--' + k.replace('_', '-')
-        if isinstance(v, list):
+        if v is None:
+            ap.add_argument(flag, type=_opt_float, default=None, help="a number, or 'none' = unset")
+        elif isinstance(v, list):
             ap.add_argument(flag, type=int, nargs='+', default=None)
         elif isinstance(v, dict):
             ap.add_argument(flag, type=json.loads, default=None, help='JSON object')
@@ -1113,6 +1138,7 @@ def parse(argv=None):
 def resolve_config(args, saved):
     """DEFAULTS < preset < saved config < flags given now."""
     given = {k: getattr(args, k) for k in DEFAULTS if getattr(args, k) is not None}
+    given = {k: None if (DEFAULTS[k] is None and v == UNSET) else v for k, v in given.items()}
     preset = given.get('preset') or saved.get('preset') or ''
     if preset and preset not in PRESETS:
         raise SystemExit(f'unknown preset {preset!r} ({sorted(PRESETS)})')
@@ -1128,12 +1154,14 @@ def resolve_config(args, saved):
 
 
 def check_eval_settings(cfg, where=''):
-    """The move-rule and Elo-offset settings (eval_select, selfplay_select and their guards,
-    elo_offsets) -> None, else SystemExit (`where`: a prefix, e.g. 'resolver_cfg: ')."""
-    from .mcts import check_select
+    """The move-rule and Elo-offset settings (eval_select, selfplay_select, their guards and their
+    completed-Q transforms, elo_offsets) -> None, else SystemExit (`where`: a prefix, e.g.
+    'resolver_cfg: ')."""
+    from .mcts import check_select, check_select_transform
     for k in ('eval_select', 'selfplay_select'):
         try:
             check_select(cfg.get(k, 'visits'), cfg.get(k + '_min_visits', 0), what=k)
+            check_select_transform(cfg.get(k, 'visits'), cfg.get(k + '_c_visit'), cfg.get(k + '_c_scale'), what=k)
         except ValueError as e:
             raise SystemExit(f'{where}{e}') from None
     try:

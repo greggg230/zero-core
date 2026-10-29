@@ -140,7 +140,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -177,7 +177,14 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         _ => None,
     };
     // training target of recorded decisions: 'visits' (default) | 'cq' (docs/search.md 3.1)
-    let policy_target = PolicyTarget::parse(&get(d, "policy_target", "visits".to_string())?, get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?).map_err(verr)?;
+    let (cq_c_visit, cq_c_scale) = (get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?);
+    let policy_target = PolicyTarget::parse(&get(d, "policy_target", "visits".to_string())?, cq_c_visit, cq_c_scale).map_err(verr)?;
+    let select: String = get(d, "select", "visits".to_string())?;
+    for k in ["select_c_visit", "select_c_scale"] {
+        if select == "visits" && matches!(d.get_item(k)?, Some(v) if !v.is_none()) {
+            return Err(PyValueError::new_err(format!("{k}: a setting of select 'cq' ('visits' has no completed-Q transform)")));
+        }
+    }
     Ok(SeatCfg::Nn(NnSeat {
         key,
         sims: get(d, "sims", 100u32)?,
@@ -194,8 +201,9 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         redet: flag(d, "redet", true)?,
         policy_target,
         // the rule of the moves it does not sample: 'visits' (default) | 'cq' with the guard
-        // select_min_visits and the completed-Q transform cq_c_visit, cq_c_scale (docs/search.md 3.3)
-        select: Select::parse(&get(d, "select", "visits".to_string())?, get(d, "select_min_visits", 0u32)?, get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?).map_err(verr)?,
+        // select_min_visits and the completed-Q transform select_c_visit, select_c_scale (absent:
+        // the target's cq_c_visit, cq_c_scale; docs/search.md 3.3)
+        select: Select::parse(&select, get(d, "select_min_visits", 0u32)?, get(d, "select_c_visit", cq_c_visit)?, get(d, "select_c_scale", cq_c_scale)?).map_err(verr)?,
     }))
 }
 

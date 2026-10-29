@@ -4,16 +4,19 @@ search saw at every decision, for the game apps' replay viewers.
   python -m <pkg>.az.replays CKPT [--opp ext:jsbot | self | random | OTHER.pt] [--games 6]
       [--sims 128] [--opp-sims N] [--spec JSON] [--selfplay] [--hint ext:jsbot | none]
       [--chance-k 2] [--device cuda] [--seed 0] [--out DIR] [--title T]
-      [--select visits | cq] [--select-min-visits N] [--upload [URL]] [--key-file F]
+      [--select visits | cq] [--select-min-visits N] [--cq-c-visit V --cq-c-scale S]
+      [--upload [URL]] [--key-file F]
 
 The checkpoint plays `--games` games against `--opp` (another checkpoint, itself, a built-in
 bot or an external player such as the JS bot), seats alternating. Its search runs the Rust tree
 from Python (`play.PyDriver`, impl 'rs'): evaluation settings by default (no noise, argmax),
 `--selfplay` = the run's self-play settings (Dirichlet noise, temperature for the first
 `temp_moves` decisions). The moves it does not sample follow the run's move rule (docs/search.md
-3.3: eval_select, or selfplay_select with --selfplay; a checkpoint without a run: 'visits'), or
---select / --select-min-visits; the seat records its rule (`select`). The spec defaults to the checkpoint's run (`runs/<run>/config.json`),
-else the game package's. `--hint ext:<name>` asks that external player, at each network
+3.3: eval_select, or selfplay_select with --selfplay, with the rule's completed-Q transform -
+its *_c_visit / *_c_scale, unset: cq_c_visit / cq_c_scale; a checkpoint without a run: 'visits'),
+or --select / --select-min-visits, and --cq-c-visit / --cq-c-scale for the 'cq' rule's transform;
+the seat records its rule (`select`, e.g. 'cq-n4-v50-s0.3'). The spec defaults to the
+checkpoint's run (`runs/<run>/config.json`), else the game package's. `--hint ext:<name>` asks that external player, at each network
 decision whose state it has not seen yet, what it would do there (stored, never applied): the
 viewer shows it next to the network's choice (default: the package's `replay_hint`).
 
@@ -52,6 +55,7 @@ import numpy as np
 
 from . import games as G, package
 from .infer import NetEvaluator, drive
+from .mcts import select_settings
 from .net import load
 from .play import NNSeat, PyDriver, Slot
 from .protocol import LeafBatch
@@ -268,13 +272,23 @@ def run_config(run):
 
 def _nn(key, sims, cfg, selfplay, chance_k, select=None):
     """A network seat at the run's settings (`cfg`); its move rule the run's (eval_select, or
-    selfplay_select with `selfplay`) unless `select` = (rule, min_visits) is given."""
+    selfplay_select with `selfplay`, with the rule's completed-Q transform: `mcts.select_settings`)
+    unless `select` = (rule, min_visits) or (rule, min_visits, c_visit, c_scale) says otherwise (a
+    rule None: the run's rule and guard; a transform None or left out: the run's rule's)."""
     pre = 'selfplay_select' if selfplay else 'eval_select'
-    rule, mv = select if select else (cfg.get(pre, 'visits'), cfg.get(pre + '_min_visits', 0))
+    rule, mv, cv, cs = select_settings(cfg, pre)
+    if select:
+        s = tuple(select) + (None,) * (4 - len(select))
+        if s[0] is not None:
+            rule, mv = s[0], s[1]
+        if rule == 'visits' and s[2:] != (None, None):
+            raise ValueError("a completed-Q transform for the move rule 'visits'")
+        cv, cs = (x if o is None else o for x, o in zip((cv, cs), s[2:]))
     return NNSeat(key=key, sims=sims, c_puct=cfg.get('c_puct', 1.0), selfplay=selfplay, alpha=cfg.get('alpha', 0.3),
                   eps=cfg.get('eps', 0.25), temp_moves=cfg.get('temp_moves', 30) if selfplay else 0,
                   chance_k=chance_k, redet=bool(cfg.get('redet', 1)), impl='rs', cq_c_visit=cfg.get('cq_c_visit', 50.0),
-                  cq_c_scale=cfg.get('cq_c_scale', 1.0), select=rule, select_min_visits=int(mv))
+                  cq_c_scale=cfg.get('cq_c_scale', 1.0), select=rule, select_min_visits=int(mv),
+                  select_c_visit=None if rule == 'visits' else cv, select_c_scale=None if rule == 'visits' else cs)
 
 
 def _with_rule(info, seat):
@@ -297,7 +311,8 @@ def record(ckpt, opp='self', games=6, sims=128, opp_sims=None, spec=None, selfpl
            device='cpu', seed=0, title=None, conc=8, log=print, select=None):
     """Play and record `games` games of checkpoint `ckpt` vs `opp` ('self', 'ext:<name>', a bot
     name or another checkpoint), seats alternating (game k: `ckpt` is seat k % 2). `select`:
-    (rule, min_visits) of the network seats (None: each checkpoint's run's). -> replays."""
+    (rule, min_visits) or (rule, min_visits, c_visit, c_scale) of the network seats (None: each
+    checkpoint's run's; a transform None: the run's rule's). -> replays."""
     ma, _ = load(ckpt, device)
     game = ma.config.get('game', package.active().game)
     run, it = run_of(ckpt)
@@ -418,12 +433,16 @@ def main(argv=None):
     ap.add_argument('--select', default=None, choices=['visits', 'cq'],
                     help="the network seats' move rule (default: the checkpoint's run's)")
     ap.add_argument('--select-min-visits', type=int, default=0)
+    ap.add_argument('--cq-c-visit', type=float, default=None,
+                    help="the 'cq' rule's completed-Q transform (default: the checkpoint's run's rule's)")
+    ap.add_argument('--cq-c-scale', type=float, default=None)
     args = ap.parse_args(argv)
+    tr = (args.cq_c_visit, args.cq_c_scale)
     seed = args.seed if args.seed is not None else random.randrange(1 << 30)
     reps = record(args.ckpt, opp=args.opp, games=args.games, sims=args.sims, opp_sims=args.opp_sims, spec=args.spec,
                   selfplay=args.selfplay, hint=None if args.hint == 'none' else args.hint, chance_k=args.chance_k,
                   device=args.device, seed=seed, title=args.title, conc=args.conc,
-                  select=(args.select, args.select_min_visits) if args.select else None)
+                  select=(args.select, args.select_min_visits, *tr) if args.select or tr != (None, None) else None)
     run, _ = run_of(args.ckpt)
     out = args.out or os.path.join(run or '.', 'replays')
     for r in reps:

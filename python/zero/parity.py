@@ -159,7 +159,7 @@ def cq_formula(game='toy', n=8, sims=64, seed=0, cq_settings=((50.0, 1.0), (50.0
 
 
 SELECT_RULES = (('visits', 0, 50.0, 1.0), ('cq', 0, 50.0, 1.0), ('cq', 1, 50.0, 1.0), ('cq', 2, 50.0, 1.0),
-                ('cq', 4, 10.0, 3.0), ('cq', 0, 50.0, 0.1))
+                ('cq', 4, 10.0, 3.0), ('cq', 0, 50.0, 0.1), ('cq', 4, 50.0, 0.3))
 
 
 def select_formula(game='toy', n=8, sims=(4, 8, 24, 64), seed=0, rules=SELECT_RULES, scale=0.15, eps=1e-9):
@@ -191,9 +191,9 @@ def select_formula(game='toy', n=8, sims=(4, 8, 24, 64), seed=0, rules=SELECT_RU
 
 
 def h2h(model, games=2000, sims=32, chance_k=0, conc=128, seed=0, game='toy', verbose=True, select='visits',
-        select_min_visits=0):
-    """Rust-tree seat vs Python-tree seat, same network and move rule, seats alternating. ->
-    summary."""
+        select_min_visits=0, select_c_visit=None, select_c_scale=None):
+    """Rust-tree seat vs Python-tree seat, same network and move rule (and the 'cq' rule's own
+    transform select_c_visit / select_c_scale, None: 50 / 1), seats alternating. -> summary."""
     import torch
     from .infer import NetEvaluator, drive
     from .net import load
@@ -201,8 +201,10 @@ def h2h(model, games=2000, sims=32, chance_k=0, conc=128, seed=0, game='toy', ve
     torch.set_num_threads(1)
     m, _ = load(model)
     ev = NetEvaluator(m)
-    rs = NNSeat('m', sims, chance_k=chance_k, impl='rs', select=select, select_min_visits=select_min_visits)
-    py = NNSeat('m', sims, chance_k=chance_k, impl='py', select=select, select_min_visits=select_min_visits)
+    kw = dict(select=select, select_min_visits=select_min_visits, select_c_visit=select_c_visit,
+              select_c_scale=select_c_scale)
+    rs = NNSeat('m', sims, chance_k=chance_k, impl='rs', **kw)
+    py = NNSeat('m', sims, chance_k=chance_k, impl='py', **kw)
     t0 = time.time()
     drv = PyDriver(game, games, lambda g: [rs, py] if g % 2 == 0 else [py, rs], concurrency=conc, seed=seed)
     drive(drv, {'m': ev})
@@ -240,6 +242,8 @@ def main(argv=None):
     h.add_argument('--seed', type=int, default=0)
     h.add_argument('--select', default='visits', choices=['visits', 'cq'])
     h.add_argument('--select-min-visits', type=int, default=0)
+    h.add_argument('--select-c-visit', type=float, default=None, help="the 'cq' rule's transform (default 50 / 1)")
+    h.add_argument('--select-c-scale', type=float, default=None)
     sf = sub.add_parser('select')
     sf.add_argument('--game', default='toy')
     sf.add_argument('--positions', type=int, default=8)
@@ -251,7 +255,8 @@ def main(argv=None):
     elif a.cmd == 'select':
         print(json.dumps(select_formula(a.game, n=a.positions)))
     else:
-        h2h(a.model, a.games, a.sims, a.chance_k, seed=a.seed, select=a.select, select_min_visits=a.select_min_visits)
+        h2h(a.model, a.games, a.sims, a.chance_k, seed=a.seed, select=a.select, select_min_visits=a.select_min_visits,
+            select_c_visit=a.select_c_visit, select_c_scale=a.select_c_scale)
 
 
 if __name__ == '__main__':

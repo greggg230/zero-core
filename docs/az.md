@@ -116,6 +116,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `elo_offsets` | '' | raw Elo offsets ('1,2,4,8'): each evaluated checkpoint k plays the checkpoints k-1, k-2, k-4, k-8 (those that exist) whatever `eval_every`, instead of evaluations back; `elo_opponents` is then not used; checkpoints never evaluated are rated through these games only and are never `best.pt` (section 5.4). '' = the default above, unchanged |
 | `eval_select`, `eval_select_min_visits` | visits, 0 | the move rule of every evaluation seat (docs/search.md 3.3): 'visits' = argmax (N, P0) (AlphaZero's; the default: today's moves bit for bit) or 'cq' = the argmax of the completed-Q target's logits (with `cq_c_visit`, `cq_c_scale`) among the options with at least `eval_select_min_visits` visits (0 = all). The yardstick, random and Elo matches (here or on the `eval_remote`), co-training's evaluations (the resolver's: `resolver_cfg`), and by default `zero.h2h` / `zero.replay` of the run's checkpoints. Recorded in the evaluations (`select`, absent = 'visits'); one Elo pool per rule (section 5.4) |
 | `selfplay_select`, `selfplay_select_min_visits` | visits, 0 | the same rule for self-play's moves after its first `temp_moves` searched decisions of a game (remote self-play too); the recorded targets stay `policy_target`'s. For a forked A/B run (section 12.4) |
+| `eval_select_c_visit`, `eval_select_c_scale` | unset (None) | the evaluation 'cq' rule's own completed-Q transform: unset = `cq_c_visit` / `cq_c_scale`, the training target's (one knob for both, the behaviour before these settings, bit for bit); a number >= 0 = the rule's own, so a training A/B of `cq_c_scale` no longer changes how the evaluations choose their moves. The rule's name and Elo pool carry the effective value (`cq-n4-v50-s0.3`, `cq-n4` at 50 / 1), so a run with the scale pinned keeps its pool when only `cq_c_scale` changes. The rule 'cq' only (an error with 'visits', as the guard); `none` on the command line unsets a saved value. Every evaluation path follows it (`Run.nn_seat`: yardstick, random, Elo, the `eval_remote`, co-training's evaluations, `eval_yard_net`), and `zero.h2h` / `zero.replay` of the run's checkpoints (sections 5.4, 12.5) |
+| `selfplay_select_c_visit`, `selfplay_select_c_scale` | unset (None) | the same for `selfplay_select` 'cq' (self-play's moves after `temp_moves`, remote self-play too: its checkout must have the setting); the recorded targets keep `cq_c_visit` / `cq_c_scale` whatever these are |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6); its own is refused |
@@ -594,9 +596,47 @@ target's argmax, optionally among the options with at least `eval_select_min_vis
 both seats -, the reference games have none, co-training's primary and resolver evaluations,
 `eval_yard_net`), so they all follow it, here and on an `eval_remote` (its config is the run's;
 section 5.2). `zero.h2h` and `zero.replay` take a checkpoint's run's rule unless told otherwise
-(`--select`, `--a-select` / `--b-select`; replays record it in the seat, `select`).
+(`--select`, `--a-select` / `--b-select`, the transform `--cq-c-visit` / `--cq-c-scale` and h2h's
+per-side `--a-cq-c-scale` / `--b-cq-c-scale`; replays record it in the seat, `select`).
 `selfplay_select` is the same rule for self-play after `temp_moves` (off by default: a forked
 run's A/B, section 12.4).
+
+**The rule's own completed-Q transform** (`eval_select_c_visit` / `eval_select_c_scale`,
+`selfplay_select_c_visit` / `selfplay_select_c_scale`; 2026-10-29, section 12.5). The 'cq' rule
+ranks options by the 'cq' target's logits, whose transform is `(c_visit + max N) c_scale`. Unset
+(the default), a rule uses the target's `cq_c_visit` / `cq_c_scale` - one knob for training and
+move selection, as before these settings; set, the rule has its own and the targets keep theirs.
+A run's evaluation rule is `mcts.select_settings(cfg, 'eval_select')` (rule, guard, effective
+transform): `Run.nn_seat` builds every evaluation seat from it, `elo.eval_tag` names its pool
+after it (`select_tag`: the effective transform, so `cq-n4-v50-s0.3` whether the 0.3 comes from
+`cq_c_scale` or from `eval_select_c_scale`, and `cq-n4` at 50 / 1), and `zero.h2h` / `zero.replay`
+read a checkpoint's run through it. Consequences: a run whose rule transform is pinned keeps its
+pool when only its training `cq_c_scale` changes; a run with the setting unset changes pool with
+`cq_c_scale` as before; pinning the scale at a restart to the value the run already selects with
+(e.g. `--eval-select-c-scale 0.3` on a run at `cq_c_scale` 0.3) keeps the pool, the evaluations
+and every file byte for byte, and pinning it to another value begins that value's pool (as any
+rule change does: `since`, no replay). The seat keys (docs/search.md 3.3): an evaluation seat
+has no 'cq' target, so it carries the rule's transform as `cq_c_visit` / `cq_c_scale` (the seat
+dict of an equal effective rule is the same dict, key for key); a self-play seat with a 'cq'
+target adds `select_c_visit` / `select_c_scale` where the rule's transform differs from the
+target's. A remote evaluation on an older checkout computes the rule from `cq_c_scale`: when that
+differs from the run's effective rule its result names another rule and is refused (5.2); a
+remote self-play checkout without the setting would select at `cq_c_scale` (nothing to compare
+there: update the remote's checkout with the pin).
+
+**What "unset" should mean long-term.** Today unset follows `cq_c_scale`, and it stays so for
+now (every existing run and config behaves bit for bit as before). Recommended later: unset = a
+fixed transform (50 / 1, the paper's and the 'cq' rule's measured default, or whatever value the
+selection-scale measurement settles on) instead of following the target. The reasons: the two
+knobs answer different questions (how sharp the training target is; how far Q may overrule the
+prior when choosing a move), they act separately (12.5: in MTG Zero's A/B the training scale 0.3 had
+no measurable effect, while selecting at 0.3 instead of 1.0 was worth ~+100 Elo head to head), and following makes every training A/B of `cq_c_scale`
+silently an A/B of the evaluation rule. The switch needs one migration: every run config with a
+'cq' rule and a `cq_c_*` other than the new default gets its current effective transform written
+in (`eval_select_c_scale` = its `cq_c_scale`, likewise `selfplay_*`), so no run changes moves or
+pool; then the default flips. Until then: **pin the selection scale explicitly** on any run whose
+`cq_c_scale` might be changed, and give both arms of a `cq_c_scale` A/B the same
+`eval_select_c_scale`.
 
 **Bookkeeping.** Every evaluation records its rule: `eval_yard`, `eval_random` and `elo` rows
 carry `select` = the rule's name (`mcts.select_tag`: 'cq', 'cq-n2', 'cq-v25-s0.5' with another
@@ -1486,3 +1526,69 @@ arms' checkpoints of equal iterations (`zero.h2h`, both sides at the same `--sel
 policy-target A/Bs (section 9) were read. Expected effects to watch: games follow Q earlier, so
 self-play's value targets see more search-preferred lines; the visit-count policy targets do
 not change meaning (a cq target is the natural pair, as Gumbel AlphaZero trains it).
+
+### 12.5 The selection scale is its own setting (2026-10-29)
+
+**Why.** MTG Zero's overnight A/B series (its `runs/ab/results.md`) forked the Delver main line
+with one setting changed per experiment and read each with an h2h of the two arms' checkpoints at
+their runs' own rules. Experiment 2, `--cq-c-scale 0.3` (the 'cq' training target's scale), won
+64.2 +- 2.4% - but the 'cq' evaluation rule read the same `cq_c_scale`, so the fork *selected*
+its moves at 0.3 (`cq-n4-v50-s0.3`) while the control selected at 1.0 (`cq-n4`). Re-run with both
+sides at `--select visits` (400 games, the same checkpoints): 49.0 +- 2.5%, no training effect.
+The 64% was the selection scale. One knob controlled both, so a training A/B silently changed the
+evaluation rule; now they are two settings (1.2, 5.4).
+
+**What was built.**
+
+* Run settings `eval_select_c_visit`, `eval_select_c_scale`, `selfplay_select_c_visit`,
+  `selfplay_select_c_scale` (default None = unset = follow `cq_c_visit` / `cq_c_scale`; validated
+  by `check_eval_settings`, for `resolver_cfg` too; `none` on the command line unsets).
+* `mcts.select_settings(cfg, pre)` (rule, guard, effective transform), `mcts.select_transform`,
+  `mcts.check_select_transform`; `elo.eval_tag` and zerodash's `runfiles.elo_pool` name the pool
+  after the effective transform.
+* Seats: `games.nn_seat(..., select_c_visit, select_c_scale)` (the dict depends on the effective
+  rule only, see 5.4), `play.NNSeat` the same (`select_transform`, `select_tag`; 'py' seats'
+  formula and 'rs' seats' `root_select` take it); the bindings' seat keys `select_c_visit` /
+  `select_c_scale` (absent: the seat's `cq_c_*`; an error on a 'visits' seat) feed `Select::Cq`,
+  while `PolicyTarget::CompletedQ` keeps `cq_c_*` (the Rust driver already held the two apart).
+* `zero.h2h`: a run's rule with its effective transform (`run_rule`), `--cq-c-visit` /
+  `--cq-c-scale` for both sides (with `--select`: 50 / 1 when not given, as before; without it now
+  over each 'cq' side's run rule - an error if no side plays 'cq'), per side `--a-cq-c-visit`,
+  `--a-cq-c-scale`, `--b-cq-c-visit`, `--b-cq-c-scale` (over the both-sides flags; an error on a
+  'visits' side). `python -m <pkg>.az.h2h K.pt K.pt --select cq --select-min-visits 4
+  --a-cq-c-scale 0.3 --b-cq-c-scale 1.0` compares two selection scales on one checkpoint
+  (`select_a` 'cq-n4-v50-s0.3', `select_b` 'cq-n4').
+* `zero.replay`: the run's rule with its transform; `--cq-c-visit` / `--cq-c-scale` (with or
+  without `--select`). `zero.parity h2h --select-c-visit / --select-c-scale`; parity's rules include
+  ('cq', 4, 50, 0.3).
+
+**Checks** (zero-core main 45885aa as the base; `tests/test_select_scale.py`, 10 tests):
+
+* Defaults byte for byte against 45885aa: the three toy-smoke runs of 12.3 (classic; rolling;
+  margin_w 0.2 + chance_k 2 + cq targets + `eval_every` 2), each with the settings left out and given
+  explicitly as `none`: shards, checkpoints (by zip member), optimizer state, metrics (timing aside),
+  Elo files and models/index.json identical; config.json gains the four keys (null). The same for
+  a run *at* the 'cq' rule with a non-default scale (cq targets, `cq_c_scale` 0.3, `eval_select cq`
+  guard 2, `selfplay_select cq`, raw Elo offsets, 4 iterations), unset and given equal to 0.3: 11
+  files identical, pool `cq-n2-v50-s0.3` byte for byte (the live Delver line's shape).
+  `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy checkpoint):
+  identical.
+* Unset vs given equal to `cq_c_scale` (0.5, both rules, a toy run): every shard, checkpoint and
+  Elo file identical, the same pool; the seat dicts key for key.
+* The selection scale changes selection only: a toy run with `--eval-select-c-scale 0.3` beside
+  its control has identical shards and checkpoints, its evaluations in pool `cq-v50-s0.3`; a run
+  with `--cq-c-scale 0.3 --eval-select-c-scale 1.0` has other shards (the targets) and the
+  control's pool `cq`; `--selfplay-select-c-scale 0.3` at `cq_c_scale` 1.0 vs `--cq-c-scale 0.3`
+  plays the same first self-play games with other targets. In the drivers (Rust driver through the
+  bindings, the Python driver's 'py' and 'rs' seats, and a Rust unit test
+  `select_transform_moves_only_the_moves_never_the_targets`): a self-play seat with target 1.0 +
+  rule 0.3 plays the games of target 0.3 + rule 0.3 (every record field but pi equal) and its
+  targets are the 1.0 targets of the same roots (checked against a target-0 run: per record,
+  (ln pi_A - ln pi_E) - (ln pi_B - ln pi_E) / 0.3 is constant over the options to < 1e-3); rule
+  1.0 plays other games (the check has power).
+* Rust vs Python at the live rule's shape (cq, guard 4, 0.3 beside a 1.0 target): the Python
+  formula on Rust roots = the Rust driver's choice on all cases (`parity.select_formula`, now 224
+  with the added rule); a Rust-tree seat vs a Python-tree seat ~50% (300 games); an 'rs' seat with
+  select_c_scale 0.3 plays exactly the games of one at `cq_c_scale` 0.3.
+* h2h per side (both flags, the side's over the both-sides', over a run's rule, the errors),
+  replays with the transform, the command line's `none`.

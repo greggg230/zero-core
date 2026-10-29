@@ -174,7 +174,8 @@ def _parse_ratings(path):
 def elo_pool(run_dir):
     """The Elo pool directory of a run's evaluation move rule (zero-core's `zero.elo.active_pool`,
     docs/az.md 5.4): elo/ for eval_select 'visits' (and runs without it), elo/<rule>/ otherwise
-    ('cq', 'cq-n2', 'cq-v25-s0.5': guard, then a completed-Q transform other than 50 / 1)."""
+    ('cq', 'cq-n2', 'cq-v25-s0.5': guard, then the rule's completed-Q transform - eval_select_c_visit
+    / _c_scale, unset: cq_c_visit / cq_c_scale - when other than 50 / 1)."""
     c = read_json(os.path.join(run_dir, 'config.json'))
     c = c if isinstance(c, dict) else {}
     rule = c.get('eval_select') or 'visits'
@@ -183,7 +184,9 @@ def elo_pool(run_dir):
     tag = rule
     if c.get('eval_select_min_visits'):
         tag += f"-n{int(c['eval_select_min_visits'])}"
-    cv, cs = float(c.get('cq_c_visit', 50.0)), float(c.get('cq_c_scale', 1.0))
+    cv, cs = c.get('eval_select_c_visit'), c.get('eval_select_c_scale')
+    cv = float(c.get('cq_c_visit', 50.0) if cv is None else cv)
+    cs = float(c.get('cq_c_scale', 1.0) if cs is None else cs)
     if (cv, cs) != (50.0, 1.0):
         tag += f'-v{cv:g}-s{cs:g}'
     return os.path.join(run_dir, 'elo', tag)

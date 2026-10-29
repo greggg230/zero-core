@@ -118,15 +118,16 @@ pub enum Select {
 }
 
 impl Select {
-    /// From the seat settings `select` ('visits' | 'cq'), `select_min_visits` (of 'cq' only),
-    /// `cq_c_visit`, `cq_c_scale` (the completed-Q transform's, shared with the 'cq' target).
+    /// From the seat settings `select` ('visits' | 'cq'), `select_min_visits` (of 'cq' only) and
+    /// the completed-Q transform `select_c_visit`, `select_c_scale` (absent: the seat's
+    /// `cq_c_visit`, `cq_c_scale`, the 'cq' target's; the target never reads these two).
     pub fn parse(name: &str, min_visits: u32, c_visit: f64, c_scale: f64) -> Result<Select, String> {
         match name {
             "visits" if min_visits == 0 => Ok(Select::Visits),
             "visits" => Err(format!("select_min_visits {min_visits}: a guard of select 'cq' (select 'visits' has none)")),
             "cq" => {
                 if !(c_visit.is_finite() && c_visit >= 0.0 && c_scale.is_finite() && c_scale >= 0.0) {
-                    return Err(format!("select 'cq' needs finite cq_c_visit >= 0 and cq_c_scale >= 0 (got {c_visit}, {c_scale})"));
+                    return Err(format!("select 'cq' needs a finite completed-Q transform c_visit >= 0, c_scale >= 0 (select_c_visit / select_c_scale, default cq_c_visit / cq_c_scale; got {c_visit}, {c_scale})"));
                 }
                 Ok(Select::Cq { c_visit, c_scale, min_visits })
             }

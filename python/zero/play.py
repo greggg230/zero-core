@@ -26,24 +26,33 @@ class NNSeat:
     """Search settings of a network seat. impl: 'py' (reference tree) | 'rs' (Rust tree).
     policy_target: training target of recorded decisions, 'visits' | 'cq' (completed Q with
     cq_c_visit, cq_c_scale). select, select_min_visits: the rule of the moves it does not sample
-    ('visits' | 'cq' with the same completed-Q transform; docs/search.md 3.3)."""
+    ('visits' | 'cq'; docs/search.md 3.3) and its completed-Q transform select_c_visit,
+    select_c_scale (None: the target's cq_c_visit, cq_c_scale)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
-                 policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0, select='visits', select_min_visits=0):
+                 policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0, select='visits', select_min_visits=0,
+                 select_c_visit=None, select_c_scale=None):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
         mcts.check_select(select, select_min_visits)
+        mcts.check_select_transform(select, select_c_visit, select_c_scale)
         self.key, self.sims, self.c_puct, self.selfplay = key, sims, c_puct, selfplay
         self.alpha, self.eps, self.temp_moves = alpha, eps, temp_moves
         self.sims_fast, self.p_full, self.chance_k, self.margin_w = sims_fast, p_full, chance_k, margin_w
         self.redet, self.impl = redet, impl
         self.policy_target, self.cq_c_visit, self.cq_c_scale = policy_target, cq_c_visit, cq_c_scale
         self.select, self.select_min_visits = select, select_min_visits
+        self.select_c_visit, self.select_c_scale = select_c_visit, select_c_scale
+
+    @property
+    def select_transform(self):
+        """The rule's completed-Q transform (c_visit, c_scale): its own, else the target's."""
+        return mcts.select_transform(self.cq_c_visit, self.cq_c_scale, self.select_c_visit, self.select_c_scale)
 
     @property
     def select_tag(self):
-        return mcts.select_tag(self.select, self.select_min_visits, self.cq_c_visit, self.cq_c_scale)
+        return mcts.select_tag(self.select, self.select_min_visits, *self.select_transform)
 
 
 class PySearch:
@@ -91,7 +100,7 @@ class PySearch:
 
     def choose(self, seat):
         """The root option the seat's move rule takes (the reference formula, `mcts.select_node`)."""
-        return mcts.select_node(self.t.root, seat.select, seat.select_min_visits, seat.cq_c_visit, seat.cq_c_scale)
+        return mcts.select_node(self.t.root, seat.select, seat.select_min_visits, *seat.select_transform)
 
     def advance(self, a, key, game):
         child = mcts.advance(self.t.root, a, key, game.to_move, game.legal())
@@ -144,7 +153,7 @@ class RsSearch:
 
     def choose(self, seat):
         """The root option the seat's move rule takes: the Rust driver's own code (`root_select`)."""
-        return self.t.root_select(seat.select, seat.select_min_visits, seat.cq_c_visit, seat.cq_c_scale)
+        return self.t.root_select(seat.select, seat.select_min_visits, *seat.select_transform)
 
     def advance(self, a, key, game):
         if game.over:

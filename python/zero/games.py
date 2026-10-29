@@ -96,25 +96,34 @@ def is_external(seat):
 
 def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20, sims_fast=None,
             p_full=1.0, chance_k=0, margin_w=0.0, redet=True, policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0,
-            sims_minor=None, select='visits', select_min_visits=0):
+            sims_minor=None, select='visits', select_min_visits=0, select_c_visit=None, select_c_scale=None):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
     (`SearchGame::minor_decision`) in self-play, never recorded (None: searched like the
     others). select, select_min_visits: the rule of the moves the seat does not sample ('visits'
-    = argmax (N, P0) | 'cq' = the completed-Q logits' argmax with the same cq_c_visit, cq_c_scale,
-    among the options with >= select_min_visits visits; docs/search.md 3.3). The target, minor and
-    select keys are only set when not the default."""
-    from .mcts import check_select
+    = argmax (N, P0) | 'cq' = the completed-Q logits' argmax among the options with >=
+    select_min_visits visits; docs/search.md 3.3), its transform select_c_visit / select_c_scale
+    (None: cq_c_visit / cq_c_scale). The target, minor and select keys are only set when not the
+    default, and the dict depends on the rule's effective transform only: a seat without a 'cq'
+    target carries it as cq_c_visit / cq_c_scale (nothing else reads them there), one with a 'cq'
+    target adds the keys select_c_visit / select_c_scale only where the rule's transform differs
+    from the target's - so a transform given equal to the target's is the seat of before, key for
+    key."""
+    from .mcts import check_select, check_select_transform, select_transform
     check_select(select, select_min_visits)
+    check_select_transform(select, select_c_visit, select_c_scale)
     d = dict(key=key, sims=sims, c_puct=c_puct, selfplay=selfplay, alpha=alpha, eps=eps, temp_moves=temp_moves,
              sims_fast=sims_fast, p_full=p_full, chance_k=chance_k, margin_w=margin_w, redet=redet)
+    sel = select_transform(cq_c_visit, cq_c_scale, select_c_visit, select_c_scale)
     if policy_target != 'visits':
         d.update(policy_target=policy_target, cq_c_visit=float(cq_c_visit), cq_c_scale=float(cq_c_scale))
     elif select != 'visits':
-        d.update(cq_c_visit=float(cq_c_visit), cq_c_scale=float(cq_c_scale))
+        d.update(cq_c_visit=sel[0], cq_c_scale=sel[1])
     if select != 'visits':
         d.update(select=select, select_min_visits=int(select_min_visits))
+        if policy_target != 'visits' and sel != (float(cq_c_visit), float(cq_c_scale)):
+            d.update(select_c_visit=sel[0], select_c_scale=sel[1])
     if sims_minor:
         d['sims_minor'] = int(sims_minor)
     return d

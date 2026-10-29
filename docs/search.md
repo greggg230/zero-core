@@ -449,10 +449,12 @@ Code: `Select::choose(p0, n, w, v)` (driver.rs; the driver's `decide` and the bi
 `mcts.select_index` / `select_node` (the reference; `play.PyDriver`'s 'py' seats use it, its
 'rs' seats the Rust tree's `root_select`), `mcts.select_tag` (the rule's name: 'visits', 'cq',
 'cq-n2' with a guard, 'cq-v25-s0.5' with another transform). Seat keys `select` ('visits' |
-'cq'), `select_min_visits` (cq's only: an error with 'visits'), and the transform `cq_c_visit`,
-`cq_c_scale` (shared with the cq target, as in Gumbel AlphaZero). Run settings: `eval_select`
-(every evaluation seat), `selfplay_select` (self-play after `temp_moves`) and their
-`*_min_visits` (docs/az.md 1.2, 5.4). Parity (section 6): the Python formula on Rust roots gives
+'cq'), `select_min_visits` (cq's only: an error with 'visits'), and the rule's transform
+`select_c_visit`, `select_c_scale` (absent: the seat's `cq_c_visit`, `cq_c_scale`, shared with the
+cq target as in Gumbel AlphaZero; cq's only; the target never reads them - `Select::Cq` and
+`PolicyTarget::CompletedQ` hold their own). Run settings: `eval_select` (every evaluation seat),
+`selfplay_select` (self-play after `temp_moves`), their `*_min_visits` and their transforms
+`*_c_visit` / `*_c_scale` (unset: `cq_c_*`; docs/az.md 1.2, 5.4, 12.5). Parity (section 6): the Python formula on Rust roots gives
 the Rust driver's move on every root and rule checked.
 
 ## 4. Bindings and registering a game
@@ -564,7 +566,10 @@ win (1e-9) and completed-Q targets (1e-6), with deferred leaves evaluated once p
 and 64 simulations, the Python `select_index` on each root's P0 / N / W / network value gives
 the Rust driver's own move (`root_select`) for all 192 (position, simulations, rule) cases -
 'visits', 'cq' with guards 0, 1, 2 and 4, and transforms (50, 1), (10, 3), (50, 0.1); no
-near-ties - and the rules do differ on these roots (cq != visits, the guard != no guard).
+near-ties - and the rules do differ on these roots (cq != visits, the guard != no guard). Since
+2026-10-29 also guard 4 at (50, 0.3), the rule of MTG Zero's Delver line (224 cases), and
+`tests/test_select_scale.py` plays it with its own transform beside a 1.0 target (docs/az.md
+12.5).
 In games (`python -m zero.parity h2h --select cq`, a toy-smoke checkpoint, 32 simulations,
 Rust-tree seat vs Python-tree seat, both 'cq'): 52.1% +-2.0 (95%, 2000 games, seed 0), 49.7%
 +-1.2 and 50.8% +-1.2 (6000 games each, seeds 1, 2) - 50.5% over the 14,000; the same seeds with

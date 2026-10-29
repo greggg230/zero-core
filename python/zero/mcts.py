@@ -39,8 +39,9 @@ the completed-Q target of Gumbel AlphaZero (`cq_target`, `completed_q_policy`).
 
 The move of a decision that is not sampled (docs/search.md 3.3; `select_index`): argmax (N, P0)
 ('visits', the default), or the argmax of the completed-Q target's logits ('cq',
-`completed_q_logits`) among the options with at least `min_visits` visits. `select_tag` names a
-rule (its evaluations' Elo pool, docs/az.md 5.4).
+`completed_q_logits`) among the options with at least `min_visits` visits, with the rule's own
+completed-Q transform where set (`select_transform`; else the target's). `select_tag` names a
+rule (its evaluations' Elo pool, docs/az.md 5.4), `select_settings` reads one from run settings.
 """
 import math
 
@@ -307,6 +308,36 @@ def check_select(rule, min_visits=0, what='select'):
         raise ValueError(f"{what}_min_visits {min_visits}: a guard of {what} 'cq' ('visits' has none)")
 
 
+def check_select_transform(rule, c_visit=None, c_scale=None, what='select'):
+    """A move rule's own completed-Q transform (`<what>_c_visit`, `<what>_c_scale`: None = unset,
+    the 'cq' target's cq_c_visit / cq_c_scale; else a finite number >= 0, of the rule 'cq' only)
+    -> None, else ValueError (`what`: the rule's setting name in the message)."""
+    for name, x in (('c_visit', c_visit), ('c_scale', c_scale)):
+        if x is None:
+            continue
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
+            raise ValueError(f'{what}_{name} {x!r}: a finite number >= 0 (unset: cq_{name})')
+        if rule == 'visits':
+            raise ValueError(f"{what}_{name} {x!r}: a setting of {what} 'cq' ('visits' has no completed-Q transform)")
+
+
+def select_transform(c_visit=50.0, c_scale=1.0, sel_c_visit=None, sel_c_scale=None):
+    """The 'cq' rule's completed-Q transform (c_visit, c_scale) as floats: its own `sel_c_visit` /
+    `sel_c_scale` where set, else the target's `c_visit` / `c_scale` (the cq_c_* settings)."""
+    return (float(c_visit if sel_c_visit is None else sel_c_visit),
+            float(c_scale if sel_c_scale is None else sel_c_scale))
+
+
+def select_settings(cfg, pre='eval_select'):
+    """(rule, min_visits, c_visit, c_scale) of a run's move rule `pre` ('eval_select' |
+    'selfplay_select') from its settings `cfg` (a config dict, missing keys at their defaults): the
+    transform is `<pre>_c_visit` / `<pre>_c_scale` where set, else cq_c_visit / cq_c_scale (docs/az.md
+    5.4)."""
+    cv, cs = select_transform(cfg.get('cq_c_visit', 50.0), cfg.get('cq_c_scale', 1.0), cfg.get(pre + '_c_visit'),
+                              cfg.get(pre + '_c_scale'))
+    return cfg.get(pre, 'visits'), int(cfg.get(pre + '_min_visits', 0)), cv, cs
+
+
 def select_index(P0, Nv, W, v, rule='visits', min_visits=0, c_visit=50.0, c_scale=1.0):
     """The chosen option of a searched decision that is not sampled (the Rust driver's
     `Select::choose`): 'visits' = argmax (N, P0); 'cq' = argmax of `completed_q_logits` among the
@@ -336,8 +367,9 @@ def select_node(node, rule='visits', min_visits=0, c_visit=50.0, c_scale=1.0):
 
 def select_tag(rule='visits', min_visits=0, c_visit=50.0, c_scale=1.0):
     """The name of a move rule: 'visits', 'cq', 'cq-n2' (the guard), 'cq-v25-s0.5' (a completed-Q
-    transform other than c_visit 50, c_scale 1). Evaluations record it (absent = 'visits') and
-    each rule has its own Elo pool (docs/az.md 5.4)."""
+    transform other than c_visit 50, c_scale 1: the rule's own, `select_transform`). Evaluations
+    record it (absent = 'visits') and each rule has its own Elo pool (docs/az.md 5.4), so the
+    pool follows the rule's transform only, never the training target's."""
     if rule == 'visits':
         return 'visits'
     t = rule
