@@ -89,10 +89,12 @@ def _with_aux(model, dim, head, aux):
         model.aux_head = _aux_head(dim, head, model.aux_layout)
 
 
-def _aux_out(model, z):
+def _aux_out(model, z, rows=None):
+    """The auxiliary head on the pooled states `z` (`rows`: of those rows only, an index tensor -
+    the search's root belief rows, docs/search.md 3.8)."""
     if not model.aux_layout:
         raise ValueError('forward(aux=True): the network has no auxiliary head (net.add_aux)')
-    return model.aux_head(z)
+    return model.aux_head(z if rows is None else z[rows])
 
 
 def aux_predict(layout, raw):
@@ -138,11 +140,11 @@ class Net(nn.Module):
         self.mar = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
         _with_aux(self, hidden, head, aux)
 
-    def forward(self, x, n_players, aux=False):
+    def forward(self, x, n_players, aux=False, aux_rows=None):
         """x [B, >= features] (a narrower network reads a prefix: the evaluator refuses that
         unless told otherwise, docs/az.md 10.4), n_players [B] -> policy logits [B, actions],
         value logits [B, seats] (absent seats -1e9), margin [B, seats] (+ with `aux` the raw
-        auxiliary outputs [B, aux width])."""
+        auxiliary outputs [B, aux width]; `aux_rows`, an index tensor: of those rows only)."""
         h = F.relu(self.inp(x[:, :self.features]))
         for b in self.blocks:
             h = b(h)
@@ -150,7 +152,7 @@ class Net(nn.Module):
         present = torch.arange(self.seats, device=x.device)[None, :] < n_players[:, None]
         vlog = self.val(h).masked_fill(~present, -1e9)
         if aux:
-            return self.pol(h), vlog, self.mar(h), _aux_out(self, h)
+            return self.pol(h), vlog, self.mar(h), _aux_out(self, h, aux_rows)
         return self.pol(h), vlog, self.mar(h)
 
     def n_params(self):
@@ -229,7 +231,7 @@ class GridNet(nn.Module):
         self.mar = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, seats))
         _with_aux(self, 256, head, aux)
 
-    def forward(self, x, n_players, aux=False):
+    def forward(self, x, n_players, aux=False, aux_rows=None):
         """As `Net.forward`."""
         B = x.shape[0]
         x = x[:, :self.features]
@@ -254,7 +256,7 @@ class GridNet(nn.Module):
         present = torch.arange(self.seats, device=x.device)[None, :] < n_players[:, None]
         vlog = self.val(e).masked_fill(~present, -1e9)
         if aux:
-            return pol, vlog, self.mar(e), _aux_out(self, e)
+            return pol, vlog, self.mar(e), _aux_out(self, e, aux_rows)
         return pol, vlog, self.mar(e)
 
     def n_params(self):
@@ -546,7 +548,7 @@ class TokenNet(nn.Module):
             return h, n, full, idt
         return h, n, full
 
-    def forward(self, x, n_players, aux=False):
+    def forward(self, x, n_players, aux=False, aux_rows=None):
         """As `Net.forward`."""
         x = x[:, :self.features]
         if self.n_id:
@@ -586,7 +588,7 @@ class TokenNet(nn.Module):
         present = torch.arange(self.seats, device=dev)[None, :] < n_players[:, None]
         vlog = self.val(z).masked_fill(~present, -1e9)
         if aux:
-            return pol[:, :self.actions], vlog, self.mar(z), _aux_out(self, z)
+            return pol[:, :self.actions], vlog, self.mar(z), _aux_out(self, z, aux_rows)
         return pol[:, :self.actions], vlog, self.mar(z)
 
     def n_params(self):
@@ -682,6 +684,32 @@ def load(path, device='cpu', game=None, allow_mismatch=False):
 class EncodingMismatch(ValueError):
     """A network built for another encoding than the one this build's game feeds it
     (`check_encoding`): fed this build's inputs it would misread them without an error."""
+
+
+class HeadMissing(EncodingMismatch):
+    """A network without the auxiliary head a setting needs (the root's belief, `*_belief_tilt` > 0,
+    docs/search.md 3.8), or with a head for other targets than the game's: it cannot serve the run. An
+    EncodingMismatch, so every path that refuses a checkpoint refuses it (a run exits with
+    EXIT_REFUSED and is not restarted; a remote reports it); never a search dealing uniformly in
+    silence (docs/az.md 18.3)."""
+
+
+def check_belief_head(model, game, what='belief_tilt'):
+    """`model` can answer root belief rows for `game` (docs/search.md 3.8): it has the auxiliary head,
+    for exactly the game's targets (names and widths in order) -> None, else HeadMissing (`what`: the
+    setting that asks, for the message)."""
+    from . import games as G
+    have = [(t[0], int(t[1])) for t in aux_layout(getattr(model, 'aux_layout', None) or model.config.get('aux'))]
+    want = [(n, int(w)) for n, w in G.info(game).get('aux_layout') or []]
+    c = getattr(model, 'config', {})
+    if not want:
+        raise HeadMissing(f'{what}: the game {game!r} has no auxiliary targets for a belief to predict')
+    if not have:
+        raise HeadMissing(f'{what}: the network (game {c.get("game")!r}, arch {c.get("arch", "mlp")!r}) has no auxiliary '
+                          f'head: the root\'s belief needs one trained on the game\'s targets {[n for n, _ in want]} (a run '
+                          f'with aux_<name>_w > 0, docs/az.md 15; a checkpoint from before it cannot serve {what})')
+    if have != want:
+        raise HeadMissing(f'{what}: the network\'s auxiliary head predicts {have}, the game\'s targets are {want}')
 
 
 ADVICE = ('Move a run across an encoding change with `python tools/fork_run.py <checkpoint> <new run>` (an exact '

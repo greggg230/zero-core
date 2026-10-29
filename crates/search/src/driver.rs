@@ -23,7 +23,9 @@
 //! temperature sampling for the first `temp_moves` searched decisions, training records of
 //! full searches (policy target: visits or completed Q, `PolicyTarget`), tree reuse, and the
 //! opt-in root minimum visits of full searches (`NnSeat::root_min_visits`, `root_floor`,
-//! docs/search.md 3.5).
+//! docs/search.md 3.5), the opt-in root's belief (`NnSeat::belief_tilt`, docs/search.md 3.8: one
+//! flagged `ROW_BELIEF` row per searched decision, whose auxiliary output `submit_aux` returns; the
+//! search's worlds are then dealt by it).
 //!
 //! **Rolling mode** (`DriverCfg::rolling`): games never run out - game `gid` takes the seats
 //! `games[gid % games.len()]` - and play is divided into phases. `resume(quota, net)` runs
@@ -55,7 +57,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockRead
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::game::{make_bot, Bot, SearchGame, MAX_SEATS};
+use crate::game::{make_bot, Belief, Bot, SearchGame, MAX_SEATS};
 use crate::rng::{split64, Rng};
 use crate::tree::Tree;
 
@@ -294,14 +296,50 @@ pub struct NnSeat {
     /// state, in that seat's perspective, no options (no policy target), `q` per `view_target`.
     pub view_samples: f64,
     pub view_target: ViewTarget,
+    /// The root's belief (docs/search.md 3.8; 0 = off, the default): a search that takes it asks
+    /// the network for the root's auxiliary output once (one `ROW_BELIEF` row) and deals every
+    /// simulation's world with `SearchGame::determinize_with` at this tilt (alpha > 0).
+    pub belief_tilt: f64,
+    /// The belief's clip R >= 1 (default 20): every weight of the deal in [1/R, R].
+    pub belief_clip: f64,
+    /// The share of a belief search's simulations dealt uniformly all the same (in [0, 1); default 0).
+    pub belief_mix: f64,
+    /// Whether fast (`sims_fast`) and minor (`sims_minor`) searches take the belief too (default
+    /// false: full searches only - every search of an evaluation seat, a self-play seat's recorded
+    /// ones).
+    pub belief_fast: bool,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false }
+    }
+
+    /// The belief settings' check (`Driver::new`; the bindings' messages): tilt finite >= 0, clip
+    /// finite >= 1, mix in [0, 1) (1 would deal every world uniformly: the tilt a silent no-op).
+    pub fn check_belief(tilt: f64, clip: f64, mix: f64) -> Result<(), String> {
+        if !(tilt.is_finite() && tilt >= 0.0) {
+            return Err(format!("belief_tilt {tilt}: a finite number >= 0 (0 = off)"));
+        }
+        if !(clip.is_finite() && clip >= 1.0) {
+            return Err(format!("belief_clip {clip}: a finite number >= 1 (every weight in [1/clip, clip])"));
+        }
+        if !(mix.is_finite() && (0.0..1.0).contains(&mix)) {
+            return Err(format!("belief_mix {mix}: a share in [0, 1) of the simulations dealt uniformly (1 would make belief_tilt a no-op: set it to 0 instead)"));
+        }
+        Ok(())
+    }
+
+    /// Whether this seat's search of a decision takes the root's belief (`full`: a full search;
+    /// docs/search.md 3.8).
+    pub fn takes_belief(&self, full: bool) -> bool {
+        self.belief_tilt > 0.0 && (full || self.belief_fast)
     }
 }
+
+/// The default belief clip R (`NnSeat::belief_clip`).
+pub const BELIEF_CLIP: f64 = 20.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SeatCfg {
@@ -398,6 +436,13 @@ pub const ROW_LEAF: u8 = 0;
 /// `LeafView::Root`, docs/search.md 3.6). Extra rows are flagged by kind so that other features can
 /// add their own (a kind > 0 always belongs to the closest leaf row before it, of the same game).
 pub const ROW_VALUE: u8 = 1;
+/// A search's root belief row (docs/search.md 3.8): `encode(viewer)` of the root (the live game's
+/// decision, the tree viewer's own view), no options, `player` the viewer. The driver reads only
+/// its auxiliary output (`Driver::submit_aux`: the network's predictions of the game's `AUX`
+/// targets); its value and margin are ignored. It follows the root's own leaf row when the root
+/// was fresh (the decision's first leaf), else it is the game's only row of the batch (a reused
+/// root: the search waits for it) - the one kind that may stand without a leaf row before it.
+pub const ROW_BELIEF: u8 = 2;
 
 /// A batch for one evaluator key (docs/search.md 2.2).
 #[derive(Clone, Debug, Default)]
@@ -415,7 +460,8 @@ pub struct Batch {
     pub player: Vec<i32>,
     pub n_players: Vec<i32>,
     pub gid: Vec<i64>,
-    /// Network batches: the kind of every row (`ROW_LEAF`, or an extra row's kind: `ROW_VALUE`).
+    /// Network batches: the kind of every row (`ROW_LEAF`, or an extra row's kind: `ROW_VALUE`,
+    /// `ROW_BELIEF`).
     pub extra: Vec<u8>,
     /// External batches: the exported state per row.
     pub states: Vec<String>,
@@ -558,14 +604,22 @@ struct Parked<G: SearchGame> {
 }
 
 enum Eval {
-    Nn { opt_off: Vec<i32>, priors: Vec<f32>, value: Vec<f32>, margin: Vec<f32>, bases: Vec<u32> },
+    /// `aux`: the `ROW_BELIEF` rows' auxiliary outputs in row order (`aux_width()` each), `aux_row`
+    /// per batch row its index there (`NO_AUX`: not a belief row; empty: no belief rows).
+    Nn { opt_off: Vec<i32>, priors: Vec<f32>, value: Vec<f32>, margin: Vec<f32>, bases: Vec<u32>, aux: Vec<f32>, aux_row: Vec<u32> },
     Ext { payloads: Vec<String>, bases: Vec<u32> },
 }
 
+/// `Eval::Nn::aux_row` of a row that is not a belief row.
+const NO_AUX: u32 = u32::MAX;
+
 enum Pending {
     /// `vrow`: the value comes from the next row, a value-only row of the tree's viewer
-    /// (`LeafView::Root` at another seat's leaf).
-    Leaf { key: u16, local: u32, seat: usize, node: u32, vrow: bool },
+    /// (`LeafView::Root` at another seat's leaf). `brow`: the row after it (and after the value
+    /// row) is the search's root belief row (`ROW_BELIEF`, with a fresh root's first leaf).
+    Leaf { key: u16, local: u32, seat: usize, node: u32, vrow: bool, brow: bool },
+    /// A reused root's belief row alone: the search waits for it (docs/search.md 3.8).
+    Belief { key: u16, local: u32, seat: usize },
     Ext { key: u16, local: u32 },
 }
 
@@ -589,6 +643,8 @@ struct Slot<G: SearchGame> {
     full: bool,
     /// The current decision is minor (searched with `sims_minor`).
     minor: bool,
+    /// The current search takes the root's belief (`NnSeat::takes_belief`, docs/search.md 3.8).
+    belief: bool,
     decisions: u32,
     ext_moves: u32,
     steps: u64,
@@ -629,6 +685,7 @@ impl<G: SearchGame> Slot<G> {
             target: None,
             full: true,
             minor: false,
+            belief: false,
             decisions: 0,
             ext_moves: 0,
             steps: 0,
@@ -743,6 +800,8 @@ struct Counters {
     /// Value-only rows sent with leaves (`LeafView::Root`) and value-only samples recorded.
     view_rows: AtomicU64,
     view_recorded: AtomicU64,
+    /// Root belief rows sent (`ROW_BELIEF`, docs/search.md 3.8).
+    belief_rows: AtomicU64,
     /// The longest a game's step took (one slot's advance between two of its leaves: its search
     /// and moves, ns), that game's gid, and the steps over SLOW_STEP_NS.
     step_max_ns: AtomicU64,
@@ -825,6 +884,9 @@ pub struct DriverStats {
     /// (`NnSeat::view_samples`; `recorded` counts the decisions).
     pub view_rows: u64,
     pub view_recorded: u64,
+    /// Root belief rows of the network batches (`ROW_BELIEF`: one per search that takes the belief,
+    /// docs/search.md 3.8).
+    pub belief_rows: u64,
     pub emitted: u64,
     pub epoch: u32,
     pub net: u32,
@@ -850,14 +912,17 @@ pub struct InFlight {
     pub max_rounds: u32,
 }
 
+/// An answered-to-be batch (`Driver::outstanding`): group, key, rows, opt_off, belief rows.
+type Outstanding = (usize, u16, usize, Vec<i32>, Vec<u32>);
+
 pub struct Driver<G: SearchGame> {
     sh: Arc<Shared<G>>,
     workers: Vec<JoinHandle<()>>,
     gstate: Vec<GState>,
     cursor: usize,
     ready: VecDeque<Batch>,
-    /// batch id -> (group, key, rows, opt_off of a network batch)
-    outstanding: HashMap<u64, (usize, u16, usize, Vec<i32>)>,
+    /// batch id -> (group, key, rows, opt_off of a network batch, its root belief rows' indexes)
+    outstanding: HashMap<u64, Outstanding>,
     next_bid: u64,
     next_gid: u32,
     results: Vec<GameResult>,
@@ -913,6 +978,10 @@ impl<G: SearchGame> Driver<G> {
                     }
                     if n.root_min_visits > 0 && n.root_min_visits_max_actions < 2 {
                         return Err(format!("root_min_visits_max_actions {}: at least 2 (a root of one option is not searched)", n.root_min_visits_max_actions));
+                    }
+                    NnSeat::check_belief(n.belief_tilt, n.belief_clip, n.belief_mix)?;
+                    if n.belief_tilt > 0.0 && G::aux_width() == 0 {
+                        return Err(format!("belief_tilt {}: {} has no auxiliary targets (SearchGame::AUX) for a belief to predict", n.belief_tilt, G::NAME));
                     }
                 }
                 SeatCfg::External(k) => {
@@ -1149,7 +1218,8 @@ impl<G: SearchGame> Driver<G> {
         loop {
             self.check_error()?;
             if let Some(b) = self.ready.pop_front() {
-                self.outstanding.insert(b.id, (b.group, b.key, b.b, b.opt_off.clone()));
+                let brows: Vec<u32> = b.extra.iter().enumerate().filter(|(_, &e)| e == ROW_BELIEF).map(|(r, _)| r as u32).collect();
+                self.outstanding.insert(b.id, (b.group, b.key, b.b, b.opt_off.clone(), brows));
                 self.batches += 1;
                 return Ok(Some(b));
             }
@@ -1243,11 +1313,44 @@ impl<G: SearchGame> Driver<G> {
     }
 
     /// Network evaluation of batch `id`: priors [options], value / margin [B * MAX_SEATS]
-    /// (relative to the decider: column j = seat (player + j) % n_players).
+    /// (relative to the decider: column j = seat (player + j) % n_players). A batch with root
+    /// belief rows needs `submit_aux`.
     pub fn submit(&mut self, id: u64, priors: &[f32], value: &[f32], margin: &[f32]) -> Result<(), String> {
-        let Some((g, key, b, opt_off)) = self.outstanding.get(&id).map(|o| (o.0, o.1, o.2, &o.3)) else {
+        self.submit_aux(id, priors, value, margin, &[])
+    }
+
+    /// `submit` with the auxiliary outputs of the batch's root belief rows (`ROW_BELIEF`,
+    /// docs/search.md 3.8): `aux` = [belief rows x aux_width()] in row order, the network's
+    /// predictions of the game's `AUX` targets for those rows (empty when the batch has none). A
+    /// batch with belief rows and no (or a wrongly sized) `aux` is an error: an evaluator that
+    /// cannot compute the belief never leaves the search dealing uniformly in silence.
+    pub fn submit_aux(&mut self, id: u64, priors: &[f32], value: &[f32], margin: &[f32], aux: &[f32]) -> Result<(), String> {
+        let Some((g, key, b, opt_off, brows)) = self.outstanding.get(&id).map(|o| (o.0, o.1, o.2, &o.3, &o.4)) else {
             return Err(format!("unknown or already answered batch id {id}"));
         };
+        let w = G::aux_width();
+        if aux.len() != brows.len() * w {
+            return Err(if brows.is_empty() {
+                format!("batch {id} has no root belief rows: {} auxiliary values given", aux.len())
+            } else {
+                format!(
+                    "batch {id} has {} root belief rows (ROW_BELIEF: a seat's belief_tilt > 0): its evaluator must answer their auxiliary outputs ({} x {w} values, got {}; a network without the auxiliary head cannot serve belief_tilt)",
+                    brows.len(),
+                    brows.len(),
+                    aux.len()
+                )
+            });
+        }
+        if let Some(x) = aux.iter().find(|x| !x.is_finite() || **x < 0.0) {
+            return Err(format!("batch {id}: a root belief row's auxiliary output {x} (predictions are finite and >= 0)"));
+        }
+        let mut aux_row = Vec::new();
+        if !brows.is_empty() {
+            aux_row = vec![NO_AUX; b];
+            for (k, &r) in brows.iter().enumerate() {
+                aux_row[r as usize] = k as u32;
+            }
+        }
         if self.sh.cfg.keys[key as usize].1 != KeyKind::Nn {
             return Err(format!("batch {id} is an external batch: use submit_external"));
         }
@@ -1255,10 +1358,10 @@ impl<G: SearchGame> Driver<G> {
         if priors.len() != nopt || value.len() != b * MAX_SEATS || margin.len() != b * MAX_SEATS {
             return Err(format!("evaluation shapes: priors {} (want {nopt}), value {} / margin {} (want {})", priors.len(), value.len(), margin.len(), b * MAX_SEATS));
         }
-        let (_, _, _, opt_off) = self.outstanding.remove(&id).unwrap();
+        let (_, _, _, opt_off, _) = self.outstanding.remove(&id).unwrap();
         let grp = &self.sh.groups[g];
         let bases = std::mem::take(&mut lock(&grp.bases)[key as usize]);
-        write(&grp.evals)[key as usize] = Some(Eval::Nn { opt_off, priors: priors.to_vec(), value: value.to_vec(), margin: margin.to_vec(), bases });
+        write(&grp.evals)[key as usize] = Some(Eval::Nn { opt_off, priors: priors.to_vec(), value: value.to_vec(), margin: margin.to_vec(), bases, aux: aux.to_vec(), aux_row });
         self.answered(g)
     }
 
@@ -1392,6 +1495,7 @@ impl<G: SearchGame> Driver<G> {
             minor: c.minor.load(Ordering::Relaxed),
             view_rows: c.view_rows.load(Ordering::Relaxed),
             view_recorded: c.view_recorded.load(Ordering::Relaxed),
+            belief_rows: c.belief_rows.load(Ordering::Relaxed),
             emitted: self.emitted,
             epoch: self.sh.epoch.load(Ordering::Relaxed),
             net: self.sh.net.load(Ordering::Relaxed),

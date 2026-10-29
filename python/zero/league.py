@@ -274,8 +274,13 @@ def load_into(ev, path, c):
     """A slot's evaluator holding the network at `path` (guarded): `ev`'s weights replaced when the
     network's config is the same, else a new NetEvaluator."""
     from .infer import NetEvaluator
-    from .net import load
+    from .net import check_belief_head, load
     m, _ = load(path, 'cpu', game=c['game'])
+    if float(c.get('selfplay_belief_tilt', 0.0) or 0.0) > 0:
+        # a league opponent is the self-play seat: it takes the root's belief too, so its checkpoint
+        # needs the head (HeadMissing: narrow selfplay_league_pool to checkpoints that have one)
+        check_belief_head(m, c['game'], f'selfplay_belief_tilt (the league opponent {path}: a selfplay_league_pool '
+                                        f'reaching before the auxiliary head was trained)')
     if ev is not None and getattr(ev.model, 'config', None) == m.config:
         ev.set_weights(m.state_dict())
         return ev

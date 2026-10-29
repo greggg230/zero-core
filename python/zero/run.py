@@ -36,6 +36,12 @@ recorded (zero/league.py, docs/az.md 14).
 head (added to a checkpoint without one, everything else as it was) and training adds its loss x the
 weight (zero/auxtarget.py, docs/az.md 15). 0 (the default): the run of before.
 
+--selfplay-belief-tilt 1 / --eval-belief-tilt 1: the root's belief (docs/search.md 3.8, docs/az.md 18):
+every full search of that seat asks the network's auxiliary head once for the root's prediction of the
+hidden cards and deals its simulations' worlds by it (the game's `determinize_with`; belief_clip,
+belief_mix, belief_fast). Needs a checkpoint with the head (aux_<name>_w > 0 in its history): one
+without it is refused (net.HeadMissing, exit 78). 0 (the default): the run of before.
+
 --selfplay-remote <name>: another machine (a remote of the game package) self-plays too, with the
 same checkpoint: both machines pull the iteration's --games (the total) from one shared queue, each
 with at most its throughput's share in flight; its shards come back into data/iter_i/
@@ -60,7 +66,7 @@ from . import auxtarget as AUX, elo, games as G, league as L, package, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
-from .net import EncodingMismatch, add_aux, aux_layout, check_checkpoint, load, make_net, save
+from .net import EncodingMismatch, add_aux, aux_layout, check_belief_head, check_checkpoint, load, make_net, save
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
 
@@ -162,6 +168,15 @@ DEFAULTS = dict(
     # target's q, 'next_q' (that seat's next search's root value, z if none) | 'z'. 0 = off
     selfplay_leaf_value_view='mover', eval_leaf_value_view='mover', selfplay_view_samples=0.0,
     view_sample_target='next_q',
+    # the root's belief (docs/search.md 3.8, docs/az.md 18): a full search of the seat asks the network's
+    # auxiliary head once for the root's prediction of the hidden cards (one extra row: the root's own
+    # features, the decider's view) and deals every simulation's world by it - the game's
+    # `determinize_with`, weights clip((belief / uniform)^tilt, 1/belief_clip, belief_clip) - but a
+    # belief_mix share dealt uniformly; belief_fast 1: fast and minor searches too. selfplay_belief_tilt:
+    # self-play's seat (a league opponent's too); eval_belief_tilt: every evaluation seat (its moves
+    # change: the Elo pool's name gets '-b<tilt>...'). Needs the auxiliary head (a checkpoint without it
+    # is refused: net.HeadMissing). 0 = off (the default: today's searches, bit for bit)
+    selfplay_belief_tilt=0.0, eval_belief_tilt=0.0, belief_clip=20.0, belief_mix=0.0, belief_fast=0,
     # the game spec of every match that records nothing (vs the yardstick, vs random, Elo, the
     # reference games); '' = the game package's evaluation spec for the self-play spec
     # (GamePackage.eval_specs; MTG: a fixed deck set, self-play random decks), else the spec
@@ -414,14 +429,24 @@ class Run:
                              root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4),
                              leaf_value_view=c.get('selfplay_leaf_value_view', 'mover'),
                              view_samples=c.get('selfplay_view_samples', 0.0),
-                             view_sample_target=c.get('view_sample_target', 'next_q'))
+                             view_sample_target=c.get('view_sample_target', 'next_q'), **belief_keys(c, 'selfplay'))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
                          select_c_visit=c.get('eval_select_c_visit'), select_c_scale=c.get('eval_select_c_scale'),
                          root_min_visits=c.get('eval_root_min_visits', 0),
                          root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4),
-                         leaf_value_view=c.get('eval_leaf_value_view', 'mover'))
+                         leaf_value_view=c.get('eval_leaf_value_view', 'mover'), **belief_keys(c, 'eval'))
+
+    def check_belief_heads(self, path):
+        """With a root belief on (selfplay_ / eval_belief_tilt > 0, docs/az.md 18) the checkpoint at
+        `path` must have the auxiliary head for the game's targets: else net.HeadMissing (the run is
+        refused, exit 78) - never a search dealing uniformly in silence."""
+        c = self.cfg
+        on = [k for k in ('selfplay_belief_tilt', 'eval_belief_tilt') if float(c.get(k, 0.0) or 0.0) > 0]
+        if on:
+            m, _ = load(path, 'cpu', game=c['game'])
+            check_belief_head(m, c['game'], f'{" / ".join(on)} (checkpoint {path})')
 
     def eval_tag(self):
         """The name of the evaluation seats' move rule ('visits', 'cq', 'cq-n2' ...): the evaluations'
@@ -530,6 +555,7 @@ class Run:
                'minor_per_game': (st.get('minor', 0) - (st0.get('minor', 0) if st0 else 0)) / max(1, len(results)),
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
+        self.belief_metrics(out, st, st0, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -551,6 +577,16 @@ class Run:
         d = lambda k: st.get(k, 0) - ((st0 or {}).get(k, 0))           # noqa: E731
         out['view'] = {'rows': d('view_rows'), 'rows_per_leaf': round(d('view_rows') / max(1, leaves), 4),
                        'samples': d('view_recorded')}
+
+    def belief_metrics(self, out, st, st0, results):
+        """Self-play's root-belief metrics (docs/az.md 18), only when it is on (the metrics of before
+        otherwise): `belief` = {rows: root belief rows sent by this machine's driver, per_decision: per
+        searched decision of its finished games}."""
+        if not float(self.cfg.get('selfplay_belief_tilt', 0.0) or 0.0):
+            return
+        rows = st.get('belief_rows', 0) - ((st0 or {}).get('belief_rows', 0))
+        dec = sum(r.get('decisions', 0) for r in results)
+        out['belief'] = {'rows': rows, 'per_decision': round(rows / max(1, dec), 4)}
 
     def selfplay_shared(self, it):
         """Iteration `it`'s self-play with a remote (docs/az.md 5.3; zero/remoteplay.py,
@@ -683,6 +719,7 @@ class Run:
                'minor_per_game': (st.get('minor', 0) - st0.get('minor', 0)) / max(1, len(results)),
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
+        self.belief_metrics(out, st, st0, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
@@ -1178,6 +1215,8 @@ class Run:
             # a resume: the newest checkpoint is a network of this build's encoding, or the run
             # refuses to start (EncodingMismatch; exit status EXIT_REFUSED, docs/az.md 10.4)
             check_checkpoint(model_path(run, start), c['game'])
+        # the root's belief needs the auxiliary head (HeadMissing: refused the same way, docs/az.md 18)
+        self.check_belief_heads(model_path(run, start))
         done = {m['iter'] for m in read_metrics(run)}
         self.log(f'run {run} starting after iter {start}; cfg {json.dumps(c)}')
         if c.get('eval_remote'):
@@ -1396,11 +1435,19 @@ def resolve_config(args, saved):
     return cfg
 
 
+def belief_keys(cfg, pre):
+    """The root-belief keyword arguments of `games.nn_seat` for a run's seat `pre` ('selfplay' | 'eval')
+    from its settings (`mcts.belief_settings`; {} when its tilt is 0: the seat of before)."""
+    from .mcts import belief_settings
+    tilt, clip, mix, fast = belief_settings(cfg, pre)
+    return dict(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast) if tilt else {}
+
+
 def check_eval_settings(cfg, where=''):
     """The move-rule and Elo-offset settings (eval_select, selfplay_select, their guards and their
     completed-Q transforms, the root minimum visits, elo_offsets) -> None, else SystemExit (`where`:
     a prefix, e.g. 'resolver_cfg: ')."""
-    from .mcts import check_leaf_view, check_root_min, check_select, check_select_transform
+    from .mcts import belief_settings, check_belief, check_leaf_view, check_root_min, check_select, check_select_transform
     for k in ('eval_select', 'selfplay_select'):
         try:
             check_select(cfg.get(k, 'visits'), cfg.get(k + '_min_visits', 0), what=k)
@@ -1416,6 +1463,9 @@ def check_eval_settings(cfg, where=''):
         check_leaf_view(cfg.get('selfplay_leaf_value_view', 'mover'), cfg.get('selfplay_view_samples', 0.0),
                         cfg.get('view_sample_target', 'next_q'), what='selfplay_leaf_value_view')
         check_leaf_view(cfg.get('eval_leaf_value_view', 'mover'), what='eval_leaf_value_view')
+        for pre in ('selfplay', 'eval'):
+            tilt, clip, mix, _ = belief_settings(cfg, pre)
+            check_belief(tilt, clip, mix, what=f'{pre}_belief_tilt')
     except ValueError as e:
         raise SystemExit(f'{where}{e}') from None
     try:
@@ -1469,8 +1519,8 @@ def main(argv=None):
         # a network of another encoding than this build's (docs/az.md 10.4): no restart fixes it
         pw.close()
         log(run, f'run REFUSED (exit status {EXIT_REFUSED}: the supervisor does not restart it): {e}')
-        runctl.write_state(run, 'run', state='refused', error=f'EncodingMismatch: {e}'[:1000])
-        print(f'EncodingMismatch: {e}', file=sys.stderr, flush=True)
+        runctl.write_state(run, 'run', state='refused', error=f'{type(e).__name__}: {e}'[:1000])
+        print(f'{type(e).__name__}: {e}', file=sys.stderr, flush=True)
         raise SystemExit(EXIT_REFUSED)
     except BaseException as e:
         pw.close()

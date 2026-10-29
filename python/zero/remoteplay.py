@@ -101,6 +101,13 @@ from .remote import Transport, _alive, remote_spec
 from .workqueue import Shares, lag_hist, merge_hist, split_games
 
 TAG = 'ZERO_SP '
+
+
+def _belief_of(cfg):
+    """The root-belief keys of a run's self-play seat (`run.belief_keys`, {} when off): what a worker's
+    hello reports and the run checks (docs/az.md 18.5)."""
+    from .run import belief_keys
+    return belief_keys(cfg, 'selfplay')
 BIG = 1 << 62                     # a remote driver's quota: its phases end by end_phase()
 RETRY_S = 60.0                    # a failed session is started again after this (env ZERO_RSP_RETRY_S)
 STALL_S = 300.0                   # a session silent this long is killed (its worker stalled)
@@ -728,6 +735,11 @@ class RemotePlay:
                     # a checkout without the self-play league would play mirror games and record both
                     # seats of the league's games: never used (zero/league.py)
                     s.no_league = True
+                want_b = _belief_of(self.R.cfg)
+                if want_b and ev.get('belief') != want_b:
+                    # a checkout without the root's belief (or reading the settings otherwise) would deal
+                    # its worlds uniformly in silence: never used (docs/az.md 18.5)
+                    s.no_belief = ev.get('belief')
                 if self.fails or s.k == 0:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
@@ -832,6 +844,13 @@ class RemotePlay:
                 self.next_try[k] = now + max(self.retry_s, 600.0)
                 self.fail_log(f'worker {k} REFUSED: its checkout has no self-play league (the run plays one, '
                               f'selfplay_league {self.R.cfg["selfplay_league"]}); killed, retried in 10 minutes')
+                s.kill()
+                continue
+            if hasattr(s, 'no_belief'):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.fail_log(f'worker {k} REFUSED: its checkout plays the root belief as {s.no_belief!r}, the run as '
+                              f'{_belief_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 18.5); killed, retried '
+                              f'in 10 minutes')
                 s.kill()
                 continue
             if now - s.pinged > PING_S:
@@ -1777,8 +1796,10 @@ class Worker:
                       f'{self.cfg["threads"]}, groups {self.cfg["groups"]}, infer_workers {self.cfg.get("infer_workers", 1)}, '
                       f'torch threads {self.cfg.get("torch_threads", 1)}, nice {self.sp.get("nice", 0)}'
                       + (', lingering between phases' if self.linger else ''))
+            # (the tests: an older checkout, without the league / the root's belief)
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
-                      mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}))   # (the tests: an older checkout)
+                      mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),
+                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

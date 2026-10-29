@@ -593,3 +593,154 @@ fn root_min_visits_off_changes_no_walk() {
     }
     assert!(checked > 5);
 }
+
+// ---------------------------------------------------------------- the root's belief (search.md 3.8)
+
+/// A toy position whose next round's card is still hidden among `n` unrevealed cards of its stage.
+fn toy_with_next_card(seed: u64) -> ToyGame {
+    let mut s = seed;
+    for k in 0.. {
+        assert!(k < 10_000, "no toy position with a hidden next card");
+        let g = mid_game(s, 3 + (k * 7 + seed as usize) % 40);
+        let r = g.round as usize;
+        if !g.over && r < 6 && legal_of(&g).len() >= 2 && (if r < 3 { 3 } else { 6 }) - r >= 2 {
+            return g;
+        }
+        s += 1000;
+    }
+    unreachable!()
+}
+
+/// `n` searches of `sims` simulations from `live` with `belief` (None: uniform worlds) and `mix`;
+/// -> per card, the share of the leaves whose world deals it as the next round's card.
+fn next_card_shares(live: &ToyGame, belief: Option<Belief>, mix: f64, searches: u64, sims: usize) -> [f64; 6] {
+    let r = live.round as usize;
+    let mut cnt = [0u64; 6];
+    let mut tot = 0u64;
+    let w = Walk { c_puct: 1.0, chance_k: 0, margin_w: 0.0 };
+    for s in 0..searches {
+        let mut rng = Rng::new(900 + s);
+        let mut t = Tree::new(live, live.to_move().unwrap(), &legal_of(live), true, &mut rng);
+        t.set_belief(belief.clone(), mix, live, &mut rng);
+        let mut g = live.clone();
+        let mut sc = Scratch::default();
+        for _ in 0..sims {
+            if let Sim::Leaf { node, player } = t.simulate(live, &mut g, &mut rng, &w, &mut sc).unwrap() {
+                // (the world of this walk: its next round's card, unless the walk already revealed it)
+                cnt[g.order[r] as usize] += 1;
+                tot += 1;
+                let (pri, v, m) = eval(&g, player, t.acts(node));
+                let (util, win) = leaf_values(&v, &m, player, t.n, 0.0);
+                t.expand(node, &pri, &util);
+                t.backup(&sc.path, &util, &win);
+            }
+        }
+    }
+    let mut out = [0.0; 6];
+    for c in 0..6 {
+        out[c] = cnt[c] as f64 / tot.max(1) as f64;
+    }
+    out
+}
+
+#[test]
+fn belief_weight_formula() {
+    use crate::game::belief_weight;
+    // the ratio to the uniform deal to the tilt, clipped to [1/R, R]
+    assert!((belief_weight(0.6, 0.3, 1.0, 20.0) - 2.0).abs() < 1e-12);
+    assert!((belief_weight(0.6, 0.3, 0.5, 20.0) - 2f64.sqrt()).abs() < 1e-12);
+    assert_eq!(belief_weight(0.0, 0.3, 1.0, 20.0), 0.05, "a card the belief rules out: 1/R, never 0");
+    assert_eq!(belief_weight(-0.2, 0.3, 1.0, 20.0), 0.05);
+    assert_eq!(belief_weight(9.0, 0.3, 1.0, 20.0), 20.0, "clipped at R");
+    assert_eq!(belief_weight(0.3, 0.0, 1.0, 4.0), 4.0, "no uniform mass: eps, clipped");
+    assert_eq!(belief_weight(0.3, 0.3, 3.0, 1.0), 1.0, "R 1: every weight 1");
+}
+
+#[test]
+fn a_belief_deals_the_worlds_by_its_weights() {
+    // the toy's next round's card (its aux target) among n unrevealed cards of its stage: uniform 1/n
+    // each without a belief; with a belief on one card c at tilt 1 and a large clip, c's weight is
+    // (p_c / (1/n)) against the others' 1/R floors: the deal follows the belief
+    let live = toy_with_next_card(3);
+    let r = live.round as usize;
+    let hi = if r < 3 { 3 } else { 6 };
+    let pool: Vec<u8> = live.order[r..hi].to_vec();
+    assert!(pool.len() >= 2, "{pool:?}");
+    let c = pool[1] as usize;
+    let mut pred = vec![0.0f32; 6];
+    pred[c] = 1.0;
+    let uni = next_card_shares(&live, None, 0.0, 20, 40);
+    for &k in &pool {
+        assert!((uni[k as usize] - 1.0 / pool.len() as f64).abs() < 0.08, "uniform deal {uni:?} over {pool:?}");
+    }
+    let sharp = next_card_shares(&live, Some(Belief { pred: pred.clone(), tilt: 1.0, clip: 1000.0 }), 0.0, 20, 40);
+    assert!(sharp[c] > 0.98, "a sharp belief: {sharp:?} (card {c})");
+    // the clip bounds it: R = 2 at most 2 / (2 + (n - 1) / 2) of the worlds
+    let n = pool.len() as f64;
+    let clipped = next_card_shares(&live, Some(Belief { pred: pred.clone(), tilt: 1.0, clip: 2.0 }), 0.0, 20, 40);
+    let want = 2.0 / (2.0 + (n - 1.0) * 0.5);
+    assert!((clipped[c] - want).abs() < 0.06, "clip 2: {} vs {want}", clipped[c]);
+    // the uniform share: mix 0.5 deals half the worlds uniformly
+    let mixed = next_card_shares(&live, Some(Belief { pred, tilt: 1.0, clip: 1000.0 }), 0.5, 20, 40);
+    let want = 0.5 + 0.5 / n;
+    assert!((mixed[c] - want).abs() < 0.06, "mix 0.5: {} vs {want}", mixed[c]);
+}
+
+#[test]
+fn no_belief_is_the_tree_of_before_and_advance_clears_it() {
+    // set_belief(None) changes no draw: the same visits as a tree never given one
+    let live = toy_with_next_card(5);
+    let w = Walk { c_puct: 1.0, chance_k: 0, margin_w: 0.0 };
+    let mut r1 = Rng::new(42);
+    let mut t1 = Tree::new(&live, live.to_move().unwrap(), &legal_of(&live), true, &mut r1);
+    search(&mut t1, &live, 64, &mut r1, &w);
+    let mut r2 = Rng::new(42);
+    let mut t2 = Tree::new(&live, live.to_move().unwrap(), &legal_of(&live), true, &mut r2);
+    t2.set_belief(None, 0.3, &live, &mut r2);
+    assert!(t2.belief().is_none() && t2.belief_mix() == 0.0);
+    search(&mut t2, &live, 64, &mut r2, &w);
+    assert_eq!(t1.visits(t1.root), t2.visits(t2.root));
+    assert_eq!(t1.values(t1.root), t2.values(t2.root));
+    // a belief belongs to one decision: advance and reset clear it
+    let mut rng = Rng::new(1);
+    let mut t = Tree::new(&live, live.to_move().unwrap(), &legal_of(&live), true, &mut rng);
+    t.set_belief(Some(Belief { pred: vec![1.0 / 6.0; 6], tilt: 1.0, clip: 20.0 }), 0.0, &live, &mut rng);
+    search(&mut t, &live, 64, &mut rng, &w);
+    assert!(t.belief().is_some());
+    let a = t.acts(t.root)[0];
+    let mut g = live.clone();
+    let (mut key, mut legal) = (Vec::new(), Vec::new());
+    transition(&mut g, a, None, &mut key, &mut legal).unwrap();
+    if let Some(p) = g.to_move() {
+        if t.advance(a, &key, p, &legal) {
+            assert!(t.belief().is_none(), "advance keeps no belief");
+        }
+    }
+    t.set_belief(Some(Belief { pred: vec![1.0 / 6.0; 6], tilt: 1.0, clip: 20.0 }), 0.0, &live, &mut rng);
+    t.reset(&live, live.to_move().unwrap(), &legal_of(&live), true, &mut rng);
+    assert!(t.belief().is_none(), "reset keeps no belief");
+}
+
+#[test]
+fn without_redet_the_belief_deals_the_decisions_one_world_again() {
+    let live = toy_with_next_card(7);
+    let r = live.round as usize;
+    let hi = if r < 3 { 3 } else { 6 };
+    let c = live.order[hi - 1] as usize;
+    let mut pred = vec![0.0f32; 6];
+    pred[c] = 1.0;
+    let mut hits = 0;
+    for s in 0..200u64 {
+        let mut rng = Rng::new(s);
+        let mut t = Tree::new(&live, live.to_move().unwrap(), &legal_of(&live), false, &mut rng);
+        t.set_belief(Some(Belief { pred: pred.clone(), tilt: 1.0, clip: 1000.0 }), 0.0, &live, &mut rng);
+        let mut g = live.clone();
+        let mut sc = Scratch::default();
+        let w = Walk { c_puct: 1.0, chance_k: 0, margin_w: 0.0 };
+        // (the one world: every walk clones it)
+        if let Sim::Leaf { .. } = t.simulate(&live, &mut g, &mut rng, &w, &mut sc).unwrap() {
+            hits += (g.order[r] as usize == c) as u32;
+        }
+    }
+    assert!(hits > 195, "{hits} of 200 worlds dealt the believed card");
+}

@@ -49,6 +49,9 @@ pub const MAX_SEATS: usize = 8;
 ///   it is a training label, never an input: `encode` stays blind to it. A driver created with
 ///   `aux` on records it with every sample (`Record::aux`); off (the default) nothing changes.
 ///   The loss of each segment is the game package's (zero/package.py `aux`).
+/// * **Belief-weighted deals** (optional; docs/search.md 3.8): `determinize_with(viewer, rng,
+///   belief)` is `determinize` with the hidden cards drawn by weights from the network's
+///   prediction of the auxiliary targets for `viewer` (`Belief`); default: `determinize`.
 pub trait SearchGame: Clone + Send + Sync + 'static {
     /// Settings shared by all games of one driver, parsed from a JSON string.
     type Spec: Clone + Send + Sync + 'static;
@@ -153,6 +156,50 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn aux_target(&self, viewer: usize, out: &mut [f32]) {
         let _ = (viewer, out);
     }
+    /// `determinize` dealt by a belief (docs/search.md 3.8): resample everything hidden from
+    /// `viewer` as `determinize` does - the same constraints, the same reseeding - but draw the
+    /// hidden cards the belief is about with weights from `belief` (the network's prediction of
+    /// this game's auxiliary targets for the root decider, `Belief::pred`; `belief_weight` is the
+    /// shared weight formula). The search calls it instead of `determinize` only while its tree
+    /// holds a belief (seat key `belief_tilt` > 0); `pred` comes from the root decider's own
+    /// features, never from the true state. Default: `determinize`, the belief ignored (a game
+    /// without a weighted deal searches as before; a seat asking for one there pays the root's
+    /// extra row for nothing: the driver refuses `belief_tilt` for a game without `AUX`).
+    fn determinize_with(&mut self, viewer: usize, rng: &mut Rng, belief: &Belief) {
+        let _ = belief;
+        self.determinize(viewer, rng)
+    }
+}
+
+/// The root's belief of a search (docs/search.md 3.8): the network's auxiliary predictions for the
+/// root decider (`pred`, `SearchGame::aux_width()` floats in `AUX` order - a multinomial segment's
+/// distribution over its columns, `zero.net.aux_predict`), computed once per decision from the
+/// root's features (the decider's own view), and the seat's tilt and clip. `SearchGame::
+/// determinize_with` deals the hidden cards it is about from it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Belief {
+    pub pred: Vec<f32>,
+    /// alpha > 0 (seat key `belief_tilt`): the weights are the belief's ratio to the uniform deal
+    /// to this power (1: the belief's expected counts, to first order; 0 would be today's deal and
+    /// is never set - a tree without a belief deals as before).
+    pub tilt: f64,
+    /// R >= 1 (seat key `belief_clip`): every weight in [1/R, R], so no card is ever ruled out or
+    /// forced.
+    pub clip: f64,
+}
+
+/// The weight of one category of hidden cards in a weighted deal (docs/search.md 3.8): `pred` =
+/// the belief's expected count of it among the cards the deal draws (already less what the viewer
+/// knows), `uniform` = the uniform deal's expected count there; -> clip((max(pred, 0) / max(uniform,
+/// eps))^tilt, 1/clip, clip). A category the belief puts at 0 gets 1/clip, never 0.
+pub fn belief_weight(pred: f64, uniform: f64, tilt: f64, clip: f64) -> f64 {
+    let r = pred.max(0.0) / uniform.max(1e-9);
+    let w = if r > 0.0 { r.powf(tilt) } else { 0.0 };
+    let lo = 1.0 / clip;
+    if w.is_nan() {
+        return lo;
+    }
+    w.clamp(lo, clip)
 }
 
 /// A built-in (Rust) player. `legal` = the decision's legal actions (>= 2 of them).

@@ -93,6 +93,7 @@ struct Tally {
     minor: u64,
     view_rows: u64,
     view_recorded: u64,
+    belief_rows: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -128,8 +129,8 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
                 slot.net = net;
             }
             match slot.pending.take() {
-                Some(Pending::Leaf { key, local, seat, node, vrow }) => {
-                    let Some(Eval::Nn { opt_off, priors, value, margin, bases }) = evals[key as usize].as_ref() else {
+                Some(Pending::Leaf { key, local, seat, node, vrow, brow }) => {
+                    let Some(Eval::Nn { opt_off, priors, value, margin, bases, aux, aux_row }) = evals[key as usize].as_ref() else {
                         return Err("internal: missing network evaluation".into());
                     };
                     let b = (bases[c] + local) as usize;
@@ -140,6 +141,16 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
                     let v = if vrow { b + 1 } else { b };
                     apply_eval(cfg, slot, seat, node, vrow, &priors[lo..hi], &value[v * MAX_SEATS..(v + 1) * MAX_SEATS], &margin[v * MAX_SEATS..(v + 1) * MAX_SEATS])?;
                     n.sims += 1;
+                    if brow {
+                        // the fresh root's belief row after it (docs/search.md 3.8)
+                        set_belief(cfg, slot, seat, belief_of(aux, aux_row, b + 1 + vrow as usize, G::aux_width())?)?;
+                    }
+                }
+                Some(Pending::Belief { key, local, seat }) => {
+                    let Some(Eval::Nn { bases, aux, aux_row, .. }) = evals[key as usize].as_ref() else {
+                        return Err("internal: missing network evaluation".into());
+                    };
+                    set_belief(cfg, slot, seat, belief_of(aux, aux_row, (bases[c] + local) as usize, G::aux_width())?)?;
                 }
                 Some(Pending::Ext { key, local }) => {
                     let Some(Eval::Ext { payloads, bases }) = evals[key as usize].as_ref() else {
@@ -183,6 +194,29 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
         k.view_rows.fetch_add(n.view_rows, Ordering::Relaxed);
         k.view_recorded.fetch_add(n.view_recorded, Ordering::Relaxed);
     }
+    if n.belief_rows > 0 {
+        k.belief_rows.fetch_add(n.belief_rows, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Row `r`'s auxiliary output (a root belief row's) in an evaluation.
+fn belief_of<'a>(aux: &'a [f32], aux_row: &[u32], r: usize, w: usize) -> Result<&'a [f32], String> {
+    let k = aux_row.get(r).copied().unwrap_or(NO_AUX);
+    if k == NO_AUX {
+        return Err(format!("internal: row {r} is not a root belief row"));
+    }
+    Ok(&aux[k as usize * w..(k as usize + 1) * w])
+}
+
+/// The search of seat `seat` takes its root's belief `pred` (the network's auxiliary output for the
+/// root's features, docs/search.md 3.8): every simulation from now on deals its world by it.
+fn set_belief<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, pred: &[f32]) -> Result<(), String> {
+    let s = nn_seat(cfg, slot.gid, seat).ok_or("internal: a belief for a non-network seat")?;
+    let live = slot.game.as_ref().ok_or("internal: a belief without a game")?;
+    let tree = slot.trees[seat].as_mut().ok_or("internal: a belief without a tree")?;
+    let b = Belief { pred: pred.to_vec(), tilt: s.belief_tilt, clip: s.belief_clip };
+    tree.set_belief(Some(b), s.belief_mix, live, &mut slot.search_rng);
     Ok(())
 }
 
@@ -211,7 +245,8 @@ fn is_external(cfg: &DriverCfg, gid: u32, p: usize) -> bool {
 fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<u64, String> {
     let leaf = matches!(slot.pending, Some(Pending::Leaf { .. }));
     let lost = slot.sims as u64 + leaf as u64;
-    if leaf {
+    // (a root belief asked of the old network is asked again of the new one: the reset tree has none)
+    if leaf || matches!(slot.pending, Some(Pending::Belief { .. })) {
         slot.pending = None;
     }
     slot.drop_trees();
@@ -268,6 +303,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.target = None;
     slot.full = true;
     slot.minor = false;
+    slot.belief = false;
     slot.decisions = 0;
     slot.ext_moves = 0;
     slot.steps = 0;
@@ -354,6 +390,19 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         let live = slot.game.as_ref().unwrap();
         let sg = scratch.game.get_or_insert_with(|| live.clone());
         let tree = slot.trees[p].as_mut().unwrap();
+        // the root's belief (docs/search.md 3.8): asked once per search, from the root's features
+        // (the live decision, the decider's own view: the same in every world). A fresh root's first
+        // simulation is its own leaf (nothing dealt is read) and the belief row goes with it; a
+        // reused root's simulations wait for the row alone.
+        let brow = slot.belief && tree.belief().is_none();
+        if brow && tree.expanded(tree.root) {
+            let buf = &mut bufs[seat.key as usize];
+            let local = buf.len() as u32;
+            push_belief_row(buf, live, p, slot.n, slot.gid);
+            n.belief_rows += 1;
+            slot.pending = Some(Pending::Belief { key: seat.key, local, seat: p });
+            return Ok(());
+        }
         std::mem::swap(&mut slot.path, &mut scratch.sim.path);
         let r = tree.simulate(live, sg, &mut slot.search_rng, &walk, &mut scratch.sim);
         std::mem::swap(&mut slot.path, &mut scratch.sim.path);
@@ -389,12 +438,32 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                     buf.extra.push(ROW_VALUE);
                     n.view_rows += 1;
                 }
-                slot.pending = Some(Pending::Leaf { key: seat.key, local, seat: p, node, vrow });
+                if brow {
+                    // (an unexpanded root: this leaf is the root itself)
+                    if node != tree.root {
+                        return Err("internal: a fresh root's first leaf is not the root".into());
+                    }
+                    push_belief_row(buf, live, p, slot.n, slot.gid);
+                    n.belief_rows += 1;
+                }
+                slot.pending = Some(Pending::Leaf { key: seat.key, local, seat: p, node, vrow, brow });
                 n.leaves += 1;
                 return Ok(());
             }
         }
     }
+}
+
+/// A root belief row (`ROW_BELIEF`, docs/search.md 3.8): `encode(p)` of the live game, no options.
+fn push_belief_row<G: SearchGame>(buf: &mut LeafBuf, live: &G, p: usize, n: usize, gid: u32) {
+    let off = buf.x.len();
+    buf.x.resize(off + G::NUM_FEATURES, 0.0);
+    live.encode(p, &mut buf.x[off..]);
+    buf.nopt.push(0);
+    buf.player.push(p as i32);
+    buf.n_players.push(n as i32);
+    buf.gid.push(gid as i64);
+    buf.extra.push(ROW_BELIEF);
 }
 
 /// Start the search for the pending decision of seat `p` (legal actions in `slot.legal`).
@@ -414,6 +483,9 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     if div > 1 {
         slot.target = slot.target.map(|t| (t / div).max(1));
     }
+    // the root's belief (docs/search.md 3.8): full searches, or every one with belief_fast; a
+    // reused tree's belief was its last decision's (`Tree::advance` cleared it)
+    slot.belief = seat.takes_belief(slot.full);
     match slot.trees[p].as_mut() {
         None => {
             let mut t = slot.spare.pop().unwrap_or_default();

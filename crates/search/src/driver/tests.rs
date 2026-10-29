@@ -1817,3 +1817,269 @@ fn value_only_samples_carry_the_observers_auxiliary_targets() {
     let a = sample_arrays(&recs, ToyGame::NUM_FEATURES);
     assert_eq!((a.aw, a.aux.len()), (w, recs.len() * w));
 }
+
+// ---------------------------------------------------------------- the root's belief (docs/search.md 3.8)
+
+fn with_belief(seat: SeatCfg, tilt: f64, clip: f64, mix: f64, fast: bool) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.belief_tilt = tilt;
+            s.belief_clip = clip;
+            s.belief_mix = mix;
+            s.belief_fast = fast;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+/// The root belief rows of a batch, their layout checked: no options, and either right after its
+/// game's root leaf row (a fresh root: the leaf of the same seat) or its game's only row (a reused
+/// root). -> (rows after a leaf, rows alone).
+fn belief_rows_of(b: &Batch) -> (usize, usize) {
+    let (mut with, mut alone) = (0, 0);
+    for r in 0..b.b {
+        if b.extra[r] != ROW_BELIEF {
+            continue;
+        }
+        assert_eq!(b.opt_off[r + 1], b.opt_off[r], "a belief row has no options");
+        let lead = r > 0 && b.extra[r - 1] == ROW_LEAF && b.gid[r - 1] == b.gid[r] && b.player[r - 1] == b.player[r] && b.opt_off[r] > b.opt_off[r - 1];
+        let only = (0..b.b).filter(|&k| b.gid[k] == b.gid[r]).count() == 1;
+        assert!(lead || only, "a belief row neither after its root's leaf row nor alone (row {r}: {:?})", &b.extra);
+        if lead {
+            with += 1;
+        } else {
+            alone += 1;
+        }
+    }
+    (with, alone)
+}
+
+/// `answer`, its root belief rows answered `pred` (a stand-in auxiliary head) -> (rows after a leaf,
+/// rows alone).
+fn answer_belief<G: SearchGame>(d: &mut Driver<G>, b: &Batch, pred: &[f32]) -> (usize, usize) {
+    let (w, a) = belief_rows_of(b);
+    let f = G::NUM_FEATURES;
+    let mut pri = Vec::new();
+    let mut v = vec![0.0; b.b * MAX_SEATS];
+    for r in 0..b.b {
+        let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+        pri.extend(std::iter::repeat_n(1.0 / k as f32, k));
+        let n = b.n_players[r] as usize;
+        let h: f32 = b.x[r * f..(r + 1) * f].iter().enumerate().map(|(i, x)| x * ((i * 7 % 13) as f32 - 6.0)).sum();
+        let p = 1.0 / (1.0 + (-h * 0.1).exp());
+        v[r * MAX_SEATS] = p;
+        for j in 1..n {
+            v[r * MAX_SEATS + j] = (1.0 - p) / (n - 1) as f32;
+        }
+    }
+    let aux: Vec<f32> = (0..w + a).flat_map(|_| pred.iter().copied()).collect();
+    d.submit_aux(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS], &aux).unwrap();
+    (w, a)
+}
+
+fn run_belief<G: SearchGame>(d: &mut Driver<G>, pred: &[f32]) -> (Vec<GameResult>, Vec<Record>, (usize, usize)) {
+    let (mut res, mut smp, mut rows) = (Vec::new(), Vec::new(), (0, 0));
+    while let Some(b) = d.next_batch(true).unwrap() {
+        let (w, a) = answer_belief(d, &b, pred);
+        rows = (rows.0 + w, rows.1 + a);
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+    }
+    res.extend(d.take_results());
+    smp.extend(d.take_samples());
+    res.sort_by_key(|r| r.gid);
+    (res, smp, rows)
+}
+
+#[test]
+fn belief_off_is_the_search_of_before() {
+    // the golden records and match with the belief's settings given (tilt 0: off) and the others
+    // set to anything valid
+    let (_, recs) = golden_selfplay(with_belief(nn(0, 16, true), 0.0, 7.0, 0.3, true));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    let seat = |k| with_belief(nn(k, 16, false), 0.0, 3.0, 0.5, false);
+    let games = (0..40).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+    let mut c = cfg(vec![seat(0), seat(1)], games, &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.record = false;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    assert_eq!(results_digest(&run(&mut d).0), GOLDEN_MATCH_VISITS);
+    assert_eq!(d.stats().belief_rows, 0);
+}
+
+#[test]
+fn belief_settings_are_checked() {
+    for (tilt, clip, mix, what) in [(-1.0, 20.0, 0.0, "belief_tilt"), (f64::NAN, 20.0, 0.0, "belief_tilt"), (1.0, 0.5, 0.0, "belief_clip"), (1.0, 20.0, 1.0, "belief_mix"), (1.0, 20.0, -0.1, "belief_mix")] {
+        let c = cfg(vec![with_belief(nn(0, 16, true), tilt, clip, mix, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+        let e = Driver::<ToyGame>::new(c).err().unwrap();
+        assert!(e.contains(what), "{tilt} {clip} {mix}: {e}");
+    }
+    // a game without auxiliary targets has nothing for a belief to predict
+    let c = cfg(vec![with_belief(nn(0, 16, true), 1.0, 20.0, 0.0, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    assert!(Driver::<Mull>::new(c).err().unwrap().contains("no auxiliary targets"));
+}
+
+#[test]
+fn one_belief_row_per_search_that_takes_it() {
+    // self-play (p_full 0.5): the full searches take the belief - as many rows as recorded decisions -,
+    // the fast ones not; with belief_fast every searched decision. Fresh roots send the row after the
+    // root's leaf, reused roots alone
+    let uni = vec![1.0 / 6.0; 6];
+    let mut c = cfg(vec![with_belief(nn(0, 16, true), 1.0, 20.0, 0.0, false)], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+    c.seed = 2026;
+    let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
+    let (res, recs, (with, alone)) = run_belief(&mut d, &uni);
+    let st = d.stats();
+    assert_eq!(st.belief_rows as usize, with + alone);
+    assert_eq!(st.belief_rows, st.recorded, "one belief row per full search");
+    assert_eq!(recs.len() as u64, st.recorded);
+    assert!(with > 0 && alone > 0, "fresh roots {with}, reused roots {alone}");
+    let decisions: u64 = res.iter().map(|r| r.decisions as u64).sum();
+    assert!(st.belief_rows < decisions);
+    c.seats = vec![with_belief(nn(0, 16, true), 1.0, 20.0, 0.0, true)];
+    let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
+    let (res, _, _) = run_belief(&mut d, &uni);
+    let decisions: u64 = res.iter().map(|r| r.decisions as u64).sum();
+    assert_eq!(d.stats().belief_rows, decisions, "belief_fast: every searched decision");
+    // an evaluation seat: every search is full
+    c.seats = vec![with_belief(nn(0, 16, false), 1.0, 20.0, 0.0, false)];
+    c.record = false;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (res, _, _) = run_belief(&mut d, &uni);
+    let decisions: u64 = res.iter().map(|r| r.decisions as u64).sum();
+    assert_eq!(d.stats().belief_rows, decisions);
+}
+
+#[test]
+fn an_evaluator_without_the_belief_stops_the_driver() {
+    // a batch with root belief rows answered without their auxiliary outputs (a network without the
+    // head) is an error, never a search dealing uniformly in silence
+    let c = cfg(vec![with_belief(nn(0, 16, true), 1.0, 20.0, 0.0, false)], vec![vec![0, 0]; 4], &[("m", KeyKind::Nn)]);
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let mut err = None;
+    while let Some(b) = d.next_batch(true).unwrap() {
+        if b.extra.contains(&ROW_BELIEF) {
+            let k = b.opt_off[b.b] as usize;
+            let nb = b.extra.iter().filter(|&&x| x == ROW_BELIEF).count();
+            let e = d.submit(b.id, &vec![0.5; k], &vec![0.5; b.b * MAX_SEATS], &vec![0.0; b.b * MAX_SEATS]).unwrap_err();
+            // the wrong width too, and a non-finite prediction
+            let e2 = d.submit_aux(b.id, &vec![0.5; k], &vec![0.5; b.b * MAX_SEATS], &vec![0.0; b.b * MAX_SEATS], &[0.5; 5]).unwrap_err();
+            let e3 = d.submit_aux(b.id, &vec![0.5; k], &vec![0.5; b.b * MAX_SEATS], &vec![0.0; b.b * MAX_SEATS], &vec![f32::NAN; 6 * nb]).unwrap_err();
+            err = Some((e, e2, e3));
+            break;
+        }
+        answer(&mut d, &b);
+    }
+    let (e, e2, e3) = err.expect("a batch with a belief row");
+    assert!(e.contains("root belief rows") && e.contains("auxiliary"), "{e}");
+    assert!(e2.contains("root belief rows"), "{e2}");
+    assert!(e3.contains("finite"), "{e3}");
+    // and a batch without belief rows takes no auxiliary values
+    let c = cfg(vec![nn(0, 16, true)], vec![vec![0, 0]; 2], &[("m", KeyKind::Nn)]);
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let b = d.next_batch(true).unwrap().unwrap();
+    let k = b.opt_off[b.b] as usize;
+    assert!(d.submit_aux(b.id, &vec![0.5; k], &vec![0.5; b.b * MAX_SEATS], &vec![0.0; b.b * MAX_SEATS], &[0.1; 6]).unwrap_err().contains("no root belief rows"));
+}
+
+/// Hidden-hand mulligan games of `seat` on both sides, the belief rows answered `pred`, every row's
+/// value from `hmull_eval` -> (records, stats, value-only rows, belief rows).
+fn hmull_belief_run(seat: SeatCfg, games: usize, seed: u64, pred: &[f32]) -> (Vec<Record>, DriverStats, usize, usize) {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
+    c.seed = seed;
+    let mut d = Driver::<HiddenMull>::new(c).unwrap();
+    let f = HiddenMull::NUM_FEATURES;
+    let (mut smp, mut vrows, mut brows) = (Vec::new(), 0, 0);
+    while let Some(b) = d.next_batch(true).unwrap() {
+        let (w, a) = belief_rows_of(&b);
+        brows += w + a;
+        let mut pri = Vec::new();
+        let mut v = vec![0.0; b.b * MAX_SEATS];
+        for r in 0..b.b {
+            let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+            vrows += (b.extra[r] == ROW_VALUE) as usize;
+            let (p, val) = hmull_eval(&b.x[r * f..(r + 1) * f], k);
+            pri.extend(p);
+            v[r * MAX_SEATS..(r + 1) * MAX_SEATS].copy_from_slice(&val);
+        }
+        let aux: Vec<f32> = (0..w + a).flat_map(|_| pred.iter().copied()).collect();
+        d.submit_aux(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS], &aux).unwrap();
+        smp.extend(d.take_samples());
+    }
+    smp.extend(d.take_samples());
+    (smp, d.stats(), vrows, brows)
+}
+
+fn hmull_belief_seat(sims: u32, tilt: f64, view: LeafView, redet: bool) -> SeatCfg {
+    let mut s = NnSeat::eval(0, sims);
+    s.selfplay = true;
+    s.eps = 0.0;
+    s.temp_moves = 0;
+    s.redet = redet;
+    with_belief(with_view(SeatCfg::Nn(s), view, 0.0, ViewTarget::NextQ), tilt, 1000.0, 0.0, false)
+}
+
+/// The mean root value q of seat 1's decisions after seat 0 kept (its records), for its own hand.
+fn seat1_q(recs: &[Record]) -> f64 {
+    let v: Vec<f64> = recs.iter().filter(|r| r.player == 1 && r.x[3] == 0.0).map(|r| r.q[0] as f64).collect();
+    v.iter().sum::<f64>() / v.len() as f64
+}
+
+#[test]
+fn the_belief_deals_the_searches_worlds() {
+    // HiddenMull: seat 1 decides after seat 0; every walk of its search ends the game, valued exactly
+    // by the hands of its world: 0.5 - 0.3 (q0 - q1) for seat 1, q0 seat 0's hand dealt by the search
+    // (good with 1/2 uniformly). A belief "seat 0's hand is good with 0.9" (tilt 1: the deal's odds
+    // exactly 0.9) lowers seat 1's root value by 0.3 x (0.9 - 0.5) x walks / (walks + 1); belief 0.5 is
+    // the uniform deal
+    let sims = 64;
+    let (uni, st0, _, b0) = hmull_belief_run(hmull_belief_seat(sims, 0.0, LeafView::Mover, true), 300, 3, &[]);
+    let (half, _, _, _) = hmull_belief_run(hmull_belief_seat(sims, 1.0, LeafView::Mover, true), 300, 3, &[0.5, 0.5]);
+    let (good, st, _, b1) = hmull_belief_run(hmull_belief_seat(sims, 1.0, LeafView::Mover, true), 300, 3, &[0.1, 0.9]);
+    assert_eq!((b0, st0.belief_rows), (0, 0));
+    assert_eq!((b1 as u64, st.belief_rows), (st.recorded, st.recorded));
+    let (qu, qh, qg) = (seat1_q(&uni), seat1_q(&half), seat1_q(&good));
+    let want = -0.3 * 0.4 * (sims - 1) as f64 / sims as f64;
+    eprintln!("hidden mull, seat 1's root value after seat 0 kept: uniform {qu:.4}, belief 0.5 {qh:.4}, belief 0.9 {qg:.4} (shift {:.4}, want {want:.4})", qg - qu);
+    assert!((qh - qu).abs() < 0.01, "a belief equal to the uniform deal: {qh} vs {qu}");
+    assert!((qg - qu - want).abs() < 0.015, "the belief's shift {} vs {want}", qg - qu);
+    // without redet (one world per decision, dealt again with the belief once it came): the same mean
+    let (one, _, _, _) = hmull_belief_run(hmull_belief_seat(sims, 1.0, LeafView::Mover, false), 300, 3, &[0.1, 0.9]);
+    let (one_u, _, _, _) = hmull_belief_run(hmull_belief_seat(sims, 0.0, LeafView::Mover, false), 300, 3, &[]);
+    assert!((seat1_q(&one) - seat1_q(&one_u) - want).abs() < 0.06, "redet off: {} vs {}", seat1_q(&one), seat1_q(&one_u));
+}
+
+#[test]
+fn root_view_values_and_the_belief_share_the_batches() {
+    // both extra row kinds in one driver: value-only rows after other seats' leaves, belief rows
+    // after fresh roots' leaves; the counts match the stats and the deal still follows the belief
+    let (recs, st, vrows, brows) = hmull_belief_run(hmull_belief_seat(32, 1.0, LeafView::Root, true), 200, 5, &[0.1, 0.9]);
+    assert!(vrows > 0 && vrows as u64 == st.view_rows, "{vrows} value-only rows, stats {}", st.view_rows);
+    assert_eq!((brows as u64, st.belief_rows), (st.recorded, st.recorded));
+    let (uni, _, _, _) = hmull_belief_run(hmull_belief_seat(32, 0.0, LeafView::Root, true), 200, 5, &[]);
+    assert!(seat1_q(&recs) < seat1_q(&uni) - 0.08, "{} vs {}", seat1_q(&recs), seat1_q(&uni));
+}
+
+#[test]
+fn rolling_phases_ask_the_belief_again_of_a_new_network() {
+    // a new network restarts every search (rolling epochs): a belief asked of the old one is asked
+    // again; every batch's belief rows answered, every full search took one
+    let mut c = cfg(vec![with_belief(nn(0, 8, true), 1.0, 20.0, 0.25, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    c.concurrency = 12;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let uni = vec![1.0 / 6.0; 6];
+    for phase in 0..4u32 {
+        d.resume(10, phase / 2).unwrap();
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer_belief(&mut d, &b, &uni);
+            d.take_results();
+            d.take_samples();
+        }
+    }
+    let st = d.stats();
+    assert_eq!(st.epoch, 1);
+    assert!(st.restarts > 0);
+    assert!(st.belief_rows >= st.recorded && st.recorded > 0, "belief rows {}, recorded {}", st.belief_rows, st.recorded);
+}
