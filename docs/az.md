@@ -1112,12 +1112,16 @@ reports - `games.info(game)` and the game package:
 * a network without layout or grid metadata (arch 'mlp', older checkpoints, a game package
   without a layout): the game and the counts alone.
 
-The message names both sides and the way out, e.g. `runs/x/models/iter_0137.pt: a network of
-another encoding than this build's (features 33652 -> 37620; token layout: segment ...). The
-network: 'mtg': 33,652 features, 1,024 actions, token layout without a version (11 segments, 1
-bag), arch 'tokens'. This build: 'mtg': 37,620 features, ..., token layout v5 (11 segments, 2
-bags). ... Move a run across an encoding change with python tools/fork_run.py <checkpoint> <new
-run> ...`.
+The message names both sides and the way out - MTG Zero's v4 main-line checkpoint on its v5
+build: `.../iter_0137.pt: a network of another encoding than this build's (features 33652 ->
+37620; token layout: segment tops: offset 17792 -> 19840; segment my_permanents: offset 18116 ->
+20164, width 148 -> 172; segment opponent_permanents: offset 22852 -> 25668, width 148 -> 172; 8
+more). The network: 'mtg': 33,652 features, 1,024 actions, token layout without a version (11
+segments, 1 bag), arch 'tokens'. This build: 'mtg': 37,620 features, 1,024 actions, token layout
+v5 (11 segments, 1 bag). Fed this build's inputs it would misread them without an error. Move a
+run across an encoding change with python tools/fork_run.py <checkpoint> <new run> (an exact
+widen when the change only adds inputs; docs/az.md 10.4), or use a build of the network's
+encoding.`
 
 **Where it runs** (every load path, for every game - a game package's own tools load through
 `zero.net.load` too):
@@ -1196,6 +1200,36 @@ for bit with resolver_init, keeping a resolver checkpoint 0, refusing the ambigu
 the remote evaluation's refusal (exit 78, the line, the lock released; the run's log in full, the
 retry); a remote self-play worker refusing while the run plays every game; selfplay_digest playing
 a narrower checkpoint (the opt-out).
+
+**Checks** (7132cb8 on main f3f5535; desktop 2026-10-29, CPU only, MTG Zero's delver2 live on the
+GPU and the Mac). Tier "core behaviour, byte-identical defaults for matching checkpoints":
+
+* `cargo test --release`: zero_search 50 passed, zero_webnet 3; `pytest tests`: **202 passed** (9
+  min 49 s; the 15 above among them).
+* **Byte identity** against f3f5535 (its own worktree and target dir): toy-smoke runs of 3
+  iterations - MLP vs `ext:toyheur`, tokens, and `cq` targets + `eval_select cq` guard 2 + rolling -
+  on both checkouts: every sample shard, `config.json`, `elo/results.json`, `models/index.json`
+  byte for byte, every checkpoint tensor for tensor with the same config and extra (the files
+  differ only in torch's archive root, named after the writing pid), the metrics equal without
+  their timings; `tools/check_checkpoint_compat.py --package zero` with a toy MLP checkpoint, a toy
+  token checkpoint, `random` and `uniform`: identical.
+* **The other games** build against it (build only, at their HEADs with this core in their
+  `third_party/zero-core`; the PyO3 crate, every test compiled, the package imported with this
+  core): Glass Road Zero c1f56dc 36 s, Caverna Zero a6fad73 55 s, Kingdom Builder Zero 4202a4a 85 s.
+* **Every game's existing checkpoints** (each run's newest, read-only): the paused runs of the
+  hub's manifest with the worktree each resumes from (its game code and built engine, this core's
+  Python): Glass Road grz2p_rb (run-c1f56dc), Caverna cvz2p_cq (run-5170335), Kingdom Builder kbz2p
+  (run-001dd88), kbz2p_pin1 (fixed-setup), kbz2p_vq9 (run-5c93167), kbz2p_grid and kbz2p_gridgold
+  (run-8f9ff15), kbz2p_xstbig_aux_rm and _rm_deep (run-99993c0): **all accepted**. Every other run
+  too: Glass Road's 7 and Caverna's 5 with their HEAD builds; Kingdom Builder's 22 with the build of
+  their game (HEAD; the aux-targets line run-2ece130 for kingdombuilder-xs / -xst; `options` for
+  -glso): all accepted - on KB's HEAD build its xs / xst / glso runs are refused as games it does
+  not have, correctly (they were trained on branches). The five `aux` runs' networks do not build
+  on main's core at all (GridNet has no `aux`: that line's core is unmerged), whatever the guard.
+  Dominion Zero and St. Pete Zero are not on zero-core (their own `net.load`): not affected.
+* MTG Zero (its ENGINE.md 61): every v5 run accepted, every v4 and older refused; the main line's
+  v4 `ab2-cqscale03/iter_0137` refused at run resume (exit 78) and by the evaluator, delver2's v5
+  `iter_0000` accepted by both.
 
 ## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
 
