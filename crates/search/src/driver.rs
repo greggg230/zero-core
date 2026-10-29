@@ -162,6 +162,70 @@ impl Select {
     }
 }
 
+/// Whose information a search leaf's VALUE comes from (docs/search.md 3.6, seat key
+/// `leaf_value_view`). The priors always come from the leaf's decider's own view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafView {
+    /// `encode(decider)` gives the leaf's priors and its value: one row (the default, the search
+    /// of before bit for bit).
+    Mover,
+    /// A leaf decided by another seat than the tree's root decider is evaluated twice, in the same
+    /// batch: its priors from `encode(decider)` and its value and margin from a value-only row
+    /// `encode(viewer)` (the root decider's information: its own hidden cards as they are, the
+    /// other seats' unknown; no options). A leaf of the root decider is one row as before.
+    Root,
+}
+
+impl LeafView {
+    /// From the seat setting `leaf_value_view` ('mover' | 'root').
+    pub fn parse(name: &str) -> Result<LeafView, String> {
+        match name {
+            "mover" => Ok(LeafView::Mover),
+            "root" => Ok(LeafView::Root),
+            _ => Err(format!("leaf_value_view {name:?}: 'mover' or 'root'")),
+        }
+    }
+}
+
+/// The value target `q` of a value-only training sample (`NnSeat::view_samples`, docs/search.md
+/// 3.6): its `z` is the game's result for the sample's observer either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewTarget {
+    /// The root win estimate of the observer's own next search (full or fast, not minor) after the
+    /// sample; `z` when it never searches again in the game. The observer only learns more until
+    /// then, so its next search's value is an unbiased estimate of the outcome given what it knows
+    /// at the sample (as a decider's sample's q is its own search's).
+    NextQ,
+    /// `q` = `z`: the outcome only.
+    Z,
+}
+
+impl ViewTarget {
+    /// From the seat setting `view_sample_target` ('next_q' | 'z').
+    pub fn parse(name: &str) -> Result<ViewTarget, String> {
+        match name {
+            "next_q" => Ok(ViewTarget::NextQ),
+            "z" => Ok(ViewTarget::Z),
+            _ => Err(format!("view_sample_target {name:?}: 'next_q' or 'z'")),
+        }
+    }
+}
+
+/// Whether recorded decision `decision` (the game's searched decisions before it) of game `gid` of
+/// a driver seeded `seed` also records the value-only samples of a seat that records a share
+/// `share` of its decisions' (`NnSeat::view_samples`): a hash of (seed, gid, decision), so no
+/// random stream changes (the Python reference's `play.view_pick` is the same arithmetic).
+pub fn view_pick(seed: u64, gid: u32, decision: u32, share: f64) -> bool {
+    if share >= 1.0 {
+        return true;
+    }
+    if share <= 0.0 {
+        return false;
+    }
+    let h = split64(seed ^ split64((((gid as u64) << 32) | decision as u64) ^ 0x7669_6577));
+    ((h >> 11) as f64 * (1.0 / (1u64 << 53) as f64)) < share
+}
+
 /// The root minimum visits a search takes (docs/search.md 3.5): the seat's `k`
 /// (`NnSeat::root_min_visits`) for a full search (`full`: a self-play seat's recorded searches,
 /// every search of an evaluation seat; never a fast or minor one, like root noise) of `m` options
@@ -222,12 +286,20 @@ pub struct NnSeat {
     pub root_min_visits: u32,
     /// The largest root (number of options) the floor applies to (default 4).
     pub root_min_visits_max_actions: u32,
+    /// Whose view a leaf's value comes from (docs/search.md 3.6; default `LeafView::Mover`).
+    pub leaf_value_view: LeafView,
+    /// Value-only samples (docs/search.md 3.6; 0 = off, the default): a recorded decision of this
+    /// seat also records, with this probability (`view_pick`), one sample per other seat of the
+    /// game that records too (a self-play network seat with `record`): `encode(other)` of the real
+    /// state, in that seat's perspective, no options (no policy target), `q` per `view_target`.
+    pub view_samples: f64,
+    pub view_target: ViewTarget,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4 }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ }
     }
 }
 
@@ -479,7 +551,9 @@ enum Eval {
 }
 
 enum Pending {
-    Leaf { key: u16, local: u32, seat: usize, node: u32 },
+    /// `vrow`: the value comes from the next row, a value-only row of the tree's viewer
+    /// (`LeafView::Root` at another seat's leaf).
+    Leaf { key: u16, local: u32, seat: usize, node: u32, vrow: bool },
     Ext { key: u16, local: u32 },
 }
 
@@ -508,6 +582,9 @@ struct Slot<G: SearchGame> {
     steps: u64,
     records: Vec<Record>,
     rq: Vec<Option<[f64; MAX_SEATS]>>,
+    /// Value-only records waiting for their observer's next search (`ViewTarget::NextQ`):
+    /// (record index, observer seat).
+    view_wait: Vec<(u32, u8)>,
     pending: Option<Pending>,
     ext_payload: Option<String>,
     /// Path of the pending leaf's simulation (kept until its evaluation is backed up).
@@ -545,6 +622,7 @@ impl<G: SearchGame> Slot<G> {
             steps: 0,
             records: Vec::new(),
             rq: Vec::new(),
+            view_wait: Vec::new(),
             pending: None,
             ext_payload: None,
             path: Vec::new(),
@@ -649,6 +727,9 @@ struct Counters {
     restarts: AtomicU64,
     recorded: AtomicU64,
     minor: AtomicU64,
+    /// Value-only rows sent with leaves (`LeafView::Root`) and value-only samples recorded.
+    view_rows: AtomicU64,
+    view_recorded: AtomicU64,
     /// The longest a game's step took (one slot's advance between two of its leaves: its search
     /// and moves, ns), that game's gid, and the steps over SLOW_STEP_NS.
     step_max_ns: AtomicU64,
@@ -726,6 +807,11 @@ pub struct DriverStats {
     pub recorded: u64,
     /// Minor decisions decided by network seats with `sims_minor`.
     pub minor: u64,
+    /// Value-only rows of the network batches (`LeafView::Root`: one per leaf of a seat other
+    /// than its tree's root decider; `leaves` counts the leaves) and value-only samples recorded
+    /// (`NnSeat::view_samples`; `recorded` counts the decisions).
+    pub view_rows: u64,
+    pub view_recorded: u64,
     pub emitted: u64,
     pub epoch: u32,
     pub net: u32,
@@ -808,6 +894,9 @@ impl<G: SearchGame> Driver<G> {
                     }
                     if let PolicyTarget::CompletedQ { c_visit, c_scale } = n.policy_target {
                         PolicyTarget::parse("cq", c_visit, c_scale)?;
+                    }
+                    if !(n.view_samples.is_finite() && (0.0..=1.0).contains(&n.view_samples)) {
+                        return Err(format!("view_samples {}: a share in [0, 1] (0 = off)", n.view_samples));
                     }
                     if n.root_min_visits > 0 && n.root_min_visits_max_actions < 2 {
                         return Err(format!("root_min_visits_max_actions {}: at least 2 (a root of one option is not searched)", n.root_min_visits_max_actions));
@@ -1287,6 +1376,8 @@ impl<G: SearchGame> Driver<G> {
             restarts: c.restarts.load(Ordering::Relaxed),
             recorded: c.recorded.load(Ordering::Relaxed),
             minor: c.minor.load(Ordering::Relaxed),
+            view_rows: c.view_rows.load(Ordering::Relaxed),
+            view_recorded: c.view_recorded.load(Ordering::Relaxed),
             emitted: self.emitted,
             epoch: self.sh.epoch.load(Ordering::Relaxed),
             net: self.sh.net.load(Ordering::Relaxed),

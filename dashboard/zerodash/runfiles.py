@@ -177,7 +177,8 @@ def elo_pool(run_dir):
     ('cq', 'cq-n2', 'cq-v25-s0.5': guard, then the rule's completed-Q transform - eval_select_c_visit
     / _c_scale, unset: cq_c_visit / cq_c_scale - when other than 50 / 1; then '-f<k>' ('-f<k>a<m>')
     for the evaluation's root minimum visits eval_root_min_visits, root_min_visits_max_actions m when
-    not 4: 'visits-f4', 'cq-n4-v50-s0.3-f4')."""
+    not 4: 'visits-f4', 'cq-n4-v50-s0.3-f4'; then '-rv' for eval_leaf_value_view 'root': 'visits-rv',
+    'cq-n4-v50-s0.3-rv')."""
     c = read_json(os.path.join(run_dir, 'config.json'))
     c = c if isinstance(c, dict) else {}
     rule = c.get('eval_select') or 'visits'
@@ -185,6 +186,8 @@ def elo_pool(run_dir):
     if c.get('eval_root_min_visits'):
         mx = int(c.get('root_min_visits_max_actions', 4))
         forced = f"-f{int(c['eval_root_min_visits'])}" + (f'a{mx}' if mx != 4 else '')
+    if c.get('eval_leaf_value_view', 'mover') == 'root':
+        forced += '-rv'
     if rule == 'visits':
         return os.path.join(run_dir, 'elo', 'visits' + forced) if forced else os.path.join(run_dir, 'elo')
     tag = rule

@@ -142,20 +142,24 @@ fn downcast<G: SearchGame>(g: &dyn DynGame) -> Result<&G, String> {
     g.as_any().downcast_ref::<G>().ok_or_else(|| format!("expected a {} game", G::NAME))
 }
 
-/// A leaf of a Python-driven search: decider, features, legal actions.
+/// A leaf of a Python-driven search: decider, features, legal actions; with root-view values
+/// (docs/search.md 3.6) the features of the tree's viewer when another seat decides the leaf.
 pub struct Leaf {
     pub player: usize,
     pub x: Vec<f32>,
     pub acts: Vec<u16>,
+    pub vx: Option<Vec<f32>>,
 }
 
 /// One search tree driven from Python (parity tests, mixed Rust-vs-Python matches).
 pub trait DynTree: Send + Sync {
     fn set_base(&mut self, live: &dyn DynGame) -> Result<(), String>;
     /// One simulation: None if it ended in a terminal state (backed up), else the leaf to
-    /// evaluate (then `expand`).
-    fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64) -> Result<Option<Leaf>, String>;
-    /// Evaluate the last leaf: priors over its options, value / margin relative to its decider.
+    /// evaluate (then `expand`). `root_view`: a leaf of another seat than the viewer also gets
+    /// the viewer's features (`Leaf::vx`), whose value `expand` then takes.
+    fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool) -> Result<Option<Leaf>, String>;
+    /// Evaluate the last leaf: priors over its options, value / margin relative to its decider
+    /// (to the viewer when the leaf came with `vx`).
     fn expand(&mut self, priors: &[f32], value: &[f32], margin: &[f32], margin_w: f64) -> Result<(), String>;
     fn add_noise(&mut self, alpha: f64, eps: f64, seed: Option<u64>);
     /// Move the root to the child for real action `a`, chance key `key` and the decision of
@@ -187,6 +191,8 @@ pub trait DynTree: Send + Sync {
     fn root_visits_pruned(&self) -> Vec<u32>;
     fn root_win_pruned(&self) -> Option<Vec<f64>>;
     fn redet(&self) -> bool;
+    /// The tree's viewer (the root decider).
+    fn viewer(&self) -> usize;
     fn edge_kids(&self, i: usize) -> Vec<(Vec<u64>, usize)>;
     fn edge_outs(&self, i: usize) -> Vec<Vec<u64>>;
     fn n_nodes(&self) -> usize;
@@ -206,7 +212,7 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
         self.t.set_base(g, &mut self.rng);
         Ok(())
     }
-    fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64) -> Result<Option<Leaf>, String> {
+    fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool) -> Result<Option<Leaf>, String> {
         if self.leaf.is_some() {
             return Err("expand the previous leaf first".into());
         }
@@ -216,10 +222,17 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
         match self.t.simulate(live, g, &mut self.rng, &w, &mut self.sc)? {
             Sim::Terminal => Ok(None),
             Sim::Leaf { node, player } => {
-                self.leaf = Some((node, player));
                 let mut x = vec![0.0; G::NUM_FEATURES];
                 g.encode(player, &mut x);
-                Ok(Some(Leaf { player, x, acts: self.t.acts(node).to_vec() }))
+                let viewer = self.t.viewer;
+                let vx = (root_view && player != viewer).then(|| {
+                    let mut v = vec![0.0; G::NUM_FEATURES];
+                    g.encode(viewer, &mut v);
+                    v
+                });
+                // (the value's seat: the viewer with a value-only row, else the decider)
+                self.leaf = Some((node, if vx.is_some() { viewer } else { player }));
+                Ok(Some(Leaf { player, x, acts: self.t.acts(node).to_vec(), vx }))
             }
         }
     }
@@ -306,6 +319,9 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     }
     fn root_win_pruned(&self) -> Option<Vec<f64>> {
         self.t.root_win_pruned().map(|w| w[..self.t.n].to_vec())
+    }
+    fn viewer(&self) -> usize {
+        self.t.viewer
     }
     fn redet(&self) -> bool {
         self.t.redet

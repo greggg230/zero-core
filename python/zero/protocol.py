@@ -107,7 +107,8 @@ def validate_samples(s, num_features=None):
         assert s['aux'].ndim == 2 and s['aux'].shape[0] == N
     off = s['opt_off']
     for b in range(N):
-        assert abs(s['pi'][off[b]:off[b + 1]].sum() - 1) < 1e-3
+        # (a value-only sample has no options and no policy target: docs/search.md 3.6)
+        assert off[b + 1] == off[b] or abs(s['pi'][off[b]:off[b + 1]].sum() - 1) < 1e-3
         n = s['n_players'][b]
         assert abs(s['z'][b, :n].sum() - 1) < 1e-4
 

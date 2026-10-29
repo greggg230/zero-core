@@ -150,6 +150,18 @@ DEFAULTS = dict(
     # evaluation seat (its moves change: the Elo pool's name gets '-f<k>'). 0 = off (the default:
     # today's searches, bit for bit)
     selfplay_root_min_visits=0, eval_root_min_visits=0, root_min_visits_max_actions=4,
+    # root-view leaf values (docs/search.md 3.6, docs/az.md 5.6): 'mover' = a search leaf's value
+    # comes from the network on its decider's view (the default: today's searches, bit for bit);
+    # 'root' = from the root decider's view of the same (sampled) state - its own hidden cards as
+    # they are, the other seats' unknown - in a second, value-only row of the same batch (the priors
+    # stay the decider's). selfplay_leaf_value_view: self-play's seat; eval_leaf_value_view: every
+    # evaluation seat (its moves change: the Elo pool's name gets '-rv'). selfplay_view_samples: the
+    # share of self-play's recorded decisions that also record value-only samples - the real state
+    # from each other recording seat's view, in its perspective, no options (no policy loss) - so
+    # the value head learns the views root-view leaves ask it for; view_sample_target: their value
+    # target's q, 'next_q' (that seat's next search's root value, z if none) | 'z'. 0 = off
+    selfplay_leaf_value_view='mover', eval_leaf_value_view='mover', selfplay_view_samples=0.0,
+    view_sample_target='next_q',
     # the game spec of every match that records nothing (vs the yardstick, vs random, Elo, the
     # reference games); '' = the game package's evaluation spec for the self-play spec
     # (GamePackage.eval_specs; MTG: a fixed deck set, self-play random decks), else the spec
@@ -399,13 +411,17 @@ class Run:
                              select_min_visits=c.get('selfplay_select_min_visits', 0),
                              select_c_visit=c.get('selfplay_select_c_visit'), select_c_scale=c.get('selfplay_select_c_scale'),
                              root_min_visits=c.get('selfplay_root_min_visits', 0),
-                             root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4))
+                             root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4),
+                             leaf_value_view=c.get('selfplay_leaf_value_view', 'mover'),
+                             view_samples=c.get('selfplay_view_samples', 0.0),
+                             view_sample_target=c.get('view_sample_target', 'next_q'))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
                          select_c_visit=c.get('eval_select_c_visit'), select_c_scale=c.get('eval_select_c_scale'),
                          root_min_visits=c.get('eval_root_min_visits', 0),
-                         root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4))
+                         root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4),
+                         leaf_value_view=c.get('eval_leaf_value_view', 'mover'))
 
     def eval_tag(self):
         """The name of the evaluation seats' move rule ('visits', 'cq', 'cq-n2' ...): the evaluations'
@@ -513,6 +529,7 @@ class Run:
                'infer_s': ev.seconds, 'avg_batch': ev.leaves / max(1, ev.calls),
                'minor_per_game': (st.get('minor', 0) - (st0.get('minor', 0) if st0 else 0)) / max(1, len(results)),
                'target': tstats.summary(c.get('policy_target', 'visits'))}
+        self.view_metrics(out, st, st0, leaves)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -523,6 +540,17 @@ class Run:
                               'restart_sims': st['restart_sims'] - st0['restart_sims'],
                               'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves']}
         return out
+
+    def view_metrics(self, out, st, st0, leaves):
+        """Self-play's root-view metrics (docs/az.md 5.6), only when a setting is on (the metrics of
+        before otherwise): `view` = {rows: value-only rows sent with leaves, rows_per_leaf, samples:
+        value-only samples recorded} by this machine's driver."""
+        c = self.cfg
+        if c.get('selfplay_leaf_value_view', 'mover') == 'mover' and not c.get('selfplay_view_samples'):
+            return
+        d = lambda k: st.get(k, 0) - ((st0 or {}).get(k, 0))           # noqa: E731
+        out['view'] = {'rows': d('view_rows'), 'rows_per_leaf': round(d('view_rows') / max(1, leaves), 4),
+                       'samples': d('view_recorded')}
 
     def selfplay_shared(self, it):
         """Iteration `it`'s self-play with a remote (docs/az.md 5.3; zero/remoteplay.py,
@@ -654,6 +682,7 @@ class Run:
                'infer_s': ev.seconds, 'avg_batch': ev.leaves / max(1, ev.calls),
                'minor_per_game': (st.get('minor', 0) - st0.get('minor', 0)) / max(1, len(results)),
                'target': tstats.summary(c.get('policy_target', 'visits'))}
+        self.view_metrics(out, st, st0, leaves)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
@@ -773,6 +802,9 @@ class Run:
                    cache=self.wcache if c.get('window_cache') else None, **kw)
         load_s = time.time() - t1
         steps = max(c['min_steps'], math.ceil(new_samples * c['reuse'] / c['batch']))
+        # value-only samples (no options, docs/az.md 5.6): no policy loss; the policy loss and the
+        # entropy are means over the decisions of a batch. A window without them: the losses of before
+        nview = int(np.count_nonzero(np.diff(W.opt_off) == 0))
         vq = value_q_at(c, it)
         mw = c['margin_loss_w']
         amp = use_amp(model, dev)
@@ -783,6 +815,8 @@ class Run:
                 acc[f'aux_{name}'] = 0.0
                 if loss == 'multinomial':
                     acc[f'aux_{name}_hit'] = 0.0
+        if nview:
+            acc.update(value_view=0.0, value_decision=0.0)
         last = min(steps, 200)
         S = model.seats
         feed = batches(W, rng, steps, c['batch'], dev, c.get('train_prefetch', 0))
@@ -799,7 +833,11 @@ class Run:
                     plog, vlog, mp = model(b['x'], b['n_players'])
             plog, vlog, mp = plog.float(), vlog.float(), mp.float()
             logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)
-            lp = -(b['pi'] * logp).sum(1).mean()
+            if nview:
+                dec = b['mask'].any(1).float()                         # rows with options: decisions
+                lp = (-(b['pi'] * logp).sum(1) * dec).sum() / dec.sum().clamp(min=1.0)
+            else:
+                lp = -(b['pi'] * logp).sum(1).mean()
             zt = ((1 - vq) * b['z'] + vq * b['q'])[:, :S]
             lv = -(zt * F.log_softmax(vlog, dim=1).clamp(min=-1e4)).sum(1).mean()
             present = (torch.arange(S, device=b['x'].device)[None, :] < b['n_players'][:, None]).float()
@@ -830,7 +868,13 @@ class Run:
             if step >= steps - last:
                 with torch.no_grad():
                     p = logp.exp()
-                    ent = -(p * logp.clamp(min=-30)).sum(1).mean()
+                    if nview:
+                        ent = (-(p * logp.clamp(min=-30)).sum(1) * dec).sum() / dec.sum().clamp(min=1.0)
+                        lvr = -(zt * F.log_softmax(vlog, dim=1).clamp(min=-1e4)).sum(1)
+                        acc['value_view'] += ((lvr * (1 - dec)).sum() / (1 - dec).sum().clamp(min=1.0)).item() / last
+                        acc['value_decision'] += ((lvr * dec).sum() / dec.sum().clamp(min=1.0)).item() / last
+                    else:
+                        ent = -(p * logp.clamp(min=-30)).sum(1).mean()
                     vacc = (vlog.argmax(1) == b['z'][:, :S].argmax(1)).float().mean()
                 acc['policy'] += lp.item() / last
                 acc['value'] += lv.item() / last
@@ -852,6 +896,8 @@ class Run:
                        window_reused=W.reused,
                        window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
                        value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
+            if nview:
+                out['window_view_samples'] = nview
             if aw:
                 out['aux'] = dict(AUX.window_stats(W, self.aux), weights=dict(self.aux_w))
                 if added:
@@ -1354,7 +1400,7 @@ def check_eval_settings(cfg, where=''):
     """The move-rule and Elo-offset settings (eval_select, selfplay_select, their guards and their
     completed-Q transforms, the root minimum visits, elo_offsets) -> None, else SystemExit (`where`:
     a prefix, e.g. 'resolver_cfg: ')."""
-    from .mcts import check_root_min, check_select, check_select_transform
+    from .mcts import check_leaf_view, check_root_min, check_select, check_select_transform
     for k in ('eval_select', 'selfplay_select'):
         try:
             check_select(cfg.get(k, 'visits'), cfg.get(k + '_min_visits', 0), what=k)
@@ -1366,6 +1412,12 @@ def check_eval_settings(cfg, where=''):
             check_root_min(cfg.get(k, 0), cfg.get('root_min_visits_max_actions', 4), what=k)
         except ValueError as e:
             raise SystemExit(f'{where}{e}') from None
+    try:
+        check_leaf_view(cfg.get('selfplay_leaf_value_view', 'mover'), cfg.get('selfplay_view_samples', 0.0),
+                        cfg.get('view_sample_target', 'next_q'), what='selfplay_leaf_value_view')
+        check_leaf_view(cfg.get('eval_leaf_value_view', 'mover'), what='eval_leaf_value_view')
+    except ValueError as e:
+        raise SystemExit(f'{where}{e}') from None
     try:
         elo.parse_offsets(cfg.get('elo_offsets', ''))
     except ValueError as e:

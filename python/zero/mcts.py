@@ -43,6 +43,11 @@ The move of a decision that is not sampled (docs/search.md 3.3; `select_index`):
 completed-Q transform where set (`select_transform`; else the target's). `select_tag` names a
 rule (its evaluations' Elo pool, docs/az.md 5.4), `select_settings` reads one from run settings.
 
+Root-view leaf values (docs/search.md 3.6; `leaf_value_view` 'root', off by default): a leaf
+decided by another seat than the tree's viewer takes its priors from `encode(decider)` and its
+value from `encode(viewer)` (`expand_and_backup(..., value_player=viewer)`): the root decider's
+information, not the guess at the other seats' hidden cards the sampled world holds.
+
 Root minimum visits (docs/search.md 3.5; `Tree.set_root_min`, off by default): every root option
 of a search gets at least k visits. A walk keeps PUCT's root option unless that option already has
 k visits and another has fewer: then it takes the least-visited root option (the lowest index on
@@ -243,9 +248,31 @@ def forced_tag(k=0, max_actions=4):
     return f'-f{int(k)}' + (f'a{int(max_actions)}' if int(max_actions) != 4 else '')
 
 
+LEAF_VIEWS = ('mover', 'root')
+VIEW_TARGETS = ('next_q', 'z')
+
+
+def check_leaf_view(view='mover', share=0.0, target='next_q', what='leaf_value_view'):
+    """Root-view settings (docs/search.md 3.6): `view` 'mover' | 'root' (`what`: its setting's name in
+    the message), the value-only samples' share in [0, 1] and their q target 'next_q' | 'z' -> None,
+    else ValueError."""
+    if view not in LEAF_VIEWS:
+        raise ValueError(f'{what} {view!r}: one of {LEAF_VIEWS}')
+    if isinstance(share, bool) or not isinstance(share, (int, float)) or not 0.0 <= float(share) <= 1.0:
+        raise ValueError(f'view_samples {share!r}: a share in [0, 1] (0 = off)')
+    if target not in VIEW_TARGETS:
+        raise ValueError(f'view_sample_target {target!r}: one of {VIEW_TARGETS}')
+
+
+def view_tag(view='mover'):
+    """The suffix of a move rule's name for its searches' leaf values: '' ('mover'), '-rv' ('root')
+    - an evaluation's moves change with it, so its Elo pool does (docs/az.md 5.4)."""
+    return '-rv' if view == 'root' else ''
+
+
 def leaf_values(value_rel, margin_rel, player, n, margin_w, team=1):
-    """Network output (relative to the decider) -> (util, win) over absolute seats (util = team
-    x win + margin_w tanh(margin))."""
+    """Network output (relative to `player`: the decider, or the viewer of a value-only row) ->
+    (util, win) over absolute seats (util = team x win + margin_w tanh(margin))."""
     win = [0.0] * n
     util = [0.0] * n
     for j in range(n):
@@ -312,10 +339,13 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
         node = child
 
 
-def expand_and_backup(node, path, priors, value_rel, margin_rel, n, margin_w=0.0, team=1, tree=None):
+def expand_and_backup(node, path, priors, value_rel, margin_rel, n, margin_w=0.0, team=1, tree=None,
+                      value_player=None):
     """Expand the leaf `node` with its evaluation and back it up along `path` (`tree`: the tree of
-    the walk, for the root minimum visits' accounting of a forced walk)."""
-    util, win = leaf_values(value_rel, margin_rel, node.player, n, margin_w, team)
+    the walk, for the root minimum visits' accounting of a forced walk). `value_player`: the seat
+    the value / margin are relative to (None: the leaf's decider; root-view values: the viewer)."""
+    vp = node.player if value_player is None else value_player
+    util, win = leaf_values(value_rel, margin_rel, vp, n, margin_w, team)
     node.expand(priors, util, n)
     if not node.acts:                       # a deferred terminal keeps its win vector
         node.wsum = list(win)

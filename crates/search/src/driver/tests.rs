@@ -1611,3 +1611,183 @@ fn aux_records_the_decider_targets_and_changes_nothing_else() {
     c.aux = true;
     assert!(Driver::<crate::toy_team::ToyTeam>::new(c).is_err());
 }
+
+// ------------------------------------------------------------------ root-view leaf values
+
+use crate::mull_game::{hmull_eval, HiddenMull};
+
+fn with_view(seat: SeatCfg, view: LeafView, share: f64, target: ViewTarget) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.leaf_value_view = view;
+            s.view_samples = share;
+            s.view_target = target;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+#[test]
+fn leaf_view_settings_and_view_pick() {
+    assert_eq!(LeafView::parse("mover"), Ok(LeafView::Mover));
+    assert_eq!(LeafView::parse("root"), Ok(LeafView::Root));
+    assert!(LeafView::parse("decider").is_err());
+    assert_eq!(ViewTarget::parse("next_q"), Ok(ViewTarget::NextQ));
+    assert_eq!(ViewTarget::parse("z"), Ok(ViewTarget::Z));
+    assert!(ViewTarget::parse("q").is_err());
+    let n = NnSeat::eval(0, 8);
+    assert_eq!((n.leaf_value_view, n.view_samples, n.view_target), (LeafView::Mover, 0.0, ViewTarget::NextQ));
+    // the share: a hash of (seed, gid, decision), about the share of the decisions, none at 0
+    assert!((0..1000).all(|d| view_pick(7, 3, d, 1.0) && !view_pick(7, 3, d, 0.0)));
+    let picked = (0..20_000u32).filter(|&d| view_pick(7, d / 100, d % 100, 0.25)).count();
+    assert!((4_600..5_400).contains(&picked), "{picked} of 20000 at 0.25");
+    let a: Vec<bool> = (0..64).map(|d| view_pick(1, 2, d, 0.5)).collect();
+    assert_eq!(a, (0..64).map(|d| view_pick(1, 2, d, 0.5)).collect::<Vec<_>>());
+    assert_ne!(a, (0..64).map(|d| view_pick(2, 2, d, 0.5)).collect::<Vec<_>>());
+    for bad in [1.5, -0.1, f64::NAN] {
+        let c = cfg(vec![with_view(nn(0, 16, true), LeafView::Mover, bad, ViewTarget::NextQ)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+        assert!(Driver::<ToyGame>::new(c).err().unwrap().contains("view_samples"), "{bad}");
+    }
+}
+
+#[test]
+fn root_view_off_and_value_samples_leave_the_searches_alone() {
+    // the golden records and match (computed before the settings existed) with the settings given
+    // at their defaults
+    let (_, recs) = golden_selfplay(with_view(nn(0, 16, true), LeafView::Mover, 0.0, ViewTarget::Z));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    let seat = |k| with_view(nn(k, 16, false), LeafView::Mover, 0.0, ViewTarget::NextQ);
+    let games = (0..40).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+    let mut c = cfg(vec![seat(0), seat(1)], games, &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.record = false;
+    assert_eq!(results_digest(&run(&mut Driver::<ToyGame>::new(c).unwrap()).0), GOLDEN_MATCH_VISITS);
+    // value-only samples (every recorded decision) add records and change nothing else: the same
+    // games, the decisions' records the golden ones; one value-only record per decision record (two
+    // players), right after it: the other seat, no options, no policy target
+    let (res, recs) = golden_selfplay(with_view(nn(0, 16, true), LeafView::Mover, 1.0, ViewTarget::NextQ));
+    let (res0, _) = golden_selfplay(nn(0, 16, true));
+    assert_eq!(results_digest(&res), results_digest(&res0));
+    let dec: Vec<Record> = recs.iter().filter(|r| !r.opts.is_empty()).cloned().collect();
+    assert_eq!((dec.len(), records_digest(&dec)), GOLDEN_RECORDS);
+    assert_eq!(recs.len(), 2 * dec.len());
+    for k in (0..recs.len()).step_by(2) {
+        let (d, v) = (&recs[k], &recs[k + 1]);
+        assert!(!d.opts.is_empty() && v.opts.is_empty() && v.pi.is_empty());
+        assert_eq!(v.player, 1 - d.player);
+        assert!((v.z[0] + d.z[0] - 1.0).abs() < 1e-6, "z in the observer's perspective");
+        assert_ne!(v.x, d.x, "the observer's view of the state");
+    }
+    assert_eq!(res.iter().map(|r| r.samples as usize).sum::<usize>(), recs.len());
+}
+
+/// Answer a hidden-hand mulligan batch with the stand-in network (`hmull_eval`), every row's value
+/// relative to its own player; checks the layout of root-view batches: a value-only row follows
+/// its leaf's row (same game, the other seat, no options). -> value-only rows.
+fn answer_hmull(d: &mut Driver<HiddenMull>, b: &Batch) -> usize {
+    let f = HiddenMull::NUM_FEATURES;
+    let mut pri = Vec::new();
+    let mut v = vec![0.0; b.b * MAX_SEATS];
+    let mut vrows = 0;
+    for r in 0..b.b {
+        let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+        if k == 0 {
+            vrows += 1;
+            let leaf_before = r > 0 && b.gid[r] == b.gid[r - 1] && b.player[r] != b.player[r - 1] && b.opt_off[r] > b.opt_off[r - 1];
+            assert!(leaf_before, "a value-only row without its leaf's row before it");
+        }
+        let (p, val) = hmull_eval(&b.x[r * f..(r + 1) * f], k);
+        pri.extend(p);
+        v[r * MAX_SEATS..(r + 1) * MAX_SEATS].copy_from_slice(&val);
+    }
+    d.submit(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS]).unwrap();
+    vrows
+}
+
+/// Hidden-hand mulligan self-play of `seat` on both sides: (records, value-only rows sent, stats).
+fn hmull_run(seat: SeatCfg, games: usize, seed: u64) -> (Vec<Record>, usize, DriverStats) {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
+    c.seed = seed;
+    let mut d = Driver::<HiddenMull>::new(c).unwrap();
+    let (mut smp, mut vrows) = (Vec::new(), 0);
+    while let Some(b) = d.next_batch(true).unwrap() {
+        vrows += answer_hmull(&mut d, &b);
+        smp.extend(d.take_samples());
+    }
+    smp.extend(d.take_samples());
+    (smp, vrows, d.stats())
+}
+
+fn hmull_seat(sims: u32, view: LeafView, share: f64, target: ViewTarget) -> SeatCfg {
+    let mut s = NnSeat::eval(0, sims);
+    s.selfplay = true;
+    s.eps = 0.0;
+    s.temp_moves = 0;
+    with_view(SeatCfg::Nn(s), view, share, target)
+}
+
+#[test]
+fn root_view_values_read_the_root_deciders_hand() {
+    // Two simulations: the first expands the root, the second takes KEEP (prior 0.6) to the other
+    // seat's decision - a leaf, whose value is the root's value q. From the other seat's view (the
+    // search of before) it reads that seat's hand in the sampled world and none of the keeper's:
+    // 1 - (0.5 + 0.3 (q1 - 0.5)) with the sampled q1 0 or 1. From the root decider's view: 0.5 +
+    // 0.3 (q0 - 0.5), its own hand, in every world.
+    let first = |recs: &[Record]| -> Vec<(f32, f32)> { recs.iter().filter(|r| r.player == 0 && r.x[1] == 0.0).map(|r| (r.x[0], r.q[0])).collect() };
+    let (rm, vm, sm) = hmull_run(hmull_seat(2, LeafView::Mover, 0.0, ViewTarget::NextQ), 200, 11);
+    let (rr, vr, sr) = hmull_run(hmull_seat(2, LeafView::Root, 0.0, ViewTarget::NextQ), 200, 11);
+    assert_eq!((vm, sm.view_rows), (0, 0));
+    assert!(vr > 150 && vr as u64 == sr.view_rows, "{vr} value-only rows, stats {}", sr.view_rows);
+    assert_eq!(sr.leaves, sm.leaves, "one evaluation per leaf either way (the value-only rows are extra rows)");
+    let (fm, fr) = (first(&rm), first(&rr));
+    assert_eq!((fm.len(), fr.len()), (200, 200));
+    let want = |q0: f32| 0.5 + 0.3 * (q0 - 0.5);
+    assert!(fr.iter().all(|&(q0, q)| (q - want(q0)).abs() < 1e-6), "root view: the keeper's own hand");
+    let off = fm.iter().filter(|&&(q0, q)| (q - want(q0)).abs() > 0.1).count();
+    assert!((60..140).contains(&off), "mover view: {off} of 200 roots valued by the other seat's sampled hand");
+    let bad = |f: &[(f32, f32)]| {
+        let v: Vec<f32> = f.iter().filter(|x| x.0 == 0.0).map(|x| x.1).collect();
+        v.iter().sum::<f32>() / v.len().max(1) as f32
+    };
+    eprintln!("hidden mull, a bad hand's KEEP after 2 simulations: mover view {:.3}, root view {:.3} (its value 0.35)", bad(&fm), bad(&fr));
+    assert!(bad(&fm) > 0.45 && (bad(&fr) - 0.35).abs() < 1e-6);
+}
+
+#[test]
+fn value_only_samples_and_their_targets() {
+    // every recorded decision (a hidden-hand game has two, both searched) records the other seat's
+    // view of the real state: [seat 0's decision, seat 1's view, seat 1's decision, seat 0's view]
+    // per game. Its z is the outcome for the observer; 'next_q': seat 1's view takes seat 1's next
+    // search's root value (its own decision's q: the same search); seat 0 never searches again
+    // after seat 1's decision, so its view takes z; 'z': q = z.
+    for target in [ViewTarget::NextQ, ViewTarget::Z] {
+        let (recs, _, st) = hmull_run(hmull_seat(16, LeafView::Root, 1.0, target), 60, 5);
+        assert_eq!(recs.len(), 240);
+        assert_eq!((st.recorded, st.view_recorded), (120, 120));
+        let mut differ = 0;
+        for g in recs.chunks(4) {
+            let (d0, v1, d1, v0) = (&g[0], &g[1], &g[2], &g[3]);
+            assert_eq!((d0.player, v1.player, d1.player, v0.player), (0, 1, 1, 0));
+            assert!(v1.opts.is_empty() && v0.opts.is_empty() && v1.pi.is_empty() && !d0.opts.is_empty());
+            // the views: seat 1 before seat 0's move (nobody decided), seat 0 before seat 1's
+            assert_eq!((v1.x[1], v0.x[1], d1.x[1]), (0.0, 1.0, 1.0));
+            assert_eq!(v1.z, d1.z);
+            assert_eq!(v0.z, d0.z);
+            assert_eq!(v0.q, v0.z);
+            if target == ViewTarget::NextQ {
+                assert_eq!(v1.q, d1.q, "seat 1's view: its next search's root value");
+                differ += (v1.q != v1.z) as usize;
+            } else {
+                assert_eq!(v1.q, v1.z);
+            }
+        }
+        assert!(target == ViewTarget::Z || differ > 30, "{differ}");
+    }
+    // a share: about that many, the decisions' records unchanged
+    let (all, _, _) = hmull_run(hmull_seat(16, LeafView::Root, 0.0, ViewTarget::NextQ), 200, 9);
+    let (half, _, st) = hmull_run(hmull_seat(16, LeafView::Root, 0.5, ViewTarget::NextQ), 200, 9);
+    assert!((150..250).contains(&st.view_recorded), "{}", st.view_recorded);
+    let dec: Vec<Record> = half.iter().filter(|r| !r.opts.is_empty()).cloned().collect();
+    assert_eq!(records_digest(&dec), records_digest(&all));
+}

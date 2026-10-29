@@ -19,7 +19,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{root_floor, sample_arrays, Batch, DriverCfg, KeyKind, NnSeat, PolicyTarget, SeatCfg, Select};
+use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, SeatCfg, Select, ViewTarget};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
 use zero_search::{SearchGame, MAX_SEATS};
 
@@ -75,6 +75,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(game_names, m)?)?;
     m.add_function(wrap_pyfunction!(game_info_of, m)?)?;
     m.add_function(wrap_pyfunction!(root_floor_of, m)?)?;
+    m.add_function(wrap_pyfunction!(view_pick_of, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
     Ok(())
 }
@@ -141,7 +142,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -212,6 +213,11 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         // root_min_visits_max_actions options (docs/search.md 3.5)
         root_min_visits: get(d, "root_min_visits", 0u32)?,
         root_min_visits_max_actions: get(d, "root_min_visits_max_actions", 4u32)?,
+        // whose view a leaf's value comes from: 'mover' (default) | 'root' (docs/search.md 3.6)
+        leaf_value_view: LeafView::parse(&get(d, "leaf_value_view", "mover".to_string())?).map_err(verr)?,
+        // value-only samples: a share of the recorded decisions (0 = off) and their q target
+        view_samples: get(d, "view_samples", 0.0f64)?,
+        view_target: ViewTarget::parse(&get(d, "view_sample_target", "next_q".to_string())?).map_err(verr)?,
     }))
 }
 
@@ -235,6 +241,14 @@ fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>>
 #[pyo3(name = "root_floor")]
 fn root_floor_of(k: u32, max_actions: u32, full: bool, m: usize, target: u32) -> u32 {
     root_floor(k, max_actions, full, m, target)
+}
+
+/// Whether recorded decision `decision` of game `gid` (driver seed `seed`) records its value-only
+/// samples at share `share` (`driver::view_pick`, docs/search.md 3.6).
+#[pyfunction]
+#[pyo3(name = "view_pick")]
+fn view_pick_of(seed: u64, gid: u32, decision: u32, share: f64) -> bool {
+    view_pick(seed, gid, decision, share)
 }
 
 /// Registered game names.
@@ -395,16 +409,27 @@ impl PySearchTree {
     }
     /// One simulation: None if it ended in a terminal state (backed up), else
     /// (decider, features, legal actions) of the leaf - call `expand` with its evaluation.
-    #[pyo3(signature = (game, c_puct, chance_k=0, margin_w=0.0))]
-    fn simulate<'py>(&mut self, py: Python<'py>, game: &PyGame, c_puct: f64, chance_k: u32, margin_w: f64) -> PyResult<Option<(usize, Bound<'py, numpy::PyArray1<f32>>, Vec<u16>)>> {
-        match self.t.simulate(&*game.g, c_puct, chance_k, margin_w).map_err(rerr)? {
+    /// `root_view` (docs/search.md 3.6): a 4-tuple, the 4th the leaf's features from the tree's
+    /// viewer (the root decider) when another seat decides it, else None; `expand` then takes the
+    /// value and margin of those features (relative to the viewer), the priors of the decider's.
+    #[pyo3(signature = (game, c_puct, chance_k=0, margin_w=0.0, root_view=false))]
+    fn simulate<'py>(&mut self, py: Python<'py>, game: &PyGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool) -> PyResult<Option<Bound<'py, pyo3::types::PyTuple>>> {
+        match self.t.simulate(&*game.g, c_puct, chance_k, margin_w, root_view).map_err(rerr)? {
             None => Ok(None),
-            Some(l) => Ok(Some((l.player, l.x.into_pyarray(py), l.acts))),
+            Some(l) if root_view => Ok(Some((l.player, l.x.into_pyarray(py), l.acts, l.vx.map(|v| v.into_pyarray(py))).into_pyobject(py)?)),
+            Some(l) => Ok(Some((l.player, l.x.into_pyarray(py), l.acts).into_pyobject(py)?)),
         }
     }
+    /// Expand the last leaf: priors over its options, value / margin relative to its decider (to
+    /// the tree's viewer when `simulate(root_view=True)` gave its features).
     #[pyo3(signature = (priors, value, margin, margin_w=0.0))]
     fn expand(&mut self, priors: Vec<f32>, value: Vec<f32>, margin: Vec<f32>, margin_w: f64) -> PyResult<()> {
         self.t.expand(&priors, &value, &margin, margin_w).map_err(rerr)
+    }
+    /// The tree's viewer (the root decider whose information set it searches).
+    #[getter]
+    fn viewer(&self) -> usize {
+        self.t.viewer()
     }
     #[pyo3(signature = (alpha, eps, seed=None))]
     fn add_noise(&mut self, alpha: f64, eps: f64, seed: Option<u64>) {
@@ -703,6 +728,8 @@ impl PySearchDriver {
         d.set_item("restarts", s.restarts)?;
         d.set_item("recorded", s.recorded)?;
         d.set_item("minor", s.minor)?;
+        d.set_item("view_rows", s.view_rows)?;
+        d.set_item("view_recorded", s.view_recorded)?;
         d.set_item("emitted", s.emitted)?;
         d.set_item("epoch", s.epoch)?;
         d.set_item("net", s.net)?;

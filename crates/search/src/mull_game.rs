@@ -122,3 +122,92 @@ pub fn mull_eval(x: &[f32], nopts: usize) -> (Vec<f32>, [f32; MAX_SEATS]) {
     val[1] = 1.0 - v;
     (pri, val)
 }
+
+/// "Keep or mulligan" with **private hands** (root-view leaf values, docs/search.md 3.6): the
+/// rules of `Mull`, but a seat sees only its own hand - `encode(viewer)` holds its own quality,
+/// the decisions made and who took a mulligan (public), never the other hand; `determinize(viewer)`
+/// deals the other seat's hand again (good 1 in 2, or 3 in 4 after its mulligan) and masks the
+/// other seat's mulligan draw in the chance keys (`MASKED`).
+///
+/// MTG Zero's Delver mulligan in miniature: after seat 0 keeps, seat 1 decides. A leaf there valued
+/// from seat 1's view (`encode(decider)`) reads seat 1's hand **of the sampled world** and is blind
+/// to seat 0's; valued from seat 0's view it reads seat 0's true hand. `hmull_eval` is the stand-in
+/// network: the value of the viewer's information if both seats keep (a hand it cannot see counts
+/// as its mean quality, 0.5; 0.525 after a mulligan), priors KEEP 0.6 / MULL 0.4.
+#[derive(Clone, Debug)]
+pub struct HiddenMull {
+    pub m: Mull,
+    observer: Option<usize>,
+}
+
+/// The chance key of a mulligan draw the observer may not see (`HiddenMull`).
+pub const MASKED: u64 = 0xFF;
+
+impl SearchGame for HiddenMull {
+    type Spec = ();
+    const NAME: &'static str = "hmull";
+    const NUM_ACTIONS: usize = 2;
+    const NUM_FEATURES: usize = 4;
+    const MIN_PLAYERS: usize = 2;
+    const MAX_PLAYERS: usize = 2;
+
+    fn parse_spec(_json: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn new_game(spec: &(), players: usize, seed: u64) -> Result<HiddenMull, String> {
+        Ok(HiddenMull { m: Mull::new_game(spec, players, seed)?, observer: None })
+    }
+    fn num_players(&self) -> usize {
+        2
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.m.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.m.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        let s = self.m.to_move().ok_or("hmull: the game is over")?;
+        let k = chance.len();
+        self.m.step(a, chance)?;
+        // a mulligan's draw is private to the drawer
+        if chance.len() > k && self.observer.is_some_and(|o| o != s) {
+            chance[k] = MASKED;
+        }
+        Ok(())
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.m.result()
+    }
+    fn margin(&self, _seat: usize) -> f32 {
+        0.0
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.m.quality(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut Rng) {
+        let o = 1 - viewer;
+        let good = if self.m.mulled[o] { rng.below(4) != 0 } else { rng.below(2) != 0 };
+        self.m.hand[o] = good as u8;
+        self.m.determinize(viewer, rng);
+        self.observer = Some(viewer);
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        out[0] = self.m.quality(viewer);
+        out[1] = self.m.decided as f32;
+        out[2] = self.m.mulled[viewer] as u8 as f32;
+        out[3] = self.m.mulled[1 - viewer] as u8 as f32;
+    }
+}
+
+/// The stand-in network on `HiddenMull` features (module docs): priors over `nopts` options and
+/// the value relative to the row's viewer.
+pub fn hmull_eval(x: &[f32], nopts: usize) -> (Vec<f32>, [f32; MAX_SEATS]) {
+    let pri = if nopts == 2 { vec![0.6, 0.4] } else { vec![1.0 / nopts.max(1) as f32; nopts] };
+    let other = if x[3] != 0.0 { 0.75 * 0.7 } else { 0.5 };
+    let v = 0.5 + 0.3 * (x[0] - other);
+    let mut val = [0.0; MAX_SEATS];
+    val[0] = v;
+    val[1] = 1.0 - v;
+    (pri, val)
+}

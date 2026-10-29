@@ -16,6 +16,10 @@
   visits in both, and the mean visit distributions with and without the forced walks, the forced
   walks per option, the completed-Q targets and the root win without the forced walks agree at the
   noise floor (Python vs Python).
+* `root_view`: root-view leaf values (docs/search.md 3.6) - positions searched by both trees with
+  the leaves of the other seat valued from the root decider's view: the mean visit distributions,
+  completed-Q targets and root win agree at the noise floor (Python vs Python), and differ from the
+  mover-view search of the same positions (the setting matters: a power check).
 * `h2h`: games between a Rust-tree seat and a Python-tree seat (`play.PyDriver`, seats
   alternating), both searching with the same network and settings (and move rule): ~50% within
   error.
@@ -23,6 +27,7 @@
   python -m zero.parity positions [--sims 128 --reps 32 --chance-k 0 --cq-c-scale 1.0]
   python -m zero.parity positions --game toy_team --players 4     (deferred leaves, teams of 2)
   python -m zero.parity forced [--k 4 --sims 96 --reps 24]         (root minimum visits)
+  python -m zero.parity root_view [--sims 96 --reps 24]            (root-view leaf values)
   python -m zero.parity h2h --model runs/toy1/models/iter_0010.pt [--games 2000 --sims 32 --select cq]
   (or python -m <pkg>.az.parity ... in a game repo)
 """
@@ -63,9 +68,11 @@ class LinearEval:
         return pri, v, [0.0] * MAX_SEATS
 
 
-def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0):
+def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0,
+              root_view=False):
     """-> (root visits, root win[, completed-Q target with cq = (c_visit, c_scale)][, the tree]);
-    `root_min`: the root minimum visits of the search (docs/search.md 3.5; 0 = off)."""
+    `root_min`: the root minimum visits of the search (docs/search.md 3.5; 0 = off); `root_view`:
+    another seat's leaves take their value from the viewer's features (docs/search.md 3.6)."""
     rng = random.Random(seed)
     t = mcts.Tree(g, redet, rng)
     t.set_root_min(root_min)
@@ -75,23 +82,30 @@ def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
             continue
         node, leaf, path = r
         pri, v, m = ev(leaf.encode(node.player), node.acts, g.n_players)
-        mcts.expand_and_backup(node, path, pri, v, m, g.n_players, team=t.team, tree=t)
+        vp = None
+        if root_view and node.player != t.viewer:
+            _, v, m = ev(leaf.encode(t.viewer), [], g.n_players)
+            vp = t.viewer
+        mcts.expand_and_backup(node, path, pri, v, m, g.n_players, team=t.team, tree=t, value_player=vp)
     out = (np.asarray(t.root.Nv, float), mcts.root_win(t.root))
     if cq is not None:
         out += (np.asarray(mcts.cq_target(t.root, *cq)),)
     return out + (t,) if tree else out
 
 
-def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0):
+def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0,
+              root_view=False):
     """`search_py` with the Rust tree (`<package>._engine.SearchTree`)."""
     t = g.search_tree(redet, seed)
     t.set_root_min(root_min)
     for _ in range(sims):
-        r = t.simulate(g, c_puct, chance_k)
+        r = t.simulate(g, c_puct, chance_k, root_view=True) if root_view else t.simulate(g, c_puct, chance_k)
         if r is None:
             continue
-        p, x, acts = r
+        p, x, acts = r[:3]
         pri, v, m = ev(x, acts, g.n_players)
+        if root_view and r[3] is not None:
+            _, v, m = ev(r[3], [], g.n_players)
         t.expand(pri, v, m)
     out = (np.asarray(t.root_visits, float), t.root_win())
     if cq is not None:
@@ -244,6 +258,41 @@ def forced(game='toy', n=10, sims=96, reps=24, k=4, seed=0, scale=0.15, eps=0.00
                                                                  'reps': reps, 'k': k}
 
 
+def root_view(game='toy', n=10, sims=96, reps=24, seed=0, scale=0.15, cq=(50.0, 1.0), verbose=False, rs_view=True):
+    """Root-view leaf values in both trees (docs/search.md 3.6): positions of random play, the
+    stand-in `LinearEval` (its value reads the row's features: a viewer's features give another value
+    than the decider's), both trees with `root_view`. -> dict: the TVs Rust-Python and Python-Python of
+    the mean visit distributions (`tv_*`) and completed-Q targets (`tv_cq_*`), |Rust - Python| of the
+    decider's mean root win (`win_diff`), and the TV between the Python tree's root-view and
+    mover-view searches (`tv_view`: what the setting changes), averaged over the positions.
+    `rs_view` False: the Rust tree searches mover-view (a power check: its TV to Python is then about
+    `tv_view`)."""
+    info = engine().game_info_of(game)
+    ev = LinearEval(info['num_features'], info['num_actions'], seed=1, scale=scale)
+    res = {k: [] for k in ('tv_rs_py', 'tv_py_py', 'tv_cq_rs_py', 'tv_cq_py_py', 'win_diff', 'tv_view')}
+    for i, g in enumerate(sample_positions(game, n, seed)):
+        rs = [search_rs(g, ev, sims, 1000 + r, cq=cq, root_view=rs_view) for r in range(reps)]
+        pa = [search_py(g, ev, sims, 2000 + r, cq=cq, root_view=True) for r in range(reps)]
+        pb = [search_py(g, ev, sims, 3000 + r, cq=cq, root_view=True) for r in range(reps)]
+        pm = [search_py(g, ev, sims, 4000 + r, cq=cq) for r in range(reps)]
+        mr, ma, mb, mm = (np.mean([x[0] for x in s], 0) for s in (rs, pa, pb, pm))
+        res['tv_rs_py'].append(tv(mr, ma))
+        res['tv_py_py'].append(tv(ma, mb))
+        res['tv_view'].append(tv(mm, ma))
+        cr, ca, cb = (np.mean([x[2] for x in s], 0) for s in (rs, pa, pb))
+        res['tv_cq_rs_py'].append(tv(cr, ca))
+        res['tv_cq_py_py'].append(tv(ca, cb))
+        wr = np.mean([x[1][g.to_move] for x in rs])
+        wa = np.mean([x[1][g.to_move] for x in pa])
+        res['win_diff'].append(abs(wr - wa))
+        if verbose:
+            print(f'position {i}: {len(g.legal())} options, TV rs-py {res["tv_rs_py"][-1]:.4f} py-py '
+                  f'{res["tv_py_py"][-1]:.4f}, root vs mover view {res["tv_view"][-1]:.4f}, cq TV rs-py '
+                  f'{res["tv_cq_rs_py"][-1]:.4f} py-py {res["tv_cq_py_py"][-1]:.4f}, root win rs {wr:.4f} py {wa:.4f}',
+                  flush=True)
+    return {k: float(np.mean(v)) for k, v in res.items()} | {'positions': n, 'sims': sims, 'reps': reps}
+
+
 def cq_formula(game='toy', n=8, sims=64, seed=0, cq_settings=((50.0, 1.0), (50.0, 0.1), (10.0, 3.0)), scale=0.15):
     """The Python `completed_q_policy` on Rust roots' statistics (P0, N, W, network value) vs
     the Rust tree's own target. -> max |difference|."""
@@ -355,6 +404,11 @@ def main(argv=None):
     fo.add_argument('--k', type=int, default=4)
     fo.add_argument('--eps', type=float, default=0.001, help='the prior left to the options but the favourite')
     fo.add_argument('--cq-c-scale', type=float, default=1.0)
+    rv = sub.add_parser('root_view')
+    rv.add_argument('--game', default='toy')
+    rv.add_argument('--positions', type=int, default=10)
+    rv.add_argument('--sims', type=int, default=96)
+    rv.add_argument('--reps', type=int, default=24)
     a = ap.parse_args(argv)
     if a.cmd == 'positions':
         print(json.dumps(positions(a.game, n=a.positions, sims=a.sims, reps=a.reps, chance_k=a.chance_k,
@@ -362,6 +416,8 @@ def main(argv=None):
                                    players=a.players, depth=tuple(a.depth))))
     elif a.cmd == 'select':
         print(json.dumps(select_formula(a.game, n=a.positions)))
+    elif a.cmd == 'root_view':
+        print(json.dumps(root_view(a.game, n=a.positions, sims=a.sims, reps=a.reps, verbose=True)))
     elif a.cmd == 'forced':
         print(json.dumps(forced(a.game, n=a.positions, sims=a.sims, reps=a.reps, k=a.k, eps=a.eps,
                                 cq=(50.0, a.cq_c_scale), verbose=True)))

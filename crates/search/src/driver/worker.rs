@@ -91,6 +91,8 @@ struct Tally {
     restarts: u64,
     recorded: u64,
     minor: u64,
+    view_rows: u64,
+    view_recorded: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -126,14 +128,17 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
                 slot.net = net;
             }
             match slot.pending.take() {
-                Some(Pending::Leaf { key, local, seat, node }) => {
+                Some(Pending::Leaf { key, local, seat, node, vrow }) => {
                     let Some(Eval::Nn { opt_off, priors, value, margin, bases }) = evals[key as usize].as_ref() else {
                         return Err("internal: missing network evaluation".into());
                     };
                     let b = (bases[c] + local) as usize;
                     let lo = opt_off[b] as usize;
                     let hi = opt_off[b + 1] as usize;
-                    apply_eval(cfg, slot, seat, node, &priors[lo..hi], &value[b * MAX_SEATS..(b + 1) * MAX_SEATS], &margin[b * MAX_SEATS..(b + 1) * MAX_SEATS])?;
+                    // the priors from the leaf's row; its value from the value-only row after it
+                    // (`LeafView::Root` at another seat's leaf, docs/search.md 3.6), else its own
+                    let v = if vrow { b + 1 } else { b };
+                    apply_eval(cfg, slot, seat, node, vrow, &priors[lo..hi], &value[v * MAX_SEATS..(v + 1) * MAX_SEATS], &margin[v * MAX_SEATS..(v + 1) * MAX_SEATS])?;
                     n.sims += 1;
                 }
                 Some(Pending::Ext { key, local }) => {
@@ -174,6 +179,10 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     k.restarts.fetch_add(n.restarts, Ordering::Relaxed);
     k.recorded.fetch_add(n.recorded, Ordering::Relaxed);
     k.minor.fetch_add(n.minor, Ordering::Relaxed);
+    if n.view_rows > 0 || n.view_recorded > 0 {
+        k.view_rows.fetch_add(n.view_rows, Ordering::Relaxed);
+        k.view_recorded.fetch_add(n.view_recorded, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -264,20 +273,25 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.steps = 0;
     slot.records.clear();
     slot.rq.clear();
+    slot.view_wait.clear();
     slot.pending = None;
     slot.ext_payload = None;
     slot.moves.clear();
     Ok(())
 }
 
-/// Expand the slot's pending leaf with its evaluation and back it up.
-fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, node: u32, priors: &[f32], value: &[f32], margin: &[f32]) -> Result<(), String> {
+/// Expand the slot's pending leaf with its evaluation and back it up. `vrow`: `value` / `margin`
+/// are relative to the tree's viewer (a value-only row, `LeafView::Root`), else to the leaf's
+/// decider.
+#[allow(clippy::too_many_arguments)]
+fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, node: u32, vrow: bool, priors: &[f32], value: &[f32], margin: &[f32]) -> Result<(), String> {
     let s = nn_seat(cfg, slot.gid, seat).ok_or("internal: pending leaf of a non-network seat")?;
     let tree = slot.trees[seat].as_mut().ok_or("internal: pending leaf without a tree")?;
     if priors.len() != tree.acts(node).len() {
         return Err("internal: evaluation option count mismatch".into());
     }
-    let (util, win) = leaf_values_team(value, margin, tree.player(node), slot.n, s.margin_w, tree.team);
+    let vp = if vrow { tree.viewer } else { tree.player(node) };
+    let (util, win) = leaf_values_team(value, margin, vp, slot.n, s.margin_w, tree.team);
     tree.expand_leaf(node, priors, &util, &win);
     tree.backup(&slot.path, &util, &win);
     if node == tree.root && s.selfplay && slot.full {
@@ -333,7 +347,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         }
         if slot.sims >= slot.target.unwrap() {
             n.minor += slot.minor as u64;
-            n.recorded += decide(cfg, slot, seat, p, &mut scratch.sim.key)? as u64;
+            decide(cfg, slot, seat, p, &mut scratch.sim.key, n)?;
             continue;
         }
         let walk = Walk { c_puct: seat.c_puct, chance_k: seat.chance_k, margin_w: seat.margin_w };
@@ -360,7 +374,20 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 buf.player.push(player as i32);
                 buf.n_players.push(slot.n as i32);
                 buf.gid.push(slot.gid as i64);
-                slot.pending = Some(Pending::Leaf { key: seat.key, local, seat: p, node });
+                // root-view leaf values (docs/search.md 3.6): another seat's leaf also sends a
+                // value-only row (no options) of the tree's viewer, the root decider, right after it
+                let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
+                if vrow {
+                    let off = buf.x.len();
+                    buf.x.resize(off + G::NUM_FEATURES, 0.0);
+                    sg.encode(tree.viewer, &mut buf.x[off..]);
+                    buf.nopt.push(0);
+                    buf.player.push(tree.viewer as i32);
+                    buf.n_players.push(slot.n as i32);
+                    buf.gid.push(slot.gid as i64);
+                    n.view_rows += 1;
+                }
+                slot.pending = Some(Pending::Leaf { key: seat.key, local, seat: p, node, vrow });
                 n.leaves += 1;
                 return Ok(());
             }
@@ -405,10 +432,24 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     slot.trees[p].as_mut().unwrap().set_root_min(k);
 }
 
-/// Choose the move after the search. -> whether a training record was made.
-fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize, key: &mut Vec<u64>) -> Result<bool, String> {
+/// Choose the move after the search; the training record (`n.recorded`) and value-only records
+/// (`n.view_recorded`) it makes.
+fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize, key: &mut Vec<u64>, n: &mut Tally) -> Result<(), String> {
     let tree = slot.trees[p].as_ref().unwrap();
     let root = tree.root;
+    // value-only records waiting for this seat's next search (`ViewTarget::NextQ`, docs/search.md
+    // 3.6) take its root value (without forced walks, as a record's q); a minor search is too small
+    if !slot.view_wait.is_empty() && !slot.minor && slot.view_wait.iter().any(|w| w.1 as usize == p) {
+        let w = if tree.root_min() > 0 { tree.root_win_pruned() } else { tree.win(root) };
+        let rq = &mut slot.rq;
+        slot.view_wait.retain(|&(i, o)| {
+            if o as usize != p {
+                return true;
+            }
+            rq[i as usize] = w;
+            false
+        });
+    }
     let nv_all = tree.visits(root);
     // with the root minimum visits (docs/search.md 3.5) the visit-based outputs - temperature
     // sampling, the 'visits' rule, the 'visits' target, the root value q - leave the forced walks
@@ -459,10 +500,35 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         }
         slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux });
         slot.rq.push(if pruned.is_some() { tree.root_win_pruned() } else { tree.win(root) });
+        n.recorded += 1;
+        // value-only samples (docs/search.md 3.6): the real state from every other recording
+        // seat's view, in its perspective, no options; q per the seat's view_target
+        if seat.view_samples > 0.0 && view_pick(cfg.seed, slot.gid, slot.decisions, seat.view_samples) {
+            let g = slot.game.as_ref().unwrap();
+            for o in 0..slot.n {
+                if o == p || !nn_seat(cfg, slot.gid, o).is_some_and(|s| s.selfplay && s.record) {
+                    continue;
+                }
+                let mut x = vec![0.0f32; G::NUM_FEATURES];
+                g.encode(o, &mut x);
+                // (with auxiliary targets: the observer's, as a decider's are the decider's)
+                let mut aux = Vec::new();
+                if cfg.aux {
+                    aux.resize(G::aux_width(), 0.0);
+                    g.aux_target(o, &mut aux);
+                }
+                if seat.view_target == ViewTarget::NextQ {
+                    slot.view_wait.push((slot.records.len() as u32, o as u8));
+                }
+                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux });
+                slot.rq.push(None);
+                n.view_recorded += 1;
+            }
+        }
     }
     slot.decisions += 1;
     apply(cfg, slot, a, key)?;
-    Ok(rec)
+    Ok(())
 }
 
 /// Apply a real move: the transition (single-option decisions of non-external seats are
@@ -516,6 +582,7 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
     let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves) };
     let records = std::mem::take(&mut slot.records);
     let rq = std::mem::take(&mut slot.rq);
+    slot.view_wait.clear();
     slot.drop_trees();
     slot.gid = NO_GAME;
     slot.pending = None;

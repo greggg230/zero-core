@@ -41,11 +41,12 @@ def pool_dir(run, tag='visits'):
 def eval_tag(cfg):
     """The name of a run's evaluation move rule (`mcts.select_tag` of eval_select, its guard and
     the rule's completed-Q transform: eval_select_c_visit / _c_scale, unset = cq_c_visit /
-    cq_c_scale; then `mcts.forced_tag` of eval_root_min_visits, '' when off): its evaluations'
-    'select' and its pool."""
-    from .mcts import forced_tag, select_settings, select_tag
+    cq_c_scale; then `mcts.forced_tag` of eval_root_min_visits, '' when off; then `mcts.view_tag` of
+    eval_leaf_value_view, '-rv' for 'root'): its evaluations' 'select' and its pool."""
+    from .mcts import forced_tag, select_settings, select_tag, view_tag
     return select_tag(*select_settings(cfg, 'eval_select')) + forced_tag(
-        cfg.get('eval_root_min_visits', 0), cfg.get('root_min_visits_max_actions', 4))
+        cfg.get('eval_root_min_visits', 0), cfg.get('root_min_visits_max_actions', 4)) + view_tag(
+        cfg.get('eval_leaf_value_view', 'mover'))
 
 
 def active_pool(run):

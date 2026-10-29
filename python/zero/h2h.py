@@ -30,7 +30,7 @@ import time
 
 from . import games as G, package
 from .infer import NetEvaluator, drive
-from .mcts import check_select, check_select_transform, forced_tag, select_settings, select_tag, select_transform
+from .mcts import check_select, check_select_transform, forced_tag, select_settings, select_tag, select_transform, view_tag
 from .net import load
 
 
@@ -39,7 +39,8 @@ def run_rule(ckpt):
     and the rule's completed-Q transform, `mcts.select_settings`; {} = the default) for a
     checkpoint runs/<run>/models/<file>.pt. An evaluation seat has no 'cq' target, so the rule's
     transform goes in as cq_c_visit / cq_c_scale (as `games.nn_seat` writes it). The run's
-    evaluation root minimum visits (eval_root_min_visits, docs/search.md 3.5) come with it."""
+    evaluation root minimum visits (eval_root_min_visits, docs/search.md 3.5) and leaf values' view
+    (eval_leaf_value_view, docs/search.md 3.6) come with it."""
     d = os.path.dirname(os.path.dirname(os.path.abspath(ckpt)))
     try:
         with open(os.path.join(d, 'config.json'), encoding='utf-8') as f:
@@ -52,6 +53,8 @@ def run_rule(ckpt):
     if c.get('eval_root_min_visits'):
         out = {'root_min_visits': int(c['eval_root_min_visits']),
                'root_min_visits_max_actions': int(c.get('root_min_visits_max_actions', 4))}
+    if c.get('eval_leaf_value_view', 'mover') != 'mover':
+        out['leaf_value_view'] = c['eval_leaf_value_view']
     if c.get('eval_select', 'visits') == 'visits':
         return out
     rule, mv, cv, cs = select_settings(c, 'eval_select')
@@ -91,7 +94,8 @@ def _tag(seat):
     cv, cs = select_transform(seat.get('cq_c_visit', 50.0), seat.get('cq_c_scale', 1.0), seat.get('select_c_visit'),
                               seat.get('select_c_scale'))
     return select_tag(seat.get('select', 'visits'), seat.get('select_min_visits', 0), cv, cs) + forced_tag(
-        seat.get('root_min_visits', 0), seat.get('root_min_visits_max_actions', 4))
+        seat.get('root_min_visits', 0), seat.get('root_min_visits_max_actions', 4)) + view_tag(
+        seat.get('leaf_value_view', 'mover'))
 
 
 def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None,

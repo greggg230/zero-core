@@ -11,7 +11,11 @@ completed-Q logits' argmax 'cq', docs/search.md 3.3), tree reuse when the same s
 the opt-in root minimum visits of full searches (`root_min_visits`, docs/search.md 3.5: the
 visit-based outputs without the forced walks, the 'cq' ones with them). Recorded decisions carry
 the seat's policy target: the visit distribution ('visits') or the completed-Q target ('cq',
-docs/search.md 3.1).
+docs/search.md 3.1). Root-view leaf values (`leaf_value_view` 'root', docs/search.md 3.6): another
+seat's leaf adds a value-only row of the tree's viewer right after its own row in the batch; the
+value-only samples (`view_samples`): a share of the recorded decisions (`view_pick`, the Rust
+driver's hash) also record every other recording seat's view of the real state, no options, q
+= that seat's next search's root value ('next_q') or z.
 """
 import random
 
@@ -22,6 +26,27 @@ from .protocol import LeafBatch, MAX_SEATS, concat_samples
 
 
 POLICY_TARGETS = ('visits', 'cq')
+M64 = (1 << 64) - 1
+
+
+def split64(x):
+    """splitmix64's finaliser (the Rust `rng::split64`)."""
+    z = (x + 0x9E3779B97F4A7C15) & M64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & M64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & M64
+    return z ^ (z >> 31)
+
+
+def view_pick(seed, gid, decision, share):
+    """Whether recorded decision `decision` (the game's searched decisions before it) of game `gid` of
+    a driver seeded `seed` records its value-only samples at share `share` (the Rust
+    `driver::view_pick`, the same arithmetic: a hash, no random stream)."""
+    if share >= 1.0:
+        return True
+    if share <= 0.0:
+        return False
+    h = split64((seed & M64) ^ split64((((gid & 0xFFFFFFFF) << 32) | (decision & 0xFFFFFFFF)) ^ 0x76696577))
+    return (h >> 11) * (1.0 / (1 << 53)) < share
 
 
 class NNSeat:
@@ -32,18 +57,22 @@ class NNSeat:
     select_c_scale (None: the target's cq_c_visit, cq_c_scale). record: whether its full searches
     are recorded (False: a league opponent, docs/az.md 14; the Rust seat key `record`). root_min_visits,
     root_min_visits_max_actions: the root minimum visits of its full searches (0 = off; docs/search.md
-    3.5)."""
+    3.5). leaf_value_view: 'mover' | 'root' (whose view a leaf's value comes from), view_samples: the
+    share of its recorded decisions that also record value-only samples (0 = off), view_sample_target:
+    their q, 'next_q' | 'z' (docs/search.md 3.6)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
                  policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0, select='visits', select_min_visits=0,
                  select_c_visit=None, select_c_scale=None, record=True, root_min_visits=0,
-                 root_min_visits_max_actions=4):
+                 root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
+                 view_sample_target='next_q'):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
         mcts.check_select(select, select_min_visits)
         mcts.check_select_transform(select, select_c_visit, select_c_scale)
         mcts.check_root_min(root_min_visits, root_min_visits_max_actions)
+        mcts.check_leaf_view(leaf_value_view, view_samples, view_sample_target)
         self.key, self.sims, self.c_puct, self.selfplay = key, sims, c_puct, selfplay
         self.alpha, self.eps, self.temp_moves = alpha, eps, temp_moves
         self.sims_fast, self.p_full, self.chance_k, self.margin_w = sims_fast, p_full, chance_k, margin_w
@@ -53,6 +82,8 @@ class NNSeat:
         self.select_c_visit, self.select_c_scale = select_c_visit, select_c_scale
         self.record = record
         self.root_min_visits, self.root_min_visits_max_actions = root_min_visits, root_min_visits_max_actions
+        self.leaf_value_view, self.view_samples = leaf_value_view, float(view_samples)
+        self.view_sample_target = view_sample_target
 
     @property
     def select_transform(self):
@@ -81,17 +112,22 @@ class PySearch:
         return self.t.redet
 
     def simulate(self, game, rng, seat):
+        """-> None (a terminal, backed up) or (decider, features, options, the viewer's features when
+        the leaf takes a root-view value, else None)."""
         r = mcts.simulate(self.t, rng, seat.c_puct, seat.chance_k, seat.margin_w)
         if r is None:
             return None
         node, leaf, path = r
-        self.pending = (node, path)
-        return node.player, leaf.encode(node.player), node.acts
+        v = self.t.viewer
+        vx = leaf.encode(v) if seat.leaf_value_view == 'root' and node.player != v else None
+        self.pending = (node, path, None if vx is None else v)
+        return node.player, leaf.encode(node.player), node.acts, vx
 
     def expand(self, priors, value, margin, seat):
-        node, path = self.pending
+        node, path, vp = self.pending
         self.pending = None
-        mcts.expand_and_backup(node, path, priors, value, margin, self.t.n, seat.margin_w, self.t.team, self.t)
+        mcts.expand_and_backup(node, path, priors, value, margin, self.t.n, seat.margin_w, self.t.team, self.t,
+                               value_player=vp)
         return node is self.t.root
 
     def add_noise(self, seat, np_rng):
@@ -148,10 +184,12 @@ class RsSearch:
         return self.t.redet
 
     def simulate(self, game, rng, seat):
+        if seat.leaf_value_view == 'root':
+            return self.t.simulate(game, seat.c_puct, seat.chance_k, seat.margin_w, root_view=True)
         r = self.t.simulate(game, seat.c_puct, seat.chance_k, seat.margin_w)
         if r is None:
             return None
-        return r[0], r[1], r[2]
+        return r[0], r[1], r[2], None
 
     def expand(self, priors, value, margin, seat):
         was = self.t.root_expanded
@@ -208,7 +246,7 @@ def make_bot(game, name, rng):
 
 class Slot:
     __slots__ = ('gid', 'rng', 'np_rng', 'search_rng', 'game', 'n', 'seats', 'bots', 'trees', 'sims', 'target',
-                 'full', 'records', 'decisions', 'steps')
+                 'full', 'records', 'decisions', 'steps', 'view_wait')
 
     def __init__(self, gid, game, spec, seats, rng):
         from .games import engine
@@ -228,6 +266,7 @@ class Slot:
         self.records = []
         self.decisions = 0
         self.steps = 0
+        self.view_wait = []                 # value-only records waiting for (record index, observer)'s next search
 
 
 class PyDriver:
@@ -236,6 +275,7 @@ class PyDriver:
     def __init__(self, game, n_games, seat_fn, spec=None, concurrency=64, seed=0, record=False, max_steps=100_000):
         from .games import spec_json
         self.game = game
+        self.seed = seed
         self.spec = spec_json(spec)
         self.n_games = n_games
         self.seat_fn = seat_fn
@@ -270,8 +310,9 @@ class PyDriver:
     def submit(self, bid, priors, value, margin):
         lb, items = self.outstanding.pop(bid)
         off = lb.opt_off
-        for b, (slot, seat, tree) in enumerate(items):
-            is_root = tree.expand(priors[off[b]:off[b + 1]].tolist(), value[b], margin[b], seat)
+        for (slot, seat, tree, b, vb) in items:
+            # (a root-view leaf: the value of its value-only row vb, the priors of its own row b)
+            is_root = tree.expand(priors[off[b]:off[b + 1]].tolist(), value[vb], margin[vb], seat)
             if is_root and seat.selfplay and slot.full:
                 tree.add_noise(seat, slot.np_rng)
             slot.sims += 1
@@ -320,24 +361,33 @@ class PyDriver:
                 if r is None:
                     slot.sims += 1
                     continue
-                player, x, acts = r
-                need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts))
+                player, x, acts, vx = r
+                need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts, vx))
                 break
         for slot in finished:
             self.active.remove(slot)
             self._finish(slot)
         self._refill()
         for key, items in need.items():
-            off = np.zeros(len(items) + 1, np.int32)
-            off[1:] = np.cumsum([len(it[5]) for it in items])
-            a = {'x': np.ascontiguousarray(np.stack([it[4] for it in items]).astype(np.float32)),
+            # rows: each leaf's, then (root-view values) its value-only row of the tree's viewer
+            rows, refs = [], []
+            for it in items:
+                slot, seat, tree, player, x, acts, vx = it
+                b = len(rows)
+                rows.append((x, acts, player, slot))
+                if vx is not None:
+                    rows.append((vx, [], tree.t.viewer, slot))
+                refs.append((slot, seat, tree, b, len(rows) - 1))
+            off = np.zeros(len(rows) + 1, np.int32)
+            off[1:] = np.cumsum([len(r[1]) for r in rows])
+            a = {'x': np.ascontiguousarray(np.stack([r[0] for r in rows]).astype(np.float32)),
                  'opt_off': off,
-                 'opt_action': np.asarray([x for it in items for x in it[5]], np.int32),
-                 'player': np.asarray([it[3] for it in items], np.int32),
-                 'n_players': np.asarray([it[0].n for it in items], np.int32),
-                 'gid': np.asarray([it[0].gid for it in items], np.int64)}
+                 'opt_action': np.asarray([x for r in rows for x in r[1]], np.int32),
+                 'player': np.asarray([r[2] for r in rows], np.int32),
+                 'n_players': np.asarray([r[3].n for r in rows], np.int32),
+                 'gid': np.asarray([r[3].gid for r in rows], np.int64)}
             lb = LeafBatch(self.next_bid, key, 'nn', a)
-            self.outstanding[self.next_bid] = (lb, [it[:3] for it in items])
+            self.outstanding[self.next_bid] = (lb, refs)
             self.next_bid += 1
             self.queue.append(lb)
 
@@ -357,6 +407,16 @@ class PyDriver:
 
     def _decide(self, slot, seat, tree, p):
         acts, Nv, P0, rw = tree.stats()
+        if slot.view_wait:
+            # value-only records waiting for this seat's next search take its root value ('next_q')
+            keep = []
+            for i, o in slot.view_wait:
+                if o == p:
+                    r = slot.records[i]
+                    slot.records[i] = r[:4] + (None if rw is None else list(rw),)
+                else:
+                    keep.append((i, o))
+            slot.view_wait = keep
         tot = sum(Nv)
         if seat.selfplay and slot.decisions < seat.temp_moves and tot > 0:
             r = slot.rng.random() * tot
@@ -373,6 +433,14 @@ class PyDriver:
         if self.record and seat.selfplay and seat.record and slot.full:
             pi = tree.target(seat)
             slot.records.append((slot.game.encode(p), list(acts), pi, p, rw))
+            if seat.view_samples > 0 and view_pick(self.seed, slot.gid, slot.decisions, seat.view_samples):
+                for o in range(slot.n):
+                    so = slot.seats[o]
+                    if o == p or not (isinstance(so, NNSeat) and so.selfplay and so.record):
+                        continue
+                    if seat.view_sample_target == 'next_q':
+                        slot.view_wait.append((len(slot.records), o))
+                    slot.records.append((slot.game.encode(o), [], [], o, None))
         slot.decisions += 1
         self._apply(slot, acts[i])
 
