@@ -186,7 +186,8 @@ def _elo(run_dir, ms):
     r = runfiles.ratings(run_dir)
     if r and r['iters']:
         pts = r['iters']
-        last, best = pts[-1], max(pts, key=lambda p: p[1])
+        cand = [p for p in pts if p[0] not in r.get('unevaluated', ())] or pts
+        last, best = pts[-1], max(cand, key=lambda p: p[1])
         return {'iter': last[0], 'elo': round(last[1], 1), 'se': last[2], 'anchor': r.get('anchor'),
                 'anchor_elo': r.get('anchor_elo'), 'best': {'iter': best[0], 'elo': round(best[1], 1)},
                 'series': [[p[0], round(p[1], 1)] for p in pts[-SPARK_POINTS:]]}

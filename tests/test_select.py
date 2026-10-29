@@ -192,6 +192,7 @@ def test_a_run_changes_its_eval_rule(tmp_path):
                                 'iter_0002|iter_0003', 'iter_0001|iter_0003'}
     r = json.load(open(run / 'elo' / 'cq' / 'ratings.json'))
     assert r['select'] == 'cq' and set(r['ratings']) == names
+    assert {k: v.get('evaluated', True) for k, v in r['ratings'].items() if k.startswith('iter_')} ==         {'iter_0001': False, 'iter_0002': False, 'iter_0003': True}
     idx = json.load(open(run / 'models' / 'index.json'))
     assert idx['select'] == 'cq' and {c['iter'] for c in idx['checkpoints']} == {1, 2, 3}
     assert {c['iter']: c.get('evaluated', True) for c in idx['checkpoints']} == {1: False, 2: False, 3: True}
@@ -201,11 +202,14 @@ def test_a_run_changes_its_eval_rule(tmp_path):
     from zero import dashboard
     d = dashboard._net(str(run))
     assert d['select'] == 'cq' and d['since'] == 3 and set(d['ratings']['ratings']) == names
+    assert set(d['other_pools']) == {'visits'} and set(d['other_pools']['visits']) == {'iter_0000', 'iter_0001', 'iter_0002'}
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'dashboard'))
     from zerodash import runfiles
     assert runfiles.elo_pool(str(run)) == elo.active_pool(str(run))[1]
-    assert runfiles.ratings(str(run))['iters'][-1][0] == 3
+    assert runfiles.ratings(str(run))['iters'][-1][0] == 3 and runfiles.ratings(str(run))['unevaluated'] == [1, 2]
+    from zerodash import summary
+    assert summary._elo(str(run), None)['best']['iter'] == 3
     # back to the default rule: its pool continues, the cq pool is left as it was
     snap_cq = open(run / 'elo' / 'cq' / 'results.json', 'rb').read()
     p = run_loop(run, '--iters', '4', '--eval-select', 'visits')
@@ -214,6 +218,15 @@ def test_a_run_changes_its_eval_rule(tmp_path):
     v = _pairs(run)
     assert 'iter_0003' not in v['logged'] and 'iter_0004' in v['logged'] and 'select' not in v
     assert not any('heuristic' in k and 'iter_0003' in k for k in v['pairs']), 'a cq evaluation in the visits pool'
+    # iteration 3 (evaluated with 'cq') is rated in the visits pool through iteration 4's Elo match only:
+    # flagged, never best.pt (the visits pool flags checkpoints once the run has another pool)
+    assert 'iter_0003|iter_0004' in v['pairs']
+    idx = json.load(open(run / 'models' / 'index.json'))
+    assert 'select' not in idx and {c['iter']: c.get('evaluated', True) for c in idx['checkpoints']}[3] is False
+    assert idx['best']['iter'] != 3
+    rv = json.load(open(run / 'elo' / 'ratings.json'))['ratings']
+    assert rv['iter_0003']['evaluated'] is False and 'evaluated' not in rv['iter_0004']
+    assert set(dashboard._net(str(run))['other_pools']) == {'cq'}
 
 
 def test_a_cq_run_from_the_start_and_selfplay_select(tmp_path):
@@ -318,6 +331,7 @@ def test_raw_elo_offsets_and_no_random_games(tmp_path):
     assert res['logged'] == ['iter_0000', 'iter_0002', 'iter_0004'] and 'heuristic|random' in res['pairs']
     r = json.load(open(run / 'elo' / 'ratings.json'))['ratings']
     assert {'iter_0001', 'iter_0003'} <= set(r)
+    assert {k: v.get('evaluated', True) for k, v in r.items() if k.startswith('iter_')} ==         {'iter_0000': True, 'iter_0001': False, 'iter_0002': True, 'iter_0003': False, 'iter_0004': True}
     idx = json.load(open(run / 'models' / 'index.json'))
     flags = {c['iter']: c.get('evaluated', True) for c in idx['checkpoints']}
     assert flags == {0: True, 1: False, 2: True, 3: False, 4: True}
@@ -327,13 +341,20 @@ def test_raw_elo_offsets_and_no_random_games(tmp_path):
     assert elo.opponents(16, 8) == [8, 0, -16, -48, -112, -240]
     from zero import dashboard
     d = dashboard._net(str(run))
-    assert d['select'] == 'visits' and 'iter_0003' in d['ratings']['ratings']
+    assert d['select'] == 'visits' and 'iter_0003' in d['ratings']['ratings'] and d['other_pools'] == {}
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'dashboard'))
+    from zerodash import summary
+    assert summary._elo(str(run), None)['best']['iter'] in (0, 2, 4)
     # the default Elo: today's opponents (evaluations back), never a raw offset
     run2 = tmp_path / 'def'
     p = run_loop(run2, '--iters', '4', '--eval-every', '2', '--eval-random-games', '0')
     assert p.returncode == 0, p.stdout + p.stderr
     nn2 = {k for k in _pairs(run2)['pairs'] if k.count('iter_') == 2}
     assert nn2 == {'iter_0000|iter_0002', 'iter_0002|iter_0004', 'iter_0000|iter_0004'}, nn2
+    # a default pool flags nothing (its files as before the flags existed)
+    assert not any('evaluated' in v for v in json.load(open(run2 / 'elo' / 'ratings.json'))['ratings'].values())
+    assert not any('evaluated' in c for c in json.load(open(run2 / 'models' / 'index.json'))['checkpoints'])
 
 
 def test_remote_ships_raw_offsets(tmp_path):

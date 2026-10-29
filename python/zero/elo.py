@@ -98,6 +98,20 @@ def opponents(k, eval_every, offsets='', limit=0):
     return [k - off * e for off in (OFFSETS[:limit] if limit else OFFSETS)]
 
 
+def other_pools(run, tag='visits'):
+    """The rules of a run's Elo pools other than `tag` (subdirectories of elo/ holding a
+    results.json, plus 'visits' for elo/ itself): a run that has evaluated with another rule
+    (docs/az.md 5.4)."""
+    d = os.path.join(run, 'elo')
+    try:
+        subs = sorted(x for x in os.listdir(d) if os.path.exists(os.path.join(d, x, 'results.json')))
+    except OSError:
+        return []
+    if os.path.exists(os.path.join(d, 'results.json')):
+        subs = ['visits'] + subs
+    return [x for x in subs if x != (tag or 'visits')]
+
+
 def _path(run, tag='visits'):
     return os.path.join(pool_dir(run, tag), 'results.json')
 
@@ -187,8 +201,16 @@ def fit(res, prior_sd=8.0, iters=50, anchor=None):
     return out
 
 
-def write_ratings(run, ratings, anchor, tag='visits'):
+def write_ratings(run, ratings, anchor, tag='visits', evaluated=None):
+    """The pool's ratings.json. `evaluated` (a set of names; None = every checkpoint): the
+    checkpoints that played the yardstick in this pool - any other rated checkpoint's row gets
+    "evaluated": false (rated through Elo matches only: raw elo_offsets, a pool begun mid-run;
+    the dashboards never call it the best)."""
     rows = {p: {'elo': round(e, 1), 'se': round(se, 1), 'games': g} for p, (e, se, g) in ratings.items()}
+    if evaluated is not None:
+        for p, r in rows.items():
+            if p.startswith('iter_') and p not in evaluated:
+                r['evaluated'] = False
     d = pool_dir(run, tag)
     os.makedirs(d, exist_ok=True)
     tmp = os.path.join(d, 'ratings.json.tmp')

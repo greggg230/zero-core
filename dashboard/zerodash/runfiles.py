@@ -8,7 +8,9 @@
 * run_state.json / supervisor_state.json (runctl: Glass Road, Caverna, Dominion).
 * PAUSE: JSON {"time", "by"} (an older or hand-made one may be empty: its mtime is the time).
 * elo/ratings.json: {"anchor", "anchor_elo", "updated", "ratings": {name: {elo, se, games}}} (a run
-  whose eval_select is not 'visits': elo/<rule>/ratings.json, its rule's pool; `elo_pool`).
+  whose eval_select is not 'visits': elo/<rule>/ratings.json, its rule's pool; `elo_pool`; a
+  checkpoint rated through Elo matches only - raw elo_offsets, a pool begun mid-run - has
+  "evaluated": false and is never the best).
 
 Everything returns None / [] for a missing or unreadable file: a run being written must never
 break the page. Parsed metrics and ratings are cached by (size, mtime).
@@ -156,15 +158,17 @@ def _parse_ratings(path):
     if not isinstance(j, dict):
         return None
     rr = j.get('ratings') if isinstance(j.get('ratings'), dict) else {}
-    iters = []
+    iters, unevaluated = [], set()
     for k, v in rr.items():
         m = re.match(r'^iter_(\d+)$', k)
         if m and isinstance(v, dict) and v.get('elo') is not None:
             iters.append((int(m.group(1)), float(v['elo']), v.get('se'), v.get('games')))
+            if v.get('evaluated') is False:
+                unevaluated.add(int(m.group(1)))   # rated through Elo matches only: never the best
     iters.sort()
     return {'anchor': j.get('anchor'), 'anchor_elo': j.get('anchor_elo'), 'updated': j.get('updated'),
-            'iters': iters, 'refs': {k: v.get('elo') for k, v in rr.items()
-                                     if not k.startswith('iter_') and isinstance(v, dict)}}
+            'iters': iters, 'unevaluated': sorted(unevaluated),
+            'refs': {k: v.get('elo') for k, v in rr.items() if not k.startswith('iter_') and isinstance(v, dict)}}
 
 
 def elo_pool(run_dir):
