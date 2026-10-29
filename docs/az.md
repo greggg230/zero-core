@@ -122,6 +122,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_select`, `selfplay_select_min_visits` | visits, 0 | the same rule for self-play's moves after its first `temp_moves` searched decisions of a game (remote self-play too); the recorded targets stay `policy_target`'s. For a forked A/B run (section 12.4) |
 | `eval_select_c_visit`, `eval_select_c_scale` | unset (None) | the evaluation 'cq' rule's own completed-Q transform: unset = `cq_c_visit` / `cq_c_scale`, the training target's (one knob for both, the behaviour before these settings, bit for bit); a number >= 0 = the rule's own, so a training A/B of `cq_c_scale` no longer changes how the evaluations choose their moves. The rule's name and Elo pool carry the effective value (`cq-n4-v50-s0.3`, `cq-n4` at 50 / 1), so a run with the scale pinned keeps its pool when only `cq_c_scale` changes. The rule 'cq' only (an error with 'visits', as the guard); `none` on the command line unsets a saved value. Every evaluation path follows it (`Run.nn_seat`: yardstick, random, Elo, the `eval_remote`, co-training's evaluations, `eval_yard_net`), and `zero.h2h` / `zero.replay` of the run's checkpoints (sections 5.4, 12.5) |
 | `selfplay_select_c_visit`, `selfplay_select_c_scale` | unset (None) | the same for `selfplay_select` 'cq' (self-play's moves after `temp_moves`, remote self-play too: its checkout must have the setting); the recorded targets keep `cq_c_visit` / `cq_c_scale` whatever these are |
+| `selfplay_root_min_visits`, `eval_root_min_visits`, `root_min_visits_max_actions` | 0, 0, 4 | root minimum visits ("forced playouts", docs/search.md 3.5, section 9.2): a full search whose root has 2 .. `root_min_visits_max_actions` options gives each at least k visits when its budget allows (2 x options x k <= its simulations): the self-play seat's recorded searches (never its fast or minor ones) / every evaluation seat. The forced walks come out of the same budget and are left out of the visit counts (the 'visits' target, temperature sampling, the 'visits' rule) and of the root value target; Q, the 'cq' target and the 'cq' rule use them. The evaluation's floor names its Elo pool (`visits-f4`, `cq-n4-v50-s0.3-f4`; `-f4a6` with max_actions 6), self-play's does not. 0 = off: today's searches bit for bit |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6); its own is refused |
@@ -911,6 +912,47 @@ vs 16: 77.2%, +211); cq-1 24 vs cq-0.3 24: 66.4% (+119).
 * **c_scale 0.3 is worse than 1** throughout (it collapses as well, only later, with smaller
   gains early).
 * Cost: none (the target is computed once per recorded decision from the root statistics).
+
+### 9.2 Root minimum visits: Q for every option of a small decision (MTG Zero's Delver mirror, 2026-10-29)
+
+The completed-Q target improves an option's policy only through its Q, and an unvisited option has
+none: it is completed at v_mix, close to the visited options' Q, so its target stays at its prior. A
+prior that has saturated (MTG Zero's Delver mulligan: >= 0.98 on Keep for most hands, 0 visits for
+Mulligan at 64 simulations) can then never move, whatever the option is worth - only root noise
+reaches it, now and then. The **root minimum visits** (docs/search.md 3.5) give every option of a
+small decision (2 .. `root_min_visits_max_actions` options, default 4) at least k visits in each full
+search, when the budget allows (2 x options x k <= the search's simulations): the forced walks are Q
+measurements for the 'cq' target and rule, and are left out of the visit counts (the 'visits' target,
+temperature sampling, the 'visits' rule) and of the root value target.
+
+**Settings** (section 1.2): `selfplay_root_min_visits` (the self-play seat: its recorded searches;
+never the fast or minor ones), `eval_root_min_visits` (every evaluation seat; its Elo pool is named
+after it, `visits-f4`, `cq-n4-v50-s0.3-f4`, `-f4a6` with max_actions 6: the evaluations' moves change),
+`root_min_visits_max_actions`; all at 0 / 0 / 4 by default = the run of before, byte for byte. The
+split follows `selfplay_select` / `eval_select`: a training A/B sets only `selfplay_root_min_visits`
+and keeps both arms' evaluation rule (and pool) the same. Remote self-play and remote evaluation get
+the seat keys like every other: the remote's checkout must have this core (an older one refuses the
+unknown seat key - a visible error, never a silent off).
+
+**Cost.** No extra simulations and no extra network calls: the forced walks are part of the search's
+budget, so leaves per second do not change; what changes is how the budget of a forced search is
+spent - at most (options - 1) x k of its walks (at 64 simulations on a 2-option root: 4 of 63 with k 4,
+8 with k 8), and none where PUCT gives every option k visits anyway. MTG Zero measured the share of
+the full searches' walks on its Delver line (its ENGINE.md 64).
+
+**Measured** (MTG Zero ENGINE.md 64, delver2's iterations 21 and 29, CPU): the floor works as
+designed - every option of the forced roots measured - but on the mulligan the network's own Q put
+Mulligan below Keep in every starved low-land hand, so the keep rates did not move (0 lands 58%, 1
+land 91%, at k 0, 4 and 8, under every move rule): those keeps come from the value head. On general
+small decisions (2-4 options, mana payments aside) 62% of the roots leave an option without a visit at
+k 0, and k 4 moved the cq target by more than 0.1 total variation at 11-13% of them and changed the
+cq4 evaluation move at 3-4%. Whether that trains a better network is an A/B question (MTG Zero
+ENGINE.md 64.6 has the flags).
+
+Tests: section docs/search.md 3.5's, and `tests/test_root_min_visits.py` (settings and names; the
+Python driver's 'py' and 'rs' seats and the Rust driver prune alike; toy runs: the settings at their
+defaults byte for byte, self-play's floor changes the shards and not the pool, the evaluation's floor
+changes the pool and not the training).
 
 ## 10. The token network (arch 'tokens', `net.TokenNet`; MTG Zero M5b, 2026-10-22)
 

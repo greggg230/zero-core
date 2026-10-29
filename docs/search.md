@@ -185,12 +185,14 @@ One list of seat dicts per game (players = its length):
 `{'bot': 'random' | 'heuristic' | ...}`, `{'external': '<key>'}`, or a network seat
 `{'key': 'm', 'sims', 'c_puct', 'selfplay', 'alpha', 'eps', 'temp_moves', 'sims_fast',
 'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale',
-'select', 'select_min_visits', 'record'}` (`games.nn_seat`; `policy_target` only matters for recorded
-decisions, section 3.1; `select` and its guard for the moves the seat does not sample, section
-3.3; `cq_c_visit` / `cq_c_scale` are the completed-Q transform of both; `record` false - absent:
-true - a self-play seat whose full searches are not recorded: it searches, samples its moves and
-draws its playout cap exactly as a recorded seat, so its games are the same move for move, and
-emits no records; zero's self-play league, docs/az.md 14, puts a past checkpoint there). Evaluator keys: every distinct
+'select', 'select_min_visits', 'record', 'root_min_visits', 'root_min_visits_max_actions'}`
+(`games.nn_seat`; `policy_target` only matters for recorded decisions, section 3.1; `select` and its
+guard for the moves the seat does not sample, section 3.3; `cq_c_visit` / `cq_c_scale` are the
+completed-Q transform of both; `record` false - absent: true - a self-play seat whose full searches
+are not recorded: it searches, samples its moves and draws its playout cap exactly as a recorded
+seat, so its games are the same move for move, and emits no records; zero's self-play league,
+docs/az.md 14, puts a past checkpoint there; `root_min_visits` the floor of its full searches' root
+visits, section 3.5). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
 
@@ -364,7 +366,8 @@ resolver driver is one (docs/az.md 11): it plays the episodes of parked games, t
   `sims_minor` gets `sims_minor` and is never recorded, the playout-cap draw being made all the
   same; the budget is then divided by the game's `sims_divisor`, at least one); root Dirichlet
   noise on full self-play
-  searches (also on a reused, already expanded root); self-play samples moves by visit count
+  searches (also on a reused, already expanded root); the opt-in root minimum visits of full
+  searches (section 3.5: forced walks, left out of the visit counts below); self-play samples moves by visit count
   for the first `temp_moves` searched decisions of the game, otherwise (and in evaluation) by
   the seat's move rule (section 3.3; the default argmax (N, P0) with the first maximum on
   ties); tree reuse: after a real move the tree
@@ -471,6 +474,87 @@ cq target as in Gumbel AlphaZero; cq's only; the target never reads them - `Sele
 `selfplay_select` (self-play after `temp_moves`), their `*_min_visits` and their transforms
 `*_c_visit` / `*_c_scale` (unset: `cq_c_*`; docs/az.md 1.2, 5.4, 12.5). Parity (section 6): the Python formula on Rust roots gives
 the Rust driver's move on every root and rule checked.
+
+### 3.5 Root minimum visits ("forced playouts"; `root_min_visits`, 2026-10-29)
+
+**Why.** A near-one-hot prior starves an option of every visit at a small decision. MTG Zero's
+Delver mirror (its ENGINE.md 64): at the mulligan (keep / mulligan) the prior is >= 0.98 on Keep for
+89 of 100 one-land seven-card hands of delver2's iteration 21, and at 64 simulations Mulligan gets no
+visit in 89 of the 100 - its Q is never estimated, and the completed-Q target (3.1) completes an unvisited
+option at v_mix, about the visited option's Q, so its target stays at its prior and cannot recover.
+Only root noise, when it happens to land there in a full self-play search, ever visits it. The same
+starvation hits any small decision under a saturated prior (attack or not, pay for Daze, yes / no).
+
+**The floor** (`Tree::set_root_min(k)`, Python `mcts.Tree.set_root_min`): every root option gets at
+least k visits. A walk keeps PUCT's root option i unless N_i >= k and another root option has fewer
+than k visits; then it takes the least-visited root option (the lowest index on ties) - a **forced
+walk**. So the floor never overrules PUCT on an option that still lacks its k; the forced walks begin
+once PUCT's favourite has k visits and stop when every option has k (a reused root's visits count).
+Nothing changes below the root. The tree counts the forced walks per root option (`root_forced`) and
+sums the win vectors they backed up; `reset` and `advance` turn the floor off (the driver sets each
+search's own).
+
+**Which searches** (`driver::root_floor(k, max_actions, full, m, target)`, Python `mcts.root_floor`,
+the bindings' `root_floor`): a **full** search - a self-play seat's recorded searches (`sims`, the
+`p_full` share; a league opponent's unrecorded seat too, docs/az.md 14, being the self-play seat with
+`record` false: it plays as in its own self-play), every search of an evaluation seat - whose root has m options with 2 <= m <=
+`root_min_visits_max_actions` (default 4), when 2 m k <= its simulations (after `sims_divisor`): the
+floor never takes more than half the budget. Otherwise k = 0, the search of before. **Never a fast
+(`sims_fast`) or minor (`sims_minor`) search**, as root noise: they record nothing, so the floor's Q
+would feed no target, and it would take a large share of their budget (KataGo turns its forced
+playouts off in its cheap searches for the same reason). With MTG Zero's Delver settings (64 / 16,
+minor 4) k 4 or 8 applies to the full searches of roots of 2-4 options.
+
+**What reads what.**
+
+| output | with the floor |
+|---|---|
+| PUCT's Q; the 'cq' target (3.1); the 'cq' move rule (3.3) and its guard | every visit: a forced walk is a Q measurement. Every option of a forced root is visited, so the target is softmax(ln P0 + sigma(Q)) over measured Q's (no v_mix), well defined and summing to 1; a guard <= k admits every option |
+| the 'visits' target N / sum N; temperature sampling (the first `temp_moves`); the 'visits' rule argmax (N, P0) | `root_visits_pruned` = N - forced: the visits PUCT chose. A move is sampled, or wins the count, only through PUCT's own visits - which include those PUCT gave it after the forced walks revealed a good Q. Nothing was visited but forced walks: P0 (target), the rule's prior argmax |
+| the root value target q (2.4, `wsum / tot`) | `root_win_pruned`: without the forced walks' backups (they did not follow the search's policy) |
+
+Why exact accounting rather than KataGo's pruning (Wu 2019, "Accelerating Self-Play Learning in Go",
+3.1: forced playouts sqrt(k P N), pruned from the policy target as far as the child's PUCT value stays
+below the best child's): the tree knows which walks it forced, so it removes exactly those, from the
+value target too (KataGo's value target is the game's result). A forced option that turns out good is
+not lost: PUCT then visits it on its own and those visits stay.
+
+**Cost.** The forced walks come out of the same budget: at most (m - 1) k walks of a forced search
+(a 2-option root at 64 simulations: 4 of 63 with k 4, 8 with k 8), none when PUCT already gives every
+option k visits. Throughput (leaves per second) does not change; the visits the favourite gets do.
+
+**Settings.** Seat keys `root_min_visits` (0 = off, the default) and `root_min_visits_max_actions`
+(4); run settings `selfplay_root_min_visits` (self-play's seat), `eval_root_min_visits` (every
+evaluation seat; its moves change, so its Elo pool's name gets `-f<k>`, `-f<k>a<m>` with another
+max_actions: `mcts.forced_tag`, docs/az.md 5.4) and `root_min_visits_max_actions` (docs/az.md 1.2,
+9.2). Off is the tree of before bit for bit (`set_root_min(0)`; the golden records and match, toy
+runs byte for byte).
+
+**Measured** on the keep-or-mulligan test game (`crates/search/src/mull_game.rs`: Keep's prior 0.999
+whatever the hand, a mulligan worth +0.16 with a bad hand and -0.14 with a good one; 64 simulations;
+`driver::tests::root_min_visits_*`): without the floor Mulligan gets 0 of 63 visits at every root and
+its cq target stays at 0.001; with k 4 it gets exactly its 4 forced visits, and in self-play (160
+games, cq target (50, 1)) the target is > 0.9 on Mulligan for 141 of 152 bad hands (the other 11:
+four unlucky redraws hid its worth) and < 0.001 for all 168 good ones; the good hands' 'visits'
+targets hold no forced visit (exactly 0 on Mulligan, unpruned 4 / 63) and their q is Keep's value to
+1e-5; temperature sampling plays Mulligan with 16 of 152 bad hands (PUCT following the forced Q) and
+0 of 168 good ones. Evaluation seats (200 games): the 'visits' rule never plays Mulligan, with or
+without the floor; 'cq' with guard 4 plays it with 179 of 193 bad hands with k 4, never without, and
+with 0 of 207 good hands either way. MTG Zero's Delver positions (its ENGINE.md 64): the floor
+works as here, but there the network's own Q put Mulligan below Keep in every starved low-land hand
+(-0.09 for 0 lands, -0.14 for 1 land), so the keep rates did not move - the keeps come from the value
+head, not from the starvation; on general small decisions (2-4 options) k 4 moved the cq target (0.3)
+by more than 0.1 at 11-13% of the roots.
+
+Code: `tree.rs` (`set_root_min`, `force_root`, `root_forced`, `root_visits_pruned`,
+`root_win_pruned`; `backup` counts a forced walk's backup), `driver.rs` (`root_floor`,
+`NnSeat::root_min_visits`), `driver/worker.rs` (`start` sets each search's floor, `decide` reads the
+pruned counts), `dynapi.rs` / the bindings (`SearchTree.set_root_min`, `root_min`, `root_forced`,
+`root_visits_pruned`, `root_win_pruned`); Python `mcts.py` (`Tree.set_root_min`, `force_root`,
+`root_visits_pruned`, `root_win_pruned`, `root_floor`, `check_root_min`, `forced_tag`; `backup` /
+`expand_and_backup` take the tree for the accounting), `play.py` (`NNSeat`, `PyDriver`'s 'py' and 'rs'
+seats), `games.nn_seat`. Tests: `tree::tests::root_min_visits_*`, `driver::tests::root_floor_*`,
+`driver::tests::root_min_visits_*`, `tests/test_root_min_visits.py`.
 
 ## 4. Bindings and registering a game
 
@@ -589,6 +673,25 @@ In games (`python -m zero.parity h2h --select cq`, a toy-smoke checkpoint, 32 si
 Rust-tree seat vs Python-tree seat, both 'cq'): 52.1% +-2.0 (95%, 2000 games, seed 0), 49.7%
 +-1.2 and 50.8% +-1.2 (6000 games each, seeds 1, 2) - 50.5% over the 14,000; the same seeds with
 'visits': 49.7% +-1.2, 50.7% +-1.2. `tests/test_select.py` asserts both checks.
+
+**Root minimum visits** (section 3.5; `python -m zero.parity forced`, `parity.forced`,
+`tests/test_root_min_visits.py`), 2026-10-29: 10 toy positions of 2-6 options, both trees with the
+floor 4 at 96 simulations, 64 repetitions per position and tree, the stand-in evaluator with a lopsided
+prior (`SkewEval`: 1 - eps on its favourite option; without the floor 60% of the options get no visit
+at eps 0.001, 31% at 0.05). Every option of every search reached 4 visits in both trees, the forced
+walks per search are the same (11.2 on average), and the statistics sit at the Python-Python floor:
+
+| setting | visits TV rs-py (py-py) | pruned TV rs-py (py-py) | cq TV rs-py (py-py) | root win \|rs - py\| without the forced walks |
+|---|---|---|---|---|
+| eps 0.001, c_scale 1 | 0.00002 (0.00005) | 0.00002 (0.00006) | 0.0110 (0.0123) | 0.0008 |
+| eps 0.05, c_scale 1 | 0.00035 (0.00026) | 0.00039 (0.00030) | 0.0150 (0.0126) | 0.0004 |
+| eps 0.05, c_scale 0.3 | | | 0.0031 (0.0025) | |
+
+Power check: a Rust floor of 5 against Python's 4 is seen at once (the test). The drivers (self-play,
+'visits' targets, the floor 2 on toy roots of up to 12 options, 24 simulations, the lopsided prior):
+the targets' mass off the prior's favourite is 0.0304 / 0.0305 / 0.0307 with the floor and 0.0296 /
+0.0296 / 0.0288 without it for the Python driver's 'py' seats, its 'rs' seats and the Rust driver -
+the forced walks pruned alike (kept, they would add at least 2 / 23).
 
 `python -m zero.parity h2h --model M --games 6000 --sims 32`: Rust-tree seat vs Python-tree
 seat in `PyDriver`, the same network, seats alternating (docs/az.md 6.2): **49.94% +-1.04**
