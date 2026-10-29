@@ -545,7 +545,11 @@ class RemotePlay:
                 if not e:
                     continue
                 util = (s.util[0] / s.util[1]) if (self.mode == 'matches' and s.util[1]) else 1.0
-                r = self.shares.observe(s.name, e.get('games', 0), e.get('active_s', 0.0), util)
+                # its head start (single-game: its running time before this machine's phase began;
+                # co-training: none - the matches come with the drafting)
+                lead = max(0.0, cur['t_local'] - cur['t0'] - e.get('backoff_s', 0.0)) if self.mode == 'selfplay' \
+                    else 0.0
+                r = self.shares.observe(s.name, e.get('games', 0), e.get('active_s', 0.0), util, lead=lead)
                 meas[s.name] = {'units': e.get('games', 0), 'run_s': round(e.get('active_s', 0.0), 1),
                                 'util': round(util, 3), 'rate_measured': None if r is None else round(r, 4)}
             if local is not None:

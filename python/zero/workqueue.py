@@ -4,18 +4,21 @@ single-game run's games and a co-training run's matches.
 An iteration needs `units` of work in total: a single-game run's `games` (finished games, across
 every machine), a co-training run's matches (its `games` events x their matches). Each **consumer**
 - the run's own driver here ('local') and every remote worker ('w0', 'w1', ...) - takes work as it
-has room under its **in-flight cap**:
+has room under its **in-flight cap**, what it finishes in one iteration's running time:
 
-    cap = clamp(ceil(inflight x units x rate / total rate), lo, hi)
+    cap = clamp(ceil(inflight x rate x (lead + P)), lo, hi),  P = (units - sum rate x lead) / total rate
 
 `rate` = the consumer's measured throughput (units finished per second of its running time, an
 EWMA over its phases; one that had less work than its cap counts as if it had kept its cap busy
-at the same latency), `total rate` = the sum over the consumers taking work now (a remote backing
-off or offline drops out, so the others' shares grow at once), `inflight` = the run setting
-`selfplay_remote_inflight` (default 1: each consumer holds about one iteration's worth of its own
-throughput, so a game or match it starts finishes within about one iteration), `lo` / `hi` its
-bounds (a few games per driver group / its driver's slots). Before a consumer is measured its rate
-is assumed proportional to its slots (`hi`). The caps' sum is `inflight x units`.
+at the same latency), `lead` = its head start (a remote's phase begins as soon as the checkpoint
+is written, before this machine's: an EWMA of the seconds it played before; this machine's: 0;
+co-training: 0, the matches come with the drafting), `P` = the phase they all play together,
+`total rate` = the sum over the consumers taking work now (a remote backing off or offline drops
+out, so the others' shares grow at once), `inflight` = the run setting `selfplay_remote_inflight`
+(default 1: each consumer holds one iteration's worth of its own throughput, so a game or match it
+starts finishes within about one iteration of its running time), `lo` / `hi` its bounds (a few
+games per driver group / its driver's slots). Before a consumer is measured its rate is assumed
+proportional to its slots (`hi`). The caps' sum is `inflight x units` (no bound binding).
 
 `Shares` is that model; `split_games` cuts a driver's sample dict into its finished games (the
 rows and the samples come out of the driver in the same order, each row counting its own
@@ -30,7 +33,7 @@ import numpy as np
 from .protocol import SAMPLE_KEYS
 
 EWMA = 0.5                         # weight of a phase's measurement in a consumer's rate
-MIN_RUN_S = 0.5                    # a phase shorter than this (running) measures nothing
+MIN_RUN_S = 0.2                    # a phase shorter than this (running) measures nothing (the toys': ~1 s)
 MIN_UTIL = 0.25                    # a consumer below this share of its cap: measured as if at 25%
 
 
@@ -111,7 +114,7 @@ class Shares:
         self.c = {}                                # name -> {lo, hi, rate, active}
 
     def consumer(self, name, lo, hi):
-        c = self.c.setdefault(name, {'rate': None, 'active': True})
+        c = self.c.setdefault(name, {'rate': None, 'active': True, 'lead': 0.0})
         c['hi'] = max(1, int(hi))
         c['lo'] = max(1, min(int(lo), c['hi']))
         return c
@@ -127,26 +130,42 @@ class Shares:
         per_slot = sum(r for r, _ in meas) / sum(h for _, h in meas) if meas else 1.0
         return {n: (c['rate'] if c['rate'] else per_slot * c['hi']) for n, c in self.c.items()}
 
-    def caps(self):
+    def horizon(self):
+        """P (seconds): the phase the active consumers play together after their head starts (None:
+        no units)."""
         r = self.rates()
         act = [n for n, c in self.c.items() if c['active']]
         tot = sum(r[n] for n in act)
+        if self.units is None or tot <= 0:
+            return None
+        return max(0.0, (self.units - sum(r[n] * self.c[n]['lead'] for n in act)) / tot)
+
+    def caps(self):
+        r = self.rates()
+        p = self.horizon()
         out = {}
         for n, c in self.c.items():
             if not c['active']:
                 out[n] = 0
-            elif self.units is None or tot <= 0:
+            elif p is None:
                 out[n] = c['hi']
             else:
-                want = math.ceil(self.f * self.units * r[n] / tot)
+                want = math.ceil(self.f * r[n] * (c['lead'] + p))
                 out[n] = max(c['lo'], min(c['hi'], want))
         return out
 
-    def observe(self, name, units, run_s, util):
+    def observe(self, name, units, run_s, util, lead=None):
         """A phase of consumer `name`: `units` finished in `run_s` seconds of its running time, its
-        outstanding work `util` of its cap on average. -> the rate measured (None: too short)."""
+        outstanding work `util` of its cap on average, `lead` seconds of that before this machine's
+        phase began. -> the rate measured (None: too short a phase)."""
         c = self.c.get(name)
-        if c is None or run_s < MIN_RUN_S or units <= 0:
+        if c is None:
+            return None
+        if lead is not None:
+            v = max(0.0, float(lead))
+            c['lead'] = v if not c.get('led') else (1 - EWMA) * c['lead'] + EWMA * v
+            c['led'] = True
+        if run_s < MIN_RUN_S or units <= 0:
             return None
         u = max(MIN_UTIL, min(1.0, float(util))) if util is not None else 1.0
         r = units / run_s / u
@@ -154,12 +173,14 @@ class Shares:
         return r
 
     def state(self):
-        return {n: {'rate': None if c['rate'] is None else round(c['rate'], 6), 'lo': c['lo'], 'hi': c['hi']}
-                for n, c in self.c.items()}
+        return {n: {'rate': None if c['rate'] is None else round(c['rate'], 6), 'lead': round(c['lead'], 2),
+                    'lo': c['lo'], 'hi': c['hi']} for n, c in self.c.items()}
 
     def restore(self, state):
-        """Rates from an earlier run of the same run directory (its last metrics row): the caps of
-        its first phase follow them instead of the slots."""
+        """Rates and head starts from an earlier run of the same run directory (its last metrics
+        row): the caps of its first phase follow them instead of the slots."""
         for n, st in (state or {}).items():
             if isinstance(st, dict) and st.get('rate'):
-                self.c.setdefault(n, {'rate': None, 'active': True, 'lo': 1, 'hi': 1})['rate'] = float(st['rate'])
+                c = self.c.setdefault(n, {'rate': None, 'active': True, 'lead': 0.0, 'lo': 1, 'hi': 1})
+                c['rate'] = float(st['rate'])
+                c['lead'] = float(st.get('lead') or 0.0)
