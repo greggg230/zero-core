@@ -2143,31 +2143,42 @@ alone recording nothing.
 
 Tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only
 (`CUDA_VISIBLE_DEVICES=`, below-normal priority), MTG Zero's A/B round live on the GPU and the Mac.
-Code 8295152 on main edf4b89.
+First on main edf4b89 (code 8295152), then again after the rebase onto main 437cef0 (feat/bignet's
+distillation: nothing on the self-play path), code 5099f00 + these docs:
 
-* `cargo test --release`: zero_search **51 passed** (50 + the unrecorded seat), zero_webnet 3.
-* `pytest tests`: **213 passed, 2 failed** (13 min 47 s): the two failures are CUDA-only tests
+* `cargo test --release`: zero_search **51 passed** (50 + the unrecorded seat), zero_webnet 3 (8295152).
+  On 5099f00 50 passed and `queued_setups_are_shared_between_the_groups` failed once: a test whose
+  first assertion depends on which group's first search finishes first (its own comment), failing 1 of
+  60 runs on this branch and 4 of 60 on 437cef0 interleaved with it (2 of 30 and 0 of 30 before), with
+  pytest and the identity runs on the machine; nothing in it records.
+* `pytest tests`: 8295152 **213 passed, 2 failed** (13 min 47 s), 5099f00 **220 passed, 3 failed** (21
+  min; main's distillation tests among them). Two failures are CUDA-only tests
   (`test_net_data.py::test_graph_runner_matches_eager_and_follows_new_weights`,
   `test_nonfinite.py::test_normal_run_has_no_debug_dir[cuda]`) that fail the same way on edf4b89 with
-  `CUDA_VISIBLE_DEVICES=` (they do not skip without a visible device); `tests/test_league.py` 13 passed.
-* **Byte identity against edf4b89** (its own worktree and target dir), the settings left out and
-  given at their defaults: toy-smoke runs - MLP vs `ext:toyheur` and tokens (classic, 3 iterations),
-  `cq` targets + `eval_select cq` guard 2 (rolling, 3), and the Delver main line's shape (rolling,
-  `cq` targets at scale 0.3, `eval_select cq` guard 4 at 0.3, raw Elo offsets, no random games,
-  value_q 0.6, window_cache, train_prefetch; 4 iterations): every shard, `elo/results.json`,
-  `ratings.json` (`updated` aside), `models/index.json` byte for byte, every checkpoint and the
-  optimizer state tensor for tensor (the files differ in torch's archive root only), the metrics equal
-  without their timings, config.json = the base's + the four keys. The rolling runs needed care: a
-  rolling phase's end depends on timing with two batches in flight (docs/search.md 2.6) - the base
-  itself reproduced its own reference in 18 of 19 runs of the Delver shape (one differed from
-  iteration 2 on), this branch in 10 of 12 (6 of 6 interleaved with the base's); with `ZERO_INFLIGHT=1`
-  (deterministic) both rolling configurations are identical in 2 runs each of the base, unset and
-  the defaults (11 and 13 files, the metrics).
+  `CUDA_VISIBLE_DEVICES=` (they do not skip without a visible device); the third,
+  `test_remoteplay.py::test_cotrain_backoff_gives_matches_back` (a co-training worker backing off in
+  time to give its matches back), failed under the load of 180 concurrent Rust test runs and passed 3
+  of 3 alone (the league is refused in co-training; matches mode never builds it).
+  `tests/test_league.py` 13 passed on both.
+* **Byte identity** against edf4b89 and again against 437cef0 (each its own worktree and target dir),
+  the settings left out and given at their defaults: toy-smoke runs - MLP vs `ext:toyheur` and tokens
+  (classic, 3 iterations), `cq` targets + `eval_select cq` guard 2 (rolling, 3), and the Delver main
+  line's shape (rolling, `cq` targets at scale 0.3, `eval_select cq` guard 4 at 0.3, raw Elo offsets,
+  no random games, value_q 0.6, window_cache, train_prefetch; 4 iterations): every shard,
+  `elo/results.json`, `ratings.json` (`updated` aside), `models/index.json` byte for byte, every
+  checkpoint and the optimizer state tensor for tensor (the files differ in torch's archive root
+  only), the metrics equal without their timings, config.json = the base's + the four keys. The
+  rolling runs needed care: a rolling phase's end depends on timing with two batches in flight
+  (docs/search.md 2.6) - edf4b89 itself reproduced its own reference in 18 of 19 runs of the Delver
+  shape (one differed from iteration 2 on), 8295152 in 10 of 12 (6 of 6 interleaved with the base's);
+  with `ZERO_INFLIGHT=1` (deterministic) both rolling configurations are identical in 2 runs each of
+  the base, unset and the defaults (11 and 13 files, the metrics), and against 437cef0 the rolling
+  ones were compared that way.
 * `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy MLP and a toy token
-  checkpoint): identical.
+  checkpoint): identical, against edf4b89 and against 437cef0.
 * The other games build against it (build only, their HEADs with this core in `third_party/zero-core`;
-  the PyO3 crate, every test compiled, the package imported): Glass Road Zero c1f56dc 45 s, Caverna
-  Zero a6fad73 70 s, Kingdom Builder Zero 4202a4a 106 s.
+  the PyO3 crate, every test compiled, the package imported): Glass Road Zero c1f56dc 45 / 36 s,
+  Caverna Zero a6fad73 70 / 59 s, Kingdom Builder Zero 4202a4a 106 / 94 s (before / after the rebase).
 * MTG Zero (branch `league`, its ENGINE.md 63): `cargo test --release -p engine --test az` 27 passed,
   `pytest tests` 48 passed; delver-smoke with the league on, classic and with the remote 'local'
   (rolling, linger).
