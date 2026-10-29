@@ -16,16 +16,23 @@ loads the same way, and remembers where each row came from (`provenance`).
 
 Window: the newest iterations' shards loaded into RAM (`Window(paths, ...)`), every shard
 subsampled at the same rate when the total exceeds the RAM budget - the rate from the shards'
-row counts (their meta), each shard subsampled as it is loaded, so the peak is the window plus
-one shard (remote self-play triples a run's samples per iteration; the rows kept are those of
-loading every shard first); `batch(idx)` builds torch tensors: features cut / zero-padded to the
-network's width, dense legal masks and policy targets over the actions, value / margin targets
-over MAX_SEATS.
+row counts (their meta), each shard subsampled as it is loaded (remote self-play triples a run's
+samples per iteration; the rows kept are those of loading every shard first); `batch(idx)` builds
+torch tensors: features cut / zero-padded to the network's width, dense legal masks and policy
+targets over the actions, value / margin targets over MAX_SEATS. The shards load in parallel
+(`threads`, default `WINDOW_THREADS`): inflating a compressed shard, its CRC and the copies
+release the GIL, so the window of MTG's Delver run (40 shards, 265k rows, 17.9 GB) loads in a
+fraction of the 41 s it took one shard at a time. Each shard's rows are drawn in path order
+before any loading (the random stream of the sequential load) and its features written into
+their place in the one preallocated `x`: the window is the same, array for array, and the peak
+is the window plus the shards being loaded (it was twice the window: the per-shard copies, then
+their concatenation).
 """
 import glob
 import json
 import os
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -35,6 +42,8 @@ from .protocol import MAX_SEATS, concat_samples
 
 EXT = '.npz'
 BAD = '.bad.npz'                  # a quarantined shard (non-finite values): never loaded
+# Shards loaded at once by a Window (env ZERO_WINDOW_THREADS overrides; 1 = one at a time).
+WINDOW_THREADS = int(os.environ.get('ZERO_WINDOW_THREADS', '0')) or min(8, os.cpu_count() or 1)
 
 
 def _narrow_int(a):
@@ -224,64 +233,77 @@ def _ranges(starts, lens):
 
 class Window:
     """The training window in RAM. paths: shard files; `budget_rows`: keep at most this many
-    samples (a uniform random share of every shard). A shard with a NaN / inf raises NonFinite."""
+    samples (a uniform random share of every shard). A shard with a NaN / inf raises NonFinite.
+    `threads`: shards loaded at once (default WINDOW_THREADS); the result does not depend on it."""
 
-    def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0):
+    def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, threads=None):
         self.F, self.A = num_features, num_actions
         self.paths = list(paths)
         rng = np.random.default_rng(seed)
-        total = sum(shard_rows(p) for p in self.paths)
+        rows = [shard_rows(p) for p in self.paths]
+        total = sum(rows)
         keep = 1.0 if not budget_rows or total <= budget_rows else budget_rows / total
-        xs, pl, npl, offs, acts, pis, zs, qs, scs = [], [], [], [np.zeros(1, np.int64)], [], [], [], [], []
-        src = []
-        base = 0
-        for path in self.paths:
-            p = read_shard(path)                   # one shard in RAM at a time: subsampled now
+        # Each shard's rows, drawn in path order (the random stream of loading one at a time).
+        picks = [None if keep >= 1.0 else np.sort(rng.choice(N, size=max(1, int(round(N * keep))), replace=False))
+                 for N in rows]
+        kept = [N if idx is None else len(idx) for N, idx in zip(rows, picks)]
+        self.starts = np.concatenate([[0], np.cumsum(kept)]).astype(np.int64)
+        self.N = int(self.starts[-1])
+        if self.N == 0:
+            raise ValueError('empty training window')
+        self.x = np.empty((self.N, self.F), np.float16)
+
+        def load(k):
+            path, idx, N = self.paths[k], picks[k], rows[k]
+            p = read_shard(path)
             probs = shard_problems(p)
             if probs:
                 raise NonFinite(f'non-finite sample values in shard {path} (meta {json.dumps(p["meta"])}): '
                                 + '; '.join(probs) + '. Move it out of the data directory (or rename it to '
                                 '*.bad.npz) to train without it')
-            N = len(p['player'])
-            idx = np.arange(N) if keep >= 1.0 else np.sort(rng.choice(N, size=max(1, int(round(N * keep))), replace=False))
-            src.append(idx.astype(np.int32))
-            x = p['x'][idx]
-            if x.shape[1] > self.F:
-                x = x[:, :self.F]
-            elif x.shape[1] < self.F:
-                x = np.pad(x, ((0, 0), (0, self.F - x.shape[1])))
-            xs.append(x.astype(np.float16))
-            pl.append(p['player'][idx].astype(np.int64))
-            npl.append(p['n_players'][idx].astype(np.int64))
+            if len(p['player']) != N:
+                raise ValueError(f'shard {path}: {len(p["player"])} rows, its meta says {N}')
+            if idx is None:
+                idx = np.arange(N)
+                sel = slice(None)
+            else:
+                sel = idx
+            w = min(self.F, p['x'].shape[1])
+            dst = self.x[self.starts[k]:self.starts[k + 1]]
+            dst[:, :w] = p['x'][sel, :w]
+            if w < self.F:
+                dst[:, w:] = 0
             off = p['opt_off'].astype(np.int64)
             lens = off[idx + 1] - off[idx]
             pos = _ranges(off[idx], lens)
-            acts.append(p['opt_action'][pos].astype(np.int64))
-            pis.append(p['pi'][pos].astype(np.float32))
-            offs.append(np.cumsum(lens) + base)
-            base += int(lens.sum())
-            for dst, k in ((zs, 'z'), (qs, 'q'), (scs, 'sc')):
+            out = {'src': idx.astype(np.int32), 'player': p['player'][sel].astype(np.int64),
+                   'n_players': p['n_players'][sel].astype(np.int64), 'lens': lens,
+                   'opt_action': p['opt_action'][pos].astype(np.int64), 'pi': p['pi'][pos].astype(np.float32)}
+            for key in ('z', 'q', 'sc'):
                 a = np.zeros((len(idx), MAX_SEATS), np.float32)
-                v = p[k][idx].astype(np.float32)
+                v = p[key][sel].astype(np.float32)
                 a[:, :v.shape[1]] = v
-                dst.append(a)
-            del p
-        self.N = sum(len(x) for x in xs)
-        if self.N == 0:
-            raise ValueError('empty training window')
-        self.src_row = np.concatenate(src)                     # window row -> its row in its shard
-        self.starts = np.concatenate([[0], np.cumsum([len(i) for i in src])])
-        self.x = np.concatenate(xs)
-        self.player = np.concatenate(pl)
-        self.n_players = np.concatenate(npl)
-        self.opt_off = np.concatenate(offs)
-        self.opt_action = np.concatenate(acts)
-        self.pi = np.concatenate(pis)
+                out[key] = a
+            return out
+
+        n_threads = max(1, min(threads or WINDOW_THREADS, len(self.paths)))
+        if n_threads == 1:
+            parts = [load(k) for k in range(len(self.paths))]
+        else:
+            with ThreadPoolExecutor(n_threads) as ex:
+                futs = [ex.submit(load, k) for k in range(len(self.paths))]
+                parts = [f.result() for f in futs]          # the first failure in path order is raised
+        self.src_row = np.concatenate([q['src'] for q in parts])     # window row -> its row in its shard
+        self.player = np.concatenate([q['player'] for q in parts])
+        self.n_players = np.concatenate([q['n_players'] for q in parts])
+        self.opt_off = np.concatenate([np.zeros(1, np.int64), np.cumsum(np.concatenate([q['lens'] for q in parts]))])
+        self.opt_action = np.concatenate([q['opt_action'] for q in parts])
+        self.pi = np.concatenate([q['pi'] for q in parts])
         if self.opt_action.max() >= self.A:
             raise ValueError(f'action id {self.opt_action.max()} >= the network\'s {self.A} actions')
-        self.z = np.concatenate(zs)
-        self.q = np.concatenate(qs)
-        self.sc = np.concatenate(scs)
+        self.z = np.concatenate([q['z'] for q in parts])
+        self.q = np.concatenate([q['q'] for q in parts])
+        self.sc = np.concatenate([q['sc'] for q in parts])
         self.loaded = total
         self.nbytes = sum(a.nbytes for a in (self.x, self.player, self.n_players, self.opt_off, self.opt_action,
                                              self.pi, self.z, self.q, self.sc))
