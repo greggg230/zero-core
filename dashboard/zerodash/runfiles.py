@@ -7,7 +7,8 @@
   Dominion writes <data_dir>/iter_NNNN/progress_*.json per worker instead.
 * run_state.json / supervisor_state.json (runctl: Glass Road, Caverna, Dominion).
 * PAUSE: JSON {"time", "by"} (an older or hand-made one may be empty: its mtime is the time).
-* elo/ratings.json: {"anchor", "anchor_elo", "updated", "ratings": {name: {elo, se, games}}}.
+* elo/ratings.json: {"anchor", "anchor_elo", "updated", "ratings": {name: {elo, se, games}}} (a run
+  whose eval_select is not 'visits': elo/<rule>/ratings.json, its rule's pool; `elo_pool`).
 
 Everything returns None / [] for a missing or unreadable file: a run being written must never
 break the page. Parsed metrics and ratings are cached by (size, mtime).
@@ -166,8 +167,26 @@ def _parse_ratings(path):
                                      if not k.startswith('iter_') and isinstance(v, dict)}}
 
 
+def elo_pool(run_dir):
+    """The Elo pool directory of a run's evaluation move rule (zero-core's `zero.elo.active_pool`,
+    docs/az.md 5.4): elo/ for eval_select 'visits' (and runs without it), elo/<rule>/ otherwise
+    ('cq', 'cq-n2', 'cq-v25-s0.5': guard, then a completed-Q transform other than 50 / 1)."""
+    c = read_json(os.path.join(run_dir, 'config.json'))
+    c = c if isinstance(c, dict) else {}
+    rule = c.get('eval_select') or 'visits'
+    if rule == 'visits':
+        return os.path.join(run_dir, 'elo')
+    tag = rule
+    if c.get('eval_select_min_visits'):
+        tag += f"-n{int(c['eval_select_min_visits'])}"
+    cv, cs = float(c.get('cq_c_visit', 50.0)), float(c.get('cq_c_scale', 1.0))
+    if (cv, cs) != (50.0, 1.0):
+        tag += f'-v{cv:g}-s{cs:g}'
+    return os.path.join(run_dir, 'elo', tag)
+
+
 def ratings(run_dir):
-    return _ratings_cache.get(os.path.join(run_dir, 'elo', 'ratings.json'), _parse_ratings)
+    return _ratings_cache.get(os.path.join(elo_pool(run_dir), 'ratings.json'), _parse_ratings)
 
 
 # ------------------------------------------------------------------ supervisor.log
