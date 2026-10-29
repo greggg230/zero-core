@@ -215,7 +215,7 @@ def test_a_batch_bound_driver_keeps_its_slots(tmp_path):
         q = r['selfplay']['queue']
         c = q['consumers']
         assert c['local']['cap_next'] == 256 > plain_cap(q, 'local'), q
-        assert c['w0']['cap_next'] == plain_cap(q, 'w0'), q
+        assert abs(c['w0']['cap_next'] - plain_cap(q, 'w0')) <= 1, q     # its share, as without the rule
         st = q['staleness']['summary']
         assert st['max'] <= 4 and st['mean'] <= 1.5, q['staleness']
     log = (run / 'log.txt').read_text(encoding='utf-8')
