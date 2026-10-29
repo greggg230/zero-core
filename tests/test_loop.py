@@ -46,6 +46,30 @@ def test_iterations_metrics_and_elo(smoke_run):
     assert runctl.read_state(str(smoke_run), 'run')['state'] == 'done'
 
 
+def test_window_cache_trains_the_same_network(smoke_run):
+    """Run setting window_cache: training from the cached window (the second training of the same
+    iteration reuses every shard) gives the network of training without it, weight for weight."""
+    import torch
+    from zero import run as R
+    with open(os.path.join(smoke_run, 'config.json')) as f:
+        cfg = json.load(f)
+    cfg = dict(cfg, train_device='cpu')
+
+    def trained(run_obj):
+        model, _, stats = run_obj.train_model(2, 200)
+        return {k: v.detach().clone() for k, v in model.state_dict().items()}, stats()
+
+    ref, st0 = trained(R.Run(str(smoke_run), dict(cfg, window_cache=0)))
+    cached = R.Run(str(smoke_run), dict(cfg, window_cache=1))
+    first, st1 = trained(cached)
+    again, st2 = trained(cached)
+    assert st0['window_reused'] == 0 and st1['window_reused'] == 0 and st2['window_reused'] == st2['window_samples'] > 0
+    for got in (first, again):
+        assert ref.keys() == got.keys()
+        for k in ref:
+            assert torch.equal(ref[k], got[k]), k
+
+
 def test_resume_continues_and_stop_file(smoke_run, tmp_path):
     import shutil
     run = tmp_path / 'r'
