@@ -692,6 +692,156 @@ def test_tokennet_actions_by_identity_save_load_widen(tmp_path):
     assert torch.allclose(q[0][:, :TOK_A], p[0], atol=1e-5)
 
 
+# A wider version of TOK_LAYOUT (a layout change as MTG Zero's v4 -> v5, docs/az.md 10.3): the
+# same tokens; the units' slots 3 floats wider and the cards' 2 (at the slots' ends), a third
+# row of the zones bag, a new bag, 3 new globals after the old ones; every block after a wider
+# one moves.
+TOK_LAYOUT2 = {'vocab': 12,
+               'segments': [{'name': 'ctx', 'offset': 5, 'count': 1, 'width': 14, 'present': None,
+                             'id': {'at': 1, 'radix': [12]}},
+                            {'name': 'units', 'offset': 19 + 36, 'count': 4, 'width': 12, 'present': 0,
+                             'id': {'at': 1, 'radix': [3, 4]}, 'actions': [[3, 1], [20, 2]]},
+                            {'name': 'cards', 'offset': 19 + 36 + 48, 'count': 3, 'width': 6, 'present': 3,
+                             'actions': [[30, 1]]}],
+               'bags': [{'name': 'zones', 'offset': 19, 'count': 3, 'width': 12},
+                        {'name': 'hidden', 'offset': 19 + 36 + 48 + 18 + 5, 'count': 1, 'width': 12}]}
+TOK_F2 = 19 + 36 + 48 + 18 + 5 + 12
+
+
+def widened_x(x, fmap, F2, seed=0):
+    """An input of the wider layout whose old features are `x` (the rest random: any value)."""
+    g = torch.Generator().manual_seed(seed)
+    x2 = torch.randn(x.shape[0], F2, generator=g) * 3
+    x2[:, fmap] = x
+    return x2
+
+
+def test_tokennet_widen_across_a_layout_change(tmp_path):
+    """`widen(..., layout=)` (docs/az.md 10.3): every new input column (wider slots, bag rows, a
+    new bag, new globals) gets zero weights, so on any input of the new layout the widened
+    network's policy, value and margin are the old network's on the old part of it; the same
+    tokens (positions, pointer columns); new actions get logit 0. Saved and loaded it stays so."""
+    from zero.net import token_feature_map, tokens_layout
+    m = tok_net(31)
+    with torch.no_grad():
+        m.bag.weight.normal_(0, 0.3)                 # (every map non-trivial)
+    lay2 = tokens_layout(TOK_LAYOUT2, TOK_F2, TOK_A + 2)
+    fmap = token_feature_map(m.config['layout'], TOK_F, lay2, TOK_F2)
+    assert fmap[:5] == list(range(5)) and fmap[5:19] == list(range(5, 19))     # globals, ctx
+    assert fmap[19:43] == list(range(19, 43))                                   # the zones' old rows
+    assert fmap[43:52] == list(range(55, 64)) and fmap[52] == 67                # units: slot 0, slot 1 at 55 + 12
+    assert fmap[79:83] == list(range(103, 107)) and fmap[83] == 109             # cards: 6 a slot
+    assert fmap[91:93] == [121, 122]                                            # the old trailing globals
+    w = widen(m, TOK_F2, TOK_A + 2, layout=TOK_LAYOUT2)
+    assert w.config['layout'] == lay2 and w.n_tok == m.n_tok and w.ptr.out_features == m.ptr.out_features
+    path = str(tmp_path / 'w.pt')
+    save(w, path)
+    w2, _ = load(path)
+    x = tok_x(40, 32)
+    n = torch.randint(2, 5, (40,))
+    with torch.no_grad():
+        p = m(x, n)
+        for seed in range(3):
+            q = w2(widened_x(x, fmap, TOK_F2, seed), n)
+            assert torch.allclose(q[0][:, :TOK_A], p[0], atol=1e-5) and torch.all(q[0][:, TOK_A:] == 0)
+            assert torch.allclose(q[1], p[1], atol=1e-5) and torch.allclose(q[2], p[2], atol=1e-5)
+        # (a widen to the layout the network has is the old widen: new features are globals)
+        a = widen(m, TOK_F + 3, TOK_A + 5, layout=TOK_LAYOUT).state_dict()
+        b = widen(m, TOK_F + 3, TOK_A + 5).state_dict()
+    assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a)
+    # the widened network trains: its new columns get gradients
+    w.train()
+    plog, vlog, mp = w(widened_x(x, fmap, TOK_F2), n)
+    (plog.logsumexp(1).mean() + vlog.logsumexp(1).mean() + mp.pow(2).mean()).backward()
+    assert w.seg_in[1].weight.grad[:, 9:].abs().sum() > 0 and w.g.weight.grad[:, 7:].abs().sum() > 0
+    assert w.bag.weight.grad[:, 2 * 17:].abs().sum() > 0
+
+
+def test_tokennet_widen_by_declared_global_blocks():
+    """Declared global blocks (layout key `globals`): the network is the one it is without them
+    (same globals, same parameters); a widen maps the old globals by block name, so a block may
+    grow at its end and new blocks may come between the old ones."""
+    import pytest
+    from zero.net import TokenNet, token_feature_map, tokens_layout
+    decl = dict(TOK_LAYOUT, globals=[{'name': 'head', 'offset': 0, 'count': 5}, {'name': 'tail', 'offset': 91, 'count': 2}])
+    lay = tokens_layout(decl, TOK_F, TOK_A)
+    assert lay['globals'][1] == {'name': 'tail', 'offset': 91, 'count': 2}
+    assert 'globals' not in tokens_layout(TOK_LAYOUT, TOK_F, TOK_A)
+    torch.manual_seed(33)
+    m = TokenNet(TOK_F, TOK_A, decl, d=16, layers=2, heads=2, ff=32, head=16).eval()
+    torch.manual_seed(33)
+    m0 = TokenNet(TOK_F, TOK_A, TOK_LAYOUT, d=16, layers=2, heads=2, ff=32, head=16).eval()
+    assert torch.equal(m.gidx, m0.gidx)
+    assert all(torch.equal(a, b) for a, b in zip(m.state_dict().values(), m0.state_dict().values()))
+    with torch.no_grad():
+        for lin in (m.gen, m.ptr, m.val[-1], m.mar[-1]):
+            lin.weight.normal_(0, 0.3)
+    # head grows 5 -> 7 (everything after it moves by 2), a block 'mid' joins before 'tail'
+    def sh(s, k):
+        return dict(s, offset=s['offset'] + k)
+    new = {'vocab': 12, 'segments': [sh(s, 2) for s in TOK_LAYOUT['segments']], 'bags': [sh(TOK_LAYOUT['bags'][0], 2)],
+           'globals': [{'name': 'head', 'offset': 0, 'count': 7}, {'name': 'mid', 'offset': 93, 'count': 2},
+                       {'name': 'tail', 'offset': 95, 'count': 2}]}
+    F2 = TOK_F + 4
+    fmap = token_feature_map(m.config['layout'], TOK_F, tokens_layout(new, F2, TOK_A), F2)
+    assert fmap[:5] == list(range(5)) and fmap[5] == 7 and fmap[91:] == [95, 96]
+    w = widen(m, F2, layout=new)
+    x = tok_x(30, 34)
+    n = torch.full((30,), 2)
+    with torch.no_grad():
+        p, q = m(x, n), w(widened_x(x, fmap, F2), n)
+    assert all(torch.allclose(a, b, atol=1e-5) for a, b in zip(p, q))
+    # validation of the blocks: all globals declared, no overlap, feature order, distinct names
+    g = decl['globals']
+    for bad in ([g[0]], [g[0], dict(g[1], offset=90, count=3)], [g[1], g[0]], [g[0], dict(g[1], name='head')]):
+        with pytest.raises(ValueError):
+            tokens_layout(dict(TOK_LAYOUT, globals=bad), TOK_F, TOK_A)
+
+
+def test_tokennet_widen_refuses_a_layout_it_cannot_follow_exactly():
+    """A new segment or more slots (new tokens), a narrower slot, another identity or present
+    flag, segments in another order, a bag gone, another vocabulary: no exact widen exists,
+    widen refuses."""
+    import pytest
+    m = tok_net(35)
+    s0, u, c = TOK_LAYOUT2['segments']
+    bad = [dict(TOK_LAYOUT2, segments=[s0, u, c, {'name': 'x', 'offset': 140, 'count': 1, 'width': 3}]),
+           dict(TOK_LAYOUT2, segments=[s0, dict(u, count=5), dict(c, offset=c['offset'] + 12)]),
+           dict(TOK_LAYOUT2, segments=[s0, dict(u, width=8), c]),
+           dict(TOK_LAYOUT2, segments=[s0, dict(u, present=11), c]),
+           dict(TOK_LAYOUT2, segments=[s0, dict(u, id={'at': 2, 'radix': [3, 4]}), c]),
+           dict(TOK_LAYOUT2, segments=[s0, c, u]),
+           dict(TOK_LAYOUT2, bags=[dict(TOK_LAYOUT2['bags'][0], name='zonez'), TOK_LAYOUT2['bags'][1]]),
+           dict(TOK_LAYOUT2, vocab=13)]
+    for b in bad:
+        with pytest.raises(ValueError):
+            widen(m, TOK_F2 + 20, TOK_A, layout=b)
+
+
+def test_fork_run_widens_across_a_layout_change(tmp_path, monkeypatch):
+    """tools/fork_run.py <src.pt> <run>: a token network follows the game package's layout as it
+    is now (here the toy's layout replaced by TOK_LAYOUT2): iteration 0 of the new run computes
+    what the source computed."""
+    import sys
+    from zero import package
+    from zero.net import token_feature_map
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools'))
+    import fork_run
+    m = tok_net(37)
+    src = str(tmp_path / 'src.pt')
+    save(m, src, {'iter': 7})
+    monkeypatch.setitem(package.active().tokens, 'toy', TOK_LAYOUT2)
+    monkeypatch.setattr(G, 'info', lambda g: dict(INFO, num_features=TOK_F2, num_actions=TOK_A))
+    assert fork_run.main([src, str(tmp_path / 'run')]) == 0
+    w, extra = load(str(tmp_path / 'run' / 'models' / 'iter_0000.pt'))
+    assert extra['iter'] == 0 and extra['source_extra'] == {'iter': 7} and w.config['features'] == TOK_F2
+    fmap = token_feature_map(m.config['layout'], TOK_F, w.config['layout'], TOK_F2)
+    x = tok_x(16, 38)
+    n = torch.full((16,), 2)
+    with torch.no_grad():
+        assert all(torch.allclose(a, b, atol=1e-5) for a, b in zip(m(x, n), w(widened_x(x, fmap, TOK_F2), n)))
+
+
 def test_tokennet_toy_layout_evaluator():
     """The core's toy layout (package.TOY_TOKENS) through the evaluator: a valid answer."""
     from zero.net import make_net

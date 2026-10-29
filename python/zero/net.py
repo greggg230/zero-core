@@ -229,7 +229,27 @@ def tokens_layout(layout, features, actions):
             raise ValueError(f'tokens layout: bag {bag["name"]} wider than the vocabulary {vocab}')
         claim(bag['name'], bag['offset'], bag['count'] * bag['width'])
         bags.append(bag)
-    return {'vocab': vocab, 'segments': segs, 'bags': bags}
+    out = {'vocab': vocab, 'segments': segs, 'bags': bags}
+    if layout.get('globals') is not None:
+        # declared global blocks (optional; the key only when set, as id_actions): named runs of
+        # globals in feature order that cover every feature outside the segments and bags. They
+        # change nothing in the network (its globals are those features, in feature order); a
+        # widen across a layout change maps the old globals onto the new ones by block name
+        # (`widen`, docs/az.md 10.3)
+        blocks, last = [], -1
+        for g in layout['globals']:
+            blk = {'name': str(g['name']), 'offset': int(g['offset']), 'count': int(g['count'])}
+            if blk['count'] < 1 or blk['offset'] <= last:
+                raise ValueError(f'tokens layout: global block {blk["name"]} is empty or out of feature order')
+            if any(b['name'] == blk['name'] for b in blocks):
+                raise ValueError(f'tokens layout: two global blocks named {blk["name"]}')
+            claim(blk['name'], blk['offset'], blk['count'])
+            last = blk['offset']
+            blocks.append(blk)
+        if len(used) != features:
+            raise ValueError(f'tokens layout: the global blocks leave {features - len(used)} features undeclared')
+        out['globals'] = blocks
+    return out
 
 
 class TBlock(nn.Module):
@@ -277,6 +297,9 @@ class TokenNet(nn.Module):
         vocab counts each, e.g. the cards of a zone by identity); each is pooled as the
         count-weighted sum of the identity embeddings, and the pools feed the global token.
       * every feature outside the segments and bags is a global (the global token's input).
+      * globals [{name, offset, count}, ...] (optional): those globals as named blocks in feature
+        order, covering all of them. The network is the same with or without them; `widen` maps
+        a checkpoint across a layout change by them (docs/az.md 10.3).
 
     Token = identity embedding + a linear map of the slot's floats + a learned embedding of
     (segment, slot) (the slot order means something: timestamps, top of the stack, whose
@@ -542,18 +565,149 @@ def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0)
     return Net(F_, A_, hidden, blocks, game=game).eval()
 
 
-def widen(old, features=None, actions=None, grid=None):
+def _global_blocks(lay, features):
+    """The globals of a normalised token layout as [(block name or None, [feature, ...]), ...] in
+    feature order: its declared blocks, else one unnamed block of every feature outside the
+    segments and bags."""
+    if lay.get('globals') is not None:
+        return [(b['name'], list(range(b['offset'], b['offset'] + b['count']))) for b in lay['globals']]
+    inside = set()
+    for s in lay['segments']:
+        inside.update(range(s['offset'], s['offset'] + s['count'] * s['width']))
+    for b in lay['bags']:
+        inside.update(range(b['offset'], b['offset'] + b['count'] * b['width']))
+    return [(None, [i for i in range(features) if i not in inside])]
+
+
+def token_feature_map(old_lay, old_features, new_lay, new_features):
+    """Where each feature of a token layout went in a wider one (docs/az.md 10.3): a list, per old
+    feature, of its new index. Raises ValueError unless `new_lay` keeps the old layout's tokens and
+    meanings and only adds inputs:
+      * the same segments (names, order, slot counts, present flags, identities, actions): a new
+        segment, or more slots, would add tokens to the attention; a segment's slots may get
+        wider, the old floats first in each slot (the new ones after them);
+      * every old bag (by name; the new layout may add bags) with the same width and its old rows
+        first (new rows after them);
+      * the old globals: by block name when the old layout declares blocks (the old floats first
+        in each), else all of them as the first globals of the new layout in feature order (new
+        globals after the old ones in feature order).
+    Both layouts normalised (`tokens_layout`)."""
+    if int(new_lay['vocab']) != int(old_lay['vocab']):
+        raise ValueError(f'widen: the vocabulary changed ({old_lay["vocab"]} -> {new_lay["vocab"]})')
+    os_, ns = old_lay['segments'], new_lay['segments']
+    if [s['name'] for s in os_] != [s['name'] for s in ns]:
+        raise ValueError(f'widen: a token layout must keep its segments (names, order): '
+                         f'{[s["name"] for s in os_]} -> {[s["name"] for s in ns]} (new tokens change the attention)')
+    fmap = [None] * old_features
+    for a, b in zip(os_, ns):
+        same = ('count', 'present', 'id', 'actions')
+        if any(a.get(k) != b.get(k) for k in same) or a.get('id_actions') != b.get('id_actions'):
+            raise ValueError(f'widen: segment {a["name"]} changed its slots, present flag, identity or actions')
+        if b['width'] < a['width']:
+            raise ValueError(f'widen: segment {a["name"]} got narrower ({a["width"]} -> {b["width"]})')
+        for s in range(a['count']):
+            for j in range(a['width']):
+                fmap[a['offset'] + s * a['width'] + j] = b['offset'] + s * b['width'] + j
+    nb = {b['name']: b for b in new_lay['bags']}
+    for a in old_lay['bags']:
+        b = nb.get(a['name'])
+        if b is None or b['width'] != a['width'] or b['count'] < a['count']:
+            raise ValueError(f'widen: bag {a["name"]} is gone, changed width or lost rows')
+        for i in range(a['count'] * a['width']):
+            fmap[a['offset'] + i] = b['offset'] + i
+    og, ng = _global_blocks(old_lay, old_features), _global_blocks(new_lay, new_features)
+    if og[0][0] is None:                         # no declared blocks: a prefix in feature order
+        old_g, new_g = og[0][1], [f for _, fs in ng for f in fs]
+        if len(new_g) < len(old_g):
+            raise ValueError(f'widen: {len(old_g)} globals -> {len(new_g)}')
+        pairs = zip(old_g, new_g)
+    else:
+        nd = dict(ng)
+        pairs = []
+        for name, fs in og:
+            if name not in nd or len(nd[name]) < len(fs):
+                raise ValueError(f'widen: global block {name} is gone or lost floats')
+            pairs.extend(zip(fs, nd[name]))
+    for f, t in pairs:
+        fmap[f] = t
+    if any(t is None for t in fmap) or len(set(fmap)) != old_features or max(fmap) >= new_features:
+        raise ValueError('widen: the old features do not map one to one into the new layout')
+    return fmap
+
+
+def _widen_tokens(old, cfg, lay):
+    """`widen` of a TokenNet onto the layout `lay` (normalised; module docs of `widen`)."""
+    ol = old.config['layout']
+    F0, F1 = old.config['features'], cfg['features']
+    fmap = token_feature_map(ol, F0, lay, F1)
+    cfg = dict(cfg, layout=lay)
+    new = build(cfg)
+    st = new.state_dict()
+    old_st = old.state_dict()
+    # the globals: columns of `g` in feature order (TokenNet.gidx)
+    ogi = old.gidx.tolist()
+    npos = {f: k for k, f in enumerate(new.gidx.tolist())}
+    gcols = [npos[fmap[f]] for f in ogi]
+    # the bags: rows of (d + 1) columns of `bag`, in bag order
+    d = old.d
+
+    def rows(l):
+        out, r = {}, 0
+        for b in l['bags']:
+            for k in range(b['count']):
+                out[(b['name'], k)] = r
+                r += 1
+        return out
+    orow, nrow = rows(ol), rows(lay)
+    seg = {f'seg_in.{i}.weight' for i in range(len(ol['segments']))}
+    for k, v in old_st.items():
+        t = st[k]
+        if k == 'g.weight':
+            t.zero_()
+            t[:, gcols] = v
+        elif k == 'bag.weight':
+            t.zero_()
+            for key, r in orow.items():
+                n = nrow[key]
+                t[:, n * (d + 1):(n + 1) * (d + 1)] = v[:, r * (d + 1):(r + 1) * (d + 1)]
+        elif k in seg:                               # the slot's old floats first
+            t.zero_()
+            t[:, :v.shape[1]] = v
+        elif k in ('gen.weight', 'gen.bias'):
+            t.zero_()
+            t[:v.shape[0]] = v
+        else:
+            if t.shape != v.shape:
+                raise ValueError(f'widen: {k} {tuple(v.shape)} -> {tuple(t.shape)}')
+            st[k] = v
+    if 'bag.weight' in st and 'bag.weight' not in old_st:   # the old network had no bags
+        st['bag.weight'].zero_()
+        st['bag.bias'].zero_()
+    new.load_state_dict(st)
+    return new.eval()
+
+
+def widen(old, features=None, actions=None, grid=None, layout=None):
     """A copy of `old` with `features` inputs / `actions` policy outputs (>= the old ones):
     new input columns get zero weights (the old outputs are unchanged), new actions zero
     weights and bias (logit 0). GridNet: `grid` = the new board grid (the game package's) when
     it adds planes (the old planes must come first, in the same order): the new planes get zero
-    input weights in the first conv. TokenNet: its layout stays; new features (after the old
-    ones) are new globals."""
+    input weights in the first conv. TokenNet: without `layout`, or with the layout it has, its
+    layout stays and new features (after the old ones) are new globals; with a new `layout` (the
+    game package's, `GamePackage.tokens`) the widen follows it segment by segment
+    (`token_feature_map`: slots wider at their ends, bags with more rows or new bags, more
+    globals; the same tokens): every new input column gets zero weights in its projection (the
+    segment's input map, the bag map, the global map), so on any input of the new layout the
+    network computes what `old` computed on the old features of it (docs/az.md 10.3)."""
     cfg = dict(old.config)
     cfg['features'] = features or cfg['features']
     cfg['actions'] = actions or cfg['actions']
     if cfg['features'] < old.config['features'] or cfg['actions'] < old.config['actions']:
         raise ValueError('widen only grows a network')
+    if cfg.get('arch') == 'tokens' and layout is not None:
+        lay = tokens_layout(layout, cfg['features'], cfg['actions'])
+        if lay != old.config['layout']:
+            return _widen_tokens(old, cfg, lay)
     if cfg.get('arch') == 'tokens':
         new = build(cfg)
         st = new.state_dict()

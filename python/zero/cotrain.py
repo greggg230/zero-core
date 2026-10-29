@@ -62,7 +62,7 @@ from . import package
 from .data import ShardWriter, TargetStats
 from .finite import NonFinite, check_state
 from .infer import drive
-from .net import load, save, widen
+from .net import load, save, tokens_layout, widen
 from .run import (DEFAULTS, PRESETS, Run, _fmt, _fmt_queue, _fmt_remote, _write_json, check_eval_settings, last_rates,
                   latest_iter, log, model_path, read_metrics, summarize)
 from .workqueue import lag_hist
@@ -468,9 +468,13 @@ class CoRun:
             raise SystemExit(f"resolver_init {path}: {old.config['features']} features / {old.config['actions']} actions, "
                              f"the game has {info['num_features']} / {info['num_actions']}")
         grid = package.active().grids.get(self.rcfg['game']) if old.config.get('arch') == 'grid' else None
+        # (a token network across a change of the game's object layout: widened segment by
+        # segment, docs/az.md 10.3)
+        layout = package.active().tokens_of(self.rcfg['game']) if old.config.get('arch') == 'tokens' else None
+        moved = layout is not None and tokens_layout(layout, info['num_features'], info['num_actions']) != old.config['layout']
         new = old
-        if old.config['features'] < info['num_features'] or old.config['actions'] < info['num_actions']:
-            new = widen(old, info['num_features'], info['num_actions'], grid=grid)
+        if old.config['features'] < info['num_features'] or old.config['actions'] < info['num_actions'] or moved:
+            new = widen(old, info['num_features'], info['num_actions'], grid=grid, layout=layout)
         save(new, model_path(self.R.run, 0), {'iter': 0, 'init_from': os.path.abspath(path), 'source_extra': extra})
         self.log(f'resolver iteration 0 = {path} ({old.config.get("arch", "mlp")}, {old.config["features"]} features, '
                  f'{old.config["actions"]} actions; extra {json.dumps(extra, default=str)[:200]})')

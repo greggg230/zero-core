@@ -2,7 +2,8 @@
 
   python tools/fork_run.py <src.pt> <new run dir> [--game toy]
       A NEW run whose iteration 0 is the source network widened to the game's current
-      feature / action counts (new inputs get zero weights: it computes what the source did).
+      feature / action counts (new inputs get zero weights: it computes what the source did); a
+      token network follows the game's object layout if it changed (docs/az.md 10.3).
       Settings: the new run's own flags when it is started.
 
   python tools/fork_run.py --source runs/a --dest runs/b [--iter K] [--set reuse=8 ...] [--copy]
@@ -37,12 +38,17 @@ def new_run(src, run, game=None):
     old, extra = load(src)
     info = games.info(game or old.config.get('game', 'toy'))
     grid = package.active().grids.get(game) if game and old.config.get('arch') == 'grid' else None
-    new = widen(old, info['num_features'], info['num_actions'], grid=grid)
+    # a token network follows the game's object layout as it is now (a layout change: widened
+    # segment by segment, docs/az.md 10.3; the same layout: as before)
+    layout = package.active().tokens_of(game or old.config.get('game', 'toy')) if old.config.get('arch') == 'tokens' else None
+    new = widen(old, info['num_features'], info['num_actions'], grid=grid, layout=layout)
     os.makedirs(os.path.join(run, 'models'), exist_ok=True)
     out = os.path.join(run, 'models', 'iter_0000.pt')
     save(new, out, {'iter': 0, 'forked_from': os.path.abspath(src), 'source_extra': extra})
+    moved = layout is not None and new.config['layout'] != old.config['layout']
     print(f'{src} ({old.config["features"]} features, {old.config["actions"]} actions) -> {out} '
-          f'({new.config["features"]} features, {new.config["actions"]} actions)')
+          f'({new.config["features"]} features, {new.config["actions"]} actions'
+          + (', across a token layout change' if moved else '') + ')')
 
 
 def _link(src, dst, copy):
