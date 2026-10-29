@@ -207,8 +207,8 @@ class RecordingDriver(PyDriver):
                 if r is None:
                     slot.sims += 1
                     continue
-                player, x, acts = r
-                need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts))
+                player, x, acts, vx = r
+                need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts, vx))
                 break
         for slot in finished:
             self.active.remove(slot)
@@ -218,19 +218,7 @@ class RecordingDriver(PyDriver):
             self._ext_batch(self.hint, hints)
         for name, items in ext.items():
             self._ext_batch(name, items)
-        for key, items in need.items():
-            off = np.zeros(len(items) + 1, np.int32)
-            off[1:] = np.cumsum([len(it[5]) for it in items])
-            a = {'x': np.ascontiguousarray(np.stack([it[4] for it in items]).astype(np.float32)),
-                 'opt_off': off,
-                 'opt_action': np.asarray([x for it in items for x in it[5]], np.int32),
-                 'player': np.asarray([it[3] for it in items], np.int32),
-                 'n_players': np.asarray([it[0].n for it in items], np.int32),
-                 'gid': np.asarray([it[0].gid for it in items], np.int64)}
-            lb = LeafBatch(self.next_bid, key, 'nn', a)
-            self.outstanding[self.next_bid] = (lb, [it[:3] for it in items])
-            self.next_bid += 1
-            self.queue.append(lb)
+        self._leaf_batches(need)
 
     def _decide(self, slot, seat, tree, p):
         t = tree.t
@@ -304,7 +292,8 @@ def _nn(key, sims, cfg, selfplay, chance_k, select=None):
     """A network seat at the run's settings (`cfg`); its move rule the run's (eval_select, or
     selfplay_select with `selfplay`, with the rule's completed-Q transform: `mcts.select_settings`)
     unless `select` = (rule, min_visits) or (rule, min_visits, c_visit, c_scale) says otherwise (a
-    rule None: the run's rule and guard; a transform None or left out: the run's rule's)."""
+    rule None: the run's rule and guard; a transform None or left out: the run's rule's). Its leaf
+    values' view is the run's (selfplay_ / eval_leaf_value_view, docs/search.md 3.6)."""
     pre = 'selfplay_select' if selfplay else 'eval_select'
     rule, mv, cv, cs = select_settings(cfg, pre)
     if select:
@@ -318,7 +307,8 @@ def _nn(key, sims, cfg, selfplay, chance_k, select=None):
                   eps=cfg.get('eps', 0.25), temp_moves=cfg.get('temp_moves', 30) if selfplay else 0,
                   chance_k=chance_k, redet=bool(cfg.get('redet', 1)), impl='rs', cq_c_visit=cfg.get('cq_c_visit', 50.0),
                   cq_c_scale=cfg.get('cq_c_scale', 1.0), select=rule, select_min_visits=int(mv),
-                  select_c_visit=None if rule == 'visits' else cv, select_c_scale=None if rule == 'visits' else cs)
+                  select_c_visit=None if rule == 'visits' else cv, select_c_scale=None if rule == 'visits' else cs,
+                  leaf_value_view=cfg.get(('selfplay' if selfplay else 'eval') + '_leaf_value_view', 'mover'))
 
 
 def _with_rule(info, seat):

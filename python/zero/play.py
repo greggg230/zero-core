@@ -368,6 +368,11 @@ class PyDriver:
             self.active.remove(slot)
             self._finish(slot)
         self._refill()
+        self._leaf_batches(need)
+
+    def _leaf_batches(self, need):
+        """Queue one network batch per key of `need` ({key: [(slot, seat, tree, player, x, acts, vx)]}):
+        each leaf's row, then (a root-view value) its value-only row of the tree's viewer."""
         for key, items in need.items():
             # rows: each leaf's, then (root-view values) its value-only row of the tree's viewer
             rows, refs = [], []
