@@ -456,7 +456,7 @@ instead (11.6), through the same queue model.
   lingering before it)`}` and **`selfplay.queue`** = `{quota, games` (all accepted), `short, held`
   (`{local, remote}`: waiting for the next iteration), `inflight, units, consumers` (per consumer:
   `games, share, units` (finished), `run_s, util, rate_measured, rate, cap` (the phase's mean),
-  `cap_next`), `rates` (the model's state: each consumer's rate, lead, lo, hi; the leaves per unit),
+  `cap_max, cap_next`), `rates` (the model's state: each consumer's rate, lead, lo, hi; the leaves per unit),
   `staleness` (`{local, remote, all}`: rows by checkpoint lag, `summary` = rows, mean, max and the
   share at lag <= 1)`}`. The log: `iter N remote self-play: 2 worker(s), 812 games, ...; 815 played,
   3 held for the next iteration` and `iter N shared queue: quota 600: 600 games (local 54, w0 271, w1
