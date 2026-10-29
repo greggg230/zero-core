@@ -66,7 +66,7 @@ def bench_infer(game='toy', device='cpu', hidden=128, blocks=3, batches=(64, 256
 def bench_selfplay(model, game='toy', threads=4, games=400, sims=64, conc=256, spec=None, hidden=128, blocks=3, device='cpu',
                    arch='mlp', heads=4, ff=0):
     if model:
-        m, _ = load(model)
+        m, _ = load(model, game=game)
     else:                                          # a fresh (random) network of the given size
         m = make_net(G.info(game), game, arch, hidden, blocks, heads=heads, ff=ff)
     ev = NetEvaluator(m, device)

@@ -49,6 +49,7 @@ The run directory holds the primary as a single-game run does (`models/`, `data/
   requeued here, and a duplicate row is dropped. The primary's own self-play (the drafting) stays
   here: the run's top-level `selfplay_remote` is refused.
 """
+import glob
 import json
 import os
 import threading
@@ -62,7 +63,8 @@ from . import package
 from .data import ShardWriter, TargetStats
 from .finite import NonFinite, check_state
 from .infer import drive
-from .net import load, save, tokens_layout, widen
+from .net import (EncodingMismatch, check_checkpoint, check_encoding, layout_sans_identity, load, save, tokens_layout,
+                  widen)
 from .run import (DEFAULTS, PRESETS, Run, _fmt, _fmt_queue, _fmt_remote, _write_json, check_eval_settings, last_rates,
                   latest_iter, log, model_path, read_metrics, summarize)
 from .workqueue import lag_hist
@@ -456,11 +458,44 @@ class CoRun:
             k -= 1
         return k if k >= 0 else None
 
+    def first_checkpoints(self):
+        """No iteration has both checkpoints yet: iteration 0 of each network. A network's existing
+        checkpoint 0 is kept, never overwritten (e.g. the primary forked into the run by
+        tools/fork_run.py, the resolver brought in by resolver_init: docs/az.md 11); the missing one
+        is created - the primary fresh, the resolver from resolver_init (else fresh). Refused (an
+        inconsistent run directory: which checkpoint 0 to start from is not clear) when either
+        network has checkpoints after 0, or when the resolver has a checkpoint 0 and resolver_init
+        is set too."""
+        P, R, c = self.P, self.R, self.cfg
+        for X in (P, R):
+            later = sorted(k for k in (int(os.path.basename(p)[5:9]) for p in
+                                       glob.glob(os.path.join(X.run, 'models', 'iter_[0-9][0-9][0-9][0-9].pt'))) if k > 0)
+            if later:
+                raise SystemExit(f'co-training: {X.run} has checkpoints after iteration 0 ({later[:4]}) but no iteration '
+                                 f'has both networks: not started (which checkpoint 0 to start from? '
+                                 f'tools/fork_run.py --source copies a co-training run with both)')
+        p0, r0 = model_path(P.run, 0), model_path(R.run, 0)
+        if os.path.exists(r0) and c.get('resolver_init'):
+            raise SystemExit(f'co-training: resolver_init {c["resolver_init"]} and a resolver checkpoint 0 already '
+                             f'there ({r0}): not started (remove one of them)')
+        if os.path.exists(p0):
+            self.log(f'primary iteration 0 = the checkpoint already there, kept: {p0}')
+        else:
+            save(P.new_model(), p0, {'iter': 0})
+        if os.path.exists(r0):
+            self.log(f'resolver iteration 0 = the checkpoint already there, kept: {r0}')
+        elif c.get('resolver_init'):
+            self.init_resolver(c['resolver_init'])
+        else:
+            save(R.new_model(), r0, {'iter': 0})
+
     def init_resolver(self, path):
         """The resolver's iteration 0 from a checkpoint (a single-game run's works): widened to the
-        game's features / actions if the game grew; its architecture is the checkpoint's."""
+        game's features / actions if the game grew; its architecture is the checkpoint's. The
+        checkpoint may be of an older encoding (the widen's purpose: loaded past the encoding
+        guard); what is written is checked against this build's (docs/az.md 10.4)."""
         info = G.info(self.rcfg['game'])
-        old, extra = load(path, 'cpu')
+        old, extra = load(path, 'cpu', allow_mismatch=True)
         game = old.config.get('game')
         if game not in (None, self.rcfg['game']):
             raise SystemExit(f"resolver_init {path}: a {game!r} network, the resolver is {self.rcfg['game']!r}")
@@ -471,10 +506,15 @@ class CoRun:
         # (a token network across a change of the game's object layout: widened segment by
         # segment, docs/az.md 10.3)
         layout = package.active().tokens_of(self.rcfg['game']) if old.config.get('arch') == 'tokens' else None
-        moved = layout is not None and tokens_layout(layout, info['num_features'], info['num_actions']) != old.config['layout']
+        moved = layout is not None and layout_sans_identity(
+            tokens_layout(layout, info['num_features'], info['num_actions'])) != layout_sans_identity(old.config['layout'])
         new = old
         if old.config['features'] < info['num_features'] or old.config['actions'] < info['num_actions'] or moved:
             new = widen(old, info['num_features'], info['num_actions'], grid=grid, layout=layout)
+        try:
+            check_encoding(new.config, self.rcfg['game'])
+        except EncodingMismatch as e:
+            raise EncodingMismatch(f'resolver_init {path}, widened: {e}') from None
         save(new, model_path(self.R.run, 0), {'iter': 0, 'init_from': os.path.abspath(path), 'source_extra': extra})
         self.log(f'resolver iteration 0 = {path} ({old.config.get("arch", "mlp")}, {old.config["features"]} features, '
                  f'{old.config["actions"]} actions; extra {json.dumps(extra, default=str)[:200]})')
@@ -565,7 +605,7 @@ class CoRun:
                        'rev': R.evaluator(model_path(R.run, it - 1)), 'co': Coordinator(*self.deferred)}
         else:
             for k, X in (('pev', P), ('rev', R)):
-                m, _ = load(model_path(X.run, it - 1), 'cpu')
+                m, _ = load(model_path(X.run, it - 1), 'cpu', game=X.cfg['game'])
                 self.sp[k].set_weights(m.state_dict())
         sp = self.sp
         pdrv, rdrv, pev, rev, co = sp['p'], sp['r'], sp['pev'], sp['rev'], sp['co']
@@ -766,12 +806,12 @@ class CoRun:
             json.dump(rc, f, indent=1)
         start = self.latest()
         if start is None:
-            save(P.new_model(), model_path(run, 0), {'iter': 0})
-            if c.get('resolver_init'):
-                self.init_resolver(c['resolver_init'])
-            else:
-                save(R.new_model(), model_path(R.run, 0), {'iter': 0})
+            self.first_checkpoints()
             start = 0
+        # both checkpoints of the start are networks of this build's encodings - a resume's, or an
+        # iteration 0 kept from a fork (docs/az.md 10.4; EncodingMismatch: the run refuses to start)
+        for X in (P, R):
+            check_checkpoint(model_path(X.run, start), X.cfg['game'])
         self.log(f'co-training run {run} starting after iter {start}: primary {c["game"]} (team size {self.team}), '
                  f'resolver {rc["game"]}; resolver cfg {json.dumps(rc)}')
         if rc.get('eval_remote'):

@@ -53,7 +53,25 @@ from . import elo, package
 
 RETRY_S = 300
 RESULT = 'ZERO_REMOTE_RESULT '
+REFUSED = 'ZERO_REMOTE_REFUSED '           # + {"error": ...}: the remote's build refused a checkpoint (docs/az.md 10.4)
 LOCK_STALE_S = 4 * 3600
+
+
+class RemoteRefused(RuntimeError):
+    """The remote's build refused a checkpoint of the run: a network of another encoding than its
+    checkout's (zero.net's encoding guard, docs/az.md 10.4: the remote's checkout is not the
+    run's code). Logged in full and retried like a failure (the checkout may be fixed)."""
+
+
+def _refused(r):
+    """A remote command's ZERO_REMOTE_REFUSED line -> RemoteRefused, else None."""
+    lines = [ln for ln in (r.stdout or '').splitlines() if ln.startswith(REFUSED)]
+    if not lines:
+        return None
+    try:
+        return RemoteRefused(json.loads(lines[-1][len(REFUSED):])['error'])
+    except (ValueError, KeyError, TypeError):
+        return RemoteRefused(lines[-1][len(REFUSED):])
 
 
 def remote_spec(name, setting='eval_remote'):
@@ -224,6 +242,11 @@ class RemoteEval:
                 try:
                     self._evaluate(it)
                     break
+                except RemoteRefused as ex:
+                    self.R.log(f"remote eval {self.name} iter {it} REFUSED by the remote's build (its checkout is not the "
+                               f"run's encoding? docs/az.md 10.4): {ex}; retry in {RETRY_S}s")
+                    self.shipped = None
+                    time.sleep(RETRY_S)
                 except Exception as ex:                # noqa: BLE001 (logged, retried)
                     self.R.log(f'remote eval {self.name} iter {it}: {type(ex).__name__}: {str(ex)[-400:]}; retry in {RETRY_S}s')
                     self.shipped = None
@@ -269,6 +292,8 @@ class RemoteEval:
         t0 = time.time()
         self._ship(it)
         r = self.t.run_module(self.module, ['eval', self.rdir, str(it)], timeout=4 * 3600)
+        if _refused(r) is not None:
+            raise _refused(r)
         lines = [ln for ln in (r.stdout or '').splitlines() if ln.startswith(RESULT)]
         if r.returncode or not lines:
             raise RuntimeError(f'exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[-600:]}')
@@ -364,6 +389,8 @@ class RemoteNetEval(RemoteEval):
         t0 = time.time()
         self._ship(it)
         r = self.t.run_module(self.module, ['evalnet', self.rdir, str(it)], timeout=4 * 3600)
+        if _refused(r) is not None:
+            raise _refused(r)
         lines = [ln for ln in (r.stdout or '').splitlines() if ln.startswith(RESULT)]
         if r.returncode or not lines:
             raise RuntimeError(f'exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[-600:]}')
@@ -495,8 +522,17 @@ def main(argv=None):
         raise SystemExit('usage: python -m <pkg>.az.remote eval MIRROR_DIR ITER | evalnet MIRROR_DIR ITER | '
                          'selfplay MIRROR_DIR WORKER')
     rdir, it = argv[1], int(argv[2])
-    with _Lock(os.path.join(os.path.dirname(os.path.normpath(rdir)), '.eval.lock')):
-        m = (evaluate_net_mirror if argv[0] == 'evalnet' else evaluate_mirror)(rdir, it)
+    from .net import EncodingMismatch
+    from .runctl import EXIT_REFUSED
+    try:
+        with _Lock(os.path.join(os.path.dirname(os.path.normpath(rdir)), '.eval.lock')):
+            m = (evaluate_net_mirror if argv[0] == 'evalnet' else evaluate_mirror)(rdir, it)
+    except EncodingMismatch as e:
+        # a checkpoint of the run is not a network of this checkout's encoding (docs/az.md 10.4):
+        # said to the run in one line, which logs it in full
+        print(REFUSED + json.dumps({'error': str(e)}), flush=True)
+        print(f'EncodingMismatch: {e}', file=sys.stderr, flush=True)
+        raise SystemExit(EXIT_REFUSED)
     print(RESULT + json.dumps(m), flush=True)
 
 

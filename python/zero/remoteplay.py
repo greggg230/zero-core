@@ -358,6 +358,8 @@ class RemotePlay:
         self.fails = 0
         self.streak = 0                            # failures since a worker last said hello
         self.t_faillog = 0.0
+        self.refusals = 0                          # workers that refused the run's checkpoint (docs/az.md 10.4)
+        self.t_refused = 0.0
         self.want = None                           # the iteration whose phase should run (None: between)
         self.accepting = None                      # the iteration whose shards are taken in
         self.co = None
@@ -939,11 +941,22 @@ class RemotePlay:
                     self.cur['requeued'] += len(requeue)
         if self.closed:
             return
-        self.fail_log(f'worker {s.k} ended (exit {rc}, after {lived:.0f}s): {str(why)[-500:]}'
-                      + (f'; {len(requeue)} episodes requeued here' if requeue else '')
-                      + (f'; {lost} accepted games lost with it (the quota needs them again)' if lost else '')
-                      + f'; restart in {max(0.0, self.next_try[s.k] - _now()):.0f}s')
         err = s.error or {}
+        tail = ((f'; {len(requeue)} episodes requeued here' if requeue else '')
+                + (f'; {lost} accepted games lost with it (the quota needs them again)' if lost else '')
+                + f'; restart in {max(0.0, self.next_try[s.k] - _now()):.0f}s')
+        if err.get('kind') == 'encoding':
+            # the worker's build refused the run's checkpoint: a network of another encoding than its
+            # checkout's (docs/az.md 10.4) - this machine plays on alone; in full the first times,
+            # then every 10 minutes (the worker said hello first: fail_log's streak restarts)
+            self.refusals += 1
+            if self.refusals <= 3 or _now() - self.t_refused > 600:
+                self.t_refused = _now()
+                self.log(f"worker {s.k} REFUSED the run's checkpoint (its checkout {self.spec.get('repo')} on "
+                         f"{self.spec.get('host')} is not the run's encoding?): {why}{tail}"
+                         + (f' ({self.refusals} refusals; logged every 10 minutes now)' if self.refusals > 3 else ''))
+            return
+        self.fail_log(f'worker {s.k} ended (exit {rc}, after {lived:.0f}s): {str(why)[-500:]}' + tail)
         if err.get('kind') == 'nonfinite':
             self._quarantine_remote(err)
 
@@ -1392,7 +1405,10 @@ class Worker:
         from .net import load
         from .run import Run
         c = self.cfg
-        m, _ = load(os.path.join(self.rdir, model), c['infer_device'])
+        # (the encoding guard: a checkpoint of another encoding than this checkout's raises
+        # EncodingMismatch, reported to the run as an 'encoding' error; docs/az.md 10.4. The
+        # tests' 'load_game': a checkout whose game feeds another encoding)
+        m, _ = load(os.path.join(self.rdir, model), c['infer_device'], game=self.test.get('load_game') or c['game'])
         if self.drv is None:
             R = Run(self.rdir, c)
             self.evr = NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1))
@@ -1694,6 +1710,8 @@ class Worker:
 
     def main(self):
         from .finite import NonFinite
+        from .net import EncodingMismatch
+        from .runctl import EXIT_REFUSED
         try:
             self._take_slot()
             self._setup()
@@ -1722,6 +1740,10 @@ class Worker:
             self.emit('error', kind='nonfinite', msg=str(e)[-3000:], bad=bad)
             self.note(f'NonFinite: {e}')
             return 1
+        except EncodingMismatch as e:
+            self.emit('error', kind='encoding', msg=str(e)[-3000:])
+            self.note(f'REFUSED the checkpoint: {e}')
+            return EXIT_REFUSED
         except SystemExit as e:
             self.emit('error', kind='refused', msg=str(e))
             self.note(f'refused: {e}')

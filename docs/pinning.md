@@ -79,5 +79,10 @@ that a game pins** (the pinned commit would disappear).
   Identical self-play record digests (policy targets visits and cq) and match results, or the
   change is a deliberate behaviour change to be documented (and the old runs not resumed on it
   silently).
+* A pin (or a game commit) that changes the game's **encoding** (feature or action counts, a
+  token layout, a board grid): the run's checkpoints are networks of the old encoding, and the
+  core's encoding guard refuses to resume them (exit 78, `docs/az.md` 10.4) - move the run with
+  `tools/fork_run.py` (a widen into a new run, 10.3). check_checkpoint_compat itself takes such a
+  checkpoint on purpose (it compares the two builds).
 * The game's `cargo test` and `pytest`, its engine parity gate, the core's
   `tools/smoke_all.sh`.

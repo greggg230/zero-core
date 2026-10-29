@@ -184,9 +184,15 @@ def use_amp(model, device):
 
 
 class NetEvaluator:
-    def __init__(self, model, device='cpu', graphs=None, workers=1):
+    """`model` answering LeafBatches (module docstring). The encoding guard's last line (docs/az.md
+    10.4): a batch whose rows are not as wide as the network's input (a network of another
+    encoding: it would read the first floats of each row, or fail later) raises
+    net.EncodingMismatch; `allow_mismatch=True` skips it (tools/selfplay_digest.py)."""
+
+    def __init__(self, model, device='cpu', graphs=None, workers=1, allow_mismatch=False):
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
+        self.width = None if allow_mismatch else getattr(model, 'features', None)
         self.amp = use_amp(model, self.device)
         if graphs is None:
             graphs = self.amp and os.environ.get('ZERO_CUDA_GRAPHS', '1') != '0'
@@ -209,10 +215,19 @@ class NetEvaluator:
         if self.fast is not None:
             self.fast.refresh()
 
+    def _check_width(self, x):
+        if self.width is not None and x.shape[1] != self.width:
+            from .net import EncodingMismatch
+            c = getattr(self.model, 'config', {})
+            raise EncodingMismatch(f'a leaf batch of {x.shape[1]:,} features per row for a network of {self.width:,} '
+                                   f'(game {c.get("game")!r}, arch {c.get("arch", "mlp")!r}): the network was built for '
+                                   f'another encoding than its driver feeds it')
+
     @torch.inference_mode()
     def evaluate(self, x, n_players, opt_off, opt_action):
         """numpy in -> (priors [options], value [B, MAX_SEATS], margin [B, MAX_SEATS]) numpy."""
         t0 = time.perf_counter()
+        self._check_width(x)
         if self._graphable(opt_off):
             r = self.fast.evaluate(x, n_players, opt_off, opt_action)
             self.calls += 1
@@ -264,6 +279,7 @@ class NetEvaluator:
             return ('f', self.pool.submit(self.evaluate, lb.x, lb.n_players, lb.opt_off, lb.opt_action), 0)
         t0 = time.perf_counter()
         if self._graphable(lb.opt_off):
+            self._check_width(lb.x)
             h = ('g', self.fast.launch(lb.x, lb.n_players, lb.opt_off, lb.opt_action), lb.B)
         else:
             h = ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action), 0)

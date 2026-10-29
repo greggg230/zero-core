@@ -313,7 +313,7 @@ def record(ckpt, opp='self', games=6, sims=128, opp_sims=None, spec=None, selfpl
     name or another checkpoint), seats alternating (game k: `ckpt` is seat k % 2). `select`:
     (rule, min_visits) or (rule, min_visits, c_visit, c_scale) of the network seats (None: each
     checkpoint's run's; a transform None: the run's rule's). -> replays."""
-    ma, _ = load(ckpt, device)
+    ma, _ = load(ckpt, device)                     # (the encoding guard: its own game's, docs/az.md 10.4)
     game = ma.config.get('game', package.active().game)
     run, it = run_of(ckpt)
     cfg = run_config(run)

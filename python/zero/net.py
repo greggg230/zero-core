@@ -23,6 +23,15 @@ config; `widen` maps a checkpoint onto a larger feature / action space (new inpu
 weights, new actions zero logits), so a widened network computes what the source did; a token
 network also across a change of its object layout that only adds (`widen(..., layout=)`,
 `token_feature_map`; docs/az.md 10.3).
+
+The encoding guard (docs/az.md 10.4): `load` refuses a checkpoint whose network was built for
+another encoding than the one this build's game feeds it (`check_encoding`: the game, the
+feature and action counts, a token network's object layout, a conv network's board grid;
+`EncodingMismatch`), since a network fed another encoding misreads it without an error (it
+takes the floats where its own layout had them). `allow_mismatch=True` skips it, for the
+callers that take such a network on purpose: tools/fork_run.py's widen, co-training's
+resolver_init (both check what they write), tools/selfplay_digest.py (check_checkpoint_compat)
+and the widen tests.
 """
 import math
 import os
@@ -62,9 +71,9 @@ class Net(nn.Module):
         self.mar = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
 
     def forward(self, x, n_players):
-        """x [B, >= features] (an older, narrower network reads a prefix), n_players [B]
-        -> policy logits [B, actions], value logits [B, seats] (absent seats -1e9),
-        margin [B, seats]."""
+        """x [B, >= features] (a narrower network reads a prefix: the evaluator refuses that
+        unless told otherwise, docs/az.md 10.4), n_players [B] -> policy logits [B, actions],
+        value logits [B, seats] (absent seats -1e9), margin [B, seats]."""
         h = F.relu(self.inp(x[:, :self.features]))
         for b in self.blocks:
             h = b(h)
@@ -95,6 +104,14 @@ class GridBlock(nn.Module):
         return F.relu(h + self.n2(self.c2(y)))
 
 
+def grid_spec(grid):
+    """A board grid of `GridNet` in its normal form (stored in the checkpoint config): {planes,
+    h, w, offset, cell_action0, hex, segments}."""
+    segs = [[int(o), int(k)] for o, k in grid.get('segments') or [[grid.get('offset', 0), grid['planes']]]]
+    return {'planes': sum(k for _, k in segs), 'h': int(grid['h']), 'w': int(grid['w']), 'offset': segs[0][0],
+            'cell_action0': int(grid.get('cell_action0', 0)), 'hex': grid.get('hex', 'odd-r'), 'segments': segs}
+
+
 class GridNet(nn.Module):
     """grid: {planes, h, w, offset (first plane feature), cell_action0 (the action of cell 0;
     cells are row-major, as the planes), hex ('odd-r' adds a row-parity plane, or none),
@@ -105,9 +122,8 @@ class GridNet(nn.Module):
     def __init__(self, features, actions, grid, ch=64, blocks=6, seats=MAX_SEATS, game='toy', head=128, ghid=128,
                  arch='grid'):
         super().__init__()
-        segs = [[int(o), int(k)] for o, k in grid.get('segments') or [[grid.get('offset', 0), grid['planes']]]]
-        grid = {'planes': sum(k for _, k in segs), 'h': int(grid['h']), 'w': int(grid['w']), 'offset': segs[0][0],
-                'cell_action0': int(grid.get('cell_action0', 0)), 'hex': grid.get('hex', 'odd-r'), 'segments': segs}
+        grid = grid_spec(grid)
+        segs = grid['segments']
         self.config = {'arch': 'grid', 'features': features, 'actions': actions, 'grid': grid, 'ch': ch, 'blocks': blocks,
                        'seats': seats, 'game': game, 'head': head, 'ghid': ghid}
         self.features = features
@@ -251,6 +267,12 @@ def tokens_layout(layout, features, actions):
         if len(used) != features:
             raise ValueError(f'tokens layout: the global blocks leave {features - len(used)} features undeclared')
         out['globals'] = blocks
+    for k in ('name', 'version'):
+        # the layout's identity (optional; the key only when set, as id_actions): nothing in the
+        # network reads it; the encoding guard compares it when the checkpoint and the build both
+        # carry one (`check_encoding`, docs/az.md 10.4)
+        if layout.get(k) is not None:
+            out[k] = layout[k]
     return out
 
 
@@ -302,6 +324,8 @@ class TokenNet(nn.Module):
       * globals [{name, offset, count}, ...] (optional): those globals as named blocks in feature
         order, covering all of them. The network is the same with or without them; `widen` maps
         a checkpoint across a layout change by them (docs/az.md 10.3).
+      * name, version (optional): the layout's identity (MTG Zero's layout files: version 5),
+        kept in the checkpoint config; only the encoding guard reads them (docs/az.md 10.4).
 
     Token = identity embedding + a linear map of the slot's floats + a learned embedding of
     (segment, slot) (the slot order means something: timestamps, top of the stack, whose
@@ -528,12 +552,171 @@ def save(model, path, extra=None):
     _replace(tmp, path)
 
 
-def load(path, device='cpu'):
+def load(path, device='cpu', game=None, allow_mismatch=False):
+    """A checkpoint -> (network, extra). The encoding guard first (docs/az.md 10.4): a network
+    built for another encoding than the one this build's `game` feeds it (default: the game in its
+    config) raises EncodingMismatch (`check_encoding`). `allow_mismatch=True` skips the guard, for
+    the callers that take such a network on purpose: tools/fork_run.py's widen, co-training's
+    resolver_init (both check what they write), tools/selfplay_digest.py and the widen tests."""
     ck = torch.load(path, map_location=device, weights_only=False)
+    if not allow_mismatch:
+        check_encoding(ck['config'], game, path)
     m = build(ck['config'])
     m.load_state_dict(ck['state'])
     m.to(device).eval()
     return m, ck.get('extra', {})
+
+
+# ---------------------------------------------------------------- the encoding guard (docs/az.md 10.4)
+class EncodingMismatch(ValueError):
+    """A network built for another encoding than the one this build's game feeds it
+    (`check_encoding`): fed this build's inputs it would misread them without an error."""
+
+
+ADVICE = ('Move a run across an encoding change with `python tools/fork_run.py <checkpoint> <new run>` (an exact '
+          "widen when the change only adds inputs; docs/az.md 10.4), or use a build of the network's encoding.")
+
+
+def build_encoding(game):
+    """What this build's game `game` feeds a network: {game, features, actions, layout (the game
+    package's object layout, normalised: arch 'tokens'), grid (its board grid: arch 'grid')}; the
+    keys layout / grid only when the package has one. An unknown game: EncodingMismatch."""
+    from . import games as G, package
+    try:
+        info = G.info(game)
+    except ImportError:
+        raise
+    except Exception as e:                         # noqa: BLE001 - the engine's unknown game
+        raise EncodingMismatch(f'game {game!r} is not a game of this build ({e})') from None
+    enc = {'game': game, 'features': int(info['num_features']), 'actions': int(info['num_actions'])}
+    pkg = package.active()
+    lay = pkg.tokens_of(game)
+    if lay:
+        enc['layout'] = tokens_layout(lay, enc['features'], enc['actions'])
+    grid = pkg.grids.get(game)
+    if grid:
+        enc['grid'] = grid_spec(grid)
+    return enc
+
+
+def _short(v, n=48):
+    s = repr(v)
+    return s if len(s) <= n else s[:n - 3] + '...'
+
+
+def _layout_diff(a, b):
+    """How token layout `b` (the build's) differs from `a` (the network's), in the parts the
+    network reads (both normalised) -> a list of short strings."""
+    out = []
+    if a['vocab'] != b['vocab']:
+        out.append(f'vocabulary {a["vocab"]} -> {b["vocab"]}')
+    an, bn = [s['name'] for s in a['segments']], [s['name'] for s in b['segments']]
+    if an != bn:
+        out.append(f'segments {_short(an)} -> {_short(bn)}')
+    else:
+        for x, y in zip(a['segments'], b['segments']):
+            ks = [k for k in sorted(set(x) | set(y)) if x.get(k) != y.get(k)]
+            if ks:
+                out.append(f'segment {x["name"]}: ' + ', '.join(f'{k} {_short(x.get(k), 24)} -> {_short(y.get(k), 24)}'
+                                                               for k in ks[:2]) + (' ...' if len(ks) > 2 else ''))
+    ab, bb = {g['name']: g for g in a['bags']}, {g['name']: g for g in b['bags']}
+    for name in sorted(set(ab) | set(bb)):
+        if ab.get(name) != bb.get(name):
+            out.append(f'bag {name}: {_short(ab.get(name), 40)} -> {_short(bb.get(name), 40)}')
+    return out[:3] + ([f'{len(out) - 3} more'] if len(out) > 3 else [])
+
+
+def _count(v):
+    return f'{v:,}' if isinstance(v, int) else repr(v)
+
+
+def _describe(e, arch=None):
+    s = f'{e.get("game")!r}: {_count(e.get("features"))} features, {_count(e.get("actions"))} actions'
+    lay = e.get('layout')
+    if lay is not None:
+        ident = (f' {lay["name"]}' if lay.get('name') is not None else '') + \
+                (f' v{lay["version"]}' if lay.get('version') is not None else '')
+        nb = len(lay['bags'])
+        s += (f', token layout{ident or " without a version"} ({len(lay["segments"])} segments, {nb} '
+              f'bag{"" if nb == 1 else "s"})')
+    if e.get('grid') is not None:
+        s += f', board grid of {e["grid"]["planes"]} planes'
+    if arch:
+        s += f', arch {arch!r}'
+    return s
+
+
+def encoding_mismatch(config, game=None):
+    """The differences between the encoding a network `config` was built for (a checkpoint's) and
+    the one this build's `game` (default: the config's game) feeds it -> None when it matches,
+    else (differences, the network's description, the build's). Judged by: the game; the feature
+    and action counts; a token network's object layout in the parts the network reads (vocabulary,
+    segments, bags: not the declared global blocks, which change nothing in it) and the layout's
+    version / name when both sides carry one, if the game package has a layout for the game; a conv
+    network's board grid, if the package has one. A network without layout or grid metadata (arch
+    'mlp', older checkpoints) is judged by the game and the counts alone."""
+    from . import package
+    mine = config.get('game')
+    game = game or mine or package.active().game
+    enc = build_encoding(game)
+    arch = config.get('arch', 'mlp')
+    net = {'game': mine, 'features': config.get('features'), 'actions': config.get('actions')}
+    diffs = []
+    if mine is not None and mine != game:
+        diffs.append(f'game {mine!r} -> {game!r}')
+    for k in ('features', 'actions'):
+        if net[k] != enc[k]:
+            diffs.append(f'{k} {net[k]} -> {enc[k]}')
+    build_desc = dict(enc)
+    if arch == 'tokens':
+        lay = config.get('layout') or {}
+        try:
+            lay = tokens_layout(lay, int(net['features']), int(net['actions']))
+        except (KeyError, TypeError, ValueError):
+            pass
+        net['layout'] = lay
+        want = enc.get('layout')
+        if want is not None and isinstance(lay, dict) and 'segments' in lay:
+            reads = ('vocab', 'segments', 'bags')
+            if any(lay.get(k) != want.get(k) for k in reads):
+                diffs.append('token layout: ' + '; '.join(_layout_diff(lay, want)))
+            for k in ('name', 'version'):
+                if lay.get(k) is not None and want.get(k) is not None and lay[k] != want[k]:
+                    diffs.append(f'token layout {k} {lay[k]!r} -> {want[k]!r}')
+    else:
+        build_desc.pop('layout', None)
+    if arch == 'grid':
+        try:
+            net['grid'] = grid_spec(config['grid'])
+        except (KeyError, TypeError, ValueError):
+            net['grid'] = config.get('grid')
+        if enc.get('grid') is not None and net['grid'] != enc['grid']:
+            diffs.append(f'board grid {_short(net["grid"], 60)} -> {_short(enc["grid"], 60)}')
+    else:
+        build_desc.pop('grid', None)
+    if not diffs:
+        return None
+    return diffs, _describe(net, arch), _describe(build_desc)
+
+
+def check_encoding(config, game=None, where=None):
+    """Raise EncodingMismatch if a network `config` was built for another encoding than the one
+    this build's `game` (default: the config's game) feeds it (`encoding_mismatch`); `where`: the
+    checkpoint (the message)."""
+    m = encoding_mismatch(config, game)
+    if m is None:
+        return
+    diffs, net, build_ = m
+    head = f'{where}: ' if where else ''
+    raise EncodingMismatch(f"{head}a network of another encoding than this build's ({'; '.join(diffs)}). The network: "
+                           f"{net}. This build: {build_}. Fed this build's inputs it would misread them without an "
+                           f"error. {ADVICE}")
+
+
+def check_checkpoint(path, game=None):
+    """`check_encoding` of the checkpoint at `path` (its config only; the network is not built)."""
+    ck = torch.load(path, map_location='cpu', weights_only=False)
+    check_encoding(ck['config'], game, path)
 
 
 def _grid_index(cfg):
@@ -637,6 +820,12 @@ def token_feature_map(old_lay, old_features, new_lay, new_features):
     return fmap
 
 
+def layout_sans_identity(lay):
+    """A normalised token layout without its identity keys (name, version): the layout as the
+    network reads it, plus its declared global blocks."""
+    return {k: v for k, v in lay.items() if k not in ('name', 'version')}
+
+
 def _widen_tokens(old, cfg, lay):
     """`widen` of a TokenNet onto the layout `lay` (normalised; module docs of `widen`)."""
     ol = old.config['layout']
@@ -694,8 +883,9 @@ def widen(old, features=None, actions=None, grid=None, layout=None):
     new input columns get zero weights (the old outputs are unchanged), new actions zero
     weights and bias (logit 0). GridNet: `grid` = the new board grid (the game package's) when
     it adds planes (the old planes must come first, in the same order): the new planes get zero
-    input weights in the first conv. TokenNet: without `layout`, or with the layout it has, its
-    layout stays and new features (after the old ones) are new globals; with a new `layout` (the
+    input weights in the first conv. TokenNet: without `layout`, or with the layout it has (its
+    name / version may differ: the given one's are recorded), its layout stays and new features
+    (after the old ones) are new globals; with a new `layout` (the
     game package's, `GamePackage.tokens`) the widen follows it segment by segment
     (`token_feature_map`: slots wider at their ends, bags with more rows or new bags, more
     globals; the same tokens): every new input column gets zero weights in its projection (the
@@ -708,8 +898,11 @@ def widen(old, features=None, actions=None, grid=None, layout=None):
         raise ValueError('widen only grows a network')
     if cfg.get('arch') == 'tokens' and layout is not None:
         lay = tokens_layout(layout, cfg['features'], cfg['actions'])
-        if lay != old.config['layout']:
+        if layout_sans_identity(lay) != layout_sans_identity(old.config['layout']):
             return _widen_tokens(old, cfg, lay)
+        # the same layout: the old widen below, the network recording the new layout's identity
+        # (name / version: e.g. a checkpoint from before they were recorded)
+        cfg['layout'] = lay
     if cfg.get('arch') == 'tokens':
         new = build(cfg)
         st = new.state_dict()

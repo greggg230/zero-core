@@ -145,6 +145,9 @@ settings a run has not stored yet; a run directory keeps its settings across cod
   supervisor then polls PAUSE every second and relaunches the run the moment it is removed
   (not a crash: no delay, no back-off); a run started while PAUSE exists exits 75 at once.
   Measured in `tests/test_loop.py`: paused mid self-play and exited in a few seconds.
+* **Refused** (exit status **78**, `runctl.EXIT_REFUSED`): the run's checkpoint is a network of
+  another encoding than this build's (the encoding guard, section 10.4); state `refused`, and the
+  supervisor ends instead of restarting it.
 * **Resume semantics**: an iteration interrupted before its checkpoint is replayed from the
   start (its data directory is cleared); one interrupted after the checkpoint was written
   (`models/iter_N.json` holds its self-play / training stats) finishes its evaluation and Elo
@@ -290,6 +293,8 @@ yardsticks, the Elo matches and reference games - to another machine while the r
   run's own code), with the remote's `<workdir>/overrides.json` (if any) over the mirror's config;
   **one evaluation at a time per workdir** (the lock directory `<workdir>/.eval.lock`, freed when
   its owner is dead or after 4 hours); the result printed as one line `ZERO_REMOTE_RESULT {json}`.
+  A checkpoint of another encoding than the remote checkout's is refused there (the encoding
+  guard, 10.4): exit 78 and one line `ZERO_REMOTE_REFUSED {"error": ...}`, logged here in full.
 * **A failure never blocks training**: an evaluation that fails (the remote asleep or
   unreachable, its checkout refused) is logged (`remote eval <name> iter N: ...; retry in 300s`)
   and retried every `RETRY_S` (300 s) on the thread; later iterations queue behind it.
@@ -324,7 +329,9 @@ iteration's samples: this machine and the remote's workers **pull the iteration'
 shared queue**, all searching with checkpoint i-1, and the remote's sample shards come back into
 `data/iter_i/`. MTG Zero's MacBook self-plays 3-6 times as fast as the shared desktop (its
 ENGINE.md 50.3, 52, 56). A co-training run gives its resolver's queued episodes to the remote
-instead (11.6), through the same queue model.
+instead (11.6), through the same queue model. A worker whose checkout reads another encoding
+than the run's checkpoints refuses them (the encoding guard, 10.4): the run logs `worker <k>
+REFUSED the run's checkpoint ...` and plays on alone.
 
 * **One pull model** (`zero/workqueue.py`, since zero-core's `feat/shared-queue`; it replaces the
   first design's "this machine's quota + whatever the remote finished"). An iteration needs `units`
@@ -1063,7 +1070,7 @@ between them (MTG Zero's v5 declares `globals`, `match`, `globals_v5`).
 (`GamePackage.tokens`) for a token network: the new run's iteration 0 is the widened source (the
 same layout: as before, new features are globals); the co-training `resolver_init` does the same.
 A resumed run never widens: a checkpoint whose layout is not the game's is a fork into a new run
-(MTG Zero's ENGINE.md 60.5 for the procedure and what restarts: iteration numbers, Elo pool,
+(the encoding guard refuses to resume it, 10.4; MTG Zero's ENGINE.md 60.5 for the procedure and what restarts: iteration numbers, Elo pool,
 window, optimizer state). The MLP and GridNet keep their widen (appended features; grid planes).
 
 Tests (`tests/test_net_data.py`): a wider synthetic layout (wider slots, a bag row, a new bag, new
@@ -1075,6 +1082,120 @@ block grown at its end and a new block between two: mapped by name; the validati
 reordered, a bag gone, another vocabulary); `fork_run` across a layout change (the toy's layout
 replaced). MTG Zero: the real-checkpoint check of its ENGINE.md 60.2 and its pytest
 `test_a_v4_token_network_widens_onto_layout_v5_exactly`.
+
+### 10.4 The encoding guard (`net.check_encoding`; MTG Zero's layout v5, 2026-10-29)
+
+**Why**: a network fed another encoding than the one it was built for misreads it **without an
+error**. A v4 TokenNet (33,652 features) loaded by MTG Zero's v5 build (37,620) takes the first
+33,652 floats of every row (`x[:, :features]`) and reads its slots and globals where v4 had them;
+an MLP does the same; a network wider than the rows fails only somewhere later. The one safe way
+across an encoding change is a widen into a new run (10.3). So every load is checked.
+
+**The check** (`net.encoding_mismatch(config, game)` -> the differences, `check_encoding` raises
+`net.EncodingMismatch`, a ValueError): a checkpoint's `config` against what this build's game
+reports - `games.info(game)` and the game package:
+
+* the **game** (the config's `game` against the game the load site plays: the run's, h2h's);
+  a game this build does not have is a mismatch too;
+* the **feature and action counts** (`num_features`, `num_actions`);
+* arch 'tokens', when the package has a layout for the game (`GamePackage.tokens`): the object
+  layout in the parts the network reads - vocabulary, segments (every key: offsets, slot counts
+  and widths, present flags, identities, actions, `id_actions`), bags - both sides normalised
+  (`tokens_layout`); not the declared global blocks (they change nothing in the network, 10.3).
+  And the layout's **identity** (layout keys `name` / `version`, optional; MTG Zero's files carry
+  `version`): kept in the normalised layout since this change (only when set: the toy's configs
+  are unchanged), compared when the checkpoint and the build both carry one. Checkpoints from
+  before (MTG Zero's v4 runs and delver2's v5) carry none: judged by the structure, which already
+  tells v4 from v5;
+* arch 'grid', when the package has a grid for the game (`GamePackage.grids`): the board grid,
+  both sides in normal form (`net.grid_spec`: an older config without `segments` is the same);
+* a network without layout or grid metadata (arch 'mlp', older checkpoints, a game package
+  without a layout): the game and the counts alone.
+
+The message names both sides and the way out, e.g. `runs/x/models/iter_0137.pt: a network of
+another encoding than this build's (features 33652 -> 37620; token layout: segment ...). The
+network: 'mtg': 33,652 features, 1,024 actions, token layout without a version (11 segments, 1
+bag), arch 'tokens'. This build: 'mtg': 37,620 features, ..., token layout v5 (11 segments, 2
+bags). ... Move a run across an encoding change with python tools/fork_run.py <checkpoint> <new
+run> ...`.
+
+**Where it runs** (every load path, for every game - a game package's own tools load through
+`zero.net.load` too):
+
+* `net.load(path, device, game=None, allow_mismatch=False)` checks before it builds the network
+  (`game`: the game the caller plays; default the config's own). Every core load goes through it:
+  the run's evaluators (self-play, the yardstick and random matches, the Elo matches, the
+  reference games), the rolling drivers' new weights, training's checkpoint, co-training's both
+  networks, the remote evaluation's mirror (`zero.remote` runs the run's own `Run.evaluate`),
+  the remote self-play worker, `zero.h2h` (A against the game played, B against its own game,
+  which must be A's), `zero.replay` (both checkpoints), `zero.targets`, `zero.bench`,
+  `zero.parity`, `zero.webexport`, a game package's extra evaluations (MTG Zero's human picks).
+  The dashboards load no networks.
+* **Run resume** (`Run.loop`, `CoRun.loop`: both networks): the newest checkpoint is checked
+  before anything starts. A mismatch ends the run with **exit status 78** (`runctl.EXIT_REFUSED`,
+  sysexits EX_CONFIG): log line `run REFUSED ...`, `run_state.json` state `refused` (the
+  dashboard: stopped, "Refused its checkpoint ..."), the message on stderr; the supervisor does
+  **not** restart it (state `refused`: a restart would refuse again).
+* **The optimizer state** (`opt_latest.pt`): loaded only if its moments have the shapes of the
+  checked network's parameters (`run.opt_state_mismatch`; torch checks the counts only, and another
+  network's state would fail at the first step); else logged, fresh optimizer.
+* **The evaluator's last line** (`infer.NetEvaluator`): a leaf batch whose rows are not as wide
+  as the network's input raises EncodingMismatch (one comparison per batch), whatever loaded the
+  network.
+* **Remote evaluation** (5.2): the remote's `python -m <pkg>.az.remote eval|evalnet` refuses with
+  exit 78 and one line `ZERO_REMOTE_REFUSED {"error": ...}`; the run logs `remote eval <name> iter
+  <i> REFUSED by the remote's build ...: <the message in full>` and retries every `RETRY_S`
+  (the remote's checkout may be fixed: `mac.sh --eval-checkout`), as for any failure.
+* **Remote self-play** (5.3): the worker refuses the phase's checkpoint (error kind `encoding`,
+  exit 78, its own log `REFUSED the checkpoint`); the run logs `worker <k> REFUSED the run's
+  checkpoint (its checkout <repo> on <host> is not the run's encoding?): <the message>` (the first
+  three times, then every 10 minutes), restarts the worker after the retry delay, and plays on
+  alone (this machine's share grows: no game is lost).
+
+**The opt-outs** (`allow_mismatch=True`), only where a mismatch is the point:
+
+* `tools/fork_run.py <src.pt> <new run> [--game G]`: loads the source past the guard (an older
+  encoding is what it widens), widens it (10.3; a conv network now follows the game's grid too)
+  and **checks the fork** against this build's encoding before writing it (`--game`: recorded in
+  the fork's config; widen keeps the source's game). `fork_run --source` (a continuation) copies
+  files and loads nothing.
+* Co-training's `resolver_init` (11): the same - loaded past the guard, widened, the result
+  checked before it is written.
+* `tools/selfplay_digest.py` (`tools/check_checkpoint_compat.py`): an old-vs-new comparison may
+  play a checkpoint on a build of another encoding on purpose (`net.load` and `NetEvaluator`
+  with `allow_mismatch`, when the checkout has the argument).
+* `net.widen` itself loads nothing; the widen tests load their test networks (of no game of this
+  build) with the opt-out.
+
+**What does not change**: a matching checkpoint loads, builds and plays exactly as before (the
+check only reads the config); toy checkpoints' configs are unchanged; `widen` to the layout a
+network has (up to its identity) is the old widen (it records the new layout's identity).
+
+**Co-training's first start** (found by MTG Zero's td1 migration, its ENGINE.md 60.7): with no
+iteration holding both checkpoints, `CoRun.loop` used to save a fresh primary over an existing
+`models/iter_0000.pt` - a draft network forked into the run, with the play network to come from
+`resolver_init`, became the preset's fresh network without a word. Now (`CoRun.first_checkpoints`)
+an existing checkpoint 0 of either network is kept (logged: `primary iteration 0 = the checkpoint
+already there, kept: ...`), the missing one is created (the primary fresh, the resolver from
+`resolver_init` or fresh), and both are checked by the guard; refused (exit 1, nothing written)
+when the resolver has a checkpoint 0 and `resolver_init` is set too, or when either network has
+checkpoints after 0 but no iteration has both.
+
+Tests (`tests/test_encoding_guard.py`; the "v4" stand-ins: the toy's encoding with the players'
+slots one float narrower, 191 features, and an MLP of 185 features, against the toy build as
+"v5"): the check (both sides named; the game, an unknown game, a moved segment at the same width,
+declared blocks ignored, the version compared when both carry one, the counts alone for an MLP,
+the grid and its older normal form); every load site refusing (`load`, `Run.evaluator`, h2h both
+ways, replay both checkpoints, targets, bench, webexport, the evaluator's rows, also on its worker
+threads); the optimizer state of another network; run resume (exit 78, nothing written, the
+state, the supervisor not restarting a refusing run); fork_run widening a v4 token checkpoint
+exactly (outputs equal on real toy rows at the map) and the fork resuming, an MLP fork, a fork the
+widen cannot bring onto the encoding not written; co-training (resolver_init from a v4 checkpoint,
+widened exactly; a v4 resolver refused at the resume; the first start keeping a forked primary bit
+for bit with resolver_init, keeping a resolver checkpoint 0, refusing the ambiguous directories);
+the remote evaluation's refusal (exit 78, the line, the lock released; the run's log in full, the
+retry); a remote self-play worker refusing while the run plays every game; selfplay_digest playing
+a narrower checkpoint (the opt-out).
 
 ## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
 
@@ -1164,7 +1285,9 @@ the payload's `"episodes"` list and send `[{"result": [...], "scores": [...]}, .
 * **PAUSE / STOP / the supervisor / kill_run** work on the one process (a PAUSE noticed on the
   main thread stops the resolver thread first). `fork_run --source` copies a co-training run with
   both networks (at an iteration where both have a checkpoint). **Bootstrap**: iteration 0 = a
-  fresh primary network and a fresh resolver network, or `resolver_init`.
+  fresh primary network and a fresh resolver network, or `resolver_init`; a checkpoint 0 of either
+  network already there (e.g. a primary forked into the run) is kept, never overwritten (10.4).
+  Both networks' checkpoints are checked by the encoding guard at every start (10.4).
 * **NonFinite names the network** (`primary net (<game>): ...`, `resolver net (<game>): ...`);
   quarantined shards and failing batches go to `<run>/debug/` or `<run>/resolver/debug/`.
 

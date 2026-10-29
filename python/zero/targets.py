@@ -45,7 +45,7 @@ from .protocol import concat_samples
 def selfplay_samples(model, game, spec, games, seat, seed=0, conc=None, threads=3, device='cpu'):
     """Self-play `games` games with network `model` (a path) and seat dict `seat`. ->
     (results sorted by gid, concatenated samples)."""
-    m, _ = load(model, device)
+    m, _ = load(model, device, game=game)
     ev = NetEvaluator(m, device)
     drv = G.Driver(game, [[seat, seat]] * games, spec=spec, concurrency=conc or games, seed=seed, record=True,
                    threads=threads, groups=2, max_steps=5000)
@@ -183,7 +183,7 @@ def compare(model, game=None, spec=None, games=100, sims=128, sims_fast=32, p_fu
 def prior_positions(model, game, spec, n, seed=0, keep=0.15, device='cpu'):
     """`n` positions (decisions with >= 2 options) from games in which both seats sample the
     network prior."""
-    m, _ = load(model, device)
+    m, _ = load(model, device, game=game)
     ev = NetEvaluator(m, device)
     rng = np.random.default_rng(seed)
     out, k = [], 0
@@ -252,7 +252,7 @@ def quality(model, game=None, spec=None, positions=300, sims=128, reps=2, ref_si
     game, spec = _game_spec(game, spec)
     t0 = time.time()
     gs = prior_positions(model, game, spec, positions, seed, device=device)
-    m, _ = load(model, device)
+    m, _ = load(model, device, game=game)
     ev = NetEvaluator(m, device)
     names = ['prior', 'visits'] + [f'cq c_scale {cs:g}' for cs in c_scales] + ['greedy Q']
     acc = {k: {'regret': [], 'best_mass': [], 'argmax_best': []} for k in names}

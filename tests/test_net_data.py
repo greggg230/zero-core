@@ -53,7 +53,8 @@ def test_save_load_widen(tmp_path):
     m = Net(F - 10, A - 2, hidden=32, blocks=2).eval()
     p = str(tmp_path / 'm.pt')
     save(m, p, {'iter': 3})
-    m2, extra = load(p)
+    # (a test network of no game of this build: the encoding guard's opt-out, as widen's callers)
+    m2, extra = load(p, allow_mismatch=True)
     assert extra['iter'] == 3
     x = torch.randn(5, F)
     n = torch.full((5,), 2)
@@ -315,7 +316,7 @@ def test_gridnet_heads_save_load_widen(tmp_path):
     assert d[:, 7].min() > 0
     path = str(tmp_path / 'g.pt')
     save(m, path, {'iter': 1})
-    m2, _ = load(path)
+    m2, _ = load(path, allow_mismatch=True)               # (a test network: the guard's opt-out)
     assert type(m2).__name__ == 'GridNet' and m2.config == m.config
     with torch.no_grad():
         assert torch.allclose(m2(x, n)[0], p, atol=1e-6)
@@ -578,7 +579,7 @@ def test_tokennet_save_load_widen_train_step(tmp_path):
         p = m(x, n)
     path = str(tmp_path / 't.pt')
     save(m, path, {'iter': 2})
-    m2, extra = load(path)
+    m2, extra = load(path, allow_mismatch=True)           # (a test network: the guard's opt-out)
     assert type(m2).__name__ == 'TokenNet' and m2.config == m.config and extra['iter'] == 2
     assert type(build(m.config)).__name__ == 'TokenNet'
     with torch.no_grad():
@@ -683,7 +684,7 @@ def test_tokennet_actions_by_identity_save_load_widen(tmp_path):
     x, n = tok_x(6, 7), torch.full((6,), 2)
     path = str(tmp_path / 'id.pt')
     save(m, path, {'iter': 1})
-    m2, _ = load(path)
+    m2, _ = load(path, allow_mismatch=True)               # (a test network: the guard's opt-out)
     with torch.no_grad():
         assert all(torch.equal(a, b) for a, b in zip(m(x, n), m2(x, n)))
         w = widen(m2, TOK_F + 2, TOK_A + 4)
@@ -736,7 +737,7 @@ def test_tokennet_widen_across_a_layout_change(tmp_path):
     assert w.config['layout'] == lay2 and w.n_tok == m.n_tok and w.ptr.out_features == m.ptr.out_features
     path = str(tmp_path / 'w.pt')
     save(w, path)
-    w2, _ = load(path)
+    w2, _ = load(path, allow_mismatch=True)               # (a test network: the guard's opt-out)
     x = tok_x(40, 32)
     n = torch.randint(2, 5, (40,))
     with torch.no_grad():

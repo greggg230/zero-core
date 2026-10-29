@@ -13,7 +13,9 @@
   a STOP file appearing while it waits ends the supervisor (the run stays paused);
 * asks Windows not to sleep while it is running (also while paused: Resume from a phone
   needs the desktop awake);
-* stops when the run exits cleanly (finished, or a STOP file in the run dir);
+* stops when the run exits cleanly (finished, or a STOP file in the run dir), and when it
+  refuses its checkpoint (exit status 78, runctl.EXIT_REFUSED: a network of another encoding
+  than this build's, docs/az.md 10.4 - restarting would refuse again);
 * optional stall watchdog (<P>_SUPERVISE_STALL seconds, default 0 = off): a run whose progress
   files (progress.json, log.txt, stdout.txt) have not changed for that long while no PAUSE is
   requested is killed (with its workers) and restarted like a crash - a hung run (e.g. a
@@ -186,6 +188,11 @@ def main(argv=None):
         if os.path.exists(stop):
             log(run, 'STOP file present; not restarting')
             runctl.write_state(run, 'supervisor', state='done', run_pid=None)
+            return
+        if code == runctl.EXIT_REFUSED:
+            log(run, f'the run REFUSED its checkpoint (exit code {code}: a network of another encoding than this '
+                     f"build's, see log.txt; docs/az.md 10.4): not restarting, supervisor done")
+            runctl.write_state(run, 'supervisor', state='refused', run_pid=None)
             return
         if code == runctl.EXIT_PAUSED or runctl.pause_requested(run):
             log(run, f'run paused (exit code {code}): waiting for the PAUSE file to be removed '

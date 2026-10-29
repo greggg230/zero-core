@@ -93,9 +93,11 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     2, ...}; {} = the default rule; None = its checkpoint's run's eval_select, `run_rule`).
     `move_log`: the driver's move log (the first N moves of each game in its row), `rows`: the
     games' result rows under 'rows'."""
-    ma, _ = load(a, device)
-    mb, _ = load(b, device)
+    # (the encoding guard, docs/az.md 10.4: A against the game played, B against its own game,
+    # which must be the same)
+    ma, _ = load(a, device, game=game)
     game = game or ma.config.get('game', 'toy')
+    mb, _ = load(b, device)
     if mb.config.get('game', game) != game:
         raise ValueError(f'{a} plays {game}, {b} plays {mb.config.get("game")}')
     spec = package.active().specs.get(game) if spec is None else spec

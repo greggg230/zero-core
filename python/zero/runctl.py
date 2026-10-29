@@ -14,9 +14,9 @@ Two control files in a run directory:
 State files, written atomically and read by the dashboard and tools/pause_run.py:
 
 * <run>/run_state.json        - the run process: pid, started (process creation time),
-  state (running | pausing | paused | done | aborted), since, and the pause timings
+  state (running | pausing | paused | done | aborted | refused), since, and the pause timings
 * <run>/supervisor_state.json - tools/supervise.py: pid, started, state (running | paused |
-  resuming | restarting | done), run_pid, since
+  resuming | restarting | done | refused), run_pid, since
 
 `run_status(run)` combines them with the control files and the processes' liveness into one
 state: running / pausing / paused / resuming / starting / restarting / stopping / stopped
@@ -30,6 +30,8 @@ import time
 PAUSE = 'PAUSE'
 STOP = 'STOP'
 EXIT_PAUSED = 75                  # sysexits EX_TEMPFAIL: "try again later"
+EXIT_REFUSED = 78                 # sysexits EX_CONFIG: the run refused its checkpoint (a network of another
+                                  # encoding than this build's, docs/az.md 10.4): no restart fixes that
 STATE_FILES = {'run': 'run_state.json', 'supervisor': 'supervisor_state.json'}
 
 
@@ -215,6 +217,8 @@ def run_status(run):
         st = 'stopped'
         rst = (rs or {}).get('state')
         detail = {'done': 'Finished, or ended by STOP.', 'aborted': 'Aborted (see the log).',
+                  'refused': "Refused its checkpoint: a network of another encoding than this build's (see the "
+                             'log; tools/fork_run.py widens a run onto a new encoding).',
                   'paused': 'Paused, and the PAUSE file is gone, but no supervisor is running: relaunch it.'
                   }.get(rst, 'No run process (killed or crashed).')
     out.update(state=st, detail=detail)

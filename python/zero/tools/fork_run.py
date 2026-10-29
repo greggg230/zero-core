@@ -3,8 +3,12 @@
   python tools/fork_run.py <src.pt> <new run dir> [--game toy]
       A NEW run whose iteration 0 is the source network widened to the game's current
       feature / action counts (new inputs get zero weights: it computes what the source did); a
-      token network follows the game's object layout if it changed (docs/az.md 10.3).
-      Settings: the new run's own flags when it is started.
+      token network follows the game's object layout if it changed (docs/az.md 10.3), a conv
+      network the game's board grid. The source may be a network of an older encoding (the
+      way to move a run across an encoding change: the encoding guard refuses to resume it,
+      docs/az.md 10.4); the fork is checked against this build's encoding before it is written
+      (--game: the fork's game, recorded in its config). Settings: the new run's own flags when
+      it is started.
 
   python tools/fork_run.py --source runs/a --dest runs/b [--iter K] [--set reuse=8 ...] [--copy]
       A CONTINUATION of a (possibly live) run at its checkpoint K (default: the newest): the
@@ -33,19 +37,25 @@ def parse_value(v):
 def new_run(src, run, game=None):
     import torch  # noqa: F401
     from .. import games
-    from ..net import load, save, widen
+    from ..net import check_encoding, layout_sans_identity, load, save, widen
     from .. import package
-    old, extra = load(src)
-    info = games.info(game or old.config.get('game', 'toy'))
-    grid = package.active().grids.get(game) if game and old.config.get('arch') == 'grid' else None
+    # the source may be a network of an older encoding: the widen's purpose (the encoding guard's
+    # opt-out; what is written is checked, docs/az.md 10.4)
+    old, extra = load(src, allow_mismatch=True)
+    target = game or old.config.get('game', 'toy')
+    info = games.info(target)
+    grid = package.active().grids.get(target) if old.config.get('arch') == 'grid' else None
     # a token network follows the game's object layout as it is now (a layout change: widened
     # segment by segment, docs/az.md 10.3; the same layout: as before)
-    layout = package.active().tokens_of(game or old.config.get('game', 'toy')) if old.config.get('arch') == 'tokens' else None
+    layout = package.active().tokens_of(target) if old.config.get('arch') == 'tokens' else None
     new = widen(old, info['num_features'], info['num_actions'], grid=grid, layout=layout)
+    if game and new.config.get('game') != game:
+        new.config['game'] = game                  # (widen keeps the source's game: the fork plays --game)
+    check_encoding(new.config, target, f'fork of {src}')
     os.makedirs(os.path.join(run, 'models'), exist_ok=True)
     out = os.path.join(run, 'models', 'iter_0000.pt')
     save(new, out, {'iter': 0, 'forked_from': os.path.abspath(src), 'source_extra': extra})
-    moved = layout is not None and new.config['layout'] != old.config['layout']
+    moved = layout is not None and layout_sans_identity(new.config['layout']) != layout_sans_identity(old.config['layout'])
     print(f'{src} ({old.config["features"]} features, {old.config["actions"]} actions) -> {out} '
           f'({new.config["features"]} features, {new.config["actions"]} actions'
           + (', across a token layout change' if moved else '') + ')')

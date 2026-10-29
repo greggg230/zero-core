@@ -93,9 +93,16 @@ def main(argv=None):
     net = _mod(a.package, 'net')
     out = {'package': a.package, 'root': os.path.abspath(a.root), 'engine': os.path.abspath(G.engine().__file__)}
     if a.model:
-        model, extra = net.load(a.model, 'cpu')
+        # the encoding guard's opt-out (docs/az.md 10.4): an old-vs-new comparison may play a
+        # checkpoint on a build of another encoding on purpose (checkouts from before the guard
+        # have no such argument)
+        import inspect
+        opt = {'allow_mismatch': True}
+        model, extra = net.load(a.model, 'cpu', **(opt if 'allow_mismatch' in inspect.signature(net.load).parameters
+                                                   else {}))
         game = a.game or model.config.get('game', 'toy')
-        ev = infer.NetEvaluator(model, 'cpu')
+        ev = infer.NetEvaluator(model, 'cpu', **(opt if 'allow_mismatch' in
+                                                 inspect.signature(infer.NetEvaluator).parameters else {}))
         out['evaluator'] = {'model': os.path.abspath(a.model), 'iter': extra.get('iter'), 'config': model.config}
     else:
         game = a.game or 'toy'

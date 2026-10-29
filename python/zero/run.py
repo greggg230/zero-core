@@ -9,7 +9,10 @@ iterations' data (a RAM-bounded window), writes models/iter_i.pt (atomic), evalu
 against the yardstick (the run's anchor at Elo 1000: a built-in bot, or an external player
 such as 'ext:toyheur' / a game's 'ext:jsbot') and the random bot, plays Elo matches against
 the checkpoints i-1, i-2, i-4 ... i-32, refits the ratings and appends a line to
-metrics.jsonl. Resumes from the newest checkpoint. Settings: DEFAULTS (+ the game package's
+metrics.jsonl. Resumes from the newest checkpoint - unless its network was built for another
+encoding than this build's game feeds it: then the run refuses to start (zero.net's encoding
+guard, exit status 78 = runctl.EXIT_REFUSED, not restarted by the supervisor; docs/az.md 10.4;
+every checkpoint the run loads is checked so). Settings: DEFAULTS (+ the game package's
 overrides) < --preset (the core's toy presets + the game package's) < the run's config.json <
 flags given on this command line (saved).
 
@@ -48,9 +51,9 @@ from . import elo, games as G, package, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
-from .net import load, make_net, save
+from .net import EncodingMismatch, check_checkpoint, load, make_net, save
 from .protocol import MAX_SEATS
-from .runctl import EXIT_PAUSED, Paused
+from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
 
 BIG = 1 << 62                                      # a rolling driver's quota when its phases end by end_phase()
 
@@ -288,6 +291,23 @@ def value_q_at(cfg, it):
     return cfg['value_q'] * (min(1.0, it / w) if w else 1.0)
 
 
+def opt_state_mismatch(model, state):
+    """An optimizer state dict (AdamW's) that does not fit `model` -> why (the first parameter
+    whose moments have another shape, or the parameter count), else None. torch's own
+    load_state_dict checks the counts only."""
+    params = list(model.parameters())
+    groups = state.get('param_groups') or []
+    n = sum(len(g.get('params', [])) for g in groups)
+    if n != len(params):
+        return f'{n} parameters, the network has {len(params)}'
+    ids = [i for g in groups for i in g.get('params', [])]
+    for i, p in zip(ids, params):
+        for k, v in (state.get('state', {}).get(i) or {}).items():
+            if torch.is_tensor(v) and v.dim() > 0 and tuple(v.shape) != tuple(p.shape):
+                return f'{k} of parameter {i}: {tuple(v.shape)}, the parameter {tuple(p.shape)}'
+    return None
+
+
 def window_iters(cfg, it):
     return min(cfg['window'], 1 + it // 2) if cfg['window_grow'] else cfg['window']
 
@@ -329,7 +349,7 @@ class Run:
                         c.get('ff', 0))
 
     def evaluator(self, path):
-        m, _ = load(path, self.cfg['infer_device'])
+        m, _ = load(path, self.cfg['infer_device'], game=self.cfg['game'])
         return NetEvaluator(m, self.cfg['infer_device'], workers=self.cfg.get('infer_workers', 1))
 
     def nn_seat(self, key, sims, selfplay=False):
@@ -384,7 +404,7 @@ class Run:
                 self.roll = self.driver(table, seed=c['seed'] * 7919 + it, record=True, rolling=True, net=it - 1)
                 self.roll_ev = self.evaluator(model_path(self.run, it - 1))
             else:
-                m, _ = load(model_path(self.run, it - 1), 'cpu')
+                m, _ = load(model_path(self.run, it - 1), 'cpu', game=c['game'])
                 self.roll_ev.set_weights(m.state_dict())
             drv, ev = self.roll, self.roll_ev
             st0 = drv.stats()
@@ -471,7 +491,7 @@ class Run:
             self.roll_ev = self.evaluator(model_path(self.run, it - 1))
             self.held, self.enq, self.taken = deque(), 0, 0
         else:
-            m, _ = load(model_path(self.run, it - 1), 'cpu')
+            m, _ = load(model_path(self.run, it - 1), 'cpu', game=c['game'])
             self.roll_ev.set_weights(m.state_dict())
         drv, ev = self.roll, self.roll_ev
         st0 = drv.stats()
@@ -610,7 +630,7 @@ class Run:
         if dev == 'cuda' and not torch.cuda.is_available():
             dev = 'cpu'
         t0 = time.time()
-        model, _ = load(model_path(self.run, it - 1), dev)
+        model, _ = load(model_path(self.run, it - 1), dev, game=c['game'])
         model.train()
         opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'])
         opt_path = os.path.join(self.run, 'models', 'opt_latest.pt')
@@ -619,6 +639,11 @@ class Run:
             try:
                 o = torch.load(opt_path, map_location=dev, weights_only=False)
                 if o.get('iter') == it - 1:
+                    # (the state of this network: its moments as its parameters; another network's,
+                    # e.g. of another encoding, would load and fail at the first step, docs/az.md 10.4)
+                    bad = opt_state_mismatch(model, o['state'])
+                    if bad:
+                        raise ValueError(f'it belongs to another network ({bad})')
                     opt.load_state_dict(o['state'])
                     fresh = False
             except Exception as e:                 # noqa: BLE001
@@ -961,6 +986,10 @@ class Run:
         if start is None:
             save(self.new_model(), model_path(run, 0), {'iter': 0})
             start = 0
+        else:
+            # a resume: the newest checkpoint is a network of this build's encoding, or the run
+            # refuses to start (EncodingMismatch; exit status EXIT_REFUSED, docs/az.md 10.4)
+            check_checkpoint(model_path(run, start), c['game'])
         done = {m['iter'] for m in read_metrics(run)}
         self.log(f'run {run} starting after iter {start}; cfg {json.dumps(c)}')
         if c.get('eval_remote'):
@@ -1211,6 +1240,13 @@ def main(argv=None):
         runctl.write_state(run, 'run', state='paused', pause_requested=pw.requested, pause_noticed=pw.seen,
                            workers_stopped=now, exited=now)
         raise SystemExit(EXIT_PAUSED)
+    except EncodingMismatch as e:
+        # a network of another encoding than this build's (docs/az.md 10.4): no restart fixes it
+        pw.close()
+        log(run, f'run REFUSED (exit status {EXIT_REFUSED}: the supervisor does not restart it): {e}')
+        runctl.write_state(run, 'run', state='refused', error=f'EncodingMismatch: {e}'[:1000])
+        print(f'EncodingMismatch: {e}', file=sys.stderr, flush=True)
+        raise SystemExit(EXIT_REFUSED)
     except BaseException as e:
         pw.close()
         log(run, f'run aborted: {type(e).__name__}: {e}')
