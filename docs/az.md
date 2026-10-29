@@ -26,14 +26,15 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `elo.py` | Bradley-Terry Elo over all results, the run's yardstick = 1000; one pool per evaluation move rule (`pool_dir`, `eval_tag`, `active_pool`), the Elo opponents (`opponents`: evaluations back, or raw `elo_offsets`; section 5.4) |
 | `runctl.py` | PAUSE / STOP files, exit status 75, run / supervisor state files, `PauseWatch` |
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
-| `bench.py` | Throughput measurements |
+| `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5) |
+| `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`) |
 | `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
 | `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
-| `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`) | Unattended runs, control, forks; each repo's `tools/<name>.py` activates its package and calls `main()` |
+| `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
 
 Repository tools (`tools/`): `build_engine.sh` (the PyO3 build every repo's `build_py.sh`
 calls), `build_py.sh` (the core's toy module), `smoke_all.sh` (core tests + each game's
@@ -64,6 +65,8 @@ python tools/pause_run.py runs/toy1      # pause within seconds (exit 75; the su
 python tools/kill_run.py runs/toy1       # hard stop: the supervisor, then the run (pids from the state files; --scan)
 python tools/fork_run.py runs/toy1/models/iter_0010.pt runs/toy2          # new run from a checkpoint (widened; across a token layout change: 10.3)
 python tools/fork_run.py --source runs/toy1 --dest runs/toy1b --iter 10 --set reuse=8   # continue at K
+python tools/distill.py runs/toy1/models/iter_0010.pt big.pt --data runs/toy1/data --hidden 256 --blocks 6   # section 13
+python tools/fork_run.py --source runs/toy1 --dest runs/toy1big --iter 10 --net big.pt  # continue at K with it
 ```
 
 Settings: `run.DEFAULTS` (+ the game package's overrides) < `--preset` < the run's saved
@@ -1231,6 +1234,41 @@ GPU and the Mac). Tier "core behaviour, byte-identical defaults for matching che
   v4 `ab2-cqscale03/iter_0137` refused at run resume (exit 78) and by the evaluator, delver2's v5
   `iter_0000` accepted by both.
 
+### 10.5 What a bigger token network costs (MTG Zero's Delver positions; desktop CPU, 2026-10-29)
+
+`python -m <pkg>.az.bench infer --arch tokens --hidden D --blocks L --heads H --ff FF --shard S ...
+--batches 96,192,384 --workers W --torch-threads T --ops` (the bench's new options: real positions
+from shards, concurrent batches on threads as `infer_workers` runs them, the operators and
+multiply-adds of one forward pass). MTG Zero's layout v5 (37,620 features, 1,024 actions), rows of
+its Delver mirror run's shards (runs/delver2 iterations 19 and 21: 17 tokens a row on average);
+the desktop's i9-13900K at below-normal priority beside other runs, 5 s per cell, the mean of two
+rounds; heads of 32 floats, feed-forward 2 x width:
+
+| network | parameters | multiply-adds / leaf | kernels / forward (batch 96 / 192) | 2 workers x 3 threads, batch 192 | 1 x 3, batch 96 / 192 / 384 | 1 x 1, batch 192 |
+|---|---:|---:|---:|---:|---:|---:|
+| 128 x 4 (MTG Zero's) | 1.55M | 21.9M | 515 / 585 | 4,627 | 3,290 / 3,250 / 4,280 | 1,622 |
+| 128 x 8 | 2.08M | 39.9M | 595 / 705 | 2,918 (1.59x) | 1,954 / 1,960 / 2,742 | 980 (1.66x) |
+| 192 x 6 | 3.59M | 65.5M | 555 / 645 | 1,996 (2.32x) | 1,497 / 1,500 / 1,540 | 642 (2.53x) |
+| 192 x 8 | 4.18M | 85.1M | 595 / 705 | 1,536 (3.01x) | 1,072 / 1,040 / 1,580 | 526 (3.09x) |
+| 256 x 6 | 5.93M | 112.8M | 555 / 645 | 1,114 (4.16x) | 894 / 941 / 1,232 | 379 (4.28x) |
+| 256 x 8 | 6.98M | 147.1M | 595 / 705 | 864 (5.36x) | 670 / 716 / 928 | 314 (5.16x) |
+
+(leaves per second; in brackets the cost per leaf against 128 x 4.)
+
+* **On a CPU the cost follows the arithmetic**: 2.3x per leaf for 192 x 6 (3.0x the multiply-adds),
+  4.2x for 256 x 6 (5.1x), 5.4x for 256 x 8 (6.7x). At width 128 the small operators still take a
+  share (10.1), so the ratios stay below the multiply-adds'; the bigger networks are arithmetic.
+  Concurrent batches (`infer_workers`) help every size alike.
+* **The operators barely change**: a forward pass dispatches 515 kernel-launching operators at
+  128 x 4 (batch 96: two chunks of rows), 555 at 6 layers of any width, 595 at 8, and 14 host syncs
+  (the packing's `nonzero` per segment, the chunks' lengths) in every size. Eager CUDA inference of
+  this network is bound by its operators, its syncs and the per-row work (the 37,620-float rows'
+  upload, the packing) rather than by its arithmetic: MTG Zero's desktop self-plays at 5-6k leaves/s
+  at batches of 96 and of ~384 alike (its ENGINE.md 54.11, 62). So a wider network costs the GPU
+  little and a deeper one a few percent per layer (+8% operators at 6 layers, +16% at 8); not
+  measured on the GPU (busy with the runs). MTG Zero's throughput plan for a bigger network: its
+  ENGINE.md 62.
+
 ## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
 
 MTG Zero's team cube draft (its DESIGN.md 2.3, 5.1) is a game whose result is decided outside
@@ -1812,3 +1850,146 @@ evaluation rule; now they are two settings (1.2, 5.4).
   select_c_scale 0.3 plays exactly the games of one at `cq_c_scale` 0.3.
 * h2h per side (both flags, the side's over the both-sides', over a run's rule, the errors),
   replays with the transform, the command line's `none`.
+
+## 13. Distillation: a bigger network that starts where the run is (`zero/distill.py`, `tools/distill.py`; MTG Zero's Delver line, 2026-10-29)
+
+**Why.** A run whose network has plateaued may be bound by the network's capacity (MTG Zero's Delver
+mirror, runs/delver2: a 128 x 4 token network at ~86-90% against its heuristic and about +1 Elo an
+iteration in 400-game head-to-heads; its ENGINE.md 62). A bigger network trained from scratch would
+replay the whole run; a bigger network **distilled** from the run's checkpoint starts where the run is.
+`distill` trains a fresh network of the new size - any width, depth or architecture of this build's
+encoding - on the run's own sample shards to compute what the checkpoint computes, and the run then
+continues from it (13.3).
+
+### 13.1 The method
+
+* **The student** (`new_student(teacher, arch, hidden, blocks, heads, ff, ch, seed, game)`): `make_net`
+  for the teacher's game with this build's encoding (the feature / action counts, the game package's
+  token layout - its version recorded - or board grid), seeded; a token network's policy starts
+  uniform as always (10).
+* **The positions**: a `data.Window` over the shards (RAM-bounded as the run's: each shard
+  subsampled at one rate), every shard checked to be of this build's encoding (its meta's game,
+  feature and action counts: the student reads this build's inputs). Held out: other shards (default
+  the last one given), never trained on.
+* **The teacher's answers** (`outputs(model, W)`): once per window row, as the search sees them - the
+  policy as probabilities over the row's legal actions (one float per option, aligned with the
+  window's `opt_action`; the evaluator's segment softmax: equal to `NetEvaluator`'s answers, tested),
+  P(win) per seat present, the margin. `Taught(W, T)` adds their dense forms to the window's batches,
+  so `data.batches` prefetches them as the run's training does.
+* **The loss** (`losses`; w = `teacher_w`): policy (1 - w) CE(pi, p_s) + w CE(p_t, p_s) over the
+  legal actions; value (1 - w) CE((1 - vq) z + vq q, v_s) + w CE(v_t, v_s) over the seats present;
+  margin `margin_w` ((1 - w) |sc - m_s|^2 + w |m_t - m_s|^2) / 2. **w = 1 (the default) is pure
+  distillation**: the student learns the teacher's function - its whole policy over the legal actions
+  and its value estimate, where a shard's z is one game's 0 / 1 - so the warm start is the teacher,
+  not a sibling trained on the same last few iterations; w = 0 is the run's own supervised loss on
+  the shards (tested equal). AdamW, gradient-norm clip 5, the non-finite check before every step
+  (4.1), a linear warm-up, then a cosine decay to `lr_min`.
+* **Agreement** (`agreement(S, T, W)`, on held-out rows): KL(teacher || student) of the policies over
+  the legal actions (nats; the mean and the 90th percentile over the decisions with at least 2 legal
+  actions), the share of them whose argmax agrees (top-1), the squared and absolute differences of
+  P(win) over the seats present, the margin's squared difference, and each network's losses against
+  the shards' own targets (policy cross-entropy against pi, value cross-entropy against z, value
+  accuracy). A network against itself: 0, 1.0, 0 (tested).
+
+### 13.2 Why not a function-preserving widen
+
+Net2Wider / Net2Deeper growth would give the bigger network the teacher's function exactly, with no
+training at all. **Depth** is clean for this pre-norm transformer: a block whose attention output and
+second feed-forward layer are zero adds nothing (x + 0 + 0), and its other weights can be random, so
+it learns from its first step. **Width** is not: the blocks' LayerNorms average over the width, so new
+residual channels must keep every token's mean and variance - only exact duplicates do ([h, h]: width
+x 2 only, the heads doubled at the same head size, every reader of the stream halved) - and duplicated
+units train in lockstep (with an even split their gradients and AdamW's updates stay identical for
+ever; uneven splits drift apart only slowly, at second order), so the network keeps the old one's
+capacity until noise, which breaks the exactness, separates them. Distillation has neither problem:
+any size (192 is not 2 x 128), any architecture (an MLP into a token network, tested), a fresh network
+that uses all of its capacity, and the same tool for every game. Its costs are a training phase (MTG
+Zero's 192 x 6: an estimated 35-50 minutes on the desktop GPU, its ENGINE.md 62.6) and a fidelity short of
+exact, which the held-out agreement and a head-to-head against the teacher measure before a run uses
+the student.
+
+### 13.3 The tool, and continuing a run from the student
+
+```
+python tools/distill.py TEACHER.pt OUT.pt --data runs/a/data [--heldout runs/a/data/iter_K/r00_000.npz] \
+    --hidden 192 --blocks 6 --heads 6 --ff 384 [--arch tokens] --steps 12000 --batch 512 --lr 1e-3 \
+    --warmup 500 --ram-budget-gb 24 --eval-every 1000 --save-every 2000 --keep-best --device cuda \
+    [--resume | --init S.pt]
+python tools/distill.py --compare OUT.pt TEACHER.pt --data runs/a/data/iter_K/r00_000.npz   # agreement only
+python tools/fork_run.py --source runs/a --dest runs/a-big --iter K --net OUT.pt [--set ...]
+```
+
+* `distill.py` (its module docstring): the student's size (default the teacher's: `--hidden`,
+  `--blocks`, `--heads`, `--ff`, `--arch`, `--ch`), the training (`--steps` or `--epochs`, `--batch`,
+  `--lr`, `--lr-min`, `--warmup`, `--wd`, `--teacher-w`, `--value-q`, `--margin-w`), the window
+  (`--ram-budget-gb`, `--heldout-rows`), held-out evaluations every `--eval-every` steps (with
+  `--keep-best` also `OUT.best.pt`, the student at its lowest held-out KL), `OUT.pt.partial` (student,
+  optimizer, step) every `--save-every` and `--resume` from it, `--init S.pt` (a further distillation
+  from a student: its size, its weights), a JSON line
+  per report on stdout and in `OUT.pt.log.jsonl`, below-normal priority. OUT.pt is a normal
+  checkpoint, checked by the encoding guard before it is written; its `extra` records
+  `distilled_from`, `teacher_sha256`, `teacher_extra` and `distill` (the settings, both networks'
+  sizes, the shards, every held-out agreement).
+* **`fork_run --source --net`**: a continuation (2) of the run at K with the student as its
+  checkpoint K (checked by the guard for the run's game), **without the source's optimizer state**
+  (it belongs to the source's network: the fork's first training starts a fresh AdamW with its
+  warm-up), **K's Elo results dropped** from every pool (they rated the source's network;
+  ratings.json is refit at the fork's next evaluation) and the network's size in the fork's
+  config.json (`arch`, `hidden`, `blocks`, `heads`, `ff` / `ch`); the window's shards, the
+  checkpoints before K and the metrics as in any continuation. Nothing in the run loop changed: a
+  run resumes the student like any checkpoint (its size comes from its config), so an A/B of a
+  bigger network is a fork with `--net` against the plain continuation of the source on one build
+  (MTG Zero's ENGINE.md 62.6). `fork_run OUT.pt <new run>` makes it iteration 0 of a new run instead
+  (no window, a new Elo pool).
+
+### 13.4 Measured
+
+* **Toy** (the tests' setting, CPU): a random 64 x 2 MLP teacher's answers on 3,471 toy positions
+  (120 games), 1,145 positions of 40 other games held out; 300 steps of 128 rows. A 32 x 2 token
+  student (another architecture): KL 0.077 -> 0.0087, top-1 0.12 -> 0.92, P(win) squared error 0.0109
+  -> 0.0003; a 128 x 3 MLP student: KL 0.095 -> 0.0034, top-1 0.18 -> 0.94, 0.0136 -> 0.0002.
+* **MTG Zero's delver2** (its ENGINE.md 62.5; CPU, 23 minutes): its iteration-21 checkpoint (128 x 4,
+  1.55M parameters) into a 192 x 6 student (3.59M) on 79,427 rows of iterations 16-20, 2,500 steps of
+  256 rows; held out 8,192 rows of iteration 21: KL 0.595 -> 0.067 (p90 1.06 -> 0.17), top-1 0.69 ->
+  0.92, the P(win) difference 0.30 -> 0.053 (squared 0.122 -> 0.0075), the student's own policy
+  cross-entropy against the shards 0.946 -> 0.414 (the teacher's 0.352), value cross-entropy 0.70 ->
+  0.40 (0.377). The training KL ended at 0.026: on 79k rows the student fits its rows better than it
+  generalises, so the real distillation takes the whole window and more steps. Head to head on CPU
+  (48 games, 32 simulations, both sides at the line's 'cq' rule): the student **62.5% +- 7.0** against
+  its teacher (parity within 1.8 se: not weaker), the fresh 192 x 6 network 0 / 24.
+
+### 13.5 Tests and checks
+
+`tests/test_distill.py` (8): `outputs` are the evaluator's answers (several batches, a ragged last
+one); a network's agreement with itself is exact and another network's is not; a token and an MLP
+student converge to an MLP teacher on held-out shards; `teacher_w` 0 is the run's supervised loss
+and 1 the teacher's terms (the dense teacher policy sums to 1 over the legal actions only); the tool
+writes a checkpoint the guard accepts, with its record (the held-out curve at steps 0 / 100 / 200)
+and its log, resumes a partial checkpoint at its step, and `--compare` reproduces the last held-out
+KL; shards of another encoding are refused; a toy run's checkpoint 2 distilled into a bigger student
+on the run's own shards and forked with `--net` (the student bit for bit as checkpoint 2, no
+optimizer state, the size in config.json, K's Elo pairs gone from the fork and kept in the source),
+then one more iteration trains the student; a network of another game is refused by `--net`. MTG
+Zero: `test_a_bigger_network_distilled_on_delver_shards_reads_layout_v5`.
+
+**Checks** (c539d8f + 907bad6 on main edf4b89; desktop 2026-10-29, CPU only - MTG Zero's round-2
+A/B held the GPU and the Mac). Tier "opt-in core feature with byte-identical defaults": nothing on the
+run path changed (`run.py`, `net.py`, `data.py`, `infer.py`, `cotrain.py`, the Rust crates untouched;
+the diff is `distill.py`, `tools/distill.py`, `bench.py`, `fork_run.py`'s `--net`, the tests, these
+docs).
+
+* `cargo test --release`: zero_search 50 passed, zero_webnet 3; `pytest tests`: **208 passed** and the
+  2 CUDA tests skipped (12 min 53 s; the 8 above among them). Run with `CUDA_VISIBLE_DEVICES=` (empty)
+  those 2 fail - torch then sees the driver but no device - and they fail alike on edf4b89; with
+  `CUDA_VISIBLE_DEVICES=-1` they skip.
+* **Byte identity** against edf4b89 (its worktree zero-core-wt/ckpt-guard): `fork_run --source --iter 1
+  --set reuse=8` (no `--net`) of a toy MLP run and of a toy token run: the two continuations identical
+  file for file; `tools/check_checkpoint_compat.py --package zero` with a toy MLP checkpoint, a toy
+  token checkpoint, `random` and `uniform`: identical. MTG Zero: its delver2 iteration-21 checkpoint
+  on its e5483aa build against this core, identical (its ENGINE.md 62.7).
+* **The other games** build against it (build only, at their HEADs with this core in their
+  `third_party/zero-core`: the PyO3 crate, every test compiled, the package imported with this core and
+  its `zero.distill`): Glass Road Zero c1f56dc 67 s, Caverna Zero a6fad73 107 s, Kingdom Builder Zero
+  4202a4a 171 s.
+* MTG Zero (ENGINE.md 62.7): `--test az` 27 passed, pytest 49 (the new distillation test among them),
+  the CPU distillation and head-to-heads of 13.4.
