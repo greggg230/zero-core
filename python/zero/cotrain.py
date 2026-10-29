@@ -39,13 +39,15 @@ The run directory holds the primary as a single-game run does (`models/`, `data/
   data directories cleared); one interrupted after them finishes its evaluations; the resolver's
   remote evaluations without a result are queued again. PAUSE / STOP / the supervisor / kill /
   fork work on the one process.
-* `resolver_cfg['selfplay_remote']` (docs/az.md 11.6, zero/remoteplay.py): another machine plays a
-  share of the queued episodes with the resolver's checkpoint i-1 - a second consumer of the
-  coordinator's queue next to the resolver's driver here (which then keeps at most `local_cap`
-  episodes queued in its driver, so the rest stay takeable); their rows come back by tag, their
-  samples as shards into `resolver/data/iter_i/`; episodes the remote loses (its session broke) or
-  does not finish in time are requeued here, and a duplicate row is dropped. The primary's own
-  self-play (the drafting) stays here: the run's top-level `selfplay_remote` is refused.
+* `resolver_cfg['selfplay_remote']` (docs/az.md 11.6, zero/remoteplay.py, zero/workqueue.py):
+  another machine plays a share of the queued episodes with the resolver's checkpoint i-1 - a second
+  consumer of the coordinator's queue next to the resolver's driver here, each with its in-flight
+  cap (its throughput's share of the iteration's matches); the coordinator keeps the local driver's
+  room under its cap (`local_cap`) in reserve, so the remote takes only what is queued beyond it;
+  their rows come back by tag, their samples as shards into `resolver/data/iter_i/`; episodes the
+  remote loses (its session broke), gives back (it backed off) or does not finish in time are
+  requeued here, and a duplicate row is dropped. The primary's own self-play (the drafting) stays
+  here: the run's top-level `selfplay_remote` is refused.
 """
 import json
 import os
