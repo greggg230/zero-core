@@ -184,8 +184,10 @@ network batches go to `evaluators[key](lb)`, external batches to `externals[key]
 One list of seat dicts per game (players = its length):
 `{'bot': 'random' | 'heuristic' | ...}`, `{'external': '<key>'}`, or a network seat
 `{'key': 'm', 'sims', 'c_puct', 'selfplay', 'alpha', 'eps', 'temp_moves', 'sims_fast',
-'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale'}`
-(`games.nn_seat`; the last three only matter for recorded decisions, section 3.1). Evaluator keys: every distinct
+'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale',
+'select', 'select_min_visits'}` (`games.nn_seat`; `policy_target` only matters for recorded
+decisions, section 3.1; `select` and its guard for the moves the seat does not sample, section
+3.3; `cq_c_visit` / `cq_c_scale` are the completed-Q transform of both). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
 
@@ -247,6 +249,9 @@ samples are emitted when it ends.
 `{gid, n, over, result, scores, steps, decisions, ext_moves, rounds, samples, tag}`; a game cut
 at `max_steps` has `over` False and result 1/n each; `tag` is the tag of the queued setup the
 game started from (2.9), else None. A deferred game's row comes when it is resolved (2.8).
+With the driver's `move_log` N (a diagnostic, default 0 = off: nothing changes), a row also
+has `moves`: its first N real moves as `(seat, action, legal actions)` (the external seats'
+answers excluded; a resolved game's: none). `zero.h2h --move-log`.
 
 ### 2.6 Rolling mode
 
@@ -345,8 +350,9 @@ resolver driver is one (docs/az.md 11): it plays the episodes of parked games, t
   same; the budget is then divided by the game's `sims_divisor`, at least one); root Dirichlet
   noise on full self-play
   searches (also on a reused, already expanded root); self-play samples moves by visit count
-  for the first `temp_moves` searched decisions of the game, otherwise (and in evaluation)
-  argmax (N, P0) with the first maximum on ties; tree reuse: after a real move the tree
+  for the first `temp_moves` searched decisions of the game, otherwise (and in evaluation) by
+  the seat's move rule (section 3.3; the default argmax (N, P0) with the first maximum on
+  ties); tree reuse: after a real move the tree
   survives only for the seat that moved, if it decides again next, with `redet`, and if the
   child for (action, real chance key, next decision) exists.
 * **Value target** (training): `(1 - q) z + q q_root`, `q = value_q * min(1, iter /
@@ -414,6 +420,40 @@ is the same in all of them. The Python reference (`mcts.simulate`) does the same
 `Node(viewer, [])`; Rust and Python agree exactly where nothing is left to chance and
 statistically elsewhere (section 6). `ToyTeam::result()` panics at the terminal, so the tests
 prove the search never calls it.
+
+### 3.3 The move rule: visits or completed Q (`select`; 2026-10-28)
+
+A network seat's move that is not sampled - every move of an evaluation seat, and a self-play
+seat's after its first `temp_moves` searched decisions of the game - is chosen from the root's
+statistics by the seat's rule (`driver::Select`; the search and the recorded targets are the
+same whatever the rule):
+
+* `'visits'` (default): argmax (N, P0), the first maximum on exact ties - AlphaZero's rule and
+  the only one before the setting existed, bit for bit (`driver::tests::select_visits_and_the_
+  move_log_change_nothing`: the golden records and an evaluation match's digest, the same as on
+  zero-core 3c26d9f; a toy-smoke run byte for byte, docs/az.md 5.4).
+* `'cq'`: the argmax of the logits of the completed-Q target (section 3.1: `ln max(P0, floor)
+  + (cq_c_visit + max N) cq_c_scale completedQ`; Gumbel AlphaZero's final move is the argmax of
+  the same quantity over its considered actions) among the options with at least
+  `select_min_visits` visits - `min(select_min_visits, max N)`, so the most visited option always
+  qualifies; 0 (default) = every option, an unvisited one completed at v_mix - the first maximum
+  on exact ties. With few simulations the prior's favourite collects most visits even when the
+  search found it worse, and `visits` plays it anyway; `cq` lets the search's Q overrule it once
+  the Q gap outweighs the log-prior gap (sigma is ~(50 + max N) logits per unit of P(win)). Its
+  weak spot: a single-visit option with a lucky Q wins too - the guard (`select_min_visits` 2:
+  options seen at least twice) is the remedy, measured in MTG Zero's ENGINE.md 57.
+* No visits at all: both rules take the prior's argmax; no options: index 0.
+
+Code: `Select::choose(p0, n, w, v)` (driver.rs; the driver's `decide` and the bindings'
+`SearchTree.root_select(select, min_visits, c_visit, c_scale)` both call it), Python
+`mcts.select_index` / `select_node` (the reference; `play.PyDriver`'s 'py' seats use it, its
+'rs' seats the Rust tree's `root_select`), `mcts.select_tag` (the rule's name: 'visits', 'cq',
+'cq-n2' with a guard, 'cq-v25-s0.5' with another transform). Seat keys `select` ('visits' |
+'cq'), `select_min_visits` (cq's only: an error with 'visits'), and the transform `cq_c_visit`,
+`cq_c_scale` (shared with the cq target, as in Gumbel AlphaZero). Run settings: `eval_select`
+(every evaluation seat), `selfplay_select` (self-play after `temp_moves`) and their
+`*_min_visits` (docs/az.md 1.2, 5.4). Parity (section 6): the Python formula on Rust roots gives
+the Rust driver's move on every root and rule checked.
 
 ## 4. Bindings and registering a game
 
@@ -518,6 +558,14 @@ win (1e-9) and completed-Q targets (1e-6), with deferred leaves evaluated once p
 | 2v2, Rust c_puct 1.3 (power check) | 0.029 | 0.0029 | 0.0017 | 0.037 (0.016) |
 
 (Positions whose search is deterministic count as 0 for both; the others carry the noise.)
+
+**The move rule** (section 3.3; `python -m zero.parity select`, `parity.select_formula`,
+`tests/test_select.py`), 2026-10-28: on 8 toy positions searched by the Rust tree at 4, 8, 24
+and 64 simulations, the Python `select_index` on each root's P0 / N / W / network value gives
+the Rust driver's own move (`root_select`) for all 192 (position, simulations, rule) cases -
+'visits', 'cq' with guards 0, 1, 2 and 4, and transforms (50, 1), (10, 3), (50, 0.1); no
+near-ties - and the rules do differ on these roots (cq != visits, the guard != no guard).
+In games: H2H_SELECT_PLACEHOLDER
 
 `python -m zero.parity h2h --model M --games 6000 --sims 32`: Rust-tree seat vs Python-tree
 seat in `PyDriver`, the same network, seats alternating (docs/az.md 6.2): **49.94% +-1.04**

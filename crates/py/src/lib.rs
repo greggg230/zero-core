@@ -19,7 +19,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{sample_arrays, Batch, DriverCfg, KeyKind, NnSeat, PolicyTarget, SeatCfg};
+use zero_search::driver::{sample_arrays, Batch, DriverCfg, KeyKind, NnSeat, PolicyTarget, SeatCfg, Select};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
 use zero_search::{SearchGame, MAX_SEATS};
 
@@ -140,7 +140,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -193,6 +193,9 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         margin_w: get(d, "margin_w", 0.0f64)?,
         redet: flag(d, "redet", true)?,
         policy_target,
+        // the rule of the moves it does not sample: 'visits' (default) | 'cq' with the guard
+        // select_min_visits and the completed-Q transform cq_c_visit, cq_c_scale (docs/search.md 3.3)
+        select: Select::parse(&get(d, "select", "visits".to_string())?, get(d, "select_min_visits", 0u32)?, get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?).map_err(verr)?,
     }))
 }
 
@@ -424,6 +427,14 @@ impl PySearchTree {
     fn root_cq_target(&self, c_visit: f64, c_scale: f64) -> Vec<f32> {
         self.t.root_cq_target(c_visit, c_scale)
     }
+    /// The option index a driver's move rule chooses at the root (`select` 'visits' | 'cq' with
+    /// the guard `min_visits` and the completed-Q transform; docs/search.md 3.3): the driver's
+    /// own code (`Select::choose`), for the Python driver's 'rs' seats and the parity tests.
+    #[pyo3(signature = (select="visits", min_visits=0, c_visit=50.0, c_scale=1.0))]
+    fn root_select(&self, select: &str, min_visits: u32, c_visit: f64, c_scale: f64) -> PyResult<usize> {
+        let sel = Select::parse(select, min_visits, c_visit, c_scale).map_err(verr)?;
+        Ok(self.t.root_select(&sel))
+    }
     /// Children of root option i: [(chance key, decider)].
     fn edge_kids(&self, i: usize) -> Vec<(Vec<u64>, usize)> {
         self.t.edge_kids(i)
@@ -449,9 +460,9 @@ pub struct PySearchDriver {
 #[pymethods]
 impl PySearchDriver {
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool) -> PyResult<Self> {
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32) -> PyResult<Self> {
         let spec = spec_json(spec)?;
         let mut keys = Vec::new();
         let mut table: Vec<SeatCfg> = Vec::new();
@@ -472,7 +483,7 @@ impl PySearchDriver {
             }
             games.push(ix);
         }
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only };
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
         Ok(PySearchDriver { d, nfeat })
@@ -573,6 +584,10 @@ impl PySearchDriver {
             d.set_item("rounds", r.rounds)?;
             d.set_item("samples", r.samples)?;
             d.set_item("tag", r.tag)?;
+            if !r.moves.is_empty() {
+                // DriverCfg::move_log (a diagnostic): [(seat, action, legal actions)]
+                d.set_item("moves", r.moves)?;
+            }
             out.append(d)?;
         }
         Ok(out)

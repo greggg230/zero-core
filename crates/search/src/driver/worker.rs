@@ -265,6 +265,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.rq.clear();
     slot.pending = None;
     slot.ext_payload = None;
+    slot.moves.clear();
     Ok(())
 }
 
@@ -421,14 +422,12 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         }
         i
     } else {
-        // max by (N, P0), first maximum on exact ties
-        let mut best = 0;
-        for k in 1..nv.len() {
-            if (nv[k], p0[k]) > (nv[best], p0[best]) {
-                best = k;
-            }
+        // the seat's rule (docs/search.md 3.3): argmax (N, P0) by default, or the completed-Q
+        // logits' argmax (Select::choose, the code SearchTree.root_select runs)
+        match seat.select {
+            Select::Visits => argmax_visits(&nv, &p0),
+            sel => sel.choose(&p0, &nv, &tree.values(root), tree.value0(root)),
         }
-        best
     };
     let a = acts[i];
     let rec = cfg.record && seat.selfplay && slot.full;
@@ -454,6 +453,10 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
     let gid = slot.gid;
     let g = slot.game.as_mut().unwrap();
     let p = g.to_move().ok_or("internal: move in a finished game")?;
+    if (slot.moves.len() as u32) < cfg.move_log {
+        // (the move log, a diagnostic: every caller has the decision's legal actions in slot.legal)
+        slot.moves.push((p as u8, a, slot.legal.clone()));
+    }
     transition_with(g, a, None, key, &mut slot.legal, |q| !is_external(cfg, gid, q)).map_err(|e| format!("move {a} failed: {e}"))?;
     slot.legal_ok = true;
     slot.steps += 1;
@@ -492,7 +495,7 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
 fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>) -> Result<(), String> {
     let g = slot.game.take().unwrap();
     let over = g.to_move().is_none();
-    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves };
+    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves) };
     let records = std::mem::take(&mut slot.records);
     let rq = std::mem::take(&mut slot.rq);
     slot.drop_trees();
@@ -504,7 +507,7 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
         let payload = g.deferred_payload().map_err(|e| format!("deferred_payload: {e}"))?;
         let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(ParkedRecord::park).collect() } else { Vec::new() };
         let bytes = records.iter().map(|r| r.bytes()).sum::<usize>() as u64;
-        let Done { gid, tag, n, steps, decisions, ext_moves } = done;
+        let Done { gid, tag, n, steps, decisions, ext_moves, .. } = done;
         parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes });
         return Ok(());
     }
@@ -520,6 +523,7 @@ pub(super) struct Done {
     pub steps: u64,
     pub decisions: u32,
     pub ext_moves: u32,
+    pub moves: Vec<(u8, u16, Vec<u16>)>,
 }
 
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
@@ -548,6 +552,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         rounds: g.rounds(),
         samples: if emit { records.len() as u32 } else { 0 },
         tag: d.tag,
+        moves: d.moves,
     };
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();
