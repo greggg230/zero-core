@@ -27,6 +27,14 @@ before any loading (the random stream of the sequential load) and its features w
 their place in the one preallocated `x`: the window is the same, array for array, and the peak
 is the window plus the shards being loaded (it was twice the window: the per-shard copies, then
 their concatenation).
+
+WindowCache (run setting `window_cache`): the shards a run's windows keep between iterations, each
+shard's full arrays as loaded, so a window loads only the shards it has not seen (an iteration's
+window shares all but its newest iteration's shards with the last one). The window then points at
+the cached shards' features (no copy: `batch` gathers its rows shard by shard) and is the window
+of loading them all, array for array. Only while the window fits its budget (no subsample: the
+window is exactly its shards); a window over budget empties the cache and loads as without it.
+The cached shards stay in RAM between trainings (up to the budget), where a window was freed.
 """
 import glob
 import json
@@ -231,14 +239,85 @@ def _ranges(starts, lens):
     return np.arange(tot) - np.repeat(np.cumsum(lens) - lens, lens) + np.repeat(starts, lens)
 
 
+def _file_key(path):
+    st = os.stat(path)
+    return st.st_size, st.st_mtime_ns
+
+
+def _load_part(path, N, idx, F, xdst=None):
+    """One shard's part of a window: rows `idx` (None = all N), features cut / zero-padded to F
+    written into `xdst` (a fresh array when None: then also returned as 'x')."""
+    p = read_shard(path)
+    probs = shard_problems(p)
+    if probs:
+        raise NonFinite(f'non-finite sample values in shard {path} (meta {json.dumps(p["meta"])}): '
+                        + '; '.join(probs) + '. Move it out of the data directory (or rename it to '
+                        '*.bad.npz) to train without it')
+    if len(p['player']) != N:
+        raise ValueError(f'shard {path}: {len(p["player"])} rows, its meta says {N}')
+    if idx is None:
+        idx = np.arange(N)
+        sel = slice(None)
+    else:
+        sel = idx
+    out = {}
+    if xdst is None:
+        xdst = out['x'] = np.empty((len(idx), F), np.float16)
+    w = min(F, p['x'].shape[1])
+    xdst[:, :w] = p['x'][sel, :w]
+    if w < F:
+        xdst[:, w:] = 0
+    off = p['opt_off'].astype(np.int64)
+    lens = off[idx + 1] - off[idx]
+    pos = _ranges(off[idx], lens)
+    out.update(src=idx.astype(np.int32), player=p['player'][sel].astype(np.int64),
+               n_players=p['n_players'][sel].astype(np.int64), lens=lens,
+               opt_action=p['opt_action'][pos].astype(np.int64), pi=p['pi'][pos].astype(np.float32))
+    for key in ('z', 'q', 'sc'):
+        a = np.zeros((len(idx), MAX_SEATS), np.float32)
+        v = p[key][sel].astype(np.float32)
+        a[:, :v.shape[1]] = v
+        out[key] = a
+    return out
+
+
+def _run_all(fn, n, threads):
+    """[fn(k) for k in range(n)] on up to `threads` threads; the first failure in order is raised."""
+    t = max(1, min(threads or WINDOW_THREADS, n))
+    if t == 1:
+        return [fn(k) for k in range(n)]
+    with ThreadPoolExecutor(t) as ex:
+        futs = [ex.submit(fn, k) for k in range(n)]
+        return [f.result() for f in futs]
+
+
+class WindowCache:
+    """Shards kept between a run's windows (module docstring): path -> (its size and mtime, the
+    number of features, its part with the features of all its rows)."""
+
+    def __init__(self):
+        self.parts = {}
+
+    def clear(self):
+        self.parts.clear()
+
+    @property
+    def nbytes(self):
+        return sum(a.nbytes for _, _, part in self.parts.values() for a in part.values())
+
+
 class Window:
     """The training window in RAM. paths: shard files; `budget_rows`: keep at most this many
     samples (a uniform random share of every shard). A shard with a NaN / inf raises NonFinite.
-    `threads`: shards loaded at once (default WINDOW_THREADS); the result does not depend on it."""
+    `threads`: shards loaded at once (default WINDOW_THREADS); the result does not depend on it.
+    `cache`: a WindowCache (module docstring): used while the window fits its budget; `reused` =
+    the rows it supplied."""
 
-    def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, threads=None):
+    def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, threads=None, cache=None):
         self.F, self.A = num_features, num_actions
         self.paths = list(paths)
+        self.reused = 0
+        self._x = self._xs = None
         rng = np.random.default_rng(seed)
         rows = [shard_rows(p) for p in self.paths]
         total = sum(rows)
@@ -251,48 +330,24 @@ class Window:
         self.N = int(self.starts[-1])
         if self.N == 0:
             raise ValueError('empty training window')
-        self.x = np.empty((self.N, self.F), np.float16)
-
-        def load(k):
-            path, idx, N = self.paths[k], picks[k], rows[k]
-            p = read_shard(path)
-            probs = shard_problems(p)
-            if probs:
-                raise NonFinite(f'non-finite sample values in shard {path} (meta {json.dumps(p["meta"])}): '
-                                + '; '.join(probs) + '. Move it out of the data directory (or rename it to '
-                                '*.bad.npz) to train without it')
-            if len(p['player']) != N:
-                raise ValueError(f'shard {path}: {len(p["player"])} rows, its meta says {N}')
-            if idx is None:
-                idx = np.arange(N)
-                sel = slice(None)
-            else:
-                sel = idx
-            w = min(self.F, p['x'].shape[1])
-            dst = self.x[self.starts[k]:self.starts[k + 1]]
-            dst[:, :w] = p['x'][sel, :w]
-            if w < self.F:
-                dst[:, w:] = 0
-            off = p['opt_off'].astype(np.int64)
-            lens = off[idx + 1] - off[idx]
-            pos = _ranges(off[idx], lens)
-            out = {'src': idx.astype(np.int32), 'player': p['player'][sel].astype(np.int64),
-                   'n_players': p['n_players'][sel].astype(np.int64), 'lens': lens,
-                   'opt_action': p['opt_action'][pos].astype(np.int64), 'pi': p['pi'][pos].astype(np.float32)}
-            for key in ('z', 'q', 'sc'):
-                a = np.zeros((len(idx), MAX_SEATS), np.float32)
-                v = p[key][sel].astype(np.float32)
-                a[:, :v.shape[1]] = v
-                out[key] = a
-            return out
-
-        n_threads = max(1, min(threads or WINDOW_THREADS, len(self.paths)))
-        if n_threads == 1:
-            parts = [load(k) for k in range(len(self.paths))]
+        if cache is not None and keep >= 1.0:
+            keys = {path: (_file_key(path), self.F) for path in self.paths}
+            for path in list(cache.parts):         # gone from the window, rewritten, another width
+                if path not in keys or cache.parts[path][:2] != keys[path]:
+                    del cache.parts[path]
+            todo = [k for k, path in enumerate(self.paths) if path not in cache.parts]
+            loaded = _run_all(lambda j: _load_part(self.paths[todo[j]], rows[todo[j]], None, self.F), len(todo), threads)
+            for k, part in zip(todo, loaded):
+                cache.parts[self.paths[k]] = keys[self.paths[k]] + (part,)
+            self.reused = self.N - sum(rows[k] for k in todo)
+            parts = [cache.parts[path][2] for path in self.paths]
+            self._xs = [q['x'] for q in parts]
         else:
-            with ThreadPoolExecutor(n_threads) as ex:
-                futs = [ex.submit(load, k) for k in range(len(self.paths))]
-                parts = [f.result() for f in futs]          # the first failure in path order is raised
+            if cache is not None:
+                cache.clear()                      # over budget: subsampled shards are not cached
+            self._x = np.empty((self.N, self.F), np.float16)
+            parts = _run_all(lambda k: _load_part(self.paths[k], rows[k], picks[k], self.F,
+                                                  self._x[self.starts[k]:self.starts[k + 1]]), len(self.paths), threads)
         self.src_row = np.concatenate([q['src'] for q in parts])     # window row -> its row in its shard
         self.player = np.concatenate([q['player'] for q in parts])
         self.n_players = np.concatenate([q['n_players'] for q in parts])
@@ -305,8 +360,28 @@ class Window:
         self.q = np.concatenate([q['q'] for q in parts])
         self.sc = np.concatenate([q['sc'] for q in parts])
         self.loaded = total
-        self.nbytes = sum(a.nbytes for a in (self.x, self.player, self.n_players, self.opt_off, self.opt_action,
-                                             self.pi, self.z, self.q, self.sc))
+        xbytes = self._x.nbytes if self._x is not None else sum(a.nbytes for a in self._xs)
+        self.nbytes = xbytes + sum(a.nbytes for a in (self.player, self.n_players, self.opt_off, self.opt_action,
+                                                      self.pi, self.z, self.q, self.sc))
+
+    @property
+    def x(self):
+        """The features [N, F] float16 (from the cache: concatenated, a copy - tests, debugging)."""
+        return self._x if self._x is not None else np.concatenate(self._xs)
+
+    def features(self, idx):
+        """The features of window rows `idx`, float16 [len(idx), F]."""
+        if self._x is not None:
+            return self._x[idx]
+        idx = np.asarray(idx, np.int64)
+        sh = np.searchsorted(self.starts, idx, side='right') - 1
+        order = np.argsort(sh, kind='stable')       # the rows grouped by shard
+        cut = np.flatnonzero(np.diff(sh[order])) + 1
+        out = np.empty((len(idx), self.F), np.float16)
+        for g in np.split(order, cut):
+            k = sh[g[0]]
+            out[g] = self._xs[k][idx[g] - self.starts[k]]
+        return out
 
     def provenance(self, idx):
         """Window rows -> [(shard path, its rows in that shard, sorted)]."""
@@ -331,6 +406,6 @@ class Window:
         def norm(a):
             return a / np.maximum(a.sum(1, keepdims=True), 1e-8)
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device)
-        return {'x': t(self.x[idx].astype(np.float32)), 'mask': t(mask), 'pi': t(pi),
+        return {'x': t(self.features(idx).astype(np.float32)), 'mask': t(mask), 'pi': t(pi),
                 'z': t(norm(self.z[idx])), 'q': t(norm(self.q[idx])), 'sc': t(self.sc[idx]),
                 'n_players': t(self.n_players[idx])}

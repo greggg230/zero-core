@@ -157,6 +157,61 @@ def test_window_streams_shards_with_the_same_rows(tmp_path):
                 assert (other.N, other.loaded, other.nbytes) == (win.N, win.loaded, win.nbytes)
 
 
+def _random_shard(path_dir, name, N, rng, compress=0):
+    nopt = rng.integers(2, 6, size=N)
+    off = np.concatenate([[0], np.cumsum(nopt)])
+    s = {'x': rng.standard_normal((N, F)).astype(np.float32), 'player': rng.integers(0, 2, N),
+         'n_players': np.full(N, 2), 'opt_off': off, 'opt_action': rng.integers(0, A, off[-1]),
+         'pi': rng.random(off[-1]).astype(np.float32), 'z': rng.random((N, 8)).astype(np.float32),
+         'q': rng.random((N, 8)).astype(np.float32), 'sc': rng.random((N, 8)).astype(np.float32),
+         'net': np.zeros(N, np.int32)}
+    w = ShardWriter(str(path_dir), name, rows=10 ** 6, meta={'game': 'toy'}, compress=compress)
+    w.add(s)
+    w.close()
+    return str(path_dir / f'{name}_000.npz')
+
+
+def test_window_cache_is_the_same_window(tmp_path):
+    """A WindowCache (run setting window_cache): windows sliding over shards load only their new
+    shards and are the windows of loading everything, array for array and batch for batch; a
+    rewritten shard or another network width loads again; a window over budget empties the cache
+    and subsamples as without it."""
+    import time
+    from zero.data import WindowCache
+    rng = np.random.default_rng(9)
+    paths = [_random_shard(tmp_path, f's{k}', N, rng, compress=k % 2) for k, N in enumerate([400, 3, 250, 900, 60])]
+    keys = ('x', 'player', 'n_players', 'opt_off', 'opt_action', 'pi', 'z', 'q', 'sc', 'src_row', 'starts')
+
+    def same(a, b):
+        for k in keys:
+            u, v = getattr(a, k), getattr(b, k)
+            assert u.dtype == v.dtype and np.array_equal(u, v), k
+        assert (a.N, a.loaded, a.nbytes) == (b.N, b.loaded, b.nbytes)
+        idx = np.random.default_rng(a.N).integers(a.N, size=97)
+        ba, bb = a.batch(idx), b.batch(idx)
+        for k in ba:
+            assert torch.equal(ba[k], bb[k]), k
+
+    cache = WindowCache()
+    steps = [(paths[0:3], F, None, 0), (paths[1:4], F, None, 253), (paths[2:5], F, None, 1150),
+             (paths[2:5], F, 10 ** 6, 1210), (paths[2:5], F - 7, None, 0), (paths[2:5], F - 7, 500, 0),
+             (paths[1:4], F - 7, None, 0), (paths[1:4], F - 7, None, 1153)]
+    for k, (ps, nf, budget, reused) in enumerate(steps):
+        win = Window(ps, nf, A, budget_rows=budget, seed=k, cache=cache)
+        same(win, Window(ps, nf, A, budget_rows=budget, seed=k))
+        assert win.reused == reused, (k, win.reused)
+        if budget == 500:                  # over budget: subsampled, the cache emptied
+            assert win.N < 1210 and not cache.parts
+        else:
+            assert sorted(cache.parts) == sorted(ps) and cache.nbytes > 0
+    # a shard written again under the same name is loaded again
+    time.sleep(0.05)
+    _random_shard(tmp_path, 's2', 250, np.random.default_rng(10))
+    win = Window(paths[1:4], F - 7, A, seed=1, cache=cache)
+    same(win, Window(paths[1:4], F - 7, A, seed=1))
+    assert win.reused == 903
+
+
 def test_elo_fit_recovers_ratings():
     rng = np.random.default_rng(0)
     true = {'yard': 1000, 'a': 1200, 'b': 800, 'c': 1500}

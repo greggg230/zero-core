@@ -45,7 +45,7 @@ import torch
 import torch.nn.functional as F
 
 from . import elo, games as G, package, runctl
-from .data import BAD, ShardWriter, TargetStats, Window, shard_paths
+from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
 from .net import load, make_net, save
@@ -96,8 +96,11 @@ DEFAULTS = dict(
     # is fresh
     batch=512, reuse=4.0, lr=1e-3, wd=1e-4, lr_halve_every=30, lr_min=1e-4, lr_warmup_steps=100, min_steps=50,
     # window: newest `window` iterations (growing 1 + iter // 2 with window_grow), more until
-    # min_window_samples; data kept keep_data iterations; RAM budget; samples per shard
+    # min_window_samples; data kept keep_data iterations; RAM budget; samples per shard;
+    # window_cache 1 = the window's shards stay in RAM between iterations and each training loads
+    # only the new ones (zero/data.py WindowCache: the same window; while it fits the budget)
     window=8, window_grow=1, min_window_samples=20_000, keep_data=12, ram_budget_gb=4.0, shard_rows=65536,
+    window_cache=0,
     # value target = (1 - q) z + q root-search estimate, q = value_q * min(1, iter / warmup)
     value_q=0.5, value_q_warmup=5, margin_loss_w=0.5,
     # evaluation: the yardstick (Elo anchor = 1000): a built-in bot or 'ext:<name>'
@@ -283,6 +286,7 @@ class Run:
         self.rsp = None                            # zero.remoteplay.RemotePlay when selfplay_remote is set
         self.roll = None                           # rolling driver + its evaluator
         self.roll_ev = None
+        self.wcache = None                         # zero.data.WindowCache with window_cache
 
     def check(self, where=''):
         if self.pw is not None:
@@ -586,7 +590,10 @@ class Run:
         bpr = model.features * 2 + 8 * 16 + 3 * MAX_SEATS * 4
         budget = int(c['ram_budget_gb'] * 1e9 / bpr)
         t1 = time.time()
-        W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it)
+        if c.get('window_cache') and self.wcache is None:
+            self.wcache = WindowCache()
+        W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it,
+                   cache=self.wcache if c.get('window_cache') else None)
         load_s = time.time() - t1
         steps = max(c['min_steps'], math.ceil(new_samples * c['reuse'] / c['batch']))
         vq = value_q_at(c, it)
@@ -641,6 +648,7 @@ class Run:
         def stats():
             secs = time.time() - t0
             return dict({k: round(v, 5) for k, v in acc.items()}, steps=steps, window_samples=W.N, window_loaded=W.loaded,
+                        window_reused=W.reused,
                         window_shards=len(paths), window_mb=round(W.nbytes / 1e6, 1), load_s=round(load_s, 2), lr=lr,
                         value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
         return model, ost, stats
