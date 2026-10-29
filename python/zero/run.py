@@ -130,6 +130,11 @@ DEFAULTS = dict(
     # checkpoint while the run trains (those games count for the next iteration, one checkpoint stale)
     selfplay_remote_inflight=1.0, selfplay_remote_giveback=30.0, selfplay_remote_overdue=3.0,
     selfplay_remote_linger=0,
+    # ... except a batch-bound machine's (its network batches grow with its games in flight, so a
+    # smaller cap only starves it: 'auto' = the ones inferring on CUDA / MPS; 'local' | 'remote' |
+    # 'all' | 'none'): its slots while its games take at most this many iterations (its throughput
+    # share x this; 1 = as the others)
+    selfplay_remote_batch='auto', selfplay_remote_batch_inflight=2.0,
     infer_device='cpu', train_device='cpu', seed=0,
     # network batches evaluated concurrently on this many Python threads (CPU: small networks
     # whose ops cannot keep the cores busy; give the driver as many `groups`); 1 = inline
@@ -402,11 +407,12 @@ class Run:
         zero/workqueue.py): `games` finished games in total, this machine's and the remote's, every
         one searched with checkpoint it - 1. This machine's driver is a rolling `queue_only` one
         (whatever `rolling` says): a setup of the run's spec is queued for every game it may start
-        under its cap - its throughput's share of the iteration x selfplay_remote_inflight - so its
-        games finish within about an iteration. A finished game counts once the shared quota accepts
-        it; the games beyond the quota (finished while it filled) wait, with their samples, for the
-        next iteration, whose quota takes them first. The phase ends when the quota is met; the
-        games in flight carry over."""
+        under its cap - its throughput's share of the iteration x selfplay_remote_inflight (a
+        batch-bound driver, CUDA / MPS: its slots while its games take at most
+        selfplay_remote_batch_inflight iterations) - so its games finish within about an iteration.
+        A finished game counts once the shared quota accepts it; the games beyond the quota (finished
+        while it filled) wait, with their samples, for the next iteration, whose quota takes them
+        first. The phase ends when the quota is met; the games in flight carry over."""
         from .workqueue import lag_hist, split_games
         from .remoteplay import staleness
         c = self.cfg
@@ -528,8 +534,8 @@ class Run:
         out['remote'] = rem
         out['queue'] = {'quota': c['games'], 'games': total, 'short': max(0, c['games'] - total),
                         'held': {'local': len(self.held), 'remote': qb.get('held_remote', 0)},
-                        'inflight': qb['inflight'], 'units': qb['units'], 'consumers': cons, 'rates': qb['rates'],
-                        'staleness': staleness(acc['stale'], qb['stale'])}
+                        'inflight': qb['inflight'], 'batch_inflight': qb['batch_inflight'], 'units': qb['units'],
+                        'consumers': cons, 'rates': qb['rates'], 'staleness': staleness(acc['stale'], qb['stale'])}
         self.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
         self.log(f'iter {it} shared queue: {_fmt_queue(out["queue"])}')
         return out
@@ -895,12 +901,12 @@ class Run:
         if c.get('selfplay_remote'):
             from .remoteplay import RemotePlay
             self.rsp = RemotePlay(self, c['selfplay_remote'])
-            self.rsp.local(max(2, int(c['groups'])), int(c['conc']))
+            self.rsp.local(max(2, int(c['groups'])), int(c['conc']), device=c['infer_device'])
             self.rsp.restore(last_rates(read_metrics(run)))
             self.log(f'self-play also on the remote {c["selfplay_remote"]!r} ({self.rsp.spec["host"]}, '
                      f'{self.rsp.procs} worker(s), mirror {self.rsp.rdir}): {c["games"]} games per iteration in '
                      f'total, in flight per machine its throughput share x {self.rsp.inflight:g}'
-                     + (', lingering while the run trains' if self.rsp.linger else ''))
+                     + self.rsp.batch_note() + (', lingering while the run trains' if self.rsp.linger else ''))
         try:
             self._iterations(start, done)
         finally:

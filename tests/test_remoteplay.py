@@ -2,15 +2,16 @@
 the toys with the remote 'local' (a mirror directory and worker subprocesses, as remote.py's tests):
 a single-game run's shared quota (exact, across both machines, games beyond it held for the next
 iteration), its remote shards joining data/iter_i/ and its training, the caps following the
-measured throughput of a slow / fast pair and keeping the rows within about one checkpoint, a worker
-slower than a phase capped at its floor, the quota moving to this machine while the remote backs
-off, a worker dying with accepted games not in a shard yet, lingering through training, late shards
-dropped, an unreachable remote never blocking, a non-finite shard quarantined (the run fails as for
-a local one), the back-off while an evaluation holds its lock, PAUSE mid-phase and resume (no worker
-outlives the run); a co-training run's resolver episodes played by the remote (exact event quotas,
-the local driver never starved), episodes requeued on a timeout, given back by a worker backing off
-and requeued when a worker dies, the settings refused; the coordinator's second consumer, the
-compressed shards and the streamed window as units."""
+measured throughput of a slow / fast pair and keeping the rows within about one checkpoint, a
+batch-bound driver at its slots, a worker slower than a phase capped at its floor, the quota moving
+to this machine while the remote backs off, a worker dying with accepted games not in a shard yet,
+lingering through training, late shards dropped, an unreachable remote never blocking, a non-finite
+shard quarantined (the run fails as for a local one), the back-off while an evaluation holds its
+lock, PAUSE mid-phase and resume (no worker outlives the run); a co-training run's resolver episodes
+played by the remote (exact event quotas, the local driver never starved, a batch-bound one at its
+slots), episodes requeued on a timeout, given back by a worker backing off and requeued when a
+worker dies, the settings refused; the coordinator's second consumer, the compressed shards and the
+streamed window as units."""
 import glob
 import json
 import os
@@ -141,13 +142,31 @@ def pair_env(tmp_path, test=None, **extra):
 def model_caps(q):
     """The caps the shared queue's model gives for a metrics row's rates, head starts and units."""
     from zero.workqueue import Shares
-    sh = Shares(q['inflight'])
+    sh = Shares(q['inflight'], q.get('batch_inflight'))
     sh.restore(q['rates'])
     for n, st in q['rates'].items():
         if not n.startswith('_'):
-            sh.consumer(n, st['lo'], st['hi'], cautious=n != 'local')
+            sh.consumer(n, st['lo'], st['hi'], cautious=n != 'local', batch=st.get('batch', False), slots=st.get('slots'))
+    for n, c in q['consumers'].items():
+        if c.get('cap_next') == 0:                 # taking no work (not up yet, backing off)
+            sh.set_active(n, False)
     sh.units = q['units']
     return sh.caps()
+
+
+def caps_match(q):
+    """Each consumer's next cap is the model's for the row's state - within one game: the row rounds
+    the rates and head starts, and a cap is a ceiling (an unmeasured worker's share can be a whole
+    number exactly)."""
+    want = model_caps(q)
+    got = {n: c['cap_next'] for n, c in q['consumers'].items()}
+    return set(got) == set(want) and all(abs(got[n] - want[n]) <= 1 for n in got)
+
+
+def plain_cap(q, n):
+    """Consumer `n`'s cap as if no consumer were batch-bound (the throughput share alone)."""
+    rates = {k: dict(v, batch=False) if isinstance(v, dict) else v for k, v in q['rates'].items()}
+    return model_caps(dict(q, rates=rates))[n]
 
 
 def test_caps_follow_throughput_and_rows_stay_within_one_checkpoint(tmp_path):
@@ -163,7 +182,7 @@ def test_caps_follow_throughput_and_rows_stay_within_one_checkpoint(tmp_path):
     check_quota(m, 192)
     for r in m[1:]:
         q = r['selfplay']['queue']
-        assert {n: c['cap_next'] for n, c in q['consumers'].items()} == model_caps(q), q
+        assert caps_match(q), q
     for r in m[3:]:
         q = r['selfplay']['queue']
         c = q['consumers']
@@ -173,6 +192,40 @@ def test_caps_follow_throughput_and_rows_stay_within_one_checkpoint(tmp_path):
         assert st['le1'] >= 0.95 and st['mean'] <= 0.8, q['staleness']
     log = (run / 'log.txt').read_text(encoding='utf-8')
     assert 'iter 5 shared queue: quota 192: 192 games (local ' in log and 'staleness: mean' in log
+
+
+def test_a_batch_bound_driver_keeps_its_slots(tmp_path):
+    """selfplay_remote_batch 'local' (as 'auto' makes a CUDA / MPS driver; the toy's is a CPU one): this
+    machine's driver is batch-bound, so its cap is its slots while its games finish within
+    selfplay_remote_batch_inflight (2) iterations - here every phase once measured, above its
+    throughput share - the worker's is its share as before; the quota stays exact, the caps are the
+    model's (the metrics row names the batch-bound consumer), the rows within two checkpoints."""
+    run = tmp_path / 'bb'
+    p = run_loop(run, '--iters', '4', *PAIR, '--selfplay-remote', 'local', '--selfplay-remote-batch', 'local',
+                 env=pair_env(tmp_path))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    check_quota(m, 192)
+    for r in m[1:]:
+        q = r['selfplay']['queue']
+        assert q['batch_inflight'] == 2.0 and q['rates']['local']['batch'] is True and 'batch' not in q['rates']['w0'], q
+        assert q['rates']['local']['slots'] == 256
+        assert caps_match(q), q
+    for r in m[2:]:
+        q = r['selfplay']['queue']
+        c = q['consumers']
+        assert c['local']['cap_next'] == 256 > plain_cap(q, 'local'), q
+        assert c['w0']['cap_next'] == plain_cap(q, 'w0'), q
+        st = q['staleness']['summary']
+        assert st['max'] <= 4 and st['mean'] <= 1.5, q['staleness']
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert 'batch-bound (local): its slots while its games take at most 2 iterations' in log
+
+
+def test_selfplay_remote_batch_is_checked(tmp_path):
+    p = run_loop(tmp_path / 'b', '--iters', '1', *TOY, '--selfplay-remote', 'local', '--selfplay-remote-batch', 'gpu',
+                 env=env_for(tmp_path))
+    assert p.returncode != 0 and "selfplay_remote_batch 'gpu': one of auto, local, remote, all, none" in p.stdout + p.stderr
 
 
 def test_a_worker_slower_than_a_phase_is_capped_at_its_floor(tmp_path):
@@ -518,6 +571,29 @@ def test_cotrain_resolver_episodes_on_the_remote(tmp_path):
     assert "[resolver] episodes also on the remote 'local'" in log and '[resolver] iter 3 remote self-play:' in log
     assert '[resolver] iter 3 shared queue: caps local ' in log
     assert gone(worker_pids(run))
+
+
+def test_cotrain_a_batch_bound_local_driver_fills_its_slots_not_its_queue(tmp_path):
+    """resolver_cfg selfplay_remote_batch 'local': the local resolver driver is batch-bound - the
+    metrics row says so, with its slots (16) below its bound (32: the queue in its driver) - and
+    the batch rule takes it to its slots at most, never into that queue (cap <= max(16, its
+    throughput share); on the toy its share is above both anyway; the slots bound itself:
+    test_workqueue.py); event quotas exact, the caps the model's."""
+    run = tmp_path / 'cb'
+    p = co_loop(run, '--iters', '3', '--games', '40', '--resolver-cfg', rcfg(selfplay_remote_batch='local'),
+                env=env_for(tmp_path))
+    assert p.returncode == 0, p.stdout + p.stderr
+    mp, mr = check_cotrain(run)
+    for b in mr[1:]:
+        q = b['selfplay']['queue']
+        st = q['rates']['local']
+        assert st['batch'] is True and st['slots'] == 16 and st['hi'] == 32 and 'batch' not in q['rates']['w0'], q
+        assert caps_match(q), q
+        if q['units']:
+            share = plain_cap(q, 'local')
+            assert share <= q['consumers']['local']['cap_next'] <= max(16, share), q
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert 'batch-bound (local): its slots while its games take at most 2 iterations' in log
 
 
 BIGREMOTE = textwrap.dedent('''

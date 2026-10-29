@@ -694,8 +694,9 @@ class CoRun:
             for v in cons.values():
                 v['share'] = round(v.get('games', 0) / max(1, tot), 4)
             mr['remote'] = rem
-            mr['queue'] = {'units': qb['units'], 'inflight': qb['inflight'], 'consumers': cons, 'rates': qb['rates'],
-                           'local_cap': co.local_cap, 'staleness': staleness(stale['r'], qb['stale'])}
+            mr['queue'] = {'units': qb['units'], 'inflight': qb['inflight'], 'batch_inflight': qb['batch_inflight'],
+                           'consumers': cons, 'rates': qb['rates'], 'local_cap': co.local_cap,
+                           'staleness': staleness(stale['r'], qb['stale'])}
             R.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
             R.log(f'iter {it} shared queue: {_fmt_queue(mr["queue"])}')
         return mp, mr
@@ -787,14 +788,15 @@ class CoRun:
             R.rsp = RemotePlay(R, rc['selfplay_remote'], mode='matches',
                                mirror=os.path.basename(os.path.normpath(run)) + '.resolver')
             # the shared queue (zero/workqueue.py): the local resolver driver is a consumer with its
-            # slots and today's queue in its driver at most; an iteration's units are its events'
-            # matches; a restart's first caps follow the last measured rates
+            # slots and today's queue in its driver at most (batch-bound on CUDA / MPS: its slots, never
+            # that queue); an iteration's units are its events' matches; a restart's first caps follow
+            # the last measured rates
             rconc = c.get('resolver_conc') or rc['conc']
-            R.rsp.local(max(2, int(rc['groups'])), rconc + max(16, rconc // 4))
+            R.rsp.local(max(2, int(rc['groups'])), rconc + max(16, rconc // 4), device=rc['infer_device'], slots=rconc)
             R.rsp.events = int(c['games'])
             R.rsp.restore(last_rates(read_metrics(R.run)))
             R.log(f'episodes also on the remote {rc["selfplay_remote"]!r} ({R.rsp.spec["host"]}, {R.rsp.procs} '
-                  f'worker(s), mirror {R.rsp.rdir})')
+                  f'worker(s), mirror {R.rsp.rdir}){R.rsp.batch_note()}')
         try:
             self._iterations(start)
         finally:

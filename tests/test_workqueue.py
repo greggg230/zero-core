@@ -1,7 +1,9 @@
 """The shared work queue's model (zero/workqueue.py, docs/az.md 5.3): each consumer's in-flight cap
-is its throughput's share of an iteration's units; per-game sample splitting (a game beyond a quota
-waits with its samples); the staleness histogram; the co-training coordinator keeping the local
-driver's share in reserve. Units: no driver except `test_split_games_on_the_driver`."""
+is its throughput's share of an iteration's units, a batch-bound consumer's its slots while its games
+take at most `batch_inflight` iterations (simulated phases of synthetic consumers whose rate grows
+with their in-flight: delver1's desktop); per-game sample splitting (a game beyond a quota waits
+with its samples); the staleness histogram; the co-training coordinator keeping the local driver's
+share in reserve. Units: no driver except `test_split_games_on_the_driver`."""
 import json
 import math
 import time
@@ -81,6 +83,130 @@ def test_rates_ewma_utilisation_and_restore():
     r = sh2.rates()
     assert r['local'] == pytest.approx(st['local']['rate'], rel=1e-5)
     assert r['w0'] == pytest.approx(st['local']['rate'] / 100 * 400, rel=1e-5)
+
+
+# ---------------------------------------------------------------- batch-bound consumers
+
+LPU = 6587.0                       # leaves per game (delver1's iteration 48)
+
+
+def simulate(consumers, units=800, phases=10, inflight=1.0, batch_inflight=2.0, off=None):
+    """Phases of synthetic consumers {name: (lo, hi, batch, latency(n), rate0)}: each keeps its cap
+    full (single-game: it starts its own games) and finishes them at the latency its curve gives for
+    that in-flight (rate = n / latency(n), Little's law); a phase lasts until the units are done;
+    each consumer is measured as zero.remoteplay measures it (its leaves per running second over the
+    leaves per unit). `rate0`: its rate before the first phase (a restart's restored state; None:
+    unmeasured). `off`: {phase: name} backing off that phase. -> [{caps, rates, secs, lat}] per
+    phase (`lat`: each consumer's game latency in phases of the joint phase)."""
+    sh = Shares(inflight, batch_inflight)
+    for n, (lo, hi, batch, lat, r0) in consumers.items():
+        sh.consumer(n, lo, hi, cautious=n != 'local', batch=batch)
+        sh.c[n]['rate'] = r0
+    sh.units = units
+    sh.lpu = LPU
+    out = []
+    for ph in range(phases):
+        for n in consumers:
+            sh.set_active(n, not (off and off.get(ph) == n))
+        caps = sh.caps()
+        rate = {n: (caps[n] / consumers[n][3](caps[n]) if caps[n] else 0.0) for n in consumers}
+        secs = units / sum(rate.values())
+        sh.observe_phase({n: {'units': rate[n] * secs, 'run_s': secs, 'util': 1.0, 'leaves': rate[n] * secs * LPU,
+                              'lead': 0.0} for n in consumers if caps[n]})
+        out.append({'caps': caps, 'rates': rate, 'secs': secs,
+                    'lat': {n: consumers[n][3](caps[n]) / secs for n in consumers if caps[n]}})
+    return out
+
+
+# delver1 on zero-core 213a9c0 (its metrics.jsonl, iterations 19-48): the desktop's leaves per second
+# grow with its games in flight (2 groups, batches of in-flight / 2: ~35 leaves/s per game at 75-192
+# in flight, 6.1-6.8k at all 192), so its games take ~180-200 s whatever its in-flight - CUDA,
+# batch-bound; a Mac worker's rate is its cores' (CPU: ~1.85 games/s at 340 or 768 in flight)
+DESKTOP = lambda n: 180.0 + 0.1 * n                     # noqa: E731
+MACW = lambda n: 5.0 + n / 1.85                         # noqa: E731
+
+
+def delver1(batch, cap0):
+    """The desktop (batch-bound or not) and the Mac's two workers, from the desktop at `cap0` in flight."""
+    return {'local': (4, 192, batch, DESKTOP, cap0 / DESKTOP(cap0)), 'w0': (4, 768, False, MACW, 1.85),
+            'w1': (4, 768, False, MACW, 1.85)}
+
+
+def test_a_batch_bound_consumer_is_not_starved_by_its_own_rate():
+    """The spiral of zero-core 213a9c0: the desktop's cap is its throughput's share, and a smaller cap
+    measures a smaller rate - its games no shorter - so its cap only settles where its games last one
+    phase: ~60% of its slots here whatever it starts from (delver1: 66-131 of 192 at 2.0-5.3k
+    leaves/s, the point moving with its games' length). Batch-bound, its cap is its slots one phase
+    from the spiral's state and stays there, its games within `batch_inflight` (2) phases (here 1.14),
+    its throughput 1.6x; the CPU workers keep games one phase long, as before."""
+    for cap0 in (75, 181):
+        old = simulate(delver1(False, cap0), phases=30)
+        assert all(r['caps']['local'] <= 0.65 * 192 for r in old[-5:]), [r['caps']['local'] for r in old]
+        new = simulate(delver1(True, cap0), phases=30)
+        assert [r['caps']['local'] for r in new[1:]] == [192] * 29, [r['caps']['local'] for r in new]
+        last, prev = new[-1], old[-1]
+        assert last['lat']['local'] < 1.3 and abs(prev['lat']['local'] - 1.0) < 0.05, (last, prev)
+        assert last['rates']['local'] > 1.5 * prev['rates']['local'], (last['rates'], prev['rates'])
+        assert last['secs'] < 0.95 * prev['secs'], 'the phase is shorter with the desktop at its slots'
+        for w in ('w0', 'w1'):                 # the Mac's workers: one phase of their throughput, as before
+            assert abs(last['lat'][w] - 1.0) < 0.05 and abs(prev['lat'][w] - 1.0) < 0.05, (last, prev)
+
+
+def test_a_batch_bound_consumer_too_slow_for_the_iterations_falls_to_its_floor():
+    """A batch-bound worker whose games take ~1,400 s at any in-flight, in phases of ~200 s (more than
+    `batch_inflight` phases): its slots would only fill the data with stale rows, so its cap falls to
+    its floor, as a CPU consumer's would; with batch_inflight 1 (or 'none') nothing is batch-bound."""
+    slow = lambda n: 1400.0 + n / 100                  # noqa: E731
+    run = simulate({'local': (4, 192, True, DESKTOP, 0.5), 'w0': (8, 768, True, slow, 0.2),
+                    'w1': (4, 768, False, MACW, 1.85)}, phases=10)
+    assert run[-1]['caps']['w0'] == 8 and run[-1]['caps']['local'] == 192, [r['caps'] for r in run]
+    same = simulate(delver1(True, 100), phases=6, batch_inflight=1.0)
+    assert [r['caps'] for r in same] == [r['caps'] for r in simulate(delver1(False, 100), phases=6)]
+
+
+def test_batch_cap_formula_bounds_and_cpu_consumers_unchanged():
+    """cap = max(inflight x share, min(slots, batch_inflight x share)) for a batch-bound consumer,
+    within [lo, hi]; `slots` (co-training: the driver's slots below hi's queue) bounds the batch rule
+    only; a consumer that is not batch-bound gets exactly the throughput share."""
+    sh = Shares(1.0, 2.0)
+    sh.consumer('local', 2, 40, batch=True, slots=32)   # co-training: 32 slots + a queue of 8
+    sh.consumer('w0', 4, 768)
+    sh.units = 60
+    sh.observe('local', 100, 100.0, 1.0)                # 1 unit/s
+    sh.observe('w0', 200, 100.0, 1.0)                   # 2 units/s: P = 20 s
+    assert sh.caps() == {'local': 32, 'w0': 40}         # its share 20, 2 x 20 = 40: its slots
+    sh.units = 30                                       # P = 10 s: a share of 10, 2 x 10 = 20 under the slots
+    assert sh.caps() == {'local': 20, 'w0': 20}
+    sh.set_active('w0', False)                          # alone: its share is the 30 units; its slots win
+    assert sh.caps() == {'local': 32, 'w0': 0}
+    sh.units = 300                                      # alone: a share of 300 is above its slots: up to hi
+    assert sh.caps()['local'] == 40
+    sh.set_active('w0', True)
+    sh.c['local']['batch'] = False                      # not batch-bound: the share, as before the batch rule
+    assert sh.caps() == {'local': 40, 'w0': 200}
+    sh.units = 30
+    assert sh.caps() == {'local': 10, 'w0': 20}
+    # an unmeasured batch-bound remote: a quarter of what the batch rule gives it until it is measured
+    sh2 = Shares(1.0, 2.0)
+    sh2.consumer('local', 2, 192)
+    sh2.consumer('w0', 4, 768, cautious=True, batch=True)
+    sh2.units = 600
+    sh2.observe('local', 100, 100.0, 1.0)               # 1/s: the rate per slot 1/192, w0's guess 4/s
+    assert sh2.caps()['w0'] == math.ceil(0.25 * min(768, 2 * 4.0 * 600 / 5.0))
+    # the state names the batch-bound consumers and their slots (a metrics row's caps can be recomputed)
+    st = json.loads(json.dumps(sh.state()))
+    assert st['w0'] == {'rate': 2.0, 'lead': 0.0, 'lo': 4, 'hi': 768}
+    sh.c['local']['batch'] = True
+    assert json.loads(json.dumps(sh.state()))['local']['batch'] is True
+    assert json.loads(json.dumps(sh.state()))['local']['slots'] == 32
+
+
+def test_a_backoff_gives_a_batch_bound_desktop_the_quota_at_once():
+    """A Mac worker backing off for a phase: its cap is 0 and the desktop takes the rest at once (here
+    its slots, as before); the next phase the shares come back."""
+    run = simulate(delver1(True, 120), phases=5, off={3: 'w0'})
+    assert run[3]['caps']['w0'] == 0 and run[3]['caps']['local'] == 192 and run[3]['caps']['w1'] > run[2]['caps']['w1']
+    assert run[4]['caps']['w0'] > 0
 
 
 def _samples(ks, rng):

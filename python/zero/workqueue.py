@@ -23,6 +23,23 @@ remote slower than its slots say would otherwise start games that finish iterati
 first measurement - its phase's end, or a few seconds of its status lines (zero.remoteplay). The
 caps' sum is `inflight x units` (no bound binding).
 
+**A batch-bound consumer** (its network batches on CUDA / MPS: the desktop's driver) is not starved
+by that formula. Its leaves per second grow with its games in flight (a network call costs about the
+same whatever its batch), so its games take about as long at any in-flight: its cap sets its
+throughput, not its latency, and a rate measured at a small cap gives a small cap again (MTG Zero's
+delver1: the desktop's cap wandered between 66 and 131 of its 192 slots, at 2-5k leaves/s against
+6.1-6.8k at all 192). Its cap is its **slots** while its games finish within `batch_inflight`
+iterations (the run setting `selfplay_remote_batch_inflight`, default 2):
+
+    cap = clamp(ceil(max(inflight x share, min(slots, batch_inflight x share))), lo, hi),  share = rate x (lead + P)
+
+(by Little's law in-flight / rate is its games' latency, so `batch_inflight x share` is the
+in-flight at `batch_inflight` horizons). `slots`: its driver's slots (`conc`), never the queue a
+co-training consumer's `hi` adds beyond them (a queued match only waits). A batch-bound consumer
+whose games outlast `batch_inflight` horizons even so falls to `lo` as any other; a consumer that is
+not batch-bound (CPU inference: its rate is its cores', whatever its in-flight) keeps the formula
+above exactly.
+
 `Shares` is that model; `split_games` cuts a driver's sample dict into its finished games (the
 rows and the samples come out of the driver in the same order, each row counting its own
 samples), so a game beyond an iteration's quota can wait - its samples with it - for the next
@@ -112,19 +129,24 @@ class Shares:
     """The consumers' throughput model and in-flight caps (module docstring). Not thread-safe:
     its owner (zero.remoteplay.RemotePlay) holds its lock around every call."""
 
-    def __init__(self, inflight=1.0):
+    def __init__(self, inflight=1.0, batch_inflight=None):
         self.f = float(inflight)
+        # a batch-bound consumer's in-flight in iterations (at least `inflight`)
+        self.fb = max(self.f, float(batch_inflight or 0.0))
         self.units = None                          # units per iteration (None: caps = hi)
         self.lpu = None                            # leaves per unit (an EWMA over the phases' finished units)
-        self.c = {}                                # name -> {lo, hi, rate, active}
+        self.c = {}                                # name -> {lo, hi, slots, batch, rate, active}
 
-    def consumer(self, name, lo, hi, cautious=False):
+    def consumer(self, name, lo, hi, cautious=False, batch=False, slots=None):
         """Consumer `name` with cap bounds [lo, hi]; `cautious` (a remote): a quarter of its guessed
-        share until it is measured."""
+        share until it is measured; `batch`: batch-bound (CUDA / MPS inference), its cap its
+        `slots` (default `hi`) while its games finish within the batch in-flight (module docstring)."""
         c = self.c.setdefault(name, {'rate': None, 'active': True, 'lead': 0.0})
         c['hi'] = max(1, int(hi))
         c['lo'] = max(1, min(int(lo), c['hi']))
+        c['slots'] = c['hi'] if not slots else max(c['lo'], min(int(slots), c['hi']))
         c['cautious'] = bool(cautious)
+        c['batch'] = bool(batch)
         return c
 
     def set_active(self, name, on):
@@ -158,7 +180,10 @@ class Shares:
             elif p is None:
                 out[n] = c['hi']
             else:
-                want = self.f * r[n] * (c['lead'] + p)
+                share = r[n] * (c['lead'] + p)             # what its throughput finishes in its horizon
+                want = self.f * share
+                if c.get('batch'):                         # its slots, while within batch_inflight horizons
+                    want = max(want, min(c['slots'], self.fb * share))
                 if c['rate'] is None and c.get('cautious'):
                     want *= BOOT
                 out[n] = max(c['lo'], min(c['hi'], math.ceil(want)))
@@ -214,7 +239,8 @@ class Shares:
 
     def state(self):
         out = {n: {'rate': None if c['rate'] is None else round(c['rate'], 6), 'lead': round(c['lead'], 2),
-                   'lo': c['lo'], 'hi': c['hi']} for n, c in self.c.items()}
+                   'lo': c['lo'], 'hi': c['hi'], **({'batch': True, 'slots': c['slots']} if c.get('batch') else {})}
+               for n, c in self.c.items()}
         if self.lpu:
             out['_leaves_per_unit'] = round(self.lpu, 1)
         return out

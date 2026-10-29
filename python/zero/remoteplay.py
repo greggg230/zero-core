@@ -4,12 +4,14 @@ both machines pull an iteration's work from one shared queue (zero/workqueue.py)
 * **A single-game run**: iteration i needs `games` finished games in total, across this machine
   and the remote's workers, all searched with checkpoint i-1 (the remote's sample shards come back
   into `data/iter_i/`). Every machine starts games as it has room under its in-flight cap (its
-  measured throughput's share of the iteration's games x `selfplay_remote_inflight`), and a finished
-  game counts only once the run **accepts** it: this machine's at once, a worker's when the run
-  answers its `fin` line. The iteration ends when `games` are accepted - exactly; games finishing
-  beyond the quota wait, held with their samples, for the next iteration (its quota takes them
-  first). A worker never holds a share of the quota: a remote that backs off, sleeps or dies leaves
-  the rest of the iteration to this machine (whose share grows at once).
+  measured throughput's share of the iteration's games x `selfplay_remote_inflight`; a batch-bound
+  one - CUDA / MPS inference - its slots while its games finish within
+  `selfplay_remote_batch_inflight` iterations), and a finished game counts only once the run
+  **accepts** it: this machine's at once, a worker's when the run answers its `fin` line. The
+  iteration ends when `games` are accepted - exactly; games finishing beyond the quota wait, held
+  with their samples, for the next iteration (its quota takes them first). A worker never holds a
+  share of the quota: a remote that backs off, sleeps or dies leaves the rest of the iteration to
+  this machine (whose share grows at once).
 * **A co-training run** (`resolver_cfg['selfplay_remote']`): the resolver's matches are the
   coordinator's queue (zero/cotrain.py); this machine's resolver driver takes its share first (the
   coordinator keeps it in reserve), the workers take theirs as they have room under their caps;
@@ -22,6 +24,9 @@ Run settings: `selfplay_remote` (a name in the game package's `remotes`; 'local'
 the tests; '' = off), `selfplay_remote_procs` (worker processes; 0 = the remote's `procs`),
 `selfplay_remote_wait` (seconds the end of a phase waits for the remote's last shards),
 `selfplay_remote_inflight` (each machine's in-flight cap, in iterations of its throughput),
+`selfplay_remote_batch` ('auto': the consumers whose inference is CUDA / MPS are batch-bound;
+'local', 'remote', 'all', 'none') and `selfplay_remote_batch_inflight` (a batch-bound consumer's
+cap is its slots while its games take at most this many iterations, zero/workqueue.py),
 `selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` (co-training),
 `selfplay_remote_linger` (0/1: the workers keep playing with their checkpoint while the run trains;
 those games and rows count for the next iteration, at most one checkpoint stale).
@@ -109,6 +114,8 @@ COMPRESS = 1                      # zlib level of the remote shards (data.savez_
 OVERDUE_MIN_S = 120.0             # co-training: an episode is never overdue sooner (env ZERO_RSP_OVERDUE_MIN_S)
 PROVISIONAL_S = 10.0              # an unmeasured worker's first rate after this much of its running time
                                   # in a phase (its status lines; env ZERO_RSP_PROVISIONAL_S)
+BATCH_MODES = ('auto', 'local', 'remote', 'all', 'none')   # selfplay_remote_batch: which consumers are batch-bound
+BATCH_DEVICES = ('cuda', 'mps')   # 'auto': inference on these batches (its rate grows with its in-flight)
 
 
 def _now():
@@ -313,6 +320,10 @@ class RemotePlay:
         self.wait_s = float(setting('selfplay_remote_wait'))
         self.timeout_s = float(setting('selfplay_remote_timeout'))
         self.inflight = float(setting('selfplay_remote_inflight'))
+        self.batch = str(setting('selfplay_remote_batch') or 'auto')
+        if self.batch not in BATCH_MODES:
+            raise SystemExit(f'selfplay_remote_batch {self.batch!r}: one of {", ".join(BATCH_MODES)}')
+        self.batch_inflight = float(setting('selfplay_remote_batch_inflight') or 0.0)
         self.giveback_s = float(setting('selfplay_remote_giveback'))
         self.overdue = float(setting('selfplay_remote_overdue'))
         self.linger = bool(int(setting('selfplay_remote_linger') or 0))
@@ -334,9 +345,10 @@ class RemotePlay:
         # a worker's most outstanding: its driver's slots (self-play: it starts its own games), plus a
         # queue in its driver (co-training: matches travel to it, so its slots never wait for them)
         self.cap = conc + max(1, conc // 4) if mode == 'matches' else conc
-        self.shares = Shares(self.inflight)
+        self.shares = Shares(self.inflight, self.batch_inflight)
+        wbatch = self.batch_bound('remote', self.overrides.get('infer_device') or c['infer_device'])
         for k in range(self.procs):
-            self.shares.consumer(f'w{k}', max(2, groups), self.cap, cautious=True)
+            self.shares.consumer(f'w{k}', max(2, groups), self.cap, cautious=True, batch=wbatch, slots=conc)
         self.capv = {}                             # the caps now (the manager's last computation)
         self.events = None                         # co-training: events per iteration (the primary's games)
         self.q = None                              # single-game: the open phase's quota
@@ -387,12 +399,29 @@ class RemotePlay:
         return self.procs * self.cap
 
     # ---------------------------------------------------------------- the shared queue's model
-    def local(self, lo, hi):
+    def batch_bound(self, who, device):
+        """Whether consumer `who` ('local', or 'remote': a worker) inferring on `device` is batch-bound
+        (selfplay_remote_batch; zero/workqueue.py)."""
+        if self.batch == 'auto':
+            return str(device) in BATCH_DEVICES
+        return self.batch in ('all', who)
+
+    def local(self, lo, hi, device='cpu', slots=None):
         """The run's own driver as a consumer of the queue: its cap's bounds (a few games per group;
-        its driver's slots)."""
+        its driver's slots, `slots` when `hi` holds a queue beyond them), its inference `device`
+        (CUDA / MPS: batch-bound, with selfplay_remote_batch 'auto')."""
         with self.mu:
-            self.shares.consumer('local', lo, hi)
+            self.shares.consumer('local', lo, hi, batch=self.batch_bound('local', device), slots=slots)
             self._refresh()
+
+    def batch_note(self):
+        """The log's note on the batch-bound consumers ('' if none)."""
+        with self.mu:
+            names = [n for n, c in self.shares.c.items() if c.get('batch')]
+        if not names or self.shares.fb <= self.shares.f:
+            return ''
+        return (f'; batch-bound ({", ".join(names)}): its slots while its games take at most '
+                f'{self.shares.fb:g} iterations')
 
     def restore(self, rates):
         """The consumers' rates from the run's last metrics row (a restart: the first caps follow
@@ -599,8 +628,9 @@ class RemotePlay:
             if self.q is not None and self.q['it'] == it:
                 quota = {'need': self.q['need'], 'accepted': self.q['done'], 'by': dict(self.q['by'])}
             held = sum(max(0, s.fin - s.acc) for s in self.sess if s is not None and s.alive())
-            qblock = {'units': self.shares.units, 'inflight': self.inflight, 'consumers': consumers,
-                      'rates': self.shares.state(), 'stale': dict(cur['stale']), 'quota': quota, 'held_remote': held}
+            qblock = {'units': self.shares.units, 'inflight': self.inflight, 'batch_inflight': self.shares.fb,
+                      'consumers': consumers, 'rates': self.shares.state(), 'stale': dict(cur['stale']), 'quota': quota,
+                      'held_remote': held}
         ends = [e for e in ends if e]
         secs = max([e['seconds'] for e in ends], default=0.0)
         leaves = sum(e['leaves'] for e in ends)
