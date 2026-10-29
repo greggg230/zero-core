@@ -18,6 +18,17 @@
       overrides. The source is only read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
       (setting `resolver`, docs/az.md 11) is copied with its resolver network: the same of
       <source>/resolver/ into <dest>/resolver/ (K: an iteration where both have a checkpoint).
+
+  python tools/fork_run.py --source runs/a --dest runs/b [--iter K] --net student.pt [--set ...]
+      The same continuation with ANOTHER NETWORK as its checkpoint K: e.g. a bigger one distilled from
+      K (tools/distill.py, docs/az.md 13). The network must be of this build's encoding for the run's
+      game (the encoding guard); the source's optimizer state is not copied (it belongs to the source's
+      network: the fork's first training starts a fresh AdamW with its warm-up), K's Elo results are
+      dropped from the fork's pools (they rated the source's network), and the fork's config.json
+      records the network's size (hidden / blocks / heads / ff, or ch). The rest - the window's
+      shards, the checkpoints before K for the Elo matches, the metrics - as above, so the fork
+      trains on the run's window from iteration K + 1 (an A/B of the network against a plain
+      continuation of the source).
 """
 import argparse
 import glob
@@ -72,7 +83,46 @@ def _link(src, dst, copy):
     shutil.copy2(src, dst)
 
 
-def continuation(source, dest, it=None, overrides=None, copy=False):
+def net_size(config):
+    """The run settings that describe a network's size (`hidden`, `blocks`, ... as `run.Run.new_model`
+    reads them) from its checkpoint config."""
+    arch = config.get('arch', 'mlp')
+    if arch == 'tokens':
+        return {'arch': 'tokens', 'hidden': config['d'], 'blocks': config['layers'], 'heads': config['heads'],
+                'ff': config['ff']}
+    if arch == 'grid':
+        return {'arch': 'grid', 'ch': config['ch'], 'blocks': config['blocks']}
+    return {'arch': 'mlp', 'hidden': config['hidden'], 'blocks': config['blocks']}
+
+
+def install_net(dest, it, net, game):
+    """--net: `net` (a checkpoint of this build's encoding for `game`) as the fork's checkpoint `it`; no
+    optimizer state; checkpoint `it`'s Elo results dropped from every pool. -> its size settings."""
+    from .. import elo
+    from ..net import check_encoding, load, save
+    from ..run import model_path
+    m, extra = load(net, game=game)
+    check_encoding(m.config, game, net)
+    save(m, model_path(dest, it), dict(extra, iter=it, net_from=os.path.abspath(net)))
+    opt = os.path.join(dest, 'models', 'opt_latest.pt')
+    if os.path.exists(opt):
+        os.remove(opt)
+    name = elo.ckpt_name(it)
+    for d, _, files in os.walk(os.path.join(dest, 'elo')):
+        if 'results.json' not in files:
+            continue
+        p = os.path.join(d, 'results.json')
+        with open(p) as f:
+            res = json.load(f)
+        res['pairs'] = {k: v for k, v in res.get('pairs', {}).items() if name not in k.split('|')}
+        if 'logged' in res:
+            res['logged'] = [x for x in res['logged'] if x != name]
+        with open(p, 'w') as f:
+            json.dump(res, f)                      # (ratings.json: refit at the fork's next evaluation)
+    return net_size(m.config)
+
+
+def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
     from ..run import DEFAULTS, latest_iter, model_path
     if os.path.exists(os.path.join(dest, 'config.json')):
         raise SystemExit(f'{dest} already holds a run')
@@ -101,11 +151,17 @@ def continuation(source, dest, it=None, overrides=None, copy=False):
         if os.path.exists(os.path.join(rsrc, 'config.json')):
             shutil.copy2(os.path.join(rsrc, 'config.json'), os.path.join(dest, 'resolver', 'config.json'))
     need, dirs, rows = _copy_run(source, dest, it, cfg, copy)
+    size = install_net(dest, it, net, cfg.get('game', 'toy')) if net else None
+    if size:
+        cfg.update(size)
     cfg.update(overrides or {})
     with open(os.path.join(dest, 'config.json'), 'w') as f:
         json.dump(cfg, f, indent=1)
     print(f'{source} @ iter {it} -> {dest}: {len(need)} checkpoints, {len(dirs)} data iterations, {len(rows)} metrics rows'
           + (' (and its resolver network)' if co else ''))
+    if size:
+        print(f'checkpoint {it} = {net} ({", ".join(f"{k} {v}" for k, v in size.items())}): no optimizer state, '
+              f'its Elo results dropped')
     print(f'next: python tools/supervise.py {dest}   (resumes after iteration {it})')
 
 
@@ -165,12 +221,13 @@ def main(argv=None):
     ap.add_argument('--iter', type=int, default=None)
     ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE')
     ap.add_argument('--copy', action='store_true', help='copy shards instead of hard-linking them')
+    ap.add_argument('--net', default=None, help="another network as the fork's checkpoint K (module docstring)")
     a = ap.parse_args(argv)
     over = {}
     for kv in a.set:
         k, _, v = kv.partition('=')
         over[k.strip().replace('-', '_')] = parse_value(v)
-    continuation(a.source, a.dest, a.iter, over, a.copy)
+    continuation(a.source, a.dest, a.iter, over, a.copy, a.net)
     return 0
 
 
