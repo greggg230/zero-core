@@ -150,12 +150,13 @@ def model_caps(q):
     return sh.caps()
 
 
-def test_caps_follow_throughput_and_rows_stay_within_one_checkpoint(tmp_path):
-    """A slow / fast pair (the worker process plays at about half this machine's driver's rate):
-    every iteration exactly its 192 games; the next caps are the model's (inflight x rate x (head
-    start + the joint phase)), the slower consumer the smaller share; once the caps are measured the
-    rows are within one checkpoint of the iteration's (at 768 slots each, every slot full - the old
-    behaviour - drifts to a mean lag of 2 and more, docs/az.md 5.3)."""
+def test_caps_follow_the_latency_model_and_rows_stay_within_one_checkpoint(tmp_path):
+    """A pair on one CPU (the worker process and this machine's driver): every iteration exactly its
+    192 games, both machines contributing; each consumer's next cap is the model's (its latency -
+    in-flight over its measured rate - against inflight x (its head start + the joint phase), 1.5x
+    that for a consumer whose latency hardly follows its load); the rows within one checkpoint of
+    the iteration's (at 768 slots each, every slot full - the first design's in-flight - drifts to a
+    mean lag of 2 and more, docs/az.md 5.3)."""
     run = tmp_path / 'pair'
     p = run_loop(run, '--iters', '5', *PAIR, '--selfplay-remote', 'local', env=pair_env(tmp_path))
     assert p.returncode == 0, p.stdout + p.stderr
@@ -164,13 +165,17 @@ def test_caps_follow_throughput_and_rows_stay_within_one_checkpoint(tmp_path):
     for r in m[1:]:
         q = r['selfplay']['queue']
         assert {n: c['cap_next'] for n, c in q['consumers'].items()} == model_caps(q), q
-    for r in m[3:]:
+    for r in m[2:]:
         q = r['selfplay']['queue']
         c = q['consumers']
-        assert c['w0']['rate'] < c['local']['rate'] and 0 < c['w0']['games'] < c['local']['games'], c
-        assert sum(min(v['cap'], 256) for v in c.values()) <= 1.15 * 192 + 4, c
-        st = q['staleness']['summary']
-        assert st['le1'] >= 0.95 and st['mean'] <= 0.8, q['staleness']
+        assert all(v['games'] > 0 for v in c.values()), c
+        for v in c.values():                   # measured: its latency, its target, the step toward it
+            lat, tgt, step = v['latency'], v['target'], v['step']
+            assert lat > 0 and tgt > 0 and 0.5 <= step <= 2.0, v
+            assert (step >= 1.0) == (lat <= tgt) or abs(lat / tgt - 1) < 0.02, v
+    for r in m[3:]:
+        st = r['selfplay']['queue']['staleness']['summary']
+        assert st['le1'] >= 0.95 and st['mean'] <= 0.8, r['selfplay']['queue']['staleness']
     log = (run / 'log.txt').read_text(encoding='utf-8')
     assert 'iter 5 shared queue: quota 192: 192 games (local ' in log and 'staleness: mean' in log
 
@@ -225,7 +230,11 @@ def test_backoff_moves_the_quota_to_this_machine(tmp_path):
     held, back = m[2]['selfplay'], m[5]['selfplay']
     assert held['remote']['backoff_s'] > 0.3 and held['remote']['games'] == 0, held['remote']
     hc, bc = held['queue']['consumers'], back['queue']['consumers']
-    assert hc['local']['games'] == 192 and hc['local']['cap_max'] == 192 and hc['w0']['games'] == 0, hc
+    assert hc['local']['games'] == 192 and hc['local']['cap_max'] >= 185 and hc['w0']['games'] == 0, hc
+    # carrying the quota alone (its latency at the larger in-flight against the longer phase it played)
+    # leaves the model's own cap as it was
+    assert hc['local']['cap_next'] >= 0.9 * m[1]['selfplay']['queue']['consumers']['local']['cap_next'], (m[1], hc)
+
     assert back['remote']['games'] > 0 and bc['local']['cap_max'] < 185 and bc['w0']['cap'] > 0, bc
 
 

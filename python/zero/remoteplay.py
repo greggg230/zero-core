@@ -336,7 +336,8 @@ class RemotePlay:
         self.cap = conc + max(1, conc // 4) if mode == 'matches' else conc
         self.shares = Shares(self.inflight)
         for k in range(self.procs):
-            self.shares.consumer(f'w{k}', max(2, groups), self.cap, cautious=True)
+            self.shares.consumer(f'w{k}', max(2, groups), self.cap, cautious=True,
+                                 gpu=str(self.overrides.get('infer_device') or c['infer_device']) in ('cuda', 'mps'))
         self.capv = {}                             # the caps now (the manager's last computation)
         self.events = None                         # co-training: events per iteration (the primary's games)
         self.q = None                              # single-game: the open phase's quota
@@ -387,11 +388,12 @@ class RemotePlay:
         return self.procs * self.cap
 
     # ---------------------------------------------------------------- the shared queue's model
-    def local(self, lo, hi):
+    def local(self, lo, hi, gpu=False):
         """The run's own driver as a consumer of the queue: its cap's bounds (a few games per group;
-        its driver's slots)."""
+        its driver's slots); `gpu`: its inference is CUDA / MPS (its latency hardly depends on its
+        in-flight: zero/workqueue.py)."""
         with self.mu:
-            self.shares.consumer('local', lo, hi)
+            self.shares.consumer('local', lo, hi, gpu=gpu)
             self._refresh()
 
     def restore(self, rates):
@@ -457,7 +459,7 @@ class RemotePlay:
             self.cur = {'it': it, 't0': _now(), 't_local': _now(), 'announced': 0, 'accepted': 0, 'rows': 0, 'bytes': 0,
                         'pending': 0, 'rejected': 0, 'quarantined': 0, 'failed': 0, 'fetch_s': 0.0, 'assigned': 0,
                         'matches': 0, 'dup': 0, 'requeued': 0, 'requeued_timeout': 0, 'requeued_backoff': 0, 'errors': 0,
-                        'games': 0, 'lost': 0, 'stale': {}, 'capsum': {}, 'capmax': {}, 'capn': 0}
+                        'games': 0, 'lost': 0, 'stale': {}, 'capsum': {}, 'capmax': {}, 'capn': 0, 'outn': 0}
             for s in self.sess:
                 if s is not None:
                     s.acc_ph = s.ship_ph = 0
@@ -574,25 +576,34 @@ class RemotePlay:
                 e = s.ended.get(it) if s is not None else None
                 if not e:
                     continue
-                util = (s.util[0] / s.util[1]) if (self.mode == 'matches' and s.util[1]) else 1.0
+                util = (s.util[0] / s.util[1]) if s.util[1] else 1.0
                 # its head start (single-game: its running time before this machine's phase began;
                 # co-training: none - the matches come with the drafting)
-                lead = max(0.0, cur['t_local'] - cur['t0'] - e.get('backoff_s', 0.0)) if self.mode == 'selfplay'                     else 0.0
+                lead = 0.0
+                if self.mode == 'selfplay':
+                    lead = max(0.0, cur['t_local'] - cur['t0'] - e.get('backoff_s', 0.0))
                 meas[s.name] = {'units': e.get('games', 0), 'run_s': e.get('active_s', 0.0), 'util': util, 'lead': lead,
-                                'leaves': e.get('leaves')}
+                                'leaves': e.get('leaves'), 'cap': phase_caps.get(s.name)}
             if local is not None:
                 meas['local'] = {'units': local.get('units', 0), 'run_s': local.get('run_s', 0.0),
-                                 'util': local.get('util'), 'leaves': local.get('leaves')}
-            got = self.shares.observe_phase(meas)
+                                 'util': local.get('util'), 'leaves': local.get('leaves'), 'cap': phase_caps.get('local')}
+            from .workqueue import TAKEOVER
+            out_share = cur['outn'] / ncap
+            got = self.shares.observe_phase(meas, phase_s=None if local is None else local.get('run_s'),
+                                            adjust=out_share < TAKEOVER)
             for n, m in meas.items():
+                g = got.get(n) or {}
                 m['run_s'] = round(m['run_s'], 1)
                 m['util'] = None if m.get('util') is None else round(m['util'], 3)
-                m['rate_measured'] = None if got.get(n) is None else round(got[n], 4)
+                m['rate_measured'] = g.get('rate')
+                for k in ('inflight', 'latency', 'target', 'sens', 'step'):
+                    if k in g:
+                        m[k] = g[k]
             self._refresh()
             rates = self.shares.rates()
             consumers = {}
             for n in self.shares.c:
-                m = {k: v for k, v in meas.get(n, {}).items() if k not in ('leaves', 'lead')}
+                m = {k: v for k, v in meas.get(n, {}).items() if k not in ('leaves', 'lead', 'cap')}
                 consumers[n] = dict(m, cap=phase_caps.get(n), cap_max=cur['capmax'].get(n), cap_next=self.capv.get(n),
                                     rate=round(rates.get(n, 0.0), 4))
             quota = None
@@ -600,6 +611,7 @@ class RemotePlay:
                 quota = {'need': self.q['need'], 'accepted': self.q['done'], 'by': dict(self.q['by'])}
             held = sum(max(0, s.fin - s.acc) for s in self.sess if s is not None and s.alive())
             qblock = {'units': self.shares.units, 'inflight': self.inflight, 'consumers': consumers,
+                      'consumer_out': round(out_share, 3),
                       'rates': self.shares.state(), 'stale': dict(cur['stale']), 'quota': quota, 'held_remote': held}
         ends = [e for e in ends if e]
         secs = max([e['seconds'] for e in ends], default=0.0)
@@ -765,6 +777,8 @@ class RemotePlay:
                 for n, v in self.capv.items():
                     self.cur['capsum'][n] = self.cur['capsum'].get(n, 0) + v
                     self.cur['capmax'][n] = max(self.cur['capmax'].get(n, 0), v)
+                if any(not c['active'] for c in self.shares.c.values()):
+                    self.cur['outn'] += 1                  # a consumer out: the others take its share
         for k in range(self.procs):
             s = self.sess[k]
             if s is not None and not s.alive() and not s.handled:
@@ -795,6 +809,12 @@ class RemotePlay:
                     if cap != s.sent_cap:
                         s.send({'cmd': 'cap', 'n': cap})
                         s.sent_cap = cap
+                    # its outstanding games' share of its cap (its status lines), sampled for the model
+                    st = s.status
+                    if want is not None and st.get('phase') == want and cap > 0 and not s.backing_off() \
+                            and 'outstanding' in st:
+                        s.util[0] += min(1.0, st['outstanding'] / cap)
+                        s.util[1] += 1
             go = want is not None and s.hello is not None and s.phase != want
             if go and self.mode == 'selfplay':
                 with self.mu:                          # the quota met already: nothing to play for

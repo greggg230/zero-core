@@ -790,7 +790,8 @@ class CoRun:
             # slots and today's queue in its driver at most; an iteration's units are its events'
             # matches; a restart's first caps follow the last measured rates
             rconc = c.get('resolver_conc') or rc['conc']
-            R.rsp.local(max(2, int(rc['groups'])), rconc + max(16, rconc // 4))
+            R.rsp.local(max(2, int(rc['groups'])), rconc + max(16, rconc // 4),
+                        gpu=str(rc['infer_device']) in ('cuda', 'mps'))
             R.rsp.events = int(c['games'])
             R.rsp.restore(last_rates(read_metrics(R.run)))
             R.log(f'episodes also on the remote {rc["selfplay_remote"]!r} ({R.rsp.spec["host"]}, {R.rsp.procs} '

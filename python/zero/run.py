@@ -895,7 +895,7 @@ class Run:
         if c.get('selfplay_remote'):
             from .remoteplay import RemotePlay
             self.rsp = RemotePlay(self, c['selfplay_remote'])
-            self.rsp.local(max(2, int(c['groups'])), int(c['conc']))
+            self.rsp.local(max(2, int(c['groups'])), int(c['conc']), gpu=str(c['infer_device']) in ('cuda', 'mps'))
             self.rsp.restore(last_rates(read_metrics(run)))
             self.log(f'self-play also on the remote {c["selfplay_remote"]!r} ({self.rsp.spec["host"]}, '
                      f'{self.rsp.procs} worker(s), mirror {self.rsp.rdir}): {c["games"]} games per iteration in '

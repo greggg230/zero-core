@@ -1,7 +1,10 @@
 """The shared work queue's model (zero/workqueue.py, docs/az.md 5.3): each consumer's in-flight cap
-is its throughput's share of an iteration's units; per-game sample splitting (a game beyond a quota
-waits with its samples); the staleness histogram; the co-training coordinator keeping the local
-driver's share in reserve. Units: no driver except `test_split_games_on_the_driver`."""
+targets its game latency (bootstrapped from its throughput's share of an iteration's units), for
+throughput-bound and latency-bound consumers alike - simulated phases of synthetic consumers whose
+latency follows a curve of their in-flight (delver1's desktop: rate growing with the games in
+flight); per-game sample splitting (a game beyond a quota waits with its samples); the staleness
+histogram; the co-training coordinator keeping the local driver's share in reserve. Units: no driver
+except `test_split_games_on_the_driver`."""
 import json
 import math
 import time
@@ -64,15 +67,19 @@ def test_a_consumer_that_stops_taking_work_gives_its_share_to_the_others():
 def test_rates_ewma_utilisation_and_restore():
     """A phase's rate joins the EWMA (half weight); a consumer that had less work than its cap counts
     as if it had kept it busy at the same latency (at most 4x); too short a phase measures nothing;
-    a restart's rates come back from the metrics row's state."""
+    a restart's rates (and the latency model's caps, sensitivities) come back from the metrics row's
+    state."""
     sh = Shares(1.0)
     sh.consumer('local', 2, 100)
     assert sh.observe('local', 100, 10.0, 1.0) == pytest.approx(10.0)
     sh.observe('local', 200, 10.0, 1.0)
     assert sh.c['local']['rate'] == pytest.approx(15.0)
-    assert sh.observe('local', 50, 10.0, 0.5) == pytest.approx(10.0)   # half busy: 5/s measured, 10/s at its cap
-    assert sh.observe('local', 50, 10.0, 0.01) == pytest.approx(20.0)  # at most x4
+    assert sh.observe('local', 50, 10.0, 0.5) == pytest.approx(5.0)    # half busy: 5/s measured ...
+    assert sh.c['local']['rate'] == pytest.approx((15.0 + 10.0) / 2)   # ... 10/s at its cap
+    sh.observe('local', 50, 10.0, 0.01)
+    assert sh.c['local']['rate'] == pytest.approx((12.5 + 20.0) / 2)   # at most x4
     assert sh.observe('local', 5, 0.1, 1.0) is None and sh.observe('local', 0, 100.0, 1.0) is None
+    sh.c['local']['cap'], sh.c['local']['sens'] = 77.0, 0.3
     st = json.loads(json.dumps(sh.state()))
     sh2 = Shares(1.0)
     sh2.restore(st)
@@ -81,6 +88,95 @@ def test_rates_ewma_utilisation_and_restore():
     r = sh2.rates()
     assert r['local'] == pytest.approx(st['local']['rate'], rel=1e-5)
     assert r['w0'] == pytest.approx(st['local']['rate'] / 100 * 400, rel=1e-5)
+    assert (sh2.c['local']['cap'], sh2.c['local']['sens'], sh2.c['w0']['cap']) == (77.0, 0.3, None)
+
+
+def simulate(consumers, units=800, phases=8, inflight=1.0, off=None):
+    """Phases of synthetic consumers {name: (lo, hi, gpu, latency(n), cap0 or None)}: each plays its
+    cap's games at the latency its curve gives (rate = n / latency(n)), the phase lasts until the
+    units are done, every consumer is measured as zero.remoteplay measures it. `off`: {phase: name}
+    backing off for that phase. -> [(caps, rates, phase seconds)] per phase."""
+    sh = Shares(inflight)
+    for n, (lo, hi, gpu, lat, cap0) in consumers.items():
+        sh.consumer(n, lo, hi, cautious=n != 'local', gpu=gpu)
+        if cap0 is not None:
+            sh.c[n]['cap'] = float(cap0)
+            sh.c[n]['rate'] = cap0 / lat(cap0)
+    sh.units = units
+    sh.lpu = 1000.0
+    out = []
+    for ph in range(phases):
+        for n in consumers:
+            sh.set_active(n, not (off and off.get(ph) == n))
+        caps = sh.caps()
+        rate = {n: (caps[n] / consumers[n][3](caps[n]) if caps[n] else 0.0) for n in consumers}
+        secs = units / sum(rate.values())
+        meas = {n: {'units': rate[n] * secs, 'run_s': secs, 'util': 1.0, 'leaves': rate[n] * secs * 1000.0,
+                    'cap': caps[n], 'lead': 0.0} for n in consumers if caps[n]}
+        sh.observe_phase(meas, phase_s=secs)
+        out.append((caps, rate, secs))
+    return out
+
+
+# delver1's desktop (zero-core 213a9c0, 2026-10-28, its log): 82 games in flight at ~234 s a game, 192
+# at ~282 s - a latency of ~198 s + 0.44 s a game (CUDA batches: the rate grows with the games in
+# flight); a Mac worker: CPU, its rate ~1.5 games/s whatever its in-flight (latency in-flight / 1.5)
+DESKTOP = lambda n: 198.0 + 0.44 * n                    # noqa: E731
+MACW = lambda n: 5.0 + n / 1.5                          # noqa: E731
+
+
+def test_a_gpu_consumer_whose_rate_grows_with_its_in_flight_is_not_starved():
+    """The spiral of zero-core 213a9c0 (its cap = rate x horizon: a smaller cap measured a lower rate
+    and shrank again - delver1's desktop 181 -> 83 -> 75 games in flight, 6.5k -> 2.3k leaves/s): the
+    latency target lets a consumer whose games take nearly as long at any load grow to its slots
+    while they finish within 1.5 iterations, from the spiral's own state; the CPU workers converge to
+    games one iteration long."""
+    run = simulate({'local': (4, 192, True, DESKTOP, 75), 'w0': (8, 768, False, MACW, 300),
+                    'w1': (8, 768, False, MACW, 300)}, phases=8)
+    caps, rate, secs = run[-1]
+    assert caps['local'] == 192, [r[0] for r in run]
+    assert run[2][0]['local'] == 192, 'two phases from the spiral back to its slots'
+    assert DESKTOP(192) <= 1.5 * secs, (DESKTOP(192), secs)       # its games: within 1.5 phases
+    for w in ('w0', 'w1'):                                        # the CPU workers: one phase each
+        assert abs(MACW(caps[w]) / secs - 1.0) < 0.1, (caps, secs)
+    assert rate['local'] > 2 * 75 / DESKTOP(75), 'the desktop more than doubled its throughput'
+
+
+def test_a_latency_bound_consumer_with_a_cpu_prior_is_found_by_its_measurements():
+    """The same desktop curve with the CPU prior (sens 1): it shrinks first, its latency hardly falls,
+    the measured sensitivity marks it latency-bound and its cap grows back to its slots."""
+    run = simulate({'local': (4, 192, False, DESKTOP, 181), 'w0': (8, 768, False, MACW, 300),
+                    'w1': (8, 768, False, MACW, 300)}, phases=10)
+    caps = [r[0]['local'] for r in run]
+    assert min(caps) < 181 and caps[-1] >= 185, caps
+
+
+def test_a_throughput_bound_consumer_converges_to_one_iteration():
+    """CPU workers alone (latency proportional to their in-flight): the caps settle where a game
+    takes one iteration's phase (inflight 1), and half of it with inflight 0.5."""
+    for f in (1.0, 0.5):
+        run = simulate({'local': (4, 768, False, MACW, None), 'w0': (8, 768, False, MACW, None)}, units=600,
+                       phases=10, inflight=f)
+        caps, rate, secs = run[-1]
+        for n in caps:
+            assert abs(MACW(caps[n]) / (f * secs) - 1.0) < 0.12, (f, caps, secs)
+
+
+def test_a_consumer_whose_games_outlast_the_phase_gets_its_floor():
+    """A worker whose games take 1,400 s at any load in a phase of ~250 s: no in-flight makes them
+    fresh, its cap falls to its floor (its stale rows stay few)."""
+    run = simulate({'local': (4, 192, True, DESKTOP, 150), 'w0': (8, 768, False, lambda n: 1400.0 + n / 10, 300),
+                    'w1': (8, 768, False, MACW, 300)}, phases=8)
+    assert run[-1][0]['w0'] == 8 and run[-1][2] < 400, [(r[0], round(r[2])) for r in run]
+
+
+def test_a_backoff_gives_the_desktop_the_whole_quota_at_once():
+    """A Mac worker backing off for a phase: its cap is 0 and the desktop's grows with its horizon at
+    once (here to its slots); the next phase the shares come back."""
+    run = simulate({'local': (4, 192, True, DESKTOP, 110), 'w0': (8, 768, False, MACW, 300)}, phases=5,
+                   off={3: 'w0'})
+    assert run[3][0]['w0'] == 0 and run[3][0]['local'] == 192, run[3][0]
+    assert run[4][0]['w0'] > 0
 
 
 def _samples(ks, rng):
