@@ -4,7 +4,7 @@
 use std::any::Any;
 
 use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record, Select};
-use crate::game::{bot_names, SearchGame, MAX_SEATS};
+use crate::game::{bot_names, Belief, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
 use crate::tree::{leaf_values_team, Scratch, Sim, Tree, Walk};
 
@@ -39,6 +39,9 @@ pub trait DynGame: Send + Sync {
     fn margin(&self, seat: usize) -> f32;
     fn score(&self, seat: usize) -> f32;
     fn determinize(&mut self, viewer: usize, seed: u64);
+    /// `SearchGame::determinize_with` (docs/search.md 3.8) with the belief `pred` (`aux_width()`
+    /// floats), `tilt`, `clip`.
+    fn determinize_with(&mut self, viewer: usize, seed: u64, pred: &[f32], tilt: f64, clip: f64) -> Result<(), String>;
     fn encode(&self, viewer: usize) -> Vec<f32>;
     fn rounds(&self) -> u32;
     fn export_state(&self) -> String;
@@ -96,6 +99,11 @@ impl<G: SearchGame> DynGame for G {
     fn determinize(&mut self, viewer: usize, seed: u64) {
         SearchGame::determinize(self, viewer, &mut Rng::new(seed))
     }
+    fn determinize_with(&mut self, viewer: usize, seed: u64, pred: &[f32], tilt: f64, clip: f64) -> Result<(), String> {
+        let b = belief_of::<G>(pred, tilt, clip)?;
+        SearchGame::determinize_with(self, viewer, &mut Rng::new(seed), &b);
+        Ok(())
+    }
     fn encode(&self, viewer: usize) -> Vec<f32> {
         let mut v = vec![0.0; G::NUM_FEATURES];
         SearchGame::encode(self, viewer, &mut v);
@@ -142,6 +150,22 @@ fn downcast<G: SearchGame>(g: &dyn DynGame) -> Result<&G, String> {
     g.as_any().downcast_ref::<G>().ok_or_else(|| format!("expected a {} game", G::NAME))
 }
 
+/// A `Belief` from the bindings' arguments, checked (docs/search.md 3.8): `aux_width()` finite
+/// predictions >= 0, a tilt > 0 and the clip / mix rules of `NnSeat::check_belief`.
+fn belief_of<G: SearchGame>(pred: &[f32], tilt: f64, clip: f64) -> Result<Belief, String> {
+    crate::driver::NnSeat::check_belief(tilt, clip, 0.0)?;
+    if tilt <= 0.0 {
+        return Err(format!("a belief's tilt {tilt}: > 0 (a search without a belief deals uniformly)"));
+    }
+    if pred.len() != G::aux_width() || G::aux_width() == 0 {
+        return Err(format!("a belief of {} values: {} has {} auxiliary target values (SearchGame::AUX)", pred.len(), G::NAME, G::aux_width()));
+    }
+    if let Some(x) = pred.iter().find(|x| !x.is_finite() || **x < 0.0) {
+        return Err(format!("a belief's prediction {x}: finite and >= 0"));
+    }
+    Ok(Belief { pred: pred.to_vec(), tilt, clip })
+}
+
 /// A leaf of a Python-driven search: decider, features, legal actions; with root-view values
 /// (docs/search.md 3.6) the features of the tree's viewer when another seat decides the leaf.
 pub struct Leaf {
@@ -186,6 +210,11 @@ pub trait DynTree: Send + Sync {
     /// the forced walks' accounting: per root option, the visit counts without them, the root
     /// win vector without them.
     fn set_root_min(&mut self, k: u32);
+    /// The root's belief from now on (`Tree::set_belief`, docs/search.md 3.8; None = uniform worlds):
+    /// predictions, tilt, clip, the uniform share `mix`; `live` re-deals a tree without `redet`.
+    fn set_belief(&mut self, pred: Option<&[f32]>, tilt: f64, clip: f64, mix: f64, live: &dyn DynGame) -> Result<(), String>;
+    /// The current search's belief predictions (None: uniform worlds).
+    fn belief(&self) -> Option<Vec<f32>>;
     fn root_min(&self) -> u32;
     fn root_forced(&self) -> Vec<u32>;
     fn root_visits_pruned(&self) -> Vec<u32>;
@@ -308,6 +337,21 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     fn set_root_min(&mut self, k: u32) {
         self.t.set_root_min(k)
     }
+    fn set_belief(&mut self, pred: Option<&[f32]>, tilt: f64, clip: f64, mix: f64, live: &dyn DynGame) -> Result<(), String> {
+        let g = downcast::<G>(live)?;
+        let b = match pred {
+            Some(p) => {
+                crate::driver::NnSeat::check_belief(tilt, clip, mix)?;
+                Some(belief_of::<G>(p, tilt, clip)?)
+            }
+            None => None,
+        };
+        self.t.set_belief(b, mix, g, &mut self.rng);
+        Ok(())
+    }
+    fn belief(&self) -> Option<Vec<f32>> {
+        self.t.belief().map(|b| b.pred.clone())
+    }
     fn root_min(&self) -> u32 {
         self.t.root_min()
     }
@@ -341,7 +385,8 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
 pub trait DynDriver: Send + Sync {
     fn info(&self) -> GameInfo;
     fn next_batch(&mut self, block: bool) -> Result<Option<Batch>, String>;
-    fn submit(&mut self, id: u64, priors: &[f32], value: &[f32], margin: &[f32]) -> Result<(), String>;
+    /// A network batch's answer; `aux`: its root belief rows' auxiliary outputs (`Driver::submit_aux`).
+    fn submit(&mut self, id: u64, priors: &[f32], value: &[f32], margin: &[f32], aux: &[f32]) -> Result<(), String>;
     fn submit_external(&mut self, id: u64, payloads: Vec<String>) -> Result<(), String>;
     fn finished(&self) -> bool;
     fn paused(&self) -> bool;
@@ -369,8 +414,8 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     fn next_batch(&mut self, block: bool) -> Result<Option<Batch>, String> {
         Driver::next_batch(self, block)
     }
-    fn submit(&mut self, id: u64, priors: &[f32], value: &[f32], margin: &[f32]) -> Result<(), String> {
-        Driver::submit(self, id, priors, value, margin)
+    fn submit(&mut self, id: u64, priors: &[f32], value: &[f32], margin: &[f32], aux: &[f32]) -> Result<(), String> {
+        Driver::submit_aux(self, id, priors, value, margin, aux)
     }
     fn submit_external(&mut self, id: u64, payloads: Vec<String>) -> Result<(), String> {
         Driver::submit_external(self, id, payloads)

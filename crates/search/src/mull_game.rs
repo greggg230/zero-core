@@ -8,7 +8,7 @@
 //! review, 2026-10-29): a prior of 0.999 on KEEP whatever the hand, and the exact value of the
 //! position if every seat still to decide keeps. With a bad hand a mulligan is worth ~0.16 more
 //! than keeping, with a good one ~0.14 less - and at 64 simulations PUCT never visits it.
-use crate::game::{SearchGame, MAX_SEATS};
+use crate::game::{belief_weight, Belief, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
 
 pub const KEEP: u16 = 0;
@@ -188,6 +188,25 @@ impl SearchGame for HiddenMull {
     fn determinize(&mut self, viewer: usize, rng: &mut Rng) {
         let o = 1 - viewer;
         let good = if self.m.mulled[o] { rng.below(4) != 0 } else { rng.below(2) != 0 };
+        self.m.hand[o] = good as u8;
+        self.m.determinize(viewer, rng);
+        self.observer = Some(viewer);
+    }
+    /// The other seat's hand (`AUX` "hand": [bad, good]) for the belief (docs/search.md 3.8): a
+    /// label, never in `encode`.
+    const AUX: &'static [(&'static str, usize)] = &[("hand", 2)];
+    fn aux_target(&self, viewer: usize, out: &mut [f32]) {
+        out[self.m.hand[1 - viewer] as usize] = 1.0;
+    }
+    /// `determinize` with the other seat's hand good with probability q w_good / (q w_good + (1 - q)
+    /// w_bad) (q the uniform deal's 1/2, 3/4 after its mulligan; w = `belief_weight` of the belief's
+    /// [bad, good] against [1 - q, q]).
+    fn determinize_with(&mut self, viewer: usize, rng: &mut Rng, belief: &Belief) {
+        let o = 1 - viewer;
+        let q = if self.m.mulled[o] { 0.75 } else { 0.5 };
+        let wg = belief_weight(belief.pred[1] as f64, q, belief.tilt, belief.clip);
+        let wb = belief_weight(belief.pred[0] as f64, 1.0 - q, belief.tilt, belief.clip);
+        let good = rng.unit() < q * wg / (q * wg + (1.0 - q) * wb);
         self.m.hand[o] = good as u8;
         self.m.determinize(viewer, rng);
         self.observer = Some(viewer);

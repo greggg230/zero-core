@@ -25,5 +25,5 @@ pub mod tree;
 #[cfg(test)]
 pub(crate) mod mull_game;
 
-pub use game::{team_of, Bot, SearchGame, MAX_SEATS};
+pub use game::{belief_weight, team_of, Belief, Bot, SearchGame, MAX_SEATS};
 pub use rng::Rng;

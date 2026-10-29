@@ -48,6 +48,12 @@ decided by another seat than the tree's viewer takes its priors from `encode(dec
 value from `encode(viewer)` (`expand_and_backup(..., value_player=viewer)`): the root decider's
 information, not the guess at the other seats' hidden cards the sampled world holds.
 
+The root's belief (docs/search.md 3.8; `Tree.set_belief`, off by default): a search may hold the
+network's prediction of the hidden cards for its viewer (`Tree.belief` = (predictions, tilt, clip),
+computed once per decision from the root's features); every simulation then deals its world with
+the game's `determinize_with(viewer, seed, predictions, tilt, clip)` - but a `belief_mix` share, one
+draw of the rng each, with `determinize` as before. No belief: the search of before.
+
 Root minimum visits (docs/search.md 3.5; `Tree.set_root_min`, off by default): every root option
 of a search gets at least k visits. A walk keeps PUCT's root option unless that option already has
 k visits and another has fewer: then it takes the least-visited root option (the lowest index on
@@ -96,7 +102,7 @@ class Tree:
     root option, `forced_win` / `forced_n` their backed-up win vectors' sum and number,
     `walk_forced` the root option of the walk in flight if it is forced (None)."""
     __slots__ = ('base', 'root', 'viewer', 'redet', 'n', 'team', 'root_min', 'forced', 'forced_win', 'forced_n',
-                 'walk_forced')
+                 'walk_forced', 'belief', 'belief_mix')
 
     def __init__(self, game, redet=True, rng=None):
         self.viewer = game.to_move
@@ -104,8 +110,19 @@ class Tree:
         self.n = game.n_players
         self.team = max(1, getattr(game, 'team_size', 1))
         self.root = Node(self.viewer, list(game.legal()))
+        self.belief, self.belief_mix = None, 0.0
         self.set_root_min(0)
         self.set_base(game, rng)
+
+    def set_belief(self, belief, mix=0.0, game=None, rng=None):
+        """The root's belief for the search starting now (docs/search.md 3.8; the Rust tree's
+        `set_belief`): `belief` = (predictions float32 [aux width], tilt > 0, clip) or None (uniform
+        worlds), `mix` the share of simulations dealt uniformly; without redet the one world of the
+        decision is dealt again from `game`. `advance` clears it."""
+        self.belief = belief
+        self.belief_mix = float(mix) if belief is not None else 0.0
+        if not self.redet:
+            self.set_base(game, rng)
 
     def set_root_min(self, k):
         """Root minimum visits for the search starting now (0 = off); clears the forced walks'
@@ -121,8 +138,19 @@ class Tree:
             self.base = game
         else:
             g = game.clone()
-            g.determinize(self.viewer, rng.getrandbits(63))
+            deal(g, self, rng)
             self.base = g
+
+
+def deal(g, tree, rng):
+    """Deal world `g` for the tree's viewer (docs/search.md 3.8): `determinize_with` the tree's belief,
+    but a `belief_mix` share (one `rng.random()` draw when 0 < mix) and every world without a belief
+    `determinize` (one `rng.getrandbits(63)` seed either way)."""
+    b = tree.belief
+    if b is not None and not (tree.belief_mix > 0 and rng.random() < tree.belief_mix):
+        g.determinize_with(tree.viewer, rng.getrandbits(63), b[0], b[1], b[2])
+    else:
+        g.determinize(tree.viewer, rng.getrandbits(63))
 
 
 def transition(g, a, forced=None):
@@ -250,6 +278,45 @@ def forced_tag(k=0, max_actions=4):
 
 LEAF_VIEWS = ('mover', 'root')
 VIEW_TARGETS = ('next_q', 'z')
+BELIEF_CLIP = 20.0                       # the Rust driver's default `belief_clip` (driver::BELIEF_CLIP)
+
+
+def check_belief(tilt=0.0, clip=None, mix=0.0, what='belief_tilt'):
+    """The root's belief settings (docs/search.md 3.8): tilt a finite number >= 0 (0 = off), clip
+    None (the default 20) or a finite number >= 1, mix a share in [0, 1) (1 would deal every world
+    uniformly: the tilt a no-op) -> None, else ValueError (`what`: the tilt's setting name)."""
+    def num(x):
+        return not isinstance(x, bool) and isinstance(x, (int, float)) and math.isfinite(x)
+    if not num(tilt) or tilt < 0:
+        raise ValueError(f'{what} {tilt!r}: a finite number >= 0 (0 = off)')
+    if clip is not None and (not num(clip) or clip < 1):
+        raise ValueError(f'belief_clip {clip!r}: a finite number >= 1 (every weight in [1/clip, clip])')
+    if not num(mix) or not 0.0 <= float(mix) < 1.0:
+        raise ValueError(f'belief_mix {mix!r}: a share in [0, 1) of the simulations dealt uniformly (1 would make '
+                         f'{what} a no-op: set it to 0)')
+
+
+def belief_settings(cfg, pre='eval'):
+    """(tilt, clip, mix, fast) of the root's belief of a run's seats `pre` ('eval' | 'selfplay') from
+    its settings `cfg` (missing keys at their defaults: <pre>_belief_tilt 0 = off, belief_clip 20,
+    belief_mix 0, belief_fast 0; docs/az.md 18)."""
+    return (float(cfg.get(pre + '_belief_tilt', 0.0) or 0.0), float(cfg.get('belief_clip', BELIEF_CLIP) or BELIEF_CLIP),
+            float(cfg.get('belief_mix', 0.0) or 0.0), bool(int(cfg.get('belief_fast', 0) or 0)))
+
+
+def belief_tag(tilt=0.0, clip=None, mix=0.0, fast=False):
+    """The suffix of a move rule's name for its searches' root belief (docs/search.md 3.8): '' (off),
+    '-b1' (tilt 1, the default clip 20, no uniform share, full searches), '-b0.5c10m0.25f' (tilt 0.5,
+    clip 10, mix 0.25, fast searches too) - an evaluation's moves change with it, so its Elo pool does
+    (docs/az.md 5.4); a remote evaluation on a checkout without it reports another rule and is refused."""
+    if not tilt:
+        return ''
+    t = f'-b{float(tilt):g}'
+    if clip is not None and float(clip) != BELIEF_CLIP:
+        t += f'c{float(clip):g}'
+    if mix:
+        t += f'm{float(mix):g}'
+    return t + ('f' if fast else '')
 
 
 def check_leaf_view(view='mover', share=0.0, target='next_q', what='leaf_value_view'):
@@ -298,7 +365,7 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
     tree.walk_forced = None
     g = tree.base.clone()
     if tree.redet:
-        g.determinize(tree.viewer, rng.getrandbits(63))
+        deal(g, tree, rng)
         if g.legal() != tree.root.acts or g.to_move != tree.root.player:
             raise RuntimeError(f"determinize() changed the root decision: {tree.root.acts} -> {g.legal()}")
     node = tree.root

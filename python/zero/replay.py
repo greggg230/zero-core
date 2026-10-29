@@ -61,7 +61,7 @@ import numpy as np
 
 from . import games as G, package
 from .infer import NetEvaluator, drive
-from .mcts import select_settings
+from .mcts import belief_settings, select_settings
 from .net import load
 from .play import NNSeat, PyDriver, Slot
 from .protocol import LeafBatch
@@ -203,13 +203,8 @@ class RecordingDriver(PyDriver):
                 if slot.sims >= slot.target:
                     self._decide(slot, seat, tree, p)
                     continue
-                r = tree.simulate(g, slot.search_rng, seat)
-                if r is None:
-                    slot.sims += 1
-                    continue
-                player, x, acts, vx = r
-                need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts, vx))
-                break
+                if self._simulate(slot, seat, tree, p, g, need):
+                    break
         for slot in finished:
             self.active.remove(slot)
             self._finish(slot)
@@ -293,7 +288,8 @@ def _nn(key, sims, cfg, selfplay, chance_k, select=None):
     selfplay_select with `selfplay`, with the rule's completed-Q transform: `mcts.select_settings`)
     unless `select` = (rule, min_visits) or (rule, min_visits, c_visit, c_scale) says otherwise (a
     rule None: the run's rule and guard; a transform None or left out: the run's rule's). Its leaf
-    values' view is the run's (selfplay_ / eval_leaf_value_view, docs/search.md 3.6)."""
+    values' view is the run's (selfplay_ / eval_leaf_value_view, docs/search.md 3.6), and so is its
+    root's belief (selfplay_ / eval_belief_tilt, belief_clip, belief_mix, belief_fast; docs/search.md 3.8)."""
     pre = 'selfplay_select' if selfplay else 'eval_select'
     rule, mv, cv, cs = select_settings(cfg, pre)
     if select:
@@ -308,7 +304,14 @@ def _nn(key, sims, cfg, selfplay, chance_k, select=None):
                   chance_k=chance_k, redet=bool(cfg.get('redet', 1)), impl='rs', cq_c_visit=cfg.get('cq_c_visit', 50.0),
                   cq_c_scale=cfg.get('cq_c_scale', 1.0), select=rule, select_min_visits=int(mv),
                   select_c_visit=None if rule == 'visits' else cv, select_c_scale=None if rule == 'visits' else cs,
-                  leaf_value_view=cfg.get(('selfplay' if selfplay else 'eval') + '_leaf_value_view', 'mover'))
+                  leaf_value_view=cfg.get(('selfplay' if selfplay else 'eval') + '_leaf_value_view', 'mover'),
+                  **belief_kw(cfg, 'selfplay' if selfplay else 'eval'))
+
+
+def belief_kw(cfg, pre):
+    """An NNSeat's root-belief keywords from a run's settings (`mcts.belief_settings`; {} when off)."""
+    tilt, clip, mix, fast = belief_settings(cfg, pre)
+    return dict(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast) if tilt else {}
 
 
 def _with_rule(info, seat):

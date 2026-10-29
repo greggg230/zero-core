@@ -21,6 +21,13 @@ side's transform flag on a 'visits' side is an error, as are both-sides flags wh
 (`GamePackage.specs`, e.g. Caverna {"full": true}, Glass Road {"intro": false}) unless --spec is
 given. Prints one JSON line: A's score (+- 1 se), its mean score margin, the Elo difference, each
 side's rule (`select_a`, `select_b`: e.g. 'cq-n4-v50-s0.3'). The models are only read.
+
+The root's belief (docs/search.md 3.8): each side deals its search's worlds as its run evaluates
+(eval_belief_tilt, belief_clip, belief_mix, belief_fast in its config.json) unless --a-belief-tilt /
+--b-belief-tilt (0 = uniform), --*-belief-clip, --*-belief-mix, --*-belief-fast say otherwise; a side
+with a tilt needs a checkpoint with the auxiliary head (refused before the match: net.HeadMissing).
+`A A --a-belief-tilt 1 --b-belief-tilt 0` is the evaluation-only A/B of the belief on one checkpoint.
+Each side's rule name carries it ('-b1', 'select_a').
 """
 import argparse
 import json
@@ -30,8 +37,9 @@ import time
 
 from . import games as G, package
 from .infer import NetEvaluator, drive
-from .mcts import check_select, check_select_transform, forced_tag, select_settings, select_tag, select_transform, view_tag
-from .net import load
+from .mcts import (belief_settings, belief_tag, check_belief, check_select, check_select_transform, forced_tag,
+                   select_settings, select_tag, select_transform, view_tag)
+from .net import check_belief_head, load
 
 
 def run_rule(ckpt):
@@ -55,6 +63,9 @@ def run_rule(ckpt):
                'root_min_visits_max_actions': int(c.get('root_min_visits_max_actions', 4))}
     if c.get('eval_leaf_value_view', 'mover') != 'mover':
         out['leaf_value_view'] = c['eval_leaf_value_view']
+    tilt, clip, mix, fast = belief_settings(c, 'eval')
+    if tilt:
+        out.update(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast)
     if c.get('eval_select', 'visits') == 'visits':
         return out
     rule, mv, cv, cs = select_settings(c, 'eval_select')
@@ -95,7 +106,35 @@ def _tag(seat):
                               seat.get('select_c_scale'))
     return select_tag(seat.get('select', 'visits'), seat.get('select_min_visits', 0), cv, cs) + forced_tag(
         seat.get('root_min_visits', 0), seat.get('root_min_visits_max_actions', 4)) + view_tag(
-        seat.get('leaf_value_view', 'mover'))
+        seat.get('leaf_value_view', 'mover')) + belief_tag(seat.get('belief_tilt', 0.0), seat.get('belief_clip'),
+                                                           seat.get('belief_mix', 0.0), seat.get('belief_fast', False))
+
+
+def with_belief(keys, tilt=None, clip=None, mix=None, fast=None):
+    """A side's seat keys with its root belief (docs/search.md 3.8) as given (None: as it was): tilt 0
+    removes it (uniform worlds); clip / mix / fast change a side that has one (or is given one)."""
+    keys = dict(keys)
+    if tilt is not None:
+        if float(tilt) == 0:
+            for k in ('belief_tilt', 'belief_clip', 'belief_mix', 'belief_fast'):
+                keys.pop(k, None)
+            return keys
+        keys.setdefault('belief_clip', 20.0)
+        keys.setdefault('belief_mix', 0.0)
+        keys.setdefault('belief_fast', False)
+        keys['belief_tilt'] = float(tilt)
+    if not keys.get('belief_tilt'):
+        if (clip, mix, fast) != (None, None, None):
+            raise ValueError('--*-belief-clip / -mix / -fast for a side without a root belief (give its --*-belief-tilt)')
+        return keys
+    if clip is not None:
+        keys['belief_clip'] = float(clip)
+    if mix is not None:
+        keys['belief_mix'] = float(mix)
+    if fast is not None:
+        keys['belief_fast'] = bool(fast)
+    check_belief(keys['belief_tilt'], keys['belief_clip'], keys['belief_mix'])
+    return keys
 
 
 def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None,
@@ -117,6 +156,9 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     sb = G.nn_seat('b', sims, c_puct, chance_k=chance_k)
     sa.update(run_rule(a) if seat_a is None else seat_a)
     sb.update(run_rule(b) if seat_b is None else seat_b)
+    for s, m, p in ((sa, ma, a), (sb, mb, b)):
+        if s.get('belief_tilt'):
+            check_belief_head(m, game, f'belief_tilt of {p}')     # (before any game: a loud refusal)
     seats = [[sa, sb] if g % 2 == 0 else [sb, sa] for g in range(games)]
     kw = {'move_log': move_log} if move_log else {}
     drv = G.Driver(game, seats, spec=spec, concurrency=conc or min(games, 1024), seed=seed, threads=threads,
@@ -168,9 +210,16 @@ def main(argv=None):
         ap.add_argument(f'--{side}-leaf-value-view', default=None, choices=['mover', 'root'],
                         help=f"side {side.upper()}'s leaf values' view (docs/search.md 3.6; default: its checkpoint's "
                              f"run's eval_leaf_value_view)")
+        ap.add_argument(f'--{side}-belief-tilt', type=float, default=None,
+                        help=f"side {side.upper()}'s root belief tilt (docs/search.md 3.8; 0 = uniform worlds; default: its "
+                             f"checkpoint's run's eval_belief_tilt)")
+        ap.add_argument(f'--{side}-belief-clip', type=float, default=None)
+        ap.add_argument(f'--{side}-belief-mix', type=float, default=None)
+        ap.add_argument(f'--{side}-belief-fast', type=int, default=None, choices=[0, 1])
+    ap.add_argument('--torch-threads', type=int, default=1, help='torch intra-op threads (default 1)')
     a = ap.parse_args(argv)
     import torch
-    torch.set_num_threads(1)
+    torch.set_num_threads(max(1, a.torch_threads))
     try:
         import psutil
         psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if os.name == 'nt' else 10)
@@ -199,6 +248,11 @@ def main(argv=None):
             keys.pop('leaf_value_view', None)
         elif view == 'root':
             keys['leaf_value_view'] = 'root'
+    try:
+        sides = [with_belief(k, *(getattr(a, f'{s}_belief_{x}') for x in ('tilt', 'clip', 'mix', 'fast')))
+                 for s, k in zip(('a', 'b'), sides)]
+    except ValueError as e:
+        ap.error(str(e))
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
                            spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log)), flush=True)
 

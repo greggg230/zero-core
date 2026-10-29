@@ -19,10 +19,13 @@ while the previous one's results come back and are softmaxed on the CPU (one CUD
 the graphs' static inputs in order; the pinned host buffers alternate between two slots).
 ZERO_INFLIGHT=1: one batch at a time, as before.
 
-Auxiliary heads (docs/az.md 15): the search's evaluations never compute them (`forward` without
-`aux`); `NetEvaluator.aux(x, n_players)` is the inference API for them - one forward pass of the given
-rows (e.g. a decision's root, MTG Zero's belief of the opponent's hand) -> each target's predictions
-(`net.aux_predict`). `set_weights` takes a state with or without the head either way (a rolling
+Auxiliary heads (docs/az.md 15): the search's evaluations compute them only for a batch's root
+belief rows (`extra` == ROW_BELIEF, docs/search.md 3.8: the head on those rows alone, in the same
+forward pass; the answer's fourth item `aux` [belief rows, aux width], each target's predictions
+concatenated in the head's order - a network without the head raises net.HeadMissing; such a batch
+skips the CUDA graphs); `NetEvaluator.aux(x, n_players)` is the inference API for them - one forward
+pass of the given rows (e.g. a decision's root, MTG Zero's belief of the opponent's hand) -> each
+target's predictions (`net.aux_predict`). `set_weights` takes a state with or without the head either way (a rolling
 evaluator built before a run turned its auxiliary target on, or one with the head given an older
 state).
 
@@ -49,7 +52,7 @@ import time
 import numpy as np
 import torch
 
-from .protocol import MAX_SEATS
+from .protocol import MAX_SEATS, belief_rows
 
 ROW_STEP = 64                    # CUDA graphs are captured for batch sizes padded to this step
 
@@ -238,11 +241,16 @@ class NetEvaluator:
                                    f'another encoding than its driver feeds it')
 
     @torch.inference_mode()
-    def evaluate(self, x, n_players, opt_off, opt_action):
-        """numpy in -> (priors [options], value [B, MAX_SEATS], margin [B, MAX_SEATS]) numpy."""
+    def evaluate(self, x, n_players, opt_off, opt_action, extra=None):
+        """numpy in -> (priors [options], value [B, MAX_SEATS], margin [B, MAX_SEATS]) numpy; with root
+        belief rows in `extra` (docs/search.md 3.8) a fourth item, their auxiliary predictions
+        [belief rows, aux width]."""
         t0 = time.perf_counter()
         self._check_width(x)
-        if self._graphable(opt_off):
+        brows = belief_rows(extra)
+        if len(brows):
+            self._check_head()
+        if not len(brows) and self._graphable(opt_off):
             r = self.fast.evaluate(x, n_players, opt_off, opt_action)
             self.calls += 1
             self.leaves += x.shape[0]
@@ -253,7 +261,10 @@ class NetEvaluator:
         xt = torch.from_numpy(x).to(dev, non_blocking=True)
         nt = torch.from_numpy(n_players.astype(np.int64)).to(dev)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
-            plog, vlog, mar = self.model(xt, nt)
+            if len(brows):
+                plog, vlog, mar, raw = self.model(xt, nt, aux=True, aux_rows=torch.from_numpy(brows).to(dev))
+            else:
+                plog, vlog, mar = self.model(xt, nt)
         cnt = torch.from_numpy(np.diff(opt_off).astype(np.int64)).to(dev)
         rows = torch.repeat_interleave(torch.arange(B, device=dev), cnt)
         acts = torch.from_numpy(opt_action.astype(np.int64)).to(dev)
@@ -269,6 +280,10 @@ class NetEvaluator:
         value[:, :seats] = val.cpu().numpy()
         margin[:, :seats] = mar.float().cpu().numpy()
         value[np.arange(MAX_SEATS)[None, :] >= n_players[:, None]] = 0.0
+        if len(brows):
+            from .net import aux_predict
+            pred = aux_predict(self.aux_layout, raw)
+            aux = np.concatenate([pred[t[0]].float().cpu().numpy() for t in self.aux_layout], 1).astype(np.float32)
         if self.pool is not None:
             with self.lock:
                 self.calls += 1
@@ -278,10 +293,22 @@ class NetEvaluator:
             self.calls += 1
             self.leaves += B
             self.seconds += time.perf_counter() - t0
+        if len(brows):
+            return pri, value, margin, aux
         return pri, value, margin
 
+    def _check_head(self):
+        """Root belief rows need the auxiliary head (net.HeadMissing otherwise: never a silent uniform
+        deal)."""
+        if not self.aux_layout:
+            from .net import HeadMissing
+            c = getattr(self.model, 'config', {})
+            raise HeadMissing(f'a leaf batch with root belief rows (a seat\'s belief_tilt > 0) for a network without the '
+                              f'auxiliary head (game {c.get("game")!r}, arch {c.get("arch", "mlp")!r}): the root\'s belief '
+                              f'needs a checkpoint with a trained head (docs/search.md 3.8)')
+
     def __call__(self, lb):
-        return self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action)
+        return self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, lb.a.get('extra'))
 
     @property
     def aux_layout(self):
@@ -310,14 +337,15 @@ class NetEvaluator:
     def launch(self, lb):
         """Start evaluating a LeafBatch; `result(handle)` -> what `ev(lb)` returns. Eager
         evaluators compute at once (or on a worker thread, `workers` > 1)."""
+        extra = lb.a.get('extra')
         if self.pool is not None:
-            return ('f', self.pool.submit(self.evaluate, lb.x, lb.n_players, lb.opt_off, lb.opt_action), 0)
+            return ('f', self.pool.submit(self.evaluate, lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra), 0)
         t0 = time.perf_counter()
-        if self._graphable(lb.opt_off):
+        if self._graphable(lb.opt_off) and not len(belief_rows(extra)):
             self._check_width(lb.x)
             h = ('g', self.fast.launch(lb.x, lb.n_players, lb.opt_off, lb.opt_action), lb.B)
         else:
-            h = ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action), 0)
+            h = ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra), 0)
         self.seconds += time.perf_counter() - t0
         return h
 

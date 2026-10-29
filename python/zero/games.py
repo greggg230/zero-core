@@ -98,7 +98,7 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             p_full=1.0, chance_k=0, margin_w=0.0, redet=True, policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0,
             sims_minor=None, select='visits', select_min_visits=0, select_c_visit=None, select_c_scale=None,
             root_min_visits=0, root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
-            view_sample_target='next_q'):
+            view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
@@ -116,12 +116,15 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     leaf_value_view: whose view its search leaves' values come from, 'mover' (no key, the seat of
     before) | 'root'; view_samples: the share of its recorded decisions that also record the other
     recording seats' value-only samples, with their q target view_sample_target (docs/search.md 3.6;
-    0 = off: no keys)."""
-    from .mcts import check_leaf_view, check_root_min, check_select, check_select_transform, select_transform
+    0 = off: no keys). belief_tilt: the root's belief (docs/search.md 3.8; 0 = off: no keys, the seat
+    of before) with its clip (None: the default 20), the uniform share belief_mix and belief_fast
+    (fast and minor searches take it too)."""
+    from .mcts import check_belief, check_leaf_view, check_root_min, check_select, check_select_transform, select_transform
     check_select(select, select_min_visits)
     check_select_transform(select, select_c_visit, select_c_scale)
     check_root_min(root_min_visits, root_min_visits_max_actions)
     check_leaf_view(leaf_value_view, view_samples, view_sample_target)
+    check_belief(belief_tilt, belief_clip, belief_mix)
     d = dict(key=key, sims=sims, c_puct=c_puct, selfplay=selfplay, alpha=alpha, eps=eps, temp_moves=temp_moves,
              sims_fast=sims_fast, p_full=p_full, chance_k=chance_k, margin_w=margin_w, redet=redet)
     sel = select_transform(cq_c_visit, cq_c_scale, select_c_visit, select_c_scale)
@@ -141,6 +144,10 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
         d['leaf_value_view'] = leaf_value_view
     if view_samples:
         d.update(view_samples=float(view_samples), view_sample_target=view_sample_target)
+    if belief_tilt:
+        from .mcts import BELIEF_CLIP
+        d.update(belief_tilt=float(belief_tilt), belief_clip=float(BELIEF_CLIP if belief_clip is None else belief_clip),
+                 belief_mix=float(belief_mix), belief_fast=bool(belief_fast))
     return d
 
 
@@ -159,8 +166,9 @@ class Driver:
         r = self.d.poll_batch()
         return None if r is None else LeafBatch(*r)
 
-    def submit(self, bid, priors, value, margin):
-        self.d.submit(bid, priors, value, margin)
+    def submit(self, bid, priors, value, margin, aux=None):
+        """`aux`: the root belief rows' auxiliary outputs (docs/search.md 3.8), when the batch has some."""
+        self.d.submit(bid, priors, value, margin, aux)
 
     def submit_external(self, bid, payloads):
         self.d.submit_external(bid, payloads)

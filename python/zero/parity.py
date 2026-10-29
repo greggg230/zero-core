@@ -20,6 +20,11 @@
   the leaves of the other seat valued from the root decider's view: the mean visit distributions,
   completed-Q targets and root win agree at the noise floor (Python vs Python), and differ from the
   mover-view search of the same positions (the setting matters: a power check).
+* `belief`: the root's belief (docs/search.md 3.8) - positions searched by both trees with a fixed
+  belief of the hidden cards (the toy: its next round's card, a sharp prediction on one unrevealed
+  card) dealing their worlds: the mean visit distributions, completed-Q targets and root win agree at
+  the noise floor (Python vs Python), the believed card's share of the leaves' worlds is the deal's
+  in both, and the searches differ from the uniform deal's of the same positions (a power check).
 * `h2h`: games between a Rust-tree seat and a Python-tree seat (`play.PyDriver`, seats
   alternating), both searching with the same network and settings (and move rule): ~50% within
   error.
@@ -28,6 +33,7 @@
   python -m zero.parity positions --game toy_team --players 4     (deferred leaves, teams of 2)
   python -m zero.parity forced [--k 4 --sims 96 --reps 24]         (root minimum visits)
   python -m zero.parity root_view [--sims 96 --reps 24]            (root-view leaf values)
+  python -m zero.parity belief [--sims 96 --reps 24 --tilt 1]       (the root's belief)
   python -m zero.parity h2h --model runs/toy1/models/iter_0010.pt [--games 2000 --sims 32 --select cq]
   (or python -m <pkg>.az.parity ... in a game repo)
 """
@@ -69,18 +75,25 @@ class LinearEval:
 
 
 def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0,
-              root_view=False):
+              root_view=False, belief=None, worlds=None):
     """-> (root visits, root win[, completed-Q target with cq = (c_visit, c_scale)][, the tree]);
     `root_min`: the root minimum visits of the search (docs/search.md 3.5; 0 = off); `root_view`:
-    another seat's leaves take their value from the viewer's features (docs/search.md 3.6)."""
+    another seat's leaves take their value from the viewer's features (docs/search.md 3.6); `belief` =
+    (predictions, tilt, clip, mix): the root's belief dealing the worlds (docs/search.md 3.8); `worlds`:
+    a list that gets each leaf's world's auxiliary targets for the viewer (`Game.aux_target`) when the
+    leaf is in the root's round."""
     rng = random.Random(seed)
     t = mcts.Tree(g, redet, rng)
     t.set_root_min(root_min)
+    if belief is not None:
+        t.set_belief((np.asarray(belief[0], np.float32), belief[1], belief[2]), belief[3], g, rng)
     for _ in range(sims):
         r = mcts.simulate(t, rng, c_puct, chance_k)
         if r is None:
             continue
         node, leaf, path = r
+        if worlds is not None and leaf.rounds == g.rounds:
+            worlds.append(np.asarray(leaf.aux_target(t.viewer)))
         pri, v, m = ev(leaf.encode(node.player), node.acts, g.n_players)
         vp = None
         if root_view and node.player != t.viewer:
@@ -94,10 +107,12 @@ def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
 
 
 def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0,
-              root_view=False):
+              root_view=False, belief=None):
     """`search_py` with the Rust tree (`<package>._engine.SearchTree`)."""
     t = g.search_tree(redet, seed)
     t.set_root_min(root_min)
+    if belief is not None:
+        t.set_belief(np.asarray(belief[0], np.float32), g, belief[1], belief[2], belief[3])
     for _ in range(sims):
         r = t.simulate(g, c_puct, chance_k, root_view=True) if root_view else t.simulate(g, c_puct, chance_k)
         if r is None:
@@ -293,6 +308,76 @@ def root_view(game='toy', n=10, sims=96, reps=24, seed=0, scale=0.15, cq=(50.0, 
     return {k: float(np.mean(v)) for k, v in res.items()} | {'positions': n, 'sims': sims, 'reps': reps}
 
 
+def belief_positions(n=8, seed=0):
+    """Toy positions (>= 3 options) whose next round's card is hidden among >= 2 unrevealed cards of its
+    stage, each with a belief sharp on one of those cards (its auxiliary target's column) -> [(game,
+    predictions, the believed card, the cards it is among)]."""
+    out = []
+    for g in sample_positions('toy', 4 * n, seed, depth=(3, 60)):
+        tgt = np.asarray(g.aux_target(g.to_move))
+        if not tgt.any():
+            continue                               # the last round: no next card
+        # the cards it can be: those the deal of a few worlds gives
+        cards = set()
+        for s in range(40):
+            w = g.clone()
+            w.determinize(g.to_move, 7000 + s)
+            cards.add(int(np.argmax(w.aux_target(g.to_move))))
+        if len(cards) < 2:
+            continue
+        c = sorted(cards)[0]
+        pred = np.full(6, 0.02, np.float32)
+        pred[c] = 1.0 - 0.02 * 5
+        out.append((g, pred, c, sorted(cards)))
+        if len(out) == n:
+            break
+    return out
+
+
+def belief(n=8, sims=96, reps=24, seed=0, scale=0.15, cq=(50.0, 1.0), tilt=1.0, clip=20.0, mix=0.0, verbose=False):
+    """The root's belief in both trees (docs/search.md 3.8; the toy's next round's card): `belief_positions`,
+    the stand-in `LinearEval`, both trees with the belief (tilt, clip, mix). -> dict: the TVs Rust-Python
+    and Python-Python of the mean visit distributions (`tv_*`) and completed-Q targets (`tv_cq_*`), |Rust -
+    Python| of the decider's mean root win (`win_diff`), the TV between the Python tree's belief and
+    uniform searches (`tv_belief`: what the belief changes), and the believed card's share of the Python
+    leaves' worlds (`share`) against the deal's own (`share_want`: w_c / sum w over the cards it is among,
+    `zero.games.engine().belief_weight`), averaged over the positions."""
+    E = engine()
+    info = E.game_info_of('toy')
+    ev = LinearEval(info['num_features'], info['num_actions'], seed=1, scale=scale)
+    res = {k: [] for k in ('tv_rs_py', 'tv_py_py', 'tv_cq_rs_py', 'tv_cq_py_py', 'win_diff', 'tv_belief', 'share',
+                           'share_want')}
+    for i, (g, pred, c, cards) in enumerate(belief_positions(n, seed)):
+        b = (pred, tilt, clip, mix)
+        worlds = []
+        rs = [search_rs(g, ev, sims, 1000 + r, cq=cq, belief=b) for r in range(reps)]
+        pa = [search_py(g, ev, sims, 2000 + r, cq=cq, belief=b, worlds=worlds) for r in range(reps)]
+        pb = [search_py(g, ev, sims, 3000 + r, cq=cq, belief=b) for r in range(reps)]
+        pu = [search_py(g, ev, sims, 4000 + r, cq=cq) for r in range(reps)]
+        mr, ma, mb, mu = (np.mean([x[0] for x in s], 0) for s in (rs, pa, pb, pu))
+        res['tv_rs_py'].append(tv(mr, ma))
+        res['tv_py_py'].append(tv(ma, mb))
+        res['tv_belief'].append(tv(mu, ma))
+        cr, ca, cb = (np.mean([x[2] for x in s], 0) for s in (rs, pa, pb))
+        res['tv_cq_rs_py'].append(tv(cr, ca))
+        res['tv_cq_py_py'].append(tv(ca, cb))
+        wr = np.mean([x[1][g.to_move] for x in rs])
+        wa = np.mean([x[1][g.to_move] for x in pa])
+        res['win_diff'].append(abs(wr - wa))
+        k = len(cards)
+        w = {d: E.belief_weight(float(pred[d]), 1.0 / k, tilt, clip) for d in cards}
+        want = (1 - mix) * w[c] / sum(w.values()) + mix / k
+        res['share'].append(float(np.mean([int(np.argmax(x)) == c for x in worlds])) if worlds else want)
+        res['share_want'].append(want)
+        if verbose:
+            print(f'position {i}: {len(g.legal())} options, next card among {cards}, TV rs-py {res["tv_rs_py"][-1]:.4f} '
+                  f'py-py {res["tv_py_py"][-1]:.4f}, belief vs uniform {res["tv_belief"][-1]:.4f}, cq TV rs-py '
+                  f'{res["tv_cq_rs_py"][-1]:.4f} py-py {res["tv_cq_py_py"][-1]:.4f}, root win rs {wr:.4f} py {wa:.4f}, '
+                  f'card {c} share {res["share"][-1]:.3f} (deal {want:.3f})', flush=True)
+    return {k: float(np.mean(v)) for k, v in res.items()} | {'positions': n, 'sims': sims, 'reps': reps, 'tilt': tilt,
+                                                              'clip': clip, 'mix': mix}
+
+
 def cq_formula(game='toy', n=8, sims=64, seed=0, cq_settings=((50.0, 1.0), (50.0, 0.1), (10.0, 3.0)), scale=0.15):
     """The Python `completed_q_policy` on Rust roots' statistics (P0, N, W, network value) vs
     the Rust tree's own target. -> max |difference|."""
@@ -404,6 +489,13 @@ def main(argv=None):
     fo.add_argument('--k', type=int, default=4)
     fo.add_argument('--eps', type=float, default=0.001, help='the prior left to the options but the favourite')
     fo.add_argument('--cq-c-scale', type=float, default=1.0)
+    bl = sub.add_parser('belief')
+    bl.add_argument('--positions', type=int, default=8)
+    bl.add_argument('--sims', type=int, default=96)
+    bl.add_argument('--reps', type=int, default=24)
+    bl.add_argument('--tilt', type=float, default=1.0)
+    bl.add_argument('--clip', type=float, default=20.0)
+    bl.add_argument('--mix', type=float, default=0.0)
     rv = sub.add_parser('root_view')
     rv.add_argument('--game', default='toy')
     rv.add_argument('--positions', type=int, default=10)
@@ -416,6 +508,9 @@ def main(argv=None):
                                    players=a.players, depth=tuple(a.depth))))
     elif a.cmd == 'select':
         print(json.dumps(select_formula(a.game, n=a.positions)))
+    elif a.cmd == 'belief':
+        print(json.dumps(belief(n=a.positions, sims=a.sims, reps=a.reps, tilt=a.tilt, clip=a.clip, mix=a.mix,
+                                verbose=True)))
     elif a.cmd == 'root_view':
         print(json.dumps(root_view(a.game, n=a.positions, sims=a.sims, reps=a.reps, verbose=True)))
     elif a.cmd == 'forced':

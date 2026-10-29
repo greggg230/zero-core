@@ -15,14 +15,18 @@ docs/search.md 3.1). Root-view leaf values (`leaf_value_view` 'root', docs/searc
 seat's leaf adds a value-only row of the tree's viewer right after its own row in the batch; the
 value-only samples (`view_samples`): a share of the recorded decisions (`view_pick`, the Rust
 driver's hash) also record every other recording seat's view of the real state, no options, q
-= that seat's next search's root value ('next_q') or z.
+= that seat's next search's root value ('next_q') or z. The root's belief (`belief_tilt` > 0,
+docs/search.md 3.8): a search that takes it (full searches; every one with `belief_fast`) sends one
+`ROW_BELIEF` row of the root's features - after the fresh root's own leaf row, or alone (a reused
+root: its simulations wait) - and deals its worlds by the batch's auxiliary answer for it (`submit`'s
+`aux`) from then on.
 """
 import random
 
 import numpy as np
 
 from . import mcts
-from .protocol import LeafBatch, MAX_SEATS, ROW_LEAF, ROW_VALUE, concat_samples
+from .protocol import LeafBatch, MAX_SEATS, ROW_BELIEF, ROW_LEAF, ROW_VALUE, belief_rows, concat_samples
 
 
 POLICY_TARGETS = ('visits', 'cq')
@@ -59,20 +63,22 @@ class NNSeat:
     root_min_visits_max_actions: the root minimum visits of its full searches (0 = off; docs/search.md
     3.5). leaf_value_view: 'mover' | 'root' (whose view a leaf's value comes from), view_samples: the
     share of its recorded decisions that also record value-only samples (0 = off), view_sample_target:
-    their q, 'next_q' | 'z' (docs/search.md 3.6)."""
+    their q, 'next_q' | 'z' (docs/search.md 3.6). belief_tilt (0 = off), belief_clip (None: 20),
+    belief_mix, belief_fast: the root's belief of its searches (docs/search.md 3.8)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
                  policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0, select='visits', select_min_visits=0,
                  select_c_visit=None, select_c_scale=None, record=True, root_min_visits=0,
                  root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
-                 view_sample_target='next_q'):
+                 view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
         mcts.check_select(select, select_min_visits)
         mcts.check_select_transform(select, select_c_visit, select_c_scale)
         mcts.check_root_min(root_min_visits, root_min_visits_max_actions)
         mcts.check_leaf_view(leaf_value_view, view_samples, view_sample_target)
+        mcts.check_belief(belief_tilt, belief_clip, belief_mix)
         self.key, self.sims, self.c_puct, self.selfplay = key, sims, c_puct, selfplay
         self.alpha, self.eps, self.temp_moves = alpha, eps, temp_moves
         self.sims_fast, self.p_full, self.chance_k, self.margin_w = sims_fast, p_full, chance_k, margin_w
@@ -84,6 +90,12 @@ class NNSeat:
         self.root_min_visits, self.root_min_visits_max_actions = root_min_visits, root_min_visits_max_actions
         self.leaf_value_view, self.view_samples = leaf_value_view, float(view_samples)
         self.view_sample_target = view_sample_target
+        self.belief_tilt, self.belief_mix, self.belief_fast = float(belief_tilt), float(belief_mix), bool(belief_fast)
+        self.belief_clip = float(mcts.BELIEF_CLIP if belief_clip is None else belief_clip)
+
+    def takes_belief(self, full):
+        """Whether its search of a decision takes the root's belief (`full`: a full search)."""
+        return self.belief_tilt > 0 and (full or self.belief_fast)
 
     @property
     def select_transform(self):
@@ -136,6 +148,13 @@ class PySearch:
     def set_root_min(self, k):
         self.t.set_root_min(k)
 
+    @property
+    def has_belief(self):
+        return self.t.belief is not None
+
+    def set_belief(self, pred, seat, game, rng):
+        self.t.set_belief((np.asarray(pred, np.float32), seat.belief_tilt, seat.belief_clip), seat.belief_mix, game, rng)
+
     def stats(self):
         """acts, visit counts, P0, root win vector - without the forced walks (root minimum visits)."""
         r = self.t.root
@@ -163,6 +182,7 @@ class PySearch:
             return False
         self.t.root = child
         self.t.set_root_min(0)
+        self.t.belief, self.t.belief_mix = None, 0.0          # (a belief is one decision's)
         return True
 
 
@@ -201,6 +221,13 @@ class RsSearch:
 
     def set_root_min(self, k):
         self.t.set_root_min(k)
+
+    @property
+    def has_belief(self):
+        return self.t.belief is not None
+
+    def set_belief(self, pred, seat, game, rng):
+        self.t.set_belief(np.asarray(pred, np.float32), game, seat.belief_tilt, seat.belief_clip, seat.belief_mix)
 
     def stats(self):
         if self.t.root_min:
@@ -246,7 +273,7 @@ def make_bot(game, name, rng):
 
 class Slot:
     __slots__ = ('gid', 'rng', 'np_rng', 'search_rng', 'game', 'n', 'seats', 'bots', 'trees', 'sims', 'target',
-                 'full', 'records', 'decisions', 'steps', 'view_wait')
+                 'full', 'records', 'decisions', 'steps', 'view_wait', 'belief')
 
     def __init__(self, gid, game, spec, seats, rng):
         from .games import engine
@@ -267,6 +294,7 @@ class Slot:
         self.decisions = 0
         self.steps = 0
         self.view_wait = []                 # value-only records waiting for (record index, observer)'s next search
+        self.belief = False                 # the current search takes the root's belief
 
 
 class PyDriver:
@@ -291,6 +319,7 @@ class PyDriver:
         self.results = []
         self.samples = []
         self.sims = 0
+        self.belief_rows = 0                # root belief rows sent (docs/search.md 3.8)
         self._refill()
 
     # ---- protocol ---------------------------------------------------------------------------
@@ -307,16 +336,40 @@ class PyDriver:
             self._round()
         return self.queue.pop(0)
 
-    def submit(self, bid, priors, value, margin):
-        lb, items = self.outstanding.pop(bid)
+    def submit(self, bid, priors, value, margin, aux=None):
+        """A network batch's answer; `aux` [belief rows, aux width]: the auxiliary outputs of its root
+        belief rows (required when it has some: the Rust driver's `submit_aux`)."""
+        lb, items = self.outstanding[bid]
+        brows = belief_rows(lb.extra)
+        if len(brows):
+            from .games import info
+            w = info(self.game)['aux_width']
+            if aux is None or np.shape(aux) != (len(brows), w):
+                raise ValueError(f'batch {bid} has {len(brows)} root belief rows (ROW_BELIEF: a seat\'s belief_tilt > 0): '
+                                 f'its evaluator must answer their auxiliary outputs ([{len(brows)}, {w}], got '
+                                 f'{None if aux is None else np.shape(aux)}; a network without the auxiliary head cannot '
+                                 f'serve belief_tilt)')
+            aux = np.asarray(aux, np.float32)
+            if not np.all(np.isfinite(aux)) or np.any(aux < 0):
+                raise ValueError(f'batch {bid}: a root belief row\'s auxiliary output is not finite and >= 0')
+        elif aux is not None and len(aux):
+            raise ValueError(f'batch {bid} has no root belief rows: {len(aux)} auxiliary rows given')
+        del self.outstanding[bid]
+        at = {int(r): k for k, r in enumerate(brows)}
         off = lb.opt_off
-        for (slot, seat, tree, b, vb) in items:
-            # (a root-view leaf: the value of its value-only row vb, the priors of its own row b)
-            is_root = tree.expand(priors[off[b]:off[b + 1]].tolist(), value[vb], margin[vb], seat)
-            if is_root and seat.selfplay and slot.full:
-                tree.add_noise(seat, slot.np_rng)
-            slot.sims += 1
-        self.sims += len(items)
+        n = 0
+        for (slot, seat, tree, b, vb, bb) in items:
+            if b is not None:
+                # (a root-view leaf: the value of its value-only row vb, the priors of its own row b)
+                is_root = tree.expand(priors[off[b]:off[b + 1]].tolist(), value[vb], margin[vb], seat)
+                if is_root and seat.selfplay and slot.full:
+                    tree.add_noise(seat, slot.np_rng)
+                slot.sims += 1
+                n += 1
+            if bb is not None:
+                # the search's root belief (docs/search.md 3.8): its worlds are dealt by it from now on
+                tree.set_belief(aux[at[bb]], seat, slot.game, slot.search_rng)
+        self.sims += n
 
     def take_results(self):
         r, self.results = self.results, []
@@ -357,32 +410,57 @@ class PyDriver:
                 if slot.sims >= slot.target:
                     self._decide(slot, seat, tree, p)
                     continue
-                r = tree.simulate(g, slot.search_rng, seat)
-                if r is None:
-                    slot.sims += 1
-                    continue
-                player, x, acts, vx = r
-                need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts, vx))
-                break
+                if self._simulate(slot, seat, tree, p, g, need):
+                    break
         for slot in finished:
             self.active.remove(slot)
             self._finish(slot)
         self._refill()
         self._leaf_batches(need)
 
+    def _simulate(self, slot, seat, tree, p, g, need):
+        """One step of seat p's search into `need`: its root belief row alone (a reused root waiting for
+        its belief, docs/search.md 3.8), or its next leaf (with the root belief row after a fresh root's
+        own leaf) -> True when the slot waits for a batch, False after a terminal walk."""
+        bx = None
+        if slot.belief and not tree.has_belief:
+            bx = g.encode(p)                # the root's features: the decider's own view
+            if tree.expanded:
+                need.setdefault(seat.key, []).append((slot, seat, tree, p, None, None, None, bx))
+                self.belief_rows += 1
+                return True
+        r = tree.simulate(g, slot.search_rng, seat)
+        if r is None:
+            if bx is not None:
+                raise RuntimeError("internal: a fresh root's first walk did not stop at the root")
+            slot.sims += 1
+            return False
+        player, x, acts, vx = r
+        need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts, vx, bx))
+        self.belief_rows += bx is not None
+        return True
+
     def _leaf_batches(self, need):
-        """Queue one network batch per key of `need` ({key: [(slot, seat, tree, player, x, acts, vx)]}):
-        each leaf's row, then (a root-view value) its value-only row of the tree's viewer."""
+        """Queue one network batch per key of `need` ({key: [(slot, seat, tree, player, x, acts, vx, bx)]}):
+        each leaf's row, then (a root-view value) its value-only row of the tree's viewer, then (a
+        fresh root's belief) its root belief row; x None: a root belief row alone."""
         for key, items in need.items():
-            # rows: each leaf's, then (root-view values) its value-only row of the tree's viewer
+            # rows: each leaf's, then (root-view values) its value-only row of the tree's viewer, then
+            # (the root's belief) the root's belief row
             rows, refs = [], []
             for it in items:
-                slot, seat, tree, player, x, acts, vx = it
-                b = len(rows)
-                rows.append((x, acts, player, slot, ROW_LEAF))
-                if vx is not None:
-                    rows.append((vx, [], tree.t.viewer, slot, ROW_VALUE))
-                refs.append((slot, seat, tree, b, len(rows) - 1))
+                slot, seat, tree, player, x, acts, vx, bx = it
+                b = vb = bb = None
+                if x is not None:
+                    b = len(rows)
+                    rows.append((x, acts, player, slot, ROW_LEAF))
+                    if vx is not None:
+                        rows.append((vx, [], tree.t.viewer, slot, ROW_VALUE))
+                    vb = len(rows) - 1
+                if bx is not None:
+                    bb = len(rows)
+                    rows.append((bx, [], player, slot, ROW_BELIEF))
+                refs.append((slot, seat, tree, b, vb, bb))
             off = np.zeros(len(rows) + 1, np.int32)
             off[1:] = np.cumsum([len(r[1]) for r in rows])
             a = {'x': np.ascontiguousarray(np.stack([r[0] for r in rows]).astype(np.float32)),
@@ -400,6 +478,7 @@ class PyDriver:
     def _start(self, slot, seat, p):
         slot.full = seat.sims_fast is None or slot.rng.random() < seat.p_full
         slot.target = seat.sims if slot.full else seat.sims_fast
+        slot.belief = seat.takes_belief(slot.full)          # (docs/search.md 3.8)
         tree = slot.trees.get(p)
         if tree is None:
             tree = slot.trees[p] = SEARCH[seat.impl](slot.game, seat, slot.search_rng)

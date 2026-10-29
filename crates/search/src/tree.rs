@@ -36,9 +36,16 @@
 //! The tree counts the forced walks per root option and sums their backed-up win vectors, so the
 //! search's visit-based outputs can leave them out (`root_visits_pruned`, `root_win_pruned`)
 //! while its Q-based ones use them (Q, `cq_target`).
+//!
+//! **The root's belief** (`Tree::set_belief`, docs/search.md 3.8; off by default): a search may hold
+//! the network's prediction of the hidden cards for its viewer (`Belief`, computed once per decision
+//! from the root's features); every simulation then deals its world with
+//! `SearchGame::determinize_with` instead of `determinize` - but a `belief_mix` share, dealt
+//! uniformly as before. `None` (the default, and after `reset` / `advance`) is the tree of before,
+//! bit for bit.
 use std::hash::{Hash, Hasher};
 
-use crate::game::{SearchGame, MAX_SEATS};
+use crate::game::{Belief, SearchGame, MAX_SEATS};
 use crate::noise;
 use crate::rng::Rng;
 
@@ -282,6 +289,19 @@ pub struct Tree<G: SearchGame> {
     forced_n: u32,
     /// The root option of the walk in flight if the floor forced it (NIL: not forced).
     walk_forced: u32,
+    /// The root's belief of the current search (`set_belief`; None: every world dealt uniformly)
+    /// and the share of its simulations still dealt uniformly.
+    belief: Option<Belief>,
+    belief_mix: f64,
+}
+
+/// Deal a world for `viewer` (docs/search.md 3.8): `determinize_with` the belief, but a `mix` share
+/// of the calls (one draw of `rng` when 0 < mix) and every call without a belief `determinize`.
+fn deal<G: SearchGame>(g: &mut G, viewer: usize, belief: Option<&Belief>, mix: f64, rng: &mut Rng) {
+    match belief {
+        Some(b) if !(mix > 0.0 && rng.unit() < mix) => g.determinize_with(viewer, rng, b),
+        _ => g.determinize(viewer, rng),
+    }
 }
 
 impl<G: SearchGame> Default for Tree<G> {
@@ -303,6 +323,8 @@ impl<G: SearchGame> Default for Tree<G> {
             forced_win: [0.0; MAX_SEATS],
             forced_n: 0,
             walk_forced: NIL,
+            belief: None,
+            belief_mix: 0.0,
         }
     }
 }
@@ -328,7 +350,32 @@ impl<G: SearchGame> Tree<G> {
         self.outs.clear();
         self.root = self.push_node(&[], viewer, legal, 0);
         self.set_root_min(0);
+        self.belief = None;
+        self.belief_mix = 0.0;
         self.set_base(game, rng);
+    }
+
+    /// The root's belief for the search starting now (docs/search.md 3.8): every simulation deals
+    /// its world with `determinize_with(viewer, rng, belief)`, a `mix` share (in [0, 1)) with
+    /// `determinize` as before; `None` = every world uniform (the tree of before, bit for bit).
+    /// Without `redet` the one world of the decision is dealt again from `live` with it. `reset`
+    /// and `advance` clear it (a belief is the prediction for one decision).
+    pub fn set_belief(&mut self, belief: Option<Belief>, mix: f64, live: &G, rng: &mut Rng) {
+        self.belief = belief;
+        self.belief_mix = if self.belief.is_some() { mix } else { 0.0 };
+        if !self.redet {
+            self.set_base(live, rng);
+        }
+    }
+
+    /// The root's belief of the current search (None: uniform worlds).
+    pub fn belief(&self) -> Option<&Belief> {
+        self.belief.as_ref()
+    }
+
+    /// The share of the current search's simulations dealt uniformly although it holds a belief.
+    pub fn belief_mix(&self) -> f64 {
+        self.belief_mix
     }
 
     /// Root minimum visits for the search starting now (docs/search.md 3.5): every root option
@@ -420,7 +467,7 @@ impl<G: SearchGame> Tree<G> {
                 }
                 None => game.clone(),
             };
-            g.determinize(self.viewer, rng);
+            deal(&mut g, self.viewer, self.belief.as_ref(), self.belief_mix, rng);
             self.base = Some(g);
         }
     }
@@ -626,7 +673,7 @@ impl<G: SearchGame> Tree<G> {
         self.walk_forced = NIL;
         g.clone_from(self.base.as_ref().unwrap_or(live));
         if self.redet {
-            g.determinize(self.viewer, rng);
+            deal(g, self.viewer, self.belief.as_ref(), self.belief_mix, rng);
             sc.legal.clear();
             g.legal_actions(&mut sc.legal);
             if g.to_move() != Some(self.player(self.root)) || sc.legal.as_slice() != self.acts(self.root) {
@@ -807,6 +854,8 @@ impl<G: SearchGame> Tree<G> {
                 self.root = k;
                 self.viewer = player;
                 self.set_root_min(0);
+                self.belief = None;
+                self.belief_mix = 0.0;
                 if self.nodes.len() > COMPACT_AT {
                     self.compact();
                 }
@@ -830,6 +879,8 @@ impl<G: SearchGame> Tree<G> {
             forced_win: self.forced_win,
             forced_n: self.forced_n,
             walk_forced: self.walk_forced,
+            belief: self.belief.take(),
+            belief_mix: self.belief_mix,
             ..Default::default()
         };
         let mut map = std::collections::HashMap::new();

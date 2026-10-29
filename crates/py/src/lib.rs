@@ -19,7 +19,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, SeatCfg, Select, ViewTarget};
+use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
 use zero_search::{SearchGame, MAX_SEATS};
 
@@ -76,7 +76,9 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(game_info_of, m)?)?;
     m.add_function(wrap_pyfunction!(root_floor_of, m)?)?;
     m.add_function(wrap_pyfunction!(view_pick_of, m)?)?;
+    m.add_function(wrap_pyfunction!(belief_weight_of, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
+    m.add("BELIEF_CLIP", BELIEF_CLIP)?;
     Ok(())
 }
 
@@ -142,7 +144,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -218,6 +220,12 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         // value-only samples: a share of the recorded decisions (0 = off) and their q target
         view_samples: get(d, "view_samples", 0.0f64)?,
         view_target: ViewTarget::parse(&get(d, "view_sample_target", "next_q".to_string())?).map_err(verr)?,
+        // the root's belief (docs/search.md 3.8): its tilt (0 = off), clip, uniform share, and
+        // whether fast and minor searches take it too
+        belief_tilt: get(d, "belief_tilt", 0.0f64)?,
+        belief_clip: get(d, "belief_clip", BELIEF_CLIP)?,
+        belief_mix: get(d, "belief_mix", 0.0f64)?,
+        belief_fast: flag(d, "belief_fast", false)?,
     }))
 }
 
@@ -249,6 +257,14 @@ fn root_floor_of(k: u32, max_actions: u32, full: bool, m: usize, target: u32) ->
 #[pyo3(name = "view_pick")]
 fn view_pick_of(seed: u64, gid: u32, decision: u32, share: f64) -> bool {
     view_pick(seed, gid, decision, share)
+}
+
+/// The weight of a category of hidden cards in a belief-weighted deal (`game::belief_weight`,
+/// docs/search.md 3.8): clip((max(pred, 0) / max(uniform, eps))^tilt, 1/clip, clip).
+#[pyfunction]
+#[pyo3(name = "belief_weight")]
+fn belief_weight_of(pred: f64, uniform: f64, tilt: f64, clip: f64) -> f64 {
+    zero_search::belief_weight(pred, uniform, tilt, clip)
 }
 
 /// Registered game names.
@@ -365,6 +381,14 @@ impl PyGame {
     }
     fn determinize(&mut self, viewer: usize, seed: u64) {
         self.g.determinize(viewer, seed)
+    }
+    /// `determinize` dealt by a belief (`SearchGame::determinize_with`, docs/search.md 3.8): `belief`
+    /// = the predictions of the game's auxiliary targets for `viewer` (f32 [aux_width]), `tilt` > 0,
+    /// `clip` >= 1.
+    #[pyo3(signature = (viewer, seed, belief, tilt=1.0, clip=BELIEF_CLIP))]
+    fn determinize_with(&mut self, viewer: usize, seed: u64, belief: PyReadonlyArray1<'_, f32>, tilt: f64, clip: f64) -> PyResult<()> {
+        let p = belief.as_slice().map_err(|e| PyValueError::new_err(format!("belief: {e}")))?;
+        self.g.determinize_with(viewer, seed, p, tilt, clip).map_err(verr)
     }
     fn encode<'py>(&self, py: Python<'py>, viewer: usize) -> Bound<'py, numpy::PyArray1<f32>> {
         self.g.encode(viewer).into_pyarray(py)
@@ -500,6 +524,23 @@ impl PySearchTree {
     fn set_root_min(&mut self, k: u32) {
         self.t.set_root_min(k)
     }
+    /// The root's belief from now on (docs/search.md 3.8): `belief` = the network's predictions of the
+    /// game's auxiliary targets for the root decider (f32 [aux_width]; None: uniform worlds, the
+    /// search of before), `tilt` > 0, `clip`, `mix` (the share of simulations dealt uniformly);
+    /// `game`: the live game (a tree without redet deals its world again). `advance` clears it.
+    #[pyo3(signature = (belief, game, tilt=1.0, clip=BELIEF_CLIP, mix=0.0))]
+    fn set_belief(&mut self, belief: Option<PyReadonlyArray1<'_, f32>>, game: &PyGame, tilt: f64, clip: f64, mix: f64) -> PyResult<()> {
+        let p = match &belief {
+            Some(b) => Some(b.as_slice().map_err(|e| PyValueError::new_err(format!("belief: {e}")))?),
+            None => None,
+        };
+        self.t.set_belief(p, tilt, clip, mix, &*game.g).map_err(verr)
+    }
+    /// The current search's belief predictions (None: uniform worlds).
+    #[getter]
+    fn belief(&self) -> Option<Vec<f32>> {
+        self.t.belief()
+    }
     #[getter]
     fn root_min(&self) -> u32 {
         self.t.root_min()
@@ -587,15 +628,22 @@ impl PySearchDriver {
         self.to_py(py, r)
     }
 
-    /// Network evaluation of batch `id`: priors f32 [options], value / margin f32 [B, MAX_SEATS].
-    fn submit(&mut self, id: u64, priors: PyReadonlyArray1<'_, f32>, value: PyReadonlyArray2<'_, f32>, margin: PyReadonlyArray2<'_, f32>) -> PyResult<()> {
+    /// Network evaluation of batch `id`: priors f32 [options], value / margin f32 [B, MAX_SEATS];
+    /// `aux` f32 [belief rows, aux_width]: the auxiliary outputs of its root belief rows (`extra` ==
+    /// ROW_BELIEF, docs/search.md 3.8), in row order - required when it has some.
+    #[pyo3(signature = (id, priors, value, margin, aux=None))]
+    fn submit(&mut self, id: u64, priors: PyReadonlyArray1<'_, f32>, value: PyReadonlyArray2<'_, f32>, margin: PyReadonlyArray2<'_, f32>, aux: Option<PyReadonlyArray2<'_, f32>>) -> PyResult<()> {
         if value.shape()[1] != MAX_SEATS || margin.shape()[1] != MAX_SEATS {
             return Err(PyValueError::new_err(format!("value / margin must be [B, {MAX_SEATS}]")));
         }
         let p = priors.as_slice().map_err(|e| PyValueError::new_err(format!("priors: {e}")))?;
         let v = value.as_slice().map_err(|e| PyValueError::new_err(format!("value: {e}")))?;
         let m = margin.as_slice().map_err(|e| PyValueError::new_err(format!("margin: {e}")))?;
-        self.d.submit(id, p, v, m).map_err(verr)
+        let a = match &aux {
+            Some(a) => a.as_slice().map_err(|e| PyValueError::new_err(format!("aux: {e}")))?,
+            None => &[],
+        };
+        self.d.submit(id, p, v, m, a).map_err(verr)
     }
 
     /// Answers of external batch `id`: one payload string per request.
@@ -730,6 +778,7 @@ impl PySearchDriver {
         d.set_item("minor", s.minor)?;
         d.set_item("view_rows", s.view_rows)?;
         d.set_item("view_recorded", s.view_recorded)?;
+        d.set_item("belief_rows", s.belief_rows)?;
         d.set_item("emitted", s.emitted)?;
         d.set_item("epoch", s.epoch)?;
         d.set_item("net", s.net)?;
