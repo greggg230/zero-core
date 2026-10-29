@@ -30,7 +30,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B) |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
-| `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
+| `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`) | Unattended runs, control, forks; each repo's `tools/<name>.py` activates its package and calls `main()` |
@@ -118,6 +118,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6); its own is refused |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); seconds the end of a phase waits for the remote's last shards (later ones are dropped) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
+| `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: those whose inference is CUDA / MPS - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
 | `selfplay_remote_linger` | 0 | 1 = the workers play on with their checkpoint between phases (while the run trains); those games count for the next iteration, one checkpoint stale (5.3) |
 | `selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` | 30, 3, 3600 | co-training (11.6): a worker backing off this many seconds gives its outstanding matches back; a match outstanding on a worker longer than this many of its expected latencies (at least 120 s; 0 = the timeout only) is requeued, and at the latest after `selfplay_remote_timeout` s of the worker's running time |
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
@@ -337,6 +338,43 @@ instead (11.6), through the same queue model.
   in its first phase (`PROVISIONAL_S`, env `ZERO_RSP_PROVISIONAL_S`). A restart takes the rates and
   head starts from the run's last metrics row (`selfplay.queue.rates`; a row of the first design,
   `selfplay.remote` without `queue`: this machine's games per second and the remote's per worker).
+* **Batch-bound consumers** (`selfplay_remote_batch`: `auto`, the default, = the consumers whose
+  inference runs on CUDA / MPS - MTG Zero's desktop driver; `local`, `remote`, `all`, `none` choose
+  explicitly): such a consumer's network batches hold its games' leaves and a network call costs
+  about the same whatever its batch, so its leaves per second grow with its games in flight and its
+  games take about as long at any in-flight. The cap above then sets its throughput, not its
+  latency: a cap that starts small measures a small rate, which gives a small cap again, and it
+  settles only where the consumer's games last one phase - a point that moves with the games'
+  length. **MTG Zero's delver1 on 213a9c0** (its ENGINE.md 56): the desktop's cap wandered between 66
+  and 131 of its 192 slots (2 groups: batches of half its in-flight) at 2.0-5.3k leaves/s - ~35
+  leaves/s per game in flight at any in-flight - against 6.1-6.8k with all 192 before the queue; it
+  made 8-17% of the 800 games. Its cap is therefore its **slots** while its games finish within
+  `selfplay_remote_batch_inflight` (default 2) iterations:
+
+  ```
+  cap = clamp(ceil(max(inflight x share, min(slots, batch_inflight x share))), lo, hi)      share = rate x (lead + P)
+  ```
+
+  (by Little's law a consumer's in-flight over its rate is its games' latency, so `batch_inflight x
+  share` is the in-flight at which they last `batch_inflight` horizons). `slots`: its driver's
+  `conc`; a co-training consumer's `hi` adds a queue beyond them (a match waiting there only waits),
+  which the batch rule never fills. A batch-bound consumer whose games outlast `batch_inflight`
+  horizons even so falls to `lo` as any other (a GPU too slow for the run's iterations does not fill
+  the data with stale rows), and a consumer that is not batch-bound keeps the formula above exactly
+  (CPU inference: its rate is its cores', nearly whatever its in-flight; delver1's Mac workers lost
+  ~13% of their leaves per second at 45% of their slots, 29.5k -> 25.5k, so more in flight would buy
+  them little and cost the staleness of 80% of the data). Not a fixed floor (no guard against a
+  consumer too slow for the iterations), nor a curve fitted to each consumer's latency against its
+  in-flight across phases (it needs phases at different caps and is noisy when the games' length
+  changes between iterations): the device says which kind a consumer is, `batch_inflight` bounds its
+  staleness. **The cost**: a batch-bound consumer's rows lag by up to `batch_inflight` checkpoints
+  (delver1's desktop at its 192 slots: games of ~1.15 phases, its rows' mean lag ~0.6 -> ~0.7); with
+  it a small part of the data, the run's mean lag moves by hundredths. **Choosing `games`**: a
+  consumer's latency in phases is its in-flight over its games per phase, so a batch-bound one keeps
+  its slots while it plays at least `slots / batch_inflight` games an iteration: `games >= slots /
+  (batch_inflight x its share of the throughput)` (delver1: 192 / (2 x ~0.2) ~ 480 - its 800 leave a
+  margin of 1.7x; a remote's back-off only raises the desktop's share). Below that the desktop holds
+  fewer than its slots (still `batch_inflight` x its share, not 1x).
 * **Single-game: the shared quota.** Both sides play a rolling `queue_only` driver (docs/search.md
   2.9) - this machine's whatever `rolling` says - and queue one setup of the run's spec for every
   game they may still start under their cap. **A finished game counts only once the quota accepts
@@ -439,7 +477,8 @@ instead (11.6), through the same queue model.
   mtgz.az.remote selfplay` refuses other code than the run's, as `eval` does).
 * **Settings** (section 1.2): `selfplay_remote`, `selfplay_remote_procs` (0), `selfplay_remote_wait`
   (30 s: how long the end of a phase waits for the last shards), `selfplay_remote_inflight` (1.0),
-  `selfplay_remote_linger` (0), and co-training's `selfplay_remote_giveback` (30 s),
+  `selfplay_remote_batch` ('auto') and `selfplay_remote_batch_inflight` (2.0: a batch-bound
+  consumer's games in iterations; 1 = as the others), `selfplay_remote_linger` (0), and co-training's `selfplay_remote_giveback` (30 s),
   `selfplay_remote_overdue` (3) and `selfplay_remote_timeout` (3,600 s, the ceiling). **An existing
   run's `games`** means the total of both machines from its first iteration on this code (the first
   design's runs played `games` here and the remote's extras on top): a run moving from that design
@@ -456,12 +495,15 @@ instead (11.6), through the same queue model.
   lingering before it)`}` and **`selfplay.queue`** = `{quota, games` (all accepted), `short, held`
   (`{local, remote}`: waiting for the next iteration), `inflight, units, consumers` (per consumer:
   `games, share, units` (finished), `run_s, util, rate_measured, rate, cap` (the phase's mean),
-  `cap_max, cap_next`), `rates` (the model's state: each consumer's rate, lead, lo, hi; the leaves per unit),
+  `cap_max, cap_next`), `batch_inflight`, `rates` (the model's state: each consumer's rate, lead, lo,
+  hi, and `batch` true with its `slots` for a batch-bound one; the leaves per unit),
   `staleness` (`{local, remote, all}`: rows by checkpoint lag, `summary` = rows, mean, max and the
   share at lag <= 1)`}`. The log: `iter N remote self-play: 2 worker(s), 812 games, ...; 815 played,
   3 held for the next iteration` and `iter N shared queue: quota 600: 600 games (local 54, w0 271, w1
   275); caps local 56.0 -> 55, w0 273.0 -> 274, ...; rates/s local 0.223, w0 1.1, ...; staleness:
-  mean 0.41, max 2, 99.6% <= 1 (52800 rows)`. progress.json during self-play: `games` (accepted of
+  mean 0.41, max 2, 99.6% <= 1 (52800 rows)`; at the start `self-play also on the remote 'mac' (...):
+  800 games per iteration in total, in flight per machine its throughput share x 1; batch-bound
+  (local): its slots while its games take at most 2 iterations`. progress.json during self-play: `games` (accepted of
   the quota), `target`, `local`, `remote` = `{host, workers, state` (playing / backing off / idle /
   connecting / offline), `games, in_flight, samples, shards, caps, quota, held}` (the dashboard's
   status line shows it); phase `remote shards` while `end` waits.
@@ -488,6 +530,16 @@ instead (11.6), through the same queue model.
   share grows from 30-70 to 54-95 of the 192 games, the self-play phases are ~25% shorter (0.7-1.0
   against 1.0-1.3 s), the rows' mean lag 0.54-0.67 against 0.28-0.44 (94-98% at lag <= 1): worth
   it when training is a large part of the iteration and the remote a large part of the self-play.
+  **Batch-bound** (`tests/test_workqueue.py`'s simulation of delver1's consumers: the desktop's games
+  180-200 s at any in-flight, each of two Mac workers 1.85 games/s at any in-flight, 800 games): the
+  cap of 213a9c0 settles at 111-116 of the desktop's 192 slots whether it starts at 75 or at 181
+  (where its games last one phase), at ~0.6 games/s; batch-bound it is at 192 one phase later and
+  stays, at 0.96 games/s (1.6x), its games 1.14 phases long, the phase 191 -> 175 s, the workers'
+  caps one phase of their throughput either way. The toy pair above at 256 slots each with
+  `--selfplay-remote-batch local` (this machine's CPU driver taken for batch-bound): its cap is its
+  256 slots from iteration 2, the rows' mean lag 0.41-0.65 (max 2, 91-100% within one) against the
+  pair's 0.29-0.44 - what the rule costs a consumer that is not batch-bound (twice its latency for
+  no throughput), which is why `auto` goes by the device.
 * **A remote workdir must be an absolute path there**: a relative one (Git Bash turns
   `ZERO_SELFPLAY_WORKDIR=/Users/...` into `C:/Program Files/Git/Users/...` for a Windows process;
   set `MSYS2_ENV_CONV_EXCL=ZERO_SELFPLAY_WORKDIR`) is refused at start, before ssh or scp could
@@ -506,14 +558,17 @@ instead (11.6), through the same queue model.
 
 Tests: `tests/test_remoteplay.py` (single-game: the shared quota exact with shards in `data/iter_i/`
 and training's steps, the caps of a slow / fast pair following the model and the rows within one
-checkpoint, a worker slower than a phase capped at its floor, the quota moving here while the worker
+checkpoint, a batch-bound driver at its slots (`selfplay_remote_batch` 'local'; a bad value
+refused), a worker slower than a phase capped at its floor, the quota moving here while the worker
 backs off, a dying worker's accepted games played here, linger, late shards dropped, an unreachable
 remote, a non-finite shard quarantined, the back-off while `.eval.lock` is held, PAUSE mid-phase and
-resume with no worker left; co-training 11.6; the coordinator's second consumer, `lock_held`,
-compressed shards), `tests/test_workqueue.py` (the caps' model, a consumer dropping out, the rates'
-EWMA and utilisation, restore, `split_games` on a sample dict and on the driver, the staleness
-histogram, the coordinator's reserve and matches per event), `tests/test_net_data.py` (the
-streamed window).
+resume with no worker left; co-training 11.6, a batch-bound local resolver driver; the
+coordinator's second consumer, `lock_held`, compressed shards), `tests/test_workqueue.py` (the caps'
+model, a consumer dropping out, the rates' EWMA and utilisation, restore, the batch-bound rule -
+delver1's desktop curve, the spiral of 213a9c0 against it, a batch-bound consumer too slow for the
+iterations at its floor, the formula's bounds and `slots`, a back-off -, `split_games` on a sample
+dict and on the driver, the staleness histogram, the coordinator's reserve and matches per event),
+`tests/test_net_data.py` (the streamed window).
 
 ## 6. Learning: the toy proof run (Glass Road Zero 2026-10-11; Caverna Zero 2026-10-10)
 
@@ -1048,7 +1103,8 @@ the MacBook plays a share of the 4v4 run's drafted matches with the play network
   queued **beyond** the local driver's room. So the local driver never waits for work a remote holds,
   and each worker takes its share as it has room, in the queue's order. The local consumer's bounds:
   2 x the resolver's groups and resolver_conc + max(16, resolver_conc / 4) (its slots and the first
-  design's queue); a worker's: 2 x its groups and conc + conc / 4. Without a remote, `feed` takes
+  design's queue; a batch-bound one - a CUDA resolver driver, 5.3 - is taken up to its slots, never
+  into that queue, by the batch rule); a worker's: 2 x its groups and conc + conc / 4. Without a remote, `feed` takes
   everything as before. **Backpressure**: `pending_max` 0 means 2 x resolver_conc + the remote's
   room (procs x (conc + conc / 4)), as before. The remote's phase starts when both checkpoints are
   written (5.3): while the networks are evaluated here it finishes its outstanding episodes and
