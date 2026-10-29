@@ -63,8 +63,8 @@ from .data import ShardWriter, TargetStats
 from .finite import NonFinite, check_state
 from .infer import drive
 from .net import load, save, widen
-from .run import (DEFAULTS, PRESETS, Run, _fmt, _fmt_queue, _fmt_remote, _write_json, last_rates, latest_iter, log,
-                  model_path, read_metrics, summarize)
+from .run import (DEFAULTS, PRESETS, Run, _fmt, _fmt_queue, _fmt_remote, _write_json, check_eval_settings, last_rates,
+                  latest_iter, log, model_path, read_metrics, summarize)
 from .workqueue import lag_hist
 
 BIG = 1 << 62                                      # a resolver driver's quota: its phases end by end_phase()
@@ -93,6 +93,7 @@ def resolver_config(cfg):
     out.update(game=cfg['resolver'], preset=preset, resolver='', resolver_cfg={}, resolver_init='')
     if out.get('policy_target', 'visits') not in ('visits', 'cq'):
         raise SystemExit(f"resolver_cfg: policy_target {out['policy_target']!r}: 'visits' or 'cq'")
+    check_eval_settings(out, 'resolver_cfg: ')
     for k in ('eval_remote', 'selfplay_remote'):
         rem = out.get(k) or ''
         if rem and rem != 'local' and rem not in package.active().remotes:
@@ -491,6 +492,10 @@ class CoRun:
         c, P = self.cfg, self.P
         s = summarize(self.event_match(it, P.yard, c['eval_games'], c['eval_sims'], seed=7919 * it + 3, play='net'))
         s['opp'] = P.yard
+        # the move rules (recorded unless the default): the primary's seats', the resolver's
+        for k, tag in (('select', P.eval_tag()), ('resolver_select', self.R.eval_tag())):
+            if tag != 'visits':
+                s[k] = tag
         return s
 
     def event_match(self, it, opp, n_games, sims, seed, opp_model=None, play='bot', a=None):

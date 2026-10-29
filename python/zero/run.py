@@ -100,17 +100,33 @@ DEFAULTS = dict(
     window=8, window_grow=1, min_window_samples=20_000, keep_data=12, ram_budget_gb=4.0, shard_rows=65536,
     # value target = (1 - q) z + q root-search estimate, q = value_q * min(1, iter / warmup)
     value_q=0.5, value_q_warmup=5, margin_loss_w=0.5,
-    # evaluation: the yardstick (Elo anchor = 1000): a built-in bot or 'ext:<name>'
+    # evaluation: the yardstick (Elo anchor = 1000): a built-in bot or 'ext:<name>'; 0 random games:
+    # no match against the random bot (the reference games below still rate it, unless ref_games 0)
     yardstick='heuristic', eval_games=200, eval_sims=32, eval_random_games=50, eval_every=1, elo_games=100,
     ref_games=400,
+    # the rule of the moves a network seat does not sample (docs/search.md 3.3): 'visits' = argmax
+    # (N, P0), AlphaZero's, the default (today's moves, bit for bit) | 'cq' = argmax of the completed-Q
+    # improved policy's logits (the 'cq' target's, with cq_c_visit and cq_c_scale) among the options
+    # with at least *_min_visits visits (0: all). eval_select: every evaluation seat - the yardstick,
+    # random and Elo matches here or on the eval_remote, co-training's evaluations of both networks
+    # (resolver_cfg for the resolver's), and by default zero.h2h / zero.replay of the run's checkpoints;
+    # the evaluations record it ('select', absent = 'visits') and each rule has its own Elo pool
+    # (elo/ for 'visits', elo/<rule>/ for another: docs/az.md 5.4), so a run can change it at a restart.
+    # selfplay_select: self-play's moves after its first temp_moves searched decisions of a game (the
+    # recorded targets stay policy_target's)
+    eval_select='visits', eval_select_min_visits=0, selfplay_select='visits', selfplay_select_min_visits=0,
     # the game spec of every match that records nothing (vs the yardstick, vs random, Elo, the
     # reference games); '' = the game package's evaluation spec for the self-play spec
     # (GamePackage.eval_specs; MTG: a fixed deck set, self-play random decks), else the spec
     eval_spec='',
     # cheaper Elo (CPU runs): each checkpoint plays the first `elo_opponents` of the checkpoints
-    # 1, 2, 4 ... 32 iterations back (0 = all), at elo_sims (0 = eval_sims); elo_together = 1
-    # plays an iteration's Elo matches in one driver (larger network batches, other seeds)
-    elo_opponents=0, elo_sims=0, elo_together=0,
+    # 1, 2, 4 ... 32 evaluations back (x eval_every iterations; 0 = all), at elo_sims (0 = eval_sims);
+    # elo_together = 1 plays an iteration's Elo matches in one driver (larger network batches, other
+    # seeds). elo_offsets ('1,2,4,8'; '' = the evaluations back above): each evaluated checkpoint plays
+    # the checkpoints that many ITERATIONS back instead, whatever eval_every (every iteration writes
+    # one; elo_opponents is not used): the ones never evaluated are rated through these games only
+    # and are never models/best.pt (docs/az.md 5)
+    elo_opponents=0, elo_sims=0, elo_together=0, elo_offsets='',
     # evaluation on another machine (a name in the game package's `remotes`, 'local' for tests;
     # '' = here): the loop queues each evaluated checkpoint and keeps training (zero.remote)
     eval_remote='',
@@ -303,13 +319,23 @@ class Run:
         return NetEvaluator(m, self.cfg['infer_device'], workers=self.cfg.get('infer_workers', 1))
 
     def nn_seat(self, key, sims, selfplay=False):
+        """A network seat at the run's settings: self-play's, or every evaluation's (no noise, no
+        temperature; the move rule eval_select)."""
         c = self.cfg
         if selfplay:
             return G.nn_seat(key, sims, c['c_puct'], True, c['alpha'], c['eps'], c['temp_moves'], c['sims_fast'],
                              c['p_full'], c['chance_k'], c['margin_w'], bool(c['redet']),
                              c.get('policy_target', 'visits'), c.get('cq_c_visit', 50.0), c.get('cq_c_scale', 1.0),
-                             sims_minor=c.get('sims_minor', 0) or None)
-        return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']))
+                             sims_minor=c.get('sims_minor', 0) or None, select=c.get('selfplay_select', 'visits'),
+                             select_min_visits=c.get('selfplay_select_min_visits', 0))
+        return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
+                         cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
+                         select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0))
+
+    def eval_tag(self):
+        """The name of the evaluation seats' move rule ('visits', 'cq', 'cq-n2' ...): the evaluations'
+        'select' and their Elo pool (docs/az.md 5.4)."""
+        return elo.eval_tag(self.cfg)
 
     def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None, queue_only=False):
         """A driver for self-play (`record`: the run's spec) or a match (eval_spec, if set).
@@ -772,11 +798,16 @@ class Run:
     def evaluate(self, it, m):
         c = self.cfg
         t0 = time.time()
+        tag = self.eval_tag()                      # the move rule, recorded unless the default
         m['eval_yard'] = summarize(self.play_match(it, self.yard, c['eval_games'], c['eval_sims'], seed=7919 * it + 1))
         m['eval_yard']['opp'] = self.yard
+        if tag != 'visits':
+            m['eval_yard']['select'] = tag
         self.log(f'iter {it} vs {self.yard}: {m["eval_yard"]}')
         if c['eval_random_games'] and self.yard != 'random':
             m['eval_random'] = summarize(self.play_match(it, 'random', c['eval_random_games'], c['eval_sims'], seed=7919 * it + 2))
+            if tag != 'visits':
+                m['eval_random']['select'] = tag
             self.log(f'iter {it} vs random: {m["eval_random"]}')
         self.extra_evals(it, m)
         m.setdefault('phases', {})['eval_s'] = time.time() - t0
@@ -803,9 +834,17 @@ class Run:
             self.log(f'iter {it} {name}: {_fmt(r)}')
 
     def elo_update(self, latest, current=None):
+        """The Elo pool of the evaluation rule (docs/az.md 5.4: elo/ for 'visits', elo/<rule>/ for
+        another, which holds only that rule's evaluations and plays its Elo matches from the
+        iteration it began at, `since`): the evaluations not in it yet, the reference and Elo
+        matches it lacks, the refit. -> (ratings, best)."""
         c = self.cfg
         t0 = time.time()
-        res = elo.load_results(self.run, anchor=self.yard)
+        tag = self.eval_tag()
+        res = elo.load_results(self.run, anchor=self.yard, tag=tag)
+        if tag != 'visits':
+            res.setdefault('select', tag)
+            res.setdefault('since', latest)
         if self.yard != 'random' and not elo.has(res, 'random', self.yard) and c['ref_games']:
             s = self.bots_match('random', self.yard, c['ref_games'], seed=17)
             elo.add(res, 'random', self.yard, s, c['ref_games'])
@@ -815,25 +854,30 @@ class Run:
             name = elo.ckpt_name(m['iter'])
             if name in logged:
                 continue
+            if m.get('eval_yard') and m['eval_yard'].get('select', 'visits') != tag:
+                continue                           # another rule's evaluation: never in this pool
             for k, opp in (('eval_yard', self.yard), ('eval_random', 'random')):
                 e = m.get(k)
                 if e and e.get('games'):
                     elo.add(res, name, e.get('opp', opp), e['score'], e['games'])
             if m.get('eval_yard'):
                 logged.append(name)
-        elo.save_results(self.run, res)
+                if 'since' in res:
+                    res['since'] = min(res['since'], m['iter'])
+        elo.save_results(self.run, res, tag=tag)
         e = max(1, int(c['eval_every']))
-        offsets = elo.OFFSETS[:c['elo_opponents']] if c.get('elo_opponents') else elo.OFFSETS
-        todo = [(k, k - off * e) for k in range(e, latest + 1, e) for off in offsets
-                if k - off * e >= 0 and os.path.exists(model_path(self.run, k - off * e))
+        since = res.get('since', 0)
+        todo = [(k, j) for k in range(e, latest + 1, e) if k >= since
+                for j in elo.opponents(k, e, c.get('elo_offsets', ''), c.get('elo_opponents', 0))
+                if j >= 0 and os.path.exists(model_path(self.run, j))
                 and os.path.exists(model_path(self.run, k))
-                and not elo.has(res, elo.ckpt_name(k), elo.ckpt_name(k - off * e))]
+                and not elo.has(res, elo.ckpt_name(k), elo.ckpt_name(j))]
         sims = c.get('elo_sims') or c['eval_sims']
 
         def record(k, j, rows):
             sc = sum(r[0] for r in rows)
             elo.add(res, elo.ckpt_name(k), elo.ckpt_name(j), sc, len(rows))
-            elo.save_results(self.run, res)
+            elo.save_results(self.run, res, tag=tag)
             self.log(f'elo match {elo.ckpt_name(k)} vs {elo.ckpt_name(j)}: {sc:.1f}/{len(rows)}')
         if c.get('elo_together'):
             for k in sorted({k for k, _ in todo}):
@@ -845,8 +889,10 @@ class Run:
                 record(k, j, self.play_match(k, 'nn', c['elo_games'], sims, seed=31 + 7919 * k + 101 * j,
                                              opp_model=model_path(self.run, j)))
         ratings = elo.fit(res, anchor=self.yard)
-        elo.write_ratings(self.run, ratings, self.yard)
-        best = elo.tag_checkpoints(self.run, ratings, latest, self.yard)
+        elo.write_ratings(self.run, ratings, self.yard, tag=tag)
+        # raw offsets rate checkpoints that never played the yardstick: never models/best.pt
+        best = elo.tag_checkpoints(self.run, ratings, latest, self.yard, tag=tag,
+                                   evaluated=set(logged) if c.get('elo_offsets') else None)
         if current is not None:
             current.setdefault('phases', {})['elo_s'] = time.time() - t0
         return ratings, best
@@ -866,8 +912,9 @@ class Run:
             ratings, best = self.elo_update(it, m)
             me = ratings.get(elo.ckpt_name(it))
             if me:
-                m['elo'] = {'elo': round(me[0], 1), 'se': round(me[1], 1)}
-                self.log(f'iter {it} elo {me[0]:.0f} +-{1.96 * me[1]:.0f}; best {best["file"]} {best["elo"]:.0f}')
+                m['elo'] = elo.row(me, self.eval_tag())
+                self.log(f'iter {it} elo {me[0]:.0f} +-{1.96 * me[1]:.0f}{elo.pool_note(self.eval_tag())}; '
+                         + (f'best {best["file"]} {best["elo"]:.0f}' if best else 'no best yet'))
         m['seconds'] = time.time() - t0 + m.get('resumed_seconds', 0)
         m['time'] = time.time()
         append_metrics(self.run, m)
@@ -1062,7 +1109,23 @@ def resolve_config(args, saved):
     cfg['preset'] = preset
     if cfg.get('policy_target', 'visits') not in ('visits', 'cq'):
         raise SystemExit(f"policy_target {cfg['policy_target']!r}: 'visits' or 'cq'")
+    check_eval_settings(cfg)
     return cfg
+
+
+def check_eval_settings(cfg, where=''):
+    """The move-rule and Elo-offset settings (eval_select, selfplay_select and their guards,
+    elo_offsets) -> None, else SystemExit (`where`: a prefix, e.g. 'resolver_cfg: ')."""
+    from .mcts import check_select
+    for k in ('eval_select', 'selfplay_select'):
+        try:
+            check_select(cfg.get(k, 'visits'), cfg.get(k + '_min_visits', 0), what=k)
+        except ValueError as e:
+            raise SystemExit(f'{where}{e}') from None
+    try:
+        elo.parse_offsets(cfg.get('elo_offsets', ''))
+    except ValueError as e:
+        raise SystemExit(f'{where}{e}') from None
 
 
 def main(argv=None):

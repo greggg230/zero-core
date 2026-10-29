@@ -23,11 +23,11 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `finite.py` | The non-finite guard (section 4.1): vectorised NaN / inf checks, `NonFinite` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
 | `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
-| `elo.py` | Bradley-Terry Elo over all results, the run's yardstick = 1000 |
+| `elo.py` | Bradley-Terry Elo over all results, the run's yardstick = 1000; one pool per evaluation move rule (`pool_dir`, `eval_tag`, `active_pool`), the Elo opponents (`opponents`: evaluations back, or raw `elo_offsets`; section 5.4) |
 | `runctl.py` | PAUSE / STOP files, exit status 75, run / supervisor state files, `PauseWatch` |
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements |
-| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B) |
+| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
 | `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
@@ -110,9 +110,12 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
-| `eval_games`, `eval_sims`, `eval_random_games`, `eval_every` | 200, 32, 50, 1 | evaluation vs the yardstick and vs random |
-| `elo_games`, `ref_games` | 100, 400 | games per Elo match (checkpoints 1, 2, 4 ... 32 iterations back); random vs yardstick reference games |
+| `eval_games`, `eval_sims`, `eval_random_games`, `eval_every` | 200, 32, 50, 1 | evaluation vs the yardstick and vs random (`eval_random_games` 0: no random match; the reference games still rate the random bot unless `ref_games` is 0) |
+| `elo_games`, `ref_games` | 100, 400 | games per Elo match (checkpoints 1, 2, 4 ... 32 evaluations back, i.e. x `eval_every` iterations; or `elo_offsets`); random vs yardstick reference games (once per Elo pool) |
 | `elo_opponents`, `elo_sims`, `elo_together` | 0, 0, 0 | cheaper Elo (CPU runs): play only the first k of the offsets 1, 2, 4 ... 32 (0 = all); Elo matches at elo_sims (0 = eval_sims); 1 = an iteration's Elo matches in one driver (one evaluator key per opponent: the checkpoint's batches hold the leaves of every match; other seeds than separate matches) |
+| `elo_offsets` | '' | raw Elo offsets ('1,2,4,8'): each evaluated checkpoint k plays the checkpoints k-1, k-2, k-4, k-8 (those that exist) whatever `eval_every`, instead of evaluations back; `elo_opponents` is then not used; checkpoints never evaluated are rated through these games only and are never `best.pt` (section 5.4). '' = the default above, unchanged |
+| `eval_select`, `eval_select_min_visits` | visits, 0 | the move rule of every evaluation seat (docs/search.md 3.3): 'visits' = argmax (N, P0) (AlphaZero's; the default: today's moves bit for bit) or 'cq' = the argmax of the completed-Q target's logits (with `cq_c_visit`, `cq_c_scale`) among the options with at least `eval_select_min_visits` visits (0 = all). The yardstick, random and Elo matches (here or on the `eval_remote`), co-training's evaluations (the resolver's: `resolver_cfg`), and by default `zero.h2h` / `zero.replay` of the run's checkpoints. Recorded in the evaluations (`select`, absent = 'visits'); one Elo pool per rule (section 5.4) |
+| `selfplay_select`, `selfplay_select_min_visits` | visits, 0 | the same rule for self-play's moves after its first `temp_moves` searched decisions of a game (remote self-play too); the recorded targets stay `policy_target`'s. For a forked A/B run (section 12.4) |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6); its own is refused |
@@ -155,11 +158,12 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games), `elo`, `phases` (seconds per phase), `seconds` |
-| `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated; `index.json` = every checkpoint's Elo; `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
+| `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool; with `elo_offsets` an evaluated one); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through raw-offset Elo matches); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
-| `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor) and the current fit |
+| `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
+| `elo/<rule>/results.json`, `elo/<rule>/ratings.json` | the pool of another evaluation move rule ('cq', 'cq-n2', ...; section 5.4): the same files, plus `select` (the rule) and `since` (the first iteration it rated) |
 | `evals.jsonl` | with `eval_remote` (section 5.2): one line per remote evaluation `{iter, eval_yard, eval_random, elo, time, host, seconds}`, merged into the iterations' rows by the dashboard; a co-training run's resolver: `resolver/evals.jsonl` (11.5); a co-training run's primary with `draft_eval_net_remote`: `{iter, eval_yard_net, time, host, seconds, remote_s}` (11.7) |
 | `progress.json` | self-play progress of the iteration in flight (dashboard); a co-training run's also has `events_resolved`, `target`, `drafting`, `pending_events`, `matches_queued`, `matches_in_flight`, `matches_done` (section 11); with `selfplay_remote`: `remote` (single-game) or `matches_remote` (co-training), sections 5.3, 11.6 |
 | `resolver/` | a co-training run's resolver network (section 11): the same layout (`config.json`, `metrics.jsonl`, `models/`, `data/`, `elo/`, `debug/`, `progress.json`), iteration numbers shared |
@@ -218,7 +222,8 @@ Every `eval_every` iterations the checkpoint plays `eval_games` against the yard
 Elo matches against the checkpoints 1, 2, 4, 8, 16, 32 evaluations back (`elo_games` each);
 the random bot is rated once against the yardstick (`ref_games`). All results are refit by
 Bradley-Terry maximum likelihood (weak Gaussian prior) with the yardstick at 1000 after every
-iteration; `models/index.json` and `best.pt` follow the fit.
+iteration; `models/index.json` and `best.pt` follow the fit. The network seats search with
+`eval_sims`, no noise, no temperature, and choose their moves by `eval_select` (section 5.4).
 
 Matches with an external player (the JS bot) run with `ext_groups` groups, and `infer.drive`
 answers the external batches on worker threads while the driver searches and evaluates the
@@ -293,9 +298,17 @@ yardsticks, the Elo matches and reference games - to another machine while the r
   settings}}`; a package may give a Mapping that resolves when the run starts (MTG Zero's
   `RunCommitRemote`: the remote's checkout of exactly the run's commit, checked before every
   evaluation).
+* **The move rule** (section 5.4): the mirror's config.json carries `eval_select`, so the remote
+  plays the run's rule with the run's code; its result's `eval_yard.select` must name the run's
+  rule ('visits' when absent), else it is refused before anything is recorded (an older checkout
+  that ignores the setting; logged and retried like any failure). The copies back are the pool's
+  (`elo/` or `elo/<rule>/`); a rule's new pool on an existing mirror keeps the mirror's
+  metrics.jsonl (only a mirror without one gets the run's). With `elo_offsets` every raw-offset
+  opponent is shipped too.
 * **Co-training runs**: the resolver's evaluation on a remote, section 11.5.
 
-Tests: `tests/test_loop.py` (`test_remote_evaluation_local`, `..._continues_a_local_run`) and
+Tests: `tests/test_loop.py` (`test_remote_evaluation_local`, `..._continues_a_local_run`),
+`tests/test_select.py` (the rule on a remote, a refused result, raw offsets shipped) and
 `tests/test_cotrain.py` (11.5).
 
 ### 5.3 Remote self-play (`zero/remoteplay.py`, `zero/workqueue.py`, run setting `selfplay_remote`)
@@ -569,6 +582,70 @@ delver1's desktop curve, the spiral of 213a9c0 against it, a batch-bound consume
 iterations at its floor, the formula's bounds and `slots`, a back-off -, `split_games` on a sample
 dict and on the driver, the staleness histogram, the coordinator's reserve and matches per event),
 `tests/test_net_data.py` (the streamed window).
+
+### 5.4 The evaluation move rule and its Elo pools; raw Elo offsets; no random games (2026-10-28)
+
+**The rule** (`eval_select`, `eval_select_min_visits`; docs/search.md 3.3): how every evaluation
+seat chooses its moves - 'visits' (argmax (N, P0), the default) or 'cq' (the completed-Q
+target's argmax, optionally among the options with at least `eval_select_min_visits` visits).
+`Run.nn_seat` builds every evaluation seat (the yardstick and random matches, the Elo matches -
+both seats -, the reference games have none, co-training's primary and resolver evaluations,
+`eval_yard_net`), so they all follow it, here and on an `eval_remote` (its config is the run's;
+section 5.2). `zero.h2h` and `zero.replay` take a checkpoint's run's rule unless told otherwise
+(`--select`, `--a-select` / `--b-select`; replays record it in the seat, `select`).
+`selfplay_select` is the same rule for self-play after `temp_moves` (off by default: a forked
+run's A/B, section 12.4).
+
+**Bookkeeping.** Every evaluation records its rule: `eval_yard`, `eval_random` and `elo` rows
+carry `select` = the rule's name (`mcts.select_tag`: 'cq', 'cq-n2', 'cq-v25-s0.5' with another
+completed-Q transform), absent = 'visits' - so a default run writes exactly what it wrote
+before, and every older row reads as 'visits'. Co-training's `eval_yard_net` records `select`
+(the primary's) and `resolver_select`.
+
+**One Elo pool per rule.** A checkpoint that chooses its moves by another rule is another
+player, so its games never enter another rule's pool: 'visits' keeps `elo/` (results.json,
+ratings.json - every run's pool from before the setting), any other rule gets `elo/<rule>/`
+with the same files plus `select` and `since`. A pool's evaluations are the metrics rows whose
+`eval_yard.select` is its rule; its Elo matches are played with both seats at its rule; its
+reference games (random vs the yardstick: bots only, rule-free) are played once in it. Chosen
+over one file with rule-tagged player names refit per rule because a pool is then a plain run
+pool (the fit, `logged`, the dashboards and the remote's copies work on it unchanged) and the
+other pools' files are never written again - nothing to filter, nothing to migrate.
+
+* **Changing the rule mid-run** (at a restart: `--eval-select cq`): the old pool's files stay
+  byte for byte as they were (tested), the new pool starts at the first iteration it sees
+  (`since`): its Elo matches are those of checkpoints evaluated from then on, against their
+  usual opponents (older checkpoints, rated in the new pool through those games only) - no
+  replay of the history. `models/index.json` and `best.pt` follow the current rule's pool (the
+  best checkpoint *under the rule the run evaluates with*), and so do the dashboards
+  (`elo.active_pool`: config.json's rule; zerodash's `runfiles.elo_pool`). The metrics rows'
+  `elo` of the earlier iterations keep their old pool's ratings; Elo is comparable within one
+  pool only. Back to a rule used before: its pool continues (and plays the Elo matches it lacks
+  for the iterations evaluated meanwhile - k >= its `since` -, at the old rule).
+* **On a remote**: the remote plays the run's rule and owns its pool (`elo/<rule>/` on the
+  mirror, copied back); a result naming another rule is refused (5.2).
+
+**Raw Elo offsets** (`elo_offsets`, e.g. '1,2,4,8'). By default an evaluated checkpoint k plays
+k - off x `eval_every` for off in 1, 2, 4 ... 32 (the first `elo_opponents`), so with
+`eval_every` 8 only k-8 and k-16, and a run whose `eval_every` changed skips the iterations in
+between (MTG Zero's delver1: iteration 12, evaluated at `eval_every` 4, never played again at 8).
+`elo_offsets` makes the offsets raw iterations: k plays k-1, k-2, k-4, k-8 (those that exist;
+every iteration writes a checkpoint) whatever `eval_every`, and `elo_opponents` is not used.
+The opponents that were never evaluated join the pool as players rated only through these games
+(the fit needs no yardstick games for them; `logged` lists the evaluated ones only), are listed
+in `models/index.json` with `"evaluated": false`, and are never `best.pt` (nor the dashboard's
+"best"); the remote ships them (5.2). '' (the default) keeps the evaluations-back offsets
+exactly.
+
+**No random games** (`eval_random_games` 0): no match against the random bot (no `eval_random`
+row: the Elo code, the dashboards and the remote work without it; the dashboards show no "vs
+random" value). The reference games still rate the random bot against the yardstick (bots only,
+`ref_games` once per pool; 0 = not at all).
+
+Default runs are unchanged: toy-smoke (classic; rolling; margin_w + chance_k + cq targets with
+`eval_every` 2) gives the same metrics (timing aside), checkpoints, optimizer states, shards, Elo
+files and models/index.json byte for byte as zero-core 3c26d9f, with the settings left out or
+given explicitly at their defaults (section 12.3). Tests: `tests/test_select.py`.
 
 ## 6. Learning: the toy proof run (Glass Road Zero 2026-10-11; Caverna Zero 2026-10-10)
 
@@ -901,7 +978,11 @@ work unchanged); the resolver has `<run>/resolver/` with the same layout. One pl
 game (`players`). Its `iters`, `games` and `rolling` are not used; its `eval_remote` sends its
 evaluations to a remote (11.5), its `selfplay_remote` a share of its episodes (11.6). The run's
 own `eval_remote` and `selfplay_remote` (the primary's) are refused; `draft_eval_net_remote` sends
-the primary's resolver-network events to a remote (11.7).
+the primary's resolver-network events to a remote (11.7). Each network has its own evaluation
+move rule (section 5.4): the run's `eval_select` for the primary's seats, `resolver_cfg`'s for the
+resolver's (its own evaluations and the episodes of `eval_yard_net`), each with its Elo pool
+(`elo/[<rule>/]`, `resolver/elo/[<rule>/]`); `eval_yard_net` records both (`select`,
+`resolver_select`, absent = 'visits'). `selfplay_select` the same way for each network's self-play.
 
 **The game package's glue** (`GamePackage.deferred`, game -> `{'episodes': fn(payload) ->
 [resolver spec JSON, ...], 'results': fn(payload, rows) -> results JSON}`): the defaults read
@@ -1297,3 +1378,57 @@ idle: the process looks idle): the phase is latency-bound, not stalled, and the 
 shorten it (the 383 / 1 start cost nothing measurable there: one thread evaluates both groups'
 batches in turn either way). The levers are the remote (11.7: its CPU), CPU inference for the
 evaluation's small batches, and fewer or shorter calls.
+
+## 12. The move rule: visits vs completed Q (MTG Zero's delver1, 2026-10-28)
+
+### 12.1 The experiment
+
+MTG Zero's Legacy Izzet Delver mirror run (runs/delver1; its ENGINE.md 54) evaluates at
+`eval_sims` 32. An experiment (zero-core branch exp/select-rule 945d75e + 4a198cb, MTG Zero
+tools/exp_select.py on branch exp/select-rule 102083d; not merged) measured each checkpoint
+against the heuristic bot (the yardstick) with three rules for the evaluation seat, 200 games a
+cell, paired deals:
+
+| checkpoint | A: visits | B: cq | C: argmax Q, >= 2 visits | C: >= 3 visits |
+|---|---|---|---|---|
+| iter 12 | 42.0% | **57.0%** | 51.0% | 54.5% |
+| iter 14 | 52.0% | **61.0%** | 45.0% | 49.5% |
+
+Head to head (the same checkpoint, B vs A): B 62.5% at iter 12, 58% at iter 14 (+56 to +89 Elo).
+At 32 simulations the prior's favourite collects most visits even where the search found it
+worse, so argmax visits mostly plays the prior; B lets Q overrule it. The user's decision
+(2026-10-28): B as an opt-in setting with today's rule the default everywhere; delver1's
+evaluation switches to B at its next re-pin; self-play later, by a forked A/B run.
+
+### 12.2 What was built
+
+`driver::Select` (docs/search.md 3.3: 'visits' | 'cq' + the guard), seat keys `select` /
+`select_min_visits`, `SearchTree.root_select`, the Python reference `mcts.select_index`; run
+settings `eval_select`, `selfplay_select` and their guards (1.2); one Elo pool per rule, raw
+Elo offsets, runs without random games (5.4); the rule on the remote (5.2), in co-training (11),
+h2h and replays. The experiment's 'q' rule (C) lost to B and was not kept; its move log is
+(`move_log`, docs/search.md 2.5).
+
+### 12.3 Checks
+
+* Rust: the golden records (`visits_records_unchanged`) and a new evaluation-match golden at
+  the default rule, equal to zero-core 3c26d9f's (12492034373733022939, computed there with the
+  same test code); new goldens for 'cq' (self-play records (329, 8716559848855127382), a cq vs
+  visits match 10451580073337998459, a guarded cq-n2 vs cq-n2 match 2225760264326051811).
+* Parity: docs/search.md 6 (the Python rule on Rust roots = the Rust driver's move on all 192
+  cases checked; Rust-tree vs Python-tree 'cq' seats in games).
+* Toy-smoke byte for byte against 3c26d9f: SMOKE_IDENT_PLACEHOLDER
+* MTG Zero (its ENGINE.md 57): the production evaluation path (`Run.evaluate`) of delver1's
+  newest checkpoint reproduces the experiment's direction; the guard's effect is measured there.
+
+### 12.4 A self-play A/B (not run)
+
+`selfplay_select cq` changes self-play's moves after `temp_moves` only (the recorded targets
+stay `policy_target`'s, the first `temp_moves` decisions are sampled as before). An A/B: fork a
+run at an iteration (`tools/fork_run.py`), set `--selfplay-select cq` on the fork and keep the
+parent as the control (same seed, same settings otherwise), evaluate both with the same
+`eval_select` (both pools then compare: the same rule), and read it with an h2h between the
+arms' checkpoints of equal iterations (`zero.h2h`, both sides at the same `--select`), as the
+policy-target A/Bs (section 9) were read. Expected effects to watch: games follow Q earlier, so
+self-play's value targets see more search-preferred lines; the visit-count policy targets do
+not change meaning (a cq target is the natural pair, as Gumbel AlphaZero trains it).

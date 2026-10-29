@@ -6,10 +6,13 @@ Local side (`RemoteEval`, a thread of the run process): each evaluated iteration
 the remote's mirror of the run (`<workdir>/<run name>`: config.json with the remote's overrides,
 the checkpoints the evaluation needs), evaluated there with `python -m <pkg>.az.remote eval
 <mirror> <iter>`, and its result appended to the run's `evals.jsonl` ({iter, eval_yard,
-eval_random, elo, time, host, seconds}); the mirror's elo/ files and models/index.json are copied
-back (the remote owns the run's Elo while `eval_remote` is on). The dashboards merge evals.jsonl
-into the iterations' rows. Evaluations missing after a restart are queued again; a failure (the
-remote asleep or offline) is retried every `RETRY_S`.
+eval_random, elo, time, host, seconds}); the mirror's Elo pool files (elo/, or elo/<rule>/ for an
+eval_select other than 'visits', docs/az.md 5.4) and models/index.json are copied back (the
+remote owns the run's Elo while `eval_remote` is on). The remote plays the run's own settings,
+eval_select included (config.json); a result that names another move rule than the run's is
+refused (the remote's checkout is not the run's code) and retried like a failure. The dashboards
+merge evals.jsonl into the iterations' rows. Evaluations missing after a restart are queued again;
+a failure (the remote asleep or offline) is retried every `RETRY_S`.
 
 Remote side (`main`): the run's own `Run.evaluate` + `Run.elo_update` on the mirror, one
 evaluation at a time per remote workdir (a lock directory), the result printed as one line
@@ -231,14 +234,19 @@ class RemoteEval:
     def _ship(self, it):
         from .run import model_path
         c = self.R.cfg
+        tag = elo.eval_tag(c)
+        pool = elo.pool_dir('', tag).replace(os.sep, '/')       # 'elo' or 'elo/<rule>' (docs/az.md 5.4)
         if self.shipped is None:
-            self.t.mkdirs(self.rdir + '/models', self.rdir + '/elo')
+            self.t.mkdirs(self.rdir + '/models', self.rdir + '/' + pool)
             self.shipped = set(self.t.listdir(self.rdir + '/models'))
-            if 'results.json' not in self.t.listdir(self.rdir + '/elo'):
-                # a new mirror: the run's Elo so far (results incl. the evaluations logged here
-                # before eval_remote) and its metrics, so the remote continues them
-                for src, dst in ((os.path.join(self.R.run, 'elo', 'results.json'), '/elo/results.json'),
-                                 (os.path.join(self.R.run, 'metrics.jsonl'), '/metrics.jsonl')):
+            if 'results.json' not in self.t.listdir(self.rdir + '/' + pool):
+                # a new mirror (or a new rule's pool on it): the pool's Elo so far (results incl. the
+                # evaluations logged here before eval_remote) and the run's metrics, so the remote
+                # continues them - a rule's new pool keeps the mirror's metrics if it has them
+                ship = [(os.path.join(elo.pool_dir(self.R.run, tag), 'results.json'), f'/{pool}/results.json')]
+                if tag == 'visits' or 'metrics.jsonl' not in self.t.listdir(self.rdir):
+                    ship.append((os.path.join(self.R.run, 'metrics.jsonl'), '/metrics.jsonl'))
+                for src, dst in ship:
                     if os.path.exists(src):
                         self.t.put(src, self.rdir + dst)
         cfg = dict(c, eval_remote='', **self.spec.get('overrides', {}))
@@ -247,8 +255,9 @@ class RemoteEval:
             json.dump(cfg, f, indent=1)
         self.t.put(tmp, self.rdir + '/config.json')
         e = max(1, int(c['eval_every']))
-        # every checkpoint Run.elo_update may play up to `it` (each evaluated one and its offsets)
-        need = sorted({j for k in [0, *range(e, it + 1, e)] for j in [k] + [k - off * e for off in elo.OFFSETS]
+        # every checkpoint Run.elo_update may play up to `it` (each evaluated one and its opponents:
+        # every offset of elo.OFFSETS, or elo_offsets' raw ones)
+        need = sorted({j for k in [0, *range(e, it + 1, e)] for j in [k] + elo.opponents(k, e, c.get('elo_offsets', ''))
                        if 0 <= j <= it})
         for k in need:
             fn = elo.ckpt_name(k) + '.pt'
@@ -264,13 +273,19 @@ class RemoteEval:
         if r.returncode or not lines:
             raise RuntimeError(f'exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[-600:]}')
         m = json.loads(lines[-1][len(RESULT):])
+        tag = elo.eval_tag(self.R.cfg)
+        got = (m.get('eval_yard') or {}).get('select', 'visits')
+        if m.get('eval_yard') and got != tag:
+            raise RuntimeError(f"the remote evaluated with the move rule {got!r}, the run's eval_select is {tag!r} "
+                               f"(its checkout is not the run's code?): not recorded")
         row = {'iter': it, 'time': time.time(), 'host': self.name, 'seconds': round(time.time() - t0, 1)}
         for k in ('eval_yard', 'eval_random', 'elo'):
             if k in m:
                 row[k] = m[k]
-        os.makedirs(os.path.join(self.R.run, 'elo'), exist_ok=True)
+        pool = elo.pool_dir('', tag).replace(os.sep, '/')
+        os.makedirs(elo.pool_dir(self.R.run, tag), exist_ok=True)
         for fn in ('results.json', 'ratings.json'):
-            self.t.get(self.rdir + '/elo/' + fn, os.path.join(self.R.run, 'elo', fn))
+            self.t.get(f'{self.rdir}/{pool}/{fn}', os.path.join(elo.pool_dir(self.R.run, tag), fn))
         self.t.get(self.rdir + '/models/index.json', os.path.join(self.R.run, 'models', 'index.json'))
         with open(os.path.join(self.R.run, 'evals.jsonl'), 'a', encoding='utf-8') as f:
             f.write(json.dumps(row) + '\n')
@@ -278,7 +293,8 @@ class RemoteEval:
         if ey:
             self.R.log(f'iter {it} vs {ey.get("opp", self.R.yard)} (remote {self.name}, {row["seconds"]:.0f}s): {ey}')
         if row.get('elo'):
-            self.R.log(f'iter {it} elo {row["elo"]["elo"]:.0f} +-{1.96 * row["elo"]["se"]:.0f} (remote {self.name})')
+            self.R.log(f'iter {it} elo {row["elo"]["elo"]:.0f} +-{1.96 * row["elo"]["se"]:.0f}{elo.pool_note(tag)} '
+                       f'(remote {self.name})')
 
 
 class RemoteNetEval(RemoteEval):
@@ -354,6 +370,10 @@ class RemoteNetEval(RemoteEval):
         m = json.loads(lines[-1][len(RESULT):])
         if not m.get('eval_yard_net'):
             raise RuntimeError(f'no eval_yard_net in the result: {lines[-1][:300]}')
+        tag = elo.eval_tag(self.R.cfg)
+        got = m['eval_yard_net'].get('select', 'visits')
+        if got != tag:
+            raise RuntimeError(f"the remote played the move rule {got!r}, the run's eval_select is {tag!r}: not recorded")
         row = {'iter': it, 'eval_yard_net': m['eval_yard_net'], 'time': time.time(), 'host': self.name,
                'seconds': round(time.time() - t0, 1), 'remote_s': m.get('seconds')}
         with open(os.path.join(self.R.run, 'evals.jsonl'), 'a', encoding='utf-8') as f:
@@ -428,7 +448,7 @@ def evaluate_mirror(rdir, it):
     ratings, best = R.elo_update(it, m)
     me = ratings.get(elo.ckpt_name(it))
     if me:
-        m['elo'] = {'elo': round(me[0], 1), 'se': round(me[1], 1)}
+        m['elo'] = elo.row(me, R.eval_tag())
     m['time'] = time.time()
     append_metrics(rdir, m)
     return m

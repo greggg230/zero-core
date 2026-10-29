@@ -36,7 +36,7 @@ import time
 
 from flask import Flask, Response, jsonify, request
 
-from . import package, runctl
+from . import elo, package, runctl
 
 app = Flask(__name__)
 app.config['RUNS'] = os.path.join(package.active().root, 'runs')
@@ -141,11 +141,13 @@ def runs():
 
 
 def _net(d):
-    """One network's view of a run directory: its settings, metrics, long-search points and Elo."""
-    res = _json(os.path.join(d, 'elo', 'results.json'), {}) or {}
+    """One network's view of a run directory: its settings, metrics, long-search points and Elo
+    (the pool of its evaluation move rule, docs/az.md 5.4: elo/ or elo/<rule>/)."""
+    tag, pool = elo.active_pool(d)
+    res = _json(os.path.join(pool, 'results.json'), {}) or {}
     return {'config': _json(os.path.join(d, 'config.json'), {}), 'metrics': _metrics(d), 'deep': _deep(d),
-            'ratings': _json(os.path.join(d, 'elo', 'ratings.json'), {}), 'pairs': res.get('pairs', {}),
-            'anchor': res.get('anchor')}
+            'ratings': _json(os.path.join(pool, 'ratings.json'), {}), 'pairs': res.get('pairs', {}),
+            'anchor': res.get('anchor'), 'select': tag, 'since': res.get('since')}
 
 
 def _resolver_dir(d):
@@ -387,7 +389,8 @@ function render(){
   const games=sp.reduce((s,m)=>s+m.selfplay.games,0);
   const t0=M.length?M[0].time:0,tl=M.length?M[M.length-1].time:0;
   const eloPts=Object.keys(R).filter(k=>k.startsWith('iter_')).map(k=>({x:+k.slice(5),y:R[k].elo,lo:R[k].elo-1.96*R[k].se,hi:R[k].elo+1.96*R[k].se,r:R[k]})).sort((a,b)=>a.x-b.x);
-  const bestElo=eloPts.reduce((b,p)=>!b||p.y>b.y?p:b,null),lastElo=eloPts[eloPts.length-1];
+  const evald=new Set(M.filter(m=>m.eval_yard).map(m=>m.iter));
+  const bestElo=eloPts.filter(p=>!cfg.elo_offsets||evald.has(p.x)).reduce((b,p)=>!b||p.y>b.y?p:b,null),lastElo=eloPts[eloPts.length-1];
   const wy=winPts(M,'eval_yard'),wr=winPts(M,'eval_random');const ly=wy[wy.length-1],lr=wr[wr.length-1];
   const P=V.pairs||{},nm=i=>'iter_'+String(i).padStart(4,'0');
   const rec=(a,b)=>{const k=a<b?a+'|'+b:b+'|'+a,p=P[k];if(!p||!p[1])return null;const s=a<b?p[0]:p[1]-p[0],w=s/p[1];return {win:w,n:p[1],se:Math.sqrt(Math.max(w*(1-w),1e-6)/p[1])}};
@@ -426,7 +429,9 @@ function render(){
   }
   const refs=[{y:1000,label:yard+' 1000'}];
   if(R.random&&yard!=='random')refs.push({y:R.random.elo,label:'random '+Math.round(R.random.elo)});
-  $('elo-cap').textContent=`The yardstick (${yard}) is fixed at 1000. Each checkpoint plays the yardstick, the random bot and the checkpoints 1, 2, 4, 8, 16 and 32 iterations before it; all games are refit together after every iteration (Bradley-Terry). Band = 95% interval.`;
+  const offs=cfg.elo_offsets?`the checkpoints ${cfg.elo_offsets.split(',').join(', ')} iterations before it (those never evaluated are rated through these games only)`:`the checkpoints 1, 2, 4, 8, 16 and 32 evaluations before it`;
+  const pool=V.select&&V.select!=='visits'?` Moves by the rule ${V.select} (its own Elo pool, from iteration ${V.since!=null?V.since:'?'}; earlier ratings are in the 'visits' pool, elo/).`:'';
+  $('elo-cap').textContent=`The yardstick (${yard}) is fixed at 1000. Each evaluated checkpoint plays the yardstick, ${cfg.eval_random_games===0?'':'the random bot, '}${offs}; all games are refit together after every iteration (Bradley-Terry). Band = 95% interval.${pool}`;
   chart($('elo'),[{pts:eloPts,color:'--series-1',label:'Elo',tip:p=>`${Math.round(p.y)} ±${Math.round(1.96*p.r.se)} (${p.r.games} games)`}],{refs});
   $('win-t').textContent='Win rate against '+yard+' and the random bot';
   const ws=[{pts:wy,color:'--series-1',label:yard,tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)} · margin ${p.e.margin}`},{pts:wr,color:'--series-2',label:'random',tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)}`}];

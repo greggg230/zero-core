@@ -4,13 +4,15 @@ search saw at every decision, for the game apps' replay viewers.
   python -m <pkg>.az.replays CKPT [--opp ext:jsbot | self | random | OTHER.pt] [--games 6]
       [--sims 128] [--opp-sims N] [--spec JSON] [--selfplay] [--hint ext:jsbot | none]
       [--chance-k 2] [--device cuda] [--seed 0] [--out DIR] [--title T]
-      [--upload [URL]] [--key-file F]
+      [--select visits | cq] [--select-min-visits N] [--upload [URL]] [--key-file F]
 
 The checkpoint plays `--games` games against `--opp` (another checkpoint, itself, a built-in
 bot or an external player such as the JS bot), seats alternating. Its search runs the Rust tree
 from Python (`play.PyDriver`, impl 'rs'): evaluation settings by default (no noise, argmax),
 `--selfplay` = the run's self-play settings (Dirichlet noise, temperature for the first
-`temp_moves` decisions). The spec defaults to the checkpoint's run (`runs/<run>/config.json`),
+`temp_moves` decisions). The moves it does not sample follow the run's move rule (docs/search.md
+3.3: eval_select, or selfplay_select with --selfplay; a checkpoint without a run: 'visits'), or
+--select / --select-min-visits; the seat records its rule (`select`). The spec defaults to the checkpoint's run (`runs/<run>/config.json`),
 else the game package's. `--hint ext:<name>` asks that external player, at each network
 decision whose state it has not seen yet, what it would do there (stored, never applied): the
 viewer shows it next to the network's choice (default: the package's `replay_hint`).
@@ -22,7 +24,8 @@ Each game -> one JSON object (format 'zero-replay/1'), written gzipped to `--out
 
   format   'zero-replay/1'
   game, spec, seed, created (unix s), title, group, source {checkpoint, run, iter}
-  seats    [{name, kind: 'nn' | 'bot' | 'ext', checkpoint?, run?, iter?, sims?}]
+  seats    [{name, kind: 'nn' | 'bot' | 'ext', checkpoint?, run?, iter?, sims?, select? (the move
+           rule, absent = 'visits')}]
   states   [the game's export_state(), parsed]   (a state is stored once per change)
   frames   one per step, in order:
            {s: state index before the step, p: seat to move, k: 'nn' | 'bot' | 'ext' | 'forced',
@@ -263,10 +266,21 @@ def run_config(run):
         return json.load(f)
 
 
-def _nn(key, sims, cfg, selfplay, chance_k):
+def _nn(key, sims, cfg, selfplay, chance_k, select=None):
+    """A network seat at the run's settings (`cfg`); its move rule the run's (eval_select, or
+    selfplay_select with `selfplay`) unless `select` = (rule, min_visits) is given."""
+    pre = 'selfplay_select' if selfplay else 'eval_select'
+    rule, mv = select if select else (cfg.get(pre, 'visits'), cfg.get(pre + '_min_visits', 0))
     return NNSeat(key=key, sims=sims, c_puct=cfg.get('c_puct', 1.0), selfplay=selfplay, alpha=cfg.get('alpha', 0.3),
                   eps=cfg.get('eps', 0.25), temp_moves=cfg.get('temp_moves', 30) if selfplay else 0,
-                  chance_k=chance_k, redet=bool(cfg.get('redet', 1)), impl='rs')
+                  chance_k=chance_k, redet=bool(cfg.get('redet', 1)), impl='rs', cq_c_visit=cfg.get('cq_c_visit', 50.0),
+                  cq_c_scale=cfg.get('cq_c_scale', 1.0), select=rule, select_min_visits=int(mv))
+
+
+def _with_rule(info, seat):
+    if seat.select != 'visits':
+        info['select'] = seat.select_tag
+    return info
 
 
 def _ckpt_seat(path, key, sims):
@@ -280,9 +294,10 @@ EXT_TITLES = {'jsbot': 'JS bot'}
 
 
 def record(ckpt, opp='self', games=6, sims=128, opp_sims=None, spec=None, selfplay=False, hint=None, chance_k=2,
-           device='cpu', seed=0, title=None, conc=8, log=print):
+           device='cpu', seed=0, title=None, conc=8, log=print, select=None):
     """Play and record `games` games of checkpoint `ckpt` vs `opp` ('self', 'ext:<name>', a bot
-    name or another checkpoint), seats alternating (game k: `ckpt` is seat k % 2). -> replays."""
+    name or another checkpoint), seats alternating (game k: `ckpt` is seat k % 2). `select`:
+    (rule, min_visits) of the network seats (None: each checkpoint's run's). -> replays."""
     ma, _ = load(ckpt, device)
     game = ma.config.get('game', package.active().game)
     run, it = run_of(ckpt)
@@ -290,8 +305,8 @@ def record(ckpt, opp='self', games=6, sims=128, opp_sims=None, spec=None, selfpl
     if spec is None:
         spec = cfg.get('spec', package.active().specs.get(game, ''))
     evaluators = {'a': NetEvaluator(ma, device)}
-    me = _ckpt_seat(ckpt, 'a', sims)
-    seat_a = _nn('a', sims, cfg, selfplay, chance_k)
+    seat_a = _nn('a', sims, cfg, selfplay, chance_k, select)
+    me = _with_rule(_ckpt_seat(ckpt, 'a', sims), seat_a)
     externals = {}
     if opp == 'self':
         other, seat_b = me, seat_a
@@ -304,8 +319,8 @@ def record(ckpt, opp='self', games=6, sims=128, opp_sims=None, spec=None, selfpl
         if mb.config.get('game', game) != game:
             raise SystemExit(f'{opp} plays {mb.config.get("game")}, {ckpt} plays {game}')
         evaluators['b'] = NetEvaluator(mb, device)
-        other = _ckpt_seat(opp, 'b', opp_sims or sims)
-        seat_b = _nn('b', opp_sims or sims, run_config(run_of(opp)[0]) or cfg, selfplay, chance_k)
+        seat_b = _nn('b', opp_sims or sims, run_config(run_of(opp)[0]) or cfg, selfplay, chance_k, select)
+        other = _with_rule(_ckpt_seat(opp, 'b', opp_sims or sims), seat_b)
     else:
         other, seat_b = {'name': opp, 'kind': 'bot', 'bot': opp}, opp
     hname = hint[4:] if hint and hint.startswith('ext:') else None
@@ -400,11 +415,15 @@ def main(argv=None):
     ap.add_argument('--out', default=None, help='default: <run>/replays')
     ap.add_argument('--upload', nargs='?', const='default', default=None, help='upload to the game app (default URL: the package replay_url)')
     ap.add_argument('--key-file', default=None)
+    ap.add_argument('--select', default=None, choices=['visits', 'cq'],
+                    help="the network seats' move rule (default: the checkpoint's run's)")
+    ap.add_argument('--select-min-visits', type=int, default=0)
     args = ap.parse_args(argv)
     seed = args.seed if args.seed is not None else random.randrange(1 << 30)
     reps = record(args.ckpt, opp=args.opp, games=args.games, sims=args.sims, opp_sims=args.opp_sims, spec=args.spec,
                   selfplay=args.selfplay, hint=None if args.hint == 'none' else args.hint, chance_k=args.chance_k,
-                  device=args.device, seed=seed, title=args.title, conc=args.conc)
+                  device=args.device, seed=seed, title=args.title, conc=args.conc,
+                  select=(args.select, args.select_min_visits) if args.select else None)
     run, _ = run_of(args.ckpt)
     out = args.out or os.path.join(run or '.', 'replays')
     for r in reps:
