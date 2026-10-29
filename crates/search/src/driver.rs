@@ -197,7 +197,7 @@ pub struct NnSeat {
     /// Whether the seat's full searches become training records (with `DriverCfg::record` and
     /// `selfplay`; default true). False: a self-play seat that searches, samples and draws its
     /// playout cap exactly as a recorded one but records nothing - a league opponent, a past
-    /// checkpoint playing the current network (zero's run setting `selfplay_league`, docs/az.md 13).
+    /// checkpoint playing the current network (zero's run setting `selfplay_league`, docs/az.md 14).
     pub record: bool,
 }
 

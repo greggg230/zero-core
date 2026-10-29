@@ -1253,7 +1253,7 @@ fn select_transform_moves_only_the_moves_never_the_targets() {
 
 #[test]
 fn an_unrecorded_seat_plays_the_same_games_and_records_nothing() {
-    // A league game (zero's run setting selfplay_league, docs/az.md 13): the current network's
+    // A league game (zero's run setting selfplay_league, docs/az.md 14): the current network's
     // self-play seat (key m) against a past checkpoint's (key L), seats alternating. With L's
     // `record` false the games are the same move for move (its search, noise, temperature and
     // playout-cap draws are a recorded seat's) and the records are exactly the m seat's of the

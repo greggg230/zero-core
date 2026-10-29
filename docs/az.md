@@ -33,6 +33,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
 | `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
+| `league.py` | The self-play league (section 14): the league games' kinds and seat tables (classic, rolling), the iteration's picks of past checkpoints (`League.plan`: uniform or pfsp), the slots' evaluators (guarded), the games' attribution and `selfplay.league` |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
 
@@ -137,6 +138,9 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `resolver_conc`, `pending_max` | 0, 0 | resolver episodes in flight in self-play (0 = its `conc`); the backpressure: resolver episodes queued or playing at which the primary's self-play waits (0 = 2 x in flight) |
 | `draft_eval_net_every` | 4 | the primary's evaluation also plays its episodes with the resolver's network on evaluated iterations that are multiples of it (`eval_yard_net`; 0 = never); the rest of its evaluation plays them with the resolver's yardstick |
 | `draft_eval_net_remote` | '' | those events (`eval_yard_net`) on another machine while the run trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 11.7); their results in the run's `evals.jsonl` |
+| `selfplay_league` | 0.0 | the self-play league (section 14): this share of the self-play games (exactly, over each driver's started games) puts a past checkpoint of the run in one seat; only the current network's decisions become samples. 0 = off (every game the current network's mirror, as before). Single-game runs (co-training refuses it) |
+| `selfplay_league_pool` | '2,4,8,16,32' | the past checkpoints it may play: raw iteration offsets back from the network that self-plays (iteration i self-plays with i-1: offset 2 = checkpoint i-3), those that exist; 'all' = every earlier checkpoint (fictitious self-play) |
+| `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
 
 ## 2. Run control (`runctl.py`)
 
@@ -166,7 +170,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s), `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
@@ -1996,3 +2000,184 @@ docs).
   4202a4a 171 s.
 * MTG Zero (ENGINE.md 62.7): `--test az` 27 passed, pytest 49 (the new distillation test among them),
   the CPU distillation and head-to-heads of 13.4.
+
+## 14. The self-play league (`zero/league.py`; MTG Zero's Delver mirror, 2026-10-29)
+
+### 14.1 Why
+
+MTG Zero's Legacy Izzet Delver mirror (its main line `runs/delver2`) settled at about +1 Elo per
+iteration (its ENGINE.md 63). In a mirror, pure self-play trains a network against its own current
+habits only: what beats them is learned, the habits it exploited fade, and nothing keeps the policy
+from narrowing or cycling. Fictitious self-play and AlphaStar's league answer it by playing part of
+the games against past versions. `selfplay_league` is that in its simplest form: an opt-in share of
+the self-play games puts a past checkpoint of the run in one seat.
+
+### 14.2 What it does
+
+* **Settings** (1.2): `selfplay_league` (share, 0 = off), `selfplay_league_pool` (raw iteration
+  offsets back from the network that self-plays - iteration i self-plays with checkpoint i-1, so the
+  default '2,4,8,16,32' offers i-3, i-5, i-9, i-17, i-33, those that exist -, or 'all': every
+  earlier checkpoint), `selfplay_league_slots` (past checkpoints per iteration, default 1; each its
+  own evaluator key 'L0', 'L1', ...), `selfplay_league_pick` ('uniform' | 'pfsp'). Validated at
+  start (`league.check_settings`); a co-training run (`resolver`, or `resolver_cfg` holding the
+  setting) is refused. The default offsets skip offset 1: checkpoint i-2 is one training iteration
+  away from the network that self-plays, so its games would be nearly mirror games recorded on one
+  side.
+* **Which games** (`league.kinds`): game g is a league game when floor((g + 1) f) > floor(g f), so a
+  driver's started games hold the share exactly (floor(n f) of n) and evenly spread; league game m
+  plays slot m mod k, the past network in seat (m div k) mod players (seats alternate, so neither
+  side gets the play / draw advantage), the other seats the current network. A classic driver gets
+  one table per iteration; a rolling or `queue_only` driver's cyclic table (`games[gid % len]`, the
+  Rust driver's) is one cycle of `league.cycle` entries (the share's denominator x slots x seats x
+  player counts), built once - its keys stay, the weights behind them follow each iteration's picks.
+  The shared queue (5.3) counts league games as any game: the quota stays exact; the share of the
+  *accepted* games is the started share up to which games finish first (25.0 +- 2% in the toy runs).
+* **The past network's seat** is the run's self-play seat on its key with `record` false (the Rust
+  seat key, docs/search.md 2.1): it searches with the self-play settings (root noise, temperature
+  moves, the playout cap, `selfplay_select`), so a past network plays as it did in its own
+  self-play, and it records nothing.
+* **Training targets: only the current network's decisions.** Its records are the league game's
+  samples: `pi` its search's target, `q` its own root value, `z` the game's result from its seat (the
+  driver's records are per decider). The past network's moves are not the current policy's: its
+  visit / completed-Q targets are an older network's improvement of an older prior (training on them
+  pulls the policy back toward the habits the league is meant to move away from), and its root
+  values estimate the game from an older value head. AlphaStar trains its main agents only on their
+  own decisions in league games, for the same reason. The cost: a league game gives about half the
+  samples of a mirror game, so an iteration's samples fall by about f / 2 (f = 0.25: ~12.5%) and
+  training's steps with them (`new samples x reuse / batch`).
+* **The picks** (`League.plan(it)`, made once per iteration and cached; the same plan whether made
+  for the remote's early phase while checkpoint it - 1 is evaluated or for this machine's phase, and
+  after a restart): the candidates are the pool's checkpoints that exist (newest first); with no
+  more candidates than slots every candidate plays (cycled over the slots), else `slots` are drawn
+  without replacement, seeded by (run seed, it). 'uniform' weighs them equally; 'pfsp' (prioritized
+  fictitious self-play, AlphaStar's f_hard) weighs candidate j by (1 - x_j)^2 (at least 1e-3), x_j =
+  the current networks' score against j from the metrics rows of iterations <= it - 2 (each row
+  weighted 0.7^age, a prior of 4 games at 0.5): checkpoints the network still loses to are played
+  more. **No candidate yet** (a new run's first iterations, a pool reaching further back than the
+  run): the slots hold checkpoint it - 1, i.e. mirror games recorded on one side (`self` in the
+  metrics).
+* **Evaluators**: each slot's checkpoint is loaded through `zero.net.load` with the run's game - the
+  encoding guard (10.4) refuses a past network of another encoding - into the slot's existing
+  evaluator when the network's config is the same (`set_weights`), else a new one.
+* **Metrics** (`selfplay.league` in metrics.jsonl): `share` (league games / the iteration's games),
+  `games`, `score` and `win` (+ `se`): the current network's score against the league (draws 0.5;
+  more than two players: 1 - the past seat's result), `pool` (per checkpoint: games, score, win),
+  `slots` ({key: checkpoint}), `candidates`, `pick` (and pfsp's `weights`), `local` / `remote` (the
+  league games of each machine), `self`, `infer_s` (the slots' inference time). A finished game is
+  attributed to the checkpoint in its slot when it finished (a rolling driver's game carried over a
+  phase boundary searched with both). The log: `iter 4 league: 149 league games (24.8%), slots
+  iter_0001 of 2 candidates (uniform); the current network scores 0.846 +- 0.030 against them
+  (iter_0001 149 games 0.846)`.
+* **Remote self-play** (5.3): the phase line names the slots' checkpoints (`league`: {key:
+  `models/iter_j.pt`}), shipped into the mirror with checkpoint i-1 at every phase start; a worker's
+  clean-up (checkpoints older than i-3) keeps the ones its phase names. The worker builds the run's
+  league table from the mirror's config, points its slot evaluators at the named checkpoints
+  (guarded), annotates its finished games with their slot's checkpoint, tallies the games the run
+  accepts and reports the tallies with its phase's `end` (`selfplay.league.remote`; a lingering
+  worker's games, held for the next phase, keep the checkpoint they played). A worker whose hello
+  does not announce the league (an older checkout: it would play mirror games and record both seats
+  of the league games) is killed and retried every 10 minutes (`worker k REFUSED: its checkout has no
+  self-play league`); this machine plays every game meanwhile. MTG Zero's remote `mac` runs exactly
+  the run's commit anyway (its RunCommitRemote).
+* **fork_run** with `--set selfplay_league=...`: the continuation links every checkpoint its league
+  may play (back to the pool's furthest offset, `league.fork_needs`; 'all': every one), not only the
+  Elo matches'. A fork made without the setting and started with it plays only the candidates it has.
+* **Off** (`selfplay_league` 0, the default): no League object, the seat dicts, tables, evaluators,
+  phase lines and metrics of before (14.5).
+
+### 14.3 Costs
+
+* **Inference calls**: each slot is one more network batch per group and dispatch (its leaves are a
+  share of the group's: f / 2 of the leaves split over the slots). On a CPU the extra call costs its
+  overhead plus its leaves; on CUDA mostly the call. Measured on the desktop's CPU (other runs on the
+  machine; rolling driver, 2 groups, 64 / 16 simulations):
+
+  | | leaves/s | calls per network (current / each slot) | batch (current / slot) |
+  |---|---:|---:|---:|
+  | toy 32 x 1, 256 in flight, 4 threads: off | 179,949 / 208,544 | 7,040 / - | 128 / - |
+  | toy, 0.25, one slot | 135,755 / 134,194 (-30%) | 7,051 / 7,051 | 112 / 16 |
+  | toy, 0.25, two slots | 123,872 / 118,763 (-38%) | 7,048 / 7,048 | 112 / 8 |
+  | toy, 0.5, one slot | 148,288 / 156,655 (-21%) | 7,075 / 7,075 | 95 / 33 |
+  | MTG Delver token network 128 x 4, 96 in flight, 4 search + 2 torch threads: off | 1,824 / 2,034 / 1,757 / 1,330 (mean 1,736) | - | 48 / - |
+  | MTG, 0.25, one slot | 1,642 / 1,344 / 1,770 / 1,296 (mean 1,513: -13%) | equal | 42 / 6 |
+  | MTG, 0.25, two slots | 1,395 / 1,233 (mean 1,314: -24%) | equal | 42 / 3 |
+
+  (Each phase 60-90 s after a warm-up; the toy's networks two checkpoints of a toy run, MTG Zero's
+  delver2 iterations 23 and 11; the desktop shared with MTG Zero's A/B arms, so the MTG phases vary by
+  +-20% between neighbours.) The toy's tiny network is the worst case: a call's overhead is most of
+  its cost (a 16-leaf call ~0.8 ms against ~1.0 ms for 112 leaves), so a slot costs nearly a call.
+  MTG's: a ~6-leaf call ~12 ms against ~46 ms for the current network's ~42 leaves - +26% inference
+  per dispatch with one slot, +38% with two - and inference is not all of the loop: about -13% of the
+  leaves per second with one slot. More slots cost more calls, a larger share does not (the same
+  number of calls, larger league batches). CUDA (a batch-bound consumer): one more graph replay per
+  dispatch, not measured here (CPU only).
+
+* **Memory**: one more network per slot in every self-playing process (this machine's driver and
+  each remote worker), inference only (no optimizer state; on CUDA its graph buffers too): MTG Zero's
+  Delver token network is 6.2 MB on disk. A rolling driver keeps its slots' evaluators.
+* **Transfer** (remote self-play): `slots` more checkpoints per iteration into the mirror - Delver:
+  6.2 MB against the 6.2 MB checkpoint and ~50 MB of compressed shards coming back per iteration.
+* **Samples**: ~f / 2 fewer per iteration (14.2), the same games.
+
+### 14.4 Tests (`tests/test_league.py`, Rust `an_unrecorded_seat_plays_the_same_games_and_records_nothing`)
+
+The kinds (exact, spread, slots and seats in turn) and the rolling cycle; the seat tables; the
+settings' checks (shares, pools, slots, picks, co-training refused, the command line); off by
+default (no League, the seat dict without `record`); through the bindings, half the games against a
+past checkpoint: the league games' samples are the current network's decisions only (decider its
+seat, z its result), and with the league seat recorded instead the same 24 games move for move whose
+current-seat samples are exactly these; the attribution; a past checkpoint of another encoding
+refused; the plans (the pool's candidates newest first, 'all', the `self` case, deterministic across
+League objects, uniform about even over 390 iterations); pfsp's weights from the metrics (decay, the
+prior, rows <= it - 2) and its picks (P 0.02 / 0.57 / 0.40 over 300 seeds); toy runs with the league
+(classic: exactly 12 of 48 games every iteration; rolling with two slots), their metrics, candidates
+and shard samples; a mirror run with no league in its metrics or log; the shared queue with the
+remote 'local' and linger: the quota exact, league games on both machines, the share 18-32%, the
+mirror after the last phase = checkpoints >= 1 and the phase's slot (iter_0000 only because it is
+named); a worker without the league refused while this machine plays every game; fork_run linking
+the league's checkpoints and the fork playing its league. In Rust: the same games with the league
+seat recorded or not, its records exactly the m seat's, z from the m seat, and an unrecorded seat
+alone recording nothing.
+
+### 14.5 Checks
+
+Tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only
+(`CUDA_VISIBLE_DEVICES=`, below-normal priority), MTG Zero's A/B round live on the GPU and the Mac.
+Code 8295152 on main edf4b89.
+
+* `cargo test --release`: zero_search **51 passed** (50 + the unrecorded seat), zero_webnet 3.
+* `pytest tests`: **213 passed, 2 failed** (13 min 47 s): the two failures are CUDA-only tests
+  (`test_net_data.py::test_graph_runner_matches_eager_and_follows_new_weights`,
+  `test_nonfinite.py::test_normal_run_has_no_debug_dir[cuda]`) that fail the same way on edf4b89 with
+  `CUDA_VISIBLE_DEVICES=` (they do not skip without a visible device); `tests/test_league.py` 13 passed.
+* **Byte identity against edf4b89** (its own worktree and target dir), the settings left out and
+  given at their defaults: toy-smoke runs - MLP vs `ext:toyheur` and tokens (classic, 3 iterations),
+  `cq` targets + `eval_select cq` guard 2 (rolling, 3), and the Delver main line's shape (rolling,
+  `cq` targets at scale 0.3, `eval_select cq` guard 4 at 0.3, raw Elo offsets, no random games,
+  value_q 0.6, window_cache, train_prefetch; 4 iterations): every shard, `elo/results.json`,
+  `ratings.json` (`updated` aside), `models/index.json` byte for byte, every checkpoint and the
+  optimizer state tensor for tensor (the files differ in torch's archive root only), the metrics equal
+  without their timings, config.json = the base's + the four keys. The rolling runs needed care: a
+  rolling phase's end depends on timing with two batches in flight (docs/search.md 2.6) - the base
+  itself reproduced its own reference in 18 of 19 runs of the Delver shape (one differed from
+  iteration 2 on), this branch in 10 of 12 (6 of 6 interleaved with the base's); with `ZERO_INFLIGHT=1`
+  (deterministic) both rolling configurations are identical in 2 runs each of the base, unset and
+  the defaults (11 and 13 files, the metrics).
+* `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy MLP and a toy token
+  checkpoint): identical.
+* The other games build against it (build only, their HEADs with this core in `third_party/zero-core`;
+  the PyO3 crate, every test compiled, the package imported): Glass Road Zero c1f56dc 45 s, Caverna
+  Zero a6fad73 70 s, Kingdom Builder Zero 4202a4a 106 s.
+* MTG Zero (branch `league`, its ENGINE.md 63): `cargo test --release -p engine --test az` 27 passed,
+  `pytest tests` 48 passed; delver-smoke with the league on, classic and with the remote 'local'
+  (rolling, linger).
+
+### 14.6 An A/B of the league
+
+Fork the main line at checkpoint K with the league on (`tools/fork_run.py --source <main> --dest
+<fork> --iter K --set selfplay_league=0.25`, so the fork has the league's checkpoints), run the fork
+and the control K -> K + N with the same build and flags (the fork adding `--selfplay-league 0.25`),
+read it with an h2h of the two K + N checkpoints at the same move rule (as the policy-target and
+selection A/Bs, 9 and 12.5). Watch `selfplay.league.win` (the network's score against its own past:
+a mirror run's policy that drifts in a cycle shows it falling against some checkpoints) and
+`train.entropy`. MTG Zero's flags: its ENGINE.md 63.

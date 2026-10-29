@@ -185,9 +185,12 @@ One list of seat dicts per game (players = its length):
 `{'bot': 'random' | 'heuristic' | ...}`, `{'external': '<key>'}`, or a network seat
 `{'key': 'm', 'sims', 'c_puct', 'selfplay', 'alpha', 'eps', 'temp_moves', 'sims_fast',
 'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale',
-'select', 'select_min_visits'}` (`games.nn_seat`; `policy_target` only matters for recorded
+'select', 'select_min_visits', 'record'}` (`games.nn_seat`; `policy_target` only matters for recorded
 decisions, section 3.1; `select` and its guard for the moves the seat does not sample, section
-3.3; `cq_c_visit` / `cq_c_scale` are the completed-Q transform of both). Evaluator keys: every distinct
+3.3; `cq_c_visit` / `cq_c_scale` are the completed-Q transform of both; `record` false - absent:
+true - a self-play seat whose full searches are not recorded: it searches, samples its moves and
+draws its playout cap exactly as a recorded seat, so its games are the same move for move, and
+emits no records; zero's self-play league, docs/az.md 14, puts a past checkpoint there). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
 
@@ -262,6 +265,18 @@ all are paused); games in progress keep their state. A new `net` starts a new se
 every game drops its trees and pending leaf and restarts its current decision's search from an
 empty tree (same playout-cap draw), so no search mixes two networks. `end_phase()` ends the
 phase now. Used by `run.py --rolling 1` (one persistent driver in the run process).
+
+**A phase's end depends on timing when batches are pipelined** (`zero.infer.drive` with two
+batches in flight, the default `ZERO_INFLIGHT` 2; measured 2026-10-29, docs/az.md 14.5): when the
+quota is met with the other group's batch already answered, that group was dispatched again and
+its games decided moves from their old trees before the pause; when its batch was still in flight,
+it pauses without that dispatch and the next phase searches those decisions again with the new
+network. Which happens depends on whether the other group's batch was ready when polled, so a
+rolling run's later iterations can differ between two runs of the same seed (zero-core edf4b89's
+toy-smoke rolling run in the Delver main line's shape: 1 of 19 runs differed from its own reference
+from iteration 2 on, `dropped_leaves` 11 vs 22);
+`ZERO_INFLIGHT=1` (one batch at a time) is deterministic. A classic driver's games never depend on
+it.
 
 ### 2.7 External seats
 

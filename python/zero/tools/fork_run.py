@@ -12,7 +12,9 @@
 
   python tools/fork_run.py --source runs/a --dest runs/b [--iter K] [--set reuse=8 ...] [--copy]
       A CONTINUATION of a (possibly live) run at its checkpoint K (default: the newest): the
-      checkpoints <= K that its Elo matches need, the optimizer state when it belongs to K, the
+      checkpoints <= K that its Elo matches need (and, with the self-play league in the fork's
+      settings - e.g. --set selfplay_league=0.25 -, every one its league may play: docs/az.md 14),
+      the optimizer state when it belongs to K, the
       window's sample shards (hard links on the same volume, --copy to copy), Elo results (every
       pool: elo/ and elo/<rule>/), metrics up to K and the source's config.json with the --set
       overrides. The source is only read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run

@@ -205,7 +205,7 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         // the target's cq_c_visit, cq_c_scale; docs/search.md 3.3)
         select: Select::parse(&select, get(d, "select_min_visits", 0u32)?, get(d, "select_c_visit", cq_c_visit)?, get(d, "select_c_scale", cq_c_scale)?).map_err(verr)?,
         // whether its full searches are recorded (absent: true; false: a league opponent, a
-        // past checkpoint whose moves are not the current policy's, docs/az.md 13)
+        // past checkpoint whose moves are not the current policy's, docs/az.md 14)
         record: flag(d, "record", true)?,
     }))
 }

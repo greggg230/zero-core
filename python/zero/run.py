@@ -27,6 +27,10 @@ iteration's self-play ends when --games games have FINISHED (docs/search.md 2.6)
 deferred terminals whose results come from episodes of the resolver game, played by a second
 network trained in the same run (<run>/resolver/); --resolver-cfg holds its settings.
 
+--selfplay-league 0.25: a quarter of the self-play games put a past checkpoint of the run (the pool
+--selfplay-league-pool, raw offsets back) in one seat; only the current network's decisions are
+recorded (zero/league.py, docs/az.md 14).
+
 --selfplay-remote <name>: another machine (a remote of the game package) self-plays too, with the
 same checkpoint: both machines pull the iteration's --games (the total) from one shared queue, each
 with at most its throughput's share in flight; its shards come back into data/iter_i/
@@ -184,7 +188,7 @@ DEFAULTS = dict(
     # zero.remote's `evalnet`, docs/az.md 11.7)
     resolver='', resolver_cfg={}, resolver_init='', resolver_conc=0, pending_max=0, draft_eval_net_every=4,
     draft_eval_net_remote='',
-    # the self-play league (zero/league.py, docs/az.md 13): this share of the self-play games puts a
+    # the self-play league (zero/league.py, docs/az.md 14): this share of the self-play games puts a
     # past checkpoint of the run in one seat (0 = off: every game the current network's mirror, as
     # before); the pool it is picked from (raw iteration offsets back from the network that
     # self-plays, those that exist, or 'all'), past checkpoints per iteration (one evaluator key

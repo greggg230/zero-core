@@ -1,4 +1,4 @@
-"""The self-play league (docs/az.md 13): a share of a run's self-play games puts a PAST checkpoint
+"""The self-play league (docs/az.md 14): a share of a run's self-play games puts a PAST checkpoint
 of the run in one seat, so that a run (MTG Zero's Delver mirror) does not settle into what its
 current network happens to do - fictitious self-play / AlphaStar's league, in its simplest form.
 

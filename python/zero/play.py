@@ -28,7 +28,7 @@ class NNSeat:
     cq_c_visit, cq_c_scale). select, select_min_visits: the rule of the moves it does not sample
     ('visits' | 'cq'; docs/search.md 3.3) and its completed-Q transform select_c_visit,
     select_c_scale (None: the target's cq_c_visit, cq_c_scale). record: whether its full searches
-    are recorded (False: a league opponent, docs/az.md 13; the Rust seat key `record`)."""
+    are recorded (False: a league opponent, docs/az.md 14; the Rust seat key `record`)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',

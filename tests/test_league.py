@@ -1,4 +1,4 @@
-"""The self-play league (zero/league.py, docs/az.md 13): a share of the self-play games against a
+"""The self-play league (zero/league.py, docs/az.md 14): a share of the self-play games against a
 past checkpoint of the run. The games' kinds and tables (exact shares, slots and seats in turn); the
 settings' checks; through the bindings, a league seat records nothing and plays the games of a
 recorded one (only the current network's samples, z / q from its seat); toy runs with the league on
