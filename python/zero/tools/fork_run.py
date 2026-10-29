@@ -8,9 +8,9 @@
   python tools/fork_run.py --source runs/a --dest runs/b [--iter K] [--set reuse=8 ...] [--copy]
       A CONTINUATION of a (possibly live) run at its checkpoint K (default: the newest): the
       checkpoints <= K that its Elo matches need, the optimizer state when it belongs to K, the
-      window's sample shards (hard links on the same volume, --copy to copy), Elo results,
-      metrics up to K and the source's config.json with the --set overrides. The source is only
-      read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
+      window's sample shards (hard links on the same volume, --copy to copy), Elo results (every
+      pool: elo/ and elo/<rule>/), metrics up to K and the source's config.json with the --set
+      overrides. The source is only read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
       (setting `resolver`, docs/az.md 11) is copied with its resolver network: the same of
       <source>/resolver/ into <dest>/resolver/ (K: an iteration where both have a checkpoint).
 """
@@ -100,6 +100,9 @@ def _copy_run(source, dest, it, cfg, copy):
     from ..run import model_path, read_metrics, window_iters
     e = max(1, int(cfg.get('eval_every', 1)))
     need = {it} | {it - off * e for off in elo.OFFSETS if it - off * e >= 0}
+    if cfg.get('elo_offsets'):
+        # raw Elo offsets (docs/az.md 5.4): the opponents of K and of the fork's next evaluation
+        need |= {j for k in (it, it + e) for j in elo.opponents(k, e, cfg['elo_offsets']) if 0 <= j <= it}
     for j in sorted(need):
         if os.path.exists(model_path(source, j)):
             _link(model_path(source, j), model_path(dest, j), True)
@@ -114,11 +117,15 @@ def _copy_run(source, dest, it, cfg, copy):
     for d in dirs:
         for p in glob.glob(os.path.join(d, '*.npz')):
             _link(p, os.path.join(dest, 'data', os.path.basename(d), os.path.basename(p)), copy)
-    for f in ('results.json', 'ratings.json'):
-        p = os.path.join(source, 'elo', f)
-        if os.path.exists(p):
-            os.makedirs(os.path.join(dest, 'elo'), exist_ok=True)
-            shutil.copy2(p, os.path.join(dest, 'elo', f))
+    # every Elo pool: elo/ ('visits') and elo/<rule>/ (another evaluation move rule, docs/az.md 5.4)
+    pools = [''] + sorted(d for d in os.listdir(os.path.join(source, 'elo'))
+                          if os.path.isdir(os.path.join(source, 'elo', d))) if os.path.isdir(os.path.join(source, 'elo')) else ['']
+    for sub in pools:
+        for f in ('results.json', 'ratings.json'):
+            p = os.path.join(source, 'elo', sub, f)
+            if os.path.exists(p):
+                os.makedirs(os.path.join(dest, 'elo', sub), exist_ok=True)
+                shutil.copy2(p, os.path.join(dest, 'elo', sub, f))
     rows = [m for m in read_metrics(source) if m['iter'] <= it]
     with open(os.path.join(dest, 'metrics.jsonl'), 'w', encoding='utf-8') as f:
         for m in rows:
