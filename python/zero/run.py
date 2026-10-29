@@ -890,9 +890,10 @@ class Run:
                                              opp_model=model_path(self.run, j)))
         ratings = elo.fit(res, anchor=self.yard)
         elo.write_ratings(self.run, ratings, self.yard, tag=tag)
-        # raw offsets rate checkpoints that never played the yardstick: never models/best.pt
+        # raw offsets, and a rule's pool begun mid-run, rate checkpoints that never played the yardstick
+        # (in this pool): never models/best.pt
         best = elo.tag_checkpoints(self.run, ratings, latest, self.yard, tag=tag,
-                                   evaluated=set(logged) if c.get('elo_offsets') else None)
+                                   evaluated=set(logged) if c.get('elo_offsets') or tag != 'visits' else None)
         if current is not None:
             current.setdefault('phases', {})['elo_s'] = time.time() - t0
         return ratings, best

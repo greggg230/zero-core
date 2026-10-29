@@ -215,8 +215,8 @@ def tag_checkpoints(run, ratings, latest, anchor, tag='visits', evaluated=None):
     """Refresh models/index.json (each checkpoint's Elo in the pool of the move rule `tag`, the
     run's rule) and copy the highest-rated checkpoint to models/best.pt. `evaluated` (a set of
     names; None = every rated one): the checkpoints that may be best - those that played the
-    yardstick (elo_offsets rates others too: they are listed with "evaluated": false). Returns
-    the best entry."""
+    yardstick in this pool (raw elo_offsets, and a rule's pool begun mid-run, rate others through
+    Elo matches only: they are listed with "evaluated": false). Returns the best entry."""
     mdir = os.path.join(run, 'models')
     index = []
     for i in range(latest + 1):

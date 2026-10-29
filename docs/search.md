@@ -565,7 +565,10 @@ and 64 simulations, the Python `select_index` on each root's P0 / N / W / networ
 the Rust driver's own move (`root_select`) for all 192 (position, simulations, rule) cases -
 'visits', 'cq' with guards 0, 1, 2 and 4, and transforms (50, 1), (10, 3), (50, 0.1); no
 near-ties - and the rules do differ on these roots (cq != visits, the guard != no guard).
-In games: H2H_SELECT_PLACEHOLDER
+In games (`python -m zero.parity h2h --select cq`, a toy-smoke checkpoint, 32 simulations,
+Rust-tree seat vs Python-tree seat, both 'cq'): 52.1% +-2.0 (95%, 2000 games, seed 0), 49.7%
++-1.2 and 50.8% +-1.2 (6000 games each, seeds 1, 2) - 50.5% over the 14,000; the same seeds with
+'visits': 49.7% +-1.2, 50.7% +-1.2. `tests/test_select.py` asserts both checks.
 
 `python -m zero.parity h2h --model M --games 6000 --sims 32`: Rust-tree seat vs Python-tree
 seat in `PyDriver`, the same network, seats alternating (docs/az.md 6.2): **49.94% +-1.04**
