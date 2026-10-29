@@ -23,7 +23,7 @@ given. Prints one JSON line: A's score (+- 1 se), its mean score margin, the Elo
 side's rule (`select_a`, `select_b`: e.g. 'cq-n4-v50-s0.3'). The models are only read.
 
 The root's belief (docs/search.md 3.8): each side deals its search's worlds as its run evaluates
-(eval_belief_tilt, belief_clip, belief_mix, belief_fast in its config.json) unless --a-belief-tilt /
+(eval_belief_tilt, belief_clip, belief_mix, belief_fast in its config.json; also with --select) unless --a-belief-tilt /
 --b-belief-tilt (0 = uniform), --*-belief-clip, --*-belief-mix, --*-belief-fast say otherwise; a side
 with a tilt needs a checkpoint with the auxiliary head (refused before the match: net.HeadMissing).
 `A A --a-belief-tilt 1 --b-belief-tilt 0` is the evaluation-only A/B of the belief on one checkpoint.
@@ -249,8 +249,11 @@ def main(argv=None):
         elif view == 'root':
             keys['leaf_value_view'] = 'root'
     try:
-        sides = [with_belief(k, *(getattr(a, f'{s}_belief_{x}') for x in ('tilt', 'clip', 'mix', 'fast')))
-                 for s, k in zip(('a', 'b'), sides)]
+        # (a side's root belief is its run's eval_belief_tilt even when --select replaced its rule, so an
+        # A/B arm whose config sets it is dealt as it trained; the side's flags override it)
+        sides = [with_belief(dict(k, **{x: v for x, v in run_rule(ckpt).items() if x.startswith('belief_')}),
+                             *(getattr(a, f'{s}_belief_{x}') for x in ('tilt', 'clip', 'mix', 'fast')))
+                 for s, k, ckpt in zip(('a', 'b'), sides, (a.a, a.b))]
     except ValueError as e:
         ap.error(str(e))
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,

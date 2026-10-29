@@ -239,7 +239,7 @@ def test_the_python_trees_mix_deals_a_share_uniformly():
 
 # ------------------------------------------------------------------ zero.h2h
 
-def test_h2h_sides_and_flags(tmp_path):
+def test_h2h_sides_and_flags(tmp_path, capsys):
     info = G.info('toy')
     torch.manual_seed(1)
     with_head = make_net(info, 'toy', 'mlp', 16, 1, aux=TOY_AUX)
@@ -266,6 +266,14 @@ def test_h2h_sides_and_flags(tmp_path):
     json.dump({'eval_belief_tilt': 0.5, 'belief_mix': 0.25}, open(run / 'config.json', 'w'))
     rr = h2h.run_rule(str(run / 'models' / 'iter_0001.pt'))
     assert (rr['belief_tilt'], rr['belief_mix'], rr['belief_clip']) == (0.5, 0.25, 20.0)
+    # the command line: each side as its run evaluates - also with --select (the A/B driver's h2h) -, the
+    # side's flags over it
+    ck = str(run / 'models' / 'iter_0001.pt')
+    capsys.readouterr()
+    h2h.main([ck, ck, '--games', '2', '--sims', '4', '--chance-k', '0', '--select', 'cq', '--select-min-visits', '4',
+              '--b-belief-tilt', '0'])
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out['select_a'] == 'cq-n4-b0.5m0.25' and out['select_b'] == 'cq-n4', out
 
 
 # ------------------------------------------------------------------ toy runs
