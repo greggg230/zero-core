@@ -20,7 +20,9 @@ Heads:
 
 Checkpoints (`save`, atomic): {config, state, extra}; `load` rebuilds the network from the
 config; `widen` maps a checkpoint onto a larger feature / action space (new inputs get zero
-weights, new actions zero logits), so a widened network computes what the source did.
+weights, new actions zero logits), so a widened network computes what the source did; a token
+network also across a change of its object layout that only adds (`widen(..., layout=)`,
+`token_feature_map`; docs/az.md 10.3).
 """
 import math
 import os

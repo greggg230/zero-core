@@ -62,7 +62,7 @@ python tools/launch_hidden.py runs/toy1/supervisor_console.txt python tools/supe
 touch runs/toy1/STOP                     # clean stop after the current iteration (the supervisor exits too)
 python tools/pause_run.py runs/toy1      # pause within seconds (exit 75; the supervisor waits); --resume, --status, --wait
 python tools/kill_run.py runs/toy1       # hard stop: the supervisor, then the run (pids from the state files; --scan)
-python tools/fork_run.py runs/toy1/models/iter_0010.pt runs/toy2          # new run from a checkpoint (widened)
+python tools/fork_run.py runs/toy1/models/iter_0010.pt runs/toy2          # new run from a checkpoint (widened; across a token layout change: 10.3)
 python tools/fork_run.py --source runs/toy1 --dest runs/toy1b --iter 10 --set reuse=8   # continue at K
 ```
 
@@ -183,7 +183,8 @@ the completed-Q target with `policy_target='cq'` (section 9) - (log-softmax over
 actions only) + value cross-entropy against `(1 - q) z + q q_root` (softmax over the seats
 present) + `margin_loss_w` x 0.5 x squared margin error over the seats present. AdamW, grad
 clip 5, step-decay LR, warmup while the optimizer state is fresh. Feature-width changes are
-handled by prefix reads (an older network reads the first columns) and `widen` (fork_run).
+handled by prefix reads (an older network reads the first columns) and `widen` (fork_run; a token
+network across a change of its object layout: section 10.3).
 
 ### 4.1 The non-finite guard (`zero/finite.py`)
 
@@ -954,7 +955,9 @@ Every feature outside the segments and bags is a global. The network:
   `id_actions` key): MTG Zero's runs/mtg5 checkpoints load and play identically
   (`check_checkpoint_compat`, its ENGINE.md 45).
 * `widen`: new actions get zero generic weights, new features (after the old ones) are new
-  globals with zero weights; the layout stays. Not in `zero.webexport`. CUDA: float32 eager
+  globals with zero weights; the layout stays. With the game's new layout (`widen(...,
+  layout=)`, fork_run) a token network follows a layout that only adds (wider slots, bag rows,
+  bags, globals; the same tokens) exactly: section 10.3. Not in `zero.webexport`. CUDA: float32 eager
   (no autocast, no CUDA graphs; not measured: the GPU was busy).
 
 Tests: `tests/test_net_data.py` (masking of absent slots, chunking / batch independence, the
@@ -1012,6 +1015,66 @@ threads) against the MLP 256 x 3 (4.19M).
   made one action dominate (55% PASS), a zero value head made every search a tie (ties play the
   first option); the policy output layers now start at zero and the value head stays random
   (section 10).
+
+### 10.3 Widening across a layout change (`net.widen(..., layout=)`; MTG Zero's layout v5, 2026-10-29)
+
+A game that needs more inputs can grow its object layout without a fresh start for its token
+networks, as long as the new layout only **adds**: a checkpoint of the old layout is widened onto
+the new one so that it computes exactly what it did. MTG Zero's layout v4 -> v5 (its ENGINE.md 60:
+wider permanent and stack slots, two more bags, 64 more globals) is the first such change.
+
+**What a new layout may change** (`token_feature_map(old_layout, F0, new_layout, F1)`, both
+normalised; `widen` refuses anything else with a ValueError):
+
+* **Segments**: the same names in the same order, the same slot counts, present flags,
+  identities (`id`), actions and `id_actions` - so the same tokens, (segment, slot) positions and
+  pointer columns. A slot may get **wider at its end**: its old floats are the first ones of the
+  new slot. Segment offsets may move (everything after a wider block moves).
+* **Bags**: every old bag by name, with the same width and its old rows first (new rows after
+  them); new bags anywhere.
+* **Globals**: with declared global blocks in the old layout (layout key `globals`, below), by
+  block name (the old floats first in each block; new blocks anywhere); without them, the old
+  globals are the new layout's first globals in feature order (new globals after the old ones in
+  feature order, e.g. after a trailing block).
+
+**What the widen does**: the new network is built from the new layout (same width, layers,
+heads, vocabulary); every parameter whose shape does not depend on the inputs is copied (the
+identity embedding, the (segment, slot) embeddings, the blocks, the heads, the pointer head);
+`seg_in.k` gets the old columns first and zeros for the new ones; `bag` gets each old row's
+(d + 1) columns at its new row and zeros elsewhere; `g` gets each old global's column at its new
+position and zeros elsewhere; new actions get zero generic weights and bias (as before). So every
+new input column has zero weight in its projection, and on any input of the new layout the network
+computes what the old one computed on the old features of it: a token's input map adds 0 for the
+new floats, a bag row's pool and total go through zero weights, a new global likewise, and the
+attention sees the same tokens (present flags and identities are old floats). Exact up to float
+rounding: a linear map over more (zero-weighted) columns may round its sum differently (measured
+on MTG Zero's main-line checkpoint: max |delta| 5.7e-6 on the policy logits, 3e-7 on the value
+probabilities; 95% of the rows bit for bit), and the new columns have no effect at all (the
+widened network on the same input with the new floats zeroed or random: bit for bit identical).
+
+**`globals`** (optional layout key): `[{"name", "offset", "count"}, ...]`, named blocks of
+globals in feature order that together cover every feature outside the segments and bags
+(validated). The network is the same with or without it (its globals are those features in
+feature order); it is stored in the normalised layout only when set, so the layouts in older
+checkpoints are unchanged. A layout that declares its blocks lets a later layout insert globals
+between them (MTG Zero's v5 declares `globals`, `match`, `globals_v5`).
+
+**Callers**: `tools/fork_run.py <src.pt> <new run>` passes the game package's layout
+(`GamePackage.tokens`) for a token network: the new run's iteration 0 is the widened source (the
+same layout: as before, new features are globals); the co-training `resolver_init` does the same.
+A resumed run never widens: a checkpoint whose layout is not the game's is a fork into a new run
+(MTG Zero's ENGINE.md 60.5 for the procedure and what restarts: iteration numbers, Elo pool,
+window, optimizer state). The MLP and GridNet keep their widen (appended features; grid planes).
+
+Tests (`tests/test_net_data.py`): a wider synthetic layout (wider slots, a bag row, a new bag, new
+globals, every block after moved) - the map, outputs equal on any input of the new layout
+(random values in the new floats), save / load, gradients reach the new columns, a widen to the
+same layout equals the old widen; declared global blocks (the same network as without them, a
+block grown at its end and a new block between two: mapped by name; the validation); refusals
+(a new segment, more slots, a narrower slot, another present flag or identity, segments
+reordered, a bag gone, another vocabulary); `fork_run` across a layout change (the toy's layout
+replaced). MTG Zero: the real-checkpoint check of its ENGINE.md 60.2 and its pytest
+`test_a_v4_token_network_widens_onto_layout_v5_exactly`.
 
 ## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
 
