@@ -128,8 +128,11 @@ def test_the_tool_writes_a_guarded_checkpoint_and_resumes(toy_data, tmp_path, ca
             '--arch', 'tokens', '--hidden', '32', '--blocks', '2', '--heads', '2', '--steps', '200', '--batch', '128',
             '--lr', '2e-3', '--warmup', '20', '--eval-every', '100', '--save-every', '100', '--report-every', '50',
             '--torch-threads', '1', '--normal-priority']
-    assert tm.main(args) == 0
+    assert tm.main(args + ['--keep-best']) == 0
     s, extra = net.load(out, game='toy')              # the encoding guard accepts it
+    b, bextra = net.load(str(tmp_path / 'student.best.pt'), game='toy')   # --keep-best: the lowest held-out KL
+    kls = {h['step']: h['policy_kl'] for h in extra['distill']['heldout']}
+    assert bextra['distill']['step'] in (100, 200) and kls[bextra['distill']['step']] == min(kls[100], kls[200])
     assert s.config['arch'] == 'tokens' and s.config['d'] == 32 and s.config['layers'] == 2
     rec = extra['distill']
     assert extra['distilled_from'] == os.path.abspath(tpath) and extra['teacher_extra'] == {'iter': 7}
@@ -146,6 +149,12 @@ def test_the_tool_writes_a_guarded_checkpoint_and_resumes(toy_data, tmp_path, ca
     assert tm.main([tpath, part] + args[2:] + ['--resume']) == 0
     lines = [json.loads(line) for line in open(part + '.log.jsonl')]
     assert lines[0]['start'] == 150 and [x['step'] for x in lines if x['event'] == 'train'] == [200]
+    # --init: a further distillation starts from the student (its size, its weights)
+    more = str(tmp_path / 'more.pt')
+    assert tm.main([tpath, more] + args[2:4] + args[4:6] + ['--init', out, '--hidden', '16', '--steps', '1', '--lr', '1e-9',
+                                                            '--warmup', '0', '--eval-every', '0', '--normal-priority']) == 0
+    m2, e2 = net.load(more, game='toy')
+    assert m2.config == s.config and e2['distill']['heldout'][0]['policy_kl'] == pytest.approx(rec['heldout'][-1]['policy_kl'], abs=1e-6)
     # --compare: the student against its teacher on the held-out shards
     capsys.readouterr()
     assert tm.main(['--compare', out, tpath, '--data', str(toy_data / 'data' / 'iter_0002'), '--normal-priority']) == 0

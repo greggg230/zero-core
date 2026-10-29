@@ -4,7 +4,7 @@
       --hidden 256 --blocks 6 --heads 8 --ff 512 [--arch tokens] [--steps 20000 | --epochs 30]
       [--batch 512 --lr 5e-4 --lr-min 1e-5 --warmup 500 --wd 1e-4]
       [--teacher-w 1.0 --value-q 0.5 --margin-w 0.5] [--ram-budget-gb 20 --heldout-rows 16384]
-      [--eval-every 1000 --save-every 2000 --resume] [--device cuda --torch-threads 4 --seed 1]
+      [--eval-every 1000 --save-every 2000 --keep-best --resume] [--device cuda --torch-threads 4 --seed 1]
       A new network of the given size for the teacher's game (this build's encoding), trained on the
       shards to compute what the teacher computes; OUT.pt is a normal checkpoint (the encoding guard
       checks it before it is written) with the record of its distillation in its `extra`
@@ -22,6 +22,9 @@ shard file; repeatable. Without --heldout the last shard of --data (in path orde
 the student reads this build's inputs. The teacher's answers are computed once per window row
 before the training. A long distillation writes OUT.pt.partial (the student, the optimizer, the
 step) every --save-every steps; --resume continues from it (other batches than without the stop).
+--init S.pt: the student starts from that checkpoint (its size; e.g. more steps after a gate missed)
+instead of fresh. --keep-best: also OUT.best.pt, the student at its lowest held-out policy KL so far (written at each
+held-out evaluation that improves it; its extra's `distill.step` says when).
 Progress: one JSON line per report on stdout and in OUT.pt.log.jsonl. Below-normal priority.
 """
 import argparse
@@ -143,6 +146,8 @@ def main(argv=None):
     ap.add_argument('--save-every', type=int, default=2000)
     ap.add_argument('--report-every', type=int, default=100)
     ap.add_argument('--resume', action='store_true')
+    ap.add_argument('--init', default=None, help="the student's start: a checkpoint (its size) instead of a fresh network")
+    ap.add_argument('--keep-best', action='store_true', help='also OUT.best.pt: the student at its lowest held-out KL')
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--torch-threads', type=int, default=4)
     ap.add_argument('--prefetch', type=int, default=2)
@@ -165,14 +170,19 @@ def main(argv=None):
     log = Log(a.log or a.out + '.log.jsonl')
     t0 = time.time()
     teacher, textra = load(a.teacher, a.device, game=a.game)
+    tsha = sha256(a.teacher)
     game = a.game or teacher.config.get('game', 'toy')
     tc = teacher.config
     size = dict(arch=a.arch or tc.get('arch', 'mlp'),
                 hidden=a.hidden or tc.get('d', tc.get('hidden', 128)),
                 blocks=a.blocks or tc.get('layers', tc.get('blocks', 4)),
                 heads=a.heads or tc.get('heads', 4), ff=a.ff, ch=a.ch)
-    student = D.new_student(teacher, size['arch'], size['hidden'], size['blocks'], size['heads'], size['ff'], size['ch'],
-                            a.seed, game)
+    if a.init:
+        student, _ = load(a.init, 'cpu', game=game)
+        student.train()
+    else:
+        student = D.new_student(teacher, size['arch'], size['hidden'], size['blocks'], size['heads'], size['ff'], size['ch'],
+                                a.seed, game)
     check_encoding(student.config, game, 'the student')
     paths = shard_list(a.data)
     if a.heldout == ['none']:
@@ -207,6 +217,15 @@ def main(argv=None):
          'epochs': round(steps * a.batch / W.N, 2), 'load_s': round(load_s, 1), 'teacher_s': round(t_s, 1),
          'device': a.device})
     hist = []
+    best = {'kl': float('inf')}
+    best_path = os.path.splitext(a.out)[0] + '.best.pt'
+
+    def record(step):
+        return {'distilled_from': os.path.abspath(a.teacher), 'teacher_sha256': tsha, 'teacher_extra': textra,
+                'distill': {'settings': settings, 'step': step, 'teacher_net': D.describe(teacher),
+                            'student_net': D.describe(student), 'train_shards': [os.path.abspath(p) for p in train],
+                            'heldout_shards': [os.path.abspath(p) for p in held], 'train_rows': W.N,
+                            'heldout': list(hist), 'seconds': round(time.time() - t0, 1)}}
 
     def held_out(step):
         if H is None:
@@ -215,6 +234,10 @@ def main(argv=None):
         student.train()
         hist.append({'step': step, **r})
         log({'event': 'heldout', 'step': step, **r})
+        if a.keep_best and step > 0 and r['policy_kl'] < best['kl']:
+            best['kl'] = r['policy_kl']
+            save(student, best_path, record(step))
+            log({'event': 'best', 'step': step, 'policy_kl': r['policy_kl'], 'out': os.path.abspath(best_path)})
         return r
     if start == 0:
         held_out(0)
@@ -238,12 +261,7 @@ def main(argv=None):
     final = held_out(steps)
     student.to('cpu').eval()
     check_encoding(student.config, game, 'the student')
-    extra = {'distilled_from': os.path.abspath(a.teacher), 'teacher_sha256': sha256(a.teacher), 'teacher_extra': textra,
-             'distill': {'settings': settings, 'teacher_net': D.describe(teacher), 'student_net': D.describe(student),
-                         'train_shards': [os.path.abspath(p) for p in train],
-                         'heldout_shards': [os.path.abspath(p) for p in held], 'train_rows': W.N,
-                         'heldout': hist, 'seconds': round(time.time() - t0, 1)}}
-    save(student, a.out, extra)
+    save(student, a.out, record(steps))
     if os.path.exists(part):
         os.remove(part)
     log({'event': 'done', 'out': os.path.abspath(a.out), 'student_net': D.describe(student), 'steps': steps,
