@@ -145,9 +145,16 @@ def _net(d):
     (the pool of its evaluation move rule, docs/az.md 5.4: elo/ or elo/<rule>/)."""
     tag, pool = elo.active_pool(d)
     res = _json(os.path.join(pool, 'results.json'), {}) or {}
+    # the run's other pools (another rule it evaluated with before): their checkpoints' ratings, drawn
+    # as their own lines - never refit with this pool's
+    others = {}
+    for t in elo.other_pools(d, tag):
+        r = (_json(os.path.join(elo.pool_dir(d, t), 'ratings.json'), {}) or {}).get('ratings') or {}
+        others[t] = {k: {'elo': v.get('elo'), 'se': v.get('se')} for k, v in r.items()
+                     if k.startswith('iter_') and isinstance(v, dict) and v.get('elo') is not None}
     return {'config': _json(os.path.join(d, 'config.json'), {}), 'metrics': _metrics(d), 'deep': _deep(d),
             'ratings': _json(os.path.join(pool, 'ratings.json'), {}), 'pairs': res.get('pairs', {}),
-            'anchor': res.get('anchor'), 'select': tag, 'since': res.get('since')}
+            'anchor': res.get('anchor'), 'select': tag, 'since': res.get('since'), 'other_pools': others}
 
 
 def _resolver_dir(d):
@@ -280,6 +287,7 @@ details summary{cursor:pointer;font-weight:600;font-size:14px}
 <div class="tiles" id="tiles"></div>
 <div class="card"><h2>Elo by iteration</h2>
 <div class="cap" id="elo-cap"></div>
+<div class="legend" id="elo-leg"></div>
 <svg id="elo" style="height:300px" role="img" aria-label="Elo by iteration"></svg></div>
 <div class="card"><h2 id="win-t">Win rate against the yardstick</h2>
 <div class="cap">Each checkpoint against the yardstick and the random bot, seats alternating, the network searching with the eval sims. Band = 95% interval.</div>
@@ -389,8 +397,8 @@ function render(){
   const games=sp.reduce((s,m)=>s+m.selfplay.games,0);
   const t0=M.length?M[0].time:0,tl=M.length?M[M.length-1].time:0;
   const eloPts=Object.keys(R).filter(k=>k.startsWith('iter_')).map(k=>({x:+k.slice(5),y:R[k].elo,lo:R[k].elo-1.96*R[k].se,hi:R[k].elo+1.96*R[k].se,r:R[k]})).sort((a,b)=>a.x-b.x);
-  const evald=new Set(M.filter(m=>m.eval_yard).map(m=>m.iter));
-  const bestElo=eloPts.filter(p=>!cfg.elo_offsets||evald.has(p.x)).reduce((b,p)=>!b||p.y>b.y?p:b,null),lastElo=eloPts[eloPts.length-1];
+  // the best: a checkpoint evaluated in this pool (one rated through Elo matches only is "evaluated": false)
+  const bestElo=eloPts.filter(p=>p.r.evaluated!==false).reduce((b,p)=>!b||p.y>b.y?p:b,null),lastElo=eloPts[eloPts.length-1];
   const wy=winPts(M,'eval_yard'),wr=winPts(M,'eval_random');const ly=wy[wy.length-1],lr=wr[wr.length-1];
   const P=V.pairs||{},nm=i=>'iter_'+String(i).padStart(4,'0');
   const rec=(a,b)=>{const k=a<b?a+'|'+b:b+'|'+a,p=P[k];if(!p||!p[1])return null;const s=a<b?p[0]:p[1]-p[0],w=s/p[1];return {win:w,n:p[1],se:Math.sqrt(Math.max(w*(1-w),1e-6)/p[1])}};
@@ -416,7 +424,7 @@ function render(){
     tile('Elo (newest)',lastElo?Math.round(lastElo.y):'–',lastElo?`±${Math.round(1.96*lastElo.r.se)} · iteration ${lastElo.x}`:'')+
     tile('Best Elo',bestElo?Math.round(bestElo.y):'–',bestElo?`iteration ${bestElo.x} · ${yard} = 1000`:'')+
     tile('vs '+yard,ly?pct(ly.y):'–',ly?`±${(196*ly.e.se).toFixed(1)} pts · margin ${ly.e.margin>0?'+':''}${ly.e.margin}`:'')+
-    tile('vs random',lr?pct(lr.y):'–',lr?`±${(196*lr.e.se).toFixed(1)} pts · ${lr.e.games} games`:'')+
+    tile('vs random',lr?pct(lr.y):'–',lr?`±${(196*lr.e.se).toFixed(1)} pts · ${lr.e.games} games`+(ly&&lr.x!==ly.x?` · iteration ${lr.x}`:''):'')+
     (dl?tile(`vs ${dl.opponent||yard} · ${dl.sims} sims`,pct(dl.win),`±${(196*dl.se).toFixed(1)} pts · iteration ${dl.iter}`):'')+
     tile('Self-play games',games.toLocaleString(),`${((tl-t0)/3600).toFixed(1)} h elapsed`)+
     tile('Leaves / s',lsp?Math.round(lsp.selfplay.leaves_per_s).toLocaleString():'–',lsp?`${Math.round(lsp.selfplay.games_per_h).toLocaleString()} games/h`:'');
@@ -430,10 +438,15 @@ function render(){
   const refs=[{y:1000,label:yard+' 1000'}];
   if(R.random&&yard!=='random')refs.push({y:R.random.elo,label:'random '+Math.round(R.random.elo)});
   const offs=cfg.elo_offsets?`the checkpoints ${cfg.elo_offsets.split(',').join(', ')} iterations before it (those never evaluated are rated through these games only)`:`the checkpoints 1, 2, 4, 8, 16 and 32 evaluations before it`;
-  const pool=V.select&&V.select!=='visits'?` Moves by the rule ${V.select} (its own Elo pool, from iteration ${V.since!=null?V.since:'?'}; earlier ratings are in the 'visits' pool, elo/).`:'';
+  const OP=V.other_pools||{},opn=Object.keys(OP);
+  const pool=(V.select&&V.select!=='visits'?` Moves by the rule ${V.select} (its own Elo pool, from iteration ${V.since!=null?V.since:'?'}).`:'')+
+    (opn.length?` The other lines: the run's pools of the rules it evaluated with before (${opn.join(', ')}); Elo compares within one pool only.`:'');
   $('elo-cap').textContent=`The yardstick (${yard}) is fixed at 1000. Each evaluated checkpoint plays the yardstick, ${cfg.eval_random_games===0?'':'the random bot, '}${offs}; all games are refit together after every iteration (Bradley-Terry). Band = 95% interval.${pool}`;
-  chart($('elo'),[{pts:eloPts,color:'--series-1',label:'Elo',tip:p=>`${Math.round(p.y)} ±${Math.round(1.96*p.r.se)} (${p.r.games} games)`}],{refs});
-  $('win-t').textContent='Win rate against '+yard+' and the random bot';
+  const es=[{pts:eloPts,color:'--series-1',label:opn.length?`Elo (${V.select||'visits'})`:'Elo',tip:p=>`${Math.round(p.y)} ±${Math.round(1.96*p.r.se)} (${p.r.games} games)${p.r.evaluated===false?' · not evaluated: Elo matches only':''}`}];
+  opn.forEach((t,i)=>es.push({pts:Object.keys(OP[t]).map(k=>({x:+k.slice(5),y:OP[t][k].elo,r:OP[t][k]})).sort((a,b)=>a.x-b.x),color:i?'--series-3':'--series-2',label:`Elo (${t})`,tip:p=>`${Math.round(p.y)} ±${Math.round(1.96*p.r.se)} (pool ${t})`}));
+  legend($('elo-leg'),opn.length?es:[]);
+  chart($('elo'),es,{refs});
+  $('win-t').textContent='Win rate against '+yard+(wr.length?' and the random bot':'');
   const ws=[{pts:wy,color:'--series-1',label:yard,tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)} · margin ${p.e.margin}`},{pts:wr,color:'--series-2',label:'random',tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)}`}];
   const wn=winPts(M,'eval_yard_net');
   if(wn.length)ws.push({pts:wn,color:'--series-3',label:`${yard} (episodes played by the resolver network)`,tip:p=>`${pct(p.y)} ±${(196*p.e.se).toFixed(1)} · margin ${p.e.margin}`});

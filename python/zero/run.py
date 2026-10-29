@@ -878,7 +878,7 @@ class Run:
             sc = sum(r[0] for r in rows)
             elo.add(res, elo.ckpt_name(k), elo.ckpt_name(j), sc, len(rows))
             elo.save_results(self.run, res, tag=tag)
-            self.log(f'elo match {elo.ckpt_name(k)} vs {elo.ckpt_name(j)}: {sc:.1f}/{len(rows)}')
+            self.log(f'elo match {elo.ckpt_name(k)} vs {elo.ckpt_name(j)}: {sc:.1f}/{len(rows)}{elo.pool_note(tag)}')
         if c.get('elo_together'):
             for k in sorted({k for k, _ in todo}):
                 js = [j for kk, j in todo if kk == k]
@@ -889,11 +889,12 @@ class Run:
                 record(k, j, self.play_match(k, 'nn', c['elo_games'], sims, seed=31 + 7919 * k + 101 * j,
                                              opp_model=model_path(self.run, j)))
         ratings = elo.fit(res, anchor=self.yard)
-        elo.write_ratings(self.run, ratings, self.yard, tag=tag)
-        # raw offsets, and a rule's pool begun mid-run, rate checkpoints that never played the yardstick
-        # (in this pool): never models/best.pt
-        best = elo.tag_checkpoints(self.run, ratings, latest, self.yard, tag=tag,
-                                   evaluated=set(logged) if c.get('elo_offsets') or tag != 'visits' else None)
+        # raw offsets, a rule's pool begun mid-run and a run back at a rule after another rate checkpoints
+        # that never played the yardstick in this pool: flagged "evaluated": false in ratings.json and
+        # models/index.json, never models/best.pt (None, a default run's pool: every rated one is evaluated)
+        evaluated = set(logged) if c.get('elo_offsets') or tag != 'visits' or elo.other_pools(self.run, tag) else None
+        elo.write_ratings(self.run, ratings, self.yard, tag=tag, evaluated=evaluated)
+        best = elo.tag_checkpoints(self.run, ratings, latest, self.yard, tag=tag, evaluated=evaluated)
         if current is not None:
             current.setdefault('phases', {})['elo_s'] = time.time() - t0
         return ratings, best
