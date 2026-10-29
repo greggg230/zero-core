@@ -418,8 +418,10 @@ class Run:
         c = self.cfg
         spec = c['spec'] if record else (c.get('eval_spec') or package.active().eval_spec_of(c['game'], c['spec']))
         kw = {'queue_only': True} if queue_only else {}
-        if record and self.aux:
-            kw['aux'] = True                       # self-play records the auxiliary targets (docs/az.md 15)
+        if record and getattr(self, 'aux', None):
+            # self-play records the auxiliary targets (docs/az.md 15; getattr: a caller's stand-in Run
+            # with only a cfg, e.g. MTG Zero's test of its evaluation specs, has none)
+            kw['aux'] = True
         return G.Driver(c['game'], seats, spec=spec, concurrency=conc or c['conc'], seed=seed, record=record,
                         threads=c['threads'], groups=groups or c['groups'], max_steps=c['max_steps'], rolling=rolling,
                         net=net, **kw)
