@@ -139,6 +139,7 @@ def test_window_streams_shards_with_the_same_rows(tmp_path):
         w.close()
         paths.append(str(tmp_path / f's{k}_000.npz'))
         assert shard_rows(paths[-1]) == N
+    keys = ('x', 'player', 'n_players', 'opt_off', 'opt_action', 'pi', 'z', 'q', 'sc', 'src_row', 'starts')
     for budget in (None, 10 ** 6, 1000, 333, 2):
         for nf in (F, F - 7, F + 3):
             win = Window(paths, nf, A, budget_rows=budget, seed=3)
@@ -147,6 +148,13 @@ def test_window_streams_shards_with_the_same_rows(tmp_path):
             assert np.array_equal(win.x, np.concatenate([r[1] for r in ref]).astype(np.float16))
             assert np.array_equal(win.z[:, :2], np.concatenate([r[4] for r in ref]).astype(np.float32)[:, :2])
             assert win.loaded == 2328 and win.N == len(win.src_row)
+            # the shards load in parallel; the window is the same whatever the number of threads
+            for threads in (1, 3):
+                other = Window(paths, nf, A, budget_rows=budget, seed=3, threads=threads)
+                for k in keys:
+                    a, b = getattr(win, k), getattr(other, k)
+                    assert a.dtype == b.dtype and np.array_equal(a, b), (k, threads)
+                assert (other.N, other.loaded, other.nbytes) == (win.N, win.loaded, win.nbytes)
 
 
 def test_elo_fit_recovers_ratings():
