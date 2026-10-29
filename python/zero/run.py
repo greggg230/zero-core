@@ -45,7 +45,7 @@ import torch
 import torch.nn.functional as F
 
 from . import elo, games as G, package, runctl
-from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, shard_paths
+from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
 from .net import load, make_net, save
@@ -101,6 +101,9 @@ DEFAULTS = dict(
     # only the new ones (zero/data.py WindowCache: the same window; while it fits the budget)
     window=8, window_grow=1, min_window_samples=20_000, keep_data=12, ram_budget_gb=4.0, shard_rows=65536,
     window_cache=0,
+    # train_prefetch n > 0 = training batches built n steps ahead on a background thread while the
+    # device trains (zero/data.py batches: the same batches in the same order)
+    train_prefetch=0,
     # value target = (1 - q) z + q root-search estimate, q = value_q * min(1, iter / warmup)
     value_q=0.5, value_q_warmup=5, margin_loss_w=0.5,
     # evaluation: the yardstick (Elo anchor = 1000): a built-in bot or 'ext:<name>'; 0 random games:
@@ -629,13 +632,13 @@ class Run:
         acc = {'policy': 0.0, 'value': 0.0, 'margin': 0.0, 'entropy': 0.0, 'value_acc': 0.0}
         last = min(steps, 200)
         S = model.seats
+        feed = batches(W, rng, steps, c['batch'], dev, c.get('train_prefetch', 0))
         for step in range(steps):
             self.check('training')
             g_lr = lr * min(1.0, (step + 1) / c['lr_warmup_steps']) if fresh and c['lr_warmup_steps'] else lr
             for g in opt.param_groups:
                 g['lr'] = g_lr
-            idx = rng.integers(W.N, size=c['batch'])
-            b = W.batch(idx, dev)
+            idx, b = next(feed)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
                 plog, vlog, mp = model(b['x'], b['n_players'])
             plog, vlog, mp = plog.float(), vlog.float(), mp.float()
@@ -668,6 +671,7 @@ class Run:
                 acc['margin'] += lm.item() / last
                 acc['entropy'] += ent.item() / last
                 acc['value_acc'] += vacc.item() / last
+        feed.close()
         model.eval()
         ost = opt.state_dict()
 

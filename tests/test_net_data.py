@@ -212,6 +212,47 @@ def test_window_cache_is_the_same_window(tmp_path):
     assert win.reused == 903
 
 
+def test_batches_prefetched_are_the_same(tmp_path):
+    """data.batches with prefetch (run setting train_prefetch): the same draws and batches in the
+    same order as without; a failure while building is raised to the consumer; closing early
+    stops the thread."""
+    import threading
+    from zero.data import batches
+    rng0 = np.random.default_rng(4)
+    paths = [_random_shard(tmp_path, f'p{k}', N, rng0, compress=k % 2) for k, N in enumerate([300, 41, 520])]
+    win = Window(paths, F, A)
+    ref = list(batches(win, np.random.default_rng(11), 25, 64))
+    for pre in (1, 3):
+        got = list(batches(win, np.random.default_rng(11), 25, 64, prefetch=pre))
+        assert len(got) == len(ref)
+        for (i0, b0), (i1, b1) in zip(ref, got):
+            assert np.array_equal(i0, i1)
+            assert b0.keys() == b1.keys() and all(torch.equal(b0[k], b1[k]) for k in b0)
+
+    class Broken:
+        N = win.N
+        calls = 0
+
+        def batch(self, idx, device='cpu'):
+            Broken.calls += 1
+            if Broken.calls == 4:
+                raise ValueError('bad batch')
+            return win.batch(idx, device)
+    g = batches(Broken(), np.random.default_rng(1), 10, 8, prefetch=2)
+    assert len([next(g) for _ in range(3)]) == 3
+    try:
+        next(g)
+        raise AssertionError('no error')
+    except ValueError as e:
+        assert 'bad batch' in str(e)
+    before = threading.active_count()
+    g = batches(win, np.random.default_rng(2), 1000, 8, prefetch=2)
+    next(g)
+    g.close()
+    assert not any(t.name == 'zero-batch-prefetch' and t.is_alive() for t in threading.enumerate())
+    assert threading.active_count() <= before
+
+
 def test_elo_fit_recovers_ratings():
     rng = np.random.default_rng(0)
     true = {'yard': 1000, 'a': 1200, 'b': 800, 'c': 1500}

@@ -68,6 +68,11 @@ def test_window_cache_trains_the_same_network(smoke_run):
         assert ref.keys() == got.keys()
         for k in ref:
             assert torch.equal(ref[k], got[k]), k
+    # train_prefetch (batches built ahead on a thread), alone and with the cache: the same network
+    for extra in ({'train_prefetch': 2}, {'train_prefetch': 3, 'window_cache': 1}):
+        got, _ = trained(R.Run(str(smoke_run), dict(cfg, **{'window_cache': 0, **extra})))
+        for k in ref:
+            assert torch.equal(ref[k], got[k]), (extra, k)
 
 
 def test_resume_continues_and_stop_file(smoke_run, tmp_path):

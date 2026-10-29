@@ -35,10 +35,17 @@ the cached shards' features (no copy: `batch` gathers its rows shard by shard) a
 of loading them all, array for array. Only while the window fits its budget (no subsample: the
 window is exactly its shards); a window over budget empties the cache and loads as without it.
 The cached shards stay in RAM between trainings (up to the budget), where a window was freed.
+
+`batches` (run setting `train_prefetch`): a training's batches in order; with prefetch, built that
+many steps ahead on a background thread (the window's gather, the float32 features and the dense
+targets: ~60 ms a batch for MTG's 33,652 features) while the training step runs on the device. The
+rows are drawn from the same generator in the same order, so the batches are the same.
 """
 import glob
 import json
 import os
+import queue
+import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -289,6 +296,64 @@ def _run_all(fn, n, threads):
     with ThreadPoolExecutor(t) as ex:
         futs = [ex.submit(fn, k) for k in range(n)]
         return [f.result() for f in futs]
+
+
+def batches(W, rng, n, size, device='cpu', prefetch=0):
+    """A training's `n` batches: `size` window rows drawn from `rng` (uniform, with replacement),
+    one draw per batch in order -> (rows, W.batch(rows, device)). `prefetch` > 0: drawn and built
+    up to that many batches ahead on a background thread (as CPU tensors, moved to `device` as
+    they are taken) while the caller trains on the current one - the same draws, the same
+    batches. A failure there is raised here; closing the generator (or dropping it) stops the
+    thread."""
+    if not prefetch:
+        for _ in range(n):
+            idx = rng.integers(W.N, size=size)
+            yield idx, W.batch(idx, device)
+        return
+    q = queue.Queue(maxsize=prefetch)
+    stop = threading.Event()
+
+    def put(item):
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def produce():
+        try:
+            for _ in range(n):
+                idx = rng.integers(W.N, size=size)
+                if not put((idx, W.batch(idx))):
+                    return
+        except BaseException as e:             # noqa: BLE001  (re-raised by the consumer)
+            put(e)
+
+    th = threading.Thread(target=produce, name='zero-batch-prefetch', daemon=True)
+    th.start()
+    try:
+        for _ in range(n):
+            while True:
+                try:
+                    item = q.get(timeout=1.0)
+                    break
+                except queue.Empty:
+                    if not th.is_alive() and q.empty():
+                        raise RuntimeError('the batch prefetch thread ended early')
+            if isinstance(item, BaseException):
+                raise item
+            idx, b = item
+            yield idx, (b if device == 'cpu' else {k: v.to(device) for k, v in b.items()})
+    finally:
+        stop.set()
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+        th.join(timeout=10)
 
 
 class WindowCache:
