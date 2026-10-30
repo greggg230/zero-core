@@ -36,11 +36,36 @@ evaluation transform (eval_select_c_* / cq_c_*); its considered options --gumbel
 run's gumbel_m, 16) and its noise --a-gumbel-scale / --b-gumbel-scale (default: its run's
 eval_gumbel_scale, 0 = none). The side's move rule is then the Gumbel search's (`select_*`:
 'gumbel-m16-v50-s0.3').
+
+Per-side simulations (docs/az.md 20.4): --a-sims / --b-sims (default --sims), e.g. `A A --a-sims 128
+--b-sims 32` (the output then names `sims_a`, `sims_b`).
+
+Paired games and sequential testing (docs/az.md 20.3):
+
+  --paired          games 2k and 2k + 1 share every random stream (the deal, shuffles, chance: the
+                    driver's `paired`) with the seats swapped, so each deal is played once from each
+                    seat by each side. The output adds `pairs` (both won / split / both lost / with a
+                    draw, the pentanomial counts of a pair's points 0, 0.5, ..., 2), `se` becomes the
+                    se of the pair scores (`se_games`: the binomial se of the games, as unpaired) and
+                    `variance_ratio` = var(pair score) / (var(game) / 2), the variance the pairing left
+                    (1 = none removed). --games must be even.
+  --sprt E0,E1      a sequential probability ratio test of H0: A is E0 Elo better than B against H1:
+                    E1 (logistic Elo; the normal-approximation GSPRT of the per-pair scores, or per-game
+                    scores unpaired), error rates --alpha / --beta (0.05 / 0.05): batches of
+                    --batch-games (default --games) are played until the log-likelihood ratio leaves
+                    (ln(beta / (1 - alpha)), ln((1 - beta) / alpha)) or --max-games (default 4 x
+                    --games) are played. `sprt` reports llr, the bounds and the decision 'H1' | 'H0' |
+                    'undecided'.
+  --target-se S     batches until `se` <= S (or --max-games).
+Each batch b > 0 is seeded seed + 7919 b (batch 0: --seed, so a one-batch run is the plain match); the
+scores, se and pairs are over every game played; `batches` lists each batch's games, score and llr
+(cumulative), and a progress line per batch goes to stderr ('# batch {...}').
 """
 import argparse
 import json
 import math
 import os
+import sys
 import time
 
 from . import games as G, package
@@ -182,13 +207,66 @@ def with_belief(keys, tilt=None, clip=None, mix=None, fast=None):
     return keys
 
 
-def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None,
-          spec=None, conc=None, seat_a=None, seat_b=None, max_steps=5000, move_log=0, rows=False):
-    """Checkpoint `a` vs checkpoint `b` (paths), `games` 2-player games, seats alternating. -> dict.
-    `seat_a` / `seat_b`: each side's move-rule seat settings ({'select': 'cq', 'select_min_visits':
-    2, ...}; {} = the default rule; None = its checkpoint's run's eval_select, `run_rule`).
-    `move_log`: the driver's move log (the first N moves of each game in its row), `rows`: the
-    games' result rows under 'rows'."""
+def pair_stats(rows):
+    """Paired games' statistics of side A (rows: result rows of a match whose games 2k and 2k + 1 are
+    a pair, A in seat gid % 2): {'n', 'score', 'se', 'var', 'both_won', 'split', 'both_lost',
+    'with_draw', 'pentanomial': counts of a pair's points [0, 0.5, 1, 1.5, 2]}; `score` the mean pair
+    score (= the mean of the pairs' games), `se` the se of the pair scores, `var` their variance.
+    Unpaired leftovers are ignored."""
+    by = {r['gid']: float(r['result'][r['gid'] % 2]) for r in rows}
+    pairs = [(by[g], by[g + 1]) for g in sorted(by) if g % 2 == 0 and g + 1 in by]
+    out = {'n': len(pairs), 'both_won': 0, 'split': 0, 'both_lost': 0, 'with_draw': 0, 'pentanomial': [0] * 5}
+    for x, y in pairs:
+        if x == 1 and y == 1:
+            out['both_won'] += 1
+        elif x == 0 and y == 0:
+            out['both_lost'] += 1
+        elif {x, y} == {0.0, 1.0}:
+            out['split'] += 1
+        else:
+            out['with_draw'] += 1
+        out['pentanomial'][min(4, max(0, int(round(2 * (x + y)))))] += 1
+    sc = [(x + y) / 2 for x, y in pairs]
+    n = len(sc)
+    mean = sum(sc) / n if n else 0.0
+    var = sum((v - mean) ** 2 for v in sc) / (n - 1) if n > 1 else 0.0
+    out.update(score=round(mean, 4), se=round(math.sqrt(var / n), 4) if n else 0.0, var=var)
+    return out
+
+
+def expected_score(elo):
+    """The logistic expected score of an `elo` difference."""
+    return 1.0 / (1.0 + 10 ** (-float(elo) / 400.0))
+
+
+def sprt_llr(obs, elo0, elo1):
+    """The log-likelihood ratio of H1 (Elo difference elo1) against H0 (elo0) for observations `obs`
+    (per-pair scores of paired games, or per-game scores) - the generalized SPRT's normal approximation
+    (Van den Bergh; Fishtest's GSPRT): n (s1 - s0) (2 mean - s0 - s1) / (2 var), s = the expected scores,
+    var the observations' variance (a tiny floor: identical observations)."""
+    n = len(obs)
+    if n < 2:
+        return 0.0
+    mean = sum(obs) / n
+    var = max(sum((v - mean) ** 2 for v in obs) / n, 1e-6)
+    s0, s1 = expected_score(elo0), expected_score(elo1)
+    return n * (s1 - s0) * (2 * mean - s0 - s1) / (2 * var)
+
+
+def sprt_bounds(alpha=0.05, beta=0.05):
+    """(lower, upper) LLR bounds: below = accept H0, above = accept H1 (Wald)."""
+    return math.log(beta / (1 - alpha)), math.log((1 - beta) / alpha)
+
+
+def observations(rows, paired):
+    """Side A's per-pair scores (paired) or per-game scores (rows of a match, A in seat gid % 2)."""
+    if paired:
+        by = {r['gid']: float(r['result'][r['gid'] % 2]) for r in rows}
+        return [(by[g] + by[g + 1]) / 2 for g in sorted(by) if g % 2 == 0 and g + 1 in by]
+    return [float(r['result'][r['gid'] % 2]) for r in rows]
+
+
+def _load_pair(a, b, device, game):
     # (the encoding guard, docs/az.md 10.4: A against the game played, B against its own game,
     # which must be the same)
     ma, _ = load(a, device, game=game)
@@ -196,29 +274,157 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     mb, _ = load(b, device)
     if mb.config.get('game', game) != game:
         raise ValueError(f'{a} plays {game}, {b} plays {mb.config.get("game")}')
-    spec = package.active().specs.get(game) if spec is None else spec
-    sa = G.nn_seat('a', sims, c_puct, chance_k=chance_k)
-    sb = G.nn_seat('b', sims, c_puct, chance_k=chance_k)
+    return ma, mb, game
+
+
+def _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b):
+    sa = G.nn_seat('a', sims if sims_a is None else int(sims_a), c_puct, chance_k=chance_k)
+    sb = G.nn_seat('b', sims if sims_b is None else int(sims_b), c_puct, chance_k=chance_k)
     sa.update(run_rule(a) if seat_a is None else seat_a)
     sb.update(run_rule(b) if seat_b is None else seat_b)
     for s, m, p in ((sa, ma, a), (sb, mb, b)):
         if s.get('belief_tilt'):
             check_belief_head(m, game, f'belief_tilt of {p}')     # (before any game: a loud refusal)
+    return sa, sb
+
+
+def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired):
     seats = [[sa, sb] if g % 2 == 0 else [sb, sa] for g in range(games)]
     kw = {'move_log': move_log} if move_log else {}
+    if paired:
+        kw['paired'] = True
     drv = G.Driver(game, seats, spec=spec, concurrency=conc or min(games, 1024), seed=seed, threads=threads,
                    groups=groups, max_steps=max_steps, **kw)
-    t0 = time.time()
-    drive(drv, {'a': NetEvaluator(ma, device), 'b': NetEvaluator(mb, device)})
-    rs = drv.take_results()
+    drive(drv, evs)
+    return drv.take_results()
+
+
+def summary(rs, paired=False):
+    """A's score (+- 1 se: the pair scores' with `paired`, else the games' binomial se), mean margin,
+    Elo difference (+ its se, the delta method), unfinished games; paired: `pairs`, `se_games`,
+    `variance_ratio` (var(pair score) / (var(game) / 2))."""
     n = len(rs)
     w = sum(r['result'][r['gid'] % 2] for r in rs) / n
     margin = sum(r['scores'][r['gid'] % 2] - r['scores'][1 - r['gid'] % 2] for r in rs) / n
     s = min(max(w, 1e-3), 1 - 1e-3)
-    out = {'a': a, 'b': b, 'game': game, 'games': n, 'sims': sims, 'chance_k': chance_k, 'a_score': round(w, 4),
-           'se': round(math.sqrt(w * (1 - w) / n), 4), 'a_margin': round(margin, 2),
-           'elo_diff': round(400 * math.log10(s / (1 - s)), 1), 'unfinished': sum(1 for r in rs if not r['over']),
-           'seconds': round(time.time() - t0, 1), 'select_a': _tag(sa), 'select_b': _tag(sb)}
+    out = {'games': n, 'a_score': round(w, 4), 'se': round(math.sqrt(w * (1 - w) / n), 4),
+           'a_margin': round(margin, 2), 'elo_diff': round(400 * math.log10(s / (1 - s)), 1),
+           'unfinished': sum(1 for r in rs if not r['over'])}
+    if paired:
+        ps = pair_stats(rs)
+        var = ps.pop('var')
+        vg = sum((r['result'][r['gid'] % 2] - w) ** 2 for r in rs) / max(1, n - 1)
+        out['se_games'] = out['se']
+        if ps['n']:
+            out['se'] = ps['se']
+        out['variance_ratio'] = round(var / (vg / 2), 4) if vg > 0 and ps['n'] > 1 else None
+        out['pairs'] = ps
+    out['elo_se'] = round(400 / math.log(10) * out['se'] / (s * (1 - s)), 1)
+    return out
+
+
+def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None,
+          spec=None, conc=None, seat_a=None, seat_b=None, max_steps=5000, move_log=0, rows=False, paired=False,
+          sims_a=None, sims_b=None):
+    """Checkpoint `a` vs checkpoint `b` (paths), `games` 2-player games, seats alternating. -> dict.
+    `seat_a` / `seat_b`: each side's move-rule seat settings ({'select': 'cq', 'select_min_visits':
+    2, ...}; {} = the default rule; None = its checkpoint's run's eval_select, `run_rule`).
+    `move_log`: the driver's move log (the first N moves of each game in its row), `rows`: the
+    games' result rows under 'rows'. `paired`: games 2k and 2k + 1 share their deal with the seats
+    swapped (`games` even; the output's `pairs`, `se` of the pair scores: `summary`). `sims_a` /
+    `sims_b`: a side's simulations (None: `sims`)."""
+    if paired and games % 2:
+        raise ValueError(f'paired games: an even number of games ({games})')
+    ma, mb, game = _load_pair(a, b, device, game)
+    spec = package.active().specs.get(game) if spec is None else spec
+    sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
+    t0 = time.time()
+    rs = _play(game, sa, sb, {'a': NetEvaluator(ma, device), 'b': NetEvaluator(mb, device)}, games, spec, conc, seed,
+               threads, groups, max_steps, move_log, paired)
+    out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
+    out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb))
+    _sides_sims(out, sims_a, sims_b)
+    if paired:
+        out['paired'] = True
+    if rows:
+        out['rows'] = sorted(rs, key=lambda r: r['gid'])
+    return out
+
+
+def _sides_sims(out, sims_a, sims_b):
+    if sims_a is not None or sims_b is not None:
+        out['sims_a'] = out['sims'] if sims_a is None else int(sims_a)
+        out['sims_b'] = out['sims'] if sims_b is None else int(sims_b)
+
+
+def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, beta=0.05, target_se=None, sims=64,
+               chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None, spec=None, conc=None,
+               seat_a=None, seat_b=None, max_steps=5000, paired=False, sims_a=None, sims_b=None, on_batch=None,
+               rows=False):
+    """`match` in batches of `batch_games` until decided: `sprt` (elo0, elo1) - the log-likelihood ratio
+    (`sprt_llr`) leaves `sprt_bounds(alpha, beta)` - or `se` <= `target_se`, or `max_games` played. Batch k
+    is seeded seed + 7919 k (batch 0: `seed`, the plain match's games). -> `match`'s dict over every game,
+    plus 'batches' (games, a_score, se, llr per batch, cumulative), 'stop' (why it stopped) and with `sprt`
+    'sprt' {elo0, elo1, alpha, beta, llr, lower, upper, decision 'H1' | 'H0' | 'undecided'}. `on_batch(dict)`:
+    called after each batch with the cumulative result (progress lines). The game ids of batch k follow
+    the earlier batches' (pairs stay 2j, 2j + 1)."""
+    if sprt is None and target_se is None:
+        raise ValueError('sequential: give sprt (elo0, elo1) and / or target_se')
+    if paired and batch_games % 2:
+        raise ValueError(f'paired games: an even batch ({batch_games})')
+    if max_games < batch_games:
+        raise ValueError(f'max_games {max_games} < batch_games {batch_games}')
+    lo = hi = e0 = e1 = None
+    if sprt is not None:
+        e0, e1 = float(sprt[0]), float(sprt[1])
+        if e1 <= e0:
+            raise ValueError(f'sprt: elo1 ({e1}) must be > elo0 ({e0})')
+        lo, hi = sprt_bounds(alpha, beta)
+    ma, mb, game = _load_pair(a, b, device, game)
+    spec = package.active().specs.get(game) if spec is None else spec
+    sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
+    evs = {'a': NetEvaluator(ma, device), 'b': NetEvaluator(mb, device)}
+    t0 = time.time()
+    rs, batches, stop, llr = [], [], None, None
+    k = 0
+    while stop is None:
+        n = min(batch_games, max_games - len(rs))
+        if paired:
+            n -= n % 2
+        if n <= 0:
+            stop = 'max_games'
+            break
+        got = _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired)
+        off = len(rs)
+        rs += [dict(r, gid=r['gid'] + off) for r in got]
+        cur = summary(rs, paired)
+        row = {'games': len(rs), 'a_score': cur['a_score'], 'se': cur['se']}
+        if sprt is not None:
+            llr = sprt_llr(observations(rs, paired), e0, e1)
+            row['llr'] = round(llr, 3)
+            if llr >= hi:
+                stop = 'sprt H1'
+            elif llr <= lo:
+                stop = 'sprt H0'
+        if stop is None and target_se is not None and cur['se'] <= target_se:
+            stop = 'target_se'
+        if stop is None and len(rs) >= max_games:
+            stop = 'max_games'
+        batches.append(row)
+        if on_batch is not None:
+            on_batch(dict(row, seconds=round(time.time() - t0, 1), stop=stop))
+        k += 1
+    out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
+    out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb), batches=batches, stop=stop)
+    _sides_sims(out, sims_a, sims_b)
+    if paired:
+        out['paired'] = True
+    if sprt is not None:
+        out['sprt'] = {'elo0': e0, 'elo1': e1, 'alpha': alpha, 'beta': beta, 'llr': round(llr or 0.0, 3),
+                       'lower': round(lo, 3), 'upper': round(hi, 3),
+                       'decision': 'H1' if stop == 'sprt H1' else 'H0' if stop == 'sprt H0' else 'undecided'}
+    if target_se is not None:
+        out['target_se'] = target_se
     if rows:
         out['rows'] = sorted(rs, key=lambda r: r['gid'])
     return out
@@ -270,7 +476,39 @@ def main(argv=None):
                         help=f"side {side.upper()}'s Gumbel noise scale (default: its run's eval_gumbel_scale, 0)")
     ap.add_argument('--gumbel-m', type=int, default=None,
                     help="a Gumbel side's considered options (default: its run's gumbel_m, 16)")
+    for side in ('a', 'b'):
+        ap.add_argument(f'--{side}-sims', type=int, default=None, help=f"side {side.upper()}'s simulations (default --sims)")
+    ap.add_argument('--paired', action='store_true',
+                    help='games 2k and 2k + 1 share their deal with the seats swapped (docs/az.md 20.3; --games even)')
+    ap.add_argument('--sprt', default=None, metavar='E0,E1',
+                    help='sequential test of H0: A is E0 Elo better against H1: E1, in batches until decided or '
+                         '--max-games (e.g. 0,20)')
+    ap.add_argument('--alpha', type=float, default=0.05, help='SPRT false-H1 rate (default 0.05)')
+    ap.add_argument('--beta', type=float, default=0.05, help='SPRT false-H0 rate (default 0.05)')
+    ap.add_argument('--target-se', type=float, default=None, help='sequential: stop once se <= this')
+    ap.add_argument('--batch-games', type=int, default=None, help='sequential: games per batch (default --games)')
+    ap.add_argument('--max-games', type=int, default=None,
+                    help='sequential: at most this many games (default 4 x --games)')
     a = ap.parse_args(argv)
+    sprt = None
+    if a.sprt is not None:
+        try:
+            sprt = tuple(float(x) for x in a.sprt.split(','))
+            if len(sprt) != 2 or sprt[1] <= sprt[0]:
+                raise ValueError
+        except ValueError:
+            ap.error(f'--sprt {a.sprt!r}: E0,E1 with E1 > E0 (e.g. 0,20)')
+    seq = sprt is not None or a.target_se is not None
+    if not seq and (a.batch_games is not None or a.max_games is not None):
+        ap.error('--batch-games / --max-games: only with --sprt or --target-se')
+    for k in ('games', 'sims', 'a_sims', 'b_sims', 'batch_games', 'max_games'):
+        v = getattr(a, k)
+        if v is not None and v < 1:
+            ap.error(f'--{k.replace("_", "-")} must be >= 1')
+    if a.paired and (a.batch_games or a.games) % 2:
+        ap.error('--paired: an even number of games (per batch)')
+    if seq and (a.max_games or 4 * a.games) < (a.batch_games or a.games):
+        ap.error('--max-games < the games of one batch')
     import torch
     torch.set_num_threads(max(1, a.torch_threads))
     try:
@@ -317,8 +555,16 @@ def main(argv=None):
             ap.error(f'side {side.upper()}: {e}')
         if getattr(a, f'{side}_gumbel_scale') is not None and sides[k].get('root_search') != 'gumbel':
             ap.error(f"--{side}-gumbel-scale: side {side.upper()} searches with PUCT")
+    if seq:
+        out = sequential(a.a, a.b, a.batch_games or a.games, a.max_games or 4 * a.games, sprt, a.alpha, a.beta,
+                         a.target_se, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device, spec=a.spec,
+                         seat_a=sides[0], seat_b=sides[1], paired=a.paired, sims_a=a.a_sims, sims_b=a.b_sims,
+                         on_batch=lambda r: print('# batch ' + json.dumps(r), file=sys.stderr, flush=True))
+        print(json.dumps(out), flush=True)
+        return
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
-                           spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log)), flush=True)
+                           spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log, paired=a.paired,
+                           sims_a=a.a_sims, sims_b=a.b_sims)), flush=True)
 
 
 if __name__ == '__main__':

@@ -274,3 +274,123 @@ def tag_checkpoints(run, ratings, latest, anchor, tag='visits', evaluated=None):
         json.dump(out, f, indent=1)
     _replace(tmp, os.path.join(mdir, 'index.json'))
     return best
+
+
+# ------------------------------------------------------------------ fixed anchors (docs/az.md 20.1)
+
+ANCHOR_PREFIX = 'anchor:'
+
+
+def parse_anchors(s):
+    """The run setting elo_anchors ('path,label=path,...', a list, or '' / None) -> [(label, path)] in
+    order (() = off). A label defaults to the file's stem; labels are distinct; the pool's player is
+    `anchor_name(label)`. ValueError on a malformed setting."""
+    if s in (None, ''):
+        return []
+    items = s.split(',') if isinstance(s, str) else list(s)
+    out = []
+    for x in items:
+        x = str(x).strip()
+        if not x:
+            continue
+        label, sep, path = x.partition('=')
+        if not sep or any(ch in label for ch in ':/' + chr(92)):
+            label, path = os.path.splitext(os.path.basename(x))[0], x      # (no label: 'E:/x/iter_0192.pt')
+        label, path = label.strip(), path.strip()
+        if not label or not path:
+            raise ValueError(f'elo_anchors {s!r}: entries "path" or "label=path"')
+        out.append((label, path))
+    labels = [lb for lb, _ in out]
+    if len(set(labels)) != len(labels):
+        raise ValueError(f'elo_anchors {s!r}: labels must be distinct ({labels})')
+    return out
+
+
+def anchor_name(label):
+    """The pool's player name of the anchor `label` (never a checkpoint's name: 'anchor:<label>')."""
+    return ANCHOR_PREFIX + label
+
+
+def is_anchor(name):
+    return name.startswith(ANCHOR_PREFIX)
+
+
+def fit_fixed(res, fixed, prior_sd=8.0, iters=50, pairs=None):
+    """`fit` with the players `fixed` ({name: elo}) held at their ratings (the anchors) and every other
+    player free (the yardstick included) -> {player: (elo, se, games)}, the fixed ones with se 0. The
+    weak Gaussian prior (prior_sd log-odds) is centred on the fixed players' mean. `pairs`: the
+    results' keys to use (None: all). Players without a path of games to a fixed one get the prior's
+    centre and a huge se. {} when no fixed player has games (or none is given)."""
+    keys = list(res['pairs']) if pairs is None else list(pairs)
+    players = sorted({p for k in keys for p in k.split('|')} | set(fixed))
+    fixed = {p: float(v) for p, v in fixed.items()}
+    if not fixed:
+        return {}
+    r0 = {p: (v - ANCHOR_ELO) / SCALE for p, v in fixed.items()}
+    centre = sum(r0.values()) / len(r0)
+    free = [p for p in players if p not in fixed]
+    idx = {p: i for i, p in enumerate(free)}
+    games = {p: 0 for p in players}
+    rows = []
+    for k in keys:
+        s, n = res['pairs'][k]
+        a, b = k.split('|')
+        if n > 0:
+            rows.append((a, b, s, n))
+            games[a] += n
+            games[b] += n
+    r = np.full(len(free), centre)
+    H = -np.eye(len(free)) / prior_sd ** 2
+
+    def rating(p):
+        return r[idx[p]] if p in idx else r0[p]
+    for _ in range(iters):
+        if not len(free):
+            break
+        g = -(r - centre) / prior_sd ** 2
+        H = -np.eye(len(free)) / prior_sd ** 2
+        for a, b, s, n in rows:
+            ia, ib = idx.get(a), idx.get(b)
+            if ia is None and ib is None:
+                continue
+            p = 1.0 / (1.0 + math.exp(-(rating(a) - rating(b))))
+            d = s - n * p
+            w = n * p * (1 - p)
+            if ia is not None:
+                g[ia] += d
+                H[ia, ia] -= w
+            if ib is not None:
+                g[ib] -= d
+                H[ib, ib] -= w
+            if ia is not None and ib is not None:
+                H[ia, ib] += w
+                H[ib, ia] += w
+        step = np.linalg.solve(H, g)
+        r -= step
+        if np.abs(step).max() < 1e-7:
+            break
+    out = {p: (fixed[p], 0.0, games[p]) for p in fixed}
+    if len(free):
+        cov = np.linalg.inv(-H)
+        for p, i in idx.items():
+            out[p] = (ANCHOR_ELO + SCALE * r[i], SCALE * math.sqrt(max(cov[i, i], 0.0)), games[p])
+    return out
+
+
+def anchored_path(run, tag='visits'):
+    return os.path.join(pool_dir(run, tag), 'anchored.json')
+
+
+def write_anchored(run, ratings, anchors, tag='visits'):
+    """The pool's anchored.json: {'anchors': the fixed anchors {name: {elo, label, sha256, ...}}, 'ratings':
+    {player: {elo, se, games}} of the fit with them fixed (`fit_fixed`), 'updated'} (docs/az.md 20.1)."""
+    d = pool_dir(run, tag)
+    os.makedirs(d, exist_ok=True)
+    out = {'anchors': anchors, 'updated': time.time(),
+           'ratings': {p: {'elo': round(e, 1), 'se': round(se, 1), 'games': g} for p, (e, se, g) in ratings.items()}}
+    if tag not in (None, '', 'visits'):
+        out['select'] = tag
+    tmp = os.path.join(d, 'anchored.json.tmp')
+    with open(tmp, 'w') as f:
+        json.dump(out, f, indent=1)
+    _replace(tmp, anchored_path(run, tag))

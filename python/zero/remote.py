@@ -11,7 +11,10 @@ eval_select other than 'visits', docs/az.md 5.4) and models/index.json are copie
 remote owns the run's Elo while `eval_remote` is on). The remote plays the run's own settings,
 eval_select included (config.json); a result that names another move rule than the run's is
 refused (the remote's checkout is not the run's code) and retried like a failure. The dashboards
-merge evals.jsonl into the iterations' rows. Evaluations missing after a restart are queued again;
+merge evals.jsonl into the iterations' rows. Fixed Elo anchors (run setting elo_anchors, docs/az.md
+20.1) are shipped once each to `<mirror>/anchors/<label>.pt` and the mirror's config names them there
+(same labels: the pool's players and their sha256 are the same on both machines); the mirror's
+anchored ratings (`anchored.json`, `elo_anchored`) come back with the pool's files. Evaluations missing after a restart are queued again;
 a failure (the remote asleep or offline) is retried every `RETRY_S`.
 
 Remote side (`main`): the run's own `Run.evaluate` + `Run.elo_update` on the mirror, one
@@ -183,6 +186,7 @@ class RemoteEval:
         self.q = queue.Queue()
         self.queued = set()
         self.shipped = None
+        self.anchors_shipped = set()               # (label, local path) put this session (docs/az.md 20.1)
         self.lock = threading.Lock()
         self.th = threading.Thread(target=self._loop, name='zero-remote-eval', daemon=True)
         self.th.start()
@@ -273,6 +277,20 @@ class RemoteEval:
                     if os.path.exists(src):
                         self.t.put(src, self.rdir + dst)
         cfg = dict(c, eval_remote='', **self.spec.get('overrides', {}))
+        anchors = elo.parse_anchors(c.get('elo_anchors', ''))
+        if anchors:
+            # the anchors (docs/az.md 20.1): each file once, under its label, the mirror's config naming them
+            have = set(self.t.listdir(self.rdir + '/anchors'))
+            if not have:
+                self.t.mkdirs(self.rdir + '/anchors')
+            remote = []
+            for label, path in anchors:
+                fn = ''.join(ch if ch.isalnum() or ch in '-_.' else '_' for ch in label) + '.pt'
+                if fn not in have or (label, path) not in self.anchors_shipped:
+                    self.t.put(path, self.rdir + '/anchors/' + fn)
+                    self.anchors_shipped.add((label, path))
+                remote.append(f'{label}={self.rdir}/anchors/{fn}')
+            cfg['elo_anchors'] = ','.join(remote)
         tmp = os.path.join(self.R.run, '.remote_config.json')
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, indent=1)
@@ -304,12 +322,13 @@ class RemoteEval:
             raise RuntimeError(f"the remote evaluated with the move rule {got!r}, the run's eval_select is {tag!r} "
                                f"(its checkout is not the run's code?): not recorded")
         row = {'iter': it, 'time': time.time(), 'host': self.name, 'seconds': round(time.time() - t0, 1)}
-        for k in ('eval_yard', 'eval_random', 'elo'):
+        for k in ('eval_yard', 'eval_random', 'elo', 'elo_anchored'):
             if k in m:
                 row[k] = m[k]
         pool = elo.pool_dir('', tag).replace(os.sep, '/')
         os.makedirs(elo.pool_dir(self.R.run, tag), exist_ok=True)
-        for fn in ('results.json', 'ratings.json'):
+        files = ('results.json', 'ratings.json') + (('anchored.json',) if self.R.cfg.get('elo_anchors') else ())
+        for fn in files:
             self.t.get(f'{self.rdir}/{pool}/{fn}', os.path.join(elo.pool_dir(self.R.run, tag), fn))
         self.t.get(self.rdir + '/models/index.json', os.path.join(self.R.run, 'models', 'index.json'))
         with open(os.path.join(self.R.run, 'evals.jsonl'), 'a', encoding='utf-8') as f:
@@ -319,6 +338,10 @@ class RemoteEval:
             self.R.log(f'iter {it} vs {ey.get("opp", self.R.yard)} (remote {self.name}, {row["seconds"]:.0f}s): {ey}')
         if row.get('elo'):
             self.R.log(f'iter {it} elo {row["elo"]["elo"]:.0f} +-{1.96 * row["elo"]["se"]:.0f}{elo.pool_note(tag)} '
+                       f'(remote {self.name})')
+        if row.get('elo_anchored'):
+            a = row['elo_anchored']
+            self.R.log(f'iter {it} elo anchored {a["elo"]:.0f} +-{1.96 * a["se"]:.0f}{elo.pool_note(tag)} '
                        f'(remote {self.name})')
 
 

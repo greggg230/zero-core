@@ -29,6 +29,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         queue_only: false,
         move_log: 0,
         aux: false,
+        paired: false,
     }
 }
 
@@ -1079,6 +1080,42 @@ fn select_visits_and_the_move_log_change_nothing() {
     // an evaluation match at the default rule: the games of zero-core before the rule existed
     assert_eq!(results_digest(&golden_match(Select::Visits, Select::Visits)), GOLDEN_MATCH_VISITS);
 }
+#[test]
+fn paired_games_share_their_streams() {
+    // DriverCfg::paired: games 2k and 2k + 1 draw every random stream from k. Two seats that search
+    // alike (same settings, the same answers) swapped between the two games of a pair - the table
+    // of a match - then play the same game twice: same moves, same scores, the result mirrored
+    // onto the swapped seats' keys. Unpaired, the two games of a "pair" are unrelated.
+    let games: Vec<Vec<u16>> = (0..40).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+    let play = |paired: bool, games: Vec<Vec<u16>>| {
+        let mut c = cfg(vec![nn(0, 16, false), nn(1, 16, false)], games, &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+        c.seed = 2026;
+        c.record = false;
+        c.move_log = 1000;
+        c.paired = paired;
+        run(&mut Driver::<ToyGame>::new(c).unwrap()).0
+    };
+    let game = |r: &GameResult| (r.steps, r.decisions, r.scores.clone(), r.result.clone(), r.moves.clone());
+    let p = play(true, games.clone());
+    assert_eq!(p.len(), 40);
+    for k in 0..20 {
+        assert_eq!(game(&p[2 * k]), game(&p[2 * k + 1]), "pair {k}: the same deal from each seat");
+    }
+    let u = play(false, games.clone());
+    assert!((0..20).any(|k| game(&u[2 * k]) != game(&u[2 * k + 1])), "unpaired games share nothing");
+    // a pair's game is the game the pair's id would play unpaired... from stream k, not 2k: the
+    // unpaired driver's game k (both seats alike) is the paired driver's games 2k and 2k + 1
+    for k in 0..20 {
+        assert_eq!(game(&p[2 * k]), game(&u[k]), "pair {k} plays the unpaired game {k}'s streams");
+    }
+    // an odd count: the last game has no partner and plays its pair's stream alone
+    let odd = play(true, games[..7].to_vec());
+    assert_eq!(odd.len(), 7);
+    assert_eq!(game(&odd[6]), game(&p[6]));
+    // off: today's match, bit for bit (the golden of before the setting)
+    assert_eq!(results_digest(&golden_match(Select::Visits, Select::Visits)), GOLDEN_MATCH_VISITS);
+}
+
 // `golden_match(Visits, Visits)`: the same digest on zero-core 3c26d9f (the driver before
 // `Select`, the same match without the select field)
 const GOLDEN_MATCH_VISITS: u64 = 12492034373733022939;

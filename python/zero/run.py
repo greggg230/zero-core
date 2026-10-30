@@ -203,6 +203,23 @@ DEFAULTS = dict(
     # one; elo_opponents is not used): the ones never evaluated are rated through these games only
     # and are never models/best.pt (docs/az.md 5)
     elo_opponents=0, elo_sims=0, elo_together=0, elo_offsets='',
+    # fixed anchors (docs/az.md 20.1): frozen checkpoints ('path' or 'label=path', comma-separated; '' =
+    # off: nothing changes) every evaluated checkpoint of the pool plays elo_anchor_games games against
+    # (at elo_sims; those of iteration >= elo_anchor_from, 0 = all of the pool's, the older ones caught up
+    # first). Their ratings are FIXED: the first anchor's at elo_anchor_elo, each later one's once, from
+    # elo_anchor_calib_games games against each anchor before it, kept in the pool's results.json
+    # ('anchors': with each file's sha256 - another file under the label is refused). A Bradley-Terry fit
+    # over the pool's whole results with them fixed rates every player: 'elo_anchored' in the metrics (and
+    # evals.jsonl), the pool's anchored.json, a log line. elo_paired 1: every Elo match (offsets, anchors,
+    # calibration) is played as paired games (docs/az.md 20.3: games 2k and 2k + 1 share their deal with
+    # the seats swapped; even game counts). Single-game runs only
+    elo_anchors='', elo_anchor_games=100, elo_anchor_elo=1000.0, elo_anchor_calib_games=200, elo_anchor_from=0,
+    elo_paired=0,
+    # held-out losses (docs/az.md 20.2, zero/heldout.py): the shards of a frozen set (comma-separated
+    # files or directories; '' = off, nothing changes) on which every evaluated checkpoint's value and
+    # policy losses are measured ('heldout' in the metrics, a log line), on heldout_device ('' = the
+    # train_device); computed here, also with eval_remote
+    heldout_shards='', heldout_device='',
     # evaluation on another machine (a name in the game package's `remotes`, 'local' for tests;
     # '' = here): the loop queues each evaluated checkpoint and keeps training (zero.remote)
     eval_remote='',
@@ -409,6 +426,8 @@ class Run:
         # auxiliary targets (docs/az.md 15): the game's layout [[name, width, loss], ...] when one of
         # their weights is on, else [] (off: nothing recorded, built or trained)
         self.aux_w, self.aux = aux_settings(cfg, self.info)
+        self.heldout = None                        # zero.heldout.HeldOut with heldout_shards (loaded once)
+        self.anchor_sha = {}                       # anchor path -> ((size, mtime), sha256)
 
     def check(self, where=''):
         if self.pw is not None:
@@ -471,12 +490,16 @@ class Run:
         'select' and their Elo pool (docs/az.md 5.4)."""
         return elo.eval_tag(self.cfg)
 
-    def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None, queue_only=False):
+    def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None, queue_only=False,
+               paired=False):
         """A driver for self-play (`record`: the run's spec) or a match (eval_spec, if set).
-        `queue_only`: a rolling driver that plays only queued setups (co-training)."""
+        `queue_only`: a rolling driver that plays only queued setups (co-training). `paired`: games 2k
+        and 2k + 1 share their streams (the driver's `paired`, docs/az.md 20.3)."""
         c = self.cfg
         spec = c['spec'] if record else (c.get('eval_spec') or package.active().eval_spec_of(c['game'], c['spec']))
         kw = {'queue_only': True} if queue_only else {}
+        if paired:
+            kw['paired'] = True
         if record and getattr(self, 'aux', None):
             # self-play records the auxiliary targets (docs/az.md 15; getattr: a caller's stand-in Run
             # with only a cfg, e.g. MTG Zero's test of its evaluation specs, has none)
@@ -1023,22 +1046,25 @@ class Run:
             return self.nn_seat('o', sims)
         return G.seat_dict(opp)
 
-    def play_match(self, it, opp, n_games, sims, seed, opp_model=None):
+    def play_match(self, it, opp, n_games, sims, seed, opp_model=None, paired=False, model=None):
         """Checkpoint `it` against `opp` ('nn' + opp_model, a bot name or 'ext:<name>'), seats
-        alternating. -> rows (score, margin, rounds, over) of the checkpoint."""
+        alternating. -> rows (score, margin, rounds, over) of the checkpoint. `paired`: paired games
+        (docs/az.md 20.3); `model`: another network than checkpoint `it` (a path: an anchor's
+        calibration, docs/az.md 20.1)."""
         if n_games <= 0:
             return []
         P = 2
         a = self.nn_seat('m', sims)
         o = self.opp_seat(opp, sims)
         seats = [[a if s == g % P else o for s in range(P)] for g in range(n_games)]
-        evs = {'m': self.evaluator(model_path(self.run, it))}
+        evs = {'m': self.evaluator(model or model_path(self.run, it))}
         if opp == 'nn':
             evs['o'] = self.evaluator(opp_model)
         ext = {}
         if G.is_external(opp):
             ext[opp[4:]] = G.external(opp[4:], seed)
-        drv = self.driver(seats, seed=seed, conc=min(self.cfg['conc'], n_games), groups=self.match_groups(ext))
+        drv = self.driver(seats, seed=seed, conc=min(self.cfg['conc'], n_games), groups=self.match_groups(ext),
+                          paired=paired)
         drive(drv, evs, ext, check=lambda: self.check('evaluation'))
         rows = []
         for r in sorted(drv.take_results(), key=lambda r: r['gid']):
@@ -1047,22 +1073,24 @@ class Run:
             rows.append((r['result'][me], sc[me] - max(sc[j] for j in range(len(sc)) if j != me), r['rounds'], r['over']))
         return rows
 
-    def play_matches(self, it, opps, n_games, sims, seed):
+    def play_matches(self, it, opps, n_games, sims, seed, paired=False, paths=None):
         """Checkpoint `it` against each of the checkpoints `opps` (n_games each, seats alternating
         within each match) in ONE driver: every opponent is its own evaluator key, so the
         checkpoint's network batches hold the leaves of all the matches. -> {opp: rows} as
-        play_match."""
+        play_match. `paired`: paired games (n_games even: a pair never spans two opponents);
+        `paths`: {opp: its network's path} for opponents that are not checkpoints of the run (the
+        anchors, docs/az.md 20.1)."""
         P = 2
         a = self.nn_seat('m', sims)
         evs = {'m': self.evaluator(model_path(self.run, it))}
         seats = []
         for t, j in enumerate(opps):
             o = self.nn_seat(f'o{t}', sims)
-            evs[f'o{t}'] = self.evaluator(model_path(self.run, j))
+            evs[f'o{t}'] = self.evaluator(paths[j] if paths and j in paths else model_path(self.run, j))
             seats += [[a if s == g % P else o for s in range(P)] for g in range(n_games)]
         if not seats:
             return {}
-        drv = self.driver(seats, seed=seed, conc=min(self.cfg['conc'], len(seats)))
+        drv = self.driver(seats, seed=seed, conc=min(self.cfg['conc'], len(seats)), paired=paired)
         drive(drv, evs, check=lambda: self.check('evaluation'))
         out = {j: [] for j in opps}
         for r in sorted(drv.take_results(), key=lambda r: r['gid']):
@@ -1162,6 +1190,7 @@ class Run:
                 and os.path.exists(model_path(self.run, k))
                 and not elo.has(res, elo.ckpt_name(k), elo.ckpt_name(j))]
         sims = c.get('elo_sims') or c['eval_sims']
+        pk = {'paired': True} if c.get('elo_paired') else {}     # (docs/az.md 20.3; off: the calls of before)
 
         def record(k, j, rows):
             sc = sum(r[0] for r in rows)
@@ -1171,12 +1200,15 @@ class Run:
         if c.get('elo_together'):
             for k in sorted({k for k, _ in todo}):
                 js = [j for kk, j in todo if kk == k]
-                for j, rows in self.play_matches(k, js, c['elo_games'], sims, seed=31 + 7919 * k).items():
+                for j, rows in self.play_matches(k, js, c['elo_games'], sims, seed=31 + 7919 * k, **pk).items():
                     record(k, j, rows)
         else:
             for k, j in todo:
                 record(k, j, self.play_match(k, 'nn', c['elo_games'], sims, seed=31 + 7919 * k + 101 * j,
-                                             opp_model=model_path(self.run, j)))
+                                             opp_model=model_path(self.run, j), **pk))
+        anchors = elo.parse_anchors(c.get('elo_anchors', ''))
+        if anchors:
+            self.anchor_matches(res, anchors, latest, tag, sims, pk)
         ratings = elo.fit(res, anchor=self.yard)
         # raw offsets, a rule's pool begun mid-run and a run back at a rule after another rate checkpoints
         # that never played the yardstick in this pool: flagged "evaluated": false in ratings.json and
@@ -1184,9 +1216,144 @@ class Run:
         evaluated = set(logged) if c.get('elo_offsets') or tag != 'visits' or elo.other_pools(self.run, tag) else None
         elo.write_ratings(self.run, ratings, self.yard, tag=tag, evaluated=evaluated)
         best = elo.tag_checkpoints(self.run, ratings, latest, self.yard, tag=tag, evaluated=evaluated)
+        if anchors:
+            # the fit with the anchors fixed (docs/az.md 20.1): every player of the pool, the yardstick too
+            fixed = {n: a['elo'] for n, a in res['anchors'].items() if a.get('elo') is not None}
+            ar = elo.fit_fixed(res, fixed)
+            elo.write_anchored(self.run, ar, res['anchors'], tag)
+            me = ar.get(elo.ckpt_name(latest))
+            if current is not None and me and me[2]:
+                current['elo_anchored'] = elo.row(me, tag)
         if current is not None:
             current.setdefault('phases', {})['elo_s'] = time.time() - t0
         return ratings, best
+
+    # ---------------------------------------------------------------- fixed anchors (docs/az.md 20.1)
+    def anchor_file_sha(self, path):
+        """sha256 of an anchor's file (cached by size and mtime)."""
+        import hashlib
+        st = os.stat(path)
+        key = (st.st_size, st.st_mtime_ns)
+        got = self.anchor_sha.get(path)
+        if got and got[0] == key:
+            return got[1]
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        self.anchor_sha[path] = (key, h.hexdigest())
+        return h.hexdigest()
+
+    def check_anchors(self):
+        """Every anchor of elo_anchors exists and is a network of this build's encoding (with the
+        auxiliary head when the evaluation's root belief needs it): else AnchorRefused / EncodingMismatch
+        (the run is refused, not restarted)."""
+        for label, path in elo.parse_anchors(self.cfg.get('elo_anchors', '')):
+            if not os.path.exists(path):
+                raise AnchorRefused(f'elo_anchors: the anchor {label!r} ({path}) does not exist')
+            check_checkpoint(path, self.cfg['game'])
+            if float(self.cfg.get('eval_belief_tilt', 0.0) or 0.0) > 0:
+                m, _ = load(path, 'cpu', game=self.cfg['game'])
+                check_belief_head(m, self.cfg['game'], f'eval_belief_tilt (the anchor {label!r}, {path})')
+
+    def anchor_matches(self, res, anchors, latest, tag, sims, pk):
+        """The anchors' part of `elo_update` (docs/az.md 20.1): each anchor's file checked against the
+        sha256 it was fixed with; a new anchor fixed (the pool's first at elo_anchor_elo, a later one by
+        elo_anchor_calib_games games against each anchor fixed before it, then a fit of those games
+        alone with the earlier ones fixed); then the anchor games of every evaluated checkpoint
+        (iteration >= the pool's `since` and elo_anchor_from) that lacks them, elo_anchor_games each, all
+        of a checkpoint's anchors in one driver. Everything recorded in `res` (saved after each match)."""
+        c = self.cfg
+        known = res.setdefault('anchors', {})
+        named = [(elo.anchor_name(lb), lb, path) for lb, path in anchors]
+        for name, lb, path in named:
+            if not os.path.exists(path):
+                raise AnchorRefused(f'elo_anchors: the anchor {lb!r} ({path}) does not exist')
+            sha = self.anchor_file_sha(path)
+            if name in known and known[name].get('sha256') not in (None, sha):
+                raise AnchorRefused(f'elo_anchors: the anchor {lb!r} ({path}, sha256 {sha[:12]}) is not the network '
+                                    f'it was fixed with in this pool ({known[name]["sha256"][:12]}, '
+                                    f'{known[name].get("file")}): another file under the same label would move the '
+                                    f'scale - give it another label')
+        save = lambda: elo.save_results(self.run, res, tag=tag)
+        for i, (name, lb, path) in enumerate(named):
+            if known.get(name, {}).get('elo') is not None:
+                continue
+            entry = {'label': lb, 'file': os.path.basename(path), 'sha256': self.anchor_file_sha(path), 'since': latest}
+            fixed = {n: a['elo'] for n, a in known.items() if a.get('elo') is not None}
+            if not fixed:
+                entry.update(elo=float(c['elo_anchor_elo']), how='set (elo_anchor_elo)')
+            else:
+                ng = int(c.get('elo_anchor_calib_games', 0))
+                if ng <= 0:
+                    raise SystemExit(f'elo_anchors: the anchor {lb!r} is new and the pool has fixed anchors already: '
+                                     f'it needs elo_anchor_calib_games > 0 to be fixed against them')
+                others = [n for n in fixed]
+                paths = {n: known[n].get('path') for n in others}
+                for n, _, p in named:
+                    paths[n] = p
+                keys = []
+                for j, other in enumerate(sorted(others)):
+                    op = paths.get(other)
+                    if not elo.has(res, name, other):
+                        if not op or not os.path.exists(op):
+                            raise AnchorRefused(f'elo_anchors: calibrating {lb!r} needs the fixed anchor {other!r}, '
+                                                f'which is not among elo_anchors (its file is needed)')
+                        rows = self.play_match(None, 'nn', ng, sims, seed=97 + 1013 * (i + 1) + 31 * j, opp_model=op,
+                                               model=path, **pk)
+                        sc = sum(r[0] for r in rows)
+                        elo.add(res, name, other, sc, len(rows))
+                        save()
+                        self.log(f'elo anchor calibration {name} vs {other}: {sc:.1f}/{len(rows)}{elo.pool_note(tag)}')
+                    keys.append(f'{min(name, other)}|{max(name, other)}')
+                fit = elo.fit_fixed(res, fixed, pairs=keys)
+                entry.update(elo=round(fit[name][0], 1), se=round(fit[name][1], 1),
+                             how=f'calibrated: {ng} games against each of {sorted(others)}')
+            entry['path'] = path
+            known[name] = entry
+            save()
+            self.log(f'elo anchor {name} fixed at {entry["elo"]:.1f} ({entry["how"]}){elo.pool_note(tag)}')
+        for name, lb, path in named:                # (the path it is played from now: a remote mirror's)
+            known[name]['path'] = path
+        e = max(1, int(c['eval_every']))
+        since = max(res.get('since', 0), int(c.get('elo_anchor_from', 0) or 0))
+        ng = int(c.get('elo_anchor_games', 0))
+        if ng <= 0:
+            return
+        for k in range(e, latest + 1, e):
+            if k < since or not os.path.exists(model_path(self.run, k)):
+                continue
+            todo = [(name, path) for name, _, path in named if not elo.has(res, elo.ckpt_name(k), name)]
+            if not todo:
+                continue
+            got = self.play_matches(k, [n for n, _ in todo], ng, sims, seed=53 + 7919 * k, paths=dict(todo), **pk)
+            for name, rows in got.items():
+                sc = sum(r[0] for r in rows)
+                elo.add(res, elo.ckpt_name(k), name, sc, len(rows))
+                save()
+                self.log(f'elo match {elo.ckpt_name(k)} vs {name}: {sc:.1f}/{len(rows)}{elo.pool_note(tag)}')
+
+    def heldout_eval(self, it, m):
+        """The held-out losses of checkpoint `it` (docs/az.md 20.2) -> m['heldout'] + a log line. A
+        failure is logged (HELDOUT FAILED) and recorded, never the run's end (a yardstick)."""
+        from .heldout import HeldOut, fmt
+        c = self.cfg
+        dev = c.get('heldout_device') or c['train_device']
+        if dev == 'cuda' and not torch.cuda.is_available():
+            dev = 'cpu'
+        try:
+            if self.heldout is None:
+                self.heldout = HeldOut(c['heldout_shards'], game=c['game'])
+            model, _ = load(model_path(self.run, it), dev, game=c['game'])
+            m['heldout'] = self.heldout.evaluate(model, dev)
+            del model
+        except Paused:
+            raise
+        except Exception as e:                     # noqa: BLE001 - recorded, loudly
+            m['heldout'] = {'error': f'{type(e).__name__}: {e}'[:500]}
+            self.log(f'iter {it} heldout: HELDOUT FAILED: {type(e).__name__}: {e}')
+            return
+        self.log(f'iter {it} heldout {fmt(m["heldout"])}')
 
     # ---------------------------------------------------------------- the loop
     def partial_path(self, it):
@@ -1197,6 +1364,8 @@ class Run:
         c = self.cfg
         _write_json(os.path.join(self.run, 'progress.json'), {'iter': it, 'phase': 'eval', 'time': time.time()})
         evaluated = it % max(1, int(c['eval_every'])) == 0 or it == 0
+        if evaluated and c.get('heldout_shards'):
+            self.heldout_eval(it, m)               # (docs/az.md 20.2: here, also with eval_remote)
         if self.remote is None:
             if evaluated:
                 self.evaluate(it, m)
@@ -1206,6 +1375,9 @@ class Run:
                 m['elo'] = elo.row(me, self.eval_tag())
                 self.log(f'iter {it} elo {me[0]:.0f} +-{1.96 * me[1]:.0f}{elo.pool_note(self.eval_tag())}; '
                          + (f'best {best["file"]} {best["elo"]:.0f}' if best else 'no best yet'))
+            if m.get('elo_anchored'):
+                a = m['elo_anchored']
+                self.log(f'iter {it} elo anchored {a["elo"]:.0f} +-{1.96 * a["se"]:.0f}{elo.pool_note(self.eval_tag())}')
         m['seconds'] = time.time() - t0 + m.get('resumed_seconds', 0)
         m['time'] = time.time()
         append_metrics(self.run, m)
@@ -1235,6 +1407,15 @@ class Run:
             check_checkpoint(model_path(run, start), c['game'])
         # the root's belief needs the auxiliary head (HeadMissing: refused the same way, docs/az.md 18)
         self.check_belief_heads(model_path(run, start))
+        # the anchors and the held-out set (docs/az.md 20): checked now, refused before any work
+        self.check_anchors()
+        if c.get('heldout_shards'):
+            from .heldout import HeldOut
+            try:
+                self.heldout = HeldOut(c['heldout_shards'], game=c['game'], features=self.info['num_features'],
+                                       actions=self.info['num_actions'])
+            except (OSError, ValueError) as e:
+                raise HeldOutRefused(f'heldout_shards: {e}') from None
         done = {m['iter'] for m in read_metrics(run)}
         self.log(f'run {run} starting after iter {start}; cfg {json.dumps(c)}')
         if c.get('eval_remote'):
@@ -1301,6 +1482,16 @@ class Run:
             _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
             self.remote.drain()
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})
+
+
+class AnchorRefused(EncodingMismatch):
+    """An Elo anchor the run cannot use (docs/az.md 20.1): missing, or another file than the one it was
+    fixed with. An EncodingMismatch, so the run is refused (exit 78) and not restarted."""
+
+
+class HeldOutRefused(EncodingMismatch):
+    """A held-out set the run cannot use (docs/az.md 20.2): missing shards, or another game or encoding.
+    Refused like an EncodingMismatch (exit 78)."""
 
 
 def aux_settings(cfg, info):
@@ -1502,8 +1693,21 @@ def check_eval_settings(cfg, where=''):
                          f"counts are its schedule, not a policy; docs/search.md 3.7)")
     try:
         elo.parse_offsets(cfg.get('elo_offsets', ''))
+        anchors = elo.parse_anchors(cfg.get('elo_anchors', ''))
     except ValueError as e:
         raise SystemExit(f'{where}{e}') from None
+    for k in ('elo_anchor_games', 'elo_anchor_calib_games', 'elo_anchor_from'):
+        v = cfg.get(k, 0)
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise SystemExit(f'{where}{k} {v!r}: an integer >= 0')
+    if (anchors or cfg.get('elo_paired')) and (cfg.get('resolver') or where):
+        raise SystemExit(f'{where}elo_anchors / elo_paired: single-game runs only (a co-training run plays its '
+                         f'matches as events)')
+    if cfg.get('elo_paired'):
+        odd = [k for k in ('elo_games', 'elo_anchor_games', 'elo_anchor_calib_games') if int(cfg.get(k, 0)) % 2]
+        if odd:
+            raise SystemExit(f'{where}elo_paired: {", ".join(f"{k} {cfg[k]}" for k in odd)} must be even (a pair is '
+                             f'two games: the same deal, the seats swapped)')
 
 
 def main(argv=None):

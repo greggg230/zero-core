@@ -440,6 +440,12 @@ pub struct DriverCfg {
     /// recorded decision) with every sample (`Record::aux`, `take_samples()['aux']`; docs/search.md
     /// 1.2); the game must have some (`SearchGame::AUX`). Off: nothing changes.
     pub aux: bool,
+    /// Paired games (docs/search.md 2.10, docs/az.md 20.3): games `2k` and `2k + 1` draw every random
+    /// stream from the pair's id `k` instead of their own gid - the same deal, shuffles and chance
+    /// stream (the game's seed), the same driver streams - so a match whose table swaps the seats
+    /// between the two games of a pair (zero.h2h, the Elo matches) plays each deal once from each
+    /// seat. Off (the default): every game's streams derive from its gid (nothing changes).
+    pub paired: bool,
 }
 
 /// A finished game (docs/search.md 2.5).

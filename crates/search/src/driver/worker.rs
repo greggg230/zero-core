@@ -269,12 +269,14 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
 }
 
 /// Start game `gid` in `slot` (with the spec of its queued setup, if any): every random
-/// stream derives from (driver seed, gid).
+/// stream derives from (driver seed, gid) - with `DriverCfg::paired`, from (driver seed, gid / 2):
+/// the two games of a pair share them.
 fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Result<(), String> {
     let cfg = &sh.cfg;
     let setup = slot.setup.take();
     let spec = setup.as_ref().map_or(&sh.spec, |s| &s.spec);
-    let mut base = Rng::new(split64(cfg.seed ^ split64(gid as u64 + 1)));
+    let stream = if cfg.paired { gid / 2 } else { gid };
+    let mut base = Rng::new(split64(cfg.seed ^ split64(stream as u64 + 1)));
     let seats = game_seats(cfg, gid);
     let n = seats.len();
     slot.tag = setup.as_ref().map(|s| s.tag.clone());

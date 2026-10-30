@@ -636,7 +636,8 @@ impl PySearchTree {
 // ------------------------------------------------------------------------ SearchDriver
 
 /// The batched driver (docs/search.md 2). `seats` = per game a list of seat dicts; `aux`: record
-/// the game's auxiliary targets with the samples (`take_samples()['aux']`, docs/search.md 1.2).
+/// the game's auxiliary targets with the samples (`take_samples()['aux']`, docs/search.md 1.2);
+/// `paired`: games 2k and 2k + 1 share every random stream (the deal), `DriverCfg::paired`.
 #[pyclass(name = "SearchDriver")]
 pub struct PySearchDriver {
     d: Box<dyn DynDriver>,
@@ -646,9 +647,9 @@ pub struct PySearchDriver {
 #[pymethods]
 impl PySearchDriver {
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool) -> PyResult<Self> {
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool) -> PyResult<Self> {
         let spec = spec_json(spec)?;
         let mut keys = Vec::new();
         let mut table: Vec<SeatCfg> = Vec::new();
@@ -669,7 +670,7 @@ impl PySearchDriver {
             }
             games.push(ix);
         }
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux };
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
         Ok(PySearchDriver { d, nfeat })
