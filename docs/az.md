@@ -23,12 +23,13 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `finite.py` | The non-finite guard (section 4.1): vectorised NaN / inf checks, `NonFinite` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
 | `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
-| `elo.py` | Bradley-Terry Elo over all results, the run's yardstick = 1000; one pool per evaluation move rule (`pool_dir`, `eval_tag`, `active_pool`), the Elo opponents (`opponents`: evaluations back, or raw `elo_offsets`; section 5.4) |
+| `elo.py` | Bradley-Terry Elo over all results, the run's yardstick = 1000; one pool per evaluation move rule (`pool_dir`, `eval_tag`, `active_pool`), the Elo opponents (`opponents`: evaluations back, or raw `elo_offsets`; section 5.4); fixed anchors (`parse_anchors`, `fit_fixed`: the fit with the anchors held at their ratings, `anchored.json`; section 20.1) |
 | `runctl.py` | PAUSE / STOP files, exit status 75, run / supervisor state files, `PauseWatch` |
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5) |
 | `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6) |
-| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log` |
+| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3) |
+| `heldout.py` | Held-out losses (section 20.2): a frozen set of sample rows (`make`), a checkpoint's value cross-entropy / accuracy / Brier against z and policy cross-entropy / top-1 against the recorded targets, decision and value-only rows apart (`HeldOut`, `losses`); `python -m <pkg>.az.heldout make | eval` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
 | `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
@@ -178,13 +179,14 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'; with `eval_games` 0 `eval_yard` has 0 games: the iteration is still evaluated, section 20.1), `elo` (`select`: its pool unless 'visits'), `elo_anchored` (with `elo_anchors`: the rating of the fit with the anchors fixed, section 20.1), `heldout` (with `heldout_shards`: the held-out losses, section 20.2), `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
 | `elo/<rule>/results.json`, `elo/<rule>/ratings.json` | the pool of another evaluation move rule ('cq', 'cq-n2', ...; section 5.4): the same files, plus `select` (the rule) and `since` (the first iteration it rated) |
-| `evals.jsonl` | with `eval_remote` (section 5.2): one line per remote evaluation `{iter, eval_yard, eval_random, elo, time, host, seconds}`, merged into the iterations' rows by the dashboard; a co-training run's resolver: `resolver/evals.jsonl` (11.5); a co-training run's primary with `draft_eval_net_remote`: `{iter, eval_yard_net, time, host, seconds, remote_s}` (11.7) |
+| `elo/[<rule>/]anchored.json` | with `elo_anchors` (section 20.1): the anchors (label, file, sha256, fixed rating and how) and every player's rating in the fit with them fixed; the pool's `results.json` then also holds `anchors` and the anchors' games (`anchor:<label>` players) |
+| `evals.jsonl` | with `eval_remote` (section 5.2): one line per remote evaluation `{iter, eval_yard, eval_random, elo, time, host, seconds}` (+ `elo_anchored` with `elo_anchors`), merged into the iterations' rows by the dashboard; a co-training run's resolver: `resolver/evals.jsonl` (11.5); a co-training run's primary with `draft_eval_net_remote`: `{iter, eval_yard_net, time, host, seconds, remote_s}` (11.7) |
 | `progress.json` | self-play progress of the iteration in flight (dashboard); a co-training run's also has `events_resolved`, `target`, `drafting`, `pending_events`, `matches_queued`, `matches_in_flight`, `matches_done` (section 11); with `selfplay_remote`: `remote` (single-game) or `matches_remote` (co-training), sections 5.3, 11.6 |
 | `resolver/` | a co-training run's resolver network (section 11): the same layout (`config.json`, `metrics.jsonl`, `models/`, `data/`, `elo/`, `debug/`, `progress.json`), iteration numbers shared |
 | `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control |
@@ -2910,3 +2912,223 @@ side B PUCT with the line's rule cq4 s0.3): 32 simulations 0.468 +- 0.020 (600 g
 either way on a network trained on PUCT's searches; whether training on Gumbel's targets and moves helps
 is the A/B's question (its ENGINE.md 68.7). Self-play records are valid and as cheap (1,794 against
 1,747 leaves/s on the final build).
+
+## 20. Strength measurement: fixed anchors, held-out losses, paired and sequential head-to-heads (MTG Zero's Delver mirror, 2026-10-30)
+
+A Fable review of MTG Zero's Delver main line (`runs/r3-2b-beliefsearch`, paused at iteration 196; its
+ENGINE.md 73) found that the line's yardsticks could not see its progress:
+
+* **The Elo pool is too coarse.** Every 8 iterations each checkpoint plays the checkpoints 1, 2, 4, 8
+  iterations back (`elo_offsets`), 25 games each at 32 simulations: +-50-115 Elo per rating, and no
+  fixed reference (each rating is a chain of noisy links to the yardstick). The pooled pairs give 0.481
+  +- 0.015, -1.9 +- 2.3 Elo per iteration: "plateau" and "+1 Elo a generation" look alike.
+* **The yardstick is saturated** (92-98% wins against the heuristic): its games carry almost no
+  information, and the user stopped testing against it.
+* **Head-to-head verdicts are too noisy.** `zero.h2h` (600 games at 32 simulations, se 0.020)
+  alternates the seats but does not pair the games: each game's deal comes from its own gid, so the
+  opening hands' variance of a mirror stays in the score. Two features were adopted at 0.538 and 0.534,
+  just under the 2-se bar (0.541), and a null cannot be told from +10 Elo.
+
+This section adds four opt-in measurements; every one off is the run of before, byte for byte (20.6). What
+they measured on the Delver line: 20.7.
+
+### 20.1 Fixed anchors in the Elo pool (`elo_anchors`)
+
+* **Settings** (run.py DEFAULTS): `elo_anchors` - frozen checkpoints, comma-separated, each `path` or
+  `label=path` (label default: the file's stem); '' = off. `elo_anchor_games` (100): games per anchor
+  for every evaluated checkpoint. `elo_anchor_elo` (1000): the first anchor's fixed rating.
+  `elo_anchor_calib_games` (200): games of a later anchor against each anchor fixed before it.
+  `elo_anchor_from` (0): only checkpoints from this iteration on play the anchors (0: every evaluated
+  checkpoint of the pool, from its `since`). `elo_paired` (0): paired Elo matches (20.3). Single-game
+  runs only (a co-training run plays its matches as events: refused).
+* **Players**: an anchor is the pool's player `anchor:<label>` (never a checkpoint's name, even when it
+  is a copy of one: it is a frozen network, not the run's), played with the run's evaluation seat (the
+  pool's move rule, `elo_sims`), so it must be of the run's encoding and, with a root belief, have the
+  auxiliary head (checked at the start: refused, exit 78).
+* **Fixing them** (`Run.anchor_matches`, in each `elo_update`): the pool's first anchor is fixed at
+  `elo_anchor_elo`; each later anchor plays `elo_anchor_calib_games` against every anchor already fixed
+  and is fixed at the rating of a fit of those games alone with the earlier ones held. The values, the
+  file's sha256, its name, the iteration and how it was fixed are kept in the pool's `results.json`
+  (`anchors`) and never refit: an anchor's games against later checkpoints never move the scale.
+  Another file under a fixed label is refused (`AnchorRefused`, exit 78: a moved scale in silence would
+  be worse than no anchor); a new label is a new anchor, calibrated against the old ones.
+* **Anchor games**: every evaluated checkpoint (`eval_every` multiples, iteration >= the pool's `since`
+  and `elo_anchor_from`) that has not played an anchor plays it, all of its anchors in one driver
+  (`play_matches` with the anchors' paths; seed 53 + 7919 k), so switching anchors on for a running
+  pool first catches its evaluated checkpoints up (the first evaluation after the switch is that much
+  longer). Recorded in `results.json` like any Elo match (`elo match iter_0200 vs anchor:a192:
+  52.0/100` in the log).
+* **The fits**: the pool's own fit (`elo.fit`, the yardstick at 1000, `ratings.json`, `models/index.json`,
+  `best.pt`) is computed as before over all the pool's games, the anchors' included (free players
+  there, listed with the references). The anchored fit, `elo.fit_fixed(res, fixed)`, is the
+  Bradley-Terry maximum likelihood over the pool's WHOLE results file with the anchors held at their
+  values and every other player free (the yardstick too); its weak Gaussian prior is centred on the
+  anchors' mean. -> `anchored.json` (the anchors and every player's rating), `elo_anchored` {elo, se} in
+  the iteration's metrics (and `evals.jsonl` from a remote), a log line `iter 200 elo anchored 1640 +-38`
+  (+- 1.96 se). A checkpoint's anchored se comes from its anchor games (200 games near 50%: ~25 Elo)
+  and shrinks as later checkpoints play it (the offsets); none of it is a chain to a saturated
+  yardstick. With one anchor `fit_fixed` is `fit` (tested to 1e-6).
+* **Remote evaluation** (`eval_remote`, 5.2): `RemoteEval` puts each anchor once a session to
+  `<mirror>/anchors/<label>.pt` and writes the mirror's config with `label=<that path>`, so the players
+  and the sha256 are the same on both machines; the mirror's `anchored.json` and `elo_anchored` come back
+  with the pool's files. The anchors' calibration and games happen on the remote, as the pool's other
+  matches.
+* **Dropping the yardstick's games**: `--eval-games 0` (the run's `eval_random_games` 0 already). The
+  iteration's `eval_yard` then has 0 games - it still marks the checkpoint evaluated (the pool's
+  `logged`, the remote's `done_iters`) and every Elo match (offsets, anchors) is played: tested. A pool
+  whose older iterations played the yardstick keeps its link to it (the ordinary fit); a fresh run
+  without yardstick games has no ordinary rating link (its `elo` se is the prior's), and the anchored fit
+  does not need one.
+* **Trade-offs**: a later anchor's calibration error (~174 / sqrt(calib games / 4) Elo: 200 games ~25)
+  is frozen with it: a constant offset of the ratings that lean on that anchor, never a trend. Anchors
+  near the line's strength give the most information per game (an anchor scored 90% against teaches
+  little); add a stronger one later (a new label), it is calibrated against the others.
+
+### 20.2 Held-out losses (`heldout_shards`, `zero/heldout.py`)
+
+The cheapest learning signal: a checkpoint's losses on a FIXED set of sample rows no checkpoint trains
+on. `python -m <pkg>.az.heldout make --from runs/x/data/iter_0191 --rows 8192 --out set.npz` draws a
+uniform random subset (fixed seed) of an iteration's self-play rows and writes it as one compressed
+shard (its meta: the source, rows, seed). Iteration i's rows train checkpoints i .. i + window - 1:
+they are held out for every other checkpoint, the run's later ones included.
+
+* **Metrics** (`heldout.losses`), per kind of row: **decision** rows (recorded searches) and **view** rows
+  (value-only samples, section 16): `value_ce` (cross-entropy of the value head against the game's
+  outcome z: the training loss with value_q 0), `value_acc` (rows with one winner: the most likely seat
+  won), `value_brier` (squared error of P(win)); the decisions also `policy_ce` (against the recorded
+  target, decisions with >= 2 options) and `policy_top1` (argmax agreement). `set` names the set (a hash
+  of its shards' names, sizes and rows): numbers are compared across checkpoints on one set (paired
+  rows: their own difficulty cancels), never across sets.
+* **Run settings**: `heldout_shards` (files or directories, comma-separated; '' = off) and
+  `heldout_device` ('' = `train_device`): every evaluated iteration gets `heldout` in its metrics row and
+  a log line (`iter 200 heldout (set 463ad8eefa5c): decision value_ce 0.3812 acc 0.8102 policy_ce ...`),
+  computed in the run process right after training (also with `eval_remote`). The set is loaded once at
+  the start (8,192 MTG rows ~0.6 GB of RAM) and must be of the run's game and encoding (refused
+  otherwise, exit 78); a failure later is logged (`HELDOUT FAILED`), never the run's end.
+* **Reading it**: `value_ce` against z is the clean signal (z is the truth). `policy_ce` against a frozen
+  target set measures agreement with the search that recorded it: it falls towards the checkpoint that
+  generated the set and may rise again after it with no loss of strength - read it as drift, not
+  strength. A checkpoint that trained on the set is contaminated (its value loss falls sharply on rows it
+  saw: below).
+* **Cost**: 2.4 s per checkpoint on the desktop CPU for 8,192 MTG rows (128 x 4 tokens net).
+
+### 20.3 Paired games and sequential head-to-heads (`zero.h2h`, `elo_paired`)
+
+* **Paired games** (docs/search.md 2.10): the driver's `paired` gives games 2k and 2k + 1 every random
+  stream of the pair k (the deal, shuffles and chance, the driver's streams); the match tables swap the
+  seats between them, so each deal is played once from each seat by each side. `zero.h2h --paired`
+  (`match(..., paired=True)`): `pairs` {n, both_won, split, both_lost, with_draw, pentanomial (counts of
+  a pair's points 0, 0.5, 1, 1.5, 2), score, se}; `se` is then the se of the pair scores, `se_games` the
+  games' binomial se (the unpaired formula), `variance_ratio` = var(pair score) / (var(game) / 2), the
+  share of the variance the pairing left (1: none removed; below 1: the deal's variance is gone). The
+  A/B driver's rule `score >= 0.5 + 2 se` reads the paired se unchanged. The run setting `elo_paired` 1
+  plays the run's Elo matches (offsets, anchors, calibration) paired (game counts even; a pair never
+  spans two opponents). The Bradley-Terry fit treats paired games as independent: pairing makes a pair's
+  two results negatively correlated, so its se is then conservative.
+* **Sequential tests** (`zero.h2h.sequential`): `--sprt E0,E1` plays batches of `--batch-games` (default
+  `--games`) until the log-likelihood ratio of H1 (A is E1 Elo better) against H0 (E0) leaves Wald's
+  bounds (ln(beta / (1 - alpha)), ln((1 - beta) / alpha)), `--alpha` / `--beta` 0.05, or `--max-games`
+  (default 4 x `--games`) are played: decision 'H1' | 'H0' | 'undecided'. The LLR is the generalized
+  SPRT's normal approximation over the per-pair scores (or per-game scores unpaired): n (s1 - s0)
+  (2 mean - s0 - s1) / (2 var), s the logistic expected scores - Fishtest's pentanomial GSPRT, the
+  standard for paired, seat-swapped games. `--target-se S`: batches until `se` <= S. Batch b is seeded
+  seed + 7919 b (batch 0 is the plain match), gids continue across batches, the output is over every
+  game plus `batches` (cumulative score, se, llr), `stop`, `sprt`; a progress line per batch goes to
+  stderr.
+* **Why an SPRT** rather than "extend by 600 games when within 1 se of the bar": the fixed bar's error
+  rates are known only for one look (a second look inflates the false positives, by an amount nobody
+  states), and 600 games cannot resolve the effects that matter (20.7: a +20 Elo fork passes the
+  600-game bar about a quarter of the time unpaired, half the time paired). The SPRT states its error
+  rates (alpha, beta at E0, E1; checking after batches only makes it slightly conservative), stops early
+  on clear results (a lopsided fork is decided in its first batch) and spends its games where the effect
+  is small. `--target-se` is there for a plain measurement (an Elo with a stated precision), not for a
+  verdict.
+
+### 20.4 Per-side simulations
+
+`zero.h2h --a-sims` / `--b-sims` (default `--sims`), `match(..., sims_a=, sims_b=)` / `sequential(...)`:
+each side searches with its own budget (`A A --a-sims 128 --b-sims 32`: what more search buys one
+checkpoint); the output names `sims_a`, `sims_b` (MTG Zero's quick checks monkeypatched `games.nn_seat`
+for it before).
+
+### 20.5 The A/B driver (MTG Zero's `runs/ab-r3/ab_driver.py`)
+
+Its `h2h()` builds `python -m mtgz.az.h2h A B --games N --sims 32 --spec S --device cuda --threads 8
+--seed 7 --select cq ...` and adopts the fork at `score >= 0.5 + 2 se` with `score = a_score`, `se =
+se`. With `--paired` alone that rule reads the paired se; with `--sprt` the verdict is `sprt.decision ==
+'H1'` (the driver's own rule should then be replaced by it). MTG Zero's ENGINE.md 73.6 gives the exact
+lines. h2h's `--chance-k` defaults to 2 where a run's evaluation plays the run's `chance_k` (MTG Zero's
+Delver line: 0) - pass it to measure what the run plays (and, on MTG Zero, to avoid the engine panics
+of 20.7).
+
+### 20.6 Off by default; tests and checks
+
+Off (`elo_anchors` '', `elo_paired` 0, `heldout_shards` '', the driver's `paired` False, h2h without the
+new flags): the runs of before, byte for byte - no seat, stream or file changes; config.json gains the
+eight keys; zero.h2h's output gains `elo_se` only.
+
+Tests: Rust `driver::tests::paired_games_share_their_streams` (two seats that search alike, swapped:
+each pair one game twice; unpaired no; pair k = the unpaired game k's streams; an odd last game; the
+golden match unchanged). `tests/test_measure.py` (11): the binding's `paired`; h2h's pairs, se and
+`se_games`, the same network's pairs all split with se 0, per-side sims, odd games refused; the SPRT's
+LLR and bounds; `sequential` (decided in the first batch = the plain match; undecided to `max_games`
+with unique gids; `target_se`; the command line and its errors); `fit_fixed` = `fit` with one anchor,
+recovers ratings with two, the calibration's pairs only; `parse_anchors`; a toy run with two anchors,
+paired Elo matches, the yardstick's games dropped and a held-out set (calibration, anchor games of every
+evaluated checkpoint, `anchored.json` = the metrics, every iteration's `heldout`, the log lines) and then
+another file under a fixed label refused (78); missing anchors / sets refused (78), odd paired games and
+duplicate labels refused; anchors on a `local` remote (shipped under their labels, the mirror's config,
+`evals.jsonl`'s `elo_anchored` = `anchored.json`, the dashboard's merge); the defaults add nothing;
+`heldout.make` / `losses` against `distill.outputs` by hand, the encoding and game guards, value-only
+rows apart, the command line.
+
+Checks: see 20.8.
+
+### 20.7 What it measured on MTG Zero's Delver line (its ENGINE.md 73)
+
+* **Held-out losses** (set: 8,192 rows of `runs/r3-2b-beliefsearch/data/iter_0191`, generated by
+  checkpoint 190; 2.4 s a checkpoint on the CPU): the decision rows' value CE falls 0.393
+  (checkpoint 83) -> 0.384 (188), -0.009 per 100 iterations over the checkpoints that never saw the
+  rows, a checkpoint-to-checkpoint scatter of ~0.003; the value-only rows' does not fall at all. The
+  six checkpoints that trained on the rows fall to 0.319 (196): the value head memorizes the outcomes of
+  the games it trained on (0.065 nats in six iterations, against 0.009 of real progress in a hundred) -
+  a set is only valid for checkpoints that never trained on it. Policy CE falls 0.522 -> 0.360 towards
+  checkpoint 190, the search that recorded the targets: agreement, not strength.
+* **Paired games** (checkpoints 196 vs 188, 32 simulations, the line's evaluation search, `chance_k` 0;
+  five paired batches of 200 games, four on the Mac, one on the desktop): 73% of the 500 pairs split
+  (each side won the same seat's deal), and **var(pair score) = 0.53 x var(game) / 2** (95% bootstrap
+  0.46-0.61): a paired h2h of N games is as precise as an unpaired one of 1.9 N; 600 games: se 0.020 ->
+  0.015, the 2-se bar 0.541 -> 0.530. Simulated with the four Mac batches' 0.54 (8,000 tests a row), the
+  old readout (600 unpaired games, the 2-se bar) adopts a real +20 Elo fork 28% of the time and a null
+  2%; paired + SPRT(0, 20) with batches of 600 and at most 2,400 games adopts +20 90% of the time (1,343
+  games on average), a null 2% (1,354 games, 9% undecided), +30 100% (841 games).
+* **Engine panics** (MTG Zero's, not this section's): three of three 600-game h2h runs of the line's
+  checkpoints 196 and 188 at h2h's default `chance_k` 2 died on a game's panic in a search
+  (deterministic: one reproduces on the desktop), six 200-game batches at `chance_k` 0 (the run's
+  evaluation) none. The driver fails a whole match on one game's panic, so a sequential test multiplies
+  the exposure: pass the run's `--chance-k` (its ENGINE.md 73.8).
+* **Fixed anchors** are not live yet: the main line's relaunch with them (and the held-out set, no
+  yardstick games, paired Elo matches) is its ENGINE.md 73.7; checked end to end on the Mac with a
+  smoke run (20.8).
+
+### 20.8 Checks
+
+Tier "opt-in core feature with byte-identical defaults" (desktop 2026-10-30, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal priority; the orchestrator's checks on the GPU, the Mac at
+nice 19 for the measurements), on ec57c15 (the code; this commit adds documentation only):
+
+* `cargo test --release`: 89 passed (zero_search; webnet 3).
+* `pytest tests`: 302 passed, 3 skipped (CUDA), 13:54 on the loaded CPU.
+* Toy-smoke runs byte for byte against 85459f5 (its own worktree and target, `ZERO_INFLIGHT=1`, 3-4
+  iterations, seed 3), four configurations - classic with `ext:toyheur`, tokens with `elo_together`,
+  rolling with 'cq' targets and the cq2 rule, the Delver line's shape (rolling, 'cq' 0.3, the cq4 rule,
+  `elo_offsets` 1,2, no random games, value_q 0.6, window cache, prefetch, tokens, margin_w 0.2,
+  chance_k 2) - each without the new settings and with all eight given at their defaults: every
+  shard, checkpoint (zip members), optimizer state, Elo file (`updated` aside), models/index.json and
+  the metrics without timings identical; config.json only gains the eight keys.
+* `check_checkpoint_compat --package zero` (random, uniform, a toy checkpoint): identical.
+* MTG Zero (branch `measure`, its ENGINE.md 73.9): `tools/gate.py optin-core` PASSED twice (on main
+  e08bade and after the rebase onto eedbf14: core tests 92, checkpoint_compat byte identity, `--test az`,
+  `--test hidden`, Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder 4202a4a build against this
+  core: GREEN), `check_checkpoint_compat` with the Delver line's checkpoint 196 identical, pytest 62
+  passed; the anchors end to end on the Mac (`eval_remote mac`).

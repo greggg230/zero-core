@@ -181,7 +181,7 @@ Default: no targets (`AUX` empty). The loss of each segment is the game package'
 ```python
 from zero import games as G       # in a game repo: from <pkg>.az import games as G
 drv = G.Driver('toy', seats, spec=None, concurrency=256, seed=0, record=False, threads=4,
-               groups=2, max_steps=100_000, rolling=False, net=0)
+               groups=2, max_steps=100_000, rolling=False, net=0)   # (+ queue_only, move_log, aux, paired: 2.9, 2.5, 1.2, 2.10)
 lb = drv.next_batch()            # LeafBatch (kind 'nn' | 'ext') or None when every game finished
 drv.submit(lb.id, priors, value, margin[, aux])  # network batch (aux: its root belief rows', 3.8)
 drv.submit_external(lb.id, payloads)            # external batch: one str per request
@@ -366,6 +366,21 @@ when fewer setups than slots arrive at once - an evaluation's matches - and no s
 setups wait); a setup's gid is its place in the queue. Co-training's
 resolver driver is one (docs/az.md 11): it plays the episodes of parked games, tagged
 `<gid>/<k>`, with the play network on every seat.
+
+### 2.10 Paired games (`paired`; 2026-10-30)
+
+`paired=True` (`DriverCfg::paired`; default False): games `2k` and `2k + 1` draw every random stream
+from the pair's id `k` - the game's seed (the deal, every shuffle and chance outcome the game draws
+from it), the driver's streams (playout cap, noise, search, the bots' seeds) - where each game draws
+them from its own gid otherwise (`worker::init_slot`: `split64(seed ^ split64(k + 1))` for `k = gid /
+2`). A table whose two games of a pair swap the seats (zero.h2h's and the run's matches: seat `g % 2`)
+then plays each deal once from each seat: two sides that search alike play the same game twice
+(tested: same moves, scores, results). The streams diverge only where the games do: the first move
+that differs consumes the shared streams differently from then on. An odd count's last game plays
+its pair's stream alone. Nothing else changes (no gid, seat or result row is different; rolling and
+queued setups pair by gid too). Off: the streams of before, bit for bit (the golden match). The
+Python reference driver has no pairing. Uses: docs/az.md 20.3 (zero.h2h `--paired`, the run setting
+`elo_paired`).
 
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
