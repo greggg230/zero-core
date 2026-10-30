@@ -30,7 +30,10 @@
       records the network's size (hidden / blocks / heads / ff, or ch). The rest - the window's
       shards, the checkpoints before K for the Elo matches, the metrics - as above, so the fork
       trains on the run's window from iteration K + 1 (an A/B of the network against a plain
-      continuation of the source).
+      continuation of the source). The network's auxiliary head must be what the fork's settings need
+      (`check_heads`, docs/az.md 13.6): with a root belief on (selfplay_ / eval_belief_tilt > 0) the
+      head for the game's targets, else net.HeadMissing - the refusal the run would give at its start
+      (exit 78) -, given before anything is copied, as the encoding guard's.
 """
 import argparse
 import glob
@@ -97,14 +100,34 @@ def net_size(config):
     return {'arch': 'mlp', 'hidden': config['hidden'], 'blocks': config['blocks']}
 
 
-def install_net(dest, it, net, game):
-    """--net: `net` (a checkpoint of this build's encoding for `game`) as the fork's checkpoint `it`; no
-    optimizer state; checkpoint `it`'s Elo results dropped from every pool. -> its size settings."""
+def check_heads(m, settings, game, net):
+    """--net: the network's auxiliary head as the fork's settings need it (docs/az.md 15, 18): with a
+    root belief on (selfplay_ / eval_belief_tilt > 0) the head for the game's targets (`check_belief_head`:
+    net.HeadMissing, the refusal the run itself would give at its start, exit 78); a run that trains
+    auxiliary targets refuses a head for other targets at its first training, so that is refused here
+    too. A network without a head in a run that only trains targets is fine (the run adds a fresh one)."""
+    from .. import games as G
+    from ..net import HeadMissing, aux_layout, check_belief_head
+    from ..run import aux_settings
+    on = [k for k in ('selfplay_belief_tilt', 'eval_belief_tilt') if float(settings.get(k, 0.0) or 0.0) > 0]
+    if on:
+        check_belief_head(m, game, f'{" / ".join(on)} of the fork (--net {net})')
+    _, want = aux_settings(dict(settings, game=game), G.info(game))
+    have = aux_layout(m.config.get('aux'))
+    if want and have and have != aux_layout(want):
+        raise HeadMissing(f'--net {net}: its auxiliary head predicts {have}, the fork trains {aux_layout(want)}')
+
+
+def install_net(dest, it, net, game, settings=None):
+    """--net: `net` (a checkpoint of this build's encoding for `game`, with the auxiliary head the fork's
+    `settings` need: `check_heads`) as the fork's checkpoint `it`; no optimizer state; checkpoint `it`'s
+    Elo results dropped from every pool. -> its size settings."""
     from .. import elo
     from ..net import check_encoding, load, save
     from ..run import model_path
     m, extra = load(net, game=game)
     check_encoding(m.config, game, net)
+    check_heads(m, settings or {}, game, net)
     save(m, model_path(dest, it), dict(extra, iter=it, net_from=os.path.abspath(net)))
     opt = os.path.join(dest, 'models', 'opt_latest.pt')
     if os.path.exists(opt):
@@ -142,6 +165,12 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
             it = min(it, r) if r is not None else None
     if it is None or not os.path.exists(model_path(source, it)):
         raise SystemExit(f'{source}: no checkpoint {it}')
+    settings = dict(cfg, **(overrides or {}))
+    if net:                                        # (refused before anything is copied: the guard, the heads)
+        from ..net import check_encoding, load
+        m, _ = load(net, game=cfg.get('game', 'toy'))
+        check_encoding(m.config, cfg.get('game', 'toy'), net)
+        check_heads(m, settings, cfg.get('game', 'toy'), net)
     if co:
         if not os.path.exists(model_path(rsrc, it)):
             raise SystemExit(f'{rsrc}: no checkpoint {it} (a co-training run forks where both networks have one)')
@@ -152,8 +181,8 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
         _copy_run(rsrc, os.path.join(dest, 'resolver'), it, rcfg, copy)
         if os.path.exists(os.path.join(rsrc, 'config.json')):
             shutil.copy2(os.path.join(rsrc, 'config.json'), os.path.join(dest, 'resolver', 'config.json'))
-    need, dirs, rows = _copy_run(source, dest, it, cfg, copy, settings=dict(cfg, **(overrides or {})))
-    size = install_net(dest, it, net, cfg.get('game', 'toy')) if net else None
+    need, dirs, rows = _copy_run(source, dest, it, cfg, copy, settings=settings)
+    size = install_net(dest, it, net, cfg.get('game', 'toy'), settings) if net else None
     if size:
         cfg.update(size)
     cfg.update(overrides or {})
