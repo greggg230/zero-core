@@ -27,7 +27,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `runctl.py` | PAUSE / STOP files, exit status 75, run / supervisor state files, `PauseWatch` |
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5) |
-| `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`) |
+| `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6) |
 | `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
@@ -1968,7 +1968,7 @@ ever; uneven splits drift apart only slowly, at second order), so the network ke
 capacity until noise, which breaks the exactness, separates them. Distillation has neither problem:
 any size (192 is not 2 x 128), any architecture (an MLP into a token network, tested), a fresh network
 that uses all of its capacity, and the same tool for every game. Its costs are a training phase (MTG
-Zero's 192 x 6: an estimated 35-50 minutes on the desktop GPU, its ENGINE.md 62.6) and a fidelity short of
+Zero's 192 x 6: an estimated 40-55 minutes on the desktop GPU for its main line's window, its ENGINE.md 62.6) and a fidelity short of
 exact, which the held-out agreement and a head-to-head against the teacher measure before a run uses
 the student.
 
@@ -1978,7 +1978,7 @@ the student.
 python tools/distill.py TEACHER.pt OUT.pt --data runs/a/data [--heldout runs/a/data/iter_K/r00_000.npz] \
     --hidden 192 --blocks 6 --heads 6 --ff 384 [--arch tokens] --steps 12000 --batch 512 --lr 1e-3 \
     --warmup 500 --ram-budget-gb 24 --eval-every 1000 --save-every 2000 --keep-best --device cuda \
-    [--resume | --init S.pt]
+    [--aux-w 1 --aux-teacher-w W] [--resume | --init S.pt]
 python tools/distill.py --compare OUT.pt TEACHER.pt --data runs/a/data/iter_K/r00_000.npz   # agreement only
 python tools/fork_run.py --source runs/a --dest runs/a-big --iter K --net OUT.pt [--set ...]
 ```
@@ -1994,8 +1994,16 @@ python tools/fork_run.py --source runs/a --dest runs/a-big --iter K --net OUT.pt
   checkpoint, checked by the encoding guard before it is written; its `extra` records
   `distilled_from`, `teacher_sha256`, `teacher_extra` and `distill` (the settings, both networks'
   sizes, the shards, every held-out agreement).
+* **A teacher with an auxiliary head** (15: MTG Zero's belief) gets a student with the same head,
+  distilled too (`--aux-w`, its term's weight, default 1; `--aux-teacher-w`, the blend of the
+  teacher's predictions with the shards' own targets, default `--teacher-w`); **shards with value-only
+  rows** (16) train the policy on their decision rows only, as the run does; the held-out agreement
+  reports both kinds of row and the head. Both in 13.6; a teacher without a head on shards without
+  value-only rows distils as before, bit for bit.
 * **`fork_run --source --net`**: a continuation (2) of the run at K with the student as its
-  checkpoint K (checked by the guard for the run's game), **without the source's optimizer state**
+  checkpoint K (checked by the guard for the run's game, and its auxiliary head against the fork's
+  settings - with a root belief on, the head for the game's targets: `check_heads`, 13.6 - before
+  anything is copied), **without the source's optimizer state**
   (it belongs to the source's network: the fork's first training starts a fresh AdamW with its
   warm-up), **K's Elo results dropped** from every pool (they rated the source's network;
   ratings.json is refit at the fork's next evaluation) and the network's size in the fork's
@@ -2024,7 +2032,7 @@ python tools/fork_run.py --source runs/a --dest runs/a-big --iter K --net OUT.pt
 
 ### 13.5 Tests and checks
 
-`tests/test_distill.py` (8): `outputs` are the evaluator's answers (several batches, a ragged last
+`tests/test_distill.py` (8; 7 more for 13.6): `outputs` are the evaluator's answers (several batches, a ragged last
 one); a network's agreement with itself is exact and another network's is not; a token and an MLP
 student converge to an MLP teacher on held-out shards; `teacher_w` 0 is the run's supervised loss
 and 1 the teacher's terms (the dense teacher policy sums to 1 over the legal actions only); the tool
@@ -2060,6 +2068,124 @@ docs).
   4202a4a 171 s.
 * MTG Zero (ENGINE.md 62.7): `--test az` 27 passed, pytest 49 (the new distillation test among them),
   the CPU distillation and head-to-heads of 13.4.
+
+### 13.6 Auxiliary heads and value-only rows (MTG Zero's main line `r3-2b-beliefsearch`, 2026-10-29)
+
+**Why.** The tool predates two things MTG Zero's main line now has (its ENGINE.md 62.9): an
+**auxiliary head** (15: the belief over the opponent's hand, `aux_belief_w` 0.25) that its search
+reads (18: `selfplay_belief_tilt` / `eval_belief_tilt` 1, which refuse a checkpoint without the head,
+exit 78), and **value-only rows** (16: `selfplay_view_samples` 0.5, a third of the window's rows). A
+student distilled before had no head - the main line refuses it - and its policy terms were means over
+every row of a batch, the value-only rows' zeros included (a policy weight two thirds of the value's).
+
+**What it does** (`zero/distill.py`, `tools/distill.py`, `tools/fork_run.py`):
+
+* **The student gets the teacher's head** (`new_student(..., aux='teacher')`, the default; `aux=None`:
+  none): the same targets, so a run trains it and a search reads it as it did the teacher's; built
+  after every other parameter (15.2), so the rest is drawn as for a student without one (tested).
+  The tool checks the teacher's head and the student's against the game's targets (names and widths,
+  `net.check_belief_head`) before it trains and before it writes; `--init` from a student without the
+  head gives it a fresh one (`net.add_aux`), one with another head is refused.
+* **The teacher's answers** include the head's predictions (`outputs`: 'aux' [N, W] by
+  `net.aux_predict` - a multinomial's distribution, a poisson's rates, an mse's values - equal to
+  `NetEvaluator.aux`'s answers, tested; the other answers equal the network's without its head) and the
+  window carries the shards' own targets (`Window(aux_width=W)`); `Taught` batches add `taux`.
+* **The loss** adds per target `aux_w` x ((1 - wa) L(the shards' target) + wa L(the teacher's
+  prediction)), L the target's own loss (`auxtarget.losses`; for a multinomial the cross-entropy to a
+  distribution = the KL to it + its entropy), wa = `aux_teacher_w`. The shards' term counts the rows with
+  a target (the run's rule); the teacher's term every row except those whose shard says a multinomial's
+  segment is empty (an empty hand: n x p = 0 whatever p, so the teacher's p there was never trained and
+  means nothing) - including the rows of shards recorded without targets, where the teacher's prediction
+  is the only label. `teacher_w` 0 with `aux_w` = the run's `aux_<name>_w` is `run.train_model`'s loss
+  line for line (tested). Training reports `aux_<name>_t`, `aux_<name>_d` and a multinomial's
+  `aux_<name>_kl` (to the teacher). A student with a head and no teacher's predictions to learn is
+  refused (a head trained on nothing would be a silent no-op).
+* **The defaults, and why.** `aux_teacher_w` = `teacher_w` (1: pure distillation of every head): the
+  teacher's distribution estimates the hand's composition given the public state - the mean of which
+  the one recorded hand is a sample -, a warm start whose searches deal their worlds as the teacher's
+  do lets the head-to-head gate compare the networks rather than two beliefs, and the continued run
+  trains the head on the true hands anyway (`aux_belief_w`, with its whole window). `aux_w` 1: every
+  output's term is then a KL to the teacher (the policy's over the legal actions, the value's, the
+  head's), equally weighted; AdamW scales the head's own parameters alike whatever the weight, so the
+  weight sets the trunk's balance only. Measured on the main line (the CPU evidence below, 2,000 steps
+  into 64 x 2, held-out rows of another iteration):
+
+  | `aux_w` / `aux_teacher_w` | policy KL (decisions) | P(win) sq. error, decision / view rows | belief KL to the teacher | belief CE vs the true hands (the teacher 2.649) |
+  |---|---:|---|---:|---:|
+  | **1 / 1 (the defaults)** | **0.099** | **0.0106 / 0.0097** | **0.026** | 2.663 |
+  | 0.25 / 1 (the run's weight) | 0.098 | 0.0117 / 0.0113 | 0.036 | 2.672 |
+  | 1 / 0.5 | 0.104 | 0.0115 / 0.0107 | 0.054 | 2.631 |
+  | 1 / 0 (the true hands only) | 0.116 | 0.0131 / 0.0121 | 0.252 | 2.735 |
+
+  The run's weight 0.25 keeps the policy no closer (0.098 vs 0.099) and the value and belief further
+  off; the true hands cost policy and value fidelity (their one-sample noise reaches the trunk) and on
+  73k rows overfit (their CE rose after step 1,000); the 0.5 blend's head reads the true hands slightly
+  better than the teacher's (2.631) at twice the KL - a choice for a student meant to improve on its
+  teacher's belief, not for a warm start.
+* **Value-only rows** (`losses(view=True)`): the policy terms and the teacher's entropy are means over
+  each batch's decision rows (rows with options), the value, margin and auxiliary terms over every row -
+  `run.train_model`'s mask; `distill` decides from the window (`np.diff(W.opt_off) == 0`, `view_rows`),
+  as the run does. Their value and margin distillation is the teacher's answers on the viewer's row.
+* **Agreement**: with value-only rows in the held-out window also 'decision' and 'view' - each kind's
+  rows, P(win) squared and absolute difference, margin squared difference, each network's value
+  cross-entropy and accuracy against z -; with a head 'aux' per target - a multinomial's KL(teacher ||
+  student) over the teacher's rows (mean, p90, per kind of row), top-1 agreement, and each network's
+  cross-entropy and `hit` against the shards' targets (the run's `train.aux_<name>` / `_hit`); another
+  loss: the squared difference and each one's loss. The keys of before are unchanged (the policy over
+  the decisions with 2+ options, P(win) over every row). `--compare` reports the head when both networks
+  have the same one. `--keep-best` still keeps the lowest held-out policy KL.
+* **RAM**: the window's budget counts 6 W + 1 bytes more a row with a head - the targets and their mask
+  as the run's window holds them, the teacher's predictions in float32 (MTG's 1,024: +6.1 KB on a
+  75.5 KB row, 8%).
+* **`fork_run --net`** checks the network's head against the fork's settings (source config + `--set`)
+  before anything is copied (`check_heads`): with a root belief on, the head for the game's targets
+  (`net.HeadMissing`, the run's own refusal at its start); a head for other targets than the run trains,
+  refused (its first training would refuse it); no head where the run only trains targets, accepted
+  (the run adds one, 15.4). The encoding guard's refusal now also comes before the copy.
+* **The start log** gains `train_view_rows`, `heldout_view_rows` (with value-only rows), `aux`,
+  `train_aux_rows`, `heldout_aux_rows`, `aux_w`, `aux_teacher_w` (with a head); the record's settings
+  gain `aux_w` and `aux_teacher_w`.
+
+**Off: the distillation of before.** A teacher without a head on shards without value-only rows: the
+forward pass without `aux`, the policy means `.mean()` as before, no new batch keys, terms or log keys.
+Checked byte for byte (the record's `settings` aside, which gains the two flags): the tool on toy shards
+(a token student with `--keep-best`, an MLP student at `teacher_w` 0.5, `--compare`, a toy run
+distilled and continued with `fork_run --net` one iteration) on main 2f0a2e8 (its own worktree,
+`E:/zero-scratch/distill2/base-2f0a2e8`) and on this branch: 16 checkpoints (configs and tensors), 9 shards and 4 logs
+identical (the teacher's file sha256 aside: torch writes a new serialization id with every save); and
+MTG Zero's delver2 iteration 71 (no head, no value-only rows) into a 32 x 1 token and a 32 x 1 MLP
+student (a 0.3 GB budget: 3,971 of 8,202 rows), `--compare`: identical (its ENGINE.md 62.9).
+
+**Tests** (`tests/test_distill.py`, 7 more, 15 in all): the toy's aux shards (targets, empty targets,
+value-only rows); `outputs` with a head = `NetEvaluator.aux`, the rest = the network without it; the
+student gets the head, built last; value-only rows: the policy terms over the decisions (the old ones
+the diluted mean), the other terms unchanged; `teacher_w` 0 = `run.train_model`'s loss with the head and
+value-only rows, `teacher_w` 1 the teacher's terms on the rows of `teacher_aux_rows`, the blend, the KL;
+a token student converges to an MLP teacher's head and to both kinds of row, a head without the
+teacher's predictions or the window's targets refused; the tool on a toy run with the target, root-view
+leaves, value-only samples and the belief in self-play: the student has the head and passes
+`check_belief_head`, its record and log, `fork_run --net` accepts it, the fork self-plays with the
+belief and trains it (head kept), `--init` from a student without the head adds it, a network without
+the head refused for the belief run (nothing copied) and accepted by a fork without it.
+
+**Measured on MTG Zero** (its ENGINE.md 62.9, CPU): the main line's checkpoint 91 (128 x 4 with the
+belief head) into a 64 x 2 student, 2,000 steps of 256 rows on 73,454 rows of iterations 89-90 (24,411
+of them value-only), held out 4,096 rows of iteration 91 (1,312 value-only): policy KL 0.571 -> 0.099,
+P(win) squared error 0.124 -> 0.0106 (decision rows) and 0.135 -> 0.0097 (value-only rows), the belief's
+KL 4.29 -> 0.026 (its CE against the true hands 6.93 -> 2.663, the teacher's 2.649); `fork_run --net`
+into a copy of the main line, two CPU iterations with the run's settings (belief tilt 1, mix 0.25,
+root-view leaves, value-only samples 0.5, belief weight 0.25): self-play with the belief, the head
+trained; the 192 x 6 student builds with the head (3,766,493 parameters) and passes the guard and the
+belief's check.
+
+**Checks** (tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal; MTG Zero's round-3 Gumbel test live on the GPU and the Mac):
+nothing on the run path changed (`run.py`, `net.py`, `data.py`, `infer.py`, the Rust crates untouched;
+the diff: `distill.py`, `tools/distill.py`, `tools/fork_run.py`, the tests, these docs). `cargo build
+--release --workspace` (26 s, its own target dir); `pytest tests` **291 passed**, 3 skipped (the CUDA
+tests; 12 min 38 s; the 15 of `test_distill.py` among them); the goldens above. MTG Zero (its ENGINE.md
+62.9): `tools/gate.py python` passed (pytest 59, the new Delver distillation test among them; the
+run-loop smoke).
 
 ## 14. The self-play league (`zero/league.py`; MTG Zero's Delver mirror, 2026-10-29)
 
