@@ -124,6 +124,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_select_c_visit`, `selfplay_select_c_scale` | unset (None) | the same for `selfplay_select` 'cq' (self-play's moves after `temp_moves`, remote self-play too: its checkout must have the setting); the recorded targets keep `cq_c_visit` / `cq_c_scale` whatever these are |
 | `selfplay_root_min_visits`, `eval_root_min_visits`, `root_min_visits_max_actions` | 0, 0, 4 | root minimum visits ("forced playouts", docs/search.md 3.5, section 9.2): a full search whose root has 2 .. `root_min_visits_max_actions` options gives each at least k visits when its budget allows (2 x options x k <= its simulations): the self-play seat's recorded searches (never its fast or minor ones) / every evaluation seat. The forced walks come out of the same budget and are left out of the visit counts (the 'visits' target, temperature sampling, the 'visits' rule) and of the root value target; Q, the 'cq' target and the 'cq' rule use them. The evaluation's floor names its Elo pool (`visits-f4`, `cq-n4-v50-s0.3-f4`; `-f4a6` with max_actions 6), self-play's does not. 0 = off: today's searches bit for bit |
 | `selfplay_leaf_value_view`, `eval_leaf_value_view` | mover, mover | whose view a search leaf's value comes from (docs/search.md 3.6, section 16): 'mover' = the network on the leaf's decider's view (today's searches bit for bit); 'root' = a leaf of another seat than the root decider also sends a value-only row of the root decider's view of the same sampled state (same batch, flagged `ROW_VALUE`), whose value and margin it takes (the priors stay the decider's). The self-play seat (remote self-play too: its checkout must have this core) / every evaluation seat; the evaluation's names its Elo pool (`-rv`), self-play's does not |
+| `selfplay_belief_tilt`, `eval_belief_tilt` | 0.0, 0.0 | the root's belief (docs/search.md 3.8, section 18): a full search of the seat asks the network's auxiliary head once for the root's prediction of the hidden cards (one `ROW_BELIEF` row of the root's features) and deals every simulation's world by it (the game's `determinize_with`, weights clip((belief / uniform)^tilt, 1/belief_clip, belief_clip)). The self-play seat (a league opponent's too; remote self-play: a checkout without it is refused at its hello, 18.5) / every evaluation seat (its Elo pool's name gets `-b<tilt>`). Needs a checkpoint with the auxiliary head: one without is refused (`net.HeadMissing`, exit 78; 18.3). 0 = off |
+| `belief_clip`, `belief_mix`, `belief_fast` | 20.0, 0.0, 0 | the belief's clip R (every weight in [1/R, R]), the share of a belief search's simulations still dealt uniformly ([0, 1)), and whether fast and minor searches take it too (section 18) |
 | `selfplay_view_samples`, `view_sample_target` | 0.0, next_q | value-only samples (section 16): this share of self-play's recorded decisions also records the real state from each other recording seat's view - its perspective, no options (no policy loss), z its result - with q = that seat's next search's root value ('next_q'; z if none) or z ('z'). 0 = off |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
@@ -174,7 +176,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'), `elo` (`select`: its pool unless 'visits'), `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
@@ -2511,3 +2513,166 @@ cannot short-circuit the wait for a new one), tolerates a torn read of `progress
 last good reading instead of resetting to `{}`), and fails immediately with the run's own output
 if the subprocess has already exited, rather than spinning out the rest of the window on a run
 that is never coming back.
+
+## 18. The root's belief: belief-weighted determinization (MTG Zero's Delver mirror, 2026-10-29)
+
+### 18.1 Why
+
+The search deals the hidden information uniformly (docs/search.md 3): every simulation a fresh world,
+every world consistent with what the root decider has seen equally likely. An auxiliary head (section
+15) can know better: MTG Zero's belief head predicts the opponent's hand from public information at 2.28
+nats per card against the uniform deal's 2.81 on held-out Delver positions, and reads "they passed with
+blue open: Force of Will" (its ENGINE.md 66). The root's belief deals the search's worlds from that
+prediction - the design of MTG Zero's ENGINE.md 66.8, built here and in its ENGINE.md 69.
+
+### 18.2 What it does (docs/search.md 3.8)
+
+* **Settings**: `selfplay_belief_tilt` (the self-play seat - a league opponent's too, being the
+  self-play seat), `eval_belief_tilt` (every evaluation seat), `belief_clip` (R, default 20),
+  `belief_mix` (the share of a belief search's simulations still dealt uniformly, in [0, 1)),
+  `belief_fast` (0: full searches only - every evaluation search, self-play's recorded ones; 1: fast and
+  minor searches too). Seat keys `belief_tilt` / `belief_clip` / `belief_mix` / `belief_fast`, only when
+  the tilt is > 0 (`games.nn_seat`, `run.belief_keys`).
+* **One row per search**: a search that takes it sends the root's own features (the decider's view) as a
+  `ROW_BELIEF` row - with the fresh root's first leaf row, or alone for a reused root (its simulations
+  wait one round trip) -, the evaluator answers that row's auxiliary predictions (`aux`, the fourth item
+  of `NetEvaluator`'s answer: the head on those rows only), and every simulation of the search deals its
+  world with the game's `determinize_with` at the seat's tilt and clip. A belief is one decision's: a
+  reused tree's (and a new network's search, a rolling epoch's) asks again.
+* **The game's weights** (its `determinize_with`): MTG Zero, its ENGINE.md 69.2: per card identity of the
+  opponent's hidden pool, the belief's expected count among the hand's unknown cards against the uniform
+  deal's, to the tilt, clipped; the hand's unknown slots drawn one at a time by those weights; every
+  constraint of `determinize` kept. A game without one ignores the belief (the default `determinize_with`);
+  the driver refuses `belief_tilt` for a game without `AUX` (nothing to predict).
+* **Evaluation and tools**: `eval_belief_tilt` names the Elo pool (`mcts.belief_tag`: `visits-b1`,
+  `cq-n4-v50-s0.3-b0.5m0.25`, after a view: `-rv-b1`); `zero.h2h` and `zero.replay` follow a run's
+  evaluation belief (its config.json), `zero.h2h --a-belief-tilt / --b-belief-tilt` (0 = uniform) and
+  `--*-belief-clip / -mix / -fast` override it per side: `A A --a-belief-tilt 1 --b-belief-tilt 0` is
+  the evaluation-only A/B on one checkpoint. Self-play's metrics gain `selfplay.belief` (`rows`: belief
+  rows its driver sent, `per_decision`) when its tilt is on.
+
+### 18.3 Off by default; a network without the head is refused
+
+With every tilt 0 (the default) nothing changes: no seat key, no row, no draw (`Tree::set_belief` is
+never called; the golden records and match, toy runs byte for byte: 18.7). config.json gains the five
+keys.
+
+**A checkpoint without the auxiliary head cannot serve a tilt > 0, and the run refuses it** - it does not
+fall back to the uniform deal with a warning. The choice, against MTG Zero's rule that a step which
+silently does nothing is a bug (memory `feedback_silent_noop_pipelines`): a run (or an A/B arm, or an h2h
+side) asked for belief-weighted searches that quietly dealt uniformly would report a result - "the belief
+does not help" - for an experiment that never happened, the false success the rule exists to prevent, and a
+warning in a log of thousands of lines is no defence (the shards, metrics and Elo would look the same).
+The cost of refusing is small and visible: the run stops at start with the reason. So:
+
+* the run checks its newest checkpoint at start (`Run.check_belief_heads`: `net.check_belief_head`, the
+  head for exactly the game's targets) and refuses with `net.HeadMissing` - an `EncodingMismatch`, so the
+  refusal paths of the encoding guard (section 10.4) apply: exit status 78, state `refused`, the
+  supervisor does not restart it; a fresh run gets the head from `aux_<name>_w` > 0 (an untrained head
+  predicts uniformly over the identities: the clip makes that deal about uniform);
+* a league opponent's checkpoint (`league.load_into`) is checked the same way when the self-play tilt is on;
+* `NetEvaluator` raises `HeadMissing` for a batch with belief rows and no head (every other path: h2h,
+  replays, remote evaluation, a remote worker); `zero.h2h` checks both sides before the first game;
+* the driver refuses an answer without the belief rows' `aux` (`UniformEvaluator`, a custom evaluator).
+
+### 18.4 Interactions
+
+* **Tree reuse**: kept; the belief is recomputed per decision (`Tree::advance` clears it; the reused root
+  sends its row alone and waits). The reused subtree's statistics were dealt by the previous decision's
+  belief - as a reused tree's always came from an earlier information set.
+* **Fast and minor searches**: no belief unless `belief_fast` (they record nothing; one row is 1/16 or 1/4
+  of their leaves).
+* **Root-view leaf values** (section 16): independent; both extra row kinds share the batches.
+* **Root minimum visits, the move rules, cq targets**: untouched (the belief changes the worlds only).
+* **The league** (section 14): the opponent's seat is the self-play seat and takes the belief; its pool's
+  checkpoints need the head (refused otherwise): a `selfplay_league_pool` reaching back before the head
+  was trained must be narrowed.
+* **Rolling self-play**: a new network restarts every search and its belief; a phase's end drops a pending
+  belief row as it drops leaves (asked again next phase).
+* **Remote self-play** (section 5.3): 18.5. **Remote evaluation** (5.2): the mirror's config.json carries
+  `eval_belief_tilt`; the result's rule name must carry the belief tag, so an older checkout (no tag) is
+  refused before anything is recorded, as for the move rule; its checkpoints need the head there too.
+* **Co-training**: the resolver's own settings (`resolver_cfg`) as any.
+
+### 18.5 Remote self-play: an older checkout is refused, not silent
+
+A remote worker builds its seat from the run's config.json with its own checkout's code: an older
+checkout would read no belief setting and deal uniformly, its shards indistinguishable. So the worker's
+hello reports its self-play seat's belief keys (`remoteplay._belief_of`), and the run compares them with
+its own: a worker without them (an older checkout) or reading them otherwise is killed at its hello and
+retried every 10 minutes (log `worker K REFUSED: its checkout plays the root belief as ...`); this machine
+plays every game meanwhile (`tests/test_belief.py::test_remote_selfplay_refuses_a_checkout_without_the_belief`).
+MTG Zero's Mac checkout is the run's commit anyway (its `RunCommitRemote`). (The same gap exists for any
+seat setting a remote worker reads from config.json - root-view values', section 16.4, say an older
+checkout "refuses an unknown seat key", which holds for shipped seat dicts, not for config.json; the
+commit-pinned checkout is what protects them.)
+
+### 18.6 Costs
+
+* **Inference**: one extra row per search that takes the belief (1/sims of its leaves: +3% at 32
+  simulations, +1.6% at 64) and the head on those rows; a reused root's search waits one batch round trip
+  for it. MTG Zero's Delver network on the desktop CPU (64 games, 4 torch + 4 search threads, the arms
+  interleaved over 4 rounds on a shared machine, its ENGINE.md 69.6): evaluation seats at 32 simulations
+  1,402 -> 1,304 leaves/s, the paired ratio 0.929 +- 0.019 (0.032 belief rows per leaf: the rows and the
+  reused roots' waits, ~3% each); the line's self-play seat (64 / 16, p_full 0.25, minor 4) 0.974 +- 0.034
+  (0.0094 rows per leaf - only the full searches take it).
+* **The deal**: the game's (MTG Zero: the weights and weighted draws over <= 64 hidden cards, 6 us a call
+  against `determinize`'s 1 us - every simulation deals, nothing beside its leaf's evaluation).
+* **Training**: unchanged (stage 1's target and head, section 15).
+
+### 18.7 Tests and checks
+
+Rust (`zero_search`, 11 new): `belief_weight_formula`, `a_belief_deals_the_worlds_by_its_weights` (the
+toy's next card: uniform 1/k, a sharp belief, the clip, the uniform share), `no_belief_is_the_tree_of_before_and_advance_clears_it`,
+`without_redet_the_belief_deals_the_decisions_one_world_again`, `belief_off_is_the_search_of_before` (the
+golden records and match with the settings given), `belief_settings_are_checked`,
+`one_belief_row_per_search_that_takes_it` (the layout; rows = full searches; `belief_fast`; evaluation
+seats), `an_evaluator_without_the_belief_stops_the_driver`, `the_belief_deals_the_searches_worlds`
+(HiddenMull: the analytic shift of seat 1's root value, with and without redet),
+`root_view_values_and_the_belief_share_the_batches`, `rolling_phases_ask_the_belief_again_of_a_new_network`.
+`tests/test_belief.py` (11): settings and names (the pool), the toy's deal at its odds, Rust vs Python trees
+at the noise floor with a power check (`parity.belief`), the three drivers' rows answered by the head,
+`HeadMissing` and the drivers' refusal, the Python tree's uniform share, `zero.h2h`'s sides and flags, toy
+runs (off byte for byte, self-play and evaluation on, a run without the head refused with exit 78), remote
+self-play refusing a checkout without it.
+
+Checks (tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal; A/B round 3 live on the GPU and the Mac), on main 3b5134d:
+`cargo test --release --workspace` 77 + 3 passed; `pytest tests` 268 passed, 2 skipped (the CUDA graph-runner
+test deselected: no visible device), and one `test_a_dying_worker_gives_its_accepted_games_back` failed once
+under the shared machine's load (30 games of the dying worker not played again: a timing race of the quota) - it
+passes alone on this branch and on 3b5134d, and `tests/test_remoteplay.py` passes whole (27);
+`python -m zero.parity belief` (docs/search.md 6: Rust-Python at the noise floor, the belief's effect 10x it);
+toy-smoke runs byte for byte against 3b5134d (its own worktree and target, `ZERO_INFLIGHT=1`), the settings left
+out and given at their defaults - classic MLP against `ext:toyheur`, classic tokens, rolling with cq targets and
+`eval_select cq` guard 2, the Delver line's shape (rolling, cq 0.3, guard 4 at 0.3, raw Elo offsets, no random
+games, value_q 0.6, window_cache, train_prefetch, tokens, margin_w 0.2, chance_k 2): every shard, checkpoint (zip
+members), optimizer state, Elo file (`updated` aside), models/index.json, the metrics without timings identical
+(12-14 files a run), config.json = the base's + the five keys; `check_checkpoint_compat --package zero` (random,
+uniform, a toy MLP and a toy token checkpoint): identical; `smoke_all.sh --with-this-core --build-only`: Glass
+Road Zero c1f56dc (47 s), Caverna Zero a6fad73 (54 s) and Kingdom Builder Zero 4202a4a (78 s) build against it.
+MTG Zero (branch `belief-search`, its ENGINE.md 69): its suites, behaviour digests unchanged,
+`check_checkpoint_compat --package mtgz` identical, the weighted-deal fuzz.
+
+### 18.8 What it measured on MTG Zero (its ENGINE.md 69)
+
+On the Delver mirror with stage 1's two networks (desktop CPU, 2026-10-29): jt, delver2's iteration 41
+fine-tuned jointly with the head, and ho, the head fitted on the frozen iteration 41.
+
+* **The deal against the true hand** (2,412 positions of a network's games against itself, 200 worlds each):
+  the cards misplaced by the worlds' mean hand 2.84 uniform -> 2.64 / 2.54 / 2.52 at tilt 0.5 / 1 / 2; the
+  cross-entropy per true card 2.78 -> 2.62 / 2.68 / 3.04 (tilt 2 overconfident: 97 distinct hands of 200
+  instead of 151). Mostly base rates the uniform deal gets wrong: the opponent holds Force of Will in 60% of
+  the positions, the uniform deal gives it one in 30%, tilt 1 in 54%; discrimination within a stratum is
+  modest.
+* **Decisions**: at 64 simulations the move of 40 threat-casting decisions into open mana changed at 1; the
+  threat's Q fell where the head expected a counter (Murktide Regent into an expected Daze 0.58 -> 0.47).
+* **Head to head** (the same checkpoint, A belief-weighted against B uniform, 32 simulations, 300 games an
+  arm, the line's rule): a null arm (both uniform) 0.517 +- 0.029; jt at tilt 1 0.567 under mover-view and
+  under root-view leaf values, tilt 1 with mix 0.25 0.512 / 0.557, tilt 0.5 0.517 - jt's five belief arms
+  pooled 0.544 +- 0.013 (+3.4 se, about +30 Elo), the settings not separable at this size; ho at tilt 1 0.500.
+* **Cost**: 3-7% of an evaluation's leaves per second, 1-3% of self-play's (section 18.6).
+
+The A/B (its ENGINE.md 69.9): evaluation only first (the same checkpoint both sides, the round's h2h), then a
+self-play arm (`selfplay_belief_tilt=1`, `eval_belief_tilt=1`, `belief_mix=0.25`, `aux_belief_w=0.25`) once
+the main line has a trained head.

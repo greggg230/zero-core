@@ -56,6 +56,7 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn margin(&self, seat: usize) -> f32;                           // aux target: (score - best other), scaled O(1)
     fn score(&self, seat: usize) -> f32;                            // reports only
     fn determinize(&mut self, viewer: usize, rng: &mut Rng);        // resample everything hidden from viewer
+    fn determinize_with(&mut self, viewer: usize, rng: &mut Rng, belief: &Belief) { determinize } // dealt by a belief (3.8)
     fn encode(&self, viewer: usize, out: &mut [f32]);               // out is zeroed by the caller
     fn rounds(&self) -> u32 { 0 }                                   // reports
     fn minor_decision(&self) -> bool { false }                      // the pending decision is minor (sims_minor)
@@ -182,7 +183,7 @@ from zero import games as G       # in a game repo: from <pkg>.az import games a
 drv = G.Driver('toy', seats, spec=None, concurrency=256, seed=0, record=False, threads=4,
                groups=2, max_steps=100_000, rolling=False, net=0)
 lb = drv.next_batch()            # LeafBatch (kind 'nn' | 'ext') or None when every game finished
-drv.submit(lb.id, priors, value, margin)        # network batch
+drv.submit(lb.id, priors, value, margin[, aux])  # network batch (aux: its root belief rows', 3.8)
 drv.submit_external(lb.id, payloads)            # external batch: one str per request
 drv.take_results(); drv.take_samples(); drv.stats(); drv.in_flight()
 drv.resume(quota, net); drv.end_phase(); drv.paused; drv.finished; drv.keys
@@ -201,7 +202,7 @@ One list of seat dicts per game (players = its length):
 `{'key': 'm', 'sims', 'c_puct', 'selfplay', 'alpha', 'eps', 'temp_moves', 'sims_fast',
 'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale',
 'select', 'select_min_visits', 'record', 'root_min_visits', 'root_min_visits_max_actions',
-'leaf_value_view', 'view_samples', 'view_sample_target'}`
+'leaf_value_view', 'view_samples', 'view_sample_target', 'belief_tilt', 'belief_clip', 'belief_mix', 'belief_fast'}`
 (`games.nn_seat`; `policy_target` only matters for recorded decisions, section 3.1; `select` and its
 guard for the moves the seat does not sample, section 3.3; `cq_c_visit` / `cq_c_scale` are the
 completed-Q transform of both; `record` false - absent: true - a self-play seat whose full searches
@@ -209,7 +210,8 @@ are not recorded: it searches, samples its moves and draws its playout cap exact
 seat, so its games are the same move for move, and emits no records; zero's self-play league,
 docs/az.md 14, puts a past checkpoint there; `root_min_visits` the floor of its full searches' root
 visits, section 3.5; `leaf_value_view` whose view its leaves' values come from, `view_samples` /
-`view_sample_target` its value-only samples, section 3.6). Evaluator keys: every distinct
+`view_sample_target` its value-only samples, section 3.6; `belief_tilt`, `belief_clip`, `belief_mix`,
+`belief_fast` the root's belief of its searches, section 3.8). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
 
@@ -221,12 +223,13 @@ key one external player. A key cannot be both.
 | `opt_off` | i32 [B+1] | leaf b's legal actions = `opt_action[opt_off[b]:opt_off[b+1]]` (>= 2; none at a deferred terminal, 3.2) |
 | `opt_action` | i32 [sum] | global action ids in the game's order |
 | `player`, `n_players`, `gid` | i32, i32, i64 [B] | decider (absolute), players, game index |
-| `extra` | u8 [B] | the row's kind: `ROW_LEAF` (0) a leaf's own row, else an extra row of the closest leaf row before it (same game): `ROW_VALUE` (1) its tree viewer's value-only row (no options; root-view leaf values, section 3.6). Evaluators may ignore it |
+| `extra` | u8 [B] | the row's kind: `ROW_LEAF` (0) a leaf's own row, else an extra row of the closest leaf row before it (same game): `ROW_VALUE` (1) its tree viewer's value-only row (no options; root-view leaf values, section 3.6); `ROW_BELIEF` (2) a search's root belief row (no options, `player` the root decider: the root's features, whose auxiliary output the driver reads; after the fresh root's own leaf row, or its game's only row - section 3.8). Evaluators may ignore it - but for `ROW_BELIEF` rows, whose `aux` the answer must carry |
 
 Answer: `priors` f32 [sum] (softmax over each leaf's legal actions), `value` f32 [B, 8] =
 P(win) per seat **relative to the decider** (column j = seat (player + j) % n; columns >= n
-are 0), `margin` f32 [B, 8] (same order). `NetEvaluator` does the gather + segment softmax on
-the device. A row with an empty option segment is a deferred terminal's leaf: its value and
+are 0), `margin` f32 [B, 8] (same order); with `ROW_BELIEF` rows also `aux` f32 [belief rows,
+aux_width]: the network's auxiliary predictions of those rows (section 3.8). `NetEvaluator` does the
+gather + segment softmax on the device. A row with an empty option segment is a deferred terminal's leaf: its value and
 margin are used, it has no priors (`NetEvaluator`, the CUDA-graph path and `UniformEvaluator`
 handle empty segments; `protocol.validate_batch` allows 0 or >= 2 options).
 
@@ -673,6 +676,105 @@ features or None; `SearchTree.viewer`; the module's `view_pick`); Python `mcts.p
 `PyDriver._leaf_batches`, `view_pick`), `replay.py`, `parity.root_view`. Tests:
 `driver::tests::leaf_view_*`, `root_view_*`, `value_only_*`, `tests/test_root_view.py`.
 
+### 3.8 The root's belief: belief-weighted determinization (`belief_tilt`; 2026-10-29)
+
+**Why.** Every simulation deals the hidden information again (`determinize`): uniformly over the
+worlds consistent with what the root decider has seen, so a card the opponent would have played by
+now is as likely in its hand as one it would hold. MTG Zero's belief head (an auxiliary target, docs/az.md
+15; its ENGINE.md 66) predicts the opponent's hand from public information better than that deal (2.28
+against 2.81 nats per card on held-out Delver positions; Force of Will held with open mana 2.7 times the
+uniform deal's rate). Here the search deals its worlds from that prediction instead.
+
+**The hook** (`game.rs`). `SearchGame::determinize_with(viewer, rng, &Belief)` - `determinize` with the
+hidden cards drawn by weights from the belief, every constraint of `determinize` kept; default:
+`determinize` (a game without it searches as before). `Belief { pred, tilt, clip }`: `pred` = the
+network's predictions of the game's `AUX` targets for the root decider (`aux_width()` floats in `AUX`
+order: a multinomial segment's distribution, `zero.net.aux_predict`), `tilt` alpha > 0, `clip` R >= 1.
+`game::belief_weight(pred, uniform, tilt, clip)` = clip((max(pred, 0) / max(uniform, eps))^tilt, 1/R, R)
+is the shared weight of one category of hidden cards: the belief's expected count of it among the cards
+the deal draws against the uniform deal's. Tilt 1 deals the belief's expected counts to first order, 0
+would be today's deal (never set: a tree without a belief deals uniformly), the clip keeps every card
+possible (no world rarer than 1/R of today's odds per card).
+
+**The tree** (`tree.rs`). `Tree::set_belief(Some(b), mix, live, rng)`: from now on every simulation deals
+its world with `determinize_with`, a `mix` share in [0, 1) with `determinize` (one `rng.unit()` draw per
+simulation when 0 < mix); without `redet` the one world of the decision is dealt again from `live` with
+it. `None` (the default; `reset` and `advance` clear it: a belief is one decision's prediction) is the
+tree of before bit for bit - no draw changes.
+
+**The driver** (`driver.rs`, `driver/worker.rs`). A search takes the belief when its seat's `belief_tilt`
+> 0 and it is a full search (`NnSeat::takes_belief`: every search of an evaluation seat, a self-play
+seat's recorded ones; every one with `belief_fast`). It asks the network once, with the root's own
+features - `encode(decider)` of the live decision: the decider's view, the same in every world - as a
+`ROW_BELIEF` row (2.2):
+
+* **a fresh root** (no tree, or a new search epoch): the row follows the root's own leaf row in the
+  search's first batch (its first simulation's leaf is the root itself, whose features do not depend on
+  the world it dealt) - no extra round trip;
+* **a reused root** (tree reuse, 3): the row alone; the search's simulations wait for it (one batch round
+  trip of that game; its group's other games go on).
+
+The answer's auxiliary output of that row becomes the tree's belief (`set_belief`, the seat's tilt, clip
+and mix). `Driver::submit_aux(id, priors, value, margin, aux)` (Python `drv.submit(id, priors, value,
+margin, aux)`) takes `aux` = [belief rows x aux_width] in row order; a batch with belief rows answered
+without them, with the wrong width or with a non-finite or negative value is an error - an evaluator that
+cannot compute the belief never leaves the search dealing uniformly in silence. `NetEvaluator` answers
+them from the auxiliary head (the head on those rows only, in the same forward pass; a fourth item of its
+answer; such a batch skips the CUDA graphs) and raises `net.HeadMissing` for a network without one;
+`UniformEvaluator` has none (the driver's error). `stats()['belief_rows']` counts the rows. **Rolling
+epochs** (2.6): a belief asked of the old network is asked again of the new one (the restarted search's
+tree has none); a phase's dropped batches drop a pending belief row too (asked again next phase).
+**Root-view leaf values** (3.6) are independent: both extra kinds ride in the same batches (a fresh
+root's leaf is the viewer's own: no value-only row there).
+
+**Leaks.** The belief comes from the root decider's own features, never from the true state, and the game
+maps it to weights from what the root decider knows (its own information, public facts, the hidden pool's
+multiset as it knows it): worlds that differ only in the cards it cannot see must deal by the same
+weights. A game tests it (MTG Zero: `deal_weights_ignore_the_opponents_hidden_cards` in its tests/hidden.rs,
+`the_belief_weights_ignore_the_opponents_hidden_cards` in tests/az.rs, its ENGINE.md 69).
+
+**Which searches, and why not fast ones by default.** Fast (`sims_fast`) and minor (`sims_minor`)
+searches record nothing and are small: one more row is 1/16 or 1/4 of their leaves (1/64 of a full
+search's), and a search too small to look deep gains little from better-dealt worlds. `belief_fast` turns
+them on.
+
+**Cost.** One extra network row per search that takes the belief - 1/sims of its leaves: +1.6% at 64
+simulations, +3% at 32 - and the head on those rows only; a reused root waits one batch round trip. The
+weighted deal is the game's (MTG Zero's: 6 us a call against `determinize`'s 1 us, nothing beside a leaf's
+evaluation). Measured on MTG Zero's Delver network (docs/az.md 18.6): 3-7% of an evaluation seat's leaves
+per second at 32 simulations, 1-3% of the self-play seat's.
+
+**The test games' deals.** The toy (`toy.rs`): the next round's card - its `next_card` target - drawn
+among the unrevealed cards of its stage with `belief_weight(p_c, 1 / cards, tilt, clip)`, the rest as
+`determinize`. `mull_game::HiddenMull` (`AUX` "hand" [bad, good]): the other seat's hand good with
+probability q w_good / (q w_good + (1 - q) w_bad), q the uniform deal's (1/2, 3/4 after its mulligan).
+
+**Settings.** Seat keys `belief_tilt` (0 = off, the default), `belief_clip` (20), `belief_mix` (0; in
+[0, 1): 1 would make the tilt a no-op and is refused), `belief_fast` (false); run settings
+`selfplay_belief_tilt`, `eval_belief_tilt`, `belief_clip`, `belief_mix`, `belief_fast` (docs/az.md 18). An
+evaluation's moves change with it: its Elo pool's name gets `mcts.belief_tag`'s suffix (`-b1`,
+`-b0.5c10m0.25f`).
+
+**Measured.** HiddenMull (`driver::tests::the_belief_deals_the_searches_worlds`, 300 games, 64
+simulations): seat 1's root value after seat 0 kept is 0.5243 with uniform worlds, 0.5233 with a belief
+equal to the uniform deal (0.5 / 0.5) and 0.4046 with "seat 0's hand is good with 0.9" - a shift of
+-0.1197 against the analytic -0.3 x (0.9 - 0.5) x 63 / 64 = -0.1181. The toy (`tree::tests::
+a_belief_deals_the_worlds_by_its_weights`): a sharp belief deals its card in > 98% of the worlds, the clip
+2 and the uniform share 0.5 exactly their odds. Parity: section 6.
+
+Code: `game.rs` (`Belief`, `belief_weight`, `SearchGame::determinize_with`), `tree.rs` (`deal`,
+`set_belief`, `belief`, `belief_mix`), `driver.rs` (`ROW_BELIEF`, `NnSeat::belief_*`, `check_belief`,
+`takes_belief`, `submit_aux`), `driver/worker.rs` (`start`, `advance_slot`'s belief row, `run_chunk`'s
+`set_belief`, `restart_search`), `toy.rs`, `mull_game.rs`, `dynapi.rs` / the bindings (`Game.determinize_with`,
+`SearchTree.set_belief` / `belief`, `SearchDriver.submit(aux=)`, `belief_weight`, `BELIEF_CLIP`); Python
+`mcts.py` (`deal`, `Tree.set_belief`, `check_belief`, `belief_settings`, `belief_tag`), `play.py`
+(`NNSeat`, `PyDriver._simulate`, `submit`), `protocol.py` (`ROW_BELIEF`, `belief_rows`, the validators),
+`infer.py`, `net.py` (`HeadMissing`, `check_belief_head`, `forward(aux_rows=)`), `replay.py`, `parity.belief`.
+Tests: `tree::tests::belief_*`, `a_belief_deals_*`, `no_belief_*`, `without_redet_*`,
+`driver::tests::belief_*`, `one_belief_row_*`, `an_evaluator_without_the_belief_*`,
+`the_belief_deals_the_searches_worlds`, `root_view_values_and_the_belief_*`, `rolling_phases_ask_the_belief_*`,
+`tests/test_belief.py`.
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:
@@ -821,6 +923,18 @@ searching mover-view against the Python root view is seen at once (TV 0.096, pow
 drivers ('py' and 'rs' seats of `PyDriver`, the Rust driver): the same batch layout (a value-only
 row after its leaf's, flagged `ROW_VALUE`), the same value-only samples and targets
 (`test_value_only_samples_and_their_targets`).
+
+**The root's belief** (section 3.8; `python -m zero.parity belief`, `parity.belief`,
+`tests/test_belief.py`), 2026-10-29: 8 toy positions whose next round's card is hidden among 2-3 cards,
+a belief of 0.9 on one of them (0.02 on the others), 96 simulations, 24 repetitions per position and
+tree, both trees dealing by it (the Rust game's `determinize_with` either way: the trees' timing, mix
+draws and statistics are what is compared): at tilt 1 visits TV Rust-Python 0.0040 (Python-Python
+floor 0.0049), cq target TV 0.0081 (0.0177), root win |rs - py| 0.0004, the believed card in 96.6% of
+the Python leaves' worlds (the deal's odds 96.9%); at tilt 0.5 with `belief_mix` 0.25: 0.0075 (0.0078),
+0.022 (0.034), 0.0008, 73.8% (74.9%). The setting matters: the belief vs the uniform deal of the same
+positions, TV 0.052 (tilt 1) and 0.027 (tilt 0.5, mix 0.25). The drivers (the Rust driver, `PyDriver`'s
+'py' and 'rs' seats): every batch valid, one belief row per full search, answered by a network with the
+head (`test_one_belief_row_per_full_search_answered_by_the_head`).
 
 `python -m zero.parity h2h --model M --games 6000 --sims 32`: Rust-tree seat vs Python-tree
 seat in `PyDriver`, the same network, seats alternating (docs/az.md 6.2): **49.94% +-1.04**
