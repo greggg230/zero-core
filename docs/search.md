@@ -13,13 +13,13 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 | File | What |
 |---|---|
 | `crates/search/src/game.rs` | `SearchGame` trait, `Bot` trait, `RandomBot`, `MAX_SEATS` = 8 |
-| `crates/search/src/tree.rs` | One search tree: PUCT, chance children, determinization, noise, reuse, `compact`, completed-Q targets |
+| `crates/search/src/tree.rs` | One search tree: PUCT, chance children, determinization, noise, reuse, `compact`, completed-Q targets, the root minimum visits (3.5), the Gumbel root search (3.7) |
 | `crates/search/src/driver.rs`, `driver/worker.rs` | Batched multi-threaded driver: groups, chunks, parallel batch assembly, playout cap, temperature, records, rolling phases, arena keys, external seats |
 | `crates/search/src/toy.rs` | "Mini Cavern", the toy game (section 5) + its heuristic bot |
 | `crates/search/src/mull_game.rs` | Test games (cfg(test)): keep-or-mulligan (`Mull`, section 3.5) and its private-hand variant (`HiddenMull`, section 3.6) |
 | `crates/search/src/toy_team.rs` | "Toy team", a two-team game with a deferred result decided by toy games (section 5.1) |
 | `crates/search/src/dynapi.rs` | Object-safe wrappers (`DynGame`, `DynTree`, `DynDriver`) so the bindings hold any game |
-| `crates/search/src/rng.rs`, `noise.rs` | xoshiro256++ / splitmix64, Gamma / Dirichlet |
+| `crates/search/src/rng.rs`, `noise.rs` | xoshiro256++ / splitmix64, Gamma / Dirichlet, Gumbel |
 | `crates/py/src/lib.rs` | `zero_py`: `Game`, `SearchTree`, `SearchDriver`, `game_names()`, `game_info_of()`, the `engine_module!` macro (section 4) |
 | `crates/toy_py/src/lib.rs` | the core's own module `zero._engine` (`toy`, `toy_team`) |
 | `python/zero/mcts.py`, `play.py` | Python reference MCTS and driver (`PyDriver`, seats searching with the Python or the Rust tree) |
@@ -29,8 +29,8 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 Build: `bash tools/build_py.sh` (the toy module: release cdylib copied to
 `python/zero/_engine.pyd`; target dir `$CARGO_TARGET_DIR` or `E:/cargo-target/zero-core/<branch>`
 on Windows). A game builds its own `<pkg>._engine` with its `tools/build_py.sh` (docs/pinning.md).
-Tests: `cargo test` (the `zero_search` crate: 40 tests, ~5 s in release), `python -m pytest
-tests` (101 tests on the toys, ~2.5 min on the loaded desktop).
+Tests: `cargo test` (the `zero_search` crate: 88 tests, ~5 s in release), `python -m pytest
+tests` (the toys, ~8 min on the loaded desktop).
 
 ## 1. The trait (final version)
 
@@ -202,7 +202,8 @@ One list of seat dicts per game (players = its length):
 `{'key': 'm', 'sims', 'c_puct', 'selfplay', 'alpha', 'eps', 'temp_moves', 'sims_fast',
 'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale',
 'select', 'select_min_visits', 'record', 'root_min_visits', 'root_min_visits_max_actions',
-'leaf_value_view', 'view_samples', 'view_sample_target', 'belief_tilt', 'belief_clip', 'belief_mix', 'belief_fast'}`
+'leaf_value_view', 'view_samples', 'view_sample_target', 'belief_tilt', 'belief_clip', 'belief_mix', 'belief_fast',
+'root_search', 'gumbel_m', 'gumbel_scale', 'gumbel_c_visit', 'gumbel_c_scale'}`
 (`games.nn_seat`; `policy_target` only matters for recorded decisions, section 3.1; `select` and its
 guard for the moves the seat does not sample, section 3.3; `cq_c_visit` / `cq_c_scale` are the
 completed-Q transform of both; `record` false - absent: true - a self-play seat whose full searches
@@ -210,7 +211,8 @@ are not recorded: it searches, samples its moves and draws its playout cap exact
 seat, so its games are the same move for move, and emits no records; zero's self-play league,
 docs/az.md 14, puts a past checkpoint there; `root_min_visits` the floor of its full searches' root
 visits, section 3.5; `leaf_value_view` whose view its leaves' values come from, `view_samples` /
-`view_sample_target` its value-only samples, section 3.6; `belief_tilt`, `belief_clip`, `belief_mix`,
+`view_sample_target` its value-only samples, section 3.6; `root_search` 'puct' | 'gumbel' and the
+`gumbel_*` keys its root search, section 3.7; `belief_tilt`, `belief_clip`, `belief_mix`,
 `belief_fast` the root's belief of its searches, section 3.8). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
@@ -393,7 +395,9 @@ resolver driver is one (docs/az.md 11): it plays the episodes of parked games, t
   same; the budget is then divided by the game's `sims_divisor`, at least one); root Dirichlet
   noise on full self-play
   searches (also on a reused, already expanded root); the opt-in root minimum visits of full
-  searches (section 3.5: forced walks, left out of the visit counts below); self-play samples moves by visit count
+  searches (section 3.5: forced walks, left out of the visit counts below); with the opt-in Gumbel
+  root search (3.7) its Gumbel noise replaces the Dirichlet noise and the temperature, sequential
+  halving replaces PUCT at the root and its move the rule below; self-play samples moves by visit count
   for the first `temp_moves` searched decisions of the game, otherwise (and in evaluation) by
   the seat's move rule (section 3.3; the default argmax (N, P0) with the first maximum on
   ties); tree reuse: after a real move the tree
@@ -676,6 +680,119 @@ features or None; `SearchTree.viewer`; the module's `view_pick`); Python `mcts.p
 `PyDriver._leaf_batches`, `view_pick`), `replay.py`, `parity.root_view`. Tests:
 `driver::tests::leaf_view_*`, `root_view_*`, `value_only_*`, `tests/test_root_view.py`.
 
+### 3.7 The Gumbel root search (`root_search`; 2026-10-29)
+
+**Why.** At a few dozen simulations PUCT's root is locked in by the prior: it spends the walks where
+the prior points and the move follows the visits. MTG Zero's Delver mirror (its ENGINE.md 64, 67): the
+prior is >= 0.98 on Keep for 89 of 100 one-land hands and Mulligan often gets no visit at 64
+simulations; an upkeep Brainstorm with prior 0.934 got 62 of 63 visits and Pass 1, also after
+root-view leaf values (3.6) had raised Pass's Q to 0.638 against Brainstorm's ~0.65. The root minimum
+visits (3.5) measure a starved option but leave PUCT's allocation and move alone; root-view values fix
+the Q but not the visits. Gumbel AlphaZero's root (Danihelka et al. 2022, "Policy improvement by
+planning with Gumbel", ICLR) is built for few simulations: it samples m candidate actions without
+replacement (Gumbel-top-k of the logits), spreads the budget over them by sequential halving, and plays
+the argmax of g + logits + sigma(completedQ) among the last survivors - a policy improvement in
+expectation whatever the budget, and with <= m legal actions every option is considered.
+
+**The algorithm** (`Tree::set_gumbel(m, budget, noise, c_visit, c_scale)`, Python
+`mcts.Tree.set_gumbel`; the arithmetic of DeepMind's mctx `gumbel_muzero_policy` - `seq_halving.py`,
+`action_selection.py`, checked against its source):
+
+1. **Noise**: g_a = scale x Gumbel(0, 1) per root option, drawn once per search (`noise::gumbel`; 0
+   without noise).
+2. **Score**: `g_a + ln max(P0_a, floor) + sigma(completedQ_a)`, sigma(q) = (c_visit + max_b N_b) c_scale
+   q - the logits of the 'cq' target and rule (`completed_q_logits`, 3.1, 3.3): completedQ is Q for a
+   visited option, v_mix for an unvisited one, N every visit of the root (a reused root's too), no
+   min-max normalisation (3.1). P0 is the noise-free prior (a Gumbel search has no Dirichlet noise).
+3. **Sequential halving** (`tree::gumbel_sequence(min(m, options), budget)` = mctx
+   `get_sequence_of_considered_visits`): root walk j may take only an option whose walks **of this
+   search** equal `seq[j]`, the highest score among those (the first maximum on exact ties). The first
+   min(m, k) walks take the unvisited options in score order - all share v_mix, so the top options by
+   g + ln P0: the Gumbel-top-k sample -, then each round gives every survivor max(1, n / (ceil(log2 m)
+   x survivors)) more walks and the survivors are halved (at least 2). 16 options at 64: 16 x 1, 8 x 2,
+   4 x 4, 2 x 8 (final counts 15, 15, 7, 7, 3 x 4, 1 x 8); 2 options: 32 / 32; 4: 8 each, then 24 / 24. The
+   schedule is that of the search's **simulations** (`budget` = the driver's target): a fresh root's own
+   evaluation takes the first simulation, so its walks follow the schedule's first target - 1 entries
+   (16 options at 64: 15, 14, 7, 7, ...; 2: 32 / 31) - the paper's allocation for the budget less one walk,
+   where mctx's schedule of 63 walks would round its middle rounds down (19, 18, 5, 5, 2 x 4, 1 x 8). Past
+   the schedule (a caller simulating more), the most walked options.
+4. **Below the root**: PUCT, unchanged.
+5. **The move** (`Tree::gumbel_choose`): among the options this search walked most (the last
+   survivors; every option when it walked none), the highest score. With noise it is a sample of the
+   improved policy pi' = softmax(ln P0 + sigma(completedQ)) over the considered options (the
+   Gumbel-max trick; with every option considered and its Q exact, exactly pi'); without, its argmax.
+6. **The root value** (`Tree::gumbel_q`): `sum_a pi'_a Wv_a / sum_a pi'_a` over the options this search
+   walked, Wv_a = this search's mean backed-up win vector through a (`gumbel_win` / `gumbel_visits`).
+
+The tree counts its own walks per root option (`gumbel_visits`, their win vectors `gumbel_win`) in
+`backup`, apart from N, so a reused root's earlier visits stay in Q, sigma and the 'cq' target but not
+in the schedule. `reset` and `advance` turn it off (the driver sets each search's own); `clear_gumbel`
+is the tree of before bit for bit.
+
+**The driver** (seat key `root_search` 'gumbel', `RootSearch::Gumbel { m, scale, c_visit, c_scale }`):
+**every** search of the seat - full, fast and minor (`sims_fast`, `sims_minor`, after `sims_divisor`) -
+is a Gumbel search, the schedule that of its simulations (`target`, step 3; a reused, expanded root
+walks all of them). Interactions:
+
+| with | what the Gumbel search does |
+|---|---|
+| root Dirichlet noise (`alpha`, `eps`) | replaced: no Dirichlet noise; the slot's noise stream draws the Gumbel noise |
+| temperature (`temp_moves`) | replaced by the noise: a self-play seat's first `temp_moves` searched decisions of a game are searched with noise `scale` (the move a sample of pi'), later ones without (the argmax) - the role temperature had; an evaluation seat: `scale` on every decision (run default 0: deterministic) |
+| the move rule (`select`, `select_min_visits`) | not used: the Gumbel move replaces it (an evaluation seat's sigma defaults to the rule's transform, below) |
+| sigma | the seat's `gumbel_c_visit` / `gumbel_c_scale` (absent: `cq_c_visit` / `cq_c_scale`). `games.nn_seat` always writes it: a self-play seat recording 'cq' takes the target's transform - the search and its target share one sigma, as in the paper -, any other seat its move rule's (`select_c_*`, else `cq_c_*`) |
+| the policy target | 'cq' (3.1), from every root visit as the paper's. A recording seat with 'visits' is refused (`Driver::new`, `PyDriver`): sequential halving's visit counts are its schedule (16 options at 64: eight options get 1 visit, two get 15, whatever their value), not a policy |
+| the root value target q (2.4) | `gumbel_q`, not `wsum / tot`: the first round walks every considered option, so the plain mean mixes in what the halving ruled out - two options at 64 simulations get half the walks each (the mulligan test game: the root mean 0.07 below a good hand's Keep value, `gumbel_q` = Keep's to 1e-4). pi' is the policy the move samples, so its value is the outcome's expectation under the move played (after `temp_moves`, the argmax: Q of the move, `gumbel_q` slightly below) |
+| value-only samples (`next_q`, 3.6) | the observer's next search's `gumbel_q` |
+| fast and minor searches | Gumbel searches too, with the seat's m (they record nothing; the move is what matters, and a few walks is what Gumbel is for): a 16-simulation fast search over 16 options walks each once and takes the best score; a 4-simulation minor search the top 4 by g + ln P0 once each. Their noise follows the temperature rule |
+| tree reuse | kept (the same seat deciding again): the reused root's visits count in Q and sigma; the schedule budgets this search's walks only, and its first round ranks the options this search has not walked by their score, so an option already measured competes with its Q |
+| root minimum visits (3.5) | exclusive (`Driver::new` refuses both on one seat, the run settings one side): with k <= m options the halving gives each at least max(1, n / (ceil(log2 k) k)) walks (2 options at 64 simulations: 31; 3: 10; 4: 8) - more than the floor's 4 or 8 on the roots it applies to |
+| root-view leaf values (3.6) | orthogonal: leaves are valued from the seat's view as before; the root's selection reads their Q |
+| chance, determinization, `chance_k`, `redet` | unchanged: every simulation its own world, `chance_k` below the root; the root's noise is per search, not per world |
+| a rolling driver's epoch restart (2.6) | the decision's search restarts from an empty tree with its noise kept (`Slot::gnoise`, as its playout-cap draw) |
+| the self-play league (docs/az.md 14) | the league seat is the self-play seat with `record` false: a Gumbel search with self-play's noise |
+| the root's belief (3.8) | orthogonal: a search that takes it deals its worlds by it; a reused root's belief row (the search waits for it) consumes no simulation, so the schedule is the same; a fresh root's rides with its own leaf (`driver::tests::gumbel_with_a_root_belief`, `tests/test_gumbel.py::test_gumbel_with_a_root_belief`) |
+| external seats, deferred terminals, teams | unchanged (the root's Q is the decider's utility; deferred leaves as 3.2) |
+
+**Why PUCT below the root.** Gumbel MuZero also replaces the interior selection with a deterministic
+rule (the action maximising pi'(a) - N(a) / (1 + sum N), the completed-Q policy of each node). It is
+not used here: the improvement guarantee is the root's, the interior rule changes every node of every
+search (the opponent's decisions in determinized worlds included), and nothing measured here says the
+interior is where PUCT fails - the starvation is at the root. It would be a separate seat flag
+(`interior_search`), with its own A/B.
+
+**Settings.** Seat keys `root_search` ('puct' default | 'gumbel'), `gumbel_m` (16, the paper's and
+mctx's default), `gumbel_scale` (1: the paper's self-play), `gumbel_c_visit` / `gumbel_c_scale`
+(absent: the seat's `cq_c_*`); a 'puct' seat with a `gumbel_*` key is an error. Run settings
+`selfplay_root_search`, `eval_root_search`, `gumbel_m`, `selfplay_gumbel_scale` (1), `eval_gumbel_scale`
+(0) (docs/az.md 1.2, 19). An evaluation's root search names its Elo pool (`mcts.gumbel_tag`:
+`gumbel-m16`, `gumbel-m16-v50-s0.3` with a transform other than 50 / 1, `-g1` with noise, then `-rv`).
+Off (`puct`) is the search of before bit for bit (the golden records and match; toy runs byte for byte).
+
+**Measured** on the keep-or-mulligan test game (`mull_game::Mull`, Keep's prior 0.999 whatever the
+hand; `tree::tests::gumbel_measures_the_starved_mulligan`, `driver::tests::gumbel_mulligan_selfplay_
+and_evaluation`): every search walks both options 32 / 31 times. Self-play with sigma (50, 1.0), 160
+games: the 'cq' target > 0.9 on Mulligan for 152 of 152 bad hands and < 0.001 for all 168 good ones,
+the sampled move Mulligan with 151 of 152 bad hands and 0 of 168 good ones, a good hand's q Keep's
+value to 1e-5 (PUCT: Mulligan never visited, never played, its target at its prior; the root minimum
+visits k 4: 141 of 152 targets, 16 of 152 moves). Evaluation without noise: Mulligan with 193 of 193 bad
+hands at sigma scale 1.0 - and with none at 0.3: (50 + 32) x 0.3 x 0.16 = 3.9 logits of Q gap cannot
+beat ln 999 = 6.9 of prior. The Gumbel root measures every option; whether that changes the move is
+sigma's scale against the prior's log-odds. MTG Zero's Delver positions: its ENGINE.md 68.
+
+Code: `tree.rs` (`gumbel_sequence`, `GumbelRoot`, `set_gumbel`, `gumbel_select`, `gumbel_choose`,
+`gumbel_q`, `gumbel_visits` / `gumbel_win` / `gumbel_noise` / `gumbel_schedule`; `backup` counts the
+search's own walks), `noise.rs` (`gumbel`), `driver.rs` (`RootSearch`, `NnSeat::root_search`, the
+checks in `Driver::new`, `Slot::gnoise`), `driver/worker.rs` (`start` sets each search's, `apply_eval`
+and `start` skip Dirichlet noise, `decide` takes the move and q, `restart_search`), `dynapi.rs` / the
+bindings (`SearchTree.set_gumbel`, `clear_gumbel`, `gumbel_on`, `gumbel_choose`, `gumbel_q`,
+`gumbel_visits`, `gumbel_win`, `gumbel_noise`, `gumbel_schedule`; the module's `gumbel_sequence`);
+Python `mcts.py` (`GumbelRoot`, `Tree.set_gumbel`, `gumbel_sequence`, `gumbel_scores`, `gumbel_select`,
+`gumbel_choose`, `gumbel_q`, `check_root_search`, `gumbel_noise_scale`, `gumbel_tag`; `backup` counts the
+walks), `play.py` (`NNSeat`, `PySearch` / `RsSearch`, `PyDriver._start` / `_decide`), `games.nn_seat`,
+`run.py`, `elo.eval_tag`, `h2h.root_keys`, `replay._nn`, `parity.gumbel` / `gumbel_formula`. Tests:
+`tree::tests::gumbel_*`, `driver::tests::gumbel_*`, `noise::tests::gumbel_moments_and_the_max_trick`,
+`tests/test_gumbel.py`.
+
 ### 3.8 The root's belief: belief-weighted determinization (`belief_tilt`; 2026-10-29)
 
 **Why.** Every simulation deals the hidden information again (`determinize`): uniformly over the
@@ -935,6 +1052,29 @@ the Python leaves' worlds (the deal's odds 96.9%); at tilt 0.5 with `belief_mix`
 positions, TV 0.052 (tilt 1) and 0.027 (tilt 0.5, mix 0.25). The drivers (the Rust driver, `PyDriver`'s
 'py' and 'rs' seats): every batch valid, one belief row per full search, answered by a network with the
 head (`test_one_belief_row_per_full_search_answered_by_the_head`).
+
+**The Gumbel root search** (section 3.7; `python -m zero.parity gumbel`, `parity.gumbel`,
+`parity.gumbel_formula`, `tests/test_gumbel.py`), 2026-10-29: the schedule `gumbel_sequence` is mctx's
+(`get_sequence_of_considered_visits` run from its source: every m < 40, n < 260) and the Rust tree's
+(the bindings' `gumbel_sequence`); the Python `gumbel_choose`, `gumbel_q` and next root walk on the
+statistics of Rust Gumbel roots (8 toy positions x 2, 5, 17, 64 simulations x m 1, 2, 4, 16) are the Rust
+tree's own on all 256 checks, the root values to 0.0. In searches (10 toy positions of 3+ options, 64
+simulations, 32 repetitions per position and tree, m 16, noise scale 1, sigma (50, 0.3); repetition r of
+every tree with the same noise, the trees' own streams otherwise):
+
+| | Rust-Python | Python-Python floor |
+|---|---|---|
+| mean visit distribution TV (= the searches' own walks: fresh roots) | 0.0096 | 0.0122 |
+| mean completed-Q target TV | 0.0098 | 0.0141 |
+| move distribution TV | 0.041 | 0.041 |
+| repetitions whose moves agree | 0.92 | 0.92 |
+| \|root value (gumbel_q) Rust - Python\| | 0.0005 | |
+
+Every search walked exactly sims - 1 root walks over min(m, options) options in both trees. Power: a
+Rust m of 2 against Python's 16 is seen at once (TV 0.285 against the floor 0.015; the test). The drivers (self-play, the 'cq' target,
+24 simulations, a lopsided prior where PUCT starves every option but its favourite): the targets' mass
+off the favourite is 0.562 / 0.558 / 0.594 with the Gumbel root for the Python driver's 'py' seats, its
+'rs' seats and the Rust driver (whose games are seeded otherwise), 0.064 / 0.064 / 0.073 with PUCT.
 
 `python -m zero.parity h2h --model M --games 6000 --sims 32`: Rust-tree seat vs Python-tree
 seat in `PyDriver`, the same network, seats alternating (docs/az.md 6.2): **49.94% +-1.04**
