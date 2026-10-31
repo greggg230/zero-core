@@ -3251,3 +3251,70 @@ normal priority, beside the live main line:
   Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder 4202a4a build against this core: GREEN); its
   digests unchanged (132437374243f7b2, encoding-free a0d54562c8330271); `check_checkpoint_compat` with
   the Delver line's checkpoint 320 on its spec identical.
+
+## 23. Heavy decisions in self-play (`zero/heavy.py`; MTG Zero's Bauble trick, 2026-10-31)
+
+(Section 21 is on another branch.)
+
+### 23.1 Why
+
+MTG Zero's Delver line never looks at its own library with Mishra's Bauble before it commits to a fetch or
+a land (its ENGINE.md 79.1). Three links block the line from finding it by itself: the search barely looks
+(prior ~0.009), when it looks it cannot see the payoff (one visit per revealed card at `chance_k` 0, the
+follow-up decision unsearched), and its games never hold the line. Heavy decisions (docs/search.md 3.11)
+give self-play's search more simulations, a root floor and chance-node replays (or stratified worlds) at
+the decisions where an option it would barely look at reveals hidden information to it within a short line.
+
+### 23.2 The settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `selfplay_sims_heavy` | 0 | a heavy decision's full draw: this many simulations instead of `sims`; 0 = off (no probe, no hook read) |
+| `selfplay_sims_heavy_fast` | 0 | its fast draw instead of `sims_fast`; required when `sims_fast` is set |
+| `selfplay_chance_k_heavy` | -1 | `chance_k` inside heavy searches; -1 = the run's |
+| `selfplay_root_min_visits_heavy` | 0 | the heavy floor: visits per root option, at most half the budget (`heavy_floor`) |
+| `selfplay_heavy_prior_max` | 1.0 | the probe's gate: only options of prior <= this are probed |
+| `selfplay_heavy_depth` / `_horizon` / `_lines` | 2 / 12 / 64 | the probe's deviations per line (the root option the first), steps per line, lines per probe |
+| `selfplay_chance_mode_heavy` | sample | `stratified`: the decider's next own revelation's units without replacement across a heavy search's simulations (heavy chance_k 0) |
+
+Self-play seats only (the league's opponents too); evaluation, Elo, anchors, h2h, replays and the eval
+remote are the searches of before. Minor and light decisions (section 22) come first: a light decision is
+never probed. Refused at the start (`resolve_config`, `Run`): every setting without
+`selfplay_sims_heavy`, budgets below the replaced ones, a fast draw's budget left implicit,
+`selfplay_chance_k_heavy` = `chance_k`, the Gumbel root, gates outside (0, 1], probe ranges, a co-training
+run, `stratified` with a heavy chance_k > 0. Saved in config.json.
+
+### 23.3 What it reports
+
+The self-play line's `heavy` (this machine's games and the remote's accepted ones): `per_game` heavy
+decisions, `share` of the searched decisions, `probed_share`, `recorded_per_game`, `sims_per_game` on heavy
+decisions and `sims_share` of all simulations (`sims_all_per_game`), `forced_per_game`, and the probe's cost
+per probed decision (`probe_lines`, `probe_steps`, `probe_ms`). The start-up line "heavy decisions: N
+simulations (full draws) / M (fast draws), chance_k K, root floor F; probe: options of prior <= P, depth D,
+horizon H, L lines[; chance outcomes stratified]".
+
+### 23.4 Remote self-play
+
+A worker's hello reports `heavy` = `heavy.fingerprint` (every setting; '' when off; the chance mode only
+when stratified); a worker whose checkout searches otherwise (an older one: none) is refused, retried in 10
+minutes ("REFUSED: its checkout searches heavy decisions as ..."). Its end line carries its accepted
+games' tallies.
+
+### 23.5 Off by default; tests
+
+Every default leaves the run, its seats, its metrics and its fingerprints as before; the toy's golden
+records are unchanged with and without `sims_heavy` (its decisions are probed, never heavy), and without
+it the hooks are never read (`driver::tests::heavy_decisions_off_change_nothing`). Tests: docs/search.md
+3.11's Rust tests; `tests/test_heavy.py` (21: settings refused, the seats, the fingerprint, the probe's
+binding and `heavy_floor`, the chance mode, a run's metrics and config.json, the remote's tallies and a
+worker refused).
+
+### 23.6 What it measured on MTG Zero (its ENGINE.md 79.5)
+
+On the Delver line's checkpoint 368 (CPU): the probe flags 93-99% of the measured Bauble spots at depth
+2 (15-20% at depth 1: the look is a follow-up action, cast then activate), and 32-57% of all searched
+decisions by the gate (23-41% outside the timing windows): the deck is made of cantrips (Brainstorm,
+Ponder, Dragon's Rage Channeler's surveil on every noncreature spell). It costs ~0.1-0.25 ms a probed
+decision. The heavy search measures the Bauble (the floor gives it ~8-9 visits) and finds it worse than
+cracking (Q -0.045 at the spots, -0.07 at turn-1 hands): it does not pick it. The numbers, the
+budget-neutral setting and the prepared fork are in its ENGINE.md 79.

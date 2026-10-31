@@ -16,6 +16,8 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 | `crates/search/src/tree.rs` | One search tree: PUCT, chance children, determinization, noise, reuse, `compact`, completed-Q targets, the root minimum visits (3.5), the Gumbel root search (3.7) |
 | `crates/search/src/driver.rs`, `driver/worker.rs` | Batched multi-threaded driver: groups, chunks, parallel batch assembly, playout cap, temperature, records, rolling phases, arena keys, external seats |
 | `crates/search/src/toy.rs` | "Mini Cavern", the toy game (section 5) + its heuristic bot |
+| `crates/search/src/heavy.rs` | Heavy decisions' reveal probe (section 3.11) |
+| `crates/search/src/peek_game.rs` | Test game (cfg(test)): "peek", a look before a guess (section 3.11) |
 | `crates/search/src/mull_game.rs` | Test games (cfg(test)): keep-or-mulligan (`Mull`, section 3.5) and its private-hand variant (`HiddenMull`, section 3.6) |
 | `crates/search/src/toy_team.rs` | "Toy team", a two-team game with a deferred result decided by toy games (section 5.1) |
 | `crates/search/src/dynapi.rs` | Object-safe wrappers (`DynGame`, `DynTree`, `DynDriver`) so the bindings hold any game |
@@ -411,7 +413,9 @@ Python reference driver has no pairing. Uses: docs/az.md 20.3 (zero.h2h `--paire
   gets `sims` and is recorded, the rest `sims_fast`; a minor decision of a self-play seat with
   `sims_minor` gets `sims_minor` and is never recorded, the playout-cap draw being made all the
   same; a light decision of a self-play seat with `sims_light` gets `sims_light` / `sims_light_fast`,
-  recorded only with `light_record`, section 3.10; the budget is then divided by the game's
+  recorded only with `light_record`, section 3.10; a heavy decision of a self-play seat with `sims_heavy`,
+  neither minor nor light, gets `sims_heavy` / `sims_heavy_fast`, the heavy floor and `chance_k_heavy`,
+  section 3.11; the budget is then divided by the game's
   `sims_divisor`, at least one); root Dirichlet
   noise on full self-play
   searches (also on a reused, already expanded root); the opt-in root minimum visits of full
@@ -972,6 +976,107 @@ Code: `game.rs` (`LIGHT_CLASSES`, `light_class`), `driver.rs` (`NnSeat::sims_lig
 `recorded_light_decisions_record_their_full_draws`,
 `light_classes_select_the_decisions_and_minor_comes_first`,
 `evaluation_seats_and_matches_ignore_light_decisions`; `tests/test_light.py`.
+
+### 3.11 Heavy decisions (`sims_heavy`, the reveal probe, `chance_mode_heavy`; 2026-10-31)
+
+**Why.** MTG Zero's Delver mirror never looks at its own library with Mishra's Bauble before it cracks a
+fetchland (its ENGINE.md 79.1): the Bauble's prior is ~0.009 at those spots (~1 of 64 simulations), the
+look's revealed card gets ~1 visit with `chance_k` 0 so the follow-up decision is not searched below it,
+and its games never hold the line. Single knobs everywhere (2x simulations, `chance_k` 4, Gumbel, root
+noise, exploration) failed. Heavy decisions loosen the starvation and the chance-node depth together, and
+only where hidden information is about to be revealed to the decider - and only in self-play.
+
+**The probe** (`heavy.rs`, `heavy::probe`). On one world determinized for the decider (so `step`'s keys
+are its view: another player's private facts masked in a game that masks them), each candidate root
+option starts a **line**: step it, then at most `horizon` steps in all - one-option decisions stepped,
+another seat's decision its passive option (`SearchGame::passive_action`, else its first option), the
+decider's minor decisions their first option, the decider's forced choices (no passive option: a required
+target, a mode) branching over every option, the decider's passable decisions branching over the other
+options while the line has deviations left (`depth`, the root option the first) and continuing with the
+passive one - stopping at the game's end or at a step that ends in a later round (`SearchGame::rounds`:
+what a new round reveals - the next draw step, a toy's round card - comes with time; that step's keys are
+not read). A line **reveals** when one of its keys is a revelation to the decider (`SearchGame::reveals`)
+beyond the root's passive line's (the baseline: what the game shows anyway - a discard, a trigger; the
+root's passive option is never probed). The decision is heavy when a probed option reveals. A line budget
+(`lines`) bounds the cost; the probe stops at the first revealing option. Whose revelations count: only
+the decider's - its own draws and looks, a hidden card of another player made public, coins and dice;
+another player's private draw or look is masked in the decider's world and never counts (MTG Zero's hook:
+its ENGINE.md 79.2).
+
+**The hooks** (`game.rs`). `passive_action(legal)` (default None: no decision has one) and
+`reveals(key, viewer)` (default true: every key - section 1's contract keys what the decider could not
+predict); `strata` / `set_stratum` for the stratified mode (default none). A game without them still gets a
+probe (lines branch at every decision of the decider, other seats take their first option); the toy's
+revelations come with its rounds, so its decisions are probed and never heavy.
+
+**The seat** (`driver.rs` `NnSeat`). `sims_heavy` (None = off: the probe never runs, no hook is read),
+`sims_heavy_fast` (a fast draw's heavy budget; required when the seat has `sims_fast`), `chance_k_heavy`
+(None = `chance_k`), `root_min_visits_heavy` (0 = none), `heavy_prior_max` (the probe's gate: only root
+options whose prior before noise is at most it are probed - options the search would barely look at; 1 =
+every option), `heavy_probe` (`ProbeCfg`: depth 2, horizon 12, lines 64), `chance_mode_heavy` (`Sample` |
+`Stratified`). At `start` a self-play seat's decision that is neither minor nor light (both come first)
+waits for the probe, which needs the root's priors: a reused root is probed at once, a fresh one at its
+first evaluation (`apply_eval`). The probe's world comes from a stream of its own (driver seed, game,
+decision): no stream of the search moves, so the search of a decision found light is the search of before.
+A heavy search takes its playout-cap draw's heavy budget (then `sims_divisor`), the **heavy floor**
+`heavy_floor(k, m, target) = min(k, target / (2 m))` per root option if it exceeds the search's own (full
+and fast draws alike: a fast draw's move is self-play's move too; the floor's accounting of 3.5 - forced
+walks out of the 'visits' target, temperature sampling, the 'visits' rule and q), `chance_k_heavy` on its
+walks, and with `Stratified` stratified worlds. A heavy full draw is recorded as any full search (its
+targets from the heavy search), a fast one is not. Restarts (rolling epochs) keep a decided heavy search's
+budget, floor and mode.
+
+**Stratified worlds** (`chance_mode_heavy` 'stratified', `Tree::set_stratified`). Every simulation deals a
+fresh world, so ~10 walks through a look reveal ~10 independent draws of the hidden card: repeats and gaps.
+Stratified, after each simulation's deal the tree calls `set_stratum(viewer, u)` with the next unit u of a
+random permutation of the world's `strata(viewer)` units (a fresh permutation after each pass): the units
+of the decider's next own revelation (MTG: the cards that could be the top of its own library, unknown to
+everyone and interchangeable with the top) are sampled without replacement across the simulations. The
+**estimator** stays the plain average of the backups: each simulation's world is still a draw of the deal's
+distribution (within a pass the unit's identity is uniform over the units, which are equally likely - the
+deal shuffles them uniformly), so the average is unbiased for the probability-weighted value, with less
+variance, and a full pass covers every unit once; the walks through a given edge are a subset of the
+simulations, so they see distinct units within a pass. Exclusive with a heavy `chance_k` > 0 (its replays
+of sampled outcomes would override the strata). **Not built**: enumerating each distinct outcome once with
+probability weights (backgammon-style) needs the outcome distribution before the step that reveals it and
+probability-weighted backups through chance edges (the tree's edge Q is the plain mean of its walks, read
+by PUCT, the targets and the root value): a tree change of its own. Limitations: MTG Zero's units cover only
+its own library's top (the next own draw or look of it); a revelation of the opponent's cards keeps the
+independent deal (the determinization's treatment, uniform or belief-weighted, of positions the opponent
+may know: a belief extension for the opponent's owner-known top cards would supply exact weights there).
+
+**Checks** (`NnSeat::check_heavy`, `Driver::new`; and zero/heavy.py): refused - never ignored - on an
+evaluation seat; any heavy setting without `sims_heavy`; budgets below the ones they replace;
+`sims_fast` without `sims_heavy_fast` and `sims_heavy_fast` without `sims_fast`; `chance_k_heavy` equal to
+`chance_k`; the Gumbel root search (its schedule is fixed when its search starts, before the probe);
+`heavy_prior_max` outside (0, 1]; probe settings out of range (depth 1-4, horizon 1-64, lines 1-4096);
+`Stratified` with a heavy `chance_k` > 0 or without `redet`.
+
+**What it reports.** A result row gets `heavy` = {probed, decisions, recorded, sims, forced, lines, steps,
+probe_ns, sims_all} when a seat of the driver has `sims_heavy` (else no key): the decisions probed and
+found heavy, those recorded, the heavy searches' simulations and forced walks, the probe's lines, steps and
+nanoseconds, and every search's simulations in the game. `stats()` adds `heavy_probed`, `heavy`,
+`heavy_sims`, `heavy_forced`, `heavy_lines`, `heavy_steps`, `heavy_probe_s`. Bindings: `Game.heavy_probe(seed,
+depth, horizon, lines, cand, first)` -> {reveal, probed, lines, steps, exhausted}, `Game.passive_action()`,
+`Game.reveals(key, viewer)`, `Game.strata` / `set_stratum`, `SearchTree.set_stratified`, `heavy_floor`. The
+Python reference driver has no heavy decisions.
+
+**Settings.** Seat keys `sims_heavy`, `sims_heavy_fast`, `chance_k_heavy`, `root_min_visits_heavy`,
+`heavy_prior_max`, `heavy_depth`, `heavy_horizon`, `heavy_lines`, `chance_mode_heavy`; run settings
+(docs/az.md 23) `selfplay_sims_heavy`, `selfplay_sims_heavy_fast`, `selfplay_chance_k_heavy` (-1 = chance_k),
+`selfplay_root_min_visits_heavy`, `selfplay_heavy_prior_max`, `selfplay_heavy_depth`,
+`selfplay_heavy_horizon`, `selfplay_heavy_lines`, `selfplay_chance_mode_heavy`.
+
+Code: `heavy.rs` (`probe`, `ProbeCfg`, `ProbeOut`), `game.rs` (`passive_action`, `reveals`, `strata`,
+`set_stratum`), `tree.rs` (`set_stratified`), `driver.rs` (`NnSeat::sims_heavy` ..., `check_heavy`,
+`heavy_budget`, `heavy_floor`, `ChanceMode`, `HeavyGame`, `GameResult::heavy`, `DriverCfg::heavy_on`, the
+stats), `driver/worker.rs` (`start`, `apply_eval`, `heavy_decide`, `restart_search`, `decide`, `finish`),
+`peek_game.rs` (the test game), `dynapi.rs` and the bindings. Tests: `heavy::tests` (the probe's lines,
+candidates / first / the caller's world, stratified worlds, settings), `driver::tests::heavy_settings_are_checked`,
+`heavy_decisions_off_change_nothing` (the hooks never read; the toy's golden records with and without
+`sims_heavy`), `heavy_decisions_take_their_budget_floor_and_records` (the driver's heavy decisions are the
+probe's, decision by decision), `heavy_chance_k_and_the_gate_change_what_they_say`,
+`light_decisions_come_first_and_evaluation_seats_never_probe`; `tests/test_heavy.py`.
 
 ## 4. Bindings and registering a game
 
