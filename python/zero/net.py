@@ -501,6 +501,21 @@ class TokenNet(nn.Module):
             at += r
         return torch.where(ok & (idx < self.vocab), idx, torch.full_like(idx, self.vocab))
 
+    def _global(self, x):
+        """The global token's input [B, d] (before its position embedding): the globals' map plus
+        the bags' (each bag pooled as the count-weighted sum of the identity embeddings and its
+        total)."""
+        B = x.shape[0]
+        g = self.g(x.index_select(1, self.gidx))
+        if self.bag is not None:
+            pools = []
+            for b in self.bags:
+                o, k, w = b['offset'], b['count'], b['width']
+                c = x[:, o:o + k * w].reshape(B, k, w)
+                pools.append(torch.cat([c @ self.emb.weight[:w], c.sum(-1, keepdim=True)], -1))
+            g = g + self.bag(torch.cat(pools, 1).flatten(1))
+        return g
+
     def pack(self, x, ident=False):
         """The packed tokens: (h [B, T, d] (row b's n[b] tokens first, in layout order; the
         global token at 0), n [B], full [B, T] = each packed token's position in the full token
@@ -519,14 +534,7 @@ class TokenNet(nn.Module):
         T = int(n.max())
         cpos = pres.long().cumsum(1) - 1                             # packed index of a present token
         full = torch.zeros(B, T, dtype=torch.long, device=dev)
-        g = self.g(x.index_select(1, self.gidx))
-        if self.bag is not None:
-            pools = []
-            for b in self.bags:
-                o, k, w = b['offset'], b['count'], b['width']
-                c = x[:, o:o + k * w].reshape(B, k, w)
-                pools.append(torch.cat([c @ self.emb.weight[:w], c.sum(-1, keepdim=True)], -1))
-            g = g + self.bag(torch.cat(pools, 1).flatten(1))
+        g = self._global(x)
         h = torch.cat([(g + self.pos[0])[:, None], g.new_zeros(B, T - 1, self.d)], 1)
         idt = torch.full((B, T), self.vocab, dtype=torch.long, device=dev) if ident else None
         start = 1
@@ -548,6 +556,37 @@ class TokenNet(nn.Module):
             return h, n, full, idt
         return h, n, full
 
+    def _trunk(self, hc, nr, fc, ic=None):
+        """The blocks and the policy logits of packed rows: hc [Bc, Tc, d] (row b's nr[b] tokens
+        first, then padding), fc [Bc, Tc] the tokens' positions in the full token axis, ic [Bc, Tc]
+        their identities (a layout with id_actions) -> (zc [Bc, 2 d] the pooled state, pc [Bc,
+        actions + 1] the policy logits; the last column a dummy for the padding's and the empty
+        slots' scores). One chunk of `forward`, or a padded batch of `forward_static`."""
+        Tc = hc.shape[1]
+        keep = torch.arange(Tc, device=hc.device)[None, :] < nr[:, None]
+        k4 = keep[:, None, None, :]
+        for blk in self.blocks:
+            hc = blk(hc, k4)
+        hc = self.ln(hc) * keep[..., None]
+        zc = torch.cat([hc[:, 0], hc.sum(1) / nr[:, None].to(hc.dtype)], 1)
+        pc = F.pad(self.gen(zc), (0, 1))
+        cols = self.tok_cols[fc]                                      # [Bc, Tc, K]
+        acts = self.tok_acts[fc]
+        if self.n_id:                                                 # actions by identity
+            ia = self.tok_idbase[fc] + ic
+            ia = torch.where((ic < self.vocab) & (ia < self.actions), ia, self.actions)
+            acts = torch.where(self.tok_isid[fc], ia[..., None], acts)
+        acts = torch.where(keep[..., None] & (cols >= 0), acts, self.actions)
+        lg = self.ptr(F.gelu(self.pk(hc) + self.pq(zc)[:, None])).gather(2, cols.clamp(min=0))
+        return zc, pc.scatter(1, acts.flatten(1), lg.flatten(1))
+
+    def _heads(self, z, pol, n_players, aux, aux_rows):
+        present = torch.arange(self.seats, device=z.device)[None, :] < n_players[:, None]
+        vlog = self.val(z).masked_fill(~present, -1e9)
+        if aux:
+            return pol[:, :self.actions], vlog, self.mar(z), _aux_out(self, z, aux_rows)
+        return pol[:, :self.actions], vlog, self.mar(z)
+
     def forward(self, x, n_players, aux=False, aux_rows=None):
         """As `Net.forward`."""
         x = x[:, :self.features]
@@ -564,32 +603,96 @@ class TokenNet(nn.Module):
             r = rows[c0:c0 + self.chunk]
             nr = n[r]
             Tc = int(nr.max())
-            hc = h[r, :Tc]
-            keep = torch.arange(Tc, device=dev)[None, :] < nr[:, None]
-            k4 = keep[:, None, None, :]
-            for blk in self.blocks:
-                hc = blk(hc, k4)
-            hc = self.ln(hc) * keep[..., None]
-            zc = torch.cat([hc[:, 0], hc.sum(1) / nr[:, None].to(hc.dtype)], 1)
-            pc = F.pad(self.gen(zc), (0, 1))
-            fc = full[r, :Tc]
-            cols = self.tok_cols[fc]                                  # [Bc, Tc, K]
-            acts = self.tok_acts[fc]
-            if self.n_id:                                             # actions by identity
-                ic = idt[r, :Tc]
-                ia = self.tok_idbase[fc] + ic
-                ia = torch.where((ic < self.vocab) & (ia < self.actions), ia, self.actions)
-                acts = torch.where(self.tok_isid[fc], ia[..., None], acts)
-            acts = torch.where(keep[..., None] & (cols >= 0), acts, self.actions)
-            lg = self.ptr(F.gelu(self.pk(hc) + self.pq(zc)[:, None])).gather(2, cols.clamp(min=0))
-            pc = pc.scatter(1, acts.flatten(1), lg.flatten(1))
+            zc, pc = self._trunk(h[r, :Tc], nr, full[r, :Tc], idt[r, :Tc] if self.n_id else None)
             z = z.index_copy(0, r, zc)
             pol = pol.index_copy(0, r, pc)
-        present = torch.arange(self.seats, device=dev)[None, :] < n_players[:, None]
-        vlog = self.val(z).masked_fill(~present, -1e9)
-        if aux:
-            return pol[:, :self.actions], vlog, self.mar(z), _aux_out(self, z, aux_rows)
-        return pol[:, :self.actions], vlog, self.mar(z)
+        return self._heads(z, pol, n_players, aux, aux_rows)
+
+    # ---- static shapes (CUDA graphs: infer.TokenGraphRunner, docs/az.md 10.6)
+    def present_index(self):
+        """Per slot of the full token axis after the global token (the segments' slots in layout
+        order): the feature index of its present flag, -1 for a segment without one (always
+        present) -> a list. The host computes a batch's tokens from it (`forward_static`'s
+        `full` and `ntok`)."""
+        out = []
+        for s in self.segs:
+            for slot in range(s['count']):
+                out.append(-1 if s['present'] is None else s['offset'] + slot * s['width'] + s['present'])
+        return out
+
+    def _static_identities(self, x):
+        """Every slot's identity and its embedding, for the segments with one -> {segment index: (ids
+        [B, count], embeddings [B, count, d])}: `_identity`'s digits, computed for all the slots of the
+        segments that share a radix at once (one gather of their digit floats, a few kernels per digit:
+        `forward_static` stays at a few hundred kernels, not ~30 per segment). The column indexes are
+        built once per device (an attribute, not a buffer: the state is unchanged)."""
+        cache = getattr(self, '_static_ident', None)
+        if cache is None or cache[0] != x.device:
+            groups = {}
+            for j, s in enumerate(self.segs):
+                if s['id'] is not None:
+                    radix = tuple(s['id']['radix'])
+                    cols = [s['offset'] + slot * s['width'] + s['id']['at'] + c
+                            for slot in range(s['count']) for c in range(sum(radix))]
+                    groups.setdefault(radix, []).append((j, s['count'], cols))
+            plan = []
+            for radix, members in groups.items():
+                cols = torch.tensor([c for _, _, cs in members for c in cs], dtype=torch.long, device=x.device)
+                parts, k = [], 0
+                for j, cnt, _ in members:
+                    parts.append((j, k, k + cnt))
+                    k += cnt
+                plan.append((radix, cols, k, parts))
+            cache = self._static_ident = (x.device, plan)
+        B, out = x.shape[0], {}
+        for radix, cols, ns, parts in cache[1]:
+            blk = x.index_select(1, cols).view(B, ns, sum(radix))
+            at, idx, ok = 0, None, None
+            for r in radix:
+                d = blk[..., at:at + r]
+                dig = (d @ torch.arange(r, dtype=x.dtype, device=x.device)).round().long()
+                has = d.sum(-1) > 0.5
+                idx = dig if idx is None else idx * r + dig
+                ok = has if ok is None else ok & has
+                at += r
+            i = torch.where(ok & (idx < self.vocab), idx, torch.full_like(idx, self.vocab))
+            e = self.emb(i)
+            for j, a, b in parts:
+                out[j] = (i[:, a:b], e[:, a:b])
+        return out
+
+    def forward_static(self, x, n_players, full, ntok, aux=False):
+        """`forward` with shapes fixed by the inputs' (no host sync, no data-dependent shape: a CUDA
+        graph can capture it): every slot is embedded, present or not, and each row's tokens are
+        gathered by `full` [B, T] (its present tokens' positions in the full token axis, in layout
+        order, the global token's 0 first, then padding: any position, masked out), `ntok` [B] its
+        token count (>= 1). All rows are run as one chunk of T tokens. The outputs are `forward`'s
+        (`aux`: the head on every row); a row's outputs depend only on it and on the batch's shape
+        (the kernels' blocking: float32 rounding)."""
+        x = x[:, :self.features]
+        B = x.shape[0]
+        g = self._global(x)
+        toks = [(g + self.pos[0])[:, None]]
+        ids = [torch.full((B, 1), self.vocab, dtype=torch.long, device=x.device)] if self.n_id else None
+        ident = self._static_identities(x)
+        start = 1
+        for j, (s, lin) in enumerate(zip(self.segs, self.seg_in)):
+            o, k, w = s['offset'], s['count'], s['width']
+            sl = x[:, o:o + k * w].reshape(B, k, w)
+            t = lin(sl) + self.pos[start:start + k]
+            if s['id'] is not None:
+                i, e = ident[j]
+                t = t + e
+            else:
+                i = torch.full((B, k), self.vocab, dtype=torch.long, device=x.device)
+            if ids is not None:
+                ids.append(i)
+            toks.append(t)
+            start += k
+        h = torch.cat(toks, 1).gather(1, full[..., None].expand(-1, -1, self.d))
+        idt = torch.cat(ids, 1).gather(1, full) if ids is not None else None
+        z, pol = self._trunk(h, ntok, full, idt)
+        return self._heads(z, pol, n_players, aux, None)
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())

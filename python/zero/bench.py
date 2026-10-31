@@ -14,7 +14,9 @@ the batch sizes, `--workers k` k batches evaluated concurrently on Python thread
 of a fresh network of the given size, `--ops` the operators one forward pass dispatches and its
 multiply-adds (eager CUDA inference of a token network is bound by its operators, not by its
 arithmetic: docs/az.md 10.5). `train`: seconds per training step (forward, backward, AdamW) at
-`--batch` on real positions, and the operators of one step.
+`--batch` on real positions, and the operators of one step. `infer` / `selfplay --graphs 0 | 1`: the
+evaluator's CUDA graphs (default: NetEvaluator's - a conv network's on, a token network's env
+ZERO_TOKEN_GRAPHS=1; docs/az.md 10.6); the output then names `graphs` (the share of batches through them).
 """
 import argparse
 import json
@@ -104,14 +106,20 @@ def _net(game, model, arch, hidden, blocks, heads, ff):
     return m, d
 
 
+def _graphs_out(out, evs, graphs):
+    if graphs is not None:
+        calls = sum(e.calls for e in evs)
+        out['graphs'] = round(sum(e.graph_calls for e in evs) / calls, 4) if calls else None
+
+
 def bench_infer(game='toy', device='cpu', hidden=128, blocks=3, batches=(64, 256, 1024), seconds=1.0, arch='mlp',
-                heads=4, ff=0, xs=None, model=None, workers=1, ops=False):
+                heads=4, ff=0, xs=None, model=None, workers=1, ops=False, graphs=None):
     """xs: feature rows to sample the batches from (real positions; a token network's cost
     depends on how many objects they hold), else random normal features. `model`: a checkpoint
     (else a fresh network of the given size); `workers` > 1: that many batches evaluated at once
     on Python threads (each its own rows, `torch_threads` intra-op threads each: run setting
     infer_workers); `ops`: the operators and multiply-adds per leaf of one forward pass per batch
-    size (`count_ops`)."""
+    size (`count_ops`); `graphs`: the evaluators' CUDA graphs (None: their default)."""
     info = G.info(game)
     m, desc = _net(game, model, arch, hidden, blocks, heads, ff)
     out = dict({'what': 'inference', 'device': device}, **desc, torch_threads=torch.get_num_threads(), leaves_per_s={})
@@ -120,7 +128,7 @@ def bench_infer(game='toy', device='cpu', hidden=128, blocks=3, batches=(64, 256
     if ops:
         out['ops'], out['macs_per_leaf'] = {}, {}
     rng = np.random.default_rng(0)
-    evs = [NetEvaluator(m, device) for _ in range(max(1, workers))]
+    evs = [NetEvaluator(m, device, graphs=graphs) for _ in range(max(1, workers))]
     for B in batches:
         def rows():
             if xs is None:
@@ -147,6 +155,7 @@ def bench_infer(game='toy', device='cpu', hidden=128, blocks=3, batches=(64, 256
             if device == 'cuda':
                 torch.cuda.synchronize()
             out['leaves_per_s'][B] = round(B * c / (time.time() - t0))
+            _graphs_out(out, evs, graphs)
             continue
         import threading
         xb = [rows() for _ in evs]
@@ -179,6 +188,7 @@ def bench_infer(game='toy', device='cpu', hidden=128, blocks=3, batches=(64, 256
         for t in ths:
             t.join()
         out['leaves_per_s'][B] = round(B * done / secs)
+    _graphs_out(out, evs, graphs)
     return out
 
 
@@ -216,23 +226,25 @@ def bench_train(xs, game='toy', device='cpu', hidden=128, blocks=3, arch='mlp', 
 
 
 def bench_selfplay(model, game='toy', threads=4, games=400, sims=64, conc=256, spec=None, hidden=128, blocks=3, device='cpu',
-                   arch='mlp', heads=4, ff=0):
+                   arch='mlp', heads=4, ff=0, graphs=None):
     if model:
         m, _ = load(model, game=game)
     else:                                          # a fresh (random) network of the given size
         m = make_net(G.info(game), game, arch, hidden, blocks, heads=heads, ff=ff)
-    ev = NetEvaluator(m, device)
+    ev = NetEvaluator(m, device, graphs=graphs)
     seat = G.nn_seat('m', sims, selfplay=True, sims_fast=sims // 4, p_full=0.25)
     drv = G.Driver(game, [[seat, seat]] * games, spec=spec, concurrency=conc, threads=threads, record=True)
     t0 = time.time()
     drive(drv, {'m': ev}, on_batch=lambda lb: drv.take_samples())
     secs = time.time() - t0
     st = drv.stats()
-    return {'what': 'self-play (network)', 'game': game, 'device': device, 'params': m.n_params(), 'threads': threads,
-            'games': games, 'sims': sims, 'seconds': round(secs, 2), 'sims_per_s': round(st['sims'] / secs),
-            'leaves_per_s': round(st['leaves'] / secs), 'games_per_h': round(games / secs * 3600),
-            'infer_share': round(ev.seconds / secs, 3), 'avg_batch': round(ev.leaves / max(1, ev.calls), 1),
-            'caller_wait_s': round(st['wait_s'], 2)}
+    out = {'what': 'self-play (network)', 'game': game, 'device': device, 'params': m.n_params(), 'threads': threads,
+           'games': games, 'sims': sims, 'seconds': round(secs, 2), 'sims_per_s': round(st['sims'] / secs),
+           'leaves_per_s': round(st['leaves'] / secs), 'games_per_h': round(games / secs * 3600),
+           'infer_share': round(ev.seconds / secs, 3), 'avg_batch': round(ev.leaves / max(1, ev.calls), 1),
+           'caller_wait_s': round(st['wait_s'], 2)}
+    _graphs_out(out, [ev], graphs)
+    return out
 
 
 def _shard_rows(paths):
@@ -268,6 +280,8 @@ def main(argv=None):
     ap.add_argument('--ops', action='store_true', help='infer: operators and multiply-adds of one forward pass')
     ap.add_argument('--batch', type=int, default=512, help='train: rows per step')
     ap.add_argument('--steps', type=int, default=5, help='train: timed steps')
+    ap.add_argument('--graphs', type=int, default=None, choices=[0, 1],
+                    help="infer / selfplay: the evaluator's CUDA graphs (default: its own; docs/az.md 10.6)")
     a = ap.parse_args(argv)
     torch.set_num_threads(a.torch_threads)
     if a.what == 'search':
@@ -276,7 +290,8 @@ def main(argv=None):
         xs = _shard_rows(a.shard) if a.shard else None
         kw = {'batches': tuple(int(b) for b in a.batches.split(','))} if a.batches else {}
         r = bench_infer(game=a.game, device=a.device, hidden=a.hidden, blocks=a.blocks, arch=a.arch, heads=a.heads, ff=a.ff,
-                        xs=xs, model=a.model, workers=a.workers, seconds=a.seconds, ops=a.ops, **kw)
+                        xs=xs, model=a.model, workers=a.workers, seconds=a.seconds, ops=a.ops,
+                        graphs=None if a.graphs is None else bool(a.graphs), **kw)
     elif a.what == 'train':
         if not a.shard:
             ap.error('train: --shard (real positions) is required')
@@ -284,7 +299,8 @@ def main(argv=None):
                         heads=a.heads, ff=a.ff, model=a.model, batch=a.batch, steps=a.steps)
     else:
         r = bench_selfplay(a.model, game=a.game, threads=a.threads, games=a.games, sims=a.sims, conc=a.conc, spec=a.spec,
-                           hidden=a.hidden, blocks=a.blocks, device=a.device, arch=a.arch, heads=a.heads, ff=a.ff)
+                           hidden=a.hidden, blocks=a.blocks, device=a.device, arch=a.arch, heads=a.heads, ff=a.ff,
+                           graphs=None if a.graphs is None else bool(a.graphs))
     print(json.dumps(r))
 
 
