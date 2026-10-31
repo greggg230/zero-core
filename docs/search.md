@@ -29,7 +29,7 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 Build: `bash tools/build_py.sh` (the toy module: release cdylib copied to
 `python/zero/_engine.pyd`; target dir `$CARGO_TARGET_DIR` or `E:/cargo-target/zero-core/<branch>`
 on Windows). A game builds its own `<pkg>._engine` with its `tools/build_py.sh` (docs/pinning.md).
-Tests: `cargo test` (the `zero_search` crate: 96 tests, ~5 s in release), `python -m pytest
+Tests: `cargo test` (the `zero_search` crate: 97 tests, ~5 s in release), `python -m pytest
 tests` (the toys, ~8 min on the loaded desktop).
 
 ## 1. The trait (final version)
@@ -932,12 +932,13 @@ window 0; `timber`: on Timber, window 1 - the rest of the round), inert unless a
 eligible, in (0, 1]), `q_margin` (>= 0, the decider's utility: P(win) with `margin_w` 0), `mask_z`,
 `game_tag` (false: the first trigger of any explored tag starts the episode; true: each eligible game
 draws one explored tag at its start, uniformly - the exploration stream's second draw -, and only that
-tag's opportunities count and can trigger), and the explored `tags` (`ExploreTagCfg`: the game's id, `p`
-in (0, 1], `window`). `Driver::new` refuses a game
+tag's opportunities count and can trigger), `min_visits` and `max_actions` (the searched alternatives,
+below; 0 = off), and the explored `tags` (`ExploreTagCfg`: the game's id, `p` in (0, 1], `window`). `Driver::new` refuses a game
 without tags, an unknown or repeated id, a value out of range, no tags, a driver that records nothing (an
 evaluation, an h2h, an Elo match, a replay) and a driver without a self-play seat that records (a league
 opponent's `record` false explores nothing): never a silent no-op. Bindings: `SearchDriver(...,
-explore={'games', 'q_margin', 'mask_z', 'game_tag', 'tags': [{'tag': name, 'p', 'window'}]})` - names the game
+explore={'games', 'q_margin', 'mask_z', 'game_tag', 'min_visits', 'max_actions', 'tags': [{'tag': name, 'p',
+'window'}]})` (`min_visits` absent: 4, `max_actions` 8) - names the game
 declares (`game_info['explore_tags']`; another is an error), a tag's `p` / `window` absent = the game's
 defaults.
 
@@ -952,11 +953,28 @@ Gumbel winner - whichever chose it) and after the decision's records are made:
   mulligan, the first turns' fetches) take most games, late ones (Murktide's delve) almost none; `game_tag`
   shares the eligible games evenly between the tags (a game whose drawn tag never comes up has no episode).
 * **The gate**: the deviation is the best option without T by visits, then P0 (`argmax_visits`' order,
-  over the visit counts the move rule read). It is played only if its completed Q - the 'cq' target's
-  (`tree::completed_q`: W/N from every visit, an unvisited option's v_mix; the network's value when
-  nothing was visited) - is at least the chosen move's minus `q_margin`. A blocked gate starts no episode
-  (`blocked`); the game stays eligible and may trigger at a later opportunity. A deviation to an unvisited
-  option passes on v_mix alone (`alt_visits` 0 in the episode: counted in the metrics).
+  over the visit counts the move rule read), among the options with at least `min_visits` root visits
+  (forced walks included). It is played only if its completed Q - the 'cq' target's (`tree::completed_q`:
+  W/N from every visit) - is at least the chosen move's minus `q_margin`. A blocked gate starts no
+  episode (`blocked`); no option without T with `min_visits` visits refuses the trigger as well
+  (`unsearched`); either way the game stays eligible and may trigger at a later opportunity. With
+  `min_visits` 0 any option is a candidate and an unvisited one passes on its v_mix alone - ~the chosen
+  move's own Q, so the gate does not judge it (MTG Zero's Delver mirror: 62% of the fetch holds, 81% of
+  the forced mulligans; its ENGINE.md 75.6) - hence the default 4 and the exploring searches.
+* **Exploring searches** (`min_visits` > 0; `driver/worker.rs`: `start` -> `explore_search`): the search
+  of a recording seat in an eligible game at a decision where a deviation can happen - an option carries
+  a tag the seat may still deviate from (before the game's episode: any explored tag, with `game_tag` the
+  drawn one; during the episode: its tag, its seat only) beside an option without it; not a minor
+  decision, a PUCT root - takes (1) at least the seat's full budget `sims` (a fast draw is raised; it
+  stays unrecorded and without root noise: the playout-cap draw is kept) and (2) the root minimum visits
+  of 3.5, `root_floor(min_visits, max_actions, true, options, budget)` (a root of 2..=`max_actions`
+  options whose budget pays 2 x options x `min_visits`; the larger of it and the seat's own
+  `root_min_visits` floor; kept by a restarted search of the same decision). The forced walks are kept
+  out of the visit counts, temperature sampling, the 'visits' rule and the root value q exactly as the
+  seat's own floor's; the 'cq' target and the gate read Q from every visit (3.5). A root over
+  `max_actions` options or a budget too small is not floored: its alternatives are candidates only with
+  the visits they got. Every other search - off, an ineligible game, a decision without such a tag, the
+  other seat, after the episode - is the search of before.
 * **The episode** (one a game, one tag): the first deviation is played; for the tag's `window` turns -
   while `rounds() < turn + window`; 0 = this decision only - every decision of that seat whose chosen move
   carries T deviates the same way, each through the gate (a blocked one ends the episode: the habit is
@@ -973,16 +991,19 @@ Gumbel winner - whichever chose it) and after the decision's records are made:
 * **Streams**: the game's own exploration stream from (driver seed, the game's stream id) - eligibility,
   then one draw per opportunity; `init_slot` draws nothing more from its `base`, so every other stream (the
   deal, noise, temperature, playout caps, the search's worlds) is the same with exploration on or off. An
-  ineligible game, or an eligible one whose opportunities never trigger, is the game of a driver without
-  exploration move for move and record for record; a game with an episode is that game up to its first
-  deviation.
+  ineligible game is the game of a driver without exploration move for move and record for record; an
+  eligible one is that game up to its first exploring search (with `min_visits` 0: whose opportunities
+  never trigger, entirely; with an episode, up to its first deviation) - the raised budget and the floor
+  draw other simulations from there on.
 
 **Reports.** `GameResult::explore` (`ExploreGame`; the Python row's `explore`): eligible, the drawn `tag`
-(`game_tag`; the row's key only then), per explored tag
-the opportunities and gate blocks before the episode, the `Episode` (tag, seat, turn, step - the game's
-real moves before the deviation, the move log's index -, decision, overridden decisions, q_gap - the
-chosen move's completed Q minus the deviation's -, alt_visits, end: `decision` | `window` | `gate` |
-`game`), and the records masked and dropped. `take_samples()['masked']` (uint8, a driver with `mask_z`);
+(`game_tag`; the row's key only then), per explored tag the opportunities, gate blocks and unsearched
+triggers before the episode, the `Episode` (tag, seat, turn, step - the game's real moves before the
+deviation, the move log's index -, decision, overridden decisions, q_gap - the chosen move's completed Q
+minus the deviation's -, alt_visits - the fewest root visits of its deviations -, end: `decision` |
+`window` | `gate` | `unsearched` | `game`), the records masked and dropped, and the exploring searches:
+`searches`, `floored`, `raised` (simulations their raised budgets added), `forced` (their forced walks),
+`first_search` (the real moves before the first). `take_samples()['masked']` (uint8, a driver with `mask_z`);
 shards store it as an optional column (docs/az.md 3); `Game.explore_tags()`.
 
 **Off.** `explore` None: nothing is read, drawn or allocated (`Slot::xp` None); the records, results and
@@ -990,7 +1011,9 @@ streams of before (the goldens, `select_*_golden_*`, check_checkpoint_compat). T
 driver (`play.PyDriver`) has no exploration: it refuses the keyword.
 
 **Cost.** Nothing off. On: one `explore_tags` call per searched decision of an eligible game's recording
-seats until its episode ends, the completed Q of the root at an opportunity, a box per game.
+seats until its episode ends, the completed Q of the root at an opportunity, a box per game; with
+`min_visits`, the exploring searches' raised budgets (the simulations `raised` counts; the floor's forced
+walks come out of the budget).
 
 Code: `game.rs` (`ExploreTag`, `SearchGame::EXPLORE_TAGS`, `explore_tags`), `tree.rs` (`completed_q`),
 `driver.rs` (`ExploreCfg`, `ExploreTagCfg`, `ExploreGame`, `Episode`, `Record::masked`, `DriverCfg::explore`,
@@ -999,7 +1022,8 @@ Code: `game.rs` (`ExploreTag`, `SearchGame::EXPLORE_TAGS`, `explore_tags`), `tre
 rows' `explore`, `take_samples()['masked']`). Tests: `driver::tests::explore_settings_are_checked`,
 `exploration_off_or_ineligible_changes_nothing`, `exploration_triggers_through_the_gate`,
 `exploration_windows_and_one_episode_a_game`, `exploration_masks_outcomes_before_the_deviation`,
-`only_the_recording_seats_explore`, `a_game_tag_explores_only_the_tag_its_game_drew`; `tests/test_explore.py`.
+`only_the_recording_seats_explore`, `a_game_tag_explores_only_the_tag_its_game_drew`,
+`exploring_searches_take_the_floor_and_deviate_to_searched_options`; `tests/test_explore.py`.
 
 ## 4. Bindings and registering a game
 

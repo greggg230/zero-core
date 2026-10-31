@@ -153,6 +153,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_explore_games`, `selfplay_explore_q_margin`, `selfplay_explore_mask_z` | 0.25, 0.1, 1 | the share of games eligible (one episode a game), the gate (a deviation only within this much completed Q of the chosen move), masking (records at or before the first deviation: z := q, no margin target; a value-only sample without a root value then dropped) |
 | `selfplay_explore_p`, `selfplay_explore_window` | '', '' | per tag: the chance an opportunity triggers and the window in turns ('' = the game's defaults, a number = every tag's, 'tag=v,...') |
 | `selfplay_explore_pick` | first | 'first' = any explored tag's first trigger starts the game's episode; 'game' = each eligible game draws one tag, only it can |
+| `selfplay_explore_min_visits`, `selfplay_explore_max_actions` | 4, 8 | a deviation only to an option with >= this many root visits; exploring searches take the full budget and that root floor (roots up to 8 options); 0 = off |
 | `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
 | `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
 
@@ -3177,6 +3178,7 @@ so a game without an episode is the game of a run without exploration.
 | `selfplay_explore_p` | '' | the chance an opportunity triggers: '' = each tag's game default, a number = every tag's, 'tag=p,...' = those tags' |
 | `selfplay_explore_window` | '' | the episode's window in turns (0 = the decision only, 1 = the rest of the turn, 2 = and the next turn): '' = each tag's game default, a number = every tag's, 'tag=w,...' |
 | `selfplay_explore_pick` | first | 'first' = the first opportunity of any explored tag that triggers starts the game's episode (the tags whose opportunities come early in a game take most episodes); 'game' = each eligible game draws one explored tag at its start, only it can (the tags share the eligible games evenly: 21.8) |
+| `selfplay_explore_min_visits`, `selfplay_explore_max_actions` | 4, 8 | the searched alternatives (docs/search.md 3.9): a deviation only to an option with at least this many root visits, and every exploring search - a decision where a deviation can happen, in an eligible game, of the recording seat - takes at least the full budget `sims` (a fast draw raised, still unrecorded) and the root minimum visits on roots of up to `max_actions` options (the forced walks out of the visit counts and q as `selfplay_root_min_visits`'). 0 = neither: an unvisited alternative is gated on its v_mix (21.8) |
 
 `explore.driver_dict(cfg, info)` resolves them into the driver's `explore` dict (each tag's p and
 window explicit); `explore.check` refuses (SystemExit, at the run's start) a name the game does not
@@ -3203,7 +3205,10 @@ the margin of masked rows towards 0: fork from the run's own checkout).
 `selfplay.explore` (in metrics.jsonl and the log's `selfplay:` line), from the phase's finished games'
 rows (`row['explore']`), this machine's and the remote's: games, eligible, episodes, overridden
 decisions, masked and dropped records and their shares of the games' records (`masked_share`,
-`dropped_share`), and per tag: `drawn` (games that drew it, pick 'game'), opportunities (before a game's episode), blocked (triggered, the gate
+`dropped_share`), the exploring searches (`searches`, `floored`, `raised_sims` and `raised_sims_per_game`:
+the simulations the raised budgets added, `forced_walks`), and per tag: `drawn` (games that drew it, pick
+'game'), `unsearched` (triggers refused: no alternative with `min_visits` visits), `alt_under` (episodes
+with a deviation under `min_visits` visits: 0 when it is on), opportunities (before a game's episode), blocked (triggered, the gate
 refused the deviation), episodes, overridden, `q_gap` (the mean at the first deviation: the chosen move's
 completed Q minus the deviation's; negative = the deviation looked better), `alt_unvisited` (first
 deviations to an option the search never visited: they pass the gate on v_mix), `ends` (decision /
@@ -3222,7 +3227,7 @@ belief (18.5): never a remote that self-plays without exploration in silence.
 ### 21.7 Off by default; tests and checks
 
 Off (`selfplay_explore` ''): no driver gets `explore`, no stream, record, shard or metric changes;
-config.json gains the seven keys. Tests: Rust `driver::tests::explore_settings_are_checked`,
+config.json gains the nine keys. Tests: Rust `driver::tests::explore_settings_are_checked`,
 `exploration_off_or_ineligible_changes_nothing` (an ineligible game or one without an episode is the game
 without exploration move for move and record for record, a game with one is that game up to its
 deviation; the same with other threads and groups), `exploration_triggers_through_the_gate` (p 1 and an
@@ -3232,7 +3237,10 @@ opportunities = blocks + the episode; p 0.3: later opportunities), `exploration_
 `exploration_masks_outcomes_before_the_deviation` (the first records masked, z = q, sc 0, the dropped ones
 value-only samples, the rest true; mask off: nothing), `only_the_recording_seats_explore` (league and
 evaluation opponents), `a_game_tag_explores_only_the_tag_its_game_drew` (each game's opportunities and
-episode its drawn tag's, both tags drawn). `tests/test_explore.py` (6): the toy's tags and the binding's refusals, the rows and
+episode its drawn tag's, both tags drawn), `exploring_searches_take_the_floor_and_deviate_to_searched_options`
+(ineligible games unchanged, eligible ones until their first exploring search, fast draws raised, the
+floor's forced walks, every deviation to an option of >= min_visits visits, unsearched triggers without a
+floor, the setting's check). `tests/test_explore.py` (6): the toy's tags and the binding's refusals, the rows and
 `masked` samples, the settings and their errors, the window's `masked` and the margin, a toy run exploring
 (metrics, log line, shards) and the defaults given = the run of before (every shard, checkpoint and
 optimizer state), a name the game does not declare refused, remote self-play exploring and a worker without
@@ -3244,7 +3252,7 @@ passed (zero_search; webnet 3); `pytest tests` 308 passed, 3 skipped on d745576 
 and on 715bbb1 inside MTG Zero's gate (`smoke_all.sh --with-this-core --build-only`: 308 passed, 3 skipped, 12:19; Glass Road c1f56dc, Caverna a6fad73, Kingdom Builder 4202a4a build: GREEN); `check_checkpoint_compat --package zero` against
 c15e3d0 (its own worktree and target), random and uniform evaluators: identical; a toy-smoke rolling run
 ('cq' targets, value-only samples, seed 3, 2 iterations) in both checkouts: every shard, checkpoint (zip
-members) and optimizer state identical, config.json gains the seven keys. MTG Zero (branch `explore`, its
+members) and optimizer state identical, config.json gains the seven keys (nine on cd3bd6d: 21.9). MTG Zero (branch `explore`, its
 ENGINE.md 75.8): the optin-core gate, both digests, `check_checkpoint_compat` with the Delver line's
 checkpoint 196 on the Delver spec.
 
@@ -3269,7 +3277,7 @@ games without exploration (the same seeds):
 * **The gate**: the visited deviations' Q gaps 0.01-0.04 on average, at most 0.098: q_margin 0.1 blocks
   0-11% of the triggers. **Most deviations go to an option the search never visited** (62% of the fetch
   holds, 81% of the forced mulligans, 39-51% of the others with 'first'): they pass on v_mix (their gap ~0)
-  - the gate does not judge them.
+  - the gate does not judge them (fixed: 21.9).
 * **What it plays**: fetch cracked at once 88.0% -> 83.2%, tap-outs into a live Daze 55.1% -> 48.6%, the
   turn 1-2 Volcanic 49.8% -> 33.3%, one-landers kept 61% -> 9% (with every game eligible, 'first'); after a
   fetch hold the seat cast its Brainstorm before cracking - the shuffle line - in 4% (19% with 'game'), its
@@ -3278,3 +3286,31 @@ games without exploration (the same seeds):
   ('first', 382), -0.16 +- 0.08 ('game', 76): the forced alternatives lose a little at iteration 196's
   strength, within 2 se; whether the value net learns from them what the plateau needs is the A/B's
   question (its ENGINE.md 75.7).
+
+### 21.9 The gate on searched alternatives (`selfplay_explore_min_visits`; cd3bd6d)
+
+**Why.** 21.8: most first deviations went to an option the search never visited, whose completed Q is
+the target's v_mix - the visited options' prior-weighted mean, ~the chosen move's Q by construction -
+so the gate passed them with a gap of ~0: it judged nothing there.
+
+**What.** `min_visits` (4) and `max_actions` (8) (docs/search.md 3.9): the gate's candidates are the
+options with at least `min_visits` root visits, and every exploring search - a decision where a
+deviation can happen, in an eligible game, of the recording seat - is searched with at least the
+seat's full budget (a fast draw raised: at 16 simulations a root of a few options would rarely give an
+alternative 4 visits) and the root minimum visits of docs/search.md 3.5 on roots of up to 8 options
+(the budget rule: 2 x 8 x 4 = 64). The forced walks stay out of the visit counts, temperature
+sampling, the 'visits' rule and q, as `selfplay_root_min_visits`' do; the 'cq' target and the gate read
+Q from every visit. A trigger without a candidate is refused (`unsearched`). Off, ineligible games and
+decisions without such a tag: the searches of before (`exploring_searches_take_the_floor_and_deviate_to_searched_options`).
+
+**Measured** (MTG Zero's ENGINE.md 75.10; iteration 196 of its Delver line, its self-play search, pick
+'game', every game eligible, 288 games against their exploration-off twins): every deviation went to an
+option of >= 4 visits (0 of 261 under the minimum, the median 4-21 by tag), no trigger was unsearched
+(1,008 of 1,056 exploring searches floored); the gate now blocks 0-61% of the triggers by tag (the forced
+mulligans 61%, Force of Will 56%, Volcanic fetches 28%, tap-outs 17%, fetch holds 6%, delve 0%); 102
+episodes (every tag), the episode seat's paired score -0.049 +- 0.060 against its twin; the cost: 131
+simulations a game from the raised budgets (2% of a game's 6,300 leaves) and 22 forced walks a game
+(inside the budget).
+
+**Checks** (cd3bd6d): `cargo test --release` 97 (zero_search), `tests/test_explore.py` 6; MTG Zero's
+optin-core gate on its a291de7 (its ENGINE.md 75.10).
