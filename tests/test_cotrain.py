@@ -125,8 +125,11 @@ def test_cotrain_pause_mid_iteration_replays_it(tmp_path):
     resumed, the iteration is replayed from its start (both data directories cleared)."""
     run = tmp_path / 'p'
     run.mkdir()
+    # (its output to a file, not a pipe read only at the end: a Windows pipe's 4 KB buffer full blocks
+    # the run's next print - its start-up lines alone come close)
+    console = open(tmp_path / 'p.out', 'w+', encoding='utf-8')
     proc = subprocess.Popen([sys.executable, '-m', 'zero.run', '--run', str(run), *CO, '--iters', '2', '--games', '5000'],
-                            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            cwd=ROOT, stdout=console, stderr=subprocess.STDOUT, text=True,
                             env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH))
     deadline = time.time() + 180
     prog = {}
@@ -142,7 +145,10 @@ def test_cotrain_pause_mid_iteration_replays_it(tmp_path):
             'matches_done'} <= set(prog), prog
     assert prog['target'] == 5000
     runctl.request_pause(str(run), by='test')
-    out, _ = proc.communicate(timeout=120)
+    proc.wait(timeout=120)
+    console.seek(0)
+    out = console.read()
+    console.close()
     assert proc.returncode == runctl.EXIT_PAUSED, out
     for d in (run, run / 'resolver'):
         assert latest_iter(str(d)) == 0 and (d / 'data' / 'iter_0001').exists()
