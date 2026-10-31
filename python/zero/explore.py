@@ -18,6 +18,13 @@ Run settings (all off by default: '' = no exploration, the runs of before byte f
                               starts its episode (the tags whose opportunities come early take most);
                               'game' = each eligible game draws one explored tag at its start, only it
                               can (the tags share the eligible games evenly)
+  selfplay_explore_min_visits a deviation only to an option with at least this many root visits, and
+                              every exploring search (an eligible game's recording seat at a decision
+                              with an option of a tag it may still deviate from) takes this root minimum
+                              visits (up to selfplay_explore_max_actions options, the budget allowing)
+                              and at least the full budget `sims` - a fast draw raised, still
+                              unrecorded (4; 0 = neither: an unvisited option gated on its v_mix)
+  selfplay_explore_max_actions the largest root an exploring search floors (8)
 
 A name the game does not declare, a p / window for a tag not explored, a value out of range: refused
 (SystemExit), never a silent no-op. Only the recording self-play seat explores (never an evaluation,
@@ -25,14 +32,18 @@ an h2h, Elo, a replay, a league opponent); single-game runs only.
 
 Metrics (`selfplay.explore`, a self-play phase's finished games - local and remote): games, eligible,
 episodes, overridden decisions, masked / dropped records and their shares of the games' records, and
-per tag: opportunities (before a game's episode), gate blocks (triggered, deviation refused), episodes,
-overridden decisions, the mean Q gap at the first deviation (the chosen move's completed Q minus the
-deviation's), first deviations to an unvisited option, how the episodes ended, their turns.
+per tag: opportunities (before a game's episode), gate blocks (triggered, deviation refused), unsearched
+(triggered, no alternative with min_visits visits), episodes, overridden decisions, the mean Q gap at the
+first deviation (the chosen move's completed Q minus the deviation's), the episodes with a deviation to
+an option under min_visits visits (0 with min_visits > 0), how the episodes ended, their turns; the
+exploring searches, those floored, the simulations the raised budgets added and the forced walks (per
+game too).
 """
 import json
 
 KEYS = ('selfplay_explore', 'selfplay_explore_games', 'selfplay_explore_q_margin', 'selfplay_explore_mask_z',
-        'selfplay_explore_p', 'selfplay_explore_window', 'selfplay_explore_pick')
+        'selfplay_explore_p', 'selfplay_explore_window', 'selfplay_explore_pick', 'selfplay_explore_min_visits',
+        'selfplay_explore_max_actions')
 
 
 def tags_of(info):
@@ -97,6 +108,10 @@ def driver_dict(cfg, info):
     pick = cfg.get('selfplay_explore_pick', 'first')
     if pick not in ('first', 'game'):
         raise SystemExit(f"selfplay_explore_pick {pick!r}: 'first' or 'game'")
+    mv, ma = cfg.get('selfplay_explore_min_visits', 4), cfg.get('selfplay_explore_max_actions', 8)
+    for k, v, lo in (('selfplay_explore_min_visits', mv, 0), ('selfplay_explore_max_actions', ma, 2)):
+        if not isinstance(v, int) or isinstance(v, bool) or v < lo:
+            raise SystemExit(f'{k} {v!r}: an integer >= {lo}')
     tags = []
     for n in names:
         _, w0, p0 = declared[known.index(n)]
@@ -106,7 +121,7 @@ def driver_dict(cfg, info):
         if w < 0:
             raise SystemExit(f'selfplay_explore_window: {n} {w}: turns >= 0 (0 = the decision only)')
         tags.append({'tag': n, 'p': float(p), 'window': int(w)})
-    d = {'games': games, 'q_margin': margin, 'mask_z': bool(mask), 'tags': tags}
+    d = {'games': games, 'q_margin': margin, 'mask_z': bool(mask), 'min_visits': mv, 'max_actions': ma, 'tags': tags}
     if pick == 'game':
         d['game_tag'] = True                       # (absent: the driver's default, 'first')
     return d
@@ -133,20 +148,24 @@ def fingerprint(cfg, info):
 # ------------------------------------------------------------------------------- metrics
 
 def _tag_sums():
-    return {'opportunities': 0, 'blocked': 0, 'episodes': 0, 'overridden': 0, 'q_gap_sum': 0.0, 'alt_unvisited': 0,
-            'drawn': 0, 'ends': {}, 'turns': {}}
+    return {'opportunities': 0, 'blocked': 0, 'unsearched': 0, 'episodes': 0, 'overridden': 0, 'q_gap_sum': 0.0,
+            'alt_unvisited': 0, 'alt_under': 0, 'drawn': 0, 'ends': {}, 'turns': {}}
+
+
+GAME_SUMS = ('games', 'eligible', 'samples', 'masked', 'dropped', 'searches', 'floored', 'raised', 'forced')
 
 
 def new_tally(info, d):
     """An empty tally (raw sums, mergeable: `merge`) of a driver exploring as `d` (`driver_dict`) in
     the game of `info`: the rows' opportunities / blocked come in d's tag order."""
     explored = [t['tag'] for t in d['tags']]
-    return {'names': [t[0] for t in tags_of(info)], 'explored': explored, 'games': 0, 'eligible': 0, 'samples': 0,
-            'masked': 0, 'dropped': 0, 'tags': {n: _tag_sums() for n in explored}}
+    return dict({k: 0 for k in GAME_SUMS}, names=[t[0] for t in tags_of(info)], explored=explored,
+                min_visits=int(d.get('min_visits', 0)), tags={n: _tag_sums() for n in explored})
 
 
 def _tag_sums_keys():
-    return ('opportunities', 'blocked', 'episodes', 'overridden', 'q_gap_sum', 'alt_unvisited', 'drawn')
+    return ('opportunities', 'blocked', 'unsearched', 'episodes', 'overridden', 'q_gap_sum', 'alt_unvisited', 'alt_under',
+            'drawn')
 
 
 def tally(rows, acc):
@@ -161,9 +180,12 @@ def tally(rows, acc):
         acc['samples'] += int(r.get('samples', 0) or 0)
         acc['masked'] += int(x['masked'])
         acc['dropped'] += int(x['dropped'])
+        for k in ('searches', 'floored', 'raised', 'forced'):
+            acc[k] += int(x.get(k, 0))
         for k, n in enumerate(acc['explored']):
             acc['tags'][n]['opportunities'] += int(x['opportunities'][k])
             acc['tags'][n]['blocked'] += int(x['blocked'][k])
+            acc['tags'][n]['unsearched'] += int(x.get('unsearched', [0] * len(acc['explored']))[k])
         if x.get('tag'):
             acc['tags'][acc['names'][int(x['tag']) - 1]]['drawn'] += 1        # (pick 'game': the game's tag)
         ep = x.get('episode')
@@ -173,6 +195,7 @@ def tally(rows, acc):
             t['overridden'] += int(ep['overridden'])
             t['q_gap_sum'] += float(ep['q_gap'])
             t['alt_unvisited'] += int(ep['alt_visits']) == 0
+            t['alt_under'] += int(ep['alt_visits']) < max(1, acc.get('min_visits', 0))
             t['ends'][ep['end']] = t['ends'].get(ep['end'], 0) + 1
             k = str(int(ep['turn']))
             t['turns'][k] = t['turns'].get(k, 0) + 1
@@ -188,8 +211,8 @@ def merge(a, b):
     if a['explored'] != b['explored']:
         raise ValueError(f'explore tallies of different tags: {a["explored"]} / {b["explored"]}')
     out = json.loads(json.dumps(a))
-    for k in ('games', 'eligible', 'samples', 'masked', 'dropped'):
-        out[k] += b[k]
+    for k in GAME_SUMS:
+        out[k] += b.get(k, 0)
     for n, t in b['tags'].items():
         o = out['tags'][n]
         for k in _tag_sums_keys():
@@ -206,12 +229,15 @@ def summary(acc):
     for n in acc['explored']:
         t = acc['tags'][n]
         e = t['episodes']
-        tags[n] = {'drawn': t['drawn'], 'opportunities': t['opportunities'], 'blocked': t['blocked'], 'episodes': e,
-                   'overridden': t['overridden'], 'q_gap': round(t['q_gap_sum'] / e, 4) if e else None,
-                   'alt_unvisited': t['alt_unvisited'], 'ends': dict(sorted(t['ends'].items())),
+        tags[n] = {'drawn': t['drawn'], 'opportunities': t['opportunities'], 'blocked': t['blocked'],
+                   'unsearched': t['unsearched'], 'episodes': e, 'overridden': t['overridden'],
+                   'q_gap': round(t['q_gap_sum'] / e, 4) if e else None, 'alt_unvisited': t['alt_unvisited'],
+                   'alt_under': t['alt_under'], 'ends': dict(sorted(t['ends'].items())),
                    'turns': dict(sorted(t['turns'].items(), key=lambda kv: int(kv[0])))}
     rec = acc['samples'] + acc['dropped']
     return {'games': acc['games'], 'eligible': acc['eligible'], 'episodes': sum(t['episodes'] for t in tags.values()),
             'overridden': sum(t['overridden'] for t in tags.values()), 'masked': acc['masked'],
             'dropped': acc['dropped'], 'masked_share': round(acc['masked'] / rec, 4) if rec else 0.0,
-            'dropped_share': round(acc['dropped'] / rec, 4) if rec else 0.0, 'tags': tags}
+            'dropped_share': round(acc['dropped'] / rec, 4) if rec else 0.0, 'searches': acc['searches'],
+            'floored': acc['floored'], 'raised_sims': acc['raised'], 'forced_walks': acc['forced'],
+            'raised_sims_per_game': round(acc['raised'] / max(1, acc['games']), 1), 'tags': tags}

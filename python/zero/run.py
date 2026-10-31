@@ -278,9 +278,14 @@ DEFAULTS = dict(
     # the records at or before the first deviation get z := q and no margin target (a value-only sample
     # without a root value by then is dropped). selfplay_explore_pick 'first': the game's first opportunity
     # of any explored tag that triggers starts its episode; 'game': each eligible game draws one explored
-    # tag at its start, only it can. Single-game runs only
+    # tag at its start, only it can. selfplay_explore_min_visits k: a deviation only to an option with >= k
+    # root visits, and every exploring search (a decision where one can happen) takes the root minimum
+    # visits k (roots of up to selfplay_explore_max_actions options, the budget allowing; the forced walks
+    # out of the visit counts and q as root_min_visits') and at least the full budget `sims` (a fast draw
+    # raised, still unrecorded); 0 = neither. Single-game runs only
     selfplay_explore='', selfplay_explore_games=0.25, selfplay_explore_q_margin=0.1, selfplay_explore_mask_z=1,
-    selfplay_explore_p='', selfplay_explore_window='', selfplay_explore_pick='first',
+    selfplay_explore_p='', selfplay_explore_window='', selfplay_explore_pick='first', selfplay_explore_min_visits=4,
+    selfplay_explore_max_actions=8,
 )
 
 PRESETS = {

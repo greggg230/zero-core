@@ -258,7 +258,7 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: search target set for a non-network seat")?;
         let mut t = slot.spare.pop().unwrap_or_default();
         t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
-        t.set_root_min(root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap()));
+        t.set_root_min(root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap()).max(slot.xfloor));
         if let RootSearch::Gumbel { m, c_visit, c_scale, .. } = seat.root_search {
             // the decision's Gumbel search again, its noise kept (as its playout-cap draw)
             t.set_gumbel(m, slot.target.unwrap(), &slot.gnoise, c_visit, c_scale);
@@ -328,7 +328,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
         // (game_tag: the eligible game's one tag, the stream's second draw)
         let only = (eligible && x.game_tag).then(|| rng.below(k as u32) as usize);
         let only_id = only.map_or(0, |o| x.tags[o].id);
-        Box::new(Explore { rng, eligible, only, only_id, ep: None, live: false, slot: 0, marks: Vec::new(), opportunities: vec![0; k], blocked: vec![0; k], tags: Vec::new() })
+        Box::new(Explore { rng, eligible, only, only_id, ep: None, live: false, slot: 0, marks: Vec::new(), opportunities: vec![0; k], blocked: vec![0; k], unsearched: vec![0; k], tags: Vec::new(), searches: 0, floored: 0, raised: 0, forced: 0, first_search: None })
     });
     Ok(())
 }
@@ -400,7 +400,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         }
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: a seat without a player")?;
         if slot.target.is_none() {
-            start(slot, seat, p);
+            start(cfg, slot, seat, p);
         }
         if slot.sims >= slot.target.unwrap() {
             n.minor += slot.minor as u64;
@@ -488,7 +488,7 @@ fn push_belief_row<G: SearchGame>(buf: &mut LeafBuf, live: &G, p: usize, n: usiz
 }
 
 /// Start the search for the pending decision of seat `p` (legal actions in `slot.legal`).
-fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
+fn start<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     slot.full = seat.sims_fast.is_none() || slot.rng.unit() < seat.p_full;
     slot.target = Some(if slot.full { seat.sims } else { seat.sims_fast.unwrap() });
     let game = slot.game.as_ref().unwrap();
@@ -503,6 +503,20 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     let div = game.sims_divisor();
     if div > 1 {
         slot.target = slot.target.map(|t| (t / div).max(1));
+    }
+    // an exploring search (docs/search.md 3.9): at least the full budget, and the floor below
+    slot.xfloor = 0;
+    if let (Some(x), Some(st)) = (cfg.explore.as_ref(), slot.xp.as_deref_mut()) {
+        if x.min_visits > 0 && seat.selfplay && seat.record && st.eligible && !slot.minor && seat.root_search == RootSearch::Puct && explore_search(x, st, game, &slot.legal, p) {
+            let t0 = slot.target.unwrap();
+            let t = t0.max((seat.sims / div).max(1));
+            slot.target = Some(t);
+            slot.xfloor = root_floor(x.min_visits, x.max_actions, true, slot.legal.len(), t);
+            st.searches += 1;
+            st.floored += (slot.xfloor > 0) as u32;
+            st.raised += (t - t0) as u64;
+            st.first_search.get_or_insert(slot.steps);
+        }
     }
     // the root's belief (docs/search.md 3.8): full searches, or every one with belief_fast; a
     // reused tree's belief was its last decision's (`Tree::advance` cleared it)
@@ -523,7 +537,7 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     }
     // the root minimum visits of this search (docs/search.md 3.5; 0 = off: the tree's walks
     // are PUCT's alone; a reused root's visits count toward the floor)
-    let k = root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap());
+    let k = root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap()).max(slot.xfloor);
     let t = slot.trees[p].as_mut().unwrap();
     t.set_root_min(k);
     // the Gumbel root search (docs/search.md 3.7): every search of the seat (full, fast, minor). Its
@@ -659,7 +673,10 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     let mut a = a;
     if let (Some(x), Some(st)) = (cfg.explore.as_ref(), slot.xp.as_deref_mut()) {
         if seat.selfplay && seat.record && st.eligible {
-            if let Some(j) = explore_move(x, st, slot.game.as_ref().unwrap(), tree, p, nv, i, slot.steps, slot.decisions, &slot.rq) {
+            if slot.xfloor > 0 {
+                st.forced += tree.root_forced().iter().map(|&f| f as u64).sum::<u64>();
+            }
+            if let Some(j) = explore_move(x, st, slot.game.as_ref().unwrap(), tree, p, nv, &nv_all, i, slot.steps, slot.decisions, &slot.rq) {
                 a = acts[j];
             }
         }
@@ -677,19 +694,13 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
 /// least the chosen move's minus `q_margin`), it is played and the episode begins; else the game
 /// plays on without one for now. While the episode's window is open, every decision of its seat
 /// whose chosen move carries T deviates the same way (a blocked gate ends the episode instead).
-/// The deviation: the best untagged option by visits, then P0 (`argmax_visits`' order).
+/// The deviation: the best untagged option by visits, then P0 (`argmax_visits`' order), among those
+/// with at least `min_visits` root visits (`nv_all`: forced walks included; none: no deviation).
 #[allow(clippy::too_many_arguments)]
-fn explore_move<G: SearchGame>(x: &ExploreCfg, st: &mut Explore, g: &G, tree: &Tree<G>, p: usize, nv: &[u32], i: usize, steps: u64, decisions: u32, rq: &[Option<[f64; MAX_SEATS]>]) -> Option<usize> {
+fn explore_move<G: SearchGame>(x: &ExploreCfg, st: &mut Explore, g: &G, tree: &Tree<G>, p: usize, nv: &[u32], nv_all: &[u32], i: usize, steps: u64, decisions: u32, rq: &[Option<[f64; MAX_SEATS]>]) -> Option<usize> {
     let turn = g.rounds();
-    if st.live {
-        // (a window closes once its turns are over, whoever decides then)
-        let ep = st.ep.as_mut().unwrap();
-        if turn >= ep.turn + x.tags[st.slot].window {
-            st.live = false;
-            ep.end = "window";
-        }
-    }
-    if st.ep.as_ref().is_some_and(|ep| !st.live || ep.seat as usize != p) {
+    close_window(x, st, turn);
+    if !explores(st, p) {
         return None;
     }
     let root = tree.root;
@@ -699,42 +710,52 @@ fn explore_move<G: SearchGame>(x: &ExploreCfg, st: &mut Explore, g: &G, tree: &T
     g.explore_tags(acts, &mut st.tags);
     let tag = st.tags[i];
     let k = x.slot_of(tag)?;
-    if (st.live && k != st.slot) || st.only.is_some_and(|o| o != k) {
+    if !tag_open(st, k) {
+        return None;
+    }
+    // (every option carries the tag: nothing to deviate to, not an opportunity)
+    if st.tags.iter().all(|&t| t == tag) {
         return None;
     }
     let p0 = tree.priors0(root);
     let mut alt: Option<usize> = None;
     for j in 0..acts.len() {
-        if st.tags[j] != tag && alt.is_none_or(|b| (nv[j], p0[j]) > (nv[b], p0[b])) {
+        if st.tags[j] != tag && nv_all[j] >= x.min_visits && alt.is_none_or(|b| (nv[j], p0[j]) > (nv[b], p0[b])) {
             alt = Some(j);
         }
     }
-    // (every option carries the tag: nothing to deviate to, not an opportunity)
-    let alt = alt?;
-    // the gate: the completed Q of the 'cq' target (every visit; an unvisited option's is v_mix)
-    let q = completed_q(&p0, &tree.visits(root), &tree.values(root), tree.value0(root));
-    let gap = q[i] - q[alt];
-    let pass = gap <= x.q_margin;
+    // the gate: the completed Q of the 'cq' target (every visit; with min_visits 0 an unvisited
+    // option's is v_mix)
+    let gap = alt.map(|a| {
+        let q = completed_q(&p0, nv_all, &tree.values(root), tree.value0(root));
+        q[i] - q[a]
+    });
+    let pass = gap.is_some_and(|d| d <= x.q_margin);
     if st.live {
         let ep = st.ep.as_mut().unwrap();
         if pass {
             ep.overridden += 1;
-            return Some(alt);
+            ep.alt_visits = ep.alt_visits.min(nv_all[alt.unwrap()]);
+            return alt;
         }
         st.live = false;
-        ep.end = "gate";
+        ep.end = if alt.is_none() { "unsearched" } else { "gate" };
         return None;
     }
     st.opportunities[k] += 1;
     if st.rng.unit() >= x.tags[k].p {
         return None;
     }
+    let (Some(alt), Some(gap)) = (alt, gap) else {
+        st.unsearched[k] += 1;
+        return None;
+    };
     if !pass {
         st.blocked[k] += 1;
         return None;
     }
     let w = x.tags[k].window;
-    st.ep = Some(Episode { tag, seat: p as u8, turn, step: steps, decision: decisions, overridden: 1, q_gap: gap, alt_visits: nv[alt], end: if w == 0 { "decision" } else { "game" } });
+    st.ep = Some(Episode { tag, seat: p as u8, turn, step: steps, decision: decisions, overridden: 1, q_gap: gap, alt_visits: nv_all[alt], end: if w == 0 { "decision" } else { "game" } });
     st.slot = k;
     st.live = w > 0;
     if x.mask_z {
@@ -744,6 +765,46 @@ fn explore_move<G: SearchGame>(x: &ExploreCfg, st: &mut Explore, g: &G, tree: &T
         st.marks = rq.iter().map(|q| if q.is_some() { MARK_Z } else { MARK_DROP }).collect();
     }
     Some(alt)
+}
+
+/// Close the episode's window once its turns are over (whoever decides then).
+fn close_window(x: &ExploreCfg, st: &mut Explore, turn: u32) {
+    if st.live {
+        let ep = st.ep.as_mut().unwrap();
+        if turn >= ep.turn + x.tags[st.slot].window {
+            st.live = false;
+            ep.end = "window";
+        }
+    }
+}
+
+/// Seat `p` may still explore in this game: no episode yet, or its own episode's window is open.
+fn explores(st: &Explore, p: usize) -> bool {
+    st.ep.as_ref().is_none_or(|ep| st.live && ep.seat as usize == p)
+}
+
+/// The explored tag of index `k` may deviate now: the live episode's, or (before the episode) any -
+/// with `game_tag` the game's drawn one only.
+fn tag_open(st: &Explore, k: usize) -> bool {
+    if st.live {
+        return k == st.slot;
+    }
+    st.only.is_none_or(|o| o == k)
+}
+
+/// The search of seat `p` at the live decision (`legal`) is an exploring search (docs/search.md 3.9):
+/// the seat may still explore, and an option carries a tag it may deviate from with an option
+/// without that tag beside it - a decision where a deviation can happen.
+fn explore_search<G: SearchGame>(x: &ExploreCfg, st: &mut Explore, g: &G, legal: &[u16], p: usize) -> bool {
+    close_window(x, st, g.rounds());
+    if !explores(st, p) {
+        return false;
+    }
+    st.tags.clear();
+    st.tags.resize(legal.len(), 0);
+    g.explore_tags(legal, &mut st.tags);
+    let tags = &st.tags;
+    tags.iter().any(|&t| x.slot_of(t).is_some_and(|k| tag_open(st, k)) && tags.iter().any(|&u| u != t))
 }
 
 /// Apply a real move: the transition (single-option decisions of non-external seats are
@@ -891,7 +952,21 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
     }
     if let Some(x) = xp {
         let x = *x;
-        row.explore = Some(ExploreGame { eligible: x.eligible, tag: x.only_id, opportunities: x.opportunities, blocked: x.blocked, episode: x.ep, masked, dropped });
+        row.explore = Some(ExploreGame {
+            eligible: x.eligible,
+            tag: x.only_id,
+            opportunities: x.opportunities,
+            blocked: x.blocked,
+            unsearched: x.unsearched,
+            episode: x.ep,
+            masked,
+            dropped,
+            searches: x.searches,
+            floored: x.floored,
+            raised: x.raised,
+            forced: x.forced,
+            first_search: x.first_search,
+        });
     }
     row
 }

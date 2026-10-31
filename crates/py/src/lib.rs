@@ -256,11 +256,11 @@ fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>>
     Ok(d)
 }
 
-const EXPLORE_KEYS: &[&str] = &["games", "q_margin", "mask_z", "game_tag", "tags"];
+const EXPLORE_KEYS: &[&str] = &["games", "q_margin", "mask_z", "game_tag", "min_visits", "max_actions", "tags"];
 const EXPLORE_TAG_KEYS: &[&str] = &["tag", "p", "window"];
 
-/// The driver's `explore` dict (docs/search.md 3.9): {games, q_margin, mask_z, game_tag, tags: [{tag:
-/// name, p, window}]} - a tag's p / window absent: the game's defaults (`SearchGame::EXPLORE_TAGS`). A
+/// The driver's `explore` dict (docs/search.md 3.9): {games, q_margin, mask_z, game_tag, min_visits,
+/// max_actions, tags: [{tag: name, p, window}]} - a tag's p / window absent: the game's defaults (`SearchGame::EXPLORE_TAGS`). A
 /// name the game does not declare, an unknown key, a bad value: an error.
 fn parse_explore(d: &Bound<'_, PyDict>, info: &GameInfo) -> PyResult<ExploreCfg> {
     for k in d.keys() {
@@ -287,7 +287,7 @@ fn parse_explore(d: &Bound<'_, PyDict>, info: &GameInfo) -> PyResult<ExploreCfg>
         let def = info.explore_tags[k];
         tags.push(ExploreTagCfg { id: (k + 1) as u8, p: get(&t, "p", def.p)?, window: get(&t, "window", def.window)? });
     }
-    Ok(ExploreCfg { games: get(d, "games", 0.25f64)?, q_margin: get(d, "q_margin", 0.1f64)?, mask_z: flag(d, "mask_z", true)?, game_tag: flag(d, "game_tag", false)?, tags })
+    Ok(ExploreCfg { games: get(d, "games", 0.25f64)?, q_margin: get(d, "q_margin", 0.1f64)?, mask_z: flag(d, "mask_z", true)?, game_tag: flag(d, "game_tag", false)?, min_visits: get(d, "min_visits", 4u32)?, max_actions: get(d, "max_actions", 8u32)?, tags })
 }
 
 /// The root minimum visits a search takes (`driver::root_floor`, docs/search.md 3.5): `k` for a
@@ -838,6 +838,12 @@ impl PySearchDriver {
                 }
                 e.set_item("opportunities", x.opportunities)?;
                 e.set_item("blocked", x.blocked)?;
+                e.set_item("unsearched", x.unsearched)?;
+                e.set_item("searches", x.searches)?;
+                e.set_item("floored", x.floored)?;
+                e.set_item("raised", x.raised)?;
+                e.set_item("forced", x.forced)?;
+                e.set_item("first_search", x.first_search)?;
                 e.set_item("masked", x.masked)?;
                 e.set_item("dropped", x.dropped)?;
                 if let Some(ep) = x.episode {

@@ -405,6 +405,15 @@ pub struct ExploreCfg {
     /// The gate: a deviation is played only when the best untagged option's completed Q is at least
     /// the chosen move's minus this (the decider's utility: P(win) with `margin_w` 0), >= 0.
     pub q_margin: f64,
+    /// The searched alternatives (docs/search.md 3.9): a deviation only to an option with at least
+    /// this many root visits (forced walks included), and every exploring search - an eligible game's
+    /// recording seat at a decision with an option of a tag it can still explore - takes the root
+    /// minimum visits (`root_floor` of `min_visits`, `max_actions`, its budget) and at least the
+    /// seat's full budget `sims` (a fast draw searched with it, still unrecorded): the gate compares
+    /// estimates, not an unvisited option's v_mix. 0: neither (any option, its completed Q as it is).
+    pub min_visits: u32,
+    /// The largest root (number of options) an exploring search floors (>= 2 with `min_visits`).
+    pub max_actions: u32,
     /// Mask the outcome before the deviation: every record of the game made at or before its
     /// first deviating decision gets z := q and no margin target (`Record::masked`), a record
     /// without a root value by then (a value-only sample still waiting) is dropped.
@@ -441,6 +450,9 @@ impl ExploreCfg {
         }
         if !(self.q_margin.is_finite() && self.q_margin >= 0.0) {
             return Err(format!("explore q_margin {}: a finite number >= 0", self.q_margin));
+        }
+        if self.min_visits > 0 && self.max_actions < 2 {
+            return Err(format!("explore max_actions {}: at least 2 (a root of one option is not searched)", self.max_actions));
         }
         if self.tags.is_empty() {
             return Err("explore: no tags (a setting that explores nothing is refused)".into());
@@ -481,10 +493,21 @@ pub struct ExploreGame {
     /// those whose draw triggered but whose gate blocked the deviation.
     pub opportunities: Vec<u32>,
     pub blocked: Vec<u32>,
+    /// Per explored tag: the triggered opportunities refused because no alternative had `min_visits`
+    /// root visits (no estimate to gate on).
+    pub unsearched: Vec<u32>,
     pub episode: Option<Episode>,
     /// Records whose outcome was masked (z := q, no margin target) and records dropped.
     pub masked: u32,
     pub dropped: u32,
+    /// The exploring searches (`ExploreCfg::min_visits`), those of them that took the floor, the
+    /// simulations their raised budgets added, their forced root walks, and the game's real moves
+    /// before the first of them (None: none) - the game is the one without exploration until then.
+    pub searches: u32,
+    pub floored: u32,
+    pub raised: u64,
+    pub forced: u64,
+    pub first_search: Option<u64>,
 }
 
 /// A game's exploration episode.
@@ -501,11 +524,13 @@ pub struct Episode {
     /// Decisions played otherwise (the first included).
     pub overridden: u32,
     /// At the first deviation: the chosen move's completed Q minus the deviation's (negative: the
-    /// deviation looked better), the deviation's visits.
+    /// deviation looked better); the fewest root visits (forced walks included) of the episode's
+    /// deviations.
     pub q_gap: f64,
     pub alt_visits: u32,
     /// Why it ended: "decision" (a window of 0), "window", "gate" (a deviation the gate blocked
-    /// inside the window: the habit was played) or "game" (over first).
+    /// inside the window: the habit was played), "unsearched" (inside the window no alternative had
+    /// `min_visits` visits: the habit was played) or "game" (over first).
     pub end: &'static str,
 }
 
@@ -854,6 +879,9 @@ struct Slot<G: SearchGame> {
     gnoise: Vec<f64>,
     /// The game's exploration (docs/search.md 3.9); None when the driver does not explore.
     xp: Option<Box<Explore>>,
+    /// The exploration floor of the current search (`ExploreCfg::min_visits`; 0: none), kept for a
+    /// restarted search of the same decision.
+    xfloor: u32,
 }
 
 /// One game's exploration state (docs/search.md 3.9).
@@ -876,8 +904,15 @@ struct Explore {
     marks: Vec<u8>,
     opportunities: Vec<u32>,
     blocked: Vec<u32>,
+    unsearched: Vec<u32>,
     /// The current decision's tags (scratch).
     tags: Vec<u8>,
+    /// The exploring searches' accounting (`ExploreGame`).
+    searches: u32,
+    floored: u32,
+    raised: u64,
+    forced: u64,
+    first_search: Option<u64>,
 }
 
 /// `Explore::marks`: the record's z becomes its q (no margin target) / the record is dropped.
@@ -920,6 +955,7 @@ impl<G: SearchGame> Slot<G> {
             moves: Vec::new(),
             gnoise: Vec::new(),
             xp: None,
+            xfloor: 0,
         }
     }
     fn drop_tree(&mut self, q: usize) {

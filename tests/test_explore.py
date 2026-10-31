@@ -24,8 +24,8 @@ from test_select_scale import _training_files
 TOY_TAGS = [('fish', 0, 0.5), ('timber', 1, 0.25)]
 
 
-def seat():
-    return G.nn_seat('m', 16, selfplay=True, sims_fast=4, p_full=0.5, temp_moves=10, view_samples=1.0)
+def seat(sims=16):
+    return G.nn_seat('m', sims, selfplay=True, sims_fast=sims // 4, p_full=0.5, temp_moves=10, view_samples=1.0)
 
 
 def uniform(lb):
@@ -41,8 +41,8 @@ def uniform(lb):
     return pri, v, np.zeros((b, 8), np.float32)
 
 
-def play(explore=None, games=24, seed=5):
-    d = G.Driver('toy', [[seat(), seat()]] * games, concurrency=games, seed=seed, record=True, threads=2,
+def play(explore=None, games=24, seed=5, sims=16):
+    d = G.Driver('toy', [[seat(sims), seat(sims)]] * games, concurrency=games, seed=seed, record=True, threads=2,
                  **({'explore': explore} if explore is not None else {}))
     rows, parts = [], []
     while True:
@@ -80,7 +80,8 @@ def test_the_toys_tags_and_unknown_names_are_refused():
 def test_rows_and_samples():
     rows, parts = play()
     assert all('explore' not in r for r in rows) and all('masked' not in s for s in parts)
-    x = {'games': 1.0, 'q_margin': 1e9, 'mask_z': True, 'tags': [{'tag': 'fish', 'p': 1.0}, {'tag': 'timber'}]}
+    x = {'games': 1.0, 'q_margin': 1e9, 'mask_z': True, 'min_visits': 0,
+         'tags': [{'tag': 'fish', 'p': 1.0}, {'tag': 'timber'}]}
     rows, parts = play(x)
     eps = [r['explore']['episode'] for r in rows if r['explore'].get('episode')]
     assert len(eps) > 10 and all(r['explore']['eligible'] for r in rows)
@@ -106,6 +107,15 @@ def test_rows_and_samples():
     t = m['tags']['fish']
     assert t['episodes'] == 2 * sum(e['tag'] == 1 for e in eps) and t['opportunities'] >= t['episodes']
     assert sum(t['turns'].values()) == t['episodes'] and t['q_gap'] is not None
+    # min_visits 2 on a 64-simulation seat (the toy's roots of ~11 options: max_actions 16): exploring
+    # searches floored and raised, every deviation to an option of >= 2 visits, the tally's accounting
+    rows4, _ = play(dict(x, min_visits=2, max_actions=16), sims=64)
+    eps4 = [r['explore']['episode'] for r in rows4 if r['explore'].get('episode')]
+    assert eps4 and all(e['alt_visits'] >= 2 for e in eps4)
+    m4 = X.summary(X.tally(rows4, X.new_tally(G.info('toy'), dict(d, min_visits=2))))
+    assert m4['floored'] > 0 and m4['raised_sims'] > 0 and m4['searches'] >= m4['floored']
+    assert all(t['alt_under'] == 0 for t in m4['tags'].values())
+    assert all(r['explore']['first_search'] is not None for r in rows4)
     # pick 'game': each game's drawn tag in its row, the tally's `drawn`, every episode that tag's
     rows3, _ = play(dict(x, game_tag=True))
     assert all(r['explore']['tag'] in (1, 2) for r in rows3)
@@ -118,17 +128,20 @@ def test_settings():
     info = G.info('toy')
     assert X.driver_dict({}, info) is None and X.driver_dict({'selfplay_explore': ''}, info) is None
     d = X.driver_dict({'selfplay_explore': 'all'}, info)
-    assert d == {'games': 0.25, 'q_margin': 0.1, 'mask_z': True,
+    assert d == {'games': 0.25, 'q_margin': 0.1, 'mask_z': True, 'min_visits': 4, 'max_actions': 8,
                  'tags': [{'tag': 'fish', 'p': 0.5, 'window': 0}, {'tag': 'timber', 'p': 0.25, 'window': 1}]}
     d = X.driver_dict({'selfplay_explore': 'timber', 'selfplay_explore_p': '0.3', 'selfplay_explore_window': 'timber=2',
-                       'selfplay_explore_games': 1.0, 'selfplay_explore_q_margin': 0.05, 'selfplay_explore_mask_z': 0},
-                      info)
-    assert d == {'games': 1.0, 'q_margin': 0.05, 'mask_z': False, 'tags': [{'tag': 'timber', 'p': 0.3, 'window': 2}]}
+                       'selfplay_explore_games': 1.0, 'selfplay_explore_q_margin': 0.05, 'selfplay_explore_mask_z': 0,
+                       'selfplay_explore_min_visits': 0, 'selfplay_explore_max_actions': 4}, info)
+    assert d == {'games': 1.0, 'q_margin': 0.05, 'mask_z': False, 'min_visits': 0, 'max_actions': 4,
+                 'tags': [{'tag': 'timber', 'p': 0.3, 'window': 2}]}
     d = X.driver_dict({'selfplay_explore': 'fish', 'selfplay_explore_pick': 'game'}, info)
     assert d['game_tag'] is True and 'game_tag' not in X.driver_dict({'selfplay_explore': 'fish'}, info)
     for cfg, msg in [({'selfplay_explore': 'fish', 'selfplay_explore_pick': 'all'}, "selfplay_explore_pick 'all'"),
                      ({'selfplay_explore': 'trees'}, "declares no habit tag \\['trees'\\]"),
                      ({'selfplay_explore': 'fish,fish'}, 'a tag twice'),
+                     ({'selfplay_explore': 'fish', 'selfplay_explore_min_visits': -1}, 'min_visits -1'),
+                     ({'selfplay_explore': 'fish', 'selfplay_explore_max_actions': 1}, 'max_actions 1'),
                      ({'selfplay_explore': 'fish', 'selfplay_explore_games': 0}, 'selfplay_explore_games 0'),
                      ({'selfplay_explore': 'fish', 'selfplay_explore_q_margin': -1}, 'q_margin -1'),
                      ({'selfplay_explore': 'fish', 'selfplay_explore_p': 'timber=0.5'}, "'timber' is not an explored"),
@@ -144,7 +157,7 @@ def test_settings():
 
 
 def test_window_masked_and_the_margin_loss(tmp_path):
-    x = {'games': 1.0, 'q_margin': 1e9, 'mask_z': True, 'tags': [{'tag': 'fish', 'p': 1.0}]}
+    x = {'games': 1.0, 'q_margin': 1e9, 'mask_z': True, 'min_visits': 0, 'tags': [{'tag': 'fish', 'p': 1.0}]}
     _, parts = play(x)
     _, plain = play()
     for name, ps in (('a', parts), ('b', plain)):

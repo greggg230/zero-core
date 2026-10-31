@@ -2342,7 +2342,7 @@ use crate::toy::{ToySpec, S_FISH};
 /// An exploration setting of the toy's tags (`ToyGame::EXPLORE_TAGS`: 1 = fish, 2 = timber):
 /// (id, p, window) each.
 fn explore(games: f64, q_margin: f64, mask_z: bool, tags: &[(u8, f64, u32)]) -> ExploreCfg {
-    ExploreCfg { games, q_margin, mask_z, game_tag: false, tags: tags.iter().map(|&(id, p, window)| ExploreTagCfg { id, p, window }).collect() }
+    ExploreCfg { games, q_margin, mask_z, game_tag: false, min_visits: 0, max_actions: 8, tags: tags.iter().map(|&(id, p, window)| ExploreTagCfg { id, p, window }).collect() }
 }
 
 /// A toy self-play run with every move logged: rows by gid, each game's records.
@@ -2645,4 +2645,62 @@ fn a_game_tag_explores_only_the_tag_its_game_drew() {
     assert!(drawn[1] > 8 && drawn[2] > 8, "{drawn:?}");
     let (ra, _) = xrun(nn(0, 16, true), Some(explore(1.0, 1e9, true, &[(1, 1.0, 0), (2, 1.0, 1)])), 10, 2, 2);
     assert!(ra.iter().all(|r| r.explore.as_ref().unwrap().tag == 0));
+}
+
+#[test]
+fn exploring_searches_take_the_floor_and_deviate_to_searched_options() {
+    // min_visits k: an eligible game's exploring searches (a decision with an option of a tag the seat
+    // may still deviate from) get at least the full budget (a fast draw raised: 64 - 16 each) and the
+    // root floor; a deviation goes only to an option with >= k root visits. Ineligible games are the
+    // games without exploration; an eligible game is until its first exploring search.
+    let mk = |k: u32, max_actions: u32| {
+        let mut x = explore(0.5, 1e9, true, &[(1, 1.0, 0), (2, 1.0, 1)]);
+        x.min_visits = k;
+        x.max_actions = max_actions;
+        x
+    };
+    let (ra, pa) = xrun(nn(0, 64, true), None, 40, 2, 2);
+    let (rb, pb) = xrun(nn(0, 64, true), Some(mk(2, 16)), 40, 2, 2);
+    let (rc, _) = xrun(nn(0, 64, true), Some(mk(2, 16)), 40, 3, 1);
+    let (mut eps, mut floored, mut eligible, mut forced) = (0, 0, 0, 0);
+    for g in 0..40 {
+        let (a, b) = (&ra[g], &rb[g]);
+        let x = b.explore.as_ref().unwrap();
+        assert_eq!((&b.moves, &b.explore), (&rc[g].moves, &rc[g].explore), "game {g}: threads and groups");
+        if !x.eligible {
+            assert_eq!(&a.moves, &b.moves);
+            assert_eq!(records_digest(&pa[g]), records_digest(&pb[g]));
+            assert_eq!((x.searches, x.floored, x.raised, x.forced, x.first_search), (0, 0, 0, 0, None));
+            continue;
+        }
+        eligible += 1;
+        let s = x.first_search.expect("an exploring search in every eligible game") as usize;
+        assert_eq!(a.moves[..s], b.moves[..s], "game {g}: before its first exploring search");
+        assert!(x.searches >= x.floored && x.floored > 0, "game {g}: {x:?}");
+        forced += x.forced;
+        assert_eq!(x.raised % 48, 0, "game {g}: fast draws raised by 64 - 16");
+        floored += x.floored;
+        if let Some(ep) = &x.episode {
+            eps += 1;
+            assert!(ep.alt_visits >= 2, "game {g}: a deviation to an option of {} visits", ep.alt_visits);
+            assert!(ep.step as usize >= s);
+        }
+    }
+    assert!(eligible > 10 && eps > 10 && floored > 50 && forced > 20, "eligible {eligible}, episodes {eps}, floored {floored}, forced {forced}");
+    // no floor (the roots are larger than max_actions) and k 24: alternatives rarely have 24 visits -
+    // triggers refused as unsearched, and every deviation still to an option of >= 24 visits
+    let (rd, _) = xrun(nn(0, 64, true), Some(mk(24, 2)), 40, 2, 2);
+    let unsearched: u32 = rd.iter().map(|r| r.explore.as_ref().unwrap().unsearched.iter().sum::<u32>()).sum();
+    assert!(unsearched > 5, "{unsearched}");
+    for r in &rd {
+        let x = r.explore.as_ref().unwrap();
+        assert_eq!(x.forced, 0);
+        if let Some(ep) = &x.episode {
+            assert!(ep.alt_visits >= 24, "{}", ep.alt_visits);
+        }
+    }
+    // the setting's check
+    let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]; 4], &[("m", KeyKind::Nn)]);
+    c.explore = Some(mk(4, 1));
+    assert!(Driver::<ToyGame>::new(c).map(|_| ()).unwrap_err().contains("max_actions 1"));
 }
