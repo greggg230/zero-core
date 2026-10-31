@@ -40,6 +40,12 @@ eval_gumbel_scale, 0 = none). The side's move rule is then the Gumbel search's (
 Per-side simulations (docs/az.md 20.4): --a-sims / --b-sims (default --sims), e.g. `A A --a-sims 128
 --b-sims 32` (the output then names `sims_a`, `sims_b`).
 
+CUDA graphs (docs/az.md 10.6): --graphs 0 | 1 for both sides, --a-graphs / --b-graphs for one (over
+--graphs); default: each side's NetEvaluator default (a conv network's on, a token network's env
+ZERO_TOKEN_GRAPHS=1). Given, the output names `graphs_a` / `graphs_b` (each side's CUDA-graph
+batches over its batches: 1.0 = every batch). `A A --a-graphs 1 --b-graphs 0` is the equivalence
+check of a token network's graphs against its eager inference.
+
 Paired games and sequential testing (docs/az.md 20.3):
 
   --paired          games 2k and 2k + 1 share every random stream (the deal, shuffles, chance: the
@@ -323,27 +329,45 @@ def summary(rs, paired=False):
     return out
 
 
+def _evaluators(ma, mb, device, graphs):
+    """Each side's NetEvaluator; `graphs` None (each one's default), a bool for both, or (a, b) (None:
+    that side's default)."""
+    ga, gb = graphs if isinstance(graphs, (tuple, list)) else (graphs, graphs)
+    return {'a': NetEvaluator(ma, device, graphs=ga), 'b': NetEvaluator(mb, device, graphs=gb)}
+
+
+def _graphs_used(out, evs, graphs):
+    """`graphs_a` / `graphs_b`: each side's CUDA-graph batches over its batches (with `graphs` given)."""
+    if graphs is None or (isinstance(graphs, (tuple, list)) and all(g is None for g in graphs)):
+        return
+    for k in ('a', 'b'):
+        ev = evs[k]
+        out[f'graphs_{k}'] = round(ev.graph_calls / ev.calls, 4) if ev.calls else None
+
+
 def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None,
           spec=None, conc=None, seat_a=None, seat_b=None, max_steps=5000, move_log=0, rows=False, paired=False,
-          sims_a=None, sims_b=None):
+          sims_a=None, sims_b=None, graphs=None):
     """Checkpoint `a` vs checkpoint `b` (paths), `games` 2-player games, seats alternating. -> dict.
     `seat_a` / `seat_b`: each side's move-rule seat settings ({'select': 'cq', 'select_min_visits':
     2, ...}; {} = the default rule; None = its checkpoint's run's eval_select, `run_rule`).
     `move_log`: the driver's move log (the first N moves of each game in its row), `rows`: the
     games' result rows under 'rows'. `paired`: games 2k and 2k + 1 share their deal with the seats
     swapped (`games` even; the output's `pairs`, `se` of the pair scores: `summary`). `sims_a` /
-    `sims_b`: a side's simulations (None: `sims`)."""
+    `sims_b`: a side's simulations (None: `sims`). `graphs`: the sides' CUDA graphs (`_evaluators`;
+    given: `graphs_a` / `graphs_b` in the output)."""
     if paired and games % 2:
         raise ValueError(f'paired games: an even number of games ({games})')
     ma, mb, game = _load_pair(a, b, device, game)
     spec = package.active().specs.get(game) if spec is None else spec
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
+    evs = _evaluators(ma, mb, device, graphs)
     t0 = time.time()
-    rs = _play(game, sa, sb, {'a': NetEvaluator(ma, device), 'b': NetEvaluator(mb, device)}, games, spec, conc, seed,
-               threads, groups, max_steps, move_log, paired)
+    rs = _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired)
     out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb))
     _sides_sims(out, sims_a, sims_b)
+    _graphs_used(out, evs, graphs)
     if paired:
         out['paired'] = True
     if rows:
@@ -360,7 +384,7 @@ def _sides_sims(out, sims_a, sims_b):
 def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, beta=0.05, target_se=None, sims=64,
                chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None, spec=None, conc=None,
                seat_a=None, seat_b=None, max_steps=5000, paired=False, sims_a=None, sims_b=None, on_batch=None,
-               rows=False):
+               rows=False, graphs=None):
     """`match` in batches of `batch_games` until decided: `sprt` (elo0, elo1) - the log-likelihood ratio
     (`sprt_llr`) leaves `sprt_bounds(alpha, beta)` - or `se` <= `target_se`, or `max_games` played. Batch k
     is seeded seed + 7919 k (batch 0: `seed`, the plain match's games). -> `match`'s dict over every game,
@@ -383,7 +407,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     ma, mb, game = _load_pair(a, b, device, game)
     spec = package.active().specs.get(game) if spec is None else spec
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
-    evs = {'a': NetEvaluator(ma, device), 'b': NetEvaluator(mb, device)}
+    evs = _evaluators(ma, mb, device, graphs)
     t0 = time.time()
     rs, batches, stop, llr = [], [], None, None
     k = 0
@@ -417,6 +441,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb), batches=batches, stop=stop)
     _sides_sims(out, sims_a, sims_b)
+    _graphs_used(out, evs, graphs)
     if paired:
         out['paired'] = True
     if sprt is not None:
@@ -478,6 +503,12 @@ def main(argv=None):
                     help="a Gumbel side's considered options (default: its run's gumbel_m, 16)")
     for side in ('a', 'b'):
         ap.add_argument(f'--{side}-sims', type=int, default=None, help=f"side {side.upper()}'s simulations (default --sims)")
+    ap.add_argument('--graphs', type=int, default=None, choices=[0, 1],
+                    help="both sides' CUDA graphs (default: the evaluator's: a conv network's on, a token network's "
+                         "env ZERO_TOKEN_GRAPHS=1; docs/az.md 10.6)")
+    for side in ('a', 'b'):
+        ap.add_argument(f'--{side}-graphs', type=int, default=None, choices=[0, 1],
+                        help=f"side {side.upper()}'s CUDA graphs (over --graphs)")
     ap.add_argument('--paired', action='store_true',
                     help='games 2k and 2k + 1 share their deal with the seats swapped (docs/az.md 20.3; --games even)')
     ap.add_argument('--sprt', default=None, metavar='E0,E1',
@@ -555,16 +586,21 @@ def main(argv=None):
             ap.error(f'side {side.upper()}: {e}')
         if getattr(a, f'{side}_gumbel_scale') is not None and sides[k].get('root_search') != 'gumbel':
             ap.error(f"--{side}-gumbel-scale: side {side.upper()} searches with PUCT")
+    graphs = None
+    if (a.graphs, a.a_graphs, a.b_graphs) != (None, None, None):
+        graphs = tuple(None if v is None else bool(v)
+                       for v in (a.graphs if a.a_graphs is None else a.a_graphs,
+                                 a.graphs if a.b_graphs is None else a.b_graphs))
     if seq:
         out = sequential(a.a, a.b, a.batch_games or a.games, a.max_games or 4 * a.games, sprt, a.alpha, a.beta,
                          a.target_se, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device, spec=a.spec,
                          seat_a=sides[0], seat_b=sides[1], paired=a.paired, sims_a=a.a_sims, sims_b=a.b_sims,
-                         on_batch=lambda r: print('# batch ' + json.dumps(r), file=sys.stderr, flush=True))
+                         on_batch=lambda r: print('# batch ' + json.dumps(r), file=sys.stderr, flush=True), graphs=graphs)
         print(json.dumps(out), flush=True)
         return
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
                            spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log, paired=a.paired,
-                           sims_a=a.a_sims, sims_b=a.b_sims)), flush=True)
+                           sims_a=a.a_sims, sims_b=a.b_sims, graphs=graphs)), flush=True)
 
 
 if __name__ == '__main__':
