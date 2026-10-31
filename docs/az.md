@@ -3234,7 +3234,7 @@ with thinner) window samples is the A/B's question (its ENGINE.md 77.6).
 On cc83628 (the code; docs after it), desktop 2026-10-31, CPU only (`CUDA_VISIBLE_DEVICES=-1`), below
 normal priority, beside the live main line:
 
-* `cargo test --release`: 95 passed (zero_search: 89 + 6 new; webnet 3). One run saw
+* `cargo test --release`: 98 passed (zero_search 95 = 89 + 6 new, webnet 3). One run saw
   `queued_setups_fill_every_free_slot_when_the_queue_is_long` fail on its batch sizes (thread timing
   under load; passed on rerun, eval seats only).
 * `pytest tests`: 328 passed, 3 skipped (CUDA), 1 failed under load -
