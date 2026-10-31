@@ -1524,7 +1524,7 @@ the code; this commit adds documentation only):
 * `check_checkpoint_compat --package mtgz` against MTG Zero's main 1605436 (zero-core c15e3d0): a random
   network (the gate) and the main line's iteration 328 (the Delver spec, 8 games a target, 8 against
   random): identical (records visits 73693aedf6cb0b7f, cq 6dd36ebeb19d9fbf, results 38b68141fc4cff90).
-* MTG Zero (branch `token-graphs`, its ENGINE.md 75): `tools/gate.py optin-core` twice on 23d4fd3 (this
+* MTG Zero (branch `token-graphs`, its ENGINE.md 78): `tools/gate.py optin-core` twice on 23d4fd3 (this
   core at 3d5875e): core tests 92 passed, checkpoint_compat byte identity identical against main 1605436,
   `--test az` 39 passed, `--test hidden` 16 passed, Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder
   4202a4a build against this core - and the last step **FAILED both times** on its smoke_all's core
