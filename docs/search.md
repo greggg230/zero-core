@@ -203,7 +203,8 @@ One list of seat dicts per game (players = its length):
 'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale',
 'select', 'select_min_visits', 'record', 'root_min_visits', 'root_min_visits_max_actions',
 'leaf_value_view', 'view_samples', 'view_sample_target', 'belief_tilt', 'belief_clip', 'belief_mix', 'belief_fast',
-'root_search', 'gumbel_m', 'gumbel_scale', 'gumbel_c_visit', 'gumbel_c_scale'}`
+'root_search', 'gumbel_m', 'gumbel_scale', 'gumbel_c_visit', 'gumbel_c_scale', 'sims_light',
+'sims_light_fast', 'light_record', 'light_classes'}`
 (`games.nn_seat`; `policy_target` only matters for recorded decisions, section 3.1; `select` and its
 guard for the moves the seat does not sample, section 3.3; `cq_c_visit` / `cq_c_scale` are the
 completed-Q transform of both; `record` false - absent: true - a self-play seat whose full searches
@@ -213,7 +214,8 @@ docs/az.md 14, puts a past checkpoint there; `root_min_visits` the floor of its 
 visits, section 3.5; `leaf_value_view` whose view its leaves' values come from, `view_samples` /
 `view_sample_target` its value-only samples, section 3.6; `root_search` 'puct' | 'gumbel' and the
 `gumbel_*` keys its root search, section 3.7; `belief_tilt`, `belief_clip`, `belief_mix`,
-`belief_fast` the root's belief of its searches, section 3.8). Evaluator keys: every distinct
+`belief_fast` the root's belief of its searches, section 3.8; `sims_light`, `sims_light_fast`,
+`light_record`, `light_classes` a self-play seat's light decisions, section 3.10). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
 
@@ -284,7 +286,8 @@ at `max_steps` has `over` False and result 1/n each; `tag` is the tag of the que
 game started from (2.9), else None. A deferred game's row comes when it is resolved (2.8).
 With the driver's `move_log` N (a diagnostic, default 0 = off: nothing changes), a row also
 has `moves`: its first N real moves as `(seat, action, legal actions)` (the external seats'
-answers excluded; a resolved game's: none). `zero.h2h --move-log`.
+answers excluded; a resolved game's: none). `zero.h2h --move-log`. With a seat that has `sims_light`
+(3.10), a row also has `light`: {decisions, recorded, sims, saved, sims_all}.
 
 ### 2.6 Rolling mode
 
@@ -407,7 +410,9 @@ Python reference driver has no pairing. Uses: docs/az.md 20.3 (zero.h2h `--paire
 * **Per decision**: single-option decisions are not searched; playout cap (`p_full` share
   gets `sims` and is recorded, the rest `sims_fast`; a minor decision of a self-play seat with
   `sims_minor` gets `sims_minor` and is never recorded, the playout-cap draw being made all the
-  same; the budget is then divided by the game's `sims_divisor`, at least one); root Dirichlet
+  same; a light decision of a self-play seat with `sims_light` gets `sims_light` / `sims_light_fast`,
+  recorded only with `light_record`, section 3.10; the budget is then divided by the game's
+  `sims_divisor`, at least one); root Dirichlet
   noise on full self-play
   searches (also on a reused, already expanded root); the opt-in root minimum visits of full
   searches (section 3.5: forced walks, left out of the visit counts below); with the opt-in Gumbel
@@ -906,6 +911,67 @@ Tests: `tree::tests::belief_*`, `a_belief_deals_*`, `no_belief_*`, `without_rede
 `driver::tests::belief_*`, `one_belief_row_*`, `an_evaluator_without_the_belief_*`,
 `the_belief_deals_the_searches_worlds`, `root_view_values_and_the_belief_*`, `rolling_phases_ask_the_belief_*`,
 `tests/test_belief.py`.
+
+### 3.10 Light decisions (`sims_light`, `light_record`, `light_classes`; 2026-10-31)
+
+(3.9 is self-play exploration's, on the unmerged branch `feat/explore`.)
+
+**Why.** MTG Zero's Delver mirror spends ~29% of its searched decisions and of its self-play
+simulations on "timing windows" - priority with an empty stack outside the decider's own main phases -
+where the network acts in ~9%, the search changes the policy's move ~2% of the time and the median Q gap
+between passing and the best alternative is 0.006 (its ENGINE.md 77.1). A minor decision (`sims_minor`)
+is small and unrecorded, but `minor_decision` is one class for a game's payments; `sims_divisor` divides
+every network seat's budget, evaluation included. Light decisions are a third kind: game-declared
+classes a **self-play** seat may search with a small budget, recorded or not, evaluation untouched.
+
+**The hook** (`game.rs`). `SearchGame::LIGHT_CLASSES` (the names of the game's classes, at most 64;
+default none) and `light_class()` (the pending decision's class, an index into them; None = not light;
+default None). Read only by a self-play seat with `sims_light`, at the start of its search of a
+decision (the live game, never a determinized world: a class should depend on public facts only).
+The toy declares two (`plow`: the plow question, `count`: the counts decisions; inert unless asked).
+
+**The seat** (`driver.rs` `NnSeat`). `sims_light` (None = off: the hook is never read, the seat of
+before), `sims_light_fast` (None = `sims_light`), `light_record` (false), `light_classes` (a bit mask of
+the game's classes; with `sims_light` at least one). At `start` (`driver/worker.rs`), after the
+playout-cap draw (made all the same, so the streams do not depend on the setting) and after the minor
+check (a minor decision stays minor: the two do not stack), a decision of a selected class takes
+`sims_light` on a full draw and `sims_light_fast` on a fast one; then `sims_divisor` divides it as any
+budget. With `light_record` false it is a minor decision's treatment: never recorded, no root
+Dirichlet noise, no root floor (3.5), no root belief unless `belief_fast` (3.8), and a value-only
+record waiting for its observer's next search (3.6) waits on past it (too small a search to be a
+target). With `light_record` true a full draw is a full search in every respect - recorded, its policy
+target and root value `q` from the light search, root noise, the floor and the belief where they
+apply - and a fast draw a fast search. **The trade-off**: unrecorded, the classes' samples are gone (a
+third of MTG Zero's recorded decisions, among them what teaches the policy when to act in a window);
+recorded, they stay with thinner targets (the visit or completed-Q target of a 16-simulation search
+instead of 64: noisier, closer to the prior) and the value targets' `q` of those rows from that search.
+
+**Checks** (`NnSeat::check_light`, `Driver::new`): refused - never ignored - on an evaluation seat, for a
+game without classes, without a class or with one the game does not have, a budget above the one it
+replaces (`sims_light` > `sims`; the fast draw's budget > `sims_fast`: set `sims_light_fast`),
+`sims_light_fast` without `sims_fast` (every draw is full), `sims_light_fast` / `light_record` /
+`light_classes` without `sims_light`, and 0 (off is no key).
+
+**What it reports.** A result row (2.5) gets `light` = {decisions, recorded, sims, saved, sims_all}
+when a seat of the driver has `sims_light` (else no key: the rows of before): the game's light decisions,
+those recorded, their simulations, the simulations they saved against their drawn budgets, and every
+search's simulations in the game (light or not: the saved share of the budget is saved / (sims_all +
+saved)). `stats()` adds `light`, `light_recorded`, `light_saved`. `Game.light_class()` (the bindings):
+the pending decision's class name. The Python reference driver (`play.py`) has neither minor nor light
+decisions (its seats refuse the keys).
+
+**Settings.** Seat keys `sims_light`, `sims_light_fast`, `light_record`, `light_classes` (class indices;
+`games.nn_seat`); game info `light_classes` (the names); run settings (docs/az.md 22)
+`selfplay_sims_light`, `selfplay_sims_light_fast`, `selfplay_light_record`, `selfplay_light_classes`.
+
+Code: `game.rs` (`LIGHT_CLASSES`, `light_class`), `driver.rs` (`NnSeat::sims_light` ...,
+`check_light`, `light_budget`, `LightGame`, `GameResult::light`, `DriverCfg::light_on`, the stats),
+`driver/worker.rs` (`start`, `decide`, `finish`), `toy.rs`, `dynapi.rs` and the bindings. Tests:
+`driver::tests::light_settings_are_checked`, `light_decisions_off_change_nothing`,
+`unrecorded_light_decisions_take_their_budget_and_no_records`,
+`recorded_light_decisions_record_their_full_draws`,
+`light_classes_select_the_decisions_and_minor_comes_first`,
+`evaluation_seats_and_matches_ignore_light_decisions`; `tests/test_light.py`.
 
 ## 4. Bindings and registering a game
 

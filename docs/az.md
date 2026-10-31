@@ -34,6 +34,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
 | `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
+| `light.py` | Light decisions in self-play (section 22): the run settings resolved against the game's classes (`settings`, `select_classes`, `seat_keys`), the remote's `fingerprint`, the result rows' tallies and the self-play line's `light` |
 | `league.py` | The self-play league (section 14): the league games' kinds and seat tables (classic, rolling), the iteration's picks of past checkpoints (`League.plan`: uniform or pfsp), the slots' evaluators (guarded), the games' attribution and `selfplay.league` |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
@@ -103,6 +104,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `ext_groups` | 2 (Glass Road Zero: 8) | groups for matches with an external player (section 5) |
 | `sims`, `sims_fast`, `p_full` | 64, 16, 0.25 | playout-cap randomisation (only `p_full` decisions are training samples) |
 | `sims_minor` | 0 | simulations of the game's minor decisions in self-play (`SearchGame::minor_decision`, MTG: the land to tap), never recorded; 0 = searched like the others (docs/search.md 1, 3) |
+| `selfplay_sims_light`, `selfplay_sims_light_fast`, `selfplay_light_record`, `selfplay_light_classes` | 0, 0, 0, 'all' | light decisions in self-play (section 22, docs/search.md 3.10): the game's classes of decisions that rarely matter (MTG Zero: its timing windows) searched with this budget (a full draw; a fast draw `_fast`, 0 = the same), recorded (full draws) only with `_record` 1; 0 = off |
 | `c_puct`, `alpha`, `eps`, `temp_moves` | 1.0, 0.3, 0.25, 20 | PUCT constant (values in [0, 1]), root Dirichlet noise, sampled moves per game |
 | `chance_k`, `margin_w`, `redet`, `max_steps` | 0, 0, 1, 100000 | sampled chance outcomes kept per edge (0 = resample every visit), utility margin credit, fresh determinization per simulation, abandon a game after this many moves |
 | `policy_target`, `cq_c_visit`, `cq_c_scale` | visits, 50, 1.0 | training target of the recorded decisions: the root visit distribution, or Gumbel AlphaZero's completed-Q target (docs/search.md 3.1, section 9); the search is the same |
@@ -3132,3 +3134,120 @@ nice 19 for the measurements), on ec57c15 (the code; this commit adds documentat
   `--test hidden`, Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder 4202a4a build against this
   core: GREEN), `check_checkpoint_compat` with the Delver line's checkpoint 196 identical, pytest 62
   passed; the anchors end to end on the Mac (`eval_remote mac`).
+
+## 22. Light decisions in self-play (`zero/light.py`; MTG Zero's timing windows, 2026-10-31)
+
+### 22.1 Why
+
+MTG Zero's Delver main line (`runs/r3-2b-beliefsearch`) spends ~29% of its searched decisions and of
+its self-play simulations on "timing windows": priority with an empty stack outside the decider's own
+main phases. The network acts in ~9% of them (Brainstorm, Lightning Bolt, Mishra's Bauble, Unholy Heat,
+a Clue, Wasteland), the search changes the policy's move ~2% of the time, the median Q gap between
+passing and the best alternative is 0.006, and 92% of them come in runs of 2+ consecutive windows with
+the same options (its ENGINE.md 77.1). Searching them at a minor decision's 4 simulations would free
+~25% of self-play's compute; recording none of them would drop ~29% of the recorded samples, among them
+what teaches the policy when to act. Light decisions do either, as a self-play setting.
+
+### 22.2 The settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `selfplay_sims_light` | 0 | N > 0: a light decision whose playout-cap draw was full is searched with N simulations instead of `sims`; 0 = off (the game's hook is never read; nothing changes) |
+| `selfplay_sims_light_fast` | 0 | a fast draw's light search: this many instead of `sims_fast` (0 = N) |
+| `selfplay_light_record` | 0 | 0: light decisions are never recorded (a minor decision's treatment: no root noise, floor or belief, no value-only record's next q from them); 1: a full draw is recorded as any full search, its targets from the N-simulation search; a fast draw stays a fast search |
+| `selfplay_light_classes` | 'all' | which of the game's classes (`SearchGame::LIGHT_CLASSES`): 'all', or comma-separated tokens left to right - a name or a glob adds what it matches, `-<name or glob>` removes it (`all,-opp_end`: every class but the opponent's end step; `opp_*`: the opponent's turn) |
+
+Self-play seats only: every evaluation seat (the yardstick, random, Elo, anchors, `zero.h2h`,
+`zero.replay`, the eval remote) is the seat of before, key for key. The league's opponents (section 14)
+are self-play seats and search light decisions too (they record nothing anyway). Refused at the start -
+never a silent no-op - for a game without classes, a token that matches no class, an empty selection, a
+budget above the one it replaces (`selfplay_sims_light` > `sims`; the fast draw's > `sims_fast`), a
+`_fast` / `_record` / `_classes` setting without `selfplay_sims_light`, a co-training run (single-game
+runs only); the driver checks the same (docs/search.md 3.10). The settings are saved in config.json
+(a resumed run without them gets the defaults: off).
+
+### 22.3 Recorded or not: the trade-off
+
+* **Unrecorded** (`selfplay_light_record` 0, e.g. `--selfplay-sims-light 4`): the cheapest - a window
+  at 4 simulations against 0.25 x 64 + 0.75 x 16 = 28 on average - but the classes' decisions are never
+  training samples. The policy there is then learned only through its generalisation from the other
+  decisions; the value head still sees those states through the recorded decisions' neighbours and the
+  value-only samples of the other seat (section 16). A value-only record waiting for its observer's
+  next search skips its light searches (too small to be a root value target) and takes the next full or
+  fast one's.
+* **Recorded** (`selfplay_light_record` 1, e.g. 16 / 4): the same decisions are recorded as before (the
+  full draws: the playout cap's share), their policy targets from a 16-simulation search instead of 64 -
+  noisier, closer to the prior: a 'cq' target with few visits leans on the network's own values - and
+  their root values `q` from it. Cost 0.25 x 16 + 0.75 x 4 = 7 simulations a window on average.
+* Neither changes the decisions of the other classes, the evaluation, or what a window offers.
+
+### 22.4 What it reports
+
+The self-play line's `light` (`Run.light_metrics`, `light.summary`), from the phase's finished games'
+result rows (docs/search.md 2.5) - this machine's and the remote's (remote self-play: each worker tallies
+the games the run accepted, `light.tally`, in its end line) - only when on:
+`games`, `per_game` (light decisions), `share` (of the searched decisions), `recorded_per_game`,
+`unrecorded_per_game`, `sims_per_game` (their simulations), `saved_per_game` (the simulations they saved
+against their drawn budgets) and `saved_share` = saved / (every search's simulations + saved): the
+share of the self-play search budget the setting saved. The start-up log says what is on ("light
+decisions: 4 simulations (full draws) / 4 (fast draws), never recorded; classes ...").
+
+### 22.5 Remote self-play
+
+A worker searches from the mirror's config (the run's): `Run.nn_seat` gives its seat the same keys. Its
+hello reports `light.fingerprint` (the budgets, recorded or not, the class names; '' when off); a worker
+whose fingerprint differs from the run's - an older checkout reports none and would search every window
+with the full budget in silence - is refused and retried in 10 minutes, as for the league and the root
+belief (sections 14, 18.5).
+
+### 22.6 Off by default; tests
+
+Off (every default): the seats, the drivers, the result rows, the samples and the metrics of before
+(the hook is never read: `driver::tests::light_decisions_off_change_nothing` with a game whose hook
+panics; the golden records). Tests: the driver's (docs/search.md 3.10) and `tests/test_light.py` (27:
+the class selection, the refusals, the seats and the evaluation seats unchanged, runs with unrecorded
+and recorded light decisions, remote self-play's tallies, a worker without them refused).
+
+### 22.7 What it measured on MTG Zero's Delver line (its ENGINE.md 77.5)
+
+CPU, the main line's checkpoint 320 (a read-only copy) at its own self-play search (64 full / 16 fast,
+p_full 0.25, minor 4, 'cq' targets 0.3, root-view leaves, the belief search, value-only samples 0.5),
+192 games a variant (driver seeds 1 and 2: the same deals in every variant, the games diverging at their
+first window), every game rebuilt from its move log and each searched decision classified by the game:
+
+| | off | light 4, unrecorded | light 16 / 4, recorded |
+|---|---|---|---|
+| windows (share of the searched decisions) | 29.3% | 29.3% | 29.3% |
+| leaves per game | 6,480 | 4,883 (-24.6%) | 5,159 (-20.4%) |
+| seconds per game (CPU, 2 + 2 threads) | 12.6 | 10.2 (-18.7%) | 10.5 (-16.3%) |
+| `saved_share` (the self-play line's) | - | 25.4% | 22.2% |
+| recorded samples per game (decisions + value-only) | 88.3 | 62.4 (-29.4%) | 90.1 (+2.0%) |
+| act rate in the windows | 8.5% +- 0.2 | 8.2% +- 0.2 | 8.6% +- 0.2 |
+
+The act rate holds by step and whose turn (every class within ~1.5 se of the control's) and the line's
+behaviour fingerprints (its ENGINE.md 73.5) move by at most ~1 se. Wall time falls less than the
+leaves: a decision's engine work stays. Both at a fixed network: what the policy learns without (or
+with thinner) window samples is the A/B's question (its ENGINE.md 77.6).
+
+### 22.8 Checks
+
+On cc83628 (the code; docs after it), desktop 2026-10-31, CPU only (`CUDA_VISIBLE_DEVICES=-1`), below
+normal priority, beside the live main line:
+
+* `cargo test --release`: 95 passed (zero_search: 89 + 6 new; webnet 3). One run saw
+  `queued_setups_fill_every_free_slot_when_the_queue_is_long` fail on its batch sizes (thread timing
+  under load; passed on rerun, eval seats only).
+* `pytest tests`: 328 passed, 3 skipped (CUDA), 1 failed under load -
+  `test_remoteplay.py::test_cotrain_the_local_driver_is_never_starved` (19 of 143 co-training games local
+  against its 15% floor; co-training never has light decisions) - and passed alone.
+* Toy-smoke runs byte for byte against c15e3d0 (its own worktree and target, `ZERO_INFLIGHT=1`, seed 3,
+  3 iterations): classic, and rolling with 'cq' 0.3 targets, the cq2 rule, value_q 0.6, the window cache -
+  each without the new settings and with all four given at their defaults: every shard, checkpoint,
+  optimizer state, Elo file, models/index.json and the metrics without timings identical; config.json
+  only gains the four keys.
+* `check_checkpoint_compat --package zero` (toy, uniform and random): identical.
+* MTG Zero (branch `light-decisions`, its ENGINE.md 77.7): `tools/gate.py optin-core` PASSED on 7e26452
+  (core tests 98, checkpoint_compat byte identity, `--test az` 39, `--test hidden` 16, `--test light` 3,
+  Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder 4202a4a build against this core: GREEN); its
+  digests unchanged (132437374243f7b2, encoding-free a0d54562c8330271); `check_checkpoint_compat` with
+  the Delver line's checkpoint 320 on its spec identical.
