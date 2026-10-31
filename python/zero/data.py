@@ -6,8 +6,11 @@ are compressed npz - zlib level 1, ~58x for MTG's sparse features - which `np.lo
 docs/az.md 5.3). Arrays: `x` float16 [N, F], `player`,
 `n_players` int8, `opt_off` int32 [N+1], `opt_action` int16/int32, `pi` float16, `z` / `q` /
 `sc` float16 [N, P] (P = most players in the shard), `net` int32, optionally `aux` float16 [N, W]
-(the deciders' auxiliary targets: self-play with an auxiliary loss on, docs/az.md 15), and `meta` (a
-JSON string: game, features, actions, rows, task info). Float16 targets are renormalised on load.
+(the deciders' auxiliary targets: self-play with an auxiliary loss on, docs/az.md 15) and `masked` uint8
+[N] (1 = an exploration episode masked the row's outcome: z = q, no margin target; self-play exploring
+with mask_z, docs/search.md 3.9), and `meta` (a JSON string: game, features, actions, rows, task info).
+Float16 targets are renormalised on load. A window with a shard that has `masked` has `masked` [N]
+(0 for the other shards' rows) and its batches `masked` [B]: the margin loss skips those rows.
 Non-finite guard (zero/finite.py, docs/az.md 4.1): `write_shard` checks x, pi, z, q, sc after the
 float16 cast; a shard with a NaN / inf is written as `*.bad.npz` instead (the window never loads
 it: `shard_paths` skips it) and the run fails (`NonFinite`). The `Window` checks every shard it
@@ -82,7 +85,8 @@ def compact(s):
             'opt_action': _narrow_int(s['opt_action']), 'pi': s['pi'].astype(np.float16),
             'z': s['z'][:, :P].astype(np.float16), 'q': s['q'][:, :P].astype(np.float16),
             'sc': s['sc'][:, :P].astype(np.float16), 'net': s['net'].astype(np.int32),
-            **({'aux': s['aux'].astype(np.float16)} if 'aux' in s else {})}
+            **({'aux': s['aux'].astype(np.float16)} if 'aux' in s else {}),
+            **({'masked': s['masked'].astype(np.uint8)} if 'masked' in s else {})}
 
 
 def write_shard(path, s, meta, bad_path=None, compress=0):
@@ -291,6 +295,9 @@ def _load_part(path, N, idx, F, xdst=None, AW=0):
         v = p[key][sel].astype(np.float32)
         a[:, :v.shape[1]] = v
         out[key] = a
+    if 'masked' in p:
+        # (an exploring self-play's shard: the rows whose outcome was masked, docs/search.md 3.9)
+        out['masked'] = p['masked'][sel].astype(np.uint8)
     if AW:
         if 'aux' in p:
             if p['aux'].shape[1] != AW:
@@ -446,6 +453,11 @@ class Window:
         self.q = np.concatenate([q['q'] for q in parts])
         self.sc = np.concatenate([q['sc'] for q in parts])
         self.loaded = total
+        # the rows an exploration episode masked (docs/search.md 3.9): None when no shard has them
+        self.masked = None
+        if any('masked' in q for q in parts):
+            self.masked = np.concatenate([q['masked'] if 'masked' in q else np.zeros(len(q['player']), np.uint8)
+                                          for q in parts])
         self.aux = np.concatenate([q['aux'] for q in parts]) if AW else None
         self.aux_mask = np.concatenate([q['aux_mask'] for q in parts]) if AW else None
         self.aux_rows = int(self.aux_mask.sum()) if AW else 0
@@ -502,4 +514,6 @@ class Window:
         if self.AW:
             out['aux'] = t(self.aux[idx].astype(np.float32))
             out['aux_mask'] = t(self.aux_mask[idx].astype(np.float32))
+        if self.masked is not None:
+            out['masked'] = t(self.masked[idx].astype(np.float32))
         return out

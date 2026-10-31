@@ -93,6 +93,9 @@ class HeldOut:
             raise ValueError(f'held-out shards of the game {self.game!r}, not {game!r}')
         self.check(features, actions)
         self.W = Window(self.paths, self.features, self.actions)
+        if self.W.masked is not None and self.W.masked.any():
+            raise ValueError(f'held-out shards {self.paths}: {int(self.W.masked.sum())} rows whose outcome exploration '
+                             f'masked (their z is not the outcome: docs/search.md 3.9)')
         self.name = set_name(self.paths)
         self.sources = sorted({m.get('heldout', {}).get('from', m.get('iter')) for m in metas}, key=str)
 
@@ -197,6 +200,10 @@ def make(src, out, rows=8192, seed=0):
         if 'aux' in z0.files:
             aw = int(z0['aux'].shape[1])
     W = Window(paths, F, A, budget_rows=int(rows), seed=int(seed), aux_width=aw)
+    if W.masked is not None and W.masked.any():
+        # (self-play exploration, docs/search.md 3.9: those rows' z is the search's q, not the outcome)
+        raise ValueError(f'{int(W.masked.sum())} of the drawn rows had their outcome masked by exploration: make the '
+                         f'held-out set from shards of a run that does not explore (selfplay_explore off)')
     s = {'x': W.x, 'player': W.player, 'n_players': W.n_players, 'opt_off': W.opt_off, 'opt_action': W.opt_action,
          'pi': W.pi, 'z': W.z, 'q': W.q, 'sc': W.sc, 'net': np.zeros(W.N, np.int32)}
     if aw and bool(W.aux_mask.all()):

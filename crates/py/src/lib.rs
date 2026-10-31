@@ -19,7 +19,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, ExploreCfg, ExploreTagCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
 use zero_search::{SearchGame, MAX_SEATS};
 
@@ -251,7 +251,43 @@ fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>>
     d.set_item("max_seats", MAX_SEATS)?;
     d.set_item("aux_layout", i.aux.clone())?;
     d.set_item("aux_width", i.aux.iter().map(|s| s.1).sum::<usize>())?;
+    // the habit tags of self-play exploration (docs/search.md 3.9): [(name, window, p)], tag id k + 1
+    d.set_item("explore_tags", i.explore_tags.iter().map(|t| (t.name, t.window, t.p)).collect::<Vec<_>>())?;
     Ok(d)
+}
+
+const EXPLORE_KEYS: &[&str] = &["games", "q_margin", "mask_z", "tags"];
+const EXPLORE_TAG_KEYS: &[&str] = &["tag", "p", "window"];
+
+/// The driver's `explore` dict (docs/search.md 3.9): {games, q_margin, mask_z, tags: [{tag: name,
+/// p, window}]} - a tag's p / window absent: the game's defaults (`SearchGame::EXPLORE_TAGS`). A
+/// name the game does not declare, an unknown key, a bad value: an error.
+fn parse_explore(d: &Bound<'_, PyDict>, info: &GameInfo) -> PyResult<ExploreCfg> {
+    for k in d.keys() {
+        let k: String = k.extract()?;
+        if !EXPLORE_KEYS.contains(&k.as_str()) {
+            return Err(PyValueError::new_err(format!("explore: unknown setting {k:?} ({EXPLORE_KEYS:?})")));
+        }
+    }
+    let names: Vec<&str> = info.explore_tags.iter().map(|t| t.name).collect();
+    let mut tags = Vec::new();
+    let list: Vec<Bound<'_, PyDict>> = match d.get_item("tags")? {
+        Some(v) if !v.is_none() => v.extract()?,
+        _ => Vec::new(),
+    };
+    for t in list {
+        for k in t.keys() {
+            let k: String = k.extract()?;
+            if !EXPLORE_TAG_KEYS.contains(&k.as_str()) {
+                return Err(PyValueError::new_err(format!("explore tag: unknown setting {k:?} ({EXPLORE_TAG_KEYS:?})")));
+            }
+        }
+        let name: String = t.get_item("tag")?.ok_or_else(|| PyValueError::new_err("explore tag: no 'tag' (its name)"))?.extract()?;
+        let k = names.iter().position(|n| *n == name).ok_or_else(|| PyValueError::new_err(format!("explore: {} declares no habit tag {name:?} (its tags: {names:?})", info.name)))?;
+        let def = info.explore_tags[k];
+        tags.push(ExploreTagCfg { id: (k + 1) as u8, p: get(&t, "p", def.p)?, window: get(&t, "window", def.window)? });
+    }
+    Ok(ExploreCfg { games: get(d, "games", 0.25f64)?, q_margin: get(d, "q_margin", 0.1f64)?, mask_z: flag(d, "mask_z", true)?, tags })
 }
 
 /// The root minimum visits a search takes (`driver::root_floor`, docs/search.md 3.5): `k` for a
@@ -398,6 +434,11 @@ impl PyGame {
             return Err(PyValueError::new_err(format!("viewer {viewer}: the game has {} players", self.g.num_players())));
         }
         Ok(self.g.aux_target(viewer).into_pyarray(py))
+    }
+    /// The habit tag id of each legal action of the pending decision (`SearchGame::explore_tags`,
+    /// docs/search.md 3.9: 0 = none, k + 1 = `info()['explore_tags'][k]`; empty once over).
+    fn explore_tags(&self) -> Vec<u8> {
+        self.g.explore_tags()
     }
     fn determinize(&mut self, viewer: usize, seed: u64) {
         self.g.determinize(viewer, seed)
@@ -637,7 +678,8 @@ impl PySearchTree {
 
 /// The batched driver (docs/search.md 2). `seats` = per game a list of seat dicts; `aux`: record
 /// the game's auxiliary targets with the samples (`take_samples()['aux']`, docs/search.md 1.2);
-/// `paired`: games 2k and 2k + 1 share every random stream (the deal), `DriverCfg::paired`.
+/// `paired`: games 2k and 2k + 1 share every random stream (the deal), `DriverCfg::paired`;
+/// `explore`: self-play exploration (a dict, `parse_explore`; docs/search.md 3.9).
 #[pyclass(name = "SearchDriver")]
 pub struct PySearchDriver {
     d: Box<dyn DynDriver>,
@@ -647,10 +689,14 @@ pub struct PySearchDriver {
 #[pymethods]
 impl PySearchDriver {
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, explore=None))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool) -> PyResult<Self> {
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, explore: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         let spec = spec_json(spec)?;
+        let explore = match explore {
+            Some(x) => Some(parse_explore(x, &info_of(game).map_err(verr)?)?),
+            None => None,
+        };
         let mut keys = Vec::new();
         let mut table: Vec<SeatCfg> = Vec::new();
         let mut games = Vec::with_capacity(seats.len());
@@ -670,7 +716,7 @@ impl PySearchDriver {
             }
             games.push(ix);
         }
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired };
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, explore };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
         Ok(PySearchDriver { d, nfeat })
@@ -782,6 +828,29 @@ impl PySearchDriver {
                 // DriverCfg::move_log (a diagnostic): [(seat, action, legal actions)]
                 d.set_item("moves", r.moves)?;
             }
+            if let Some(x) = r.explore {
+                // the game's exploration (a driver that explores, docs/search.md 3.9)
+                let e = PyDict::new(py);
+                e.set_item("eligible", x.eligible)?;
+                e.set_item("opportunities", x.opportunities)?;
+                e.set_item("blocked", x.blocked)?;
+                e.set_item("masked", x.masked)?;
+                e.set_item("dropped", x.dropped)?;
+                if let Some(ep) = x.episode {
+                    let p = PyDict::new(py);
+                    p.set_item("tag", ep.tag)?;
+                    p.set_item("seat", ep.seat)?;
+                    p.set_item("turn", ep.turn)?;
+                    p.set_item("step", ep.step)?;
+                    p.set_item("decision", ep.decision)?;
+                    p.set_item("overridden", ep.overridden)?;
+                    p.set_item("q_gap", ep.q_gap)?;
+                    p.set_item("alt_visits", ep.alt_visits)?;
+                    p.set_item("end", ep.end)?;
+                    e.set_item("episode", p)?;
+                }
+                d.set_item("explore", e)?;
+            }
             out.append(d)?;
         }
         Ok(out)
@@ -793,6 +862,7 @@ impl PySearchDriver {
         if recs.is_empty() {
             return Ok(None);
         }
+        let masks = self.d.masks();
         let f = self.nfeat;
         let s = py.allow_threads(|| sample_arrays(&recs, f));
         drop(recs);
@@ -811,6 +881,10 @@ impl PySearchDriver {
         if s.aw > 0 {
             // the auxiliary targets (a driver created with aux=True; docs/search.md 1.2)
             a.set_item("aux", s.aux.into_pyarray(py).reshape([n, s.aw])?)?;
+        }
+        if masks {
+            // the outcomes masked by exploration episodes (explore mask_z, docs/search.md 3.9)
+            a.set_item("masked", s.masked.into_pyarray(py))?;
         }
         Ok(Some(a.into_any().unbind()))
     }

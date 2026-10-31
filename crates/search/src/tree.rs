@@ -230,29 +230,31 @@ pub fn completed_q_policy(p0: &[f32], n: &[u32], w: &[f64], v: f64, c_visit: f64
 /// completedQ` per option (f64; the policy is their softmax). Their argmax among the options a
 /// guard admits is the `driver::Select::Cq` move (docs/search.md 3.3).
 pub fn completed_q_logits(p0: &[f32], n: &[u32], w: &[f64], v: f64, c_visit: f64, c_scale: f64) -> Vec<f64> {
+    let q = completed_q(p0, n, w, v);
+    let max_n = n.iter().copied().max().unwrap_or(0);
+    let scale = (c_visit + max_n as f64) * c_scale;
+    (0..p0.len()).map(|i| (p0[i] as f64).max(PRIOR_FLOOR).ln() + scale * q[i]).collect()
+}
+
+/// The completed Q of every option (the values `completed_q_policy` mixes in): `W_a / N_a` for a
+/// visited option, `v_mix` for an unvisited one (`v` itself when nothing was visited). The
+/// exploration gate compares these (docs/search.md 3.9).
+pub fn completed_q(p0: &[f32], n: &[u32], w: &[f64], v: f64) -> Vec<f64> {
     let k = p0.len();
     assert!(n.len() == k && w.len() == k, "completed_q_policy: {k} priors, {} visit counts, {} value sums", n.len(), w.len());
     let mut sum_n = 0.0;
-    let mut max_n = 0u32;
     let mut sum_p = 0.0;
     let mut sum_pq = 0.0;
     for i in 0..k {
         if n[i] > 0 {
             let p = (p0[i] as f64).max(PRIOR_FLOOR);
             sum_n += n[i] as f64;
-            max_n = max_n.max(n[i]);
             sum_p += p;
             sum_pq += p * (w[i] / n[i] as f64);
         }
     }
     let v_mix = if sum_n > 0.0 { (v + sum_n * (sum_pq / sum_p)) / (1.0 + sum_n) } else { v };
-    let scale = (c_visit + max_n as f64) * c_scale;
-    (0..k)
-        .map(|i| {
-            let q = if n[i] > 0 { w[i] / n[i] as f64 } else { v_mix };
-            (p0[i] as f64).max(PRIOR_FLOOR).ln() + scale * q
-        })
-        .collect()
+    (0..k).map(|i| if n[i] > 0 { w[i] / n[i] as f64 } else { v_mix }).collect()
 }
 
 /// (util, win) of a finished game (util = team_size x win (+ margin_w tanh(margin))).

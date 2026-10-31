@@ -4,7 +4,7 @@
 use std::any::Any;
 
 use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record, Select};
-use crate::game::{bot_names, Belief, SearchGame, MAX_SEATS};
+use crate::game::{bot_names, Belief, ExploreTag, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
 use crate::tree::{leaf_values_team, Scratch, Sim, Tree, Walk};
 
@@ -19,10 +19,12 @@ pub struct GameInfo {
     pub bots: Vec<&'static str>,
     /// Auxiliary target segments (name, width) (`SearchGame::AUX`; empty: none).
     pub aux: Vec<(&'static str, usize)>,
+    /// Habit tags for self-play exploration (`SearchGame::EXPLORE_TAGS`; empty: none).
+    pub explore_tags: Vec<ExploreTag>,
 }
 
 pub fn game_info<G: SearchGame>() -> GameInfo {
-    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>(), aux: G::AUX.to_vec() }
+    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>(), aux: G::AUX.to_vec(), explore_tags: G::EXPLORE_TAGS.to_vec() }
 }
 
 /// One game, any type.
@@ -54,6 +56,9 @@ pub trait DynGame: Send + Sync {
     fn team_size(&self) -> usize;
     /// `SearchGame::aux_target` for `viewer` (`aux_width()` floats; none: empty).
     fn aux_target(&self, viewer: usize) -> Vec<f32>;
+    /// `SearchGame::explore_tags` of the pending decision: one tag id per legal action (empty when
+    /// the game is over).
+    fn explore_tags(&self) -> Vec<u8>;
     /// A search tree for this game's pending decision.
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String>;
 }
@@ -136,6 +141,15 @@ impl<G: SearchGame> DynGame for G {
         let mut v = vec![0.0; G::aux_width()];
         SearchGame::aux_target(self, viewer, &mut v);
         v
+    }
+    fn explore_tags(&self) -> Vec<u8> {
+        if SearchGame::to_move(self).is_none() {
+            return Vec::new();
+        }
+        let legal = DynGame::legal(self);
+        let mut t = vec![0; legal.len()];
+        SearchGame::explore_tags(self, &legal, &mut t);
+        t
     }
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String> {
         let viewer = SearchGame::to_move(self).ok_or("the game is over")?;
@@ -450,6 +464,9 @@ pub trait DynDriver: Send + Sync {
     fn in_flight(&self) -> InFlight;
     /// Evaluator keys in index order, and whether each is external.
     fn keys(&self) -> Vec<(String, bool)>;
+    /// The driver masks outcomes before exploration deviations (`ExploreCfg::mask_z`): its sample
+    /// arrays carry `masked`.
+    fn masks(&self) -> bool;
 }
 
 impl<G: SearchGame> DynDriver for Driver<G> {
@@ -506,6 +523,9 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     }
     fn keys(&self) -> Vec<(String, bool)> {
         self.cfg().keys.iter().map(|(k, t)| (k.clone(), *t == KeyKind::External)).collect()
+    }
+    fn masks(&self) -> bool {
+        self.cfg().explore.as_ref().is_some_and(|x| x.mask_z)
     }
 }
 

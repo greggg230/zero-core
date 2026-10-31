@@ -8,7 +8,7 @@
 //! * `driver`: the batched multi-threaded self-play / evaluation driver (leaf batches out,
 //!   priors / values in; one leaf per game per batch - no virtual loss, no in-tree batching),
 //!   playout-cap randomisation, temperature, training records, rolling mode, arena (several
-//!   network keys), external seats.
+//!   network keys), external seats, opt-in self-play exploration (habit tags, docs/search.md 3.9).
 //! * `toy`: "Mini Cavern", the toy game the stack is proven on; `toy_team`: a two-team game
 //!   with a deferred result decided by toy matches (deferred terminals, teams, co-training).
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
@@ -25,5 +25,5 @@ pub mod tree;
 #[cfg(test)]
 pub(crate) mod mull_game;
 
-pub use game::{belief_weight, team_of, Belief, Bot, SearchGame, MAX_SEATS};
+pub use game::{belief_weight, team_of, Belief, Bot, ExploreTag, SearchGame, MAX_SEATS};
 pub use rng::Rng;

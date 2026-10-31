@@ -52,6 +52,11 @@ pub const MAX_SEATS: usize = 8;
 /// * **Belief-weighted deals** (optional; docs/search.md 3.8): `determinize_with(viewer, rng,
 ///   belief)` is `determinize` with the hidden cards drawn by weights from the network's
 ///   prediction of the auxiliary targets for `viewer` (`Belief`); default: `determinize`.
+/// * **Habit tags** (optional; docs/search.md 3.9): `EXPLORE_TAGS` names the habits a game can
+///   recognise, `explore_tags(legal, out)` puts a tag id (k + 1 = `EXPLORE_TAGS[k]`, 0 = none) on
+///   each legal action of the pending decision, from what its decider can see; a self-play driver
+///   with exploration on plays another option in place of a tagged one now and then (never
+///   evaluation). Tags change nothing else: not the rules, the legal actions or the features.
 pub trait SearchGame: Clone + Send + Sync + 'static {
     /// Settings shared by all games of one driver, parsed from a JSON string.
     type Spec: Clone + Send + Sync + 'static;
@@ -79,7 +84,7 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn score(&self, seat: usize) -> f32;
     fn determinize(&mut self, viewer: usize, rng: &mut Rng);
     fn encode(&self, viewer: usize, out: &mut [f32]);
-    /// Rounds played so far (reports).
+    /// Rounds played so far (reports; the turns of an exploration window, docs/search.md 3.9).
     fn rounds(&self) -> u32 {
         0
     }
@@ -169,6 +174,30 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
         let _ = belief;
         self.determinize(viewer, rng)
     }
+    /// The habits this game can tag (docs/search.md 3.9), tag id k + 1 = entry k (at most 255);
+    /// empty: none (a driver asking for exploration is refused).
+    const EXPLORE_TAGS: &'static [ExploreTag] = &[];
+    /// The habit tag of each legal action of the pending decision (`legal`: `legal_actions()`, in
+    /// its order) into `out` (`legal.len()` entries, zeroed by the caller; 0 = no tag, k + 1 =
+    /// `EXPLORE_TAGS[k]`). Read only what the decider can see, and change nothing: the driver
+    /// calls it on the live game of an exploring self-play seat only. Default: no tags.
+    fn explore_tags(&self, legal: &[u16], out: &mut [u8]) {
+        let _ = (legal, out);
+    }
+}
+
+/// A habit a game can tag for self-play exploration (`SearchGame::EXPLORE_TAGS`, docs/search.md
+/// 3.9): its name (the name settings use), and its defaults: the episode's window and the chance
+/// that one opportunity starts an episode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExploreTag {
+    pub name: &'static str,
+    /// Turns (`SearchGame::rounds`) an episode lasts: 0 = the decision that starts it only, 1 = the
+    /// rest of its turn, 2 = the rest of its turn and the next turn, ...
+    pub window: u32,
+    /// The chance that one opportunity (a decision whose chosen move carries the tag) starts an
+    /// episode in an eligible game, in (0, 1].
+    pub p: f64,
 }
 
 /// The root's belief of a search (docs/search.md 3.8): the network's auxiliary predictions for the

@@ -899,6 +899,28 @@ impl SearchGame for ToyGame {
             rng.shuffle(&mut self.markers[lo..5]);
         }
     }
+
+    /// Two habit tags for the tests of self-play exploration (docs/search.md 3.9; inert unless a
+    /// driver explores, as `AUX` is unless one records it): `fish` = placing a worker on Fishing
+    /// (this decision only), `timber` = placing one on Timber (the rest of the round). Not habits a
+    /// toy player has: decisions to tag.
+    const EXPLORE_TAGS: &'static [crate::game::ExploreTag] = &[
+        crate::game::ExploreTag { name: "fish", window: 0, p: 0.5 },
+        crate::game::ExploreTag { name: "timber", window: 1, p: 0.25 },
+    ];
+
+    fn explore_tags(&self, legal: &[u16], out: &mut [u8]) {
+        if self.sub != Sub::Place {
+            return;
+        }
+        for (t, &a) in out.iter_mut().zip(legal) {
+            *t = match a as usize {
+                S_FISH => 1,
+                S_TIMBER => 2,
+                _ => 0,
+            };
+        }
+    }
 }
 
 /// `ToyGame::heuristic` as a driver bot.

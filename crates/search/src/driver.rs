@@ -394,6 +394,114 @@ impl NnSeat {
 /// The default belief clip R (`NnSeat::belief_clip`).
 pub const BELIEF_CLIP: f64 = 20.0;
 
+/// Self-play exploration (docs/search.md 3.9; `DriverCfg::explore`): forced deviations from the
+/// habits the game tags (`SearchGame::explore_tags`), in a share of the games, one episode a game.
+/// Only the seats that record (`NnSeat::selfplay` and `record`) of a recording driver explore.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExploreCfg {
+    /// The share of games eligible for an episode, in (0, 1] (a draw of the game's own
+    /// exploration stream).
+    pub games: f64,
+    /// The gate: a deviation is played only when the best untagged option's completed Q is at least
+    /// the chosen move's minus this (the decider's utility: P(win) with `margin_w` 0), >= 0.
+    pub q_margin: f64,
+    /// Mask the outcome before the deviation: every record of the game made at or before its
+    /// first deviating decision gets z := q and no margin target (`Record::masked`), a record
+    /// without a root value by then (a value-only sample still waiting) is dropped.
+    pub mask_z: bool,
+    /// The habits explored, each at most once.
+    pub tags: Vec<ExploreTagCfg>,
+}
+
+/// One explored habit of an `ExploreCfg`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExploreTagCfg {
+    /// The game's tag id (k + 1 = `SearchGame::EXPLORE_TAGS[k]`).
+    pub id: u8,
+    /// The chance that one opportunity starts the episode, in (0, 1].
+    pub p: f64,
+    /// The episode's window in turns (`ExploreTag::window`).
+    pub window: u32,
+}
+
+impl ExploreCfg {
+    /// The settings' check for game G (`Driver::new`; the bindings' messages).
+    pub fn check<G: SearchGame>(&self) -> Result<(), String> {
+        let n = G::EXPLORE_TAGS.len();
+        if n == 0 {
+            return Err(format!("explore: {} declares no habit tags (SearchGame::EXPLORE_TAGS)", G::NAME));
+        }
+        if !(self.games.is_finite() && self.games > 0.0 && self.games <= 1.0) {
+            return Err(format!("explore games {}: a share in (0, 1] of the games (no exploration: no explore setting)", self.games));
+        }
+        if !(self.q_margin.is_finite() && self.q_margin >= 0.0) {
+            return Err(format!("explore q_margin {}: a finite number >= 0", self.q_margin));
+        }
+        if self.tags.is_empty() {
+            return Err("explore: no tags (a setting that explores nothing is refused)".into());
+        }
+        for (k, t) in self.tags.iter().enumerate() {
+            if t.id == 0 || t.id as usize > n {
+                return Err(format!("explore: tag id {} ({} declares {n}: {:?})", t.id, G::NAME, G::EXPLORE_TAGS.iter().map(|t| t.name).collect::<Vec<_>>()));
+            }
+            let name = G::EXPLORE_TAGS[t.id as usize - 1].name;
+            if self.tags[..k].iter().any(|u| u.id == t.id) {
+                return Err(format!("explore: tag {name:?} twice"));
+            }
+            if !(t.p.is_finite() && t.p > 0.0 && t.p <= 1.0) {
+                return Err(format!("explore: tag {name:?}'s p {}: a chance in (0, 1]", t.p));
+            }
+        }
+        Ok(())
+    }
+
+    /// The enabled tag of id `id` (its index in `tags`).
+    fn slot_of(&self, id: u8) -> Option<usize> {
+        if id == 0 {
+            return None;
+        }
+        self.tags.iter().position(|t| t.id == id)
+    }
+}
+
+/// A game's exploration (`GameResult::explore`, docs/search.md 3.9), in a driver that explores.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExploreGame {
+    /// The game drew a place among the `ExploreCfg::games` share.
+    pub eligible: bool,
+    /// Per explored tag (`ExploreCfg::tags` order): the opportunities before the game's episode (a
+    /// recording seat's decision whose chosen move carried the tag, with an untagged option), and
+    /// those whose draw triggered but whose gate blocked the deviation.
+    pub opportunities: Vec<u32>,
+    pub blocked: Vec<u32>,
+    pub episode: Option<Episode>,
+    /// Records whose outcome was masked (z := q, no margin target) and records dropped.
+    pub masked: u32,
+    pub dropped: u32,
+}
+
+/// A game's exploration episode.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Episode {
+    /// The game's tag id (`SearchGame::EXPLORE_TAGS[tag - 1]`), the exploring seat.
+    pub tag: u8,
+    pub seat: u8,
+    /// `SearchGame::rounds()` at the first deviation, the game's real moves before it (`steps`) and
+    /// its searched decisions before it.
+    pub turn: u32,
+    pub step: u64,
+    pub decision: u32,
+    /// Decisions played otherwise (the first included).
+    pub overridden: u32,
+    /// At the first deviation: the chosen move's completed Q minus the deviation's (negative: the
+    /// deviation looked better), the deviation's visits.
+    pub q_gap: f64,
+    pub alt_visits: u32,
+    /// Why it ended: "decision" (a window of 0), "window", "gate" (a deviation the gate blocked
+    /// inside the window: the habit was played) or "game" (over first).
+    pub end: &'static str,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SeatCfg {
     /// A built-in bot by name (`random`, or one of the game's `bot_names`).
@@ -446,6 +554,10 @@ pub struct DriverCfg {
     /// between the two games of a pair (zero.h2h, the Elo matches) plays each deal once from each
     /// seat. Off (the default): every game's streams derive from its gid (nothing changes).
     pub paired: bool,
+    /// Self-play exploration (docs/search.md 3.9): forced deviations from the game's tagged habits
+    /// by the recording seats (`ExploreCfg`); a driver that records nothing is refused. None (the
+    /// default): nothing changes.
+    pub explore: Option<ExploreCfg>,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -469,6 +581,8 @@ pub struct GameResult {
     /// `DriverCfg::move_log`: the game's first real moves (seat, action, legal
     /// actions), the external seats' answers excluded; empty when off.
     pub moves: Vec<(u8, u16, Vec<u16>)>,
+    /// The game's exploration (`DriverCfg::explore`), None when the driver does not explore.
+    pub explore: Option<ExploreGame>,
 }
 
 /// One recorded root decision with its targets.
@@ -486,6 +600,9 @@ pub struct Record {
     pub net: u32,
     /// The decider's auxiliary targets at this decision (`DriverCfg::aux`), else empty.
     pub aux: Vec<f32>,
+    /// Its outcome was masked by an exploration episode after it (docs/search.md 3.9): `z` = `q`
+    /// and no margin target (`sc` 0, the loss skips it).
+    pub masked: bool,
 }
 
 /// The kind of a network batch row (`Batch::extra`, docs/search.md 2.2): a leaf's own row (or a
@@ -639,7 +756,7 @@ impl ParkedRecord {
         ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux }
     }
     fn unpark(self) -> Record {
-        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux }
+        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux, masked: false }
     }
     fn bytes(&self) -> usize {
         std::mem::size_of::<Self>() + self.x.len() * 2 + self.opts.len() * 2 + self.pi.len() * 4 + self.aux.len() * 4
@@ -660,6 +777,8 @@ struct Parked<G: SearchGame> {
     payload: String,
     /// Memory held by the records (`DriverStats::parked_bytes`).
     bytes: u64,
+    /// The game's exploration and its records' marks (`Explore::marks`), None without.
+    xp: Option<Box<Explore>>,
 }
 
 enum Eval {
@@ -726,7 +845,33 @@ struct Slot<G: SearchGame> {
     /// The current decision's Gumbel noise per root option (`RootSearch::Gumbel`; empty: none),
     /// kept for a restarted search of the same decision.
     gnoise: Vec<f64>,
+    /// The game's exploration (docs/search.md 3.9); None when the driver does not explore.
+    xp: Option<Box<Explore>>,
 }
+
+/// One game's exploration state (docs/search.md 3.9).
+struct Explore {
+    /// Its own stream, from (driver seed, the game's stream id): eligibility, then one draw per
+    /// opportunity; no other stream is touched.
+    rng: Rng,
+    eligible: bool,
+    /// The episode (at most one a game) and whether its window is still open.
+    ep: Option<Episode>,
+    live: bool,
+    /// The episode's tag (its index in `ExploreCfg::tags`).
+    slot: usize,
+    /// Per record index below its length (the records made at or before the first deviation, with
+    /// `mask_z`): MARK_Z or MARK_DROP.
+    marks: Vec<u8>,
+    opportunities: Vec<u32>,
+    blocked: Vec<u32>,
+    /// The current decision's tags (scratch).
+    tags: Vec<u8>,
+}
+
+/// `Explore::marks`: the record's z becomes its q (no margin target) / the record is dropped.
+const MARK_Z: u8 = 1;
+const MARK_DROP: u8 = 2;
 
 impl<G: SearchGame> Slot<G> {
     fn empty() -> Slot<G> {
@@ -763,6 +908,7 @@ impl<G: SearchGame> Slot<G> {
             net: 0,
             moves: Vec::new(),
             gnoise: Vec::new(),
+            xp: None,
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -1077,6 +1223,17 @@ impl<G: SearchGame> Driver<G> {
         }
         if cfg.aux && G::aux_width() == 0 {
             return Err(format!("aux: {} has no auxiliary targets (SearchGame::AUX)", G::NAME));
+        }
+        if let Some(x) = &cfg.explore {
+            // (docs/search.md 3.9: self-play's recording seats only; a setting that explores
+            // nothing is an error, never a silent no-op)
+            x.check::<G>()?;
+            if !cfg.record {
+                return Err("explore: a driver that records nothing (an evaluation, a match) never explores".into());
+            }
+            if !cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if n.selfplay && n.record)) {
+                return Err("explore: no seat would explore (only self-play network seats that record do)".into());
+            }
         }
         let conc = if cfg.rolling { cfg.concurrency.max(1) } else { cfg.concurrency.max(1).min(cfg.games.len().max(1)) };
         let groups = cfg.groups.max(1).min(conc);
@@ -1506,7 +1663,8 @@ impl<G: SearchGame> Driver<G> {
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
-        let row = catch_unwind(AssertUnwindSafe(|| worker::emit(cfg.record, &p.game, true, done, records, p.rq, &mut samples)))
+        let xp = p.xp.take();
+        let row = catch_unwind(AssertUnwindSafe(|| worker::emit(cfg.record, &p.game, true, done, records, p.rq, xp, &mut samples)))
             .map_err(|pn| format!("game {gid} (driver seed {seed}): its outcome after resolve panicked: {}", worker::panic_msg(pn)))?;
         self.results.push(row);
         self.samples.append(&mut samples);
@@ -1643,6 +1801,8 @@ pub struct SampleArrays {
     /// Auxiliary targets [n * aw] (`DriverCfg::aux`; aw = 0: none recorded).
     pub aw: usize,
     pub aux: Vec<f32>,
+    /// Per sample: 1 = its outcome was masked by an exploration episode (`Record::masked`).
+    pub masked: Vec<u8>,
 }
 
 pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
@@ -1663,6 +1823,7 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         net: Vec::with_capacity(n),
         aw,
         aux: Vec::with_capacity(n * aw),
+        masked: Vec::with_capacity(n),
     };
     for r in recs {
         debug_assert_eq!(r.x.len(), f);
@@ -1678,6 +1839,7 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         s.net.push(r.net);
         assert_eq!(r.aux.len(), aw, "records with different auxiliary target widths");
         s.aux.extend_from_slice(&r.aux);
+        s.masked.push(r.masked as u8);
     }
     s
 }

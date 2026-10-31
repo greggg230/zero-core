@@ -30,6 +30,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         move_log: 0,
         aux: false,
         paired: false,
+        explore: None,
     }
 }
 
@@ -2332,4 +2333,293 @@ fn gumbel_with_a_root_belief() {
     let (_, s0, rows0, _) = mk(1, 1, 0.0);
     assert_eq!(rows0, (0, 0));
     assert_ne!(records_digest(&s0), records_digest(&s1), "the belief changed nothing in the Gumbel searches");
+}
+
+// ------------------------------------------------------------------ self-play exploration
+
+use crate::toy::{ToySpec, S_FISH};
+
+/// An exploration setting of the toy's tags (`ToyGame::EXPLORE_TAGS`: 1 = fish, 2 = timber):
+/// (id, p, window) each.
+fn explore(games: f64, q_margin: f64, mask_z: bool, tags: &[(u8, f64, u32)]) -> ExploreCfg {
+    ExploreCfg { games, q_margin, mask_z, tags: tags.iter().map(|&(id, p, window)| ExploreTagCfg { id, p, window }).collect() }
+}
+
+/// A toy self-play run with every move logged: rows by gid, each game's records.
+fn xrun(seat: SeatCfg, x: Option<ExploreCfg>, games: usize, threads: usize, groups: usize) -> (Vec<GameResult>, Vec<Vec<Record>>) {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
+    c.explore = x;
+    c.move_log = 100_000;
+    c.threads = threads;
+    c.groups = groups;
+    c.seed = 31;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (mut res, mut smp) = (Vec::new(), Vec::new());
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer(&mut d, &b);
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+    }
+    res.extend(d.take_results());
+    smp.extend(d.take_samples());
+    let mut it = smp.into_iter();
+    let mut per: Vec<(u32, Vec<Record>)> = res.iter().map(|r| (r.gid, it.by_ref().take(r.samples as usize).collect())).collect();
+    assert!(it.next().is_none());
+    per.sort_by_key(|p| p.0);
+    res.sort_by_key(|r| r.gid);
+    (res, per.into_iter().map(|p| p.1).collect())
+}
+
+/// Game `gid`'s logged moves replayed (driver seed 31): per move (seat, action, its tag, the
+/// decision's tags, the round).
+#[allow(clippy::type_complexity)]
+fn replay_tags(gid: u32, moves: &[(u8, u16, Vec<u16>)]) -> Vec<(u8, u16, u8, Vec<u8>, u32)> {
+    let seed = Rng::new(split64(31 ^ split64(gid as u64 + 1))).next_u64();
+    let mut g = ToyGame::new_game(&ToySpec::default(), 2, seed).unwrap();
+    let (mut key, mut legal) = (Vec::new(), Vec::new());
+    let mut out = Vec::new();
+    for (seat, a, lg) in moves {
+        legal.clear();
+        g.legal_actions(&mut legal);
+        assert_eq!((g.to_move(), &legal), (Some(*seat as usize), lg), "game {gid}: the replay left the log");
+        let mut t = vec![0u8; legal.len()];
+        g.explore_tags(&legal, &mut t);
+        let k = legal.iter().position(|x| x == a).unwrap();
+        out.push((*seat, *a, t[k], t.clone(), g.rounds()));
+        crate::tree::transition(&mut g, *a, None, &mut key, &mut legal).unwrap();
+    }
+    assert!(g.to_move().is_none(), "game {gid}: the log ended before the game");
+    out
+}
+
+#[test]
+fn explore_settings_are_checked() {
+    let mk = |x: ExploreCfg, record: bool, seat: SeatCfg| {
+        let mut c = cfg(vec![seat], vec![vec![0, 0]; 4], &[("m", KeyKind::Nn)]);
+        c.explore = Some(x);
+        c.record = record;
+        Driver::<ToyGame>::new(c).map(|_| ()).unwrap_err()
+    };
+    let sp = || nn(0, 8, true);
+    let ok = || explore(0.25, 0.1, true, &[(1, 0.5, 0)]);
+    let mut c = cfg(vec![sp()], vec![vec![0, 0]; 4], &[("m", KeyKind::Nn)]);
+    c.explore = Some(ok());
+    assert!(Driver::<ToyGame>::new(c.clone()).is_ok());
+    assert!(mk(explore(0.25, 0.1, true, &[(3, 0.5, 0)]), true, sp()).contains("tag id 3"));
+    assert!(mk(explore(0.25, 0.1, true, &[(0, 0.5, 0)]), true, sp()).contains("tag id 0"));
+    assert!(mk(explore(0.25, 0.1, true, &[(1, 0.5, 0), (1, 0.2, 1)]), true, sp()).contains("twice"));
+    assert!(mk(explore(0.25, 0.1, true, &[(1, 0.0, 0)]), true, sp()).contains("p 0"));
+    assert!(mk(explore(0.25, 0.1, true, &[(1, 1.5, 0)]), true, sp()).contains("p 1.5"));
+    assert!(mk(explore(0.0, 0.1, true, &[(1, 0.5, 0)]), true, sp()).contains("games 0"));
+    assert!(mk(explore(1.5, 0.1, true, &[(1, 0.5, 0)]), true, sp()).contains("games 1.5"));
+    assert!(mk(explore(0.25, -0.1, true, &[(1, 0.5, 0)]), true, sp()).contains("q_margin"));
+    assert!(mk(explore(0.25, 0.1, true, &[]), true, sp()).contains("no tags"));
+    // never evaluation: a driver that records nothing, or no seat that self-plays and records
+    assert!(mk(ok(), false, sp()).contains("records nothing"));
+    assert!(mk(ok(), true, nn(0, 8, false)).contains("no seat would explore"));
+    let mut league = NnSeat::eval(0, 8);
+    league.selfplay = true;
+    league.record = false;
+    assert!(mk(ok(), true, SeatCfg::Nn(league)).contains("no seat would explore"));
+    // a game without habit tags
+    let e = Driver::<crate::toy_team::ToyTeam>::new(DriverCfg { games: vec![vec![0, 0, 0, 0]; 4], ..c }).map(|_| ()).unwrap_err();
+    assert!(e.contains("declares no habit tags"), "{e}");
+}
+
+#[test]
+fn exploration_off_or_ineligible_changes_nothing() {
+    // The exploration stream is the game's own: an ineligible game, or an eligible one without an
+    // episode, is the game of a driver without exploration move for move and record for record;
+    // a game with an episode is that game up to its first deviation, where its move differs. The
+    // same with other threads and groups.
+    let (ra, pa) = xrun(nn(0, 16, true), None, 40, 2, 2);
+    assert!(ra.iter().all(|r| r.explore.is_none()));
+    let x = explore(0.5, 1e9, true, &[(1, 1.0, 0), (2, 1.0, 1)]);
+    let (rb, pb) = xrun(nn(0, 16, true), Some(x.clone()), 40, 2, 2);
+    let (rc, pc) = xrun(nn(0, 16, true), Some(x), 40, 3, 1);
+    let (mut ineligible, mut episodes) = (0, 0);
+    for g in 0..40 {
+        let (a, b, c) = (&ra[g], &rb[g], &rc[g]);
+        assert_eq!((&b.moves, &b.explore, records_digest(&pb[g])), (&c.moves, &c.explore, records_digest(&pc[g])));
+        let xb = b.explore.as_ref().unwrap();
+        match &xb.episode {
+            None => {
+                assert_eq!((&a.moves, a.steps, &a.scores), (&b.moves, b.steps, &b.scores), "game {g}");
+                assert_eq!(records_digest(&pa[g]), records_digest(&pb[g]), "game {g}");
+                assert_eq!((xb.masked, xb.dropped), (0, 0));
+                ineligible += !xb.eligible as usize;
+                if !xb.eligible {
+                    assert!(xb.opportunities.iter().all(|&o| o == 0));
+                }
+            }
+            Some(ep) => {
+                episodes += 1;
+                let k = ep.step as usize;
+                assert_eq!(a.moves[..k], b.moves[..k], "game {g}: the moves before the deviation");
+                assert_eq!((a.moves[k].0, &a.moves[k].2), (b.moves[k].0, &b.moves[k].2));
+                assert_ne!(a.moves[k].1, b.moves[k].1, "game {g}: the deviation");
+                assert_eq!(ep.seat, a.moves[k].0);
+            }
+        }
+    }
+    assert!(ineligible > 8 && episodes > 8, "ineligible {ineligible}, episodes {episodes}");
+}
+
+#[test]
+fn exploration_triggers_through_the_gate() {
+    // p 1, an open gate: the first opportunity of an eligible game starts its episode (one each);
+    // the habit (Fishing) was the chosen move there, the deviation is untagged
+    let (ra, _) = xrun(nn(0, 16, true), None, 30, 2, 2);
+    let (rb, _) = xrun(nn(0, 16, true), Some(explore(1.0, 1e9, true, &[(1, 1.0, 0)])), 30, 2, 2);
+    let mut n = 0;
+    for (a, b) in ra.iter().zip(&rb) {
+        let x = b.explore.as_ref().unwrap();
+        assert!(x.eligible);
+        match &x.episode {
+            Some(ep) => {
+                n += 1;
+                assert_eq!((x.opportunities[0], x.blocked[0], ep.overridden, ep.end, ep.tag), (1, 0, 1, "decision", 1));
+                let k = ep.step as usize;
+                assert_eq!(a.moves[k].1 as usize, S_FISH, "the habit played without exploration");
+                assert_ne!(b.moves[k].1 as usize, S_FISH);
+                // the first tagged move with an alternative of the game without exploration
+                let t = replay_tags(a.gid, &a.moves);
+                let first = t.iter().position(|m| m.2 == 1 && m.3.iter().any(|&u| u != 1)).unwrap();
+                assert_eq!(first, k);
+            }
+            None => assert_eq!(x.opportunities[0], 0),
+        }
+    }
+    assert!(n > 15, "{n} episodes");
+    // a closed gate (q_margin 0): only deviations at least as good as the habit pass, the others are
+    // blocked and the game may trigger again later; every episode's gap is within the margin
+    let (rz, _) = xrun(nn(0, 16, true), Some(explore(1.0, 0.0, true, &[(1, 1.0, 0)])), 60, 2, 2);
+    let blocked: u32 = rz.iter().map(|r| r.explore.as_ref().unwrap().blocked[0]).sum();
+    let eps: Vec<&Episode> = rz.iter().filter_map(|r| r.explore.as_ref().unwrap().episode.as_ref()).collect();
+    assert!(blocked > 5 && !eps.is_empty(), "blocked {blocked}, episodes {}", eps.len());
+    assert!(eps.iter().all(|e| e.q_gap <= 0.0), "{:?}", eps.iter().map(|e| e.q_gap).collect::<Vec<_>>());
+    for r in &rz {
+        let x = r.explore.as_ref().unwrap();
+        assert_eq!(x.opportunities[0], x.blocked[0] + x.episode.is_some() as u32, "game {}", r.gid);
+    }
+    // a draw per opportunity: p 0.3 spreads the episodes over later opportunities
+    let (rp, _) = xrun(nn(0, 16, true), Some(explore(1.0, 1e9, true, &[(1, 0.3, 0)])), 60, 2, 2);
+    let later = rp.iter().filter(|r| r.explore.as_ref().unwrap().opportunities[0] > 1 && r.explore.as_ref().unwrap().episode.is_some()).count();
+    assert!(later > 5, "{later}");
+}
+
+#[test]
+fn exploration_windows_and_one_episode_a_game() {
+    // timber, window 1 (the rest of the round): no Timber placement by the episode's seat while its
+    // round lasts, the episode ends with the window; afterwards the habit is played again (one
+    // episode a game: no second deviation, of either tag)
+    let (rb, _) = xrun(nn(0, 16, true), Some(explore(1.0, 1e9, true, &[(2, 1.0, 1), (1, 1.0, 0)])), 40, 2, 2);
+    let (mut n, mut later_habit) = (0, 0);
+    for r in &rb {
+        let x = r.explore.as_ref().unwrap();
+        let Some(ep) = &x.episode else { continue };
+        let t = replay_tags(r.gid, &r.moves);
+        let k = ep.step as usize;
+        assert_eq!(t[k].4, ep.turn);
+        let w = if ep.tag == 2 { 1 } else { 0 };
+        if ep.tag == 2 {
+            n += 1;
+            assert!(ep.end == "window" || ep.end == "game", "{}", ep.end);
+            let inside: Vec<_> = t[k..].iter().filter(|m| m.0 == ep.seat && m.4 < ep.turn + 1).collect();
+            assert!(inside.iter().all(|m| m.2 != 2 || m.3.iter().all(|&u| u == 2)), "game {}: a Timber placement inside the window", r.gid);
+            assert!(ep.overridden >= 1 && ep.overridden as usize <= inside.len());
+        } else {
+            assert_eq!((ep.overridden, ep.end), (1, "decision"));
+        }
+        // after the episode: tagged moves with alternatives are played again
+        later_habit += t[k + 1..].iter().any(|m| m.2 != 0 && (m.4 >= ep.turn + w || m.0 != ep.seat) && m.3.iter().any(|&u| u != m.2)) as usize;
+    }
+    assert!(n > 5 && later_habit > 10, "timber episodes {n}, games with a later habit {later_habit}");
+}
+
+#[test]
+fn exploration_masks_outcomes_before_the_deviation() {
+    // Records at or before the first deviation (both seats', value-only samples too): z := q, no
+    // margin target - or dropped when they have no root value yet (a value-only sample waiting for
+    // its observer's next search). The records after it keep their true z. Off (mask_z false): every
+    // z true, nothing dropped.
+    let seat = || with_view(nn(0, 16, true), LeafView::Mover, 1.0, ViewTarget::NextQ);
+    let (_, pa) = xrun(seat(), None, 30, 2, 2);
+    let x = |mask| explore(1.0, 1e9, mask, &[(1, 1.0, 0), (2, 1.0, 1)]);
+    let (rb, pb) = xrun(seat(), Some(x(true)), 30, 2, 2);
+    let (rn, pn) = xrun(seat(), Some(x(false)), 30, 2, 2);
+    let (mut masked, mut dropped, mut margins) = (0, 0, 0);
+    for g in 0..30 {
+        let xb = rb[g].explore.as_ref().unwrap();
+        let xn = rn[g].explore.as_ref().unwrap();
+        assert_eq!(rb[g].moves, rn[g].moves, "mask_z changes no move");
+        assert_eq!((xn.masked, xn.dropped), (0, 0));
+        assert!(pn[g].iter().all(|r| !r.masked && r.z[0] == rn[g].result[r.player as usize]));
+        assert_eq!(rb[g].samples as usize, pb[g].len());
+        if xb.episode.is_none() {
+            assert!(pb[g].iter().all(|r| !r.masked));
+            continue;
+        }
+        let m = xb.masked as usize;
+        masked += m;
+        dropped += xb.dropped as usize;
+        // the masked records come first, each z its q, no margin; the rest the game's outcome
+        for (i, r) in pb[g].iter().enumerate() {
+            assert_eq!(r.masked, i < m, "game {g}, record {i}");
+            if r.masked {
+                assert_eq!((r.z, r.sc), (r.q, [0.0; MAX_SEATS]));
+            } else {
+                assert_eq!(r.z[0], rb[g].result[r.player as usize]);
+                margins += (r.sc[0] != 0.0) as usize;
+            }
+        }
+        // before the deviation the game is the one without exploration: its first masked + dropped
+        // records, the dropped ones value-only samples, the masked ones the same states and targets
+        let before = &pa[g][..m + xb.dropped as usize];
+        let mut j = 0;
+        for r in before {
+            let k = &pb[g][j.min(m.max(1) - 1)];
+            if j < m && r.x == k.x && r.player == k.player && r.opts == k.opts {
+                assert_eq!((&r.pi, r.q), (&k.pi, k.q));
+                j += 1;
+            } else {
+                assert!(r.opts.is_empty(), "game {g}: a dropped decision record");
+            }
+        }
+        assert_eq!(j, m, "game {g}");
+    }
+    assert!(masked > 20 && dropped > 5 && margins > 50, "masked {masked}, dropped {dropped}, margins {margins}");
+}
+
+#[test]
+fn only_the_recording_seats_explore() {
+    // A league game (selfplay_league): the current network's recording seat against a past
+    // checkpoint's unrecorded one, seats alternating, and games against an evaluation seat: every
+    // episode is the recording seat's.
+    let mut l = NnSeat::eval(1, 16);
+    l.selfplay = true;
+    l.record = false;
+    l.sims_fast = Some(4);
+    l.p_full = 0.5;
+    l.temp_moves = 10;
+    let games: Vec<Vec<u16>> = (0..40)
+        .map(|g| match g % 4 {
+            0 => vec![0, 1],
+            1 => vec![1, 0],
+            2 => vec![0, 2],
+            _ => vec![2, 0],
+        })
+        .collect();
+    let mut c = cfg(vec![nn(0, 16, true), SeatCfg::Nn(l), nn(1, 16, false)], games, &[("m", KeyKind::Nn), ("L", KeyKind::Nn)]);
+    c.explore = Some(explore(1.0, 1e9, true, &[(1, 1.0, 0), (2, 1.0, 1)]));
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (res, _) = run(&mut d);
+    let mut n = 0;
+    for r in &res {
+        if let Some(ep) = &r.explore.as_ref().unwrap().episode {
+            n += 1;
+            assert_eq!(ep.seat as u32, r.gid % 2, "game {}", r.gid);
+        }
+    }
+    assert!(n > 20, "{n}");
 }

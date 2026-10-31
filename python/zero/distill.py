@@ -245,7 +245,12 @@ def losses(model, b, teacher_w=1.0, value_q=0.5, margin_w=0.5, amp=False, view=F
     v_d = -(zt * lv).sum(1).mean()
     present = (torch.arange(S, device=plog.device)[None, :] < b['n_players'][:, None]).float()
     m_t = (((mp - b['tm'][:, :S]) ** 2) * present).sum(1).mean() / 2
-    m_d = (((mp - b['sc'][:, :S]) ** 2) * present).sum(1).mean() / 2
+    if 'masked' in b:
+        # (rows an exploration episode masked, docs/search.md 3.9: no margin target - the run's loss)
+        keep = 1.0 - b['masked']
+        m_d = (((mp - b['sc'][:, :S]) ** 2) * present * keep[:, None]).sum() / keep.sum().clamp(min=1.0) / 2
+    else:
+        m_d = (((mp - b['sc'][:, :S]) ** 2) * present).sum(1).mean() / 2
     w = float(teacher_w)
     total = (1 - w) * (p_d + v_d + margin_w * m_d) + w * (p_t + v_t + margin_w * m_t)
     terms = {'policy_t': p_t, 'value_t': v_t, 'margin_t': m_t, 'policy_d': p_d, 'value_d': v_d, 'margin_d': m_d,

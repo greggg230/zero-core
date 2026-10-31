@@ -108,6 +108,14 @@ def _belief_of(cfg):
     hello reports and the run checks (docs/az.md 18.5)."""
     from .run import belief_keys
     return belief_keys(cfg, 'selfplay')
+
+
+def _explore_of(cfg):
+    """A run's self-play exploration as its driver plays it (`explore.fingerprint`, '' when off): what a
+    worker's hello reports and the run checks (docs/az.md 21)."""
+    from . import explore as X
+    from .games import info
+    return X.fingerprint(cfg, info(cfg['game']))
 BIG = 1 << 62                     # a remote driver's quota: its phases end by end_phase()
 RETRY_S = 60.0                    # a failed session is started again after this (env ZERO_RSP_RETRY_S)
 STALL_S = 300.0                   # a session silent this long is killed (its worker stalled)
@@ -666,6 +674,12 @@ class RemotePlay:
                 for e in ends:
                     lg = merge(lg, e.get('league'))
                 out['league'] = lg
+            if any('explore' in e for e in ends):      # self-play exploration: its accepted games' (explore.tally)
+                from .explore import merge as xmerge
+                xp = None
+                for e in ends:
+                    xp = xmerge(xp, e.get('explore'))
+                out['explore'] = xp
         if self.mode == 'matches':
             with self.mu:
                 outstanding = sum(len(s.assigned) for s in self.sess if s is not None)
@@ -740,6 +754,11 @@ class RemotePlay:
                     # a checkout without the root's belief (or reading the settings otherwise) would deal
                     # its worlds uniformly in silence: never used (docs/az.md 18.5)
                     s.no_belief = ev.get('belief')
+                want_x = _explore_of(self.R.cfg) if self.mode == 'selfplay' else ''
+                if want_x and ev.get('explore') != want_x:
+                    # a checkout without self-play exploration (or reading its settings otherwise) would
+                    # play its games without it in silence: never used (docs/az.md 21)
+                    s.no_explore = ev.get('explore')
                 if self.fails or s.k == 0:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
@@ -844,6 +863,13 @@ class RemotePlay:
                 self.next_try[k] = now + max(self.retry_s, 600.0)
                 self.fail_log(f'worker {k} REFUSED: its checkout has no self-play league (the run plays one, '
                               f'selfplay_league {self.R.cfg["selfplay_league"]}); killed, retried in 10 minutes')
+                s.kill()
+                continue
+            if hasattr(s, 'no_explore'):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.fail_log(f'worker {k} REFUSED: its checkout explores as {s.no_explore!r}, the run as '
+                              f'{_explore_of(self.R.cfg)!r} (an older checkout does not explore: docs/az.md 21); '
+                              f'killed, retried in 10 minutes')
                 s.kill()
                 continue
             if hasattr(s, 'no_belief'):
@@ -1481,6 +1507,7 @@ class Worker:
                 self.drv.enqueue(tag, spec)
             self.backlog = []
             self.info = R.info
+            self.xp = R.explore                    # self-play exploration (zero/explore.py), None when off
         else:
             self.evr.set_weights(m.state_dict())
         keep = set()
@@ -1566,6 +1593,9 @@ class Worker:
             if self.lg_on:
                 from .league import tally
                 tally([row], ph['league'])
+            if ph.get('explore') is not None:
+                from .explore import tally as xtally
+                xtally([row], ph['explore'])
         die = int(self.test.get('die_after_accepts') or 0)
         if die and ph['accepted'] >= die:
             self.note('test: dying with accepted games in no shard yet')
@@ -1704,6 +1734,8 @@ class Worker:
         ph['t_close'] = now
         ph['leaves_close'] = st['leaves']
         extra = {'league': ph['league']} if self.lg_on else {}
+        if ph.get('explore') is not None:
+            extra['explore'] = ph['explore']
         self.emit('end', iter=ph['it'], games=ph['games'], samples=ph['samples'], shards=w['shards'], bytes=w['bytes'],
                   leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - bo, 2),
                   backoff_s=round(bo, 2), in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
@@ -1734,6 +1766,9 @@ class Worker:
         ph = {'it': it, 'games': 0, 'samples': 0, 't0': _now(), 'backoff': 0.0, 'bo_t0': 0.0, 'ending': False,
               't_lock': 0.0, 'leaves0': st0['leaves'], 'bw': bw, 'closed': False, 'accepted': 0,
               'linger_games': 0, 'linger_prev': getattr(self, 'linger_prev', None), 'league': {}}
+        if getattr(self, 'xp', None) and self.mode == 'selfplay':
+            from .explore import new_tally
+            ph['explore'] = new_tally(self.info, self.xp)
         evs = {'m': self.evr, **self.lg_evs} if self.lg_on else {'m': self.evr}
         self.linger_prev = None
         for sd in self.held_samples:               # co-training: rows finished while lingering, sent already
@@ -1799,7 +1834,8 @@ class Worker:
             # (the tests: an older checkout, without the league / the root's belief)
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
                       mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),
-                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}))
+                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}),
+                      **({} if self.test.get('no_explore') else {'explore': _explore_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

@@ -62,7 +62,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import auxtarget as AUX, elo, games as G, league as L, package, runctl
+from . import auxtarget as AUX, elo, explore as X, games as G, league as L, package, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
@@ -268,6 +268,17 @@ DEFAULTS = dict(
     # each) and how they are picked ('uniform' | 'pfsp': weighted by how often each still beats the
     # current network). Only the current network's decisions become samples. Single-game runs only
     selfplay_league=0.0, selfplay_league_pool=L.DEFAULT_POOL, selfplay_league_slots=1, selfplay_league_pick='uniform',
+    # self-play exploration (zero/explore.py, docs/search.md 3.9, docs/az.md 21): forced deviations from
+    # the habits the game tags (comma-separated names of its SearchGame::EXPLORE_TAGS, or 'all'; '' = off:
+    # nothing changes) in a share of the games, one episode a game, by the recording seat only: a chosen
+    # move with an explored tag plays the best untagged option instead (with the tag's chance per
+    # opportunity, selfplay_explore_p: '' = the game's default, a number, or tag=p,...), when its
+    # completed Q is within selfplay_explore_q_margin of the chosen move's; the same through the tag's
+    # window (selfplay_explore_window, turns: '' = the game's default, a number, or tag=w,...). mask_z 1:
+    # the records at or before the first deviation get z := q and no margin target (a value-only sample
+    # without a root value by then is dropped). Single-game runs only
+    selfplay_explore='', selfplay_explore_games=0.25, selfplay_explore_q_margin=0.1, selfplay_explore_mask_z=1,
+    selfplay_explore_p='', selfplay_explore_window='',
 )
 
 PRESETS = {
@@ -428,6 +439,8 @@ class Run:
         self.aux_w, self.aux = aux_settings(cfg, self.info)
         self.heldout = None                        # zero.heldout.HeldOut with heldout_shards (loaded once)
         self.anchor_sha = {}                       # anchor path -> ((size, mtime), sha256)
+        # self-play exploration (zero/explore.py): the driver's `explore` dict, None when off
+        self.explore = X.check(cfg, self.info)
 
     def check(self, where=''):
         if self.pw is not None:
@@ -504,6 +517,8 @@ class Run:
             # self-play records the auxiliary targets (docs/az.md 15; getattr: a caller's stand-in Run
             # with only a cfg, e.g. MTG Zero's test of its evaluation specs, has none)
             kw['aux'] = True
+        if record and getattr(self, 'explore', None):
+            kw['explore'] = self.explore           # self-play exploration (zero/explore.py)
         return G.Driver(c['game'], seats, spec=spec, concurrency=conc or c['conc'], seed=seed, record=record,
                         threads=c['threads'], groups=groups or c['groups'], max_steps=c['max_steps'], rolling=rolling,
                         net=net, **kw)
@@ -597,6 +612,7 @@ class Run:
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
+        self.explore_metrics(out, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -618,6 +634,15 @@ class Run:
         d = lambda k: st.get(k, 0) - ((st0 or {}).get(k, 0))           # noqa: E731
         out['view'] = {'rows': d('view_rows'), 'rows_per_leaf': round(d('view_rows') / max(1, leaves), 4),
                        'samples': d('view_recorded')}
+
+    def explore_metrics(self, out, results, remote=None):
+        """Self-play's exploration metrics (zero/explore.py), only when it is on (the metrics of before
+        otherwise): `explore` = the phase's finished games' episodes, gate blocks, masked and dropped
+        records ... (`explore.summary`), this machine's and the remote's (`remote`: its tally)."""
+        if not self.explore:
+            return
+        acc = X.tally(results, X.new_tally(self.info, self.explore))
+        out['explore'] = X.summary(X.merge(acc, remote))
 
     def belief_metrics(self, out, st, st0, results):
         """Self-play's root-belief metrics (docs/az.md 18), only when it is on (the metrics of before
@@ -761,6 +786,7 @@ class Run:
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
+        self.explore_metrics(out, results, rem.pop('explore', None))
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
@@ -919,7 +945,13 @@ class Run:
             zt = ((1 - vq) * b['z'] + vq * b['q'])[:, :S]
             lv = -(zt * F.log_softmax(vlog, dim=1).clamp(min=-1e4)).sum(1).mean()
             present = (torch.arange(S, device=b['x'].device)[None, :] < b['n_players'][:, None]).float()
-            lm = (((mp - b['sc'][:, :S]) ** 2) * present).sum(1).mean() / 2
+            if 'masked' in b:
+                # rows whose outcome an exploration episode masked (zero/explore.py): no margin target,
+                # the margin loss a mean over the others (their z is already their q)
+                keep = 1.0 - b['masked']
+                lm = (((mp - b['sc'][:, :S]) ** 2) * present * keep[:, None]).sum() / keep.sum().clamp(min=1.0) / 2
+            else:
+                lm = (((mp - b['sc'][:, :S]) ** 2) * present).sum(1).mean() / 2
             loss = lp + lv + mw * lm
             terms = [lp.detach(), lv.detach(), lm.detach()]
             if aw:
@@ -1641,6 +1673,10 @@ def resolve_config(args, saved):
             raise SystemExit(f'{k} {w!r}: a number >= 0 (an auxiliary target weight; 0 = off, docs/az.md 15)')
     if isinstance(cfg.get('resolver_cfg'), dict) and L.enabled(cfg['resolver_cfg']):
         raise SystemExit('resolver_cfg: selfplay_league: single-game runs only (not a co-training resolver)')
+    # self-play exploration (zero/explore.py): names the game declares, values in range, single-game runs
+    X.check(cfg, G.info(cfg['game']))
+    if isinstance(cfg.get('resolver_cfg'), dict) and str(cfg['resolver_cfg'].get('selfplay_explore', '') or ''):
+        raise SystemExit('resolver_cfg: selfplay_explore: single-game runs only (not a co-training resolver)')
     return cfg
 
 

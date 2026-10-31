@@ -1,7 +1,7 @@
 //! The driver's worker threads: advancing games (search, bots, external requests), batch
 //! assembly, finished games and training records.
 use super::*;
-use crate::tree::{leaf_values_team, transition_with, Scratch as SimScratch, Sim, Walk};
+use crate::tree::{completed_q, leaf_values_team, transition_with, Scratch as SimScratch, Sim, Walk};
 
 struct WScratch<G: SearchGame> {
     game: Option<G>,
@@ -319,8 +319,19 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.pending = None;
     slot.ext_payload = None;
     slot.moves.clear();
+    // exploration (docs/search.md 3.9): the game's own stream, from (driver seed, stream id) - no
+    // draw from `base`, so every other stream is the same with it on or off
+    slot.xp = cfg.explore.as_ref().map(|x| {
+        let mut rng = Rng::new(split64(split64(cfg.seed ^ EXPLORE_SALT) ^ split64(stream as u64 + 1)));
+        let eligible = rng.unit() < x.games;
+        let k = x.tags.len();
+        Box::new(Explore { rng, eligible, ep: None, live: false, slot: 0, marks: Vec::new(), opportunities: vec![0; k], blocked: vec![0; k], tags: Vec::new() })
+    });
     Ok(())
 }
+
+/// The salt of the exploration streams (`init_slot`).
+const EXPLORE_SALT: u64 = 0x6578_706c_6f72_6521;
 
 /// Expand the slot's pending leaf with its evaluation and back it up. `vrow`: `value` / `margin`
 /// are relative to the tree's viewer (a value-only row, `LeafView::Root`), else to the leaf's
@@ -606,7 +617,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             aux.resize(G::aux_width(), 0.0);
             g.aux_target(p, &mut aux);
         }
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux });
+        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, masked: false });
         slot.rq.push(if gumbel {
             tree.gumbel_q()
         } else if pruned.is_some() {
@@ -634,15 +645,102 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                 if seat.view_target == ViewTarget::NextQ {
                     slot.view_wait.push((slot.records.len() as u32, o as u8));
                 }
-                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux });
+                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, masked: false });
                 slot.rq.push(None);
                 n.view_recorded += 1;
+            }
+        }
+    }
+    // self-play exploration (docs/search.md 3.9): the recording seats of an eligible game may play
+    // another option than the chosen one; the search, its tree and the records above are not touched
+    let mut a = a;
+    if let (Some(x), Some(st)) = (cfg.explore.as_ref(), slot.xp.as_deref_mut()) {
+        if seat.selfplay && seat.record && st.eligible {
+            if let Some(j) = explore_move(x, st, slot.game.as_ref().unwrap(), tree, p, nv, i, slot.steps, slot.decisions, &slot.rq) {
+                a = acts[j];
             }
         }
     }
     slot.decisions += 1;
     apply(cfg, slot, a, key)?;
     Ok(())
+}
+
+/// Self-play exploration at a searched decision of recording seat `p` of an eligible game (docs/
+/// search.md 3.9; `i`: the chosen option, `nv`: the visit counts the move rule read): the option to
+/// play instead, or None (the chosen move). Before the game's episode, a chosen move that carries an
+/// explored tag T with an untagged option is an opportunity: with the tag's chance it triggers the
+/// episode - if the gate lets the deviation through (the best untagged option's completed Q at
+/// least the chosen move's minus `q_margin`), it is played and the episode begins; else the game
+/// plays on without one for now. While the episode's window is open, every decision of its seat
+/// whose chosen move carries T deviates the same way (a blocked gate ends the episode instead).
+/// The deviation: the best untagged option by visits, then P0 (`argmax_visits`' order).
+#[allow(clippy::too_many_arguments)]
+fn explore_move<G: SearchGame>(x: &ExploreCfg, st: &mut Explore, g: &G, tree: &Tree<G>, p: usize, nv: &[u32], i: usize, steps: u64, decisions: u32, rq: &[Option<[f64; MAX_SEATS]>]) -> Option<usize> {
+    let turn = g.rounds();
+    if st.live {
+        // (a window closes once its turns are over, whoever decides then)
+        let ep = st.ep.as_mut().unwrap();
+        if turn >= ep.turn + x.tags[st.slot].window {
+            st.live = false;
+            ep.end = "window";
+        }
+    }
+    if st.ep.as_ref().is_some_and(|ep| !st.live || ep.seat as usize != p) {
+        return None;
+    }
+    let root = tree.root;
+    let acts = tree.acts(root);
+    st.tags.clear();
+    st.tags.resize(acts.len(), 0);
+    g.explore_tags(acts, &mut st.tags);
+    let tag = st.tags[i];
+    let k = x.slot_of(tag)?;
+    if st.live && k != st.slot {
+        return None;
+    }
+    let p0 = tree.priors0(root);
+    let mut alt: Option<usize> = None;
+    for j in 0..acts.len() {
+        if st.tags[j] != tag && alt.is_none_or(|b| (nv[j], p0[j]) > (nv[b], p0[b])) {
+            alt = Some(j);
+        }
+    }
+    // (every option carries the tag: nothing to deviate to, not an opportunity)
+    let alt = alt?;
+    // the gate: the completed Q of the 'cq' target (every visit; an unvisited option's is v_mix)
+    let q = completed_q(&p0, &tree.visits(root), &tree.values(root), tree.value0(root));
+    let gap = q[i] - q[alt];
+    let pass = gap <= x.q_margin;
+    if st.live {
+        let ep = st.ep.as_mut().unwrap();
+        if pass {
+            ep.overridden += 1;
+            return Some(alt);
+        }
+        st.live = false;
+        ep.end = "gate";
+        return None;
+    }
+    st.opportunities[k] += 1;
+    if st.rng.unit() >= x.tags[k].p {
+        return None;
+    }
+    if !pass {
+        st.blocked[k] += 1;
+        return None;
+    }
+    let w = x.tags[k].window;
+    st.ep = Some(Episode { tag, seat: p as u8, turn, step: steps, decision: decisions, overridden: 1, q_gap: gap, alt_visits: nv[alt], end: if w == 0 { "decision" } else { "game" } });
+    st.slot = k;
+    st.live = w > 0;
+    if x.mask_z {
+        // every record so far (this decision's included) is at or before the first deviation: its
+        // outcome is masked, or it is dropped when it has no root value yet (a value-only sample
+        // waiting for its observer's next search, which now comes after the deviation)
+        st.marks = rq.iter().map(|q| if q.is_some() { MARK_Z } else { MARK_DROP }).collect();
+    }
+    Some(alt)
 }
 
 /// Apply a real move: the transition (single-option decisions of non-external seats are
@@ -696,6 +794,7 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
     let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves) };
     let records = std::mem::take(&mut slot.records);
     let rq = std::mem::take(&mut slot.rq);
+    let xp = slot.xp.take();
     slot.view_wait.clear();
     slot.drop_trees();
     slot.gid = NO_GAME;
@@ -707,10 +806,10 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
         let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(ParkedRecord::park).collect() } else { Vec::new() };
         let bytes = records.iter().map(|r| r.bytes()).sum::<usize>() as u64;
         let Done { gid, tag, n, steps, decisions, ext_moves, .. } = done;
-        parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes });
+        parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes, xp });
         return Ok(());
     }
-    results.push(emit(cfg.record, &g, over, done, records, rq, samples));
+    results.push(emit(cfg.record, &g, over, done, records, rq, xp, samples));
     Ok(())
 }
 
@@ -728,8 +827,11 @@ pub(super) struct Done {
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
 /// over and records made): `z` = `result()`, `q` = the root search's win estimate (`z` without
 /// one), `sc` = `margin()`, each relative to the record's decider. A game cut at max_steps
-/// (`over` false) is a draw and emits nothing.
-pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, records: Vec<Record>, rq: Vec<Option<[f64; MAX_SEATS]>>, samples: &mut Vec<Record>) -> GameResult {
+/// (`over` false) is a draw and emits nothing. An exploration episode's marks (`xp`, docs/search.md
+/// 3.9): a masked record's `z` is its `q` and its `sc` 0 (`Record::masked`), a dropped one is not
+/// emitted.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, records: Vec<Record>, rq: Vec<Option<[f64; MAX_SEATS]>>, xp: Option<Box<Explore>>, samples: &mut Vec<Record>) -> GameResult {
     let n = d.n;
     let res: [f32; MAX_SEATS] = if over {
         g.result()
@@ -739,7 +841,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         r
     };
     let emit = record && over && !records.is_empty();
-    let row = GameResult {
+    let mut row = GameResult {
         gid: d.gid,
         n,
         over,
@@ -749,13 +851,21 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         decisions: d.decisions,
         ext_moves: d.ext_moves,
         rounds: g.rounds(),
-        samples: if emit { records.len() as u32 } else { 0 },
+        samples: 0,
         tag: d.tag,
         moves: d.moves,
+        explore: None,
     };
+    let marks: &[u8] = xp.as_ref().map_or(&[], |x| &x.marks);
+    let (mut masked, mut dropped) = (0u32, 0u32);
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();
-        for (mut r, rq) in records.into_iter().zip(rq) {
+        for (k, (mut r, rq)) in records.into_iter().zip(rq).enumerate() {
+            let mark = marks.get(k).copied().unwrap_or(0);
+            if mark == MARK_DROP {
+                dropped += 1;
+                continue;
+            }
             for j in 0..n {
                 let s = (r.player as usize + j) % n;
                 r.z[j] = res[s];
@@ -765,8 +875,20 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
                 };
                 r.sc[j] = margins[s];
             }
+            if mark == MARK_Z {
+                // (the outcome after a deviation is not the policy's: the search's own estimate)
+                r.z = r.q;
+                r.sc = [0.0; MAX_SEATS];
+                r.masked = true;
+                masked += 1;
+            }
             samples.push(r);
+            row.samples += 1;
         }
+    }
+    if let Some(x) = xp {
+        let x = *x;
+        row.explore = Some(ExploreGame { eligible: x.eligible, opportunities: x.opportunities, blocked: x.blocked, episode: x.ep, masked, dropped });
     }
     row
 }

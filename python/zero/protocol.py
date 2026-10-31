@@ -44,8 +44,10 @@ def belief_rows(extra):
     return np.flatnonzero(np.asarray(extra) == ROW_BELIEF)
 SAMPLE_KEYS = ('x', 'player', 'n_players', 'opt_off', 'opt_action', 'pi', 'z', 'q', 'sc', 'net')
 # in some sample dicts only: 'aux' f32 [N, W] = the deciders' auxiliary targets (a driver created with
-# aux=True: `SearchGame::aux_target`, docs/search.md 1.2, docs/az.md 15); per sample row, like `x`
-OPTIONAL_SAMPLE_KEYS = ('aux',)
+# aux=True: `SearchGame::aux_target`, docs/search.md 1.2, docs/az.md 15); 'masked' u8 [N] = 1 where an
+# exploration episode masked the outcome (z := q, no margin target: a driver exploring with mask_z,
+# docs/search.md 3.9); per sample row, like `x`
+OPTIONAL_SAMPLE_KEYS = ('aux', 'masked')
 ALL_SAMPLE_KEYS = SAMPLE_KEYS + OPTIONAL_SAMPLE_KEYS
 
 
