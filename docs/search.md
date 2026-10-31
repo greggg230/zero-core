@@ -852,7 +852,8 @@ margin, aux)`) takes `aux` = [belief rows x aux_width] in row order; a batch wit
 without them, with the wrong width or with a non-finite or negative value is an error - an evaluator that
 cannot compute the belief never leaves the search dealing uniformly in silence. `NetEvaluator` answers
 them from the auxiliary head (the head on those rows only, in the same forward pass; a fourth item of its
-answer; such a batch skips the CUDA graphs) and raises `net.HeadMissing` for a network without one;
+answer; such a batch skips a conv network's CUDA graphs, a token network's answer it: docs/az.md 10.6)
+and raises `net.HeadMissing` for a network without one;
 `UniformEvaluator` has none (the driver's error). `stats()['belief_rows']` counts the rows. **Rolling
 epochs** (2.6): a belief asked of the old network is asked again of the new one (the restarted search's
 tree has none); a phase's dropped batches drop a pending belief row too (asked again next phase).

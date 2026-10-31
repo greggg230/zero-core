@@ -17,8 +17,8 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `package.py` | The game package registry: `GamePackage` (name, root, engine module, run module, presets, DEFAULTS overrides, external players, specs, decision kinds, dashboard title / port, env prefix, deferred-result glue), `register`, `active` |
 | `run.py` | The loop: `DEFAULTS`, `PRESETS` (the toy's + the package's), self-play (classic or rolling), training, evaluation, Elo, resume, STOP / PAUSE |
 | `cotrain.py` | Co-training (section 11): a primary game whose deferred terminals the episodes of a resolver game decide, one network each in one run: `CoRun` (the loop), `Coordinator` (parked games -> queued episodes -> results by tag -> `resolve`), `run_pair` (two drivers on two threads), `PrimaryRun` (team events as matches) |
-| `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions; all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
-| `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place; `workers`: eager batches on threads), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
+| `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions, `forward_static` (static shapes for the CUDA graphs, 10.6); all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
+| `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place; `workers`: eager batches on threads; `graphs`: the conv network's `GraphRunner`, the token network's opt-in `TokenGraphRunner` - env ZERO_TOKEN_GRAPHS=1, section 10.6 -, `graph_calls`), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
 | `data.py` | Sample shards (`ShardWriter`, atomic npz, optionally compressed - remote self-play's; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (each shard subsampled as it is loaded; checks every shard; row provenance), `TargetStats` |
 | `finite.py` | The non-finite guard (section 4.1): vectorised NaN / inf checks, `NonFinite` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
@@ -26,9 +26,9 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `elo.py` | Bradley-Terry Elo over all results, the run's yardstick = 1000; one pool per evaluation move rule (`pool_dir`, `eval_tag`, `active_pool`), the Elo opponents (`opponents`: evaluations back, or raw `elo_offsets`; section 5.4); fixed anchors (`parse_anchors`, `fit_fixed`: the fit with the anchors held at their ratings, `anchored.json`; section 20.1) |
 | `runctl.py` | PAUSE / STOP files, exit status 75, run / supervisor state files, `PauseWatch` |
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
-| `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5) |
+| `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5; `--graphs`: 10.6) |
 | `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6) |
-| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3) |
+| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
 | `heldout.py` | Held-out losses (section 20.2): a frozen set of sample rows (`make`), a checkpoint's value cross-entropy / accuracy / Brier against z and policy cross-entropy / top-1 against the recorded targets, decision and value-only rows apart (`HeldOut`, `losses`); `python -m <pkg>.az.heldout make | eval` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
@@ -1034,7 +1034,7 @@ Every feature outside the segments and bags is a global. The network:
   globals with zero weights; the layout stays. With the game's new layout (`widen(...,
   layout=)`, fork_run) a token network follows a layout that only adds (wider slots, bag rows,
   bags, globals; the same tokens) exactly: section 10.3. Not in `zero.webexport`. CUDA: float32 eager
-  (no autocast, no CUDA graphs; not measured: the GPU was busy).
+  (no autocast); CUDA graphs opt-in (`TokenGraphRunner`, ZERO_TOKEN_GRAPHS=1: section 10.6).
 
 Tests: `tests/test_net_data.py` (masking of absent slots, chunking / batch independence, the
 pointer logits land on the slot actions, identity digits, save / load / widen, a training step
@@ -1333,7 +1333,204 @@ rounds; heads of 32 floats, feed-forward 2 x width:
   at batches of 96 and of ~384 alike (its ENGINE.md 54.11, 62). So a wider network costs the GPU
   little and a deeper one a few percent per layer (+8% operators at 6 layers, +16% at 8); not
   measured on the GPU (busy with the runs). MTG Zero's throughput plan for a bigger network: its
-  ENGINE.md 62.
+  ENGINE.md 62. Section 10.6 takes the operators and syncs out with CUDA graphs.
+
+### 10.6 CUDA graphs of the token network (`infer.TokenGraphRunner`; MTG Zero's Delver line, 2026-10-31)
+
+**Why.** The desktop's share of MTG Zero's Delver self-play and, above all, every head-to-head and
+Elo evaluation it runs on the RTX 5090 are eager CUDA inference of the token network, bound by its
+operators and host syncs (10.5): 445 kernels and 13 syncs a forward of 64 rows of the main line's
+128 x 4 network, 585 and 15 at 192 rows; on the GPU shared with a training run every sync waits
+behind the other process's work. A 2,400-game paired head-to-head at 32 simulations took ~80 minutes.
+The conv network has had CUDA graphs since Kingdom Builder (`GraphRunner`, ZERO_CUDA_GRAPHS); the
+token network's eager forward packs each batch by its data (`nonzero` per segment, the rows sorted
+by token count, chunks as long as their longest row), which a graph cannot capture.
+
+**Opt-in, off by default** (every default: the evaluator of before, byte for byte):
+
+* `NetEvaluator(model, 'cuda', graphs=True)` (False: eager; None, the default: the env below);
+* env `ZERO_TOKEN_GRAPHS=1`: every token network's evaluator of the process that has no `graphs`
+  given - the run loop's self-play and evaluations (`Run.evaluator`, co-training's, the league's),
+  `zero.h2h`, `zero.bench`, `zero.replay`, `zero.targets`, on CUDA (distillation and the held-out losses
+  call the network directly: eager). A run gets it from its environment (`ZERO_TOKEN_GRAPHS=1 python
+  tools/launch_hidden.py ... tools/supervise.py ...`: the supervisor passes its environment to the run;
+  a remote's workers do not get it: the Mac runs on its CPU anyway). No run
+  setting: `Run.evaluator` would pass one (`infer_graphs` in DEFAULTS), left for when run.py is not
+  being changed by another branch;
+* `ZERO_CUDA_GRAPHS=0` (the conv network's switch) turns the env off too: no CUDA graphs anywhere,
+  said on stderr. An explicit `graphs=True` wins over both envs, as it always did for the conv
+  network;
+* `zero.h2h --graphs 0 | 1` (both sides), `--a-graphs` / `--b-graphs` (one side, over `--graphs`): given,
+  the output names `graphs_a` / `graphs_b`, each side's share of batches through the graphs;
+  `zero.bench infer | selfplay --graphs 0 | 1` (the output's `graphs`);
+* **never a silent fallback**: asked for by the env on a CPU evaluator, or turned off by
+  ZERO_CUDA_GRAPHS=0, is said on stderr (`zero.infer: ... eager inference`); `graphs=True` on a CPU
+  evaluator, or for an MLP, is a ValueError; when on, each evaluator says `zero.infer: token network
+  CUDA graphs on` (a run's console). Every batch goes through the graphs - root belief rows and
+  value-only rows included -, and `NetEvaluator.graph_calls` counts them (`graph_calls == calls`).
+* **float32** (`use_amp` stays the conv network's). `TokenGraphRunner(model, amp=True)` (bfloat16
+  autocast) exists for the measurement below only; no switch reaches it.
+
+**How** (`zero/infer.py`, `zero/net.py`):
+
+* **The host packs the batch** (numpy, `token_presence`, `token_index`): each slot's present flag read
+  from the features, each row's token count and its tokens' positions in the full token axis (the
+  global token's 0 first, layout order, then padding). The batch is padded to B rows (a multiple of
+  ROW_STEP = 64) x T tokens (the longest row's, a multiple of T_STEP = 16); one graph per (B, T),
+  captured on first use (two warm-up runs on a side stream, then the capture; ~10 shapes in a
+  200-game head-to-head).
+* **`TokenNet.forward_static(x, n, full, ntok, aux)`**, what the graphs capture: every slot embedded,
+  present or not (the per-segment input maps on all slots, every identity decoded by one gather of
+  the digit floats per radix: 156 kernels whatever the batch, no sync), the tokens gathered by `full`,
+  the whole batch one chunk of T tokens (padding masked out of the attention as in a chunk), then the
+  trunk and heads of `forward` (`_trunk`, `_heads`: the chunk body and the heads moved out of `forward`
+  unchanged - the same operations in the same order: `forward`'s outputs and gradients are bit for bit
+  those of c15e3d0 on the Delver rows, CPU and CUDA). With the auxiliary head, the head's predictions
+  of every row (`aux_predict` in the graph); after the replay the batch's root belief rows are
+  gathered on the device and downloaded (no host sync). Value-only rows are rows with no options.
+* **One upload, one download.** Pinned host buffers, a set per batch in flight (any number in flight:
+  a set is reused after its `result`); the host copies the features outside the segments and only the
+  present slots' floats (an absent slot's are never read: its token is not gathered; for the Delver
+  rows 44% fewer bytes); the options' softmax on the CPU (numpy), as GraphRunner. One set of device
+  inputs and one memory pool for every graph (they run in order on one stream). The graphs read the
+  model's own parameters: `set_weights` (load_state_dict, in place) is seen by the next replay.
+
+**Numerics** (graphs against eager on the main line's iteration 328 and 8,192 held-out rows,
+`runs/heldout/r3-2b_iter0197fresh_8192.npz`; batches of 1-1,024 rows, a third value-only, 5% root
+belief rows, 3 batches a size):
+
+| output | max abs. difference | mean abs. difference |
+|---|---:|---:|
+| priors | 2.9e-6 | 8.7e-8 |
+| value (P(win)) | 9.5e-7 | 1.3e-8 |
+| margin | 2.4e-6 | 1.1e-7 |
+| belief (the head's distribution) | 5.1e-7 | 3.9e-10 |
+
+float32 rounding: the matrix products run at other shapes (one chunk of B x T rows against eager's
+chunks of 64 rows each as long as its own longest row, the input maps over all slots) and cuBLAS picks
+its kernels by shape; the same at every batch size (no growth with B or T), replays bit for bit
+deterministic, a row alone and inside a batch within 1.3e-7. A fresh 192 x 6 network (6 heads, feed-
+forward 384, the belief head: MTG Zero's bigger candidate, its ENGINE.md 62.3) on the same rows: priors
+4.8e-7, value 1.8e-7, margin 5.4e-7. Not a concern for the search (a prior or value 1e-6 off moves a
+visit only at a near tie, at 32-64 simulations); but the games are then not exactly the same games,
+which is why the head-to-head below measures the equivalence.
+
+**Throughput** (the desktop's RTX 5090 shared with the main line's training and self-play and another
+session's head-to-head, 67-78% busy before any of these; eager and graphs interleaved so the
+contention hits both alike). Inference alone (real rows as the search sends them - a third
+value-only, 3% belief rows -, drive's pipeline of two batches in flight, 3 s a cell, the median of 3
+rounds), leaves per second (ms a batch):
+
+| rows a batch | eager | graphs | graphs / eager | graphs, bfloat16 |
+|---:|---:|---:|---:|---:|
+| 64 | 3,034 (21.1) | 21,790 (2.9) | 7.2x | 22,488 |
+| 96 | 3,510 (27.4) | 26,008 (3.7) | 7.4x | 23,837 |
+| 144 | 4,291 (33.6) | 27,054 (5.3) | 6.3x | 26,816 |
+| 192 | 5,305 (36.2) | 25,680 (7.5) | 4.8x | 26,605 |
+| 256 | 5,698 (44.9) | 27,071 (9.5) | 4.8x | 25,364 |
+| 384 | 6,897 (55.7) | 27,580 (13.9) | 4.0x | 27,761 |
+| 512 | 6,871 (74.5) | 26,690 (19.2) | 3.9x | 26,491 |
+
+A head-to-head of iteration 328 against itself (`zero.h2h`'s seats: 200 games, 32 simulations,
+`cq-n4-v50-s0.3-rv-b1m0.25` both sides as the A/B driver plays them, 8 search threads, 200 games in
+flight: batches of 36 rows on average, 64.9k of them): **eager 1,753.7 s, graphs 261.3 s - 6.7x**
+(843 against 5,681 leaves/s; an earlier version of the graphs, 443 kernels a replay and the whole
+rows copied, 284.1 s); the same seed's games, A 0.505 in both. With the graphs the evaluators took
+230 s of the 261 (3.5 ms a batch), the search threads were busy 11% of their time. The A/B driver's
+shape, 2,400 paired games (1,024 in flight) with the graphs on both sides: **1,670.6 s (27.8 min)**
+against ~80 minutes for an eager 2,400-game paired head-to-head that day (as reported; not
+interleaved, and this one ran with this branch's gate compiling and testing on the CPU beside it); its
+1,200 pairs all split (two identical, deterministic sides).
+
+Self-play at the main line's settings (its config.json's self-play seat - 'cq' targets, root-view
+leaves with value-only samples 0.5, the belief tilt 1 / mix 0.25, 64 / 16 simulations, minor 4 -, 192
+games in flight, 8 threads, 2 groups, recording; batches of ~145 rows as its desktop share's; 60 s of
+warm-up, then 120 s measured; eager, graphs, eager, graphs): **eager 2,195 and 2,004 leaves/s, graphs
+6,457 and 8,028 - 3.4x** (2.9x and 4.0x a pair; the run's own desktop self-play measured 4.3k eager
+leaves/s that day, its phases not overlapping another head-to-head). With the graphs the evaluator holds 72-76% of the time: the search
+and the host's per-row work are now a quarter of it.
+
+**Bfloat16** (the same graphs under autocast, measured only): the same leaves/s (the table's last
+column: the graphs are not bound by arithmetic) and 10^4 x float32's differences (priors up to 0.036,
+value up to 0.014, margin 0.021, belief 0.007). Not worth it; no switch reaches it.
+
+**Where the graphs' time goes** (one batch, 64 / 192 / 512 rows of T 64; CUDA events and the host's
+clock): the host's packing 0.2 / 0.3 / 1.9 ms, its copy of the rows into the pinned buffer 1.9 / 3.8 /
+12.9 ms, the upload 0.6 / 1.7 / 4.4 ms, the replay 1.2 / 2.4 / 4.3 ms (156 kernels; 1.7 ms at 64
+rows with the first version's 443), the download 0.04-0.13 ms. Pipelined (two batches in flight), a
+batch costs about the larger of the host's part and the device's: **from ~192 rows the host's copy of
+the 37,620-float (150 KB) rows bounds it, at ~27k leaves/s.** Copying only the features outside the
+segments and the present slots (44% of the bytes) saves 10-26% of the copy against whole rows (fresh
+batches: 0.89 against 1.20 ms at 36 rows, 3.07 / 3.38 at 144, 9.86 / 11.58 at 512; the fancy indexing
+costs the rest), and the bags (19,456 of the floats, 0.4% nonzero) are copied whole. The rows are 0.7%
+nonzero (~260 floats): the next step is a sparse feed from the driver (10.1: not built), which would
+take the copy and most of the upload out; pinning the driver's own array in place
+(`cudaHostRegister`, ~1 ms) was no faster (its upload 9-15 ms and the unregister 3-7 ms at 512 rows).
+
+**Memory**: the graphs share one pool; a 200-game head-to-head's two evaluators peaked at 414 MiB of
+the device (10 shapes each), one evaluator with shapes up to 1,024 x 80 at 914 MiB; pinned host
+buffers of at least 256 rows x 150 KB (38 MB) a batch in flight and an evaluator.
+
+**Equivalence** (the same checkpoint, A through the graphs, B eager: `zero.h2h A A --paired --games 400
+--a-graphs 1 --b-graphs 0`, seed 11, the A/B driver's search otherwise: 32 simulations, chance_k 2,
+`cq-n4-v50-s0.3-rv-b1m0.25` both sides; `graphs_a` 1.0, `graphs_b` 0.0): **A 0.4975 +- 0.0043** (the pair
+scores' se; the games' binomial 0.025), Elo -1.7 +- 3.0, margin +0.03, none unfinished. 197 of the 200
+deals were split - each seat won its deal under both inferences, as a mirror's paired games do when
+the two players play the same moves -, 1 won twice by A and 2 by B (variance ratio 0.03): float32
+rounding changed the outcome of 1.5% of the deals and favours neither side. (Unpaired, the same seed's
+200-game matches with the graphs on both sides and eager on both sides scored A 0.505 alike.)
+
+**Limits.** One graph per (B, T) shape: a batch of an unseen shape pays a capture (26-75 ms from 64 x
+32 to 1,024 x 80; the process's first 0.7 s, the libraries' start; ~10 shapes in a match, 13 in the
+numerics' 1-1,024 rows). Batches of fewer rows than ROW_STEP run as 64 (at 36 rows on average a
+200-game match's padding is ~45% of the rows; the GPU does not care, the copy is of the real rows
+only). `GraphRunner` (the conv network's) is unchanged: its two fixed host
+slots would be overwritten by a third batch in flight (ZERO_INFLIGHT > 2), which the token runner's
+per-launch buffers avoid. Eager `NetEvaluator.launch` counts its batch's seconds twice (in `evaluate`
+and again in `launch`): an eager run's `selfplay.infer_s` is about twice the evaluator's time (the
+main line: 408 s of a 240-s phase); not changed here (a metric of every eager run).
+
+Tests (`tests/test_token_graphs.py`): `forward_static` against `forward` (both layouts, the auxiliary
+head, longer rows, padding positions holding other slots, padding rows), the host's packing; off by
+default and the switches (env, ZERO_CUDA_GRAPHS=0, a CPU evaluator said / refused, an MLP, explicit
+False); zero.h2h's flags (given: `graphs_a` / `graphs_b`; not given: the match of before; a CPU side
+refused); CUDA: the graphs against eager on batches of 1-130 rows with value-only and root belief
+rows (2e-5), replays deterministic, new weights in place, an absent slot's NaN floats never read
+(before and after other batches), four launches in flight, toy games with the belief and root-view
+leaves through the graphs (every batch, every answer valid, drive's pipeline too).
+
+Checks (tier "opt-in core feature with byte-identical defaults"; the desktop, 2026-10-31, on 3d5875e,
+the code; this commit adds documentation only):
+
+* **`TokenNet.forward` bit for bit c15e3d0's** (the refactor into `_global` / `_trunk` / `_heads`): its
+  outputs (with the auxiliary head on a subset of rows, and without) at batches of 1-1,500 Delver
+  rows and a training step's gradients (256 rows), CPU and CUDA, compared bit for bit (the CPU gradient
+  of `pos` differs run to run in both checkouts: threaded accumulation).
+* `pytest tests/test_token_graphs.py tests/test_net_data.py tests/test_belief.py tests/test_aux.py
+  tests/test_measure.py` with CUDA: 79 passed, none skipped. The whole suite on the CPU (in MTG Zero's
+  gate): 305 passed, 8 skipped (CUDA), 2 failed - `test_remoteplay.py`'s
+  `test_cotrain_the_local_driver_is_never_starved` and `test_a_dying_worker_gives_its_accepted_games_back`,
+  shares of games between the local driver and a worker; run side by side on c15e3d0 and here under
+  the same load the first fails in both the same way (the local driver's share 23 / 158 and 21 / 158,
+  the bar 15%) and the second passes in both: load, not this change.
+* Toy-smoke token runs byte for byte against c15e3d0 (its own worktree and target, `ZERO_INFLIGHT=1`,
+  the CPU, 4 iterations, seed 3): classic with `ext:toyheur`, and the Delver line's shape (rolling, 'cq'
+  0.3, the cq2 rule, root-view leaves with value-only samples 0.5, the auxiliary head `aux_next_card_w`
+  0.25 with the belief tilt 1 / mix 0.25, value_q 0.6, `elo_offsets` 1,2, no random games, margin_w
+  0.2), each without the env and with `ZERO_TOKEN_GRAPHS=1` on the CPU (said: eager): every shard,
+  checkpoint (zip members), optimizer state, Elo file and the metrics without timings identical. The
+  Delver-shaped run on CUDA with the env: 4 iterations, every evaluator through the graphs (rolling
+  `set_weights` included).
+* `check_checkpoint_compat --package mtgz` against MTG Zero's main 1605436 (zero-core c15e3d0): a random
+  network (the gate) and the main line's iteration 328 (the Delver spec, 8 games a target, 8 against
+  random): identical (records visits 73693aedf6cb0b7f, cq 6dd36ebeb19d9fbf, results 38b68141fc4cff90).
+* MTG Zero (branch `token-graphs`, its ENGINE.md 75): `tools/gate.py optin-core` twice on 23d4fd3 (this
+  core at 3d5875e): core tests 92 passed, checkpoint_compat byte identity identical against main 1605436,
+  `--test az` 39 passed, `--test hidden` 16 passed, Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder
+  4202a4a build against this core - and the last step **FAILED both times** on its smoke_all's core
+  pytest: the first run on the two `test_remoteplay.py` tests above (305 passed), the second on
+  `test_cotrain_the_local_driver_is_never_starved` alone (306 passed), which fails the same way on
+  c15e3d0 under the same load (above). Every other step passed both times.
 
 ## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
 
