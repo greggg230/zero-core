@@ -29,7 +29,7 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 Build: `bash tools/build_py.sh` (the toy module: release cdylib copied to
 `python/zero/_engine.pyd`; target dir `$CARGO_TARGET_DIR` or `E:/cargo-target/zero-core/<branch>`
 on Windows). A game builds its own `<pkg>._engine` with its `tools/build_py.sh` (docs/pinning.md).
-Tests: `cargo test` (the `zero_search` crate: 95 tests, ~5 s in release), `python -m pytest
+Tests: `cargo test` (the `zero_search` crate: 96 tests, ~5 s in release), `python -m pytest
 tests` (the toys, ~8 min on the loaded desktop).
 
 ## 1. The trait (final version)
@@ -929,12 +929,15 @@ number, both players' turns). The toy declares two test tags (`fish`: placing a 
 window 0; `timber`: on Timber, window 1 - the rest of the round), inert unless a driver explores.
 
 **The setting** (`DriverCfg::explore`, `ExploreCfg`; None = nothing changes): `games` (the share of games
-eligible, in (0, 1]), `q_margin` (>= 0, the decider's utility: P(win) with `margin_w` 0), `mask_z`, and
-the explored `tags` (`ExploreTagCfg`: the game's id, `p` in (0, 1], `window`). `Driver::new` refuses a game
+eligible, in (0, 1]), `q_margin` (>= 0, the decider's utility: P(win) with `margin_w` 0), `mask_z`,
+`game_tag` (false: the first trigger of any explored tag starts the episode; true: each eligible game
+draws one explored tag at its start, uniformly - the exploration stream's second draw -, and only that
+tag's opportunities count and can trigger), and the explored `tags` (`ExploreTagCfg`: the game's id, `p`
+in (0, 1], `window`). `Driver::new` refuses a game
 without tags, an unknown or repeated id, a value out of range, no tags, a driver that records nothing (an
 evaluation, an h2h, an Elo match, a replay) and a driver without a self-play seat that records (a league
 opponent's `record` false explores nothing): never a silent no-op. Bindings: `SearchDriver(...,
-explore={'games', 'q_margin', 'mask_z', 'tags': [{'tag': name, 'p', 'window'}]})` - names the game
+explore={'games', 'q_margin', 'mask_z', 'game_tag', 'tags': [{'tag': name, 'p', 'window'}]})` - names the game
 declares (`game_info['explore_tags']`; another is an error), a tag's `p` / `window` absent = the game's
 defaults.
 
@@ -942,9 +945,12 @@ defaults.
 `record`, only in an eligible game, AFTER the move is chosen (temperature sampling, the move rule, the
 Gumbel winner - whichever chose it) and after the decision's records are made:
 
-* **Opportunity**: before the game's episode, a decision whose chosen move carries an explored tag T and
-  which has an option without T. With T's chance `p` (one draw of the game's exploration stream) it
-  triggers.
+* **Opportunity**: before the game's episode, a decision whose chosen move carries an explored tag T (with
+  `game_tag`: the game's drawn tag) and which has an option without T. With T's chance `p` (one draw of the
+  game's exploration stream) it triggers. Without `game_tag` the tags compete within a game: the one whose
+  opportunity triggers first takes the game's episode - tags whose opportunities come early (MTG: the
+  mulligan, the first turns' fetches) take most games, late ones (Murktide's delve) almost none; `game_tag`
+  shares the eligible games evenly between the tags (a game whose drawn tag never comes up has no episode).
 * **The gate**: the deviation is the best option without T by visits, then P0 (`argmax_visits`' order,
   over the visit counts the move rule read). It is played only if its completed Q - the 'cq' target's
   (`tree::completed_q`: W/N from every visit, an unvisited option's v_mix; the network's value when
@@ -971,7 +977,8 @@ Gumbel winner - whichever chose it) and after the decision's records are made:
   exploration move for move and record for record; a game with an episode is that game up to its first
   deviation.
 
-**Reports.** `GameResult::explore` (`ExploreGame`; the Python row's `explore`): eligible, per explored tag
+**Reports.** `GameResult::explore` (`ExploreGame`; the Python row's `explore`): eligible, the drawn `tag`
+(`game_tag`; the row's key only then), per explored tag
 the opportunities and gate blocks before the episode, the `Episode` (tag, seat, turn, step - the game's
 real moves before the deviation, the move log's index -, decision, overridden decisions, q_gap - the
 chosen move's completed Q minus the deviation's -, alt_visits, end: `decision` | `window` | `gate` |
@@ -992,7 +999,7 @@ Code: `game.rs` (`ExploreTag`, `SearchGame::EXPLORE_TAGS`, `explore_tags`), `tre
 rows' `explore`, `take_samples()['masked']`). Tests: `driver::tests::explore_settings_are_checked`,
 `exploration_off_or_ineligible_changes_nothing`, `exploration_triggers_through_the_gate`,
 `exploration_windows_and_one_episode_a_game`, `exploration_masks_outcomes_before_the_deviation`,
-`only_the_recording_seats_explore`; `tests/test_explore.py`.
+`only_the_recording_seats_explore`, `a_game_tag_explores_only_the_tag_its_game_drew`; `tests/test_explore.py`.
 
 ## 4. Bindings and registering a game
 
