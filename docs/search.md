@@ -12,9 +12,9 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 
 | File | What |
 |---|---|
-| `crates/search/src/game.rs` | `SearchGame` trait, `Bot` trait, `RandomBot`, `MAX_SEATS` = 8 |
+| `crates/search/src/game.rs` | `SearchGame` trait, `Bot` trait, `RandomBot`, `MAX_SEATS` = 8, `ExploreTag` (habit tags, 3.9) |
 | `crates/search/src/tree.rs` | One search tree: PUCT, chance children, determinization, noise, reuse, `compact`, completed-Q targets, the root minimum visits (3.5), the Gumbel root search (3.7) |
-| `crates/search/src/driver.rs`, `driver/worker.rs` | Batched multi-threaded driver: groups, chunks, parallel batch assembly, playout cap, temperature, records, rolling phases, arena keys, external seats |
+| `crates/search/src/driver.rs`, `driver/worker.rs` | Batched multi-threaded driver: groups, chunks, parallel batch assembly, playout cap, temperature, records, rolling phases, arena keys, external seats, self-play exploration (3.9) |
 | `crates/search/src/toy.rs` | "Mini Cavern", the toy game (section 5) + its heuristic bot |
 | `crates/search/src/mull_game.rs` | Test games (cfg(test)): keep-or-mulligan (`Mull`, section 3.5) and its private-hand variant (`HiddenMull`, section 3.6) |
 | `crates/search/src/toy_team.rs` | "Toy team", a two-team game with a deferred result decided by toy games (section 5.1) |
@@ -29,7 +29,7 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 Build: `bash tools/build_py.sh` (the toy module: release cdylib copied to
 `python/zero/_engine.pyd`; target dir `$CARGO_TARGET_DIR` or `E:/cargo-target/zero-core/<branch>`
 on Windows). A game builds its own `<pkg>._engine` with its `tools/build_py.sh` (docs/pinning.md).
-Tests: `cargo test` (the `zero_search` crate: 88 tests, ~5 s in release), `python -m pytest
+Tests: `cargo test` (the `zero_search` crate: 95 tests, ~5 s in release), `python -m pytest
 tests` (the toys, ~8 min on the loaded desktop).
 
 ## 1. The trait (final version)
@@ -181,7 +181,7 @@ Default: no targets (`AUX` empty). The loss of each segment is the game package'
 ```python
 from zero import games as G       # in a game repo: from <pkg>.az import games as G
 drv = G.Driver('toy', seats, spec=None, concurrency=256, seed=0, record=False, threads=4,
-               groups=2, max_steps=100_000, rolling=False, net=0)   # (+ queue_only, move_log, aux, paired: 2.9, 2.5, 1.2, 2.10)
+               groups=2, max_steps=100_000, rolling=False, net=0)   # (+ queue_only, move_log, aux, paired, explore: 2.9, 2.5, 1.2, 2.10, 3.9)
 lb = drv.next_batch()            # LeafBatch (kind 'nn' | 'ext') or None when every game finished
 drv.submit(lb.id, priors, value, margin[, aux])  # network batch (aux: its root belief rows', 3.8)
 drv.submit_external(lb.id, payloads)            # external batch: one str per request
@@ -275,7 +275,9 @@ can be followed by rows of other seats' views of the same state with an empty op
 `pi` entries. A driver created with `aux=True` (`DriverCfg::aux`; the game must
 have targets, else the driver refuses) adds `aux` f32 [N, W]: each row's decider's
 `aux_target` at that decision (section 1.2), computed when the decision is recorded; every other
-array is the same with it on or off (tested: the golden records).
+array is the same with it on or off (tested: the golden records). A driver exploring with `mask_z`
+(section 3.9) adds `masked` u8 [N]: 1 = an exploration episode masked the row's outcome (its z is its
+q, its sc 0); the rows it dropped are not emitted.
 
 ### 2.5 Results (`take_results`)
 
@@ -284,7 +286,8 @@ at `max_steps` has `over` False and result 1/n each; `tag` is the tag of the que
 game started from (2.9), else None. A deferred game's row comes when it is resolved (2.8).
 With the driver's `move_log` N (a diagnostic, default 0 = off: nothing changes), a row also
 has `moves`: its first N real moves as `(seat, action, legal actions)` (the external seats'
-answers excluded; a resolved game's: none). `zero.h2h --move-log`.
+answers excluded; a resolved game's: none). `zero.h2h --move-log`. A driver that explores (3.9)
+adds `explore` to every row: {eligible, opportunities, blocked, masked, dropped, episode?}.
 
 ### 2.6 Rolling mode
 
@@ -906,6 +909,90 @@ Tests: `tree::tests::belief_*`, `a_belief_deals_*`, `no_belief_*`, `without_rede
 `driver::tests::belief_*`, `one_belief_row_*`, `an_evaluator_without_the_belief_*`,
 `the_belief_deals_the_searches_worlds`, `root_view_values_and_the_belief_*`, `rolling_phases_ask_the_belief_*`,
 `tests/test_belief.py`.
+
+### 3.9 Self-play exploration: habit-targeted forced deviations (`explore`; 2026-10-30)
+
+**Why.** A habit the search reinforces is never tested against its alternative when the alternative's
+payoff lies turns beyond the search's horizon: only the value network can learn it, and only from games
+that play it. MTG Zero's Delver line (its ENGINE.md 73.5, 75) cracks a fetchland at once ~90% of the
+time across 100+ generations, so Brainstorm almost never has a shuffle; the 'cq' targets put ~86% on one
+move, the alternatives almost never appear in the data, and a bigger network learns from the same games.
+Exploration plays the alternative now and then - only where the game says a habit is, only when the
+search found it close - and keeps the training data honest about it.
+
+**The hook** (`game.rs`). `SearchGame::EXPLORE_TAGS: &[ExploreTag]` (name, default `window` in turns,
+default chance `p` per opportunity; tag id k + 1 = entry k) and `explore_tags(legal, out)`: per legal
+action of the pending decision its tag id (0 = none), from what the decider can see. Default: no tags. A
+game's tags change nothing - rules, legal actions, features, digests -: the driver reads them only on the
+live game of an exploring seat's decision. Windows are measured with `rounds()` (MTG: the global turn
+number, both players' turns). The toy declares two test tags (`fish`: placing a worker on Fishing,
+window 0; `timber`: on Timber, window 1 - the rest of the round), inert unless a driver explores.
+
+**The setting** (`DriverCfg::explore`, `ExploreCfg`; None = nothing changes): `games` (the share of games
+eligible, in (0, 1]), `q_margin` (>= 0, the decider's utility: P(win) with `margin_w` 0), `mask_z`, and
+the explored `tags` (`ExploreTagCfg`: the game's id, `p` in (0, 1], `window`). `Driver::new` refuses a game
+without tags, an unknown or repeated id, a value out of range, no tags, a driver that records nothing (an
+evaluation, an h2h, an Elo match, a replay) and a driver without a self-play seat that records (a league
+opponent's `record` false explores nothing): never a silent no-op. Bindings: `SearchDriver(...,
+explore={'games', 'q_margin', 'mask_z', 'tags': [{'tag': name, 'p', 'window'}]})` - names the game
+declares (`game_info['explore_tags']`; another is an error), a tag's `p` / `window` absent = the game's
+defaults.
+
+**The episode** (`driver/worker.rs`: `decide` -> `explore_move`). Only the seats with `selfplay` and
+`record`, only in an eligible game, AFTER the move is chosen (temperature sampling, the move rule, the
+Gumbel winner - whichever chose it) and after the decision's records are made:
+
+* **Opportunity**: before the game's episode, a decision whose chosen move carries an explored tag T and
+  which has an option without T. With T's chance `p` (one draw of the game's exploration stream) it
+  triggers.
+* **The gate**: the deviation is the best option without T by visits, then P0 (`argmax_visits`' order,
+  over the visit counts the move rule read). It is played only if its completed Q - the 'cq' target's
+  (`tree::completed_q`: W/N from every visit, an unvisited option's v_mix; the network's value when
+  nothing was visited) - is at least the chosen move's minus `q_margin`. A blocked gate starts no episode
+  (`blocked`); the game stays eligible and may trigger at a later opportunity. A deviation to an unvisited
+  option passes on v_mix alone (`alt_visits` 0 in the episode: counted in the metrics).
+* **The episode** (one a game, one tag): the first deviation is played; for the tag's `window` turns -
+  while `rounds() < turn + window`; 0 = this decision only - every decision of that seat whose chosen move
+  carries T deviates the same way, each through the gate (a blocked one ends the episode: the habit is
+  played). Other tags and the other seat play as chosen. The search, its tree, the recorded policy target
+  and q stay the unconstrained search's: only the played move changes (tree reuse follows the move
+  played).
+* **Masking** (`mask_z`): every record of the game made at or before the first deviating decision (both
+  seats', value-only samples included) gets z := q - the search's own estimate, before the deviation
+  could move it - and no margin target (`Record::masked`: sc 0, the margin loss skips the row); a record
+  without a root value at that point (a value-only sample waiting for its observer's next search, which
+  now comes after the deviation; a 'z'-target value-only sample) is dropped. Records after the first
+  deviation keep their true z: their states are real and their outcomes are the signal (a held fetch,
+  then Brainstorm and the shuffle). With `mask_z` off nothing is masked or dropped.
+* **Streams**: the game's own exploration stream from (driver seed, the game's stream id) - eligibility,
+  then one draw per opportunity; `init_slot` draws nothing more from its `base`, so every other stream (the
+  deal, noise, temperature, playout caps, the search's worlds) is the same with exploration on or off. An
+  ineligible game, or an eligible one whose opportunities never trigger, is the game of a driver without
+  exploration move for move and record for record; a game with an episode is that game up to its first
+  deviation.
+
+**Reports.** `GameResult::explore` (`ExploreGame`; the Python row's `explore`): eligible, per explored tag
+the opportunities and gate blocks before the episode, the `Episode` (tag, seat, turn, step - the game's
+real moves before the deviation, the move log's index -, decision, overridden decisions, q_gap - the
+chosen move's completed Q minus the deviation's -, alt_visits, end: `decision` | `window` | `gate` |
+`game`), and the records masked and dropped. `take_samples()['masked']` (uint8, a driver with `mask_z`);
+shards store it as an optional column (docs/az.md 3); `Game.explore_tags()`.
+
+**Off.** `explore` None: nothing is read, drawn or allocated (`Slot::xp` None); the records, results and
+streams of before (the goldens, `select_*_golden_*`, check_checkpoint_compat). The Python reference
+driver (`play.PyDriver`) has no exploration: it refuses the keyword.
+
+**Cost.** Nothing off. On: one `explore_tags` call per searched decision of an eligible game's recording
+seats until its episode ends, the completed Q of the root at an opportunity, a box per game.
+
+Code: `game.rs` (`ExploreTag`, `SearchGame::EXPLORE_TAGS`, `explore_tags`), `tree.rs` (`completed_q`),
+`driver.rs` (`ExploreCfg`, `ExploreTagCfg`, `ExploreGame`, `Episode`, `Record::masked`, `DriverCfg::explore`,
+`SampleArrays::masked`), `driver/worker.rs` (`init_slot`, `decide`, `explore_move`, `emit`), `toy.rs`,
+`dynapi.rs` / the bindings (`parse_explore`, `explore_tags` in the game info, `Game.explore_tags`, the
+rows' `explore`, `take_samples()['masked']`). Tests: `driver::tests::explore_settings_are_checked`,
+`exploration_off_or_ineligible_changes_nothing`, `exploration_triggers_through_the_gate`,
+`exploration_windows_and_one_episode_a_game`, `exploration_masks_outcomes_before_the_deviation`,
+`only_the_recording_seats_explore`; `tests/test_explore.py`.
 
 ## 4. Bindings and registering a game
 

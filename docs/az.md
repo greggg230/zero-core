@@ -34,6 +34,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
 | `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
+| `explore.py` | Self-play exploration (section 21; docs/search.md 3.9): the run settings `selfplay_explore*` -> the driver's `explore` dict (`driver_dict`, `check`: names the game declares), the remote's `fingerprint`, the metrics (`new_tally`, `tally`, `merge`, `summary`: `selfplay.explore`) |
 | `league.py` | The self-play league (section 14): the league games' kinds and seat tables (classic, rolling), the iteration's picks of past checkpoints (`League.plan`: uniform or pfsp), the slots' evaluators (guarded), the games' attribution and `selfplay.league` |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
@@ -148,6 +149,9 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `draft_eval_net_remote` | '' | those events (`eval_yard_net`) on another machine while the run trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 11.7); their results in the run's `evals.jsonl` |
 | `selfplay_league` | 0.0 | the self-play league (section 14): this share of the self-play games (exactly, over each driver's started games) puts a past checkpoint of the run in one seat; only the current network's decisions become samples. 0 = off (every game the current network's mirror, as before). Single-game runs (co-training refuses it) |
 | `selfplay_league_pool` | '2,4,8,16,32' | the past checkpoints it may play: raw iteration offsets back from the network that self-plays (iteration i self-plays with i-1: offset 2 = checkpoint i-3), those that exist; 'all' = every earlier checkpoint (fictitious self-play) |
+| `selfplay_explore` | '' | self-play exploration (section 21, docs/search.md 3.9): the habit tags explored (names the game declares, or 'all'); '' = off, the run of before byte for byte. Single-game runs only |
+| `selfplay_explore_games`, `selfplay_explore_q_margin`, `selfplay_explore_mask_z` | 0.25, 0.1, 1 | the share of games eligible (one episode a game), the gate (a deviation only within this much completed Q of the chosen move), masking (records at or before the first deviation: z := q, no margin target; a value-only sample without a root value then dropped) |
+| `selfplay_explore_p`, `selfplay_explore_window` | '', '' | per tag: the chance an opportunity triggers and the window in turns ('' = the game's defaults, a number = every tag's, 'tag=v,...') |
 | `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
 | `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
 
@@ -179,9 +183,9 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'; with `eval_games` 0 `eval_yard` has 0 games: the iteration is still evaluated, section 20.1), `elo` (`select`: its pool unless 'visits'), `elo_anchored` (with `elo_anchors`: the rating of the fit with the anchors fixed, section 20.1), `heldout` (with `heldout_shards`: the held-out losses, section 20.2), `phases` (seconds per phase), `seconds` |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18; `explore`: with `selfplay_explore` on, the episodes, gate blocks, overridden decisions, Q gaps, trigger turns and masked / dropped records per tag, this machine's and the remote's, section 21.5), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'; with `eval_games` 0 `eval_yard` has 0 games: the iteration is still evaluated, section 20.1), `elo` (`select`: its pool unless 'visits'), `elo_anchored` (with `elo_anchors`: the rating of the fit with the anchors fixed, section 20.1), `heldout` (with `heldout_shards`: the held-out losses, section 20.2), `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
-| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
+| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15; with exploration masking, the key `masked`: section 21.4): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
 | `elo/<rule>/results.json`, `elo/<rule>/ratings.json` | the pool of another evaluation move rule ('cq', 'cq-n2', ...; section 5.4): the same files, plus `select` (the rule) and `since` (the first iteration it rated) |
@@ -3132,3 +3136,112 @@ nice 19 for the measurements), on ec57c15 (the code; this commit adds documentat
   `--test hidden`, Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder 4202a4a build against this
   core: GREEN), `check_checkpoint_compat` with the Delver line's checkpoint 196 identical, pytest 62
   passed; the anchors end to end on the Mac (`eval_remote mac`).
+
+## 21. Self-play exploration: habit-targeted forced deviations (`zero/explore.py`; MTG Zero's Delver mirror, 2026-10-30)
+
+### 21.1 Why
+
+MTG Zero's Delver main line (its ENGINE.md 73.5, 75) plateaued with habits frozen across 100+
+generations: fetchlands cracked at once ~90% of the time (so Brainstorm has a shuffle 11-16% of the
+time, never in response to a fetch), tapping out into a live Daze about half the time, Force of Will
+pitched to Force of Will 56-91% of the time when another blue card was there, Murktide's delve leaving
+an instant or sorcery behind in a third of its casts, Volcanic Island fetched on turns 1-2 when only blue
+was needed 60-83%, one-landers kept 54-92%. The payoff of each alternative is turns away, beyond a 16-64
+simulation search: only the value network can learn it, and only from games that play it. The 'cq'
+targets put ~86% on one move, so the alternatives almost never appear in self-play and the habits
+reinforce themselves; a bigger network (r3-big192x6) learns from the same games. Exploration makes
+self-play play the alternative now and then, where the game names a habit and the search found it
+close, and keeps the value targets of the states before the deviation honest.
+
+### 21.2 What it does (docs/search.md 3.9)
+
+The game tags its habits (`SearchGame::EXPLORE_TAGS`, `explore_tags`); a share of the self-play games is
+eligible; in one, the recording seat's first chosen move that carries an explored tag (each opportunity
+with the tag's chance) is replaced by the best untagged option when the gate lets it - its completed Q
+within `q_margin` of the chosen move's -, and through the tag's window (in turns) every move of that
+seat with the tag is; one episode a game. The search, its tree and the recorded targets are the
+unconstrained search's. With `mask_z`, every record of the game made at or before the first deviation
+gets z := q and no margin target, a value-only sample without a root value by then is dropped; the
+records after it keep their outcome. The exploration stream is the game's own (no other stream moves),
+so a game without an episode is the game of a run without exploration.
+
+### 21.3 Settings (`zero/explore.py`; all off by default)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `selfplay_explore` | '' | the habit tags explored: comma-separated names the game declares (its `explore_tags` in `G.info(game)`), or 'all'; '' = off (the run of before, byte for byte) |
+| `selfplay_explore_games` | 0.25 | the share of self-play games eligible for an episode, in (0, 1] |
+| `selfplay_explore_q_margin` | 0.1 | the gate: a deviation only when its completed Q is at least the chosen move's minus this (P(win) with `margin_w` 0) |
+| `selfplay_explore_mask_z` | 1 | 1 = the records at or before the first deviation get z := q, no margin target (the shards' `masked` column); a value-only sample without a root value by then is dropped. 0 = no masking |
+| `selfplay_explore_p` | '' | the chance an opportunity triggers: '' = each tag's game default, a number = every tag's, 'tag=p,...' = those tags' |
+| `selfplay_explore_window` | '' | the episode's window in turns (0 = the decision only, 1 = the rest of the turn, 2 = and the next turn): '' = each tag's game default, a number = every tag's, 'tag=w,...' |
+
+`explore.driver_dict(cfg, info)` resolves them into the driver's `explore` dict (each tag's p and
+window explicit); `explore.check` refuses (SystemExit, at the run's start) a name the game does not
+declare, a game without tags, a p / window for a tag not explored, a value out of range, and co-training
+(single-game runs only; a resolver's `selfplay_explore` too). `Run.driver` passes it to self-play's
+drivers only (`record` True): evaluation, Elo, h2h, replays and the remote evaluation never get it, and
+the driver refuses it without a recording self-play seat. The league (section 14) composes: only the
+current network's recording seat explores, never the past checkpoint's.
+
+### 21.4 Training on masked rows
+
+Shards carry the optional `masked` uint8 column (1 = an episode masked the row's outcome; data.py,
+protocol.py's `OPTIONAL_SAMPLE_KEYS`); a window with any shard that has it has `Window.masked` (0 for the
+rows of shards without) and its batches `masked`. The value target needs nothing (z is already q: the
+target (1 - value_q) z + value_q q is q); the margin loss skips masked rows - a mean of the squared error
+over the unmasked rows' present seats, `sum / unmasked rows / 2`, the loss of before when the window has
+no `masked` (the run's training and distillation's `losses`, section 13). A held-out set (section 20.2)
+is refused from masked rows (`heldout.make`, `HeldOut`): their z is not the outcome. Old checkouts read
+such shards without the column's meaning (an older run training on an exploring run's shards would train
+the margin of masked rows towards 0: fork from the run's own checkout).
+
+### 21.5 Metrics
+
+`selfplay.explore` (in metrics.jsonl and the log's `selfplay:` line), from the phase's finished games'
+rows (`row['explore']`), this machine's and the remote's: games, eligible, episodes, overridden
+decisions, masked and dropped records and their shares of the games' records (`masked_share`,
+`dropped_share`), and per tag: opportunities (before a game's episode), blocked (triggered, the gate
+refused the deviation), episodes, overridden, `q_gap` (the mean at the first deviation: the chosen move's
+completed Q minus the deviation's; negative = the deviation looked better), `alt_unvisited` (first
+deviations to an option the search never visited: they pass the gate on v_mix), `ends` (decision /
+window / gate / game) and `turns` (the first deviations' turns: `rounds()`). `explore.tally` / `merge` /
+`summary` compute them.
+
+### 21.6 Remote self-play
+
+A worker explores from its mirror's config.json (the run's settings): its driver is `Run.driver`'s. It
+tallies the games the run accepts (`explore.tally`) into its `end` line; the run merges them into
+`selfplay.explore` with its own. Its hello reports `explore.fingerprint` (the driver dict as canonical
+JSON); a worker whose checkout explores otherwise - an older checkout does not explore at all - is
+refused (killed at its hello, retried in 10 minutes; this machine plays every game), as for the root's
+belief (18.5): never a remote that self-plays without exploration in silence.
+
+### 21.7 Off by default; tests and checks
+
+Off (`selfplay_explore` ''): no driver gets `explore`, no stream, record, shard or metric changes;
+config.json gains the six keys. Tests: Rust `driver::tests::explore_settings_are_checked`,
+`exploration_off_or_ineligible_changes_nothing` (an ineligible game or one without an episode is the game
+without exploration move for move and record for record, a game with one is that game up to its
+deviation; the same with other threads and groups), `exploration_triggers_through_the_gate` (p 1 and an
+open gate: the first opportunity, the habit the chosen move there; q_margin 0: blocks, every gap <= 0,
+opportunities = blocks + the episode; p 0.3: later opportunities), `exploration_windows_and_one_episode_a_game`
+(no tagged move of the seat inside the window, the habit played after it, one episode),
+`exploration_masks_outcomes_before_the_deviation` (the first records masked, z = q, sc 0, the dropped ones
+value-only samples, the rest true; mask off: nothing), `only_the_recording_seats_explore` (league and
+evaluation opponents). `tests/test_explore.py` (6): the toy's tags and the binding's refusals, the rows and
+`masked` samples, the settings and their errors, the window's `masked` and the margin, a toy run exploring
+(metrics, log line, shards) and the defaults given = the run of before (every shard, checkpoint and
+optimizer state), a name the game does not declare refused, remote self-play exploring and a worker without
+it refused.
+
+Checks (desktop 2026-10-30, CPU only, below normal priority; feat/explore d745576): `cargo test --release`
+95 passed (zero_search; webnet 3); `pytest tests` 308 passed, 3 skipped, 12:43 on the loaded CPU;
+`check_checkpoint_compat --package zero` against c15e3d0 (its own worktree and target), random and uniform
+evaluators: identical; a toy-smoke rolling run ('cq' targets, value-only samples, seed 3, 2 iterations)
+in both checkouts: every shard, checkpoint (zip members) and optimizer state identical, config.json gains
+the six keys. MTG Zero (branch `explore`, its ENGINE.md 75.7): the optin-core gate.
+
+### 21.8 What it measured on MTG Zero's Delver line (its ENGINE.md 75.5)
+
+RESULTS_PLACEHOLDER

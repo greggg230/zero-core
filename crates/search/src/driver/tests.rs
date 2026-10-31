@@ -2342,7 +2342,7 @@ use crate::toy::{ToySpec, S_FISH};
 /// An exploration setting of the toy's tags (`ToyGame::EXPLORE_TAGS`: 1 = fish, 2 = timber):
 /// (id, p, window) each.
 fn explore(games: f64, q_margin: f64, mask_z: bool, tags: &[(u8, f64, u32)]) -> ExploreCfg {
-    ExploreCfg { games, q_margin, mask_z, tags: tags.iter().map(|&(id, p, window)| ExploreTagCfg { id, p, window }).collect() }
+    ExploreCfg { games, q_margin, mask_z, game_tag: false, tags: tags.iter().map(|&(id, p, window)| ExploreTagCfg { id, p, window }).collect() }
 }
 
 /// A toy self-play run with every move logged: rows by gid, each game's records.
@@ -2622,4 +2622,27 @@ fn only_the_recording_seats_explore() {
         }
     }
     assert!(n > 20, "{n}");
+}
+
+#[test]
+fn a_game_tag_explores_only_the_tag_its_game_drew() {
+    // game_tag: each eligible game draws one explored tag at its start (its stream's second draw); its
+    // opportunities and its episode are that tag's only, and both tags are drawn over the games. The
+    // default (the first trigger of any tag) draws none.
+    let mut x = explore(1.0, 1e9, true, &[(1, 1.0, 0), (2, 1.0, 1)]);
+    x.game_tag = true;
+    let (rb, _) = xrun(nn(0, 16, true), Some(x), 40, 2, 2);
+    let mut drawn = [0; 3];
+    for r in &rb {
+        let e = r.explore.as_ref().unwrap();
+        assert!(e.tag == 1 || e.tag == 2, "{}", e.tag);
+        drawn[e.tag as usize] += 1;
+        assert_eq!(e.opportunities[if e.tag == 1 { 1 } else { 0 }], 0, "game {}", r.gid);
+        if let Some(ep) = &e.episode {
+            assert_eq!(ep.tag, e.tag);
+        }
+    }
+    assert!(drawn[1] > 8 && drawn[2] > 8, "{drawn:?}");
+    let (ra, _) = xrun(nn(0, 16, true), Some(explore(1.0, 1e9, true, &[(1, 1.0, 0), (2, 1.0, 1)])), 10, 2, 2);
+    assert!(ra.iter().all(|r| r.explore.as_ref().unwrap().tag == 0));
 }

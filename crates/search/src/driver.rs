@@ -409,6 +409,11 @@ pub struct ExploreCfg {
     /// first deviating decision gets z := q and no margin target (`Record::masked`), a record
     /// without a root value by then (a value-only sample still waiting) is dropped.
     pub mask_z: bool,
+    /// Each eligible game draws one of the explored tags at its start (uniformly, from its exploration
+    /// stream): only that tag's opportunities can start its episode. False (the default): the first
+    /// opportunity of any explored tag that triggers does - the tags whose opportunities come early in
+    /// a game (a mulligan, the first turns' fetches) then take most episodes.
+    pub game_tag: bool,
     /// The habits explored, each at most once.
     pub tags: Vec<ExploreTagCfg>,
 }
@@ -469,6 +474,8 @@ impl ExploreCfg {
 pub struct ExploreGame {
     /// The game drew a place among the `ExploreCfg::games` share.
     pub eligible: bool,
+    /// With `ExploreCfg::game_tag`: the tag id the eligible game drew (0: none drawn).
+    pub tag: u8,
     /// Per explored tag (`ExploreCfg::tags` order): the opportunities before the game's episode (a
     /// recording seat's decision whose chosen move carried the tag, with an untagged option), and
     /// those whose draw triggered but whose gate blocked the deviation.
@@ -855,6 +862,10 @@ struct Explore {
     /// opportunity; no other stream is touched.
     rng: Rng,
     eligible: bool,
+    /// `ExploreCfg::game_tag`: the one tag (its index in `ExploreCfg::tags`, and its id) the game may
+    /// explore.
+    only: Option<usize>,
+    only_id: u8,
     /// The episode (at most one a game) and whether its window is still open.
     ep: Option<Episode>,
     live: bool,

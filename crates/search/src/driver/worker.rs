@@ -325,7 +325,10 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
         let mut rng = Rng::new(split64(split64(cfg.seed ^ EXPLORE_SALT) ^ split64(stream as u64 + 1)));
         let eligible = rng.unit() < x.games;
         let k = x.tags.len();
-        Box::new(Explore { rng, eligible, ep: None, live: false, slot: 0, marks: Vec::new(), opportunities: vec![0; k], blocked: vec![0; k], tags: Vec::new() })
+        // (game_tag: the eligible game's one tag, the stream's second draw)
+        let only = (eligible && x.game_tag).then(|| rng.below(k as u32) as usize);
+        let only_id = only.map_or(0, |o| x.tags[o].id);
+        Box::new(Explore { rng, eligible, only, only_id, ep: None, live: false, slot: 0, marks: Vec::new(), opportunities: vec![0; k], blocked: vec![0; k], tags: Vec::new() })
     });
     Ok(())
 }
@@ -696,7 +699,7 @@ fn explore_move<G: SearchGame>(x: &ExploreCfg, st: &mut Explore, g: &G, tree: &T
     g.explore_tags(acts, &mut st.tags);
     let tag = st.tags[i];
     let k = x.slot_of(tag)?;
-    if st.live && k != st.slot {
+    if (st.live && k != st.slot) || st.only.is_some_and(|o| o != k) {
         return None;
     }
     let p0 = tree.priors0(root);
@@ -888,7 +891,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
     }
     if let Some(x) = xp {
         let x = *x;
-        row.explore = Some(ExploreGame { eligible: x.eligible, opportunities: x.opportunities, blocked: x.blocked, episode: x.ep, masked, dropped });
+        row.explore = Some(ExploreGame { eligible: x.eligible, tag: x.only_id, opportunities: x.opportunities, blocked: x.blocked, episode: x.ep, masked, dropped });
     }
     row
 }

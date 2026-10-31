@@ -106,6 +106,12 @@ def test_rows_and_samples():
     t = m['tags']['fish']
     assert t['episodes'] == 2 * sum(e['tag'] == 1 for e in eps) and t['opportunities'] >= t['episodes']
     assert sum(t['turns'].values()) == t['episodes'] and t['q_gap'] is not None
+    # pick 'game': each game's drawn tag in its row, the tally's `drawn`, every episode that tag's
+    rows3, _ = play(dict(x, game_tag=True))
+    assert all(r['explore']['tag'] in (1, 2) for r in rows3)
+    assert all(r['explore']['episode']['tag'] == r['explore']['tag'] for r in rows3 if r['explore'].get('episode'))
+    m3 = X.summary(X.tally(rows3, X.new_tally(G.info('toy'), dict(d, game_tag=True))))
+    assert m3['tags']['fish']['drawn'] + m3['tags']['timber']['drawn'] == len(rows3) and m3['tags']['fish']['drawn'] > 0
 
 
 def test_settings():
@@ -118,7 +124,10 @@ def test_settings():
                        'selfplay_explore_games': 1.0, 'selfplay_explore_q_margin': 0.05, 'selfplay_explore_mask_z': 0},
                       info)
     assert d == {'games': 1.0, 'q_margin': 0.05, 'mask_z': False, 'tags': [{'tag': 'timber', 'p': 0.3, 'window': 2}]}
-    for cfg, msg in [({'selfplay_explore': 'trees'}, "declares no habit tag \\['trees'\\]"),
+    d = X.driver_dict({'selfplay_explore': 'fish', 'selfplay_explore_pick': 'game'}, info)
+    assert d['game_tag'] is True and 'game_tag' not in X.driver_dict({'selfplay_explore': 'fish'}, info)
+    for cfg, msg in [({'selfplay_explore': 'fish', 'selfplay_explore_pick': 'all'}, "selfplay_explore_pick 'all'"),
+                     ({'selfplay_explore': 'trees'}, "declares no habit tag \\['trees'\\]"),
                      ({'selfplay_explore': 'fish,fish'}, 'a tag twice'),
                      ({'selfplay_explore': 'fish', 'selfplay_explore_games': 0}, 'selfplay_explore_games 0'),
                      ({'selfplay_explore': 'fish', 'selfplay_explore_q_margin': -1}, 'q_margin -1'),

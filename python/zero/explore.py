@@ -14,6 +14,10 @@ Run settings (all off by default: '' = no exploration, the runs of before byte f
                               'tag=p,...' = those tags' (the others their default)
   selfplay_explore_window     '' = each tag's default window (turns; 0 = the decision only); a number =
                               every tag's; 'tag=w,...' = those tags'
+  selfplay_explore_pick       'first' = the game's first opportunity that triggers, of any explored tag,
+                              starts its episode (the tags whose opportunities come early take most);
+                              'game' = each eligible game draws one explored tag at its start, only it
+                              can (the tags share the eligible games evenly)
 
 A name the game does not declare, a p / window for a tag not explored, a value out of range: refused
 (SystemExit), never a silent no-op. Only the recording self-play seat explores (never an evaluation,
@@ -28,7 +32,7 @@ deviation's), first deviations to an unvisited option, how the episodes ended, t
 import json
 
 KEYS = ('selfplay_explore', 'selfplay_explore_games', 'selfplay_explore_q_margin', 'selfplay_explore_mask_z',
-        'selfplay_explore_p', 'selfplay_explore_window')
+        'selfplay_explore_p', 'selfplay_explore_window', 'selfplay_explore_pick')
 
 
 def tags_of(info):
@@ -90,6 +94,9 @@ def driver_dict(cfg, info):
         raise SystemExit(f'selfplay_explore_mask_z {mask!r}: 0 or 1')
     ps = _per_tag(cfg.get('selfplay_explore_p', ''), names, 'selfplay_explore_p', float)
     ws = _per_tag(cfg.get('selfplay_explore_window', ''), names, 'selfplay_explore_window', int)
+    pick = cfg.get('selfplay_explore_pick', 'first')
+    if pick not in ('first', 'game'):
+        raise SystemExit(f"selfplay_explore_pick {pick!r}: 'first' or 'game'")
     tags = []
     for n in names:
         _, w0, p0 = declared[known.index(n)]
@@ -99,7 +106,10 @@ def driver_dict(cfg, info):
         if w < 0:
             raise SystemExit(f'selfplay_explore_window: {n} {w}: turns >= 0 (0 = the decision only)')
         tags.append({'tag': n, 'p': float(p), 'window': int(w)})
-    return {'games': games, 'q_margin': margin, 'mask_z': bool(mask), 'tags': tags}
+    d = {'games': games, 'q_margin': margin, 'mask_z': bool(mask), 'tags': tags}
+    if pick == 'game':
+        d['game_tag'] = True                       # (absent: the driver's default, 'first')
+    return d
 
 
 def check(cfg, info, where=''):
@@ -124,7 +134,7 @@ def fingerprint(cfg, info):
 
 def _tag_sums():
     return {'opportunities': 0, 'blocked': 0, 'episodes': 0, 'overridden': 0, 'q_gap_sum': 0.0, 'alt_unvisited': 0,
-            'ends': {}, 'turns': {}}
+            'drawn': 0, 'ends': {}, 'turns': {}}
 
 
 def new_tally(info, d):
@@ -133,6 +143,10 @@ def new_tally(info, d):
     explored = [t['tag'] for t in d['tags']]
     return {'names': [t[0] for t in tags_of(info)], 'explored': explored, 'games': 0, 'eligible': 0, 'samples': 0,
             'masked': 0, 'dropped': 0, 'tags': {n: _tag_sums() for n in explored}}
+
+
+def _tag_sums_keys():
+    return ('opportunities', 'blocked', 'episodes', 'overridden', 'q_gap_sum', 'alt_unvisited', 'drawn')
 
 
 def tally(rows, acc):
@@ -150,6 +164,8 @@ def tally(rows, acc):
         for k, n in enumerate(acc['explored']):
             acc['tags'][n]['opportunities'] += int(x['opportunities'][k])
             acc['tags'][n]['blocked'] += int(x['blocked'][k])
+        if x.get('tag'):
+            acc['tags'][acc['names'][int(x['tag']) - 1]]['drawn'] += 1        # (pick 'game': the game's tag)
         ep = x.get('episode')
         if ep is not None:
             t = acc['tags'][acc['names'][int(ep['tag']) - 1]]
@@ -176,8 +192,8 @@ def merge(a, b):
         out[k] += b[k]
     for n, t in b['tags'].items():
         o = out['tags'][n]
-        for k in ('opportunities', 'blocked', 'episodes', 'overridden', 'q_gap_sum', 'alt_unvisited'):
-            o[k] += t[k]
+        for k in _tag_sums_keys():
+            o[k] += t.get(k, 0)
         for k in ('ends', 'turns'):
             for x, v in t[k].items():
                 o[k][x] = o[k].get(x, 0) + v
@@ -190,7 +206,7 @@ def summary(acc):
     for n in acc['explored']:
         t = acc['tags'][n]
         e = t['episodes']
-        tags[n] = {'opportunities': t['opportunities'], 'blocked': t['blocked'], 'episodes': e,
+        tags[n] = {'drawn': t['drawn'], 'opportunities': t['opportunities'], 'blocked': t['blocked'], 'episodes': e,
                    'overridden': t['overridden'], 'q_gap': round(t['q_gap_sum'] / e, 4) if e else None,
                    'alt_unvisited': t['alt_unvisited'], 'ends': dict(sorted(t['ends'].items())),
                    'turns': dict(sorted(t['turns'].items(), key=lambda kv: int(kv[0])))}

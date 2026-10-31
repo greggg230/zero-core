@@ -276,9 +276,11 @@ DEFAULTS = dict(
     # completed Q is within selfplay_explore_q_margin of the chosen move's; the same through the tag's
     # window (selfplay_explore_window, turns: '' = the game's default, a number, or tag=w,...). mask_z 1:
     # the records at or before the first deviation get z := q and no margin target (a value-only sample
-    # without a root value by then is dropped). Single-game runs only
+    # without a root value by then is dropped). selfplay_explore_pick 'first': the game's first opportunity
+    # of any explored tag that triggers starts its episode; 'game': each eligible game draws one explored
+    # tag at its start, only it can. Single-game runs only
     selfplay_explore='', selfplay_explore_games=0.25, selfplay_explore_q_margin=0.1, selfplay_explore_mask_z=1,
-    selfplay_explore_p='', selfplay_explore_window='',
+    selfplay_explore_p='', selfplay_explore_window='', selfplay_explore_pick='first',
 )
 
 PRESETS = {
