@@ -35,10 +35,33 @@ def cfg_of(**kw):
     (dict(selfplay_sims_heavy=32, selfplay_sims_heavy_fast=8, selfplay_heavy_depth=5), '1..4'),
     (dict(selfplay_sims_heavy=32, selfplay_sims_heavy_fast=8, selfplay_root_search='gumbel'), 'exclusive'),
     (dict(selfplay_sims_heavy=-1), '>= 0'),
+    (dict(selfplay_chance_mode_heavy='stratified'), 'without selfplay_sims_heavy'),
+    (dict(selfplay_sims_heavy=32, selfplay_sims_heavy_fast=8, selfplay_chance_mode_heavy='enumerate'), 'one of'),
+    (dict(selfplay_sims_heavy=32, selfplay_sims_heavy_fast=8, selfplay_chance_k_heavy=2,
+          selfplay_chance_mode_heavy='stratified'), 'exclusive'),
 ])
+
+
 def test_settings_that_would_do_nothing_are_refused(kw, msg):
     with pytest.raises(ValueError, match=msg):
         HV.settings(cfg_of(**kw))
+
+def test_stratified_chance_outcomes_are_a_setting_of_their_own(tmp_path):
+    on = Run(str(tmp_path / 'on'), cfg_of(selfplay_sims_heavy=32, selfplay_sims_heavy_fast=8,
+                                          selfplay_chance_mode_heavy='stratified'))
+    sp = on.nn_seat('m', 8, selfplay=True)
+    assert sp['chance_mode_heavy'] == 'stratified'
+    assert HV.fingerprint(on.cfg).endswith(',chance_mode_heavy=stratified')
+    assert 'chance outcomes stratified' in HV.describe(on.heavy)
+    E = G.engine()
+    g = E.Game('toy', None, 2, 5)
+    while len(g.legal()) < 2:
+        g.step(g.legal()[0])
+    t = g.search_tree(True, 1)
+    t.set_stratified(True)
+    assert t.stratified and g.strata(0) == 0       # (the toy has no strata: its worlds are dealt as before)
+    G.Driver('toy', [[sp] * 2], concurrency=1, seed=1)
+
 
 
 def test_the_seats(tmp_path):
@@ -47,7 +70,8 @@ def test_the_seats(tmp_path):
                                           selfplay_root_min_visits_heavy=2, selfplay_heavy_prior_max=0.05))
     assert off.heavy is None
     assert on.heavy == {'sims_heavy': 32, 'sims_heavy_fast': 8, 'chance_k_heavy': 4, 'root_min_visits_heavy': 2,
-                        'heavy_prior_max': 0.05, 'heavy_depth': 2, 'heavy_horizon': 12, 'heavy_lines': 64}
+                        'heavy_prior_max': 0.05, 'heavy_depth': 2, 'heavy_horizon': 12, 'heavy_lines': 64,
+                        'chance_mode_heavy': 'sample'}
     sp_off, sp_on = off.nn_seat('m', 8, selfplay=True), on.nn_seat('m', 8, selfplay=True)
     assert not any(k.startswith('sims_heavy') or 'heavy' in k for k in sp_off)
     assert dict(sp_on) == dict(sp_off, sims_heavy=32, sims_heavy_fast=8, chance_k_heavy=4, root_min_visits_heavy=2,

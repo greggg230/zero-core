@@ -363,6 +363,17 @@ pub struct Tree<G: SearchGame> {
     belief_mix: f64,
     /// The Gumbel root search of the current search (`set_gumbel`; None = PUCT at the root).
     gumbel: Option<Box<GumbelRoot>>,
+    /// Stratified worlds of the current search (`set_stratified`, docs/search.md 3.11): the units of
+    /// the viewer's next own revelation dealt without replacement - a random permutation of the
+    /// `SearchGame::strata` units, one unit a simulation, a fresh permutation after each pass.
+    strat: Option<Strat>,
+}
+
+/// `Tree::set_stratified`'s pass: the units' permutation and the next position in it.
+#[derive(Clone, Debug, Default)]
+struct Strat {
+    perm: Vec<u32>,
+    pos: usize,
 }
 
 /// Deal a world for `viewer` (docs/search.md 3.8): `determinize_with` the belief, but a `mix` share
@@ -396,6 +407,7 @@ impl<G: SearchGame> Default for Tree<G> {
             belief: None,
             belief_mix: 0.0,
             gumbel: None,
+            strat: None,
         }
     }
 }
@@ -424,7 +436,25 @@ impl<G: SearchGame> Tree<G> {
         self.belief = None;
         self.belief_mix = 0.0;
         self.gumbel = None;
+        self.strat = None;
         self.set_base(game, rng);
+    }
+
+    /// Stratified worlds for the search starting now (docs/search.md 3.11; needs `redet`): after each
+    /// simulation's deal, `SearchGame::set_stratum(viewer, unit)` with the next unit of a random
+    /// permutation of the world's `strata(viewer)` units (a new permutation after each pass, or when the
+    /// count changes) - the units of the viewer's next own revelation sampled without replacement
+    /// across the simulations instead of independently. Each world is still a draw of the deal's
+    /// distribution (a unit's identity is uniform over a pass), so a plain average of the backups stays
+    /// an unbiased estimate of the probability-weighted value, and a full pass covers every unit once.
+    /// `reset` and `advance` turn it off.
+    pub fn set_stratified(&mut self, on: bool) {
+        self.strat = if on && self.redet { Some(Strat::default()) } else { None };
+    }
+
+    /// Whether the current search deals stratified worlds.
+    pub fn stratified(&self) -> bool {
+        self.strat.is_some()
     }
 
     /// The root's belief for the search starting now (docs/search.md 3.8): every simulation deals
@@ -876,6 +906,19 @@ impl<G: SearchGame> Tree<G> {
         g.clone_from(self.base.as_ref().unwrap_or(live));
         if self.redet {
             deal(g, self.viewer, self.belief.as_ref(), self.belief_mix, rng);
+            if let Some(st) = self.strat.as_mut() {
+                let n = g.strata(self.viewer);
+                if n > 0 {
+                    if st.pos >= st.perm.len() || st.perm.len() != n as usize {
+                        st.perm.clear();
+                        st.perm.extend(0..n);
+                        rng.shuffle(&mut st.perm);
+                        st.pos = 0;
+                    }
+                    g.set_stratum(self.viewer, st.perm[st.pos]);
+                    st.pos += 1;
+                }
+            }
             sc.legal.clear();
             g.legal_actions(&mut sc.legal);
             if g.to_move() != Some(self.player(self.root)) || sc.legal.as_slice() != self.acts(self.root) {
@@ -1074,6 +1117,7 @@ impl<G: SearchGame> Tree<G> {
                 self.belief = None;
                 self.belief_mix = 0.0;
                 self.gumbel = None;
+                self.strat = None;
                 if self.nodes.len() > COMPACT_AT {
                     self.compact();
                 }
@@ -1100,6 +1144,7 @@ impl<G: SearchGame> Tree<G> {
             belief: self.belief.take(),
             belief_mix: self.belief_mix,
             gumbel: self.gumbel.take(),
+            strat: self.strat.take(),
             ..Default::default()
         };
         let mut map = std::collections::HashMap::new();

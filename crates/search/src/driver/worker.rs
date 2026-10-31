@@ -287,6 +287,7 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
             // (a heavy search keeps its budget and its floor, docs/search.md 3.11; one still waiting for
             // the probe is probed at the new root's expansion)
             k = k.max(heavy_floor(seat.root_min_visits_heavy, slot.legal.len(), slot.target.unwrap()));
+            t.set_stratified(seat.chance_mode_heavy == ChanceMode::Stratified);
         }
         t.set_root_min(k);
         if let RootSearch::Gumbel { m, c_visit, c_scale, .. } = seat.root_search {
@@ -430,6 +431,7 @@ fn heavy_decide<G: SearchGame>(seed: u64, slot: &mut Slot<G>, seat: &NnSeat, p: 
     if k > tree.root_min() {
         tree.set_root_min(k);
     }
+    tree.set_stratified(seat.chance_mode_heavy == ChanceMode::Stratified);
     Ok(())
 }
 

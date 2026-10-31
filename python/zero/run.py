@@ -117,6 +117,9 @@ DEFAULTS = dict(
     # Single-game runs only
     selfplay_sims_heavy=0, selfplay_sims_heavy_fast=0, selfplay_chance_k_heavy=-1, selfplay_root_min_visits_heavy=0,
     selfplay_heavy_prior_max=1.0, selfplay_heavy_depth=2, selfplay_heavy_horizon=12, selfplay_heavy_lines=64,
+    # ... and how a heavy search samples the decider's own revelations: 'sample' (independent worlds) |
+    # 'stratified' (their equally likely units without replacement across its simulations; chance_k 0)
+    selfplay_chance_mode_heavy='sample',
     # policy target of the recorded (full-search) decisions: 'visits' (the root visit
     # distribution) | 'cq' (Gumbel AlphaZero's completed-Q target softmax(ln P0 + (cq_c_visit +
     # max N) cq_c_scale completedQ), docs/search.md 3.1); the search itself is the same

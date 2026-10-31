@@ -141,6 +141,19 @@ impl SearchGame for Peek {
     fn rounds(&self) -> u32 {
         self.round
     }
+    /// The coin is seat 0's own next revelation while unseen: two equally likely units (0, 1).
+    fn strata(&self, viewer: usize) -> u32 {
+        if viewer == 0 && !self.over && matches!(self.phase, 0..=3 | 5) {
+            2
+        } else {
+            0
+        }
+    }
+    fn set_stratum(&mut self, viewer: usize, unit: u32) {
+        if self.strata(viewer) > 0 {
+            self.coin = unit as u8;
+        }
+    }
     /// One light class (docs/search.md 3.10), `start`: seat 0's first decision.
     const LIGHT_CLASSES: &'static [&'static str] = &["start"];
     fn light_class(&self) -> Option<usize> {

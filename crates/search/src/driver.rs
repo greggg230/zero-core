@@ -396,12 +396,34 @@ pub struct NnSeat {
     pub heavy_prior_max: f64,
     /// The probe's lines (`heavy::ProbeCfg`: deviations, horizon, line budget).
     pub heavy_probe: ProbeCfg,
+    /// How a heavy search samples the chance outcomes of the decider's own revelations (default
+    /// `ChanceMode::Sample`: every world independent, as every search; `Stratified`: the units of the
+    /// next own revelation without replacement across the simulations, `Tree::set_stratified`).
+    pub chance_mode_heavy: ChanceMode,
+}
+
+/// A heavy search's chance outcomes (`NnSeat::chance_mode_heavy`, docs/search.md 3.11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChanceMode {
+    #[default]
+    Sample,
+    Stratified,
+}
+
+impl ChanceMode {
+    pub fn parse(s: &str) -> Result<ChanceMode, String> {
+        match s {
+            "sample" => Ok(ChanceMode::Sample),
+            "stratified" => Ok(ChanceMode::Stratified),
+            _ => Err(format!("chance_mode_heavy {s:?}: 'sample' or 'stratified'")),
+        }
+    }
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, sims_light: None, sims_light_fast: None, light_record: false, light_classes: 0, sims_heavy: None, sims_heavy_fast: None, chance_k_heavy: None, root_min_visits_heavy: 0, heavy_prior_max: 1.0, heavy_probe: ProbeCfg::default() }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, sims_light: None, sims_light_fast: None, light_record: false, light_classes: 0, sims_heavy: None, sims_heavy_fast: None, chance_k_heavy: None, root_min_visits_heavy: 0, heavy_prior_max: 1.0, heavy_probe: ProbeCfg::default(), chance_mode_heavy: ChanceMode::Sample }
     }
 
     /// The belief settings' check (`Driver::new`; the bindings' messages): tilt finite >= 0, clip
@@ -481,8 +503,8 @@ impl NnSeat {
     /// outside (0, 1], probe settings out of range.
     pub fn check_heavy(&self) -> Result<(), String> {
         let Some(sh) = self.sims_heavy else {
-            if self.sims_heavy_fast.is_some() || self.chance_k_heavy.is_some() || self.root_min_visits_heavy > 0 || self.heavy_prior_max != 1.0 || self.heavy_probe != ProbeCfg::default() {
-                return Err("sims_heavy_fast / chance_k_heavy / root_min_visits_heavy / heavy_prior_max / heavy_depth / heavy_horizon / heavy_lines without sims_heavy: heavy decisions are off (sims_heavy absent), the settings would do nothing".into());
+            if self.sims_heavy_fast.is_some() || self.chance_k_heavy.is_some() || self.root_min_visits_heavy > 0 || self.heavy_prior_max != 1.0 || self.heavy_probe != ProbeCfg::default() || self.chance_mode_heavy != ChanceMode::Sample {
+                return Err("sims_heavy_fast / chance_k_heavy / root_min_visits_heavy / heavy_prior_max / heavy_depth / heavy_horizon / heavy_lines / chance_mode_heavy without sims_heavy: heavy decisions are off (sims_heavy absent), the settings would do nothing".into());
             }
             return Ok(());
         };
@@ -503,6 +525,14 @@ impl NnSeat {
         }
         if matches!(self.root_search, RootSearch::Gumbel { .. }) {
             return Err(format!("sims_heavy {sh} with root_search 'gumbel': exclusive (the Gumbel search's schedule and noise are fixed when its search starts; the probe decides after the root's first evaluation)"));
+        }
+        if self.chance_mode_heavy == ChanceMode::Stratified {
+            if self.chance_k_heavy.unwrap_or(self.chance_k) > 0 {
+                return Err(format!("chance_mode_heavy 'stratified' with a heavy chance_k {}: exclusive (its replays of sampled outcomes would override the stratified worlds)", self.chance_k_heavy.unwrap_or(self.chance_k)));
+            }
+            if !self.redet {
+                return Err("chance_mode_heavy 'stratified' without redet: one world per decision has nothing to stratify".into());
+            }
         }
         if !(self.heavy_prior_max > 0.0 && self.heavy_prior_max <= 1.0) {
             return Err(format!("heavy_prior_max {}: in (0, 1] (1 = every option probed)", self.heavy_prior_max));

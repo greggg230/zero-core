@@ -335,6 +335,55 @@ mod tests {
         assert_eq!(probe(&g, 0, &legal[..1], &[], &cfg, &mut Rng::new(1), false).unwrap().probed, 0);
     }
 
+    /// Seat 0 at the look (phase 2: PASS looks at the coin), every simulation through PASS (its prior
+    /// 1, values constant): the coins its walks reveal, per value.
+    fn coins_through_the_look(stratified: bool, sims: usize, seed: u64) -> [usize; 2] {
+        use crate::tree::{leaf_values, Scratch, Sim, Tree, Walk};
+        let mut g = Peek::new_game(&(), 2, seed).unwrap();
+        g.step(PEEK, &mut Vec::new()).unwrap();
+        g.step(AT_COIN, &mut Vec::new()).unwrap();
+        let mut legal = Vec::new();
+        g.legal_actions(&mut legal);
+        let mut rng = Rng::new(seed);
+        let mut t = Tree::new(&g, 0, &legal, true, &mut rng);
+        t.set_stratified(stratified);
+        assert_eq!(t.stratified(), stratified);
+        let (mut sg, mut sc) = (g.clone(), Scratch::default());
+        let w = Walk { c_puct: 1.0, chance_k: 0, margin_w: 0.0 };
+        for _ in 0..sims {
+            if let Sim::Leaf { node, player } = t.simulate(&g, &mut sg, &mut rng, &w, &mut sc).unwrap() {
+                let n = t.acts(node).len();
+                let pri: Vec<f32> = if node == t.root { (0..n).map(|i| (i == 0) as u8 as f32).collect() } else { vec![1.0 / n as f32; n] };
+                let (u, win) = leaf_values(&[0.5, 0.5], &[0.0, 0.0], player, 2, 0.0);
+                t.expand_leaf(node, &pri, &u, &win);
+                t.backup(&sc.path, &u, &win);
+            }
+        }
+        assert_eq!(t.visits(t.root)[0] as usize, sims - 1, "every walk through the look");
+        let mut c = [0usize; 2];
+        for k in t.outs(t.root, 0) {
+            c[(k[0] & 1) as usize] += 1;
+        }
+        c
+    }
+
+    #[test]
+    fn stratified_worlds_reveal_the_units_without_replacement() {
+        // 63 walks through the look (the root's own evaluation takes the first simulation): stratified,
+        // the coin's two units alternate within each pass of the permutation - never more than one apart
+        // (a walk takes the next unit of the simulation's pass); independent worlds drift
+        let mut drift = 0;
+        for seed in 0..8 {
+            let s = coins_through_the_look(true, 64, seed);
+            assert_eq!(s[0] + s[1], 63);
+            assert!(s[0].abs_diff(s[1]) <= 2, "stratified {s:?} (seed {seed})");
+            let p = coins_through_the_look(false, 64, seed);
+            assert_eq!(p[0] + p[1], 63);
+            drift = drift.max(p[0].abs_diff(p[1]));
+        }
+        assert!(drift > 2, "independent worlds never drifted ({drift})");
+    }
+
     #[test]
     fn probe_settings_are_checked() {
         assert!(ProbeCfg::default().check().is_ok());

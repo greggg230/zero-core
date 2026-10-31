@@ -139,6 +139,21 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
         let _ = (key, viewer);
         true
     }
+    /// Stratified chance outcomes (docs/search.md 3.11, a heavy search's `chance_mode_heavy`
+    /// 'stratified'): in this determinized world, the number of equally likely units of `viewer`'s next
+    /// revelation of its own hidden cards - MTG: the cards that could be the top of its own library,
+    /// interchangeably with the top card (unknown to everyone) -, 0 if there are none (the top is known,
+    /// the game has no such revelation). Default 0: never stratified.
+    fn strata(&self, viewer: usize) -> u32 {
+        let _ = viewer;
+        0
+    }
+    /// Put unit `unit` (< `strata(viewer)`) where that revelation reads (MTG: the identity at position
+    /// `unit` of the units' sorted identities on top of the library, swapped with the card holding it):
+    /// only information hidden from `viewer` (and from everyone) changes. Default: nothing.
+    fn set_stratum(&mut self, viewer: usize, unit: u32) {
+        let _ = (viewer, unit);
+    }
     /// The game is over (`to_move()` None) but its result comes from outside: episodes of
     /// another game decide it (docs/search.md 1.1). Until `resolve`, the search treats this
     /// terminal as a leaf the network evaluates and the driver parks the game; nothing calls

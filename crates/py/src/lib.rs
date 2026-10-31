@@ -19,7 +19,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{heavy_floor, root_floor, ProbeCfg, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{heavy_floor, root_floor, ChanceMode, ProbeCfg, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
 use zero_search::{SearchGame, MAX_SEATS};
 
@@ -146,7 +146,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "sims_light", "sims_light_fast", "light_record", "light_classes", "sims_heavy", "sims_heavy_fast", "chance_k_heavy", "root_min_visits_heavy", "heavy_prior_max", "heavy_depth", "heavy_horizon", "heavy_lines"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "sims_light", "sims_light_fast", "light_record", "light_classes", "sims_heavy", "sims_heavy_fast", "chance_k_heavy", "root_min_visits_heavy", "heavy_prior_max", "heavy_depth", "heavy_horizon", "heavy_lines", "chance_mode_heavy"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -276,6 +276,7 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         root_min_visits_heavy: get(d, "root_min_visits_heavy", 0u32)?,
         heavy_prior_max: get(d, "heavy_prior_max", 1.0f64)?,
         heavy_probe,
+        chance_mode_heavy: ChanceMode::parse(&get(d, "chance_mode_heavy", "sample".to_string())?).map_err(verr)?,
     }))
 }
 
@@ -471,6 +472,14 @@ impl PyGame {
     fn reveals(&self, key: u64, viewer: usize) -> bool {
         self.g.reveals(key, viewer)
     }
+    /// The equally likely units of `viewer`'s next own revelation in this world (`SearchGame::strata`,
+    /// docs/search.md 3.11; 0: none) and `set_stratum` (put unit `unit` there; hidden information only).
+    fn strata(&self, viewer: usize) -> u32 {
+        self.g.strata(viewer)
+    }
+    fn set_stratum(&mut self, viewer: usize, unit: u32) {
+        self.g.set_stratum(viewer, unit)
+    }
     /// The auxiliary targets of the pending decision for `viewer` (f32 [aux_width], from the true
     /// state: a training label, `SearchGame::aux_target`; docs/search.md 1.2).
     fn aux_target<'py>(&self, py: Python<'py>, viewer: usize) -> PyResult<Bound<'py, numpy::PyArray1<f32>>> {
@@ -623,6 +632,15 @@ impl PySearchTree {
     /// accounting): the floor of the driver's full searches (`root_floor`).
     fn set_root_min(&mut self, k: u32) {
         self.t.set_root_min(k)
+    }
+    /// Stratified worlds from now on (docs/search.md 3.11: the units of the root decider's next own
+    /// revelation dealt without replacement across the simulations; needs redet). `advance` clears it.
+    fn set_stratified(&mut self, on: bool) {
+        self.t.set_stratified(on)
+    }
+    #[getter]
+    fn stratified(&self) -> bool {
+        self.t.stratified()
     }
     /// The root's belief from now on (docs/search.md 3.8): `belief` = the network's predictions of the
     /// game's auxiliary targets for the root decider (f32 [aux_width]; None: uniform worlds, the

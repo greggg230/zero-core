@@ -55,6 +55,9 @@ pub trait DynGame: Send + Sync {
     fn passive_action(&self) -> Option<u16>;
     /// `SearchGame::reveals`.
     fn reveals(&self, key: u64, viewer: usize) -> bool;
+    /// `SearchGame::strata` / `set_stratum` (docs/search.md 3.11).
+    fn strata(&self, viewer: usize) -> u32;
+    fn set_stratum(&mut self, viewer: usize, unit: u32);
     fn export_state(&self) -> String;
     fn apply_external(&mut self, payload: &str) -> Result<Vec<u64>, String>;
     /// Deferred results and teams (`SearchGame::deferred`, `deferred_payload`, `resolve`,
@@ -147,6 +150,12 @@ impl<G: SearchGame> DynGame for G {
     }
     fn reveals(&self, key: u64, viewer: usize) -> bool {
         SearchGame::reveals(self, key, viewer)
+    }
+    fn strata(&self, viewer: usize) -> u32 {
+        SearchGame::strata(self, viewer)
+    }
+    fn set_stratum(&mut self, viewer: usize, unit: u32) {
+        SearchGame::set_stratum(self, viewer, unit)
     }
     fn export_state(&self) -> String {
         SearchGame::export_state(self)
@@ -246,6 +255,9 @@ pub trait DynTree: Send + Sync {
     /// the forced walks' accounting: per root option, the visit counts without them, the root
     /// win vector without them.
     fn set_root_min(&mut self, k: u32);
+    /// Stratified worlds from now on (`Tree::set_stratified`, docs/search.md 3.11).
+    fn set_stratified(&mut self, on: bool);
+    fn stratified(&self) -> bool;
     /// The root's belief from now on (`Tree::set_belief`, docs/search.md 3.8; None = uniform worlds):
     /// predictions, tilt, clip, the uniform share `mix`; `live` re-deals a tree without `redet`.
     fn set_belief(&mut self, pred: Option<&[f32]>, tilt: f64, clip: f64, mix: f64, live: &dyn DynGame) -> Result<(), String>;
@@ -384,6 +396,12 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     }
     fn set_root_min(&mut self, k: u32) {
         self.t.set_root_min(k)
+    }
+    fn set_stratified(&mut self, on: bool) {
+        self.t.set_stratified(on)
+    }
+    fn stratified(&self) -> bool {
+        self.t.stratified()
     }
     fn set_belief(&mut self, pred: Option<&[f32]>, tilt: f64, clip: f64, mix: f64, live: &dyn DynGame) -> Result<(), String> {
         let g = downcast::<G>(live)?;

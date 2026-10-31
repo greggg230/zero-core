@@ -102,7 +102,7 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
             sims_light=None, sims_light_fast=None, light_record=False, light_classes=None,
             sims_heavy=None, sims_heavy_fast=None, chance_k_heavy=None, root_min_visits_heavy=0, heavy_prior_max=1.0,
-            heavy_depth=None, heavy_horizon=None, heavy_lines=None):
+            heavy_depth=None, heavy_horizon=None, heavy_lines=None, chance_mode_heavy='sample'):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
@@ -196,7 +196,10 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
         if float(heavy_prior_max) != 1.0:
             d['heavy_prior_max'] = float(heavy_prior_max)
         d.update({k: int(v) for k, v in probe.items()})
-    elif sims_heavy_fast or chance_k_heavy is not None or root_min_visits_heavy or float(heavy_prior_max) != 1.0 or probe:
+        if chance_mode_heavy != 'sample':
+            d['chance_mode_heavy'] = str(chance_mode_heavy)
+    elif sims_heavy_fast or chance_k_heavy is not None or root_min_visits_heavy or float(heavy_prior_max) != 1.0 or probe \
+            or chance_mode_heavy != 'sample':
         raise ValueError('sims_heavy_fast / chance_k_heavy / root_min_visits_heavy / heavy_prior_max / heavy_depth / '
                          'heavy_horizon / heavy_lines without sims_heavy (docs/search.md 3.11)')
     if root_search == 'gumbel':

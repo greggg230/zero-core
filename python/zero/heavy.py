@@ -37,7 +37,9 @@ the root floor's forced walks, and the probe's cost (lines, steps and millisecon
 decision).
 """
 KEYS = ('selfplay_sims_heavy', 'selfplay_sims_heavy_fast', 'selfplay_chance_k_heavy', 'selfplay_root_min_visits_heavy',
-        'selfplay_heavy_prior_max', 'selfplay_heavy_depth', 'selfplay_heavy_horizon', 'selfplay_heavy_lines')
+        'selfplay_heavy_prior_max', 'selfplay_heavy_depth', 'selfplay_heavy_horizon', 'selfplay_heavy_lines',
+        'selfplay_chance_mode_heavy')
+MODES = ('sample', 'stratified')
 # the probe's defaults (zero_search::heavy::ProbeCfg::default)
 PROBE = {'selfplay_heavy_depth': 2, 'selfplay_heavy_horizon': 12, 'selfplay_heavy_lines': 64}
 
@@ -67,6 +69,9 @@ def settings(cfg):
     ck, k = _int(cfg, 'selfplay_chance_k_heavy', -1), _int(cfg, 'selfplay_root_min_visits_heavy')
     gate = _float(cfg, 'selfplay_heavy_prior_max', 1.0)
     probe = {k2: _int(cfg, k2, v) for k2, v in PROBE.items()}
+    mode = str(cfg.get('selfplay_chance_mode_heavy') or 'sample')
+    if mode not in MODES:
+        raise ValueError(f'selfplay_chance_mode_heavy {mode!r}: one of {MODES}')
     if sh < 0 or sf < 0 or k < 0 or ck < -1:
         raise ValueError(f'selfplay_sims_heavy {sh} / _fast {sf} / selfplay_root_min_visits_heavy {k}: >= 0; '
                          f'selfplay_chance_k_heavy {ck}: >= 0 or -1 (= chance_k)')
@@ -77,6 +82,8 @@ def settings(cfg):
         if gate != 1.0:
             bad.append('selfplay_heavy_prior_max')
         bad += [n for n, v in probe.items() if v != PROBE[n]]
+        if mode != 'sample':
+            bad.append('selfplay_chance_mode_heavy')
         if bad:
             raise ValueError(f'{" / ".join(bad)} without selfplay_sims_heavy: heavy decisions are off '
                              f'(selfplay_sims_heavy 0), the settings would do nothing')
@@ -100,11 +107,15 @@ def settings(cfg):
     if not 1 <= probe['selfplay_heavy_depth'] <= 4 or not 1 <= probe['selfplay_heavy_horizon'] <= 64 \
             or not 1 <= probe['selfplay_heavy_lines'] <= 4096:
         raise ValueError(f'selfplay_heavy_depth / _horizon / _lines {list(probe.values())}: 1..4, 1..64, 1..4096')
+    if mode == 'stratified' and (chance_k if ck == -1 else ck) > 0:
+        raise ValueError(f'selfplay_chance_mode_heavy stratified with a heavy chance_k {chance_k if ck == -1 else ck}: '
+                         f'exclusive (its replays would override the stratified worlds)')
     if str(cfg.get('selfplay_root_search', 'puct')) == 'gumbel':
         raise ValueError('selfplay_sims_heavy with selfplay_root_search gumbel: exclusive (docs/search.md 3.11)')
     return {'sims_heavy': sh, 'sims_heavy_fast': sf or None, 'chance_k_heavy': None if ck == -1 else ck,
             'root_min_visits_heavy': k, 'heavy_prior_max': gate, 'heavy_depth': probe['selfplay_heavy_depth'],
-            'heavy_horizon': probe['selfplay_heavy_horizon'], 'heavy_lines': probe['selfplay_heavy_lines']}
+            'heavy_horizon': probe['selfplay_heavy_horizon'], 'heavy_lines': probe['selfplay_heavy_lines'],
+            'chance_mode_heavy': mode}
 
 
 def check(cfg, where=''):
@@ -128,8 +139,9 @@ def fingerprint(cfg):
     s = settings(cfg)
     if s is None:
         return ''
-    return ','.join(f'{k}={s[k]}' for k in ('sims_heavy', 'sims_heavy_fast', 'chance_k_heavy', 'root_min_visits_heavy',
-                                            'heavy_prior_max', 'heavy_depth', 'heavy_horizon', 'heavy_lines'))
+    keys = ('sims_heavy', 'sims_heavy_fast', 'chance_k_heavy', 'root_min_visits_heavy', 'heavy_prior_max', 'heavy_depth',
+            'heavy_horizon', 'heavy_lines') + (('chance_mode_heavy',) if s['chance_mode_heavy'] != 'sample' else ())
+    return ','.join(f'{k}={s[k]}' for k in keys)
 
 
 def describe(s):
@@ -138,7 +150,8 @@ def describe(s):
     ck = 'the run\'s chance_k' if s['chance_k_heavy'] is None else f'chance_k {s["chance_k_heavy"]}'
     return (f'heavy decisions: {s["sims_heavy"]} simulations (full draws) / {fast} (fast draws), {ck}, root floor '
             f'{s["root_min_visits_heavy"]}; probe: options of prior <= {s["heavy_prior_max"]}, depth {s["heavy_depth"]}, '
-            f'horizon {s["heavy_horizon"]}, {s["heavy_lines"]} lines')
+            f'horizon {s["heavy_horizon"]}, {s["heavy_lines"]} lines'
+            + (f'; chance outcomes {s["chance_mode_heavy"]}' if s['chance_mode_heavy'] != 'sample' else ''))
 
 
 # ---------------------------------------------------------------- metrics

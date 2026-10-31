@@ -2708,6 +2708,13 @@ fn heavy_settings_are_checked() {
     gumbel.policy_target = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: 1.0 };
     let mut off_probe = nn_of(nn(0, 16, true));
     off_probe.heavy_probe.horizon = 4;
+    let mut off_mode = nn_of(nn(0, 16, true));
+    off_mode.chance_mode_heavy = ChanceMode::Stratified;
+    let mut strat_k = nn_of(with_heavy(nn(0, 16, true), Some(64), Some(16), Some(2), 0, 1.0));
+    strat_k.chance_mode_heavy = ChanceMode::Stratified;
+    let mut strat_ok = nn_of(with_heavy(nn(0, 16, true), Some(64), Some(16), None, 4, 1.0));
+    strat_ok.chance_mode_heavy = ChanceMode::Stratified;
+    assert!(ok(SeatCfg::Nn(strat_ok)).is_ok());
     let refused = [
         (with_heavy(nn(0, 16, false), Some(64), None, None, 0, 1.0), "self-play seat"),
         (with_heavy(nn(0, 16, true), Some(8), Some(4), None, 0, 1.0), "at least the one it replaces"),
@@ -2723,6 +2730,8 @@ fn heavy_settings_are_checked() {
         (with_heavy(nn(0, 16, true), None, None, None, 4, 1.0), "without sims_heavy"),
         (with_heavy(nn(0, 16, true), None, None, None, 0, 0.5), "without sims_heavy"),
         (SeatCfg::Nn(off_probe), "without sims_heavy"),
+        (SeatCfg::Nn(off_mode), "without sims_heavy"),
+        (SeatCfg::Nn(strat_k), "exclusive"),
     ];
     for (s, want) in refused {
         let e = ok(s.clone()).expect_err(&format!("{s:?} accepted"));
