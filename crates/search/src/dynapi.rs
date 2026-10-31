@@ -48,6 +48,13 @@ pub trait DynGame: Send + Sync {
     fn rounds(&self) -> u32;
     /// `SearchGame::light_class` (None once over).
     fn light_class(&self) -> Option<usize>;
+    /// The heavy decisions' reveal probe of the pending decision for its decider (`heavy::probe`,
+    /// docs/search.md 3.11): `cand` per legal option (empty: all), the world dealt from `seed`.
+    fn heavy_probe(&self, cand: &[bool], cfg: &crate::heavy::ProbeCfg, seed: u64, first: bool) -> Result<crate::heavy::ProbeOut, String>;
+    /// `SearchGame::passive_action` of the pending decision (None once over).
+    fn passive_action(&self) -> Option<u16>;
+    /// `SearchGame::reveals`.
+    fn reveals(&self, key: u64, viewer: usize) -> bool;
     fn export_state(&self) -> String;
     fn apply_external(&mut self, payload: &str) -> Result<Vec<u64>, String>;
     /// Deferred results and teams (`SearchGame::deferred`, `deferred_payload`, `resolve`,
@@ -121,6 +128,25 @@ impl<G: SearchGame> DynGame for G {
             return None;
         }
         SearchGame::light_class(self)
+    }
+    fn heavy_probe(&self, cand: &[bool], cfg: &crate::heavy::ProbeCfg, seed: u64, first: bool) -> Result<crate::heavy::ProbeOut, String> {
+        cfg.check()?;
+        let Some(p) = SearchGame::to_move(self) else { return Err("heavy probe: the game is over".into()) };
+        let mut legal = Vec::new();
+        self.legal_actions(&mut legal);
+        if !cand.is_empty() && cand.len() != legal.len() {
+            return Err(format!("heavy probe: {} candidates for {} options", cand.len(), legal.len()));
+        }
+        crate::heavy::probe(self, p, &legal, cand, cfg, &mut Rng::new(seed), first)
+    }
+    fn passive_action(&self) -> Option<u16> {
+        SearchGame::to_move(self)?;
+        let mut legal = Vec::new();
+        self.legal_actions(&mut legal);
+        SearchGame::passive_action(self, &legal).filter(|a| legal.contains(a))
+    }
+    fn reveals(&self, key: u64, viewer: usize) -> bool {
+        SearchGame::reveals(self, key, viewer)
     }
     fn export_state(&self) -> String {
         SearchGame::export_state(self)

@@ -62,7 +62,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import auxtarget as AUX, elo, games as G, league as L, light as LT, package, runctl
+from . import auxtarget as AUX, elo, games as G, heavy as HV, league as L, light as LT, package, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
@@ -107,6 +107,16 @@ DEFAULTS = dict(
     # recorded (a minor decision's treatment), 1 = full draws recorded with the light search's targets.
     # Self-play seats only (evaluation unchanged); 0 = off: nothing changes. Single-game runs only
     selfplay_sims_light=0, selfplay_sims_light_fast=0, selfplay_light_record=0, selfplay_light_classes='all',
+    # heavy decisions in self-play (zero/heavy.py, docs/search.md 3.11, docs/az.md 23): a decision (not
+    # minor, not light) where an option of prior <= selfplay_heavy_prior_max leads within a short line
+    # (selfplay_heavy_depth deviations, selfplay_heavy_horizon steps, selfplay_heavy_lines lines) to a
+    # revelation of hidden information to the decider is searched with selfplay_sims_heavy simulations
+    # (a full draw) / selfplay_sims_heavy_fast (a fast draw; required with sims_fast), chance_k
+    # selfplay_chance_k_heavy (-1 = chance_k) and a root floor of selfplay_root_min_visits_heavy visits
+    # per option (0 = none). Self-play seats only (evaluation unchanged); 0 = off: nothing changes.
+    # Single-game runs only
+    selfplay_sims_heavy=0, selfplay_sims_heavy_fast=0, selfplay_chance_k_heavy=-1, selfplay_root_min_visits_heavy=0,
+    selfplay_heavy_prior_max=1.0, selfplay_heavy_depth=2, selfplay_heavy_horizon=12, selfplay_heavy_lines=64,
     # policy target of the recorded (full-search) decisions: 'visits' (the root visit
     # distribution) | 'cq' (Gumbel AlphaZero's completed-Q target softmax(ln P0 + (cq_c_visit +
     # max N) cq_c_scale completedQ), docs/search.md 3.1); the search itself is the same
@@ -438,6 +448,8 @@ class Run:
         self.anchor_sha = {}                       # anchor path -> ((size, mtime), sha256)
         # light decisions in self-play (zero/light.py): the resolved settings, None when off
         self.light = LT.check(cfg, self.info)
+        # heavy decisions in self-play (zero/heavy.py): the resolved settings, None when off
+        self.heavy = HV.check(cfg)
 
     def check(self, where=''):
         if self.pw is not None:
@@ -475,7 +487,7 @@ class Run:
                              view_sample_target=c.get('view_sample_target', 'next_q'),
                              root_search=c.get('selfplay_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
                              gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), **belief_keys(c, 'selfplay'),
-                             **LT.seat_keys(c, getattr(self, 'info', None)))
+                             **LT.seat_keys(c, getattr(self, 'info', None)), **HV.seat_keys(c))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
@@ -609,6 +621,7 @@ class Run:
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
         self.light_metrics(out, results)
+        self.heavy_metrics(out, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -630,6 +643,15 @@ class Run:
         d = lambda k: st.get(k, 0) - ((st0 or {}).get(k, 0))           # noqa: E731
         out['view'] = {'rows': d('view_rows'), 'rows_per_leaf': round(d('view_rows') / max(1, leaves), 4),
                        'samples': d('view_recorded')}
+
+    def heavy_metrics(self, out, results, remote=None):
+        """Self-play's heavy-decision metrics (zero/heavy.py), only when they are on (the metrics of
+        before otherwise): `heavy` = the phase's finished games' heavy decisions per game, their share of
+        the searched decisions, the probed share, recorded, the simulations spent on them and their share,
+        the forced walks, the probe's cost - this machine's games and the remote's (`remote`: its tally)."""
+        if not getattr(self, 'heavy', None):
+            return
+        out['heavy'] = HV.summary(HV.merge(HV.tally(results), remote))
 
     def light_metrics(self, out, results, remote=None):
         """Self-play's light-decision metrics (zero/light.py), only when they are on (the metrics of
@@ -783,6 +805,7 @@ class Run:
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
         self.light_metrics(out, results, rem.pop('light', None))
+        self.heavy_metrics(out, results, rem.pop('heavy', None))
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
@@ -1442,6 +1465,8 @@ class Run:
         self.log(f'run {run} starting after iter {start}; cfg {json.dumps(c)}')
         if self.light:
             self.log(LT.describe(self.light))
+        if self.heavy:
+            self.log(HV.describe(self.heavy))
         if c.get('eval_remote'):
             from .remote import RemoteEval
             self.remote = RemoteEval(self, c['eval_remote'])
@@ -1672,6 +1697,13 @@ def resolve_config(args, saved):
         raise SystemExit('selfplay_sims_light: single-game runs only (not a co-training run)')
     if isinstance(cfg.get('resolver_cfg'), dict) and int(cfg['resolver_cfg'].get('selfplay_sims_light', 0) or 0):
         raise SystemExit('resolver_cfg: selfplay_sims_light: single-game runs only (not a co-training resolver)')
+    # heavy decisions (zero/heavy.py): budgets that are heavy, no setting that would do nothing;
+    # single-game runs only
+    HV.check(cfg)
+    if cfg.get('resolver') and int(cfg.get('selfplay_sims_heavy', 0) or 0):
+        raise SystemExit('selfplay_sims_heavy: single-game runs only (not a co-training run)')
+    if isinstance(cfg.get('resolver_cfg'), dict) and int(cfg['resolver_cfg'].get('selfplay_sims_heavy', 0) or 0):
+        raise SystemExit('resolver_cfg: selfplay_sims_heavy: single-game runs only (not a co-training resolver)')
     return cfg
 
 

@@ -19,7 +19,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{heavy_floor, root_floor, ProbeCfg, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
 use zero_search::{SearchGame, MAX_SEATS};
 
@@ -75,6 +75,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(game_names, m)?)?;
     m.add_function(wrap_pyfunction!(game_info_of, m)?)?;
     m.add_function(wrap_pyfunction!(root_floor_of, m)?)?;
+    m.add_function(wrap_pyfunction!(heavy_floor_of, m)?)?;
     m.add_function(wrap_pyfunction!(view_pick_of, m)?)?;
     m.add_function(wrap_pyfunction!(belief_weight_of, m)?)?;
     m.add_function(wrap_pyfunction!(gumbel_sequence_of, m)?)?;
@@ -145,7 +146,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "sims_light", "sims_light_fast", "light_record", "light_classes"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "sims_light", "sims_light_fast", "light_record", "light_classes", "sims_heavy", "sims_heavy_fast", "chance_k_heavy", "root_min_visits_heavy", "heavy_prior_max", "heavy_depth", "heavy_horizon", "heavy_lines"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -204,6 +205,11 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
             }
         }
     }
+    // heavy decisions (docs/search.md 3.11): their budgets (absent: off), chance_k and floor, the
+    // probe's prior gate and lines (Driver::new checks them)
+    let (sims_heavy, sims_heavy_fast, chance_k_heavy) = (opt_u32("sims_heavy")?, opt_u32("sims_heavy_fast")?, opt_u32("chance_k_heavy")?);
+    let pd = ProbeCfg::default();
+    let heavy_probe = ProbeCfg { depth: get(d, "heavy_depth", pd.depth)?, horizon: get(d, "heavy_horizon", pd.horizon)?, lines: get(d, "heavy_lines", pd.lines)? };
     // training target of recorded decisions: 'visits' (default) | 'cq' (docs/search.md 3.1)
     let (cq_c_visit, cq_c_scale) = (get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?);
     let policy_target = PolicyTarget::parse(&get(d, "policy_target", "visits".to_string())?, cq_c_visit, cq_c_scale).map_err(verr)?;
@@ -264,6 +270,12 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         sims_light_fast,
         light_record: flag(d, "light_record", false)?,
         light_classes,
+        sims_heavy,
+        sims_heavy_fast,
+        chance_k_heavy,
+        root_min_visits_heavy: get(d, "root_min_visits_heavy", 0u32)?,
+        heavy_prior_max: get(d, "heavy_prior_max", 1.0f64)?,
+        heavy_probe,
     }))
 }
 
@@ -288,6 +300,14 @@ fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>>
 #[pyo3(name = "root_floor")]
 fn root_floor_of(k: u32, max_actions: u32, full: bool, m: usize, target: u32) -> u32 {
     root_floor(k, max_actions, full, m, target)
+}
+
+/// The root floor of a heavy search (`driver::heavy_floor`, docs/search.md 3.11): `k` per option, at
+/// most `target / (2 m)`, for a root of `m >= 2` options; else 0.
+#[pyfunction]
+#[pyo3(name = "heavy_floor")]
+fn heavy_floor_of(k: u32, m: usize, target: u32) -> u32 {
+    heavy_floor(k, m, target)
 }
 
 /// Whether recorded decision `decision` of game `gid` (driver seed `seed`) records its value-only
@@ -423,6 +443,33 @@ impl PyGame {
     /// None if it is not a light decision (or the game is over).
     fn light_class(&self) -> Option<&'static str> {
         self.g.light_class().map(|c| self.g.info().light[c])
+    }
+    /// The heavy decisions' reveal probe of the pending decision for its decider (docs/search.md
+    /// 3.11, `heavy::probe`): `cand` = per legal option whether to probe it (None: every option), the
+    /// probe's world dealt from `seed`; `first` stops at the first revealing option. -> {reveal: [bool
+    /// per legal option], probed, lines, steps, exhausted}. The game is not changed.
+    #[pyo3(signature = (seed=0, depth=None, horizon=None, lines=None, cand=None, first=false))]
+    fn heavy_probe<'py>(&self, py: Python<'py>, seed: u64, depth: Option<u32>, horizon: Option<u32>, lines: Option<u32>, cand: Option<Vec<bool>>, first: bool) -> PyResult<Bound<'py, PyDict>> {
+        let pd = ProbeCfg::default();
+        let cfg = ProbeCfg { depth: depth.unwrap_or(pd.depth), horizon: horizon.unwrap_or(pd.horizon), lines: lines.unwrap_or(pd.lines) };
+        let o = self.g.heavy_probe(cand.as_deref().unwrap_or(&[]), &cfg, seed, first).map_err(verr)?;
+        let d = PyDict::new(py);
+        d.set_item("reveal", o.reveal)?;
+        d.set_item("probed", o.probed)?;
+        d.set_item("lines", o.lines)?;
+        d.set_item("steps", o.steps)?;
+        d.set_item("exhausted", o.exhausted)?;
+        Ok(d)
+    }
+    /// The pending decision's passive option (`SearchGame::passive_action`, docs/search.md 3.11),
+    /// None if it has none (or the game is over).
+    fn passive_action(&self) -> Option<u16> {
+        self.g.passive_action()
+    }
+    /// Whether chance key `key` (from `step` in a world determinized for `viewer`) tells `viewer`
+    /// something (`SearchGame::reveals`, docs/search.md 3.11).
+    fn reveals(&self, key: u64, viewer: usize) -> bool {
+        self.g.reveals(key, viewer)
     }
     /// The auxiliary targets of the pending decision for `viewer` (f32 [aux_width], from the true
     /// state: a training label, `SearchGame::aux_target`; docs/search.md 1.2).
@@ -825,6 +872,20 @@ impl PySearchDriver {
                 ld.set_item("sims_all", l.sims_all)?;
                 d.set_item("light", ld)?;
             }
+            if let Some(h) = r.heavy {
+                // a driver with sims_heavy on a seat (docs/search.md 3.11): the game's heavy decisions
+                let hd = PyDict::new(py);
+                hd.set_item("probed", h.probed)?;
+                hd.set_item("decisions", h.decisions)?;
+                hd.set_item("recorded", h.recorded)?;
+                hd.set_item("sims", h.sims)?;
+                hd.set_item("forced", h.forced)?;
+                hd.set_item("lines", h.lines)?;
+                hd.set_item("steps", h.steps)?;
+                hd.set_item("probe_ns", h.probe_ns)?;
+                hd.set_item("sims_all", h.sims_all)?;
+                d.set_item("heavy", hd)?;
+            }
             out.append(d)?;
         }
         Ok(out)
@@ -884,6 +945,13 @@ impl PySearchDriver {
         d.set_item("light", s.light)?;
         d.set_item("light_recorded", s.light_recorded)?;
         d.set_item("light_saved", s.light_saved)?;
+        d.set_item("heavy_probed", s.heavy_probed)?;
+        d.set_item("heavy", s.heavy)?;
+        d.set_item("heavy_sims", s.heavy_sims)?;
+        d.set_item("heavy_forced", s.heavy_forced)?;
+        d.set_item("heavy_lines", s.heavy_lines)?;
+        d.set_item("heavy_steps", s.heavy_steps)?;
+        d.set_item("heavy_probe_s", s.heavy_probe_s)?;
         d.set_item("view_rows", s.view_rows)?;
         d.set_item("view_recorded", s.view_recorded)?;
         d.set_item("belief_rows", s.belief_rows)?;

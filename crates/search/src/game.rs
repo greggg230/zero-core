@@ -55,6 +55,11 @@ pub const MAX_SEATS: usize = 8;
 /// * **Light decisions** (optional; docs/search.md 3.10): `LIGHT_CLASSES` names classes of
 ///   decisions and `light_class()` the pending decision's; a self-play seat with `sims_light`
 ///   searches the classes it selects with that budget (recorded or not, `light_record`).
+/// * **Heavy decisions** (optional; docs/search.md 3.11): a self-play seat with `sims_heavy` probes
+///   its decisions for options whose short line of play reveals hidden information to it
+///   (`heavy::probe`); `passive_action` (the option that lets the game go on) and `reveals` (which
+///   of `step`'s keys tell a viewer something) shape the probe's lines. Defaults: no passive option,
+///   every key reveals.
 pub trait SearchGame: Clone + Send + Sync + 'static {
     /// Settings shared by all games of one driver, parsed from a JSON string.
     type Spec: Clone + Send + Sync + 'static;
@@ -112,6 +117,27 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     /// None.
     fn light_class(&self) -> Option<usize> {
         None
+    }
+    /// The pending decision's passive option among `legal` (docs/search.md 3.11): the one that lets
+    /// the game go on without the decider doing anything (MTG: pass priority, keep, no attackers, no
+    /// blocks, decline, no more targets), None if it has none (a forced choice). Read only by the
+    /// heavy decisions' reveal probe (`heavy::probe`): other seats take it on a probe's lines, the
+    /// decider's own passive play continues with it, and the root's passive option is the probe's
+    /// baseline, never probed. Default: None (no decision has one: a probe's lines then branch at
+    /// every decision of the decider and take another seat's first option).
+    fn passive_action(&self, legal: &[u16]) -> Option<u16> {
+        let _ = legal;
+        None
+    }
+    /// Whether chance key `key`, pushed by the `step` that led to this state in a world determinized
+    /// for `viewer`, tells `viewer` something it did not know (docs/search.md 3.11): a draw or a look
+    /// of its own, a hidden card made public, a die. Read only by the heavy decisions' reveal probe.
+    /// Default: every key (docs/search.md 1: a transition keys what the decider could not predict;
+    /// MTG Zero overrides it: its keys also carry single-option bookkeeping and other players'
+    /// masked private facts).
+    fn reveals(&self, key: u64, viewer: usize) -> bool {
+        let _ = (key, viewer);
+        true
     }
     /// The game is over (`to_move()` None) but its result comes from outside: episodes of
     /// another game decide it (docs/search.md 1.1). Until `resolve`, the search treats this

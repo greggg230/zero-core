@@ -94,6 +94,13 @@ struct Tally {
     light: u64,
     light_recorded: u64,
     light_saved: u64,
+    heavy_probed: u64,
+    heavy: u64,
+    heavy_sims: u64,
+    heavy_forced: u64,
+    heavy_lines: u64,
+    heavy_steps: u64,
+    heavy_probe_ns: u64,
     view_rows: u64,
     view_recorded: u64,
     belief_rows: u64,
@@ -142,7 +149,7 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
                     // the priors from the leaf's row; its value from the value-only row after it
                     // (`LeafView::Root` at another seat's leaf, docs/search.md 3.6), else its own
                     let v = if vrow { b + 1 } else { b };
-                    apply_eval(cfg, slot, seat, node, vrow, &priors[lo..hi], &value[v * MAX_SEATS..(v + 1) * MAX_SEATS], &margin[v * MAX_SEATS..(v + 1) * MAX_SEATS])?;
+                    apply_eval(cfg, slot, seat, node, vrow, &priors[lo..hi], &value[v * MAX_SEATS..(v + 1) * MAX_SEATS], &margin[v * MAX_SEATS..(v + 1) * MAX_SEATS], &mut n)?;
                     n.sims += 1;
                     if brow {
                         // the fresh root's belief row after it (docs/search.md 3.8)
@@ -197,6 +204,15 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
         k.light.fetch_add(n.light, Ordering::Relaxed);
         k.light_recorded.fetch_add(n.light_recorded, Ordering::Relaxed);
         k.light_saved.fetch_add(n.light_saved, Ordering::Relaxed);
+    }
+    if n.heavy_probed > 0 || n.heavy > 0 {
+        k.heavy_probed.fetch_add(n.heavy_probed, Ordering::Relaxed);
+        k.heavy.fetch_add(n.heavy, Ordering::Relaxed);
+        k.heavy_sims.fetch_add(n.heavy_sims, Ordering::Relaxed);
+        k.heavy_forced.fetch_add(n.heavy_forced, Ordering::Relaxed);
+        k.heavy_lines.fetch_add(n.heavy_lines, Ordering::Relaxed);
+        k.heavy_steps.fetch_add(n.heavy_steps, Ordering::Relaxed);
+        k.heavy_probe_ns.fetch_add(n.heavy_probe_ns, Ordering::Relaxed);
     }
     if n.view_rows > 0 || n.view_recorded > 0 {
         k.view_rows.fetch_add(n.view_rows, Ordering::Relaxed);
@@ -266,7 +282,13 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: search target set for a non-network seat")?;
         let mut t = slot.spare.pop().unwrap_or_default();
         t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
-        t.set_root_min(root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap()));
+        let mut k = root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap());
+        if slot.heavy {
+            // (a heavy search keeps its budget and its floor, docs/search.md 3.11; one still waiting for
+            // the probe is probed at the new root's expansion)
+            k = k.max(heavy_floor(seat.root_min_visits_heavy, slot.legal.len(), slot.target.unwrap()));
+        }
+        t.set_root_min(k);
         if let RootSearch::Gumbel { m, c_visit, c_scale, .. } = seat.root_search {
             // the decision's Gumbel search again, its noise kept (as its playout-cap draw)
             t.set_gumbel(m, slot.target.unwrap(), &slot.gnoise, c_visit, c_scale);
@@ -320,6 +342,9 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.light = false;
     slot.light_saved = 0;
     slot.lg = LightGame::default();
+    slot.heavy_wait = false;
+    slot.heavy = false;
+    slot.hg = HeavyGame::default();
     slot.belief = false;
     slot.decisions = 0;
     slot.ext_moves = 0;
@@ -337,7 +362,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
 /// are relative to the tree's viewer (a value-only row, `LeafView::Root`), else to the leaf's
 /// decider.
 #[allow(clippy::too_many_arguments)]
-fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, node: u32, vrow: bool, priors: &[f32], value: &[f32], margin: &[f32]) -> Result<(), String> {
+fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, node: u32, vrow: bool, priors: &[f32], value: &[f32], margin: &[f32], n: &mut Tally) -> Result<(), String> {
     let s = nn_seat(cfg, slot.gid, seat).ok_or("internal: pending leaf of a non-network seat")?;
     let tree = slot.trees[seat].as_mut().ok_or("internal: pending leaf without a tree")?;
     if priors.len() != tree.acts(node).len() {
@@ -352,7 +377,59 @@ fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, n
         let r = tree.root;
         tree.add_noise(r, s.alpha, s.eps, &mut slot.noise_rng);
     }
+    let at_root = node == tree.root;
     slot.sims += 1;
+    // the heavy probe of a fresh root, now that its priors are known (docs/search.md 3.11)
+    if at_root && slot.heavy_wait {
+        heavy_decide(cfg.seed, slot, s, seat, n)?;
+    }
+    Ok(())
+}
+
+/// Stream salt of the heavy probe's worlds (docs/search.md 3.11).
+const HEAVY_SALT: u64 = 0x6865_6176_795f_7072;
+
+/// The heavy probe of seat `p`'s pending decision (docs/search.md 3.11; its root expanded): the root
+/// options of prior (before noise) <= `heavy_prior_max` probed in a world of a stream of their own
+/// (driver seed, game, decision: no stream of the search moves); if one reveals, the search becomes
+/// heavy - the heavy budget of its playout-cap draw (then `sims_divisor`), the heavy floor (if it
+/// exceeds the search's own), `chance_k_heavy` on its walks (`advance_slot`).
+fn heavy_decide<G: SearchGame>(seed: u64, slot: &mut Slot<G>, seat: &NnSeat, p: usize, n: &mut Tally) -> Result<(), String> {
+    slot.heavy_wait = false;
+    let tree = slot.trees[p].as_ref().ok_or("internal: heavy probe without a tree")?;
+    let p0 = tree.priors0(tree.root);
+    if p0.len() != slot.legal.len() {
+        return Err("internal: heavy probe: the root's options are not the decision's".into());
+    }
+    let cand: Vec<bool> = p0.iter().map(|&x| x as f64 <= seat.heavy_prior_max).collect();
+    let game = slot.game.as_ref().unwrap();
+    let mut rng = Rng::new(split64(seed ^ HEAVY_SALT ^ split64(((slot.gid as u64) << 32) | slot.decisions as u64)));
+    let t0 = Instant::now();
+    let out = crate::heavy::probe(game, p, &slot.legal, &cand, &seat.heavy_probe, &mut rng, true)?;
+    let ns = t0.elapsed().as_nanos() as u64;
+    slot.hg.probed += 1;
+    slot.hg.lines += out.lines as u64;
+    slot.hg.steps += out.steps as u64;
+    slot.hg.probe_ns += ns;
+    n.heavy_probed += 1;
+    n.heavy_lines += out.lines as u64;
+    n.heavy_steps += out.steps as u64;
+    n.heavy_probe_ns += ns;
+    if !out.any() {
+        return Ok(());
+    }
+    slot.heavy = true;
+    let div = game.sims_divisor();
+    let mut t = seat.heavy_budget(slot.full).ok_or("internal: heavy decision without sims_heavy")?;
+    if div > 1 {
+        t = (t / div).max(1);
+    }
+    slot.target = Some(t);
+    let k = heavy_floor(seat.root_min_visits_heavy, slot.legal.len(), t);
+    let tree = slot.trees[p].as_mut().unwrap();
+    if k > tree.root_min() {
+        tree.set_root_min(k);
+    }
     Ok(())
 }
 
@@ -397,14 +474,16 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         }
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: a seat without a player")?;
         if slot.target.is_none() {
-            start(slot, seat, p);
+            start(cfg.seed, slot, seat, p, n)?;
         }
         if slot.sims >= slot.target.unwrap() {
             n.minor += slot.minor as u64;
             decide(cfg, slot, seat, p, &mut scratch.sim.key, n)?;
             continue;
         }
-        let walk = Walk { c_puct: seat.c_puct, chance_k: seat.chance_k, margin_w: seat.margin_w };
+        // (a heavy search's walks take chance_k_heavy, docs/search.md 3.11)
+        let chance_k = if slot.heavy { seat.chance_k_heavy.unwrap_or(seat.chance_k) } else { seat.chance_k };
+        let walk = Walk { c_puct: seat.c_puct, chance_k, margin_w: seat.margin_w };
         let live = slot.game.as_ref().unwrap();
         let sg = scratch.game.get_or_insert_with(|| live.clone());
         let tree = slot.trees[p].as_mut().unwrap();
@@ -485,7 +564,7 @@ fn push_belief_row<G: SearchGame>(buf: &mut LeafBuf, live: &G, p: usize, n: usiz
 }
 
 /// Start the search for the pending decision of seat `p` (legal actions in `slot.legal`).
-fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
+fn start<G: SearchGame>(seed: u64, slot: &mut Slot<G>, seat: &NnSeat, p: usize, n: &mut Tally) -> Result<(), String> {
     slot.full = seat.sims_fast.is_none() || slot.rng.unit() < seat.p_full;
     slot.target = Some(if slot.full { seat.sims } else { seat.sims_fast.unwrap() });
     let game = slot.game.as_ref().unwrap();
@@ -522,6 +601,11 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     if slot.light {
         slot.light_saved = drawn.saturating_sub(slot.target.unwrap());
     }
+    // a heavy decision (docs/search.md 3.11: a self-play seat with sims_heavy, neither minor nor light
+    // - those come first): the probe reads the root's priors, so it runs once the root is expanded
+    // (below for a reused root, at its first evaluation for a fresh one: `apply_eval`)
+    slot.heavy = false;
+    slot.heavy_wait = seat.selfplay && seat.sims_heavy.is_some() && !slot.minor && !slot.light;
     // the root's belief (docs/search.md 3.8): full searches, or every one with belief_fast; a
     // reused tree's belief was its last decision's (`Tree::advance` cleared it)
     slot.belief = seat.takes_belief(slot.full);
@@ -560,6 +644,10 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
         }
         t.set_gumbel(m, slot.target.unwrap(), &slot.gnoise, c_visit, c_scale);
     }
+    if slot.heavy_wait && slot.trees[p].as_ref().is_some_and(|t| t.expanded(t.root)) {
+        heavy_decide(seed, slot, seat, p, n)?;
+    }
+    Ok(())
 }
 
 /// Choose the move after the search; the training record (`n.recorded`) and value-only records
@@ -627,6 +715,18 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     let rec = cfg.record && seat.selfplay && seat.record && slot.full;
     // the game's light decisions (docs/search.md 3.10; every search's simulations too)
     slot.lg.sims_all += slot.sims as u64;
+    // ... and its heavy decisions (docs/search.md 3.11)
+    slot.hg.sims_all += slot.sims as u64;
+    if slot.heavy {
+        let forced: u64 = tree.root_forced().iter().map(|&x| x as u64).sum();
+        slot.hg.decisions += 1;
+        slot.hg.sims += slot.sims as u64;
+        slot.hg.forced += forced;
+        slot.hg.recorded += rec as u32;
+        n.heavy += 1;
+        n.heavy_sims += slot.sims as u64;
+        n.heavy_forced += forced;
+    }
     if slot.light {
         slot.lg.decisions += 1;
         slot.lg.sims += slot.sims as u64;
@@ -741,7 +841,8 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
     let g = slot.game.take().unwrap();
     let over = g.to_move().is_none();
     let light = if cfg.light_on() { Some(std::mem::take(&mut slot.lg)) } else { None };
-    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), light };
+    let heavy = if cfg.heavy_on() { Some(std::mem::take(&mut slot.hg)) } else { None };
+    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), light, heavy };
     let records = std::mem::take(&mut slot.records);
     let rq = std::mem::take(&mut slot.rq);
     slot.view_wait.clear();
@@ -754,8 +855,8 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
         let payload = g.deferred_payload().map_err(|e| format!("deferred_payload: {e}"))?;
         let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(ParkedRecord::park).collect() } else { Vec::new() };
         let bytes = records.iter().map(|r| r.bytes()).sum::<usize>() as u64;
-        let Done { gid, tag, n, steps, decisions, ext_moves, light, .. } = done;
-        parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes, light });
+        let Done { gid, tag, n, steps, decisions, ext_moves, light, heavy, .. } = done;
+        parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes, light, heavy });
         return Ok(());
     }
     results.push(emit(cfg.record, &g, over, done, records, rq, samples));
@@ -772,6 +873,7 @@ pub(super) struct Done {
     pub ext_moves: u32,
     pub moves: Vec<(u8, u16, Vec<u16>)>,
     pub light: Option<LightGame>,
+    pub heavy: Option<HeavyGame>,
 }
 
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
@@ -802,6 +904,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         tag: d.tag,
         moves: d.moves,
         light: d.light,
+        heavy: d.heavy,
     };
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();

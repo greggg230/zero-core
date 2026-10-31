@@ -100,7 +100,9 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             root_min_visits=0, root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
             view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
             root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
-            sims_light=None, sims_light_fast=None, light_record=False, light_classes=None):
+            sims_light=None, sims_light_fast=None, light_record=False, light_classes=None,
+            sims_heavy=None, sims_heavy_fast=None, chance_k_heavy=None, root_min_visits_heavy=0, heavy_prior_max=1.0,
+            heavy_depth=None, heavy_horizon=None, heavy_lines=None):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
@@ -129,7 +131,11 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     self-play seat's light decisions (docs/search.md 3.10; None = off: no keys, the seat of before) - the
     budget of a full draw's search of one, sims_light_fast a fast draw's (None: sims_light), light_record
     whether full draws are recorded, light_classes the indices of the game's LIGHT_CLASSES it searches
-    light (zero/light.py resolves a run's names)."""
+    light (zero/light.py resolves a run's names). sims_heavy: a self-play seat's heavy decisions
+    (docs/search.md 3.11; None = off: no keys) - a heavy full draw's budget, sims_heavy_fast a fast draw's,
+    chance_k_heavy the heavy searches' chance_k (None: chance_k), root_min_visits_heavy their root floor,
+    heavy_prior_max / heavy_depth / heavy_horizon / heavy_lines the probe's gate and lines (None: the
+    core's defaults; zero/heavy.py resolves a run's settings)."""
     from .mcts import (check_belief, check_leaf_view, check_root_min, check_root_search, check_select,
                        check_select_transform, select_transform)
     check_select(select, select_min_visits)
@@ -175,6 +181,24 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             d['sims_light_fast'] = int(sims_light_fast)
     elif sims_light_fast or light_record or light_classes:
         raise ValueError('sims_light_fast / light_record / light_classes without sims_light (docs/search.md 3.10)')
+    probe = {k: v for k, v in (('heavy_depth', heavy_depth), ('heavy_horizon', heavy_horizon), ('heavy_lines', heavy_lines))
+             if v is not None}
+    if sims_heavy:
+        if not selfplay:
+            raise ValueError(f"sims_heavy {sims_heavy}: a self-play seat's setting (docs/search.md 3.11)")
+        d['sims_heavy'] = int(sims_heavy)
+        if sims_heavy_fast:
+            d['sims_heavy_fast'] = int(sims_heavy_fast)
+        if chance_k_heavy is not None:
+            d['chance_k_heavy'] = int(chance_k_heavy)
+        if root_min_visits_heavy:
+            d['root_min_visits_heavy'] = int(root_min_visits_heavy)
+        if float(heavy_prior_max) != 1.0:
+            d['heavy_prior_max'] = float(heavy_prior_max)
+        d.update({k: int(v) for k, v in probe.items()})
+    elif sims_heavy_fast or chance_k_heavy is not None or root_min_visits_heavy or float(heavy_prior_max) != 1.0 or probe:
+        raise ValueError('sims_heavy_fast / chance_k_heavy / root_min_visits_heavy / heavy_prior_max / heavy_depth / '
+                         'heavy_horizon / heavy_lines without sims_heavy (docs/search.md 3.11)')
     if root_search == 'gumbel':
         cv, cs = (float(cq_c_visit), float(cq_c_scale)) if policy_target == 'cq' else sel
         d.update(root_search='gumbel', gumbel_m=int(gumbel_m), gumbel_scale=float(gumbel_scale),

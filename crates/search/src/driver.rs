@@ -61,6 +61,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::game::{make_bot, Belief, Bot, SearchGame, MAX_SEATS};
+pub use crate::heavy::ProbeCfg;
 use crate::rng::{split64, Rng};
 use crate::tree::Tree;
 
@@ -374,12 +375,33 @@ pub struct NnSeat {
     /// The light classes this seat searches light (bit k = `SearchGame::LIGHT_CLASSES[k]`); with
     /// `sims_light` at least one.
     pub light_classes: u64,
+    /// Heavy decisions (docs/search.md 3.11; None = off, the default: the probe never runs): a
+    /// self-play seat's decision, neither minor nor light, at which an option of prior <=
+    /// `heavy_prior_max` leads within a short line to a revelation of hidden information to the
+    /// decider (`heavy::probe`, decided once the root is expanded) is searched with this many
+    /// simulations on a full playout-cap draw instead of `sims`.
+    pub sims_heavy: Option<u32>,
+    /// ... and with this many on a fast draw instead of `sims_fast` (required when the seat has
+    /// `sims_fast`; refused without).
+    pub sims_heavy_fast: Option<u32>,
+    /// `chance_k` inside a heavy search (None: the seat's `chance_k`): with chance_k k > 0, an edge
+    /// holding k sampled outcomes replays one of them, so a revealed card's subtree is searched again.
+    pub chance_k_heavy: Option<u32>,
+    /// Root minimum visits of a heavy search (0 = off): every root option at least this many,
+    /// clipped to half the budget (`heavy_floor`), full and fast draws alike - the root floor's
+    /// machinery and accounting (docs/search.md 3.5: forced walks out of the visit-based outputs).
+    pub root_min_visits_heavy: u32,
+    /// The probe's prior gate in (0, 1] (1 = every option probed): only root options whose prior
+    /// (before noise) is at most this are probed - an option the search would barely look at.
+    pub heavy_prior_max: f64,
+    /// The probe's lines (`heavy::ProbeCfg`: deviations, horizon, line budget).
+    pub heavy_probe: ProbeCfg,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, sims_light: None, sims_light_fast: None, light_record: false, light_classes: 0 }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, sims_light: None, sims_light_fast: None, light_record: false, light_classes: 0, sims_heavy: None, sims_heavy_fast: None, chance_k_heavy: None, root_min_visits_heavy: 0, heavy_prior_max: 1.0, heavy_probe: ProbeCfg::default() }
     }
 
     /// The belief settings' check (`Driver::new`; the bindings' messages): tilt finite >= 0, clip
@@ -451,6 +473,50 @@ impl NnSeat {
         Ok(())
     }
 
+    /// The heavy-decision settings' check (`Driver::new`, docs/search.md 3.11): refused - never
+    /// ignored - where a setting would do nothing (any heavy setting without `sims_heavy`, on an
+    /// evaluation seat, `chance_k_heavy` equal to `chance_k`, `sims_heavy_fast` where every draw is
+    /// full) or would not be heavy (a budget below the one it replaces), a fast draw's budget left
+    /// implicit (`sims_fast` without `sims_heavy_fast`), a floor with the Gumbel root search, a gate
+    /// outside (0, 1], probe settings out of range.
+    pub fn check_heavy(&self) -> Result<(), String> {
+        let Some(sh) = self.sims_heavy else {
+            if self.sims_heavy_fast.is_some() || self.chance_k_heavy.is_some() || self.root_min_visits_heavy > 0 || self.heavy_prior_max != 1.0 || self.heavy_probe != ProbeCfg::default() {
+                return Err("sims_heavy_fast / chance_k_heavy / root_min_visits_heavy / heavy_prior_max / heavy_depth / heavy_horizon / heavy_lines without sims_heavy: heavy decisions are off (sims_heavy absent), the settings would do nothing".into());
+            }
+            return Ok(());
+        };
+        if !self.selfplay {
+            return Err(format!("sims_heavy {sh}: a self-play seat's setting (an evaluation seat searches every decision with its budget)"));
+        }
+        if sh < self.sims {
+            return Err(format!("sims_heavy {sh} < sims {}: a heavy decision's budget is at least the one it replaces", self.sims));
+        }
+        match (self.sims_fast, self.sims_heavy_fast) {
+            (Some(sf), None) => return Err(format!("sims_heavy {sh} with sims_fast {sf}: set sims_heavy_fast (a fast draw's heavy budget) explicitly")),
+            (None, Some(f)) => return Err(format!("sims_heavy_fast {f} without sims_fast: every search of the seat is a full one")),
+            (Some(sf), Some(f)) if f < sf => return Err(format!("sims_heavy_fast {f} < sims_fast {sf}: a heavy decision's budget is at least the one it replaces")),
+            _ => {}
+        }
+        if self.chance_k_heavy == Some(self.chance_k) {
+            return Err(format!("chance_k_heavy {} = chance_k: the setting would do nothing (absent = the seat's chance_k)", self.chance_k));
+        }
+        if matches!(self.root_search, RootSearch::Gumbel { .. }) {
+            return Err(format!("sims_heavy {sh} with root_search 'gumbel': exclusive (the Gumbel search's schedule and noise are fixed when its search starts; the probe decides after the root's first evaluation)"));
+        }
+        if !(self.heavy_prior_max > 0.0 && self.heavy_prior_max <= 1.0) {
+            return Err(format!("heavy_prior_max {}: in (0, 1] (1 = every option probed)", self.heavy_prior_max));
+        }
+        self.heavy_probe.check()
+    }
+
+    /// The budget of a heavy search (None: the seat has no heavy decisions): `full` = the playout-cap
+    /// draw.
+    pub fn heavy_budget(&self, full: bool) -> Option<u32> {
+        let sh = self.sims_heavy?;
+        Some(if full { sh } else { self.sims_heavy_fast.unwrap_or(sh) })
+    }
+
     /// The budget of this seat's search of a light decision of class `class` (None: not light for
     /// it: off, an evaluation seat, a class it does not select): `full` = the playout-cap draw.
     pub fn light_budget(&self, class: Option<usize>, full: bool) -> Option<u32> {
@@ -473,6 +539,33 @@ pub struct LightGame {
     pub sims: u64,
     pub saved: u64,
     pub sims_all: u64,
+}
+
+/// One game's heavy decisions (`GameResult::heavy`, docs/search.md 3.11): the decisions the probe
+/// examined (`probed`) and found heavy (`decisions`), those recorded, the heavy searches'
+/// simulations, the root floor's forced walks in them, the probe's lines, steps and nanoseconds, and
+/// every search's simulations in the game (heavy or not).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeavyGame {
+    pub probed: u32,
+    pub decisions: u32,
+    pub recorded: u32,
+    pub sims: u64,
+    pub forced: u64,
+    pub lines: u64,
+    pub steps: u64,
+    pub probe_ns: u64,
+    pub sims_all: u64,
+}
+
+/// The root floor of a heavy search (docs/search.md 3.11): `k` per option, at most half the budget
+/// (`k <= target / (2 m)`), for a root of `m >= 2` options; 0 = none. Unlike `root_floor` it is not
+/// limited to small roots or full draws: the probe already chose the decision.
+pub fn heavy_floor(k: u32, m: usize, target: u32) -> u32 {
+    if k == 0 || m < 2 {
+        return 0;
+    }
+    k.min(target / (2 * m as u32))
 }
 
 /// The default belief clip R (`NnSeat::belief_clip`).
@@ -538,6 +631,11 @@ impl DriverCfg {
     pub fn light_on(&self) -> bool {
         self.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if n.sims_light.is_some()))
     }
+    /// A seat of the driver searches heavy decisions (`NnSeat::sims_heavy`, docs/search.md 3.11):
+    /// its result rows carry `GameResult::heavy`.
+    pub fn heavy_on(&self) -> bool {
+        self.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if n.sims_heavy.is_some()))
+    }
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -564,6 +662,9 @@ pub struct GameResult {
     /// The game's light decisions (docs/search.md 3.10) when a seat of the driver has `sims_light`;
     /// None otherwise (the rows of before).
     pub light: Option<LightGame>,
+    /// The game's heavy decisions (docs/search.md 3.11) when a seat of the driver has `sims_heavy`;
+    /// None otherwise.
+    pub heavy: Option<HeavyGame>,
 }
 
 /// One recorded root decision with its targets.
@@ -756,6 +857,7 @@ struct Parked<G: SearchGame> {
     /// Memory held by the records (`DriverStats::parked_bytes`).
     bytes: u64,
     light: Option<LightGame>,
+    heavy: Option<HeavyGame>,
 }
 
 enum Eval {
@@ -804,6 +906,12 @@ struct Slot<G: SearchGame> {
     light_saved: u32,
     /// The game's light decisions so far (`GameResult::light`).
     lg: LightGame,
+    /// The current decision awaits the heavy probe (a self-play seat with `sims_heavy`, neither minor
+    /// nor light: decided once its root is expanded), is heavy (searched with the heavy budget, its
+    /// floor and `chance_k_heavy`, docs/search.md 3.11); the game's heavy decisions so far.
+    heavy_wait: bool,
+    heavy: bool,
+    hg: HeavyGame,
     /// The current search takes the root's belief (`NnSeat::takes_belief`, docs/search.md 3.8).
     belief: bool,
     decisions: u32,
@@ -852,6 +960,9 @@ impl<G: SearchGame> Slot<G> {
             light: false,
             light_saved: 0,
             lg: LightGame::default(),
+            heavy_wait: false,
+            heavy: false,
+            hg: HeavyGame::default(),
             belief: false,
             decisions: 0,
             ext_moves: 0,
@@ -969,6 +1080,15 @@ struct Counters {
     light: AtomicU64,
     light_recorded: AtomicU64,
     light_saved: AtomicU64,
+    /// Heavy decisions: probed, heavy, their simulations, forced walks, probe lines / steps / ns
+    /// (docs/search.md 3.11).
+    heavy_probed: AtomicU64,
+    heavy: AtomicU64,
+    heavy_sims: AtomicU64,
+    heavy_forced: AtomicU64,
+    heavy_lines: AtomicU64,
+    heavy_steps: AtomicU64,
+    heavy_probe_ns: AtomicU64,
     /// Value-only rows sent with leaves (`LeafView::Root`) and value-only samples recorded.
     view_rows: AtomicU64,
     view_recorded: AtomicU64,
@@ -1056,6 +1176,15 @@ pub struct DriverStats {
     pub light: u64,
     pub light_recorded: u64,
     pub light_saved: u64,
+    /// Heavy decisions (docs/search.md 3.11): decisions probed, found heavy, the heavy searches'
+    /// simulations and forced walks, the probe's lines, steps and seconds.
+    pub heavy_probed: u64,
+    pub heavy: u64,
+    pub heavy_sims: u64,
+    pub heavy_forced: u64,
+    pub heavy_lines: u64,
+    pub heavy_steps: u64,
+    pub heavy_probe_s: f64,
     /// Value-only rows of the network batches (`LeafView::Root`: one per leaf of a seat other
     /// than its tree's root decider; `leaves` counts the leaves) and value-only samples recorded
     /// (`NnSeat::view_samples`; `recorded` counts the decisions).
@@ -1158,6 +1287,7 @@ impl<G: SearchGame> Driver<G> {
                     }
                     NnSeat::check_belief(n.belief_tilt, n.belief_clip, n.belief_mix)?;
                     n.check_light(G::NAME, G::LIGHT_CLASSES.len())?;
+                    n.check_heavy()?;
                     if n.belief_tilt > 0.0 && G::aux_width() == 0 {
                         return Err(format!("belief_tilt {}: {} has no auxiliary targets (SearchGame::AUX) for a belief to predict", n.belief_tilt, G::NAME));
                     }
@@ -1617,7 +1747,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), light: p.light };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), light: p.light, heavy: p.heavy };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
@@ -1684,6 +1814,13 @@ impl<G: SearchGame> Driver<G> {
             light: c.light.load(Ordering::Relaxed),
             light_recorded: c.light_recorded.load(Ordering::Relaxed),
             light_saved: c.light_saved.load(Ordering::Relaxed),
+            heavy_probed: c.heavy_probed.load(Ordering::Relaxed),
+            heavy: c.heavy.load(Ordering::Relaxed),
+            heavy_sims: c.heavy_sims.load(Ordering::Relaxed),
+            heavy_forced: c.heavy_forced.load(Ordering::Relaxed),
+            heavy_lines: c.heavy_lines.load(Ordering::Relaxed),
+            heavy_steps: c.heavy_steps.load(Ordering::Relaxed),
+            heavy_probe_s: c.heavy_probe_ns.load(Ordering::Relaxed) as f64 * 1e-9,
             view_rows: c.view_rows.load(Ordering::Relaxed),
             view_recorded: c.view_recorded.load(Ordering::Relaxed),
             belief_rows: c.belief_rows.load(Ordering::Relaxed),

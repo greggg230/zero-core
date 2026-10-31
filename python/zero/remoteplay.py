@@ -110,6 +110,13 @@ def _belief_of(cfg):
     return belief_keys(cfg, 'selfplay')
 
 
+def _heavy_of(cfg):
+    """A run's heavy decisions as its self-play driver plays them (`heavy.fingerprint`, '' when off): what a
+    worker's hello reports and the run checks (docs/az.md 23; an older checkout reports none)."""
+    from .heavy import fingerprint
+    return fingerprint(cfg)
+
+
 def _light_of(cfg):
     """A run's light decisions as its self-play driver plays them (`light.fingerprint`, '' when off):
     what a worker's hello reports and the run checks (docs/az.md 22; an older checkout reports none)."""
@@ -680,6 +687,12 @@ class RemotePlay:
                 for e in ends:
                     lt = lmerge(lt, e.get('light'))
                 out['light'] = lt
+            if any('heavy' in e for e in ends):        # heavy decisions: its accepted games' (heavy.tally)
+                from .heavy import merge as hmerge
+                ht = None
+                for e in ends:
+                    ht = hmerge(ht, e.get('heavy'))
+                out['heavy'] = ht
         if self.mode == 'matches':
             with self.mu:
                 outstanding = sum(len(s.assigned) for s in self.sess if s is not None)
@@ -760,6 +773,12 @@ class RemotePlay:
                     # every decision with the full budget - or another one - in silence: never used
                     # (docs/az.md 22)
                     s.no_light = ev.get('light')
+                want_h = _heavy_of(self.R.cfg) if self.mode == 'selfplay' else ''
+                if (want_h or ev.get('heavy')) and (ev.get('heavy') or '') != want_h:
+                    # a checkout without heavy decisions (or reading the settings otherwise) would search
+                    # every decision with the normal budget - or another one - in silence: never used
+                    # (docs/az.md 23)
+                    s.no_heavy = ev.get('heavy')
                 if self.fails or s.k == 0:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
@@ -870,6 +889,13 @@ class RemotePlay:
                 self.next_try[k] = now + max(self.retry_s, 600.0)
                 self.fail_log(f'worker {k} REFUSED: its checkout searches light decisions as {s.no_light!r}, the run '
                               f'as {_light_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 22); killed, '
+                              f'retried in 10 minutes')
+                s.kill()
+                continue
+            if hasattr(s, 'no_heavy'):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.fail_log(f'worker {k} REFUSED: its checkout searches heavy decisions as {s.no_heavy!r}, the run '
+                              f'as {_heavy_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 23); killed, '
                               f'retried in 10 minutes')
                 s.kill()
                 continue
@@ -1509,6 +1535,7 @@ class Worker:
             self.backlog = []
             self.info = R.info
             self.light_on = self.mode == 'selfplay' and R.light is not None     # light decisions (zero/light.py)
+            self.heavy_on = self.mode == 'selfplay' and getattr(R, 'heavy', None) is not None    # zero/heavy.py
         else:
             self.evr.set_weights(m.state_dict())
         keep = set()
@@ -1597,6 +1624,9 @@ class Worker:
             if ph.get('light') is not None:
                 from .light import tally as ltally
                 ltally([row], ph['light'])
+            if ph.get('heavy') is not None:
+                from .heavy import tally as htally
+                htally([row], ph['heavy'])
         die = int(self.test.get('die_after_accepts') or 0)
         if die and ph['accepted'] >= die:
             self.note('test: dying with accepted games in no shard yet')
@@ -1737,6 +1767,8 @@ class Worker:
         extra = {'league': ph['league']} if self.lg_on else {}
         if ph.get('light') is not None:
             extra['light'] = ph['light']
+        if ph.get('heavy') is not None:
+            extra['heavy'] = ph['heavy']
         self.emit('end', iter=ph['it'], games=ph['games'], samples=ph['samples'], shards=w['shards'], bytes=w['bytes'],
                   leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - bo, 2),
                   backoff_s=round(bo, 2), in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
@@ -1770,6 +1802,9 @@ class Worker:
         if getattr(self, 'light_on', False):
             from .light import new_tally
             ph['light'] = new_tally()
+        if getattr(self, 'heavy_on', False):
+            from .heavy import new_tally as hnew
+            ph['heavy'] = hnew()
         evs = {'m': self.evr, **self.lg_evs} if self.lg_on else {'m': self.evr}
         self.linger_prev = None
         for sd in self.held_samples:               # co-training: rows finished while lingering, sent already
@@ -1836,7 +1871,8 @@ class Worker:
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
                       mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),
                       **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}),
-                      **({} if self.test.get('no_light') else {'light': _light_of(self.cfg)}))
+                      **({} if self.test.get('no_light') else {'light': _light_of(self.cfg)}),
+                      **({} if self.test.get('no_heavy') else {'heavy': _heavy_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

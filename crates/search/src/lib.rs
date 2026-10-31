@@ -15,6 +15,7 @@
 pub mod driver;
 pub mod dynapi;
 pub mod game;
+pub mod heavy;
 pub mod noise;
 pub mod rng;
 pub mod toy;
@@ -24,6 +25,9 @@ pub mod tree;
 // a test game for the root minimum visits (docs/search.md 3.5)
 #[cfg(test)]
 pub(crate) mod mull_game;
+// a test game for heavy decisions (docs/search.md 3.11)
+#[cfg(test)]
+pub(crate) mod peek_game;
 
 pub use game::{belief_weight, team_of, Belief, Bot, SearchGame, MAX_SEATS};
 pub use rng::Rng;

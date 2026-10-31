@@ -2638,3 +2638,271 @@ fn evaluation_seats_and_matches_ignore_light_decisions() {
     let (res, _) = run(&mut d);
     assert!(res.iter().all(|r| r.light.is_none()) && d.stats().light == 0);
 }
+
+// ---------------------------------------------------------------- heavy decisions (docs/search.md 3.11)
+
+use crate::heavy::{probe, ProbeCfg};
+use crate::peek_game::Peek;
+
+fn with_heavy(seat: SeatCfg, sims: Option<u32>, fast: Option<u32>, chance_k: Option<u32>, floor: u32, gate: f64) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.sims_heavy = sims;
+            s.sims_heavy_fast = fast;
+            s.chance_k_heavy = chance_k;
+            s.root_min_visits_heavy = floor;
+            s.heavy_prior_max = gate;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+fn nn_of(s: SeatCfg) -> NnSeat {
+    match s {
+        SeatCfg::Nn(n) => n,
+        _ => unreachable!(),
+    }
+}
+
+/// Self-play of `games` peek games (seed 2026) with the move log on: results, records, stats.
+fn peek_selfplay<G: SearchGame>(seat: SeatCfg, games: usize, threads: usize) -> (Vec<GameResult>, Vec<Record>, DriverStats) {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.threads = threads;
+    c.move_log = 100_000;
+    let mut d = Driver::<G>::new(c).unwrap();
+    let (r, s) = run(&mut d);
+    (r, s, d.stats())
+}
+
+/// The heavy decisions of a logged game by the probe itself (every option a candidate, the default
+/// lines), the game rebuilt from its seed: (heavy decisions, decisions probed) - `light` skips the
+/// light decisions as the driver does.
+fn peek_heavy_by_log(seed: u64, r: &GameResult, light: bool) -> (u32, u32) {
+    let mut base = Rng::new(split64(seed ^ split64(r.gid as u64 + 1)));
+    let mut g = Peek::new_game(&(), 2, base.next_u64()).unwrap();
+    let (mut heavy, mut probed) = (0, 0);
+    for (p, a, legal) in &r.moves {
+        assert!(legal.len() >= 2);
+        if !(light && g.light_class().is_some()) {
+            probed += 1;
+            let o = probe(&g, *p as usize, legal, &[], &ProbeCfg::default(), &mut Rng::new(1), true).unwrap();
+            heavy += o.any() as u32;
+        }
+        g.step(*a, &mut Vec::new()).unwrap();
+    }
+    (heavy, probed)
+}
+
+#[test]
+fn heavy_settings_are_checked() {
+    let ok = |s: SeatCfg| Driver::<ToyGame>::new(cfg(vec![s], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).map(|_| ());
+    // nn(): sims 16, sims_fast 4
+    assert!(ok(with_heavy(nn(0, 16, true), Some(64), Some(16), Some(4), 8, 0.05)).is_ok());
+    assert!(ok(with_heavy(nn(0, 16, true), Some(16), Some(4), None, 0, 1.0)).is_ok());
+    let mut bad_probe = nn_of(with_heavy(nn(0, 16, true), Some(64), Some(16), None, 0, 1.0));
+    bad_probe.heavy_probe.depth = 0;
+    let mut gumbel = nn_of(with_heavy(nn(0, 16, true), Some(64), Some(16), None, 0, 1.0));
+    gumbel.root_search = RootSearch::Gumbel { m: 4, scale: 1.0, c_visit: 50.0, c_scale: 1.0 };
+    gumbel.policy_target = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: 1.0 };
+    let mut off_probe = nn_of(nn(0, 16, true));
+    off_probe.heavy_probe.horizon = 4;
+    let refused = [
+        (with_heavy(nn(0, 16, false), Some(64), None, None, 0, 1.0), "self-play seat"),
+        (with_heavy(nn(0, 16, true), Some(8), Some(4), None, 0, 1.0), "at least the one it replaces"),
+        (with_heavy(nn(0, 16, true), Some(64), Some(2), None, 0, 1.0), "at least the one it replaces"),
+        (with_heavy(nn(0, 16, true), Some(64), None, None, 0, 1.0), "set sims_heavy_fast"),
+        (with_heavy(nn(0, 16, true), Some(64), Some(16), Some(0), 0, 1.0), "would do nothing"),
+        (with_heavy(nn(0, 16, true), Some(64), Some(16), None, 0, 0.0), "in (0, 1]"),
+        (with_heavy(nn(0, 16, true), Some(64), Some(16), None, 0, 1.5), "in (0, 1]"),
+        (SeatCfg::Nn(bad_probe), "heavy_depth"),
+        (SeatCfg::Nn(gumbel), "exclusive"),
+        (with_heavy(nn(0, 16, true), None, Some(16), None, 0, 1.0), "without sims_heavy"),
+        (with_heavy(nn(0, 16, true), None, None, Some(4), 0, 1.0), "without sims_heavy"),
+        (with_heavy(nn(0, 16, true), None, None, None, 4, 1.0), "without sims_heavy"),
+        (with_heavy(nn(0, 16, true), None, None, None, 0, 0.5), "without sims_heavy"),
+        (SeatCfg::Nn(off_probe), "without sims_heavy"),
+    ];
+    for (s, want) in refused {
+        let e = ok(s.clone()).expect_err(&format!("{s:?} accepted"));
+        assert!(e.contains(want), "{e:?} (wanted {want:?})");
+    }
+    // sims_heavy_fast where every draw is full
+    let mut full = NnSeat::eval(0, 16);
+    full.selfplay = true;
+    let e = ok(with_heavy(SeatCfg::Nn(full), Some(64), Some(16), None, 0, 1.0)).unwrap_err();
+    assert!(e.contains("without sims_fast"), "{e}");
+    // the heavy floor: k per option, at most half the budget
+    assert_eq!(heavy_floor(8, 6, 256), 8);
+    assert_eq!(heavy_floor(8, 6, 64), 5);
+    assert_eq!(heavy_floor(8, 1, 256), 0);
+    assert_eq!(heavy_floor(0, 6, 256), 0);
+}
+
+/// Peek whose heavy hooks panic: a driver must never read them without sims_heavy.
+#[derive(Clone)]
+struct NoHeavyPeek(Peek);
+
+impl SearchGame for NoHeavyPeek {
+    type Spec = ();
+    const NAME: &'static str = "noheavypeek";
+    const NUM_ACTIONS: usize = Peek::NUM_ACTIONS;
+    const NUM_FEATURES: usize = Peek::NUM_FEATURES;
+    const MIN_PLAYERS: usize = 2;
+    const MAX_PLAYERS: usize = 2;
+    fn parse_spec(json: &str) -> Result<(), String> {
+        Peek::parse_spec(json)
+    }
+    fn new_game(spec: &(), players: usize, seed: u64) -> Result<Self, String> {
+        Peek::new_game(spec, players, seed).map(NoHeavyPeek)
+    }
+    fn num_players(&self) -> usize {
+        2
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.0.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.0.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn rounds(&self) -> u32 {
+        self.0.rounds()
+    }
+    fn passive_action(&self, _: &[u16]) -> Option<u16> {
+        panic!("passive_action read without sims_heavy")
+    }
+    fn reveals(&self, _: u64, _: usize) -> bool {
+        panic!("reveals read without sims_heavy")
+    }
+}
+
+#[test]
+fn heavy_decisions_off_change_nothing() {
+    // without sims_heavy the hooks are never read (they panic here) and the rows have no heavy
+    let (res, recs, st) = peek_selfplay::<NoHeavyPeek>(nn(0, 16, true), 32, 2);
+    let (res0, recs0, _) = peek_selfplay::<Peek>(nn(0, 16, true), 32, 2);
+    assert!(res.iter().all(|r| r.heavy.is_none()));
+    assert_eq!((st.heavy_probed, st.heavy, st.heavy_sims, st.heavy_forced), (0, 0, 0, 0));
+    assert_eq!(records_digest(&recs), records_digest(&recs0));
+    assert_eq!(res.iter().map(|r| r.moves.clone()).collect::<Vec<_>>(), res0.iter().map(|r| r.moves.clone()).collect::<Vec<_>>());
+    // the toy's golden records; and with sims_heavy the toy finds nothing heavy (its round cards come
+    // with its rounds), probes every decision - and still plays and records the golden games: the
+    // probe moves no stream of the driver
+    let (_, recs) = golden_selfplay(nn(0, 16, true));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    let (res, recs) = golden_selfplay(with_heavy(nn(0, 16, true), Some(64), Some(16), Some(2), 4, 1.0));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    let h: Vec<HeavyGame> = res.iter().map(|r| r.heavy.expect("heavy rows with sims_heavy")).collect();
+    assert!(h.iter().all(|h| h.decisions == 0 && h.sims == 0 && h.probed > 0 && h.lines > 0));
+    let searched: u32 = res.iter().map(|r| r.decisions).sum();
+    assert_eq!(h.iter().map(|h| h.probed).sum::<u32>(), searched, "every searched decision probed");
+}
+
+#[test]
+fn heavy_decisions_take_their_budget_floor_and_records() {
+    let seat = with_heavy(nn(0, 16, true), Some(64), Some(16), None, 4, 1.0);
+    let (res, recs, st) = peek_selfplay::<Peek>(seat.clone(), 64, 2);
+    let (_, _, st0) = peek_selfplay::<Peek>(nn(0, 16, true), 64, 2);
+    assert_eq!(res.len(), 64);
+    let (mut heavy, mut probed, mut rec) = (0u64, 0u64, 0u64);
+    for r in &res {
+        let h = r.heavy.expect("heavy rows with sims_heavy");
+        // the driver's heavy decisions are the probe's, decision by decision (every decision probed)
+        assert_eq!((h.decisions, h.probed), peek_heavy_by_log(2026, r, false), "game {}", r.gid);
+        assert!(h.decisions >= 1, "the first decision (PEEK reveals) is heavy");
+        // heavy budgets: 64 full, 16 fast
+        assert!(h.sims >= 16 * h.decisions as u64 && h.sims <= 64 * h.decisions as u64, "{h:?}");
+        assert!(h.recorded <= h.decisions && h.sims_all >= h.sims);
+        heavy += h.decisions as u64;
+        probed += h.probed as u64;
+        rec += h.recorded as u64;
+    }
+    assert!(rec > 0 && rec < heavy, "full draws recorded, fast ones not ({rec} of {heavy})");
+    assert_eq!((st.heavy, st.heavy_probed), (heavy, probed));
+    assert_eq!(st.heavy_sims, res.iter().map(|r| r.heavy.unwrap().sims).sum::<u64>());
+    assert_eq!(st.sims, res.iter().map(|r| r.heavy.unwrap().sims_all).sum::<u64>());
+    // the floor: 4 per option at 6 options (64: 4 <= 64 / 12; 16: clipped to 1), forced walks counted
+    assert!(st.heavy_forced > 0 && st.heavy_forced == res.iter().map(|r| r.heavy.unwrap().forced).sum::<u64>());
+    assert!(st.leaves > st0.leaves, "{} leaves with heavy decisions vs {}", st.leaves, st0.leaves);
+    assert!(st.heavy_lines > 0 && st.heavy_steps > 0 && st.heavy_probe_s > 0.0);
+    // every recorded decision's records keep their shape (the floor's forced walks out of 'visits')
+    assert!(recs.iter().filter(|r| !r.pi.is_empty()).all(|r| (r.pi.iter().sum::<f32>() - 1.0).abs() < 1e-4));
+    // reproducible across threads
+    let (r4, s4, st4) = peek_selfplay::<Peek>(seat, 64, 4);
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples, r.decisions, r.heavy.map(|h| (h.probed, h.decisions, h.recorded, h.sims, h.forced, h.lines, h.steps, h.sims_all)));
+    assert_eq!(res.iter().map(key).collect::<Vec<_>>(), r4.iter().map(key).collect::<Vec<_>>());
+    assert_eq!(records_digest(&recs), records_digest(&s4));
+    assert_eq!((st.heavy, st.heavy_sims, st.heavy_forced), (st4.heavy, st4.heavy_sims, st4.heavy_forced));
+}
+
+#[test]
+fn heavy_chance_k_and_the_gate_change_what_they_say() {
+    // chance_k_heavy: the heavy searches replay sampled outcomes (the look's coin) - other records
+    let base = with_heavy(nn(0, 16, true), Some(64), Some(16), None, 0, 1.0);
+    let (_, recs, _) = peek_selfplay::<Peek>(base, 64, 2);
+    let (_, recs_k, _) = peek_selfplay::<Peek>(with_heavy(nn(0, 16, true), Some(64), Some(16), Some(1), 0, 1.0), 64, 2);
+    assert_ne!(records_digest(&recs), records_digest(&recs_k), "chance_k_heavy changed nothing");
+    // the gate: uniform priors (1/6 at the first decision, 1/2 at the choice of where to look, 1/3
+    // at the follow-up) - a gate of 0.1 probes nothing (every decision probed, none heavy); a gate of
+    // 0.4 never probes the choice of where to look
+    let (res, _, st) = peek_selfplay::<Peek>(with_heavy(nn(0, 16, true), Some(64), Some(16), None, 0, 0.1), 64, 2);
+    assert!(st.heavy_probed > 0 && st.heavy == 0 && res.iter().all(|r| r.heavy.unwrap().sims == 0));
+    let (res, _, _) = peek_selfplay::<Peek>(with_heavy(nn(0, 16, true), Some(64), Some(16), None, 0, 0.4), 64, 2);
+    for r in &res {
+        let choice = r.moves.iter().filter(|m| m.2 == [crate::peek_game::AT_COIN, crate::peek_game::AT_NOTHING]).count() as u32;
+        let (all, _) = peek_heavy_by_log(2026, r, false);
+        assert_eq!(r.heavy.unwrap().decisions, all - choice, "game {}", r.gid);
+    }
+}
+
+#[test]
+fn light_decisions_come_first_and_evaluation_seats_never_probe() {
+    // light 'start' (seat 0's first decision) with heavy: that decision is searched light, never probed
+    let seat = with_heavy(with_light(nn(0, 16, true), Some(4), Some(2), false, 0b1), Some(64), Some(16), None, 0, 1.0);
+    let (res, _, st) = peek_selfplay::<Peek>(seat, 64, 2);
+    for r in &res {
+        let h = r.heavy.unwrap();
+        assert_eq!((h.decisions, h.probed), peek_heavy_by_log(2026, r, true), "game {}", r.gid);
+        assert_eq!(r.light.unwrap().decisions, 1);
+    }
+    assert_eq!(st.light, 64);
+    // a match: the heavy self-play seat against an evaluation seat - only the self-play seat probes
+    let seats = vec![with_heavy(nn(0, 16, true), Some(64), Some(16), None, 0, 1.0), nn(1, 16, false)];
+    let mut c = cfg(seats, (0..32).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect(), &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.record = false;
+    c.move_log = 100_000;
+    let mut d = Driver::<Peek>::new(c).unwrap();
+    let (res, smp) = run(&mut d);
+    assert!(smp.is_empty());
+    for r in &res {
+        let hs = if r.gid % 2 == 0 { 0 } else { 1 };
+        let n = r.moves.iter().filter(|m| m.0 as usize == hs).count() as u32;
+        assert_eq!(r.heavy.unwrap().probed, n, "game {}: only the heavy seat's decisions are probed", r.gid);
+    }
+    // two evaluation seats: no heavy rows
+    let mut c = cfg(vec![nn(0, 16, false), nn(1, 16, false)], vec![vec![0, 1]; 4], &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    c.record = false;
+    let mut d = Driver::<Peek>::new(c).unwrap();
+    let (res, _) = run(&mut d);
+    assert!(res.iter().all(|r| r.heavy.is_none()) && d.stats().heavy_probed == 0);
+}
