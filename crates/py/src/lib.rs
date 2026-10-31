@@ -145,7 +145,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "sims_light", "sims_light_fast", "light_record", "light_classes"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -181,6 +181,29 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         Some(v) if !v.is_none() => Some(v.extract()?),
         _ => None,
     };
+    // light decisions (docs/search.md 3.10): their budgets (absent: off), whether they are recorded,
+    // and the classes (indices into the game's LIGHT_CLASSES; Driver::new checks them)
+    let opt_u32 = |k: &str| -> PyResult<Option<u32>> {
+        match d.get_item(k)? {
+            Some(v) if !v.is_none() => Ok(Some(v.extract()?)),
+            _ => Ok(None),
+        }
+    };
+    let (sims_light, sims_light_fast) = (opt_u32("sims_light")?, opt_u32("sims_light_fast")?);
+    let mut light_classes = 0u64;
+    if let Some(v) = d.get_item("light_classes")? {
+        if !v.is_none() {
+            for c in v.extract::<Vec<u32>>()? {
+                if c >= 64 {
+                    return Err(PyValueError::new_err(format!("light_classes: class {c} out of range (at most 64 classes)")));
+                }
+                if light_classes & (1 << c) != 0 {
+                    return Err(PyValueError::new_err(format!("light_classes: class {c} given twice")));
+                }
+                light_classes |= 1 << c;
+            }
+        }
+    }
     // training target of recorded decisions: 'visits' (default) | 'cq' (docs/search.md 3.1)
     let (cq_c_visit, cq_c_scale) = (get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?);
     let policy_target = PolicyTarget::parse(&get(d, "policy_target", "visits".to_string())?, cq_c_visit, cq_c_scale).map_err(verr)?;
@@ -237,6 +260,10 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         belief_mix: get(d, "belief_mix", 0.0f64)?,
         belief_fast: flag(d, "belief_fast", false)?,
         root_search,
+        sims_light,
+        sims_light_fast,
+        light_record: flag(d, "light_record", false)?,
+        light_classes,
     }))
 }
 
@@ -251,6 +278,7 @@ fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>>
     d.set_item("max_seats", MAX_SEATS)?;
     d.set_item("aux_layout", i.aux.clone())?;
     d.set_item("aux_width", i.aux.iter().map(|s| s.1).sum::<usize>())?;
+    d.set_item("light_classes", i.light.clone())?;
     Ok(d)
 }
 
@@ -390,6 +418,11 @@ impl PyGame {
     #[getter]
     fn rounds(&self) -> u32 {
         self.g.rounds()
+    }
+    /// The pending decision's light class by name (`SearchGame::light_class`, docs/search.md 3.10),
+    /// None if it is not a light decision (or the game is over).
+    fn light_class(&self) -> Option<&'static str> {
+        self.g.light_class().map(|c| self.g.info().light[c])
     }
     /// The auxiliary targets of the pending decision for `viewer` (f32 [aux_width], from the true
     /// state: a training label, `SearchGame::aux_target`; docs/search.md 1.2).
@@ -782,6 +815,16 @@ impl PySearchDriver {
                 // DriverCfg::move_log (a diagnostic): [(seat, action, legal actions)]
                 d.set_item("moves", r.moves)?;
             }
+            if let Some(l) = r.light {
+                // a driver with sims_light on a seat (docs/search.md 3.10): the game's light decisions
+                let ld = PyDict::new(py);
+                ld.set_item("decisions", l.decisions)?;
+                ld.set_item("recorded", l.recorded)?;
+                ld.set_item("sims", l.sims)?;
+                ld.set_item("saved", l.saved)?;
+                ld.set_item("sims_all", l.sims_all)?;
+                d.set_item("light", ld)?;
+            }
             out.append(d)?;
         }
         Ok(out)
@@ -838,6 +881,9 @@ impl PySearchDriver {
         d.set_item("restarts", s.restarts)?;
         d.set_item("recorded", s.recorded)?;
         d.set_item("minor", s.minor)?;
+        d.set_item("light", s.light)?;
+        d.set_item("light_recorded", s.light_recorded)?;
+        d.set_item("light_saved", s.light_saved)?;
         d.set_item("view_rows", s.view_rows)?;
         d.set_item("view_recorded", s.view_recorded)?;
         d.set_item("belief_rows", s.belief_rows)?;

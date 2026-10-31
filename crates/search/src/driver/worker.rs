@@ -91,6 +91,9 @@ struct Tally {
     restarts: u64,
     recorded: u64,
     minor: u64,
+    light: u64,
+    light_recorded: u64,
+    light_saved: u64,
     view_rows: u64,
     view_recorded: u64,
     belief_rows: u64,
@@ -190,6 +193,11 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     k.restarts.fetch_add(n.restarts, Ordering::Relaxed);
     k.recorded.fetch_add(n.recorded, Ordering::Relaxed);
     k.minor.fetch_add(n.minor, Ordering::Relaxed);
+    if n.light > 0 {
+        k.light.fetch_add(n.light, Ordering::Relaxed);
+        k.light_recorded.fetch_add(n.light_recorded, Ordering::Relaxed);
+        k.light_saved.fetch_add(n.light_saved, Ordering::Relaxed);
+    }
     if n.view_rows > 0 || n.view_recorded > 0 {
         k.view_rows.fetch_add(n.view_rows, Ordering::Relaxed);
         k.view_recorded.fetch_add(n.view_recorded, Ordering::Relaxed);
@@ -309,6 +317,9 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.target = None;
     slot.full = true;
     slot.minor = false;
+    slot.light = false;
+    slot.light_saved = 0;
+    slot.lg = LightGame::default();
     slot.belief = false;
     slot.decisions = 0;
     slot.ext_moves = 0;
@@ -485,10 +496,31 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
         slot.full = false;
         slot.target = seat.sims_minor;
     }
+    // a light decision (docs/search.md 3.10: a self-play seat with sims_light, a class it selects,
+    // not minor): the light budget of its draw instead (sims_light full, sims_light_fast fast);
+    // without light_record it is never recorded and gets no root noise, floor or belief (a minor
+    // decision's treatment), with it a full draw is recorded with targets from this search. The
+    // playout-cap draw above is made all the same, and the hook is read only with sims_light.
+    slot.light = false;
+    slot.light_saved = 0;
+    let drawn = slot.target.unwrap();
+    if !slot.minor && seat.selfplay && seat.sims_light.is_some() {
+        if let Some(t) = seat.light_budget(game.light_class(), slot.full) {
+            slot.light = true;
+            slot.target = Some(t);
+            if !seat.light_record {
+                slot.full = false;
+            }
+        }
+    }
     // a lighter decision class (`SearchGame::sims_divisor`): the drawn budget divided
     let div = game.sims_divisor();
+    let drawn = if div > 1 { (drawn / div).max(1) } else { drawn };
     if div > 1 {
         slot.target = slot.target.map(|t| (t / div).max(1));
+    }
+    if slot.light {
+        slot.light_saved = drawn.saturating_sub(slot.target.unwrap());
     }
     // the root's belief (docs/search.md 3.8): full searches, or every one with belief_fast; a
     // reused tree's belief was its last decision's (`Tree::advance` cleared it)
@@ -536,9 +568,11 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     let tree = slot.trees[p].as_ref().unwrap();
     let root = tree.root;
     // value-only records waiting for this seat's next search (`ViewTarget::NextQ`, docs/search.md
-    // 3.6) take its root value (without forced walks, as a record's q); a minor search is too small
+    // 3.6) take its root value (without forced walks, as a record's q); a minor search is too small,
+    // so is an unrecorded light one (docs/search.md 3.10; a recorded light search is a target)
     let gumbel = tree.gumbel_on();
-    if !slot.view_wait.is_empty() && !slot.minor && slot.view_wait.iter().any(|w| w.1 as usize == p) {
+    let small = slot.minor || (slot.light && !seat.light_record);
+    if !slot.view_wait.is_empty() && !small && slot.view_wait.iter().any(|w| w.1 as usize == p) {
         let w = if gumbel {
             tree.gumbel_q()
         } else if tree.root_min() > 0 {
@@ -591,6 +625,19 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     let a = acts[i];
     // (a seat with `record` false - a league opponent - records nothing; the move is the same)
     let rec = cfg.record && seat.selfplay && seat.record && slot.full;
+    // the game's light decisions (docs/search.md 3.10; every search's simulations too)
+    slot.lg.sims_all += slot.sims as u64;
+    if slot.light {
+        slot.lg.decisions += 1;
+        slot.lg.sims += slot.sims as u64;
+        slot.lg.saved += slot.light_saved as u64;
+        n.light += 1;
+        n.light_saved += slot.light_saved as u64;
+        if rec {
+            slot.lg.recorded += 1;
+            n.light_recorded += 1;
+        }
+    }
     if rec {
         let pi: Vec<f32> = match seat.policy_target {
             PolicyTarget::Visits if tot > 0 => nv.iter().map(|&c| (c as f64 / tot as f64) as f32).collect(),
@@ -693,7 +740,8 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
 fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>) -> Result<(), String> {
     let g = slot.game.take().unwrap();
     let over = g.to_move().is_none();
-    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves) };
+    let light = if cfg.light_on() { Some(std::mem::take(&mut slot.lg)) } else { None };
+    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), light };
     let records = std::mem::take(&mut slot.records);
     let rq = std::mem::take(&mut slot.rq);
     slot.view_wait.clear();
@@ -706,8 +754,8 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
         let payload = g.deferred_payload().map_err(|e| format!("deferred_payload: {e}"))?;
         let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(ParkedRecord::park).collect() } else { Vec::new() };
         let bytes = records.iter().map(|r| r.bytes()).sum::<usize>() as u64;
-        let Done { gid, tag, n, steps, decisions, ext_moves, .. } = done;
-        parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes });
+        let Done { gid, tag, n, steps, decisions, ext_moves, light, .. } = done;
+        parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes, light });
         return Ok(());
     }
     results.push(emit(cfg.record, &g, over, done, records, rq, samples));
@@ -723,6 +771,7 @@ pub(super) struct Done {
     pub decisions: u32,
     pub ext_moves: u32,
     pub moves: Vec<(u8, u16, Vec<u16>)>,
+    pub light: Option<LightGame>,
 }
 
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
@@ -752,6 +801,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         samples: if emit { records.len() as u32 } else { 0 },
         tag: d.tag,
         moves: d.moves,
+        light: d.light,
     };
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();

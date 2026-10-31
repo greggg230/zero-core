@@ -823,6 +823,19 @@ impl SearchGame for ToyGame {
         self.round as u32
     }
 
+    /// Two light classes for the tests of light decisions (docs/search.md 3.10; read only by a
+    /// self-play seat with sims_light): the plow question and the counts decisions (sow, build,
+    /// trade, feast); placing a worker is never light.
+    const LIGHT_CLASSES: &'static [&'static str] = &["plow", "count"];
+
+    fn light_class(&self) -> Option<usize> {
+        match self.sub {
+            Sub::Place => None,
+            Sub::Plow => Some(0),
+            Sub::Sow(_) | Sub::Build(_) | Sub::Trade(..) | Sub::Feast(_) => Some(1),
+        }
+    }
+
     fn export_state(&self) -> String {
         self.to_json()
     }

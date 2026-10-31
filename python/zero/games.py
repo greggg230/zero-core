@@ -99,7 +99,8 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             sims_minor=None, select='visits', select_min_visits=0, select_c_visit=None, select_c_scale=None,
             root_min_visits=0, root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
             view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
-            root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None):
+            root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
+            sims_light=None, sims_light_fast=None, light_record=False, light_classes=None):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
@@ -124,7 +125,11 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     at the root; its move replaces temperature and the move rule). Sigma's transform gumbel_c_visit /
     gumbel_c_scale, None = the seat's: the 'cq' target's (cq_c_visit, cq_c_scale) when it records one -
     the target and the search share sigma - else its move rule's (select_c_* or cq_c_*); the dict always
-    holds the resolved transform, so the Rust seat never falls back to its own defaults."""
+    holds the resolved transform, so the Rust seat never falls back to its own defaults. sims_light: a
+    self-play seat's light decisions (docs/search.md 3.10; None = off: no keys, the seat of before) - the
+    budget of a full draw's search of one, sims_light_fast a fast draw's (None: sims_light), light_record
+    whether full draws are recorded, light_classes the indices of the game's LIGHT_CLASSES it searches
+    light (zero/light.py resolves a run's names)."""
     from .mcts import (check_belief, check_leaf_view, check_root_min, check_root_search, check_select,
                        check_select_transform, select_transform)
     check_select(select, select_min_visits)
@@ -159,6 +164,17 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
         from .mcts import BELIEF_CLIP
         d.update(belief_tilt=float(belief_tilt), belief_clip=float(BELIEF_CLIP if belief_clip is None else belief_clip),
                  belief_mix=float(belief_mix), belief_fast=bool(belief_fast))
+    if sims_light:
+        if not selfplay:
+            raise ValueError(f"sims_light {sims_light}: a self-play seat's setting (docs/search.md 3.10)")
+        if not light_classes:
+            raise ValueError(f'sims_light {sims_light}: no light_classes')
+        d.update(sims_light=int(sims_light), light_record=bool(light_record),
+                 light_classes=[int(c) for c in light_classes])
+        if sims_light_fast:
+            d['sims_light_fast'] = int(sims_light_fast)
+    elif sims_light_fast or light_record or light_classes:
+        raise ValueError('sims_light_fast / light_record / light_classes without sims_light (docs/search.md 3.10)')
     if root_search == 'gumbel':
         cv, cs = (float(cq_c_visit), float(cq_c_scale)) if policy_target == 'cq' else sel
         d.update(root_search='gumbel', gumbel_m=int(gumbel_m), gumbel_scale=float(gumbel_scale),

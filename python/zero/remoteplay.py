@@ -108,6 +108,14 @@ def _belief_of(cfg):
     hello reports and the run checks (docs/az.md 18.5)."""
     from .run import belief_keys
     return belief_keys(cfg, 'selfplay')
+
+
+def _light_of(cfg):
+    """A run's light decisions as its self-play driver plays them (`light.fingerprint`, '' when off):
+    what a worker's hello reports and the run checks (docs/az.md 22; an older checkout reports none)."""
+    from .games import info
+    from .light import fingerprint
+    return fingerprint(cfg, info(cfg['game']))
 BIG = 1 << 62                     # a remote driver's quota: its phases end by end_phase()
 RETRY_S = 60.0                    # a failed session is started again after this (env ZERO_RSP_RETRY_S)
 STALL_S = 300.0                   # a session silent this long is killed (its worker stalled)
@@ -666,6 +674,12 @@ class RemotePlay:
                 for e in ends:
                     lg = merge(lg, e.get('league'))
                 out['league'] = lg
+            if any('light' in e for e in ends):        # light decisions: its accepted games' (light.tally)
+                from .light import merge as lmerge
+                lt = None
+                for e in ends:
+                    lt = lmerge(lt, e.get('light'))
+                out['light'] = lt
         if self.mode == 'matches':
             with self.mu:
                 outstanding = sum(len(s.assigned) for s in self.sess if s is not None)
@@ -740,6 +754,12 @@ class RemotePlay:
                     # a checkout without the root's belief (or reading the settings otherwise) would deal
                     # its worlds uniformly in silence: never used (docs/az.md 18.5)
                     s.no_belief = ev.get('belief')
+                want_l = _light_of(self.R.cfg) if self.mode == 'selfplay' else ''
+                if (want_l or ev.get('light')) and (ev.get('light') or '') != want_l:
+                    # a checkout without light decisions (or reading the settings otherwise) would search
+                    # every decision with the full budget - or another one - in silence: never used
+                    # (docs/az.md 22)
+                    s.no_light = ev.get('light')
                 if self.fails or s.k == 0:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
@@ -844,6 +864,13 @@ class RemotePlay:
                 self.next_try[k] = now + max(self.retry_s, 600.0)
                 self.fail_log(f'worker {k} REFUSED: its checkout has no self-play league (the run plays one, '
                               f'selfplay_league {self.R.cfg["selfplay_league"]}); killed, retried in 10 minutes')
+                s.kill()
+                continue
+            if hasattr(s, 'no_light'):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.fail_log(f'worker {k} REFUSED: its checkout searches light decisions as {s.no_light!r}, the run '
+                              f'as {_light_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 22); killed, '
+                              f'retried in 10 minutes')
                 s.kill()
                 continue
             if hasattr(s, 'no_belief'):
@@ -1481,6 +1508,7 @@ class Worker:
                 self.drv.enqueue(tag, spec)
             self.backlog = []
             self.info = R.info
+            self.light_on = self.mode == 'selfplay' and R.light is not None     # light decisions (zero/light.py)
         else:
             self.evr.set_weights(m.state_dict())
         keep = set()
@@ -1566,6 +1594,9 @@ class Worker:
             if self.lg_on:
                 from .league import tally
                 tally([row], ph['league'])
+            if ph.get('light') is not None:
+                from .light import tally as ltally
+                ltally([row], ph['light'])
         die = int(self.test.get('die_after_accepts') or 0)
         if die and ph['accepted'] >= die:
             self.note('test: dying with accepted games in no shard yet')
@@ -1704,6 +1735,8 @@ class Worker:
         ph['t_close'] = now
         ph['leaves_close'] = st['leaves']
         extra = {'league': ph['league']} if self.lg_on else {}
+        if ph.get('light') is not None:
+            extra['light'] = ph['light']
         self.emit('end', iter=ph['it'], games=ph['games'], samples=ph['samples'], shards=w['shards'], bytes=w['bytes'],
                   leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - bo, 2),
                   backoff_s=round(bo, 2), in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
@@ -1734,6 +1767,9 @@ class Worker:
         ph = {'it': it, 'games': 0, 'samples': 0, 't0': _now(), 'backoff': 0.0, 'bo_t0': 0.0, 'ending': False,
               't_lock': 0.0, 'leaves0': st0['leaves'], 'bw': bw, 'closed': False, 'accepted': 0,
               'linger_games': 0, 'linger_prev': getattr(self, 'linger_prev', None), 'league': {}}
+        if getattr(self, 'light_on', False):
+            from .light import new_tally
+            ph['light'] = new_tally()
         evs = {'m': self.evr, **self.lg_evs} if self.lg_on else {'m': self.evr}
         self.linger_prev = None
         for sd in self.held_samples:               # co-training: rows finished while lingering, sent already
@@ -1799,7 +1835,8 @@ class Worker:
             # (the tests: an older checkout, without the league / the root's belief)
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
                       mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),
-                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}))
+                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}),
+                      **({} if self.test.get('no_light') else {'light': _light_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

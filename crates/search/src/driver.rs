@@ -361,12 +361,25 @@ pub struct NnSeat {
     pub belief_fast: bool,
     /// The root search (docs/search.md 3.7; default `RootSearch::Puct`).
     pub root_search: RootSearch,
+    /// Light decisions (docs/search.md 3.10; None = off, the default: the hook is never read): a
+    /// self-play seat's search of a light decision (`SearchGame::light_class` in `light_classes`,
+    /// not minor) whose playout-cap draw was full takes this many simulations instead of `sims`.
+    pub sims_light: Option<u32>,
+    /// ... and one whose draw was fast this many instead of `sims_fast` (None: `sims_light`).
+    pub sims_light_fast: Option<u32>,
+    /// Whether light decisions are recorded (default false: like a minor decision, never recorded,
+    /// no root noise, no root belief or floor, no value-only record's next q; true: a full draw is
+    /// recorded as usual, its targets from the light search, a fast draw is a fast search).
+    pub light_record: bool,
+    /// The light classes this seat searches light (bit k = `SearchGame::LIGHT_CLASSES[k]`); with
+    /// `sims_light` at least one.
+    pub light_classes: u64,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, sims_light: None, sims_light_fast: None, light_record: false, light_classes: 0 }
     }
 
     /// The belief settings' check (`Driver::new`; the bindings' messages): tilt finite >= 0, clip
@@ -389,6 +402,77 @@ impl NnSeat {
     pub fn takes_belief(&self, full: bool) -> bool {
         self.belief_tilt > 0.0 && (full || self.belief_fast)
     }
+
+    /// The light-decision settings' check (`Driver::new`, docs/search.md 3.10) for a game named
+    /// `game` with `classes` light classes: each setting refused where it would do nothing (a silent
+    /// no-op is a bug) - without `sims_light`, on an evaluation seat, for a game without light
+    /// classes, without a class, a class the game does not have, `sims_light_fast` where every draw is
+    /// full - or where it would not be light (more simulations than the budget it replaces).
+    pub fn check_light(&self, game: &str, classes: usize) -> Result<(), String> {
+        let Some(sl) = self.sims_light else {
+            if self.sims_light_fast.is_some() || self.light_record || self.light_classes != 0 {
+                return Err("sims_light_fast / light_record / light_classes without sims_light: light decisions are off (sims_light 0 / absent), the settings would do nothing".into());
+            }
+            return Ok(());
+        };
+        if !self.selfplay {
+            return Err(format!("sims_light {sl}: a self-play seat's setting (an evaluation seat searches every decision with its budget)"));
+        }
+        if classes == 0 {
+            return Err(format!("sims_light {sl}: {game} declares no light decisions (SearchGame::LIGHT_CLASSES)"));
+        }
+        if classes > 64 {
+            return Err(format!("{game}: {classes} light classes (at most 64)"));
+        }
+        if self.light_classes == 0 {
+            return Err(format!("sims_light {sl}: no light class selected (light_classes; {game} has {classes})"));
+        }
+        if classes < 64 && self.light_classes >> classes != 0 {
+            return Err(format!("light_classes {:#x}: {game} has {classes} light classes", self.light_classes));
+        }
+        if sl == 0 || self.sims_light_fast == Some(0) {
+            return Err("sims_light / sims_light_fast 0: at least 1 (off = no sims_light)".into());
+        }
+        if sl > self.sims {
+            return Err(format!("sims_light {sl} > sims {}: a light decision's budget is at most the one it replaces", self.sims));
+        }
+        if let Some(f) = self.sims_light_fast {
+            let Some(sf) = self.sims_fast else {
+                return Err(format!("sims_light_fast {f} without sims_fast: every search of the seat is a full one"));
+            };
+            if f > sf {
+                return Err(format!("sims_light_fast {f} > sims_fast {sf}: a light decision's budget is at most the one it replaces"));
+            }
+        } else if let Some(sf) = self.sims_fast {
+            if sl > sf {
+                return Err(format!("sims_light {sl} > sims_fast {sf} with no sims_light_fast: a fast draw's light search would take more than the fast budget it replaces (set sims_light_fast)"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The budget of this seat's search of a light decision of class `class` (None: not light for
+    /// it: off, an evaluation seat, a class it does not select): `full` = the playout-cap draw.
+    pub fn light_budget(&self, class: Option<usize>, full: bool) -> Option<u32> {
+        let sl = self.sims_light?;
+        let c = class?;
+        if !self.selfplay || c >= 64 || (self.light_classes >> c) & 1 == 0 {
+            return None;
+        }
+        Some(if full { sl } else { self.sims_light_fast.unwrap_or(sl) })
+    }
+}
+
+/// One game's light decisions (`GameResult::light`, docs/search.md 3.10): the light decisions its
+/// network seats decided, those recorded, their simulations, the simulations they saved (their drawn
+/// budgets' minus theirs) and every search's simulations in the game (light or not).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LightGame {
+    pub decisions: u32,
+    pub recorded: u32,
+    pub sims: u64,
+    pub saved: u64,
+    pub sims_all: u64,
 }
 
 /// The default belief clip R (`NnSeat::belief_clip`).
@@ -448,6 +532,14 @@ pub struct DriverCfg {
     pub paired: bool,
 }
 
+impl DriverCfg {
+    /// A seat of the driver searches light decisions (`NnSeat::sims_light`, docs/search.md 3.10): its
+    /// result rows carry `GameResult::light`.
+    pub fn light_on(&self) -> bool {
+        self.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if n.sims_light.is_some()))
+    }
+}
+
 /// A finished game (docs/search.md 2.5).
 #[derive(Clone, Debug)]
 pub struct GameResult {
@@ -469,6 +561,9 @@ pub struct GameResult {
     /// `DriverCfg::move_log`: the game's first real moves (seat, action, legal
     /// actions), the external seats' answers excluded; empty when off.
     pub moves: Vec<(u8, u16, Vec<u16>)>,
+    /// The game's light decisions (docs/search.md 3.10) when a seat of the driver has `sims_light`;
+    /// None otherwise (the rows of before).
+    pub light: Option<LightGame>,
 }
 
 /// One recorded root decision with its targets.
@@ -660,6 +755,7 @@ struct Parked<G: SearchGame> {
     payload: String,
     /// Memory held by the records (`DriverStats::parked_bytes`).
     bytes: u64,
+    light: Option<LightGame>,
 }
 
 enum Eval {
@@ -702,6 +798,12 @@ struct Slot<G: SearchGame> {
     full: bool,
     /// The current decision is minor (searched with `sims_minor`).
     minor: bool,
+    /// The current decision is light (searched with `sims_light` / `sims_light_fast`, docs/search.md
+    /// 3.10) and the simulations that saved against its drawn budget.
+    light: bool,
+    light_saved: u32,
+    /// The game's light decisions so far (`GameResult::light`).
+    lg: LightGame,
     /// The current search takes the root's belief (`NnSeat::takes_belief`, docs/search.md 3.8).
     belief: bool,
     decisions: u32,
@@ -747,6 +849,9 @@ impl<G: SearchGame> Slot<G> {
             target: None,
             full: true,
             minor: false,
+            light: false,
+            light_saved: 0,
+            lg: LightGame::default(),
             belief: false,
             decisions: 0,
             ext_moves: 0,
@@ -860,6 +965,10 @@ struct Counters {
     restarts: AtomicU64,
     recorded: AtomicU64,
     minor: AtomicU64,
+    /// Light decisions decided, recorded, simulations saved (docs/search.md 3.10).
+    light: AtomicU64,
+    light_recorded: AtomicU64,
+    light_saved: AtomicU64,
     /// Value-only rows sent with leaves (`LeafView::Root`) and value-only samples recorded.
     view_rows: AtomicU64,
     view_recorded: AtomicU64,
@@ -942,6 +1051,11 @@ pub struct DriverStats {
     pub recorded: u64,
     /// Minor decisions decided by network seats with `sims_minor`.
     pub minor: u64,
+    /// Light decisions decided by self-play seats with `sims_light`, those recorded, and the
+    /// simulations they saved (docs/search.md 3.10).
+    pub light: u64,
+    pub light_recorded: u64,
+    pub light_saved: u64,
     /// Value-only rows of the network batches (`LeafView::Root`: one per leaf of a seat other
     /// than its tree's root decider; `leaves` counts the leaves) and value-only samples recorded
     /// (`NnSeat::view_samples`; `recorded` counts the decisions).
@@ -1043,6 +1157,7 @@ impl<G: SearchGame> Driver<G> {
                         return Err(format!("root_min_visits_max_actions {}: at least 2 (a root of one option is not searched)", n.root_min_visits_max_actions));
                     }
                     NnSeat::check_belief(n.belief_tilt, n.belief_clip, n.belief_mix)?;
+                    n.check_light(G::NAME, G::LIGHT_CLASSES.len())?;
                     if n.belief_tilt > 0.0 && G::aux_width() == 0 {
                         return Err(format!("belief_tilt {}: {} has no auxiliary targets (SearchGame::AUX) for a belief to predict", n.belief_tilt, G::NAME));
                     }
@@ -1502,7 +1617,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new() };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), light: p.light };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
@@ -1566,6 +1681,9 @@ impl<G: SearchGame> Driver<G> {
             restarts: c.restarts.load(Ordering::Relaxed),
             recorded: c.recorded.load(Ordering::Relaxed),
             minor: c.minor.load(Ordering::Relaxed),
+            light: c.light.load(Ordering::Relaxed),
+            light_recorded: c.light_recorded.load(Ordering::Relaxed),
+            light_saved: c.light_saved.load(Ordering::Relaxed),
             view_rows: c.view_rows.load(Ordering::Relaxed),
             view_recorded: c.view_recorded.load(Ordering::Relaxed),
             belief_rows: c.belief_rows.load(Ordering::Relaxed),

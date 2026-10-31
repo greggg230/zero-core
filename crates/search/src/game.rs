@@ -52,6 +52,9 @@ pub const MAX_SEATS: usize = 8;
 /// * **Belief-weighted deals** (optional; docs/search.md 3.8): `determinize_with(viewer, rng,
 ///   belief)` is `determinize` with the hidden cards drawn by weights from the network's
 ///   prediction of the auxiliary targets for `viewer` (`Belief`); default: `determinize`.
+/// * **Light decisions** (optional; docs/search.md 3.10): `LIGHT_CLASSES` names classes of
+///   decisions and `light_class()` the pending decision's; a self-play seat with `sims_light`
+///   searches the classes it selects with that budget (recorded or not, `light_record`).
 pub trait SearchGame: Clone + Send + Sync + 'static {
     /// Settings shared by all games of one driver, parsed from a JSON string.
     type Spec: Clone + Send + Sync + 'static;
@@ -96,6 +99,19 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     /// Default 1: every decision gets the seat's budget.
     fn sims_divisor(&self) -> u32 {
         1
+    }
+    /// Names of the game's classes of light decisions (docs/search.md 3.10; at most 64): the
+    /// decisions a self-play seat with `sims_light` may search with a small budget, recorded or not
+    /// (`light_record`), the seat choosing which classes (`light_classes`). Empty (the default): the
+    /// game has none, and a seat asking for them is refused.
+    const LIGHT_CLASSES: &'static [&'static str] = &[];
+    /// The pending decision's light class (an index into `LIGHT_CLASSES`), None if it is not a light
+    /// decision (MTG Zero: a priority decision with an empty stack outside the decider's own main
+    /// phases, a "timing window", by step and whose turn). Read only for a self-play seat with
+    /// `sims_light`, at the start of its search of a decision; never by evaluation seats. Default:
+    /// None.
+    fn light_class(&self) -> Option<usize> {
+        None
     }
     /// The game is over (`to_move()` None) but its result comes from outside: episodes of
     /// another game decide it (docs/search.md 1.1). Until `resolve`, the search treats this

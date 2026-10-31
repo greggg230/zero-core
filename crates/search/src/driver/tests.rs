@@ -2333,3 +2333,308 @@ fn gumbel_with_a_root_belief() {
     assert_eq!(rows0, (0, 0));
     assert_ne!(records_digest(&s0), records_digest(&s1), "the belief changed nothing in the Gumbel searches");
 }
+
+// ---------------------------------------------------------------- light decisions (docs/search.md 3.10)
+
+fn with_light(seat: SeatCfg, sims: Option<u32>, fast: Option<u32>, record: bool, classes: u64) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.sims_light = sims;
+            s.sims_light_fast = fast;
+            s.light_record = record;
+            s.light_classes = classes;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+/// The toy whose light-class hook panics: a driver must never read it without sims_light.
+#[derive(Clone)]
+struct NoLightToy(ToyGame);
+
+impl SearchGame for NoLightToy {
+    type Spec = <ToyGame as SearchGame>::Spec;
+    const NAME: &'static str = "nolighttoy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    const LIGHT_CLASSES: &'static [&'static str] = &["plow", "count"];
+    fn parse_spec(json: &str) -> Result<Self::Spec, String> {
+        ToyGame::parse_spec(json)
+    }
+    fn new_game(spec: &Self::Spec, players: usize, seed: u64) -> Result<Self, String> {
+        ToyGame::new_game(spec, players, seed).map(NoLightToy)
+    }
+    fn num_players(&self) -> usize {
+        self.0.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)
+    }
+    fn force_chance(&mut self, forced: &[u64]) {
+        self.0.force_chance(forced)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.0.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.0.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn light_class(&self) -> Option<usize> {
+        panic!("light_class read without sims_light")
+    }
+}
+
+/// The toy's class of a decision from its legal actions (`ToyGame::light_class`: the plow question
+/// [PLOW, SKIP], the counts decisions INC0 / INC1 / DONE, else a placement).
+fn toy_class(legal: &[u16]) -> Option<usize> {
+    if legal.contains(&crate::toy::A_PLOW) {
+        Some(0)
+    } else if legal.iter().all(|&a| a >= crate::toy::A_INC0) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Self-play of 24 toy games (seed 2026) with the move log on: results, records, stats.
+fn light_selfplay<G: SearchGame>(seat: SeatCfg, threads: usize) -> (Vec<GameResult>, Vec<Record>, DriverStats) {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.threads = threads;
+    c.move_log = 100_000;
+    let mut d = Driver::<G>::new(c).unwrap();
+    let (r, s) = run(&mut d);
+    (r, s, d.stats())
+}
+
+#[test]
+fn light_settings_are_checked() {
+    let ok = |s: SeatCfg| Driver::<ToyGame>::new(cfg(vec![s], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).map(|_| ());
+    let both = 0b11;
+    assert!(ok(with_light(nn(0, 16, true), Some(2), None, false, both)).is_ok());
+    assert!(ok(with_light(nn(0, 16, true), Some(8), Some(2), true, 0b01)).is_ok());
+    let refused = [
+        // an evaluation seat searches every decision with its budget
+        (with_light(nn(0, 16, false), Some(2), None, false, both), "self-play seat"),
+        (with_light(nn(0, 16, true), Some(2), None, false, 0), "no light class"),
+        (with_light(nn(0, 16, true), Some(2), None, false, 0b100), "has 2 light classes"),
+        (with_light(nn(0, 16, true), Some(0), None, false, both), "at least 1"),
+        (with_light(nn(0, 16, true), Some(2), Some(0), false, both), "at least 1"),
+        (with_light(nn(0, 16, true), Some(32), None, false, both), "at most the one it replaces"),
+        // nn(): sims_fast = sims / 4 = 4
+        (with_light(nn(0, 16, true), Some(8), None, false, both), "set sims_light_fast"),
+        (with_light(nn(0, 16, true), Some(8), Some(5), false, both), "at most the one it replaces"),
+        (with_light(nn(0, 16, true), None, Some(2), false, 0), "without sims_light"),
+        (with_light(nn(0, 16, true), None, None, true, 0), "without sims_light"),
+        (with_light(nn(0, 16, true), None, None, false, both), "without sims_light"),
+    ];
+    for (s, want) in refused {
+        let e = ok(s.clone()).expect_err(&format!("{s:?} accepted"));
+        assert!(e.contains(want), "{e:?} (wanted {want:?})");
+    }
+    // sims_light_fast where every draw is full (no sims_fast)
+    let mut full = NnSeat::eval(0, 16);
+    full.selfplay = true;
+    let e = ok(with_light(SeatCfg::Nn(full), Some(4), Some(2), false, both)).unwrap_err();
+    assert!(e.contains("without sims_fast"), "{e}");
+    // a game without light classes
+    let e = Driver::<MinorToy>::new(cfg(vec![with_light(nn(0, 16, true), Some(2), None, false, 1)], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).map(|_| ()).unwrap_err();
+    assert!(e.contains("declares no light decisions"), "{e}");
+}
+
+#[test]
+fn light_decisions_off_change_nothing() {
+    // without sims_light the hook is never read (it panics here) and the records are the golden ones
+    let (res, recs, st) = light_selfplay::<NoLightToy>(nn(0, 16, true), 2);
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    assert!(res.iter().all(|r| r.light.is_none()), "a result row of a driver without sims_light has light");
+    assert_eq!((st.light, st.light_recorded, st.light_saved), (0, 0, 0));
+    // the toy itself declares classes: still the golden records
+    let (_, recs) = golden_selfplay(nn(0, 16, true));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+}
+
+#[test]
+fn unrecorded_light_decisions_take_their_budget_and_no_records() {
+    let seat = with_light(nn(0, 16, true), Some(1), None, false, 0b11);
+    let (res, recs, st) = light_selfplay::<ToyGame>(seat.clone(), 2);
+    let (_, recs0, st0) = light_selfplay::<ToyGame>(nn(0, 16, true), 2);
+    assert_eq!(res.len(), 24);
+    assert!(res.iter().all(|r| r.over));
+    // the light decisions by the move log (every searched decision is a network seat's here)
+    let mut light = 0u64;
+    for r in &res {
+        let l = r.light.expect("light rows with sims_light");
+        let n = r.moves.iter().filter(|m| m.2.len() >= 2 && toy_class(&m.2).is_some()).count() as u64;
+        assert_eq!(l.decisions as u64, n, "game {}: light decisions vs the move log", r.gid);
+        assert_eq!(l.recorded, 0);
+        // budget 1 whatever the draw (no sims_light_fast); saved = the drawn budget (16 or 4) - 1
+        assert_eq!(l.sims, l.decisions as u64);
+        assert!(l.saved >= 3 * l.decisions as u64 && l.saved <= 15 * l.decisions as u64);
+        light += n;
+    }
+    assert!(light > 0);
+    assert_eq!(st.light, light);
+    assert_eq!(st.light_recorded, 0);
+    assert_eq!(st.light_saved, res.iter().map(|r| r.light.unwrap().saved).sum::<u64>());
+    // every simulation of the driver is some game's (no restarts here)
+    assert_eq!(st.sims, res.iter().map(|r| r.light.unwrap().sims_all).sum::<u64>());
+    // never recorded: only placements are; fewer leaves than without
+    assert!(!recs.is_empty() && recs.iter().all(|r| toy_class(&r.opts).is_none()), "a light decision was recorded");
+    assert!(recs0.iter().any(|r| toy_class(&r.opts).is_some()));
+    assert!(st.leaves < st0.leaves, "{} leaves with sims_light vs {}", st.leaves, st0.leaves);
+    // reproducible across threads
+    let (r4, s4, st4) = light_selfplay::<ToyGame>(seat, 4);
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples, r.decisions, r.light);
+    assert_eq!(res.iter().map(key).collect::<Vec<_>>(), r4.iter().map(key).collect::<Vec<_>>());
+    assert_eq!(records_digest(&recs), records_digest(&s4));
+    assert_eq!((st.light, st.light_saved), (st4.light, st4.light_saved));
+}
+
+#[test]
+fn recorded_light_decisions_record_their_full_draws() {
+    // full draws (p_full 0.5) at 8 simulations, recorded; fast draws at 2, not recorded
+    let (res, recs, st) = light_selfplay::<ToyGame>(with_light(nn(0, 16, true), Some(8), Some(2), true, 0b11), 2);
+    let (mut dec, mut rec) = (0u64, 0u64);
+    for r in &res {
+        let l = r.light.unwrap();
+        assert_eq!(l.sims, 8 * l.recorded as u64 + 2 * (l.decisions - l.recorded) as u64, "game {}", r.gid);
+        assert_eq!(l.saved, (16 - 8) * l.recorded as u64 + (4 - 2) * (l.decisions - l.recorded) as u64);
+        dec += l.decisions as u64;
+        rec += l.recorded as u64;
+    }
+    assert!(rec > 0 && rec < dec, "{rec} of {dec} light decisions recorded");
+    assert_eq!((st.light, st.light_recorded), (dec, rec));
+    // the recorded light decisions are records: as many as the rows say
+    let light_recs = recs.iter().filter(|r| toy_class(&r.opts).is_some()).count() as u64;
+    assert_eq!(light_recs, rec);
+    assert_eq!(recs.len() as u32, res.iter().map(|r| r.samples).sum::<u32>());
+}
+
+#[test]
+fn light_classes_select_the_decisions_and_minor_comes_first() {
+    // only the plow question (class 0): the counts decisions are searched and recorded as before
+    let (res, recs, _) = light_selfplay::<ToyGame>(with_light(nn(0, 16, true), Some(1), None, false, 0b01), 2);
+    for r in &res {
+        let n = r.moves.iter().filter(|m| m.2.len() >= 2 && toy_class(&m.2) == Some(0)).count() as u32;
+        assert_eq!(r.light.unwrap().decisions, n);
+    }
+    assert!(recs.iter().all(|r| toy_class(&r.opts) != Some(0)));
+    assert!(recs.iter().any(|r| toy_class(&r.opts) == Some(1)), "the counts decisions are no longer recorded");
+    // a minor decision stays minor: the minor toy's two-option decisions (the plow question among
+    // them) take sims_minor and count as minor, never light
+    let seat = with_minor(with_light(nn(0, 16, true), Some(2), None, false, 0b11), Some(1));
+    let (res, _, st) = light_selfplay::<LightMinorToy>(seat, 2);
+    let (mut light, mut minor) = (0u64, 0u64);
+    for r in &res {
+        light += r.moves.iter().filter(|m| m.2.len() >= 3 && toy_class(&m.2).is_some()).count() as u64;
+        minor += r.moves.iter().filter(|m| m.2.len() == 2).count() as u64;
+        assert_eq!(r.light.unwrap().sims, 2 * r.light.unwrap().decisions as u64);
+    }
+    assert!(light > 0 && minor > 0);
+    assert_eq!((st.light, st.minor), (light, minor));
+}
+
+/// The minor toy (two-option decisions minor) with the toy's light classes.
+#[derive(Clone)]
+struct LightMinorToy(ToyGame);
+
+impl SearchGame for LightMinorToy {
+    type Spec = <ToyGame as SearchGame>::Spec;
+    const NAME: &'static str = "lightminortoy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    const LIGHT_CLASSES: &'static [&'static str] = ToyGame::LIGHT_CLASSES;
+    fn parse_spec(json: &str) -> Result<Self::Spec, String> {
+        ToyGame::parse_spec(json)
+    }
+    fn new_game(spec: &Self::Spec, players: usize, seed: u64) -> Result<Self, String> {
+        ToyGame::new_game(spec, players, seed).map(LightMinorToy)
+    }
+    fn num_players(&self) -> usize {
+        self.0.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)
+    }
+    fn force_chance(&mut self, forced: &[u64]) {
+        self.0.force_chance(forced)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.0.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.0.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn minor_decision(&self) -> bool {
+        let mut v = Vec::new();
+        self.0.legal_actions(&mut v);
+        v.len() == 2
+    }
+    fn light_class(&self) -> Option<usize> {
+        self.0.light_class()
+    }
+}
+
+#[test]
+fn evaluation_seats_and_matches_ignore_light_decisions() {
+    // a match: a self-play seat with light decisions against an evaluation seat - only the
+    // self-play seat's decisions are light (the evaluation seat's searches keep their budget)
+    let seats = vec![with_light(nn(0, 16, true), Some(1), None, false, 0b11), nn(1, 16, false)];
+    let mut c = cfg(seats, (0..24).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect(), &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.record = false;
+    c.move_log = 100_000;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (res, smp) = run(&mut d);
+    assert!(smp.is_empty());
+    let mut light = 0u64;
+    for r in &res {
+        let ls = if r.gid % 2 == 0 { 0 } else { 1 };
+        let n = r.moves.iter().filter(|m| m.0 as usize == ls && m.2.len() >= 2 && toy_class(&m.2).is_some()).count() as u32;
+        assert_eq!(r.light.unwrap().decisions, n, "game {}: only the light seat's decisions", r.gid);
+        light += n as u64;
+    }
+    assert!(light > 0);
+    // the same match with two evaluation seats: no light rows at all
+    let mut c = cfg(vec![nn(0, 16, false), nn(1, 16, false)], vec![vec![0, 1]; 4], &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    c.record = false;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (res, _) = run(&mut d);
+    assert!(res.iter().all(|r| r.light.is_none()) && d.stats().light == 0);
+}

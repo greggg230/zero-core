@@ -62,7 +62,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import auxtarget as AUX, elo, games as G, league as L, package, runctl
+from . import auxtarget as AUX, elo, games as G, league as L, light as LT, package, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import NetEvaluator, drive, use_amp
@@ -99,6 +99,14 @@ DEFAULTS = dict(
     # simulations of the game's minor decisions in self-play (SearchGame::minor_decision, e.g.
     # MTG's choice of the land to tap), never recorded; 0 = searched like the others
     sims_minor=0,
+    # light decisions in self-play (zero/light.py, docs/search.md 3.10, docs/az.md 22): the game's
+    # classes of decisions that rarely matter (SearchGame::LIGHT_CLASSES; MTG Zero: its timing
+    # windows), selfplay_light_classes of them ('all', or comma-separated names / globs, '-' removes:
+    # 'all,-opp_end'), searched with selfplay_sims_light simulations (a full draw) and
+    # selfplay_sims_light_fast (a fast draw; 0 = selfplay_sims_light); selfplay_light_record 0 = never
+    # recorded (a minor decision's treatment), 1 = full draws recorded with the light search's targets.
+    # Self-play seats only (evaluation unchanged); 0 = off: nothing changes. Single-game runs only
+    selfplay_sims_light=0, selfplay_sims_light_fast=0, selfplay_light_record=0, selfplay_light_classes='all',
     # policy target of the recorded (full-search) decisions: 'visits' (the root visit
     # distribution) | 'cq' (Gumbel AlphaZero's completed-Q target softmax(ln P0 + (cq_c_visit +
     # max N) cq_c_scale completedQ), docs/search.md 3.1); the search itself is the same
@@ -428,6 +436,8 @@ class Run:
         self.aux_w, self.aux = aux_settings(cfg, self.info)
         self.heldout = None                        # zero.heldout.HeldOut with heldout_shards (loaded once)
         self.anchor_sha = {}                       # anchor path -> ((size, mtime), sha256)
+        # light decisions in self-play (zero/light.py): the resolved settings, None when off
+        self.light = LT.check(cfg, self.info)
 
     def check(self, where=''):
         if self.pw is not None:
@@ -464,7 +474,8 @@ class Run:
                              view_samples=c.get('selfplay_view_samples', 0.0),
                              view_sample_target=c.get('view_sample_target', 'next_q'),
                              root_search=c.get('selfplay_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
-                             gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), **belief_keys(c, 'selfplay'))
+                             gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), **belief_keys(c, 'selfplay'),
+                             **LT.seat_keys(c, getattr(self, 'info', None)))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
@@ -597,6 +608,7 @@ class Run:
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
+        self.light_metrics(out, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -618,6 +630,15 @@ class Run:
         d = lambda k: st.get(k, 0) - ((st0 or {}).get(k, 0))           # noqa: E731
         out['view'] = {'rows': d('view_rows'), 'rows_per_leaf': round(d('view_rows') / max(1, leaves), 4),
                        'samples': d('view_recorded')}
+
+    def light_metrics(self, out, results, remote=None):
+        """Self-play's light-decision metrics (zero/light.py), only when they are on (the metrics of
+        before otherwise): `light` = the phase's finished games' light decisions per game, their share
+        of the searched decisions, recorded / unrecorded, simulations taken and saved - this machine's
+        games and the remote's (`remote`: its tally, light.tally)."""
+        if not getattr(self, 'light', None):
+            return
+        out['light'] = LT.summary(LT.merge(LT.tally(results), remote))
 
     def belief_metrics(self, out, st, st0, results):
         """Self-play's root-belief metrics (docs/az.md 18), only when it is on (the metrics of before
@@ -761,6 +782,7 @@ class Run:
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
+        self.light_metrics(out, results, rem.pop('light', None))
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
@@ -1418,6 +1440,8 @@ class Run:
                 raise HeldOutRefused(f'heldout_shards: {e}') from None
         done = {m['iter'] for m in read_metrics(run)}
         self.log(f'run {run} starting after iter {start}; cfg {json.dumps(c)}')
+        if self.light:
+            self.log(LT.describe(self.light))
         if c.get('eval_remote'):
             from .remote import RemoteEval
             self.remote = RemoteEval(self, c['eval_remote'])
@@ -1641,6 +1665,13 @@ def resolve_config(args, saved):
             raise SystemExit(f'{k} {w!r}: a number >= 0 (an auxiliary target weight; 0 = off, docs/az.md 15)')
     if isinstance(cfg.get('resolver_cfg'), dict) and L.enabled(cfg['resolver_cfg']):
         raise SystemExit('resolver_cfg: selfplay_league: single-game runs only (not a co-training resolver)')
+    # light decisions (zero/light.py): classes the game declares, budgets that are light, no setting
+    # that would do nothing; single-game runs only
+    LT.check(cfg, G.info(cfg['game']))
+    if cfg.get('resolver') and int(cfg.get('selfplay_sims_light', 0) or 0):
+        raise SystemExit('selfplay_sims_light: single-game runs only (not a co-training run)')
+    if isinstance(cfg.get('resolver_cfg'), dict) and int(cfg['resolver_cfg'].get('selfplay_sims_light', 0) or 0):
+        raise SystemExit('resolver_cfg: selfplay_sims_light: single-game runs only (not a co-training resolver)')
     return cfg
 
 

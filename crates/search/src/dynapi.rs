@@ -19,10 +19,12 @@ pub struct GameInfo {
     pub bots: Vec<&'static str>,
     /// Auxiliary target segments (name, width) (`SearchGame::AUX`; empty: none).
     pub aux: Vec<(&'static str, usize)>,
+    /// Light decision classes (`SearchGame::LIGHT_CLASSES`; empty: none).
+    pub light: Vec<&'static str>,
 }
 
 pub fn game_info<G: SearchGame>() -> GameInfo {
-    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>(), aux: G::AUX.to_vec() }
+    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>(), aux: G::AUX.to_vec(), light: G::LIGHT_CLASSES.to_vec() }
 }
 
 /// One game, any type.
@@ -44,6 +46,8 @@ pub trait DynGame: Send + Sync {
     fn determinize_with(&mut self, viewer: usize, seed: u64, pred: &[f32], tilt: f64, clip: f64) -> Result<(), String>;
     fn encode(&self, viewer: usize) -> Vec<f32>;
     fn rounds(&self) -> u32;
+    /// `SearchGame::light_class` (None once over).
+    fn light_class(&self) -> Option<usize>;
     fn export_state(&self) -> String;
     fn apply_external(&mut self, payload: &str) -> Result<Vec<u64>, String>;
     /// Deferred results and teams (`SearchGame::deferred`, `deferred_payload`, `resolve`,
@@ -111,6 +115,12 @@ impl<G: SearchGame> DynGame for G {
     }
     fn rounds(&self) -> u32 {
         SearchGame::rounds(self)
+    }
+    fn light_class(&self) -> Option<usize> {
+        if SearchGame::to_move(self).is_none() {
+            return None;
+        }
+        SearchGame::light_class(self)
     }
     fn export_state(&self) -> String {
         SearchGame::export_state(self)
