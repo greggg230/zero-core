@@ -452,6 +452,12 @@ pub struct DriverCfg {
     /// between the two games of a pair (zero.h2h, the Elo matches) plays each deal once from each
     /// seat. Off (the default): every game's streams derive from its gid (nothing changes).
     pub paired: bool,
+    /// Sparse network batches (docs/search.md 2.2): every row's features as its non-zero (index,
+    /// value) pairs (`Batch::xs_off`, `xs_idx`, `xs_val`; `x` empty) instead of `NUM_FEATURES` floats -
+    /// an MTG row is ~150 non-zeros of 37,620: the host's copies of the dense rows bound the
+    /// lookahead's big batches (docs/search.md 3.9). The same features, the same games. Off (the
+    /// default): dense rows (nothing changes).
+    pub sparse: bool,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -528,6 +534,11 @@ pub struct Batch {
     /// Network batches: the kind of every row (`ROW_LEAF`, or an extra row's kind: `ROW_VALUE`,
     /// `ROW_BELIEF`).
     pub extra: Vec<u8>,
+    /// Sparse network batches (`DriverCfg::sparse`; else empty): row b's non-zero features are
+    /// `xs_idx[xs_off[b]..xs_off[b + 1]]` (feature indexes, ascending) with values `xs_val[..]`.
+    pub xs_off: Vec<i64>,
+    pub xs_idx: Vec<u32>,
+    pub xs_val: Vec<f32>,
     /// External batches: the exported state per row.
     pub states: Vec<String>,
 }
@@ -543,6 +554,13 @@ struct LeafBuf {
     opt_action: Vec<i32>,
     extra: Vec<u8>,
     states: Vec<String>,
+    /// Sparse rows (`DriverCfg::sparse`): per row its non-zeros' count, their indexes and values; a
+    /// row is encoded into `scratch` (zeroed) and sealed into these (`seal`).
+    sparse: bool,
+    xs_nnz: Vec<u32>,
+    xs_idx: Vec<u32>,
+    xs_val: Vec<f32>,
+    scratch: Vec<f32>,
 }
 
 impl LeafBuf {
@@ -555,9 +573,52 @@ impl LeafBuf {
         self.opt_action.clear();
         self.extra.clear();
         self.states.clear();
+        self.xs_nnz.clear();
+        self.xs_idx.clear();
+        self.xs_val.clear();
     }
     fn len(&self) -> usize {
         self.player.len()
+    }
+    /// The features of a new row, zeroed, for the caller to encode into: a slice of `x` (dense), or the
+    /// scratch row (sparse: `seal` it afterwards).
+    fn row_x(&mut self, f: usize) -> &mut [f32] {
+        if self.sparse {
+            if self.scratch.len() != f {
+                self.scratch.clear();
+                self.scratch.resize(f, 0.0);
+            }
+            &mut self.scratch
+        } else {
+            let off = self.x.len();
+            self.x.resize(off + f, 0.0);
+            &mut self.x[off..]
+        }
+    }
+    /// A sparse buffer's scratch row into its sparse arrays (its non-zero floats, -0.0 included; the
+    /// scratch zeroed again); nothing for a dense one.
+    fn seal(&mut self) {
+        if !self.sparse {
+            return;
+        }
+        let mut k = 0u32;
+        for (i, v) in self.scratch.iter_mut().enumerate() {
+            if v.to_bits() != 0 {
+                self.xs_idx.push(i as u32);
+                self.xs_val.push(*v);
+                *v = 0.0;
+                k += 1;
+            }
+        }
+        self.xs_nnz.push(k);
+    }
+    /// Drop the open row's features (dense: the last row of `x`; sparse: the scratch row, zeroed).
+    fn unrow(&mut self, f: usize) {
+        if self.sparse {
+            self.scratch.iter_mut().for_each(|v| *v = 0.0);
+        } else {
+            self.x.truncate(self.x.len() - f);
+        }
     }
 }
 
@@ -830,6 +891,10 @@ struct Dest {
     opt_off: *mut i32,
     opt_action: *mut i32,
     extra: *mut u8,
+    /// Sparse batches: their non-zeros' offsets, indexes, values.
+    xs_off: *mut i64,
+    xs_idx: *mut u32,
+    xs_val: *mut f32,
 }
 
 // SAFETY: a Dest points into the heap buffers of a batch owned by the group's `Asm`, which
@@ -844,6 +909,8 @@ struct AsmKey {
     dest: Dest,
     row_base: Vec<usize>,
     opt_base: Vec<usize>,
+    /// Sparse batches: every chunk's first non-zero in the batch.
+    nz_base: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -1173,7 +1240,8 @@ impl<G: SearchGame> Driver<G> {
             for c in 0..nchunks {
                 let a = c * ns / nchunks;
                 let b = (c + 1) * ns / nchunks;
-                chunks.push(Mutex::new(Chunk { slots: (a..b).map(|_| Slot::empty()).collect(), bufs: (0..nkeys).map(|_| LeafBuf::default()).collect(), results: Vec::new(), samples: Vec::new(), parked: Vec::new() }));
+                let bufs = (0..nkeys).map(|_| LeafBuf { sparse: cfg.sparse, ..Default::default() }).collect();
+                chunks.push(Mutex::new(Chunk { slots: (a..b).map(|_| Slot::empty()).collect(), bufs, results: Vec::new(), samples: Vec::new(), parked: Vec::new() }));
             }
             gv.push(Group {
                 chunks,

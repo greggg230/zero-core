@@ -301,6 +301,14 @@ class TokenGraphRunner:
         self.inp = None                              # shared device inputs (rows, x, n, full, ntok)
         self.slots = []                              # pinned host buffers, one set per launch in flight
         self.free = []                               # their indexes not in flight
+        self.sslots = []                             # the same for sparse batches (`launch_sparse`)
+        self.sfree = []
+        # a sparse row's present flags (`launch_sparse`): per feature its slot's column of the presence
+        # matrix (1 + slot) when it is a present flag, else -1; slots without a flag are always present
+        self.flag_col = np.full(self.F, -1, np.int64)
+        has = self.pidx >= 0
+        self.flag_col[self.pidx[has]] = 1 + np.flatnonzero(has)
+        self.always = 1 + np.flatnonzero(~has)
         self.captures = 0
         self.replays = 0
 
@@ -431,10 +439,98 @@ class TokenGraphRunner:
         self.replays += 1
         return (ev, slot, B, n_players, opt_off, opt_action, nb)
 
+    def _sslot(self, Bp, nnz):
+        """A free set of pinned host buffers of a sparse batch (`launch_sparse`): the dense set's
+        without the features, plus the non-zeros' flat indexes and values."""
+        k = self.sfree.pop() if self.sfree else None
+        if k is None:
+            k = len(self.sslots)
+            self.sslots.append(None)
+        b = self.sslots[k]
+        if b is None or b[1].shape[0] < Bp or b[7].shape[0] < nnz:
+            n = max(Bp, 256, 0 if b is None else b[1].shape[0])
+            z = max(nnz, 1 << 16, 0 if b is None else b[7].shape[0])
+            with torch.inference_mode(False):
+                b = self.sslots[k] = (None, torch.empty(n, dtype=torch.int64).pin_memory(),
+                                      torch.empty(n * self.t_cap, dtype=torch.int64).pin_memory(),
+                                      torch.empty(n, dtype=torch.int64).pin_memory(),
+                                      torch.empty((n, self.A + 2 * self.S), dtype=torch.float32).pin_memory(),
+                                      torch.empty((n, max(1, self.W)), dtype=torch.float32).pin_memory(),
+                                      torch.empty(n, dtype=torch.int64).pin_memory(),
+                                      torch.empty(z, dtype=torch.int64).pin_memory(),
+                                      torch.empty(z, dtype=torch.float32).pin_memory())
+        return k, b
+
+    def presence_sparse(self, xs_off, xs_idx, xs_val):
+        """`token_presence` of sparse rows: [B, 1 + slots] bool, the global token and the slots without a
+        flag always, each flagged slot when its flag's value > 0.5."""
+        B = len(xs_off) - 1
+        P = np.zeros((B, self.n_tok), bool)
+        P[:, 0] = True
+        P[:, self.always] = True
+        rows = np.repeat(np.arange(B), np.diff(xs_off))
+        col = self.flag_col[np.asarray(xs_idx, np.int64)]
+        hit = (col >= 0) & (np.asarray(xs_val) > 0.5)
+        P[rows[hit], col[hit]] = True
+        return P
+
+    def launch_sparse(self, xs_off, xs_idx, xs_val, n_players, opt_off, opt_action, brows=None):
+        """`launch` of a sparse batch (protocol.py: each row's non-zero features): the presence from the
+        non-zeros, the rows built on the device (the graphs' input rows zeroed, the non-zeros scattered
+        in: the same floats wherever the graphs read) - no dense row on the host. The answers are
+        `launch`'s on the densified rows, bit for bit."""
+        xs_off = np.asarray(xs_off, np.int64)
+        B = len(xs_off) - 1
+        Bp = -(-B // ROW_STEP) * ROW_STEP
+        nnz = int(xs_off[-1])
+        P = self.presence_sparse(xs_off, xs_idx, xs_val)
+        cnt = P.sum(1)
+        Tp = -(-int(cnt.max()) // T_STEP) * T_STEP
+        nb = 0 if brows is None else len(brows)
+        if nb and not self.layout:
+            raise RuntimeError('TokenGraphRunner: root belief rows for a network without the auxiliary head')
+        slot, (_, pin_n, pin_full, pin_ntok, pin_out, pin_aux, pin_b, pin_fi, pin_val) = self._sslot(Bp, nnz)
+        graph, xs, ns, fs, ts, out, aux = self._graph(Bp, Tp)
+        rows = np.repeat(np.arange(B, dtype=np.int64), np.diff(xs_off))
+        fi = pin_fi[:nnz].numpy()
+        np.multiply(rows, self.F, out=fi)
+        fi += np.asarray(xs_idx, np.int64)
+        pin_val[:nnz].numpy()[:] = xs_val
+        pn = pin_n[:Bp].numpy()
+        pn[:B] = n_players
+        pn[B:] = 2
+        pt = pin_ntok[:Bp].numpy()
+        pt[:B] = cnt
+        pt[B:] = 1
+        token_index(P, pin_full[:Bp * Tp].numpy().reshape(Bp, Tp))
+        if nb:
+            pin_b[:nb].numpy()[:] = brows
+        with torch.inference_mode(False):
+            xs.zero_()
+            if nnz:
+                fd = pin_fi[:nnz].to(self.dev, non_blocking=True)
+                vd = pin_val[:nnz].to(self.dev, non_blocking=True)
+                xs.view(-1).index_copy_(0, fd, vd)
+            ns.copy_(pin_n[:Bp], non_blocking=True)
+            fs.view(-1).copy_(pin_full[:Bp * Tp], non_blocking=True)
+            ts.copy_(pin_ntok[:Bp], non_blocking=True)
+            graph.replay()
+            pin_out[:B].copy_(out[:B], non_blocking=True)
+            if nb:
+                bi = pin_b[:nb].to(self.dev, non_blocking=True)
+                pin_aux[:nb].copy_(aux.index_select(0, bi), non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record()
+        self.replays += 1
+        return (ev, ('s', slot), B, n_players, opt_off, opt_action, nb)
+
     def result(self, h):
         ev, slot, B, n_players, opt_off, opt_action, nb = h
         ev.synchronize()
-        o = self.slots[slot][4][:B].numpy()
+        bufs = self.slots
+        if isinstance(slot, tuple):                  # (a sparse batch's buffers, `launch_sparse`)
+            bufs, slot = self.sslots, slot[1]
+        o = bufs[slot][4][:B].numpy()
         A, S = self.A, self.S
         rows = np.repeat(np.arange(B), np.diff(opt_off))
         pri = segment_softmax_np(o[rows, opt_action], opt_off)
@@ -443,8 +539,8 @@ class TokenGraphRunner:
         value[:, :S] = o[:, A:A + S]
         margin[:, :S] = o[:, A + S:A + 2 * S]
         value[np.arange(MAX_SEATS)[None, :] >= np.asarray(n_players)[:, None]] = 0.0
-        aux = self.slots[slot][5][:nb].numpy().copy() if nb else None
-        self.free.append(slot)
+        aux = bufs[slot][5][:nb].numpy().copy() if nb else None
+        (self.sfree if bufs is self.sslots else self.free).append(slot)
         if nb:
             return pri, value, margin, aux
         return pri, value, margin
@@ -666,7 +762,36 @@ class NetEvaluator:
                               f'needs a checkpoint with a trained head (docs/search.md 3.8)')
 
     def __call__(self, lb):
+        if lb.a.get('xs_val') is not None and self._graphable(lb.opt_off, belief_rows(lb.a.get('extra'))):
+            return self.result(self.launch(lb))
         return self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, lb.a.get('extra'))
+
+    def _launch_sparse(self, lb):
+        """A sparse batch through a token network's graphs (`TokenGraphRunner.launch_sparse`), in pieces of
+        at most max_rows rows (all launched, collected by `result`) -> a handle ('s', [piece handles], B)."""
+        if self.width is not None and int(lb.a['n_features']) != self.width:
+            from .net import EncodingMismatch
+            raise EncodingMismatch(f'a sparse leaf batch of {int(lb.a["n_features"]):,} features per row for a network of '
+                                   f'{self.width:,}: the network was built for another encoding than its driver feeds it')
+        extra = lb.a.get('extra')
+        xs_off, xs_idx, xs_val = np.asarray(lb.a['xs_off'], np.int64), lb.a['xs_idx'], lb.a['xs_val']
+        opt_off = np.asarray(lb.opt_off)
+        B = lb.B
+        M = self.max_rows or B
+        hs = []
+        for a in range(0, B, M):
+            b = min(B, a + M)
+            br = belief_rows(None if extra is None else extra[a:b])
+            if len(br):
+                self._check_head()
+            off = xs_off[a:b + 1] - xs_off[a]
+            oo = (opt_off[a:b + 1] - opt_off[a]).astype(opt_off.dtype)
+            hs.append(self.fast.launch_sparse(off, xs_idx[xs_off[a]:xs_off[b]], xs_val[xs_off[a]:xs_off[b]],
+                                              lb.n_players[a:b], oo, lb.opt_action[opt_off[a]:opt_off[b]],
+                                              *((br,) if len(br) else ())))
+        if len(hs) > 1:
+            self.pieces += 1
+        return ('s', hs, B)
 
     @property
     def aux_layout(self):
@@ -698,6 +823,11 @@ class NetEvaluator:
         """Start evaluating a LeafBatch; `result(handle)` -> what `ev(lb)` returns. Eager
         evaluators compute at once (or on a worker thread, `workers` > 1)."""
         extra = lb.a.get('extra')
+        if lb.a.get('xs_val') is not None and self._graphable(lb.opt_off, belief_rows(extra)):
+            t0 = time.perf_counter()
+            h = self._launch_sparse(lb)
+            self.seconds += time.perf_counter() - t0
+            return h
         if self.max_rows is not None and lb.B > self.max_rows:
             # (in pieces, answered now: `_pieces`)
             return ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra), 0)
@@ -722,6 +852,20 @@ class NetEvaluator:
             return v.result()
         if kind == 'd':
             return v
+        if kind == 's':
+            # (a sparse batch's pieces, in order)
+            t0 = time.perf_counter()
+            res = [self.fast.result(x) for x in v]
+            self.calls += len(res)
+            self.graph_calls += len(res)
+            self.leaves += B
+            self.seconds += time.perf_counter() - t0
+            if len(res) == 1:
+                return res[0]
+            out = (np.concatenate([r[0] for r in res]).astype(np.float32, copy=False),
+                   np.concatenate([r[1] for r in res]), np.concatenate([r[2] for r in res]))
+            aux = [r[3] for r in res if len(r) > 3]
+            return out + (np.concatenate(aux),) if aux else out
         t0 = time.perf_counter()
         r = self.fast.result(v)
         self.calls += 1

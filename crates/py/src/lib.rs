@@ -654,7 +654,9 @@ impl PySearchTree {
 
 /// The batched driver (docs/search.md 2). `seats` = per game a list of seat dicts; `aux`: record
 /// the game's auxiliary targets with the samples (`take_samples()['aux']`, docs/search.md 1.2);
-/// `paired`: games 2k and 2k + 1 share every random stream (the deal), `DriverCfg::paired`.
+/// `paired`: games 2k and 2k + 1 share every random stream (the deal), `DriverCfg::paired`;
+/// `sparse`: network batches carry each row's non-zero features (`xs_off`, `xs_idx`, `xs_val`,
+/// `n_features`) instead of `x` (`DriverCfg::sparse`, docs/search.md 2.2).
 #[pyclass(name = "SearchDriver")]
 pub struct PySearchDriver {
     d: Box<dyn DynDriver>,
@@ -664,9 +666,9 @@ pub struct PySearchDriver {
 #[pymethods]
 impl PySearchDriver {
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool) -> PyResult<Self> {
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool) -> PyResult<Self> {
         let spec = spec_json(spec)?;
         let mut keys = Vec::new();
         let mut table: Vec<SeatCfg> = Vec::new();
@@ -687,7 +689,7 @@ impl PySearchDriver {
             }
             games.push(ix);
         }
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired };
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
         Ok(PySearchDriver { d, nfeat })
@@ -921,7 +923,15 @@ impl PySearchDriver {
             a.set_item("states", b.states)?;
             return Ok(Some((b.id, key, "ext", a).into_pyobject(py)?.into_any().unbind()));
         }
-        a.set_item("x", b.x.into_pyarray(py).reshape([n, self.nfeat])?)?;
+        if b.xs_off.is_empty() {
+            a.set_item("x", b.x.into_pyarray(py).reshape([n, self.nfeat])?)?;
+        } else {
+            // a sparse batch (`sparse=True`, docs/search.md 2.2): each row's non-zero features
+            a.set_item("xs_off", b.xs_off.into_pyarray(py))?;
+            a.set_item("xs_idx", b.xs_idx.into_pyarray(py))?;
+            a.set_item("xs_val", b.xs_val.into_pyarray(py))?;
+            a.set_item("n_features", self.nfeat)?;
+        }
         a.set_item("opt_off", b.opt_off.into_pyarray(py))?;
         a.set_item("opt_action", b.opt_action.into_pyarray(py))?;
         a.set_item("extra", b.extra.into_pyarray(py))?;

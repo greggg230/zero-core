@@ -185,3 +185,58 @@ def test_max_rows_pieces_answer_as_the_whole_batch():
     assert pieces.pieces == 1 and whole.pieces == 0
     with pytest.raises(ValueError):
         NetEvaluator(m, 'cpu', max_rows=0)
+
+
+# ------------------------------------------------------------------ sparse batches (docs/search.md 2.2)
+
+def test_a_sparse_driver_plays_the_same_games_as_a_dense_one():
+    from zero.protocol import densify
+    seat = G.nn_seat('m', 8, leaf_value_view='root')
+    la = dict(G.nn_seat('m', 8), lookahead={'plies': 2, 'worlds': 2})
+    ev = NetEvaluator(toy_net(2), 'cpu')
+    out = {}
+    for sparse in (False, True):
+        drv = G.Driver('toy', [[la, seat], [seat, la]] * 2, concurrency=4, seed=9, threads=2, move_log=400, sparse=sparse)
+        xs = []
+
+        def on(lb, xs=xs):
+            assert lb.sparse == sparse
+            if sparse:
+                assert lb.a['xs_off'][-1] == len(lb.a['xs_val']) and 0 < len(lb.a['xs_val']) < lb.B * INFO['num_features']
+            xs.append(np.asarray(lb.x).copy())             # (a sparse batch densified: by the eager evaluator)
+        drive(drv, {'m': ev}, on_batch=on)
+        out[sparse] = (sorted(drv.take_results(), key=lambda r: r['gid']), xs)
+    assert [r['moves'] for r in out[True][0]] == [r['moves'] for r in out[False][0]]
+    assert len(out[True][1]) == len(out[False][1]) and all(np.array_equal(a, b) for a, b in zip(*(out[k][1] for k in (False, True))))
+    assert np.array_equal(densify([0, 2, 2], [1, 3], [5.0, -0.0], 4), np.array([[0, 5, 0, -0.0], [0, 0, 0, 0]], np.float32))
+
+
+@pytest.mark.skipif(not __import__('torch').cuda.is_available(), reason='CUDA graphs need CUDA')
+def test_sparse_batches_through_the_token_graphs_answer_as_dense_ones():
+    from test_net_data import tok_x
+    from test_token_graphs import net
+    from zero.protocol import LeafBatch, ROW_BELIEF
+    m = net().cuda()
+    dense, sparse = (NetEvaluator(m, "cuda", graphs=True, max_rows=64) for _ in range(2))
+    rng = np.random.default_rng(1)
+    B = 150
+    x = tok_x(B, seed=3).numpy()
+    x[rng.random(x.shape) < 0.5] = 0.0
+    cnt = rng.integers(0, 4, B)
+    cnt[cnt == 1] = 2
+    off = np.concatenate([[0], np.cumsum(cnt)]).astype(np.int32)
+    acts = rng.integers(0, m.config['actions'], int(off[-1])).astype(np.int32)
+    extra = np.zeros(B, np.uint8)
+    extra[[3, 77]] = ROW_BELIEF
+    n = np.full(B, 2, np.int32)
+    nzr, nzc = np.nonzero(x)
+    xs_off = np.concatenate([[0], np.cumsum(np.bincount(nzr, minlength=B))]).astype(np.int64)
+    a = {'opt_off': off, 'opt_action': acts, 'player': np.zeros(B, np.int32), 'n_players': n, 'gid': np.zeros(B, np.int64),
+         'extra': extra, 'xs_off': xs_off, 'xs_idx': nzc.astype(np.uint32), 'xs_val': x[nzr, nzc], 'n_features': x.shape[1]}
+    lb = LeafBatch(0, 'm', 'nn', a)
+    got = sparse.result(sparse.launch(lb))
+    want = dense.evaluate(x, n, off, acts, extra)
+    assert len(got) == len(want) == 4
+    for u, v in zip(got, want):
+        assert u.shape == v.shape and np.array_equal(u, v), np.abs(u - v).max()
+    assert sparse.graph_calls == 3 and sparse.pieces == 1

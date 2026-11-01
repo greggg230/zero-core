@@ -447,9 +447,8 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             Sim::Leaf { node, player } => {
                 let buf = &mut bufs[seat.key as usize];
                 let local = buf.len() as u32;
-                let off = buf.x.len();
-                buf.x.resize(off + G::NUM_FEATURES, 0.0);
-                sg.encode(player, &mut buf.x[off..]);
+                sg.encode(player, buf.row_x(G::NUM_FEATURES));
+                buf.seal();
                 let acts = tree.acts(node);
                 buf.nopt.push(acts.len() as i32);
                 buf.opt_action.extend(acts.iter().map(|&a| a as i32));
@@ -461,9 +460,8 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 // value-only row (no options) of the tree's viewer, the root decider, right after it
                 let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
                 if vrow {
-                    let off = buf.x.len();
-                    buf.x.resize(off + G::NUM_FEATURES, 0.0);
-                    sg.encode(tree.viewer, &mut buf.x[off..]);
+                    sg.encode(tree.viewer, buf.row_x(G::NUM_FEATURES));
+                    buf.seal();
                     buf.nopt.push(0);
                     buf.player.push(tree.viewer as i32);
                     buf.n_players.push(slot.n as i32);
@@ -493,10 +491,24 @@ struct LeafSink<'a> {
     buf: &'a mut LeafBuf,
     gid: u32,
     n: usize,
+    /// The last row's features may still be written (sealed at the next row, or on drop).
+    open: bool,
+}
+
+impl Drop for LeafSink<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            self.buf.seal();
+        }
+    }
 }
 
 impl<G: SearchGame> RowSink<G> for LeafSink<'_> {
     fn push_row(&mut self, viewer: usize, opts: &[u16], kind: u8) -> &mut [f32] {
+        if self.open {
+            self.buf.seal();
+        }
+        self.open = true;
         let b = &mut *self.buf;
         b.nopt.push(opts.len() as i32);
         b.opt_action.extend(opts.iter().map(|&a| a as i32));
@@ -504,11 +516,12 @@ impl<G: SearchGame> RowSink<G> for LeafSink<'_> {
         b.n_players.push(self.n as i32);
         b.gid.push(self.gid as i64);
         b.extra.push(kind);
-        let off = b.x.len();
-        b.x.resize(off + G::NUM_FEATURES, 0.0);
-        &mut b.x[off..]
+        b.row_x(G::NUM_FEATURES)
     }
     fn pop_row(&mut self) {
+        // (only the row just pushed: the lookahead pops a duplicate observation's row at once)
+        debug_assert!(self.open, "pop_row without an open row");
+        self.open = false;
         let b = &mut *self.buf;
         let k = b.nopt.pop().unwrap_or(0) as usize;
         b.opt_action.truncate(b.opt_action.len() - k);
@@ -516,7 +529,7 @@ impl<G: SearchGame> RowSink<G> for LeafSink<'_> {
         b.n_players.pop();
         b.gid.pop();
         b.extra.pop();
-        b.x.truncate(b.x.len() - G::NUM_FEATURES);
+        b.unrow(G::NUM_FEATURES);
     }
 }
 
@@ -535,9 +548,10 @@ fn look_step<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, seat: &NnSeat, l
     }
     let buf = &mut bufs[seat.key as usize];
     let local = buf.len() as u32;
-    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n };
+    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false };
     let look = slot.look.as_mut().unwrap();
     let r = look.step(&mut sink, &mut slot.search_rng);
+    drop(sink);
     let busy = t0.elapsed().as_secs_f64();
     let r = r?;
     if let LookStep::Rows(_) = r {
@@ -564,9 +578,8 @@ fn look_step<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, seat: &NnSeat, l
 
 /// A root belief row (`ROW_BELIEF`, docs/search.md 3.8): `encode(p)` of the live game, no options.
 fn push_belief_row<G: SearchGame>(buf: &mut LeafBuf, live: &G, p: usize, n: usize, gid: u32) {
-    let off = buf.x.len();
-    buf.x.resize(off + G::NUM_FEATURES, 0.0);
-    live.encode(p, &mut buf.x[off..]);
+    live.encode(p, buf.row_x(G::NUM_FEATURES));
+    buf.seal();
     buf.nopt.push(0);
     buf.player.push(p as i32);
     buf.n_players.push(n as i32);
@@ -887,14 +900,17 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
     let mut asm = Asm::default();
     let mut bases_all = lock(&grp.bases);
     for (k, (_, kind)) in sh.cfg.keys.iter().enumerate() {
-        let (mut b, mut nopt) = (0usize, 0usize);
+        let (mut b, mut nopt, mut nz) = (0usize, 0usize, 0usize);
         let mut row_base = Vec::with_capacity(chunks.len());
         let mut opt_base = Vec::with_capacity(chunks.len());
+        let mut nz_base = Vec::with_capacity(chunks.len());
         for ch in chunks.iter() {
             row_base.push(b);
             opt_base.push(nopt);
+            nz_base.push(nz);
             b += ch.bufs[k].len();
             nopt += ch.bufs[k].opt_action.len();
+            nz += ch.bufs[k].xs_idx.len();
         }
         bases_all[k] = row_base.iter().map(|&r| r as u32).collect();
         if b == 0 {
@@ -912,7 +928,13 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
             asm.batches.push(bt);
             continue;
         }
-        bt.x = vec![0.0; b * f];
+        if sh.cfg.sparse {
+            bt.xs_off = vec![0; b + 1];
+            bt.xs_idx = vec![0; nz];
+            bt.xs_val = vec![0.0; nz];
+        } else {
+            bt.x = vec![0.0; b * f];
+        }
         bt.player = vec![0; b];
         bt.n_players = vec![0; b];
         bt.gid = vec![0; b];
@@ -927,8 +949,11 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
             opt_off: bt.opt_off.as_mut_ptr(),
             opt_action: bt.opt_action.as_mut_ptr(),
             extra: bt.extra.as_mut_ptr(),
+            xs_off: bt.xs_off.as_mut_ptr(),
+            xs_idx: bt.xs_idx.as_mut_ptr(),
+            xs_val: bt.xs_val.as_mut_ptr(),
         };
-        asm.keys.push(AsmKey { key: k, dest, row_base, opt_base });
+        asm.keys.push(AsmKey { key: k, dest, row_base, opt_base, nz_base });
         asm.batches.push(bt);
     }
     drop(bases_all);
@@ -942,12 +967,13 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
 fn fill_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize) {
     let grp = &sh.groups[g];
     let f = G::NUM_FEATURES;
-    let parts: Vec<(usize, Dest, usize, usize)> = {
+    let sparse = sh.cfg.sparse;
+    let parts: Vec<(usize, Dest, usize, usize, usize)> = {
         let a = lock(&grp.asm);
-        a.as_ref().map(|a| a.keys.iter().map(|k| (k.key, k.dest, k.row_base[c], k.opt_base[c])).collect()).unwrap_or_default()
+        a.as_ref().map(|a| a.keys.iter().map(|k| (k.key, k.dest, k.row_base[c], k.opt_base[c], k.nz_base[c])).collect()).unwrap_or_default()
     };
     let ch = lock(&grp.chunks[c]);
-    for (k, d, rb, ob) in parts {
+    for (k, d, rb, ob, zb) in parts {
         let x = &ch.bufs[k];
         let n = x.len();
         if n == 0 {
@@ -957,7 +983,20 @@ fn fill_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize) {
         // SAFETY: rows rb..rb + n and options ob..ob + no belong to this chunk alone (the plan's
         // prefix sums) and lie inside the batch's buffers (sized for all rows / options); see Dest.
         unsafe {
-            std::slice::from_raw_parts_mut(d.x.add(rb * f), n * f).copy_from_slice(&x.x);
+            if sparse {
+                // (rows rb..rb + n's non-zeros zb..zb + nz: this chunk's alone, the plan's prefix sums)
+                let nz = x.xs_idx.len();
+                std::slice::from_raw_parts_mut(d.xs_idx.add(zb), nz).copy_from_slice(&x.xs_idx);
+                std::slice::from_raw_parts_mut(d.xs_val.add(zb), nz).copy_from_slice(&x.xs_val);
+                let xo = std::slice::from_raw_parts_mut(d.xs_off.add(rb + 1), n);
+                let mut z = zb;
+                for l in 0..n {
+                    z += x.xs_nnz[l] as usize;
+                    xo[l] = z as i64;
+                }
+            } else {
+                std::slice::from_raw_parts_mut(d.x.add(rb * f), n * f).copy_from_slice(&x.x);
+            }
             std::slice::from_raw_parts_mut(d.player.add(rb), n).copy_from_slice(&x.player);
             std::slice::from_raw_parts_mut(d.n_players.add(rb), n).copy_from_slice(&x.n_players);
             std::slice::from_raw_parts_mut(d.gid.add(rb), n).copy_from_slice(&x.gid);

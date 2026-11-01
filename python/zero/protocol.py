@@ -26,6 +26,11 @@ The answer: `priors` f32 [sum] (softmax over each leaf's legal actions), `value`
 that cannot (a network without the auxiliary head) must fail; the driver refuses an answer
 without them (docs/search.md 3.8).
 
+A sparse network batch (a driver created with `sparse=True`, docs/search.md 2.2) carries each row's
+non-zero features instead of `x`: `xs_off` i64 [B+1], `xs_idx` u32 [nnz] (feature indexes, ascending
+per row), `xs_val` f32 [nnz], `n_features` (F). `LeafBatch.x` densifies it on first use (an evaluator
+that reads `x` sees the same rows); `NetEvaluator`'s token CUDA graphs scatter it on the device.
+
 An external batch ('ext') holds B requests: `states` (list of str: the game's
 `export_state()`), `player`, `n_players`, `gid`; the answer is one payload string per request
 (applied by `SearchGame::apply_external`).
@@ -66,14 +71,32 @@ class LeafBatch:
     def B(self):
         return len(self.a['player'])
 
+    @property
+    def sparse(self):
+        """A sparse network batch (its rows' non-zeros: `xs_off`, `xs_idx`, `xs_val`)."""
+        return 'xs_val' in self.a
+
     def __getattr__(self, k):
         try:
             return self.a[k]
         except KeyError:
+            if k == 'x' and 'xs_val' in self.a:
+                x = self.a['x'] = densify(self.a['xs_off'], self.a['xs_idx'], self.a['xs_val'], self.a['n_features'])
+                return x
             raise AttributeError(k) from None
 
     def __repr__(self):
         return f'LeafBatch(id={self.id}, key={self.key!r}, kind={self.kind}, B={self.B})'
+
+
+def densify(xs_off, xs_idx, xs_val, n_features):
+    """A sparse batch's rows as f32 [B, F] (zeros but at the non-zeros)."""
+    xs_off = np.asarray(xs_off)
+    B = len(xs_off) - 1
+    x = np.zeros((B, int(n_features)), np.float32)
+    rows = np.repeat(np.arange(B), np.diff(xs_off))
+    x[rows, np.asarray(xs_idx, np.int64)] = xs_val
+    return x
 
 
 def validate_batch(lb, num_features=None, num_actions=None):

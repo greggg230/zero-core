@@ -303,11 +303,14 @@ def _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, s
     return sa, sb
 
 
-def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, stats_out=None):
+def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, stats_out=None,
+          sparse=False):
     seats = [[sa, sb] if g % 2 == 0 else [sb, sa] for g in range(games)]
     kw = {'move_log': move_log} if move_log else {}
     if paired:
         kw['paired'] = True
+    if sparse:
+        kw['sparse'] = True
     drv = G.Driver(game, seats, spec=spec, concurrency=conc or min(games, 1024), seed=seed, threads=threads,
                    groups=groups, max_steps=max_steps, **kw)
     drive(drv, evs)
@@ -419,7 +422,7 @@ def _graphs_used(out, evs, graphs):
 
 def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None,
           spec=None, conc=None, seat_a=None, seat_b=None, max_steps=5000, move_log=0, rows=False, paired=False,
-          sims_a=None, sims_b=None, graphs=None, max_rows=None):
+          sims_a=None, sims_b=None, graphs=None, max_rows=None, sparse=None):
     """Checkpoint `a` vs checkpoint `b` (paths), `games` 2-player games, seats alternating. -> dict.
     `seat_a` / `seat_b`: each side's move-rule seat settings ({'select': 'cq', 'select_min_visits':
     2, ...}; {} = the default rule; None = its checkpoint's run's eval_select, `run_rule`).
@@ -428,27 +431,39 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     swapped (`games` even; the output's `pairs`, `se` of the pair scores: `summary`). `sims_a` /
     `sims_b`: a side's simulations (None: `sims`). `graphs`: the sides' CUDA graphs (`_evaluators`;
     given: `graphs_a` / `graphs_b` in the output). A seat dict with `lookahead` is a lookahead side
-    (docs/search.md 3.9: the output's `lookahead_*`, `look`); `max_rows` the evaluators' (`_max_rows`)."""
+    (docs/search.md 3.9: the output's `lookahead_*`, `look`); `max_rows` the evaluators' (`_max_rows`);
+    `sparse` the driver's sparse batches (None: with a lookahead side; docs/search.md 2.2)."""
     if paired and games % 2:
         raise ValueError(f'paired games: an even number of games ({games})')
     ma, mb, game = _load_pair(a, b, device, game)
     spec = package.active().specs.get(game) if spec is None else spec
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
     mr = _max_rows(sa, sb, max_rows)
+    sp = _sparse(sa, sb, sparse)
     evs = _evaluators(ma, mb, device, graphs, mr)
     t0 = time.time()
     st = []
-    rs = _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, st)
+    rs = _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, st, sp)
     out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb))
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
     _look_out(out, sa, sb, st, mr, evs)
+    if sp:
+        out['sparse'] = True
     if paired:
         out['paired'] = True
     if rows:
         out['rows'] = sorted(rs, key=lambda r: r['gid'])
     return out
+
+
+def _sparse(sa, sb, sparse):
+    """The driver's sparse batches: as given, else on with a lookahead side (its batches are bound by
+    the host's copies of the dense rows), else off (the batches of before)."""
+    if sparse is not None:
+        return bool(sparse)
+    return bool(sa.get('lookahead') or sb.get('lookahead'))
 
 
 def _sides_sims(out, sims_a, sims_b):
@@ -460,7 +475,7 @@ def _sides_sims(out, sims_a, sims_b):
 def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, beta=0.05, target_se=None, sims=64,
                chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None, spec=None, conc=None,
                seat_a=None, seat_b=None, max_steps=5000, paired=False, sims_a=None, sims_b=None, on_batch=None,
-               rows=False, graphs=None, max_rows=None):
+               rows=False, graphs=None, max_rows=None, sparse=None):
     """`match` in batches of `batch_games` until decided: `sprt` (elo0, elo1) - the log-likelihood ratio
     (`sprt_llr`) leaves `sprt_bounds(alpha, beta)` - or `se` <= `target_se`, or `max_games` played. Batch k
     is seeded seed + 7919 k (batch 0: `seed`, the plain match's games). -> `match`'s dict over every game,
@@ -484,6 +499,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     spec = package.active().specs.get(game) if spec is None else spec
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
     mr = _max_rows(sa, sb, max_rows)
+    sp = _sparse(sa, sb, sparse)
     evs = _evaluators(ma, mb, device, graphs, mr)
     t0 = time.time()
     st = []
@@ -496,7 +512,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
         if n <= 0:
             stop = 'max_games'
             break
-        got = _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired, st)
+        got = _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired, st, sp)
         off = len(rs)
         rs += [dict(r, gid=r['gid'] + off) for r in got]
         cur = summary(rs, paired)
@@ -521,6 +537,8 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
     _look_out(out, sa, sb, st, mr, evs)
+    if sp:
+        out['sparse'] = True
     if paired:
         out['paired'] = True
     if sprt is not None:
@@ -596,6 +614,8 @@ def main(argv=None):
                         help=f"side {side.upper()} a lookahead seat (over --lookahead)")
     ap.add_argument('--conc', type=int, default=None,
                     help='games in flight at once (default: every game, at most 1024)')
+    ap.add_argument('--sparse', type=int, default=None, choices=[0, 1],
+                    help="the driver's sparse batches (default: on with a lookahead side, else off; docs/search.md 2.2)")
     ap.add_argument('--groups', type=int, default=2,
                     help="the driver's groups (default 2: one searches while another is evaluated)")
     ap.add_argument('--max-rows', type=int, default=None,
@@ -701,13 +721,13 @@ def main(argv=None):
                          a.target_se, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device, spec=a.spec,
                          seat_a=sides[0], seat_b=sides[1], paired=a.paired, sims_a=a.a_sims, sims_b=a.b_sims,
                          on_batch=lambda r: print('# batch ' + json.dumps(r), file=sys.stderr, flush=True), graphs=graphs,
-                         max_rows=a.max_rows, conc=a.conc, groups=a.groups)
+                         max_rows=a.max_rows, conc=a.conc, groups=a.groups, sparse=a.sparse)
         print(json.dumps(out), flush=True)
         return
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
                            spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log, paired=a.paired,
                            sims_a=a.a_sims, sims_b=a.b_sims, graphs=graphs, max_rows=a.max_rows, conc=a.conc,
-                           groups=a.groups)), flush=True)
+                           groups=a.groups, sparse=a.sparse)), flush=True)
 
 
 if __name__ == '__main__':

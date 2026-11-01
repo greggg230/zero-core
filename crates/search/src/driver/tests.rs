@@ -30,6 +30,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         move_log: 0,
         aux: false,
         paired: false,
+        sparse: false,
     }
 }
 

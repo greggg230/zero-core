@@ -267,6 +267,7 @@ fn driver_cfg(seats: Vec<SeatCfg>, games: usize, threads: usize) -> DriverCfg {
         move_log: 20,
         aux: false,
         paired: false,
+        sparse: false,
     }
 }
 
@@ -340,4 +341,70 @@ fn a_lookahead_seat_over_its_budget_searches_with_mcts_and_takes_the_belief() {
     s.look = Some(Box::new(cfg(r#"{"plies": 2}"#)));
     s.selfplay = true;
     assert!(Driver::<Peek>::new(driver_cfg(vec![SeatCfg::Nn(s), SeatCfg::Nn(NnSeat::eval(0, 16))], 2, 1)).is_err());
+}
+
+/// A batch's features, dense (a sparse batch densified).
+fn dense_x(b: &crate::driver::Batch, f: usize) -> Vec<f32> {
+    if b.xs_off.is_empty() {
+        return b.x.clone();
+    }
+    let mut x = vec![0.0; b.b * f];
+    for r in 0..b.b {
+        for k in b.xs_off[r] as usize..b.xs_off[r + 1] as usize {
+            x[r * f + b.xs_idx[k] as usize] = b.xs_val[k];
+        }
+    }
+    x
+}
+
+#[test]
+fn sparse_batches_carry_the_same_rows_and_play_the_same_games() {
+    // the toy game (mcts seats with root-view rows and the belief, a lookahead seat): every batch's
+    // rows equal dense or sparse, the same games
+    use crate::driver::{Batch, LeafView};
+    use crate::toy::ToyGame;
+    let run = |sparse: bool| {
+        let mut m = NnSeat::eval(0, 12);
+        m.leaf_value_view = LeafView::Root;
+        m.belief_tilt = 1.0;
+        let mut l = NnSeat::eval(0, 8);
+        l.look = Some(Box::new(cfg(r#"{"plies": 2, "worlds": 3}"#)));
+        let mut c = driver_cfg(vec![SeatCfg::Nn(l), SeatCfg::Nn(m)], 6, 3);
+        c.sparse = sparse;
+        let mut d = Driver::<ToyGame>::new(c).unwrap();
+        let f = ToyGame::NUM_FEATURES;
+        let w = ToyGame::aux_width();
+        let mut hashes = Vec::new();
+        let mut res = Vec::new();
+        while let Some(b) = d.next_batch(true).unwrap() {
+            let b: Batch = b;
+            assert_eq!(b.x.is_empty(), sparse);
+            let x = dense_x(&b, f);
+            hashes.push((b.b, x.iter().map(|v| v.to_bits() as u64).fold(7u64, |h, v| h.wrapping_mul(31).wrapping_add(v))));
+            let mut pri = Vec::new();
+            for r in 0..b.b {
+                let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+                pri.extend(std::iter::repeat_n(1.0 / k as f32, k));
+            }
+            let mut v = vec![0.0; b.b * MAX_SEATS];
+            for r in 0..b.b {
+                let h: f32 = x[r * f..(r + 1) * f].iter().enumerate().map(|(i, y)| y * ((i * 7 % 13) as f32 - 6.0)).sum();
+                v[r * MAX_SEATS] = 1.0 / (1.0 + (-h * 0.1).exp());
+                v[r * MAX_SEATS + 1] = 1.0 - v[r * MAX_SEATS];
+            }
+            let nb = b.extra.iter().filter(|&&e| e == ROW_BELIEF).count();
+            let aux = vec![1.0 / w as f32; nb * w];
+            d.submit_aux(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS], &aux).unwrap();
+            res.extend(d.take_results());
+        }
+        res.extend(d.take_results());
+        res.sort_by_key(|r| r.gid);
+        (format!("{res:?}"), hashes, d.stats().look.decisions)
+    };
+    let (a, ha, la) = run(false);
+    let (b, hb, lb) = run(true);
+    assert!(la > 0);
+    assert_eq!(ha, hb, "the same rows, batch by batch");
+    assert_eq!(a, b, "the same games");
+    assert_eq!(la, lb);
 }
