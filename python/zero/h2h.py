@@ -587,6 +587,8 @@ def main(argv=None):
                         help=f"side {side.upper()} a lookahead seat (over --lookahead)")
     ap.add_argument('--conc', type=int, default=None,
                     help='games in flight at once (default: every game, at most 1024)')
+    ap.add_argument('--groups', type=int, default=2,
+                    help="the driver's groups (default 2: one searches while another is evaluated)")
     ap.add_argument('--max-rows', type=int, default=None,
                     help='evaluate batches over this many rows in pieces (default: 1024 with a lookahead side, else whole)')
     ap.add_argument('--paired', action='store_true',
@@ -678,6 +680,8 @@ def main(argv=None):
         ap.error('--max-rows must be >= 1')
     if a.conc is not None and a.conc < 1:
         ap.error('--conc must be >= 1')
+    if a.groups < 1:
+        ap.error('--groups must be >= 1')
     graphs = None
     if (a.graphs, a.a_graphs, a.b_graphs) != (None, None, None):
         graphs = tuple(None if v is None else bool(v)
@@ -688,12 +692,13 @@ def main(argv=None):
                          a.target_se, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device, spec=a.spec,
                          seat_a=sides[0], seat_b=sides[1], paired=a.paired, sims_a=a.a_sims, sims_b=a.b_sims,
                          on_batch=lambda r: print('# batch ' + json.dumps(r), file=sys.stderr, flush=True), graphs=graphs,
-                         max_rows=a.max_rows, conc=a.conc)
+                         max_rows=a.max_rows, conc=a.conc, groups=a.groups)
         print(json.dumps(out), flush=True)
         return
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
                            spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log, paired=a.paired,
-                           sims_a=a.a_sims, sims_b=a.b_sims, graphs=graphs, max_rows=a.max_rows, conc=a.conc)), flush=True)
+                           sims_a=a.a_sims, sims_b=a.b_sims, graphs=graphs, max_rows=a.max_rows, conc=a.conc,
+                           groups=a.groups)), flush=True)
 
 
 if __name__ == '__main__':

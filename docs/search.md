@@ -17,14 +17,16 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 | `crates/search/src/driver.rs`, `driver/worker.rs` | Batched multi-threaded driver: groups, chunks, parallel batch assembly, playout cap, temperature, records, rolling phases, arena keys, external seats |
 | `crates/search/src/toy.rs` | "Mini Cavern", the toy game (section 5) + its heuristic bot |
 | `crates/search/src/mull_game.rs` | Test games (cfg(test)): keep-or-mulligan (`Mull`, section 3.5) and its private-hand variant (`HiddenMull`, section 3.6) |
+| `crates/search/src/lookahead.rs`, `peek_game.rs` | The exhaustive lookahead per information set (section 3.9: settings, the level-by-level state machine, its network rows, the budget's fallbacks) and its test game (cfg(test)) |
 | `crates/search/src/toy_team.rs` | "Toy team", a two-team game with a deferred result decided by toy games (section 5.1) |
-| `crates/search/src/dynapi.rs` | Object-safe wrappers (`DynGame`, `DynTree`, `DynDriver`) so the bindings hold any game |
+| `crates/search/src/dynapi.rs` | Object-safe wrappers (`DynGame`, `DynTree`, `DynDriver`, `DynLook`) so the bindings hold any game |
 | `crates/search/src/rng.rs`, `noise.rs` | xoshiro256++ / splitmix64, Gamma / Dirichlet, Gumbel |
-| `crates/py/src/lib.rs` | `zero_py`: `Game`, `SearchTree`, `SearchDriver`, `game_names()`, `game_info_of()`, the `engine_module!` macro (section 4) |
+| `crates/py/src/lib.rs` | `zero_py`: `Game`, `SearchTree`, `SearchDriver`, `Lookahead` (3.9), `game_names()`, `game_info_of()`, `lookahead_settings()`, the `engine_module!` macro (section 4) |
 | `crates/toy_py/src/lib.rs` | the core's own module `zero._engine` (`toy`, `toy_team`) |
 | `python/zero/mcts.py`, `play.py` | Python reference MCTS and driver (`PyDriver`, seats searching with the Python or the Rust tree) |
 | `python/zero/protocol.py` | Leaf-batch protocol: `LeafBatch`, validators, `MAX_SEATS` |
 | `python/zero/parity.py` | Rust-vs-Python statistical parity (section 6) |
+| `python/zero/lookahead.py` | The lookahead's settings and position API (section 3.9) |
 
 Build: `bash tools/build_py.sh` (the toy module: release cdylib copied to
 `python/zero/_engine.pyd`; target dir `$CARGO_TARGET_DIR` or `E:/cargo-target/zero-core/<branch>`
@@ -203,7 +205,7 @@ One list of seat dicts per game (players = its length):
 'sims_minor', 'p_full', 'chance_k', 'margin_w', 'redet', 'policy_target', 'cq_c_visit', 'cq_c_scale',
 'select', 'select_min_visits', 'record', 'root_min_visits', 'root_min_visits_max_actions',
 'leaf_value_view', 'view_samples', 'view_sample_target', 'belief_tilt', 'belief_clip', 'belief_mix', 'belief_fast',
-'root_search', 'gumbel_m', 'gumbel_scale', 'gumbel_c_visit', 'gumbel_c_scale'}`
+'root_search', 'gumbel_m', 'gumbel_scale', 'gumbel_c_visit', 'gumbel_c_scale', 'lookahead'}`
 (`games.nn_seat`; `policy_target` only matters for recorded decisions, section 3.1; `select` and its
 guard for the moves the seat does not sample, section 3.3; `cq_c_visit` / `cq_c_scale` are the
 completed-Q transform of both; `record` false - absent: true - a self-play seat whose full searches
@@ -213,7 +215,8 @@ docs/az.md 14, puts a past checkpoint there; `root_min_visits` the floor of its 
 visits, section 3.5; `leaf_value_view` whose view its leaves' values come from, `view_samples` /
 `view_sample_target` its value-only samples, section 3.6; `root_search` 'puct' | 'gumbel' and the
 `gumbel_*` keys its root search, section 3.7; `belief_tilt`, `belief_clip`, `belief_mix`,
-`belief_fast` the root's belief of its searches, section 3.8). Evaluator keys: every distinct
+`belief_fast` the root's belief of its searches, section 3.8; `lookahead` a dict of the exhaustive
+lookahead's settings that decides the seat's moves instead of MCTS, section 3.9). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
 key one external player. A key cannot be both.
 
@@ -233,7 +236,9 @@ are 0), `margin` f32 [B, 8] (same order); with `ROW_BELIEF` rows also `aux` f32 
 aux_width]: the network's auxiliary predictions of those rows (section 3.8). `NetEvaluator` does the
 gather + segment softmax on the device. A row with an empty option segment is a deferred terminal's leaf: its value and
 margin are used, it has no priors (`NetEvaluator`, the CUDA-graph path and `UniformEvaluator`
-handle empty segments; `protocol.validate_batch` allows 0 or >= 2 options).
+handle empty segments; `protocol.validate_batch` allows 0 or >= 2 options). A lookahead seat (section
+3.9) puts many rows of one game in a batch, all `ROW_LEAF` (priors: rows with their >= 2 options;
+values: value-only rows of the root decider, `player` its seat) but its root's `ROW_BELIEF`.
 
 ### 2.3 Rules of the exchange
 
@@ -907,6 +912,130 @@ Tests: `tree::tests::belief_*`, `a_belief_deals_*`, `no_belief_*`, `without_rede
 `driver::tests::belief_*`, `one_belief_row_*`, `an_evaluator_without_the_belief_*`,
 `the_belief_deals_the_searches_worlds`, `root_view_values_and_the_belief_*`, `rolling_phases_ask_the_belief_*`,
 `tests/test_belief.py`.
+
+### 3.9 The exhaustive lookahead per information set (`lookahead`; MTG Zero's Delver mirror, 2026-11-01)
+
+**Why.** The Delver Lab's x-ply lookahead (delver-lab `delverlab/xply_is.py`, the per-world tree
+`delverlab/xply.py`, Python over the bindings) found lines the network's MCTS never visits - Mishra's
+Bauble first at a turn-1 spot, with a card-dependent follow-up -, because it ignores the prior (every
+option gets the same look), decides our moves per information set (the right value of information) and
+searches every reply. But it walks every node in Python and values the leaves on the CPU (~1,500
+positions/s): 5-30 s a 6-ply decision. Here the same lookahead is Rust inside the search crate, a seat
+of the driver whose rows go through the same batches as MCTS leaves (one GPU batch for every game in
+flight), and a position API for the lab.
+
+**Semantics** (the lab's, ported exactly; `crates/search/src/lookahead.rs`):
+
+* **Plies** are decisions with >= 2 options, of either seat: a move is `tree::transition` (single-option
+  decisions stepped, as in the search). A **minor** decision (`SearchGame::minor_decision`: MTG's mana
+  payments) takes the network's top prior (the mover's view; the first maximum) and counts no ply.
+* **Horizon** (`horizon`): `plies` moves (default 4); 'turn' - a line ends at the first decision of the
+  next turn (`rounds()` past the root's); 'next_turn' - at the first decision of the root decider's next
+  turn (`SearchGame::active_seat`, a new hook: the seat whose turn it is; default None, the horizon
+  refused). With a horizon a line is cut at `max_plies` moves (default 40; counted, `cut`). Checked per
+  member in the lab's order: finished, the horizon, minor, the ply cap, no options, ours, the opponent's.
+* **Branching**: every option (`topk` 0, the default), or the `topk` of highest prior (stable: ties in the
+  options' order) below the root; `topk_root` caps the root too (the lab's information-set solver does,
+  its per-world tree never does: the parity runs set it per mode); `topk_from_turn` every option before
+  that turn.
+* **Our decisions** (`mode` 'infoset', the default). All worlds are expanded in lockstep along the same
+  action sequences. At each level - the members between two of our decisions - our members are grouped
+  by observation: an exact hash of `encode(R)` (`obs_hash`, 128 bits of the float bits; the lab hashes
+  the bytes with blake2b) and the legal options. A group takes ONE action, the one with the best average
+  over its members weighted by their weights ("max of average"; a later action replaces the best only by
+  more than 1e-12, the lab's tolerance), and every member gets its value under that choice. Our reveals
+  (a draw, a look) change the encoding and split the groups: the value of information. `mode` 'world':
+  every member its own group (each world a perfect-information tree: the lab's per-world upper bound).
+* **The opponent** decides per world (`opp`): 'min' (alias 'best') its reply worst for us - each reply's
+  member weighted 1 / replies in our later averages (we learn the reply, not why it was chosen); 'expect'
+  (alias 'policy') the prior-weighted mean of its replies, the prior from its own view, member weights
+  scaled by it; 'top' its top-prior reply only.
+* **Leaves**: the network's value of a value-only row `encode(R)` (P(R wins): root-view leaves, as the
+  evaluation seats of the Delver line); a finished game its `result()[R]` (a deferred terminal: the
+  network's value). Margins are not used.
+* **Worlds** (`worlds`, default 8): dealt once per decision from the root decider's view by the search's
+  own deal (`tree::deal`): with the seat's `belief_tilt` > 0 one `ROW_BELIEF` row of the root first, then
+  `determinize_with` that belief at the seat's tilt / clip, a `belief_mix` share `determinize`. The
+  driver deals from the slot's search stream (reproducible from the driver's seed); the position API
+  from explicit seeds (one per world), or takes the worlds given.
+* **The decision**: the root option with the best mean over the worlds (the first in the root's order on
+  ties: the lab sorts its options by value, stably).
+* **Budget** (`budget` nodes per decision - the lab's count: children created -, 0 = none): over it the
+  attempt is abandoned and the next stage runs on the same worlds: `fallback_topk` (default 4) below the
+  root, then each of `fallback_plies` (default one stage at max(2, plies - 2), 4 for a horizon), then the
+  final fallback `fallback` 'mcts' (the seat's own MCTS search of the decision: its `sims`, rule, belief,
+  leaf view - an evaluation seat's settings) or 'prior' (the network's top prior). `LookStats` /
+  `stats()['look']` count what each decision took (`by_stage`, `fallback_*`, `aborted_nodes`).
+
+**Leaf values by observation** (`dedup`, default on): a leaf's value is the network's answer to its row
+`encode(R)` alone, so leaves whose encodings are equal share one row - worlds the root decider cannot tell
+apart after the same moves: ~70% of the leaves on turn 1 of the Delver mirror. Exact up to the network's
+float rounding at another batch shape; `value_dups` counts them (`value_rows` the rows sent; the lab's
+value rows = their sum). `dedup` 0 sends a row per leaf, as the lab.
+
+**How it runs.** `lookahead::Look` is a state machine, level by level as the lab's recursion (its
+members, groups and order are the lab's: the group, action, member order of the children; the minor
+members then the opponent's children per advance round). It asks for network rows through a `RowSink`
+(`Look::step` -> `Step::Rows(n)`, then `Look::answer`): the priors that choose what to expand or weigh -
+minor decisions, the opponent's under 'top' / 'expect' or a cap, our groups under a cap - block their
+level; leaf values never do and fill a round up to `rows` (default 512), a value round going out as soon
+as `rows` of them wait (their games dropped once encoded: memory). Rows are encoded in place in the
+sink's buffer (`push_row`; a duplicate observation's row popped again). Memory: one game per live member
+(MTG: ~11 KB) - `peak_games` counts the most live at once; the node budget bounds it.
+
+**The driver** (`driver.rs`, `driver/worker.rs`). Seat key `lookahead` (a dict of its settings; the Rust
+`LookCfg::parse` checks them: an unknown key, a wrong type or a bad value is a ValueError, never
+ignored; None = off). A lookahead seat is an evaluation seat (`selfplay` refused: no training records
+yet). At each of its decisions with >= 2 options `look_step` creates the `Look` (the seat's belief
+settings), steps it into the seat key's leaf buffer (`Pending::Look`: the game waits for its round's rows,
+as a leaf), answers it from the group's evaluation (`run_chunk`), and plays its move (`slot.decisions`
+counts it) - or, after the final fallback 'mcts', lets the seat's MCTS search the decision (`look_mcts`,
+cleared by the move). A minor root decision takes the network's top prior (one row; `minor_root`).
+Every lookahead row is a `ROW_LEAF` row (priors: its options; values: none) or the root's `ROW_BELIEF`:
+the batches carry many rows per game, nothing else changes for the evaluator. A new search epoch
+(rolling) or a phase's dropped batch restarts the decision's lookahead. Counters: `DriverStats::look`
+(`LookTotals`), `stats()['look']` in Python - only for a driver that made lookahead decisions (the stats
+of before otherwise).
+
+**The evaluator.** `NetEvaluator(max_rows=n)` (opt-in; None: every batch whole, as before) evaluates a
+batch of more than n rows in consecutive pieces, their answers concatenated: a lookahead's batches hold
+thousands of rows, and the pieces keep a token network's CUDA graphs (docs/az.md 10.6) to a few shapes.
+
+**The position API** (the lab's call). `<pkg>._engine.Lookahead(game, settings, worlds=None, seeds=None,
+seed=0, belief_tilt=0, belief_clip=20, belief_mix=0, belief=None, lines=True)` with `next_batch()` /
+`submit(priors, value, aux=None)` / `result()` / `line(world, action)` / `worlds()`;
+`zero.lookahead.evaluate_position(game, ev, settings, ...)` drives it with an evaluator and returns per
+root option its value in each world, mean +- sd, the modal principal line with labels (each world's line
+replayed on its world: the exported state's option labels, `reveal(keys, player)` for what a move showed)
+and the counters. `zero.lookahead.parse('plies=6,worlds=8,opp=best,budget=200000')` reads the
+command-line form (`fallback_plies=4/2`), `settings(d)` the canonical dict, `tag(d)` a short name.
+
+**zero.h2h**: `--a-lookahead` / `--b-lookahead` SETTINGS (`--lookahead` both): that side a lookahead seat
+over its seat settings (its MCTS settings: the fallback; its belief: the worlds' deal); the output adds
+`lookahead_a` / `lookahead_b`, `lookahead_tag_*`, `look` (the drivers' counters summed, per decision
+means) and `max_rows` (default 1024 with a lookahead side). `--conc` sets the games in flight (default:
+every game, at most 1024, as before).
+
+**Parity with the lab** (MTG Zero's ENGINE.md 80.4): on the same dealt worlds, the same network (CPU),
+both modes, the three opponent models, 4 and 6 plies, five positions - the values per world to 3.6e-7, the
+choices, node / leaf / group / prior-row counts identical in 59 of 60 configurations (the 60th a root
+near-tie, two options within ~1e-7, flipped by float rounding).
+
+**Off** (the default: no seat key `lookahead`): the driver, the trees, the bindings' existing classes and
+every evaluator of before, byte for byte (`check_checkpoint_compat`, toy runs; section 3.9's checks in
+docs/az.md 21).
+
+**Tests**: `lookahead::tests` (11: the test game `peek_game::Peek` - a hidden coin seat 0 may peek at -,
+where looking is worth +0.32 per information set and -0.08 per world; the opponent models; the minor
+payment; the horizons; the budget's stages to MCTS or the prior; the settings; top-k; reproducible deals
+with the belief; `obs_hash`; a lookahead seat in the driver, reproducible across threads; its MCTS
+fallback with the belief), `tests/test_lookahead.py` (8).
+
+Code: `lookahead.rs` (`LookCfg`, `Look`, `RowSink`, `Answers`, `LookStats`, `obs_hash`), `peek_game.rs`,
+`game.rs` (`SearchGame::active_seat`), `tree.rs` (`deal`), `driver.rs` (`NnSeat::look`, `Pending::Look`,
+`LookTotals`), `driver/worker.rs` (`look_step`, `LeafSink`), `dynapi.rs` (`DynGame::lookahead`, `DynLook`,
+`LookRows`), the bindings (`Lookahead`, `lookahead_settings`, seat key `lookahead`, `stats()['look']`);
+Python `lookahead.py`, `infer.py` (`max_rows`), `h2h.py`.
 
 ## 4. Bindings and registering a game
 
