@@ -558,22 +558,40 @@ enum VEntry {
 }
 
 /// A 128-bit hash of an encoding's float bits (the observation key; the lab's blake2b of the bytes):
-/// two independent multiply-xorshift lanes over its 64-bit words, finished by `split64`.
+/// the (position, bits) of its non-zero 64-bit words (two floats each; -0.0 counts, its bits are not 0)
+/// through two independent multiply-xorshift lanes, finished by `split64`. The encodings are sparse (a
+/// Delver position: ~150 non-zero floats of 37,620): blocks of zero words are skipped.
 pub fn obs_hash(x: &[f32]) -> u128 {
+    #[inline(always)]
+    fn mix(a: &mut u64, b: &mut u64, i: u64, v: u64) {
+        let k = v ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        *a = (*a ^ k).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        *a ^= *a >> 32;
+        *b = (b.wrapping_add(k ^ (i << 1))).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
+    }
     let mut a: u64 = 0x243F_6A88_85A3_08D3;
     let mut b: u64 = 0x1319_8A2E_0370_7344;
-    let mut it = x.chunks_exact(2);
-    for w in &mut it {
-        let v = (w[0].to_bits() as u64) | ((w[1].to_bits() as u64) << 32);
-        a = (a ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        a ^= a >> 29;
-        b = (b.wrapping_add(v)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        b = b.rotate_left(27);
+    const BLOCK: usize = 16;
+    let mut blocks = x.chunks_exact(BLOCK);
+    let mut base = 0u64;
+    for blk in &mut blocks {
+        let any = blk.iter().fold(0u32, |o, f| o | f.to_bits());
+        if any != 0 {
+            for (j, w) in blk.chunks_exact(2).enumerate() {
+                let v = (w[0].to_bits() as u64) | ((w[1].to_bits() as u64) << 32);
+                if v != 0 {
+                    mix(&mut a, &mut b, base + j as u64, v);
+                }
+            }
+        }
+        base += (BLOCK / 2) as u64;
     }
-    if let [z] = it.remainder() {
-        let v = z.to_bits() as u64 | (1 << 63);
-        a = (a ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        b = (b.wrapping_add(v)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    let rest = blocks.remainder();
+    for (j, w) in rest.chunks(2).enumerate() {
+        let v = (w[0].to_bits() as u64) | (w.get(1).map_or(0, |f| f.to_bits() as u64) << 32);
+        if v != 0 {
+            mix(&mut a, &mut b, base + j as u64, v);
+        }
     }
     let n = x.len() as u64;
     ((split64(a ^ n) as u128) << 64) | split64(b ^ n.rotate_left(17)) as u128
