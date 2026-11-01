@@ -12,19 +12,19 @@ struct Rows {
 }
 
 impl<G: SearchGame> RowSink<G> for Rows {
-    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8) {
+    fn push_row(&mut self, viewer: usize, opts: &[u16], kind: u8) -> &mut [f32] {
+        self.opts.push(opts.to_vec());
+        self.viewer.push(viewer);
+        self.kind.push(kind);
         let off = self.x.len();
         self.x.resize(off + G::NUM_FEATURES, 0.0);
-        g.encode(viewer, &mut self.x[off..]);
-        self.opts.push(opts.to_vec());
-        self.viewer.push(viewer);
-        self.kind.push(kind);
+        &mut self.x[off..]
     }
-    fn row_x(&mut self, x: &[f32], viewer: usize, opts: &[u16], kind: u8) {
-        self.x.extend_from_slice(x);
-        self.opts.push(opts.to_vec());
-        self.viewer.push(viewer);
-        self.kind.push(kind);
+    fn pop_row(&mut self) {
+        self.opts.pop();
+        self.viewer.pop();
+        self.kind.pop();
+        self.x.truncate(self.x.len() - G::NUM_FEATURES);
     }
 }
 

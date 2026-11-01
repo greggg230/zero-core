@@ -496,27 +496,27 @@ struct LeafSink<'a> {
 }
 
 impl<G: SearchGame> RowSink<G> for LeafSink<'_> {
-    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8) {
+    fn push_row(&mut self, viewer: usize, opts: &[u16], kind: u8) -> &mut [f32] {
         let b = &mut *self.buf;
+        b.nopt.push(opts.len() as i32);
+        b.opt_action.extend(opts.iter().map(|&a| a as i32));
+        b.player.push(viewer as i32);
+        b.n_players.push(self.n as i32);
+        b.gid.push(self.gid as i64);
+        b.extra.push(kind);
         let off = b.x.len();
         b.x.resize(off + G::NUM_FEATURES, 0.0);
-        g.encode(viewer, &mut b.x[off..]);
-        b.nopt.push(opts.len() as i32);
-        b.opt_action.extend(opts.iter().map(|&a| a as i32));
-        b.player.push(viewer as i32);
-        b.n_players.push(self.n as i32);
-        b.gid.push(self.gid as i64);
-        b.extra.push(kind);
+        &mut b.x[off..]
     }
-    fn row_x(&mut self, x: &[f32], viewer: usize, opts: &[u16], kind: u8) {
+    fn pop_row(&mut self) {
         let b = &mut *self.buf;
-        b.x.extend_from_slice(x);
-        b.nopt.push(opts.len() as i32);
-        b.opt_action.extend(opts.iter().map(|&a| a as i32));
-        b.player.push(viewer as i32);
-        b.n_players.push(self.n as i32);
-        b.gid.push(self.gid as i64);
-        b.extra.push(kind);
+        let k = b.nopt.pop().unwrap_or(0) as usize;
+        b.opt_action.truncate(b.opt_action.len() - k);
+        b.player.pop();
+        b.n_players.pop();
+        b.gid.pop();
+        b.extra.pop();
+        b.x.truncate(b.x.len() - G::NUM_FEATURES);
     }
 }
 

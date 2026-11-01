@@ -505,21 +505,21 @@ impl RowsBuf {
 }
 
 impl<G: SearchGame> RowSink<G> for RowsBuf {
-    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8) {
+    fn push_row(&mut self, viewer: usize, opts: &[u16], kind: u8) -> &mut [f32] {
+        self.nopt.push(opts.len() as i32);
+        self.opt_action.extend(opts.iter().map(|&a| a as i32));
+        self.player.push(viewer as i32);
+        self.extra.push(kind);
         let off = self.x.len();
         self.x.resize(off + G::NUM_FEATURES, 0.0);
-        g.encode(viewer, &mut self.x[off..]);
-        self.nopt.push(opts.len() as i32);
-        self.opt_action.extend(opts.iter().map(|&a| a as i32));
-        self.player.push(viewer as i32);
-        self.extra.push(kind);
+        &mut self.x[off..]
     }
-    fn row_x(&mut self, x: &[f32], viewer: usize, opts: &[u16], kind: u8) {
-        self.x.extend_from_slice(x);
-        self.nopt.push(opts.len() as i32);
-        self.opt_action.extend(opts.iter().map(|&a| a as i32));
-        self.player.push(viewer as i32);
-        self.extra.push(kind);
+    fn pop_row(&mut self) {
+        let k = self.nopt.pop().unwrap_or(0) as usize;
+        self.opt_action.truncate(self.opt_action.len() - k);
+        self.player.pop();
+        self.extra.pop();
+        self.x.truncate(self.x.len() - G::NUM_FEATURES);
     }
 }
 

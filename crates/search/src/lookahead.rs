@@ -444,10 +444,17 @@ pub enum Outcome {
 
 /// Where the network rows of a lookahead go (`Look::step`): one row = `g.encode(viewer)`, the
 /// options `opts` (empty: a value-only row), its kind (`ROW_LEAF`, `ROW_BELIEF`).
-pub trait RowSink<G> {
-    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8);
-    /// A row of features already encoded (`x`: `NUM_FEATURES` floats).
-    fn row_x(&mut self, x: &[f32], viewer: usize, opts: &[u16], kind: u8);
+pub trait RowSink<G: SearchGame> {
+    /// A new row (`viewer`'s, its options, its kind) -> its `NUM_FEATURES` features, zeroed, for the
+    /// caller to encode.
+    fn push_row(&mut self, viewer: usize, opts: &[u16], kind: u8) -> &mut [f32];
+    /// Drop the last row pushed (a leaf whose observation another row has: `dedup`).
+    fn pop_row(&mut self);
+    /// A row of `g.encode(viewer)`.
+    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8) {
+        let x = self.push_row(viewer, opts, kind);
+        g.encode(viewer, x);
+    }
 }
 
 /// The network's answers to a round's rows (`Look::answer`): rows `base..base + n` of a batch with
@@ -558,9 +565,9 @@ enum VEntry {
 }
 
 /// A 128-bit hash of an encoding's float bits (the observation key; the lab's blake2b of the bytes):
-/// the (position, bits) of its non-zero 64-bit words (two floats each; -0.0 counts, its bits are not 0)
-/// through two independent multiply-xorshift lanes, finished by `split64`. The encodings are sparse (a
-/// Delver position: ~150 non-zero floats of 37,620): blocks of zero words are skipped.
+/// the (position, bits) of its non-zero pairs of floats (-0.0 counts: its bits are not 0) through two
+/// independent multiply-xorshift lanes, finished by `split64`. The encodings are sparse (a Delver
+/// position: ~150 non-zero floats of 37,620): blocks of zero bits are skipped (an OR over the block).
 pub fn obs_hash(x: &[f32]) -> u128 {
     #[inline(always)]
     fn mix(a: &mut u64, b: &mut u64, i: u64, v: u64) {
@@ -569,16 +576,21 @@ pub fn obs_hash(x: &[f32]) -> u128 {
         *a ^= *a >> 32;
         *b = (b.wrapping_add(k ^ (i << 1))).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
     }
+    // SAFETY: f32 and u32 have the same size and alignment; the bits are read, never written
+    let u: &[u32] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u32, x.len()) };
     let mut a: u64 = 0x243F_6A88_85A3_08D3;
     let mut b: u64 = 0x1319_8A2E_0370_7344;
-    const BLOCK: usize = 16;
-    let mut blocks = x.chunks_exact(BLOCK);
+    const BLOCK: usize = 64;
+    let mut blocks = u.chunks_exact(BLOCK);
     let mut base = 0u64;
     for blk in &mut blocks {
-        let any = blk.iter().fold(0u32, |o, f| o | f.to_bits());
+        let mut any = 0u32;
+        for &w in blk {
+            any |= w;
+        }
         if any != 0 {
             for (j, w) in blk.chunks_exact(2).enumerate() {
-                let v = (w[0].to_bits() as u64) | ((w[1].to_bits() as u64) << 32);
+                let v = w[0] as u64 | ((w[1] as u64) << 32);
                 if v != 0 {
                     mix(&mut a, &mut b, base + j as u64, v);
                 }
@@ -586,9 +598,8 @@ pub fn obs_hash(x: &[f32]) -> u128 {
         }
         base += (BLOCK / 2) as u64;
     }
-    let rest = blocks.remainder();
-    for (j, w) in rest.chunks(2).enumerate() {
-        let v = (w[0].to_bits() as u64) | (w.get(1).map_or(0, |f| f.to_bits() as u64) << 32);
+    for (j, w) in blocks.remainder().chunks(2).enumerate() {
+        let v = w[0] as u64 | (w.get(1).map_or(0, |&f| f as u64) << 32);
         if v != 0 {
             mix(&mut a, &mut b, base + j as u64, v);
         }
@@ -1230,16 +1241,19 @@ impl<G: SearchGame> Look<G> {
             if !self.cfg.dedup {
                 sink.row(&g, self.viewer, &[], ROW_LEAF);
             } else {
-                self.xbuf.iter_mut().for_each(|x| *x = 0.0);
-                g.encode(self.viewer, &mut self.xbuf);
-                let h = obs_hash(&self.xbuf);
+                // (encoded in place, the row dropped again when its observation was sent already)
+                let x = sink.push_row(self.viewer, &[], ROW_LEAF);
+                g.encode(self.viewer, x);
+                let h = obs_hash(x);
                 match self.vcache.get_mut(&h) {
                     Some(VEntry::Val(v)) => {
+                        sink.pop_row();
                         self.mems[m as usize].value = *v;
                         self.st.value_dups += 1;
                         continue;
                     }
                     Some(VEntry::Wait(w)) => {
+                        sink.pop_row();
                         w.push(m);
                         self.st.value_dups += 1;
                         continue;
@@ -1247,7 +1261,6 @@ impl<G: SearchGame> Look<G> {
                     None => {
                         self.vcache.insert(h, VEntry::Wait(Vec::new()));
                         self.vhash.insert(m, h);
-                        sink.row_x(&self.xbuf, self.viewer, &[], ROW_LEAF);
                     }
                 }
             }
