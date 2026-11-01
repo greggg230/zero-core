@@ -45,6 +45,16 @@ Each game -> one JSON object (format 'zero-replay/1'), written gzipped to `--out
                    Zero: `belief` {for, n, cards: [[name, expected count], ...]}), by default
                    aux: {<target>: [[column, value], ...]} (its 12 largest values)}
   final    index of the final state; result (per seat), scores, rounds, over
+
+A lookahead seat (`--lookahead SETTINGS` / `record(lookahead=)`; docs/search.md 3.9): the checkpoint's seat
+decides by the exhaustive lookahead per information set (its settings as `zero.lookahead.parse` reads
+them) against the checkpoint's own MCTS seat (`--opp self` only). Its decisions still run the seat's MCTS
+search, whose statistics fill the frame as for any network decision - what the seat's MCTS would have
+played -, and the frame adds `look`: {a: the lookahead's move (the frame's `a`), mcts_a: the MCTS move,
+options: [[action, mean value over the worlds, sd], ...] (the root's order), stats: {nodes, leaves, rows,
+stage, last, minor_root}, guard: whether a guarded seat's margin overrode MCTS} (a minor root decision: the
+network's top prior, `options` empty). The seats say `player` 'lookahead' (with `lookahead`: the
+canonical settings) or 'mcts'.
 """
 import argparse
 import base64
@@ -60,6 +70,7 @@ import time
 import numpy as np
 
 from . import games as G, package
+from . import lookahead as LA
 from .infer import NetEvaluator, drive
 from .mcts import belief_settings, gumbel_tag, select_settings
 from .net import load
@@ -93,8 +104,10 @@ class RecordingDriver(PyDriver):
     at network decisions. Finished games: `take_replays()` (dicts without the header fields)."""
 
     def __init__(self, game, n_games, seat_fn, spec=None, concurrency=8, seed=0, max_steps=100_000, hint=None,
-                 aux=None, aux_render=None):
+                 aux=None, aux_render=None, look_ev=None):
         self.hint = hint
+        # evaluator key -> the NetEvaluator of its lookahead seats' rows (a seat with `look`: its settings)
+        self.look_ev = dict(look_ev or {})
         # evaluator key -> its NetEvaluator, for the network seats whose checkpoint has an auxiliary
         # head (docs/az.md 15): each of their decisions' frames shows the head's predictions at the root
         self.aux = dict(aux or {})
@@ -238,7 +251,35 @@ class RecordingDriver(PyDriver):
             x = np.asarray(slot.game.encode(p), np.float32)[None]
             pred = {k: v[0] for k, v in ev.aux(x, np.asarray([slot.n], np.int64)).items()}
             f.update(self.aux_render(pred, slot.states[f['s']], p, f))
-        super()._decide(slot, seat, tree, p)
+        look = getattr(seat, 'look', None)
+        if look is None:
+            super()._decide(slot, seat, tree, p)
+            return
+        # a lookahead seat (docs/search.md 3.9): the MCTS search's move is recorded (`look.mcts_a`), the
+        # lookahead's is played (the fallback 'mcts' and a guard below its margin: the MCTS move)
+        i = tree.choose(seat) if seat.select != 'visits' else max(range(len(nv)), key=lambda k: (nv[k], p0[k]))
+        a_mcts = int(acts[i])
+        kw = {}
+        if seat.belief_tilt:
+            kw = dict(belief_tilt=seat.belief_tilt, belief_clip=seat.belief_clip, belief_mix=seat.belief_mix)
+        la = G.engine().Lookahead(slot.game, look, seed=slot.search_rng.getrandbits(63), lines=False, **kw)
+        LA.drive(la, self.look_ev[seat.key])
+        r = la.result()
+        opts = [[int(o['action']), round(float(o['mean']), 5), round(float(o['sd']), 5)] for o in r['options']]
+        a, guarded = (a_mcts if r['outcome'] == 'mcts' else int(r['outcome'])), False
+        g = float(look.get('guard') or 0.0)
+        if g > 0 and r['outcome'] != 'mcts':
+            mean = {o[0]: o[1] for o in opts}
+            a = a_mcts
+            if not r['stats']['minor_root'] and a_mcts in mean:
+                best = max(opts, key=lambda o: o[1])
+                if best[0] != a_mcts and best[1] - mean[a_mcts] > g:
+                    a, guarded = best[0], True
+        st = r['stats']
+        f['look'] = {'a': a, 'mcts_a': a_mcts, 'options': opts, 'guard': guarded,
+                     'stats': {k: st[k] for k in ('nodes', 'leaves', 'rows', 'stage', 'last', 'minor_root')}}
+        slot.decisions += 1
+        self._apply(slot, a)
 
     def _apply(self, slot, a):
         f = slot.frame
@@ -353,11 +394,13 @@ EXT_TITLES = {'jsbot': 'JS bot'}
 
 
 def record(ckpt, opp='self', games=6, sims=128, opp_sims=None, spec=None, selfplay=False, hint=None, chance_k=2,
-           device='cpu', seed=0, title=None, conc=8, log=print, select=None):
+           device='cpu', seed=0, title=None, conc=8, log=print, select=None, lookahead=None):
     """Play and record `games` games of checkpoint `ckpt` vs `opp` ('self', 'ext:<name>', a bot
     name or another checkpoint), seats alternating (game k: `ckpt` is seat k % 2). `select`:
     (rule, min_visits) or (rule, min_visits, c_visit, c_scale) of the network seats (None: each
-    checkpoint's run's; a transform None: the run's rule's). -> replays."""
+    checkpoint's run's; a transform None: the run's rule's). `lookahead` (settings, a dict): the
+    checkpoint's seat is a lookahead seat against its own MCTS seat (`opp` 'self'; module docstring).
+    -> replays."""
     ma, _ = load(ckpt, device)                     # (the encoding guard: its own game's, docs/az.md 10.4)
     game = ma.config.get('game', package.active().game)
     run, it = run_of(ckpt)
@@ -391,9 +434,22 @@ def record(ckpt, opp='self', games=6, sims=128, opp_sims=None, spec=None, selfpl
     for s in (me, other):
         if s.get('key') in aux:
             s['aux'] = [n for n, _, _ in aux[s['key']].aux_layout]
+    look_ev = None
+    if lookahead is not None:
+        if opp != 'self' or selfplay:
+            raise ValueError("a lookahead seat plays against its checkpoint's own MCTS seat (opp 'self', no selfplay)")
+        import copy
+        st = LA.settings(lookahead)
+        seat_a = copy.copy(seat_a)
+        seat_a.look = st
+        me = dict(me, name=f'{me["name"]} lookahead {LA.tag(st)}', player='lookahead', lookahead=st)
+        other = dict(other, player='mcts')
+        look_ev = {'a': NetEvaluator(ma, device, max_rows=1024)}
     seats = lambda k: [seat_a, seat_b] if k % 2 == 0 else [seat_b, seat_a]  # noqa: E731
     names = lambda k: [me, other] if k % 2 == 0 else [other, me]  # noqa: E731
     kw = {'aux': aux, 'aux_render': package.active().replay_aux_of(game)} if aux else {}
+    if look_ev:
+        kw['look_ev'] = look_ev
     drv = RecordingDriver(game, games, seats, spec=spec, concurrency=min(conc, games), seed=seed, max_steps=5000,
                           hint=hname, **kw)
     t0 = time.time()
