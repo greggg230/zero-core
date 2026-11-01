@@ -3329,3 +3329,30 @@ nice 19 for the measurements), on ec57c15 (the code; this commit adds documentat
   `--test hidden`, Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder 4202a4a build against this
   core: GREEN), `check_checkpoint_compat` with the Delver line's checkpoint 196 identical, pytest 62
   passed; the anchors end to end on the Mac (`eval_remote mac`).
+
+## 21. A lookahead player: the exhaustive lookahead per information set as a seat (MTG Zero's Delver mirror, 2026-11-01)
+
+The design, the semantics and the API are docs/search.md 3.9; this section is the run-level view: how
+a match fields a lookahead seat, what it costs on the desktop, what it measured.
+
+**A match.** `zero.h2h A B --a-lookahead SETTINGS` (or `--b-lookahead`, `--lookahead` for both) makes a side
+a lookahead seat: its seat dict is its checkpoint's run's evaluation seat (`run_rule`: rule, leaf view,
+root belief) with the key `lookahead` added - the belief deals the lookahead's worlds, the MCTS settings
+play its final fallback. `--conc` (games in flight; default every game, at most 1024) and `--groups`
+(default 2) shape the driver; `--max-rows` (default 1024 with a lookahead side) the evaluators' pieces
+(`NetEvaluator(max_rows=)`: a token network's CUDA graphs answer them two in flight). The output's
+`look` sums the lookahead counters (decisions, nodes, leaf / prior / value rows, the shared values,
+rounds, fallbacks per stage, the most live member games), `perf` where the time went (the drivers'
+search, assembly and wait seconds; each evaluator's seconds, calls, rows, pieces).
+
+**The host's copies.** The lookahead's batches hold up to `rows` per game in flight - thousands of
+37,620-float rows for MTG, ~150 of them non-zero - and the host's copies of the dense rows bound them (the
+CUDA graphs' own limit from ~192 rows, 10.6): the driver assembling a batch into fresh memory (page
+faults: ~70-120 us a row on the loaded desktop, 59% of a 4-ply match's wall time waiting for it) and the
+graphs' pinned copy. Three opt-in remedies: **sparse batches** (`sparse=True`, docs/search.md 2.2: each
+row's non-zeros; `TokenGraphRunner.launch_sparse` builds the rows on the device; h2h `--sparse`, on with a
+lookahead side) - a 32-game 4-ply match 165 s -> 89 s, its batches' assembly 85 s -> 1.5 s, the same
+games; **4 driver groups** (h2h `--groups 4`: 89 s -> 65 s); and for dense token batches of >= 512 rows
+the graphs' host copy split over 4 threads (`COPY_PAR_ROWS`, `COPY_THREADS`; the same bytes, answers bit
+for bit; MCTS batches of tens to a few hundred rows unaffected). MCTS self-play and evaluation could take
+sparse batches too (not measured here).

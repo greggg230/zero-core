@@ -183,7 +183,7 @@ Default: no targets (`AUX` empty). The loss of each segment is the game package'
 ```python
 from zero import games as G       # in a game repo: from <pkg>.az import games as G
 drv = G.Driver('toy', seats, spec=None, concurrency=256, seed=0, record=False, threads=4,
-               groups=2, max_steps=100_000, rolling=False, net=0)   # (+ queue_only, move_log, aux, paired: 2.9, 2.5, 1.2, 2.10)
+               groups=2, max_steps=100_000, rolling=False, net=0)   # (+ queue_only, move_log, aux, paired, sparse: 2.9, 2.5, 1.2, 2.10, 2.2)
 lb = drv.next_batch()            # LeafBatch (kind 'nn' | 'ext') or None when every game finished
 drv.submit(lb.id, priors, value, margin[, aux])  # network batch (aux: its root belief rows', 3.8)
 drv.submit_external(lb.id, payloads)            # external batch: one str per request
@@ -239,6 +239,20 @@ margin are used, it has no priors (`NetEvaluator`, the CUDA-graph path and `Unif
 handle empty segments; `protocol.validate_batch` allows 0 or >= 2 options). A lookahead seat (section
 3.9) puts many rows of one game in a batch, all `ROW_LEAF` (priors: rows with their >= 2 options;
 values: value-only rows of the root decider, `player` its seat) but its root's `ROW_BELIEF`.
+
+**Sparse batches** (`sparse=True`, `DriverCfg::sparse`; off by default: the batches of before). Instead
+of `x` a network batch carries each row's non-zero features: `xs_off` i64 [B+1], `xs_idx` u32 [nnz] (the
+feature indexes, ascending per row), `xs_val` f32 [nnz], `n_features`. The same rows (a chunk encodes each
+into a zeroed scratch row and seals its non-zeros, -0.0 included), the same games. Why: an MTG row is
+~150 non-zero floats of 37,620, and copying the dense rows - into the batch (fresh memory: page faults,
+~70-120 us a row on the loaded desktop) and into the CUDA graphs' pinned buffers - bounded the lookahead's
+batches of thousands of rows (section 3.9). `protocol.LeafBatch.x` densifies a sparse batch on first use
+(an evaluator that reads `x` sees the same rows); `NetEvaluator`'s token CUDA graphs take it as it is
+(`TokenGraphRunner.launch_sparse`: the presence flags read from the non-zeros, the graphs' input rows
+zeroed on the device and the non-zeros scattered in - the same floats wherever the graphs read: the
+answers are bit for bit those of the dense rows at the same batch shape). Measured (32 games of a 4-ply
+lookahead against MCTS on MTG Zero's Delver mirror, the desktop shared): 165 s dense, 89 s sparse - the
+batches' assembly 85 s -> 1.5 s -, the same games; 65 s with 4 driver groups.
 
 ### 2.3 Rules of the exchange
 
@@ -960,6 +974,12 @@ flight), and a position API for the lab.
   from explicit seeds (one per world), or takes the worlds given.
 * **The decision**: the root option with the best mean over the worlds (the first in the root's order on
   ties: the lab sorts its options by value, stably).
+* **The guarded player** (`guard` > 0, a driver seat): the seat's MCTS search decides as usual, and its
+  move stands unless the lookahead's best option's mean exceeds the MCTS move's mean by more than
+  `guard` (P(win), e.g. 0.05): the lookahead's max over many noisy leaf values is optimistic (the
+  optimizer's curse: MTG Zero's teacher experiment, its ENGINE.md 80, found the 6-ply lookahead's
+  predicted +2.4 pp realized at -1.0 where it disagreed with MCTS), large margins are not. Minor
+  decisions are the MCTS search's alone. `guard_decisions` / `guard_overrides` count them.
 * **Budget** (`budget` nodes per decision - the lab's count: children created -, 0 = none): over it the
   attempt is abandoned and the next stage runs on the same worlds: `fallback_topk` (default 4) below the
   root, then each of `fallback_plies` (default one stage at max(2, plies - 2), 4 for a horizon), then the
@@ -1025,11 +1045,20 @@ near-tie, two options within ~1e-7, flipped by float rounding).
 every evaluator of before, byte for byte (`check_checkpoint_compat`, toy runs; section 3.9's checks in
 docs/az.md 21).
 
-**Tests**: `lookahead::tests` (11: the test game `peek_game::Peek` - a hidden coin seat 0 may peek at -,
+**Tests**: `lookahead::tests` (13: the test game `peek_game::Peek` - a hidden coin seat 0 may peek at -,
 where looking is worth +0.32 per information set and -0.08 per world; the opponent models; the minor
 payment; the horizons; the budget's stages to MCTS or the prior; the settings; top-k; reproducible deals
 with the belief; `obs_hash`; a lookahead seat in the driver, reproducible across threads; its MCTS
-fallback with the belief), `tests/test_lookahead.py` (8).
+fallback with the belief; sparse batches carrying the same rows and games as dense ones; the guarded
+player's margin), `tests/test_lookahead.py` (10: settings, the seat key, the driver, the position API, the
+protocol's refusals, h2h's flags, `max_rows`, sparse batches through the driver and through the token
+graphs bit for bit).
+
+**Measured** (MTG Zero's Delver mirror, its ENGINE.md 80): one position at a time on the GPU, 4 / 5 / 6
+plies every option 0.19 / 0.37 / 0.80 s a decision (2.1k / 6.3k / 18k nodes; the lab's Python ~7-10 s for
+a 6-ply turn-1 spot); against MCTS at 32 simulations (the same network, paired games) the pure lookahead
+player loses (4 plies 0.32-0.39, 6 plies 0.37-0.47) and the guarded one at 5 pp is even (0.515 +- 0.015 over
+300 pairs at 4 plies).
 
 Code: `lookahead.rs` (`LookCfg`, `Look`, `RowSink`, `Answers`, `LookStats`, `obs_hash`), `peek_game.rs`,
 `game.rs` (`SearchGame::active_seat`), `tree.rs` (`deal`), `driver.rs` (`NnSeat::look`, `Pending::Look`,
