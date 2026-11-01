@@ -11,7 +11,8 @@
 //!
 //! (its `Cargo.toml` depends on `zero_py`, `zero_search`, its engine crate and
 //! `pyo3 = { version = "0.23", features = ["extension-module"] }`). The module exposes `Game`,
-//! `SearchTree`, `SearchDriver`, `game_names()`, `game_info_of(name)` and `MAX_SEATS`.
+//! `SearchTree`, `SearchDriver`, `Lookahead` (the position API of docs/search.md 3.9),
+//! `game_names()`, `game_info_of(name)`, `lookahead_settings(settings)` and `MAX_SEATS`.
 use std::sync::OnceLock;
 
 use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
@@ -20,7 +21,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
-use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynTree, GameInfo};
+use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
+use zero_search::lookahead::{LookCfg, Outcome};
 use zero_search::{SearchGame, MAX_SEATS};
 
 /// For `engine_module!` (the game crate needs its own `pyo3` dependency too: the PyO3 macros
@@ -72,6 +74,8 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_class::<PyGame>()?;
     m.add_class::<PySearchTree>()?;
     m.add_class::<PySearchDriver>()?;
+    m.add_class::<PyLookahead>()?;
+    m.add_function(wrap_pyfunction!(lookahead_settings, m)?)?;
     m.add_function(wrap_pyfunction!(game_names, m)?)?;
     m.add_function(wrap_pyfunction!(game_info_of, m)?)?;
     m.add_function(wrap_pyfunction!(root_floor_of, m)?)?;
@@ -145,7 +149,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -199,6 +203,11 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         }
     }
     let root_search = RootSearch::parse(&root_search, get(d, "gumbel_m", 16u32)?, get(d, "gumbel_scale", 1.0f64)?, get(d, "gumbel_c_visit", cq_c_visit)?, get(d, "gumbel_c_scale", cq_c_scale)?).map_err(verr)?;
+    // the exhaustive lookahead (docs/search.md 3.9): a dict of its settings (or their JSON), None = off
+    let look = match d.get_item("lookahead")? {
+        Some(v) if !v.is_none() => Some(Box::new(LookCfg::parse(&spec_json(Some(&v))?).map_err(verr)?)),
+        _ => None,
+    };
     Ok(SeatCfg::Nn(NnSeat {
         key,
         sims: get(d, "sims", 100u32)?,
@@ -237,6 +246,7 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         belief_mix: get(d, "belief_mix", 0.0f64)?,
         belief_fast: flag(d, "belief_fast", false)?,
         root_search,
+        look,
     }))
 }
 
@@ -285,6 +295,13 @@ fn belief_weight_of(pred: f64, uniform: f64, tilt: f64, clip: f64) -> f64 {
 #[pyo3(name = "gumbel_sequence")]
 fn gumbel_sequence_of(m: u32, n: u32) -> Vec<u32> {
     zero_search::tree::gumbel_sequence(m, n)
+}
+
+/// A lookahead's settings checked (docs/search.md 3.9; a dict or its JSON) -> their canonical JSON
+/// (every setting, defaults filled in); a ValueError names a bad or unknown one.
+#[pyfunction]
+fn lookahead_settings(settings: &Bound<'_, PyAny>) -> PyResult<String> {
+    Ok(LookCfg::parse(&spec_json(Some(settings))?).map_err(verr)?.to_json())
 }
 
 /// Registered game names.
@@ -852,6 +869,30 @@ impl PySearchDriver {
         d.set_item("step_max_s", s.step_max_s)?;
         d.set_item("step_max_gid", s.step_max_gid)?;
         d.set_item("slow_steps", s.slow_steps)?;
+        if s.look.decisions > 0 {
+            // the lookahead seats' counters (docs/search.md 3.9; only a driver with lookahead decisions)
+            let l = &s.look;
+            let ld = PyDict::new(py);
+            ld.set_item("decisions", l.decisions)?;
+            ld.set_item("nodes", l.nodes)?;
+            ld.set_item("leaves", l.leaves)?;
+            ld.set_item("prior_rows", l.prior_rows)?;
+            ld.set_item("value_rows", l.value_rows)?;
+            ld.set_item("minor_steps", l.minor_steps)?;
+            ld.set_item("groups", l.groups)?;
+            ld.set_item("cut", l.cut)?;
+            ld.set_item("rounds", l.rounds)?;
+            ld.set_item("rows", l.rows)?;
+            ld.set_item("fallback_stage", l.fallback_stage)?;
+            ld.set_item("fallback_last", l.fallback_last)?;
+            ld.set_item("fallback_mcts", l.fallback_mcts)?;
+            ld.set_item("minor_root", l.minor_root)?;
+            ld.set_item("aborted_nodes", l.aborted_nodes)?;
+            ld.set_item("peak_games", l.peak_games)?;
+            ld.set_item("by_stage", l.by_stage.clone())?;
+            ld.set_item("busy_s", l.busy_s)?;
+            d.set_item("look", ld)?;
+        }
         Ok(d)
     }
 
@@ -884,5 +925,133 @@ impl PySearchDriver {
         a.set_item("opt_action", b.opt_action.into_pyarray(py))?;
         a.set_item("extra", b.extra.into_pyarray(py))?;
         Ok(Some((b.id, key, "nn", a).into_pyobject(py)?.into_any().unbind()))
+    }
+}
+
+// ------------------------------------------------------------------------ Lookahead
+
+/// The exhaustive lookahead of one position (docs/search.md 3.9; the position API behind
+/// `zero.lookahead.evaluate_position`): `Lookahead(game, settings, worlds=None, seeds=None, seed=0,
+/// belief_tilt=0.0, belief_clip=BELIEF_CLIP, belief_mix=0.0, belief=None, lines=True)` - the pending
+/// decision of `game`; its worlds given (`worlds`: games at the same decision), else dealt from `seeds`
+/// (one per world) or `seed`'s stream; with `belief_tilt` > 0 dealt by the root's belief: `belief` (the
+/// predictions, f32 [aux_width]) or, None, asked for in a first round's `ROW_BELIEF` row. Drive it with
+/// `next_batch()` (None: decided) and `submit(priors, value, aux=None)`, then read `result()`, `line()`.
+#[pyclass(name = "Lookahead")]
+pub struct PyLookahead {
+    l: Box<dyn DynLook>,
+    nfeat: usize,
+}
+
+#[pymethods]
+impl PyLookahead {
+    #[new]
+    #[pyo3(signature = (game, settings, worlds=None, seeds=None, seed=0, belief_tilt=0.0, belief_clip=BELIEF_CLIP, belief_mix=0.0, belief=None, lines=true))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(game: &PyGame, settings: &Bound<'_, PyAny>, worlds: Option<Vec<PyRef<'_, PyGame>>>, seeds: Option<Vec<u64>>, seed: u64, belief_tilt: f64, belief_clip: f64, belief_mix: f64, belief: Option<PyReadonlyArray1<'_, f32>>, lines: bool) -> PyResult<Self> {
+        let cfg = LookCfg::parse(&spec_json(Some(settings))?).map_err(verr)?;
+        let ws: Vec<&dyn DynGame> = worlds.as_ref().map(|v| v.iter().map(|w| &*w.g).collect()).unwrap_or_default();
+        let b = (belief_tilt > 0.0).then_some((belief_tilt, belief_clip, belief_mix));
+        if b.is_none() && belief.is_some() {
+            return Err(PyValueError::new_err("lookahead: belief predictions without a belief_tilt > 0"));
+        }
+        let pred = match &belief {
+            Some(p) => Some(p.as_slice().map_err(|e| PyValueError::new_err(format!("belief: {e}")))?.to_vec()),
+            None => None,
+        };
+        let l = game.g.lookahead(cfg, ws, seeds.unwrap_or_default(), seed, b, pred, lines).map_err(verr)?;
+        Ok(PyLookahead { l, nfeat: game.g.info().num_features })
+    }
+
+    /// The next round's rows - {x [b, F], opt_off, opt_action, player, n_players, extra} (a network
+    /// batch as the driver's) - or None when the decision is made.
+    fn next_batch<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(r) = py.allow_threads(|| self.l.step()).map_err(rerr)? else { return Ok(None) };
+        let a = PyDict::new(py);
+        let n = r.b;
+        a.set_item("x", r.x.into_pyarray(py).reshape([n, self.nfeat])?)?;
+        a.set_item("opt_off", r.opt_off.into_pyarray(py))?;
+        a.set_item("opt_action", r.opt_action.into_pyarray(py))?;
+        a.set_item("player", r.player.into_pyarray(py))?;
+        a.set_item("n_players", r.n_players.into_pyarray(py))?;
+        a.set_item("extra", r.extra.into_pyarray(py))?;
+        Ok(Some(a))
+    }
+
+    /// The last round's answers: priors f32 [options], value f32 [b, MAX_SEATS] (relative to each row's
+    /// player), `aux` f32 [belief rows, aux_width] when the round has a root belief row.
+    #[pyo3(signature = (priors, value, aux=None))]
+    fn submit(&mut self, priors: PyReadonlyArray1<'_, f32>, value: PyReadonlyArray2<'_, f32>, aux: Option<PyReadonlyArray2<'_, f32>>) -> PyResult<()> {
+        if value.shape()[1] != MAX_SEATS {
+            return Err(PyValueError::new_err(format!("value must be [B, {MAX_SEATS}]")));
+        }
+        let p = priors.as_slice().map_err(|e| PyValueError::new_err(format!("priors: {e}")))?;
+        let v = value.as_slice().map_err(|e| PyValueError::new_err(format!("value: {e}")))?;
+        let a = match &aux {
+            Some(a) => a.as_slice().map_err(|e| PyValueError::new_err(format!("aux: {e}")))?,
+            None => &[],
+        };
+        self.l.submit(p, v, a).map_err(verr)
+    }
+
+    /// After the decision: {'outcome': the chosen action (or 'mcts': every stage over the budget),
+    /// 'options': [{'action', 'values': [[world, value], ...], 'mean', 'sd'}] in the root's order,
+    /// 'stats': the counters, 'settings': the stage's settings (JSON)}.
+    fn result<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        match self.l.outcome() {
+            None => return Err(PyRuntimeError::new_err("lookahead: not decided yet (next_batch until None)")),
+            Some(Outcome::Act(a)) => d.set_item("outcome", a)?,
+            Some(Outcome::Mcts) => d.set_item("outcome", "mcts")?,
+        }
+        let opts = PyList::empty(py);
+        let st = self.l.stats();
+        if !st.last && !st.minor_root {
+            for o in self.l.options().map_err(rerr)? {
+                let od = PyDict::new(py);
+                od.set_item("action", o.act)?;
+                od.set_item("values", o.values.iter().map(|&(w, v)| (w, v)).collect::<Vec<_>>())?;
+                od.set_item("mean", o.mean)?;
+                od.set_item("sd", o.sd)?;
+                opts.append(od)?;
+            }
+        }
+        d.set_item("options", opts)?;
+        let sd = PyDict::new(py);
+        sd.set_item("nodes", st.nodes)?;
+        sd.set_item("leaves", st.leaves)?;
+        sd.set_item("prior_rows", st.prior_rows)?;
+        sd.set_item("value_rows", st.value_rows)?;
+        sd.set_item("minor_steps", st.minor_steps)?;
+        sd.set_item("cut", st.cut)?;
+        sd.set_item("groups", st.groups)?;
+        sd.set_item("rounds", st.rounds)?;
+        sd.set_item("rows", st.rows)?;
+        sd.set_item("stage", st.stage)?;
+        sd.set_item("last", st.last)?;
+        sd.set_item("aborted_nodes", st.aborted_nodes)?;
+        sd.set_item("minor_root", st.minor_root)?;
+        sd.set_item("peak_games", st.peak_games)?;
+        d.set_item("stats", sd)?;
+        d.set_item("settings", self.l.cfg_json())?;
+        Ok(d)
+    }
+
+    /// World `world`'s line after root option `action` under the solved policy: ([(player, action,
+    /// minor)], where it ended: 'game over' | 'horizon' | 'cut' | 'plies' | 'no options'), None when
+    /// the world's root group did not expand it.
+    fn line(&mut self, world: usize, action: u16) -> PyResult<Option<(Vec<(u8, u16, bool)>, &'static str)>> {
+        Ok(self.l.line(world, action).map_err(rerr)?.map(|(l, e)| (l, e.name())))
+    }
+
+    /// The worlds (after the deal): games at the root decision.
+    fn worlds(&self) -> Vec<PyGame> {
+        self.l.worlds().into_iter().map(|g| PyGame { g }).collect()
+    }
+
+    /// The root belief's predictions the worlds were dealt by (None: uniform worlds).
+    #[getter]
+    fn belief(&self) -> Option<Vec<f32>> {
+        self.l.belief()
     }
 }

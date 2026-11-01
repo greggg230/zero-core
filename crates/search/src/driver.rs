@@ -61,6 +61,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::game::{make_bot, Belief, Bot, SearchGame, MAX_SEATS};
+use crate::lookahead::{Look, LookCfg};
 use crate::rng::{split64, Rng};
 use crate::tree::Tree;
 
@@ -361,12 +362,17 @@ pub struct NnSeat {
     pub belief_fast: bool,
     /// The root search (docs/search.md 3.7; default `RootSearch::Puct`).
     pub root_search: RootSearch,
+    /// The exhaustive lookahead (docs/search.md 3.9; None, the default: the seat searches with MCTS):
+    /// every decision of the seat is decided by `lookahead::Look` with these settings, its rows in the
+    /// driver's batches; the seat's MCTS settings serve its final fallback (`Last::Mcts`). An
+    /// evaluation seat (no records).
+    pub look: Option<Box<LookCfg>>,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None }
     }
 
     /// The belief settings' check (`Driver::new`; the bindings' messages): tilt finite >= 0, clip
@@ -679,6 +685,8 @@ enum Pending {
     Leaf { key: u16, local: u32, seat: usize, node: u32, vrow: bool, brow: bool },
     /// A reused root's belief row alone: the search waits for it (docs/search.md 3.8).
     Belief { key: u16, local: u32, seat: usize },
+    /// A lookahead's round of rows from `local` (docs/search.md 3.9).
+    Look { key: u16, local: u32 },
     Ext { key: u16, local: u32 },
 }
 
@@ -726,6 +734,10 @@ struct Slot<G: SearchGame> {
     /// The current decision's Gumbel noise per root option (`RootSearch::Gumbel`; empty: none),
     /// kept for a restarted search of the same decision.
     gnoise: Vec<f64>,
+    /// The lookahead of the current decision (a lookahead seat, docs/search.md 3.9), and whether the
+    /// decision fell back to the seat's MCTS search (every stage over its budget).
+    look: Option<Box<Look<G>>>,
+    look_mcts: bool,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -763,6 +775,8 @@ impl<G: SearchGame> Slot<G> {
             net: 0,
             moves: Vec::new(),
             gnoise: Vec::new(),
+            look: None,
+            look_mcts: false,
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -870,6 +884,64 @@ struct Counters {
     step_max_ns: AtomicU64,
     step_max_gid: AtomicU64,
     slow_steps: AtomicU64,
+    /// The lookahead seats' decisions and their counters (docs/search.md 3.9; `LookTotals`).
+    look: Mutex<LookTotals>,
+}
+
+/// The lookahead seats' counters summed over their decisions (`DriverStats::look`, docs/search.md
+/// 3.9): decisions, the lookahead's nodes / leaves / rows / rounds of the stage that decided, the
+/// decisions that needed a fallback stage, the final fallback, a minor root's top prior, aborted
+/// stages' nodes, the most live member games of one decision, the rows of every round.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LookTotals {
+    pub decisions: u64,
+    pub nodes: u64,
+    pub leaves: u64,
+    pub prior_rows: u64,
+    pub value_rows: u64,
+    pub minor_steps: u64,
+    pub groups: u64,
+    pub cut: u64,
+    pub rounds: u64,
+    pub rows: u64,
+    /// Decisions a fallback stage decided, decisions the final fallback decided (and of those, the
+    /// MCTS searches), minor roots (the network's top prior, no lookahead).
+    pub fallback_stage: u64,
+    pub fallback_last: u64,
+    pub fallback_mcts: u64,
+    pub minor_root: u64,
+    pub aborted_nodes: u64,
+    pub peak_games: u64,
+    /// Decisions per stage that decided (index = `LookStats::stage`; the last = the final fallback).
+    pub by_stage: Vec<u64>,
+    /// Wall time of the lookahead's own work on the search threads (s, summed over threads).
+    pub busy_s: f64,
+}
+
+impl LookTotals {
+    pub fn add(&mut self, s: &crate::lookahead::LookStats, mcts: bool) {
+        self.decisions += 1;
+        self.nodes += s.nodes;
+        self.leaves += s.leaves;
+        self.prior_rows += s.prior_rows;
+        self.value_rows += s.value_rows;
+        self.minor_steps += s.minor_steps;
+        self.groups += s.groups;
+        self.cut += s.cut;
+        self.rounds += s.rounds;
+        self.rows += s.rows;
+        self.fallback_stage += (s.stage > 0 && !s.last) as u64;
+        self.fallback_last += s.last as u64;
+        self.fallback_mcts += mcts as u64;
+        self.minor_root += s.minor_root as u64;
+        self.aborted_nodes += s.aborted_nodes;
+        self.peak_games = self.peak_games.max(s.peak_games);
+        let k = s.stage as usize;
+        if self.by_stage.len() <= k {
+            self.by_stage.resize(k + 1, 0);
+        }
+        self.by_stage[k] += 1;
+    }
 }
 
 /// A game's step longer than this counts as slow (`DriverStats::slow_steps`): an engine's slow
@@ -964,6 +1036,8 @@ pub struct DriverStats {
     pub step_max_s: f64,
     pub step_max_gid: u64,
     pub slow_steps: u64,
+    /// The lookahead seats' counters (docs/search.md 3.9; all 0 without one).
+    pub look: LookTotals,
 }
 
 /// The games in progress.
@@ -1047,6 +1121,13 @@ impl<G: SearchGame> Driver<G> {
                         return Err(format!("belief_tilt {}: {} has no auxiliary targets (SearchGame::AUX) for a belief to predict", n.belief_tilt, G::NAME));
                     }
                     n.root_search.check()?;
+                    if let Some(lc) = &n.look {
+                        // (docs/search.md 3.9: an evaluation seat; its rows are batched like leaves)
+                        lc.check()?;
+                        if n.selfplay {
+                            return Err("lookahead: an evaluation seat (selfplay false): it records no training samples yet".into());
+                        }
+                    }
                     if matches!(n.root_search, RootSearch::Gumbel { .. }) {
                         // (docs/search.md 3.7: sequential halving already visits every considered option)
                         if n.root_min_visits > 0 {
@@ -1355,6 +1436,10 @@ impl<G: SearchGame> Driver<G> {
                 if !out.batches.is_empty() {
                     for ch in &self.sh.groups[g].chunks {
                         for s in lock(ch).slots.iter_mut() {
+                            // (a lookahead's unanswered round: its decision is looked at again)
+                            if matches!(s.pending, Some(Pending::Look { .. })) {
+                                s.look = None;
+                            }
                             s.pending = None;
                         }
                     }
@@ -1580,6 +1665,7 @@ impl<G: SearchGame> Driver<G> {
             step_max_s: c.step_max_ns.load(Ordering::Relaxed) as f64 * 1e-9,
             step_max_gid: c.step_max_gid.load(Ordering::Relaxed),
             slow_steps: c.slow_steps.load(Ordering::Relaxed),
+            look: lock(&c.look).clone(),
         }
     }
 

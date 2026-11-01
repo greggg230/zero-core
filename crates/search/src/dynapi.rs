@@ -3,8 +3,9 @@
 //! behind one class each: registering a game is one line in the game's `zero_py::engine_module!`.
 use std::any::Any;
 
-use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record, Select};
+use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record, Select, ROW_BELIEF};
 use crate::game::{bot_names, Belief, SearchGame, MAX_SEATS};
+use crate::lookahead::{Answers, Line, Look, LookCfg, LookStats, OptionValue, Outcome, RowSink, Step};
 use crate::rng::Rng;
 use crate::tree::{leaf_values_team, Scratch, Sim, Tree, Walk};
 
@@ -56,6 +57,12 @@ pub trait DynGame: Send + Sync {
     fn aux_target(&self, viewer: usize) -> Vec<f32>;
     /// A search tree for this game's pending decision.
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String>;
+    /// The lookahead of this game's pending decision (docs/search.md 3.9; `lookahead::Look::new`):
+    /// its worlds given (`worlds`, games of this type at the same decision), or dealt from `seeds`, or
+    /// from `seed`'s stream; the root belief as settings to ask for (`belief` (tilt, clip, mix): one
+    /// belief row first) or as predictions given (`pred`, with `belief`'s tilt / clip / mix).
+    #[allow(clippy::too_many_arguments)]
+    fn lookahead(&self, cfg: LookCfg, worlds: Vec<&dyn DynGame>, seeds: Vec<u64>, seed: u64, belief: Option<(f64, f64, f64)>, pred: Option<Vec<f32>>, lines: bool) -> Result<Box<dyn DynLook>, String>;
 }
 
 impl<G: SearchGame> DynGame for G {
@@ -143,6 +150,19 @@ impl<G: SearchGame> DynGame for G {
         let legal = DynGame::legal(self);
         let t = Tree::new(self, viewer, &legal, redet, &mut rng);
         Ok(Box::new(TreeBox { t, rng, scratch: None, sc: Scratch::default(), leaf: None }))
+    }
+    fn lookahead(&self, cfg: LookCfg, worlds: Vec<&dyn DynGame>, seeds: Vec<u64>, seed: u64, belief: Option<(f64, f64, f64)>, pred: Option<Vec<f32>>, lines: bool) -> Result<Box<dyn DynLook>, String> {
+        let viewer = SearchGame::to_move(self).ok_or("the game is over")?;
+        let ws = worlds.into_iter().map(|w| downcast::<G>(w).cloned()).collect::<Result<Vec<G>, String>>()?;
+        if !ws.is_empty() && ws.len() != cfg.worlds as usize {
+            return Err(format!("lookahead: {} worlds given, the settings say {}", ws.len(), cfg.worlds));
+        }
+        let mut l = Look::new(cfg, self, viewer, belief, ws, seeds, lines)?;
+        if let Some(p) = pred {
+            let (t, c, _) = belief.ok_or("lookahead: belief predictions without the belief's tilt / clip / mix")?;
+            l.set_belief(belief_of::<G>(&p, t, c)?)?;
+        }
+        Ok(Box::new(LookBox { l, rng: Rng::new(seed), rows: None }))
     }
 }
 
@@ -423,6 +443,138 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     }
     fn n_nodes(&self) -> usize {
         self.t.n_nodes()
+    }
+}
+
+/// One round of a lookahead's rows for Python (`DynLook::step`): a network batch as the driver's
+/// (`Batch`'s arrays: features [b * F], option segments, player, players, row kinds).
+pub struct LookRows {
+    pub b: usize,
+    pub x: Vec<f32>,
+    pub opt_off: Vec<i32>,
+    pub opt_action: Vec<i32>,
+    pub player: Vec<i32>,
+    pub n_players: Vec<i32>,
+    pub extra: Vec<u8>,
+}
+
+/// One lookahead driven from Python (the position API, docs/search.md 3.9).
+pub trait DynLook: Send + Sync {
+    /// The next round's rows (None: the decision is made).
+    fn step(&mut self) -> Result<Option<LookRows>, String>;
+    /// The answers of the last round: priors over its options, values [b x MAX_SEATS] relative to
+    /// each row's player, its belief rows' auxiliary outputs in row order.
+    fn submit(&mut self, priors: &[f32], value: &[f32], aux: &[f32]) -> Result<(), String>;
+    fn outcome(&self) -> Option<Outcome>;
+    fn options(&mut self) -> Result<Vec<OptionValue>, String>;
+    fn stats(&self) -> LookStats;
+    fn line(&mut self, world: usize, act: u16) -> Result<Option<Line>, String>;
+    fn worlds(&self) -> Vec<Box<dyn DynGame>>;
+    fn belief(&self) -> Option<Vec<f32>>;
+    /// The settings of the stage that ran (`LookCfg::to_json`).
+    fn cfg_json(&self) -> String;
+}
+
+/// The rows of a round in Python's arrays (`DynLook::step`).
+#[derive(Default)]
+struct RowsBuf {
+    x: Vec<f32>,
+    nopt: Vec<i32>,
+    opt_action: Vec<i32>,
+    player: Vec<i32>,
+    n: usize,
+    extra: Vec<u8>,
+}
+
+impl<G: SearchGame> RowSink<G> for RowsBuf {
+    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8) {
+        let off = self.x.len();
+        self.x.resize(off + G::NUM_FEATURES, 0.0);
+        g.encode(viewer, &mut self.x[off..]);
+        self.nopt.push(opts.len() as i32);
+        self.opt_action.extend(opts.iter().map(|&a| a as i32));
+        self.player.push(viewer as i32);
+        self.n = g.num_players();
+        self.extra.push(kind);
+    }
+}
+
+struct LookBox<G: SearchGame> {
+    l: Look<G>,
+    rng: Rng,
+    /// The last round's option offsets and row kinds (for its answers).
+    rows: Option<(Vec<i32>, Vec<u8>)>,
+}
+
+impl<G: SearchGame> DynLook for LookBox<G> {
+    fn step(&mut self) -> Result<Option<LookRows>, String> {
+        if self.rows.is_some() {
+            return Err("lookahead: submit the last rows' answers first".into());
+        }
+        let mut buf = RowsBuf::default();
+        match self.l.step(&mut buf, &mut self.rng)? {
+            Step::Done => Ok(None),
+            Step::Rows(b) => {
+                let mut opt_off = Vec::with_capacity(b + 1);
+                opt_off.push(0);
+                let mut o = 0;
+                for &k in &buf.nopt {
+                    o += k;
+                    opt_off.push(o);
+                }
+                self.rows = Some((opt_off.clone(), buf.extra.clone()));
+                Ok(Some(LookRows { b, x: buf.x, opt_off, opt_action: buf.opt_action, player: buf.player, n_players: vec![buf.n as i32; b], extra: buf.extra }))
+            }
+        }
+    }
+    fn submit(&mut self, priors: &[f32], value: &[f32], aux: &[f32]) -> Result<(), String> {
+        let (opt_off, extra) = self.rows.take().ok_or("lookahead: no rows to answer")?;
+        let b = extra.len();
+        let nopt = *opt_off.last().unwrap_or(&0) as usize;
+        if priors.len() != nopt || value.len() != b * MAX_SEATS {
+            let e = format!("lookahead answers: priors {} (want {nopt}), value {} (want {})", priors.len(), value.len(), b * MAX_SEATS);
+            self.rows = Some((opt_off, extra));
+            return Err(e);
+        }
+        let w = G::aux_width();
+        let mut aux_row = vec![u32::MAX; b];
+        let mut k = 0;
+        for (r, &e) in extra.iter().enumerate() {
+            if e == ROW_BELIEF {
+                aux_row[r] = k;
+                k += 1;
+            }
+        }
+        if aux.len() != k as usize * w {
+            let e = format!("lookahead answers: {} auxiliary values for {k} belief rows of {w}", aux.len());
+            self.rows = Some((opt_off, extra));
+            return Err(e);
+        }
+        if let Some(x) = aux.iter().find(|x| !x.is_finite() || **x < 0.0) {
+            return Err(format!("lookahead answers: a root belief output {x} (finite and >= 0)"));
+        }
+        self.l.answer(&Answers { base: 0, opt_off: &opt_off, priors, value, aux, aux_row: &aux_row, aux_width: w })
+    }
+    fn outcome(&self) -> Option<Outcome> {
+        self.l.outcome()
+    }
+    fn options(&mut self) -> Result<Vec<OptionValue>, String> {
+        self.l.options()
+    }
+    fn stats(&self) -> LookStats {
+        self.l.stats().clone()
+    }
+    fn line(&mut self, world: usize, act: u16) -> Result<Option<Line>, String> {
+        self.l.line(world, act)
+    }
+    fn worlds(&self) -> Vec<Box<dyn DynGame>> {
+        self.l.worlds().iter().map(|w| Box::new(w.clone()) as Box<dyn DynGame>).collect()
+    }
+    fn belief(&self) -> Option<Vec<f32>> {
+        self.l.belief().map(|b| b.pred.clone())
+    }
+    fn cfg_json(&self) -> String {
+        self.l.cfg().to_json()
     }
 }
 

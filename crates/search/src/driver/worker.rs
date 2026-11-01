@@ -1,6 +1,7 @@
 //! The driver's worker threads: advancing games (search, bots, external requests), batch
 //! assembly, finished games and training records.
 use super::*;
+use crate::lookahead::{Answers, Outcome, RowSink, Step as LookStep};
 use crate::tree::{leaf_values_team, transition_with, Scratch as SimScratch, Sim, Walk};
 
 struct WScratch<G: SearchGame> {
@@ -158,6 +159,14 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
                     };
                     slot.ext_payload = Some(payloads[(bases[c] + local) as usize].clone());
                 }
+                Some(Pending::Look { key, local }) => {
+                    // a lookahead's round (docs/search.md 3.9): its rows' answers
+                    let Some(Eval::Nn { opt_off, priors, value, bases, aux, aux_row, .. }) = evals[key as usize].as_ref() else {
+                        return Err("internal: missing network evaluation".into());
+                    };
+                    let ans = Answers { base: (bases[c] + local) as usize, opt_off, priors, value, aux, aux_row, aux_width: G::aux_width() };
+                    slot.look.as_mut().ok_or("internal: a lookahead answer without a lookahead")?.answer(&ans)?;
+                }
                 None => {}
             }
             advance_slot(sh, slot, &mut ch.bufs, &mut ch.results, &mut ch.samples, &mut ch.parked, scratch, &mut n)
@@ -249,6 +258,11 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
     if leaf || matches!(slot.pending, Some(Pending::Belief { .. })) {
         slot.pending = None;
     }
+    // (a lookahead begins again with the new network: docs/search.md 3.9)
+    if matches!(slot.pending, Some(Pending::Look { .. })) {
+        slot.pending = None;
+    }
+    slot.look = None;
     slot.drop_trees();
     slot.sims = 0;
     if slot.target.is_some() {
@@ -319,6 +333,8 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.pending = None;
     slot.ext_payload = None;
     slot.moves.clear();
+    slot.look = None;
+    slot.look_mcts = false;
     Ok(())
 }
 
@@ -385,6 +401,16 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             continue;
         }
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: a seat without a player")?;
+        if let Some(lc) = seat.look.as_deref() {
+            // a lookahead seat (docs/search.md 3.9): the lookahead decides, unless it fell back to the
+            // seat's MCTS search for this decision
+            if !slot.look_mcts {
+                if look_step(sh, slot, seat, lc, p, bufs, &mut scratch.sim.key)? {
+                    return Ok(());
+                }
+                continue;
+            }
+        }
         if slot.target.is_none() {
             start(slot, seat, p);
         }
@@ -459,6 +485,71 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             }
         }
     }
+}
+
+/// A lookahead's rows into a key's leaf buffer (docs/search.md 3.9): one row each, `encode(viewer)`
+/// with its options (none: value-only), kind as given.
+struct LeafSink<'a> {
+    buf: &'a mut LeafBuf,
+    gid: u32,
+    n: usize,
+}
+
+impl<G: SearchGame> RowSink<G> for LeafSink<'_> {
+    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8) {
+        let b = &mut *self.buf;
+        let off = b.x.len();
+        b.x.resize(off + G::NUM_FEATURES, 0.0);
+        g.encode(viewer, &mut b.x[off..]);
+        b.nopt.push(opts.len() as i32);
+        b.opt_action.extend(opts.iter().map(|&a| a as i32));
+        b.player.push(viewer as i32);
+        b.n_players.push(self.n as i32);
+        b.gid.push(self.gid as i64);
+        b.extra.push(kind);
+    }
+}
+
+/// The lookahead of seat `p`'s pending decision (docs/search.md 3.9): created at the decision's first
+/// step (its belief from the seat's settings, its worlds dealt from the slot's search stream), stepped
+/// until it needs rows (-> true: the slot waits for the batch) or decides: its move is played, or
+/// (every stage over the budget, `Last::Mcts`) the decision goes to the seat's MCTS search (-> false
+/// either way: the slot goes on). Its counters go to the driver's `LookTotals`.
+#[allow(clippy::too_many_arguments)]
+fn look_step<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, seat: &NnSeat, lc: &LookCfg, p: usize, bufs: &mut [LeafBuf], key: &mut Vec<u64>) -> Result<bool, String> {
+    let t0 = Instant::now();
+    if slot.look.is_none() {
+        let live = slot.game.as_ref().ok_or("internal: a lookahead without a game")?;
+        let belief = (seat.belief_tilt > 0.0).then_some((seat.belief_tilt, seat.belief_clip, seat.belief_mix));
+        slot.look = Some(Box::new(Look::new(lc.clone(), live, p, belief, Vec::new(), Vec::new(), false)?));
+    }
+    let buf = &mut bufs[seat.key as usize];
+    let local = buf.len() as u32;
+    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n };
+    let look = slot.look.as_mut().unwrap();
+    let r = look.step(&mut sink, &mut slot.search_rng);
+    let busy = t0.elapsed().as_secs_f64();
+    let r = r?;
+    if let LookStep::Rows(_) = r {
+        lock(&sh.counters.look).busy_s += busy;
+        slot.pending = Some(Pending::Look { key: seat.key, local });
+        return Ok(true);
+    }
+    let look = slot.look.take().unwrap();
+    let outcome = look.outcome().ok_or("internal: a lookahead done without an outcome")?;
+    {
+        let mut t = lock(&sh.counters.look);
+        t.busy_s += busy;
+        t.add(look.stats(), outcome == Outcome::Mcts);
+    }
+    match outcome {
+        Outcome::Act(a) => {
+            slot.decisions += 1;
+            apply(&sh.cfg, slot, a, key)?;
+        }
+        Outcome::Mcts => slot.look_mcts = true,
+    }
+    Ok(false)
 }
 
 /// A root belief row (`ROW_BELIEF`, docs/search.md 3.8): `encode(p)` of the live game, no options.
@@ -658,6 +749,7 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
     transition_with(g, a, None, key, &mut slot.legal, |q| !is_external(cfg, gid, q)).map_err(|e| format!("move {a} failed: {e}"))?;
     slot.legal_ok = true;
     slot.steps += 1;
+    slot.look_mcts = false;
     let nxt = g.to_move();
     for q in 0..slot.n {
         let keep = match (slot.trees[q].as_mut(), nxt) {
@@ -681,6 +773,8 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
     slot.ext_moves += 1;
     slot.steps += 1;
     slot.legal_ok = false;
+    slot.look = None;
+    slot.look_mcts = false;
     slot.drop_trees();
     slot.sims = 0;
     slot.target = None;
@@ -698,6 +792,8 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
     let rq = std::mem::take(&mut slot.rq);
     slot.view_wait.clear();
     slot.drop_trees();
+    slot.look = None;
+    slot.look_mcts = false;
     slot.gid = NO_GAME;
     slot.pending = None;
     slot.ext_payload = None;

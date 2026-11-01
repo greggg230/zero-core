@@ -169,6 +169,13 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
         let _ = belief;
         self.determinize(viewer, rng)
     }
+    /// The seat whose turn it is, for a game with turns (MTG's active player): the lookahead's
+    /// horizon 'next_turn' (docs/search.md 3.9) ends a line when the root decider's next turn begins
+    /// (`rounds()` past the root's and this seat the decider). Default None: the game has no turns
+    /// (that horizon is refused).
+    fn active_seat(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The root's belief of a search (docs/search.md 3.8): the network's auxiliary predictions for the

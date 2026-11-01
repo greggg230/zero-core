@@ -367,7 +367,8 @@ pub struct Tree<G: SearchGame> {
 
 /// Deal a world for `viewer` (docs/search.md 3.8): `determinize_with` the belief, but a `mix` share
 /// of the calls (one draw of `rng` when 0 < mix) and every call without a belief `determinize`.
-fn deal<G: SearchGame>(g: &mut G, viewer: usize, belief: Option<&Belief>, mix: f64, rng: &mut Rng) {
+/// (Also the lookahead's deal of its worlds, docs/search.md 3.9.)
+pub(crate) fn deal<G: SearchGame>(g: &mut G, viewer: usize, belief: Option<&Belief>, mix: f64, rng: &mut Rng) {
     match belief {
         Some(b) if !(mix > 0.0 && rng.unit() < mix) => g.determinize_with(viewer, rng, b),
         _ => g.determinize(viewer, rng),

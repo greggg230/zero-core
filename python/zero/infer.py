@@ -39,6 +39,13 @@ belief of the opponent's hand) -> each target's predictions (`net.aux_predict`).
 evaluator built before a run turned its auxiliary target on, or one with the head given an older
 state).
 
+`NetEvaluator(..., max_rows=n)` (opt-in, default None: every batch whole, as before): a batch of more
+than n rows is evaluated in consecutive pieces of at most n rows, their answers concatenated (the same
+answers up to the networks' float rounding at another batch shape). The lookahead's batches (docs/search.md
+3.9: up to `rows` per game in flight) can hold thousands of rows; the pieces keep a token network's CUDA
+graphs to a few shapes (one graph per padded shape) and its memory bounded. Such a batch is answered at
+once (`launch` computes it: no pipelining for it).
+
 `NetEvaluator(..., workers=k)` (k > 1; run setting `infer_workers`): eager batches are evaluated
 on k Python threads (torch releases the GIL), and `drive` keeps up to k batches in flight (the
 driver needs as many `groups`). For small networks on a CPU, where one batch cannot keep the
@@ -451,7 +458,11 @@ class NetEvaluator:
     encoding: it would read the first floats of each row, or fail later) raises
     net.EncodingMismatch; `allow_mismatch=True` skips it (tools/selfplay_digest.py)."""
 
-    def __init__(self, model, device='cpu', graphs=None, workers=1, allow_mismatch=False):
+    def __init__(self, model, device='cpu', graphs=None, workers=1, allow_mismatch=False, max_rows=None):
+        if max_rows is not None and int(max_rows) < 1:
+            raise ValueError(f'max_rows {max_rows}: at least 1 (None: every batch whole)')
+        self.max_rows = None if max_rows is None else int(max_rows)
+        self.pieces = 0                              # batches split by max_rows
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
         self.width = None if allow_mismatch else getattr(model, 'features', None)
@@ -519,11 +530,35 @@ class NetEvaluator:
                                    f'(game {c.get("game")!r}, arch {c.get("arch", "mlp")!r}): the network was built for '
                                    f'another encoding than its driver feeds it')
 
+    def _pieces(self, x, n_players, opt_off, opt_action, extra):
+        """`evaluate` of a batch over max_rows rows: consecutive pieces of at most max_rows rows, their
+        answers concatenated (priors in option order, rows in row order, belief rows in row order)."""
+        B, M = x.shape[0], self.max_rows
+        self.pieces += 1
+        pri, val, mar, aux = [], [], [], []
+        opt_off = np.asarray(opt_off)
+        for a in range(0, B, M):
+            b = min(B, a + M)
+            off = (opt_off[a:b + 1] - opt_off[a]).astype(opt_off.dtype)
+            ex = None if extra is None else extra[a:b]
+            r = self.evaluate(x[a:b], n_players[a:b], off, opt_action[opt_off[a]:opt_off[b]], ex, _whole=True)
+            pri.append(r[0])
+            val.append(r[1])
+            mar.append(r[2])
+            if len(r) > 3:
+                aux.append(r[3])
+        out = (np.concatenate(pri).astype(np.float32, copy=False), np.concatenate(val), np.concatenate(mar))
+        if aux:
+            return out + (np.concatenate(aux),)
+        return out
+
     @torch.inference_mode()
-    def evaluate(self, x, n_players, opt_off, opt_action, extra=None):
+    def evaluate(self, x, n_players, opt_off, opt_action, extra=None, _whole=False):
         """numpy in -> (priors [options], value [B, MAX_SEATS], margin [B, MAX_SEATS]) numpy; with root
         belief rows in `extra` (docs/search.md 3.8) a fourth item, their auxiliary predictions
-        [belief rows, aux width]."""
+        [belief rows, aux width]. With `max_rows`, a bigger batch goes in pieces (`_pieces`)."""
+        if self.max_rows is not None and not _whole and x.shape[0] > self.max_rows:
+            return self._pieces(x, n_players, opt_off, opt_action, extra)
         t0 = time.perf_counter()
         self._check_width(x)
         brows = belief_rows(extra)
@@ -620,6 +655,9 @@ class NetEvaluator:
         """Start evaluating a LeafBatch; `result(handle)` -> what `ev(lb)` returns. Eager
         evaluators compute at once (or on a worker thread, `workers` > 1)."""
         extra = lb.a.get('extra')
+        if self.max_rows is not None and lb.B > self.max_rows:
+            # (in pieces, answered now: `_pieces`)
+            return ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra), 0)
         if self.pool is not None:
             return ('f', self.pool.submit(self.evaluate, lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra), 0)
         t0 = time.perf_counter()

@@ -46,6 +46,15 @@ ZERO_TOKEN_GRAPHS=1). Given, the output names `graphs_a` / `graphs_b` (each side
 batches over its batches: 1.0 = every batch). `A A --a-graphs 1 --b-graphs 0` is the equivalence
 check of a token network's graphs against its eager inference.
 
+The exhaustive lookahead (docs/search.md 3.9): --a-lookahead / --b-lookahead SETTINGS (or --lookahead
+for both) make a side a lookahead seat - its decisions decided by the lookahead per information set
+(`zero.lookahead.parse`: e.g. `plies=6,worlds=8,topk=0,opp=best,mode=infoset,budget=200000`), its worlds
+dealt by its seat's root belief, its final fallback (every budget stage over) its seat's MCTS search
+with the settings above. The output adds `lookahead_a` / `lookahead_b` (the canonical settings),
+`look` (the driver's lookahead counters: decisions, nodes, rows, fallbacks per stage...) and
+`max_rows`: batches over --max-rows rows (default 1024 with a lookahead side, else whole) are evaluated
+in pieces (`NetEvaluator(max_rows=)`, the CUDA graphs' shapes bounded).
+
 Paired games and sequential testing (docs/az.md 20.3):
 
   --paired          games 2k and 2k + 1 share every random stream (the deal, shuffles, chance: the
@@ -74,7 +83,7 @@ import os
 import sys
 import time
 
-from . import games as G, package
+from . import games as G, lookahead as LA, package
 from .infer import NetEvaluator, drive
 from .mcts import (belief_settings, belief_tag, check_belief, check_root_search, check_select, check_select_transform,
                    forced_tag, gumbel_tag, select_settings, select_tag, select_transform, view_tag)
@@ -294,7 +303,7 @@ def _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, s
     return sa, sb
 
 
-def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired):
+def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, stats_out=None):
     seats = [[sa, sb] if g % 2 == 0 else [sb, sa] for g in range(games)]
     kw = {'move_log': move_log} if move_log else {}
     if paired:
@@ -302,7 +311,39 @@ def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps
     drv = G.Driver(game, seats, spec=spec, concurrency=conc or min(games, 1024), seed=seed, threads=threads,
                    groups=groups, max_steps=max_steps, **kw)
     drive(drv, evs)
+    if stats_out is not None:
+        stats_out.append(drv.stats())
     return drv.take_results()
+
+
+LOOK_SUMS = ('decisions', 'nodes', 'leaves', 'prior_rows', 'value_rows', 'minor_steps', 'groups', 'cut', 'rounds', 'rows',
+             'fallback_stage', 'fallback_last', 'fallback_mcts', 'minor_root', 'aborted_nodes', 'busy_s')
+
+
+def look_summary(stats):
+    """The lookahead counters of the drivers' `stats()` (docs/search.md 3.9), summed (by_stage per stage,
+    peak_games the max), with per-decision means; None when no driver had a lookahead decision."""
+    ls = [st['look'] for st in stats if st.get('look')]
+    if not ls:
+        return None
+    out = {k: sum(x[k] for x in ls) for k in LOOK_SUMS}
+    out['busy_s'] = round(out['busy_s'], 2)
+    out['peak_games'] = max(x['peak_games'] for x in ls)
+    by = []
+    for x in ls:
+        for i, v in enumerate(x['by_stage']):
+            if i >= len(by):
+                by.append(0)
+            by[i] += v
+    out['by_stage'] = by
+    d = max(1, out['decisions'])
+    out['per_decision'] = {k: round(out[k] / d, 1) for k in ('nodes', 'leaves', 'rows', 'rounds')}
+    return out
+
+
+def look_keys(spec):
+    """A side's lookahead seat key from its command-line settings (`lookahead.parse`; None: none)."""
+    return None if spec is None else LA.parse(spec)
 
 
 def summary(rs, paired=False):
@@ -329,11 +370,33 @@ def summary(rs, paired=False):
     return out
 
 
-def _evaluators(ma, mb, device, graphs):
+def _evaluators(ma, mb, device, graphs, max_rows=None):
     """Each side's NetEvaluator; `graphs` None (each one's default), a bool for both, or (a, b) (None:
-    that side's default)."""
+    that side's default); `max_rows`: batches evaluated in pieces of at most that many rows."""
     ga, gb = graphs if isinstance(graphs, (tuple, list)) else (graphs, graphs)
-    return {'a': NetEvaluator(ma, device, graphs=ga), 'b': NetEvaluator(mb, device, graphs=gb)}
+    kw = {} if max_rows is None else {'max_rows': int(max_rows)}
+    return {'a': NetEvaluator(ma, device, graphs=ga, **kw), 'b': NetEvaluator(mb, device, graphs=gb, **kw)}
+
+
+def _max_rows(sa, sb, max_rows):
+    """The evaluators' max_rows: as given, else 1024 when a side is a lookahead seat (its batches hold
+    up to `rows` per game in flight), else None (every batch whole)."""
+    if max_rows is not None:
+        return int(max_rows)
+    return 1024 if (sa.get('lookahead') or sb.get('lookahead')) else None
+
+
+def _look_out(out, sa, sb, stats, max_rows):
+    """The lookahead fields of a match's output (only with a lookahead side or max_rows)."""
+    for k, sd in (('a', sa), ('b', sb)):
+        if sd.get('lookahead'):
+            out[f'lookahead_{k}'] = LA.settings(sd['lookahead'])
+            out[f'lookahead_tag_{k}'] = LA.tag(sd['lookahead'])
+    ls = look_summary(stats)
+    if ls is not None:
+        out['look'] = ls
+    if max_rows is not None:
+        out['max_rows'] = max_rows
 
 
 def _graphs_used(out, evs, graphs):
@@ -347,7 +410,7 @@ def _graphs_used(out, evs, graphs):
 
 def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None,
           spec=None, conc=None, seat_a=None, seat_b=None, max_steps=5000, move_log=0, rows=False, paired=False,
-          sims_a=None, sims_b=None, graphs=None):
+          sims_a=None, sims_b=None, graphs=None, max_rows=None):
     """Checkpoint `a` vs checkpoint `b` (paths), `games` 2-player games, seats alternating. -> dict.
     `seat_a` / `seat_b`: each side's move-rule seat settings ({'select': 'cq', 'select_min_visits':
     2, ...}; {} = the default rule; None = its checkpoint's run's eval_select, `run_rule`).
@@ -355,19 +418,23 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     games' result rows under 'rows'. `paired`: games 2k and 2k + 1 share their deal with the seats
     swapped (`games` even; the output's `pairs`, `se` of the pair scores: `summary`). `sims_a` /
     `sims_b`: a side's simulations (None: `sims`). `graphs`: the sides' CUDA graphs (`_evaluators`;
-    given: `graphs_a` / `graphs_b` in the output)."""
+    given: `graphs_a` / `graphs_b` in the output). A seat dict with `lookahead` is a lookahead side
+    (docs/search.md 3.9: the output's `lookahead_*`, `look`); `max_rows` the evaluators' (`_max_rows`)."""
     if paired and games % 2:
         raise ValueError(f'paired games: an even number of games ({games})')
     ma, mb, game = _load_pair(a, b, device, game)
     spec = package.active().specs.get(game) if spec is None else spec
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
-    evs = _evaluators(ma, mb, device, graphs)
+    mr = _max_rows(sa, sb, max_rows)
+    evs = _evaluators(ma, mb, device, graphs, mr)
     t0 = time.time()
-    rs = _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired)
+    st = []
+    rs = _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, st)
     out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb))
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
+    _look_out(out, sa, sb, st, mr)
     if paired:
         out['paired'] = True
     if rows:
@@ -384,7 +451,7 @@ def _sides_sims(out, sims_a, sims_b):
 def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, beta=0.05, target_se=None, sims=64,
                chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None, spec=None, conc=None,
                seat_a=None, seat_b=None, max_steps=5000, paired=False, sims_a=None, sims_b=None, on_batch=None,
-               rows=False, graphs=None):
+               rows=False, graphs=None, max_rows=None):
     """`match` in batches of `batch_games` until decided: `sprt` (elo0, elo1) - the log-likelihood ratio
     (`sprt_llr`) leaves `sprt_bounds(alpha, beta)` - or `se` <= `target_se`, or `max_games` played. Batch k
     is seeded seed + 7919 k (batch 0: `seed`, the plain match's games). -> `match`'s dict over every game,
@@ -407,8 +474,10 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     ma, mb, game = _load_pair(a, b, device, game)
     spec = package.active().specs.get(game) if spec is None else spec
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
-    evs = _evaluators(ma, mb, device, graphs)
+    mr = _max_rows(sa, sb, max_rows)
+    evs = _evaluators(ma, mb, device, graphs, mr)
     t0 = time.time()
+    st = []
     rs, batches, stop, llr = [], [], None, None
     k = 0
     while stop is None:
@@ -418,7 +487,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
         if n <= 0:
             stop = 'max_games'
             break
-        got = _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired)
+        got = _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired, st)
         off = len(rs)
         rs += [dict(r, gid=r['gid'] + off) for r in got]
         cur = summary(rs, paired)
@@ -442,6 +511,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb), batches=batches, stop=stop)
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
+    _look_out(out, sa, sb, st, mr)
     if paired:
         out['paired'] = True
     if sprt is not None:
@@ -509,6 +579,14 @@ def main(argv=None):
     for side in ('a', 'b'):
         ap.add_argument(f'--{side}-graphs', type=int, default=None, choices=[0, 1],
                         help=f"side {side.upper()}'s CUDA graphs (over --graphs)")
+    ap.add_argument('--lookahead', default=None, metavar='SETTINGS',
+                    help="both sides lookahead seats (docs/search.md 3.9; zero.lookahead.parse, e.g. "
+                         "plies=6,worlds=8,opp=best,mode=infoset,budget=200000)")
+    for side in ('a', 'b'):
+        ap.add_argument(f'--{side}-lookahead', default=None, metavar='SETTINGS',
+                        help=f"side {side.upper()} a lookahead seat (over --lookahead)")
+    ap.add_argument('--max-rows', type=int, default=None,
+                    help='evaluate batches over this many rows in pieces (default: 1024 with a lookahead side, else whole)')
     ap.add_argument('--paired', action='store_true',
                     help='games 2k and 2k + 1 share their deal with the seats swapped (docs/az.md 20.3; --games even)')
     ap.add_argument('--sprt', default=None, metavar='E0,E1',
@@ -586,6 +664,16 @@ def main(argv=None):
             ap.error(f'side {side.upper()}: {e}')
         if getattr(a, f'{side}_gumbel_scale') is not None and sides[k].get('root_search') != 'gumbel':
             ap.error(f"--{side}-gumbel-scale: side {side.upper()} searches with PUCT")
+    for k, side in enumerate(('a', 'b')):
+        spec_l = getattr(a, f'{side}_lookahead') or a.lookahead
+        try:
+            lk = look_keys(spec_l)
+        except ValueError as e:
+            ap.error(f'side {side.upper()}: {e}')
+        if lk is not None:
+            sides[k] = dict(sides[k], lookahead=lk)
+    if a.max_rows is not None and a.max_rows < 1:
+        ap.error('--max-rows must be >= 1')
     graphs = None
     if (a.graphs, a.a_graphs, a.b_graphs) != (None, None, None):
         graphs = tuple(None if v is None else bool(v)
@@ -595,12 +683,13 @@ def main(argv=None):
         out = sequential(a.a, a.b, a.batch_games or a.games, a.max_games or 4 * a.games, sprt, a.alpha, a.beta,
                          a.target_se, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device, spec=a.spec,
                          seat_a=sides[0], seat_b=sides[1], paired=a.paired, sims_a=a.a_sims, sims_b=a.b_sims,
-                         on_batch=lambda r: print('# batch ' + json.dumps(r), file=sys.stderr, flush=True), graphs=graphs)
+                         on_batch=lambda r: print('# batch ' + json.dumps(r), file=sys.stderr, flush=True), graphs=graphs,
+                         max_rows=a.max_rows)
         print(json.dumps(out), flush=True)
         return
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
                            spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log, paired=a.paired,
-                           sims_a=a.a_sims, sims_b=a.b_sims, graphs=graphs)), flush=True)
+                           sims_a=a.a_sims, sims_b=a.b_sims, graphs=graphs, max_rows=a.max_rows)), flush=True)
 
 
 if __name__ == '__main__':
