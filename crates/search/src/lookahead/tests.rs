@@ -408,3 +408,24 @@ fn sparse_batches_carry_the_same_rows_and_play_the_same_games() {
     assert_eq!(a, b, "the same games");
     assert_eq!(la, lb);
 }
+
+#[test]
+fn the_guarded_player_overrides_mcts_only_by_more_than_its_margin() {
+    let run = |guard: f64| {
+        let mut s = NnSeat::eval(0, 16);
+        s.look = Some(Box::new(cfg(&format!(r#"{{"plies": 3, "worlds": 8, "guard": {guard}}}"#))));
+        let mut d = Driver::<Peek>::new(driver_cfg(vec![SeatCfg::Nn(s), SeatCfg::Nn(NnSeat::eval(0, 16))], 12, 2)).unwrap();
+        let res = run_peek(&mut d);
+        (res, d.stats().look)
+    };
+    // a margin of 0.05: PEEK (worth +0.32 over GO to the lookahead) whatever the MCTS search prefers
+    let (res, lk) = run(0.05);
+    assert!(lk.guard_decisions > 0 && lk.guard_decisions + lk.minor_root <= lk.decisions + 12 * 4, "{lk:?}");
+    for r in res.iter().filter(|r| r.gid % 2 == 0) {
+        assert_eq!(r.moves[0].1, PEEK, "game {}: {:?}", r.gid, r.moves);
+    }
+    // a margin of 0.9: never the lookahead's move
+    let (_, lk) = run(0.9);
+    assert!(lk.guard_decisions > 0 && lk.guard_overrides == 0, "{lk:?}");
+    assert!(LookCfg::parse(r#"{"guard": 1.0}"#).is_err() && LookCfg::parse(r#"{"guard": -0.1}"#).is_err());
+}

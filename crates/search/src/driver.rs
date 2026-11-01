@@ -799,6 +799,9 @@ struct Slot<G: SearchGame> {
     /// decision fell back to the seat's MCTS search (every stage over its budget).
     look: Option<Box<Look<G>>>,
     look_mcts: bool,
+    /// The guarded player (`LookCfg::guard`): the lookahead's mean per root option and the margin, for
+    /// the MCTS search's decision of the same decision.
+    look_guard: Option<(Vec<(u16, f64)>, f64)>,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -838,6 +841,7 @@ impl<G: SearchGame> Slot<G> {
             gnoise: Vec::new(),
             look: None,
             look_mcts: false,
+            look_guard: None,
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -984,6 +988,10 @@ pub struct LookTotals {
     pub by_stage: Vec<u64>,
     /// Wall time of the lookahead's own work on the search threads (s, summed over threads).
     pub busy_s: f64,
+    /// The guarded player (`LookCfg::guard`): its decisions compared and those where the lookahead's
+    /// move was played (its margin over the MCTS move above the guard).
+    pub guard_decisions: u64,
+    pub guard_overrides: u64,
 }
 
 impl LookTotals {

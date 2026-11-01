@@ -128,16 +128,21 @@ pub struct LookCfg {
     pub last: Last,
     pub rows: u32,
     pub dedup: bool,
+    /// The guarded player (a driver seat only; 0 = off): the seat's MCTS move unless the lookahead's
+    /// best option's value exceeds the MCTS move's by more than this (P(win), e.g. 0.05) - the
+    /// lookahead's max over many noisy leaf values is optimistic (the optimizer's curse), large margins
+    /// are not.
+    pub guard: f64,
 }
 
 impl Default for LookCfg {
     fn default() -> Self {
-        LookCfg { plies: 4, horizon: Horizon::Plies, max_plies: 40, worlds: 8, topk: 0, topk_root: false, topk_from_turn: None, opp: Opp::Min, mode: Mode::Infoset, budget: 0, fallback_topk: 4, fallback_plies: None, last: Last::Mcts, rows: 512, dedup: true }
+        LookCfg { plies: 4, horizon: Horizon::Plies, max_plies: 40, worlds: 8, topk: 0, topk_root: false, topk_from_turn: None, opp: Opp::Min, mode: Mode::Infoset, budget: 0, fallback_topk: 4, fallback_plies: None, last: Last::Mcts, rows: 512, dedup: true, guard: 0.0 }
     }
 }
 
 /// The settings `LookCfg::parse` knows.
-pub const LOOK_KEYS: &[&str] = &["plies", "horizon", "max_plies", "worlds", "topk", "topk_root", "topk_from_turn", "opp", "mode", "budget", "fallback_topk", "fallback_plies", "fallback", "rows", "dedup"];
+pub const LOOK_KEYS: &[&str] = &["plies", "horizon", "max_plies", "worlds", "topk", "topk_root", "topk_from_turn", "opp", "mode", "budget", "fallback_topk", "fallback_plies", "fallback", "rows", "dedup", "guard"];
 
 fn uint(v: &Value, k: &str) -> Result<u64, String> {
     v.as_u64().or_else(|| v.as_f64().filter(|x| x.fract() == 0.0 && *x >= 0.0).map(|x| x as u64)).ok_or_else(|| format!("lookahead {k}: a whole number >= 0 (got {v})"))
@@ -166,7 +171,7 @@ impl LookCfg {
     /// option), topk_root, topk_from_turn, opp ('min' | 'best' | 'expect' | 'policy' | 'top'), mode
     /// ('infoset' | 'world'), budget (nodes, 0 = none), fallback_topk, fallback_plies (a list or one
     /// number), fallback ('mcts' | 'prior'), rows (rows per batch), dedup (leaf values shared by
-    /// observation, default true).
+    /// observation, default true), guard (the guarded player's margin, 0 = off).
     pub fn parse(json: &str) -> Result<LookCfg, String> {
         let v: Value = serde_json::from_str(json).map_err(|e| format!("lookahead: {e}"))?;
         let o = v.as_object().ok_or_else(|| format!("lookahead: a JSON object of settings, not {v}"))?;
@@ -220,6 +225,7 @@ impl LookCfg {
                 }
                 "rows" => c.rows = u32_of(x, k)?,
                 "dedup" => c.dedup = boolean(x, k)?,
+                "guard" => c.guard = x.as_f64().ok_or_else(|| format!("lookahead guard: a number (got {x})"))?,
                 _ => return Err(format!("lookahead: unknown setting {k:?} (one of {LOOK_KEYS:?})")),
             }
         }
@@ -237,6 +243,9 @@ impl LookCfg {
         }
         if !(1..=4096).contains(&self.worlds) {
             return Err(format!("lookahead worlds {}: 1 to 4096", self.worlds));
+        }
+        if !(self.guard.is_finite() && (0.0..1.0).contains(&self.guard)) {
+            return Err(format!("lookahead guard {}: a margin of P(win) in [0, 1) (0 = off)", self.guard));
         }
         if !(1..=1 << 20).contains(&self.rows) {
             return Err(format!("lookahead rows {}: 1 to {}", self.rows, 1 << 20));
@@ -324,7 +333,7 @@ impl LookCfg {
             Last::Mcts => "mcts",
             Last::Prior => "prior",
         };
-        let mut j = serde_json::json!({"plies": self.plies, "horizon": h, "max_plies": self.max_plies, "worlds": self.worlds, "topk": self.topk, "topk_root": self.topk_root, "topk_from_turn": self.topk_from_turn, "opp": o, "mode": m, "budget": self.budget, "fallback_topk": self.fallback_topk, "fallback": l, "rows": self.rows, "dedup": self.dedup});
+        let mut j = serde_json::json!({"plies": self.plies, "horizon": h, "max_plies": self.max_plies, "worlds": self.worlds, "topk": self.topk, "topk_root": self.topk_root, "topk_from_turn": self.topk_from_turn, "opp": o, "mode": m, "budget": self.budget, "fallback_topk": self.fallback_topk, "fallback": l, "rows": self.rows, "dedup": self.dedup, "guard": self.guard});
         if let Some(fp) = &self.fallback_plies {
             j["fallback_plies"] = serde_json::json!(fp);
         }

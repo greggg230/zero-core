@@ -320,7 +320,8 @@ def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps
 
 
 LOOK_SUMS = ('decisions', 'nodes', 'leaves', 'prior_rows', 'value_rows', 'value_dups', 'minor_steps', 'groups', 'cut', 'rounds', 'rows',
-             'fallback_stage', 'fallback_last', 'fallback_mcts', 'minor_root', 'aborted_nodes', 'busy_s')
+             'fallback_stage', 'fallback_last', 'fallback_mcts', 'minor_root', 'aborted_nodes', 'busy_s', 'guard_decisions',
+             'guard_overrides')
 
 
 def look_summary(stats):

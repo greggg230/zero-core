@@ -335,6 +335,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.moves.clear();
     slot.look = None;
     slot.look_mcts = false;
+    slot.look_guard = None;
     Ok(())
 }
 
@@ -416,7 +417,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         }
         if slot.sims >= slot.target.unwrap() {
             n.minor += slot.minor as u64;
-            decide(cfg, slot, seat, p, &mut scratch.sim.key, n)?;
+            decide(cfg, slot, seat, p, &mut scratch.sim.key, n, &sh.counters.look)?;
             continue;
         }
         let walk = Walk { c_puct: seat.c_puct, chance_k: seat.chance_k, margin_w: seat.margin_w };
@@ -541,6 +542,11 @@ impl<G: SearchGame> RowSink<G> for LeafSink<'_> {
 #[allow(clippy::too_many_arguments)]
 fn look_step<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, seat: &NnSeat, lc: &LookCfg, p: usize, bufs: &mut [LeafBuf], key: &mut Vec<u64>) -> Result<bool, String> {
     let t0 = Instant::now();
+    if lc.guard > 0.0 && slot.look.is_none() && slot.game.as_ref().is_some_and(|g| g.minor_decision()) {
+        // (the guarded player: a minor decision is the MCTS search's alone)
+        slot.look_mcts = true;
+        return Ok(false);
+    }
     if slot.look.is_none() {
         let live = slot.game.as_ref().ok_or("internal: a lookahead without a game")?;
         let belief = (seat.belief_tilt > 0.0).then_some((seat.belief_tilt, seat.belief_clip, seat.belief_mix));
@@ -567,6 +573,13 @@ fn look_step<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, seat: &NnSeat, l
         t.add(look.stats(), outcome == Outcome::Mcts);
     }
     match outcome {
+        Outcome::Act(_) if lc.guard > 0.0 => {
+            // the guarded player: the MCTS search decides, against the lookahead's values (`decide`)
+            let mut l = look;
+            let means = l.options()?.into_iter().map(|o| (o.act, o.mean)).collect();
+            slot.look_guard = Some((means, lc.guard));
+            slot.look_mcts = true;
+        }
         Outcome::Act(a) => {
             slot.decisions += 1;
             apply(&sh.cfg, slot, a, key)?;
@@ -574,6 +587,24 @@ fn look_step<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, seat: &NnSeat, l
         Outcome::Mcts => slot.look_mcts = true,
     }
     Ok(false)
+}
+
+/// The guarded player's move (`LookCfg::guard`): the MCTS move `a`, unless the lookahead's best root
+/// option (the first best mean) has a mean over the MCTS move's above the margin -> (the move, whether
+/// the lookahead's). An MCTS move the lookahead did not expand (a capped root) stays.
+fn guard_move(means: &[(u16, f64)], margin: f64, a: u16) -> (u16, bool) {
+    let Some(&(_, m)) = means.iter().find(|x| x.0 == a) else { return (a, false) };
+    let mut best = means[0];
+    for &x in means {
+        if x.1 > best.1 {
+            best = x;
+        }
+    }
+    if best.0 != a && best.1 - m > margin {
+        (best.0, true)
+    } else {
+        (a, false)
+    }
 }
 
 /// A root belief row (`ROW_BELIEF`, docs/search.md 3.8): `encode(p)` of the live game, no options.
@@ -646,7 +677,8 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
 
 /// Choose the move after the search; the training record (`n.recorded`) and value-only records
 /// (`n.view_recorded`) it makes.
-fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize, key: &mut Vec<u64>, n: &mut Tally) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize, key: &mut Vec<u64>, n: &mut Tally, look: &Mutex<LookTotals>) -> Result<(), String> {
     let tree = slot.trees[p].as_ref().unwrap();
     let root = tree.root;
     // value-only records waiting for this seat's next search (`ViewTarget::NextQ`, docs/search.md
@@ -702,7 +734,16 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             sel => sel.choose(&p0, &nv_all, &tree.values(root), tree.value0(root)),
         }
     };
-    let a = acts[i];
+    let mut a = acts[i];
+    if let Some((means, margin)) = slot.look_guard.take() {
+        // the guarded lookahead player (docs/search.md 3.9): this search's move unless the lookahead's
+        // margin over it exceeds the guard
+        let (b, over) = guard_move(&means, margin, a);
+        a = b;
+        let mut t = lock(look);
+        t.guard_decisions += 1;
+        t.guard_overrides += over as u64;
+    }
     // (a seat with `record` false - a league opponent - records nothing; the move is the same)
     let rec = cfg.record && seat.selfplay && seat.record && slot.full;
     if rec {
@@ -773,6 +814,7 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
     slot.legal_ok = true;
     slot.steps += 1;
     slot.look_mcts = false;
+    slot.look_guard = None;
     let nxt = g.to_move();
     for q in 0..slot.n {
         let keep = match (slot.trees[q].as_mut(), nxt) {
@@ -798,6 +840,7 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
     slot.legal_ok = false;
     slot.look = None;
     slot.look_mcts = false;
+    slot.look_guard = None;
     slot.drop_trees();
     slot.sims = 0;
     slot.target = None;
@@ -817,6 +860,7 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
     slot.drop_trees();
     slot.look = None;
     slot.look_mcts = false;
+    slot.look_guard = None;
     slot.gid = NO_GAME;
     slot.pending = None;
     slot.ext_payload = None;

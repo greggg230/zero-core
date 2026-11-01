@@ -18,6 +18,8 @@ A lookahead seat is a network seat with the key `lookahead` (a dict of its setti
     rows            rows per network batch of one decision (default 512)
     dedup           leaves of the same observation share one value row (default 1: exact, the value is
                     the network's answer to encode(R) alone; 0: a row per leaf, as the lab)
+    guard           the guarded player (a driver seat; 0 = off): the seat's MCTS move unless the
+                    lookahead's best option's value exceeds the MCTS move's by more than this (e.g. 0.05)
 
 `parse('plies=6,worlds=8,topk=0,opp=best,mode=infoset,budget=200000')` reads the command-line form
 (zero.h2h --a-lookahead / --b-lookahead; `fallback_plies=4/2`), `settings(d)` the canonical dict.
@@ -33,10 +35,11 @@ import json
 import time
 
 KEYS = ('plies', 'horizon', 'max_plies', 'worlds', 'topk', 'topk_root', 'topk_from_turn', 'opp', 'mode', 'budget',
-        'fallback_topk', 'fallback_plies', 'fallback', 'rows', 'dedup')
+        'fallback_topk', 'fallback_plies', 'fallback', 'rows', 'dedup', 'guard')
 INT_KEYS = ('plies', 'max_plies', 'worlds', 'topk', 'topk_from_turn', 'budget', 'fallback_topk', 'rows')
 BOOL_KEYS = ('topk_root', 'dedup')
 STR_KEYS = ('horizon', 'opp', 'mode', 'fallback')
+FLOAT_KEYS = ('guard',)
 
 
 def _engine():
@@ -78,6 +81,8 @@ def parse(text):
                 d[k] = v.lower() in ('1', 'true')
             elif k == 'fallback_plies':
                 d[k] = [int(x) for x in v.split('/') if x.strip()]
+            elif k in FLOAT_KEYS:
+                d[k] = float(v)
             else:
                 d[k] = v
         except ValueError:
@@ -94,7 +99,8 @@ def tag(d):
     k = 'all' if not s['topk'] else f'k{s["topk"]}' + ('r' if s['topk_root'] else '')
     m = {'infoset': 'is', 'world': 'w'}[s['mode']]
     b = f'-b{s["budget"]}' if s['budget'] else ''
-    return f'la-{h}-w{s["worlds"]}-{k}-{s["opp"]}-{m}{b}'
+    g = f'-g{s["guard"]:g}' if s.get('guard') else ''
+    return f'la-{h}-w{s["worlds"]}-{k}-{s["opp"]}-{m}{b}{g}'
 
 
 def _labels(g):

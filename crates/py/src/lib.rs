@@ -894,6 +894,8 @@ impl PySearchDriver {
             ld.set_item("peak_games", l.peak_games)?;
             ld.set_item("by_stage", l.by_stage.clone())?;
             ld.set_item("busy_s", l.busy_s)?;
+            ld.set_item("guard_decisions", l.guard_decisions)?;
+            ld.set_item("guard_overrides", l.guard_overrides)?;
             d.set_item("look", ld)?;
         }
         Ok(d)
