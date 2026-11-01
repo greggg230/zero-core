@@ -508,6 +508,16 @@ impl<G: SearchGame> RowSink<G> for LeafSink<'_> {
         b.gid.push(self.gid as i64);
         b.extra.push(kind);
     }
+    fn row_x(&mut self, x: &[f32], viewer: usize, opts: &[u16], kind: u8) {
+        let b = &mut *self.buf;
+        b.x.extend_from_slice(x);
+        b.nopt.push(opts.len() as i32);
+        b.opt_action.extend(opts.iter().map(|&a| a as i32));
+        b.player.push(viewer as i32);
+        b.n_players.push(self.n as i32);
+        b.gid.push(self.gid as i64);
+        b.extra.push(kind);
+    }
 }
 
 /// The lookahead of seat `p`'s pending decision (docs/search.md 3.9): created at the decision's first

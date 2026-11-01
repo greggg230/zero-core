@@ -162,7 +162,7 @@ impl<G: SearchGame> DynGame for G {
             let (t, c, _) = belief.ok_or("lookahead: belief predictions without the belief's tilt / clip / mix")?;
             l.set_belief(belief_of::<G>(&p, t, c)?)?;
         }
-        Ok(Box::new(LookBox { l, rng: Rng::new(seed), rows: None }))
+        Ok(Box::new(LookBox { l, rng: Rng::new(seed), n: SearchGame::num_players(self), rows: None }))
     }
 }
 
@@ -494,7 +494,13 @@ impl<G: SearchGame> RowSink<G> for RowsBuf {
         self.nopt.push(opts.len() as i32);
         self.opt_action.extend(opts.iter().map(|&a| a as i32));
         self.player.push(viewer as i32);
-        self.n = g.num_players();
+        self.extra.push(kind);
+    }
+    fn row_x(&mut self, x: &[f32], viewer: usize, opts: &[u16], kind: u8) {
+        self.x.extend_from_slice(x);
+        self.nopt.push(opts.len() as i32);
+        self.opt_action.extend(opts.iter().map(|&a| a as i32));
+        self.player.push(viewer as i32);
         self.extra.push(kind);
     }
 }
@@ -502,6 +508,8 @@ impl<G: SearchGame> RowSink<G> for RowsBuf {
 struct LookBox<G: SearchGame> {
     l: Look<G>,
     rng: Rng,
+    /// The game's players (every row's `n_players`).
+    n: usize,
     /// The last round's option offsets and row kinds (for its answers).
     rows: Option<(Vec<i32>, Vec<u8>)>,
 }
@@ -511,7 +519,7 @@ impl<G: SearchGame> DynLook for LookBox<G> {
         if self.rows.is_some() {
             return Err("lookahead: submit the last rows' answers first".into());
         }
-        let mut buf = RowsBuf::default();
+        let mut buf = RowsBuf { n: self.n, ..Default::default() };
         match self.l.step(&mut buf, &mut self.rng)? {
             Step::Done => Ok(None),
             Step::Rows(b) => {

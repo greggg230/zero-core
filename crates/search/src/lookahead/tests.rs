@@ -20,6 +20,12 @@ impl<G: SearchGame> RowSink<G> for Rows {
         self.viewer.push(viewer);
         self.kind.push(kind);
     }
+    fn row_x(&mut self, x: &[f32], viewer: usize, opts: &[u16], kind: u8) {
+        self.x.extend_from_slice(x);
+        self.opts.push(opts.to_vec());
+        self.viewer.push(viewer);
+        self.kind.push(kind);
+    }
 }
 
 /// The belief `peek_eval`'s stand-in answers for a belief row: coin 1 at 0.7.
@@ -115,7 +121,11 @@ fn the_minor_payment_takes_the_top_prior_and_counts_no_ply() {
     let (peek, go, _, mut l) = look(r#"{"plies": 1}"#);
     assert!(close(peek, 0.9) && close(go, 0.5), "PEEK {peek} GO {go}");
     let s = l.stats().clone();
-    assert_eq!((s.nodes, s.leaves, s.minor_steps, s.value_rows, s.prior_rows, s.groups), (4, 4, 4, 4, 4, 1));
+    // (the two worlds after GO look the same to seat 0: one value row for both, `dedup`)
+    assert_eq!((s.nodes, s.leaves, s.minor_steps, s.value_rows, s.value_dups, s.prior_rows, s.groups), (4, 4, 4, 3, 1, 4, 1));
+    let (peek2, go2, _, l2) = look(r#"{"plies": 1, "dedup": false}"#);
+    assert_eq!((l2.stats().value_rows, l2.stats().value_dups), (4, 0));
+    assert!(peek2 == peek && go2 == go, "the same values without dedup");
     let (line, end) = l.line(1, GO).unwrap().unwrap();
     assert_eq!(line, vec![(0, GO, false), (0, TAP_B, true)]);
     assert_eq!(end, End::Plies);

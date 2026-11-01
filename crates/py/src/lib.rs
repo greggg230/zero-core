@@ -878,6 +878,7 @@ impl PySearchDriver {
             ld.set_item("leaves", l.leaves)?;
             ld.set_item("prior_rows", l.prior_rows)?;
             ld.set_item("value_rows", l.value_rows)?;
+            ld.set_item("value_dups", l.value_dups)?;
             ld.set_item("minor_steps", l.minor_steps)?;
             ld.set_item("groups", l.groups)?;
             ld.set_item("cut", l.cut)?;
@@ -1022,6 +1023,7 @@ impl PyLookahead {
         sd.set_item("leaves", st.leaves)?;
         sd.set_item("prior_rows", st.prior_rows)?;
         sd.set_item("value_rows", st.value_rows)?;
+        sd.set_item("value_dups", st.value_dups)?;
         sd.set_item("minor_steps", st.minor_steps)?;
         sd.set_item("cut", st.cut)?;
         sd.set_item("groups", st.groups)?;

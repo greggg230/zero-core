@@ -899,6 +899,7 @@ pub struct LookTotals {
     pub leaves: u64,
     pub prior_rows: u64,
     pub value_rows: u64,
+    pub value_dups: u64,
     pub minor_steps: u64,
     pub groups: u64,
     pub cut: u64,
@@ -925,6 +926,7 @@ impl LookTotals {
         self.leaves += s.leaves;
         self.prior_rows += s.prior_rows;
         self.value_rows += s.value_rows;
+        self.value_dups += s.value_dups;
         self.minor_steps += s.minor_steps;
         self.groups += s.groups;
         self.cut += s.cut;

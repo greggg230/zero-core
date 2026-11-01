@@ -45,6 +45,12 @@
 //! early). The driver puts every game's rows of a round into its batches (one GPU batch for every game
 //! in flight, as MCTS leaves); `PyLookahead` hands them to Python (the position API).
 //!
+//! **Leaf values by observation** (`dedup`, default on): a leaf's value is the network's answer to
+//! `encode(R)` alone, so leaves whose encodings are equal - the same hash, `obs_hash` - share one row
+//! (worlds the root decider cannot tell apart, after the same moves: most of them, early in a game). The
+//! values are the same up to the network's float rounding at another batch shape; `LookStats::
+//! value_dups` counts the shared ones (`value_rows` the rows sent; the lab's value rows = their sum).
+//!
 //! Not ported: the lab's `constraint` (restricting our lines to a class) and its reveal annotations
 //! (`ev`: a line replayed in Python recovers them from the chance keys).
 use std::collections::HashMap;
@@ -121,16 +127,17 @@ pub struct LookCfg {
     pub fallback_plies: Option<Vec<u32>>,
     pub last: Last,
     pub rows: u32,
+    pub dedup: bool,
 }
 
 impl Default for LookCfg {
     fn default() -> Self {
-        LookCfg { plies: 4, horizon: Horizon::Plies, max_plies: 40, worlds: 8, topk: 0, topk_root: false, topk_from_turn: None, opp: Opp::Min, mode: Mode::Infoset, budget: 0, fallback_topk: 4, fallback_plies: None, last: Last::Mcts, rows: 512 }
+        LookCfg { plies: 4, horizon: Horizon::Plies, max_plies: 40, worlds: 8, topk: 0, topk_root: false, topk_from_turn: None, opp: Opp::Min, mode: Mode::Infoset, budget: 0, fallback_topk: 4, fallback_plies: None, last: Last::Mcts, rows: 512, dedup: true }
     }
 }
 
 /// The settings `LookCfg::parse` knows.
-pub const LOOK_KEYS: &[&str] = &["plies", "horizon", "max_plies", "worlds", "topk", "topk_root", "topk_from_turn", "opp", "mode", "budget", "fallback_topk", "fallback_plies", "fallback", "rows"];
+pub const LOOK_KEYS: &[&str] = &["plies", "horizon", "max_plies", "worlds", "topk", "topk_root", "topk_from_turn", "opp", "mode", "budget", "fallback_topk", "fallback_plies", "fallback", "rows", "dedup"];
 
 fn uint(v: &Value, k: &str) -> Result<u64, String> {
     v.as_u64().or_else(|| v.as_f64().filter(|x| x.fract() == 0.0 && *x >= 0.0).map(|x| x as u64)).ok_or_else(|| format!("lookahead {k}: a whole number >= 0 (got {v})"))
@@ -158,7 +165,8 @@ impl LookCfg {
     /// ignored): plies, horizon ('plies' | 'turn' | 'next_turn'), max_plies, worlds, topk (0 = every
     /// option), topk_root, topk_from_turn, opp ('min' | 'best' | 'expect' | 'policy' | 'top'), mode
     /// ('infoset' | 'world'), budget (nodes, 0 = none), fallback_topk, fallback_plies (a list or one
-    /// number), fallback ('mcts' | 'prior'), rows (rows per batch).
+    /// number), fallback ('mcts' | 'prior'), rows (rows per batch), dedup (leaf values shared by
+    /// observation, default true).
     pub fn parse(json: &str) -> Result<LookCfg, String> {
         let v: Value = serde_json::from_str(json).map_err(|e| format!("lookahead: {e}"))?;
         let o = v.as_object().ok_or_else(|| format!("lookahead: a JSON object of settings, not {v}"))?;
@@ -211,6 +219,7 @@ impl LookCfg {
                     }
                 }
                 "rows" => c.rows = u32_of(x, k)?,
+                "dedup" => c.dedup = boolean(x, k)?,
                 _ => return Err(format!("lookahead: unknown setting {k:?} (one of {LOOK_KEYS:?})")),
             }
         }
@@ -315,7 +324,7 @@ impl LookCfg {
             Last::Mcts => "mcts",
             Last::Prior => "prior",
         };
-        let mut j = serde_json::json!({"plies": self.plies, "horizon": h, "max_plies": self.max_plies, "worlds": self.worlds, "topk": self.topk, "topk_root": self.topk_root, "topk_from_turn": self.topk_from_turn, "opp": o, "mode": m, "budget": self.budget, "fallback_topk": self.fallback_topk, "fallback": l, "rows": self.rows});
+        let mut j = serde_json::json!({"plies": self.plies, "horizon": h, "max_plies": self.max_plies, "worlds": self.worlds, "topk": self.topk, "topk_root": self.topk_root, "topk_from_turn": self.topk_from_turn, "opp": o, "mode": m, "budget": self.budget, "fallback_topk": self.fallback_topk, "fallback": l, "rows": self.rows, "dedup": self.dedup});
         if let Some(fp) = &self.fallback_plies {
             j["fallback_plies"] = serde_json::json!(fp);
         }
@@ -437,6 +446,8 @@ pub enum Outcome {
 /// options `opts` (empty: a value-only row), its kind (`ROW_LEAF`, `ROW_BELIEF`).
 pub trait RowSink<G> {
     fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8);
+    /// A row of features already encoded (`x`: `NUM_FEATURES` floats).
+    fn row_x(&mut self, x: &[f32], viewer: usize, opts: &[u16], kind: u8);
 }
 
 /// The network's answers to a round's rows (`Look::answer`): rows `base..base + n` of a batch with
@@ -461,6 +472,8 @@ pub struct LookStats {
     pub leaves: u64,
     pub prior_rows: u64,
     pub value_rows: u64,
+    /// Leaves valued by another leaf's row (the same observation: `dedup`).
+    pub value_dups: u64,
     pub minor_steps: u64,
     pub cut: u64,
     pub groups: u64,
@@ -533,6 +546,15 @@ pub struct Look<G: SearchGame> {
     xbuf: Vec<f32>,
     key: Vec<u64>,
     legal: Vec<u16>,
+    /// `dedup`: per observation hash the value, or the members waiting for the row sent this round;
+    /// per sent value row its hash.
+    vcache: HashMap<u128, VEntry>,
+    vhash: HashMap<u32, u128>,
+}
+
+enum VEntry {
+    Wait(Vec<u32>),
+    Val(f64),
 }
 
 /// A 128-bit hash of an encoding's float bits (the observation key; the lab's blake2b of the bytes):
@@ -676,6 +698,8 @@ impl<G: SearchGame> Look<G> {
             xbuf: vec![0.0; G::NUM_FEATURES],
             key: Vec::new(),
             legal: Vec::new(),
+            vcache: HashMap::new(),
+            vhash: HashMap::new(),
         })
     }
 
@@ -767,6 +791,8 @@ impl<G: SearchGame> Look<G> {
         self.mem_pri.clear();
         self.group_pri.clear();
         self.minors.clear();
+        self.vcache.clear();
+        self.vhash.clear();
         self.live_games = 0;
         let k = std::mem::take(&mut self.st);
         self.st = LookStats { stage: self.stage as u32, aborted_nodes: k.aborted_nodes, rounds: k.rounds, rows: k.rows, minor_root: k.minor_root, peak_games: k.peak_games, ..Default::default() };
@@ -1145,8 +1171,10 @@ impl<G: SearchGame> Look<G> {
         Ok(())
     }
 
-    /// Push this round's rows: the blocking priors first, then leaf values up to `rows`.
-    fn emit(&mut self, sink: &mut dyn RowSink<G>) -> Result<Step, String> {
+    /// Push this round's rows: the blocking priors first, then leaf values up to `rows` (with `dedup`
+    /// a leaf whose observation was sent already takes that row's value) -> Some(Step::Rows), or None
+    /// when every leaf left was valued by an earlier row (no round).
+    fn emit(&mut self, sink: &mut dyn RowSink<G>) -> Result<Option<Step>, String> {
         let cap = self.cfg.rows as usize;
         while self.inflight.len() < cap {
             let Some(q) = self.prior_q.pop_front() else { break };
@@ -1180,17 +1208,40 @@ impl<G: SearchGame> Look<G> {
         while self.inflight.len() < cap {
             let Some(m) = self.value_q.pop_front() else { break };
             let g = self.mems[m as usize].g.take().ok_or("internal: a value row without a game")?;
-            sink.row(&g, self.viewer, &[], ROW_LEAF);
             self.live_games -= 1;
+            if !self.cfg.dedup {
+                sink.row(&g, self.viewer, &[], ROW_LEAF);
+            } else {
+                self.xbuf.iter_mut().for_each(|x| *x = 0.0);
+                g.encode(self.viewer, &mut self.xbuf);
+                let h = obs_hash(&self.xbuf);
+                match self.vcache.get_mut(&h) {
+                    Some(VEntry::Val(v)) => {
+                        self.mems[m as usize].value = *v;
+                        self.st.value_dups += 1;
+                        continue;
+                    }
+                    Some(VEntry::Wait(w)) => {
+                        w.push(m);
+                        self.st.value_dups += 1;
+                        continue;
+                    }
+                    None => {
+                        self.vcache.insert(h, VEntry::Wait(Vec::new()));
+                        self.vhash.insert(m, h);
+                        sink.row_x(&self.xbuf, self.viewer, &[], ROW_LEAF);
+                    }
+                }
+            }
             self.st.value_rows += 1;
             self.inflight.push(Req::Value(m));
         }
         if self.inflight.is_empty() {
-            return Err("internal: an empty round".into());
+            return Ok(None);
         }
         self.st.rounds += 1;
         self.st.rows += self.inflight.len() as u64;
-        Ok(Step::Rows(self.inflight.len()))
+        Ok(Some(Step::Rows(self.inflight.len())))
     }
 
     /// The network's answers to the last `Step::Rows` (row i of the round = row `ans.base + i`).
@@ -1225,6 +1276,13 @@ impl<G: SearchGame> Look<G> {
                         return Err(format!("lookahead: a leaf value {v}"));
                     }
                     self.mems[m as usize].value = v;
+                    if let Some(h) = self.vhash.remove(&m) {
+                        if let Some(VEntry::Wait(w)) = self.vcache.insert(h, VEntry::Val(v)) {
+                            for k in w {
+                                self.mems[k as usize].value = v;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1245,7 +1303,10 @@ impl<G: SearchGame> Look<G> {
                         continue;
                     }
                     self.prior_q.push_back(Req::Belief);
-                    return self.emit(sink);
+                    if let Some(r) = self.emit(sink)? {
+                        return Ok(r);
+                    }
+                    continue;
                 }
                 Phase::RootPrior => {
                     if let Some(p) = self.root_pri.take() {
@@ -1257,7 +1318,10 @@ impl<G: SearchGame> Look<G> {
                         continue;
                     }
                     self.prior_q.push_back(Req::RootPrior);
-                    return self.emit(sink);
+                    if let Some(r) = self.emit(sink)? {
+                        return Ok(r);
+                    }
+                    continue;
                 }
                 Phase::Deal => {
                     if self.worlds.is_empty() {
@@ -1268,7 +1332,10 @@ impl<G: SearchGame> Look<G> {
                 }
                 Phase::Classify => {
                     if self.value_q.len() >= self.cfg.rows as usize {
-                        return self.emit(sink);
+                        if let Some(r) = self.emit(sink)? {
+                        return Ok(r);
+                    }
+                    continue;
                     }
                     self.classify()?;
                     if self.adv_minor.is_empty() && self.adv_opp.is_empty() {
@@ -1286,11 +1353,17 @@ impl<G: SearchGame> Look<G> {
                         }
                     }
                     self.phase = Phase::AdvWait;
-                    return self.emit(sink);
+                    if let Some(r) = self.emit(sink)? {
+                        return Ok(r);
+                    }
+                    continue;
                 }
                 Phase::AdvWait => {
                     if !self.prior_q.is_empty() {
-                        return self.emit(sink);
+                        if let Some(r) = self.emit(sink)? {
+                        return Ok(r);
+                    }
+                    continue;
                     }
                     match self.advance() {
                         Ok(()) => self.phase = Phase::Classify,
@@ -1300,7 +1373,10 @@ impl<G: SearchGame> Look<G> {
                 }
                 Phase::Solve => {
                     if self.value_q.len() >= self.cfg.rows as usize {
-                        return self.emit(sink);
+                        if let Some(r) = self.emit(sink)? {
+                        return Ok(r);
+                    }
+                    continue;
                     }
                     if !self.group()? {
                         self.phase = Phase::Flush;
@@ -1315,11 +1391,17 @@ impl<G: SearchGame> Look<G> {
                         continue;
                     }
                     self.phase = Phase::SolveWait;
-                    return self.emit(sink);
+                    if let Some(r) = self.emit(sink)? {
+                        return Ok(r);
+                    }
+                    continue;
                 }
                 Phase::SolveWait => {
                     if !self.prior_q.is_empty() {
-                        return self.emit(sink);
+                        if let Some(r) = self.emit(sink)? {
+                        return Ok(r);
+                    }
+                    continue;
                     }
                     match self.expand() {
                         Ok(()) => self.phase = Phase::Classify,
@@ -1329,7 +1411,10 @@ impl<G: SearchGame> Look<G> {
                 }
                 Phase::Flush => {
                     if !self.value_q.is_empty() {
-                        return self.emit(sink);
+                        if let Some(r) = self.emit(sink)? {
+                        return Ok(r);
+                    }
+                    continue;
                     }
                     self.backup()?;
                     let opts = self.options()?;

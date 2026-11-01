@@ -316,7 +316,7 @@ def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps
     return drv.take_results()
 
 
-LOOK_SUMS = ('decisions', 'nodes', 'leaves', 'prior_rows', 'value_rows', 'minor_steps', 'groups', 'cut', 'rounds', 'rows',
+LOOK_SUMS = ('decisions', 'nodes', 'leaves', 'prior_rows', 'value_rows', 'value_dups', 'minor_steps', 'groups', 'cut', 'rounds', 'rows',
              'fallback_stage', 'fallback_last', 'fallback_mcts', 'minor_root', 'aborted_nodes', 'busy_s')
 
 
