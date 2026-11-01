@@ -119,6 +119,12 @@ DEFAULTS = dict(
     # only the new ones (zero/data.py WindowCache: the same window; while it fits the budget)
     window=8, window_grow=1, min_window_samples=20_000, keep_data=12, ram_budget_gb=4.0, shard_rows=65536,
     window_cache=0,
+    # window_sparse 1 = the window keeps each row's features as their non-zeros (zero/data.py
+    # SparseRows): the same window and batches, in a fraction of the RAM for sparse encodings
+    # (MTG's ~0.7% non-zero); with window_cache the cache then keeps every shard whole, also when the
+    # window is over budget (subsampled from the cache), so an iteration loads only its new shards.
+    # The budget (ram_budget_gb) still counts dense rows: the same rows as without it
+    window_sparse=0,
     # train_prefetch n > 0 = training batches built n steps ahead on a background thread while the
     # device trains (zero/data.py batches: the same batches in the same order)
     train_prefetch=0,
@@ -883,6 +889,8 @@ class Run:
         if c.get('window_cache') and self.wcache is None:
             self.wcache = WindowCache()
         kw = {'aux_width': aw} if aw else {}
+        if c.get('window_sparse'):
+            kw['sparse'] = True
         W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it,
                    cache=self.wcache if c.get('window_cache') else None, **kw)
         load_s = time.time() - t1

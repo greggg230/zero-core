@@ -113,6 +113,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `lr_halve_every`, `lr_min`, `lr_warmup_steps` | 30, 1e-4, 100 | step decay; linear warmup while the optimizer state is fresh |
 | `window`, `window_grow`, `min_window_samples` | 8, 1, 20000 | newest iterations trained on (1 + iter // 2 with window_grow), more until min samples |
 | `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
+| `window_cache`, `window_sparse` | 0, 0 | 1 = the window's shards stay in RAM between iterations (zero/data.py WindowCache); 1 = the window keeps each row's features as their non-zeros - the same window and batches in a fraction of the RAM for a sparse encoding, and with `window_cache` every shard cached whole also over budget, so an iteration loads only its new shards (10.8). The budget still counts dense rows |
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
 | `eval_games`, `eval_sims`, `eval_random_games`, `eval_every` | 200, 32, 50, 1 | evaluation vs the yardstick and vs random (`eval_random_games` 0: no random match; the reference games still rate the random bot unless `ref_games` is 0) |
@@ -1574,6 +1575,57 @@ Dense batches grow their host copy with the batch (10.6: flat at ~27k leaves/s f
 games in flight did not pay; sparse ones do, up to ~768 in flight (batches of ~575 rows) on this GPU.
 More groups only split the same games into smaller batches. The process stays under a core: the GPU (and
 its other tenant) is the limit now, not the host.
+
+### 10.8 A sparse training window (run setting `window_sparse`; MTG Zero's Delver line, 2026-11-01)
+
+**Why.** With faster self-play (10.7) the Delver line's training became the larger part of a
+generation: ~100 s, of which 40-54 s was loading the window. The window's shards (iteration 489: 73
+shards, 864k rows - 7 local shards of 29.8 GB stored plain, 66 remote ones of 0.5 GB compressed, 36 GB
+inflated) exceed the 34 GB budget, so the window is a subsample (438k rows) - and a subsampled window
+cannot use the WindowCache (window_cache was on and reused nothing): every iteration read and inflated
+every shard again. The rows are 252 non-zeros of 37,620 floats on average.
+
+**What** (zero/data.py; opt-in, the default the window of before):
+
+* `SparseRows`: features as CSR rows (int64 offsets, uint16 column indexes - int32 past 65,536 features -,
+  float16 values). Non-zero is decided on the float16 bits, so a -0.0 is kept: `dense()` gives the dense
+  rows bit for bit, and float32 rows directly (exact) for a batch.
+* `Window(sparse=True)` (run setting `window_sparse`): each shard's features converted to SparseRows as
+  it loads - in chunks of 1,024 rows on the window's threads (numpy releases the GIL), read in place
+  (np.memmap of the npz member) when the shard is stored uncompressed, since np.load copies a member
+  through a Python loop that holds the GIL (two 4 GB local shards could not load in parallel). The
+  non-finite guard of `x` reads the non-zeros (a NaN / inf is never zero bits); a bad shard is described
+  from its dense rows as before.
+* With a WindowCache every shard is cached whole (as SparseRows), also over budget: the window draws the
+  same picks as loading (the same random stream), cuts the other arrays from the cached parts
+  (`_subset_part`) and reads each row's features from its cached shard by `src_row` when a batch is built.
+  An iteration loads only its new shards. The cache's key includes the representation, so turning the
+  setting on or off mid-run loads afresh.
+* The budget (`ram_budget_gb`) still counts dense rows: the same rows as without the setting. A bigger
+  budget would now cost little RAM - and change the window (more rows kept): a training change, not part
+  of this setting.
+
+**Equivalence.** `tests/test_net_data.py::test_sparse_window_is_the_same_window` (mostly-zero features
+with -0.0s, auxiliary targets, plain and compressed shards, networks narrower and wider than the shards,
+over budget, a cache over sliding windows, several chunks on threads): every array, the features bit for
+bit and the batches. `tests/test_loop.py::test_window_cache_trains_the_same_network`: training with
+window_sparse (with and without the cache and prefetch, and over budget from the cache twice) gives the
+network of the dense window, weight for weight. On the Delver line's shards: the dense and sparse windows
+of iteration 489 at a 40k-row budget, and the cached and uncached sparse windows at the full budget -
+every array equal, 20 batches of 512 bit for bit.
+
+**Measured** (the Delver line's windows, budget 438,636 rows, 8 threads, the desktop shared with a live
+run):
+
+| | dense, cache over budget (before) | sparse + cache |
+|---|---:|---:|
+| a window, cold (the process's first) | 54.1 s (iteration 489) | 29.8 s (iteration 488) |
+| the next iteration's window | the same: nothing reused (the run's log: 32-61 s) | 6.6 s (iteration 489: 8 new shards, 2 of them local) |
+| the process's RAM after it | 34 GB of window + the rest | 4.3 GB in all (the cache 2.8 GB of it) |
+| a batch of 512 rows | - | 19-21 ms |
+
+A warm window is its new shards (3.3 s: a 65k-row local shard read in place and converted on 8
+threads 1.8 s, on one 5.0 s) and the window's assembly from the cache (1.1 s).
 
 ## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
 

@@ -213,6 +213,74 @@ def test_window_cache_is_the_same_window(tmp_path):
     assert win.reused == 903
 
 
+def _sparse_shard(path_dir, name, N, rng, compress=0, aux=0):
+    """A shard of mostly-zero features (~5% non-zero, some -0.0) and, `aux` > 0, auxiliary targets."""
+    nopt = rng.integers(2, 6, size=N)
+    off = np.concatenate([[0], np.cumsum(nopt)])
+    x = np.where(rng.random((N, F)) < 0.05, rng.standard_normal((N, F)), 0.0).astype(np.float32)
+    x[rng.random((N, F)) < 0.01] = -0.0
+    s = {'x': x, 'player': rng.integers(0, 2, N), 'n_players': np.full(N, 2), 'opt_off': off,
+         'opt_action': rng.integers(0, A, off[-1]), 'pi': rng.random(off[-1]).astype(np.float32),
+         'z': rng.random((N, 8)).astype(np.float32), 'q': rng.random((N, 8)).astype(np.float32),
+         'sc': rng.random((N, 8)).astype(np.float32), 'net': np.zeros(N, np.int32)}
+    if aux:
+        s['aux'] = np.where(rng.random((N, aux)) < 0.1, rng.random((N, aux)), 0.0).astype(np.float32)
+    w = ShardWriter(str(path_dir), name, rows=10 ** 6, meta={'game': 'toy'}, compress=compress)
+    w.add(s)
+    w.close()
+    return str(path_dir / f'{name}_000.npz')
+
+
+def test_sparse_window_is_the_same_window(tmp_path, monkeypatch):
+    """A sparse window (run setting window_sparse): the features kept as their non-zeros give the
+    dense window bit for bit (-0.0 included) and its batches - alone, cut / padded to another network
+    width, over budget, with auxiliary targets; with a WindowCache every shard is cached whole, also
+    over budget (subsampled from the cache), and a window loads only its new shards."""
+    from zero.data import SparseRows, WindowCache
+    monkeypatch.setattr(SparseRows, 'CHUNK', 64)    # several chunks a shard, converted on threads
+    rng = np.random.default_rng(5)
+    paths = [_sparse_shard(tmp_path, f'p{k}', N, rng, compress=k % 2, aux=6 if k != 1 else 0)
+             for k, N in enumerate([400, 3, 250, 900, 60])]
+    keys = ('player', 'n_players', 'opt_off', 'opt_action', 'pi', 'z', 'q', 'sc', 'src_row', 'starts', 'aux',
+            'aux_mask')
+
+    def same(a, b):
+        assert np.array_equal(a.x.view(np.uint16), b.x.view(np.uint16))
+        for k in keys:
+            u, v = getattr(a, k), getattr(b, k)
+            assert (u is None) == (v is None), k
+            if u is not None:
+                assert u.dtype == v.dtype and np.array_equal(u, v), k
+        assert (a.N, a.loaded) == (b.N, b.loaded) and a.nbytes < b.nbytes
+        idx = np.random.default_rng(a.N).integers(a.N, size=97)
+        assert np.array_equal(a.features(idx).view(np.uint16), b.features(idx).view(np.uint16))
+        ba, bb = a.batch(idx), b.batch(idx)
+        assert ba.keys() == bb.keys()
+        for k in ba:
+            assert ba[k].dtype == bb[k].dtype and torch.equal(ba[k], bb[k]), k
+        assert torch.equal(ba['x'].view(torch.int32), bb['x'].view(torch.int32))      # signed zeros too
+
+    for nf, budget, aw in ((F, None, 0), (F - 7, None, 6), (F + 5, 700, 6), (F, 300, 0)):
+        ps = paths[1:4]
+        kw = {'aux_width': aw} if aw else {}
+        same(Window(ps, nf, A, budget_rows=budget, seed=3, sparse=True, **kw),
+             Window(ps, nf, A, budget_rows=budget, seed=3, **kw))
+    cache = WindowCache()
+    # (paths, width, budget, rows the cache supplies)
+    steps = [(paths[0:3], F, None, 0), (paths[1:4], F, None, 253), (paths[2:5], F, None, 1150),
+             (paths[2:5], F, 500, None), (paths[1:4], F, 600, None), (paths[1:4], F - 7, None, 0)]
+    for k, (ps, nf, budget, reused) in enumerate(steps):
+        win = Window(ps, nf, A, budget_rows=budget, seed=k, cache=cache, sparse=True, aux_width=6)
+        same(win, Window(ps, nf, A, budget_rows=budget, seed=k, aux_width=6))
+        assert sorted(cache.parts) == sorted(ps)        # whole shards, also over budget
+        if reused is not None:
+            assert win.reused == reused, (k, win.reused)
+        else:                                           # over budget: subsampled; only the new shards loaded
+            new = [j for j, p in enumerate(ps) if p not in steps[k - 1][0]]
+            assert win.N <= budget + 5
+            assert win.reused == win.N - sum(int(win.starts[j + 1] - win.starts[j]) for j in new), (k, win.reused)
+
+
 def test_batches_prefetched_are_the_same(tmp_path):
     """data.batches with prefetch (run setting train_prefetch): the same draws and batches in the
     same order as without; a failure while building is raised to the consumer; closing early

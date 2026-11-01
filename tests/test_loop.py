@@ -69,10 +69,22 @@ def test_window_cache_trains_the_same_network(smoke_run):
         for k in ref:
             assert torch.equal(ref[k], got[k]), k
     # train_prefetch (batches built ahead on a thread), alone and with the cache: the same network
-    for extra in ({'train_prefetch': 2}, {'train_prefetch': 3, 'window_cache': 1}):
+    for extra in ({'train_prefetch': 2}, {'train_prefetch': 3, 'window_cache': 1}, {'window_sparse': 1},
+                  {'window_sparse': 1, 'window_cache': 1, 'train_prefetch': 2}):
         got, _ = trained(R.Run(str(smoke_run), dict(cfg, **{'window_cache': 0, **extra})))
         for k in ref:
             assert torch.equal(ref[k], got[k]), (extra, k)
+    # window_sparse with the cache over budget (a subsampled window): the network of the dense window,
+    # its second training loading no shard
+    small = dict(cfg, window_cache=0, ram_budget_gb=1e-4)
+    ref_s, st_s = trained(R.Run(str(smoke_run), small))
+    assert st_s['window_samples'] < st_s['window_loaded']
+    sp = R.Run(str(smoke_run), dict(small, window_sparse=1, window_cache=1))
+    for n in range(2):
+        got, st = trained(sp)
+        assert st['window_samples'] == st_s['window_samples'] and st['window_reused'] == (st['window_samples'] if n else 0)
+        for k in ref_s:
+            assert torch.equal(ref_s[k], got[k]), (n, k)
 
 
 def test_sparse_setting_plays_the_same_selfplay(smoke_run, tmp_path, monkeypatch):

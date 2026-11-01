@@ -40,6 +40,17 @@ of loading them all, array for array. Only while the window fits its budget (no 
 window is exactly its shards); a window over budget empties the cache and loads as without it.
 The cached shards stay in RAM between trainings (up to the budget), where a window was freed.
 
+Sparse window (run setting `window_sparse`, `Window(sparse=True)`): each row's features kept as their
+non-zeros (`SparseRows`: column indexes and float16 values; non-zero = the float16 bits, so a -0.0
+is kept) - the same window, rows and batches bit for bit, in a fraction of the RAM for a sparse
+encoding (MTG's rows are ~0.7% non-zero: the Delver line's 34 GB window in 1.8 GB). A shard's
+features are converted on threads in chunks, read in place from the file when the shard is stored
+uncompressed (np.memmap: np.load copies a member through a Python loop that holds the GIL); the
+non-finite guard of `x` reads its non-zeros. With a WindowCache every shard is cached whole, also
+when the window is over budget: the window is subsampled from the cache (the picks of loading)
+and its rows' features read from their cached shards (`src_row`), so an iteration loads only its
+new shards (the Delver line: 54 s -> 6.6 s). The budget still counts dense rows.
+
 `batches` (run setting `train_prefetch`): a training's batches in order; with prefetch, built that
 many steps ahead on a background thread (the window's gather, the float32 features and the dense
 targets: ~60 ms a batch for MTG's 33,652 features) while the training step runs on the device. The
@@ -134,6 +145,56 @@ def read_shard(path):
     with np.load(path) as z:
         out = {k: z[k] for k in z.files if k != 'meta'}
         out['meta'] = json.loads(str(z['meta']))
+    return out
+
+
+def _stored_member(path, name):
+    """Member `name` of an npz as a read-only np.memmap when it is stored uncompressed (a local
+    shard), else None (compressed, absent, Fortran order, objects): its bytes in place in the file,
+    read as they are used (np.load copies the whole member through a Python loop)."""
+    import struct
+    with zipfile.ZipFile(path) as zf:
+        try:
+            zi = zf.getinfo(name + '.npy')
+        except KeyError:
+            return None
+        if zi.compress_type != zipfile.ZIP_STORED:
+            return None
+    with open(path, 'rb') as f:
+        f.seek(zi.header_offset)
+        h = f.read(30)
+        if len(h) < 30 or h[:4] != b'PK\x03\x04':
+            return None
+        n, m = struct.unpack('<HH', h[26:30])         # the local header's name and extra lengths
+        f.seek(zi.header_offset + 30 + n + m)
+        version = np.lib.format.read_magic(f)
+        read = np.lib.format.read_array_header_1_0 if version == (1, 0) else np.lib.format.read_array_header_2_0
+        shape, fortran, dtype = read(f)
+        offset = f.tell()
+    if fortran or dtype.hasobject or not shape or 0 in shape:
+        return None
+    return np.memmap(path, dtype=dtype, mode='r', offset=offset, shape=shape)
+
+
+def _read_shard_sparse(path, F, idx, threads):
+    """read_shard for a sparse window: every array but `x`, whose rows `idx` (None = all) come as
+    SparseRows 'xs' - from the file in place when stored uncompressed. The non-finite guard of x
+    reads its non-zeros (a NaN / inf is never zero bits); a bad x is described from the dense rows."""
+    with np.load(path) as z:
+        out = {k: z[k] for k in z.files if k not in ('meta', 'x')}
+        out['meta'] = json.loads(str(z['meta']))
+        x = _stored_member(path, 'x')
+        if x is None:
+            x = z['x']
+    if x.dtype != np.float16:                      # (shards store float16; the dense window's cast)
+        x = np.asarray(x).astype(np.float16)
+    try:
+        xs = SparseRows.from_dense(x, F, idx, threads=threads)
+        if not np.isfinite(xs.val).all():
+            out['x'] = np.asarray(x)               # (shard_problems names the rows and columns)
+    finally:
+        del x
+    out['xs'] = xs
     return out
 
 
@@ -251,16 +312,96 @@ def _ranges(starts, lens):
     return np.arange(tot) - np.repeat(np.cumsum(lens) - lens, lens) + np.repeat(starts, lens)
 
 
+class SparseRows:
+    """Feature rows kept as their non-zeros (a sparse window, module docstring): row r's columns are
+    `idx[indptr[r]:indptr[r + 1]]` (ascending) and its values `val[...]` (float16). Non-zero means
+    the float16 bits: a -0.0 is kept, so `dense` gives back the dense rows bit for bit."""
+
+    CHUNK = 1024                                   # rows a conversion step (a bool mask of CHUNK x F)
+
+    def __init__(self, indptr, idx, val, F):
+        self.indptr, self.idx, self.val, self.F = indptr, idx, val, int(F)
+
+    @property
+    def N(self):
+        return len(self.indptr) - 1
+
+    @property
+    def nbytes(self):
+        return self.indptr.nbytes + self.idx.nbytes + self.val.nbytes
+
+    @classmethod
+    def from_dense(cls, x, F, rows=None, threads=1):
+        """The rows `rows` (None = all) of float16 `x` [N, w], their columns cut to F (a narrower `x` is
+        zero-padded: nothing to keep). Chunks of CHUNK rows on up to `threads` threads (numpy releases
+        the GIL)."""
+        w = min(F, x.shape[1])
+        n = len(x) if rows is None else len(rows)
+        itype = np.uint16 if F <= 1 << 16 else np.int32
+
+        def one(a):
+            b = min(n, a + cls.CHUNK)
+            xa = np.ascontiguousarray(x[a:b, :w] if rows is None else x[rows[a:b], :w])
+            f = np.flatnonzero(xa.view(np.uint16) != 0)
+            r = f // w
+            return np.bincount(r, minlength=b - a), (f - r * w).astype(itype), xa.reshape(-1)[f]
+        starts = range(0, n, cls.CHUNK)
+        if threads > 1 and n > cls.CHUNK:
+            with ThreadPoolExecutor(min(threads, len(starts))) as ex:
+                got = list(ex.map(one, starts))
+        else:
+            got = [one(a) for a in starts]
+        cnt = np.concatenate([g[0] for g in got]) if got else np.zeros(0, np.int64)
+        indptr = np.concatenate([np.zeros(1, np.int64), np.cumsum(cnt, dtype=np.int64)])
+        idx = np.concatenate([g[1] for g in got]) if got else np.zeros(0, itype)
+        val = np.concatenate([g[2] for g in got]) if got else np.zeros(0, np.float16)
+        return cls(indptr, idx, val, F)
+
+    def _pos(self, rows):
+        rows = np.asarray(rows, np.int64)
+        s = self.indptr[rows]
+        lens = self.indptr[rows + 1] - s
+        return rows, lens, _ranges(s, lens)
+
+    def take(self, rows):
+        """The rows `rows`, in that order."""
+        rows, lens, pos = self._pos(rows)
+        indptr = np.concatenate([np.zeros(1, np.int64), np.cumsum(lens, dtype=np.int64)])
+        return SparseRows(indptr, self.idx[pos], self.val[pos], self.F)
+
+    @staticmethod
+    def concat(parts, F):
+        """The rows of `parts` one after the other."""
+        nnz = np.cumsum([0] + [len(p.idx) for p in parts])
+        indptr = np.concatenate([np.zeros(1, np.int64)] + [p.indptr[1:] + o for p, o in zip(parts, nnz[:-1])])
+        itype = parts[0].idx.dtype if parts else np.uint16
+        return SparseRows(indptr, np.concatenate([p.idx for p in parts]) if parts else np.zeros(0, itype),
+                          np.concatenate([p.val for p in parts]) if parts else np.zeros(0, np.float16), F)
+
+    def dense(self, rows, dtype=np.float16):
+        """The dense rows `rows` [len(rows), F] in `dtype` (float16: the dense rows bit for bit; float32:
+        their exact float32 values)."""
+        out = np.zeros((len(rows), self.F), dtype)
+        self.scatter(out, np.arange(len(rows)), rows)
+        return out
+
+    def scatter(self, out, at, rows):
+        """Writes rows `rows`' non-zeros into the zeroed rows `at` of `out`."""
+        rows, lens, pos = self._pos(rows)
+        out[np.repeat(np.asarray(at, np.int64), lens), self.idx[pos]] = self.val[pos]
+
+
 def _file_key(path):
     st = os.stat(path)
     return st.st_size, st.st_mtime_ns
 
 
-def _load_part(path, N, idx, F, xdst=None, AW=0):
+def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1):
     """One shard's part of a window: rows `idx` (None = all N), features cut / zero-padded to F
-    written into `xdst` (a fresh array when None: then also returned as 'x'); `AW` > 0: the auxiliary
+    written into `xdst` (a fresh array when None: then also returned as 'x'); `sparse`: instead the
+    features as SparseRows 'xs' (converted on `xthreads` threads); `AW` > 0: the auxiliary
     targets too ('aux' float16 [rows, AW] and 'aux_mask': zeros and False for a shard without them)."""
-    p = read_shard(path)
+    p = _read_shard_sparse(path, F, idx, xthreads) if sparse else read_shard(path)
     probs = shard_problems(p)
     if probs:
         raise NonFinite(f'non-finite sample values in shard {path} (meta {json.dumps(p["meta"])}): '
@@ -268,18 +409,21 @@ def _load_part(path, N, idx, F, xdst=None, AW=0):
                         '*.bad.npz) to train without it')
     if len(p['player']) != N:
         raise ValueError(f'shard {path}: {len(p["player"])} rows, its meta says {N}')
+    out = {}
+    if sparse:
+        out['xs'] = p.pop('xs')
     if idx is None:
         idx = np.arange(N)
         sel = slice(None)
     else:
         sel = idx
-    out = {}
-    if xdst is None:
-        xdst = out['x'] = np.empty((len(idx), F), np.float16)
-    w = min(F, p['x'].shape[1])
-    xdst[:, :w] = p['x'][sel, :w]
-    if w < F:
-        xdst[:, w:] = 0
+    if not sparse:
+        if xdst is None:
+            xdst = out['x'] = np.empty((len(idx), F), np.float16)
+        w = min(F, p['x'].shape[1])
+        xdst[:, :w] = p['x'][sel, :w]
+        if w < F:
+            xdst[:, w:] = 0
     off = p['opt_off'].astype(np.int64)
     lens = off[idx + 1] - off[idx]
     pos = _ranges(off[idx], lens)
@@ -300,6 +444,20 @@ def _load_part(path, N, idx, F, xdst=None, AW=0):
         else:
             out['aux'] = np.zeros((len(idx), AW), np.float16)
             out['aux_mask'] = np.zeros(len(idx), bool)
+    return out
+
+
+def _subset_part(part, idx, xs=True):
+    """A shard's full part (`_load_part` with idx None) cut to its rows `idx` (sorted): the part of
+    loading the shard with `idx`, array for array (`xs` False: its features left out)."""
+    lens = part['lens']
+    off = np.concatenate([np.zeros(1, np.int64), np.cumsum(lens)])
+    pos = _ranges(off[idx], lens[idx])
+    out = {k: part[k][idx] for k in ('src', 'player', 'n_players', 'lens', 'z', 'q', 'sc', 'aux', 'aux_mask')
+           if k in part}
+    out.update(opt_action=part['opt_action'][pos], pi=part['pi'][pos])
+    if xs and 'xs' in part:
+        out['xs'] = part['xs'].take(idx)
     return out
 
 
@@ -395,12 +553,12 @@ class Window:
     = the rows that have them)."""
 
     def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, threads=None, cache=None,
-                 aux_width=0):
+                 aux_width=0, sparse=False):
         self.F, self.A = num_features, num_actions
         self.AW = AW = int(aux_width)
         self.paths = list(paths)
         self.reused = 0
-        self._x = self._xs = None
+        self._x = self._xs = self._csr = self._xsp = None
         rng = np.random.default_rng(seed)
         rows = [shard_rows(p) for p in self.paths]
         total = sum(rows)
@@ -413,7 +571,34 @@ class Window:
         self.N = int(self.starts[-1])
         if self.N == 0:
             raise ValueError('empty training window')
-        if cache is not None and keep >= 1.0:
+        if sparse:
+            T = threads or WINDOW_THREADS
+            if cache is not None:
+                # every shard cached whole (its rows as non-zeros), subsampled from the cache: the window
+                # of loading the picks, also over budget
+                keys = {path: (_file_key(path), ('sparse', self.F, AW)) for path in self.paths}
+                for path in list(cache.parts):
+                    if path not in keys or cache.parts[path][:2] != keys[path]:
+                        del cache.parts[path]
+                todo = [k for k, path in enumerate(self.paths) if path not in cache.parts]
+                todo.sort(key=lambda k: -rows[k])  # the big shards first (the order of the results is the paths')
+                loaded = _run_all(lambda j: _load_part(self.paths[todo[j]], rows[todo[j]], None, self.F, AW=AW,
+                                                       sparse=True, xthreads=T), len(todo), T)
+                for k, part in zip(todo, loaded):
+                    cache.parts[self.paths[k]] = keys[self.paths[k]] + (part,)
+                self.reused = self.N - sum(kept[k] for k in todo)
+                full = [cache.parts[path][2] for path in self.paths]
+                # the features stay in the cached shards (`features` reads a row from its shard by
+                # src_row); the other arrays cut to the picks
+                parts = [q if idx is None else _subset_part(q, idx, xs=False) for q, idx in zip(full, picks)]
+                self._xsp = [q['xs'] for q in full]
+            else:
+                # (a big shard's conversion on T threads too: it is the slowest part, and a small
+                # shard's few chunks bound the threads in flight)
+                parts = _run_all(lambda k: _load_part(self.paths[k], rows[k], picks[k], self.F, AW=AW, sparse=True,
+                                                      xthreads=T), len(self.paths), T)
+                self._csr = SparseRows.concat([q['xs'] for q in parts], self.F)
+        elif cache is not None and keep >= 1.0:
             # (the auxiliary width only when on: the keys of before otherwise)
             keys = {path: (_file_key(path), (self.F, AW) if AW else self.F) for path in self.paths}
             for path in list(cache.parts):         # gone from the window, rewritten, another width
@@ -449,18 +634,39 @@ class Window:
         self.aux = np.concatenate([q['aux'] for q in parts]) if AW else None
         self.aux_mask = np.concatenate([q['aux_mask'] for q in parts]) if AW else None
         self.aux_rows = int(self.aux_mask.sum()) if AW else 0
-        xbytes = self._x.nbytes if self._x is not None else sum(a.nbytes for a in self._xs)
+        xbytes = (self._x.nbytes if self._x is not None else self._csr.nbytes if self._csr is not None
+                  else sum(a.nbytes for a in self._xsp) if self._xsp is not None
+                  else sum(a.nbytes for a in self._xs))
         self.nbytes = xbytes + sum(a.nbytes for a in (self.player, self.n_players, self.opt_off, self.opt_action,
                                                       self.pi, self.z, self.q, self.sc)
                                    + ((self.aux, self.aux_mask) if AW else ()))
 
     @property
     def x(self):
-        """The features [N, F] float16 (from the cache: concatenated, a copy - tests, debugging)."""
+        """The features [N, F] float16 (from the cache or a sparse window: a dense copy - tests,
+        debugging)."""
+        if self._csr is not None or self._xsp is not None:
+            return self.features(np.arange(self.N))
         return self._x if self._x is not None else np.concatenate(self._xs)
 
-    def features(self, idx):
-        """The features of window rows `idx`, float16 [len(idx), F]."""
+    def features(self, idx, dtype=np.float16):
+        """The features of window rows `idx`, [len(idx), F] in `dtype` (float16; float32: their exact
+        float32 values - a sparse window builds them directly)."""
+        if self._csr is not None:
+            return self._csr.dense(idx, dtype)
+        if self._xsp is not None:                  # (a cached sparse window: each row in its shard)
+            idx = np.asarray(idx, np.int64)
+            sh = np.searchsorted(self.starts, idx, side='right') - 1
+            src = self.src_row[idx]
+            order = np.argsort(sh, kind='stable')
+            cut = np.flatnonzero(np.diff(sh[order])) + 1
+            out = np.zeros((len(idx), self.F), dtype)
+            for g in np.split(order, cut):
+                if len(g):
+                    self._xsp[sh[g[0]]].scatter(out, g, src[g])
+            return out
+        if dtype != np.float16:
+            return self.features(idx).astype(dtype)
         if self._x is not None:
             return self._x[idx]
         idx = np.asarray(idx, np.int64)
@@ -496,7 +702,7 @@ class Window:
         def norm(a):
             return a / np.maximum(a.sum(1, keepdims=True), 1e-8)
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device)
-        out = {'x': t(self.features(idx).astype(np.float32)), 'mask': t(mask), 'pi': t(pi),
+        out = {'x': t(self.features(idx, np.float32)), 'mask': t(mask), 'pi': t(pi),
                'z': t(norm(self.z[idx])), 'q': t(norm(self.q[idx])), 'sc': t(self.sc[idx]),
                'n_players': t(self.n_players[idx])}
         if self.AW:
