@@ -140,6 +140,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` | 30, 3, 3600 | co-training (11.6): a worker backing off this many seconds gives its outstanding matches back; a match outstanding on a worker longer than this many of its expected latencies (at least 120 s; 0 = the timeout only) is requeued, and at the latest after `selfplay_remote_timeout` s of the worker's running time |
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
+| `sparse` | 0 | 1 = the run's drivers (self-play and matches) send sparse network batches (each row's non-zero features; docs/search.md 2.2): the same rows, games and samples; a token network's CUDA graphs scatter them on the device, other evaluators densify them (10.7) |
 | `resolver` | '' | co-training (section 11): the resolver game, whose episodes decide this game's deferred terminals ('' = a single-game run: this loop, line for line) |
 | `resolver_cfg` | {} | the resolver's settings (a JSON object of these same settings: spec, players, network, search, training, evaluation; `preset` names one), saved nested in config.json; resolved into `<run>/resolver/config.json` |
 | `resolver_init` | '' | the checkpoint the resolver's network starts from ('' = fresh); a single-game run's checkpoint works (widened if the game grew) |
@@ -1531,6 +1532,48 @@ the code; this commit adds documentation only):
   pytest: the first run on the two `test_remoteplay.py` tests above (305 passed), the second on
   `test_cotrain_the_local_driver_is_never_starved` alone (306 passed), which fails the same way on
   c15e3d0 under the same load (above). Every other step passed both times.
+
+### 10.7 Sparse batches in a run (run setting `sparse`; MTG Zero's Delver line, 2026-11-01)
+
+**Why.** With the token network's CUDA graphs (10.6) a batch of the Delver line's self-play (~144 rows,
+37,620 floats a row, ~0.7% of them non-zero) spent most of its time moving zeros: the driver assembling
+the dense rows in fresh memory, the graphs' pinned copy (3.8 ms at 192 rows) and the upload (1.7 ms),
+against a 2.4 ms replay. Its self-play process used under half a CPU core and waited on inference 90%
+of the time. The sparse batches built for the lookahead (docs/search.md 2.2, `DriverCfg::sparse`,
+`TokenGraphRunner.launch_sparse`) take both copies out.
+
+**What.** Run setting `sparse` (default 0: the drivers of before, byte for byte): `Run.driver` passes
+`sparse=True` to every driver the run builds - self-play (rolling or not), the yardstick / random / Elo
+matches, co-training's and a remote's (from the mirror's config; a remote's `overrides` can turn it off -
+MTG Zero's Mac does, its CPU evaluators would only densify). The rows, games and samples are the dense
+ones' (the graphs' answers bit for bit at the same batch shape, 10.6 / search.md 2.2); only the batches'
+transport changes.
+
+**Equivalence.** `tests/test_loop.py::test_sparse_setting_plays_the_same_selfplay`: an iteration's
+self-play of the toy run, its shards array for array the dense one's. On MTG Zero's Delver line
+(iteration 489, the run's self-play seat, CUDA graphs, 24 games in flight, 8 threads, the first 24
+finished games' samples and results hashed): dense d31a5acb09179104 twice, sparse d31a5acb09179104.
+
+**Throughput** (the line's local self-play exactly as `Run.selfplay` drives it - its rolling driver,
+seat and evaluator with ZERO_TOKEN_GRAPHS=1, samples taken every 32 batches -, from iteration 489; 90 s
+of warm-up, then 150 s measured; one configuration a process, configurations interleaved, two or four
+rounds; the RTX 5090 shared with another session's live run, so the absolute numbers are a loaded GPU's;
+8 search threads):
+
+| batches | groups | in flight | leaves/s (range) | x dense | rows a batch | CPU cores |
+|---|---:|---:|---:|---:|---:|---:|
+| dense | 2 | 192 | 13,390 (12,792-13,989) | 1.00 | 144 | 0.40 |
+| sparse | 2 | 192 | 24,996 (24,801-25,192) | 1.87 | 144 | 0.62 |
+| sparse | 4 | 192 | 20,037 (19,867-20,207) | 1.50 | 72 | 0.52 |
+| sparse | 2 | 384 | 35,610 (34,723-37,636) | 2.66 | 288 | 0.65 |
+| sparse | 4 | 384 | 31,536 (31,214-31,859) | 2.36 | 144 | 0.58 |
+| sparse | 2 | 768 | 44,278 (43,477-45,078) | 3.31 | 575 | 0.53 |
+| sparse | 2 | 1,536 | 41,694 (40,614-42,775) | 3.11 | 1,143 | 0.55 |
+
+Dense batches grow their host copy with the batch (10.6: flat at ~27k leaves/s from ~192 rows), so more
+games in flight did not pay; sparse ones do, up to ~768 in flight (batches of ~575 rows) on this GPU.
+More groups only split the same games into smaller batches. The process stays under a core: the GPU (and
+its other tenant) is the limit now, not the host.
 
 ## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
 
