@@ -34,7 +34,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
 | `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
-| `league.py` | The self-play league (section 14): the league games' kinds and seat tables (classic, rolling), the iteration's picks of past checkpoints (`League.plan`: uniform or pfsp), the slots' evaluators (guarded), the games' attribution and `selfplay.league` |
+| `league.py` | The self-play league (section 14): the league games' kinds and seat tables (classic, rolling), the iteration's picks of past checkpoints (`League.plan`: uniform or pfsp) or of fixed opponents (`selfplay_league_fixed`: `League.prepare` copies and checks them, 14.7), the slots' evaluators (guarded), the games' attribution and `selfplay.league` |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
 
@@ -67,6 +67,7 @@ python tools/pause_run.py runs/toy1      # pause within seconds (exit 75; the su
 python tools/kill_run.py runs/toy1       # hard stop: the supervisor, then the run (pids from the state files; --scan)
 python tools/fork_run.py runs/toy1/models/iter_0010.pt runs/toy2          # new run from a checkpoint (widened; across a token layout change: 10.3)
 python tools/fork_run.py --source runs/toy1 --dest runs/toy1b --iter 10 --set reuse=8   # continue at K
+python tools/fork_run.py --source runs/toy1 --dest runs/toy1x --iter 10 --no-data       # ... without the window's shards (14.7)
 python tools/distill.py runs/toy1/models/iter_0010.pt big.pt --data runs/toy1/data --hidden 256 --blocks 6   # section 13
 python tools/fork_run.py --source runs/toy1 --dest runs/toy1big --iter 10 --net big.pt  # continue at K with it
 ```
@@ -149,6 +150,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_league` | 0.0 | the self-play league (section 14): this share of the self-play games (exactly, over each driver's started games) puts a past checkpoint of the run in one seat; only the current network's decisions become samples. 0 = off (every game the current network's mirror, as before). Single-game runs (co-training refuses it) |
 | `selfplay_league_pool` | '2,4,8,16,32' | the past checkpoints it may play: raw iteration offsets back from the network that self-plays (iteration i self-plays with i-1: offset 2 = checkpoint i-3), those that exist; 'all' = every earlier checkpoint (fictitious self-play) |
 | `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
+| `selfplay_league_fixed` | '' | fixed opponents instead of the pool (section 14.7): frozen checkpoints, 'path' or 'label=path', comma-separated (label = the file's stem by default), each copied once into the run's `league/<label>.pt` with its sha256 recorded (another file under a recorded label is refused, exit 78); the slots play those copies (`fixed:<label>` in the metrics). With `selfplay_league` 1.0 every self-play game is the current network against them: a best-response run. Needs `selfplay_league` > 0, the pool at its default (not read), slots <= the fixed opponents. '' = off |
 | `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
 
 ## 2. Run control (`runctl.py`)
@@ -188,6 +190,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `elo/[<rule>/]anchored.json` | with `elo_anchors` (section 20.1): the anchors (label, file, sha256, fixed rating and how) and every player's rating in the fit with them fixed; the pool's `results.json` then also holds `anchors` and the anchors' games (`anchor:<label>` players) |
 | `evals.jsonl` | with `eval_remote` (section 5.2): one line per remote evaluation `{iter, eval_yard, eval_random, elo, time, host, seconds}` (+ `elo_anchored` with `elo_anchors`), merged into the iterations' rows by the dashboard; a co-training run's resolver: `resolver/evals.jsonl` (11.5); a co-training run's primary with `draft_eval_net_remote`: `{iter, eval_yard_net, time, host, seconds, remote_s}` (11.7) |
 | `progress.json` | self-play progress of the iteration in flight (dashboard); a co-training run's also has `events_resolved`, `target`, `drafting`, `pending_events`, `matches_queued`, `matches_in_flight`, `matches_done` (section 11); with `selfplay_remote`: `remote` (single-game) or `matches_remote` (co-training), sections 5.3, 11.6 |
+| `league/<label>.pt`, `league/fixed.json` | with `selfplay_league_fixed` (section 14.7): the run's copies of its fixed league opponents and their record (`{label: {sha256, bytes, source, since, time}}`) |
 | `resolver/` | a co-training run's resolver network (section 11): the same layout (`config.json`, `metrics.jsonl`, `models/`, `data/`, `elo/`, `debug/`, `progress.json`), iteration numbers shared |
 | `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control |
 
@@ -2469,6 +2472,8 @@ the self-play games puts a past checkpoint of the run in one seat.
   Elo matches'. A fork made without the setting and started with it plays only the candidates it has.
 * **Off** (`selfplay_league` 0, the default): no League object, the seat dicts, tables, evaluators,
   phase lines and metrics of before (14.5).
+* **Fixed opponents** instead of the pool's past checkpoints (`selfplay_league_fixed`, e.g. a
+  best-response run against a frozen copy of another run's network): 14.7.
 
 ### 14.3 Costs
 
@@ -2577,6 +2582,116 @@ read it with an h2h of the two K + N checkpoints at the same move rule (as the p
 selection A/Bs, 9 and 12.5). Watch `selfplay.league.win` (the network's score against its own past:
 a mirror run's policy that drifts in a cycle shows it falling against some checkpoints) and
 `train.entropy`. MTG Zero's flags: its ENGINE.md 63.
+
+### 14.7 Fixed opponents: a best-response run (`selfplay_league_fixed`; MTG Zero's exploitability test, 2026-11-01)
+
+**Why.** MTG Zero's Delver main line sits at a self-consistent fixed point (its ENGINE.md 81: its
+review of 2026-11-01). Whether the policy it settled into is *exploitable* - a learner trained only
+against a frozen copy of it beats it clearly - is the measurable form of the hidden-information
+question, and a league with one fixed opponent at share 1.0 is exactly a best-response trainer: the
+opponent's seat records nothing, so the learner's samples are its own decisions against that one
+frozen network (14.2). The pool's offsets cannot say "this checkpoint of another run, always"; this
+setting can.
+
+**The setting.** `selfplay_league_fixed`: '' (off, the default) or frozen checkpoints, comma-separated,
+each `path` or `label=path` (a label defaults to the file's stem; distinct; letters, digits, `.`, `_`,
+`-`). With it the league's candidates are those fixed opponents, named `fixed:<label>` in the plans,
+the metrics and the games' attribution; the pool's offsets are not read. `selfplay_league` stays the
+share of the self-play games against them (1.0: every game; a share < 1 mixes mirror games in, and
+several fixed opponents with fewer slots are picked as the pool's are, `uniform` or `pfsp`). The
+seats are the league's (14.2): the fixed opponent searches with the run's self-play settings (noise,
+temperature, the playout cap, the root belief) on its key `L<t>` with `record` false. Refused at the
+start (`league.check_settings`, SystemExit): the setting with `selfplay_league` 0, a non-default
+`selfplay_league_pool` with it (it would not be read), more slots than fixed opponents, a malformed or
+duplicate label, co-training (as the league).
+
+**The copy and its record** (`League.prepare`, when the run starts, before any work - with the
+anchors' and the held-out set's checks): each fixed opponent is copied once into the run as
+`league/<label>.pt` (through a temporary file whose sha256 must equal the source's) and recorded in
+`league/fixed.json`: `{label: {sha256, bytes, source, since (the iteration it starts at), time}}`. The
+slots play the run's copy, never the setting's path. At a restart the copy must still hash to the
+record and the setting's file, when it still exists, too: another file under a recorded label is
+refused - give it another label - as an Elo anchor's is (20.1); a missing copy is made again from an
+unchanged source, the source may be gone while the copy is intact. Then every copy goes through the
+encoding guard (10.4) and, with `selfplay_belief_tilt` on, the belief-head check (18.3). Every refusal
+is `league.LeagueRefused` (an `EncodingMismatch`): exit status 78, not restarted by the supervisor.
+The log: `league: fixed opponent g475 (E:/.../r3-2b_iter_0475.pt, sha256 a12f8c44272d) copied to
+league/g475.pt`, then every start `league: fixed opponents fixed:g475 = league/g475.pt (sha256
+a12f8c44272d); 100% of the self-play games against them, the pool not used`.
+
+**Metrics.** `selfplay.league` as in 14.2 - `slots` {`L0`: `fixed:g475`}, `candidates`, `pool`
+{`fixed:g475`: games, score, win}, `win` +- `se`: the learner's score against the fixed opponent in
+its self-play games (both seats with self-play's noise and temperature) - plus `fixed` {name:
+sha256[:16]}; the log line `iter N league: 1600 league games (100.0%), slots fixed:g475 (fixed); the
+current network scores 0.512 +- 0.012 against them (fixed:g475 1600 games 0.512)`.
+
+**What the learner trains on, and what it does not.** Only its own decisions (z its result, q its own
+search's root value). Two consequences at share 1.0: an iteration records about half the decision
+samples of a mirror iteration (one seat), and **no value-only view samples** - `selfplay_view_samples`
+records, at a recorded decision, one sample per *other recording* seat (docs/search.md 3.6), and the
+fixed opponent's seat does not record. Training's steps follow (`new samples x reuse / batch`): MTG
+Zero's Delver line records 26-31 samples a game this way instead of its mirror's 89 (its ENGINE.md
+81.5): ~180 training steps an iteration at 1,600 games instead of ~500.
+
+**Remote self-play** (5.3). The run ships its copies into the mirror (`<mirror>/league/<label>.pt`)
+with the mirror's config, before any worker starts; a worker's hello announces `league_fixed`
+{label: sha256 of its mirror's copy, None if missing}, and the run refuses a worker whose announcement
+is not its own record - an older checkout (no announcement: it would read the slot `league/g475.pt` as
+a past checkpoint) or a mirror holding another file: `worker k REFUSED: its fixed league opponents are
+..., the run's ...; killed, retried in 10 minutes` (the copies shipped again with the next session);
+this machine plays every game meanwhile. The phase line names the slot's file (`league`: {`L0`:
+`league/g475.pt`}); the worker reads it with `league.slot_of` and checks the file against its hello
+before loading it. Past checkpoints of the run are shipped per phase as before; fixed ones are not.
+
+**fork_run** (tools). `--no-data`: no window shards, so a best-response fork's first trainings see only
+its own games against the fixed opponent (a fork of a live run: its window would be the source's
+mirror games). A continuation now leaves out of its Elo pools the games of checkpoints after K: a fork
+behind its source's newest checkpoint held them under its own checkpoints' names (its K + e would find
+its Elo matches and anchor games "played" and its rating would mix two networks); a fork at the
+source's newest checkpoint copies the pools byte for byte as before. The source's `league/` (copies and
+record) is copied with the run; `league.fork_needs` with fixed opponents: none of the run's
+checkpoints.
+
+**Evaluating a best-response fork.** The league score is the running readout. For a confirmation at
+evaluation settings, the fixed opponent's copy is a checkpoint of the run for `zero.h2h` (its
+config.json two directories up is the run's): `python -m <pkg>.az.h2h <run>/models/iter_N.pt
+<run>/league/<label>.pt --paired ...`. As an Elo anchor of the fork's pool, name the same file in
+`elo_anchors` (`label=path`): a new anchor in a pool with fixed anchors is calibrated against them
+(20.1).
+
+**Off** (`selfplay_league_fixed` '', the default): no change. Byte identity against c6b959b, each
+checkout its own engine build and run directory, classic (deterministic) toy-smoke runs with the
+setting off - an MLP (3 iterations), a token network (3) - and the pool league on (0.25, pool '1,2', two
+slots, 4 iterations): every shard and checkpoint (tensor for tensor), the optimizer state,
+`elo/results.json` byte for byte, `ratings.json` and `models/index.json` (`updated` aside), the
+metrics without their timings, config.json = the base's + the new key; `check_checkpoint_compat
+--package zero` (random evaluator): identical.
+
+**Tests** (`tests/test_league.py`, 9 more): the settings and their refusals, the names and files
+(`name_of`, `rel_of`, `slot_of` round trips); `prepare`'s copy and record and its refusals (another
+file under the label, a changed copy, copy and source both missing, a missing new file, another
+encoding; the source gone with the copy intact accepted); through the bindings at share 1.0 the learner
+only meets the frozen network (24 of 24 games, seats alternating, the slot's weights the frozen file's,
+its samples exactly the current seat's of the same games recorded on both sides, z its result,
+attribution `fixed:<label>`, the metrics' `fixed`); a classic toy run (48 of 48 games a league game
+every iteration, the shards' samples, the copy, the log); a restart under another file refused (exit
+78, nothing played); fork_run `--no-data` behind its source (checkpoint 3's Elo pairs left out, the
+fork plays its own) and at the source's newest (the pool byte for byte); the shared queue with the
+remote 'local' (the quota exact, every accepted game against the fixed opponent on both machines, the
+mirror's copy); a worker without the fixed opponents and one announcing another file refused while
+this machine plays every game.
+
+**Checks** (tier "opt-in core feature with byte-identical defaults"; desktop 2026-11-01, CPU only,
+MTG Zero's main line live on the GPU and the Mac): `tests/test_league.py` 22 passed (13 + 9) and
+`tests/test_loop.py` with it 37 passed (2 min 35 s); the byte identity and `check_checkpoint_compat`
+above; MTG Zero's `tools/gate.py optin-core` on its branch `league-fixed` (5d71a91, this code 970f6ca
+pinned) PASSED: `cargo test --release` here 92 passed, its checkpoint_compat byte identity against its
+main e057c87 identical, its `--test az` 39 / `--test hidden` 16 passed, Glass Road c1f56dc / Caverna
+a6fad73 / Kingdom Builder 4202a4a build against this core, `pytest tests` here **316 passed, 8
+skipped** (17 min 42 s; the load-sensitive co-training timing test passed this time). MTG Zero's
+own evidence on the real game (a CPU run whose iteration 0 is the Delver line's frozen gen 475, two
+iterations at share 1.0 against it; a launch of a fork through its supervisor, a mismatched fixed file
+refused with exit 78 and not restarted): its ENGINE.md 81.7.
 
 ## 15. Auxiliary training targets (`zero/auxtarget.py`; MTG Zero's belief head, 2026-10-29)
 
