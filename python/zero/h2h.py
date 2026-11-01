@@ -386,8 +386,10 @@ def _max_rows(sa, sb, max_rows):
     return 1024 if (sa.get('lookahead') or sb.get('lookahead')) else None
 
 
-def _look_out(out, sa, sb, stats, max_rows):
-    """The lookahead fields of a match's output (only with a lookahead side or max_rows)."""
+def _look_out(out, sa, sb, stats, max_rows, evs=None):
+    """The lookahead fields of a match's output (only with a lookahead side or max_rows); with a
+    lookahead side also `perf` (where the time went: the drivers' search / assembly / the caller's
+    wait, the evaluators' seconds, calls, rows)."""
     for k, sd in (('a', sa), ('b', sb)):
         if sd.get('lookahead'):
             out[f'lookahead_{k}'] = LA.settings(sd['lookahead'])
@@ -395,6 +397,13 @@ def _look_out(out, sa, sb, stats, max_rows):
     ls = look_summary(stats)
     if ls is not None:
         out['look'] = ls
+        perf = {k: round(sum(st[k] for st in stats), 2) for k in ('busy_s', 'assemble_s', 'wait_s', 'wall_s')}
+        perf.update({k: sum(st[k] for st in stats) for k in ('batches', 'leaves', 'sims', 'belief_rows', 'view_rows')})
+        perf['threads'] = stats[0]['threads']
+        for k, ev in (evs or {}).items():
+            perf[f'eval_{k}'] = {'seconds': round(ev.seconds, 2), 'calls': ev.calls, 'rows': ev.leaves,
+                                 'graph_calls': ev.graph_calls, 'pieces': ev.pieces}
+        out['perf'] = perf
     if max_rows is not None:
         out['max_rows'] = max_rows
 
@@ -434,7 +443,7 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb))
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
-    _look_out(out, sa, sb, st, mr)
+    _look_out(out, sa, sb, st, mr, evs)
     if paired:
         out['paired'] = True
     if rows:
@@ -511,7 +520,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb), batches=batches, stop=stop)
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
-    _look_out(out, sa, sb, st, mr)
+    _look_out(out, sa, sb, st, mr, evs)
     if paired:
         out['paired'] = True
     if sprt is not None:
