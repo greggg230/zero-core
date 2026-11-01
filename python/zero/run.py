@@ -197,6 +197,14 @@ DEFAULTS = dict(
     # the root minimum visits of the same side (sequential halving already visits every considered option)
     selfplay_root_search='puct', eval_root_search='puct', gumbel_m=16, selfplay_gumbel_scale=1.0,
     eval_gumbel_scale=0.0,
+    # late sampling (docs/search.md 3.10, docs/az.md 22): self-play's searched decisions after its first
+    # temp_moves of a game - full and fast searches, never minor ones - are sampled with probability
+    # proportional to N^(1 / selfplay_temp_late) over the root visit counts instead of always playing the
+    # rule's move (selfplay_select); selfplay_temp_late_margin > 0 admits only the options whose completed
+    # Q is at most that much below the rule's move's (the rule's move always). 0 = off (the default:
+    # today's games, bit for bit); the metrics' selfplay.temp_late counts the late decisions and the
+    # deviations (this machine's driver). Remote self-play: a checkout without it is refused at its hello
+    selfplay_temp_late=0.0, selfplay_temp_late_margin=0.0,
     # the game spec of every match that records nothing (vs the yardstick, vs random, Elo, the
     # reference games); '' = the game package's evaluation spec for the self-play spec
     # (GamePackage.eval_specs; MTG: a fixed deck set, self-play random decks), else the spec
@@ -475,7 +483,9 @@ class Run:
                              view_samples=c.get('selfplay_view_samples', 0.0),
                              view_sample_target=c.get('view_sample_target', 'next_q'),
                              root_search=c.get('selfplay_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
-                             gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), **belief_keys(c, 'selfplay'))
+                             gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), **belief_keys(c, 'selfplay'),
+                             temp_late=c.get('selfplay_temp_late', 0.0),
+                             temp_late_margin=c.get('selfplay_temp_late_margin', 0.0))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
@@ -610,6 +620,7 @@ class Run:
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
+        self.late_metrics(out, st, st0, len(results))
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -641,6 +652,18 @@ class Run:
         rows = st.get('belief_rows', 0) - ((st0 or {}).get('belief_rows', 0))
         dec = sum(r.get('decisions', 0) for r in results)
         out['belief'] = {'rows': rows, 'per_decision': round(rows / max(1, dec), 4)}
+
+    def late_metrics(self, out, st, st0, games):
+        """Self-play's late-sampling metrics (docs/az.md 22), only when it is on (the metrics of before
+        otherwise): `temp_late` = this machine's driver's late-sampled decisions over the phase, full and
+        fast searches apart, their deviations (a move other than the rule's), the share of them with one
+        option alone weighed (the gate left no choice), the mean completed-Q cost of a deviation (the rule's
+        move's Q - the played move's) and per game (per game this machine finished in the phase)."""
+        if not float(self.cfg.get('selfplay_temp_late', 0.0) or 0.0):
+            return
+        a, b = st.get('late') or {}, (st0 or {}).get('late') or {}
+        d = {k: a.get(k, 0) - b.get(k, 0) for k in set(a) | set(b)}
+        out['temp_late'] = late_summary(d, games)
 
     def selfplay_shared(self, it):
         """Iteration `it`'s self-play with a remote (docs/az.md 5.3; zero/remoteplay.py,
@@ -774,6 +797,7 @@ class Run:
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
+        self.late_metrics(out, st, st0, acc['finished'])
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
@@ -1526,6 +1550,30 @@ def aux_settings(cfg, info):
     return w, targets
 
 
+def late_summary(d, games):
+    """Late sampling's counters (`SearchDriver.stats()['late']` keys, summed or differenced; docs/search.md
+    3.10) over `games` finished games -> {decisions, deviations, rate, single, cost, per_game}: full / fast
+    / all, the rate = deviations / decisions, `single` = the share of decisions where one option alone
+    weighed, `cost` = the mean completed-Q cost of a deviation, `per_game` = deviations and summed cost
+    per game."""
+    g = lambda k: d.get(k, 0)                      # noqa: E731
+    out = {'decisions': {}, 'deviations': {}, 'rate': {}, 'single': {}, 'cost': {}}
+    for kind in ('full', 'fast', 'all'):
+        ks = ('full', 'fast') if kind == 'all' else (kind,)
+        n = sum(g('decisions_' + k) for k in ks)
+        dev = sum(g('deviations_' + k) for k in ks)
+        cost = sum(g('cost_' + k) for k in ks)
+        out['decisions'][kind] = n
+        out['deviations'][kind] = dev
+        out['rate'][kind] = round(dev / n, 4) if n else 0.0
+        out['single'][kind] = round(sum(g('single_' + k) for k in ks) / n, 4) if n else 0.0
+        out['cost'][kind] = round(cost / dev, 5) if dev else 0.0
+    out['per_game'] = {'deviations': round(out['deviations']['all'] / max(1, games), 3),
+                       'cost': round(sum(g('cost_' + k) for k in ('full', 'fast')) / max(1, games), 5),
+                       'decisions': round(out['decisions']['all'] / max(1, games), 2)}
+    return out
+
+
 def _fmt(d):
     return json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in d.items()})
 
@@ -1692,7 +1740,12 @@ def check_eval_settings(cfg, where=''):
             check_belief(tilt, clip, mix, what=f'{pre}_belief_tilt')
     except ValueError as e:
         raise SystemExit(f'{where}{e}') from None
-    from .mcts import check_root_search
+    from .mcts import check_root_search, check_temp_late
+    try:
+        check_temp_late(cfg.get('selfplay_temp_late', 0.0), cfg.get('selfplay_temp_late_margin', 0.0),
+                        root_search=cfg.get('selfplay_root_search', 'puct'), what='selfplay_temp_late')
+    except ValueError as e:
+        raise SystemExit(f'{where}{e}') from None
     for side, scale_d in (('selfplay', 1.0), ('eval', 0.0)):
         try:
             rs = cfg.get(f'{side}_root_search', 'puct')

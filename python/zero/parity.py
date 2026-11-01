@@ -31,6 +31,10 @@
   moves (`gumbel_choose`) and the root values (`gumbel_q`) agree at the noise floor (Python vs
   Python with the same noise); `gumbel_formula`: the Python `gumbel_choose` / `gumbel_q` / next
   root walk on Rust roots' statistics against the Rust tree's own, exactly.
+* `late_formula`: late sampling (docs/search.md 3.10) - the Python `mcts.completed_q`, `late_weights`
+  and `late_pick` on Rust roots' statistics against the Rust driver's own (the bindings' `completed_q`,
+  `late_weights`, `late_pick`: the code of a driver's late-sampled moves), for each temperature and
+  margin gate and a grid of draws: exactly (but on a draw within rounding of a weight's boundary).
 * `h2h`: games between a Rust-tree seat and a Python-tree seat (`play.PyDriver`, seats
   alternating), both searching with the same network and settings (and move rule): ~50% within
   error.
@@ -544,6 +548,51 @@ def select_formula(game='toy', n=8, sims=(4, 8, 24, 64), seed=0, rules=SELECT_RU
                     out['near_ties'] += 1
                 else:
                     out['mismatches'].append({'position': k, 'sims': ns, 'rule': [rule, mv, cv, cs], 'py': py, 'rs': rs})
+    return out
+
+
+LATE_SETTINGS = ((1.0, 0.0), (0.7, 0.0), (0.5, 0.0), (1.0, 0.05), (0.7, 0.02), (0.5, 0.005))
+
+
+def late_formula(game='toy', n=8, sims=(4, 8, 24, 64), seed=0, settings=LATE_SETTINGS, draws=64, scale=0.15,
+                 eps=1e-9):
+    """Late sampling's Python formulas on Rust roots' statistics (the visits rule's move as the rule's)
+    vs the Rust driver's (`completed_q`, `late_weights`, `late_pick` of the bindings) for each (temp,
+    margin) of `settings` and `draws` draws u -> {checked, agree, near_ties, mismatches, gated}: the
+    completed Q and weights must agree to `eps` (relative), the picks exactly but where u x total lies
+    within `eps` of a cumulative weight (a near-tie); `gated` counts the roots where a margin left a
+    visited option out (the check has power)."""
+    E = engine()
+    info = E.game_info_of(game)
+    ev = LinearEval(info["num_features"], info["num_actions"], seed=1, scale=scale)
+    out = {'checked': 0, 'agree': 0, 'near_ties': 0, 'mismatches': [], 'gated': 0}
+    for k, g in enumerate(sample_positions(game, n, seed)):
+        for ns in sims:
+            *_, t = search_rs(g, ev, ns, 900 + 31 * k + ns, tree=True)
+            P0, Nv, W, v = t.root_priors0, t.root_visits, t.root_values, t.root_value0
+            q, qr = mcts.completed_q(P0, Nv, W, v), E.completed_q(P0, Nv, W, v)
+            if any(abs(a - b) > eps * max(1.0, abs(a)) for a, b in zip(q, qr)):
+                out['mismatches'].append({'position': k, 'sims': ns, 'q': [q, qr]})
+                continue
+            rule = mcts.select_index(P0, Nv, W, v)
+            for temp, margin in settings:
+                w, wr = mcts.late_weights(Nv, q, rule, temp, margin), E.late_weights(Nv, qr, rule, temp, margin)
+                if any(abs(a - b) > eps * max(1.0, abs(a)) for a, b in zip(w, wr)) or [a > 0 for a in w] != [b > 0 for b in wr]:
+                    out['mismatches'].append({'position': k, 'sims': ns, 'late': [temp, margin], 'w': [w, wr]})
+                    continue
+                if margin > 0 and any(c > 0 and x == 0 for c, x in zip(Nv, w)):
+                    out['gated'] += 1
+                cum = [sum(w[:i + 1]) for i in range(len(w))]
+                for j in range(draws):
+                    u = (j + 0.5) / draws
+                    py, rs = mcts.late_pick(w, rule, u), E.late_pick(wr, rule, u)
+                    out['checked'] += 1
+                    if py == rs:
+                        out['agree'] += 1
+                    elif any(abs(u * cum[-1] - c) < eps * max(1.0, cum[-1]) for c in cum):
+                        out['near_ties'] += 1
+                    else:
+                        out['mismatches'].append({'position': k, 'sims': ns, 'late': [temp, margin], 'u': u, 'py': py, 'rs': rs})
     return out
 
 

@@ -2334,3 +2334,218 @@ fn gumbel_with_a_root_belief() {
     assert_eq!(rows0, (0, 0));
     assert_ne!(records_digest(&s0), records_digest(&s1), "the belief changed nothing in the Gumbel searches");
 }
+
+// ------------------------------------------------------------------ late sampling (docs/search.md 3.10)
+
+fn with_late(seat: SeatCfg, temp: f64, margin: f64) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.temp_late = temp;
+            s.temp_late_margin = margin;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+/// Self-play of `seat` on both sides of 24 toy games (seed 2026, the move log on, `skewed` priors or
+/// `answer`'s uniform ones): the result rows (by gid), the records and the driver's counters.
+fn late_run(seat: SeatCfg, threads: usize, skewed: bool) -> (Vec<GameResult>, Vec<Record>, DriverStats) {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.move_log = 100_000;
+    c.threads = threads;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (mut res, mut smp) = (Vec::new(), Vec::new());
+    while let Some(b) = d.next_batch(true).unwrap() {
+        if skewed {
+            answer_skewed(&mut d, &b);
+        } else {
+            answer(&mut d, &b);
+        }
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+    }
+    res.extend(d.take_results());
+    smp.extend(d.take_samples());
+    res.sort_by_key(|r| r.gid);
+    let st = d.stats();
+    (res, smp, st)
+}
+
+#[test]
+fn late_weights_and_pick_by_hand() {
+    let nv = [10u32, 5, 0, 1];
+    let q = [0.60, 0.59, 0.90, 0.50];
+    // no gate: N^(1 / T) of every visited option (the unvisited one, however good its Q, weighs 0)
+    assert_eq!(late_weights(&nv, &q, 0, 1.0, 0.0), vec![10.0, 5.0, 0.0, 1.0]);
+    assert_eq!(late_weights(&nv, &q, 0, 0.5, 0.0), vec![100.0, 25.0, 0.0, 1.0]);
+    let w = late_weights(&nv, &q, 0, 2.0, 0.0);
+    assert!((w[0] - 10f64.sqrt()).abs() < 1e-12 && (w[1] - 5f64.sqrt()).abs() < 1e-12 && w[3] == 1.0);
+    // a gate of 0.02: option 3 (0.10 below the rule's move) is out
+    assert_eq!(late_weights(&nv, &q, 0, 1.0, 0.02), vec![10.0, 5.0, 0.0, 0.0]);
+    // the gate is relative to the rule's move: from option 1 (Q 0.59) the better option 0 is in
+    assert_eq!(late_weights(&nv, &q, 1, 1.0, 0.005), vec![10.0, 5.0, 0.0, 0.0]);
+    // ... and the rule's move always is, even when a gate leaves it alone
+    assert_eq!(late_weights(&nv, &q, 3, 1.0, 0.001), vec![10.0, 5.0, 0.0, 1.0]);
+    assert_eq!(late_weights(&[3, 1], &[0.2, 0.9], 0, 1.0, 0.01), vec![3.0, 1.0]);
+    assert_eq!(late_weights(&[3, 1], &[0.9, 0.2], 0, 1.0, 0.01), vec![3.0, 0.0]);
+    // the pick: cumulative weights against u x total
+    let w = [10.0, 5.0, 0.0, 0.0];
+    assert_eq!(late_pick(&w, 0, 0.0), 0);
+    assert_eq!(late_pick(&w, 0, 0.66), 0);
+    assert_eq!(late_pick(&w, 0, 0.67), 1);
+    assert_eq!(late_pick(&w, 0, 0.999_999), 1);
+    assert_eq!(late_pick(&[0.0, 2.0, 0.0], 0, 0.5), 1);
+    // nothing weighs anything (the rule's move unvisited and alone): the rule's move
+    assert_eq!(late_pick(&[0.0, 0.0], 1, 0.3), 1);
+    assert_eq!(late_pick(&[], 0, 0.3), 0);
+}
+
+#[test]
+fn late_sampling_off_changes_nothing() {
+    // temp_late 0 (the default, explicit here): the golden records, bit for bit, and no counters
+    let (_, recs) = golden_selfplay(with_late(nn(0, 16, true), 0.0, 0.0));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    let (_, recs) = golden_selfplay(with_late(with_select(nn(0, 16, true), CQ), 0.0, 0.0));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_SELECT_CQ_RECORDS);
+    let (res, _, st) = late_run(nn(0, 16, true), 2, false);
+    assert_eq!(st.late, LateTotals::default());
+    assert!(res.iter().all(|r| r.late.is_empty()));
+    assert_eq!(results_digest(&golden_match(Select::Visits, Select::Visits)), GOLDEN_MATCH_VISITS);
+}
+
+/// The searched decisions' moves of a game's move log (every seat a network seat: the logged moves
+/// with more than one legal action), in order.
+fn searched(r: &GameResult) -> Vec<u16> {
+    r.moves.iter().filter(|m| m.2.len() > 1).map(|m| m.1).collect()
+}
+
+#[test]
+fn late_sampling_plays_the_games_of_before_until_its_first_deviation() {
+    // Every search full (no sims_fast: no playout-cap draw), so the slot's move stream feeds the
+    // temperature and late sampling alone: a game with temp_late plays exactly the game without it
+    // until its first deviation, which is the first late entry whose move is not the rule's - there
+    // the game without it played the rule's move. Late decisions start at temp_moves (10).
+    let seat = |late: f64| match nn(0, 16, true) {
+        SeatCfg::Nn(mut s) => {
+            s.sims_fast = None;
+            s.p_full = 1.0;
+            with_late(SeatCfg::Nn(s), late, 0.0)
+        }
+        s => s,
+    };
+    let (base, _, _) = late_run(seat(0.0), 2, false);
+    let (mut deviated, mut same) = (0, 0);
+    for temp in [1.0, 0.1] {
+        let (late, _, st) = late_run(seat(temp), 2, false);
+        let (late4, _, st4) = late_run(seat(temp), 4, false);
+        assert_eq!(st.late, st4.late, "late sampling is not reproducible across threads");
+        assert_eq!(late.iter().map(|r| (&r.moves, &r.late)).collect::<Vec<_>>(), late4.iter().map(|r| (&r.moves, &r.late)).collect::<Vec<_>>());
+        assert_eq!(st.late.decisions_fast, 0);
+        for (a, b) in base.iter().zip(&late) {
+            assert!(b.over);
+            let (sa, sb) = (searched(a), searched(b));
+            assert!(b.late.iter().all(|m| m.decision >= 10 && m.full), "game {}: a late entry before temp_moves", b.gid);
+            assert_eq!(b.late.len() as u32, b.decisions.saturating_sub(10), "game {}: every searched decision after temp_moves", b.gid);
+            match b.late.iter().find(|m| m.rule != m.played) {
+                None => {
+                    assert_eq!(a.moves, b.moves, "game {}: no deviation, yet another game", b.gid);
+                    same += 1;
+                }
+                Some(m) => {
+                    let d = m.decision as usize;
+                    assert_eq!(sa[..d], sb[..d], "game {}: the games differ before the first deviation (decision {d})", b.gid);
+                    assert_eq!((sa[d], sb[d]), (m.rule, m.played), "game {}: decision {d}", b.gid);
+                    deviated += 1;
+                }
+            }
+        }
+        assert_eq!(st.late.deviations_full, late.iter().map(|r| r.late.iter().filter(|m| m.rule != m.played).count() as u64).sum::<u64>());
+        eprintln!("late sampling T {temp}: {deviated} games deviated, {same} played the game of before (cumulative); {} deviations in {} late decisions", st.late.deviations_full, st.late.decisions_full);
+    }
+    assert!(deviated > 0 && same > 0, "{deviated} deviated, {same} the same: both cases must be checked");
+}
+
+#[test]
+fn late_sampling_counts_full_and_fast_and_its_margin_gate_holds() {
+    // the toy's self-play seat (fast searches at 4 simulations): both kinds are sampled late; the
+    // counters equal the move log's late entries (all of them: a log longer than any game); every
+    // deviation of a gated seat is within its margin by the logged Q, and the gate binds
+    for (temp, margin) in [(1.0, 0.0), (0.5, 0.0), (1.0, 0.02), (1.0, 0.005)] {
+        let (res, recs, st) = late_run(with_late(nn(0, 16, true), temp, margin), 2, true);
+        assert!(res.iter().all(|r| r.over) && !recs.is_empty());
+        let mut t = LateTotals::default();
+        for r in &res {
+            assert_eq!(r.late.len() as u32, r.decisions.saturating_sub(10), "game {}", r.gid);
+            for m in &r.late {
+                assert!(m.decision >= 10 && m.weighed >= 1 && m.weighed <= m.options);
+                let dev = m.rule != m.played;
+                let cost = if dev { m.q_rule - m.q_played } else { 0.0 };
+                if margin > 0.0 && dev {
+                    assert!(cost <= margin + 1e-12, "T {temp} margin {margin}: a deviation {cost} below the rule's Q");
+                }
+                let (dec, single, devs, c) = if m.full {
+                    (&mut t.decisions_full, &mut t.single_full, &mut t.deviations_full, &mut t.cost_full)
+                } else {
+                    (&mut t.decisions_fast, &mut t.single_fast, &mut t.deviations_fast, &mut t.cost_fast)
+                };
+                *dec += 1;
+                *single += (m.weighed <= 1) as u64;
+                *devs += dev as u64;
+                *c += cost;
+            }
+        }
+        let l = &st.late;
+        assert_eq!((l.decisions_full, l.decisions_fast, l.single_full, l.single_fast, l.deviations_full, l.deviations_fast), (t.decisions_full, t.decisions_fast, t.single_full, t.single_fast, t.deviations_full, t.deviations_fast), "T {temp} margin {margin}");
+        assert!((l.cost_full - t.cost_full).abs() < 1e-9 && (l.cost_fast - t.cost_fast).abs() < 1e-9);
+        assert!(l.decisions_full > 0 && l.decisions_fast > 0 && l.deviations_full > 0 && l.deviations_fast > 0, "T {temp} margin {margin}: {l:?}");
+        eprintln!("late T {temp} margin {margin}: full {}/{} deviations (cost {:.4}), fast {}/{} (cost {:.4}); single {} / {}", l.deviations_full, l.decisions_full, l.cost_full, l.deviations_fast, l.decisions_fast, l.cost_fast, l.single_full, l.single_fast);
+    }
+    // the gate binds: fewer options weighed and fewer deviations than without it, at the same T
+    let (_, _, open) = late_run(with_late(nn(0, 16, true), 1.0, 0.0), 2, true);
+    let (_, _, gated) = late_run(with_late(nn(0, 16, true), 1.0, 0.005), 2, true);
+    let rate = |l: &LateTotals| (l.deviations_full + l.deviations_fast) as f64 / l.decisions() as f64;
+    let single = |l: &LateTotals| (l.single_full + l.single_fast) as f64 / l.decisions() as f64;
+    assert!(single(&gated.late) > single(&open.late) && rate(&gated.late) < rate(&open.late), "{:?} vs {:?}", gated.late, open.late);
+    // a colder T deviates less
+    let (_, _, cold) = late_run(with_late(nn(0, 16, true), 0.3, 0.0), 2, true);
+    assert!(rate(&cold.late) < rate(&open.late));
+}
+
+#[test]
+fn late_sampling_leaves_minor_searches_to_the_rule() {
+    // MinorToy: two-option decisions are minor (searched at sims_minor 4, three visits): never sampled
+    // late, never counted; the other decisions after temp_moves are
+    let seat = with_late(with_minor(nn(0, 16, true), Some(4)), 1.0, 0.0);
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.move_log = 100_000;
+    let mut d = Driver::<MinorToy>::new(c).unwrap();
+    let (res, _) = run(&mut d);
+    let st = d.stats();
+    assert!(st.minor > 0 && st.late.decisions() > 0);
+    let mut minor_late = 0;
+    for r in &res {
+        assert!(r.late.iter().all(|m| m.options != 2), "game {}: a minor decision sampled late", r.gid);
+        // the searched decisions after temp_moves that are minor (two options) ...
+        let opts: Vec<usize> = r.moves.iter().filter(|m| m.2.len() > 1).map(|m| m.2.len()).collect();
+        assert_eq!(opts.len() as u32, r.decisions);
+        minor_late += opts.iter().skip(10).filter(|&&k| k == 2).count();
+        // ... are exactly the late decisions missing from the log
+        assert_eq!(r.late.len(), opts.iter().skip(10).filter(|&&k| k != 2).count(), "game {}", r.gid);
+    }
+    assert!(minor_late > 0, "no minor decision after temp_moves: the test has no power");
+}
+
+#[test]
+fn late_sampling_settings_are_checked() {
+    let bad = |seat: SeatCfg| Driver::<ToyGame>::new(cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).err().unwrap_or_default();
+    assert!(bad(with_late(nn(0, 8, true), -1.0, 0.0)).contains("temp_late -1"));
+    assert!(bad(with_late(nn(0, 8, true), f64::NAN, 0.0)).contains("temp_late NaN"));
+    assert!(bad(with_late(nn(0, 8, true), 1.0, f64::INFINITY)).contains("temp_late_margin"));
+    assert!(bad(with_late(nn(0, 8, true), 0.0, 0.05)).contains("a gate of temp_late > 0"));
+    assert!(bad(with_late(nn(0, 8, false), 1.0, 0.0)).contains("self-play seat"));
+    assert!(bad(with_late(with_gumbel(nn(0, 8, true), 16, 1.0, 1.0), 1.0, 0.0)).contains("exclusive"));
+    assert!(Driver::<ToyGame>::new(cfg(vec![with_late(nn(0, 8, true), 0.7, 0.05)], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_ok());
+}

@@ -434,7 +434,9 @@ Python reference driver has no pairing. Uses: docs/az.md 20.3 (zero.h2h `--paire
   halving replaces PUCT at the root and its move the rule below; self-play samples moves by visit count
   for the first `temp_moves` searched decisions of the game, otherwise (and in evaluation) by
   the seat's move rule (section 3.3; the default argmax (N, P0) with the first maximum on
-  ties); tree reuse: after a real move the tree
+  ties) - or, with the opt-in late sampling (section 3.10), samples its full and fast searches'
+  moves after `temp_moves` too, by N^(1 / temp_late) among the options near the rule's move's Q;
+  tree reuse: after a real move the tree
   survives only for the seat that moved, if it decides again next, with `redet`, and if the
   child for (action, real chance key, next decision) exists.
 * **Value target** (training): `(1 - q) z + q q_root`, `q = value_q * min(1, iter /
@@ -506,8 +508,9 @@ prove the search never calls it.
 ### 3.3 The move rule: visits or completed Q (`select`; 2026-10-28)
 
 A network seat's move that is not sampled - every move of an evaluation seat, and a self-play
-seat's after its first `temp_moves` searched decisions of the game - is chosen from the root's
-statistics by the seat's rule (`driver::Select`; the search and the recorded targets are the
+seat's after its first `temp_moves` searched decisions of the game (unless late sampling, section
+3.10, samples it: the rule's move is then its anchor) - is chosen from the root's statistics by the
+seat's rule (`driver::Select`; the search and the recorded targets are the
 same whatever the rule):
 
 * `'visits'` (default): argmax (N, P0), the first maximum on exact ties - AlphaZero's rule and
@@ -1066,6 +1069,66 @@ Code: `lookahead.rs` (`LookCfg`, `Look`, `RowSink`, `Answers`, `LookStats`, `obs
 `LookRows`), the bindings (`Lookahead`, `lookahead_settings`, seat key `lookahead`, `stats()['look']`);
 Python `lookahead.py`, `infer.py` (`max_rows`), `h2h.py`.
 
+### 3.10 Late sampling: gentle temperature for the rest of the game (`temp_late`; MTG Zero's Delver mirror, 2026-11-01)
+
+**Why.** A self-play seat samples its moves for its first `temp_moves` searched decisions only and then
+always plays its rule's move. In MTG Zero's Delver mirror `temp_moves` 60 of ~243 searched decisions a
+game is about turns 1-4: the mid- and late-game positions are only ever reached along the rule's moves,
+so no alternative there is ever played out, and the network's top prior agrees with its search's move
+97.4% of the time. Late sampling keeps sampling, more gently and optionally gated by the search's own
+value estimate, for the rest of the game.
+
+**What.** Seat keys `temp_late` (default 0 = off) and `temp_late_margin` (default 0 = no gate). A
+self-play seat's searched decision at or after its first `temp_moves` (`decisions >= temp_moves`, the
+count the temperature reads), full or fast, with root visits:
+
+1. The rule's move r (section 3.3: argmax (N, P0), or 'cq') is computed as before.
+2. Its weights: `w_k = N_k^(1 / temp_late)` over the visit counts the temperature reads (the forced walks
+   of section 3.5 left out); with a gate (`temp_late_margin` m > 0) only r and the options with
+   `Q_r - Q_k <= m` keep their weight, Q the completed Q of section 3.1 (W / N, v_mix if unvisited; from
+   every visit, as the 'cq' rule reads it: `tree::completed_q`). An unvisited option weighs 0 always.
+3. The move: one draw u of the slot's move stream (the temperature's: `slot.rng`), the first option whose
+   cumulative weight passes u x the total (`driver::late_pick`; r when nothing weighs).
+
+T = 1 samples the visit distribution as the temperature does; T < 1 sharpens it (T 0.5 = N^2). The gate
+bounds a deviation's cost by the search's own estimate - a curiosity among near-equal moves, without move
+tags; the rule's move is always eligible, so the gate can leave it alone (no choice).
+
+* **Minor searches** (`sims_minor`, MTG: the mana payments at 4 simulations) keep the rule: three or four
+  visits are too coarse a distribution to sample - one stray visit would make a 1-in-4 move - and those
+  choices (which land to tap) are the rule's to make. Fast (`sims_fast`) and full searches both sample:
+  the fast ones are most of a game's decisions and play its moves as much as the full ones.
+* **The Gumbel root search** (section 3.7): exclusive (an error: its noise is its temperature, and a
+  self-play seat past `temp_moves` searches without it on purpose), as its root minimum visits are.
+* **Evaluation seats**: refused (an evaluation seat never samples); a league opponent (a self-play seat
+  with `record` false) samples late as the recorded seat does.
+* **Records**: unchanged - the policy target and the root value of a recorded decision are its search's;
+  only the move played (and so the positions that follow) changes.
+* **Streams**: the draw comes from the slot's move stream after the temperature's, so a game with late
+  sampling plays exactly the game without it until its first deviation when every search is full
+  (`late_sampling_plays_the_games_of_before_until_its_first_deviation`); with fast searches the extra
+  draws also move the later playout-cap draws (another game, as any setting that changes a move).
+* **Counters** (`DriverStats::late`, the bindings' `stats()['late']`, only with late-sampled decisions):
+  `decisions_full` / `decisions_fast` (late-sampled decisions), `single_*` (those where one option alone
+  weighed: no choice), `deviations_*` (a move other than the rule's), `cost_*` (their summed completed-Q
+  cost Q_r - Q_played, the decider's utility: P(win) with `margin_w` 0; negative when the sampled move's Q
+  was higher). The move log (`DriverCfg::move_log`) also logs each game's late-sampled decisions
+  (`GameResult::late`, `take_results()[...]['late']`: decision index, round, full, options, weighed, the
+  rule's and the played action, their Q), a diagnostic.
+* **Off** (temp_late 0): no draw, no key in `games.nn_seat`'s dict - the search of before bit for bit (the
+  golden records and match, `late_sampling_off_changes_nothing`).
+
+The Python reference (`play.PyDriver`, `play.late_on`, `mcts.late_weights`, `mcts.late_pick`,
+`mcts.completed_q`; `PyDriver.late` the counters) does the same; it has no minor decisions. Replays
+(`zero.replay --selfplay`) sample late as the run's self-play does and mark those frames `sampled` and
+`late`. Parity (section 6): exact on Rust roots, alike in games.
+
+Code: `driver.rs` (`NnSeat::temp_late`, `temp_late_margin`, `check_temp_late`, `late_weights`, `late_pick`,
+`LateTotals`, `LateMove`), `driver/worker.rs` (`decide`), `tree.rs` (`completed_q`), the bindings (seat
+keys, `stats()['late']`, `completed_q`, `late_weights`, `late_pick`); Python `mcts.py`, `play.py`,
+`replay.py`, `games.nn_seat`, `run.py` (run settings `selfplay_temp_late`, `selfplay_temp_late_margin`;
+docs/az.md 22).
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:
@@ -1249,6 +1312,14 @@ Rust m of 2 against Python's 16 is seen at once (TV 0.285 against the floor 0.01
 24 simulations, a lopsided prior where PUCT starves every option but its favourite): the targets' mass
 off the favourite is 0.562 / 0.558 / 0.594 with the Gumbel root for the Python driver's 'py' seats, its
 'rs' seats and the Rust driver (whose games are seeded otherwise), 0.064 / 0.064 / 0.073 with PUCT.
+
+**Late sampling** (section 3.10; `parity.late_formula`, `tests/test_temp_late.py`), 2026-11-01: the
+Python `completed_q`, `late_weights` and `late_pick` on Rust roots' statistics (8 toy positions x 4, 8,
+24, 64 simulations x T 1, 0.7, 0.5 without a gate and 1 / 0.05, 0.7 / 0.02, 0.5 / 0.005 with one x 64
+draws) equal the Rust driver's own on all 12,288 checks (Q and weights to 1e-9, picks exactly; the gates
+left a visited option out on 67 roots). In games (toy self-play, 160 games, T 1 and a 0.02 gate, full 16
+/ fast 4 simulations): deviation rates full / fast 0.348 / 0.336 for the Rust driver, 0.339 / 0.353
+(`PyDriver` 'py' seats) and 0.329 / 0.355 ('rs' seats), the gated-alone shares alike.
 
 `python -m zero.parity h2h --model M --games 6000 --sims 32`: Rust-tree seat vs Python-tree
 seat in `PyDriver`, the same network, seats alternating (docs/az.md 6.2): **49.94% +-1.04**

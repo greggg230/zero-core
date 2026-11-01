@@ -24,7 +24,12 @@ root: its simulations wait) - and deals its worlds by the batch's auxiliary answ
 'gumbel', docs/search.md 3.7): every search of the seat has Gumbel noise (a self-play seat's first
 temp_moves decisions; an evaluation seat's at `gumbel_scale`, every decision) and sequential halving
 at the root instead of Dirichlet noise, temperature and the move rule; its move is the halving's
-winner, its root value the improved policy's (`mcts.gumbel_choose`, `gumbel_q`).
+winner, its root value the improved policy's (`mcts.gumbel_choose`, `gumbel_q`). Late sampling
+(`temp_late` > 0, docs/search.md 3.10): a self-play seat's searched decisions after its first temp_moves
+are sampled by N^(1 / temp_late) among the options within `temp_late_margin` of the rule's move's
+completed Q (0: all), from the slot's move stream (`late_on`, `mcts.late_weights`, `mcts.late_pick`);
+`PyDriver.late` counts them as the Rust driver's `stats()['late']` does. (This driver has no minor
+decisions, which the Rust driver leaves to the rule.)
 """
 import random
 
@@ -44,6 +49,17 @@ def split64(x):
     z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & M64
     z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & M64
     return z ^ (z >> 31)
+
+
+LATE_KEYS = ('decisions_full', 'decisions_fast', 'single_full', 'single_fast', 'deviations_full', 'deviations_fast',
+             'cost_full', 'cost_fast')
+
+
+def late_on(seat, decisions):
+    """Whether a searched decision of `seat` (`decisions`: its game's searched decisions before it) is
+    sampled late (docs/search.md 3.10): a self-play seat with temp_late > 0 past its first temp_moves (the
+    Rust driver's `decide`; its minor searches excepted)."""
+    return seat.temp_late > 0 and seat.selfplay and not seat.gumbel and decisions >= seat.temp_moves
 
 
 def view_pick(seed, gid, decision, share):
@@ -71,7 +87,9 @@ class NNSeat:
     their q, 'next_q' | 'z' (docs/search.md 3.6). belief_tilt (0 = off), belief_clip (None: 20),
     belief_mix, belief_fast: the root's belief of its searches (docs/search.md 3.8). root_search: 'puct' |
     'gumbel' (docs/search.md 3.7), gumbel_m the options sequential halving considers, gumbel_scale its
-    noise's scale, gumbel_c_visit / gumbel_c_scale sigma's transform (None: cq_c_visit / cq_c_scale)."""
+    noise's scale, gumbel_c_visit / gumbel_c_scale sigma's transform (None: cq_c_visit / cq_c_scale).
+    temp_late (0 = off), temp_late_margin (0 = no gate): late sampling of a self-play seat's decisions after
+    temp_moves (docs/search.md 3.10)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
@@ -79,7 +97,8 @@ class NNSeat:
                  select_c_visit=None, select_c_scale=None, record=True, root_min_visits=0,
                  root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
                  view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
-                 root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None):
+                 root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
+                 temp_late=0.0, temp_late_margin=0.0):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
         mcts.check_select(select, select_min_visits)
@@ -90,6 +109,8 @@ class NNSeat:
         mcts.check_root_search(root_search, gumbel_m, gumbel_scale, gumbel_c_visit, gumbel_c_scale)
         if root_search == 'gumbel' and root_min_visits:
             raise ValueError("root_min_visits with root_search 'gumbel': exclusive (docs/search.md 3.7)")
+        mcts.check_temp_late(temp_late, temp_late_margin, selfplay, root_search)
+        self.temp_late, self.temp_late_margin = float(temp_late), float(temp_late_margin)
         self.key, self.sims, self.c_puct, self.selfplay = key, sims, c_puct, selfplay
         self.alpha, self.eps, self.temp_moves = alpha, eps, temp_moves
         self.sims_fast, self.p_full, self.chance_k, self.margin_w = sims_fast, p_full, chance_k, margin_w
@@ -203,6 +224,11 @@ class PySearch:
         """The root option the seat's move rule takes (the reference formula, `mcts.select_node`)."""
         return mcts.select_node(self.t.root, seat.select, seat.select_min_visits, *seat.select_transform)
 
+    def root_q(self):
+        """The root's completed Q per option (every visit: `mcts.completed_q`)."""
+        r = self.t.root
+        return mcts.completed_q(r.P0, r.Nv, r.W, r.vec[r.player])
+
     def advance(self, a, key, game):
         child = mcts.advance(self.t.root, a, key, game.to_move, game.legal())
         if child is None:
@@ -281,6 +307,11 @@ class RsSearch:
         """The root option the seat's move rule takes: the Rust driver's own code (`root_select`)."""
         return self.t.root_select(seat.select, seat.select_min_visits, *seat.select_transform)
 
+    def root_q(self):
+        """The root's completed Q per option (the reference formula on the Rust root's statistics)."""
+        t = self.t
+        return mcts.completed_q(t.root_priors0, t.root_visits, t.root_values, t.root_value0)
+
     def advance(self, a, key, game):
         if game.over:
             return False
@@ -356,6 +387,8 @@ class PyDriver:
         self.samples = []
         self.sims = 0
         self.belief_rows = 0                # root belief rows sent (docs/search.md 3.8)
+        self.late = dict.fromkeys(LATE_KEYS, 0)   # late sampling's counters (docs/search.md 3.10)
+        self.late['cost_full'] = self.late['cost_fast'] = 0.0
         self._refill()
 
     # ---- protocol ---------------------------------------------------------------------------
@@ -560,10 +593,10 @@ class PyDriver:
                 if r < 0:
                     i = k
                     break
-        elif seat.select == 'visits':
-            i = max(range(len(Nv)), key=lambda k: (Nv[k], P0[k]))
         else:
-            i = tree.choose(seat)
+            i = max(range(len(Nv)), key=lambda k: (Nv[k], P0[k])) if seat.select == 'visits' else tree.choose(seat)
+            if late_on(seat, slot.decisions) and tot > 0:
+                i = self._late(slot, seat, tree, Nv, i)
         if self.record and seat.selfplay and seat.record and slot.full:
             pi = tree.target(seat)
             slot.records.append((slot.game.encode(p), list(acts), pi, p, rw))
@@ -577,6 +610,21 @@ class PyDriver:
                     slot.records.append((slot.game.encode(o), [], [], o, None))
         slot.decisions += 1
         self._apply(slot, acts[i])
+
+    def _late(self, slot, seat, tree, Nv, r):
+        """Late sampling of a decision whose rule's move is option `r` (docs/search.md 3.10) -> the option
+        played; its counters."""
+        q = tree.root_q()
+        w = mcts.late_weights(Nv, q, r, seat.temp_late, seat.temp_late_margin)
+        k = mcts.late_pick(w, r, slot.rng.random())
+        kind = 'full' if slot.full else 'fast'
+        c = self.late
+        c['decisions_' + kind] += 1
+        c['single_' + kind] += sum(1 for x in w if x > 0) <= 1
+        if k != r:
+            c['deviations_' + kind] += 1
+            c['cost_' + kind] += q[r] - q[k]
+        return k
 
     def _apply(self, slot, a):
         g = slot.game

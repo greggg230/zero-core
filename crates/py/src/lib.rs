@@ -20,7 +20,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{late_pick, late_weights, root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
 use zero_search::lookahead::{LookCfg, Outcome};
 use zero_search::{SearchGame, MAX_SEATS};
@@ -82,6 +82,9 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(view_pick_of, m)?)?;
     m.add_function(wrap_pyfunction!(belief_weight_of, m)?)?;
     m.add_function(wrap_pyfunction!(gumbel_sequence_of, m)?)?;
+    m.add_function(wrap_pyfunction!(completed_q_of, m)?)?;
+    m.add_function(wrap_pyfunction!(late_weights_of, m)?)?;
+    m.add_function(wrap_pyfunction!(late_pick_of, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
     m.add("BELIEF_CLIP", BELIEF_CLIP)?;
     Ok(())
@@ -149,7 +152,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "temp_late", "temp_late_margin"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -247,6 +250,11 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         belief_fast: flag(d, "belief_fast", false)?,
         root_search,
         look,
+        // late sampling (docs/search.md 3.10): a self-play seat's searched decisions after temp_moves
+        // sampled by N^(1 / temp_late) (0 = off), among the options within temp_late_margin of the
+        // rule's move's completed Q (0 = no gate)
+        temp_late: get(d, "temp_late", 0.0f64)?,
+        temp_late_margin: get(d, "temp_late_margin", 0.0f64)?,
     }))
 }
 
@@ -295,6 +303,38 @@ fn belief_weight_of(pred: f64, uniform: f64, tilt: f64, clip: f64) -> f64 {
 #[pyo3(name = "gumbel_sequence")]
 fn gumbel_sequence_of(m: u32, n: u32) -> Vec<u32> {
     zero_search::tree::gumbel_sequence(m, n)
+}
+
+/// The completed Q per option (`tree::completed_q`): W / N of a visited option, v_mix of an unvisited
+/// one (`p0` the noise-free priors, `n` the visit counts, `w` the value sums, `v` the network's utility
+/// of the node for its decider).
+#[pyfunction]
+#[pyo3(name = "completed_q")]
+fn completed_q_of(p0: Vec<f32>, n: Vec<u32>, w: Vec<f64>, v: f64) -> PyResult<Vec<f64>> {
+    if n.len() != p0.len() || w.len() != p0.len() {
+        return Err(PyValueError::new_err(format!("completed_q: {} priors, {} visit counts, {} value sums", p0.len(), n.len(), w.len())));
+    }
+    Ok(zero_search::tree::completed_q(&p0, &n, &w, v))
+}
+
+/// Late sampling's weights (`driver::late_weights`, docs/search.md 3.10): per option nv^(1 / temp) for
+/// the options the margin gate admits (`margin` 0: all), 0 for the others and the unvisited ones;
+/// `q` the completed Q per option, `rule` the rule's move (an option index).
+#[pyfunction]
+#[pyo3(name = "late_weights")]
+fn late_weights_of(nv: Vec<u32>, q: Vec<f64>, rule: usize, temp: f64, margin: f64) -> PyResult<Vec<f64>> {
+    if q.len() != nv.len() || (rule >= nv.len() && !nv.is_empty()) || !(temp > 0.0) {
+        return Err(PyValueError::new_err(format!("late_weights: {} visit counts, {} Q, rule {rule}, temp {temp} (> 0)", nv.len(), q.len())));
+    }
+    Ok(late_weights(&nv, &q, rule, temp, margin))
+}
+
+/// The option late sampling plays (`driver::late_pick`): weights `w`, the rule's move `rule`, a draw `u`
+/// in [0, 1).
+#[pyfunction]
+#[pyo3(name = "late_pick")]
+fn late_pick_of(w: Vec<f64>, rule: usize, u: f64) -> usize {
+    late_pick(&w, rule, u)
 }
 
 /// A lookahead's settings checked (docs/search.md 3.9; a dict or its JSON) -> their canonical JSON
@@ -801,6 +841,24 @@ impl PySearchDriver {
                 // DriverCfg::move_log (a diagnostic): [(seat, action, legal actions)]
                 d.set_item("moves", r.moves)?;
             }
+            if !r.late.is_empty() {
+                // DriverCfg::move_log with late sampling (docs/search.md 3.10): its decisions
+                let l = PyList::empty(py);
+                for m in &r.late {
+                    let x = PyDict::new(py);
+                    x.set_item("decision", m.decision)?;
+                    x.set_item("round", m.round)?;
+                    x.set_item("full", m.full)?;
+                    x.set_item("options", m.options)?;
+                    x.set_item("weighed", m.weighed)?;
+                    x.set_item("rule", m.rule)?;
+                    x.set_item("played", m.played)?;
+                    x.set_item("q_rule", m.q_rule)?;
+                    x.set_item("q_played", m.q_played)?;
+                    l.append(x)?;
+                }
+                d.set_item("late", l)?;
+            }
             out.append(d)?;
         }
         Ok(out)
@@ -897,6 +955,20 @@ impl PySearchDriver {
             ld.set_item("guard_decisions", l.guard_decisions)?;
             ld.set_item("guard_overrides", l.guard_overrides)?;
             d.set_item("look", ld)?;
+        }
+        if s.late.decisions() > 0 {
+            // late sampling's counters (docs/search.md 3.10; only a driver with late-sampled decisions)
+            let l = &s.late;
+            let ld = PyDict::new(py);
+            ld.set_item("decisions_full", l.decisions_full)?;
+            ld.set_item("decisions_fast", l.decisions_fast)?;
+            ld.set_item("single_full", l.single_full)?;
+            ld.set_item("single_fast", l.single_fast)?;
+            ld.set_item("deviations_full", l.deviations_full)?;
+            ld.set_item("deviations_fast", l.deviations_fast)?;
+            ld.set_item("cost_full", l.cost_full)?;
+            ld.set_item("cost_fast", l.cost_fast)?;
+            d.set_item("late", ld)?;
         }
         Ok(d)
     }

@@ -108,6 +108,13 @@ def _belief_of(cfg):
     hello reports and the run checks (docs/az.md 18.5)."""
     from .run import belief_keys
     return belief_keys(cfg, 'selfplay')
+def _late_of(cfg):
+    """The late-sampling settings of a run's self-play seat ({} when off; docs/search.md 3.10): what a
+    worker's hello reports and the run checks (an older checkout would play the rule's moves in silence)."""
+    t = float(cfg.get('selfplay_temp_late', 0.0) or 0.0)
+    return {'temp_late': t, 'temp_late_margin': float(cfg.get('selfplay_temp_late_margin', 0.0) or 0.0)} if t else {}
+
+
 BIG = 1 << 62                     # a remote driver's quota: its phases end by end_phase()
 RETRY_S = 60.0                    # a failed session is started again after this (env ZERO_RSP_RETRY_S)
 STALL_S = 300.0                   # a session silent this long is killed (its worker stalled)
@@ -740,6 +747,10 @@ class RemotePlay:
                     # a checkout without the root's belief (or reading the settings otherwise) would deal
                     # its worlds uniformly in silence: never used (docs/az.md 18.5)
                     s.no_belief = ev.get('belief')
+                want_l = _late_of(self.R.cfg)
+                if want_l and ev.get('late') != want_l:
+                    # a checkout without late sampling would play the rule's moves after temp_moves in silence
+                    s.no_late = ev.get('late')
                 if self.fails or s.k == 0:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
@@ -850,6 +861,13 @@ class RemotePlay:
                 self.next_try[k] = now + max(self.retry_s, 600.0)
                 self.fail_log(f'worker {k} REFUSED: its checkout plays the root belief as {s.no_belief!r}, the run as '
                               f'{_belief_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 18.5); killed, retried '
+                              f'in 10 minutes')
+                s.kill()
+                continue
+            if hasattr(s, 'no_late'):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.fail_log(f'worker {k} REFUSED: its checkout plays late sampling as {s.no_late!r}, the run as '
+                              f'{_late_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 22); killed, retried '
                               f'in 10 minutes')
                 s.kill()
                 continue
@@ -1799,7 +1817,8 @@ class Worker:
             # (the tests: an older checkout, without the league / the root's belief)
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
                       mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),
-                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}))
+                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}),
+                      **({} if self.test.get('no_late') else {'late': _late_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

@@ -367,12 +367,45 @@ pub struct NnSeat {
     /// driver's batches; the seat's MCTS settings serve its final fallback (`Last::Mcts`). An
     /// evaluation seat (no records).
     pub look: Option<Box<LookCfg>>,
+    /// Late sampling (docs/search.md 3.10; 0 = off, the default: the search of before bit for bit): a
+    /// self-play seat's searched decisions at or after its first `temp_moves` - full and fast searches,
+    /// never minor ones - are sampled with probability proportional to N^(1 / temp_late) over the root
+    /// visit counts (without forced walks), instead of always playing the rule's move (`select`).
+    pub temp_late: f64,
+    /// Late sampling's margin gate (0 = no gate, the default): with it only the options whose
+    /// completed Q (`tree::completed_q`, the decider's utility the 'cq' rule reads) is at most this much
+    /// below the rule's move's are eligible; the rule's move always is, an unvisited option never.
+    pub temp_late_margin: f64,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None, temp_late: 0.0, temp_late_margin: 0.0 }
+    }
+
+    /// The late-sampling settings' check (`Driver::new`; docs/search.md 3.10): both finite >= 0; a
+    /// margin only with `temp_late` > 0 (a gate of nothing would be a silent no-op); `temp_late` only on a
+    /// self-play seat (an evaluation seat never samples) and not with the Gumbel root search (its noise
+    /// is its temperature: exclusive, as its root minimum visits are).
+    pub fn check_temp_late(&self) -> Result<(), String> {
+        let (t, m) = (self.temp_late, self.temp_late_margin);
+        if !(t.is_finite() && t >= 0.0) {
+            return Err(format!("temp_late {t}: a finite number >= 0 (0 = off: the rule's move after temp_moves)"));
+        }
+        if !(m.is_finite() && m >= 0.0) {
+            return Err(format!("temp_late_margin {m}: a finite number >= 0 (0 = no gate)"));
+        }
+        if m > 0.0 && t == 0.0 {
+            return Err(format!("temp_late_margin {m}: a gate of temp_late > 0 (temp_late is 0: nothing is sampled late)"));
+        }
+        if t > 0.0 && !self.selfplay {
+            return Err(format!("temp_late {t}: a self-play seat's (an evaluation seat never samples its moves)"));
+        }
+        if t > 0.0 && matches!(self.root_search, RootSearch::Gumbel { .. }) {
+            return Err(format!("temp_late {t} with root_search 'gumbel': exclusive (the Gumbel noise is its temperature; docs/search.md 3.7)"));
+        }
+        Ok(())
     }
 
     /// The belief settings' check (`Driver::new`; the bindings' messages): tilt finite >= 0, clip
@@ -395,6 +428,49 @@ impl NnSeat {
     pub fn takes_belief(&self, full: bool) -> bool {
         self.belief_tilt > 0.0 && (full || self.belief_fast)
     }
+}
+
+/// Late sampling's weights (docs/search.md 3.10) of a decision whose rule's move is option `rule`:
+/// per root option `nv^(1 / temp)` (`nv`: the visit counts the sampling reads, forced walks left out)
+/// for the eligible options, else 0. Without a gate (`margin` 0) every option is eligible; with one, the
+/// rule's move and the visited options whose completed Q (`q`, `tree::completed_q`) is at most `margin`
+/// below the rule's move's. An option without visits weighs 0 either way.
+pub fn late_weights(nv: &[u32], q: &[f64], rule: usize, temp: f64, margin: f64) -> Vec<f64> {
+    let e = 1.0 / temp;
+    let qr = q.get(rule).copied().unwrap_or(0.0);
+    nv.iter()
+        .enumerate()
+        .map(|(k, &c)| {
+            let ok = k == rule || margin <= 0.0 || qr - q[k] <= margin;
+            if ok && c > 0 {
+                (c as f64).powf(e)
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// The option late sampling plays from its weights (`late_weights`) and a uniform draw `u` in [0, 1):
+/// the first option whose cumulative weight passes `u` x the total (the last weighted one if rounding
+/// leaves none); the rule's move `rule` when nothing weighs anything.
+pub fn late_pick(w: &[f64], rule: usize, u: f64) -> usize {
+    let tot: f64 = w.iter().sum();
+    if !(tot > 0.0) {
+        return rule;
+    }
+    let mut r = u * tot;
+    let mut last = rule;
+    for (k, &x) in w.iter().enumerate() {
+        if x > 0.0 {
+            last = k;
+            r -= x;
+            if r < 0.0 {
+                return k;
+            }
+        }
+    }
+    last
 }
 
 /// The default belief clip R (`NnSeat::belief_clip`).
@@ -481,6 +557,26 @@ pub struct GameResult {
     /// `DriverCfg::move_log`: the game's first real moves (seat, action, legal
     /// actions), the external seats' answers excluded; empty when off.
     pub moves: Vec<(u8, u16, Vec<u16>)>,
+    /// `DriverCfg::move_log` with late sampling (docs/search.md 3.10): the game's first late-sampled
+    /// decisions (as many as `move_log`), a diagnostic; empty otherwise.
+    pub late: Vec<LateMove>,
+}
+
+/// A late-sampled decision (`GameResult::late`, docs/search.md 3.10): its index among the game's searched
+/// decisions, the game's round then, a full search (else a fast one), the root's options and those late
+/// sampling weighed (> 0), the rule's move and the move played (actions) and their completed Q (the
+/// decider's utility).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LateMove {
+    pub decision: u32,
+    pub round: u32,
+    pub full: bool,
+    pub options: u16,
+    pub weighed: u16,
+    pub rule: u16,
+    pub played: u16,
+    pub q_rule: f64,
+    pub q_played: f64,
 }
 
 /// One recorded root decision with its targets.
@@ -792,6 +888,8 @@ struct Slot<G: SearchGame> {
     net: u32,
     /// The logged real moves (`DriverCfg::move_log`).
     moves: Vec<(u8, u16, Vec<u16>)>,
+    /// The logged late-sampled decisions (`DriverCfg::move_log`, `GameResult::late`).
+    late: Vec<LateMove>,
     /// The current decision's Gumbel noise per root option (`RootSearch::Gumbel`; empty: none),
     /// kept for a restarted search of the same decision.
     gnoise: Vec<f64>,
@@ -838,6 +936,7 @@ impl<G: SearchGame> Slot<G> {
             epoch: 0,
             net: 0,
             moves: Vec::new(),
+            late: Vec::new(),
             gnoise: Vec::new(),
             look: None,
             look_mcts: false,
@@ -957,6 +1056,40 @@ struct Counters {
     slow_steps: AtomicU64,
     /// The lookahead seats' decisions and their counters (docs/search.md 3.9; `LookTotals`).
     look: Mutex<LookTotals>,
+    /// Late sampling's counters (docs/search.md 3.10; `LateTotals`).
+    late: Mutex<LateTotals>,
+}
+
+/// Late sampling's counters (`DriverStats::late`, docs/search.md 3.10), full and fast searches apart:
+/// the late-sampled decisions, those where one option alone weighed anything (no choice: the rule's
+/// move), the deviations (the move played is not the rule's) and their summed completed-Q cost (the
+/// rule's move's Q - the played move's, the decider's utility).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LateTotals {
+    pub decisions_full: u64,
+    pub decisions_fast: u64,
+    pub single_full: u64,
+    pub single_fast: u64,
+    pub deviations_full: u64,
+    pub deviations_fast: u64,
+    pub cost_full: f64,
+    pub cost_fast: f64,
+}
+
+impl LateTotals {
+    pub fn add(&mut self, o: &LateTotals) {
+        self.decisions_full += o.decisions_full;
+        self.decisions_fast += o.decisions_fast;
+        self.single_full += o.single_full;
+        self.single_fast += o.single_fast;
+        self.deviations_full += o.deviations_full;
+        self.deviations_fast += o.deviations_fast;
+        self.cost_full += o.cost_full;
+        self.cost_fast += o.cost_fast;
+    }
+    pub fn decisions(&self) -> u64 {
+        self.decisions_full + self.decisions_fast
+    }
 }
 
 /// The lookahead seats' counters summed over their decisions (`DriverStats::look`, docs/search.md
@@ -1115,6 +1248,8 @@ pub struct DriverStats {
     pub slow_steps: u64,
     /// The lookahead seats' counters (docs/search.md 3.9; all 0 without one).
     pub look: LookTotals,
+    /// Late sampling's counters (docs/search.md 3.10; all 0 without it).
+    pub late: LateTotals,
 }
 
 /// The games in progress.
@@ -1198,6 +1333,7 @@ impl<G: SearchGame> Driver<G> {
                         return Err(format!("belief_tilt {}: {} has no auxiliary targets (SearchGame::AUX) for a belief to predict", n.belief_tilt, G::NAME));
                     }
                     n.root_search.check()?;
+                    n.check_temp_late()?;
                     if let Some(lc) = &n.look {
                         // (docs/search.md 3.9: an evaluation seat; its rows are batched like leaves)
                         lc.check()?;
@@ -1665,7 +1801,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new() };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), late: Vec::new() };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
@@ -1744,6 +1880,7 @@ impl<G: SearchGame> Driver<G> {
             step_max_gid: c.step_max_gid.load(Ordering::Relaxed),
             slow_steps: c.slow_steps.load(Ordering::Relaxed),
             look: lock(&c.look).clone(),
+            late: lock(&c.late).clone(),
         }
     }
 

@@ -95,6 +95,8 @@ struct Tally {
     view_rows: u64,
     view_recorded: u64,
     belief_rows: u64,
+    /// Late sampling's counters (docs/search.md 3.10).
+    late: LateTotals,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -205,6 +207,9 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     }
     if n.belief_rows > 0 {
         k.belief_rows.fetch_add(n.belief_rows, Ordering::Relaxed);
+    }
+    if n.late.decisions() > 0 {
+        lock(&k.late).add(&n.late);
     }
     Ok(())
 }
@@ -333,6 +338,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Res
     slot.pending = None;
     slot.ext_payload = None;
     slot.moves.clear();
+    slot.late.clear();
     slot.look = None;
     slot.look_mcts = false;
     slot.look_guard = None;
@@ -729,9 +735,42 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     } else {
         // the seat's rule (docs/search.md 3.3): argmax (N, P0) by default, or the completed-Q
         // logits' argmax (Select::choose, the code SearchTree.root_select runs)
-        match seat.select {
+        let r = match seat.select {
             Select::Visits => argmax_visits(nv, &p0),
             sel => sel.choose(&p0, &nv_all, &tree.values(root), tree.value0(root)),
+        };
+        // late sampling (docs/search.md 3.10): a self-play seat's full and fast searches after its
+        // first temp_moves, sampled by N^(1 / temp_late) among the options its margin gate admits
+        // (the completed Q from every visit, as the 'cq' rule reads it). Never a minor search: its
+        // 4-odd visits are too coarse a distribution to sample (one stray visit would be a 1-in-4
+        // move), and its choices (which land to tap) are the rule's to make.
+        if seat.temp_late > 0.0 && seat.selfplay && !slot.minor && tot > 0 {
+            let q = crate::tree::completed_q(&p0, &nv_all, &tree.values(root), tree.value0(root));
+            let lw = late_weights(nv, &q, r, seat.temp_late, seat.temp_late_margin);
+            let k = late_pick(&lw, r, slot.rng.unit());
+            let weighed = lw.iter().filter(|&&x| x > 0.0).count();
+            let t = &mut n.late;
+            let dev = k != r;
+            let cost = if dev { q[r] - q[k] } else { 0.0 };
+            if slot.full {
+                t.decisions_full += 1;
+                t.single_full += (weighed <= 1) as u64;
+                t.deviations_full += dev as u64;
+                t.cost_full += cost;
+            } else {
+                t.decisions_fast += 1;
+                t.single_fast += (weighed <= 1) as u64;
+                t.deviations_fast += dev as u64;
+                t.cost_fast += cost;
+            }
+            if (slot.late.len() as u32) < cfg.move_log {
+                // (the move log's diagnostic: GameResult::late)
+                let round = slot.game.as_ref().map_or(0, |g| g.rounds());
+                slot.late.push(LateMove { decision: slot.decisions, round, full: slot.full, options: acts.len() as u16, weighed: weighed as u16, rule: acts[r], played: acts[k], q_rule: q[r], q_played: q[k] });
+            }
+            k
+        } else {
+            r
         }
     };
     let mut a = acts[i];
@@ -853,7 +892,7 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
 fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>) -> Result<(), String> {
     let g = slot.game.take().unwrap();
     let over = g.to_move().is_none();
-    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves) };
+    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), late: std::mem::take(&mut slot.late) };
     let records = std::mem::take(&mut slot.records);
     let rq = std::mem::take(&mut slot.rq);
     slot.view_wait.clear();
@@ -886,6 +925,7 @@ pub(super) struct Done {
     pub decisions: u32,
     pub ext_moves: u32,
     pub moves: Vec<(u8, u16, Vec<u16>)>,
+    pub late: Vec<LateMove>,
 }
 
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
@@ -915,6 +955,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         samples: if emit { records.len() as u32 } else { 0 },
         tag: d.tag,
         moves: d.moves,
+        late: d.late,
     };
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();

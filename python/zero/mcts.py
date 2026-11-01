@@ -62,6 +62,10 @@ win vectors: the visit-based outputs leave them out (`root_visits_pruned`, `root
 Q-based ones (Q, the 'cq' target and rule) use them. `root_floor` decides which searches take it
 (the Rust driver's `driver::root_floor`).
 
+Late sampling (docs/search.md 3.10; `late_weights`, `late_pick`, off by default): a self-play seat's
+searched decisions after its first `temp_moves` are sampled by N^(1 / temp_late) among the options whose
+completed Q is within `temp_late_margin` of the rule's move's (0: all) instead of playing the rule's move.
+
 Gumbel root search (docs/search.md 3.7; `Tree.set_gumbel`, off by default): Gumbel AlphaZero's root
 (Danihelka et al. 2022; mctx's arithmetic). Root walk j of a search may only take an option whose
 walks of THIS search equal `gumbel_sequence(min(m, options), budget)[j]` (sequential halving), the
@@ -491,22 +495,27 @@ def advance(root, a, key, player, legal):
 def completed_q_logits(P0, Nv, W, v, c_visit=50.0, c_scale=1.0):
     """The logits of `completed_q_policy`: ln max(P0, PRIOR_FLOOR) + (c_visit + max N) c_scale
     completedQ per option (the Rust tree's `completed_q_logits`, f64)."""
+    q = completed_q(P0, Nv, W, v)
+    scale = (c_visit + max(Nv, default=0)) * c_scale
+    return [math.log(max(float(P0[i]), PRIOR_FLOOR)) + scale * q[i] for i in range(len(P0))]
+
+
+def completed_q(P0, Nv, W, v):
+    """The completed Q per option (the Rust tree's `completed_q`): W / N of a visited option, v_mix =
+    (v + sum N * sum_{N>0} P0 Q / sum_{N>0} P0) / (1 + sum N) of an unvisited one - the decider's utility
+    the 'cq' target and rule read, and late sampling's margin gate (`late_weights`)."""
     k = len(P0)
     sum_n = 0.0
-    max_n = 0
     sum_p = 0.0
     sum_pq = 0.0
     for i in range(k):
         if Nv[i] > 0:
             p = max(float(P0[i]), PRIOR_FLOOR)
             sum_n += Nv[i]
-            max_n = max(max_n, Nv[i])
             sum_p += p
             sum_pq += p * (W[i] / Nv[i])
     v_mix = (v + sum_n * (sum_pq / sum_p)) / (1.0 + sum_n) if sum_n > 0 else v
-    scale = (c_visit + max_n) * c_scale
-    return [math.log(max(float(P0[i]), PRIOR_FLOOR)) + scale * (W[i] / Nv[i] if Nv[i] > 0 else v_mix)
-            for i in range(k)]
+    return [W[i] / Nv[i] if Nv[i] > 0 else v_mix for i in range(k)]
 
 
 def completed_q_policy(P0, Nv, W, v, c_visit=50.0, c_scale=1.0):
@@ -622,6 +631,52 @@ def select_tag(rule='visits', min_visits=0, c_visit=50.0, c_scale=1.0):
     if (float(c_visit), float(c_scale)) != (50.0, 1.0):
         t += f'-v{float(c_visit):g}-s{float(c_scale):g}'
     return t
+
+
+# ------------------------------------------------------------------ late sampling (docs/search.md 3.10)
+
+def check_temp_late(temp=0.0, margin=0.0, selfplay=True, root_search='puct', what='temp_late'):
+    """Late sampling's settings (the Rust `NnSeat::check_temp_late`): `temp` and `margin` finite numbers
+    >= 0, a margin only with temp > 0, temp only on a self-play seat and not with the Gumbel root search
+    (its noise is its temperature) -> None, else ValueError (`what`: the setting's name in the message)."""
+    for k, x in ((what, temp), (what + '_margin', margin)):
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
+            raise ValueError(f'{k} {x!r}: a finite number >= 0 (0 = off)')
+    if margin > 0 and temp == 0:
+        raise ValueError(f'{what}_margin {margin}: a gate of {what} > 0 ({what} is 0: nothing is sampled late)')
+    if temp > 0 and not selfplay:
+        raise ValueError(f"{what} {temp}: a self-play seat's (an evaluation seat never samples its moves)")
+    if temp > 0 and root_search == 'gumbel':
+        raise ValueError(f"{what} {temp} with root_search 'gumbel': exclusive (the Gumbel noise is its temperature; "
+                         f"docs/search.md 3.7)")
+
+
+def late_weights(nv, q, rule, temp, margin=0.0):
+    """Late sampling's weights (the Rust `driver::late_weights`): per root option nv^(1 / temp) (`nv` the
+    visit counts the sampling reads, forced walks left out) for the eligible options, else 0 - every
+    option without a gate (`margin` 0), else the rule's move `rule` and the options whose completed Q
+    (`q`, `completed_q`) is at most `margin` below its; an unvisited option weighs 0 either way."""
+    e = 1.0 / temp
+    qr = q[rule] if rule < len(q) else 0.0
+    return [float(c) ** e if c > 0 and (k == rule or margin <= 0 or qr - q[k] <= margin) else 0.0
+            for k, c in enumerate(nv)]
+
+
+def late_pick(w, rule, u):
+    """The option late sampling plays (the Rust `driver::late_pick`): the first whose cumulative weight
+    passes u x the total (the last weighted one if rounding leaves none); `rule` when nothing weighs."""
+    tot = sum(w)
+    if not tot > 0:
+        return rule
+    r = u * tot
+    last = rule
+    for k, x in enumerate(w):
+        if x > 0:
+            last = k
+            r -= x
+            if r < 0:
+                return k
+    return last
 
 
 # ------------------------------------------------------------------ the Gumbel root search (docs/search.md 3.7)

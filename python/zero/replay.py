@@ -11,7 +11,9 @@ The checkpoint plays `--games` games against `--opp` (another checkpoint, itself
 bot or an external player such as the JS bot), seats alternating. Its search runs the Rust tree
 from Python (`play.PyDriver`, impl 'rs'): evaluation settings by default (no noise, argmax),
 `--selfplay` = the run's self-play settings (Dirichlet noise, temperature for the first
-`temp_moves` decisions). The moves it does not sample follow the run's move rule (docs/search.md
+`temp_moves` decisions, and the run's late sampling after them: selfplay_temp_late /
+selfplay_temp_late_margin, docs/search.md 3.10 - this driver has no minor decisions, so its late
+sampling covers the decisions the Rust driver searches as minor too). The moves it does not sample follow the run's move rule (docs/search.md
 3.3: eval_select, or selfplay_select with --selfplay, with the rule's completed-Q transform -
 its *_c_visit / *_c_scale, unset: cq_c_visit / cq_c_scale; a checkpoint without a run: 'visits'),
 or --select / --select-min-visits, and --cq-c-visit / --cq-c-scale for the 'cq' rule's transform;
@@ -36,7 +38,8 @@ Each game -> one JSON object (format 'zero-replay/1'), written gzipped to `--out
             a: action id ('nn', 'bot', 'forced'),
             'nn':  acts, n (root visits), p0 (network priors, noise-free), q (mean utility of each
                    option for the mover, null if unvisited), v (network utility of the root for
-                   the mover), w (search P(win) per seat), sims, sampled (a temperature pick)
+                   the mover), w (search P(win) per seat), sims, sampled (a temperature pick, or a
+                   late-sampled one: then also late: true, docs/search.md 3.10)
             'ext': x (the external's answer, parsed JSON)
             hint:  {by: 'ext:<name>', x: its answer at this state} (network decisions)
             the auxiliary head (a checkpoint with one, docs/az.md 15; absent otherwise): what the
@@ -74,7 +77,7 @@ from . import lookahead as LA
 from .infer import NetEvaluator, drive
 from .mcts import belief_settings, gumbel_tag, select_settings
 from .net import load
-from .play import NNSeat, PyDriver, Slot
+from .play import NNSeat, PyDriver, Slot, late_on
 from .protocol import LeafBatch
 
 FORMAT = 'zero-replay/1'
@@ -237,12 +240,16 @@ class RecordingDriver(PyDriver):
         # seat's at a positive gumbel_scale)
         win = t.gumbel_q() if t.gumbel_on else t.root_win()
         noisy = seat.gumbel_scale > 0 and (not seat.selfplay or slot.decisions < seat.temp_moves)
-        sampled = noisy if seat.gumbel else seat.selfplay and slot.decisions < seat.temp_moves
+        # (late sampling, docs/search.md 3.10: a self-play seat's decisions after temp_moves, sampled too)
+        late = late_on(seat, slot.decisions) and sum(nv) > 0
+        sampled = noisy if seat.gumbel else (seat.selfplay and slot.decisions < seat.temp_moves) or late
         f = slot.frame
         f.update(acts=acts, n=nv, p0=[round(float(x), 4) for x in p0],
                  q=[round(w / n, 4) if n else None for w, n in zip(wsum, nv)],
                  v=round(float(t.root_value0), 4), w=[round(float(x), 4) for x in win] if win else None,
                  sims=int(sum(nv)), sampled=bool(sampled and sum(nv) > 0))
+        if late:
+            f['late'] = True
         ev = self.aux.get(seat.key)
         if ev is not None:
             # the auxiliary head at the root, for the decider: one forward pass of the root's features
@@ -337,7 +344,8 @@ def _nn(key, sims, cfg, selfplay, chance_k, select=None):
     values' view is the run's (selfplay_ / eval_leaf_value_view, docs/search.md 3.6), and so are its
     root's belief (selfplay_ / eval_belief_tilt, belief_clip, belief_mix, belief_fast; docs/search.md 3.8)
     and its root search (selfplay_ / eval_root_search, docs/search.md 3.7: sigma the target's in
-    self-play, the rule's transform in evaluation)."""
+    self-play, the rule's transform in evaluation), and with `selfplay` the run's late sampling
+    (selfplay_temp_late, selfplay_temp_late_margin; docs/search.md 3.10)."""
     pre = 'selfplay_select' if selfplay else 'eval_select'
     rule, mv, cv, cs = select_settings(cfg, pre)
     if select:
@@ -353,7 +361,14 @@ def _nn(key, sims, cfg, selfplay, chance_k, select=None):
                   cq_c_scale=cfg.get('cq_c_scale', 1.0), select=rule, select_min_visits=int(mv),
                   select_c_visit=None if rule == 'visits' else cv, select_c_scale=None if rule == 'visits' else cs,
                   leaf_value_view=cfg.get(('selfplay' if selfplay else 'eval') + '_leaf_value_view', 'mover'),
-                  **belief_kw(cfg, 'selfplay' if selfplay else 'eval'), **_gumbel_keys(cfg, selfplay, cv, cs))
+                  **belief_kw(cfg, 'selfplay' if selfplay else 'eval'), **_gumbel_keys(cfg, selfplay, cv, cs),
+                  **(late_kw(cfg) if selfplay else {}))
+
+
+def late_kw(cfg):
+    """An NNSeat's late-sampling keywords from a run's settings (docs/search.md 3.10; {} when off)."""
+    t = float(cfg.get('selfplay_temp_late', 0.0) or 0.0)
+    return dict(temp_late=t, temp_late_margin=float(cfg.get('selfplay_temp_late_margin', 0.0) or 0.0)) if t else {}
 
 
 def belief_kw(cfg, pre):
