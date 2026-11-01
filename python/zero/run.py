@@ -248,6 +248,11 @@ DEFAULTS = dict(
     # network batches evaluated concurrently on this many Python threads (CPU: small networks
     # whose ops cannot keep the cores busy; give the driver as many `groups`); 1 = inline
     infer_workers=1,
+    # sparse 1 = the run's drivers (self-play and matches) send sparse network batches (each row's
+    # non-zero features, DriverCfg::sparse, docs/search.md 2.2): the same rows, games and samples; a
+    # token network's CUDA graphs scatter them on the device instead of the host copying the dense
+    # rows (docs/az.md 10.6), other evaluators densify them. 0 = dense batches, as before
+    sparse=0,
     # co-training (zero/cotrain.py, docs/az.md 11): the resolver game whose episodes decide this
     # game's deferred terminals ('' = a single-game run: the loop of this module), its settings
     # (a dict of these same settings - game, spec, network, search, training, evaluation; 'preset'
@@ -500,6 +505,8 @@ class Run:
         kw = {'queue_only': True} if queue_only else {}
         if paired:
             kw['paired'] = True
+        if c.get('sparse'):
+            kw['sparse'] = True                    # sparse network batches (docs/search.md 2.2)
         if record and getattr(self, 'aux', None):
             # self-play records the auxiliary targets (docs/az.md 15; getattr: a caller's stand-in Run
             # with only a cfg, e.g. MTG Zero's test of its evaluation specs, has none)

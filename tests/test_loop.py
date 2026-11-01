@@ -75,6 +75,36 @@ def test_window_cache_trains_the_same_network(smoke_run):
             assert torch.equal(ref[k], got[k]), (extra, k)
 
 
+def test_sparse_setting_plays_the_same_selfplay(smoke_run, tmp_path, monkeypatch):
+    """Run setting sparse: the run's drivers send sparse network batches, and an iteration's self-play
+    is the same - its shards array for array - as with dense batches."""
+    import shutil
+    import numpy as np
+    from zero import games as G, run as R
+    with open(os.path.join(smoke_run, 'config.json')) as f:
+        cfg = json.load(f)
+    seen = []
+    orig = G.Driver
+
+    def spy(*a, **kw):
+        seen.append(kw.get('sparse', False))
+        return orig(*a, **kw)
+    monkeypatch.setattr(G, 'Driver', spy)
+    shards = {}
+    for sp in (0, 1):
+        run = tmp_path / f'sparse{sp}'
+        shutil.copytree(smoke_run, run)
+        R.Run(str(run), dict(cfg, sparse=sp)).selfplay(2)
+        d = run / 'data' / 'iter_0002'
+        shards[sp] = {p: dict(np.load(d / p)) for p in sorted(os.listdir(d)) if p.endswith('.npz')}
+    assert seen == [False, True]
+    assert shards[0].keys() == shards[1].keys() and shards[0]
+    for p, arrs in shards[0].items():
+        assert arrs.keys() == shards[1][p].keys(), p
+        for k in arrs:
+            assert np.array_equal(arrs[k], shards[1][p][k]), (p, k)
+
+
 def test_resume_continues_and_stop_file(smoke_run, tmp_path):
     import shutil
     run = tmp_path / 'r'
