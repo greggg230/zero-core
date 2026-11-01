@@ -942,6 +942,9 @@ impl PySearchDriver {
 pub struct PyLookahead {
     l: Box<dyn DynLook>,
     nfeat: usize,
+    /// The features of every round, one array kept across rounds (fresh memory a round is slower
+    /// than the lookahead): a round's `x` is a view of its first rows, valid until the next round.
+    xbuf: Option<Py<numpy::PyArray2<f32>>>,
 }
 
 #[pymethods]
@@ -961,21 +964,36 @@ impl PyLookahead {
             None => None,
         };
         let l = game.g.lookahead(cfg, ws, seeds.unwrap_or_default(), seed, b, pred, lines).map_err(verr)?;
-        Ok(PyLookahead { l, nfeat: game.g.info().num_features })
+        Ok(PyLookahead { l, nfeat: game.g.info().num_features, xbuf: None })
     }
 
     /// The next round's rows - {x [b, F], opt_off, opt_action, player, n_players, extra} (a network
-    /// batch as the driver's) - or None when the decision is made.
+    /// batch as the driver's; `x` a view of an array the lookahead reuses: valid until the next
+    /// round) - or None when the decision is made.
     fn next_batch<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let Some(r) = py.allow_threads(|| self.l.step()).map_err(rerr)? else { return Ok(None) };
+        let l = &mut self.l;
+        let Some(n) = py.allow_threads(|| l.step()).map_err(rerr)? else { return Ok(None) };
+        let f = self.nfeat;
+        let cap = self.xbuf.as_ref().map_or(0, |x| x.bind(py).shape()[0]);
+        if cap < n {
+            let rows = n.max(cap * 2).max(64);
+            self.xbuf = Some(numpy::PyArray2::<f32>::zeros(py, [rows, f], false).unbind());
+        }
+        let xb = self.xbuf.as_ref().unwrap().bind(py);
+        let r = self.l.rows();
+        {
+            // SAFETY: the array is this object's own, never handed out but as the views below, which
+            // the protocol reads before the next round overwrites them (under the GIL here)
+            let dst = unsafe { xb.as_slice_mut() }.map_err(|e| PyRuntimeError::new_err(format!("lookahead buffer: {e}")))?;
+            dst[..n * f].copy_from_slice(&r.x[..n * f]);
+        }
         let a = PyDict::new(py);
-        let n = r.b;
-        a.set_item("x", r.x.into_pyarray(py).reshape([n, self.nfeat])?)?;
-        a.set_item("opt_off", r.opt_off.into_pyarray(py))?;
-        a.set_item("opt_action", r.opt_action.into_pyarray(py))?;
-        a.set_item("player", r.player.into_pyarray(py))?;
-        a.set_item("n_players", r.n_players.into_pyarray(py))?;
-        a.set_item("extra", r.extra.into_pyarray(py))?;
+        a.set_item("x", xb.call_method1("__getitem__", (pyo3::types::PySlice::new(py, 0, n as isize, 1),))?)?;
+        a.set_item("opt_off", r.opt_off.to_vec().into_pyarray(py))?;
+        a.set_item("opt_action", r.opt_action.to_vec().into_pyarray(py))?;
+        a.set_item("player", r.player.to_vec().into_pyarray(py))?;
+        a.set_item("n_players", r.n_players.to_vec().into_pyarray(py))?;
+        a.set_item("extra", r.extra.to_vec().into_pyarray(py))?;
         Ok(Some(a))
     }
 
