@@ -532,22 +532,43 @@ class NetEvaluator:
 
     def _pieces(self, x, n_players, opt_off, opt_action, extra):
         """`evaluate` of a batch over max_rows rows: consecutive pieces of at most max_rows rows, their
-        answers concatenated (priors in option order, rows in row order, belief rows in row order)."""
+        answers concatenated (priors in option order, rows in row order, belief rows in row order).
+        Through the CUDA graphs two pieces are in flight (the next one packed and uploaded while the
+        device runs the last)."""
         B, M = x.shape[0], self.max_rows
         self.pieces += 1
-        pri, val, mar, aux = [], [], [], []
         opt_off = np.asarray(opt_off)
+        parts = []
         for a in range(0, B, M):
             b = min(B, a + M)
             off = (opt_off[a:b + 1] - opt_off[a]).astype(opt_off.dtype)
             ex = None if extra is None else extra[a:b]
-            r = self.evaluate(x[a:b], n_players[a:b], off, opt_action[opt_off[a]:opt_off[b]], ex, _whole=True)
-            pri.append(r[0])
-            val.append(r[1])
-            mar.append(r[2])
-            if len(r) > 3:
-                aux.append(r[3])
-        out = (np.concatenate(pri).astype(np.float32, copy=False), np.concatenate(val), np.concatenate(mar))
+            parts.append((x[a:b], n_players[a:b], off, opt_action[opt_off[a]:opt_off[b]], ex))
+        res = []
+        if self.fast is not None and self.fast_aux:
+            # (a token network's graphs answer every piece, belief rows included: pipelined)
+            self._check_width(x)
+            t0 = time.perf_counter()
+            pending = []
+            for xx, nn, oo, aa, ex in parts:
+                br = belief_rows(ex)
+                if len(br):
+                    self._check_head()
+                pending.append((self.fast.launch(xx, nn, oo, aa, *((br,) if len(br) else ())), xx.shape[0]))
+                if len(pending) >= 2:
+                    h, rows = pending.pop(0)
+                    res.append(self.fast.result(h))
+            for h, rows in pending:
+                res.append(self.fast.result(h))
+            self.calls += len(parts)
+            self.graph_calls += len(parts)
+            self.leaves += B
+            self.seconds += time.perf_counter() - t0
+        else:
+            res = [self.evaluate(*p, _whole=True) for p in parts]
+        out = (np.concatenate([r[0] for r in res]).astype(np.float32, copy=False), np.concatenate([r[1] for r in res]),
+               np.concatenate([r[2] for r in res]))
+        aux = [r[3] for r in res if len(r) > 3]
         if aux:
             return out + (np.concatenate(aux),)
         return out
