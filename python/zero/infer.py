@@ -206,6 +206,20 @@ class GraphRunner:
 
 T_STEP = 16                      # token networks' graphs: a batch's tokens per row padded to this step
 TOKEN_GRAPHS_ENV = 'ZERO_TOKEN_GRAPHS'
+# A token batch of at least this many rows has its host copy split over COPY_THREADS threads (numpy
+# releases the GIL in the copies; the same bytes copied): the lookahead's batches of thousands of rows
+# (docs/search.md 3.9) are bound by the host's copy of the 150 KB rows. MCTS batches (tens to a few
+# hundred rows) copy on the caller's thread as before.
+COPY_PAR_ROWS = 512
+COPY_THREADS = 4
+_COPY_POOL = []
+
+
+def _copy_pool():
+    if not _COPY_POOL:
+        from concurrent.futures import ThreadPoolExecutor
+        _COPY_POOL.append(ThreadPoolExecutor(COPY_THREADS, thread_name_prefix='zero-copy'))
+    return _COPY_POOL[0]
 
 
 def token_presence(x, pidx):
@@ -384,7 +398,15 @@ class TokenGraphRunner:
             raise RuntimeError('TokenGraphRunner: root belief rows for a network without the auxiliary head')
         slot, (pin_x, pin_n, pin_full, pin_ntok, pin_out, pin_aux, pin_b) = self._slot(Bp)
         graph, xs, ns, fs, ts, out, aux = self._graph(Bp, Tp)
-        self._copy_rows(x, P, pin_x[:B].numpy())
+        if B >= COPY_PAR_ROWS:
+            step = -(-B // COPY_THREADS)
+            dst = pin_x[:B].numpy()
+            futs = [_copy_pool().submit(self._copy_rows, x[a:a + step], P[a:a + step], dst[a:a + step])
+                    for a in range(0, B, step)]
+            for f in futs:
+                f.result()
+        else:
+            self._copy_rows(x, P, pin_x[:B].numpy())
         pn = pin_n[:Bp].numpy()
         pn[:B] = n_players
         pn[B:] = 2
