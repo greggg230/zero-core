@@ -16,6 +16,8 @@ A lookahead seat is a network seat with the key `lookahead` (a dict of its setti
                     root, then fallback_plies (a list; default max(2, plies - 2), 4 under a horizon),
                     then fallback 'mcts' (default: the seat's MCTS search) | 'prior' (the top prior)
     rows            rows per network batch of one decision (default 512)
+    dedup           leaves of the same observation share one value row (default 1: exact, the value is
+                    the network's answer to encode(R) alone; 0: a row per leaf, as the lab)
 
 `parse('plies=6,worlds=8,topk=0,opp=best,mode=infoset,budget=200000')` reads the command-line form
 (zero.h2h --a-lookahead / --b-lookahead; `fallback_plies=4/2`), `settings(d)` the canonical dict.
@@ -31,9 +33,9 @@ import json
 import time
 
 KEYS = ('plies', 'horizon', 'max_plies', 'worlds', 'topk', 'topk_root', 'topk_from_turn', 'opp', 'mode', 'budget',
-        'fallback_topk', 'fallback_plies', 'fallback', 'rows')
+        'fallback_topk', 'fallback_plies', 'fallback', 'rows', 'dedup')
 INT_KEYS = ('plies', 'max_plies', 'worlds', 'topk', 'topk_from_turn', 'budget', 'fallback_topk', 'rows')
-BOOL_KEYS = ('topk_root',)
+BOOL_KEYS = ('topk_root', 'dedup')
 STR_KEYS = ('horizon', 'opp', 'mode', 'fallback')
 
 
@@ -50,7 +52,7 @@ def settings(d):
 
 def parse(text):
     """'k=v,k=v,...' (or a JSON object) -> the settings dict as given, checked (`settings`). Integers,
-    booleans (topk_root: 1 / 0 / true / false), names; fallback_plies '4/2' (a list; '' = none)."""
+    booleans (topk_root, dedup: 1 / 0 / true / false), names; fallback_plies '4/2' (a list; '' = none)."""
     text = (text or '').strip()
     if text.startswith('{'):
         d = json.loads(text)
