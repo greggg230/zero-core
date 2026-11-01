@@ -131,6 +131,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_view_samples`, `view_sample_target` | 0.0, next_q | value-only samples (section 16): this share of self-play's recorded decisions also records the real state from each other recording seat's view - its perspective, no options (no policy loss), z its result - with q = that seat's next search's root value ('next_q'; z if none) or z ('z'). 0 = off |
 | `selfplay_root_search`, `eval_root_search` | puct, puct | the root search (docs/search.md 3.7, section 19): 'puct' = today's searches bit for bit; 'gumbel' = Gumbel AlphaZero's root - Gumbel noise per root option, sequential halving over the `gumbel_m` options of highest noise + log-prior, the completed-Q sigma - whose move replaces root Dirichlet noise, temperature sampling and the move rule (`*_select`; PUCT stays below the root). Every search of the seat is one (full, fast, minor). The self-play seat (remote self-play and the league seat too: their checkouts must have this core) needs `policy_target` 'cq' (an error otherwise: sequential halving's counts are no policy), its sigma the target's (`cq_c_visit`, `cq_c_scale`); every evaluation seat: sigma the evaluation rule's transform (`eval_select_c_*`, else `cq_c_*`), and its root search names its Elo pool (`gumbel-m16`, `gumbel-m16-v50-s0.3`, `-g1` with noise, `-rv`), self-play's does not. Exclusive with the same side's `*_root_min_visits` (an error). `zero.h2h` / `zero.replay` follow the run's |
 | `gumbel_m`, `selfplay_gumbel_scale`, `eval_gumbel_scale` | 16, 1.0, 0.0 | the Gumbel search's considered options (the paper's and mctx's 16: every option of a smaller root) and its noise scale: self-play's first `temp_moves` searched decisions of a game are searched with `selfplay_gumbel_scale` (1 = the move a sample of the improved policy, the paper's), later ones without - the role temperature had; the evaluation's on every decision (0 = deterministic, the paper's evaluation) |
+| `selfplay_temp_late`, `selfplay_temp_late_margin` | 0.0, 0.0 | late sampling (docs/search.md 3.10, section 22): self-play's searched decisions after its first `temp_moves` of a game - full and fast searches, never minor ones - are sampled with probability proportional to N^(1 / temp_late) over the root visit counts (forced walks out) instead of always playing the rule's move (`selfplay_select`); a margin > 0 admits only the options whose completed Q is at most that far below the rule's move's (the rule's move always). The metrics' `selfplay.temp_late` (this machine's driver) count the late decisions, the deviations and their Q cost. Exclusive with `selfplay_root_search` 'gumbel' (an error); a margin without temp_late is an error. Remote self-play (and the league seat) too: a remote checkout without it is refused at its hello. 0 = off: today's games bit for bit |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6); its own is refused |
@@ -3468,3 +3469,103 @@ zero` identical; toy-smoke runs byte for byte against c6b959b in two configurati
 'cq' 0.3 and the cq2 rule); MTG Zero's `tools/gate.py optin-core` PASSED (its ENGINE.md 80.8: digests
 unchanged, check_checkpoint_compat with the Delver line's iteration 475 identical, Glass Road / Caverna /
 Kingdom Builder build against this core).
+
+## 22. Late sampling: gentle temperature for the rest of the game (MTG Zero's Delver mirror, 2026-11-01)
+
+### 22.1 Why
+
+Self-play samples its moves for the first `temp_moves` searched decisions of a game only. MTG Zero's Delver
+line has `temp_moves` 60 of ~240 searched decisions a game (about global turns 1-5); after that every move
+is the rule's (`selfplay_select`), so mid- and late-game positions are only ever reached along it, no
+alternative there is ever played out, and the network's top prior agrees with its search's move 97.4% of
+the time. Late sampling keeps sampling for the rest of the game, gently and gated by the search's own value
+estimate: "curiosity among near-equal moves", with no move tags (the labelled habit exploration of
+MTG Zero's ENGINE.md 75 needed them).
+
+### 22.2 What it does (docs/search.md 3.10)
+
+* **Settings** (section 1.2): `selfplay_temp_late` (0 = off) and `selfplay_temp_late_margin` (0 = no gate);
+  seat keys `temp_late`, `temp_late_margin` (`games.nn_seat` writes them only when on).
+* A self-play seat's searched decision after its first `temp_moves`, full or fast (never minor: 3-4 visits
+  are too coarse to sample), plays option k with probability proportional to N_k^(1 / temp_late) over the
+  root visits (forced walks out), among the rule's move and the options whose completed Q is at most the
+  margin below the rule's move's; the rule's move otherwise. One draw of the slot's move stream.
+* The recorded targets are the search's as before; only the moves (and so the positions that follow) change.
+* Exclusive with `selfplay_root_search` 'gumbel' (an error); an evaluation seat refuses it; a league opponent
+  samples late as the recorded seat does.
+* **Metrics**: `selfplay.temp_late` in the metrics and the `iter N selfplay:` log line (this machine's driver
+  over the phase; the remote's games are not in it): `decisions` / `deviations` / `rate` (full, fast, all),
+  `single` (the share where one option alone weighed: no choice), `cost` (the mean completed-Q cost of a
+  deviation, Q of the rule's move - Q of the played one, P(win) units; negative = the sampled move's Q was
+  higher), `per_game` (deviations, summed cost, late decisions per finished game).
+* **Remote self-play**: the worker's hello reports the late-sampling settings it plays (`remoteplay._late_of`);
+  a checkout without them is refused at its hello (killed, retried in 10 minutes; this machine plays every
+  game meanwhile), as section 18.5's root belief - never a silent off.
+* **Replays** (`zero.replay --selfplay`): sample late as the run's self-play does and mark those frames
+  `sampled` and `late`.
+
+### 22.3 Off by default
+
+0 everywhere is the run of before bit for bit: no draw, no seat key, no metrics key (the golden records and
+match, `late_sampling_off_changes_nothing`; MTG Zero's `check_checkpoint_compat` with the Delver line's
+iteration 534 identical against the live run's build). config.json gains the two keys.
+
+### 22.4 Costs
+
+None measurable: one completed-Q pass over the root's options and one draw per late decision. MTG Zero's
+Delver self-play at 128 games in flight on the shared RTX 5090: 150 games in 51-84 s at every setting
+(off: 59-73 s).
+
+### 22.5 Tests and checks
+
+Rust (`cargo test --release`, 108): `driver::tests::late_weights_and_pick_by_hand`, `late_sampling_off_changes_
+nothing`, `late_sampling_plays_the_games_of_before_until_its_first_deviation` (every search full: the games
+agree with the rule's until the first deviation, where the game without it played the rule's move; T 1 and
+0.1, so both cases occur; reproducible across threads), `late_sampling_counts_full_and_fast_and_its_margin_
+gate_holds` (the counters = the move log's late entries; every gated deviation within its margin; the gate and
+a colder T deviate less), `late_sampling_leaves_minor_searches_to_the_rule` (MinorToy at sims_minor 4: no minor
+decision sampled, the others all), `late_sampling_settings_are_checked`. `tests/test_temp_late.py` (8): the
+Python formulas = the Rust driver's on Rust roots (12,288 draws), by hand, the seat settings and their checks
+(Python, the bindings, the run settings), off = the games of before in both drivers, the Python ('py', 'rs')
+and Rust drivers alike in games, a run's config / metrics / log, replays, the remote refusal and acceptance.
+
+Checks (tier "opt-in core feature with byte-identical defaults"; desktop 2026-11-01, the Delver main line
+training on the GPU and the Mac): cargo test 108 passed (`queued_setups_fill_every_free_slot_when_the_queue_is_
+long`, a dispatch-timing test without late sampling, failed once under the parallel load and passed 5 of 5
+alone); pytest 333 passed, 2 failed - the known load-flaky `test_remoteplay.py::test_cotrain_the_local_driver_is_
+never_starved` (local share 21 / 160 against the 15% bar, as in MTG Zero's ENGINE.md 79; passed alone) and
+`test_token_graphs.py::test_graphs_match_eager_and_follow_new_weights` (3.7e-5 against its 2e-5 tolerance on
+the shared GPU; passed 1 of 2 alone; this change touches neither the token network nor inference); MTG Zero
+(branch `temp-late`, its ENGINE.md 84): `--test az` 40, pytest 69, `check_checkpoint_compat --package mtgz`
+identical, a delver-smoke with late sampling and minor searches.
+
+### 22.6 What it measured on MTG Zero (its ENGINE.md 84)
+
+The Delver line's self-play seat as configured (iteration 534; 64 / 16 simulations, p_full 0.25, sims_minor 4,
+temp_moves 60, root-view leaves, the root belief, the rule 'visits'), 150 games per setting at one driver seed
+(the same deals), se clustered by game:
+
+| T | margin | deviation rate full | fast | all | deviations / game | no choice | Q cost: mean | p90 |
+|---|---|---|---|---|---|---|---|---|
+| 1.0 | 0 | 0.201 | 0.102 | 0.127 +- 0.003 | 20.2 +- 1.0 | 0.41 | +0.008 | 0.040 |
+| 1.0 | 0.05 | 0.178 | 0.099 | 0.119 | 18.4 | 0.49 | -0.001 | 0.022 |
+| 1.0 | 0.02 | 0.163 | 0.090 | 0.108 | 16.9 +- 0.8 | 0.55 | -0.003 | 0.007 |
+| 0.7 | 0 | 0.132 | 0.075 | 0.089 | 14.8 | 0.41 | +0.005 | 0.032 |
+| 0.7 | 0.05 | 0.122 | 0.069 | 0.083 | 13.6 | 0.49 | -0.001 | 0.021 |
+| 0.7 | 0.02 | 0.114 | 0.064 | 0.077 | 12.9 | 0.54 | -0.004 | 0.007 |
+| 0.5 | 0 | 0.098 | 0.055 | 0.066 | 10.9 | 0.39 | +0.003 | 0.031 |
+| 0.5 | 0.05 | 0.092 | 0.053 | 0.063 | 10.4 | 0.47 | -0.002 | 0.019 |
+| 0.5 | 0.02 | 0.085 | 0.048 | 0.057 +- 0.002 | 9.7 +- 0.6 | 0.54 | -0.004 | 0.007 |
+
+(se of the full / fast rates 0.004-0.007 / 0.002-0.004.) Read: the visit counts are concentrated - with no
+gate 7% of the late full searches and 52% of the fast (16-simulation) ones have every visit on one option, so no
+temperature changes them - but not so much that T 0.5 never deviates (6.6%). The gate removes few deviations
+(T 0.5: 6.6% -> 5.7%) and nearly all of the costly tail (p90 0.031 -> 0.007): most deviations were to near-equal
+moves already. Under the 'visits' rule a gated alternative's Q is as often above the rule's move's as below
+(the mean cost turns negative): at 16-64 simulations the most visited option is often not the best by Q. Game
+length is unchanged within noise (off 238 +- 7 searched decisions, 16.9 rounds; on 218-233, 17.0-17.7). A second
+seed reproduces it (T 0.5 / 0.02: 9.3 a game, 0.055), and so does the rule 'cq' (T 0.7 / 0.02: 0.075 vs 0.077).
+What deviates (games replayed from their seeds): ~45% timing (pass priority <-> activate a Bauble, a fetch,
+Wasteland, cast Lightning Bolt, Brainstorm, Daze, Force of Will), ~12% one action for another, ~11% trivial
+(another copy of the same card or trigger, trigger order); the rate per decision about doubles from the first
+turns after temp_moves to the late game.
