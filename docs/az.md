@@ -3356,3 +3356,20 @@ games; **4 driver groups** (h2h `--groups 4`: 89 s -> 65 s); and for dense token
 the graphs' host copy split over 4 threads (`COPY_PAR_ROWS`, `COPY_THREADS`; the same bytes, answers bit
 for bit; MCTS batches of tens to a few hundred rows unaffected). MCTS self-play and evaluation could take
 sparse batches too (not measured here).
+
+**Measured** (MTG Zero's Delver mirror, its ENGINE.md 80; the same network both sides, MCTS at 32 simulations
+with the run's evaluation rule, paired games): the pure lookahead player loses - 4 plies 0.315 +- 0.030 (best
+reply) and 0.390 +- 0.034 (policy-weighted) over 100 pairs, 6 plies 0.470 +- 0.046 and 0.370 +- 0.045 over 50 -:
+its max over many noisy leaf values is optimistic (another session's teacher experiment saw the same where
+the lookahead disagreed with MCTS). The guarded player (`guard` 0.05, 16 worlds; docs/search.md 3.9) changes
+~2% of the MCTS moves and is even: 0.515 +- 0.015 over 300 pairs at 4 plies, 0.460 +- 0.035 over 50 at 6.
+Throughput with 64 games in flight on the desktop's RTX 5090: 4 / 5 / 6 plies 104 / 65 / 40 lookahead
+decisions a second (83k / 143k / 242k nodes, 29k / 48k / 79k network rows a second; one game alone 17 / 12.5
+/ 5.6); a 6-ply match ~9 s a game with 64 in flight.
+
+**Checks** (tier "opt-in core feature with byte-identical defaults"): cargo test 102 (13 lookahead tests) +
+webnet 3; pytest 316 passed / 9 skipped (CPU; the CUDA tests separately); check_checkpoint_compat `--package
+zero` identical; toy-smoke runs byte for byte against c6b959b in two configurations (classic; rolling with
+'cq' 0.3 and the cq2 rule); MTG Zero's `tools/gate.py optin-core` PASSED (its ENGINE.md 80.8: digests
+unchanged, check_checkpoint_compat with the Delver line's iteration 475 identical, Glass Road / Caverna /
+Kingdom Builder build against this core).
