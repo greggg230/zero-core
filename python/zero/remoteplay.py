@@ -735,6 +735,12 @@ class RemotePlay:
                     # a checkout without the self-play league would play mirror games and record both
                     # seats of the league's games: never used (zero/league.py)
                     s.no_league = True
+                lg = self.R.league
+                if lg is not None and self.mode == 'selfplay' and lg.fixed and ev.get('league_fixed') != lg.fixed_sha:
+                    # the league's fixed opponents (docs/az.md 14.7): a checkout without them (it would
+                    # read the slots as past checkpoints) or a mirror holding other files than the
+                    # run's copies would play another opponent: never used
+                    s.bad_fixed = ev.get('league_fixed')
                 want_b = _belief_of(self.R.cfg)
                 if want_b and ev.get('belief') != want_b:
                     # a checkout without the root's belief (or reading the settings otherwise) would deal
@@ -846,6 +852,14 @@ class RemotePlay:
                               f'selfplay_league {self.R.cfg["selfplay_league"]}); killed, retried in 10 minutes')
                 s.kill()
                 continue
+            if hasattr(s, 'bad_fixed'):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.mirror_ready = False              # (the next session ships the run's copies again)
+                self.fail_log(f"worker {k} REFUSED: its fixed league opponents are {s.bad_fixed!r}, the run's "
+                              f'{self.R.league.fixed_sha!r} (label: sha256; an older checkout has none, a mirror '
+                              f"without the run's copy None: docs/az.md 14.7); killed, retried in 10 minutes")
+                s.kill()
+                continue
             if hasattr(s, 'no_belief'):
                 self.next_try[k] = now + max(self.retry_s, 600.0)
                 self.fail_log(f'worker {k} REFUSED: its checkout plays the root belief as {s.no_belief!r}, the run as '
@@ -912,6 +926,13 @@ class RemotePlay:
                 os.remove(tmp)
             except OSError:
                 pass
+        if self.R.league is not None and self.mode == 'selfplay' and self.R.league.fixed:
+            # the league's fixed opponents (docs/az.md 14.7): the run's copies, before any worker starts
+            # (its hello announces their sha256)
+            from .league import FIXED_DIR, fixed_path
+            self.t.mkdirs(self.rdir + '/' + FIXED_DIR)
+            for label in self.R.league.fixed_sha:
+                self.t.put(fixed_path(self.R.run, label), f'{self.rdir}/{FIXED_DIR}/{label}.pt')
         self.mirror_ready = True
 
     def _start(self, k):
@@ -932,7 +953,8 @@ class RemotePlay:
             return False
         names = [want - 1]
         if self.R.league is not None and self.mode == 'selfplay':
-            names += sorted(set(self.R.league.plan(want)['slots']) - {want - 1})
+            # (past checkpoints of the run; fixed opponents went into the mirror with its config)
+            names += sorted({j for j in self.R.league.plan(want)['slots'] if not isinstance(j, str)} - {want - 1})
         for j in names:
             try:
                 self.t.put(model_path(self.R.run, j), f'{self.rdir}/models/iter_{j:04d}.pt')
@@ -1285,6 +1307,7 @@ class Worker:
         self.lg_kinds = None
         self.lg_evs = {}
         self.lg_slots = None
+        self.fixed_sha = {}                        # the fixed opponents' sha256 announced at the hello
         from .games import spec_json
         self.spec = spec_json(self.cfg.get('spec'))
 
@@ -1489,9 +1512,19 @@ class Worker:
             if not league or set(league) != {L.key(t) for t in range(int(c.get('selfplay_league_slots', 1)))}:
                 raise SystemExit(f'remote self-play: the run plays a league but its phase names the slots {league!r}')
             for k, rel in league.items():
-                self.lg_evs[k] = L.load_into(self.lg_evs.get(k), os.path.join(self.rdir, *rel.split('/')), c)
+                j = L.slot_of(rel)
+                path = os.path.join(self.rdir, *rel.split('/'))
+                if L.is_fixed(j):
+                    # a fixed opponent (docs/az.md 14.7): the file this worker announced in its hello
+                    lb = j[len(L.FIXED_PREFIX):]
+                    got = L.sha256_file(path) if os.path.exists(path) else None
+                    if lb not in self.fixed_sha or got != self.fixed_sha[lb]:
+                        raise SystemExit(f'remote self-play: the fixed league opponent {lb!r} ({path}) is not the '
+                                         f'file announced at the hello ({str(got)[:12]} vs '
+                                         f'{str(self.fixed_sha.get(lb))[:12]})')
+                self.lg_evs[k] = L.load_into(self.lg_evs.get(k), path, c)
                 keep.add(os.path.basename(rel))
-            self.lg_slots = [int(os.path.basename(league[L.key(t)])[5:9]) for t in range(len(league))]
+            self.lg_slots = [L.slot_of(league[L.key(t)]) for t in range(len(league))]
         for p in glob.glob(os.path.join(self.rdir, 'models', 'iter_*.pt')):
             try:
                 if int(os.path.basename(p)[5:9]) < it - 3 and os.path.basename(p) not in keep:
@@ -1796,10 +1829,16 @@ class Worker:
                       f'{self.cfg["threads"]}, groups {self.cfg["groups"]}, infer_workers {self.cfg.get("infer_workers", 1)}, '
                       f'torch threads {self.cfg.get("torch_threads", 1)}, nice {self.sp.get("nice", 0)}'
                       + (', lingering between phases' if self.linger else ''))
-            # (the tests: an older checkout, without the league / the root's belief)
+            # (the tests: an older checkout, without the league / the root's belief / fixed opponents, or
+            # one announcing other fixed opponents)
+            fx = {}
+            if self.lg_on and not self.test.get('no_league_fixed'):
+                from .league import fixed_shas
+                self.fixed_sha = fixed_shas(self.rdir, self.cfg)          # {} without fixed opponents
+                fx = {'league_fixed': self.test.get('league_fixed', self.fixed_sha)} if self.fixed_sha else {}
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
                       mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),
-                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}))
+                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}), **fx)
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

@@ -356,3 +356,260 @@ def test_fork_links_the_leagues_checkpoints(league_runs, tmp_path):
     p = run_loop(lg, '--iters', '4')
     assert p.returncode == 0, p.stderr
     assert read_metrics(str(lg))[-1]['selfplay']['league']['candidates'] == ['iter_0000']
+
+
+# ---------------------------------------------------------------- fixed opponents (docs/az.md 14.7)
+def _frozen(path, seed=7):
+    """A toy network saved at `path` (another run's frozen checkpoint, outside the run)."""
+    import torch  # noqa: F401
+    from zero import run as R
+    from zero.net import save
+    os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+    r = R.Run(os.path.dirname(str(path)), cfg(game='toy', hidden=32, blocks=1, seed=seed))
+    save(r.new_model(), str(path), {'iter': 0})
+    return str(path)
+
+
+def test_fixed_settings_checked():
+    assert DEFAULTS['selfplay_league_fixed'] == ''
+    assert L.parse_fixed('') == L.parse_fixed(None) == []
+    assert L.parse_fixed('E:/x/iter_0475.pt') == [('iter_0475', 'E:/x/iter_0475.pt')]
+    assert L.parse_fixed('g475=C:/Users/a b/iter_0475.pt, b=x.pt') == [('g475', 'C:/Users/a b/iter_0475.pt'),
+                                                                       ('b', 'x.pt')]
+    assert L.parse_fixed('C:' + chr(92) + 'runs' + chr(92) + 'iter_0475.pt')[0][0] == 'iter_0475'
+    for bad in ('a=x.pt,a=y.pt', 'bad label=x.pt', ',', '=x.pt'):
+        with pytest.raises(ValueError):
+            L.parse_fixed(bad)
+    L.check_settings(cfg(selfplay_league=1.0, selfplay_league_fixed='g=x.pt'))
+    L.check_settings(cfg(selfplay_league=0.5, selfplay_league_fixed='a=x.pt,b=y.pt', selfplay_league_slots=2,
+                         selfplay_league_pick='pfsp'))
+    for bad in (dict(selfplay_league_fixed='g=x.pt'),                                  # share 0
+                dict(selfplay_league=1.0, selfplay_league_fixed='g=x.pt', selfplay_league_pool='1,2'),
+                dict(selfplay_league=1.0, selfplay_league_fixed='g=x.pt', selfplay_league_pool='all'),
+                dict(selfplay_league=1.0, selfplay_league_fixed='g=x.pt', selfplay_league_slots=2),
+                dict(selfplay_league=1.0, selfplay_league_fixed='a=x.pt,a=y.pt'),
+                dict(selfplay_league=1.0, selfplay_league_fixed='no good=x.pt'),
+                dict(selfplay_league=1.0, selfplay_league_fixed='g=x.pt', resolver='toy')):
+        with pytest.raises(SystemExit):
+            L.check_settings(cfg(**bad))
+    from zero import run as R
+    c = R.resolve_config(R.parse(['--run', 'x', '--selfplay-league', '1', '--selfplay-league-fixed', 'g=E:/f.pt']), {})
+    assert c['selfplay_league'] == 1.0 and c['selfplay_league_fixed'] == 'g=E:/f.pt'
+    with pytest.raises(SystemExit):
+        R.resolve_config(R.parse(['--run', 'x', '--selfplay-league-fixed', 'g=E:/f.pt']), {})
+    # the slots' names and files
+    assert L.name_of(5) == 'iter_0005' and L.name_of('fixed:g') == 'fixed:g'
+    assert L.rel_of(5) == 'models/iter_0005.pt' and L.rel_of('fixed:g475') == 'league/g475.pt'
+    for j in (0, 5, 475, 12345, 'fixed:g475', 'fixed:a.b-c_d'):
+        assert L.slot_of(L.rel_of(j)) == j
+    for bad in ('models/x.pt', 'league/../x.pt', 'other/iter_0001.pt', 'league/g.npz'):
+        with pytest.raises(ValueError):
+            L.slot_of(bad)
+    assert L.fork_needs(cfg(selfplay_league=1.0, selfplay_league_fixed='g=x.pt'), 20) == set()
+
+
+def test_fixed_opponent_copied_recorded_and_guarded(tmp_path):
+    """prepare: the fixed opponent copied into league/<label>.pt with its sha256 in league/fixed.json;
+    a restart checks the copy and the source; another file under the label, a changed copy, both
+    missing, another encoding: refused."""
+    import torch
+    from zero.net import EncodingMismatch
+    src = _frozen(tmp_path / 'frozen' / 'opp.pt')
+    run = tmp_path / 'run'
+    r = _toy_run(run, n_ckpts=1, selfplay_league=1.0, selfplay_league_fixed=f'g={src}')
+    assert r.league.fixed == [('g', src)] and r.league.fixed_sha == {}
+    sha = L.sha256_file(src)
+    assert r.league.prepare(1) == {'g': sha}
+    rec = json.load(open(run / 'league' / 'fixed.json'))
+    assert rec['g']['sha256'] == sha and rec['g']['since'] == 1 and rec['g']['source'] == os.path.abspath(src)
+    assert L.sha256_file(run / 'league' / 'g.pt') == sha
+    assert r.league.plan(5) == {'candidates': ['fixed:g'], 'slots': ['fixed:g']}
+    assert r.league.files(5) == {'L0': 'league/g.pt'} and r.league.files(9) == {'L0': 'league/g.pt'}
+    assert 'league: fixed opponents fixed:g = league/g.pt' in (run / 'log.txt').read_text(encoding='utf-8')
+    from zero import run as R
+    again = R.Run(str(run), r.cfg).league
+    assert again.prepare(3) == {'g': sha} and json.load(open(run / 'league' / 'fixed.json')) == rec
+    os.remove(src)                                         # the source gone: the run's copy is the opponent
+    assert R.Run(str(run), r.cfg).league.prepare(3) == {'g': sha}
+    _frozen(src, seed=8)                                   # another file under the label
+    with pytest.raises(L.LeagueRefused, match='another file under the same label'):
+        R.Run(str(run), r.cfg).league.prepare(3)
+    os.remove(src)
+    with open(run / 'league' / 'g.pt', 'ab') as f:         # the copy changed
+        f.write(b'x')
+    with pytest.raises(L.LeagueRefused, match='is not the file it recorded'):
+        R.Run(str(run), r.cfg).league.prepare(3)
+    os.remove(run / 'league' / 'g.pt')
+    with pytest.raises(L.LeagueRefused, match='both missing'):
+        R.Run(str(run), r.cfg).league.prepare(3)
+    # a new label whose file does not exist / is of another encoding
+    with pytest.raises(L.LeagueRefused, match='does not exist'):
+        R.Run(str(run), dict(r.cfg, selfplay_league_fixed=f'h={tmp_path / "none.pt"}')).league.prepare(3)
+    other = _frozen(tmp_path / 'frozen' / 'other.pt')
+    ck = torch.load(other, weights_only=False)
+    ck['config']['features'] = ck['config']['features'] - 1
+    torch.save(ck, other)
+    with pytest.raises(EncodingMismatch):
+        R.Run(str(run), dict(r.cfg, selfplay_league_fixed=f'h={other}')).league.prepare(3)
+    assert not os.path.exists(run / 'league' / 'h.pt')
+    # off: nothing to prepare, the pool's candidates
+    off = R.Run(str(run), cfg(game='toy', selfplay_league=0.25, selfplay_league_pool='1'))
+    assert off.league.fixed == [] and off.league.prepare(3) == {} and off.league.candidates(2) == [0]
+
+
+def test_the_learner_only_meets_the_fixed_opponent(tmp_path):
+    """selfplay_league 1.0 with a fixed opponent, through the bindings: every game is the current
+    network (checkpoint 1) against the frozen network in alternating seats, the samples are the
+    current network's decisions only (z its result), and the same games with the opponent's seat
+    recorded have exactly these as their current-seat samples; the slot holds the frozen weights;
+    the games are attributed to the fixed opponent's name."""
+    import torch
+    from zero.run import model_path
+    src = _frozen(tmp_path / 'frozen' / 'opp.pt', seed=11)
+    r = _toy_run(tmp_path / 'run', selfplay_league=1.0, selfplay_league_fixed=f'opp={src}')
+    r.league.prepare(2)
+    seat = r.nn_seat('m', 8, selfplay=True)
+    plan = r.league.plan(2)
+    assert plan == {'candidates': ['fixed:opp'], 'slots': ['fixed:opp']}
+    evs = {'m': r.evaluator(model_path(r.run, 1))}
+    r.league.evaluators(2, evs)
+    want = torch.load(src, weights_only=False)['state']
+    got_w = evs['L0'].model.state_dict()
+    assert set(want) == set(got_w) and all(torch.equal(want[k].cpu(), got_w[k].cpu()) for k in want)
+    games, ks = L.table(r.cfg, seat, [2] * 24)
+    assert all(k is not None for k in ks) and [k[1] for k in ks] == [0, 1] * 12
+    got = _play(r, games, evs)
+    ref = _play(r, [[dict(s, record=True) if s.get('key') == 'L0' else s for s in g] for g in games], evs)
+    assert len(got) == len(ref) == 24
+    for (row, sd), (rrow, rsd), kd in zip(got, ref, ks):
+        assert (row['gid'], row['steps'], row['scores'], row['result']) == (rrow['gid'], rrow['steps'], rrow['scores'],
+                                                                            rrow['result'])
+        me = 1 - kd[1]
+        assert sd is not None and set(sd['player'].tolist()) == {me}
+        keep = np.flatnonzero(rsd['player'] == me)
+        assert len(keep) == len(sd['player']) == row['samples'] < rrow['samples']
+        for k in ('x', 'player', 'n_players', 'z', 'q', 'sc', 'net'):
+            assert np.array_equal(sd[k], rsd[k][keep]), k
+        assert np.allclose(sd['z'][:, 0], row['result'][me])
+    t = L.tally(L.League.attribute([row for row, _ in got], ks, plan['slots']))
+    assert list(t) == ['fixed:opp'] and t['fixed:opp'][1] == 24
+    lg = L.metrics(plan, t, None, 24, 'uniform', fixed=r.league.fixed_sha)
+    assert lg['share'] == 1.0 and lg['games'] == 24 and lg['fixed'] == {'fixed:opp': L.sha256_file(src)[:16]}
+    assert 'fixed' not in L.metrics(plan, t, None, 24, 'uniform')
+    assert '(fixed)' in L.fmt(lg) and 'candidates' not in L.fmt(lg)
+
+
+@pytest.fixture(scope='module')
+def fixed_run(tmp_path_factory):
+    base = tmp_path_factory.mktemp('fixed')
+    src = _frozen(base / 'frozen' / 'opp.pt')
+    run = base / 'classic'
+    p = run_loop(run, '--iters', '3', '--games', '48', '--conc', '48', '--selfplay-league', '1.0',
+                 '--selfplay-league-fixed', f'opp={src}')
+    assert p.returncode == 0, p.stdout + p.stderr
+    return run, src
+
+
+def test_fixed_run_plays_every_game_against_it(fixed_run):
+    run, src = fixed_run
+    sha = L.sha256_file(src)
+    m = read_metrics(str(run))
+    assert [r['iter'] for r in m] == [0, 1, 2, 3]
+    for r in m[1:]:
+        sp, lg = r['selfplay'], r['selfplay']['league']
+        assert lg['games'] == sp['games'] == 48 and lg['share'] == 1.0 and lg['local'] == 48
+        assert lg['slots'] == {'L0': 'fixed:opp'} and lg['candidates'] == ['fixed:opp'] and 'self' not in lg
+        assert list(lg['pool']) == ['fixed:opp'] and lg['pool']['fixed:opp']['games'] == 48
+        assert lg['fixed'] == {'fixed:opp': sha[:16]}
+        n = 0
+        for f in glob.glob(str(run / 'data' / f'iter_{r["iter"]:04d}' / '*.npz')):
+            with np.load(f) as z:
+                n += len(z['player'])
+        assert n == sp['samples'] > 0
+    assert json.load(open(run / 'league' / 'fixed.json'))['opp']['sha256'] == sha
+    assert L.sha256_file(run / 'league' / 'opp.pt') == sha
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert 'league: fixed opponents fixed:opp = league/opp.pt' in log
+    assert 'iter 3 league: 48 league games (100.0%)' in log
+    assert json.load(open(run / 'config.json'))['selfplay_league_fixed'] == f'opp={src}'
+
+
+def test_fixed_run_refuses_another_file_under_its_label(fixed_run, tmp_path):
+    """A restart whose setting names another file under the recorded label: refused, exit 78."""
+    import shutil
+    run, src = fixed_run
+    r2 = tmp_path / 'r2'
+    shutil.copytree(run, r2)
+    other = _frozen(tmp_path / 'frozen' / 'opp.pt', seed=99)
+    p = run_loop(r2, '--iters', '4', '--selfplay-league-fixed', f'opp={other}')
+    assert p.returncode == 78, p.stdout + p.stderr
+    assert 'another file under the same label' in (r2 / 'log.txt').read_text(encoding='utf-8')
+    assert len(read_metrics(str(r2))) == 4                 # nothing played
+
+
+def test_fork_of_a_fixed_run_behind_its_source(fixed_run, tmp_path):
+    """fork_run at 2 of the fixed run (newest 3) with --no-data: no window shards, the league's copy
+    and record, the Elo games of checkpoint 3 left out; the fork plays its own checkpoint 3's Elo
+    matches and every game against the fixed opponent. At the source's newest: the pools as they were."""
+    sys.path.insert(0, os.path.join(ROOT, 'tools'))
+    import fork_run
+    src_run, src = fixed_run
+    res_src = json.load(open(src_run / 'elo' / 'results.json'))
+    assert any('iter_0003' in k for k in res_src['pairs'])
+    fk = tmp_path / 'fork'
+    assert fork_run.main(['--source', str(src_run), '--dest', str(fk), '--iter', '2', '--no-data']) == 0
+    assert not glob.glob(str(fk / 'data' / '*'))
+    assert sorted(os.listdir(fk / 'league')) == ['fixed.json', 'opp.pt']
+    res = json.load(open(fk / 'elo' / 'results.json'))
+    assert not any('iter_0003' in k for k in res['pairs']) and res['pairs']
+    assert all(v == res_src['pairs'][k] for k, v in res['pairs'].items())
+    assert 'iter_0003' not in res.get('logged', [])
+    p = run_loop(fk, '--iters', '3')
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(fk))
+    assert m[-1]['iter'] == 3 and m[-1]['selfplay']['league']['pool']['fixed:opp']['games'] == 24
+    assert any('iter_0003' in k for k in json.load(open(fk / 'elo' / 'results.json'))['pairs'])
+    fk2 = tmp_path / 'fork2'
+    assert fork_run.main(['--source', str(src_run), '--dest', str(fk2), '--iter', '3']) == 0
+    assert (fk2 / 'elo' / 'results.json').read_bytes() == (src_run / 'elo' / 'results.json').read_bytes()
+    assert glob.glob(str(fk2 / 'data' / '*'))
+
+
+def test_fixed_opponent_with_remote_selfplay(tmp_path):
+    """The shared queue with the remote 'local' and a fixed opponent at share 1.0: the quota exact,
+    every accepted game a league game against it on both machines; the mirror holds the run's copy
+    (shipped with its config, announced in the worker's hello)."""
+    src = _frozen(tmp_path / 'frozen' / 'opp.pt')
+    run = tmp_path / 'sp'
+    p = run_loop(run, '--iters', '3', '--conc', '64', '--games', '600', '--selfplay-remote', 'local',
+                 '--selfplay-remote-linger', '1', '--selfplay-league', '1.0', '--selfplay-league-fixed', f'opp={src}',
+                 env=env_for(tmp_path))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    check_quota(m, 600)
+    assert any(r['selfplay']['league']['remote'] > 0 for r in m[1:]), [r['selfplay']['league'] for r in m[1:]]
+    for r in m[1:]:
+        lg = r['selfplay']['league']
+        assert lg['games'] == 600 == lg['local'] + lg['remote'] and lg['share'] == 1.0, lg
+        assert list(lg['pool']) == ['fixed:opp']
+    rd = tmp_path / 'mirror' / 'sp'
+    assert L.sha256_file(rd / 'league' / 'opp.pt') == L.sha256_file(src)
+    assert 'REFUSED' not in (run / 'log.txt').read_text(encoding='utf-8')
+    assert gone(worker_pids(run))
+
+
+@pytest.mark.parametrize('test', [{'no_league_fixed': 1}, {'league_fixed': {'opp': '0' * 64}}])
+def test_a_worker_without_the_fixed_opponent_is_refused(tmp_path, test):
+    """A worker whose checkout has no fixed opponents (an older checkout: it would read the slot as a
+    past checkpoint) or that announces another file is killed at its hello; this machine plays every
+    game, all of them against the fixed opponent."""
+    src = _frozen(tmp_path / 'frozen' / 'opp.pt')
+    run = tmp_path / 'sp'
+    p = run_loop(run, '--iters', '2', '--conc', '64', '--games', '200', '--selfplay-remote', 'local',
+                 '--selfplay-league', '1.0', '--selfplay-league-fixed', f'opp={src}', env=env_for(tmp_path, test))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    for r in m[1:]:
+        assert r['selfplay']['games'] == 200 and r['selfplay']['remote']['games'] == 0
+        assert r['selfplay']['league']['games'] == 200 == r['selfplay']['league']['local']
+    assert 'REFUSED: its fixed league opponents are' in (run / 'log.txt').read_text(encoding='utf-8')

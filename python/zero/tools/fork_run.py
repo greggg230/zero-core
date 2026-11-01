@@ -15,9 +15,12 @@
       checkpoints <= K that its Elo matches need (and, with the self-play league in the fork's
       settings - e.g. --set selfplay_league=0.25 -, every one its league may play: docs/az.md 14),
       the optimizer state when it belongs to K, the
-      window's sample shards (hard links on the same volume, --copy to copy), Elo results (every
-      pool: elo/ and elo/<rule>/), metrics up to K and the source's config.json with the --set
-      overrides. The source is only read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
+      window's sample shards (hard links on the same volume, --copy to copy; --no-data: none, so the
+      fork's first trainings see only its own self-play - a best-response fork, docs/az.md 14.7), Elo
+      results (every pool: elo/ and elo/<rule>/; the games of checkpoints after K - a fork behind a
+      live source - left out, so the fork's own K + e plays its matches), the league's fixed opponents
+      (league/: the run's copies and their record), metrics up to K and the source's config.json with
+      the --set overrides. The source is only read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
       (setting `resolver`, docs/az.md 11) is copied with its resolver network: the same of
       <source>/resolver/ into <dest>/resolver/ (K: an iteration where both have a checkpoint).
 
@@ -147,7 +150,7 @@ def install_net(dest, it, net, game, settings=None):
     return net_size(m.config)
 
 
-def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
+def continuation(source, dest, it=None, overrides=None, copy=False, net=None, data=True):
     from ..run import DEFAULTS, latest_iter, model_path
     if os.path.exists(os.path.join(dest, 'config.json')):
         raise SystemExit(f'{dest} already holds a run')
@@ -178,10 +181,10 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
         if os.path.exists(os.path.join(rsrc, 'config.json')):
             with open(os.path.join(rsrc, 'config.json')) as f:
                 rcfg = json.load(f)
-        _copy_run(rsrc, os.path.join(dest, 'resolver'), it, rcfg, copy)
+        _copy_run(rsrc, os.path.join(dest, 'resolver'), it, rcfg, copy, data=data)
         if os.path.exists(os.path.join(rsrc, 'config.json')):
             shutil.copy2(os.path.join(rsrc, 'config.json'), os.path.join(dest, 'resolver', 'config.json'))
-    need, dirs, rows = _copy_run(source, dest, it, cfg, copy, settings=settings)
+    need, dirs, rows = _copy_run(source, dest, it, cfg, copy, settings=settings, data=data)
     size = install_net(dest, it, net, cfg.get('game', 'toy'), settings) if net else None
     if size:
         cfg.update(size)
@@ -189,18 +192,37 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
     with open(os.path.join(dest, 'config.json'), 'w') as f:
         json.dump(cfg, f, indent=1)
     print(f'{source} @ iter {it} -> {dest}: {len(need)} checkpoints, {len(dirs)} data iterations, {len(rows)} metrics rows'
-          + (' (and its resolver network)' if co else ''))
+          + (' (and its resolver network)' if co else '') + ('' if data else ' (--no-data: no window shards)'))
     if size:
         print(f'checkpoint {it} = {net} ({", ".join(f"{k} {v}" for k, v in size.items())}): no optimizer state, '
               f'its Elo results dropped')
     print(f'next: python tools/supervise.py {dest}   (resumes after iteration {it})')
 
 
-def _copy_run(source, dest, it, cfg, copy, settings=None):
+def _after(name, it):
+    """A pool player who is a checkpoint after `it` (an Elo pool's 'iter_NNNN')."""
+    return name.startswith('iter_') and name[5:].isdigit() and int(name[5:]) > it
+
+
+def _pool_upto(res, it):
+    """An Elo pool's results.json without the games of checkpoints after `it` (and without them in
+    'logged') -> (results, pairs dropped). A fork at `it` behind its source's newest checkpoint would
+    otherwise hold the source's games of e.g. iter_{it + e} under its own checkpoint's name: its Elo
+    matches and anchor games would count as played and its rating mix two networks."""
+    pairs = res.get('pairs', {})
+    keep = {k: v for k, v in pairs.items() if not any(_after(p, it) for p in k.split('|'))}
+    out = dict(res, pairs=keep)
+    if 'logged' in res:
+        out['logged'] = [x for x in res['logged'] if not _after(x, it)]
+    return out, len(pairs) - len(keep)
+
+
+def _copy_run(source, dest, it, cfg, copy, settings=None, data=True):
     """Checkpoint `it` and those its Elo matches need (and, with the self-play league in `settings` -
     the fork's: the source's config with the --set overrides -, every past checkpoint its league may
-    play, zero/league.py), its optimizer state, the window's shards, Elo results, metrics up to `it`
-    -> (checkpoints, data dirs, metrics rows)."""
+    play, zero/league.py), its optimizer state, the window's shards (`data` False: none), Elo results
+    up to `it`, the league's fixed opponents, metrics up to `it` -> (checkpoints, data dirs, metrics
+    rows)."""
     from .. import elo, league
     from ..run import model_path, read_metrics, window_iters
     e = max(1, int(cfg.get('eval_every', 1)))
@@ -220,6 +242,8 @@ def _copy_run(source, dest, it, cfg, copy, settings=None):
             shutil.copy2(opt, os.path.join(dest, 'models', 'opt_latest.pt'))
     dirs = sorted(glob.glob(os.path.join(source, 'data', 'iter_*')), reverse=True)
     dirs = [d for d in dirs if int(os.path.basename(d)[5:9]) <= it][:max(window_iters(cfg, it + 1), 1) + 1]
+    if not data:
+        dirs = []
     for d in dirs:
         for p in glob.glob(os.path.join(d, '*.npz')):
             _link(p, os.path.join(dest, 'data', os.path.basename(d), os.path.basename(p)), copy)
@@ -232,6 +256,21 @@ def _copy_run(source, dest, it, cfg, copy, settings=None):
             if os.path.exists(p):
                 os.makedirs(os.path.join(dest, 'elo', sub), exist_ok=True)
                 shutil.copy2(p, os.path.join(dest, 'elo', sub, f))
+        p = os.path.join(dest, 'elo', sub, 'results.json')
+        if os.path.exists(p):
+            with open(p) as f:
+                res = json.load(f)
+            res, dropped = _pool_upto(res, it)
+            if dropped:                            # (else the file as copied, byte for byte)
+                with open(p, 'w') as f:
+                    json.dump(res, f, indent=1)
+                print(f'elo/{sub + "/" if sub else ""}results.json: {dropped} pairs of checkpoints after {it} left out')
+    # the league's fixed opponents (docs/az.md 14.7): the source's copies and their record
+    from ..league import FIXED_DIR
+    for p in glob.glob(os.path.join(source, FIXED_DIR, '*')):
+        if os.path.isfile(p) and not p.endswith('.tmp'):
+            os.makedirs(os.path.join(dest, FIXED_DIR), exist_ok=True)
+            shutil.copy2(p, os.path.join(dest, FIXED_DIR, os.path.basename(p)))
     rows = [m for m in read_metrics(source) if m['iter'] <= it]
     with open(os.path.join(dest, 'metrics.jsonl'), 'w', encoding='utf-8') as f:
         for m in rows:
@@ -255,13 +294,15 @@ def main(argv=None):
     ap.add_argument('--iter', type=int, default=None)
     ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE')
     ap.add_argument('--copy', action='store_true', help='copy shards instead of hard-linking them')
+    ap.add_argument('--no-data', action='store_true', help="no window shards: the fork's first trainings see only "
+                    "its own self-play (a best-response fork, docs/az.md 14.7)")
     ap.add_argument('--net', default=None, help="another network as the fork's checkpoint K (module docstring)")
     a = ap.parse_args(argv)
     over = {}
     for kv in a.set:
         k, _, v = kv.partition('=')
         over[k.strip().replace('-', '_')] = parse_value(v)
-    continuation(a.source, a.dest, a.iter, over, a.copy, a.net)
+    continuation(a.source, a.dest, a.iter, over, a.copy, a.net, data=not a.no_data)
     return 0
 
 

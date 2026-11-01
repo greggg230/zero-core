@@ -29,7 +29,9 @@ network trained in the same run (<run>/resolver/); --resolver-cfg holds its sett
 
 --selfplay-league 0.25: a quarter of the self-play games put a past checkpoint of the run (the pool
 --selfplay-league-pool, raw offsets back) in one seat; only the current network's decisions are
-recorded (zero/league.py, docs/az.md 14).
+recorded (zero/league.py, docs/az.md 14). --selfplay-league 1.0 --selfplay-league-fixed <a frozen
+checkpoint>: every self-play game against that fixed opponent instead (copied into the run's league/,
+its sha256 recorded): a best-response run (docs/az.md 14.7).
 
 --aux-<name>-w 0.5: an auxiliary training target of the game (the game package's `aux`, e.g. MTG Zero's
 `belief`, the opponent's hand): self-play records it with every sample, the network gets an auxiliary
@@ -266,8 +268,13 @@ DEFAULTS = dict(
     # before); the pool it is picked from (raw iteration offsets back from the network that
     # self-plays, those that exist, or 'all'), past checkpoints per iteration (one evaluator key
     # each) and how they are picked ('uniform' | 'pfsp': weighted by how often each still beats the
-    # current network). Only the current network's decisions become samples. Single-game runs only
+    # current network). Only the current network's decisions become samples. Single-game runs only.
+    # selfplay_league_fixed: FIXED opponents instead of the pool - frozen checkpoints ('path' or
+    # 'label=path', comma-separated; '' = off: the pool), each copied once into <run>/league/<label>.pt
+    # with its sha256 recorded (league/fixed.json; another file under a recorded label is refused), the
+    # slots playing those copies (docs/az.md 14.7: a best-response run, selfplay_league 1.0)
     selfplay_league=0.0, selfplay_league_pool=L.DEFAULT_POOL, selfplay_league_slots=1, selfplay_league_pick='uniform',
+    selfplay_league_fixed='',
 )
 
 PRESETS = {
@@ -789,7 +796,7 @@ class Run:
     def league_metrics(self, it, plan, local, remote, games, evs):
         """The iteration's `selfplay.league` (zero/league.py: the share, the current network's score
         against the past checkpoints, which ones), logged; the slots' inference time."""
-        lg = L.metrics(plan, local, remote, games, self.league.pick)
+        lg = L.metrics(plan, local, remote, games, self.league.pick, fixed=self.league.fixed_sha)
         lg['infer_s'] = round(sum(evs[k].seconds for k in self.league.keys() if k in evs), 2)
         for k in self.league.keys():
             if k in evs:
@@ -1409,6 +1416,9 @@ class Run:
         self.check_belief_heads(model_path(run, start))
         # the anchors and the held-out set (docs/az.md 20): checked now, refused before any work
         self.check_anchors()
+        if self.league is not None:
+            # the league's fixed opponents (docs/az.md 14.7): copied / checked now, refused before any work
+            self.league.prepare(start + 1)
         if c.get('heldout_shards'):
             from .heldout import HeldOut
             try:
