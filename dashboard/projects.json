@@ -55,6 +55,15 @@
       "roots": ["C:/Users/Gregg Keithley/kingdombuilder-zero/runs"],
       "pause": true,
       "yardstick": {"key": "eval_yard", "label": "JS bot"}
+    },
+    {
+      "id": "mtg",
+      "name": "MTG Zero",
+      "repo": "C:/Users/Gregg Keithley/mtg-zero",
+      "dashboard": "http://desktop-j05412i:5340",
+      "roots": ["C:/Users/Gregg Keithley/mtg-zero/runs"],
+      "pause": true,
+      "yardstick": {"key": "eval_yard", "label": "heuristic"}
     }
   ]
 }
