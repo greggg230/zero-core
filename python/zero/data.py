@@ -471,17 +471,25 @@ def _run_all(fn, n, threads):
         return [f.result() for f in futs]
 
 
-def batches(W, rng, n, size, device='cpu', prefetch=0):
+def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False):
     """A training's `n` batches: `size` window rows drawn from `rng` (uniform, with replacement),
-    one draw per batch in order -> (rows, W.batch(rows, device)). `prefetch` > 0: drawn and built
-    up to that many batches ahead on a background thread (as CPU tensors, moved to `device` as
+    one draw per batch in order -> (rows, W.batch(rows, device, tokens)). `prefetch` > 0: drawn and
+    built up to that many batches ahead on a background thread (as CPU tensors, moved to `device` as
     they are taken) while the caller trains on the current one - the same draws, the same
     batches. A failure there is raised here; closing the generator (or dropping it) stops the
-    thread."""
+    thread. `coo` (a sparse window): each batch's features travel as their non-zeros and are
+    scattered into the dense rows on `device` (`Window.batch`'s `coo`: the same rows, bit for bit)."""
+    def build(idx, dev):                       # (a window-like `W` without the options: the call of before)
+        return W.batch(idx, dev, tokens=tokens, coo=coo) if tokens is not None or coo else W.batch(idx, dev)
+
+    def to(b):
+        if device != 'cpu':
+            b = {k: v.to(device) for k, v in b.items()}
+        return dense_coo(b, W.F) if coo else b
     if not prefetch:
         for _ in range(n):
             idx = rng.integers(W.N, size=size)
-            yield idx, W.batch(idx, device)
+            yield idx, to(build(idx, 'cpu')) if coo else build(idx, device)
         return
     q = queue.Queue(maxsize=prefetch)
     stop = threading.Event()
@@ -499,7 +507,7 @@ def batches(W, rng, n, size, device='cpu', prefetch=0):
         try:
             for _ in range(n):
                 idx = rng.integers(W.N, size=size)
-                if not put((idx, W.batch(idx))):
+                if not put((idx, build(idx, 'cpu'))):
                     return
         except BaseException as e:             # noqa: BLE001  (re-raised by the consumer)
             put(e)
@@ -518,7 +526,7 @@ def batches(W, rng, n, size, device='cpu', prefetch=0):
             if isinstance(item, BaseException):
                 raise item
             idx, b = item
-            yield idx, (b if device == 'cpu' else {k: v.to(device) for k, v in b.items()})
+            yield idx, to(b)
     finally:
         stop.set()
         while not q.empty():
@@ -527,6 +535,17 @@ def batches(W, rng, n, size, device='cpu', prefetch=0):
             except queue.Empty:
                 break
         th.join(timeout=10)
+
+
+def dense_coo(b, F):
+    """A `coo` batch (`Window.batch`) with its features as dense float32 rows 'x' [B, F] on the batch's
+    device, scattered from 'x_rows' / 'x_cols' / 'x_vals' (which it drops): `features(idx, float32)`
+    bit for bit (a float16 value is exact in float32; every other float a zero)."""
+    rows, cols, vals = b.pop('x_rows'), b.pop('x_cols'), b.pop('x_vals')
+    x = torch.zeros((len(b['n_players']), F), dtype=torch.float32, device=vals.device)
+    x.view(-1).index_copy_(0, rows * F + cols, vals.float())
+    b['x'] = x
+    return b
 
 
 class WindowCache:
@@ -685,7 +704,42 @@ class Window:
         sh = np.searchsorted(self.starts, idx, side='right') - 1
         return [(self.paths[k], np.unique(self.src_row[idx[sh == k]])) for k in np.unique(sh)]
 
-    def batch(self, idx, device='cpu'):
+    @property
+    def sparse(self):
+        """Whether the features are kept as their non-zeros (a sparse window)."""
+        return self._csr is not None or self._xsp is not None
+
+    def features_coo(self, idx):
+        """A sparse window's features of rows `idx` as their non-zeros -> (rows [nnz] int64: each one's
+        position in `idx`, cols [nnz] int64, vals [nnz] float16): `features(idx)`'s non-zeros (a -0.0
+        too), grouped by shard."""
+        idx = np.asarray(idx, np.int64)
+        if self._csr is not None:
+            groups = [(np.arange(len(idx)), self._csr, idx)]
+        elif self._xsp is not None:
+            sh = np.searchsorted(self.starts, idx, side='right') - 1
+            src = self.src_row[idx]
+            order = np.argsort(sh, kind='stable')
+            cut = np.flatnonzero(np.diff(sh[order])) + 1
+            groups = [(g, self._xsp[sh[g[0]]], src[g]) for g in np.split(order, cut) if len(g)]
+        else:
+            raise ValueError('features_coo: not a sparse window')
+        R, C, V = [], [], []
+        for at, part, rows in groups:
+            rows, lens, pos = part._pos(rows)
+            R.append(np.repeat(at, lens))
+            C.append(part.idx[pos].astype(np.int64))
+            V.append(part.val[pos])
+        return np.concatenate(R), np.concatenate(C), np.concatenate(V)
+
+    def batch(self, idx, device='cpu', tokens=None, coo=False):
+        """The training batch of window rows `idx` (tensors on `device`). `tokens` (a token network's
+        static forward, run setting train_static: (TokenNet.present_index() as an int64 array, T step))
+        adds each row's tokens as `TokenNet.forward_static` takes them: 'full' [B, T] (their positions in
+        the full token axis, the global token's 0 first, then padding 0) and 'ntok' [B], T the longest
+        row's tokens rounded up to the step. `coo` (a sparse window): the features as their non-zeros
+        'x_rows' / 'x_cols' / 'x_vals' (`features_coo`) instead of 'x' - `dense_coo` makes 'x' of them on the
+        device -, the tokens read from them."""
         B = len(idx)
         off = self.opt_off
         starts = off[idx]
@@ -702,10 +756,35 @@ class Window:
         def norm(a):
             return a / np.maximum(a.sum(1, keepdims=True), 1e-8)
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device)
-        out = {'x': t(self.features(idx, np.float32)), 'mask': t(mask), 'pi': t(pi),
-               'z': t(norm(self.z[idx])), 'q': t(norm(self.q[idx])), 'sc': t(self.sc[idx]),
-               'n_players': t(self.n_players[idx])}
+        if coo:
+            xr, xc, xv = self.features_coo(idx)
+            out = {'x_rows': t(xr), 'x_cols': t(xc), 'x_vals': t(xv)}
+        else:
+            x = self.features(idx, np.float32)
+            out = {'x': t(x)}
+        out.update({'mask': t(mask), 'pi': t(pi),
+                    'z': t(norm(self.z[idx])), 'q': t(norm(self.q[idx])), 'sc': t(self.sc[idx]),
+                    'n_players': t(self.n_players[idx])})
         if self.AW:
             out['aux'] = t(self.aux[idx].astype(np.float32))
             out['aux_mask'] = t(self.aux_mask[idx].astype(np.float32))
+        if tokens is not None:
+            pidx, step = tokens
+            has = pidx >= 0
+            P = np.ones((B, 1 + len(pidx)), bool)          # (infer.token_presence / token_index)
+            if coo:                                         # a flag is present when its value > 0.5
+                P[:, 1:][:, has] = False
+                slot = np.full(self.F, -1, np.int64)
+                slot[pidx[has]] = np.flatnonzero(has) + 1
+                c = slot[xc]
+                on = (c >= 0) & (xv > 0.5)
+                P[xr[on], c[on]] = True
+            else:
+                P[:, 1:][:, has] = x[:, pidx[has]] > 0.5
+            n = P.sum(1)
+            T = -(-int(n.max()) // step) * step
+            full = np.zeros((B, T), np.int64)
+            r, c = np.nonzero(P)
+            full[r, (np.cumsum(P, 1) - 1)[r, c]] = c
+            out['full'], out['ntok'] = t(full), t(n.astype(np.int64))
         return out

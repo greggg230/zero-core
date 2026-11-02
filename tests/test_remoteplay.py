@@ -319,6 +319,28 @@ def test_linger_plays_through_training(tmp_path):
     assert 'lingering between phases' in wl and '; lingering' in wl
 
 
+def test_local_linger_plays_while_the_run_trains(tmp_path):
+    """selfplay_local_linger 1: while the run trains, this machine's driver plays on with the checkpoint
+    of the phase that ended; the games it finishes count for the next iteration (its quota takes them
+    first, one checkpoint behind it); quotas stay exact; never after the last iteration; refused
+    without a remote."""
+    run = tmp_path / 'll'
+    p = run_loop(run, '--iters', '4', *PAIR, '--selfplay-remote', 'local', '--selfplay-local-linger', '1',
+                 '--min-steps', '150', env=pair_env(tmp_path))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    check_quota(m, 192)
+    lg = [r.get('linger') for r in m[1:]]
+    assert all(x is not None and x['seconds'] > 0 for x in lg[:-1]) and lg[-1] is None, lg
+    assert any(x['games'] > 0 and x['leaves'] > 0 for x in lg[:-1]), lg
+    stale = [r['selfplay']['queue']['staleness']['local'] for r in m[2:]]
+    assert any(s.get('1', 0) > 0 for s in stale), stale
+    assert all(r['selfplay']['games'] <= 192 for r in m[1:])
+    assert 'local linger:' in (run / 'log.txt').read_text(encoding='utf-8')
+    p = run_loop(tmp_path / 'no', '--iters', '1', '--selfplay-local-linger', '1')
+    assert p.returncode != 0 and 'selfplay_local_linger: needs selfplay_remote' in p.stderr, p.stderr
+
+
 def test_late_shards_are_dropped(tmp_path):
     """A remote slower than selfplay_remote_wait: its shards of phase i come after the phase closed
     and are dropped (reported as late), never in iteration i or any later one; the run waits at

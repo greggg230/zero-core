@@ -87,6 +87,94 @@ def test_window_cache_trains_the_same_network(smoke_run):
             assert torch.equal(ref_s[k], got[k]), (n, k)
 
 
+@pytest.fixture(scope='module')
+def token_run(tmp_path_factory):
+    run = tmp_path_factory.mktemp('runs') / 'tok'
+    p = run_loop(run, '--iters', '2', '--arch', 'tokens', '--hidden', '16', '--blocks', '1', '--heads', '2')
+    assert p.returncode == 0, p.stdout + p.stderr
+    return run
+
+
+def test_train_static_trains_the_same_network_up_to_rounding(token_run, smoke_run):
+    """Run setting train_static: a token network trained through its static forward (and, on CUDA, a
+    fused AdamW) - the same batches, each row's tokens as the inference graphs take them -: a step's
+    loss and gradients are the eager forward's up to float32 rounding, and the trained network ends
+    where the eager training ends up to that rounding as AdamW's per-parameter normalisation amplifies
+    it over the steps (the losses too); 0 is the training of before; an MLP run refuses it."""
+    import numpy as np
+    import torch
+    from zero import run as R
+    from zero.data import Window
+    from zero.infer import T_STEP, token_index, token_presence
+    from zero.net import load
+    with open(os.path.join(token_run, 'config.json')) as f:
+        cfg = json.load(f)
+    start, _ = load(str(token_run / 'models' / 'iter_0001.pt'))
+    s0 = {k: v.detach().clone() for k, v in start.state_dict().items()}
+
+    def trained(c):
+        model, _, stats = R.Run(str(token_run), c).train_model(2, 200)
+        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}, stats()
+
+    for dev in ['cpu'] + (['cuda'] if torch.cuda.is_available() else []):
+        c = dict(cfg, train_device=dev)
+        ref, st0 = trained(dict(c, train_static=0))
+        got, st1 = trained(dict(c, train_static=1))
+        assert st1['steps'] == st0['steps'] >= 10
+        for k in ('policy', 'value', 'margin', 'entropy'):
+            assert abs(st1[k] - st0[k]) < 1e-4, (dev, k, st0[k], st1[k])
+        moved = max(float((ref[k] - s0[k]).abs().max()) for k in ref)
+        diff = max(float((ref[k] - got[k]).abs().max()) for k in ref)
+        assert moved > 1e-3 and diff < 0.05 * moved, (dev, moved, diff)
+        # a sparse window (batches as their non-zeros, dense on the device), cached or not, with prefetch:
+        # the same batches - on the CPU the same network, weight for weight
+        for extra in ({'window_sparse': 1}, {'window_sparse': 1, 'window_cache': 1, 'train_prefetch': 2}):
+            sp, st2 = trained(dict(c, train_static=1, **extra))
+            for k in got:
+                if dev == 'cpu':
+                    assert torch.equal(got[k], sp[k]), (extra, k)
+                else:
+                    assert float((got[k] - sp[k]).abs().max()) < 0.05 * moved, (extra, k)
+    m, _ = load(str(token_run / 'models' / 'iter_0001.pt'))
+    W = Window(R.Run(str(token_run), cfg).window_shards(2), m.features, m.config['actions'])
+    idx = np.random.default_rng(0).integers(W.N, size=64)
+    pidx = np.asarray(m.present_index(), np.int64)
+    b = W.batch(idx, 'cpu', (pidx, T_STEP))
+
+    def step(static):                              # one step's loss and gradients
+        m.zero_grad()
+        o = m.forward_static(b['x'], b['n_players'], b['full'], b['ntok']) if static else m(b['x'], b['n_players'])
+        lp = torch.log_softmax(o[0].masked_fill(~b['mask'], -1e9), 1)
+        loss = -(b['pi'] * lp).sum(1).mean() + torch.log_softmax(o[1], 1)[:, 0].mean() + (o[2] ** 2).mean()
+        loss.backward()
+        return loss.item(), {n: p.grad.clone() for n, p in m.named_parameters() if p.grad is not None}
+    (l0, g0), (l1, g1) = step(False), step(True)
+    assert abs(l0 - l1) < 1e-6 and g0.keys() == g1.keys()
+    for k in g0:
+        assert float((g0[k] - g1[k]).abs().max()) <= 1e-5 * max(1.0, float(g0[k].abs().max())), k
+    # the batches' tokens: infer's (the graphs') for the same rows
+    P = token_presence(b['x'].numpy(), pidx)
+    T = -(-int(P.sum(1).max()) // T_STEP) * T_STEP
+    assert b['full'].shape == (64, T) and np.array_equal(b['ntok'].numpy(), P.sum(1))
+    assert np.array_equal(b['full'].numpy(), token_index(P, np.zeros((64, T), np.int64)))
+    assert set(b) - {'full', 'ntok'} == set(W.batch(idx, 'cpu'))
+    # a sparse window's batch as non-zeros (cached and not): the dense rows bit for bit, the same tokens
+    from zero.data import WindowCache, dense_coo
+    paths = R.Run(str(token_run), cfg).window_shards(2)
+    for cache in (None, WindowCache()):
+        Ws = Window(paths, m.features, m.config['actions'], cache=cache, sparse=True)
+        assert Ws.sparse and not W.sparse
+        bc = Ws.batch(idx, 'cpu', (pidx, T_STEP), coo=True)
+        assert 'x' not in bc and {'x_rows', 'x_cols', 'x_vals'} <= set(bc)
+        bc = dense_coo(bc, Ws.F)
+        assert set(bc) == set(b) and all(torch.equal(bc[k], b[k]) for k in b)
+        assert torch.equal(bc['x'].view(torch.int32), b['x'].view(torch.int32))   # -0.0 kept
+    with open(os.path.join(smoke_run, 'config.json')) as f:
+        mlp = json.load(f)
+    with pytest.raises(SystemExit, match='train_static is for a token network'):
+        R.Run(str(smoke_run), dict(mlp, train_device='cpu', train_static=1)).train_model(2, 200)
+
+
 def test_sparse_setting_plays_the_same_selfplay(smoke_run, tmp_path, monkeypatch):
     """Run setting sparse: the run's drivers send sparse network batches, and an iteration's self-play
     is the same - its shards array for array - as with dense batches."""

@@ -49,12 +49,14 @@ with at most its throughput's share in flight; its shards come back into data/it
 --resolver-cfg '{"selfplay_remote": ...}' (the remote plays a share of the queued episodes, 11.6).
 """
 import argparse
+import contextlib
 import glob
 import json
 import math
 import os
 import shutil
 import sys
+import threading
 import time
 from collections import deque
 
@@ -65,7 +67,7 @@ import torch.nn.functional as F
 from . import auxtarget as AUX, elo, games as G, league as L, package, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
-from .infer import NetEvaluator, drive, use_amp
+from .infer import T_STEP, NetEvaluator, drive, use_amp
 from .net import EncodingMismatch, add_aux, aux_layout, check_belief_head, check_checkpoint, load, make_net, save
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
@@ -128,6 +130,12 @@ DEFAULTS = dict(
     # train_prefetch n > 0 = training batches built n steps ahead on a background thread while the
     # device trains (zero/data.py batches: the same batches in the same order)
     train_prefetch=0,
+    # train_static 1 = a token network trains through its static forward (TokenNet.forward_static, the
+    # inference CUDA graphs' - every batch one chunk of its longest row's tokens, no host sync, a few
+    # hundred kernels instead of eager `forward`'s per-segment packing and chunks of 64 rows) and, on
+    # CUDA, a fused AdamW: the same losses and updates up to float32 rounding, ~3x faster a step on
+    # MTG Zero's Delver network (docs/az.md 10.9). Another network is refused. 0 = as before
+    train_static=0,
     # value target = (1 - q) z + q root-search estimate, q = value_q * min(1, iter / warmup)
     value_q=0.5, value_q_warmup=5, margin_loss_w=0.5,
     # evaluation: the yardstick (Elo anchor = 1000): a built-in bot or 'ext:<name>'; 0 random games:
@@ -245,6 +253,13 @@ DEFAULTS = dict(
     # checkpoint while the run trains (those games count for the next iteration, one checkpoint stale)
     selfplay_remote_inflight=1.0, selfplay_remote_giveback=30.0, selfplay_remote_overdue=3.0,
     selfplay_remote_linger=0,
+    # selfplay_local_linger 1 = this machine's self-play driver plays on too while the run trains (on a
+    # thread, its network batches on a CUDA stream of their own beside the training's): new games up to
+    # its cap, and the games in flight carried over finish with the checkpoint they began with; the games
+    # finished then count for the next iteration (its quota takes them first), one checkpoint stale - as
+    # a remote's lingering games. Needs selfplay_remote (the shared queue); single-game runs without the
+    # self-play league. 0 = this machine's self-play waits while the run trains, as before
+    selfplay_local_linger=0,
     # ... except a batch-bound machine's (its network batches grow with its games in flight, so a
     # smaller cap only starves it: 'auto' = the ones inferring on CUDA / MPS; 'local' | 'remote' |
     # 'all' | 'none'): its slots while its games take at most this many iterations (its throughput
@@ -439,6 +454,7 @@ class Run:
         self.aux_w, self.aux = aux_settings(cfg, self.info)
         self.heldout = None                        # zero.heldout.HeldOut with heldout_shards (loaded once)
         self.anchor_sha = {}                       # anchor path -> ((size, mtime), sha256)
+        self.linger = None                         # selfplay_local_linger: the lingering thread's state
 
     def check(self, where=''):
         if self.pw is not None:
@@ -810,6 +826,81 @@ class Run:
         self.log(f'iter {it} league: {L.fmt(lg)}')
         return lg
 
+    def linger_start(self, it):
+        """selfplay_local_linger (docs/az.md 5.3): after iteration `it`'s self-play phase, this machine's
+        rolling driver plays on with checkpoint it - 1 on a thread while the run trains - setups queued up
+        to its cap as in the phase, the games in flight finishing with the network they began with; the
+        finished games are held, with their samples, for iteration it + 1's quota (which takes the held
+        games first): one checkpoint stale, as a remote's linger. Its network batches run on a CUDA stream
+        of their own (the training's are on the default one). Never after the last iteration, nor with
+        STOP or PAUSE there, nor more games held than an iteration's quota."""
+        c = self.cfg
+        if not c.get('selfplay_local_linger') or self.rsp is None or self.roll is None or it >= c['iters'] \
+                or runctl.stop_requested(self.run) or runctl.pause_requested(self.run):
+            return
+        st = self.linger = {'stop': threading.Event(), 'games': 0, 'error': None, 't0': time.time(),
+                            'leaves0': self.roll.stats()['leaves']}
+        st['thread'] = threading.Thread(target=self._linger, args=(it, st), name='zero-local-linger', daemon=True)
+        st['thread'].start()
+
+    def _linger(self, it, st):
+        from .workqueue import split_games
+        c = self.cfg
+        drv, evs = self.roll, self.roll_evs
+        spec = G.spec_json(c['spec'])
+        cap_held = int(c['games'])
+        cuda = str(c['infer_device']).startswith('cuda') and torch.cuda.is_available()
+        side = torch.cuda.Stream() if cuda else None
+
+        def pump(lb=None):
+            rows = drv.take_results()
+            s = drv.take_samples()
+            if rows:
+                self.taken += len(rows)
+                st['games'] += len(rows)
+                self.held.extend(split_games(rows, s))
+            if st['stop'].is_set() or len(self.held) >= cap_held:
+                drv.end_phase()
+            else:
+                cap = self.rsp.local_cap()
+                for _ in range(max(0, cap - (self.enq - self.taken))):
+                    drv.enqueue(f'L{self.enq}', spec)
+                    self.enq += 1
+        try:
+            with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
+                drv.resume(BIG, it - 1)            # the same network: the searches in flight go on
+                while True:
+                    pump()
+                    drive(drv, evs, on_batch=pump)
+                    if drv.paused:
+                        break
+                    if drv.in_flight()['games'] == 0 and not drv.queued:
+                        time.sleep(0.05)           # nothing to play (a cap of 0)
+                pump()
+            if side is not None:
+                side.synchronize()
+        except BaseException as e:                 # noqa: BLE001  (raised by linger_stop on the main thread)
+            st['error'] = e
+
+    def linger_stop(self, quiet=False):
+        """End the lingering self-play (linger_start): the driver paused, its finished games held -> its
+        metrics {games, seconds, leaves, infer_s, held}, None if none ran. A failure on its thread is
+        raised here (`quiet`: not - another exception is on its way)."""
+        st = self.linger
+        if st is None:
+            return None
+        self.linger = None
+        st['stop'].set()
+        st['thread'].join()
+        if st['error'] is not None and not quiet:
+            raise RuntimeError(f'local linger: {type(st["error"]).__name__}: {st["error"]}') from st['error']
+        ev = self.roll_ev
+        out = {'games': st['games'], 'seconds': round(time.time() - st['t0'], 2),
+               'leaves': self.roll.stats()['leaves'] - st['leaves0'], 'infer_s': round(ev.seconds, 2),
+               'held': len(self.held)}
+        ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0         # (the next phase's own inference metrics)
+        return out
+
     # ---------------------------------------------------------------- training
     def window_shards(self, it):
         dirs = sorted(glob.glob(os.path.join(self.run, 'data', 'iter_*')), reverse=True)
@@ -849,12 +940,18 @@ class Run:
             added = True
             self.log(f'iter {it}: auxiliary head {self.aux} added to checkpoint {it - 1} (its other outputs unchanged)')
         model.train()
+        static = bool(c.get('train_static'))
+        if static and not hasattr(model, 'forward_static'):
+            raise SystemExit(f'iter {it}: train_static is for a token network (arch tokens); checkpoint {it - 1} '
+                             f'is {model.config.get("arch", "mlp")!r} (set train_static 0)')
+        # fused AdamW (train_static on CUDA): the same update, one kernel set for every parameter
+        okw = {'fused': True} if static and str(dev).startswith('cuda') else {}
         heads = [p for n, p in model.named_parameters() if n.startswith('aux_')]
         trunk = [p for n, p in model.named_parameters() if not n.startswith('aux_')]
         if heads:                                  # two groups: the network of before, its auxiliary head
-            opt = torch.optim.AdamW([{'params': trunk}, {'params': heads}], lr=c['lr'], weight_decay=c['wd'])
+            opt = torch.optim.AdamW([{'params': trunk}, {'params': heads}], lr=c['lr'], weight_decay=c['wd'], **okw)
         else:
-            opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'])
+            opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'], **okw)
         opt_path = os.path.join(self.run, 'models', 'opt_latest.pt')
         fresh = True
         if os.path.exists(opt_path):
@@ -867,7 +964,7 @@ class Run:
                         bad = opt_state_mismatch(model, o['state'], params=trunk)
                         if bad:
                             raise ValueError(f'it belongs to another network ({bad})')
-                        opt = torch.optim.AdamW(trunk, lr=c['lr'], weight_decay=c['wd'])
+                        opt = torch.optim.AdamW(trunk, lr=c['lr'], weight_decay=c['wd'], **okw)
                         opt.load_state_dict(o['state'])
                         opt.add_param_group({'params': heads})
                     else:
@@ -912,7 +1009,10 @@ class Run:
             acc.update(value_view=0.0, value_decision=0.0)
         last = min(steps, 200)
         S = model.seats
-        feed = batches(W, rng, steps, c['batch'], dev, c.get('train_prefetch', 0))
+        tokens = (np.asarray(model.present_index(), np.int64), T_STEP) if static else None
+        # (a sparse window: the static training's batches travel as their non-zeros, dense on the device)
+        feed = batches(W, rng, steps, c['batch'], dev, c.get('train_prefetch', 0), tokens=tokens,
+                       coo=static and W.sparse)
         for step in range(steps):
             self.check('training')
             g_lr = lr * min(1.0, (step + 1) / c['lr_warmup_steps']) if fresh and c['lr_warmup_steps'] else lr
@@ -920,7 +1020,12 @@ class Run:
                 g['lr'] = g_lr
             idx, b = next(feed)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
-                if aw:
+                if static:
+                    o = model.forward_static(b['x'], b['n_players'], b['full'], b['ntok'], aux=bool(aw))
+                    plog, vlog, mp = o[:3]
+                    if aw:
+                        ap = o[3]
+                elif aw:
                     plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True)
                 else:
                     plog, vlog, mp = model(b['x'], b['n_players'])
@@ -1484,10 +1589,21 @@ class Run:
             sp = self.selfplay(it)
             self.log(f'iter {it} selfplay: {_fmt(sp)}')
             t1 = time.time()
-            tr = self.train(it, sp['samples'] + sp.get('remote', {}).get('samples', 0))
+            self.linger_start(it)                  # (selfplay_local_linger: self-play on while it trains)
+            try:
+                tr = self.train(it, sp['samples'] + sp.get('remote', {}).get('samples', 0))
+            except BaseException:
+                self.linger_stop(quiet=True)
+                raise
+            t2 = time.time()
+            lg = self.linger_stop()
             self.log(f'iter {it} train: {_fmt(tr)}')
-            m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': t1 - t0, 'train_s': time.time() - t1},
+            m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': t1 - t0, 'train_s': t2 - t1},
                  'resumed_seconds': 0}
+            if lg is not None:
+                m['linger'] = lg
+                self.log(f'iter {it} local linger: {lg["games"]} games in {lg["seconds"]:.1f}s while training '
+                         f'({lg["leaves"] / max(lg["seconds"], 1e-9):.0f} leaves/s; {lg["held"]} held for iter {it + 1})')
             _write_json(self.partial_path(it), dict(m, resumed_seconds=time.time() - t0))
             self.early_remote(it + 1)
             self.finish_iter(it, m, t0)
@@ -1656,6 +1772,12 @@ def resolve_config(args, saved):
             raise SystemExit(f'{k} {w!r}: a number >= 0 (an auxiliary target weight; 0 = off, docs/az.md 15)')
     if isinstance(cfg.get('resolver_cfg'), dict) and L.enabled(cfg['resolver_cfg']):
         raise SystemExit('resolver_cfg: selfplay_league: single-game runs only (not a co-training resolver)')
+    if cfg.get('selfplay_local_linger'):
+        why = ('needs selfplay_remote (the shared queue holds the games it finishes)' if not cfg.get('selfplay_remote')
+               else 'single-game runs only' if cfg.get('resolver')
+               else 'not with the self-play league (selfplay_league 0)' if L.enabled(cfg) else None)
+        if why:
+            raise SystemExit(f'selfplay_local_linger: {why}')
     return cfg
 
 

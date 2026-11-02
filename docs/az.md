@@ -114,6 +114,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `window`, `window_grow`, `min_window_samples` | 8, 1, 20000 | newest iterations trained on (1 + iter // 2 with window_grow), more until min samples |
 | `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
 | `window_cache`, `window_sparse` | 0, 0 | 1 = the window's shards stay in RAM between iterations (zero/data.py WindowCache); 1 = the window keeps each row's features as their non-zeros - the same window and batches in a fraction of the RAM for a sparse encoding, and with `window_cache` every shard cached whole also over budget, so an iteration loads only its new shards (10.8). The budget still counts dense rows |
+| `train_static` | 0 | 1 = a token network trains through its static forward (`TokenNet.forward_static`, the inference graphs': each batch one chunk of its longest row's tokens, no host sync) with a fused AdamW on CUDA, and a sparse window's batches travel as their non-zeros (dense on the device): the same batches and losses, the updates up to float32 rounding; ~2.8x a step on MTG Zero's Delver network (10.9). Another network is refused |
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
 | `eval_games`, `eval_sims`, `eval_random_games`, `eval_every` | 200, 32, 50, 1 | evaluation vs the yardstick and vs random (`eval_random_games` 0: no random match; the reference games still rate the random bot unless `ref_games` is 0) |
@@ -138,6 +139,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: those whose inference is CUDA / MPS - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
 | `selfplay_remote_linger` | 0 | 1 = the workers play on with their checkpoint between phases (while the run trains); those games count for the next iteration, one checkpoint stale (5.3) |
+| `selfplay_local_linger` | 0 | 1 = this machine's self-play plays on too while the run trains (a thread; CUDA batches on their own stream): its finished games count for the next iteration, one checkpoint stale, as the remote's linger (5.3, 10.10). Needs `selfplay_remote`; single-game runs without the league |
 | `selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` | 30, 3, 3600 | co-training (11.6): a worker backing off this many seconds gives its outstanding matches back; a match outstanding on a worker longer than this many of its expected latencies (at least 120 s; 0 = the timeout only) is requeued, and at the latest after `selfplay_remote_timeout` s of the worker's running time |
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
@@ -473,6 +475,17 @@ REFUSED the run's checkpoint ...` and plays on alone.
   at once, their samples are held) and count for iteration i+1, into whose shards their samples go:
   those rows are one checkpoint behind the iteration's (lag 1); new games start only while its held
   and outstanding games stay under its cap. The next `phase` ends the lingering at once.
+* **Local linger** (`selfplay_local_linger` 1, opt-in; 10.10): the run's own driver does the same while
+  the run trains - `Run.linger_start` after the phase (not after the last iteration, nor with STOP or
+  PAUSE there), on a thread whose network batches run on a CUDA stream of their own beside the
+  training's default one: setups queued up to the local cap as in the phase, the games in flight
+  finishing with checkpoint i-1 (the same network id: nothing restarts), the finished ones held with
+  their samples for iteration i+1's quota (which takes held games first: lag 1), never more held than
+  an iteration's quota. `Run.linger_stop` after the training (and on any exception from it) ends the
+  phase, answers its last batches and joins the thread; `linger` in the iteration's metrics row =
+  `{games, seconds, leaves, infer_s, held}` (the lingering's inference is not counted in the next
+  phase's `infer_s`), and a log line `iter i local linger: ...`. The rates and caps of the shared
+  queue measure the phases only.
 * **Arrival**: fetch threads (one per worker) copy each announced shard of the running phase under a
   temporary name (`*.tmp.npz`: never a loadable shard name), check it - **the non-finite guard**
   (4.1) and the run's game / features / actions - and rename it into `data/iter_i/` beside the
@@ -1626,6 +1639,120 @@ run):
 
 A warm window is its new shards (3.3 s: a 65k-row local shard read in place and converted on 8
 threads 1.8 s, on one 5.0 s) and the window's assembly from the cache (1.1 s).
+
+### 10.9 The static training step (run setting `train_static`; MTG Zero's Delver line, 2026-11-01)
+
+**Why.** With sparse self-play batches and a sparse window (10.7, 10.8) a Delver generation was ~183 s:
+self-play ~133 s and training ~49 s (542 steps of 512 rows, ~91 ms a step; the window 3 s). The step was
+the eager `TokenNet.forward` (10.5): the batch packed by its data (`nonzero` per segment, its rows sorted
+by token count, chunks of 64 rows each as long as its longest row: ~20 host syncs and ~1,200 kernels a
+forward of 512 rows) and its backward, then a foreach AdamW. A micro-benchmark on the line's iteration
+580 (512 held-out rows, the RTX 5090 shared with the live run; the run's own loss replaced by a simpler
+one of the same outputs):
+
+| the step | ms |
+|---|---:|
+| eager forward, foreach AdamW (the run's) | 88.5 |
+| eager forward, fused AdamW | 71.1 |
+| `forward_static` (10.6), fused AdamW | 29.2 |
+| `forward_static`, fused AdamW, bfloat16 autocast (measured only) | 20.2 |
+
+**What** (opt-in, `train_static` 0 the training of before line for line):
+
+* `Run.train_model` trains a token network through `TokenNet.forward_static` - every slot embedded, each
+  row's tokens gathered by `full`, the whole batch one chunk of its longest row's tokens (rounded up to
+  `infer.T_STEP`), no host sync - and, on CUDA, with `torch.optim.AdamW(..., fused=True)` (the same
+  update, one kernel set for all parameters; its optimizer state loads from a foreach one's and back).
+  Another network (MLP, GridNet) is refused (`SystemExit`: set train_static 0).
+* The batches carry each row's tokens (`Window.batch(..., tokens=(present_index, T_STEP))`: `full` [B, T]
+  and `ntok` [B], `infer.token_presence` / `token_index`'s, built on the prefetch thread).
+* **A sparse window's batches travel as their non-zeros** (`Window.batch(..., coo=True)`,
+  `Window.features_coo`; `data.dense_coo`): ~130k (row, column, float16 value) triples a batch of 512
+  Delver rows (~2.5 MB) instead of 77 MB of float32 rows, scattered into zeroed rows on the device - the
+  dense rows bit for bit (float16 values are exact in float32; a -0.0 is kept) - and the tokens read from
+  the non-zeros (a flag present when its value > 0.5, as on the dense rows). With the dense rows the
+  feed cost the step ~15 ms of densifying and ~10 ms of tokens on the prefetch thread and a ~10 ms
+  pageable upload on the training thread; as non-zeros a batch takes ~10 ms on the prefetch thread and
+  ~1 ms to upload (fed: 6.2-6.9 ms a batch with prefetch 2, the step no longer waits for it).
+
+**Equivalence.** `forward_static`'s outputs are `forward`'s up to float32 rounding (10.6: other matrix
+shapes, cuBLAS picks its kernels by shape). One step's loss and gradients on the toy token run: equal to
+1e-7 of each gradient's scale (`tests/test_loop.py::test_train_static_trains_the_same_network_up_to_rounding`).
+Over a training AdamW's per-parameter normalisation amplifies that rounding where a gradient is tiny: the
+toy's trained networks end within ~2% of the largest weight change (the test's bar 5%), CPU (foreach) and
+CUDA (fused) alike; with a sparse window (cached or not, prefetch on) the same network as the dense
+window's, weight for weight on the CPU. On the Delver line (one generation's training, iteration 585 from
+checkpoint 584 and its optimizer state, the same window, 542 steps, in one process): the training's
+logged losses (means of the last 200 steps)
+
+| | policy | value | margin | entropy | belief |
+|---|---:|---:|---:|---:|---:|
+| eager | 0.22216 | 0.37837 | 0.17771 | 0.22322 | 2.50654 |
+| train_static | 0.22216 | 0.37837 | 0.17770 | 0.22322 | 2.50654 |
+
+and the two networks 0.016 of the update's norm apart (update norms 0.70996 / 0.70983, distance 0.01140).
+
+**Measured** (the Delver line's training on the desktop, the GPU shared with the live run's self-play
+throughout, so absolute numbers vary with its phase; same process, same window):
+
+| the training (542 steps) | ms a step |
+|---|---:|
+| eager (the run's; its log 91-96 ms on an unshared GPU) | 113.9 |
+| train_static, the dense rows fed | 60.6 |
+| train_static, the non-zeros fed | 40.4 (32.8 in a quieter minute) |
+
+A step is now bound by the device's float32 arithmetic (~23 ms of kernels, ~1,200 of them; the matrix
+products are float32 SIMT kernels, no tensor cores): the same batches with their tokens cut to 32 (a
+timing only) take 17.8 ms, so about half of it is padding - a row has 15 tokens on average (90% at most
+20) and every row is run as long as the batch's longest (64-80). Not done here: bucketing a batch's rows
+by token count (two static chunks), bfloat16 (19.4 ms; a numerics change: its own decision), the step as
+one CUDA graph, the non-finite guard's per-step sync made asynchronous.
+
+Tests: `tests/test_loop.py::test_train_static_trains_the_same_network_up_to_rounding` (above; a step's
+gradients, the trained network CPU and CUDA, sparse windows cached or not with prefetch, the batches'
+tokens against `infer`'s, the COO batch against the dense one bit for bit, an MLP refused) and
+`test_window_cache_trains_the_same_network` (the default path, unchanged).
+
+### 10.10 Local linger: this machine's self-play while the run trains (run setting `selfplay_local_linger`; MTG Zero's Delver line, 2026-11-01)
+
+**Why.** With a remote (5.3), the remote's workers play on while the run trains (`selfplay_remote_linger`)
+but this machine's driver stopped for the whole training: on the Delver line the desktop makes ~75% of a
+generation's games (~9 a second) and idled ~49 s a generation (~19 s with `train_static`).
+
+**What** (opt-in, `selfplay_local_linger` 0 the loop of before; 5.3's "Local linger" has the protocol):
+after the phase, `Run.linger_start` resumes the rolling driver with the same network id (the searches in
+flight go on with checkpoint i-1, nothing restarts) on a thread and keeps queueing setups up to the local
+cap; the finished games wait, with their samples, for the next iteration's quota, which takes them first
+(lag 1, as a remote's lingering games). `Run.linger_stop` after the training ends the phase, answers the
+last batches and joins. Needs `selfplay_remote` (the shared queue keeps the held games and the quota) and
+a single-game run without the league (refused otherwise, at the start).
+
+**Two CUDA consequences.** The thread's network batches run on a CUDA stream of its own (`torch.cuda.Stream()`,
+non-blocking with the legacy default stream the training uses): the inference kernels interleave with the
+training's instead of queueing behind a whole step. And **a CUDA graph capture is thread-local now**
+(`infer.CAPTURE_MODE = 'thread_local'`, both graph runners): torch's default ('global') fails any other
+thread's sync or allocation while a stream captures. Measured (`capture_stress.py`, the line's network:
+one thread trains with the static step - a sync and allocator churn every step - while another evaluates
+52 new (rows, tokens) shapes through the graphs on its own stream): 'global' failed at once (the training
+thread `cudaErrorStreamCaptureUnsupported`, the capture `cudaErrorStreamCaptureInvalidated`);
+'thread_local' three times clean (245-286 training steps alongside, every answer within 9.8e-7 of the
+eager forward). One thread: the same as 'global'.
+
+**Evaluators on other threads.** `infer_workers` > 1 evaluates on worker threads whose current stream is
+the default one: correct, but queued behind the training's kernels.
+
+**On the Delver line** (a 3-iteration GPU smoke forked from r3-2b-late550 at 589: 400 games an iteration,
+384 in flight, `train_static` 1, the desktop alone - MTG Zero's 'local' remote refuses an unpinned
+checkout -, the GPU shared with the live run): 80 and 57 games during trainings of 31.3 s (the cold window)
+and 12.9 s, at 18.4k / 31.4k leaves/s against ~38k in the phases; none after the last iteration; quotas
+exact. The training beside it took 68-78 ms a step against 50 ms alone (the GPU shared three ways). The
+desktop's samples one checkpoint behind: 67% and 54% (+6% two behind) at this small quota (400 games with
+384 in flight: most games span phases); the live line without the setting (1,600 games, 768 in flight):
+~35% one behind, from the games in flight carried over.
+
+Tests: `tests/test_remoteplay.py::test_local_linger_plays_while_the_run_trains` (a toy run with the
+remote 'local': linger games every iteration but the last, quotas exact, the held games' samples lag 1
+in the next iteration, refused without a remote) and the remote linger's test (unchanged).
 
 ## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
 

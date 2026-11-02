@@ -72,6 +72,11 @@ import torch
 from .protocol import MAX_SEATS, belief_rows
 
 ROW_STEP = 64                    # CUDA graphs are captured for batch sizes padded to this step
+# A capture checks only its own thread's CUDA calls ('thread_local'; torch's default 'global' fails any
+# other thread's sync or allocation while it captures - and the capture with it): a run's local linger
+# (run setting selfplay_local_linger, docs/az.md 5.3) captures a new batch shape on its thread while the
+# run trains on another. One thread: the same as 'global'
+CAPTURE_MODE = 'thread_local'
 
 
 def segment_softmax_np(logits, off):
@@ -157,7 +162,7 @@ class GraphRunner:
                     self._run(x, n)
             torch.cuda.current_stream().wait_stream(side)
             graph = torch.cuda.CUDAGraph()
-            with torch.no_grad(), torch.cuda.graph(graph, pool=self.pool):
+            with torch.no_grad(), torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
                 out = self._run(x, n)
             g = self.graphs[Bp] = (graph, x, n, out)
         return g
@@ -372,7 +377,7 @@ class TokenGraphRunner:
                         self._run(x, n, full, ntok)
                 torch.cuda.current_stream().wait_stream(side)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=self.pool):
+                with torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
                     out, aux = self._run(x, n, full, ntok)
             g = self.graphs[(Bp, Tp)] = (graph, x, n, full, ntok, out, aux)
             self.captures += 1
