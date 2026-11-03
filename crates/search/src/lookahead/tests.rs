@@ -268,6 +268,8 @@ fn driver_cfg(seats: Vec<SeatCfg>, games: usize, threads: usize) -> DriverCfg {
         aux: false,
         paired: false,
         sparse: false,
+        branch: None,
+        starts: None,
     }
 }
 

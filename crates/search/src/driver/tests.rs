@@ -31,6 +31,8 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         aux: false,
         paired: false,
         sparse: false,
+        branch: None,
+        starts: None,
     }
 }
 
@@ -2333,4 +2335,208 @@ fn gumbel_with_a_root_belief() {
     let (_, s0, rows0, _) = mk(1, 1, 0.0);
     assert_eq!(rows0, (0, 0));
     assert_ne!(records_digest(&s0), records_digest(&s1), "the belief changed nothing in the Gumbel searches");
+}
+
+// ------------------------------------------------------------------- branched games, archive starts
+
+/// A self-play seat whose every search is full (no playout cap): each searched decision that is not a
+/// deviation is recorded.
+fn nn_full(sims: u32) -> SeatCfg {
+    let mut s = NnSeat::eval(0, sims);
+    s.selfplay = true;
+    s.temp_moves = 6;
+    SeatCfg::Nn(s)
+}
+
+/// Every result row with its own samples (a game's samples follow its predecessors' in emission
+/// order), sorted by (gid, branch or not).
+fn run_split<G: SearchGame>(d: &mut Driver<G>, skewed: bool) -> Vec<(GameResult, Vec<Record>)> {
+    fn take<G: SearchGame>(d: &mut Driver<G>, rows: &mut Vec<(GameResult, Vec<Record>)>) {
+        let rs = d.take_results();
+        let smp = d.take_samples();
+        let mut a = 0;
+        for r in rs {
+            let k = r.samples as usize;
+            rows.push((r, smp[a..a + k].to_vec()));
+            a += k;
+        }
+        assert_eq!(a, smp.len(), "every sample belongs to a row taken with it");
+    }
+    let mut rows = Vec::new();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        if skewed {
+            answer_skewed(d, &b);
+        } else {
+            answer(d, &b);
+        }
+        take(d, &mut rows);
+    }
+    take(d, &mut rows);
+    rows.sort_by_key(|(r, _)| (r.gid, r.branch.is_some()));
+    rows
+}
+
+fn branch_cfg(games: usize, p: f64) -> DriverCfg {
+    let mut c = cfg(vec![nn_full(12)], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
+    c.seed = 31;
+    c.branch = Some(BranchCfg { p, moves: 3, temp: 2.0 });
+    c
+}
+
+#[test]
+fn branched_games_leave_their_games_alone_and_record_their_own_outcome() {
+    let on = run_split(&mut Driver::<ToyGame>::new(branch_cfg(40, 0.5)).unwrap(), true);
+    let mut c = branch_cfg(40, 0.5);
+    c.branch = None;
+    let off = run_split(&mut Driver::<ToyGame>::new(c).unwrap(), true);
+    assert_eq!(off.len(), 40);
+    // the games themselves: move for move and record for record the games without branching
+    let main: Vec<_> = on.iter().filter(|(r, _)| r.branch.is_none()).collect();
+    assert_eq!(main.len(), 40);
+    for ((r, s), (r0, s0)) in main.iter().zip(&off) {
+        assert_eq!((r.gid, r.steps, &r.scores, r.decisions, r.samples), (r0.gid, r0.steps, &r0.scores, r0.decisions, r0.samples));
+        assert_eq!(records_digest(s), records_digest(s0), "game {}: its records changed", r.gid);
+    }
+    let br: Vec<_> = on.iter().filter(|(r, _)| r.branch.is_some()).collect();
+    assert!((10..=30).contains(&br.len()), "{} branches of 40 games at p 0.5", br.len());
+    let mut gids: Vec<u32> = br.iter().map(|(r, _)| r.gid).collect();
+    gids.dedup();
+    assert_eq!(gids.len(), br.len(), "one branch a game at most");
+    let mut moves = [0u32; 4];
+    for (r, s) in &br {
+        let b = r.branch.as_ref().unwrap();
+        let parent = &off[r.gid as usize].0;
+        assert!((1..=3).contains(&b.moves) && b.played <= b.moves && b.at < b.of, "{b:?}");
+        assert!(b.decision < parent.decisions && b.step < parent.steps, "{b:?} in a game of {} decisions", parent.decisions);
+        assert!(r.over && b.start.is_none());
+        moves[b.moves as usize] += 1;
+        // nothing recorded at or before the deviation moves: with every search full, the records are
+        // exactly the branch's searched decisions after them
+        assert_eq!(r.samples, r.decisions - b.decision - b.played, "{b:?}");
+        assert_eq!(s.len(), r.samples as usize);
+        for x in s.iter() {
+            // the branch's own outcome, relative to each record's decider
+            for j in 0..2 {
+                assert_eq!(x.z[j], r.result[(x.player as usize + j) % 2]);
+            }
+        }
+    }
+    assert!(moves[1] > 0 && moves[2] > 0 && moves[3] > 0, "deviation moves 1..=3 all drawn: {moves:?}");
+    // the branches play games of their own (another score or length than their game's somewhere)
+    assert!(br.iter().any(|(r, _)| r.scores != off[r.gid as usize].0.scores || r.steps != off[r.gid as usize].0.steps));
+    let mut d = Driver::<ToyGame>::new(branch_cfg(40, 0.5)).unwrap();
+    let again = run_split(&mut d, true);
+    let st = d.stats();
+    assert_eq!(st.branches as usize, br.len());
+    assert_eq!(st.dev_moves, br.iter().map(|(r, _)| r.branch.as_ref().unwrap().played as u64).sum::<u64>());
+    // reproducible from the seed
+    let key = |v: &Vec<(GameResult, Vec<Record>)>| v.iter().map(|(r, s)| (r.gid, r.steps, r.scores.clone(), r.branch.clone(), records_digest(s))).collect::<Vec<_>>();
+    assert_eq!(key(&on), key(&again));
+}
+
+#[test]
+fn branches_count_in_rolling_quotas_and_survive_the_phases() {
+    let mut c = branch_cfg(1, 0.4);
+    c.rolling = true;
+    c.concurrency = 10;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let mut rows = Vec::new();
+    for phase in 0..5u32 {
+        d.resume(12, phase).unwrap();
+        let mut fin = 0;
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer(&mut d, &b);
+            let r = d.take_results();
+            fin += r.len();
+            rows.extend(r);
+            d.take_samples();
+        }
+        let r = d.take_results();
+        fin += r.len();
+        rows.extend(r);
+        assert!(fin >= 12, "phase {phase}: {fin} games (branches count)");
+    }
+    let nb = rows.iter().filter(|r| r.branch.is_some()).count();
+    assert!(nb > 0);
+    // a branch's row comes after its game's
+    for (i, r) in rows.iter().enumerate().filter(|(_, r)| r.branch.is_some()) {
+        assert!(rows[..i].iter().any(|q| q.gid == r.gid && q.branch.is_none()), "branch of game {} before its game", r.gid);
+    }
+    let st = d.stats();
+    assert_eq!(st.games_finished as usize, rows.len());
+    assert!(st.branches as usize >= nb && st.branches as usize <= nb + 10, "branches started {} finished {nb}", st.branches);
+}
+
+#[test]
+fn archive_starts_play_their_entries_specs() {
+    let entries = vec![("rich".to_string(), r#"{"food": [30, 30]}"#.to_string()), ("poor".to_string(), r#"{"food": [0, 9]}"#.to_string())];
+    let mk = |spec: &str, starts: Option<StartsCfg>| {
+        let mut c = cfg(vec![nn_full(8)], vec![vec![0, 0]; 30], &[("m", KeyKind::Nn)]);
+        c.spec = spec.into();
+        c.starts = starts;
+        let mut d = Driver::<ToyGame>::new(c).unwrap();
+        let r = run_split(&mut d, false);
+        (r, d.stats())
+    };
+    let (on, st) = mk("{}", Some(StartsCfg { p: 0.5, specs: entries.clone() }));
+    let (plain, _) = mk("{}", None);
+    let (rich, _) = mk(&entries[0].1, None);
+    let (poor, _) = mk(&entries[1].1, None);
+    let n = on.iter().filter(|(r, _)| r.start.is_some()).count();
+    assert!((7..=23).contains(&n), "{n} archive starts of 30 at p 0.5");
+    assert_eq!(st.starts as usize, n);
+    assert!(on.iter().any(|(r, _)| r.start == Some(0)) && on.iter().any(|(r, _)| r.start == Some(1)));
+    // game g started from entry j is game g of a driver whose spec is entry j's (the same streams);
+    // the others are the driver's own games
+    for (r, s) in &on {
+        let refr = match r.start {
+            None => &plain,
+            Some(0) => &rich,
+            Some(_) => &poor,
+        };
+        let (r0, s0) = &refr[r.gid as usize];
+        assert_eq!((r.steps, &r.scores, r.samples), (r0.steps, &r0.scores, r0.samples), "game {} start {:?}", r.gid, r.start);
+        assert_eq!(records_digest(s), records_digest(s0));
+    }
+}
+
+#[test]
+fn a_branch_of_an_archive_start_names_its_entry() {
+    let mut c = branch_cfg(30, 1.0);
+    c.starts = Some(StartsCfg { p: 1.0, specs: vec![("e".into(), r#"{"food": [5, 5]}"#.into())] });
+    let rows = run_split(&mut Driver::<ToyGame>::new(c).unwrap(), false);
+    assert!(rows.iter().filter(|(r, _)| r.branch.is_none()).all(|(r, _)| r.start == Some(0)));
+    let br: Vec<_> = rows.iter().filter_map(|(r, _)| r.branch.as_ref().map(|b| (r, b))).collect();
+    assert!(br.len() >= 25, "every game branches at p 1 ({} of 30)", br.len());
+    assert!(br.iter().all(|(r, b)| r.start.is_none() && b.start == Some(0)));
+}
+
+#[test]
+fn branch_and_starts_settings_are_checked() {
+    let bad_branch = |b: BranchCfg| {
+        let mut c = branch_cfg(2, 0.5);
+        c.branch = Some(b);
+        Driver::<ToyGame>::new(c).err().unwrap_or_default()
+    };
+    assert!(bad_branch(BranchCfg { p: 0.0, moves: 3, temp: 2.0 }).contains("branch p"));
+    assert!(bad_branch(BranchCfg { p: 1.5, moves: 3, temp: 2.0 }).contains("branch p"));
+    assert!(bad_branch(BranchCfg { p: 0.5, moves: 0, temp: 2.0 }).contains("moves 0"));
+    assert!(bad_branch(BranchCfg { p: 0.5, moves: 2, temp: 0.0 }).contains("temp"));
+    // only drivers that record a self-play seat branch or start from an archive
+    let mut c = branch_cfg(2, 0.5);
+    c.record = false;
+    assert!(Driver::<ToyGame>::new(c).err().unwrap_or_default().contains("never branches"));
+    let mut c = cfg(vec![nn(0, 8, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.branch = Some(BranchCfg { p: 0.5, moves: 3, temp: 2.0 });
+    assert!(Driver::<ToyGame>::new(c).is_err());
+    let bad_starts = |s: StartsCfg| {
+        let mut c = cfg(vec![nn_full(8)], vec![vec![0, 0]; 2], &[("m", KeyKind::Nn)]);
+        c.starts = Some(s);
+        Driver::<ToyGame>::new(c).err().unwrap_or_default()
+    };
+    assert!(bad_starts(StartsCfg { p: 0.5, specs: vec![] }).contains("no entries"));
+    assert!(bad_starts(StartsCfg { p: 0.0, specs: vec![("a".into(), "{}".into())] }).contains("starts p"));
+    assert!(bad_starts(StartsCfg { p: 0.5, specs: vec![("a".into(), r#"{"nope": 1}"#.into())] }).contains("entry \"a\""));
+    // an entry the game refuses to start is refused when the driver is made
+    assert!(bad_starts(StartsCfg { p: 0.5, specs: vec![("three".into(), r#"{"food": [1, 1, 1]}"#.into())] }).contains("does not start"));
 }

@@ -20,7 +20,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, BranchCfg, DriverCfg, KeyKind, StartsCfg, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
 use zero_search::lookahead::{LookCfg, Outcome};
 use zero_search::{SearchGame, MAX_SEATS};
@@ -160,6 +160,41 @@ fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> 
             Ok((keys.len() - 1) as u16)
         }
     }
+}
+
+/// `branch` dict {p, moves, temp} (docs/search.md 2.11; another key is an error).
+fn parse_branch(d: &Bound<'_, PyDict>) -> PyResult<BranchCfg> {
+    for k in d.keys() {
+        let k: String = k.extract()?;
+        if !["p", "moves", "temp"].contains(&k.as_str()) {
+            return Err(PyValueError::new_err(format!("branch: unknown key {k:?} (p, moves, temp)")));
+        }
+    }
+    let p: f64 = d.get_item("p")?.ok_or_else(|| PyValueError::new_err("branch: p (the share of games that branch) is required"))?.extract()?;
+    let b = BranchCfg { p, moves: get(d, "moves", 3u32)?, temp: get(d, "temp", 2.0f64)? };
+    b.check().map_err(PyValueError::new_err)?;
+    Ok(b)
+}
+
+/// `starts` dict {p, specs: [(id, spec JSON or dict), ...]} (docs/search.md 2.11).
+fn parse_starts(d: &Bound<'_, PyDict>) -> PyResult<StartsCfg> {
+    for k in d.keys() {
+        let k: String = k.extract()?;
+        if !["p", "specs"].contains(&k.as_str()) {
+            return Err(PyValueError::new_err(format!("starts: unknown key {k:?} (p, specs)")));
+        }
+    }
+    let p: f64 = d.get_item("p")?.ok_or_else(|| PyValueError::new_err("starts: p (the share of games started from the archive) is required"))?.extract()?;
+    let list = d.get_item("specs")?.ok_or_else(|| PyValueError::new_err("starts: specs ([(id, spec), ...]) is required"))?;
+    let mut specs = Vec::new();
+    for e in list.try_iter()? {
+        let e = e?;
+        let (id, sp): (String, Bound<'_, PyAny>) = e.extract().map_err(|_| PyValueError::new_err("starts: each entry is (id, spec)"))?;
+        specs.push((id, spec_json(Some(&sp))?));
+    }
+    let c = StartsCfg { p, specs };
+    c.check().map_err(PyValueError::new_err)?;
+    Ok(c)
 }
 
 /// Seat dict: {'bot': name} | {'external': key} | network seat settings (SEAT_KEYS).
@@ -656,7 +691,8 @@ impl PySearchTree {
 /// the game's auxiliary targets with the samples (`take_samples()['aux']`, docs/search.md 1.2);
 /// `paired`: games 2k and 2k + 1 share every random stream (the deal), `DriverCfg::paired`;
 /// `sparse`: network batches carry each row's non-zero features (`xs_off`, `xs_idx`, `xs_val`,
-/// `n_features`) instead of `x` (`DriverCfg::sparse`, docs/search.md 2.2).
+/// `n_features`) instead of `x` (`DriverCfg::sparse`, docs/search.md 2.2); `branch` {p, moves, temp}:
+/// branched games, `starts` {p, specs}: archive starts (docs/search.md 2.11; None: off).
 #[pyclass(name = "SearchDriver")]
 pub struct PySearchDriver {
     d: Box<dyn DynDriver>,
@@ -666,9 +702,9 @@ pub struct PySearchDriver {
 #[pymethods]
 impl PySearchDriver {
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool) -> PyResult<Self> {
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         let spec = spec_json(spec)?;
         let mut keys = Vec::new();
         let mut table: Vec<SeatCfg> = Vec::new();
@@ -689,7 +725,9 @@ impl PySearchDriver {
             }
             games.push(ix);
         }
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse };
+        let branch = branch.map(parse_branch).transpose()?;
+        let starts = starts.map(parse_starts).transpose()?;
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
         Ok(PySearchDriver { d, nfeat })
@@ -801,6 +839,24 @@ impl PySearchDriver {
                 // DriverCfg::move_log (a diagnostic): [(seat, action, legal actions)]
                 d.set_item("moves", r.moves)?;
             }
+            if let Some(b) = &r.branch {
+                // a branch game (DriverCfg::branch, docs/search.md 2.11)
+                let bd = PyDict::new(py);
+                bd.set_item("at", b.at)?;
+                bd.set_item("of", b.of)?;
+                bd.set_item("decision", b.decision)?;
+                bd.set_item("step", b.step)?;
+                bd.set_item("action", b.action)?;
+                bd.set_item("moves", b.moves)?;
+                bd.set_item("played", b.played)?;
+                bd.set_item("same_first", b.same_first)?;
+                bd.set_item("start", b.start)?;
+                d.set_item("branch", bd)?;
+            }
+            if let Some(j) = r.start {
+                // a game started from an archive entry (DriverCfg::starts)
+                d.set_item("start", j)?;
+            }
             out.append(d)?;
         }
         Ok(out)
@@ -871,6 +927,9 @@ impl PySearchDriver {
         d.set_item("step_max_s", s.step_max_s)?;
         d.set_item("step_max_gid", s.step_max_gid)?;
         d.set_item("slow_steps", s.slow_steps)?;
+        d.set_item("branches", s.branches)?;
+        d.set_item("dev_moves", s.dev_moves)?;
+        d.set_item("starts", s.starts)?;
         if s.look.decisions > 0 {
             // the lookahead seats' counters (docs/search.md 3.9; only a driver with lookahead decisions)
             let l = &s.look;

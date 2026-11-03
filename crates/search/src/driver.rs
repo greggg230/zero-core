@@ -400,6 +400,95 @@ impl NnSeat {
 /// The default belief clip R (`NnSeat::belief_clip`).
 pub const BELIEF_CLIP: f64 = 20.0;
 
+/// Branched games (docs/search.md 2.11, KataGo's side games; `DriverCfg::branch`): a share `p` of the
+/// games a self-play driver starts (never a branch itself) each spawn one **branch game** from a copy
+/// of their state at a uniformly drawn decision of theirs - a recording self-play network seat's
+/// searched decision with at least two options that is not minor (`SearchGame::minor_decision`), the
+/// draw a reservoir sample over the game's such decisions from the game's own branch stream. When the
+/// game ends, its slot plays the branch: its first `1..=moves` (uniform) non-minor network decisions
+/// are **deviation moves**, sampled from the network's priors (the root's evaluation alone, one
+/// simulation, no noise) at temperature `temp` and recorded nowhere; then normal self-play to the
+/// end, its records' z the branch's own outcome. The game itself plays and records exactly as without
+/// it (its streams untouched); the branch's records start after its deviation moves, so no state of
+/// the game before the branch point is recorded twice. A branch is a finished game of its own (its
+/// result row, counted by rolling quotas) with the game's gid and `GameResult::branch`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BranchCfg {
+    /// The share of games that spawn a branch, in (0, 1].
+    pub p: f64,
+    /// A branch's deviation moves: uniform in 1..=moves (>= 1).
+    pub moves: u32,
+    /// The deviation moves' temperature on the network's priors (P0^(1/temp), > 0).
+    pub temp: f64,
+}
+
+impl BranchCfg {
+    /// The settings' check (`Driver::new`; the bindings' messages).
+    pub fn check(&self) -> Result<(), String> {
+        if !(self.p.is_finite() && self.p > 0.0 && self.p <= 1.0) {
+            return Err(format!("branch p {}: a share in (0, 1] of the games (no branching: no branch setting)", self.p));
+        }
+        if self.moves == 0 {
+            return Err("branch moves 0: at least 1 deviation move (a branch that never deviates is a replay)".into());
+        }
+        if !(self.temp.is_finite() && self.temp > 0.0) {
+            return Err(format!("branch temp {}: a temperature > 0", self.temp));
+        }
+        Ok(())
+    }
+}
+
+/// Archive starts (docs/search.md 2.11; `DriverCfg::starts`): a share `p` of the games a driver starts
+/// (never a branch) begin from an archived position instead - the spec of an entry drawn uniformly
+/// (`specs`: (id, spec JSON) - a game's own way to start from a position, e.g. MTG Zero's `start`
+/// block), from the game's own start stream; the game's seed is drawn as for any other game (the
+/// spec decides what it seeds). Every entry is parsed and started once when the driver is made (an
+/// entry the game refuses is an error then). It replaces the spec the game would start with (the
+/// driver's, or its queued setup's: a self-play driver's setups are its spec). `GameResult::start`
+/// is the entry's index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StartsCfg {
+    /// The share of games that start from an archive entry, in (0, 1].
+    pub p: f64,
+    pub specs: Vec<(String, String)>,
+}
+
+impl StartsCfg {
+    pub fn check(&self) -> Result<(), String> {
+        if !(self.p.is_finite() && self.p > 0.0 && self.p <= 1.0) {
+            return Err(format!("starts p {}: a share in (0, 1] of the games (no archive: no starts setting)", self.p));
+        }
+        if self.specs.is_empty() {
+            return Err("starts: no entries (an archive that starts nothing is refused)".into());
+        }
+        Ok(())
+    }
+}
+
+/// A branch game's origin (`GameResult::branch`, docs/search.md 2.11).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BranchInfo {
+    /// The branch point: its index among the game's eligible decisions (`BranchCfg`) and their count,
+    /// the game's searched decisions and real moves before it, the game's own move there.
+    pub at: u32,
+    pub of: u32,
+    pub decision: u32,
+    pub step: u64,
+    pub action: u16,
+    /// The deviation moves drawn and played (fewer if the branch ended first), and whether the first
+    /// of them was the game's own move at the branch point.
+    pub moves: u32,
+    pub played: u32,
+    pub same_first: bool,
+    /// The archive entry the game started from (`StartsCfg`), if any.
+    pub start: Option<u32>,
+}
+
+/// The branch stream's and the start stream's salts (docs/search.md 2.11): their own streams from
+/// (driver seed, the game's stream id), never a draw from the game's other streams.
+const BRANCH_SALT: u64 = 0x6272_616e_6368_2d31;
+const START_SALT: u64 = 0x7374_6172_7473_2d31;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SeatCfg {
     /// A built-in bot by name (`random`, or one of the game's `bot_names`).
@@ -458,6 +547,11 @@ pub struct DriverCfg {
     /// lookahead's big batches (docs/search.md 3.9). The same features, the same games. Off (the
     /// default): dense rows (nothing changes).
     pub sparse: bool,
+    /// Branched games (docs/search.md 2.11, `BranchCfg`): self-play drivers that record only. None
+    /// (the default): nothing changes.
+    pub branch: Option<BranchCfg>,
+    /// Archive starts (docs/search.md 2.11, `StartsCfg`). None (the default): nothing changes.
+    pub starts: Option<StartsCfg>,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -481,6 +575,10 @@ pub struct GameResult {
     /// `DriverCfg::move_log`: the game's first real moves (seat, action, legal
     /// actions), the external seats' answers excluded; empty when off.
     pub moves: Vec<(u8, u16, Vec<u16>)>,
+    /// A branch game (`DriverCfg::branch`): its branch point and deviation moves; None otherwise.
+    pub branch: Option<BranchInfo>,
+    /// A game started from an archive entry (`DriverCfg::starts`): the entry's index; None otherwise.
+    pub start: Option<u32>,
 }
 
 /// One recorded root decision with its targets.
@@ -727,6 +825,30 @@ struct Parked<G: SearchGame> {
     payload: String,
     /// Memory held by the records (`DriverStats::parked_bytes`).
     bytes: u64,
+    /// The archive entry the game started from (`GameResult::start`).
+    start: Option<u32>,
+}
+
+/// A game's branching (docs/search.md 2.11; `DriverCfg::branch`): a game that drew a branch keeps a
+/// copy of its state at the reservoir's current pick of its eligible decisions.
+struct Fork<G: SearchGame> {
+    /// Its own stream, from (driver seed, the game's stream id): the spawn draw, one draw per eligible
+    /// decision, the branch's moves and streams.
+    rng: Rng,
+    /// Eligible decisions so far.
+    seen: u32,
+    point: Option<ForkPoint<G>>,
+}
+
+/// The branch point: the game's state at the decision (before its move), its searched decisions,
+/// real moves and move log before it, the index among its eligible decisions, the move it played.
+struct ForkPoint<G: SearchGame> {
+    game: G,
+    decisions: u32,
+    steps: u64,
+    moves: Vec<(u8, u16, Vec<u16>)>,
+    at: u32,
+    action: u16,
 }
 
 enum Eval {
@@ -802,6 +924,16 @@ struct Slot<G: SearchGame> {
     /// The guarded player (`LookCfg::guard`): the lookahead's mean per root option and the margin, for
     /// the MCTS search's decision of the same decision.
     look_guard: Option<(Vec<(u16, f64)>, f64)>,
+    /// Branching (docs/search.md 2.11): a game that drew a branch (None: it did not, the driver does
+    /// not branch, or it is a branch).
+    fork: Option<Box<Fork<G>>>,
+    /// A branch game's origin (None: not a branch), its deviation moves left, and whether the
+    /// current search is one's (a root evaluation for its priors).
+    branch: Option<BranchInfo>,
+    dev_left: u32,
+    dev_now: bool,
+    /// The archive entry the game started from (`DriverCfg::starts`).
+    start_ix: Option<u32>,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -842,6 +974,11 @@ impl<G: SearchGame> Slot<G> {
             look: None,
             look_mcts: false,
             look_guard: None,
+            fork: None,
+            branch: None,
+            dev_left: 0,
+            dev_now: false,
+            start_ix: None,
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -957,6 +1094,11 @@ struct Counters {
     slow_steps: AtomicU64,
     /// The lookahead seats' decisions and their counters (docs/search.md 3.9; `LookTotals`).
     look: Mutex<LookTotals>,
+    /// Branching and archive starts (docs/search.md 2.11): branch games started, deviation moves
+    /// played, games started from an archive entry.
+    branches: AtomicU64,
+    dev_moves: AtomicU64,
+    starts: AtomicU64,
 }
 
 /// The lookahead seats' counters summed over their decisions (`DriverStats::look`, docs/search.md
@@ -1028,6 +1170,8 @@ pub const SLOW_STEP_NS: u64 = 10_000_000_000;
 struct Shared<G: SearchGame> {
     cfg: DriverCfg,
     spec: G::Spec,
+    /// The archive entries' parsed specs (`DriverCfg::starts`; empty without).
+    starts: Vec<G::Spec>,
     groups: Vec<Group<G>>,
     queue: Mutex<VecDeque<(u32, u32)>>,
     queue_cv: Condvar,
@@ -1115,6 +1259,11 @@ pub struct DriverStats {
     pub slow_steps: u64,
     /// The lookahead seats' counters (docs/search.md 3.9; all 0 without one).
     pub look: LookTotals,
+    /// Branch games started, their deviation moves played, games started from an archive entry
+    /// (docs/search.md 2.11; all 0 without).
+    pub branches: u64,
+    pub dev_moves: u64,
+    pub starts: u64,
 }
 
 /// The games in progress.
@@ -1236,6 +1385,30 @@ impl<G: SearchGame> Driver<G> {
         if cfg.aux && G::aux_width() == 0 {
             return Err(format!("aux: {} has no auxiliary targets (SearchGame::AUX)", G::NAME));
         }
+        // branched games and archive starts (docs/search.md 2.11): self-play drivers that record; a
+        // setting that does nothing is an error, never a silent no-op
+        let selfplay_seat = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if n.selfplay && n.record));
+        if let Some(b) = &cfg.branch {
+            b.check()?;
+            if !cfg.record || !selfplay_seat {
+                return Err("branch: a driver that records no self-play seat never branches (an evaluation, a match)".into());
+            }
+        }
+        let mut starts = Vec::new();
+        if let Some(sc) = &cfg.starts {
+            sc.check()?;
+            if !cfg.record || !selfplay_seat {
+                return Err("starts: a driver that records no self-play seat starts no archive games (an evaluation, a match)".into());
+            }
+            let n = cfg.games.first().map_or(2, |g| g.len());
+            for (id, js) in &sc.specs {
+                let s = G::parse_spec(js).map_err(|e| format!("starts: entry {id:?}: {e}"))?;
+                // (each entry started once: one the game refuses - an action its replay does not offer -
+                // fails here, never in the middle of a run)
+                G::new_game(&s, n, 0).map_err(|e| format!("starts: entry {id:?} does not start: {e}"))?;
+                starts.push(s);
+            }
+        }
         let conc = if cfg.rolling { cfg.concurrency.max(1) } else { cfg.concurrency.max(1).min(cfg.games.len().max(1)) };
         let groups = cfg.groups.max(1).min(conc);
         let threads = cfg.threads.max(1);
@@ -1267,6 +1440,7 @@ impl<G: SearchGame> Driver<G> {
         let sh = Arc::new(Shared {
             cfg,
             spec,
+            starts,
             groups: gv,
             queue: Mutex::new(VecDeque::new()),
             queue_cv: Condvar::new(),
@@ -1665,7 +1839,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new() };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
@@ -1744,6 +1918,9 @@ impl<G: SearchGame> Driver<G> {
             step_max_gid: c.step_max_gid.load(Ordering::Relaxed),
             slow_steps: c.slow_steps.load(Ordering::Relaxed),
             look: lock(&c.look).clone(),
+            branches: c.branches.load(Ordering::Relaxed),
+            dev_moves: c.dev_moves.load(Ordering::Relaxed),
+            starts: c.starts.load(Ordering::Relaxed),
         }
     }
 

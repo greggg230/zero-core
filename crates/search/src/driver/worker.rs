@@ -95,6 +95,10 @@ struct Tally {
     view_rows: u64,
     view_recorded: u64,
     belief_rows: u64,
+    /// Branching and archive starts (docs/search.md 2.11).
+    branches: u64,
+    dev_moves: u64,
+    starts: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -116,7 +120,7 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
         // names the game to replay and the chunk's lock is never poisoned
         let r = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
             if let Some(gid) = slot.start.take() {
-                init_slot(sh, slot, gid)?;
+                init_slot(sh, slot, gid, &mut n)?;
                 slot.epoch = epoch;
                 slot.net = net;
             }
@@ -206,6 +210,11 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     if n.belief_rows > 0 {
         k.belief_rows.fetch_add(n.belief_rows, Ordering::Relaxed);
     }
+    if n.branches > 0 || n.dev_moves > 0 || n.starts > 0 {
+        k.branches.fetch_add(n.branches, Ordering::Relaxed);
+        k.dev_moves.fetch_add(n.dev_moves, Ordering::Relaxed);
+        k.starts.fetch_add(n.starts, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -272,8 +281,12 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: search target set for a non-network seat")?;
         let mut t = slot.spare.pop().unwrap_or_default();
         t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
+        if slot.dev_now {
+            slot.target = Some(1);                 // (the deviation's root evaluation again)
+        }
         t.set_root_min(root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap()));
-        if let RootSearch::Gumbel { m, c_visit, c_scale, .. } = seat.root_search {
+        // (a branch's deviation search is the root's evaluation alone: no Gumbel schedule)
+        if let (RootSearch::Gumbel { m, c_visit, c_scale, .. }, false) = (seat.root_search, slot.dev_now) {
             // the decision's Gumbel search again, its noise kept (as its playout-cap draw)
             t.set_gumbel(m, slot.target.unwrap(), &slot.gnoise, c_visit, c_scale);
         }
@@ -285,11 +298,34 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
 /// Start game `gid` in `slot` (with the spec of its queued setup, if any): every random
 /// stream derives from (driver seed, gid) - with `DriverCfg::paired`, from (driver seed, gid / 2):
 /// the two games of a pair share them.
-fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32) -> Result<(), String> {
+fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &mut Tally) -> Result<(), String> {
     let cfg = &sh.cfg;
     let setup = slot.setup.take();
-    let spec = setup.as_ref().map_or(&sh.spec, |s| &s.spec);
+    let mut spec = setup.as_ref().map_or(&sh.spec, |s| &s.spec);
     let stream = if cfg.paired { gid / 2 } else { gid };
+    // archive starts (docs/search.md 2.11): the game's own start stream, never `base`
+    slot.start_ix = None;
+    if let Some(sc) = &cfg.starts {
+        let mut r = Rng::new(split64(cfg.seed ^ split64(stream as u64 + 1) ^ START_SALT));
+        if r.unit() < sc.p {
+            let j = r.below(sh.starts.len() as u32) as usize;
+            spec = &sh.starts[j];
+            slot.start_ix = Some(j as u32);
+            n_.starts += 1;
+        }
+    }
+    // branched games (docs/search.md 2.11): the game's own branch stream, never `base`; only a game
+    // that draws a branch keeps one
+    slot.fork = None;
+    slot.branch = None;
+    slot.dev_left = 0;
+    slot.dev_now = false;
+    if let Some(bc) = &cfg.branch {
+        let mut r = Rng::new(split64(cfg.seed ^ split64(stream as u64 + 1) ^ BRANCH_SALT));
+        if r.unit() < bc.p {
+            slot.fork = Some(Box::new(Fork { rng: r, seen: 0, point: None }));
+        }
+    }
     let mut base = Rng::new(split64(cfg.seed ^ split64(stream as u64 + 1)));
     let seats = game_seats(cfg, gid);
     let n = seats.len();
@@ -370,7 +406,12 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
     loop {
         let g = slot.game.as_ref().unwrap();
         let Some(p) = g.to_move().filter(|_| slot.steps < cfg.max_steps) else {
-            return finish(cfg, slot, results, samples, parked);
+            finish(sh, slot, results, samples, parked, n)?;
+            if slot.game.is_some() {
+                // the game drew a branch (docs/search.md 2.11): its slot plays it now
+                continue;
+            }
+            return Ok(());
         };
         if let SeatCfg::External(key) = seat_cfg(cfg, slot.gid, p) {
             if let Some(pl) = slot.ext_payload.take() {
@@ -413,7 +454,12 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             }
         }
         if slot.target.is_none() {
-            start(slot, seat, p);
+            if slot.dev_left > 0 && !slot.game.as_ref().unwrap().minor_decision() {
+                // a branch's deviation move (docs/search.md 2.11): the network's priors alone
+                start_dev(slot, seat, p);
+            } else {
+                start(slot, seat, p);
+            }
         }
         if slot.sims >= slot.target.unwrap() {
             n.minor += slot.minor as u64;
@@ -675,10 +721,77 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     }
 }
 
+/// Start a branch's deviation search of seat `p`'s decision (docs/search.md 2.11): the root's own
+/// evaluation alone (one simulation; none when a reused root is expanded already) for the network's
+/// priors - no noise, floor, Gumbel schedule or belief, never recorded.
+fn start_dev<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
+    slot.full = false;
+    slot.minor = false;
+    slot.belief = false;
+    slot.dev_now = true;
+    let game = slot.game.as_ref().unwrap();
+    match slot.trees[p].as_mut() {
+        None => {
+            let mut t = slot.spare.pop().unwrap_or_default();
+            t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
+            slot.trees[p] = Some(t);
+        }
+        Some(t) => t.set_base(game, &mut slot.search_rng),
+    }
+    let t = slot.trees[p].as_mut().unwrap();
+    t.set_root_min(0);
+    t.clear_gumbel();
+    slot.target = Some(if t.expanded(t.root) { 0 } else { 1 });
+}
+
+/// A branch's deviation move (docs/search.md 2.11): sampled from the root's priors P0 (the network's
+/// policy, before any noise) raised to 1 / temp, from the branch's own stream; nothing recorded.
+fn deviate<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, p: usize, key: &mut Vec<u64>, n: &mut Tally) -> Result<(), String> {
+    let temp = cfg.branch.as_ref().ok_or("internal: a deviation without branch settings")?.temp;
+    let tree = slot.trees[p].as_ref().unwrap();
+    let root = tree.root;
+    let p0 = tree.priors0(root);
+    let acts = tree.acts(root);
+    if p0.len() != acts.len() || acts.len() < 2 {
+        return Err("internal: a deviation search without the root's priors".into());
+    }
+    let w: Vec<f64> = p0.iter().map(|&x| (x.max(0.0) as f64).powf(1.0 / temp)).collect();
+    let tot: f64 = w.iter().sum();
+    let i = if tot > 0.0 && tot.is_finite() {
+        let mut r = slot.rng.unit() * tot;
+        let mut i = w.len() - 1;
+        for (k, &x) in w.iter().enumerate() {
+            r -= x;
+            if r < 0.0 {
+                i = k;
+                break;
+            }
+        }
+        i
+    } else {
+        slot.rng.below(acts.len() as u32) as usize
+    };
+    let a = acts[i];
+    if let Some(b) = slot.branch.as_mut() {
+        if b.played == 0 {
+            b.same_first = a == b.action;
+        }
+        b.played += 1;
+    }
+    slot.dev_left -= 1;
+    slot.dev_now = false;
+    slot.decisions += 1;
+    n.dev_moves += 1;
+    apply(cfg, slot, a, key)
+}
+
 /// Choose the move after the search; the training record (`n.recorded`) and value-only records
 /// (`n.view_recorded`) it makes.
 #[allow(clippy::too_many_arguments)]
 fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize, key: &mut Vec<u64>, n: &mut Tally, look: &Mutex<LookTotals>) -> Result<(), String> {
+    if slot.dev_now {
+        return deviate(cfg, slot, p, key, n);
+    }
     let tree = slot.trees[p].as_ref().unwrap();
     let root = tree.root;
     // value-only records waiting for this seat's next search (`ViewTarget::NextQ`, docs/search.md
@@ -745,7 +858,8 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         t.guard_overrides += over as u64;
     }
     // (a seat with `record` false - a league opponent - records nothing; the move is the same)
-    let rec = cfg.record && seat.selfplay && seat.record && slot.full;
+    // (a branch records nothing before its deviation moves are played: docs/search.md 2.11)
+    let rec = cfg.record && seat.selfplay && seat.record && slot.full && slot.dev_left == 0;
     if rec {
         let pi: Vec<f32> = match seat.policy_target {
             PolicyTarget::Visits if tot > 0 => nv.iter().map(|&c| (c as f64 / tot as f64) as f32).collect(),
@@ -792,6 +906,18 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                 slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux });
                 slot.rq.push(None);
                 n.view_recorded += 1;
+            }
+        }
+    }
+    // branching (docs/search.md 2.11): the reservoir over the game's eligible decisions - a
+    // recording self-play seat's search of a decision (>= 2 options) that is not minor - keeps a copy
+    // of the state at a uniformly drawn one, from the game's branch stream
+    if let Some(f) = slot.fork.as_mut() {
+        let g = slot.game.as_ref().unwrap();
+        if cfg.record && seat.selfplay && seat.record && !g.minor_decision() {
+            f.seen += 1;
+            if f.rng.unit() * (f.seen as f64) < 1.0 {
+                f.point = Some(ForkPoint { game: g.clone(), decisions: slot.decisions, steps: slot.steps, moves: slot.moves.clone(), at: f.seen - 1, action: a });
             }
         }
     }
@@ -850,10 +976,16 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
 /// The game ended (or hit max_steps): result row and training samples; a game over at a
 /// deferred terminal is parked instead (its records, root values and payload; `Driver::resolve`
 /// emits them later).
-fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>) -> Result<(), String> {
+fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>, n_: &mut Tally) -> Result<(), String> {
+    let cfg = &sh.cfg;
     let g = slot.game.take().unwrap();
     let over = g.to_move().is_none();
-    let done = Done { gid: slot.gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves) };
+    let gid = slot.gid;
+    let start = slot.start_ix.take();
+    let fork = slot.fork.take();
+    let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start };
+    slot.dev_left = 0;
+    slot.dev_now = false;
     let records = std::mem::take(&mut slot.records);
     let rq = std::mem::take(&mut slot.rq);
     slot.view_wait.clear();
@@ -866,14 +998,77 @@ fn finish<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<
     slot.ext_payload = None;
     slot.legal_ok = false;
     if over && g.deferred() {
+        if fork.as_ref().is_some_and(|f| f.point.is_some()) {
+            return Err("branch: a game at a deferred terminal cannot branch (docs/search.md 2.11)".into());
+        }
         let payload = g.deferred_payload().map_err(|e| format!("deferred_payload: {e}"))?;
         let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(ParkedRecord::park).collect() } else { Vec::new() };
         let bytes = records.iter().map(|r| r.bytes()).sum::<usize>() as u64;
         let Done { gid, tag, n, steps, decisions, ext_moves, .. } = done;
-        parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes });
+        parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes, start });
         return Ok(());
     }
     results.push(emit(cfg.record, &g, over, done, records, rq, samples));
+    if let Some(mut f) = fork {
+        if let Some(fp) = f.point.take() {
+            spawn_branch(sh, slot, gid, f, fp, start)?;
+            n_.branches += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The finished game `gid`'s branch into its slot (docs/search.md 2.11): the state at its branch
+/// point, the game's searched decisions, real moves and move log before it; streams of its own (from
+/// the game's branch stream), fresh trees and records; its deviation moves drawn (1..=moves).
+fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut f: Box<Fork<G>>, fp: ForkPoint<G>, start: Option<u32>) -> Result<(), String> {
+    let cfg = &sh.cfg;
+    let bc = cfg.branch.as_ref().ok_or("internal: a branch without branch settings")?;
+    let moves = 1 + f.rng.below(bc.moves);
+    let mut base = Rng::new(f.rng.next_u64());
+    let seats = game_seats(cfg, gid);
+    // (bots of a branch: from the driver's spec, or the archive entry's the game started from)
+    let spec = start.map_or(&sh.spec, |j| &sh.starts[j as usize]);
+    slot.gid = gid;
+    slot.n = seats.len();
+    slot.rng = Rng::new(base.next_u64());
+    slot.noise_rng = Rng::new(base.next_u64());
+    slot.search_rng = Rng::new(base.next_u64());
+    let seeds: Vec<u64> = seats.iter().map(|_| base.next_u64()).collect();
+    slot.bots = seats
+        .iter()
+        .zip(seeds)
+        .map(|(&s, seed)| match &cfg.seats[s as usize] {
+            SeatCfg::Bot(name) => make_bot::<G>(spec, name, seed),
+            _ => None,
+        })
+        .collect();
+    slot.drop_trees();
+    slot.game = Some(fp.game);
+    slot.tag = None;
+    slot.legal_ok = false;
+    slot.sims = 0;
+    slot.target = None;
+    slot.full = true;
+    slot.minor = false;
+    slot.belief = false;
+    slot.decisions = fp.decisions;
+    slot.ext_moves = 0;
+    slot.steps = fp.steps;
+    slot.records.clear();
+    slot.rq.clear();
+    slot.view_wait.clear();
+    slot.pending = None;
+    slot.ext_payload = None;
+    slot.moves = fp.moves;
+    slot.look = None;
+    slot.look_mcts = false;
+    slot.look_guard = None;
+    slot.fork = None;
+    slot.start_ix = None;
+    slot.branch = Some(BranchInfo { at: fp.at, of: f.seen, decision: fp.decisions, step: fp.steps, action: fp.action, moves, played: 0, same_first: false, start });
+    slot.dev_left = moves;
+    slot.dev_now = false;
     Ok(())
 }
 
@@ -886,6 +1081,8 @@ pub(super) struct Done {
     pub decisions: u32,
     pub ext_moves: u32,
     pub moves: Vec<(u8, u16, Vec<u16>)>,
+    pub branch: Option<BranchInfo>,
+    pub start: Option<u32>,
 }
 
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
@@ -915,6 +1112,8 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         samples: if emit { records.len() as u32 } else { 0 },
         tag: d.tag,
         moves: d.moves,
+        branch: d.branch,
+        start: d.start,
     };
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();

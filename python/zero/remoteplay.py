@@ -108,6 +108,13 @@ def _belief_of(cfg):
     hello reports and the run checks (docs/az.md 18.5)."""
     from .run import belief_keys
     return belief_keys(cfg, 'selfplay')
+
+
+def _forks_of(fk):
+    """A run's branched games and archive starts as its driver plays them (`forks.fingerprint` of a Run's
+    `forks`, '' when off): what a worker's hello reports and the run checks (docs/az.md 24)."""
+    from .forks import fingerprint
+    return fingerprint(fk)
 BIG = 1 << 62                     # a remote driver's quota: its phases end by end_phase()
 RETRY_S = 60.0                    # a failed session is started again after this (env ZERO_RSP_RETRY_S)
 STALL_S = 300.0                   # a session silent this long is killed (its worker stalled)
@@ -666,6 +673,12 @@ class RemotePlay:
                 for e in ends:
                     lg = merge(lg, e.get('league'))
                 out['league'] = lg
+            if any('forks' in e for e in ends):        # branched games, archive starts: its accepted games' (forks.tally)
+                from .forks import merge as fmerge
+                fk = None
+                for e in ends:
+                    fk = fmerge(fk, e.get('forks'))
+                out['forks'] = fk
         if self.mode == 'matches':
             with self.mu:
                 outstanding = sum(len(s.assigned) for s in self.sess if s is not None)
@@ -740,6 +753,11 @@ class RemotePlay:
                     # a checkout without the root's belief (or reading the settings otherwise) would deal
                     # its worlds uniformly in silence: never used (docs/az.md 18.5)
                     s.no_belief = ev.get('belief')
+                want_f = _forks_of(getattr(self.R, 'forks', None)) if self.mode == 'selfplay' else ''
+                if want_f and ev.get('forks') != want_f:
+                    # a checkout without branched games / archive starts (or with another archive) would
+                    # play its games without them in silence: never used (docs/az.md 24)
+                    s.no_forks = ev.get('forks')
                 if self.fails or s.k == 0:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
@@ -846,6 +864,13 @@ class RemotePlay:
                               f'selfplay_league {self.R.cfg["selfplay_league"]}); killed, retried in 10 minutes')
                 s.kill()
                 continue
+            if hasattr(s, 'no_forks'):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.fail_log(f'worker {k} REFUSED: its checkout plays branched games / archive starts as '
+                              f'{s.no_forks!r}, the run as {_forks_of(self.R.forks)!r} (an older checkout has none: '
+                              f'docs/az.md 24); killed, retried in 10 minutes')
+                s.kill()
+                continue
             if hasattr(s, 'no_belief'):
                 self.next_try[k] = now + max(self.retry_s, 600.0)
                 self.fail_log(f'worker {k} REFUSED: its checkout plays the root belief as {s.no_belief!r}, the run as '
@@ -894,6 +919,12 @@ class RemotePlay:
         self.t.mkdirs(self.rdir + '/models', self.rdir + '/data')
         cfg = dict(self.R.cfg, **self.overrides)
         cfg.update(eval_remote='', selfplay_remote='', resolver='', resolver_cfg={}, resolver_init='')
+        fk = getattr(self.R, 'forks', None)
+        if self.mode == 'selfplay' and fk is not None and fk.archive:
+            # the archive starts' file (zero/forks.py) into the mirror: the workers read it there
+            from .forks import MIRROR_NAME
+            self.t.put(fk.archive['path'], self.rdir + '/' + MIRROR_NAME)
+            cfg['selfplay_archive'] = MIRROR_NAME
         if 'shard_rows' not in self.overrides:
             cfg['shard_rows'] = min(int(cfg['shard_rows']), SHARD_ROWS)
         try:
@@ -1288,6 +1319,16 @@ class Worker:
         from .games import spec_json
         self.spec = spec_json(self.cfg.get('spec'))
 
+    def _forks(self):
+        """This worker's branched games and archive starts (zero/forks.py: the mirror's config, its
+        archive.json), None when off."""
+        if self.mode != 'selfplay':
+            return None
+        if not hasattr(self, 'fk'):
+            from .forks import setup
+            self.fk = setup(self.rdir, self.cfg)
+        return self.fk
+
     # ---- output
     def emit(self, ev, **kw):
         line = TAG + json.dumps(dict(ev=ev, w=self.k, **kw), separators=(',', ':'))
@@ -1536,7 +1577,8 @@ class Worker:
             self.drv.end_phase()
 
     def outstanding(self):
-        """Setups queued in the driver or playing (queue_only: every setup comes back as one row)."""
+        """Setups queued in the driver or playing (queue_only: every setup comes back as one row, and a
+        branch of its game as a second one, zero/forks.py: `taken` counts the first)."""
         return self.enq - self.taken
 
     def _topup(self, ph):
@@ -1566,6 +1608,9 @@ class Worker:
             if self.lg_on:
                 from .league import tally
                 tally([row], ph['league'])
+            if ph.get('forks') is not None:
+                from .forks import tally as ftally
+                ftally([row], ph['forks'], self._forks().kinds())
         die = int(self.test.get('die_after_accepts') or 0)
         if die and ph['accepted'] >= die:
             self.note('test: dying with accepted games in no shard yet')
@@ -1578,7 +1623,8 @@ class Worker:
             from .league import League
             League.attribute(rows, self.lg_kinds, self.lg_slots)     # (the slots' checkpoints now)
         games = split_games(rows, s)
-        self.taken += len(games)
+        from .forks import setups
+        self.taken += setups(rows)                 # (a branch is its game's second row: zero/forks.py)
         if ph['closed']:
             ph['linger_games'] += len(games)
         else:
@@ -1704,6 +1750,8 @@ class Worker:
         ph['t_close'] = now
         ph['leaves_close'] = st['leaves']
         extra = {'league': ph['league']} if self.lg_on else {}
+        if ph.get('forks') is not None:
+            extra['forks'] = ph['forks']
         self.emit('end', iter=ph['it'], games=ph['games'], samples=ph['samples'], shards=w['shards'], bytes=w['bytes'],
                   leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - bo, 2),
                   backoff_s=round(bo, 2), in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
@@ -1734,6 +1782,9 @@ class Worker:
         ph = {'it': it, 'games': 0, 'samples': 0, 't0': _now(), 'backoff': 0.0, 'bo_t0': 0.0, 'ending': False,
               't_lock': 0.0, 'leaves0': st0['leaves'], 'bw': bw, 'closed': False, 'accepted': 0,
               'linger_games': 0, 'linger_prev': getattr(self, 'linger_prev', None), 'league': {}}
+        if self.mode == 'selfplay' and self._forks() is not None:
+            from .forks import new_tally
+            ph['forks'] = new_tally()
         evs = {'m': self.evr, **self.lg_evs} if self.lg_on else {'m': self.evr}
         self.linger_prev = None
         for sd in self.held_samples:               # co-training: rows finished while lingering, sent already
@@ -1799,7 +1850,8 @@ class Worker:
             # (the tests: an older checkout, without the league / the root's belief)
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
                       mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),
-                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}))
+                      **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}),
+                      **({} if self.test.get('no_forks') else {'forks': _forks_of(self._forks())}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

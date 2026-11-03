@@ -64,7 +64,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import auxtarget as AUX, elo, games as G, league as L, package, runctl
+from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
@@ -260,6 +260,15 @@ DEFAULTS = dict(
     # a remote's lingering games. Needs selfplay_remote (the shared queue); single-game runs without the
     # self-play league. 0 = this machine's self-play waits while the run trains, as before
     selfplay_local_linger=0,
+    # branched self-play games and archive starts (zero/forks.py, docs/az.md 24, docs/search.md 2.11):
+    # selfplay_branch p = a share p of the games each spawn one branch game from a copy of their state at
+    # a uniformly drawn decision of theirs: 1..selfplay_branch_moves deviation moves sampled from the
+    # network's priors at temperature selfplay_branch_temp (never recorded), then normal self-play, its
+    # rows' z its own outcome; a branch counts as one of the iteration's games. selfplay_archive = an
+    # archive file ('zero-archive/1', built for the run's spec by the game's own tool): a share
+    # selfplay_archive_p of the games start from one of its positions instead of a new deal. 0 / '' =
+    # off: nothing changes. Single-game runs without the league; branching needs rolling self-play
+    selfplay_branch=0.0, selfplay_branch_moves=3, selfplay_branch_temp=2.0, selfplay_archive='', selfplay_archive_p=0.1,
     # ... except a batch-bound machine's (its network batches grow with its games in flight, so a
     # smaller cap only starves it: 'auto' = the ones inferring on CUDA / MPS; 'local' | 'remote' |
     # 'all' | 'none'): its slots while its games take at most this many iterations (its throughput
@@ -455,6 +464,8 @@ class Run:
         self.heldout = None                        # zero.heldout.HeldOut with heldout_shards (loaded once)
         self.anchor_sha = {}                       # anchor path -> ((size, mtime), sha256)
         self.linger = None                         # selfplay_local_linger: the lingering thread's state
+        # branched games and archive starts (zero/forks.py): the self-play driver's settings, None when off
+        self.forks = FK.setup(run, cfg)
 
     def check(self, where=''):
         if self.pw is not None:
@@ -533,6 +544,8 @@ class Run:
             # self-play records the auxiliary targets (docs/az.md 15; getattr: a caller's stand-in Run
             # with only a cfg, e.g. MTG Zero's test of its evaluation specs, has none)
             kw['aux'] = True
+        if record and getattr(self, 'forks', None) is not None:
+            kw.update(self.forks.kwargs())         # branched games, archive starts (zero/forks.py)
         return G.Driver(c['game'], seats, spec=spec, concurrency=conc or c['conc'], seed=seed, record=record,
                         threads=c['threads'], groups=groups or c['groups'], max_steps=c['max_steps'], rolling=rolling,
                         net=net, **kw)
@@ -626,6 +639,7 @@ class Run:
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
+        self.fork_metrics(it, out, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -647,6 +661,18 @@ class Run:
         d = lambda k: st.get(k, 0) - ((st0 or {}).get(k, 0))           # noqa: E731
         out['view'] = {'rows': d('view_rows'), 'rows_per_leaf': round(d('view_rows') / max(1, leaves), 4),
                        'samples': d('view_recorded')}
+
+    def fork_metrics(self, it, out, results, remote=None):
+        """Self-play's branched games and archive starts (zero/forks.py), only when one is on (the metrics
+        of before otherwise): `forks` = the iteration's accepted games, samples and searched decisions by
+        origin (game / branch / archive), this machine's and the remote's (`remote`: its tally), logged."""
+        if self.forks is None:
+            return
+        acc = FK.tally(results, FK.new_tally(), self.forks.kinds())
+        out['forks'] = FK.summary(FK.merge(acc, remote), self.forks)
+        if remote:
+            out['forks']['remote'] = {'games': dict(remote['games']), 'samples': dict(remote['samples'])}
+        self.log(f'iter {it} forks: {FK.fmt(out["forks"])}')
 
     def belief_metrics(self, out, st, st0, results):
         """Self-play's root-belief metrics (docs/az.md 18), only when it is on (the metrics of before
@@ -724,7 +750,7 @@ class Run:
             if rows and lg is not None:
                 L.League.attribute(rows, self.roll_kinds, plan['slots'])   # (the slots' checkpoints now)
             if rows:
-                self.taken += len(rows)
+                self.taken += FK.setups(rows)      # (a branch is its game's second row: zero/forks.py)
                 acc['finished'] += len(rows)
                 self.held.extend(split_games(rows, s))
             if self.held:
@@ -763,7 +789,7 @@ class Run:
         if rows and lg is not None:
             L.League.attribute(rows, self.roll_kinds, plan['slots'])
         if rows:
-            self.taken += len(rows)
+            self.taken += FK.setups(rows)
             acc['finished'] += len(rows)
             self.held.extend(split_games(rows, drv.take_samples()))
         ws = writer.close()
@@ -790,6 +816,7 @@ class Run:
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
+        self.fork_metrics(it, out, results, rem.pop('forks', None))
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
@@ -856,7 +883,7 @@ class Run:
             rows = drv.take_results()
             s = drv.take_samples()
             if rows:
-                self.taken += len(rows)
+                self.taken += FK.setups(rows)      # (a branch is its game's second row: zero/forks.py)
                 st['games'] += len(rows)
                 self.held.extend(split_games(rows, s))
             if st['stop'].is_set() or len(self.held) >= cap_held:
@@ -1538,6 +1565,8 @@ class Run:
                 raise HeldOutRefused(f'heldout_shards: {e}') from None
         done = {m['iter'] for m in read_metrics(run)}
         self.log(f'run {run} starting after iter {start}; cfg {json.dumps(c)}')
+        if self.forks is not None:
+            self.log(f'self-play forks (zero/forks.py): {self.forks.describe()}')
         if c.get('eval_remote'):
             from .remote import RemoteEval
             self.remote = RemoteEval(self, c['eval_remote'])
@@ -1772,6 +1801,10 @@ def resolve_config(args, saved):
             raise SystemExit(f'{k} {w!r}: a number >= 0 (an auxiliary target weight; 0 = off, docs/az.md 15)')
     if isinstance(cfg.get('resolver_cfg'), dict) and L.enabled(cfg['resolver_cfg']):
         raise SystemExit('resolver_cfg: selfplay_league: single-game runs only (not a co-training resolver)')
+    # branched games and archive starts (zero/forks.py): ranges, single-game runs, rolling self-play
+    FK.check_settings(cfg)
+    if isinstance(cfg.get('resolver_cfg'), dict) and FK.enabled(cfg['resolver_cfg']):
+        raise SystemExit('resolver_cfg: selfplay_branch / selfplay_archive: single-game runs only (not a co-training resolver)')
     if cfg.get('selfplay_local_linger'):
         why = ('needs selfplay_remote (the shared queue holds the games it finishes)' if not cfg.get('selfplay_remote')
                else 'single-game runs only' if cfg.get('resolver')
