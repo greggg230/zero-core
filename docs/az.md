@@ -35,6 +35,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
 | `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
 | `league.py` | The self-play league (section 14): the league games' kinds and seat tables (classic, rolling), the iteration's picks of past checkpoints (`League.plan`: uniform or pfsp), the slots' evaluators (guarded), the games' attribution and `selfplay.league` |
+| `forks.py` | Branched self-play games and archive starts (section 24): the settings, the archive file (`zero-archive/1`: its entries' patches over the run's spec), the self-play driver's `branch` / `starts`, the remote hello's fingerprint, the tallies and `selfplay.forks` |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
 
@@ -153,6 +154,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_league` | 0.0 | the self-play league (section 14): this share of the self-play games (exactly, over each driver's started games) puts a past checkpoint of the run in one seat; only the current network's decisions become samples. 0 = off (every game the current network's mirror, as before). Single-game runs (co-training refuses it) |
 | `selfplay_league_pool` | '2,4,8,16,32' | the past checkpoints it may play: raw iteration offsets back from the network that self-plays (iteration i self-plays with i-1: offset 2 = checkpoint i-3), those that exist; 'all' = every earlier checkpoint (fictitious self-play) |
 | `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
+| `selfplay_branch`, `selfplay_branch_moves`, `selfplay_branch_temp`, `selfplay_branch_differ` | 0.0, 3, 2.0, 0 | branched self-play games (section 24, docs/search.md 2.11): this share of the games each spawn one branch game from a copy of their state at a uniformly drawn decision of theirs - 1..`moves` deviation moves sampled from the network's priors at temperature `temp` (never recorded; `differ` 1: the first never the game's own move), then normal self-play, its rows' z its own outcome; a branch counts as one of the iteration's games. 0 = off (nothing changes); needs rolling self-play (`rolling` 1 or `selfplay_remote`); single-game runs without the league |
+| `selfplay_archive`, `selfplay_archive_p` | '', 0.1 | archive starts (section 24): this share of the games start from a position of the archive file (format 'zero-archive/1', built for the run's spec by the game's own tool: MTG Zero's `tools/delver_archive.py`) instead of a new deal. '' = off |
 | `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
 
 ## 2. Run control (`runctl.py`)
@@ -3595,3 +3598,121 @@ zero` identical; toy-smoke runs byte for byte against c6b959b in two configurati
 'cq' 0.3 and the cq2 rule); MTG Zero's `tools/gate.py optin-core` PASSED (its ENGINE.md 80.8: digests
 unchanged, check_checkpoint_compat with the Delver line's iteration 475 identical, Glass Road / Caverna /
 Kingdom Builder build against this core).
+
+## 24. Branched self-play games and archive starts (`zero/forks.py`; MTG Zero's Delver mirror, 2026-11-03)
+
+(Sections 22 and 23 are taken by open branches: `feat/heavy-decisions`, `feat/light-decisions`, `feat/temp-late`.)
+
+### 24.1 Why
+
+MTG Zero's Delver mirror review 5 (its hub notes, `delver_review_5_2026-11-03.md` section 5, step 2): the
+measured bottleneck is **which positions the value head sees** - its own sharp, self-confirming lines, one
+outcome per ~90 rows. At 71 decisions from human games that a strong player calls mistakes, three
+generations re-searched at 1,024 simulations rate the played move as their own with a gap of 0.000 at 62:
+the value head rates the lines it never plays like the lines it plays. Its exploration A/B (section 21 of
+`feat/explore`: gated single deviations, targets unchanged) and late sampling re-weighted options inside
+the games; neither put *new positions with real outcomes* into the data. KataGo's answer is side games
+(a share of games branch at a random move into a game of their own); Go-Exploit's is starting games from
+an archive of states. This section is both, as opt-in run settings.
+
+### 24.2 What it does
+
+* **Branched games** (`selfplay_branch` = p; driver: docs/search.md 2.11). A share p of the games each
+  spawn one branch from a uniformly drawn decision of theirs (a recording seat's searched decision, not
+  minor). When the game ends, its slot plays the branch: 1..`selfplay_branch_moves` (uniform) deviation
+  moves sampled from the network's priors at temperature `selfplay_branch_temp` - the root's evaluation
+  alone, no search: **they are recorded nowhere** (no policy target, no value target) - then normal
+  self-play to the end; every row of the branch gets **the branch's own z**. The game itself is untouched:
+  its moves, its rows, its streams (a branch reads only its own stream), so none of its rows - the branch
+  point's included - is recorded twice. `selfplay_branch_differ` 1: the first deviation is never the
+  game's own move at the branch point (without it, a sharp policy at temperature 2 often samples the
+  game's own move first, and a one-move branch then re-plays its game's line from there: 24.6).
+* **No row needs a masked value target.** The exploration feature (`feat/explore`) masks z := q on the rows
+  before its forced deviation, because there the deviation is inside the game whose outcome those rows
+  get. Here the deviation is in the branch only, and recorded nowhere; the game keeps its own outcome; the
+  branch's rows all come after its deviations, and an archive start's rows after its start. So there is
+  nothing to mask, and the shards carry no new column.
+* **Archive starts** (`selfplay_archive` = a file, `selfplay_archive_p` = the share). A game starts from an
+  archived position instead of a new deal: an entry's `patch` merged into the run's spec (MTG Zero: its
+  `start` block - the source game's seed and root actions, the library orders nobody knows dealt again
+  from the game's own seed: MTG Zero's ENGINE.md 76, 87). The file, `zero-archive/1` = {format, game,
+  base_spec, entries: [{id, kind, patch, ...}], ...}, is the game's own tool's (MTG Zero's
+  `tools/delver_archive.py` replays and checks every position and lists what it skips); `zero/forks.py`
+  refuses another game, a `base_spec` other than the run's, duplicate ids, an empty or malformed entry,
+  and the driver starts every entry once when it is made. Its sha256 (of the entries) is logged at the
+  run's start and in every iteration's `selfplay.forks.archive_sha`.
+
+**Quota and compute.** A branch is a finished game of its own: it counts toward the iteration's `games`
+(local, remote, shared queue alike), so an arm with branching plays the same number of games an iteration
+as one without - but a branch starts mid-game and an archive start at turn 3-15, so the arm plays fewer
+searched decisions and records fewer rows an iteration (24.6: MTG Zero's numbers). An archive start is one
+of the iteration's games. The shared queue (5.3) and the local linger count setups by the games that
+started from one (`forks.setups`: a branch is the second row of its game's setup), else they would queue
+one more setup per branch, every iteration.
+
+**Metrics** (`selfplay.forks`, only when one is on): the iteration's accepted games, samples and searched
+decisions by origin (game / branch / archive), their shares, samples per game, the branches' means
+(deviation moves drawn and played, `same_first`, the branch point's place in its game `at_frac`, of
+archive games), archive starts by kind, the archive's sha, and the remote's own counts (`remote`); one log
+line per iteration (`iter i forks: ...`).
+
+**Remote self-play** (5.3): the workers branch and start from the archive exactly as this machine - their
+config.json is the run's, and the archive file is shipped into the mirror as `archive.json` (the config's
+path rewritten to it) at each session start. A worker's hello reports its `forks.fingerprint` (the branch
+settings, the archive's p, entry count and sha); a worker whose checkout plays them otherwise (an older
+checkout reports none) is refused, retried in 10 minutes, and the run plays on alone - never silently
+without them. Their accepted games' tallies come back in their end lines.
+
+### 24.3 Off by default
+
+`selfplay_branch` 0 and `selfplay_archive` '' (the defaults): the driver gets neither (`DriverCfg::branch`
+and `starts` None), no metric, no new key in a result row or a stats dict but the three zero counters,
+the run of before byte for byte. Refused: a share outside [0, 1] / (0, 1], moves < 1, temperature <= 0,
+`selfplay_branch` without rolling self-play (a classic iteration's list of games would get its branches
+on top of its quota), co-training runs (and a `resolver_cfg` with either), the self-play league.
+
+### 24.4 Costs
+
+A game that drew a branch clones its state at the reservoir's picks (H(n) ~ ln n + 0.58 clones over n
+eligible decisions: ~6 for MTG's ~300) and holds one copy until it ends; a deviation move costs one network
+row. The archive's entries are parsed and started once per driver (MTG Zero's 321 entries: a fraction of a
+second). Nothing else: the games, search and training of before.
+
+### 24.5 Tests and checks
+
+`cargo test` 108 (the driver's 6 tests of docs/search.md 2.11); `tests/test_forks.py` (15: the bindings -
+rows, stats, the settings refused, `differ` -, the run settings, the archive file's checks, a rolling toy
+run with both on: every iteration exactly its quota with branches and archive starts among them, the
+metrics; off has no metrics; remote self-play with the remote 'local': the shipped archive, exact shared
+quotas with branches counted as games, the remote's tally; an older worker refused by its hello). The full
+pytest (CPU, beside the live Delver line): 334 passed, 9 skipped, 1 failed - `test_cotrain_pause_mid_iteration_replays_it`,
+whose run hung on a print: the new settings pushed the co-training run's start-up lines past a Windows
+pipe's 4 KB buffer, which the test read only at the end (the exploration branch met the same: its fix,
+`feat/explore` 7985add - the PAUSE tests' output to a file -, cherry-picked here); the PAUSE tests then pass.
+
+### 24.6 What it measured on MTG Zero's Delver mirror (its ENGINE.md 87)
+
+2026-11-03, the desktop's CPU at below-normal priority beside the live Delver line (MTG Zero's ENGINE.md 87
+has the tables). **The archive** (its `tools/delver_archive.py`): 321 positions - 76 canary-library spots,
+242 Play-tab positions (turns 3-8 of 50 human games), 3 Play reports - every one rebuilt through MTG
+Zero's `start` block equal to its source replay; 4 Play games skipped and listed (played on an older
+engine build). **At the driver** (MTG Zero's `tools/forks_check.py`, its line's self-play seat at 16
+simulations, checkpoint 808): branches 21.1% +- 3.5 of 128 games (p 0.2), deviation moves 1/2/3 drawn
+11/3/13 and all played, every branch row's z its own outcome, none beyond its searched decisions after the
+deviations; archive starts 10.9% +- 2.7 (p 0.1). **Without `differ` the first deviation was the game's own
+move in 79% of the branches** (the network's top move at temperature 2), and those branches' rows re-played
+their games' states; with it 0%. A branch records ~39 rows against a game's ~63, an archive game ~53: at
+p 0.2 / 0.1 the arm records ~8% fewer rows and searches ~8% fewer decisions per iteration at the same games.
+With a batch-invariant evaluator every game equals its twin without branching (44 of 44, 87 of 87); with
+the CPU token network the twins differ (two runs without branching are identical, 32 of 32): its answers
+depend on a batch's other rows (padding), which the branches change. **End to end** (`mtgz.az.run`,
+the Delver preset with a 32 x 1 token network on CPU, the line's flags - sparse batches and window, window
+cache, train_static, local and remote linger -, both features on, remote self-play on the remote 'local'
+with one worker): 4 iterations of 192 games, every one exactly its quota (this machine 115 / 93 / 73 / 58,
+the worker 77 / 99 / 119 / 134), the archive shipped into the mirror byte for byte, no worker refused, the
+iterations' `forks` = their games and samples (local + the remote's tally); 77% games, 15% branches, 8%
+archive starts over the run (branches lag their games by up to a phase: 17.6% per game that can branch).
+
+**Off**: MTG Zero's `check_checkpoint_compat` against main 37d6574 (zero-core cd2f43f) identical - random
+network on the cube spec, and checkpoint 808 on the Delver spec at 16 simulations (1,161 samples, records
+cc72319a5d5ca31d / 5a26e15c983461e8); its engine digest f6543eb2b1b8752f unchanged.

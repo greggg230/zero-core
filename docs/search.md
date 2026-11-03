@@ -401,6 +401,51 @@ queued setups pair by gid too). Off: the streams of before, bit for bit (the gol
 Python reference driver has no pairing. Uses: docs/az.md 20.3 (zero.h2h `--paired`, the run setting
 `elo_paired`).
 
+### 2.11 Branched games and archive starts (`branch`, `starts`; MTG Zero's Delver mirror, 2026-11-03)
+
+Two opt-in ways for a recording self-play driver to put positions into its samples that its own games
+rarely reach (docs/az.md 24 has the why, the run settings and what they measured). Off (both `None`, the
+defaults): every game, stream and sample of before - both read only their own streams, from (seed, the
+game's stream id) and a salt of their own, never a draw of the game's other streams.
+
+**Branched games** (`branch={'p', 'moves', 'temp', 'differ'}`, `DriverCfg::branch` / `BranchCfg`; KataGo's
+side games): each game the driver starts (never a branch) draws, with chance `p`, a branch. Such a game
+keeps a reservoir sample over its **eligible decisions** - a recording self-play network seat's searched
+decision (two options or more) that is not minor (`SearchGame::minor_decision`): at the k-th one a copy of
+the state is kept with chance 1/k, so the branch point is uniform over the game's eligible decisions (a
+game whose length is not known in advance). The game plays and records exactly as without it. When the
+game ends (its row and samples emitted), its slot plays the **branch** from the copy, with streams of its
+own (from the game's branch stream) and fresh trees: its first `1..=moves` (uniform) non-minor network
+decisions are **deviation moves** - the root's own evaluation alone (one simulation; none when a reused
+root is expanded already; no Dirichlet noise, root floor, Gumbel schedule or belief), the move sampled
+from the root's priors P0 (the network's policy) raised to 1/`temp`; with `differ` the first of them never
+the game's own move there. Nothing is recorded until they are played (not the deviation decisions, nor a
+minor decision between them): no state of the game before the branch point is recorded twice. Then
+normal self-play to the end; the branch's records' z is its own outcome. It carries its game's searched
+decisions, real moves (`max_steps` counts them) and move log up to the branch point, and its gid; its row
+has `branch` = {at, of: the branch point's index among the game's eligible decisions and their count,
+decision, step: the game's searched decisions and real moves before it, action: the game's own move there,
+moves, played: deviation moves drawn and played, same_first: the first deviation was the game's own move,
+start: the archive entry the game started from}; a branch never branches. A branch is a finished game:
+rolling quotas count it (2.6), in a classic driver its branches play after the listed games; in a
+`queue_only` driver it is the second row of its game's queued setup. A game at a deferred terminal (2.8)
+that kept a branch point is an error. Stats: `branches` (started), `dev_moves`.
+
+**Archive starts** (`starts={'p', 'specs': [(id, spec), ...]}`, `DriverCfg::starts` / `StartsCfg`): each game
+the driver starts (never a branch) is started, with chance `p`, from an entry drawn uniformly: that entry's
+spec instead of the driver's or its queued setup's (a self-play driver's setups are its own spec), the
+game's seed drawn as for any other game (the spec decides what it seeds: MTG Zero's `start` block deals the
+cards nobody knows from it). Every entry is parsed and started once when the driver is made: an entry the
+game refuses is an error then. Its row has `start` = the entry's index. Stats: `starts`.
+
+Both need a driver that records a self-play seat (an evaluation or a match is refused). Tests:
+`driver::tests::branched_games_leave_their_games_alone_and_record_their_own_outcome` (with every search
+full: a branch's records are exactly its searched decisions after the deviations; the games equal their
+twins without branching, move for move and record for record), `branches_count_in_rolling_quotas_and_survive_the_phases`,
+`archive_starts_play_their_entries_specs` (game g started from entry j is game g of a driver whose spec is
+entry j's), `a_branch_of_an_archive_start_names_its_entry`, `differ_never_replays_the_games_own_move_first`,
+`branch_and_starts_settings_are_checked`; tests/test_forks.py.
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),

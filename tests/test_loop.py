@@ -221,8 +221,10 @@ def test_resume_continues_and_stop_file(smoke_run, tmp_path):
 def test_pause_exits_75_and_resume_finishes(tmp_path):
     run = tmp_path / 'p'
     run.mkdir()
+    # (its output to a file, not a pipe read only at the end: a full pipe would block the run)
+    console = open(tmp_path / 'p.out', 'w+', encoding='utf-8')
     proc = subprocess.Popen([sys.executable, '-m', 'zero.run', '--run', str(run), *SMOKE, '--iters', '3',
-                             '--games', '600', '--conc', '64'], cwd=ROOT, stdout=subprocess.PIPE,
+                             '--games', '600', '--conc', '64'], cwd=ROOT, stdout=console,
                             stderr=subprocess.STDOUT, text=True,
                             env=dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH))
     deadline = time.time() + 120
@@ -230,7 +232,10 @@ def test_pause_exits_75_and_resume_finishes(tmp_path):
         time.sleep(0.2)
     runctl.request_pause(str(run), by='test')
     t0 = time.time()
-    out, _ = proc.communicate(timeout=120)
+    proc.wait(timeout=120)
+    console.seek(0)
+    out = console.read()
+    console.close()
     assert proc.returncode == runctl.EXIT_PAUSED, out
     assert time.time() - t0 < 30
     st = runctl.read_state(str(run), 'run')
