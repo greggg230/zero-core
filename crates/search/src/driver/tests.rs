@@ -2379,7 +2379,7 @@ fn run_split<G: SearchGame>(d: &mut Driver<G>, skewed: bool) -> Vec<(GameResult,
 fn branch_cfg(games: usize, p: f64) -> DriverCfg {
     let mut c = cfg(vec![nn_full(12)], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
     c.seed = 31;
-    c.branch = Some(BranchCfg { p, moves: 3, temp: 2.0 });
+    c.branch = Some(BranchCfg { p, moves: 3, temp: 2.0, differ: false });
     c
 }
 
@@ -2518,16 +2518,16 @@ fn branch_and_starts_settings_are_checked() {
         c.branch = Some(b);
         Driver::<ToyGame>::new(c).err().unwrap_or_default()
     };
-    assert!(bad_branch(BranchCfg { p: 0.0, moves: 3, temp: 2.0 }).contains("branch p"));
-    assert!(bad_branch(BranchCfg { p: 1.5, moves: 3, temp: 2.0 }).contains("branch p"));
-    assert!(bad_branch(BranchCfg { p: 0.5, moves: 0, temp: 2.0 }).contains("moves 0"));
-    assert!(bad_branch(BranchCfg { p: 0.5, moves: 2, temp: 0.0 }).contains("temp"));
+    assert!(bad_branch(BranchCfg { p: 0.0, moves: 3, temp: 2.0, differ: false }).contains("branch p"));
+    assert!(bad_branch(BranchCfg { p: 1.5, moves: 3, temp: 2.0, differ: false }).contains("branch p"));
+    assert!(bad_branch(BranchCfg { p: 0.5, moves: 0, temp: 2.0, differ: false }).contains("moves 0"));
+    assert!(bad_branch(BranchCfg { p: 0.5, moves: 2, temp: 0.0, differ: false }).contains("temp"));
     // only drivers that record a self-play seat branch or start from an archive
     let mut c = branch_cfg(2, 0.5);
     c.record = false;
     assert!(Driver::<ToyGame>::new(c).err().unwrap_or_default().contains("never branches"));
     let mut c = cfg(vec![nn(0, 8, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
-    c.branch = Some(BranchCfg { p: 0.5, moves: 3, temp: 2.0 });
+    c.branch = Some(BranchCfg { p: 0.5, moves: 3, temp: 2.0, differ: false });
     assert!(Driver::<ToyGame>::new(c).is_err());
     let bad_starts = |s: StartsCfg| {
         let mut c = cfg(vec![nn_full(8)], vec![vec![0, 0]; 2], &[("m", KeyKind::Nn)]);
@@ -2539,4 +2539,18 @@ fn branch_and_starts_settings_are_checked() {
     assert!(bad_starts(StartsCfg { p: 0.5, specs: vec![("a".into(), r#"{"nope": 1}"#.into())] }).contains("entry \"a\""));
     // an entry the game refuses to start is refused when the driver is made
     assert!(bad_starts(StartsCfg { p: 0.5, specs: vec![("three".into(), r#"{"food": [1, 1, 1]}"#.into())] }).contains("does not start"));
+}
+
+#[test]
+fn differ_never_replays_the_games_own_move_first() {
+    let run = |differ: bool| {
+        let mut c = branch_cfg(60, 1.0);
+        c.branch = Some(BranchCfg { p: 1.0, moves: 1, temp: 2.0, differ });
+        run_split(&mut Driver::<ToyGame>::new(c).unwrap(), true)
+    };
+    let br = |v: &Vec<(GameResult, Vec<Record>)>| v.iter().filter_map(|(r, _)| r.branch.clone()).collect::<Vec<_>>();
+    let plain = br(&run(false));
+    let differ = br(&run(true));
+    assert!(plain.iter().any(|b| b.same_first), "without differ some first deviations are the game's own move");
+    assert!(differ.len() >= 50 && differ.iter().all(|b| !b.same_first && b.played == 1));
 }

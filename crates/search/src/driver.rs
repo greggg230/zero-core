@@ -420,6 +420,10 @@ pub struct BranchCfg {
     pub moves: u32,
     /// The deviation moves' temperature on the network's priors (P0^(1/temp), > 0).
     pub temp: f64,
+    /// The first deviation move is never the game's own move at the branch point (its option left out
+    /// of the sampling): every branch leaves its game's line at once. False: sampled from all options
+    /// (the game's own move among them - a branch may then re-play its game's line from there).
+    pub differ: bool,
 }
 
 impl BranchCfg {

@@ -194,3 +194,10 @@ def test_an_older_worker_is_refused(tmp_path):
     log = (run / 'log.txt').read_text(encoding='utf-8')
     assert 'REFUSED' in log and 'branched games / archive starts' in log, log[-3000:]
     check_quota(read_metrics(str(run)), 192)
+
+
+def test_differ_leaves_the_games_line_at_once():
+    d = G.Driver('toy', [[seat(), seat()]] * 30, spec='{}', concurrency=16, seed=9, record=True, threads=2,
+                 branch={'p': 1.0, 'moves': 1, 'differ': True})
+    br = [r['branch'] for r, _ in play(d) if 'branch' in r]
+    assert len(br) >= 25 and not any(b['same_first'] for b in br), br

@@ -7,7 +7,8 @@ played by the self-play driver itself (`DriverCfg::branch`, `DriverCfg::starts`)
   the games each spawn one branch game from a copy of their state at a uniformly drawn decision of
   theirs (a recording seat's searched decision, not minor); when the game ends its slot plays the
   branch: 1..`selfplay_branch_moves` deviation moves sampled from the network's priors at temperature
-  `selfplay_branch_temp` (never recorded: no search, no policy target, no z), then normal self-play
+  `selfplay_branch_temp` (never recorded: no search, no policy target, no z; `selfplay_branch_differ` 1:
+  the first one never the game's own move there), then normal self-play
   to the end, its rows' z the branch's own outcome. The game itself is untouched (its rows, its
   streams); none of its rows is recorded twice.
 * **Archive starts** (`selfplay_archive` = an archive file, '' = off; `selfplay_archive_p` = the share
@@ -33,7 +34,8 @@ import os
 
 FORMAT = 'zero-archive/1'
 MIRROR_NAME = 'archive.json'           # the archive's name in a remote self-play mirror (zero/remoteplay.py)
-KEYS = ('selfplay_branch', 'selfplay_branch_moves', 'selfplay_branch_temp', 'selfplay_archive', 'selfplay_archive_p')
+KEYS = ('selfplay_branch', 'selfplay_branch_moves', 'selfplay_branch_temp', 'selfplay_branch_differ', 'selfplay_archive',
+        'selfplay_archive_p')
 
 
 def branch_on(cfg):
@@ -63,6 +65,9 @@ def check_settings(cfg, where=''):
     t = cfg.get('selfplay_branch_temp', 2.0)
     if not (_num(t) and t > 0):
         raise SystemExit(f'{where}selfplay_branch_temp {t!r}: a temperature > 0')
+    d = cfg.get('selfplay_branch_differ', 0)
+    if d not in (0, 1, True, False):
+        raise SystemExit(f'{where}selfplay_branch_differ {d!r}: 0 or 1')
     a = cfg.get('selfplay_archive_p', 0.1)
     if not (_num(a) and 0.0 < a <= 1.0):
         raise SystemExit(f'{where}selfplay_archive_p {a!r}: a share in (0, 1] of the games')
@@ -144,7 +149,8 @@ class Forks:
         self.branch = None
         if branch_on(cfg):
             self.branch = {'p': float(cfg['selfplay_branch']), 'moves': int(cfg.get('selfplay_branch_moves', 3)),
-                           'temp': float(cfg.get('selfplay_branch_temp', 2.0))}
+                           'temp': float(cfg.get('selfplay_branch_temp', 2.0)),
+                           'differ': bool(int(cfg.get('selfplay_branch_differ', 0) or 0))}
         self.archive = None
         if archive_on(cfg):
             path = archive_path(run_dir, str(cfg['selfplay_archive']))
@@ -167,7 +173,8 @@ class Forks:
         out = []
         if self.branch:
             b = self.branch
-            out.append(f'branch {b["p"]} of the games ({b["moves"]} deviation moves at most, temperature {b["temp"]})')
+            out.append(f'branch {b["p"]} of the games ({b["moves"]} deviation moves at most, temperature {b["temp"]}'
+                       + (", the first never the game's own move)" if b['differ'] else ')'))
         if self.archive:
             a = self.archive
             out.append(f'archive starts {a["p"]} of the games from {a["n"]} entries of {a["path"]} (sha {a["sha"]})')
@@ -186,7 +193,7 @@ def fingerprint(fk):
     parts = []
     if fk.branch:
         b = fk.branch
-        parts.append(f'branch p={b["p"]} moves={b["moves"]} temp={b["temp"]}')
+        parts.append(f'branch p={b["p"]} moves={b["moves"]} temp={b["temp"]}' + (' differ' if b['differ'] else ''))
     if fk.archive:
         a = fk.archive
         parts.append(f'archive p={a["p"]} n={a["n"]} sha={a["sha"]}')

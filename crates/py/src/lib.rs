@@ -162,16 +162,16 @@ fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> 
     }
 }
 
-/// `branch` dict {p, moves, temp} (docs/search.md 2.11; another key is an error).
+/// `branch` dict {p, moves, temp, differ} (docs/search.md 2.11; another key is an error).
 fn parse_branch(d: &Bound<'_, PyDict>) -> PyResult<BranchCfg> {
     for k in d.keys() {
         let k: String = k.extract()?;
-        if !["p", "moves", "temp"].contains(&k.as_str()) {
-            return Err(PyValueError::new_err(format!("branch: unknown key {k:?} (p, moves, temp)")));
+        if !["p", "moves", "temp", "differ"].contains(&k.as_str()) {
+            return Err(PyValueError::new_err(format!("branch: unknown key {k:?} (p, moves, temp, differ)")));
         }
     }
     let p: f64 = d.get_item("p")?.ok_or_else(|| PyValueError::new_err("branch: p (the share of games that branch) is required"))?.extract()?;
-    let b = BranchCfg { p, moves: get(d, "moves", 3u32)?, temp: get(d, "temp", 2.0f64)? };
+    let b = BranchCfg { p, moves: get(d, "moves", 3u32)?, temp: get(d, "temp", 2.0f64)?, differ: flag(d, "differ", false)? };
     b.check().map_err(PyValueError::new_err)?;
     Ok(b)
 }

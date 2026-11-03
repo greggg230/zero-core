@@ -755,7 +755,10 @@ fn deviate<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, p: usize, key: &m
     if p0.len() != acts.len() || acts.len() < 2 {
         return Err("internal: a deviation search without the root's priors".into());
     }
-    let w: Vec<f64> = p0.iter().map(|&x| (x.max(0.0) as f64).powf(1.0 / temp)).collect();
+    let differ = cfg.branch.as_ref().is_some_and(|b| b.differ);
+    // (BranchCfg::differ: the first deviation leaves the game's own move out)
+    let own = slot.branch.as_ref().filter(|b| differ && b.played == 0).map(|b| b.action);
+    let w: Vec<f64> = p0.iter().zip(acts).map(|(&x, &a)| if Some(a) == own { 0.0 } else { (x.max(0.0) as f64).powf(1.0 / temp) }).collect();
     let tot: f64 = w.iter().sum();
     let i = if tot > 0.0 && tot.is_finite() {
         let mut r = slot.rng.unit() * tot;

@@ -268,7 +268,9 @@ DEFAULTS = dict(
     # archive file ('zero-archive/1', built for the run's spec by the game's own tool): a share
     # selfplay_archive_p of the games start from one of its positions instead of a new deal. 0 / '' =
     # off: nothing changes. Single-game runs without the league; branching needs rolling self-play
-    selfplay_branch=0.0, selfplay_branch_moves=3, selfplay_branch_temp=2.0, selfplay_archive='', selfplay_archive_p=0.1,
+    # (selfplay_branch_differ 1: a branch's first deviation never the game's own move there)
+    selfplay_branch=0.0, selfplay_branch_moves=3, selfplay_branch_temp=2.0, selfplay_branch_differ=0, selfplay_archive='',
+    selfplay_archive_p=0.1,
     # ... except a batch-bound machine's (its network batches grow with its games in flight, so a
     # smaller cap only starves it: 'auto' = the ones inferring on CUDA / MPS; 'local' | 'remote' |
     # 'all' | 'none'): its slots while its games take at most this many iterations (its throughput
