@@ -157,6 +157,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
 | `selfplay_branch`, `selfplay_branch_moves`, `selfplay_branch_temp`, `selfplay_branch_differ` | 0.0, 3, 2.0, 0 | branched self-play games (section 24, docs/search.md 2.11): this share of the games each spawn one branch game from a copy of their state at a uniformly drawn decision of theirs - 1..`moves` deviation moves sampled from the network's priors at temperature `temp` (never recorded; `differ` 1: the first never the game's own move), then normal self-play, its rows' z its own outcome; a branch counts as one of the iteration's games. 0 = off (nothing changes); needs rolling self-play (`rolling` 1 or `selfplay_remote`); single-game runs without the league |
 | `selfplay_archive`, `selfplay_archive_p` | '', 0.1 | archive starts (section 24): this share of the games start from a position of the archive file (format 'zero-archive/1', built for the run's spec by the game's own tool: MTG Zero's `tools/delver_archive.py`) instead of a new deal. '' = off |
+| `selfplay_resign_t`, `selfplay_resign_k`, `selfplay_resign_noresign` | 0.0, 5, 0.1 | self-play resignation (section 27, docs/search.md 3.14): t > 0 = a self-play game ends when `k` consecutive full searches (the recorded ones; never fast or minor) found one seat's root win estimate >= 1 - t, the same seat each time, scored as that seat's win, every record kept (z the resignation's); this share of the games (a hash of seed and game) never resigns and reports where it would have (`selfplay.resign`: the live wrong-resignation rate; 1 = a dry run). Evaluations never resign. 0 = off (nothing changes); two-player single-game runs without the league |
 | `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
 
 ## 2. Run control (`runctl.py`)
@@ -3770,3 +3771,166 @@ the priors): N 8,192 at 768 games in flight is at most ~0.7 GB.
 driver's golden records and matches unchanged with the cache off); on the MacBook the ten golden tests fail
 alike on main 96f1566 and on this branch, with the same digests (the goldens are the desktop's floats);
 pytest `test_loop.py::test_eval_cache_setting`.
+
+## 27. Self-play resignation with a no-resign share (`selfplay_resign_t`; MTG Zero's Delver mirror, 2026-11-04)
+
+The driver's semantics are docs/search.md 3.14; this section is the run-level view.
+
+### 27.1 Why
+
+MTG Zero's Delver line is data-rate-limited (its value head improves with games and with nothing else tried)
+and, since the evaluation cache, its self-play phase is bound by the CPU's searches (Fable's review of
+2026-11-04, `E:/mtg-zero-scratch/fable-ideas/report.md` 1.1, 2.2). A third of those searches come after the
+game is decided: 36.5% of its recorded decision rows have the decider's root win estimate outside
+(0.05, 0.95), and the outcome agrees in 98.9% of them (27.6). Their policy targets come from searches with
+no gradient (utility = P(win) only) and their value targets are the ones the value head already predicts.
+Ending a game once the search has called it decided for a while buys games per hour at the same compute.
+KataGo's form: resign after a run of decided searches, and keep a share of games that never resign - they
+keep the value head seeing decided positions and are the live measurement of how often the rule is wrong.
+
+### 27.2 What it does
+
+* **The settings.** `selfplay_resign_t` t (0 = off), `selfplay_resign_k` k, `selfplay_resign_noresign` (the
+  no-resign share) become the self-play seat's keys `resign_t`, `resign_k`, `resign_noresign`
+  (`Run.nn_seat(selfplay=True)`, `resign.seat_keys`): this machine's rolling or classic driver, the shared
+  queue's driver, the local linger's (the same driver) and every remote worker's (they build the seat from
+  the run's config.json) - one rule everywhere.
+* **The rule** (docs/search.md 3.14): a game ends when k consecutive **full** searches of its self-play seat
+  (the searches that make its records; fast and minor searches neither count nor reset) found **one seat's
+  root win estimate >= 1 - t** - the record's q, by absolute seat; the same favoured seat each time. It is
+  scored as that seat's win before the firing decision's move; every record so far is kept with z = that
+  outcome. A share of the games - `noresign_pick(seed, gid, share)`, a hash, so no game changes - never
+  resigns: each reports where the rule would have fired and whether the favoured seat then won.
+* **Who never resigns**: evaluation seats (the evaluations, Elo matches, anchors, `zero.h2h`, a game's Play
+  tab - `games.nn_seat` refuses `resign_t` on a seat that is not self-play, the driver on one that records
+  nothing), and every tool that builds its own seats (MTG Zero's blunder sidecar plays full games).
+* **Quotas**: a resigned game is one finished game - one result row - for the rolling quota, the shared
+  queue's quota (5.3), the local linger's held games and a remote's `fin` / accept: an iteration plays its
+  `games` games exactly as before, each shorter. Branched games (24) compose: a resigned game spawns its
+  branch, a branch resigns by its own count.
+* **Metrics** (`selfplay.resign`, only when on; the iteration's accepted games, this machine's and the
+  remote's): `games`, `resigned` / `resigned_share`, `noresign`, `would` (no-resign games where the rule
+  fired) / `would_share`, `wrong` (of those, the favoured seat did not win: a loss or a draw) / `wrong_rate` -
+  **the live wrong-resignation rate** -, `rows_saved` and `decisions_saved` (the share of the no-resign games'
+  samples and searched decisions after the point where they would have resigned: what resigning saves per
+  game), `samples_per_game` {resigned, noresign}, `remote` {games, resigned, noresign}. A log line per
+  iteration (`iter i resign: ...`) and the settings at the run's start (`self-play resignation
+  (zero/resign.py): t=... k=... noresign=...`).
+* **Remote self-play** (5.3): the workers resign exactly as this machine. A worker's hello reports its
+  `resign.fingerprint` (t, k, share); one whose checkout plays otherwise - an older checkout reports nothing -
+  is refused, retried in 10 minutes, and the run plays on alone: never a worker playing every game out in
+  silence. Its accepted games' tally comes back in its end line and joins the iteration's metrics.
+
+### 27.3 Off by default
+
+`selfplay_resign_t` 0 (the default): the seat dict has no key, no row a `resign` field, no metric, no log line:
+the run of before byte for byte (27.5). `selfplay_resign_noresign` 1 is a **dry run**: no game resigns, the
+games are those of the run without it (nothing reads a stream) and every row reports where it would have -
+the rule measured on the live run at no cost. Refused at the start (`resolve_config`): t outside [0, 0.5), k < 1, a
+share outside [0, 1]; co-training (`resolver`, and a `resolver_cfg` with it: deferred terminals take their
+outcome from outside), the self-play league (its opponent seat copies the self-play seat; one counter per
+game), `players` other than 2.
+
+### 27.4 Costs, and what changes in the data
+
+* **Compute**: a few comparisons per full search. Memory: none.
+* **The rows**: a resigned game records only its rows up to the firing search, so the window holds fewer
+  decided-position rows - the no-resign games' and the rows before each resignation remain. That is the
+  intent (they are the rows the value head already predicts at 99% and whose policy targets carry no
+  gradient), and the risk: a value head trained on fewer decided positions may drift in them, which shows up
+  first as a rising `wrong_rate`.
+* **A wrong resignation** gives every row of its game the wrong z (the rule's call is not the played-out
+  outcome). In self-play both seats are the network, so a wrong resignation is its own misjudgement of a
+  position it then would have lost; the no-resign games measure the rate every iteration.
+* **The margin and score of a resigned game** are the position's where it resigned: its records' `sc`
+  (`margin()`, the margin head's target at `margin_loss_w`) and its row's `scores` (`avg_score`) are
+  mid-game values, and `rounds`, `steps_per_game`, `decisions_per_game` fall with the resignations.
+* **Throughput**: an iteration of the same `games` searches fewer decisions. `decisions_saved` is the share
+  of a game's searched decisions that resigning saves (averaged over the no-resign games, those that never
+  fired counting 0), so a game costs about 1 - (1 - the no-resign share) x `decisions_saved` of one played out,
+  and its rows fall by about (1 - the share) x `rows_saved` - per iteration in the metrics.
+
+### 27.5 Tests and checks
+
+`cargo test` 118 + webnet 3 (the driver's six resignation tests, docs/search.md 3.14; every golden record and
+match unchanged); `tools/check_checkpoint_compat.py` main (aae4ca2) vs this branch on the toy, random network:
+identical (records, results, the match); `tests/test_resign.py` (10: the bindings - a resigned game is its dry
+twin up to the firing search with the resignation's z, the draw, the settings refused -, the run settings, a
+rolling toy run of 3 x 96 games with exact quotas and the metrics, off has none, remote self-play with the
+remote 'local' and the local linger - exact shared quotas with resigned games counted, the remote's tally in the
+metrics -, an older worker refused by its hello); `test_bindings.py` + `test_forks.py` 27 passed; `-k 'refused
+or older or eval_cache or local_linger'` 16 passed. MTG Zero main 619f1f2 builds against this branch.
+
+### 27.6 What it measured on MTG Zero's Delver mirror
+
+**Offline, the exact rule** (2026-11-04, numpy on the desktop's CPU: `E:/mtg-zero-scratch/ideas-2/offline_resign.py`,
+`offline_grid.py`, on the review-5 offline screens' rows of gens 855 and 859 - 522 + 436 whole games, 90,061 rows,
+60,232 decision rows; the run's seat records its full searches only, so the decision rows are exactly the
+searches the rule counts). Per game, the rule is replayed over its decision rows in order (both seats, the
+row's q by absolute seat, the favoured seat the first maximum); a resignation keeps the firing decision's row
+and its value-only rows; wrong = the favoured seat did not win (no draws occurred).
+
+| t | k | games resigned | rows saved | wrong (of resigned) | 855 / 859 wrong | games per hour at share 0.1 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.01 | 3 | 76.7% | 21.9% | 2 / 735 = 0.27 +- 0.19% | 0.51 / 0.00% | x1.25 |
+| 0.02 | 2 | 87.9% | 28.9% | 7 / 842 = 0.83 +- 0.31% | 0.89 / 0.77% | x1.35 |
+| **0.02** | **3** | **82.6%** | **26.4%** | **7 / 791 = 0.88 +- 0.33%** | 0.95 / 0.81% | **x1.31** |
+| 0.02 | 5 | 73.6% | 22.1% | 2 / 705 = 0.28 +- 0.20% | 0.27 / 0.30% | x1.25 |
+| 0.03 | 3 | 86.1% | 29.8% | 10 / 825 = 1.21 +- 0.38% | 1.13 / 1.31% | x1.37 |
+| 0.05 | 3 | 90.6% | 35.2% | 21 / 868 = 2.42 +- 0.52% | 2.75 / 2.02% | x1.46 |
+| 0.05 | 5 | 80.9% | 29.7% | 13 / 775 = 1.68 +- 0.46% | 2.14 / 1.13% | x1.37 |
+| 0.05 | 8 | 71.2% | 24.3% | 7 / 682 = 1.03 +- 0.39% | 1.09 / 0.95% | x1.28 |
+| 0.10 | 5 | 88.9% | 38.9% | 28 / 852 = 3.29 +- 0.61% | 3.85 / 2.60% | x1.54 |
+
+(Rows saved = decision rows saved within 0.2 points; games per hour = 1 / (1 - 0.9 x decisions saved), if a
+game's time scales with its searched decisions - decided positions are not cheaper than average, Fable's 2.2.)
+**The threshold matters more than the count**: at ~29% saved, t 0.02 / k 2 is wrong half as often as t 0.05 /
+k 5. Fable's numbers for t 0.05 / k 5 (32.2% / 31.4% saved, 8 / 5 wrong) counted any recorded row, value-only
+rows included (their q is the observer's next search); counting searches only, as the driver does, gives
+30.5% / 28.8% saved and 9 / 4 wrong.
+
+**The driver on MTG** (2026-11-04, `E:/mtg-zero-scratch/ideas-2/mtg_smoke.py`: MTG Zero main 619f1f2 built on this
+branch, the Delver line's exact self-play seat from checkpoint 1000's config.json - 64 / 16 simulations, p_full
+0.25, 4 minor, the cq target, root-view values, the root belief, value-only samples 0.5 - plus `eval_cache` 8192
+and resignation; 32 games a run on the desktop's CPU at idle priority beside the live line, CUDA hidden). For
+every game the rule replayed over its own records' decision rows (`offline_resign.fire`) fires exactly where the
+driver resigned - and in a no-resign game where it said it would have, and never where it never fired -; every
+resigned game's z is the favoured seat's win and its samples its `records`; every game's no-resign flag is
+`noresign_pick`'s: **0 mismatches in 96 games**.
+
+| run | resigned | no-resign games that would have / wrongly | never fired | seconds |
+|---|---:|---:|---:|---:|
+| t 0.05, k 5, share 0.25 | 20 | 4 / 0 | 8 | 137 |
+| t 0.02, k 3, share 0.25 | 21 | 5 / 0 | 6 | 107 |
+| t 0.05, k 5, share 1 (dry run: every game played out) | 0 | 24 / 1 | 8 | 163 |
+
+The dry run's 24 firings would have saved 26.5% of its rows and 26.7% of its searched decisions (offline at
+t 0.05, k 5 on gens 855 / 859: 29.7%); its one wrong call favoured seat 1 at decision 122 of 272 and seat 0 won.
+137 s against 163 s for the same 32 games at share 0.25 (-16%; the CPU beside the live line, a run's tail
+its slowest game's: indicative only, not a throughput measurement). Resigned games averaged 13.1 turns and
+62 samples, played-out ones 81 samples.
+
+### 27.7 The recommended A/B and its kill rule
+
+Not launched. **Fork**: the line's checkpoint and settings plus `selfplay_resign_t 0.02 selfplay_resign_k 3
+selfplay_resign_noresign 0.1` and `games 2000` (x1.25: a generation then takes about the control's self-play
+time and records about its rows - offline 26% fewer rows per game x 0.9 resigning -, so the two arms compare at
+equal compute per generation and the fork has seen 1.25x the games); **control**: the line as is (1,600 games).
+Both from the same checkpoint, 40 generations (the `E:/mtg-zero-scratch/forked-games/launch.sh` pattern). The
+fork's remote workers (the Mac) must run this zero-core: an older checkout is refused by its hello, never
+silently playing its games out.
+A cheaper first step, if the line is relaunched on this core anyway: a **dry run** (`selfplay_resign_noresign
+1` with t 0.02, k 3) for a few generations - the line's games unchanged - measures the rule on the live network
+(`selfplay.resign.would_share`, `wrong_rate`, `rows_saved`) before any arm resigns.
+
+Readouts per generation: `selfplay.resign` (wrong_rate, would_share, rows_saved, decisions_saved,
+resigned_share), `selfplay.seconds` and `samples` (fork ~ control), fresh-row value CE, the blunder
+fingerprints, then the paired GPU h2h at +20 / +40 against the control (within noise or better: resignation
+paid for itself; the data-rate argument predicts +).
+
+**Kill rule**: the wrong-resignation rate of the no-resign games (`wrong / would`), pooled over the last 10
+generations (~165 would-have-resigned games a generation at 2,000 games x 0.1 x ~0.83: se ~0.25% at 1%),
+must stay **below 3%**; stop the fork when it reaches 3%, or when a single generation is above 8% (a gross
+failure: ~4 se above 3% at ~165 games), or when the h2h at +40 is -20 or worse. A rate that creeps up generation after generation
+while still under 3% is the value head drifting in the positions it no longer trains on: raise the no-resign
+share to 0.2 or lower t to 0.01 before it reaches the line.
