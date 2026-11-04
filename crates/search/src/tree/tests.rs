@@ -81,6 +81,39 @@ fn visits_add_up() {
 }
 
 #[test]
+fn shape_counts_every_walk_and_edge() {
+    // a fresh search: every walk but the terminal ones expanded one node, the root's own evaluation the first
+    let mut rng = Rng::new(11);
+    let mut checked = 0;
+    for s in 0..20 {
+        let g = mid_game(s, 10 + s as usize);
+        if g.over {
+            continue;
+        }
+        let p = g.to_move().unwrap();
+        let mut t = Tree::new(&g, p, &legal_of(&g), true, &mut rng);
+        let term = search(&mut t, &g, 120, &mut rng, &W);
+        let sh = t.shape();
+        assert_eq!(sh.nodes as usize, t.n_nodes(), "a fresh tree holds no garbage");
+        assert_eq!(sh.expanded as usize + term, 120);
+        assert_eq!(sh.depth_hist.iter().sum::<u32>(), sh.expanded);
+        assert_eq!(sh.opp_hist.iter().sum::<u32>(), sh.expanded);
+        assert_eq!(sh.switch_hist.iter().sum::<u32>(), sh.expanded);
+        assert_eq!(sh.depth_hist[0], 1, "the root");
+        assert!(sh.depth_hist.len() as u32 <= sh.max_depth + 1);
+        // every node but the root is one edge's child: the edges' children add up to the nodes
+        assert_eq!(sh.edges.iter().map(|e| e.kids).sum::<u32>() + 1, sh.nodes);
+        let root_n: u32 = sh.edges.iter().filter(|e| e.depth == 0).map(|e| e.n).sum();
+        assert_eq!(root_n, t.tot(t.root));
+        let ml = sh.main_line.first().unwrap();
+        assert_eq!(ml.n, *t.visits(t.root).iter().max().unwrap());
+        assert!(sh.main_line.windows(2).all(|w| w[1].n <= w[0].n));
+        checked += 1;
+    }
+    assert!(checked > 10);
+}
+
+#[test]
 fn search_reaches_terminals_late() {
     let mut rng = Rng::new(2);
     // a game near its end: simulations hit terminal states

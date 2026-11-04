@@ -84,6 +84,11 @@ def test_search_tree_api():
         t.expand([1 / len(acts)] * len(acts), [0.5, 0.5], [0, 0])
     assert t.root_expanded and sum(t.root_visits) == 63 and t.root_acts == g.legal()
     assert abs(sum(t.root_win()) - 1) < 1e-6
+    # the shape diagnostic (docs/search.md 3.15): every node once, the walk length of the last simulation
+    sh = t.shape()
+    assert sh['nodes'] == t.n_nodes and sum(sh['depth_hist']) == sh['expanded'] <= 64 and sh['depth_hist'][0] == 1
+    assert sum(e[2] for e in sh['edges'] if e[0] == 0) == 63 and sh['main_line'][0][2] == max(t.root_visits)
+    assert sum(sh['opp_hist']) == sum(sh['switch_hist']) == sh['expanded'] and 1 <= t.path_len <= sh['max_depth']
     with pytest.raises(RuntimeError):
         t.expand([1.0], [1.0], [0.0])                  # no pending leaf
 
