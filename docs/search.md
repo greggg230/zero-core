@@ -1174,6 +1174,93 @@ Code: `driver.rs` (`NnSeat::eval_cache`, `Cached`, `LeafPart`, `cache_key`, `Slo
 emptying in `init_slot` / `restart_search`), the bindings (seat key `eval_cache`, the stats); Python
 `games.nn_seat(eval_cache=)`, `run.py` (`eval_cache`, `Run.cache_metrics`).
 
+### 3.13 A prior exponent in the 'cq' target (`cq_prior_w`; MTG Zero's Delver mirror, 2026-11-04)
+
+**Why.** The 'cq' target of 3.1 is `pi' ~ P0 exp(sigma completedQ)` with P0 the prior of the network that
+plays. The policy fits its targets (MTG Zero's Delver line: train policy CE = the targets' entropy), so from
+generation to generation `pi_{t+1} ~ pi_t exp(sigma Q_t)`, and after T generations `logit_T = ln pi_0 + sigma
+sum_t Q_t`: **the policy's logits are the cumulative sum of every advantage a search ever measured, with no
+forgetting.** Three consequences, all visible on the Delver line: a favourite whose Q sits a hair above v_mix
+gains a little every generation, so the targets drift to one-hot (gen 859's 26,746 recorded decision rows:
+max-share > 0.99 in 54.6%, > 0.999 in 38.7%; 52.2% with normalised entropy < 0.05); an option visited once on a
+bad leaf loses sigma x delta logits at once and, once its prior is low enough that PUCT stops visiting it,
+is never measured again (an unvisited option's completed Q is v_mix, about the favourite's: it neither gains
+nor recovers); and the targets' entropy falls whatever the strength does (0.35 -> 0.20 over 1,000
+generations while the anchored Elo was flat for hundreds at a time). Fable's review of 2026-11-04 (MTG Zero
+hub notes, `E:/mtg-zero-scratch/fable-ideas/report.md` 2.1) ranked it first.
+
+**What it does.** A 'cq' seat's prior exponent beta (`PolicyTarget::CompletedQ::prior_w`; the bindings'
+seat key `cq_prior_w`, run setting `cq_prior_w`) records
+
+```
+pi' = softmax(beta ln max(P0, PRIOR_FLOOR) + sigma(completedQ))      beta in (0, 1]; 1 = the target of 3.1
+```
+
+i.e. `pi' ~ P0^beta exp(sigma completedQ)`. Fitted generation after generation, `logit_T = beta^T ln pi_0 +
+sigma sum_t beta^(T-t) Q_t`: an exponentially weighted sum with a bounded fixed point `pi ~ exp(sigma Q /
+(1 - beta))`, and the log-ratio of an option no search measures to the favourite shrinks by the factor beta
+a generation, so within ~1/(1 - beta) generations its prior is high enough again for the root noise and
+PUCT to visit it and its Q is measured afresh. At the Delver line's sigma (c_visit 50, c_scale 0.3, 64
+simulations: (50 + max N) x 0.3 ~ 30): a systematic 1-pp Q gap is worth 0.3 logits a generation forever at
+beta 1, 1.5 logits at the fixed point at beta 0.8 (82 / 18; a dead option relaxes in ~5 generations), 0.75 at
+0.6 (68 / 32; ~2.5 generations), 0.6 at 0.5.
+
+* **Only the prior's term.** v_mix keeps its P0 weights (the completed value of the unvisited options is the
+  search's estimate of the node, not part of the target's regulariser) and sigma is unchanged. The logits are
+  `completed_q_logits + (beta - 1) ln max(P0, PRIOR_FLOOR)` in f64, then the softmax (`tree::completed_q_policy_w`,
+  `Tree::cq_target_w`); at beta 1 the term is skipped: `completed_q_policy` / `cq_target` are those functions at
+  1.0, bit for bit.
+* **Only the recorded target.** The worker's record (`decide`) is the one reader. The search (PUCT and its
+  priors, root noise, temperature), the 'cq' move rule (`Select::Cq`, `completed_q_logits`, 3.3), the Gumbel
+  root's scores, schedule and move (3.7), the root value q, z and the value-only samples are those of beta 1:
+  for the same network a seat plays the same games at every beta, and two runs of an A/B diverge only through
+  what their networks learn. (MTG Zero's ENGINE.md 59: a training A/B must never move the evaluation rule.)
+* Python reference: `mcts.completed_q_policy(..., prior_w)` / `mcts.cq_target(..., prior_w)` (the same
+  arithmetic), `play.NNSeat(cq_prior_w=)` for the Python driver; `mcts.check_cq_prior_w`.
+
+**Settings.** Seat key `cq_prior_w` (absent = 1.0; refused outside (0, 1], and anything but 1.0 with
+`policy_target` 'visits', which has no prior term to scale); `games.nn_seat(cq_prior_w=)` adds the key only
+when != 1. Run setting `cq_prior_w` (default 1.0) goes to the self-play seat alone (`Run.nn_seat(selfplay=True)`,
+so the local linger's and the remote's seats too; evaluation seats record nothing), checked by
+`check_eval_settings` (also for `resolver_cfg`). Bindings: `SearchTree.root_cq_target(c_visit, c_scale,
+prior_w=1.0)` and the module function `completed_q_policy(p0, n, w, v, c_visit=50, c_scale=1, prior_w=1)` (the
+parity tests' handle on the Rust arithmetic).
+
+**Off by default.** beta 1.0: no seat key, `PolicyTarget::parse` gives `prior_w` 1.0, and the records are those
+of before byte for byte (`driver::tests::GOLDEN_CQ_RECORDS` / `GOLDEN_CQ_SKEWED_RECORDS`: digests of aae4ca2's
+'cq' records, before the setting existed; `tools/check_checkpoint_compat.py --package zero --net random --game
+toy` against aae4ca2: identical).
+
+**Costs.** One `ln` and one multiply-add per option of each recorded decision. Nothing in the search.
+
+**Remote self-play.** A remote worker builds its seat from the run's config.json with its own checkout: one
+without this setting would record beta-1 targets in silence (docs/az.md 18.5's gap). MTG Zero's Mac checkout is
+the run's commit (`RunCommitRemote`); any other remote must run a checkout with this core.
+
+**Tests.** `tree::tests::completed_q_prior_w_by_hand` (50-digit references at beta 0.5 / 0.6 / 0.7 / 0.8;
+nothing visited -> P0^beta normalised, 0.8 / 0.2 at 0.5 -> 2 / 1; beta 1 = `completed_q_policy` bit for bit;
+`ln pi_beta - ln pi_1 = (beta - 1) ln P0 + const`; a zero prior; one option; the tree's target),
+`driver::tests::cq_prior_w_changes_only_the_recorded_targets` (prior_w 1.0 reproduces aae4ca2's 'cq' record
+digests; skewed priors, beta 0.8 and 0.5: the same games and every record field but pi equal, > 90% of the
+targets differ, the log-ratio identity per root within 1e-3, normalised entropy up and max-share down at each
+step; with the 'cq' move rule and with the Gumbel root, beta 0.6 plays the same games; beta 0, -0.5, 1.0001, 2,
+NaN, inf refused, 'visits' takes 1.0 only), pytest `tests/test_cq_prior_w.py` (the hand-checked numbers in Python
+and Rust; 40 random (P0, N, W, v, beta) Python = Rust within 1e-6; the Python formula on Rust roots at beta 1 /
+0.8 / 0.5 / 0.2; the Rust driver and the Python driver (both trees): only pi changes; the seat key and its
+refusals; the run setting reaching the self-play seat only).
+
+**Measured.** The toy (skewed priors, c_scale 0.3, 24 games, 371 records): mean normalised entropy of the
+targets 0.546 (beta 1) -> 0.576 (0.8) -> 0.605 (0.6) -> 0.619 (0.5), mean max-share 0.641 -> 0.624 -> 0.608 ->
+0.600. MTG Zero's Delver line (its checkpoint 1000 and exact self-play seat, 24 games on the CPU, the same driver
+seed: the same games at every beta, 1,475 recorded decisions): targets with max-share > 0.99 56.9% at beta 1 (the
+prior itself: 51.9% - the search sharpens it every generation), 48.6% at 0.8, 38.2% at 0.6; details and the planned
+A/B in docs/az.md 26.
+
+Code: `tree.rs` (`completed_q_policy_w`, `Tree::cq_target_w`), `driver.rs` (`PolicyTarget::CompletedQ::prior_w`,
+`PolicyTarget::with_prior_w`), `driver/worker.rs` (`decide`'s record), `dynapi.rs` (`root_cq_target`), the
+bindings (seat key, `root_cq_target`, `completed_q_policy`); Python `mcts.py`, `games.py`, `play.py`, `run.py`,
+`parity.py` (`cq_formula(prior_ws=)`).
+
 ### 3.14 Self-play resignation with a no-resign share (`resign_t`; MTG Zero's Delver mirror, 2026-11-04)
 
 **Why.** A third of a self-play game's searches can come after the game is decided. Measured on MTG Zero's

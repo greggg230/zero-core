@@ -100,7 +100,7 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             root_min_visits=0, root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
             view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
             root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
-            eval_cache=0, resign_t=0.0, resign_k=5, resign_noresign=0.1):
+            eval_cache=0, resign_t=0.0, resign_k=5, resign_noresign=0.1, cq_prior_w=1.0):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
@@ -130,10 +130,14 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     and options a game already sent is answered from the cache, not sent; 0 = off: no key, the seat of
     before). resign_t: self-play resignation (docs/search.md 3.14; a self-play seat that records): a game ends
     when resign_k consecutive full searches found one seat's root win estimate >= 1 - resign_t, scored as that
-    seat's win; a share resign_noresign of the games never resigns (0 = off: no keys, the seat of before)."""
-    from .mcts import (check_belief, check_leaf_view, check_root_min, check_root_search, check_select,
-                       check_select_transform, select_transform)
+    seat's win; a share resign_noresign of the games never resigns (0 = off: no keys, the seat of before).
+    cq_prior_w: beta, the prior's exponent in the recorded 'cq' target (docs/search.md 3.13:
+    softmax(beta ln P0 + sigma completedQ), in (0, 1]; the moves never read it; 1 = off: no key, the seat
+    of before)."""
+    from .mcts import (check_belief, check_cq_prior_w, check_leaf_view, check_root_min, check_root_search,
+                       check_select, check_select_transform, select_transform)
     check_select(select, select_min_visits)
+    check_cq_prior_w(cq_prior_w, policy_target)
     check_root_search(root_search, gumbel_m, gumbel_scale, gumbel_c_visit, gumbel_c_scale)
     if root_search == 'gumbel' and root_min_visits:
         raise ValueError("root_min_visits with root_search 'gumbel': exclusive (sequential halving already visits "
@@ -180,6 +184,8 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
         d['eval_cache'] = int(eval_cache)
     if resign_t:
         d.update(resign_t=float(resign_t), resign_k=int(resign_k), resign_noresign=float(resign_noresign))
+    if cq_prior_w != 1.0:
+        d['cq_prior_w'] = float(cq_prior_w)
     return d
 
 

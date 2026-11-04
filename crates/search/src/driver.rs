@@ -97,7 +97,10 @@ pub enum PolicyTarget {
     Visits,
     /// Gumbel AlphaZero's completed-Q target `softmax(ln P0 + (c_visit + max N) c_scale
     /// completedQ)` (`tree::completed_q_policy`; Danihelka et al. 2022: c_visit 50, c_scale 1).
-    CompletedQ { c_visit: f64, c_scale: f64 },
+    /// `prior_w` = beta, the prior's exponent in the recorded target, `softmax(beta ln P0 + ...)`
+    /// (`tree::completed_q_policy_w`, docs/search.md 3.13; 1.0 = the target of before, bit for
+    /// bit): the target only, never the 'cq' move rule, the Gumbel root or v_mix.
+    CompletedQ { c_visit: f64, c_scale: f64, prior_w: f64 },
 }
 
 impl PolicyTarget {
@@ -109,9 +112,25 @@ impl PolicyTarget {
                 if !(c_visit.is_finite() && c_visit >= 0.0 && c_scale.is_finite() && c_scale >= 0.0) {
                     return Err(format!("policy_target 'cq' needs finite cq_c_visit >= 0 and cq_c_scale >= 0 (got {c_visit}, {c_scale})"));
                 }
-                Ok(PolicyTarget::CompletedQ { c_visit, c_scale })
+                Ok(PolicyTarget::CompletedQ { c_visit, c_scale, prior_w: 1.0 })
             }
             _ => Err(format!("policy_target {name:?}: 'visits' or 'cq'")),
+        }
+    }
+
+    /// The target with the prior exponent `prior_w` (seat key `cq_prior_w`, docs/search.md 3.13):
+    /// beta in (0, 1] for 'cq' (1.0 = the target of before); 'visits' has none (only 1.0 is
+    /// accepted, so a beta never goes unread).
+    pub fn with_prior_w(self, prior_w: f64) -> Result<PolicyTarget, String> {
+        match self {
+            PolicyTarget::CompletedQ { c_visit, c_scale, .. } => {
+                if !(prior_w > 0.0 && prior_w <= 1.0) {
+                    return Err(format!("cq_prior_w {prior_w}: the prior's exponent in the 'cq' target, in (0, 1] (1 = off)"));
+                }
+                Ok(PolicyTarget::CompletedQ { c_visit, c_scale, prior_w })
+            }
+            PolicyTarget::Visits if prior_w == 1.0 => Ok(self),
+            PolicyTarget::Visits => Err(format!("cq_prior_w {prior_w}: a setting of policy_target 'cq' ('visits' has no prior term)")),
         }
     }
 }
@@ -1507,8 +1526,8 @@ impl<G: SearchGame> Driver<G> {
                     if cfg.keys.get(n.key as usize).map(|k| k.1) != Some(KeyKind::Nn) {
                         return Err("network seat: bad evaluator key".into());
                     }
-                    if let PolicyTarget::CompletedQ { c_visit, c_scale } = n.policy_target {
-                        PolicyTarget::parse("cq", c_visit, c_scale)?;
+                    if let PolicyTarget::CompletedQ { c_visit, c_scale, prior_w } = n.policy_target {
+                        PolicyTarget::parse("cq", c_visit, c_scale)?.with_prior_w(prior_w)?;
                     }
                     if !(n.view_samples.is_finite() && (0.0..=1.0).contains(&n.view_samples)) {
                         return Err(format!("view_samples {}: a share in [0, 1] (0 = off)", n.view_samples));

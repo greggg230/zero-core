@@ -107,6 +107,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `c_puct`, `alpha`, `eps`, `temp_moves` | 1.0, 0.3, 0.25, 20 | PUCT constant (values in [0, 1]), root Dirichlet noise, sampled moves per game |
 | `chance_k`, `margin_w`, `redet`, `max_steps` | 0, 0, 1, 100000 | sampled chance outcomes kept per edge (0 = resample every visit), utility margin credit, fresh determinization per simulation, abandon a game after this many moves |
 | `policy_target`, `cq_c_visit`, `cq_c_scale` | visits, 50, 1.0 | training target of the recorded decisions: the root visit distribution, or Gumbel AlphaZero's completed-Q target (docs/search.md 3.1, section 9); the search is the same |
+| `cq_prior_w` | 1.0 | beta in (0, 1]: the prior's exponent in self-play's recorded 'cq' targets, softmax(beta ln P0 + sigma completedQ) (docs/search.md 3.13): < 1 turns the generations' cumulative sum of advantages into a bounded fixed point exp(sigma Q / (1 - beta)), so an option no search visits recovers and is re-measured; the self-play seat only, never its moves (PUCT, temperature, `selfplay_select`, the Gumbel root) or an evaluation; needs `policy_target` 'cq' (26) |
 | `hidden`, `blocks` | 256, 4 | network size (only when the run's first network is created) |
 | `arch`, `ch` | 'mlp', 64 | 'grid': a `GridNet` of `ch` channels x `blocks` over the package's board grid (Kingdom Builder: 16 planes x 20 x 20; bfloat16 autocast on CUDA for inference and training; not in zero.webexport); 'tokens': a `TokenNet` of width `hidden`, `blocks` layers over the package's object layout (section 10; not in zero.webexport) |
 | `heads`, `ff` | 4, 0 | arch 'tokens': attention heads, feed-forward width (0 = 2 x hidden) |
@@ -3771,6 +3772,112 @@ the priors): N 8,192 at 768 games in flight is at most ~0.7 GB.
 driver's golden records and matches unchanged with the cache off); on the MacBook the ten golden tests fail
 alike on main 96f1566 and on this branch, with the same digests (the goldens are the desktop's floats);
 pytest `test_loop.py::test_eval_cache_setting`.
+
+## 26. A prior exponent in the 'cq' target (`cq_prior_w`; MTG Zero's Delver mirror, 2026-11-04)
+
+The semantics are docs/search.md 3.13; this section is the run-level view.
+
+### 26.1 Why
+
+With `policy_target` 'cq' the recorded target is `softmax(ln P0 + sigma completedQ)` with P0 the playing
+network's own prior, and the network fits its targets: generation after generation the policy's logits add up
+every advantage a search measured and forget none. On MTG Zero's Delver line the targets have drifted to one-hot
+(gen 859: 54.6% of the recorded decisions with max-share > 0.99, 38.7% > 0.999; the targets' mean normalised
+entropy 0.35 -> 0.20 between gens 40 and 1096) while the habits human players beat it with stayed flat for
+hundreds of generations: an option PUCT stopped visiting is never measured again. A prior exponent beta < 1
+gives the generations' policy a bounded fixed point `exp(sigma Q / (1 - beta))` and lets a dead option's prior
+recover by the factor beta a generation until the search measures it again (Fable's review of 2026-11-04, its
+rank 1: `E:/mtg-zero-scratch/fable-ideas/report.md` 2.1).
+
+### 26.2 The setting
+
+`cq_prior_w` = beta (default 1.0 = off): self-play's recorded 'cq' targets are `softmax(beta ln P0 + sigma
+completedQ)`. It goes to the self-play seat alone (`Run.nn_seat(selfplay=True)`: this machine's, the local
+linger's and the remote workers'), never to an evaluation, and inside the seat to the recorded target alone: the
+moves (PUCT, root noise, temperature, `selfplay_select`, the Gumbel root), q and z are those of beta 1. It needs
+`policy_target` 'cq' and a value in (0, 1] (`resolve_config` / `check_eval_settings` exit otherwise, also for
+`resolver_cfg`). Off, the seat dict has no key and the run records and trains as before, byte for byte.
+
+**What changes with it on.** Only the `pi` of the recorded rows, so a run's first generation with it plays
+exactly the games it would have played; from the next one on its network differs (it trained on softer targets)
+and with it everything the network touches. The evaluation seats' rule and Elo pool are unchanged, so an A/B's
+arms share them. The readouts that show it: self-play's `target` (`h_norm` up, `max_share` down, from the first
+generation) and `train.entropy` (the policy's own entropy, a generation later). A remote worker must run a
+checkout with this core (docs/search.md 3.13: an older one would record beta-1 targets in silence; MTG Zero's Mac
+runs the run's commit).
+
+**Costs.** None measurable: one `ln` per option of each recorded decision.
+
+### 26.3 Measured: the targets at beta 1, 0.8 and 0.6 (MTG Zero's Delver line, CPU, 2026-11-04)
+
+The Delver line's checkpoint 1000 (r3-2b-float550) with its exact self-play seat (config.json: 64 / 16
+simulations, p_full 0.25, 4 minor, root noise, temp_moves 60, cq c_scale 0.3, root belief, root-view leaf values,
+value-only samples 0.5, plus the run's eval_cache 8192), 24 games on the desktop's CPU at idle priority beside the
+live run (2 search + 2 torch threads, ~210 s per beta), recorded (`take_samples`), once per beta with the same
+driver seed; an evaluator wrapper kept every leaf row's priors, so each recorded decision's P0 is known (all
+1,475). Script and data: `E:/mtg-zero-scratch/ideas-1/` (`cq_prior_probe.py`, `probe_24g.json`,
+`probe_24g_beta*.npz`, `analyze.py`).
+
+* **The games are identical** at the three betas: every result and every sample field but `pi` bit for bit
+  (2,235 samples, 1,475 decisions with 2+ options; 167,483 rows sent, 83,569 answered from the cache, each run).
+* **pi_beta = pi_1 P0^(beta - 1), normalised**: rebuilt offline from the beta-1 targets and the captured priors it
+  matches the driver's targets at 0.8 and 0.6 to 5e-8 (only the prior's term differs, as designed).
+
+| recorded targets (1,475 decisions) | P0 (the prior) | beta 1.0 (today) | 0.9 * | 0.8 | 0.7 * | 0.6 | 0.5 * |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| max-share > 0.9 | 75.1% | 76.7% | 74.5% | 71.4% | 69.1% | 65.4% | 59.7% |
+| max-share > 0.99 | 51.9% | **56.9%** | 53.2% | **48.6%** | 43.6% | **38.2%** | 31.3% |
+| max-share > 0.999 | 34.6% | 40.3% | 36.0% | 31.3% | 28.0% | 24.3% | 20.3% |
+| mean max-share | 0.916 | 0.919 | | 0.902 | | 0.876 | |
+| mean normalised entropy | 0.214 | 0.202 | 0.221 | 0.244 | 0.273 | 0.307 | 0.350 |
+| normalised entropy < 0.05 | 49.5% | 54.7% | 50.4% | 45.4% | 40.7% | 34.8% | 29.7% |
+| KL(pi \|\| P0), mean (median) | 0 | 0.021 (0.00004) | 0.025 | 0.033 (0.003) | 0.046 | 0.069 (0.020) | 0.109 |
+| argmax pi = argmax P0 | | 97.8% | | 97.2% | | 96.4% | |
+
+\* rebuilt offline from the beta-1 targets and P0 (exact up to f32 rounding: see the check above).
+
+The beta-1 row reproduces the line's own readouts (gen 859's offline screen: 75.7% / 54.6% / 38.7%, entropy 0.20;
+`metrics.jsonl` max-share 0.92). **At beta 1 the target is sharper than the prior** (56.9% vs 51.9% above 0.99):
+the ratchet, measured within one generation. beta 0.9 still sharpens (53.2%); **0.8 is about where the target
+stops sharpening the prior** (48.6%, mean max-share 0.902 vs the prior's 0.916); 0.6 softens it clearly.
+
+*Projected, not measured* (`analyze.py`, assuming the network fits its targets exactly and every option's
+completed Q stays what this search measured - an option whose prior rises would in fact be visited and its Q
+re-measured, so the projection overstates the softening of options no search visited): the share above 0.99
+after 1 / 5 / 10 generations and at the fixed point is 57 / 65 / 69% at beta 1 (still climbing), 49 / 34 / 30 /
+31% at 0.8, 38 / 20 / 20 / 20% at 0.6; at the fixed point the mean entropy is 0.52 at 0.8 and 0.62 at 0.6. The
+relaxation is fast (most of it within ~5 generations at 0.8), well inside a 40-generation A/B.
+
+### 26.4 The A/B (planned, not run)
+
+Recommended first arm: **beta 0.8** - it passes the review's kill test (a) (fewer than 50% of the targets above
+0.99 at the chosen beta: 48.6%), it is the first beta at which the targets stop out-sharpening the prior, and
+its fixed point keeps a 1-pp systematic Q gap at ~1.5 logits (docs/search.md 3.13) while the self-play policy
+softens least. 0.6 is the second arm if 0.8's lever proves too weak. The fork + control pattern of section 24
+(MTG Zero's `E:/mtg-zero-scratch/forked-games/launch.sh`), arms in turn, both from the line's checkpoint K,
+40 generations each at the line's flags: the fork `--cq-prior-w 0.8` on a build pinning this core, the control
+the line continued on its own pin. Endpoints at equal generations: self-play `target.h_norm` / `max_share`
+and `train.entropy` (the lever), paired GPU h2h fork N vs control N at K+20 and K+40 (1,200 games, 32 sims,
+the evaluation seat), the blunder sidecar's flat fingerprints (`fp_daze_tapout`, `fp_fow_pitch_fow`,
+`fp_fetch_now`, and `tam_flip_clean_pre`), the held-out canary half, fresh-row value CE at K+40. Stop rules:
+the fork's `target.h_norm` at K+5 less than 0.04 above the control's (no compounding beyond the first
+generation's +0.043) = too weak, rerun at 0.6; h2h <= -20 Elo at K+20 = too soft; entropy up and no fingerprint
+moved >= 5 points by K+40 with the h2h within noise = the ratchet was not the freeze (stop); a fingerprint moved
+>= 5 points with the h2h within noise = adopt (a relaunch flag; the evaluation pools are unchanged). The
+plan in full: `E:/mtg-zero-scratch/ideas-1/AB_PLAN.md`.
+
+### 26.5 Checks
+
+cargo test 114 + webnet 3 on the desktop (`tree::tests::completed_q_prior_w_by_hand`,
+`driver::tests::cq_prior_w_changes_only_the_recorded_targets`: prior_w 1.0 reproduces aae4ca2's 'cq' record
+digests; the driver's other golden records and matches unchanged); pytest `tests/test_cq_prior_w.py` (7),
+`test_policy_target.py` + `test_mcts.py` (17), `test_gumbel.py` + `test_bindings.py` (26);
+`tools/check_checkpoint_compat.py --package zero --net random --game toy` against aae4ca2: identical; the toy
+loop (`--preset toy-smoke --policy-target cq --cq-prior-w 0.6` vs 1.0): the first iteration's 385 samples
+alike, target `h_norm` 0.900 vs 0.878, then the networks diverge; MTG Zero main 619f1f2 builds against this
+core and plays the identical games of 26.3, and `check_checkpoint_compat.py --package mtgz` with the Delver
+line's checkpoint 1000 and its spec (8 games, 32 sims, 'visits' and 'cq' records, a match vs random), 619f1f2 on
+aae4ca2 vs 619f1f2 on this core: identical.
 
 ## 27. Self-play resignation with a no-resign share (`selfplay_resign_t`; MTG Zero's Delver mirror, 2026-11-04)
 

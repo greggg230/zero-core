@@ -317,6 +317,58 @@ fn cq_target_of_a_searched_root() {
     assert!(t.cq_target(t.root, 50.0, 1.0).is_empty());
 }
 
+#[test]
+fn completed_q_prior_w_by_hand() {
+    // docs/search.md 3.13: pi ~ P0^beta exp(sigma completedQ). References computed with 50-digit
+    // mpmath (E:/mtg-zero-scratch/ideas-1/ref_numbers.py; the Python test uses the same numbers).
+    let (p0, n, w) = ([0.5f32, 0.3, 0.2], [6u32, 3, 0], [3.6f64, 2.4, 0.0]);
+    let pi = completed_q_policy_w(&p0, &n, &w, 0.5, 50.0, 0.1, 0.5);
+    assert!(close(&pi, &[0.2354746509, 0.5590229101, 0.205502439], 1e-6), "{pi:?}");
+    let pi = completed_q_policy_w(&p0, &n, &w, 0.5, 50.0, 1.0, 0.7);
+    assert!(close(&pi, &[1.954679451e-5, 0.9997228533, 0.0002575999492], 1e-6), "{pi:?}");
+    let (p1, n1, w1) = ([0.9f32, 0.08, 0.02], [27u32, 4, 1], [27.0 * 0.40, 4.0 * 0.47, 0.60]);
+    let pi = completed_q_policy_w(&p1, &n1, &w1, 0.45, 50.0, 0.3, 0.6);
+    assert!(close(&pi, &[0.07987888371, 0.09418779954, 0.8259333168], 1e-6), "{pi:?}");
+    // a favourite at 0.97 with a hair more Q than v_mix: beta 0.8 gives the unvisited option back
+    // a share of its own (the ratchet of section 3.13)
+    let (p2, n2, w2) = ([0.97f32, 0.02, 0.01], [60u32, 3, 0], [60.0 * 0.55, 3.0 * 0.52, 0.0]);
+    let pi = completed_q_policy_w(&p2, &n2, &w2, 0.55, 50.0, 0.3, 0.8);
+    assert!(close(&pi, &[0.9597958246, 0.01598210311, 0.02422207231], 1e-6), "{pi:?}");
+    assert!(pi[0] < completed_q_policy(&p2, &n2, &w2, 0.55, 50.0, 0.3)[0]);
+    // nothing visited (every option at v): P0^beta normalised, 0.8 / 0.2 at beta 0.5 -> 2 / 1
+    let pi = completed_q_policy_w(&[0.8, 0.2], &[0, 0], &[0.0; 2], 0.5, 50.0, 1.0, 0.5);
+    assert!(close(&pi, &[2.0 / 3.0, 1.0 / 3.0], 1e-6), "{pi:?}");
+    // 1.0 is completed_q_policy bit for bit, everywhere
+    for (p, nn, ww, v, cs) in [
+        (&p0[..], &n[..], &w[..], 0.5, 1.0),
+        (&p1[..], &n1[..], &w1[..], 0.45, 0.3),
+        (&p2[..], &n2[..], &w2[..], 0.55, 0.3),
+        (&[1.0f32, 0.0, 0.0][..], &[3u32, 1, 0][..], &[1.5f64, 0.9, 0.0][..], 0.5, 1.0),
+    ] {
+        assert_eq!(completed_q_policy_w(p, nn, ww, v, 50.0, cs, 1.0), completed_q_policy(p, nn, ww, v, 50.0, cs));
+    }
+    // the log-ratio of two targets of one node is (beta - 1) ln P0 + a constant: only the prior's
+    // term moves, v_mix and sigma do not
+    let (a, b) = (completed_q_policy_w(&p1, &n1, &w1, 0.45, 50.0, 0.3, 0.6), completed_q_policy(&p1, &n1, &w1, 0.45, 50.0, 0.3));
+    let d: Vec<f64> = (0..3).map(|k| (a[k] as f64).ln() - (b[k] as f64).ln() - (0.6 - 1.0) * (p1[k] as f64).ln()).collect();
+    assert!(d.iter().all(|x| (x - d[0]).abs() < 1e-5), "{d:?}");
+    // a zero prior stays finite (floored); softer than beta 1 but still ~0 next to a real option
+    let pi = completed_q_policy_w(&[1.0, 0.0, 0.0], &[3, 1, 0], &[1.5, 0.9, 0.0], 0.5, 50.0, 1.0, 0.5);
+    assert!(pi.iter().all(|x| x.is_finite() && *x >= 0.0) && (pi.iter().sum::<f32>() - 1.0).abs() < 1e-6 && pi[0] > 0.999, "{pi:?}");
+    // a single option: 1
+    assert_eq!(completed_q_policy_w(&[1.0], &[7], &[3.0], 0.4, 50.0, 1.0, 0.3), vec![1.0]);
+    // the tree's target: the formula over the root's statistics; 1.0 = cq_target
+    let mut rng = Rng::new(12);
+    let g = mid_game(31, 13);
+    let p = g.to_move().unwrap();
+    let mut t = Tree::new(&g, p, &legal_of(&g), true, &mut rng);
+    search(&mut t, &g, 120, &mut rng, &W);
+    let r = t.root;
+    assert_eq!(t.cq_target_w(r, 50.0, 0.3, 1.0), t.cq_target(r, 50.0, 0.3));
+    let want = completed_q_policy_w(&t.priors0(r), &t.visits(r), &t.values(r), t.value0(r), 50.0, 0.3, 0.7);
+    assert_eq!(t.cq_target_w(r, 50.0, 0.3, 0.7), want);
+}
+
 // ------------------------------------------------------------------ deferred terminals, teams
 
 use crate::toy_team::ToyTeam;

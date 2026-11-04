@@ -216,7 +216,23 @@ pub const PRIOR_FLOOR: f64 = f32::MIN_POSITIVE as f64;
 /// so Q is P(win) in [0, 1] with `margin_w` 0: no further normalisation), `v`: the decider's
 /// network utility. Computed in f64; the result sums to 1 (f32).
 pub fn completed_q_policy(p0: &[f32], n: &[u32], w: &[f64], v: f64, c_visit: f64, c_scale: f64) -> Vec<f32> {
+    completed_q_policy_w(p0, n, w, v, c_visit, c_scale, 1.0)
+}
+
+/// `completed_q_policy` with a prior exponent `prior_w` (beta; docs/search.md 3.13):
+/// `softmax(beta ln max(P0, PRIOR_FLOOR) + (c_visit + max N) c_scale completedQ)`, i.e.
+/// `pi' ~ P0^beta exp(sigma completedQ)`. Only the prior's term is scaled: `v_mix` keeps its P0
+/// weights, and `completed_q_logits` (the 'cq' move rule's and the Gumbel root's arithmetic) has
+/// no beta. 1.0 = `completed_q_policy` bit for bit (the logits are not touched). The logits are
+/// `completed_q_logits` plus `(beta - 1) ln max(P0, PRIOR_FLOOR)` (the Python reference's
+/// arithmetic too, `mcts.completed_q_policy`).
+pub fn completed_q_policy_w(p0: &[f32], n: &[u32], w: &[f64], v: f64, c_visit: f64, c_scale: f64, prior_w: f64) -> Vec<f32> {
     let mut lg = completed_q_logits(p0, n, w, v, c_visit, c_scale);
+    if prior_w != 1.0 {
+        for (x, &p) in lg.iter_mut().zip(p0) {
+            *x += (prior_w - 1.0) * (p as f64).max(PRIOR_FLOOR).ln();
+        }
+    }
     let m = lg.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let mut s = 0.0;
     for x in lg.iter_mut() {
@@ -781,11 +797,16 @@ impl<G: SearchGame> Tree<G> {
     /// The completed-Q policy target at `node` (`completed_q_policy` over its P0, N, W and its
     /// decider's network utility; empty if not expanded).
     pub fn cq_target(&self, node: u32, c_visit: f64, c_scale: f64) -> Vec<f32> {
+        self.cq_target_w(node, c_visit, c_scale, 1.0)
+    }
+    /// `cq_target` with the prior exponent `prior_w` (`completed_q_policy_w`, docs/search.md
+    /// 3.13; 1.0 = `cq_target`): the recorded target of a seat's `PolicyTarget::CompletedQ`.
+    pub fn cq_target_w(&self, node: u32, c_visit: f64, c_scale: f64, prior_w: f64) -> Vec<f32> {
         let st = self.stats_of(node);
         let p0: Vec<f32> = st.iter().map(|s| s.p0).collect();
         let n: Vec<u32> = st.iter().map(|s| s.n).collect();
         let w: Vec<f64> = st.iter().map(|s| s.w).collect();
-        completed_q_policy(&p0, &n, &w, self.value0(node), c_visit, c_scale)
+        completed_q_policy_w(&p0, &n, &w, self.value0(node), c_visit, c_scale, prior_w)
     }
     /// The search's average win vector at `node` (absolute seats), None before any backup.
     pub fn win(&self, node: u32) -> Option<[f64; MAX_SEATS]> {

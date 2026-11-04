@@ -71,7 +71,8 @@ class NNSeat:
     their q, 'next_q' | 'z' (docs/search.md 3.6). belief_tilt (0 = off), belief_clip (None: 20),
     belief_mix, belief_fast: the root's belief of its searches (docs/search.md 3.8). root_search: 'puct' |
     'gumbel' (docs/search.md 3.7), gumbel_m the options sequential halving considers, gumbel_scale its
-    noise's scale, gumbel_c_visit / gumbel_c_scale sigma's transform (None: cq_c_visit / cq_c_scale)."""
+    noise's scale, gumbel_c_visit / gumbel_c_scale sigma's transform (None: cq_c_visit / cq_c_scale).
+    cq_prior_w: beta, the prior's exponent in the recorded 'cq' target (docs/search.md 3.13; 1 = off)."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
@@ -79,9 +80,11 @@ class NNSeat:
                  select_c_visit=None, select_c_scale=None, record=True, root_min_visits=0,
                  root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
                  view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
-                 root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None):
+                 root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
+                 cq_prior_w=1.0):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
+        mcts.check_cq_prior_w(cq_prior_w, policy_target)
         mcts.check_select(select, select_min_visits)
         mcts.check_select_transform(select, select_c_visit, select_c_scale)
         mcts.check_root_min(root_min_visits, root_min_visits_max_actions)
@@ -106,6 +109,7 @@ class NNSeat:
         self.root_search, self.gumbel_m, self.gumbel_scale = root_search, int(gumbel_m), float(gumbel_scale)
         self.gumbel_c_visit = float(cq_c_visit if gumbel_c_visit is None else gumbel_c_visit)
         self.gumbel_c_scale = float(cq_c_scale if gumbel_c_scale is None else gumbel_c_scale)
+        self.cq_prior_w = float(cq_prior_w)
 
     def takes_belief(self, full):
         """Whether its search of a decision takes the root's belief (`full`: a full search)."""
@@ -192,7 +196,7 @@ class PySearch:
     def target(self, seat):
         """The seat's policy target at the root (the visits target without the forced walks)."""
         if seat.policy_target == 'cq':
-            return mcts.cq_target(self.t.root, seat.cq_c_visit, seat.cq_c_scale)
+            return mcts.cq_target(self.t.root, seat.cq_c_visit, seat.cq_c_scale, seat.cq_prior_w)
         if self.t.root_min:
             nv = mcts.root_visits_pruned(self.t)
             tot = sum(nv)
@@ -272,7 +276,7 @@ class RsSearch:
 
     def target(self, seat):
         if seat.policy_target == 'cq':
-            return self.t.root_cq_target(seat.cq_c_visit, seat.cq_c_scale)
+            return self.t.root_cq_target(seat.cq_c_visit, seat.cq_c_scale, seat.cq_prior_w)
         nv = self.t.root_visits_pruned if self.t.root_min else self.t.root_visits
         tot = sum(nv)
         return [n / tot for n in nv] if tot else list(self.t.root_priors0)

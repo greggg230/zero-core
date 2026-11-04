@@ -509,25 +509,39 @@ def completed_q_logits(P0, Nv, W, v, c_visit=50.0, c_scale=1.0):
             for i in range(k)]
 
 
-def completed_q_policy(P0, Nv, W, v, c_visit=50.0, c_scale=1.0):
+def completed_q_policy(P0, Nv, W, v, c_visit=50.0, c_scale=1.0, prior_w=1.0):
     """Gumbel AlphaZero's policy-improvement target (Danihelka et al. 2022; mctx
     `qtransform_completed_by_mix_value` without per-node min-max rescaling):
     softmax(ln P0 + (c_visit + max N) * c_scale * completedQ), completedQ = W / N for visited
     options and v_mix = (v + sum N * sum_{N>0} P0 Q / sum_{N>0} P0) / (1 + sum N) for unvisited
     ones (their eq. 33; v = the network's value of the node for its decider). Q is the
     decider's utility (P(win) in [0, 1] with margin_w 0). Same arithmetic as the Rust tree's
-    `completed_q_policy` (f64)."""
+    `completed_q_policy` (f64). prior_w = beta, the prior's exponent (docs/search.md 3.13):
+    softmax(beta ln P0 + sigma completedQ), the logits of `completed_q_logits` plus (beta - 1)
+    ln max(P0, PRIOR_FLOOR) (v_mix keeps its P0 weights; the Rust `completed_q_policy_w`); 1.0 =
+    the target of before, bit for bit."""
     lg = completed_q_logits(P0, Nv, W, v, c_visit, c_scale)
+    if prior_w != 1.0:
+        lg = [x + (prior_w - 1.0) * math.log(max(float(p), PRIOR_FLOOR)) for x, p in zip(lg, P0)]
     m = max(lg)
     e = [math.exp(x - m) for x in lg]
     s = sum(e)
     return [x / s for x in e]
 
 
-def cq_target(node, c_visit=50.0, c_scale=1.0):
+def cq_target(node, c_visit=50.0, c_scale=1.0, prior_w=1.0):
     """The completed-Q target at an expanded node (its P0, N, W and its decider's network
-    utility `vec[player]`)."""
-    return completed_q_policy(node.P0, node.Nv, node.W, node.vec[node.player], c_visit, c_scale)
+    utility `vec[player]`), with the prior exponent `prior_w` (docs/search.md 3.13)."""
+    return completed_q_policy(node.P0, node.Nv, node.W, node.vec[node.player], c_visit, c_scale, prior_w)
+
+
+def check_cq_prior_w(prior_w=1.0, policy_target='cq', what='cq_prior_w'):
+    """The prior's exponent beta in the 'cq' target (docs/search.md 3.13): a number in (0, 1] (1 = off),
+    and != 1 only with policy_target 'cq' -> None, else ValueError."""
+    if isinstance(prior_w, bool) or not isinstance(prior_w, (int, float)) or not 0.0 < prior_w <= 1.0:
+        raise ValueError(f"{what} {prior_w!r}: the prior's exponent in the 'cq' target, in (0, 1] (1 = off)")
+    if prior_w != 1.0 and policy_target != 'cq':
+        raise ValueError(f"{what} {prior_w!r}: a setting of policy_target 'cq' ({policy_target!r} has no prior term)")
 
 
 def visits_target(node):
