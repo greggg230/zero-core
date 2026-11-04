@@ -20,7 +20,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{root_floor, sample_arrays, view_pick, Batch, BranchCfg, DriverCfg, KeyKind, StartsCfg, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{noresign_pick, root_floor, sample_arrays, view_pick, Batch, BranchCfg, DriverCfg, KeyKind, StartsCfg, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
 use zero_search::lookahead::{LookCfg, Outcome};
 use zero_search::{SearchGame, MAX_SEATS};
@@ -80,6 +80,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(game_info_of, m)?)?;
     m.add_function(wrap_pyfunction!(root_floor_of, m)?)?;
     m.add_function(wrap_pyfunction!(view_pick_of, m)?)?;
+    m.add_function(wrap_pyfunction!(noresign_pick_of, m)?)?;
     m.add_function(wrap_pyfunction!(belief_weight_of, m)?)?;
     m.add_function(wrap_pyfunction!(gumbel_sequence_of, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
@@ -149,7 +150,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -284,6 +285,11 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         look,
         // the game's evaluation cache: at most this many answers per game (0 = off; docs/search.md 3.12)
         eval_cache: get(d, "eval_cache", 0u32)?,
+        // self-play resignation (docs/search.md 3.14): the threshold t (0 = off), the consecutive decided
+        // full searches k, the share of games that never resign (checked by the driver)
+        resign_t: get(d, "resign_t", 0.0f64)?,
+        resign_k: get(d, "resign_k", 5u32)?,
+        resign_noresign: get(d, "resign_noresign", 0.1f64)?,
     }))
 }
 
@@ -315,6 +321,14 @@ fn root_floor_of(k: u32, max_actions: u32, full: bool, m: usize, target: u32) ->
 #[pyo3(name = "view_pick")]
 fn view_pick_of(seed: u64, gid: u32, decision: u32, share: f64) -> bool {
     view_pick(seed, gid, decision, share)
+}
+
+/// Whether game `gid` of a driver seeded `seed` is one of the share `share` of games that never resign
+/// (`driver::noresign_pick`, docs/search.md 3.14).
+#[pyfunction]
+#[pyo3(name = "noresign_pick")]
+fn noresign_pick_of(seed: u64, gid: u32, share: f64) -> bool {
+    noresign_pick(seed, gid, share)
 }
 
 /// The weight of a category of hidden cards in a belief-weighted deal (`game::belief_weight`,
@@ -858,6 +872,17 @@ impl PySearchDriver {
             if let Some(j) = r.start {
                 // a game started from an archive entry (DriverCfg::starts)
                 d.set_item("start", j)?;
+            }
+            if let Some(rs) = &r.resign {
+                // self-play resignation (NnSeat::resign_t, docs/search.md 3.14): only when the game's seats resign
+                let rd = PyDict::new(py);
+                rd.set_item("resigned", rs.resigned)?;
+                rd.set_item("noresign", rs.noresign)?;
+                rd.set_item("winner", rs.winner)?;
+                rd.set_item("decision", rs.decision)?;
+                rd.set_item("step", rs.step)?;
+                rd.set_item("records", rs.records)?;
+                d.set_item("resign", rd)?;
             }
             out.append(d)?;
         }

@@ -53,6 +53,11 @@
 //! the idle groups). A game started from the queue carries its tag into its result row. The
 //! groups share the queued setups (`queue_share`): each starts its part of everything in flight
 //! or queued, never leaving a free slot idle while the other groups are full.
+//!
+//! **Resignation** (`NnSeat::resign_t`, docs/search.md 3.14): a self-play game of two players ends when
+//! `resign_k` consecutive full searches of its resigning seats call it decided for one seat (its root win
+//! estimate >= 1 - t), scored as that seat's win, every record kept (`GameResult::resign`); a share
+//! `resign_noresign` of the games (`noresign_pick`) never resigns and reports where it would have.
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -280,6 +285,85 @@ pub fn view_pick(seed: u64, gid: u32, decision: u32, share: f64) -> bool {
     ((h >> 11) as f64 * (1.0 / (1u64 << 53) as f64)) < share
 }
 
+/// Whether game `gid` of a driver seeded `seed` is one of the share `share` of games that never resign
+/// (`NnSeat::resign_noresign`, docs/search.md 3.14): a hash of (seed, gid), so no random stream changes; a
+/// branch (2.11) shares its game's gid and draw.
+pub fn noresign_pick(seed: u64, gid: u32, share: f64) -> bool {
+    if share >= 1.0 {
+        return true;
+    }
+    if share <= 0.0 {
+        return false;
+    }
+    let h = split64(seed ^ split64(((gid as u64) << 32) ^ RESIGN_SALT));
+    ((h >> 11) as f64 * (1.0 / (1u64 << 53) as f64)) < share
+}
+
+/// The no-resign draw's salt (`noresign_pick`).
+const RESIGN_SALT: u64 = 0x7265_7369_676e_2d31;
+
+/// A game's self-play resignation (docs/search.md 3.14; `GameResult::resign`, None when its seats do not
+/// resign): whether it ended by resignation, whether it is a no-resign game, and the point where the rule
+/// fired - resigned there, or in a no-resign game would have (`winner` None: it never fired).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResignInfo {
+    pub resigned: bool,
+    pub noresign: bool,
+    /// The favoured seat (its root win estimate >= 1 - t in the `resign_k` searches that fired the rule).
+    pub winner: Option<u8>,
+    /// At the firing search: the game's searched decisions (the firing one included), real moves before it,
+    /// training records made (the firing decision's included). 0 when the rule never fired.
+    pub decision: u32,
+    pub step: u64,
+    pub records: u32,
+}
+
+/// A game's resignation counter (`Slot::resign`): its settings (the resigning seats'), its no-resign draw,
+/// the run of consecutive decided counted searches for one seat, the first firing.
+struct ResignState {
+    t: f64,
+    k: u32,
+    noresign: bool,
+    run: u32,
+    lead: usize,
+    fired: Option<(u8, u32, u64, u32)>,
+    resigned: bool,
+}
+
+impl ResignState {
+    /// One counted search (a resigning seat's full search) with its root win vector `w` (absolute seats; None:
+    /// no value): decided iff the favoured seat's (the first maximum's) estimate is >= 1 - t; the run grows
+    /// while the searches are decided for the same seat, starts again at 1 for the other seat, drops to 0 when
+    /// one is not decided. -> whether the rule fires now (the game's first time it reaches k).
+    fn count(&mut self, w: Option<[f64; MAX_SEATS]>, n: usize, decision: u32, step: u64, records: usize) -> bool {
+        let fav = w.and_then(|w| {
+            let f = (0..n).fold(0, |b, s| if w[s] > w[b] { s } else { b });
+            (w[f] >= 1.0 - self.t).then_some(f)
+        });
+        match fav {
+            Some(f) if self.run > 0 && self.lead == f => self.run += 1,
+            Some(f) => {
+                self.run = 1;
+                self.lead = f;
+            }
+            None => self.run = 0,
+        }
+        if self.run >= self.k && self.fired.is_none() {
+            self.fired = Some((self.lead as u8, decision, step, records as u32));
+            return true;
+        }
+        false
+    }
+
+    fn info(&self) -> ResignInfo {
+        let (winner, decision, step, records) = match self.fired {
+            Some((w, d, s, r)) => (Some(w), d, s, r),
+            None => (None, 0, 0, 0),
+        };
+        ResignInfo { resigned: self.resigned, noresign: self.noresign, winner, decision, step, records }
+    }
+}
+
 /// The root minimum visits a search takes (docs/search.md 3.5): the seat's `k`
 /// (`NnSeat::root_min_visits`) for a full search (`full`: a self-play seat's recorded searches,
 /// every search of an evaluation seat; never a fast or minor one, like root noise) of `m` options
@@ -372,12 +456,36 @@ pub struct NnSeat {
     /// this many per game (emptied when full); a leaf whose rows are all cached is expanded at once and
     /// its search goes on, a row of it that is cached is not sent.
     pub eval_cache: u32,
+    /// Self-play resignation (docs/search.md 3.14; 0 = off, the default): the threshold t in (0, 0.5) - a
+    /// game ends when `resign_k` consecutive full searches of its resigning seats found one seat's root
+    /// win estimate >= 1 - t (the same seat each time), scored as that seat's win; a share
+    /// `resign_noresign` of the games (`noresign_pick`) never resigns and only reports where it would have.
+    /// A recording self-play seat of a two-player game; every resigning seat of a game the same settings.
+    pub resign_t: f64,
+    pub resign_k: u32,
+    pub resign_noresign: f64,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None, eval_cache: 0 }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None, eval_cache: 0, resign_t: 0.0, resign_k: 5, resign_noresign: 0.1 }
+    }
+
+    /// The resignation settings' check (`Driver::new`; the bindings' messages): t finite in [0, 0.5) (0 =
+    /// off; at 0.5 every search would be decided), k >= 1, the no-resign share in [0, 1] (1: no game
+    /// resigns, every one reports where it would have - a dry run of the rule).
+    pub fn check_resign(t: f64, k: u32, noresign: f64) -> Result<(), String> {
+        if !(t.is_finite() && (0.0..0.5).contains(&t)) {
+            return Err(format!("resign_t {t}: a threshold in [0, 0.5) (0 = off; a search is decided when a seat's root win estimate is >= 1 - t)"));
+        }
+        if k == 0 {
+            return Err("resign_k 0: at least 1 decided search before a game resigns".into());
+        }
+        if !(noresign.is_finite() && (0.0..=1.0).contains(&noresign)) {
+            return Err(format!("resign_noresign {noresign}: a share in [0, 1] of the games that never resign"));
+        }
+        Ok(())
     }
 
     /// The belief settings' check (`Driver::new`; the bindings' messages): tilt finite >= 0, clip
@@ -588,6 +696,8 @@ pub struct GameResult {
     pub branch: Option<BranchInfo>,
     /// A game started from an archive entry (`DriverCfg::starts`): the entry's index; None otherwise.
     pub start: Option<u32>,
+    /// Self-play resignation (`NnSeat::resign_t`, docs/search.md 3.14): None unless the game's seats resign.
+    pub resign: Option<ResignInfo>,
 }
 
 /// One recorded root decision with its targets.
@@ -979,6 +1089,8 @@ struct Slot<G: SearchGame> {
     /// network id, row key); emptied as a game starts, as a new search epoch begins (another network)
     /// and when full.
     cache: HashMap<(u16, u32, u128), Cached>,
+    /// Self-play resignation (docs/search.md 3.14): the game's counter, None unless its seats resign.
+    resign: Option<ResignState>,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -1025,6 +1137,7 @@ impl<G: SearchGame> Slot<G> {
             dev_now: false,
             start_ix: None,
             cache: HashMap::new(),
+            resign: None,
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -1470,6 +1583,34 @@ impl<G: SearchGame> Driver<G> {
                 starts.push(s);
             }
         }
+        // self-play resignation (docs/search.md 3.14): a recording self-play seat of two-player games, every
+        // resigning seat of a game the same settings (one counter per game); a setting that does nothing
+        // is an error, never a silent no-op
+        for s in &cfg.seats {
+            if let SeatCfg::Nn(n) = s {
+                NnSeat::check_resign(n.resign_t, n.resign_k, n.resign_noresign)?;
+                if n.resign_t > 0.0 && !(cfg.record && n.selfplay && n.record) {
+                    return Err(format!("resign_t {}: a seat that records no self-play never resigns (evaluations, matches and league opponents play their games out)", n.resign_t));
+                }
+            }
+        }
+        for (g, s) in cfg.games.iter().enumerate() {
+            let rs: Vec<(f64, u32, f64)> = s
+                .iter()
+                .filter_map(|&i| match &cfg.seats[i as usize] {
+                    SeatCfg::Nn(n) if n.resign_t > 0.0 => Some((n.resign_t, n.resign_k, n.resign_noresign)),
+                    _ => None,
+                })
+                .collect();
+            if let Some(a) = rs.first() {
+                if s.len() != 2 {
+                    return Err(format!("game {g}: resign_t with {} seats: two-player games only (the winner of a resignation is the one favoured seat)", s.len()));
+                }
+                if rs.iter().any(|b| b != a) {
+                    return Err(format!("game {g}: its resigning seats' resign_t / resign_k / resign_noresign differ (one counter per game)"));
+                }
+            }
+        }
         let conc = if cfg.rolling { cfg.concurrency.max(1) } else { cfg.concurrency.max(1).min(cfg.games.len().max(1)) };
         let groups = cfg.groups.max(1).min(conc);
         let threads = cfg.threads.max(1);
@@ -1900,7 +2041,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();

@@ -327,6 +327,16 @@ fn is_external(cfg: &DriverCfg, gid: u32, p: usize) -> bool {
     matches!(seat_cfg(cfg, gid, p), SeatCfg::External(_))
 }
 
+/// Game `gid`'s resignation counter as it starts (docs/search.md 3.14): None unless a seat of it resigns
+/// (`NnSeat::resign_t` > 0; `Driver::new` made its resigning seats agree), its no-resign draw by (seed, gid).
+fn resign_state(cfg: &DriverCfg, gid: u32) -> Option<ResignState> {
+    let s = game_seats(cfg, gid).iter().find_map(|&i| match &cfg.seats[i as usize] {
+        SeatCfg::Nn(s) if s.resign_t > 0.0 => Some(s),
+        _ => None,
+    })?;
+    Some(ResignState { t: s.resign_t, k: s.resign_k, noresign: noresign_pick(cfg.seed, gid, s.resign_noresign), run: 0, lead: 0, fired: None, resigned: false })
+}
+
 /// A new search epoch began (`Driver::resume` with another network): drop the slot's trees
 /// and pending leaf and restart the search of its current decision from an empty tree,
 /// keeping that decision's playout-cap draw. -> simulations thrown away.
@@ -409,6 +419,10 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     if !divides {
         return Err(format!("{}: team_size {team} does not divide {n} players", G::NAME));
     }
+    slot.resign = resign_state(cfg, gid);
+    if slot.resign.is_some() && team != 1 {
+        return Err(format!("resign_t: {} plays teams (team_size {team}): resignation is for two-player games of two sides", G::NAME));
+    }
     slot.gid = gid;
     slot.n = n;
     slot.rng = Rng::new(base.next_u64());
@@ -477,8 +491,10 @@ fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, n
 fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [LeafBuf], results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>, scratch: &mut WScratch<G>, n: &mut Tally) -> Result<(), String> {
     let cfg = &sh.cfg;
     loop {
+        // (a game that resigned at its last decision ends here: docs/search.md 3.14)
+        let resigned = slot.resign.as_ref().is_some_and(|r| r.resigned);
         let g = slot.game.as_ref().unwrap();
-        let Some(p) = g.to_move().filter(|_| slot.steps < cfg.max_steps) else {
+        let Some(p) = g.to_move().filter(|_| slot.steps < cfg.max_steps && !resigned) else {
             finish(sh, slot, results, samples, parked, n)?;
             if slot.game.is_some() {
                 // the game drew a branch (docs/search.md 2.11): its slot plays it now
@@ -1063,6 +1079,22 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         }
     }
     slot.decisions += 1;
+    // self-play resignation (docs/search.md 3.14): a resigning seat's full search - exactly the searches that
+    // make its records - counts with its root win vector (a record's q); when the rule fires the game ends
+    // here, before the move, every record kept (a no-resign game only notes where it would have)
+    if let Some(rs) = slot.resign.as_mut().filter(|_| seat.resign_t > 0.0 && slot.full && slot.dev_left == 0) {
+        let w = if gumbel {
+            tree.gumbel_q()
+        } else if pruned.is_some() {
+            tree.root_win_pruned()
+        } else {
+            tree.win(root)
+        };
+        if rs.count(w, slot.n, slot.decisions, slot.steps, slot.records.len()) && !rs.noresign {
+            rs.resigned = true;
+            return Ok(());
+        }
+    }
     apply(cfg, slot, a, key)?;
     Ok(())
 }
@@ -1120,11 +1152,13 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
 fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>, n_: &mut Tally) -> Result<(), String> {
     let cfg = &sh.cfg;
     let g = slot.game.take().unwrap();
-    let over = g.to_move().is_none();
+    // (a resigned game is over: its result is the resignation's, docs/search.md 3.14)
+    let resign = slot.resign.take();
+    let over = g.to_move().is_none() || resign.as_ref().is_some_and(|r| r.resigned);
     let gid = slot.gid;
     let start = slot.start_ix.take();
     let fork = slot.fork.take();
-    let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start };
+    let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start, resign: resign.as_ref().map(|r| r.info()) };
     slot.dev_left = 0;
     slot.dev_now = false;
     let records = std::mem::take(&mut slot.records);
@@ -1141,6 +1175,9 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
     if over && g.deferred() {
         if fork.as_ref().is_some_and(|f| f.point.is_some()) {
             return Err("branch: a game at a deferred terminal cannot branch (docs/search.md 2.11)".into());
+        }
+        if resign.is_some() {
+            return Err("resign_t: a game with deferred terminals cannot resign (its outcome comes from outside: docs/search.md 3.14)".into());
         }
         let payload = g.deferred_payload().map_err(|e| format!("deferred_payload: {e}"))?;
         let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(ParkedRecord::park).collect() } else { Vec::new() };
@@ -1210,6 +1247,8 @@ fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut
     // (a branch is a game of its own: its evaluation cache starts empty, docs/search.md 3.12)
     slot.cache.clear();
     slot.branch = Some(BranchInfo { at: fp.at, of: f.seen, decision: fp.decisions, step: fp.steps, action: fp.action, moves, played: 0, same_first: false, start });
+    // (a branch counts its own searches from its start; its no-resign draw is its game's: docs/search.md 3.14)
+    slot.resign = resign_state(cfg, gid);
     slot.dev_left = moves;
     slot.dev_now = false;
     Ok(())
@@ -1226,6 +1265,9 @@ pub(super) struct Done {
     pub moves: Vec<(u8, u16, Vec<u16>)>,
     pub branch: Option<BranchInfo>,
     pub start: Option<u32>,
+    /// Self-play resignation (docs/search.md 3.14): `resigned` = the game ended by the rule (over, its
+    /// result the winner's).
+    pub resign: Option<ResignInfo>,
 }
 
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
@@ -1234,7 +1276,12 @@ pub(super) struct Done {
 /// (`over` false) is a draw and emits nothing.
 pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, records: Vec<Record>, rq: Vec<Option<[f64; MAX_SEATS]>>, samples: &mut Vec<Record>) -> GameResult {
     let n = d.n;
-    let res: [f32; MAX_SEATS] = if over {
+    let res: [f32; MAX_SEATS] = if let Some(w) = d.resign.as_ref().filter(|r| r.resigned).and_then(|r| r.winner) {
+        // a resigned game (docs/search.md 3.14): the favoured seat wins
+        let mut r = [0.0; MAX_SEATS];
+        r[w as usize] = 1.0;
+        r
+    } else if over {
         g.result()
     } else {
         let mut r = [0.0; MAX_SEATS];
@@ -1257,6 +1304,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         moves: d.moves,
         branch: d.branch,
         start: d.start,
+        resign: d.resign,
     };
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();

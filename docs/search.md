@@ -1174,6 +1174,83 @@ Code: `driver.rs` (`NnSeat::eval_cache`, `Cached`, `LeafPart`, `cache_key`, `Slo
 emptying in `init_slot` / `restart_search`), the bindings (seat key `eval_cache`, the stats); Python
 `games.nn_seat(eval_cache=)`, `run.py` (`eval_cache`, `Run.cache_metrics`).
 
+### 3.14 Self-play resignation with a no-resign share (`resign_t`; MTG Zero's Delver mirror, 2026-11-04)
+
+**Why.** A third of a self-play game's searches can come after the game is decided. Measured on MTG Zero's
+Delver line (gens 855 and 859, 958 whole games, 90,061 rows): 36.5% of the decision rows have the decider's
+root win estimate outside (0.05, 0.95) and the outcome agrees with it in 98.9% of them. KataGo ends such games
+early and keeps a share of games that never resign, to measure the rule and to keep showing the value head
+decided positions. docs/az.md 27 has the run settings, the measurements and the recommended A/B.
+
+**What it does.** A network seat with `resign_t` t > 0 (`NnSeat::resign_t`, `resign_k`, `resign_noresign`;
+the bindings' seat keys of the same names, defaults 0 / 5 / 0.1; `games.nn_seat(resign_t=...)`) is a
+**resigning seat**. A game with a resigning seat keeps one counter (`Slot::resign`, `ResignState`):
+
+* **Which searches count**: a resigning seat's **full** searches - exactly the searches that make its
+  training records (`slot.full`, after the deviation moves of a branch, 2.11). Fast searches (`sims_fast`),
+  minor ones (`sims_minor`) and a branch's deviation evaluations never count, and never reset the count.
+  The other seat's full searches count too when it is a resigning seat (a self-play mirror: both); a seat
+  that does not resign (another network) neither counts nor resets.
+* **Whose value**: the search's root win vector as its record stores it (`q`): `Tree::win(root)`, the root
+  floor's `root_win_pruned` (3.5), the Gumbel root's `gumbel_q` (3.7) - by absolute seat. Its **favoured seat**
+  is its argmax (the first maximum on ties); the search is **decided** when the favoured seat's estimate is
+  >= 1 - t. In a two-player game that is the decider's own q <= t or >= 1 - t.
+* **The count**: a decided search for the same favoured seat as the run's adds 1; decided for the other seat
+  starts a new run at 1; a counted search that is not decided resets it to 0. The rule **fires** at the first
+  search where the run reaches `resign_k`.
+* **Resigning**: the firing search's decision is recorded as usual (its record and, with `view_samples`
+  3.6, its value-only records), then the game ends there, before its move (`decide` returns; `advance_slot`
+  finishes it). Its result is the favoured seat's win (1 for it, 0 for the other; never a draw); every record
+  of the game is kept, `z` = that result relative to each record's decider, `q` the searches' own root values
+  (a value-only record still waiting for its observer's next search gets `z`, as at any game end); `sc` =
+  `margin()` and the row's `scores` = `score()` **of the position where it resigned** (the game was not
+  played out). The game is `over`; rolling quotas, `queue_only` setups, the shared queue and the local linger
+  count it like any finished game (it is one result row).
+* **The no-resign share**: game `gid` of a driver seeded `seed` never resigns when `noresign_pick(seed, gid,
+  resign_noresign)` (a hash of (seed, gid) with a salt of its own, `view_pick`'s arithmetic: no random stream
+  draws it, so no game changes). It plays out as without resignation and notes the first time the rule fired
+  - where it **would have** resigned. `resign_noresign` 1 is a dry run: no game resigns, every row reports.
+* **Branches** (2.11): a game that resigns spawns its branch like one that plays out (the branch point is drawn
+  over its eligible decisions up to the firing one). A branch counts its own searches from its start (after its
+  deviation moves) with a fresh counter; it shares its game's gid and so its no-resign draw.
+
+**Result row** (2.5): a game with a resigning seat has `resign` = {`resigned` (it ended by the rule),
+`noresign` (a no-resign game), `winner` (the favoured seat when the rule fired - resigned there, or would
+have; None: it never fired), `decision`, `step`, `records` (at the firing search: the game's searched
+decisions with the firing one, real moves before it, records made with the firing decision's; 0 when it never
+fired)}. A resigned game's `steps`, `decisions` and `samples` equal its `step`, `decision` and `records`; a
+no-resign game's `samples - records` are the rows resigning would have saved. Games without a resigning seat
+have no key.
+
+**Refused** (`Driver::new` unless said): `resign_t` outside [0, 0.5), `resign_k` 0, `resign_noresign` outside
+[0, 1]; a resigning seat that records no self-play (an evaluation seat, `record` false - a league opponent -,
+a driver with `record` false); a game of other than two seats with a resigning seat; resigning seats of one
+game with different settings (one counter per game); a game whose `team_size` is not 1 (when it starts); a
+game with a resigning seat that reaches a deferred terminal (2.8; at that terminal - a deferred game that
+resigns before reaching one is not caught here: the run settings refuse co-training, docs/az.md 27). The
+Python reference driver (`zero/play.py`) has no resignation (its `NNSeat` refuses the keys).
+
+**Off** (`resign_t` 0, the default): no key in the seat dict, no counter, no `resign` in a row - the driver of
+before, byte for byte (the golden records). With it on, the searches, moves and records of every game up to
+its firing search are those of the game without it (nothing reads a stream); a resigned game's records are
+that game's first `records` records with `z` replaced, and nothing after.
+
+**Tests** (`driver::tests`): `resignation_off_or_a_dry_run_plays_the_games_of_before` (off: the golden records;
+a dry run at t 0.3, k 2: the golden records and results, every row reporting), `resigned_games_end_where_the_rule_fires_with_its_outcome`
+(every game resigning vs the dry run, with an evaluator of the row alone: a resigned game is its dry twin up to
+the firing search - the same x, pi, q, opts -, z the favoured seat's win, nothing after it, the firing search's
+favoured estimate >= 1 - t; three seats: every search full, a playout cap - fast searches never count -, a
+Gumbel root), `the_no_resign_share_is_a_hash_of_seed_and_gid` (the draw; a run at share 0.4 = the dry run's
+games where it draws a no-resign game and the all-resigning run's elsewhere), `resigned_games_count_in_rolling_quotas`,
+`branches_of_resigning_games`, `resign_settings_are_checked`; tests/test_resign.py (the bindings, the run
+settings, the loop, remote self-play).
+
+Code: `driver.rs` (`NnSeat::resign_t`, `resign_k`, `resign_noresign`, `NnSeat::check_resign`, `noresign_pick`,
+`ResignState`, `ResignInfo`, `GameResult::resign`, `Slot::resign`, the checks in `Driver::new`),
+`driver/worker.rs` (`resign_state`, `init_slot`, `decide`'s count, `advance_slot`'s end, `finish`, `emit`,
+`spawn_branch`), the bindings (seat keys, the row's `resign`, `noresign_pick`); Python `games.nn_seat(resign_*)`,
+`zero/resign.py`, `run.py`, `remoteplay.py`.
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:

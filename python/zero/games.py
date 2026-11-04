@@ -100,7 +100,7 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             root_min_visits=0, root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
             view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
             root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
-            eval_cache=0):
+            eval_cache=0, resign_t=0.0, resign_k=5, resign_noresign=0.1):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
@@ -128,7 +128,9 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     holds the resolved transform, so the Rust seat never falls back to its own defaults. eval_cache: the
     game's evaluation cache, at most this many answers per game (docs/search.md 3.12: a row whose features
     and options a game already sent is answered from the cache, not sent; 0 = off: no key, the seat of
-    before)."""
+    before). resign_t: self-play resignation (docs/search.md 3.14; a self-play seat that records): a game ends
+    when resign_k consecutive full searches found one seat's root win estimate >= 1 - resign_t, scored as that
+    seat's win; a share resign_noresign of the games never resigns (0 = off: no keys, the seat of before)."""
     from .mcts import (check_belief, check_leaf_view, check_root_min, check_root_search, check_select,
                        check_select_transform, select_transform)
     check_select(select, select_min_visits)
@@ -142,6 +144,10 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     check_belief(belief_tilt, belief_clip, belief_mix)
     if int(eval_cache) != eval_cache or eval_cache < 0:
         raise ValueError(f'eval_cache {eval_cache!r}: answers per game, an integer >= 0 (0 = off)')
+    from .resign import check_values
+    check_values(resign_t, resign_k, resign_noresign, what='resign')
+    if resign_t and not selfplay:
+        raise ValueError(f'resign_t {resign_t!r}: a self-play seat only (evaluations play their games out)')
     d = dict(key=key, sims=sims, c_puct=c_puct, selfplay=selfplay, alpha=alpha, eps=eps, temp_moves=temp_moves,
              sims_fast=sims_fast, p_full=p_full, chance_k=chance_k, margin_w=margin_w, redet=redet)
     sel = select_transform(cq_c_visit, cq_c_scale, select_c_visit, select_c_scale)
@@ -172,6 +178,8 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
                  gumbel_c_scale=float(cs if gumbel_c_scale is None else gumbel_c_scale))
     if eval_cache:
         d['eval_cache'] = int(eval_cache)
+    if resign_t:
+        d.update(resign_t=float(resign_t), resign_k=int(resign_k), resign_noresign=float(resign_noresign))
     return d
 
 
