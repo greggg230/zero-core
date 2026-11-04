@@ -1174,6 +1174,55 @@ Code: `driver.rs` (`NnSeat::eval_cache`, `Cached`, `LeafPart`, `cache_key`, `Slo
 emptying in `init_slot` / `restart_search`), the bindings (seat key `eval_cache`, the stats); Python
 `games.nn_seat(eval_cache=)`, `run.py` (`eval_cache`, `Run.cache_metrics`).
 
+### 3.15 The tree's shape, and the information-set merging gate (`Tree::shape`; MTG Zero's Delver mirror, 2026-11-04)
+
+**Why.** A review of the Delver line (Fable, 2026-11-04) proposed merging the tree's nodes by the root decider's
+observation (single-observer information-set MCTS inside the tree: every node keyed by `obs_hash(encode(viewer))`,
+the other seat's nodes subset-armed over the union of their option lists, Cowling, Powley & Whitehouse 2012), from
+the evaluation cache's measurement (3.12) that a third of a search's leaves re-expand an information set of the
+root decider the tree already holds. Its gate before any build: a tree-shape probe of the run's 64-simulation
+self-play search - build only if the mean leaf depth is < 2.5 and the main line's edge into the other seat's
+decisions spawns > 8 child nodes ("fragments": the tree keys a child by chance key, decider and legal options,
+so another dealt hand with other options is another child).
+
+**The diagnostic** (read-only; no search change). `Tree::shape()` -> `Shape`: the nodes reachable from the root
+(each once, at its shortest depth), the expanded ones per depth (root 0; in a fresh search each expanded node was
+one walk's leaf), per number of other-seat nodes above them (`opp_hist`) and per decider changes above them
+(`switch_hist`), the deepest node, every edge with a visit or a child (`EdgeShape`: depth, whether the viewer
+decides its node, visits, child nodes, of them the other seat's and the expanded ones) and the main line (the most
+visited option from the root on, then that edge's most backed-up child). Bindings: `SearchTree.shape()` (a dict),
+`SearchTree.path_len` (the last simulation's walk length: its leaf's or terminal's depth).
+
+**Measured** (desktop CPU at idle priority beside the live run; r3-2b-float550 gen 1000, its exact full self-play
+search - c_puct 1, root noise, root belief tilt 1 / clip 20 / mix 0.25, root-view leaf values, redeterminized
+worlds, chance_k 0 - on 50 positions of its network's own play (prior-sampled, 2,043 candidate decisions, PayMana
+left out), 4 fresh searches each; `E:/mtg-zero-scratch/ideas-4/gate_probe.py`, its NOTES.md):
+
+| | 64 sims | 32 sims (the evaluation seat's) | 16 sims |
+|---|---:|---:|---:|
+| mean walk depth (leaf or terminal; root's own evaluation left out) | 5.10 | 4.22 | 3.31 |
+| walks ending at depth 1 / 2 | 11.4% / 14.7% | 16.7% / 18.4% | 25.2% / 21.8% |
+| other-seat decisions above a new node: mean (share none / one) | 1.43 (40% / 28%) | 1.06 (49% / 27%) | 0.71 (63% / 23%) |
+| new nodes whose root-decider observation the search held already: own / other seat / all | 11.6% / 48.4% / 29.6% | 8.4% / 44.1% / 25.5% | 4.7% / 36.5% / 18.7% |
+| main line's first edge into the other seat: child nodes mean / median / p90 (> 8 in) | 6.1 / 3 / 12 (16%) | 4.4 / 3 / 10 (14%) | 3.2 / 2 / 7 (5%) |
+
+**Decision: the gate fails; the merge was not built.** MTG walks are deep in decisions (the root decider's own
+consecutive decisions - cast, target, pay, attack - each a level) and the main line fragments less than assumed;
+the repeat share (30% of a fresh 64-simulation search's new nodes, ~18 walks of 63) is real but under the 36.5% the
+proposal started from, i.e. ~1.4x the effective walks, less than the 2x of 128 simulations that measured "equal or
+slightly better" (MTG Zero's runs). What the tree IS shallow in is the other seat's replies (68% of new nodes have
+at most one above them at 64 simulations), and the strategy-fusion leak of the unmerged tree (the root decider's
+next node split by what the other seat was dealt) cannot be measured by a shape probe - only by a paired match of
+a built merge. The worked-out design (a two-level child identity: today's per-edge signature as a link, mapped to
+a merged node by the observation at a new signature only; no depth in the key, a path check with alias nodes
+against cycles; subset-armed PUCT with availability counts and mean priors; growth leaves for a world's new
+options; `advance` by the real observation; `compact` once per node) and the h2h plan are in that NOTES.md. The
+Python reference has no merged mode.
+
+Tests: `tree::tests::shape_counts_every_walk_and_edge` (a fresh search's expanded nodes + terminal walks = its
+simulations, the histograms and the edges' children add up, the main line follows the visits), pytest
+`test_bindings.py::test_search_tree_api`.
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:
