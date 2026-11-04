@@ -201,3 +201,20 @@ def test_differ_leaves_the_games_line_at_once():
                  branch={'p': 1.0, 'moves': 1, 'differ': True})
     br = [r['branch'] for r, _ in play(d) if 'branch' in r]
     assert len(br) >= 25 and not any(b['same_first'] for b in br), br
+
+
+def test_remote_evaluation_mirror_plays_no_forks(tmp_path):
+    """eval_remote with both on: the evaluation mirror's config has branches and archive starts off
+    (self-play's settings; the archive's path is this machine's and a remote's Run could not open it -
+    the Delver fork's first Mac evaluation, 2026-11-03), and the evaluations come back."""
+    arch = toy_archive(tmp_path / 'arch.json')
+    run, mirror = tmp_path / 'rem', tmp_path / 'mirror'
+    p = run_loop(run, '--iters', '1', '--rolling', '1', '--games', '32', '--conc', '16', '--eval-remote', 'local',
+                 '--selfplay-branch', '0.5', '--selfplay-archive', arch, '--selfplay-archive-p', '0.25',
+                 env={'ZERO_REMOTE_WORKDIR': str(mirror)})
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    cfg = json.load(open(mirror / 'rem' / 'config.json', encoding='utf-8'))
+    assert cfg['selfplay_branch'] == 0.0 and cfg['selfplay_archive'] == ''
+    assert json.load(open(run / 'config.json', encoding='utf-8'))['selfplay_archive'] == arch
+    ev = [json.loads(line) for line in open(run / 'evals.jsonl', encoding='utf-8')]
+    assert sorted(e['iter'] for e in ev) == [0, 1]

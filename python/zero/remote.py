@@ -277,6 +277,9 @@ class RemoteEval:
                     if os.path.exists(src):
                         self.t.put(src, self.rdir + dst)
         cfg = dict(c, eval_remote='', **self.spec.get('overrides', {}))
+        # branched games and archive starts (zero/forks.py) are self-play's: the evaluation mirror plays
+        # neither, and the archive's path is this machine's (the remote's Run would fail to open it)
+        cfg.update(selfplay_branch=0.0, selfplay_archive='')
         anchors = elo.parse_anchors(c.get('elo_anchors', ''))
         if anchors:
             # the anchors (docs/az.md 20.1): each file once, under its label, the mirror's config naming them
