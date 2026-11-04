@@ -2760,3 +2760,273 @@ fn the_eval_cache_with_root_view_rows_and_the_belief() {
     assert_eq!(n1 + st1.cache_hits, n0);
     assert!(st1.cache_leaves > 0 && v0 > 0, "{} leaves at once, {v0} value-only rows", st1.cache_leaves);
 }
+
+// ---- self-play resignation (NnSeat::resign_t, docs/search.md 3.14) ----
+
+fn with_resign(seat: SeatCfg, t: f64, k: u32, noresign: f64) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.resign_t = t;
+            s.resign_k = k;
+            s.resign_noresign = noresign;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+/// Uniform priors; the decider's value from its score lead and the round (ToyGame's features: a lead late in
+/// the game is decisive) - a function of the row alone, so every game is the same whatever its batches.
+fn answer_lead(d: &mut Driver<ToyGame>, b: &Batch) {
+    let f = ToyGame::NUM_FEATURES;
+    let base = 6 + 3 + 4 + 12 + 6 + crate::toy::N_SPACES * 7;
+    let mut pri = Vec::new();
+    for r in 0..b.b {
+        let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+        pri.extend(std::iter::repeat_n(1.0 / k as f32, k));
+    }
+    let mut v = vec![0.0; b.b * MAX_SEATS];
+    let m = vec![0.0; b.b * MAX_SEATS];
+    for r in 0..b.b {
+        let x = &b.x[r * f..(r + 1) * f];
+        let lead = (x[base + 14] - x[base + 16 + 14]) * 20.0;
+        let round = (0..6).find(|&i| x[i] > 0.0).unwrap_or(0) as f32 + 1.0;
+        let w = 1.0 / (1.0 + (-1.5 * lead * round / 6.0).exp());
+        v[r * MAX_SEATS] = w;
+        v[r * MAX_SEATS + 1] = 1.0 - w;
+    }
+    d.submit(b.id, &pri, &v, &m).unwrap();
+}
+
+/// `run_split` with `answer_lead`: every result row with its own samples, sorted by (gid, branch or not).
+fn run_lead(d: &mut Driver<ToyGame>) -> Vec<(GameResult, Vec<Record>)> {
+    fn take(d: &mut Driver<ToyGame>, rows: &mut Vec<(GameResult, Vec<Record>)>) {
+        let rs = d.take_results();
+        let smp = d.take_samples();
+        let mut a = 0;
+        for r in rs {
+            let k = r.samples as usize;
+            rows.push((r, smp[a..a + k].to_vec()));
+            a += k;
+        }
+        assert_eq!(a, smp.len(), "every sample belongs to a row taken with it");
+    }
+    let mut rows = Vec::new();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer_lead(d, &b);
+        take(d, &mut rows);
+    }
+    take(d, &mut rows);
+    rows.sort_by_key(|(r, _)| (r.gid, r.branch.is_some()));
+    rows
+}
+
+fn resign_cfg(seat: SeatCfg, games: usize, t: f64, k: u32, noresign: f64) -> DriverCfg {
+    let mut c = cfg(vec![with_resign(seat, t, k, noresign)], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
+    c.seed = 11;
+    c
+}
+
+#[test]
+fn resignation_off_or_a_dry_run_plays_the_games_of_before() {
+    // off (resign_t 0): the golden records; a dry run (every game a no-resign game): the same games, records and
+    // streams, each row reporting where the rule would have fired
+    let (r0, s0) = golden_selfplay(nn(0, 16, true));
+    assert_eq!(records_digest(&s0), GOLDEN_RECORDS.1);
+    assert!(r0.iter().all(|r| r.resign.is_none()));
+    let (r1, s1) = golden_selfplay(with_resign(nn(0, 16, true), 0.3, 2, 1.0));
+    assert_eq!((s1.len(), records_digest(&s1)), GOLDEN_RECORDS, "a dry run changed the records");
+    let key = |r: &GameResult| (r.gid, r.over, r.result.clone(), r.steps, r.scores.clone(), r.samples, r.decisions);
+    assert_eq!(r0.iter().map(key).collect::<Vec<_>>(), r1.iter().map(key).collect::<Vec<_>>());
+    let fired = r1.iter().filter(|r| r.resign.as_ref().unwrap().winner.is_some()).count();
+    assert!(r1.iter().all(|r| r.resign.as_ref().is_some_and(|x| x.noresign && !x.resigned)));
+    assert!(fired > 0, "the dry run never fired at t 0.3, k 2");
+}
+
+#[test]
+fn resigned_games_end_where_the_rule_fires_with_its_outcome() {
+    // every game resigns where the rule fires (noresign 0) vs the dry run (noresign 1: the games of before, each
+    // noting where it would have): a resigned game is its dry twin up to that point - the same records but z, the
+    // resignation's outcome for the favoured seat - and nothing after it. With a playout cap (fast searches never
+    // count), a Gumbel root (its root value counts) and every search full.
+    let seats = [nn_full(16), nn(0, 16, true), with_gumbel(nn(0, 16, true), 4, 1.0, 1.0)];
+    for (si, seat) in seats.into_iter().enumerate() {
+        let on = run_lead(&mut Driver::<ToyGame>::new(resign_cfg(seat.clone(), 40, 0.05, 4, 0.0)).unwrap());
+        let dry = run_lead(&mut Driver::<ToyGame>::new(resign_cfg(seat, 40, 0.05, 4, 1.0)).unwrap());
+        assert_eq!((on.len(), dry.len()), (40, 40));
+        let (mut resigned, mut wrong) = (0, 0);
+        for ((r, s), (r0, s0)) in on.iter().zip(&dry) {
+            assert_eq!(r.gid, r0.gid);
+            let (x, x0) = (r.resign.as_ref().unwrap(), r0.resign.as_ref().unwrap());
+            assert!(!x.noresign && x0.noresign && !x0.resigned);
+            let Some(w) = x0.winner else {
+                // the rule never fired: the game of before
+                assert!(!x.resigned && x.winner.is_none());
+                assert_eq!((r.over, &r.result, r.steps, r.samples, r.decisions), (r0.over, &r0.result, r0.steps, r0.samples, r0.decisions));
+                assert_eq!(records_digest(s), records_digest(s0));
+                continue;
+            };
+            resigned += 1;
+            assert!(x.resigned, "seat {si} game {}: the rule fired in its twin but it did not resign", r.gid);
+            assert_eq!((x.winner, x.decision, x.step, x.records), (x0.winner, x0.decision, x0.step, x0.records), "seat {si} game {}", r.gid);
+            assert!(r.over && x.decision <= r0.decisions && x.step < r0.steps);
+            assert_eq!((r.steps, r.decisions, r.samples), (x.step, x.decision, x.records));
+            let mut z = vec![0.0; 2];
+            z[w as usize] = 1.0;
+            assert_eq!(r.result, z, "the favoured seat wins");
+            wrong += (r0.result[w as usize] < 1.0) as usize;
+            // its records: the twin's first ones, z the resignation's (relative to each record's decider)
+            assert_eq!(s.len(), x.records as usize);
+            for (a, b) in s.iter().zip(s0) {
+                assert_eq!((&a.x, &a.pi, &a.opts, a.player, a.q, a.net), (&b.x, &b.pi, &b.opts, b.player, b.q, b.net));
+                for j in 0..2 {
+                    assert_eq!(a.z[j], z[(a.player as usize + j) % 2]);
+                }
+            }
+            // the firing search (the last record): its root value calls the favoured seat's win (q: the decider's view)
+            let last = s.last().unwrap();
+            let qf = last.q[(w as usize + 2 - last.player as usize) % 2];
+            assert!(qf as f64 >= 0.95 - 1e-6, "the firing search's favoured estimate {qf}");
+        }
+        eprintln!("seat {si}: {resigned} of 40 games resigned, {wrong} against their played-out result");
+        assert!((8..=36).contains(&resigned) && wrong < resigned, "seat {si}: {resigned} of 40 games resigned, {wrong} wrongly");
+    }
+}
+
+#[test]
+fn the_no_resign_share_is_a_hash_of_seed_and_gid() {
+    assert!(!noresign_pick(5, 3, 0.0) && noresign_pick(5, 3, 1.0));
+    let n = (0..20_000).filter(|&g| noresign_pick(7, g, 0.1)).count();
+    assert!((1_800..2_200).contains(&n), "{n} of 20,000 at 0.1");
+    assert!((0..20_000).all(|g| noresign_pick(7, g, 0.1) == noresign_pick(7, g, 0.1)));
+    assert!((0..200).any(|g| noresign_pick(7, g, 0.5) != noresign_pick(8, g, 0.5)), "the seed matters");
+    // a run with a share: each game's draw is noresign_pick's; the no-resign games are the dry run's games, the
+    // others the all-resign run's (no stream moves)
+    let all = run_lead(&mut Driver::<ToyGame>::new(resign_cfg(nn(0, 16, true), 40, 0.1, 3, 0.0)).unwrap());
+    let dry = run_lead(&mut Driver::<ToyGame>::new(resign_cfg(nn(0, 16, true), 40, 0.1, 3, 1.0)).unwrap());
+    let mix = run_lead(&mut Driver::<ToyGame>::new(resign_cfg(nn(0, 16, true), 40, 0.1, 3, 0.4)).unwrap());
+    let mut free = 0;
+    for (k, (r, s)) in mix.iter().enumerate() {
+        let x = r.resign.as_ref().unwrap();
+        assert_eq!(x.noresign, noresign_pick(11, r.gid, 0.4));
+        let (r1, s1) = if x.noresign { &dry[k] } else { &all[k] };
+        let y = r1.resign.as_ref().unwrap();
+        assert_eq!((r.gid, &r.result, r.steps, r.samples), (r1.gid, &r1.result, r1.steps, r1.samples));
+        assert_eq!((x.resigned, x.winner, x.decision, x.step, x.records), (y.resigned, y.winner, y.decision, y.step, y.records));
+        assert_eq!(records_digest(s), records_digest(s1));
+        free += x.noresign as usize;
+    }
+    assert!((6..=26).contains(&free), "{free} no-resign games of 40 at 0.4");
+}
+
+#[test]
+fn resigned_games_count_in_rolling_quotas() {
+    let mut c = resign_cfg(nn(0, 16, true), 1, 0.1, 3, 0.2);
+    c.rolling = true;
+    c.concurrency = 10;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (mut rows, mut samples) = (Vec::new(), 0usize);
+    for phase in 0..5u32 {
+        d.resume(12, phase).unwrap();
+        let mut fin = 0;
+        loop {
+            let b = d.next_batch(true).unwrap();
+            if let Some(b) = &b {
+                answer_lead(&mut d, b);
+            }
+            let r = d.take_results();
+            fin += r.len();
+            samples += d.take_samples().len();
+            rows.extend(r);
+            if b.is_none() {
+                break;
+            }
+        }
+        assert!(fin >= 12, "phase {phase}: {fin} games (resigned games count)");
+    }
+    let st = d.stats();
+    assert_eq!(st.games_finished as usize, rows.len());
+    assert_eq!(rows.iter().map(|r| r.samples as usize).sum::<usize>(), samples);
+    let res = rows.iter().filter(|r| r.resign.as_ref().unwrap().resigned).count();
+    assert!(res > 0 && res < rows.len(), "{res} of {} resigned", rows.len());
+    assert!(rows.iter().all(|r| r.over));
+}
+
+#[test]
+fn branches_of_resigning_games() {
+    // branched games (docs/search.md 2.11) with resignation: a game that resigns spawns its branch like one that
+    // plays out; a branch counts its own searches (after its deviation moves) and shares its game's draw
+    let mut c = branch_cfg(40, 1.0);
+    c.seats = vec![with_resign(nn_full(12), 0.1, 3, 0.3)];
+    let rows = run_lead(&mut Driver::<ToyGame>::new(c.clone()).unwrap());
+    let br: Vec<_> = rows.iter().filter(|(r, _)| r.branch.is_some()).collect();
+    assert!(br.len() >= 30, "{} branches of 40 games at p 1", br.len());
+    let mut of_resigned = 0;
+    for (r, s) in &br {
+        let b = r.branch.as_ref().unwrap();
+        let x = r.resign.as_ref().unwrap();
+        let (g, _) = rows.iter().find(|(q, _)| q.gid == r.gid && q.branch.is_none()).unwrap();
+        let gx = g.resign.as_ref().unwrap();
+        assert_eq!(x.noresign, gx.noresign, "a branch shares its game's draw");
+        assert_eq!(x.noresign, noresign_pick(c.seed, r.gid, 0.3));
+        of_resigned += gx.resigned as usize;
+        assert!(b.decision < g.decisions, "the branch point is a decision its game played");
+        assert_eq!(s.len(), r.samples as usize);
+        if x.resigned {
+            // its records: its searched decisions after the deviation moves, up to the firing one
+            assert_eq!(r.samples, x.decision - b.decision - b.played);
+            assert_eq!(r.samples, x.records);
+        } else {
+            assert_eq!(r.samples, r.decisions - b.decision - b.played);
+        }
+    }
+    assert!(of_resigned > 0, "some branches come from resigned games");
+    assert!(br.iter().any(|(r, _)| r.resign.as_ref().unwrap().resigned), "some branches resign");
+    // reproducible
+    let again = run_lead(&mut Driver::<ToyGame>::new(c).unwrap());
+    let key = |v: &Vec<(GameResult, Vec<Record>)>| v.iter().map(|(r, s)| (r.gid, r.steps, r.branch.clone(), r.resign.clone(), records_digest(s))).collect::<Vec<_>>();
+    assert_eq!(key(&rows), key(&again));
+}
+
+#[test]
+fn resign_settings_are_checked() {
+    let err = |c: DriverCfg| Driver::<ToyGame>::new(c).err().unwrap_or_default();
+    assert!(err(resign_cfg(nn(0, 8, true), 2, 0.5, 5, 0.1)).contains("resign_t 0.5"));
+    assert!(err(resign_cfg(nn(0, 8, true), 2, -0.1, 5, 0.1)).contains("resign_t"));
+    assert!(err(resign_cfg(nn(0, 8, true), 2, f64::NAN, 5, 0.1)).contains("resign_t"));
+    assert!(err(resign_cfg(nn(0, 8, true), 2, 0.05, 0, 0.1)).contains("resign_k 0"));
+    assert!(err(resign_cfg(nn(0, 8, true), 2, 0.05, 5, 1.5)).contains("resign_noresign"));
+    // a seat that records no self-play never resigns: an evaluation seat, a league opponent, a driver that records nothing
+    assert!(err(resign_cfg(nn(0, 8, false), 2, 0.05, 5, 0.1)).contains("never resigns"));
+    let mut c = resign_cfg(nn(0, 8, true), 2, 0.05, 5, 0.1);
+    c.record = false;
+    assert!(err(c).contains("never resigns"));
+    let league = match with_resign(nn(0, 8, true), 0.05, 5, 0.1) {
+        SeatCfg::Nn(mut s) => {
+            s.record = false;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    };
+    assert!(err(cfg(vec![league], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).contains("never resigns"));
+    // two-player games; one counter per game
+    let mut c = resign_cfg(nn(0, 8, true), 2, 0.05, 5, 0.1);
+    c.games = vec![vec![0, 0, 0]];
+    assert!(err(c).contains("two-player"));
+    let c = cfg(vec![with_resign(nn(0, 8, true), 0.05, 5, 0.1), with_resign(nn(1, 8, true), 0.05, 3, 0.1)], vec![vec![0, 1]], &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    assert!(err(c).contains("differ"));
+    // a resigning seat against one that does not (another network, say): fine
+    let c = cfg(vec![with_resign(nn(0, 8, true), 0.05, 5, 0.1), nn(1, 8, true)], vec![vec![0, 1]], &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    assert!(Driver::<ToyGame>::new(c).is_ok());
+    // a game with deferred terminals cannot resign: refused at its first one (a rule that never fires here)
+    let c = cfg(vec![with_resign(nn(0, 8, true), 0.0001, 50, 0.0)], vec![vec![0, 0]; 2], &[("m", KeyKind::Nn)]);
+    let mut d = Driver::<ToyTeam>::new(c).unwrap();
+    let e = loop {
+        match d.next_batch(true) {
+            Ok(Some(b)) => answer(&mut d, &b),
+            Ok(None) => break String::new(),
+            Err(e) => break e,
+        }
+    };
+    assert!(e.contains("deferred terminals cannot resign"), "{e:?}");
+}

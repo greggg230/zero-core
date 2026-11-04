@@ -110,6 +110,13 @@ def _belief_of(cfg):
     return belief_keys(cfg, 'selfplay')
 
 
+def _resign_of(cfg):
+    """A run's self-play resignation (`resign.fingerprint`, '' when off): what a worker's hello reports and the
+    run checks (docs/az.md 27)."""
+    from .resign import fingerprint
+    return fingerprint(cfg)
+
+
 def _forks_of(fk):
     """A run's branched games and archive starts as its driver plays them (`forks.fingerprint` of a Run's
     `forks`, '' when off): what a worker's hello reports and the run checks (docs/az.md 24)."""
@@ -679,6 +686,12 @@ class RemotePlay:
                 for e in ends:
                     fk = fmerge(fk, e.get('forks'))
                 out['forks'] = fk
+            if any('resign' in e for e in ends):       # self-play resignation: its accepted games' (resign.tally)
+                from .resign import merge as rmerge
+                rs = None
+                for e in ends:
+                    rs = rmerge(rs, e.get('resign'))
+                out['resign'] = rs
         if self.mode == 'matches':
             with self.mu:
                 outstanding = sum(len(s.assigned) for s in self.sess if s is not None)
@@ -758,6 +771,11 @@ class RemotePlay:
                     # a checkout without branched games / archive starts (or with another archive) would
                     # play its games without them in silence: never used (docs/az.md 24)
                     s.no_forks = ev.get('forks')
+                want_r = _resign_of(self.R.cfg) if self.mode == 'selfplay' else ''
+                if want_r and ev.get('resign') != want_r:
+                    # a checkout without self-play resignation (or with other settings) would play its games out
+                    # in silence: never used (docs/az.md 27)
+                    s.no_resign = ev.get('resign')
                 if self.fails or s.k == 0:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
@@ -869,6 +887,13 @@ class RemotePlay:
                 self.fail_log(f'worker {k} REFUSED: its checkout plays branched games / archive starts as '
                               f'{s.no_forks!r}, the run as {_forks_of(self.R.forks)!r} (an older checkout has none: '
                               f'docs/az.md 24); killed, retried in 10 minutes')
+                s.kill()
+                continue
+            if hasattr(s, 'no_resign'):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.fail_log(f'worker {k} REFUSED: its checkout plays self-play resignation as {s.no_resign!r}, the run '
+                              f'as {_resign_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 27); killed, '
+                              f'retried in 10 minutes')
                 s.kill()
                 continue
             if hasattr(s, 'no_belief'):
@@ -1611,6 +1636,9 @@ class Worker:
             if ph.get('forks') is not None:
                 from .forks import tally as ftally
                 ftally([row], ph['forks'], self._forks().kinds())
+            if ph.get('resign') is not None:
+                from .resign import tally as rtally
+                rtally([row], ph['resign'])
         die = int(self.test.get('die_after_accepts') or 0)
         if die and ph['accepted'] >= die:
             self.note('test: dying with accepted games in no shard yet')
@@ -1752,6 +1780,8 @@ class Worker:
         extra = {'league': ph['league']} if self.lg_on else {}
         if ph.get('forks') is not None:
             extra['forks'] = ph['forks']
+        if ph.get('resign') is not None:
+            extra['resign'] = ph['resign']
         self.emit('end', iter=ph['it'], games=ph['games'], samples=ph['samples'], shards=w['shards'], bytes=w['bytes'],
                   leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - bo, 2),
                   backoff_s=round(bo, 2), in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
@@ -1785,6 +1815,9 @@ class Worker:
         if self.mode == 'selfplay' and self._forks() is not None:
             from .forks import new_tally
             ph['forks'] = new_tally()
+        from . import resign as RS
+        if self.mode == 'selfplay' and RS.enabled(c):
+            ph['resign'] = RS.new_tally()
         evs = {'m': self.evr, **self.lg_evs} if self.lg_on else {'m': self.evr}
         self.linger_prev = None
         for sd in self.held_samples:               # co-training: rows finished while lingering, sent already
@@ -1851,7 +1884,8 @@ class Worker:
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
                       mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),
                       **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}),
-                      **({} if self.test.get('no_forks') else {'forks': _forks_of(self._forks())}))
+                      **({} if self.test.get('no_forks') else {'forks': _forks_of(self._forks())}),
+                      **({} if self.test.get('no_resign') else {'resign': _resign_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

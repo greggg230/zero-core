@@ -64,7 +64,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, runctl
+from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, resign as RS, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
@@ -290,6 +290,14 @@ DEFAULTS = dict(
     # sent is answered from the cache instead of sent (docs/search.md 3.12, docs/az.md 25: the same
     # answers up to the network's float rounding at another batch shape). 0 = off, as before
     eval_cache=0,
+    # self-play resignation with a no-resign share (zero/resign.py, docs/az.md 27, docs/search.md 3.14; KataGo's):
+    # selfplay_resign_t t > 0 = a self-play game ends when selfplay_resign_k consecutive full searches of its
+    # seats (the recorded ones, never fast or minor) found one seat's root win estimate >= 1 - t - the same seat
+    # each time -, scored as that seat's win, every record kept (z the resignation's); a share
+    # selfplay_resign_noresign of the games (a hash of seed and game: no stream moves) never resigns and reports
+    # where it would have (the live wrong-resignation rate, `selfplay.resign`; 1 = a dry run). Evaluations never
+    # resign. 0 = off: nothing changes. Two-player single-game runs without the league
+    selfplay_resign_t=0.0, selfplay_resign_k=5, selfplay_resign_noresign=0.1,
     # co-training (zero/cotrain.py, docs/az.md 11): the resolver game whose episodes decide this
     # game's deferred terminals ('' = a single-game run: the loop of this module), its settings
     # (a dict of these same settings - game, spec, network, search, training, evaluation; 'preset'
@@ -510,7 +518,7 @@ class Run:
                              view_sample_target=c.get('view_sample_target', 'next_q'),
                              root_search=c.get('selfplay_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
                              gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), eval_cache=c.get('eval_cache', 0),
-                             **belief_keys(c, 'selfplay'))
+                             **belief_keys(c, 'selfplay'), **RS.seat_keys(c))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
@@ -650,6 +658,7 @@ class Run:
         self.belief_metrics(out, st, st0, results)
         self.fork_metrics(it, out, results)
         self.cache_metrics(out, st, st0)
+        self.resign_metrics(it, out, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -710,6 +719,20 @@ class Run:
         out['eval_cache'] = {'hits': hits, 'leaves': d('cache_leaves'), 'partial': d('cache_partial'),
                              'clears': d('cache_clears'),
                              'share': round(hits / max(1, hits + sent), 4)}
+
+    def resign_metrics(self, it, out, results, remote=None):
+        """Self-play resignation (zero/resign.py, docs/az.md 27), only when it is on (the metrics of before
+        otherwise): `resign` = the iteration's accepted games resigned, the no-resign games, where those would
+        have resigned and how often wrongly, the rows a resignation saves - this machine's and the remote's
+        (`remote`: its tally) -, logged."""
+        if not RS.enabled(self.cfg):
+            return
+        acc = RS.merge(RS.tally(results, RS.new_tally()), remote)
+        out['resign'] = RS.summary(acc)
+        if remote:
+            out['resign']['remote'] = {'games': remote['games'], 'resigned': remote['resigned'],
+                                       'noresign': remote['noresign']}
+        self.log(f'iter {it} resign: {RS.fmt(out["resign"])}')
 
     def selfplay_shared(self, it):
         """Iteration `it`'s self-play with a remote (docs/az.md 5.3; zero/remoteplay.py,
@@ -845,6 +868,7 @@ class Run:
         self.belief_metrics(out, st, st0, results)
         self.fork_metrics(it, out, results, rem.pop('forks', None))
         self.cache_metrics(out, st, st0)
+        self.resign_metrics(it, out, results, rem.pop('resign', None))
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
@@ -1595,6 +1619,8 @@ class Run:
         self.log(f'run {run} starting after iter {start}; cfg {json.dumps(c)}')
         if self.forks is not None:
             self.log(f'self-play forks (zero/forks.py): {self.forks.describe()}')
+        if RS.enabled(c):
+            self.log(f'self-play resignation (zero/resign.py): {RS.fingerprint(c)}')
         if c.get('eval_remote'):
             from .remote import RemoteEval
             self.remote = RemoteEval(self, c['eval_remote'])
@@ -1833,6 +1859,10 @@ def resolve_config(args, saved):
     FK.check_settings(cfg)
     if isinstance(cfg.get('resolver_cfg'), dict) and FK.enabled(cfg['resolver_cfg']):
         raise SystemExit('resolver_cfg: selfplay_branch / selfplay_archive: single-game runs only (not a co-training resolver)')
+    # self-play resignation (zero/resign.py): ranges, two-player single-game runs without the league
+    RS.check_settings(cfg)
+    if isinstance(cfg.get('resolver_cfg'), dict) and RS.enabled(cfg['resolver_cfg']):
+        raise SystemExit('resolver_cfg: selfplay_resign_t: single-game runs only (not a co-training resolver)')
     if cfg.get('selfplay_local_linger'):
         why = ('needs selfplay_remote (the shared queue holds the games it finishes)' if not cfg.get('selfplay_remote')
                else 'single-game runs only' if cfg.get('resolver')
