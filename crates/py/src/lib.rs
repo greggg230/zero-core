@@ -82,6 +82,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(view_pick_of, m)?)?;
     m.add_function(wrap_pyfunction!(belief_weight_of, m)?)?;
     m.add_function(wrap_pyfunction!(gumbel_sequence_of, m)?)?;
+    m.add_function(wrap_pyfunction!(completed_q_policy_of, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
     m.add("BELIEF_CLIP", BELIEF_CLIP)?;
     Ok(())
@@ -149,7 +150,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "cq_prior_w"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -223,6 +224,8 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
     // training target of recorded decisions: 'visits' (default) | 'cq' (docs/search.md 3.1)
     let (cq_c_visit, cq_c_scale) = (get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?);
     let policy_target = PolicyTarget::parse(&get(d, "policy_target", "visits".to_string())?, cq_c_visit, cq_c_scale).map_err(verr)?;
+    // the prior's exponent beta in the 'cq' target (docs/search.md 3.13; absent: 1.0, the target of before)
+    let policy_target = policy_target.with_prior_w(get(d, "cq_prior_w", 1.0f64)?).map_err(verr)?;
     let select: String = get(d, "select", "visits".to_string())?;
     for k in ["select_c_visit", "select_c_scale"] {
         if select == "visits" && matches!(d.get_item(k)?, Some(v) if !v.is_none()) {
@@ -332,6 +335,19 @@ fn belief_weight_of(pred: f64, uniform: f64, tilt: f64, clip: f64) -> f64 {
 #[pyo3(name = "gumbel_sequence")]
 fn gumbel_sequence_of(m: u32, n: u32) -> Vec<u32> {
     zero_search::tree::gumbel_sequence(m, n)
+}
+
+/// The completed-Q policy target of one node's statistics (`tree::completed_q_policy_w`,
+/// docs/search.md 3.1 / 3.13): priors before noise, visits, value sums, the network's value for the
+/// decider, sigma's transform and the prior exponent (1.0 = `completed_q_policy`). The parity tests'
+/// handle on the Rust arithmetic.
+#[pyfunction]
+#[pyo3(name = "completed_q_policy", signature = (p0, n, w, v, c_visit=50.0, c_scale=1.0, prior_w=1.0))]
+fn completed_q_policy_of(p0: Vec<f32>, n: Vec<u32>, w: Vec<f64>, v: f64, c_visit: f64, c_scale: f64, prior_w: f64) -> PyResult<Vec<f32>> {
+    if n.len() != p0.len() || w.len() != p0.len() {
+        return Err(PyValueError::new_err(format!("completed_q_policy: {} priors, {} visit counts, {} value sums", p0.len(), n.len(), w.len())));
+    }
+    Ok(zero_search::tree::completed_q_policy_w(&p0, &n, &w, v, c_visit, c_scale, prior_w))
 }
 
 /// A lookahead's settings checked (docs/search.md 3.9; a dict or its JSON) -> their canonical JSON
@@ -580,10 +596,11 @@ impl PySearchTree {
     fn root_value0(&self) -> f64 {
         self.t.root_value0()
     }
-    /// The completed-Q policy target at the root (docs/search.md 3.1; [] before expansion).
-    #[pyo3(signature = (c_visit=50.0, c_scale=1.0))]
-    fn root_cq_target(&self, c_visit: f64, c_scale: f64) -> Vec<f32> {
-        self.t.root_cq_target(c_visit, c_scale)
+    /// The completed-Q policy target at the root (docs/search.md 3.1; [] before expansion), with
+    /// the prior exponent `prior_w` (docs/search.md 3.13; 1.0 = the target of before).
+    #[pyo3(signature = (c_visit=50.0, c_scale=1.0, prior_w=1.0))]
+    fn root_cq_target(&self, c_visit: f64, c_scale: f64, prior_w: f64) -> Vec<f32> {
+        self.t.root_cq_target(c_visit, c_scale, prior_w)
     }
     /// The option index a driver's move rule chooses at the root (`select` 'visits' | 'cq' with
     /// the guard `min_visits` and the completed-Q transform; docs/search.md 3.3): the driver's

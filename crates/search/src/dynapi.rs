@@ -220,9 +220,9 @@ pub trait DynTree: Send + Sync {
     fn root_win(&self) -> Option<Vec<f64>>;
     /// The network's utility of the root for its decider (0 before expansion).
     fn root_value0(&self) -> f64;
-    /// The completed-Q policy target at the root (`tree::completed_q_policy`; empty before
-    /// expansion).
-    fn root_cq_target(&self, c_visit: f64, c_scale: f64) -> Vec<f32>;
+    /// The completed-Q policy target at the root (`tree::completed_q_policy_w` with the prior
+    /// exponent `prior_w`, 1.0 = `completed_q_policy`; empty before expansion).
+    fn root_cq_target(&self, c_visit: f64, c_scale: f64, prior_w: f64) -> Vec<f32>;
     /// The option the driver's move rule `sel` chooses at the root (`Select::choose`; 0 before
     /// expansion): the same code as a driver's non-sampled moves.
     fn root_select(&self, sel: &Select) -> usize;
@@ -359,8 +359,8 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     fn root_value0(&self) -> f64 {
         self.t.value0(self.t.root)
     }
-    fn root_cq_target(&self, c_visit: f64, c_scale: f64) -> Vec<f32> {
-        self.t.cq_target(self.t.root, c_visit, c_scale)
+    fn root_cq_target(&self, c_visit: f64, c_scale: f64, prior_w: f64) -> Vec<f32> {
+        self.t.cq_target_w(self.t.root, c_visit, c_scale, prior_w)
     }
     fn root_select(&self, sel: &Select) -> usize {
         let r = self.t.root;

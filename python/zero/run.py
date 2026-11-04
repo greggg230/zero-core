@@ -105,6 +105,11 @@ DEFAULTS = dict(
     # distribution) | 'cq' (Gumbel AlphaZero's completed-Q target softmax(ln P0 + (cq_c_visit +
     # max N) cq_c_scale completedQ), docs/search.md 3.1); the search itself is the same
     policy_target='visits', cq_c_visit=50.0, cq_c_scale=1.0,
+    # cq_prior_w = beta in (0, 1], the prior's exponent in the recorded 'cq' target softmax(beta ln P0 +
+    # sigma completedQ) (docs/search.md 3.13, docs/az.md 26): beta < 1 gives the generations' policy a
+    # bounded fixed point instead of a cumulative sum of advantages. Self-play's seat only (the moves,
+    # the 'cq' rule, the Gumbel root and every evaluation never read it). 1 = off, as before
+    cq_prior_w=1.0,
     # network (only when the run's first network is created): arch 'mlp' (hidden x blocks),
     # 'grid' (a conv tower of `ch` channels x blocks over the game package's board planes,
     # GamePackage.grids; net.GridNet) or 'tokens' (a transformer over the game package's
@@ -510,6 +515,7 @@ class Run:
                              view_sample_target=c.get('view_sample_target', 'next_q'),
                              root_search=c.get('selfplay_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
                              gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), eval_cache=c.get('eval_cache', 0),
+                             cq_prior_w=c.get('cq_prior_w', 1.0),
                              **belief_keys(c, 'selfplay'))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
@@ -1889,6 +1895,11 @@ def check_eval_settings(cfg, where=''):
     if cfg.get('selfplay_root_search', 'puct') == 'gumbel' and cfg.get('policy_target', 'visits') != 'cq':
         raise SystemExit(f"{where}selfplay_root_search 'gumbel' needs policy_target 'cq' (sequential halving's visit "
                          f"counts are its schedule, not a policy; docs/search.md 3.7)")
+    from .mcts import check_cq_prior_w
+    try:
+        check_cq_prior_w(cfg.get('cq_prior_w', 1.0), cfg.get('policy_target', 'visits'))
+    except ValueError as e:
+        raise SystemExit(f'{where}{e}') from None
     try:
         elo.parse_offsets(cfg.get('elo_offsets', ''))
         anchors = elo.parse_anchors(cfg.get('elo_anchors', ''))

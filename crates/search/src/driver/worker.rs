@@ -1005,7 +1005,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         let pi: Vec<f32> = match seat.policy_target {
             PolicyTarget::Visits if tot > 0 => nv.iter().map(|&c| (c as f64 / tot as f64) as f32).collect(),
             PolicyTarget::Visits => p0.clone(),
-            PolicyTarget::CompletedQ { c_visit, c_scale } => tree.cq_target(root, c_visit, c_scale),
+            PolicyTarget::CompletedQ { c_visit, c_scale, prior_w } => tree.cq_target_w(root, c_visit, c_scale, prior_w),
         };
         let g = slot.game.as_ref().unwrap();
         let mut x = vec![0.0f32; G::NUM_FEATURES];

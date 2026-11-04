@@ -284,7 +284,7 @@ fn with_target(seat: SeatCfg, t: PolicyTarget) -> SeatCfg {
 fn completed_q_changes_only_the_policy_targets() {
     // the search is unchanged, so the games, moves and every other field are identical; only
     // pi differs (sharper than the visit distribution on average)
-    let cq = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: 1.0 };
+    let cq = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: 1.0, prior_w: 1.0 };
     let (rv, sv) = golden_selfplay(with_target(nn(0, 16, true), PolicyTarget::Visits));
     let (rc, sc) = golden_selfplay(with_target(nn(0, 16, true), cq));
     let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples, r.decisions);
@@ -304,10 +304,121 @@ fn completed_q_changes_only_the_policy_targets() {
     assert!(differ * 10 > sv.len() * 9, "{differ} of {} targets differ", sv.len());
     assert!(hc < hv, "normalised entropy: completed Q {hc} vs visits {hv}");
     // bad settings are rejected
-    let bad = with_target(nn(0, 8, true), PolicyTarget::CompletedQ { c_visit: f64::NAN, c_scale: 1.0 });
+    let bad = with_target(nn(0, 8, true), PolicyTarget::CompletedQ { c_visit: f64::NAN, c_scale: 1.0, prior_w: 1.0 });
     assert!(Driver::<ToyGame>::new(cfg(vec![bad], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_err());
     assert!(PolicyTarget::parse("cq", 50.0, -1.0).is_err() && PolicyTarget::parse("argmax", 50.0, 1.0).is_err());
     assert_eq!(PolicyTarget::parse("visits", 0.0, 0.0), Ok(PolicyTarget::Visits));
+}
+
+/// Self-play records of a fixed configuration under skewed priors (`answer_skewed`: under
+/// `answer`'s uniform priors P0^beta is uniform too, and a prior exponent changes nothing).
+fn skewed_selfplay(seat: SeatCfg) -> (Vec<GameResult>, Vec<Record>) {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+    c.seed = 2026;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (mut res, mut smp) = (Vec::new(), Vec::new());
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer_skewed(&mut d, &b);
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+    }
+    res.extend(d.take_results());
+    smp.extend(d.take_samples());
+    res.sort_by_key(|r| r.gid);
+    (res, smp)
+}
+
+/// The 'cq' target's records at main aae4ca2 (before `prior_w`): `golden_selfplay` at c_scale 1.0
+/// and `skewed_selfplay` at c_scale 0.3 (the Delver line's) - prior_w 1.0 must reproduce both.
+const GOLDEN_CQ_RECORDS: (usize, u64) = (347, 1109346877610972733);
+const GOLDEN_CQ_SKEWED_RECORDS: (usize, u64) = (371, 6033783840401516154);
+
+#[test]
+fn cq_prior_w_changes_only_the_recorded_targets() {
+    // docs/search.md 3.13: the prior exponent beta is read by the recorded 'cq' target alone - the
+    // moves (PUCT, temperature, the 'cq' move rule, the Gumbel root), results, q, z and every other
+    // field of a record are those of beta 1; pi is softer.
+    let cq = |cs: f64, pw: f64| PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: cs, prior_w: pw };
+    // prior_w 1.0: the records of before, bit for bit
+    let (_, s) = golden_selfplay(with_target(nn(0, 16, true), cq(1.0, 1.0)));
+    assert_eq!((s.len(), records_digest(&s)), GOLDEN_CQ_RECORDS);
+    let (r1, s1) = skewed_selfplay(with_target(nn(0, 16, true), cq(0.3, 1.0)));
+    assert_eq!((s1.len(), records_digest(&s1)), GOLDEN_CQ_SKEWED_RECORDS);
+    let key = |r: &GameResult| (r.gid, r.steps, r.scores.clone(), r.samples, r.decisions);
+    let keys = |rs: &[GameResult]| rs.iter().map(key).collect::<Vec<_>>();
+    let ent = |p: &[f32]| -p.iter().filter(|&&x| x > 0.0).map(|&x| x as f64 * (x as f64).ln()).sum::<f64>() / (p.len() as f64).ln();
+    let maxs = |p: &[f32]| p.iter().copied().fold(0.0f32, f32::max) as f64;
+    // c_scale 0: the target is the floored prior itself (ln P0 for the identity below)
+    let (r0, s0) = skewed_selfplay(with_target(nn(0, 16, true), cq(0.0, 1.0)));
+    assert_eq!(keys(&r0), keys(&r1));
+    let mut last = (mean_of(&s1, &ent), mean_of(&s1, &maxs));
+    for pw in [0.8, 0.5] {
+        let (rb, sb) = skewed_selfplay(with_target(nn(0, 16, true), cq(0.3, pw)));
+        assert_eq!(keys(&rb), keys(&r1), "prior_w {pw}: the games changed");
+        assert_eq!(sb.len(), s1.len());
+        let (mut differ, mut worst, mut multi) = (0, 0.0f64, 0);
+        for ((a, b), e) in s1.iter().zip(&sb).zip(&s0) {
+            assert_eq!((&a.x, a.player, a.n_players, &a.opts, a.z, a.q, a.sc, a.net), (&b.x, b.player, b.n_players, &b.opts, b.z, b.q, b.sc, b.net));
+            assert!((b.pi.iter().sum::<f32>() - 1.0).abs() < 1e-5 && b.pi.iter().all(|x| x.is_finite() && *x >= 0.0));
+            differ += (a.pi != b.pi) as usize;
+            // ln pi_beta - ln pi_1 = (beta - 1) ln P0 + a constant per root (ln P0 = ln pi_E + a constant)
+            let d: Vec<f64> = (0..a.pi.len())
+                .filter(|&k| a.pi[k] > 1e-30 && b.pi[k] > 1e-30 && e.pi[k] > 1e-30)
+                .map(|k| (b.pi[k] as f64).ln() - (a.pi[k] as f64).ln() - (pw - 1.0) * (e.pi[k] as f64).ln())
+                .collect();
+            if d.len() >= 2 {
+                multi += 1;
+                let (lo, hi) = d.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+                worst = worst.max(hi - lo);
+            }
+        }
+        assert!(differ * 10 > s1.len() * 9, "prior_w {pw}: {differ} of {} targets differ", s1.len());
+        assert!(multi * 2 > s1.len() && worst < 1e-3, "prior_w {pw}: {multi} roots checked, worst spread {worst}");
+        // softer as beta falls: higher normalised entropy, lower max-share
+        let now = (mean_of(&sb, &ent), mean_of(&sb, &maxs));
+        assert!(now.0 > last.0 && now.1 < last.1, "prior_w {pw}: entropy / max-share {now:?} after {last:?}");
+        last = now;
+    }
+    // the moves never read beta: the 'cq' move rule (self-play's after temp_moves) and the Gumbel root
+    for seat in [
+        with_select(with_target(nn(0, 16, true), cq(0.3, 1.0)), Select::Cq { c_visit: 50.0, c_scale: 0.3, min_visits: 0 }),
+        with_gumbel(nn(0, 16, true), 4, 1.0, 0.3),
+    ] {
+        let set_pw = |s: &SeatCfg, pw: f64| match s.clone() {
+            SeatCfg::Nn(mut n) => {
+                n.policy_target = n.policy_target.with_prior_w(pw).unwrap();
+                SeatCfg::Nn(n)
+            }
+            o => o,
+        };
+        let (ra, sa) = skewed_selfplay(set_pw(&seat, 1.0));
+        let (rb, sb) = skewed_selfplay(set_pw(&seat, 0.6));
+        assert_eq!(keys(&ra), keys(&rb));
+        assert!(sa.len() == sb.len() && !sa.is_empty());
+        let mut differ = 0;
+        for (a, b) in sa.iter().zip(&sb) {
+            assert_eq!((&a.x, a.player, &a.opts, a.z, a.q, a.sc), (&b.x, b.player, &b.opts, b.z, b.q, b.sc));
+            differ += (a.pi != b.pi) as usize;
+        }
+        assert!(differ * 2 > sa.len(), "{differ} of {}", sa.len());
+    }
+    // beta outside (0, 1] is refused, and 'visits' takes none
+    let t = PolicyTarget::parse("cq", 50.0, 0.3).unwrap();
+    assert_eq!(t, cq(0.3, 1.0));
+    assert_eq!(t.with_prior_w(0.7), Ok(cq(0.3, 0.7)));
+    assert_eq!(t.with_prior_w(1.0), Ok(t));
+    for bad in [0.0, -0.5, 1.0001, 2.0, f64::NAN, f64::INFINITY] {
+        assert!(t.with_prior_w(bad).is_err(), "prior_w {bad}");
+        let seat = with_target(nn(0, 8, true), cq(0.3, bad));
+        assert!(Driver::<ToyGame>::new(cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_err(), "prior_w {bad}");
+    }
+    assert_eq!(PolicyTarget::Visits.with_prior_w(1.0), Ok(PolicyTarget::Visits));
+    assert!(PolicyTarget::Visits.with_prior_w(0.7).is_err());
+}
+
+fn mean_of(s: &[Record], f: &dyn Fn(&[f32]) -> f64) -> f64 {
+    let v: Vec<f64> = s.iter().filter(|r| r.pi.len() >= 2).map(|r| f(&r.pi)).collect();
+    v.iter().sum::<f64>() / v.len() as f64
 }
 
 /// The toy with its two-option decisions marked minor (`SearchGame::minor_decision`).
@@ -1245,7 +1356,7 @@ fn select_transform_moves_only_the_moves_never_the_targets() {
     // (`answer_skewed`), so that the rule's c_scale matters.
     const RS: f64 = 0.3;
     let seat = |target: f64, rule: f64| {
-        let s = with_target(nn(0, 16, true), PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: target });
+        let s = with_target(nn(0, 16, true), PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: target, prior_w: 1.0 });
         with_select(s, Select::Cq { c_visit: 50.0, c_scale: rule, min_visits: 0 })
     };
     let play = |s: SeatCfg| {
@@ -1493,7 +1604,7 @@ fn mull_moves(res: &[GameResult], hands: &[[u8; 2]]) -> ([u32; 2], [u32; 2]) {
 #[test]
 fn root_min_visits_selfplay_targets_and_moves() {
     // The Delver mulligan in miniature: KEEP's prior 0.999 at every hand, 64 simulations.
-    let cq = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: 1.0 };
+    let cq = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale: 1.0, prior_w: 1.0 };
     let (r0, s0, hands) = mull_run(mull_seat(0, true, cq, Select::Visits), 160, true);
     let (r4, s4, hands4) = mull_run(mull_seat(4, true, cq, Select::Visits), 160, true);
     assert_eq!(hands, hands4);
@@ -2133,7 +2244,7 @@ fn with_gumbel(seat: SeatCfg, m: u32, scale: f64, c_scale: f64) -> SeatCfg {
         SeatCfg::Nn(mut s) => {
             s.root_search = RootSearch::Gumbel { m, scale, c_visit: 50.0, c_scale };
             if s.selfplay {
-                s.policy_target = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale };
+                s.policy_target = PolicyTarget::CompletedQ { c_visit: 50.0, c_scale, prior_w: 1.0 };
             }
             SeatCfg::Nn(s)
         }

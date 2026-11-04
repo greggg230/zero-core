@@ -501,17 +501,20 @@ def gumbel_formula(game='toy', n=8, sims=(2, 5, 17, 64), ms=(1, 2, 4, 16), seed=
     return out
 
 
-def cq_formula(game='toy', n=8, sims=64, seed=0, cq_settings=((50.0, 1.0), (50.0, 0.1), (10.0, 3.0)), scale=0.15):
+def cq_formula(game='toy', n=8, sims=64, seed=0, cq_settings=((50.0, 1.0), (50.0, 0.1), (10.0, 3.0)), scale=0.15,
+               prior_ws=(1.0,)):
     """The Python `completed_q_policy` on Rust roots' statistics (P0, N, W, network value) vs
-    the Rust tree's own target. -> max |difference|."""
+    the Rust tree's own target, at each prior exponent of `prior_ws` (docs/search.md 3.13). -> max
+    |difference|."""
     info = engine().game_info_of(game)
     ev = LinearEval(info["num_features"], info["num_actions"], seed=1, scale=scale)
     worst = 0.0
     for k, g in enumerate(sample_positions(game, n, seed)):
         *_, t = search_rs(g, ev, sims, 500 + k, tree=True)
         for cv, cs in cq_settings:
-            py = mcts.completed_q_policy(t.root_priors0, t.root_visits, t.root_values, t.root_value0, cv, cs)
-            worst = max(worst, float(np.abs(np.asarray(py) - np.asarray(t.root_cq_target(cv, cs))).max()))
+            for pw in prior_ws:
+                py = mcts.completed_q_policy(t.root_priors0, t.root_visits, t.root_values, t.root_value0, cv, cs, pw)
+                worst = max(worst, float(np.abs(np.asarray(py) - np.asarray(t.root_cq_target(cv, cs, pw))).max()))
     return worst
 
 
