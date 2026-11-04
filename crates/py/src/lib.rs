@@ -700,6 +700,12 @@ impl PySearchTree {
         d.set_item("main_line", e(&s.main_line))?;
         Ok(d)
     }
+    /// The number of (node, option) pairs the last `simulate` walked (a diagnostic: its leaf's or
+    /// terminal's depth, root 0).
+    #[getter]
+    fn path_len(&self) -> usize {
+        self.t.path_len()
+    }
 }
 
 // ------------------------------------------------------------------------ SearchDriver

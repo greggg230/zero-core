@@ -259,6 +259,8 @@ pub trait DynTree: Send + Sync {
     fn n_nodes(&self) -> usize;
     /// The tree's shape under its root (`Tree::shape`, a diagnostic: docs/search.md 3.15).
     fn shape(&self) -> crate::tree::Shape;
+    /// The (node, option) pairs the last simulation walked (its depth: a leaf's, or a terminal's).
+    fn path_len(&self) -> usize;
 }
 
 struct TreeBox<G: SearchGame> {
@@ -448,6 +450,9 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     }
     fn shape(&self) -> crate::tree::Shape {
         self.t.shape()
+    }
+    fn path_len(&self) -> usize {
+        self.sc.path.len()
     }
 }
 
