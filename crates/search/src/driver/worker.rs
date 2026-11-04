@@ -1,7 +1,7 @@
 //! The driver's worker threads: advancing games (search, bots, external requests), batch
 //! assembly, finished games and training records.
 use super::*;
-use crate::lookahead::{Answers, Outcome, RowSink, Step as LookStep};
+use crate::lookahead::{obs_hash, Answers, Outcome, RowSink, Step as LookStep};
 use crate::tree::{leaf_values_team, transition_with, Scratch as SimScratch, Sim, Walk};
 
 struct WScratch<G: SearchGame> {
@@ -99,6 +99,10 @@ struct Tally {
     branches: u64,
     dev_moves: u64,
     starts: u64,
+    cache_hits: u64,
+    cache_leaves: u64,
+    cache_partial: u64,
+    cache_clears: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -134,7 +138,45 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
                 slot.net = net;
             }
             match slot.pending.take() {
-                Some(Pending::Leaf { key, local, seat, node, vrow, brow }) => {
+                Some(Pending::Leaf { key, local, seat, node, vrow, brow, part: Some(pt) }) => {
+                    // the evaluation cache on (docs/search.md 3.12): the rows sent, the others cached
+                    let Some(Eval::Nn { opt_off, priors, value, margin, bases, aux, aux_row }) = evals[key as usize].as_ref() else {
+                        return Err("internal: missing network evaluation".into());
+                    };
+                    let LeafPart { lkey, leaf, vkey, view } = *pt;
+                    let mut r = (bases[c] + local) as usize;
+                    let leaf = match leaf {
+                        Some(l) => l,
+                        None => {
+                            let l = row_answer(opt_off, priors, value, margin, r);
+                            r += 1;
+                            l
+                        }
+                    };
+                    let view = match (vrow, view) {
+                        (false, _) => None,
+                        (true, Some(v)) => Some(v),
+                        (true, None) => {
+                            let v = row_answer(opt_off, priors, value, margin, r);
+                            r += 1;
+                            Some(v)
+                        }
+                    };
+                    let (v, m) = view.as_ref().map_or((&leaf.value, &leaf.margin), |w| (&w.value, &w.margin));
+                    apply_eval(cfg, slot, seat, node, vrow, &leaf.priors, v, m)?;
+                    n.sims += 1;
+                    let cap = nn_seat(cfg, slot.gid, seat).map_or(0, |s| s.eval_cache);
+                    if let Some(k) = lkey {
+                        cache_put(slot, cap, key, k, leaf, &mut n);
+                    }
+                    if let (Some(k), Some(w)) = (vkey, view) {
+                        cache_put(slot, cap, key, k, w, &mut n);
+                    }
+                    if brow {
+                        set_belief(cfg, slot, seat, belief_of(aux, aux_row, r, G::aux_width())?)?;
+                    }
+                }
+                Some(Pending::Leaf { key, local, seat, node, vrow, brow, part: None }) => {
                     let Some(Eval::Nn { opt_off, priors, value, margin, bases, aux, aux_row }) = evals[key as usize].as_ref() else {
                         return Err("internal: missing network evaluation".into());
                     };
@@ -215,6 +257,12 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
         k.dev_moves.fetch_add(n.dev_moves, Ordering::Relaxed);
         k.starts.fetch_add(n.starts, Ordering::Relaxed);
     }
+    if n.cache_hits > 0 || n.cache_clears > 0 {
+        k.cache_hits.fetch_add(n.cache_hits, Ordering::Relaxed);
+        k.cache_leaves.fetch_add(n.cache_leaves, Ordering::Relaxed);
+        k.cache_partial.fetch_add(n.cache_partial, Ordering::Relaxed);
+        k.cache_clears.fetch_add(n.cache_clears, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -225,6 +273,28 @@ fn belief_of<'a>(aux: &'a [f32], aux_row: &[u32], r: usize, w: usize) -> Result<
         return Err(format!("internal: row {r} is not a root belief row"));
     }
     Ok(&aux[k as usize * w..(k as usize + 1) * w])
+}
+
+/// Row `r`'s answer in an evaluation (its options' priors, value and margin per seat) as a cache entry.
+fn row_answer(opt_off: &[i32], priors: &[f32], value: &[f32], margin: &[f32], r: usize) -> Cached {
+    let mut v = [0.0; MAX_SEATS];
+    let mut m = [0.0; MAX_SEATS];
+    v.copy_from_slice(&value[r * MAX_SEATS..(r + 1) * MAX_SEATS]);
+    m.copy_from_slice(&margin[r * MAX_SEATS..(r + 1) * MAX_SEATS]);
+    Cached { priors: priors[opt_off[r] as usize..opt_off[r + 1] as usize].into(), value: v, margin: m }
+}
+
+/// A row's answer into the game's evaluation cache (at most `cap` entries: emptied first when full).
+fn cache_put<G: SearchGame>(slot: &mut Slot<G>, cap: u32, key: u16, k: u128, c: Cached, n: &mut Tally) {
+    let net = slot.net;
+    if cap == 0 {
+        return;
+    }
+    if slot.cache.len() >= cap as usize {
+        slot.cache.clear();
+        n.cache_clears += 1;
+    }
+    slot.cache.insert((key, net, k), c);
 }
 
 /// The search of seat `seat` takes its root's belief `pred` (the network's auxiliary output for the
@@ -273,6 +343,8 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
     }
     slot.look = None;
     slot.drop_trees();
+    // (no answer of the old network is reused: docs/search.md 3.12)
+    slot.cache.clear();
     slot.sims = 0;
     if slot.target.is_some() {
         slot.ensure_legal();
@@ -372,6 +444,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     slot.look = None;
     slot.look_mcts = false;
     slot.look_guard = None;
+    slot.cache.clear();
     Ok(())
 }
 
@@ -491,6 +564,71 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 slot.sims += 1;
                 n.sims += 1;
             }
+            Sim::Leaf { node, player } if seat.eval_cache > 0 => {
+                // the game's evaluation cache (docs/search.md 3.12): each row is looked up by the hash
+                // of its features and options; a cached row is not sent
+                let buf = &mut bufs[seat.key as usize];
+                let local = buf.len() as u32;
+                let acts = tree.acts(node);
+                let row = buf.row_x(G::NUM_FEATURES);
+                sg.encode(player, row);
+                let lkey = cache_key(obs_hash(row), acts);
+                let leaf = slot.cache.get(&(seat.key, slot.net, lkey)).cloned();
+                if leaf.is_some() {
+                    buf.unrow(G::NUM_FEATURES);
+                } else {
+                    buf.seal();
+                    buf.nopt.push(acts.len() as i32);
+                    buf.opt_action.extend(acts.iter().map(|&a| a as i32));
+                    buf.player.push(player as i32);
+                    buf.n_players.push(slot.n as i32);
+                    buf.gid.push(slot.gid as i64);
+                    buf.extra.push(ROW_LEAF);
+                }
+                let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
+                let (mut vkey, mut view) = (None, None);
+                if vrow {
+                    let row = buf.row_x(G::NUM_FEATURES);
+                    sg.encode(tree.viewer, row);
+                    let k = cache_key(obs_hash(row), &[]);
+                    view = slot.cache.get(&(seat.key, slot.net, k)).cloned();
+                    if view.is_some() {
+                        buf.unrow(G::NUM_FEATURES);
+                    } else {
+                        buf.seal();
+                        buf.nopt.push(0);
+                        buf.player.push(tree.viewer as i32);
+                        buf.n_players.push(slot.n as i32);
+                        buf.gid.push(slot.gid as i64);
+                        buf.extra.push(ROW_VALUE);
+                        n.view_rows += 1;
+                        vkey = Some(k);
+                    }
+                }
+                n.cache_hits += leaf.is_some() as u64 + view.is_some() as u64;
+                if let Some(l) = leaf.as_ref().filter(|_| !vrow || view.is_some()) {
+                    // every row cached: the leaf is expanded now and the search goes on (a fresh root's
+                    // belief row is then sent alone, as a reused root's, above)
+                    let (v, m) = view.as_ref().map_or((&l.value, &l.margin), |w| (&w.value, &w.margin));
+                    apply_eval(cfg, slot, p, node, vrow, &l.priors, v, m)?;
+                    n.sims += 1;
+                    n.cache_leaves += 1;
+                    continue;
+                }
+                n.cache_partial += (leaf.is_some() || view.is_some()) as u64;
+                if brow {
+                    // (an unexpanded root: this leaf is the root itself)
+                    if node != tree.root {
+                        return Err("internal: a fresh root's first leaf is not the root".into());
+                    }
+                    push_belief_row(buf, live, p, slot.n, slot.gid);
+                    n.belief_rows += 1;
+                }
+                let lkey = leaf.is_none().then_some(lkey);
+                slot.pending = Some(Pending::Leaf { key: seat.key, local, seat: p, node, vrow, brow, part: Some(Box::new(LeafPart { lkey, leaf, vkey, view })) });
+                n.leaves += 1;
+                return Ok(());
+            }
             Sim::Leaf { node, player } => {
                 let buf = &mut bufs[seat.key as usize];
                 let local = buf.len() as u32;
@@ -524,7 +662,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                     push_belief_row(buf, live, p, slot.n, slot.gid);
                     n.belief_rows += 1;
                 }
-                slot.pending = Some(Pending::Leaf { key: seat.key, local, seat: p, node, vrow, brow });
+                slot.pending = Some(Pending::Leaf { key: seat.key, local, seat: p, node, vrow, brow, part: None });
                 n.leaves += 1;
                 return Ok(());
             }
@@ -1069,6 +1207,8 @@ fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut
     slot.look_guard = None;
     slot.fork = None;
     slot.start_ix = None;
+    // (a branch is a game of its own: its evaluation cache starts empty, docs/search.md 3.12)
+    slot.cache.clear();
     slot.branch = Some(BranchInfo { at: fp.at, of: f.seen, decision: fp.decisions, step: fp.steps, action: fp.action, moves, played: 0, same_first: false, start });
     slot.dev_left = moves;
     slot.dev_now = false;

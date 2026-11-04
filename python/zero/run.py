@@ -285,6 +285,11 @@ DEFAULTS = dict(
     # token network's CUDA graphs scatter them on the device instead of the host copying the dense
     # rows (docs/az.md 10.6), other evaluators densify them. 0 = dense batches, as before
     sparse=0,
+    # eval_cache N > 0 = every network seat of the run (self-play and evaluation) keeps its game's network
+    # answers, at most N per game, by a hash of each row's features and options: a row the game already
+    # sent is answered from the cache instead of sent (docs/search.md 3.12, docs/az.md 25: the same
+    # answers up to the network's float rounding at another batch shape). 0 = off, as before
+    eval_cache=0,
     # co-training (zero/cotrain.py, docs/az.md 11): the resolver game whose episodes decide this
     # game's deferred terminals ('' = a single-game run: the loop of this module), its settings
     # (a dict of these same settings - game, spec, network, search, training, evaluation; 'preset'
@@ -504,7 +509,8 @@ class Run:
                              view_samples=c.get('selfplay_view_samples', 0.0),
                              view_sample_target=c.get('view_sample_target', 'next_q'),
                              root_search=c.get('selfplay_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
-                             gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), **belief_keys(c, 'selfplay'))
+                             gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), eval_cache=c.get('eval_cache', 0),
+                             **belief_keys(c, 'selfplay'))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
@@ -513,7 +519,8 @@ class Run:
                          root_min_visits_max_actions=c.get('root_min_visits_max_actions', 4),
                          leaf_value_view=c.get('eval_leaf_value_view', 'mover'),
                          root_search=c.get('eval_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
-                         gumbel_scale=c.get('eval_gumbel_scale', 0.0), **belief_keys(c, 'eval'))
+                         gumbel_scale=c.get('eval_gumbel_scale', 0.0), eval_cache=c.get('eval_cache', 0),
+                         **belief_keys(c, 'eval'))
 
     def check_belief_heads(self, path):
         """With a root belief on (selfplay_ / eval_belief_tilt > 0, docs/az.md 18) the checkpoint at
@@ -642,6 +649,7 @@ class Run:
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
         self.fork_metrics(it, out, results)
+        self.cache_metrics(out, st, st0)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -685,6 +693,23 @@ class Run:
         rows = st.get('belief_rows', 0) - ((st0 or {}).get('belief_rows', 0))
         dec = sum(r.get('decisions', 0) for r in results)
         out['belief'] = {'rows': rows, 'per_decision': round(rows / max(1, dec), 4)}
+
+    def cache_metrics(self, out, st, st0):
+        """Self-play's evaluation-cache metrics (docs/az.md 25), only when it is on (the metrics of before
+        otherwise): `eval_cache` = {hits: network rows answered from a game's cache by this machine's
+        driver, leaves: leaves expanded at once (every row cached), partial: leaves that sent one row and
+        took the other from the cache, clears: caches emptied because full, share: hits / (hits + rows
+        sent)}."""
+        if not self.cfg.get('eval_cache'):
+            return
+
+        def d(k):
+            return st.get(k, 0) - ((st0 or {}).get(k, 0))
+        hits = d('cache_hits')
+        sent = d('leaves') + d('view_rows') + d('belief_rows')
+        out['eval_cache'] = {'hits': hits, 'leaves': d('cache_leaves'), 'partial': d('cache_partial'),
+                             'clears': d('cache_clears'),
+                             'share': round(hits / max(1, hits + sent), 4)}
 
     def selfplay_shared(self, it):
         """Iteration `it`'s self-play with a remote (docs/az.md 5.3; zero/remoteplay.py,
@@ -819,6 +844,7 @@ class Run:
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
         self.fork_metrics(it, out, results, rem.pop('forks', None))
+        self.cache_metrics(out, st, st0)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
