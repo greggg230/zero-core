@@ -257,6 +257,8 @@ pub trait DynTree: Send + Sync {
     fn edge_kids(&self, i: usize) -> Vec<(Vec<u64>, usize)>;
     fn edge_outs(&self, i: usize) -> Vec<Vec<u64>>;
     fn n_nodes(&self) -> usize;
+    /// The tree's shape under its root (`Tree::shape`, a diagnostic: docs/search.md 3.15).
+    fn shape(&self) -> crate::tree::Shape;
 }
 
 struct TreeBox<G: SearchGame> {
@@ -443,6 +445,9 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     }
     fn n_nodes(&self) -> usize {
         self.t.n_nodes()
+    }
+    fn shape(&self) -> crate::tree::Shape {
+        self.t.shape()
     }
 }
 

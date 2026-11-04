@@ -685,6 +685,21 @@ impl PySearchTree {
     fn n_nodes(&self) -> usize {
         self.t.n_nodes()
     }
+    /// The tree's shape under its root (a read-only diagnostic, docs/search.md 3.15): a dict of
+    /// nodes, expanded, depth_hist (expanded nodes per depth, root 0), max_depth, edges and main_line
+    /// (each a list of (depth, own, visits, kids, opp_kids, expanded_kids)).
+    fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let s = self.t.shape();
+        let d = PyDict::new(py);
+        let e = |v: &[zero_search::tree::EdgeShape]| -> Vec<(u32, bool, u32, u32, u32, u32)> { v.iter().map(|x| (x.depth, x.own, x.n, x.kids, x.opp_kids, x.expanded_kids)).collect() };
+        d.set_item("nodes", s.nodes)?;
+        d.set_item("expanded", s.expanded)?;
+        d.set_item("depth_hist", s.depth_hist.clone())?;
+        d.set_item("max_depth", s.max_depth)?;
+        d.set_item("edges", e(&s.edges))?;
+        d.set_item("main_line", e(&s.main_line))?;
+        Ok(d)
+    }
 }
 
 // ------------------------------------------------------------------------ SearchDriver

@@ -114,6 +114,32 @@ pub enum Sim {
     Terminal,
 }
 
+/// One edge of `Tree::shape` (a diagnostic): the depth of its node (root 0), whether the tree's viewer
+/// decides that node, its visits, its child nodes (`opp_kids` of them decided by another seat,
+/// `expanded_kids` expanded).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EdgeShape {
+    pub depth: u32,
+    pub own: bool,
+    pub n: u32,
+    pub kids: u32,
+    pub opp_kids: u32,
+    pub expanded_kids: u32,
+}
+
+/// The shape of a tree under its root (`Tree::shape`, docs/search.md 3.15): nodes reachable, expanded,
+/// expanded nodes per depth (root 0), the deepest node, every edge with a visit or a child, and the
+/// main line (the most visited option from the root on, then that edge's most backed-up child).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Shape {
+    pub nodes: u32,
+    pub expanded: u32,
+    pub depth_hist: Vec<u32>,
+    pub max_depth: u32,
+    pub edges: Vec<EdgeShape>,
+    pub main_line: Vec<EdgeShape>,
+}
+
 /// Search settings of one tree walk.
 #[derive(Clone, Copy, Debug)]
 pub struct Walk {
@@ -832,6 +858,86 @@ impl<G: SearchGame> Tree<G> {
     /// Nodes stored (incl. garbage above a reused root).
     pub fn n_nodes(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// The shape of the tree under the root (a read-only diagnostic, docs/search.md 3.15): every node
+    /// reachable from the root once, at its shortest depth (root 0). In a fresh search each expanded node
+    /// was one walk's leaf, so `depth_hist` is the walks' leaf depths but those that ended at a terminal.
+    pub fn shape(&self) -> Shape {
+        let mut s = Shape::default();
+        let mut depth: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut order = vec![self.root];
+        depth.insert(self.root, 0);
+        let mut k = 0;
+        while k < order.len() {
+            let id = order[k];
+            k += 1;
+            let d = depth[&id];
+            s.nodes += 1;
+            s.max_depth = s.max_depth.max(d);
+            if !self.expanded(id) {
+                continue;
+            }
+            s.expanded += 1;
+            if s.depth_hist.len() <= d as usize {
+                s.depth_hist.resize(d as usize + 1, 0);
+            }
+            s.depth_hist[d as usize] += 1;
+            let own = self.player(id) == self.viewer;
+            for i in 0..self.nodes[id as usize].nacts as usize {
+                let n = self.n_of(id, i);
+                let kids = self.kid_ids(id, i);
+                if n == 0 && kids.is_empty() {
+                    continue;
+                }
+                let mut e = EdgeShape { depth: d, own, n, kids: kids.len() as u32, ..Default::default() };
+                for &c in &kids {
+                    e.opp_kids += (self.player(c) != self.viewer) as u32;
+                    e.expanded_kids += self.expanded(c) as u32;
+                    if let std::collections::hash_map::Entry::Vacant(v) = depth.entry(c) {
+                        v.insert(d + 1);
+                        order.push(c);
+                    }
+                }
+                s.edges.push(e);
+            }
+        }
+        // the main line: the most visited option from the root on (the first maximum on ties)
+        let mut id = self.root;
+        let mut seen = std::collections::HashSet::new();
+        while self.expanded(id) && seen.insert(id) {
+            let st = self.stats_of(id);
+            let Some(i) = (0..st.len()).max_by(|&a, &b| st[a].n.cmp(&st[b].n).then(b.cmp(&a))) else { break };
+            if st[i].n == 0 {
+                break;
+            }
+            let kids = self.kid_ids(id, i);
+            let mut e = EdgeShape { depth: s.main_line.len() as u32, own: self.player(id) == self.viewer, n: st[i].n, kids: kids.len() as u32, ..Default::default() };
+            for &c in &kids {
+                e.opp_kids += (self.player(c) != self.viewer) as u32;
+                e.expanded_kids += self.expanded(c) as u32;
+            }
+            s.main_line.push(e);
+            // the edge's most visited child (backups through it: tot)
+            let Some(&c) = kids.iter().max_by_key(|&&c| self.nodes[c as usize].tot) else { break };
+            id = c;
+        }
+        s
+    }
+
+    /// The child nodes of (node, option i), newest first.
+    fn kid_ids(&self, node: u32, i: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        let so = self.nodes[node as usize].stat_off;
+        if so == NIL {
+            return out;
+        }
+        let mut k = self.stats[so as usize + i].kid;
+        while k != NIL {
+            out.push(k);
+            k = self.nodes[k as usize].next;
+        }
+        out
     }
 
     // ---------------------------------------------------------------- search
