@@ -3874,4 +3874,6 @@ digests; the driver's other golden records and matches unchanged); pytest `tests
 `tools/check_checkpoint_compat.py --package zero --net random --game toy` against aae4ca2: identical; the toy
 loop (`--preset toy-smoke --policy-target cq --cq-prior-w 0.6` vs 1.0): the first iteration's 385 samples
 alike, target `h_norm` 0.900 vs 0.878, then the networks diverge; MTG Zero main 619f1f2 builds against this
-core and plays the identical games of 26.3.
+core and plays the identical games of 26.3, and `check_checkpoint_compat.py --package mtgz` with the Delver
+line's checkpoint 1000 and its spec (8 games, 32 sims, 'visits' and 'cq' records, a match vs random), 619f1f2 on
+aae4ca2 vs 619f1f2 on this core: identical.
