@@ -3819,4 +3819,6 @@ comparisons are within one process or interleaved A / B on one seed):
 match_the_dense_row`, `driver::tests::sparse_rows_from_encode_sparse_are_the_dense_rows`), pytest -k "sparse or
 cache" 6 passed / 1 skipped (CUDA); MTG Zero (ENGINE.md 89): its engine test
 `encode_sparse_is_the_rows_non_zeros_with_the_same_key` (cube and Delver mirror states, both viewers) and its re-pin
-gate (the engine digest unchanged).
+gate (the engine digest f6543eb2b1b8752f unchanged, the 1-config Delver search smoke); `tools/smoke_all.sh
+--with-this-core --build-only` with Glass Road, Caverna and Kingdom Builder: all three build (the trait method has
+a default).
