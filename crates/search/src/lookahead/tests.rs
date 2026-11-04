@@ -241,6 +241,50 @@ fn obs_hash_tells_encodings_apart() {
     assert_ne!(obs_hash(&[1.0, 2.0]), obs_hash(&[2.0, 1.0]));
 }
 
+#[test]
+fn sparse_scan_and_obs_hash_sparse_match_the_dense_row() {
+    // docs/search.md 2.12: `game::sparse_scan` = the old `LeafBuf::seal` loop (every float whose bits are not 0,
+    // in index order, zeroed after), and `obs_hash_sparse` of its pairs = `obs_hash` of the row - lengths around
+    // the scan's 32-float and the hash's 64-float blocks, even and odd, empty to full rows, -0.0, NaN,
+    // subnormals and neighbouring pairs
+    let mut rng = Rng::new(7);
+    let specials = [-0.0f32, f32::NAN, f32::from_bits(1), 1e30, -1.0, 0.25];
+    let mut rows = 0;
+    for &n in &[1usize, 2, 3, 31, 32, 33, 63, 64, 65, 95, 127, 128, 129, 1001, 37_620] {
+        for &share in &[0.0f64, 0.002, 0.03, 0.3, 1.0] {
+            for _ in 0..4 {
+                let mut x = vec![0.0f32; n];
+                for v in x.iter_mut() {
+                    if rng.unit() < share {
+                        *v = if rng.unit() < 0.3 { specials[rng.below(specials.len() as u32) as usize] } else { rng.unit() as f32 - 0.5 };
+                    }
+                }
+                let dense = obs_hash(&x);
+                let (mut ri, mut rv) = (Vec::new(), Vec::new());
+                for (i, v) in x.iter().enumerate() {
+                    if v.to_bits() != 0 {
+                        ri.push(i as u32);
+                        rv.push(*v);
+                    }
+                }
+                let (mut idx, mut val) = (vec![9u32], vec![9.0f32]);
+                let k = crate::game::sparse_scan(&mut x, &mut idx, &mut val);
+                assert_eq!(k as usize, ri.len());
+                assert_eq!((idx[0], val[0]), (9, 9.0), "appended after what was there");
+                assert_eq!(&idx[1..], &ri[..], "n {n} share {share}: other indexes");
+                assert!(val[1..].iter().zip(&rv).all(|(a, b)| a.to_bits() == b.to_bits()), "n {n}: other values");
+                assert!(x.iter().all(|v| v.to_bits() == 0), "n {n}: the row not zeroed again");
+                assert_eq!(obs_hash_sparse(&idx[1..], &val[1..], n), dense, "n {n} share {share}: another hash");
+                rows += 1;
+            }
+        }
+    }
+    assert_eq!(rows, 15 * 5 * 4);
+    // the length is in the hash, as in the dense one
+    assert_eq!(obs_hash_sparse(&[3], &[1.0], 8), obs_hash(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]));
+    assert_ne!(obs_hash_sparse(&[3], &[1.0], 8), obs_hash_sparse(&[3], &[1.0], 9));
+}
+
 // ------------------------------------------------------------------ the driver's lookahead seats
 
 fn look_seat(settings: &str, sims: u32) -> SeatCfg {

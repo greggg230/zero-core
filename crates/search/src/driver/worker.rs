@@ -1,7 +1,7 @@
 //! The driver's worker threads: advancing games (search, bots, external requests), batch
 //! assembly, finished games and training records.
 use super::*;
-use crate::lookahead::{obs_hash, Answers, Outcome, RowSink, Step as LookStep};
+use crate::lookahead::{Answers, Outcome, RowSink, Step as LookStep};
 use crate::tree::{leaf_values_team, transition_with, Scratch as SimScratch, Sim, Walk};
 
 struct WScratch<G: SearchGame> {
@@ -570,9 +570,8 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 let buf = &mut bufs[seat.key as usize];
                 let local = buf.len() as u32;
                 let acts = tree.acts(node);
-                let row = buf.row_x(G::NUM_FEATURES);
-                sg.encode(player, row);
-                let lkey = cache_key(obs_hash(row), acts);
+                buf.encode_row(sg, player);
+                let lkey = cache_key(buf.row_hash(G::NUM_FEATURES), acts);
                 let leaf = slot.cache.get(&(seat.key, slot.net, lkey)).cloned();
                 if leaf.is_some() {
                     buf.unrow(G::NUM_FEATURES);
@@ -588,9 +587,8 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
                 let (mut vkey, mut view) = (None, None);
                 if vrow {
-                    let row = buf.row_x(G::NUM_FEATURES);
-                    sg.encode(tree.viewer, row);
-                    let k = cache_key(obs_hash(row), &[]);
+                    buf.encode_row(sg, tree.viewer);
+                    let k = cache_key(buf.row_hash(G::NUM_FEATURES), &[]);
                     view = slot.cache.get(&(seat.key, slot.net, k)).cloned();
                     if view.is_some() {
                         buf.unrow(G::NUM_FEATURES);
@@ -632,7 +630,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             Sim::Leaf { node, player } => {
                 let buf = &mut bufs[seat.key as usize];
                 let local = buf.len() as u32;
-                sg.encode(player, buf.row_x(G::NUM_FEATURES));
+                buf.encode_row(sg, player);
                 buf.seal();
                 let acts = tree.acts(node);
                 buf.nopt.push(acts.len() as i32);
@@ -645,7 +643,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 // value-only row (no options) of the tree's viewer, the root decider, right after it
                 let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
                 if vrow {
-                    sg.encode(tree.viewer, buf.row_x(G::NUM_FEATURES));
+                    buf.encode_row(sg, tree.viewer);
                     buf.seal();
                     buf.nopt.push(0);
                     buf.player.push(tree.viewer as i32);
@@ -793,7 +791,7 @@ fn guard_move(means: &[(u16, f64)], margin: f64, a: u16) -> (u16, bool) {
 
 /// A root belief row (`ROW_BELIEF`, docs/search.md 3.8): `encode(p)` of the live game, no options.
 fn push_belief_row<G: SearchGame>(buf: &mut LeafBuf, live: &G, p: usize, n: usize, gid: u32) {
-    live.encode(p, buf.row_x(G::NUM_FEATURES));
+    buf.encode_row(live, p);
     buf.seal();
     buf.nopt.push(0);
     buf.player.push(p as i32);

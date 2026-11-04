@@ -578,17 +578,9 @@ enum VEntry {
 /// independent multiply-xorshift lanes, finished by `split64`. The encodings are sparse (a Delver
 /// position: ~150 non-zero floats of 37,620): blocks of zero bits are skipped (an OR over the block).
 pub fn obs_hash(x: &[f32]) -> u128 {
-    #[inline(always)]
-    fn mix(a: &mut u64, b: &mut u64, i: u64, v: u64) {
-        let k = v ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        *a = (*a ^ k).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        *a ^= *a >> 32;
-        *b = (b.wrapping_add(k ^ (i << 1))).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
-    }
     // SAFETY: f32 and u32 have the same size and alignment; the bits are read, never written
     let u: &[u32] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u32, x.len()) };
-    let mut a: u64 = 0x243F_6A88_85A3_08D3;
-    let mut b: u64 = 0x1319_8A2E_0370_7344;
+    let (mut a, mut b) = OBS_SEED;
     const BLOCK: usize = 64;
     let mut blocks = u.chunks_exact(BLOCK);
     let mut base = 0u64;
@@ -613,8 +605,56 @@ pub fn obs_hash(x: &[f32]) -> u128 {
             mix(&mut a, &mut b, base + j as u64, v);
         }
     }
-    let n = x.len() as u64;
+    obs_finish(a, b, x.len())
+}
+
+/// `obs_hash`'s two lanes before any pair.
+const OBS_SEED: (u64, u64) = (0x243F_6A88_85A3_08D3, 0x1319_8A2E_0370_7344);
+
+/// `obs_hash`'s step: the pair of floats at pair index `i` with bits `v` (the first float's in the low half).
+#[inline(always)]
+fn mix(a: &mut u64, b: &mut u64, i: u64, v: u64) {
+    let k = v ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    *a = (*a ^ k).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    *a ^= *a >> 32;
+    *b = (b.wrapping_add(k ^ (i << 1))).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
+}
+
+/// `obs_hash`'s finish over the encoding's length `n`.
+#[inline(always)]
+fn obs_finish(a: u64, b: u64, n: usize) -> u128 {
+    let n = n as u64;
     ((split64(a ^ n) as u128) << 64) | split64(b ^ n.rotate_left(17)) as u128
+}
+
+/// `obs_hash` of an encoding of `n` floats given as its non-zero (index, value) pairs (docs/search.md 2.12:
+/// `SearchGame::encode_sparse`, `game::sparse_scan`): indexes ascending, every value's bits non-zero. The same
+/// mixing of the same (pair index, bits) as the dense hash, so the same key: `obs_hash_sparse` of a row's
+/// non-zeros == `obs_hash` of the row (the evaluation cache's key is either, docs/search.md 3.12).
+pub fn obs_hash_sparse(idx: &[u32], val: &[f32], n: usize) -> u128 {
+    debug_assert_eq!(idx.len(), val.len());
+    let (mut a, mut b) = OBS_SEED;
+    let mut k = 0;
+    while k < idx.len() {
+        let i = idx[k];
+        let bits = val[k].to_bits() as u64;
+        // the pair of floats (2j, 2j + 1) holding feature i: its other float from the next pair if present
+        let v = if i & 1 == 0 {
+            if k + 1 < idx.len() && idx[k + 1] == i + 1 {
+                k += 1;
+                bits | ((val[k].to_bits() as u64) << 32)
+            } else {
+                bits
+            }
+        } else {
+            bits << 32
+        };
+        k += 1;
+        if v != 0 {
+            mix(&mut a, &mut b, (i >> 1) as u64, v);
+        }
+    }
+    obs_finish(a, b, n)
 }
 
 /// The first index of the largest prior (Python's `max(range(n), key=p.__getitem__)`).

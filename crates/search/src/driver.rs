@@ -662,12 +662,16 @@ struct LeafBuf {
     extra: Vec<u8>,
     states: Vec<String>,
     /// Sparse rows (`DriverCfg::sparse`): per row its non-zeros' count, their indexes and values; a
-    /// row is encoded into `scratch` (zeroed) and sealed into these (`seal`).
+    /// row is encoded into `scratch` (zeroed) and sealed into these (`seal`), or its non-zeros appended
+    /// at once (`encode_row`, docs/search.md 2.12).
     sparse: bool,
     xs_nnz: Vec<u32>,
     xs_idx: Vec<u32>,
     xs_val: Vec<f32>,
     scratch: Vec<f32>,
+    /// A sparse buffer's open row from `encode_row`: its first non-zero in `xs_idx` (None: the open row,
+    /// if any, is in `scratch`).
+    open: Option<usize>,
 }
 
 impl LeafBuf {
@@ -683,18 +687,42 @@ impl LeafBuf {
         self.xs_nnz.clear();
         self.xs_idx.clear();
         self.xs_val.clear();
+        self.open = None;
     }
     fn len(&self) -> usize {
         self.player.len()
+    }
+    /// A new row: `g.encode(viewer)` (dense: into `x`; sparse: `encode_sparse`, its non-zeros appended
+    /// without a scan of the whole row, docs/search.md 2.12). `seal` or `unrow` it afterwards.
+    fn encode_row<G: SearchGame>(&mut self, g: &G, viewer: usize) {
+        if self.sparse {
+            self.zeroed_scratch(G::NUM_FEATURES);
+            self.open = Some(self.xs_idx.len());
+            g.encode_sparse(viewer, &mut self.scratch, &mut self.xs_idx, &mut self.xs_val);
+        } else {
+            g.encode(viewer, self.row_x(G::NUM_FEATURES));
+        }
+    }
+    /// `obs_hash` of the open row of `f` features (the evaluation cache's key, docs/search.md 3.12): of the
+    /// dense row, or of an `encode_row` row's non-zeros (`obs_hash_sparse`: the same key).
+    fn row_hash(&self, f: usize) -> u128 {
+        match self.open {
+            Some(lo) => crate::lookahead::obs_hash_sparse(&self.xs_idx[lo..], &self.xs_val[lo..], f),
+            None if self.sparse => crate::lookahead::obs_hash(&self.scratch),
+            None => crate::lookahead::obs_hash(&self.x[self.x.len() - f..]),
+        }
+    }
+    fn zeroed_scratch(&mut self, f: usize) {
+        if self.scratch.len() != f {
+            self.scratch.clear();
+            self.scratch.resize(f, 0.0);
+        }
     }
     /// The features of a new row, zeroed, for the caller to encode into: a slice of `x` (dense), or the
     /// scratch row (sparse: `seal` it afterwards).
     fn row_x(&mut self, f: usize) -> &mut [f32] {
         if self.sparse {
-            if self.scratch.len() != f {
-                self.scratch.clear();
-                self.scratch.resize(f, 0.0);
-            }
+            self.zeroed_scratch(f);
             &mut self.scratch
         } else {
             let off = self.x.len();
@@ -702,26 +730,29 @@ impl LeafBuf {
             &mut self.x[off..]
         }
     }
-    /// A sparse buffer's scratch row into its sparse arrays (its non-zero floats, -0.0 included; the
-    /// scratch zeroed again); nothing for a dense one.
+    /// A sparse buffer's open row into its sparse arrays: an `encode_row` row's non-zeros counted, or the
+    /// scratch row's non-zero floats (-0.0 included; `game::sparse_scan`, the scratch zeroed again);
+    /// nothing for a dense one.
     fn seal(&mut self) {
         if !self.sparse {
             return;
         }
-        let mut k = 0u32;
-        for (i, v) in self.scratch.iter_mut().enumerate() {
-            if v.to_bits() != 0 {
-                self.xs_idx.push(i as u32);
-                self.xs_val.push(*v);
-                *v = 0.0;
-                k += 1;
-            }
+        if let Some(lo) = self.open.take() {
+            self.xs_nnz.push((self.xs_idx.len() - lo) as u32);
+            return;
         }
+        let k = crate::game::sparse_scan(&mut self.scratch, &mut self.xs_idx, &mut self.xs_val);
         self.xs_nnz.push(k);
     }
-    /// Drop the open row's features (dense: the last row of `x`; sparse: the scratch row, zeroed).
+    /// Drop the open row's features (dense: the last row of `x`; sparse: an `encode_row` row's non-zeros,
+    /// or the scratch row, zeroed).
     fn unrow(&mut self, f: usize) {
         if self.sparse {
+            if let Some(lo) = self.open.take() {
+                self.xs_idx.truncate(lo);
+                self.xs_val.truncate(lo);
+                return;
+            }
             self.scratch.iter_mut().for_each(|v| *v = 0.0);
         } else {
             self.x.truncate(self.x.len() - f);

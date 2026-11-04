@@ -79,6 +79,16 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn score(&self, seat: usize) -> f32;
     fn determinize(&mut self, viewer: usize, rng: &mut Rng);
     fn encode(&self, viewer: usize, out: &mut [f32]);
+    /// `encode(viewer)` as its non-zero features (docs/search.md 2.12): append to `idx` / `val` every
+    /// feature whose f32 bits are not 0 (-0.0 included), in ascending index order - exactly the
+    /// non-zeros of `encode(viewer, out)` on a zeroed `out`. `scratch` is `NUM_FEATURES` zeros on entry
+    /// and must be zeros again on return. The driver's sparse batches and its evaluation cache's key
+    /// read a row this way. Default: `encode` into `scratch`, then `sparse_scan` (which zeroes it
+    /// again); a game may emit its pairs without the dense row.
+    fn encode_sparse(&self, viewer: usize, scratch: &mut [f32], idx: &mut Vec<u32>, val: &mut Vec<f32>) {
+        self.encode(viewer, scratch);
+        sparse_scan(scratch, idx, val);
+    }
     /// Rounds played so far (reports).
     fn rounds(&self) -> u32 {
         0
@@ -207,6 +217,48 @@ pub fn belief_weight(pred: f64, uniform: f64, tilt: f64, clip: f64) -> f64 {
         return lo;
     }
     w.clamp(lo, clip)
+}
+
+/// The non-zero floats of a feature row into (index, value) pairs (docs/search.md 2.12): appends to `idx` /
+/// `val` every float of `x` whose bits are not 0 (-0.0 and NaN included), in ascending index order,
+/// zeroes each of them in `x`, -> how many. The rows are sparse (a Delver position: ~250 non-zeros of
+/// 37,620), so blocks of 32 zero floats are skipped (an OR over the block's bits) and a block's non-zero
+/// lanes are taken from a bit mask, without a branch per float.
+pub fn sparse_scan(x: &mut [f32], idx: &mut Vec<u32>, val: &mut Vec<f32>) -> u32 {
+    const B: usize = 32;
+    let start = idx.len();
+    // SAFETY: f32 and u32 have the same size and alignment; a float is replaced by 0.0's bits only
+    let u: &mut [u32] = unsafe { std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut u32, x.len()) };
+    let mut base = 0usize;
+    let mut blocks = u.chunks_exact_mut(B);
+    for blk in &mut blocks {
+        let mut any = 0u32;
+        for &w in blk.iter() {
+            any |= w;
+        }
+        if any != 0 {
+            let mut m = 0u32;
+            for (j, &w) in blk.iter().enumerate() {
+                m |= ((w != 0) as u32) << j;
+            }
+            while m != 0 {
+                let j = m.trailing_zeros() as usize;
+                m &= m - 1;
+                idx.push((base + j) as u32);
+                val.push(f32::from_bits(blk[j]));
+                blk[j] = 0;
+            }
+        }
+        base += B;
+    }
+    for (j, w) in blocks.into_remainder().iter_mut().enumerate() {
+        if *w != 0 {
+            idx.push((base + j) as u32);
+            val.push(f32::from_bits(*w));
+            *w = 0;
+        }
+    }
+    (idx.len() - start) as u32
 }
 
 /// A built-in (Rust) player. `legal` = the decision's legal actions (>= 2 of them).
