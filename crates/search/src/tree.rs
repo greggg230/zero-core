@@ -135,6 +135,11 @@ pub struct Shape {
     pub nodes: u32,
     pub expanded: u32,
     pub depth_hist: Vec<u32>,
+    /// Expanded nodes by the number of nodes above them on their path decided by another seat than
+    /// the viewer (the other seat's replies a walk to them modelled; root 0).
+    pub opp_hist: Vec<u32>,
+    /// Expanded nodes by the number of decider changes on their path (root 0).
+    pub switch_hist: Vec<u32>,
     pub max_depth: u32,
     pub edges: Vec<EdgeShape>,
     pub main_line: Vec<EdgeShape>,
@@ -866,8 +871,11 @@ impl<G: SearchGame> Tree<G> {
     pub fn shape(&self) -> Shape {
         let mut s = Shape::default();
         let mut depth: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        // (per node reached: the opponent nodes above it, the decider changes above it)
+        let mut above: std::collections::HashMap<u32, (u32, u32)> = std::collections::HashMap::new();
         let mut order = vec![self.root];
         depth.insert(self.root, 0);
+        above.insert(self.root, (0, 0));
         let mut k = 0;
         while k < order.len() {
             let id = order[k];
@@ -883,6 +891,13 @@ impl<G: SearchGame> Tree<G> {
                 s.depth_hist.resize(d as usize + 1, 0);
             }
             s.depth_hist[d as usize] += 1;
+            let (oa, sa) = above[&id];
+            for (h, x) in [(&mut s.opp_hist, oa), (&mut s.switch_hist, sa)] {
+                if h.len() <= x as usize {
+                    h.resize(x as usize + 1, 0);
+                }
+                h[x as usize] += 1;
+            }
             let own = self.player(id) == self.viewer;
             for i in 0..self.nodes[id as usize].nacts as usize {
                 let n = self.n_of(id, i);
@@ -896,6 +911,7 @@ impl<G: SearchGame> Tree<G> {
                     e.expanded_kids += self.expanded(c) as u32;
                     if let std::collections::hash_map::Entry::Vacant(v) = depth.entry(c) {
                         v.insert(d + 1);
+                        above.insert(c, (oa + !own as u32, sa + (self.player(c) != self.player(id)) as u32));
                         order.push(c);
                     }
                 }

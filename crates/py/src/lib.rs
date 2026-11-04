@@ -686,7 +686,8 @@ impl PySearchTree {
         self.t.n_nodes()
     }
     /// The tree's shape under its root (a read-only diagnostic, docs/search.md 3.15): a dict of
-    /// nodes, expanded, depth_hist (expanded nodes per depth, root 0), max_depth, edges and main_line
+    /// nodes, expanded, depth_hist (expanded nodes per depth, root 0), opp_hist / switch_hist (expanded nodes
+    /// by the other seat's nodes / the decider changes above them), max_depth, edges and main_line
     /// (each a list of (depth, own, visits, kids, opp_kids, expanded_kids)).
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let s = self.t.shape();
@@ -695,6 +696,8 @@ impl PySearchTree {
         d.set_item("nodes", s.nodes)?;
         d.set_item("expanded", s.expanded)?;
         d.set_item("depth_hist", s.depth_hist.clone())?;
+        d.set_item("opp_hist", s.opp_hist.clone())?;
+        d.set_item("switch_hist", s.switch_hist.clone())?;
         d.set_item("max_depth", s.max_depth)?;
         d.set_item("edges", e(&s.edges))?;
         d.set_item("main_line", e(&s.main_line))?;
