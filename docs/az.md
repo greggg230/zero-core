@@ -129,6 +129,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_select_c_visit`, `selfplay_select_c_scale` | unset (None) | the same for `selfplay_select` 'cq' (self-play's moves after `temp_moves`, remote self-play too: its checkout must have the setting); the recorded targets keep `cq_c_visit` / `cq_c_scale` whatever these are |
 | `selfplay_root_min_visits`, `eval_root_min_visits`, `root_min_visits_max_actions` | 0, 0, 4 | root minimum visits ("forced playouts", docs/search.md 3.5, section 9.2): a full search whose root has 2 .. `root_min_visits_max_actions` options gives each at least k visits when its budget allows (2 x options x k <= its simulations): the self-play seat's recorded searches (never its fast or minor ones) / every evaluation seat. The forced walks come out of the same budget and are left out of the visit counts (the 'visits' target, temperature sampling, the 'visits' rule) and of the root value target; Q, the 'cq' target and the 'cq' rule use them. The evaluation's floor names its Elo pool (`visits-f4`, `cq-n4-v50-s0.3-f4`; `-f4a6` with max_actions 6), self-play's does not. 0 = off: today's searches bit for bit |
 | `selfplay_leaf_value_view`, `eval_leaf_value_view` | mover, mover | whose view a search leaf's value comes from (docs/search.md 3.6, section 16): 'mover' = the network on the leaf's decider's view (today's searches bit for bit); 'root' = a leaf of another seat than the root decider also sends a value-only row of the root decider's view of the same sampled state (same batch, flagged `ROW_VALUE`), whose value and margin it takes (the priors stay the decider's). The self-play seat (remote self-play too: its checkout must have this core) / every evaluation seat; the evaluation's names its Elo pool (`-rv`), self-play's does not |
+| `eval_infoset_merge` | 0 | 1 = every evaluation seat's trees merge their nodes by the root decider's observation (single-observer information-set MCTS inside the tree: the other seat's nodes subset-armed over the union of its sampled worlds' options, the root decider's next decision one node whatever the other seat was dealt; docs/search.md 3.16). Needs `eval_leaf_value_view` 'root'; names the Elo pool (`-ism`); h2h `--a-infoset-merge / --b-infoset-merge`. Self-play support is not built. 0 = off (nothing changes) (30) |
 | `selfplay_belief_tilt`, `eval_belief_tilt` | 0.0, 0.0 | the root's belief (docs/search.md 3.8, section 18): a full search of the seat asks the network's auxiliary head once for the root's prediction of the hidden cards (one `ROW_BELIEF` row of the root's features) and deals every simulation's world by it (the game's `determinize_with`, weights clip((belief / uniform)^tilt, 1/belief_clip, belief_clip)). The self-play seat (a league opponent's too; remote self-play: a checkout without it is refused at its hello, 18.5) / every evaluation seat (its Elo pool's name gets `-b<tilt>`). Needs a checkpoint with the auxiliary head: one without is refused (`net.HeadMissing`, exit 78; 18.3). 0 = off |
 | `belief_clip`, `belief_mix`, `belief_fast` | 20.0, 0.0, 0 | the belief's clip R (every weight in [1/R, R]), the share of a belief search's simulations still dealt uniformly ([0, 1)), and whether fast and minor searches take it too (section 18) |
 | `selfplay_view_samples`, `view_sample_target` | 0.0, next_q | value-only samples (section 16): this share of self-play's recorded decisions also records the real state from each other recording seat's view - its perspective, no options (no policy loss), z its result - with q = that seat's next search's root value ('next_q'; z if none) or z ('z'). 0 = off |
@@ -4093,3 +4094,67 @@ cache" 6 passed / 1 skipped (CUDA); MTG Zero (ENGINE.md 89): its engine test
 gate (the engine digest f6543eb2b1b8752f unchanged, the 1-config Delver search smoke); `tools/smoke_all.sh
 --with-this-core --build-only` with Glass Road, Caverna and Kingdom Builder: all three build (the trait method has
 a default).
+
+## 30. Information-set merging in the evaluation seats (`eval_infoset_merge`; MTG Zero's Delver mirror, 2026-11-04)
+
+The semantics are docs/search.md 3.16; this section is the run-level view.
+
+**Why.** With hidden cards, the other seat's options differ between the worlds a search deals (Daze in the sampled
+hand or not), and the tree of before keys the other seat's decision by its option list - so the root decider's next
+decision is split into one node per option list above it, each with its own statistics: the search can play one
+information set of the root decider differently depending on what the other seat was dealt (strategy fusion). In the
+Delver line's searches two thirds of the main lines see the other seat with two or more option lists (Step 0 in
+3.16). Merging the tree's nodes by the root decider's observation (single-observer ISMCTS) removes the split. Its gate
+(3.15) failed on depth and fragment counts; the user decided to build it and let an evaluation-only paired match
+decide.
+
+**The setting.** `eval_infoset_merge` 0 | 1 (default 0 = off): every evaluation seat's trees merge their nodes by the
+root decider's observation (`games.nn_seat(infoset_merge=True)`, the seat key `infoset_merge`). Needs
+`eval_leaf_value_view` 'root' (validated: a merged node of the other seat is valued from the root decider's view).
+The evaluation's moves change with it, so its Elo pool's name gets `-ism` (`mcts.merge_tag`, after the view's and
+the belief's suffixes: `cq-n4-v50-s0.3-rv-b1m0.25-ism`). Off, the seat dict has no key and every search is the one
+of before, bit for bit. Self-play support is not built (the driver refuses the key on a self-play seat; what is
+missing: docs/search.md 3.16).
+
+**h2h.** `--a-infoset-merge / --b-infoset-merge 0 | 1` (or `--infoset-merge` for both; default: each side's run's
+`eval_infoset_merge`). A merged side needs root-view leaf values (its run's `eval_leaf_value_view` 'root' or
+`--*-leaf-value-view root`), else the match is refused before any game. The output names the side (`select_a`:
+`...-ism`) and adds `merge`: the merged trees' links, merges, aliases and growth leaves summed over the drivers (a
+merged side whose trees made no link is reported on stderr: a setting that did nothing).
+
+**Costs.** One sparse encode of the viewer's row and a hash per new child signature (about one per walk), a link per
+signature, 16 bytes of side statistics per option of an expanded node; known links cost nothing. Measured below.
+
+**Measured** (MTG, CPU, the desktop beside the live A/B; docs/search.md 3.16 has the tables): the merged tree's walks
+are 14-17% deeper, a search expands 20-33% more distinct information sets (0.86-0.90 per walk against 0.65-0.75),
+the share of leaves re-expanding a held information set falls from 26-35% to 10-13% (the rest: growth leaves), and the
+main line's edge into the other seat holds ~1.4 other-seat nodes instead of 3-8. The evaluation rule's root pick
+changes in ~10% of contested decisions (prior max < 0.7; 8% of all decisions) and in none of 160 searches at
+uniformly drawn positions: an effect on ~1% of the evaluation seat's moves, if any.
+
+**The evaluation-only h2h** (the GPU's, after the A/B; from an MTG Zero checkout whose zero-core has this branch -
+`C:/Users/Gregg Keithley/mtg-zero-wt/infoset-build` is one, built): the same checkpoint on both sides, the run's
+evaluation seat (32 simulations, cq rule guard 4 c_scale 0.3, root-view values, the root's belief tilt 1 / clip 20 /
+mix 0.25), side A merged:
+
+```
+python -m mtgz.az.h2h CK CK --paired --games 1200 --sims 32 --chance-k 0 --device cuda --seed 0 \
+    --select cq --select-min-visits 4 --cq-c-scale 0.3 \
+    --a-leaf-value-view root --b-leaf-value-view root \
+    --a-belief-tilt 1 --b-belief-tilt 1 --a-belief-mix 0.25 --b-belief-mix 0.25 \
+    --a-infoset-merge 1 --b-infoset-merge 0
+```
+
+(With CK = `E:/mtg-zero/runs/r3-2b-float550/models/iter_NNNN.pt` the explicit rule flags are what the run's
+config.json gives anyway - `--a-infoset-merge 1 --b-infoset-merge 0` alone would do; a checkpoint copied elsewhere
+has no config.json two levels up, hence the flags.) The output must name `select_a` `cq-n4-v50-s0.3-rv-b1m0.25-ism`
+and `select_b` `cq-n4-v50-s0.3-rv-b1m0.25`, and carry `merge` with links > 0. **Stop rule** (Fable's): `elo_diff`
+within +-7 -> stop (the merge is null at play); above +7 -> build self-play support and run a self-play A/B; below -7
+-> drop it. At 1,200 paired games `elo_se` is ~7-8, so a result near the boundary can be extended with the same seed
+schedule (`--sprt -7,7 --batch-games 600 --max-games 2400`, or `--target-se 5`).
+
+**Checks.** cargo test (zero_search 134, webnet 3): the golden records and matches unchanged with the setting off;
+the merge's tree and driver tests (docs/search.md 3.16). pytest `tests/test_infoset_merge.py` (4) and `-k "h2h or
+settings_seats or search_tree_api or tree_bindings or eval_tag or names"` (22). MTG Zero e098aff with this core
+(`ZERO_CORE_UNPINNED=1`): the engine digest f6543eb2b1b8752f unchanged, and the h2h command above end to end (2 paired
+games at 4 simulations on the CPU: the names and `merge` counters as stated).

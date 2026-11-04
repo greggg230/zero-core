@@ -524,7 +524,8 @@ MTG Zero checks its own states (ENGINE.md 89: 10k Delver leaf rows, pairs and ke
 
 The Rust tree stores everything in flat arrays (no allocation per node; children of an edge as
 a linked list matched by a hash of (key, signature) then exactly); a reused subtree keeps the
-old arrays until it holds > 65k nodes (`compact`).
+old arrays until it holds > 65k nodes (`compact`). With information-set merging on (3.16, an evaluation seat's
+`infoset_merge`) an edge's children are links to nodes merged by the root decider's observation.
 
 ### 3.1 Policy targets: visits or completed Q (`policy_target`)
 
@@ -1392,7 +1393,9 @@ one walk's leaf), per number of other-seat nodes above them (`opp_hist`) and per
 (`switch_hist`), the deepest node, every edge with a visit or a child (`EdgeShape`: depth, whether the viewer
 decides its node, visits, child nodes, of them the other seat's and the expanded ones) and the main line (the most
 visited option from the root on, then that edge's most backed-up child). Bindings: `SearchTree.shape()` (a dict),
-`SearchTree.path_len` (the last simulation's walk length: its leaf's or terminal's depth).
+`SearchTree.path_len` (the last simulation's walk length: its leaf's or terminal's depth). Each edge also counts
+its other-seat children's distinct option lists and chance keys, the backups through them and those of the most
+backed-up list (`opp_lists`, `opp_keys`, `opp_tot`, `opp_modal_tot`: the strategy-fusion sizing of 3.16).
 
 **Measured** (desktop CPU at idle priority beside the live run; r3-2b-float550 gen 1000, its exact full self-play
 search - c_puct 1, root noise, root belief tilt 1 / clip 20 / mix 0.25, root-view leaf values, redeterminized
@@ -1418,11 +1421,162 @@ a built merge. The worked-out design (a two-level child identity: today's per-ed
 a merged node by the observation at a new signature only; no depth in the key, a path check with alias nodes
 against cycles; subset-armed PUCT with availability counts and mean priors; growth leaves for a world's new
 options; `advance` by the real observation; `compact` once per node) and the h2h plan are in that NOTES.md. The
-Python reference has no merged mode.
+Python reference has no merged mode. (Built afterwards on the user's decision: 3.16.)
 
 Tests: `tree::tests::shape_counts_every_walk_and_edge` (a fresh search's expanded nodes + terminal walks = its
 simulations, the histograms and the edges' children add up, the main line follows the visits), pytest
 `test_bindings.py::test_search_tree_api`.
+
+### 3.16 Information-set merging by the root decider's observation (`infoset_merge`; MTG Zero's Delver mirror, 2026-11-04)
+
+**Why.** The tree keys a child by (chance key, decider, legal options) under its parent edge (section 3). When the
+other seat's options depend on its hidden cards - MTG Zero's Delver mirror: Daze or Force of Will in the sampled
+hand, or not - each dealt world with another option list gets its own node of the other seat, and the root decider's
+next decision is split with them: one information set of the root decider becomes several nodes, each with its own
+statistics, so PUCT can choose differently at one information set depending on what the other seat was dealt
+(strategy fusion: the search values the root decider as if it knew the other hand two plies down). 3.15's gate
+(build only if walks are shallow and the main line fragments > 8 ways) failed; the user decided to build it anyway
+for the strategy-fusion question, to be answered by an evaluation-only paired match. Sizing (Step 0, below): at the
+main line's first edge into the other seat, 65-72% of the run's searches see two or more option lists, ~28-31% of
+the walks through it go to the less common lists, and the children differ by option list, not chance key (1.07-1.15
+distinct keys per edge).
+
+**What it does** (`tree.rs` module docs and `tree/merge.rs`; `Tree::set_merge`, off by default). Single-observer
+information-set MCTS inside the tree (Cowling, Powley & Whitehouse 2012, "Information Set Monte Carlo Tree Search"):
+
+* **Links.** An edge's children are links: the signature above and the node it leads to. A walk follows a known link
+  without encoding anything (by the game contract the same path and chance keys give the root decider the same
+  observation: revelations are keyed, section 1). At a new signature - exactly where the tree of before creates a
+  node - it encodes the reached state from the viewer's view (`encode_sparse(viewer)`, the eval cache's key
+  `obs_hash_sparse`, 2.12 / 3.12) and looks the observation up in the tree's map (key: the observation hash, the
+  decider, and for the viewer's own nodes their options - equal features always had equal options, 3.12; a world
+  where they differ stays apart): found, a new link to that node - the tree is a DAG; not found, a new node.
+* **No depth in the key; a path check.** World-dependent auto-steps make depth world-dependent (the other seat with
+  a single option is auto-stepped, one holding Daze decides: the root decider's next information set sits at depth 1
+  in one world and 2 in the other - the strategy-fusion case itself), so the key holds no depth. A walk never holds a
+  node twice: a link (known or new) that would lead to a node already on the walk's path leads to a fresh unmapped
+  node instead (an alias; a known link is re-pointed to it), so path-based backup stays exact.
+* **Subset-armed nodes of the other seats.** An other seat's node holds the union of its worlds' option lists
+  (appended; indices never change). A walk takes only an option legal in its world: `argmax Q_a + c_puct P'_a
+  sqrt(max(avail_a, 1)) / (1 + N_a)` over them, P' = the option's mean prior (over the network rows that offered it)
+  renormalised over the available options, avail_a = the walks at the node in which a was legal (counted at
+  selection), FPU the node's `vec`. The root decider's nodes keep PUCT (their options are fixed; `tot` counts the
+  backups from every parent).
+* **Growth leaves.** A walk reaching an expanded other-seat node with an option outside its union ends there:
+  `Sim::Leaf` on the expanded node; the caller evaluates that world's row with its options (`Tree::leaf_acts`),
+  `expand_leaf` appends the new options and folds the priors into the means, and the value is backed up along the
+  path as any leaf's (the node itself gets no visit, as a leaf never does). A world whose options are all known walks
+  on without a network row.
+* **Values: root view only.** A merged node of another seat is valued from the root decider's view (3.6), the same in
+  every world of its observation; the mover's view would be one world's opponent view (the driver refuses the key
+  without `leaf_value_view` 'root').
+* **Reuse, compaction, reset.** `Tree::advance_in(a, key, player, legal, live)` (the driver's tree reuse) finds the
+  new root by the real signature, else by the real observation (the live game's `encode(viewer)`: no hidden
+  information; an unknown real key - a revelation the search never sampled - is no longer a lost subtree), for the
+  same viewer only; the map is then rebuilt from the nodes reachable from the new root (or `compact`, above 65k nodes,
+  copies each reachable node once with its links, outs and side statistics). `reset` drops the merge state (the
+  driver calls `set_merge` after each reset: `start`, `start_dev`, `restart_search`). The root (the viewer's node,
+  on every walk's path) is never merged into; deferred terminals are not merged.
+* **Unchanged:** the root's statistics are the same kind as before, so the Gumbel root (3.7), the root floor (3.5), the
+  cq target, the move rules, root noise, the belief (3.8) and the eval cache (3.12: a growth leaf's rows are looked up
+  like any) read and work as before; backup is path-based as before.
+
+**The seat key** `infoset_merge` (bool; `NnSeat::infoset_merge`, the bindings' seat key, `games.nn_seat(
+infoset_merge=)`). Refused without `leaf_value_view` 'root' and on a self-play seat (self-play support is not built:
+see below). The Python reference `mcts.py` has no merged mode: `play.NNSeat(infoset_merge=True)` needs `impl='rs'`
+(the Rust tree; `RsSearch` calls `set_merge`). Run setting `eval_infoset_merge` (docs/az.md 30); h2h
+`--a-infoset-merge / --b-infoset-merge` (or `--infoset-merge`). Off (the default) none of the merge runs: the tree
+of before, bit for bit (the golden records and matches).
+
+**Driver touch-points** (`driver/worker.rs`): `set_merge(seat.infoset_merge)` after each reset; `tree.leaf_acts(node)`
+in place of `tree.acts(node)` at the leaf's row (two places: with and without the eval cache) and in `apply_eval`'s
+check; `apply` calls `advance_in` with the live game. Stats (`Driver::stats`, the bindings' `stats()`): `merge_links`
+(new child signatures), `merge_merged` (of them, found by observation), `merge_aliases`, `merge_growths` (growth
+leaves; in `leaves` too). Bindings: `SearchTree.set_merge` (a fresh tree only), `merge_on`, `merge_stats()`;
+`simulate` gives a growth leaf's options and `expand` takes them; `advance` uses `advance_in`.
+
+**Costs.** One `encode_sparse(viewer)` + `obs_hash_sparse` per new signature (about one per walk), a hash-map lookup,
+a link per new signature (its key and options), and per stat 16 bytes of side statistics; nothing per known link. A
+merged walk that reaches a known information set walks on, so a search's walks are deeper (more nodes per walk on
+the path, PUCT at each). With root-view values the driver encodes the same viewer row again at another seat's leaf
+for its value-only row (not shared with the tree's yet).
+
+**Tests** (`tree::tests`, `driver::tests`, pytest `tests/test_infoset_merge.py`). A new test game `counter_game`
+(`#[cfg(test)]`): seat 1 holds hidden Daze / Force (1/2 each); seat 0 casts or holds for R rounds; a cast is answered
+with ALLOW plus the counters held (auto-stepped when none) - the other seat's option list depends on its hidden hand;
+spec `{"rounds", "forget"}` (forgetful features repeat observations along a line).
+
+* `the_counter_game_merges_the_other_seats_options_and_the_next_round`: one seat-1 node under CAST over the union
+  {ALLOW, DAZE, FORCE} (every seat-1 link leads to it), ALLOW available in every walk, each counter in 45-90% of
+  them; seat 0's next round one node reached from the root's CAST (the auto-stepped world, depth 1) and seat 1's
+  ALLOW (depth 2); the tree of before splits it into >= 3 nodes and holds more nodes; merges and growth leaves happen.
+* `merged_trees_recount_exactly_with_chance_noise_floor_and_gumbel`: toy (chance keys, chance_k 0-2) and counter,
+  PUCT / root noise / root floor / Gumbel root: N and W per edge, tot and wsum per node recounted bit for bit from
+  the backed-up walks, no walk holds a node twice, N add up to tot and W to the decider's wins at every node,
+  availability >= N and <= tot.
+* `merged_compact_copies_each_node_once_and_searches_on_identically`: compact = the same search (a canonical dump
+  through the links) and the same walks afterwards (the map rebuilt), toy and counter.
+* `merged_advance_finds_the_root_by_signature_or_by_observation`: the reused subtree as it was, by signature and by
+  an unknown real key's observation (one encode), refused for another viewer; the search goes on, compaction keeps it.
+* `a_repeated_observation_on_the_walks_path_gets_a_fresh_node`: forgetful counter games alias, the recount stays
+  exact, compact keeps it.
+* `set_merge_takes_a_fresh_tree_and_reset_turns_it_off`.
+* Driver: `infoset_merge_needs_root_view_values_and_an_evaluation_seat`, `infoset_merge_off_changes_nothing` (the
+  golden match and records with the key given off), `infoset_merge_plays_counter_matches_that_merge_and_reproduce`
+  (merged vs unmerged seats: merges, growths, aliases on forgetful games; the same games across thread counts and with
+  the eval cache; tree reuse through `advance_in`), `infoset_merge_with_the_root_floor_gumbel_and_the_toy`,
+  `infoset_merge_survives_rolling_network_changes` (restarts from fresh merged trees).
+* pytest: the seat dict and the run setting (validated, '-ism' in the Elo pool's name), the tree bindings, the Rust
+  driver's and the Python driver's ('rs') merged seats, h2h's flags, tags and `merge` counters.
+
+**Measured** (2026-11-04, the desktop CPU at idle priority beside the live A/B - timings loaded; r3-2b-float550 gen
+1000 with its config; E:/mtg-zero-scratch/ideas-4b/, its NOTES.md):
+
+* *Step 0, before the build* (`Tree::shape`'s per-edge split: `EdgeShape::opp_lists` / `opp_keys` / `opp_tot` /
+  `opp_modal_tot`, the other-seat children's distinct option lists, chance keys, backups, and the backups of the most
+  backed-up list; `step0.py`, the run's full self-play search, fresh trees): at the main line's first edge into the
+  other seat, searches with two or more option lists 71.7% / 70.0% (64 / 32 simulations, 30 positions x 2) and
+  65.4% / 65.4% (the gate's 50 positions x 4); distinct option lists among its children 4.3-7.7 (= the children: one
+  chance key in > 90% of the searches); backups outside the most backed-up list 22-31% (pooled).
+* *Merged against unmerged on the same positions and seeds* (`measure.py`: the run's root belief, root-view values,
+  redet, chance_k 0; 64 simulations with root noise = self-play's full search, 32 without = the evaluation seat's;
+  4 fresh searches per position; "uniform" = 20 positions drawn from 6 prior-played games, "contested" = the 24 of
+  400 drawn decisions whose prior max is < 0.7):
+
+  | off / on | 64 uniform | 32 uniform | 64 contested | 32 contested |
+  |---|---:|---:|---:|---:|
+  | mean walk depth (root's own evaluation left out) | 5.14 / **5.95** | 4.63 / **5.30** | 4.15 / **4.87** | 3.39 / **3.91** |
+  | walks ending at depth <= 2 | 22.9% / 17.6% | 27.0% / 21.8% | 32.7% / 25.4% | 42.4% / 35.2% |
+  | information sets expanded per search (per walk) | 41.6 / **55.5** (0.65 / 0.87) | 21.9 / **27.5** (0.69 / 0.86) | 43.5 / **55.9** (0.68 / 0.87) | 24.0 / **28.8** (0.75 / 0.90) |
+  | leaves at an information set already expanded | 35.1% / 12.3% | 32.0% / 12.9% | 32.1% / 12.3% | 25.7% / 10.3% |
+  | merges / growth leaves / aliases per search | - / 25.9 / 7.6 / 0.03 | - / 12.2 / 3.9 / 0.01 | - / 20.0 / 7.6 / 0.04 | - / 7.7 / 3.2 / 0.01 |
+  | main line's first edge into the other seat: its other-seat children | 8.25 / **1.45** | 6.24 / **1.44** | 4.63 / **1.47** | 3.01 / **1.36** |
+  | the evaluation rule's root pick (cq, guard 4, c_scale 0.3) as the unmerged search's | 100% | 100% | 90.6% | 89.6% |
+  | the same pick across a mode's 4 repeats (off / on) | 100% / 100% | 100% / 100% | 85.4% / 77.8% | 81.2% / 79.9% |
+
+  The merged tree's remaining repeats are its growth leaves (610 of 612 at 64 uniform). The root's visit
+  distribution moves little where the root is easy: total variation merged vs unmerged 0.008 (64, noise; 0.117
+  repeat to repeat) and 0.001 (32) on the uniform positions, whose roots average 2.25 options with 85% / 97.5% of the
+  visits on one. So the merge changes the evaluation seat's move at roughly one contested decision in ten - about 1
+  decision in 100 overall -, which is what the h2h measures. Wall time per walk in this lockstep Python harness (the
+  CPU network included, loaded machine): 0.81 -> 1.10 ms (64 uniform), 0.88 -> 1.16 (32 uniform), 0.81 -> 0.90 and
+  0.93 -> 0.87 (contested): longer walks and one viewer encode per new signature; not a driver measurement.
+* *The MTG h2h, end to end* (2 paired games at 4 simulations, CPU, the command of docs/az.md 30): the sides named
+  `cq-n4-v50-s0.3-rv-b1m0.25-ism` / `cq-n4-v50-s0.3-rv-b1m0.25` (the run's evaluation pool), `merge` {links 1,789,
+  merged 264, aliases 2, growths 98}. MTG Zero e098aff with this core: the engine digest f6543eb2b1b8752f unchanged.
+
+**Not built: self-play.** Missing for a self-play seat: lifting `Driver::new`'s refusal and a run setting
+`selfplay_infoset_merge`; tests of recorded self-play with it (records reproducible across threads, value-only samples
+and resignation reading a merged root - both read the root only); the remote self-play machine's core; and the cost
+in self-play throughput (one extra viewer encode per walk, see Costs - sharing the tree's row with the value-only row
+would remove most of it). Training on merged searches is a self-play A/B of its own, after the evaluation-only match.
+
+Code: `tree.rs` (`Tree::merge`, the simulate loop's merged branch, `expand`'s growth, `kids` / `kid_ids` /
+`compact` dispatch), `tree/merge.rs` (`Merge`, `Link`, `MergeStats`, `set_merge`, `leaf_acts`, `merged_child`,
+`select_avail`, `grow`, `advance_in`, `compact_merged`, `avail`, `in_links`), `counter_game.rs`, `driver.rs`
+(`NnSeat::infoset_merge`, the checks, the stats), `driver/worker.rs`, `dynapi.rs` and the bindings; Python
+`games.nn_seat`, `mcts.check_merge` / `merge_tag`, `play.NNSeat` / `RsSearch`, `run.py` (`eval_infoset_merge`),
+`elo.eval_tag`, `h2h.py`.
 
 ## 4. Bindings and registering a game
 
