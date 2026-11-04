@@ -58,6 +58,12 @@ def layout(tmp_path):
     return tmp_path
 
 
+def test_finds_the_games_beside_the_main_checkout(layout):
+    """The old rule (../<game>), unchanged."""
+    rc, out = smoke(str(layout / 'zero-core' / 'tools' / 'smoke_all.sh'), '--dry-run')
+    assert rc == 0 and found(out) == list(GAMES[:2]), out
+
+
 def test_finds_the_games_from_a_worktree(layout):
     wt = layout / 'zero-core-wt' / 'x'
     git('worktree', 'add', '-q', '--detach', str(wt), cwd=layout / 'zero-core')

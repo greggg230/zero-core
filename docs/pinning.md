@@ -85,4 +85,6 @@ that a game pins** (the pinned commit would disappear).
   `tools/fork_run.py` (a widen into a new run, 10.3). check_checkpoint_compat itself takes such a
   checkpoint on purpose (it compares the two builds).
 * The game's `cargo test` and `pytest`, its engine parity gate, the core's
-  `tools/smoke_all.sh`.
+  `tools/smoke_all.sh` (for the other games: `--with-this-core --build-only` from the core commit
+  being pinned - from a worktree or a game's `third_party/zero-core` it finds them beside the main
+  checkouts, and it fails when it finds none instead of passing with the core alone, `docs/az.md` 29).

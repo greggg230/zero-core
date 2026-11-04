@@ -33,8 +33,10 @@ Bash on Windows. Every script is bash.
    merge commits.
 3. **Don't break the games.** Every core change has to keep compiling against the game repos
    (`bash tools/smoke_all.sh --with-this-core --build-only`, run from a checkout with your
-   change committed). A change to search or loop behaviour also needs the full
-   `bash tools/smoke_all.sh --with-this-core` (each game's build, tests and smoke run).
+   change committed; a worktree is fine, and its summary must say `games: N of N checked` - it
+   fails when it finds no game, `docs/az.md` 29). A change to search or loop behaviour also
+   needs the full `bash tools/smoke_all.sh --with-this-core` (each game's build, tests and
+   smoke run).
 4. **Encodings are guarded.** A checkpoint is a network for one feature layout. The encoding
    guard (`net.check_encoding`, `docs/az.md` 10.4) refuses to resume across a layout change
    (exit 78). Don't weaken it. Runs move across layouts with `tools/fork_run.py`, never by
