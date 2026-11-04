@@ -3041,7 +3041,8 @@ build still compile against this core commit, nothing about their behaviour (the
 by default there; MTG Zero's own suite already covers whether it changed anything). Combine with
 `--with-this-core` to build the games against THIS checkout's HEAD rather than their own pin.
 Default game discovery (no explicit paths) now also looks for `../kingdombuilder-zero`, alongside
-`../glassroad-zero` and `../caverna-zero` - it was missing from the list before this.
+`../glassroad-zero` and `../caverna-zero` - it was missing from the list before this. (From a worktree or a
+`third_party/zero-core` submodule that discovery found no game and printed GREEN anyway until 29.)
 
 **De-flaked `crates/search/src/driver/tests.rs::queued_setups_are_shared_between_the_groups`**:
 asserted the exact POSITION of each group's dispatch size in the combined `sizes` vector it
@@ -4094,6 +4095,52 @@ cache" 6 passed / 1 skipped (CUDA); MTG Zero (ENGINE.md 89): its engine test
 gate (the engine digest f6543eb2b1b8752f unchanged, the 1-config Delver search smoke); `tools/smoke_all.sh
 --with-this-core --build-only` with Glass Road, Caverna and Kingdom Builder: all three build (the trait method has
 a default).
+
+## 29. `smoke_all.sh` finds the games from a worktree or a submodule, and no game is a failure (2026-11-04)
+
+**The bug.** With no game arguments `tools/smoke_all.sh` looked for the game repos only beside the checkout
+it ran from (`../glassroad-zero`, `../caverna-zero`, `../kingdombuilder-zero`). From a git worktree
+(`zero-core-wt/<name>`) or a zero-core submodule (a game's or MTG Zero's `third_party/zero-core`, in a
+worktree or not) there is nothing there, so it found no game, ran the core's own steps and printed GREEN:
+"do the other games still build against this core?" was silently never asked. MTG Zero's tiered gate runs it
+exactly that way - `bash third_party/zero-core/tools/smoke_all.sh --with-this-core --build-only` from the
+checkout under gate, always a worktree, as its `optin-core` tier's step "build-only: the other games" - so
+that step built no game whenever it was run without `--other-games` (its GREEN on 619f1f2, 2026-11-03, was
+the core's cargo test, build and pytest alone; MTG Zero's ENGINE.md 90). Found 2026-11-04 when the same
+command with the three repos passed explicitly built all three. A pipeline that processed 0 of N must fail
+loudly.
+
+**What it does now.**
+
+* **Discovery** (no game arguments): `../<game>`; beside the main checkout when this is a worktree (the
+  directory holding `git rev-parse --git-common-dir`); for a submodule, beside the superproject's checkout
+  (`--show-superproject-working-tree`) and beside the superproject's main checkout. The first hit per game
+  wins; `SMOKE_GAMES_ROOT=<dir>` looks in `<dir>` only.
+* **No game is a failure**: found none and given none, it fails before running anything - exit 1, a
+  `FAIL  games: no game repo found ...` summary line naming where it looked, never GREEN. A deliberate
+  core-only run says so: `--core-only` (or `SKIP_GAMES=1`). A game it cannot find is a `missing:` summary
+  line, and the summary counts what it checked (`games: 3 of 3 checked (glassroad-zero caverna-zero
+  kingdombuilder-zero)`).
+* **Explicit game arguments**: unchanged for game checkouts. A path that does not exist exits 2 (it used to
+  become an empty entry that was skipped silently), an unknown option exits 2 (it used to be taken as a
+  path), and a directory that is not a game repo is a FAIL (was a `skip`).
+* **`--with-this-core`**: a scratch worktree whose zero-core cannot be moved to this core's HEAD is a FAIL
+  (it used to build the game's own pin and report it as built against this core); a note says when the core
+  checkout has uncommitted changes, which the games' builds do not contain.
+* **`--dry-run`**: prints the core steps, each game and where it was found, and exits (1 when no game is
+  found).
+
+**Tests and checks.** `tests/test_smoke_all.py` (throwaway git repos, `--dry-run` and the no-game exit only,
+nothing built): the games found beside the main checkout, from a worktree and from a submodule inside a
+worktree of its superproject, the no-game failure and `--core-only`, explicit paths - 5 passed; the worktree,
+submodule, no-game and explicit-path cases fail against the old script. On the desktop: the old script (aa10733) from `zero-core-wt/smoke-fix` and from an MTG Zero worktree's
+`third_party/zero-core`, `SKIP_CORE=1 ... --with-this-core --build-only`, printed an empty summary and GREEN
+(exit 0); the new one (7d3dbd8) finds `C:/Users/Gregg Keithley/{glassroad,caverna,kingdombuilder}-zero` from
+both, and with `SMOKE_GAMES_ROOT` pointing at a missing directory exits 1 without GREEN (dry run and real
+run). MTG Zero's fixed gate step (its ENGINE.md 90: the three repos passed explicitly, an "ok <game>: build"
+line required for each), run for real against 7d3dbd8 at IDLE priority with 2 build jobs: PASS in 159 s,
+Glass Road 41 s, Caverna 43 s, Kingdom Builder 66 s, `games: 3 of 3 checked`; its summary is the old
+script's explicit-path summary line for line plus that count line.
 
 ## 30. Information-set merging in the evaluation seats (`eval_infoset_merge`; MTG Zero's Delver mirror, 2026-11-04)
 

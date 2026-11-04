@@ -161,7 +161,9 @@ bash tools/smoke_all.sh                        # core tests + each sibling game 
 ```
 
 `smoke_all.sh` looks for the game repos next to this one (`../glassroad-zero`, `../caverna-zero`,
-`../kingdombuilder-zero`; or pass their paths). Some games' yardsticks are JavaScript bots, so
+`../kingdombuilder-zero`; from a worktree or a game's `third_party/zero-core`, next to the main
+checkouts; or pass their paths), and fails if it finds none (`--core-only` for the core alone,
+`--dry-run` to see what it found; `docs/az.md` 29). Some games' yardsticks are JavaScript bots, so
 it needs Node.js too. In a game repo, the same commands go through the game's package, for
 example `python -m mtgz.az.run`, `python -m mtgz.az.h2h` and `python -m mtgz.az.dashboard`.
 
