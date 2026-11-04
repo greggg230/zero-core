@@ -103,6 +103,10 @@ fn shape_counts_every_walk_and_edge() {
         assert!(sh.depth_hist.len() as u32 <= sh.max_depth + 1);
         // every node but the root is one edge's child: the edges' children add up to the nodes
         assert_eq!(sh.edges.iter().map(|e| e.kids).sum::<u32>() + 1, sh.nodes);
+        for e in sh.edges.iter().chain(&sh.main_line) {
+            assert!(e.opp_lists <= e.opp_kids && e.opp_keys <= e.opp_kids && (e.opp_kids == 0) == (e.opp_lists == 0));
+            assert!(e.opp_modal_tot <= e.opp_tot && e.opp_tot <= e.n);
+        }
         let root_n: u32 = sh.edges.iter().filter(|e| e.depth == 0).map(|e| e.n).sum();
         assert_eq!(root_n, t.tot(t.root));
         let ml = sh.main_line.first().unwrap();

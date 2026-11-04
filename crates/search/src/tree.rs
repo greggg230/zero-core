@@ -125,6 +125,13 @@ pub struct EdgeShape {
     pub kids: u32,
     pub opp_kids: u32,
     pub expanded_kids: u32,
+    /// Among the other-seat children: their distinct option lists (decider and legal options), their
+    /// distinct chance keys, the backups through them (`tot`) and the backups through the children of the
+    /// most backed-up option list (the strategy-fusion sizing of docs/search.md 3.16).
+    pub opp_lists: u32,
+    pub opp_keys: u32,
+    pub opp_tot: u32,
+    pub opp_modal_tot: u32,
 }
 
 /// The shape of a tree under its root (`Tree::shape`, docs/search.md 3.15): nodes reachable, expanded,
@@ -927,6 +934,7 @@ impl<G: SearchGame> Tree<G> {
                     continue;
                 }
                 let mut e = EdgeShape { depth: d, own, n, kids: kids.len() as u32, ..Default::default() };
+                self.opp_split(&kids, &mut e);
                 for &c in &kids {
                     e.opp_kids += (self.player(c) != self.viewer) as u32;
                     e.expanded_kids += self.expanded(c) as u32;
@@ -950,6 +958,7 @@ impl<G: SearchGame> Tree<G> {
             }
             let kids = self.kid_ids(id, i);
             let mut e = EdgeShape { depth: s.main_line.len() as u32, own: self.player(id) == self.viewer, n: st[i].n, kids: kids.len() as u32, ..Default::default() };
+            self.opp_split(&kids, &mut e);
             for &c in &kids {
                 e.opp_kids += (self.player(c) != self.viewer) as u32;
                 e.expanded_kids += self.expanded(c) as u32;
@@ -960,6 +969,25 @@ impl<G: SearchGame> Tree<G> {
             id = c;
         }
         s
+    }
+
+    /// `EdgeShape`'s other-seat split of an edge's children `kids`: their distinct option lists, chance keys,
+    /// backups, and the backups of the most backed-up option list.
+    fn opp_split(&self, kids: &[u32], e: &mut EdgeShape) {
+        let mut lists: std::collections::HashMap<(usize, &[u16]), u32> = std::collections::HashMap::new();
+        let mut keys: std::collections::HashSet<&[u64]> = std::collections::HashSet::new();
+        for &c in kids {
+            if self.player(c) == self.viewer {
+                continue;
+            }
+            let t = self.nodes[c as usize].tot;
+            *lists.entry((self.player(c), self.acts(c))).or_insert(0) += t;
+            keys.insert(self.node_key(c));
+            e.opp_tot += t;
+        }
+        e.opp_lists = lists.len() as u32;
+        e.opp_keys = keys.len() as u32;
+        e.opp_modal_tot = lists.values().copied().max().unwrap_or(0);
     }
 
     /// The child nodes of (node, option i), newest first.

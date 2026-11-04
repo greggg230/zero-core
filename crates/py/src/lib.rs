@@ -719,11 +719,14 @@ impl PySearchTree {
     /// The tree's shape under its root (a read-only diagnostic, docs/search.md 3.15): a dict of
     /// nodes, expanded, depth_hist (expanded nodes per depth, root 0), opp_hist / switch_hist (expanded nodes
     /// by the other seat's nodes / the decider changes above them), max_depth, edges and main_line
-    /// (each a list of (depth, own, visits, kids, opp_kids, expanded_kids)).
+    /// (each a list of (depth, own, visits, kids, opp_kids, expanded_kids, opp_lists, opp_keys, opp_tot,
+    /// opp_modal_tot): the other-seat children's distinct option lists and chance keys, their backups and
+    /// those of the most backed-up option list).
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let s = self.t.shape();
         let d = PyDict::new(py);
-        let e = |v: &[zero_search::tree::EdgeShape]| -> Vec<(u32, bool, u32, u32, u32, u32)> { v.iter().map(|x| (x.depth, x.own, x.n, x.kids, x.opp_kids, x.expanded_kids)).collect() };
+        #[allow(clippy::type_complexity)]
+        let e = |v: &[zero_search::tree::EdgeShape]| -> Vec<(u32, bool, u32, u32, u32, u32, u32, u32, u32, u32)> { v.iter().map(|x| (x.depth, x.own, x.n, x.kids, x.opp_kids, x.expanded_kids, x.opp_lists, x.opp_keys, x.opp_tot, x.opp_modal_tot)).collect() };
         d.set_item("nodes", s.nodes)?;
         d.set_item("expanded", s.expanded)?;
         d.set_item("depth_hist", s.depth_hist.clone())?;
