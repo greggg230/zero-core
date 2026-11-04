@@ -257,6 +257,11 @@ pub trait DynTree: Send + Sync {
     fn edge_kids(&self, i: usize) -> Vec<(Vec<u64>, usize)>;
     fn edge_outs(&self, i: usize) -> Vec<Vec<u64>>;
     fn n_nodes(&self) -> usize;
+    /// Information-set merging (`Tree::set_merge`, docs/search.md 3.16): a fresh tree only; whether it is on; its
+    /// counters (None when off).
+    fn set_merge(&mut self, on: bool) -> Result<(), String>;
+    fn merge_on(&self) -> bool;
+    fn merge_stats(&self) -> Option<crate::tree::MergeStats>;
     /// The tree's shape under its root (`Tree::shape`, a diagnostic: docs/search.md 3.15).
     fn shape(&self) -> crate::tree::Shape;
     /// The (node, option) pairs the last simulation walked (its depth: a leaf's, or a terminal's).
@@ -297,13 +302,14 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
                 });
                 // (the value's seat: the viewer with a value-only row, else the decider)
                 self.leaf = Some((node, if vx.is_some() { viewer } else { player }));
-                Ok(Some(Leaf { player, x, acts: self.t.acts(node).to_vec(), vx }))
+                // (a merged tree's growth leaf: this world's options, docs/search.md 3.16)
+                Ok(Some(Leaf { player, x, acts: self.t.leaf_acts(node).to_vec(), vx }))
             }
         }
     }
     fn expand(&mut self, priors: &[f32], value: &[f32], margin: &[f32], margin_w: f64) -> Result<(), String> {
         let (node, player) = self.leaf.take().ok_or("no leaf to expand")?;
-        if priors.len() != self.t.acts(node).len() {
+        if priors.len() != self.t.leaf_acts(node).len() {
             self.leaf = Some((node, player));
             return Err("priors length != options".into());
         }
@@ -331,7 +337,8 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
         let g = downcast::<G>(after)?;
         let Some(p) = SearchGame::to_move(g) else { return Ok(false) };
         let legal = DynGame::legal(g);
-        Ok(self.t.advance(a, key, p, &legal))
+        // (a merged tree finds the new root by the real observation too: docs/search.md 3.16)
+        Ok(self.t.advance_in(a, key, p, &legal, g))
     }
     fn root_acts(&self) -> Vec<u16> {
         self.t.acts(self.t.root).to_vec()
@@ -447,6 +454,18 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     }
     fn n_nodes(&self) -> usize {
         self.t.n_nodes()
+    }
+    fn set_merge(&mut self, on: bool) -> Result<(), String> {
+        if self.leaf.is_some() {
+            return Err("set_merge: a fresh tree only (a leaf is pending)".into());
+        }
+        self.t.set_merge(on)
+    }
+    fn merge_on(&self) -> bool {
+        self.t.merge_on()
+    }
+    fn merge_stats(&self) -> Option<crate::tree::MergeStats> {
+        self.t.merge_stats()
     }
     fn shape(&self) -> crate::tree::Shape {
         self.t.shape()

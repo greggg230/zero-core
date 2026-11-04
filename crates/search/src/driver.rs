@@ -483,12 +483,16 @@ pub struct NnSeat {
     pub resign_t: f64,
     pub resign_k: u32,
     pub resign_noresign: f64,
+    /// Information-set merging (docs/search.md 3.16; false, the default: the tree of before): the seat's trees
+    /// merge their nodes by the root decider's observation (`Tree::set_merge`). Needs root-view leaf values
+    /// (`LeafView::Root`); an evaluation seat (self-play support is not built: `Driver::new` refuses it).
+    pub infoset_merge: bool,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None, eval_cache: 0, resign_t: 0.0, resign_k: 5, resign_noresign: 0.1 }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None, eval_cache: 0, resign_t: 0.0, resign_k: 5, resign_noresign: 0.1, infoset_merge: false }
     }
 
     /// The resignation settings' check (`Driver::new`; the bindings' messages): t finite in [0, 0.5) (0 =
@@ -1302,6 +1306,11 @@ struct Counters {
     cache_leaves: AtomicU64,
     cache_partial: AtomicU64,
     cache_clears: AtomicU64,
+    /// Information-set merging (docs/search.md 3.16): links made, merges, aliases, growth leaves.
+    merge_links: AtomicU64,
+    merge_merged: AtomicU64,
+    merge_aliases: AtomicU64,
+    merge_growths: AtomicU64,
     /// The longest a game's step took (one slot's advance between two of its leaves: its search
     /// and moves, ns), that game's gid, and the steps over SLOW_STEP_NS.
     step_max_ns: AtomicU64,
@@ -1467,6 +1476,14 @@ pub struct DriverStats {
     pub cache_leaves: u64,
     pub cache_partial: u64,
     pub cache_clears: u64,
+    /// Information-set merging (`NnSeat::infoset_merge`, docs/search.md 3.16): the merged trees' new child
+    /// signatures (links), those that found an existing node by its observation (merges), the walks given a
+    /// fresh node because that node was on their path (aliases), and the growth leaves (a world with an option
+    /// outside another seat's union; they are in `leaves` too).
+    pub merge_links: u64,
+    pub merge_merged: u64,
+    pub merge_aliases: u64,
+    pub merge_growths: u64,
     pub emitted: u64,
     pub epoch: u32,
     pub net: u32,
@@ -1571,6 +1588,16 @@ impl<G: SearchGame> Driver<G> {
                         return Err(format!("belief_tilt {}: {} has no auxiliary targets (SearchGame::AUX) for a belief to predict", n.belief_tilt, G::NAME));
                     }
                     n.root_search.check()?;
+                    if n.infoset_merge {
+                        // (docs/search.md 3.16: an other seat's merged node is valued from the root decider's view,
+                        // the same in every world of its observation - the mover's view would be one world's)
+                        if n.leaf_value_view != LeafView::Root {
+                            return Err("infoset_merge: needs leaf_value_view 'root' (a merged node of another seat is valued from the root decider's view)".into());
+                        }
+                        if n.selfplay {
+                            return Err("infoset_merge: an evaluation seat (selfplay false): self-play support is not built yet (docs/search.md 3.16)".into());
+                        }
+                    }
                     if let Some(lc) = &n.look {
                         // (docs/search.md 3.9: an evaluation seat; its rows are batched like leaves)
                         lc.check()?;
@@ -2162,6 +2189,10 @@ impl<G: SearchGame> Driver<G> {
             cache_leaves: c.cache_leaves.load(Ordering::Relaxed),
             cache_partial: c.cache_partial.load(Ordering::Relaxed),
             cache_clears: c.cache_clears.load(Ordering::Relaxed),
+            merge_links: c.merge_links.load(Ordering::Relaxed),
+            merge_merged: c.merge_merged.load(Ordering::Relaxed),
+            merge_aliases: c.merge_aliases.load(Ordering::Relaxed),
+            merge_growths: c.merge_growths.load(Ordering::Relaxed),
             emitted: self.emitted,
             epoch: self.sh.epoch.load(Ordering::Relaxed),
             net: self.sh.net.load(Ordering::Relaxed),

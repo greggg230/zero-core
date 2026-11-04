@@ -373,6 +373,26 @@ def check_leaf_view(view='mover', share=0.0, target='next_q', what='leaf_value_v
         raise ValueError(f'view_sample_target {target!r}: one of {VIEW_TARGETS}')
 
 
+def check_merge(on=False, view='mover', selfplay=False, what='infoset_merge'):
+    """Information-set merging (docs/search.md 3.16): 0 / 1 (False / True); on needs root-view leaf values (an
+    other seat's merged node is valued from the root decider's view, the same in every world of its observation)
+    and an evaluation seat (self-play support is not built) -> None, else ValueError. The Python reference tree
+    (this module) has no merged mode: the Rust tree only (`play.NNSeat(impl='rs')`, the Rust driver)."""
+    if isinstance(on, float) or on not in (0, 1):
+        raise ValueError(f'{what} {on!r}: 0 or 1')
+    if on and view != 'root':
+        raise ValueError(f"{what}: needs leaf_value_view 'root' (a merged node of another seat is valued from the root "
+                         f"decider's view; docs/search.md 3.16)")
+    if on and selfplay:
+        raise ValueError(f'{what}: an evaluation seat (self-play support is not built yet; docs/search.md 3.16)')
+
+
+def merge_tag(on=False):
+    """The suffix of a move rule's name for its searches' information-set merging (docs/search.md 3.16): '' (off),
+    '-ism' (on) - an evaluation's moves change with it, so its Elo pool does (docs/az.md 5.4)."""
+    return '-ism' if on else ''
+
+
 def view_tag(view='mover'):
     """The suffix of a move rule's name for its searches' leaf values: '' ('mover'), '-rv' ('root')
     - an evaluation's moves change with it, so its Elo pool does (docs/az.md 5.4)."""

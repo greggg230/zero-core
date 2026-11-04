@@ -3199,3 +3199,180 @@ fn sparse_rows_from_encode_sparse_are_the_dense_rows() {
         assert!(t0.belief_rows > 0 && t0.view_rows > 0 && (cap == 0 || t0.cache_hits > 0));
     }
 }
+
+// ------------------------------------------------------------------ information-set merging (docs/search.md 3.16)
+
+use crate::counter_game::{counter_eval, Counter};
+
+fn with_merge(seat: SeatCfg, on: bool) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.infoset_merge = on;
+            if on {
+                s.leaf_value_view = LeafView::Root;
+            }
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+/// Answer a counter batch with its stand-in network (`counter_eval`: priors by option over the row's options,
+/// the value relative to the row's player).
+fn answer_counter(d: &mut Driver<Counter>, b: &Batch) {
+    let f = Counter::NUM_FEATURES;
+    let mut pri = Vec::new();
+    let mut v = vec![0.0; b.b * MAX_SEATS];
+    for r in 0..b.b {
+        let opts: Vec<u16> = b.opt_action[b.opt_off[r] as usize..b.opt_off[r + 1] as usize].iter().map(|&a| a as u16).collect();
+        let (p, val) = counter_eval(&b.x[r * f..(r + 1) * f], &opts);
+        pri.extend(p);
+        v[r * MAX_SEATS..(r + 1) * MAX_SEATS].copy_from_slice(&val);
+    }
+    d.submit(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS]).unwrap();
+}
+
+/// A counter match (`spec`): key a (`sa`) vs key b (`sb`), seats alternating. -> (results, stats).
+fn counter_match(sa: SeatCfg, sb: SeatCfg, games: usize, spec: &str, seed: u64, threads: usize) -> (Vec<GameResult>, DriverStats) {
+    let gs = (0..games).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+    let mut c = cfg(vec![sa, sb], gs, &[("a", KeyKind::Nn), ("b", KeyKind::Nn)]);
+    c.spec = spec.into();
+    c.seed = seed;
+    c.record = false;
+    c.threads = threads;
+    let mut d = Driver::<Counter>::new(c).unwrap();
+    let mut res = Vec::new();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer_counter(&mut d, &b);
+        res.extend(d.take_results());
+    }
+    res.extend(d.take_results());
+    res.sort_by_key(|r| r.gid);
+    (res, d.stats())
+}
+
+#[test]
+fn infoset_merge_needs_root_view_values_and_an_evaluation_seat() {
+    let mk = |view: LeafView, selfplay: bool| {
+        let mut s = NnSeat::eval(0, 8);
+        s.infoset_merge = true;
+        s.leaf_value_view = view;
+        s.selfplay = selfplay;
+        cfg(vec![SeatCfg::Nn(s)], vec![vec![0, 0]], &[("m", KeyKind::Nn)])
+    };
+    let e = Driver::<ToyGame>::new(mk(LeafView::Mover, false)).err().unwrap();
+    assert!(e.contains("leaf_value_view 'root'"), "{e}");
+    let e = Driver::<ToyGame>::new(mk(LeafView::Root, true)).err().unwrap();
+    assert!(e.contains("evaluation seat"), "{e}");
+    assert!(Driver::<ToyGame>::new(mk(LeafView::Root, false)).is_ok());
+}
+
+#[test]
+fn infoset_merge_off_changes_nothing() {
+    // the golden match and records with the setting given off (computed before it existed)
+    let seats = vec![with_merge(nn(0, 16, false), false), with_merge(nn(1, 16, false), false)];
+    let games = (0..40).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+    let mut c = cfg(seats, games, &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+    c.seed = 2026;
+    c.record = false;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    assert_eq!(results_digest(&run(&mut d).0), GOLDEN_MATCH_VISITS);
+    let st = d.stats();
+    assert_eq!((st.merge_links, st.merge_merged, st.merge_growths), (0, 0, 0));
+    let (_, recs) = golden_selfplay(with_merge(nn(0, 16, true), false));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+}
+
+#[test]
+fn infoset_merge_plays_counter_matches_that_merge_and_reproduce() {
+    // a merged seat against an unmerged one, both with root-view values: the merged trees merge (the other seat's
+    // option lists, the next round across depths) and grow; the games are the same across thread counts, with the
+    // evaluation cache (the stand-in network is a function of the row), and with tree reuse through advance_in
+    let a = with_merge(nn(0, 24, false), true);
+    let b = with_view(nn(1, 24, false), LeafView::Root, 0.0, ViewTarget::NextQ);
+    let mut differ = 0;
+    for spec in ["{}", r#"{"rounds": 4}"#, r#"{"rounds": 5, "forget": true}"#] {
+        let (r0, s0) = counter_match(a.clone(), b.clone(), 200, spec, 11, 2);
+        assert_eq!(r0.len(), 200);
+        assert!(r0.iter().all(|r| r.over));
+        assert!(s0.merge_merged > 0 && s0.merge_growths > 0 && s0.merge_links > s0.merge_merged, "{spec}: {s0:?}");
+        if spec.contains("forget") {
+            assert!(s0.merge_aliases > 0, "{spec}: {s0:?}");
+        }
+        let (r1, s1) = counter_match(a.clone(), b.clone(), 200, spec, 11, 1);
+        assert_eq!(results_digest(&r1), results_digest(&r0), "{spec}: threads");
+        assert_eq!((s1.merge_merged, s1.merge_growths), (s0.merge_merged, s0.merge_growths));
+        let cached = |s: &SeatCfg| match s.clone() {
+            SeatCfg::Nn(mut n) => {
+                n.eval_cache = 64;
+                SeatCfg::Nn(n)
+            }
+            s => s,
+        };
+        let (r2, s2) = counter_match(cached(&a), cached(&b), 200, spec, 11, 2);
+        assert_eq!(results_digest(&r2), results_digest(&r0), "{spec}: the eval cache");
+        assert!(s2.cache_hits > 0 && s2.merge_growths == s0.merge_growths);
+        // the merged seat is not the unmerged one (in the longer games: the 2-round game's moves may coincide)
+        let (r3, _) = counter_match(with_view(nn(0, 24, false), LeafView::Root, 0.0, ViewTarget::NextQ), b.clone(), 200, spec, 11, 2);
+        differ += (results_digest(&r3) != results_digest(&r0)) as u32;
+    }
+    assert!(differ >= 1, "merging changed no game");
+}
+
+#[test]
+fn infoset_merge_with_the_root_floor_gumbel_and_the_toy() {
+    let floor = |s: SeatCfg| match s {
+        SeatCfg::Nn(mut n) => {
+            n.root_min_visits = 3;
+            SeatCfg::Nn(n)
+        }
+        s => s,
+    };
+    let gumbel = |s: SeatCfg| match s {
+        SeatCfg::Nn(mut n) => {
+            n.root_search = RootSearch::Gumbel { m: 4, scale: 0.0, c_visit: 50.0, c_scale: 1.0 };
+            SeatCfg::Nn(n)
+        }
+        s => s,
+    };
+    let b = with_view(nn(1, 16, false), LeafView::Root, 0.0, ViewTarget::NextQ);
+    for a in [floor(with_merge(nn(0, 16, false), true)), gumbel(with_merge(nn(0, 16, false), true))] {
+        let (r, s) = counter_match(a.clone(), b.clone(), 100, r#"{"rounds": 3}"#, 5, 2);
+        assert_eq!(r.len(), 100);
+        assert!(s.merge_growths > 0, "{s:?}");
+        // the toy: chance keys, more seats, reuse
+        let seats = vec![a, with_view(nn(1, 16, false), LeafView::Root, 0.0, ViewTarget::NextQ)];
+        let games: Vec<Vec<u16>> = (0..24).map(|g| if g % 3 == 0 { vec![0, 1, 1] } else if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+        let mut c = cfg(seats, games, &[("m", KeyKind::Nn), ("o", KeyKind::Nn)]);
+        c.record = false;
+        let mut d = Driver::<ToyGame>::new(c).unwrap();
+        let (res, _) = run(&mut d);
+        assert_eq!(res.len(), 24);
+        assert!(d.stats().merge_links > 0);
+    }
+}
+
+#[test]
+fn infoset_merge_survives_rolling_network_changes() {
+    // a rolling match driver whose network changes between phases: every merged search restarts from a fresh tree
+    // (reset + set_merge) and the games go on
+    let seats = vec![with_merge(nn(0, 16, false), true), with_view(nn(1, 16, false), LeafView::Root, 0.0, ViewTarget::NextQ)];
+    let mut c = cfg(seats, vec![vec![0, 1], vec![1, 0]], &[("a", KeyKind::Nn), ("b", KeyKind::Nn)]);
+    c.spec = r#"{"rounds": 6}"#.into();
+    c.rolling = true;
+    c.record = false;
+    c.concurrency = 12;
+    let mut d = Driver::<Counter>::new(c).unwrap();
+    let mut total = 0;
+    for phase in 0..6u32 {
+        d.resume(10, phase).unwrap();
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer_counter(&mut d, &b);
+            total += d.take_results().len();
+        }
+        total += d.take_results().len();
+    }
+    let st = d.stats();
+    assert!(total >= 60 && st.restarts > 0 && st.epoch == 5, "{total} games, {st:?}");
+    assert!(st.merge_merged > 0 && st.merge_growths > 0);
+}

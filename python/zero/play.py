@@ -72,7 +72,9 @@ class NNSeat:
     belief_mix, belief_fast: the root's belief of its searches (docs/search.md 3.8). root_search: 'puct' |
     'gumbel' (docs/search.md 3.7), gumbel_m the options sequential halving considers, gumbel_scale its
     noise's scale, gumbel_c_visit / gumbel_c_scale sigma's transform (None: cq_c_visit / cq_c_scale).
-    cq_prior_w: beta, the prior's exponent in the recorded 'cq' target (docs/search.md 3.13; 1 = off)."""
+    cq_prior_w: beta, the prior's exponent in the recorded 'cq' target (docs/search.md 3.13; 1 = off).
+    infoset_merge: information-set merging (docs/search.md 3.16): the Rust tree only (impl 'rs'; the reference
+    tree has no merged mode), root-view leaf values, an evaluation seat."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',
@@ -81,7 +83,7 @@ class NNSeat:
                  root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
                  view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
                  root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
-                 cq_prior_w=1.0):
+                 cq_prior_w=1.0, infoset_merge=False):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
         mcts.check_cq_prior_w(cq_prior_w, policy_target)
@@ -93,6 +95,11 @@ class NNSeat:
         mcts.check_root_search(root_search, gumbel_m, gumbel_scale, gumbel_c_visit, gumbel_c_scale)
         if root_search == 'gumbel' and root_min_visits:
             raise ValueError("root_min_visits with root_search 'gumbel': exclusive (docs/search.md 3.7)")
+        mcts.check_merge(infoset_merge, leaf_value_view, selfplay)
+        if infoset_merge and impl != 'rs':
+            raise ValueError("infoset_merge: the Rust tree only (impl 'rs'): the Python reference tree has no merged "
+                             "mode (docs/search.md 3.16)")
+        self.infoset_merge = bool(infoset_merge)
         self.key, self.sims, self.c_puct, self.selfplay = key, sims, c_puct, selfplay
         self.alpha, self.eps, self.temp_moves = alpha, eps, temp_moves
         self.sims_fast, self.p_full, self.chance_k, self.margin_w = sims_fast, p_full, chance_k, margin_w
@@ -223,6 +230,8 @@ class RsSearch:
 
     def __init__(self, game, seat, rng):
         self.t = game.search_tree(seat.redet, rng.getrandbits(63))
+        if getattr(seat, 'infoset_merge', False):
+            self.t.set_merge(True)                 # (docs/search.md 3.16: a fresh tree)
 
     def set_base(self, game, rng):
         self.t.set_base(game)

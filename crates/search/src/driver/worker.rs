@@ -103,6 +103,8 @@ struct Tally {
     cache_leaves: u64,
     cache_partial: u64,
     cache_clears: u64,
+    /// Information-set merging (docs/search.md 3.16): the merged trees' counters, summed over simulations.
+    merge: crate::tree::MergeStats,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -263,6 +265,12 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
         k.cache_partial.fetch_add(n.cache_partial, Ordering::Relaxed);
         k.cache_clears.fetch_add(n.cache_clears, Ordering::Relaxed);
     }
+    if n.merge.links > 0 {
+        k.merge_links.fetch_add(n.merge.links, Ordering::Relaxed);
+        k.merge_merged.fetch_add(n.merge.merged, Ordering::Relaxed);
+        k.merge_aliases.fetch_add(n.merge.aliases, Ordering::Relaxed);
+        k.merge_growths.fetch_add(n.merge.growths, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -363,6 +371,8 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: search target set for a non-network seat")?;
         let mut t = slot.spare.pop().unwrap_or_default();
         t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
+        // (information-set merging, docs/search.md 3.16: a fresh tree takes the seat's setting)
+        t.set_merge(seat.infoset_merge)?;
         if slot.dev_now {
             slot.target = Some(1);                 // (the deviation's root evaluation again)
         }
@@ -469,7 +479,8 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
 fn apply_eval<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, node: u32, vrow: bool, priors: &[f32], value: &[f32], margin: &[f32]) -> Result<(), String> {
     let s = nn_seat(cfg, slot.gid, seat).ok_or("internal: pending leaf of a non-network seat")?;
     let tree = slot.trees[seat].as_mut().ok_or("internal: pending leaf without a tree")?;
-    if priors.len() != tree.acts(node).len() {
+    // (a merged tree's growth leaf is evaluated with its world's options: docs/search.md 3.16)
+    if priors.len() != tree.leaf_acts(node).len() {
         return Err("internal: evaluation option count mismatch".into());
     }
     let vp = if vrow { tree.viewer } else { tree.player(node) };
@@ -573,8 +584,16 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             return Ok(());
         }
         std::mem::swap(&mut slot.path, &mut scratch.sim.path);
+        let m0 = tree.merge_stats();
         let r = tree.simulate(live, sg, &mut slot.search_rng, &walk, &mut scratch.sim);
         std::mem::swap(&mut slot.path, &mut scratch.sim.path);
+        if let (Some(a), Some(b)) = (m0, tree.merge_stats()) {
+            // (information-set merging, docs/search.md 3.16: this walk's links, merges, aliases, growth leaf)
+            n.merge.links += b.links - a.links;
+            n.merge.merged += b.merged - a.merged;
+            n.merge.aliases += b.aliases - a.aliases;
+            n.merge.growths += b.growths - a.growths;
+        }
         match r? {
             Sim::Terminal => {
                 slot.sims += 1;
@@ -585,7 +604,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 // of its features and options; a cached row is not sent
                 let buf = &mut bufs[seat.key as usize];
                 let local = buf.len() as u32;
-                let acts = tree.acts(node);
+                let acts = tree.leaf_acts(node);
                 buf.encode_row(sg, player);
                 let lkey = cache_key(buf.row_hash(G::NUM_FEATURES), acts);
                 let leaf = slot.cache.get(&(seat.key, slot.net, lkey)).cloned();
@@ -648,7 +667,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 let local = buf.len() as u32;
                 buf.encode_row(sg, player);
                 buf.seal();
-                let acts = tree.acts(node);
+                let acts = tree.leaf_acts(node);
                 buf.nopt.push(acts.len() as i32);
                 buf.opt_action.extend(acts.iter().map(|&a| a as i32));
                 buf.player.push(player as i32);
@@ -840,6 +859,8 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
         None => {
             let mut t = slot.spare.pop().unwrap_or_default();
             t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
+            // (information-set merging, docs/search.md 3.16: a fresh tree takes the seat's setting)
+            t.set_merge(seat.infoset_merge).expect("internal: set_merge right after reset");
             slot.trees[p] = Some(t);
         }
         Some(t) => {
@@ -886,6 +907,7 @@ fn start_dev<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
         None => {
             let mut t = slot.spare.pop().unwrap_or_default();
             t.reset(game, p, &slot.legal, seat.redet, &mut slot.search_rng);
+            t.set_merge(seat.infoset_merge).expect("internal: set_merge right after reset");
             slot.trees[p] = Some(t);
         }
         Some(t) => t.set_base(game, &mut slot.search_rng),
@@ -1114,8 +1136,9 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
     slot.look_guard = None;
     let nxt = g.to_move();
     for q in 0..slot.n {
+        // (a merged tree finds the next root by the real observation too: `Tree::advance_in`, docs/search.md 3.16)
         let keep = match (slot.trees[q].as_mut(), nxt) {
-            (Some(t), Some(np)) => q == p && np == p && t.redet && t.advance(a, key, np, &slot.legal),
+            (Some(t), Some(np)) => q == p && np == p && t.redet && t.advance_in(a, key, np, &slot.legal, slot.game.as_ref().unwrap()),
             _ => false,
         };
         if !keep {

@@ -151,7 +151,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -293,6 +293,9 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         resign_t: get(d, "resign_t", 0.0f64)?,
         resign_k: get(d, "resign_k", 5u32)?,
         resign_noresign: get(d, "resign_noresign", 0.1f64)?,
+        // information-set merging (docs/search.md 3.16; absent: false, the tree of before; checked by the driver:
+        // root-view leaf values, an evaluation seat)
+        infoset_merge: flag(d, "infoset_merge", false)?,
     }))
 }
 
@@ -743,6 +746,30 @@ impl PySearchTree {
     fn path_len(&self) -> usize {
         self.t.path_len()
     }
+    /// Information-set merging from now on (docs/search.md 3.16; a fresh tree only: right after
+    /// `game.search_tree()`, before its first simulation). Use it with `simulate(root_view=True)`: an other
+    /// seat's merged node takes the viewer's value. A leaf may then be a growth leaf (an expanded node of
+    /// another seat whose world has a new option): `simulate` gives its world's options, `expand` takes them.
+    fn set_merge(&mut self, on: bool) -> PyResult<()> {
+        self.t.set_merge(on).map_err(verr)
+    }
+    #[getter]
+    fn merge_on(&self) -> bool {
+        self.t.merge_on()
+    }
+    /// The merged tree's counters since `set_merge` (None when off): links (new child signatures), encodes
+    /// (observations encoded), merged (new signatures that found a node by its observation), aliases (fresh
+    /// nodes for a walk that would revisit one), growths (growth leaves).
+    fn merge_stats<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(m) = self.t.merge_stats() else { return Ok(None) };
+        let d = PyDict::new(py);
+        d.set_item("links", m.links)?;
+        d.set_item("encodes", m.encodes)?;
+        d.set_item("merged", m.merged)?;
+        d.set_item("aliases", m.aliases)?;
+        d.set_item("growths", m.growths)?;
+        Ok(Some(d))
+    }
 }
 
 // ------------------------------------------------------------------------ SearchDriver
@@ -991,6 +1018,10 @@ impl PySearchDriver {
         d.set_item("cache_leaves", s.cache_leaves)?;
         d.set_item("cache_partial", s.cache_partial)?;
         d.set_item("cache_clears", s.cache_clears)?;
+        d.set_item("merge_links", s.merge_links)?;
+        d.set_item("merge_merged", s.merge_merged)?;
+        d.set_item("merge_aliases", s.merge_aliases)?;
+        d.set_item("merge_growths", s.merge_growths)?;
         d.set_item("emitted", s.emitted)?;
         d.set_item("epoch", s.epoch)?;
         d.set_item("net", s.net)?;

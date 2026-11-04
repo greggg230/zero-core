@@ -37,6 +37,13 @@ run's gumbel_m, 16) and its noise --a-gumbel-scale / --b-gumbel-scale (default: 
 eval_gumbel_scale, 0 = none). The side's move rule is then the Gumbel search's (`select_*`:
 'gumbel-m16-v50-s0.3').
 
+Information-set merging (docs/search.md 3.16, docs/az.md 30): --a-infoset-merge / --b-infoset-merge 0 | 1 (or
+--infoset-merge for both) - each side's trees merge their nodes by the root decider's observation, or not (default:
+its run's eval_infoset_merge). A merged side needs root-view leaf values (its run's eval_leaf_value_view 'root' or
+--*-leaf-value-view root). `CK CK --a-infoset-merge 1 --b-infoset-merge 0` is the evaluation-only A/B of the merge
+on one checkpoint; the side's rule name carries it ('-ism') and the output adds `merge` (the merged trees' links,
+merges, aliases and growth leaves, summed over the drivers).
+
 Per-side simulations (docs/az.md 20.4): --a-sims / --b-sims (default --sims), e.g. `A A --a-sims 128
 --b-sims 32` (the output then names `sims_a`, `sims_b`).
 
@@ -85,8 +92,9 @@ import time
 
 from . import games as G, lookahead as LA, package
 from .infer import NetEvaluator, drive
-from .mcts import (belief_settings, belief_tag, check_belief, check_root_search, check_select, check_select_transform,
-                   forced_tag, gumbel_tag, select_settings, select_tag, select_transform, view_tag)
+from .mcts import (belief_settings, belief_tag, check_belief, check_merge, check_root_search, check_select,
+                   check_select_transform, forced_tag, gumbel_tag, merge_tag, select_settings, select_tag, select_transform,
+                   view_tag)
 from .net import check_belief_head, load
 
 
@@ -144,6 +152,8 @@ def run_rule(ckpt):
                'root_min_visits_max_actions': int(c.get('root_min_visits_max_actions', 4))}
     if c.get('eval_leaf_value_view', 'mover') != 'mover':
         out['leaf_value_view'] = c['eval_leaf_value_view']
+    if c.get('eval_infoset_merge'):
+        out['infoset_merge'] = True                # (docs/search.md 3.16)
     tilt, clip, mix, fast = belief_settings(c, 'eval')
     if tilt:
         out.update(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast)
@@ -183,16 +193,33 @@ def side_keys(ckpt, select=None, min_visits=0, c_visit=None, c_scale=None):
 
 
 def _tag(seat):
+    ism = merge_tag(seat.get('infoset_merge', False))
     if seat.get('root_search', 'puct') == 'gumbel':
         return gumbel_tag(seat.get('gumbel_m', 16), seat.get('gumbel_c_visit', 50.0), seat.get('gumbel_c_scale', 1.0),
                           seat.get('gumbel_scale', 1.0)) + view_tag(seat.get('leaf_value_view', 'mover')) + belief_tag(
-            seat.get('belief_tilt', 0.0), seat.get('belief_clip'), seat.get('belief_mix', 0.0), seat.get('belief_fast', False))
+            seat.get('belief_tilt', 0.0), seat.get('belief_clip'), seat.get('belief_mix', 0.0), seat.get('belief_fast', False)) + ism
     cv, cs = select_transform(seat.get('cq_c_visit', 50.0), seat.get('cq_c_scale', 1.0), seat.get('select_c_visit'),
                               seat.get('select_c_scale'))
     return select_tag(seat.get('select', 'visits'), seat.get('select_min_visits', 0), cv, cs) + forced_tag(
         seat.get('root_min_visits', 0), seat.get('root_min_visits_max_actions', 4)) + view_tag(
         seat.get('leaf_value_view', 'mover')) + belief_tag(seat.get('belief_tilt', 0.0), seat.get('belief_clip'),
-                                                           seat.get('belief_mix', 0.0), seat.get('belief_fast', False))
+                                                           seat.get('belief_mix', 0.0), seat.get('belief_fast', False)) + ism
+
+
+MERGE_STATS = ('links', 'merged', 'aliases', 'growths')
+
+
+def _merge_out(out, sa, sb, stats):
+    """`merge` in a match's output when a side merges its trees (docs/search.md 3.16): the drivers' merged-tree
+    counters summed (links, merges, aliases, growth leaves); a merged side whose trees made no link is reported
+    on stderr (a setting that did nothing)."""
+    if not (sa.get('infoset_merge') or sb.get('infoset_merge')):
+        return
+    m = {k: sum(int(st.get(f'merge_{k}', 0)) for st in stats) for k in MERGE_STATS}
+    out['merge'] = m
+    if m['links'] == 0:
+        print('# WARNING: infoset_merge on but the merged trees made no link (docs/search.md 3.16)', file=sys.stderr,
+              flush=True)
 
 
 def with_belief(keys, tilt=None, clip=None, mix=None, fast=None):
@@ -450,6 +477,7 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
     _look_out(out, sa, sb, st, mr, evs)
+    _merge_out(out, sa, sb, st)
     if sp:
         out['sparse'] = True
     if paired:
@@ -538,6 +566,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
     _look_out(out, sa, sb, st, mr, evs)
+    _merge_out(out, sa, sb, st)
     if sp:
         out['sparse'] = True
     if paired:
@@ -590,6 +619,13 @@ def main(argv=None):
         ap.add_argument(f'--{side}-belief-clip', type=float, default=None)
         ap.add_argument(f'--{side}-belief-mix', type=float, default=None)
         ap.add_argument(f'--{side}-belief-fast', type=int, default=None, choices=[0, 1])
+    ap.add_argument('--infoset-merge', type=int, default=None, choices=[0, 1],
+                    help="both sides' information-set merging (docs/search.md 3.16; default: each side's run's "
+                         "eval_infoset_merge)")
+    for side in 'ab':
+        ap.add_argument(f'--{side}-infoset-merge', type=int, default=None, choices=[0, 1],
+                        help=f"side {side.upper()}'s information-set merging (over --infoset-merge; needs root-view "
+                             f"leaf values)")
     ap.add_argument('--torch-threads', type=int, default=1, help='torch intra-op threads (default 1)')
     for side in ('a', 'b'):
         ap.add_argument(f'--{side}-root-search', default=None, choices=['puct', 'gumbel'],
@@ -682,6 +718,19 @@ def main(argv=None):
             keys.pop('leaf_value_view', None)
         elif view == 'root':
             keys['leaf_value_view'] = 'root'
+    for side, keys in zip(('a', 'b'), sides):
+        # information-set merging (docs/search.md 3.16): as given, else the side's run's
+        on = getattr(a, f'{side}_infoset_merge')
+        on = a.infoset_merge if on is None else on
+        if on == 0:
+            keys.pop('infoset_merge', None)
+        elif on == 1:
+            keys['infoset_merge'] = True
+        try:
+            check_merge(int(bool(keys.get('infoset_merge'))), keys.get('leaf_value_view', 'mover'),
+                        what=f'side {side.upper()} infoset_merge')
+        except ValueError as e:
+            ap.error(f'{e} (--{side}-leaf-value-view root, or its run\'s eval_leaf_value_view)')
     try:
         # (a side's root belief is its run's eval_belief_tilt even when --select replaced its rule, so an
         # A/B arm whose config sets it is dealt as it trained; the side's flags override it)

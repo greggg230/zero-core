@@ -187,6 +187,12 @@ DEFAULTS = dict(
     # target's q, 'next_q' (that seat's next search's root value, z if none) | 'z'. 0 = off
     selfplay_leaf_value_view='mover', eval_leaf_value_view='mover', selfplay_view_samples=0.0,
     view_sample_target='next_q',
+    # information-set merging (docs/search.md 3.16, docs/az.md 30): 1 = every evaluation seat's trees merge their
+    # nodes by the root decider's observation (single-observer information-set MCTS inside the tree: the other
+    # seat's nodes subset-armed over the union of its sampled worlds' options, the root decider's next decision one
+    # node whatever the other seat was dealt). Needs eval_leaf_value_view 'root'; its moves change, so the Elo
+    # pool's name gets '-ism'. Self-play support is not built. 0 = off (the default: today's searches, bit for bit)
+    eval_infoset_merge=0,
     # the root's belief (docs/search.md 3.8, docs/az.md 18): a full search of the seat asks the network's
     # auxiliary head once for the root's prediction of the hidden cards (one extra row: the root's own
     # features, the decider's view) and deals every simulation's world by it - the game's
@@ -534,7 +540,7 @@ class Run:
                          leaf_value_view=c.get('eval_leaf_value_view', 'mover'),
                          root_search=c.get('eval_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
                          gumbel_scale=c.get('eval_gumbel_scale', 0.0), eval_cache=c.get('eval_cache', 0),
-                         **belief_keys(c, 'eval'))
+                         infoset_merge=bool(c.get('eval_infoset_merge', 0)), **belief_keys(c, 'eval'))
 
     def check_belief_heads(self, path):
         """With a root belief on (selfplay_ / eval_belief_tilt > 0, docs/az.md 18) the checkpoint at
@@ -1906,6 +1912,8 @@ def check_eval_settings(cfg, where=''):
         check_leaf_view(cfg.get('selfplay_leaf_value_view', 'mover'), cfg.get('selfplay_view_samples', 0.0),
                         cfg.get('view_sample_target', 'next_q'), what='selfplay_leaf_value_view')
         check_leaf_view(cfg.get('eval_leaf_value_view', 'mover'), what='eval_leaf_value_view')
+        from .mcts import check_merge
+        check_merge(cfg.get('eval_infoset_merge', 0), cfg.get('eval_leaf_value_view', 'mover'), what='eval_infoset_merge')
         for pre in ('selfplay', 'eval'):
             tilt, clip, mix, _ = belief_settings(cfg, pre)
             check_belief(tilt, clip, mix, what=f'{pre}_belief_tilt')
