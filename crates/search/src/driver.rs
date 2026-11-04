@@ -367,12 +367,17 @@ pub struct NnSeat {
     /// driver's batches; the seat's MCTS settings serve its final fallback (`Last::Mcts`). An
     /// evaluation seat (no records).
     pub look: Option<Box<LookCfg>>,
+    /// The game's evaluation cache (docs/search.md 3.12; 0 = off, the default): the answers to the rows a
+    /// game sent this seat's network, kept by a 128-bit hash of each row's features and options, at most
+    /// this many per game (emptied when full); a leaf whose rows are all cached is expanded at once and
+    /// its search goes on, a row of it that is cached is not sent.
+    pub eval_cache: u32,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None, eval_cache: 0 }
     }
 
     /// The belief settings' check (`Driver::new`; the bindings' messages): tilt finite >= 0, clip
@@ -743,12 +748,44 @@ enum Pending {
     /// `vrow`: the value comes from the next row, a value-only row of the tree's viewer
     /// (`LeafView::Root` at another seat's leaf). `brow`: the row after it (and after the value
     /// row) is the search's root belief row (`ROW_BELIEF`, with a fresh root's first leaf).
-    Leaf { key: u16, local: u32, seat: usize, node: u32, vrow: bool, brow: bool },
+    /// `part`: with the seat's evaluation cache on (`NnSeat::eval_cache`), what the leaf takes from the
+    /// game's cache and the keys of the rows it sent (None: the cache is off, the rows as above).
+    Leaf { key: u16, local: u32, seat: usize, node: u32, vrow: bool, brow: bool, part: Option<Box<LeafPart>> },
     /// A reused root's belief row alone: the search waits for it (docs/search.md 3.8).
     Belief { key: u16, local: u32, seat: usize },
     /// A lookahead's round of rows from `local` (docs/search.md 3.9).
     Look { key: u16, local: u32 },
     Ext { key: u16, local: u32 },
+}
+
+/// A cached answer to one network row (docs/search.md 3.12): the priors of its options (none for a
+/// value-only row), its value and margin per seat.
+#[derive(Clone)]
+struct Cached {
+    priors: Box<[f32]>,
+    value: [f32; MAX_SEATS],
+    margin: [f32; MAX_SEATS],
+}
+
+/// A pending leaf's rows with the evaluation cache on (`Pending::Leaf::part`): the leaf row is sent
+/// (`lkey`: its cache key) or cached (`leaf`), and so is the value-only row of `LeafView::Root` (`vkey` /
+/// `view`; neither without one). The rows sent are consecutive from the leaf's `local`, in that order,
+/// the root belief row after them.
+struct LeafPart {
+    lkey: Option<u128>,
+    leaf: Option<Cached>,
+    vkey: Option<u128>,
+    view: Option<Cached>,
+}
+
+/// The evaluation cache's key of a row (docs/search.md 3.12): the hash of its features (`obs_hash`) and
+/// its options in order (none: a value-only row).
+fn cache_key(x: u128, acts: &[u16]) -> u128 {
+    let mut a = split64(0x6576_616c_6361_6368 ^ acts.len() as u64);
+    for &o in acts {
+        a = split64(a ^ o as u64);
+    }
+    x ^ (((a as u128) << 64) | split64(a ^ 0x5bd1_e995) as u128)
 }
 
 struct Slot<G: SearchGame> {
@@ -802,6 +839,10 @@ struct Slot<G: SearchGame> {
     /// The guarded player (`LookCfg::guard`): the lookahead's mean per root option and the margin, for
     /// the MCTS search's decision of the same decision.
     look_guard: Option<(Vec<(u16, f64)>, f64)>,
+    /// The game's evaluation cache (`NnSeat::eval_cache`, docs/search.md 3.12): by (evaluator key,
+    /// network id, row key); emptied as a game starts, as a new search epoch begins (another network)
+    /// and when full.
+    cache: HashMap<(u16, u32, u128), Cached>,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -842,6 +883,7 @@ impl<G: SearchGame> Slot<G> {
             look: None,
             look_mcts: false,
             look_guard: None,
+            cache: HashMap::new(),
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -950,6 +992,12 @@ struct Counters {
     view_recorded: AtomicU64,
     /// Root belief rows sent (`ROW_BELIEF`, docs/search.md 3.8).
     belief_rows: AtomicU64,
+    /// The evaluation cache (docs/search.md 3.12): rows answered from it (not sent), leaves wholly
+    /// answered from it (expanded at once), leaves answered from it in part, caches emptied because full.
+    cache_hits: AtomicU64,
+    cache_leaves: AtomicU64,
+    cache_partial: AtomicU64,
+    cache_clears: AtomicU64,
     /// The longest a game's step took (one slot's advance between two of its leaves: its search
     /// and moves, ns), that game's gid, and the steps over SLOW_STEP_NS.
     step_max_ns: AtomicU64,
@@ -1099,6 +1147,15 @@ pub struct DriverStats {
     /// Root belief rows of the network batches (`ROW_BELIEF`: one per search that takes the belief,
     /// docs/search.md 3.8).
     pub belief_rows: u64,
+    /// The evaluation cache (`NnSeat::eval_cache`, docs/search.md 3.12): network rows answered from a
+    /// game's cache instead of sent, leaves expanded at once (every row of theirs cached; not in
+    /// `leaves`, which counts the leaves that sent rows), leaves that sent one row and took the other
+    /// from the cache (`LeafView::Root`: the leaf's own row and the value-only row), caches emptied
+    /// because full.
+    pub cache_hits: u64,
+    pub cache_leaves: u64,
+    pub cache_partial: u64,
+    pub cache_clears: u64,
     pub emitted: u64,
     pub epoch: u32,
     pub net: u32,
@@ -1732,6 +1789,10 @@ impl<G: SearchGame> Driver<G> {
             view_rows: c.view_rows.load(Ordering::Relaxed),
             view_recorded: c.view_recorded.load(Ordering::Relaxed),
             belief_rows: c.belief_rows.load(Ordering::Relaxed),
+            cache_hits: c.cache_hits.load(Ordering::Relaxed),
+            cache_leaves: c.cache_leaves.load(Ordering::Relaxed),
+            cache_partial: c.cache_partial.load(Ordering::Relaxed),
+            cache_clears: c.cache_clears.load(Ordering::Relaxed),
             emitted: self.emitted,
             epoch: self.sh.epoch.load(Ordering::Relaxed),
             net: self.sh.net.load(Ordering::Relaxed),

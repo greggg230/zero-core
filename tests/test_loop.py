@@ -205,6 +205,36 @@ def test_sparse_setting_plays_the_same_selfplay(smoke_run, tmp_path, monkeypatch
             assert np.array_equal(arrs[k], shards[1][p][k]), (p, k)
 
 
+def test_eval_cache_setting(smoke_run, tmp_path, monkeypatch):
+    """Run setting eval_cache (docs/az.md 25): 0 = no seat key, no metrics key (the run of before); N > 0 =
+    every network seat carries it and self-play reports the rows its games' caches answered."""
+    import shutil
+    from zero import games as G, run as R
+    with open(os.path.join(smoke_run, 'config.json')) as f:
+        cfg = json.load(f)
+    assert R.DEFAULTS['eval_cache'] == 0
+    seats = []
+    orig = G.Driver
+
+    def spy(game, table, *a, **kw):
+        seats.extend(s for row in table for s in row)
+        return orig(game, table, *a, **kw)
+    monkeypatch.setattr(G, 'Driver', spy)
+    out = {}
+    for n in (0, 4096):
+        run = tmp_path / f'cache{n}'
+        shutil.copytree(smoke_run, run)
+        seats.clear()
+        out[n] = R.Run(str(run), dict(cfg, eval_cache=n)).selfplay(2)
+        assert seats and all(s.get('eval_cache') == (n or None) for s in seats), seats[:2]
+    assert 'eval_cache' not in out[0]
+    m = out[4096]['eval_cache']
+    assert m['hits'] > 0 and 0 < m['share'] < 1 and m['clears'] == 0, m
+    assert out[4096]['games'] == out[0]['games']
+    with pytest.raises(ValueError, match='eval_cache'):
+        G.nn_seat('m', 8, eval_cache=-1)
+
+
 def test_resume_continues_and_stop_file(smoke_run, tmp_path):
     import shutil
     run = tmp_path / 'r'

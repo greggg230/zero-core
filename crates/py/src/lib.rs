@@ -149,7 +149,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -247,6 +247,8 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         belief_fast: flag(d, "belief_fast", false)?,
         root_search,
         look,
+        // the game's evaluation cache: at most this many answers per game (0 = off; docs/search.md 3.12)
+        eval_cache: get(d, "eval_cache", 0u32)?,
     }))
 }
 
@@ -860,6 +862,10 @@ impl PySearchDriver {
         d.set_item("view_rows", s.view_rows)?;
         d.set_item("view_recorded", s.view_recorded)?;
         d.set_item("belief_rows", s.belief_rows)?;
+        d.set_item("cache_hits", s.cache_hits)?;
+        d.set_item("cache_leaves", s.cache_leaves)?;
+        d.set_item("cache_partial", s.cache_partial)?;
+        d.set_item("cache_clears", s.cache_clears)?;
         d.set_item("emitted", s.emitted)?;
         d.set_item("epoch", s.epoch)?;
         d.set_item("net", s.net)?;

@@ -1066,6 +1066,69 @@ Code: `lookahead.rs` (`LookCfg`, `Look`, `RowSink`, `Answers`, `LookStats`, `obs
 `LookRows`), the bindings (`Lookahead`, `lookahead_settings`, seat key `lookahead`, `stats()['look']`);
 Python `lookahead.py`, `infer.py` (`max_rows`), `h2h.py`.
 
+### 3.12 The game's evaluation cache (`eval_cache`; MTG Zero's Delver mirror, 2026-11-03)
+
+**Why.** A game's searches send the network the same rows again and again. Measured on MTG Zero's Delver
+line (48 self-play games of its gen 960 at its exact self-play seat, 520,304 rows; its ENGINE.md / the probe
+in docs/az.md 25): 33.8% of the rows repeat, bit for bit, a row the same game sent earlier - 62.6% of the
+root-view value-only rows (3.6), 19.0% of the leaf rows, every root belief row (the root's own leaf row) -
+and none repeat across games. The source is hidden information, not move order: each simulation deals the
+other seat a new hand (`redet`), so its decision nodes differ (their option lists), while the root decider
+sees one position - its own decisions repeat 34% (21% within a single search), the other seat's 3.8%.
+Putting the permanents in a canonical order adds 0.6 points. The legal options never told two equal
+feature rows apart.
+
+**What it does.** A network seat with `eval_cache` N > 0 (`NnSeat::eval_cache`; the bindings' seat key
+`eval_cache`, run setting `eval_cache`) keeps, per game in flight (`Slot::cache`), the answers to the rows
+the game sent its network: the priors of the row's options, its value and margin per seat, by the key
+(evaluator key, network id, `cache_key(obs_hash(features), options)` - the lookahead's 128-bit hash of the
+float bits, 3.9, with the options in order; a value-only row has none). At a search leaf (`advance_slot`,
+`Sim::Leaf`):
+
+* each of the leaf's rows - its own row, and with `LeafView::Root` at another seat's leaf the root decider's
+  value-only row - is encoded and looked up alone; a cached row is dropped from the batch (`LeafBuf::unrow`),
+  a missing one is sent as before;
+* every row cached: the leaf is expanded and backed up at once and the search goes on (a fresh root whose
+  leaf was cached then sends its belief row alone, a reused root's way, 3.8);
+* otherwise the leaf waits for its batch with what it took from the cache (`Pending::Leaf::part`, `LeafPart`:
+  the rows it sent are consecutive from its `local`, the belief row after them); the answers to the rows it
+  sent go into the cache when they come back.
+
+The cache is emptied as a game starts, as a new search epoch begins (a rolling driver's new network: the
+network id is in the key too, so another network's answer is never found) and when it holds N answers.
+Each evaluator key has its own answers (a match's two networks never share one). The lookahead (3.9) keeps
+its own per-round dedup and does not use the cache.
+
+**What changes.** The answers a search reads are the network's answers to the same rows, computed in another
+batch: equal up to the network's float rounding at another batch shape (an evaluator whose answer is a
+function of the row alone gives the same games and records bit for bit: the tests). A leaf answered from
+the cache takes no batch round, so a game moves faster through its rounds than the others: when games
+finish changes, and with it the order of their records, a rolling phase's quota (which games it ends,
+which are in flight at a network change) and a run's batch shapes. Off (0, the default), nothing changes:
+no key, the rows, batches and games of before, byte for byte.
+
+**Stats** (`Driver::stats`, the bindings' `stats()`): `cache_hits` (rows answered from a cache instead of
+sent), `cache_leaves` (leaves expanded at once; not in `leaves`, which counts the leaves that sent rows),
+`cache_partial` (leaves that sent one row and took the other from the cache), `cache_clears` (caches
+emptied because full). Every row is sent or answered from the cache: rows sent + `cache_hits` = the rows
+without the cache, for the same searches.
+
+**Memory.** An answer is ~100 bytes plus its priors; N answers per game in flight at most.
+
+**Tests** (`driver::tests`): `the_eval_cache_plays_the_same_games_with_fewer_rows` (ToyGame self-play, an
+evaluator of the row alone: the same results and records - as a multiset - bit for bit, as many
+simulations, rows sent + hits = rows without; dense and sparse batches; a cache of 3 emptied 7,143 times),
+`the_eval_cache_keeps_each_networks_answers_apart` (a match of two keys bit for bit; rolling phases over a
+network change: after it every cache holds the new network's answers alone),
+`the_eval_cache_with_root_view_value_rows` (value-only rows cached, leaves answered in part, the same games),
+`the_eval_cache_with_root_view_rows_and_the_belief` (HiddenMull with the root's belief: one belief row per
+search either way, the same records).
+
+Code: `driver.rs` (`NnSeat::eval_cache`, `Cached`, `LeafPart`, `cache_key`, `Slot::cache`, the stats),
+`driver/worker.rs` (`advance_slot`'s cached leaf, `run_chunk`'s answers, `row_answer`, `cache_put`, the
+emptying in `init_slot` / `restart_search`), the bindings (seat key `eval_cache`, the stats); Python
+`games.nn_seat(eval_cache=)`, `run.py` (`eval_cache`, `Run.cache_metrics`).
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:

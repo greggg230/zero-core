@@ -144,6 +144,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
 | `sparse` | 0 | 1 = the run's drivers (self-play and matches) send sparse network batches (each row's non-zero features; docs/search.md 2.2): the same rows, games and samples; a token network's CUDA graphs scatter them on the device, other evaluators densify them (10.7) |
+| `eval_cache` | 0 | N > 0 = every network seat (self-play and evaluation) keeps its game's network answers, at most N per game, by a hash of each row's features and options, and answers a repeated row from them instead of sending it (docs/search.md 3.12; the same answers up to float rounding at another batch shape) (25) |
 | `resolver` | '' | co-training (section 11): the resolver game, whose episodes decide this game's deferred terminals ('' = a single-game run: this loop, line for line) |
 | `resolver_cfg` | {} | the resolver's settings (a JSON object of these same settings: spec, players, network, search, training, evaluation; `preset` names one), saved nested in config.json; resolved into `<run>/resolver/config.json` |
 | `resolver_init` | '' | the checkpoint the resolver's network starts from ('' = fresh); a single-game run's checkpoint works (widened if the game grew) |
@@ -3595,3 +3596,56 @@ zero` identical; toy-smoke runs byte for byte against c6b959b in two configurati
 'cq' 0.3 and the cq2 rule); MTG Zero's `tools/gate.py optin-core` PASSED (its ENGINE.md 80.8: digests
 unchanged, check_checkpoint_compat with the Delver line's iteration 475 identical, Glass Road / Caverna /
 Kingdom Builder build against this core).
+
+## 25. The game's evaluation cache (`eval_cache`; MTG Zero's Delver mirror, 2026-11-03)
+
+The semantics are docs/search.md 3.12; this section is the run-level view.
+
+**Why.** A third of the network rows of MTG Zero's Delver self-play repeat a row the same game sent earlier
+(measured below), and self-play's time is mostly the network's: the Delver line's gen 960 spent 96 of its
+128 s of self-play in the evaluator. A row the game already sent need not be sent again.
+
+**The setting.** `eval_cache` N (default 0 = off): every network seat of the run - self-play's
+(`Run.nn_seat(selfplay=True)`, also the remote's and the local linger's) and the evaluations' - keeps its
+game's answers, at most N per game in flight, and answers a repeated row from them. Off, the seat dict has
+no key and the run plays, records and trains as before, byte for byte. With it on, the answers are the
+network's answers to the same rows computed in another batch (equal up to its float rounding at another
+batch shape); games finish in another order, so a run's batches, shards and rolling phases differ from the
+run without it at the float-rounding level, never in what the search computes.
+
+**Metrics.** Self-play's `eval_cache` (when on): `hits` (rows answered from a cache by this machine's
+driver), `leaves` (leaves expanded at once), `partial` (leaves that sent one row and took the other from the
+cache), `clears` (caches emptied because full), `share` = hits / (hits + rows sent).
+
+**Costs.** Per row, one 128-bit hash of its features (`obs_hash` skips all-zero blocks of 64 floats) and a
+hash-map lookup, on the driver's search threads. Memory: N answers per game in flight (~100 bytes each plus
+the priors): N 8,192 at 768 games in flight is at most ~0.7 GB.
+
+**Measured.**
+
+* *How many rows repeat* (2026-11-03; MTG Zero's Delver line r3-2b-float550, gen 960, its self-play seat
+  exactly - 64 / 16 simulations, p_full 0.25, 4 minor, root noise, root belief, root-view leaf values,
+  redeterminized worlds - 48 games on the CPU, every leaf batch's rows hashed before the network answered:
+  E:/mtg-zero-scratch/state-dedup/): 520,304 rows; repeats of a row from earlier in the same game 33.8% (one
+  search 25.2%): value-only 62.6%, leaf 19.0%, belief 100%; none across games. By decider: the root decider's
+  own decisions 34.0%, the other seat's 3.8% - hidden information (each simulation deals the other seat a new
+  hand). Equal features always had equal options. The permanents in a canonical order (cross-references
+  relabelled) add 0.6 points.
+* *Throughput* (2026-11-03, the desktop's RTX 5090 alone - the run stopped -, MTG Zero main 37d6574 on this core,
+  E:/mtg-zero-scratch/state-dedup/gpu_timing.py): the Delver line's self-play seat with its gen 1000, a rolling
+  driver as the run's local one (768 games in flight, 8 threads, 2 groups, sparse batches, token CUDA graphs),
+  256 games to warm up, then 640 timed; off / on alternately, each pair on one seed:
+
+  | eval_cache | games/s | simulations/s | rows sent/s | rows cached | leaves at once / in part | avg batch |
+  |---|---:|---:|---:|---:|---:|---:|
+  | 0 | 10.67, 10.44 | 73.7k, 72.6k | 108.7k, 107.1k | - | - | 577 |
+  | 8192 | **14.29, 14.00** | 99.5k, 97.8k | 97.2k, 95.4k | 34.0%, 34.1% | 0.81M / 1.38M per 640 games | 465 |
+
+  +34% games a second (10.55 -> 14.15); the cache was emptied ~0.3 times a game (some games pass 8,192 answers).
+* *The toy* (`driver::tests`): ToyGame self-play at 32 simulations 21,630 rows -> 15,750 sent (27% cached);
+  with root-view values 33,871 -> 27,631 (value-only 11,446 -> 10,657).
+
+**Checks.** cargo test 106 + webnet 3 on the desktop (the four eval-cache tests, docs/search.md 3.12; the
+driver's golden records and matches unchanged with the cache off); on the MacBook the ten golden tests fail
+alike on main 96f1566 and on this branch, with the same digests (the goldens are the desktop's floats);
+pytest `test_loop.py::test_eval_cache_setting`.

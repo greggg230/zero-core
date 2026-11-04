@@ -2334,3 +2334,209 @@ fn gumbel_with_a_root_belief() {
     assert_eq!(rows0, (0, 0));
     assert_ne!(records_digest(&s0), records_digest(&s1), "the belief changed nothing in the Gumbel searches");
 }
+
+// ---- the evaluation cache (NnSeat::eval_cache, docs/search.md 3.12) ----
+
+fn with_cache(seat: SeatCfg, n: u32) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.eval_cache = n;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+/// A batch's features dense (a sparse batch's non-zeros scattered).
+fn dense_x(b: &Batch, f: usize) -> Vec<f32> {
+    if b.xs_off.is_empty() {
+        return b.x.clone();
+    }
+    let mut x = vec![0.0; b.b * f];
+    for r in 0..b.b {
+        for k in b.xs_off[r] as usize..b.xs_off[r + 1] as usize {
+            x[r * f + b.xs_idx[k] as usize] = b.xs_val[k];
+        }
+    }
+    x
+}
+
+/// `answer_skewed` (priors and value functions of the row alone) shifted by `salt` (a network id, an
+/// evaluator key): what a cache would answer wrongly if it kept another network's answers.
+fn answer_salted<G: SearchGame>(d: &mut Driver<G>, b: &Batch, salt: f32) {
+    let f = G::NUM_FEATURES;
+    let x = dense_x(b, f);
+    let mut pri = Vec::new();
+    let mut v = vec![0.0; b.b * MAX_SEATS];
+    for r in 0..b.b {
+        let row = &x[r * f..(r + 1) * f];
+        let h: f32 = row.iter().enumerate().map(|(i, x)| x * ((i * 5 % 11) as f32 - 5.0)).sum();
+        let (lo, hi) = (b.opt_off[r] as usize, b.opt_off[r + 1] as usize);
+        let e: Vec<f32> = b.opt_action[lo..hi].iter().map(|&a| (1.5 * (a as f32 * 1.7 + h * 0.3 + salt).sin()).exp()).collect();
+        let t: f32 = e.iter().sum();
+        pri.extend(e.iter().map(|x| x / t));
+        let n = b.n_players[r] as usize;
+        let h: f32 = row.iter().enumerate().map(|(i, x)| x * ((i * 7 % 13) as f32 - 6.0)).sum();
+        let w = 1.0 / (1.0 + (-h * 0.1 - salt).exp());
+        v[r * MAX_SEATS] = w;
+        for j in 1..n {
+            v[r * MAX_SEATS + j] = (1.0 - w) / (n - 1) as f32;
+        }
+    }
+    d.submit(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS]).unwrap();
+}
+
+/// The records' digest as a multiset (each record's digest, sorted, digested): the evaluation cache changes
+/// when games finish, so the order their records come out in, never the records.
+fn records_set_digest(recs: &[Record]) -> u64 {
+    let mut each: Vec<u64> = recs.iter().map(|r| records_digest(std::slice::from_ref(r))).collect();
+    each.sort_unstable();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for v in each {
+        for x in v.to_le_bytes() {
+            h ^= x as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+/// Self-play / a match of `seats` (keys "a", "b" when two) on ToyGame answered by `answer_salted` (salt =
+/// the batch's key) -> (results digest, records digest (a multiset), rows sent, value-only rows sent, stats).
+fn cache_run(seats: Vec<SeatCfg>, games: usize, sparse: bool) -> (u64, u64, u64, u64, DriverStats) {
+    let two = seats.len() == 2;
+    let keys: &[(&str, KeyKind)] = if two { &[("a", KeyKind::Nn), ("b", KeyKind::Nn)] } else { &[("m", KeyKind::Nn)] };
+    let table = (0..games).map(|g| if !two { vec![0, 0] } else if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+    let mut c = cfg(seats, table, keys);
+    c.sparse = sparse;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    let (mut res, mut smp, mut rows, mut vrows) = (Vec::new(), Vec::new(), 0u64, 0u64);
+    while let Some(b) = d.next_batch(true).unwrap() {
+        rows += b.b as u64;
+        vrows += b.extra.iter().filter(|&&e| e == ROW_VALUE).count() as u64;
+        answer_salted(&mut d, &b, b.key as f32);
+        res.extend(d.take_results());
+        smp.extend(d.take_samples());
+    }
+    res.extend(d.take_results());
+    smp.extend(d.take_samples());
+    res.sort_by_key(|r| r.gid);
+    (results_digest(&res), records_set_digest(&smp), rows, vrows, d.stats())
+}
+
+#[test]
+fn the_eval_cache_plays_the_same_games_with_fewer_rows() {
+    // An evaluator whose answer is a function of the row alone: the cache changes which rows are sent,
+    // never an answer -> the same games and training records bit for bit, every row either sent or
+    // answered from the cache, as many simulations; dense and sparse batches; a tiny cache (emptied
+    // when full) too
+    let seat = |n: u32| with_cache(nn(0, 32, true), n);
+    let (r0, s0, n0, _, st0) = cache_run(vec![seat(0)], 40, false);
+    assert_eq!((st0.cache_hits, st0.cache_leaves, st0.cache_clears), (0, 0, 0));
+    for (cap, sparse) in [(1 << 20, false), (1 << 20, true), (3, false)] {
+        let (r1, s1, n1, _, st1) = cache_run(vec![seat(cap)], 40, sparse);
+        eprintln!("eval_cache {cap} (sparse {sparse}): {n1} rows sent of {n0}, {} answered from the cache, {} leaves at once, {} clears", st1.cache_hits, st1.cache_leaves, st1.cache_clears);
+        assert_eq!((r1, s1), (r0, s0), "eval_cache {cap}: other games");
+        assert_eq!(st1.sims, st0.sims);
+        assert_eq!(n1 + st1.cache_hits, n0, "every row sent or cached");
+        assert!(st1.cache_hits > 0 && st1.cache_leaves > 0, "no hits: the test proves nothing");
+        assert_eq!(st1.leaves + st1.cache_leaves, st0.leaves);
+        assert_eq!(st1.cache_clears > 0, cap == 3);
+        assert_eq!(st1.cache_partial, 0, "a leaf of one row answered in part");
+    }
+}
+
+#[test]
+fn the_eval_cache_keeps_each_networks_answers_apart() {
+    // a match: each evaluator key its own answers (the salt); a cache shared by the keys would answer one
+    // network's rows with the other's
+    let s = |k: u16, n: u32| with_cache(nn(k, 24, false), n);
+    let (r0, s0, n0, _, _) = cache_run(vec![s(0, 0), s(1, 0)], 24, false);
+    let (r1, s1, n1, _, st1) = cache_run(vec![s(0, 4096), s(1, 4096)], 24, false);
+    assert_eq!((r1, s1), (r0, s0));
+    assert!(st1.cache_hits > 0 && n1 + st1.cache_hits == n0);
+    // rolling phases with a new network every other phase (games in flight across the change: their
+    // searches start again): the network id is in every key and the new search epoch empties the
+    // caches, so after the last change every game's cache holds the new network's answers alone. (The
+    // games themselves are not compared with a run without the cache: the cache changes when games
+    // finish, so which games a phase's quota ends and which are in flight at a change.)
+    let mut c = cfg(vec![with_cache(nn(0, 16, true), 4096)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    c.concurrency = 12;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    for phase in 0..4u32 {
+        let net = phase / 2;
+        d.resume(10, net).unwrap();
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer_salted(&mut d, &b, net as f32 * 0.7);
+            d.take_results();
+            d.take_samples();
+        }
+    }
+    let st = d.stats();
+    assert!(st.cache_hits > 0 && st.epoch == 1 && st.restarts > 0, "hits {}, epoch {}, restarts {}", st.cache_hits, st.epoch, st.restarts);
+    let (mut held, mut stale) = (0, 0);
+    for g in &d.sh.groups {
+        for ch in &g.chunks {
+            for slot in &lock(ch).slots {
+                held += slot.cache.len();
+                stale += slot.cache.keys().filter(|k| k.1 != 1).count();
+            }
+        }
+    }
+    assert!(held > 0 && stale == 0, "{held} answers held, {stale} of the old network's");
+}
+
+#[test]
+fn the_eval_cache_with_root_view_value_rows() {
+    // LeafView::Root: another seat's leaf sends its own row (priors) and a value-only row of the root
+    // decider; each is looked up alone, so a leaf may send one of them (the other cached), both or none.
+    // The same games and records bit for bit; value-only rows cached too
+    let seat = |n: u32| with_cache(with_view(nn(0, 32, true), LeafView::Root, 0.0, ViewTarget::NextQ), n);
+    let (r0, s0, n0, v0, _) = cache_run(vec![seat(0)], 40, false);
+    let (r1, s1, n1, v1, st1) = cache_run(vec![seat(4096)], 40, false);
+    eprintln!("root view: {n1} rows sent of {n0} ({v1} value-only of {v0}), {} cached, {} leaves at once", st1.cache_hits, st1.cache_leaves);
+    assert_eq!((r1, s1), (r0, s0));
+    assert_eq!(n1 + st1.cache_hits, n0);
+    assert!(v0 > 0 && v1 < v0, "no value-only row cached");
+    assert!(st1.cache_partial > 0, "no leaf answered in part");
+}
+
+#[test]
+fn the_eval_cache_with_root_view_rows_and_the_belief() {
+    // HiddenMull with root-view values and the root's belief: fresh roots whose leaf is cached send their
+    // belief row alone (a reused root's way); the same records bit for bit, one belief row per search
+    let run = |n: u32| {
+        let mut c = cfg(vec![with_cache(hmull_belief_seat(64, 1.0, LeafView::Root, true), n)], vec![vec![0, 0]; 200], &[("m", KeyKind::Nn)]);
+        c.seed = 5;
+        let mut d = Driver::<HiddenMull>::new(c).unwrap();
+        let f = HiddenMull::NUM_FEATURES;
+        let (mut smp, mut rows, mut vrows, mut brows) = (Vec::new(), 0u64, 0u64, 0u64);
+        while let Some(b) = d.next_batch(true).unwrap() {
+            let (w, a) = belief_rows_of(&b);
+            brows += (w + a) as u64;
+            rows += b.b as u64;
+            let mut pri = Vec::new();
+            let mut v = vec![0.0; b.b * MAX_SEATS];
+            for r in 0..b.b {
+                let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+                vrows += (b.extra[r] == ROW_VALUE) as u64;
+                let (p, val) = hmull_eval(&b.x[r * f..(r + 1) * f], k);
+                pri.extend(p);
+                v[r * MAX_SEATS..(r + 1) * MAX_SEATS].copy_from_slice(&val);
+            }
+            let aux: Vec<f32> = (0..w + a).flat_map(|_| [0.1f32, 0.9]).collect();
+            d.submit_aux(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS], &aux).unwrap();
+            smp.extend(d.take_samples());
+        }
+        smp.extend(d.take_samples());
+        (records_set_digest(&smp), rows, vrows, brows, d.stats())
+    };
+    let (s0, n0, v0, b0, st0) = run(0);
+    let (s1, n1, v1, b1, st1) = run(4096);
+    eprintln!("hidden mull: {n1} rows sent of {n0} ({v1} value-only of {v0}), {} cached, {} leaves at once", st1.cache_hits, st1.cache_leaves);
+    assert_eq!(s1, s0, "other records");
+    assert_eq!((b1, st1.belief_rows), (b0, st0.belief_rows), "one belief row per search either way");
+    assert_eq!(n1 + st1.cache_hits, n0);
+    assert!(st1.cache_leaves > 0 && v0 > 0, "{} leaves at once, {v0} value-only rows", st1.cache_leaves);
+}
