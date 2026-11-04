@@ -3141,3 +3141,61 @@ fn resign_settings_are_checked() {
     };
     assert!(e.contains("deferred terminals cannot resign"), "{e:?}");
 }
+
+#[test]
+fn sparse_rows_from_encode_sparse_are_the_dense_rows() {
+    // docs/search.md 2.12: a sparse driver reads every row with `encode_sparse` (the default: `encode` +
+    // `sparse_scan`) and keys the evaluation cache by `obs_hash_sparse` of its non-zeros. Batch for batch the
+    // dense driver's rows (densified), the same games and records, the same cache hits (the same keys): leaf
+    // rows, root-view value rows and root belief rows, without and with the cache
+    for cap in [0u32, 4096] {
+        let seat = with_cache(with_view(nn(0, 32, true), LeafView::Root, 0.0, ViewTarget::NextQ), cap);
+        let (r0, s0, n0, v0, st0) = cache_run(vec![seat.clone()], 40, false);
+        let (r1, s1, n1, v1, st1) = cache_run(vec![seat], 40, true);
+        assert_eq!((r1, s1, n1, v1), (r0, s0, n0, v0), "toy, eval_cache {cap}: sparse plays otherwise");
+        assert_eq!((st1.cache_hits, st1.cache_leaves, st1.cache_partial, st1.sims), (st0.cache_hits, st0.cache_leaves, st0.cache_partial, st0.sims));
+        assert!(v0 > 0 && (cap == 0 || st1.cache_hits > 0));
+        let run = |sparse: bool| {
+            let mut c = cfg(vec![with_cache(hmull_belief_seat(64, 1.0, LeafView::Root, true), cap)], vec![vec![0, 0]; 120], &[("m", KeyKind::Nn)]);
+            c.seed = 11;
+            c.sparse = sparse;
+            let mut d = Driver::<HiddenMull>::new(c).unwrap();
+            let f = HiddenMull::NUM_FEATURES;
+            let (mut smp, mut xs, mut kinds) = (Vec::new(), Vec::new(), Vec::new());
+            while let Some(b) = d.next_batch(true).unwrap() {
+                assert_eq!(b.x.is_empty(), sparse);
+                if sparse {
+                    for r in 0..b.b {
+                        let row = &b.xs_idx[b.xs_off[r] as usize..b.xs_off[r + 1] as usize];
+                        assert!(row.windows(2).all(|w| w[0] < w[1]), "a row's indexes not ascending");
+                    }
+                    assert!(b.xs_val.iter().all(|v| v.to_bits() != 0), "a zero in the non-zeros");
+                }
+                let x = dense_x(&b, f);
+                let (w, a) = belief_rows_of(&b);
+                let mut pri = Vec::new();
+                let mut v = vec![0.0; b.b * MAX_SEATS];
+                for r in 0..b.b {
+                    let k = (b.opt_off[r + 1] - b.opt_off[r]) as usize;
+                    let (p, val) = hmull_eval(&x[r * f..(r + 1) * f], k);
+                    pri.extend(p);
+                    v[r * MAX_SEATS..(r + 1) * MAX_SEATS].copy_from_slice(&val);
+                }
+                let aux: Vec<f32> = (0..w + a).flat_map(|_| [0.1f32, 0.9]).collect();
+                d.submit_aux(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS], &aux).unwrap();
+                xs.push(x);
+                kinds.push(b.extra.clone());
+                smp.extend(d.take_samples());
+            }
+            smp.extend(d.take_samples());
+            (records_set_digest(&smp), xs, kinds, d.stats())
+        };
+        let (h0, x0, k0, t0) = run(false);
+        let (h1, x1, k1, t1) = run(true);
+        assert_eq!(x1.len(), x0.len(), "hidden mull, eval_cache {cap}: other batches");
+        assert!(x1 == x0 && k1 == k0, "hidden mull, eval_cache {cap}: other rows");
+        assert_eq!(h1, h0, "hidden mull, eval_cache {cap}: other records");
+        assert_eq!((t1.belief_rows, t1.view_rows, t1.cache_hits, t1.leaves), (t0.belief_rows, t0.view_rows, t0.cache_hits, t0.leaves));
+        assert!(t0.belief_rows > 0 && t0.view_rows > 0 && (cap == 0 || t0.cache_hits > 0));
+    }
+}
