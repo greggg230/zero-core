@@ -3629,6 +3629,14 @@ fn infoset_merge_selfplay_with_gumbel_the_root_floor_and_the_belief() {
     }
     let (again, ..) = hmull_belief_run(seat, 80, 5, &[0.1, 0.9]);
     assert_eq!(records_set_digest(&again), records_set_digest(&recs));
+    // minor decisions (`sims_minor`: their own budget, never recorded) and the playout cap of a merged self-play seat
+    let mut c = cfg(vec![with_minor(sp_seat(16, true, 0.0), Some(2))], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+    c.seed = 2026;
+    let (rows, st, _) = run_rows(&mut Driver::<MinorToy>::new(c.clone()).unwrap(), &toy_hash_ans);
+    let (dec, _) = check_rows(&rows, 24);
+    assert!(dec > 0 && st.minor > 0 && st.merge_links > 0, "{dec} records, {st:?}");
+    c.threads = 1;
+    assert_eq!(rows_digest(&run_rows(&mut Driver::<MinorToy>::new(c).unwrap(), &toy_hash_ans).0), rows_digest(&rows));
 }
 
 #[test]

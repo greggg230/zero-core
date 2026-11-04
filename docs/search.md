@@ -1482,24 +1482,29 @@ information-set MCTS inside the tree (Cowling, Powley & Whitehouse 2012, "Inform
   like any) read and work as before; backup is path-based as before.
 
 **The seat key** `infoset_merge` (bool; `NnSeat::infoset_merge`, the bindings' seat key, `games.nn_seat(
-infoset_merge=)`). Refused without `leaf_value_view` 'root' and on a self-play seat (self-play support is not built:
-see below). The Python reference `mcts.py` has no merged mode: `play.NNSeat(infoset_merge=True)` needs `impl='rs'`
-(the Rust tree; `RsSearch` calls `set_merge`). Run setting `eval_infoset_merge` (docs/az.md 30); h2h
-`--a-infoset-merge / --b-infoset-merge` (or `--infoset-merge`). Off (the default) none of the merge runs: the tree
-of before, bit for bit (the golden records and matches).
+infoset_merge=)`), on evaluation and self-play seats alike (self-play: below). Refused without `leaf_value_view`
+'root'. The Python reference `mcts.py` has no merged mode: `play.NNSeat(infoset_merge=True)` needs `impl='rs'`
+(the Rust tree; `RsSearch` calls `set_merge`). Run settings `eval_infoset_merge` and `selfplay_infoset_merge`
+(docs/az.md 30); h2h `--a-infoset-merge / --b-infoset-merge` (or `--infoset-merge`). Off (the default) none of the
+merge runs: the tree of before, bit for bit (the golden records and matches).
 
 **Driver touch-points** (`driver/worker.rs`): `set_merge(seat.infoset_merge)` after each reset; `tree.leaf_acts(node)`
 in place of `tree.acts(node)` at the leaf's row (two places: with and without the eval cache) and in `apply_eval`'s
-check; `apply` calls `advance_in` with the live game. Stats (`Driver::stats`, the bindings' `stats()`): `merge_links`
-(new child signatures), `merge_merged` (of them, found by observation), `merge_aliases`, `merge_growths` (growth
-leaves; in `leaves` too). Bindings: `SearchTree.set_merge` (a fresh tree only), `merge_on`, `merge_stats()`;
+check; `apply` calls `advance_in` with the live game; the leaf's row of the viewer comes from the merged tree's
+encoding when the walk encoded its leaf (`Tree::leaf_obs`, under Self-play below). Stats (`Driver::stats`, the
+bindings' `stats()`): `merge_links` (new child signatures), `merge_merged` (of them, found by observation),
+`merge_aliases`, `merge_growths` (growth leaves; in `leaves` too), `merge_shared` (leaf rows of the viewer taken from
+the tree's encoding). Bindings: `SearchTree.set_merge` (a fresh tree only), `merge_on`, `merge_stats()`;
 `simulate` gives a growth leaf's options and `expand` takes them; `advance` uses `advance_in`.
 
 **Costs.** One `encode_sparse(viewer)` + `obs_hash_sparse` per new signature (about one per walk), a hash-map lookup,
 a link per new signature (its key and options), and per stat 16 bytes of side statistics; nothing per known link. A
 merged walk that reaches a known information set walks on, so a search's walks are deeper (more nodes per walk on
-the path, PUCT at each). With root-view values the driver encodes the same viewer row again at another seat's leaf
-for its value-only row (not shared with the tree's yet).
+the path, PUCT at each). The driver used to encode the leaf's row of the viewer again (another seat's leaf's
+value-only row, a viewer's leaf's own row); since the self-play build it takes the tree's encoding of it
+(`Tree::leaf_obs`), so a merged walk's extra encodes are its merges and `advance_in`'s lookups. Merged walks send more
+distinct rows per simulation (fewer re-expanded information sets for the evaluation cache to answer: measured under
+Self-play).
 
 **Tests** (`tree::tests`, `driver::tests`, pytest `tests/test_infoset_merge.py`). A new test game `counter_game`
 (`#[cfg(test)]`): seat 1 holds hidden Daze / Force (1/2 each); seat 0 casts or holds for R rounds; a cast is answered
@@ -1528,6 +1533,23 @@ spec `{"rounds", "forget"}` (forgetful features repeat observations along a line
   `infoset_merge_survives_rolling_network_changes` (restarts from fresh merged trees).
 * pytest: the seat dict and the run setting (validated, '-ism' in the Elo pool's name), the tree bindings, the Rust
   driver's and the Python driver's ('rs') merged seats, h2h's flags, tags and `merge` counters.
+* Self-play (`driver::tests`, 2026-11-04): `infoset_merge_needs_root_view_values` (evaluation and self-play seats),
+  `infoset_merge_selfplay_records_are_valid_and_reproduce` (the counter game, a merged self-play seat on both sides
+  with its playout cap, root noise, temperature and value-only samples 0 / 1: pi a distribution over the options, q in
+  range, z the result from the record's player's view, every game over; the same rows across 1 / 2 / 4 threads and
+  with the evaluation cache; merges, growth leaves, aliases (forgetful games) and shared rows happen; other records
+  than unmerged self-play), `infoset_merge_selfplay_with_gumbel_the_root_floor_and_the_belief` (also the hidden-hand
+  mulligan's root belief, and minor decisions with their own budget), `infoset_merge_shares_the_leaf_encoding_byte_
+  for_byte` (every batch the same bytes with the reuse switched off - dense and sparse, eval cache 0 / 256, counter and
+  toy -, the same games and records; 91-92% of the leaves take the tree's encoding),
+  `infoset_merge_selfplay_resigns_and_branches` (a resigned game is its dry twin up to the firing search, z the
+  resignation's; branches of resigning games reproducible across threads), `infoset_merge_selfplay_rolling_quotas_and_
+  network_changes` (counter and toy, resignation on, the network changing every other phase: every phase its quota,
+  every game counted once, restarts from fresh merged trees). pytest `tests/test_infoset_merge.py`: the run setting
+  (validated; `Run.nn_seat` gives it to the self-play seat only; off = the seat dict of before), the bindings' merged
+  self-play records (valid, the same across threads), a rolling toy run (exact quotas with resignation and value-only
+  samples, the `selfplay.merge` metrics; refused without root-view values; no metrics when off), remote self-play (the
+  workers merge: no refusal, exact quotas) and an older worker refused.
 
 **Measured** (2026-11-04, the desktop CPU at idle priority beside the live A/B - timings loaded; r3-2b-float550 gen
 1000 with its config; E:/mtg-zero-scratch/ideas-4b/, its NOTES.md):
@@ -1565,18 +1587,79 @@ spec `{"rounds", "forget"}` (forgetful features repeat observations along a line
   `cq-n4-v50-s0.3-rv-b1m0.25-ism` / `cq-n4-v50-s0.3-rv-b1m0.25` (the run's evaluation pool), `merge` {links 1,789,
   merged 264, aliases 2, growths 98}. MTG Zero e098aff with this core: the engine digest f6543eb2b1b8752f unchanged.
 
-**Not built: self-play.** Missing for a self-play seat: lifting `Driver::new`'s refusal and a run setting
-`selfplay_infoset_merge`; tests of recorded self-play with it (records reproducible across threads, value-only samples
-and resignation reading a merged root - both read the root only); the remote self-play machine's core; and the cost
-in self-play throughput (one extra viewer encode per walk, see Costs - sharing the tree's row with the value-only row
-would remove most of it). Training on merged searches is a self-play A/B of its own, after the evaluation-only match.
+**Self-play** (2026-11-04, zero-core `feat/infoset-merge-selfplay`; built after the evaluation-only match came out
++9.3 +- 5.3 Elo at 2,400 paired games on MTG Zero's Delver mirror, above the +7 of its stop rule). `Driver::new` no
+longer refuses the key on a self-play seat (root-view leaf values are still required); run setting
+`selfplay_infoset_merge` (docs/az.md 30.1). Every search of the seat merges (full, fast, minor). What it composes with:
+
+* *The recorded policy target* ('visits', 'cq' with `cq_prior_w`), *the root value q*, *value-only samples*
+  (`view_samples` and their `next_q`), *self-play resignation* (3.14: the root win vector of its full searches) and
+  *the move* (temperature, the move rule, the Gumbel root's choice) read the root only - its options' visits and
+  values, `win(root)`, `root_win_pruned`, `gumbel_q` - and the root is the viewer's node, never merged into, whose
+  statistics are the same kind as before. Merging changes what flows into them (the values of the subtrees below the
+  root), which is the point; their formulas are untouched.
+* *Root noise* (Dirichlet on a full search's root expansion or reused root; Gumbel noise), *the root floor* (3.5),
+  *the root's belief* (3.8: the root's features, one row per search; a growth leaf is never the root), *the evaluation
+  cache* (3.12: a growth leaf's row is keyed with its world's options), *playout-cap fast searches* and *minor searches*
+  (a budget; the same tree), *tree reuse* (`advance_in`), *rolling restarts on a new network* (`restart_search`: reset
+  + `set_merge`), *branched games and archive starts* (2.11: a deviation search is the root's own evaluation;
+  `start_dev` calls `set_merge` after its reset; a branch starts with fresh trees): each tested below.
+* *Remote self-play* (`zero/remoteplay.py`): a worker's hello reports `merge` ('ism' when its checkout's
+  `selfplay_infoset_merge` is on); a worker that does not - an older checkout would search its games unmerged in
+  silence - is refused (REFUSED in the run's log, killed, retried in 10 minutes), as resignation's and the belief's
+  settings are. Remote evaluation needs no new guard: its result names the move rule as the remote's checkout computed
+  it (`elo.eval_tag`, '-ism'), and another name is refused.
+* *Refused or untested:* the Python reference tree (`mcts.py`; `play.NNSeat(impl='py')` refuses the key) and a seat
+  without root-view values are refused. Not tested with merging: team games (`toy_team`), deferred terminals
+  (co-training; a merged tree keeps deferred nodes unmerged), the self-play league (its seats are the self-play seat's).
+
+*The leaf's row of the viewer from the tree's encoding* (the saving Costs named). The merged tree encodes the reached
+state from the viewer's view at each new signature (its observation key), and nearly every leaf is reached through
+one (a new node, an alias, a growth leaf). `Tree::leaf_obs(node)` returns those features (`encode_sparse(viewer)`'s
+pairs) when the walk's last new signature encoded its leaf (`Merge::enc_node`: set by `merged_child` after an encode;
+cleared at the walk's start, at every encode and by `advance_in`; a compacted tree starts without one), None otherwise
+(off, the root's own evaluation, a known link). The driver takes the leaf's row of the viewer from it - the leaf's own
+row at a viewer's leaf, the root-view value-only row at another seat's - instead of encoding the state again
+(`LeafBuf::push_pairs`: a sparse batch appends the pairs, a dense one scatters them into zeros), the same row bit for
+bit by `encode_sparse`'s contract (2.12). Off, `leaf_obs` is None: the path of before. Counted as `merge_shared`.
+On the way: the worker flushed its merge counters only for a chunk that made a link, so aliases made through known
+links went uncounted (`merge_aliases` differed across thread counts; the games never did) - fixed.
+
+*Measured* (2026-11-04; MTG Zero's Delver mirror: the run's self-play seat and driver built by `zero.run` from gen
+1000's config with eval_cache 8192 - full 64 / fast 16 at p_full 0.25 / minor 4 simulations, root noise, the root
+belief, root-view values, value-only samples 0.5, 'cq' targets -, the gen-1000 network on the CPU, 24 games in flight,
+2 threads x 2 groups, sparse batches; one process alternating off / on, 8 configurations of 12 timed games; the desktop
+at idle priority beside the live run, so the timings are loaded; E:/mtg-zero-scratch/ideas-4c/throughput.py):
+
+| per simulation | off | on |
+|---|---:|---:|
+| rows sent (leaf + value-only + belief) | 0.988 | **1.200 (+21.5%)** |
+| leaf rows / value-only rows sent | 0.790 / 0.188 | 0.874 / 0.317 |
+| rows answered by the evaluation cache | 0.503 | 0.293 |
+| rows needed (sent + cached) | 1.490 | 1.493 |
+| encodes (rows + the tree's observations) | 1.490 | 1.768 (+19%; 2.726 = +83% without the reuse) |
+| links / merges / growth leaves / shared rows | - | 1.234 / 0.400 / 0.125 / 0.959 |
+| search-thread time (driver `busy_s` / sims), median (min) of 4 | 99.0 (84.9) us | **140.1 (113.0) us (+42%, +33%)** |
+| simulations per wall second, the CPU network included, median of 4 | 1,008 | 723 (-28%) |
+
+A merged simulation needs the same rows, but fewer of them are answered by the evaluation cache - the repeats it used
+to answer (re-expansions of a held information set) are merged away and the walk goes on to a new information set -
+so it sends 21.5% more network rows: on a GPU-bound self-play, ~20% more evaluator time per game. The reuse of the
+tree's encoding takes 0.96 encodes per simulation off (the merged search's extra encodes +19% instead of +83%); the
+search threads' remaining extra time (longer walks, link lookups, subset-armed selection, more sent rows' bookkeeping)
+was +33-42% under this load (the threads 5% busy, preempted by the live run: a noisy number). Every game finished
+and every record checked valid (pi a distribution over two or more options, q in range, z the result from the
+record's player's view): 634 + 318 value-only records per 12 games off, 607 + 301 on, the same in each repeat.
+
+Training on merged searches is the self-play A/B (docs/az.md 30.1).
 
 Code: `tree.rs` (`Tree::merge`, the simulate loop's merged branch, `expand`'s growth, `kids` / `kid_ids` /
-`compact` dispatch), `tree/merge.rs` (`Merge`, `Link`, `MergeStats`, `set_merge`, `leaf_acts`, `merged_child`,
-`select_avail`, `grow`, `advance_in`, `compact_merged`, `avail`, `in_links`), `counter_game.rs`, `driver.rs`
-(`NnSeat::infoset_merge`, the checks, the stats), `driver/worker.rs`, `dynapi.rs` and the bindings; Python
-`games.nn_seat`, `mcts.check_merge` / `merge_tag`, `play.NNSeat` / `RsSearch`, `run.py` (`eval_infoset_merge`),
-`elo.eval_tag`, `h2h.py`.
+`compact` dispatch), `tree/merge.rs` (`Merge`, `Link`, `MergeStats`, `set_merge`, `leaf_acts`, `leaf_obs`,
+`merged_child`, `select_avail`, `grow`, `advance_in`, `compact_merged`, `avail`, `in_links`), `counter_game.rs`,
+`driver.rs` (`NnSeat::infoset_merge`, the checks, the stats, `LeafBuf::push_pairs`), `driver/worker.rs` (`leaf_obs`,
+`encode_leaf_row`), `dynapi.rs` and the bindings; Python `games.nn_seat`, `mcts.check_merge` / `merge_tag`,
+`play.NNSeat` / `RsSearch`, `run.py` (`eval_infoset_merge`, `selfplay_infoset_merge`, `merge_metrics`), `remoteplay.py`
+(`_merge_of`, the hello guard), `elo.eval_tag`, `h2h.py`.
 
 ## 4. Bindings and registering a game
 
