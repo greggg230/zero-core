@@ -54,6 +54,11 @@
 //! unchanged. The final move is `gumbel_choose` (the same score among the options this search
 //! visited most), the root value `gumbel_q` (the improved policy's value). A reused root's earlier
 //! visits count in Q and sigma but not in the schedule (this search's walks are counted apart).
+//!
+//! **Information-set merging** (`Tree::set_merge`, docs/search.md 3.16; off by default, `merge.rs`): an edge's
+//! children become links (the signature above) to nodes merged by the root decider's observation - the tree is
+//! then a DAG, the other seats' nodes subset-armed over the union of their worlds' options. Off, nothing of it
+//! runs: the tree of before, bit for bit.
 use std::hash::{Hash, Hasher};
 
 use crate::game::{Belief, SearchGame, MAX_SEATS};
@@ -64,6 +69,10 @@ const NIL: u32 = u32::MAX;
 /// Node count above which a reused root triggers compaction.
 const COMPACT_AT: usize = 1 << 16;
 
+mod merge;
+pub use merge::MergeStats;
+use merge::Merge;
+
 /// Per-option statistics of an expanded node.
 #[derive(Clone, Copy, Debug)]
 struct Stat {
@@ -71,7 +80,8 @@ struct Stat {
     p0: f32,
     n: u32,
     w: f64,
-    /// First child node of this edge (linked through `Node::next`), or NIL.
+    /// First child node of this edge (linked through `Node::next`), or NIL. In a merged tree: the first link
+    /// (`merge::Link`, linked through `Link::next`).
     kid: u32,
     /// Newest sampled-outcome record (`Tree::outs`, linked), or NIL.
     outs: u32,
@@ -107,7 +117,9 @@ pub enum Sim {
     /// The walk reached an unexpanded node: the scratch game holds the leaf state; the caller
     /// evaluates `encode(player)` and calls `expand_leaf` + `backup` with `leaf_values_team`
     /// (`expand` + `leaf_values` for a game without teams or deferred terminals). A deferred
-    /// terminal's node has no options (no priors).
+    /// terminal's node has no options (no priors). In a merged tree (`set_merge`) the node may be an
+    /// expanded node of another seat whose union lacks one of this world's options (a growth leaf): its
+    /// row's options are `leaf_acts(node)` - always read them there.
     Leaf { node: u32, player: usize },
     /// The walk ended the game (or reached an evaluated deferred terminal); its value was
     /// backed up.
@@ -417,6 +429,8 @@ pub struct Tree<G: SearchGame> {
     belief_mix: f64,
     /// The Gumbel root search of the current search (`set_gumbel`; None = PUCT at the root).
     gumbel: Option<Box<GumbelRoot>>,
+    /// Information-set merging (`set_merge`, docs/search.md 3.16; None = the tree of before).
+    merge: Option<Box<Merge>>,
 }
 
 /// Deal a world for `viewer` (docs/search.md 3.8): `determinize_with` the belief, but a `mix` share
@@ -451,6 +465,7 @@ impl<G: SearchGame> Default for Tree<G> {
             belief: None,
             belief_mix: 0.0,
             gumbel: None,
+            merge: None,
         }
     }
 }
@@ -474,6 +489,8 @@ impl<G: SearchGame> Tree<G> {
         self.acts.clear();
         self.keys.clear();
         self.outs.clear();
+        // (the merge state goes: `set_merge` after a reset turns it on again, docs/search.md 3.16)
+        self.merge = None;
         self.root = self.push_node(&[], viewer, legal, 0);
         self.set_root_min(0);
         self.belief = None;
@@ -748,6 +765,9 @@ impl<G: SearchGame> Tree<G> {
             vec: [0.0; MAX_SEATS],
             wsum: [0.0; MAX_SEATS],
         });
+        if let Some(m) = self.merge.as_mut() {
+            m.pushed();
+        }
         id
     }
 
@@ -864,6 +884,10 @@ impl<G: SearchGame> Tree<G> {
         let so = self.nodes[node as usize].stat_off;
         if so == NIL {
             return out;
+        }
+        if self.merge.is_some() {
+            // (a merged tree: the edge's links, newest first - their signature's key and the node they lead to)
+            return self.edge_links(node, i).into_iter().map(|l| (self.link_key(l).to_vec(), self.link_node(l))).collect();
         }
         let mut k = self.stats[so as usize + i].kid;
         while k != NIL {
@@ -997,6 +1021,16 @@ impl<G: SearchGame> Tree<G> {
         if so == NIL {
             return out;
         }
+        if self.merge.is_some() {
+            // (a merged tree: the distinct nodes the edge's links lead to)
+            for l in self.edge_links(node, i) {
+                let c = self.link_node(l);
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+            return out;
+        }
         let mut k = self.stats[so as usize + i].kid;
         while k != NIL {
             out.push(k);
@@ -1045,6 +1079,9 @@ impl<G: SearchGame> Tree<G> {
     {
         sc.path.clear();
         self.walk_forced = NIL;
+        if let Some(m) = self.merge.as_mut() {
+            m.grow_node = NIL;
+        }
         g.clone_from(self.base.as_ref().unwrap_or(live));
         if self.redet {
             deal(g, self.viewer, self.belief.as_ref(), self.belief_mix, rng);
@@ -1059,10 +1096,13 @@ impl<G: SearchGame> Tree<G> {
             if !self.expanded(node) {
                 return Ok(Sim::Leaf { node, player: self.player(node) });
             }
+            // (a merged tree's node of another seat: subset-armed over this world's options, sc.legal)
+            let subset = self.merge.is_some() && self.player(node) != self.viewer;
             let i = match hook(self, node, g) {
                 Some(i) => i,
                 // (the Gumbel root search, docs/search.md 3.7: sequential halving at the root, PUCT below)
                 None if node == self.root && self.gumbel.is_some() => self.gumbel_select(),
+                None if subset => self.select_avail(node, w.c_puct, &sc.legal),
                 None => {
                     let i = self.select(node, w.c_puct);
                     if self.root_min > 0 && node == self.root {
@@ -1072,6 +1112,9 @@ impl<G: SearchGame> Tree<G> {
                     }
                 }
             };
+            if subset {
+                self.mark_avail(node, &sc.legal);
+            }
             sc.path.push((node, i as u32));
             let si = self.nodes[node as usize].stat_off as usize + i;
             let st = self.stats[si];
@@ -1112,13 +1155,17 @@ impl<G: SearchGame> Tree<G> {
                     // network, its stored value backed up on every later visit (module docs)
                     let v = self.viewer;
                     let h = sig_hash(&sc.key, v, &[]);
-                    let k = match self.find_kid(node, i, &sc.key, v, &[], h) {
-                        Some(k) => k,
-                        None => {
-                            let k = self.push_node(&sc.key, v, &[], h);
-                            self.nodes[k as usize].next = self.stats[si].kid;
-                            self.stats[si].kid = k;
-                            k
+                    let k = if self.merge.is_some() {
+                        self.deferred_child(node, i, &sc.key, h)
+                    } else {
+                        match self.find_kid(node, i, &sc.key, v, &[], h) {
+                            Some(k) => k,
+                            None => {
+                                let k = self.push_node(&sc.key, v, &[], h);
+                                self.nodes[k as usize].next = self.stats[si].kid;
+                                self.stats[si].kid = k;
+                                k
+                            }
                         }
                     };
                     if !self.expanded(k) {
@@ -1134,6 +1181,15 @@ impl<G: SearchGame> Tree<G> {
                 return Ok(Sim::Terminal);
             };
             let h = sig_hash(&sc.key, p, &sc.legal);
+            if self.merge.is_some() {
+                // (docs/search.md 3.16: a known link, else the reached observation's node; a growth leaf ends the walk)
+                let (k, grow) = self.merged_child(node, i, h, g, sc);
+                if grow {
+                    return Ok(Sim::Leaf { node: k, player: p });
+                }
+                node = k;
+                continue;
+            }
             node = match self.find_kid(node, i, &sc.key, p, &sc.legal, h) {
                 Some(k) => k,
                 None => {
@@ -1148,6 +1204,11 @@ impl<G: SearchGame> Tree<G> {
 
     /// Expand `node` with the network's priors over its options and utility vector.
     pub fn expand(&mut self, node: u32, priors: &[f32], util: &[f64; MAX_SEATS]) {
+        if self.merge.as_ref().is_some_and(|m| m.grow_node == node) && self.expanded(node) {
+            // (a merged tree's growth leaf: its union grows, this world's priors join the means)
+            self.grow(node, priors);
+            return;
+        }
         let nd = &self.nodes[node as usize];
         debug_assert_eq!(nd.stat_off, NIL, "node expanded twice");
         debug_assert_eq!(priors.len(), nd.nacts as usize);
@@ -1159,6 +1220,9 @@ impl<G: SearchGame> Tree<G> {
         nd.stat_off = off;
         nd.vec = *util;
         nd.wsum = [0.0; MAX_SEATS];
+        if let Some(m) = self.merge.as_mut() {
+            m.expanded(priors);
+        }
     }
 
     /// `expand` that also keeps the leaf's win vector: a deferred terminal's node (no options)
@@ -1257,6 +1321,10 @@ impl<G: SearchGame> Tree<G> {
 
     /// Copy the subtree under `root` into fresh arrays (drops the garbage above it).
     pub fn compact(&mut self) {
+        if self.merge.is_some() {
+            // (a DAG: each reachable node once, docs/search.md 3.16)
+            return self.compact_merged();
+        }
         let mut t: Tree<G> = Tree {
             viewer: self.viewer,
             redet: self.redet,

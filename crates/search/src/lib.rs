@@ -30,6 +30,9 @@ pub(crate) mod mull_game;
 // a test game for the lookahead (docs/search.md 3.9): looking is worth something per information set
 #[cfg(test)]
 pub(crate) mod peek_game;
+// a test game for information-set merging (docs/search.md 3.16): the other seat's options depend on its hidden hand
+#[cfg(test)]
+pub(crate) mod counter_game;
 
 pub use game::{belief_weight, team_of, Belief, Bot, SearchGame, MAX_SEATS};
 pub use rng::Rng;

@@ -1052,3 +1052,416 @@ fn gumbel_measures_the_starved_mulligan() {
         }
     }
 }
+
+// ------------------------------------------------------------------ information-set merging (docs/search.md 3.16)
+
+use crate::counter_game::{counter_eval, Counter, ALLOW, CAST, DAZE, FORCE, HOLD};
+
+/// A backed-up walk: its path, utility and win vectors.
+type Backup = (Vec<(u32, u32)>, [f64; MAX_SEATS], [f64; MAX_SEATS]);
+
+/// A row's stand-in network for a game: (priors over `opts`, value relative to `viewer`).
+type Net<'a, G> = &'a dyn Fn(&G, usize, &[u16]) -> (Vec<f32>, [f32; MAX_SEATS]);
+
+fn counter_net(g: &Counter, viewer: usize, opts: &[u16]) -> (Vec<f32>, [f32; MAX_SEATS]) {
+    let mut x = [0.0f32; 8];
+    g.encode(viewer, &mut x);
+    counter_eval(&x, opts)
+}
+
+fn toy_net(g: &ToyGame, viewer: usize, opts: &[u16]) -> (Vec<f32>, [f32; MAX_SEATS]) {
+    let (pri, v, _) = eval(g, viewer, opts);
+    let pri = if opts.is_empty() { Vec::new() } else { pri };
+    (pri, v)
+}
+
+/// `sims` simulations with root-view leaf values (the driver's `LeafView::Root`): a leaf's priors from its
+/// decider's row over `leaf_acts`, its value from the viewer's row; every backup appended to `log`. -> terminal walks.
+fn rv_search<G: SearchGame>(t: &mut Tree<G>, live: &G, sims: usize, rng: &mut Rng, w: &Walk, net: Net<G>, log: &mut Vec<Backup>) -> usize {
+    let mut g = live.clone();
+    let mut sc = Scratch::default();
+    let mut terminals = 0;
+    for _ in 0..sims {
+        match t.simulate(live, &mut g, rng, w, &mut sc).unwrap() {
+            Sim::Terminal => {
+                terminals += 1;
+                let (util, win) = terminal_values(&g, w.margin_w);
+                log.push((sc.path.clone(), util, win));
+            }
+            Sim::Leaf { node, player } => {
+                let (pri, _) = net(&g, player, t.leaf_acts(node));
+                assert_eq!(pri.len(), t.leaf_acts(node).len());
+                let (_, v) = net(&g, t.viewer, &[]);
+                let (util, win) = leaf_values(&v, &[0.0; MAX_SEATS], t.viewer, t.n, w.margin_w);
+                t.expand_leaf(node, &pri, &util, &win);
+                t.backup(&sc.path, &util, &win);
+                log.push((sc.path.clone(), util, win));
+            }
+        }
+    }
+    terminals
+}
+
+/// The statistics of a fresh tree recounted from its backed-up walks: N and W per edge, tot and wsum per node,
+/// bit for bit (the same additions in the same order); no walk holds a node twice; every expanded node's N add up
+/// to its tot and its W to its decider's backed-up wins (margin 0, teams of 1); an other seat's merged node never
+/// counts an option's visits above the walks it was available in, nor those above the node's.
+fn recount<G: SearchGame>(t: &Tree<G>, log: &[Backup]) {
+    use std::collections::HashMap;
+    let mut n: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut w: HashMap<(u32, u32), f64> = HashMap::new();
+    let mut tot: HashMap<u32, u32> = HashMap::new();
+    let mut wsum: HashMap<u32, [f64; MAX_SEATS]> = HashMap::new();
+    for (path, util, win) in log {
+        let mut seen = std::collections::HashSet::new();
+        for &(nd, i) in path {
+            assert!(seen.insert(nd), "a walk held node {nd} twice: {path:?}");
+            *n.entry((nd, i)).or_insert(0) += 1;
+            *w.entry((nd, i)).or_insert(0.0) += util[t.player(nd)];
+            *tot.entry(nd).or_insert(0) += 1;
+            let s = wsum.entry(nd).or_insert([0.0; MAX_SEATS]);
+            for j in 0..MAX_SEATS {
+                s[j] += win[j];
+            }
+        }
+    }
+    for nd in 0..t.n_nodes() as u32 {
+        if !t.expanded(nd) || t.is_deferred_leaf(nd) {
+            continue;
+        }
+        let k = t.acts(nd).len();
+        let mut sn = 0;
+        let mut sw = 0.0;
+        for i in 0..k {
+            let key = (nd, i as u32);
+            assert_eq!(t.n_of(nd, i), n.get(&key).copied().unwrap_or(0), "N of node {nd} option {i}");
+            assert_eq!(t.w_of(nd, i).to_bits(), w.get(&key).copied().unwrap_or(0.0).to_bits(), "W of node {nd} option {i}");
+            sn += t.n_of(nd, i);
+            sw += t.w_of(nd, i);
+        }
+        let nt = tot.get(&nd).copied().unwrap_or(0);
+        assert_eq!(t.tot(nd), nt, "tot of node {nd}");
+        assert_eq!(sn, nt, "node {nd}: N add up to tot");
+        if nt > 0 {
+            let ws = wsum[&nd];
+            let mine = t.win(nd).unwrap();
+            for j in 0..t.n {
+                assert!((mine[j] - ws[j] / nt as f64).abs() < 1e-12, "wsum of node {nd}");
+            }
+            assert!((sw - ws[t.player(nd)]).abs() < 1e-9, "node {nd}: W add up to its decider's wins");
+        }
+        if t.merge_on() && t.player(nd) != t.viewer {
+            let av = t.avail(nd);
+            assert_eq!(av.len(), k);
+            for i in 0..k {
+                assert!(av[i] >= t.n_of(nd, i) && av[i] <= t.tot(nd), "node {nd} option {i}: avail {} N {} tot {}", av[i], t.n_of(nd, i), t.tot(nd));
+            }
+        }
+    }
+}
+
+/// A canonical dump of the tree under its root (breadth first through `kids`): per node its decider, options,
+/// backups, win vector and network vector, per option N, W, P, P0, availability, sampled keys and links (key, the
+/// child's dump index) - equal for two trees iff they hold the same search, node ids aside.
+fn dump<G: SearchGame>(t: &Tree<G>) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut idx: HashMap<u32, usize> = HashMap::new();
+    let mut order = vec![t.root];
+    idx.insert(t.root, 0);
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < order.len() {
+        let nd = order[k];
+        k += 1;
+        let mut s = format!("p{} acts{:?} tot{} win{:?} vec{:?} av{:?}", t.player(nd), t.acts(nd), t.tot(nd), t.win(nd), t.vec_of(nd), t.avail(nd));
+        if t.expanded(nd) {
+            let pr = t.priors(nd);
+            for i in 0..t.acts(nd).len() {
+                s += &format!(" |{i}: n{} w{} p{} p0{} outs{:?}", t.n_of(nd, i), t.w_of(nd, i).to_bits(), pr[i].to_bits(), t.p0_of(nd, i).to_bits(), t.outs(nd, i));
+                for (key, c) in t.kids(nd, i) {
+                    let next = order.len();
+                    let j = *idx.entry(c).or_insert_with(|| {
+                        order.push(c);
+                        next
+                    });
+                    s += &format!(" {key:?}->{j}");
+                }
+            }
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// Seat 0's node of the next round under (node, option i) of a counter tree (a child decided by seat 0).
+fn seat0_kid(t: &Tree<Counter>, node: u32, i: usize) -> Option<u32> {
+    t.kids(node, i).into_iter().map(|(_, c)| c).find(|&c| t.player(c) == 0)
+}
+
+#[test]
+fn set_merge_takes_a_fresh_tree_and_reset_turns_it_off() {
+    let g = Counter::with_hand(true, false);
+    let mut rng = Rng::new(1);
+    let mut t = Tree::new(&g, 0, &[CAST, HOLD], true, &mut rng);
+    assert!(!t.merge_on() && t.merge_stats().is_none());
+    t.set_merge(true).unwrap();
+    assert!(t.merge_on());
+    let mut log = Vec::new();
+    rv_search(&mut t, &g, 10, &mut rng, &W, &counter_net, &mut log);
+    assert!(t.set_merge(false).is_err(), "a tree with a search in it");
+    assert!(t.set_merge(true).is_ok(), "already on: nothing to do");
+    t.reset(&g, 0, &[CAST, HOLD], true, &mut rng);
+    assert!(!t.merge_on(), "reset: the tree of before");
+}
+
+#[test]
+fn the_counter_game_merges_the_other_seats_options_and_the_next_round() {
+    // Seat 0 casts or holds; seat 1 answers a cast with ALLOW plus the counters its sampled hand holds (auto-stepped
+    // when it holds none). The tree of before keys seat 1's answer by its option list - three nodes under CAST - and
+    // seat 0's next round under each answer and under the auto-stepped world. Merged: one seat-1 node over the union
+    // {ALLOW, DAZE, FORCE}, its options available in their worlds only, and one seat-0 node of "cast resolved, round
+    // 2" reached from the root's CAST (depth 1) and from seat 1's ALLOW (depth 2).
+    for seed in 0..8u64 {
+        let g = Counter::with_hand(seed % 2 == 0, seed % 3 == 0);
+        let mut rng = Rng::new(seed);
+        let mut t = Tree::new(&g, 0, &[CAST, HOLD], true, &mut rng);
+        t.set_merge(true).unwrap();
+        let mut log = Vec::new();
+        rv_search(&mut t, &g, 300, &mut rng, &W, &counter_net, &mut log);
+        recount(&t, &log);
+        let ms = t.merge_stats().unwrap();
+        assert!(ms.merged > 0 && ms.growths > 0, "{ms:?}");
+        let r = t.root;
+        let ci = t.acts(r).iter().position(|&a| a == CAST).unwrap();
+        let kids = t.kids(r, ci);
+        let opp: Vec<u32> = kids.iter().map(|k| k.1).filter(|&c| t.player(c) == 1).collect();
+        assert!(opp.len() >= 3 && opp.windows(2).all(|w| w[0] == w[1]), "every seat-1 link under CAST leads to one node: {kids:?}");
+        let o = opp[0];
+        let mut union = t.acts(o).to_vec();
+        union.sort_unstable();
+        assert_eq!(union, vec![ALLOW, DAZE, FORCE]);
+        // availability: ALLOW in every world, each counter in about 2/3 of the worlds reaching the node (1/2 of the
+        // deals hold it, 3/4 reach the node)
+        let av = t.avail(o);
+        let ai = t.acts(o).iter().position(|&a| a == ALLOW).unwrap();
+        assert_eq!(av[ai], t.tot(o));
+        for c in [DAZE, FORCE] {
+            let j = t.acts(o).iter().position(|&a| a == c).unwrap();
+            let share = av[j] as f64 / t.tot(o) as f64;
+            assert!((0.45..0.9).contains(&share), "{c}: available in {share} of the walks at the node");
+        }
+        // seat 0's next round after a resolved cast: the auto-stepped world's link under CAST and seat 1's ALLOW
+        let x0 = seat0_kid(&t, r, ci).expect("the auto-stepped world");
+        let x1 = seat0_kid(&t, o, ai).expect("seat 1 allowed");
+        assert_eq!(x0, x1, "one information set of seat 0, two parents at two depths");
+        assert!(t.in_links()[&x0] >= 2);
+        // the unmerged tree: seat 1's answers split by option list, seat 0's next round split with them
+        let mut rng = Rng::new(seed);
+        let mut u = Tree::new(&g, 0, &[CAST, HOLD], true, &mut rng);
+        let mut log = Vec::new();
+        rv_search(&mut u, &g, 300, &mut rng, &W, &counter_net, &mut log);
+        recount(&u, &log);
+        let ukids = u.kids(u.root, ci);
+        let uopp: Vec<u32> = ukids.iter().map(|k| k.1).filter(|&c| u.player(c) == 1).collect();
+        assert!(uopp.len() >= 3);
+        let mut xs: Vec<u32> = uopp
+            .iter()
+            .filter_map(|&o| {
+                let ai = u.acts(o).iter().position(|&a| a == ALLOW)?;
+                seat0_kid(&u, o, ai)
+            })
+            .collect();
+        xs.extend(seat0_kid(&u, u.root, ci));
+        xs.sort_unstable();
+        xs.dedup();
+        assert!(xs.len() >= 3, "the tree of before splits seat 0's next round: {xs:?}");
+        assert!(t.n_nodes() < u.n_nodes(), "merged {} nodes, unmerged {}", t.n_nodes(), u.n_nodes());
+        // the merged node of seat 0's next round has the visits of every world that reached it
+        let ux: u32 = xs.iter().map(|&x| u.tot(x)).sum();
+        assert!(t.tot(x0) as f64 > 0.6 * ux as f64);
+    }
+}
+
+#[test]
+fn merged_trees_recount_exactly_with_chance_noise_floor_and_gumbel() {
+    // fresh merged searches on the toy (chance keys, revelations) and the counter game (growth leaves), PUCT,
+    // root Dirichlet noise, the root floor and the Gumbel root: every statistic recounted from the backups
+    let mut checked = 0;
+    for s in 0..12u64 {
+        for mode in 0..4 {
+            let mut rng = Rng::new(100 + s * 4 + mode);
+            let mut log = Vec::new();
+            if s % 2 == 0 {
+                let g = mid_game(s, 6 + s as usize);
+                if g.over {
+                    continue;
+                }
+                let p = g.to_move().unwrap();
+                let mut t = Tree::new(&g, p, &legal_of(&g), true, &mut rng);
+                t.set_merge(true).unwrap();
+                rv_search(&mut t, &g, 1, &mut rng, &W, &toy_net, &mut log);
+                log.clear();
+                let k = t.acts(t.root).len();
+                match mode {
+                    1 => t.add_noise(t.root, 0.3, 0.25, &mut rng),
+                    2 => t.set_root_min(3),
+                    3 => t.set_gumbel(4, 150, &(0..k).map(|i| i as f64 * 0.1).collect::<Vec<_>>(), 50.0, 1.0),
+                    _ => {}
+                }
+                let w = Walk { c_puct: 1.0, chance_k: (s % 3) as u32, margin_w: 0.0 };
+                rv_search(&mut t, &g, 149, &mut rng, &w, &toy_net, &mut log);
+                recount(&t, &log);
+                if mode == 3 {
+                    assert_eq!(t.gumbel_visits().iter().sum::<u32>(), 149);
+                }
+                if mode == 2 && k <= 49 {
+                    assert!(t.visits(t.root).iter().all(|&n| n >= 3));
+                }
+            } else {
+                let g = Counter::with_hand(s % 4 == 1, s % 3 == 1);
+                let mut t = Tree::new(&g, 0, &[CAST, HOLD], true, &mut rng);
+                t.set_merge(true).unwrap();
+                rv_search(&mut t, &g, 1, &mut rng, &W, &counter_net, &mut log);
+                log.clear();
+                match mode {
+                    1 => t.add_noise(t.root, 0.3, 0.25, &mut rng),
+                    2 => t.set_root_min(40),
+                    3 => t.set_gumbel(2, 200, &[0.3, -0.2], 50.0, 1.0),
+                    _ => {}
+                }
+                rv_search(&mut t, &g, 199, &mut rng, &W, &counter_net, &mut log);
+                recount(&t, &log);
+                assert!(t.merge_stats().unwrap().growths > 0);
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 40, "{checked}");
+}
+
+#[test]
+fn merged_compact_copies_each_node_once_and_searches_on_identically() {
+    for s in 0..6u64 {
+        let g = Counter::with_hand(s % 4 == 0, s % 3 != 1);
+        let mut a = Tree::new(&g, 0, &[CAST, HOLD], true, &mut Rng::new(s));
+        a.set_merge(true).unwrap();
+        let mut rng = Rng::new(7 + s);
+        let mut log = Vec::new();
+        rv_search(&mut a, &g, 120, &mut rng, &W, &counter_net, &mut log);
+        let mut b = a.clone();
+        b.compact();
+        assert_eq!(dump(&a), dump(&b));
+        assert!(b.n_nodes() <= a.n_nodes());
+        assert_eq!(a.in_links().values().sum::<u32>(), b.in_links().values().sum::<u32>());
+        // the same walks afterwards (the map was rebuilt: the same merges)
+        let (mut ra, mut rb) = (rng.clone(), rng.clone());
+        rv_search(&mut a, &g, 80, &mut ra, &W, &counter_net, &mut Vec::new());
+        rv_search(&mut b, &g, 80, &mut rb, &W, &counter_net, &mut Vec::new());
+        assert_eq!(dump(&a), dump(&b));
+        assert_eq!(a.merge_stats().unwrap().merged, b.merge_stats().unwrap().merged);
+    }
+    // the toy (chance keys and outs)
+    for s in 0..6u64 {
+        let g = mid_game(s, 5);
+        if g.over {
+            continue;
+        }
+        let p = g.to_move().unwrap();
+        let mut rng = Rng::new(s);
+        let mut a = Tree::new(&g, p, &legal_of(&g), true, &mut rng);
+        a.set_merge(true).unwrap();
+        let w = Walk { c_puct: 1.0, chance_k: 2, margin_w: 0.0 };
+        rv_search(&mut a, &g, 150, &mut rng, &w, &toy_net, &mut Vec::new());
+        let mut b = a.clone();
+        b.compact();
+        assert_eq!(dump(&a), dump(&b));
+        let (mut ra, mut rb) = (rng.clone(), rng.clone());
+        rv_search(&mut a, &g, 60, &mut ra, &w, &toy_net, &mut Vec::new());
+        rv_search(&mut b, &g, 60, &mut rb, &w, &toy_net, &mut Vec::new());
+        assert_eq!(dump(&a), dump(&b));
+    }
+}
+
+#[test]
+fn merged_advance_finds_the_root_by_signature_or_by_observation() {
+    let mut checked = [0; 2];
+    for s in 0..10u64 {
+        let g = Counter::with_hand(s % 2 == 0, s % 3 == 0);
+        let mut rng = Rng::new(s);
+        let mut t = Tree::new(&g, 0, &[CAST, HOLD], true, &mut rng);
+        t.set_merge(true).unwrap();
+        rv_search(&mut t, &g, 200, &mut rng, &W, &counter_net, &mut Vec::new());
+        let r = t.root;
+        let ci = t.acts(r).iter().position(|&a| a == CAST).unwrap();
+        let x = seat0_kid(&t, r, ci).unwrap();
+        let before = {
+            let mut c = t.clone();
+            c.root = x;
+            dump(&c)
+        };
+        // the real game: seat 0 casts; seat 1 (holding Daze) allows - the same observation for seat 0 as the
+        // auto-stepped world's. By signature: the real transition as the auto-stepped world keyed it ([]); by
+        // observation: an unknown real key (as a revelation the search never sampled), found by encode(viewer)
+        let mut live = Counter::with_hand(true, false);
+        let mut keys = Vec::new();
+        live.step(CAST, &mut keys).unwrap();
+        live.step(ALLOW, &mut keys).unwrap();
+        let legal = vec![CAST, HOLD];
+        let by_obs = s % 2 == 1;
+        let key: Vec<u64> = if by_obs { vec![99] } else { vec![] };
+        let mut u = t.clone();
+        let enc = u.merge_stats().unwrap().encodes;
+        assert!(!u.advance_in(CAST, &key, 1, &legal, &live), "another viewer: no reuse");
+        assert!(u.advance_in(CAST, &key, 0, &legal, &live));
+        assert_eq!(u.merge_stats().unwrap().encodes, enc + by_obs as u64);
+        assert_eq!(u.root, x);
+        assert_eq!(dump(&u), before, "the reused subtree as it was");
+        checked[by_obs as usize] += 1;
+        // the search goes on from the new root
+        let tot0 = u.tot(u.root);
+        rv_search(&mut u, &live, 100, &mut rng, &W, &counter_net, &mut Vec::new());
+        assert_eq!(u.tot(u.root), tot0 + 100);
+        // and a compaction of the reused tree keeps the search
+        let mut c = u.clone();
+        c.compact();
+        assert_eq!(dump(&c), dump(&u));
+        // an observation the tree never reached: no reuse
+        let mut other = Counter::with_hand(false, false);
+        other.step(HOLD, &mut keys).unwrap();
+        other.step(HOLD, &mut keys).unwrap();
+        assert!(other.to_move().is_none());
+    }
+    assert!(checked[0] > 0 && checked[1] > 0);
+}
+
+#[test]
+fn a_repeated_observation_on_the_walks_path_gets_a_fresh_node() {
+    // a forgetful counter game (features without the round and the score) of 5 rounds: seat 0's next round after a
+    // hold looks like this one, so a walk would reach a node already on its path - it gets an alias instead, and
+    // every walk's backup stays exact
+    use crate::counter_game::CounterSpec;
+    let spec = CounterSpec { rounds: 5, forget: true };
+    let mut aliases = 0;
+    for s in 0..6u64 {
+        let g = Counter::with_spec(spec, s % 2 == 0, s % 3 == 0);
+        let mut rng = Rng::new(s);
+        let mut t = Tree::new(&g, 0, &[CAST, HOLD], true, &mut rng);
+        t.set_merge(true).unwrap();
+        let mut log = Vec::new();
+        rv_search(&mut t, &g, 400, &mut rng, &W, &counter_net, &mut log);
+        recount(&t, &log);
+        let ms = t.merge_stats().unwrap();
+        assert!(ms.merged > 0, "{ms:?}");
+        aliases += ms.aliases;
+        let mut b = t.clone();
+        b.compact();
+        assert_eq!(dump(&t), dump(&b));
+        let (mut ra, mut rb) = (rng.clone(), rng.clone());
+        let (mut la, mut lb) = (log.clone(), log.clone());
+        rv_search(&mut t, &g, 100, &mut ra, &W, &counter_net, &mut la);
+        rv_search(&mut b, &g, 100, &mut rb, &W, &counter_net, &mut lb);
+        assert_eq!(dump(&t), dump(&b));
+        recount(&t, &la);
+    }
+    assert!(aliases > 0, "no walk met its own observation");
+}
