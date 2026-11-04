@@ -446,6 +446,42 @@ twins without branching, move for move and record for record), `branches_count_i
 entry j's), `a_branch_of_an_archive_start_names_its_entry`, `differ_never_replays_the_games_own_move_first`,
 `branch_and_starts_settings_are_checked`; tests/test_forks.py.
 
+### 2.12 Sparse rows without full-row scans (`SearchGame::encode_sparse`; MTG Zero's Delver mirror, 2026-11-04)
+
+No setting: the same batches, byte for byte, read with less work (docs/az.md 28 has the measurements).
+
+**Why.** A sparse driver (2.2) read each network row by `encode` into a zeroed scratch row of `F` floats,
+then `LeafBuf::seal` walked all `F` floats one by one for the non-zeros; with the evaluation cache (3.12)
+`obs_hash` read the row a second time for the key, and a cached row was zeroed in full. An MTG Zero row is
+~250 non-zero floats of 37,620 (82 of its 587 blocks of 64 hold any), and on 10k Delver leaf rows the scans
+cost about as much as `encode` itself: `seal` ~11 us, `obs_hash` ~3 us, the zeroing ~2 us against `encode`
+~13-15 us and ~14-18 us for the rest of a simulation.
+
+**What.**
+
+* `SearchGame::encode_sparse(viewer, scratch, idx, val)`: `encode(viewer)` as its non-zero (index, value)
+  pairs - every feature whose f32 bits are not 0 (-0.0 included), indexes ascending - appended to `idx` /
+  `val`; `scratch` is `F` zeros on entry and on return. The default is `encode` into `scratch`, then
+  `game::sparse_scan`. A game may override it to emit its pairs without the dense row; its pairs must be
+  exactly the default's (a test over its states: the driver's batches and cache keys depend on it).
+* `game::sparse_scan(x, idx, val)`: `seal`'s scan, the same pairs: blocks of 32 zero floats skipped by an
+  OR of their bits, a block's non-zero lanes taken from a bit mask (no branch per float), each zeroed again.
+  `LeafBuf::seal` uses it for rows written into the scratch (the lookahead's, 3.9).
+* `lookahead::obs_hash_sparse(idx, val, n)`: `obs_hash` of an `n`-float row given as those pairs - the same
+  mixing of the same (pair index, bits), so `obs_hash_sparse` of a row's non-zeros == `obs_hash` of the row.
+* The driver (`LeafBuf::encode_row` / `row_hash`): a sparse buffer's leaf rows, root-view value rows (3.6)
+  and root belief rows (3.8) come from `encode_sparse`; the evaluation cache's key is `obs_hash_sparse` of the
+  row's pairs (the same key as before: the same hits); a cached row's pairs are dropped (truncated) instead
+  of zeroing the scratch. Dense drivers are unchanged (`encode` into the batch's `x`, `obs_hash` of the row).
+  The lookahead's own observation key (3.9) still hashes its dense rows: unchanged.
+
+**Tests.** `lookahead::tests::sparse_scan_and_obs_hash_sparse_match_the_dense_row` (lengths around both
+block sizes, odd and even, empty to full rows, -0.0, NaN, subnormals: the old `seal` loop's pairs and the
+dense hash); `driver::tests::sparse_rows_from_encode_sparse_are_the_dense_rows` (ToyGame with root-view
+rows, HiddenMull with root-view and belief rows, eval_cache 0 and 4096: every batch's rows densified equal
+the dense driver's, the same games, records, cache hits and rows); the golden digests (dense) unchanged.
+MTG Zero checks its own states (ENGINE.md 89: 10k Delver leaf rows, pairs and keys equal).
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),
@@ -1127,7 +1163,8 @@ feature rows apart.
 `eval_cache`, run setting `eval_cache`) keeps, per game in flight (`Slot::cache`), the answers to the rows
 the game sent its network: the priors of the row's options, its value and margin per seat, by the key
 (evaluator key, network id, `cache_key(obs_hash(features), options)` - the lookahead's 128-bit hash of the
-float bits, 3.9, with the options in order; a value-only row has none). At a search leaf (`advance_slot`,
+float bits, 3.9, with the options in order; a value-only row has none; a sparse driver hashes the row's
+non-zeros, `obs_hash_sparse`, the same key: 2.12). At a search leaf (`advance_slot`,
 `Sim::Leaf`):
 
 * each of the leaf's rows - its own row, and with `LeafView::Root` at another seat's leaf the root decider's

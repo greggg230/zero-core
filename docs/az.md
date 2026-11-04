@@ -3770,3 +3770,53 @@ the priors): N 8,192 at 768 games in flight is at most ~0.7 GB.
 driver's golden records and matches unchanged with the cache off); on the MacBook the ten golden tests fail
 alike on main 96f1566 and on this branch, with the same digests (the goldens are the desktop's floats);
 pytest `test_loop.py::test_eval_cache_setting`.
+
+## 28. Sparse rows without the full-row scans (no setting; MTG Zero's Delver mirror, 2026-11-04)
+
+The driver side is docs/search.md 2.12; this section is the why and what it measured.
+
+**Why.** With the evaluation cache (25) on, the Delver line's self-play phase no longer waits on the network
+alone (MTG Zero's r3-2b-float550, gens 1048-1112: the evaluator busy 62-70 s of a 92-102 s phase), and a
+search thread spends most of a simulation on its network rows. Measured on 10k Delver leaf rows (below):
+per row `encode` ~13-22 us, `LeafBuf::seal`'s float-by-float scan ~11-14 us, `obs_hash` (the cache's key)
+~3-4.6 us, a cached row's full zeroing ~2 us - against ~14-22 us for the rest of a simulation (the deal, the
+walk, the engine's steps, the expansion and backup). At the run's mix of 1.48 rows encoded per simulation
+(0.98 sent, 0.50 answered from the cache) the scans, the key and the zeroing were ~17 us of a simulation's
+~50 us of measured work, `encode` ~20 us.
+
+**What changes.** Nothing a run sees: the same batches byte for byte, the same cache keys and hits, so there
+is no setting (it would switch between two ways of computing the same bytes). A sparse driver (run setting
+`sparse`, search.md 2.2) reads its rows with `SearchGame::encode_sparse` (default: `encode` + the
+block-skipping `game::sparse_scan`) and keys its cache by `obs_hash_sparse` of the pairs; a dense driver is
+unchanged. A game may override `encode_sparse` to emit its pairs without the dense row (search.md 2.12 has the
+contract); MTG Zero does not (ENGINE.md 89: what is left of the scan after this, ~3 us a row, does not pay for
+rewriting its encoder).
+
+**Costs.** None: the same memory (a scratch row per chunk buffer, as before), the same work elsewhere.
+
+**Measured** (2026-11-04, the desktop beside the live Delver run - CPU timings inflated by it, so the
+comparisons are within one process or interleaved A / B on one seed):
+
+* *Per row* (`rowcost`, E:/mtg-zero-scratch/ideas-3/rowcost: 15 Delver mirror games searched at the line's
+  64 / 16 simulations with priors 0.85 on the heuristic bot's move, every 16th leaf kept - 10,001 rows, both rows
+  of a root-view leaf, ~252 non-zeros of 37,620 a row in ~82 of 587 blocks of 64; mimalloc, as MTG Zero's module):
+  the old scan 10.7-12.3 us -> `sparse_scan` 3.0-3.9 us; `obs_hash` 3.0-3.5 us -> `obs_hash_sparse` 0.65-0.88 us;
+  a whole row as the driver reads it, old -> new, interleaved per row: **sent 21.0 -> 11.8 us, cached 12.4 -> 11.4
+  us**; pairs and keys equal on every row. At the run's 0.98 sent and 0.50 cached rows per simulation: -9.5 us
+  of thread time a simulation (-23% of the ~41 us measured in the same process).
+* *The driver* (MTG Zero's self-play seat - eval_cache 8192, root-view rows, the root's belief, sparse batches -
+  with the line's gen 1000 on the CPU, 24 games in flight, 2 threads, 2 groups, one seed; the old build (zero-core
+  aae4ca2) and the new one run at the same time, so under the same load; E:/mtg-zero-scratch/ideas-3/ab_conc.sh):
+  the search threads' time per simulation (`busy_s` / sims) **103.4 -> 87.0 us and 93.8 -> 80.8 us (-16%,
+  -14%)**, the same 62,578 rows sent and simulations in the timed window. (Run one after the other: 101.1 /
+  104.6 old, 93.3 / 68.9 new - the load moved between runs.) The absolute numbers are the loaded desktop's.
+* *Byte identity on MTG* (E:/mtg-zero-scratch/ideas-3/digest_ab.py: the same seat, 6 games, answered by a
+  function of each row's non-zeros - no network, whose CPU floats are not reproducible run to run): the old and
+  the new build give the same 29,114 batches (sparse arrays, options, kinds, players, gids), samples and results,
+  digest for digest, and the same counters (25,428 cache hits, 14,533 value-only rows, 536 belief rows).
+
+**Checks.** cargo test 114 (the golden digests unchanged; `lookahead::tests::sparse_scan_and_obs_hash_sparse_
+match_the_dense_row`, `driver::tests::sparse_rows_from_encode_sparse_are_the_dense_rows`), pytest -k "sparse or
+cache" 6 passed / 1 skipped (CUDA); MTG Zero (ENGINE.md 89): its engine test
+`encode_sparse_is_the_rows_non_zeros_with_the_same_key` (cube and Delver mirror states, both viewers) and its re-pin
+gate (the engine digest unchanged).
