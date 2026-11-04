@@ -93,6 +93,9 @@ pub(super) struct Merge {
     dense: Vec<f32>,
     idx: Vec<u32>,
     val: Vec<f32>,
+    /// The node whose state `idx` / `val` encode from the viewer's view: set by the walk's last `merged_child` when
+    /// it encoded (a new signature), NIL otherwise (`Tree::leaf_obs`: the driver's row of the leaf's viewer).
+    pub(super) enc_node: u32,
 }
 
 impl Merge {
@@ -108,6 +111,7 @@ impl Merge {
             dense: Vec::new(),
             idx: Vec::new(),
             val: Vec::new(),
+            enc_node: NIL,
         }
     }
 
@@ -160,6 +164,18 @@ impl<G: SearchGame> Tree<G> {
         match &self.merge {
             Some(m) if m.grow_node == node => &m.grow,
             _ => self.acts(node),
+        }
+    }
+
+    /// The viewer's features of the last walk's leaf `node` as the merged tree encoded them at the walk's last new
+    /// signature (`encode_sparse(viewer)` of the leaf's state: its non-zero indexes and values), None when that walk
+    /// did not encode its leaf (off, the root's own evaluation, a known link). The driver reuses them for the
+    /// leaf's row of the viewer - the leaf's own row at a viewer's node, the root-view value-only row at another
+    /// seat's - instead of encoding the same state again (docs/search.md 3.16). Valid until the next walk.
+    pub fn leaf_obs(&self, node: u32) -> Option<(&[u32], &[f32])> {
+        match &self.merge {
+            Some(m) if m.enc_node == node && node != NIL => Some((&m.idx, &m.val)),
+            _ => None,
         }
     }
 
@@ -232,6 +248,7 @@ impl<G: SearchGame> Tree<G> {
         }
         m.idx.clear();
         m.val.clear();
+        m.enc_node = NIL;
         g.encode_sparse(viewer, &mut m.dense, &mut m.idx, &mut m.val);
         m.count.encodes += 1;
         (obs_hash_sparse(&m.idx, &m.val, G::NUM_FEATURES), sig_hash(&[], p, if p == viewer { acts } else { &[] }))
@@ -243,6 +260,7 @@ impl<G: SearchGame> Tree<G> {
     pub(super) fn merged_child(&mut self, parent: u32, i: usize, h: u64, g: &G, sc: &Scratch) -> (u32, bool) {
         let p = g.to_move().expect("merged_child: a decision");
         let si = self.nodes[parent as usize].stat_off as usize + i;
+        self.merge.as_mut().unwrap().enc_node = NIL;
         let k = match self.find_link(parent, i, &sc.key, p, &sc.legal, h) {
             Some(l) => {
                 let k = self.link_node(l);
@@ -277,6 +295,8 @@ impl<G: SearchGame> Tree<G> {
                     }
                 };
                 self.push_link(si, &sc.key, p, &sc.legal, h, k);
+                // (the encoding is of `g`, the state at k in this world: the leaf's if the walk ends at k)
+                self.merge.as_mut().unwrap().enc_node = k;
                 k
             }
         };
@@ -505,7 +525,9 @@ impl<G: SearchGame> Tree<G> {
         self.belief = None;
         self.belief_mix = 0.0;
         self.gumbel = None;
-        self.merge.as_mut().unwrap().grow_node = NIL;
+        let m = self.merge.as_mut().unwrap();
+        m.grow_node = NIL;
+        m.enc_node = NIL;
         if self.nodes.len() > COMPACT_AT {
             self.compact();
         } else {

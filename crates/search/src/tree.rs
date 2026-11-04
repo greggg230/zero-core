@@ -1081,6 +1081,7 @@ impl<G: SearchGame> Tree<G> {
         self.walk_forced = NIL;
         if let Some(m) = self.merge.as_mut() {
             m.grow_node = NIL;
+            m.enc_node = NIL;
         }
         g.clone_from(self.base.as_ref().unwrap_or(live));
         if self.redet {

@@ -134,7 +134,8 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     cq_prior_w: beta, the prior's exponent in the recorded 'cq' target (docs/search.md 3.13:
     softmax(beta ln P0 + sigma completedQ), in (0, 1]; the moves never read it; 1 = off: no key, the seat
     of before). infoset_merge: information-set merging of its trees by the root decider's observation
-    (docs/search.md 3.16; leaf_value_view 'root', an evaluation seat; False = off: no key, the seat of before)."""
+    (docs/search.md 3.16; leaf_value_view 'root'; an evaluation or a self-play seat; False = off: no key, the seat
+    of before)."""
     from .mcts import (check_belief, check_cq_prior_w, check_leaf_view, check_merge, check_root_min,
                        check_root_search, check_select, check_select_transform, select_transform)
     check_select(select, select_min_visits)

@@ -1022,6 +1022,7 @@ impl PySearchDriver {
         d.set_item("merge_merged", s.merge_merged)?;
         d.set_item("merge_aliases", s.merge_aliases)?;
         d.set_item("merge_growths", s.merge_growths)?;
+        d.set_item("merge_shared", s.merge_shared)?;
         d.set_item("emitted", s.emitted)?;
         d.set_item("epoch", s.epoch)?;
         d.set_item("net", s.net)?;

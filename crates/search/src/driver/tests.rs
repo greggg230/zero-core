@@ -3252,7 +3252,7 @@ fn counter_match(sa: SeatCfg, sb: SeatCfg, games: usize, spec: &str, seed: u64, 
 }
 
 #[test]
-fn infoset_merge_needs_root_view_values_and_an_evaluation_seat() {
+fn infoset_merge_needs_root_view_values() {
     let mk = |view: LeafView, selfplay: bool| {
         let mut s = NnSeat::eval(0, 8);
         s.infoset_merge = true;
@@ -3260,11 +3260,12 @@ fn infoset_merge_needs_root_view_values_and_an_evaluation_seat() {
         s.selfplay = selfplay;
         cfg(vec![SeatCfg::Nn(s)], vec![vec![0, 0]], &[("m", KeyKind::Nn)])
     };
-    let e = Driver::<ToyGame>::new(mk(LeafView::Mover, false)).err().unwrap();
-    assert!(e.contains("leaf_value_view 'root'"), "{e}");
-    let e = Driver::<ToyGame>::new(mk(LeafView::Root, true)).err().unwrap();
-    assert!(e.contains("evaluation seat"), "{e}");
-    assert!(Driver::<ToyGame>::new(mk(LeafView::Root, false)).is_ok());
+    for selfplay in [false, true] {
+        let e = Driver::<ToyGame>::new(mk(LeafView::Mover, selfplay)).err().unwrap();
+        assert!(e.contains("leaf_value_view 'root'"), "{e}");
+        // (evaluation and self-play seats: docs/search.md 3.16)
+        assert!(Driver::<ToyGame>::new(mk(LeafView::Root, selfplay)).is_ok());
+    }
 }
 
 #[test]
@@ -3375,4 +3376,398 @@ fn infoset_merge_survives_rolling_network_changes() {
     let st = d.stats();
     assert!(total >= 60 && st.restarts > 0 && st.epoch == 5, "{total} games, {st:?}");
     assert!(st.merge_merged > 0 && st.merge_growths > 0);
+}
+
+// ------------------------------------------------------- information-set merging in self-play (docs/search.md 3.16)
+
+fn fnv(h: &mut u64, bytes: &[u8]) {
+    for &x in bytes {
+        *h ^= x as u64;
+        *h = h.wrapping_mul(0x100000001b3);
+    }
+}
+
+/// A batch's bytes as the evaluator receives them (dense or sparse rows, options, kinds, players, games, key).
+fn batch_digest(h: &mut u64, b: &Batch) {
+    for v in &b.x {
+        fnv(h, &v.to_bits().to_le_bytes());
+    }
+    for v in &b.xs_off {
+        fnv(h, &v.to_le_bytes());
+    }
+    for v in &b.xs_idx {
+        fnv(h, &v.to_le_bytes());
+    }
+    for v in &b.xs_val {
+        fnv(h, &v.to_bits().to_le_bytes());
+    }
+    for v in &b.opt_off {
+        fnv(h, &v.to_le_bytes());
+    }
+    for v in &b.opt_action {
+        fnv(h, &v.to_le_bytes());
+    }
+    fnv(h, &b.extra);
+    for v in &b.player {
+        fnv(h, &v.to_le_bytes());
+    }
+    for v in &b.gid {
+        fnv(h, &v.to_le_bytes());
+    }
+    fnv(h, &b.key.to_le_bytes());
+}
+
+/// A stand-in network: (row's dense features, its options, players) -> (priors over the options, value per seat
+/// relative to the row's player).
+type RowEval = dyn Fn(&[f32], &[u16], usize) -> (Vec<f32>, [f32; MAX_SEATS]);
+
+/// Answer a network batch with `ans`, row by row (a sparse batch densified).
+fn answer_with<G: SearchGame>(d: &mut Driver<G>, b: &Batch, ans: &RowEval) {
+    let f = G::NUM_FEATURES;
+    let x = dense_x(b, f);
+    let mut pri = Vec::new();
+    let mut v = vec![0.0; b.b * MAX_SEATS];
+    for r in 0..b.b {
+        let opts: Vec<u16> = b.opt_action[b.opt_off[r] as usize..b.opt_off[r + 1] as usize].iter().map(|&a| a as u16).collect();
+        let (p, val) = ans(&x[r * f..(r + 1) * f], &opts, b.n_players[r] as usize);
+        pri.extend(p);
+        v[r * MAX_SEATS..(r + 1) * MAX_SEATS].copy_from_slice(&val);
+    }
+    d.submit(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS]).unwrap();
+}
+
+/// The finished games' rows, each with its own samples.
+fn take_rows<G: SearchGame>(d: &mut Driver<G>, rows: &mut Vec<(GameResult, Vec<Record>)>) {
+    let rs = d.take_results();
+    let smp = d.take_samples();
+    let mut a = 0;
+    for r in rs {
+        let k = r.samples as usize;
+        rows.push((r, smp[a..a + k].to_vec()));
+        a += k;
+    }
+    assert_eq!(a, smp.len(), "every sample belongs to a row taken with it");
+}
+
+/// Run a driver to the end, every batch answered by `ans` -> (rows with their own samples sorted by (gid, branch or
+/// not), stats, the digest of every batch sent, in order).
+fn run_rows<G: SearchGame>(d: &mut Driver<G>, ans: &RowEval) -> (Vec<(GameResult, Vec<Record>)>, DriverStats, u64) {
+    let mut rows = Vec::new();
+    let mut h: u64 = 0xcbf29ce484222325;
+    while let Some(b) = d.next_batch(true).unwrap() {
+        batch_digest(&mut h, &b);
+        answer_with(d, &b, ans);
+        take_rows(d, &mut rows);
+    }
+    take_rows(d, &mut rows);
+    rows.sort_by_key(|(r, _)| (r.gid, r.branch.is_some()));
+    (rows, d.stats(), h)
+}
+
+/// The rows' digest: each game's outcome and its own records, in gid order.
+fn rows_digest(rows: &[(GameResult, Vec<Record>)]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for (r, s) in rows {
+        fnv(&mut h, &r.gid.to_le_bytes());
+        fnv(&mut h, &r.steps.to_le_bytes());
+        fnv(&mut h, &r.decisions.to_le_bytes());
+        fnv(&mut h, &[r.over as u8, r.branch.is_some() as u8, r.resign.as_ref().is_some_and(|x| x.resigned) as u8]);
+        for v in &r.result {
+            fnv(&mut h, &v.to_bits().to_le_bytes());
+        }
+        fnv(&mut h, &records_digest(s).to_le_bytes());
+    }
+    h
+}
+
+/// Valid self-play rows: every game over, its samples its own; a decision record's pi a distribution over its
+/// options (two or more), a value-only record (no options) no pi; q a win vector in range; z the game's result
+/// from the record's player's view. -> (decision records, value-only records).
+fn check_rows(rows: &[(GameResult, Vec<Record>)], games: usize) -> (usize, usize) {
+    assert!(rows.len() >= games, "{} rows of {games} games", rows.len());
+    let (mut dec, mut val) = (0, 0);
+    for (r, s) in rows {
+        assert!(r.over, "game {} did not finish", r.gid);
+        assert_eq!(s.len(), r.samples as usize);
+        for x in s {
+            let n = x.n_players as usize;
+            assert_eq!(n, r.n);
+            if x.opts.is_empty() {
+                assert!(x.pi.is_empty());
+                val += 1;
+            } else {
+                assert!(x.opts.len() >= 2 && x.pi.len() == x.opts.len(), "{:?} {:?}", x.opts, x.pi);
+                assert!(x.pi.iter().all(|&p| (0.0..=1.0 + 1e-6).contains(&p)), "pi {:?}", x.pi);
+                assert!((x.pi.iter().sum::<f32>() - 1.0).abs() < 1e-4, "pi {:?} sums to {}", x.pi, x.pi.iter().sum::<f32>());
+                dec += 1;
+            }
+            for j in 0..n {
+                assert!((-1e-6..=1.0 + 1e-6).contains(&x.q[j]), "q {:?}", x.q);
+                assert_eq!(x.z[j], r.result[(x.player as usize + j) % n], "z from the record's player's view");
+            }
+            assert!((x.q[..n].iter().sum::<f32>() - 1.0).abs() < 1e-4, "q {:?}", x.q);
+        }
+    }
+    (dec, val)
+}
+
+fn counter_sp_cfg(seat: SeatCfg, games: usize, spec: &str, seed: u64) -> DriverCfg {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
+    c.spec = spec.into();
+    c.seed = seed;
+    c
+}
+
+fn counter_ans(x: &[f32], opts: &[u16], _n: usize) -> (Vec<f32>, [f32; MAX_SEATS]) {
+    counter_eval(x, opts)
+}
+
+/// Counter self-play of the configuration's seat on both sides, answered by `counter_eval`.
+fn counter_sp(c: DriverCfg) -> (Vec<(GameResult, Vec<Record>)>, DriverStats, u64) {
+    run_rows(&mut Driver::<Counter>::new(c).unwrap(), &counter_ans)
+}
+
+/// ToyGame: uniform priors, the value a hash of the features (`answer`'s, a function of the row).
+fn toy_hash_ans(x: &[f32], opts: &[u16], n: usize) -> (Vec<f32>, [f32; MAX_SEATS]) {
+    let k = opts.len();
+    let pri = vec![1.0 / k.max(1) as f32; k];
+    let h: f32 = x.iter().enumerate().map(|(i, x)| x * ((i * 7 % 13) as f32 - 6.0)).sum();
+    let w = 1.0 / (1.0 + (-h * 0.1).exp());
+    let mut v = [0.0; MAX_SEATS];
+    v[0] = w;
+    for j in 1..n {
+        v[j] = (1.0 - w) / (n - 1) as f32;
+    }
+    (pri, v)
+}
+
+/// ToyGame: uniform priors, the value from the row player's score lead and the round (`answer_lead`'s: a lead late
+/// in the game is decisive, so resignation fires).
+fn toy_lead_ans(x: &[f32], opts: &[u16], _n: usize) -> (Vec<f32>, [f32; MAX_SEATS]) {
+    let base = 6 + 3 + 4 + 12 + 6 + crate::toy::N_SPACES * 7;
+    let k = opts.len();
+    let pri = vec![1.0 / k.max(1) as f32; k];
+    let lead = (x[base + 14] - x[base + 16 + 14]) * 20.0;
+    let round = (0..6).find(|&i| x[i] > 0.0).unwrap_or(0) as f32 + 1.0;
+    let w = 1.0 / (1.0 + (-1.5 * lead * round / 6.0).exp());
+    let mut v = [0.0; MAX_SEATS];
+    v[0] = w;
+    v[1] = 1.0 - w;
+    (pri, v)
+}
+
+fn sp_seat(sims: u32, merge: bool, share: f64) -> SeatCfg {
+    let s = with_view(nn(0, sims, true), LeafView::Root, share, ViewTarget::NextQ);
+    with_merge(s, merge)
+}
+
+#[test]
+fn infoset_merge_selfplay_records_are_valid_and_reproduce() {
+    // a merged self-play seat on both sides of the counter game, with its playout cap (fast searches; root noise on
+    // the full ones), temperature and value-only samples: valid records; the same games and records across thread
+    // counts and with the evaluation cache (the stand-in network is a function of the row); merges, growth leaves
+    // and shared leaf encodings happen; the games or records are not unmerged self-play's
+    for spec in [r#"{"rounds": 4}"#, r#"{"rounds": 5, "forget": true}"#] {
+        for share in [0.0, 1.0] {
+            let (r0, s0, _) = counter_sp(counter_sp_cfg(sp_seat(24, true, share), 120, spec, 13));
+            let (dec, val) = check_rows(&r0, 120);
+            assert_eq!(r0.len(), 120);
+            assert!(dec > 200, "{spec}: {dec} decision records");
+            if share > 0.0 {
+                // (every decision record of a seat has the other seat's value-only record with it)
+                assert_eq!(val, dec, "{spec}: value-only records");
+            } else {
+                assert_eq!(val, 0);
+            }
+            assert!(s0.merge_merged > 0 && s0.merge_growths > 0 && s0.merge_shared > 0, "{spec}: {s0:?}");
+            if spec.contains("forget") {
+                assert!(s0.merge_aliases > 0, "{spec}: {s0:?}");
+            }
+            for (threads, groups) in [(1, 1), (4, 3)] {
+                let mut c = counter_sp_cfg(sp_seat(24, true, share), 120, spec, 13);
+                c.threads = threads;
+                c.groups = groups;
+                let (r1, s1, _) = counter_sp(c);
+                assert_eq!(rows_digest(&r1), rows_digest(&r0), "{spec}: {threads} threads, {groups} groups");
+                assert_eq!((s1.merge_merged, s1.merge_growths, s1.merge_aliases, s1.merge_shared), (s0.merge_merged, s0.merge_growths, s0.merge_aliases, s0.merge_shared));
+            }
+            let (r2, s2, _) = counter_sp(counter_sp_cfg(with_cache(sp_seat(24, true, share), 256), 120, spec, 13));
+            assert_eq!(rows_digest(&r2), rows_digest(&r0), "{spec}: the eval cache");
+            assert!(s2.cache_hits > 0 && s2.merge_growths == s0.merge_growths);
+            let (r3, s3, _) = counter_sp(counter_sp_cfg(sp_seat(24, false, share), 120, spec, 13));
+            assert_ne!(rows_digest(&r3), rows_digest(&r0), "{spec}: merging changed nothing");
+            assert_eq!((s3.merge_links, s3.merge_shared), (0, 0));
+        }
+    }
+}
+
+#[test]
+fn infoset_merge_selfplay_with_gumbel_the_root_floor_and_the_belief() {
+    let floor = |s: SeatCfg| match s {
+        SeatCfg::Nn(mut n) => {
+            n.root_min_visits = 3;
+            SeatCfg::Nn(n)
+        }
+        s => s,
+    };
+    // the Gumbel root (its noise, the 'cq' target) and the root floor, merged, self-play: valid, reproducible
+    for seat in [with_gumbel(sp_seat(24, true, 0.0), 4, 1.0, 1.0), floor(sp_seat(24, true, 0.0))] {
+        let (r, st, _) = counter_sp(counter_sp_cfg(seat.clone(), 80, r#"{"rounds": 4}"#, 3));
+        let (dec, _) = check_rows(&r, 80);
+        assert!(dec > 100 && st.merge_merged > 0 && st.merge_growths > 0, "{dec} records, {st:?}");
+        let mut c = counter_sp_cfg(seat, 80, r#"{"rounds": 4}"#, 3);
+        c.threads = 1;
+        c.groups = 1;
+        assert_eq!(rows_digest(&counter_sp(c).0), rows_digest(&r));
+    }
+    // the root belief (the hidden-hand mulligan's auxiliary head): one belief row per full search, merged trees
+    let seat = with_merge(hmull_belief_seat(32, 1.0, LeafView::Root, true), true);
+    let (recs, st, vrows, brows) = hmull_belief_run(seat.clone(), 80, 5, &[0.1, 0.9]);
+    assert!(!recs.is_empty() && brows > 0 && vrows > 0 && st.merge_links > 0, "{} records, {brows} belief rows, {st:?}", recs.len());
+    for x in &recs {
+        assert!((x.pi.iter().sum::<f32>() - 1.0).abs() < 1e-4 && (x.q[0] + x.q[1] - 1.0).abs() < 1e-4);
+    }
+    let (again, ..) = hmull_belief_run(seat, 80, 5, &[0.1, 0.9]);
+    assert_eq!(records_set_digest(&again), records_set_digest(&recs));
+}
+
+#[test]
+fn infoset_merge_shares_the_leaf_encoding_byte_for_byte() {
+    // the driver takes the leaf's row of the viewer (a viewer's leaf's own row, another seat's leaf's value-only row)
+    // from the merged tree's encoding of it (`Tree::leaf_obs`): every batch is the bytes it is when each row is
+    // encoded again - dense and sparse, without and with the evaluation cache, on the counter game (two seats) and
+    // the toy (chance keys, three seats); the same games and records
+    for sparse in [false, true] {
+        for cap in [0u32, 256] {
+            let counter = |off: bool| {
+                let mut c = counter_sp_cfg(with_cache(sp_seat(24, true, 0.5), cap), 60, r#"{"rounds": 4}"#, 17);
+                c.sparse = sparse;
+                let mut d = Driver::<Counter>::new(c).unwrap();
+                d.sh.counters.share_off.store(off, Ordering::Relaxed);
+                run_rows(&mut d, &counter_ans)
+            };
+            let toy = |off: bool| {
+                let games: Vec<Vec<u16>> = (0..30).map(|g| if g % 3 == 0 { vec![0, 0, 0] } else { vec![0, 0] }).collect();
+                let mut c = cfg(vec![with_cache(sp_seat(16, true, 0.5), cap)], games, &[("m", KeyKind::Nn)]);
+                c.sparse = sparse;
+                let mut d = Driver::<ToyGame>::new(c).unwrap();
+                d.sh.counters.share_off.store(off, Ordering::Relaxed);
+                run_rows(&mut d, &toy_hash_ans)
+            };
+            for (name, (r_on, s_on, h_on), (r_off, s_off, h_off)) in [("counter", counter(false), counter(true)), ("toy", toy(false), toy(true))] {
+                let what = format!("{name}, sparse {sparse}, eval_cache {cap}");
+                assert_eq!(h_on, h_off, "{what}: other batches");
+                assert_eq!(rows_digest(&r_on), rows_digest(&r_off), "{what}: other games or records");
+                assert_eq!((s_on.leaves, s_on.view_rows, s_on.cache_hits, s_on.merge_links), (s_off.leaves, s_off.view_rows, s_off.cache_hits, s_off.merge_links), "{what}");
+                assert_eq!(s_off.merge_shared, 0, "{what}");
+                // (nearly every leaf comes from a new signature, whose observation the tree encoded)
+                let rows = s_on.leaves + s_on.cache_leaves;
+                eprintln!("{what}: shared {} of {} leaves (+{} cached), {} merged, {} growths", s_on.merge_shared, s_on.leaves, s_on.cache_leaves, s_on.merge_merged, s_on.merge_growths);
+                assert!(s_on.merge_shared > 0 && s_on.merge_shared <= rows, "{what}: {s_on:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn infoset_merge_selfplay_resigns_and_branches() {
+    // self-play resignation (docs/search.md 3.14: it reads the merged search's root win vector) with every game
+    // resigning where the rule fires, against the dry run (the same games played out): a resigned game is its dry
+    // twin up to that point, z the resignation's
+    let seat = with_merge(nn_full(16), true);
+    let (on, s_on, _) = run_rows(&mut Driver::<ToyGame>::new(resign_cfg(seat.clone(), 40, 0.05, 4, 0.0)).unwrap(), &toy_lead_ans);
+    let (dry, _, _) = run_rows(&mut Driver::<ToyGame>::new(resign_cfg(seat, 40, 0.05, 4, 1.0)).unwrap(), &toy_lead_ans);
+    check_rows(&on, 40);
+    check_rows(&dry, 40);
+    assert!(s_on.merge_links > 0);
+    let mut resigned = 0;
+    for ((r, s), (r0, s0)) in on.iter().zip(&dry) {
+        assert_eq!(r.gid, r0.gid);
+        let (x, x0) = (r.resign.as_ref().unwrap(), r0.resign.as_ref().unwrap());
+        let Some(w) = x0.winner else {
+            assert!(!x.resigned);
+            assert_eq!(records_digest(s), records_digest(s0));
+            continue;
+        };
+        resigned += 1;
+        assert!(x.resigned && x.winner == Some(w) && (x.decision, x.step, x.records) == (x0.decision, x0.step, x0.records));
+        assert_eq!(s.len(), x.records as usize);
+        for (a, b) in s.iter().zip(s0) {
+            assert_eq!((&a.x, &a.pi, &a.opts, a.player, a.q), (&b.x, &b.pi, &b.opts, b.player, b.q));
+        }
+    }
+    assert!((4..=38).contains(&resigned), "{resigned} of 40 games resigned");
+    // branched games (docs/search.md 2.11) of resigning merged games: reproducible across thread counts
+    let mut c = branch_cfg(40, 1.0);
+    c.seats = vec![with_resign(with_merge(nn_full(12), true), 0.1, 3, 0.3)];
+    let (rows, st, _) = run_rows(&mut Driver::<ToyGame>::new(c.clone()).unwrap(), &toy_lead_ans);
+    check_rows(&rows, 40);
+    let nb = rows.iter().filter(|(r, _)| r.branch.is_some()).count();
+    assert!(nb >= 30 && st.merge_links > 0 && st.dev_moves > 0, "{nb} branches, {st:?}");
+    c.threads = 1;
+    c.groups = 1;
+    let (again, _, _) = run_rows(&mut Driver::<ToyGame>::new(c).unwrap(), &toy_lead_ans);
+    assert_eq!(rows_digest(&again), rows_digest(&rows));
+}
+
+#[test]
+fn infoset_merge_selfplay_rolling_quotas_and_network_changes() {
+    // a rolling self-play driver whose network changes every other phase (its searches restart from fresh merged
+    // trees: reset + set_merge), with resignation: every phase finishes at least its quota, every game is counted
+    // once, its samples its own and valid; merges and restarts happen
+    for counter in [true, false] {
+        let mut c = if counter {
+            let mut c = counter_sp_cfg(sp_seat(16, true, 0.5), 1, r#"{"rounds": 6}"#, 21);
+            c.seats = vec![with_resign(c.seats[0].clone(), 0.2, 2, 0.2)];
+            c
+        } else {
+            resign_cfg(with_merge(nn(0, 16, true), true), 1, 0.1, 3, 0.2)
+        };
+        c.rolling = true;
+        c.concurrency = 10;
+        let ans: &RowEval = if counter { &counter_ans } else { &toy_lead_ans };
+        let mut rows = Vec::new();
+        let (st, games) = if counter {
+            let mut d = Driver::<Counter>::new(c).unwrap();
+            let games = rolling_phases_of(&mut d, ans, &mut rows);
+            (d.stats(), games)
+        } else {
+            let mut d = Driver::<ToyGame>::new(c).unwrap();
+            let games = rolling_phases_of(&mut d, ans, &mut rows);
+            (d.stats(), games)
+        };
+        assert_eq!(st.games_finished as usize, games);
+        assert_eq!(rows.len(), games);
+        check_rows(&rows, games);
+        let res = rows.iter().filter(|(r, _)| r.resign.as_ref().unwrap().resigned).count();
+        assert!(res > 0 && res < rows.len(), "counter {counter}: {res} of {} resigned", rows.len());
+        assert!(st.restarts > 0 && st.epoch == 2 && st.merge_links > 0, "counter {counter}: {st:?}");
+        if counter {
+            assert!(st.merge_merged > 0 && st.merge_growths > 0);
+        }
+    }
+}
+
+/// Six phases of a rolling driver (quota 12, the network changing every other phase) -> games finished.
+fn rolling_phases_of<G: SearchGame>(d: &mut Driver<G>, ans: &RowEval, rows: &mut Vec<(GameResult, Vec<Record>)>) -> usize {
+    let mut total = 0;
+    for phase in 0..6u32 {
+        d.resume(12, phase / 2).unwrap();
+        let before = rows.len();
+        loop {
+            let b = d.next_batch(true).unwrap();
+            if let Some(b) = &b {
+                answer_with(d, b, ans);
+            }
+            take_rows(d, rows);
+            if b.is_none() {
+                break;
+            }
+        }
+        let fin = rows.len() - before;
+        assert!(fin >= 12, "phase {phase}: {fin} games");
+        assert!(d.paused());
+        total += fin;
+    }
+    total
 }

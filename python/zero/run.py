@@ -187,12 +187,15 @@ DEFAULTS = dict(
     # target's q, 'next_q' (that seat's next search's root value, z if none) | 'z'. 0 = off
     selfplay_leaf_value_view='mover', eval_leaf_value_view='mover', selfplay_view_samples=0.0,
     view_sample_target='next_q',
-    # information-set merging (docs/search.md 3.16, docs/az.md 30): 1 = every evaluation seat's trees merge their
-    # nodes by the root decider's observation (single-observer information-set MCTS inside the tree: the other
-    # seat's nodes subset-armed over the union of its sampled worlds' options, the root decider's next decision one
-    # node whatever the other seat was dealt). Needs eval_leaf_value_view 'root'; its moves change, so the Elo
-    # pool's name gets '-ism'. Self-play support is not built. 0 = off (the default: today's searches, bit for bit)
-    eval_infoset_merge=0,
+    # information-set merging (docs/search.md 3.16, docs/az.md 30): 1 = the seat's trees merge their nodes by the
+    # root decider's observation (single-observer information-set MCTS inside the tree: the other seat's nodes
+    # subset-armed over the union of its sampled worlds' options, the root decider's next decision one node whatever
+    # the other seat was dealt). selfplay_infoset_merge: self-play's seat, every search of it (full, fast, minor;
+    # its records, root values and resignation read the root as before; a remote worker whose checkout does not
+    # merge is refused); needs selfplay_leaf_value_view 'root'. eval_infoset_merge: every evaluation seat; needs
+    # eval_leaf_value_view 'root'; its moves change, so the Elo pool's name gets '-ism'. 0 = off (the default:
+    # today's searches, bit for bit)
+    selfplay_infoset_merge=0, eval_infoset_merge=0,
     # the root's belief (docs/search.md 3.8, docs/az.md 18): a full search of the seat asks the network's
     # auxiliary head once for the root's prediction of the hidden cards (one extra row: the root's own
     # features, the decider's view) and deals every simulation's world by it - the game's
@@ -530,6 +533,7 @@ class Run:
                              root_search=c.get('selfplay_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
                              gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), eval_cache=c.get('eval_cache', 0),
                              cq_prior_w=c.get('cq_prior_w', 1.0),
+                             infoset_merge=bool(c.get('selfplay_infoset_merge', 0)),
                              **belief_keys(c, 'selfplay'), **RS.seat_keys(c))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
@@ -670,6 +674,7 @@ class Run:
         self.belief_metrics(out, st, st0, results)
         self.fork_metrics(it, out, results)
         self.cache_metrics(out, st, st0)
+        self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
@@ -731,6 +736,24 @@ class Run:
         out['eval_cache'] = {'hits': hits, 'leaves': d('cache_leaves'), 'partial': d('cache_partial'),
                              'clears': d('cache_clears'),
                              'share': round(hits / max(1, hits + sent), 4)}
+
+    def merge_metrics(self, it, out, st, st0, leaves):
+        """Self-play's information-set merging (docs/search.md 3.16, docs/az.md 30), only when it is on (the metrics
+        of before otherwise): `merge` = this machine's driver's merged trees - links (new child signatures), merged
+        (of them, found by their observation), aliases, growths (growth leaves), shared (leaf rows of the viewer taken
+        from the tree's encoding, not encoded again), merged_per_leaf. An iteration whose leaves made no link is
+        logged: a setting that did nothing."""
+        if not int(self.cfg.get('selfplay_infoset_merge', 0) or 0):
+            return
+
+        def d(k):
+            return st.get(k, 0) - ((st0 or {}).get(k, 0))
+        out['merge'] = {'links': d('merge_links'), 'merged': d('merge_merged'), 'aliases': d('merge_aliases'),
+                        'growths': d('merge_growths'), 'shared': d('merge_shared'),
+                        'merged_per_leaf': round(d('merge_merged') / max(1, leaves), 4)}
+        if leaves > 0 and out['merge']['links'] == 0:
+            self.log(f'iter {it} WARNING: selfplay_infoset_merge is on but the merged trees made no link '
+                     f'({leaves} leaves): nothing was merged (docs/search.md 3.16)')
 
     def resign_metrics(self, it, out, results, remote=None):
         """Self-play resignation (zero/resign.py, docs/az.md 27), only when it is on (the metrics of before
@@ -880,6 +903,7 @@ class Run:
         self.belief_metrics(out, st, st0, results)
         self.fork_metrics(it, out, results, rem.pop('forks', None))
         self.cache_metrics(out, st, st0)
+        self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results, rem.pop('resign', None))
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
@@ -1914,6 +1938,8 @@ def check_eval_settings(cfg, where=''):
         check_leaf_view(cfg.get('eval_leaf_value_view', 'mover'), what='eval_leaf_value_view')
         from .mcts import check_merge
         check_merge(cfg.get('eval_infoset_merge', 0), cfg.get('eval_leaf_value_view', 'mover'), what='eval_infoset_merge')
+        check_merge(cfg.get('selfplay_infoset_merge', 0), cfg.get('selfplay_leaf_value_view', 'mover'),
+                    what='selfplay_infoset_merge')
         for pre in ('selfplay', 'eval'):
             tilt, clip, mix, _ = belief_settings(cfg, pre)
             check_belief(tilt, clip, mix, what=f'{pre}_belief_tilt')

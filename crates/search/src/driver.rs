@@ -484,8 +484,8 @@ pub struct NnSeat {
     pub resign_k: u32,
     pub resign_noresign: f64,
     /// Information-set merging (docs/search.md 3.16; false, the default: the tree of before): the seat's trees
-    /// merge their nodes by the root decider's observation (`Tree::set_merge`). Needs root-view leaf values
-    /// (`LeafView::Root`); an evaluation seat (self-play support is not built: `Driver::new` refuses it).
+    /// merge their nodes by the root decider's observation (`Tree::set_merge`) - every search of the seat (full,
+    /// fast, minor; evaluation or self-play). Needs root-view leaf values (`LeafView::Root`).
     pub infoset_merge: bool,
 }
 
@@ -834,6 +834,21 @@ impl LeafBuf {
             g.encode_sparse(viewer, &mut self.scratch, &mut self.xs_idx, &mut self.xs_val);
         } else {
             g.encode(viewer, self.row_x(G::NUM_FEATURES));
+        }
+    }
+    /// A new row from the non-zero features of `encode(viewer)` (`encode_sparse`'s pairs of it, computed
+    /// elsewhere: a merged tree's encoding of the leaf, docs/search.md 3.16) - by `encode_sparse`'s contract the row
+    /// `encode_row` makes, bit for bit (sparse: the pairs appended as its open row; dense: scattered into zeros).
+    fn push_pairs(&mut self, idx: &[u32], val: &[f32], f: usize) {
+        if self.sparse {
+            self.open = Some(self.xs_idx.len());
+            self.xs_idx.extend_from_slice(idx);
+            self.xs_val.extend_from_slice(val);
+        } else {
+            let x = self.row_x(f);
+            for (&i, &v) in idx.iter().zip(val) {
+                x[i as usize] = v;
+            }
         }
     }
     /// `obs_hash` of the open row of `f` features (the evaluation cache's key, docs/search.md 3.12): of the
@@ -1306,11 +1321,17 @@ struct Counters {
     cache_leaves: AtomicU64,
     cache_partial: AtomicU64,
     cache_clears: AtomicU64,
-    /// Information-set merging (docs/search.md 3.16): links made, merges, aliases, growth leaves.
+    /// Information-set merging (docs/search.md 3.16): links made, merges, aliases, growth leaves, leaf rows of the
+    /// viewer taken from the tree's encoding (not encoded again).
     merge_links: AtomicU64,
     merge_merged: AtomicU64,
     merge_aliases: AtomicU64,
     merge_growths: AtomicU64,
+    merge_shared: AtomicU64,
+    /// (the tests: the leaf rows are encoded as before, never taken from a merged tree's encoding - the batches
+    /// must be the same bytes either way)
+    #[cfg(test)]
+    share_off: AtomicBool,
     /// The longest a game's step took (one slot's advance between two of its leaves: its search
     /// and moves, ns), that game's gid, and the steps over SLOW_STEP_NS.
     step_max_ns: AtomicU64,
@@ -1479,11 +1500,14 @@ pub struct DriverStats {
     /// Information-set merging (`NnSeat::infoset_merge`, docs/search.md 3.16): the merged trees' new child
     /// signatures (links), those that found an existing node by its observation (merges), the walks given a
     /// fresh node because that node was on their path (aliases), and the growth leaves (a world with an option
-    /// outside another seat's union; they are in `leaves` too).
+    /// outside another seat's union; they are in `leaves` too). `merge_shared`: the leaf rows of the tree's viewer
+    /// (a viewer's leaf's own row, another seat's leaf's root-view value-only row) whose features were the merged
+    /// tree's encoding of the leaf, not encoded again (sent or looked up in the evaluation cache).
     pub merge_links: u64,
     pub merge_merged: u64,
     pub merge_aliases: u64,
     pub merge_growths: u64,
+    pub merge_shared: u64,
     pub emitted: u64,
     pub epoch: u32,
     pub net: u32,
@@ -1591,11 +1615,10 @@ impl<G: SearchGame> Driver<G> {
                     if n.infoset_merge {
                         // (docs/search.md 3.16: an other seat's merged node is valued from the root decider's view,
                         // the same in every world of its observation - the mover's view would be one world's)
+                        // (self-play too: the records, the root value, resignation and the move read the root only,
+                        // whose statistics are the same kind merged or not)
                         if n.leaf_value_view != LeafView::Root {
                             return Err("infoset_merge: needs leaf_value_view 'root' (a merged node of another seat is valued from the root decider's view)".into());
-                        }
-                        if n.selfplay {
-                            return Err("infoset_merge: an evaluation seat (selfplay false): self-play support is not built yet (docs/search.md 3.16)".into());
                         }
                     }
                     if let Some(lc) = &n.look {
@@ -2193,6 +2216,7 @@ impl<G: SearchGame> Driver<G> {
             merge_merged: c.merge_merged.load(Ordering::Relaxed),
             merge_aliases: c.merge_aliases.load(Ordering::Relaxed),
             merge_growths: c.merge_growths.load(Ordering::Relaxed),
+            merge_shared: c.merge_shared.load(Ordering::Relaxed),
             emitted: self.emitted,
             epoch: self.sh.epoch.load(Ordering::Relaxed),
             net: self.sh.net.load(Ordering::Relaxed),

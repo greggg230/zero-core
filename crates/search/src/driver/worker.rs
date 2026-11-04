@@ -103,8 +103,10 @@ struct Tally {
     cache_leaves: u64,
     cache_partial: u64,
     cache_clears: u64,
-    /// Information-set merging (docs/search.md 3.16): the merged trees' counters, summed over simulations.
+    /// Information-set merging (docs/search.md 3.16): the merged trees' counters, summed over simulations, and the
+    /// leaf rows of the viewer taken from a merged tree's encoding.
     merge: crate::tree::MergeStats,
+    merge_shared: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -265,11 +267,13 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
         k.cache_partial.fetch_add(n.cache_partial, Ordering::Relaxed);
         k.cache_clears.fetch_add(n.cache_clears, Ordering::Relaxed);
     }
-    if n.merge.links > 0 {
+    // (every counter: a chunk's walks may alias through known links without making a link)
+    if n.merge != crate::tree::MergeStats::default() || n.merge_shared > 0 {
         k.merge_links.fetch_add(n.merge.links, Ordering::Relaxed);
         k.merge_merged.fetch_add(n.merge.merged, Ordering::Relaxed);
         k.merge_aliases.fetch_add(n.merge.aliases, Ordering::Relaxed);
         k.merge_growths.fetch_add(n.merge.growths, Ordering::Relaxed);
+        k.merge_shared.fetch_add(n.merge_shared, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -605,7 +609,10 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 let buf = &mut bufs[seat.key as usize];
                 let local = buf.len() as u32;
                 let acts = tree.leaf_acts(node);
-                buf.encode_row(sg, player);
+                // (information-set merging, docs/search.md 3.16: the leaf's row of the viewer - its own row at a
+                // viewer's leaf, the value-only row at another seat's - as the merged tree encoded it, not again)
+                let shared = leaf_obs(sh, tree, node);
+                encode_leaf_row(buf, sg, player, shared.filter(|_| player == tree.viewer), n);
                 let lkey = cache_key(buf.row_hash(G::NUM_FEATURES), acts);
                 let leaf = slot.cache.get(&(seat.key, slot.net, lkey)).cloned();
                 if leaf.is_some() {
@@ -622,7 +629,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
                 let (mut vkey, mut view) = (None, None);
                 if vrow {
-                    buf.encode_row(sg, tree.viewer);
+                    encode_leaf_row(buf, sg, tree.viewer, shared, n);
                     let k = cache_key(buf.row_hash(G::NUM_FEATURES), &[]);
                     view = slot.cache.get(&(seat.key, slot.net, k)).cloned();
                     if view.is_some() {
@@ -665,7 +672,9 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             Sim::Leaf { node, player } => {
                 let buf = &mut bufs[seat.key as usize];
                 let local = buf.len() as u32;
-                buf.encode_row(sg, player);
+                // (the leaf's row of the viewer from the merged tree's encoding: as with the eval cache, above)
+                let shared = leaf_obs(sh, tree, node);
+                encode_leaf_row(buf, sg, player, shared.filter(|_| player == tree.viewer), n);
                 buf.seal();
                 let acts = tree.leaf_acts(node);
                 buf.nopt.push(acts.len() as i32);
@@ -678,7 +687,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 // value-only row (no options) of the tree's viewer, the root decider, right after it
                 let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
                 if vrow {
-                    buf.encode_row(sg, tree.viewer);
+                    encode_leaf_row(buf, sg, tree.viewer, shared, n);
                     buf.seal();
                     buf.nopt.push(0);
                     buf.player.push(tree.viewer as i32);
@@ -821,6 +830,30 @@ fn guard_move(means: &[(u16, f64)], margin: f64, a: u16) -> (u16, bool) {
         (best.0, true)
     } else {
         (a, false)
+    }
+}
+
+/// The merged tree's encoding of the walk's leaf from its viewer (`Tree::leaf_obs`; None when off, when the walk did
+/// not encode its leaf, or when a test turned the reuse off).
+fn leaf_obs<'t, G: SearchGame>(sh: &Shared<G>, tree: &'t Tree<G>, node: u32) -> Option<(&'t [u32], &'t [f32])> {
+    #[cfg(test)]
+    if sh.counters.share_off.load(Ordering::Relaxed) {
+        return None;
+    }
+    let _ = sh;
+    tree.leaf_obs(node)
+}
+
+/// A leaf's row of `viewer` into `buf` (sealed by the caller): `encode(viewer)` of `g`, or `shared` - the merged
+/// tree's `encode_sparse(viewer)` of the same state (docs/search.md 3.16), the same row bit for bit by that
+/// contract, one encode fewer.
+fn encode_leaf_row<G: SearchGame>(buf: &mut LeafBuf, g: &G, viewer: usize, shared: Option<(&[u32], &[f32])>, n: &mut Tally) {
+    match shared {
+        Some((idx, val)) => {
+            buf.push_pairs(idx, val, G::NUM_FEATURES);
+            n.merge_shared += 1;
+        }
+        None => buf.encode_row(g, viewer),
     }
 }
 

@@ -74,7 +74,7 @@ class NNSeat:
     noise's scale, gumbel_c_visit / gumbel_c_scale sigma's transform (None: cq_c_visit / cq_c_scale).
     cq_prior_w: beta, the prior's exponent in the recorded 'cq' target (docs/search.md 3.13; 1 = off).
     infoset_merge: information-set merging (docs/search.md 3.16): the Rust tree only (impl 'rs'; the reference
-    tree has no merged mode), root-view leaf values, an evaluation seat."""
+    tree has no merged mode), root-view leaf values."""
 
     def __init__(self, key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, temp_moves=20,
                  sims_fast=None, p_full=1.0, chance_k=0, margin_w=0.0, redet=True, impl='py',

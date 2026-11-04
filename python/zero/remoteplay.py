@@ -117,6 +117,12 @@ def _resign_of(cfg):
     return fingerprint(cfg)
 
 
+def _merge_of(cfg):
+    """A run's self-play information-set merging (`selfplay_infoset_merge`, '' when off): what a worker's hello
+    reports and the run checks (docs/az.md 30) - an older checkout would search its games unmerged in silence."""
+    return 'ism' if int(cfg.get('selfplay_infoset_merge', 0) or 0) else ''
+
+
 def _forks_of(fk):
     """A run's branched games and archive starts as its driver plays them (`forks.fingerprint` of a Run's
     `forks`, '' when off): what a worker's hello reports and the run checks (docs/az.md 24)."""
@@ -776,6 +782,11 @@ class RemotePlay:
                     # a checkout without self-play resignation (or with other settings) would play its games out
                     # in silence: never used (docs/az.md 27)
                     s.no_resign = ev.get('resign')
+                want_m = _merge_of(self.R.cfg) if self.mode == 'selfplay' else ''
+                if want_m and ev.get('merge') != want_m:
+                    # a checkout without self-play information-set merging would search unmerged in silence:
+                    # never used (docs/az.md 30)
+                    s.no_merge = ev.get('merge')
                 if self.fails or s.k == 0:
                     self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
             elif kind == 'status':
@@ -894,6 +905,13 @@ class RemotePlay:
                 self.fail_log(f'worker {k} REFUSED: its checkout plays self-play resignation as {s.no_resign!r}, the run '
                               f'as {_resign_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 27); killed, '
                               f'retried in 10 minutes')
+                s.kill()
+                continue
+            if hasattr(s, 'no_merge'):
+                self.next_try[k] = now + max(self.retry_s, 600.0)
+                self.fail_log(f'worker {k} REFUSED: its checkout plays self-play information-set merging as '
+                              f'{s.no_merge!r}, the run as {_merge_of(self.R.cfg)!r} (an older checkout has none: '
+                              f'docs/az.md 30); killed, retried in 10 minutes')
                 s.kill()
                 continue
             if hasattr(s, 'no_belief'):
@@ -1885,7 +1903,8 @@ class Worker:
                       mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),
                       **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}),
                       **({} if self.test.get('no_forks') else {'forks': _forks_of(self._forks())}),
-                      **({} if self.test.get('no_resign') else {'resign': _resign_of(self.cfg)}))
+                      **({} if self.test.get('no_resign') else {'resign': _resign_of(self.cfg)}),
+                      **({} if self.test.get('no_merge') else {'merge': _merge_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None
