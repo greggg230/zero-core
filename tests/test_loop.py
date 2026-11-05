@@ -205,6 +205,106 @@ def test_sparse_setting_plays_the_same_selfplay(smoke_run, tmp_path, monkeypatch
             assert np.array_equal(arrs[k], shards[1][p][k]), (p, k)
 
 
+def test_shard_sparse_writes_the_same_samples(smoke_run, tmp_path):
+    """Run setting shard_sparse (docs/az.md 32): an iteration's self-play (one-shot and rolling) writes the
+    same samples as sparse shards - read back array for array, the features bit for bit -, smaller; off
+    (the default) the shards of before: the dense arrays, no x_* meta key."""
+    import shutil
+    import numpy as np
+    from zero import run as R
+    from zero.data import read_shard
+    assert R.DEFAULTS['shard_sparse'] == 0
+    with open(os.path.join(smoke_run, 'config.json')) as f:
+        cfg = json.load(f)
+    for rolling in (0, 1):
+        got = {}
+        for sp in (0, 1):
+            run = tmp_path / f'r{rolling}s{sp}'
+            shutil.copytree(smoke_run, run)
+            out = R.Run(str(run), dict(cfg, rolling=rolling, shard_sparse=sp)).selfplay(2)
+            d = run / 'data' / 'iter_0002'
+            names = sorted(p for p in os.listdir(d) if p.endswith('.npz'))
+            files = {}
+            for p in names:
+                with np.load(d / p) as z:
+                    files[p] = z.files
+            got[sp] = ({p: read_shard(str(d / p)) for p in names}, files, out)
+        (dense, dfiles, dout), (sparse, sfiles, sout) = got[0], got[1]
+        assert dense.keys() == sparse.keys() and dense
+        assert (dout['samples'], dout['shards'], dout['games']) == (sout['samples'], sout['shards'], sout['games'])
+        assert sout['bytes'] < dout['bytes']
+        for p, a in dense.items():
+            b = sparse[p]
+            assert 'x' in dfiles[p] and 'x_val' not in dfiles[p] and 'x' not in sfiles[p] and 'x_val' in sfiles[p]
+            assert not any(k.startswith('x_') for k in a['meta'])
+            assert b['meta'] == dict(a['meta'], x_format='sparse', x_version=1, x_cols=a['x'].shape[1],
+                                     x_nnz=int((a['x'].view(np.uint16) != 0).sum()))
+            assert a.keys() == b.keys()
+            for k in a:
+                if k != 'meta':
+                    assert a[k].dtype == b[k].dtype and np.array_equal(a[k], b[k]), (rolling, p, k)
+            assert np.array_equal(a['x'].view(np.uint16), b['x'].view(np.uint16))
+
+
+def test_sparse_shards_train_the_same_network(smoke_run, tmp_path):
+    """A run whose shards are sparse (shard_sparse), or a mix of dense and sparse generations, trains the
+    network of its dense shards, weight for weight: dense and sparse windows (window_sparse), the cache,
+    prefetch, and over budget (a subsampled window)."""
+    import glob
+    import shutil
+    import torch
+    from zero import run as R
+    from zero.data import convert_shard
+    with open(os.path.join(smoke_run, 'config.json')) as f:
+        cfg = json.load(f)
+    cfg = dict(cfg, train_device='cpu')
+    runs = {}
+    for kind in ('sparse', 'mixed'):
+        run = tmp_path / kind
+        shutil.copytree(smoke_run, run)
+        for d in sorted(glob.glob(str(run / 'data' / 'iter_*'))):
+            if kind == 'mixed' and d.endswith('1'):
+                continue                               # (iteration 1 stays dense)
+            for p in sorted(glob.glob(os.path.join(d, '*.npz'))):
+                convert_shard(p, p + '.conv')
+                os.replace(p + '.conv', p)
+        runs[kind] = run
+
+    def trained(run, c):
+        model, _, stats = R.Run(str(run), c).train_model(2, 200)
+        return {k: v.detach().clone() for k, v in model.state_dict().items()}, stats()
+
+    for extra in ({}, {'window_cache': 1}, {'window_sparse': 1}, {'window_sparse': 1, 'window_cache': 1, 'train_prefetch': 2},
+                  {'ram_budget_gb': 1e-4}, {'ram_budget_gb': 1e-4, 'window_sparse': 1, 'window_cache': 1}):
+        c = dict(cfg, **{'window_cache': 0, **extra})
+        ref, st0 = trained(smoke_run, c)
+        for kind, run in runs.items():
+            got, st = trained(run, c)
+            assert (st['window_samples'], st['window_loaded']) == (st0['window_samples'], st0['window_loaded'])
+            for k in ref:
+                assert torch.equal(ref[k], got[k]), (kind, extra, k)
+
+
+def test_loop_with_sparse_shards(tmp_path):
+    """`--shard-sparse 1`: the loop end to end on sparse shards (every shard sparse, the iteration's bytes
+    its files' sizes, training on them)."""
+    import glob
+    import numpy as np
+    run = tmp_path / 'sps'
+    p = run_loop(run, '--iters', '2', '--shard-sparse', '1')
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert json.load(open(run / 'config.json'))['shard_sparse'] == 1
+    m = read_metrics(str(run))
+    assert [r['iter'] for r in m] == [0, 1, 2] and m[2]['train']['steps'] >= 10
+    for r in m[1:]:
+        files = sorted(glob.glob(str(run / 'data' / f'iter_{r["iter"]:04d}' / '*.npz')))
+        assert files and r['selfplay']['bytes'] == sum(os.path.getsize(f) for f in files)
+        for f in files:
+            with np.load(f) as z:
+                assert 'x_val' in z.files and 'x' not in z.files
+                assert json.loads(str(z['meta']))['x_format'] == 'sparse'
+
+
 def test_eval_cache_setting(smoke_run, tmp_path, monkeypatch):
     """Run setting eval_cache (docs/az.md 25): 0 = no seat key, no metrics key (the run of before); N > 0 =
     every network seat carries it and self-play reports the rows its games' caches answered."""

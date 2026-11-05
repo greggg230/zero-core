@@ -394,12 +394,15 @@ def test_unreachable_remote_never_blocks(tmp_path):
     assert not remote_shards(run)
 
 
-def test_nonfinite_remote_shard_is_quarantined(tmp_path):
+@pytest.mark.parametrize('sparse', [0, 1])
+def test_nonfinite_remote_shard_is_quarantined(tmp_path, sparse):
     """A remote shard with a NaN (here a file damaged after the worker's own check) is caught on
     arrival: quarantined in <run>/debug/, never in data/, and the run fails with NonFinite at the
-    end of the phase, before any training on it."""
+    end of the phase, before any training on it - a sparse shard (shard_sparse) too."""
+    from zero.data import read_shard
     run = tmp_path / 'nan'
-    p = run_loop(run, '--iters', '3', *TOY, '--selfplay-remote', 'local', env=env_for(tmp_path, {'corrupt': 1}))
+    p = run_loop(run, '--iters', '3', *TOY, '--selfplay-remote', 'local', '--shard-sparse', str(sparse),
+                 env=env_for(tmp_path, {'corrupt': 1}))
     assert p.returncode != 0
     out = p.stdout + p.stderr
     assert 'NonFinite' in out and 'non-finite sample values in its shard' in out, out[-3000:]
@@ -409,9 +412,37 @@ def test_nonfinite_remote_shard_is_quarantined(tmp_path):
     assert not remote_shards(run)
     assert not os.path.exists(run / 'models' / f'iter_{it:04d}.pt'), 'no training on it'
     assert runctl.read_state(str(run), 'run')['state'] == 'aborted'
-    with np.load(bad[0]) as z:
-        assert np.isnan(z['x'].astype(np.float32)).any()
+    assert ('x_val' in read_shard(bad[0], dense=False)) == bool(sparse)
+    assert np.isnan(read_shard(bad[0])['x'].astype(np.float32)).any()
     assert gone(worker_pids(run))
+
+
+def test_sparse_shards_from_both_machines(tmp_path):
+    """Run setting shard_sparse with remote self-play: the worker writes its compressed shards sparse too
+    (the run's settings reach its mirror), each checked and counted on arrival as a dense one; the
+    training's steps follow both machines' samples."""
+    run = tmp_path / 'sps'
+    p = run_loop(run, '--iters', '3', *TOY, '--selfplay-remote', 'local', '--shard-sparse', '1', env=env_for(tmp_path))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    assert [r for r in m[1:] if r['selfplay']['remote']['samples']]
+    for r in m[1:]:
+        it, sp, rem = r['iter'], r['selfplay'], r['selfplay']['remote']
+        files = remote_shards(run, it)
+        assert len(files) == rem['shards'] and rem['bytes'] == sum(os.path.getsize(f) for f in files)
+        assert rem['quarantined'] == 0 and rem['rejected'] == 0
+        rows = 0
+        local = [f for f in glob.glob(str(run / 'data' / f'iter_{it:04d}' / '*.npz')) if f not in files]
+        assert local and sp['bytes'] == sum(os.path.getsize(f) for f in local)
+        for f in files + local:
+            with np.load(f) as z:
+                meta = json.loads(str(z['meta']))
+                assert 'x_val' in z.files and 'x' not in z.files and meta['x_format'] == 'sparse'
+                if f in files:
+                    assert meta['source'] == 'remote' and len(z['player']) == meta['rows']
+                    rows += meta['rows']
+        assert rows == rem['samples']
+        assert r['train']['steps'] == max(10, int(np.ceil((sp['samples'] + rem['samples']) * 4.0 / 64)))
 
 
 def test_backs_off_while_an_evaluation_holds_its_lock(tmp_path):

@@ -255,6 +255,29 @@ def test_defaults_add_nothing(base_run):
 
 # ------------------------------------------------------------------ zero.heldout
 
+def test_heldout_on_sparse_shards(base_run, tmp_path):
+    """Sparse shards (run setting shard_sparse, docs/az.md 32): a held-out set made from them is the set of
+    the dense shards, and a sparse held-out set gives the dense set's losses (its name - file sizes -
+    aside)."""
+    from zero import heldout
+    from zero.data import convert_shard, read_shard, shard_paths
+    from zero.net import load
+    d = base_run
+    sd = tmp_path / 'iter_0003'
+    for p in shard_paths(str(d / 'base' / 'data' / 'iter_0003')):
+        convert_shard(p, str(sd / os.path.basename(p)))
+    heldout.make([str(sd)], str(tmp_path / 'ho.npz'), rows=120, seed=1)
+    a, b = read_shard(str(d / 'ho.npz')), read_shard(str(tmp_path / 'ho.npz'))
+    assert a['meta'] == b['meta'] and a.keys() == b.keys()
+    assert all(a[k].dtype == b[k].dtype and np.array_equal(a[k], b[k]) for k in a if k != 'meta')
+    convert_shard(str(d / 'ho.npz'), str(tmp_path / 'ho_sparse.npz'))
+    m, _ = load(str(d / 'base' / 'models' / 'iter_0003.pt'))
+    r0 = heldout.HeldOut([str(d / 'ho.npz')]).evaluate(m)
+    r1 = heldout.HeldOut([str(tmp_path / 'ho_sparse.npz')]).evaluate(m)
+    assert {k: v for k, v in r0.items() if k not in ('set', 'seconds')} == {k: v for k, v in r1.items()
+                                                                           if k not in ('set', 'seconds')}
+
+
 def test_heldout_make_losses_and_guards(base_run, tmp_path):
     from zero import heldout
     from zero.data import Window, read_shard

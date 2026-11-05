@@ -8,6 +8,8 @@ Checks (all vectorised; a float16 array is checked on its bits, exponent all one
 * `write_shard` (zero/data.py): x, pi, z, q, sc after the float16 cast (a value above 65504
   becomes inf); a bad shard is written as `*.bad.npz` (the window never loads it) and the run
   fails naming the array, rows, columns (x) and the shard's meta.
+  A sparse shard (run setting shard_sparse, docs/az.md 32) is checked on its features' values
+  (`x_val`), and described by the rows and columns of the dense rows.
 * `Window`: the same arrays of every shard it loads (shards written before the guard too).
 * `Run.train` (zero/run.py): the loss terms and the gradient norm after `clip_grad_norm_`,
   before `optimizer.step()`; the failing batch is saved to `<run>/debug/`.
@@ -78,11 +80,29 @@ def describe(name, a, rows, opt_off=None):
     return out + f' ({kinds})'
 
 
+def describe_sparse_x(c, ent):
+    """`describe` of a sparse shard's features (`x_ptr` / `x_idx` / `x_val`, zero/data.py) whose value
+    entries `ent` are non-finite: the dense rows' line (rows, columns, kinds)."""
+    ptr = np.asarray(c['x_ptr'], np.int64)
+    rows = np.unique(np.searchsorted(ptr, ent, side='right') - 1)
+    cols = np.unique(np.asarray(c['x_idx'])[ent])
+    v = np.asarray(c['x_val'])[ent].astype(np.float32)
+    n = [int(np.isnan(v).sum()), int(np.isposinf(v).sum()), int(np.isneginf(v).sum())]
+    kinds = ', '.join(f'{k} {name}' for k, name in zip(n, ('NaN', '+inf', '-inf')) if k)
+    return f'x: {len(rows)} row(s) {head(rows)}, column(s) {head(cols)} ({kinds})'
+
+
 def shard_problems(c):
     """The non-finite entries of a shard's float arrays (stored dtypes: zero/data.py) -> one
-    line per bad array; [] = clean."""
+    line per bad array; [] = clean. A sparse shard's features (`x_val`, no `x`): its values (a NaN /
+    inf is never a zero), described as the dense rows would be."""
     probs = []
     for k in SHARD_FLOATS:
+        if k == 'x' and 'x' not in c and 'x_val' in c:
+            ent = nonfinite_rows(c['x_val'])
+            if len(ent):
+                probs.append(describe_sparse_x(c, ent))
+            continue
         if k not in c:
             continue
         rows = nonfinite_rows(c[k])

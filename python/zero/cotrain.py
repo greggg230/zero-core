@@ -60,7 +60,7 @@ import numpy as np
 
 from . import games as G
 from . import package
-from .data import ShardWriter, TargetStats
+from .data import ShardWriter, TargetStats, shard_format
 from .finite import NonFinite, check_state
 from .infer import drive
 from .net import (EncodingMismatch, check_checkpoint, check_encoding, layout_sans_identity, load, save, tokens_layout,
@@ -614,7 +614,7 @@ class CoRun:
         writers, tstats = {}, {}
         for k, X in (('p', P), ('r', R)):
             meta = {'game': X.cfg['game'], 'features': X.info['num_features'], 'actions': X.info['num_actions'],
-                    'iter': it, 'net': 'primary' if k == 'p' else 'resolver'}
+                    'iter': it, 'net': 'primary' if k == 'p' else 'resolver', **shard_format(X.cfg)}
             writers[k] = ShardWriter(os.path.join(X.run, 'data', f'iter_{it:04d}'), 'r00', rows=X.cfg['shard_rows'],
                                      meta=meta, bad_dir=X.debug_dir())
             tstats[k] = TargetStats()

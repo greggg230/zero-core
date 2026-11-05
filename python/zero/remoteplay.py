@@ -1233,7 +1233,7 @@ class RemotePlay:
         logged) | ('quarantined', 0, None) (non-finite: moved to <run>/debug/, the run fails at end())."""
         from .data import read_shard
         from .finite import NonFinite, shard_problems
-        sh = read_shard(path)
+        sh = read_shard(path, dense=False)           # (a sparse shard's features as stored: docs/az.md 32)
         meta = sh['meta']
         info = self.R.info
         want = (self.R.cfg['game'], info['num_features'], info['num_actions'])
@@ -1824,7 +1824,7 @@ class Worker:
                   f'({bo:.0f}s backing off)' + ('; lingering' if self.linger and not ph['ending'] else ''))
 
     def _phase(self, msg):
-        from .data import ShardWriter
+        from .data import ShardWriter, shard_format
         from .infer import drive
         it = int(msg['iter'])
         self._load(it, msg['model'], msg.get('league'))
@@ -1832,7 +1832,7 @@ class Worker:
         c = self.cfg
         drv = self.drv
         meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'],
-                'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid}
+                'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid, **shard_format(c)}
         box = {}
         writer = ShardWriter(os.path.join(self.rdir, 'data', f'iter_{it:04d}'), self.prefix, rows=int(c['shard_rows']),
                              meta=meta, bad_dir=os.path.join(self.rdir, 'debug'), compress=COMPRESS,
@@ -1982,14 +1982,16 @@ def _terminate(pid, grace=10.0):
 
 
 def _corrupt(path):
-    """Tests: rewrite a shard with a NaN in x (as a damaged file would arrive)."""
+    """Tests: rewrite a shard with a NaN in x (as a damaged file would arrive; a sparse shard's first
+    stored value, in its format)."""
     import numpy as np
     from .data import read_shard, savez_level
-    sh = read_shard(path)
+    sh = read_shard(path, dense=False)
     meta = sh.pop('meta')
-    x = sh['x'].copy()
-    x[0, 0] = np.nan
-    sh['x'] = x
+    k = 'x_val' if 'x_val' in sh else 'x'
+    x = sh[k].copy()
+    x.reshape(-1)[0] = np.nan
+    sh[k] = x
     savez_level(path + '.c.tmp', COMPRESS, dict(meta=np.array(json.dumps(meta)), **sh))
     os.replace(path + '.c.tmp', path)
 

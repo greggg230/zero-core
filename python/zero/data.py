@@ -55,6 +55,20 @@ new shards (the Delver line: 54 s -> 6.6 s). The budget still counts dense rows.
 many steps ahead on a background thread (the window's gather, the float32 features and the dense
 targets: ~60 ms a batch for MTG's 33,652 features) while the training step runs on the device. The
 rows are drawn from the same generator in the same order, so the batches are the same.
+
+Sparse shards (run setting `shard_sparse`, docs/az.md 32): a shard's features stored as their non-zeros
+instead of `x` - `x_ptr` int64 [N+1], `x_idx` uint16 [nnz] (int32 past 65,536 columns), `x_val` float16
+[nnz]: row r's non-zeros are x_idx / x_val[x_ptr[r]:x_ptr[r + 1]], columns ascending, non-zero = the
+float16 bits (a -0.0 is kept), so the dense rows come back bit for bit - and in its meta `x_format`
+'sparse', `x_version` 1 (`X_VERSION`: a newer one is refused), `x_cols` (the dense width) and `x_nnz`.
+Every other array is the dense shard's. The writer is asked for it by its meta (`shard_format(cfg)`:
+{'x_format': 'sparse'}; without it a shard is written as before, byte for byte); a ShardWriter so asked
+keeps each added sample dict's features as their non-zeros (never the dense float16 copy of a whole
+shard). Every reader takes both formats, and a window mixes them (a generation written before the
+setting beside one written with it): `read_shard` densifies a sparse shard's features (all its rows;
+`dense=False`: as stored), the window reads a sparse shard's rows straight into its dense rows or its
+SparseRows (the same window either way), `shard_features` reads some rows of either, and the
+non-finite guard reads a sparse shard's values (zero/finite.py).
 """
 import glob
 import json
@@ -74,6 +88,54 @@ EXT = '.npz'
 BAD = '.bad.npz'                  # a quarantined shard (non-finite values): never loaded
 # Shards loaded at once by a Window (env ZERO_WINDOW_THREADS overrides; 1 = one at a time).
 WINDOW_THREADS = int(os.environ.get('ZERO_WINDOW_THREADS', '0')) or min(8, os.cpu_count() or 1)
+X_SPARSE = 'sparse'               # meta `x_format` of a sparse shard (module docstring)
+X_VERSION = 1                     # the sparse format's version this build writes and reads
+X_SPARSE_KEYS = ('x_ptr', 'x_idx', 'x_val')
+
+
+def shard_format(cfg):
+    """The meta keys that ask `write_shard` / `ShardWriter` for a run's shard format (run setting
+    `shard_sparse`): {'x_format': 'sparse'}, or {} (dense: the meta, and the shard, of before)."""
+    return {'x_format': X_SPARSE} if int(cfg.get('shard_sparse', 0) or 0) else {}
+
+
+def _wants_sparse(meta):
+    """Whether a writer's meta asks for sparse features ('x_format': 'sparse' | 'dense' | absent)."""
+    fmt = (meta or {}).get('x_format', 'dense')
+    if fmt not in ('dense', X_SPARSE):
+        raise ValueError(f"shard meta x_format {fmt!r}: 'dense' or {X_SPARSE!r}")
+    return fmt == X_SPARSE
+
+
+def _sparse_stored(files, meta, path):
+    """Whether a shard (its member names, its meta) stores its features sparse; a sparse format of a
+    newer version (or an incomplete one) is refused."""
+    if 'x_val' not in files:
+        return False
+    v = int(meta.get('x_version', 1))
+    if meta.get('x_format', X_SPARSE) != X_SPARSE or v > X_VERSION:
+        raise ValueError(f'shard {path}: features stored as {meta.get("x_format")!r} version {v}; this build '
+                         f'reads {X_SPARSE!r} up to version {X_VERSION} (a newer zero-core wrote it)')
+    if any(k not in files for k in X_SPARSE_KEYS) or 'x_cols' not in meta:
+        raise ValueError(f'shard {path}: a sparse shard without {X_SPARSE_KEYS} / meta x_cols')
+    return True
+
+
+def stored_rows(p, F=None):
+    """A sparse shard's features (`read_shard(..., dense=False)` arrays and meta) as SparseRows of
+    width F (None: the stored `x_cols`; narrower: the columns >= F dropped; wider: nothing to add),
+    column indexes in SparseRows' dtype for F (`SparseRows.from_dense`'s)."""
+    cols = int(p['meta']['x_cols'])
+    F = cols if F is None else int(F)
+    ptr, idx, val = p['x_ptr'].astype(np.int64, copy=False), p['x_idx'], p['x_val']
+    if F < cols and len(idx) and int(idx.max()) >= F:
+        keep = idx < F
+        N = len(ptr) - 1
+        cnt = np.bincount(np.repeat(np.arange(N), np.diff(ptr))[keep], minlength=N)
+        ptr = np.concatenate([np.zeros(1, np.int64), np.cumsum(cnt, dtype=np.int64)])
+        idx, val = idx[keep], val[keep]
+    itype = np.uint16 if F <= 1 << 16 else np.int32
+    return SparseRows(ptr, idx.astype(itype, copy=False), val.astype(np.float16, copy=False), F)
 
 
 def _narrow_int(a):
@@ -86,9 +148,14 @@ def _narrow_int(a):
 
 def compact(s):
     """Sample arrays (driver format) -> the stored dtypes."""
+    return {'x': s['x'].astype(np.float16), **_compact_rest(s)}
+
+
+def _compact_rest(s):
+    """`compact` but the features (in the stored order of the arrays)."""
     n = s['n_players']
     P = int(n.max()) if len(n) else 1
-    return {'x': s['x'].astype(np.float16), 'player': s['player'].astype(np.int8),
+    return {'player': s['player'].astype(np.int8),
             'n_players': n.astype(np.int8), 'opt_off': s['opt_off'].astype(np.int32),
             'opt_action': _narrow_int(s['opt_action']), 'pi': s['pi'].astype(np.float16),
             'z': s['z'][:, :P].astype(np.float16), 'q': s['q'][:, :P].astype(np.float16),
@@ -96,13 +163,26 @@ def compact(s):
             **({'aux': s['aux'].astype(np.float16)} if 'aux' in s else {})}
 
 
+def compact_sparse(s):
+    """`compact` of a sparse shard: the features as `x_ptr` / `x_idx` / `x_val` (from the sample dict's
+    SparseRows 'xs' when a ShardWriter made them, else from its dense 'x': the non-zeros of the float16
+    cast, bit for bit) -> (arrays, the dense width)."""
+    xs = s['xs'] if 'xs' in s else SparseRows.from_dense(s['x'], s['x'].shape[1])
+    return {'x_ptr': xs.indptr, 'x_idx': xs.idx, 'x_val': xs.val, **_compact_rest(s)}, xs.F
+
+
 def write_shard(path, s, meta, bad_path=None, compress=0):
     """Write the samples `s` to `path` (atomic) -> (rows, bytes). Non-finite values after the
     float16 cast: the shard goes to `bad_path` (default: `path` as *.bad.npz) and NonFinite is
     raised naming the arrays, rows, columns and the meta. `compress`: 0 = a plain npz (np.savez),
-    1-9 = a compressed npz at that zlib level (remote self-play: 1)."""
-    c = compact(s)
-    meta = dict(meta, rows=int(len(c['player'])))
+    1-9 = a compressed npz at that zlib level (remote self-play: 1). A meta with 'x_format': 'sparse'
+    (`shard_format`): the features stored as their non-zeros (module docstring)."""
+    if _wants_sparse(meta):
+        c, cols = compact_sparse(s)
+        meta = dict(meta, rows=int(len(c['player'])), x_version=X_VERSION, x_cols=int(cols), x_nnz=int(len(c['x_val'])))
+    else:
+        c = compact(s)
+        meta = dict(meta, rows=int(len(c['player'])))
     probs = shard_problems(c)
     if probs:
         bad = bad_path or path[:-len(EXT)] + BAD
@@ -141,10 +221,48 @@ def _save_npz(path, c, meta, compress=0):
             time.sleep(0.25)
 
 
-def read_shard(path):
+def read_shard(path, dense=True):
+    """A shard's arrays and its meta (a dict). A sparse shard's features (module docstring) come
+    densified as `x` float16 [N, x_cols], the dense shard's bit for bit (all its rows: the window
+    reads a sparse shard's rows without that, `shard_features` some of them); `dense` False: as
+    stored (`x_ptr` / `x_idx` / `x_val`; a dense shard's `x` as ever)."""
     with np.load(path) as z:
         out = {k: z[k] for k in z.files if k != 'meta'}
         out['meta'] = json.loads(str(z['meta']))
+    if _sparse_stored(out, out['meta'], path) and dense:
+        xs = stored_rows(out)
+        out['x'] = xs.dense(np.arange(xs.N))
+        for k in X_SPARSE_KEYS:
+            del out[k]
+    return out
+
+
+def shard_features(path, rows=None, F=None):
+    """Rows `rows` (None = all; an int array or a slice) of a shard's features as float16 [n, F] (F None
+    = the stored width; else cut / zero-padded), from either format: a dense shard's read in place
+    when it is stored uncompressed (only those rows), a sparse shard's scattered from its non-zeros."""
+    with np.load(path) as z:
+        meta = json.loads(str(z['meta']))
+        sparse = _sparse_stored(z.files, meta, path)
+        if sparse:
+            p = {k: z[k] for k in X_SPARSE_KEYS}
+        else:
+            x = _stored_member(path, 'x')
+            if x is None:
+                x = z['x']
+    if sparse:
+        p['meta'] = meta
+        xs = stored_rows(p, F)
+        N, cols = xs.N, xs.F
+    else:
+        N, cols = x.shape
+        F = cols if F is None else int(F)
+    sel = np.arange(N)[rows] if rows is not None else np.arange(N)
+    if sparse:
+        return xs.dense(sel)
+    out = np.zeros((len(sel), F), np.float16)
+    w = min(F, cols)
+    out[:, :w] = x[sel, :w]
     return out
 
 
@@ -179,10 +297,16 @@ def _stored_member(path, name):
 def _read_shard_sparse(path, F, idx, threads):
     """read_shard for a sparse window: every array but `x`, whose rows `idx` (None = all) come as
     SparseRows 'xs' - from the file in place when stored uncompressed. The non-finite guard of x
-    reads its non-zeros (a NaN / inf is never zero bits); a bad x is described from the dense rows."""
+    reads its non-zeros (a NaN / inf is never zero bits); a bad x is described from the dense rows.
+    A sparse shard: its rows' non-zeros as stored (cut to F; `x_ptr` / `x_idx` / `x_val` stay in the
+    result for the guard, which reads all of them)."""
     with np.load(path) as z:
         out = {k: z[k] for k in z.files if k not in ('meta', 'x')}
         out['meta'] = json.loads(str(z['meta']))
+        if _sparse_stored(z.files, out['meta'], path):
+            xs = stored_rows(out, F)
+            out['xs'] = xs if idx is None else xs.take(idx)
+            return out
         x = _stored_member(path, 'x')
         if x is None:
             x = z['x']
@@ -196,6 +320,44 @@ def _read_shard_sparse(path, F, idx, threads):
         del x
     out['xs'] = xs
     return out
+
+
+def convert_shard(src, dst, sparse=True, compress=None, threads=1):
+    """Write shard `src` again as `dst` with its features sparse (`sparse`) or dense (module docstring)
+    -> (rows, bytes): the same rows, every other array as stored (an old generation shrunk for good, or
+    a sparse one made readable by an older checkout). A dense uncompressed `src` is read in place in
+    chunks (never its dense rows in RAM at once; on `threads`). `compress`: zlib level of `dst` (None:
+    `src`'s - 1 if it is compressed, else 0). A shard with non-finite values is refused (NonFinite).
+    `dst` must be another file (write it, then replace `src` with it)."""
+    if os.path.abspath(src) == os.path.abspath(dst):
+        raise ValueError(f'convert_shard: {dst} is the source')
+    with zipfile.ZipFile(src) as zf:
+        deflated = any(zi.compress_type != zipfile.ZIP_STORED for zi in zf.infolist())
+    compress = (1 if deflated else 0) if compress is None else int(compress)
+    with np.load(src) as z:
+        meta0 = json.loads(str(z['meta']))
+        was = _sparse_stored(z.files, meta0, src)
+        rest = {k: z[k] for k in z.files if k not in ('meta', 'x') + X_SPARSE_KEYS}
+        if was:
+            xs = stored_rows(dict({k: z[k] for k in X_SPARSE_KEYS}, meta=meta0))
+        else:
+            x = _stored_member(src, 'x')
+            if x is None:
+                x = z['x']
+    meta = {k: v for k, v in meta0.items() if k not in ('x_format', 'x_version', 'x_cols', 'x_nnz')}
+    if sparse:
+        if not was:
+            xs = SparseRows.from_dense(x, x.shape[1], threads=threads)
+        c = {'x_ptr': xs.indptr, 'x_idx': xs.idx, 'x_val': xs.val, **rest}
+        meta.update(x_format=X_SPARSE, x_version=X_VERSION, x_cols=int(xs.F), x_nnz=int(len(xs.val)))
+    else:
+        c = {'x': xs.dense(np.arange(xs.N)) if was else x, **rest}
+    probs = shard_problems(c)
+    if probs:
+        raise NonFinite(f'shard {src}: non-finite values: ' + '; '.join(probs) + ' (not converted)')
+    os.makedirs(os.path.dirname(os.path.abspath(dst)) or '.', exist_ok=True)
+    _save_npz(dst, c, meta, compress)
+    return int(len(rest['player'])), os.path.getsize(dst)
 
 
 def shard_paths(d):
@@ -216,12 +378,16 @@ class ShardWriter:
     `bad_dir`: where a shard with non-finite values is quarantined, as
     `<data dir name>_<prefix>_SSS.bad.npz` (default: next to the good ones, `*.bad.npz`).
     `compress`: zlib level of the shards (0 = plain npz). `on_write(path, rows, bytes)`: called
-    after each shard is written (remote self-play announces its shards so)."""
+    after each shard is written (remote self-play announces its shards so). A `meta` with
+    'x_format': 'sparse' (`shard_format`, run setting shard_sparse): sparse shards, each added sample
+    dict's features kept as their non-zeros as it is added (the dense float16 rows of a shard are
+    never made)."""
 
     def __init__(self, d, prefix, rows=65536, meta=None, bad_dir=None, compress=0, on_write=None):
         os.makedirs(d, exist_ok=True)
         self.d, self.prefix, self.rows, self.meta, self.bad_dir = d, prefix, rows, dict(meta or {}), bad_dir
         self.compress, self.on_write = compress, on_write
+        self.sparse = _wants_sparse(self.meta)
         self.buf = []
         self.nbuf = 0
         self.k = 0
@@ -232,16 +398,25 @@ class ShardWriter:
     def add(self, s):
         if s is None or not len(s['player']):
             return
+        if self.sparse:
+            x = s['x']
+            s = {k: v for k, v in s.items() if k != 'x'}
+            s['xs'] = SparseRows.from_dense(x, x.shape[1])
         self.buf.append(s)
         self.nbuf += len(s['player'])
         if self.nbuf >= self.rows:
             self.flush()
 
     def flush(self):
+        xs = [b.pop('xs') for b in self.buf] if self.sparse else None
         s = concat_samples(self.buf)
         self.buf, self.nbuf = [], 0
         if s is None:
             return
+        if xs is not None:
+            if len({p.F for p in xs}) != 1:
+                raise ValueError(f'ShardWriter: sample dicts of different feature widths {sorted({p.F for p in xs})}')
+            s = dict(s, xs=SparseRows.concat(xs, xs[0].F))
         name = f'{self.prefix}_{self.k:03d}'
         bad = None
         if self.bad_dir:
@@ -334,7 +509,9 @@ class SparseRows:
     def from_dense(cls, x, F, rows=None, threads=1):
         """The rows `rows` (None = all) of float16 `x` [N, w], their columns cut to F (a narrower `x` is
         zero-padded: nothing to keep). Chunks of CHUNK rows on up to `threads` threads (numpy releases
-        the GIL)."""
+        the GIL). Another float `x` (a driver's float32 samples, ShardWriter): the rows of its float16
+        cast, bit for bit - a float32 `x` without that cast (its non-zero bits, then the values cast:
+        a value whose cast is +0.0 is dropped, a -0.0 kept)."""
         w = min(F, x.shape[1])
         n = len(x) if rows is None else len(rows)
         itype = np.uint16 if F <= 1 << 16 else np.int32
@@ -342,9 +519,18 @@ class SparseRows:
         def one(a):
             b = min(n, a + cls.CHUNK)
             xa = np.ascontiguousarray(x[a:b, :w] if rows is None else x[rows[a:b], :w])
-            f = np.flatnonzero(xa.view(np.uint16) != 0)
+            if xa.dtype == np.float32:
+                f = np.flatnonzero(xa.view(np.uint32) != 0)
+                v = xa.reshape(-1)[f].astype(np.float16)
+                k = v.view(np.uint16) != 0
+                f, v = f[k], v[k]
+            else:
+                if xa.dtype != np.float16:
+                    xa = xa.astype(np.float16)
+                f = np.flatnonzero(xa.view(np.uint16) != 0)
+                v = xa.reshape(-1)[f]
             r = f // w
-            return np.bincount(r, minlength=b - a), (f - r * w).astype(itype), xa.reshape(-1)[f]
+            return np.bincount(r, minlength=b - a), (f - r * w).astype(itype), v
         starts = range(0, n, cls.CHUNK)
         if threads > 1 and n > cls.CHUNK:
             with ThreadPoolExecutor(min(threads, len(starts))) as ex:
@@ -400,8 +586,10 @@ def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1):
     """One shard's part of a window: rows `idx` (None = all N), features cut / zero-padded to F
     written into `xdst` (a fresh array when None: then also returned as 'x'); `sparse`: instead the
     features as SparseRows 'xs' (converted on `xthreads` threads); `AW` > 0: the auxiliary
-    targets too ('aux' float16 [rows, AW] and 'aux_mask': zeros and False for a shard without them)."""
-    p = _read_shard_sparse(path, F, idx, xthreads) if sparse else read_shard(path)
+    targets too ('aux' float16 [rows, AW] and 'aux_mask': zeros and False for a shard without them).
+    A sparse shard (`shard_sparse`): its rows' non-zeros scattered into `xdst` (the dense shard's rows
+    bit for bit), or kept as they are stored for `sparse`."""
+    p = _read_shard_sparse(path, F, idx, xthreads) if sparse else read_shard(path, dense=False)
     probs = shard_problems(p)
     if probs:
         raise NonFinite(f'non-finite sample values in shard {path} (meta {json.dumps(p["meta"])}): '
@@ -420,10 +608,14 @@ def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1):
     if not sparse:
         if xdst is None:
             xdst = out['x'] = np.empty((len(idx), F), np.float16)
-        w = min(F, p['x'].shape[1])
-        xdst[:, :w] = p['x'][sel, :w]
-        if w < F:
-            xdst[:, w:] = 0
+        if 'x_val' in p:                           # a sparse shard
+            xdst[:] = 0
+            stored_rows(p, F).scatter(xdst, np.arange(len(idx)), idx)
+        else:
+            w = min(F, p['x'].shape[1])
+            xdst[:, :w] = p['x'][sel, :w]
+            if w < F:
+                xdst[:, w:] = 0
     off = p['opt_off'].astype(np.int64)
     lens = off[idx + 1] - off[idx]
     pos = _ranges(off[idx], lens)

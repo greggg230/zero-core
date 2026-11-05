@@ -19,7 +19,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `cotrain.py` | Co-training (section 11): a primary game whose deferred terminals the episodes of a resolver game decide, one network each in one run: `CoRun` (the loop), `Coordinator` (parked games -> queued episodes -> results by tag -> `resolve`), `run_pair` (two drivers on two threads), `PrimaryRun` (team events as matches) |
 | `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions, `forward_static` (static shapes for the CUDA graphs, 10.6); all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
 | `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place; `workers`: eager batches on threads; `graphs`: the conv network's `GraphRunner`, the token network's opt-in `TokenGraphRunner` - env ZERO_TOKEN_GRAPHS=1, section 10.6 -, `graph_calls`), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
-| `data.py` | Sample shards (`ShardWriter`, atomic npz, optionally compressed - remote self-play's; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (each shard subsampled as it is loaded; checks every shard; row provenance), `TargetStats` |
+| `data.py` | Sample shards (`ShardWriter`, atomic npz, optionally compressed - remote self-play's; the features dense or, with `shard_sparse`, as their non-zeros - section 32; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (each shard subsampled as it is loaded; checks every shard; row provenance), `TargetStats` |
 | `finite.py` | The non-finite guard (section 4.1): vectorised NaN / inf checks, `NonFinite` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
 | `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
@@ -116,6 +116,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `window`, `window_grow`, `min_window_samples` | 8, 1, 20000 | newest iterations trained on (1 + iter // 2 with window_grow), more until min samples |
 | `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
 | `window_cache`, `window_sparse` | 0, 0 | 1 = the window's shards stay in RAM between iterations (zero/data.py WindowCache); 1 = the window keeps each row's features as their non-zeros - the same window and batches in a fraction of the RAM for a sparse encoding, and with `window_cache` every shard cached whole also over budget, so an iteration loads only its new shards (10.8). The budget still counts dense rows |
+| `shard_sparse` | 0 | 1 = self-play writes each shard's features as their non-zeros (`x_ptr` / `x_idx` / `x_val`, meta `x_format` 'sparse'; every other array as before; this machine's shards and a remote's): the dense rows bit for bit in ~1/25 of the disk on MTG Zero's Delver line, written ~4-5x faster with the float32 rows never buffered. Every reader takes both formats, so a window may mix them; an older checkout cannot read a sparse shard (`data.convert_shard` makes it dense again) (32) |
 | `train_static` | 0 | 1 = a token network trains through its static forward (`TokenNet.forward_static`, the inference graphs': each batch one chunk of its longest row's tokens, no host sync) with a fused AdamW on CUDA, and a sparse window's batches travel as their non-zeros (dense on the device): the same batches and losses, the updates up to float32 rounding; ~2.8x a step on MTG Zero's Delver network (10.9). Another network is refused |
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
@@ -194,7 +195,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
 | `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'; with `eval_games` 0 `eval_yard` has 0 games: the iteration is still evaluated, section 20.1), `elo` (`select`: its pool unless 'visits'), `elo_anchored` (with `elo_anchors`: the rating of the fit with the anchors fixed, section 20.1), `heldout` (with `heldout_shards`: the held-out losses, section 20.2), `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
-| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
+| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15; with `shard_sparse` the features as `x_ptr` / `x_idx` / `x_val` instead of `x`: section 32): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
 | `elo/<rule>/results.json`, `elo/<rule>/ratings.json` | the pool of another evaluation move rule ('cq', 'cq-n2', ...; section 5.4): the same files, plus `select` (the rule) and `since` (the first iteration it rated) |
@@ -4375,3 +4376,125 @@ abort -, the resume replays and finishes); the loop's `NonFinite` from the write
 the full pytest (383 passed, 9 skipped, with 16 of these; the 17th alone), cargo test 139 + webnet 3 (the golden
 records), and MTG Zero's gates (its ENGINE.md 93: `check_checkpoint_compat` byte identity - take_samples now goes
 through the shared conversion -, the engine digest, the other games built against this core).
+
+## 32. Sparse sample shards (`shard_sparse`; MTG Zero's Delver mirror, 2026-11-04)
+
+**Why.** A shard stored each row's features dense as float16: for MTG Zero's Delver line 37,620 floats (75 KB) a
+row, ~9.6 GB per generation (iteration 1289: 124,581 rows in two shards, 9,632 MB - the `bytes` of its self-play
+metrics), though a row has ~242 non-zeros (0.64%). The window has kept only the non-zeros in RAM since 10.8
+(`window_sparse`), so the dense files were overhead everywhere else: disk (E: has run short: a forked A/B arm needs
+~50 GB of shards of its own), the write on the run's caller thread (part of the 22% of self-play throughput lost to
+sample handling, MTG Zero's E:/mtg-zero-scratch/ideas-3/bench_threads_ab.json), RAM (the writer buffers the driver's
+float32 rows until a shard is full - 9.5 GB for a 65k-row MTG shard - then concatenates and casts them at the
+flush: a peak of ~20 GB), and the copies from the remote.
+
+**What** (zero/data.py, zero/finite.py; opt-in, the default the shards of before):
+
+* *The format* (version 1): the features as `x_ptr` int64 [N+1], `x_idx` uint16 [nnz] (int32 past 65,536 columns),
+  `x_val` float16 [nnz] instead of `x` - row r's non-zeros at `x_ptr[r]:x_ptr[r + 1]`, columns ascending, non-zero
+  decided on the float16 bits (a -0.0 is kept, a value whose float16 is +0.0 is not: the dense rows come back bit for
+  bit) - and in the meta `x_format` 'sparse', `x_version` 1, `x_cols` (the dense width), `x_nnz`. Every other array
+  (`player`, `n_players`, `opt_off`, `opt_action`, `pi`, `z`, `q`, `sc`, `net`, `aux`) is the dense shard's, in the
+  same order. A shard is sparse when it has `x_val`; a newer `x_version` is refused by every reader (ValueError
+  naming it). Plain or compressed npz as before (local plain, the remote's zlib 1).
+* *Writing.* `data.shard_format(cfg)` gives the meta keys that ask for it (`{'x_format': 'sparse'}`, `{}` off);
+  `write_shard` writes sparse when its meta asks, and a `ShardWriter` whose meta asks converts each added sample dict
+  as it arrives (`SparseRows.from_dense` of the driver's float32 rows: their non-zero bits, then those values cast)
+  and never holds or builds the dense rows - its buffer is the non-zeros and the other arrays. ShardWriter's
+  interface is unchanged (constructor, `add`, `close` and its `{'samples', 'bytes', 'shards'}`, `on_write`), so a
+  wrapper calling it on another thread works on either format; `bytes` is the files as written. The writers that
+  ask: the run's self-play (one-shot, rolling and the shared queue with a remote), co-training's two networks, and
+  a remote self-play worker (the run's settings reach it through its mirror's config.json; an older remote checkout
+  writes dense shards, accepted as any).
+* *Reading* - every reader takes both formats, and a window mixes them (the generations before the setting beside
+  the ones after):
+  * `read_shard(path)`: the arrays and meta, a sparse shard's features densified as `x` (all its rows - tools,
+    tests); `read_shard(path, dense=False)`: as stored (`x_ptr` / `x_idx` / `x_val`).
+  * `shard_features(path, rows, F)`: some rows of either, cut / zero-padded to F (a dense shard's read in place
+    when stored plain); `stored_rows(p, F)`: a sparse shard's SparseRows at a network width.
+  * `Window`: a dense window scatters a sparse shard's rows into its own (subsampled or whole, the cache too); a
+    sparse window (`window_sparse`, with or without the cache) takes the stored non-zeros as its SparseRows, cut to
+    the network's width, the column dtype `from_dense` would give - the same window either way, so `batch`,
+    `features_coo` (train_static's COO path), `batches` / prefetch, `WindowCache` and the budget (dense rows, from
+    the meta's `rows`) are unchanged.
+  * The non-finite guard (`finite.shard_problems`): a sparse shard's `x_val`, described by the rows and columns of
+    the dense rows (the same message); the writer quarantines a bad sparse shard as `*.bad.npz` in its format.
+  * `heldout` (Window, meta), `distill` / `tools/distill.py` (Window, meta), remote self-play's fetch check (the
+    arrays as stored: no 0.6 GB dense copy per arriving MTG shard) and its test helper `_corrupt` (keeps the
+    format), `bench --shard` (`shard_features`), `run.window_shards` and `shard_rows` (the meta), `fork_run` (hard
+    links / copies the files, never reads them).
+* `data.convert_shard(src, dst, sparse=True | False)`: one shard rewritten in the other format offline, every other
+  array as stored (a dense source read in place in chunks, never its dense rows in RAM): an old generation shrunk for
+  good, or a sparse shard made readable by an older checkout.
+
+**Off by default.** `shard_sparse` 0: the shards of before - the same arrays in the same order and the same meta (no
+`x_*` key; `compact` now builds its dict from `_compact_rest`, the same dict). On: `--shard-sparse 1` (or in a
+preset); it takes effect at the next self-play phase, and the window reads the dense generations already on disk
+beside the new sparse ones. Nothing about the samples, the window, the batches or the training changes.
+
+**Costs.** The conversion of each added sample dict on the writer's thread (~63 us a MTG row: 4.1 s for a 65k-row
+shard, spread over the phase) against the dense flush's concatenation, cast and 5 GB write. An older zero-core
+cannot read a sparse shard (KeyError 'x'): a fork onto an older pin, tools of pinned run worktrees and scripts that
+read the `x` member need `convert_shard(..., sparse=False)` or this reader (MTG Zero's readout scripts: its ENGINE.md
+94). The auxiliary targets stay dense: on MTG they are now 134 MB of the 200 MB shard (zlib 1 makes them 1.4 MB;
+the next candidate, not part of this setting).
+
+**Tests and checks** (pytest; the whole suite below):
+
+* `tests/test_net_data.py::test_sparse_shards_round_trip` - the same driver-format samples (float32, ~5% non-zero,
+  -0.0s, values whose float16 is +0.0 and -0.0, an all-zero row, value-only rows, auxiliary targets) through a dense
+  and a sparse ShardWriter, plain and compressed, two shards each: every array and the features bit for bit, the
+  meta plus the `x_*` keys, the writers' counts; the stored arrays (dtypes, ascending columns, -0.0 kept); the dense
+  shard's members and meta exactly those of before; `shard_rows`, `shard_features` (rows, slices, cut / padded);
+  `convert_shard` both ways equal to the writers' shards; an unknown `x_format` and a newer `x_version` refused by
+  every reader.
+* `test_sparse_shards_are_the_same_window` - windows over sparse shards and over a mix of dense and sparse ones are
+  the windows of the dense shards of the same samples (every array, the features bit for bit, the batches - COO too
+  -, the bytes and reuse): dense and sparse windows, narrower / wider networks, over budget, auxiliary targets with
+  one shard without, and both caches over sliding windows.
+* `tests/test_loop.py::test_shard_sparse_writes_the_same_samples` - a toy run's self-play (one-shot and rolling)
+  with the setting on writes the shards of the setting off, read back array for array, smaller; off, the dense
+  members and meta of before. `test_sparse_shards_train_the_same_network` - the smoke run's shards converted to
+  sparse, and a mix of dense and sparse generations, train the network of the dense shards weight for weight
+  (dense / sparse window, cache, prefetch, over budget). `test_loop_with_sparse_shards` - `--shard-sparse 1` end to
+  end.
+* `tests/test_nonfinite.py::test_sparse_shards_are_guarded_alike` - a float16 overflow quarantined with the dense
+  shard's message, the bad shard sparse; a NaN in a sparse shard refused by both windows, naming its row and column.
+* `tests/test_remoteplay.py::test_sparse_shards_from_both_machines` (the remote 'local' worker writes sparse shards,
+  each checked and counted on arrival; the steps follow both machines' samples) and
+  `test_nonfinite_remote_shard_is_quarantined[0|1]` (a damaged sparse remote shard quarantined).
+* `tests/test_measure.py::test_heldout_on_sparse_shards` (a held-out set made from sparse shards is the dense
+  shards' set; a sparse set gives the same losses) and `tests/test_distill.py::test_the_tool_reads_sparse_shards`
+  (`--compare` on sparse shards = on dense ones).
+* The whole suite on 3f830c5: 377 passed, 9 skipped (once standalone with one known timing flake in
+  `test_remoteplay.py::test_a_dying_worker_gives_its_accepted_games_back` that passed alone; once in MTG Zero's
+  optin-core gate with none). MTG Zero `feat/sparse-shards` (its ENGINE.md 94): its own test on Delver rows, the
+  optin-core gate (checkpoint_compat identical, the three other games built against this core) and the repin gate
+  (engine digest f6543eb2b1b8752f).
+* A test merge with `feat/shard-writer-thread` 57fd981 (the writer thread that wraps ShardWriter, section 31; `git
+  merge-tree`: no conflict): an iteration's toy self-play, one-shot and rolling, writes the same samples with
+  `shard_writer_thread` x `shard_sparse` in all four combinations, and both branches' shard tests pass on it. With
+  both on, the writer thread casts each dict's features to float16 before `add`, which then converts that (the same
+  non-zeros; `from_dense` would take the float32 rows directly).
+
+**Measured** (2026-11-04, the desktop beside the live Delver line, IDLE priority; MTG Zero's r3-2b-float550,
+iteration 1289's shards copied to E:/mtg-zero-scratch/sparse-shards/real, converted there, deleted after;
+measure.py / measure2.py / measure.json):
+
+| | dense | sparse |
+|---|---:|---:|
+| a local 65,566-row shard (the features 4,933 MB, `aux` 134 MB, the rest 2 MB) | 5,069 MB | **200 MB (25.3x)**: the features 63.9 MB (15.85 M non-zeros, 242 a row, 0.64%: 77x), `aux` 134 MB |
+| the same, zlib level 1 | - | 11.0 MB (461x; 3.4 s to convert against 3.1 s plain) |
+| a remote shard (the Mac's, zlib 1; 6,673-7,405 rows) | 6.8-7.6 MB | **1.11-1.25 MB (6.1x)** |
+| a generation (iteration 1289: 124,581 local + 21,450 remote rows) | 9,632 + 22 MB | ~380 + 3.6 MB |
+| writing (ShardWriter, the driver's float32 rows in dicts of 512 rows) | 0.32-0.38 ms a row at the flush (4,096 rows 1.31-1.47 s, 8,192 rows 3.12 s): ~21-25 s for a 65k-row shard | 4.1 s of `add` (the conversion) + 0.5 s at the flush for the 65,566-row shard: ~0.07 ms a row |
+| the writer's buffer before the flush / its peak (tracemalloc; 8,192 rows) | 1,187 / 2,533 MB (~9.5 / ~20 GB for 65k rows) | 39 / 163 MB (~0.3 GB for 65k rows: the float32 `aux` most of it) |
+| a remote shard written at zlib 1 (on the desktop) | 1.77-2.00 s | 0.44-0.56 s |
+| a shard into a sparse window (whole, the cache's way; 8 threads) | 1.77 s (read in place + converted) | 0.36 s (zlib 1: 0.53 s) |
+| 4,096 rows of it into a dense window | - | 0.46 s |
+| a remote shard read (`read_shard`, densified) | 0.79-0.93 s | 0.18-0.21 s |
+
+Every one of the 65,566 rows came back bit for bit (0 mismatched values over 2.47 G) with every other array equal;
+the ShardWriter's own sparse shard of those rows (from float32 dicts) was `convert_shard`'s, array for array; the
+remote shards' round trips too. (The timings are the loaded desktop's: the dense writer's full 65k-row flush could
+not run beside the live run - it needs ~20 GB - so its row is the 4,096- and 8,192-row flushes, linear in rows.)
