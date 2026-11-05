@@ -116,7 +116,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `window`, `window_grow`, `min_window_samples` | 8, 1, 20000 | newest iterations trained on (1 + iter // 2 with window_grow), more until min samples |
 | `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
 | `window_cache`, `window_sparse` | 0, 0 | 1 = the window's shards stay in RAM between iterations (zero/data.py WindowCache); 1 = the window keeps each row's features as their non-zeros - the same window and batches in a fraction of the RAM for a sparse encoding, and with `window_cache` every shard cached whole also over budget, so an iteration loads only its new shards (10.8). The budget still counts dense rows |
-| `shard_sparse` | 0 | 1 = self-play writes each shard's features as their non-zeros (`x_ptr` / `x_idx` / `x_val`, meta `x_format` 'sparse'; every other array as before; this machine's shards and a remote's): the dense rows bit for bit in ~1/25 of the disk on MTG Zero's Delver line, written ~4x faster with the float32 rows never buffered. Every reader takes both formats, so a window may mix them; an older checkout cannot read a sparse shard (`data.convert_shard` makes it dense again) (32) |
+| `shard_sparse` | 0 | 1 = self-play writes each shard's features as their non-zeros (`x_ptr` / `x_idx` / `x_val`, meta `x_format` 'sparse'; every other array as before; this machine's shards and a remote's): the dense rows bit for bit in ~1/25 of the disk on MTG Zero's Delver line, written ~4-5x faster with the float32 rows never buffered. Every reader takes both formats, so a window may mix them; an older checkout cannot read a sparse shard (`data.convert_shard` makes it dense again) (32) |
 | `train_static` | 0 | 1 = a token network trains through its static forward (`TokenNet.forward_static`, the inference graphs': each batch one chunk of its longest row's tokens, no host sync) with a fused AdamW on CUDA, and a sparse window's batches travel as their non-zeros (dense on the device): the same batches and losses, the updates up to float32 rounding; ~2.8x a step on MTG Zero's Delver network (10.9). Another network is refused |
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
@@ -4355,6 +4355,16 @@ the next candidate, not part of this setting).
 * `tests/test_measure.py::test_heldout_on_sparse_shards` (a held-out set made from sparse shards is the dense
   shards' set; a sparse set gives the same losses) and `tests/test_distill.py::test_the_tool_reads_sparse_shards`
   (`--compare` on sparse shards = on dense ones).
+* The whole suite on 3f830c5: 377 passed, 9 skipped (once standalone with one known timing flake in
+  `test_remoteplay.py::test_a_dying_worker_gives_its_accepted_games_back` that passed alone; once in MTG Zero's
+  optin-core gate with none). MTG Zero `feat/sparse-shards` (its ENGINE.md 94): its own test on Delver rows, the
+  optin-core gate (checkpoint_compat identical, the three other games built against this core) and the repin gate
+  (engine digest f6543eb2b1b8752f).
+* A test merge with `feat/shard-writer-thread` 57fd981 (the writer thread that wraps ShardWriter, section 31; `git
+  merge-tree`: no conflict): an iteration's toy self-play, one-shot and rolling, writes the same samples with
+  `shard_writer_thread` x `shard_sparse` in all four combinations, and both branches' shard tests pass on it. With
+  both on, the writer thread casts each dict's features to float16 before `add`, which then converts that (the same
+  non-zeros; `from_dense` would take the float32 rows directly).
 
 **Measured** (2026-11-04, the desktop beside the live Delver line, IDLE priority; MTG Zero's r3-2b-float550,
 iteration 1289's shards copied to E:/mtg-zero-scratch/sparse-shards/real, converted there, deleted after;
