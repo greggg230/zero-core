@@ -1839,6 +1839,9 @@ class Worker:
                              on_write=self._on_shard(it, box))
         if self.threaded:
             from .shardthread import MB, ThreadedShardWriter
+            if not hasattr(drv, 'take_records'):
+                raise SystemExit('shard_writer_thread: this engine module has no SearchDriver.take_records (built from '
+                                 'an older zero-core): rebuild it')
             bw = ThreadedShardWriter(writer, max_bytes=float(c.get('shard_writer_queue_mb', 4096)) * MB,
                                      name='zero-rsp-writer')
         else:
