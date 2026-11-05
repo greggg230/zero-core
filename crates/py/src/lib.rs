@@ -11,7 +11,8 @@
 //!
 //! (its `Cargo.toml` depends on `zero_py`, `zero_search`, its engine crate and
 //! `pyo3 = { version = "0.23", features = ["extension-module"] }`). The module exposes `Game`,
-//! `SearchTree`, `SearchDriver`, `Lookahead` (the position API of docs/search.md 3.9),
+//! `SearchTree`, `SearchDriver`, `SampleRecords` (`SearchDriver.take_records`), `Lookahead` (the
+//! position API of docs/search.md 3.9),
 //! `game_names()`, `game_info_of(name)`, `lookahead_settings(settings)` and `MAX_SEATS`.
 use std::sync::OnceLock;
 
@@ -20,7 +21,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use zero_search::driver::{noresign_pick, root_floor, sample_arrays, view_pick, Batch, BranchCfg, DriverCfg, KeyKind, StartsCfg, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{noresign_pick, root_floor, sample_arrays, view_pick, Batch, BranchCfg, DriverCfg, KeyKind, StartsCfg, LeafView, NnSeat, PolicyTarget, Record, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
 use zero_search::lookahead::{LookCfg, Outcome};
 use zero_search::{SearchGame, MAX_SEATS};
@@ -74,6 +75,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_class::<PyGame>()?;
     m.add_class::<PySearchTree>()?;
     m.add_class::<PySearchDriver>()?;
+    m.add_class::<PySampleRecords>()?;
     m.add_class::<PyLookahead>()?;
     m.add_function(wrap_pyfunction!(lookahead_settings, m)?)?;
     m.add_function(wrap_pyfunction!(game_names, m)?)?;
@@ -962,30 +964,19 @@ impl PySearchDriver {
 
     /// Training sample arrays (docs/search.md 2.4) or None.
     fn take_samples(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        samples_dict(py, self.d.take_samples(), self.nfeat)
+    }
+
+    /// The training records as the driver holds them, or None (docs/search.md 2.4): take_samples
+    /// without its conversion - the records move out (no copy), and `SampleRecords.arrays()` turns
+    /// them into take_samples' arrays later, on any thread (zero/data.py ThreadedShardWriter: the
+    /// thread that drives the search never pays the copy; docs/az.md 31).
+    fn take_records(&mut self) -> Option<PySampleRecords> {
         let recs = self.d.take_samples();
         if recs.is_empty() {
-            return Ok(None);
+            return None;
         }
-        let f = self.nfeat;
-        let s = py.allow_threads(|| sample_arrays(&recs, f));
-        drop(recs);
-        let n = s.n;
-        let a = PyDict::new(py);
-        a.set_item("x", s.x.into_pyarray(py).reshape([n, f])?)?;
-        a.set_item("player", s.player.into_pyarray(py))?;
-        a.set_item("n_players", s.n_players.into_pyarray(py))?;
-        a.set_item("opt_off", s.opt_off.into_pyarray(py))?;
-        a.set_item("opt_action", s.opt_action.into_pyarray(py))?;
-        a.set_item("pi", s.pi.into_pyarray(py))?;
-        a.set_item("z", s.z.into_pyarray(py).reshape([n, MAX_SEATS])?)?;
-        a.set_item("q", s.q.into_pyarray(py).reshape([n, MAX_SEATS])?)?;
-        a.set_item("sc", s.sc.into_pyarray(py).reshape([n, MAX_SEATS])?)?;
-        a.set_item("net", s.net.into_pyarray(py))?;
-        if s.aw > 0 {
-            // the auxiliary targets (a driver created with aux=True; docs/search.md 1.2)
-            a.set_item("aux", s.aux.into_pyarray(py).reshape([n, s.aw])?)?;
-        }
-        Ok(Some(a.into_any().unbind()))
+        Some(PySampleRecords::new(recs, self.nfeat))
     }
 
     /// Throughput counters.
@@ -1075,6 +1066,110 @@ impl PySearchDriver {
         d.set_item("max_steps", s.max_steps)?;
         d.set_item("max_rounds", s.max_rounds)?;
         Ok(d)
+    }
+}
+
+/// take_samples' dict of `recs` (docs/search.md 2.4), None if there are none: the arrays built and
+/// the records freed off the GIL. `SearchDriver.take_samples` and `SampleRecords.arrays` (one
+/// conversion for both).
+fn samples_dict(py: Python<'_>, recs: Vec<Record>, f: usize) -> PyResult<Option<PyObject>> {
+    if recs.is_empty() {
+        return Ok(None);
+    }
+    let s = py.allow_threads(move || {
+        let s = sample_arrays(&recs, f);
+        drop(recs);
+        s
+    });
+    let n = s.n;
+    let a = PyDict::new(py);
+    a.set_item("x", s.x.into_pyarray(py).reshape([n, f])?)?;
+    a.set_item("player", s.player.into_pyarray(py))?;
+    a.set_item("n_players", s.n_players.into_pyarray(py))?;
+    a.set_item("opt_off", s.opt_off.into_pyarray(py))?;
+    a.set_item("opt_action", s.opt_action.into_pyarray(py))?;
+    a.set_item("pi", s.pi.into_pyarray(py))?;
+    a.set_item("z", s.z.into_pyarray(py).reshape([n, MAX_SEATS])?)?;
+    a.set_item("q", s.q.into_pyarray(py).reshape([n, MAX_SEATS])?)?;
+    a.set_item("sc", s.sc.into_pyarray(py).reshape([n, MAX_SEATS])?)?;
+    a.set_item("net", s.net.into_pyarray(py))?;
+    if s.aw > 0 {
+        // the auxiliary targets (a driver created with aux=True; docs/search.md 1.2)
+        a.set_item("aux", s.aux.into_pyarray(py).reshape([n, s.aw])?)?;
+    }
+    Ok(Some(a.into_any().unbind()))
+}
+
+/// The bytes a record holds (itself and its arrays' contents): `SampleRecords.nbytes`, a bounded
+/// queue's measure.
+fn record_bytes(r: &Record) -> usize {
+    std::mem::size_of::<Record>() + 4 * r.x.len() + 2 * r.opts.len() + 4 * r.pi.len() + 4 * r.aux.len()
+}
+
+/// Training records taken from a driver as they are (`SearchDriver.take_records`, docs/search.md
+/// 2.4): `len()` records holding `nbytes`; `split(sizes)` cuts them into consecutive parts (a
+/// finished game's records each: zero/workqueue.py split_records) and `arrays()` converts them
+/// into take_samples' dict - value for value the arrays take_samples gives at the point the records
+/// were taken, cut where the parts are - once: the records are consumed.
+#[pyclass(name = "SampleRecords")]
+pub struct PySampleRecords {
+    recs: Vec<Record>,
+    nfeat: usize,
+    bytes: usize,
+    used: bool,
+}
+
+impl PySampleRecords {
+    fn new(recs: Vec<Record>, nfeat: usize) -> PySampleRecords {
+        let bytes = recs.iter().map(record_bytes).sum();
+        PySampleRecords { recs, nfeat, bytes, used: false }
+    }
+
+    fn check(&self) -> PyResult<()> {
+        if self.used {
+            return Err(PyRuntimeError::new_err("SampleRecords: these records were converted or split already"));
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl PySampleRecords {
+    fn __len__(&self) -> usize {
+        self.recs.len()
+    }
+
+    /// Bytes the records hold (the records and their arrays).
+    #[getter]
+    fn nbytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Cut into consecutive parts of `sizes` records each (every size > 0, their sum `len()`): new
+    /// SampleRecords in order; this one is used up.
+    fn split(&mut self, sizes: Vec<usize>) -> PyResult<Vec<PySampleRecords>> {
+        self.check()?;
+        let total: usize = sizes.iter().sum();
+        if total != self.recs.len() || sizes.iter().any(|&k| k == 0) {
+            return Err(PyValueError::new_err(format!(
+                "SampleRecords.split: sizes {:?} (sum {}) for {} records (every size > 0, their sum the records)",
+                sizes,
+                total,
+                self.recs.len()
+            )));
+        }
+        self.used = true;
+        let nfeat = self.nfeat;
+        let mut rest = std::mem::take(&mut self.recs).into_iter();
+        Ok(sizes.iter().map(|&k| PySampleRecords::new(rest.by_ref().take(k).collect(), nfeat)).collect())
+    }
+
+    /// take_samples' dict of these records (docs/search.md 2.4), built off the GIL; once (a second
+    /// call, or one after `split`, raises).
+    fn arrays(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        self.check()?;
+        self.used = true;
+        samples_dict(py, std::mem::take(&mut self.recs), self.nfeat)
     }
 }
 
