@@ -80,6 +80,7 @@ control line came for `watchdog_s` (an orphan never outlives its run by long). A
 a slot (mirror, K) that a live worker of the same run still holds stops that one first; another
 run's is refused.
 """
+import contextlib
 import glob
 import json
 import os
@@ -98,6 +99,7 @@ from collections import deque
 
 from . import package
 from .remote import Transport, _alive, remote_spec
+from .shardthread import SampleClock, sample_rows, split_records
 from .workqueue import Shares, lag_hist, merge_hist, split_games
 
 TAG = 'ZERO_SP '
@@ -704,6 +706,11 @@ class RemotePlay:
             out.update(matches=cur['matches'], assigned=cur['assigned'], requeued=cur['requeued'],
                        requeued_timeout=cur['requeued_timeout'], requeued_backoff=cur['requeued_backoff'],
                        duplicates_dropped=cur['dup'], outstanding=outstanding)
+        if any('shard_writer' in e for e in ends):  # shard_writer_thread (docs/az.md 31): the workers' summed
+            ws = [e['shard_writer'] for e in ends if 'shard_writer' in e]
+            out['shard_writer'] = dict({k: round(sum(w.get(k, 0) for w in ws), 3) for k in
+                                        ('items', 'rows', 'waits', 'wait_s', 'close_s', 'writer_s', 'samples_s')},
+                                       queue_peak_mb=max(w.get('queue_peak_mb', 0) for w in ws), workers=len(ws))
         if any(e.get('linger') for e in ends):
             out['linger'] = {'games': sum((e.get('linger') or {}).get('games', 0) for e in ends),
                              'seconds': round(max((e.get('linger') or {}).get('seconds', 0.0) for e in ends), 1)}
@@ -1361,6 +1368,10 @@ class Worker:
         self.lg_slots = None
         from .games import spec_json
         self.spec = spec_json(self.cfg.get('spec'))
+        # shard_writer_thread (docs/az.md 31, the run's config): the records taken as they are (take_records) and
+        # converted, written and announced on a bounded writer thread (zero/shardthread.py); off: take_samples and
+        # the unbounded _BgWriter, as before
+        self.threaded = bool(self.cfg.get('shard_writer_thread'))
 
     def _forks(self):
         """This worker's branched games and archive starts (zero/forks.py: the mirror's config, its
@@ -1668,7 +1679,7 @@ class Worker:
         if self.lg_on:
             from .league import League
             League.attribute(rows, self.lg_kinds, self.lg_slots)     # (the slots' checkpoints now)
-        games = split_games(rows, s)
+        games = split_records(rows, s) if self.threaded else split_games(rows, s)
         from .forks import setups
         self.taken += setups(rows)                 # (a branch is its game's second row: zero/forks.py)
         if ph['closed']:
@@ -1681,7 +1692,7 @@ class Worker:
                 self.emit('row', row=row)
                 self.rows_out += 1
                 if sd is not None:
-                    ph['samples'] += len(sd['player'])
+                    ph['samples'] += sample_rows(sd)
                     if ph['closed']:
                         self.held_samples.append(sd)
                     else:
@@ -1693,7 +1704,7 @@ class Worker:
                     os._exit(9)
         else:
             self.held.extend(games)
-            ph['samples'] += sum(len(sd['player']) for _, sd in games if sd is not None)
+            ph['samples'] += sum(sample_rows(sd) for _, sd in games if sd is not None)
             if games:
                 self.emit('fin', iter=ph['it'], n=len(games))
 
@@ -1800,6 +1811,8 @@ class Worker:
             extra['forks'] = ph['forks']
         if ph.get('resign') is not None:
             extra['resign'] = ph['resign']
+        if self.threaded:
+            extra['shard_writer'] = dict(bw.metrics(), samples_s=round(ph['clock'].s, 3))
         self.emit('end', iter=ph['it'], games=ph['games'], samples=ph['samples'], shards=w['shards'], bytes=w['bytes'],
                   leaves=st['leaves'] - ph['leaves0'], seconds=round(secs, 2), active_s=round(secs - bo, 2),
                   backoff_s=round(bo, 2), in_flight=self.drv.in_flight()['games'], queued=self.drv.queued,
@@ -1824,12 +1837,22 @@ class Worker:
         writer = ShardWriter(os.path.join(self.rdir, 'data', f'iter_{it:04d}'), self.prefix, rows=int(c['shard_rows']),
                              meta=meta, bad_dir=os.path.join(self.rdir, 'debug'), compress=COMPRESS,
                              on_write=self._on_shard(it, box))
-        bw = box['bw'] = _BgWriter(writer)
+        if self.threaded:
+            from .shardthread import MB, ThreadedShardWriter
+            if not hasattr(drv, 'take_records'):
+                raise SystemExit('shard_writer_thread: this engine module has no SearchDriver.take_records (built from '
+                                 'an older zero-core): rebuild it')
+            bw = ThreadedShardWriter(writer, max_bytes=float(c.get('shard_writer_queue_mb', 4096)) * MB,
+                                     name='zero-rsp-writer')
+        else:
+            bw = _BgWriter(writer)
+        box['bw'] = bw
         st0 = drv.stats()
         drv.resume(BIG, it - 1)
         ph = {'it': it, 'games': 0, 'samples': 0, 't0': _now(), 'backoff': 0.0, 'bo_t0': 0.0, 'ending': False,
               't_lock': 0.0, 'leaves0': st0['leaves'], 'bw': bw, 'closed': False, 'accepted': 0,
-              'linger_games': 0, 'linger_prev': getattr(self, 'linger_prev', None), 'league': {}}
+              'linger_games': 0, 'linger_prev': getattr(self, 'linger_prev', None), 'league': {},
+              'clock': SampleClock() if self.threaded else contextlib.nullcontext()}
         if self.mode == 'selfplay' and self._forks() is not None:
             from .forks import new_tally
             ph['forks'] = new_tally()
@@ -1849,12 +1872,13 @@ class Worker:
             self._watchdog()
             if self.closing:
                 self._end_phase(ph)
-            rows = drv.take_results()
-            s = drv.take_samples()
-            if rows:
-                self._finished(ph, rows, s)
-            elif s is not None:
-                raise RuntimeError('remote self-play: samples without finished games')
+            with ph['clock']:
+                rows = drv.take_results()
+                s = drv.take_records() if self.threaded else drv.take_samples()
+                if rows:
+                    self._finished(ph, rows, s)
+                elif s is not None:
+                    raise RuntimeError('remote self-play: samples without finished games')
             if not ph['closed']:
                 bw.check()
             if slow:

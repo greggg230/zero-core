@@ -296,6 +296,17 @@ have targets, else the driver refuses) adds `aux` f32 [N, W]: each row's decider
 `aux_target` at that decision (section 1.2), computed when the decision is recorded; every other
 array is the same with it on or off (tested: the golden records).
 
+`take_records()` (2026-11-04; the run setting `shard_writer_thread`, docs/az.md 31) drains the same
+records without the conversion: the driver's `Record`s move out as they are (no copy) as a
+`SampleRecords` - `len()`, `nbytes` (what they hold: the bounded queue's measure), `split(sizes)`
+(consecutive parts, every size > 0 and their sum `len()`: per finished game, its row's `samples`;
+`zero/shardthread.py split_records` mirrors `zero/workqueue.py split_games`) and `arrays()`: the
+dict `take_samples` would have given for those records, value for value and dtype for dtype (one
+conversion for both, built and the records freed off the GIL), once - a second call, or one after
+`split`, raises. A caller drains with one or the other at each point; `take_results` pairs with
+either as before. So the thread that drives the search pays only the move, and a writer thread pays
+the copy into the dense arrays (MTG: 37,620 floats a row).
+
 ### 2.5 Results (`take_results`)
 
 `{gid, n, over, result, scores, steps, decisions, ext_moves, rounds, samples, tag}`; a game cut

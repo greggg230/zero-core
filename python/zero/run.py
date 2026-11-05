@@ -71,6 +71,7 @@ from .infer import T_STEP, NetEvaluator, drive, use_amp
 from .net import EncodingMismatch, add_aux, aux_layout, check_belief_head, check_checkpoint, load, make_net, save
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
+from .shardthread import MB, SampleClock, ThreadedShardWriter, split_records
 
 BIG = 1 << 62                                      # a rolling driver's quota when its phases end by end_phase()
 
@@ -274,6 +275,14 @@ DEFAULTS = dict(
     # a remote's lingering games. Needs selfplay_remote (the shared queue); single-game runs without the
     # self-play league. 0 = this machine's self-play waits while the run trains, as before
     selfplay_local_linger=0,
+    # shard_writer_thread 1 = self-play's training records are converted and written into shards on a thread of
+    # their own (zero/shardthread.py, docs/az.md 31): the thread that drives the search only takes them from the
+    # driver (SearchDriver.take_records: moved, not copied) and queues them, at most shard_writer_queue_mb MB (it
+    # waits while the queue is full; metrics selfplay.shard_writer). The same shards byte for byte, but the caller's
+    # timing changes which games finish when (a rolling or shared quota's games). This machine's self-play, the
+    # local linger and the remote workers (their config's); single-game runs. 0 = the samples taken, converted
+    # and written between batches, as before
+    shard_writer_thread=0, shard_writer_queue_mb=4096,
     # branched self-play games and archive starts (zero/forks.py, docs/az.md 24, docs/search.md 2.11):
     # selfplay_branch p = a share p of the games each spawn one branch game from a copy of their state at
     # a uniformly drawn decision of theirs: 1..selfplay_branch_moves deviation moves sampled from the
@@ -493,6 +502,7 @@ class Run:
         self.heldout = None                        # zero.heldout.HeldOut with heldout_shards (loaded once)
         self.anchor_sha = {}                       # anchor path -> ((size, mtime), sha256)
         self.linger = None                         # selfplay_local_linger: the lingering thread's state
+        self.writers = []                          # shard_writer_thread: the self-play phase's writer threads
         # branched games and archive starts (zero/forks.py): the self-play driver's settings, None when off
         self.forks = FK.setup(run, cfg)
 
@@ -587,7 +597,34 @@ class Run:
         return self.cfg.get('ext_groups', DEFAULTS['ext_groups']) if ext else None
 
     # ---------------------------------------------------------------- self-play
+    def shard_thread(self, drv, writer, on_item=None):
+        """shard_writer_thread (docs/az.md 31): the phase's ShardWriter on a writer thread of its own (a
+        zero.shardthread.ThreadedShardWriter the phase feeds with `drv.take_records()`; `on_item(s)`: run
+        there on each converted sample dict) - else None, the synchronous writer of before."""
+        c = self.cfg
+        if not c.get('shard_writer_thread'):
+            return None
+        if not hasattr(drv, 'take_records'):
+            raise RuntimeError('shard_writer_thread: this engine module has no SearchDriver.take_records (built '
+                               'from an older zero-core): rebuild it (tools/build_py.sh)')
+        tw = ThreadedShardWriter(writer, max_bytes=float(c['shard_writer_queue_mb']) * MB, on_item=on_item)
+        self.writers.append(tw)
+        return tw
+
     def selfplay(self, it):
+        """Iteration `it`'s self-play (`_selfplay`). An exception on the way out (PAUSE, an error) stops the
+        phase's shard writer thread first (shard_writer_thread): the shard it is writing is completed, the
+        rest dropped - the iteration is replayed - and no thread outlives the phase."""
+        try:
+            return self._selfplay(it)
+        except BaseException:
+            for tw in self.writers:
+                tw.abort()
+            raise
+        finally:
+            self.writers = []
+
+    def _selfplay(self, it):
         if self.rsp is not None:
             return self.selfplay_shared(it)        # with a remote: the shared queue (docs/az.md 5.3)
         c = self.cfg
@@ -635,8 +672,15 @@ class Run:
         state = {'n': 0, 't': time.time()}
         prog = os.path.join(self.run, 'progress.json')
         tstats = TargetStats()
+        # shard_writer_thread (docs/az.md 31): the records queued as they are, converted, tallied and written
+        # on the writer thread; None = here, between batches, as before
+        tw = self.shard_thread(drv, writer, on_item=tstats.add)
+        clock = SampleClock() if tw is not None else contextlib.nullcontext()
 
         def take():
+            if tw is not None:
+                tw.add(drv.take_records())
+                return
             s = drv.take_samples()
             tstats.add(s)
             writer.add(s)
@@ -644,16 +688,18 @@ class Run:
         def on_batch(lb):
             state['n'] += 1
             if state['n'] % 32 == 0:
-                take()
-                results.extend(drv.take_results())
+                with clock:
+                    take()
+                    results.extend(drv.take_results())
             if time.time() - state['t'] > 2:
                 state['t'] = time.time()
                 p = {'iter': it, 'phase': 'selfplay', 'games': len(results), 'target': c['games'], 'time': time.time()}
                 _write_json(prog, p)
         drive(drv, evs, check=lambda: self.check('self-play'), on_batch=on_batch)
-        take()
-        results.extend(drv.take_results())
-        ws = writer.close()
+        with clock:
+            take()
+            results.extend(drv.take_results())
+        ws = writer.close() if tw is None else tw.close()
         secs = time.time() - t0
         _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
         st = drv.stats()
@@ -685,7 +731,20 @@ class Run:
             out['rolling'] = {'in_flight': inf['games'], 'restarts': st['restarts'] - st0['restarts'],
                               'restart_sims': st['restart_sims'] - st0['restart_sims'],
                               'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves']}
+        self.writer_metrics(it, out, tw, clock)
         return out
+
+    def writer_metrics(self, it, out, tw, clock):
+        """shard_writer_thread: the phase's `shard_writer` block (docs/az.md 31) - the caller's seconds in its
+        sample handling (samples_s: taking the results and records, splitting, the quota, queueing, its waits
+        for room included), its waits for room (waits, wait_s), at the end for the last shard (close_s), the
+        writer thread's busy seconds, the queue's peak - and a log line. Nothing when off."""
+        if tw is None:
+            return
+        out['shard_writer'] = w = dict(tw.metrics(), samples_s=round(clock.s, 3))
+        self.log(f'iter {it} shard writer thread: caller {w["samples_s"]:.2f}s in the samples ({w["waits"]} waits for '
+                 f'room, {w["wait_s"]:.2f}s; {w["close_s"]:.2f}s at the end), writer {w["writer_s"]:.2f}s, queue peak '
+                 f'{w["queue_peak_mb"]:.0f} of {w["queue_mb"]:.0f} MB')
 
     def view_metrics(self, out, st, st0, leaves):
         """Self-play's root-view metrics (docs/az.md 16), only when a setting is on (the metrics of
@@ -816,6 +875,15 @@ class Run:
         prog = os.path.join(self.run, 'progress.json')
         acc = {'results': [], 'stale': {}, 'finished': 0, 'util': [0.0, 0], 't': 0.0, 'league': {}}
 
+        def tally(sd):
+            tstats.add(sd)
+            lag_hist(sd['net'], it, acc['stale'])
+        # shard_writer_thread (docs/az.md 31): the held games' records are queued as they are, converted, tallied
+        # and written on the writer thread; None = here, between batches, as before
+        tw = self.shard_thread(drv, writer, on_item=tally)
+        clock = SampleClock() if tw is not None else contextlib.nullcontext()
+        take, split = (drv.take_samples, split_games) if tw is None else (drv.take_records, split_records)
+
         def accept():
             """The held games, oldest first, as many as the quota takes."""
             a = rsp.accept_local(it, len(self.held))
@@ -824,22 +892,25 @@ class Run:
                 acc['results'].append(row)
                 if lg is not None:
                     L.tally([row], acc['league'])
-                if sd is not None:
+                if sd is not None and tw is not None:
+                    tw.add(sd)
+                elif sd is not None:
                     tstats.add(sd)
                     writer.add(sd)
                     lag_hist(sd['net'], it, acc['stale'])
 
         def pump(lb=None):
-            rows = drv.take_results()
-            s = drv.take_samples()
-            if rows and lg is not None:
-                L.League.attribute(rows, self.roll_kinds, plan['slots'])   # (the slots' checkpoints now)
-            if rows:
-                self.taken += FK.setups(rows)      # (a branch is its game's second row: zero/forks.py)
-                acc['finished'] += len(rows)
-                self.held.extend(split_games(rows, s))
-            if self.held:
-                accept()
+            with clock:
+                rows = drv.take_results()
+                s = take()
+                if rows and lg is not None:
+                    L.League.attribute(rows, self.roll_kinds, plan['slots'])   # (the slots' checkpoints now)
+                if rows:
+                    self.taken += FK.setups(rows)      # (a branch is its game's second row: zero/forks.py)
+                    acc['finished'] += len(rows)
+                    self.held.extend(split(rows, s))
+                if self.held:
+                    accept()
             if rsp.need(it) <= 0:
                 drv.end_phase()                    # the quota is met: the games in flight carry over
             else:
@@ -857,7 +928,8 @@ class Run:
                 _write_json(prog, {'iter': it, 'phase': 'selfplay', 'games': q.get('accepted', len(acc['results'])),
                                    'target': c['games'], 'local': len(acc['results']), 'remote': rp, 'time': now})
 
-        accept()                                   # the last iteration's leftovers come first
+        with clock:
+            accept()                               # the last iteration's leftovers come first
         while rsp.need(it) > 0:
             self.check('self-play')
             if drv.paused:
@@ -876,8 +948,8 @@ class Run:
         if rows:
             self.taken += FK.setups(rows)
             acc['finished'] += len(rows)
-            self.held.extend(split_games(rows, drv.take_samples()))
-        ws = writer.close()
+            self.held.extend(split(rows, take()))
+        ws = writer.close() if tw is None else tw.close()
         secs = time.time() - t0                    # this machine's phase (the remote's wait not counted)
         _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
         util = acc['util'][0] / acc['util'][1] if acc['util'][1] else None
@@ -928,6 +1000,7 @@ class Run:
                         'consumers': cons, 'rates': qb['rates'], 'staleness': staleness(acc['stale'], qb['stale'])}
         self.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
         self.log(f'iter {it} shared queue: {_fmt_queue(out["queue"])}')
+        self.writer_metrics(it, out, tw, clock)
         return out
 
     def league_metrics(self, it, plan, local, remote, games, evs):
@@ -966,14 +1039,20 @@ class Run:
         cap_held = int(c['games'])
         cuda = str(c['infer_device']).startswith('cuda') and torch.cuda.is_available()
         side = torch.cuda.Stream() if cuda else None
+        # shard_writer_thread (docs/az.md 31): the held games keep their records as they are (the next phase's
+        # writer thread converts them); None = their sample arrays taken here, as before
+        on = bool(c.get('shard_writer_thread'))
+        clock = st['clock'] = SampleClock() if on else contextlib.nullcontext()
+        take, split = (drv.take_records, split_records) if on else (drv.take_samples, split_games)
 
         def pump(lb=None):
-            rows = drv.take_results()
-            s = drv.take_samples()
-            if rows:
-                self.taken += FK.setups(rows)      # (a branch is its game's second row: zero/forks.py)
-                st['games'] += len(rows)
-                self.held.extend(split_games(rows, s))
+            with clock:
+                rows = drv.take_results()
+                s = take()
+                if rows:
+                    self.taken += FK.setups(rows)      # (a branch is its game's second row: zero/forks.py)
+                    st['games'] += len(rows)
+                    self.held.extend(split(rows, s))
             if st['stop'].is_set() or len(self.held) >= cap_held:
                 drv.end_phase()
             else:
@@ -1013,6 +1092,8 @@ class Run:
         out = {'games': st['games'], 'seconds': round(time.time() - st['t0'], 2),
                'leaves': self.roll.stats()['leaves'] - st['leaves0'], 'infer_s': round(ev.seconds, 2),
                'held': len(self.held)}
+        if isinstance(st.get('clock'), SampleClock):
+            out['samples_s'] = round(st['clock'].s, 3)       # (shard_writer_thread: its caller's sample handling)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0         # (the next phase's own inference metrics)
         return out
 
@@ -1905,6 +1986,13 @@ def resolve_config(args, saved):
                else 'not with the self-play league (selfplay_league 0)' if L.enabled(cfg) else None)
         if why:
             raise SystemExit(f'selfplay_local_linger: {why}')
+    if cfg.get('shard_writer_thread') or (isinstance(cfg.get('resolver_cfg'), dict)
+                                          and cfg['resolver_cfg'].get('shard_writer_thread')):
+        if cfg.get('resolver'):
+            raise SystemExit('shard_writer_thread: single-game runs only (co-training writes its shards on the '
+                             'driving thread, as before)')
+        if not float(cfg.get('shard_writer_queue_mb', 0)) > 0:
+            raise SystemExit(f"shard_writer_queue_mb {cfg.get('shard_writer_queue_mb')!r}: a number > 0 (MB)")
     return cfg
 
 

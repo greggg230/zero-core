@@ -144,6 +144,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: those whose inference is CUDA / MPS - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
 | `selfplay_remote_linger` | 0 | 1 = the workers play on with their checkpoint between phases (while the run trains); those games count for the next iteration, one checkpoint stale (5.3) |
 | `selfplay_local_linger` | 0 | 1 = this machine's self-play plays on too while the run trains (a thread; CUDA batches on their own stream): its finished games count for the next iteration, one checkpoint stale, as the remote's linger (5.3, 10.10). Needs `selfplay_remote`; single-game runs without the league |
+| `shard_writer_thread`, `shard_writer_queue_mb` | 0, 4096 | 1 = self-play's training records are converted and written into shards on a writer thread of their own (`zero/shardthread.py`): the thread that drives the search only takes them (`SearchDriver.take_records`: moved, not copied), splits them per game and queues them, at most `shard_writer_queue_mb` MB (it waits while the queue is full, counted). The same shards byte for byte; the caller's timing changes which games finish when (a rolling or shared quota's). This machine's self-play (plain, rolling, the shared queue), the local linger and the remote's workers (their config's); metrics `selfplay.shard_writer`, `linger.samples_s`, `selfplay.remote.shard_writer`. Single-game runs (co-training refused). 0 = taken, converted and written between batches, as before (31) |
 | `selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` | 30, 3, 3600 | co-training (11.6): a worker backing off this many seconds gives its outstanding matches back; a match outstanding on a worker longer than this many of its expected latencies (at least 120 s; 0 = the timeout only) is requeued, and at the latest after `selfplay_remote_timeout` s of the worker's running time |
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
@@ -4264,3 +4265,113 @@ bit), every other flag the line's, `eval_infoset_merge` 0 in both (the in-run El
 quotas and the metrics, remote workers merging, an older worker refused) and `tests/test_resign.py`,
 `tests/test_forks.py`, `tests/test_bindings.py` (37); MTG Zero `feat/infoset-selfplay` (its ENGINE.md 92): the engine
 digest f6543eb2b1b8752f, its optin-core and repin gates.
+
+## 31. Self-play's shards written on a thread of their own (`shard_writer_thread`; MTG Zero's Delver mirror, 2026-11-04)
+
+**Why.** One Python thread drives a self-play driver (`zero.infer.drive`: `next_batch` -> the evaluator -> `submit`)
+and, between batches, also handled the training samples: `take_samples` (a copy of every record into one dense
+float32 array - MTG Zero's rows are 37,620 floats, ~9 GB of shards a generation), `split_games`, `TargetStats`, and
+`ShardWriter.add`, whose every `shard_rows`-th add concatenated, cast to float16, checked and wrote an .npz shard
+synchronously. Meanwhile the network and the search threads waited. MTG Zero's thread benchmark on the GPU
+(E:/mtg-zero-scratch/ideas-3/bench_threads_ab.json: the Delver line's self-play seat and driver, 8 threads x 2
+groups, 768 games in flight, 640 games timed) did **13.7 games/s without the sample handling and 10.7 with the
+run's** (-22%); the evaluator's busy share fell 0.92 -> 0.71 (the live run's self-play phases show ~66-71%). Of
+the pump's 15.4 s of the caller's time in that configuration, 11.6 s were the shard writes and ~3 s `take_samples`'
+copy (the same take every 64 batches costs 2.3-3.0 s without any writing: 6-7% of the caller's time).
+
+**What it does** (`zero/shardthread.py`; docs/search.md 2.4 for the binding). With `shard_writer_thread` 1:
+
+* **The caller only takes.** `SearchDriver.take_records()` moves the driver's records out as they are (no copy:
+  a `SampleRecords`), `split_records` cuts them per finished game (the records move, as `split_games` slices a dict:
+  the shared queue's held games keep their records), and `ThreadedShardWriter.add` queues them. What stays on the
+  caller: `take_results` (the finished games' rows: the quota needs them now), the move, the split (moves in Rust),
+  the queueing. Measured below, per 1,000 rows.
+* **The writer thread** ('zero-shard-writer', one per self-play phase) converts each item - `SampleRecords.arrays()`
+  is `take_samples`' conversion (one function for both), built and the records freed off the GIL; the features cast
+  to float16, the dtype a dense shard stores (the same values: the same bytes; half the memory while the writer
+  buffers a shard) - runs the phase's tallies on it (`TargetStats`; the shared queue's staleness histogram), and
+  calls the wrapped `zero.data.ShardWriter`'s `add`, then its `close`, in the order the items came. Same records,
+  same order, same writer: **the shards are the synchronous writer's byte for byte** - rows, order, file names,
+  meta, quarantined `*.bad.npz`. `ShardWriter` itself is unchanged (wrapped, not edited; a writer that keeps its
+  rows' non-zeros - an attribute `sparse` true, as MTG Zero's parallel sparse-shards work proposes - gets the float32
+  rows and casts them itself).
+* **Bounded.** At most `shard_writer_queue_mb` MB of items wait (`SampleRecords.nbytes`: MTG ~150 KB a row; the
+  default 4096 holds ~27k MTG rows, more than the GPU's self-play makes while one 65,536-row shard is written);
+  when full, `add` blocks (counted: `waits`, `wait_s`), and an item larger than the bound passes alone. The writer
+  buffers at most a shard, in float16; the synchronous writer buffered it in float32 and concatenated it in float32
+  (a peak of ~2 float32 shards), so the threaded writer with its default queue stays within what the synchronous one
+  used.
+* **Errors** on the writer thread (`NonFinite` - the shard quarantined exactly as before -, an `OSError`) are
+  re-raised in the caller by its next `add` or by `close`: the exception itself, never lost; the run fails as it
+  did (state `aborted`, "run aborted: NonFinite: ..." in its log).
+* **Every shard on disk before training reads the window.** The phase's `close` waits for the queue, the last shard
+  (`ShardWriter.close`, on the writer thread) and the thread before self-play returns: this machine's phase end, the
+  shared queue's (its `samples` = what was written), so before `linger_start` (the local linger takes records and
+  holds them; the next phase's writer converts them) and before training. **PAUSE or an error mid-phase:**
+  `Run.selfplay` aborts the phase's writer first - it finishes the shard it is writing (completed and renamed: never
+  a half-written shard, nor its temporary file; the test fails without the abort) and drops the rest; the iteration
+  is replayed, as always (its data directory cleared). STOP is read between iterations: the phase closes normally.
+* **Remote workers** (`selfplay_remote`): a worker reads the setting from the run's config; with it, it takes
+  records and writes on a bounded `ThreadedShardWriter` instead of the unbounded `_BgWriter` (its shards were already
+  written on a thread: the take's copy and the bound are what change) and announces each shard with its games as
+  before. A worker on an older checkout ignores the setting: its shards are the same. An engine module built
+  before `take_records` (a checkout updated but not rebuilt) is refused with that reason, here and on a worker.
+
+**Metrics** (only with it on): `selfplay.shard_writer` = `samples_s` (the caller's seconds in its sample handling:
+taking the results and records, splitting, the quota's accounting, queueing, waits included), `waits` / `wait_s`
+(for room), `close_s` (the phase's end waiting for the last shard), `writer_s` (the writer thread's busy seconds),
+`items`, `rows`, `queue_peak_mb`, `queue_mb`, and a log line per iteration; `linger.samples_s` (the linger thread's
+take and split); `selfplay.remote.shard_writer` (the workers', summed).
+
+**Off by default.** 0: `take_samples`, `split_games` and the synchronous `ShardWriter` between batches (the remote's
+`_BgWriter`), exactly the loop of before; no new metrics key. Turn it on with `--shard-writer-thread 1` (and
+`--shard-writer-queue-mb N`). Although the shards stay byte-identical, **the caller's timing changes which games
+finish when** - a rolling driver's quota and the shared queue take the games that finished first - hence opt-in.
+Single-game runs: a co-training run is refused (its writers stay on the driving thread).
+
+**Costs.** One thread per phase: the conversion and the writes still take a core, now beside the search instead of
+between its batches (memory bandwidth, and the GIL in short pieces: numpy's casts, copies and CRCs release it,
+`np.savez`'s chunk copies do not). Memory: the queue's bound (4 GB by default) beside a shard's float16 buffer. The
+binding: `SearchDriver.take_records` and `SampleRecords` (additive; `take_samples` now frees its records off the GIL
+too - the same arrays).
+
+**Measured** (2026-11-04, the desktop's CPU only - the GPU is the live run's -, IDLE priority beside the live
+Delver run and other jobs: relative numbers). MTG Zero's thread bench with the 't' configurations added
+(E:/mtg-zero-scratch/shard-thread/bench_threads.py, bench_cpu.log / .json): gen 1000's self-play seat and driver
+(eval_cache 8192, sparse batches, the belief recorded), the network on the CPU, 48 games in flight, 4 threads x 2
+groups, the same seed in every configuration (the same 32 timed games, 2,849 rows, 3 shards of 1,024 rows), 'p' =
+the run's synchronous pump (take_results + take_samples after every batch, split_games, TargetStats, ShardWriter),
+'t' = this setting's (take_results + take_records, split_records, the queue), interleaved p, t, p, t:
+
+| the caller's seconds | p | t | p | t |
+|---|---|---|---|---|
+| take (take_results + take_samples / take_records) | 0.35 | 0.035 | 0.45 | 0.021 |
+| split per game | 0.002 | 0.002 | 0.004 | 0.002 |
+| add (the writes / the queueing) | 1.16 | 0.001 | 0.80 | 0.001 |
+| in the phase, per 1,000 rows | **529 ms** | **13 ms** | **442 ms** | **8 ms** |
+| close (the phase end: the last shard / the writer's drain) | 0.20 | 0.23 | 0.21 | 0.11 |
+| the writer thread's busy seconds | - | 1.54 | - | 0.94 |
+
+So the caller's share of the sample handling inside the phase fell ~40-55x: take_samples' copy alone was 120-160 us
+a row on this loaded machine (take_records + take_results: 7-12 us), the writes ~0.3-0.4 ms a row; the queue never
+filled (peak 20 MB). The phase end waits for the last shard in both (a training needs it). Games per second are not
+comparable on the CPU: the network there is the bottleneck (the caller's sample handling was < 1% of its time) and
+the load moved 0.14-0.21 games/s between configurations. On the GPU the same per-row costs were the 22% above (the
+caller's 15.4 s of 59.7 in 'p'); the GPU run (`CONFIGS=8x2,8x2p,8x2t,16x3,16x3p,16x3t bash
+E:/mtg-zero-scratch/shard-thread/bench_threads.sh`, the main session's) measures what it gives back.
+
+**Tests and checks** (`tests/test_shard_thread.py`, 17): `take_records` + `split` per game + `arrays()` =
+`take_samples` + `split_games`, array for array and dtype for dtype (and the binding's errors); the threaded writer's
+shards = the synchronous writer's byte for byte, file for file (per-game records and dicts, plain and compressed
+shards, the `on_write` calls, a queue bound smaller than an item so that every add waits); whole takes with
+`TargetStats` on the writer thread (the same summary); a writer keeping its rows' non-zeros gets float32 rows;
+`NonFinite` and an `OSError` re-raised in the caller (the same quarantined shard); a full queue blocks the caller and
+a writer error frees it; `abort` completes the shard being written; an iteration's shards with the setting off and on
+byte for byte (several shards; the same samples, games and target metrics; no writer thread left; no metrics key
+off); a rolling run's quotas exact; the shared queue with the remote 'local' and the local linger (quotas exact, the
+linger's held records counted one checkpoint stale, the workers' writer threads, every shard holding the rows its
+metrics report); PAUSE mid-phase with the writer inside a shard (exit 75, no temporary file - fails without the
+abort -, the resume replays and finishes); the loop's `NonFinite` from the writer thread; co-training refused. Off:
+the full pytest (383 passed, 9 skipped, with 16 of these; the 17th alone), cargo test 139 + webnet 3 (the golden
+records), and MTG Zero's gates (its ENGINE.md 93: `check_checkpoint_compat` byte identity - take_samples now goes
+through the shared conversion -, the engine digest, the other games built against this core).
