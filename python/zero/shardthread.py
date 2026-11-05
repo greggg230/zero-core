@@ -10,8 +10,9 @@ and wrote .npz shards, while the network and the search threads waited for it. W
   copy, docs/search.md 2.4), `split_records` cuts them per finished game (the records move, as
   `zero.workqueue.split_games` slices a sample dict), and `ThreadedShardWriter.add` queues them;
 * one writer thread ('zero-shard-writer') converts each queued item (`SampleRecords.arrays()`: the
-  arrays take_samples gives, built off the GIL; the features cast to float16, the type the shards
-  store, which halves what the writer buffers) and calls the wrapped `zero.data.ShardWriter`'s `add`,
+  arrays take_samples gives, built off the GIL; the features cast to float16, the type dense shards
+  store, which halves what the writer buffers - not for a writer keeping its rows' non-zeros, an
+  attribute `sparse` true) and calls the wrapped `zero.data.ShardWriter`'s `add`,
   then its `close`, in the order the items came: the same records in the same order through the same
   writer, so the shards are the synchronous writer's byte for byte (rows, order, file names, meta,
   quarantined *.bad.npz). `on_item(s)` runs there too, on each converted dict (TargetStats, the
@@ -58,13 +59,13 @@ def item_bytes(s):
     return int(s.nbytes)
 
 
-def to_arrays(s):
+def to_arrays(s, half=True):
     """A queued item -> the sample dict a ShardWriter takes (None: none): a SampleRecords converted
-    (take_samples' arrays), float32 features cast to float16 (the type `compact` stores: the same
-    values, so the same shard bytes, in half the memory while the writer buffers them)."""
+    (take_samples' arrays); `half`: float32 features cast to float16 (the type `compact` stores: the
+    same values, so the same shard bytes, in half the memory while the writer buffers them)."""
     if s is not None and not isinstance(s, dict):
         s = s.arrays()
-    if s is not None and getattr(s.get('x'), 'dtype', None) == np.float32:
+    if half and s is not None and getattr(s.get('x'), 'dtype', None) == np.float32:
         s = dict(s, x=s['x'].astype(np.float16))
     return s
 
@@ -215,7 +216,8 @@ class ThreadedShardWriter:
             try:
                 self.games += g
                 if s is not None:
-                    s = to_arrays(s)
+                    # (a writer that keeps its rows' non-zeros, `sparse`, casts them itself: no dense copy)
+                    s = to_arrays(s, half=not getattr(self.w, 'sparse', False))
                     if self.on_item is not None:
                         self.on_item(s)
                     self.w.add(s)

@@ -446,3 +446,23 @@ def test_loop_fails_on_nonfinite_samples_from_the_writer_thread(tmp_path):
     assert 'non-finite sample values in shard c00_000.npz' in msg and 'x: 1 row(s) [3], column(s) [5] (1 +inf)' in msg
     assert os.listdir(run / 'debug') == ['iter_0001_c00_000.bad.npz']
     assert D.shard_paths(str(run / 'data' / 'iter_0001')) == []
+
+
+def test_a_writer_keeping_non_zeros_gets_the_float32_rows(tmp_path):
+    """The float16 cast is for a writer that buffers dense rows; one keeping its rows' non-zeros (an attribute
+    `sparse` true, as zero-core feat/sparse-shards' ShardWriter) gets the driver's float32 features to cast
+    itself (no dense float16 copy)."""
+    got = []
+
+    class Sparse(ShardWriter):
+        sparse = True
+
+        def add(self, s):
+            got.append(s['x'].dtype)
+            super().add(s)
+    takes = toy_takes(lambda d: d.take_records(), games=8)
+    tw = ThreadedShardWriter(Sparse(str(tmp_path / 's'), 'r00', rows=1000))
+    for _, s in takes:
+        tw.add(s)
+    tw.close()
+    assert got and set(got) == {np.dtype(np.float32)}
