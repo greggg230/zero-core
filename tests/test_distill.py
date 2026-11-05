@@ -162,6 +162,24 @@ def test_the_tool_writes_a_guarded_checkpoint_and_resumes(toy_data, tmp_path, ca
     assert cmp['policy_kl'] == pytest.approx(rec['heldout'][-1]['policy_kl'], abs=1e-6)
 
 
+def test_the_tool_reads_sparse_shards(toy_data, tmp_path, capsys):
+    """Sparse shards (run setting shard_sparse, docs/az.md 32): --compare on them (the encoding check, the
+    window) gives the numbers of their dense shards."""
+    tm = tool()
+    a, b = str(tmp_path / 'a.pt'), str(tmp_path / 'b.pt')
+    net.save(teacher(5), a)
+    net.save(teacher(6), b)
+    sd = tmp_path / 'sparse' / 'iter_0002'
+    for p in data.shard_paths(str(toy_data / 'data' / 'iter_0002')):
+        data.convert_shard(p, str(sd / os.path.basename(p)))
+    got = []
+    for d in (toy_data / 'data' / 'iter_0002', sd):
+        capsys.readouterr()
+        assert tm.main(['--compare', a, b, '--data', str(d), '--normal-priority']) == 0
+        got.append(json.loads(capsys.readouterr().out.strip().splitlines()[-1]))
+    assert got[0] == got[1] and got[0]['shards'] >= 1
+
+
 def test_the_tool_refuses_shards_of_another_encoding(toy_data, tmp_path):
     tm = tool()
     tpath = str(tmp_path / 'teacher.pt')

@@ -281,6 +281,176 @@ def test_sparse_window_is_the_same_window(tmp_path, monkeypatch):
             assert win.reused == win.N - sum(int(win.starts[j + 1] - win.starts[j]) for j in new), (k, win.reused)
 
 
+def _driver_samples(N, rng, aux=0, view=True):
+    """Driver-format samples: float32 features ~5% non-zero, with -0.0s, values whose float16 cast is
+    +0.0 (1e-9: dropped by a sparse shard) or -0.0 (-1e-9: kept), an all-zero row; value-only rows
+    (no options) when `view`; auxiliary targets when `aux` > 0."""
+    nopt = rng.integers(2, 6, size=N)
+    if view:
+        nopt[rng.random(N) < 0.2] = 0
+    off = np.concatenate([[0], np.cumsum(nopt)])
+    x = np.where(rng.random((N, F)) < 0.05, rng.standard_normal((N, F)), 0.0).astype(np.float32)
+    for v in (-0.0, 1e-9, -1e-9):
+        x[rng.random((N, F)) < 0.01] = v
+    x[N // 2] = 0.0
+    s = {'x': x, 'player': rng.integers(0, 2, N), 'n_players': np.full(N, 2), 'opt_off': off,
+         'opt_action': rng.integers(0, A, off[-1]), 'pi': rng.random(off[-1]).astype(np.float32),
+         'z': rng.random((N, 8)).astype(np.float32), 'q': rng.random((N, 8)).astype(np.float32),
+         'sc': rng.random((N, 8)).astype(np.float32), 'net': np.zeros(N, np.int32)}
+    if aux:
+        s['aux'] = np.where(rng.random((N, aux)) < 0.1, rng.random((N, aux)), 0.0).astype(np.float32)
+    return s
+
+
+def _shard_pair(tmp_path, name, parts, compress=0, rows=10 ** 6):
+    """The sample dicts `parts` written by a dense and a sparse ShardWriter (run setting shard_sparse)
+    -> (dense paths, sparse paths, the writers' close() results)."""
+    from zero.data import shard_format
+    out = []
+    for fmt in ({}, shard_format({'shard_sparse': 1})):
+        d = tmp_path / ('sparse' if fmt else 'dense')
+        w = ShardWriter(str(d), name, rows=rows, meta={'game': 'toy', 'iter': 3, **fmt}, compress=compress)
+        for s in parts:
+            w.add(s)
+        res = w.close()
+        out.append((sorted(str(p) for p in d.glob(f'{name}_*.npz')), res))
+    (dp, dres), (sp, sres) = out
+    return dp, sp, dres, sres
+
+
+def test_sparse_shards_round_trip(tmp_path):
+    """Run setting shard_sparse: a sparse shard (x_ptr / x_idx / x_val, meta x_format) reads back as the
+    dense shard of the same samples, every array and the features bit for bit (-0.0 kept, a value whose
+    float16 is +0.0 dropped), plain and compressed, the writer's shards and counts as the dense one's;
+    its non-zeros as stored; some rows of either (shard_features, cut / padded); convert_shard both
+    ways; the dense format and meta unchanged with the setting off; a newer sparse version refused."""
+    import json
+    import zipfile
+    from zero.data import convert_shard, shard_features, shard_format, shard_rows, write_shard
+    assert shard_format({}) == {} and shard_format({'shard_sparse': 0}) == {}
+    rng = np.random.default_rng(21)
+    parts = [_driver_samples(N, rng, aux=5) for N in (300, 7, 450)]
+    for comp in (0, 1):
+        dp, sp, dres, sres = _shard_pair(tmp_path / f'c{comp}', 'r00', parts, compress=comp, rows=305)
+        assert len(dp) == len(sp) == 2
+        assert (dres['samples'], dres['shards']) == (sres['samples'], sres['shards']) == (757, 2)
+        assert sres['bytes'] < dres['bytes']
+        for d, s in zip(dp, sp):
+            a, b = read_shard(d), read_shard(s)
+            assert set(a) == set(b)
+            for k in a:
+                if k != 'meta':
+                    assert a[k].dtype == b[k].dtype and a[k].shape == b[k].shape and np.array_equal(a[k], b[k]), k
+            assert np.array_equal(a['x'].view(np.uint16), b['x'].view(np.uint16))
+            assert b['meta'] == dict(a['meta'], x_format='sparse', x_version=1, x_cols=F,
+                                     x_nnz=int((a['x'].view(np.uint16) != 0).sum()))
+            # the dense shard: the arrays and the meta of before the setting
+            with np.load(d) as z:
+                assert z.files == ['meta', 'x', 'player', 'n_players', 'opt_off', 'opt_action', 'pi', 'z', 'q', 'sc',
+                                   'net', 'aux']
+                assert list(json.loads(str(z['meta']))) == ['game', 'iter', 'rows']
+            with zipfile.ZipFile(s) as zf:
+                assert all((zi.compress_type != zipfile.ZIP_STORED) == bool(comp) for zi in zf.infolist())
+            raw = read_shard(s, dense=False)
+            assert 'x' not in raw and raw['x_ptr'].dtype == np.int64 and raw['x_idx'].dtype == np.uint16
+            assert raw['x_val'].dtype == np.float16 and raw['x_ptr'][-1] == len(raw['x_idx']) == b['meta']['x_nnz']
+            assert (raw['x_val'].view(np.uint16) != 0).all() and (raw['x_val'].view(np.uint16) == 0x8000).any()
+            rows = np.repeat(np.arange(len(raw['x_ptr']) - 1), np.diff(raw['x_ptr']))
+            assert np.all((np.diff(raw['x_idx'].astype(np.int64)) > 0) | (np.diff(rows) > 0))   # ascending per row
+            assert shard_rows(d) == shard_rows(s) == len(a['player'])
+            for r in (None, slice(3, 40), np.array([5, 0, 5, len(a['player']) - 1])):
+                for nf in (None, F - 7, F + 5):
+                    u, v = shard_features(d, r, nf), shard_features(s, r, nf)
+                    assert u.dtype == v.dtype == np.float16 and np.array_equal(u.view(np.uint16), v.view(np.uint16))
+            assert np.array_equal(shard_features(s).view(np.uint16), a['x'].view(np.uint16))
+            # convert_shard: dense -> sparse is the sparse writer's shard, sparse -> dense the dense one's
+            for src, sparse, want in ((d, True, s), (s, False, d)):
+                out = str(tmp_path / f'conv{comp}_{int(sparse)}.npz')
+                n, nbytes = convert_shard(src, out, sparse=sparse, threads=2)
+                assert n == len(a['player']) and nbytes == os.path.getsize(out)
+                got, ref2 = read_shard(out, dense=False), read_shard(want, dense=False)
+                assert set(got) == set(ref2) and got['meta'] == ref2['meta']
+                for k in ref2:
+                    if k != 'meta':
+                        assert got[k].dtype == ref2[k].dtype and np.array_equal(got[k], ref2[k]), k
+    try:
+        convert_shard(sp[0], sp[0])
+        raise AssertionError('converted onto itself')
+    except ValueError:
+        pass
+    try:
+        write_shard(str(tmp_path / 'bogus.npz'), parts[1], {'x_format': 'csr'})
+        raise AssertionError('an unknown format written')
+    except ValueError as e:
+        assert 'csr' in str(e)
+    # a sparse format of a newer version is refused by every reader
+    raw = read_shard(sp[0], dense=False)
+    meta = dict(raw.pop('meta'), x_version=2)
+    newer = str(tmp_path / 'newer.npz')
+    np.savez(newer, meta=np.array(json.dumps(meta)), **raw)
+    for read in (lambda: read_shard(newer), lambda: shard_features(newer), lambda: Window([newer], F, A),
+                 lambda: Window([newer], F, A, sparse=True)):
+        try:
+            read()
+            raise AssertionError('a newer version read')
+        except ValueError as e:
+            assert 'version 2' in str(e)
+
+
+def test_sparse_shards_are_the_same_window(tmp_path, monkeypatch):
+    """Windows over sparse shards (run setting shard_sparse), and over a mix of dense and sparse ones (a
+    generation written before the setting beside one written with it), are the windows of the dense
+    shards of the same samples: every array, the features bit for bit, the batches (also as COO) and
+    the bytes - dense and sparse windows (window_sparse), cut / padded to another network width, over
+    budget, with auxiliary targets (one shard without), and with a WindowCache over sliding windows
+    (the same rows reused)."""
+    from zero.data import SparseRows, WindowCache
+    monkeypatch.setattr(SparseRows, 'CHUNK', 64)
+    rng = np.random.default_rng(13)
+    dense, sparse = [], []
+    for k, N in enumerate([400, 3, 250, 900, 60]):
+        dp, sp, _, _ = _shard_pair(tmp_path / f's{k}', f'p{k}', [_driver_samples(N, rng, aux=6 if k != 1 else 0)],
+                                   compress=k % 2)
+        dense += dp
+        sparse += sp
+    mixed = [sparse[k] if k % 2 == 0 else dense[k] for k in range(5)]
+    keys = ('player', 'n_players', 'opt_off', 'opt_action', 'pi', 'z', 'q', 'sc', 'src_row', 'starts', 'aux',
+            'aux_mask')
+
+    def same(a, b):
+        assert a.sparse == b.sparse
+        assert np.array_equal(a.x.view(np.uint16), b.x.view(np.uint16))
+        for k in keys:
+            u, v = getattr(a, k), getattr(b, k)
+            assert (u is None) == (v is None), k
+            if u is not None:
+                assert u.dtype == v.dtype and np.array_equal(u, v), k
+        assert (a.N, a.loaded, a.nbytes, a.reused) == (b.N, b.loaded, b.nbytes, b.reused)
+        idx = np.random.default_rng(a.N).integers(a.N, size=97)
+        assert np.array_equal(a.features(idx).view(np.uint16), b.features(idx).view(np.uint16))
+        for coo in ((False, True) if a.sparse else (False,)):
+            ba, bb = a.batch(idx, coo=coo), b.batch(idx, coo=coo)
+            assert ba.keys() == bb.keys()
+            for k in ba:
+                assert ba[k].dtype == bb[k].dtype and torch.equal(ba[k], bb[k]), (coo, k)
+            if not coo:
+                assert torch.equal(ba['x'].view(torch.int32), bb['x'].view(torch.int32))
+
+    for ps in (sparse, mixed):
+        for win_sparse in (False, True):
+            for nf, budget, aw in ((F, None, 0), (F - 7, None, 6), (F + 5, 700, 6), (F, 300, 0)):
+                kw = dict(budget_rows=budget, seed=3, sparse=win_sparse, **({'aux_width': aw} if aw else {}))
+                same(Window(ps[1:4], nf, A, **kw), Window(dense[1:4], nf, A, **kw))
+        # with a WindowCache: sliding windows (cached whole in a sparse window also over budget)
+        for win_sparse in (False, True):
+            ca, cb = WindowCache(), WindowCache()
+            steps = [(slice(0, 3), F, None), (slice(1, 4), F, None), (slice(2, 5), F, None), (slice(2, 5), F, 500),
+                     (slice(1, 4), F, 600), (slice(1, 4), F - 7, None), (slice(1, 4), F - 7, None)]
+            for k, (sl, nf, budget) in enumerate(steps):
+                kw = dict(budget_rows=budget, seed=k, sparse=win_sparse, aux_width=6)
+                same(Window(ps[sl], nf, A, cache=ca, **kw), Window(dense[sl], nf, A, cache=cb, **kw))
+
+
 def test_batches_prefetched_are_the_same(tmp_path):
     """data.batches with prefetch (run setting train_prefetch): the same draws and batches in the
     same order as without; a failure while building is raised to the consumer; closing early

@@ -100,6 +100,44 @@ def test_window_checks_old_shards_and_tells_provenance(samples, tmp_path):
     assert f'shard {old}' in str(e.value) and 'q: 1 row(s) [9], column(s) [0] (1 NaN)' in str(e.value)
 
 
+def test_sparse_shards_are_guarded_alike(samples, tmp_path):
+    """Run setting shard_sparse: a sparse shard is guarded as a dense one - the writer quarantines a float16
+    overflow with the dense shard's message (rows, columns), the bad shard written sparse; a sparse shard
+    damaged after writing (a NaN among its values) is refused by the dense and the sparse window, naming
+    its row and column."""
+    from zero.data import shard_format
+    sp = shard_format({'shard_sparse': 1})
+    s = dict(samples, x=samples['x'].copy())
+    s['x'][4, 7] = 1e6
+    d = tmp_path / 'data' / 'iter_0003'
+    w = ShardWriter(str(d), 'c00', rows=10 ** 6, meta={'game': 'toy', 'iter': 3, **sp}, bad_dir=str(tmp_path / 'debug'))
+    w.add(s)
+    with pytest.raises(NonFinite) as e:
+        w.close()
+    msg = str(e.value)
+    assert 'shard c00_000.npz' in msg and 'x: 1 row(s) [4], column(s) [7] (1 +inf)' in msg
+    bad = tmp_path / 'debug' / 'iter_0003_c00_000.bad.npz'
+    assert bad.exists() and shard_paths(str(d)) == []
+    q = read_shard(str(bad), dense=False)
+    assert 'x_val' in q and q['meta']['nonfinite'] and q['meta']['x_format'] == 'sparse'
+    assert np.isposinf(read_shard(str(bad))['x'][4, 7])
+    good = str(tmp_path / 'c00_000.npz')
+    write_shard(good, samples, {'game': 'toy', **sp})
+    raw = read_shard(good, dense=False)
+    meta = raw.pop('meta')
+    r = int(np.flatnonzero(np.diff(raw['x_ptr'])[9:] > 0)[0]) + 9      # a row from 9 on with a non-zero
+    e0 = int(raw['x_ptr'][r])
+    col = int(raw['x_idx'][e0])
+    raw['x_val'] = raw['x_val'].copy()
+    raw['x_val'][e0] = np.nan
+    old = str(tmp_path / 'c00_001.npz')
+    np.savez(old, meta=np.array(json.dumps(meta)), **raw)
+    for sparse in (False, True):
+        with pytest.raises(NonFinite) as e:
+            Window([good, old], F, A, sparse=sparse)
+        assert f'shard {old}' in str(e.value) and f'x: 1 row(s) [{r}], column(s) [{col}] (1 NaN)' in str(e.value)
+
+
 def test_checkpoint_refuses_nonfinite(tmp_path):
     m = Net(F, A, hidden=16, blocks=1)
     save(m, str(tmp_path / 'ok.pt'))

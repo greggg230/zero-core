@@ -65,7 +65,7 @@ import torch
 import torch.nn.functional as F
 
 from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, resign as RS, runctl
-from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_paths
+from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
 from .net import EncodingMismatch, add_aux, aux_layout, check_belief_head, check_checkpoint, load, make_net, save
@@ -132,6 +132,11 @@ DEFAULTS = dict(
     # window is over budget (subsampled from the cache), so an iteration loads only its new shards.
     # The budget (ram_budget_gb) still counts dense rows: the same rows as without it
     window_sparse=0,
+    # shard_sparse 1 = self-play writes each shard's features as their non-zeros (zero/data.py: x_ptr /
+    # x_idx / x_val, meta x_format 'sparse'; every other array as before): the dense rows bit for bit in a
+    # fraction of the disk and write time for sparse encodings (MTG's ~0.7% non-zero). Every reader takes
+    # both formats, so a window may mix them (docs/az.md 32). 0 = dense shards, byte for byte as before
+    shard_sparse=0,
     # train_prefetch n > 0 = training batches built n steps ahead on a background thread while the
     # device trains (zero/data.py batches: the same batches in the same order)
     train_prefetch=0,
@@ -597,7 +602,8 @@ class Run:
         t0 = time.time()
         seat = self.nn_seat('m', c['sims'], selfplay=True)
         rng = np.random.default_rng(c['seed'] * 1_000_003 + it)
-        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it}
+        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
+                **shard_format(c)}
         lg = self.league
         if c['rolling']:
             if self.roll is None:
@@ -808,7 +814,8 @@ class Run:
             plan = lg.plan(it)
             lg.evaluators(it, evs)                 # the slots' past checkpoints (guarded)
         st0 = drv.stats()
-        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it}
+        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
+                **shard_format(c)}
         writer = ShardWriter(d, 'r00', rows=c['shard_rows'], meta=meta, bad_dir=self.debug_dir())
         tstats = TargetStats()
         spec = G.spec_json(c['spec'])

@@ -248,10 +248,9 @@ def bench_selfplay(model, game='toy', threads=4, games=400, sims=64, conc=256, s
 
 
 def _shard_rows(paths):
-    parts = []
-    for p in paths:
-        with np.load(p) as z:
-            parts.append(z['x'][:8192])
+    """The first 8,192 rows of each shard's features (float16; a dense or a sparse shard)."""
+    from .data import shard_features
+    parts = [shard_features(p, slice(0, 8192)) for p in paths]
     return np.concatenate(parts) if len(parts) > 1 else parts[0]
 
 
