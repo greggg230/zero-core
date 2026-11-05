@@ -455,13 +455,15 @@ def test_a_writer_keeping_non_zeros_gets_the_float32_rows(tmp_path):
     got = []
 
     class Sparse(ShardWriter):
-        sparse = True
-
         def add(self, s):
             got.append(s['x'].dtype)
             super().add(s)
     takes = toy_takes(lambda d: d.take_records(), games=8)
-    tw = ThreadedShardWriter(Sparse(str(tmp_path / 's'), 'r00', rows=1000))
+    # (a real sparse writer: its meta asks for the format - data.shard_format, run setting shard_sparse - and
+    # ShardWriter sets `sparse` from it in its constructor; a class attribute would be shadowed by it)
+    w = Sparse(str(tmp_path / 's'), 'r00', rows=1000, meta={'x_format': 'sparse'})
+    assert w.sparse
+    tw = ThreadedShardWriter(w)
     for _, s in takes:
         tw.add(s)
     tw.close()
