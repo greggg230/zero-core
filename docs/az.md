@@ -4681,3 +4681,24 @@ removed, b took 407 and 434 (this machine 193, 166); the file emptied, this mach
 exact, no shard late. `selfplay_local` 0 with [a, b]: iteration 1 this machine 511 (the workers came up during it),
 iterations 2-5 none - a 296-313, b 287-304 - its rate kept at its iteration-1 measurement; emptied, this machine all
 600 again. Rows within one checkpoint throughout (mean lag 0.05-0.12).
+
+### 34.8 Checks (desktop, 2026-11-05)
+
+* **One remote, against the code before** (d499716, the same toy run - test_remoteplay's settings, 3 iterations,
+  `--selfplay-remote local`): the 163 key paths of its metrics rows identical, and its remote / shared-queue /
+  worker log lines identical with the numbers masked.
+* **No remote**: `tools/check_checkpoint_compat.py --old <d499716> --new <this> --package zero --net random --game toy`
+  identical (visits 169 samples, records b1b86b689ab98313; cq d02691e9e005a5d5; vs random 3.0/16), and a plain
+  `toy-smoke` run (2 iterations, `--threads 1`) gives the same shards and checkpoints bit for bit as d499716's (and as a
+  second run of d499716: the run is deterministic).
+* **The whole suite** (415 tests): 408 passed in one run on a desktop held at 100% of its 32 cores by other projects'
+  jobs; the 7 others - six `eval_remote` tests whose evaluation subprocess took 119-212 s an evaluation (toy: ~2 s)
+  and hit their timeouts, and `test_token_graphs::test_absent_slots_are_never_read` (CUDA eager against eager, 3e-8
+  at tolerance 0, the GPU shared with live runs) - passed rerun alone; none touches what changed. An earlier run of
+  `test_remoteplay.py` + `test_workqueue.py` beside the multi-host tests had two timing failures
+  (`test_caps_follow_...`, `test_a_dying_worker_...`: the worker's death seen after the phase closed, its 30 games
+  short), both passing alone and in the whole suite (AGENTS.md's caveat). `tests/test_multi_remote.py` (12) passed
+  in the loaded whole-suite run as well.
+* **The games build against this core**: `SKIP_CORE=1 SMOKE_TARGET=multi-remote bash tools/smoke_all.sh
+  --with-this-core --build-only` GREEN, games: 3 of 3 checked (glassroad-zero, caverna-zero, kingdombuilder-zero; no
+  Rust change).
