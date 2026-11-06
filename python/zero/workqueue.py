@@ -153,6 +153,16 @@ class Shares:
         if name in self.c:
             self.c[name]['active'] = bool(on)
 
+    def rename(self, old, new):
+        """Consumer `old` is called `new` from now on (its rate, head start and bounds kept; remote
+        self-play's hosts, docs/az.md 34)."""
+        if old != new and old in self.c:
+            self.c[new] = self.c.pop(old)
+
+    def drop(self, name):
+        """Consumer `name` leaves the queue (a remote host no longer listed, docs/az.md 34)."""
+        self.c.pop(name, None)
+
     def rates(self):
         """Each consumer's rate, measured or (not yet) assumed: proportional to its slots, scaled
         by the measured consumers' rate per slot (all unmeasured: the slots themselves)."""

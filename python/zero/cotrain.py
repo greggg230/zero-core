@@ -96,11 +96,14 @@ def resolver_config(cfg):
     if out.get('policy_target', 'visits') not in ('visits', 'cq'):
         raise SystemExit(f"resolver_cfg: policy_target {out['policy_target']!r}: 'visits' or 'cq'")
     check_eval_settings(out, 'resolver_cfg: ')
+    from .remote import known_remote
+    from .remoteplay import remote_names
     for k in ('eval_remote', 'selfplay_remote'):
-        rem = out.get(k) or ''
-        if rem and rem != 'local' and rem not in package.active().remotes:
-            raise SystemExit(f'resolver_cfg: {k} {rem!r}: not in the game package remotes '
-                             f'({sorted(package.active().remotes)})')
+        # (selfplay_remote: a comma-separated list, each name a remote or a parametrised one, docs/az.md 34)
+        for rem in (remote_names(out.get(k)) if k == 'selfplay_remote' else [out.get(k) or '']):
+            if rem and not known_remote(rem):
+                raise SystemExit(f'resolver_cfg: {k} {rem!r}: not in the game package remotes '
+                                 f'({sorted(package.active().remotes)})')
     return out
 
 
@@ -417,6 +420,12 @@ class CoRun:
             raise SystemExit("selfplay_remote: a co-training run's primary self-play (its parked games and their "
                              "coordinator) stays here; the resolver's episodes go to a remote with resolver_cfg's "
                              "selfplay_remote")
+        from .remoteplay import REMOTES_FILE, remotes_file_in_use
+        for d in (run, os.path.join(run, 'resolver')):
+            if remotes_file_in_use(d):
+                raise SystemExit(f"{os.path.join(d, REMOTES_FILE)}: a co-training run's resolver takes its remotes from "
+                                 f"resolver_cfg's selfplay_remote (a comma-separated list), never from the file "
+                                 f"(docs/az.md 34): remove it")
         if len(set(cfg['players'])) != 1:
             raise SystemExit(f"co-training: one player count for the primary game (players {cfg['players']})")
         self.rcfg = resolver_config(cfg)
@@ -742,11 +751,16 @@ class CoRun:
             tot = sum(v.get('games', 0) for v in cons.values())
             for v in cons.values():
                 v['share'] = round(v.get('games', 0) / max(1, tot), 4)
+            rems = rem.pop('remotes', None)        # (a list of remotes: each one's share, docs/az.md 34)
             mr['remote'] = rem
+            if rems is not None:
+                mr['remotes'] = rems
             mr['queue'] = {'units': qb['units'], 'inflight': qb['inflight'], 'batch_inflight': qb['batch_inflight'],
                            'consumers': cons, 'rates': qb['rates'], 'local_cap': co.local_cap,
                            'staleness': staleness(stale['r'], qb['stale'])}
             R.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
+            for name, r in (rems or {}).items():
+                R.log(f'iter {it} remote self-play {name}: {_fmt_remote(r)}')
             R.log(f'iter {it} shared queue: {_fmt_queue(mr["queue"])}')
         return mp, mr
 
@@ -844,8 +858,11 @@ class CoRun:
             R.rsp.local(max(2, int(rc['groups'])), rconc + max(16, rconc // 4), device=rc['infer_device'], slots=rconc)
             R.rsp.events = int(c['games'])
             R.rsp.restore(last_rates(read_metrics(R.run)))
-            R.log(f'episodes also on the remote {rc["selfplay_remote"]!r} ({R.rsp.spec["host"]}, {R.rsp.procs} '
-                  f'worker(s), mirror {R.rsp.rdir}){R.rsp.batch_note()}')
+            if not R.rsp.multi:
+                R.log(f'episodes also on the remote {rc["selfplay_remote"]!r} ({R.rsp.spec["host"]}, {R.rsp.procs} '
+                      f'worker(s), mirror {R.rsp.rdir}){R.rsp.batch_note()}')
+            else:                                  # a list of remotes (docs/az.md 34)
+                R.log(f'episodes also on the remotes {R.rsp.describe()}{R.rsp.batch_note()}')
         try:
             self._iterations(start)
         finally:

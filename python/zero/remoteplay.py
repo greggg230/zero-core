@@ -21,7 +21,10 @@ both machines pull an iteration's work from one shared queue (zero/workqueue.py)
   latency (at most `selfplay_remote_timeout` s) of that worker's running time is requeued too.
 
 Run settings: `selfplay_remote` (a name in the game package's `remotes`; 'local' = this machine,
-the tests; '' = off), `selfplay_remote_procs` (worker processes; 0 = the remote's `procs`),
+the tests; '' = off; a comma-separated list = several hosts, and the run directory's `selfplay_remotes`
+file replaces the list at every phase start: docs/az.md 34), `selfplay_local` (0: this machine takes no
+games while a remote worker takes work, docs/az.md 34.4), `selfplay_remote_procs` (worker processes per
+host; 0 = the remote's `procs`),
 `selfplay_remote_wait` (seconds the end of a phase waits for the remote's last shards),
 `selfplay_remote_inflight` (each machine's in-flight cap, in iterations of its throughput),
 `selfplay_remote_batch` ('auto': the consumers whose inference is CUDA / MPS are batch-bound;
@@ -42,7 +45,9 @@ overrides (run settings for the workers: concurrency, threads, groups, inference
 default to at most 8192 rows), env}.
 
 Local side (`RemotePlay`: threads of the run process; the main thread never waits for the remote
-except in `end`, bounded by `selfplay_remote_wait`):
+except in `end`, bounded by `selfplay_remote_wait`). Each remote is a `Host` (its spec, transport,
+mirror, sessions); one remote's workers are the consumers 'w0', 'w1', ... as they always were, a list
+of hosts' '<name>/w<k>' (docs/az.md 34: hosts join - resolved on a thread - and leave at phase starts):
 
 * a manager thread keeps `procs` persistent **sessions**: `ssh host 'cd repo && python -m
   <pkg>.az.remote selfplay MIRROR K'` (or a local subprocess), one worker each; its stdin is the
@@ -95,6 +100,7 @@ import sys
 import threading
 import time
 import traceback
+import zlib
 from collections import deque
 
 from . import package
@@ -188,13 +194,54 @@ def _owner_alive(pid):
 
 # ================================================================== the local side
 
+REMOTES_FILE = 'selfplay_remotes'           # <run>/selfplay_remotes: the hosts of a run's self-play (docs/az.md 34)
+
+
+def remote_names(setting):
+    """The remote names of a `selfplay_remote` setting: a comma-separated list ('' = none), in order,
+    each once (docs/az.md 34)."""
+    out = []
+    for n in str(setting or '').split(','):
+        n = n.strip()
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def read_remotes_file(path):
+    """The remote names of a `selfplay_remotes` file - one per line, '#' starts a comment, blank lines
+    ignored - in order, each once; None when there is no such file (docs/az.md 34)."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+    except FileNotFoundError:
+        return None
+    out = []
+    for ln in text.splitlines():
+        n = ln.split('#', 1)[0].strip()
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def remotes_file_in_use(run):
+    """Whether run directory `run` holds a `selfplay_remotes` file (it turns remote self-play on even with
+    the setting `selfplay_remote` empty: docs/az.md 34)."""
+    return os.path.exists(os.path.join(run, REMOTES_FILE))
+
+
+def _host_tag(name):
+    """A remote name as a part of a file name (a shard's local name, docs/az.md 34)."""
+    return ''.join(ch if ch.isalnum() or ch in '._-' else '_' for ch in name)
+
+
 class Session:
     """One remote worker process and its pipes (reader, writer and stderr threads). Events from
     the worker go to the owner's `_event` on the reader thread."""
 
-    def __init__(self, rp, k):
-        self.rp, self.k = rp, k
-        self.name = f'w{k}'
+    def __init__(self, h, k):
+        self.rp, self.h, self.k = h.rp, h, k
+        self.name = h.cname(k)
         self.proc = None
         self.wq = queue.Queue()
         self.err = deque(maxlen=60)
@@ -221,23 +268,23 @@ class Session:
         self.util = [0.0, 0]                       # co-training: outstanding / cap, sampled while active
 
     def start(self):
-        rp = self.rp
-        args = ['selfplay', rp.rdir, str(self.k)]
-        env = {k: str(v) for k, v in rp.env.items()}
+        rp, h = self.rp, self.h
+        args = ['selfplay', h.rdir, str(self.k)]
+        env = {k: str(v) for k, v in h.env.items()}
         kw = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                   encoding='utf-8', errors='replace', bufsize=1)
         if os.name == 'nt':
             kw['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-        if rp.t.local:
+        if h.t.local:
             env.setdefault('PYTHONPATH', os.pathsep.join(p for p in sys.path if p))
-            self.proc = subprocess.Popen([rp.spec['python'], '-m', rp.module, *args], cwd=rp.spec['repo'],
+            self.proc = subprocess.Popen([h.spec['python'], '-m', rp.module, *args], cwd=h.spec['repo'],
                                          env=dict(os.environ, **env), **kw)
         else:
             exports = ' '.join(f'{k}={shlex.quote(v)}' for k, v in env.items())
-            sh = (f'cd {shlex.quote(rp.spec["repo"])} && {exports} exec {shlex.quote(rp.spec["python"])} -m '
+            sh = (f'cd {shlex.quote(h.spec["repo"])} && {exports} exec {shlex.quote(h.spec["python"])} -m '
                   f'{rp.module} ' + ' '.join(shlex.quote(a) for a in args))
             self.proc = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', '-o',
-                                          'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4', rp.spec['host'], sh],
+                                          'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4', h.spec['host'], sh],
                                          **kw)
         for fn, nm in ((self._read, 'out'), (self._write, 'in'), (self._drain, 'err')):
             threading.Thread(target=fn, name=f'zero-rsp-w{self.k}-{nm}', daemon=True).start()
@@ -317,18 +364,23 @@ class Session:
         self.kill()
 
 
-class RemotePlay:
-    """A run's self-play on the remote `name` (module docstring). `mode` 'selfplay' (a single-game
-    run's self-play: the shared quota of games, shards) or 'matches' (a co-training run's resolver
-    episodes from the coordinator given to `begin`: rows and shards). `mirror`: the mirror's name in
-    the remote's selfplay workdir (default the run directory's name; a co-training run's resolver:
-    '<run name>.resolver'). The run's own driver is the consumer 'local' (`local(lo, hi)`), whose
-    cap `local_cap()` gives."""
+def _counters(it):
+    """A phase's counters of the remote's work (a host's, and all hosts' together)."""
+    return {'it': it, 'announced': 0, 'accepted': 0, 'rows': 0, 'bytes': 0, 'pending': 0, 'rejected': 0,
+            'quarantined': 0, 'failed': 0, 'fetch_s': 0.0, 'assigned': 0, 'matches': 0, 'dup': 0, 'requeued': 0,
+            'requeued_timeout': 0, 'requeued_backoff': 0, 'errors': 0, 'games': 0, 'lost': 0, 'stale': {}}
 
-    def __init__(self, R, name, mode='selfplay', mirror=None):
-        from .run import DEFAULTS
-        self.R, self.name, self.mode = R, name, mode
-        c = R.cfg
+
+class Host:
+    """One remote of a run's self-play (`RemotePlay`): its spec, transport, mirror and settings, its
+    `procs` worker sessions and their bookkeeping (failures, the checkpoint shipped). A run with one
+    remote has one; with a list of remotes (docs/az.md 34) one per name, each with its own mirror on
+    its own machine. `prefix`: its consumers' names in the shared queue ('' with one remote: 'w0',
+    'w1', ...; '<name>/' with a list)."""
+
+    def __init__(self, rp, name):
+        c = rp.R.cfg
+        self.rp, self.name = rp, name
         self.spec = remote_spec(name, 'selfplay_remote')
         sp = dict(self.spec.get('selfplay') or {})
         self.t = Transport(self.spec)
@@ -339,9 +391,78 @@ class RemotePlay:
             raise SystemExit(f'selfplay_remote {name!r}: the remote self-play workdir {self.workdir!r} is not an '
                              f'absolute path on the remote (a Windows shell converted $ZERO_SELFPLAY_WORKDIR? Git '
                              f'Bash: MSYS2_ENV_CONV_EXCL=ZERO_SELFPLAY_WORKDIR)')
-        self.mirror = mirror or os.path.basename(os.path.normpath(R.run))
-        self.rdir = self.workdir + '/' + self.mirror
+        self.rdir = self.workdir + '/' + rp.mirror
+        # (where its mirror is: two hosts with the same one would take each other's worker slots)
+        self.where = (self.spec['host'], os.path.normcase(os.path.abspath(self.workdir)) if self.t.local else self.workdir)
         self.procs = max(1, int(c.get('selfplay_remote_procs') or sp.get('procs') or 1))
+        self.env = dict(self.spec.get('env') or {}, **(sp.get('env') or {}))
+        self.overrides = dict(sp.get('overrides') or {})
+        self.locks = [self.spec['workdir'].rstrip('/\\') + '/.eval.lock'] + list(sp.get('locks') or [])
+        self.nice = int(sp.get('nice', 0))
+        self.backoff = sp.get('backoff', 'stop')
+        if self.backoff not in ('stop', 'background'):
+            raise SystemExit(f"selfplay_remote {name!r}: backoff {self.backoff!r}: 'stop' or 'background'")
+        self.conc = int(self.overrides.get('conc') or c['conc'])
+        self.groups = int(self.overrides.get('groups') or c['groups'])
+        # a worker's most outstanding: its driver's slots (self-play: it starts its own games), plus a
+        # queue in its driver (co-training: matches travel to it, so its slots never wait for them)
+        self.cap = self.conc + max(1, self.conc // 4) if rp.mode == 'matches' else self.conc
+        self.batch = rp.batch_bound('remote', self.overrides.get('infer_device') or c['infer_device'])
+        self.prefix = ''                           # its consumers' names: prefix + 'w<k>'
+        self.tag = ''                              # a list of hosts: its shards' local names start with it
+        self.salt = 0                              # ... and its workers' driver seeds differ by it
+        self.sess = [None] * self.procs
+        self.next_try = [0.0] * self.procs
+        self.fails = 0
+        self.streak = 0                            # failures since a worker last said hello
+        self.t_faillog = 0.0
+        self.refusals = 0                          # workers that refused the run's checkpoint (docs/az.md 10.4)
+        self.t_refused = 0.0
+        self.model_shipped = None
+        self.ship_retry = 0.0
+        self.mirror_ready = False
+        self.cur = None                            # its counters of the open phase (_counters)
+        self.late_total = 0
+        self.late_reported = 0
+        self.retired = False                       # no longer listed (docs/az.md 34)
+
+    def cname(self, k):
+        """Worker `k`'s consumer name in the shared queue."""
+        return f'{self.prefix}w{k}'
+
+    def cnames(self):
+        return [self.cname(k) for k in range(self.procs)]
+
+    def log(self, msg):
+        self.rp.R.log(f'remote self-play {self.name}: {msg}')
+
+    def fail_log(self, msg):
+        """A failure to start or keep a worker: logged the first times, then every 10 minutes (a
+        remote asleep for a night is not 500 lines)."""
+        self.streak += 1
+        if self.streak <= 3 or _now() - self.t_faillog > 600:
+            self.t_faillog = _now()
+            self.log(msg + (f' ({self.streak} failures in a row; logged every 10 minutes now)' if self.streak > 3 else ''))
+
+    def live(self):
+        return [s for s in self.sess if s is not None and s.alive()]
+
+
+class RemotePlay:
+    """A run's self-play on the remote `name` (module docstring) - or on several (docs/az.md 34):
+    `name` a comma-separated list of remotes, or the run directory's `selfplay_remotes` file (one name
+    per line, re-read at every phase start: hosts join and leave a live run). `mode` 'selfplay' (a
+    single-game run's self-play: the shared quota of games, shards) or 'matches' (a co-training run's
+    resolver episodes from the coordinator given to `begin`: rows and shards; the setting's list, never
+    the file). `mirror`: the mirror's name in each remote's selfplay workdir (default the run
+    directory's name; a co-training run's resolver: '<run name>.resolver'). The run's own driver is
+    the consumer 'local' (`local(lo, hi)`), whose cap `local_cap()` gives."""
+
+    def __init__(self, R, name, mode='selfplay', mirror=None):
+        from .run import DEFAULTS
+        self.R, self.name, self.mode = R, name, mode
+        c = R.cfg
+        self.mirror = mirror or os.path.basename(os.path.normpath(R.run))
 
         def setting(k):
             v = c.get(k)
@@ -356,78 +477,229 @@ class RemotePlay:
         self.giveback_s = float(setting('selfplay_remote_giveback'))
         self.overdue = float(setting('selfplay_remote_overdue'))
         self.linger = bool(int(setting('selfplay_remote_linger') or 0))
+        # selfplay_local 0 (docs/az.md 34): this machine takes no games while a remote worker takes work
+        self.local_play = bool(int(setting('selfplay_local')))
+        if not self.local_play and mode != 'selfplay':
+            raise SystemExit('selfplay_local 0: single-game runs only (a co-training run\'s resolver plays its '
+                             'reserve here)')
+        self.local_off = False
         self.overdue_min = float(os.environ.get('ZERO_RSP_OVERDUE_MIN_S', OVERDUE_MIN_S))
         self.provisional_s = float(os.environ.get('ZERO_RSP_PROVISIONAL_S', PROVISIONAL_S))
         self.retry_s = float(os.environ.get('ZERO_RSP_RETRY_S', RETRY_S))
-        self.env = dict(self.spec.get('env') or {}, **(sp.get('env') or {}))
-        self.overrides = dict(sp.get('overrides') or {})
-        self.locks = [self.spec['workdir'].rstrip('/\\') + '/.eval.lock'] + list(sp.get('locks') or [])
-        self.nice = int(sp.get('nice', 0))
-        self.backoff = sp.get('backoff', 'stop')
-        if self.backoff not in ('stop', 'background'):
-            raise SystemExit(f"selfplay_remote {name!r}: backoff {self.backoff!r}: 'stop' or 'background'")
         pkg = package.active()
         self.module = f'{pkg.name}.az.remote' if pkg.name != 'zero' else 'zero.remote'
         self.run_id = f'{socket.gethostname()}:{os.path.abspath(R.run)}'
-        conc = int(self.overrides.get('conc') or c['conc'])
-        groups = int(self.overrides.get('groups') or c['groups'])
-        # a worker's most outstanding: its driver's slots (self-play: it starts its own games), plus a
-        # queue in its driver (co-training: matches travel to it, so its slots never wait for them)
-        self.cap = conc + max(1, conc // 4) if mode == 'matches' else conc
         self.shares = Shares(self.inflight, self.batch_inflight)
-        wbatch = self.batch_bound('remote', self.overrides.get('infer_device') or c['infer_device'])
-        for k in range(self.procs):
-            self.shares.consumer(f'w{k}', max(2, groups), self.cap, cautious=True, batch=wbatch, slots=conc)
         self.capv = {}                             # the caps now (the manager's last computation)
         self.events = None                         # co-training: events per iteration (the primary's games)
         self.q = None                              # single-game: the open phase's quota
         self.mu = threading.Condition()
-        self.sess = [None] * self.procs
-        self.next_try = [0.0] * self.procs
-        self.fails = 0
-        self.streak = 0                            # failures since a worker last said hello
-        self.t_faillog = 0.0
-        self.refusals = 0                          # workers that refused the run's checkpoint (docs/az.md 10.4)
-        self.t_refused = 0.0
         self.want = None                           # the iteration whose phase should run (None: between)
         self.accepting = None                      # the iteration whose shards are taken in
         self.co = None
-        self.cur = None                            # the phase's counters
-        self.model_shipped = None
-        self.ship_retry = 0.0
-        self.mirror_ready = False
+        self.cur = None                            # the phase's counters (every host's together)
         self.fatal = None                          # a NonFinite to raise on the main thread
         self.closed = False
         self.late_total = 0
         self.late_reported = 0
         self.fq = queue.Queue()
+        self.fths = []
+        # the hosts (docs/az.md 34): the setting's list, or the run directory's selfplay_remotes file
+        # (single-game runs: re-read at every phase start); one remote = 'w0', 'w1', ... as before
+        self.setting = remote_names(name)
+        self.file = os.path.join(R.run, REMOTES_FILE) if mode == 'selfplay' else None
+        names, from_file = self._wanted()
+        self.multi = bool(from_file or len(names) >= 2)
+        self.listed = names                        # the names that should play
+        self.hosts = {}                            # name -> Host (the resolved ones, in the order they joined)
+        self.resolving = set()                     # names resolving on a thread now
+        self.restored = {}                         # a list of hosts: restored rates of consumers not here yet
+        if not self.multi:
+            if not names:
+                raise SystemExit(f'selfplay_remote {name!r}: no remote named')
+            self._add_host(Host(self, names[0]))   # (an unknown name: SystemExit, as always)
+        else:
+            for n in names:
+                try:
+                    h = Host(self, n)
+                except (Exception, SystemExit) as e:   # noqa: BLE001 - logged, retried at the next phase
+                    self._skipped(n, e)
+                    continue
+                self._add_host(h)
         self.mth = threading.Thread(target=self._loop, name='zero-rsp', daemon=True)
+        self.mth.start()
+
+    # ---------------------------------------------------------------- hosts
+    @property
+    def spec(self):
+        """The (first) host's spec ({} with none)."""
+        h = next(iter(self.hosts.values()), None)
+        return h.spec if h is not None else {}
+
+    @property
+    def rdir(self):
+        h = next(iter(self.hosts.values()), None)
+        return h.rdir if h is not None else ''
+
+    @property
+    def procs(self):
+        """Worker processes on every host together."""
+        return sum(h.procs for h in self.hosts.values())
+
+    def describe(self):
+        """The hosts for the log ('mac' (host, 2 worker(s), mirror ...), ...)."""
+        with self.mu:
+            hs = [f'{h.name!r} ({h.spec["host"]}, {h.procs} worker(s), mirror {h.rdir})' for h in self.hosts.values()]
+            todo = [n for n in self.listed if n not in self.hosts]
+        return ', '.join(hs + [f'{n!r} (not resolved yet)' for n in todo]) or 'none yet'
+
+    def _wanted(self):
+        """(names, from the file) The remotes that should self-play now: the run directory's
+        `selfplay_remotes` file's when it exists (single-game runs), else the setting's."""
+        if self.file is not None:
+            names = read_remotes_file(self.file)
+            if names is not None:
+                return names, True
+        return list(self.setting), False
+
+    def _skipped(self, name, e):
+        self.R.log(f'remote self-play {name}: not added ({type(e).__name__}: {str(e)[-400:]}); retried at the next '
+                   f'phase')
+
+    def _label(self, h):
+        """(mu held) Host `h`'s consumer names, shard tag and seed salt: a list of hosts names them, one
+        remote keeps today's ('w0', no tag, no salt)."""
+        if self.multi:
+            h.prefix, h.tag = f'{h.name}/', _host_tag(h.name)
+            h.salt = (zlib.crc32(h.name.encode('utf-8')) & 0xffffffff) * 104729
+        else:
+            h.prefix, h.tag, h.salt = '', '', 0
+
+    def _add_host(self, h):
+        """(mu held, or before the threads start) Host `h` joins: its consumers enter the shared queue
+        (a restored rate first; an unmeasured remote's bootstrap otherwise), its sessions start with the
+        manager's next tick. -> False if its mirror is another host's."""
+        for o in self.hosts.values():
+            if o.where == h.where:
+                h.log(f'not added: its mirror {h.rdir} on {h.spec["host"]} is {o.name!r}\'s (one machine and workdir '
+                      f'under two names: give each a selfplay workdir of its own); retried at the next phase')
+                return False
+        self.hosts[h.name] = h
+        self._label(h)
+        for n in h.cnames():
+            self.shares.consumer(n, max(2, h.groups), h.cap, cautious=True, batch=h.batch, slots=h.conc)
+            st = self.restored.pop(n, None)
+            if st:
+                self.shares.restore({n: st})
+        if self.cur is not None:
+            h.cur = _counters(self.cur['it'])
         # one fetch thread per worker: the workers' last shards of a phase come back side by side (each
         # copy is an scp with its own ssh handshake, ~1-2 s, then the check)
-        self.fths = [threading.Thread(target=self._fetcher, name=f'zero-rsp-fetch{k}', daemon=True)
-                     for k in range(max(2, self.procs))]
-        self.mth.start()
-        for th in self.fths:
+        while len(self.fths) < max(2, self.procs):
+            th = threading.Thread(target=self._fetcher, name=f'zero-rsp-fetch{len(self.fths)}', daemon=True)
+            self.fths.append(th)
             th.start()
+        return True
+
+    def _relabel(self, multi):
+        """(mu held) One remote <-> a list: the hosts' consumers renamed in place (their rates kept)."""
+        if multi == self.multi:
+            return
+        self.multi = multi
+        for h in self.hosts.values():
+            old = h.cnames()
+            self._label(h)
+            for k, o in enumerate(old):
+                self.shares.rename(o, h.cname(k))
+                if h.sess[k] is not None:
+                    h.sess[k].name = h.cname(k)
+
+    def _retire(self, h):
+        """(mu held; a phase start, so no phase of `h` is open) Host `h` is no longer listed: its
+        consumers leave the queue at once; the games its workers hold or play are never accepted (the
+        quota never counted them: nothing to give back); its sessions quit (on threads)."""
+        h.retired = True
+        del self.hosts[h.name]
+        for n in h.cnames():
+            self.shares.drop(n)
+        sess = [s for s in h.sess if s is not None]
+        requeue = []
+        for s in sess:
+            s.handled = True                       # (its end is no failure)
+            requeue += [(tag, spec) for tag, (_t, spec) in s.assigned.items()]
+            s.assigned.clear()
+            threading.Thread(target=s.close, name=f'zero-rsp-retire-{h.name}', daemon=True).start()
+        if requeue and self.co is not None:
+            self.co.requeue(requeue)
+        h.log(f'removed: its {len(sess)} worker(s) quit; the games they hold or play are not counted')
+
+    def _membership(self, it):
+        """(mu held) A phase starts: the hosts follow the selfplay_remotes file (or, without one, the
+        setting) - the unlisted ones leave, the newly listed ones resolve on a thread (a failure is
+        logged and retried at the next phase) and join as they are ready. Every change is logged."""
+        try:
+            names, from_file = self._wanted()
+        except OSError as e:
+            self.R.log(f'remote self-play: {self.file} not read ({type(e).__name__}: {e}); the hosts stay '
+                       f'[{", ".join(self.listed)}]')
+            return
+        if names != self.listed:
+            added = [n for n in names if n not in self.listed]
+            gone = [n for n in self.listed if n not in names]
+            self.R.log(f'remote self-play: hosts now [{", ".join(names)}] ('
+                       + ', '.join([f'+{n}' for n in added] + [f'-{n}' for n in gone]) + ')'
+                       + ('' if names else ': this machine plays alone'))
+            self.listed = names
+        for n in [n for n in self.hosts if n not in names]:
+            self._retire(self.hosts[n])
+        self._relabel(bool(from_file or len(names) >= 2))
+        for n in names:
+            if n not in self.hosts and n not in self.resolving:
+                self.resolving.add(n)
+                threading.Thread(target=self._resolve, args=(n,), name=f'zero-rsp-resolve-{n}', daemon=True).start()
+
+    def _resolve(self, name):
+        """(a thread) Host `name`'s spec resolves (a Mapping's checks, a parametrised remote's call) and the
+        host joins - unless it was unlisted meanwhile."""
+        try:
+            h, err = Host(self, name), None
+        except (Exception, SystemExit) as e:   # noqa: BLE001 - logged, retried at the next phase
+            h, err = None, e
+        with self.mu:
+            self.resolving.discard(name)
+            if self.closed:
+                return
+            if err is not None:
+                self._skipped(name, err)
+                return
+            if name not in self.listed or name in self.hosts:
+                return
+            if self._add_host(h):
+                h.log(f'added ({h.spec["host"]}, {h.procs} worker(s), mirror {h.rdir})')
+                self._refresh()
+                self.mu.notify_all()
 
     def log(self, msg):
-        self.R.log(f'remote self-play {self.name}: {msg}')
-
-    def fail_log(self, msg):
-        """A failure to start or keep a worker: logged the first times, then every 10 minutes (a
-        remote asleep for a night is not 500 lines)."""
-        self.streak += 1
-        if self.streak <= 3 or _now() - self.t_faillog > 600:
-            self.t_faillog = _now()
-            self.log(msg + (f' ({self.streak} failures in a row; logged every 10 minutes now)' if self.streak > 3 else ''))
+        self.R.log(f'remote self-play {self.name}: {msg}' if not self.multi else f'remote self-play: {msg}')
 
     def _wake(self):
         with self.mu:
             self.mu.notify_all()
 
     def capacity(self):
-        """Episodes outstanding on the remote at most (co-training: the backpressure's share)."""
-        return self.procs * self.cap
+        """Episodes outstanding on the remotes at most (co-training: the backpressure's share)."""
+        return sum(h.procs * h.cap for h in self.hosts.values())
+
+    def _sessions(self):
+        """(mu held) Every host's sessions (not None)."""
+        return [s for h in self.hosts.values() for s in h.sess if s is not None]
+
+    def _inc(self, h, key, n=1):
+        """(mu held) Counter `key` of the open phase, all hosts' and host `h`'s."""
+        if self.cur is not None:
+            self.cur[key] += n
+        if h is not None and h.cur is not None:
+            h.cur[key] += n
 
     # ---------------------------------------------------------------- the shared queue's model
     def batch_bound(self, who, device):
@@ -456,9 +728,35 @@ class RemotePlay:
 
     def restore(self, rates):
         """The consumers' rates from the run's last metrics row (a restart: the first caps follow
-        them, not the slots)."""
+        them, not the slots). With one remote, a row of a list of hosts gives that remote's workers
+        theirs ('<name>/w<k>' -> 'w<k>'; other hosts' are dropped); with a list, a row of one remote
+        gives it its workers' ('w<k>' -> '<name>/w<k>', the setting's name), and a host not here yet
+        gets its rates when it joins."""
+        state = dict(rates or {})
         with self.mu:
-            self.shares.restore(rates)
+            if not self.multi:
+                h = next(iter(self.hosts.values()), None)
+                pre = f'{h.name}/' if h is not None else None
+                for n in [n for n in state if '/' in n]:
+                    st = state.pop(n)
+                    if pre and n.startswith(pre) and n[len(pre):] not in state:
+                        state[n[len(pre):]] = st
+                self.shares.restore(state)
+            else:
+                one = self.setting[0] if len(self.setting) == 1 else None
+                mine = {n for h in self.hosts.values() for n in h.cnames()} | {'local'}
+                keep = {}
+                for n, st in state.items():
+                    if n.startswith('_'):
+                        keep[n] = st
+                        continue
+                    if one and '/' not in n and n != 'local':
+                        n = f'{one}/{n}'
+                    if n in mine:
+                        keep[n] = st
+                    elif isinstance(st, dict):
+                        self.restored[n] = st
+                self.shares.restore(keep)
             self._refresh()
 
     def local_cap(self):
@@ -478,15 +776,29 @@ class RemotePlay:
     def _refresh(self):
         """(mu held) Who takes work now, the caps, and the local driver's cap in the coordinator. A
         worker not measured yet gets its first rate from its status lines once it has run for
-        `provisional_s` in a phase."""
+        `provisional_s` in a phase. selfplay_local 0: this machine takes work only while no remote
+        worker does."""
         sh = self.shares
-        for k in range(self.procs):
-            s = self.sess[k]
-            sh.set_active(f'w{k}', s is not None and s.alive() and s.hello is not None and not s.backing_off())
-            st = s.status if s is not None else {}
-            if st.get('phase') is not None and st.get('run_s', 0) >= self.provisional_s                     and sh.provisional(f'w{k}', st.get('leaves'), st['run_s']):
-                self.log(f'worker {k}: first measured at {st["leaves"] / st["run_s"]:.0f} leaves/s in '
-                         f'{st["run_s"]:.0f}s of its phase')
+        taking = 0
+        for h in self.hosts.values():
+            for k in range(h.procs):
+                s = h.sess[k]
+                on = s is not None and s.alive() and s.hello is not None and not s.backing_off()
+                sh.set_active(h.cname(k), on)
+                taking += on
+                st = s.status if s is not None else {}
+                if st.get('phase') is not None and st.get('run_s', 0) >= self.provisional_s \
+                        and sh.provisional(h.cname(k), st.get('leaves'), st['run_s']):
+                    h.log(f'worker {k}: first measured at {st["leaves"] / st["run_s"]:.0f} leaves/s in '
+                          f'{st["run_s"]:.0f}s of its phase')
+        if not self.local_play and 'local' in sh.c:
+            off = taking > 0
+            if off != self.local_off:
+                self.local_off = off
+                self.R.log(f'remote self-play: this machine takes no games now ({taking} remote worker(s) take the '
+                           f'queue; selfplay_local 0)' if off else
+                           'remote self-play: this machine plays again (no remote worker takes work; selfplay_local 0)')
+            sh.set_active('local', not off)
         sh.units = self._units()
         self.capv = sh.caps()
         if self.co is not None and 'local' in self.capv:
@@ -502,7 +814,8 @@ class RemotePlay:
     def begin(self, it, co=None):
         """Iteration `it`'s self-play starts: the remote's as soon as it can (never waited for).
         The run calls it as soon as checkpoint it - 1 is written (before its evaluation) and again
-        when its own phase starts (then a no-op). Single-game: the iteration's quota opens."""
+        when its own phase starts (then a no-op). Single-game: the iteration's quota opens; the hosts
+        follow the selfplay_remotes file (docs/az.md 34)."""
         with self.mu:
             if self.fatal is not None:
                 raise self.fatal
@@ -512,16 +825,18 @@ class RemotePlay:
                 self.cur['t_local'] = _now()           # this machine's phase starts now
                 self._refresh()
                 return
+            self._membership(it)
             self.want = it
             self.accepting = it
             self.cur = {'it': it, 't0': _now(), 't_local': _now(), 'announced': 0, 'accepted': 0, 'rows': 0, 'bytes': 0,
                         'pending': 0, 'rejected': 0, 'quarantined': 0, 'failed': 0, 'fetch_s': 0.0, 'assigned': 0,
                         'matches': 0, 'dup': 0, 'requeued': 0, 'requeued_timeout': 0, 'requeued_backoff': 0, 'errors': 0,
                         'games': 0, 'lost': 0, 'stale': {}, 'capsum': {}, 'capmax': {}, 'capn': 0}
-            for s in self.sess:
-                if s is not None:
-                    s.acc_ph = s.ship_ph = 0
-                    s.util = [0.0, 0]
+            for h in self.hosts.values():
+                h.cur = _counters(it)
+            for s in self._sessions():
+                s.acc_ph = s.ship_ph = 0
+                s.util = [0.0, 0]
             if self.mode == 'selfplay':
                 self.q = {'it': it, 'need': int(self.R.cfg['games']), 'done': 0, 'by': {}, 'open': True}
             self._refresh()
@@ -579,8 +894,8 @@ class RemotePlay:
         """(mu held) The quota is met: every worker in the phase ends it now (its later games wait)."""
         q = self.q
         q['open'] = False
-        for s in self.sess:
-            if s is not None and s.alive() and s.phase == q['it'] and s.end_sent != q['it']:
+        for s in self._sessions():
+            if s.alive() and s.phase == q['it'] and s.end_sent != q['it']:
                 s.send({'cmd': 'end', 'iter': q['it']})
                 s.end_sent = q['it']
         self.mu.notify_all()
@@ -588,7 +903,7 @@ class RemotePlay:
     def _accept_remote(self, s):
         """(mu held) Worker `s`'s finished games, as many as the quota still needs."""
         q = self.q
-        if q is None or s.phase != q['it'] or s.end_sent == q['it'] or not s.alive():
+        if q is None or s.phase != q['it'] or s.end_sent == q['it'] or not s.alive() or s.h.retired:
             return
         a = self._take(q['it'], s.name, s.fin - s.acc)
         if a:
@@ -597,72 +912,10 @@ class RemotePlay:
             s.send({'cmd': 'accept', 'iter': q['it'], 'n': a})
             self._close_if_met()
 
-    def end(self, it, local=None):
-        """Iteration `it`'s self-play ended here: the remote's phase ends too; waits at most
-        `selfplay_remote_wait` s for its last shards. `local`: this machine's phase ({units, run_s,
-        util}: the shared queue's measurement). -> the remote's share (metrics), with `queue`: the
-        consumers' caps, rates and the remote rows' staleness."""
-        t0 = _now()
-        with self.mu:
-            self.want = None
-            if self.q is not None and self.q['it'] == it:
-                self.q['open'] = False
-            targets = [s for s in self.sess if s is not None and s.alive() and s.phase == it]
-            for s in targets:
-                if s.end_sent != it:
-                    s.send({'cmd': 'end', 'iter': it})
-                    s.end_sent = it
-            deadline = t0 + self.wait_s
-            while True:
-                done = all(it in s.ended or not s.alive() for s in targets) and self.cur['pending'] == 0
-                if done or _now() >= deadline:
-                    break
-                self.mu.wait(min(0.25, max(0.01, deadline - _now())))
-            self.accepting = None
-            cur = dict(self.cur)
-            ends = [s.ended.get(it) for s in targets]
-            late = cur['announced'] - cur['accepted'] - cur['rejected'] - cur['quarantined'] - cur['failed']
-            late_prev, self.late_reported = self.late_total - self.late_reported, self.late_total
-            live = sum(1 for s in self.sess if s is not None and s.alive())
-            out = {'host': self.name, 'procs': self.procs, 'workers': live, 'in_phase': len(targets),
-                   'ended': sum(1 for e in ends if e)}
-            # the shared queue: each consumer's phase measured, the next caps
-            ncap = max(1, cur['capn'])
-            phase_caps = {n: round(v / ncap, 1) for n, v in cur['capsum'].items()}
-            meas = {}
-            for s in self.sess:
-                e = s.ended.get(it) if s is not None else None
-                if not e:
-                    continue
-                util = (s.util[0] / s.util[1]) if (self.mode == 'matches' and s.util[1]) else 1.0
-                # its head start (single-game: its running time before this machine's phase began;
-                # co-training: none - the matches come with the drafting)
-                lead = max(0.0, cur['t_local'] - cur['t0'] - e.get('backoff_s', 0.0)) if self.mode == 'selfplay'                     else 0.0
-                meas[s.name] = {'units': e.get('games', 0), 'run_s': e.get('active_s', 0.0), 'util': util, 'lead': lead,
-                                'leaves': e.get('leaves')}
-            if local is not None:
-                meas['local'] = {'units': local.get('units', 0), 'run_s': local.get('run_s', 0.0),
-                                 'util': local.get('util'), 'leaves': local.get('leaves')}
-            got = self.shares.observe_phase(meas)
-            for n, m in meas.items():
-                m['run_s'] = round(m['run_s'], 1)
-                m['util'] = None if m.get('util') is None else round(m['util'], 3)
-                m['rate_measured'] = None if got.get(n) is None else round(got[n], 4)
-            self._refresh()
-            rates = self.shares.rates()
-            consumers = {}
-            for n in self.shares.c:
-                m = {k: v for k, v in meas.get(n, {}).items() if k not in ('leaves', 'lead')}
-                consumers[n] = dict(m, cap=phase_caps.get(n), cap_max=cur['capmax'].get(n), cap_next=self.capv.get(n),
-                                    rate=round(rates.get(n, 0.0), 4))
-            quota = None
-            if self.q is not None and self.q['it'] == it:
-                quota = {'need': self.q['need'], 'accepted': self.q['done'], 'by': dict(self.q['by'])}
-            held = sum(max(0, s.fin - s.acc) for s in self.sess if s is not None and s.alive())
-            qblock = {'units': self.shares.units, 'inflight': self.inflight, 'batch_inflight': self.shares.fb,
-                      'consumers': consumers, 'rates': self.shares.state(), 'stale': dict(cur['stale']), 'quota': quota,
-                      'held_remote': held}
-        ends = [e for e in ends if e]
+    def _record(self, out, ends, cur, late, late_prev, wait_s, lead_s, caps, held, outstanding):
+        """`out` ({host, procs, workers, in_phase, ended}) completed into a phase's remote record (the
+        metrics' `selfplay.remote`; with a list of hosts also each host's, `selfplay.remotes`) from its
+        workers' end events and the phase's counters."""
         secs = max([e['seconds'] for e in ends], default=0.0)
         leaves = sum(e['leaves'] for e in ends)
         # single-game: the games whose samples arrived (accepted shards' games, and accepted games with
@@ -678,10 +931,10 @@ class RemotePlay:
                    backoff_s=round(max([e['backoff_s'] for e in ends], default=0.0), 1),
                    in_flight=sum(e.get('in_flight', 0) for e in ends), late=late, late_prev=late_prev,
                    rejected=cur['rejected'], quarantined=cur['quarantined'], fetch_failed=cur['failed'],
-                   fetch_s=round(cur['fetch_s'], 1), wait_s=round(_now() - t0, 2), session_errors=cur['errors'],
-                   lead_s=round(cur['t_local'] - cur['t0'], 1), caps=phase_caps)
+                   fetch_s=round(cur['fetch_s'], 1), wait_s=wait_s, session_errors=cur['errors'],
+                   lead_s=lead_s, caps=caps)
         if self.mode == 'selfplay':
-            out.update(accepted=sum(e.get('accepted', 0) for e in ends), held=qblock['held_remote'], lost=cur['lost'])
+            out.update(accepted=sum(e.get('accepted', 0) for e in ends), held=held, lost=cur['lost'])
             if any('league' in e for e in ends):       # the self-play league: its accepted games' (league.tally)
                 from .league import merge
                 lg = {}
@@ -701,8 +954,6 @@ class RemotePlay:
                     rs = rmerge(rs, e.get('resign'))
                 out['resign'] = rs
         if self.mode == 'matches':
-            with self.mu:
-                outstanding = sum(len(s.assigned) for s in self.sess if s is not None)
             out.update(matches=cur['matches'], assigned=cur['assigned'], requeued=cur['requeued'],
                        requeued_timeout=cur['requeued_timeout'], requeued_backoff=cur['requeued_backoff'],
                        duplicates_dropped=cur['dup'], outstanding=outstanding)
@@ -714,31 +965,139 @@ class RemotePlay:
         if any(e.get('linger') for e in ends):
             out['linger'] = {'games': sum((e.get('linger') or {}).get('games', 0) for e in ends),
                              'seconds': round(max((e.get('linger') or {}).get('seconds', 0.0) for e in ends), 1)}
+        return out
+
+    def end(self, it, local=None):
+        """Iteration `it`'s self-play ended here: the remote's phase ends too; waits at most
+        `selfplay_remote_wait` s for its last shards. `local`: this machine's phase ({units, run_s,
+        util}: the shared queue's measurement). -> the remote's share (metrics), with `queue`: the
+        consumers' caps, rates and the remote rows' staleness; with a list of hosts also `remotes`,
+        each host's share (docs/az.md 34)."""
+        t0 = _now()
+        with self.mu:
+            self.want = None
+            if self.q is not None and self.q['it'] == it:
+                self.q['open'] = False
+            hosts = list(self.hosts.values())
+            targets = [s for s in self._sessions() if s.alive() and s.phase == it]
+            for s in targets:
+                if s.end_sent != it:
+                    s.send({'cmd': 'end', 'iter': it})
+                    s.end_sent = it
+            deadline = t0 + self.wait_s
+            while True:
+                done = all(it in s.ended or not s.alive() for s in targets) and self.cur['pending'] == 0
+                if done or _now() >= deadline:
+                    break
+                self.mu.wait(min(0.25, max(0.01, deadline - _now())))
+            self.accepting = None
+            cur = dict(self.cur)
+            ends = [s.ended.get(it) for s in targets]
+            late = cur['announced'] - cur['accepted'] - cur['rejected'] - cur['quarantined'] - cur['failed']
+            late_prev, self.late_reported = self.late_total - self.late_reported, self.late_total
+            live = sum(1 for s in self._sessions() if s.alive())
+            out = {'host': self.name if not self.multi else [h.name for h in hosts],
+                   'procs': sum(h.procs for h in hosts), 'workers': live, 'in_phase': len(targets),
+                   'ended': sum(1 for e in ends if e)}
+            # the shared queue: each consumer's phase measured, the next caps
+            ncap = max(1, cur['capn'])
+            phase_caps = {n: round(v / ncap, 1) for n, v in cur['capsum'].items()}
+            meas = {}
+            for s in self._sessions():
+                e = s.ended.get(it)
+                if not e:
+                    continue
+                util = (s.util[0] / s.util[1]) if (self.mode == 'matches' and s.util[1]) else 1.0
+                # its head start (single-game: its running time before this machine's phase began;
+                # co-training: none - the matches come with the drafting)
+                lead = max(0.0, cur['t_local'] - cur['t0'] - e.get('backoff_s', 0.0)) if self.mode == 'selfplay' \
+                    else 0.0
+                meas[s.name] = {'units': e.get('games', 0), 'run_s': e.get('active_s', 0.0), 'util': util, 'lead': lead,
+                                'leaves': e.get('leaves')}
+            # (selfplay_local 0: a phase this machine sat out measures nothing - its rate is kept)
+            if local is not None and (self.local_play or phase_caps.get('local', 1) > 0):
+                meas['local'] = {'units': local.get('units', 0), 'run_s': local.get('run_s', 0.0),
+                                 'util': local.get('util'), 'leaves': local.get('leaves')}
+            got = self.shares.observe_phase(meas)
+            for n, m in meas.items():
+                m['run_s'] = round(m['run_s'], 1)
+                m['util'] = None if m.get('util') is None else round(m['util'], 3)
+                m['rate_measured'] = None if got.get(n) is None else round(got[n], 4)
+            self._refresh()
+            rates = self.shares.rates()
+            consumers = {}
+            for n in self.shares.c:
+                m = {k: v for k, v in meas.get(n, {}).items() if k not in ('leaves', 'lead')}
+                consumers[n] = dict(m, cap=phase_caps.get(n), cap_max=cur['capmax'].get(n), cap_next=self.capv.get(n),
+                                    rate=round(rates.get(n, 0.0), 4))
+            quota = None
+            if self.q is not None and self.q['it'] == it:
+                quota = {'need': self.q['need'], 'accepted': self.q['done'], 'by': dict(self.q['by'])}
+            held = sum(max(0, s.fin - s.acc) for s in self._sessions() if s.alive())
+            qblock = {'units': self.shares.units, 'inflight': self.inflight, 'batch_inflight': self.shares.fb,
+                      'consumers': consumers, 'rates': self.shares.state(), 'stale': dict(cur['stale']), 'quota': quota,
+                      'held_remote': held}
+            outstanding = sum(len(s.assigned) for s in self._sessions())
+            per = []                               # a list of hosts: each host's share
+            if self.multi:
+                for h in hosts:
+                    ht = [s for s in targets if s.h is h]
+                    hc = h.cur if h.cur is not None and h.cur['it'] == it else _counters(it)
+                    hlate = hc['announced'] - hc['accepted'] - hc['rejected'] - hc['quarantined'] - hc['failed']
+                    hprev, h.late_reported = h.late_total - h.late_reported, h.late_total
+                    hends = [s.ended.get(it) for s in ht]
+                    hout = {'host': h.name, 'procs': h.procs, 'workers': len(h.live()), 'in_phase': len(ht),
+                            'ended': sum(1 for e in hends if e)}
+                    per.append((h.name, hout, [e for e in hends if e], dict(hc), hlate, hprev,
+                                {n: phase_caps[n] for n in h.cnames() if n in phase_caps},
+                                sum(max(0, s.fin - s.acc) for s in h.live()),
+                                sum(len(s.assigned) for s in h.sess if s is not None)))
+        ends = [e for e in ends if e]
+        wait_s = round(_now() - t0, 2)
+        lead_s = round(cur['t_local'] - cur['t0'], 1)
+        out = self._record(out, ends, cur, late, late_prev, wait_s, lead_s, phase_caps, qblock['held_remote'], outstanding)
+        if self.multi:
+            out['remotes'] = {name: self._record(hout, hends, hc, hlate, hprev, wait_s, lead_s, hcaps, hheld, hout_n)
+                              for name, hout, hends, hc, hlate, hprev, hcaps, hheld, hout_n in per}
         out['queue'] = qblock
         if self.fatal is not None:
             raise self.fatal
         return out
 
+    def _progress(self, sess, host, caps, cur, by):
+        """The progress record of the sessions `sess` (all hosts' or one host's)."""
+        live = [s for s in sess if s is not None and s.alive()]
+        st = [s.status for s in live if s.status]
+        back = any(x.get('backoff') for x in st)
+        bg = any(x.get('background') for x in st)
+        state = ('background' if bg else 'backing off' if back else 'playing') if any(x.get('phase') for x in st) \
+            else ('idle' if live else ('connecting' if any(s is not None for s in sess) else 'offline'))
+        out = {'host': host, 'workers': len(live), 'state': state,
+               'games': sum(x.get('games', 0) for x in st), 'in_flight': sum(x.get('in_flight', 0) for x in st),
+               'samples': cur['rows'] if cur else 0, 'shards': cur['accepted'] if cur else 0, 'caps': caps}
+        if self.mode == 'selfplay' and self.q is not None:
+            out['games'] = sum(v for k, v in self.q['by'].items() if by(k))
+            out['quota'] = {'need': self.q['need'], 'accepted': self.q['done'], 'open': self.q['open']}
+            out['held'] = sum(max(0, s.fin - s.acc) for s in live)
+        if self.mode == 'matches':
+            out['outstanding'] = sum(len(s.assigned) for s in sess if s is not None)
+            out['matches'] = cur['matches'] if cur else 0
+        return out
+
     def progress(self):
-        """The remote's state for progress.json."""
+        """The remote's state for progress.json (with a list of hosts also `remotes`: each host's)."""
         with self.mu:
-            live = [s for s in self.sess if s is not None and s.alive()]
-            st = [s.status for s in live if s.status]
-            back = any(x.get('backoff') for x in st)
-            bg = any(x.get('background') for x in st)
-            state = ('background' if bg else 'backing off' if back else 'playing') if any(x.get('phase') for x in st) \
-                else ('idle' if live else ('connecting' if any(s is not None for s in self.sess) else 'offline'))
-            out = {'host': self.name, 'workers': len(live), 'state': state,
-                   'games': sum(x.get('games', 0) for x in st), 'in_flight': sum(x.get('in_flight', 0) for x in st),
-                   'samples': self.cur['rows'] if self.cur else 0, 'shards': self.cur['accepted'] if self.cur else 0,
-                   'caps': dict(self.capv)}
-            if self.mode == 'selfplay' and self.q is not None:
-                out['games'] = sum(v for k, v in self.q['by'].items() if k != 'local')
-                out['quota'] = {'need': self.q['need'], 'accepted': self.q['done'], 'open': self.q['open']}
-                out['held'] = sum(max(0, s.fin - s.acc) for s in live)
-            if self.mode == 'matches':
-                out['outstanding'] = sum(len(s.assigned) for s in self.sess if s is not None)
-                out['matches'] = self.cur['matches'] if self.cur else 0
+            out = self._progress(self._sessions(), self.name if not self.multi else list(self.hosts),
+                                 dict(self.capv), self.cur, lambda k: k != 'local')
+            if self.multi:
+                rems = {}
+                for h in self.hosts.values():
+                    mine = set(h.cnames())
+                    r = self._progress(h.sess, h.name, {n: v for n, v in self.capv.items() if n in mine},
+                                       h.cur, lambda k, mine=mine: k in mine)
+                    r.pop('quota', None)
+                    rems[h.name] = r
+                out['remotes'] = rems
         return out
 
     def close(self):
@@ -752,24 +1111,26 @@ class RemotePlay:
             self.accepting = None
             if self.q is not None:
                 self.q['open'] = False
-            sess = [s for s in self.sess if s is not None]
+            sess = self._sessions()
+            fths = list(self.fths)
             self.mu.notify_all()
         ths = [threading.Thread(target=s.close, daemon=True) for s in sess]
         for th in ths:
             th.start()
         for th in ths:
             th.join(15)
-        for _ in self.fths:
+        for _ in fths:
             self.fq.put(None)
 
     # ---------------------------------------------------------------- events (reader threads)
     def _event(self, s, ev):
         kind = ev.get('ev')
         rows = None
+        h = s.h
         with self.mu:
             if kind == 'hello':
                 s.hello = ev
-                self.streak = 0
+                h.streak = 0
                 if self.R.league is not None and self.mode == 'selfplay' and not ev.get('league'):
                     # a checkout without the self-play league would play mirror games and record both
                     # seats of the league's games: never used (zero/league.py)
@@ -794,8 +1155,8 @@ class RemotePlay:
                     # a checkout without self-play information-set merging would search unmerged in silence:
                     # never used (docs/az.md 30)
                     s.no_merge = ev.get('merge')
-                if self.fails or s.k == 0:
-                    self.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {self.rdir})')
+                if h.fails or s.k == 0:
+                    h.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {h.rdir})')
             elif kind == 'status':
                 s.status = ev
                 if ev.get('backoff'):
@@ -813,16 +1174,17 @@ class RemotePlay:
                 s.acc_ph -= n
                 self._give_back(s, ev.get('iter'), n)
             elif kind == 'shard':
-                if self.cur is not None and ev.get('iter') == self.accepting == self.cur['it']:
-                    self.cur['pending'] += 1
-                    self.cur['announced'] += 1
+                if self.cur is not None and ev.get('iter') == self.accepting == self.cur['it'] and not h.retired:
+                    self._inc(h, 'pending')
+                    self._inc(h, 'announced')
                     s.ship_ph += int(ev.get('games', 0))
                     self.fq.put((s, ev))
                 else:
                     self.late_total += 1               # its phase is over: dropped
+                    h.late_total += 1
                     s.send({'cmd': 'fetched', 'path': ev.get('path')})
-                    self.log(f'worker {s.k}: shard {os.path.basename(str(ev.get("path")))} of iteration '
-                             f'{ev.get("iter")} came after its phase closed: dropped')
+                    h.log(f'worker {s.k}: shard {os.path.basename(str(ev.get("path")))} of iteration '
+                          f'{ev.get("iter")} came after its phase closed: dropped')
             elif kind == 'row':
                 rows = [ev['row']]
                 s.assigned.pop(ev['row'].get('tag'), None)
@@ -842,8 +1204,8 @@ class RemotePlay:
                 return
             with self.mu:
                 if self.cur is not None:
-                    self.cur['matches'] += n
-                    self.cur['dup'] += len(rows) - n
+                    self._inc(h, 'matches', n)
+                    self._inc(h, 'dup', len(rows) - n)
 
     # ---------------------------------------------------------------- the manager thread
     def _loop(self):
@@ -873,159 +1235,173 @@ class RemotePlay:
                 for n, v in self.capv.items():
                     self.cur['capsum'][n] = self.cur['capsum'].get(n, 0) + v
                     self.cur['capmax'][n] = max(self.cur['capmax'].get(n, 0), v)
-        for k in range(self.procs):
-            s = self.sess[k]
-            if s is not None and not s.alive() and not s.handled:
-                self._lost(s)
-                s = None
-            if s is None:
-                if want is not None and now >= self.next_try[k]:
-                    try:
-                        self._start(k)
-                    except Exception as e:             # noqa: BLE001 - logged, retried
-                        self.fails += 1
-                        self.next_try[k] = now + self.retry_s
+            hosts = list(self.hosts.values())
+        for h in hosts:
+            for k in range(h.procs):
+                if not h.retired:
+                    self._tick_worker(h, k, want, now)
+
+    def _tick_worker(self, h, k, want, now):
+        s = h.sess[k]
+        if s is not None and not s.alive() and not s.handled:
+            self._lost(s)
+            s = None
+        if s is None:
+            if want is not None and now >= h.next_try[k]:
+                try:
+                    self._start(h, k)
+                except Exception as e:                 # noqa: BLE001 - logged, retried
+                    with self.mu:
+                        h.fails += 1
+                        h.next_try[k] = now + self.retry_s
                         if self.cur is not None:
-                            self.cur['errors'] += 1
-                        self.fail_log(f'worker {k} not started: {type(e).__name__}: {str(e)[-300:]}; retry in '
-                                      f'{self.retry_s:.0f}s')
-                continue
-            if now - s.last > STALL_S:
-                self.log(f'worker {k} silent for {now - s.last:.0f}s: killed')
-                s.kill()
-                continue
-            if getattr(s, 'no_league', False):
-                self.next_try[k] = now + max(self.retry_s, 600.0)
-                self.fail_log(f'worker {k} REFUSED: its checkout has no self-play league (the run plays one, '
-                              f'selfplay_league {self.R.cfg["selfplay_league"]}); killed, retried in 10 minutes')
-                s.kill()
-                continue
-            if hasattr(s, 'no_forks'):
-                self.next_try[k] = now + max(self.retry_s, 600.0)
-                self.fail_log(f'worker {k} REFUSED: its checkout plays branched games / archive starts as '
-                              f'{s.no_forks!r}, the run as {_forks_of(self.R.forks)!r} (an older checkout has none: '
-                              f'docs/az.md 24); killed, retried in 10 minutes')
-                s.kill()
-                continue
-            if hasattr(s, 'no_resign'):
-                self.next_try[k] = now + max(self.retry_s, 600.0)
-                self.fail_log(f'worker {k} REFUSED: its checkout plays self-play resignation as {s.no_resign!r}, the run '
-                              f'as {_resign_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 27); killed, '
-                              f'retried in 10 minutes')
-                s.kill()
-                continue
-            if hasattr(s, 'no_merge'):
-                self.next_try[k] = now + max(self.retry_s, 600.0)
-                self.fail_log(f'worker {k} REFUSED: its checkout plays self-play information-set merging as '
-                              f'{s.no_merge!r}, the run as {_merge_of(self.R.cfg)!r} (an older checkout has none: '
-                              f'docs/az.md 30); killed, retried in 10 minutes')
-                s.kill()
-                continue
-            if hasattr(s, 'no_belief'):
-                self.next_try[k] = now + max(self.retry_s, 600.0)
-                self.fail_log(f'worker {k} REFUSED: its checkout plays the root belief as {s.no_belief!r}, the run as '
-                              f'{_belief_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 18.5); killed, retried '
-                              f'in 10 minutes')
-                s.kill()
-                continue
-            if now - s.pinged > PING_S:
-                s.pinged = now
-                s.send({'cmd': 'ping'})
-            if s.hello is not None and self.mode == 'selfplay':
+                            self._inc(h, 'errors')
+                    h.fail_log(f'worker {k} not started: {type(e).__name__}: {str(e)[-300:]}; retry in '
+                               f'{self.retry_s:.0f}s')
+            return
+        if now - s.last > STALL_S:
+            h.log(f'worker {k} silent for {now - s.last:.0f}s: killed')
+            s.kill()
+            return
+        if getattr(s, 'no_league', False):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout has no self-play league (the run plays one, '
+                       f'selfplay_league {self.R.cfg["selfplay_league"]}); killed, retried in 10 minutes')
+            s.kill()
+            return
+        if hasattr(s, 'no_forks'):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout plays branched games / archive starts as '
+                       f'{s.no_forks!r}, the run as {_forks_of(self.R.forks)!r} (an older checkout has none: '
+                       f'docs/az.md 24); killed, retried in 10 minutes')
+            s.kill()
+            return
+        if hasattr(s, 'no_resign'):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout plays self-play resignation as {s.no_resign!r}, the run '
+                       f'as {_resign_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 27); killed, '
+                       f'retried in 10 minutes')
+            s.kill()
+            return
+        if hasattr(s, 'no_merge'):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout plays self-play information-set merging as '
+                       f'{s.no_merge!r}, the run as {_merge_of(self.R.cfg)!r} (an older checkout has none: '
+                       f'docs/az.md 30); killed, retried in 10 minutes')
+            s.kill()
+            return
+        if hasattr(s, 'no_belief'):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout plays the root belief as {s.no_belief!r}, the run as '
+                       f'{_belief_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 18.5); killed, retried '
+                       f'in 10 minutes')
+            s.kill()
+            return
+        if now - s.pinged > PING_S:
+            s.pinged = now
+            s.send({'cmd': 'ping'})
+        if s.hello is not None and self.mode == 'selfplay':
+            with self.mu:
+                cap = self.capv.get(s.name, 0)
+                if cap != s.sent_cap:
+                    s.send({'cmd': 'cap', 'n': cap})
+                    s.sent_cap = cap
+        go = want is not None and s.hello is not None and s.phase != want
+        if go and self.mode == 'selfplay':
+            with self.mu:                              # the quota met already: nothing to play for
+                go = self.q is not None and self.q['it'] == want and self.q['open']
+        if go and self._ship_model(h, want):
+            with self.mu:
+                if self.want == want and s.alive() and not h.retired:
+                    msg = {'cmd': 'phase', 'iter': want, 'model': f'models/iter_{want - 1:04d}.pt'}
+                    if self.R.league is not None and self.mode == 'selfplay':
+                        msg['league'] = self.R.league.files(want)   # {key: models/iter_j.pt} (shipped)
+                    s.send(msg)
+                    s.phase = want
+                    s.acc_ph = s.ship_ph = 0
+                    if self.mode == 'selfplay':
+                        self._accept_remote(s)         # the games it held from the last phase count first
+        if self.mode == 'matches':
+            self._giveback(s)
+            self._timeouts(s)
+            if want is not None and s.phase == want:
+                self._assign(s)
                 with self.mu:
                     cap = self.capv.get(s.name, 0)
-                    if cap != s.sent_cap:
-                        s.send({'cmd': 'cap', 'n': cap})
-                        s.sent_cap = cap
-            go = want is not None and s.hello is not None and s.phase != want
-            if go and self.mode == 'selfplay':
-                with self.mu:                          # the quota met already: nothing to play for
-                    go = self.q is not None and self.q['it'] == want and self.q['open']
-            if go and self._ship_model(want):
-                with self.mu:
-                    if self.want == want and s.alive():
-                        msg = {'cmd': 'phase', 'iter': want, 'model': f'models/iter_{want - 1:04d}.pt'}
-                        if self.R.league is not None and self.mode == 'selfplay':
-                            msg['league'] = self.R.league.files(want)   # {key: models/iter_j.pt} (shipped)
-                        s.send(msg)
-                        s.phase = want
-                        s.acc_ph = s.ship_ph = 0
-                        if self.mode == 'selfplay':
-                            self._accept_remote(s)     # the games it held from the last phase count first
-            if self.mode == 'matches':
-                self._giveback(s)
-                self._timeouts(s)
-                if want is not None and s.phase == want:
-                    self._assign(s)
-                    with self.mu:
-                        cap = self.capv.get(s.name, 0)
-                        if cap > 0 and not s.backing_off():
-                            s.util[0] += min(1.0, len(s.assigned) / cap)
-                            s.util[1] += 1
+                    if cap > 0 and not s.backing_off():
+                        s.util[0] += min(1.0, len(s.assigned) / cap)
+                        s.util[1] += 1
 
-    def _prepare_mirror(self):
-        if self.mirror_ready:
+    def _prepare_mirror(self, h):
+        if h.mirror_ready:
             return
-        self.t.mkdirs(self.rdir + '/models', self.rdir + '/data')
-        cfg = dict(self.R.cfg, **self.overrides)
+        h.t.mkdirs(h.rdir + '/models', h.rdir + '/data')
+        cfg = dict(self.R.cfg, **h.overrides)
         cfg.update(eval_remote='', selfplay_remote='', resolver='', resolver_cfg={}, resolver_init='')
         fk = getattr(self.R, 'forks', None)
         if self.mode == 'selfplay' and fk is not None and fk.archive:
             # the archive starts' file (zero/forks.py) into the mirror: the workers read it there
             from .forks import MIRROR_NAME
-            self.t.put(fk.archive['path'], self.rdir + '/' + MIRROR_NAME)
+            h.t.put(fk.archive['path'], h.rdir + '/' + MIRROR_NAME)
             cfg['selfplay_archive'] = MIRROR_NAME
-        if 'shard_rows' not in self.overrides:
+        if 'shard_rows' not in h.overrides:
             cfg['shard_rows'] = min(int(cfg['shard_rows']), SHARD_ROWS)
         try:
             test = json.loads(os.environ.get('ZERO_RSP_TEST') or '{}')
         except ValueError:
             test = {}
-        spj = {'mode': self.mode, 'locks': self.locks, 'nice': self.nice, 'backoff': self.backoff, 'run_id': self.run_id,
-               'workdir': self.workdir, 'mirror': self.mirror, 'watchdog_s': WATCHDOG_S, 'linger': self.linger,
+        spj = {'mode': self.mode, 'locks': h.locks, 'nice': h.nice, 'backoff': h.backoff, 'run_id': self.run_id,
+               'workdir': h.workdir, 'mirror': self.mirror, 'watchdog_s': WATCHDOG_S, 'linger': self.linger,
                'test': test}
+        if h.salt:                                 # a list of hosts (docs/az.md 34): its name, its seeds' salt
+            spj.update(remote=h.name, seed_salt=h.salt)
         for name, obj in (('config.json', cfg), ('selfplay.json', spj)):
             tmp = os.path.join(self.R.run, f'.remote_selfplay_{name}')
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(obj, f, indent=1)
-            self.t.put(tmp, self.rdir + '/' + name)
+            h.t.put(tmp, h.rdir + '/' + name)
             try:
                 os.remove(tmp)
             except OSError:
                 pass
-        self.mirror_ready = True
+        h.mirror_ready = True
 
-    def _start(self, k):
-        self._prepare_mirror()
-        s = Session(self, k)
+    def _start(self, h, k):
+        self._prepare_mirror(h)
+        s = Session(h, k)
         s.start()
         with self.mu:
-            self.sess[k] = s
+            if not h.retired:
+                h.sess[k] = s
+                return
+            s.handled = True                       # unlisted meanwhile: it quits at once
+        threading.Thread(target=s.close, daemon=True).start()
 
-    def _ship_model(self, want):
-        """Checkpoint want - 1 into the mirror (once per phase); with the self-play league
+    def _ship_model(self, h, want):
+        """Checkpoint want - 1 into host `h`'s mirror (once per phase); with the self-play league
         (zero/league.py) also the past checkpoints of the phase's slots (every phase: a worker deletes
         the checkpoints older than its phase - 3 that its phase does not name)."""
         from .run import model_path
-        if self.model_shipped == want - 1:
+        if h.model_shipped == want - 1:
             return True
-        if _now() < self.ship_retry:
+        if _now() < h.ship_retry:
             return False
         names = [want - 1]
         if self.R.league is not None and self.mode == 'selfplay':
             names += sorted(set(self.R.league.plan(want)['slots']) - {want - 1})
         for j in names:
             try:
-                self.t.put(model_path(self.R.run, j), f'{self.rdir}/models/iter_{j:04d}.pt')
+                h.t.put(model_path(self.R.run, j), f'{h.rdir}/models/iter_{j:04d}.pt')
             except Exception as e:                     # noqa: BLE001 - retried
-                self.ship_retry = _now() + 30
-                self.log(f'checkpoint {j} not shipped: {type(e).__name__}: {str(e)[-300:]}; retry in 30s')
+                h.ship_retry = _now() + 30
+                h.log(f'checkpoint {j} not shipped: {type(e).__name__}: {str(e)[-300:]}; retry in 30s')
                 return False
-        self.model_shipped = want - 1
+        h.model_shipped = want - 1
         return True
 
     def _lost(self, s):
         """Session `s` ended (its pipes are closed: every row it sent was taken)."""
+        h = s.h
         s.handled = True
         rc = None
         if s.proc is not None:
@@ -1039,13 +1415,13 @@ class RemotePlay:
         requeue = []
         lost = 0
         with self.mu:
-            if self.sess[s.k] is s:
-                self.sess[s.k] = None
+            if h.sess[s.k] is s:
+                h.sess[s.k] = None
             if not self.closed:
-                self.fails += 1
-                self.next_try[s.k] = _now() + (0.0 if lived > 120 and not s.error else self.retry_s)
+                h.fails += 1
+                h.next_try[s.k] = _now() + (0.0 if lived > 120 and not s.error else self.retry_s)
                 if self.cur is not None:
-                    self.cur['errors'] += 1
+                    self._inc(h, 'errors')
             requeue = [(tag, spec) for tag, (_t, spec) in s.assigned.items()]
             s.assigned.clear()
             # single-game: games it had accepted whose samples never reached a shard are not this
@@ -1054,39 +1430,39 @@ class RemotePlay:
             if q is not None and s.phase == q['it']:
                 lost = max(0, s.acc_ph - s.ship_ph)
                 if lost and self._give_back(s, q['it'], lost):
-                    self.cur['lost'] += lost
+                    self._inc(h, 'lost', lost)
             # the next session starts from a mirror prepared again (it may be what failed: removed,
             # half-written) and gets its checkpoint again (6 MB)
-            self.mirror_ready = False
-            self.model_shipped = None
+            h.mirror_ready = False
+            h.model_shipped = None
             self._refresh()
         if requeue and self.co is not None:
             self.co.requeue(requeue)
             with self.mu:
                 if self.cur is not None:
-                    self.cur['requeued'] += len(requeue)
+                    self._inc(h, 'requeued', len(requeue))
         if self.closed:
             return
         err = s.error or {}
         tail = ((f'; {len(requeue)} episodes requeued here' if requeue else '')
                 + (f'; {lost} accepted games lost with it (the quota needs them again)' if lost else '')
-                + f'; restart in {max(0.0, self.next_try[s.k] - _now()):.0f}s')
+                + f'; restart in {max(0.0, h.next_try[s.k] - _now()):.0f}s')
         if err.get('kind') == 'encoding':
             # the worker's build refused the run's checkpoint: a network of another encoding than its
             # checkout's (docs/az.md 10.4) - this machine plays on alone; in full the first times,
             # then every 10 minutes (the worker said hello first: fail_log's streak restarts)
-            self.refusals += 1
-            if self.refusals <= 3 or _now() - self.t_refused > 600:
-                self.t_refused = _now()
-                self.log(f"worker {s.k} REFUSED the run's checkpoint (its checkout {self.spec.get('repo')} on "
-                         f"{self.spec.get('host')} is not the run's encoding?): {why}{tail}"
-                         + (f' ({self.refusals} refusals; logged every 10 minutes now)' if self.refusals > 3 else ''))
+            h.refusals += 1
+            if h.refusals <= 3 or _now() - h.t_refused > 600:
+                h.t_refused = _now()
+                h.log(f"worker {s.k} REFUSED the run's checkpoint (its checkout {h.spec.get('repo')} on "
+                      f"{h.spec.get('host')} is not the run's encoding?): {why}{tail}"
+                      + (f' ({h.refusals} refusals; logged every 10 minutes now)' if h.refusals > 3 else ''))
             return
-        self.fail_log(f'worker {s.k} ended (exit {rc}, after {lived:.0f}s): {str(why)[-500:]}' + tail)
+        h.fail_log(f'worker {s.k} ended (exit {rc}, after {lived:.0f}s): {str(why)[-500:]}' + tail)
         if err.get('kind') == 'nonfinite':
-            self._quarantine_remote(err)
+            self._quarantine_remote(h, err)
 
-    def _quarantine_remote(self, err):
+    def _quarantine_remote(self, h, err):
         """The worker's own write check found a non-finite shard (its bad copy in the mirror's
         debug/): fetch it into <run>/debug/ and fail the run (as a local bad shard does)."""
         from .finite import NonFinite
@@ -1094,14 +1470,14 @@ class RemotePlay:
         bad = err.get('bad')
         if bad:
             os.makedirs(self.R.debug_dir(), exist_ok=True)
-            dst = os.path.join(self.R.debug_dir(), 'remote_' + os.path.basename(bad))
+            dst = os.path.join(self.R.debug_dir(), 'remote_' + (f'{h.tag}-' if h.tag else '') + os.path.basename(bad))
             try:
-                if not self.t.get(bad, dst):
+                if not h.t.get(bad, dst):
                     dst = None
             except Exception:                          # noqa: BLE001
                 dst = None
         with self.mu:
-            self.fatal = NonFinite(f'remote self-play ({self.name}): {err.get("msg", "")[-1500:]}'
+            self.fatal = NonFinite(f'remote self-play ({h.name}): {err.get("msg", "")[-1500:]}'
                                    + (f' (quarantined here as {dst})' if dst else ''))
             self.mu.notify_all()
 
@@ -1124,7 +1500,7 @@ class RemotePlay:
                 s.assigned[tag] = (act, spec)
                 s.send({'cmd': 'enqueue', 'tag': tag, 'spec': spec})
             if self.cur is not None:
-                self.cur['assigned'] += len(items)
+                self._inc(s.h, 'assigned', len(items))
 
     def _giveback(self, s):
         """A worker backing off for `selfplay_remote_giveback` s gives its outstanding episodes back
@@ -1139,9 +1515,9 @@ class RemotePlay:
             self.co.requeue(back)
             with self.mu:
                 if self.cur is not None:
-                    self.cur['requeued_backoff'] += len(back)
-            self.log(f'worker {s.k}: backing off for {_now() - s.bo_since:.0f}s ({s.status.get("backoff")}): its '
-                     f'{len(back)} outstanding episodes requeued here (a second result is dropped)')
+                    self._inc(s.h, 'requeued_backoff', len(back))
+            s.h.log(f'worker {s.k}: backing off for {_now() - s.bo_since:.0f}s ({s.status.get("backoff")}): its '
+                    f'{len(back)} outstanding episodes requeued here (a second result is dropped)')
 
     def overdue_s(self, s):
         """How long (its running time) an episode may stay outstanding on worker `s`: at most
@@ -1168,9 +1544,9 @@ class RemotePlay:
             self.co.requeue(late)
             with self.mu:
                 if self.cur is not None:
-                    self.cur['requeued_timeout'] += len(late)
-            self.log(f'worker {s.k}: {len(late)} episodes not finished within {lim:g}s of its running '
-                     f'time: requeued here (a second result is dropped)')
+                    self._inc(s.h, 'requeued_timeout', len(late))
+            s.h.log(f'worker {s.k}: {len(late)} episodes not finished within {lim:g}s of its running '
+                    f'time: requeued here (a second result is dropped)')
 
     # ---------------------------------------------------------------- shards (the fetch thread)
     def _fetcher(self):
@@ -1179,8 +1555,11 @@ class RemotePlay:
             if item is None:
                 return
             s, ev = item
+            h = s.h
             it = ev['iter']
-            name = os.path.basename(ev['path'])
+            # (a list of hosts: the local name starts with the host's tag - two hosts' workers K never
+            # write the same name into data/iter_i/)
+            name = (f'{h.tag}-' if h.tag else '') + os.path.basename(ev['path'])
             d = os.path.join(self.R.run, 'data', f'iter_{it:04d}')
             final = os.path.join(d, name)
             tmp = final[:-len('.npz')] + '.tmp.npz'   # never a loadable shard name (data.shard_paths)
@@ -1191,9 +1570,9 @@ class RemotePlay:
                     go = self.accepting == it
                 if go:
                     os.makedirs(d, exist_ok=True)
-                    if not self.t.get(ev['path'], tmp):
+                    if not h.t.get(ev['path'], tmp):
                         raise RuntimeError(f'copy of {ev["path"]} failed')
-                    res, rows, net = self._check(tmp, it, name)
+                    res, rows, net = self._check(h, tmp, it, name)
                     if res == 'ok':
                         with self.mu:
                             if self.accepting == it:
@@ -1204,7 +1583,7 @@ class RemotePlay:
                 else:
                     res = 'late'
             except Exception as e:                     # noqa: BLE001 - the shard is lost, the run goes on
-                self.log(f'shard {name} of iteration {it} not fetched: {type(e).__name__}: {str(e)[-300:]}')
+                h.log(f'shard {name} of iteration {it} not fetched: {type(e).__name__}: {str(e)[-300:]}')
             finally:
                 try:
                     os.remove(tmp)
@@ -1212,23 +1591,23 @@ class RemotePlay:
                     pass
             s.send({'cmd': 'fetched', 'path': ev['path']})
             with self.mu:
-                c = self.cur
-                if c is not None and c['it'] == it:
-                    c['pending'] -= 1
-                    c['fetch_s'] += _now() - t0
-                    if res == 'accepted':
-                        c['accepted'] += 1
-                        c['rows'] += rows
-                        c['bytes'] += int(ev.get('bytes', 0))
-                        c['games'] += int(ev.get('games', 0))
-                        lag_hist(net, it, c['stale'])
-                    elif res in ('rejected', 'quarantined'):
-                        c[res] += 1
-                    elif res == 'failed':
-                        c['failed'] += 1
+                for c in (self.cur, h.cur):
+                    if c is not None and c['it'] == it:
+                        c['pending'] -= 1
+                        c['fetch_s'] += _now() - t0
+                        if res == 'accepted':
+                            c['accepted'] += 1
+                            c['rows'] += rows
+                            c['bytes'] += int(ev.get('bytes', 0))
+                            c['games'] += int(ev.get('games', 0))
+                            lag_hist(net, it, c['stale'])
+                        elif res in ('rejected', 'quarantined'):
+                            c[res] += 1
+                        elif res == 'failed':
+                            c['failed'] += 1
                 self.mu.notify_all()
 
-    def _check(self, path, it, name):
+    def _check(self, h, path, it, name):
         """A fetched shard -> ('ok', rows, net) | ('rejected', 0, None) (another game's or encoder's:
         logged) | ('quarantined', 0, None) (non-finite: moved to <run>/debug/, the run fails at end())."""
         from .data import read_shard
@@ -1239,26 +1618,26 @@ class RemotePlay:
         want = (self.R.cfg['game'], info['num_features'], info['num_actions'])
         got = (meta.get('game'), meta.get('features'), meta.get('actions'))
         if got != want:
-            self.log(f'shard {name} of iteration {it} REJECTED: game / features / actions {got}, the run\'s {want} '
-                     f'(the remote\'s code is not the run\'s?)')
+            h.log(f'shard {name} of iteration {it} REJECTED: game / features / actions {got}, the run\'s {want} '
+                  f'(the remote\'s code is not the run\'s?)')
             return 'rejected', 0, None
         probs = shard_problems(sh)
         if probs:
             os.makedirs(self.R.debug_dir(), exist_ok=True)
             bad = os.path.join(self.R.debug_dir(), f'iter_{it:04d}_{name[:-len(".npz")]}.bad.npz')
             os.replace(path, bad)
-            msg = (f'remote self-play ({self.name}): non-finite sample values in its shard {name} of iteration {it} '
+            msg = (f'remote self-play ({h.name}): non-finite sample values in its shard {name} of iteration {it} '
                    f'(meta {json.dumps(meta)}): ' + '; '.join(probs) + f'. Quarantined in {bad} (never loaded by the '
                    f'window); the run stops at the end of this self-play phase')
-            self.log(msg)
+            h.log(msg)
             with self.mu:
                 self.fatal = NonFinite(msg)
             return 'quarantined', 0, None
         if getattr(self.R, 'aux', None) and 'aux' not in sh:
             # (accepted - its policy / value rows train as any - but its auxiliary rows are masked:
             # the remote's checkout predates the run's auxiliary targets, docs/az.md 15)
-            self.log(f'shard {name} of iteration {it} has NO auxiliary targets (the run trains {self.R.aux}): '
-                     f"is the remote's checkout the run's?")
+            h.log(f'shard {name} of iteration {it} has NO auxiliary targets (the run trains {self.R.aux}): '
+                  f"is the remote's checkout the run's?")
         return 'ok', int(meta.get('rows', len(sh['player']))), sh.get('net')
 
 
@@ -1565,7 +1944,8 @@ class Worker:
             R = Run(self.rdir, c)
             self.evr = NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1))
             seat = R.nn_seat('m', c['sims'], selfplay=True)
-            seed = int(c['seed']) * 7919 + it + 7_777_777 * (self.k + 1)
+            # (a list of hosts, docs/az.md 34: each host's workers K play other games than another host's K)
+            seed = int(c['seed']) * 7919 + it + 7_777_777 * (self.k + 1) + int(self.sp.get('seed_salt') or 0)
             # both modes play queued setups only: the run's episodes (co-training), or a setup of the
             # run's spec for every game the worker may start under its cap (self-play)
             table = [[seat] * c['players'][0]] if self.mode == 'matches' else [[seat] * p for p in c['players']]
@@ -1832,7 +2212,8 @@ class Worker:
         c = self.cfg
         drv = self.drv
         meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'],
-                'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid, **shard_format(c)}
+                'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid, **shard_format(c),
+                **({'remote': self.sp['remote']} if self.sp.get('remote') else {})}   # (a list of hosts: its name)
         box = {}
         writer = ShardWriter(os.path.join(self.rdir, 'data', f'iter_{it:04d}'), self.prefix, rows=int(c['shard_rows']),
                              meta=meta, bad_dir=os.path.join(self.rdir, 'debug'), compress=COMPRESS,
@@ -1921,7 +2302,8 @@ class Worker:
             self.note(f'started: mode {self.mode}, mirror {self.rdir}, conc {self.cfg["conc"]}, threads '
                       f'{self.cfg["threads"]}, groups {self.cfg["groups"]}, infer_workers {self.cfg.get("infer_workers", 1)}, '
                       f'torch threads {self.cfg.get("torch_threads", 1)}, nice {self.sp.get("nice", 0)}'
-                      + (', lingering between phases' if self.linger else ''))
+                      + (', lingering between phases' if self.linger else '')
+                      + ''.join(f', env {k}={os.environ.get(k)!r}' for k in self.test.get('echo_env') or []))
             # (the tests: an older checkout, without the league / the root's belief)
             self.emit('hello', pid=os.getpid(), host=socket.gethostname(), sid=self.sid, conc=self.cfg['conc'],
                       mode=self.mode, **({} if self.test.get('no_league') else {'league': 1}),

@@ -139,7 +139,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `gumbel_m`, `selfplay_gumbel_scale`, `eval_gumbel_scale` | 16, 1.0, 0.0 | the Gumbel search's considered options (the paper's and mctx's 16: every option of a smaller root) and its noise scale: self-play's first `temp_moves` searched decisions of a game are searched with `selfplay_gumbel_scale` (1 = the move a sample of the improved policy, the paper's), later ones without - the role temperature had; the evaluation's on every decision (0 = deterministic, the paper's evaluation) |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
-| `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6); its own is refused |
+| `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A comma-separated list = several hosts, each its own workers, mirror and shards, consumers `<name>/w<k>`, metrics `selfplay.remotes` (one name: exactly as before); a name `<prefix>:<arg>` calls the package's callable remote `<prefix>:`; the run directory's `selfplay_remotes` file (one name per line) replaces the list, is re-read at every phase start (hosts join and leave a live run) and alone turns remote self-play on (section 34). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6; a list too, never the file); its own is refused |
+| `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); seconds the end of a phase waits for the remote's last shards (later ones are dropped) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: those whose inference is CUDA / MPS - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -355,7 +356,9 @@ Tests: `tests/test_loop.py` (`test_remote_evaluation_local`, `..._continues_a_lo
 ### 5.3 Remote self-play (`zero/remoteplay.py`, `zero/workqueue.py`, run setting `selfplay_remote`)
 
 `selfplay_remote <name>` (a remote of the game package, the same `GamePackage.remotes` entry as
-`eval_remote`; `local` = this machine, the tests) gives a run a second producer of each
+`eval_remote`; `local` = this machine, the tests; **several hosts** - a comma-separated list, or the run
+directory's `selfplay_remotes` file re-read at every phase start, hosts joining and leaving a live run - and
+`selfplay_local` 0, the run's machine only training: section 34) gives a run a second producer of each
 iteration's samples: this machine and the remote's workers **pull the iteration's work from one
 shared queue**, all searching with checkpoint i-1, and the remote's sample shards come back into
 `data/iter_i/`. MTG Zero's MacBook self-plays 3-6 times as fast as the shared desktop (its
@@ -4498,3 +4501,177 @@ Every one of the 65,566 rows came back bit for bit (0 mismatched values over 2.4
 the ShardWriter's own sparse shard of those rows (from float32 dicts) was `convert_shard`'s, array for array; the
 remote shards' round trips too. (The timings are the loaded desktop's: the dense writer's full 65k-row flush could
 not run beside the live run - it needs ~20 GB - so its row is the 4,096- and 8,192-row flushes, linear in rows.)
+
+## 34. Remote self-play on several hosts, and hosts joining a live run (`selfplay_remote` lists, the `selfplay_remotes` file, `selfplay_local`; MTG Zero, 2026-11-05)
+
+### 34.1 Why
+
+Remote self-play (5.3) took one remote: a run's games came from this machine and the workers of ONE other machine
+(MTG Zero's MacBook). MTG Zero now rents GPU boxes (Vast.ai) by the hour to self-play beside it: several at once,
+each started and destroyed while the run trains, sometimes a second GPU of one box as a host of its own. The shared
+queue (`zero/workqueue.py`) already modelled any number of consumers; what was single was `RemotePlay`: one spec,
+one transport, one mirror, one set of `procs` sessions. And a run whose machine trains on its GPU wants the GPU for
+training alone - an actor / learner split - while never stalling when every actor is gone.
+
+### 34.2 What it does (zero/remoteplay.py, zero/remote.py)
+
+* **A list of remotes.** `selfplay_remote` is a comma-separated list of remote names. **One name behaves exactly as
+  before** (5.3: the consumers 'w0'..'w{procs-1}', the metrics, log lines, progress.json and the rates' restore of
+  before - 34.5). With 2+ names every host is a `Host` of `RemotePlay`: its spec, transport, mirror (`<its selfplay
+  workdir>/<run name>` on its machine), env, overrides, locks, niceness and back-off; its own `procs` worker
+  sessions (its spec's `selfplay.procs`, or `selfplay_remote_procs` when > 0, per host); its own checkpoint shipping,
+  failure counting, retries and refusals. Its consumers in the shared queue are `<name>/w<k>` ('mac/w0',
+  'vast:w1/w0'), all in the one quota / `Shares` model exactly as one remote's workers are (each bootstraps as an
+  unmeasured remote, `workqueue.BOOT`). The fetch threads serve every host (one per worker of all hosts, at least
+  two; a fetch uses its session's host's transport). `selfplay_remote_wait`, `_inflight`, `_batch`,
+  `_batch_inflight`, `_linger`, `_giveback`, `_overdue`, `_timeout` keep their meaning, applied to every host's
+  workers (a host's workers are batch-bound by its own `overrides.infer_device`).
+* **Each host's shards and seeds.** With a list a host's shards arrive in `data/iter_i/` as
+  `<tag>-m<KK>-<sid>_SSS.npz` (`tag`: its name with every character but letters, digits, '.', '_', '-' as '_':
+  'vast_w1-m00-3fa2_000.npz'), so two hosts' workers K never write one name, and their meta carries `remote` (the
+  host's name). Its mirror's `selfplay.json` carries `remote` and `seed_salt` (crc32 of the name x 104,729): a
+  worker's driver seed is the one of 5.3 plus the salt, so two hosts' workers K started in the same iteration play
+  other games. One remote: neither key, its seeds and shard names as before.
+* **One machine, two hosts.** Several hosts may be one machine - host 'local' twice with a different `env` (a second
+  GPU: `{'host': 'local', 'env': {'CUDA_VISIBLE_DEVICES': '1'}, 'selfplay': {'workdir': '/root/mtgz-gpu1', ...}}`).
+  Each needs a selfplay workdir of its own: the worker slots (`<mirror>/.wKK.lock`) and busy markers
+  (`<workdir>/.busy-<mirror>-wKK`) live there. A host whose (host, selfplay workdir) is another host's is **not
+  added** (logged `remote self-play <name>: not added: its mirror ... is '<other>''s ...; retried at the next
+  phase`): it would take the other's worker slots. Two spellings of one ssh host are not detected. The remote's
+  evaluation lock (`<its workdir>/.eval.lock`, 5.2) is the spec's `workdir`, as before - two hosts of one machine may
+  share it. `$ZERO_SELFPLAY_WORKDIR` (5.3) still overrides every host's workdir: with two local hosts it makes them
+  one mirror (the second refused).
+* **Parametrised names** (`remote.remote_spec`, also `eval_remote`'s): a name that is not in `GamePackage.remotes`
+  and has a ':' is looked up as `remotes[<prefix> + ':']` (the prefix: up to the first ':'); when that entry is
+  callable it is called with the rest of the name, and its result (a dict, or a Mapping that resolves then, like
+  MTG Zero's `RunCommitRemote`) is the spec: `remotes={'vast:': lambda box: RunCommitRemote(..., host=f'mtgz-{box}')}`
+  makes 'vast:w1', 'vast:w2', ... remotes. It is called every time the name is resolved: the run's start, and every
+  phase start while the host is listed but not resolved (34.3). A name with no such entry, or one that is not
+  callable, is the SystemExit of before (`not in the game package remotes`). `remote.known_remote(name)` tells
+  without resolving (co-training's settings check uses it).
+
+### 34.3 Hosts joining and leaving a live run: the `selfplay_remotes` file
+
+* **The file.** `<run>/selfplay_remotes`: plain text, one remote name per line, '#' starts a comment, blank lines and
+  repeats ignored. When it exists it **replaces the setting's list**, and it is re-read at the start of every
+  self-play phase (`RemotePlay.begin`'s first call for an iteration: right after checkpoint i-1 is written - the
+  remotes' early phase, 5.3 - or this machine's phase when there is none), so a change applies from the next
+  iteration whose phase has not begun: written once metrics row k exists, from iteration k + 2. Write it atomically
+  (a temporary file, then rename): a half-written file read at that moment lists fewer hosts for one iteration. A
+  file that cannot be read keeps the hosts as they are (logged). **The file alone turns remote self-play on**: a run
+  whose `selfplay_remote` is '' and whose directory holds the file when it starts (an empty one is enough) plays the
+  shared queue (5.3) with the file's hosts. A run started with neither does not pick up a file written later (its
+  self-play is not the shared queue's: restart it - PAUSE and resume, section 2 - after writing the file). The file
+  removed, the setting decides again ('' = this machine alone, the shared queue still in use). With the file in use
+  the run names its hosts as a list does ('<name>/w<k>', `selfplay.remotes`), whatever their number.
+* **Every change is logged**: `remote self-play: hosts now [mac, vast:w1] (+vast:w1)`, `... hosts now [] (-mac):
+  this machine plays alone`.
+* **A host newly listed**: its spec resolves on a thread (the main thread never waits for it: a `RunCommitRemote`
+  check over ssh); a failure - an unknown name, a callable that raises, a Mapping whose checks fail - is logged
+  (`remote self-play <name>: not added (<error>); retried at the next phase`) and retried at every phase start while
+  it is listed; the run never stops for it. Once resolved it joins (`remote self-play <name>: added (host, N
+  worker(s), mirror ...)`): its consumers enter the queue (a rate restored at the run's start if its consumers had
+  one, else the bootstrap share), its mirror is prepared and its sessions start with the manager's next tick, and
+  its workers take their part of the phase that is open, if any - from their `phase` line on, as a restarted
+  worker's do.
+* **A host no longer listed** is removed at a phase start, so no phase of it is open (5.3's phases are sent by the
+  manager after `begin` opens them, and the previous one was closed by `end`). Its consumers leave the queue at once
+  (no cap, no share: the others' shares grow at once); the games its workers hold (finished beyond the last quota)
+  or play are **never accepted** - the quota never counted them, so there is nothing to give back and nothing is
+  counted twice; its sessions quit at once (`quit`, stdin closed, killed after 10 s; logged `remote self-play
+  <name>: removed: its N worker(s) quit; the games they hold or play are not counted`). There is nothing left for
+  them to do, so this is the simpler of the two choices (giving their games back as a dying worker's are, 5.3, or
+  letting them finish into an open phase): neither applies to a host that has no open phase. Its shards of the
+  phase before were fetched or dropped by that phase's `end` (today's rules: `late`, `late_prev`). A host listed
+  again later is a new host (its spec resolved again, its mirror prepared again).
+* **An empty list** (an empty file, or every host removed): this machine plays the quota alone, as when every
+  worker is offline (5.3) - not an error; `selfplay.remote` then counts no worker and waits for nothing.
+* **One remote <-> a list** (the file written in a run of one remote, or removed again): the hosts' consumers are
+  renamed in place ('w0' <-> 'mac/w0'), their rates kept. A restart restores the last row's rates the same way: with
+  one remote a row's '<name>/w<k>' are its 'w<k>' (other hosts' are dropped), with a list a row's 'w<k>' are
+  `<the setting's one name>/w<k>`, and a host not resolved yet gets its consumers' rates when it joins.
+
+### 34.4 This machine's share: `selfplay_local`
+
+`selfplay_local` 0 (default 1: every phase this machine takes its share, as before): while at least one remote worker
+takes work (alive, its hello received, not backing off - the shared queue's active consumers), this machine's
+driver is no consumer (its cap 0: it starts no games; the games it has in flight finish and count, and its held
+games count first in the next iteration, as always) - the run's machine only trains, its GPU never shared between
+training and self-play. When no worker takes work (all offline, backing off, refused, not up yet, or no host
+listed) it is a consumer again and plays the quota itself, so the run never stalls. The switch is logged both ways
+(`remote self-play: this machine takes no games now (2 remote worker(s) take the queue; selfplay_local 0)` / `...
+this machine plays again (no remote worker takes work; selfplay_local 0)`). A phase it sat out entirely measures
+nothing (its rate is kept for when it plays again). `selfplay_local_linger` takes its cap, so it plays nothing while
+this machine is off. Single-game runs (co-training: refused, `resolver_cfg`'s too); a run without remote self-play
+plays here whatever it says.
+
+### 34.5 Metrics, progress, log; what stays as before
+
+* **`selfplay.remote`** stays the remotes' aggregate in today's format (5.3): sums over every host's workers, `host`
+  = the list of the hosts' names (one remote: its name, as before), `procs` / `workers` summed, `caps` every
+  consumer's. **`selfplay.remotes`** = `{name: that host's record in the same format}` (`host` its name, `caps` its
+  consumers'; its own `late` / `late_prev`, `lost`, `session_errors`, its tallies of the league / forks /
+  resignation) - only with a list or the file. `selfplay.queue` is unchanged (its consumers named '<name>/w<k>').
+  progress.json: `remote` aggregated as before, and with a list `remotes` = `{name: {host, workers, state, games,
+  in_flight, samples, shards, caps, held}}` (co-training: inside `matches_remote`). The log adds a line per host after
+  the aggregate's: `iter N remote self-play mac: 2 worker(s), 812 games, ...`; at the start `self-play also on the
+  remotes of selfplay_remote 'mac,vast:w1': 'mac' (user@mac, 2 worker(s), mirror ...), 'vast:w1' (...): 800 games
+  per iteration in total, ...` (`of the file <path>` when the file decides).
+* **One name, exactly as before**: the same consumers, metrics keys, log lines (the start line, `iter N remote
+  self-play: ...`, `iter N shared queue: ...`, `remote self-play <name>: worker 0 up ...`), progress.json and rates'
+  restore, shard names and mirror files (no `remote` / `seed_salt`), seeds; an unknown name is the SystemExit of
+  before at the start. Checked against the code before (d499716): the same toy run (test_remoteplay's settings, 3
+  iterations, the remote 'local') - its 163 metrics key paths identical, and its remote / queue / worker log lines
+  identical with the numbers masked; `tests/test_multi_remote.py::test_one_remote_is_exactly_as_before` keeps the
+  record's and the queue's key sets of before and the line formats. A run without remote self-play (no setting, no
+  file) never builds a `RemotePlay`: nothing changes (one `os.path.exists` at its start).
+* **Co-training** (`resolver_cfg['selfplay_remote']`, 11.6): the list works the same way (the resolver's episodes on
+  every host, consumers '<name>/w<k>', `remotes` in the resolver's metrics); the file is refused there at the start
+  (`<run>/selfplay_remotes` or `<run>/resolver/selfplay_remotes`: SystemExit) - a co-training run's hosts are its
+  setting's.
+* **Settings checked at the start** that ask for `selfplay_remote` (`selfplay_local_linger`; `selfplay_branch`
+  without `rolling`) read the setting, not the file: with the file alone, set `selfplay_remote` too (any of its
+  hosts: the file replaces the list).
+
+### 34.6 For the game repos (MTG Zero)
+
+A parametrised entry `remotes['vast:'] = fn` is called with the name's rest at every resolution (the run's start,
+then each phase start while the host is listed and not resolved); its result is read with `dict(**spec)` then (a
+Mapping's checks run then, on the resolving thread, never the main one). Before a host is listed its machine needs
+what one remote needs (5.2, 5.3): ssh in BatchMode to `host` (its key), `repo` at the run's code with `python`
+able to run `python -m <pkg>.az.remote selfplay MIRROR K`, and an absolute selfplay `workdir` it may create (the run
+makes the mirror, writes its config.json / selfplay.json and ships the checkpoint itself). A host's workers are its
+spec's `selfplay.procs` (or `selfplay_remote_procs`), its overrides its own (a GPU box: `infer_device` 'cuda',
+batch-bound under `selfplay_remote_batch` 'auto'). To add a rented box: write `<run>/selfplay_remotes` with every host
+the run should use (the box's name among them); to drop it before destroying it, rewrite the file without it and
+wait for the log's `removed` line (its workers quit at the next phase start; the run never waits for a dead box
+anyway - its worker's session fails and is retried, 5.3). A worker of an older checkout ignores `seed_salt` (two
+such hosts' workers K started in one iteration would play the same games): every host runs the run's commit.
+
+### 34.7 Costs, tests, measured
+
+**Costs**: none for one remote or none (34.5). With a list, per host one ssh session per worker, one mirror and one
+checkpoint copy per phase, as a remote of its own; one thread per newly listed host while it resolves.
+
+**Tests** (`tests/test_multi_remote.py`, every host a 'local' one with a selfplay workdir of its own): two hosts share
+an iteration's quota exactly (every iteration 600 = this machine's + 'a/w0' + 'b/w0'; their shards in data/iter_i/
+under '<tag>-' names with `remote` in their meta, each host's samples and shards adding up to the aggregate's; each
+host's env in its workers - `ZERO_RSP_TEST`'s `echo_env`, the worker's log; distinct seed salts; no worker left); a
+second name for one machine and workdir refused, the run going on; the file (alone, the setting empty) at [a], b
+added after row 2 (playing from iteration 4-5), a removed after row 4 (none of its games from iteration 6, every
+iteration exactly 600, its worker gone), emptied after row 6 (iteration 8 all this machine's, nothing waited for),
+every change logged, progress.json's `remotes`; parametrised names ('vast:x') and hosts that fail (a callable that
+raises, a Mapping whose checks fail, no such remote: logged at the start and at every phase start, the run going
+on); one remote exactly as before; `selfplay_local` 0 (the file [a, b]: iteration 5's 600 games all the hosts', this
+machine's cap 0; the file emptied, iteration 6's all this machine's; both switches logged) and its check; a
+co-training resolver on two hosts (and the file refused there); the units: `remote_spec`'s parametrised names,
+`known_remote`, the file's format, `Shares.rename` / `drop`. `tests/test_remoteplay.py`, `tests/test_workqueue.py`
+and `tests/test_cotrain.py` unchanged and passing; the whole suite and the checks in 34.8.
+
+**Measured** (the toy, desktop 2026-11-05, every host a worker process on the same CPU; 600 games an iteration,
+64 slots each, test_remoteplay's `TOY`): with [a] the worker took 351-384 of the 600 games (this machine 216-249); b
+added for iteration 4 was up 2 s into it (0 games) and took 184 in iteration 5 beside a's 336 (this machine 80); a
+removed, b took 407 and 434 (this machine 193, 166); the file emptied, this machine played all 600; every iteration
+exact, no shard late. `selfplay_local` 0 with [a, b]: iteration 1 this machine 511 (the workers came up during it),
+iterations 2-5 none - a 296-313, b 287-304 - its rate kept at its iteration-1 measurement; emptied, this machine all
+600 again. Rows within one checkpoint throughout (mean lag 0.05-0.12).

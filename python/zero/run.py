@@ -47,6 +47,10 @@ same checkpoint: both machines pull the iteration's --games (the total) from one
 with at most its throughput's share in flight; its shards come back into data/iter_i/
 (zero/remoteplay.py, zero/workqueue.py, docs/az.md 5.3). A co-training run: the resolver's
 --resolver-cfg '{"selfplay_remote": ...}' (the remote plays a share of the queued episodes, 11.6).
+--selfplay-remote a,b: several hosts, each its own workers and mirror; the run directory's
+`selfplay_remotes` file (one name per line) replaces the list at every self-play phase - hosts join
+and leave a live run - and alone turns remote self-play on; --selfplay-local 0: this machine plays
+only while no remote worker takes work (docs/az.md 34).
 """
 import argparse
 import contextlib
@@ -263,7 +267,15 @@ DEFAULTS = dict(
     # processes there (0 = the remote's `procs`), seconds the end of a phase waits for its last
     # shards, and (co-training: the resolver's setting) seconds of a worker's running time after
     # which an episode it has not finished is requeued here at the latest
+    # A comma-separated list of names (or the run directory's `selfplay_remotes` file, one name per line,
+    # re-read at every self-play phase: hosts join and leave a live run; the file alone turns remote
+    # self-play on): every host its own workers, mirror and shards, one shared queue (docs/az.md 34)
     selfplay_remote='', selfplay_remote_procs=0, selfplay_remote_wait=30.0, selfplay_remote_timeout=3600.0,
+    # selfplay_local 0 = while at least one remote worker takes work, this machine's driver takes no
+    # games (the run's machine only trains: an actor / learner split); with none (all offline, backing
+    # off, refused, or no host listed) it plays the quota itself, so the run never stalls. 1 = this
+    # machine always takes its share, as before (docs/az.md 34)
+    selfplay_local=1,
     # the shared queue (zero/workqueue.py): each machine's in-flight cap in iterations of its own
     # throughput (its measured share of the iteration's games or matches x this: 1 = a game it starts
     # finishes within about one iteration); co-training: a worker backing off this many seconds
@@ -932,8 +944,10 @@ class Run:
                 acc['t'] = now
                 rp = rsp.progress()
                 q = rp.get('quota') or {}
+                rps = rp.pop('remotes', None)      # (a list of hosts: each host's, docs/az.md 34)
                 _write_json(prog, {'iter': it, 'phase': 'selfplay', 'games': q.get('accepted', len(acc['results'])),
-                                   'target': c['games'], 'local': len(acc['results']), 'remote': rp, 'time': now})
+                                   'target': c['games'], 'local': len(acc['results']), 'remote': rp,
+                                   **({'remotes': rps} if rps is not None else {}), 'time': now})
 
         with clock:
             accept()                               # the last iteration's leftovers come first
@@ -998,7 +1012,10 @@ class Run:
         for v in cons.values():
             v['share'] = round(v.get('games', 0) / max(1, total), 4)
         rem_league = rem.pop('league', None)
+        rems = rem.pop('remotes', None)            # (a list of hosts: each host's share, docs/az.md 34)
         out['remote'] = rem
+        if rems is not None:
+            out['remotes'] = rems
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, acc['league'], rem_league, total, evs)
         out['queue'] = {'quota': c['games'], 'games': total, 'short': max(0, c['games'] - total),
@@ -1006,6 +1023,8 @@ class Run:
                         'inflight': qb['inflight'], 'batch_inflight': qb['batch_inflight'], 'units': qb['units'],
                         'consumers': cons, 'rates': qb['rates'], 'staleness': staleness(acc['stale'], qb['stale'])}
         self.log(f'iter {it} remote self-play: {_fmt_remote(rem)}')
+        for name, r in (rems or {}).items():
+            self.log(f'iter {it} remote self-play {name}: {_fmt_remote(r)}')
         self.log(f'iter {it} shared queue: {_fmt_queue(out["queue"])}')
         self.writer_metrics(it, out, tw, clock)
         return out
@@ -1750,15 +1769,29 @@ class Run:
             self.remote = RemoteEval(self, c['eval_remote'])
             self.remote.backfill(start if start in done else start - 1)
             self.log(f'evaluations on the remote {c["eval_remote"]!r} ({self.remote.spec["host"]})')
-        if c.get('selfplay_remote'):
+        from .remoteplay import remotes_file_in_use
+        if c.get('selfplay_remote') or remotes_file_in_use(run):
+            # (a list of remotes, or the run directory's selfplay_remotes file - which alone turns remote
+            # self-play on: docs/az.md 34)
             from .remoteplay import RemotePlay
             self.rsp = RemotePlay(self, c['selfplay_remote'])
             self.rsp.local(max(2, int(c['groups'])), int(c['conc']), device=c['infer_device'])
             self.rsp.restore(last_rates(read_metrics(run)))
-            self.log(f'self-play also on the remote {c["selfplay_remote"]!r} ({self.rsp.spec["host"]}, '
-                     f'{self.rsp.procs} worker(s), mirror {self.rsp.rdir}): {c["games"]} games per iteration in '
-                     f'total, in flight per machine its throughput share x {self.rsp.inflight:g}'
-                     + self.rsp.batch_note() + (', lingering while the run trains' if self.rsp.linger else ''))
+            if not self.rsp.multi:
+                self.log(f'self-play also on the remote {c["selfplay_remote"]!r} ({self.rsp.spec["host"]}, '
+                         f'{self.rsp.procs} worker(s), mirror {self.rsp.rdir}): {c["games"]} games per iteration in '
+                         f'total, in flight per machine its throughput share x {self.rsp.inflight:g}'
+                         + self.rsp.batch_note() + (', lingering while the run trains' if self.rsp.linger else ''))
+            else:
+                src = (f'the file {os.path.join(run, "selfplay_remotes")}' if remotes_file_in_use(run)
+                       else f'selfplay_remote {c["selfplay_remote"]!r}')
+                self.log(f'self-play also on the remotes of {src}: {self.rsp.describe()}: {c["games"]} games per '
+                         f'iteration in total, in flight per machine its throughput share x {self.rsp.inflight:g}'
+                         + self.rsp.batch_note() + (', lingering while the run trains' if self.rsp.linger else '')
+                         + ('' if self.rsp.local_play else '; this machine plays only while no remote worker takes '
+                            'work (selfplay_local 0)'))
+            if not self.rsp.local_play and not self.rsp.multi:
+                self.log('self-play here only while no remote worker takes work (selfplay_local 0)')
         try:
             self._iterations(start, done)
         finally:
@@ -1987,6 +2020,13 @@ def resolve_config(args, saved):
     RS.check_settings(cfg)
     if isinstance(cfg.get('resolver_cfg'), dict) and RS.enabled(cfg['resolver_cfg']):
         raise SystemExit('resolver_cfg: selfplay_resign_t: single-game runs only (not a co-training resolver)')
+    for where, cc in (('', cfg), ('resolver_cfg: ', cfg.get('resolver_cfg') if isinstance(cfg.get('resolver_cfg'), dict)
+                                    else {})):
+        v = cc.get('selfplay_local', 1)
+        if v not in (0, 1, True, False):
+            raise SystemExit(f'{where}selfplay_local {v!r}: 0 or 1 (docs/az.md 34)')
+        if not v and (where or cfg.get('resolver')):
+            raise SystemExit(f'{where}selfplay_local 0: single-game runs only (docs/az.md 34)')
     if cfg.get('selfplay_local_linger'):
         why = ('needs selfplay_remote (the shared queue holds the games it finishes)' if not cfg.get('selfplay_remote')
                else 'single-game runs only' if cfg.get('resolver')

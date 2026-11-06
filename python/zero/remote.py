@@ -80,15 +80,26 @@ def _refused(r):
 def remote_spec(name, setting='eval_remote'):
     """The game package's remote `name` as a dict (a Mapping such as MTG Zero's RunCommitRemote
     resolves here: its checks run now). 'local': this machine (the tests). `setting`: the run
-    setting that names it (the error message)."""
+    setting that names it (the error message).
+
+    A parametrised name (docs/az.md 34): a `name` that is not in the package's remotes and has a ':'
+    is looked up as its prefix up to the first ':' plus ':' - `remotes['vast:']` for 'vast:w1' - and
+    when that entry is callable it is called with the rest ('w1'): its result is the spec (a dict, or
+    a Mapping that resolves here like RunCommitRemote). Called every time the name is resolved (a run's
+    start, a host joining a run's self-play)."""
     pkg = package.active()
     if name == 'local':
         return dict({'host': 'local', 'repo': pkg.root, 'python': sys.executable,
                      'workdir': os.environ.get('ZERO_REMOTE_WORKDIR', os.path.join(tempfile.gettempdir(), 'zero-remote')),
                      'env': {}, 'overrides': {}}, **pkg.remotes.get('local', {}))
-    if name not in pkg.remotes:
-        raise SystemExit(f'{setting} {name!r}: not in the game package remotes ({sorted(pkg.remotes)})')
-    spec = dict({'env': {}, 'overrides': {}}, **pkg.remotes[name])
+    entry = pkg.remotes.get(name)
+    if entry is None or (callable(entry) and name.endswith(':')):
+        pre, sep, arg = name.partition(':')
+        fn = pkg.remotes.get(pre + sep) if sep else None
+        if not callable(fn):
+            raise SystemExit(f'{setting} {name!r}: not in the game package remotes ({sorted(pkg.remotes)})')
+        entry = fn(arg)
+    spec = dict({'env': {}, 'overrides': {}}, **entry)
     # another evaluation workdir on the remote (an end-to-end test beside a live run's workdir: its
     # own mirrors and its own .eval.lock); an absolute path there (Git Bash rewrites /Users/... in a
     # Windows process's environment: MSYS2_ENV_CONV_EXCL=ZERO_EVAL_WORKDIR)
@@ -99,6 +110,16 @@ def remote_spec(name, setting='eval_remote'):
                              f'shell converted it? Git Bash: MSYS2_ENV_CONV_EXCL=ZERO_EVAL_WORKDIR)')
         spec['workdir'] = wd.rstrip('/')
     return spec
+
+
+def known_remote(name):
+    """Whether `name` names a remote of the game package without resolving it: 'local', a remote, or a
+    parametrised name whose prefix entry ('<prefix>:') is callable (docs/az.md 34)."""
+    remotes = package.active().remotes
+    if name == 'local' or (name in remotes and not (callable(remotes[name]) and name.endswith(':'))):
+        return True
+    pre, sep, _ = name.partition(':')
+    return bool(sep) and callable(remotes.get(pre + sep))
 
 
 class Transport:
