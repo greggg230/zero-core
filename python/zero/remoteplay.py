@@ -425,6 +425,7 @@ class Host:
         self.late_total = 0
         self.late_reported = 0
         self.retired = False                       # no longer listed (docs/az.md 34)
+        self.th = None                             # a list of hosts: its own manager thread (_host_loop)
 
     def cname(self, k):
         """Worker `k`'s consumer name in the shared queue."""
@@ -593,6 +594,8 @@ class RemotePlay:
                 self.shares.restore({n: st})
         if self.cur is not None:
             h.cur = _counters(self.cur['it'])
+        if self.multi:
+            self._own_thread(h)
         # one fetch thread per worker: the workers' last shards of a phase come back side by side (each
         # copy is an scp with its own ssh handshake, ~1-2 s, then the check)
         while len(self.fths) < max(2, self.procs):
@@ -602,7 +605,8 @@ class RemotePlay:
         return True
 
     def _relabel(self, multi):
-        """(mu held) One remote <-> a list: the hosts' consumers renamed in place (their rates kept)."""
+        """(mu held) One remote <-> a list: the hosts' consumers renamed in place (their rates kept); a list's
+        hosts each get a manager thread of their own."""
         if multi == self.multi:
             return
         self.multi = multi
@@ -613,6 +617,16 @@ class RemotePlay:
                 self.shares.rename(o, h.cname(k))
                 if h.sess[k] is not None:
                     h.sess[k].name = h.cname(k)
+            if multi:
+                self._own_thread(h)
+
+    def _own_thread(self, h):
+        """(mu held) Host `h`'s workers managed on a thread of its own (a list of hosts): its blocking work -
+        a worker's start over ssh, its mirror, the checkpoint's copy - never holds up the other hosts' or the
+        caps. One remote: the manager thread does it all, as it always did."""
+        if h.th is None:
+            h.th = threading.Thread(target=self._host_loop, args=(h,), name=f'zero-rsp-{h.name}', daemon=True)
+            h.th.start()
 
     def _retire(self, h):
         """(mu held; a phase start, so no phase of `h` is open) Host `h` is no longer listed: its
@@ -1235,11 +1249,34 @@ class RemotePlay:
                 for n, v in self.capv.items():
                     self.cur['capsum'][n] = self.cur['capsum'].get(n, 0) + v
                     self.cur['capmax'][n] = max(self.cur['capmax'].get(n, 0), v)
-            hosts = list(self.hosts.values())
+            hosts = [h for h in self.hosts.values() if h.th is None]   # (a list's hosts: their own threads)
         for h in hosts:
             for k in range(h.procs):
                 if not h.retired:
                     self._tick_worker(h, k, want, now)
+
+    def _host_loop(self, h):
+        """A list of hosts: host `h`'s workers ticked on its own thread (the shared manager computes the
+        caps) until the run closes or the host leaves."""
+        last_err = 0.0
+        while True:
+            with self.mu:
+                if self.closed or h.retired:
+                    return
+                want = self.want
+            now = _now()
+            try:
+                for k in range(h.procs):
+                    if not h.retired:
+                        self._tick_worker(h, k, want, now)
+            except Exception as e:                     # noqa: BLE001 - logged, retried
+                if _now() - last_err > 60:
+                    last_err = _now()
+                    h.log(f'{type(e).__name__}: {str(e)[-400:]}')
+            with self.mu:
+                if self.closed or h.retired:
+                    return
+                self.mu.wait(0.25)
 
     def _tick_worker(self, h, k, want, now):
         s = h.sess[k]
@@ -1356,7 +1393,7 @@ class RemotePlay:
         if h.salt:                                 # a list of hosts (docs/az.md 34): its name, its seeds' salt
             spj.update(remote=h.name, seed_salt=h.salt)
         for name, obj in (('config.json', cfg), ('selfplay.json', spj)):
-            tmp = os.path.join(self.R.run, f'.remote_selfplay_{name}')
+            tmp = os.path.join(self.R.run, f'.remote_selfplay_{h.tag + "_" if h.tag else ""}{name}')
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(obj, f, indent=1)
             h.t.put(tmp, h.rdir + '/' + name)

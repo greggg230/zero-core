@@ -4522,7 +4522,10 @@ training alone - an actor / learner split - while never stalling when every acto
   sessions (its spec's `selfplay.procs`, or `selfplay_remote_procs` when > 0, per host); its own checkpoint shipping,
   failure counting, retries and refusals. Its consumers in the shared queue are `<name>/w<k>` ('mac/w0',
   'vast:w1/w0'), all in the one quota / `Shares` model exactly as one remote's workers are (each bootstraps as an
-  unmeasured remote, `workqueue.BOOT`). The fetch threads serve every host (one per worker of all hosts, at least
+  unmeasured remote, `workqueue.BOOT`). Each host's workers are managed on a thread of its own (their starts over
+  ssh, the mirror, the checkpoint's copy, `phase` / `cap` / pings), so a slow or unreachable host never holds up
+  the others or the caps, which the shared manager thread recomputes every 0.25 s (one remote: the one manager
+  thread does both, as before). The fetch threads serve every host (one per worker of all hosts, at least
   two; a fetch uses its session's host's transport). `selfplay_remote_wait`, `_inflight`, `_batch`,
   `_batch_inflight`, `_linger`, `_giveback`, `_overdue`, `_timeout` keep their meaning, applied to every host's
   workers (a host's workers are batch-bound by its own `overrides.infer_device`).
@@ -4566,8 +4569,8 @@ training alone - an actor / learner split - while never stalling when every acto
   the run names its hosts as a list does ('<name>/w<k>', `selfplay.remotes`), whatever their number.
 * **Every change is logged**: `remote self-play: hosts now [mac, vast:w1] (+vast:w1)`, `... hosts now [] (-mac):
   this machine plays alone`.
-* **A host newly listed**: its spec resolves on a thread (the main thread never waits for it: a `RunCommitRemote`
-  check over ssh); a failure - an unknown name, a callable that raises, a Mapping whose checks fail - is logged
+* **A host newly listed** (at a phase start; the hosts listed when the run starts resolve then, on its main
+  thread): its spec resolves on a thread (the main thread never waits for it: a `RunCommitRemote` check over ssh); a failure - an unknown name, a callable that raises, a Mapping whose checks fail - is logged
   (`remote self-play <name>: not added (<error>); retried at the next phase`) and retried at every phase start while
   it is listed; the run never stops for it. Once resolved it joins (`remote self-play <name>: added (host, N
   worker(s), mirror ...)`): its consumers enter the queue (a rate restored at the run's start if its consumers had
@@ -4637,7 +4640,9 @@ plays here whatever it says.
 
 A parametrised entry `remotes['vast:'] = fn` is called with the name's rest at every resolution (the run's start,
 then each phase start while the host is listed and not resolved); its result is read with `dict(**spec)` then (a
-Mapping's checks run then, on the resolving thread, never the main one). Before a host is listed its machine needs
+Mapping's checks run then: at the run's start on its main thread, as for one remote - a host that fails there is
+logged and retried, never fatal, with a list -, later on a thread of its own, so a slow check never holds up the
+run). Before a host is listed its machine needs
 what one remote needs (5.2, 5.3): ssh in BatchMode to `host` (its key), `repo` at the run's code with `python`
 able to run `python -m <pkg>.az.remote selfplay MIRROR K`, and an absolute selfplay `workdir` it may create (the run
 makes the mirror, writes its config.json / selfplay.json and ships the checkpoint itself). A host's workers are its
@@ -4651,7 +4656,8 @@ such hosts' workers K started in one iteration would play the same games): every
 ### 34.7 Costs, tests, measured
 
 **Costs**: none for one remote or none (34.5). With a list, per host one ssh session per worker, one mirror and one
-checkpoint copy per phase, as a remote of its own; one thread per newly listed host while it resolves.
+checkpoint copy per phase, as a remote of its own, and a manager thread; one thread per newly listed host while it
+resolves.
 
 **Tests** (`tests/test_multi_remote.py`, every host a 'local' one with a selfplay workdir of its own): two hosts share
 an iteration's quota exactly (every iteration 600 = this machine's + 'a/w0' + 'b/w0'; their shards in data/iter_i/

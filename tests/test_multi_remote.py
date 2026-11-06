@@ -508,6 +508,7 @@ def test_restore_and_one_remote_becoming_a_list(tmp_path, monkeypatch):
                     '_leaves_per_unit': 10.0})
         assert set(rp.shares.c) == {'w0', 'local'} and rp.shares.c['w0']['rate'] == 3.0
         assert rp.shares.c['w0']['lead'] == 1.5 and rp.shares.lpu == 10.0 and not rp.multi
+        assert rp.hosts['a'].th is None, 'one remote: its workers on the one manager thread, as before'
         write_file(rp.R.run, ['a', 'b'])
         with rp.mu:
             rp._membership(1)
@@ -517,6 +518,7 @@ def test_restore_and_one_remote_becoming_a_list(tmp_path, monkeypatch):
             time.sleep(0.05)
         assert set(rp.shares.c) == {'a/w0', 'local', 'b/w0'} and rp.hosts['b'].salt and rp.hosts['a'].salt
         assert rp.hosts['a'].tag == 'a' and rp.hosts['b'].cname(0) == 'b/w0'
+        assert rp.hosts['a'].th.is_alive() and rp.hosts['b'].th.is_alive(), 'a list: a manager thread per host'
         assert 'remote self-play: hosts now [a, b] (+b)' in logs
         os.remove(os.path.join(rp.R.run, 'selfplay_remotes'))      # the setting decides again: one remote
         with rp.mu:
