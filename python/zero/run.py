@@ -36,6 +36,12 @@ recorded (zero/league.py, docs/az.md 14).
 head (added to a checkpoint without one, everything else as it was) and training adds its loss x the
 weight (zero/auxtarget.py, docs/az.md 15). 0 (the default): the run of before.
 
+--reader-<target> 1: the game package's reader of that auxiliary target (docs/az.md 36; the toy's
+--reader-next-card): a small MLP of the network reads declared public features, predicts the target
+(trained by its loss: needs --aux-<target>-w > 0) and feeds the prediction into the trunk (added to a
+checkpoint without it, every output unchanged). --reader-detach 0: the trunk's losses train it too.
+0 (the default): the network of before.
+
 --selfplay-belief-tilt 1 / --eval-belief-tilt 1: the root's belief (docs/search.md 3.8, docs/az.md 18):
 every full search of that seat asks the network's auxiliary head once for the root's prediction of the
 hidden cards and deals its simulations' worlds by it (the game's `determinize_with`; belief_clip,

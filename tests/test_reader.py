@@ -334,6 +334,12 @@ def test_run_with_the_reader_on(tmp_path):
     # a reader without its target's loss is refused at start
     p = run_loop(tmp_path / 'bad', '--iters', '1', '--reader-next-card', '1')
     assert p.returncode != 0 and 'aux_next_card_w' in p.stdout + p.stderr
+    # the static training step (train_static, forward_static) trains it too, detached or not
+    p = run_loop(tmp_path / 'static', '--iters', '1', '--arch', 'tokens', '--aux-next-card-w', '1.0',
+                 '--reader-next-card', '1', '--train-static', '1', '--reader-detach', '0')
+    assert p.returncode == 0, p.stdout + p.stderr
+    tr = read_metrics(str(tmp_path / 'static'))[1]['train']
+    assert tr['readers'] == {'targets': ['next_card'], 'detach': False} and 0 < tr['reader_next_card'] < 2
 
 
 def test_a_fork_without_the_reader_adds_it_exactly_and_rolls_on(tmp_path):
