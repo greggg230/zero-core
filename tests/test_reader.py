@@ -389,3 +389,42 @@ def test_reader_settings_at_their_defaults_change_nothing(tmp_path):
     x = torch.load(str(a / 'models' / 'opt_latest.pt'), weights_only=False)['state']['state']
     y = torch.load(str(b / 'models' / 'opt_latest.pt'), weights_only=False)['state']['state']
     assert all(torch.equal(x[k][j], y[k][j]) for k in x for j in x[k] if torch.is_tensor(x[k][j]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA graphs need CUDA')
+def test_cuda_graphs_compute_the_reader():
+    """The token network's CUDA graphs (dense and sparse batches, belief rows) and the conv network's
+    answer what the eager evaluator answers for a network with a reader (the graphs run forward_static /
+    the folded forward, which compute it)."""
+    from zero.infer import NetEvaluator, TokenGraphRunner
+    from zero.protocol import ROW_BELIEF
+    x = toy_x(40, seed=9)
+    n2 = np.full(len(x), 2)
+    off = np.arange(len(x) + 1, dtype=np.int32) * 2
+    acts = np.tile(np.array([0, 3], np.int32), len(x))
+    extra = np.zeros(len(x), np.uint8)
+    extra[[1, 30]] = ROW_BELIEF
+    for arch, graphs in (('tokens', True), ('grid', True)):
+        m = nets(TOY_AUX, [dict(TOY_READER[0], belief=True)])[arch]
+        shake(m, 0.05)
+        shake(m, 0.3, 'readers.')
+        eager = NetEvaluator(m, 'cpu')
+        want = eager.evaluate(x, n2, off, acts)
+        want_b = eager.evaluate(x, n2, off, acts, extra)
+        ev = NetEvaluator(m.to('cuda'), 'cuda', graphs=graphs)
+        got = ev.evaluate(x, n2, off, acts)
+        assert ev.graph_calls == 1
+        tol = 1e-4 if arch == 'tokens' else 3e-2                    # (the conv graphs run bfloat16)
+        for u, v in zip(want, got):
+            assert np.allclose(u, v, atol=tol, rtol=tol)
+        got_b = ev.evaluate(x, n2, off, acts, extra)
+        assert np.allclose(want_b[3], got_b[3], atol=tol, rtol=tol)    # the reader's prediction, as declared
+        if isinstance(ev.fast, TokenGraphRunner):
+            nz = [np.flatnonzero(r) for r in x]
+            xs_off = np.concatenate([[0], np.cumsum([len(i) for i in nz])]).astype(np.int64)
+            xs_idx = np.concatenate(nz).astype(np.int32)
+            xs_val = np.concatenate([r[i] for r, i in zip(x, nz)]).astype(np.float32)
+            h = ev.fast.launch_sparse(xs_off, xs_idx, xs_val, n2, off, acts, np.array([1, 30]))
+            s = ev.fast.result(h)
+            for u, v in zip(got_b, s):
+                assert np.allclose(u, v, atol=1e-6)
