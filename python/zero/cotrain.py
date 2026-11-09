@@ -615,7 +615,7 @@ class CoRun:
         else:
             for k, X in (('pev', P), ('rev', R)):
                 m, _ = load(model_path(X.run, it - 1), 'cpu', game=X.cfg['game'])
-                self.sp[k].set_weights(m.state_dict())
+                self.sp[k].set_network(m)
         sp = self.sp
         pdrv, rdrv, pev, rev, co = sp['p'], sp['r'], sp['pev'], sp['rev'], sp['co']
         pst0, rst0 = pdrv.stats(), rdrv.stats()

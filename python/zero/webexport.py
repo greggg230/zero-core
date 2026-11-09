@@ -22,6 +22,10 @@ def export_model(ckpt, out):
     from .net import load
     model, extra = load(ckpt, 'cpu')
     cfg = model.config
+    if cfg.get('readers'):
+        # (the browser's forward has no readers: it would compute another network in silence)
+        raise ValueError(f'{ckpt}: a network with readers (docs/az.md 36) - the browser players (zero_webnet) cannot '
+                         f'run them')
     tensors, chunks, off, worst = [], [], 0, 0.0
     for name, t in model.state_dict().items():
         if name.startswith('mar.') or name.startswith('aux_'):

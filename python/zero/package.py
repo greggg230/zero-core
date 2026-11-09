@@ -78,13 +78,21 @@ class GamePackage:
                     head (zero.replay; predictions {name: numpy [w]} = `net.aux_predict` at the
                     root, state = the frame's parsed export_state, seat = the decider). Default:
                     {'aux': {name: [[column, value], ...]}}, each target's 12 largest values
+    readers         game -> its readers (docs/az.md 36): [{target, inputs, hidden, enter, belief}, ...],
+                    each a small MLP of the network from the features `inputs` ([[offset, count],
+                    ...]; a token network: bags and globals only) to the auxiliary target `target`
+                    (one of `aux`), trained by its loss, its prediction also an input of the trunk
+                    (enter 'trunk', the default; 'none': an auxiliary output only); hidden (default
+                    64) its hidden width; belief (default false) true: a search's root belief rows
+                    get the reader's prediction for the target instead of the head's. Each reader
+                    gets the run setting `reader_<target>` (default 0 = off: the network of before)
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
-                 replay_aux=None):
+                 replay_aux=None, readers=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -110,6 +118,7 @@ class GamePackage:
         self.evals = dict(evals or {})
         self.aux = dict(aux or {})
         self.replay_aux = dict(replay_aux or {})
+        self.readers = dict(readers or {})
 
     def aux_of(self, game):
         """`game`'s auxiliary targets [[name, width, loss], ...] (none: [])."""
@@ -125,6 +134,26 @@ class GamePackage:
                 name = t['name'] if isinstance(t, dict) else t[0]
                 out[f'aux_{name}_w'] = 0.0
         return out
+
+    def readers_of(self, game):
+        """`game`'s readers in their normal form (`net.reader_layout`: each completed with its target's
+        width and loss from `aux`; docs/az.md 36); none: []. A reader of a target the game does not
+        declare: ValueError."""
+        from .net import reader_layout
+        targets = {n: (w, loss) for n, w, loss in self.aux_of(game)}
+        out = []
+        for r in self.readers.get(game) or []:
+            if r['target'] not in targets:
+                raise ValueError(f'{self.name}: the reader of {game!r} reads for {r["target"]!r}, not an auxiliary '
+                                 f'target of the game ({sorted(targets)})')
+            w, loss = targets[r['target']]
+            out.append(dict(r, width=w, loss=loss))
+        return reader_layout(out)
+
+    def reader_settings(self):
+        """The run settings of the package's readers: {'reader_<target>': 0} for every reader of every
+        game (zero.run adds them to DEFAULTS)."""
+        return {f'reader_{r["target"]}': 0 for rs in self.readers.values() for r in rs}
 
     def replay_aux_of(self, game):
         """`game`'s replay rendering of auxiliary predictions (`replay_aux`; None: zero.replay's default)."""
@@ -192,10 +221,15 @@ TOY_TOKENS = {'vocab': 8,
 # distribution (the best from public information: uniform over the next stage's unrevealed cards).
 TOY_AUX = [{'name': 'next_card', 'width': 6, 'loss': 'multinomial'}]
 
+# The toy's reader (docs/az.md 36): next_card from the public information that determines its best
+# prediction - the round (its one-hot, features 0-5) and the revealed round cards (25-30, the token
+# layout's bag 'cards') - fed into the trunk.
+TOY_READERS = [{'target': 'next_card', 'inputs': [[0, 6], [25, 6]], 'hidden': 32}]
+
 # the core's own package: the toy game, zero._engine (crates/toy_py, tools/build_py.sh)
 CORE = GamePackage('zero', 'Zero Core', CORE_ROOT, engine='zero._engine', run_module='zero.run', game='toy',
                    dashboard_port=None, hub_id=None, env_prefix='ZERO', tokens={'toy': TOY_TOKENS},
-                   aux={'toy': TOY_AUX})
+                   aux={'toy': TOY_AUX}, readers={'toy': TOY_READERS})
 
 def default_episodes(payload):
     """The resolver specs of a deferred terminal: its payload's "episodes" (each a JSON string,

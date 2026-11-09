@@ -72,7 +72,8 @@ from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, packa
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
-from .net import EncodingMismatch, add_aux, aux_layout, check_belief_head, check_checkpoint, load, make_net, save
+from .net import (EncodingMismatch, add_aux, add_reader, aux_layout, check_belief_head, check_checkpoint, load, make_net,
+                  reader_layout, save)
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
 from .shardthread import MB, SampleClock, ThreadedShardWriter, split_records
@@ -215,6 +216,12 @@ DEFAULTS = dict(
     # change: the Elo pool's name gets '-b<tilt>...'). Needs the auxiliary head (a checkpoint without it
     # is refused: net.HeadMissing). 0 = off (the default: today's searches, bit for bit)
     selfplay_belief_tilt=0.0, eval_belief_tilt=0.0, belief_clip=20.0, belief_mix=0.0, belief_fast=0,
+    # readers (docs/az.md 36): the game package's `readers`, each turned on by its run setting
+    # `reader_<target>` (default 0 = off: the network of before) - a small branch of the network reading
+    # declared features, trained by its auxiliary target's loss (aux_<target>_w > 0), its prediction an
+    # input of the trunk. reader_detach 1: the prediction enters the trunk detached (only the auxiliary
+    # loss trains the reader); 0: the trunk's losses train it too
+    reader_detach=1,
     # the root search (docs/search.md 3.7, docs/az.md 19): 'puct' (the default: today's searches, bit
     # for bit) | 'gumbel' = Gumbel AlphaZero's root (Danihelka et al. 2022) - Gumbel noise per root
     # option and sequential halving over the gumbel_m options of highest noise + log-prior, the
@@ -392,7 +399,7 @@ def apply_package(pkg):
     """The game package's run presets and DEFAULTS overrides (zero.package.register calls this;
     so does importing this module), and the weight setting of each of its auxiliary targets
     (`aux_<name>_w`, default 0 = off; docs/az.md 15). Unknown setting names are an error."""
-    known = dict(_CORE_DEFAULTS, **pkg.aux_settings())
+    known = dict(_CORE_DEFAULTS, **pkg.aux_settings(), **pkg.reader_settings())
     bad = sorted(set(pkg.defaults) - set(known))
     if bad:
         raise ValueError(f'{pkg.name}: unknown run settings in defaults: {bad}')
@@ -516,6 +523,8 @@ class Run:
         # auxiliary targets (docs/az.md 15): the game's layout [[name, width, loss], ...] when one of
         # their weights is on, else [] (off: nothing recorded, built or trained)
         self.aux_w, self.aux = aux_settings(cfg, self.info)
+        # readers (docs/az.md 36): the game's readers turned on (reader_<target> 1), [] when none is
+        self.readers = reader_settings(cfg, self.aux_w)
         self.heldout = None                        # zero.heldout.HeldOut with heldout_shards (loaded once)
         self.anchor_sha = {}                       # anchor path -> ((size, mtime), sha256)
         self.linger = None                         # selfplay_local_linger: the lingering thread's state
@@ -535,7 +544,7 @@ class Run:
         c = self.cfg
         torch.manual_seed(c['seed'])
         return make_net(self.info, c['game'], c.get('arch', 'mlp'), c['hidden'], c['blocks'], c['ch'], c.get('heads', 4),
-                        c.get('ff', 0), aux=self.aux or None)
+                        c.get('ff', 0), aux=self.aux or None, readers=self.readers or None)
 
     def evaluator(self, path):
         m, _ = load(path, self.cfg['infer_device'], game=self.cfg['game'])
@@ -665,7 +674,7 @@ class Run:
                 self.roll_evs = {'m': self.roll_ev}
             else:
                 m, _ = load(model_path(self.run, it - 1), 'cpu', game=c['game'])
-                self.roll_ev.set_weights(m.state_dict())
+                self.roll_ev.set_network(m)
             drv, ev = self.roll, self.roll_ev
             evs, kinds = self.roll_evs, self.roll_kinds
             st0 = drv.stats()
@@ -879,7 +888,7 @@ class Run:
             self.held, self.enq, self.taken = deque(), 0, 0
         else:
             m, _ = load(model_path(self.run, it - 1), 'cpu', game=c['game'])
-            self.roll_ev.set_weights(m.state_dict())
+            self.roll_ev.set_network(m)
         drv, ev, evs = self.roll, self.roll_ev, self.roll_evs
         if lg is not None:
             plan = lg.plan(it)
@@ -1161,6 +1170,21 @@ class Run:
             model = add_aux(model, self.aux, seed=c['seed'] * 7919 + it)
             added = True
             self.log(f'iter {it}: auxiliary head {self.aux} added to checkpoint {it - 1} (its other outputs unchanged)')
+        readers = getattr(self, 'readers', None) or []
+        r_added = False
+        have = reader_layout(model.config.get('readers'))
+        if have != readers:
+            if have:
+                raise SystemExit(f'iter {it}: checkpoint {it - 1} has the readers {have}, this run reads {readers or "none"} '
+                                 f'(a reader is part of the network\'s input: keep it - reader_<target> 1, its declaration '
+                                 f'unchanged - or fork from a checkpoint without it; docs/az.md 36)')
+            # a checkpoint without readers (a fork of a run without them): fresh readers, the rest as it was
+            model = add_reader(model, readers, seed=c['seed'] * 7919 + it + 1)
+            r_added = True
+            self.log(f'iter {it}: readers {[r["target"] for r in readers]} added to checkpoint {it - 1} (its outputs '
+                     f'unchanged)')
+        if readers:
+            model.reader_detach = bool(c.get('reader_detach', 1))
         model.train()
         static = bool(c.get('train_static'))
         if static and not hasattr(model, 'forward_static'):
@@ -1169,9 +1193,12 @@ class Run:
         # fused AdamW (train_static on CUDA): the same update, one kernel set for every parameter
         okw = {'fused': True} if static and str(dev).startswith('cuda') else {}
         heads = [p for n, p in model.named_parameters() if n.startswith('aux_')]
-        trunk = [p for n, p in model.named_parameters() if not n.startswith('aux_')]
-        if heads:                                  # two groups: the network of before, its auxiliary head
-            opt = torch.optim.AdamW([{'params': trunk}, {'params': heads}], lr=c['lr'], weight_decay=c['wd'], **okw)
+        rdrs = [p for n, p in model.named_parameters() if n.startswith('readers.')]
+        trunk = [p for n, p in model.named_parameters() if not n.startswith('aux_') and not n.startswith('readers.')]
+        # parameter groups: the network of before, its auxiliary head, its readers (each when it has them)
+        pgroups = [g for g in (trunk, heads, rdrs) if g]
+        if len(pgroups) > 1:
+            opt = torch.optim.AdamW([{'params': g} for g in pgroups], lr=c['lr'], weight_decay=c['wd'], **okw)
         else:
             opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'], **okw)
         opt_path = os.path.join(self.run, 'models', 'opt_latest.pt')
@@ -1181,14 +1208,18 @@ class Run:
                 o = torch.load(opt_path, map_location=dev, weights_only=False)
                 if o.get('iter') == it - 1:
                     groups = o['state'].get('param_groups') or []
-                    if heads and len(groups) == 1 and len(groups[0].get('params', [])) == len(trunk):
-                        # the state of the network before its head: kept for it, the head starts fresh
-                        bad = opt_state_mismatch(model, o['state'], params=trunk)
+                    k = len(groups)
+                    if 0 < k < len(pgroups) and [len(g.get('params', [])) for g in groups] == [len(g) for g in pgroups[:k]]:
+                        # the state of the network before its head (and / or readers): kept for it, the new
+                        # parts start fresh
+                        bad = opt_state_mismatch(model, o['state'], params=[p for g in pgroups[:k] for p in g])
                         if bad:
                             raise ValueError(f'it belongs to another network ({bad})')
-                        opt = torch.optim.AdamW(trunk, lr=c['lr'], weight_decay=c['wd'], **okw)
+                        opt = torch.optim.AdamW(trunk if k == 1 else [{'params': g} for g in pgroups[:k]], lr=c['lr'],
+                                                weight_decay=c['wd'], **okw)
                         opt.load_state_dict(o['state'])
-                        opt.add_param_group({'params': heads})
+                        for g in pgroups[k:]:
+                            opt.add_param_group({'params': g})
                     else:
                         # (the state of this network: its moments as its parameters; another network's,
                         # e.g. of another encoding, would load and fail at the first step, docs/az.md 10.4)
@@ -1227,6 +1258,16 @@ class Run:
                 acc[f'aux_{name}'] = 0.0
                 if loss == 'multinomial':
                     acc[f'aux_{name}_hit'] = 0.0
+        # each reader's columns of the forward's auxiliary outputs (after the head's) and of the targets
+        rcols, k0 = [], aw
+        cols = {name: sl for name, _, sl in AUX.columns(self.aux)}
+        for r in readers:
+            rcols.append((r['target'], [[r['target'], r['width'], r['loss']]], slice(k0, k0 + r['width']),
+                          cols[r['target']]))
+            k0 += r['width']
+            acc[f'reader_{r["target"]}'] = 0.0
+            if r['loss'] == 'multinomial':
+                acc[f'reader_{r["target"]}_hit'] = 0.0
         if nview:
             acc.update(value_view=0.0, value_decision=0.0)
         last = min(steps, 200)
@@ -1270,6 +1311,12 @@ class Run:
                     if self.aux_w[name] > 0:
                         loss = loss + self.aux_w[name] * v['loss']
                     terms.append(v['loss'].detach())
+                # the readers: their targets' losses on their own outputs (docs/az.md 36)
+                lr_ = {}
+                for name, lay, rsl, tsl in rcols:
+                    lr_[name] = AUX.losses(lay, ap[:, rsl].float(), b['aux'][:, tsl], b['aux_mask'])[name]
+                    loss = loss + self.aux_w[name] * lr_[name]['loss']
+                    terms.append(lr_[name]['loss'].detach())
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -1282,6 +1329,7 @@ class Run:
                 named = {'policy': lp, 'value': lv, 'margin': lm}
                 if aw:
                     named.update({f'aux_{name}': v['loss'] for name, v in la.items()})
+                    named.update({f'reader_{name}': v['loss'] for name, v in lr_.items()})
                 self.nonfinite_step(it, step, steps, b, idx, W, model, named,
                                     gnorm, per, dict(lr=g_lr, value_q=vq, margin_loss_w=mw, amp=amp, device=dev))
             opt.step()
@@ -1306,6 +1354,10 @@ class Run:
                         acc[f'aux_{name}'] += v['loss'].item() / last
                         if 'hit' in v:
                             acc[f'aux_{name}_hit'] += v['hit'].item() / last
+                    for name, v in lr_.items():
+                        acc[f'reader_{name}'] += v['loss'].item() / last
+                        if 'hit' in v:
+                            acc[f'reader_{name}_hit'] += v['hit'].item() / last
         feed.close()
         model.eval()
         ost = opt.state_dict()
@@ -1322,6 +1374,10 @@ class Run:
                 out['aux'] = dict(AUX.window_stats(W, self.aux), weights=dict(self.aux_w))
                 if added:
                     out['aux']['head_added'] = True
+            if readers:
+                out['readers'] = {'targets': [r['target'] for r in readers], 'detach': bool(model.reader_detach)}
+                if r_added:
+                    out['readers']['added'] = True
             return out
         return model, ost, stats
 
@@ -1882,6 +1938,19 @@ def aux_settings(cfg, info):
     return w, targets
 
 
+def reader_settings(cfg, aux_w):
+    """The readers a run turns on (docs/az.md 36): the game package's readers whose `reader_<target>` is 1,
+    in their normal form (`net.reader_layout`), [] when none is. A reader on needs its target's weight
+    (`aux_<target>_w` > 0: its loss is what trains it, and only then does self-play record the target),
+    else SystemExit."""
+    out = [r for r in package.active().readers_of(cfg['game']) if int(cfg.get(f'reader_{r["target"]}') or 0)]
+    for r in out:
+        if not aux_w.get(r['target'], 0.0) > 0:
+            raise SystemExit(f'reader_{r["target"]} 1 needs aux_{r["target"]}_w > 0: its target\'s auxiliary loss trains '
+                             f'the reader (docs/az.md 36)')
+    return out
+
+
 def _fmt(d):
     return json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in d.items()})
 
@@ -2010,6 +2079,9 @@ def resolve_config(args, saved):
         w = cfg.get(k, 0.0)
         if not isinstance(w, (int, float)) or isinstance(w, bool) or not w >= 0:
             raise SystemExit(f'{k} {w!r}: a number >= 0 (an auxiliary target weight; 0 = off, docs/az.md 15)')
+    for k in list(package.active().reader_settings()) + ['reader_detach']:
+        if cfg.get(k, 0) not in (0, 1):
+            raise SystemExit(f'{k} {cfg.get(k)!r}: 0 or 1 (docs/az.md 36)')
     if isinstance(cfg.get('resolver_cfg'), dict) and L.enabled(cfg['resolver_cfg']):
         raise SystemExit('resolver_cfg: selfplay_league: single-game runs only (not a co-training resolver)')
     # branched games and archive starts (zero/forks.py): ranges, single-game runs, rolling self-play

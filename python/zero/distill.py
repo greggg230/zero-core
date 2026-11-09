@@ -82,6 +82,9 @@ def new_student(teacher, arch=None, hidden=128, blocks=4, heads=4, ff=0, ch=64, 
     arch = arch or teacher.config.get('arch', 'mlp')
     if isinstance(aux, str) and aux == 'teacher':
         aux = teacher.config.get('aux')
+    if teacher.config.get('readers'):
+        # (docs/az.md 36: not built yet - a student without them would silently drop the teacher's input path)
+        raise ValueError('distillation of a network with readers is not supported yet (docs/az.md 36)')
     torch.manual_seed(seed)
     return make_net(G.info(game), game, arch, hidden, blocks, ch, heads, ff, aux=aux_layout(aux) or None)
 
@@ -288,6 +291,8 @@ def distill(student, W, T, steps, batch=512, lr=5e-4, lr_min=1e-5, warmup=500, w
     `Window(aux_width=)`), `aux_w` / `aux_teacher_w` its weight and blend; a student with a head and a
     `T` without the teacher's predictions is refused (the head would train on nothing); a student
     without one ignores them. -> (the AdamW optimizer, the last report)."""
+    if getattr(student, 'reader_specs', None):
+        raise ValueError('distillation into a network with readers is not supported yet (docs/az.md 36)')
     if aux_width(student):
         if 'aux' not in T or aux_layout(T.get('aux_layout')) != student.aux_layout:
             raise ValueError(f"the student's auxiliary head {student.aux_layout} needs the teacher's predictions for "

@@ -1994,7 +1994,7 @@ class Worker:
             self.backlog = []
             self.info = R.info
         else:
-            self.evr.set_weights(m.state_dict())
+            self.evr.set_network(m)
         keep = set()
         if self.lg_on:
             # the phase's league slots: {key: models/iter_j.pt}, shipped by the run (zero/league.py)

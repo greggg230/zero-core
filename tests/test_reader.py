@@ -225,3 +225,167 @@ def test_checkpoint_with_a_reader_loads_and_passes_the_encoding_guard(tmp_path):
     for k, v in t.state_dict().items():
         assert torch.equal(v, m.state_dict()[k])
     assert build(m.config).config == m.config
+
+
+# ----------------------------------------------------------------------------- the package, settings
+
+def test_package_declares_the_toy_reader_and_its_settings():
+    from zero.run import DEFAULTS, reader_settings, resolve_config
+    assert package.CORE.readers_of('toy') == TOY_READER and package.CORE.readers_of('toy_team') == []
+    assert DEFAULTS['reader_next_card'] == 0 and DEFAULTS['reader_detach'] == 1
+    import argparse
+    args = argparse.Namespace(**{k: None for k in DEFAULTS})
+    assert resolve_config(args, {'game': 'toy'})['reader_next_card'] == 0
+    with pytest.raises(SystemExit, match='0 or 1'):
+        resolve_config(args, {'game': 'toy', 'reader_next_card': 2})
+    assert reader_settings(dict(DEFAULTS), {'next_card': 0.0}) == []
+    with pytest.raises(SystemExit, match='aux_next_card_w'):
+        reader_settings(dict(DEFAULTS, reader_next_card=1), {'next_card': 0.0})
+    assert reader_settings(dict(DEFAULTS, reader_next_card=1), {'next_card': 0.5}) == TOY_READER
+    bad = package.GamePackage('bad', 'Bad', ROOT, aux={'toy': package.TOY_AUX},
+                              readers={'toy': [{'target': 'hand', 'inputs': [[0, 6]]}]})
+    with pytest.raises(ValueError, match='not an auxiliary target'):
+        bad.readers_of('toy')
+
+
+# ----------------------------------------------------------------------------- the evaluators
+
+def test_evaluators_compute_the_reader_and_answer_it():
+    from zero.infer import NetEvaluator
+    from zero.protocol import ROW_BELIEF
+    x = toy_x(seed=6)
+    n2 = np.full(len(x), 2)
+    off = np.arange(len(x) + 1, dtype=np.int32) * 2
+    acts = np.tile(np.array([0, 3], np.int32), len(x))
+    plain = nets(TOY_AUX)['tokens']
+    shake(plain, 0.1)
+    m = add_reader(plain, TOY_READER, seed=1)
+    shake(m, 0.3, 'readers.')
+    ev, ev0 = NetEvaluator(m), NetEvaluator(plain)
+    with torch.no_grad():
+        o = m(torch.from_numpy(x), torch.from_numpy(n2), aux=True)
+    r = ev.evaluate(x, n2, off, acts)
+    assert np.allclose(r[1][:, :o[1].shape[1]], torch.softmax(o[1], 1).numpy(), atol=1e-6)    # the trunk read the reader
+    assert not np.allclose(r[1], ev0.evaluate(x, n2, off, acts)[1])
+    rd = ev.reader(x, n2)
+    assert set(rd) == {'next_card'}
+    assert np.allclose(rd['next_card'], reader_predict(m, o[3])['next_card'].numpy(), atol=1e-6)
+    assert ev0.reader(x, n2) == {}
+    assert np.allclose(ev.aux(x, n2)['next_card'], aux_predict(TOY_AUX, o[3])['next_card'].numpy(), atol=1e-6)
+    # a search's root belief rows: the head's prediction, or the reader's when it is declared `belief`
+    extra = np.zeros(len(x), np.uint8)
+    extra[[2, 5]] = ROW_BELIEF
+    want = aux_predict(TOY_AUX, o[3])['next_card'][[2, 5]].numpy()
+    assert np.allclose(ev.evaluate(x, n2, off, acts, extra)[3], want, atol=1e-6)
+    mb = add_reader(plain, [dict(TOY_READER[0], belief=True)], seed=1)
+    mb.load_state_dict(m.state_dict())
+    evb = NetEvaluator(mb)
+    assert np.allclose(evb.evaluate(x, n2, off, acts, extra)[3], rd['next_card'][[2, 5]], atol=1e-6)
+    assert np.allclose(evb.aux(x, n2)['next_card'], rd['next_card'], atol=1e-6)
+    # a state with readers into a network without them (and back) is refused; set_network takes the network
+    with pytest.raises(RuntimeError):
+        ev0.set_weights(m.state_dict())
+    with pytest.raises(RuntimeError):
+        ev.set_weights(plain.state_dict())
+    ev0.set_network(m)
+    assert np.array_equal(ev0.evaluate(x, n2, off, acts)[1], r[1]) and ev0.model is m
+    ev0.set_network(plain)
+    assert 'readers' not in ev0.model.config
+
+
+def test_webexport_and_distillation_refuse_a_reader(tmp_path):
+    from zero import distill, webexport
+    m = nets(None, TOY_READER)['mlp']
+    p = str(tmp_path / 'r.pt')
+    save(m, p)
+    with pytest.raises(ValueError, match='readers'):
+        webexport.export_model(p, str(tmp_path / 'r.bin'))
+    with pytest.raises(ValueError, match='readers'):
+        distill.new_student(m, hidden=16, blocks=1)
+    with pytest.raises(ValueError, match='readers'):
+        distill.distill(m, None, {}, steps=1)
+
+
+# ----------------------------------------------------------------------------- the run loop
+
+SMOKE = ['--preset', 'toy-smoke', '--conc', '24', '--games', '24', '--eval-games', '8', '--eval-random-games', '4',
+         '--elo-games', '4', '--ref-games', '8']
+
+
+def run_loop(run, *extra, timeout=300, env=None):
+    e = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH, **(env or {}))
+    return subprocess.run([sys.executable, '-m', 'zero.run', '--run', str(run), *SMOKE, *extra], cwd=ROOT,
+                          capture_output=True, text=True, timeout=timeout, env=e)
+
+
+def test_run_with_the_reader_on(tmp_path):
+    from zero.run import read_metrics
+    run = tmp_path / 'on'
+    p = run_loop(run, '--iters', '2', '--arch', 'tokens', '--aux-next-card-w', '1.0', '--reader-next-card', '1')
+    assert p.returncode == 0, p.stdout + p.stderr
+    tr = read_metrics(str(run))[2]['train']
+    assert tr['readers'] == {'targets': ['next_card'], 'detach': True}
+    assert 0 < tr['reader_next_card'] < np.log(6) + 0.05 and 0 <= tr['reader_next_card_hit'] <= 1
+    for it in (0, 1, 2):
+        ck = torch.load(str(run / 'models' / f'iter_{it:04d}.pt'), weights_only=False)
+        assert ck['config']['readers'] == TOY_READER and ck['config']['aux'] == TOY_AUX
+    o = torch.load(str(run / 'models' / 'opt_latest.pt'), weights_only=False)
+    assert [len(g['params']) for g in o['state']['param_groups']][1:] == [4, 6]    # trunk, head, reader
+    # a reader without its target's loss is refused at start
+    p = run_loop(tmp_path / 'bad', '--iters', '1', '--reader-next-card', '1')
+    assert p.returncode != 0 and 'aux_next_card_w' in p.stdout + p.stderr
+
+
+def test_a_fork_without_the_reader_adds_it_exactly_and_rolls_on(tmp_path):
+    """The carry-over: a run with the auxiliary head and no reader, forked with reader_next_card=1 (rolling
+    self-play): its first training adds the reader to checkpoint K (the rest exactly as K), keeps the
+    optimizer moments of the trunk and the head, and the rolling evaluator takes the network with the
+    reader at the next iteration (set_network). A fork that turns it off again is refused."""
+    from zero.run import read_metrics
+    sys.path.insert(0, os.path.join(ROOT, 'tools'))
+    import fork_run
+    src = tmp_path / 'src'
+    p = run_loop(src, '--iters', '2', '--aux-next-card-w', '1.0', '--rolling', '1')
+    assert p.returncode == 0, p.stdout + p.stderr
+    c = tmp_path / 'fork'
+    assert fork_run.main(['--source', str(src), '--dest', str(c), '--iter', '2', '--set', 'reader_next_card=1']) == 0
+    p = run_loop(c, '--iters', '4')
+    assert p.returncode == 0, p.stdout + p.stderr
+    tr = read_metrics(str(c))
+    assert tr[3]['train']['readers'].get('added') is True and 'added' not in tr[4]['train']['readers']
+    assert 'optimizer state not loaded' not in open(c / 'log.txt').read()
+    k2, _ = load(str(c / 'models' / 'iter_0002.pt'))
+    k3, _ = load(str(c / 'models' / 'iter_0003.pt'))
+    assert 'readers' not in k2.config and k3.config['readers'] == TOY_READER
+    x = torch.from_numpy(toy_x(seed=8))
+    n = torch.full((len(x),), 2)
+    r = add_reader(k2, TOY_READER, seed=11)
+    with torch.no_grad():
+        for u, v in zip(k2(x, n, aux=True), r(x, n, aux=True)):
+            assert torch.equal(u, v[:, :u.shape[1]])
+    d = tmp_path / 'off'
+    assert fork_run.main(['--source', str(c), '--dest', str(d), '--iter', '4', '--set', 'reader_next_card=0']) == 0
+    p = run_loop(d, '--iters', '5')
+    assert p.returncode != 0 and 'has the readers' in p.stdout + p.stderr
+
+
+def test_reader_settings_at_their_defaults_change_nothing(tmp_path):
+    """The run with the settings given at their defaults is the run without them, byte for byte (shards,
+    checkpoints, optimizer state)."""
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    for run, extra in ((a, []), (b, ['--reader-next-card', '0', '--reader-detach', '1'])):
+        p = run_loop(run, '--iters', '2', '--aux-next-card-w', '0.5', *extra, env={'ZERO_INFLIGHT': '1'})
+        assert p.returncode == 0, p.stdout + p.stderr
+    for it in (1, 2):
+        d = f'iter_{it:04d}'
+        sa = sorted(os.listdir(a / 'data' / d))
+        assert sa == sorted(os.listdir(b / 'data' / d))
+        for f in sa:
+            assert open(a / 'data' / d / f, 'rb').read() == open(b / 'data' / d / f, 'rb').read()
+    for f in ('iter_0001.pt', 'iter_0002.pt'):
+        x = torch.load(str(a / 'models' / f), weights_only=False)
+        y = torch.load(str(b / 'models' / f), weights_only=False)
+        assert x['config'] == y['config'] and all(torch.equal(v, y['state'][k]) for k, v in x['state'].items())
+    x = torch.load(str(a / 'models' / 'opt_latest.pt'), weights_only=False)['state']['state']
+    y = torch.load(str(b / 'models' / 'opt_latest.pt'), weights_only=False)['state']['state']
+    assert all(torch.equal(x[k][j], y[k][j]) for k in x for j in x[k] if torch.is_tensor(x[k][j]))

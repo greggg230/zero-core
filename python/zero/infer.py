@@ -351,14 +351,14 @@ class TokenGraphRunner:
         return k, b
 
     def _run(self, x, n, full, ntok):
-        from .net import aux_predict
+        from .net import aux_answer
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
             r = self.net.forward_static(x, n, full, ntok, aux=bool(self.layout))
         plog, vlog, mar = r[:3]
         out = torch.cat([plog.float(), torch.softmax(vlog.float(), 1), mar.float()], 1)
         aux = None
         if self.layout:
-            pred = aux_predict(self.layout, r[3])
+            pred = aux_answer(self.net, r[3])
             aux = torch.cat([pred[t[0]].float() for t in self.layout], 1)
         return out, aux
 
@@ -645,6 +645,21 @@ class NetEvaluator:
         if self.fast is not None:
             self.fast.refresh()
 
+    def set_network(self, model):
+        """New weights from a loaded network `model`: `set_weights` of its state, unless its readers differ from
+        the evaluator's network's (docs/az.md 36: a reader is part of the trunk's input - a state cannot carry it
+        into a network without one, and `set_weights` refuses such a state): then the evaluator takes `model`
+        itself, on its device, its CUDA graphs rebuilt (a rolling evaluator of a run whose readers were added at
+        its last training)."""
+        from .net import reader_layout
+        if reader_layout(model.config.get('readers')) == reader_layout(self.model.config.get('readers')):
+            return self.set_weights(model.state_dict())
+        self.model = model.to(self.device).eval()
+        if isinstance(self.fast, TokenGraphRunner):
+            self.fast = TokenGraphRunner(self.model)
+        elif self.fast is not None:
+            self.fast = GraphRunner(self.model)
+
     def _check_width(self, x):
         if self.width is not None and x.shape[1] != self.width:
             from .net import EncodingMismatch
@@ -740,8 +755,8 @@ class NetEvaluator:
         margin[:, :seats] = mar.float().cpu().numpy()
         value[np.arange(MAX_SEATS)[None, :] >= n_players[:, None]] = 0.0
         if len(brows):
-            from .net import aux_predict
-            pred = aux_predict(self.aux_layout, raw)
+            from .net import aux_answer
+            pred = aux_answer(self.model, raw)
             aux = np.concatenate([pred[t[0]].float().cpu().numpy() for t in self.aux_layout], 1).astype(np.float32)
         if self.pool is not None:
             with self.lock:
@@ -811,13 +826,25 @@ class NetEvaluator:
         the search's batches (its evaluations never compute the head)."""
         if not self.aux_layout:
             return {}
-        from .net import aux_predict
+        from .net import aux_answer
+        return {k: v.float().cpu().numpy() for k, v in aux_answer(self.model, self._aux_raw(x, n_players)).items()}
+
+    def _aux_raw(self, x, n_players):
         self._check_width(x)
         xt = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).to(self.device)
         nt = torch.from_numpy(np.asarray(n_players, np.int64)).to(self.device)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
-            raw = self.model(xt, nt, aux=True)[3]
-        return {k: v.float().cpu().numpy() for k, v in aux_predict(self.aux_layout, raw).items()}
+            return self.model(xt, nt, aux=True)[3]
+
+    @torch.inference_mode()
+    def reader(self, x, n_players):
+        """The readers' predictions for rows `x` [B, F] (docs/az.md 36) -> {target: float32 numpy [B, width]}
+        (`net.reader_predict`); {} for a network without readers. One forward pass, outside the search's
+        batches (as `aux`)."""
+        if not getattr(self.model, 'reader_specs', None):
+            return {}
+        from .net import reader_predict
+        return {k: v.float().cpu().numpy() for k, v in reader_predict(self.model, self._aux_raw(x, n_players)).items()}
 
     def _graphable(self, opt_off, brows):
         """The batch goes through the CUDA graphs (a conv network's skip batches with root belief
