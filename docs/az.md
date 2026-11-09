@@ -4860,6 +4860,21 @@ shard, checkpoint, optimizer state, Elo file and metric (timings aside) identica
 `reader_next_card`, `reader_detach`; `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy MLP,
 a toy token and a toy token-with-head checkpoint) identical.
 
+**Checks** (tier "opt-in core feature with byte-identical defaults"; desktop 2026-11-09): `cargo test --release
+--workspace` 140 + 3 passed (no Rust change); `pytest tests` (CUDA hidden) 423 passed, 10 skipped, 2 failed under the
+load of this section's measurements running beside it (`test_encoding_guard::test_remote_selfplay_worker_refuses_and_
+the_run_plays_on`: the run took 4 min where it takes 20 s, the refusal not yet logged; `test_remoteplay::test_a_dying_
+worker_gives_its_accepted_games_back`: AGENTS.md's timing caveat) - both pass alone, and `test_remoteplay.py` +
+`test_encoding_guard.py` + `test_multi_remote.py` pass whole (57); with the GPU visible, `test_reader`'s CUDA test
+passes and `test_token_graphs` 9 of 10 (`test_graphs_match_eager_and_follow_new_weights`: 3.7e-5 against its 2e-5
+tolerance, the same on e4779b2: the shared GPU's rounding, not this change). `SKIP_CORE=1 bash tools/smoke_all.sh
+--with-this-core --build-only`: Glass Road Zero, Caverna Zero, Kingdom Builder Zero build against it (3 of 3); MTG
+Zero (`eoe-f7-numbers` at 026ebd4, which pins e4779b2) could not be moved by smoke_all (its scratch worktree's
+`submodule update` cannot fetch the unpushed pin), so by hand: a scratch worktree of 026ebd4 with this core (7e54b79)
+in `third_party/zero-core`, `ZERO_CORE_UNPINNED=1 tools/build_py.sh`, its `pytest tests` 206 passed, 1 skipped, and
+`mtgz.az.run --preset mtg-smoke` 4 iterations, every game finished (config.json gains `reader_detach` only: MTG Zero
+declares no reader).
+
 ### 36.8 Costs
 
 Per position, measured with `tools/reader_measure.py cost` (desktop, 2026-11-09: i9-13900K, 4 torch threads,
