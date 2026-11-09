@@ -4704,3 +4704,163 @@ iterations 2-5 none - a 296-313, b 287-304 - its rate kept at its iteration-1 me
 * **The games build against this core**: `SKIP_CORE=1 SMOKE_TARGET=multi-remote bash tools/smoke_all.sh
   --with-this-core --build-only` GREEN, games: 3 of 3 checked (glassroad-zero, caverna-zero, kingdombuilder-zero; no
   Rust change).
+
+## 36. Readers: a branch that reads declared inputs, predicts an auxiliary target and feeds the trunk (`reader_<target>`; MTG Zero's Edge of Eternities sealed, 2026-11-09)
+
+(Sections 33 and 35 are taken by open branches: `feat/explore2`, `feat/amcts-exploiter`, `feat/quiet-value`.)
+
+### 36.1 Why
+
+MTG Zero moves from the Legacy Delver mirror, where the opponent's decklist was known, to Edge of Eternities
+sealed, where it is not: the network has to predict the opponent's unseen deck, "both as a network head and an
+input, similar to how we architected the hand-reading" (the user, 2026-11-09). Hand-reading today is section 15's
+auxiliary head - an MLP on the trunk's pooled state trained against the true hand - used by the search's weighted
+deals (section 18). That head reads the trunk's OUTPUT, so feeding its prediction back as an input would be circular.
+A reader is a separate branch that reads only declared raw inputs (in MTG: the bags of cards the opponent has shown,
+a few globals), predicts the target, trains like an auxiliary head, and is also fed into the trunk - all in one
+forward pass. The core part is generic: any game may declare one per auxiliary target.
+
+### 36.2 What it does
+
+* **The declaration** (the game package's `readers`, zero/package.py): `{game: [{target, inputs, hidden, enter,
+  belief}, ...]}` - `target` one of the game's auxiliary targets (section 15: its width and loss come from there),
+  `inputs` ranges `[[offset, count], ...]` of the flat feature vector (in input order; each feature once), `hidden`
+  the MLP's width (default 64), `enter` 'trunk' (the default: the prediction is an input of the trunk) or 'none' (an
+  auxiliary output only), `belief` (default false; 36.5). `GamePackage.readers_of(game)` completes and checks them
+  (`net.reader_layout`: the normal form stored in the checkpoint config under `readers`). **A token network's reader
+  reads its flat part**: the bags and the globals, every feature outside the segments (a reader on a segment's floats
+  is refused at build: the CUDA graphs' host copy leaves an absent slot's floats stale, 10.6, and the floats of the
+  tokens are the attention's business). MTG's shown cards arrive as bags, its turn and life totals as globals.
+* **The run setting** `reader_<target>` (one per declared reader, default 0; the toy's `reader_next_card`): 1 = the
+  run's networks have the reader. It needs `aux_<target>_w` > 0 - that weight's loss is what trains it, and only
+  then does self-play record the target (refused at start otherwise). `reader_detach` (default 1, 36.4).
+* **The branch** (zero/net.py `Reader`): an MLP inputs -> hidden -> the target's width (ReLU; its last layer zero, so
+  it first predicts what its loss predicts from zeros: uniform for 'multinomial'), its prediction = the target's
+  `aux_predict` (a softmax for 'multinomial', exp for 'poisson', as is for 'mse'), and with enter 'trunk' a
+  projection width -> the trunk's width at its input point, **zero-initialised**, whose output is added there:
+  `Net` - the first layer's input (`inp(x) + proj(p)`, before its ReLU); `GridNet` - the globals' embedding (which
+  biases the stem, every block and the pooled trunk); `TokenNet` - the global token's input (beside the globals' map
+  and the bags' pools, before its position embedding). Built after every other parameter, the auxiliary head
+  included: a network with a reader initialises the rest exactly as one without (the new run's first network).
+* **One forward pass**: every forward computes the readers (they feed the trunk); `forward(x, n, aux=True)` returns as
+  its fourth output the head's raw outputs followed by each reader's (width W + the readers' widths), so the code that
+  reads the head (`aux_predict`, `AUX.losses` by the layout's columns) is unchanged. `forward_static` (the token
+  network's CUDA graphs and static training) computes them the same way.
+* **Training** (`run.train_model`): each reader's target loss on its own outputs (section 15's losses, the rows with
+  targets, the same masks and windows), times `aux_<target>_w`, added to the loss; recording, windows and shards
+  unchanged. Metrics `train.reader_<target>`, `reader_<target>_hit`, `train.readers` {targets, detach, added}; the
+  non-finite guard checks the reader losses. The optimizer has a third parameter group for the readers (trunk, head,
+  readers).
+* **Beside the pooled-state head**: a run with a reader always has section 15's head too (the head covers every
+  target of the game once any weight is on), and both train against the reader's target with the same weight. They
+  are two estimates of one label: the reader's from the declared inputs alone (a "public prior", cheap, an input of
+  the trunk), the head's from the trunk's pooled state, which reads the reader's prediction among everything else (it
+  can refine it: in MTG, play patterns). Another target (MTG's hand) keeps its head as before.
+
+### 36.3 Off by default; refusals
+
+Every `reader_<target>` 0 (the default): no network has a reader (`make_net` / `build` get no `readers`), the
+forward, the optimizer (`AdamW(model.parameters())`, or the two groups of section 15) and the losses are the code of
+before; config.json gains `reader_<target>` and `reader_detach`. Checked byte for byte (36.6). A reader never
+disappears in silence:
+
+* a checkpoint with a reader in a run that turns it off, or with another reader than the declaration's, is refused at
+  the run's first training (SystemExit: a reader is part of the trunk's input; removing it changes the network);
+* `NetEvaluator.set_weights` refuses a state with a reader into a network without one (and the reverse);
+  `NetEvaluator.set_network(model)` - the rolling, remote-worker and co-training evaluators' call - takes the new
+  network itself (its CUDA graphs rebuilt) when its readers differ, so a rolling run whose reader was just added
+  evaluates with it;
+* distillation from or into a network with readers (`distill.new_student`, `distill.distill`) and the browser export
+  (`zero.webexport`) are refused (not built yet);
+* a remote worker on an older checkout cannot build such a checkpoint (its constructors do not know `readers`): it
+  fails loudly at load, as for any config key it does not know.
+
+### 36.4 The gradient: `reader_detach` (default 1)
+
+With 1 the prediction enters the trunk detached: only the target's loss trains the reader, and the trunk's losses
+train the projection (from zero) and the trunk. With 0 the policy / value / margin losses reach the reader through the
+projection as well. Measured on the toy (36.7: four networks from one seed on the same batches): the detached and
+undetached readers' held-out next_card losses agree to 1e-4 at every point (0.4638 both after 3,000 steps, two
+seeds), and policy / value move within the arms' noise - the trunk's gradient through a projection that starts at zero
+is tiny next to the target's own loss. The default is 1: no evidence for the extra coupling, and a detached reader stays
+an estimate of its target alone (its loss is a calibrated measure, its prediction what a search's belief, 36.5, or a
+determinization may deal from), not a feature the trunk's losses may bend. `reader_detach 0` is the A/B arm should a
+game's evidence differ (MTG's deck: 36.9).
+
+### 36.5 Inference: every path computes it; the search can take its prediction
+
+The reader is part of the network's forward, so every evaluation path computes it with no code of its own: eager
+`NetEvaluator.evaluate` (any `workers`, `max_rows` pieces), the token network's CUDA graphs (`forward_static`; dense,
+sparse and belief-row batches), the conv network's graphs (`_fold` copies the readers), h2h, replays, the league's,
+remote evaluation and remote self-play workers (their checkpoints rebuild it from the config). Where a path cannot,
+it is refused (36.3). `NetEvaluator.reader(x, n)` -> {target: predictions} is the readers' API (as `aux` is the
+head's). **The search's root belief rows** (section 18) and `NetEvaluator.aux` answer the head's prediction by default;
+a reader declared `belief: true` answers its target's columns instead (`net.aux_answer`: the same row of the same
+forward, so a search dealing the opponent's deck by its prediction pays nothing more). With no reader the answer is
+`aux_predict` of the head, as before.
+
+### 36.6 Carry-over and checks
+
+**Carry-over**: `net.add_reader(model, readers, seed)` returns a copy with fresh readers (seeded; the global RNG
+untouched) and every other parameter and buffer exactly the checkpoint's; since a reader's last layer and its
+projection are zero, every output - policy, value, margin, the head's - is unchanged (tested on the three archs,
+equal tensors). The run does it itself: a fork of a run without the reader, `tools/fork_run.py --source <run> --dest
+<fork> --iter K --set reader_next_card=1`, adds it at its first training (logged; `train.readers.added`), keeps the
+AdamW moments of the trunk and the head (the saved groups load, the readers join as a new group) and trains on the
+window as it is (the targets were recorded already). `net.widen` carries a reader across a token layout change (its
+inputs moved to where `token_feature_map` put them: the same floats, the same first-layer columns); a declaration that
+reads MORE inputs after a layout change is refused (36.3), not widened (left for when it is needed).
+
+**Tests** (`tests/test_reader.py`, 20; one CUDA): the declarations' checks; built last (every other tensor equal, the
+outputs equal, the readers' columns zero); `add_reader` exact on the three archs, the RNG untouched, `add_aux` before
+or after it the same network and head, `strip_aux` keeps it; the prediction reaches the trunk and reads only its inputs, belief rows'
+rows; `reader_detach` stops only the reader's trunk gradient; the token network's static forward and a widen across
+test_net_data's layout change; a checkpoint through the encoding guard; the package and the settings; the evaluators
+(the trunk reads it, `reader`, `aux` and belief rows with and without `belief`, `set_weights` refusing, `set_network`);
+the refusals (distillation, web export); toy runs with the reader (tokens; static training, undetached), refused
+without its weight; a rolling fork that adds it (exactly; optimizer moments kept; the rolling evaluator takes the new
+network) and a fork that turns it off (refused); the settings at their defaults byte for byte; the CUDA graphs
+(token dense, sparse, belief rows; conv) answering what eager answers.
+
+### 36.7 Measured on the toy (desktop, 2026-11-09, CPU, other projects' jobs on the machine)
+
+The toy's reader: `next_card` from the round (features 0-5) and the revealed round cards (25-30; the token layout's
+bag 'cards'), hidden 32 - the public information that determines the best prediction (uniform over the next round's
+stage's unrevealed cards). `tools/reader_measure.py learn` on a toy run's shards (8 iterations of 600 games, 16
+simulations, `aux_next_card_w` 0.5; 29,885 training rows, the last iteration's 3,967 held out, 3,209 with a target):
+token networks 64 x 2 from seed 0 and 1 on the same batches (256 rows, lr 1e-3, 3,000 steps), held-out next_card loss
+in nats against the uniform prior ln 6 = 1.792 and the best from public information 0.462:
+
+@@LEARN@@
+
+In the run loop (the same settings with `--reader-next-card 1 --arch tokens`, 8 iterations): the reader's training
+loss 1.655, 1.294, 0.966, 0.761, 0.648, 0.583, 0.560, 0.532 (iterations 1-8, ~60 steps each), the head's 1.248 ->
+0.494. On the toy the trunk reads the same features directly, so the head learns as fast and policy / value gain
+nothing measurable from the reader: the toy proves the mechanism (it learns, it carries over exactly, it changes
+nothing when off), not a strength gain - that is MTG's A/B (36.9).
+
+**Byte identity** against e4779b2 (its own worktree and target dir, `ZERO_INFLIGHT=1`, CPU), the reader settings
+left out and given at their defaults: toy-smoke MLP against `ext:toyheur`, tokens (3 iterations), rolling cq targets +
+`eval_select cq` guard 2 (3), tokens + `aux_next_card_w` 0.5 rolling (3), the Delver line's shape (tokens, rolling,
+cq, guard 4, value_q 0.6, window_cache, train_prefetch, margin_w 0.2, chance_k 2, no random games; 4), and a fork that
+adds the auxiliary head (the optimizer groups' code the readers generalised; each checkout's own fork_run) - every
+shard, checkpoint, optimizer state, Elo file and metric (timings aside) identical, config.json = the base's +
+`reader_next_card`, `reader_detach`; `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy MLP,
+a toy token and a toy token-with-head checkpoint) identical.
+
+### 36.8 Costs
+
+@@COST@@
+
+### 36.9 For MTG Zero (its EoE layout comes later)
+
+To use it MTG Zero declares (1) an auxiliary target for the opponent's unseen deck - in `SearchGame::AUX` /
+`aux_target` (the true state's remaining deck by identity, a count vector: loss 'multinomial', whose total is public)
+and in its package's `aux` (e.g. `{name: 'deck', width: <identities>, loss: 'multinomial'}`); (2) the reader in its
+package's `readers`: `{target: 'deck', inputs: [[<offset>, <count>], ...] of the bags of the opponent's shown cards
+(graveyard, exile, battlefield, revealed) and the globals it needs, hidden: 256-330}` - bags and globals only (its
+token layout's segments are refused); (3) runs with `aux_deck_w` > 0 and `reader_deck` 1 (a fork of a run without it
+gets the reader exactly at its first training), `belief: true` if its search should deal the opponent's library and
+hand from the reader's prediction rather than the head's. Open: a softmax over ~330 identities makes inputs of ~1/330
+each - the projection learns its scale (Adam), but a scaled input (p x width) may train faster; `reader_detach` 0 and
+the reader's width are A/B arms; a layout change that widens the reader's inputs needs a reader widen (36.6).
