@@ -4780,8 +4780,9 @@ disappears in silence:
 With 1 the prediction enters the trunk detached: only the target's loss trains the reader, and the trunk's losses
 train the projection (from zero) and the trunk. With 0 the policy / value / margin losses reach the reader through the
 projection as well. Measured on the toy (36.7: four networks from one seed on the same batches): the detached and
-undetached readers' held-out next_card losses agree to 1e-4 at every point (0.4638 both after 3,000 steps, two
-seeds), and policy / value move within the arms' noise - the trunk's gradient through a projection that starts at zero
+undetached readers' held-out next_card losses agree within 1e-3 at every point (after 3,000 steps 0.4638 both with
+seed 0, 0.4654 both with seed 1; a reader not fed into the trunk at all the same), and policy / value differ by less
+than between the seeds - the trunk's gradient through a projection that starts at zero
 is tiny next to the target's own loss. The default is 1: no evidence for the extra coupling, and a detached reader stays
 an estimate of its target alone (its loss is a calibrated measure, its prediction what a search's belief, 36.5, or a
 determinization may deal from), not a feature the trunk's losses may bend. `reader_detach 0` is the A/B arm should a
@@ -4831,7 +4832,18 @@ simulations, `aux_next_card_w` 0.5; 29,885 training rows, the last iteration's 3
 token networks 64 x 2 from seed 0 and 1 on the same batches (256 rows, lr 1e-3, 3,000 steps), held-out next_card loss
 in nats against the uniform prior ln 6 = 1.792 and the best from public information 0.462:
 
-@@LEARN@@
+| arm (seed 0 / seed 1) | reader, 500 steps | reader, 1,000 | reader, 3,000 | head, 3,000 | policy, 1,000 | value, 1,000 | policy, 3,000 | value, 3,000 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| head only (no reader) | - | - | - | 0.477 / 0.491 | 1.591 / 1.587 | 0.573 / 0.589 | 1.588 / 1.574 | 0.609 / 0.624 |
+| reader, detached (`reader_detach` 1) | 0.513 / 0.508 | 0.474 / 0.474 | 0.464 / 0.465 | 0.470 / 0.480 | 1.590 / 1.588 | 0.572 / 0.584 | 1.586 / 1.578 | 0.615 / 0.635 |
+| reader, not detached (0) | 0.513 / 0.509 | 0.474 / 0.474 | 0.464 / 0.465 | 0.479 / 0.478 | 1.591 / 1.587 | 0.573 / 0.585 | 1.590 / 1.574 | 0.616 / 0.618 |
+| reader, enter 'none' (not fed) | 0.513 / 0.508 | 0.474 / 0.474 | 0.464 / 0.465 | 0.475 / 0.485 | 1.590 / 1.587 | 0.575 / 0.587 | 1.586 / 1.582 | 0.608 / 0.629 |
+
+The reader learns the target: 1.792 (uniform, its first prediction) -> 0.464 / 0.465, within 0.003 of the best
+any predictor can do from public information (0.462). Detached, not detached and not fed at all, its loss agrees to
+1e-3 at every point: the trunk's losses barely reach it through a projection that starts at zero. The value loss
+rises from 1,000 to 3,000 steps in every arm (the 30k-row window overfits), and policy / value differ between the arms
+by less than between the seeds.
 
 In the run loop (the same settings with `--reader-next-card 1 --arch tokens`, 8 iterations): the reader's training
 loss 1.655, 1.294, 0.966, 0.761, 0.648, 0.583, 0.560, 0.532 (iterations 1-8, ~60 steps each), the head's 1.248 ->
@@ -4850,7 +4862,31 @@ a toy token and a toy token-with-head checkpoint) identical.
 
 ### 36.8 Costs
 
-@@COST@@
+Per position, measured with `tools/reader_measure.py cost` (desktop, 2026-11-09: i9-13900K, 4 torch threads,
+batch 256; RTX 5090 eager, shared with other projects' runs):
+
+* **The toy's reader** (12 inputs -> 32 -> 6, projected into the global token): 1,344 multiply-adds, 0.02% of the
+  toy's 128 x 4 token network (6.90M in its linear layers) and 0.1% of a 64 x 2 one; wall time within the noise (128 x
+  4: 92.0 -> 90.6 us a position on the CPU, 44.3 -> 43.7 us eager on the GPU).
+* **MTG Zero's planned size** (1,320 bag inputs = 4 x 330 identities -> hidden -> 330, projected into d = 128), against
+  the 128 x 4 token network's 21.9M multiply-adds and its 308 us a leaf on this CPU (3,250 leaves/s at 1 x 3 threads,
+  batch 192: section 10.5):
+
+| hidden | multiply-adds | share of 21.9M | parameters (share of the network's 1.55M) | CPU us / position | GPU eager us / position |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 253,440 | 1.2% | 254,026 (16%) | 4.0 | 0.6 |
+| 256 | 464,640 | 2.1% | 465,354 (30%) | 6.0 | 0.9 |
+| 330 | 586,740 | 2.7% | 587,528 (38%) | 7.9 | 0.6 |
+
+  So hidden 256 meets the ~2% target (CPU 6.0 us against 308 us a leaf: 2.0%). The parameters' share is large because
+  the reader runs once a position while the trunk's weights run once a token (~17 a Delver position): the checkpoint
+  and the optimizer state grow by that share, the arithmetic does not. On the GPU the reader is 5 kernels (a gather,
+  two linear layers, a softmax, the projection) inside the CUDA graph of a forward of hundreds; eager, it is under 1 us
+  a position.
+* **Training**: the reader's forward and backward in each step (the same share of the step's arithmetic) and its
+  target's loss (a softmax over the width); the shards and windows are unchanged (the target is recorded for
+  `aux_<target>_w` anyway).
+* **Off**: nothing (the code of before).
 
 ### 36.9 For MTG Zero (its EoE layout comes later)
 
