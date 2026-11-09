@@ -606,12 +606,12 @@ class PyDriver:
     def _finish(self, slot):
         g = slot.game
         n = slot.n
-        over = g.over
+        over = g.over and not g.aborted     # (an aborted game has no result: as unfinished)
         if over and g.deferred:
             raise RuntimeError(f'game {slot.gid}: a deferred terminal (the Python reference driver does not park games; '
                                f'the Rust driver does, docs/search.md 2.8)')
         res = list(g.result()) if over else [1.0 / n] * n
-        self.results.append({'gid': slot.gid, 'n': n, 'over': over, 'result': res, 'scores': g.scores(),
+        self.results.append({'gid': slot.gid, 'n': n, 'over': over, 'aborted': bool(g.aborted), 'result': res, 'scores': g.scores(),
                              'steps': slot.steps, 'decisions': slot.decisions, 'ext_moves': 0,
                              'rounds': g.rounds, 'samples': len(slot.records) if self.record and over else 0})
         if self.record and over and slot.records:

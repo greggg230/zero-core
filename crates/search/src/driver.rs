@@ -700,6 +700,9 @@ pub struct GameResult {
     pub gid: u32,
     pub n: usize,
     pub over: bool,
+    /// The game ended without a result (`SearchGame::aborted`): `over` is false and it emitted
+    /// no samples.
+    pub aborted: bool,
     pub result: Vec<f32>,
     pub scores: Vec<f32>,
     pub steps: u64,

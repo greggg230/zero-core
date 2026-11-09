@@ -1206,9 +1206,10 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
 fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>, n_: &mut Tally) -> Result<(), String> {
     let cfg = &sh.cfg;
     let g = slot.game.take().unwrap();
-    // (a resigned game is over: its result is the resignation's, docs/search.md 3.14)
+    // (a resigned game is over: its result is the resignation's, docs/search.md 3.14; an aborted
+    // game has no result: not over, so it emits no samples, `SearchGame::aborted`)
     let resign = slot.resign.take();
-    let over = g.to_move().is_none() || resign.as_ref().is_some_and(|r| r.resigned);
+    let over = (g.to_move().is_none() && !g.aborted()) || resign.as_ref().is_some_and(|r| r.resigned);
     let gid = slot.gid;
     let start = slot.start_ix.take();
     let fork = slot.fork.take();
@@ -1347,6 +1348,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         gid: d.gid,
         n,
         over,
+        aborted: g.to_move().is_none() && g.aborted(),
         result: res[..n].to_vec(),
         scores: (0..n).map(|i| g.score(i)).collect(),
         steps: d.steps,

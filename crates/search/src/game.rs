@@ -114,6 +114,15 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn deferred(&self) -> bool {
         false
     }
+    /// The game is over (`to_move()` None) **without a result**: it ended where the game can't
+    /// go on exactly (MTG Zero: a number past its exact range, ENGINE.md 100.7). Opt-in, default
+    /// never. Such a game is neither a win, a loss nor a draw: the driver ends it as not over
+    /// (`GameResult::over` false, `aborted` true: no training samples, as a game cut at
+    /// `max_steps`), and a search walk that reaches it treats it as a leaf the network evaluates
+    /// (as a deferred terminal before `resolve`); nothing calls `result()` or `margin()` on it.
+    fn aborted(&self) -> bool {
+        false
+    }
     /// What must be played to resolve the deferred terminal (JSON; by convention
     /// `{"episodes": [<a spec of the resolver game>, ...], ...}`, read by the run's game
     /// package, docs/az.md 11). Called once, when the driver parks the game.

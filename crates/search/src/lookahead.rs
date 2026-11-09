@@ -946,7 +946,8 @@ impl<G: SearchGame> Look<G> {
         for m in pending {
             let (over, deferred, reached, minor, plies) = {
                 let g = self.game(m)?;
-                (g.to_move().is_none(), g.deferred(), self.reached(g), g.minor_decision(), self.mems[m as usize].plies as u32)
+                // (an aborted game has no result: valued by the network, as a deferred terminal)
+                (g.to_move().is_none(), g.deferred() || g.aborted(), self.reached(g), g.minor_decision(), self.mems[m as usize].plies as u32)
             };
             if over {
                 self.leaf(m, End::Terminal);

@@ -50,6 +50,8 @@ pub trait DynGame: Send + Sync {
     /// Deferred results and teams (`SearchGame::deferred`, `deferred_payload`, `resolve`,
     /// `team_size`).
     fn deferred(&self) -> bool;
+    /// Over without a result (`SearchGame::aborted`).
+    fn aborted(&self) -> bool;
     fn deferred_payload(&self) -> Result<String, String>;
     fn resolve(&mut self, results: &str) -> Result<(), String>;
     fn team_size(&self) -> usize;
@@ -129,6 +131,9 @@ impl<G: SearchGame> DynGame for G {
     }
     fn deferred(&self) -> bool {
         SearchGame::to_move(self).is_none() && SearchGame::deferred(self)
+    }
+    fn aborted(&self) -> bool {
+        SearchGame::to_move(self).is_none() && SearchGame::aborted(self)
     }
     fn deferred_payload(&self) -> Result<String, String> {
         SearchGame::deferred_payload(self)

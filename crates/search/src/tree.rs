@@ -1151,9 +1151,10 @@ impl<G: SearchGame> Tree<G> {
                 s.nouts += 1;
             }
             let Some(p) = g.to_move() else {
-                if g.deferred() {
+                if g.deferred() || g.aborted() {
                     // a deferred terminal: a no-option node of the viewer, evaluated once by the
-                    // network, its stored value backed up on every later visit (module docs)
+                    // network, its stored value backed up on every later visit (module docs); an
+                    // aborted game (no result, `SearchGame::aborted`) is evaluated the same way
                     let v = self.viewer;
                     let h = sig_hash(&sc.key, v, &[]);
                     let k = if self.merge.is_some() {

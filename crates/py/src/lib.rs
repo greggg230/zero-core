@@ -455,6 +455,11 @@ impl PyGame {
     fn deferred(&self) -> bool {
         self.g.deferred()
     }
+    /// Over without a result (`SearchGame::aborted`): no result, margin or samples.
+    #[getter]
+    fn aborted(&self) -> bool {
+        self.g.aborted()
+    }
     /// What must be played to resolve the deferred terminal (JSON string).
     fn deferred_payload(&self) -> PyResult<String> {
         self.g.deferred_payload().map_err(verr)
@@ -916,6 +921,7 @@ impl PySearchDriver {
             d.set_item("gid", r.gid)?;
             d.set_item("n", r.n)?;
             d.set_item("over", r.over)?;
+            d.set_item("aborted", r.aborted)?;
             d.set_item("result", r.result)?;
             d.set_item("scores", r.scores)?;
             d.set_item("steps", r.steps)?;

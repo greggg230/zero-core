@@ -452,8 +452,9 @@ def simulate(tree, rng, c_puct, chance_k=0, margin_w=0.0):
         key, legal = transition(g, node.acts[i], forced)
         if key and forced is None:
             edge.outs.append(key)
-        if g.over and g.deferred:
-            # a deferred terminal: evaluated once by the network, then its value backed up
+        if g.over and (g.deferred or g.aborted):
+            # a deferred terminal: evaluated once by the network, then its value backed up (an
+            # aborted game, no result, the same: tree.rs)
             sk = (key, tree.viewer, ())
             child = edge.kids.get(sk)
             if child is None:

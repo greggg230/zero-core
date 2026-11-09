@@ -3779,3 +3779,68 @@ fn rolling_phases_of<G: SearchGame>(d: &mut Driver<G>, ans: &RowEval, rows: &mut
     }
     total
 }
+
+/// `SearchGame::aborted`: the toy whose every end is aborted (no result). Nothing may call
+/// `result()` or `margin()` on it (they panic): the driver ends each game as not over with no
+/// samples, and the search evaluates an aborted terminal like a deferred one, by the network.
+#[derive(Clone)]
+struct AbortToy(ToyGame);
+
+impl SearchGame for AbortToy {
+    type Spec = <ToyGame as SearchGame>::Spec;
+    const NAME: &'static str = "abort_toy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    fn parse_spec(json: &str) -> Result<Self::Spec, String> {
+        ToyGame::parse_spec(json)
+    }
+    fn new_game(spec: &Self::Spec, players: usize, seed: u64) -> Result<Self, String> {
+        ToyGame::new_game(spec, players, seed).map(AbortToy)
+    }
+    fn num_players(&self) -> usize {
+        self.0.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        panic!("result() of an aborted game")
+    }
+    fn margin(&self, _seat: usize) -> f32 {
+        panic!("margin() of an aborted game")
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn aborted(&self) -> bool {
+        self.0.to_move().is_none()
+    }
+}
+
+#[test]
+fn aborted_games_end_unfinished_without_samples_and_search_never_reads_their_result() {
+    let mut d = Driver::<AbortToy>::new(cfg(vec![nn(0, 16, true)], vec![vec![0, 0]; 12], &[("m", KeyKind::Nn)])).unwrap();
+    let (res, smp) = run(&mut d);
+    assert_eq!(res.len(), 12);
+    assert!(res.iter().all(|r| r.aborted && !r.over && r.samples == 0), "{res:?}");
+    assert!(smp.is_empty());
+    assert!(d.finished());
+    // (the default: a toy game that ends is over, not aborted)
+    let mut d = Driver::<ToyGame>::new(cfg(vec![nn(0, 16, true)], vec![vec![0, 0]; 4], &[("m", KeyKind::Nn)])).unwrap();
+    let (res, smp) = run(&mut d);
+    assert!(res.iter().all(|r| r.over && !r.aborted) && !smp.is_empty());
+}
