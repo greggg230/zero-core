@@ -28,6 +28,14 @@ Heads:
            without the head (an older checkpoint) a fresh one, everything else copied exactly
            (its policy / value / margin outputs unchanged), `strip_aux` removes it. The encoding
            guard ignores it: the head reads no input.
+  readers: optional (config key `readers`, the game package's `readers`; docs/az.md 36): per
+           reader, a small MLP from declared ranges of the features (a token network: its bags and
+           globals) to one auxiliary target's raw outputs, trained by that target's loss; its
+           prediction is also an input of the trunk, through a projection that starts at zero
+           (`Net`: the first layer's input; `GridNet`: the globals' embedding; `TokenNet`: the global
+           token's input). Every forward computes them (they feed the trunk); `forward(..., aux=True)`
+           appends their raw outputs after the head's. `add_reader` gives a network without readers
+           fresh ones, everything else copied exactly (all its outputs unchanged).
 
 Checkpoints (`save`, atomic): {config, state, extra}; `load` rebuilds the network from the
 config; `widen` maps a checkpoint onto a larger feature / action space (new inputs get zero
@@ -89,28 +97,142 @@ def _with_aux(model, dim, head, aux):
         model.aux_head = _aux_head(dim, head, model.aux_layout)
 
 
-def _aux_out(model, z, rows=None):
+def _aux_out(model, z, rows=None, rraw=None):
     """The auxiliary head on the pooled states `z` (`rows`: of those rows only, an index tensor -
-    the search's root belief rows, docs/search.md 3.8)."""
-    if not model.aux_layout:
+    the search's root belief rows, docs/search.md 3.8), followed by the readers' raw outputs `rraw`
+    (docs/az.md 36; None: no readers)."""
+    if not model.aux_layout and rraw is None:
         raise ValueError('forward(aux=True): the network has no auxiliary head (net.add_aux)')
-    return model.aux_head(z if rows is None else z[rows])
+    out = model.aux_head(z if rows is None else z[rows]) if model.aux_layout else None
+    if rraw is None:
+        return out
+    rr = rraw if rows is None else rraw[rows]
+    return rr if out is None else torch.cat([out, rr.to(out.dtype)], 1)
+
+
+def _predict(loss, r):
+    """A target's predictions from its raw outputs r [B, w] (float) by its loss (`aux_predict`)."""
+    if loss == 'multinomial':
+        return torch.softmax(r, 1)
+    if loss == 'poisson':
+        return torch.exp(r.clamp(max=30.0))
+    return r
 
 
 def aux_predict(layout, raw):
-    """Raw auxiliary outputs [B, W] (`forward(..., aux=True)`'s fourth) -> {name: predictions [B, w]}
-    by each target's loss: 'multinomial' the softmax over its segment (a distribution: MTG Zero's
-    belief, x the hand size = expected counts), 'poisson' exp (rates = expected counts), 'mse' raw."""
+    """Raw auxiliary outputs [B, >= W] (`forward(..., aux=True)`'s fourth: the head's W columns first)
+    -> {name: predictions [B, w]} by each target's loss: 'multinomial' the softmax over its segment (a
+    distribution: MTG Zero's belief, x the hand size = expected counts), 'poisson' exp (rates =
+    expected counts), 'mse' raw."""
     out, k = {}, 0
     for name, w, loss in aux_layout(layout):
-        r = raw[:, k:k + w].float()
-        if loss == 'multinomial':
-            out[name] = torch.softmax(r, 1)
-        elif loss == 'poisson':
-            out[name] = torch.exp(r.clamp(max=30.0))
-        else:
-            out[name] = r
+        out[name] = _predict(loss, raw[:, k:k + w].float())
         k += w
+    return out
+
+
+# ---------------------------------------------------------------- readers (docs/az.md 36)
+READER_ENTER = ('trunk', 'none')
+
+
+def reader_layout(readers):
+    """Readers ([{target, width, loss, inputs, hidden, enter, belief}, ...]: a config's `readers`, or the
+    game package's declarations completed with their targets' width and loss, `GamePackage.readers_of`;
+    None = none) -> their normal form (stored in the checkpoint config): [{'target', 'width', 'loss',
+    'inputs': [[offset, count], ...], 'hidden', 'enter', 'belief'}, ...], checked (targets distinct, a
+    loss of AUX_LOSSES, inputs non-empty and without a feature twice, enter of READER_ENTER)."""
+    out = []
+    for r in readers or []:
+        s = {'target': str(r['target']), 'width': int(r['width']), 'loss': str(r['loss']),
+             'inputs': [[int(o), int(k)] for o, k in r['inputs']], 'hidden': int(r.get('hidden', 64)),
+             'enter': str(r.get('enter', 'trunk')), 'belief': bool(r.get('belief', False))}
+        idx = [o + i for o, k in s['inputs'] for i in range(k)]
+        bad = (s['width'] < 1 or s['loss'] not in AUX_LOSSES or s['hidden'] < 1 or s['enter'] not in READER_ENTER
+               or not idx or min(idx) < 0 or any(k < 1 for _, k in s['inputs']) or len(set(idx)) != len(idx)
+               or any(o['target'] == s['target'] for o in out))
+        if bad:
+            raise ValueError(f'reader {r!r}: a target of its own, width >= 1, a loss of {AUX_LOSSES}, inputs [[offset, '
+                             f'count >= 1], ...] reading each feature once, hidden >= 1, enter of {READER_ENTER}')
+        out.append(s)
+    return out
+
+
+def reader_index(spec):
+    """The feature indexes a reader reads, in its input order."""
+    return [o + i for o, k in spec['inputs'] for i in range(k)]
+
+
+class Reader(nn.Module):
+    """One reader (docs/az.md 36): an MLP from the features it declares (`spec['inputs']`) to its
+    target's raw outputs, its last layer zero (it predicts what the target's loss predicts from zeros:
+    uniform for 'multinomial'); with enter 'trunk' its prediction (`_predict`) goes into the trunk's
+    input point through `proj` (width -> the trunk's width there), zero: a network that gains a reader
+    computes what it computed before."""
+
+    def __init__(self, spec, features, d_enter):
+        super().__init__()
+        idx = reader_index(spec)
+        if max(idx) >= features:
+            raise ValueError(f'reader {spec["target"]}: inputs up to feature {max(idx)}, the network has {features}')
+        self.spec = spec
+        self.register_buffer('idx', torch.tensor(idx, dtype=torch.long), persistent=False)
+        h = spec['hidden']
+        self.mlp = nn.Sequential(nn.Linear(len(idx), h), nn.ReLU(), nn.Linear(h, spec['width']))
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
+        self.proj = None
+        if spec['enter'] == 'trunk':
+            self.proj = nn.Linear(spec['width'], d_enter)
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+
+
+def _with_readers(model, features, d_enter, readers):
+    """Give `model` its readers (config 'readers') when `readers` names any (built after every other
+    parameter, the auxiliary head included). `model.reader_detach` (not saved: training only, run
+    setting reader_detach): the prediction enters the trunk detached, so only its target's auxiliary
+    loss trains the reader (docs/az.md 36)."""
+    model.reader_specs = reader_layout(readers)
+    model.reader_detach = True
+    model.readers = None
+    if model.reader_specs:
+        model.config['readers'] = model.reader_specs
+        model.readers = nn.ModuleList(Reader(s, features, d_enter) for s in model.reader_specs)
+
+
+def _read(model, x):
+    """The readers on rows x [B, features] -> (their raw outputs [B, sum of widths] in reader order,
+    what they add to the trunk's input point [B, d_enter] or None)."""
+    raws, entry = [], None
+    for r in model.readers:
+        raw = r.mlp(x.index_select(1, r.idx))
+        raws.append(raw)
+        if r.proj is not None:
+            p = _predict(r.spec['loss'], raw.float())
+            e = r.proj(p.detach() if model.reader_detach else p)
+            entry = e if entry is None else entry + e
+    return torch.cat(raws, 1) if len(raws) > 1 else raws[0], entry
+
+
+def reader_predict(model, raw):
+    """{target: predictions [B, w]} of `model`'s readers from `forward(..., aux=True)`'s fourth output (the
+    readers' columns follow the head's W)."""
+    k, out = sum(w for _, w, _ in (getattr(model, 'aux_layout', None) or [])), {}
+    for s in getattr(model, 'reader_specs', None) or []:
+        out[s['target']] = _predict(s['loss'], raw[:, k:k + s['width']].float())
+        k += s['width']
+    return out
+
+
+def aux_answer(model, raw):
+    """{name: predictions [B, w]} of `model`'s auxiliary outputs `raw` (`forward(..., aux=True)`'s fourth) in
+    its head's layout - what the search's root belief rows and `NetEvaluator.aux` answer: the head's
+    (`aux_predict`), except that a target whose reader is declared `belief` takes the reader's (docs/az.md
+    36). A network without readers: `aux_predict` of its head."""
+    out = aux_predict(model.aux_layout, raw)
+    for s in getattr(model, 'reader_specs', None) or []:
+        if s['belief'] and s['target'] in out:
+            out[s['target']] = reader_predict(model, raw)[s['target']]
     return out
 
 
@@ -126,7 +248,8 @@ class Block(nn.Module):
 
 
 class Net(nn.Module):
-    def __init__(self, features, actions, hidden=256, blocks=4, seats=MAX_SEATS, game='toy', head=128, aux=None):
+    def __init__(self, features, actions, hidden=256, blocks=4, seats=MAX_SEATS, game='toy', head=128, aux=None,
+                 readers=None):
         super().__init__()
         self.config = {'features': features, 'actions': actions, 'hidden': hidden, 'blocks': blocks,
                        'seats': seats, 'game': game, 'head': head}
@@ -139,20 +262,29 @@ class Net(nn.Module):
         self.val = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
         _with_aux(self, hidden, head, aux)
+        # readers (docs/az.md 36): their predictions are added to the first layer's input
+        _with_readers(self, features, hidden, readers)
 
     def forward(self, x, n_players, aux=False, aux_rows=None):
         """x [B, >= features] (a narrower network reads a prefix: the evaluator refuses that
         unless told otherwise, docs/az.md 10.4), n_players [B] -> policy logits [B, actions],
         value logits [B, seats] (absent seats -1e9), margin [B, seats] (+ with `aux` the raw
-        auxiliary outputs [B, aux width]; `aux_rows`, an index tensor: of those rows only)."""
-        h = F.relu(self.inp(x[:, :self.features]))
+        auxiliary outputs [B, aux width (+ the readers' widths)]; `aux_rows`, an index tensor: of
+        those rows only)."""
+        x = x[:, :self.features]
+        h, rraw = self.inp(x), None
+        if self.readers is not None:
+            rraw, e = _read(self, x)
+            if e is not None:
+                h = h + e
+        h = F.relu(h)
         for b in self.blocks:
             h = b(h)
         h = F.relu(self.ln(h))
         present = torch.arange(self.seats, device=x.device)[None, :] < n_players[:, None]
         vlog = self.val(h).masked_fill(~present, -1e9)
         if aux:
-            return self.pol(h), vlog, self.mar(h), _aux_out(self, h, aux_rows)
+            return self.pol(h), vlog, self.mar(h), _aux_out(self, h, aux_rows, rraw)
         return self.pol(h), vlog, self.mar(h)
 
     def n_params(self):
@@ -193,7 +325,7 @@ class GridNet(nn.Module):
     Every feature outside the plane blocks is a global."""
 
     def __init__(self, features, actions, grid, ch=64, blocks=6, seats=MAX_SEATS, game='toy', head=128, ghid=128,
-                 arch='grid', aux=None):
+                 arch='grid', aux=None, readers=None):
         super().__init__()
         grid = grid_spec(grid)
         segs = grid['segments']
@@ -230,6 +362,9 @@ class GridNet(nn.Module):
         self.val = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, seats))
         _with_aux(self, 256, head, aux)
+        # readers (docs/az.md 36): their predictions are added to the globals' embedding (which biases
+        # the stem, every block and the pooled trunk)
+        _with_readers(self, features, ghid, readers)
 
     def forward(self, x, n_players, aux=False, aux_rows=None):
         """As `Net.forward`."""
@@ -242,6 +377,11 @@ class GridNet(nn.Module):
         else:
             p = x.index_select(1, self.pidx).reshape(B, self.P, self.H, self.W)
             g = self.g(x.index_select(1, self.gidx))
+        rraw = None
+        if self.readers is not None:
+            rraw, ent = _read(self, x)
+            if ent is not None:
+                g = g + ent
         if self.par.shape[1]:
             p = torch.cat([p, self.par.expand(B, -1, -1, -1)], 1)
         if getattr(self, 'channels_last', False):        # infer.GraphRunner's folded copy
@@ -256,7 +396,7 @@ class GridNet(nn.Module):
         present = torch.arange(self.seats, device=x.device)[None, :] < n_players[:, None]
         vlog = self.val(e).masked_fill(~present, -1e9)
         if aux:
-            return pol, vlog, self.mar(e), _aux_out(self, e, aux_rows)
+            return pol, vlog, self.mar(e), _aux_out(self, e, aux_rows, rraw)
         return pol, vlog, self.mar(e)
 
     def n_params(self):
@@ -416,7 +556,7 @@ class TokenNet(nn.Module):
     """
 
     def __init__(self, features, actions, layout, d=128, layers=3, heads=4, ff=256, seats=MAX_SEATS, game='toy',
-                 head=128, arch='tokens', aux=None):
+                 head=128, arch='tokens', aux=None, readers=None):
         super().__init__()
         lay = tokens_layout(layout, features, actions)
         self.config = {'arch': 'tokens', 'features': features, 'actions': actions, 'layout': lay, 'd': d,
@@ -488,6 +628,18 @@ class TokenNet(nn.Module):
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
         _with_aux(self, 2 * d, head, aux)
+        # readers (docs/az.md 36): they read the flat part of the features - the bags and the globals,
+        # every feature outside the segments (what the CUDA graphs' host copy always copies) - and their
+        # predictions are added to the global token's input
+        in_seg = set()
+        for s in self.segs:
+            in_seg.update(range(s['offset'], s['offset'] + s['count'] * s['width']))
+        for s in reader_layout(readers):
+            seg = sorted(set(reader_index(s)) & in_seg)
+            if seg:
+                raise ValueError(f'reader {s["target"]}: a token network\'s reader reads its bags and globals (the '
+                                 f'features outside the segments), not feature {seg[0]} of a segment')
+        _with_readers(self, features, d, readers)
 
     def _identity(self, sl, idspec):
         """Identity index [N] of slot rows [N, width] from their one-hot digits (vocab = none)."""
@@ -501,10 +653,10 @@ class TokenNet(nn.Module):
             at += r
         return torch.where(ok & (idx < self.vocab), idx, torch.full_like(idx, self.vocab))
 
-    def _global(self, x):
+    def _global(self, x, entry=None):
         """The global token's input [B, d] (before its position embedding): the globals' map plus
         the bags' (each bag pooled as the count-weighted sum of the identity embeddings and its
-        total)."""
+        total), plus the readers' `entry` (`_read`, docs/az.md 36; None: none)."""
         B = x.shape[0]
         g = self.g(x.index_select(1, self.gidx))
         if self.bag is not None:
@@ -514,13 +666,15 @@ class TokenNet(nn.Module):
                 c = x[:, o:o + k * w].reshape(B, k, w)
                 pools.append(torch.cat([c @ self.emb.weight[:w], c.sum(-1, keepdim=True)], -1))
             g = g + self.bag(torch.cat(pools, 1).flatten(1))
+        if entry is not None:
+            g = g + entry
         return g
 
-    def pack(self, x, ident=False):
+    def pack(self, x, ident=False, entry=None):
         """The packed tokens: (h [B, T, d] (row b's n[b] tokens first, in layout order; the
         global token at 0), n [B], full [B, T] = each packed token's position in the full token
         axis (0 = global, then the segments' slots)); with `ident`, also each packed token's
-        identity [B, T] (vocab: none)."""
+        identity [B, T] (vocab: none). `entry`: the readers' (`_global`)."""
         B, dev = x.shape[0], x.device
         segs, pres = [], [torch.ones(B, 1, dtype=torch.bool, device=dev)]
         for s in self.segs:
@@ -534,7 +688,7 @@ class TokenNet(nn.Module):
         T = int(n.max())
         cpos = pres.long().cumsum(1) - 1                             # packed index of a present token
         full = torch.zeros(B, T, dtype=torch.long, device=dev)
-        g = self._global(x)
+        g = self._global(x, entry)
         h = torch.cat([(g + self.pos[0])[:, None], g.new_zeros(B, T - 1, self.d)], 1)
         idt = torch.full((B, T), self.vocab, dtype=torch.long, device=dev) if ident else None
         start = 1
@@ -580,20 +734,23 @@ class TokenNet(nn.Module):
         lg = self.ptr(F.gelu(self.pk(hc) + self.pq(zc)[:, None])).gather(2, cols.clamp(min=0))
         return zc, pc.scatter(1, acts.flatten(1), lg.flatten(1))
 
-    def _heads(self, z, pol, n_players, aux, aux_rows):
+    def _heads(self, z, pol, n_players, aux, aux_rows, rraw=None):
         present = torch.arange(self.seats, device=z.device)[None, :] < n_players[:, None]
         vlog = self.val(z).masked_fill(~present, -1e9)
         if aux:
-            return pol[:, :self.actions], vlog, self.mar(z), _aux_out(self, z, aux_rows)
+            return pol[:, :self.actions], vlog, self.mar(z), _aux_out(self, z, aux_rows, rraw)
         return pol[:, :self.actions], vlog, self.mar(z)
 
     def forward(self, x, n_players, aux=False, aux_rows=None):
         """As `Net.forward`."""
         x = x[:, :self.features]
+        rraw = ent = None
+        if self.readers is not None:
+            rraw, ent = _read(self, x)
         if self.n_id:
-            h, n, full, idt = self.pack(x, ident=True)
+            h, n, full, idt = self.pack(x, ident=True, entry=ent)
         else:
-            h, n, full = self.pack(x)
+            h, n, full = self.pack(x, entry=ent)
         B, T, D = h.shape
         dev = x.device
         rows = torch.argsort(n, stable=True) if B > self.chunk else torch.arange(B, device=dev)
@@ -606,7 +763,7 @@ class TokenNet(nn.Module):
             zc, pc = self._trunk(h[r, :Tc], nr, full[r, :Tc], idt[r, :Tc] if self.n_id else None)
             z = z.index_copy(0, r, zc)
             pol = pol.index_copy(0, r, pc)
-        return self._heads(z, pol, n_players, aux, aux_rows)
+        return self._heads(z, pol, n_players, aux, aux_rows, rraw)
 
     # ---- static shapes (CUDA graphs: infer.TokenGraphRunner, docs/az.md 10.6)
     def present_index(self):
@@ -671,7 +828,10 @@ class TokenNet(nn.Module):
         (the kernels' blocking: float32 rounding)."""
         x = x[:, :self.features]
         B = x.shape[0]
-        g = self._global(x)
+        rraw = ent = None
+        if self.readers is not None:
+            rraw, ent = _read(self, x)
+        g = self._global(x, ent)
         toks = [(g + self.pos[0])[:, None]]
         ids = [torch.full((B, 1), self.vocab, dtype=torch.long, device=x.device)] if self.n_id else None
         ident = self._static_identities(x)
@@ -692,7 +852,7 @@ class TokenNet(nn.Module):
         h = torch.cat(toks, 1).gather(1, full[..., None].expand(-1, -1, self.d))
         idt = torch.cat(ids, 1).gather(1, full) if ids is not None else None
         z, pol = self._trunk(h, ntok, full, idt)
-        return self._heads(z, pol, n_players, aux, None)
+        return self._heads(z, pol, n_players, aux, None, rraw)
 
     def n_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -742,6 +902,30 @@ def strip_aux(model):
         return model
     new = build({k: v for k, v in model.config.items() if k != 'aux'})
     new.load_state_dict({k: v for k, v in model.state_dict().items() if not k.startswith('aux_')})
+    dev = next(model.parameters()).device
+    return new.to(dev).train(model.training)
+
+
+def add_reader(model, readers, seed=0):
+    """`model` with the readers `readers` (`reader_layout`, docs/az.md 36): a network without readers (an
+    older checkpoint) -> a copy with every other parameter and buffer exactly as they were and fresh readers
+    (initialised from `seed`, the global torch RNG untouched; each one's last layer and its projection into
+    the trunk zero), so its policy / value / margin / auxiliary-head outputs are unchanged. A network with
+    those readers already: `model` itself; with other ones: ValueError (a reader is part of the trunk's
+    input: removing or changing one changes the network)."""
+    readers = reader_layout(readers)
+    have = reader_layout(model.config.get('readers'))
+    if have == readers:
+        return model
+    if have or not readers:
+        raise ValueError(f'add_reader: the network has the readers {have}, wanted {readers}')
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        new = build(dict(model.config, readers=readers))
+    missing, unexpected = new.load_state_dict(model.state_dict(), strict=False)
+    if unexpected or not missing or any(not k.startswith('readers.') for k in missing):
+        raise RuntimeError(f'add_reader: state mismatch (missing {missing}, unexpected {unexpected})')
+    new.reader_detach = getattr(model, 'reader_detach', True)
     dev = next(model.parameters()).device
     return new.to(dev).train(model.training)
 
@@ -971,12 +1155,15 @@ def _grid_index(cfg):
     return planes, [i for i in range(cfg['features']) if i not in inplane]
 
 
-def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0, aux=None):
+def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0, aux=None, readers=None):
     """A new network for `game` (info = games.info(game)): 'mlp' (`Net`, hidden x blocks), 'grid'
     (`GridNet` over the game package's board planes, ch x blocks) or 'tokens' (`TokenNet` over
     the game package's object layout: d = hidden, layers = blocks, heads, ff (0: 2 x hidden)); `aux`:
-    its auxiliary targets (`aux_layout`; None: no auxiliary head, the network of before)."""
+    its auxiliary targets (`aux_layout`; None: no auxiliary head, the network of before); `readers`:
+    its readers (`reader_layout`, docs/az.md 36; None: none, the network of before)."""
     kw = {'aux': aux} if aux else {}
+    if readers:
+        kw['readers'] = readers
     from . import package
     F_, A_ = info['num_features'], info['num_actions']
     if arch == 'grid':
@@ -1071,12 +1258,28 @@ def layout_sans_identity(lay):
     return {k: v for k, v in lay.items() if k not in ('name', 'version')}
 
 
+def _map_reader(spec, fmap):
+    """A reader's spec with its inputs moved by a feature map (`token_feature_map`), as runs [[offset,
+    count], ...] in its input order."""
+    runs = []
+    for f in (fmap[i] for i in reader_index(spec)):
+        if runs and runs[-1][0] + runs[-1][1] == f:
+            runs[-1][1] += 1
+        else:
+            runs.append([f, 1])
+    return dict(spec, inputs=runs)
+
+
 def _widen_tokens(old, cfg, lay):
     """`widen` of a TokenNet onto the layout `lay` (normalised; module docs of `widen`)."""
     ol = old.config['layout']
     F0, F1 = old.config['features'], cfg['features']
     fmap = token_feature_map(ol, F0, lay, F1)
     cfg = dict(cfg, layout=lay)
+    if cfg.get('readers'):
+        # a reader reads the same floats where the new layout put them (its inputs' order, so its first
+        # layer's columns, unchanged; docs/az.md 36)
+        cfg['readers'] = [_map_reader(s, fmap) for s in reader_layout(cfg['readers'])]
     new = build(cfg)
     st = new.state_dict()
     old_st = old.state_dict()
