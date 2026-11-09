@@ -39,6 +39,11 @@ belief of the opponent's hand) -> each target's predictions (`net.aux_predict`).
 evaluator built before a run turned its auxiliary target on, or one with the head given an older
 state).
 
+Readers (docs/az.md 36) are part of the network's forward (they feed the trunk), so every path here
+computes them; `NetEvaluator.reader(x, n_players)` is their API, a reader declared `belief` answers
+its target in the root belief rows and `aux` (`net.aux_answer`), and `set_network(model)` replaces
+`set_weights` where a new checkpoint may have gained a reader (a state cannot carry one).
+
 `NetEvaluator(..., max_rows=n)` (opt-in, default None: every batch whole, as before): a batch of more
 than n rows is evaluated in consecutive pieces of at most n rows, their answers concatenated (the same
 answers up to the networks' float rounding at another batch shape). The lookahead's batches (docs/search.md
