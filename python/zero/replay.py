@@ -260,6 +260,8 @@ class RecordingDriver(PyDriver):
         i = tree.choose(seat) if seat.select != 'visits' else max(range(len(nv)), key=lambda k: (nv[k], p0[k]))
         a_mcts = int(acts[i])
         kw = {}
+        if getattr(seat, 'belief_tilts', None):
+            raise ValueError('a lookahead seat with per-target tilts (belief_tilts): not built (docs/search.md 3.8.1)')
         if seat.belief_tilt:
             kw = dict(belief_tilt=seat.belief_tilt, belief_clip=seat.belief_clip, belief_mix=seat.belief_mix)
         la = G.engine().Lookahead(slot.game, look, seed=slot.search_rng.getrandbits(63), lines=False, **kw)
@@ -358,8 +360,13 @@ def _nn(key, sims, cfg, selfplay, chance_k, select=None):
 
 def belief_kw(cfg, pre):
     """An NNSeat's root-belief keywords from a run's settings (`mcts.belief_settings`; {} when off)."""
+    from .mcts import belief_tilts
     tilt, clip, mix, fast = belief_settings(cfg, pre)
-    return dict(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast) if tilt else {}
+    tilts = belief_tilts(cfg, pre)
+    out = dict(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast) if tilt or tilts else {}
+    if tilts:
+        out['belief_tilts'] = tilts            # (per-target tilts, docs/search.md 3.8.1)
+    return out
 
 
 def _gumbel_keys(cfg, selfplay, cv, cs):

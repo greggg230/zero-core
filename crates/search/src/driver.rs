@@ -463,6 +463,12 @@ pub struct NnSeat {
     /// false: full searches only - every search of an evaluation seat, a self-play seat's recorded
     /// ones).
     pub belief_fast: bool,
+    /// Per-target tilts of the root's belief (docs/search.md 3.8.1; empty, the default: none): (an
+    /// `SearchGame::AUX` target's name, its alpha >= 0), sorted by name. A seat with one > 0 takes
+    /// the belief (one `ROW_BELIEF` row, as `belief_tilt`) even with `belief_tilt` 0; the game's
+    /// `determinize_with` reads them as `Belief::tilts` (in `AUX` order). `belief_clip`,
+    /// `belief_mix` and `belief_fast` apply to them too.
+    pub belief_tilts: Vec<(String, f64)>,
     /// The root search (docs/search.md 3.7; default `RootSearch::Puct`).
     pub root_search: RootSearch,
     /// The exhaustive lookahead (docs/search.md 3.9; None, the default: the seat searches with MCTS):
@@ -492,7 +498,7 @@ pub struct NnSeat {
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, root_search: RootSearch::Puct, look: None, eval_cache: 0, resign_t: 0.0, resign_k: 5, resign_noresign: 0.1, infoset_merge: false }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, belief_tilts: Vec::new(), root_search: RootSearch::Puct, look: None, eval_cache: 0, resign_t: 0.0, resign_k: 5, resign_noresign: 0.1, infoset_merge: false }
     }
 
     /// The resignation settings' check (`Driver::new`; the bindings' messages): t finite in [0, 0.5) (0 =
@@ -529,7 +535,39 @@ impl NnSeat {
     /// Whether this seat's search of a decision takes the root's belief (`full`: a full search;
     /// docs/search.md 3.8).
     pub fn takes_belief(&self, full: bool) -> bool {
-        self.belief_tilt > 0.0 && (full || self.belief_fast)
+        self.belief_on() && (full || self.belief_fast)
+    }
+
+    /// Whether the seat's root belief is on at all: `belief_tilt` > 0 or a per-target tilt > 0.
+    pub fn belief_on(&self) -> bool {
+        self.belief_tilt > 0.0 || self.belief_tilts.iter().any(|t| t.1 > 0.0)
+    }
+
+    /// The per-target tilts' check against the game's targets `aux` (`Driver::new`; docs/search.md
+    /// 3.8.1): every name one of `aux`'s, once, its alpha finite >= 0.
+    pub fn check_belief_tilts(tilts: &[(String, f64)], aux: &[(&str, usize)]) -> Result<(), String> {
+        for (i, (name, t)) in tilts.iter().enumerate() {
+            if !aux.iter().any(|a| a.0 == name) {
+                let names: Vec<&str> = aux.iter().map(|a| a.0).collect();
+                return Err(format!("belief_tilts: {name:?} is not an auxiliary target of the game ({names:?})"));
+            }
+            if tilts[..i].iter().any(|o| &o.0 == name) {
+                return Err(format!("belief_tilts: {name:?} twice"));
+            }
+            if !(t.is_finite() && *t >= 0.0) {
+                return Err(format!("belief_tilts {name:?} {t}: a finite number >= 0 (0 = off)"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The per-target tilts in the order of the game's targets `aux` (`Belief::tilts`; empty when
+    /// the seat names none).
+    pub fn target_tilts(&self, aux: &[(&str, usize)]) -> Vec<f64> {
+        if self.belief_tilts.is_empty() {
+            return Vec::new();
+        }
+        aux.iter().map(|a| self.belief_tilts.iter().find(|t| t.0 == a.0).map_or(0.0, |t| t.1)).collect()
     }
 }
 
@@ -1613,6 +1651,10 @@ impl<G: SearchGame> Driver<G> {
                     NnSeat::check_belief(n.belief_tilt, n.belief_clip, n.belief_mix)?;
                     if n.belief_tilt > 0.0 && G::aux_width() == 0 {
                         return Err(format!("belief_tilt {}: {} has no auxiliary targets (SearchGame::AUX) for a belief to predict", n.belief_tilt, G::NAME));
+                    }
+                    NnSeat::check_belief_tilts(&n.belief_tilts, G::AUX)?;
+                    if n.look.is_some() && !n.belief_tilts.is_empty() {
+                        return Err("belief_tilts: not built for a lookahead seat (its belief is belief_tilt's)".into());
                     }
                     n.root_search.check()?;
                     if n.infoset_merge {

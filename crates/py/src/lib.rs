@@ -146,6 +146,19 @@ fn get<'py, T: FromPyObject<'py>>(d: &Bound<'py, PyDict>, k: &str, default: T) -
     }
 }
 
+/// The seat key `belief_tilts` ({target: alpha}, docs/search.md 3.8.1): sorted by name; absent or None:
+/// none.
+fn belief_tilts_of(d: &Bound<'_, PyDict>) -> PyResult<Vec<(String, f64)>> {
+    match d.get_item("belief_tilts")? {
+        Some(v) if !v.is_none() => {
+            let m: std::collections::BTreeMap<String, f64> =
+                v.extract().map_err(|_| PyValueError::new_err("belief_tilts: a dict {target: alpha}"))?;
+            Ok(m.into_iter().collect())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     match d.get_item(k)? {
         Some(v) if !v.is_none() => v.is_truthy(),
@@ -153,7 +166,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "belief_tilts", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -286,6 +299,9 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         belief_clip: get(d, "belief_clip", BELIEF_CLIP)?,
         belief_mix: get(d, "belief_mix", 0.0f64)?,
         belief_fast: flag(d, "belief_fast", false)?,
+        // per-target tilts of the root's belief ({target: alpha}, docs/search.md 3.8.1; absent: none),
+        // sorted by name; checked against the game's targets by the driver
+        belief_tilts: belief_tilts_of(d)?,
         root_search,
         look,
         // the game's evaluation cache: at most this many answers per game (0 = off; docs/search.md 3.12)
@@ -499,10 +515,12 @@ impl PyGame {
     /// `determinize` dealt by a belief (`SearchGame::determinize_with`, docs/search.md 3.8): `belief`
     /// = the predictions of the game's auxiliary targets for `viewer` (f32 [aux_width]), `tilt` > 0,
     /// `clip` >= 1.
-    #[pyo3(signature = (viewer, seed, belief, tilt=1.0, clip=BELIEF_CLIP))]
-    fn determinize_with(&mut self, viewer: usize, seed: u64, belief: PyReadonlyArray1<'_, f32>, tilt: f64, clip: f64) -> PyResult<()> {
+    /// `tilts` = per-target tilts {target: alpha} (docs/search.md 3.8.1; None: none - then `tilt` > 0).
+    #[pyo3(signature = (viewer, seed, belief, tilt=1.0, clip=BELIEF_CLIP, tilts=None))]
+    fn determinize_with(&mut self, viewer: usize, seed: u64, belief: PyReadonlyArray1<'_, f32>, tilt: f64, clip: f64, tilts: Option<std::collections::BTreeMap<String, f64>>) -> PyResult<()> {
         let p = belief.as_slice().map_err(|e| PyValueError::new_err(format!("belief: {e}")))?;
-        self.g.determinize_with(viewer, seed, p, tilt, clip).map_err(verr)
+        let t: Vec<(String, f64)> = tilts.unwrap_or_default().into_iter().collect();
+        self.g.determinize_with(viewer, seed, p, tilt, clip, &t).map_err(verr)
     }
     fn encode<'py>(&self, py: Python<'py>, viewer: usize) -> Bound<'py, numpy::PyArray1<f32>> {
         self.g.encode(viewer).into_pyarray(py)
@@ -643,13 +661,15 @@ impl PySearchTree {
     /// game's auxiliary targets for the root decider (f32 [aux_width]; None: uniform worlds, the
     /// search of before), `tilt` > 0, `clip`, `mix` (the share of simulations dealt uniformly);
     /// `game`: the live game (a tree without redet deals its world again). `advance` clears it.
-    #[pyo3(signature = (belief, game, tilt=1.0, clip=BELIEF_CLIP, mix=0.0))]
-    fn set_belief(&mut self, belief: Option<PyReadonlyArray1<'_, f32>>, game: &PyGame, tilt: f64, clip: f64, mix: f64) -> PyResult<()> {
+    /// `tilts`: per-target tilts {target: alpha} (docs/search.md 3.8.1; None: none).
+    #[pyo3(signature = (belief, game, tilt=1.0, clip=BELIEF_CLIP, mix=0.0, tilts=None))]
+    fn set_belief(&mut self, belief: Option<PyReadonlyArray1<'_, f32>>, game: &PyGame, tilt: f64, clip: f64, mix: f64, tilts: Option<std::collections::BTreeMap<String, f64>>) -> PyResult<()> {
         let p = match &belief {
             Some(b) => Some(b.as_slice().map_err(|e| PyValueError::new_err(format!("belief: {e}")))?),
             None => None,
         };
-        self.t.set_belief(p, tilt, clip, mix, &*game.g).map_err(verr)
+        let t: Vec<(String, f64)> = tilts.unwrap_or_default().into_iter().collect();
+        self.t.set_belief(p, tilt, clip, mix, &t, &*game.g).map_err(verr)
     }
     /// The current search's belief predictions (None: uniform worlds).
     #[getter]

@@ -762,15 +762,15 @@ fn a_belief_deals_the_worlds_by_its_weights() {
     for &k in &pool {
         assert!((uni[k as usize] - 1.0 / pool.len() as f64).abs() < 0.08, "uniform deal {uni:?} over {pool:?}");
     }
-    let sharp = next_card_shares(&live, Some(Belief { pred: pred.clone(), tilt: 1.0, clip: 1000.0 }), 0.0, 20, 40);
+    let sharp = next_card_shares(&live, Some(Belief { pred: pred.clone(), tilt: 1.0, clip: 1000.0, tilts: Vec::new() }), 0.0, 20, 40);
     assert!(sharp[c] > 0.98, "a sharp belief: {sharp:?} (card {c})");
     // the clip bounds it: R = 2 at most 2 / (2 + (n - 1) / 2) of the worlds
     let n = pool.len() as f64;
-    let clipped = next_card_shares(&live, Some(Belief { pred: pred.clone(), tilt: 1.0, clip: 2.0 }), 0.0, 20, 40);
+    let clipped = next_card_shares(&live, Some(Belief { pred: pred.clone(), tilt: 1.0, clip: 2.0, tilts: Vec::new() }), 0.0, 20, 40);
     let want = 2.0 / (2.0 + (n - 1.0) * 0.5);
     assert!((clipped[c] - want).abs() < 0.06, "clip 2: {} vs {want}", clipped[c]);
     // the uniform share: mix 0.5 deals half the worlds uniformly
-    let mixed = next_card_shares(&live, Some(Belief { pred, tilt: 1.0, clip: 1000.0 }), 0.5, 20, 40);
+    let mixed = next_card_shares(&live, Some(Belief { pred, tilt: 1.0, clip: 1000.0, tilts: Vec::new() }), 0.5, 20, 40);
     let want = 0.5 + 0.5 / n;
     assert!((mixed[c] - want).abs() < 0.06, "mix 0.5: {} vs {want}", mixed[c]);
 }
@@ -793,7 +793,7 @@ fn no_belief_is_the_tree_of_before_and_advance_clears_it() {
     // a belief belongs to one decision: advance and reset clear it
     let mut rng = Rng::new(1);
     let mut t = Tree::new(&live, live.to_move().unwrap(), &legal_of(&live), true, &mut rng);
-    t.set_belief(Some(Belief { pred: vec![1.0 / 6.0; 6], tilt: 1.0, clip: 20.0 }), 0.0, &live, &mut rng);
+    t.set_belief(Some(Belief { pred: vec![1.0 / 6.0; 6], tilt: 1.0, clip: 20.0, tilts: Vec::new() }), 0.0, &live, &mut rng);
     search(&mut t, &live, 64, &mut rng, &w);
     assert!(t.belief().is_some());
     let a = t.acts(t.root)[0];
@@ -805,7 +805,7 @@ fn no_belief_is_the_tree_of_before_and_advance_clears_it() {
             assert!(t.belief().is_none(), "advance keeps no belief");
         }
     }
-    t.set_belief(Some(Belief { pred: vec![1.0 / 6.0; 6], tilt: 1.0, clip: 20.0 }), 0.0, &live, &mut rng);
+    t.set_belief(Some(Belief { pred: vec![1.0 / 6.0; 6], tilt: 1.0, clip: 20.0, tilts: Vec::new() }), 0.0, &live, &mut rng);
     t.reset(&live, live.to_move().unwrap(), &legal_of(&live), true, &mut rng);
     assert!(t.belief().is_none(), "reset keeps no belief");
 }
@@ -822,7 +822,7 @@ fn without_redet_the_belief_deals_the_decisions_one_world_again() {
     for s in 0..200u64 {
         let mut rng = Rng::new(s);
         let mut t = Tree::new(&live, live.to_move().unwrap(), &legal_of(&live), false, &mut rng);
-        t.set_belief(Some(Belief { pred: pred.clone(), tilt: 1.0, clip: 1000.0 }), 0.0, &live, &mut rng);
+        t.set_belief(Some(Belief { pred: pred.clone(), tilt: 1.0, clip: 1000.0, tilts: Vec::new() }), 0.0, &live, &mut rng);
         let mut g = live.clone();
         let mut sc = Scratch::default();
         let w = Walk { c_puct: 1.0, chance_k: 0, margin_w: 0.0 };

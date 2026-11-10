@@ -82,7 +82,7 @@ class NNSeat:
                  select_c_visit=None, select_c_scale=None, record=True, root_min_visits=0,
                  root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
                  view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
-                 root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
+                 belief_tilts=None, root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
                  cq_prior_w=1.0, infoset_merge=False):
         if policy_target not in POLICY_TARGETS:
             raise ValueError(f'policy_target {policy_target!r}: one of {POLICY_TARGETS}')
@@ -92,6 +92,7 @@ class NNSeat:
         mcts.check_root_min(root_min_visits, root_min_visits_max_actions)
         mcts.check_leaf_view(leaf_value_view, view_samples, view_sample_target)
         mcts.check_belief(belief_tilt, belief_clip, belief_mix)
+        mcts.check_belief_tilts(belief_tilts)
         mcts.check_root_search(root_search, gumbel_m, gumbel_scale, gumbel_c_visit, gumbel_c_scale)
         if root_search == 'gumbel' and root_min_visits:
             raise ValueError("root_min_visits with root_search 'gumbel': exclusive (docs/search.md 3.7)")
@@ -113,6 +114,8 @@ class NNSeat:
         self.view_sample_target = view_sample_target
         self.belief_tilt, self.belief_mix, self.belief_fast = float(belief_tilt), float(belief_mix), bool(belief_fast)
         self.belief_clip = float(mcts.BELIEF_CLIP if belief_clip is None else belief_clip)
+        # per-target tilts {target: alpha > 0} (docs/search.md 3.8.1; {} = none)
+        self.belief_tilts = {k: float(v) for k, v in sorted((belief_tilts or {}).items()) if v}
         self.root_search, self.gumbel_m, self.gumbel_scale = root_search, int(gumbel_m), float(gumbel_scale)
         self.gumbel_c_visit = float(cq_c_visit if gumbel_c_visit is None else gumbel_c_visit)
         self.gumbel_c_scale = float(cq_c_scale if gumbel_c_scale is None else gumbel_c_scale)
@@ -120,7 +123,7 @@ class NNSeat:
 
     def takes_belief(self, full):
         """Whether its search of a decision takes the root's belief (`full`: a full search)."""
-        return self.belief_tilt > 0 and (full or self.belief_fast)
+        return (self.belief_tilt > 0 or bool(self.belief_tilts)) and (full or self.belief_fast)
 
     @property
     def gumbel(self):
@@ -182,7 +185,8 @@ class PySearch:
         return self.t.belief is not None
 
     def set_belief(self, pred, seat, game, rng):
-        self.t.set_belief((np.asarray(pred, np.float32), seat.belief_tilt, seat.belief_clip), seat.belief_mix, game, rng)
+        b = (np.asarray(pred, np.float32), seat.belief_tilt, seat.belief_clip)
+        self.t.set_belief(b + ((seat.belief_tilts,) if seat.belief_tilts else ()), seat.belief_mix, game, rng)
 
     def set_gumbel(self, m, budget, noise, c_visit, c_scale):
         self.t.set_gumbel(m, budget, noise, c_visit, c_scale)
@@ -268,7 +272,8 @@ class RsSearch:
         return self.t.belief is not None
 
     def set_belief(self, pred, seat, game, rng):
-        self.t.set_belief(np.asarray(pred, np.float32), game, seat.belief_tilt, seat.belief_clip, seat.belief_mix)
+        self.t.set_belief(np.asarray(pred, np.float32), game, seat.belief_tilt, seat.belief_clip, seat.belief_mix,
+                          seat.belief_tilts or None)
 
     def set_gumbel(self, m, budget, noise, c_visit, c_scale):
         self.t.set_gumbel(m, budget, [float(x) for x in noise], c_visit, c_scale)

@@ -2202,6 +2202,52 @@ fn the_belief_deals_the_searches_worlds() {
 }
 
 #[test]
+fn per_target_tilts_take_the_belief_and_deal_by_it() {
+    // docs/search.md 3.8.1: a seat with belief_tilt 0 and a per-target tilt asks the root's belief (one
+    // row per full search) and the game reads the target's tilt: HiddenMull's `hand` at 1 deals as
+    // belief_tilt 1 does, the same shift of seat 1's root value
+    let sims = 64;
+    let mut s = hmull_belief_seat(sims, 0.0, LeafView::Mover, true);
+    if let SeatCfg::Nn(n) = &mut s {
+        n.belief_tilts = vec![("hand".to_string(), 1.0)];
+    }
+    let (good, st, _, b1) = hmull_belief_run(s, 300, 3, &[0.1, 0.9]);
+    assert_eq!((b1 as u64, st.belief_rows), (st.recorded, st.recorded));
+    let (uni, _, _, _) = hmull_belief_run(hmull_belief_seat(sims, 0.0, LeafView::Mover, true), 300, 3, &[]);
+    let want = -0.3 * 0.4 * (sims - 1) as f64 / sims as f64;
+    let (qu, qg) = (seat1_q(&uni), seat1_q(&good));
+    assert!((qg - qu - want).abs() < 0.015, "the per-target tilt's shift {} vs {want}", qg - qu);
+    // the mapping to AUX order, and a seat naming none: empty (every Belief of before)
+    let mut n = NnSeat::eval(0, 8);
+    assert!(n.target_tilts(ToyGame::AUX).is_empty() && !n.belief_on());
+    n.belief_tilts = vec![("next_card".to_string(), 0.5)];
+    assert_eq!(n.target_tilts(ToyGame::AUX), vec![0.5]);
+    assert!(n.belief_on() && n.takes_belief(true) && !n.takes_belief(false));
+    n.belief_tilts = vec![("next_card".to_string(), 0.0)];
+    assert!(!n.belief_on(), "a per-target tilt of 0 is off");
+}
+
+#[test]
+fn per_target_tilts_are_checked() {
+    // an unknown target, a target twice, a tilt < 0 or not finite: refused by the driver; and a
+    // lookahead seat (its belief is belief_tilt's)
+    for (tilts, what) in [
+        (vec![("hand".to_string(), 1.0)], "not an auxiliary target"),
+        (vec![("next_card".to_string(), 1.0), ("next_card".to_string(), 0.5)], "twice"),
+        (vec![("next_card".to_string(), -1.0)], "finite number >= 0"),
+        (vec![("next_card".to_string(), f64::NAN)], "finite number >= 0"),
+    ] {
+        let mut s = with_belief(nn(0, 16, true), 0.0, 20.0, 0.0, false);
+        if let SeatCfg::Nn(n) = &mut s {
+            n.belief_tilts = tilts.clone();
+        }
+        let c = cfg(vec![s], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+        let e = Driver::<ToyGame>::new(c).err().unwrap();
+        assert!(e.contains(what), "{tilts:?}: {e}");
+    }
+}
+
+#[test]
 fn root_view_values_and_the_belief_share_the_batches() {
     // both extra row kinds in one driver: value-only rows after other seats' leaves, belief rows
     // after fresh roots' leaves; the counts match the stats and the deal still follows the belief

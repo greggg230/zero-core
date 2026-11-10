@@ -134,6 +134,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_infoset_merge` | 0 | 1 = self-play's seat merges its trees' nodes by the root decider's observation, every search of it (full, fast, minor; docs/search.md 3.16). Needs `selfplay_leaf_value_view` 'root'; the records, root values, value-only samples and resignation read the root as before; the leaf's viewer row is taken from the merged tree's encoding; remote self-play refuses a worker whose checkout does not merge; metrics `selfplay.merge`. 0 = off (nothing changes) (30.1) |
 | `selfplay_belief_tilt`, `eval_belief_tilt` | 0.0, 0.0 | the root's belief (docs/search.md 3.8, section 18): a full search of the seat asks the network's auxiliary head once for the root's prediction of the hidden cards (one `ROW_BELIEF` row of the root's features) and deals every simulation's world by it (the game's `determinize_with`, weights clip((belief / uniform)^tilt, 1/belief_clip, belief_clip)). The self-play seat (a league opponent's too; remote self-play: a checkout without it is refused at its hello, 18.5) / every evaluation seat (its Elo pool's name gets `-b<tilt>`). Needs a checkpoint with the auxiliary head: one without is refused (`net.HeadMissing`, exit 78; 18.3). 0 = off |
 | `belief_clip`, `belief_mix`, `belief_fast` | 20.0, 0.0, 0 | the belief's clip R (every weight in [1/R, R]), the share of a belief search's simulations still dealt uniformly ([0, 1)), and whether fast and minor searches take it too (section 18) |
+| `selfplay_belief_tilts`, `eval_belief_tilts` | {}, {} | per-target tilts of the root's belief (docs/search.md 3.8.1, section 38): `{target: alpha}`, an auxiliary target of the game whose deal the game tilts by its own alpha (MTG Zero: `deck`, the opponent's whole unseen deck); a seat with one > 0 takes the belief (one row per full search) even with its `*_belief_tilt` 0, `belief_clip` / `_mix` / `_fast` applying. The evaluation's names its Elo pool (`-t<target><alpha>`); a remote self-play worker without it is refused at its hello. {} = off |
 | `selfplay_view_samples`, `view_sample_target` | 0.0, next_q | value-only samples (section 16): this share of self-play's recorded decisions also records the real state from each other recording seat's view - its perspective, no options (no policy loss), z its result - with q = that seat's next search's root value ('next_q'; z if none) or z ('z'). 0 = off |
 | `selfplay_root_search`, `eval_root_search` | puct, puct | the root search (docs/search.md 3.7, section 19): 'puct' = today's searches bit for bit; 'gumbel' = Gumbel AlphaZero's root - Gumbel noise per root option, sequential halving over the `gumbel_m` options of highest noise + log-prior, the completed-Q sigma - whose move replaces root Dirichlet noise, temperature sampling and the move rule (`*_select`; PUCT stays below the root). Every search of the seat is one (full, fast, minor). The self-play seat (remote self-play and the league seat too: their checkouts must have this core) needs `policy_target` 'cq' (an error otherwise: sequential halving's counts are no policy), its sigma the target's (`cq_c_visit`, `cq_c_scale`); every evaluation seat: sigma the evaluation rule's transform (`eval_select_c_*`, else `cq_c_*`), and its root search names its Elo pool (`gumbel-m16`, `gumbel-m16-v50-s0.3`, `-g1` with noise, `-rv`), self-play's does not. Exclusive with the same side's `*_root_min_visits` (an error). `zero.h2h` / `zero.replay` follow the run's |
 | `gumbel_m`, `selfplay_gumbel_scale`, `eval_gumbel_scale` | 16, 1.0, 0.0 | the Gumbel search's considered options (the paper's and mctx's 16: every option of a smaller root) and its noise scale: self-play's first `temp_moves` searched decisions of a game are searched with `selfplay_gumbel_scale` (1 = the move a sample of the improved policy, the paper's), later ones without - the role temperature had; the evaluation's on every decision (0 = deterministic, the paper's evaluation) |
@@ -5134,3 +5135,51 @@ Tier "opt-in core feature with byte-identical defaults"; desktop, 2026-11-09, CP
   declaring `deck` (1,024, multinomial) after `belief`: widened at load in 0.10 s (`aux_parts` [[belief], [deck]]),
   policy, value, margin and belief's raw outputs `torch.equal` to the checkpoint's own on 512 of its self-play rows,
   `deck` uniform.
+
+## 38. Per-target tilts of the root's belief (`selfplay_belief_tilts`, `eval_belief_tilts`; MTG Zero's Edge of Eternities deck tilt, 2026-11-10)
+
+### 38.1 Why
+
+MTG Zero's network predicts two hidden things: the opponent's hand (target `belief`, section 15) and, in Edge of
+Eternities sealed where decklists are hidden, the opponent's whole unseen deck (target `deck`, its reader of section
+36). Section 18 deals the search's worlds by the root's belief at one tilt, `belief_tilt`, which MTG Zero applies to
+the hand. Its deck tilt (its ENGINE.md 106) needs an alpha of its own: the two deals differ in reach (seven cards of a
+known pool against a whole deck chosen from a format) and are measured apart (an evaluation-only A/B of the deck tilt
+with the hand's off, then both).
+
+### 38.2 What it does (docs/search.md 3.8.1)
+
+* **Run settings** `selfplay_belief_tilts` (the self-play seat, a league opponent's too) and `eval_belief_tilts`
+  (every evaluation seat): `{target: alpha}` (JSON on the command line: `--selfplay-belief-tilts '{"deck": 1}'`),
+  default `{}`. Seat key `belief_tilts`, only when one is > 0 (`run.belief_keys`, `games.nn_seat`, `play.NNSeat`,
+  `replay`'s seats).
+* **The search**: a seat with one > 0 takes the root's belief (one `ROW_BELIEF` row per full search) even with its
+  `*_belief_tilt` 0; the game's `determinize_with` reads them as `Belief::tilts` (in `AUX` order). The answer is
+  section 18's (the head's prediction of every target, or a reader's when declared `belief`, 36.5).
+* **Names**: an evaluation's per-target tilts name its Elo pool after the belief's tag (`mcts.belief_tag`:
+  `-b0-tdeck1`, `-b1-tdeck0.5`); `zero.h2h` follows a side's run (`eval_belief_tilts`) and `--a-belief-tilts` /
+  `--b-belief-tilts` (JSON; `{}` removes them) override it.
+* **The head**: a run with per-target tilts on checks its checkpoint for the auxiliary head as for `*_belief_tilt`
+  (refused without it, 18.3), a league opponent's and h2h's sides too; self-play's `belief` metrics are reported.
+* **Remote self-play**: the worker's hello carries the self-play seat's belief keys (18.5), per-target tilts
+  included: an older checkout is refused.
+
+### 38.3 Off by default
+
+`{}` (the default): no seat key, no row, `Belief::tilts` empty - the searches of before bit for bit (the golden
+records and match, `belief_off_is_the_search_of_before`); config.json gains the two keys. `Belief` gains a field
+(`tilts`): a game constructing one by a struct literal adds `tilts: Vec::new()` (MTG Zero's tests do).
+
+### 38.4 Costs
+
+None of its own: the row, the head and the game's deal are section 18's (the deal's cost is the game's: MTG Zero's
+ENGINE.md 106).
+
+### 38.5 Tests and checks
+
+Rust: `driver::tests::per_target_tilts_take_the_belief_and_deal_by_it` (HiddenMull at `belief_tilt` 0 and `hand` 1:
+a row per full search, seat 1's root value shifted as `belief_tilt` 1 shifts it), `per_target_tilts_are_checked`
+(an unknown target, a target twice, a tilt < 0 or NaN refused). `tests/test_belief_tilts.py` (2): the settings, seats
+and names (none set: the dicts and tags of before), the refusals, h2h's sides; a seat at `belief_tilt` 0 with
+`next_card` 1 sends one row per full search in the three drivers and the toy deals draw for draw as at `belief_tilt`
+1. Byte identity and the gate: MTG Zero's ENGINE.md 106.

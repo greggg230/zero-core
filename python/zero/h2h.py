@@ -92,8 +92,8 @@ import time
 
 from . import games as G, lookahead as LA, package
 from .infer import NetEvaluator, drive
-from .mcts import (belief_settings, belief_tag, check_belief, check_merge, check_root_search, check_select,
-                   check_select_transform, forced_tag, gumbel_tag, merge_tag, select_settings, select_tag, select_transform,
+from .mcts import (belief_settings, belief_tag, belief_tilts, check_belief, check_belief_tilts, check_merge,
+                   check_root_search, check_select, check_select_transform, forced_tag, gumbel_tag, merge_tag, select_settings, select_tag, select_transform,
                    view_tag)
 from .net import check_belief_head, load
 
@@ -155,8 +155,11 @@ def run_rule(ckpt):
     if c.get('eval_infoset_merge'):
         out['infoset_merge'] = True                # (docs/search.md 3.16)
     tilt, clip, mix, fast = belief_settings(c, 'eval')
-    if tilt:
+    tilts = belief_tilts(c, 'eval')
+    if tilt or tilts:
         out.update(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast)
+    if tilts:
+        out['belief_tilts'] = tilts                # (per-target tilts, docs/search.md 3.8.1)
     if c.get('eval_select', 'visits') == 'visits':
         return root_keys(ckpt, out)
     rule, mv, cv, cs = select_settings(c, 'eval_select')
@@ -197,13 +200,13 @@ def _tag(seat):
     if seat.get('root_search', 'puct') == 'gumbel':
         return gumbel_tag(seat.get('gumbel_m', 16), seat.get('gumbel_c_visit', 50.0), seat.get('gumbel_c_scale', 1.0),
                           seat.get('gumbel_scale', 1.0)) + view_tag(seat.get('leaf_value_view', 'mover')) + belief_tag(
-            seat.get('belief_tilt', 0.0), seat.get('belief_clip'), seat.get('belief_mix', 0.0), seat.get('belief_fast', False)) + ism
+            seat.get('belief_tilt', 0.0), seat.get('belief_clip'), seat.get('belief_mix', 0.0), seat.get('belief_fast', False), seat.get('belief_tilts')) + ism
     cv, cs = select_transform(seat.get('cq_c_visit', 50.0), seat.get('cq_c_scale', 1.0), seat.get('select_c_visit'),
                               seat.get('select_c_scale'))
     return select_tag(seat.get('select', 'visits'), seat.get('select_min_visits', 0), cv, cs) + forced_tag(
         seat.get('root_min_visits', 0), seat.get('root_min_visits_max_actions', 4)) + view_tag(
         seat.get('leaf_value_view', 'mover')) + belief_tag(seat.get('belief_tilt', 0.0), seat.get('belief_clip'),
-                                                           seat.get('belief_mix', 0.0), seat.get('belief_fast', False)) + ism
+                                                           seat.get('belief_mix', 0.0), seat.get('belief_fast', False), seat.get('belief_tilts')) + ism
 
 
 MERGE_STATS = ('links', 'merged', 'aliases', 'growths')
@@ -222,20 +225,31 @@ def _merge_out(out, sa, sb, stats):
               flush=True)
 
 
-def with_belief(keys, tilt=None, clip=None, mix=None, fast=None):
+def with_belief(keys, tilt=None, clip=None, mix=None, fast=None, tilts=None):
     """A side's seat keys with its root belief (docs/search.md 3.8) as given (None: as it was): tilt 0
-    removes it (uniform worlds); clip / mix / fast change a side that has one (or is given one)."""
+    removes it (uniform worlds) unless the side keeps per-target tilts; `tilts` ({target: alpha}, 3.8.1)
+    replaces the side's per-target tilts ({} removes them); clip / mix / fast change a side that has a
+    belief (or is given one)."""
     keys = dict(keys)
+    if tilts is not None:
+        check_belief_tilts(tilts, what='--*-belief-tilts')
+        tilts = {k: float(v) for k, v in sorted(tilts.items()) if v}
+        keys.pop('belief_tilts', None)
+        if tilts:
+            keys['belief_tilts'] = tilts
     if tilt is not None:
-        if float(tilt) == 0:
-            for k in ('belief_tilt', 'belief_clip', 'belief_mix', 'belief_fast'):
-                keys.pop(k, None)
-            return keys
+        keys['belief_tilt'] = float(tilt)
+    if not keys.get('belief_tilt') and not keys.get('belief_tilts'):
+        for k in ('belief_tilt', 'belief_clip', 'belief_mix', 'belief_fast'):
+            keys.pop(k, None)
+        if tilt is not None:
+            return keys                            # (tilt 0 given: uniform worlds, as before)
+    else:
+        keys.setdefault('belief_tilt', 0.0)
         keys.setdefault('belief_clip', 20.0)
         keys.setdefault('belief_mix', 0.0)
         keys.setdefault('belief_fast', False)
-        keys['belief_tilt'] = float(tilt)
-    if not keys.get('belief_tilt'):
+    if not keys.get('belief_tilt') and not keys.get('belief_tilts'):
         if (clip, mix, fast) != (None, None, None):
             raise ValueError('--*-belief-clip / -mix / -fast for a side without a root belief (give its --*-belief-tilt)')
         return keys
@@ -325,8 +339,8 @@ def _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, s
     sa.update(run_rule(a) if seat_a is None else seat_a)
     sb.update(run_rule(b) if seat_b is None else seat_b)
     for s, m, p in ((sa, ma, a), (sb, mb, b)):
-        if s.get('belief_tilt'):
-            check_belief_head(m, game, f'belief_tilt of {p}')     # (before any game: a loud refusal)
+        if s.get('belief_tilt') or s.get('belief_tilts'):
+            check_belief_head(m, game, f'belief_tilt / belief_tilts of {p}')     # (before any game: a loud refusal)
     return sa, sb
 
 
@@ -619,6 +633,9 @@ def main(argv=None):
         ap.add_argument(f'--{side}-belief-clip', type=float, default=None)
         ap.add_argument(f'--{side}-belief-mix', type=float, default=None)
         ap.add_argument(f'--{side}-belief-fast', type=int, default=None, choices=[0, 1])
+        ap.add_argument(f'--{side}-belief-tilts', type=json.loads, default=None,
+                        help=f"side {side.upper()}'s per-target tilts, JSON {{target: alpha}} (docs/search.md 3.8.1; {{}} = "
+                             f"none; default: its checkpoint's run's eval_belief_tilts)")
     ap.add_argument('--infoset-merge', type=int, default=None, choices=[0, 1],
                     help="both sides' information-set merging (docs/search.md 3.16; default: each side's run's "
                          "eval_infoset_merge)")
@@ -735,7 +752,7 @@ def main(argv=None):
         # (a side's root belief is its run's eval_belief_tilt even when --select replaced its rule, so an
         # A/B arm whose config sets it is dealt as it trained; the side's flags override it)
         sides = [with_belief(dict(k, **{x: v for x, v in run_rule(ckpt).items() if x.startswith('belief_')}),
-                             *(getattr(a, f'{s}_belief_{x}') for x in ('tilt', 'clip', 'mix', 'fast')))
+                             *(getattr(a, f'{s}_belief_{x}') for x in ('tilt', 'clip', 'mix', 'fast', 'tilts')))
                  for s, k, ckpt in zip(('a', 'b'), sides, (a.a, a.b))]
     except ValueError as e:
         ap.error(str(e))

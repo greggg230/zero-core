@@ -222,6 +222,11 @@ DEFAULTS = dict(
     # change: the Elo pool's name gets '-b<tilt>...'). Needs the auxiliary head (a checkpoint without it
     # is refused: net.HeadMissing). 0 = off (the default: today's searches, bit for bit)
     selfplay_belief_tilt=0.0, eval_belief_tilt=0.0, belief_clip=20.0, belief_mix=0.0, belief_fast=0,
+    # per-target tilts of the root's belief (docs/search.md 3.8.1, docs/az.md 38): {target: alpha} - an auxiliary
+    # target of the game the seat's deal tilts by its own alpha (MTG Zero: 'deck', its whole unseen deck); a seat
+    # with one > 0 asks the belief even with its <pre>_belief_tilt 0 (belief_clip / _mix / _fast apply). {} = none
+    # (the default: today's searches, bit for bit). The Elo pool's name gets '-t<target><alpha>'
+    selfplay_belief_tilts={}, eval_belief_tilts={},
     # readers (docs/az.md 36): the game package's `readers`, each turned on by its run setting
     # `reader_<target>` (default 0 = off: the network of before) - a small branch of the network reading
     # declared features, trained by its auxiliary target's loss (aux_<target>_w > 0), its prediction an
@@ -615,8 +620,10 @@ class Run:
         """With a root belief on (selfplay_ / eval_belief_tilt > 0, docs/az.md 18) the checkpoint at
         `path` must have the auxiliary head for the game's targets: else net.HeadMissing (the run is
         refused, exit 78) - never a search dealing uniformly in silence."""
+        from .mcts import belief_tilts
         c = self.cfg
         on = [k for k in ('selfplay_belief_tilt', 'eval_belief_tilt') if float(c.get(k, 0.0) or 0.0) > 0]
+        on += [k + 's' for k in ('selfplay_belief_tilt', 'eval_belief_tilt') if belief_tilts(c, k.split('_')[0])]
         if on:
             m, _ = load(path, 'cpu', game=c['game'])
             check_belief_head(m, c['game'], f'{" / ".join(on)} (checkpoint {path})')
@@ -829,7 +836,8 @@ class Run:
         """Self-play's root-belief metrics (docs/az.md 18), only when it is on (the metrics of before
         otherwise): `belief` = {rows: root belief rows sent by this machine's driver, per_decision: per
         searched decision of its finished games}."""
-        if not float(self.cfg.get('selfplay_belief_tilt', 0.0) or 0.0):
+        from .mcts import belief_tilts
+        if not float(self.cfg.get('selfplay_belief_tilt', 0.0) or 0.0) and not belief_tilts(self.cfg, 'selfplay'):
             return
         rows = st.get('belief_rows', 0) - ((st0 or {}).get('belief_rows', 0))
         dec = sum(r.get('decisions', 0) for r in results)
@@ -2182,16 +2190,21 @@ def resolve_config(args, saved):
 def belief_keys(cfg, pre):
     """The root-belief keyword arguments of `games.nn_seat` for a run's seat `pre` ('selfplay' | 'eval')
     from its settings (`mcts.belief_settings`; {} when its tilt is 0: the seat of before)."""
-    from .mcts import belief_settings
+    from .mcts import belief_settings, belief_tilts
     tilt, clip, mix, fast = belief_settings(cfg, pre)
-    return dict(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast) if tilt else {}
+    tilts = belief_tilts(cfg, pre)
+    out = dict(belief_tilt=tilt, belief_clip=clip, belief_mix=mix, belief_fast=fast) if tilt or tilts else {}
+    if tilts:
+        out['belief_tilts'] = tilts            # (per-target tilts, docs/search.md 3.8.1)
+    return out
 
 
 def check_eval_settings(cfg, where=''):
     """The move-rule and Elo-offset settings (eval_select, selfplay_select, their guards and their
     completed-Q transforms, the root minimum visits, elo_offsets) -> None, else SystemExit (`where`:
     a prefix, e.g. 'resolver_cfg: ')."""
-    from .mcts import belief_settings, check_belief, check_leaf_view, check_root_min, check_select, check_select_transform
+    from .mcts import (belief_settings, belief_tilts, check_belief, check_leaf_view, check_root_min, check_select,
+                       check_select_transform)
     for k in ('eval_select', 'selfplay_select'):
         try:
             check_select(cfg.get(k, 'visits'), cfg.get(k + '_min_visits', 0), what=k)
@@ -2214,6 +2227,7 @@ def check_eval_settings(cfg, where=''):
         for pre in ('selfplay', 'eval'):
             tilt, clip, mix, _ = belief_settings(cfg, pre)
             check_belief(tilt, clip, mix, what=f'{pre}_belief_tilt')
+            belief_tilts(cfg, pre)
     except ValueError as e:
         raise SystemExit(f'{where}{e}') from None
     from .mcts import check_root_search

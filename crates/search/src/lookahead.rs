@@ -1342,7 +1342,7 @@ impl<G: SearchGame> Look<G> {
                     }
                     let w = ans.aux_width;
                     let (t, c, _) = self.belief_ask.ok_or("internal: a belief answer without a belief")?;
-                    self.belief = Some(Belief { pred: ans.aux[k as usize * w..(k as usize + 1) * w].to_vec(), tilt: t, clip: c });
+                    self.belief = Some(Belief { pred: ans.aux[k as usize * w..(k as usize + 1) * w].to_vec(), tilt: t, clip: c, tilts: Vec::new() });
                 }
                 Req::RootPrior => self.root_pri = Some(pri.to_vec()),
                 Req::Prior(m) => {

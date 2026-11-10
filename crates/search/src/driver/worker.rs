@@ -315,7 +315,7 @@ fn set_belief<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: usize, p
     let s = nn_seat(cfg, slot.gid, seat).ok_or("internal: a belief for a non-network seat")?;
     let live = slot.game.as_ref().ok_or("internal: a belief without a game")?;
     let tree = slot.trees[seat].as_mut().ok_or("internal: a belief without a tree")?;
-    let b = Belief { pred: pred.to_vec(), tilt: s.belief_tilt, clip: s.belief_clip };
+    let b = Belief { pred: pred.to_vec(), tilt: s.belief_tilt, clip: s.belief_clip, tilts: s.target_tilts(G::AUX) };
     tree.set_belief(Some(b), s.belief_mix, live, &mut slot.search_rng);
     Ok(())
 }

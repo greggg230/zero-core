@@ -276,7 +276,8 @@ def load_into(ev, path, c):
     from .infer import NetEvaluator
     from .net import check_belief_head, load
     m, _ = load(path, 'cpu', game=c['game'])
-    if float(c.get('selfplay_belief_tilt', 0.0) or 0.0) > 0:
+    from .mcts import belief_tilts
+    if float(c.get('selfplay_belief_tilt', 0.0) or 0.0) > 0 or belief_tilts(c, 'selfplay'):
         # a league opponent is the self-play seat: it takes the root's belief too, so its checkpoint
         # needs the head (HeadMissing: narrow selfplay_league_pool to checkpoints that have one)
         check_belief_head(m, c['game'], f'selfplay_belief_tilt (the league opponent {path}: a selfplay_league_pool '

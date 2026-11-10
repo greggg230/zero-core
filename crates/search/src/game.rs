@@ -200,8 +200,8 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
 /// The root's belief of a search (docs/search.md 3.8): the network's auxiliary predictions for the
 /// root decider (`pred`, `SearchGame::aux_width()` floats in `AUX` order - a multinomial segment's
 /// distribution over its columns, `zero.net.aux_predict`), computed once per decision from the
-/// root's features (the decider's own view), and the seat's tilt and clip. `SearchGame::
-/// determinize_with` deals the hidden cards it is about from it.
+/// root's features (the decider's own view), and the seat's tilt, clip and per-target tilts.
+/// `SearchGame::determinize_with` deals the hidden cards it is about from it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Belief {
     pub pred: Vec<f32>,
@@ -212,6 +212,19 @@ pub struct Belief {
     /// R >= 1 (seat key `belief_clip`): every weight in [1/R, R], so no card is ever ruled out or
     /// forced.
     pub clip: f64,
+    /// Per-target tilts (seat key `belief_tilts`, docs/search.md 3.8.1): one per `SearchGame::AUX`
+    /// target, in `AUX` order - a target the seat names gets its own alpha (0 = not tilted by its
+    /// own setting) - or empty (the seat names none: every literal of before). The game decides
+    /// what each target's tilt deals (MTG Zero: `belief` its hand by `tilt`, `deck` its whole unseen
+    /// deck by this). With per-target tilts `tilt` may be 0: the game's own deal takes no tilt.
+    pub tilts: Vec<f64>,
+}
+
+impl Belief {
+    /// The tilt of `AUX` target `i` set by the seat's `belief_tilts` (0: none).
+    pub fn target_tilt(&self, i: usize) -> f64 {
+        self.tilts.get(i).copied().unwrap_or(0.0)
+    }
 }
 
 /// The weight of one category of hidden cards in a weighted deal (docs/search.md 3.8): `pred` =

@@ -41,8 +41,9 @@ pub trait DynGame: Send + Sync {
     fn score(&self, seat: usize) -> f32;
     fn determinize(&mut self, viewer: usize, seed: u64);
     /// `SearchGame::determinize_with` (docs/search.md 3.8) with the belief `pred` (`aux_width()`
-    /// floats), `tilt`, `clip`.
-    fn determinize_with(&mut self, viewer: usize, seed: u64, pred: &[f32], tilt: f64, clip: f64) -> Result<(), String>;
+    /// floats), `tilt`, `clip` and the per-target tilts `tilts` ((target, alpha), docs/search.md
+    /// 3.8.1; empty: none).
+    fn determinize_with(&mut self, viewer: usize, seed: u64, pred: &[f32], tilt: f64, clip: f64, tilts: &[(String, f64)]) -> Result<(), String>;
     fn encode(&self, viewer: usize) -> Vec<f32>;
     fn rounds(&self) -> u32;
     fn export_state(&self) -> String;
@@ -108,8 +109,8 @@ impl<G: SearchGame> DynGame for G {
     fn determinize(&mut self, viewer: usize, seed: u64) {
         SearchGame::determinize(self, viewer, &mut Rng::new(seed))
     }
-    fn determinize_with(&mut self, viewer: usize, seed: u64, pred: &[f32], tilt: f64, clip: f64) -> Result<(), String> {
-        let b = belief_of::<G>(pred, tilt, clip)?;
+    fn determinize_with(&mut self, viewer: usize, seed: u64, pred: &[f32], tilt: f64, clip: f64, tilts: &[(String, f64)]) -> Result<(), String> {
+        let b = belief_of::<G>(pred, tilt, clip, tilts)?;
         SearchGame::determinize_with(self, viewer, &mut Rng::new(seed), &b);
         Ok(())
     }
@@ -165,7 +166,7 @@ impl<G: SearchGame> DynGame for G {
         let mut l = Look::new(cfg, self, viewer, belief, ws, seeds, lines)?;
         if let Some(p) = pred {
             let (t, c, _) = belief.ok_or("lookahead: belief predictions without the belief's tilt / clip / mix")?;
-            l.set_belief(belief_of::<G>(&p, t, c)?)?;
+            l.set_belief(belief_of::<G>(&p, t, c, &[])?)?;
         }
         Ok(Box::new(LookBox { l, rng: Rng::new(seed), buf: RowsBuf { n: SearchGame::num_players(self), ..Default::default() }, waiting: false }))
     }
@@ -176,11 +177,16 @@ fn downcast<G: SearchGame>(g: &dyn DynGame) -> Result<&G, String> {
 }
 
 /// A `Belief` from the bindings' arguments, checked (docs/search.md 3.8): `aux_width()` finite
-/// predictions >= 0, a tilt > 0 and the clip / mix rules of `NnSeat::check_belief`.
-fn belief_of<G: SearchGame>(pred: &[f32], tilt: f64, clip: f64) -> Result<Belief, String> {
+/// predictions >= 0, a tilt > 0 (or a per-target tilt > 0, 3.8.1) and the clip / mix rules of
+/// `NnSeat::check_belief`.
+fn belief_of<G: SearchGame>(pred: &[f32], tilt: f64, clip: f64, tilts: &[(String, f64)]) -> Result<Belief, String> {
     crate::driver::NnSeat::check_belief(tilt, clip, 0.0)?;
-    if tilt <= 0.0 {
-        return Err(format!("a belief's tilt {tilt}: > 0 (a search without a belief deals uniformly)"));
+    crate::driver::NnSeat::check_belief_tilts(tilts, G::AUX)?;
+    let mut seat = crate::driver::NnSeat::eval(0, 1);
+    seat.belief_tilt = tilt;
+    seat.belief_tilts = tilts.to_vec();
+    if !seat.belief_on() {
+        return Err(format!("a belief's tilt {tilt}: > 0, or a per-target tilt > 0 (a search without a belief deals uniformly)"));
     }
     if pred.len() != G::aux_width() || G::aux_width() == 0 {
         return Err(format!("a belief of {} values: {} has {} auxiliary target values (SearchGame::AUX)", pred.len(), G::NAME, G::aux_width()));
@@ -188,7 +194,7 @@ fn belief_of<G: SearchGame>(pred: &[f32], tilt: f64, clip: f64) -> Result<Belief
     if let Some(x) = pred.iter().find(|x| !x.is_finite() || **x < 0.0) {
         return Err(format!("a belief's prediction {x}: finite and >= 0"));
     }
-    Ok(Belief { pred: pred.to_vec(), tilt, clip })
+    Ok(Belief { pred: pred.to_vec(), tilt, clip, tilts: seat.target_tilts(G::AUX) })
 }
 
 /// A leaf of a Python-driven search: decider, features, legal actions; with root-view values
@@ -236,8 +242,9 @@ pub trait DynTree: Send + Sync {
     /// win vector without them.
     fn set_root_min(&mut self, k: u32);
     /// The root's belief from now on (`Tree::set_belief`, docs/search.md 3.8; None = uniform worlds):
-    /// predictions, tilt, clip, the uniform share `mix`; `live` re-deals a tree without `redet`.
-    fn set_belief(&mut self, pred: Option<&[f32]>, tilt: f64, clip: f64, mix: f64, live: &dyn DynGame) -> Result<(), String>;
+    /// predictions, tilt, clip, the uniform share `mix`, the per-target tilts `tilts` (docs/search.md 3.8.1;
+    /// empty: none); `live` re-deals a tree without `redet`.
+    fn set_belief(&mut self, pred: Option<&[f32]>, tilt: f64, clip: f64, mix: f64, tilts: &[(String, f64)], live: &dyn DynGame) -> Result<(), String>;
     /// The current search's belief predictions (None: uniform worlds).
     fn belief(&self) -> Option<Vec<f32>>;
     fn root_min(&self) -> u32;
@@ -385,12 +392,12 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
     fn set_root_min(&mut self, k: u32) {
         self.t.set_root_min(k)
     }
-    fn set_belief(&mut self, pred: Option<&[f32]>, tilt: f64, clip: f64, mix: f64, live: &dyn DynGame) -> Result<(), String> {
+    fn set_belief(&mut self, pred: Option<&[f32]>, tilt: f64, clip: f64, mix: f64, tilts: &[(String, f64)], live: &dyn DynGame) -> Result<(), String> {
         let g = downcast::<G>(live)?;
         let b = match pred {
             Some(p) => {
                 crate::driver::NnSeat::check_belief(tilt, clip, mix)?;
-                Some(belief_of::<G>(p, tilt, clip)?)
+                Some(belief_of::<G>(p, tilt, clip, tilts)?)
             }
             None => None,
         };

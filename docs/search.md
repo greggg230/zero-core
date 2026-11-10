@@ -1020,6 +1020,30 @@ Tests: `tree::tests::belief_*`, `a_belief_deals_*`, `no_belief_*`, `without_rede
 `the_belief_deals_the_searches_worlds`, `root_view_values_and_the_belief_*`, `rolling_phases_ask_the_belief_*`,
 `tests/test_belief.py`.
 
+#### 3.8.1 Per-target tilts (`belief_tilts`; MTG Zero's Edge of Eternities deck tilt, 2026-11-10)
+
+A game whose belief predicts two hidden things - MTG Zero's opponent's hand (`belief`) and, with hidden decklists,
+their whole unseen deck (`deck`) - may want each dealt by its own tilt, or one without the other. The seat key
+`belief_tilts` ({target: alpha >= 0}; absent or {} = none, the seat of before) gives a target of the game's `AUX`
+its own alpha:
+
+* **The search**: a seat with a per-target tilt > 0 takes the root's belief exactly as one with `belief_tilt` > 0
+  (`NnSeat::belief_on`, `takes_belief`: one `ROW_BELIEF` row per full search, or every search with `belief_fast`),
+  even with `belief_tilt` 0. `belief_clip`, `belief_mix` and `belief_fast` apply to the whole deal as before.
+* **The game**: `Belief::tilts` holds them in `AUX` order (0 for a target the seat does not name; empty when it
+  names none - every `Belief` of before), `Belief::target_tilt(i)` reads one. What a target's tilt deals is the
+  game's (`determinize_with`); `Belief::tilt` may now be 0 (the seat's `belief_tilt`). The toy and HiddenMull read
+  their one target's tilt when set, else `tilt` (unchanged without per-target tilts).
+* **Checks**: the driver refuses a name that is not one of the game's targets, a name twice, an alpha not finite
+  or < 0 (`NnSeat::check_belief_tilts`), and per-target tilts on a lookahead seat (not built: its belief is
+  `belief_tilt`'s). The bindings: `Game.determinize_with(..., tilts=None)`, `SearchTree.set_belief(..., tilts=None)`;
+  the Python tree's belief takes them as a fourth item; `play.NNSeat(belief_tilts=)`.
+* **Off**: no seat names one: no key in any seat dict, no row, no change (the golden records and match, the toy runs).
+
+Tests: `driver::tests::per_target_tilts_take_the_belief_and_deal_by_it` (HiddenMull at `belief_tilt` 0 and `hand` 1:
+one row per full search, the same shift of seat 1's root value as `belief_tilt` 1), `per_target_tilts_are_checked`;
+`tests/test_belief_tilts.py`.
+
 ### 3.9 The exhaustive lookahead per information set (`lookahead`; MTG Zero's Delver mirror, 2026-11-01)
 
 **Why.** The Delver Lab's x-ply lookahead (delver-lab `delverlab/xply_is.py`, the per-world tree

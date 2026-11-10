@@ -138,7 +138,8 @@ class Tree:
 
     def set_belief(self, belief, mix=0.0, game=None, rng=None):
         """The root's belief for the search starting now (docs/search.md 3.8; the Rust tree's
-        `set_belief`): `belief` = (predictions float32 [aux width], tilt > 0, clip) or None (uniform
+        `set_belief`): `belief` = (predictions float32 [aux width], tilt > 0, clip) - or with a fourth item,
+        the per-target tilts {target: alpha} (docs/search.md 3.8.1; then the tilt may be 0) - or None (uniform
         worlds), `mix` the share of simulations dealt uniformly; without redet the one world of the
         decision is dealt again from `game`. `advance` clears it."""
         self.belief = belief
@@ -182,7 +183,7 @@ def deal(g, tree, rng):
     `determinize` (one `rng.getrandbits(63)` seed either way)."""
     b = tree.belief
     if b is not None and not (tree.belief_mix > 0 and rng.random() < tree.belief_mix):
-        g.determinize_with(tree.viewer, rng.getrandbits(63), b[0], b[1], b[2])
+        g.determinize_with(tree.viewer, rng.getrandbits(63), b[0], b[1], b[2], *((b[3],) if len(b) > 3 and b[3] else ()))
     else:
         g.determinize(tree.viewer, rng.getrandbits(63))
 
@@ -346,19 +347,42 @@ def belief_settings(cfg, pre='eval'):
             float(cfg.get('belief_mix', 0.0) or 0.0), bool(int(cfg.get('belief_fast', 0) or 0)))
 
 
-def belief_tag(tilt=0.0, clip=None, mix=0.0, fast=False):
+def check_belief_tilts(tilts, what='belief_tilts'):
+    """Per-target tilts of the root's belief (docs/search.md 3.8.1): None or a dict {target name: a finite
+    number >= 0} (0 = that target off) -> None, else ValueError (`what`: the setting's name). The targets
+    are checked against the game's by the Rust driver."""
+    if tilts is None:
+        return
+    if not isinstance(tilts, dict):
+        raise ValueError(f'{what} {tilts!r}: a dict {{target: tilt}} (docs/search.md 3.8.1)')
+    for k, v in tilts.items():
+        if not isinstance(k, str) or isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)                 or v < 0:
+            raise ValueError(f'{what} {k!r}: {v!r}: a target name and a finite number >= 0 (0 = off)')
+
+
+def belief_tilts(cfg, pre='eval'):
+    """{target: tilt > 0} of a run's seats `pre` ('eval' | 'selfplay'): its `<pre>_belief_tilts` (docs/search.md
+    3.8.1) without the zeros, sorted by target; {} when none (the seat of before)."""
+    t = cfg.get(pre + '_belief_tilts') or {}
+    check_belief_tilts(t, what=f'{pre}_belief_tilts')
+    return {k: float(t[k]) for k in sorted(t) if float(t[k]) > 0}
+
+
+def belief_tag(tilt=0.0, clip=None, mix=0.0, fast=False, tilts=None):
     """The suffix of a move rule's name for its searches' root belief (docs/search.md 3.8): '' (off),
     '-b1' (tilt 1, the default clip 20, no uniform share, full searches), '-b0.5c10m0.25f' (tilt 0.5,
-    clip 10, mix 0.25, fast searches too) - an evaluation's moves change with it, so its Elo pool does
-    (docs/az.md 5.4); a remote evaluation on a checkout without it reports another rule and is refused."""
-    if not tilt:
+    clip 10, mix 0.25, fast searches too); per-target tilts (3.8.1) after it, '-b1-tdeck0.5' (or '-b0-tdeck1'
+    with belief_tilt 0) - an evaluation's moves change with it, so its Elo pool does (docs/az.md 5.4); a
+    remote evaluation on a checkout without it reports another rule and is refused."""
+    tilts = {k: v for k, v in sorted((tilts or {}).items()) if v}
+    if not tilt and not tilts:
         return ''
     t = f'-b{float(tilt):g}'
     if clip is not None and float(clip) != BELIEF_CLIP:
         t += f'c{float(clip):g}'
     if mix:
         t += f'm{float(mix):g}'
-    return t + ('f' if fast else '')
+    return t + ('f' if fast else '') + ''.join(f'-t{k}{float(v):g}' for k, v in tilts.items())
 
 
 def check_leaf_view(view='mover', share=0.0, target='next_q', what='leaf_value_view'):

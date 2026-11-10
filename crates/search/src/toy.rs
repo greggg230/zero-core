@@ -868,7 +868,8 @@ impl SearchGame for ToyGame {
     /// (`order[round]`) drawn among the unrevealed cards of its stage with the weights
     /// `belief_weight(p_c, 1 / cards, tilt, clip)` (p = the belief's distribution over the 6 cards;
     /// the uniform deal gives each unrevealed card of the stage 1 / cards), then everything else as
-    /// `determinize` deals it. In the last round (no next card): `determinize`.
+    /// `determinize` deals it. In the last round (no next card): `determinize`. The tilt is the
+    /// `next_card` target's own when the seat sets one (`belief_tilts`, docs/search.md 3.8.1), else `tilt`.
     fn determinize_with(&mut self, viewer: usize, rng: &mut Rng, belief: &crate::game::Belief) {
         let r = self.round as usize;
         if self.over || r >= ROUNDS as usize || belief.pred.len() < N_CARDS {
@@ -877,7 +878,8 @@ impl SearchGame for ToyGame {
         let hi = if r < 3 { 3 } else { 6 };
         let n = hi - r;
         let u = 1.0 / n as f64;
-        let w: Vec<f64> = (r..hi).map(|i| crate::game::belief_weight(belief.pred[self.order[i] as usize] as f64, u, belief.tilt, belief.clip)).collect();
+        let tilt = if belief.target_tilt(0) > 0.0 { belief.target_tilt(0) } else { belief.tilt };
+        let w: Vec<f64> = (r..hi).map(|i| crate::game::belief_weight(belief.pred[self.order[i] as usize] as f64, u, tilt, belief.clip)).collect();
         let mut x = rng.unit() * w.iter().sum::<f64>();
         let mut k = n - 1;
         for (j, &wj) in w.iter().enumerate() {
