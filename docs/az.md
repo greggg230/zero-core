@@ -17,9 +17,9 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `package.py` | The game package registry: `GamePackage` (name, root, engine module, run module, presets, DEFAULTS overrides, external players, specs, decision kinds, dashboard title / port, env prefix, deferred-result glue), `register`, `active` |
 | `run.py` | The loop: `DEFAULTS`, `PRESETS` (the toy's + the package's), self-play (classic or rolling), training, evaluation, Elo, resume, STOP / PAUSE |
 | `cotrain.py` | Co-training (section 11): a primary game whose deferred terminals the episodes of a resolver game decide, one network each in one run: `CoRun` (the loop), `Coordinator` (parked games -> queued episodes -> results by tag -> `resolve`), `run_pair` (two drivers on two threads), `PrimaryRun` (team events as matches) |
-| `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions, `forward_static` (static shapes for the CUDA graphs, 10.6); all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; readers (a branch over declared inputs predicting an auxiliary target, fed into the trunk: `add_reader`, section 36); atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
-| `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place, `set_network` when a reader came or went (section 36), `reader`; `workers`: eager batches on threads; `graphs`: the conv network's `GraphRunner`, the token network's opt-in `TokenGraphRunner` - env ZERO_TOKEN_GRAPHS=1, section 10.6 -, `graph_calls`), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
-| `data.py` | Sample shards (`ShardWriter`, atomic npz, optionally compressed - remote self-play's; the features dense or, with `shard_sparse`, as their non-zeros - section 32; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (each shard subsampled as it is loaded; checks every shard; row provenance), `TargetStats` |
+| `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions, `forward_static` (static shapes for the CUDA graphs, 10.6); all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; readers (a branch over declared inputs predicting an auxiliary target, fed into the trunk: `add_reader`, section 36); a head widened to more targets, every output of before bit for bit (`widen_aux`; `load` does it for the game's declared targets: section 37); atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
+| `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place, `set_network` when a reader came or went or a head was widened (sections 36, 37), `reader`; `workers`: eager batches on threads; `graphs`: the conv network's `GraphRunner`, the token network's opt-in `TokenGraphRunner` - env ZERO_TOKEN_GRAPHS=1, section 10.6 -, `graph_calls`), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
+| `data.py` | Sample shards (`ShardWriter`, atomic npz, optionally compressed - remote self-play's; the features dense or, with `shard_sparse`, as their non-zeros - section 32; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (each shard subsampled as it is loaded; checks every shard; row provenance; the shards of a widened head's older layouts, section 37), `TargetStats` |
 | `finite.py` | The non-finite guard (section 4.1): vectorised NaN / inf checks, `NonFinite` |
 | `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
 | `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
@@ -196,8 +196,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 |---|---|
 | `config.json` | the resolved settings |
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
-| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15; with a reader on, `reader_<target>` its loss, `reader_<target>_hit`, and `readers`: the targets, `detach`, `added` the iteration that added them, section 36); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'; with `eval_games` 0 `eval_yard` has 0 games: the iteration is still evaluated, section 20.1), `elo` (`select`: its pool unless 'visits'), `elo_anchored` (with `elo_anchors`: the rating of the fit with the anchors fixed, section 20.1), `heldout` (with `heldout_shards`: the held-out losses, section 20.2), `phases` (seconds per phase), `seconds` |
-| `models/iter_NNNN.pt` | checkpoints (atomic); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15, `head_widened` {from, added} the iteration that widened it and per target its `rows` while the window holds shards of an older layout, section 37; with a reader on, `reader_<target>` its loss, `reader_<target>_hit`, and `readers`: the targets, `detach`, `added` the iteration that added them, section 36); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'; with `eval_games` 0 `eval_yard` has 0 games: the iteration is still evaluated, section 20.1), `elo` (`select`: its pool unless 'visits'), `elo_anchored` (with `elo_anchors`: the rating of the fit with the anchors fixed, section 20.1), `heldout` (with `heldout_shards`: the held-out losses, section 20.2), `phases` (seconds per phase), `seconds` |
+| `models/iter_NNNN.pt` | checkpoints (atomic; `extra['aux_older']`: the layouts a widened auxiliary head had, section 37); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15; with `shard_sparse` the features as `x_ptr` / `x_idx` / `x_val` instead of `x`: section 32): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
@@ -2892,7 +2892,8 @@ of one parameter group fits the trunk's parameters: it is loaded, and the head j
 group with fresh moments) and trains on the window whose older shards have no targets (masked). Every
 later checkpoint has the head and two parameter groups. The encoding guard (10.4) ignores the head (it
 reads no input): such a checkpoint loads, resumes and is checked like any. A new run with a weight on
-builds its first network with the head.
+builds its first network with the head. A checkpoint whose head predicts some of the game's targets is widened to
+all of them, exactly (section 37).
 
 ### 15.5 Replays (`zero.replay`, format 'zero-replay/1' extended)
 
@@ -4810,7 +4811,8 @@ equal tensors). The run does it itself: a fork of a run without the reader, `too
 AdamW moments of the trunk and the head (the saved groups load, the readers join as a new group) and trains on the
 window as it is (the targets were recorded already). `net.widen` carries a reader across a token layout change (its
 inputs moved to where `token_feature_map` put them: the same floats, the same first-layer columns); a declaration that
-reads MORE inputs after a layout change is refused (36.3), not widened (left for when it is needed).
+reads MORE inputs after a layout change is refused (36.3), not widened (left for when it is needed). A reader for a
+target that a widened head gained (section 37) is added the same way, at the same first training.
 
 **Tests** (`tests/test_reader.py`, 20; one CUDA): the declarations' checks; built last (every other tensor equal, the
 outputs equal, the readers' columns zero); `add_reader` exact on the three archs, the RNG untouched, `add_aux` before
@@ -4915,3 +4917,220 @@ gets the reader exactly at its first training), `belief: true` if its search sho
 hand from the reader's prediction rather than the head's. Open: a softmax over ~330 identities makes inputs of ~1/330
 each - the projection learns its scale (Adam), but a scaled input (p x width) may train faster; `reader_detach` 0 and
 the reader's width are A/B arms; a layout change that widens the reader's inputs needs a reader widen (36.6).
+
+## 37. Widening an auxiliary head: new targets for a trained head (`net.widen_aux`; MTG Zero's Edge of Eternities deck target, 2026-11-09)
+
+### 37.1 Why
+
+MTG Zero's game gains a second auxiliary target. Its head has one today, `belief` (the opponent's hand by identity,
+1,024 wide, multinomial; section 15, its ENGINE.md 66); its Edge of Eternities work adds `deck` (the opponent's unseen
+deck, also 1,024), so the game's layout becomes `[belief, deck]` = 2,048 outputs. Until now a checkpoint whose head's
+layout differed from the run's was refused - at the run's first training (SystemExit) and, with a root belief on, at
+its start (`HeadMissing`, section 18.3) - so MTG Zero's trained Delver networks could not resume or fork onto the new
+code without `strip_aux` and a fresh head: the belief they learned, lost. Section 15.4 (`add_aux`) carries a checkpoint
+without a head over exactly, section 36.6 (`add_reader`) one without readers; this is the missing case - the
+checkpoint's head predicts some of the game's targets - with every output of before kept bit for bit.
+
+### 37.2 What it does
+
+* **The rule** (`net.aux_widen_problem`): the head's targets T, the game's declared targets T' (its package's `aux`):
+  every target of T is in T' by name with the same width and loss, and T' adds at least one. T' may be declared in any
+  order: each target's outputs move to its place in T' (its columns of every raw output, prediction and recorded target
+  vector are T''s). Anything else is refused (37.3).
+* **The head** (`net.widen_aux(model, layout)`): the head's hidden layer (the trunk's pooled state -> `head` (128),
+  ReLU) is kept; its last layer is kept as it is (`aux_head.2`); the new targets get a last layer of their own on the
+  same hidden activations (`aux_more.<k>`: head -> their total width, zero weights and bias). The forward runs the hidden
+  layer once, each part's last layer on it, concatenates them and puts the columns in T''s order (`aux_perm`, a
+  non-persistent index buffer, only when that order differs from the parts'). Config: `aux` = T' - what every consumer
+  reads (the losses, `aux_predict`, the readers' columns after it, the belief rows, replays) -, and `aux_parts` = the
+  split, `[[part 0's targets], [part 1's], ...]`, only on a widened network; a second widen adds a part. Every parameter
+  and buffer of the network of before stays as it was, and every output of before - policy, value, margin, each old
+  target's raw outputs, the readers' - is the same computation on the same inputs: bit for bit, on any device, in any
+  dtype. The new targets start at what zeros predict (uniform for 'multinomial', unit rates for 'poisson', 0 for 'mse').
+* **Why not one wider last layer** (the obvious "same MLP, more rows"): a matrix product's kernel and blocking depend on
+  its output width, so the old rows of a wider layer are not computed bit for bit. Measured on this desktop (CPU,
+  torch's default threads; RTX 5090): `F.linear` of 256 rows through the toy's head (128 -> 6) against the same rows
+  through a 128 -> 9 layer whose first 6 rows are the old ones differs by up to 1.7e-6 on the CPU, and under CUDA bf16
+  autocast (the training's amp) by 0.016; MTG's shape (128 -> 1,024 vs 2,048) happened to agree on both. A wider layer
+  would also need its AdamW moments cut row by row under one step count shared by old and new rows (the new rows'
+  updates without Adam's bias correction: 6.5x a fresh parameter's step at step 10, 3.3x at step 100).
+* **The hidden layer is shared - what that means for training**: the new targets read the head's hidden layer, as a
+  fresh head for both targets would (one MLP). That layer has learned the old targets' features, and the new targets
+  start from them; from the first training on it learns from every target's loss (each `aux_<name>_w`), and so does
+  the trunk below it. The new part starts at zero, so the new loss sends the hidden layer and the trunk no gradient
+  until the part has learned something (15.4's fresh head likewise). The old targets' predictions move only as the
+  shared layers do: on the toy the old target's held-out loss came out 0.015 / 0.012 nats worse than a control's over
+  the next seven checkpoints (two seeds; 37.6), the policy and value no different. A separate hidden layer per part
+  would isolate the old targets (not built: the measured cost is within the checkpoints' noise, and MTG's targets - a
+  hand and a deck of one opponent - should share their features).
+* **Where the run does it**: `net.load(path, game=...)` widens a checkpoint's head when the game's declared targets
+  include its targets and add some (`net.game_aux`; the game is the caller's, else the checkpoint's; nothing happens
+  when the layouts are the same, the head is missing, or the rule refuses). Every consumer therefore sees the widened
+  head: the run's training - where 15.4 adds a head: its first training after a resume or a fork (`tools/fork_run.py
+  --source <run> --dest <fork> --iter K --set aux_<new>_w=0.25`), or a run's first training from an older checkpoint
+  -, the self-play and evaluation evaluators, the league's slots, the Elo pool's older checkpoints, the anchors, the
+  root belief's checks (`check_belief_head`: a widened head serves a belief for the game's targets, its new segments at
+  their zero-row predictions - so a run with `selfplay_belief_tilt` / `eval_belief_tilt` on resumes on the new layout at
+  once, its pre-widen checkpoints still playing its Elo matches), remote workers and evaluation hosts (their own
+  `load`), `zero.h2h`, replays, `fork_run --net`, distillation's teacher. The training logs `iter K: auxiliary head of
+  checkpoint K-1 widened [...] -> [...] (every output of before unchanged)` and its metrics row gets
+  `train.aux.head_widened` = {from, added}; checkpoint K is written with `aux_parts`.
+* **The optimizer**: the AdamW moments of every parameter of before are kept - the trunk, the head (its hidden layer
+  and its old last layer: the same tensors as before), the readers; each new part is a parameter group of its own,
+  after the readers, with fresh moments (step 0, Adam's bias correction as for any new parameter: 15.4, 36.6).
+  `run.match_opt_groups` finds the saved groups among the network's groups by their parameters' shapes, in the saved
+  order, so the moments survive any order of `add_aux`, `widen_aux` and `add_reader` (a reader added after a widen: the
+  saved trunk, head and part load into their groups, the readers start fresh). The first training after a widen has no
+  warm-up (the saved state loaded, as 15.4).
+* **The training window**: the shards recorded before the widen hold the old layout's targets (narrower, in the old
+  order); self-play after it records the game's (the engine's `aux_target`). A widened network remembers the layouts it
+  had (`aux_older`: written to every later checkpoint's `extra['aux_older']` by `net.save`, read back by `load`, carried
+  by `add_reader`, `strip_aux` and `widen`), and the run gives the window `aux_older = auxtarget.older_columns(T',
+  aux_older)`: a shard of an older layout's width has its targets put in their columns of T' (the others zero), and a
+  mask per row and target (`Window.aux_tmask` [N, T], `batch()['aux_tmask']`) keeps each target's loss to the rows that
+  recorded it (`auxtarget.losses(..., tmask=)`, the readers' losses too). So the shards of before keep training the old
+  targets and never teach a new one zeros (a 'poisson' or 'mse' target would learn them; a multinomial's empty row is
+  skipped anyway). `train.aux` gains each target's `rows` (and its multinomial figures on those rows); the window cache
+  keys a shard by the older layouts too; the RAM budget counts T bytes a row more. Each widen adds a target, so each
+  older layout has a width of its own; two older layouts of one width placing their columns differently are refused.
+* **Readers** (36): a reader is tied to a target, and adding one for a new target is `add_reader`'s job. The two compose:
+  the run widens the head when it loads the checkpoint, then adds the reader at the same first training when the fork
+  turns on the new target's weight and its reader (`--set aux_deck_w=0.25 --set reader_deck=1`). Tested: the head
+  widened and then the reader added, or the reader added and then the head widened, give the same network (the
+  reader's fresh draws aside: they depend on what was built before it); a reader of the new target added after the
+  widen changes no output; the readers' columns follow the head's W' in `forward(..., aux=True)`.
+* **Evaluators**: `NetEvaluator.set_network` takes the new network itself (its CUDA graphs rebuilt) when both networks
+  have a head and the heads differ (targets or parts: the state has other shapes) - a rolling evaluator built from a
+  network of before; the same head: `set_weights` as before. The token network's CUDA graphs (`forward_static`) and the
+  conv network's folded copy run the parts with no code of their own (tested against eager on CUDA).
+
+### 37.3 Refusals stay loud; nothing to turn on
+
+* **Refused**: a target removed or renamed (the head would lose what it learned: `strip_aux`, then fork), a width or a
+  loss changed, the same targets in another order (the shards of the two orders could not be told apart by width). For
+  these `load` leaves the head as it is and the run refuses where the head is needed, as before: its first training
+  (SystemExit naming both layouts and section 37), a root belief (`HeadMissing`, exit 78); `widen_aux` itself raises
+  ValueError, and `add_aux` on a head for some of the targets points to `widen_aux`. A network without a head: `add_aux`
+  (15.4).
+* **No setting**: what it changes was refused before. With the game's layout unchanged nothing changes - `load` compares
+  the layouts and returns the network, no checkpoint gets `aux_parts` or `aux_older`, the optimizer's groups and the
+  losses are the code of before, the window gets no `aux_older` (no `aux_tmask`), config.json gains no key. Checked byte
+  for byte (37.6).
+* An older checkout cannot build a widened checkpoint (its constructors do not know `aux_parts`): it fails loudly at
+  load, as for readers (36.3).
+
+### 37.4 Costs
+
+* **Parameters**: a part per widen, head x (the new targets' width) + that width - MTG's deck: 128 x 1,024 + 1,024 =
+  132,096, what a one-layer head of 2,048 has as well (8.5% of MTG's 1.55M-parameter token network; the optimizer state
+  and the checkpoint grow by the same).
+* **Compute**: on the head's rows only (training, `aux`, root belief rows): the parts' matrix products (the arithmetic
+  of one wider layer), a concatenation of B x W' and, when the order differs, a column gather. The search's own batches
+  do not compute the head (15.2).
+* **Load**: a widen at each load of a pre-widen checkpoint: 9.1 ms on a 128 x 4 token network with a 1,024-wide head
+  widened by 1,024 (4 CPU threads; a plain build and state copy of it 4.6 ms); a whole load of a Delver checkpoint (3.3M
+  parameters) widened to `[belief, deck]` 0.10 s (37.8).
+* **Window**: T bytes a row (the mask) while the run has older layouts.
+* **Off**: nothing (the code of before, plus one layout comparison per `load`).
+
+### 37.5 Tests (`tests/test_aux_widen.py`, 13; one CUDA)
+
+The refusals (removed, renamed, width, loss, a pure reorder, no head, `add_aux`'s pointer); `widen_aux` on the three
+archs from the toy's head (next_card) by targets after it, before it and around it, of all three losses: every
+parameter of before equal, policy / value / margin and the old target's raw outputs `torch.equal` on 64 real positions
+(all rows and belief rows' rows), the new columns zero (their predictions uniform / 1 / 0), the global RNG untouched, the
+config rebuilding the same network; a second widen keeping the first part; `save` / `load` (extra `aux_older`, `load`
+widening for the game's targets with the package declaring a second one, leaving a refused head as it is, the
+attributes through `strip_aux`, `add_reader` and `widen`), `check_belief_head` serving the widened head and refusing the
+narrower; widen and readers in either order and a reader of the new target; `set_network`; `older_columns`' checks; the
+window over shards without targets, of the older and of the new layout (placement, `aux_tmask`, the cache, the sparse
+window, subsampling, the refusal without `aux_older`) and the losses counting each target's rows ('mse' over its rows
+only); `match_opt_groups` (the groups of before, a reader after a widen, history's order, parameters never stepped);
+the run: a toy run with next_card, forked with `tests/toy_aux2.py`'s second target `next_parity` (the next card's
+parity, 2 wide; declared on the Python side - package, engine info, shard writer - since the toy's engine has one
+target) - widened at its first training (logged once, `head_widened`), no optimizer state lost (the moments of before
+one step count, the part's newer), the older shard counted for next_card and not next_parity, next_parity learning,
+checkpoints with `aux_parts` and `aux_older`, the run with one target writing neither, checkpoint K widened computing
+K's outputs bit for bit on 256 positions; with the GPU visible, the token graphs (belief rows too) and the conv graphs
+answering what eager answers.
+
+### 37.6 Measured on the toy (desktop, 2026-11-09, CPU, other projects' jobs on the machine)
+
+`next_parity` is the parity of the next round's hidden card - not public: the next round's stage (rounds 1-3: cards 0-2,
+4-6: cards 3-5) has one or two even cards and the revealed ones say which are left (`toy_aux2.best_public`, the best
+loss from public information). A tokens run (toy-smoke, 200 games an iteration, `aux_next_card_w` 0.5,
+`ZERO_INFLIGHT=1`), forked at iteration 4 into a control A (next_card only) and an arm B (`tests/toy_aux2.py`,
+`aux_next_parity_w` 0.5), both run to iteration 12; seeds 0 and 1.
+
+* **Exactness in the run**: iteration 5's self-play - A by checkpoint 4, B by checkpoint 4 widened - is the same array
+  for array (1,296 / 1,341 rows: every key; `aux` B's first 6 columns, B 8 wide). B's log: one `widened` line, no
+  "optimizer state not loaded".
+* **Learning**, held out on B's iteration-12 rows (1,228 / 1,282 rows, 999 / 1,007 with a next_parity target; the best
+  from public information 0.310 / 0.316 nats, uniform ln 2 = 0.693), seed 0 / seed 1:
+
+| checkpoint | B next_parity | B next_card | A next_card | B policy | A policy | B value | A value |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 (B: widened) | 0.693 / 0.693 | 0.526 / 0.546 | 0.526 / 0.546 | 1.669 / 1.749 | 1.669 / 1.749 | 0.601 / 0.636 | 0.601 / 0.636 |
+| 5 | 0.366 / 0.399 | 0.525 / 0.591 | 0.518 / 0.561 | 1.601 / 1.685 | 1.605 / 1.684 | 0.600 / 0.621 | 0.605 / 0.618 |
+| 7 | 0.329 / 0.358 | 0.525 / 0.521 | 0.520 / 0.507 | 1.554 / 1.633 | 1.567 / 1.625 | 0.578 / 0.611 | 0.581 / 0.615 |
+| 9 | 0.331 / 0.332 | 0.516 / 0.511 | 0.526 / 0.514 | 1.539 / 1.567 | 1.545 / 1.571 | 0.566 / 0.599 | 0.573 / 0.600 |
+| 11 | 0.318 / 0.328 | 0.533 / 0.545 | 0.504 / 0.505 | 1.532 / 1.552 | 1.535 / 1.548 | 0.575 / 0.579 | 0.560 / 0.594 |
+| mean 5-11 | - | 0.530 / 0.533 | 0.516 / 0.522 | 1.556 / 1.610 | 1.562 / 1.611 | 0.576 / 0.603 | 0.577 / 0.607 |
+
+  The new target learns from uniform to within 0.008 / 0.012 nats of the best any predictor can do from public
+  information in seven iterations (training loss 0.468 / 0.471 at iteration 5, its first training, 0.30-0.33 from
+  iteration 7). The old target: 0.015 / 0.012 nats worse in B on average (single checkpoints swing by up to 0.06 in
+  both arms); at
+  iteration 5, where A and B train on the same rows in the same batches, B's training next_card loss is 0.536 / 0.507
+  against A's 0.529 / 0.499 - the shared hidden layer's cost (37.2). Policy and value: no difference beyond the noise.
+* **Byte identity** against 0974e50 (its own worktree, the same engine build - no Rust change -, `ZERO_INFLIGHT=1`,
+  CPU), every run in both checkouts: toy-smoke MLP (3 iterations), tokens (3), rolling cq targets + `eval_select cq`
+  `eval_select_min_visits` 2 (3), tokens + rolling + `aux_next_card_w` 0.5 (3), `aux_next_card_w` 0.5 with
+  `window_sparse`, `window_cache` and `shard_sparse` (3), the Delver line's shape with the head and the reader (tokens,
+  rolling, cq, guard 4 at 0.3, value_q 0.6, window_cache, train_prefetch 2, margin_w 0.2, chance_k 2, no random games,
+  `aux_next_card_w` 0.25, `reader_next_card` 1; 4), a fork that adds the head (`--set aux_next_card_w=1.0`, 15.4) and
+  one that adds the reader (`--set reader_next_card=1`, 36.6), each checkout's own fork_run - 14-16 files a run: every
+  shard, checkpoint (config, state, extra), optimizer state, Elo file, `models/index.json`, metrics (timings aside) and
+  config.json identical; `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy MLP, a toy token, a
+  toy token-with-head and a toy head-and-reader checkpoint) identical.
+
+### 37.7 For MTG Zero
+
+To move a belief-only checkpoint onto the two-target layout MTG Zero (1) declares `deck` - in `SearchGame::AUX` /
+`aux_target` (the true state's unseen deck by identity) and in its package's `aux`, with `belief`'s entry unchanged
+(name, 1,024, 'multinomial'; `deck` before or after it); (2) moves its pin to a core with this section; (3) runs on:
+a resume of a Delver run on the new build, or a fork (`tools/fork_run.py --source <run> --dest <fork> --iter K --set
+aux_deck_w=0.25`, and `--set reader_deck=1` for 36.9's reader), loads checkpoint K with its belief head widened -
+`belief`'s outputs bit for bit, `deck` uniform - so self-play, the root belief (`selfplay_` / `eval_belief_tilt`: the
+engine's belief rows are then 2,048 wide and the widened head answers them; its `determinize_with` reads a uniform deck
+segment until the part has learned), the Elo pool's older checkpoints and remote workers work from the first
+iteration; the first training trains the deck part from zero with fresh moments while everything else keeps its own,
+on a window whose belief-only shards keep training `belief` (masked for `deck`). With `aux_deck_w` 0 and
+`aux_belief_w` > 0 the head is widened too (the game's layout) and the deck part stays at zero. No step by hand:
+`strip_aux` is not needed and nothing is rewritten in the source run. Worth a game-side test: a delver checkpoint
+loaded by the two-target build predicts the same belief, to the bit (as 37.5's).
+
+### 37.8 Checks
+
+Tier "opt-in core feature with byte-identical defaults"; desktop, 2026-11-09, CPU with CUDA hidden unless said:
+
+* **cargo**: no Rust change (the branch's crates are 0974e50's; not rerun).
+* **pytest** `tests`: 435 passed, 11 skipped, 2 failed - `test_remoteplay::test_cotrain_backoff_gives_matches_back` and
+  `test_cotrain_episodes_requeued_on_timeout` (the remote worker not started in time: MTG Zero's suite and smoke run
+  were running beside it; neither touches an auxiliary target). `tests/test_remoteplay.py` rerun whole: 29 passed, 1
+  failed (`test_backoff_moves_the_quota_to_this_machine`, another of AGENTS.md's timing tests); the three alone: passed.
+  `tests/test_aux_widen.py`'s CUDA test with the GPU visible: passed.
+* **The toy and byte identity**: 37.6.
+* **The games build against this core**: `SKIP_CORE=1 SMOKE_TARGET=aux-widen bash tools/smoke_all.sh --with-this-core
+  --build-only` at 47b0900: Glass Road Zero (28 s), Caverna Zero (26 s), Kingdom Builder Zero (50 s) built; games: 3 of
+  3 checked, GREEN.
+* **MTG Zero** (`eoe-net` at 3020b2a, which pins 0974e50 - this branch's base; smoke_all does not look for MTG Zero),
+  by hand: a scratch worktree of 3020b2a with this core (bca121c) in `third_party/zero-core` (the submodule initialised
+  from the local zero-core repository: `git -c submodule.third_party/zero-core.url=<zero-core> -c
+  protocol.file.allow=always submodule update --init`, then the commit checked out), `ZERO_CORE_UNPINNED=1
+  tools/build_py.sh` (built, 2 min), its `pytest tests` 221 passed, 1 skipped, `mtgz.az.run --preset mtg-smoke` 4
+  iterations, every game finished (64 games). And a real Delver checkpoint - r3-deep128x16-2736's iteration 3064, a
+  3.3M-parameter token network with the belief head (1,024, multinomial) -, loaded by that build with its package
+  declaring `deck` (1,024, multinomial) after `belief`: widened at load in 0.10 s (`aux_parts` [[belief], [deck]]),
+  policy, value, margin and belief's raw outputs `torch.equal` to the checkpoint's own on 512 of its self-play rows,
+  `deck` uniform.
