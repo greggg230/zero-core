@@ -497,6 +497,29 @@ def opt_state_mismatch(model, state, params=None):
     return None
 
 
+def match_opt_groups(state, pgroups):
+    """Which of the parameter groups `pgroups` (lists of parameters) an optimizer state dict's groups belong
+    to, in the saved order -> [an index of `pgroups` per saved group], or None when a saved group fits none
+    (docs/az.md 37: the network of a widened head has the groups of before and new ones, the order of
+    history). Each saved group takes the first group not taken with as many parameters whose moments have
+    their shapes (a parameter never stepped has none: its count decides)."""
+    groups = state.get('param_groups') or []
+    st = state.get('state', {})
+    taken = []
+    for g in groups:
+        ids = list(g.get('params', []))
+        for j, pg in enumerate(pgroups):
+            if j in taken or len(pg) != len(ids):
+                continue
+            if all(tuple(v.shape) == tuple(p.shape) for i, p in zip(ids, pg) for v in (st.get(i) or {}).values()
+                   if torch.is_tensor(v) and v.dim() > 0):
+                taken.append(j)
+                break
+        else:
+            return None
+    return taken or None
+
+
 def window_iters(cfg, it):
     return min(cfg['window'], 1 + it // 2) if cfg['window_grow'] else cfg['window']
 
@@ -1168,10 +1191,16 @@ class Run:
         t0 = time.time()
         model, _ = load(model_path(self.run, it - 1), dev, game=c['game'])
         added = False
+        # a head for some of the game's targets was widened to all of them by `load` (docs/az.md 37)
+        widened = getattr(model, 'aux_widened', None)
+        if widened:
+            self.log(f'iter {it}: auxiliary head of checkpoint {it - 1} widened {[t[0] for t in widened]} -> '
+                     f'{[t[0] for t in model.aux_layout]} (every output of before unchanged; docs/az.md 37)')
         if self.aux and aux_layout(model.config.get('aux')) != self.aux:
             if model.config.get('aux'):
                 raise SystemExit(f'iter {it}: checkpoint {it - 1} has the auxiliary head {model.config["aux"]}, this run '
-                                 f'trains {self.aux} (net.strip_aux, then fork the run)')
+                                 f'trains {self.aux} (a head for some of the targets is widened exactly, docs/az.md 37; '
+                                 f'a target removed, renamed or changed: net.strip_aux, then fork the run)')
             # a checkpoint without the head (a fork of a run without it): a fresh head, the rest as it was
             model = add_aux(model, self.aux, seed=c['seed'] * 7919 + it)
             added = True
@@ -1198,11 +1227,14 @@ class Run:
                              f'is {model.config.get("arch", "mlp")!r} (set train_static 0)')
         # fused AdamW (train_static on CUDA): the same update, one kernel set for every parameter
         okw = {'fused': True} if static and str(dev).startswith('cuda') else {}
-        heads = [p for n, p in model.named_parameters() if n.startswith('aux_')]
+        heads = [p for n, p in model.named_parameters() if n.startswith('aux_head.')]
         rdrs = [p for n, p in model.named_parameters() if n.startswith('readers.')]
         trunk = [p for n, p in model.named_parameters() if not n.startswith('aux_') and not n.startswith('readers.')]
+        # a widened head's later parts (docs/az.md 37): a group each, after the readers
+        more = [[p for n, p in model.named_parameters() if n.startswith(f'aux_more.{k}.')]
+                for k in range(len(getattr(model, 'aux_more', None) or []))]
         # parameter groups: the network of before, its auxiliary head, its readers (each when it has them)
-        pgroups = [g for g in (trunk, heads, rdrs) if g]
+        pgroups = [g for g in [trunk, heads, rdrs] + more if g]
         if len(pgroups) > 1:
             opt = torch.optim.AdamW([{'params': g} for g in pgroups], lr=c['lr'], weight_decay=c['wd'], **okw)
         else:
@@ -1215,7 +1247,21 @@ class Run:
                 if o.get('iter') == it - 1:
                     groups = o['state'].get('param_groups') or []
                     k = len(groups)
-                    if 0 < k < len(pgroups) and [len(g.get('params', [])) for g in groups] == [len(g) for g in pgroups[:k]]:
+                    if more:
+                        # a widened head (docs/az.md 37): each saved group is one part of this network (the
+                        # trunk, the head of before, the readers, an earlier widen's part) - matched by its
+                        # parameters' shapes, its moments kept; the parts it lacks start fresh
+                        at = match_opt_groups(o['state'], pgroups)
+                        if at is None:
+                            raise ValueError(f'it belongs to another network ({opt_state_mismatch(model, o["state"])})')
+                        ordered = [pgroups[j] for j in at]
+                        opt = torch.optim.AdamW(ordered[0] if len(ordered) == 1 else [{'params': g} for g in ordered],
+                                                lr=c['lr'], weight_decay=c['wd'], **okw)
+                        opt.load_state_dict(o['state'])
+                        for j, g in enumerate(pgroups):
+                            if j not in at:
+                                opt.add_param_group({'params': g})
+                    elif 0 < k < len(pgroups) and [len(g.get('params', [])) for g in groups] == [len(g) for g in pgroups[:k]]:
                         # the state of the network before its head (and / or readers): kept for it, the new
                         # parts start fresh
                         bad = opt_state_mismatch(model, o['state'], params=[p for g in pgroups[:k] for p in g])
@@ -1239,12 +1285,17 @@ class Run:
         lr = lr_at(c, it)
         paths = self.window_shards(it)
         aw = sum(w for _, w, _ in self.aux)
-        bpr = model.features * 2 + 8 * 16 + 3 * MAX_SEATS * 4 + (2 * aw + 1 if aw else 0)
+        # a widened head (docs/az.md 37): the window's shards of its older, narrower layouts load too
+        older = AUX.older_columns(self.aux, getattr(model, 'aux_older', None)) if aw else None
+        bpr = (model.features * 2 + 8 * 16 + 3 * MAX_SEATS * 4 + (2 * aw + 1 if aw else 0)
+               + (len(self.aux) if older is not None else 0))
         budget = int(c['ram_budget_gb'] * 1e9 / bpr)
         t1 = time.time()
         if c.get('window_cache') and self.wcache is None:
             self.wcache = WindowCache()
         kw = {'aux_width': aw} if aw else {}
+        if older is not None:
+            kw['aux_older'] = older
         if c.get('window_sparse'):
             kw['sparse'] = True
         W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it,
@@ -1267,6 +1318,7 @@ class Run:
         # each reader's columns of the forward's auxiliary outputs (after the head's) and of the targets
         rcols, k0 = [], aw
         cols = {name: sl for name, _, sl in AUX.columns(self.aux)}
+        tidx = {name: j for j, (name, _, _) in enumerate(self.aux)}
         for r in readers:
             rcols.append((r['target'], [[r['target'], r['width'], r['loss']]], slice(k0, k0 + r['width']),
                           cols[r['target']]))
@@ -1312,7 +1364,9 @@ class Run:
             loss = lp + lv + mw * lm
             terms = [lp.detach(), lv.detach(), lm.detach()]
             if aw:
-                la = AUX.losses(self.aux, ap.float(), b['aux'], b['aux_mask'])
+                # (a window with shards of an older layout: each target's rows, docs/az.md 37)
+                tkw = {'tmask': b['aux_tmask']} if 'aux_tmask' in b else {}
+                la = AUX.losses(self.aux, ap.float(), b['aux'], b['aux_mask'], **tkw)
                 for name, v in la.items():
                     if self.aux_w[name] > 0:
                         loss = loss + self.aux_w[name] * v['loss']
@@ -1320,7 +1374,8 @@ class Run:
                 # the readers: their targets' losses on their own outputs (docs/az.md 36)
                 lr_ = {}
                 for name, lay, rsl, tsl in rcols:
-                    lr_[name] = AUX.losses(lay, ap[:, rsl].float(), b['aux'][:, tsl], b['aux_mask'])[name]
+                    rkw = {'tmask': b['aux_tmask'][:, tidx[name]:tidx[name] + 1]} if tkw else {}
+                    lr_[name] = AUX.losses(lay, ap[:, rsl].float(), b['aux'][:, tsl], b['aux_mask'], **rkw)[name]
                     loss = loss + self.aux_w[name] * lr_[name]['loss']
                     terms.append(lr_[name]['loss'].detach())
             opt.zero_grad(set_to_none=True)
@@ -1380,6 +1435,9 @@ class Run:
                 out['aux'] = dict(AUX.window_stats(W, self.aux), weights=dict(self.aux_w))
                 if added:
                     out['aux']['head_added'] = True
+                if widened:
+                    out['aux']['head_widened'] = {'from': [t[0] for t in widened],
+                                                  'added': [t[0] for t in self.aux if t not in widened]}
             if readers:
                 out['readers'] = {'targets': [r['target'] for r in readers], 'detach': bool(model.reader_detach)}
                 if r_added:

@@ -582,11 +582,14 @@ def _file_key(path):
     return st.st_size, st.st_mtime_ns
 
 
-def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1):
+def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1, older=None):
     """One shard's part of a window: rows `idx` (None = all N), features cut / zero-padded to F
     written into `xdst` (a fresh array when None: then also returned as 'x'); `sparse`: instead the
     features as SparseRows 'xs' (converted on `xthreads` threads); `AW` > 0: the auxiliary
-    targets too ('aux' float16 [rows, AW] and 'aux_mask': zeros and False for a shard without them).
+    targets too ('aux' float16 [rows, AW] and 'aux_mask': zeros and False for a shard without them);
+    `older` (`auxtarget.older_columns`, docs/az.md 37): a shard of an older layout's width has its
+    targets put in their places (the others zero), and 'aux_tmask' [rows, T] says which targets a row
+    has.
     A sparse shard (`shard_sparse`): its rows' non-zeros scattered into `xdst` (the dense shard's rows
     bit for bit), or kept as they are stored for `sparse`."""
     p = _read_shard_sparse(path, F, idx, xthreads) if sparse else read_shard(path, dense=False)
@@ -629,13 +632,25 @@ def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1):
         out[key] = a
     if AW:
         if 'aux' in p:
-            if p['aux'].shape[1] != AW:
-                raise ValueError(f'shard {path}: auxiliary targets of width {p["aux"].shape[1]}, the window wants {AW}')
+            w = p['aux'].shape[1]
+            if older is not None and w != AW and w in older['maps']:
+                # a shard of an older, narrower layout (docs/az.md 37): its targets in their places
+                cols, have = older['maps'][w]
+                out['aux'] = np.zeros((len(idx), AW), np.float16)
+                out['aux'][:, cols] = p['aux'][sel].astype(np.float16)
+                out['aux_mask'] = np.ones(len(idx), bool)
+                out['aux_tmask'] = np.repeat(have[None, :], len(idx), 0)
+                return out
+            if w != AW:
+                raise ValueError(f'shard {path}: auxiliary targets of width {w}, the window wants {AW}'
+                                 + (f' (or an older layout of {sorted(older["maps"])})' if older is not None else ''))
             out['aux'] = p['aux'][sel].astype(np.float16)
             out['aux_mask'] = np.ones(len(idx), bool)
         else:
             out['aux'] = np.zeros((len(idx), AW), np.float16)
             out['aux_mask'] = np.zeros(len(idx), bool)
+        if older is not None:
+            out['aux_tmask'] = np.repeat(out['aux_mask'][:, None], older['T'], 1)
     return out
 
 
@@ -645,8 +660,8 @@ def _subset_part(part, idx, xs=True):
     lens = part['lens']
     off = np.concatenate([np.zeros(1, np.int64), np.cumsum(lens)])
     pos = _ranges(off[idx], lens[idx])
-    out = {k: part[k][idx] for k in ('src', 'player', 'n_players', 'lens', 'z', 'q', 'sc', 'aux', 'aux_mask')
-           if k in part}
+    out = {k: part[k][idx] for k in ('src', 'player', 'n_players', 'lens', 'z', 'q', 'sc', 'aux', 'aux_mask',
+                                     'aux_tmask') if k in part}
     out.update(opt_action=part['opt_action'][pos], pi=part['pi'][pos])
     if xs and 'xs' in part:
         out['xs'] = part['xs'].take(idx)
@@ -761,12 +776,16 @@ class Window:
     `threads`: shards loaded at once (default WINDOW_THREADS); the result does not depend on it.
     `cache`: a WindowCache (module docstring): used while the window fits its budget; `reused` =
     the rows it supplied. `aux_width` W > 0: the auxiliary targets too (module docstring; `aux_rows`
-    = the rows that have them)."""
+    = the rows that have them). `aux_older` (`auxtarget.older_columns`; a run whose auxiliary head was
+    widened, docs/az.md 37): shards recorded under an older, narrower layout load too, their targets in
+    their places, and `aux_tmask` [N, T] (else None) says which targets each row has."""
 
     def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, threads=None, cache=None,
-                 aux_width=0, sparse=False):
+                 aux_width=0, sparse=False, aux_older=None):
         self.F, self.A = num_features, num_actions
         self.AW = AW = int(aux_width)
+        older = aux_older if AW else None
+        okw = {'older': older} if older is not None else {}     # (none: the calls of before)
         self.paths = list(paths)
         self.reused = 0
         self._x = self._xs = self._csr = self._xsp = None
@@ -787,14 +806,15 @@ class Window:
             if cache is not None:
                 # every shard cached whole (its rows as non-zeros), subsampled from the cache: the window
                 # of loading the picks, also over budget
-                keys = {path: (_file_key(path), ('sparse', self.F, AW)) for path in self.paths}
+                ck = ('sparse', self.F, AW) + ((older['key'],) if older is not None else ())
+                keys = {path: (_file_key(path), ck) for path in self.paths}
                 for path in list(cache.parts):
                     if path not in keys or cache.parts[path][:2] != keys[path]:
                         del cache.parts[path]
                 todo = [k for k, path in enumerate(self.paths) if path not in cache.parts]
                 todo.sort(key=lambda k: -rows[k])  # the big shards first (the order of the results is the paths')
                 loaded = _run_all(lambda j: _load_part(self.paths[todo[j]], rows[todo[j]], None, self.F, AW=AW,
-                                                       sparse=True, xthreads=T), len(todo), T)
+                                                       sparse=True, xthreads=T, **okw), len(todo), T)
                 for k, part in zip(todo, loaded):
                     cache.parts[self.paths[k]] = keys[self.paths[k]] + (part,)
                 self.reused = self.N - sum(kept[k] for k in todo)
@@ -807,17 +827,18 @@ class Window:
                 # (a big shard's conversion on T threads too: it is the slowest part, and a small
                 # shard's few chunks bound the threads in flight)
                 parts = _run_all(lambda k: _load_part(self.paths[k], rows[k], picks[k], self.F, AW=AW, sparse=True,
-                                                      xthreads=T), len(self.paths), T)
+                                                      xthreads=T, **okw), len(self.paths), T)
                 self._csr = SparseRows.concat([q['xs'] for q in parts], self.F)
         elif cache is not None and keep >= 1.0:
             # (the auxiliary width only when on: the keys of before otherwise)
-            keys = {path: (_file_key(path), (self.F, AW) if AW else self.F) for path in self.paths}
+            ck = ((self.F, AW) + ((older['key'],) if older is not None else ())) if AW else self.F
+            keys = {path: (_file_key(path), ck) for path in self.paths}
             for path in list(cache.parts):         # gone from the window, rewritten, another width
                 if path not in keys or cache.parts[path][:2] != keys[path]:
                     del cache.parts[path]
             todo = [k for k, path in enumerate(self.paths) if path not in cache.parts]
-            loaded = _run_all(lambda j: _load_part(self.paths[todo[j]], rows[todo[j]], None, self.F, AW=AW), len(todo),
-                              threads)
+            loaded = _run_all(lambda j: _load_part(self.paths[todo[j]], rows[todo[j]], None, self.F, AW=AW, **okw),
+                              len(todo), threads)
             for k, part in zip(todo, loaded):
                 cache.parts[self.paths[k]] = keys[self.paths[k]] + (part,)
             self.reused = self.N - sum(rows[k] for k in todo)
@@ -828,8 +849,8 @@ class Window:
                 cache.clear()                      # over budget: subsampled shards are not cached
             self._x = np.empty((self.N, self.F), np.float16)
             parts = _run_all(lambda k: _load_part(self.paths[k], rows[k], picks[k], self.F,
-                                                  self._x[self.starts[k]:self.starts[k + 1]], AW=AW), len(self.paths),
-                             threads)
+                                                  self._x[self.starts[k]:self.starts[k + 1]], AW=AW, **okw),
+                             len(self.paths), threads)
         self.src_row = np.concatenate([q['src'] for q in parts])     # window row -> its row in its shard
         self.player = np.concatenate([q['player'] for q in parts])
         self.n_players = np.concatenate([q['n_players'] for q in parts])
@@ -845,12 +866,14 @@ class Window:
         self.aux = np.concatenate([q['aux'] for q in parts]) if AW else None
         self.aux_mask = np.concatenate([q['aux_mask'] for q in parts]) if AW else None
         self.aux_rows = int(self.aux_mask.sum()) if AW else 0
+        self.aux_tmask = np.concatenate([q['aux_tmask'] for q in parts]) if older is not None else None
         xbytes = (self._x.nbytes if self._x is not None else self._csr.nbytes if self._csr is not None
                   else sum(a.nbytes for a in self._xsp) if self._xsp is not None
                   else sum(a.nbytes for a in self._xs))
         self.nbytes = xbytes + sum(a.nbytes for a in (self.player, self.n_players, self.opt_off, self.opt_action,
                                                       self.pi, self.z, self.q, self.sc)
-                                   + ((self.aux, self.aux_mask) if AW else ()))
+                                   + ((self.aux, self.aux_mask) if AW else ())
+                                   + ((self.aux_tmask,) if self.aux_tmask is not None else ()))
 
     @property
     def x(self):
@@ -960,6 +983,8 @@ class Window:
         if self.AW:
             out['aux'] = t(self.aux[idx].astype(np.float32))
             out['aux_mask'] = t(self.aux_mask[idx].astype(np.float32))
+            if self.aux_tmask is not None:
+                out['aux_tmask'] = t(self.aux_tmask[idx].astype(np.float32))
         if tokens is not None:
             pidx, step = tokens
             has = pidx >= 0

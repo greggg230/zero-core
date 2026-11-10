@@ -655,9 +655,12 @@ class NetEvaluator:
         the evaluator's network's (docs/az.md 36: a reader is part of the trunk's input - a state cannot carry it
         into a network without one, and `set_weights` refuses such a state): then the evaluator takes `model`
         itself, on its device, its CUDA graphs rebuilt (a rolling evaluator of a run whose readers were added at
-        its last training)."""
+        its last training). So too when both networks have an auxiliary head and the heads differ (targets or
+        parts: a head widened, docs/az.md 37 - its state has other shapes)."""
         from .net import reader_layout
-        if reader_layout(model.config.get('readers')) == reader_layout(self.model.config.get('readers')):
+        a, b = model.config, self.model.config
+        head = bool(a.get('aux')) and bool(b.get('aux')) and any(a.get(k) != b.get(k) for k in ('aux', 'aux_parts'))
+        if not head and reader_layout(a.get('readers')) == reader_layout(b.get('readers')):
             return self.set_weights(model.state_dict())
         self.model = model.to(self.device).eval()
         if isinstance(self.fast, TokenGraphRunner):

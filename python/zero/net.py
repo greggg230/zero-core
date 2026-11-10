@@ -27,7 +27,12 @@ Heads:
            initialises the rest as one without), its last layer zero; `add_aux` gives a network
            without the head (an older checkpoint) a fresh one, everything else copied exactly
            (its policy / value / margin outputs unchanged), `strip_aux` removes it. The encoding
-           guard ignores it: the head reads no input.
+           guard ignores it: the head reads no input. `widen_aux` gives a head new targets (docs/az.md
+           37: a game that declares more targets than a checkpoint's head predicts): the head's last
+           layer stays as it was and the new targets' outputs come from a layer of their own on the
+           same hidden layer (config `aux_parts`, `aux_more`), zero, so every output of before is
+           computed by the same layers, bit for bit; `load` does it for a checkpoint whose head
+           predicts a subset of the game's declared targets (`game_aux`).
   readers: optional (config key `readers`, the game package's `readers`; docs/az.md 36): per
            reader, a small MLP from declared ranges of the features (a token network: its bags and
            globals) to one auxiliary target's raw outputs, trained by that target's loss; its
@@ -89,12 +94,68 @@ def _aux_head(dim, head, layout):
     return m
 
 
-def _with_aux(model, dim, head, aux):
-    """Give `model` its auxiliary head (config 'aux') when `aux` names targets (built last)."""
+def aux_parts_of(layout, parts):
+    """The split of an auxiliary head's last layer (config `aux_parts`, docs/az.md 37) checked against its
+    layout: [[target name, ...], ...] - part 0 the head's own last layer (`aux_head[2]`), part k >= 1 the layer
+    `aux_more[k - 1]` of the targets the k-th `widen_aux` added; every target of `layout` in exactly one part,
+    no part empty -> (parts, perm): perm the layout's columns in the parts' concatenated outputs (None when
+    they are in the layout's order). No parts, or one part in the layout's order: (None, None) - the head of
+    before (one layer)."""
+    lay = aux_layout(layout)
+    if not parts:
+        return None, None
+    parts = [[str(n) for n in p] for p in parts]
+    names = [n for n, _, _ in lay]
+    flat = [n for p in parts for n in p]
+    if any(not p for p in parts) or len(set(flat)) != len(flat) or sorted(flat) != sorted(names):
+        raise ValueError(f'aux_parts {parts}: every auxiliary target of {names} in exactly one part, no part empty')
+    if len(parts) == 1 and flat == names:
+        return None, None
+    width = {n: w for n, w, _ in lay}
+    start, k = {}, 0
+    for n in flat:
+        start[n] = k
+        k += width[n]
+    perm = [start[n] + i for n in names for i in range(width[n])]
+    return parts, (None if perm == list(range(k)) else perm)
+
+
+def _with_aux(model, dim, head, aux, parts=None):
+    """Give `model` its auxiliary head (config 'aux') when `aux` names targets (built last); `parts`
+    (config 'aux_parts', a widened head: `widen_aux`): its last layer split by targets, the parts after
+    the first as `aux_more` (zero), registered right after the head (before the readers)."""
     model.aux_layout = aux_layout(aux)
     if model.aux_layout:
         model.config['aux'] = model.aux_layout
-        model.aux_head = _aux_head(dim, head, model.aux_layout)
+        parts, perm = aux_parts_of(model.aux_layout, parts)
+        if parts is None:
+            model.aux_head = _aux_head(dim, head, model.aux_layout)
+            return
+        model.config['aux_parts'] = parts
+        spec = {n: [n, w, loss] for n, w, loss in model.aux_layout}
+        model.aux_head = _aux_head(dim, head, [spec[n] for n in parts[0]])
+        if len(parts) > 1:
+            model.aux_more = nn.ModuleList(nn.Linear(head, sum(spec[n][1] for n in p)) for p in parts[1:])
+            for lin in model.aux_more:
+                nn.init.zeros_(lin.weight)
+                nn.init.zeros_(lin.bias)
+        if perm is not None:
+            model.register_buffer('aux_perm', torch.tensor(perm, dtype=torch.long), persistent=False)
+
+
+def _aux_raw(model, z):
+    """The auxiliary head's raw outputs on the pooled states `z`, in its layout's order: one MLP; a widened
+    head (docs/az.md 37) runs its hidden layer once and each part's last layer on it - the first part the
+    layer of before, so its targets' outputs are the same computation bit for bit - concatenated and put in
+    the layout's order."""
+    more, perm = getattr(model, 'aux_more', None), getattr(model, 'aux_perm', None)
+    if more is None and perm is None:
+        return model.aux_head(z)
+    h = model.aux_head[1](model.aux_head[0](z))
+    out = model.aux_head[2](h)
+    if more is not None:
+        out = torch.cat([out] + [lin(h) for lin in more], 1)
+    return out if perm is None else out.index_select(1, perm)
 
 
 def _aux_out(model, z, rows=None, rraw=None):
@@ -103,7 +164,7 @@ def _aux_out(model, z, rows=None, rraw=None):
     (docs/az.md 36; None: no readers)."""
     if not model.aux_layout and rraw is None:
         raise ValueError('forward(aux=True): the network has no auxiliary head (net.add_aux)')
-    out = model.aux_head(z if rows is None else z[rows]) if model.aux_layout else None
+    out = _aux_raw(model, z if rows is None else z[rows]) if model.aux_layout else None
     if rraw is None:
         return out
     rr = rraw if rows is None else rraw[rows]
@@ -249,7 +310,7 @@ class Block(nn.Module):
 
 class Net(nn.Module):
     def __init__(self, features, actions, hidden=256, blocks=4, seats=MAX_SEATS, game='toy', head=128, aux=None,
-                 readers=None):
+                 readers=None, aux_parts=None):
         super().__init__()
         self.config = {'features': features, 'actions': actions, 'hidden': hidden, 'blocks': blocks,
                        'seats': seats, 'game': game, 'head': head}
@@ -261,7 +322,7 @@ class Net(nn.Module):
         self.pol = nn.Linear(hidden, actions)
         self.val = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(hidden, head), nn.ReLU(), nn.Linear(head, seats))
-        _with_aux(self, hidden, head, aux)
+        _with_aux(self, hidden, head, aux, aux_parts)
         # readers (docs/az.md 36): their predictions are added to the first layer's input
         _with_readers(self, features, hidden, readers)
 
@@ -325,7 +386,7 @@ class GridNet(nn.Module):
     Every feature outside the plane blocks is a global."""
 
     def __init__(self, features, actions, grid, ch=64, blocks=6, seats=MAX_SEATS, game='toy', head=128, ghid=128,
-                 arch='grid', aux=None, readers=None):
+                 arch='grid', aux=None, readers=None, aux_parts=None):
         super().__init__()
         grid = grid_spec(grid)
         segs = grid['segments']
@@ -361,7 +422,7 @@ class GridNet(nn.Module):
         self.other = nn.Linear(256, actions - H * W)
         self.val = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(256, head), nn.ReLU(), nn.Linear(head, seats))
-        _with_aux(self, 256, head, aux)
+        _with_aux(self, 256, head, aux, aux_parts)
         # readers (docs/az.md 36): their predictions are added to the globals' embedding (which biases
         # the stem, every block and the pooled trunk)
         _with_readers(self, features, ghid, readers)
@@ -556,7 +617,7 @@ class TokenNet(nn.Module):
     """
 
     def __init__(self, features, actions, layout, d=128, layers=3, heads=4, ff=256, seats=MAX_SEATS, game='toy',
-                 head=128, arch='tokens', aux=None, readers=None):
+                 head=128, arch='tokens', aux=None, readers=None, aux_parts=None):
         super().__init__()
         lay = tokens_layout(layout, features, actions)
         self.config = {'arch': 'tokens', 'features': features, 'actions': actions, 'layout': lay, 'd': d,
@@ -627,7 +688,7 @@ class TokenNet(nn.Module):
         for lin in (self.gen, self.ptr):
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
-        _with_aux(self, 2 * d, head, aux)
+        _with_aux(self, 2 * d, head, aux, aux_parts)
         # readers (docs/az.md 36): they read the flat part of the features - the bags and the globals,
         # every feature outside the segments (what the CUDA graphs' host copy always copies) - and their
         # predictions are added to the global token's input
@@ -878,13 +939,15 @@ def add_aux(model, aux, seed=0):
     policy / value / margin outputs unchanged, and a fresh head (initialised from `seed`, the global
     torch RNG untouched; its last layer zero: it predicts the uniform / unit / zero output and sends
     the trunk no gradient until it has learned something). A network with that head already: `model`
-    itself; with another one: ValueError (strip_aux first)."""
+    itself; with another one: ValueError (a head for some of the targets: `widen_aux`; else strip_aux
+    first)."""
     aux = aux_layout(aux)
     have = aux_layout(model.config.get('aux'))
     if have == aux:
         return model
     if have or not aux:
-        raise ValueError(f'add_aux: the network has the auxiliary head {have}, wanted {aux} (strip_aux first)')
+        raise ValueError(f'add_aux: the network has the auxiliary head {have}, wanted {aux} (a head for some of the '
+                         f'targets: widen_aux; else strip_aux first)')
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(seed)
         new = build(dict(model.config, aux=aux))
@@ -900,10 +963,95 @@ def strip_aux(model):
     margin), e.g. for code that predates the head."""
     if not model.config.get('aux'):
         return model
-    new = build({k: v for k, v in model.config.items() if k != 'aux'})
+    new = build({k: v for k, v in model.config.items() if k not in ('aux', 'aux_parts')})
     new.load_state_dict({k: v for k, v in model.state_dict().items() if not k.startswith('aux_')})
     dev = next(model.parameters()).device
+    return _carry(model, new).to(dev).train(model.training)
+
+
+def aux_widen_problem(have, want):
+    """Why a head for the targets `have` cannot be widened to `want` (docs/az.md 37), or None: every target
+    of `have` must be in `want` (by name) with the same width and loss, and `want` must add one. A target
+    removed or renamed, a width or a loss changed, no head at all (`add_aux`) or the same targets in another
+    order (shards of the two orders could not be told apart: the training window places a narrower shard's
+    columns by its width) are refused."""
+    have, want = aux_layout(have), aux_layout(want)
+    if not have:
+        return 'the network has no auxiliary head (add_aux gives it a fresh one)'
+    spec = {n: (w, loss) for n, w, loss in want}
+    for n, w, loss in have:
+        if n not in spec:
+            return (f'its target {n!r} is not among {[t[0] for t in want]} (a target removed or renamed: refused - '
+                    f'the head would lose what it learned; net.strip_aux, then fork the run)')
+        if spec[n] != (w, loss):
+            return f'its target {n!r} is {w} wide ({loss}), wanted {spec[n][0]} wide ({spec[n][1]})'
+    if len(want) == len(have):
+        return f'the same targets in another order ({[t[0] for t in have]} -> {[t[0] for t in want]})'
+    return None
+
+
+def widen_aux(model, aux):
+    """`model` with its auxiliary head widened to the targets `aux` (docs/az.md 37): every target of the
+    head's in `aux` with the same width and loss, `aux` adding at least one (`aux_widen_problem`, else
+    ValueError) -> a copy whose head's last layer is the one it had and whose new targets' outputs come from
+    a layer of their own on the same hidden layer (config `aux_parts`, parameters `aux_more.<k>`), zero: every
+    parameter and buffer of `model` exactly as it was, every output of before - policy, value, margin, each
+    old target's raw outputs, the readers' - the same computation bit for bit (on any device: one wider layer
+    would change the matrix product's kernel), each new target predicting what zeros predict (uniform for
+    'multinomial'). The targets may be declared in any order: the outputs are put in `aux`'s order. The
+    global torch RNG is untouched. The copy remembers the layout it was widened from (`aux_older`, saved in
+    its checkpoints' extra: the training window places the narrower shards of before by it) and, until it is
+    saved, `aux_widened` (that layout: the run logs it). A network with that head already: `model`."""
+    aux = aux_layout(aux)
+    have = aux_layout(model.config.get('aux'))
+    if have == aux:
+        return model
+    why = aux_widen_problem(have, aux)
+    if why:
+        raise ValueError(f'widen_aux: {why}')
+    old = {n for n, _, _ in have}
+    parts = [list(p) for p in model.config.get('aux_parts') or [[n for n, _, _ in have]]]
+    parts.append([n for n, _, _ in aux if n not in old])
+    with torch.random.fork_rng(devices=[]):
+        new = build(dict(model.config, aux=aux, aux_parts=parts))
+    missing, unexpected = new.load_state_dict(model.state_dict(), strict=False)
+    added = {f'aux_more.{len(parts) - 2}.weight', f'aux_more.{len(parts) - 2}.bias'}
+    if unexpected or set(missing) != added:
+        raise RuntimeError(f'widen_aux: state mismatch (missing {missing}, unexpected {unexpected})')
+    _carry(model, new)
+    new.aux_older = [list(map(list, o)) for o in getattr(model, 'aux_older', None) or []]
+    if have not in new.aux_older:
+        new.aux_older.append(have)
+    new.aux_widened = have
+    dev = next(model.parameters()).device
     return new.to(dev).train(model.training)
+
+
+def game_aux(model, game=None):
+    """`model` with its auxiliary head widened to `game`'s declared targets (the active game package's `aux`;
+    default the game in its config) when they include the head's and add some (`widen_aux`, docs/az.md 37),
+    else `model` as it is - a network without a head, with the game's head, or with a head the game's targets
+    cannot widen (the run refuses that where the head is needed: its training, a root belief)."""
+    have = aux_layout(model.config.get('aux'))
+    if not have:
+        return model
+    from . import package
+    want = package.active().aux_of(game or model.config.get('game'))
+    if not want or want == have or aux_widen_problem(have, want):
+        return model
+    return widen_aux(model, want)
+
+
+CARRIED = ('reader_detach', 'aux_older', 'aux_widened')
+
+
+def _carry(src, dst):
+    """`dst` with `src`'s Python attributes that are not in its config or state (CARRIED: the readers'
+    training gradient, the layouts its head was widened from) -> `dst`."""
+    for k in CARRIED:
+        if k in src.__dict__:
+            setattr(dst, k, src.__dict__[k])
+    return dst
 
 
 def add_reader(model, readers, seed=0):
@@ -926,6 +1074,7 @@ def add_reader(model, readers, seed=0):
     if unexpected or not missing or any(not k.startswith('readers.') for k in missing):
         raise RuntimeError(f'add_reader: state mismatch (missing {missing}, unexpected {unexpected})')
     new.reader_detach = getattr(model, 'reader_detach', True)
+    _carry(model, new)                             # (a widened head's layouts of before, docs/az.md 37)
     dev = next(model.parameters()).device
     return new.to(dev).train(model.training)
 
@@ -944,9 +1093,13 @@ def _replace(tmp, dst, tries=40):
 
 def save(model, path, extra=None):
     """Atomic (a crash never leaves a half-written checkpoint); a NaN / inf in any float tensor
-    raises finite.NonFinite instead of writing it (docs/az.md 4.1)."""
+    raises finite.NonFinite instead of writing it (docs/az.md 4.1). A network whose auxiliary head
+    was widened (`widen_aux`) also saves the layouts it had before in `extra['aux_older']`."""
     state = model.state_dict()
     check_state(state, path)
+    older = getattr(model, 'aux_older', None)
+    if older:
+        extra = dict(extra or {}, aux_older=[list(map(list, o)) for o in older])
     tmp = path + f'.{os.getpid()}.tmp'
     torch.save({'config': model.config, 'state': state, 'extra': extra or {}}, tmp)
     _replace(tmp, path)
@@ -957,14 +1110,21 @@ def load(path, device='cpu', game=None, allow_mismatch=False):
     built for another encoding than the one this build's `game` feeds it (default: the game in its
     config) raises EncodingMismatch (`check_encoding`). `allow_mismatch=True` skips the guard, for
     the callers that take such a network on purpose: tools/fork_run.py's widen, co-training's
-    resolver_init (both check what they write), tools/selfplay_digest.py and the widen tests."""
+    resolver_init (both check what they write), tools/selfplay_digest.py and the widen tests.
+    An auxiliary head that predicts some of the game's declared targets is widened to all of them
+    (`game_aux`, docs/az.md 37: every output of before unchanged, bit for bit); the layouts a head was
+    widened from come back as `aux_older` (from `extra`)."""
     ck = torch.load(path, map_location=device, weights_only=False)
     if not allow_mismatch:
         check_encoding(ck['config'], game, path)
     m = build(ck['config'])
     m.load_state_dict(ck['state'])
+    extra = ck.get('extra', {})
+    if extra.get('aux_older'):
+        m.aux_older = [aux_layout(o) for o in extra['aux_older']]
+    m = game_aux(m, game)
     m.to(device).eval()
-    return m, ck.get('extra', {})
+    return m, extra
 
 
 # ---------------------------------------------------------------- the encoding guard (docs/az.md 10.4)
@@ -1338,7 +1498,13 @@ def widen(old, features=None, actions=None, grid=None, layout=None):
     (`token_feature_map`: slots wider at their ends, bags with more rows or new bags, more
     globals; the same tokens): every new input column gets zero weights in its projection (the
     segment's input map, the bag map, the global map), so on any input of the new layout the
-    network computes what `old` computed on the old features of it (docs/az.md 10.3)."""
+    network computes what `old` computed on the old features of it (docs/az.md 10.3). The copy keeps
+    `old`'s attributes outside its config and state (`CARRIED`)."""
+    return _carry(old, _widen(old, features, actions, grid, layout))
+
+
+def _widen(old, features=None, actions=None, grid=None, layout=None):
+    """`widen` without the carried attributes."""
     cfg = dict(old.config)
     cfg['features'] = features or cfg['features']
     cfg['actions'] = actions or cfg['actions']
