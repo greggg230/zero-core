@@ -3,7 +3,7 @@ the others - its head's last layer kept, the new targets' outputs from a layer o
 layer, zero - so every output of before stays bit for bit. The network part (`widen_aux`, the refusals, the
 readers, `load` / `save`), the training window (shards of the older layout placed, a mask per target), the
 optimizer's groups, the evaluators; the run part: a run of the toy with a second target (tests/toy_aux2.py's
-`next_half`) forked from a run with one, widened at its first training and learning the new target."""
+`next_parity`) forked from a run with one, widened at its first training and learning the new target."""
 import os
 import subprocess
 import sys
@@ -23,7 +23,7 @@ import toy_aux2  # noqa: E402
 
 PYPATH = os.pathsep.join([os.path.join(ROOT, 'python')] + [p for p in [os.environ.get('PYTHONPATH')] if p])
 CARD = ['next_card', 6, 'multinomial']
-HALF = ['next_half', 2, 'multinomial']
+PAR = ['next_parity', 2, 'multinomial']
 RATE = ['rate', 3, 'poisson']
 LEVEL = ['level', 1, 'mse']
 TOY_AUX = [CARD]
@@ -77,10 +77,10 @@ def cols(layout, name):
 
 def test_refusals_stay_loud():
     m = nets(TOY_AUX)['mlp']
-    for want, why in (([HALF], 'not among'),                                   # removed
-                      ([['card', 6, 'multinomial'], HALF], 'not among'),        # renamed
-                      ([['next_card', 5, 'multinomial'], HALF], 'wide'),        # width changed
-                      ([['next_card', 6, 'poisson'], HALF], 'wide'),            # loss changed
+    for want, why in (([PAR], 'not among'),                                   # removed
+                      ([['card', 6, 'multinomial'], PAR], 'not among'),        # renamed
+                      ([['next_card', 5, 'multinomial'], PAR], 'wide'),        # width changed
+                      ([['next_card', 6, 'poisson'], PAR], 'wide'),            # loss changed
                       ([CARD], None)):                                          # the same: nothing to do
         if why is None:
             assert aux_widen_problem(TOY_AUX, want) == 'the same targets in another order ([\'next_card\'] -> ' \
@@ -89,13 +89,13 @@ def test_refusals_stay_loud():
         assert why in aux_widen_problem(TOY_AUX, want)
         with pytest.raises(ValueError, match=why):
             widen_aux(m, want)
-    two = widen_aux(m, [CARD, HALF])
+    two = widen_aux(m, [CARD, PAR])
     with pytest.raises(ValueError, match='another order'):                     # a pure reorder
-        widen_aux(two, [HALF, CARD])
+        widen_aux(two, [PAR, CARD])
     with pytest.raises(ValueError, match='no auxiliary head'):
-        widen_aux(nets()['mlp'], [CARD, HALF])
+        widen_aux(nets()['mlp'], [CARD, PAR])
     with pytest.raises(ValueError, match='widen_aux'):                         # add_aux points to it
-        add_aux(m, [CARD, HALF])
+        add_aux(m, [CARD, PAR])
 
 
 @pytest.mark.parametrize('arch', ['mlp', 'tokens', 'grid'])
@@ -110,7 +110,7 @@ def test_widen_keeps_every_output_bit_for_bit(arch):
     with torch.no_grad():
         ref = m(x, n, aux=True)
         ref_rows = m(x, n, aux=True, aux_rows=torch.tensor([5, 0, 9]))[3]
-    for lay in ([CARD, HALF], [HALF, CARD], [RATE, CARD, LEVEL]):
+    for lay in ([CARD, PAR], [PAR, CARD], [RATE, CARD, LEVEL]):
         torch.manual_seed(77)
         r0 = torch.rand(3)
         torch.manual_seed(77)
@@ -143,21 +143,21 @@ def test_widen_keeps_every_output_bit_for_bit(arch):
         with torch.no_grad():
             assert all(torch.equal(u, v) for u, v in zip(b.eval()(x, n, aux=True), out))
     # twice: the first widen's part kept, a second one added
-    w1 = widen_aux(m, [CARD, HALF])
+    w1 = widen_aux(m, [CARD, PAR])
     shake(w1, 0.3, 'aux_more.')
-    w2 = widen_aux(w1, [LEVEL, CARD, HALF, RATE])
-    assert w2.config['aux_parts'] == [['next_card'], ['next_half'], ['level', 'rate']]
-    assert w2.aux_older == [TOY_AUX, [CARD, HALF]]
+    w2 = widen_aux(w1, [LEVEL, CARD, PAR, RATE])
+    assert w2.config['aux_parts'] == [['next_card'], ['next_parity'], ['level', 'rate']]
+    assert w2.aux_older == [TOY_AUX, [CARD, PAR]]
     with torch.no_grad():
         o1, o2 = w1(x, n, aux=True)[3], w2(x, n, aux=True)[3]
-    lay2 = [LEVEL, CARD, HALF, RATE]
-    for name in ('next_card', 'next_half'):
-        assert torch.equal(o2[:, cols(lay2, name)], o1[:, cols([CARD, HALF], name)])
+    lay2 = [LEVEL, CARD, PAR, RATE]
+    for name in ('next_card', 'next_parity'):
+        assert torch.equal(o2[:, cols(lay2, name)], o1[:, cols([CARD, PAR], name)])
 
 
 def test_save_load_and_the_game_targets(tmp_path, monkeypatch):
     """A checkpoint keeps a widened head and the layouts of before (extra 'aux_older'); `load` widens a head for
-    some of the game's declared targets to all of them (the package declares next_half here) and leaves any
+    some of the game's declared targets to all of them (the package declares next_parity here) and leaves any
     other head as it is (the run refuses that where the head is needed)."""
     x, n = toy_x(seed=2), torch.full((64,), 2)
     m = nets(TOY_AUX)['tokens']
@@ -167,9 +167,9 @@ def test_save_load_and_the_game_targets(tmp_path, monkeypatch):
     assert torch.load(p1, weights_only=False)['extra'] == {'iter': 4}
     a, extra = load(p1)                                        # the package of the toy: next_card only
     assert a.config == m.config and not hasattr(a, 'aux_older') and extra == {'iter': 4}
-    monkeypatch.setitem(package.CORE.aux, 'toy', list(package.TOY_AUX) + [toy_aux2.HALF])
+    monkeypatch.setitem(package.CORE.aux, 'toy', list(package.TOY_AUX) + [toy_aux2.PARITY])
     b, extra = load(p1, game='toy')
-    assert b.config['aux'] == [CARD, HALF] and b.aux_widened == TOY_AUX and b.aux_older == [TOY_AUX]
+    assert b.config['aux'] == [CARD, PAR] and b.aux_widened == TOY_AUX and b.aux_older == [TOY_AUX]
     with torch.no_grad():
         u, v = m(x, n, aux=True), b(x, n, aux=True)
     assert all(torch.equal(s, t) for s, t in zip(u[:3], v[:3])) and torch.equal(v[3][:, :6], u[3])
@@ -177,7 +177,7 @@ def test_save_load_and_the_game_targets(tmp_path, monkeypatch):
     save(b, p2, {'iter': 5})
     ck = torch.load(p2, weights_only=False)
     assert ck['extra'] == {'iter': 5, 'aux_older': [TOY_AUX]} and ck['config']['aux_parts'] == [['next_card'],
-                                                                                                  ['next_half']]
+                                                                                                  ['next_parity']]
     c, _ = load(p2)
     assert c.aux_older == [TOY_AUX] and not hasattr(c, 'aux_widened')
     assert all(torch.equal(s, c.state_dict()[k]) for k, s in b.state_dict().items())
@@ -193,7 +193,7 @@ def test_save_load_and_the_game_targets(tmp_path, monkeypatch):
     # a root belief (docs/az.md 18) for the game's targets: the widened head serves it, the head of before not
     from zero.net import HeadMissing, check_belief_head
     info0 = G.info
-    monkeypatch.setattr(G, 'info', lambda g: dict(info0(g), aux_layout=list(info0(g)['aux_layout']) + [('next_half', 2)])
+    monkeypatch.setattr(G, 'info', lambda g: dict(info0(g), aux_layout=list(info0(g)['aux_layout']) + [('next_parity', 2)])
                         if g == 'toy' else info0(g))
     check_belief_head(b, 'toy')
     check_belief_head(load(p1, game='toy')[0], 'toy')
@@ -216,7 +216,7 @@ def test_cuda_graphs_answer_what_eager_answers_for_a_widened_head():
     for arch in ('tokens', 'grid'):
         m = nets(TOY_AUX)[arch]
         shake(m, 0.05)
-        w = widen_aux(m, [HALF, CARD])
+        w = widen_aux(m, [PAR, CARD])
         shake(w, 0.3, 'aux_more.')
         eager = NetEvaluator(w, 'cpu')
         want, want_b = eager.evaluate(x, n2, off, acts), eager.evaluate(x, n2, off, acts, extra)
@@ -237,8 +237,8 @@ def test_widen_and_readers_compose(arch):
     x, n = toy_x(seed=3), torch.full((64,), 2)
     m = nets(TOY_AUX)[arch]
     shake(m)
-    a = add_reader(widen_aux(m, [CARD, HALF]), TOY_READER, seed=4)
-    b = widen_aux(add_reader(m, TOY_READER, seed=4), [CARD, HALF])
+    a = add_reader(widen_aux(m, [CARD, PAR]), TOY_READER, seed=4)
+    b = widen_aux(add_reader(m, TOY_READER, seed=4), [CARD, PAR])
     assert a.config == b.config and set(a.state_dict()) == set(b.state_dict())
     # (a reader's fresh weights depend on what was built before it: the same seed, other draws)
     assert all(torch.equal(v, b.state_dict()[k]) for k, v in a.state_dict().items() if not k.startswith('readers.'))
@@ -246,10 +246,10 @@ def test_widen_and_readers_compose(arch):
         with torch.no_grad():
             o, ref = net(x, n, aux=True), m(x, n, aux=True)
         assert all(torch.equal(u, v) for u, v in zip(ref[:3], o[:3])) and torch.equal(o[3][:, :6], ref[3])
-    half_reader = reader_layout([{'target': 'next_half', 'width': 2, 'loss': 'multinomial', 'inputs': [[0, 6], [25, 6]],
+    parity_reader = reader_layout([{'target': 'next_parity', 'width': 2, 'loss': 'multinomial', 'inputs': [[0, 6], [25, 6]],
                                   'hidden': 8}])
-    w = widen_aux(m, [CARD, HALF])
-    r = add_reader(w, half_reader, seed=5)
+    w = widen_aux(m, [CARD, PAR])
+    r = add_reader(w, parity_reader, seed=5)
     with torch.no_grad():
         p, q = w(x, n, aux=True), r(x, n, aux=True)
     assert all(torch.equal(u, v) for u, v in zip(p[:3], q[:3]))
@@ -257,7 +257,7 @@ def test_widen_and_readers_compose(arch):
     shake(r, 0.3, 'readers.')
     with torch.no_grad():
         q = r(x, n, aux=True)
-    assert torch.allclose(reader_predict(r, q[3])['next_half'], torch.softmax(q[3][:, 8:], 1))
+    assert torch.allclose(reader_predict(r, q[3])['next_parity'], torch.softmax(q[3][:, 8:], 1))
 
 
 def test_set_network_takes_a_widened_network():
@@ -270,9 +270,9 @@ def test_set_network_takes_a_widened_network():
     shake(m)
     ev = NetEvaluator(m)
     want = ev.evaluate(x, n2, off, acts)
-    w = widen_aux(m, [CARD, HALF])
+    w = widen_aux(m, [CARD, PAR])
     ev.set_network(w)
-    assert ev.model is w and set(ev.aux(x, n2)) == {'next_card', 'next_half'}
+    assert ev.model is w and set(ev.aux(x, n2)) == {'next_card', 'next_parity'}
     assert all(np.array_equal(u, v) for u, v in zip(want, ev.evaluate(x, n2, off, acts)))
     ev.set_network(w)                                          # the same head: its weights, as before
     assert ev.model is w
@@ -290,13 +290,13 @@ def selfplay(games=12, seed=4):
 
 
 def test_older_columns_are_checked():
-    two = [CARD, HALF]
-    o = AUX.older_columns([HALF, CARD], [TOY_AUX])
+    two = [CARD, PAR]
+    o = AUX.older_columns([PAR, CARD], [TOY_AUX])
     assert o['T'] == 2 and list(o['maps']) == [6]
     c, have = o['maps'][6]
     assert c.tolist() == [2, 3, 4, 5, 6, 7] and have.tolist() == [False, True]
     assert AUX.older_columns(two, None) is None and AUX.older_columns(two, []) is None
-    for bad in ([[['next_card', 5, 'multinomial']]], [[HALF, ['x', 1, 'mse']]], [two]):
+    for bad in ([[['next_card', 5, 'multinomial']]], [[PAR, ['x', 1, 'mse']]], [two]):
         with pytest.raises(ValueError):
             AUX.older_columns(two, bad)
     with pytest.raises(ValueError, match='either'):                     # two layouts of one width
@@ -360,7 +360,7 @@ def test_optimizer_groups_are_matched_by_their_parts():
     """`match_opt_groups`: the saved groups of the network of before (trunk, head, readers - whichever it had)
     are found among a widened network's groups, in the saved order, by their parameters' shapes."""
     from zero.run import match_opt_groups
-    m = add_reader(widen_aux(nets(TOY_AUX)['mlp'], [CARD, HALF]), TOY_READER, seed=1)
+    m = add_reader(widen_aux(nets(TOY_AUX)['mlp'], [CARD, PAR]), TOY_READER, seed=1)
     names = [n for n, _ in m.named_parameters()]
     params = dict(m.named_parameters())
 
@@ -396,7 +396,7 @@ SMOKE = ['--preset', 'toy-smoke', '--conc', '24', '--games', '24', '--eval-games
 
 
 def run_loop(run, *extra, second=False, timeout=600):
-    """zero.run on the toy; `second`: with tests/toy_aux2.py's second target (next_half) declared."""
+    """zero.run on the toy; `second`: with tests/toy_aux2.py's second target (next_parity) declared."""
     e = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH)
     cmd = [os.path.join(ROOT, 'tests', 'toy_aux2.py')] if second else ['-m', 'zero.run']
     return subprocess.run([sys.executable, *cmd, '--run', str(run), *SMOKE, *extra], cwd=ROOT, capture_output=True,
@@ -405,10 +405,10 @@ def run_loop(run, *extra, second=False, timeout=600):
 
 def test_a_fork_widens_its_head_exactly_and_learns_the_new_target(tmp_path, monkeypatch):
     """A run with the toy's one target (next_card), forked (`fork_run --source`) and run on with a second
-    target declared (next_half): its first training widens checkpoint K's head (logged; `train.aux.head_widened`),
+    target declared (next_parity): its first training widens checkpoint K's head (logged; `train.aux.head_widened`),
     keeps the optimizer moments of every parameter of before (the new part a group of its own, fresh), trains
     on the window whose older shards have the first target only (their rows count for next_card, not for
-    next_half) and learns the new target. Checkpoint K widened computes K's outputs bit for bit; the run with
+    next_parity) and learns the new target. Checkpoint K widened computes K's outputs bit for bit; the run with
     one target writes neither `aux_parts` nor `aux_older`."""
     from zero.run import read_metrics
     sys.path.insert(0, os.path.join(ROOT, 'tools'))
@@ -421,19 +421,19 @@ def test_a_fork_widens_its_head_exactly_and_learns_the_new_target(tmp_path, monk
         assert 'aux_parts' not in ck['config'] and ck['extra'] == {'iter': it}
     c = tmp_path / 'fork'
     assert fork_run.main(['--source', str(src), '--dest', str(c), '--iter', '2']) == 0
-    p = run_loop(c, '--iters', '4', '--aux-next-half-w', '1.0', second=True)
+    p = run_loop(c, '--iters', '4', '--aux-next-parity-w', '1.0', second=True)
     assert p.returncode == 0, p.stdout + p.stderr
     log = open(c / 'log.txt', encoding='utf-8').read()
-    assert "iter 3: auxiliary head of checkpoint 2 widened ['next_card'] -> ['next_card', 'next_half']" in log
+    assert "iter 3: auxiliary head of checkpoint 2 widened ['next_card'] -> ['next_card', 'next_parity']" in log
     assert 'optimizer state not loaded' not in log and log.count('auxiliary head of checkpoint') == 1
     m = read_metrics(str(c))
     a3, a4 = m[3]['train']['aux'], m[4]['train']['aux']
-    assert a3['head_widened'] == {'from': ['next_card'], 'added': ['next_half']} and 'head_widened' not in a4
-    assert a3['next_half']['rows'] < a3['next_card']['rows'] == a3['rows']      # the older shard: next_card only
-    assert m[4]['train']['aux_next_half'] < np.log(2) and m[4]['train']['aux_next_half'] < m[3]['train']['aux_next_half']
+    assert a3['head_widened'] == {'from': ['next_card'], 'added': ['next_parity']} and 'head_widened' not in a4
+    assert a3['next_parity']['rows'] < a3['next_card']['rows'] == a3['rows']      # the older shard: next_card only
+    assert m[4]['train']['aux_next_parity'] < np.log(2) and m[4]['train']['aux_next_parity'] < m[3]['train']['aux_next_parity']
     for it in (3, 4):
         ck = torch.load(str(c / 'models' / f'iter_{it:04d}.pt'), weights_only=False)
-        assert ck['config']['aux'] == toy_aux2.LAYOUT2 and ck['config']['aux_parts'] == [['next_card'], ['next_half']]
+        assert ck['config']['aux'] == toy_aux2.LAYOUT2 and ck['config']['aux_parts'] == [['next_card'], ['next_parity']]
         assert ck['extra']['aux_older'] == [TOY_AUX]
     o = torch.load(str(c / 'models' / 'opt_latest.pt'), weights_only=False)['state']
     sizes = [len(g['params']) for g in o['param_groups']]
@@ -443,7 +443,7 @@ def test_a_fork_widens_its_head_exactly_and_learns_the_new_target(tmp_path, monk
     # checkpoint 2 widened: its outputs bit for bit (the package of this process declares next_card only)
     k2, _ = load(str(c / 'models' / 'iter_0002.pt'))
     assert k2.config['aux'] == TOY_AUX
-    monkeypatch.setitem(package.CORE.aux, 'toy', list(package.TOY_AUX) + [toy_aux2.HALF])
+    monkeypatch.setitem(package.CORE.aux, 'toy', list(package.TOY_AUX) + [toy_aux2.PARITY])
     w2, _ = load(str(c / 'models' / 'iter_0002.pt'), game='toy')
     x, n = toy_x(256, seed=8), torch.full((256,), 2)
     with torch.no_grad():
