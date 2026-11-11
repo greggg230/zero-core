@@ -8,7 +8,10 @@ the checkpoints the evaluation needs), evaluated there with `python -m <pkg>.az.
 <mirror> <iter>`, and its result appended to the run's `evals.jsonl` ({iter, eval_yard,
 eval_random, elo, time, host, seconds}); the mirror's Elo pool files (elo/, or elo/<rule>/ for an
 eval_select other than 'visits', docs/az.md 5.4) and models/index.json are copied back (the
-remote owns the run's Elo while `eval_remote` is on). The remote plays the run's own settings,
+remote owns the run's Elo while `eval_remote` is on), models/best.pt is set to the checkpoint that
+index.json names best (as elo.tag_checkpoints does where the pool is fitted), and the game package's
+files of the evaluation (`GamePackage.remote_eval_files`, e.g. its game log) are copied to the same
+paths in the run, before the result is recorded. The remote plays the run's own settings,
 eval_select included (config.json); a result that names another move rule than the run's is
 refused (the remote's checkout is not the run's code) and retried like a failure. The dashboards
 merge evals.jsonl into the iterations' rows. Fixed Elo anchors (run setting elo_anchors, docs/az.md
@@ -330,6 +333,27 @@ class RemoteEval:
                 self.t.put(model_path(self.R.run, k), self.rdir + '/models/' + fn)
                 self.shipped.add(fn)
 
+    def _fetch_files(self, it):
+        """The game package's files of this evaluation (`GamePackage.remote_eval_files`, docs/az.md 5.2):
+        each copied from the mirror to the same path in the run; a '*' in a path's last component
+        matches any characters (every match copied). A path with no file in the mirror, or a file that
+        does not arrive, fails the evaluation (RuntimeError: logged, retried) - the run's record of it
+        would be missing."""
+        import fnmatch
+        for rel in package.active().remote_eval_files_of(self.R.cfg['game'], it):
+            d, _, name = rel.rpartition('/')
+            names = sorted(n for n in self.t.listdir(f'{self.rdir}/{d}' if d else self.rdir) if fnmatch.fnmatchcase(n, name))
+            if not names:
+                raise RuntimeError(f"the evaluation left no {rel} in the mirror (the game package's remote_eval_files): "
+                                   f"not recorded")
+            for n in names:
+                sub = f'{d}/{n}' if d else n
+                dst = os.path.join(self.R.run, *sub.split('/'))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if not self.t.get(f'{self.rdir}/{sub}', dst):
+                    raise RuntimeError(f"{sub} of the mirror did not arrive (the game package's remote_eval_files): "
+                                       f"not recorded")
+
     def _evaluate(self, it):
         t0 = time.time()
         self._ship(it)
@@ -349,12 +373,21 @@ class RemoteEval:
         for k in ('eval_yard', 'eval_random', 'elo', 'elo_anchored'):
             if k in m:
                 row[k] = m[k]
+        self._fetch_files(it)
         pool = elo.pool_dir('', tag).replace(os.sep, '/')
         os.makedirs(elo.pool_dir(self.R.run, tag), exist_ok=True)
         files = ('results.json', 'ratings.json') + (('anchored.json',) if self.R.cfg.get('elo_anchors') else ())
         for fn in files:
             self.t.get(f'{self.rdir}/{pool}/{fn}', os.path.join(elo.pool_dir(self.R.run, tag), fn))
-        self.t.get(self.rdir + '/models/index.json', os.path.join(self.R.run, 'models', 'index.json'))
+        mdir = os.path.join(self.R.run, 'models')
+        if not self.t.get(self.rdir + '/models/index.json', os.path.join(mdir, 'index.json')):
+            raise RuntimeError('the mirror has no models/index.json after its evaluation: not recorded')
+        # models/best.pt follows the remote's fit as it follows a local one (elo.tag_checkpoints): the
+        # checkpoint index.json names best, copied here from the run's own models/
+        with open(os.path.join(mdir, 'index.json'), encoding='utf-8') as f:
+            best = json.load(f).get('best')
+        if best:
+            elo.set_best(mdir, best['file'])
         with open(os.path.join(self.R.run, 'evals.jsonl'), 'a', encoding='utf-8') as f:
             f.write(json.dumps(row) + '\n')
         ey = row.get('eval_yard')

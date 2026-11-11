@@ -86,13 +86,21 @@ class GamePackage:
                     64) its hidden width; belief (default false) true: a search's root belief rows
                     get the reader's prediction for the target instead of the head's. Each reader
                     gets the run setting `reader_<target>` (default 0 = off: the network of before)
+    remote_eval_files
+                    game -> [path, ...]: files a remote evaluation (zero.remote, docs/az.md 5.2) of the
+                    game writes in its mirror that belong to the run - the package's remote side
+                    writes them, `RemoteEval` copies each to the same path in the run after the
+                    evaluation and before its result is recorded; a missing one fails the evaluation
+                    (logged, retried). Paths are relative and '/'-separated, formatted with
+                    `iter` = the evaluated iteration ('games/eval-iter_{iter:04d}.jsonl': MTG Zero's
+                    game log of the evaluation's games). Default none: the copies of before
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
-                 replay_aux=None, readers=None):
+                 replay_aux=None, readers=None, remote_eval_files=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -119,6 +127,17 @@ class GamePackage:
         self.aux = dict(aux or {})
         self.replay_aux = dict(replay_aux or {})
         self.readers = dict(readers or {})
+        self.remote_eval_files = {g: list(ps) for g, ps in (remote_eval_files or {}).items()}
+        for g, ps in self.remote_eval_files.items():
+            for p in ps:
+                if not isinstance(p, str) or not p or p.startswith('/') or '\\' in p or '..' in p.split('/'):
+                    raise ValueError(f'{name}: remote_eval_files of {g!r}: {p!r} is not a relative /-separated path '
+                                     f'inside the mirror')
+
+    def remote_eval_files_of(self, game, it):
+        """The files a remote evaluation of `game`'s iteration `it` leaves in its mirror for the run
+        (`remote_eval_files`, formatted with `iter`); none: []."""
+        return [p.format(iter=int(it)) for p in self.remote_eval_files.get(game, [])]
 
     def aux_of(self, game):
         """`game`'s auxiliary targets [[name, width, loss], ...] (none: [])."""

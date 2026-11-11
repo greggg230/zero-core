@@ -324,7 +324,16 @@ yardsticks, the Elo matches and reference games - to another machine while the r
   <iter>` in the remote's `repo` (ssh, `BatchMode`), appends the result to the run's
   **`evals.jsonl`** (`{iter, eval_yard, eval_random, elo, time, host, seconds}`) and copies the
   mirror's `elo/results.json`, `elo/ratings.json` and `models/index.json` back: the remote owns
-  the run's Elo while `eval_remote` is on (`models/best.pt` is not copied back).
+  the run's Elo while `eval_remote` is on. `models/best.pt` follows it: the checkpoint the
+  returned index.json names best is copied to best.pt from the run's own `models/` (as
+  `elo.tag_checkpoints` does where the pool is fitted; before 2026-11-11 best.pt was left at the
+  last local evaluation's). The game package's **files of the evaluation**
+  (`GamePackage.remote_eval_files`: per game, mirror-relative paths formatted with `iter`, a `*` in
+  the last component matching any characters; MTG Zero's game log of the evaluation's games,
+  `games/eval-iter_{iter:04d}-*.jsonl`) are copied to the same paths in the run before the result
+  is recorded; a path with no file, or a file that does not arrive, fails the evaluation (logged,
+  retried). The package's remote side writes them; a package without `remote_eval_files` copies
+  what it did before.
 * **Remote side** (`zero.remote.main`): `Run.evaluate` + `Run.elo_update` on the mirror (the
   run's own code), with the remote's `<workdir>/overrides.json` (if any) over the mirror's config;
   **one evaluation at a time per workdir** (the lock directory `<workdir>/.eval.lock`, freed when

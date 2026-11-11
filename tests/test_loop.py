@@ -548,6 +548,41 @@ def test_remote_evaluation_local(tmp_path):
     from zero import dashboard
     rows = dashboard._metrics(str(run))
     assert rows[2]['eval_yard'] == next(e for e in ev if e['iter'] == 2)['eval_yard'] and 'elo' in rows[2]
+    # models/best.pt follows the remote's fit (docs/az.md 5.2): the checkpoint the returned index.json names
+    best = json.load(open(run / 'models' / 'index.json'))['best']
+    assert best and (run / 'models' / 'best.pt').read_bytes() == (run / 'models' / best['file']).read_bytes()
+
+
+def test_remote_evaluation_copies_the_packages_files(tmp_path, monkeypatch):
+    """GamePackage.remote_eval_files (docs/az.md 5.2): after a remote evaluation of iteration it, every file
+    of the game's paths (formatted with iter; a '*' in the last component: every match) is copied from the
+    mirror to the same path in the run; a path with no file fails the evaluation (nothing recorded, retried).
+    Paths outside the mirror are refused when the package is made."""
+    from types import SimpleNamespace
+
+    from zero import package, remote
+    monkeypatch.setattr(package.active(), 'remote_eval_files',
+                        {'toy': ['games/eval-iter_{iter:04d}-*.jsonl', 'notes/n{iter}.txt'], 'other': ['x.txt']})
+    mirror, run = tmp_path / 'mirror', tmp_path / 'run'
+    (mirror / 'games').mkdir(parents=True)
+    (mirror / 'notes').mkdir()
+    for n in ('eval-iter_0003-11.jsonl', 'eval-iter_0003-12.jsonl', 'eval-iter_0004-13.jsonl', 'other.jsonl'):
+        (mirror / 'games' / n).write_text(n)
+    (mirror / 'notes' / 'n3.txt').write_text('three')
+    ev = remote.RemoteEval.__new__(remote.RemoteEval)      # (no thread: the copy step alone)
+    ev.R, ev.t, ev.rdir = SimpleNamespace(run=str(run), cfg={'game': 'toy'}), remote.Transport({'host': 'local'}), str(mirror)
+    ev._fetch_files(3)
+    assert sorted(os.listdir(run / 'games')) == ['eval-iter_0003-11.jsonl', 'eval-iter_0003-12.jsonl']
+    assert (run / 'games' / 'eval-iter_0003-12.jsonl').read_text() == 'eval-iter_0003-12.jsonl'
+    assert (run / 'notes' / 'n3.txt').read_text() == 'three'
+    with pytest.raises(RuntimeError, match='left no notes/n4.txt'):
+        ev._fetch_files(4)
+    with pytest.raises(RuntimeError, match='left no games/eval-iter_0005-'):
+        ev._fetch_files(5)
+    assert package.active().remote_eval_files_of('nogame', 3) == []
+    for bad in ('/abs.txt', '../up.txt', 'a\\b.txt', ''):
+        with pytest.raises(ValueError, match='not a relative'):
+            package.GamePackage('t', 'T', str(tmp_path), remote_eval_files={'toy': [bad]})
 
 
 def test_remote_evaluation_continues_a_local_run(tmp_path):

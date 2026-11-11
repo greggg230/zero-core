@@ -249,6 +249,13 @@ def _replace(tmp, dst, tries=40):
             time.sleep(0.25)
 
 
+def set_best(mdir, file):
+    """models/best.pt = a copy of the checkpoint `file` of the models directory `mdir` (through a
+    temporary name: a reader never sees a partial best.pt)."""
+    shutil.copyfile(os.path.join(mdir, file), os.path.join(mdir, 'best.pt.tmp'))
+    _replace(os.path.join(mdir, 'best.pt.tmp'), os.path.join(mdir, 'best.pt'))
+
+
 def tag_checkpoints(run, ratings, latest, anchor, tag='visits', evaluated=None):
     """Refresh models/index.json (each checkpoint's Elo in the pool of the move rule `tag`, the
     run's rule) and copy the highest-rated checkpoint to models/best.pt. `evaluated` (a set of
@@ -268,8 +275,7 @@ def tag_checkpoints(run, ratings, latest, anchor, tag='visits', evaluated=None):
     cands = [r for r in index if r.get('evaluated', True)]
     best = max(cands, key=lambda r: r['elo']) if cands else None
     if best:
-        shutil.copyfile(os.path.join(mdir, best['file']), os.path.join(mdir, 'best.pt.tmp'))
-        _replace(os.path.join(mdir, 'best.pt.tmp'), os.path.join(mdir, 'best.pt'))
+        set_best(mdir, best['file'])
     refs = {p: {'elo': round(e, 1), 'se': round(se, 1)} for p, (e, se, g) in ratings.items() if not p.startswith('iter_')}
     tmp = os.path.join(mdir, 'index.json.tmp')
     out = {'anchor': f'{anchor}={ANCHOR_ELO:g}', 'best': best, 'references': refs, 'checkpoints': index}
