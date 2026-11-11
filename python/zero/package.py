@@ -67,7 +67,18 @@ class GamePackage:
                     as {"error": ...}, the run goes on); measuring only, never a training
                     signal. By convention the dict holds `value` (the dashboard's series),
                     optional `label`, `pct` (a share: shown as a percentage) and `refs`
-                    ({name: value}: reference lines, e.g. baselines on the same positions)
+                    ({name: value}: reference lines, e.g. baselines on the same positions).
+                    A remote evaluation (zero.remote, docs/az.md 5.2) runs them on the remote and
+                    brings `extras` back into the run's evals.jsonl (docs/az.md 40)
+    settings        {name: default}: run settings of the package's own (docs/az.md 40), e.g. an extra
+                    evaluation's options - zero.run adds them to DEFAULTS (a flag each, saved in the
+                    run's config.json, presets may set them, shipped to a remote evaluation's mirror
+                    with the rest); a name the core already has is refused. Default none
+    evals_every     {eval name: run setting}: an extra evaluation (`evals`) with a cadence of its own
+                    (docs/az.md 40): it runs only on evaluated iterations that are multiples of the
+                    setting's value, and never - silently: no log line, no `extras` key - while the
+                    value is 0. The setting must be one of `settings` with an integer default.
+                    Without an entry an extra evaluation runs on every evaluated iteration, as before
     aux             game -> its auxiliary training targets (docs/az.md 15): [{name, width, loss}, ...]
                     in the order of the game's `SearchGame::AUX` segments (the engine computes
                     them: a run checks the names and widths against it), loss 'multinomial' |
@@ -100,7 +111,7 @@ class GamePackage:
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
-                 replay_aux=None, readers=None, remote_eval_files=None):
+                 replay_aux=None, readers=None, remote_eval_files=None, settings=None, evals_every=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -133,6 +144,22 @@ class GamePackage:
                 if not isinstance(p, str) or not p or p.startswith('/') or '\\' in p or '..' in p.split('/'):
                     raise ValueError(f'{name}: remote_eval_files of {g!r}: {p!r} is not a relative /-separated path '
                                      f'inside the mirror')
+        self.settings = dict(settings or {})
+        self.evals_every = dict(evals_every or {})
+        for ev, s in self.evals_every.items():
+            d = self.settings.get(s)
+            if s not in self.settings or not isinstance(d, int) or isinstance(d, bool) or d < 0:
+                raise ValueError(f'{name}: evals_every of {ev!r}: {s!r} is not one of the package\'s settings with an '
+                                 f'integer default >= 0')
+
+    def eval_due(self, name, cfg, it):
+        """Whether the extra evaluation `name` runs on the evaluated iteration `it` of a run with settings
+        `cfg` (`evals_every`: a multiple of its setting's value, never at 0; without an entry: always)."""
+        s = self.evals_every.get(name)
+        if s is None:
+            return True
+        n = int(cfg.get(s, self.settings[s]) or 0)
+        return n > 0 and int(it) % n == 0
 
     def remote_eval_files_of(self, game, it):
         """The files a remote evaluation of `game`'s iteration `it` leaves in its mirror for the run
