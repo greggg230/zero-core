@@ -131,6 +131,13 @@ def _merge_of(cfg):
     return 'ism' if int(cfg.get('selfplay_infoset_merge', 0) or 0) else ''
 
 
+def _value_choice_of(cfg):
+    """A run's self-play value choices (docs/search.md 3.17; '' when off): what a worker's hello reports and the run
+    checks (docs/az.md 39) - an older checkout would search the game's value choices as any decision in silence."""
+    from .mcts import value_choice_tag
+    return value_choice_tag(cfg.get('selfplay_value_choice_worlds', 0) or 0, cfg.get('selfplay_value_choice_temp', 0.0) or 0.0)
+
+
 def _forks_of(fk):
     """A run's branched games and archive starts as its driver plays them (`forks.fingerprint` of a Run's
     `forks`, '' when off): what a worker's hello reports and the run checks (docs/az.md 24)."""
@@ -1169,6 +1176,11 @@ class RemotePlay:
                     # a checkout without self-play information-set merging would search unmerged in silence:
                     # never used (docs/az.md 30)
                     s.no_merge = ev.get('merge')
+                want_v = _value_choice_of(self.R.cfg) if self.mode == 'selfplay' else ''
+                if want_v and ev.get('value_choice') != want_v:
+                    # a checkout without value choices would search them as any decision, recorded, in silence:
+                    # never used (docs/az.md 39)
+                    s.no_value_choice = ev.get('value_choice')
                 if h.fails or s.k == 0:
                     h.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {h.rdir})')
             elif kind == 'status':
@@ -1325,6 +1337,13 @@ class RemotePlay:
             h.fail_log(f'worker {k} REFUSED: its checkout plays self-play information-set merging as '
                        f'{s.no_merge!r}, the run as {_merge_of(self.R.cfg)!r} (an older checkout has none: '
                        f'docs/az.md 30); killed, retried in 10 minutes')
+            s.kill()
+            return
+        if hasattr(s, 'no_value_choice'):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout plays self-play value choices as {s.no_value_choice!r}, the '
+                       f'run as {_value_choice_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 39); killed, '
+                       f'retried in 10 minutes')
             s.kill()
             return
         if hasattr(s, 'no_belief'):
@@ -2347,7 +2366,8 @@ class Worker:
                       **({} if self.test.get('no_belief') else {'belief': _belief_of(self.cfg)}),
                       **({} if self.test.get('no_forks') else {'forks': _forks_of(self._forks())}),
                       **({} if self.test.get('no_resign') else {'resign': _resign_of(self.cfg)}),
-                      **({} if self.test.get('no_merge') else {'merge': _merge_of(self.cfg)}))
+                      **({} if self.test.get('no_merge') else {'merge': _merge_of(self.cfg)}),
+                      **({} if self.test.get('no_value_choice') else {'value_choice': _value_choice_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

@@ -166,7 +166,7 @@ fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
     }
 }
 
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "belief_tilts", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge"];
+const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "belief_tilts", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge", "value_choice_worlds", "value_choice_temp"];
 
 fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
     match keys.iter().position(|k| k.0 == name) {
@@ -314,6 +314,10 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
         // information-set merging (docs/search.md 3.16; absent: false, the tree of before; checked by the driver:
         // root-view leaf values, an evaluation seat)
         infoset_merge: flag(d, "infoset_merge", false)?,
+        // value choices (docs/search.md 3.17; absent: 0 worlds, off): the worlds that value each option of a
+        // decision the game marks, and the temperature of the choice (0: the best mean value)
+        value_choice_worlds: get(d, "value_choice_worlds", 0u32)?,
+        value_choice_temp: get(d, "value_choice_temp", 0.0f64)?,
     }))
 }
 
@@ -1054,6 +1058,8 @@ impl PySearchDriver {
         d.set_item("branches", s.branches)?;
         d.set_item("dev_moves", s.dev_moves)?;
         d.set_item("starts", s.starts)?;
+        d.set_item("value_choices", s.value_choices)?;
+        d.set_item("value_choice_rows", s.value_choice_rows)?;
         if s.look.decisions > 0 {
             // the lookahead seats' counters (docs/search.md 3.9; only a driver with lookahead decisions)
             let l = &s.look;

@@ -1696,6 +1696,53 @@ Code: `tree.rs` (`Tree::merge`, the simulate loop's merged branch, `expand`'s gr
 `play.NNSeat` / `RsSearch`, `run.py` (`eval_infoset_merge`, `selfplay_infoset_merge`, `merge_metrics`), `remoteplay.py`
 (`_merge_of`, the hello guard), `elo.eval_tag`, `h2h.py`.
 
+### 3.17 Value choices: a decision valued by a one-ply lookahead (`value_choice_worlds`; MTG Zero's Edge of Eternities deck choice, 2026-11-10)
+
+**Why.** Some decisions are worth only what they make of the decider's own view of the game that follows: MTG Zero's
+sealed player choosing its deck among K builds of its pool, hidden from the opponent (its ENGINE.md 107.2). The tree
+search does three things wrong there. (1) It values a leaf from its decider's view (`LeafView::Mover`); the first
+decision after a deck choice is often the opponent's (who chooses who plays first, the first mulligan), whose view
+cannot see the chosen deck, so every option gets the same value. (2) Its budget: a game can lower a decision's
+simulations (`minor_decision`, `sims_divisor`), never raise them, and a self-play seat's fast searches (16 at MTG
+Zero's eoe-1) give K = 32 options less than a visit each. (3) It records the decision with a policy target over
+options the network cannot see. The lookahead (3.9) already values every option in many worlds from the root decider's
+view; a value choice is its one-ply case, made a decision of any network seat.
+
+**What it does.** A game marks a decision (`SearchGame::value_choice`, default false). A network seat with
+`value_choice_worlds` M > 0 (`NnSeat`; the seat key, run settings `selfplay_value_choice_worlds` /
+`eval_value_choice_worlds`) decides such a decision by a `lookahead::Look` with `plies` 1 and `worlds` M (every other
+setting the lookahead's default): M worlds dealt from the slot's search stream by `determinize` (no belief); each
+option played in each world (`tree::transition`: single-option decisions stepped); the line ends at the next decision
+with two options or more (or the game's end); its value is the network's on a value-only row `encode(decider)` of that
+state (P(decider wins); a finished game its result), rows shared by observation (`dedup`). Each option's value is its
+mean over the worlds (`Look::options`). The move (`value_choice_pick`): temperature `value_choice_temp` 0 (the default)
+the best mean, the first in the decision's option order on a tie; tau > 0 a draw with probability proportional to
+exp((mean - best) / tau) from one uniform of the slot's noise stream. The rows go into the seat key's batches like a
+lookahead's (`Pending::Look`); a new network epoch starts the choice again. The decision counts in the game's
+`decisions` (temperature moves) and is **never recorded**: no policy target (the network cannot see the options), no
+value sample. Self-play and evaluation seats alike; refused on a lookahead seat (that seat's lookahead decides every
+decision). zero.play's `NNSeat` and the Python reference tree have no value choices: they search the decision as any.
+
+**Off by default.** M = 0: the hook is never consulted, the decision is searched as any other - the searches of before
+bit for bit (`value_choices_are_valued_by_a_one_ply_lookahead_and_never_recorded`: the toy's golden self-play records
+with a game marking value choices and the seat off, and with the seat on in a game that marks none).
+
+**Costs.** One lookahead per value choice: options x M worlds, each a clone, a deal and a step or two, and at most that
+many value-only rows (fewer with dedup); nothing elsewhere. MTG Zero's deck choice: its ENGINE.md 107.2.
+
+**Tests.** Rust: `driver::tests::value_choices_are_valued_by_a_one_ply_lookahead_and_never_recorded` (ChoiceToy, the
+toy with its two-option decisions marked: off - the golden records; on - every game finishes, value choices made with
+rows, at most options x worlds rows each, no two-option decision recorded, the same games with 1 and 2 threads, a
+temperature, evaluation seats; the checks: worlds > 1024, a temperature < 0 or NaN, a lookahead seat),
+`value_choice_pick_takes_the_best_or_draws_by_the_softmax` (the first best at 0; 40,000 draws at 0.1 within 0.01 of
+the softmax). Python: `tests/test_value_choice.py` (az.md 39).
+
+Code: `game.rs` (`SearchGame::value_choice`), `driver.rs` (`NnSeat::value_choice_worlds` / `value_choice_temp`,
+`check_value_choice`, `VALUE_CHOICE_MAX_WORLDS`, `value_choice_pick`, the counters `value_choices` /
+`value_choice_rows`), `driver/worker.rs` (`value_choice_step`), the bindings (seat keys, stats); Python `games.nn_seat`,
+`mcts.check_value_choice` / `value_choice_tag`, `run.py` (the four settings, `value_choice_keys`), `elo.eval_tag`,
+`h2h.py` (`run_rule`, `_tag`), `remoteplay.py` (`_value_choice_of`, the hello guard).
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:

@@ -227,6 +227,13 @@ DEFAULTS = dict(
     # with one > 0 asks the belief even with its <pre>_belief_tilt 0 (belief_clip / _mix / _fast apply). {} = none
     # (the default: today's searches, bit for bit). The Elo pool's name gets '-t<target><alpha>'
     selfplay_belief_tilts={}, eval_belief_tilts={},
+    # value choices (docs/search.md 3.17, docs/az.md 39): at a decision the game marks (`SearchGame::value_choice`:
+    # MTG Zero's sealed deck choice) a network seat values each option by the network's value from its own view of
+    # the state one decision on, averaged over <pre>_value_choice_worlds worlds (a one-ply lookahead whose rows go in
+    # the batches), and takes the best mean (temperature 0) or draws by softmax(mean / <pre>_value_choice_temp);
+    # never recorded (the network cannot see the options). The Elo pool's name gets '-vc<worlds>[t<temp>]'. 0 worlds
+    # = off (the default: the decision searched as any other, today's searches bit for bit)
+    selfplay_value_choice_worlds=0, selfplay_value_choice_temp=0.0, eval_value_choice_worlds=0, eval_value_choice_temp=0.0,
     # readers (docs/az.md 36): the game package's `readers`, each turned on by its run setting
     # `reader_<target>` (default 0 = off: the network of before) - a small branch of the network reading
     # declared features, trained by its auxiliary target's loss (aux_<target>_w > 0), its prediction an
@@ -604,7 +611,7 @@ class Run:
                              gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), eval_cache=c.get('eval_cache', 0),
                              cq_prior_w=c.get('cq_prior_w', 1.0),
                              infoset_merge=bool(c.get('selfplay_infoset_merge', 0)),
-                             **belief_keys(c, 'selfplay'), **RS.seat_keys(c))
+                             **belief_keys(c, 'selfplay'), **RS.seat_keys(c), **value_choice_keys(c, 'selfplay'))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
@@ -614,7 +621,8 @@ class Run:
                          leaf_value_view=c.get('eval_leaf_value_view', 'mover'),
                          root_search=c.get('eval_root_search', 'puct'), gumbel_m=c.get('gumbel_m', 16),
                          gumbel_scale=c.get('eval_gumbel_scale', 0.0), eval_cache=c.get('eval_cache', 0),
-                         infoset_merge=bool(c.get('eval_infoset_merge', 0)), **belief_keys(c, 'eval'))
+                         infoset_merge=bool(c.get('eval_infoset_merge', 0)), **belief_keys(c, 'eval'),
+                         **value_choice_keys(c, 'eval'))
 
     def check_belief_heads(self, path):
         """With a root belief on (selfplay_ / eval_belief_tilt > 0, docs/az.md 18) the checkpoint at
@@ -2199,6 +2207,13 @@ def belief_keys(cfg, pre):
     return out
 
 
+def value_choice_keys(cfg, pre):
+    """The value-choice keyword arguments of `games.nn_seat` for a run's seat `pre` ('selfplay' | 'eval'; docs/search.md
+    3.17; {} when its worlds are 0: the seat of before)."""
+    w = int(cfg.get(f'{pre}_value_choice_worlds', 0) or 0)
+    return dict(value_choice_worlds=w, value_choice_temp=float(cfg.get(f'{pre}_value_choice_temp', 0.0) or 0.0)) if w else {}
+
+
 def check_eval_settings(cfg, where=''):
     """The move-rule and Elo-offset settings (eval_select, selfplay_select, their guards and their
     completed-Q transforms, the root minimum visits, elo_offsets) -> None, else SystemExit (`where`:
@@ -2228,6 +2243,9 @@ def check_eval_settings(cfg, where=''):
             tilt, clip, mix, _ = belief_settings(cfg, pre)
             check_belief(tilt, clip, mix, what=f'{pre}_belief_tilt')
             belief_tilts(cfg, pre)
+            from .mcts import check_value_choice
+            check_value_choice(cfg.get(f'{pre}_value_choice_worlds', 0) or 0, cfg.get(f'{pre}_value_choice_temp', 0.0) or 0.0,
+                               what=f'{pre}_value_choice')
     except ValueError as e:
         raise SystemExit(f'{where}{e}') from None
     from .mcts import check_root_search

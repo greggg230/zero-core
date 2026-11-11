@@ -135,6 +135,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_belief_tilt`, `eval_belief_tilt` | 0.0, 0.0 | the root's belief (docs/search.md 3.8, section 18): a full search of the seat asks the network's auxiliary head once for the root's prediction of the hidden cards (one `ROW_BELIEF` row of the root's features) and deals every simulation's world by it (the game's `determinize_with`, weights clip((belief / uniform)^tilt, 1/belief_clip, belief_clip)). The self-play seat (a league opponent's too; remote self-play: a checkout without it is refused at its hello, 18.5) / every evaluation seat (its Elo pool's name gets `-b<tilt>`). Needs a checkpoint with the auxiliary head: one without is refused (`net.HeadMissing`, exit 78; 18.3). 0 = off |
 | `belief_clip`, `belief_mix`, `belief_fast` | 20.0, 0.0, 0 | the belief's clip R (every weight in [1/R, R]), the share of a belief search's simulations still dealt uniformly ([0, 1)), and whether fast and minor searches take it too (section 18) |
 | `selfplay_belief_tilts`, `eval_belief_tilts` | {}, {} | per-target tilts of the root's belief (docs/search.md 3.8.1, section 38): `{target: alpha}`, an auxiliary target of the game whose deal the game tilts by its own alpha (MTG Zero: `deck`, the opponent's whole unseen deck); a seat with one > 0 takes the belief (one row per full search) even with its `*_belief_tilt` 0, `belief_clip` / `_mix` / `_fast` applying. The evaluation's names its Elo pool (`-t<target><alpha>`); a remote self-play worker without it is refused at its hello. {} = off |
+| `selfplay_value_choice_worlds`, `selfplay_value_choice_temp`, `eval_value_choice_worlds`, `eval_value_choice_temp` | 0, 0.0, 0, 0.0 | value choices (docs/search.md 3.17, section 39): at a decision the game marks (`SearchGame::value_choice`: MTG Zero's sealed deck choice) the seat values each option by a one-ply lookahead over this many worlds (the network's value from its own view of the state one decision on) and takes the best mean, or draws by softmax(mean / temp); never recorded. The evaluation's names its Elo pool (`-vc<worlds>[t<temp>]`); a remote self-play worker without it is refused at its hello. 0 worlds = off |
 | `selfplay_view_samples`, `view_sample_target` | 0.0, next_q | value-only samples (section 16): this share of self-play's recorded decisions also records the real state from each other recording seat's view - its perspective, no options (no policy loss), z its result - with q = that seat's next search's root value ('next_q'; z if none) or z ('z'). 0 = off |
 | `selfplay_root_search`, `eval_root_search` | puct, puct | the root search (docs/search.md 3.7, section 19): 'puct' = today's searches bit for bit; 'gumbel' = Gumbel AlphaZero's root - Gumbel noise per root option, sequential halving over the `gumbel_m` options of highest noise + log-prior, the completed-Q sigma - whose move replaces root Dirichlet noise, temperature sampling and the move rule (`*_select`; PUCT stays below the root). Every search of the seat is one (full, fast, minor). The self-play seat (remote self-play and the league seat too: their checkouts must have this core) needs `policy_target` 'cq' (an error otherwise: sequential halving's counts are no policy), its sigma the target's (`cq_c_visit`, `cq_c_scale`); every evaluation seat: sigma the evaluation rule's transform (`eval_select_c_*`, else `cq_c_*`), and its root search names its Elo pool (`gumbel-m16`, `gumbel-m16-v50-s0.3`, `-g1` with noise, `-rv`), self-play's does not. Exclusive with the same side's `*_root_min_visits` (an error). `zero.h2h` / `zero.replay` follow the run's |
 | `gumbel_m`, `selfplay_gumbel_scale`, `eval_gumbel_scale` | 16, 1.0, 0.0 | the Gumbel search's considered options (the paper's and mctx's 16: every option of a smaller root) and its noise scale: self-play's first `temp_moves` searched decisions of a game are searched with `selfplay_gumbel_scale` (1 = the move a sample of the improved policy, the paper's), later ones without - the role temperature had; the evaluation's on every decision (0 = deterministic, the paper's evaluation) |
@@ -5183,3 +5184,35 @@ a row per full search, seat 1's root value shifted as `belief_tilt` 1 shifts it)
 and names (none set: the dicts and tags of before), the refusals, h2h's sides; a seat at `belief_tilt` 0 with
 `next_card` 1 sends one row per full search in the three drivers and the toy deals draw for draw as at `belief_tilt`
 1. Byte identity and the gate: MTG Zero's ENGINE.md 106.
+
+## 39. Value choices: a decision valued by a one-ply lookahead (`selfplay_value_choice_worlds`, `eval_value_choice_worlds`; MTG Zero's Edge of Eternities deck choice, 2026-11-10)
+
+**Why and what**: docs/search.md 3.17. A game marks a decision whose options are worth only what they make of the
+decider's own view of what follows (MTG Zero: a sealed player's choice of its deck among builds of its pool); a
+network seat with the setting values each option by the network's value from its own view one decision on, averaged
+over M worlds, and chooses by those values; the decision is never recorded.
+
+### 39.1 Settings
+
+* **Run settings** `selfplay_value_choice_worlds` / `_temp` (the self-play seat; a league opponent's too) and
+  `eval_value_choice_worlds` / `_temp` (every evaluation seat), default 0 / 0.0 (`run.value_choice_keys`); seat keys
+  `value_choice_worlds`, `value_choice_temp`, only when the worlds are > 0 (`games.nn_seat`). Checked
+  (`mcts.check_value_choice`, the Rust driver's `NnSeat::check_value_choice`): worlds an integer in [0, 1024], the
+  temperature finite >= 0; refused on a lookahead seat.
+* **Names**: an evaluation's value choices name its Elo pool (`mcts.value_choice_tag`: `-vc4`, `-vc8t0.03`); `zero.h2h`
+  follows a side's run (`eval_value_choice_worlds` / `_temp`).
+* **Remote self-play**: the worker's hello carries the self-play seat's (`_value_choice_of`): an older checkout, which
+  would search the game's value choices as any decision and record them, is refused.
+* **Stats**: the driver's `value_choices` and `value_choice_rows`.
+
+### 39.2 Off by default
+
+0 worlds (the default): no seat key, the hook never consulted - the searches of before bit for bit (the toy's golden
+self-play records, docs/search.md 3.17); config.json gains the four keys.
+
+### 39.3 Tests and checks
+
+`tests/test_value_choice.py` (2): the settings, seats and names (none set: the dicts and tags of before), the refusals
+in Python and in the Rust driver, h2h's run rule and tag, the hello's fingerprint; a seat with the setting plays the
+toy's games (which mark no value choice) exactly as one without, making none. The search: docs/search.md 3.17's Rust
+tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.

@@ -154,6 +154,10 @@ def run_rule(ckpt):
         out['leaf_value_view'] = c['eval_leaf_value_view']
     if c.get('eval_infoset_merge'):
         out['infoset_merge'] = True                # (docs/search.md 3.16)
+    if c.get('eval_value_choice_worlds'):
+        # (value choices, docs/search.md 3.17)
+        out.update(value_choice_worlds=int(c['eval_value_choice_worlds']),
+                   value_choice_temp=float(c.get('eval_value_choice_temp', 0.0) or 0.0))
     tilt, clip, mix, fast = belief_settings(c, 'eval')
     tilts = belief_tilts(c, 'eval')
     if tilt or tilts:
@@ -196,7 +200,9 @@ def side_keys(ckpt, select=None, min_visits=0, c_visit=None, c_scale=None):
 
 
 def _tag(seat):
-    ism = merge_tag(seat.get('infoset_merge', False))
+    from .mcts import value_choice_tag
+    ism = merge_tag(seat.get('infoset_merge', False)) + value_choice_tag(seat.get('value_choice_worlds', 0),
+                                                                         seat.get('value_choice_temp', 0.0))
     if seat.get('root_search', 'puct') == 'gumbel':
         return gumbel_tag(seat.get('gumbel_m', 16), seat.get('gumbel_c_visit', 50.0), seat.get('gumbel_c_scale', 1.0),
                           seat.get('gumbel_scale', 1.0)) + view_tag(seat.get('leaf_value_view', 'mover')) + belief_tag(

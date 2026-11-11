@@ -493,12 +493,33 @@ pub struct NnSeat {
     /// merge their nodes by the root decider's observation (`Tree::set_merge`) - every search of the seat (full,
     /// fast, minor; evaluation or self-play). Needs root-view leaf values (`LeafView::Root`).
     pub infoset_merge: bool,
+    /// Value choices (docs/search.md 3.17; 0 = off, the default: a value-choice decision is searched as
+    /// any other): at a decision the game marks (`SearchGame::value_choice`), each option is valued by the
+    /// network's value from the decider's view of the state one decision on, averaged over this many
+    /// worlds (a one-ply `lookahead::Look`, its rows in the driver's batches), and the seat chooses by
+    /// `value_choice_temp`. Never recorded; self-play or evaluation.
+    pub value_choice_worlds: u32,
+    /// The value choice's temperature tau >= 0 (default 0): 0 takes the option of the best mean value (the
+    /// first on a tie); tau > 0 draws an option with probability proportional to exp(mean / tau).
+    pub value_choice_temp: f64,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, belief_tilts: Vec::new(), root_search: RootSearch::Puct, look: None, eval_cache: 0, resign_t: 0.0, resign_k: 5, resign_noresign: 0.1, infoset_merge: false }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, belief_tilts: Vec::new(), root_search: RootSearch::Puct, look: None, eval_cache: 0, resign_t: 0.0, resign_k: 5, resign_noresign: 0.1, infoset_merge: false, value_choice_worlds: 0, value_choice_temp: 0.0 }
+    }
+
+    /// The value choice's settings' check (`Driver::new`; the bindings' messages): worlds at most
+    /// `VALUE_CHOICE_MAX_WORLDS`, the temperature finite >= 0.
+    pub fn check_value_choice(worlds: u32, temp: f64) -> Result<(), String> {
+        if worlds > VALUE_CHOICE_MAX_WORLDS {
+            return Err(format!("value_choice_worlds {worlds}: at most {VALUE_CHOICE_MAX_WORLDS} (0 = off)"));
+        }
+        if !(temp.is_finite() && temp >= 0.0) {
+            return Err(format!("value_choice_temp {temp}: a temperature >= 0 (0: the best mean value)"));
+        }
+        Ok(())
     }
 
     /// The resignation settings' check (`Driver::new`; the bindings' messages): t finite in [0, 0.5) (0 =
@@ -573,6 +594,33 @@ impl NnSeat {
 
 /// The default belief clip R (`NnSeat::belief_clip`).
 pub const BELIEF_CLIP: f64 = 20.0;
+
+/// The most worlds a value choice takes (`NnSeat::value_choice_worlds`, docs/search.md 3.17).
+pub const VALUE_CHOICE_MAX_WORLDS: u32 = 1024;
+
+/// A value choice's move (docs/search.md 3.17): among `opts` (each option's mean value over the worlds, in
+/// the decision's option order), temperature 0 takes the first best mean; tau > 0 draws an option with
+/// probability proportional to exp((mean - best) / tau) from one uniform of `rng`.
+pub fn value_choice_pick(opts: &[(u16, f64)], tau: f64, rng: &mut Rng) -> Result<u16, String> {
+    let mut best = *opts.first().ok_or("internal: a value choice without options")?;
+    for &o in &opts[1..] {
+        if o.1 > best.1 {
+            best = o;
+        }
+    }
+    if tau <= 0.0 {
+        return Ok(best.0);
+    }
+    let w: Vec<f64> = opts.iter().map(|o| ((o.1 - best.1) / tau).exp()).collect();
+    let mut x = rng.unit() * w.iter().sum::<f64>();
+    for (o, &q) in opts.iter().zip(&w) {
+        if x < q {
+            return Ok(o.0);
+        }
+        x -= q;
+    }
+    Ok(opts.last().expect("options").0)
+}
 
 /// Branched games (docs/search.md 2.11, KataGo's side games; `DriverCfg::branch`): a share `p` of the
 /// games a self-play driver starts (never a branch itself) each spawn one **branch game** from a copy
@@ -1356,6 +1404,9 @@ struct Counters {
     view_recorded: AtomicU64,
     /// Root belief rows sent (`ROW_BELIEF`, docs/search.md 3.8).
     belief_rows: AtomicU64,
+    /// Value choices made (docs/search.md 3.17) and their lookaheads' rows.
+    value_choices: AtomicU64,
+    value_choice_rows: AtomicU64,
     /// The evaluation cache (docs/search.md 3.12): rows answered from it (not sent), leaves wholly
     /// answered from it (expanded at once), leaves answered from it in part, caches emptied because full.
     cache_hits: AtomicU64,
@@ -1570,6 +1621,10 @@ pub struct DriverStats {
     pub branches: u64,
     pub dev_moves: u64,
     pub starts: u64,
+    /// Value choices made by network seats (`NnSeat::value_choice_worlds`, docs/search.md 3.17) and the
+    /// network rows their one-ply lookaheads sent (all 0 without).
+    pub value_choices: u64,
+    pub value_choice_rows: u64,
 }
 
 /// The games in progress.
@@ -1665,6 +1720,10 @@ impl<G: SearchGame> Driver<G> {
                         if n.leaf_value_view != LeafView::Root {
                             return Err("infoset_merge: needs leaf_value_view 'root' (a merged node of another seat is valued from the root decider's view)".into());
                         }
+                    }
+                    NnSeat::check_value_choice(n.value_choice_worlds, n.value_choice_temp)?;
+                    if n.value_choice_worlds > 0 && n.look.is_some() {
+                        return Err("value_choice_worlds: not built for a lookahead seat (the lookahead decides every decision)".into());
                     }
                     if let Some(lc) = &n.look {
                         // (docs/search.md 3.9: an evaluation seat; its rows are batched like leaves)
@@ -2277,6 +2336,8 @@ impl<G: SearchGame> Driver<G> {
             branches: c.branches.load(Ordering::Relaxed),
             dev_moves: c.dev_moves.load(Ordering::Relaxed),
             starts: c.starts.load(Ordering::Relaxed),
+            value_choices: c.value_choices.load(Ordering::Relaxed),
+            value_choice_rows: c.value_choice_rows.load(Ordering::Relaxed),
         }
     }
 

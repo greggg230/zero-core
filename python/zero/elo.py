@@ -43,14 +43,16 @@ def eval_tag(cfg):
     the rule's completed-Q transform: eval_select_c_visit / _c_scale, unset = cq_c_visit /
     cq_c_scale; then `mcts.forced_tag` of eval_root_min_visits, '' when off; then `mcts.view_tag` of
     eval_leaf_value_view, '-rv' for 'root'; then `mcts.belief_tag` of the evaluations' root belief,
-    '-b<tilt>...' when eval_belief_tilt > 0; then `mcts.merge_tag` of eval_infoset_merge, '-ism' when on): its
+    '-b<tilt>...' when eval_belief_tilt > 0; then `mcts.merge_tag` of eval_infoset_merge, '-ism' when on; then
+    `mcts.value_choice_tag` of eval_value_choice_worlds / _temp, '-vc<worlds>[t<temp>]' when on): its
     evaluations' 'select' and its pool. With
     eval_root_search 'gumbel' the move is the Gumbel search's: `mcts.gumbel_tag` (gumbel_m, the rule's
     transform, eval_gumbel_scale) instead of the rule's name, then the view's and the belief's suffixes
     ('gumbel-m16-v50-s0.3'; docs/search.md 3.7)."""
     from .mcts import (belief_settings, belief_tag, belief_tilts, forced_tag, gumbel_tag, merge_tag, select_settings, select_tag,
-                       view_tag)
-    ism = merge_tag(cfg.get('eval_infoset_merge', 0))
+                       value_choice_tag, view_tag)
+    ism = merge_tag(cfg.get('eval_infoset_merge', 0)) + value_choice_tag(cfg.get('eval_value_choice_worlds', 0) or 0,
+                                                                      cfg.get('eval_value_choice_temp', 0.0) or 0.0)
     if cfg.get('eval_root_search', 'puct') == 'gumbel':
         _, _, cv, cs = select_settings(cfg, 'eval_select')
         return gumbel_tag(cfg.get('gumbel_m', 16), cv, cs, cfg.get('eval_gumbel_scale', 0.0)) + view_tag(

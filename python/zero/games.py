@@ -100,7 +100,8 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             root_min_visits=0, root_min_visits_max_actions=4, leaf_value_view='mover', view_samples=0.0,
             view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
             belief_tilts=None, root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
-            eval_cache=0, resign_t=0.0, resign_k=5, resign_noresign=0.1, cq_prior_w=1.0, infoset_merge=False):
+            eval_cache=0, resign_t=0.0, resign_k=5, resign_noresign=0.1, cq_prior_w=1.0, infoset_merge=False,
+            value_choice_worlds=0, value_choice_temp=0.0):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
@@ -136,7 +137,9 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     softmax(beta ln P0 + sigma completedQ), in (0, 1]; the moves never read it; 1 = off: no key, the seat
     of before). infoset_merge: information-set merging of its trees by the root decider's observation
     (docs/search.md 3.16; leaf_value_view 'root'; an evaluation or a self-play seat; False = off: no key, the seat
-    of before)."""
+    of before). value_choice_worlds: value choices (docs/search.md 3.17): at a decision the game marks
+    (`SearchGame::value_choice`) each option is valued by a one-ply lookahead over this many worlds and chosen at the
+    temperature value_choice_temp (0: the best mean value); never recorded (0 = off: no keys, the seat of before)."""
     from .mcts import (check_belief, check_belief_tilts, check_cq_prior_w, check_leaf_view, check_merge, check_root_min,
                        check_root_search, check_select, check_select_transform, select_transform)
     check_select(select, select_min_visits)
@@ -152,6 +155,8 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     check_belief_tilts(belief_tilts)
     belief_tilts = {k: float(v) for k, v in sorted((belief_tilts or {}).items()) if v}
     check_merge(infoset_merge, leaf_value_view, selfplay)
+    from .mcts import check_value_choice
+    check_value_choice(value_choice_worlds, value_choice_temp)
     if int(eval_cache) != eval_cache or eval_cache < 0:
         raise ValueError(f'eval_cache {eval_cache!r}: answers per game, an integer >= 0 (0 = off)')
     from .resign import check_values
@@ -196,6 +201,8 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
         d['cq_prior_w'] = float(cq_prior_w)
     if infoset_merge:
         d['infoset_merge'] = True
+    if value_choice_worlds:
+        d.update(value_choice_worlds=int(value_choice_worlds), value_choice_temp=float(value_choice_temp))
     return d
 
 

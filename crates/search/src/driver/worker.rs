@@ -107,6 +107,9 @@ struct Tally {
     /// leaf rows of the viewer taken from a merged tree's encoding.
     merge: crate::tree::MergeStats,
     merge_shared: u64,
+    /// Value choices (docs/search.md 3.17) and their lookaheads' rows.
+    value_choices: u64,
+    value_choice_rows: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -255,6 +258,10 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     }
     if n.belief_rows > 0 {
         k.belief_rows.fetch_add(n.belief_rows, Ordering::Relaxed);
+    }
+    if n.value_choices > 0 {
+        k.value_choices.fetch_add(n.value_choices, Ordering::Relaxed);
+        k.value_choice_rows.fetch_add(n.value_choice_rows, Ordering::Relaxed);
     }
     if n.branches > 0 || n.dev_moves > 0 || n.starts > 0 {
         k.branches.fetch_add(n.branches, Ordering::Relaxed);
@@ -547,6 +554,14 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             continue;
         }
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: a seat without a player")?;
+        if seat.value_choice_worlds > 0 && slot.target.is_none() && slot.game.as_ref().unwrap().value_choice() {
+            // a value choice (docs/search.md 3.17): a one-ply lookahead values the options, the seat
+            // chooses by the values; never recorded
+            if value_choice_step(slot, seat, p, bufs, &mut scratch.sim.key, n, cfg)? {
+                return Ok(());
+            }
+            continue;
+        }
         if let Some(lc) = seat.look.as_deref() {
             // a lookahead seat (docs/search.md 3.9): the lookahead decides, unless it fell back to the
             // seat's MCTS search for this decision
@@ -812,6 +827,50 @@ fn look_step<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, seat: &NnSeat, l
         }
         Outcome::Mcts => slot.look_mcts = true,
     }
+    Ok(false)
+}
+
+/// A value choice of seat `p` (docs/search.md 3.17): a one-ply `Look` of the decision - `value_choice_worlds`
+/// worlds dealt from the slot's search stream by `determinize`, each option played in each, the state one
+/// decision on valued by the network from `p`'s view (a value-only row; terminal states by their result;
+/// rows shared by observation) - created at the decision's first step and stepped until it needs rows (->
+/// true: the slot waits for the batch) or has its values: the move is `value_choice_pick` over the options'
+/// means at the seat's temperature (from the slot's noise stream), played without a record (-> false).
+#[allow(clippy::too_many_arguments)]
+fn value_choice_step<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize, bufs: &mut [LeafBuf], key: &mut Vec<u64>, n: &mut Tally, cfg: &DriverCfg) -> Result<bool, String> {
+    if slot.look.is_none() {
+        let live = slot.game.as_ref().ok_or("internal: a value choice without a game")?;
+        let lc = LookCfg { plies: 1, worlds: seat.value_choice_worlds, ..LookCfg::default() };
+        slot.look = Some(Box::new(Look::new(lc, live, p, None, Vec::new(), Vec::new(), false)?));
+    }
+    let buf = &mut bufs[seat.key as usize];
+    let local = buf.len() as u32;
+    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false };
+    let look = slot.look.as_mut().unwrap();
+    let r = look.step(&mut sink, &mut slot.search_rng);
+    drop(sink);
+    if let LookStep::Rows(_) = r? {
+        slot.pending = Some(Pending::Look { key: seat.key, local });
+        return Ok(true);
+    }
+    let mut look = slot.look.take().unwrap();
+    if !matches!(look.outcome(), Some(Outcome::Act(_))) {
+        return Err("internal: a value choice's lookahead fell back (it has no budget)".into());
+    }
+    let rows = look.stats().rows;
+    let mut opts: Vec<(u16, f64)> = look.options()?.into_iter().map(|o| (o.act, o.mean)).collect();
+    // (the decision's option order: the first best on a tie, the draw's order)
+    slot.ensure_legal();
+    let pos = |a: u16| slot.legal.iter().position(|&x| x == a).unwrap_or(usize::MAX);
+    opts.sort_by_key(|o| pos(o.0));
+    if opts.len() != slot.legal.len() {
+        return Err(format!("internal: a value choice valued {} of {} options", opts.len(), slot.legal.len()));
+    }
+    let a = value_choice_pick(&opts, seat.value_choice_temp, &mut slot.noise_rng)?;
+    n.value_choices += 1;
+    n.value_choice_rows += rows;
+    slot.decisions += 1;
+    apply(cfg, slot, a, key)?;
     Ok(false)
 }
 

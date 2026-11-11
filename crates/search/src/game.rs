@@ -107,6 +107,16 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn sims_divisor(&self) -> u32 {
         1
     }
+    /// The pending decision is a **value choice** (docs/search.md 3.17): a choice among options whose
+    /// worth shows only in the decider's own view of what follows (MTG Zero: a sealed player's choice of
+    /// its deck among builds of its pool, hidden from the opponent). A network seat with
+    /// `value_choice_worlds` M > 0 values each option by the network's value, from the decider's view,
+    /// of the state one decision on, averaged over M worlds (a one-ply `lookahead::Look`), and chooses
+    /// by those values (`value_choice_temp`); the decision is never recorded. A seat without the setting
+    /// searches it as any other decision. Default: no decision is.
+    fn value_choice(&self) -> bool {
+        false
+    }
     /// The game is over (`to_move()` None) but its result comes from outside: episodes of
     /// another game decide it (docs/search.md 1.1). Until `resolve`, the search treats this
     /// terminal as a leaf the network evaluates and the driver parks the game; nothing calls

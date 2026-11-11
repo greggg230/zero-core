@@ -412,6 +412,34 @@ def check_merge(on=False, view='mover', selfplay=False, what='infoset_merge'):
                          f"decider's view; docs/search.md 3.16)")
 
 
+VALUE_CHOICE_MAX_WORLDS = 1024       # the Rust driver's (driver.rs VALUE_CHOICE_MAX_WORLDS)
+
+
+def check_value_choice(worlds=0, temp=0.0, what='value_choice'):
+    """Value choices (docs/search.md 3.17): `worlds` an integer in [0, 1024] (0 = off), `temp` a temperature >= 0
+    (0: the option of the best mean value) -> None, else ValueError. The Rust driver's seats only (zero.play's
+    NNSeat and this module's tree search a value choice as any decision)."""
+    if isinstance(worlds, bool) or not isinstance(worlds, (int, float)) or int(worlds) != worlds \
+            or not 0 <= worlds <= VALUE_CHOICE_MAX_WORLDS:
+        raise ValueError(f'{what}_worlds {worlds!r}: worlds per option, an integer in [0, {VALUE_CHOICE_MAX_WORLDS}] '
+                         f'(0 = off)')
+    try:
+        t = float(temp)
+    except (TypeError, ValueError):
+        t = float('nan')
+    if not (t == t and 0.0 <= t < float('inf')):
+        raise ValueError(f'{what}_temp {temp!r}: a temperature >= 0 (0: the best mean value)')
+
+
+def value_choice_tag(worlds=0, temp=0.0):
+    """The suffix of a move rule's name for its value choices (docs/search.md 3.17): '' (off), '-vc<worlds>' and
+    't<temp>' when the temperature is not 0 - an evaluation's moves change with it, so its Elo pool does (docs/az.md
+    5.4)."""
+    if not worlds:
+        return ''
+    return f'-vc{int(worlds)}' + (f't{float(temp):g}' if temp else '')
+
+
 def merge_tag(on=False):
     """The suffix of a move rule's name for its searches' information-set merging (docs/search.md 3.16): '' (off),
     '-ism' (on) - an evaluation's moves change with it, so its Elo pool does (docs/az.md 5.4)."""

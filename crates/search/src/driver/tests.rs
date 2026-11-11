@@ -3890,3 +3890,133 @@ fn aborted_games_end_unfinished_without_samples_and_search_never_reads_their_res
     let (res, smp) = run(&mut d);
     assert!(res.iter().all(|r| r.over && !r.aborted) && !smp.is_empty());
 }
+
+/// The toy with its two-option decisions marked value choices (`SearchGame::value_choice`, docs/search.md 3.17).
+#[derive(Clone)]
+struct ChoiceToy(ToyGame);
+
+impl SearchGame for ChoiceToy {
+    type Spec = <ToyGame as SearchGame>::Spec;
+    const NAME: &'static str = "choicetoy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    fn parse_spec(json: &str) -> Result<Self::Spec, String> {
+        ToyGame::parse_spec(json)
+    }
+    fn new_game(spec: &Self::Spec, players: usize, seed: u64) -> Result<Self, String> {
+        ToyGame::new_game(spec, players, seed).map(ChoiceToy)
+    }
+    fn num_players(&self) -> usize {
+        self.0.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)
+    }
+    fn force_chance(&mut self, forced: &[u64]) {
+        self.0.force_chance(forced)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.0.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.0.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn value_choice(&self) -> bool {
+        let mut v = Vec::new();
+        self.0.legal_actions(&mut v);
+        v.len() == 2
+    }
+}
+
+fn with_value_choice(seat: SeatCfg, worlds: u32, temp: f64) -> SeatCfg {
+    match seat {
+        SeatCfg::Nn(mut s) => {
+            s.value_choice_worlds = worlds;
+            s.value_choice_temp = temp;
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    }
+}
+
+#[test]
+fn value_choices_are_valued_by_a_one_ply_lookahead_and_never_recorded() {
+    let go = |seat: SeatCfg, threads: usize| {
+        let mut c = cfg(vec![seat], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+        c.seed = 2026;
+        c.threads = threads;
+        let mut d = Driver::<ChoiceToy>::new(c).unwrap();
+        let (r, s) = run(&mut d);
+        (r, s, d.stats())
+    };
+    // off (the default): the hook is never consulted - the toy's golden self-play records
+    let (_, recs, st) = go(nn(0, 16, true), 2);
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    assert_eq!((st.value_choices, st.value_choice_rows), (0, 0));
+    // and a game without value choices is unchanged by the setting
+    let (_, recs) = golden_selfplay(with_value_choice(nn(0, 16, true), 4, 0.05));
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    // on: the two-option decisions are valued (rows from the lookahead), chosen, never recorded
+    let (res, recs, st) = go(with_value_choice(nn(0, 16, true), 4, 0.0), 2);
+    assert_eq!(res.len(), 24);
+    assert!(res.iter().all(|r| r.over));
+    assert!(st.value_choices > 0 && st.value_choice_rows > 0, "{} choices, {} rows", st.value_choices, st.value_choice_rows);
+    assert!(st.value_choice_rows <= st.value_choices * 2 * 4, "at most options x worlds rows a choice");
+    assert!(!recs.is_empty() && recs.iter().all(|r| r.opts.len() != 2), "a value choice was recorded");
+    // reproducible whatever the threads
+    let (res1, recs1, _) = go(with_value_choice(nn(0, 16, true), 4, 0.0), 1);
+    assert_eq!(results_digest(&res1), results_digest(&res));
+    assert_eq!(records_digest(&recs1), records_digest(&recs));
+    // a temperature changes the moves, not the machinery; evaluation seats too
+    let (res_t, _, st_t) = go(with_value_choice(nn(0, 16, true), 4, 0.05), 2);
+    assert!(res_t.iter().all(|r| r.over) && st_t.value_choices > 0);
+    let (res_e, recs_e, st_e) = go(with_value_choice(nn(0, 16, false), 2, 0.0), 2);
+    assert!(res_e.iter().all(|r| r.over) && recs_e.is_empty() && st_e.value_choices > 0);
+    // the checks
+    let bad = |seat: SeatCfg| Driver::<ChoiceToy>::new(cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).is_err();
+    assert!(bad(with_value_choice(nn(0, 8, true), VALUE_CHOICE_MAX_WORLDS + 1, 0.0)));
+    assert!(bad(with_value_choice(nn(0, 8, true), 4, -1.0)));
+    assert!(bad(with_value_choice(nn(0, 8, true), 4, f64::NAN)));
+    let mut look = NnSeat::eval(0, 8);
+    look.look = Some(Box::new(LookCfg::default()));
+    look.value_choice_worlds = 2;
+    assert!(bad(SeatCfg::Nn(look)));
+}
+
+#[test]
+fn value_choice_pick_takes_the_best_or_draws_by_the_softmax() {
+    let opts = [(5u16, 0.5), (7, 0.6), (9, 0.6)];
+    let mut rng = Rng::new(3);
+    assert_eq!(value_choice_pick(&opts, 0.0, &mut rng).unwrap(), 7, "the first best");
+    assert!(value_choice_pick(&[], 0.0, &mut rng).is_err());
+    let n = 40_000;
+    let mut c = [0u32; 3];
+    for _ in 0..n {
+        let a = value_choice_pick(&opts, 0.1, &mut rng).unwrap();
+        c[opts.iter().position(|o| o.0 == a).unwrap()] += 1;
+    }
+    let w = [(-1.0f64).exp(), 1.0, 1.0];
+    let s: f64 = w.iter().sum();
+    for i in 0..3 {
+        let p = w[i] / s;
+        let f = c[i] as f64 / n as f64;
+        assert!((f - p).abs() < 0.01, "option {i}: {f} against {p}");
+    }
+}
