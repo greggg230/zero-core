@@ -13,7 +13,8 @@
 //! `pyo3 = { version = "0.23", features = ["extension-module"] }`). The module exposes `Game`,
 //! `SearchTree`, `SearchDriver`, `SampleRecords` (`SearchDriver.take_records`), `Lookahead` (the
 //! position API of docs/search.md 3.9),
-//! `game_names()`, `game_info_of(name)`, `lookahead_settings(settings)` and `MAX_SEATS`.
+//! `game_names()`, `game_info_of(name)`, `lookahead_settings(settings)`, `driver_settings(seats, ...)`
+//! (the `DriverCfg` a `SearchDriver` would get, as text: a diagnostic) and `MAX_SEATS`.
 use std::sync::OnceLock;
 
 use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
@@ -78,6 +79,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_class::<PySampleRecords>()?;
     m.add_class::<PyLookahead>()?;
     m.add_function(wrap_pyfunction!(lookahead_settings, m)?)?;
+    m.add_function(wrap_pyfunction!(driver_settings, m)?)?;
     m.add_function(wrap_pyfunction!(game_names, m)?)?;
     m.add_function(wrap_pyfunction!(game_info_of, m)?)?;
     m.add_function(wrap_pyfunction!(root_floor_of, m)?)?;
@@ -805,6 +807,47 @@ impl PySearchTree {
 
 // ------------------------------------------------------------------------ SearchDriver
 
+/// The `DriverCfg` of `SearchDriver(game, seats, ...)`'s arguments (the seat dicts parsed, the
+/// distinct seats de-duplicated into one table).
+#[allow(clippy::too_many_arguments)]
+fn driver_cfg(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>) -> PyResult<DriverCfg> {
+    let spec = spec_json(spec)?;
+    let mut keys = Vec::new();
+    let mut table: Vec<SeatCfg> = Vec::new();
+    let mut games = Vec::with_capacity(seats.len());
+    for g in seats.iter() {
+        let row: Vec<Bound<'_, PyDict>> = g.extract()?;
+        let mut ix = Vec::with_capacity(row.len());
+        for s in row {
+            let sc = parse_seat(&s, &mut keys)?;
+            let i = match table.iter().position(|x| *x == sc) {
+                Some(i) => i,
+                None => {
+                    table.push(sc);
+                    table.len() - 1
+                }
+            };
+            ix.push(i as u16);
+        }
+        games.push(ix);
+    }
+    let branch = branch.map(parse_branch).transpose()?;
+    let starts = starts.map(parse_starts).transpose()?;
+    Ok(DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts })
+}
+
+/// The driver settings `SearchDriver(game, seats, ...)` would be built with, as the Rust `DriverCfg`'s
+/// pretty Debug text (a diagnostic: no driver is made, the game is not checked): the seat dicts parsed,
+/// the distinct seats in one table. zero-farm's settings tools compare it across parsers and with the
+/// native worker's (docs/az.md 42).
+#[pyfunction]
+#[pyo3(signature = (seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None))]
+#[allow(clippy::too_many_arguments)]
+fn driver_settings(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>) -> PyResult<String> {
+    let cfg = driver_cfg(seats, spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts)?;
+    Ok(format!("{cfg:#?}"))
+}
+
 /// The batched driver (docs/search.md 2). `seats` = per game a list of seat dicts; `aux`: record
 /// the game's auxiliary targets with the samples (`take_samples()['aux']`, docs/search.md 1.2);
 /// `paired`: games 2k and 2k + 1 share every random stream (the deal), `DriverCfg::paired`;
@@ -823,29 +866,7 @@ impl PySearchDriver {
     #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        let spec = spec_json(spec)?;
-        let mut keys = Vec::new();
-        let mut table: Vec<SeatCfg> = Vec::new();
-        let mut games = Vec::with_capacity(seats.len());
-        for g in seats.iter() {
-            let row: Vec<Bound<'_, PyDict>> = g.extract()?;
-            let mut ix = Vec::with_capacity(row.len());
-            for s in row {
-                let sc = parse_seat(&s, &mut keys)?;
-                let i = match table.iter().position(|x| *x == sc) {
-                    Some(i) => i,
-                    None => {
-                        table.push(sc);
-                        table.len() - 1
-                    }
-                };
-                ix.push(i as u16);
-            }
-            games.push(ix);
-        }
-        let branch = branch.map(parse_branch).transpose()?;
-        let starts = starts.map(parse_starts).transpose()?;
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts };
+        let cfg = driver_cfg(seats, spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts)?;
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
         Ok(PySearchDriver { d, nfeat })
