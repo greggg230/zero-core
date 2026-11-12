@@ -5225,3 +5225,53 @@ self-play records, docs/search.md 3.17); config.json gains the four keys.
 in Python and in the Rust driver, h2h's run rule and tag, the hello's fingerprint; a seat with the setting plays the
 toy's games (which mark no value choice) exactly as one without, making none. The search: docs/search.md 3.17's Rust
 tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.
+
+## 40. A game package's run settings, self-play spec and remote evaluation inputs (`GamePackage.settings`, `selfplay_specs`, `remote_eval_inputs`; MTG Zero's deck evaluator retrained inside a run, 2026-11-11)
+
+### 40.1 Why
+
+MTG Zero's run 2 chooses each self-play seat's sealed deck with a learned deck evaluator read from a file named in
+the game's spec, and retrains that evaluator during the run on the run's own recent games (MTG Zero's ENGINE.md 112).
+Three things the core did not offer: (1) **settings of the package's own** (how often to retrain, on how many
+iterations) as run settings - presets, flags and config.json -, not keys the game's spec parser would have to accept;
+(2) **a self-play spec that changes between iterations** while the rolling driver (2.6 of docs/search.md) keeps its
+games in flight - a new driver per change would drop them; (3) **a remote evaluation that reads a file of the run**
+(the evaluator version its iteration used): the mirror held only checkpoints, the config and the Elo state.
+
+### 40.2 What it does
+
+* **`GamePackage(settings={name: default})`**: added to `zero.run.DEFAULTS` by `apply_package` (as the auxiliary
+  targets' and readers' settings), so they have flags (`--name`), may appear in presets and the package's `defaults`,
+  and are saved in config.json; a name of the core's (or an auxiliary target's or reader's) is refused. The core never
+  reads them; the package's hooks do (`run.cfg`).
+* **`GamePackage(selfplay_specs={game: fn(run, it) -> spec JSON | None})`** (or 'module:attr'): `Run.selfplay_spec(it)`
+  asks it at the start of every local self-play phase (`run`: the `Run`); None (or no hook) is the run's spec. A
+  rolling run's driver is made with the phase's spec, and when a later phase's differs the run calls
+  `Driver.set_spec` between the phases (docs/search.md 2.13: the games it starts from then on; games in flight keep
+  theirs) and logs `iter N self-play: the rolling driver plays the game package's new spec from now on`; a phase's
+  driver (rolling 0) is made with it (`Run.driver(..., spec=)`, self-play's only). An answer that is not a non-empty
+  string is an error. Remote self-play (section 5.3) refuses a changed spec: its workers play the run's spec.
+* **`GamePackage(remote_eval_inputs={game: fn(run, it) -> [path, ...]})`** (or 'module:attr'): `RemoteEval._ship` puts
+  each named file of the run (run-relative, '/'-separated; absolute, '..', backslashes and drive letters refused) at the
+  same path in the mirror before evaluating iteration `it`, again whenever its size or modification time changed since
+  this session put it (a mirror re-shipped after an error: all again). A missing file fails the evaluation (logged,
+  retried), as a missing `remote_eval_files` file does (5.2).
+
+### 40.3 Off by default
+
+A package declaring none of the three: nothing is asked or shipped - `selfplay_spec` is the run's spec, the drivers are
+made exactly as before (`spec=None`), `set_spec` is never called. With a hook that answers None the same. A package's
+settings add keys to config.json and nothing else. The driver's spec is read through a lock once per game started:
+the same games (the toy's golden self-play records and MTG Zero's checkpoint compatibility check, its ENGINE.md 112).
+
+### 40.4 Costs
+
+None without a hook. With one: the hook's own time once per phase; `set_spec` parses one spec between phases.
+
+### 40.5 Tests and checks
+
+`tests/test_package_hooks.py` (6): no hook, the run's spec; a rolling driver switches between phases (logged once, a
+non-string answer and an invalid spec refused); a phase's driver is made with the hook's spec; remote self-play
+refuses a changed spec; a package setting is a run setting with a flag (a core name refused, the defaults restored);
+a remote evaluation ships the inputs (again only when changed; a missing file and paths outside the run refused). Rust:
+docs/search.md 2.13's test. The gate: MTG Zero's `optin-core` (ENGINE.md 112).

@@ -94,13 +94,31 @@ class GamePackage:
                     (logged, retried). Paths are relative and '/'-separated, formatted with
                     `iter` = the evaluated iteration ('games/eval-iter_{iter:04d}.jsonl': MTG Zero's
                     game log of the evaluation's games). Default none: the copies of before
+    settings        the package's own run settings {name: default} (docs/az.md 40): added to
+                    zero.run.DEFAULTS (so presets, flags `--name` and config.json carry them, as the
+                    core's); a name of the core's, an auxiliary target's or a reader's is an error. Read
+                    only by the package's hooks. Default none
+    selfplay_specs  game -> fn(run, it) -> spec JSON or None, or 'module:attr' (docs/az.md 40): the
+                    spec of iteration `it`'s self-play (`run`: the `zero.run.Run`), asked at the start
+                    of each local self-play phase; None = the run's spec (as before). A rolling driver
+                    switches to a new spec between phases (`Driver.set_spec`: the games it starts
+                    from then on; games in flight keep theirs), a phase's driver is made with it.
+                    Refused with remote self-play (its workers play the run's spec). Default none:
+                    the run's spec, every phase
+    remote_eval_inputs
+                    game -> fn(run, it) -> [path, ...] or 'module:attr' (docs/az.md 40): files of the run
+                    a remote evaluation of iteration `it` needs (run-relative, '/'-separated), put at the
+                    same paths in the mirror before it (`RemoteEval._ship`; each again when its size or
+                    modification time changed). A missing file fails the evaluation (logged, retried).
+                    Default none: the shipping of before
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
                  dashboard_port=None, hub_id=None, env_prefix=None, defaults=None, presets=None,
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
-                 replay_aux=None, readers=None, remote_eval_files=None):
+                 replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
+                 remote_eval_inputs=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -133,6 +151,31 @@ class GamePackage:
                 if not isinstance(p, str) or not p or p.startswith('/') or '\\' in p or '..' in p.split('/'):
                     raise ValueError(f'{name}: remote_eval_files of {g!r}: {p!r} is not a relative /-separated path '
                                      f'inside the mirror')
+        self.settings = dict(settings or {})
+        self.selfplay_specs = dict(selfplay_specs or {})
+        self.remote_eval_inputs = dict(remote_eval_inputs or {})
+
+    def selfplay_spec_fn(self, game):
+        """`game`'s self-play spec hook fn(run, it) -> spec JSON or None (`selfplay_specs`), or None."""
+        f = self.selfplay_specs.get(game)
+        if isinstance(f, str):
+            f = self.selfplay_specs[game] = resolve(f)
+        return f
+
+    def remote_eval_inputs_of(self, game, run, it):
+        """The run's files a remote evaluation of `game`'s iteration `it` needs (`remote_eval_inputs`;
+        `run`: the `zero.run.Run`): run-relative '/'-separated paths, checked; none: []."""
+        f = self.remote_eval_inputs.get(game)
+        if f is None:
+            return []
+        if isinstance(f, str):
+            f = self.remote_eval_inputs[game] = resolve(f)
+        out = list(f(run, it) or [])
+        for p in out:
+            if not isinstance(p, str) or not p or p.startswith('/') or '\\' in p or ':' in p or '..' in p.split('/'):
+                raise ValueError(f'{self.name}: remote_eval_inputs of {game!r}: {p!r} is not a relative /-separated path '
+                                 f'inside the run')
+        return out
 
     def remote_eval_files_of(self, game, it):
         """The files a remote evaluation of `game`'s iteration `it` leaves in its mirror for the run

@@ -211,6 +211,7 @@ class RemoteEval:
         self.queued = set()
         self.shipped = None
         self.anchors_shipped = set()               # (label, local path) put this session (docs/az.md 20.1)
+        self.inputs_shipped = {}                   # the package's inputs put this session: rel -> (size, mtime) (az.md 40)
         self.lock = threading.Lock()
         self.th = threading.Thread(target=self._loop, name='zero-remote-eval', daemon=True)
         self.th.start()
@@ -290,6 +291,7 @@ class RemoteEval:
         if self.shipped is None:
             self.t.mkdirs(self.rdir + '/models', self.rdir + '/' + pool)
             self.shipped = set(self.t.listdir(self.rdir + '/models'))
+            self.inputs_shipped = {}
             if 'results.json' not in self.t.listdir(self.rdir + '/' + pool):
                 # a new mirror (or a new rule's pool on it): the pool's Elo so far (results incl. the
                 # evaluations logged here before eval_remote) and the run's metrics, so the remote
@@ -322,6 +324,7 @@ class RemoteEval:
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, indent=1)
         self.t.put(tmp, self.rdir + '/config.json')
+        self._ship_inputs(it)
         e = max(1, int(c['eval_every']))
         # every checkpoint Run.elo_update may play up to `it` (each evaluated one and its opponents:
         # every offset of elo.OFFSETS, or elo_offsets' raw ones)
@@ -332,6 +335,27 @@ class RemoteEval:
             if fn not in self.shipped and os.path.exists(model_path(self.R.run, k)):
                 self.t.put(model_path(self.R.run, k), self.rdir + '/models/' + fn)
                 self.shipped.add(fn)
+
+    def _ship_inputs(self, it):
+        """The game package's inputs of this evaluation (`GamePackage.remote_eval_inputs`, docs/az.md 40): each file
+        of the run put at the same path in the mirror, again whenever its size or modification time changed since
+        this session put it. A missing file fails the evaluation (RuntimeError: logged, retried)."""
+        rels = package.active().remote_eval_inputs_of(self.R.cfg['game'], self.R, it)
+        if not rels:
+            return
+        for rel in rels:
+            src = os.path.join(self.R.run, *rel.split('/'))
+            if not os.path.isfile(src):
+                raise RuntimeError(f"{rel}: the game package's remote_eval_inputs names no file of the run: not evaluated")
+            st = os.stat(src)
+            key = (st.st_size, st.st_mtime_ns)
+            if self.inputs_shipped.get(rel) == key:
+                continue
+            d = rel.rpartition('/')[0]
+            if d:
+                self.t.mkdirs(f'{self.rdir}/{d}')
+            self.t.put(src, f'{self.rdir}/{rel}')
+            self.inputs_shipped[rel] = key
 
     def _fetch_files(self, it):
         """The game package's files of this evaluation (`GamePackage.remote_eval_files`, docs/az.md 5.2):

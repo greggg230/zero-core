@@ -1506,7 +1506,9 @@ pub const SLOW_STEP_NS: u64 = 10_000_000_000;
 
 struct Shared<G: SearchGame> {
     cfg: DriverCfg,
-    spec: G::Spec,
+    /// The spec of the games the driver starts (`DriverCfg::spec`; a rolling driver's `set_spec`
+    /// replaces it between phases: docs/search.md 2.13).
+    spec: Mutex<Arc<G::Spec>>,
     /// The archive entries' parsed specs (`DriverCfg::starts`; empty without).
     starts: Vec<G::Spec>,
     groups: Vec<Group<G>>,
@@ -1845,7 +1847,7 @@ impl<G: SearchGame> Driver<G> {
         let cfg = DriverCfg { threads, groups, ..cfg };
         let sh = Arc::new(Shared {
             cfg,
-            spec,
+            spec: Mutex::new(Arc::new(spec)),
             starts,
             groups: gv,
             queue: Mutex::new(VecDeque::new()),
@@ -2256,6 +2258,31 @@ impl<G: SearchGame> Driver<G> {
         self.finished_games += 1;
         self.phase_games += 1;
         self.resolved += 1;
+        Ok(())
+    }
+
+    /// Rolling mode, between phases (`paused`): the games the driver starts from now on - every
+    /// game a slot starts, its archive starts and queued setups aside - play `spec` (JSON, the
+    /// game's `parse_spec`; an error here, the spec of before kept) instead of the driver's; games
+    /// in flight keep theirs (docs/search.md 2.13). The bots of the driver's seats must exist for
+    /// it. Not a rolling driver, or a phase running: an error.
+    pub fn set_spec(&mut self, spec: &str) -> Result<(), String> {
+        self.check_error()?;
+        if !self.sh.cfg.rolling {
+            return Err("set_spec: not a rolling driver (a phase's driver is made with its spec)".into());
+        }
+        if !self.paused() {
+            return Err("set_spec: the current phase has not ended".into());
+        }
+        let s = G::parse_spec(spec).map_err(|e| format!("set_spec: {e}"))?;
+        for seat in &self.sh.cfg.seats {
+            if let SeatCfg::Bot(name) = seat {
+                if make_bot::<G>(&s, name, 0).is_none() {
+                    return Err(format!("set_spec: unknown bot {name:?} for {} with this spec", G::NAME));
+                }
+            }
+        }
+        *lock(&self.sh.spec) = Arc::new(s);
         Ok(())
     }
 

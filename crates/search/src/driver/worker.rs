@@ -404,7 +404,8 @@ fn restart_search<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>) -> Result<
 fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &mut Tally) -> Result<(), String> {
     let cfg = &sh.cfg;
     let setup = slot.setup.take();
-    let mut spec = setup.as_ref().map_or(&sh.spec, |s| &s.spec);
+    let spec_now = lock(&sh.spec).clone();
+    let mut spec = setup.as_ref().map_or(&*spec_now, |s| &s.spec);
     let stream = if cfg.paired { gid / 2 } else { gid };
     // archive starts (docs/search.md 2.11): the game's own start stream, never `base`
     slot.start_ix = None;
@@ -1320,7 +1321,8 @@ fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut
     let mut base = Rng::new(f.rng.next_u64());
     let seats = game_seats(cfg, gid);
     // (bots of a branch: from the driver's spec, or the archive entry's the game started from)
-    let spec = start.map_or(&sh.spec, |j| &sh.starts[j as usize]);
+    let spec_now = lock(&sh.spec).clone();
+    let spec = start.map_or(&*spec_now, |j| &sh.starts[j as usize]);
     slot.gid = gid;
     slot.n = seats.len();
     slot.rng = Rng::new(base.next_u64());
