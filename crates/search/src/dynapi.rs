@@ -870,6 +870,8 @@ pub trait DynDriver: Send + Sync {
     fn finished(&self) -> bool;
     fn paused(&self) -> bool;
     fn resume(&mut self, quota: u64, net: u32) -> Result<(), String>;
+    /// Rolling mode, between phases: the games started from now on play `spec` (`Driver::set_spec`).
+    fn set_spec(&mut self, spec: &str) -> Result<(), String>;
     fn end_phase(&mut self);
     fn take_results(&mut self) -> Vec<GameResult>;
     fn take_samples(&mut self) -> Vec<Record>;
@@ -907,6 +909,9 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     }
     fn resume(&mut self, quota: u64, net: u32) -> Result<(), String> {
         Driver::resume(self, quota, net)
+    }
+    fn set_spec(&mut self, spec: &str) -> Result<(), String> {
+        Driver::set_spec(self, spec)
     }
     fn end_phase(&mut self) {
         Driver::end_phase(self)

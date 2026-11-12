@@ -170,6 +170,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
 | `reader_<target>` (one per reader the game package declares: the toy's `reader_next_card`) | 0 | a reader (section 36): 1 = the network gets the game's reader of that auxiliary target - a small MLP reading declared features (a token network: bags and globals) whose prediction is trained by the target's loss (needs `aux_<target>_w` > 0, its weight) and is also an input of the trunk (a new run's first network; added to a checkpoint without it at its next training, every output unchanged; a checkpoint with another reader, or with one in a run that turns it off, is refused). 0 = off: the network of before bit for bit (section 36.6) |
 | `reader_detach` | 1 | 1 = a reader's prediction enters the trunk detached: only its target's loss trains the reader (section 36.4); 0 = the trunk's losses train it too |
+| the game package's own settings (`GamePackage.settings`; MTG Zero's `real_decks_every`, `real_decks_pools`, `real_decks_games`, `real_decks_builder`, and its deck evaluator's `evaluator_every`, `evaluator_window`, ..., `deckchoice_eval_games`) | the package's | run settings a game package declares for its own features (section 40): a flag each, saved in config.json, shipped to a remote evaluation's mirror; an extra evaluation's cadence (`GamePackage.evals_every`: it runs on the evaluated iterations that are multiples of the setting, never at 0). A package without them: none |
 
 ## 2. Run control (`runctl.py`)
 
@@ -335,6 +336,10 @@ yardsticks, the Elo matches and reference games - to another machine while the r
   is recorded; a path with no file, or a file that does not arrive, fails the evaluation (logged,
   retried). The package's remote side writes them; a package without `remote_eval_files` copies
   what it did before.
+* **The package's other yardsticks** (`GamePackage.evals`, run by `Run.evaluate` on the remote): their
+  `extras` come back in the evals.jsonl row beside eval_yard (and the log names each, `iter N <name> (remote
+  <host>): ...`), as a local evaluation records them in metrics.jsonl; the dashboard merges them (section 40;
+  before 2026-11-11 they were computed on the remote and dropped).
 * **Remote side** (`zero.remote.main`): `Run.evaluate` + `Run.elo_update` on the mirror (the
   run's own code), with the remote's `<workdir>/overrides.json` (if any) over the mirror's config;
   **one evaluation at a time per workdir** (the lock directory `<workdir>/.eval.lock`, freed when
@@ -5228,6 +5233,109 @@ self-play records, docs/search.md 3.17); config.json gains the four keys.
 in Python and in the Rust driver, h2h's run rule and tag, the hello's fingerprint; a seat with the setting plays the
 toy's games (which mark no value choice) exactly as one without, making none. The search: docs/search.md 3.17's Rust
 tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.
+
+## 40. A game package's run settings and hooks: a self-play spec per phase, remote evaluation inputs, an extra evaluation's cadence, a remote evaluation's extras (`GamePackage.settings`, `selfplay_specs`, `remote_eval_inputs`, `evals_every`; MTG Zero's deck evaluator retrained inside a run and its win % against real decks, 2026-11-11)
+
+Two branches wrote this section at the same time, both from f9ca5c3 and both pinned by MTG Zero branches:
+**`feat/selfplay-spec-hook`** (ef63ee1; MTG Zero's ENGINE.md 112: (a) below) and **`feat/extra-evals`** (6ed51d5; its
+ENGINE.md 113: (b) below). `feat/eoe-run2` merges them (a merge commit; both stay published). Each needed run settings of
+a game package's own and each had written them the same way (the same check and update in `apply_package`): one
+`GamePackage.settings` is kept, serving both. The subsections keep both branches' numbers (40.1 to 40.5), so references
+to either branch's 40.x still point at their text.
+
+### 40.1 Why
+
+**(a) The deck evaluator.** MTG Zero's run 2 chooses each self-play seat's sealed deck with a learned deck evaluator
+read from a file named in the game's spec, and retrains that evaluator during the run on the run's own recent games
+(MTG Zero's ENGINE.md 112). Three things the core did not offer: (1) **settings of the package's own** (how often to
+retrain, on how many iterations) as run settings - presets, flags and config.json -, not keys the game's spec parser
+would have to accept; (2) **a self-play spec that changes between iterations** while the rolling driver (2.6 of
+docs/search.md) keeps its games in flight - a new driver per change would drop them; (3) **a remote evaluation that
+reads a file of the run** (the evaluator version its iteration used): the mirror held only checkpoints, the config and
+the Elo state.
+
+**(b) The real-deck yardstick.** MTG Zero's Edge of Eternities runs gain a yardstick of their deckbuilding: the win
+rate of our deck of a 17lands pool against real players' decks, beside the player's own deck of the same pool (its
+docs/ENGINE.md 113). It is an extra evaluation (`GamePackage.evals`, section 5's `extras`), but three things were
+missing: (1) it costs several times a run's other evaluations, so it needs a cadence of its own, set per run - and a
+game package could not declare a run setting (`apply_package` refused any name outside the core's DEFAULTS: (a)'s (1));
+(2) an extra evaluation that has nothing to measure returns None and logs `iter N <name>: skipped` every evaluation -
+for an opt-in yardstick that is off, a line in every run's log; (3) a remote evaluation (5.2) ran the package's extra
+evaluations on the remote and dropped their results: `RemoteEval` copied `eval_yard`, `eval_random`, `elo` and
+`elo_anchored` into evals.jsonl, not `extras`.
+
+### 40.2 What it does
+
+* **`GamePackage(settings={name: default})`**: run settings of the package's own. `apply_package` adds them to
+  `zero.run.DEFAULTS` with the core's, the auxiliary targets' and the readers' (so each gets its flag, `--name`, e.g.
+  `--real-decks-every 20`; presets and the package's `defaults` may set them; `resolve_config` keeps a saved value;
+  config.json carries them, and a remote evaluation's mirror config with them); a name of the core's (or an auxiliary
+  target's or reader's) is refused (`ValueError` at registration). The core never reads them; the package's hooks and
+  evaluations do (`run.cfg`).
+* **`GamePackage(selfplay_specs={game: fn(run, it) -> spec JSON | None})`** (or 'module:attr'): `Run.selfplay_spec(it)`
+  asks it at the start of every local self-play phase (`run`: the `Run`); None (or no hook) is the run's spec. A
+  rolling run's driver is made with the phase's spec, and when a later phase's differs the run calls
+  `Driver.set_spec` between the phases (docs/search.md 2.13: the games it starts from then on; games in flight keep
+  theirs) and logs `iter N self-play: the rolling driver plays the game package's new spec from now on`; a phase's
+  driver (rolling 0) is made with it (`Run.driver(..., spec=)`, self-play's only). An answer that is not a non-empty
+  string is an error. Remote self-play (section 5.3) refuses a changed spec: its workers play the run's spec.
+* **`GamePackage(remote_eval_inputs={game: fn(run, it) -> [path, ...]})`** (or 'module:attr'): `RemoteEval._ship` puts
+  each named file of the run (run-relative, '/'-separated; absolute, '..', backslashes and drive letters refused) at the
+  same path in the mirror before evaluating iteration `it`, again whenever its size or modification time changed since
+  this session put it (a mirror re-shipped after an error: all again). A missing file fails the evaluation (logged,
+  retried), as a missing `remote_eval_files` file does (5.2).
+* **`GamePackage(evals_every={eval name: setting})`**: an extra evaluation with a cadence of its own. `Run.extra_evals`
+  runs it on an evaluated iteration `it` only when the setting's value n > 0 and `it % n == 0` (`GamePackage.eval_due`);
+  otherwise it is passed over silently - no call, no log line, no `extras` key. The setting must be one of the package's
+  `settings` with an integer default >= 0 (else `ValueError` when the package is made). It runs only where the run
+  evaluates at all (`eval_every`): a cadence that is a multiple of `eval_every` runs every n-th iteration. An extra
+  evaluation without an entry runs on every evaluated iteration, as before.
+* **Remote evaluations bring `extras` back**: `RemoteEval._evaluate` copies the result's `extras` into the run's
+  evals.jsonl row (absent: no key, the row of before) and logs each one (`iter N <name> (remote <host>): {...}`, or
+  `EXTRA EVAL FAILED: ...`); `dashboard._metrics` merges `extras` from evals.jsonl into the iteration's row with the
+  other evaluation keys, so the "Other yardsticks" chart shows a remote run's extras too. An extra evaluation that
+  reads a file of the run on the remote names it in `remote_eval_inputs` (MTG Zero's deck-choice evaluation: the
+  evaluator version of the iteration).
+
+### 40.3 Off by default
+
+A package declaring none of the five (the toy, Caverna, Glass Road, Kingdom Builder, St. Petersburg, Dominion Zero
+today) has the DEFAULTS, the flags, the self-play and the extra evaluations of before: nothing is asked or shipped -
+`selfplay_spec` is the run's spec, the drivers are made exactly as before (`spec=None`), `set_spec` is never called, and
+`RemoteEval._ship` reads no more of the run's settings than before (a package with no `remote_eval_inputs` returns
+before reading `game`: `test_select.py`'s `test_remote_ships_raw_offsets` ships with a settings dict that has none).
+With a hook that answers None the same. A package's settings add keys to config.json and nothing else. The driver's
+spec is read through a lock once per game started: the same games (the toy's golden self-play records and MTG Zero's
+checkpoint compatibility check, its ENGINE.md 112). `extras` reach evals.jsonl only when a package's extra evaluation
+produced them on the remote. Nothing in self-play, search, training or the local evaluation's matches changes. MTG Zero
+declares its settings off (its real-deck cadence 0, its evaluator retrain 0): its runs' config.json gain the keys, and
+their self-play, evaluations and logs are as before.
+
+### 40.4 Costs
+
+None without a hook. With one: the hook's own time once per phase; `set_spec` parses one spec between phases. A
+cadence: a dictionary lookup per extra evaluation and evaluated iteration.
+
+### 40.5 Tests and checks
+
+(a) `tests/test_package_hooks.py` (6): no hook, the run's spec; a rolling driver switches between phases (logged once,
+a non-string answer and an invalid spec refused); a phase's driver is made with the hook's spec; remote self-play
+refuses a changed spec; a package setting is a run setting with a flag (a core name refused, the defaults restored);
+a remote evaluation ships the inputs (again only when changed; a missing file and paths outside the run refused). Rust:
+docs/search.md 2.13's test. The gate: MTG Zero's `optin-core` (ENGINE.md 112).
+
+(b) `tests/test_extra_evals.py` (3): a package's settings join DEFAULTS (flags, presets, a saved value) and leave with
+the package, a clash with a core setting and a cadence setting that is not an integer setting of the package refused;
+an extra evaluation with a cadence runs exactly at the multiples (0: never, silently - no log line), one without runs
+every time; a remote evaluation (the 'local' remote, the remote side in process) of iterations 1 and 2 with the cadence
+2 in the shipped config: evals.jsonl's iteration 2 carries both extras, iteration 1 only the one without a cadence, the
+dashboard merges them and the log names them. `tests/test_cotrain.py::test_extra_evals_are_logged_and_skipped`
+unchanged and passing. MTG Zero's end-to-end check (a remote evaluation of an `mtg_eoe` run through its real `python -m
+mtgz.az.remote eval`): its ENGINE.md 113.
+
+The merge (`feat/eoe-run2`): both test files unchanged and passing (the clash message names both readings: "run
+settings of the core already (names of the core's, ...)"); the full suite, and MTG Zero's integration of both
+(`eoe-run2-int`, its ENGINE.md 126).
 
 ## 43. Variable-length rows: tail tokens and pointer overrides in shards, the window and the run (`allow_draft_layout` in 43.4; MTG Zero's layout v7, 2026-11-11)
 

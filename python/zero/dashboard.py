@@ -79,7 +79,7 @@ def _metrics(d):
         for m in rows:
             e = evals.get(m.get('iter'))
             if e:
-                for k in ('eval_yard', 'eval_random', 'elo', 'eval_yard_net', 'elo_anchored'):
+                for k in ('eval_yard', 'eval_random', 'elo', 'eval_yard_net', 'elo_anchored', 'extras'):
                     if k in e:
                         m[k] = e[k]
     return rows

@@ -421,8 +421,16 @@ _CORE_PRESETS = dict(PRESETS)
 def apply_package(pkg):
     """The game package's run presets and DEFAULTS overrides (zero.package.register calls this;
     so does importing this module), and the weight setting of each of its auxiliary targets
-    (`aux_<name>_w`, default 0 = off; docs/az.md 15). Unknown setting names are an error."""
+    (`aux_<name>_w`, default 0 = off; docs/az.md 15), and the package's own run settings
+    (`GamePackage.settings`, docs/az.md 40; a name the core already has is an error). Unknown setting
+    names are an error."""
     known = dict(_CORE_DEFAULTS, **pkg.aux_settings(), **pkg.reader_settings())
+    # the package's own run settings (GamePackage.settings, docs/az.md 40): new names only
+    clash = sorted(set(getattr(pkg, 'settings', {})) & set(known))
+    if clash:
+        raise ValueError(f'{pkg.name}: the package\'s settings {clash} are run settings of the core already '
+                         f'(names of the core\'s, an auxiliary target\'s or a reader\'s)')
+    known.update(getattr(pkg, 'settings', {}))
     bad = sorted(set(pkg.defaults) - set(known))
     if bad:
         raise ValueError(f'{pkg.name}: unknown run settings in defaults: {bad}')
@@ -589,6 +597,7 @@ class Run:
         self.rsp = None                            # zero.remoteplay.RemotePlay when selfplay_remote is set
         self.roll = None                           # rolling driver + its evaluator
         self.roll_ev = None
+        self.roll_spec = None                      # the rolling driver's spec (selfplay_specs, docs/az.md 40)
         self.wcache = None                         # zero.data.WindowCache with window_cache
         # the self-play league (zero/league.py): None when selfplay_league is 0 (nothing changes)
         self.league = L.League(self) if L.enabled(cfg) else None
@@ -675,12 +684,16 @@ class Run:
         return elo.eval_tag(self.cfg)
 
     def driver(self, seats, seed, record=False, conc=None, rolling=False, net=0, groups=None, queue_only=False,
-               paired=False):
+               paired=False, spec=None):
         """A driver for self-play (`record`: the run's spec) or a match (eval_spec, if set).
         `queue_only`: a rolling driver that plays only queued setups (co-training). `paired`: games 2k
-        and 2k + 1 share their streams (the driver's `paired`, docs/az.md 20.3)."""
+        and 2k + 1 share their streams (the driver's `paired`, docs/az.md 20.3). `spec`: self-play's
+        spec of the phase instead of the run's (`selfplay_spec`, docs/az.md 40)."""
         c = self.cfg
-        spec = c['spec'] if record else (c.get('eval_spec') or package.active().eval_spec_of(c['game'], c['spec']))
+        if spec is not None and not record:
+            raise ValueError('driver: a spec of its own is self-play\'s (record)')
+        if spec is None:
+            spec = c['spec'] if record else (c.get('eval_spec') or package.active().eval_spec_of(c['game'], c['spec']))
         kw = {'queue_only': True} if queue_only else {}
         if paired:
             kw['paired'] = True
@@ -727,10 +740,26 @@ class Run:
         finally:
             self.writers = []
 
+    def selfplay_spec(self, it):
+        """Iteration `it`'s self-play spec (docs/az.md 40): the game package's `selfplay_specs` hook's answer, else
+        (no hook, or it answers None) the run's spec. A spec of the hook's must be a non-empty string."""
+        f = package.active().selfplay_spec_fn(self.cfg['game'])
+        s = f(self, it) if f is not None else None
+        if s is None:
+            return self.cfg['spec']
+        if not isinstance(s, str) or not s:
+            raise ValueError(f'the game package\'s selfplay_specs hook answered {s!r} for iteration {it}: a spec JSON or None')
+        return s
+
     def _selfplay(self, it):
         if self.rsp is not None:
+            # (remote self-play's workers play the run's spec: a phase's spec of the package's is refused)
+            if self.selfplay_spec(it) != self.cfg['spec']:
+                raise RuntimeError('selfplay_specs: the game package changed the self-play spec, which remote self-play '
+                                   'does not follow (docs/az.md 40)')
             return self.selfplay_shared(it)        # with a remote: the shared queue (docs/az.md 5.3)
         c = self.cfg
+        spec = self.selfplay_spec(it)
         d = os.path.join(self.run, 'data', f'iter_{it:04d}')
         if os.path.exists(d):
             self.drop_data(d, strict=True)         # an interrupted iteration is replayed
@@ -745,12 +774,19 @@ class Run:
                     table, self.roll_kinds = L.rolling_table(c, seat)
                 else:
                     table = [[seat] * p for p in c['players']]
-                self.roll = self.driver(table, seed=c['seed'] * 7919 + it, record=True, rolling=True, net=it - 1)
+                self.roll = self.driver(table, seed=c['seed'] * 7919 + it, record=True, rolling=True, net=it - 1,
+                                        spec=spec if spec != c['spec'] else None)
+                self.roll_spec = spec
                 self.roll_ev = self.evaluator(model_path(self.run, it - 1))
                 self.roll_evs = {'m': self.roll_ev}
             else:
                 m, _ = load(model_path(self.run, it - 1), 'cpu', game=c['game'])
                 self.roll_ev.set_network(m)
+                if spec != self.roll_spec:
+                    # (docs/az.md 40: the games the driver starts from now on play the phase's spec)
+                    self.roll.set_spec(spec)
+                    self.roll_spec = spec
+                    self.log(f'iter {it} self-play: the rolling driver plays the game package\'s new spec from now on')
             drv, ev = self.roll, self.roll_ev
             evs, kinds = self.roll_evs, self.roll_kinds
             st0 = drv.stats()
@@ -762,7 +798,7 @@ class Run:
                 games, kinds = L.table(c, seat, counts)
             else:
                 games, kinds = [[seat] * int(p) for p in counts], None
-            drv = self.driver(games, seed=c['seed'] * 1_000_003 + it, record=True)
+            drv = self.driver(games, seed=c['seed'] * 1_000_003 + it, record=True, spec=spec if spec != c['spec'] else None)
             ev = self.evaluator(model_path(self.run, it - 1))
             evs = {'m': ev}
             st0 = None
@@ -1754,8 +1790,12 @@ class Run:
         """The game package's other yardsticks of checkpoint `it` (GamePackage.evals): measured
         and logged under m['extras'][name], never fed back. One that raises does not stop the
         run (a yardstick, not the loop): its error is logged (EXTRA EVAL FAILED) and recorded as
-        m['extras'][name] = {'error': ...}."""
-        for name, fn in package.active().evals_of(self.cfg['game']).items():
+        m['extras'][name] = {'error': ...}. One with a cadence of its own (GamePackage.evals_every,
+        docs/az.md 40) runs only when it is due and is passed over silently otherwise."""
+        pkg = package.active()
+        for name, fn in pkg.evals_of(self.cfg['game']).items():
+            if not pkg.eval_due(name, self.cfg, it):
+                continue
             t0 = time.time()
             try:
                 r = fn(self, it)

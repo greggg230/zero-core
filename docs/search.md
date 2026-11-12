@@ -597,6 +597,19 @@ rows, HiddenMull with root-view and belief rows, eval_cache 0 and 4096: every ba
 the dense driver's, the same games, records, cache hits and rows); the golden digests (dense) unchanged.
 MTG Zero checks its own states (ENGINE.md 89: 10k Delver leaf rows, pairs and keys equal).
 
+### 2.13 A rolling driver's spec between phases (`set_spec`; MTG Zero's deck evaluator, 2026-11-11)
+
+`set_spec(spec)` (a rolling driver, between phases: `paused()`) makes every game the driver starts from then on
+play `spec` (JSON, the game's `parse_spec`) instead of the driver's; the games in flight keep the spec they began
+with, queued setups and archive starts keep theirs, and the bots of the driver's seats must exist for the new spec.
+An invalid spec, a phase running or a driver that is not rolling is an error, and the spec of before stays. Game
+`gid` started after it is game `gid` of a driver made with the new spec (the same (seed, gid) streams). The run loop
+calls it when a game package's self-play spec hook answers a new spec for a phase (docs/az.md 40); nothing else
+does, so a driver that is never told plays its spec as before (the shared spec is now behind a lock, read once per
+game started: the same games). Test: `driver::tests::set_spec_plays_the_new_spec_in_the_games_started_after_it`
+(the toy's extra food from the switch: games started before it equal the old spec's driver, games after it the new
+spec's; the refusals).
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),

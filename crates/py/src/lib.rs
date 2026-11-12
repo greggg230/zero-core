@@ -976,6 +976,10 @@ impl PySearchDriver {
     fn resume(&mut self, quota: u64, net: u32) -> PyResult<()> {
         self.d.resume(quota, net).map_err(rerr)
     }
+    /// Rolling mode, between phases: the games started from now on play `spec` (docs/search.md 2.13).
+    fn set_spec(&mut self, spec: &str) -> PyResult<()> {
+        self.d.set_spec(spec).map_err(rerr)
+    }
     fn end_phase(&mut self) {
         self.d.end_phase()
     }
