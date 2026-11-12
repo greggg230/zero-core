@@ -16,7 +16,7 @@
 //! `game_names()`, `game_info_of(name)`, `lookahead_settings(settings)` and `MAX_SEATS`.
 use std::sync::OnceLock;
 
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -26,6 +26,8 @@ use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGam
 use zero_search::lookahead::{LookCfg, Outcome};
 use zero_search::tail::TailRow;
 use zero_search::{SearchGame, MAX_SEATS};
+
+mod pack;
 
 /// For `engine_module!` (the game crate needs its own `pyo3` dependency too: the PyO3 macros
 /// refer to `::pyo3`).
@@ -87,6 +89,8 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(belief_weight_of, m)?)?;
     m.add_function(wrap_pyfunction!(gumbel_sequence_of, m)?)?;
     m.add_function(wrap_pyfunction!(completed_q_policy_of, m)?)?;
+    m.add_function(wrap_pyfunction!(pack_sparse_tokens, m)?)?;
+    m.add_function(wrap_pyfunction!(pack_tail_tokens, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
     m.add("BELIEF_CLIP", BELIEF_CLIP)?;
     Ok(())
@@ -402,6 +406,75 @@ fn completed_q_policy_of(p0: Vec<f32>, n: Vec<u32>, w: Vec<f64>, v: f64, c_visit
         return Err(PyValueError::new_err(format!("completed_q_policy: {} priors, {} visit counts, {} value sums", p0.len(), n.len(), w.len())));
     }
     Ok(zero_search::tree::completed_q_policy_w(&p0, &n, &w, v, c_visit, c_scale, prior_w))
+}
+
+fn contiguous<T>(r: Result<T, numpy::NotContiguousError>, what: &str) -> PyResult<T> {
+    r.map_err(|_| PyValueError::new_err(format!("{what}: a contiguous array")))
+}
+
+/// A token network's sparse batch packed for its CUDA graphs, off the GIL (`pack::sparse`; `zero.infer.TokenGraphRunner`,
+/// docs/az.md 43.12): the non-zeros' flat indexes and values into `fi` / `val`, each row's tokens into `ntok`
+/// (padding rows 1), the token positions into `full` (row stride Tp), the head presence into `pres` when given ->
+/// (Tp, the longest row's tokens); Tp = 0 when a row is longer than `long_t` (>= 0).
+#[pyfunction]
+#[pyo3(signature = (xs_off, xs_idx, xs_val, nfeat, flag_col, base, t_off, long_t, t_step, fi, val, ntok, full, pres=None))]
+#[allow(clippy::too_many_arguments)]
+fn pack_sparse_tokens(
+    py: Python<'_>,
+    xs_off: PyReadonlyArray1<'_, i64>,
+    xs_idx: PyReadonlyArray1<'_, u32>,
+    xs_val: PyReadonlyArray1<'_, f32>,
+    nfeat: usize,
+    flag_col: PyReadonlyArray1<'_, i64>,
+    base: PyReadonlyArray1<'_, bool>,
+    t_off: Option<PyReadonlyArray1<'_, i64>>,
+    long_t: i64,
+    t_step: usize,
+    mut fi: PyReadwriteArray1<'_, i64>,
+    mut val: PyReadwriteArray1<'_, f32>,
+    mut ntok: PyReadwriteArray1<'_, i64>,
+    mut full: PyReadwriteArray1<'_, i64>,
+    mut pres: Option<PyReadwriteArray1<'_, bool>>,
+) -> PyResult<(usize, usize)> {
+    let (a, i, v) = (contiguous(xs_off.as_slice(), "xs_off")?, contiguous(xs_idx.as_slice(), "xs_idx")?, contiguous(xs_val.as_slice(), "xs_val")?);
+    let (fc, bs) = (contiguous(flag_col.as_slice(), "flag_col")?, contiguous(base.as_slice(), "base")?);
+    let t = match &t_off {
+        Some(t) => Some(contiguous(t.as_slice(), "t_off")?),
+        None => None,
+    };
+    let (fo, vo) = (contiguous(fi.as_slice_mut(), "fi")?, contiguous(val.as_slice_mut(), "val")?);
+    let (no, uo) = (contiguous(ntok.as_slice_mut(), "ntok")?, contiguous(full.as_slice_mut(), "full")?);
+    let po = match pres.as_mut() {
+        Some(p) => Some(contiguous(p.as_slice_mut(), "pres")?),
+        None => None,
+    };
+    py.allow_threads(move || pack::sparse(a, i, v, nfeat, fc, bs, t, long_t, t_step, fo, vo, no, uo, po)).map_err(verr)
+}
+
+/// A batch's tail tokens padded for a graph of `ntp` entries, off the GIL (`pack::tail`, docs/az.md 43.12): rows,
+/// segments, slots into `tint` [3 * ntp], the floats into `tval` [ntp * wt], with TokenGraphRunner's checks.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn pack_tail_tokens(
+    py: Python<'_>,
+    t_off: PyReadonlyArray1<'_, i64>,
+    t_seg: PyReadonlyArray1<'_, u16>,
+    t_slot: PyReadonlyArray1<'_, u32>,
+    t_val: PyReadonlyArray1<'_, f32>,
+    width: PyReadonlyArray1<'_, i64>,
+    net_tail: PyReadonlyArray1<'_, bool>,
+    head: PyReadonlyArray1<'_, i64>,
+    wt: usize,
+    ntp: usize,
+    pad_seg: i64,
+    pad_slot: i64,
+    mut tint: PyReadwriteArray1<'_, i64>,
+    mut tval: PyReadwriteArray1<'_, f32>,
+) -> PyResult<()> {
+    let (o, s, l, v) = (contiguous(t_off.as_slice(), "t_off")?, contiguous(t_seg.as_slice(), "t_seg")?, contiguous(t_slot.as_slice(), "t_slot")?, contiguous(t_val.as_slice(), "t_val")?);
+    let (w, nt, h) = (contiguous(width.as_slice(), "width")?, contiguous(net_tail.as_slice(), "net_tail")?, contiguous(head.as_slice(), "head")?);
+    let (ti, tv) = (contiguous(tint.as_slice_mut(), "tint")?, contiguous(tval.as_slice_mut(), "tval")?);
+    py.allow_threads(move || pack::tail(o, s, l, v, w, nt, h, wt, ntp, pad_seg, pad_slot, ti, tv)).map_err(verr)
 }
 
 /// A lookahead's settings checked (docs/search.md 3.9; a dict or its JSON) -> their canonical JSON

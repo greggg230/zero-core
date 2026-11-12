@@ -348,6 +348,26 @@ class _Split:
             setattr(self, k, v)
 
 
+# A launch's upload and its graph's integer inputs (docs/az.md 43.12): regions of int64 words, each starting on a
+# multiple of IN_ALIGN words (256 bytes: an allocation's own alignment, so no kernel sees another alignment than in
+# a buffer of its own)
+IN_ALIGN = 32
+
+
+def _al(n):
+    return -(-int(n) // IN_ALIGN) * IN_ALIGN
+
+
+class _Down:
+    """A launch's download (`TokenGraphRunner._stage_down`): its outputs copied out of the graph's on the device stream
+    (`done` recorded after them), the copies to the pinned host buffers queued later on the download stream
+    (`_flush_downs`: after the next launch's uploads, or at its result), `ev` recorded after them (None until)."""
+    __slots__ = ('done', 'items', 'ev')
+
+    def __init__(self, done, items):
+        self.done, self.items, self.ev = done, items, None
+
+
 class _Parts:
     """A batch run as length-sorted chunks (`TokenGraphRunner`, `chunk_rows`): each chunk's rows and handle, merged by
     `result` into the batch's row order."""
@@ -413,9 +433,12 @@ class TokenGraphRunner:
             col += k
         edges = np.flatnonzero(np.diff(np.concatenate([[1], seg.astype(np.int8), [1]])))
         self.runs = [(int(a), int(b)) for a, b in zip(edges[::2], edges[1::2])]
-        self.graphs = {}                             # (B, T) -> (graph, x, n, full, ntok, out, aux)
+        self.graphs = {}                             # key -> (graph, x, its input region, its layout, out, aux)
         self.pool = torch.cuda.graph_pool_handle()
-        self.inp = None                              # shared device inputs (rows, x, n, full, ntok)
+        self.inp = None                              # shared device input rows (capacity, X [cap, F])
+        # the graphs' integer inputs (and the tails' floats): one shared int64 buffer, each graph's views at its key's
+        # layout (`_layout`) - a launch fills them with one copy (docs/az.md 43.12)
+        self.ibuf = None
         self.slots = []                              # pinned host buffers, one set per launch in flight
         self.free = []                               # their indexes not in flight
         self.sslots = []                             # the same for sparse batches (`launch_sparse`)
@@ -426,6 +449,12 @@ class TokenGraphRunner:
         has = self.pidx >= 0
         self.flag_col[self.pidx[has]] = 1 + np.flatnonzero(has)
         self.always = 1 + np.flatnonzero(~has)
+        # the token columns every row has (the global token, the slots without a flag): the packer's (docs/az.md 43.12)
+        self.base = np.zeros(self.n_tok, bool)
+        self.base[0] = True
+        self.base[self.always] = True
+        self.engine = None                           # the engine module whose packers a sparse batch goes through
+        self.widths_lut = {}                         # a batch's tail widths -> per segment its width (`_pack_tail`)
         self.captures = 0
         self.replays = 0
         # the transfers beside the graphs (docs/az.md 43.11): each buffer set's uploads on a copy stream into device
@@ -435,6 +464,11 @@ class TokenGraphRunner:
         self.dstage = {}                             # buffer set key -> {name: device staging tensor}
         self.xstate = {}                             # input rows' storage -> {'X', 'idx', 'n', 'all'}
         self.streams = None                          # (copy stream, download stream)
+        # launches whose downloads are not queued yet (`_Down`): queued by the next launch after its uploads and its
+        # inputs' copies, just before its replay, or at their result (a download waits for its graph; queued before
+        # an upload or a device copy, it holds them back on this machine's copy engines until that graph ends - and
+        # the next graph waits for its inputs: docs/az.md 43.12)
+        self.downs = []
         # variable-length token sets (docs/az.md 43.7): tails and overrides uploaded beside the rows, graphs
         # keyed by (rows, tokens, tail tokens, overrides), rows of more than LONG_T tokens eager
         self.tailnet = bool(model.tails) or model.option_pointers
@@ -453,8 +487,6 @@ class TokenGraphRunner:
             # for the graphs in flight)
             self.seg_nk = model.seg_nk.cpu().numpy()
             self.pos_seg = model.pos_seg.cpu().numpy()
-            self.tinp = None                         # shared device inputs of the tails / overrides
-            self.tbufs = {}                          # pinned host tails / overrides per buffer set
 
     def refresh(self):
         """Nothing to do: the graphs read the model's parameters, which set_weights rewrites in place."""
@@ -463,15 +495,44 @@ class TokenGraphRunner:
         if self.inp is None or self.inp[0] < Bp:
             cap = max(Bp, 512)
             with torch.inference_mode(False):
-                self.inp = (cap, torch.zeros((cap, self.F), device=self.dev),
-                            torch.full((cap,), 2, dtype=torch.int64, device=self.dev),
-                            torch.zeros(cap * self.t_cap, dtype=torch.int64, device=self.dev),
-                            torch.ones(cap, dtype=torch.int64, device=self.dev))
+                self.inp = (cap, torch.zeros((cap, self.F), device=self.dev))
             X = self.inp[1]
             self.xstate[X.data_ptr()] = {'X': X, 'idx': None, 'n': 0, 'all': False}     # (zeros)
         return self.inp
 
-    # ---- the transfers beside the graphs (docs/az.md 43.11)
+    def _ibuf(self, L):
+        """The graphs' shared integer inputs, at least L words (a graph keeps the views it was captured with: a bigger
+        buffer is a new one, the graphs before keep theirs)."""
+        if self.ibuf is None or self.ibuf.shape[0] < L:
+            with torch.inference_mode(False):
+                self.ibuf = torch.zeros(max(L, 1 << 16), dtype=torch.int64, device=self.dev)
+        return self.ibuf
+
+    def _layout(self, Bp, Tp, NTp=None, NOp=None):
+        """A graph's integer inputs as regions of the shared buffer (`_ibuf`) -> ({name: offset}, words): n [Bp], ntok
+        [Bp], full [Bp * Tp]; with tails / overrides (NTp not None) tint [3 * NTp] (rows, segments, slots), oint [4 *
+        NOp] (rows, actions, refs, columns), tval [NTp, Wt] float32. A launch uploads the same layout after its own
+        non-zeros and belief rows (`_up_head`) and copies it into the graph's region in one copy."""
+        o = {'n': 0, 'ntok': _al(Bp)}
+        o['full'] = o['ntok'] + _al(Bp)
+        e = o['full'] + _al(Bp * Tp)
+        if NTp is not None:
+            o['tint'] = e
+            e += _al(3 * NTp)
+            o['oint'] = e
+            e += _al(4 * NOp)
+            o['tval'] = e
+            e += _al((NTp * self.Wt + 1) // 2)
+        return o, e
+
+    @staticmethod
+    def _up_head(nnz, nb):
+        """A launch's upload (int64 words) before its graph's inputs: the non-zeros' flat indexes [nnz], their values
+        [nnz float32], the root belief rows [nb] -> (their offsets, the graph inputs' offset)."""
+        vo = _al(nnz)
+        bo = vo + _al((nnz + 1) // 2)
+        return 0, vo, bo, bo + _al(nb)
+
     def _streams(self):
         if self.streams is None:
             self.streams = (torch.cuda.Stream(self.dev), torch.cuda.Stream(self.dev))
@@ -487,23 +548,23 @@ class TokenGraphRunner:
                 t = d[name] = torch.empty(pin.shape, dtype=pin.dtype, device=self.dev)
         return t
 
-    def _stage_up(self, key, items):
-        """The uploads of a launch on the copy stream: `items` [(name, pinned buffer, entries)] -> ({name: its device
-        staging slice}, the event after them). The copies overlap the graph running before (the staging is the
-        buffer set's own); the device stream waits for the event before it reads them."""
-        have = {id(t) for t in self.dstage.get(key, {}).values()}
-        dst = {name: self._mirror(key, name, pin)[:n] for name, pin, n in items}
+    def _upload(self, key, pin_i, U):
+        """A launch's one upload on the copy stream: its pinned words pin_i[:U] into its buffer set's device staging ->
+        (the staging, the event after the copy). The copy overlaps the graph running before (the staging is the set's
+        own); the device stream waits for the event before it reads the staging."""
+        d = self.dstage.setdefault(key, {})
+        st = d.get('i')
         cs = self._streams()[0]
-        if any(id(t) not in have for t in self.dstage[key].values()):
+        if st is None or st.shape != pin_i.shape:
+            with torch.inference_mode(False):
+                st = d['i'] = torch.empty(pin_i.shape, dtype=torch.int64, device=self.dev)
             # (a staging tensor just made: its memory may have been the device stream's - wait for that stream once)
             cs.wait_stream(torch.cuda.current_stream(self.dev))
         with torch.cuda.stream(cs):
-            for name, pin, n in items:
-                if n:
-                    dst[name].copy_(pin[:n], non_blocking=True)
+            st[:U].copy_(pin_i[:U], non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(cs)
-        return dst, ev
+        return st, ev
 
     def _rezero(self, xs):
         """The graphs' input rows (the storage under `xs`) back to zeros before a sparse batch's scatter: where the
@@ -540,27 +601,51 @@ class TokenGraphRunner:
 
     def _stage_down(self, key, out, aux, B, nb, bi, pin_out, pin_aux):
         """After a replay: its outputs copied out of the graph's (on the device stream, so the next replay of the
-        same graph may overwrite them), then downloaded on the download stream -> the event the result waits for."""
+        same graph may overwrite them) -> the launch's `_Down`, its download queued by `_flush_downs` (by the next
+        launch just before its replay, or at its result: `_wait_down`)."""
         dout = self._mirror(key, 'out', pin_out)
         dout[:B].copy_(out[:B])
+        items = [(pin_out[:B], dout[:B])]
         if nb:
             daux = self._mirror(key, 'aux', pin_aux)
             torch.index_select(aux, 0, bi, out=daux[:nb])
+            items.append((pin_aux[:nb], daux[:nb]))
         done = torch.cuda.Event()
         done.record(torch.cuda.current_stream(self.dev))
-        ds = self._streams()[1]
-        ds.wait_event(done)
-        with torch.cuda.stream(ds):
-            pin_out[:B].copy_(dout[:B], non_blocking=True)
-            if nb:
-                pin_aux[:nb].copy_(daux[:nb], non_blocking=True)
-            ev = torch.cuda.Event()
-            ev.record(ds)
-        return ev
+        d = _Down(done, items)
+        self.downs.append(d)
+        return d
 
-    def _slot(self, Bp):
-        """A free set of pinned host buffers for `Bp` rows (a new one when every set is in flight:
-        a launch's buffers are reused only after its `result`)."""
+    def _flush_downs(self, here=False):
+        """The downloads of the launches not queued yet (`downs`), in launch order, on the download stream: each waits
+        for its graph (`done`) - with `here`, for the device stream as it is now, after the next launch's input copies
+        (a download that ran beside them would hold them back on the copy engine) -, its event recorded after its
+        copies."""
+        if not self.downs:
+            return
+        ds = self._streams()[1]
+        if here:
+            now = torch.cuda.Event()
+            now.record(torch.cuda.current_stream(self.dev))
+        with torch.inference_mode(False), torch.cuda.stream(ds):
+            for d in self.downs:
+                ds.wait_event(now if here else d.done)
+                for pin, dev in d.items:
+                    pin.copy_(dev, non_blocking=True)
+                d.ev = torch.cuda.Event()
+                d.ev.record(ds)
+        self.downs.clear()
+
+    def _wait_down(self, d):
+        """Wait for a launch's download (queued now if it is not yet)."""
+        if d.ev is None:
+            self._flush_downs()
+        d.ev.synchronize()
+
+    def _slot(self, Bp, U):
+        """A free set of pinned host buffers for a dense batch of `Bp` rows and an upload of U words (a new one when
+        every set is in flight: a launch's buffers are reused only after its `result`) -> (its index, (rows, upload
+        words, outputs, auxiliary outputs))."""
         k = self.free.pop() if self.free else None
         if k is None:
             k = len(self.slots)
@@ -570,12 +655,13 @@ class TokenGraphRunner:
             n = max(Bp, 256)
             with torch.inference_mode(False):
                 b = self.slots[k] = (torch.zeros((n, self.F), dtype=torch.float32).pin_memory(),
-                                     torch.empty(n, dtype=torch.int64).pin_memory(),
-                                     torch.empty(n * self.t_cap, dtype=torch.int64).pin_memory(),
-                                     torch.empty(n, dtype=torch.int64).pin_memory(),
+                                     torch.empty(max(U, 1 << 16), dtype=torch.int64).pin_memory(),
                                      torch.empty((n, self.A + 2 * self.S), dtype=torch.float32).pin_memory(),
-                                     torch.empty((n, max(1, self.W)), dtype=torch.float32).pin_memory(),
-                                     torch.empty(n, dtype=torch.int64).pin_memory())
+                                     torch.empty((n, max(1, self.W)), dtype=torch.float32).pin_memory())
+        if b[1].shape[0] < U:
+            with torch.inference_mode(False):
+                b = self.slots[k] = (b[0], torch.empty(max(U, 2 * b[1].shape[0]), dtype=torch.int64).pin_memory(),
+                                     b[2], b[3])
         return k, b
 
     def _run(self, x, n, full, ntok, tail=None, ov=None):
@@ -593,20 +679,7 @@ class TokenGraphRunner:
             aux = torch.cat([pred[t[0]].float() for t in self.layout], 1)
         return out, aux
 
-    def _tinputs(self, NTp, NOp):
-        """The shared device inputs of tails and overrides, at least NTp / NOp entries (a graph keeps views
-        of the ones it was captured with, as of `_inputs`'): the tail's integers [3 * entries] (a graph of NTp
-        entries: its rows, segments, slots in turn - one upload), its floats [entries, Wt], the overrides'
-        integers [4 * entries] (rows, actions, refs, columns in turn)."""
-        ti = self.tinp
-        if ti is None or ti[0] < NTp or ti[1] < NOp:
-            ct = max(NTp, 256, ti[0] if ti else 0)
-            co = max(NOp, 256, ti[1] if ti else 0)
-            L, dev = torch.long, self.dev
-            with torch.inference_mode(False):
-                self.tinp = (ct, co, torch.zeros(3 * ct, dtype=L, device=dev), torch.zeros((ct, self.Wt), device=dev),
-                             torch.zeros(4 * co, dtype=L, device=dev))
-        return self.tinp
+
 
     def _pad_inputs(self, tail, ov):
         """Device tails / overrides set to padding (docs/az.md 43.5: tail row 0, the first tail segment, slot
@@ -626,17 +699,23 @@ class TokenGraphRunner:
         key = (Bp, Tp) if NTp is None else (Bp, Tp, NTp, NOp)
         g = self.graphs.get(key)
         if g is None:
-            _, X, N, FULL, NT = self._inputs(Bp)
-            x, n, full, ntok = X[:Bp], N[:Bp], FULL[:Bp * Tp].view(Bp, Tp), NT[:Bp]
-            tail = ov = tint = oint = None
-            if NTp is not None:                      # (a network with tails or overrides, docs/az.md 43.7)
-                _, _, TI, TV, OI = self._tinputs(NTp, NOp)
-                tint, oint = TI[:3 * NTp], OI[:4 * NOp]
-                if self.net.tails:
-                    tail = {'row': tint[:NTp], 'seg': tint[NTp:2 * NTp], 'slot': tint[2 * NTp:], 'val': TV[:NTp]}
-                if self.net.option_pointers:
-                    ov = {k: oint[i * NOp:(i + 1) * NOp] for i, k in enumerate(('row', 'act', 'ref', 'col'))}
+            _, X = self._inputs(Bp)
+            o, L = self._layout(Bp, Tp, NTp, NOp)
+            IN = self._ibuf(L)
             with torch.inference_mode(False), torch.no_grad():
+                # (the views of the shared inputs made outside inference mode: normal tensors the graph's copy writes)
+                x, n, ntok, reg = X[:Bp], IN[o['n']:o['n'] + Bp], IN[o['ntok']:o['ntok'] + Bp], IN[:L]
+                full = IN[o['full']:o['full'] + Bp * Tp].view(Bp, Tp)
+                tail = ov = None
+                if NTp is not None:                  # (a network with tails or overrides, docs/az.md 43.7)
+                    tint, oint = IN[o['tint']:o['tint'] + 3 * NTp], IN[o['oint']:o['oint'] + 4 * NOp]
+                    if self.net.tails:
+                        tv = IN[o['tval']:o['tval'] + (NTp * self.Wt + 1) // 2].view(torch.float32)
+                        tail = {'row': tint[:NTp], 'seg': tint[NTp:2 * NTp], 'slot': tint[2 * NTp:],
+                                'val': tv[:NTp * self.Wt].view(NTp, self.Wt)}
+                    if self.net.option_pointers:
+                        ov = {k: oint[i * NOp:(i + 1) * NOp] for i, k in enumerate(('row', 'act', 'ref', 'col'))}
+                n.fill_(2)
                 full.zero_()
                 ntok.fill_(1)
                 self._pad_inputs(tail, ov)
@@ -649,7 +728,7 @@ class TokenGraphRunner:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
                     out, aux = self._run(x, n, full, ntok, tail, ov)
-            g = self.graphs[key] = (graph, x, n, full, ntok, out, aux) + (() if NTp is None else (tail, ov, tint, oint))
+            g = self.graphs[key] = (graph, x, reg, o, out, aux)
             self.captures += 1
         return g
 
@@ -694,8 +773,10 @@ class TokenGraphRunner:
         nb = 0 if brows is None else len(brows)
         if nb and not self.layout:
             raise RuntimeError('TokenGraphRunner: root belief rows for a network without the auxiliary head')
-        slot, (pin_x, pin_n, pin_full, pin_ntok, pin_out, pin_aux, pin_b) = self._slot(Bp)
-        graph, xs, ns, fs, ts, out, aux = self._graph(Bp, Tp)
+        o, L = self._layout(Bp, Tp)
+        _, _, bo, R0 = self._up_head(0, nb)
+        slot, (pin_x, pin_i, pin_out, pin_aux) = self._slot(Bp, R0 + L)
+        graph, xs, reg, _, out, aux = self._graph(Bp, Tp)
         if B >= COPY_PAR_ROWS:
             step = -(-B // COPY_THREADS)
             dst = pin_x[:B].numpy()
@@ -705,50 +786,94 @@ class TokenGraphRunner:
                 f.result()
         else:
             self._copy_rows(x, P, pin_x[:B].numpy())
-        pn = pin_n[:Bp].numpy()
+        I = pin_i.numpy()
+        pn = I[R0 + o['n']:R0 + o['n'] + Bp]
         pn[:B] = n_players
         pn[B:] = 2
-        pt = pin_ntok[:Bp].numpy()
+        pt = I[R0 + o['ntok']:R0 + o['ntok'] + Bp]
         pt[:B] = cnt
         pt[B:] = 1
-        token_index(P, pin_full[:Bp * Tp].numpy().reshape(Bp, Tp))
+        token_index(P, I[R0 + o['full']:R0 + o['full'] + Bp * Tp].reshape(Bp, Tp))
         if nb:
-            pin_b[:nb].numpy()[:] = brows
+            I[bo:bo + nb] = brows
         key = ('d', slot)
         with torch.inference_mode(False):
-            st, up = self._stage_up(key, [('n', pin_n, Bp), ('full', pin_full, Bp * Tp), ('ntok', pin_ntok, Bp),
-                                          ('b', pin_b, nb)])
+            st, up = self._upload(key, pin_i, R0 + L)
             torch.cuda.current_stream(self.dev).wait_event(up)
             self._dense_rows(xs, pin_x, B)
-            ns.copy_(st['n'])
-            fs.view(-1).copy_(st['full'])
-            ts.copy_(st['ntok'])
+            reg.copy_(st[R0:R0 + L])
+            self._flush_downs(True)
             graph.replay()
-            ev = self._stage_down(key, out, aux, B, nb, st['b'], pin_out, pin_aux)
+            ev = self._stage_down(key, out, aux, B, nb, st[bo:bo + nb], pin_out, pin_aux)
         self.replays += 1
         return (ev, slot, B, n_players, opt_off, opt_action, nb)
 
-    def _sslot(self, Bp, nnz):
-        """A free set of pinned host buffers of a sparse batch (`launch_sparse`): the dense set's
-        without the features, plus the non-zeros' flat indexes and values."""
+    def _sslot(self, Bp, U):
+        """A free set of pinned host buffers of a sparse batch (`launch_sparse`): the dense set's without the rows ->
+        (its index, (None, upload words, outputs, auxiliary outputs))."""
         k = self.sfree.pop() if self.sfree else None
         if k is None:
             k = len(self.sslots)
             self.sslots.append(None)
         b = self.sslots[k]
-        if b is None or b[1].shape[0] < Bp or b[7].shape[0] < nnz:
-            n = max(Bp, 256, 0 if b is None else b[1].shape[0])
-            z = max(nnz, 1 << 16, 0 if b is None else b[7].shape[0])
+        if b is None or b[2].shape[0] < Bp or b[1].shape[0] < U:
+            n = max(Bp, 256, 0 if b is None else b[2].shape[0])
+            u = max(U, 1 << 18, 0 if b is None else 2 * b[1].shape[0])
             with torch.inference_mode(False):
-                b = self.sslots[k] = (None, torch.empty(n, dtype=torch.int64).pin_memory(),
-                                      torch.empty(n * self.t_cap, dtype=torch.int64).pin_memory(),
-                                      torch.empty(n, dtype=torch.int64).pin_memory(),
+                b = self.sslots[k] = (None, torch.empty(u, dtype=torch.int64).pin_memory(),
                                       torch.empty((n, self.A + 2 * self.S), dtype=torch.float32).pin_memory(),
-                                      torch.empty((n, max(1, self.W)), dtype=torch.float32).pin_memory(),
-                                      torch.empty(n, dtype=torch.int64).pin_memory(),
-                                      torch.empty(z, dtype=torch.int64).pin_memory(),
-                                      torch.empty(z, dtype=torch.float32).pin_memory())
+                                      torch.empty((n, max(1, self.W)), dtype=torch.float32).pin_memory())
         return k, b
+
+    def _packer(self):
+        """The active game package's engine module (`games.engine()`), whose `pack_sparse_tokens` /
+        `pack_tail_tokens` pack a sparse batch off the GIL (docs/az.md 43.12)."""
+        if self.engine is None:
+            from . import games as G
+            e = G.engine()
+            if not hasattr(e, 'pack_sparse_tokens'):
+                raise RuntimeError(f'{e.__name__} has no pack_sparse_tokens: a build of a zero-core before docs/az.md 43.12 '
+                                   f'under this one - rebuild it (tools/build_py.sh)')
+            self.engine = e
+        return self.engine
+
+    def _pack_sparse(self, sp, t_off, long_t, Bp, I, R0, o, pres=None):
+        """A sparse batch `sp` (xs_off int64, xs_idx, xs_val) into a set's upload words `I` (numpy int64; `_up_head`'s
+        regions, the graph's inputs `o` from R0): the non-zeros' flat indexes and values, each row's tokens (head +
+        tail, `t_off`'s; the padding rows 1) and the token positions (`token_index` / `token_index_tail`'s, row stride
+        Tp), the head presence into `pres` [B * n_tok] when given -> (Tp, the longest row's tokens); Tp 0 (nothing but
+        the counts) when a row is longer than `long_t` (>= 0)."""
+        xs_off, xs_idx, xs_val = sp
+        nnz = int(xs_off[-1])
+        if xs_idx.dtype != np.uint32:
+            xs_idx = np.asarray(xs_idx)
+            if len(xs_idx) and (int(xs_idx.min()) < 0 or int(xs_idx.max()) >= self.F):
+                raise ValueError(f'TokenGraphRunner: a sparse feature index out of [0, {self.F})')
+        xs_idx = np.ascontiguousarray(xs_idx, np.uint32)
+        xs_val = np.ascontiguousarray(xs_val, np.float32)
+        _, vo, _, _ = self._up_head(nnz, 0)
+        return self._packer().pack_sparse_tokens(
+            xs_off, xs_idx, xs_val, self.F, self.flag_col, self.base, t_off, int(long_t), T_STEP, I[:nnz],
+            I[vo:vo + (nnz + 1) // 2].view(np.float32)[:nnz], I[R0 + o['ntok']:R0 + o['ntok'] + Bp],
+            I[R0 + o['full']:], pres)
+
+    def _pack_tail(self, tail, NTp, I, at):
+        """A batch's tail into a set's upload words `I` at the graph inputs' region `at` (`_layout`'s tint, tval): rows,
+        segments, slots and the floats padded to NTp entries, checked (`pack::tail`: `_check_tail_host`'s checks;
+        docs/az.md 43.12)."""
+        k = tuple(sorted(tail.widths.items()))
+        w = self.widths_lut.get(k)
+        if w is None:
+            w = np.zeros(max(len(self.seg_count), max(tail.widths, default=-1) + 1), np.int64)
+            for g, v in tail.widths.items():
+                w[int(g)] = int(v)
+            self.widths_lut[k] = w
+        ti, tv = at
+        self._packer().pack_tail_tokens(
+            np.ascontiguousarray(tail.off, np.int64), np.ascontiguousarray(tail.seg, np.uint16),
+            np.ascontiguousarray(tail.slot, np.uint32), np.ascontiguousarray(tail.val, np.float32), w, self.seg_tail,
+            self.seg_count, self.Wt, NTp, int(self.pad_seg), int(self.pad_slot), I[ti:ti + 3 * NTp],
+            I[tv:tv + (NTp * self.Wt + 1) // 2].view(np.float32)[:NTp * self.Wt])
 
     def presence_sparse(self, xs_off, xs_idx, xs_val):
         """`token_presence` of sparse rows: [B, 1 + slots] bool, the global token and the slots without a
@@ -779,47 +904,42 @@ class TokenGraphRunner:
     def _launch_sparse1(self, xs_off, xs_idx, xs_val, n_players, opt_off, opt_action, brows=None, tail=None, ov=None):
         if self.tailnet or tail is not None or ov is not None:
             return self._launch_tails(None, (xs_off, xs_idx, xs_val), n_players, opt_off, opt_action, brows, tail, ov)
-        xs_off = np.asarray(xs_off, np.int64)
+        xs_off = np.ascontiguousarray(xs_off, np.int64)
         B = len(xs_off) - 1
         Bp = -(-B // ROW_STEP) * ROW_STEP
         nnz = int(xs_off[-1])
-        P = self.presence_sparse(xs_off, xs_idx, xs_val)
-        cnt = P.sum(1)
-        Tp = -(-int(cnt.max()) // T_STEP) * T_STEP
         nb = 0 if brows is None else len(brows)
         if nb and not self.layout:
             raise RuntimeError('TokenGraphRunner: root belief rows for a network without the auxiliary head')
-        slot, (_, pin_n, pin_full, pin_ntok, pin_out, pin_aux, pin_b, pin_fi, pin_val) = self._sslot(Bp, nnz)
-        graph, xs, ns, fs, ts, out, aux = self._graph(Bp, Tp)
-        rows = np.repeat(np.arange(B, dtype=np.int64), np.diff(xs_off))
-        fi = pin_fi[:nnz].numpy()
-        np.multiply(rows, self.F, out=fi)
-        fi += np.asarray(xs_idx, np.int64)
-        pin_val[:nnz].numpy()[:] = xs_val
-        pn = pin_n[:Bp].numpy()
+        _, vo, bo, R0 = self._up_head(nnz, nb)
+        o, Lmax = self._layout(Bp, self.t_cap)
+        slot, (_, pin_i, pin_out, pin_aux) = self._sslot(Bp, R0 + Lmax)
+        I = pin_i.numpy()
+        try:
+            # (the rows' non-zeros, tokens and token positions: `presence_sparse` and `token_index`'s, packed off the GIL)
+            Tp, _ = self._pack_sparse((xs_off, xs_idx, xs_val), None, -1, Bp, I, R0, o)
+        except Exception:
+            self.sfree.append(slot)
+            raise
+        o, L = self._layout(Bp, Tp)
+        graph, xs, reg, _, out, aux = self._graph(Bp, Tp)
+        pn = I[R0 + o['n']:R0 + o['n'] + Bp]
         pn[:B] = n_players
         pn[B:] = 2
-        pt = pin_ntok[:Bp].numpy()
-        pt[:B] = cnt
-        pt[B:] = 1
-        token_index(P, pin_full[:Bp * Tp].numpy().reshape(Bp, Tp))
         if nb:
-            pin_b[:nb].numpy()[:] = brows
+            I[bo:bo + nb] = brows
         key = ('s', slot)
         with torch.inference_mode(False):
-            st, up = self._stage_up(key, [('fi', pin_fi, nnz), ('val', pin_val, nnz), ('n', pin_n, Bp),
-                                          ('full', pin_full, Bp * Tp), ('ntok', pin_ntok, Bp), ('b', pin_b, nb)])
+            st, up = self._upload(key, pin_i, R0 + L)
             torch.cuda.current_stream(self.dev).wait_event(up)
-            self._scatter(xs, st['fi'], st['val'])
-            ns.copy_(st['n'])
-            fs.view(-1).copy_(st['full'])
-            ts.copy_(st['ntok'])
+            self._scatter(xs, st[:nnz], st[vo:vo + (nnz + 1) // 2].view(torch.float32)[:nnz])
+            reg.copy_(st[R0:R0 + L])
+            self._flush_downs(True)
             graph.replay()
-            ev = self._stage_down(key, out, aux, B, nb, st['b'], pin_out, pin_aux)
+            ev = self._stage_down(key, out, aux, B, nb, st[bo:bo + nb], pin_out, pin_aux)
         self.replays += 1
         return (ev, ('s', slot), B, n_players, opt_off, opt_action, nb)
 
-    # ---- variable-length token sets (docs/az.md 43.7)
     def _tail_args(self, tail, ov):
         net = self.net
         if net.tails and tail is None:
@@ -873,17 +993,7 @@ class TokenGraphRunner:
             raise ValueError(f'TokenGraphRunner: pointer override {i} (row {r[i]}, action {a[i]}, ref {ref[i]}, column '
                              f'{col[i]}): its target is not a present token of its row with that column (docs/az.md 43.7)')
 
-    def _tbuf(self, key, NTp, NOp):
-        """A buffer set's pinned host tails / overrides (reused with the set: after its launch's result)."""
-        b = self.tbufs.get(key)
-        if b is None or b['val'].shape[0] < NTp or b['oint'].shape[0] < 4 * NOp:
-            ct = max(NTp, 256, 0 if b is None else b['val'].shape[0])
-            co = max(NOp, 256, 0 if b is None else b['oint'].shape[0] // 4)
-            with torch.inference_mode(False):
-                b = self.tbufs[key] = {'tint': torch.empty(3 * ct, dtype=torch.int64).pin_memory(),
-                                       'val': torch.empty((ct, self.Wt), dtype=torch.float32).pin_memory(),
-                                       'oint': torch.empty(4 * co, dtype=torch.int64).pin_memory()}
-        return b
+
 
     def _launch_tails(self, x, sp, n_players, opt_off, opt_action, brows, tail, ov):
         """`launch` / `launch_sparse` of a network with tail segments or pointer overrides (docs/az.md 43.7):
@@ -897,9 +1007,14 @@ class TokenGraphRunner:
                 x = x[:, :self.F] if x.shape[1] > self.F else np.pad(x, ((0, 0), (0, self.F - x.shape[1])))
             P = token_presence(x, self.pidx)
         else:
-            xs_off = np.asarray(sp[0], np.int64)
+            xs_off = np.ascontiguousarray(sp[0], np.int64)
             sp = (xs_off, np.asarray(sp[1]), np.asarray(sp[2]))
             B = len(xs_off) - 1
+            # (packed off the GIL straight into a buffer set: docs/az.md 43.12; a batch with a row of more than LONG_T
+            # tokens goes on below, its rows split)
+            h = self._graph_tails_sparse(B, sp, n_players, opt_off, opt_action, brows, tail, ov)
+            if h is not None:
+                return h
             P = self.presence_sparse(*sp)
         tcnt = tail.counts() if tail is not None else np.zeros(B, np.int64)
         cnt = P.sum(1) + tcnt
@@ -1029,11 +1144,13 @@ class TokenGraphRunner:
         return o, aux
 
     def _graph_tails(self, B, x, sp, P, tcnt, cnt, n_players, opt_off, opt_action, brows, tail, ov):
-        """One graph launch of a batch of a network with tails / overrides whose rows are at most LONG_T tokens:
-        the rows (dense: the copied features; sparse: the non-zeros scattered on the device), the extended
-        `full` (`token_index_tail`), the tail padded to NTp entries and the overrides resolved on the host
-        (`rows.resolve`) padded to NOp (docs/az.md 43.5) -> `result`'s handle."""
+        """One graph launch of a dense batch of a network with tails / overrides whose rows are at most LONG_T tokens
+        (a sparse one: `_graph_tails_sparse`): the copied features, the extended `full` (`token_index_tail`), the tail
+        padded to NTp entries and the overrides resolved on the host (`rows.resolve`) padded to NOp (docs/az.md 43.5)
+        -> `result`'s handle."""
         from . import rows as R
+        if x is None:
+            raise RuntimeError('internal: _graph_tails of a sparse batch (_graph_tails_sparse packs those)')
         net = self.net
         Bp = -(-B // ROW_STEP) * ROW_STEP
         Tp = -(-int(cnt.max()) // T_STEP) * T_STEP
@@ -1052,70 +1169,108 @@ class TokenGraphRunner:
         if NO:
             self._check_ov_host(res, P, tr if NT else None, ts if NT else None, B, NT)
         NTp, NOp = tail_bucket(NT), tail_bucket(NO)
-        if x is not None:
-            slot, (pin_x, pin_n, pin_full, pin_ntok, pin_out, pin_aux, pin_b) = self._slot(Bp)
-            key = ('d', slot)
-        else:
-            nnz = int(sp[0][-1])
-            slot, (_, pin_n, pin_full, pin_ntok, pin_out, pin_aux, pin_b, pin_fi, pin_val) = self._sslot(Bp, nnz)
-            key = ('s', slot)
-        tb = self._tbuf(key, NTp, NOp)
-        graph, xs, ns, fs, ts_, out, aux, tin, oin, tint, oint = self._graph(Bp, Tp, NTp, NOp)
-        if x is not None:
-            self._copy_rows(x, P, pin_x[:B].numpy())
-        else:
-            fi = pin_fi[:nnz].numpy()
-            np.multiply(np.repeat(np.arange(B, dtype=np.int64), np.diff(sp[0])), self.F, out=fi)
-            fi += sp[1].astype(np.int64)
-            pin_val[:nnz].numpy()[:] = sp[2]
-        pn = pin_n[:Bp].numpy()
+        o, L = self._layout(Bp, Tp, NTp, NOp)
+        _, _, bo, R0 = self._up_head(0, nb)
+        slot, (pin_x, pin_i, pin_out, pin_aux) = self._slot(Bp, R0 + L)
+        key = ('d', slot)
+        graph, xs, reg, _, out, aux = self._graph(Bp, Tp, NTp, NOp)
+        self._copy_rows(x, P, pin_x[:B].numpy())
+        I = pin_i.numpy()
+        pn = I[R0 + o['n']:R0 + o['n'] + Bp]
         pn[:B] = n_players
         pn[B:] = 2
-        pt = pin_ntok[:Bp].numpy()
+        pt = I[R0 + o['ntok']:R0 + o['ntok'] + Bp]
         pt[:B] = cnt
         pt[B:] = 1
-        token_index_tail(P, tcnt, self.n_tok, pin_full[:Bp * Tp].numpy().reshape(Bp, Tp))
+        token_index_tail(P, tcnt, self.n_tok, I[R0 + o['full']:R0 + o['full'] + Bp * Tp].reshape(Bp, Tp))
         if nb:
-            pin_b[:nb].numpy()[:] = brows
-        if tin is not None and NTp:
-            a = tb['tint'][:3 * NTp].numpy().reshape(3, NTp)       # (the graph's rows, segments, slots in turn)
+            I[bo:bo + nb] = brows
+        if net.tails and NTp:
+            a = I[R0 + o['tint']:R0 + o['tint'] + 3 * NTp].reshape(3, NTp)     # (the graph's rows, segments, slots)
             for i, (v, pad) in enumerate(((tr, 0), (ts, self.pad_seg), (tsl, self.pad_slot))):
                 a[i, :NT] = v
                 a[i, NT:] = pad
-            a = tb['val'][:NTp].numpy()
+            t0 = R0 + o['tval']
+            a = I[t0:t0 + (NTp * self.Wt + 1) // 2].view(np.float32)[:NTp * self.Wt].reshape(NTp, self.Wt)
             a[:NT] = tv
             a[NT:] = 0.0
-        if oin is not None and NOp:
-            a = tb['oint'][:4 * NOp].numpy().reshape(4, NOp)       # (rows, actions, refs, columns in turn)
+        if net.option_pointers and NOp:
+            a = I[R0 + o['oint']:R0 + o['oint'] + 4 * NOp].reshape(4, NOp)    # (rows, actions, refs, columns)
             for i, (k, pad) in enumerate((('row', 0), ('act', self.A), ('ref', -1), ('col', 0))):
                 a[i, :NO] = res[k]
                 a[i, NO:] = pad
-        items = [('n', pin_n, Bp), ('full', pin_full, Bp * Tp), ('ntok', pin_ntok, Bp), ('b', pin_b, nb)]
-        if x is None:
-            items += [('fi', pin_fi, nnz), ('val', pin_val, nnz)]
-        if tin is not None and NTp:
-            items += [('tint', tb['tint'], 3 * NTp), ('tval', tb['val'], NTp)]
-        if oin is not None and NOp:
-            items += [('oint', tb['oint'], 4 * NOp)]
         with torch.inference_mode(False):
-            st, up = self._stage_up(key, items)
+            st, up = self._upload(key, pin_i, R0 + L)
             torch.cuda.current_stream(self.dev).wait_event(up)
-            if x is not None:
-                self._dense_rows(xs, pin_x, B)
-            else:
-                self._scatter(xs, st['fi'], st['val'])
-            ns.copy_(st['n'])
-            fs.view(-1).copy_(st['full'])
-            ts_.copy_(st['ntok'])
-            if tin is not None and NTp:
-                tint.copy_(st['tint'])
-                tin['val'].copy_(st['tval'])
-            if oin is not None and NOp:
-                oint.copy_(st['oint'])
+            self._dense_rows(xs, pin_x, B)
+            reg.copy_(st[R0:R0 + L])
+            self._flush_downs(True)
             graph.replay()
-            ev = self._stage_down(key, out, aux, B, nb, st['b'], pin_out, pin_aux)
+            ev = self._stage_down(key, out, aux, B, nb, st[bo:bo + nb], pin_out, pin_aux)
         self.replays += 1
-        return (ev, slot if x is not None else ('s', slot), B, n_players, opt_off, opt_action, nb)
+        return (ev, slot, B, n_players, opt_off, opt_action, nb)
+
+    def _graph_tails_sparse(self, B, sp, n_players, opt_off, opt_action, brows, tail, ov):
+        """`_graph_tails` of a sparse batch, packed off the GIL (`_pack_sparse`, `_pack_tail`; docs/az.md 43.12): the
+        same inputs, bit for bit -> `result`'s handle, or None (nothing launched) when a row has more than LONG_T
+        tokens."""
+        from . import rows as R
+        net = self.net
+        Bp = -(-B // ROW_STEP) * ROW_STEP
+        nb = 0 if brows is None else len(brows)
+        if nb and not self.layout:
+            raise RuntimeError('TokenGraphRunner: root belief rows for a network without the auxiliary head')
+        nnz = int(sp[0][-1])
+        NT = tail.NT if tail is not None else 0
+        NO = ov.NO if ov is not None else 0          # (`rows.resolve`: one entry per override)
+        NTp, NOp = tail_bucket(NT), tail_bucket(NO)
+        # (the head presence: only for the overrides' checks)
+        pres = np.empty(B * self.n_tok, bool) if NO else None
+        _, vo, bo, R0 = self._up_head(nnz, nb)
+        o, Lmax = self._layout(Bp, self.t_cap, NTp, NOp)
+        slot, (_, pin_i, pin_out, pin_aux) = self._sslot(Bp, R0 + Lmax)
+        I = pin_i.numpy()
+        try:
+            Tp, _ = self._pack_sparse(sp, None if tail is None else np.ascontiguousarray(tail.off, np.int64), LONG_T, Bp,
+                                      I, R0, o, pres)
+            if not Tp:
+                self.sfree.append(slot)
+                return None
+            res = R.resolve(tail, ov, opt_off, opt_action, self.lay) if net.option_pointers else None
+            if (0 if res is None else len(res['row'])) != NO:
+                raise RuntimeError(f'internal: {NO} overrides resolved into {len(res["row"])}')
+            if NO:
+                tr = np.repeat(np.arange(B, dtype=np.int64), tail.counts()) if NT else None
+                ts = tail.seg.astype(np.int64) if NT else None
+                self._check_ov_host(res, pres.reshape(B, self.n_tok), tr, ts, B, NT)
+            o, L = self._layout(Bp, Tp, NTp, NOp)
+            graph, xs, reg, _, out, aux = self._graph(Bp, Tp, NTp, NOp)
+            if net.tails and NTp:
+                self._pack_tail(tail, NTp, I, (R0 + o['tint'], R0 + o['tval']))
+        except Exception:
+            self.sfree.append(slot)
+            raise
+        pn = I[R0 + o['n']:R0 + o['n'] + Bp]
+        pn[:B] = n_players
+        pn[B:] = 2
+        if nb:
+            I[bo:bo + nb] = brows
+        if net.option_pointers and NOp:
+            a = I[R0 + o['oint']:R0 + o['oint'] + 4 * NOp].reshape(4, NOp)    # (rows, actions, refs, columns)
+            for i, (k, pad) in enumerate((('row', 0), ('act', self.A), ('ref', -1), ('col', 0))):
+                a[i, :NO] = res[k]
+                a[i, NO:] = pad
+        key = ('s', slot)
+        with torch.inference_mode(False):
+            st, up = self._upload(key, pin_i, R0 + L)
+            torch.cuda.current_stream(self.dev).wait_event(up)
+            self._scatter(xs, st[:nnz], st[vo:vo + (nnz + 1) // 2].view(torch.float32)[:nnz])
+            reg.copy_(st[R0:R0 + L])
+            self._flush_downs(True)
+            graph.replay()
+            ev = self._stage_down(key, out, aux, B, nb, st[bo:bo + nb], pin_out, pin_aux)
+        self.replays += 1
+        return (ev, ('s', slot), B, n_players, opt_off, opt_action, nb)
 
     def _result_split(self, h):
         """`result` of a `_Split`: the graphs' rows and the eager long rows merged in row order."""
@@ -1125,13 +1280,13 @@ class TokenGraphRunner:
         o[h.long] = h.o
         if h.h is not None:
             ev, slot, Bs, _, _, _, nbs = h.h
-            ev.synchronize()
+            self._wait_down(ev)
             bufs = self.slots
             if isinstance(slot, tuple):
                 bufs, slot = self.sslots, slot[1]
-            o[h.short] = bufs[slot][4][:Bs].numpy()
+            o[h.short] = bufs[slot][2][:Bs].numpy()
             if nbs:
-                aux[np.isin(h.brows, h.short)] = bufs[slot][5][:nbs].numpy()
+                aux[np.isin(h.brows, h.short)] = bufs[slot][3][:nbs].numpy()
             (self.sfree if bufs is self.sslots else self.free).append(slot)
         if nb and h.aux is not None:
             aux[np.isin(h.brows, h.long)] = h.aux
@@ -1153,11 +1308,11 @@ class TokenGraphRunner:
         if isinstance(h, _Split):
             return self._result_split(h)
         ev, slot, B, n_players, opt_off, opt_action, nb = h
-        ev.synchronize()
+        self._wait_down(ev)
         bufs = self.slots
         if isinstance(slot, tuple):                  # (a sparse batch's buffers, `launch_sparse`)
             bufs, slot = self.sslots, slot[1]
-        o = bufs[slot][4][:B].numpy()
+        o = bufs[slot][2][:B].numpy()
         A, S = self.A, self.S
         rows = np.repeat(np.arange(B), np.diff(opt_off))
         pri = segment_softmax_np(o[rows, opt_action], opt_off)
@@ -1166,7 +1321,7 @@ class TokenGraphRunner:
         value[:, :S] = o[:, A:A + S]
         margin[:, :S] = o[:, A + S:A + 2 * S]
         value[np.arange(MAX_SEATS)[None, :] >= np.asarray(n_players)[:, None]] = 0.0
-        aux = bufs[slot][5][:nb].numpy().copy() if nb else None
+        aux = bufs[slot][3][:nb].numpy().copy() if nb else None
         (self.sfree if bufs is self.sslots else self.free).append(slot)
         if nb:
             return pri, value, margin, aux

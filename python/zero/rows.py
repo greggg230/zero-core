@@ -325,11 +325,14 @@ def resolve(tail, ov, opt_off, opt_action, lay, present=None):
     -1: the generic logit) and the pointer column. `present` (bool [N, n_tok], `presence`; None: not checked): the
     rows' head tokens. ValueError (R6) for an option out of its row, a column out of its segment's columns, a
     target head slot not present, a missing tail token, a token of no segment."""
-    opt_off = np.asarray(opt_off, np.int64)
-    opt_action = np.asarray(opt_action, np.int64)
     N = len(opt_off) - 1
     if ov.N != N or (tail is not None and tail.N != N):
         raise ValueError(f'resolve: {ov.N} override rows / {None if tail is None else tail.N} tail rows for {N} rows')
+    if not ov.NO:
+        # (no override: nothing to resolve or check - the arrays below, empty; most batches, docs/az.md 43.12)
+        return {k: np.zeros(0, np.int64) for k in ('row', 'act', 'ref', 'col')}
+    opt_off = np.asarray(opt_off, np.int64)
+    opt_action = np.asarray(opt_action, np.int64)
     segs = lay.get('segments', [])
     counts = np.asarray([int(s.get('count') or 0) for s in segs], np.int64)
     first = np.concatenate([np.ones(1, np.int64), 1 + np.cumsum(counts)])[:len(segs)]
