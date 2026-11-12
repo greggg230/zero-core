@@ -265,6 +265,9 @@ pub struct Written {
     pub bytes: u64,
     pub games: usize,
     pub gids: Vec<u32>,
+    /// The oldest network id of its rows (PROTOCOL.md 5's `gen`: the oldest checkpoint generation its games
+    /// were played with).
+    pub gen: Option<u32>,
 }
 
 pub struct ShardWriter {
@@ -336,7 +339,8 @@ impl ShardWriter {
         let tmp = self.dir.join(format!("{name}.{}.tmp.npz", std::process::id()));
         let bytes = write_npz(&tmp, &members, self.level)?;
         std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let w = Written { seq: self.seq, path, rows, bytes, games: ngames, gids };
+        let gen = games.iter().flat_map(|g| g.records.iter().map(|r| r.net)).min();
+        let w = Written { seq: self.seq, path, rows, bytes, games: ngames, gids, gen };
         self.seq += 1;
         self.written.push(w.clone());
         Ok(Some(w))

@@ -70,18 +70,16 @@ impl Args<'_> {
     }
 }
 
-/// The ONNX Runtime library: `--ort-dll`, else env ZERO_ORT_DYLIB / ORT_DYLIB_PATH, else
-/// `onnxruntime.dll` (`libonnxruntime.so` / `.dylib`) next to the executable.
+/// The ONNX Runtime library: `--ort-dll` / the job's `ort_dylib`, else the job's `runtime_dir` (a verified
+/// runtime pack, PROTOCOL.md 5) or env ZEROFARM_RUNTIME_DIR holding it, else env ZERO_ORT_DYLIB /
+/// ORT_DYLIB_PATH, else `onnxruntime.dll` (`libonnxruntime.so` / `.dylib`) next to the executable.
 pub fn ort_dylib(given: Option<&str>) -> PathBuf {
+    ort_dylib_in(given, None)
+}
+
+pub fn ort_dylib_in(given: Option<&str>, runtime_dir: Option<&str>) -> PathBuf {
     if let Some(g) = given {
         return PathBuf::from(g);
-    }
-    for k in ["ZERO_ORT_DYLIB", "ORT_DYLIB_PATH"] {
-        if let Ok(v) = std::env::var(k) {
-            if !v.is_empty() {
-                return PathBuf::from(v);
-            }
-        }
     }
     let name = if cfg!(windows) {
         "onnxruntime.dll"
@@ -90,6 +88,17 @@ pub fn ort_dylib(given: Option<&str>) -> PathBuf {
     } else {
         "libonnxruntime.so"
     };
+    let env_rt = std::env::var("ZEROFARM_RUNTIME_DIR").ok().filter(|v| !v.is_empty());
+    if let Some(d) = runtime_dir.map(String::from).or(env_rt) {
+        return PathBuf::from(d).join(name);
+    }
+    for k in ["ZERO_ORT_DYLIB", "ORT_DYLIB_PATH"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.is_empty() {
+                return PathBuf::from(v);
+            }
+        }
+    }
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(name))).unwrap_or_else(|| PathBuf::from(name))
 }
 
@@ -183,7 +192,7 @@ fn job_from_value(v: &Value, base: &Path) -> Result<Job, String> {
     let games = u("games").ok_or("job: games")?;
     let threads = u("threads").unwrap_or(1).max(1) as usize;
     let out_dir = base.join(o.get("out_dir").and_then(|x| x.as_str()).unwrap_or("out"));
-    let ort = OrtCfg { dylib: ort_dylib(o.get("ort_dylib").and_then(|x| x.as_str())), intra_threads: u("infer_threads").map_or(threads, |t| t as usize), spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false) };
+    let ort = OrtCfg { dylib: ort_dylib_in(o.get("ort_dylib").and_then(|x| x.as_str()), o.get("runtime_dir").and_then(|x| x.as_str())), intra_threads: u("infer_threads").map_or(threads, |t| t as usize), spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false) };
     let sha256 = o.get("sha256").and_then(|x| x.as_str()).map(String::from);
     let eval = match o.get("model").and_then(|m| m.as_str()) {
         Some(m) => EvalKind::Onnx { model: base.join(m), ort, sha256 },
@@ -254,9 +263,8 @@ fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress
             }
         }
         "ping" => {
-            let mut s = progress.lock().unwrap().stats();
-            s["ev"] = json!("status");
-            sink.event(s);
+            let s = progress.lock().unwrap().stats();
+            sink.event(json!({"ev": "status", "stats": s}));
         }
         "job" => sink.event(json!({"ev": "error", "message": "a second job line: one job per worker process", "fatal": false})),
         other => sink.event(json!({"ev": "error", "message": format!("unknown op {other:?}"), "fatal": false})),
@@ -305,9 +313,8 @@ fn run_with_control(game: &'static GameEntry, mut job: Job, sink: Arc<Stdout>, l
         }
         if t_status.elapsed().as_secs_f64() >= status_s {
             t_status = Instant::now();
-            let mut s = progress.lock().unwrap().stats();
-            s["ev"] = json!("status");
-            sink.event(s);
+            let s = progress.lock().unwrap().stats();
+            sink.event(json!({"ev": "status", "stats": s}));
         }
     }
     worker.join().map_err(|_| "the job thread panicked".to_string())?
@@ -372,7 +379,7 @@ fn serve(games: &'static [GameEntry], repo: &str) -> i32 {
                     }
                 };
             }
-            Some("ping") => sink.event(json!({"ev": "status", "games": 0})),
+            Some("ping") => sink.event(json!({"ev": "status", "stats": {"games": 0}})),
             Some("quit") => {
                 sink.event(json!({"ev": "end", "reason": "quit", "stats": {}, "unfinished": Value::Null}));
                 return 0;

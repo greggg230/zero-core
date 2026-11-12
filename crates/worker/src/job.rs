@@ -469,7 +469,7 @@ impl Run<'_> {
         }
         let rel = w.path.strip_prefix(&self.job.out_dir).map(|p| p.to_path_buf()).unwrap_or_else(|_| w.path.clone());
         let gids: Vec<[u32; 2]> = ranges(&w.gids).into_iter().map(|r| [r.0, r.1]).collect();
-        self.sink.event(json!({"ev": "shard", "seq": w.seq, "path": rel.to_string_lossy().replace('\\', "/"), "games": w.games, "rows": w.rows, "bytes": w.bytes, "gids": gids}));
+        self.sink.event(json!({"ev": "shard", "seq": w.seq, "path": rel.to_string_lossy().replace('\\', "/"), "games": w.games, "rows": w.rows, "bytes": w.bytes, "gids": gids, "gen": w.gen}));
     }
 
     /// The remote worker's `pump`: control, finished games into the shards, setups queued, status.
@@ -536,9 +536,8 @@ impl Run<'_> {
         self.snapshot();
         if self.t_status.elapsed().as_secs_f64() >= self.job.status_s {
             self.t_status = Instant::now();
-            let mut s = self.progress.lock().unwrap().stats();
-            s["ev"] = json!("status");
-            self.sink.event(s);
+            let s = self.progress.lock().unwrap().stats();
+            self.sink.event(json!({"ev": "status", "stats": s}));
         }
         Ok(())
     }
