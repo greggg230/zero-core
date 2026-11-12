@@ -162,6 +162,8 @@ pub struct Progress {
     pub infer_rows: u64,
     pub infer_ms: f64,
     pub wait_ms: f64,
+    /// The search threads' busy time (the driver's `busy_s`).
+    pub search_ms: f64,
     pub batch_ms: Vec<f32>,
     pub yields: u64,
     pub yield_ms_max: f64,
@@ -178,7 +180,7 @@ impl Progress {
         ms.sort_by(|a, b| a.total_cmp(b));
         let q = |p: f64| if ms.is_empty() { Value::Null } else { json!((ms[((ms.len() - 1) as f64 * p).round() as usize] as f64 * 1000.0).round() / 1000.0) };
         json!({
-            "games": self.games, "decisions": self.decisions, "leaves": self.leaves, "infer_batches": self.infer_batches,
+            "games": self.games, "decisions": self.decisions, "leaves": self.leaves, "infer_batches": self.infer_batches, "search_ms": self.search_ms.round(),
             "infer_ms_p50": q(0.5), "infer_ms_p95": q(0.95), "infer_ms": self.infer_ms.round(), "wait_ms": self.wait_ms.round(),
             "rss_mb": rss_mb(), "threads": self.threads, "concurrency": self.concurrency, "provider": self.provider,
             "yields": self.yields, "yield_ms_max": (self.yield_ms_max * 10.0).round() / 10.0,
@@ -454,8 +456,8 @@ impl Run<'_> {
         p.started = self.enq - self.drv.queued() as u64;
         p.leaves = st.leaves;
         p.sims = st.sims;
-        p.decisions = st.recorded;
         p.wait_ms = st.wait_s * 1e3;
+        p.search_ms = st.busy_s * 1e3;
         p.wall_s = self.t0.elapsed().as_secs_f64();
     }
 
@@ -503,7 +505,12 @@ impl Run<'_> {
             if records.len() != k {
                 return Err(format!("game {} has {k} samples, {} left", r.gid, records.len()));
             }
-            self.progress.lock().unwrap().finished_gids.push(r.gid);
+            {
+                // (Stats: the finished games' searched decisions)
+                let mut p = self.progress.lock().unwrap();
+                p.finished_gids.push(r.gid);
+                p.decisions += r.decisions as u64;
+            }
             if let Some(w) = self.writer.add(GameSamples { gid: r.gid, records })? {
                 self.emit_shard(w);
             }
@@ -611,6 +618,9 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
             EvalKind::Uniform => "uniform".into(),
             EvalKind::Onnx { .. } => "cpu".into(),
         };
+    }
+    if cfg.concurrency == 0 {
+        return Err("conc 0: no game would ever start (the setup cap is the games in flight)".into());
     }
     let cap = cfg.concurrency as u64;
     let spec = spec_of(&job.settings)?;
