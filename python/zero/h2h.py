@@ -17,9 +17,15 @@ same checkpoint with two rules is an A/B of the rule. The 'cq' rule's transform:
 without one takes 50 / 1 when its rule is given here, else its run's - so `A A --select cq
 --a-cq-c-scale 0.3 --b-cq-c-scale 1.0` is an A/B of the selection scale on one checkpoint. A
 side's transform flag on a 'visits' side is an error, as are both-sides flags when no side plays
-'cq'. The game comes from checkpoint A (`Net.config['game']`), its spec from the game package
-(`GamePackage.specs`, e.g. Caverna {"full": true}, Glass Road {"intro": false}) unless --spec is
-given. Prints one JSON line: A's score (+- 1 se), its mean score margin, the Elo difference, each
+'cq'. The game comes from checkpoint A (`Net.config['game']`). Unless --spec is given the games
+are played at A's run's evaluation spec, `Run.driver`'s rule: its `eval_spec`, else the game
+package's eval spec of its self-play spec (`GamePackage.eval_specs`; MTG Zero: its fixed evaluation
+decks) - without a run config.json, the game package's default spec (`GamePackage.specs`, e.g.
+Caverna {"full": true}, Glass Road {"intro": false}). Each side's seat also takes its run's
+`margin_w`, `redet` and `eval_cache` (`Run.nn_seat`'s; without a run config margin_w 0, redet on, no
+cache), so an h2h of a run's checkpoints plays the games of its evaluation and of a zero.farm_h2h
+at the same settings (docs/az.md 42.3; before 2026-11-12 these four were the package's defaults).
+Prints one JSON line: A's score (+- 1 se), its mean score margin, the Elo difference, each
 side's rule (`select_a`, `select_b`: e.g. 'cq-n4-v50-s0.3'). The models are only read.
 
 The root's belief (docs/search.md 3.8): each side deals its search's worlds as its run evaluates
@@ -107,6 +113,53 @@ def run_config(ckpt):
     except (OSError, ValueError):
         return {}
     return c if isinstance(c, dict) else {}
+
+
+def run_settings(ckpt):
+    """A checkpoint's run's settings resolved as the run resolves them (`zero.run.resolve_config`: DEFAULTS < its
+    preset < its config.json, as zero.farm_h2h does) - {} without a config.json. A config that no longer resolves
+    (e.g. a preset since removed) gives its saved values over DEFAULTS, with a note on stderr."""
+    c = run_config(ckpt)
+    if not c:
+        return {}
+    from . import run as R
+    try:
+        return R.resolve_config(argparse.Namespace(**{k: None for k in R.DEFAULTS}), c)
+    except (SystemExit, ValueError) as e:
+        print(f'# note: the run config of {ckpt} does not resolve ({e}): its saved values over the defaults',
+              file=sys.stderr, flush=True)
+        return dict(R.DEFAULTS, **c)
+
+
+def run_seat_keys(ckpt):
+    """The evaluation seat keys `Run.nn_seat` takes from a checkpoint's run besides its move rule (`run_rule`):
+    margin_w, redet, eval_cache (docs/az.md 42.3) - {} without a run config (the seat of before: margin_w 0, redet
+    on, no cache)."""
+    c = run_settings(ckpt)
+    if not c:
+        return {}
+    return {'margin_w': c['margin_w'], 'redet': bool(c['redet']), 'eval_cache': c.get('eval_cache', 0)}
+
+
+def run_eval_spec(ckpt, game):
+    """The spec of a checkpoint's run's evaluation matches, `Run.driver`'s rule (its eval_spec, else the game
+    package's eval spec of its self-play spec); without a run config the game package's default spec of `game`."""
+    c = run_settings(ckpt)
+    if not c:
+        return package.active().specs.get(game)
+    return c.get('eval_spec') or package.active().eval_spec_of(game, c['spec'])
+
+
+def match_spec(a, b, game, spec=None):
+    """The match's spec: `spec` if given, else A's run's evaluation spec (`run_eval_spec`; a note on stderr when
+    B's run evaluates at another one)."""
+    if spec is not None:
+        return spec
+    sa = run_eval_spec(a, game)
+    if run_config(b) and G.spec_json(run_eval_spec(b, game)) != G.spec_json(sa):
+        print(f"# note: B's run evaluates at another spec than A's; the match plays A's ({G.spec_json(sa)[:120]})",
+              file=sys.stderr, flush=True)
+    return sa
 
 
 def root_keys(ckpt, keys, root=None, m=None, scale=None):
@@ -340,8 +393,9 @@ def _load_pair(a, b, device, game):
 
 
 def _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b):
-    sa = G.nn_seat('a', sims if sims_a is None else int(sims_a), c_puct, chance_k=chance_k)
-    sb = G.nn_seat('b', sims if sims_b is None else int(sims_b), c_puct, chance_k=chance_k)
+    # (each side's run's margin_w, redet and eval_cache: Run.nn_seat's evaluation seat, docs/az.md 42.3)
+    sa = G.nn_seat('a', sims if sims_a is None else int(sims_a), c_puct, chance_k=chance_k, **run_seat_keys(a))
+    sb = G.nn_seat('b', sims if sims_b is None else int(sims_b), c_puct, chance_k=chance_k, **run_seat_keys(b))
     sa.update(run_rule(a) if seat_a is None else seat_a)
     sb.update(run_rule(b) if seat_b is None else seat_b)
     for s, m, p in ((sa, ma, a), (sb, mb, b)):
@@ -484,7 +538,7 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     if paired and games % 2:
         raise ValueError(f'paired games: an even number of games ({games})')
     ma, mb, game = _load_pair(a, b, device, game)
-    spec = package.active().specs.get(game) if spec is None else spec
+    spec = match_spec(a, b, game, spec)            # (A's run's evaluation spec unless given: Run.driver's, docs/az.md 42.3)
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
     mr = _max_rows(sa, sb, max_rows)
     sp = _sparse(sa, sb, sparse)
@@ -545,7 +599,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
             raise ValueError(f'sprt: elo1 ({e1}) must be > elo0 ({e0})')
         lo, hi = sprt_bounds(alpha, beta)
     ma, mb, game = _load_pair(a, b, device, game)
-    spec = package.active().specs.get(game) if spec is None else spec
+    spec = match_spec(a, b, game, spec)            # (A's run's evaluation spec unless given: Run.driver's, docs/az.md 42.3)
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
     mr = _max_rows(sa, sb, max_rows)
     sp = _sparse(sa, sb, sparse)
@@ -613,7 +667,9 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--device', default='cpu', help="network device ('cuda' works; the GPU is shared)")
-    ap.add_argument('--spec', default=None, help="game spec JSON (default: the game package's spec of the game)")
+    ap.add_argument('--spec', default=None, help="game spec JSON (default: A's run's evaluation spec - its eval_spec, else "
+                                                  "the game package's eval spec of its spec -, without a run config the "
+                                                  "game package's spec of the game)")
     ap.add_argument('--select', default=None, choices=['visits', 'cq'],
                     help="both sides' move rule (default: each checkpoint's run's eval_select)")
     ap.add_argument('--select-min-visits', type=int, default=0)

@@ -5,6 +5,7 @@ the readout zero.h2h gives on this machine, played by the farm's native workers.
       --build <worker build_id> --runtime <runtime build_id> [--config <run>/config.json | --preset NAME]
       [--sims 32] [--name SLUG] [--seed 1] [--games-per-lease auto] [--priority 1] [--needs-ram-mb 1500]
       [--reference-batches NPZ ...] [--worker <mtgz-worker.exe>] [--url https://farm.greggg230.com] [--no-wait]
+      [--key <data key>] [--farm-release <farm-release.exe>] [--expires-days 30] [--defs-dir DIR]
   python -m zero.farm_h2h --resume NAME        (re-attach: poll, download, print the readout)
   python -m zero.farm_h2h --cancel NAME        (pause the run: its leases are cancelled at their next beat)
   (python -m <pkg>.az.farm_h2h ...: the game package registered; or --package <pkg>.az [--root <checkout>])
@@ -18,9 +19,13 @@ What it does:
 2. Both checkpoints exported to zero-onnx/1 (zero.onnx_export, 'packed') with their reference sets (256 rows
    of recorded batches - `--reference-batches`, else a short self-play of A recorded here, CPU - with torch's
    answers, checked through onnxruntime: <= 2e-5, else nothing is published).
-3. The run `h2h-<slug>` (`PUT /v1/admin/run/h2h-<slug>`, selfplay null, the worker build and runtime), the
-   graphs and reference sets uploaded (`PUT /v1/admin/artifact/ckpt/<run>/<gen>/...`), registered as gens 1
-   (A) and 2 (B), then the eval batch: `checkpoints [1, 2]`, seats [{"net": 1}, {"net": 2}], paired, `--games`.
+3. The run `h2h-<slug>` (`PUT /v1/admin/run/h2h-<slug>`, selfplay null, the worker build and runtime); its signed
+   definition (zero-farm PROTOCOL.md 7, zero.farm_def: builds [the worker build], the runtime, gens 1 and 2 with
+   their graphs' and reference sets' sha256 and sizes, `jobs.eval` = the batch's job; the next version, signed with
+   the data key and published by `farm-release define --publish`; it expires after `--expires-days`); the graphs
+   and reference sets uploaded (`PUT /v1/admin/artifact/ckpt/<run>/<gen>/...`), registered as gens 1 (A) and 2 (B),
+   then the eval batch: `checkpoints [1, 2]`, its job {settings, seats [{"net": 1}, {"net": 2}], paired, seed} -
+   the definition's template exactly (the coordinator issues leases only within it), `--games`.
 4. It polls `GET /v1/admin/run/<run>/results`, downloads each eval file (first copy of a game id wins;
    `dup_ids` skipped), acks what it saved, and prints a progress line; at the end the readout: A's score +- its
    standard error (pair-aware: the se of the pair scores), the Elo difference with its 95% interval, the games,
@@ -28,9 +33,11 @@ What it does:
    machines, elo_95), so results compare directly with a local zero.h2h.
 
 State: `~/.zero-farm/h2h/<run>/` (`--state-dir`): state.json (the run's body, the gens' files and hashes, the
-results cursor), ckpt/<gen>/ (the exported graphs and reference sets), results/ (the downloaded files). Every
+definition's version and file, the results cursor), ckpt/<gen>/ (the exported graphs and reference sets), results/
+(the downloaded files); the definition itself in the archive (~/.zero-farm/definitions/run/<run>/<version>/). Every
 step is idempotent: `--resume` finishes whatever an interrupted start left. The admin token is read from
-`%USERPROFILE%/.config/zero-farm/admin_token` (or env ZEROFARM_ADMIN_TOKEN) and never printed.
+`%USERPROFILE%/.config/zero-farm/admin_token` (or env ZEROFARM_ADMIN_TOKEN) and never printed; farm-release gets
+it in its environment, never on its command line.
 """
 import argparse
 import hashlib
@@ -39,115 +46,12 @@ import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
 
-URL = 'https://farm.greggg230.com'
-SLUG_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,62}$')
-MULTIPART = 90 << 20                    # bigger artifacts go up in parts (a Worker request's limit ~100 MB)
-PART = 32 << 20
+from .farm_def import (URL, Client, FarmError, file_sha256, read_token, token_path)  # noqa: F401  (the farm tools' client)
+from . import farm_def as FD
 
-
-def token_path():
-    return os.path.join(os.path.expanduser('~'), '.config', 'zero-farm', 'admin_token')
-
-
-def read_token():
-    t = os.environ.get('ZEROFARM_ADMIN_TOKEN')
-    if t:
-        return t.strip()
-    p = token_path()
-    try:
-        with open(p, encoding='utf-8') as f:
-            t = f.read().strip()
-    except OSError:
-        raise SystemExit(f'no admin token: {p} (or env ZEROFARM_ADMIN_TOKEN)') from None
-    if not t:
-        raise SystemExit(f'{p} is empty')
-    return t
-
-
-class FarmError(RuntimeError):
-    def __init__(self, status, code, message, body=None):
-        super().__init__(f'{status} {code}: {message}')
-        self.status, self.code, self.body = status, code, body or {}
-
-
-class Client:
-    """The coordinator's desktop API (bearer = the admin token, never printed). `transport(method, url, headers,
-    data) -> (status, bytes)` (tests pass a fake coordinator); 5xx and network errors are retried with backoff."""
-
-    def __init__(self, url=URL, token=None, transport=None, tries=6):
-        self.url = url.rstrip('/')
-        self._token = token if token is not None else read_token()
-        self.transport = transport or self._urllib
-        self.tries = tries
-
-    def __repr__(self):
-        return f'Client({self.url!r})'
-
-    @staticmethod
-    def _urllib(method, url, headers, data):
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=300) as r:
-                return r.status, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
-
-    def call(self, method, path, body=None, data=None, headers=None, raw=False):
-        h = {'authorization': f'Bearer {self._token}', 'user-agent': 'zero-farm-h2h'}
-        if body is not None:
-            data = json.dumps(body).encode()
-            h['content-type'] = 'application/json'
-        h.update(headers or {})
-        delay = 1.0
-        for k in range(self.tries):
-            try:
-                status, out = self.transport(method, self.url + path, h, data)
-            except (OSError, urllib.error.URLError) as e:
-                status, out = None, str(e).encode()
-            if status is not None and status < 500:
-                break
-            if k == self.tries - 1:
-                raise FarmError(status or 0, 'unreachable', f'{method} {path}: {out[:300]!r}')
-            time.sleep(delay)
-            delay = min(delay * 2, 60)
-        if status >= 400:
-            try:
-                e = json.loads(out)
-            except ValueError:
-                e = {'error': 'http', 'message': out[:300].decode('utf-8', 'replace')}
-            raise FarmError(status, e.get('error'), e.get('message'), e)
-        return out if raw else (json.loads(out) if out else None)
-
-    def put_artifact(self, key, path, sha):
-        size = os.path.getsize(path)
-        if size <= MULTIPART:
-            with open(path, 'rb') as f:
-                return self.call('PUT', f'/v1/admin/artifact/{key}', data=f.read(),
-                                 headers={'x-sha256': sha, 'content-type': 'application/octet-stream'})
-        up = self.call('POST', f'/v1/admin/artifact/{key}?uploads', data=b'')['upload_id']
-        parts = []
-        with open(path, 'rb') as f:
-            n = 1
-            while True:
-                blk = f.read(PART)
-                if not blk:
-                    break
-                r = self.call('PUT', f'/v1/admin/artifact/{key}?upload_id={up}&part={n}', data=blk,
-                              headers={'content-type': 'application/octet-stream'})
-                parts.append({'part': n, 'etag': r['etag']})
-                n += 1
-        return self.call('POST', f'/v1/admin/artifact/{key}?upload_id={up}', body={'parts': parts})
-
-
-def file_sha256(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for blk in iter(lambda: f.read(1 << 20), b''):
-            h.update(blk)
-    return h.hexdigest()
+SLUG_RE = FD.SLUG_RE
+EXPIRES_DAYS = 30                       # a head-to-head's definition expires after this many days (--expires-days)
 
 
 # ---------------------------------------------------------------- settings and names
@@ -248,8 +152,9 @@ def export(ckpt, gen, out_dir, game, rows_list, ckpt_id, threads=4):
     if not chk['max_abs'] <= REFERENCE_TOL:
         raise SystemExit(f'gen {gen} ({ckpt}): the graph differs from torch by {chk["max_abs"]:g} on its reference '
                          f'set (> {REFERENCE_TOL:g}): not published')
-    return {'model': model, 'sha256': file_sha256(model), 'reference': ref, 'reference_sha256': file_sha256(ref),
-            'check': chk, 'checkpoint': os.path.abspath(ckpt), 'checkpoint_sha256': info['checkpoint_sha256']}
+    return {'model': model, 'sha256': file_sha256(model), 'model_size': os.path.getsize(model), 'reference': ref,
+            'reference_sha256': file_sha256(ref), 'reference_size': os.path.getsize(ref), 'check': chk,
+            'checkpoint': os.path.abspath(ckpt), 'checkpoint_sha256': info['checkpoint_sha256']}
 
 
 # ---------------------------------------------------------------- state
@@ -274,26 +179,66 @@ def load_state(d):
         return json.load(f)
 
 
+def eval_job(st):
+    """The eval batch's job object - also, exactly, the signed definition's `jobs.eval` template (PROTOCOL.md 7: an
+    agent builds its job line from the template plus only `gid_base`, `games` and `seed`; `seed` here is the run's
+    base seed, which the coordinator copies into every lease)."""
+    return {'settings': st['settings'], 'seats': [{'net': 1}, {'net': 2}], 'paired': True, 'seed': st['seed']}
+
+
 def run_body(st, eval_on=True):
-    """The run's PUT body (the eval batch once the gens are registered)."""
+    """The run's PUT body (the eval batch once the definition is published and the gens are registered)."""
     b = {'game': st['game'], 'build_id': st['build_id'], 'runtime': st['runtime'], 'priority': st['priority'],
          'selfplay': None, 'eval': None, 'state': st.get('run_state', 'active')}
     if eval_on:
         b['eval'] = {'batch': st['batch'], 'games': st['games'], 'checkpoints': [1, 2],
                      'games_per_lease': st['games_per_lease'], 'gpu': 'any', 'needs': st['needs'],
-                     'job': {'settings': st['settings'], 'seats': [{'net': 1}, {'net': 2}], 'paired': True,
-                             'seed': st['seed']}}
+                     'job': eval_job(st)}
     return b
 
 
-def setup(cl, d, st, log):
-    """The coordinator's side of a new head-to-head, each step once (state flags)."""
+def definition_fields(st):
+    """The run's definition (PROTOCOL.md 7): the worker build, its runtime, gens 1 and 2 (each graph's and reference
+    set's sha256 and size) and the eval template; no self-play, no fuzz."""
+    cks = {}
+    for gen in ('1', '2'):
+        g = st['gens'][gen]
+        cks[gen] = {'model_sha256': g['sha256'], 'model_size': g.get('model_size') or os.path.getsize(g['model']),
+                    'reference_sha256': g['reference_sha256'],
+                    'reference_size': g.get('reference_size') or os.path.getsize(g['reference'])}
+    return {'game': st['game'], 'builds': [st['build_id']], 'runtime': st['runtime'], 'checkpoints': cks,
+            'jobs': {'selfplay': None, 'eval': eval_job(st), 'fuzz': None}}
+
+
+def define(cl, d, st, log, opts):
+    """The run's signed definition, made and published once (state `definition`): a new version (the coordinator's
+    current + 1), kept in the definitions archive, signed with the data key by `farm-release define --publish`."""
+    info = st.get('definition')
+    if info and info.get('published'):
+        return info
+    if not info:
+        info = FD.prepare(cl, 'run', st['run'], expires_days=opts.get('expires_days', EXPIRES_DAYS),
+                          root=opts.get('defs_dir'), **definition_fields(st))
+        st['definition'] = info
+        save_state(d, st)
+        log(f'definition run/{st["run"]} version {info["version"]}: {info["path"]}')
+    info = FD.publish(cl, info, key=opts.get('key'), farm_release=opts.get('farm_release'), log=log)
+    st['definition'] = info
+    save_state(d, st)
+    return info
+
+
+def setup(cl, d, st, log, opts=None):
+    """The coordinator's side of a new head-to-head, each step once (state flags): the run (no batch), its signed
+    definition, the gens' files and registrations, then the eval batch, whose job is the definition's template."""
     run = st['run']
+    opts = opts or {}
     if not st.get('run_put'):
         cl.call('PUT', f'/v1/admin/run/{run}', body=run_body(st, eval_on=False))
         st['run_put'] = True
         save_state(d, st)
         log(f'run {run} created (worker build {st["build_id"]}, runtime {st["runtime"]})')
+    define(cl, d, st, log, opts)
     for gen in ('1', '2'):
         g = st['gens'][gen]
         if not g.get('registered'):
@@ -498,7 +443,15 @@ def main(argv=None, client=None):
     ap.add_argument('--poll', type=float, default=30.0)
     ap.add_argument('--no-wait', action='store_true')
     ap.add_argument('--threads', type=int, default=4, help='CPU threads of the export and the reference recording')
+    ap.add_argument('--key', default=None, help='the data key that signs the run definition (default: env '
+                    'ZEROFARM_DATA_KEY, else ~/.config/zero-farm/data.key)')
+    ap.add_argument('--farm-release', default=None, help='zero-farm farm-release (default: env ZEROFARM_FARM_RELEASE, '
+                    f'else {FD.FARM_RELEASE})')
+    ap.add_argument('--expires-days', type=float, default=EXPIRES_DAYS,
+                    help=f'the definition expires after this many days (default {EXPIRES_DAYS}; 0 = never)')
+    ap.add_argument('--defs-dir', help='the definitions archive (default: env ZEROFARM_DEFS_DIR, else ~/.zero-farm/definitions)')
     a = ap.parse_args(argv)
+    opts = {'key': a.key, 'farm_release': a.farm_release, 'expires_days': a.expires_days, 'defs_dir': a.defs_dir}
     log = lambda m: print('# ' + m, file=sys.stderr, flush=True)
     if a.root:
         sys.path.insert(0, os.path.abspath(a.root))
@@ -516,7 +469,7 @@ def main(argv=None, client=None):
             save_state(d, st)
             log(f'{run} paused (its leases are cancelled at their next beat); --resume {name} to read what came in')
             return 0
-        setup(cl, d, st, log)
+        setup(cl, d, st, log, opts)
         if not a.no_wait:
             watch(cl, d, st, a.poll, log)
         finish_print(cl, d, st)
@@ -568,7 +521,7 @@ def main(argv=None, client=None):
           'created': time.time(), 'cursor': 0}
     save_state(d, st)
     cl = client or Client(a.url)
-    setup(cl, d, st, log)
+    setup(cl, d, st, log, opts)
     if a.no_wait:
         log(f'set up; read the results with: python -m zero.farm_h2h --resume {run}')
         return 0
