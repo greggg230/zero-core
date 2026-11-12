@@ -1,6 +1,6 @@
 //! "Toy match" (`toy_match`): a best-of-three match of toy games ("Mini Cavern", `toy.rs`) between two players, each
 //! game its own episode - the core's test bed for **chained episodes** (docs/search.md 1.3, 2.14; docs/az.md 42),
-//! shaped like MTG Zero's best-of-three with one episode per game (its ENGINE.md 112).
+//! shaped like MTG Zero's best-of-three with one episode per game (its ENGINE.md 121).
 //!
 //! Rules. Games until a player has won two or three games have been played (a drawn game - equal toy scores -
 //! counts as a game); the match's result is by game wins (1 / 0, or 0.5 each on equal wins). Game 1 starts as a toy

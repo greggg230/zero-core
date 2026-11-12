@@ -5230,7 +5230,7 @@ tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.
 
 (Section 40 is taken by `feat/extra-evals` and `feat/selfplay-spec-hook`, 41 by `farm`.) **No run setting**: the game
 decides, by its spec, whether its episodes chain (MTG Zero: the `mtg` spec key `"game_episodes": true`, its ENGINE.md
-112). A game that never says so plays and trains exactly as before.
+121). A game that never says so plays and trains exactly as before.
 
 ### 42.1 Why (the user's decision, 2026-11-11)
 
@@ -5306,11 +5306,11 @@ each remote worker's hello.
 * The full suite on the shared desktop (2026-11-11, other agents' jobs and a live run on it): two failures, each
   load-dependent - `test_gumbel.py::test_python_driver_refuses_a_visits_target` passed alone, and
   `test_forks.py::test_an_older_worker_is_refused` fails the same way on f9ca5c3 (the worker's hello came after the
-  run's two short iterations ended). MTG Zero's gates on its branch `bo3-game-episodes` (its ENGINE.md 112.5).
+  run's two short iterations ended). MTG Zero's gates on its branch `bo3-game-episodes` (its ENGINE.md 121.5).
 
 ### 42.6 Measured (the toy, desktop CPU, 2026-11-11, heavily shared)
 
 `toy_match` at toy-smoke scale (`--game toy_match`, 24 contests an iteration, 8 sims): 2.5 games per contest (60 games
 of 24 contests, 1-3 drawn), ~6.8 samples per game; the evaluation reports, e.g., iteration 2 vs random: matches 4.0/4,
 games 8.5/9 (`per_game`); the Elo log `iter_0002 vs iter_0001: 2.0/4 (games 4.0/8)`. MTG Zero's best-of-three smoke:
-its ENGINE.md 112.5.
+its ENGINE.md 121.5.
