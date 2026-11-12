@@ -22,7 +22,9 @@ both machines pull an iteration's work from one shared queue (zero/workqueue.py)
 
 Run settings: `selfplay_remote` (a name in the game package's `remotes`; 'local' = this machine,
 the tests; '' = off; a comma-separated list = several hosts, and the run directory's `selfplay_remotes`
-file replaces the list at every phase start: docs/az.md 34), `selfplay_local` (0: this machine takes no
+file replaces the list at every phase start: docs/az.md 34; a name `pool:<farm run>` is the zero-farm pool,
+friends' idle PCs through the farm's coordinator: zero/farm_pool.py, docs/az.md 43 - it has no sessions and
+holds no share of the quota: its games count as they arrive), `selfplay_local` (0: this machine takes no
 games while a remote worker takes work, docs/az.md 34.4), `selfplay_remote_procs` (worker processes per
 host; 0 = the remote's `procs`),
 `selfplay_remote_wait` (seconds the end of a phase waits for the remote's last shards),
@@ -105,6 +107,7 @@ from collections import deque
 
 from . import package
 from .remote import Transport, _alive, remote_spec
+from .farm_pool import Pool, is_pool
 from .shardthread import SampleClock, sample_rows, split_records
 from .workqueue import Shares, lag_hist, merge_hist, split_games
 
@@ -517,17 +520,25 @@ class RemotePlay:
         self.setting = remote_names(name)
         self.file = os.path.join(R.run, REMOTES_FILE) if mode == 'selfplay' else None
         names, from_file = self._wanted()
-        self.multi = bool(from_file or len(names) >= 2)
+        hnames = [n for n in names if not is_pool(n)]
+        self.multi = bool(from_file or len(hnames) >= 2)
         self.listed = names                        # the names that should play
         self.hosts = {}                            # name -> Host (the resolved ones, in the order they joined)
+        self.pools = {}                            # name -> farm_pool.Pool ('pool:<farm run>', docs/az.md 43)
         self.resolving = set()                     # names resolving on a thread now
         self.restored = {}                         # a list of hosts: restored rates of consumers not here yet
+        if mode != 'selfplay' and len(hnames) != len(names):
+            raise SystemExit(f'selfplay_remote {name!r}: the farm pool plays single-game self-play only')
+        for n in names:
+            if is_pool(n):
+                self.pools[n] = Pool(self, n)      # (its settings checked: SystemExit at the run's start)
         if not self.multi:
             if not names:
                 raise SystemExit(f'selfplay_remote {name!r}: no remote named')
-            self._add_host(Host(self, names[0]))   # (an unknown name: SystemExit, as always)
+            if hnames:
+                self._add_host(Host(self, hnames[0]))   # (an unknown name: SystemExit, as always)
         else:
-            for n in names:
+            for n in hnames:
                 try:
                     h = Host(self, n)
                 except (Exception, SystemExit) as e:   # noqa: BLE001 - logged, retried at the next phase
@@ -558,8 +569,9 @@ class RemotePlay:
         """The hosts for the log ('mac' (host, 2 worker(s), mirror ...), ...)."""
         with self.mu:
             hs = [f'{h.name!r} ({h.spec["host"]}, {h.procs} worker(s), mirror {h.rdir})' for h in self.hosts.values()]
-            todo = [n for n in self.listed if n not in self.hosts]
-        return ', '.join(hs + [f'{n!r} (not resolved yet)' for n in todo]) or 'none yet'
+            todo = [n for n in self.listed if n not in self.hosts and n not in self.pools]
+            ps = [p.describe() for p in self.pools.values()]
+        return ', '.join(hs + ps + [f'{n!r} (not resolved yet)' for n in todo]) or 'none yet'
 
     def _wanted(self):
         """(names, from the file) The remotes that should self-play now: the run directory's
@@ -673,8 +685,18 @@ class RemotePlay:
             self.listed = names
         for n in [n for n in self.hosts if n not in names]:
             self._retire(self.hosts[n])
-        self._relabel(bool(from_file or len(names) >= 2))
-        for n in names:
+        for n in [n for n in self.pools if n not in names]:
+            self.pools.pop(n).close()              # (its held games are dropped: never counted)
+            self.R.log(f'farm pool {n}: removed')
+        for n in [n for n in names if is_pool(n) and n not in self.pools]:
+            try:
+                self.pools[n] = Pool(self, n)
+                self.R.log(f'farm pool {n}: added')
+            except (Exception, SystemExit) as e:   # noqa: BLE001 - logged, retried at the next phase
+                self._skipped(n, e)
+        hnames = [n for n in names if not is_pool(n)]
+        self._relabel(bool(from_file or len(hnames) >= 2))
+        for n in hnames:
             if n not in self.hosts and n not in self.resolving:
                 self.resolving.add(n)
                 threading.Thread(target=self._resolve, args=(n,), name=f'zero-rsp-resolve-{n}', daemon=True).start()
@@ -812,6 +834,8 @@ class RemotePlay:
                         and sh.provisional(h.cname(k), st.get('leaves'), st['run_s']):
                     h.log(f'worker {k}: first measured at {st["leaves"] / st["run_s"]:.0f} leaves/s in '
                           f'{st["run_s"]:.0f}s of its phase')
+        # (a farm pool takes work while its records arrive: farm_pool.Pool.live, docs/az.md 43)
+        taking += sum(1 for p in self.pools.values() if p.live())
         if not self.local_play and 'local' in sh.c:
             off = taking > 0
             if off != self.local_off:
@@ -862,6 +886,9 @@ class RemotePlay:
                 self.q = {'it': it, 'need': int(self.R.cfg['games']), 'done': 0, 'by': {}, 'open': True}
             self._refresh()
             self.mu.notify_all()
+            pools = list(self.pools.values())
+        for p in pools:
+            p.begin(it)                            # (checkpoint it - 1 published on the pool's thread)
 
     # ---- single-game: the quota
     def need(self, it):
@@ -875,6 +902,22 @@ class RemotePlay:
         (the rest wait for the next one)."""
         with self.mu:
             a = self._take(it, 'local', n)
+            self._close_if_met()
+            return a
+
+    def pool_iteration(self):
+        """The iteration whose quota takes games now (single-game; None between phases or once it is met)."""
+        with self.mu:
+            q = self.q
+            if q is None or not q['open'] or self.accepting != q['it']:
+                return None
+            return q['it']
+
+    def accept_pool(self, it, who, n):
+        """The farm pool `who` brings `n` more games (zero/farm_pool.py): how many count for iteration `it` (as a
+        remote worker's: as many as the quota still needs)."""
+        with self.mu:
+            a = self._take(it, who, n)
             self._close_if_met()
             return a
 
@@ -1080,6 +1123,13 @@ class RemotePlay:
         if self.multi:
             out['remotes'] = {name: self._record(hout, hends, hc, hlate, hprev, wait_s, lead_s, hcaps, hheld, hout_n)
                               for name, hout, hends, hc, hlate, hprev, hcaps, hheld, hout_n in per}
+        if self.pools:
+            # the farm pools' share (docs/az.md 43): closed with what they accepted - the run never waits for them
+            pls = {p.name: p.end_phase(it) for p in list(self.pools.values())}
+            out['pools'] = {n: {k: v for k, v in r.items() if k != 'stale'} for n, r in pls.items()}
+            out['games'] = out.get('games', 0) + sum(r['games'] for r in pls.values())
+            out['samples'] = out.get('samples', 0) + sum(r['samples'] for r in pls.values())
+            qblock['stale'] = merge_hist(qblock['stale'], *[r['stale'] for r in pls.values()])
         out['queue'] = qblock
         if self.fatal is not None:
             raise self.fatal
@@ -1119,6 +1169,8 @@ class RemotePlay:
                     r.pop('quota', None)
                     rems[h.name] = r
                 out['remotes'] = rems
+            if self.pools:
+                out['pools'] = {p.name: p.progress() for p in self.pools.values()}
         return out
 
     def close(self):
@@ -1134,7 +1186,10 @@ class RemotePlay:
                 self.q['open'] = False
             sess = self._sessions()
             fths = list(self.fths)
+            pools = list(self.pools.values())
             self.mu.notify_all()
+        for p in pools:
+            p.close()
         ths = [threading.Thread(target=s.close, daemon=True) for s in sess]
         for th in ths:
             th.start()

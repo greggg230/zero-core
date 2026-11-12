@@ -398,7 +398,7 @@ class ShardWriter:
     def add(self, s):
         if s is None or not len(s['player']):
             return
-        if self.sparse:
+        if self.sparse and 'x' in s:          # (a dict may bring its features as SparseRows already: 'xs')
             x = s['x']
             s = {k: v for k, v in s.items() if k != 'x'}
             s['xs'] = SparseRows.from_dense(x, x.shape[1])

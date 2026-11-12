@@ -538,6 +538,49 @@ first: the same games, batches in a timing-dependent order.
 eval job's `finish` (no new game starts; the games in flight play on). Nothing else changes; nothing calls it
 but the worker. Test: `clear_queue_starts_no_new_game`.
 
+### 2.15 Traced games and game records (`set_trace`, `zero_search::record`; zero-farm phase 3, 2026-11-12)
+
+No setting: a call only zero-farm's native worker makes (its self-play job's records, docs/az.md 43); a driver never
+asked traces nothing and every game, row and batch is what it was.
+
+**Why.** A friend's PC uploads what replays a game instead of its sample rows (zero-farm DESIGN.md 6.1): the live game
+is never determinized (only search clones are), so `new_game(spec, n, seed)` and the real moves rebuild every state,
+and with it every row's features, options, auxiliary targets, `z` and `sc`. Only what the search produced has to
+travel: each row's policy target, root value and network id. A record is ~20-40x smaller than its rows, and its replay
+on the trainer is the validation.
+
+**What it does.** `Driver::set_trace(true)` (`DynDriver::set_trace`, the binding's `SearchDriver.set_trace`) - a
+rolling driver, before its first `resume`; refused on a fixed table (its games start with the driver), with branched
+games or archive starts (they don't start from a seed alone) - makes every game the driver starts keep its seed (the
+`new_game` seed of `worker::init_slot`: `record::game_seed(seed, gid, paired)`) and every real move: each action
+`apply` steps, the single-option decisions `transition_each` steps after it, and an external seat's answer (as its
+payload). A finished game's `GameResult::trace` holds them with the game's `SearchGame::record_setup` (what the game
+built from its seed, compared on replay: MTG Zero's per-seat decks; default empty) and, for a game that ended with a
+result, each seat's `margin`. Each training record's `Record::step` is the number of real moves before its decision
+(0 when not tracing). A game at a deferred terminal is refused (its result comes from outside).
+
+`record::game_json(row, samples)` is one game's record (`records/1`, module docs of `crates/search/src/record.rs`):
+gid, players, seed, steps (actions and external answers), over / aborted / resigned (the winner), the result and
+margins as f32 bits, rounds, setup, and per sample its step, decider, kind (0 leaf / 1 value-only), network id, the
+policy target over its options and `q` per seat as float16 bits (the shard's own precision). `record::replay::<G>`
+plays it back on a copy of `new_game`'s game (a game may do what only its live game does: MTG Zero's EoE game log is
+written by the live game only): every action must be legal, every leaf sample's decider the step's seat with at least
+two options and exactly its policy's length, every value-only sample's decider another seat; the result, the margins,
+the rounds and the setup must equal the record's; `pi` and `q` must be finite and in [0, 1]. It returns the rows
+exactly as the driver emitted them (`x` = `encode(decider)`, the options, `z` and `sc` from the replayed end, the
+auxiliary targets with `aux`; `pi`, `q`, `net` from the record), or why the record is refused. The binding's
+`replay_rows(game, spec, record, aux)` returns them as `take_samples`' dict; `take_game_records()` returns a traced
+driver's finished rows, their records and their samples at one point; `game_seed_of(seed, gid)`.
+
+**Tests.** `traced_games_replay_to_their_rows_bit_for_bit` (toy, rolling, auxiliary targets, value-only rows,
+resignations, a new network mid-phase: every replayed row equal to the driver's - features, options, `z`, `sc`,
+auxiliary targets bit for bit, `pi` and `q` as float16 - and every game seed its id's), `tracing_changes_no_game_and_no_row`
+(the same games, rows and policy bits traced or not), `a_tampered_record_is_refused` (seed, an action, a missing or extra
+move, result, margin, rounds, setup, `q` and `pi` out of range, a policy value too many or too few, a row of another seat
+or kind, samples of a game without a result, a resignation of a finished game),
+`set_trace_before_games_and_never_with_branches`; zero_worker's `records_replay_to_the_shards_rows_bit_for_bit` and
+zero.farm_pool's tests (docs/az.md 43).
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),

@@ -140,13 +140,16 @@ def record_rows(model, game, spec, rows=320, conc=32, sims=16, threads=4, seed=1
                 model.features, batch_off=np.concatenate([[0], np.cumsum(n)]).astype(np.int64), source='farm_h2h')
 
 
-def export(ckpt, gen, out_dir, game, rows_list, ckpt_id, threads=4):
+def export(ckpt, gen, out_dir, game, rows_list, ckpt_id, threads=4, checkpoint_iter=None):
     """`ckpt` -> <out_dir>/model.onnx + reference.npz, the reference checked through onnxruntime -> their
-    {model, sha256, reference, reference_sha256, check} (local paths)."""
+    {model, sha256, reference, reference_sha256, check} (local paths). `checkpoint_iter`: the graph's network id
+    (its metadata `checkpoint_iter`: a self-play worker's rows carry it; default the checkpoint's iteration)."""
     from .onnx_export import REFERENCE_TOL, check_reference, export as onnx_export, load_checkpoint, write_reference
     os.makedirs(out_dir, exist_ok=True)
     m, info = load_checkpoint(ckpt, game)
     info['checkpoint'] = ckpt_id
+    if checkpoint_iter is not None:
+        info['checkpoint_iter'] = str(int(checkpoint_iter))
     model = os.path.join(out_dir, 'model.onnx')
     ref = os.path.join(out_dir, 'reference.npz')
     onnx_export(m, model, 'packed', info)

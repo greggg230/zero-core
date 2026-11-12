@@ -296,6 +296,20 @@ DEFAULTS = dict(
     # re-read at every self-play phase: hosts join and leave a live run; the file alone turns remote
     # self-play on): every host its own workers, mirror and shards, one shared queue (docs/az.md 34)
     selfplay_remote='', selfplay_remote_procs=0, selfplay_remote_wait=30.0, selfplay_remote_timeout=3600.0,
+    # the zero-farm pool (a `selfplay_remote` name `pool:<farm run>`: friends' idle PCs through the farm's
+    # coordinator, zero/farm_pool.py, docs/az.md 43; unused without one): the worker build (required) and its
+    # runtime build, that build's signed executable here (its check-config picks the template's settings), the
+    # coordinator ('' = zero.farm_def.URL), the generations a farm game may lag (accepted into iteration i while
+    # its network >= i - 1 - pool_max_stale), the coordinator's quota per generation (0 = games) and slack, games
+    # per lease ('auto' or n), the run's priority on the farm, the RAM a lease needs (0 = the coordinator's
+    # default), seconds between result polls, the data key and farm-release ('' = zero.farm_def's), and the
+    # definitions' expiry in days (0 = never)
+    pool_build='', pool_runtime='', pool_worker='', pool_url='', pool_max_stale=1, pool_quota=0, pool_slack=0.1,
+    pool_games_per_lease='auto', pool_priority=1.0, pool_needs_ram_mb=0, pool_poll_s=10.0, pool_key='',
+    pool_farm_release='', pool_expires_days=30,
+    # with selfplay_local 0, the pool counts as a remote taking work while a valid game arrived within this many
+    # seconds (this machine then only trains; when the farm goes quiet it plays again: the run never stalls)
+    pool_live_s=900.0,
     # selfplay_local 0 = while at least one remote worker takes work, this machine's driver takes no
     # games (the run's machine only trains: an actor / learner split); with none (all offline, backing
     # off, refused, or no host listed) it plays the quota itself, so the run never stalls. 1 = this
@@ -1953,7 +1967,7 @@ class Run:
             self.rsp = RemotePlay(self, c['selfplay_remote'])
             self.rsp.local(max(2, int(c['groups'])), int(c['conc']), device=c['infer_device'])
             self.rsp.restore(last_rates(read_metrics(run)))
-            if not self.rsp.multi:
+            if not self.rsp.multi and self.rsp.hosts and not self.rsp.pools:
                 self.log(f'self-play also on the remote {c["selfplay_remote"]!r} ({self.rsp.spec["host"]}, '
                          f'{self.rsp.procs} worker(s), mirror {self.rsp.rdir}): {c["games"]} games per iteration in '
                          f'total, in flight per machine its throughput share x {self.rsp.inflight:g}'

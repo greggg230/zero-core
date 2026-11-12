@@ -537,6 +537,10 @@
    "class": "trainer",
    "why": "orchestration (the farm pool, docs/az.md 43)"
   },
+  "pool_live_s": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
   "selfplay_local": {
    "class": "trainer",
    "why": "orchestration"
