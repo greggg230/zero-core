@@ -1018,8 +1018,9 @@ impl PySearchDriver {
     /// Network evaluation of batch `id`: priors f32 [options], value / margin f32 [B, MAX_SEATS];
     /// `aux` f32 [belief rows, aux_width]: the auxiliary outputs of its root belief rows (`extra` ==
     /// ROW_BELIEF, docs/search.md 3.8), in row order - required when it has some.
+    /// Releases the GIL while it hands the answers over (docs/az.md 43.12).
     #[pyo3(signature = (id, priors, value, margin, aux=None))]
-    fn submit(&mut self, id: u64, priors: PyReadonlyArray1<'_, f32>, value: PyReadonlyArray2<'_, f32>, margin: PyReadonlyArray2<'_, f32>, aux: Option<PyReadonlyArray2<'_, f32>>) -> PyResult<()> {
+    fn submit(&mut self, py: Python<'_>, id: u64, priors: PyReadonlyArray1<'_, f32>, value: PyReadonlyArray2<'_, f32>, margin: PyReadonlyArray2<'_, f32>, aux: Option<PyReadonlyArray2<'_, f32>>) -> PyResult<()> {
         if value.shape()[1] != MAX_SEATS || margin.shape()[1] != MAX_SEATS {
             return Err(PyValueError::new_err(format!("value / margin must be [B, {MAX_SEATS}]")));
         }
@@ -1030,7 +1031,8 @@ impl PySearchDriver {
             Some(a) => a.as_slice().map_err(|e| PyValueError::new_err(format!("aux: {e}")))?,
             None => &[],
         };
-        self.d.submit(id, p, v, m, a).map_err(verr)
+        let d = &mut self.d;
+        py.allow_threads(move || d.submit(id, p, v, m, a)).map_err(verr)
     }
 
     /// Answers of external batch `id`: one payload string per request.
