@@ -24,6 +24,7 @@ pub mod noise;
 pub mod rng;
 pub mod tail;
 pub mod toy;
+pub mod toy_tail;
 pub mod toy_team;
 pub mod tree;
 

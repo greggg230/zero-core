@@ -459,10 +459,10 @@ pub trait RowSink<G: SearchGame> {
     fn push_row(&mut self, viewer: usize, opts: &[u16], kind: u8) -> &mut [f32];
     /// Drop the last row pushed (a leaf whose observation another row has: `dedup`).
     fn pop_row(&mut self);
-    /// A row of `g.encode(viewer)`.
-    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8) {
+    /// A row of `g.encode(viewer)` (`look_encode`: a row with a tail or overrides is refused, R12).
+    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8) -> Result<(), String> {
         let x = self.push_row(viewer, opts, kind);
-        g.encode(viewer, x);
+        look_encode(g, viewer, opts, x)
     }
 }
 
@@ -578,6 +578,13 @@ enum VEntry {
 /// independent multiply-xorshift lanes, finished by `split64`. The encodings are sparse (a Delver
 /// position: ~150 non-zero floats of 37,620): blocks of zero bits are skipped (an OR over the block).
 pub fn obs_hash(x: &[f32]) -> u128 {
+    let (a, b) = obs_state(x);
+    obs_finish(a, b, x.len())
+}
+
+/// `obs_hash`'s two lanes after the pairs of `x`, before `obs_finish` (a row's tail continues them:
+/// `tail::tail_mix`, docs/search.md 2.15).
+pub(crate) fn obs_state(x: &[f32]) -> (u64, u64) {
     // SAFETY: f32 and u32 have the same size and alignment; the bits are read, never written
     let u: &[u32] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u32, x.len()) };
     let (mut a, mut b) = OBS_SEED;
@@ -605,7 +612,7 @@ pub fn obs_hash(x: &[f32]) -> u128 {
             mix(&mut a, &mut b, base + j as u64, v);
         }
     }
-    obs_finish(a, b, x.len())
+    (a, b)
 }
 
 /// `obs_hash`'s two lanes before any pair.
@@ -628,7 +635,7 @@ pub(crate) fn obs_mix(a: &mut u64, b: &mut u64, i: u64, v: u64) {
 
 /// `obs_hash`'s finish over the encoding's length `n`.
 #[inline(always)]
-fn obs_finish(a: u64, b: u64, n: usize) -> u128 {
+pub(crate) fn obs_finish(a: u64, b: u64, n: usize) -> u128 {
     let n = n as u64;
     ((split64(a ^ n) as u128) << 64) | split64(b ^ n.rotate_left(17)) as u128
 }
@@ -638,6 +645,12 @@ fn obs_finish(a: u64, b: u64, n: usize) -> u128 {
 /// mixing of the same (pair index, bits) as the dense hash, so the same key: `obs_hash_sparse` of a row's
 /// non-zeros == `obs_hash` of the row (the evaluation cache's key is either, docs/search.md 3.12).
 pub fn obs_hash_sparse(idx: &[u32], val: &[f32], n: usize) -> u128 {
+    let (a, b) = obs_state_sparse(idx, val);
+    obs_finish(a, b, n)
+}
+
+/// `obs_hash_sparse`'s two lanes before `obs_finish` (`obs_state` of the dense row).
+pub(crate) fn obs_state_sparse(idx: &[u32], val: &[f32]) -> (u64, u64) {
     debug_assert_eq!(idx.len(), val.len());
     let (mut a, mut b) = OBS_SEED;
     let mut k = 0;
@@ -660,7 +673,39 @@ pub fn obs_hash_sparse(idx: &[u32], val: &[f32], n: usize) -> u128 {
             mix(&mut a, &mut b, (i >> 1) as u64, v);
         }
     }
+    (a, b)
+}
+
+/// The observation key of a row with a tail and overrides (docs/search.md 2.15, K1-K3): the head's lanes
+/// (`obs_state` / `obs_state_sparse`), the tail and overrides mixed in (`tail::tail_mix`), finished over the
+/// head's `n` floats. An empty tail without overrides is exactly `obs_hash` of the head.
+pub fn obs_hash_row(head: (u64, u64), n: usize, seg: &[u16], slot: &[u32], val: &[f32], ov: &[(u32, i64)]) -> u128 {
+    let (mut a, mut b) = head;
+    crate::tail::tail_mix(&mut a, &mut b, seg, slot, val, ov);
     obs_finish(a, b, n)
+}
+
+/// A lookahead row's features (docs/search.md 2.15, R12): `encode(viewer)` for a game without tails or pointer
+/// overrides (the path of before); otherwise `encode_row`, refused when the row has a tail token or (with options)
+/// an override - the lookahead's rows carry neither yet (P1).
+pub fn look_encode<G: SearchGame>(g: &G, viewer: usize, opts: &[u16], x: &mut [f32]) -> Result<(), String> {
+    if G::TAILS.is_empty() && !G::OPTION_POINTERS {
+        g.encode(viewer, x);
+        return Ok(());
+    }
+    let mut tb = crate::tail::TailBuf::new(G::TAILS);
+    g.encode_row(viewer, x, &mut tb);
+    if !tb.is_empty() {
+        return Err("lookahead: tail rows not supported yet".into());
+    }
+    if G::OPTION_POINTERS && !opts.is_empty() {
+        let mut ov = Vec::new();
+        g.option_overrides(viewer, opts, &mut ov);
+        if !ov.is_empty() {
+            return Err("lookahead: tail rows not supported yet (a row with pointer overrides)".into());
+        }
+    }
+    Ok(())
 }
 
 /// The first index of the largest prior (Python's `max(range(n), key=p.__getitem__)`).
@@ -1103,7 +1148,7 @@ impl<G: SearchGame> Look<G> {
                 Mode::World => None,
                 Mode::Infoset => {
                     self.xbuf.iter_mut().for_each(|x| *x = 0.0);
-                    g.encode(self.viewer, &mut self.xbuf);
+                    look_encode(g, self.viewer, &[], &mut self.xbuf)?;
                     let k = (obs_hash(&self.xbuf), legal.clone());
                     match by_key.get(&k) {
                         Some(&gi) => Some(gi),
@@ -1270,20 +1315,20 @@ impl<G: SearchGame> Look<G> {
                     if matches!(q, Req::RootPrior) {
                         g.legal_actions(&mut self.legal);
                     }
-                    sink.row(g, self.viewer, &self.legal, if matches!(q, Req::Belief) { ROW_BELIEF } else { ROW_LEAF });
+                    sink.row(g, self.viewer, &self.legal, if matches!(q, Req::Belief) { ROW_BELIEF } else { ROW_LEAF })?;
                 }
                 Req::Prior(m) => {
                     let g = self.mems[m as usize].g.as_deref().ok_or("internal: a prior row without a game")?;
                     self.legal.clear();
                     g.legal_actions(&mut self.legal);
                     let p = g.to_move().ok_or("internal: a prior row at a finished game")?;
-                    sink.row(g, p, &self.legal, ROW_LEAF);
+                    sink.row(g, p, &self.legal, ROW_LEAF)?;
                     self.st.prior_rows += 1;
                 }
                 Req::Group(gi) => {
                     let rep = self.groups[gi as usize].members[0];
                     let g = self.mems[rep as usize].g.as_deref().ok_or("internal: a group prior row without a game")?;
-                    sink.row(g, self.viewer, &self.groups[gi as usize].acts, ROW_LEAF);
+                    sink.row(g, self.viewer, &self.groups[gi as usize].acts, ROW_LEAF)?;
                     self.st.prior_rows += 1;
                 }
                 Req::Value(_) => return Err("internal: a value in the prior queue".into()),
@@ -1295,11 +1340,11 @@ impl<G: SearchGame> Look<G> {
             let g = self.mems[m as usize].g.take().ok_or("internal: a value row without a game")?;
             self.live_games -= 1;
             if !self.cfg.dedup {
-                sink.row(&g, self.viewer, &[], ROW_LEAF);
+                sink.row(&g, self.viewer, &[], ROW_LEAF)?;
             } else {
                 // (encoded in place, the row dropped again when its observation was sent already)
                 let x = sink.push_row(self.viewer, &[], ROW_LEAF);
-                g.encode(self.viewer, x);
+                look_encode(&*g, self.viewer, &[], x)?;
                 let h = obs_hash(x);
                 match self.vcache.get_mut(&h) {
                     Some(VEntry::Val(v)) => {

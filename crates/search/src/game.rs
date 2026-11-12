@@ -97,6 +97,11 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     /// A row's capacity 1 + Σ head slots + its tail tokens may not pass this (docs/search.md 2.15). Required finite
     /// when `TAILS` is non-empty (a const assert in the driver).
     const MAX_ROW_TOKENS: usize = usize::MAX;
+    /// The layout's head tokens `1 + Σ count` (the global token plus every segment's head slots, tail or not): a
+    /// row's capacity is `HEAD_TOKENS + its tail tokens` (docs/search.md 2.15; the API change of 2026-11-11).
+    /// Required non-zero when `TAILS` is non-empty (the same compile-time assert as `MAX_ROW_TOKENS`); zero.package
+    /// checks it against the layout. Default 0.
+    const HEAD_TOKENS: usize = 0;
     /// `encode(viewer)` as the head, plus the tail tokens (`tail` empty on entry, any order: the driver sorts and
     /// validates). `head` is zeroed by the caller. Default: `encode` and no tokens.
     ///

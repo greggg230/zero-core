@@ -32,7 +32,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::*;
-use crate::lookahead::obs_hash_sparse;
+use crate::lookahead::{obs_hash_row, obs_hash_sparse, obs_state_sparse};
+use crate::tail::TailBuf;
 
 /// A node's key in the observation map: (`obs_hash` of the viewer's features, `sig_hash` of the decider and -
 /// for the viewer's own nodes - the options).
@@ -93,6 +94,10 @@ pub(super) struct Merge {
     dense: Vec<f32>,
     idx: Vec<u32>,
     val: Vec<f32>,
+    /// A game with tail segments or pointer overrides (docs/search.md 2.15): the encoding's sealed tail (with
+    /// `idx` / `val`) and the overrides of its key (the viewer's own decision only).
+    tail: TailBuf,
+    ov: Vec<(u32, i64)>,
     /// The node whose state `idx` / `val` encode from the viewer's view: set by the walk's last `merged_child` when
     /// it encoded (a new signature), NIL otherwise (`Tree::leaf_obs`: the driver's row of the leaf's viewer).
     pub(super) enc_node: u32,
@@ -111,6 +116,8 @@ impl Merge {
             dense: Vec::new(),
             idx: Vec::new(),
             val: Vec::new(),
+            tail: TailBuf::default(),
+            ov: Vec::new(),
             enc_node: NIL,
         }
     }
@@ -175,6 +182,15 @@ impl<G: SearchGame> Tree<G> {
     pub fn leaf_obs(&self, node: u32) -> Option<(&[u32], &[f32])> {
         match &self.merge {
             Some(m) if m.enc_node == node && node != NIL => Some((&m.idx, &m.val)),
+            _ => None,
+        }
+    }
+
+    /// `leaf_obs`'s tail tokens (docs/search.md 2.15): the sealed (seg, slot, floats) of the same encoding, empty for
+    /// a game without tail segments; None when `leaf_obs` is.
+    pub fn leaf_obs_tail(&self, node: u32) -> Option<(&[u16], &[u32], &[f32])> {
+        match &self.merge {
+            Some(m) if m.enc_node == node && node != NIL => Some((m.tail.seg(), m.tail.slot(), m.tail.val())),
             _ => None,
         }
     }
@@ -249,9 +265,27 @@ impl<G: SearchGame> Tree<G> {
         m.idx.clear();
         m.val.clear();
         m.enc_node = NIL;
-        g.encode_sparse(viewer, &mut m.dense, &mut m.idx, &mut m.val);
+        let h = if G::TAILS.is_empty() && !G::OPTION_POINTERS {
+            g.encode_sparse(viewer, &mut m.dense, &mut m.idx, &mut m.val);
+            obs_hash_sparse(&m.idx, &m.val, G::NUM_FEATURES)
+        } else {
+            // (docs/search.md 2.15: the key covers the tail and, at the viewer's own decision, its overrides - the
+            // same key as the driver's evaluation cache, K3)
+            if m.tail.segs().len() != G::TAILS.len() {
+                m.tail = TailBuf::new(G::TAILS);
+            }
+            m.tail.clear();
+            g.encode_row(viewer, &mut m.dense, &mut m.tail);
+            crate::game::sparse_scan(&mut m.dense, &mut m.idx, &mut m.val);
+            m.tail.seal();
+            m.ov.clear();
+            if G::OPTION_POINTERS && p == viewer && !acts.is_empty() {
+                g.option_overrides(viewer, acts, &mut m.ov);
+            }
+            obs_hash_row(obs_state_sparse(&m.idx, &m.val), G::NUM_FEATURES, m.tail.seg(), m.tail.slot(), m.tail.val(), &m.ov)
+        };
         m.count.encodes += 1;
-        (obs_hash_sparse(&m.idx, &m.val, G::NUM_FEATURES), sig_hash(&[], p, if p == viewer { acts } else { &[] }))
+        (h, sig_hash(&[], p, if p == viewer { acts } else { &[] }))
     }
 
     /// The node the walk at (`parent`, option i) goes to after a transition to decision (p, `sc.legal`) with chance

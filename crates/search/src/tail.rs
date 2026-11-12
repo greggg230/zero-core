@@ -35,6 +35,13 @@ pub struct TailBuf {
     tmp: Vec<f32>,
 }
 
+impl Default for TailBuf {
+    /// A buffer of no tail segments (a game without `TAILS`): `token` panics.
+    fn default() -> Self {
+        TailBuf::new(&[])
+    }
+}
+
 impl TailBuf {
     pub fn new(segs: &'static [TailSeg]) -> Self {
         TailBuf { seg: Vec::new(), slot: Vec::new(), val: Vec::new(), segs, off: Vec::new(), order: Vec::new(), tmp: Vec::new() }
@@ -149,6 +156,17 @@ impl TailBuf {
     }
     pub fn val(&self) -> &[f32] {
         &self.val
+    }
+
+    /// Replace the tokens by a sealed row's (`seg` / `slot` sorted, `val` their floats): a row encoded elsewhere
+    /// (a merged tree's encoding of a leaf, docs/search.md 3.16).
+    pub fn set_sealed(&mut self, seg: &[u16], slot: &[u32], val: &[f32]) {
+        self.seg.clear();
+        self.seg.extend_from_slice(seg);
+        self.slot.clear();
+        self.slot.extend_from_slice(slot);
+        self.val.clear();
+        self.val.extend_from_slice(val);
     }
 
     /// A copy of the (sealed) tokens as a record's row.

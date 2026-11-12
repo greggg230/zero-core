@@ -68,7 +68,7 @@ use std::time::Instant;
 use crate::game::{make_bot, Belief, Bot, SearchGame, MAX_SEATS};
 use crate::lookahead::{Look, LookCfg};
 use crate::rng::{split64, Rng};
-use crate::tail::TailRow;
+use crate::tail::{TailBuf, TailRow};
 use crate::tree::Tree;
 
 mod worker;
@@ -815,6 +815,9 @@ pub struct GameResult {
     pub start: Option<u32>,
     /// Self-play resignation (`NnSeat::resign_t`, docs/search.md 3.14): None unless the game's seats resign.
     pub resign: Option<ResignInfo>,
+    /// Why the driver aborted the game (`aborted` true): `"max_row_tokens"` - a row passed the limit
+    /// (docs/search.md 2.15). None otherwise (a game's own `SearchGame::aborted` included).
+    pub abort_reason: Option<&'static str>,
 }
 
 /// One recorded root decision with its targets.
@@ -916,9 +919,41 @@ struct LeafBuf {
     /// A sparse buffer's open row from `encode_row`: its first non-zero in `xs_idx` (None: the open row,
     /// if any, is in `scratch`).
     open: Option<usize>,
+    /// Variable-length rows (docs/search.md 2.15). `tails`: the game declares `TAILS` - every sealed row
+    /// pushes its tail tokens (`t_nt` their count, `t_seg` / `t_slot` / `t_val`); the open row's are in `tb`,
+    /// and an encoded row with more than `max_tail` tokens is over the limit (`encode_row` returns its
+    /// capacity). `pointers`: `OPTION_POINTERS` - every sealed row pushes its overrides (`ov_n` their count),
+    /// the open row's in `ov_open`. Both off: nothing here is touched (the rows of before).
+    tails: bool,
+    pointers: bool,
+    head_tokens: usize,
+    max_tail: usize,
+    tb: TailBuf,
+    ov_open: Vec<(u32, i64)>,
+    t_nt: Vec<u32>,
+    t_seg: Vec<u16>,
+    t_slot: Vec<u32>,
+    t_val: Vec<f32>,
+    ov_n: Vec<u32>,
+    ov_opt: Vec<i32>,
+    ov_tok: Vec<i64>,
 }
 
 impl LeafBuf {
+    /// A key's buffer for game `G` (`sparse` rows or dense; the tail and override arrays when `G` has them,
+    /// `limit` the driver's `max_row_tokens`).
+    fn new<G: SearchGame>(sparse: bool, limit: usize) -> LeafBuf {
+        let tails = !G::TAILS.is_empty();
+        LeafBuf {
+            sparse,
+            tails,
+            pointers: G::OPTION_POINTERS,
+            head_tokens: G::HEAD_TOKENS,
+            max_tail: limit.saturating_sub(G::HEAD_TOKENS),
+            tb: if tails { TailBuf::new(G::TAILS) } else { TailBuf::default() },
+            ..Default::default()
+        }
+    }
     fn clear(&mut self) {
         self.x.clear();
         self.player.clear();
@@ -932,13 +967,40 @@ impl LeafBuf {
         self.xs_idx.clear();
         self.xs_val.clear();
         self.open = None;
+        self.tb.clear();
+        self.ov_open.clear();
+        self.t_nt.clear();
+        self.t_seg.clear();
+        self.t_slot.clear();
+        self.t_val.clear();
+        self.ov_n.clear();
+        self.ov_opt.clear();
+        self.ov_tok.clear();
     }
     fn len(&self) -> usize {
         self.player.len()
     }
     /// A new row: `g.encode(viewer)` (dense: into `x`; sparse: `encode_sparse`, its non-zeros appended
-    /// without a scan of the whole row, docs/search.md 2.12). `seal` or `unrow` it afterwards.
-    fn encode_row<G: SearchGame>(&mut self, g: &G, viewer: usize) {
+    /// without a scan of the whole row, docs/search.md 2.12); a game with tails: `encode_row` into `x` or the
+    /// scratch row, its tail sealed into `tb` (docs/search.md 2.15). `seal` or `unrow` it afterwards. -> the row's
+    /// capacity when it passes the limit (`1 + Σ head + tail` > `max_row_tokens`: the caller unrows it and aborts
+    /// the game), else None.
+    fn encode_row<G: SearchGame>(&mut self, g: &G, viewer: usize) -> Option<usize> {
+        if self.tails {
+            let f = G::NUM_FEATURES;
+            self.tb.clear();
+            self.open = None;
+            if self.sparse {
+                self.zeroed_scratch(f);
+                g.encode_row(viewer, &mut self.scratch, &mut self.tb);
+            } else {
+                let off = self.x.len();
+                self.x.resize(off + f, 0.0);
+                g.encode_row(viewer, &mut self.x[off..], &mut self.tb);
+            }
+            self.tb.seal();
+            return self.over();
+        }
         if self.sparse {
             self.zeroed_scratch(G::NUM_FEATURES);
             self.open = Some(self.xs_idx.len());
@@ -946,11 +1008,17 @@ impl LeafBuf {
         } else {
             g.encode(viewer, self.row_x(G::NUM_FEATURES));
         }
+        None
+    }
+    /// The open row's capacity if it passes the limit.
+    fn over(&self) -> Option<usize> {
+        (self.tails && self.tb.len() > self.max_tail).then(|| self.head_tokens + self.tb.len())
     }
     /// A new row from the non-zero features of `encode(viewer)` (`encode_sparse`'s pairs of it, computed
     /// elsewhere: a merged tree's encoding of the leaf, docs/search.md 3.16) - by `encode_sparse`'s contract the row
-    /// `encode_row` makes, bit for bit (sparse: the pairs appended as its open row; dense: scattered into zeros).
-    fn push_pairs(&mut self, idx: &[u32], val: &[f32], f: usize) {
+    /// `encode_row` makes, bit for bit (sparse: the pairs appended as its open row; dense: scattered into zeros) -
+    /// and, for a game with tails, that encoding's sealed tail. -> as `encode_row`.
+    fn push_pairs(&mut self, idx: &[u32], val: &[f32], f: usize, tail: Option<(&[u16], &[u32], &[f32])>) -> Option<usize> {
         if self.sparse {
             self.open = Some(self.xs_idx.len());
             self.xs_idx.extend_from_slice(idx);
@@ -961,15 +1029,37 @@ impl LeafBuf {
                 x[i as usize] = v;
             }
         }
+        if self.tails {
+            let (s, l, v) = tail.expect("internal: a shared row of a game with tails without its tail");
+            self.tb.set_sealed(s, l, v);
+            return self.over();
+        }
+        None
+    }
+    /// The open row's pointer overrides (docs/search.md 2.15): `g.option_overrides(viewer, opts)` for a row with
+    /// options of a game with `OPTION_POINTERS` (else nothing), checked: option indexes ascending and in range,
+    /// tokens -1 or a packed token (an engine bug panics: the game is named by the worker).
+    fn overrides<G: SearchGame>(&mut self, g: &G, viewer: usize, opts: &[u16]) {
+        if !self.pointers {
+            return;
+        }
+        self.ov_open.clear();
+        if opts.is_empty() {
+            return;
+        }
+        g.option_overrides(viewer, opts, &mut self.ov_open);
+        check_overrides(&self.ov_open, opts.len());
     }
     /// `obs_hash` of the open row of `f` features (the evaluation cache's key, docs/search.md 3.12): of the
-    /// dense row, or of an `encode_row` row's non-zeros (`obs_hash_sparse`: the same key).
+    /// dense row, or of an `encode_row` row's non-zeros (`obs_hash_sparse`: the same key); with its tail and
+    /// overrides mixed in (docs/search.md 2.15: none = the key of before).
     fn row_hash(&self, f: usize) -> u128 {
-        match self.open {
-            Some(lo) => crate::lookahead::obs_hash_sparse(&self.xs_idx[lo..], &self.xs_val[lo..], f),
-            None if self.sparse => crate::lookahead::obs_hash(&self.scratch),
-            None => crate::lookahead::obs_hash(&self.x[self.x.len() - f..]),
-        }
+        let head = match self.open {
+            Some(lo) => crate::lookahead::obs_state_sparse(&self.xs_idx[lo..], &self.xs_val[lo..]),
+            None if self.sparse => crate::lookahead::obs_state(&self.scratch),
+            None => crate::lookahead::obs_state(&self.x[self.x.len() - f..]),
+        };
+        crate::lookahead::obs_hash_row(head, f, self.tb.seg(), self.tb.slot(), self.tb.val(), &self.ov_open)
     }
     fn zeroed_scratch(&mut self, f: usize) {
         if self.scratch.len() != f {
@@ -978,8 +1068,12 @@ impl LeafBuf {
         }
     }
     /// The features of a new row, zeroed, for the caller to encode into: a slice of `x` (dense), or the
-    /// scratch row (sparse: `seal` it afterwards).
+    /// scratch row (sparse: `seal` it afterwards). Head only: a row made this way has no tail tokens (the
+    /// lookahead's rows, `lookahead::look_encode`).
     fn row_x(&mut self, f: usize) -> &mut [f32] {
+        if self.tails {
+            self.tb.clear();
+        }
         if self.sparse {
             self.zeroed_scratch(f);
             &mut self.scratch
@@ -991,21 +1085,37 @@ impl LeafBuf {
     }
     /// A sparse buffer's open row into its sparse arrays: an `encode_row` row's non-zeros counted, or the
     /// scratch row's non-zero floats (-0.0 included; `game::sparse_scan`, the scratch zeroed again);
-    /// nothing for a dense one.
+    /// nothing for a dense one. The open row's tail and overrides into theirs (a game with them).
     fn seal(&mut self) {
-        if !self.sparse {
-            return;
+        if self.sparse {
+            if let Some(lo) = self.open.take() {
+                self.xs_nnz.push((self.xs_idx.len() - lo) as u32);
+            } else {
+                let k = crate::game::sparse_scan(&mut self.scratch, &mut self.xs_idx, &mut self.xs_val);
+                self.xs_nnz.push(k);
+            }
         }
-        if let Some(lo) = self.open.take() {
-            self.xs_nnz.push((self.xs_idx.len() - lo) as u32);
-            return;
+        if self.tails {
+            self.t_nt.push(self.tb.len() as u32);
+            self.t_seg.extend_from_slice(self.tb.seg());
+            self.t_slot.extend_from_slice(self.tb.slot());
+            self.t_val.extend_from_slice(self.tb.val());
+            self.tb.clear();
         }
-        let k = crate::game::sparse_scan(&mut self.scratch, &mut self.xs_idx, &mut self.xs_val);
-        self.xs_nnz.push(k);
+        if self.pointers {
+            self.ov_n.push(self.ov_open.len() as u32);
+            for &(o, t) in &self.ov_open {
+                self.ov_opt.push(o as i32);
+                self.ov_tok.push(t);
+            }
+            self.ov_open.clear();
+        }
     }
     /// Drop the open row's features (dense: the last row of `x`; sparse: an `encode_row` row's non-zeros,
-    /// or the scratch row, zeroed).
+    /// or the scratch row, zeroed), its tail and overrides.
     fn unrow(&mut self, f: usize) {
+        self.tb.clear();
+        self.ov_open.clear();
         if self.sparse {
             if let Some(lo) = self.open.take() {
                 self.xs_idx.truncate(lo);
@@ -1016,6 +1126,59 @@ impl LeafBuf {
         } else {
             self.x.truncate(self.x.len() - f);
         }
+    }
+    /// Drop every sealed row from `local` on (a game aborted by the row limit takes back the rows it sent this
+    /// step, docs/search.md 2.15); no row may be open.
+    fn truncate_rows(&mut self, local: usize, f: usize) {
+        let n = self.len();
+        if local >= n {
+            return;
+        }
+        if self.sparse {
+            let nz: usize = self.xs_nnz[local..].iter().map(|&k| k as usize).sum();
+            self.xs_idx.truncate(self.xs_idx.len() - nz);
+            self.xs_val.truncate(self.xs_val.len() - nz);
+            self.xs_nnz.truncate(local);
+        } else {
+            self.x.truncate(local * f);
+        }
+        let no: usize = self.nopt[local..].iter().map(|&k| k as usize).sum();
+        self.opt_action.truncate(self.opt_action.len() - no);
+        self.nopt.truncate(local);
+        self.player.truncate(local);
+        self.n_players.truncate(local);
+        self.gid.truncate(local);
+        self.extra.truncate(local);
+        if self.tails {
+            let nt: usize = self.t_nt[local..].iter().map(|&k| k as usize).sum();
+            let k = self.t_seg.len() - nt;
+            let w: usize = self.t_seg[k..].iter().map(|&s| self.tb.seg_info(s).map_or(0, |i| i.width)).sum();
+            self.t_seg.truncate(k);
+            self.t_slot.truncate(k);
+            self.t_val.truncate(self.t_val.len() - w);
+            self.t_nt.truncate(local);
+        }
+        if self.pointers {
+            let no: usize = self.ov_n[local..].iter().map(|&k| k as usize).sum();
+            self.ov_opt.truncate(self.ov_opt.len() - no);
+            self.ov_tok.truncate(self.ov_tok.len() - no);
+            self.ov_n.truncate(local);
+        }
+    }
+}
+
+/// A row's pointer overrides checked (docs/search.md 2.15): option indexes ascending, unique and below `nopt`,
+/// tokens -1 or a packed token (>= 0). A violation is an engine bug: panic (the worker names the game).
+pub fn check_overrides(ov: &[(u32, i64)], nopt: usize) {
+    let mut last: i64 = -1;
+    for &(o, t) in ov {
+        if (o as i64) <= last || o as usize >= nopt {
+            panic!("option_overrides: option index {o} not ascending or out of the row's {nopt} options ({ov:?})");
+        }
+        if t < -1 {
+            panic!("option_overrides: token {t} is neither -1 nor a packed token");
+        }
+        last = o as i64;
     }
 }
 
@@ -1274,6 +1437,9 @@ struct Slot<G: SearchGame> {
     cache: HashMap<(u16, u32, u128), Cached>,
     /// Self-play resignation (docs/search.md 3.14): the game's counter, None unless its seats resign.
     resign: Option<ResignState>,
+    /// A row of the game passed `max_row_tokens` (docs/search.md 2.15): the game ends as aborted at the
+    /// advance loop's top (`GameResult::aborted`, no samples).
+    row_abort: bool,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -1321,6 +1487,7 @@ impl<G: SearchGame> Slot<G> {
             start_ix: None,
             cache: HashMap::new(),
             resign: None,
+            row_abort: false,
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -1432,6 +1599,12 @@ struct Counters {
     /// Value choices made (docs/search.md 3.17) and their lookaheads' rows.
     value_choices: AtomicU64,
     value_choice_rows: AtomicU64,
+    /// Variable-length rows (docs/search.md 2.15): rows sent with a tail, their tokens, the most in one row,
+    /// games aborted by the row limit.
+    tail_rows: AtomicU64,
+    tail_tokens: AtomicU64,
+    tail_max: AtomicU64,
+    aborted_row_tokens: AtomicU64,
     /// The evaluation cache (docs/search.md 3.12): rows answered from it (not sent), leaves wholly
     /// answered from it (expanded at once), leaves answered from it in part, caches emptied because full.
     cache_hits: AtomicU64,
@@ -1708,11 +1881,15 @@ pub struct Driver<G: SearchGame> {
 impl<G: SearchGame> Driver<G> {
     pub fn new(cfg: DriverCfg) -> Result<Driver<G>, String> {
         // R3 (docs/search.md 2.15): a game with tail segments declares a finite row limit
-        const { assert!(G::TAILS.is_empty() || G::MAX_ROW_TOKENS != usize::MAX, "a game with TAILS must set a finite MAX_ROW_TOKENS") };
+        const { assert!(G::TAILS.is_empty() || (G::MAX_ROW_TOKENS != usize::MAX && G::HEAD_TOKENS > 0 && G::HEAD_TOKENS <= G::MAX_ROW_TOKENS), "a game with TAILS must set a finite MAX_ROW_TOKENS and its HEAD_TOKENS (1 + every segment's head slots, at most MAX_ROW_TOKENS)") };
         if let Some(m) = cfg.max_row_tokens {
             if m > G::MAX_ROW_TOKENS {
                 return Err(format!("max_row_tokens {m} is above the game's {} (it may only lower it)", G::MAX_ROW_TOKENS));
             }
+        }
+        let row_limit = cfg.max_row_tokens.unwrap_or(G::MAX_ROW_TOKENS);
+        if !G::TAILS.is_empty() && row_limit < G::HEAD_TOKENS {
+            return Err(format!("max_row_tokens {row_limit} is below the game's head tokens {} (no row would fit)", G::HEAD_TOKENS));
         }
         let spec = G::parse_spec(&cfg.spec)?;
         for (g, s) in cfg.games.iter().enumerate() {
@@ -1865,7 +2042,7 @@ impl<G: SearchGame> Driver<G> {
             for c in 0..nchunks {
                 let a = c * ns / nchunks;
                 let b = (c + 1) * ns / nchunks;
-                let bufs = (0..nkeys).map(|_| LeafBuf { sparse: cfg.sparse, ..Default::default() }).collect();
+                let bufs = (0..nkeys).map(|_| LeafBuf::new::<G>(cfg.sparse, row_limit)).collect();
                 chunks.push(Mutex::new(Chunk { slots: (a..b).map(|_| Slot::empty()).collect(), bufs, results: Vec::new(), samples: Vec::new(), parked: Vec::new() }));
             }
             gv.push(Group {
@@ -2283,7 +2460,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None, abort: None };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
@@ -2376,10 +2553,10 @@ impl<G: SearchGame> Driver<G> {
             starts: c.starts.load(Ordering::Relaxed),
             value_choices: c.value_choices.load(Ordering::Relaxed),
             value_choice_rows: c.value_choice_rows.load(Ordering::Relaxed),
-            tail_rows: 0,
-            tail_tokens: 0,
-            tail_max: 0,
-            aborted_row_tokens: 0,
+            tail_rows: c.tail_rows.load(Ordering::Relaxed),
+            tail_tokens: c.tail_tokens.load(Ordering::Relaxed),
+            tail_max: c.tail_max.load(Ordering::Relaxed),
+            aborted_row_tokens: c.aborted_row_tokens.load(Ordering::Relaxed),
         }
     }
 
@@ -2456,7 +2633,16 @@ pub struct SampleArrays {
     pub ov_tok: Vec<i64>,
 }
 
+/// `sample_arrays_rows` of a game without tails or pointer overrides; a record with either is refused (a panic:
+/// they would be dropped).
 pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
+    sample_arrays_rows(recs, f, false, false)
+}
+
+/// Training sample arrays of `records` of a game with tails (`tails`: the `t_*` arrays, `t_off` n + 1 entries even
+/// if every tail is empty) and / or pointer overrides (`pointers`: the `ov_*` arrays; docs/search.md 2.15). A
+/// record carrying what its flag leaves out is refused (a panic: never a silent drop).
+pub fn sample_arrays_rows(recs: &[Record], f: usize, tails: bool, pointers: bool) -> SampleArrays {
     let n = recs.len();
     let aw = recs.first().map_or(0, |r| r.aux.len());
     let mut s = SampleArrays {
@@ -2474,8 +2660,8 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         net: Vec::with_capacity(n),
         aw,
         aux: Vec::with_capacity(n * aw),
-        tails: false,
-        pointers: false,
+        tails,
+        pointers,
         t_off: Vec::new(),
         t_seg: Vec::new(),
         t_slot: Vec::new(),
@@ -2484,6 +2670,12 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         ov_opt: Vec::new(),
         ov_tok: Vec::new(),
     };
+    if tails {
+        s.t_off.push(0);
+    }
+    if pointers {
+        s.ov_off.push(0);
+    }
     for r in recs {
         debug_assert_eq!(r.x.len(), f);
         s.x.extend_from_slice(&r.x);
@@ -2498,9 +2690,30 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         s.net.push(r.net);
         assert_eq!(r.aux.len(), aw, "records with different auxiliary target widths");
         s.aux.extend_from_slice(&r.aux);
+        if tails {
+            s.t_seg.extend_from_slice(&r.tail.seg);
+            s.t_slot.extend_from_slice(&r.tail.slot);
+            s.t_val.extend_from_slice(&r.tail.val);
+            s.t_off.push(s.t_seg.len() as i64);
+        } else {
+            assert!(r.tail.is_empty(), "sample_arrays: a record with tail tokens for arrays without tails");
+        }
+        if pointers {
+            for &(o, t) in &r.ov {
+                s.ov_opt.push(o as i32);
+                s.ov_tok.push(t);
+            }
+            s.ov_off.push(s.ov_opt.len() as i64);
+        } else {
+            assert!(r.ov.is_empty(), "sample_arrays: a record with pointer overrides for arrays without them");
+        }
     }
     s
 }
 
 #[cfg(test)]
 mod tests;
+// variable-length rows through the driver (docs/search.md 2.15)
+#[cfg(test)]
+#[path = "driver/tests/tail.rs"]
+mod tail_tests;
