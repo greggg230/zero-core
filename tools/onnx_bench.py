@@ -71,7 +71,7 @@ def main(argv=None):
     paths = {}
     for p in packs:
         path = os.path.join(a.onnx_dir, f'{stem}.{p}.onnx')
-        if not os.path.exists(path) or OP._meta(path).get('checkpoint_sha256') != info['checkpoint_sha256']:
+        if not os.path.exists(path) or OP.read_metadata(path).get('checkpoint_sha256') != info['checkpoint_sha256']:
             OX.export(model, path, p, info)
         paths[p] = path
     rows = OP.Rows.load(a.batches, a.max_rows)

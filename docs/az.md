@@ -37,6 +37,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `league.py` | The self-play league (section 14): the league games' kinds and seat tables (classic, rolling), the iteration's picks of past checkpoints (`League.plan`: uniform or pfsp), the slots' evaluators (guarded), the games' attribution and `selfplay.league` |
 | `forks.py` | Branched self-play games and archive starts (section 24): the settings, the archive file (`zero-archive/1`: its entries' patches over the run's spec), the self-play driver's `branch` / `starts`, the remote hello's fingerprint, the tallies and `selfplay.forks` |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
+| `onnx_export.py`, `onnx_parity.py` | zero-onnx/1 (section 41): any network (`TokenNet`, `GridNet`, `Net`) exported to one self-contained ONNX graph that takes the driver's sparse batch (`export`, `export_checkpoint`; `python -m zero.onnx_export`), and its parity gate against torch on real batches (`python -m zero.onnx_parity`); `tools/onnx_record.py` records a self-play's batches, `tools/onnx_bench.py` times ONNX Runtime against torch. Need onnx / onnxscript / onnxruntime; nothing on a run's path imports them |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
 
 Repository tools (`tools/`): `build_engine.sh` (the PyO3 build every repo's `build_py.sh`
@@ -5225,3 +5226,116 @@ self-play records, docs/search.md 3.17); config.json gains the four keys.
 in Python and in the Rust driver, h2h's run rule and tag, the hello's fingerprint; a seat with the setting plays the
 toy's games (which mark no value choice) exactly as one without, making none. The search: docs/search.md 3.17's Rust
 tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.
+
+## 41. zero-onnx/1: a network as one self-contained ONNX graph, and its parity gate (no setting; zero-farm phase 0a, 2026-11-11)
+
+**Why.** zero-farm (friends' idle Windows PCs doing a run's self-play and evaluation games) runs the search in a
+native Rust worker with ONNX Runtime: no Python, no torch. The worker must serve any run, including runs with
+networks not designed yet, without code of its own per network. So the network travels as a graph that takes
+the driver's batch exactly as the driver produces it and returns what every zero-core evaluator returns before
+its generic last step; everything specific to an architecture - TokenNet's packing of its objects, readers,
+heads, the auxiliary targets' transforms - is inside the graph, exported from the `net.py` the run trains.
+
+**What.** `zero.onnx_export` (the interface is in its docstring):
+
+| | name | type | shape | |
+|---|---|---|---|---|
+| in | `x_ptr` | i64 | [B+1] | the sparse batch's row offsets (`xs_off`, a driver with `sparse`) |
+| in | `x_idx` | i32 | [nnz] | feature indexes, ascending per row (`xs_idx`) |
+| in | `x_val` | f32 | [nnz] | (`xs_val`) |
+| in | `n_players` | i64 | [B] | |
+| in | `belief` | bool | [B] | the root belief rows (`extra` == ROW_BELIEF) |
+| out | `policy` | f32 | [B, A] | raw logits |
+| out | `value` | f32 | [B, 8] | softmax over the seats present, 0 beyond n_players |
+| out | `margin` | f32 | [B, 8] | |
+| out | `aux` | f32 | [B, W] | `net.aux_answer` per target in the head's layout, 0 on rows without `belief`; W = 0 without a head |
+
+The worker's generic step (`onnx_parity.answer`, the same for every network): each row's priors are the
+max-subtracted float32 softmax of `policy[row, legal actions]`; value and margin as they are; the auxiliary
+answer is `aux[belief rows]`. Metadata: zero_onnx=1, protocol, game, arch, features, actions, seats, aux_layout,
+aux_width, packing, checkpoint, checkpoint_sha256, opset, exporter, torch. `export(net, path)` takes a loaded
+network (`load_checkpoint` = `net.load`: built from the config - TokenNet's token tables, `gidx` and the reader
+indexes rebuilt, not saved -, the encoding guard, the head widened to the game's targets, section 37). The
+densify is in the graph (a scatter-add of ones at the row ends and a running sum give each non-zero's row: no
+data-dependent shape). An absent slot's floats are never part of the arithmetic (its identity digits zeroed
+before the round-to-integer decode, its token replaced by zero), so NaN or junk there changes nothing.
+
+A token network packs its objects inside the graph in one of four ways (`packing`; the first three need nothing
+but the interface):
+
+* `mask`: every slot is a token (170 for MTG Zero), the absent ones masked out of the attention as keys and of
+  the pooling; static shapes but B.
+* `compact`: the present tokens gathered in layout order (TopK over the presence; T = the batch's longest row, a
+  data-dependent shape), then `forward_static`'s trunk on rows padded to T.
+* `packed` (the default): the batch's N present tokens as one list [N, d] (NonZero) for every per-token layer
+  (the LayerNorms, the projections, the MLPs, the pointer head: 2-D Gemms), only the attention and the pooling on
+  rows padded to T (gathered in and back).
+* `host`: `forward_static`'s signature kept as two more inputs (`tok_full`, `tok_n`, packed by the caller with
+  `token_presence` / `token_index`; metadata `present_index`) - the worker would carry TokenNet's packing, so it
+  is measured, not used.
+
+`GridNet` and `Net` have no packing (their forward on the densified rows). Exporter: torch's dynamo-based
+`torch.onnx.export(dynamo=True)` (onnxscript), opset 18, IR 10, one file (no external data), checked by
+`onnx.checker`.
+
+**The gate** (`python -m zero.onnx_parity <checkpoint> --batches <file> ...`): ONNX Runtime's CPU EP against
+torch on real batches - recorded driver batches (`tools/onnx_record.py`: a short CPU self-play's sparse
+LeafBatches with root-view value rows and root belief rows, under the game checkout's own core) or shard rows.
+Per file: batches of 1, 7, 64, 256 and 1,024 rows, each as it is and with NaN in every absent slot's floats
+(the host packing also with junk in its padding positions), and the first recorded batches as the driver sent
+them; a batch over 64 rows is also answered in pieces of 64 rows grouped by their non-zero count (the worker's
+chunking, `run_chunked`). Each is compared with `forward_static` on the host-packed rows and with the eager
+`NetEvaluator`: priors, value, margin and the belief rows' auxiliary answers within 2e-5 max abs (10.6's
+graphs-vs-eager tolerance), value exactly 0 beyond n_players, one auxiliary row per belief row, and the graph
+deterministic (each case run twice, bit-identical outputs). Exit 1 on a failure.
+
+**Not a setting.** Nothing on a run's path imports these modules (onnx, onnxscript and onnxruntime are not run
+dependencies; `tests/test_onnx.py` skips without them); no existing module changed.
+
+**Measured** (2026-11-11, the desktop's i9-13900K, CPU only, onnxruntime 1.31.1, torch 2.11.0, beside a live
+Delver run and an EoE race: the CPU 33-100% busy, so the numbers are noisy; the methods interleaved; zero-farm
+docs/phase0a-onnx.md has every cell):
+
+* *Gate*: MTG Zero's eoe1 iteration 80 (`mtg_eoe`, layout v6 'eoe', 44,212 features, 4 layers, the deck reader,
+  aux belief + deck, W = 2,048) on 60 recorded driver batches of the main-branch build (every 40th batch of a
+  sims-4 self-play, 7,457 rows: 1,479 value-only, 547 belief), 80 early-game driver batches and 2,048 rows of its
+  iteration-80 shard; the Delver deep8 iteration 3293 (`mtg`, layout v5, 37,620 features, 8 layers, aux belief,
+  W = 1,024) on 4,096 rows of the held-out shard r3-2b_iter0197fresh (value-only rows as stored, a belief copy
+  after every 8th leaf row): **every packing passes**, worst ORT-vs-torch difference 1.5e-5 (eoe1's margin;
+  priors <= 4.6e-6). Against a float64 forward the ORT answers are as close as torch's own (eoe1 margin, 64 rows:
+  ORT 4.6e-6, torch 9.9e-6): the ORT-torch difference is two float32 roundings, not an error of either.
+* *Speed* (leaves/s, from the sparse rows to an evaluator's answer; 1 thread, the least disturbed measurement):
+
+  | net | B | torch eager | ORT mask | ORT compact | ORT packed | ORT packed, 64-row chunks |
+  |---|---|---|---|---|---|---|
+  | eoe1 | 16 | 535 | 92 | 567 | 719 | 683 |
+  | eoe1 | 64 | 515 | 76 | 468 | 716 | 642 |
+  | eoe1 | 256 | 818 | 82 | 419 | 570 | 874 |
+  | Delver deep8 | 16 | 466 | 50 | 485 | 784 | 592 |
+  | Delver deep8 | 64 | 273 | 41 | 180 | 453 | 461 |
+  | Delver deep8 | 256 | 498 | 40 | 143 | 335 | 575 |
+
+  A second run (torch and `packed` only, 12 calls per cell, the CPU 96-100% busy) gave 0.90-1.49x torch eager at
+  1 thread: over both runs `packed` (with the 64-row chunks at 256 rows) is 1.09-1.69x torch eager for 16-64 rows
+  and 0.90-1.26x at 256 rows, where the eager evaluator already sorts rows into 64-row chunks. With 4 and 8
+  intra-op threads ORT scales (eoe1, 64 rows, packed: 716 -> 1,095 -> 1,932) while torch's eager evaluator
+  collapses on the saturated machine (section 7; 515 -> 121 -> 91). `mask` computes all 170 tokens
+  (the rows hold 15-22 on average): 5-10x slower. `compact` and `host` pad every row to the batch's longest and
+  are 1.3-2.5x slower than `packed`; the host's packing itself costs 0.2-1.6 ms per batch (numpy). Session load
+  0.2-0.4 s; the files 13.4 MB (eoe1) and 9.7 MB (Delver), the checkpoints' size.
+
+**Problems met** (each handled in the code; zero-farm docs/phase0a-onnx.md has the details): the data-dependent
+T needs `.item()` + `torch._check` (and T >= 2, or the attention's broadcast check cannot be decided); slicing
+`x_ptr[1:-1]` made the tracer guard B >= 3 (the row ends `x_ptr[1:]` do not); **ONNX Runtime's CPU ScatterND with
+`reduction='add'` races on duplicate indices with several threads** (lost updates: wrong sums at 8 threads,
+measured) - `index_add` / `index_put(accumulate=True)` must not appear in an export (the packed pooling goes
+through the padded rows), which is why the gate runs every case twice; an absolute tolerance only means
+something for outputs of order 1 (a test network with large random weights gets margins of ~170 and Poisson
+rates of 1e6, whose float32 rounding alone exceeds 2e-5 in torch and ORT alike).
+
+**Tests and checks.** `tests/test_onnx.py` (16): the in-graph densify against protocol.densify (torch and ORT,
+empty rows, 4 threads, repeated); a token network in each packing (plain and id_actions layouts) through the gate
+on batches of 1-150 rows with NaN in absent slots; a reader declared `belief` plus a head widened by a Poisson
+target on a token, an MLP and a conv network; a network without the head (aux [B, 0]); the interface's names,
+dtypes, dynamic dimensions and metadata; real toy games driven through the graph (sparse driver batches with
+value-only and belief rows, every answer validated and within 2e-5 of eager).

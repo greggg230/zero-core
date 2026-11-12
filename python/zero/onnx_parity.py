@@ -405,7 +405,7 @@ def main(argv=None):
     paths, export_s = {}, {}
     for p in packs:
         path = os.path.join(d, f'{stem}.{p}.onnx')
-        if not (a.reuse and os.path.exists(path) and _meta(path).get('checkpoint_sha256') == info['checkpoint_sha256']):
+        if not (a.reuse and os.path.exists(path) and read_metadata(path).get('checkpoint_sha256') == info['checkpoint_sha256']):
             t0 = time.perf_counter()
             OX.export(model, path, p if p != 'none' else 'mask', info)
             export_s[p] = round(time.perf_counter() - t0, 1)
@@ -424,7 +424,7 @@ def main(argv=None):
     return 0 if ok else 1
 
 
-def _meta(path):
+def read_metadata(path):
     import onnx
     m = onnx.load(path, load_external_data=False)
     return {p.key: p.value for p in m.metadata_props}

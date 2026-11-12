@@ -33,7 +33,7 @@ opset, exporter, torch.
 
 How a token network (`net.TokenNet`) packs its objects inside the graph (`packing`):
 
-* 'mask' (default): every slot of the full token axis is a token (the global token and all 170 of MTG
+* 'mask': every slot of the full token axis is a token (the global token and all 170 of MTG
   Zero's slots, as `forward_static` embeds them), the absent ones masked out of the attention (as
   keys) and of the pooling, their pointer logits sent to the dummy column. Static shapes but B: the
   worker needs nothing but the interface.
@@ -43,7 +43,7 @@ How a token network (`net.TokenNet`) packs its objects inside the graph (`packin
 * 'packed': in-graph compaction without padding: the batch's N present tokens as one list [N, d]
   (NonZero over the presence) for every per-token layer (LayerNorms, the projections, the MLPs, the
   pointer head: 2-D Gemms), only the attention and the pooling on the rows padded to T (gathered in,
-  scattered back). The same interface; the fastest on the CPU (docs/az.md 41).
+  scattered back). The same interface; the default: the fastest on the CPU (docs/az.md 41).
 * 'host': `forward_static`'s signature kept as two more inputs, `tok_full` i64 [B, T] and `tok_n` i64
   [B] (`infer.token_presence` / `token_index`, packed by the caller; metadata `present_index`). Not
   architecture-agnostic (the worker would carry TokenNet's packing): measured, not recommended
@@ -185,8 +185,9 @@ def _row_tokens(pres, n_tok):
 def _trunk_packed(net, h, pres, ids):
     """`TokenNet._trunk` with the tokens packed (in-graph compaction without padding): the per-token layers
     (LayerNorms, the attention's projections, the MLPs, the pointer head) run on the batch's N present tokens
-    [N, d] (row-major, each row's in layout order), only the attention itself on the rows padded to the
-    longest (gathered in, scattered back). -> (z [B, 2 d], logits [B, actions + 1])."""
+    [N, d] (row-major, each row's in layout order), only the attention and the pooling on the rows padded to
+    the longest (gathered in, gathered back). N >= 2 is assumed while tracing (MTG Zero's rows hold the global
+    and the context token: N >= 2 B); the graph keeps no such guard. -> (z [B, 2 d], logits [B, actions + 1])."""
     B, NT, D = h.shape
     flat = pres.reshape(-1)
     sel = torch.nonzero(flat).squeeze(1)                          # [N] the present tokens, row-major
@@ -238,7 +239,7 @@ class ZeroOnnx(nn.Module):
     """A network behind the zero-onnx/1 interface (module docstring): `forward(x_ptr, x_idx, x_val,
     n_players, belief[, tok_full, tok_n])` -> (policy, value, margin, aux)."""
 
-    def __init__(self, net, packing='mask'):
+    def __init__(self, net, packing='packed'):
         super().__init__()
         self.net = net
         self.tokens = isinstance(net, TokenNet)
@@ -346,7 +347,7 @@ def metadata(net, packing, extra=None):
     return meta
 
 
-def export(net, path, packing='mask', extra=None, opset=OPSET):
+def export(net, path, packing='packed', extra=None, opset=OPSET):
     """Export `net` (a TokenNet, GridNet or Net, as loaded: `net.load` / `load_checkpoint`) to the ONNX
     file `path` (zero-onnx/1; one file, no external data; written atomically) -> its metadata. `packing`:
     a token network's ('mask', 'compact', 'host'; module docstring), ignored for the others. `extra`:
@@ -396,7 +397,7 @@ def load_checkpoint(path, game=None, allow_mismatch=False):
     return m, info
 
 
-def export_checkpoint(path, out, packing='mask', game=None, allow_mismatch=False, checkpoint_id=None):
+def export_checkpoint(path, out, packing='packed', game=None, allow_mismatch=False, checkpoint_id=None):
     """`load_checkpoint` + `export` -> the metadata written. `checkpoint_id`: the id the run publishes
     the checkpoint under (default its file name)."""
     m, info = load_checkpoint(path, game, allow_mismatch)
@@ -410,7 +411,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description='Export a checkpoint to a zero-onnx/1 ONNX graph (docs/az.md 41).')
     ap.add_argument('checkpoint')
     ap.add_argument('out')
-    ap.add_argument('--packing', default='mask', choices=PACKINGS)
+    ap.add_argument('--packing', default='packed', choices=PACKINGS)
     ap.add_argument('--game', default=None)
     ap.add_argument('--id', default=None, help='the checkpoint id in the metadata (default: its file name)')
     ap.add_argument('--allow-mismatch', action='store_true',
