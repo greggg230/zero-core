@@ -209,7 +209,7 @@ def compare(a_path, b_path):
 def compare_worker(path, worker):
     with open(path, encoding='utf-8') as f:
         a = json.load(f)
-    bad = same = skipped = 0
+    bad = same = skipped = unsupported = 0
     for name, r in sorted(a.items()):
         want = r.get('selfplay_remote')
         if want is None or 'cfg' not in r:
@@ -223,10 +223,16 @@ def compare_worker(path, worker):
             same += 1
         elif got == want:
             same += 1
+        elif got.startswith('ERROR') and 'unsupported by the native worker' in got:
+            # a Python-only feature (the league, branched games, archive starts): refused by design, and
+            # check-config lists it
+            unsupported += 1
+            print(f'worker refuses (Python-only feature)  {name}: {got}')
         else:
             bad += 1
             print(f'DIFFERENT {name} (python vs worker):\n--- python\n{want}\n--- worker\n{got}')
-    print(f'{same} cases agree (built or both refused), {bad} different, {skipped} without a self-play driver')
+    print(f'{same} cases agree (built or both refused), {unsupported} refused by the worker as Python-only, {bad} '
+          f'different, {skipped} without a self-play driver')
     return 1 if bad else 0
 
 

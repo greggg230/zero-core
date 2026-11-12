@@ -66,8 +66,10 @@ pub struct Verdict {
     pub why: String,
 }
 
-/// Every setting of `c` for a worker of `info`'s game.
-pub fn classify(c: &Settings, info: &GameInfo) -> Result<Vec<Verdict>, String> {
+/// Every setting of `c` for a worker of `info`'s game; `others`: the other games the worker build
+/// registers (a game package's settings `aux_<t>_w` / `reader_<t>` exist for every game's targets:
+/// another game's are harmless while off - Python ignores them - and refused when on).
+pub fn classify(c: &Settings, info: &GameInfo, others: &[GameInfo]) -> Result<Vec<Verdict>, String> {
     let (keys, pats) = table()?;
     let mut out = Vec::new();
     let null = PyJson::Null;
@@ -80,7 +82,14 @@ pub fn classify(c: &Settings, info: &GameInfo) -> Result<Vec<Verdict>, String> {
                 info.aux.iter().any(|a| a.0 == t).then(|| (cl.clone(), format!("{why} (target {t:?})")))
             })
         });
+        let other = || {
+            pats.iter().find_map(|(pre, suf, _, _)| {
+                let t = k.strip_prefix(pre.as_str())?.strip_suffix(suf.as_str())?;
+                others.iter().find(|g| g.aux.iter().any(|a| a.0 == t)).map(|g| format!("a setting of {:?}'s auxiliary target {t:?}, which {} has not (Python ignores it)", g.name, info.name))
+            })
+        };
         let (status, why) = match found {
+            None if other().is_some() => (if truthy(v) { "unsupported" } else { "off" }, other().unwrap()),
             None => ("unknown", format!("not a zero-core run setting of this build, nor an auxiliary target setting of {} ({:?})", info.name, info.aux.iter().map(|a| a.0).collect::<Vec<_>>())),
             Some((Class::Play, w)) => ("play", w),
             Some((Class::Trainer, w)) => ("trainer", w),
@@ -132,9 +141,13 @@ mod tests {
     fn verdicts() {
         let info = GameInfo { name: "t", num_actions: 2, num_features: 2, min_players: 2, max_players: 2, bots: vec![], aux: vec![("deck", 3)] };
         let c = Settings::parse(r#"{"game": "t", "sims": 4, "lr": 0.1, "selfplay_league": 0.0, "selfplay_league_pool": "2,4", "resolver": "x", "aux_deck_w": 0.5, "reader_deck": 1, "aux_hand_w": 1, "bogus": 1}"#).unwrap();
-        let v = classify(&c, &info).unwrap();
+        let other = GameInfo { name: "o", num_actions: 2, num_features: 2, min_players: 2, max_players: 2, bots: vec![], aux: vec![("hand", 3)] };
+        let v = classify(&c, &info, &[other.clone()]).unwrap();
         let st: Vec<(&str, &str)> = v.iter().map(|x| (x.key.as_str(), x.status)).collect();
-        assert_eq!(st, vec![("game", "play"), ("sims", "play"), ("lr", "trainer"), ("selfplay_league", "off"), ("selfplay_league_pool", "off"), ("resolver", "unsupported"), ("aux_deck_w", "play"), ("reader_deck", "trainer"), ("aux_hand_w", "unknown"), ("bogus", "unknown")]);
+        assert_eq!(st, vec![("game", "play"), ("sims", "play"), ("lr", "trainer"), ("selfplay_league", "off"), ("selfplay_league_pool", "off"), ("resolver", "unsupported"), ("aux_deck_w", "play"), ("reader_deck", "trainer"), ("aux_hand_w", "unsupported"), ("bogus", "unknown")]);
         assert_eq!(failures(&v).len(), 3);
+        let c = Settings::parse(r#"{"game": "t", "aux_hand_w": 0.0, "aux_cards_w": 0.0}"#).unwrap();
+        let st: Vec<&str> = classify(&c, &info, &[other]).unwrap().iter().map(|x| x.status).collect();
+        assert_eq!(st, vec!["play", "off", "unknown"]);
     }
 }

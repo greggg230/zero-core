@@ -424,7 +424,8 @@ fn check_config(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     let s = read_settings(path)?;
     let game = game_of(games, &s)?;
     let info = (game.info)();
-    let v = classify::classify(&s, &info)?;
+    let others: Vec<_> = games.iter().filter(|g| g.name != game.name).map(|g| (g.info)()).collect();
+    let v = classify::classify(&s, &info, &others)?;
     let bad = classify::failures(&v);
     // the settings must also build the driver (the Python remote worker's checks)
     let built = crate::settings::selfplay_driver_cfg(&s, &info, 0, 0).err();
