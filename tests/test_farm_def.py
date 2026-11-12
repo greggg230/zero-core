@@ -98,6 +98,7 @@ def test_versions_the_archive_and_publishing(tmp_path, monkeypatch, capsys):
     assert calls[-1]['argv'] == ['define', info['path'], '--key', stub['key'], '--publish', '--url', 'http://fake']
     assert calls[-1]['token_ok'] and TOKEN not in json.dumps(calls)
     assert STUB.current(stub['state'], 'campaign', 'cmp')['version'] == 1
+    assert FD.published_to(info['path'], 'http://fake') and not FD.published_to(info['path'], 'http://other')
     # the next one: 2; the archive keeps both, each under its version, never rewritten with other bytes
     info2 = FD.prepare(cl, 'campaign', 'cmp', 'mtg', [R], None, None, jobs, now=2001)
     assert info2['version'] == 2 and FD.local_versions('campaign', 'cmp') == [1, 2]
@@ -124,7 +125,7 @@ def test_versions_the_archive_and_publishing(tmp_path, monkeypatch, capsys):
     info4 = FD.prepare(cl, 'campaign', 'cmp', 'mtg', [B], None, None, jobs, now=2003)
     with pytest.raises(SystemExit) as e:
         FD.publish(cl, info4)
-    assert 'boom: the coordinator refused it' in str(e.value)
+    assert 'boom: the coordinator refused it' in str(e.value) and not FD.published_to(info4['path'], 'http://fake')
     monkeypatch.delenv('FARM_STUB_FAIL')
     FD.publish(cl, info4)
     err = capsys.readouterr().err

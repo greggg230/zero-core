@@ -501,4 +501,22 @@ def publish(client, info, key=None, farm_release=None, log=None):
                          f'{info["sha256"][:16]})')
     log(f'definition {info["kind"]}/{info["id"]} version {info["version"]} signed and published ({info["sha256"][:16]}, '
         f'expires {"never" if info["expires"] is None else time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(info["expires"]))})')
+    mark = {'url': client.url, 'version': info['version'], 'sha256': info['sha256'], 't': int(time.time())}
+    with open(published_path(info['path']), 'w', encoding='utf-8', newline='\n') as f:
+        json.dump(mark, f)
     return dict(info, published=True)
+
+
+def published_path(path):
+    """The marker `publish` leaves next to a definition it published (url, version, sha256, t)."""
+    return os.path.join(os.path.dirname(path), 'published.json')
+
+
+def published_to(path, url):
+    """Was the kept definition at `path` published to the coordinator at `url` (by `publish`, these bytes)?"""
+    try:
+        with open(published_path(path), encoding='utf-8') as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return m.get('url') == url.rstrip('/') and m.get('sha256') == file_sha256(path)
