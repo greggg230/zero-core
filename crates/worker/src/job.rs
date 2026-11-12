@@ -698,6 +698,9 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let hi = job.gid_base + job.games as u32;
     let mut stats = p.stats();
     stats["peak_rss_mb"] = json!(peak_rss_mb());
+    // (games after the last shard that had no samples - an aborted game -: in no shard's `games`; the remote
+    // worker's 'unshipped')
+    stats["unshipped"] = json!(writer.pending_games());
     stats["seconds"] = json!((t0.elapsed().as_secs_f64() * 100.0).round() / 100.0);
     Ok(Outcome { reason, stats, unfinished: missing_ranges(lo, hi, &p.finished_gids), shards: writer.written })
 }
