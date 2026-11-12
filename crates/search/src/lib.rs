@@ -14,12 +14,15 @@
 //! * `lookahead`: the exhaustive lookahead per information set (docs/search.md 3.9; a seat's opt-in
 //!   `lookahead`), its rows batched through the driver like MCTS leaves.
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
+//! * `settings`: the driver's settings from JSON - seats, branch, starts, a whole `DriverCfg` (the one
+//!   parser the bindings and native workers share; docs/search.md 4.1).
 pub mod driver;
 pub mod dynapi;
 pub mod game;
 pub mod lookahead;
 pub mod noise;
 pub mod rng;
+pub mod settings;
 pub mod toy;
 pub mod toy_team;
 pub mod tree;

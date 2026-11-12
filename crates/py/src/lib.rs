@@ -20,9 +20,11 @@ use std::sync::OnceLock;
 use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyString, PyTuple};
+use serde_json::{Map, Value};
 
-use zero_search::driver::{noresign_pick, root_floor, sample_arrays, view_pick, Batch, BranchCfg, DriverCfg, KeyKind, StartsCfg, LeafView, NnSeat, PolicyTarget, Record, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{noresign_pick, root_floor, sample_arrays, view_pick, Batch, DriverCfg, Record, Select, BELIEF_CLIP};
+use zero_search::settings::{self, DriverArgs};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
 use zero_search::lookahead::{LookCfg, Outcome};
 use zero_search::{SearchGame, MAX_SEATS};
@@ -141,186 +143,69 @@ fn spec_json(spec: Option<&Bound<'_, PyAny>>) -> PyResult<String> {
     }
 }
 
-fn get<'py, T: FromPyObject<'py>>(d: &Bound<'py, PyDict>, k: &str, default: T) -> PyResult<T> {
-    match d.get_item(k)? {
-        Some(v) if !v.is_none() => v.extract(),
-        _ => Ok(default),
+/// A Python value as JSON for the shared settings parser (`zero_search::settings`): None, bool, str,
+/// int, float (finite: JSON has no NaN / inf), list / tuple, dict with string keys; an int-like
+/// (`__index__`, e.g. numpy's) as an integer, a float-like as a float. Another type is an error.
+fn to_json(v: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if v.is_none() {
+        return Ok(Value::Null);
     }
+    if let Ok(b) = v.downcast::<PyBool>() {
+        return Ok(Value::Bool(b.is_true()));
+    }
+    if let Ok(s) = v.downcast::<PyString>() {
+        return Ok(Value::String(s.to_str()?.to_owned()));
+    }
+    if let Ok(d) = v.downcast::<PyDict>() {
+        let mut m = Map::new();
+        for (k, x) in d.iter() {
+            let k: String = k.extract().map_err(|_| PyValueError::new_err(format!("a setting's name is a string, not {}", k.repr().map_or_else(|_| "?".into(), |r| r.to_string()))))?;
+            m.insert(k, to_json(&x)?);
+        }
+        return Ok(Value::Object(m));
+    }
+    if v.downcast::<PyList>().is_ok() || v.downcast::<PyTuple>().is_ok() {
+        return v.try_iter()?.map(|x| to_json(&x?)).collect::<PyResult<Vec<_>>>().map(Value::Array);
+    }
+    let float = |f: f64| serde_json::Number::from_f64(f).map(Value::Number).ok_or_else(|| PyValueError::new_err(format!("setting value {f}: not a finite number (JSON has no NaN / inf)")));
+    if v.downcast::<PyFloat>().is_ok() {
+        return float(v.extract::<f64>()?);
+    }
+    if let Ok(i) = v.extract::<i64>() {
+        return Ok(Value::from(i));
+    }
+    if let Ok(u) = v.extract::<u64>() {
+        return Ok(Value::from(u));
+    }
+    if let Ok(f) = v.extract::<f64>() {
+        return float(f);
+    }
+    Err(PyValueError::new_err(format!("setting value {}: not a JSON value (None, bool, str, int, float, list, dict)", v.repr().map_or_else(|_| "?".into(), |r| r.to_string()))))
 }
 
-/// The seat key `belief_tilts` ({target: alpha}, docs/search.md 3.8.1): sorted by name; absent or None:
-/// none.
-fn belief_tilts_of(d: &Bound<'_, PyDict>) -> PyResult<Vec<(String, f64)>> {
-    match d.get_item("belief_tilts")? {
-        Some(v) if !v.is_none() => {
-            let m: std::collections::BTreeMap<String, f64> =
-                v.extract().map_err(|_| PyValueError::new_err("belief_tilts: a dict {target: alpha}"))?;
-            Ok(m.into_iter().collect())
-        }
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
-    match d.get_item(k)? {
-        Some(v) if !v.is_none() => v.is_truthy(),
-        _ => Ok(default),
-    }
-}
-
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "belief_tilts", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge", "value_choice_worlds", "value_choice_temp"];
-
-fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
-    match keys.iter().position(|k| k.0 == name) {
-        Some(i) if keys[i].1 == kind => Ok(i as u16),
-        Some(_) => Err(PyValueError::new_err(format!("evaluator key {name:?} used for both a network and an external seat"))),
-        None => {
-            keys.push((name, kind));
-            Ok((keys.len() - 1) as u16)
+/// `starts` as JSON with each entry's spec as Python gave it to the game since the beginning
+/// (`spec_json`: a string as it is, None "{}", a dict `json.dumps`'d - its key order and spacing
+/// kept); anything else as it is (the parser says what is wrong).
+fn starts_json(d: &Bound<'_, PyDict>) -> PyResult<Value> {
+    let mut m = Map::new();
+    for (k, x) in d.iter() {
+        let k: String = k.extract().map_err(|_| PyValueError::new_err("starts: a setting's name is a string"))?;
+        if k == "specs" && x.downcast::<PyString>().is_err() {
+            let mut list = Vec::new();
+            for e in x.try_iter()? {
+                let e = e?;
+                let pair = (e.downcast::<PyTuple>().is_ok() || e.downcast::<PyList>().is_ok()).then(|| e.extract::<(String, Bound<'_, PyAny>)>().ok()).flatten();
+                list.push(match pair {
+                    Some((id, sp)) => Value::Array(vec![Value::String(id), Value::String(spec_json(Some(&sp))?)]),
+                    None => to_json(&e)?,
+                });
+            }
+            m.insert(k, Value::Array(list));
+        } else {
+            m.insert(k, to_json(&x)?);
         }
     }
-}
-
-/// `branch` dict {p, moves, temp, differ} (docs/search.md 2.11; another key is an error).
-fn parse_branch(d: &Bound<'_, PyDict>) -> PyResult<BranchCfg> {
-    for k in d.keys() {
-        let k: String = k.extract()?;
-        if !["p", "moves", "temp", "differ"].contains(&k.as_str()) {
-            return Err(PyValueError::new_err(format!("branch: unknown key {k:?} (p, moves, temp, differ)")));
-        }
-    }
-    let p: f64 = d.get_item("p")?.ok_or_else(|| PyValueError::new_err("branch: p (the share of games that branch) is required"))?.extract()?;
-    let b = BranchCfg { p, moves: get(d, "moves", 3u32)?, temp: get(d, "temp", 2.0f64)?, differ: flag(d, "differ", false)? };
-    b.check().map_err(PyValueError::new_err)?;
-    Ok(b)
-}
-
-/// `starts` dict {p, specs: [(id, spec JSON or dict), ...]} (docs/search.md 2.11).
-fn parse_starts(d: &Bound<'_, PyDict>) -> PyResult<StartsCfg> {
-    for k in d.keys() {
-        let k: String = k.extract()?;
-        if !["p", "specs"].contains(&k.as_str()) {
-            return Err(PyValueError::new_err(format!("starts: unknown key {k:?} (p, specs)")));
-        }
-    }
-    let p: f64 = d.get_item("p")?.ok_or_else(|| PyValueError::new_err("starts: p (the share of games started from the archive) is required"))?.extract()?;
-    let list = d.get_item("specs")?.ok_or_else(|| PyValueError::new_err("starts: specs ([(id, spec), ...]) is required"))?;
-    let mut specs = Vec::new();
-    for e in list.try_iter()? {
-        let e = e?;
-        let (id, sp): (String, Bound<'_, PyAny>) = e.extract().map_err(|_| PyValueError::new_err("starts: each entry is (id, spec)"))?;
-        specs.push((id, spec_json(Some(&sp))?));
-    }
-    let c = StartsCfg { p, specs };
-    c.check().map_err(PyValueError::new_err)?;
-    Ok(c)
-}
-
-/// Seat dict: {'bot': name} | {'external': key} | network seat settings (SEAT_KEYS).
-fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyResult<SeatCfg> {
-    if let Some(b) = d.get_item("bot")? {
-        return Ok(SeatCfg::Bot(b.extract()?));
-    }
-    if let Some(e) = d.get_item("external")? {
-        return Ok(SeatCfg::External(key_index(keys, e.extract()?, KeyKind::External)?));
-    }
-    for k in d.keys() {
-        let k: String = k.extract()?;
-        if !SEAT_KEYS.contains(&k.as_str()) {
-            return Err(PyValueError::new_err(format!("seat: unknown setting {k:?} (bot, external, {SEAT_KEYS:?})")));
-        }
-    }
-    let key = key_index(keys, get(d, "key", "m".to_string())?, KeyKind::Nn)?;
-    let sims_fast: Option<u32> = match d.get_item("sims_fast")? {
-        Some(v) if !v.is_none() => Some(v.extract()?),
-        _ => None,
-    };
-    let sims_minor: Option<u32> = match d.get_item("sims_minor")? {
-        Some(v) if !v.is_none() => Some(v.extract()?),
-        _ => None,
-    };
-    // training target of recorded decisions: 'visits' (default) | 'cq' (docs/search.md 3.1)
-    let (cq_c_visit, cq_c_scale) = (get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?);
-    let policy_target = PolicyTarget::parse(&get(d, "policy_target", "visits".to_string())?, cq_c_visit, cq_c_scale).map_err(verr)?;
-    // the prior's exponent beta in the 'cq' target (docs/search.md 3.13; absent: 1.0, the target of before)
-    let policy_target = policy_target.with_prior_w(get(d, "cq_prior_w", 1.0f64)?).map_err(verr)?;
-    let select: String = get(d, "select", "visits".to_string())?;
-    for k in ["select_c_visit", "select_c_scale"] {
-        if select == "visits" && matches!(d.get_item(k)?, Some(v) if !v.is_none()) {
-            return Err(PyValueError::new_err(format!("{k}: a setting of select 'cq' ('visits' has no completed-Q transform)")));
-        }
-    }
-    // the root search: 'puct' (default) | 'gumbel' with its settings (docs/search.md 3.7; sigma's
-    // transform absent: the seat's cq_c_visit, cq_c_scale)
-    let root_search: String = get(d, "root_search", "puct".to_string())?;
-    for k in ["gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale"] {
-        if root_search != "gumbel" && matches!(d.get_item(k)?, Some(v) if !v.is_none()) {
-            return Err(PyValueError::new_err(format!("{k}: a setting of root_search 'gumbel'")));
-        }
-    }
-    let root_search = RootSearch::parse(&root_search, get(d, "gumbel_m", 16u32)?, get(d, "gumbel_scale", 1.0f64)?, get(d, "gumbel_c_visit", cq_c_visit)?, get(d, "gumbel_c_scale", cq_c_scale)?).map_err(verr)?;
-    // the exhaustive lookahead (docs/search.md 3.9): a dict of its settings (or their JSON), None = off
-    let look = match d.get_item("lookahead")? {
-        Some(v) if !v.is_none() => Some(Box::new(LookCfg::parse(&spec_json(Some(&v))?).map_err(verr)?)),
-        _ => None,
-    };
-    Ok(SeatCfg::Nn(NnSeat {
-        key,
-        sims: get(d, "sims", 100u32)?,
-        c_puct: get(d, "c_puct", 1.0f64)?,
-        selfplay: flag(d, "selfplay", false)?,
-        alpha: get(d, "alpha", 0.3f64)?,
-        eps: get(d, "eps", 0.25f64)?,
-        temp_moves: get(d, "temp_moves", 30u32)?,
-        sims_fast,
-        p_full: get(d, "p_full", 1.0f64)?,
-        sims_minor,
-        chance_k: get(d, "chance_k", 0u32)?,
-        margin_w: get(d, "margin_w", 0.0f64)?,
-        redet: flag(d, "redet", true)?,
-        policy_target,
-        // the rule of the moves it does not sample: 'visits' (default) | 'cq' with the guard
-        // select_min_visits and the completed-Q transform select_c_visit, select_c_scale (absent:
-        // the target's cq_c_visit, cq_c_scale; docs/search.md 3.3)
-        select: Select::parse(&select, get(d, "select_min_visits", 0u32)?, get(d, "select_c_visit", cq_c_visit)?, get(d, "select_c_scale", cq_c_scale)?).map_err(verr)?,
-        // whether its full searches are recorded (absent: true; false: a league opponent, a
-        // past checkpoint whose moves are not the current policy's, docs/az.md 14)
-        record: flag(d, "record", true)?,
-        // root minimum visits of its full searches (0 = off) on roots of up to
-        // root_min_visits_max_actions options (docs/search.md 3.5)
-        root_min_visits: get(d, "root_min_visits", 0u32)?,
-        root_min_visits_max_actions: get(d, "root_min_visits_max_actions", 4u32)?,
-        // whose view a leaf's value comes from: 'mover' (default) | 'root' (docs/search.md 3.6)
-        leaf_value_view: LeafView::parse(&get(d, "leaf_value_view", "mover".to_string())?).map_err(verr)?,
-        // value-only samples: a share of the recorded decisions (0 = off) and their q target
-        view_samples: get(d, "view_samples", 0.0f64)?,
-        view_target: ViewTarget::parse(&get(d, "view_sample_target", "next_q".to_string())?).map_err(verr)?,
-        // the root's belief (docs/search.md 3.8): its tilt (0 = off), clip, uniform share, and
-        // whether fast and minor searches take it too
-        belief_tilt: get(d, "belief_tilt", 0.0f64)?,
-        belief_clip: get(d, "belief_clip", BELIEF_CLIP)?,
-        belief_mix: get(d, "belief_mix", 0.0f64)?,
-        belief_fast: flag(d, "belief_fast", false)?,
-        // per-target tilts of the root's belief ({target: alpha}, docs/search.md 3.8.1; absent: none),
-        // sorted by name; checked against the game's targets by the driver
-        belief_tilts: belief_tilts_of(d)?,
-        root_search,
-        look,
-        // the game's evaluation cache: at most this many answers per game (0 = off; docs/search.md 3.12)
-        eval_cache: get(d, "eval_cache", 0u32)?,
-        // self-play resignation (docs/search.md 3.14): the threshold t (0 = off), the consecutive decided
-        // full searches k, the share of games that never resign (checked by the driver)
-        resign_t: get(d, "resign_t", 0.0f64)?,
-        resign_k: get(d, "resign_k", 5u32)?,
-        resign_noresign: get(d, "resign_noresign", 0.1f64)?,
-        // information-set merging (docs/search.md 3.16; absent: false, the tree of before; checked by the driver:
-        // root-view leaf values, an evaluation seat)
-        infoset_merge: flag(d, "infoset_merge", false)?,
-        // value choices (docs/search.md 3.17; absent: 0 worlds, off): the worlds that value each option of a
-        // decision the game marks, and the temperature of the choice (0: the best mean value)
-        value_choice_worlds: get(d, "value_choice_worlds", 0u32)?,
-        value_choice_temp: get(d, "value_choice_temp", 0.0f64)?,
-    }))
+    Ok(Value::Object(m))
 }
 
 fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>> {
@@ -812,28 +697,15 @@ impl PySearchTree {
 #[allow(clippy::too_many_arguments)]
 fn driver_cfg(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>) -> PyResult<DriverCfg> {
     let spec = spec_json(spec)?;
-    let mut keys = Vec::new();
-    let mut table: Vec<SeatCfg> = Vec::new();
     let mut games = Vec::with_capacity(seats.len());
     for g in seats.iter() {
         let row: Vec<Bound<'_, PyDict>> = g.extract()?;
-        let mut ix = Vec::with_capacity(row.len());
-        for s in row {
-            let sc = parse_seat(&s, &mut keys)?;
-            let i = match table.iter().position(|x| *x == sc) {
-                Some(i) => i,
-                None => {
-                    table.push(sc);
-                    table.len() - 1
-                }
-            };
-            ix.push(i as u16);
-        }
-        games.push(ix);
+        games.push(row.iter().map(|s| to_json(s.as_any())).collect::<PyResult<Vec<_>>>()?);
     }
-    let branch = branch.map(parse_branch).transpose()?;
-    let starts = starts.map(parse_starts).transpose()?;
-    Ok(DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts })
+    let branch = branch.map(|b| to_json(b.as_any())).transpose()?;
+    let starts = starts.map(starts_json).transpose()?;
+    let args = DriverArgs { spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse };
+    settings::driver_cfg(&games, branch.as_ref(), starts.as_ref(), args).map_err(verr)
 }
 
 /// The driver settings `SearchDriver(game, seats, ...)` would be built with, as the Rust `DriverCfg`'s
