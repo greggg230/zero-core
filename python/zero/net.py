@@ -638,6 +638,7 @@ class _WeightedAttention(torch.autograd.Function):
     math ran ~25 nodes: docs/az.md 43.9)."""
 
     @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(ctx, q, k, v, w4, pad3):
         B, H, T, dh = q.shape
         scale = 1.0 / math.sqrt(dh)
@@ -655,6 +656,7 @@ class _WeightedAttention(torch.autograd.Function):
         return out.view(B, H, T, dh)
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, dO):
         q3, k3, v3, e, p, Z, out = ctx.saved_tensors
         B, H, T, dh, scale = ctx.dims
@@ -679,6 +681,7 @@ class _TailEmbed(torch.autograd.Function):
     identity embedding's weight, then the K tail segments' input-map weights, their biases, their position maps."""
 
     @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
     def forward(ctx, val, psi, tk, ids, sel, w_index, Wt, tail_base, emb_w, *params):
         K = len(params) // 3
         d = tail_base.shape[1]
@@ -700,6 +703,7 @@ class _TailEmbed(torch.autograd.Function):
         return t
 
     @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, G):
         K, d, Wt, nid, wshapes, nemb = ctx.meta
         val, psi, tk, w_index, *rest = ctx.saved_tensors
@@ -1045,8 +1049,9 @@ class TokenNet(nn.Module):
         are one-hot or empty (what an encoder writes; each product then sums one exact term per digit)."""
         tab = self._digit_tables(idspec, sl.device, sl.dtype)
         blk = sl[:, idspec['at']:idspec['at'] + tab[0].shape[0]]
-        dig = (blk @ tab[0]).round().long()
-        ok = ((blk @ tab[1]) > 0.5).all(1)
+        with torch.autocast(sl.device.type, enabled=False):      # (the products in the rows' float32 under amp)
+            dig = (blk @ tab[0]).round().long()
+            ok = ((blk @ tab[1]) > 0.5).all(1)
         idx = (dig * tab[2]).sum(1)
         return torch.where(ok & (idx < self.vocab), idx, torch.full_like(idx, self.vocab))
 
@@ -1376,8 +1381,9 @@ class TokenNet(nn.Module):
             r, a, p, gc, isg, bw, isgen = ov
             v, g0 = P[r, p, gc], gen[r, a]
             if isg is not None:
-                # gen + min(g, 1) (ptr - gen) as torch.lerp: exactly gen at 0 and exactly ptr at 1
-                v = torch.where(isg, torch.lerp(g0, v, bw), v)
+                # gen + min(g, 1) (ptr - gen) as torch.lerp, in the gates' float32 and cast back: exactly gen at 0 and
+                # exactly ptr at 1 in every dtype (autocast's bfloat16 / float16 logits are exact in float32)
+                v = torch.where(isg, torch.lerp(g0.float(), v.float(), bw.float()).to(v.dtype), v)
             pc = pc.index_put((r, a), torch.where(isgen, g0, v))
         return zc, pc
 
@@ -1416,8 +1422,8 @@ class TokenNet(nn.Module):
             nr = n[r]
             Tc = int(nr.max())
             zc, pc = self._trunk(h[r, :Tc], nr, full[r, :Tc], idt[r, :Tc] if self.n_id else None)
-            z = z.index_copy(0, r, zc)
-            pol = pol.index_copy(0, r, pc)
+            z = z.index_copy(0, r, zc.to(z.dtype))
+            pol = pol.index_copy(0, r, pc.to(pol.dtype))
         return self._heads(z, pol, n_players, aux, aux_rows, rraw)
 
     def _forward_ext(self, x, n_players, aux, aux_rows, tail, ov, NT, NO):
@@ -1436,7 +1442,7 @@ class TokenNet(nn.Module):
         explicit = False
         if self.gated and NT:
             gi = self.seg_gi[tail['seg']]
-            tw = (torch.arange(T, device=dev)[None, :] < n[:, None]).to(h.dtype)
+            tw = (torch.arange(T, device=dev)[None, :] < n[:, None]).to(self.gate.dtype)
             tw = tw.index_put((tail['row'], tpos), self._tail_weight(tail['seg']))
             tg = torch.zeros(B, T, dtype=torch.bool, device=dev).index_put((tail['row'], tpos), gi >= 0)
             explicit = self._explicit(gi)
@@ -1462,8 +1468,8 @@ class TokenNet(nn.Module):
                 if len(sel):
                     ext['ov'] = (opos[sel] - c0,) + tuple(None if t is None else t[sel] for t in ovx[1:])
             zc, pc = self._trunk(h[r, :Tc], nr, full[r, :Tc], idt[r, :Tc] if self.n_id else None, ext)
-            z = z.index_copy(0, r, zc)
-            pol = pol.index_copy(0, r, pc)
+            z = z.index_copy(0, r, zc.to(z.dtype))
+            pol = pol.index_copy(0, r, pc.to(pol.dtype))
         return self._heads(z, pol, n_players, aux, aux_rows, rraw)
 
     # ---- static shapes (CUDA graphs: infer.TokenGraphRunner, docs/az.md 10.6)

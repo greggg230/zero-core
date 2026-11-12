@@ -5605,3 +5605,31 @@ waits on a drained pipeline. Inference (the graphs' replay) is unchanged.
 
 Tests: `tests/test_tail_net.py`'s gradient test forces the explicit attention through `_explicit_flag` (static and
 eager); every tail test passes; the equivalence above is a scratch script (`perf_equiv.py`, not committed).
+
+**Autocast** (2026-11-12, found by MTG Zero's lane Z). `run.py` and `zero.distill` train a token network in float32
+(`infer.use_amp` turns bfloat16 autocast on for the conv network only), but any caller under CUDA autocast - and the
+graphs' measurement mode `TokenGraphRunner(amp=True)` - crashed on a gated network: the pointer blend's `torch.lerp`
+of bfloat16 logits by a float32 gate weight, and `_WeightedAttention`'s backward (float32 gradient, bfloat16 saved
+operands) whenever a present gate is 0. Fixed:
+
+* the blend runs in float32 and is cast back: bfloat16 / float16 logits are exact in float32, so it is still exactly
+  the generic logit at g = 0 and exactly the pointer logit at g = 1 (`tests/test_tail_amp.py` compares them bit for bit
+  under bfloat16, static and eager, training and inference);
+* both autograd nodes (`_TailEmbed`, `_WeightedAttention`) are `torch.amp.custom_fwd(cast_inputs=float32)` /
+  `custom_bwd`: float32 inside under autocast, their backward in the forward's autocast state; the identity digits are
+  decoded with autocast off (exact integers); eager's token weights are in the gates' dtype;
+* the eager forward's per-chunk accumulators take each chunk's outputs in their dtype (`.to`, a no-op without
+  autocast): a token network's eager forward crashed under autocast before this project too (f9ca5c3: `index_copy_`
+  of bfloat16 logits into float32), now it runs.
+
+Without autocast nothing changes (forward outputs and gradients bit for bit; the gates' and the identity embedding's
+gradients sum by atomics: they vary run to run in the last bits, as fd8e246's). The float32 mask log w and the gated
+pooling are float32 (the gates' dtype); SDPA under autocast casts the mask to bfloat16 (-inf and 0 exact). float16
+autocast still fails in `_heads` (its absent seats' -1e9 overflows float16: every network kind, before this project
+too; no caller uses float16) - with that mask made float16-safe the varlen paths run under float16 as well.
+
+Tests: `tests/test_tail_amp.py` (13, CUDA): the blend's exactness; AdamW steps under bfloat16 for eager and static
+at gates 0 and > 0 with tails and overrides into gated and ungated tokens (finite gradients, the gates' non-zero, the
+loss lower, float32's outputs within bfloat16's precision, the explicit attention exactly while a gate is 0); a
+train_static step at shut gates with and without overrides (lane Z's case); the graphs' bfloat16 mode with tails;
+`Run.train_model` on toy_tail on CUDA with autocast forced on, eager and train_static.
