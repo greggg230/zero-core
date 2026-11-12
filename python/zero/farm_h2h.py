@@ -206,7 +206,7 @@ def definition_fields(st):
         cks[gen] = {'model_sha256': g['sha256'], 'model_size': g.get('model_size') or os.path.getsize(g['model']),
                     'reference_sha256': g['reference_sha256'],
                     'reference_size': g.get('reference_size') or os.path.getsize(g['reference'])}
-    return {'game': st['game'], 'builds': [st['build_id']], 'runtime': st['runtime'], 'checkpoints': cks,
+    return {'game': st['build_game'], 'builds': [st['build_id']], 'runtime': st['runtime'], 'checkpoints': cks,
             'jobs': {'selfplay': None, 'eval': eval_job(st), 'fuzz': None}}
 
 
@@ -216,6 +216,8 @@ def define(cl, d, st, log, opts):
     info = st.get('definition')
     if info and info.get('published'):
         return info
+    if not st.get('build_game'):
+        st['build_game'] = FD.worker_game(cl, st['build_id'], st['runtime'])
     if not info:
         info = FD.prepare(cl, 'run', st['run'], expires_days=opts.get('expires_days', EXPIRES_DAYS),
                           root=opts.get('defs_dir'), **definition_fields(st))
@@ -480,6 +482,10 @@ def main(argv=None, client=None):
         ap.error('--games: an even number (paired games: each deal from both seats)')
     if not (a.build and a.runtime):
         ap.error('--build and --runtime: the worker build and the runtime pack it requires')
+    # the worker build's manifest first (fail before the export): its game is the definition's, and it must require
+    # this runtime
+    cl = client or Client(a.url)
+    build_game = FD.worker_game(cl, a.build, a.runtime)
     import torch
     torch.set_num_threads(max(1, a.threads))
     from . import farm_eval as FE
@@ -518,9 +524,8 @@ def main(argv=None, client=None):
           'games': a.games, 'seed': a.seed, 'build_id': a.build, 'runtime': a.runtime, 'priority': a.priority,
           'games_per_lease': gpl, 'needs': {'threads': a.needs_threads, 'ram_mb': a.needs_ram_mb}, 'batch': 'h2h',
           'settings': cfg, 'select': _tag(FE.seat_dicts(cfg, [{'net': 1}, {'net': 2}])[0]), 'gens': gens,
-          'created': time.time(), 'cursor': 0}
+          'created': time.time(), 'cursor': 0, 'build_game': build_game}
     save_state(d, st)
-    cl = client or Client(a.url)
     setup(cl, d, st, log, opts)
     if a.no_wait:
         log(f'set up; read the results with: python -m zero.farm_h2h --resume {run}')

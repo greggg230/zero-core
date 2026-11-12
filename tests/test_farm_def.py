@@ -136,6 +136,27 @@ def test_versions_the_archive_and_publishing(tmp_path, monkeypatch, capsys):
         FD.publish(cl, info4, key=str(tmp_path / 'missing.key'))
 
 
+def test_a_worker_builds_game_from_its_manifest(monkeypatch):
+    """A definition's game is the worker build's (its manifest: "mtg" for MTG Zero, not a run's "mtg_eoe"); the
+    manifest must be the build's (sha256[:24] = its id), a worker's, and require the runtime given."""
+    import hashlib
+    man = {'manifest': 1, 'kind': 'worker', 'game': 'mtg', 'requires_runtime': R}
+    raw = json.dumps(man).encode()
+    bid = hashlib.sha256(raw).hexdigest()[:24]
+    other = json.dumps(dict(man, kind='runtime')).encode()
+    rid = hashlib.sha256(other).hexdigest()[:24]
+    objs = {bid: raw, rid: other, B: raw}                     # (B: an id whose manifest is another build's)
+
+    def t(method, url, headers, data):
+        return 200, objs[url.split('/builds/')[1].split('/')[0]]
+    cl = FD.Client('http://fake', token=TOKEN, transport=t)
+    assert FD.worker_game(cl, bid, R) == 'mtg'
+    for b, rt, why in ((bid, B, 'requires runtime'), (rid, R, 'not a worker'), (B, R, 'not that build'),
+                       ('nope', R, 'a build_id')):
+        with pytest.raises(SystemExit, match=why):
+            FD.worker_game(cl, b, rt)
+
+
 def test_checkpoint_entries(tmp_path):
     m, r = tmp_path / 'model.onnx', tmp_path / 'reference.npz'
     m.write_bytes(b'graph' * 10)

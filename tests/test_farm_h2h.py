@@ -26,6 +26,11 @@ import farm_release_stub as STUB  # noqa: E402
 
 TOKEN = 'secret-admin-token-xyz'
 INFO = G.info('toy')
+RT = 'c' * 24
+# the worker build's signed manifest (its id: sha256[:24] of these bytes); its game is the repo's, not the settings'
+MANIFEST = json.dumps({'manifest': 1, 'kind': 'worker', 'version': 'toy-test', 'game': 'zero-toy', 'requires_runtime': RT,
+                       'entry': 'w.exe', 'files': []}).encode()
+BID = hashlib.sha256(MANIFEST).hexdigest()[:24]
 
 
 def _ckpts(tmp_path):
@@ -67,7 +72,7 @@ class Fake:
         m = re.match(r'^/v1/admin/run/([a-z0-9-]+)$', p)
         if m and method == 'PUT':
             run = m.group(1)
-            assert body['selfplay'] is None and body['build_id'] == 'b' * 24 and body['runtime'] == 'c' * 24
+            assert body['selfplay'] is None and body['build_id'] == BID and body['runtime'] == RT
             if body['eval']:
                 assert body['eval']['checkpoints'] == [1, 2]
                 assert all((run, g) in self.ckpts for g in (1, 2)), 'gens before the batch'
@@ -94,6 +99,8 @@ class Fake:
             self.objects[m.group(1)] = data
             return ok({'ok': True, 'key': m.group(1), 'size': len(data)})
         if m and method == 'GET':
+            if m.group(1) == f'builds/{BID}/manifest.json':
+                return 200, MANIFEST
             return 200, self.objects[m.group(1)]
         m = re.match(r'^/v1/admin/run/([a-z0-9-]+)/checkpoint/(\d+)$', p)
         if m and method == 'PUT':
@@ -175,7 +182,7 @@ def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
     fake = Fake()
     cl = FH.Client('http://fake', transport=fake)
     st_dir = str(tmp_path / 'state')
-    rc = FH.main(['--a', a, '--b', b, '--games', '10', '--build', 'b' * 24, '--runtime', 'c' * 24, '--state-dir', st_dir,
+    rc = FH.main(['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', RT, '--state-dir', st_dir,
                   '--poll', '0', '--threads', '1', '--seed', '3'], client=cl)
     assert rc == 0
     out, err = capsys.readouterr()
@@ -198,8 +205,8 @@ def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
         raw = f.read()
     doc = json.loads(raw)
     assert raw == FD.encode(doc)
-    assert (doc['kind'], doc['id'], doc['version'], doc['game']) == ('run', run, 1, 'toy')
-    assert doc['builds'] == ['b' * 24] and doc['runtime'] == 'c' * 24 and doc['expires'] == doc['created'] + 30 * 86400
+    assert (doc['kind'], doc['id'], doc['version'], doc['game']) == ('run', run, 1, 'zero-toy')   # the build's game
+    assert doc['builds'] == [BID] and doc['runtime'] == RT and doc['expires'] == doc['created'] + 30 * 86400
     assert doc['jobs'] == {'selfplay': None, 'eval': fake.runs[run]['eval']['job'], 'fuzz': None}
     for g in (1, 2):
         ck = fake.ckpts[(run, g)]
@@ -237,9 +244,15 @@ def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
     assert st['definition']['published'] and st['definition']['version'] == 1
     FH.main(['--cancel', run, '--state-dir', st_dir], client=cl)
     assert fake.runs[run]['state'] == 'paused' and fake.runs[run]['eval']['batch'] == 'h2h'
+    # a runtime the build does not require: refused before the export, nothing put
+    n = len(fake.calls)
+    with pytest.raises(SystemExit, match='requires runtime'):
+        FH.main(['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', 'd' * 24, '--state-dir', st_dir,
+                 '--name', 'other'], client=cl)
+    assert [c for c in fake.calls[n:] if c[0] != 'GET'] == [] and not os.path.exists(os.path.join(st_dir, 'h2h-other'))
     # a second start of the same run is refused (resume it)
     with pytest.raises(SystemExit):
-        FH.main(['--a', a, '--b', b, '--games', '10', '--build', 'b' * 24, '--runtime', 'c' * 24, '--state-dir', st_dir],
+        FH.main(['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', RT, '--state-dir', st_dir],
                 client=cl)
 
 

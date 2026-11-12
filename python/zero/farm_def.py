@@ -324,6 +324,32 @@ def r2_key(kind, id, version):
     return f'defs/{kind}/{id}/{int(version)}/definition.json'
 
 
+def build_manifest(client, build_id):
+    """A registered build's signed manifest (`GET /v1/admin/artifact/builds/<id>/manifest.json`), checked against its
+    id (sha256[:24] of the bytes: the coordinator cannot answer another) -> the manifest dict."""
+    if not BUILD_RE.match(build_id or ''):
+        raise SystemExit(f'build {build_id!r}: a build_id (24 hex)')
+    b = client.call('GET', f'/v1/admin/artifact/builds/{build_id}/manifest.json', raw=True)
+    if hashlib.sha256(b).hexdigest()[:24] != build_id:
+        raise SystemExit(f'build {build_id}: the coordinator\'s manifest.json is not that build\'s (sha256)')
+    return json.loads(b)
+
+
+def worker_game(client, build_id, runtime):
+    """The game (repo) of a worker build - a definition's `game` (PROTOCOL.md 7: "mtg" for any MTG Zero run, as the
+    build's manifest says, not a run's settings game such as "mtg_eoe") - checked: a worker build, and `runtime` the
+    runtime pack it requires (when it requires one)."""
+    m = build_manifest(client, build_id)
+    if m.get('kind') != 'worker':
+        raise SystemExit(f'build {build_id} is a {m.get("kind")!r} build, not a worker')
+    need = m.get('requires_runtime')
+    if need and need != runtime:
+        raise SystemExit(f'worker build {build_id} requires runtime {need}, not {runtime}')
+    if not m.get('game'):
+        raise SystemExit(f'worker build {build_id}: its manifest names no game')
+    return m['game']
+
+
 # ---------------------------------------------------------------- versions
 
 def current_of(answer):
