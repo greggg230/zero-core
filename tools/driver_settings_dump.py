@@ -6,7 +6,7 @@ zero_search, docs/az.md 42).
     python tools/driver_settings_dump.py --root <game checkout> --package mtgz.az --configs <runs dir>... \
         --out old.json [--cfg-dir <dir for the resolved configs>]
     python tools/driver_settings_dump.py --compare old.json new.json
-    python tools/driver_settings_dump.py --compare-worker new.json --worker <native worker exe>
+    python tools/driver_settings_dump.py --compare-worker new.json --worker <native worker exe> [--eval]
 
 Per case (each preset of the package, each `<runs dir>/*/config.json`): the settings resolved as a run
 resolves them (DEFAULTS < preset < saved config: `zero.run.resolve_config`), then the drivers the run
@@ -20,12 +20,16 @@ builds from them, each as `driver_settings` text (or 'ERROR: ...' when the setti
 * `eval_yard`, `eval_random`: the evaluation seat against the yardstick / the random bot
   (`Run.play_match`: seats alternating, 6 games, paired with elo_paired);
 * `elo`: the evaluation seat against two checkpoints in one driver (`Run.play_matches`, keys o0, o1);
-* `bots`: the yardstick against the random bot (`Run.bots_match`).
+* `bots`: the yardstick against the random bot (`Run.bots_match`);
+* `eval_farm`: a zero-farm eval job's match (zero.farm_eval.match_driver: Run.play_match's driver of two network
+  seats, 6 paired games, the run's eval spec resolved into `eval_spec`; its settings file `cfg_eval`).
 
 `--compare` lists, per case and driver, equal / both refused / DIFFERENT and exits 1 on any difference.
 `--compare-worker` runs `<worker> driver-cfg <resolved config> --seed S --net 0` for every case whose
 `selfplay_remote` was built and compares its text with it (the native worker's settings -> driver path,
-a Rust port of the run's self-play seat; exit 1 on a difference). Reads the configs only.
+a Rust port of the run's self-play seat; exit 1 on a difference); with `--eval`, also `<worker> driver-cfg
+<cfg_eval> --eval --seats ... --games 6 --seed S --paired` against `eval_farm` (the eval job's port of
+Run.nn_seat(key, eval_sims) and the match's driver, docs/az.md 42.2). Reads the configs only.
 """
 import argparse
 import glob
@@ -38,7 +42,8 @@ import tempfile
 import traceback
 
 SEED = 4242
-CASES = ('selfplay_remote', 'selfplay_local', 'eval_yard', 'eval_random', 'elo', 'bots')
+CASES = ('selfplay_remote', 'selfplay_local', 'eval_yard', 'eval_random', 'elo', 'bots', 'eval_farm')
+EVAL_SEATS = [{'net': 1}, {'net': 2}]
 
 
 def _err(e):
@@ -163,6 +168,16 @@ def dump(args):
             one('eval_random', match('random'))
             one('elo', elo)
             one('bots', bots)
+            try:
+                from zero import farm_eval as FE
+                ce = FE.resolve_eval_spec(c)
+                cpe = os.path.join(args.cfg_dir, f'{len(out):03d}-eval.json')
+                with open(cpe, 'w', encoding='utf-8') as f:
+                    json.dump(ce, f, indent=1)
+                row['cfg_eval'] = cpe
+                one('eval_farm', lambda: FE.match_driver(ce, EVAL_SEATS, 6, SEED, paired=True))
+            except BaseException as e:             # noqa: BLE001
+                row['eval_farm'] = _err(e)
             print(f'{name}: ' + ', '.join(f'{k} {"ERR" if v.startswith("ERROR") else "ok"}'
                                           for k, v in row.items() if k in CASES), file=sys.stderr)
     finally:
@@ -206,10 +221,29 @@ def compare(a_path, b_path):
     return 1 if bad else 0
 
 
-def compare_worker(path, worker):
+def compare_worker(path, worker, ev=False):
     with open(path, encoding='utf-8') as f:
         a = json.load(f)
     bad = same = skipped = unsupported = 0
+    if ev:
+        for name, r in sorted(a.items()):
+            want = r.get('eval_farm')
+            if want is None or 'cfg_eval' not in r:
+                skipped += 1
+                continue
+            p = subprocess.run([worker, 'driver-cfg', r['cfg_eval'], '--eval', '--seats', json.dumps(EVAL_SEATS), '--games', '6',
+                                '--seed', str(SEED), '--paired'], capture_output=True, text=True, encoding='utf-8')
+            got = p.stdout.rstrip('\n') if p.returncode == 0 else f'ERROR: {p.stderr.strip()[-600:]}'
+            if want.startswith('ERROR') and got.startswith('ERROR'):
+                print(f'both refused  {name} eval_farm:\n    python: {want}\n    worker: {got}')
+                same += 1
+            elif got == want:
+                same += 1
+            else:
+                bad += 1
+                print(f'DIFFERENT {name} eval_farm (python vs worker):\n--- python\n{want}\n--- worker\n{got}')
+        print(f'eval_farm: {same} cases agree (built or both refused), {bad} different, {skipped} without one')
+        return 1 if bad else 0
     for name, r in sorted(a.items()):
         want = r.get('selfplay_remote')
         if want is None or 'cfg' not in r:
@@ -246,12 +280,13 @@ def main():
     ap.add_argument('--compare', nargs=2)
     ap.add_argument('--compare-worker')
     ap.add_argument('--worker')
+    ap.add_argument('--eval', action='store_true', help='--compare-worker: the eval jobs\' drivers (eval_farm)')
     ap.add_argument('--verbose', action='store_true')
     args = ap.parse_args()
     if args.compare:
         sys.exit(compare(*args.compare))
     if args.compare_worker:
-        sys.exit(compare_worker(args.compare_worker, args.worker))
+        sys.exit(compare_worker(args.compare_worker, args.worker, args.eval))
     if not (args.root and args.package and args.out):
         ap.error('--root, --package and --out (or --compare / --compare-worker)')
     args.cfg_dir = args.cfg_dir or os.path.splitext(args.out)[0] + '-cfg'

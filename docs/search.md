@@ -521,6 +521,23 @@ can be played again elsewhere as the same game. Refused on a fixed-table driver 
 after the first `resume`. Test: `first_gid_plays_the_same_games` (games 4..7 of a driver from 0 == a driver
 from 4, record for record).
 
+**An eval job's match as a rolling driver** (zero-farm phase 2, 2026-11-12; docs/az.md 42.2). A match's
+fixed-table driver (`Run.play_match`: game g takes `games[g]`, ids 0..n) cannot start at a lease's first id, so
+the worker plays a lease of it as a rolling `queue_only` driver whose table is the match's first two rows (game
+gid takes row gid % 2: the seats of every game id, swapped between the games of a pair), with the lease's setups
+(the driver's spec) all queued before its first `resume` and `set_first_gid(gid_base)`. With one group it sends
+the fixed table's batches in the fixed table's order and plays its games: a queue that never runs dry starts a
+game in every free slot exactly when the fixed driver starts its next game id (`queue_share` gives one group
+every queued setup), and the game's streams are its gid's either way. Test:
+`a_queued_rolling_driver_plays_a_fixed_tables_match_batch_for_batch` (paired and unpaired, conc above and below
+the games, a lease from game 4: every batch's key, rows and features, every game's steps, result, scores and
+rounds). With more groups the fixed driver serves them round-robin and a `queue_only` driver whichever is ready
+first: the same games, batches in a timing-dependent order.
+
+`Driver::clear_queue()` / `DynDriver::clear_queue` drops the queued setups not started yet (-> how many): the
+eval job's `finish` (no new game starts; the games in flight play on). Nothing else changes; nothing calls it
+but the worker. Test: `clear_queue_starts_no_new_game`.
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),

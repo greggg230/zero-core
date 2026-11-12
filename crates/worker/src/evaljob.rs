@@ -354,6 +354,7 @@ fn build_evaluators(game: &GameEntry, job: &EvalJob, keys: &[(String, KeyKind)],
     let info = (game.info)();
     let want = Expect { game: info.name.to_string(), features: info.num_features, actions: info.num_actions, aux_width: info.aux.iter().map(|a| a.1).sum(), belief, sha256: None };
     let mut evs: Vec<(u32, Box<dyn Evaluator>)> = Vec::new();
+    let mut worst: Option<f64> = None;
     for (gen, m) in &job.models {
         let ev: Box<dyn Evaluator> = match &job.ort {
             None => Box::new(Uniform),
@@ -364,11 +365,17 @@ fn build_evaluators(game: &GameEntry, job: &EvalJob, keys: &[(String, KeyKind)],
                         return Err(format!("gen {gen}: {} has sha256 {got}, the job says {h}", m.model.display()));
                     }
                 }
-                build_eval(&EvalKind::Onnx { model: m.model.clone(), ort: ort.clone(), sha256: None, reference: m.reference.clone() }, &want, sink, progress, Some(*gen))?
+                let ev = build_eval(&EvalKind::Onnx { model: m.model.clone(), ort: ort.clone(), sha256: None, reference: m.reference.clone() }, &want, sink, progress, Some(*gen))?;
+                // (Stats' selftest_max_abs: the largest over the job's networks)
+                if let Some(x) = progress.lock().unwrap().selftest_max_abs {
+                    worst = Some(worst.map_or(x, |w| if x.is_nan() || x > w { x } else { w }));
+                }
+                ev
             }
         };
         evs.push((*gen, ev));
     }
+    progress.lock().unwrap().selftest_max_abs = worst;
     let mut key_ev = Vec::with_capacity(keys.len());
     for (k, kind) in keys {
         let seat = match k.as_str() {
