@@ -190,7 +190,8 @@ segment (count 0), and, with `OPTION_POINTERS`, the row's **pointer overrides**.
 |---|---|---|
 | `const TAILS: &[TailSeg]` | `&[]` | the layout's tail segments in layout order: `{seg, name, width, head}` (`seg` = the segment's index in the layout's `segments`, `head` = its head slots) |
 | `const OPTION_POINTERS: bool` | false | rows carry pointer overrides |
-| `const MAX_ROW_TOKENS: usize` | `usize::MAX` | the resource limit of a row's capacity `1 + Σ head + tail` (2.15); must be finite with `TAILS` (a compile-time assert in `Driver::new`, R3) |
+| `const MAX_ROW_TOKENS: usize` | `usize::MAX` | the resource limit of a row's capacity `HEAD_TOKENS + tail` (2.15); must be finite with `TAILS` (a compile-time assert in `Driver::new`, R3) |
+| `const HEAD_TOKENS: usize` | 0 | the layout's `1 + Σ count` over **every** segment (the global token and all head slots, tail or not): the driver's capacity of a row is `HEAD_TOKENS + tail.len()`. Required non-zero (and at most `MAX_ROW_TOKENS`) with `TAILS` (the same assert). `zero.package` checks it against the layout (R15). Added by the API change of 2026-11-11: the driver knows only the tail segments' heads, MTG's capacity is 1 + 169 + tail |
 | `fn encode_row(viewer, head, tail: &mut TailBuf)` | `encode(viewer, head)`, no token | the head plus the tail tokens: `tail.token(seg, slot)` returns a zeroed slice of the segment's width; any order (the driver seals: sorted by (seg, slot), a duplicate or a slot inside the head panics, R2) |
 | `fn option_overrides(viewer, legal, out)` | none | `(index in legal, tok)`, ascending: `tok = tail::pack_tok(seg, col, slot)` = `(seg << 40) \| (col << 32) \| slot`, or -1 = the generic logit. Only for rows with options, only with `OPTION_POINTERS` |
 
@@ -479,6 +480,57 @@ twins without branching, move for move and record for record), `branches_count_i
 `archive_starts_play_their_entries_specs` (game g started from entry j is game g of a driver whose spec is
 entry j's), `a_branch_of_an_archive_start_names_its_entry`, `differ_never_replays_the_games_own_move_first`,
 `branch_and_starts_settings_are_checked`; tests/test_forks.py.
+
+### 2.15 Tail rows, their keys and the row limit (opt-in with `SearchGame::TAILS` / `OPTION_POINTERS`; 2026-11-11)
+
+A game with tail segments (1.4) sends every network row with its tail tokens and, with `OPTION_POINTERS`, its pointer
+overrides. Nothing of this exists for a game without them: no array, no key, no branch taken (the `TAILS` /
+`OPTION_POINTERS` tests are on constants) - the golden digests and cache counts of the toys are unchanged.
+
+**Rows.** Every row kind - a leaf's own row (`ROW_LEAF`), a value-only row (`ROW_VALUE`), a root belief row
+(`ROW_BELIEF`), the root's record - is `encode_row` of its state: the head into the batch's dense row or the sparse
+scratch (then `sparse_scan`), the tail sealed (sorted by (seg, slot); a duplicate, a slot inside the head or a token
+of a non-tail segment panics: an engine bug, the game named by the worker). A row with options gets its overrides
+from `option_overrides(viewer, opts)`, checked (option indexes ascending and in range, tokens -1 or packed; else a
+panic). A merged tree's shared leaf row (3.16) carries the tail of the same encoding (`Tree::leaf_obs_tail`), its
+overrides computed from the state. Lookahead and value-choice rows (3.9, 3.17) are refused when they have a tail or
+an override (`lookahead::look_encode`: `Err("lookahead: tail rows not supported yet")`, R12, P1 of the plan); so is
+a Python-driven `SearchTree` leaf (head-only rows).
+
+**Batches** (`Batch`, the binding's dict; a game with tails / pointers only): `t_off` i64 [B+1] (B + 1 offsets even
+if every row's tail is empty), `t_seg` u16, `t_slot` u32, `t_val` f32 (each token's floats, `width(seg)` each,
+consecutive; the offsets are never sent), `ov_off` i64 [B+1], `ov_opt` i32 (the option's index in its row), `ov_tok`
+i64 (`(seg << 40) | (col << 32) | slot`, or -1 = the generic logit). Records carry `tail` (a `TailRow`) and `ov`
+(through parking too); `sample_arrays_rows` / `take_samples` / `SampleRecords.arrays()` give the same keys with N
+rows (`sample_arrays`, head-only, refuses a record that has either: never a silent drop). The batch's tail CSR is
+assembled in the plan step (`tail_csr`: short, most rows have none).
+
+**Keys** (the evaluation cache 3.12, the merged trees' observation keys 3.16 - the same function, K3): a row with an
+empty tail and no overrides has exactly the key of before (`obs_hash` of the dense head = `obs_hash_sparse` of its
+non-zeros; K1). Otherwise `tail::tail_mix` continues the head's two lanes before the finish (`lookahead::obs_hash_row`):
+every token's header `(seg, slot)`, then the row's `t_val` floats by their position (non-zero bits only), then each
+override `(k, opt, tok)`, then the counts. Every tail input's index has one of the top three bits set (a head pair's
+index is < 2^31) and the four domains are disjoint (constants in `tail.rs`); a token's width is fixed by its
+segment, so (headers, positions) identify every float of every token. The tests: a change of one float bit, a seg, a
+slot, a token count or an override changes the key, a split of the same floats across tokens of other segments
+too; the dense and the sparse driver send the same rows and find the same cache hits; with a row echo evaluator
+(answers from every head float, tail token and override) the cache plays the same games as without it, and a key
+that drops the tail fails that test (checked by mutation).
+
+**The limit.** A row's capacity is `HEAD_TOKENS + tail.len()`; past `max_row_tokens` (`DriverCfg::max_row_tokens`,
+None = the game's `MAX_ROW_TOKENS`; a driver may lower it, never raise it nor set it below the head) the row's game is
+**aborted**: the open row and every row it sent this step are taken back (`LeafBuf::truncate_rows`), the game ends at
+the advance loop's top as aborted (`GameResult::aborted`, `abort_reason` "max_row_tokens", not over, no samples - the
+existing aborted semantics), `aborted_row_tokens` counts it, one stderr line names the gid, the driver seed, the row
+kind and its capacity. This holds for every row kind, the records included. A truncated row is never produced.
+
+**Stats:** `tail_rows` (rows sent with at least one tail token), `tail_tokens`, `tail_max` (the most in one row),
+`aborted_row_tokens` (the binding's `stats()` reports them for a game with tails only).
+
+**Tests:** `crates/search/src/driver/tests/tail.rs` (the toy below through the driver: rows sorted and every override
+pointing at a token of its row, records and sample arrays, dense = sparse, the cache and the merged trees with tails,
+the limit, the lookahead's refusal, a game without tails has no array, the key properties), `tail.rs` and
+`toy_tail.rs`'s unit tests.
 
 ### 2.12 Sparse rows without full-row scans (`SearchGame::encode_sparse`; MTG Zero's Delver mirror, 2026-11-04)
 
@@ -1820,6 +1872,21 @@ with more match wins (`result` 1/T or 0 per seat, 1/2T each on a draw), margin =
 reshuffles it); each later offer is a chance key `round << 32 | mask` (`force_chance` deals a
 queued offer if its cards are undealt). `result()` / `margin()` panic before `resolve`. 16
 actions (card ids), 64 features. Bots: `random`, `greedy` (the most food).
+
+### 5.3 The variable-length rows' toy: "Toy tail" (`crates/search/src/toy_tail.rs`, `toy_tail`; 2026-11-11)
+
+The core's test game for 1.4 / 2.15 (the varlen API's section 8): two players, an ordered list of items (values 1..9,
+marked by a player or not), spec `{"items0": 3, "max_moves": 40}`. A turn: `PASS` (0), `ADD k` (1..=3: k items at
+the end, each value a forceable chance outcome; while the list keeps at most 24), `MARK` (12: the last item gets the
+player's mark) - on the first page only -, `TAKE j` (4..=10: the item at position `w * 7 + j` of page `w`, scored
++2 if marked) or `NEXT` (11: the next page, the same player, offered while a later window holds an item). Over
+after `max_moves` moves or when the list is empty after two moves without an `ADD`; the higher score wins.
+`NUM_FEATURES` 72 = 8 globals + segment `items` (4 head slots x 16; the value one-hot at floats 6-15), its items
+past the 4th as tail tokens of slot `position`; tail-only segment `marks` (width 4, a token per marked item).
+`OPTION_POINTERS`: a `TAKE` of a position >= 4 on the first page and every `TAKE` on a later page point at
+`(items, col 0, position)`. `MAX_ROW_TOKENS` 64, `HEAD_TOKENS` 5; spec `{"items0": 70}` passes the limit at the first
+row. `encode` panics on a state with a tail (R1). Its token layout is `zero.package.TOY_TAIL_TOKENS` (the API's
+section 1.4, literally); `TOY_TAIL_TOKENS_BASE` is the same without `marks`.
 
 ## 6. Parity: Rust search vs Python reference
 

@@ -223,8 +223,9 @@ class Driver:
         # (a game with tail segments: the batches know their widths, `LeafBatch.tail`; docs/search.md 2.15)
         inf = dict(self.d.info())
         self.tails = tail_widths(inf)
-        if inf.get('tails') or inf.get('option_pointers'):
-            package.check_rows(game, inf)           # (R15: the build's rows against the package's layout)
+        # (R15: the build's variable-length rows against the package's layout - a stale build with HEAD_TOKENS 0 or no
+        # tails at all under a layout with them included; pure Python, nothing to refuse for a game and layout without)
+        package.check_rows(game, inf)
 
     def next_batch(self):
         r = self.d.next_batch()

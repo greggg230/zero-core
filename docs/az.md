@@ -117,6 +117,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
 | `window_cache`, `window_sparse` | 0, 0 | 1 = the window's shards stay in RAM between iterations (zero/data.py WindowCache); 1 = the window keeps each row's features as their non-zeros - the same window and batches in a fraction of the RAM for a sparse encoding, and with `window_cache` every shard cached whole also over budget, so an iteration loads only its new shards (10.8). The budget still counts dense rows |
 | `shard_sparse` | 0 | 1 = self-play writes each shard's features as their non-zeros (`x_ptr` / `x_idx` / `x_val`, meta `x_format` 'sparse'; every other array as before; this machine's shards and a remote's): the dense rows bit for bit in ~1/25 of the disk on MTG Zero's Delver line, written ~4-5x faster with the float32 rows never buffered. Every reader takes both formats, so a window may mix them; an older checkout cannot read a sparse shard (`data.convert_shard` makes it dense again) (32) |
+| `allow_draft_layout` | 0 | 1 = a run may train on a game package's token layout marked `draft` (variable-length rows: MTG Zero's layout v7 while it is built, R16); 0: such a run is refused at start (exit 78). A layout without `draft` - every layout of before - is unaffected (43.4) |
 | `train_static` | 0 | 1 = a token network trains through its static forward (`TokenNet.forward_static`, the inference graphs': each batch one chunk of its longest row's tokens, no host sync) with a fused AdamW on CUDA, and a sparse window's batches travel as their non-zeros (dense on the device): the same batches and losses, the updates up to float32 rounding; ~2.8x a step on MTG Zero's Delver network (10.9). Another network is refused |
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
@@ -5225,3 +5226,94 @@ self-play records, docs/search.md 3.17); config.json gains the four keys.
 in Python and in the Rust driver, h2h's run rule and tag, the hello's fingerprint; a seat with the setting plays the
 toy's games (which mark no value choice) exactly as one without, making none. The search: docs/search.md 3.17's Rust
 tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.
+
+## 43. Variable-length rows: tail tokens and pointer overrides in shards, the window and the run (`allow_draft_layout` in 43.4; MTG Zero's layout v7, 2026-11-11)
+
+**Why.** MTG Zero's rule is that the engine **and the network's input** are exact in every reachable state. Fixed
+slot caps (a hand past 16 cards, a stack past 8, waiting triggers past 4) and new kinds of state (delayed triggers,
+the opponent's triggers, links, exile offers) need a variable-length **tail** of tokens after today's fixed-width row
+(the **head**), and options about objects past a cap need **pointer overrides** (docs/search.md 1.4, 2.15). This
+section is the data path of lane X (shards, window, run, tools, remotes); 43.5-43.8 are the network's (lane Y).
+
+### 43.1 Rows on the host and shard format v2
+
+* `zero.rows`: `Tail` (CSR over rows: `off`, `seg` u16, `slot` u32, `val` float32 / float16, `widths`) and
+  `Overrides` (`off`, `opt` i32, `tok` i64), with `take` / `concat` / `nbytes` / `padded` / `to_torch`; `pack_tok`,
+  `unpack_tok`, `layout_tails`, `resolve` (overrides -> the network's `ov`: each target's extended position - a head
+  slot's place in the full token axis, a tail token's `n_tok` + its index in the batch's tail; refuses an absent head
+  slot, a missing tail token, a column out of range, an option out of its row: R6), `token_full` (a static forward's
+  `full` / `ntok` with each row's tail tokens after its head tokens), `game_row` (a game's `encode_row` and
+  overrides for an evaluator), `shard_layout`.
+* The bindings (docs/search.md 2.15): batch and sample dicts carry `t_off` / `t_seg` / `t_slot` / `t_val` and
+  `ov_off` / `ov_opt` / `ov_tok` for a game with them only; `LeafBatch.tail` / `.ov`; `Game.encode_row`,
+  `Game.option_overrides`; `Game.encode` raises ValueError on a state with a tail (R1); `game_info()` adds `tails`,
+  `option_pointers`, `max_row_tokens`, `head_tokens`. `protocol.concat_samples` and `take_rows` carry the CSRs
+  (re-offset); `validate_rows` checks them.
+* **Shard format v2** (`zero/data.py`): written iff the game declares tails or pointer overrides (`shard_format(cfg,
+  info)` adds the meta `t_segs` [[seg, name, width, head], ...], `option_pointers`, `max_row_tokens`), always sparse
+  (`x_version` 2): version 1's members plus `t_ptr` int64 [N+1], `t_seg` uint16, `t_slot` uint32, `t_val` float16
+  (dense per token), `ov_ptr` int64 [N+1], `ov_opt` int32, `ov_tok` int64. A dense shard with tails is refused at the
+  setting (`shard_format`), at `ShardWriter.add` and at `write_shard` (R8): an older reader would read `x` and ignore
+  the tail. Version 1 readers refuse version 2 (their `x_version` check); this build reads both and refuses a newer
+  one (R7). `read_shard` returns the v2 members with the features (`head_only=True` drops them: an explicit choice);
+  `shard_features` - the features alone - is refused for a shard with any tail token or override unless `head_only`
+  (R10). `convert_shard` keeps v2 (never dense). The non-finite guard reads `t_val` (zero/finite.py).
+
+### 43.2 The window and training
+
+* `Window(..., layout=<the network's normalised layout>)`: with tail segments or pointer overrides it loads every
+  shard's tails and overrides (`Window.tail`, `Window.ov`) through the dense, sparse, cached (`WindowCache`, its key
+  names the tail segments) and subsampled loads, its `nbytes` counting them; a shard of other tail segments, or one
+  without them (v1), is refused (R9: a v7 network trains on v2 shards only - a fork starts a fresh window). Without a
+  layout, a shard with any tail token or override is refused (R11: never a silent drop).
+* `Window.batch(idx, tokens=None, coo=False)` adds `'tail'` (the network's `tail`, unpadded) and `'ov'` (resolved,
+  the head slots' presence read from the features) and with `tokens` builds `full` / `ntok` by `rows.token_full`;
+  `Window.row_inputs` gives the same for any rows (distill's outputs); `use_layout` swaps in the network's layout for
+  a window loaded from its shards' `t_segs` (a held-out set). `data.batches` moves the nested dicts to the device.
+* `run.train_model` passes `tail` / `ov` to `forward` / `forward_static` only when the batch has them
+  (`rows.forward_kw`: the calls of before otherwise); `distill.outputs` / `losses`, `heldout` (sets made from v2
+  shards keep their tails; `HeldOut.evaluate` takes the network's layout, R9), `targets`, `bench --shard` (the rows'
+  tails through `infer` and `train`) and `replay` (the root's `encode_row`) pass them through.
+
+### 43.3 The run: refusals and metrics
+
+* At start (`Run.check_rows`, before any work; `RowsRefused`, an EncodingMismatch: exit 78, not restarted): a layout
+  marked `draft` without `allow_draft_layout` (R16, 43.4); a build whose rows differ from its package's layout -
+  tails, pointers, limit or `HEAD_TOKENS` vs the layout's 1 + Σ count, a stale build with 0 included (R15:
+  `package.check_rows`, also run by `games.Driver` and at `register` when the engine is loaded); a game with tails or
+  overrides with an arch other than 'tokens' (R4) or with `shard_sparse` 0 (R8).
+* The row limit (docs/search.md 2.15): a game whose row passes `max_row_tokens` is aborted (no samples), counted and
+  logged, never truncated.
+* Metrics, only for a game with tail segments: self-play `tail` = {rows sent with a tail, their tokens, the most in
+  one row, `aborted_row_tokens`} (a line in the log when a game was aborted); training `tail` = {the window's rows
+  with a tail, tokens, max, overrides, and the network's `gates` (max(theta, 0)) when it has gated segments}.
+
+### 43.4 Draft layouts, remotes, the toy
+
+* **`allow_draft_layout`** (run setting, default 0): a package layout with `"draft": true` (MTG Zero's v7 until this
+  project ends) is refused by a run at start (R16; `tools/fork_run.py --allow-draft` is lane Y's). 1 trains on it
+  anyway. Off by default; a layout without `draft` is unaffected either way.
+* **Remote self-play**: a worker's hello carries `caps: ['tails']`; for a game with tails or overrides a worker
+  without it (an older checkout) is refused, logged and retried in 10 minutes (R13), as the other capability checks.
+  The worker's samples are split per game with their tails (`remoteplay.split_games_rows`; its shards are v2).
+  **Remote evaluation**: the result line carries `caps`; an older remote's result for such a game is refused
+  (`RemoteRefused`) and retried.
+* **The toy** `toy_tail` (docs/search.md 5.3) with its layout `package.TOY_TAIL_TOKENS` is registered in the core's
+  package and engine.
+
+**Off by default / byte identity.** Everything above is keyed on the game declaring tail segments or pointer
+overrides (and `allow_draft_layout` only reads a `draft` key no layout of before has): Glass Road, Caverna, Kingdom
+Builder, the toy and every existing MTG Zero layout produce no new array, key, meta, metric or stats key, and their
+shards are written byte for byte as before (`x_version` 1 or dense). config.json gains `allow_draft_layout`.
+
+**Costs.** For a game without tails: a few constant-false branches. With them: the tail tokens' floats per row (MTG:
+mostly none; a hand past 16 cards is ~4% of Delver states), their key mixing, a CSR per batch assembled serially
+(rows without a tail cost an offset), float16 tail floats in shards.
+
+**Tests and checks.** `tests/test_tail_rows.py` (13: the bindings, R1, the tree and lookahead refusals, the
+containers, batches / samples / records / take_rows / concat carrying the rows exactly, the cache with sparse batches,
+the limit, games without rows unchanged, R15, R6, the remote split), `tests/test_tail_shards.py` (11: v2 round trip,
+R7-R11, convert, the finite guard, the window's five loads and its batches incl. the static axis and the resolved
+overrides, distill / held-out / bench feeding the rows, v1 shards unchanged), `tests/test_tail_loop.py` (3: toy_tail
+through the run's own self-play phase - synchronous and threaded writer, the same shards - into the window's
+batches, an aborted game, the run's refusals); the Rust tests of docs/search.md 2.15.
