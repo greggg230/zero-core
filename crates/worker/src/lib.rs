@@ -30,6 +30,7 @@ pub mod job;
 pub mod npz;
 pub mod proto;
 pub mod pyjson;
+pub mod records;
 pub mod selftest;
 pub mod settings;
 pub mod shard;

@@ -5,7 +5,8 @@
 //! <worker> selfplay --settings F (--model M | --uniform) --games N [--gid-base G] [--seed S] [--net N]
 //!          [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
 //!          [--ort-dll PATH] [--spinning 0|1] [--record-batches N --record-file F] [--sha256 H (the model file's)]
-//!          [--status-s X] [--stdin-control] [--reference R]   one job from flags (the same runner; events on stdout)
+//!          [--status-s X] [--stdin-control] [--reference R] [--output shards|records|both (default shards)]
+//!                                                  one job from flags (the same runner; events on stdout)
 //! <worker> eval --settings F (--model GEN=M ... | --uniform) --seats JSON --games N [--gid-base G] [--seed S]
 //!          [--paired] [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
 //!          [--reference GEN=R ...] [--sha256 GEN=H ...] [--ort-dll PATH] [--spinning 0|1] [--flush-games N]
@@ -32,11 +33,13 @@
 //! lease_id, kind 'selfplay', settings, games, gid_base, seed, model, reference (the self-test's set:
 //! answered before the first batch, `selftest` {provider, max_abs, ok}; a failure is fatal), threads, out_dir;
 //! optional gen - the rows' network id, default the graph's `checkpoint_iter` -, sha256 - the model FILE's,
-//! checked before the file is loaded -, conc, groups, infer_threads, spinning, prefix); during it `yield` ->
+//! checked before the file is loaded -, conc, groups, infer_threads, spinning, prefix, output - 'records' (the
+//! default from zero-farm phase 3: game records, `records` events; zero-core docs/search.md 2.15), 'shards'
+//! (sample shards, `shard` events) or 'both'); during it `yield` ->
 //! `yielded` (no batch started, the session dropped), `resume` -> `resumed`, `finish`, `quit`, `checkpoint`
 //! {gen, model, sha256? (the file's), reference?},
-//! `ping` -> `status`; events `fin`, `shard` (seq, path under out_dir, games, rows, bytes, gids:
-//! half-open [a, b) ranges), `status` every <= 10 s (PROTOCOL.md 3 Stats fields), `end` (reason, stats,
+//! `ping` -> `status`; events `fin`, `records` / `shard` (seq, path under out_dir, games, rows, bytes, gids:
+//! half-open [a, b) ranges, gen: the oldest network of its rows), `status` every <= 10 s (PROTOCOL.md 3 Stats fields), `end` (reason, stats,
 //! unfinished {gids: [[a, b)]}), `error` (message, fatal). The process exits after `end` (or a fatal
 //! error, status 1).
 //!
@@ -271,6 +274,8 @@ fn job_from_value(v: &Value, base: &Path) -> Result<Job, String> {
         meta,
         record_batches: None,
         status_s: 10.0,
+        // (zero-farm phase 3: a served self-play job writes game records unless its line says otherwise)
+        output: crate::records::Output::parse(o.get("output").and_then(|x| x.as_str()).unwrap_or("records"))?,
     })
 }
 
@@ -741,6 +746,7 @@ fn selfplay_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
         meta,
         record_batches: record,
         status_s: a.num("--status-s")?.unwrap_or(10.0),
+        output: crate::records::Output::parse(a.get("--output").unwrap_or("shards"))?,
     };
     let sink = Arc::new(Stdout { mu: Mutex::new(()) });
     let lines = a.has("--stdin-control").then(|| stdin_lines(sink.clone()));

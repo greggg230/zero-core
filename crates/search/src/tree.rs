@@ -192,6 +192,12 @@ fn sig_hash(key: &[u64], player: usize, acts: &[u16]) -> u64 {
 /// of the whole transition go to `key`, and `legal` ends up holding the legal actions of the
 /// pending decision (empty if the game is over). `forced`: outcomes to replay (chance_k).
 pub fn transition_with<G: SearchGame>(g: &mut G, a: u16, forced: Option<&[u64]>, key: &mut Vec<u64>, legal: &mut Vec<u16>, auto: impl Fn(usize) -> bool) -> Result<(), String> {
+    transition_each(g, a, forced, key, legal, auto, |_| {})
+}
+
+/// `transition_with`, calling `each(action)` after every step it makes - `a`, then each single-option
+/// decision it steps (the driver's trace of a live game's real moves, docs/search.md 2.15).
+pub fn transition_each<G: SearchGame>(g: &mut G, a: u16, forced: Option<&[u64]>, key: &mut Vec<u64>, legal: &mut Vec<u16>, auto: impl Fn(usize) -> bool, mut each: impl FnMut(u16)) -> Result<(), String> {
     key.clear();
     legal.clear();
     if let Some(f) = forced {
@@ -199,6 +205,7 @@ pub fn transition_with<G: SearchGame>(g: &mut G, a: u16, forced: Option<&[u64]>,
     }
     let r = (|| {
         g.step(a, key)?;
+        each(a);
         while let Some(p) = g.to_move() {
             legal.clear();
             g.legal_actions(legal);
@@ -210,6 +217,7 @@ pub fn transition_with<G: SearchGame>(g: &mut G, a: u16, forced: Option<&[u64]>,
             }
             let o = legal[0];
             g.step(o, key)?;
+            each(o);
             legal.clear();
         }
         Ok(())

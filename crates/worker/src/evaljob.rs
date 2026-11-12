@@ -471,5 +471,5 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
     let mut stats = p.stats();
     stats["peak_rss_mb"] = json!(peak_rss_mb());
     stats["seconds"] = json!((t0.elapsed().as_secs_f64() * 100.0).round() / 100.0);
-    Ok(Outcome { reason, stats, unfinished: missing_ranges(lo, hi, &p.finished_gids), shards: written })
+    Ok(Outcome { reason, stats, unfinished: missing_ranges(lo, hi, &p.finished_gids), shards: written, records: Vec::new() })
 }

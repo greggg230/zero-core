@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Map, Value};
 use zero_worker::job::{do_resume, do_yield, run_job, Control, EvalKind, EvalLink, Job, Progress, Sink};
 use zero_worker::npz::read_npz;
+use zero_worker::records::Output;
 use zero_worker::settings::Settings;
 use zero_worker::GameEntry;
 
@@ -51,6 +52,7 @@ fn job(dir: &Path, games: u64, gid_base: u32, groups: usize, sparse: bool) -> Jo
         meta: Map::new(),
         record_batches: None,
         status_s: 0.0,
+        output: Output::Shards,
     }
 }
 
@@ -186,4 +188,92 @@ fn quit_and_finish() {
     // finish: every game started was finished; the unfinished are the ones never started (one range)
     assert_eq!(o.unfinished.len(), 1);
     assert_eq!(o.unfinished[0], (done as u32, 40));
+}
+
+/// A records file (`zero_worker::records`): its header and its games' records.
+fn read_records(p: &Path) -> (Value, Vec<String>) {
+    use std::io::Read;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(p).unwrap()).read_to_string(&mut text).unwrap();
+    let mut lines = text.lines();
+    let h: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    (h, lines.map(String::from).collect())
+}
+
+/// Toy settings with every kind of row a record must rebuild: auxiliary targets and value-only rows.
+fn rich(j: &mut Job) {
+    use zero_worker::pyjson::PyJson;
+    j.settings.set("aux_next_card_w", PyJson::Float(1.0));
+    j.settings.set("selfplay_view_samples", PyJson::Float(0.5));
+    j.settings.set("shard_rows", PyJson::Int(60));
+}
+
+#[test]
+fn records_replay_to_the_shards_rows_bit_for_bit() {
+    for sparse in [true, false] {
+        let d = tmp(&format!("records-{sparse}"));
+        let mut j = job(&d, 30, 40, 2, sparse);
+        rich(&mut j);
+        j.output = Output::Both;
+        let (o, ev) = run(&j, |_, _, _, _| {});
+        assert_eq!(o.reason, "done");
+        assert!(o.records.len() >= 2, "several records files: {}", o.records.len());
+        assert_eq!(o.records.len(), o.shards.len(), "records files and shards are cut at the same games");
+        let (mut rows, mut views, mut auxed) = (0, 0, 0);
+        for (rw, sw) in o.records.iter().zip(&o.shards) {
+            let (h, lines) = read_records(&rw.path);
+            assert_eq!((h["records"].as_u64(), h["game"].as_str(), h["aux"].as_bool(), h["seed"].as_u64()), (Some(1), Some("toy"), Some(true), Some(99)));
+            assert_eq!(h["games"].as_u64(), Some(lines.len() as u64));
+            let mut gids: Vec<u32> = rw.gids.clone();
+            gids.sort();
+            let mut sg = sw.gids.clone();
+            sg.sort();
+            assert_eq!(gids, sg, "the file's games are the shard's");
+            // the rows rebuilt from the records, through the same shard writer, against the shard written directly
+            let games: Vec<zero_worker::shard::GameSamples> = lines
+                .iter()
+                .map(|l| {
+                    let rp = zero_search::record::replay_json::<zero_search::toy::ToyGame>(h["spec"].as_str().unwrap(), l, true).unwrap();
+                    assert_eq!(rp.seed, zero_search::record::game_seed(99, rp.gid, false), "the game's seed is its id's");
+                    zero_worker::shard::GameSamples { gid: rp.gid, records: rp.records }
+                })
+                .filter(|g| !g.records.is_empty())
+                .collect();
+            let f = <zero_search::toy::ToyGame as zero_search::SearchGame>::NUM_FEATURES;
+            let (arrays, _, probs) = zero_worker::shard::shard_arrays(&games, f, sparse);
+            assert!(probs.is_empty());
+            let z = read_npz(&sw.path).unwrap();
+            assert_eq!(z.len() - 1, arrays.len(), "the same members");
+            for (name, a) in &arrays {
+                assert_eq!(z[*name].data, a.data, "{name}: rebuilt rows == the shard's");
+                assert_eq!(z[*name].shape, a.shape, "{name}");
+            }
+            rows += games.iter().map(|g| g.records.len()).sum::<usize>();
+            views += games.iter().flat_map(|g| g.records.iter()).filter(|r| r.opts.is_empty()).count();
+            auxed += games.iter().flat_map(|g| g.records.iter()).filter(|r| r.aux.iter().any(|&x| x != 0.0)).count();
+        }
+        assert_eq!(rows, o.shards.iter().map(|w| w.rows).sum::<usize>());
+        assert!(views > 0 && auxed > 0, "value-only rows {views}, rows with auxiliary targets {auxed}");
+        let n_rec = ev.iter().filter(|e| e["ev"] == "records").count();
+        assert_eq!(n_rec, o.records.len());
+        assert_eq!(o.stats["rows"].as_u64(), Some(rows as u64), "rows counted once");
+    }
+}
+
+#[test]
+fn a_served_job_writes_records_only() {
+    let d = tmp("records-only");
+    let mut j = job(&d, 9, 0, 1, true);
+    j.output = Output::Records;
+    let (o, ev) = run(&j, |_, _, _, _| {});
+    assert_eq!(o.reason, "done");
+    assert!(o.shards.is_empty() && !o.records.is_empty());
+    assert!(!std::fs::read_dir(&d).unwrap().any(|e| e.unwrap().path().extension().is_some_and(|x| x == "npz")));
+    assert!(ev.iter().all(|e| e["ev"] != "shard"));
+    let games: u64 = ev.iter().filter(|e| e["ev"] == "records").map(|e| e["games"].as_u64().unwrap()).sum();
+    assert_eq!(games, 9);
+    for e in ev.iter().filter(|e| e["ev"] == "records") {
+        assert!(e["path"].as_str().unwrap().ends_with(".rec.jsonl.gz"));
+        assert_eq!(e["gen"].as_u64(), Some(7), "the rows' network");
+    }
 }

@@ -1,0 +1,360 @@
+//! Game records (zero-farm DESIGN.md 6.1, docs/search.md 2.15): one self-play game as what replays it - its
+//! seed, every real move (forced single-option steps and external answers included) - plus only what the
+//! search produced: per training row its step index, decider, kind (leaf / value-only), policy target as
+//! float16 over that step's options, root value `q` (float16 per seat, relative to the decider) and network
+//! id. Everything else of a training row (`x`, the options, `z`, `sc`, the auxiliary targets) is the game's:
+//! `replay` rebuilds the rows from a record exactly as the driver emitted them.
+//!
+//! A driver records its games' traces when asked (`Driver::set_trace`, off by default: nothing changes):
+//! every finished game's `GameResult::trace` holds its seed, its real moves and the game's own record of
+//! its setup (`SearchGame::record_setup`: MTG Zero's per-seat decks), and each training record its
+//! `Record::step` (the real moves played before its decision). `game_json` turns a finished game and its
+//! samples into a record (JSON, one object); `replay` plays it back.
+//!
+//! The record of one game (`records/1`):
+//!
+//! ```text
+//! {"gid": u32, "n": players, "seed": u64 (the game's: new_game(spec, n, seed)),
+//!  "steps": [action (u16) | "external answer" (string), ...],
+//!  "over": bool, "aborted": bool, "resigned": winner seat | null,
+//!  "result": [f32 bits per seat], "margin": [f32 bits per seat] (over games; else []), "rounds": u32,
+//!  "setup": "<SearchGame::record_setup>" (left out when empty),
+//!  "samples": {"step": [...], "player": [...], "kind": [0 leaf | 1 value-only, ...], "net": [...],
+//!              "pi": [f16 bits over each leaf row's options, in order], "q": [f16 bits x n per row]}}
+//! ```
+//!
+//! Replay is the validation (DESIGN.md 6.1): an illegal or impossible move, a sample whose decider is not
+//! the step's (or whose options don't match its policy's length), a terminal result, margin, round count or
+//! setup that differs from the record's - any of them rejects the whole record. The search's outputs (`pi`,
+//! `q`) can't be checked without searching again; they are checked to be finite and in [0, 1].
+use serde_json::{json, Map, Value};
+
+use crate::driver::{f16_to_f32, f32_to_f16, GameResult, Record};
+use crate::game::{SearchGame, MAX_SEATS};
+
+/// The record format's version (`records/1`).
+pub const RECORDS_VERSION: u32 = 1;
+
+/// One real move of a game.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TraceStep {
+    /// A legal action (decisions with a single option included: the driver steps them as moves).
+    Act(u16),
+    /// An external seat's answer (`SearchGame::apply_external`'s payload).
+    Ext(String),
+}
+
+/// What replays a finished game (`Driver::set_trace`): its seed (`SearchGame::new_game`'s), its real moves
+/// in order, the game's record of its setup (`SearchGame::record_setup`) and, for a game that ended with a
+/// result, each seat's margin (`SearchGame::margin`, what its samples' `sc` hold).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GameTrace {
+    pub seed: u64,
+    pub steps: Vec<TraceStep>,
+    pub setup: String,
+    /// `margin(seat)` per seat when the game is over (a result or a resignation), else empty.
+    pub margins: Vec<f32>,
+}
+
+/// Kind of a sample in a record: a searched decision's row (with its options and policy target).
+pub const KIND_LEAF: u8 = 0;
+/// Kind of a sample in a record: a value-only row (no options; `NnSeat::view_samples`).
+pub const KIND_VALUE: u8 = 1;
+
+fn bits32(v: &[f32]) -> Vec<Value> {
+    v.iter().map(|x| json!(x.to_bits())).collect()
+}
+
+/// The record of finished game `row` (its trace on: `Driver::set_trace`) and its emitted samples (`row.samples`
+/// of them, in order, as `take_samples` gave them) - one JSON object (module docs).
+pub fn game_json(row: &GameResult, samples: &[Record]) -> Result<Value, String> {
+    let t = row.trace.as_ref().ok_or_else(|| format!("game {}: no trace (Driver::set_trace)", row.gid))?;
+    if samples.len() != row.samples as usize {
+        return Err(format!("game {}: {} samples given, its row says {}", row.gid, samples.len(), row.samples));
+    }
+    let n = row.n;
+    let steps: Vec<Value> = t
+        .steps
+        .iter()
+        .map(|s| match s {
+            TraceStep::Act(a) => json!(a),
+            TraceStep::Ext(p) => json!(p),
+        })
+        .collect();
+    let (mut st, mut pl, mut kind, mut net, mut pi, mut q) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+    for r in samples {
+        if r.n_players as usize != n {
+            return Err(format!("game {}: a sample of {} players in a game of {n}", row.gid, r.n_players));
+        }
+        st.push(json!(r.step));
+        pl.push(json!(r.player));
+        let k = if r.opts.is_empty() { KIND_VALUE } else { KIND_LEAF };
+        if k == KIND_VALUE && !r.pi.is_empty() {
+            return Err(format!("game {}: a value-only sample with a policy", row.gid));
+        }
+        if r.pi.len() != r.opts.len() {
+            return Err(format!("game {}: a sample's policy over {} values for {} options", row.gid, r.pi.len(), r.opts.len()));
+        }
+        kind.push(json!(k));
+        net.push(json!(r.net));
+        pi.extend(r.pi.iter().map(|&x| json!(f32_to_f16(x))));
+        q.extend(r.q[..n].iter().map(|&x| json!(f32_to_f16(x))));
+    }
+    let resigned = row.resign.as_ref().filter(|r| r.resigned).and_then(|r| r.winner);
+    let mut o = Map::new();
+    o.insert("gid".into(), json!(row.gid));
+    o.insert("n".into(), json!(n));
+    o.insert("seed".into(), json!(t.seed));
+    o.insert("steps".into(), Value::Array(steps));
+    o.insert("over".into(), json!(row.over));
+    o.insert("aborted".into(), json!(row.aborted));
+    o.insert("resigned".into(), json!(resigned));
+    o.insert("result".into(), Value::Array(bits32(&row.result)));
+    o.insert("margin".into(), Value::Array(bits32(&t.margins)));
+    o.insert("rounds".into(), json!(row.rounds));
+    if !t.setup.is_empty() {
+        o.insert("setup".into(), json!(t.setup));
+    }
+    o.insert("samples".into(), json!({"step": st, "player": pl, "kind": kind, "net": net, "pi": pi, "q": q}));
+    Ok(Value::Object(o))
+}
+
+/// A replayed record: the training rows exactly as the driver emitted them (`Record`s in the record's order:
+/// `x` = `encode(decider)`, the options, `z` = the result, `sc` = the margins, `aux` = the decider's auxiliary
+/// targets with `aux` on; `pi`, `q`, `net` the record's) and the game's facts.
+#[derive(Clone, Debug)]
+pub struct Replayed {
+    pub gid: u32,
+    pub n: usize,
+    pub seed: u64,
+    pub over: bool,
+    pub aborted: bool,
+    pub resigned: Option<u8>,
+    pub result: Vec<f32>,
+    pub rounds: u32,
+    /// Real moves replayed.
+    pub steps: usize,
+    pub setup: String,
+    pub records: Vec<Record>,
+}
+
+fn field<'a>(o: &'a Map<String, Value>, k: &str) -> Result<&'a Value, String> {
+    o.get(k).ok_or_else(|| format!("record: no {k:?}"))
+}
+
+fn uint(v: &Value, what: &str, max: u64) -> Result<u64, String> {
+    v.as_u64().filter(|&x| x <= max).ok_or_else(|| format!("record: {what} {v} is not an integer in [0, {max}]"))
+}
+
+fn uints(o: &Map<String, Value>, k: &str, max: u64) -> Result<Vec<u64>, String> {
+    let a = field(o, k)?.as_array().ok_or_else(|| format!("record: {k} is not a list"))?;
+    a.iter().map(|v| uint(v, k, max)).collect()
+}
+
+fn f32s(o: &Map<String, Value>, k: &str) -> Result<Vec<f32>, String> {
+    Ok(uints(o, k, u32::MAX as u64)?.into_iter().map(|b| f32::from_bits(b as u32)).collect())
+}
+
+fn same_bits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// Replay one game record (`game_json`'s object) of game type `G` with spec `spec` -> its training rows and
+/// facts, or why the record is refused (module docs). `aux`: the rows carry the decider's auxiliary targets
+/// (the driver's `aux`, the run's auxiliary targets on). The game is replayed on a copy of the new game, never
+/// on the game `new_game` made (a game may do what only its live game does - MTG Zero's EoE game log - and a
+/// replay is not a live game).
+pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<Replayed, String> {
+    let o = rec.as_object().ok_or("record: not a JSON object")?;
+    let gid = uint(field(o, "gid")?, "gid", u32::MAX as u64)? as u32;
+    let n = uint(field(o, "n")?, "n", MAX_SEATS as u64)? as usize;
+    if n < G::MIN_PLAYERS || n > G::MAX_PLAYERS.min(MAX_SEATS) {
+        return Err(format!("record: {n} players ({} plays {}..={})", G::NAME, G::MIN_PLAYERS, G::MAX_PLAYERS));
+    }
+    let seed = field(o, "seed")?.as_u64().ok_or("record: seed is not a u64")?;
+    let over = field(o, "over")?.as_bool().ok_or("record: over is not a bool")?;
+    let aborted = field(o, "aborted")?.as_bool().ok_or("record: aborted is not a bool")?;
+    let resigned = match field(o, "resigned")? {
+        Value::Null => None,
+        v => Some(uint(v, "resigned", n as u64 - 1)? as u8),
+    };
+    let result = f32s(o, "result")?;
+    let margin = f32s(o, "margin")?;
+    let rounds = uint(field(o, "rounds")?, "rounds", u32::MAX as u64)? as u32;
+    let setup = match o.get("setup") {
+        None => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => return Err(format!("record: setup {v} is not a string")),
+    };
+    let steps = field(o, "steps")?.as_array().ok_or("record: steps is not a list")?;
+    let s = field(o, "samples")?.as_object().ok_or("record: samples is not an object")?;
+    let st = uints(s, "step", steps.len() as u64)?;
+    let pl = uints(s, "player", n as u64 - 1)?;
+    let kind = uints(s, "kind", KIND_VALUE as u64)?;
+    let net = uints(s, "net", u32::MAX as u64)?;
+    let pi = uints(s, "pi", u16::MAX as u64)?;
+    let q = uints(s, "q", u16::MAX as u64)?;
+    let ns = st.len();
+    if pl.len() != ns || kind.len() != ns || net.len() != ns || q.len() != ns * n {
+        return Err(format!("record: samples of {ns} steps, {} players, {} kinds, {} nets, {} q values ({n} per row)", pl.len(), kind.len(), net.len(), q.len()));
+    }
+    if st.windows(2).any(|w| w[0] > w[1]) {
+        return Err("record: the samples' steps are not in order".into());
+    }
+    if result.len() != n {
+        return Err(format!("record: a result of {} seats in a game of {n}", result.len()));
+    }
+    if ns > 0 && !(over || resigned.is_some()) {
+        return Err("record: samples from a game without a result (a game cut short emits none)".into());
+    }
+    if resigned.is_some() && (!over || aborted) {
+        return Err("record: a resigned game is over and not aborted".into());
+    }
+    let unit = |h: u64| {
+        let x = f16_to_f32(h as u16);
+        x.is_finite() && (0.0..=1.0).contains(&x)
+    };
+    if let Some(i) = pi.iter().position(|&h| !unit(h)) {
+        return Err(format!("record: policy value {i} (f16 {:#06x}) is not in [0, 1]", pi[i]));
+    }
+    if let Some(i) = q.iter().position(|&h| !unit(h)) {
+        return Err(format!("record: q value {i} (f16 {:#06x}) is not in [0, 1]", q[i]));
+    }
+
+    // the game, replayed on a copy of the game new_game made (module docs)
+    let mut g = G::new_game(spec, n, seed).map_err(|e| format!("record: new_game: {e}"))?.clone();
+    if g.num_players() != n {
+        return Err(format!("record: new_game made a game of {} players, the record says {n}", g.num_players()));
+    }
+    let mut records: Vec<Record> = Vec::with_capacity(ns);
+    let mut legal: Vec<u16> = Vec::new();
+    let mut chance: Vec<u64> = Vec::new();
+    let (mut j, mut pk) = (0usize, 0usize);
+    for k in 0..=steps.len() {
+        while j < ns && st[j] as usize == k {
+            let p = pl[j] as usize;
+            let to_move = g.to_move();
+            let mut opts = Vec::new();
+            let mut pis = Vec::new();
+            if kind[j] as u8 == KIND_LEAF {
+                if to_move != Some(p) {
+                    return Err(format!("record: sample {j} (step {k}) is seat {p}'s decision, the game has {to_move:?} to move"));
+                }
+                legal.clear();
+                g.legal_actions(&mut legal);
+                if legal.len() < 2 {
+                    return Err(format!("record: sample {j} (step {k}): a decision of {} option(s) is never searched", legal.len()));
+                }
+                if pk + legal.len() > pi.len() {
+                    return Err(format!("record: sample {j} (step {k}) has {} options, the policy {} values left", legal.len(), pi.len() - pk));
+                }
+                opts = legal.clone();
+                pis = pi[pk..pk + legal.len()].iter().map(|&h| f16_to_f32(h as u16)).collect();
+                pk += legal.len();
+            } else if to_move.is_none() || to_move == Some(p) {
+                return Err(format!("record: value-only sample {j} (step {k}) of seat {p}: the game has {to_move:?} to move"));
+            }
+            let mut x = vec![0.0f32; G::NUM_FEATURES];
+            g.encode(p, &mut x);
+            let mut a = Vec::new();
+            if aux {
+                a.resize(G::aux_width(), 0.0);
+                g.aux_target(p, &mut a);
+            }
+            let mut qv = [0.0f32; MAX_SEATS];
+            for (c, &h) in q[j * n..(j + 1) * n].iter().enumerate() {
+                qv[c] = f16_to_f32(h as u16);
+            }
+            records.push(Record { x, player: p as u8, n_players: n as u8, opts, pi: pis, z: [0.0; MAX_SEATS], q: qv, sc: [0.0; MAX_SEATS], net: net[j] as u32, aux: a, step: k as u32 });
+            j += 1;
+        }
+        if k == steps.len() {
+            break;
+        }
+        let Some(p) = g.to_move() else {
+            return Err(format!("record: step {k} of {} after the game ended", steps.len()));
+        };
+        chance.clear();
+        match &steps[k] {
+            Value::String(pl) => g.apply_external(pl, &mut chance).map_err(|e| format!("record: step {k}: external answer: {e}"))?,
+            v => {
+                let a = uint(v, "step", u16::MAX as u64)? as u16;
+                legal.clear();
+                g.legal_actions(&mut legal);
+                if !legal.contains(&a) {
+                    return Err(format!("record: step {k}: action {a} is not one of seat {p}'s {} legal actions", legal.len()));
+                }
+                g.step(a, &mut chance).map_err(|e| format!("record: step {k}: action {a}: {e}"))?;
+            }
+        }
+    }
+    if j != ns {
+        return Err(format!("record: {} samples after the last step", ns - j));
+    }
+    if pk != pi.len() {
+        return Err(format!("record: {} policy values left over", pi.len() - pk));
+    }
+    // the end: as the driver ended the game (driver::worker::finish / emit)
+    let ended = g.to_move().is_none();
+    let res: Vec<f32> = match resigned {
+        Some(w) => {
+            if ended {
+                return Err("record: a resigned game the replay finished".into());
+            }
+            (0..n).map(|s| if s == w as usize { 1.0 } else { 0.0 }).collect()
+        }
+        None if over => {
+            if !ended || g.aborted() {
+                return Err(format!("record: the game is over, its replay {}", if ended { "aborted" } else { "is not" }));
+            }
+            g.result()[..n].to_vec()
+        }
+        None => {
+            if ended && !g.aborted() && !aborted {
+                return Err("record: a game without a result that the replay finished with one".into());
+            }
+            if aborted != (ended && g.aborted()) {
+                return Err(format!("record: aborted {aborted}, the replay {}", ended && g.aborted()));
+            }
+            vec![1.0 / n as f32; n]
+        }
+    };
+    if !same_bits(&res, &result) {
+        return Err(format!("record: result {result:?}, the replay's {res:?}"));
+    }
+    let margins: Vec<f32> = if over { (0..n).map(|s| g.margin(s)).collect() } else { Vec::new() };
+    if !same_bits(&margins, &margin) {
+        return Err(format!("record: margins {margin:?}, the replay's {margins:?}"));
+    }
+    if g.rounds() != rounds {
+        return Err(format!("record: {rounds} rounds, the replay's {}", g.rounds()));
+    }
+    let set = g.record_setup();
+    if set != setup {
+        return Err(format!("record: the game's setup differs from the record's (record {} bytes, replay {} bytes)", setup.len(), set.len()));
+    }
+    // the samples' z and sc relative to their deciders (driver::worker::emit)
+    for r in &mut records {
+        for c in 0..n {
+            let s = (r.player as usize + c) % n;
+            r.z[c] = res[s];
+            r.sc[c] = margins[s];
+        }
+    }
+    Ok(Replayed { gid, n, seed, over, aborted, resigned, result: res, rounds, steps: steps.len(), setup, records })
+}
+
+/// The seed of game `gid` of a driver seeded `seed` (`SearchGame::new_game`'s, as the driver starts it:
+/// `driver::worker::init_slot`; `paired`: the pair's stream, `DriverCfg::paired`). A record's `seed` must be its
+/// game id's: a worker can't choose its games.
+pub fn game_seed(seed: u64, gid: u32, paired: bool) -> u64 {
+    let stream = if paired { gid / 2 } else { gid };
+    crate::rng::Rng::new(crate::rng::split64(seed ^ crate::rng::split64(stream as u64 + 1))).next_u64()
+}
+
+/// `replay` from JSON text: the spec (`SearchGame::parse_spec`) and one game's record.
+pub fn replay_json<G: SearchGame>(spec: &str, rec: &str, aux: bool) -> Result<Replayed, String> {
+    let sp = G::parse_spec(spec)?;
+    let v: Value = serde_json::from_str(rec).map_err(|e| format!("record: not JSON: {e}"))?;
+    replay::<G>(&sp, &v, aux)
+}

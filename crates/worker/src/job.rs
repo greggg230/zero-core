@@ -1,6 +1,7 @@
 //! A self-play job: the games `gid_base .. gid_base + games` of a run's self-play driver (the Python
 //! remote worker's: rolling, queue_only, its seed; `settings::selfplay_driver_cfg`) played with one
-//! network, their samples written as shards (`shard`). The loop is the remote worker's
+//! network, written as game records (`records`: what replays each game and its search's outputs; zero-farm
+//! phase 3) and / or their samples as shards (`shard`; `Job::output`). The loop is the remote worker's
 //! (`remoteplay.Worker._phase` + `infer.drive`): `resume`, then `pump` (take the finished games'
 //! results and samples, write them, queue a setup of the run's spec for every game it may start -
 //! at most `conc` in flight, `games` in all), the drive loop with up to two network batches in flight
@@ -28,6 +29,7 @@ use zero_search::dynapi::DynDriver;
 
 use crate::eval::{Answer, Evaluator, Expect, OrtCfg, OrtEvaluator, Uniform};
 use crate::settings::{selfplay_driver_cfg, spec_of, Settings};
+use crate::records::{Output, RecordWriter};
 use crate::shard::{GameSamples, Npy, ShardWriter, Written};
 use crate::GameEntry;
 
@@ -69,6 +71,8 @@ pub struct Job {
     /// Keep the first n network batches as sent to the evaluator (onnx_record.py's format) in this file.
     pub record_batches: Option<(PathBuf, usize)>,
     pub status_s: f64,
+    /// Game records, shards or both (`records`).
+    pub output: Output,
 }
 
 /// A checkpoint to switch to.
@@ -265,6 +269,8 @@ pub struct Outcome {
     /// Game ids of the job that did not finish (half-open ranges).
     pub unfinished: Vec<(u32, u32)>,
     pub shards: Vec<Written>,
+    /// The records files written (`Output::Records` / `Both`).
+    pub records: Vec<Written>,
 }
 
 /// Ranges [a, b) of the ids in `lo..hi` not in `done`.
@@ -502,6 +508,8 @@ struct Run<'a> {
     answers: Receiver<(u64, Result<Answer, String>, f64)>,
     pending: VecDeque<u64>,
     writer: ShardWriter,
+    /// The records files (`Job::output` with records).
+    rec: Option<RecordWriter>,
     spec: String,
     cap: u64,
     enq: u64,
@@ -530,15 +538,19 @@ impl Run<'_> {
         p.wall_s = self.t0.elapsed().as_secs_f64();
     }
 
-    fn emit_shard(&mut self, w: Written) {
+    /// A result file is ready: `ev` 'shard' or 'records' (PROTOCOL.md 5). Its rows count once (the records' when
+    /// both are written).
+    fn emit_file(&mut self, ev: &str, w: Written) {
         {
             let mut p = self.progress.lock().unwrap();
-            p.rows += w.rows as u64;
+            if ev == "records" || !self.job.output.records() {
+                p.rows += w.rows as u64;
+            }
             p.shards += 1;
         }
         let rel = w.path.strip_prefix(&self.job.out_dir).map(|p| p.to_path_buf()).unwrap_or_else(|_| w.path.clone());
         let gids: Vec<[u32; 2]> = ranges(&w.gids).into_iter().map(|r| [r.0, r.1]).collect();
-        self.sink.event(json!({"ev": "shard", "seq": w.seq, "path": rel.to_string_lossy().replace('\\', "/"), "games": w.games, "rows": w.rows, "bytes": w.bytes, "gids": gids, "gen": w.gen}));
+        self.sink.event(json!({"ev": ev, "seq": w.seq, "path": rel.to_string_lossy().replace('\\', "/"), "games": w.games, "rows": w.rows, "bytes": w.bytes, "gids": gids, "gen": w.gen}));
     }
 
     /// The remote worker's `pump`: control, finished games into the shards, setups queued, status.
@@ -580,8 +592,15 @@ impl Run<'_> {
                 p.finished_gids.push(r.gid);
                 p.decisions += r.decisions as u64;
             }
-            if let Some(w) = self.writer.add(GameSamples { gid: r.gid, records })? {
-                self.emit_shard(w);
+            if let Some(rw) = self.rec.as_mut() {
+                if let Some(w) = rw.add(&r, &records)? {
+                    self.emit_file("records", w);
+                }
+            }
+            if self.job.output.shards() {
+                if let Some(w) = self.writer.add(GameSamples { gid: r.gid, records })? {
+                    self.emit_file("shard", w);
+                }
             }
         }
         if it.next().is_some() {
@@ -692,9 +711,14 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     }
     let cap = cfg.concurrency as u64;
     let spec = spec_of(&job.settings)?;
+    let aux = cfg.aux;
     let mut drv = (game.new_driver)(cfg)?;
     if job.gid_base != 0 {
         drv.set_first_gid(job.gid_base)?;
+    }
+    if job.output.records() {
+        // (every game's seed, real moves and setup: what its record replays from; zero-core docs/search.md 2.15)
+        drv.set_trace(true)?;
     }
     drv.resume(BIG, job.net)?;
     let mut meta = Map::new();
@@ -704,10 +728,25 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     meta.extend(job.meta.clone());
     let sparse = crate::settings::truthy(job.settings.get("shard_sparse").unwrap_or(&crate::pyjson::PyJson::Null));
     let shard_rows = crate::settings::py_int("shard_rows", job.settings.req("shard_rows")?)?;
+    let rec = if job.output.records() {
+        let mut h = Map::new();
+        h.insert("game".into(), json!(info.name));
+        h.insert("spec".into(), json!(spec));
+        h.insert("aux".into(), json!(aux));
+        h.insert("features".into(), json!(info.num_features));
+        h.insert("actions".into(), json!(info.num_actions));
+        h.insert("aux_width".into(), json!(info.aux.iter().map(|a| a.1).sum::<usize>()));
+        h.insert("seed".into(), json!(job.seed));
+        h.insert("lease".into(), json!(job.lease_id));
+        h.insert("build_id".into(), job.meta.get("build_id").cloned().unwrap_or(Value::Null));
+        Some(RecordWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, h, 6)?)
+    } else {
+        None
+    };
     let writer = ShardWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, meta, sparse, info.num_features, 1)?;
     let (link, answers, eval_thread) = spawn_eval(ev);
     link_out(link.clone());
-    let mut r = Run { job, sink, ctl, drv, link, answers, pending: VecDeque::new(), writer, spec, cap, enq: 0, finished: 0, stop_topup: false, ended: false, switching: None, progress: progress.clone(), recorder: job.record_batches.as_ref().map(|(p, n)| Recorder::new(p.clone(), *n)), want, t0, t_status: Instant::now(), fin_unsent: 0 };
+    let mut r = Run { job, sink, ctl, drv, link, answers, pending: VecDeque::new(), writer, rec, spec, cap, enq: 0, finished: 0, stop_topup: false, ended: false, switching: None, progress: progress.clone(), recorder: job.record_batches.as_ref().map(|(p, n)| Recorder::new(p.clone(), *n)), want, t0, t_status: Instant::now(), fin_unsent: 0 };
     let res = (|| -> Result<(), String> {
         r.pump()?;
         let mut idle = 0;
@@ -738,8 +777,11 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
             r.pump()?;
         }
         r.pump()?;
+        if let Some(w) = r.rec.as_mut().map(|rw| rw.flush()).transpose()?.flatten() {
+            r.emit_file("records", w);
+        }
         if let Some(w) = r.writer.flush()? {
-            r.emit_shard(w);
+            r.emit_file("shard", w);
         }
         Ok(())
     })();
@@ -748,7 +790,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         _ => Ok(()),
     };
     r.snapshot();
-    let Run { link, writer, .. } = r;
+    let Run { link, writer, rec, .. } = r;
     let _ = link.tx.send(Req::Stop);
     drop(link);
     let _ = eval_thread.join();
@@ -768,9 +810,9 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     stats["peak_rss_mb"] = json!(peak_rss_mb());
     // (games after the last shard that had no samples - an aborted game -: in no shard's `games`; the remote
     // worker's 'unshipped')
-    stats["unshipped"] = json!(writer.pending_games());
+    stats["unshipped"] = json!(rec.as_ref().map_or(writer.pending_games(), |rw| rw.pending_games()));
     stats["seconds"] = json!((t0.elapsed().as_secs_f64() * 100.0).round() / 100.0);
-    Ok(Outcome { reason, stats, unfinished: missing_ranges(lo, hi, &p.finished_gids), shards: writer.written })
+    Ok(Outcome { reason, stats, unfinished: missing_ranges(lo, hi, &p.finished_gids), shards: writer.written, records: rec.map(|rw| rw.written).unwrap_or_default() })
 }
 
 /// The yield (`aw/1`): no more batches started, the ones in flight answered, the session dropped.

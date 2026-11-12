@@ -14,6 +14,8 @@
 //! * `lookahead`: the exhaustive lookahead per information set (docs/search.md 3.9; a seat's opt-in
 //!   `lookahead`), its rows batched through the driver like MCTS leaves.
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
+//! * `record`: game records (a game's seed, real moves and search outputs) and their replay into the
+//!   training rows the driver emitted (docs/search.md 2.15; zero-farm's self-play records).
 //! * `settings`: the driver's settings from JSON - seats, branch, starts, a whole `DriverCfg` (the one
 //!   parser the bindings and native workers share; docs/search.md 4.1).
 pub mod driver;
@@ -21,6 +23,7 @@ pub mod dynapi;
 pub mod game;
 pub mod lookahead;
 pub mod noise;
+pub mod record;
 pub mod rng;
 pub mod settings;
 pub mod toy;

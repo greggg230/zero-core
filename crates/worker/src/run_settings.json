@@ -481,6 +481,62 @@
    "class": "trainer",
    "why": "orchestration"
   },
+  "pool_build": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_runtime": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_worker": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_url": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_max_stale": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_quota": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_slack": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_games_per_lease": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_priority": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_needs_ram_mb": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_poll_s": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_key": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_farm_release": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
+  "pool_expires_days": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 43)"
+  },
   "selfplay_local": {
    "class": "trainer",
    "why": "orchestration"

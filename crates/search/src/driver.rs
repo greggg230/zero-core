@@ -67,6 +67,7 @@ use std::time::Instant;
 
 use crate::game::{make_bot, Belief, Bot, SearchGame, MAX_SEATS};
 use crate::lookahead::{Look, LookCfg};
+pub use crate::record::{GameTrace, TraceStep};
 use crate::rng::{split64, Rng};
 use crate::tree::Tree;
 
@@ -810,6 +811,9 @@ pub struct GameResult {
     pub start: Option<u32>,
     /// Self-play resignation (`NnSeat::resign_t`, docs/search.md 3.14): None unless the game's seats resign.
     pub resign: Option<ResignInfo>,
+    /// The game's trace (`Driver::set_trace`, docs/search.md 2.15): its seed, real moves and setup record -
+    /// what replays it (`record::replay`). None while tracing is off (the default).
+    pub trace: Option<Box<GameTrace>>,
 }
 
 /// One recorded root decision with its targets.
@@ -827,6 +831,9 @@ pub struct Record {
     pub net: u32,
     /// The decider's auxiliary targets at this decision (`DriverCfg::aux`), else empty.
     pub aux: Vec<f32>,
+    /// The real moves of its game played before this decision (`GameResult::trace`'s steps; docs/search.md
+    /// 2.15) while the driver traces its games (`Driver::set_trace`), else 0.
+    pub step: u32,
 }
 
 /// The kind of a network batch row (`Batch::extra`, docs/search.md 2.2): a leaf's own row (or a
@@ -1074,14 +1081,15 @@ struct ParkedRecord {
     pi: Vec<f32>,
     net: u32,
     aux: Vec<f32>,
+    step: u32,
 }
 
 impl ParkedRecord {
     fn park(r: Record) -> ParkedRecord {
-        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux }
+        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux, step: r.step }
     }
     fn unpark(self) -> Record {
-        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux }
+        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux, step: self.step }
     }
     fn bytes(&self) -> usize {
         std::mem::size_of::<Self>() + self.x.len() * 2 + self.opts.len() * 2 + self.pi.len() * 4 + self.aux.len() * 4
@@ -1249,6 +1257,9 @@ struct Slot<G: SearchGame> {
     cache: HashMap<(u16, u32, u128), Cached>,
     /// Self-play resignation (docs/search.md 3.14): the game's counter, None unless its seats resign.
     resign: Option<ResignState>,
+    /// The game's real moves so far (`Driver::set_trace`, docs/search.md 2.15; None: not traced) and its seed.
+    trace: Option<Vec<TraceStep>>,
+    game_seed: u64,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -1296,6 +1307,8 @@ impl<G: SearchGame> Slot<G> {
             start_ix: None,
             cache: HashMap::new(),
             resign: None,
+            trace: None,
+            game_seed: 0,
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -1523,6 +1536,8 @@ struct Shared<G: SearchGame> {
     counters: Counters,
     epoch: AtomicU32,
     net: AtomicU32,
+    /// Games started from now on are traced (`Driver::set_trace`).
+    trace: AtomicBool,
 }
 
 impl<G: SearchGame> Shared<G> {
@@ -1862,6 +1877,7 @@ impl<G: SearchGame> Driver<G> {
             counters: Counters::default(),
             epoch: AtomicU32::new(0),
             net: AtomicU32::new(net),
+            trace: AtomicBool::new(false),
         });
         let mut workers = Vec::new();
         for k in 0..threads {
@@ -2042,6 +2058,27 @@ impl<G: SearchGame> Driver<G> {
             return Err("set_first_gid: before the first resume (games have started)".into());
         }
         self.next_gid = gid;
+        Ok(())
+    }
+
+    /// Trace every game (docs/search.md 2.15, zero-farm's self-play records): each finished game's result row
+    /// carries its seed, its real moves (single-option steps and external answers included) and the game's
+    /// setup record (`GameResult::trace`), and each training record the moves played before its decision
+    /// (`Record::step`) - what `record::replay` rebuilds the rows from. A rolling driver's, before its first
+    /// resume. Not with
+    /// branched games or archive starts (their games don't start from a seed alone) nor deferred results
+    /// (a parked game's trace: not kept). Never called: nothing changes.
+    pub fn set_trace(&mut self, on: bool) -> Result<(), String> {
+        if !self.sh.cfg.rolling {
+            return Err("set_trace: a rolling driver's (a fixed table's games start with the driver)".into());
+        }
+        if self.resumed {
+            return Err("set_trace: before the first resume (games have started)".into());
+        }
+        if on && (self.sh.cfg.branch.is_some() || self.sh.cfg.starts.is_some()) {
+            return Err("set_trace: branched games and archive starts are not replayable from a seed (docs/search.md 2.15)".into());
+        }
+        self.sh.trace.store(on, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2266,7 +2303,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None, trace: None };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();

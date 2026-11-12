@@ -27,6 +27,7 @@ use zero_search::driver::{noresign_pick, root_floor, sample_arrays, view_pick, B
 use zero_search::settings::{self, DriverArgs};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
 use zero_search::lookahead::{LookCfg, Outcome};
+use zero_search::record::Replayed;
 use zero_search::{SearchGame, MAX_SEATS};
 
 /// For `engine_module!` (the game crate needs its own `pyo3` dependency too: the PyO3 macros
@@ -39,11 +40,13 @@ pub struct GameEntry {
     pub new_game: fn(&str, usize, u64) -> Result<Box<dyn DynGame>, String>,
     pub new_driver: fn(DriverCfg) -> Result<Box<dyn DynDriver>, String>,
     pub info: fn() -> GameInfo,
+    /// `zero_search::record::replay_json` of the game type (docs/search.md 2.15).
+    pub replay: fn(&str, &str, bool) -> Result<Replayed, String>,
 }
 
 impl GameEntry {
     pub const fn of<G: SearchGame>(name: &'static str) -> GameEntry {
-        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G> }
+        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G>, replay: zero_search::record::replay_json::<G> }
     }
 }
 
@@ -90,6 +93,8 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(belief_weight_of, m)?)?;
     m.add_function(wrap_pyfunction!(gumbel_sequence_of, m)?)?;
     m.add_function(wrap_pyfunction!(completed_q_policy_of, m)?)?;
+    m.add_function(wrap_pyfunction!(replay_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(game_seed_of, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
     m.add("BELIEF_CLIP", BELIEF_CLIP)?;
     Ok(())
@@ -840,55 +845,38 @@ impl PySearchDriver {
     fn take_results<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let out = PyList::empty(py);
         for r in self.d.take_results() {
-            let d = PyDict::new(py);
-            d.set_item("gid", r.gid)?;
-            d.set_item("n", r.n)?;
-            d.set_item("over", r.over)?;
-            d.set_item("aborted", r.aborted)?;
-            d.set_item("result", r.result)?;
-            d.set_item("scores", r.scores)?;
-            d.set_item("steps", r.steps)?;
-            d.set_item("decisions", r.decisions)?;
-            d.set_item("ext_moves", r.ext_moves)?;
-            d.set_item("rounds", r.rounds)?;
-            d.set_item("samples", r.samples)?;
-            d.set_item("tag", r.tag)?;
-            if !r.moves.is_empty() {
-                // DriverCfg::move_log (a diagnostic): [(seat, action, legal actions)]
-                d.set_item("moves", r.moves)?;
-            }
-            if let Some(b) = &r.branch {
-                // a branch game (DriverCfg::branch, docs/search.md 2.11)
-                let bd = PyDict::new(py);
-                bd.set_item("at", b.at)?;
-                bd.set_item("of", b.of)?;
-                bd.set_item("decision", b.decision)?;
-                bd.set_item("step", b.step)?;
-                bd.set_item("action", b.action)?;
-                bd.set_item("moves", b.moves)?;
-                bd.set_item("played", b.played)?;
-                bd.set_item("same_first", b.same_first)?;
-                bd.set_item("start", b.start)?;
-                d.set_item("branch", bd)?;
-            }
-            if let Some(j) = r.start {
-                // a game started from an archive entry (DriverCfg::starts)
-                d.set_item("start", j)?;
-            }
-            if let Some(rs) = &r.resign {
-                // self-play resignation (NnSeat::resign_t, docs/search.md 3.14): only when the game's seats resign
-                let rd = PyDict::new(py);
-                rd.set_item("resigned", rs.resigned)?;
-                rd.set_item("noresign", rs.noresign)?;
-                rd.set_item("winner", rs.winner)?;
-                rd.set_item("decision", rs.decision)?;
-                rd.set_item("step", rs.step)?;
-                rd.set_item("records", rs.records)?;
-                d.set_item("resign", rd)?;
-            }
-            out.append(d)?;
+            out.append(result_row(py, &r)?)?;
         }
         Ok(out)
+    }
+
+    /// Trace every game (`Driver::set_trace`, docs/search.md 2.15): before the first resume.
+    fn set_trace(&mut self, on: bool) -> PyResult<()> {
+        self.d.set_trace(on).map_err(verr)
+    }
+
+    /// A traced driver's finished games (docs/search.md 2.15): take_results and take_samples at one point, with each
+    /// game's record (`zero_search::record::game_json`, JSON text) -> (rows, records, samples dict or None).
+    fn take_game_records<'py>(&mut self, py: Python<'py>) -> PyResult<(Bound<'py, PyList>, Vec<String>, Option<PyObject>)> {
+        let rows = self.d.take_results();
+        let recs = self.d.take_samples();
+        let out = PyList::empty(py);
+        let mut texts = Vec::with_capacity(rows.len());
+        let mut a = 0usize;
+        for r in &rows {
+            let b = a + r.samples as usize;
+            if b > recs.len() {
+                return Err(rerr(format!("game {} has {} samples, {} left", r.gid, r.samples, recs.len() - a)));
+            }
+            texts.push(zero_search::record::game_json(r, &recs[a..b]).map_err(rerr)?.to_string());
+            out.append(result_row(py, r)?)?;
+            a = b;
+        }
+        if a != recs.len() {
+            return Err(rerr(format!("{} samples left over after the finished games", recs.len() - a)));
+        }
+        let s = samples_dict(py, recs, self.nfeat)?;
+        Ok((out, texts, s))
     }
 
     /// Training sample arrays (docs/search.md 2.4) or None.
@@ -1029,6 +1017,92 @@ fn samples_dict(py: Python<'_>, recs: Vec<Record>, f: usize) -> PyResult<Option<
         a.set_item("aux", s.aux.into_pyarray(py).reshape([n, s.aw])?)?;
     }
     Ok(Some(a.into_any().unbind()))
+}
+
+/// One game record replayed (docs/search.md 2.15, zero-farm's self-play records: `zero_search::record`): game
+/// `game` with spec `spec` (JSON text), `record` one game's record (JSON text), `aux` its rows carry the
+/// auxiliary targets -> (the rows as `take_samples` gives them - None for a game without samples -, the game's
+/// facts {gid, n, seed, over, aborted, resigned, result, rounds, steps, setup, rows}). A record replay refuses
+/// raises ValueError with the reason (the record is rejected whole).
+#[pyfunction]
+#[pyo3(signature = (game, spec, record, aux=false))]
+fn replay_rows(py: Python<'_>, game: &str, spec: &str, record: &str, aux: bool) -> PyResult<(Option<PyObject>, PyObject)> {
+    let e = entry(game).map_err(verr)?;
+    let (spec, record) = (spec.to_string(), record.to_string());
+    let rp = py.allow_threads(move || (e.replay)(&spec, &record, aux)).map_err(verr)?;
+    let info = PyDict::new(py);
+    info.set_item("gid", rp.gid)?;
+    info.set_item("n", rp.n)?;
+    info.set_item("seed", rp.seed)?;
+    info.set_item("over", rp.over)?;
+    info.set_item("aborted", rp.aborted)?;
+    info.set_item("resigned", rp.resigned)?;
+    info.set_item("result", rp.result.clone())?;
+    info.set_item("rounds", rp.rounds)?;
+    info.set_item("steps", rp.steps)?;
+    info.set_item("setup", rp.setup.clone())?;
+    info.set_item("rows", rp.records.len())?;
+    let nfeat = (e.info)().num_features;
+    let s = samples_dict(py, rp.records, nfeat)?;
+    Ok((s, info.into_any().unbind()))
+}
+
+/// The seed of game `gid` of a driver seeded `seed` (`zero_search::record::game_seed`: what `new_game` gets).
+#[pyfunction]
+#[pyo3(signature = (seed, gid, paired=false))]
+fn game_seed_of(seed: u64, gid: u32, paired: bool) -> u64 {
+    zero_search::record::game_seed(seed, gid, paired)
+}
+
+/// A finished game's row as `take_results` gives it (docs/search.md 2.5).
+fn result_row<'py>(py: Python<'py>, r: &zero_search::driver::GameResult) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("gid", r.gid)?;
+    d.set_item("n", r.n)?;
+    d.set_item("over", r.over)?;
+    d.set_item("aborted", r.aborted)?;
+    d.set_item("result", r.result.clone())?;
+    d.set_item("scores", r.scores.clone())?;
+    d.set_item("steps", r.steps)?;
+    d.set_item("decisions", r.decisions)?;
+    d.set_item("ext_moves", r.ext_moves)?;
+    d.set_item("rounds", r.rounds)?;
+    d.set_item("samples", r.samples)?;
+    d.set_item("tag", r.tag.clone())?;
+    if !r.moves.is_empty() {
+        // DriverCfg::move_log (a diagnostic): [(seat, action, legal actions)]
+        d.set_item("moves", r.moves.clone())?;
+    }
+    if let Some(b) = &r.branch {
+        // a branch game (DriverCfg::branch, docs/search.md 2.11)
+        let bd = PyDict::new(py);
+        bd.set_item("at", b.at)?;
+        bd.set_item("of", b.of)?;
+        bd.set_item("decision", b.decision)?;
+        bd.set_item("step", b.step)?;
+        bd.set_item("action", b.action)?;
+        bd.set_item("moves", b.moves)?;
+        bd.set_item("played", b.played)?;
+        bd.set_item("same_first", b.same_first)?;
+        bd.set_item("start", b.start)?;
+        d.set_item("branch", bd)?;
+    }
+    if let Some(j) = r.start {
+        // a game started from an archive entry (DriverCfg::starts)
+        d.set_item("start", j)?;
+    }
+    if let Some(rs) = &r.resign {
+        // self-play resignation (NnSeat::resign_t, docs/search.md 3.14): only when the game's seats resign
+        let rd = PyDict::new(py);
+        rd.set_item("resigned", rs.resigned)?;
+        rd.set_item("noresign", rs.noresign)?;
+        rd.set_item("winner", rs.winner)?;
+        rd.set_item("decision", rs.decision)?;
+        rd.set_item("step", rs.step)?;
+        rd.set_item("records", rs.records)?;
+        d.set_item("resign", rd)?;
+    }
+    Ok(d)
 }
 
 /// The bytes a record holds (itself and its arrays' contents): `SampleRecords.nbytes`, a bounded

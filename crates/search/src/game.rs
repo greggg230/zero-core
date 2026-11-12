@@ -205,6 +205,14 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn active_seat(&self) -> Option<usize> {
         None
     }
+    /// What the game built from its seed that a game record carries (docs/search.md 2.15, zero-farm's
+    /// self-play records): text the game defines (MTG Zero: each seat's deck), compared with the replayed
+    /// game's at the end of a replay (`record::replay`) - so a record whose setup another machine built
+    /// differently (another platform's libm in a deck builder) is refused, not trained on. Called on a
+    /// finished (or resigned) game. Default empty: nothing to record.
+    fn record_setup(&self) -> String {
+        String::new()
+    }
 }
 
 /// The root's belief of a search (docs/search.md 3.8): the network's auxiliary predictions for the
