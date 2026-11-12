@@ -38,9 +38,12 @@ def load_sampler(stop, samples):
 
 
 def peak_wset(pid):
+    """The peak working set (MB) of `pid` and its children, the largest (a venv's python.exe is a launcher: the
+    interpreter is its child)."""
     try:
         import psutil
-        return psutil.Process(pid).memory_info().peak_wset / 2 ** 20
+        p = psutil.Process(pid)
+        return max(q.memory_info().peak_wset for q in [p] + p.children(recursive=True)) / 2 ** 20
     except Exception:                              # noqa: BLE001
         return None
 

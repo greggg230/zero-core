@@ -20,6 +20,8 @@ def main():
     ap.add_argument('--onnx', required=True)
     ap.add_argument('--checkpoint', required=True)
     ap.add_argument('--games', type=int, default=200)
+    ap.add_argument('--minutes', type=float, default=60)
+    ap.add_argument('--batch-games', type=int, default=40)
     ap.add_argument('--sims', type=int, default=32)
     ap.add_argument('--spec', default=None)
     ap.add_argument('--select', default='visits')
@@ -49,9 +51,27 @@ def main():
     seat = {'select': a.select}
     if a.select == 'cq':
         seat.update(select_min_visits=0, cq_c_visit=a.cq_c_visit, cq_c_scale=a.cq_c_scale)
-    out = h2h.match(a.checkpoint, a.checkpoint, games=a.games, sims=a.sims, chance_k=a.chance_k, seed=a.seed,
-                    threads=a.threads, groups=a.groups, device='cpu', spec=a.spec, seat_a=dict(seat), seat_b=dict(seat),
-                    max_steps=a.max_steps, paired=True, sparse=True)
+    import time
+    t0 = time.time()
+    rows = []
+    batches = []
+    k = 0
+    while len(rows) < a.games and time.time() - t0 < a.minutes * 60:
+        n = min(a.batch_games, a.games - len(rows))
+        n -= n % 2
+        o = h2h.match(a.checkpoint, a.checkpoint, games=n, sims=a.sims, chance_k=a.chance_k, seed=a.seed + 1000 * k,
+                      threads=a.threads, groups=a.groups, device='cpu', spec=a.spec, seat_a=dict(seat), seat_b=dict(seat),
+                      max_steps=a.max_steps, paired=True, sparse=True, rows=True)
+        base = len(rows)                           # (an even offset: a game's seat parity and its pair kept)
+        for r in o.pop('rows'):
+            r = dict(r, gid=r['gid'] + base)
+            rows.append(r)
+        batches.append({'games': n, 'a_score': o['a_score'], 'seconds': o['seconds']})
+        print(json.dumps({'batch': k, **batches[-1], 'games_so_far': len(rows), 'minutes': round((time.time() - t0) / 60, 1)}),
+              flush=True)
+        k += 1
+    out = dict(h2h.summary(rows, paired=True), sims=a.sims, chance_k=a.chance_k, batches=batches,
+               seconds=round(time.time() - t0, 1), select_a=o['select_a'], select_b=o['select_b'])
     out['a'] = f'onnx {a.onnx} (onnxruntime, {a.onnx_threads} threads)'
     out['b'] = f'torch {a.checkpoint} (NetEvaluator, cpu)'
     print(json.dumps(out))

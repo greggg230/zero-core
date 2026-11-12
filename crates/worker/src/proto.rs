@@ -265,11 +265,13 @@ fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress
 
 /// Run `job` on a thread while this thread reads control lines from `lines` (None: no control) and
 /// emits a status line every `status_s` -> the outcome.
-fn run_with_control(game: &'static GameEntry, job: Job, sink: Arc<Stdout>, lines: Option<std::sync::mpsc::Receiver<Option<Value>>>, base: PathBuf) -> Result<Outcome, String> {
+fn run_with_control(game: &'static GameEntry, mut job: Job, sink: Arc<Stdout>, lines: Option<std::sync::mpsc::Receiver<Option<Value>>>, base: PathBuf) -> Result<Outcome, String> {
     let ctl = Arc::new(Control::default());
     let link: Arc<Mutex<Option<EvalLink>>> = Arc::new(Mutex::new(None));
     let progress = Arc::new(Mutex::new(Progress::default()));
+    // (the status lines come from this thread, which also runs while the job waits on its search threads)
     let status_s = job.status_s;
+    job.status_s = f64::INFINITY;
     let (c2, l2, p2, s2) = (ctl.clone(), link.clone(), progress.clone(), sink.clone());
     let worker = std::thread::Builder::new()
         .name("zero-worker-job".into())
