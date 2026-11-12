@@ -5286,7 +5286,8 @@ section is the data path of lane X (shards, window, run, tools, remotes); 43.5-4
   logged, never truncated.
 * Metrics, only for a game with tail segments: self-play `tail` = {rows sent with a tail, their tokens, the most in
   one row, `aborted_row_tokens`} (a line in the log when a game was aborted); training `tail` = {the window's rows
-  with a tail, tokens, max, overrides, and the network's `gates` (max(theta, 0)) when it has gated segments}.
+  with a tail, tokens, max, overrides, and when the network has gated segments its `gates` {segment: g}, `gate_steps`
+  {segment: training steps whose batch held its tokens} and `gates_stuck` (43.6)}.
 
 ### 43.4 Draft layouts, remotes, the toy
 
@@ -5403,9 +5404,16 @@ At g = 0 a gated token changes no other token, the pooling or any logit, exactly
 the gate no finite gradient there; one host sync decides). The static forward weighs every token whenever the
 network has gated segments and the batch has tail tokens (no data-dependent branch; with weights 0 / 1 the float mask
 is the bool mask's computation). At g = 0 the gate is the only parameter of its segment with a gradient (the
-segment's own maps get exactly none until it opens). `TokenNet.gates()` -> {segment: g} for the run's metrics
-(lane X logs them; a gate still at 0 after a generation should be said loudly). Note: the run's AdamW decays every
-parameter, the gates too (a gate at 0 stays there unless its gradient moves it).
+segment's own maps get exactly none until it opens).
+
+**In a run** (2026-11-12, the coordinator's decisions; the API's change log): `TokenNet.gates()` -> {segment: g} is
+logged every iteration as `train.tail.gates`, with `train.tail.gate_steps` (per gated segment, the training steps
+whose batch held its tokens); a gate still exactly 0 after `run.GATE_STUCK_STEPS` = 100 such steps is said loudly - a
+`WARNING gate <segment> still exactly 0 after N training steps ...` line in the run's log and `train.tail.gates_stuck`.
+The gates are **not weight-decayed** (`net.NO_DECAY`, `no_decay_params`): AdamW gets them as a group of their own, last,
+with `weight_decay` 0 (a scalar gate decayed would be biased shut); every other parameter stays in the groups of
+before, so a network without gates has the optimizer of before, its groups and their order (check_checkpoint_compat:
+identical). `zero.distill` does the same for a student with gates.
 
 Built fresh, a gate is 1; a widen sets each new segment's gate to exactly 0 (43.8).
 
@@ -5454,6 +5462,16 @@ segments with pointer columns: bit for bit in eager on rows with tail tokens, ov
 and the gated segment; to rounding in static there (the tail embedding is one product over every tail token, and the
 old batch has fewer); the gated segment's overrides exactly the generic logit at g = 0 and exactly the pointer logit
 at g = 1 (as the same network with the segment ungated).
+
+**Exporters (R14)**: `net.varlen_features(model)` names a network's tail segments, pointer overrides and gates;
+`zero.webexport` (the browser players' weights) refuses a network with any of them (ValueError: its fixed-width rows
+would drop them). zero-onnx (`zero/onnx_export.py`) is on the `farm` branch, not in this tree: **whichever of `farm`
+and `feat/varlen` lands second adds the same refusal there** (in the exporter's constructor, beside its
+`isinstance(net, TokenNet)` check: `varlen_features(net)` non-empty -> ValueError).
+
+**Remote self-play (R13)**: `tests/test_tail_remote.py` - a local worker with a token network plays toy_tail, its v2
+shards carry tails (and the run trains on them and their overrides); a worker whose hello reports no capability
+'tails' (the tests' `no_tails`) is refused, and this machine plays every game.
 
 **Encoding guard** (10.4): the segments' `tail` / `gate` / `columns` and the layout's `option_pointers` /
 `max_row_tokens` are compared with the build's layout (absent on both sides for every layout before them);

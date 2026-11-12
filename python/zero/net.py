@@ -1586,6 +1586,31 @@ def game_aux(model, game=None):
 
 CARRIED = ('reader_detach', 'aux_older', 'aux_widened')
 
+# parameters without weight decay (docs/az.md 43.6): a gated segment's gate theta (g = max(theta, 0)) - a scalar the
+# decay would bias shut. Every other parameter is decayed as before.
+NO_DECAY = ('gate',)
+
+
+def varlen_features(model):
+    """What of variable-length token sets (docs/az.md 43.5-43.7) a network has, as short descriptions ([]: none):
+    tail segments, pointer overrides, gates - the parts an exporter of fixed-width rows would drop in silence (R14:
+    `zero.webexport`, zero-onnx refuse a network with any of them)."""
+    out = []
+    segs = getattr(model, 'segs', None) or []
+    if getattr(model, 'tails', None):
+        out.append('tail segments ' + ', '.join(segs[j]['name'] for j in model.tails))
+    if getattr(model, 'option_pointers', False):
+        out.append('pointer overrides (option_pointers)')
+    if getattr(model, 'gated', None):
+        out.append('gates on ' + ', '.join(segs[j]['name'] for j in model.gated))
+    return out
+
+
+def no_decay_params(model):
+    """`model`'s parameters that AdamW must not decay (`NO_DECAY`), in parameter order ([]: none - every optimizer
+    of before, unchanged)."""
+    return [p for n, p in model.named_parameters() if n in NO_DECAY]
+
 
 def _carry(src, dst):
     """`dst` with `src`'s Python attributes that are not in its config or state (CARRIED: the readers'
