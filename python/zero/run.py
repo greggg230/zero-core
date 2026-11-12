@@ -79,8 +79,8 @@ from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, s
 from .rows import forward_kw
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
-from .net import (EncodingMismatch, add_aux, add_reader, aux_layout, check_belief_head, check_checkpoint, load, make_net,
-                  reader_layout, save)
+from .net import (NO_DECAY, EncodingMismatch, add_aux, add_reader, aux_layout, check_belief_head, check_checkpoint, load,
+                  make_net, no_decay_params, reader_layout, save)
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
 from .shardthread import MB, SampleClock, ThreadedShardWriter, split_records
@@ -512,6 +512,34 @@ def opt_state_mismatch(model, state, params=None):
             if torch.is_tensor(v) and v.dim() > 0 and tuple(v.shape) != tuple(p.shape):
                 return f'{k} of parameter {i}: {tuple(v.shape)}, the parameter {tuple(p.shape)}'
     return None
+
+
+# a gate still exactly 0 after this many training steps whose batches held its segment's tokens: a warning in the
+# run's log and `train.tail.gates_stuck` (docs/az.md 43.6)
+GATE_STUCK_STEPS = 100
+
+
+def gated_rows(model, W):
+    """Per gated segment of `model` (`TokenNet.gated`, in order) a bool [W.N] of the window's rows holding its tail
+    tokens; [] for a network without gates or a window without tails."""
+    gated = list(getattr(model, 'gated', None) or [])
+    if not gated or getattr(W, 'tail', None) is None:
+        return []
+    tail = W.tail
+    row = np.repeat(np.arange(tail.N), tail.counts())
+    seg = tail.seg.astype(np.int64)
+    out = []
+    for j in gated:
+        has = np.zeros(tail.N, bool)
+        has[row[seg == j]] = True
+        out.append(has)
+    return out
+
+
+def stuck_gates(gates, steps):
+    """The gated segments whose gate (`TokenNet.gates()`: {name: g}) is still exactly 0 after GATE_STUCK_STEPS training
+    steps that held their tokens (`steps`, in the same order) -> [name, ...]."""
+    return [n for (n, g), k in zip(gates.items(), steps) if g == 0.0 and k >= GATE_STUCK_STEPS]
 
 
 def match_opt_groups(state, pgroups):
@@ -1306,14 +1334,21 @@ class Run:
         okw = {'fused': True} if static and str(dev).startswith('cuda') else {}
         heads = [p for n, p in model.named_parameters() if n.startswith('aux_head.')]
         rdrs = [p for n, p in model.named_parameters() if n.startswith('readers.')]
-        trunk = [p for n, p in model.named_parameters() if not n.startswith('aux_') and not n.startswith('readers.')]
+        trunk = [p for n, p in model.named_parameters() if not n.startswith('aux_') and not n.startswith('readers.')
+                 and n not in NO_DECAY]
         # a widened head's later parts (docs/az.md 37): a group each, after the readers
         more = [[p for n, p in model.named_parameters() if n.startswith(f'aux_more.{k}.')]
                 for k in range(len(getattr(model, 'aux_more', None) or []))]
+        # the gates (docs/az.md 43.6): a group of their own, last, without weight decay (a network without gates:
+        # the groups of before)
+        gates = no_decay_params(model)
+
+        def group(g):
+            return {'params': g, 'weight_decay': 0.0} if g is gates else {'params': g}
         # parameter groups: the network of before, its auxiliary head, its readers (each when it has them)
-        pgroups = [g for g in [trunk, heads, rdrs] + more if g]
+        pgroups = [g for g in [trunk, heads, rdrs] + more + [gates] if g]
         if len(pgroups) > 1:
-            opt = torch.optim.AdamW([{'params': g} for g in pgroups], lr=c['lr'], weight_decay=c['wd'], **okw)
+            opt = torch.optim.AdamW([group(g) for g in pgroups], lr=c['lr'], weight_decay=c['wd'], **okw)
         else:
             opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'], **okw)
         opt_path = os.path.join(self.run, 'models', 'opt_latest.pt')
@@ -1332,23 +1367,24 @@ class Run:
                         if at is None:
                             raise ValueError(f'it belongs to another network ({opt_state_mismatch(model, o["state"])})')
                         ordered = [pgroups[j] for j in at]
-                        opt = torch.optim.AdamW(ordered[0] if len(ordered) == 1 else [{'params': g} for g in ordered],
+                        opt = torch.optim.AdamW(ordered[0] if len(ordered) == 1 and ordered[0] is not gates
+                                                else [group(g) for g in ordered],
                                                 lr=c['lr'], weight_decay=c['wd'], **okw)
                         opt.load_state_dict(o['state'])
                         for j, g in enumerate(pgroups):
                             if j not in at:
-                                opt.add_param_group({'params': g})
+                                opt.add_param_group(group(g))
                     elif 0 < k < len(pgroups) and [len(g.get('params', [])) for g in groups] == [len(g) for g in pgroups[:k]]:
                         # the state of the network before its head (and / or readers): kept for it, the new
                         # parts start fresh
                         bad = opt_state_mismatch(model, o['state'], params=[p for g in pgroups[:k] for p in g])
                         if bad:
                             raise ValueError(f'it belongs to another network ({bad})')
-                        opt = torch.optim.AdamW(trunk if k == 1 else [{'params': g} for g in pgroups[:k]], lr=c['lr'],
+                        opt = torch.optim.AdamW(trunk if k == 1 else [group(g) for g in pgroups[:k]], lr=c['lr'],
                                                 weight_decay=c['wd'], **okw)
                         opt.load_state_dict(o['state'])
                         for g in pgroups[k:]:
-                            opt.add_param_group({'params': g})
+                            opt.add_param_group(group(g))
                     else:
                         # (the state of this network: its moments as its parameters; another network's,
                         # e.g. of another encoding, would load and fail at the first step, docs/az.md 10.4)
@@ -1414,12 +1450,18 @@ class Run:
         # (a sparse window: the static training's batches travel as their non-zeros, dense on the device)
         feed = batches(W, rng, steps, c['batch'], dev, c.get('train_prefetch', 0), tokens=tokens,
                        coo=static and W.sparse)
+        # the gated segments (docs/az.md 43.6): per segment the window's rows holding its tokens, and the steps whose
+        # batch held some (a gate still exactly 0 after GATE_STUCK_STEPS of them is said loudly)
+        gseen = gated_rows(model, W)
+        gsteps = [0] * len(gseen)
         for step in range(steps):
             self.check('training')
             g_lr = lr * min(1.0, (step + 1) / c['lr_warmup_steps']) if fresh and c['lr_warmup_steps'] else lr
             for g in opt.param_groups:
                 g['lr'] = g_lr
             idx, b = next(feed)
+            for k, has in enumerate(gseen):
+                gsteps[k] += bool(has[idx].any())
             rk = forward_kw(b)                     # (variable-length rows: tail / ov; {} without - the calls of before)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
                 if static:
@@ -1528,10 +1570,20 @@ class Run:
                 tc = W.tail.counts() if W.tail is not None else np.zeros(0, np.int64)
                 out['tail'] = {'rows': int(np.count_nonzero(tc)), 'tokens': int(tc.sum()), 'max': int(tc.max(initial=0)),
                                'overrides': int(W.ov.NO) if W.ov is not None else 0}
-                g = getattr(model, 'gate', None)
-                if isinstance(g, torch.Tensor) and g.numel():
-                    out['tail']['gates'] = [round(float(v), 5) for v in g.detach().clamp(min=0).cpu()]
+                gates_ = model.gates() if hasattr(model, 'gates') else {}
+                if gates_:
+                    out['tail']['gates'] = {k: round(v, 6) for k, v in gates_.items()}
+                    out['tail']['gate_steps'] = dict(zip(gates_, gsteps))
+                    stuck = stuck_gates(gates_, gsteps)
+                    if stuck:
+                        out['tail']['gates_stuck'] = stuck
             return out
+        stuck = stuck_gates(model.gates(), gsteps) if gseen else []
+        if stuck:
+            self.log(f'iter {it}: WARNING gate{"s" if len(stuck) > 1 else ""} {", ".join(stuck)} still exactly 0 after '
+                     f'{", ".join(str(gsteps[list(model.gates()).index(n)]) for n in stuck)} training steps whose batches '
+                     f'held {"their" if len(stuck) > 1 else "its"} tokens: the segment changes nothing yet (docs/az.md '
+                     f'43.6; an opening gate needs a gradient pushing it up)')
         return model, ost, stats
 
     def opt_path(self):

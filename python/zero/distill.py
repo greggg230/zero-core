@@ -68,7 +68,7 @@ from .data import batches
 from .rows import forward_kw
 from .finite import NonFinite
 from .infer import use_amp
-from .net import aux_layout, aux_predict, make_net
+from .net import NO_DECAY, aux_layout, aux_predict, make_net, no_decay_params
 from .protocol import MAX_SEATS
 
 
@@ -311,7 +311,12 @@ def distill(student, W, T, steps, batch=512, lr=5e-4, lr_min=1e-5, warmup=500, w
     view = view_rows(W) > 0
     kw = {'view': view, 'aux_w': aux_w, 'aux_teacher_w': aux_teacher_w} if view or 'aux' in T else {}
     student.to(device).train()
-    o = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=wd)
+    gates = no_decay_params(student)             # (docs/az.md 43.6: the gates undecayed; none: the optimizer of before)
+    if gates:
+        o = torch.optim.AdamW([{'params': [p for n, p in student.named_parameters() if n not in NO_DECAY]},
+                               {'params': gates, 'weight_decay': 0.0}], lr=lr, weight_decay=wd)
+    else:
+        o = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=wd)
     if opt is not None:
         o.load_state_dict(opt)
     amp = use_amp(student, device)

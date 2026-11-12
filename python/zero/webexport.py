@@ -19,9 +19,14 @@ import numpy as np
 
 def export_model(ckpt, out):
     """Checkpoint -> .bin weight file. Returns (params, max relative f16 rounding error)."""
-    from .net import load
+    from .net import load, varlen_features
     model, extra = load(ckpt, 'cpu')
     cfg = model.config
+    var = varlen_features(model)
+    if var:
+        # (R14, docs/az.md 43.8: the browser's rows are fixed-width - it would drop every row's tail and override)
+        raise ValueError(f'{ckpt}: a network with {"; ".join(var)} (variable-length token sets, docs/az.md 43) - the '
+                         f'browser players (zero_webnet) cannot run it')
     if cfg.get('readers'):
         # (the browser's forward has no readers: it would compute another network in silence)
         raise ValueError(f'{ckpt}: a network with readers (docs/az.md 36) - the browser players (zero_webnet) cannot '

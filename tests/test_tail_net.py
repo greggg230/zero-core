@@ -729,7 +729,7 @@ def test_gradients_reach_the_gates(static, monkeypatch):
     assert not calls and (gpos != 0).all() and torch.isfinite(gpos).all()
     for k in ('tail_base', 'pos_tail.1.weight', 'pos_tail.2.weight', 'seg_in.1.weight', 'seg_in.2.weight'):
         assert w.get_parameter(k).grad.abs().sum() > 0 and torch.isfinite(w.get_parameter(k).grad).all(), k
-    monkeypatch.setattr(TokenNet, '_explicit', lambda self, gi: True)
+    monkeypatch.setattr(TokenNet, '_explicit_flag', lambda self, gi, clean=False: torch.ones((), dtype=torch.bool, device=gi.device))
     w2 = _gate_net([0.6, 0.3])
     out_math = run(w2)
     assert maxdiff(out_sdpa, out_math) < 1e-5
@@ -988,3 +988,20 @@ def test_fork_run_widens_onto_a_tail_layout(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match='draft'):
         fork_run.main([src, str(tmp_path / 'd')])
     assert fork_run.main([src, str(tmp_path / 'e'), '--allow-draft']) == 0
+
+
+def test_webexport_refuses_variable_length_networks(tmp_path):
+    """R14: the browser players' export (`zero.webexport`) refuses a network with tail segments, pointer overrides or
+    gates - its fixed-width rows would drop them (`net.varlen_features` names them)."""
+    from zero import webexport
+    from zero.net import varlen_features
+    torch.manual_seed(0)
+    m = TokenNet(F, A, package.TOY_TAIL_TOKENS, d=16, layers=1, heads=2, ff=32, game='toy_tail')
+    assert varlen_features(m) == ['tail segments items, marks', 'pointer overrides (option_pointers)']
+    assert varlen_features(rand_net(TOY_GATED, 1))[-1] == 'gates on marks'
+    assert varlen_features(TokenNet(195, 13, package.TOY_TOKENS, d=16, layers=1, heads=2, ff=32)) == []
+    path = str(tmp_path / 'tail.pt')
+    save(m, path, {'iter': 1})
+    with pytest.raises(ValueError, match='tail segments items, marks'):
+        webexport.export_model(path, str(tmp_path / 'out.bin'))
+    assert not os.path.exists(str(tmp_path / 'out.bin'))
