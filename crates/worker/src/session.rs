@@ -549,9 +549,37 @@ fn bind(rt: &Runtime, p: ProviderKind, a: Option<&Adapter>, adapters: &[Adapter]
 /// the provider leaves it to the CPU and builds its engines around it (`nv_op_types_to_exclude`).
 pub const NVRTX_EXCLUDE: &str = "NonZero";
 
+/// Whether this ONNX Runtime's TensorRT-RTX provider takes `nv_op_types_to_exclude` (1.23.2 refuses the key:
+/// cleared after the first refusal).
+static NVRTX_EXCLUDE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The most non-zeros of a piece a TensorRT-RTX engine takes (its optimisation profile's maximum; a
+/// batch is cut into pieces under it, `InferenceSession::max_nnz`).
+pub const NVRTX_MAX_NNZ: usize = GPU_CHUNK * 1024;
+
+/// TensorRT-RTX's options: an explicit optimisation profile for zero-onnx/1's inputs (its implicit one
+/// gives every dynamic axis the same maximum, which `x_ptr`'s B + 1 against `n_players`' B contradicts:
+/// the engine then fails at run time), NonZero left to the CPU when the provider takes the option.
+pub fn nvrtx_options() -> Vec<(String, String)> {
+    let shapes = |b: usize, nnz: usize| format!("x_ptr:{},x_idx:{nnz},x_val:{nnz},n_players:{b},belief:{b}", b + 1);
+    let mut o = vec![
+        ("nv_profile_min_shapes".to_string(), shapes(1, 1)),
+        ("nv_profile_opt_shapes".to_string(), shapes(256, 256 * 256)),
+        ("nv_profile_max_shapes".to_string(), shapes(GPU_CHUNK, NVRTX_MAX_NNZ)),
+    ];
+    if NVRTX_EXCLUDE_OK.load(std::sync::atomic::Ordering::Relaxed) {
+        o.push(("nv_op_types_to_exclude".to_string(), NVRTX_EXCLUDE.to_string()));
+    }
+    o
+}
+
 fn nvrtx(ord: u32) -> ort::ep::NVRTX {
     use ort::ep::ArbitrarilyConfigurableExecutionProvider;
-    ort::ep::NVRTX::default().with_device_id(ord).with_arbitrary_config("nv_op_types_to_exclude", NVRTX_EXCLUDE)
+    let mut ep = ort::ep::NVRTX::default().with_device_id(ord);
+    for (k, v) in nvrtx_options() {
+        ep = ep.with_arbitrary_config(k, v);
+    }
+    ep
 }
 
 fn builder(rt: &Runtime, b: &Binding, threads: usize, spinning: bool, log_id: Option<&str>) -> Result<SessionBuilder, String> {
@@ -602,7 +630,12 @@ fn builder(rt: &Runtime, b: &Binding, threads: usize, spinning: bool, log_id: Op
             if devs.is_empty() {
                 return Err(format!("{ep}: no device with LUID {}", luid_hex(*luid)));
             }
-            sb = sb.with_devices(devs, None).map_err(oerr)?;
+            // (a plugin's options are named "<its EP name>.<option>")
+            let opts: Vec<(String, String)> = match ProviderKind::of_ort_name(ep) {
+                Some(ProviderKind::TensorRtRtx) => nvrtx_options().into_iter().map(|(k, v)| (format!("{ep}.{k}"), v)).collect(),
+                _ => Vec::new(),
+            };
+            sb = sb.with_devices(devs, Some(&opts)).map_err(oerr)?;
         }
     }
     Ok(sb)
@@ -653,6 +686,17 @@ static LOG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 /// Build a session for `b`, with the node placement read from ONNX Runtime's log when `capture`.
 fn build(rt: &Runtime, model: &Path, b: &Binding, threads: usize, spinning: bool, capture: bool) -> Result<(Session, Vec<(String, String)>), String> {
+    let r = build_once(rt, model, b, threads, spinning, capture);
+    if let (Err(e), Binding::Named(ProviderKind::TensorRtRtx, _)) = (&r, b) {
+        if e.contains("Failed to load provider") && NVRTX_EXCLUDE_OK.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            // (an older TensorRT-RTX provider without nv_op_types_to_exclude: NonZero stays in its engines)
+            return build_once(rt, model, b, threads, spinning, capture);
+        }
+    }
+    r
+}
+
+fn build_once(rt: &Runtime, model: &Path, b: &Binding, threads: usize, spinning: bool, capture: bool) -> Result<(Session, Vec<(String, String)>), String> {
     if !capture {
         let mut sb = builder(rt, b, threads, spinning, None)?;
         return Ok((sb.commit_from_file(model).map_err(|e| format!("{}: {}", model.display(), oerr(e)))?, Vec::new()));
@@ -755,6 +799,8 @@ pub struct InferenceSession {
     pub load_s: f64,
     /// Rows per piece (`chunk_for`).
     pub chunk: usize,
+    /// Non-zeros per piece at most (TensorRT-RTX's profile), None: no limit.
+    pub max_nnz: Option<usize>,
 }
 
 /// Rows per piece of a GPU provider's batch: a GPU wants whole batches (the CPU's 64-row pieces cost it a
@@ -937,6 +983,7 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
         batch_ms: Vec::new(),
         load_s: build_s,
         chunk: chunk_for(p),
+        max_nnz: (p == ProviderKind::TensorRtRtx).then_some(NVRTX_MAX_NNZ),
     };
     if let Some(r) = reference {
         match self_test(&mut s, r, fallback, build_s) {
@@ -1061,18 +1108,33 @@ impl InferenceSession {
         }
         let bb = b.b;
         let chunk = self.chunk;
-        if bb <= chunk {
+        let total = (b.xs_off[bb] - b.xs_off[0]) as usize;
+        if bb <= chunk && self.max_nnz.is_none_or(|m| total <= m) {
             let idx: Vec<usize> = (0..bb).collect();
             return self.run_piece(b, &idx);
         }
         let mut order: Vec<usize> = (0..bb).collect();
         order.sort_by_key(|&r| b.xs_off[r + 1] - b.xs_off[r]);
+        // pieces of at most `chunk` rows and `max_nnz` non-zeros, in that order
+        let mut pieces: Vec<&[usize]> = Vec::new();
+        let mut start = 0;
+        let mut nnz = 0usize;
+        for (k, &r) in order.iter().enumerate() {
+            let n = (b.xs_off[r + 1] - b.xs_off[r]) as usize;
+            if k > start && (k - start == chunk || self.max_nnz.is_some_and(|m| nnz + n > m)) {
+                pieces.push(&order[start..k]);
+                start = k;
+                nnz = 0;
+            }
+            nnz += n;
+        }
+        pieces.push(&order[start..]);
         let (a, w) = (self.actions, self.aux_w);
         let mut pol = vec![0f32; bb * a];
         let mut val = vec![0f32; bb * MAX_SEATS];
         let mut mar = vec![0f32; bb * MAX_SEATS];
         let mut aux = vec![0f32; bb * w];
-        for piece in order.chunks(chunk) {
+        for piece in pieces {
             let (p, v, m, x) = self.run_piece(b, piece)?;
             for (k, &r) in piece.iter().enumerate() {
                 pol[r * a..(r + 1) * a].copy_from_slice(&p[k * a..(k + 1) * a]);

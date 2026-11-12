@@ -127,7 +127,9 @@ pub fn run(o: &Opts) -> Result<Value, String> {
     } else {
         json!({"present": false})
     };
-    let tmp = std::env::temp_dir().join(format!("zero-probe-{}", std::process::id()));
+    // (the built-in graph's files go under the working directory - the agent's work/probe - else the temp dir)
+    let base = std::env::current_dir().ok().filter(|d| std::fs::metadata(d).is_ok_and(|m| !m.permissions().readonly())).unwrap_or_else(std::env::temp_dir);
+    let tmp = base.join(format!("zero-probe-{}", std::process::id()));
     let (model, reference, graph) = match (&o.model, &o.reference) {
         (Some(m), Some(r)) => (m.clone(), r.clone(), m.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()),
         (Some(_), None) => return Err("--model needs its --reference (the self-test)".into()),
