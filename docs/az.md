@@ -5225,3 +5225,168 @@ self-play records, docs/search.md 3.17); config.json gains the four keys.
 in Python and in the Rust driver, h2h's run rule and tag, the hello's fingerprint; a seat with the setting plays the
 toy's games (which mark no value choice) exactly as one without, making none. The search: docs/search.md 3.17's Rust
 tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.
+
+## 43. Variable-length token sets: a row's head and its tail (varlen; MTG Zero's layout v7, 2026-11-11)
+
+**Why.** MTG Zero's rule: the engine and the network input must be exact in every reachable state. A token
+network reads a fixed-width row, so every segment has a slot cap (32 permanents a side, 16 hand cards, 8 stack items,
+...) and some kinds of object have no slot at all (the other player's waiting triggers, delayed triggers, linked or
+offered exiled cards). The project ("varlen") gives a row a variable-length **tail** of tokens after its unchanged
+fixed-width **head**: slots past a segment's cap, and tokens of new tail-only segments, with pointer overrides from
+the engine for the options the static slot table cannot score. The frozen API and the design live in MTG Zero's
+scratch (`varlen_api.md`, `varlen_design.md`). Sections 43.1-43.4 are the rows, the driver, the shards and the run
+(lane X); 43.5-43.8 below are the network, its gates, inference and the widen (lane Y).
+
+Everything is opt-in: a layout without the new keys normalises as before, a network without tail segments has no new
+parameter and runs the code of before line for line, and a tail network's batch with no tail token and no override
+runs that code too.
+
+### 43.5 The layout keys and the network's tail tokens (`net.tokens_layout`, `net.TokenNet`)
+
+**Layout keys** (each stored in the normalised layout only when set):
+
+| Key | Where | Meaning |
+|---|---|---|
+| `tail: true` | segment | its slots >= `count` come as tail tokens |
+| `count: 0`, `offset: null` | segment | a tail-only segment (needs `tail`; claims no feature) |
+| `gate: true` | segment | a gated segment (43.6); only with `count` 0 |
+| `columns: k` | segment | k pointer columns after its action pairs (and identity column), no static table; needs `option_pointers` |
+| `option_pointers: true` | layout | rows carry pointer overrides (43.7) |
+| `max_row_tokens: n` | layout | required with a tail segment, >= 1 + sum(count); the driver aborts a game past it |
+| `draft: true` | layout | refused by run launches and fork_run unless allowed (43.8); not part of the encoding |
+
+The action collision check covers head slots only (a tail token never gets a static action).
+
+**Parameters** (all absent without tail segments): `seg_in.{i}` for every segment (tail-only too); `tail_base`
+[n_tail, d] (a head-ful segment's row starts as its last head slot's `pos`, a tail-only one's N(0, 0.02));
+`pos_tail.{k}.weight` [d, 49] (N(0, 0.02), no bias); `gate` [n_gated] (43.6); `ptr` with a row per pointer column.
+
+**A tail token** at slot s of tail segment k (head count c) is embedded as a head slot: the segment's input map of its
+floats + its identity's embedding + its position `tail_base[k] + pos_tail[k](psi(s - c))`, where psi(n) for n in
+[0, 2^32) is its 32 binary digits (computed from the int64 slot on the device: exact for every u32), log2(n + 1) / 32,
+and sin / cos(2 pi (n mod 2^j) / 2^j) for j = 1..8 (interleaved sin_1, cos_1, ...; float64, then float32).
+
+**Inputs** (the API's 2.6): `forward(x, n_players, aux=False, aux_rows=None, tail=None, ov=None)` and
+`forward_static(x, n_players, full, ntok, aux=False, tail=None, ov=None)`. `tail = {'row', 'seg', 'slot': int64 [NT],
+'val': float32 [NT, Wt]}` (rows ascending; Wt the widest tail segment's width, a token's floats first) is required,
+possibly empty, iff the network has a tail segment; `ov` (43.7) iff `option_pointers`. Refused (ValueError, R5): a
+missing or unexpected `tail` / `ov`, a token of a segment without a tail or at a head slot, rows out of order, the
+wrong float width, an override whose target is not a present token of its row with that column - in eager always
+(host syncs), in `forward_static` outside a CUDA graph capture (one host sync; inside a capture the host checked).
+
+**Packing.** Eager: each row's tail tokens follow its head tokens (`n` counts them), the rows sorted by token count
+and chunked as before; a segment's tail tokens are embedded by one product of their own. Static: `full` holds
+extended positions (0 the global token, 1 + ... the head slots, `n_tok + j` the batch's tail token j); the tokens are
+gathered from cat(every head slot [B * n_tok, d], the tail tokens [NT, d]); the tail embedding is a few dozen kernels
+whatever the number of tail segments (`_tail_embed_static`: every tail segment's input map on every token as one
+product - their weights in one zero-padded matrix -, every position map as one, each identity layout's digits decoded
+once, each token's own picked by its segment; a loop over the 13 tail segments of a v7-like layout cost a training
+step ~1,250 kernel launches, ~35 ms more on the desktop). Padded tail entries (row 0, the first tail segment, slot
+its count, floats 0) and padded overrides (action `actions`, ref -1) are allowed. `present_index()` stays the head's.
+
+### 43.6 Gates: new kinds of token, exactly inert at a widen (`gate`)
+
+A gated segment s has a gate theta_s, g_s = max(theta_s, 0) with a straight-through gradient (backward the
+identity: a gate pushed below 0 comes back). A token weighs 1 (the global token, every ungated token), g_s (a token of
+gated segment s) or 0 (padding):
+
+* attention: p_ij = exp(s_ij - m_i) w_j, out_i = sum_j p_ij v_j / sum_j p_ij, m_i the max over the non-padding keys;
+* pooling: z_mean = sum_t w_t h_t / sum_t w_t;
+* an override into a gated segment's token: gen[a] + min(g_s, 1) (ptr - gen[a]), as `torch.lerp`: exactly the generic
+  logit at 0, exactly the pointer logit at 1.
+
+At g = 0 a gated token changes no other token, the pooling or any logit, exactly; it still attends as a query.
+**Paths:** without gated segments, today's bool-mask SDPA; with gated tokens present, SDPA with the float mask log w
+(-inf at 0) in inference and in training once every present gate is > 0, and an explicit math attention
+(`TBlock.forward_weighted`, the same formula) in training while a present gate is exactly 0 (SDPA's mask would give
+the gate no finite gradient there; one host sync decides). The static forward weighs every token whenever the
+network has gated segments and the batch has tail tokens (no data-dependent branch; with weights 0 / 1 the float mask
+is the bool mask's computation). At g = 0 the gate is the only parameter of its segment with a gradient (the
+segment's own maps get exactly none until it opens). `TokenNet.gates()` -> {segment: g} for the run's metrics
+(lane X logs them; a gate still at 0 after a generation should be said loudly). Note: the run's AdamW decays every
+parameter, the gates too (a gate at 0 stays there unless its gradient moves it).
+
+Built fresh, a gate is 1; a widen sets each new segment's gate to exactly 0 (43.8).
+
+### 43.7 Pointer overrides, the evaluator and the CUDA graphs (`infer.py`)
+
+**Overrides in the network.** `ov = {'row', 'act' (the option's action), 'ref' (the target's extended position;
+-1 = the generic logit), 'col' (the target segment's pointer column)}`, int64 [NO], resolved on the host
+(`rows.resolve`, lane X). After the static scatter of head slots' actions, each override's action gets its target
+token's logit in its column (a gated target's blended, 43.6) or, ref -1, the generic logit saved before the scatter.
+A tail token has no static action: it scores only through overrides. A row that fits the old caps lists none.
+
+**`NetEvaluator`.** `evaluate(x, n_players, opt_off, opt_action, extra=None, tail=None, ov=None)` (`rows.Tail` /
+`rows.Overrides`; `__call__` / `launch` take them from `LeafBatch.tail` / `.ov`; `max_rows` pieces and worker threads
+cut them with the batch; `aux(x, n, tail=)` / `reader(...)` take the rows' tail and give an empty override set).
+Refusals: a network without tails or pointers given either (R5); at construction, a game whose `game_info()['tails']`
+is non-empty with any network but a token network with exactly those tail segments (`TokenNet.tail_segments()`;
+ValueError, R4).
+
+**`TokenGraphRunner`** (`launch(..., tail=None, ov=None)`, `launch_sparse(..., tail=None, ov=None)`): the host packs
+the head presence as before plus each row's tail tokens (`token_index_tail`), checks the tail and the resolved
+overrides (what a graph cannot check: a target a present head slot or a tail token of the same row, its column), pads
+the tail to NTp and the overrides to NOp in {0} U {16 * 2^k} (`tail_bucket`) and uploads only the tail floats and the
+overrides beside the rows; one graph per (rows, tokens, tail tokens, overrides). A batch with no tail token and no
+override runs the graph (rows, tokens, 0, 0): the static forward of before. **Rows of more than `LONG_T` = 128
+tokens** are evaluated eagerly (`_eager_rows`, in groups whose attention matrices stay under `LONG_BYTES` = 512 MB),
+the other rows through the graphs, the answers merged in row order (`_Split`); `long_rows` counts them.
+
+### 43.8 The widen, the encoding guard, fork_run; tests, checks, measured
+
+**Widen** (`net.widen(old, ..., layout=, ungated=False)`, `token_feature_map`, `_widen_tokens`). Allowed beyond 10.3:
+a segment gaining `tail` (its head unchanged; its `tail_base` row starts at the old network's last head slot, its
+`pos_tail` fresh: no old row reads them); tail-only segments appended after the old ones (fresh `seg_in`, positions,
+and a gate exactly 0 - `gate: true` written into the widened layout unless `ungated=True`, which refuses a layout that
+gates them anyway); the layout gaining `option_pointers` / `max_row_tokens`; `draft` changing. New pointer columns get
+zero `ptr` rows. Refused: everything 10.3 refuses, plus a segment losing its tail or changing its gate or columns, a
+new segment with head slots or not at the end, the layout losing `option_pointers`, a limit below the head. A
+tail-only segment's pointer columns are a matrix product of their own (`TokenNet.ptr_parts`: rows of the same `ptr`),
+so a widened network computes the old columns by the products of before (one wider product rounded them differently).
+
+**Exactness** (`tests/test_tail_net.py`): a network of the toy's layout without tails widened onto the toy's tail
+layout (tail on items, option_pointers, the gated marks) computes the old outputs bit for bit (policy, value, margin,
+the auxiliary head; CPU and CUDA; also saved and loaded) on rows without tails (eager and static) and on rows whose
+only new tokens are gated marks (static at the same T; eager when a chunk's length is the same; to float rounding
+otherwise, < 1e-5); through the CUDA graphs bit for bit on rows with gated marks. A tail network widened by gated
+segments with pointer columns: bit for bit in eager on rows with tail tokens, overrides into head slots, tail tokens
+and the gated segment; to rounding in static there (the tail embedding is one product over every tail token, and the
+old batch has fewer); the gated segment's overrides exactly the generic logit at g = 0 and exactly the pointer logit
+at g = 1 (as the same network with the segment ungated).
+
+**Encoding guard** (10.4): the segments' `tail` / `gate` / `columns` and the layout's `option_pointers` /
+`max_row_tokens` are compared with the build's layout (absent on both sides for every layout before them);
+`layout_sans_identity` drops `draft` with `name` / `version`.
+
+**fork_run**: `tools/fork_run.py <src.pt> <run> [--ungated] [--allow-draft]`: the widen above onto the game's layout,
+checked by the guard before it is written - so a game's layout must declare `gate: true` on its new segments for the
+gated fork (else the fork is refused, or `--ungated`); a `draft` layout is refused unless `--allow-draft` (R16; a
+continuation `--source` too, unless the run's settings set `allow_draft_layout`).
+
+**Tests.** `tests/test_tail_net.py` (21): layout keys and validation, psi's exactness, both exactness tests above (CPU
+and CUDA), tails changing only their rows, static = eager with every kind of padding, the gates' gradients (eager and
+static; g = 0 explicit, g < 0 straight-through, g > 0 SDPA; inference never explicit), overrides' logits, the R5
+refusals, widen refusals, the ungated widen, the guard, the evaluator (eager, pieces, LeafBatch, aux, R4, R5),
+fork_run. `tests/test_tail_graphs.py` (8): the host packing, graphs = eager (dense and sparse, pieces, value-only and
+belief rows, g = 0 and > 0, deterministic), a batch without tails through the graph of before, the widen through the
+graphs, long rows eager beside the graphs, new weights / gates in place, the host refusals. Both build their rows
+from tensors and the toy's literal layout; `zero.rows` (lane X) is used when present, else a stub of its frozen API.
+
+**Measured** (desktop RTX 5090 shared with another session's run, 8-17% busy; three interleaved rounds, medians).
+A random 128 x 4 network on MTG Zero's layout v6 (44,212 features) against its widen onto a v7-like layout (tails on
+the 7 capped segments, 6 gated tail-only segments of 60-230 floats, option_pointers), synthetic Delver-like rows
+(~15-25 present head tokens; 1-2 gated `delayed` tokens on 23% of the rows; 1-15 ungated hand tail tokens on 4%):
+
+| per batch | v6 | v7, no tail token | v7, gated g = 0 | v7, gated + tails |
+|---|---:|---:|---:|---:|
+| eager inference, 192 rows | 34.8 ms | 30.8 | 40.1 | 43.8 |
+| train_static step, 512 rows, T 48 | 28.5 | 28.1 | 42.7 (g = 0.5: 39.7) | 45.5 |
+| graphs, 144 rows: replay / whole call | 1.66 / 3.63 | 1.71 / 3.80 | 1.87 / 4.68 | 1.90 / 4.98 |
+| graphs, 512 rows: replay / whole call | 2.57 / 7.36 | 2.65 / 7.56 | 2.80 / 9.00 | 3.57 / 10.24 |
+
+So: a tail network's batch without tail tokens costs what v6's does (the code of before); gated tokens cost the
+graphs' replay +6-9% and the host ~1 ms a call (the tail's packing, checks and four more uploads: hidden behind the
+device by drive's two batches in flight when the device is the bound), and a training step +40-50% in this
+synthetic (the tail embedding's and the weighted trunk's ~230 more kernels, at ~27 us a launch on this shared GPU;
+the explicit attention at g = 0 another ~3 ms). The toy's 32 x 2 network: graphs 1.6 -> 2.0 (no tail token) -> 3.0 ms
+(gated) a 144-row call.

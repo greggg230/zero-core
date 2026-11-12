@@ -253,6 +253,64 @@ def token_index(P, full):
     return full
 
 
+# Variable-length token sets (docs/az.md 43.7): a token network with tail segments or pointer overrides runs
+# its CUDA graphs for the rows of at most LONG_T tokens; a longer row is evaluated eagerly, outside the graphs,
+# in groups of rows whose attention matrices (rows x heads x T^2 floats) stay under LONG_BYTES.
+LONG_T = 128
+LONG_BYTES = 1 << 29
+
+
+def token_index_tail(P, tcnt, n_tok, full):
+    """`token_index` plus each row's tail tokens (`tcnt` [B] per row, the batch's tail in row order) after its
+    head tokens, at their extended positions n_tok + j (j: the token's index in the batch's tail; docs/az.md
+    43.5) - forward_static's `full` of a batch with tails (`rows.token_full`'s layout)."""
+    token_index(P, full)
+    tcnt = np.asarray(tcnt, np.int64)
+    NT = int(tcnt.sum())
+    if NT:
+        rows = np.repeat(np.arange(len(tcnt)), tcnt)
+        loc = np.arange(NT) - (np.cumsum(tcnt) - tcnt)[rows]
+        full[rows, P.sum(1)[rows] + loc] = n_tok + np.arange(NT)
+    return full
+
+
+def tail_bucket(n):
+    """A graph's tail tokens / overrides padded to 0 or 16 * 2^k (docs/az.md 43.7)."""
+    n = int(n)
+    if n <= 0:
+        return 0
+    b = 16
+    while b < n:
+        b *= 2
+    return b
+
+
+def take_options(opt_off, opt_action, rows):
+    """The options of rows `rows` (an index array) of a batch -> (their opt_off, their opt_action)."""
+    opt_off = np.asarray(opt_off, np.int64)
+    rows = np.asarray(rows, np.int64)
+    cnt = opt_off[rows + 1] - opt_off[rows]
+    off = np.zeros(len(rows) + 1, np.int64)
+    np.cumsum(cnt, out=off[1:])
+    idx = np.repeat(opt_off[rows] - off[:-1], cnt) + np.arange(off[-1])
+    return off, np.asarray(opt_action)[idx]
+
+
+def ov_torch(res, device):
+    """`rows.resolve`'s overrides (numpy) -> TokenNet's `ov` (int64 tensors on `device`)."""
+    return {k: torch.from_numpy(np.ascontiguousarray(res[k], dtype=np.int64)).to(device) for k in ('row', 'act', 'ref', 'col')}
+
+
+class _Split:
+    """A batch whose rows of more than LONG_T tokens were evaluated eagerly (`TokenGraphRunner`): the graphs'
+    handle of the other rows (or None) and the long rows' outputs, merged by `result`."""
+    __slots__ = ('h', 'o', 'aux', 'short', 'long', 'B', 'n_players', 'opt_off', 'opt_action', 'brows')
+
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
 class TokenGraphRunner:
     """CUDA graphs of a token network's evaluation (`net.TokenNet`, docs/az.md 10.6); opt-in
     (NetEvaluator's `graphs`, env ZERO_TOKEN_GRAPHS=1). `evaluate` / `launch` / `result` have
@@ -300,7 +358,7 @@ class TokenGraphRunner:
         self.slot_segs, col = [], 1
         for s in model.segs:
             o, k, w = s['offset'], s['count'], s['width']
-            if s['present'] is not None:
+            if s['present'] is not None and k:       # (a tail-only segment has no head slots)
                 seg[o:o + k * w] = True
                 self.slot_segs.append((o, k, w, col))
             col += k
@@ -321,6 +379,22 @@ class TokenGraphRunner:
         self.always = 1 + np.flatnonzero(~has)
         self.captures = 0
         self.replays = 0
+        # variable-length token sets (docs/az.md 43.7): tails and overrides uploaded beside the rows, graphs
+        # keyed by (rows, tokens, tail tokens, overrides), rows of more than LONG_T tokens eager
+        self.tailnet = bool(model.tails) or model.option_pointers
+        self.long_rows = 0                           # rows evaluated eagerly (more than LONG_T tokens)
+        if self.tailnet:
+            self.t_cap = max(self.t_cap, -(-LONG_T // T_STEP) * T_STEP)
+            self.lay = model.config['layout']
+            self.Wt = model.t_width
+            self.seg_tail = np.zeros(len(model.segs), bool)
+            self.seg_tail[model.tails] = True
+            self.seg_count = np.array([s['count'] for s in model.segs], np.int64)
+            # a padded tail entry: row 0, the first tail segment, slot its head count, floats 0
+            self.pad_seg = model.tails[0] if model.tails else 0
+            self.pad_slot = int(self.seg_count[self.pad_seg])
+            self.tinp = None                         # shared device inputs of the tails / overrides
+            self.tbufs = {}                          # pinned host tails / overrides per buffer set
 
     def refresh(self):
         """Nothing to do: the graphs read the model's parameters, which set_weights rewrites in place."""
@@ -355,10 +429,13 @@ class TokenGraphRunner:
                                      torch.empty(n, dtype=torch.int64).pin_memory())
         return k, b
 
-    def _run(self, x, n, full, ntok):
+    def _run(self, x, n, full, ntok, tail=None, ov=None):
         from .net import aux_answer
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
-            r = self.net.forward_static(x, n, full, ntok, aux=bool(self.layout))
+            if tail is None and ov is None:
+                r = self.net.forward_static(x, n, full, ntok, aux=bool(self.layout))
+            else:
+                r = self.net.forward_static(x, n, full, ntok, aux=bool(self.layout), tail=tail, ov=ov)
         plog, vlog, mar = r[:3]
         out = torch.cat([plog.float(), torch.softmax(vlog.float(), 1), mar.float()], 1)
         aux = None
@@ -367,24 +444,61 @@ class TokenGraphRunner:
             aux = torch.cat([pred[t[0]].float() for t in self.layout], 1)
         return out, aux
 
-    def _graph(self, Bp, Tp):
-        g = self.graphs.get((Bp, Tp))
+    def _tinputs(self, NTp, NOp):
+        """The shared device inputs of tails and overrides, at least NTp / NOp entries (a graph keeps views
+        of the ones it was captured with, as of `_inputs`')."""
+        ti = self.tinp
+        if ti is None or ti[0] < NTp or ti[1] < NOp:
+            ct = max(NTp, 256, ti[0] if ti else 0)
+            co = max(NOp, 256, ti[1] if ti else 0)
+            L, dev = torch.long, self.dev
+            with torch.inference_mode(False):
+                self.tinp = (ct, co,
+                             {'row': torch.zeros(ct, dtype=L, device=dev), 'seg': torch.zeros(ct, dtype=L, device=dev),
+                              'slot': torch.zeros(ct, dtype=L, device=dev),
+                              'val': torch.zeros((ct, self.Wt), device=dev)},
+                             {k: torch.zeros(co, dtype=L, device=dev) for k in ('row', 'act', 'ref', 'col')})
+        return self.tinp
+
+    def _pad_inputs(self, tail, ov):
+        """Device tails / overrides set to padding (docs/az.md 43.5: tail row 0, the first tail segment, slot
+        its count, floats 0; override action `actions`, ref -1)."""
+        if tail is not None:
+            tail['row'].zero_()
+            tail['seg'].fill_(self.pad_seg)
+            tail['slot'].fill_(self.pad_slot)
+            tail['val'].zero_()
+        if ov is not None:
+            ov['row'].zero_()
+            ov['act'].fill_(self.A)
+            ov['ref'].fill_(-1)
+            ov['col'].zero_()
+
+    def _graph(self, Bp, Tp, NTp=None, NOp=None):
+        key = (Bp, Tp) if NTp is None else (Bp, Tp, NTp, NOp)
+        g = self.graphs.get(key)
         if g is None:
             _, X, N, FULL, NT = self._inputs(Bp)
             x, n, full, ntok = X[:Bp], N[:Bp], FULL[:Bp * Tp].view(Bp, Tp), NT[:Bp]
+            tail = ov = None
+            if NTp is not None:                      # (a network with tails or overrides, docs/az.md 43.7)
+                _, _, TI, OI = self._tinputs(NTp, NOp)
+                tail = {k: v[:NTp] for k, v in TI.items()} if self.net.tails else None
+                ov = {k: v[:NOp] for k, v in OI.items()} if self.net.option_pointers else None
             with torch.inference_mode(False), torch.no_grad():
                 full.zero_()
                 ntok.fill_(1)
+                self._pad_inputs(tail, ov)
                 side = torch.cuda.Stream()
                 side.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(side):
                     for _ in range(2):               # warm-up (cuBLAS, the attention kernels)
-                        self._run(x, n, full, ntok)
+                        self._run(x, n, full, ntok, tail, ov)
                 torch.cuda.current_stream().wait_stream(side)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
-                    out, aux = self._run(x, n, full, ntok)
-            g = self.graphs[(Bp, Tp)] = (graph, x, n, full, ntok, out, aux)
+                    out, aux = self._run(x, n, full, ntok, tail, ov)
+            g = self.graphs[key] = (graph, x, n, full, ntok, out, aux) + (() if NTp is None else (tail, ov))
             self.captures += 1
         return g
 
@@ -400,10 +514,14 @@ class TokenGraphRunner:
                 d.shape = (len(d), k, w)                 # (a view, or an error: never a silent copy)
                 d[r, s] = x[:, o:o + k * w].reshape(-1, k, w)[r, s]
 
-    def launch(self, x, n_players, opt_off, opt_action, brows=None):
+    def launch(self, x, n_players, opt_off, opt_action, brows=None, tail=None, ov=None):
         """Upload a batch and queue its graph and download; -> a handle for `result` (any number of
         launches outstanding: each has its own pinned buffers until its result). `brows`: the root
-        belief rows whose auxiliary predictions `result` returns (`protocol.belief_rows`)."""
+        belief rows whose auxiliary predictions `result` returns (`protocol.belief_rows`). `tail` /
+        `ov` (`rows.Tail` / `rows.Overrides`: a network with tail segments / option_pointers needs them,
+        any other refuses them; docs/az.md 43.7): `_launch_tails`."""
+        if self.tailnet or tail is not None or ov is not None:
+            return self._launch_tails(x, None, n_players, opt_off, opt_action, brows, tail, ov)
         B = x.shape[0]
         Bp = -(-B // ROW_STEP) * ROW_STEP
         if x.shape[1] != self.F:
@@ -484,11 +602,13 @@ class TokenGraphRunner:
         P[rows[hit], col[hit]] = True
         return P
 
-    def launch_sparse(self, xs_off, xs_idx, xs_val, n_players, opt_off, opt_action, brows=None):
+    def launch_sparse(self, xs_off, xs_idx, xs_val, n_players, opt_off, opt_action, brows=None, tail=None, ov=None):
         """`launch` of a sparse batch (protocol.py: each row's non-zero features): the presence from the
         non-zeros, the rows built on the device (the graphs' input rows zeroed, the non-zeros scattered
         in: the same floats wherever the graphs read) - no dense row on the host. The answers are
-        `launch`'s on the densified rows, bit for bit."""
+        `launch`'s on the densified rows, bit for bit. `tail` / `ov`: as `launch`'s."""
+        if self.tailnet or tail is not None or ov is not None:
+            return self._launch_tails(None, (xs_off, xs_idx, xs_val), n_players, opt_off, opt_action, brows, tail, ov)
         xs_off = np.asarray(xs_off, np.int64)
         B = len(xs_off) - 1
         Bp = -(-B // ROW_STEP) * ROW_STEP
@@ -534,7 +654,292 @@ class TokenGraphRunner:
         self.replays += 1
         return (ev, ('s', slot), B, n_players, opt_off, opt_action, nb)
 
+    # ---- variable-length token sets (docs/az.md 43.7)
+    def _tail_args(self, tail, ov):
+        net = self.net
+        if net.tails and tail is None:
+            raise ValueError("TokenGraphRunner: a network with tail segments needs the batch's tail (rows.Tail; R5)")
+        if not net.tails and tail is not None:
+            raise ValueError('TokenGraphRunner: a batch with a tail for a network without tail segments (R5)')
+        if net.option_pointers and ov is None:
+            raise ValueError("TokenGraphRunner: a network with option_pointers needs the batch's overrides (R5)")
+        if not net.option_pointers and ov is not None:
+            raise ValueError('TokenGraphRunner: a batch with pointer overrides for a network without option_pointers (R5)')
+
+    def _check_tail_host(self, tr, ts, tsl, tv, B):
+        """A batch's padded tail (numpy) is this network's (R5): tail segments, slots at or past the head and
+        below 2^32, rows in [0, B) ascending, floats [NT, Wt]."""
+        NT = len(ts)
+        if tv.ndim != 2 or tv.shape != (NT, self.Wt) or len(tr) != NT or len(tsl) != NT:
+            raise ValueError(f"TokenGraphRunner: a tail of {NT} tokens with floats {tv.shape} (the network's tail "
+                             f"width {self.Wt})")
+        if not NT:
+            return
+        sc = np.clip(ts, 0, len(self.seg_tail) - 1)
+        bad = ((ts < 0) | (ts >= len(self.seg_tail)) | ~self.seg_tail[sc] | (tsl < self.seg_count[sc]) | (tsl >= 1 << 32)
+               | (tr < 0) | (tr >= B))
+        bad[1:] |= tr[1:] < tr[:-1]
+        if bad.any():
+            i = int(np.flatnonzero(bad)[0])
+            raise ValueError(f'TokenGraphRunner: tail token {i} (row {tr[i]}, segment {ts[i]}, slot {tsl[i]}) is not a '
+                             f'tail token of this network ({self.net.tail_segments()}; rows ascending)')
+
+    def _check_ov_host(self, res, P, tr, ts, B, NT):
+        """A batch's resolved overrides (numpy) for the graphs, which cannot check them (the network checks them
+        in eager): each target a present head slot (`P`, the head presence) or a tail token of the same row,
+        the column one its segment has, ref -1 or a token, the action in [0, actions]."""
+        r, a, ref, col = (np.asarray(res[k], np.int64) for k in ('row', 'act', 'ref', 'col'))
+        n_tok = self.n_tok
+        nk = self.net.seg_nk.cpu().numpy()
+        pos_seg = self.net.pos_seg.cpu().numpy()
+        bad = (ref < -1) | (ref == 0) | (ref >= n_tok + NT) | (r < 0) | (r >= B) | (a < 0) | (a > self.A) | (col < 0)
+        rc = np.clip(r, 0, B - 1)
+        hd = (ref > 0) & (ref < n_tok)
+        hr = np.clip(ref, 0, n_tok - 1)
+        seg = pos_seg[hr]
+        bad |= hd & ~P[rc, hr]
+        if NT:
+            tl = ref >= n_tok
+            tj = np.clip(ref - n_tok, 0, NT - 1)
+            bad |= tl & (tr[tj] != r)
+            seg = np.where(tl, ts[tj], seg)
+        bad |= (ref > 0) & (col >= nk[np.clip(seg, 0, len(nk) - 1)])
+        if bad.any():
+            i = int(np.flatnonzero(bad)[0])
+            raise ValueError(f'TokenGraphRunner: pointer override {i} (row {r[i]}, action {a[i]}, ref {ref[i]}, column '
+                             f'{col[i]}): its target is not a present token of its row with that column (docs/az.md 43.7)')
+
+    def _tbuf(self, key, NTp, NOp):
+        """A buffer set's pinned host tails / overrides (reused with the set: after its launch's result)."""
+        b = self.tbufs.get(key)
+        if b is None or b['row'].shape[0] < NTp or b['orow'].shape[0] < NOp:
+            ct = max(NTp, 256, 0 if b is None else b['row'].shape[0])
+            co = max(NOp, 256, 0 if b is None else b['orow'].shape[0])
+            with torch.inference_mode(False):
+                b = self.tbufs[key] = {k: torch.empty(ct, dtype=torch.int64).pin_memory() for k in ('row', 'seg', 'slot')}
+                b['val'] = torch.empty((ct, self.Wt), dtype=torch.float32).pin_memory()
+                b.update({k: torch.empty(co, dtype=torch.int64).pin_memory() for k in ('orow', 'act', 'ref', 'col')})
+        return b
+
+    def _launch_tails(self, x, sp, n_players, opt_off, opt_action, brows, tail, ov):
+        """`launch` / `launch_sparse` of a network with tail segments or pointer overrides (docs/az.md 43.7):
+        the rows of at most LONG_T tokens (head tokens + tail tokens) through the graph of (rows, tokens,
+        tail tokens, overrides), each padded; the longer rows evaluated eagerly now (`_eager_rows`), their
+        answers merged by `result`."""
+        self._tail_args(tail, ov)
+        if x is not None:
+            B = x.shape[0]
+            if x.shape[1] != self.F:
+                x = x[:, :self.F] if x.shape[1] > self.F else np.pad(x, ((0, 0), (0, self.F - x.shape[1])))
+            P = token_presence(x, self.pidx)
+        else:
+            xs_off = np.asarray(sp[0], np.int64)
+            sp = (xs_off, np.asarray(sp[1]), np.asarray(sp[2]))
+            B = len(xs_off) - 1
+            P = self.presence_sparse(*sp)
+        tcnt = tail.counts() if tail is not None else np.zeros(B, np.int64)
+        cnt = P.sum(1) + tcnt
+        long = cnt > LONG_T
+        if not long.any():
+            return self._graph_tails(B, x, sp, P, tcnt, cnt, n_players, opt_off, opt_action, brows, tail, ov)
+        short, lng = np.flatnonzero(~long), np.flatnonzero(long)
+        brows = np.asarray([] if brows is None else brows, np.int64)
+        where = np.full(B, -1, np.int64)
+
+        def part(rows):
+            where[:] = -1
+            where[rows] = np.arange(len(rows))
+            off, act = take_options(opt_off, opt_action, rows)
+            br = where[brows[where[brows] >= 0]] if len(brows) else np.zeros(0, np.int64)
+            if x is not None:
+                xx = x[rows]
+            else:
+                o0, o1 = sp[0][rows], sp[0][rows + 1]
+                xo = np.zeros(len(rows) + 1, np.int64)
+                np.cumsum(o1 - o0, out=xo[1:])
+                ii = np.repeat(o0 - xo[:-1], o1 - o0) + np.arange(xo[-1])
+                xx = (xo, sp[1][ii], sp[2][ii])
+            return (xx, np.asarray(n_players)[rows], off, act, br,
+                    None if tail is None else tail.take(rows), None if ov is None else ov.take(rows))
+        h = None
+        if len(short):
+            xx, nn, off, act, br, tt, oo = part(short)
+            h = (self.launch(xx, nn, off, act, br if len(br) else None, tt, oo) if x is not None else
+                 self.launch_sparse(*xx, nn, off, act, br if len(br) else None, tt, oo))
+        xx, nn, off, act, br, tt, oo = part(lng)
+        if x is None:
+            from .protocol import densify
+            xx = densify(*xx, self.F)
+        o, aux = self._eager_rows(xx, nn, off, act, br, tt, oo, cnt[lng])
+        self.long_rows += len(lng)
+        return _Split(h=h, o=o, aux=aux, short=short, long=lng, B=B, n_players=n_players, opt_off=opt_off,
+                      opt_action=opt_action, brows=brows)
+
+    def _eager_rows(self, x, n_players, opt_off, opt_action, brows, tail, ov, cnt):
+        """Rows of more than LONG_T tokens through the eager forward, in groups whose attention matrices stay
+        under LONG_BYTES (at least one row a group) -> (their outputs [L, actions + 2 seats] as the graphs'
+        `out`, their root belief rows' auxiliary predictions [len(brows), W] or None)."""
+        from . import rows as R
+        from .net import aux_answer
+        net, dev = self.net, self.dev
+        heads = net.blocks[0].h if len(net.blocks) else 1
+        L = x.shape[0]
+        o = np.zeros((L, self.A + 2 * self.S), np.float32)
+        aux = np.zeros((len(brows), max(1, self.W)), np.float32) if len(brows) else None
+        isb = np.zeros(L, bool)
+        isb[brows] = True
+        bpos = np.cumsum(isb) - 1                     # a belief row's index among `brows`
+        a = 0
+        with torch.no_grad():
+            while a < L:
+                b, cost = a, 0
+                while b < L and (b == a or cost + 4 * heads * int(cnt[b]) ** 2 <= LONG_BYTES):
+                    cost += 4 * heads * int(cnt[b]) ** 2
+                    b += 1
+                rows = np.arange(a, b)
+                off, act = take_options(opt_off, opt_action, rows)
+                kw = {}
+                tt = None if tail is None else tail.take(rows)
+                if net.tails:
+                    kw['tail'] = tt.to_torch(dev)
+                if net.option_pointers:
+                    kw['ov'] = ov_torch(R.resolve(tt, ov.take(rows), off, act, self.lay), dev)
+                xt = torch.from_numpy(np.ascontiguousarray(x[a:b], dtype=np.float32)).to(dev)
+                nt = torch.from_numpy(np.asarray(n_players[a:b], np.int64)).to(dev)
+                gb = np.flatnonzero(isb[a:b])
+                if len(gb):
+                    plog, vlog, mar, raw = net(xt, nt, aux=True, aux_rows=torch.from_numpy(gb).to(dev), **kw)
+                    pred = aux_answer(net, raw)
+                    aux[bpos[a + gb]] = torch.cat([pred[t[0]].float() for t in self.layout], 1).cpu().numpy()
+                else:
+                    plog, vlog, mar = net(xt, nt, **kw)
+                o[a:b] = torch.cat([plog.float(), torch.softmax(vlog.float(), 1), mar.float()], 1).cpu().numpy()
+                a = b
+        return o, aux
+
+    def _graph_tails(self, B, x, sp, P, tcnt, cnt, n_players, opt_off, opt_action, brows, tail, ov):
+        """One graph launch of a batch of a network with tails / overrides whose rows are at most LONG_T tokens:
+        the rows (dense: the copied features; sparse: the non-zeros scattered on the device), the extended
+        `full` (`token_index_tail`), the tail padded to NTp entries and the overrides resolved on the host
+        (`rows.resolve`) padded to NOp (docs/az.md 43.5) -> `result`'s handle."""
+        from . import rows as R
+        net = self.net
+        Bp = -(-B // ROW_STEP) * ROW_STEP
+        Tp = -(-int(cnt.max()) // T_STEP) * T_STEP
+        nb = 0 if brows is None else len(brows)
+        if nb and not self.layout:
+            raise RuntimeError('TokenGraphRunner: root belief rows for a network without the auxiliary head')
+        NT = 0
+        if tail is not None:
+            tr, ts, tsl, tv = tail.padded()
+            tr, ts, tsl = (np.asarray(a, np.int64) for a in (tr, ts, tsl))
+            tv = np.asarray(tv, np.float32)
+            self._check_tail_host(tr, ts, tsl, tv, B)
+            NT = len(ts)
+        res = R.resolve(tail, ov, opt_off, opt_action, self.lay) if net.option_pointers else None
+        NO = 0 if res is None else len(res['row'])
+        if NO:
+            self._check_ov_host(res, P, tr if NT else None, ts if NT else None, B, NT)
+        NTp, NOp = tail_bucket(NT), tail_bucket(NO)
+        if x is not None:
+            slot, (pin_x, pin_n, pin_full, pin_ntok, pin_out, pin_aux, pin_b) = self._slot(Bp)
+            key = ('d', slot)
+        else:
+            nnz = int(sp[0][-1])
+            slot, (_, pin_n, pin_full, pin_ntok, pin_out, pin_aux, pin_b, pin_fi, pin_val) = self._sslot(Bp, nnz)
+            key = ('s', slot)
+        tb = self._tbuf(key, NTp, NOp)
+        graph, xs, ns, fs, ts_, out, aux, tin, oin = self._graph(Bp, Tp, NTp, NOp)
+        if x is not None:
+            self._copy_rows(x, P, pin_x[:B].numpy())
+        else:
+            fi = pin_fi[:nnz].numpy()
+            np.multiply(np.repeat(np.arange(B, dtype=np.int64), np.diff(sp[0])), self.F, out=fi)
+            fi += sp[1].astype(np.int64)
+            pin_val[:nnz].numpy()[:] = sp[2]
+        pn = pin_n[:Bp].numpy()
+        pn[:B] = n_players
+        pn[B:] = 2
+        pt = pin_ntok[:Bp].numpy()
+        pt[:B] = cnt
+        pt[B:] = 1
+        token_index_tail(P, tcnt, self.n_tok, pin_full[:Bp * Tp].numpy().reshape(Bp, Tp))
+        if nb:
+            pin_b[:nb].numpy()[:] = brows
+        if tin is not None and NTp:
+            for k, v, pad in (('row', tr, 0), ('seg', ts, self.pad_seg), ('slot', tsl, self.pad_slot)):
+                a = tb[k][:NTp].numpy()
+                a[:NT] = v
+                a[NT:] = pad
+            a = tb['val'][:NTp].numpy()
+            a[:NT] = tv
+            a[NT:] = 0.0
+        if oin is not None and NOp:
+            for k, kk, pad in (('row', 'orow', 0), ('act', 'act', self.A), ('ref', 'ref', -1), ('col', 'col', 0)):
+                a = tb[kk][:NOp].numpy()
+                a[:NO] = res[k]
+                a[NO:] = pad
+        with torch.inference_mode(False):
+            if x is not None:
+                xs[:B].copy_(pin_x[:B], non_blocking=True)
+            else:
+                xs.zero_()
+                if nnz:
+                    fd = pin_fi[:nnz].to(self.dev, non_blocking=True)
+                    vd = pin_val[:nnz].to(self.dev, non_blocking=True)
+                    xs.view(-1).index_copy_(0, fd, vd)
+            ns.copy_(pin_n[:Bp], non_blocking=True)
+            fs.view(-1).copy_(pin_full[:Bp * Tp], non_blocking=True)
+            ts_.copy_(pin_ntok[:Bp], non_blocking=True)
+            if tin is not None and NTp:
+                for k in ('row', 'seg', 'slot', 'val'):
+                    tin[k].copy_(tb[k][:NTp], non_blocking=True)
+            if oin is not None and NOp:
+                for k, kk in (('row', 'orow'), ('act', 'act'), ('ref', 'ref'), ('col', 'col')):
+                    oin[k].copy_(tb[kk][:NOp], non_blocking=True)
+            graph.replay()
+            pin_out[:B].copy_(out[:B], non_blocking=True)
+            if nb:
+                bi = pin_b[:nb].to(self.dev, non_blocking=True)
+                pin_aux[:nb].copy_(aux.index_select(0, bi), non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record()
+        self.replays += 1
+        return (ev, slot if x is not None else ('s', slot), B, n_players, opt_off, opt_action, nb)
+
+    def _result_split(self, h):
+        """`result` of a `_Split`: the graphs' rows and the eager long rows merged in row order."""
+        o = np.zeros((h.B, self.A + 2 * self.S), np.float32)
+        nb = len(h.brows)
+        aux = np.zeros((nb, max(1, self.W)), np.float32) if nb else None
+        o[h.long] = h.o
+        if h.h is not None:
+            ev, slot, Bs, _, _, _, nbs = h.h
+            ev.synchronize()
+            bufs = self.slots
+            if isinstance(slot, tuple):
+                bufs, slot = self.sslots, slot[1]
+            o[h.short] = bufs[slot][4][:Bs].numpy()
+            if nbs:
+                aux[np.isin(h.brows, h.short)] = bufs[slot][5][:nbs].numpy()
+            (self.sfree if bufs is self.sslots else self.free).append(slot)
+        if nb and h.aux is not None:
+            aux[np.isin(h.brows, h.long)] = h.aux
+        A, S, B = self.A, self.S, h.B
+        rows = np.repeat(np.arange(B), np.diff(h.opt_off))
+        pri = segment_softmax_np(o[rows, h.opt_action], h.opt_off)
+        value = np.zeros((B, MAX_SEATS), np.float32)
+        margin = np.zeros((B, MAX_SEATS), np.float32)
+        value[:, :S] = o[:, A:A + S]
+        margin[:, :S] = o[:, A + S:A + 2 * S]
+        value[np.arange(MAX_SEATS)[None, :] >= np.asarray(h.n_players)[:, None]] = 0.0
+        if nb:
+            return pri, value, margin, aux[:, :self.W]
+        return pri, value, margin
+
     def result(self, h):
+        if isinstance(h, _Split):
+            return self._result_split(h)
         ev, slot, B, n_players, opt_off, opt_action, nb = h
         ev.synchronize()
         bufs = self.slots
@@ -555,8 +960,8 @@ class TokenGraphRunner:
             return pri, value, margin, aux
         return pri, value, margin
 
-    def evaluate(self, x, n_players, opt_off, opt_action, brows=None):
-        return self.result(self.launch(x, n_players, opt_off, opt_action, brows))
+    def evaluate(self, x, n_players, opt_off, opt_action, brows=None, tail=None, ov=None):
+        return self.result(self.launch(x, n_players, opt_off, opt_action, brows, tail, ov))
 
 
 def token_graphs_default():
@@ -584,7 +989,13 @@ class NetEvaluator:
     """`model` answering LeafBatches (module docstring). The encoding guard's last line (docs/az.md
     10.4): a batch whose rows are not as wide as the network's input (a network of another
     encoding: it would read the first floats of each row, or fail later) raises
-    net.EncodingMismatch; `allow_mismatch=True` skips it (tools/selfplay_digest.py)."""
+    net.EncodingMismatch; `allow_mismatch=True` skips it (tools/selfplay_digest.py).
+
+    Variable-length token sets (docs/az.md 43.7): a token network with tail segments / option_pointers
+    takes each batch's tail and overrides (`LeafBatch.tail` / `.ov`, `rows.Tail` / `rows.Overrides`; the
+    overrides resolved on the host, `rows.resolve`); every other network refuses a batch that carries them,
+    and the evaluator of a game that declares tails (`game_info()['tails']`) refuses at its construction any
+    network but a token network with the same tail segments (ValueError, R4)."""
 
     def __init__(self, model, device='cpu', graphs=None, workers=1, allow_mismatch=False, max_rows=None):
         if max_rows is not None and int(max_rows) < 1:
@@ -595,6 +1006,7 @@ class NetEvaluator:
         self.model = model.to(self.device).eval()
         self.width = None if allow_mismatch else getattr(model, 'features', None)
         self.amp = use_amp(model, self.device)
+        self._check_game_tails()
         if getattr(model, 'config', {}).get('arch') == 'tokens':
             self.fast = self._token_graphs(graphs)
         else:
@@ -617,6 +1029,69 @@ class NetEvaluator:
             from concurrent.futures import ThreadPoolExecutor
             self.pool = ThreadPoolExecutor(self.workers, thread_name_prefix='zero-infer')
             self.lock = threading.Lock()
+
+    @property
+    def tailnet(self):
+        """The network takes tails or overrides (a token network with tail segments or option_pointers)."""
+        return bool(getattr(self.model, 'tails', None)) or bool(getattr(self.model, 'option_pointers', False))
+
+    def _check_game_tails(self):
+        """R4 (docs/az.md 43.8): the network's game declares tail segments (`games.info(game)['tails']`) -> the
+        network must be a token network with exactly those tail segments (index, name, width, head slots), else
+        ValueError (an MLP / GridNet / other layout would drop every row's tail). A game this build cannot
+        describe is left to the encoding guard (a batch with a tail is refused anyway: `_tail_kw`)."""
+        game = getattr(self.model, 'config', {}).get('game')
+        if game is None:
+            return
+        try:
+            from . import games as G
+            want = G.info(game).get('tails') or []
+        except Exception:                          # noqa: BLE001 - no engine / not this build's game
+            return
+        if not want:
+            return
+        want = [(int(t['seg']), str(t['name']), int(t['width']), int(t['head'])) for t in want]
+        have = self.model.tail_segments() if hasattr(self.model, 'tail_segments') else None
+        if have != want:
+            c = getattr(self.model, 'config', {})
+            raise ValueError(f'NetEvaluator: the game {game!r} has tail segments {want} (index, name, width, head slots); '
+                             f'the network (arch {c.get("arch", "mlp")!r}) has {have}: it would drop or misread the rows\' '
+                             f'tails (a token network of the game\'s layout is needed; docs/az.md 43.8)')
+
+    def _tail_kw(self, tail, ov):
+        """A batch's tail / overrides as the network takes them: {} for a network without tails or pointers (which
+        refuses a batch with either: R5), else {'tail': rows.Tail, 'ov': rows.Overrides} (each one its network
+        needs, required)."""
+        if not self.tailnet:
+            if tail is not None or ov is not None:
+                c = getattr(self.model, 'config', {})
+                raise ValueError(f'NetEvaluator: a batch with tail tokens / pointer overrides for a network without tail '
+                                 f'segments or option_pointers (arch {c.get("arch", "mlp")!r}): it would drop them (R5)')
+            return {}
+        kw = {}
+        for k, v, need in (('tail', tail, bool(self.model.tails)), ('ov', ov, self.model.option_pointers)):
+            if need and v is None:
+                raise ValueError(f'NetEvaluator: the network needs each batch\'s {k} (rows.{"Tail" if k == "tail" else "Overrides"}'
+                                 f', possibly empty; R5)')
+            if not need and v is not None:
+                raise ValueError(f'NetEvaluator: a batch with {k} for a network that takes none (R5)')
+            if need:
+                kw[k] = v
+        return kw
+
+    def _torch_tail(self, kw, opt_off, opt_action):
+        """`_tail_kw`'s host tail / overrides -> the forward's (`tail` on the device; the overrides resolved on
+        the host, `rows.resolve`)."""
+        if not kw:
+            return {}
+        out = {}
+        if 'tail' in kw:
+            out['tail'] = kw['tail'].to_torch(self.device)
+        if 'ov' in kw:
+            from . import rows as R
+            out['ov'] = ov_torch(R.resolve(kw.get('tail'), kw['ov'], np.asarray(opt_off), np.asarray(opt_action),
+                                           self.model.config['layout']), self.device)
+        return out
 
     def _token_graphs(self, graphs):
         """A token network's TokenGraphRunner when its CUDA graphs are asked for (`graphs` True, or
@@ -663,6 +1138,7 @@ class NetEvaluator:
         if not head and reader_layout(a.get('readers')) == reader_layout(b.get('readers')):
             return self.set_weights(model.state_dict())
         self.model = model.to(self.device).eval()
+        self._check_game_tails()
         if isinstance(self.fast, TokenGraphRunner):
             self.fast = TokenGraphRunner(self.model)
         elif self.fast is not None:
@@ -676,31 +1152,33 @@ class NetEvaluator:
                                    f'(game {c.get("game")!r}, arch {c.get("arch", "mlp")!r}): the network was built for '
                                    f'another encoding than its driver feeds it')
 
-    def _pieces(self, x, n_players, opt_off, opt_action, extra):
+    def _pieces(self, x, n_players, opt_off, opt_action, extra, tail=None, ov=None):
         """`evaluate` of a batch over max_rows rows: consecutive pieces of at most max_rows rows, their
         answers concatenated (priors in option order, rows in row order, belief rows in row order).
         Through the CUDA graphs two pieces are in flight (the next one packed and uploaded while the
-        device runs the last)."""
+        device runs the last). A batch's tail / overrides are cut with it (docs/az.md 43.7)."""
         B, M = x.shape[0], self.max_rows
         self.pieces += 1
         opt_off = np.asarray(opt_off)
+        kw = self._tail_kw(tail, ov)
         parts = []
         for a in range(0, B, M):
             b = min(B, a + M)
             off = (opt_off[a:b + 1] - opt_off[a]).astype(opt_off.dtype)
             ex = None if extra is None else extra[a:b]
-            parts.append((x[a:b], n_players[a:b], off, opt_action[opt_off[a]:opt_off[b]], ex))
+            parts.append((x[a:b], n_players[a:b], off, opt_action[opt_off[a]:opt_off[b]], ex,
+                          {k: v.take(np.arange(a, b)) for k, v in kw.items()}))
         res = []
         if self.fast is not None and self.fast_aux:
             # (a token network's graphs answer every piece, belief rows included: pipelined)
             self._check_width(x)
             t0 = time.perf_counter()
             pending = []
-            for xx, nn, oo, aa, ex in parts:
+            for xx, nn, oo, aa, ex, tk in parts:
                 br = belief_rows(ex)
                 if len(br):
                     self._check_head()
-                pending.append((self.fast.launch(xx, nn, oo, aa, *((br,) if len(br) else ())), xx.shape[0]))
+                pending.append((self.fast.launch(xx, nn, oo, aa, *((br,) if len(br) else ()), **tk), xx.shape[0]))
                 if len(pending) >= 2:
                     h, rows = pending.pop(0)
                     res.append(self.fast.result(h))
@@ -711,7 +1189,7 @@ class NetEvaluator:
             self.leaves += B
             self.seconds += time.perf_counter() - t0
         else:
-            res = [self.evaluate(*p, _whole=True) for p in parts]
+            res = [self.evaluate(*p[:5], _whole=True, **p[5]) for p in parts]
         out = (np.concatenate([r[0] for r in res]).astype(np.float32, copy=False), np.concatenate([r[1] for r in res]),
                np.concatenate([r[2] for r in res]))
         aux = [r[3] for r in res if len(r) > 3]
@@ -720,19 +1198,22 @@ class NetEvaluator:
         return out
 
     @torch.inference_mode()
-    def evaluate(self, x, n_players, opt_off, opt_action, extra=None, _whole=False):
+    def evaluate(self, x, n_players, opt_off, opt_action, extra=None, tail=None, ov=None, _whole=False):
         """numpy in -> (priors [options], value [B, MAX_SEATS], margin [B, MAX_SEATS]) numpy; with root
         belief rows in `extra` (docs/search.md 3.8) a fourth item, their auxiliary predictions
-        [belief rows, aux width]. With `max_rows`, a bigger batch goes in pieces (`_pieces`)."""
+        [belief rows, aux width]. With `max_rows`, a bigger batch goes in pieces (`_pieces`). `tail` /
+        `ov`: the batch's (`rows.Tail` / `rows.Overrides`, docs/az.md 43.7; a network with tail segments /
+        option_pointers needs them, any other refuses them)."""
         if self.max_rows is not None and not _whole and x.shape[0] > self.max_rows:
-            return self._pieces(x, n_players, opt_off, opt_action, extra)
+            return self._pieces(x, n_players, opt_off, opt_action, extra, tail, ov)
         t0 = time.perf_counter()
         self._check_width(x)
+        kw = self._tail_kw(tail, ov)
         brows = belief_rows(extra)
         if len(brows):
             self._check_head()
         if self._graphable(opt_off, brows):
-            r = self.fast.evaluate(x, n_players, opt_off, opt_action, *((brows,) if len(brows) else ()))
+            r = self.fast.evaluate(x, n_players, opt_off, opt_action, *((brows,) if len(brows) else ()), **kw)
             self.calls += 1
             self.graph_calls += 1
             self.leaves += x.shape[0]
@@ -742,11 +1223,12 @@ class NetEvaluator:
         B = x.shape[0]
         xt = torch.from_numpy(x).to(dev, non_blocking=True)
         nt = torch.from_numpy(n_players.astype(np.int64)).to(dev)
+        tk = self._torch_tail(kw, opt_off, opt_action)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
             if len(brows):
-                plog, vlog, mar, raw = self.model(xt, nt, aux=True, aux_rows=torch.from_numpy(brows).to(dev))
+                plog, vlog, mar, raw = self.model(xt, nt, aux=True, aux_rows=torch.from_numpy(brows).to(dev), **tk)
             else:
-                plog, vlog, mar = self.model(xt, nt)
+                plog, vlog, mar = self.model(xt, nt, **tk)
         cnt = torch.from_numpy(np.diff(opt_off).astype(np.int64)).to(dev)
         rows = torch.repeat_interleave(torch.arange(B, device=dev), cnt)
         acts = torch.from_numpy(opt_action.astype(np.int64)).to(dev)
@@ -792,7 +1274,7 @@ class NetEvaluator:
     def __call__(self, lb):
         if lb.a.get('xs_val') is not None and self._graphable(lb.opt_off, belief_rows(lb.a.get('extra'))):
             return self.result(self.launch(lb))
-        return self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, lb.a.get('extra'))
+        return self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, lb.a.get('extra'), *_lb_tail(lb))
 
     def _launch_sparse(self, lb):
         """A sparse batch through a token network's graphs (`TokenGraphRunner.launch_sparse`), in pieces of
@@ -806,6 +1288,7 @@ class NetEvaluator:
         opt_off = np.asarray(lb.opt_off)
         B = lb.B
         M = self.max_rows or B
+        kw = self._tail_kw(*_lb_tail(lb))
         hs = []
         for a in range(0, B, M):
             b = min(B, a + M)
@@ -814,9 +1297,10 @@ class NetEvaluator:
                 self._check_head()
             off = xs_off[a:b + 1] - xs_off[a]
             oo = (opt_off[a:b + 1] - opt_off[a]).astype(opt_off.dtype)
+            tk = kw if (a == 0 and b == B) else {k: v.take(np.arange(a, b)) for k, v in kw.items()}
             hs.append(self.fast.launch_sparse(off, xs_idx[xs_off[a]:xs_off[b]], xs_val[xs_off[a]:xs_off[b]],
                                               lb.n_players[a:b], oo, lb.opt_action[opt_off[a]:opt_off[b]],
-                                              *((br,) if len(br) else ())))
+                                              *((br,) if len(br) else ()), **tk))
         if len(hs) > 1:
             self.pieces += 1
         return ('s', hs, B)
@@ -827,32 +1311,46 @@ class NetEvaluator:
         return list(getattr(self.model, 'aux_layout', None) or [])
 
     @torch.inference_mode()
-    def aux(self, x, n_players):
+    def aux(self, x, n_players, tail=None):
         """The auxiliary head's predictions for rows `x` [B, F] (numpy; n_players [B]) -> {name: float32
         numpy [B, width]} (`net.aux_predict`: a multinomial target's distribution, a poisson target's
         rates, an mse target's values); {} for a network without the head. One forward pass, outside
-        the search's batches (its evaluations never compute the head)."""
+        the search's batches (its evaluations never compute the head). `tail`: the rows' (`rows.Tail`; a
+        network with tail segments needs it: docs/az.md 43.7)."""
         if not self.aux_layout:
             return {}
         from .net import aux_answer
-        return {k: v.float().cpu().numpy() for k, v in aux_answer(self.model, self._aux_raw(x, n_players)).items()}
+        return {k: v.float().cpu().numpy() for k, v in aux_answer(self.model, self._aux_raw(x, n_players, tail)).items()}
 
-    def _aux_raw(self, x, n_players):
+    def _aux_raw(self, x, n_players, tail=None):
         self._check_width(x)
         xt = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).to(self.device)
         nt = torch.from_numpy(np.asarray(n_players, np.int64)).to(self.device)
+        tk = {}
+        if not self.tailnet:
+            self._tail_kw(tail, None)                # (a tail for a network without tails: refused, R5)
+        else:
+            if self.model.tails:
+                if tail is None:
+                    raise ValueError("NetEvaluator: the network needs the rows' tail (rows.Tail, possibly empty; R5)")
+                tk['tail'] = tail.to_torch(self.device)
+            elif tail is not None:
+                raise ValueError('NetEvaluator: a tail for a network without tail segments (R5)')
+            if self.model.option_pointers:
+                # (the auxiliary outputs read no policy logit: no options, so no overrides - an empty set)
+                tk['ov'] = {k: torch.zeros(0, dtype=torch.long, device=self.device) for k in ('row', 'act', 'ref', 'col')}
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
-            return self.model(xt, nt, aux=True)[3]
+            return self.model(xt, nt, aux=True, **tk)[3]
 
     @torch.inference_mode()
-    def reader(self, x, n_players):
+    def reader(self, x, n_players, tail=None):
         """The readers' predictions for rows `x` [B, F] (docs/az.md 36) -> {target: float32 numpy [B, width]}
         (`net.reader_predict`); {} for a network without readers. One forward pass, outside the search's
-        batches (as `aux`)."""
+        batches (as `aux`; `tail` as its)."""
         if not getattr(self.model, 'reader_specs', None):
             return {}
         from .net import reader_predict
-        return {k: v.float().cpu().numpy() for k, v in reader_predict(self.model, self._aux_raw(x, n_players)).items()}
+        return {k: v.float().cpu().numpy() for k, v in reader_predict(self.model, self._aux_raw(x, n_players, tail)).items()}
 
     def _graphable(self, opt_off, brows):
         """The batch goes through the CUDA graphs (a conv network's skip batches with root belief
@@ -868,21 +1366,22 @@ class NetEvaluator:
             h = self._launch_sparse(lb)
             self.seconds += time.perf_counter() - t0
             return h
+        tl = _lb_tail(lb)
         if self.max_rows is not None and lb.B > self.max_rows:
             # (in pieces, answered now: `_pieces`)
-            return ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra), 0)
+            return ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra, *tl), 0)
         if self.pool is not None:
-            return ('f', self.pool.submit(self.evaluate, lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra), 0)
+            return ('f', self.pool.submit(self.evaluate, lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra, *tl), 0)
         t0 = time.perf_counter()
         brows = belief_rows(extra)
         if self._graphable(lb.opt_off, brows):
             self._check_width(lb.x)
             if len(brows):
                 self._check_head()
-            h = ('g', self.fast.launch(lb.x, lb.n_players, lb.opt_off, lb.opt_action, *((brows,) if len(brows) else ())),
-                 lb.B)
+            h = ('g', self.fast.launch(lb.x, lb.n_players, lb.opt_off, lb.opt_action, *((brows,) if len(brows) else ()),
+                                       **self._tail_kw(*tl)), lb.B)
         else:
-            h = ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra), 0)
+            h = ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra, *tl), 0)
         self.seconds += time.perf_counter() - t0
         return h
 
@@ -913,6 +1412,12 @@ class NetEvaluator:
         self.leaves += B
         self.seconds += time.perf_counter() - t0
         return r
+
+
+def _lb_tail(lb):
+    """A LeafBatch's tail and overrides (`LeafBatch.tail` / `.ov`: rows.Tail / rows.Overrides, docs/az.md 43.7)
+    -> (tail, ov), None each when the batch has none (a game without tails or pointer overrides)."""
+    return getattr(lb, 'tail', None), getattr(lb, 'ov', None)
 
 
 class UniformEvaluator:

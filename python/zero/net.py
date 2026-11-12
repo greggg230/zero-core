@@ -466,9 +466,13 @@ class GridNet(nn.Module):
 
 def tokens_layout(layout, features, actions):
     """The normalised object layout of a `TokenNet` (validated against the feature / action
-    widths; module docstring of TokenNet). -> a plain dict (stored in the checkpoint config)."""
+    widths; module docstring of TokenNet). -> a plain dict (stored in the checkpoint config).
+    The keys of variable-length token sets (docs/az.md 43.5: segment `tail`, `gate`, `columns`, a
+    tail-only segment's `count` 0 / `offset` null; layout `option_pointers`, `max_row_tokens`,
+    `draft`) are kept only when set, so every layout without them normalises as before."""
     vocab = int(layout['vocab'])
     segs, bags, used, acts, ids = [], [], set(), {}, []
+    pointers = bool(layout.get('option_pointers'))
 
     def claim(name, lo, n):
         if lo < 0 or lo + n > features:
@@ -479,11 +483,16 @@ def tokens_layout(layout, features, actions):
         used.update(r)
 
     for s in layout.get('segments', []):
-        seg = {'name': str(s['name']), 'offset': int(s['offset']), 'count': int(s['count']), 'width': int(s['width']),
+        tail = bool(s.get('tail'))
+        seg = {'name': str(s['name']), 'offset': None if s.get('offset') is None else int(s['offset']),
+               'count': int(s['count']), 'width': int(s['width']),
                'present': None if s.get('present') is None else int(s['present']), 'id': None,
                'actions': [[int(b), int(k)] for b, k in s.get('actions', [])]}
-        if seg['count'] < 1 or seg['width'] < 1:
+        if (seg['count'] < 1 and not (tail and seg['count'] == 0)) or seg['width'] < 1:
             raise ValueError(f'tokens layout: segment {seg["name"]} has no slots')
+        if (seg['count'] == 0) != (seg['offset'] is None):
+            raise ValueError(f'tokens layout: segment {seg["name"]}: offset null exactly for a tail-only segment '
+                             f'(count 0, tail), which claims no features')
         if seg['present'] is not None and not 0 <= seg['present'] < seg['width']:
             raise ValueError(f'tokens layout: segment {seg["name"]}: present flag outside the slot')
         if s.get('id') is not None:
@@ -492,7 +501,10 @@ def tokens_layout(layout, features, actions):
             if at < 0 or at + sum(radix) > seg['width'] or math.prod(radix) > vocab:
                 raise ValueError(f'tokens layout: segment {seg["name"]}: identity {s["id"]} does not fit')
             seg['id'] = {'at': at, 'radix': radix}
-        claim(seg['name'], seg['offset'], seg['count'] * seg['width'])
+        if seg['count']:
+            claim(seg['name'], seg['offset'], seg['count'] * seg['width'])
+        # (a segment's static actions are its head slots': a tail token never gets one, so the
+        # collision check covers the head slots only)
         for j, (base, stride) in enumerate(seg['actions']):
             for slot in range(seg['count']):
                 a = base + slot * stride
@@ -511,6 +523,19 @@ def tokens_layout(layout, features, actions):
                 raise ValueError(f'tokens layout: segment {seg["name"]}: id_actions {base} outside {actions}')
             seg['id_actions'] = base
             ids.append(seg)
+        # variable-length token sets (docs/az.md 43.5; each key only when set)
+        if tail:
+            seg['tail'] = True
+        if s.get('gate'):
+            if seg['count'] != 0:
+                raise ValueError(f'tokens layout: segment {seg["name"]}: gate only on a tail-only segment (count 0)')
+            seg['gate'] = True
+        if s.get('columns') is not None:
+            c = int(s['columns'])
+            if c < 1 or not pointers:
+                raise ValueError(f'tokens layout: segment {seg["name"]}: columns {c} needs columns >= 1 and the layout\'s '
+                                 f'option_pointers')
+            seg['columns'] = c
         segs.append(seg)
     for seg in ids:
         lo, hi = seg['id_actions'], seg['id_actions'] + vocab
@@ -550,6 +575,21 @@ def tokens_layout(layout, features, actions):
         # carry one (`check_encoding`, docs/az.md 10.4)
         if layout.get(k) is not None:
             out[k] = layout[k]
+    # variable-length token sets (docs/az.md 43.5; each key only when set): rows carry pointer
+    # overrides; a row's capacity 1 + sum(count) + its tail tokens may not pass max_row_tokens (required
+    # with a tail segment); a draft layout (run launches and fork_run refuse it unless allowed)
+    if pointers:
+        out['option_pointers'] = True
+    head = 1 + sum(s['count'] for s in segs)
+    if any(s.get('tail') for s in segs) and layout.get('max_row_tokens') is None:
+        raise ValueError('tokens layout: a layout with tail segments needs max_row_tokens')
+    if layout.get('max_row_tokens') is not None:
+        mrt = int(layout['max_row_tokens'])
+        if mrt < head:
+            raise ValueError(f'tokens layout: max_row_tokens {mrt} below the head\'s {head} token positions')
+        out['max_row_tokens'] = mrt
+    if layout.get('draft'):
+        out['draft'] = True
     return out
 
 
@@ -567,12 +607,39 @@ class TBlock(nn.Module):
         self.ff2 = nn.Linear(ff, d)
 
     def forward(self, h, keep):
-        """h [B, T, d], keep [B, 1, 1, T] bool (False = padding: never attended to)."""
+        """h [B, T, d], keep [B, 1, 1, T] bool (False = padding: never attended to), or a float
+        additive mask (gated tokens, docs/az.md 43.6: log of the keys' weights, -inf at 0)."""
         B, T, D = h.shape
         q, k, v = self.qkv(self.ln1(h)).view(B, T, 3, self.h, D // self.h).permute(2, 0, 3, 1, 4)
         a = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
         h = h + self.out(a.transpose(1, 2).reshape(B, T, D))
         return h + self.ff2(F.gelu(self.ff1(self.ln2(h))))
+
+    def forward_weighted(self, h, w4, keep4):
+        """`forward` with weighted keys, as an explicit math attention (docs/az.md 43.6: training while a
+        present gate is exactly 0, where SDPA's float mask log w would give the gate no finite gradient):
+        p_ij = exp(s_ij - m_i) * w_j, out_i = sum_j p_ij v_j / sum_j p_ij, m_i the max over the
+        non-padding keys (`keep4` [B, 1, 1, T]); w4 [B, 1, 1, T] the keys' weights (1 ungated, g gated, 0
+        padding)."""
+        B, T, D = h.shape
+        q, k, v = self.qkv(self.ln1(h)).view(B, T, 3, self.h, D // self.h).permute(2, 0, 3, 1, 4)
+        s = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(q.shape[-1]))
+        s = s.masked_fill(~keep4, float('-inf'))
+        p = torch.exp(s - s.amax(-1, keepdim=True).detach()) * w4
+        a = (p @ v) / p.sum(-1, keepdim=True)
+        h = h + self.out(a.transpose(1, 2).reshape(B, T, D))
+        return h + self.ff2(F.gelu(self.ff1(self.ln2(h))))
+
+
+# tail token positions (docs/az.md 43.5): psi(n), n = slot - count in [0, 2^32): its 32 binary digits,
+# log2(n + 1) / 32, and sin / cos(2 pi (n mod 2^j) / 2^j) for j = 1..8 (interleaved: sin_1, cos_1, sin_2, ...)
+PSI = 49
+
+
+def _capturing(t):
+    """A CUDA graph is being captured on the current stream (`t`: a tensor of the forward's device): the
+    checks that need a host sync are skipped then (the host checked the graph's inputs)."""
+    return t.is_cuda and torch.cuda.is_current_stream_capturing()
 
 
 class TokenNet(nn.Module):
@@ -614,6 +681,16 @@ class TokenNet(nn.Module):
     slot's own actions are scored from its token, conditioned on the pooled state (pointer
     logits), and so is its identity's action in a segment with `id_actions`. An empty slot's
     actions fall back to the generic logits.
+
+    Variable-length token sets (docs/az.md 43.5-43.8; all opt-in, a layout without them builds the
+    network of before): a segment with `tail` takes its slots >= `count` as tail tokens (`forward*(...,
+    tail=)`: (row, segment, slot, floats)), embedded as head slots (the segment's input map, the
+    identity) with the position `tail_base[k] + pos_tail[k](psi(slot - count))`; a tail-only segment
+    (`count` 0) has tail tokens only; a `gate`d segment's tokens weigh g = max(theta, 0) in the
+    attention's keys and the pooling (exactly 0 at a widen: they change nothing else); `columns` gives a
+    segment pointer columns without a static table; with `option_pointers` the rows' pointer overrides
+    (`ov`, resolved on the host) score their options from a token's column (or the generic logit)
+    after the static scatter.
     """
 
     def __init__(self, features, actions, layout, d=128, layers=3, heads=4, ff=256, seats=MAX_SEATS, game='toy',
@@ -627,8 +704,15 @@ class TokenNet(nn.Module):
         self.features, self.seats, self.actions, self.d = features, seats, actions, d
         self.segs, self.bags, self.vocab = lay['segments'], lay['bags'], lay['vocab']
         self.chunk = 64                      # rows per packed chunk (an execution detail, not saved)
+        # variable-length token sets (docs/az.md 43.5): the tail segments and the gated ones (segment
+        # indexes, layout order), pointer overrides; none of them: the network of before
+        self.tails = [j for j, s in enumerate(self.segs) if s.get('tail')]
+        self.gated = [j for j, s in enumerate(self.segs) if s.get('gate')]
+        self.option_pointers = bool(lay.get('option_pointers'))
         inside = set()
         for s in self.segs:
+            if not s['count']:               # (a tail-only segment claims no features)
+                continue
             inside.update(range(s['offset'], s['offset'] + s['count'] * s['width']))
         for b in self.bags:
             inside.update(range(b['offset'], b['offset'] + b['count'] * b['width']))
@@ -651,7 +735,9 @@ class TokenNet(nn.Module):
         # id_actions; per position in the full token axis (0 = global, then the segments' slots)
         # its columns and action ids (-1 / `actions` = none: scattered into a dummy column); an
         # identity column's action is its base + the token's identity (`tok_isid`, `tok_idbase`)
-        nk = [len(s['actions']) + ('id_actions' in s) for s in self.segs]
+        # (a segment's `columns`: pointer columns after its action pairs and identity column, with no
+        # static table: scored only through pointer overrides, docs/az.md 43.7)
+        nk = [len(s['actions']) + ('id_actions' in s) + s.get('columns', 0) for s in self.segs]
         self.n_id = sum('id_actions' in s for s in self.segs)
         self.ptr = nn.Linear(d, max(1, sum(nk)))
         K = max(nk + [1])
@@ -672,11 +758,20 @@ class TokenNet(nn.Module):
                     idbase[start + slot] = s['id_actions']
             start += s['count']
             c0 += k
+        if self.tails:
+            # one more position, n_tok: every tail token's (no static action: a tail token is scored
+            # only through pointer overrides, docs/az.md 43.7)
+            cols = torch.cat([cols, torch.full((1, K), -1, dtype=torch.long)])
+            acts = torch.cat([acts, torch.full((1, K), actions, dtype=torch.long)])
+            isid = torch.cat([isid, torch.zeros((1, K), dtype=torch.bool)])
+            idbase = torch.cat([idbase, torch.zeros(1, dtype=torch.long)])
         self.register_buffer('tok_cols', cols, persistent=False)
         self.register_buffer('tok_acts', acts, persistent=False)
         if self.n_id:
             self.register_buffer('tok_isid', isid, persistent=False)
             self.register_buffer('tok_idbase', idbase, persistent=False)
+        if self.tails or self.option_pointers:
+            self._tail_buffers(nk)
         self.val = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
         self.mar = nn.Sequential(nn.Linear(2 * d, head), nn.ReLU(), nn.Linear(head, seats))
         # the policy starts uniform: with random output layers the generic logit of a frequent
@@ -688,19 +783,281 @@ class TokenNet(nn.Module):
         for lin in (self.gen, self.ptr):
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
+        if self.tails:
+            # tail positions (docs/az.md 43.5): per tail segment k a base (a segment with head slots: its
+            # last head slot's embedding, so its first tail slot starts where the head ends; tail-only:
+            # N(0, 0.02)) and a map of psi(slot - count), N(0, 0.02)
+            tb = torch.empty(len(self.tails), d)
+            for k, j in enumerate(self.tails):
+                if self.segs[j]['count']:
+                    tb[k] = self.pos.data[self.seg_start[j] + self.segs[j]['count'] - 1]
+                else:
+                    nn.init.normal_(tb[k], std=0.02)
+            self.tail_base = nn.Parameter(tb)
+            self.pos_tail = nn.ModuleList(nn.Linear(PSI, d, bias=False) for _ in self.tails)
+            for lin in self.pos_tail:
+                nn.init.normal_(lin.weight, std=0.02)
+        if self.gated:
+            # the gated segments' gates theta (g = max(theta, 0)): 1 when built, 0 when a widen adds the
+            # segment (docs/az.md 43.6)
+            self.gate = nn.Parameter(torch.ones(len(self.gated)))
         _with_aux(self, 2 * d, head, aux, aux_parts)
         # readers (docs/az.md 36): they read the flat part of the features - the bags and the globals,
         # every feature outside the segments (what the CUDA graphs' host copy always copies) - and their
         # predictions are added to the global token's input
         in_seg = set()
         for s in self.segs:
-            in_seg.update(range(s['offset'], s['offset'] + s['count'] * s['width']))
+            if s['count']:
+                in_seg.update(range(s['offset'], s['offset'] + s['count'] * s['width']))
         for s in reader_layout(readers):
             seg = sorted(set(reader_index(s)) & in_seg)
             if seg:
                 raise ValueError(f'reader {s["target"]}: a token network\'s reader reads its bags and globals (the '
                                  f'features outside the segments), not feature {seg[0]} of a segment')
         _with_readers(self, features, d, readers)
+
+    # ---- variable-length token sets (docs/az.md 43.5-43.7)
+    def _tail_buffers(self, nk):
+        """The per-segment tables of tails and pointer overrides (non-persistent buffers: the state is
+        unchanged): a segment's pointer columns (first global index, number), head slot count, whether it
+        takes tail tokens, its index among the tail segments and among the gated ones (-1: not one); each
+        head position's segment (the global token: -1); psi's shifts and moduli."""
+        start, c0, p, c = [], [], 1, 0
+        for s, k in zip(self.segs, nk):
+            start.append(p)
+            c0.append(c)
+            p += s['count']
+            c += k
+        self.seg_start = start                      # a segment's first position in the full token axis
+        tk, gi = [-1] * len(self.segs), [-1] * len(self.segs)
+        for k, j in enumerate(self.tails):
+            tk[j] = k
+        for k, j in enumerate(self.gated):
+            gi[j] = k
+
+        def lt(v):
+            return torch.tensor(v, dtype=torch.long)
+        self.register_buffer('seg_c0', lt(c0), persistent=False)
+        self.register_buffer('seg_nk', lt(nk), persistent=False)
+        self.register_buffer('seg_count', lt([s['count'] for s in self.segs]), persistent=False)
+        self.register_buffer('seg_istail', torch.tensor([bool(s.get('tail')) for s in self.segs]), persistent=False)
+        self.register_buffer('seg_tk', lt(tk), persistent=False)
+        self.register_buffer('seg_gi', lt(gi), persistent=False)
+        self.register_buffer('pos_seg', lt([-1] + [j for j, s in enumerate(self.segs) for _ in range(s['count'])]),
+                             persistent=False)
+        # the pointer head's parts (`_pointer`): each tail-only segment's columns apart, runs of the others
+        parts, run = [], None
+        for s, a, k in zip(self.segs, c0, nk):
+            if not k:
+                continue
+            if s['count'] == 0:
+                parts.append((a, a + k))
+                run = None
+            elif run is not None and parts[run][1] == a:
+                parts[run] = (parts[run][0], a + k)
+            else:
+                parts.append((a, a + k))
+                run = len(parts) - 1
+        self.ptr_parts = parts or [(0, self.ptr.out_features)]
+        self.register_buffer('psi_shift', torch.arange(32, dtype=torch.long), persistent=False)
+        self.register_buffer('psi_mod', lt([2 ** j for j in range(1, 9)]), persistent=False)
+        # a tail token's floats: the first width(segment) of t_width columns (the widest tail segment's)
+        self.t_width = max([self.segs[j]['width'] for j in self.tails] or [0])
+
+    def tail_segments(self):
+        """The network's tail segments [(segment index, name, width, head slots), ...] in layout order (what a
+        game's `game_info()['tails']` must be: `infer.NetEvaluator` refuses another, docs/az.md 43.8)."""
+        return [(j, self.segs[j]['name'], self.segs[j]['width'], self.segs[j]['count']) for j in self.tails]
+
+    def gates(self):
+        """{gated segment name: g = max(theta, 0)} (docs/az.md 43.6: the run logs them; a gate that stays at 0
+        is said loudly there); {} without gated segments."""
+        if not self.gated:
+            return {}
+        g = self.gate.detach().clamp(min=0).cpu().tolist()
+        return {self.segs[j]['name']: float(v) for j, v in zip(self.gated, g)}
+
+    def _gate_g(self):
+        """g = max(theta, 0) of the gated segments, with a straight-through gradient (backward the identity:
+        a gate pushed below 0 can come back). Exact: theta + (relu(theta) - theta) is relu(theta)."""
+        th = self.gate
+        return th + (th.clamp(min=0) - th).detach()
+
+    def _psi(self, n):
+        """psi(n) [N, PSI] of int64 offsets n in [0, 2^32) (PSI's comment): the digits exact from the
+        integers, the rest computed in float64 and rounded to float32 (the same on every device)."""
+        bits = ((n[:, None] >> self.psi_shift) & 1).to(torch.float32)
+        lg = (torch.log2(n.to(torch.float64) + 1.0) / 32.0)[:, None]
+        mod = self.psi_mod.to(torch.float64)
+        ang = (n[:, None] & (self.psi_mod - 1)).to(torch.float64) * (2.0 * math.pi) / mod
+        sc = torch.stack([torch.sin(ang), torch.cos(ang)], -1).flatten(1)
+        return torch.cat([bits, torch.cat([lg, sc], 1).to(torch.float32)], 1)
+
+    def _tail_embed(self, tail, static):
+        """Tail tokens' embeddings [NT, d], as a head slot's: the segment's input map of its floats + the
+        position tail_base[k] + pos_tail[k](psi(slot - count)) + its identity's embedding (a segment with an
+        identity). `static`: `_tail_embed_static`; else each present segment's tokens selected, its maps on
+        them (forward: a segment's tokens embedded by the products a network without the other segments
+        would run)."""
+        seg, val = tail['seg'], tail['val']
+        if static:
+            return self._tail_embed_static(seg, tail['slot'], val)
+        psi = self._psi(tail['slot'] - self.seg_count[seg])
+        out = val.new_zeros(seg.shape[0], self.d)
+        for k, j in enumerate(self.tails):
+            s = self.segs[j]
+            sel = (seg == j).nonzero(as_tuple=True)[0]
+            if not len(sel):
+                continue
+            rows, ps = val[sel], psi[sel]
+            t = self.seg_in[j](rows[:, :s['width']]) + (self.tail_base[k] + self.pos_tail[k](ps))
+            if s['id'] is not None:
+                t = t + self.emb(self._identity(rows, s['id']))
+            out = out.index_put((sel,), t)
+        return out
+
+    def _tail_embed_static(self, seg, slot, val):
+        """`_tail_embed` with no data-dependent shape and few kernels (forward_static, the CUDA graphs): every
+        tail segment's input map on every token as one product (their weights in one matrix, each zero past
+        its width: a token's floats are zeros there), every position map as one, each identity layout's digits
+        decoded once; each token's own picked by its segment. A few dozen kernels whatever the number of tail
+        segments (MTG Zero's v7: 13), where a loop over the segments ran ~45 each (forward) and as many again
+        (backward)."""
+        K, d, NT = len(self.tails), self.d, seg.shape[0]
+        tab = self._tail_tables(val.device)
+        tk = self.seg_tk[seg]
+        W = torch.cat([self.seg_in[j].weight.reshape(-1) for j in self.tails])
+        W = W.new_zeros(K * d * self.t_width).index_copy(0, tab['w_index'], W).view(K * d, self.t_width)
+        b = torch.cat([self.seg_in[j].bias for j in self.tails])
+        pick = tk[:, None, None].expand(NT, 1, d)
+        x = F.linear(val, W, b).view(NT, K, d).gather(1, pick).squeeze(1)
+        P = torch.cat([lin.weight for lin in self.pos_tail])
+        pos = F.linear(self._psi(slot - self.seg_count[seg]), P).view(NT, K, d).gather(1, pick).squeeze(1)
+        t = x + (self.tail_base[tk] + pos)
+        for spec, uses in tab['ids']:
+            e = self.emb(self._identity(val, spec))
+            t = t + torch.where(uses[seg][:, None], e, torch.zeros((), dtype=e.dtype, device=e.device))
+        return t
+
+    def _tail_tables(self, dev):
+        """`_tail_embed_static`'s tables, built once per device (an attribute: the state is unchanged): each
+        tail segment's input-map weights' places in the [K * d, t_width] matrix, and per identity layout of the
+        tail segments (`id`) the segments that use it."""
+        cache = getattr(self, '_ttab', None)
+        if cache is None or cache[0] != dev:
+            d, Wt, idx, specs = self.d, self.t_width, [], {}
+            for k, j in enumerate(self.tails):
+                w = self.segs[j]['width']
+                r = torch.arange(d)[:, None]
+                idx.append(((k * d + r) * Wt + torch.arange(w)[None, :]).reshape(-1))
+                if self.segs[j]['id'] is not None:
+                    key = (self.segs[j]['id']['at'], tuple(self.segs[j]['id']['radix']))
+                    specs.setdefault(key, []).append(j)
+            ids = []
+            for (at, radix), js in specs.items():
+                uses = torch.zeros(len(self.segs), dtype=torch.bool)
+                uses[js] = True
+                ids.append(({'at': at, 'radix': list(radix)}, uses.to(dev)))
+            cache = self._ttab = (dev, {'w_index': torch.cat(idx).to(dev), 'ids': ids})
+        return cache[1]
+
+    def _tail_weight(self, seg):
+        """Tail tokens' weights [NT] in the attention's keys and the pooling: a gated segment's g, else 1."""
+        gi = self.seg_gi[seg]
+        g = self._gate_g()
+        return torch.where(gi >= 0, g[gi.clamp(min=0)], torch.ones((), dtype=g.dtype, device=g.device))
+
+    def _explicit(self, gi):
+        """Whether the attention runs as the explicit math (docs/az.md 43.6): gradients on (training) and a
+        gated segment with present tokens (`gi`: the present tail tokens' gated indexes, -1 = not gated) at
+        g == 0. One host sync, training only."""
+        if not (torch.is_grad_enabled() and self.gate.requires_grad):
+            return False
+        G = len(self.gated)
+        pres = torch.zeros(G + 1, dtype=torch.bool, device=gi.device).index_fill(0, torch.where(gi >= 0, gi, G), True)
+        return bool(((self.gate <= 0) & pres[:G]).any())
+
+    def _tail_args(self, tail, ov):
+        """The refusals of a forward's `tail` / `ov` (R5, docs/az.md 43.5) -> (NT, NO)."""
+        if self.tails and tail is None:
+            raise ValueError(f'TokenNet: a network with tail segments ({[self.segs[j]["name"] for j in self.tails]}) '
+                             f'needs `tail` (possibly empty; docs/az.md 43.5)')
+        if not self.tails and tail is not None:
+            raise ValueError('TokenNet: `tail` given to a network without tail segments (docs/az.md 43.5)')
+        if self.option_pointers and ov is None:
+            raise ValueError('TokenNet: a network with option_pointers needs `ov` (possibly empty; docs/az.md 43.7)')
+        if not self.option_pointers and ov is not None:
+            raise ValueError('TokenNet: `ov` given to a network without option_pointers (docs/az.md 43.7)')
+        return (0 if tail is None else int(tail['seg'].shape[0])), (0 if ov is None else int(ov['row'].shape[0]))
+
+    def _check_tail(self, tail, B, eager, full=None, keep=None):
+        """A tail's shapes, and (unless a CUDA graph is being captured: the host checked it) that each token
+        is a tail token of this network: a tail segment's, slot >= its head count and < 2^32 (R5); eager
+        also its row in [0, B), rows ascending; with `full` / `keep` (forward_static) also every token
+        position of `full` in [0, n_tok + NT) - one host sync for all."""
+        seg, slot, row, val = tail['seg'], tail['slot'], tail['row'], tail['val']
+        NT = seg.shape[0]
+        if (tuple(row.shape) != (NT,) or tuple(slot.shape) != (NT,) or val.dim() != 2 or val.shape[0] != NT
+                or val.shape[1] != self.t_width):
+            raise ValueError(f'TokenNet: a tail of {NT} tokens needs row / seg / slot [{NT}] and val [{NT}, '
+                             f'{self.t_width}] (got {tuple(row.shape)}, {tuple(slot.shape)}, {tuple(val.shape)})')
+        if not NT or _capturing(seg):
+            return
+        ns = len(self.segs)
+        sc = seg.clamp(0, ns - 1)
+        bad = (seg < 0) | (seg >= ns) | ~self.seg_istail[sc] | (slot < self.seg_count[sc]) | (slot >= 1 << 32)
+        if eager:
+            bad = bad | (row < 0) | (row >= B)
+            if NT > 1:
+                bad = bad | torch.cat([bad.new_zeros(1), row[1:] < row[:-1]])
+        fbad = None if full is None else keep & ((full < 0) | (full >= self.n_tok + NT))
+        if bool(bad.any() if fbad is None else (bad.any() | fbad.any())):
+            if fbad is not None and bool(fbad.any()):
+                raise ValueError(f'forward_static: a token position of `full` outside [0, {self.n_tok + NT}) '
+                                 f'(docs/az.md 43.5)')
+            i = int(bad.nonzero()[0, 0])
+            raise ValueError(f'TokenNet: tail token {i} (row {int(row[i])}, segment {int(seg[i])}, slot {int(slot[i])}) '
+                             f'is not a tail token of this network: its tail segments are {self.tail_segments()} (index, '
+                             f'name, width, head slots), a slot at or past the head and below 2^32, rows ascending')
+
+    def _ov_index(self, ov, full, keep, tail, inv_head, inv_tail):
+        """The overrides of packed rows (docs/az.md 43.7): each one's target found by its extended position
+        (`inv_head` [B, >= n_tok]: a head position's packed index; `inv_tail` [>= NT]: a tail token's) ->
+        (row, action, packed index, global pointer column, gated target (None: no gates), its blend weight
+        min(g, 1), generic (ref -1)). Checked (unless a graph is being captured): a target is a present token
+        of its row with that column, ref -1 or a token, the action in [0, actions]."""
+        r, a, ref, col = ov['row'], ov['act'], ov['ref'], ov['col']
+        B, T = full.shape
+        n_tok = self.n_tok
+        NT = 0 if tail is None else tail['seg'].shape[0]
+        gen = ref < 0
+        hd = ref < n_tok
+        rc = r.clamp(0, B - 1)
+        hpos = ref.clamp(0, n_tok - 1)
+        p = inv_head[rc, hpos]
+        seg = self.pos_seg[hpos]
+        if NT:
+            tj = (ref - n_tok).clamp(0, NT - 1)
+            p = torch.where(hd, p, inv_tail[tj])
+            seg = torch.where(hd, seg, tail['seg'][tj])
+        p = torch.where(gen, torch.zeros_like(p), p).clamp(0, T - 1)
+        segc = seg.clamp(min=0)
+        gc = (self.seg_c0[segc] + col).clamp(0, self.ptr.out_features - 1)
+        if not _capturing(ref) and r.shape[0]:
+            bad = (ref < -1) | (ref == 0) | (ref >= n_tok + NT) | (r < 0) | (r >= B) | (a < 0) | (a > self.actions)
+            bad = bad | (~gen & ((full[rc, p] != ref) | ~keep[rc, p] | (seg < 0) | (col < 0)
+                                 | (col >= self.seg_nk[segc])))
+            if bool(bad.any()):
+                i = int(bad.nonzero()[0, 0])
+                raise ValueError(f'TokenNet: pointer override {i} (row {int(r[i])}, action {int(a[i])}, ref {int(ref[i])}, '
+                                 f'column {int(col[i])}): its target is not a present token of its row with that column '
+                                 f'(ref -1 = the generic logit; docs/az.md 43.7)')
+        isg = bw = None
+        if self.gated:
+            gi = self.seg_gi[segc]
+            isg = ~gen & (gi >= 0)
+            bw = self._gate_g()[gi.clamp(min=0)].clamp(max=1.0)
+        return r, a, p, gc, isg, bw, gen
 
     def _identity(self, sl, idspec):
         """Identity index [N] of slot rows [N, width] from their one-hot digits (vocab = none)."""
@@ -736,9 +1093,18 @@ class TokenNet(nn.Module):
         global token at 0), n [B], full [B, T] = each packed token's position in the full token
         axis (0 = global, then the segments' slots)); with `ident`, also each packed token's
         identity [B, T] (vocab: none). `entry`: the readers' (`_global`)."""
+        r = self._pack(x, ident, entry)
+        return r[:4] if ident else r[:3]
+
+    def _pack(self, x, ident=False, entry=None, tail=None):
+        """`pack` -> (h, n, full, idt (None without `ident`), cpos [B, n_tok] (a present head position's packed
+        index), tpos [NT] (a tail token's) or None). With `tail` (docs/az.md 43.5) each row's tail tokens
+        follow its head tokens (`n` counts them), their positions in `full` the extended ones (n_tok + their
+        index in the tail), their identities none (they score no static action)."""
         B, dev = x.shape[0], x.device
         segs, pres = [], [torch.ones(B, 1, dtype=torch.bool, device=dev)]
-        for s in self.segs:
+        heads = [(s, lin) for s, lin in zip(self.segs, self.seg_in) if s['count']]   # (tail-only: no head)
+        for s, _ in heads:
             o, k, w = s['offset'], s['count'], s['width']
             sl = x[:, o:o + k * w].reshape(B, k, w)
             segs.append(sl)
@@ -746,6 +1112,13 @@ class TokenNet(nn.Module):
                         else torch.ones(B, k, dtype=torch.bool, device=dev))
         pres = torch.cat(pres, 1)                                     # [B, n_tok]
         n = pres.sum(1)
+        NT = 0 if tail is None else tail['seg'].shape[0]
+        tpos = None
+        if NT:
+            trow = tail['row']
+            tcnt = torch.bincount(trow, minlength=B)
+            tpos = n[trow] + torch.arange(NT, device=dev) - (tcnt.cumsum(0) - tcnt)[trow]
+            n = n + tcnt
         T = int(n.max())
         cpos = pres.long().cumsum(1) - 1                             # packed index of a present token
         full = torch.zeros(B, T, dtype=torch.long, device=dev)
@@ -753,7 +1126,7 @@ class TokenNet(nn.Module):
         h = torch.cat([(g + self.pos[0])[:, None], g.new_zeros(B, T - 1, self.d)], 1)
         idt = torch.full((B, T), self.vocab, dtype=torch.long, device=dev) if ident else None
         start = 1
-        for s, sl, lin in zip(self.segs, segs, self.seg_in):
+        for (s, lin), sl in zip(heads, segs):
             bi, si = pres[:, start:start + s['count']].nonzero(as_tuple=True)
             if len(bi):
                 rows = sl[bi, si]                                     # [N, width]
@@ -767,16 +1140,21 @@ class TokenNet(nn.Module):
                 h = h.index_put((bi, pi), t)
                 full[bi, pi] = start + si
             start += s['count']
-        if ident:
-            return h, n, full, idt
-        return h, n, full
+        if NT:
+            h = h.index_put((trow, tpos), self._tail_embed(tail, static=False))
+            full[trow, tpos] = self.n_tok + torch.arange(NT, device=dev)
+        return h, n, full, idt, cpos, tpos
 
-    def _trunk(self, hc, nr, fc, ic=None):
+    def _trunk(self, hc, nr, fc, ic=None, ext=None):
         """The blocks and the policy logits of packed rows: hc [Bc, Tc, d] (row b's nr[b] tokens
         first, then padding), fc [Bc, Tc] the tokens' positions in the full token axis, ic [Bc, Tc]
         their identities (a layout with id_actions) -> (zc [Bc, 2 d] the pooled state, pc [Bc,
         actions + 1] the policy logits; the last column a dummy for the padding's and the empty
-        slots' scores). One chunk of `forward`, or a padded batch of `forward_static`."""
+        slots' scores). One chunk of `forward`, or a padded batch of `forward_static`. `ext`
+        (rows with tail tokens or pointer overrides, docs/az.md 43.5-43.7): `_trunk_ext`'s keywords;
+        None: the trunk of before, line for line."""
+        if ext is not None:
+            return self._trunk_ext(hc, nr, fc, ic, **ext)
         Tc = hc.shape[1]
         keep = torch.arange(Tc, device=hc.device)[None, :] < nr[:, None]
         k4 = keep[:, None, None, :]
@@ -795,6 +1173,64 @@ class TokenNet(nn.Module):
         lg = self.ptr(F.gelu(self.pk(hc) + self.pq(zc)[:, None])).gather(2, cols.clamp(min=0))
         return zc, pc.scatter(1, acts.flatten(1), lg.flatten(1))
 
+    def _pointer(self, hid):
+        """The pointer head's logits of every column ([..., columns]): `ptr`, its rows in parts (`ptr_parts`):
+        each tail-only segment's columns a matrix product of their own, the columns between them one each - so
+        a widen that appends segments (always tail-only) computes the old columns with the same products as
+        before, bit for bit (docs/az.md 43.8). One part: `ptr` itself."""
+        if len(self.ptr_parts) == 1:
+            return self.ptr(hid)
+        W, b = self.ptr.weight, self.ptr.bias
+        return torch.cat([F.linear(hid, W[a:e], b[a:e]) for a, e in self.ptr_parts], -1)
+
+    def _trunk_ext(self, hc, nr, fc, ic=None, w=None, explicit=False, ov=None):
+        """`_trunk` of rows with tail tokens or pointer overrides (docs/az.md 43.5-43.7). `w` [Bc, Tc]: the
+        tokens' weights when gated tokens are present (1 the global and ungated tokens, g a gated one's, 0
+        padding): the attention's keys and the pooling weighted - SDPA with the float mask log w (-inf at
+        0), or the explicit math (`explicit`: training while a present gate is 0); None: today's bool mask
+        and mean. A tail position (fc >= n_tok) has no static action. `ov` (`_ov_index`'s, rows local to
+        these): after the static scatter each override's action gets its target token's logit in its
+        column (a gated target's blended: gen + min(g, 1) (ptr - gen)) or, ref -1, the generic logit."""
+        Tc = hc.shape[1]
+        keep = torch.arange(Tc, device=hc.device)[None, :] < nr[:, None]
+        if w is None:
+            k4 = keep[:, None, None, :]
+            for blk in self.blocks:
+                hc = blk(hc, k4)
+        elif explicit:
+            w4, k4 = w[:, None, None, :], keep[:, None, None, :]
+            for blk in self.blocks:
+                hc = blk.forward_weighted(hc, w4, k4)
+        else:
+            m4 = torch.log(w)[:, None, None, :]
+            for blk in self.blocks:
+                hc = blk(hc, m4)
+        hc = self.ln(hc) * keep[..., None]
+        if w is None:
+            zm = hc.sum(1) / nr[:, None].to(hc.dtype)
+        else:
+            zm = (hc * w[..., None]).sum(1) / w.sum(1, keepdim=True)
+        zc = torch.cat([hc[:, 0], zm], 1)
+        gen = F.pad(self.gen(zc), (0, 1))
+        fcl = fc.clamp(max=self.n_tok) if self.tails else fc        # (n_tok: a tail token's, no action)
+        cols = self.tok_cols[fcl]                                     # [Bc, Tc, K]
+        acts = self.tok_acts[fcl]
+        if self.n_id:                                                 # actions by identity
+            ia = self.tok_idbase[fcl] + ic
+            ia = torch.where((ic < self.vocab) & (ia < self.actions), ia, self.actions)
+            acts = torch.where(self.tok_isid[fcl], ia[..., None], acts)
+        acts = torch.where(keep[..., None] & (cols >= 0), acts, self.actions)
+        P = self._pointer(F.gelu(self.pk(hc) + self.pq(zc)[:, None]))   # [Bc, Tc, columns]
+        pc = gen.scatter(1, acts.flatten(1), P.gather(2, cols.clamp(min=0)).flatten(1))
+        if ov is not None:
+            r, a, p, gc, isg, bw, isgen = ov
+            v, g0 = P[r, p, gc], gen[r, a]
+            if isg is not None:
+                # gen + min(g, 1) (ptr - gen) as torch.lerp: exactly gen at 0 and exactly ptr at 1
+                v = torch.where(isg, torch.lerp(g0, v, bw), v)
+            pc = pc.index_put((r, a), torch.where(isgen, g0, v))
+        return zc, pc
+
     def _heads(self, z, pol, n_players, aux, aux_rows, rraw=None):
         present = torch.arange(self.seats, device=z.device)[None, :] < n_players[:, None]
         vlog = self.val(z).masked_fill(~present, -1e9)
@@ -802,9 +1238,17 @@ class TokenNet(nn.Module):
             return pol[:, :self.actions], vlog, self.mar(z), _aux_out(self, z, aux_rows, rraw)
         return pol[:, :self.actions], vlog, self.mar(z)
 
-    def forward(self, x, n_players, aux=False, aux_rows=None):
-        """As `Net.forward`."""
+    def forward(self, x, n_players, aux=False, aux_rows=None, tail=None, ov=None):
+        """As `Net.forward`. `tail` (required, possibly empty, iff the network has tail segments) = {'row':
+        int64 [NT] ascending, 'seg': int64 [NT] (segment index), 'slot': int64 [NT], 'val': float32 [NT, Wt]};
+        `ov` (required, possibly empty, iff option_pointers) = {'row', 'act' (the option's action), 'ref' (the
+        target's extended position: n_tok + j a tail token; -1 the generic logit), 'col' (the segment's
+        pointer column)}: int64 [NO] each, resolved on the host (docs/az.md 43.5-43.7). With no tail token
+        and no override: the forward of before, line for line."""
         x = x[:, :self.features]
+        NT, NO = self._tail_args(tail, ov)
+        if NT or NO:
+            return self._forward_ext(x, n_players, aux, aux_rows, tail, ov, NT, NO)
         rraw = ent = None
         if self.readers is not None:
             rraw, ent = _read(self, x)
@@ -822,6 +1266,52 @@ class TokenNet(nn.Module):
             nr = n[r]
             Tc = int(nr.max())
             zc, pc = self._trunk(h[r, :Tc], nr, full[r, :Tc], idt[r, :Tc] if self.n_id else None)
+            z = z.index_copy(0, r, zc)
+            pol = pol.index_copy(0, r, pc)
+        return self._heads(z, pol, n_players, aux, aux_rows, rraw)
+
+    def _forward_ext(self, x, n_players, aux, aux_rows, tail, ov, NT, NO):
+        """`forward` of a batch with tail tokens or pointer overrides (docs/az.md 43.5-43.7): each row's tail
+        tokens packed after its head tokens, rows sorted by token count and chunked as `forward`; a chunk
+        holding gated tokens runs the weighted trunk; the overrides are applied per chunk."""
+        B, dev = x.shape[0], x.device
+        if NT:
+            self._check_tail(tail, B, eager=True)
+        rraw = ent = None
+        if self.readers is not None:
+            rraw, ent = _read(self, x)
+        h, n, full, idt, cpos, tpos = self._pack(x, ident=bool(self.n_id), entry=ent, tail=tail)
+        T, D = h.shape[1], h.shape[2]
+        tw = tg = None
+        explicit = False
+        if self.gated and NT:
+            gi = self.seg_gi[tail['seg']]
+            tw = (torch.arange(T, device=dev)[None, :] < n[:, None]).to(h.dtype)
+            tw = tw.index_put((tail['row'], tpos), self._tail_weight(tail['seg']))
+            tg = torch.zeros(B, T, dtype=torch.bool, device=dev).index_put((tail['row'], tpos), gi >= 0)
+            explicit = self._explicit(gi)
+        ovx = opos = None
+        rows = torch.argsort(n, stable=True) if B > self.chunk else torch.arange(B, device=dev)
+        if NO:
+            keep = torch.arange(T, device=dev)[None, :] < n[:, None]
+            ovx = self._ov_index(ov, full, keep, tail, cpos, tpos)
+            inv = torch.empty(B, dtype=torch.long, device=dev)
+            inv[rows] = torch.arange(B, device=dev)
+            opos = inv[ovx[0]]                                        # an override's row in the sorted order
+        z = h.new_zeros(B, 2 * D)
+        pol = h.new_zeros(B, self.actions + 1)
+        for c0 in range(0, B, self.chunk):
+            r = rows[c0:c0 + self.chunk]
+            nr = n[r]
+            Tc = int(nr.max())
+            ext = {'w': None, 'explicit': explicit, 'ov': None}
+            if tg is not None and bool(tg[r, :Tc].any()):
+                ext['w'] = tw[r, :Tc]
+            if ovx is not None:
+                sel = ((opos >= c0) & (opos < c0 + len(r))).nonzero(as_tuple=True)[0]
+                if len(sel):
+                    ext['ov'] = (opos[sel] - c0,) + tuple(None if t is None else t[sel] for t in ovx[1:])
+            zc, pc = self._trunk(h[r, :Tc], nr, full[r, :Tc], idt[r, :Tc] if self.n_id else None, ext)
             z = z.index_copy(0, r, zc)
             pol = pol.index_copy(0, r, pc)
         return self._heads(z, pol, n_players, aux, aux_rows, rraw)
@@ -848,7 +1338,7 @@ class TokenNet(nn.Module):
         if cache is None or cache[0] != x.device:
             groups = {}
             for j, s in enumerate(self.segs):
-                if s['id'] is not None:
+                if s['id'] is not None and s['count']:
                     radix = tuple(s['id']['radix'])
                     cols = [s['offset'] + slot * s['width'] + s['id']['at'] + c
                             for slot in range(s['count']) for c in range(sum(radix))]
@@ -879,16 +1369,22 @@ class TokenNet(nn.Module):
                 out[j] = (i[:, a:b], e[:, a:b])
         return out
 
-    def forward_static(self, x, n_players, full, ntok, aux=False):
+    def forward_static(self, x, n_players, full, ntok, aux=False, tail=None, ov=None):
         """`forward` with shapes fixed by the inputs' (no host sync, no data-dependent shape: a CUDA
         graph can capture it): every slot is embedded, present or not, and each row's tokens are
         gathered by `full` [B, T] (its present tokens' positions in the full token axis, in layout
         order, the global token's 0 first, then padding: any position, masked out), `ntok` [B] its
         token count (>= 1). All rows are run as one chunk of T tokens. The outputs are `forward`'s
         (`aux`: the head on every row); a row's outputs depend only on it and on the batch's shape
-        (the kernels' blocking: float32 rounding)."""
+        (the kernels' blocking: float32 rounding). `tail` / `ov` as `forward`'s (docs/az.md 43.5):
+        `full` holds extended positions (a tail token at n_tok + its index in the tail, after the row's
+        head tokens); padded tail entries (row 0, the first tail segment, slot its count, floats 0) and
+        padded overrides (action `actions`, ref -1) are allowed; outside a graph capture the inputs are
+        checked (one host sync) and, training with a present gate at 0, the explicit attention decided
+        (another). With no tail token and no override: the forward of before, line for line."""
         x = x[:, :self.features]
         B = x.shape[0]
+        NT, NO = self._tail_args(tail, ov)
         rraw = ent = None
         if self.readers is not None:
             rraw, ent = _read(self, x)
@@ -899,6 +1395,8 @@ class TokenNet(nn.Module):
         start = 1
         for j, (s, lin) in enumerate(zip(self.segs, self.seg_in)):
             o, k, w = s['offset'], s['count'], s['width']
+            if not k:                                # (a tail-only segment: no head slots)
+                continue
             sl = x[:, o:o + k * w].reshape(B, k, w)
             t = lin(sl) + self.pos[start:start + k]
             if s['id'] is not None:
@@ -910,9 +1408,53 @@ class TokenNet(nn.Module):
                 ids.append(i)
             toks.append(t)
             start += k
+        if NT or NO:
+            return self._static_ext(x, n_players, full, ntok, aux, tail, ov, NT, NO, toks, ids, rraw)
         h = torch.cat(toks, 1).gather(1, full[..., None].expand(-1, -1, self.d))
         idt = torch.cat(ids, 1).gather(1, full) if ids is not None else None
         z, pol = self._trunk(h, ntok, full, idt)
+        return self._heads(z, pol, n_players, aux, None, rraw)
+
+    def _static_ext(self, x, n_players, full, ntok, aux, tail, ov, NT, NO, toks, ids, rraw):
+        """`forward_static` of a batch with tail tokens or overrides (docs/az.md 43.5): the tokens gathered
+        from cat(the head slots [B * n_tok, d], the tail tokens [NT, d]) by b * n_tok + p (a head position)
+        or B * n_tok + j (tail token j); the weighted trunk whenever the network has gated segments (static:
+        the weights say which tokens are gated); the overrides' targets found by inverse maps of `full`."""
+        B, dev = x.shape[0], x.device
+        n_tok, d, T = self.n_tok, self.d, full.shape[1]
+        keep = torch.arange(T, device=dev)[None, :] < ntok[:, None]
+        tl = full >= n_tok
+        idx = torch.arange(B, device=dev)[:, None] * n_tok + full.clamp(0, n_tok - 1)
+        src = torch.cat(toks, 1).reshape(B * n_tok, d)
+        tj = None
+        if NT:
+            self._check_tail(tail, B, eager=False, full=full, keep=keep)
+            tj = (full - n_tok).clamp(0, NT - 1)
+            idx = torch.where(tl, B * n_tok + tj, idx)
+            src = torch.cat([src, self._tail_embed(tail, static=True)])
+        elif not _capturing(full) and bool((keep & ((full < 0) | tl)).any()):
+            raise ValueError(f'forward_static: a token position of `full` outside [0, {n_tok}) and no tail tokens')
+        h = src.index_select(0, idx.reshape(-1)).view(B, T, d)
+        idt = None
+        if ids is not None:
+            idt = torch.cat(ids, 1).gather(1, full.clamp(0, n_tok - 1))
+            if NT:
+                idt = torch.where(tl, torch.full_like(idt, self.vocab), idt)
+        w, explicit = None, False
+        if self.gated and NT:
+            w = torch.where(tl, self._tail_weight(tail['seg'])[tj], torch.ones((), dtype=h.dtype, device=dev)) * keep
+            explicit = self._explicit(torch.where(keep & tl, self.seg_gi[tail['seg'][tj]], -1).reshape(-1))
+        ovx = None
+        if NO:
+            pos = torch.arange(T, device=dev).expand(B, T)
+            inv_h = torch.zeros(B, n_tok + 1, dtype=torch.long, device=dev).scatter_(
+                1, torch.where(keep & ~tl, full, n_tok), pos)
+            inv_t = None
+            if NT:
+                inv_t = torch.zeros(NT + 1, dtype=torch.long, device=dev).scatter_(
+                    0, torch.where(keep & tl, tj, NT).reshape(-1), pos.reshape(-1))
+            ovx = self._ov_index(ov, full, keep, tail, inv_h, inv_t)
+        z, pol = self._trunk(h, ntok, full, idt, {'w': w, 'explicit': explicit, 'ov': ovx})
         return self._heads(z, pol, n_players, aux, None, rraw)
 
     def n_params(self):
@@ -1209,6 +1751,9 @@ def _layout_diff(a, b):
     for name in sorted(set(ab) | set(bb)):
         if ab.get(name) != bb.get(name):
             out.append(f'bag {name}: {_short(ab.get(name), 40)} -> {_short(bb.get(name), 40)}')
+    for k in ('option_pointers', 'max_row_tokens'):          # (docs/az.md 43.5)
+        if a.get(k) != b.get(k):
+            out.append(f'{k} {a.get(k)!r} -> {b.get(k)!r}')
     return out[:3] + ([f'{len(out) - 3} more'] if len(out) > 3 else [])
 
 
@@ -1263,7 +1808,9 @@ def encoding_mismatch(config, game=None):
         net['layout'] = lay
         want = enc.get('layout')
         if want is not None and isinstance(lay, dict) and 'segments' in lay:
-            reads = ('vocab', 'segments', 'bags')
+            # (segments: every key, the tails' `tail` / `gate` / `columns` included; the layout's pointer
+            # overrides and row limit, docs/az.md 43.5 - absent on both sides for every layout before them)
+            reads = ('vocab', 'segments', 'bags', 'option_pointers', 'max_row_tokens')
             if any(lay.get(k) != want.get(k) for k in reads):
                 diffs.append('token layout: ' + '; '.join(_layout_diff(lay, want)))
             for k in ('name', 'version'):
@@ -1350,7 +1897,8 @@ def _global_blocks(lay, features):
         return [(b['name'], list(range(b['offset'], b['offset'] + b['count']))) for b in lay['globals']]
     inside = set()
     for s in lay['segments']:
-        inside.update(range(s['offset'], s['offset'] + s['count'] * s['width']))
+        if s['count']:
+            inside.update(range(s['offset'], s['offset'] + s['count'] * s['width']))
     for b in lay['bags']:
         inside.update(range(b['offset'], b['offset'] + b['count'] * b['width']))
     return [(None, [i for i in range(features) if i not in inside])]
@@ -1360,9 +1908,12 @@ def token_feature_map(old_lay, old_features, new_lay, new_features):
     """Where each feature of a token layout went in a wider one (docs/az.md 10.3): a list, per old
     feature, of its new index. Raises ValueError unless `new_lay` keeps the old layout's tokens and
     meanings and only adds inputs:
-      * the same segments (names, order, slot counts, present flags, identities, actions): a new
-        segment, or more slots, would add tokens to the attention; a segment's slots may get
-        wider, the old floats first in each slot (the new ones after them);
+      * the same segments (names, order, slot counts, present flags, identities, actions, pointer
+        columns, gates): a new segment with head slots, or more slots, would add tokens to the
+        attention; a segment's slots may get wider, the old floats first in each slot (the new ones
+        after them); a segment may gain a `tail` (never lose it); tail-only segments (count 0) may be
+        appended after the old ones (docs/az.md 43.8: `_widen_tokens` gates them); the layout may gain
+        `option_pointers` (never lose it) and `max_row_tokens`;
       * every old bag (by name; the new layout may add bags) with the same width and its old rows
         first (new rows after them);
       * the old globals: by block name when the old layout declares blocks (the old floats first
@@ -1372,14 +1923,25 @@ def token_feature_map(old_lay, old_features, new_lay, new_features):
     if int(new_lay['vocab']) != int(old_lay['vocab']):
         raise ValueError(f'widen: the vocabulary changed ({old_lay["vocab"]} -> {new_lay["vocab"]})')
     os_, ns = old_lay['segments'], new_lay['segments']
-    if [s['name'] for s in os_] != [s['name'] for s in ns]:
-        raise ValueError(f'widen: a token layout must keep its segments (names, order): '
+    if [s['name'] for s in ns[:len(os_)]] != [s['name'] for s in os_]:
+        raise ValueError(f'widen: a token layout must keep its segments (names, order; new segments only after them): '
                          f'{[s["name"] for s in os_]} -> {[s["name"] for s in ns]} (new tokens change the attention)')
+    for b in ns[len(os_):]:
+        # (docs/az.md 43.8: a new segment may only hold tokens of a kind the old layout had no slot for -
+        # tail-only, count 0, claiming no feature; `_widen_tokens` gates it)
+        if b['count'] != 0 or not b.get('tail'):
+            raise ValueError(f'widen: new segment {b["name"]} has head slots (count {b["count"]}): only tail-only segments '
+                             f'(count 0, tail) may be appended (new head tokens change the attention)')
+    if old_lay.get('option_pointers') and not new_lay.get('option_pointers'):
+        raise ValueError('widen: the layout lost option_pointers (the network would ignore the overrides of its rows)')
     fmap = [None] * old_features
     for a, b in zip(os_, ns):
-        same = ('count', 'present', 'id', 'actions')
-        if any(a.get(k) != b.get(k) for k in same) or a.get('id_actions') != b.get('id_actions'):
-            raise ValueError(f'widen: segment {a["name"]} changed its slots, present flag, identity or actions')
+        same = ('count', 'present', 'id', 'actions', 'id_actions', 'columns', 'gate')
+        if any(a.get(k) != b.get(k) for k in same):
+            raise ValueError(f'widen: segment {a["name"]} changed its slots, present flag, identity, actions, pointer '
+                             f'columns or gate')
+        if a.get('tail') and not b.get('tail'):
+            raise ValueError(f'widen: segment {a["name"]} lost its tail (its tail tokens would have no place)')
         if b['width'] < a['width']:
             raise ValueError(f'widen: segment {a["name"]} got narrower ({a["width"]} -> {b["width"]})')
         for s in range(a['count']):
@@ -1413,9 +1975,9 @@ def token_feature_map(old_lay, old_features, new_lay, new_features):
 
 
 def layout_sans_identity(lay):
-    """A normalised token layout without its identity keys (name, version): the layout as the
-    network reads it, plus its declared global blocks."""
-    return {k: v for k, v in lay.items() if k not in ('name', 'version')}
+    """A normalised token layout without its identity keys (name, version) and its `draft` mark (docs/az.md
+    43.5): the layout as the network reads it, plus its declared global blocks."""
+    return {k: v for k, v in lay.items() if k not in ('name', 'version', 'draft')}
 
 
 def _map_reader(spec, fmap):
@@ -1430,10 +1992,32 @@ def _map_reader(spec, fmap):
     return dict(spec, inputs=runs)
 
 
-def _widen_tokens(old, cfg, lay):
+def _gate_new_segments(ol, lay, cfg, ungated=False):
+    """The layout `lay` (normalised) with every segment it appends after the old layout `ol`'s gated
+    (docs/az.md 43.8: `gate: true` written in, so the widened network's new tokens weigh g = 0 and change
+    nothing) - unless `ungated` (the new tokens then perturb the outputs of the rows where they appear; a
+    layout that gates one of them anyway is refused as contradictory)."""
+    n_old, segs = len(ol['segments']), []
+    for j, s in enumerate(lay['segments']):
+        if j >= n_old:
+            if ungated and s.get('gate'):
+                raise ValueError(f'widen: ungated, but the layout gates the new segment {s["name"]}')
+            if not ungated and not s.get('gate'):
+                s = dict(s, gate=True)
+        segs.append(s)
+    return tokens_layout(dict(lay, segments=segs), cfg['features'], cfg['actions'])
+
+
+def _ptr_columns(lay):
+    """The pointer columns of a normalised token layout (`TokenNet.ptr`'s used rows)."""
+    return sum(len(s['actions']) + ('id_actions' in s) + s.get('columns', 0) for s in lay['segments'])
+
+
+def _widen_tokens(old, cfg, lay, ungated=False):
     """`widen` of a TokenNet onto the layout `lay` (normalised; module docs of `widen`)."""
     ol = old.config['layout']
     F0, F1 = old.config['features'], cfg['features']
+    lay = _gate_new_segments(ol, lay, cfg, ungated)
     fmap = token_feature_map(ol, F0, lay, F1)
     cfg = dict(cfg, layout=lay)
     if cfg.get('readers'):
@@ -1459,7 +2043,11 @@ def _widen_tokens(old, cfg, lay):
         return out
     orow, nrow = rows(ol), rows(lay)
     seg = {f'seg_in.{i}.weight' for i in range(len(ol['segments']))}
+    # (by segment name below: the tail positions, the gates, the pointer head's rows - docs/az.md 43.8)
+    later = {'tail_base', 'gate', 'ptr.weight', 'ptr.bias'} | {f'pos_tail.{k}.weight' for k in range(len(old.tails))}
     for k, v in old_st.items():
+        if k in later:
+            continue
         t = st[k]
         if k == 'g.weight':
             t.zero_()
@@ -1482,11 +2070,41 @@ def _widen_tokens(old, cfg, lay):
     if 'bag.weight' in st and 'bag.weight' not in old_st:   # the old network had no bags
         st['bag.weight'].zero_()
         st['bag.bias'].zero_()
+    # the pointer head: the old columns' rows (new segments' columns come after them), the new ones zero
+    nc = _ptr_columns(ol)
+    for k in ('ptr.weight', 'ptr.bias'):
+        if st[k].shape == old_st[k].shape:
+            st[k] = old_st[k]
+        else:
+            st[k] = torch.zeros_like(st[k])
+            st[k][:nc] = old_st[k][:nc]
+    # tail positions by segment name: a segment that had a tail keeps its own; one that gains a tail starts
+    # at its last head slot's embedding (the old network's); a new tail-only segment keeps its fresh init
+    names = [s['name'] for s in lay['segments']]
+    otl = [names[j] for j in old.tails]
+    if new.tails:
+        tb = st['tail_base'].clone()
+        for k, j in enumerate(new.tails):
+            if names[j] in otl:
+                ko = otl.index(names[j])
+                tb[k] = old_st['tail_base'][ko]
+                st[f'pos_tail.{k}.weight'] = old_st[f'pos_tail.{ko}.weight']
+            elif lay['segments'][j]['count']:
+                tb[k] = st['pos'][new.seg_start[j] + lay['segments'][j]['count'] - 1]
+        st['tail_base'] = tb
+    # gates: an old gated segment's as it was, a new one's exactly 0 (its tokens change nothing)
+    if new.gated:
+        ogl = [names[j] for j in old.gated]
+        g = torch.zeros(len(new.gated))
+        for k, j in enumerate(new.gated):
+            if names[j] in ogl:
+                g[k] = old_st['gate'][ogl.index(names[j])]
+        st['gate'] = g
     new.load_state_dict(st)
     return new.eval()
 
 
-def widen(old, features=None, actions=None, grid=None, layout=None):
+def widen(old, features=None, actions=None, grid=None, layout=None, ungated=False):
     """A copy of `old` with `features` inputs / `actions` policy outputs (>= the old ones):
     new input columns get zero weights (the old outputs are unchanged), new actions zero
     weights and bias (logit 0). GridNet: `grid` = the new board grid (the game package's) when
@@ -1498,12 +2116,15 @@ def widen(old, features=None, actions=None, grid=None, layout=None):
     (`token_feature_map`: slots wider at their ends, bags with more rows or new bags, more
     globals; the same tokens): every new input column gets zero weights in its projection (the
     segment's input map, the bag map, the global map), so on any input of the new layout the
-    network computes what `old` computed on the old features of it (docs/az.md 10.3). The copy keeps
-    `old`'s attributes outside its config and state (`CARRIED`)."""
-    return _carry(old, _widen(old, features, actions, grid, layout))
+    network computes what `old` computed on the old features of it (docs/az.md 10.3). Variable-length
+    token sets (docs/az.md 43.8): a segment may gain a `tail` (new tail positions, unused by every old row)
+    and tail-only segments may be appended, gated (`gate: true` written into the layout, g = 0: their
+    tokens change nothing; `ungated=True`: not gated) with fresh input maps and positions; new pointer
+    columns get zero rows. The copy keeps `old`'s attributes outside its config and state (`CARRIED`)."""
+    return _carry(old, _widen(old, features, actions, grid, layout, ungated))
 
 
-def _widen(old, features=None, actions=None, grid=None, layout=None):
+def _widen(old, features=None, actions=None, grid=None, layout=None, ungated=False):
     """`widen` without the carried attributes."""
     cfg = dict(old.config)
     cfg['features'] = features or cfg['features']
@@ -1513,7 +2134,7 @@ def _widen(old, features=None, actions=None, grid=None, layout=None):
     if cfg.get('arch') == 'tokens' and layout is not None:
         lay = tokens_layout(layout, cfg['features'], cfg['actions'])
         if layout_sans_identity(lay) != layout_sans_identity(old.config['layout']):
-            return _widen_tokens(old, cfg, lay)
+            return _widen_tokens(old, cfg, lay, ungated)
         # the same layout: the old widen below, the network recording the new layout's identity
         # (name / version: e.g. a checkpoint from before they were recorded)
         cfg['layout'] = lay

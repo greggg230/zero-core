@@ -1,6 +1,6 @@
 """Start a run from another run's checkpoint.
 
-  python tools/fork_run.py <src.pt> <new run dir> [--game toy]
+  python tools/fork_run.py <src.pt> <new run dir> [--game toy] [--ungated] [--allow-draft]
       A NEW run whose iteration 0 is the source network widened to the game's current
       feature / action counts (new inputs get zero weights: it computes what the source did); a
       token network follows the game's object layout if it changed (docs/az.md 10.3), a conv
@@ -8,7 +8,10 @@
       way to move a run across an encoding change: the encoding guard refuses to resume it,
       docs/az.md 10.4); the fork is checked against this build's encoding before it is written
       (--game: the fork's game, recorded in its config). Settings: the new run's own flags when
-      it is started.
+      it is started. Variable-length token sets (docs/az.md 43.8): a segment that gains a tail needs
+      nothing, a new tail-only segment is gated (its gate exactly 0: the fork computes what the source
+      did on every row the source could read; --ungated: not gated, then the game's layout must not
+      gate it either). A `draft` layout (the game's) is refused unless --allow-draft (R16).
 
   python tools/fork_run.py --source runs/a --dest runs/b [--iter K] [--set reuse=8 ...] [--copy]
       A CONTINUATION of a (possibly live) run at its checkpoint K (default: the newest): the
@@ -50,7 +53,18 @@ def parse_value(v):
         return v
 
 
-def new_run(src, run, game=None):
+def check_draft(game, allow=False, what='fork_run'):
+    """R16 (docs/az.md 43.8): the game's token layout is a `draft` (a layout still being built, e.g. MTG Zero's
+    v7 until its project ends) -> SystemExit unless `allow` (--allow-draft; a run's `allow_draft_layout`)."""
+    from .. import package
+    lay = package.active().tokens_of(game) or {}
+    if lay.get('draft') and not allow:
+        ident = ' '.join(str(lay[k]) for k in ('name', 'version') if lay.get(k) is not None)
+        raise SystemExit(f'{what}: the game {game!r} has a draft token layout ({ident or "no name"}): refused unless '
+                         f'--allow-draft (docs/az.md 43.8)')
+
+
+def new_run(src, run, game=None, allow_draft=False, ungated=False):
     import torch  # noqa: F401
     from .. import games
     from ..net import check_encoding, layout_sans_identity, load, save, widen
@@ -59,12 +73,14 @@ def new_run(src, run, game=None):
     # opt-out; what is written is checked, docs/az.md 10.4)
     old, extra = load(src, allow_mismatch=True)
     target = game or old.config.get('game', 'toy')
+    check_draft(target, allow_draft)
     info = games.info(target)
     grid = package.active().grids.get(target) if old.config.get('arch') == 'grid' else None
     # a token network follows the game's object layout as it is now (a layout change: widened
-    # segment by segment, docs/az.md 10.3; the same layout: as before)
+    # segment by segment, docs/az.md 10.3; the same layout: as before; new tail-only segments gated
+    # unless --ungated, docs/az.md 43.8)
     layout = package.active().tokens_of(target) if old.config.get('arch') == 'tokens' else None
-    new = widen(old, info['num_features'], info['num_actions'], grid=grid, layout=layout)
+    new = widen(old, info['num_features'], info['num_actions'], grid=grid, layout=layout, ungated=ungated)
     if game and new.config.get('game') != game:
         new.config['game'] = game                  # (widen keeps the source's game: the fork plays --game)
     check_encoding(new.config, target, f'fork of {src}')
@@ -72,9 +88,21 @@ def new_run(src, run, game=None):
     out = os.path.join(run, 'models', 'iter_0000.pt')
     save(new, out, {'iter': 0, 'forked_from': os.path.abspath(src), 'source_extra': extra})
     moved = layout is not None and layout_sans_identity(new.config['layout']) != layout_sans_identity(old.config['layout'])
+    tails = ''
+    if moved:
+        segs = new.config['layout']['segments']
+        had = {s['name'] for s in old.config['layout']['segments'] if s.get('tail')}
+        got = [s['name'] for s in segs if s.get('tail') and s['name'] not in had and s['count']]
+        gated = new.gates() if hasattr(new, 'gates') else {}
+        fresh = [s['name'] for s in segs[len(old.config['layout']['segments']):]]
+        if got:
+            tails += f'; tails on {", ".join(got)}'
+        if fresh:
+            tails += '; new segments ' + ', '.join(f'{n} (gate {gated[n]:g})' if n in gated else f'{n} (ungated)'
+                                                   for n in fresh)
     print(f'{src} ({old.config["features"]} features, {old.config["actions"]} actions) -> {out} '
           f'({new.config["features"]} features, {new.config["actions"]} actions'
-          + (', across a token layout change' if moved else '') + ')')
+          + (', across a token layout change' if moved else '') + tails + ')')
 
 
 def _link(src, dst, copy):
@@ -147,7 +175,7 @@ def install_net(dest, it, net, game, settings=None):
     return net_size(m.config)
 
 
-def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
+def continuation(source, dest, it=None, overrides=None, copy=False, net=None, allow_draft=False):
     from ..run import DEFAULTS, latest_iter, model_path
     if os.path.exists(os.path.join(dest, 'config.json')):
         raise SystemExit(f'{dest} already holds a run')
@@ -156,6 +184,9 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None):
     for k in overrides or {}:
         if k not in DEFAULTS:
             raise SystemExit(f'--set {k}: unknown setting')
+    # (R16: a draft layout's run continues only where its settings allow it, or --allow-draft)
+    check_draft(cfg.get('game', 'toy'), allow_draft or bool(dict(cfg, **(overrides or {})).get('allow_draft_layout')),
+                'fork_run --source')
     co = bool(cfg.get('resolver'))
     rsrc = os.path.join(source, 'resolver')
     if it is None:
@@ -246,8 +277,11 @@ def main(argv=None):
         ap.add_argument('src')
         ap.add_argument('run')
         ap.add_argument('--game', default=None)
+        ap.add_argument('--ungated', action='store_true',
+                        help='new tail-only segments without a gate (their tokens perturb the rows they appear in)')
+        ap.add_argument('--allow-draft', action='store_true', help="fork onto the game's draft token layout (R16)")
         a = ap.parse_args(argv)
-        new_run(a.src, a.run, a.game)
+        new_run(a.src, a.run, a.game, a.allow_draft, a.ungated)
         return 0
     ap = argparse.ArgumentParser(description='continue a run at one of its checkpoints (module docstring)')
     ap.add_argument('--source', required=True)
@@ -256,12 +290,13 @@ def main(argv=None):
     ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE')
     ap.add_argument('--copy', action='store_true', help='copy shards instead of hard-linking them')
     ap.add_argument('--net', default=None, help="another network as the fork's checkpoint K (module docstring)")
+    ap.add_argument('--allow-draft', action='store_true', help="continue a run of the game's draft token layout (R16)")
     a = ap.parse_args(argv)
     over = {}
     for kv in a.set:
         k, _, v = kv.partition('=')
         over[k.strip().replace('-', '_')] = parse_value(v)
-    continuation(a.source, a.dest, a.iter, over, a.copy, a.net)
+    continuation(a.source, a.dest, a.iter, over, a.copy, a.net, a.allow_draft)
     return 0
 
 
