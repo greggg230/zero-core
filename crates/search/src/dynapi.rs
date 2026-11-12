@@ -660,6 +660,8 @@ pub trait DynDriver: Send + Sync {
     fn finished(&self) -> bool;
     fn paused(&self) -> bool;
     fn resume(&mut self, quota: u64, net: u32) -> Result<(), String>;
+    /// A rolling driver's first game id (`Driver::set_first_gid`).
+    fn set_first_gid(&mut self, gid: u32) -> Result<(), String>;
     fn end_phase(&mut self);
     fn take_results(&mut self) -> Vec<GameResult>;
     fn take_samples(&mut self) -> Vec<Record>;
@@ -697,6 +699,9 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     }
     fn resume(&mut self, quota: u64, net: u32) -> Result<(), String> {
         Driver::resume(self, quota, net)
+    }
+    fn set_first_gid(&mut self, gid: u32) -> Result<(), String> {
+        Driver::set_first_gid(self, gid)
     }
     fn end_phase(&mut self) {
         Driver::end_phase(self)

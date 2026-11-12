@@ -1649,6 +1649,8 @@ pub struct Driver<G: SearchGame> {
     outstanding: HashMap<u64, Outstanding>,
     next_bid: u64,
     next_gid: u32,
+    /// A rolling driver's first `resume` happened (`set_first_gid` only before it).
+    resumed: bool,
     results: Vec<GameResult>,
     samples: Vec<Record>,
     wait_ns: u64,
@@ -1874,6 +1876,7 @@ impl<G: SearchGame> Driver<G> {
             outstanding: HashMap::new(),
             next_bid: 0,
             next_gid: 0,
+            resumed: false,
             results: Vec::new(),
             samples: Vec::new(),
             wait_ns: 0,
@@ -2015,12 +2018,28 @@ impl<G: SearchGame> Driver<G> {
         }
         self.quota = quota;
         self.phase_games = 0;
+        self.resumed = true;
         if self.sh.net.swap(net, Ordering::SeqCst) != net {
             self.sh.epoch.fetch_add(1, Ordering::SeqCst);
         }
         for g in 0..self.gstate.len() {
             self.dispatch(g);
         }
+        Ok(())
+    }
+
+    /// A rolling driver's first game id (before its first `resume`; default 0): its games are `gid`,
+    /// `gid + 1`, ... - each game's random streams derive from (seed, gid) as ever, so a block of game
+    /// ids played by one driver plays exactly those games of a driver started at 0 (a native worker's
+    /// job of games `gid_base..`, zero-farm; docs/search.md 2.13). Nothing changes when never called.
+    pub fn set_first_gid(&mut self, gid: u32) -> Result<(), String> {
+        if !self.sh.cfg.rolling {
+            return Err("set_first_gid: a rolling driver's (a fixed table's games are 0..games)".into());
+        }
+        if self.resumed {
+            return Err("set_first_gid: before the first resume (games have started)".into());
+        }
+        self.next_gid = gid;
         Ok(())
     }
 

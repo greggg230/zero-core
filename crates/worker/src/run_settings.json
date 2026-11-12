@@ -1,0 +1,640 @@
+{
+ "_doc": "zero-farm check-config (docs/az.md 42): every zero-core run setting (zero.run DEFAULTS) classified for a native SELF-PLAY worker. play = read by the worker, supported; trainer = deliberately unused by a self-play worker (training, evaluation, orchestration, Python inference, network shape - the network is the ONNX graph); python_only = play-affecting but implemented in Python only: unsupported unless off (falsy); param = a setting of a python_only switch, unused while the switch is off. Game-package settings: aux_<target>_w (play: the driver records the target) and reader_<target> (trainer: the reader is in the graph), for the game's auxiliary targets. Any other key is unknown. tests/test_worker_settings.py fails when DEFAULTS and this table differ.",
+ "keys": {
+  "game": {
+   "class": "play",
+   "why": "the game the worker plays (one the worker build registers)"
+  },
+  "spec": {
+   "class": "play",
+   "why": "the self-play games' spec (zero.games.spec_json: a dict json.dumps'd)"
+  },
+  "players": {
+   "class": "play",
+   "why": "the self-play table: one entry per player count"
+  },
+  "conc": {
+   "class": "play",
+   "why": "games in flight (the rolling driver's concurrency; also the setup cap, as a remote worker's without a cap message)"
+  },
+  "threads": {
+   "class": "play",
+   "why": "search threads (the job's threads replace it unless the job says otherwise)"
+  },
+  "groups": {
+   "class": "play",
+   "why": "driver groups (batches in flight)"
+  },
+  "max_steps": {
+   "class": "play",
+   "why": "real moves after which a game is abandoned"
+  },
+  "sims": {
+   "class": "play",
+   "why": "simulations of a full search"
+  },
+  "sims_fast": {
+   "class": "play",
+   "why": "simulations of a fast search (playout cap)"
+  },
+  "p_full": {
+   "class": "play",
+   "why": "share of full searches (playout cap)"
+  },
+  "c_puct": {
+   "class": "play",
+   "why": "PUCT constant"
+  },
+  "alpha": {
+   "class": "play",
+   "why": "root Dirichlet alpha"
+  },
+  "eps": {
+   "class": "play",
+   "why": "root noise share"
+  },
+  "temp_moves": {
+   "class": "play",
+   "why": "temperature-sampled searched decisions"
+  },
+  "chance_k": {
+   "class": "play",
+   "why": "chance outcomes kept per edge"
+  },
+  "margin_w": {
+   "class": "play",
+   "why": "utility margin weight"
+  },
+  "redet": {
+   "class": "play",
+   "why": "fresh determinization per simulation"
+  },
+  "sims_minor": {
+   "class": "play",
+   "why": "simulations of a minor decision"
+  },
+  "policy_target": {
+   "class": "play",
+   "why": "recorded policy target ('visits' | 'cq')"
+  },
+  "cq_c_visit": {
+   "class": "play",
+   "why": "the 'cq' target's c_visit"
+  },
+  "cq_c_scale": {
+   "class": "play",
+   "why": "the 'cq' target's c_scale"
+  },
+  "cq_prior_w": {
+   "class": "play",
+   "why": "the 'cq' target's prior exponent"
+  },
+  "selfplay_select": {
+   "class": "play",
+   "why": "self-play move rule after temp_moves"
+  },
+  "selfplay_select_min_visits": {
+   "class": "play",
+   "why": "the 'cq' rule's guard"
+  },
+  "selfplay_select_c_visit": {
+   "class": "play",
+   "why": "the 'cq' rule's c_visit"
+  },
+  "selfplay_select_c_scale": {
+   "class": "play",
+   "why": "the 'cq' rule's c_scale"
+  },
+  "selfplay_root_min_visits": {
+   "class": "play",
+   "why": "root minimum visits of full searches"
+  },
+  "root_min_visits_max_actions": {
+   "class": "play",
+   "why": "largest root the floor applies to"
+  },
+  "selfplay_leaf_value_view": {
+   "class": "play",
+   "why": "whose view a leaf's value comes from"
+  },
+  "selfplay_view_samples": {
+   "class": "play",
+   "why": "share of decisions with value-only samples"
+  },
+  "view_sample_target": {
+   "class": "play",
+   "why": "value-only samples' q target"
+  },
+  "selfplay_infoset_merge": {
+   "class": "play",
+   "why": "information-set merging"
+  },
+  "selfplay_belief_tilt": {
+   "class": "play",
+   "why": "the root's belief tilt"
+  },
+  "belief_clip": {
+   "class": "play",
+   "why": "the belief's clip"
+  },
+  "belief_mix": {
+   "class": "play",
+   "why": "the belief's uniform share"
+  },
+  "belief_fast": {
+   "class": "play",
+   "why": "fast and minor searches take the belief"
+  },
+  "selfplay_belief_tilts": {
+   "class": "play",
+   "why": "per-target belief tilts"
+  },
+  "selfplay_value_choice_worlds": {
+   "class": "play",
+   "why": "value-choice worlds"
+  },
+  "selfplay_value_choice_temp": {
+   "class": "play",
+   "why": "value-choice temperature"
+  },
+  "selfplay_root_search": {
+   "class": "play",
+   "why": "the root search ('puct' | 'gumbel')"
+  },
+  "gumbel_m": {
+   "class": "play",
+   "why": "Gumbel's considered options"
+  },
+  "selfplay_gumbel_scale": {
+   "class": "play",
+   "why": "self-play's Gumbel noise scale"
+  },
+  "shard_rows": {
+   "class": "play",
+   "why": "samples per shard"
+  },
+  "shard_sparse": {
+   "class": "play",
+   "why": "the shards' feature format: x_ptr / x_idx / x_val (1) or dense x (0), as zero/data.py writes it"
+  },
+  "sparse": {
+   "class": "play",
+   "why": "sparse network batches (the native worker always asks the driver for sparse rows: the same rows and games)"
+  },
+  "eval_cache": {
+   "class": "play",
+   "why": "the game's evaluation cache"
+  },
+  "selfplay_resign_t": {
+   "class": "play",
+   "why": "self-play resignation threshold"
+  },
+  "selfplay_resign_k": {
+   "class": "play",
+   "why": "consecutive decided searches before resigning"
+  },
+  "selfplay_resign_noresign": {
+   "class": "play",
+   "why": "share of games that never resign"
+  },
+  "preset": {
+   "class": "trainer",
+   "why": "the settings' provenance (the resolved settings are what count)"
+  },
+  "iters": {
+   "class": "trainer",
+   "why": "the training loop"
+  },
+  "games": {
+   "class": "trainer",
+   "why": "the iteration's quota (a job carries its own games)"
+  },
+  "rolling": {
+   "class": "trainer",
+   "why": "the run's own driver mode (a worker plays a remote worker's rolling queue_only driver either way)"
+  },
+  "torch_threads": {
+   "class": "trainer",
+   "why": "torch inference threads (the native worker: ONNX Runtime with the job's threads)"
+  },
+  "ext_groups": {
+   "class": "trainer",
+   "why": "groups of matches against an external player (evaluation)"
+  },
+  "hidden": {
+   "class": "trainer",
+   "why": "network shape (inside the ONNX graph)"
+  },
+  "blocks": {
+   "class": "trainer",
+   "why": "network shape (inside the ONNX graph)"
+  },
+  "arch": {
+   "class": "trainer",
+   "why": "network architecture (inside the ONNX graph)"
+  },
+  "ch": {
+   "class": "trainer",
+   "why": "network shape (inside the ONNX graph)"
+  },
+  "heads": {
+   "class": "trainer",
+   "why": "network shape (inside the ONNX graph)"
+  },
+  "ff": {
+   "class": "trainer",
+   "why": "network shape (inside the ONNX graph)"
+  },
+  "batch": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "reuse": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "lr": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "wd": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "lr_halve_every": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "lr_min": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "lr_warmup_steps": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "min_steps": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "window": {
+   "class": "trainer",
+   "why": "training window"
+  },
+  "window_grow": {
+   "class": "trainer",
+   "why": "training window"
+  },
+  "min_window_samples": {
+   "class": "trainer",
+   "why": "training window"
+  },
+  "keep_data": {
+   "class": "trainer",
+   "why": "the trainer's data retention"
+  },
+  "ram_budget_gb": {
+   "class": "trainer",
+   "why": "training window"
+  },
+  "window_cache": {
+   "class": "trainer",
+   "why": "training window"
+  },
+  "window_sparse": {
+   "class": "trainer",
+   "why": "training window"
+  },
+  "train_prefetch": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "train_static": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "value_q": {
+   "class": "trainer",
+   "why": "training targets (value_q mixing happens at training time)"
+  },
+  "value_q_warmup": {
+   "class": "trainer",
+   "why": "training targets"
+  },
+  "margin_loss_w": {
+   "class": "trainer",
+   "why": "training loss"
+  },
+  "yardstick": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_games": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_sims": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_random_games": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_every": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_games": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "ref_games": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_select": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_select_min_visits": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_select_c_visit": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_select_c_scale": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_root_min_visits": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_leaf_value_view": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_infoset_merge": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_belief_tilt": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_belief_tilts": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_value_choice_worlds": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_value_choice_temp": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_root_search": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_gumbel_scale": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "eval_spec": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_opponents": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_sims": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_together": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_offsets": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_anchors": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_anchor_games": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_anchor_elo": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_anchor_calib_games": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_anchor_from": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "elo_paired": {
+   "class": "trainer",
+   "why": "evaluation (eval jobs, phase 2)"
+  },
+  "reader_detach": {
+   "class": "trainer",
+   "why": "training (readers are inside the ONNX graph)"
+  },
+  "heldout_shards": {
+   "class": "trainer",
+   "why": "trainer metrics"
+  },
+  "heldout_device": {
+   "class": "trainer",
+   "why": "trainer metrics"
+  },
+  "eval_remote": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote_procs": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote_wait": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote_timeout": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_local": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote_inflight": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote_giveback": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote_overdue": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote_linger": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_local_linger": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote_batch": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "selfplay_remote_batch_inflight": {
+   "class": "trainer",
+   "why": "orchestration"
+  },
+  "shard_writer_thread": {
+   "class": "trainer",
+   "why": "the Python writer's thread (the native worker writes on its own; the same shards)"
+  },
+  "shard_writer_queue_mb": {
+   "class": "trainer",
+   "why": "the Python writer's queue"
+  },
+  "infer_device": {
+   "class": "trainer",
+   "why": "Python inference device (the native worker: ONNX Runtime CPU)"
+  },
+  "train_device": {
+   "class": "trainer",
+   "why": "training"
+  },
+  "seed": {
+   "class": "trainer",
+   "why": "the run's seed (a job carries its driver seed and game ids)"
+  },
+  "infer_workers": {
+   "class": "trainer",
+   "why": "Python inference threads"
+  },
+  "selfplay_league": {
+   "class": "python_only",
+   "off": 0.0,
+   "why": "the self-play league: zero/league.py (its table, slots, past checkpoints) is Python only"
+  },
+  "selfplay_branch": {
+   "class": "python_only",
+   "off": 0.0,
+   "why": "branched games: set up and tallied by zero/forks.py (Python only)"
+  },
+  "selfplay_archive": {
+   "class": "python_only",
+   "off": "",
+   "why": "archive starts: zero/forks.py reads the archive (Python only)"
+  },
+  "resolver": {
+   "class": "python_only",
+   "off": "",
+   "why": "co-training (zero/cotrain.py: deferred results, two networks; phase 3b)"
+  },
+  "selfplay_league_pool": {
+   "class": "param",
+   "of": "selfplay_league",
+   "why": "a setting of selfplay_league (unused while it is off)"
+  },
+  "selfplay_league_slots": {
+   "class": "param",
+   "of": "selfplay_league",
+   "why": "a setting of selfplay_league (unused while it is off)"
+  },
+  "selfplay_league_pick": {
+   "class": "param",
+   "of": "selfplay_league",
+   "why": "a setting of selfplay_league (unused while it is off)"
+  },
+  "selfplay_branch_moves": {
+   "class": "param",
+   "of": "selfplay_branch",
+   "why": "a setting of selfplay_branch (unused while it is off)"
+  },
+  "selfplay_branch_temp": {
+   "class": "param",
+   "of": "selfplay_branch",
+   "why": "a setting of selfplay_branch (unused while it is off)"
+  },
+  "selfplay_branch_differ": {
+   "class": "param",
+   "of": "selfplay_branch",
+   "why": "a setting of selfplay_branch (unused while it is off)"
+  },
+  "selfplay_archive_p": {
+   "class": "param",
+   "of": "selfplay_archive",
+   "why": "a setting of selfplay_archive (unused while it is off)"
+  },
+  "resolver_cfg": {
+   "class": "param",
+   "of": "resolver",
+   "why": "a setting of resolver (unused while it is off)"
+  },
+  "resolver_init": {
+   "class": "param",
+   "of": "resolver",
+   "why": "a setting of resolver (unused while it is off)"
+  },
+  "resolver_conc": {
+   "class": "param",
+   "of": "resolver",
+   "why": "a setting of resolver (unused while it is off)"
+  },
+  "pending_max": {
+   "class": "param",
+   "of": "resolver",
+   "why": "a setting of resolver (unused while it is off)"
+  },
+  "draft_eval_net_every": {
+   "class": "param",
+   "of": "resolver",
+   "why": "a setting of resolver (unused while it is off)"
+  },
+  "draft_eval_net_remote": {
+   "class": "param",
+   "of": "resolver",
+   "why": "a setting of resolver (unused while it is off)"
+  }
+ },
+ "patterns": [
+  {
+   "prefix": "aux_",
+   "suffix": "_w",
+   "class": "play",
+   "why": "an auxiliary target's weight: > 0 makes the driver record the target (run.aux_settings)"
+  },
+  {
+   "prefix": "reader_",
+   "suffix": "",
+   "class": "trainer",
+   "why": "a reader (inside the ONNX graph; a reader on needs its target weighted: checked)"
+  }
+ ]
+}

@@ -4020,3 +4020,59 @@ fn value_choice_pick_takes_the_best_or_draws_by_the_softmax() {
         assert!((f - p).abs() < 0.01, "option {i}: {f} against {p}");
     }
 }
+
+// ------------------------------------------------------------------ a rolling driver's first game id (2.13)
+
+/// (gid, steps, result, records) of every game a rolling queue_only driver plays for `n` queued setups.
+fn rolling_games(first: Option<u32>, n: usize) -> Vec<(u32, u64, Vec<f32>, Vec<(Vec<f32>, Vec<u16>, Vec<f32>, [f32; MAX_SEATS])>)> {
+    let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    c.queue_only = true;
+    c.concurrency = 3;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    if let Some(g) = first {
+        d.set_first_gid(g).unwrap();
+    }
+    d.resume(n as u64, 0).unwrap();
+    for k in 0..n {
+        d.enqueue(&format!("s{k}"), "{}").unwrap();
+    }
+    let mut out = Vec::new();
+    let mut take = |d: &mut Driver<ToyGame>| {
+        let res = d.take_results();
+        let mut recs = d.take_samples().into_iter();
+        for r in res {
+            let rr: Vec<_> = recs.by_ref().take(r.samples as usize).map(|x| (x.x, x.opts, x.pi, x.q)).collect();
+            out.push((r.gid, r.steps, r.result, rr));
+        }
+        assert!(recs.next().is_none());
+    };
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer(&mut d, &b);
+        take(&mut d);
+    }
+    take(&mut d);
+    out.sort_by_key(|g| g.0);
+    out
+}
+
+#[test]
+fn first_gid_plays_the_same_games() {
+    let all = rolling_games(None, 7);
+    assert_eq!(all.iter().map(|g| g.0).collect::<Vec<_>>(), (0..7).collect::<Vec<u32>>());
+    let tail = rolling_games(Some(4), 3);
+    assert_eq!(tail.iter().map(|g| g.0).collect::<Vec<_>>(), vec![4, 5, 6]);
+    assert!(all[4..].iter().zip(&tail).all(|(a, b)| a == b), "games 4..7 of a driver from 0 == a driver from 4");
+    assert!(all[4..].iter().any(|g| !g.3.is_empty()), "the games recorded samples");
+    // only a rolling driver, only before its first resume
+    let mut fixed = Driver::<ToyGame>::new(cfg(vec![nn(0, 4, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).unwrap();
+    assert!(fixed.set_first_gid(3).is_err());
+    let mut c = cfg(vec![nn(0, 4, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    d.resume(1, 0).unwrap();
+    assert!(d.set_first_gid(3).is_err());
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer(&mut d, &b);
+    }
+}

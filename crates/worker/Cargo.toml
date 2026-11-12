@@ -1,0 +1,17 @@
+[package]
+name = "zero_worker"
+version = "0.1.0"
+edition = "2021"
+description = "Zero Core: the native self-play worker library (zero-farm): any run's settings, a zero-onnx/1 network through ONNX Runtime on the CPU, zero-core's sample shards, the agent<->worker protocol aw/1 (docs/az.md 42)"
+publish = false
+
+[dependencies]
+zero_search = { path = "../search" }
+serde = "1"
+serde_json = "1"
+half = "2"
+flate2 = "1"
+crc32fast = "1"
+# ONNX Runtime, loaded at run time from the library the worker is pointed at (load-dynamic: no
+# download, no link-time dependency); api-31 = ONNX Runtime 1.31's C API (older libraries refuse)
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"] }
