@@ -709,8 +709,7 @@ class Run:
         t0 = time.time()
         seat = self.nn_seat('m', c['sims'], selfplay=True)
         rng = np.random.default_rng(c['seed'] * 1_000_003 + it)
-        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
-                **shard_format(c, self.info)}
+        meta = self.shard_meta(it)
         lg = self.league
         if c['rolling']:
             if self.roll is None:
@@ -911,6 +910,15 @@ class Run:
             self.log(f'iter {it}: {out["tail"]["aborted_row_tokens"]} game(s) aborted by max_row_tokens '
                      f'{self.info.get("max_row_tokens")} (counted, no samples; docs/search.md 2.15)')
 
+    def shard_meta(self, it, **extra):
+        """The meta of iteration `it`'s self-play shards: game, features, actions, iter, `extra` (in its order), then the
+        shard format's keys (`data.shard_format` of the run's settings and game: sparse, and for a game with
+        variable-length rows format v2's `t_segs` / `option_pointers` / `max_row_tokens`, docs/az.md 43) - the meta of
+        before, key for key, for a game without them."""
+        c = self.cfg
+        return {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
+                **extra, **shard_format(c, self.info)}
+
     def check_rows(self):
         """Variable-length rows at the run's start (docs/az.md 43): refused (RowsRefused, exit 78) before any work - a
         package layout marked `draft` without allow_draft_layout (R16); the game's build disagreeing with its layout
@@ -987,8 +995,7 @@ class Run:
             plan = lg.plan(it)
             lg.evaluators(it, evs)                 # the slots' past checkpoints (guarded)
         st0 = drv.stats()
-        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
-                **shard_format(c, self.info)}
+        meta = self.shard_meta(it)
         writer = ShardWriter(d, 'r00', rows=c['shard_rows'], meta=meta, bad_dir=self.debug_dir())
         tstats = TargetStats()
         spec = G.spec_json(c['spec'])
@@ -1003,7 +1010,10 @@ class Run:
         # and written on the writer thread; None = here, between batches, as before
         tw = self.shard_thread(drv, writer, on_item=tally)
         clock = SampleClock() if tw is not None else contextlib.nullcontext()
-        take, split = (drv.take_samples, split_games) if tw is None else (drv.take_records, split_records)
+        # (variable-length rows: a dict's tails cut with their games, docs/az.md 43)
+        tws = G.tail_widths(self.info)
+        take, split = (drv.take_samples, lambda r, x: split_games(r, x, tws)) if tw is None else \
+            (drv.take_records, split_records)
 
         def accept():
             """The held games, oldest first, as many as the quota takes."""
@@ -1172,7 +1182,9 @@ class Run:
         # writer thread converts them); None = their sample arrays taken here, as before
         on = bool(c.get('shard_writer_thread'))
         clock = st['clock'] = SampleClock() if on else contextlib.nullcontext()
-        take, split = (drv.take_records, split_records) if on else (drv.take_samples, split_games)
+        tws = G.tail_widths(self.info)              # (variable-length rows: a dict's tails cut with their games)
+        take, split = (drv.take_records, split_records) if on else (drv.take_samples,
+                                                                       lambda r, x: split_games(r, x, tws))
 
         def pump(lb=None):
             with clock:

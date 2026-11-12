@@ -43,14 +43,15 @@ above exactly.
 `Shares` is that model; `split_games` cuts a driver's sample dict into its finished games (the
 rows and the samples come out of the driver in the same order, each row counting its own
 samples), so a game beyond an iteration's quota can wait - its samples with it - for the next
-one; `lag_hist` is the staleness histogram (rows by how many checkpoints older than the
+one (variable-length rows, docs/az.md 43: a dict's tail and override CSRs cut with their rows by
+`protocol.take_rows`; a tail without the game's widths is refused, never dropped); `lag_hist` is the staleness histogram (rows by how many checkpoints older than the
 iteration's their search's network was).
 """
 import math
 
 import numpy as np
 
-from .protocol import ALL_SAMPLE_KEYS
+from .protocol import ALL_SAMPLE_KEYS, has_rows, take_rows
 
 EWMA = 0.5                         # weight of a phase's measurement in a consumer's rate
 MIN_RUN_S = 0.2                    # a phase shorter than this (running) measures nothing (the toys': ~1 s)
@@ -58,10 +59,18 @@ MIN_UTIL = 0.25                    # a consumer below this share of its cap: mea
 BOOT = 0.25                        # an unmeasured remote's cap: this share of its slot-proportional one
 
 
-def split_games(rows, s):
+def split_games(rows, s, widths=None):
     """[(row, sample dict or None)] for the finished-game rows `rows` and the sample dict `s` the
     driver handed out with them (take_results + take_samples at the same point: game k's samples
-    are rows[k]['samples'] consecutive samples after game k - 1's)."""
+    are rows[k]['samples'] consecutive samples after game k - 1's). A dict with variable-length rows
+    (docs/az.md 43: `t_*` / `ov_*`) is cut by `protocol.take_rows`, every key carried; its tail needs
+    the game's tail segments `widths` (`games.tail_widths(info)`): without them a ValueError, never a
+    dropped tail."""
+    if has_rows(s):
+        if 't_off' in s and not widths:
+            raise ValueError('split_games: samples with tail tokens need the game\'s tail widths '
+                             '(split_games(rows, s, games.tail_widths(info))); they would be dropped')
+        return _split_rows(rows, s, widths)
     out = []
     a = 0
     n = 0 if s is None else len(s['player'])
@@ -88,6 +97,23 @@ def split_games(rows, s):
                 part[key] = v[a:b]
         out.append((r, part))
         a = b
+    if a != n:
+        raise RuntimeError(f'split_games: {n - a} samples left over after {len(rows)} games')
+    return out
+
+
+def _split_rows(rows, s, widths):
+    """`split_games` of a dict with variable-length rows: each game's part by `protocol.take_rows`."""
+    out, a, n = [], 0, len(s['player'])
+    for r in rows:
+        k = int(r.get('samples', 0) or 0)
+        if not k:
+            out.append((r, None))
+            continue
+        if a + k > n:
+            raise RuntimeError(f'split_games: game {r.get("gid")} has {k} samples, {n - a} left in the batch')
+        out.append((r, take_rows(s, a, a + k, widths)))
+        a += k
     if a != n:
         raise RuntimeError(f'split_games: {n - a} samples left over after {len(rows)} games')
     return out

@@ -5300,6 +5300,19 @@ section is the data path of lane X (shards, window, run, tools, remotes); 43.5-4
   (`RemoteRefused`) and retried.
 * **The toy** `toy_tail` (docs/search.md 5.3) with its layout `package.TOY_TAIL_TOKENS` is registered in the core's
   package and engine.
+* **Other readers of samples and shards:** `workqueue.split_games(rows, s, widths)` cuts a dict's tail and override
+  CSRs with their games (`protocol.take_rows`; a tail without the game's widths is refused - the run's shared-queue
+  self-play and its local linger pass `games.tail_widths(info)`); co-training's writers take the meta of
+  `Run.shard_meta` (format v2 for a resolver game with tails) and `CoRun.loop` runs both games' `check_rows`;
+  `zero/tools/distill.py` builds its window with the student's layout; `tools/selfplay_digest.py` hashes each
+  record's tail and overrides (a game without them: the digest of before). `tools/reader_measure.py` (the toy's
+  reader study) reads with `encode` and a window without a layout: refused for a game with tails (R1, R11).
+* **Not yet for a game with tails** (refused loudly, never a silent drop): the Python search - `play.PyDriver` and
+  the `SearchTree` binding (its leaves are head-only rows) and `mcts.py`'s reference, which reads `encode` (R1) - and
+  so `zero.replay` (the AI replays, and every game package's replay publisher built on it), `zero.parity` (Rust vs
+  Python search parity, its `h2h` of a Rust and a Python seat) and `zero.targets quality` (reference searches through
+  `SearchTree`; `targets sharpness` uses the driver and works). The position API's `Lookahead` refuses tail rows
+  (R12, P1 of the plan).
 
 **Off by default / byte identity.** Everything above is keyed on the game declaring tail segments or pointer
 overrides (and `allow_draft_layout` only reads a `draft` key no layout of before has): Glass Road, Caverna, Kingdom

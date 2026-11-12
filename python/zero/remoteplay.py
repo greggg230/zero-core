@@ -124,25 +124,8 @@ def _tail_widths(info):
 
 
 def split_games_rows(rows, s, widths):
-    """`workqueue.split_games` for a sample dict that may carry variable-length rows (docs/az.md 43): without them the
-    same call; with them each game's part from `protocol.take_rows` (the tail and override CSRs cut with their
-    rows, `widths` the game's tail segments) - never a silent drop."""
-    from .protocol import has_rows, take_rows
-    if not has_rows(s):
-        return split_games(rows, s)
-    out, a, n = [], 0, len(s['player'])
-    for r in rows:
-        k = int(r.get('samples', 0) or 0)
-        if not k:
-            out.append((r, None))
-            continue
-        if a + k > n:
-            raise RuntimeError(f'split_games: game {r.get("gid")} has {k} samples, {n - a} left in the batch')
-        out.append((r, take_rows(s, a, a + k, widths)))
-        a += k
-    if a != n:
-        raise RuntimeError(f'split_games: {n - a} samples left over after {len(rows)} games')
-    return out
+    """`workqueue.split_games` with the game's tail widths (variable-length rows, docs/az.md 43: every key carried)."""
+    return split_games(rows, s, widths)
 
 
 def _belief_of(cfg):

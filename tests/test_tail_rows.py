@@ -259,3 +259,38 @@ def test_remote_workers_need_the_capability():
     back = protocol.concat_samples([p for _, p in parts if p is not None])
     for k in s:
         assert np.array_equal(back[k], s[k]), k
+
+
+def test_workqueue_split_games_carries_the_rows_or_refuses():
+    from zero.workqueue import split_games
+    seen, s, _ = _drive({'items0': 6}, n=3, seed=7)
+    n = len(s['player'])
+    rows = [{'gid': 0, 'samples': 3}, {'gid': 1, 'samples': 0}, {'gid': 2, 'samples': n - 3}]
+    parts = split_games(rows, s, WIDTHS)
+    assert [r['gid'] for r, _ in parts] == [0, 1, 2] and parts[1][1] is None
+    back = protocol.concat_samples([p for _, p in parts if p is not None])
+    assert sorted(back) == sorted(s)
+    for k in s:
+        assert np.array_equal(back[k], s[k]), k
+    assert int(parts[2][1]['t_off'][-1]) == len(parts[2][1]['t_seg'])
+    with pytest.raises(ValueError, match='tail widths'):
+        split_games(rows, s)                              # a tail without the widths: refused, never dropped
+    ov_only = {k: v for k, v in s.items() if not k.startswith('t_')}
+    assert all('ov_off' in p for _, p in split_games(rows, ov_only) if p is not None)
+    plain = {k: v for k, v in ov_only.items() if not k.startswith('ov_')}
+    a = split_games(rows, plain)                          # a dict without rows: the split of before
+    assert sorted(a[0][1]) == sorted(plain)
+
+
+def test_the_run_shard_meta_asks_for_format_v2(tmp_path):
+    from zero import run as RUN
+    from test_tail_loop import cfg
+    r = RUN.Run(str(tmp_path), cfg())
+    m = r.shard_meta(3, net='resolver')
+    assert list(m)[:5] == ['game', 'features', 'actions', 'iter', 'net']
+    assert m['x_format'] == 'sparse' and m['t_segs'] == [[0, 'items', 16, 4], [1, 'marks', 4, 0]]
+    assert m['option_pointers'] is True and m['max_row_tokens'] == 64
+    # a game without rows: the meta of before, key for key (co-training's resolver writer, the run's self-play)
+    t = RUN.Run(str(tmp_path), cfg(game='toy', spec={}, arch='mlp', shard_sparse=0))
+    assert json.dumps(t.shard_meta(3, net='primary')) == json.dumps(
+        {'game': 'toy', 'features': t.info['num_features'], 'actions': t.info['num_actions'], 'iter': 3, 'net': 'primary'})

@@ -86,9 +86,14 @@ def check_shards(paths, features, actions, game=None):
 
 
 def window(paths, model, rows=None, seed=0, aux_width=0):
-    """The shards' window for `model`'s inputs; `aux_width` > 0: with the shards' auxiliary targets."""
+    """The shards' window for `model`'s inputs; `aux_width` > 0: with the shards' auxiliary targets; a token network
+    with tail segments / pointer overrides: their tails and overrides too (its layout, docs/az.md 43; a shard of other
+    tail segments or without them is refused, R9)."""
     from ..data import Window
     kw = {'aux_width': aux_width} if aux_width else {}
+    lay = getattr(model, 'config', {}).get('layout')
+    if lay is not None and (any(s.get('tail') for s in lay.get('segments', [])) or lay.get('option_pointers')):
+        kw['layout'] = lay
     return Window(paths, model.features, model.config['actions'], budget_rows=rows, seed=seed, **kw)
 
 
