@@ -5226,22 +5226,12 @@ in Python and in the Rust driver, h2h's run rule and tag, the hello's fingerprin
 toy's games (which mark no value choice) exactly as one without, making none. The search: docs/search.md 3.17's Rust
 tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.
 
-## 43. Variable-length token sets: a row's head and its tail (varlen; MTG Zero's layout v7, 2026-11-11)
+### 43.5 The layout keys and the network's tail tokens (`net.tokens_layout`, `net.TokenNet`; lane Y, 2026-11-11)
 
-**Why.** MTG Zero's rule: the engine and the network input must be exact in every reachable state. A token
-network reads a fixed-width row, so every segment has a slot cap (32 permanents a side, 16 hand cards, 8 stack items,
-...) and some kinds of object have no slot at all (the other player's waiting triggers, delayed triggers, linked or
-offered exiled cards). The project ("varlen") gives a row a variable-length **tail** of tokens after its unchanged
-fixed-width **head**: slots past a segment's cap, and tokens of new tail-only segments, with pointer overrides from
-the engine for the options the static slot table cannot score. The frozen API and the design live in MTG Zero's
-scratch (`varlen_api.md`, `varlen_design.md`). Sections 43.1-43.4 are the rows, the driver, the shards and the run
-(lane X); 43.5-43.8 below are the network, its gates, inference and the widen (lane Y).
-
-Everything is opt-in: a layout without the new keys normalises as before, a network without tail segments has no new
-parameter and runs the code of before line for line, and a tail network's batch with no tail token and no override
-runs that code too.
-
-### 43.5 The layout keys and the network's tail tokens (`net.tokens_layout`, `net.TokenNet`)
+(43.1-43.4: the rows, the driver, the shards and the run, lane X; 43.5-43.8: the network, its gates, inference and
+the widen, lane Y.) Everything here is opt-in: a layout without the new keys normalises as before, a network without
+tail segments has no new parameter and runs the code of before line for line, and a tail network's batch with no
+tail token and no override runs that code too.
 
 **Layout keys** (each stored in the normalised layout only when set):
 
@@ -5390,3 +5380,22 @@ device by drive's two batches in flight when the device is the bound), and a tra
 synthetic (the tail embedding's and the weighted trunk's ~230 more kernels, at ~27 us a launch on this shared GPU;
 the explicit attention at g = 0 another ~3 ms). The toy's 32 x 2 network: graphs 1.6 -> 2.0 (no tail token) -> 3.0 ms
 (gated) a 144-row call.
+
+**Checks** (tier "opt-in core feature with byte-identical defaults"; the desktop, 2026-11-11, a38fc7f; the machine
+loaded by three other sessions' test suites throughout):
+
+* `pytest tests`: 476 passed, 4 failed, 2 errors (1 h 44 min). The remote and co-training timing tests - two
+  co-training remote-evaluation fixtures timed out, a host of `test_multi_remote` got no game, `test_remoteplay`'s
+  dying worker's share, a co-training run's subprocess exit 0xC0000005 in `test_encoding_guard` - each passed alone
+  afterwards; `test_token_graphs::test_graphs_match_eager_and_follow_new_weights` (graphs against eager: 3.7e-5
+  against its bar 2e-5) fails the same way, the same value, on f9ca5c3 on this shared GPU (4 of 4 runs each; earlier
+  1 of 3 passed on f9ca5c3). The new tests 29 passed; test_net_data / test_token_graphs / test_encoding_guard 57
+  passed in a targeted run.
+* `check_checkpoint_compat --package zero` (roots `<checkout>/python`) against f9ca5c3: a toy token checkpoint with
+  the auxiliary head, a toy MLP checkpoint and `random`: identical (records visits / cq, results, the match).
+* `smoke_all.sh --with-this-core --build-only`: glassroad-zero, caverna-zero, kingdombuilder-zero build (3 of 3,
+  GREEN).
+* With lane X's `feat/varlen-rows` (1c33d53) merged in a scratch worktree: both lanes' tail tests 56 passed, and
+  `toy_tail` runs end to end with a token network (2 iterations, CPU eager; and CUDA graphs + sparse batches +
+  train_static + a sparse window): self-play with tail tokens (up to 21 a row) and overrides through `NetEvaluator`,
+  v2 shards, training on them (the window's overrides resolved: 227), Elo matches.
