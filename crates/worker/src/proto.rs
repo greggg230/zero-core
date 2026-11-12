@@ -170,7 +170,15 @@ fn job_from_value(v: &Value, base: &Path) -> Result<Job, String> {
     if kind != "selfplay" {
         return Err(format!("job kind {kind:?}: this worker build runs 'selfplay' jobs (fuzz, eval, diag: not built yet)"));
     }
-    let settings = Settings::from_value(o.get("settings").ok_or("job: no settings")?)?;
+    // (the settings as the line wrote them - key order and int / float kept: a dict spec reaches the game
+    // as Python's json.dumps of it)
+    let settings = match o.get("_raw").and_then(|r| r.as_str()) {
+        Some(raw) => match crate::pyjson::PyJson::parse(raw)?.get("settings") {
+            Some(s @ crate::pyjson::PyJson::Dict(_)) => Settings { raw: s.clone() },
+            _ => return Err("job: settings must be an object".into()),
+        },
+        None => Settings::from_value(o.get("settings").ok_or("job: no settings")?)?,
+    };
     let u = |k: &str| o.get(k).and_then(|x| x.as_u64());
     let games = u("games").ok_or("job: games")?;
     let threads = u("threads").unwrap_or(1).max(1) as usize;
@@ -314,7 +322,10 @@ fn stdin_lines(sink: Arc<Stdout>) -> std::sync::mpsc::Receiver<Option<Value>> {
                     continue;
                 }
                 match serde_json::from_str::<Value>(&line) {
-                    Ok(v) => {
+                    Ok(mut v) => {
+                        if v.get("op").and_then(|o| o.as_str()) == Some("job") {
+                            v["_raw"] = Value::String(line.clone());
+                        }
                         if tx.send(Some(v)).is_err() {
                             return;
                         }
