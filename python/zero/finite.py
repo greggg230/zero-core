@@ -9,7 +9,8 @@ Checks (all vectorised; a float16 array is checked on its bits, exponent all one
   becomes inf); a bad shard is written as `*.bad.npz` (the window never loads it) and the run
   fails naming the array, rows, columns (x) and the shard's meta.
   A sparse shard (run setting shard_sparse, docs/az.md 32) is checked on its features' values
-  (`x_val`), and described by the rows and columns of the dense rows.
+  (`x_val`), and described by the rows and columns of the dense rows. A version 2 shard (variable-length rows,
+  docs/az.md 43) is checked on its tail tokens' floats too (`t_val`), described by sample rows and tokens.
 * `Window`: the same arrays of every shard it loads (shards written before the guard too).
 * `Run.train` (zero/run.py): the loss terms and the gradient norm after `clip_grad_norm_`,
   before `optimizer.step()`; the failing batch is saved to `<run>/debug/`.
@@ -92,6 +93,22 @@ def describe_sparse_x(c, ent):
     return f'x: {len(rows)} row(s) {head(rows)}, column(s) {head(cols)} ({kinds})'
 
 
+def describe_tail(c, ent):
+    """One line about a v2 shard's non-finite tail floats (`t_val` entries `ent`): their sample rows and tokens
+    (`t_ptr`, `t_seg`, `t_slot`; the token of an entry from the cumulative widths when the widths are uniform per
+    token count, else the entries alone)."""
+    v = np.asarray(c['t_val'])[ent].astype(np.float32)
+    n = [int(np.isnan(v).sum()), int(np.isposinf(v).sum()), int(np.isneginf(v).sum())]
+    kinds = ', '.join(f'{k} {name}' for k, name in zip(n, ('NaN', '+inf', '-inf')) if k)
+    out = f't_val: {len(ent)} tail float(s) {head(ent)}'
+    nt = len(c.get('t_seg', ()))
+    if nt and len(c['t_val']) % nt == 0 and 't_ptr' in c:
+        tok = np.unique(np.asarray(ent) // (len(c['t_val']) // nt))
+        rows = np.unique(np.searchsorted(np.asarray(c['t_ptr'], np.int64), tok, side='right') - 1)
+        out += f' of token(s) {head(tok)} in sample row(s) {head(rows)}'
+    return out + f' ({kinds})'
+
+
 def shard_problems(c):
     """The non-finite entries of a shard's float arrays (stored dtypes: zero/data.py) -> one
     line per bad array; [] = clean. A sparse shard's features (`x_val`, no `x`): its values (a NaN /
@@ -108,6 +125,11 @@ def shard_problems(c):
         rows = nonfinite_rows(c[k])
         if len(rows):
             probs.append(describe(k, c[k], rows, c.get('opt_off')))
+    if 't_val' in c:
+        # (a v2 shard's tail floats, docs/az.md 43; float16 as stored, float32 in a sample dict)
+        ent = nonfinite_rows(np.asarray(c['t_val']))
+        if len(ent):
+            probs.append(describe_tail(c, ent))
     return probs
 
 

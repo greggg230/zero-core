@@ -245,10 +245,70 @@ TOY_AUX = [{'name': 'next_card', 'width': 6, 'loss': 'multinomial'}]
 # layout's bag 'cards') - fed into the trunk.
 TOY_READERS = [{'target': 'next_card', 'inputs': [[0, 6], [25, 6]], 'hidden': 32}]
 
-# the core's own package: the toy game, zero._engine (crates/toy_py, tools/build_py.sh)
+# The variable-length rows' toy (crates/search/src/toy_tail.rs, docs/search.md 5.3; the varlen API's section 1.4,
+# copied literally by the network's tests): 72 features - 8 globals, then segment `items` (4 head slots x 16 from
+# feature 8: present, value / 9, marked, by the viewer, on the page, position / 8, the value one-hot over floats
+# 6-15; TAKE j = action 4 + j on the first page), its items past the 4th as tail tokens; segment `marks` tail-only
+# (width 4: present, position / 8, by the viewer, 0). Pointer overrides; a row has at most 64 tokens.
+TOY_TAIL_TOKENS = {"vocab": 16, "name": "toy_tail", "version": 1, "option_pointers": True, "max_row_tokens": 64,
+                   "segments": [
+                       {"name": "items", "offset": 8, "count": 4, "width": 16, "present": 0, "id": {"at": 6, "radix": [10]},
+                        "actions": [[4, 1]], "tail": True},
+                       {"name": "marks", "offset": None, "count": 0, "width": 4, "present": 0, "id": None, "actions": [],
+                        "tail": True}],
+                   "bags": [],
+                   "globals": [{"name": "globals", "offset": 0, "count": 8}]}
+# the same without `marks` (the widen test adds it, gated)
+TOY_TAIL_TOKENS_BASE = dict(TOY_TAIL_TOKENS, segments=TOY_TAIL_TOKENS['segments'][:1])
+
+# the core's own package: the toy games, zero._engine (crates/toy_py, tools/build_py.sh)
 CORE = GamePackage('zero', 'Zero Core', CORE_ROOT, engine='zero._engine', run_module='zero.run', game='toy',
-                   dashboard_port=None, hub_id=None, env_prefix='ZERO', tokens={'toy': TOY_TOKENS},
+                   dashboard_port=None, hub_id=None, env_prefix='ZERO',
+                   tokens={'toy': TOY_TOKENS, 'toy_tail': TOY_TAIL_TOKENS},
                    aux={'toy': TOY_AUX}, readers={'toy': TOY_READERS})
+
+
+class RowsMismatch(ValueError):
+    """A game whose variable-length rows (`game_info()`: tails, option_pointers, max_row_tokens, head_tokens) differ
+    from its package's token layout (R15, docs/az.md 43): a run refuses it as an encoding mismatch (exit 78)."""
+
+
+def rows_problems(layout, info):
+    """How a game's `games.info` disagrees with its token layout about variable-length rows: [] = they agree (or
+    neither has them). Plain Python: the layout's tail segments (index, name, width, head slots), pointer overrides,
+    row limit and head tokens (1 + every segment's head slots) against the game's."""
+    segs = (layout or {}).get('segments', [])
+    lay_tails = [[i, str(s['name']), int(s['width']), int(s.get('count') or 0)] for i, s in enumerate(segs) if s.get('tail')]
+    game_tails = [[int(t['seg']), str(t['name']), int(t['width']), int(t['head'])] for t in info.get('tails') or []]
+    out = []
+    if lay_tails != game_tails:
+        out.append(f'tail segments: the layout {lay_tails}, the game {game_tails}')
+    lp, gp = bool((layout or {}).get('option_pointers')), bool(info.get('option_pointers'))
+    if lp != gp:
+        out.append(f'option_pointers: the layout {lp}, the game {gp}')
+    if lay_tails or game_tails:
+        lm, gm = (layout or {}).get('max_row_tokens'), info.get('max_row_tokens')
+        if lm != gm:
+            out.append(f'max_row_tokens: the layout {lm}, the game {gm}')
+        lh = 1 + sum(int(s.get('count') or 0) for s in segs)
+        gh = int(info.get('head_tokens') or 0)
+        if gh != lh:
+            out.append(f'head_tokens: the layout\'s 1 + Σ count = {lh}, the game\'s HEAD_TOKENS = {gh}'
+                       + (' (a build without HEAD_TOKENS)' if not gh else ''))
+    return out
+
+
+def check_rows(game, info, pkg=None):
+    """Refuse (RowsMismatch, R15) a game whose variable-length rows differ from the active package's token layout of
+    it; nothing for a game without a layout or rows on either side."""
+    pkg = pkg or active()
+    lay = pkg.tokens_of(game)
+    if lay is None:
+        return                                      # (no token layout: an arch without one refuses the rows itself)
+    probs = rows_problems(lay, info)
+    if probs:
+        raise RowsMismatch(f'game {game!r} of package {pkg.name!r}: its build and its token layout disagree about '
+                           f'variable-length rows: ' + '; '.join(probs) + ' (rebuild the engine, or fix the layout)')
 
 def default_episodes(payload):
     """The resolver specs of a deferred terminal: its payload's "episodes" (each a JSON string,
@@ -281,6 +341,14 @@ def register(pkg):
     if _ACTIVE is not None and _ACTIVE.name != pkg.name:
         raise RuntimeError(f'zero-core: game package {_ACTIVE.name!r} is already active in this process; '
                            f'cannot also use {pkg.name!r}')
+    eng = sys.modules.get(pkg.engine) if pkg.engine else None
+    if eng is not None and hasattr(eng, 'game_info_of'):
+        # R15 (docs/az.md 43): the engine is loaded already, so its games' variable-length rows are checked against
+        # the layouts now (a light registration never imports it: zero.games and zero.run check them at use)
+        names = set(eng.game_names())
+        for g in list(pkg.tokens):
+            if g in names:
+                check_rows(g, dict(eng.game_info_of(g)), pkg)
     _ACTIVE = pkg
     run = sys.modules.get('zero.run')
     if run is not None:

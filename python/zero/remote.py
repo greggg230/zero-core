@@ -364,6 +364,13 @@ class RemoteEval:
         if r.returncode or not lines:
             raise RuntimeError(f'exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[-600:]}')
         m = json.loads(lines[-1][len(RESULT):])
+        info = getattr(self.R, 'info', None) or {}
+        if (info.get('tails') or info.get('option_pointers')) and 'tails' not in (m.get('caps') or []):
+            # an older remote checkout would have evaluated a game with variable-length rows without them, or not
+            # at all (R13, docs/az.md 43.4): refused, logged, retried like a failure
+            raise RemoteRefused(f'the remote checkout reports no capability \'tails\' (its result line: caps '
+                                f'{m.get("caps")!r}); the game has variable-length rows: not recorded')
+        m.pop('caps', None)
         tag = elo.eval_tag(self.R.cfg)
         got = (m.get('eval_yard') or {}).get('select', 'visits')
         if m.get('eval_yard') and got != tag:
@@ -613,7 +620,9 @@ def main(argv=None):
         print(REFUSED + json.dumps({'error': str(e)}), flush=True)
         print(f'EncodingMismatch: {e}', file=sys.stderr, flush=True)
         raise SystemExit(EXIT_REFUSED)
-    print(RESULT + json.dumps(m), flush=True)
+    # (the capabilities of this checkout: 'tails' = variable-length rows end to end, R13 - the run refuses a result
+    # of a game with them from a checkout without it)
+    print(RESULT + json.dumps(dict(m, caps=['tails'])), flush=True)
 
 
 if __name__ == '__main__':

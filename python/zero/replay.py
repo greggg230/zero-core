@@ -72,6 +72,7 @@ import numpy as np
 from . import games as G, package
 from . import lookahead as LA
 from .infer import NetEvaluator, drive
+from .rows import game_row
 from .mcts import belief_settings, gumbel_tag, select_settings
 from .net import load
 from .play import NNSeat, PyDriver, Slot
@@ -248,8 +249,13 @@ class RecordingDriver(PyDriver):
             # the auxiliary head at the root, for the decider: one forward pass of the root's features
             # (the search's own evaluations never compute the head, and a reused tree's root was
             # evaluated during an earlier search)
-            x = np.asarray(slot.game.encode(p), np.float32)[None]
-            pred = {k: v[0] for k, v in ev.aux(x, np.asarray([slot.n], np.int64)).items()}
+            # (a game with tail segments: encode_row, its tail with the row - docs/az.md 43; else encode, as before)
+            inf = getattr(self, '_rows_info', None)
+            if inf is None:
+                inf = self._rows_info = G.info(self.game)
+            x, tail, ov = game_row(slot.game, p, G.tail_widths(inf), False)
+            rk = {'tail': tail} if tail is not None else {}
+            pred = {k: v[0] for k, v in ev.aux(x, np.asarray([slot.n], np.int64), **rk).items()}
             f.update(self.aux_render(pred, slot.states[f['s']], p, f))
         look = getattr(seat, 'look', None)
         if look is None:

@@ -31,6 +31,14 @@ non-zero features instead of `x`: `xs_off` i64 [B+1], `xs_idx` u32 [nnz] (featur
 per row), `xs_val` f32 [nnz], `n_features` (F). `LeafBatch.x` densifies it on first use (an evaluator
 that reads `x` sees the same rows); `NetEvaluator`'s token CUDA graphs scatter it on the device.
 
+Variable-length rows (a game with tail segments / pointer overrides, docs/search.md 2.15): a network batch
+also carries `t_off` i64 [B+1], `t_seg` u16 [NT], `t_slot` u32 [NT], `t_val` f32 [Σ width(t_seg)] (each row's
+tail tokens, sorted by (seg, slot), slot >= the segment's head slots) and, with pointer overrides, `ov_off` i64
+[B+1], `ov_opt` i32 [NO] (the option's index in its row, ascending), `ov_tok` i64 [NO] (`rows.pack_tok`, -1 = the
+generic logit). `LeafBatch.tail` / `.ov` are them as `rows.Tail` / `rows.Overrides` (None without); `LeafBatch.x`
+stays the head (densification never touches the tail). Sample dicts carry the same keys (N rows). A game without
+them has none of these keys.
+
 An external batch ('ext') holds B requests: `states` (list of str: the game's
 `export_state()`), `player`, `n_players`, `gid`; the answer is one payload string per request
 (applied by `SearchGame::apply_external`).
@@ -52,16 +60,46 @@ SAMPLE_KEYS = ('x', 'player', 'n_players', 'opt_off', 'opt_action', 'pi', 'z', '
 # aux=True: `SearchGame::aux_target`, docs/search.md 1.2, docs/az.md 15); per sample row, like `x`
 OPTIONAL_SAMPLE_KEYS = ('aux',)
 ALL_SAMPLE_KEYS = SAMPLE_KEYS + OPTIONAL_SAMPLE_KEYS
+# variable-length rows (docs/search.md 2.15): CSRs over the rows - never sliced by row index like the keys above
+# (`take_rows`, `concat_samples` re-offset them); present together, in a game with tails / pointer overrides only
+TAIL_SAMPLE_KEYS = ('t_off', 't_seg', 't_slot', 't_val')
+OV_SAMPLE_KEYS = ('ov_off', 'ov_opt', 'ov_tok')
+ROW_SAMPLE_KEYS = TAIL_SAMPLE_KEYS + OV_SAMPLE_KEYS
+
+
+def has_rows(s):
+    """Whether a batch / sample dict carries variable-length rows (any tail or override key)."""
+    return s is not None and any(k in s for k in ROW_SAMPLE_KEYS)
 
 
 class LeafBatch:
-    __slots__ = ('id', 'key', 'kind', 'a')
+    __slots__ = ('id', 'key', 'kind', 'a', 'tails')
 
-    def __init__(self, bid, key, kind, arrays):
+    def __init__(self, bid, key, kind, arrays, tails=None):
         self.id = bid
         self.key = key
         self.kind = kind
         self.a = arrays
+        # the game's tail segments {seg: (width, head, k)} (`rows.layout_tails` of `games.Driver`; None: none)
+        self.tails = tails
+
+    @property
+    def tail(self):
+        """The rows' tail tokens (`rows.Tail`), None for a batch without them."""
+        if 't_off' not in self.a:
+            return None
+        if not self.tails:
+            raise ValueError('LeafBatch.tail: a batch with tail tokens but no tail segments (LeafBatch(tails=...))')
+        from .rows import Tail
+        return Tail.from_arrays(self.a, self.tails)
+
+    @property
+    def ov(self):
+        """The rows' pointer overrides (`rows.Overrides`), None for a batch without them."""
+        if 'ov_off' not in self.a:
+            return None
+        from .rows import Overrides
+        return Overrides.from_arrays(self.a)
 
     @property
     def external(self):
@@ -77,6 +115,8 @@ class LeafBatch:
         return 'xs_val' in self.a
 
     def __getattr__(self, k):
+        if k == 'tails':                       # (an unpickled batch of before: no tail segments)
+            return None
         try:
             return self.a[k]
         except KeyError:
@@ -139,6 +179,34 @@ def validate_batch(lb, num_features=None, num_actions=None):
         assert lead >= 0 and a['gid'][lead] == a['gid'][b], 'an extra row without its leaf row before it'
         if ex[b] == ROW_VALUE:
             assert cnt[b] == 0 and a['player'][b] != a['player'][lead], 'a value-only row: no options, the viewer'
+    validate_rows(a, B, cnt, lb.tails)
+
+
+def validate_rows(a, B, nopt, tails=None):
+    """A batch / sample dict's variable-length rows (docs/search.md 2.15): the tail CSR's offsets, dtypes, order
+    and widths, slots past their segment's head (`tails` {seg: (width, head, k)}: required with a tail), the
+    overrides' offsets, order and range (`nopt` [B]: the rows' option counts). Nothing without them."""
+    if 't_off' in a or any(k in a for k in TAIL_SAMPLE_KEYS):
+        assert all(k in a for k in TAIL_SAMPLE_KEYS), 'a tail without all its arrays'
+        off = a['t_off']
+        assert off.dtype == np.int64 and off.shape == (B + 1,) and off[0] == 0 and np.all(np.diff(off) >= 0)
+        assert a['t_seg'].dtype == np.uint16 and a['t_slot'].dtype == np.uint32 and a['t_val'].dtype == np.float32
+        assert int(off[-1]) == len(a['t_seg']) == len(a['t_slot'])
+        assert tails, 'a tail without its tail segments'
+        from .rows import Tail
+        t = Tail.from_arrays(a, tails)          # (widths: every token's segment a tail segment, the floats' count)
+        t.check()                               # (sorted (seg, slot), no duplicate, slot >= head)
+    if 'ov_off' in a or any(k in a for k in OV_SAMPLE_KEYS):
+        assert all(k in a for k in OV_SAMPLE_KEYS), 'overrides without all their arrays'
+        off = a['ov_off']
+        assert off.dtype == np.int64 and off.shape == (B + 1,) and off[0] == 0 and np.all(np.diff(off) >= 0)
+        assert a['ov_opt'].dtype == np.int32 and a['ov_tok'].dtype == np.int64 and int(off[-1]) == len(a['ov_opt'])
+        opt, tok = a['ov_opt'].astype(np.int64), a['ov_tok']
+        row = np.repeat(np.arange(B), np.diff(off))
+        assert np.all((opt >= 0) & (opt < np.asarray(nopt)[row])), 'an override of an option out of its row'
+        assert np.all(row[1:] != row[:-1]) or np.all(opt[1:][row[1:] == row[:-1]] > opt[:-1][row[1:] == row[:-1]]), \
+            'a row\'s overrides not ascending'
+        assert np.all(tok >= -1), 'an override token neither -1 nor a packed token'
 
 
 
@@ -161,7 +229,7 @@ def validate_evaluation(lb, priors, value, margin, aux=None, aux_width=None):
         assert abs(value[b, :n].sum() - 1) < 1e-4 and np.all(value[b, n:] == 0)
 
 
-def validate_samples(s, num_features=None):
+def validate_samples(s, num_features=None, tails=None):
     N = len(s['player'])
     assert s['x'].shape[0] == N and s['opt_off'].shape == (N + 1,)
     if num_features is not None:
@@ -171,6 +239,7 @@ def validate_samples(s, num_features=None):
         assert s[k].shape == (N, MAX_SEATS)
     if 'aux' in s:
         assert s['aux'].ndim == 2 and s['aux'].shape[0] == N
+    validate_rows(s, N, np.diff(np.asarray(s['opt_off'], np.int64)), tails)
     off = s['opt_off']
     for b in range(N):
         # (a value-only sample has no options and no policy target: docs/search.md 3.6)
@@ -180,13 +249,20 @@ def validate_samples(s, num_features=None):
 
 
 def concat_samples(parts):
-    """Concatenate sample dicts (re-offsetting opt_off). None for no parts."""
+    """Concatenate sample dicts (re-offsetting opt_off; the tail and override CSRs re-offset too: in all parts or
+    none, else ValueError). None for no parts."""
     parts = [p for p in parts if p is not None and len(p['player'])]
     if not parts:
         return None
     if len(parts) == 1:
         return parts[0]
     out = {}
+    for keys in (TAIL_SAMPLE_KEYS, OV_SAMPLE_KEYS):
+        have = [all(k in p for k in keys) for p in parts]
+        if any(any(k in p for k in keys) for p in parts) and not all(have):
+            raise ValueError(f'concat_samples: {keys} in some parts only')
+        if all(have):
+            out.update(_concat_csr(parts, keys))
     for k in ALL_SAMPLE_KEYS:
         if k == 'opt_off':
             offs, base = [np.zeros(1, np.int64)], 0
@@ -198,6 +274,43 @@ def concat_samples(parts):
             if k in OPTIONAL_SAMPLE_KEYS and any(k not in p for p in parts):
                 raise ValueError(f'concat_samples: {k!r} in some parts only')
             out[k] = np.concatenate([p[k] for p in parts])
+    return out
+
+
+def _concat_csr(parts, keys):
+    """The CSR `keys` (offsets first) of sample dicts, concatenated (offsets re-based)."""
+    offs, base = [np.zeros(1, np.int64)], 0
+    for p in parts:
+        offs.append(np.asarray(p[keys[0]][1:], np.int64) + base)
+        base += int(p[keys[0]][-1])
+    return {keys[0]: np.concatenate(offs), **{k: np.concatenate([p[k] for p in parts]) for k in keys[1:]}}
+
+
+def take_rows(s, a, b, widths=None):
+    """Rows [a, b) of a sample dict (every key: per-row arrays, the options' arrays by `opt_off`, the tail and
+    override CSRs by their offsets; the tail's floats by the tokens' widths `widths` ({seg: width} or
+    `rows.layout_tails`; required with a tail, ValueError otherwise)) - a part a consumer may handle as a whole
+    sample dict."""
+    off = np.asarray(s['opt_off'], np.int64)
+    lo, hi = int(off[a]), int(off[b])
+    out = {}
+    for k, v in s.items():
+        if k == 'opt_off':
+            out[k] = (off[a:b + 1] - lo).astype(np.asarray(v).dtype)
+        elif k in ('opt_action', 'pi'):
+            out[k] = v[lo:hi]
+        elif k not in ROW_SAMPLE_KEYS:
+            out[k] = v[a:b]
+    if 'ov_off' in s:
+        o = np.asarray(s['ov_off'], np.int64)
+        out['ov_off'] = o[a:b + 1] - o[a]
+        out['ov_opt'], out['ov_tok'] = s['ov_opt'][o[a]:o[b]], s['ov_tok'][o[a]:o[b]]
+    if 't_off' in s:
+        if widths is None:
+            raise ValueError('take_rows: a sample dict with a tail needs its tail widths')
+        from .rows import Tail
+        t = Tail.from_arrays(s, widths).take(np.arange(a, b))
+        out.update(t_off=t.off, t_seg=t.seg, t_slot=t.slot, t_val=t.val)
     return out
 
 

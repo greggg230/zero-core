@@ -38,6 +38,7 @@ import torch
 from . import games as G
 from . import mcts, package
 from .infer import NetEvaluator, drive
+from .rows import eval_kw, game_row, sample_rows
 from .net import load
 from .protocol import concat_samples
 
@@ -88,11 +89,14 @@ def network_prior(model, s, device='cpu'):
     pri = []
     B = 2048
     off = np.asarray(s['opt_off'], np.int64)
+    widths = G.tail_widths(G.info(m.config.get('game') or package.active().game)) if 't_off' in s else None
     for a in range(0, len(s['player']), B):
         b = min(len(s['player']), a + B)
         o = off[a:b + 1]
+        # (variable-length rows, docs/az.md 43: the samples' tails and overrides; none: the call of before)
+        rk = eval_kw(*sample_rows(s, widths, a, b)) if 't_off' in s or 'ov_off' in s else {}
         p, _, _ = ev.evaluate(np.ascontiguousarray(s['x'][a:b], np.float32), np.asarray(s['n_players'][a:b], np.int32),
-                              (o - o[0]).astype(np.int32), np.asarray(s['opt_action'][o[0]:o[-1]], np.int32))
+                              (o - o[0]).astype(np.int32), np.asarray(s['opt_action'][o[0]:o[-1]], np.int32), **rk)
         pri.append(p)
     return np.concatenate(pri).astype(np.float64)
 
@@ -186,6 +190,8 @@ def prior_positions(model, game, spec, n, seed=0, keep=0.15, device='cpu'):
     m, _ = load(model, device, game=game)
     ev = NetEvaluator(m, device)
     rng = np.random.default_rng(seed)
+    inf = G.info(game)
+    widths, pointers = G.tail_widths(inf), bool(inf.get('option_pointers'))
     out, k = [], 0
     while len(out) < n:
         g = G.engine().Game(game, spec, 2, seed * 100_003 + k)
@@ -193,8 +199,10 @@ def prior_positions(model, game, spec, n, seed=0, keep=0.15, device='cpu'):
         while not g.over and len(out) < n:
             legal = g.legal()
             if len(legal) > 1:
-                pri, _, _ = ev.evaluate(g.encode(g.to_move)[None], np.array([g.n_players], np.int32),
-                                        np.array([0, len(legal)], np.int32), np.asarray(legal, np.int32))
+                x, tail, ov = game_row(g, g.to_move, widths, pointers)      # (encode_row with tails, docs/az.md 43)
+                pri, _, _ = ev.evaluate(x, np.array([g.n_players], np.int32),
+                                        np.array([0, len(legal)], np.int32), np.asarray(legal, np.int32),
+                                        **eval_kw(tail, ov))
                 if rng.random() < keep:
                     out.append(g.clone())
                 a = legal[int(rng.choice(len(legal), p=pri / pri.sum()))]

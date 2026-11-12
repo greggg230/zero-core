@@ -65,6 +65,7 @@ import torch.nn.functional as F
 
 from . import auxtarget as AUX
 from .data import batches
+from .rows import forward_kw
 from .finite import NonFinite
 from .infer import use_amp
 from .net import aux_layout, aux_predict, make_net
@@ -126,13 +127,17 @@ def outputs(model, W, device=None, batch=1024):
     amp = use_amp(model, device)
     for lo in range(0, N, batch):
         rows = np.arange(lo, min(N, lo + batch))
-        x = torch.from_numpy(W.features(rows).astype(np.float32)).to(device)
+        xn = W.features(rows).astype(np.float32)
+        x = torch.from_numpy(xn).to(device)
         n = torch.from_numpy(W.n_players[rows]).to(device)
+        # (variable-length rows, docs/az.md 43: the window's tails and overrides; {} without - the calls of before)
+        rk = W.row_inputs(rows, device, xn) if getattr(W, 'tail', None) is not None or getattr(W, 'ov', None) is not None \
+            else {}
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
             if layout:
-                plog, vlog, mar, raw = model(x, n, aux=True)
+                plog, vlog, mar, raw = model(x, n, aux=True, **rk)
             else:
-                plog, vlog, mar = model(x, n)
+                plog, vlog, mar = model(x, n, **rk)
         if layout:
             pred = aux_predict(layout, raw)
             aux[rows] = torch.cat([pred[name] for name, _, _ in layout], 1).cpu().numpy()
@@ -221,11 +226,12 @@ def losses(model, b, teacher_w=1.0, value_q=0.5, margin_w=0.5, amp=False, view=F
     teacher's predictions."""
     layout = getattr(model, 'aux_layout', None) or []
     aux = bool(layout) and 'taux' in b
+    rk = forward_kw(b)                             # (variable-length rows: the batch's tail / ov, docs/az.md 43)
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
         if aux:
-            plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True)
+            plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True, **rk)
         else:
-            plog, vlog, mp = model(b['x'], b['n_players'])
+            plog, vlog, mp = model(b['x'], b['n_players'], **rk)
     plog, vlog, mp = plog.float(), vlog.float(), mp.float()
     S = model.seats
     logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)

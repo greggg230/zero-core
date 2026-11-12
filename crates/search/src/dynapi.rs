@@ -7,6 +7,7 @@ use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight,
 use crate::game::{bot_names, Belief, SearchGame, MAX_SEATS};
 use crate::lookahead::{Answers, Line, Look, LookCfg, LookStats, OptionValue, Outcome, RowSink, Step};
 use crate::rng::Rng;
+use crate::tail::{TailBuf, TailRow, TailSeg};
 use crate::tree::{leaf_values_team, Scratch, Sim, Tree, Walk};
 
 /// Static facts about a game type.
@@ -20,10 +21,28 @@ pub struct GameInfo {
     pub bots: Vec<&'static str>,
     /// Auxiliary target segments (name, width) (`SearchGame::AUX`; empty: none).
     pub aux: Vec<(&'static str, usize)>,
+    /// Variable-length rows (docs/search.md 1.4): the tail segments (`SearchGame::TAILS`, empty: none), pointer
+    /// overrides, the row limit (None: `usize::MAX`, no limit) and the head tokens (`HEAD_TOKENS`).
+    pub tails: Vec<TailSeg>,
+    pub option_pointers: bool,
+    pub max_row_tokens: Option<usize>,
+    pub head_tokens: usize,
 }
 
 pub fn game_info<G: SearchGame>() -> GameInfo {
-    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>(), aux: G::AUX.to_vec() }
+    GameInfo {
+        name: G::NAME,
+        num_actions: G::NUM_ACTIONS,
+        num_features: G::NUM_FEATURES,
+        min_players: G::MIN_PLAYERS,
+        max_players: G::MAX_PLAYERS.min(MAX_SEATS),
+        bots: bot_names::<G>(),
+        aux: G::AUX.to_vec(),
+        tails: G::TAILS.to_vec(),
+        option_pointers: G::OPTION_POINTERS,
+        max_row_tokens: (G::MAX_ROW_TOKENS != usize::MAX).then_some(G::MAX_ROW_TOKENS),
+        head_tokens: G::HEAD_TOKENS,
+    }
 }
 
 /// One game, any type.
@@ -44,7 +63,14 @@ pub trait DynGame: Send + Sync {
     /// floats), `tilt`, `clip` and the per-target tilts `tilts` ((target, alpha), docs/search.md
     /// 3.8.1; empty: none).
     fn determinize_with(&mut self, viewer: usize, seed: u64, pred: &[f32], tilt: f64, clip: f64, tilts: &[(String, f64)]) -> Result<(), String>;
-    fn encode(&self, viewer: usize) -> Vec<f32>;
+    /// `SearchGame::encode` (the head): refused (Err, R1) for a state whose row has a tail (docs/search.md 1.4) -
+    /// a head-only caller never silently drops tokens.
+    fn encode(&self, viewer: usize) -> Result<Vec<f32>, String>;
+    /// `SearchGame::encode_row`: the head and the sealed tail (docs/search.md 1.4).
+    fn encode_row(&self, viewer: usize) -> (Vec<f32>, TailRow);
+    /// `SearchGame::option_overrides` of `viewer`'s row against `legal_actions()` (docs/search.md 2.15; checked;
+    /// none for a game without `OPTION_POINTERS` or a decision without options).
+    fn option_overrides(&self, viewer: usize) -> Vec<(u32, i64)>;
     fn rounds(&self) -> u32;
     fn export_state(&self) -> String;
     fn apply_external(&mut self, payload: &str) -> Result<Vec<u64>, String>;
@@ -114,10 +140,38 @@ impl<G: SearchGame> DynGame for G {
         SearchGame::determinize_with(self, viewer, &mut Rng::new(seed), &b);
         Ok(())
     }
-    fn encode(&self, viewer: usize) -> Vec<f32> {
+    fn encode(&self, viewer: usize) -> Result<Vec<f32>, String> {
+        if G::TAILS.is_empty() {
+            let mut v = vec![0.0; G::NUM_FEATURES];
+            SearchGame::encode(self, viewer, &mut v);
+            return Ok(v);
+        }
+        let (v, t) = DynGame::encode_row(self, viewer);
+        if !t.is_empty() {
+            return Err(format!("{}: encode of a state whose row has {} tail tokens (use encode_row)", G::NAME, t.len()));
+        }
+        Ok(v)
+    }
+    fn encode_row(&self, viewer: usize) -> (Vec<f32>, TailRow) {
         let mut v = vec![0.0; G::NUM_FEATURES];
-        SearchGame::encode(self, viewer, &mut v);
-        v
+        let mut tb = TailBuf::new(G::TAILS);
+        SearchGame::encode_row(self, viewer, &mut v, &mut tb);
+        tb.seal();
+        (v, tb.to_row())
+    }
+    fn option_overrides(&self, viewer: usize) -> Vec<(u32, i64)> {
+        let mut out = Vec::new();
+        if !G::OPTION_POINTERS {
+            return out;
+        }
+        let mut legal = Vec::new();
+        self.legal_actions(&mut legal);
+        if legal.is_empty() {
+            return out;
+        }
+        SearchGame::option_overrides(self, viewer, &legal, &mut out);
+        crate::driver::check_overrides(&out, legal.len());
+        out
     }
     fn rounds(&self) -> u32 {
         SearchGame::rounds(self)
@@ -304,9 +358,14 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
         match self.t.simulate(live, g, &mut self.rng, &w, &mut self.sc)? {
             Sim::Terminal => Ok(None),
             Sim::Leaf { node, player } => {
+                let viewer = self.t.viewer;
+                if !G::TAILS.is_empty() || G::OPTION_POINTERS {
+                    // (a Python-driven tree's leaves are head-only rows: refused for a game with tails or
+                    // overrides, docs/search.md 2.15 - the driver carries them)
+                    return Err(format!("{}: SearchTree leaves carry no tail or overrides (use the driver)", G::NAME));
+                }
                 let mut x = vec![0.0; G::NUM_FEATURES];
                 g.encode(player, &mut x);
-                let viewer = self.t.viewer;
                 let vx = (root_view && player != viewer).then(|| {
                     let mut v = vec![0.0; G::NUM_FEATURES];
                     g.encode(viewer, &mut v);

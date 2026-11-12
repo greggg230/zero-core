@@ -69,6 +69,17 @@ setting beside one written with it): `read_shard` densifies a sparse shard's fea
 `dense=False`: as stored), the window reads a sparse shard's rows straight into its dense rows or its
 SparseRows (the same window either way), `shard_features` reads some rows of either, and the
 non-finite guard reads a sparse shard's values (zero/finite.py).
+
+Shard format v2 (variable-length rows, docs/az.md 43, docs/search.md 2.15): a game with tail segments or pointer
+overrides writes sparse shards only (`x_version` 2; a dense shard with tails is refused: an older reader would read
+`x` and ignore the tail), with version 1's members plus `t_ptr` int64 [N+1], `t_seg` uint16, `t_slot` uint32, `t_val`
+float16 (each token's floats, dense), `ov_ptr` int64 [N+1], `ov_opt` int32, `ov_tok` int64, and in its meta `t_segs`
+([[seg, name, width, head], ...]), `option_pointers`, `max_row_tokens`. Version 1 readers refuse it (their
+`x_version` check); this build reads both (a v1 shard has empty tails) and refuses a newer one (R7). `read_shard`
+returns the v2 members with the features; the features alone (`shard_features`) are refused for a shard with any
+tail token or override unless `head_only` (R10). A window for a network with tail segments (`Window(layout=...)`)
+loads them as `Window.tail` / `Window.ov` and refuses shards of other tail segments or without them (v1, R9); a
+window for a network without them refuses a shard with any tail token or override (R11: never a silent drop).
 """
 import glob
 import json
@@ -82,6 +93,8 @@ import numpy as np
 import torch
 
 from .finite import NonFinite, shard_problems
+from .protocol import has_rows
+from . import rows as R
 from .protocol import MAX_SEATS, concat_samples
 
 EXT = '.npz'
@@ -89,14 +102,46 @@ BAD = '.bad.npz'                  # a quarantined shard (non-finite values): nev
 # Shards loaded at once by a Window (env ZERO_WINDOW_THREADS overrides; 1 = one at a time).
 WINDOW_THREADS = int(os.environ.get('ZERO_WINDOW_THREADS', '0')) or min(8, os.cpu_count() or 1)
 X_SPARSE = 'sparse'               # meta `x_format` of a sparse shard (module docstring)
-X_VERSION = 1                     # the sparse format's version this build writes and reads
+X_VERSION = 1                     # the sparse format's version of a shard without variable-length rows
+X_VERSION_ROWS = 2                # ... of a shard with them (a game with tail segments / pointer overrides)
+X_VERSION_MAX = 2                 # the newest version this build reads (R7: a newer one is refused)
 X_SPARSE_KEYS = ('x_ptr', 'x_idx', 'x_val')
+ROW_KEYS = ('t_ptr', 't_seg', 't_slot', 't_val', 'ov_ptr', 'ov_opt', 'ov_tok')    # format v2's members
 
 
-def shard_format(cfg):
+def shard_format(cfg, info=None):
     """The meta keys that ask `write_shard` / `ShardWriter` for a run's shard format (run setting
-    `shard_sparse`): {'x_format': 'sparse'}, or {} (dense: the meta, and the shard, of before)."""
-    return {'x_format': X_SPARSE} if int(cfg.get('shard_sparse', 0) or 0) else {}
+    `shard_sparse`): {'x_format': 'sparse'}, or {} (dense: the meta, and the shard, of before). `info` (the game's
+    `games.info`) of a game with tail segments or pointer overrides: format v2's meta (`rows_meta`) too, and dense
+    shards are refused (R8)."""
+    sparse = int(cfg.get('shard_sparse', 0) or 0)
+    rm = rows_meta(info) if info is not None else {}
+    if rm and not sparse:
+        raise ValueError(f'game {info.get("name")!r} has variable-length rows (tail segments / pointer overrides): its '
+                         f'shards are sparse only (shard_sparse 1; docs/az.md 43)')
+    return dict({'x_format': X_SPARSE} if sparse else {}, **rm)
+
+
+def rows_meta(info):
+    """Format v2's meta of a game (`games.info`) with tail segments or pointer overrides: {'t_segs', 'option_pointers',
+    'max_row_tokens'}; {} for a game without (the meta of before)."""
+    if not info or not (info.get('tails') or info.get('option_pointers')):
+        return {}
+    return {'t_segs': R.info_segs(info), 'option_pointers': bool(info.get('option_pointers')),
+            'max_row_tokens': info.get('max_row_tokens')}
+
+
+def _rows_shard(meta):
+    """Whether a writer's meta asks for format v2 (variable-length rows)."""
+    return bool((meta or {}).get('t_segs')) or bool((meta or {}).get('option_pointers'))
+
+
+def shard_widths(meta):
+    """A v2 shard's tail segments {seg: (width, head, k)} from its meta `t_segs` (None for a v1 shard)."""
+    t = (meta or {}).get('t_segs')
+    if t is None:
+        return None
+    return {int(s): (int(w), int(h), k) for k, (s, _, w, h) in enumerate(t)}
 
 
 def _wants_sparse(meta):
@@ -113,12 +158,19 @@ def _sparse_stored(files, meta, path):
     if 'x_val' not in files:
         return False
     v = int(meta.get('x_version', 1))
-    if meta.get('x_format', X_SPARSE) != X_SPARSE or v > X_VERSION:
+    if meta.get('x_format', X_SPARSE) != X_SPARSE or v > X_VERSION_MAX:
         raise ValueError(f'shard {path}: features stored as {meta.get("x_format")!r} version {v}; this build '
-                         f'reads {X_SPARSE!r} up to version {X_VERSION} (a newer zero-core wrote it)')
+                         f'reads {X_SPARSE!r} up to version {X_VERSION_MAX} (a newer zero-core wrote it)')
     if any(k not in files for k in X_SPARSE_KEYS) or 'x_cols' not in meta:
         raise ValueError(f'shard {path}: a sparse shard without {X_SPARSE_KEYS} / meta x_cols')
+    if v >= X_VERSION_ROWS and (any(k not in files for k in ROW_KEYS) or 't_segs' not in meta):
+        raise ValueError(f'shard {path}: a version {v} shard without {ROW_KEYS} / meta t_segs')
     return True
+
+
+def _shard_has_rows(p):
+    """Whether a shard's arrays (`read_shard(dense=False)`) hold any tail token or override."""
+    return any(k in p and len(p[k]) and int(p[k][-1]) > 0 for k in ('t_ptr', 'ov_ptr'))
 
 
 def stored_rows(p, F=None):
@@ -163,6 +215,35 @@ def _compact_rest(s):
             **({'aux': s['aux'].astype(np.float16)} if 'aux' in s else {})}
 
 
+def compact_rows(s, meta):
+    """Format v2's members of the samples `s` (driver format; meta `t_segs` / `option_pointers` say which the game
+    has: a tail game's samples carry `t_off` etc., an overrides game's `ov_off` etc. - refused when missing; the other
+    kind empty): `t_val` as float16."""
+    N = len(s['player'])
+    if meta.get('t_segs'):
+        if 't_off' not in s:
+            raise ValueError('a shard of a game with tail segments: samples without their tails (t_off)')
+        t = {'t_ptr': np.asarray(s['t_off'], np.int64), 't_seg': np.asarray(s['t_seg'], np.uint16),
+             't_slot': np.asarray(s['t_slot'], np.uint32), 't_val': np.asarray(s['t_val']).astype(np.float16)}
+    else:
+        if 't_off' in s:
+            raise ValueError('samples with tails for a shard whose meta declares no tail segments (t_segs)')
+        t = {'t_ptr': np.zeros(N + 1, np.int64), 't_seg': np.zeros(0, np.uint16), 't_slot': np.zeros(0, np.uint32),
+             't_val': np.zeros(0, np.float16)}
+    if meta.get('option_pointers'):
+        if 'ov_off' not in s:
+            raise ValueError('a shard of a game with pointer overrides: samples without them (ov_off)')
+        o = {'ov_ptr': np.asarray(s['ov_off'], np.int64), 'ov_opt': np.asarray(s['ov_opt'], np.int32),
+             'ov_tok': np.asarray(s['ov_tok'], np.int64)}
+    else:
+        if 'ov_off' in s:
+            raise ValueError('samples with pointer overrides for a shard whose meta declares none (option_pointers)')
+        o = {'ov_ptr': np.zeros(N + 1, np.int64), 'ov_opt': np.zeros(0, np.int32), 'ov_tok': np.zeros(0, np.int64)}
+    if len(t['t_ptr']) != N + 1 or len(o['ov_ptr']) != N + 1:
+        raise ValueError(f'samples of {N} rows with tail / override offsets of {len(t["t_ptr"])} / {len(o["ov_ptr"])}')
+    return {**t, **o}
+
+
 def compact_sparse(s):
     """`compact` of a sparse shard: the features as `x_ptr` / `x_idx` / `x_val` (from the sample dict's
     SparseRows 'xs' when a ShardWriter made them, else from its dense 'x': the non-zeros of the float16
@@ -177,7 +258,17 @@ def write_shard(path, s, meta, bad_path=None, compress=0):
     raised naming the arrays, rows, columns and the meta. `compress`: 0 = a plain npz (np.savez),
     1-9 = a compressed npz at that zlib level (remote self-play: 1). A meta with 'x_format': 'sparse'
     (`shard_format`): the features stored as their non-zeros (module docstring)."""
-    if _wants_sparse(meta):
+    if _rows_shard(meta):
+        # format v2 (variable-length rows): sparse only (R8)
+        if not _wants_sparse(meta):
+            raise ValueError(f'shard {path}: tails / pointer overrides need a sparse shard (shard_sparse 1; R8)')
+        c, cols = compact_sparse(s)
+        c.update(compact_rows(s, meta))
+        meta = dict(meta, rows=int(len(c['player'])), x_version=X_VERSION_ROWS, x_cols=int(cols), x_nnz=int(len(c['x_val'])))
+    elif has_rows(s):
+        raise ValueError(f'shard {path}: samples with tails / pointer overrides for a meta without format v2\'s '
+                         f'(t_segs / option_pointers: `shard_format(cfg, info)`); they would be dropped')
+    elif _wants_sparse(meta):
         c, cols = compact_sparse(s)
         meta = dict(meta, rows=int(len(c['player'])), x_version=X_VERSION, x_cols=int(cols), x_nnz=int(len(c['x_val'])))
     else:
@@ -221,11 +312,13 @@ def _save_npz(path, c, meta, compress=0):
             time.sleep(0.25)
 
 
-def read_shard(path, dense=True):
+def read_shard(path, dense=True, head_only=False):
     """A shard's arrays and its meta (a dict). A sparse shard's features (module docstring) come
     densified as `x` float16 [N, x_cols], the dense shard's bit for bit (all its rows: the window
     reads a sparse shard's rows without that, `shard_features` some of them); `dense` False: as
-    stored (`x_ptr` / `x_idx` / `x_val`; a dense shard's `x` as ever)."""
+    stored (`x_ptr` / `x_idx` / `x_val`; a dense shard's `x` as ever). A v2 shard's tail and override members
+    (`t_ptr`, ..., `ov_tok`) come with the features either way; `head_only` drops them (the caller's explicit
+    choice to read the heads alone, R10)."""
     with np.load(path) as z:
         out = {k: z[k] for k in z.files if k != 'meta'}
         out['meta'] = json.loads(str(z['meta']))
@@ -234,16 +327,39 @@ def read_shard(path, dense=True):
         out['x'] = xs.dense(np.arange(xs.N))
         for k in X_SPARSE_KEYS:
             del out[k]
+    if head_only:
+        for k in ROW_KEYS:
+            out.pop(k, None)
     return out
 
 
-def shard_features(path, rows=None, F=None):
+def shard_tail(p, widths=None):
+    """A shard's (`read_shard`) tails and overrides as (`rows.Tail` or None, `rows.Overrides` or None): None for a
+    v1 shard or a kind its meta does not declare. `widths` (the network's tail segments): refused (ValueError, R9)
+    when they differ from the shard's `t_segs`."""
+    meta = p['meta']
+    sw = shard_widths(meta)
+    if sw is None:
+        return None, None
+    if widths is not None and {s: v[:2] for s, v in sw.items()} != {int(s): tuple(v[:2]) for s, v in widths.items()}:
+        raise ValueError(f'shard tail segments {meta.get("t_segs")} differ from the network\'s {widths} (R9)')
+    tail = R.Tail(p['t_ptr'], p['t_seg'], p['t_slot'], p['t_val'], sw) if sw else None
+    ov = R.Overrides(p['ov_ptr'], p['ov_opt'], p['ov_tok']) if meta.get('option_pointers') else None
+    return tail, ov
+
+
+def shard_features(path, rows=None, F=None, head_only=False):
     """Rows `rows` (None = all; an int array or a slice) of a shard's features as float16 [n, F] (F None
     = the stored width; else cut / zero-padded), from either format: a dense shard's read in place
-    when it is stored uncompressed (only those rows), a sparse shard's scattered from its non-zeros."""
+    when it is stored uncompressed (only those rows), a sparse shard's scattered from its non-zeros. The features
+    alone: refused (ValueError, R10) for a v2 shard with any tail token or override unless `head_only`."""
     with np.load(path) as z:
         meta = json.loads(str(z['meta']))
         sparse = _sparse_stored(z.files, meta, path)
+        if sparse and not head_only and int(meta.get('x_version', 1)) >= X_VERSION_ROWS \
+                and _shard_has_rows({k: z[k] for k in ('t_ptr', 'ov_ptr')}):
+            raise ValueError(f'shard {path}: its rows have tail tokens / pointer overrides; the features alone would '
+                             f'drop them (read_shard, or head_only=True; R10)')
         if sparse:
             p = {k: z[k] for k in X_SPARSE_KEYS}
         else:
@@ -345,11 +461,15 @@ def convert_shard(src, dst, sparse=True, compress=None, threads=1):
             if x is None:
                 x = z['x']
     meta = {k: v for k, v in meta0.items() if k not in ('x_format', 'x_version', 'x_cols', 'x_nnz')}
+    v2 = was and int(meta0.get('x_version', 1)) >= X_VERSION_ROWS
+    if v2 and not sparse:
+        raise ValueError(f'convert_shard: {src} is a version 2 shard (tails / pointer overrides): never dense (R8)')
     if sparse:
         if not was:
             xs = SparseRows.from_dense(x, x.shape[1], threads=threads)
         c = {'x_ptr': xs.indptr, 'x_idx': xs.idx, 'x_val': xs.val, **rest}
-        meta.update(x_format=X_SPARSE, x_version=X_VERSION, x_cols=int(xs.F), x_nnz=int(len(xs.val)))
+        meta.update(x_format=X_SPARSE, x_version=X_VERSION_ROWS if v2 else X_VERSION, x_cols=int(xs.F),
+                    x_nnz=int(len(xs.val)))
     else:
         c = {'x': xs.dense(np.arange(xs.N)) if was else x, **rest}
     probs = shard_problems(c)
@@ -398,6 +518,9 @@ class ShardWriter:
     def add(self, s):
         if s is None or not len(s['player']):
             return
+        if has_rows(s) and not (self.sparse and _rows_shard(self.meta)):
+            raise ValueError('ShardWriter: samples with tails / pointer overrides need a sparse format v2 writer '
+                             '(meta `shard_format(cfg, info)` with shard_sparse 1; R8)')
         if self.sparse:
             x = s['x']
             s = {k: v for k, v in s.items() if k != 'x'}
@@ -582,7 +705,7 @@ def _file_key(path):
     return st.st_size, st.st_mtime_ns
 
 
-def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1, older=None):
+def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1, older=None, rows=None):
     """One shard's part of a window: rows `idx` (None = all N), features cut / zero-padded to F
     written into `xdst` (a fresh array when None: then also returned as 'x'); `sparse`: instead the
     features as SparseRows 'xs' (converted on `xthreads` threads); `AW` > 0: the auxiliary
@@ -591,7 +714,11 @@ def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1, older
     targets put in their places (the others zero), and 'aux_tmask' [rows, T] says which targets a row
     has.
     A sparse shard (`shard_sparse`): its rows' non-zeros scattered into `xdst` (the dense shard's rows
-    bit for bit), or kept as they are stored for `sparse`."""
+    bit for bit), or kept as they are stored for `sparse`.
+    `rows` (a window for a network with tail segments / pointer overrides: {'widths': its tail segments, 'pointers'}):
+    the shard's tails and overrides of the rows too ('tail' `rows.Tail` float16, 'ov' `rows.Overrides`), refused
+    for a shard of other tail segments or without them (R9); None: a shard with any tail token or override is
+    refused (R11)."""
     p = _read_shard_sparse(path, F, idx, xthreads) if sparse else read_shard(path, dense=False)
     probs = shard_problems(p)
     if probs:
@@ -601,6 +728,24 @@ def _load_part(path, N, idx, F, xdst=None, AW=0, sparse=False, xthreads=1, older
     if len(p['player']) != N:
         raise ValueError(f'shard {path}: {len(p["player"])} rows, its meta says {N}')
     out = {}
+    if rows is not None:
+        try:
+            tail, ov = shard_tail(p, rows['widths'] or None)
+        except ValueError as e:
+            raise ValueError(f'shard {path}: {e}') from None
+        if rows['widths'] and tail is None:
+            raise ValueError(f'shard {path}: no tail tokens stored (a version 1 shard, or no tail segments), the '
+                             f'network has tail segments {rows["widths"]} (R9: a v7 network trains on v2 shards only)')
+        if rows['pointers'] and ov is None:
+            raise ValueError(f'shard {path}: no pointer overrides stored, the network reads them (R9)')
+        sel_rows = np.arange(N) if idx is None else idx
+        if tail is not None:
+            out['tail'] = tail.take(sel_rows)
+        if ov is not None:
+            out['ov'] = ov.take(sel_rows)
+    elif _shard_has_rows(p):
+        raise ValueError(f'shard {path}: rows with tail tokens / pointer overrides, the network has none - its window '
+                         f'would drop them (R11; a network with the shard\'s tail segments reads them)')
     if sparse:
         out['xs'] = p.pop('xs')
     if idx is None:
@@ -663,6 +808,9 @@ def _subset_part(part, idx, xs=True):
     out = {k: part[k][idx] for k in ('src', 'player', 'n_players', 'lens', 'z', 'q', 'sc', 'aux', 'aux_mask',
                                      'aux_tmask') if k in part}
     out.update(opt_action=part['opt_action'][pos], pi=part['pi'][pos])
+    for k in ('tail', 'ov'):                      # (variable-length rows: the rows' tails and overrides)
+        if k in part:
+            out[k] = part[k].take(idx)
     if xs and 'xs' in part:
         out['xs'] = part['xs'].take(idx)
     return out
@@ -691,7 +839,9 @@ def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False):
 
     def to(b):
         if device != 'cpu':
-            b = {k: v.to(device) for k, v in b.items()}
+            # (a window's 'tail' / 'ov' are dicts of tensors: variable-length rows, docs/az.md 43)
+            b = {k: ({j: u.to(device) for j, u in v.items()} if isinstance(v, dict) else v.to(device))
+                 for k, v in b.items()}
         return dense_coo(b, W.F) if coo else b
     if not prefetch:
         for _ in range(n):
@@ -767,7 +917,12 @@ class WindowCache:
 
     @property
     def nbytes(self):
-        return sum(a.nbytes for _, _, part in self.parts.values() for a in part.values())
+        return sum(_nbytes(a) for _, _, part in self.parts.values() for a in part.values())
+
+
+def _nbytes(a):
+    """An array's bytes, or a `rows.Tail` / `rows.Overrides`'."""
+    return a.nbytes() if callable(a.nbytes) else a.nbytes
 
 
 class Window:
@@ -778,14 +933,24 @@ class Window:
     the rows it supplied. `aux_width` W > 0: the auxiliary targets too (module docstring; `aux_rows`
     = the rows that have them). `aux_older` (`auxtarget.older_columns`; a run whose auxiliary head was
     widened, docs/az.md 37): shards recorded under an older, narrower layout load too, their targets in
-    their places, and `aux_tmask` [N, T] (else None) says which targets each row has."""
+    their places, and `aux_tmask` [N, T] (else None) says which targets each row has.
+    `layout` (the network's normalised token layout; variable-length rows, docs/az.md 43): with tail segments or
+    pointer overrides the window loads the shards' tails and overrides (`tail`: `rows.Tail` over the window's rows,
+    `ov`: `rows.Overrides`; None without), refusing shards of other tail segments or without them (R9); without, a
+    shard with any tail token or override is refused (R11)."""
 
     def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, threads=None, cache=None,
-                 aux_width=0, sparse=False, aux_older=None):
+                 aux_width=0, sparse=False, aux_older=None, layout=None):
         self.F, self.A = num_features, num_actions
         self.AW = AW = int(aux_width)
         older = aux_older if AW else None
         okw = {'older': older} if older is not None else {}     # (none: the calls of before)
+        self.layout = layout
+        lt = R.layout_tails(layout) if layout is not None else {}
+        pointers = bool(layout is not None and layout.get('option_pointers'))
+        rspec = {'widths': lt, 'pointers': pointers}
+        okw['rows'] = rspec if (lt or pointers) else None
+        rkey = (('rows', tuple(sorted((s, v[:2]) for s, v in lt.items())), pointers),) if (lt or pointers) else ()
         self.paths = list(paths)
         self.reused = 0
         self._x = self._xs = self._csr = self._xsp = None
@@ -806,7 +971,7 @@ class Window:
             if cache is not None:
                 # every shard cached whole (its rows as non-zeros), subsampled from the cache: the window
                 # of loading the picks, also over budget
-                ck = ('sparse', self.F, AW) + ((older['key'],) if older is not None else ())
+                ck = ('sparse', self.F, AW) + ((older['key'],) if older is not None else ()) + rkey
                 keys = {path: (_file_key(path), ck) for path in self.paths}
                 for path in list(cache.parts):
                     if path not in keys or cache.parts[path][:2] != keys[path]:
@@ -832,6 +997,8 @@ class Window:
         elif cache is not None and keep >= 1.0:
             # (the auxiliary width only when on: the keys of before otherwise)
             ck = ((self.F, AW) + ((older['key'],) if older is not None else ())) if AW else self.F
+            if rkey:                               # (variable-length rows: the keys of before without them)
+                ck = (ck,) + rkey
             keys = {path: (_file_key(path), ck) for path in self.paths}
             for path in list(cache.parts):         # gone from the window, rewritten, another width
                 if path not in keys or cache.parts[path][:2] != keys[path]:
@@ -867,6 +1034,10 @@ class Window:
         self.aux_mask = np.concatenate([q['aux_mask'] for q in parts]) if AW else None
         self.aux_rows = int(self.aux_mask.sum()) if AW else 0
         self.aux_tmask = np.concatenate([q['aux_tmask'] for q in parts]) if older is not None else None
+        self.tail = R.Tail.concat([q['tail'] for q in parts]) if lt else None
+        self.ov = R.Overrides.concat([q['ov'] for q in parts]) if pointers else None
+        if self.tail is not None and self.tail.N != self.N or self.ov is not None and self.ov.N != self.N:
+            raise ValueError('internal: the window\'s tails / overrides do not cover its rows')
         xbytes = (self._x.nbytes if self._x is not None else self._csr.nbytes if self._csr is not None
                   else sum(a.nbytes for a in self._xsp) if self._xsp is not None
                   else sum(a.nbytes for a in self._xs))
@@ -874,6 +1045,7 @@ class Window:
                                                       self.pi, self.z, self.q, self.sc)
                                    + ((self.aux, self.aux_mask) if AW else ())
                                    + ((self.aux_tmask,) if self.aux_tmask is not None else ()))
+        self.nbytes += sum(r.nbytes() for r in (self.tail, self.ov) if r is not None)
 
     @property
     def x(self):
@@ -947,6 +1119,42 @@ class Window:
             V.append(part.val[pos])
         return np.concatenate(R), np.concatenate(C), np.concatenate(V)
 
+    def use_layout(self, layout):
+        """Resolve overrides with `layout` (a network's normalised token layout) from now on: its tail segments and
+        pointer overrides must be the window's (R9; a window loaded with `rows.shard_layout` of its shards, e.g. a
+        held-out set, takes the network's here)."""
+        lt = {s: v[:2] for s, v in R.layout_tails(layout).items()}
+        mine = {s: v[:2] for s, v in R.layout_tails(self.layout).items()} if self.layout is not None else {}
+        if lt != mine or bool(layout.get('option_pointers')) != (self.ov is not None):
+            raise ValueError(f'the network\'s tail segments {lt} / option_pointers {bool(layout.get("option_pointers"))} '
+                             f'differ from the window\'s {mine} / {self.ov is not None} (R9)')
+        self.layout = layout
+
+    def row_inputs(self, idx, device='cpu', x=None):
+        """The network's variable-length row inputs of window rows `idx` (docs/az.md 43): {'tail': the rows' tails
+        (`rows.Tail.to_torch`), 'ov': their overrides resolved (`rows.resolve`; the head slots' presence from the
+        float features `x` [len(idx), F], read here when None)} for the kinds the window has; {} for a window without
+        them."""
+        if self.tail is None and self.ov is None:
+            return {}
+        if self.layout is not None and self.layout.get('placeholder'):
+            raise ValueError('Window.row_inputs: the window knows its shards\' tail segments only (use_layout(the '
+                             'network\'s layout) first)')
+        out = {}
+        tail = self.tail.take(idx) if self.tail is not None else None
+        if tail is not None:
+            out['tail'] = tail.to_torch(device)
+        if self.ov is not None:
+            if x is None:
+                x = self.features(idx, np.float32)
+            off = self.opt_off
+            lens = off[idx + 1] - off[idx]
+            acts = self.opt_action[_ranges(off[idx], lens)]
+            boff = np.concatenate([np.zeros(1, np.int64), np.cumsum(lens)])
+            out['ov'] = R.ov_torch(R.resolve(tail, self.ov.take(idx), boff, acts, self.layout,
+                                             present=R.presence(np.asarray(x), self.layout)), device)
+        return out
+
     def batch(self, idx, device='cpu', tokens=None, coo=False):
         """The training batch of window rows `idx` (tensors on `device`). `tokens` (a token network's
         static forward, run setting train_static: (TokenNet.present_index() as an int64 array, T step))
@@ -954,7 +1162,10 @@ class Window:
         the full token axis, the global token's 0 first, then padding 0) and 'ntok' [B], T the longest
         row's tokens rounded up to the step. `coo` (a sparse window): the features as their non-zeros
         'x_rows' / 'x_cols' / 'x_vals' (`features_coo`) instead of 'x' - `dense_coo` makes 'x' of them on the
-        device -, the tokens read from them."""
+        device -, the tokens read from them.
+        A window with tails / overrides (`layout`): 'tail' (`rows.Tail.to_torch`: the network's `tail`, unpadded) and
+        'ov' (`rows.resolve`d: the network's `ov`, a pointer to an absent head slot or a missing tail token refused);
+        with `tokens`, each row's tail tokens follow its head tokens in 'full' (`rows.token_full`)."""
         B = len(idx)
         off = self.opt_off
         starts = off[idx]
@@ -985,8 +1196,19 @@ class Window:
             out['aux_mask'] = t(self.aux_mask[idx].astype(np.float32))
             if self.aux_tmask is not None:
                 out['aux_tmask'] = t(self.aux_tmask[idx].astype(np.float32))
-        if tokens is not None:
-            pidx, step = tokens
+        tail = self.tail.take(idx) if self.tail is not None else None
+        ov = self.ov.take(idx) if self.ov is not None else None
+        if (tail is not None or ov is not None) and self.layout.get('placeholder'):
+            raise ValueError("Window.batch: the window knows its shards' tail segments only (use_layout(the network's "
+                             "layout) first)")
+        if tokens is None and ov is not None:
+            tokens_p = (R.present_index(self.layout), None)     # (the head slots' presence, for `resolve` only)
+        else:
+            tokens_p = tokens
+        if tail is not None:
+            out['tail'] = tail.to_torch(device)
+        if tokens_p is not None:
+            pidx, step = tokens_p
             has = pidx >= 0
             P = np.ones((B, 1 + len(pidx)), bool)          # (infer.token_presence / token_index)
             if coo:                                         # a flag is present when its value > 0.5
@@ -998,6 +1220,15 @@ class Window:
                 P[xr[on], c[on]] = True
             else:
                 P[:, 1:][:, has] = x[:, pidx[has]] > 0.5
+            if ov is not None:
+                boff = np.concatenate([np.zeros(1, np.int64), np.cumsum(lens)])     # (the batch's option segments)
+                out['ov'] = R.ov_torch(R.resolve(tail, ov, boff, acts, self.layout, present=P), device)
+            if tokens is None:
+                return out
+            if tail is not None:
+                full, n = R.token_full(P, tail.counts(), 1 + len(pidx), step)
+                out['full'], out['ntok'] = t(full), t(n)
+                return out
             n = P.sum(1)
             T = -(-int(n.max()) // step) * step
             full = np.zeros((B, T), np.int64)

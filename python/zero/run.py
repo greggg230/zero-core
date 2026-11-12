@@ -76,6 +76,7 @@ import torch.nn.functional as F
 
 from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, resign as RS, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths
+from .rows import forward_kw
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
 from .net import (EncodingMismatch, add_aux, add_reader, aux_layout, check_belief_head, check_checkpoint, load, make_net,
@@ -149,6 +150,10 @@ DEFAULTS = dict(
     # fraction of the disk and write time for sparse encodings (MTG's ~0.7% non-zero). Every reader takes
     # both formats, so a window may mix them (docs/az.md 32). 0 = dense shards, byte for byte as before
     shard_sparse=0,
+    # allow_draft_layout 1 = a run may train on a game package's token layout marked `draft` (variable-length rows,
+    # docs/az.md 43.4: MTG Zero's layout v7 while it is built; R16). 0 (the default): such a run is refused at start
+    # (exit 78); a layout without `draft` - every layout of before - is unaffected either way
+    allow_draft_layout=0,
     # train_prefetch n > 0 = training batches built n steps ahead on a background thread while the
     # device trains (zero/data.py batches: the same batches in the same order)
     train_prefetch=0,
@@ -705,7 +710,7 @@ class Run:
         seat = self.nn_seat('m', c['sims'], selfplay=True)
         rng = np.random.default_rng(c['seed'] * 1_000_003 + it)
         meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
-                **shard_format(c)}
+                **shard_format(c, self.info)}
         lg = self.league
         if c['rolling']:
             if self.roll is None:
@@ -793,6 +798,7 @@ class Run:
         self.cache_metrics(out, st, st0)
         self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results)
+        self.tail_metrics(it, out, st, st0)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -886,6 +892,50 @@ class Run:
             self.log(f'iter {it} WARNING: selfplay_infoset_merge is on but the merged trees made no link '
                      f'({leaves} leaves): nothing was merged (docs/search.md 3.16)')
 
+    def tail_metrics(self, it, out, st, st0, remote=None):
+        """Self-play's variable-length rows (docs/az.md 43.3), only for a game with tail segments (the metrics of
+        before otherwise): `tail` = this machine's driver's network rows sent with a tail (rows), their tail tokens
+        (tokens), the most in one row so far (max), and the games aborted by the row limit (aborted_row_tokens: never
+        a truncated row) - plus the remote's (`remote`: its counts) -, logged when a game was aborted."""
+        if 'tail_rows' not in st:
+            return
+
+        def d(k):
+            return st.get(k, 0) - ((st0 or {}).get(k, 0))
+        out['tail'] = {'rows': d('tail_rows'), 'tokens': d('tail_tokens'), 'max': st.get('tail_max', 0),
+                       'aborted_row_tokens': d('aborted_row_tokens')}
+        if remote:
+            for k in ('rows', 'tokens', 'aborted_row_tokens'):
+                out['tail'][k] += int(remote.get(k, 0))
+            out['tail']['max'] = max(out['tail']['max'], int(remote.get('max', 0)))
+            out['tail']['remote'] = dict(remote)
+        if out['tail']['aborted_row_tokens']:
+            self.log(f'iter {it}: {out["tail"]["aborted_row_tokens"]} game(s) aborted by max_row_tokens '
+                     f'{self.info.get("max_row_tokens")} (counted, no samples; docs/search.md 2.15)')
+
+    def check_rows(self):
+        """Variable-length rows at the run's start (docs/az.md 43): refused (RowsRefused, exit 78) before any work - a
+        package layout marked `draft` without allow_draft_layout (R16); the game's build disagreeing with its layout
+        (tails, pointers, limit, head tokens: R15); a game with tails or overrides with an arch other than 'tokens'
+        (R4) or dense shards (shard_sparse 0, R8). Nothing for a game and layout without them."""
+        c = self.cfg
+        lay = package.active().tokens_of(c['game'])
+        if lay is not None and lay.get('draft') and not int(c.get('allow_draft_layout', 0) or 0):
+            raise RowsRefused(f'game {c["game"]!r}: its token layout {lay.get("name")!r} version {lay.get("version")} is a '
+                              f'draft (R16, docs/az.md 43.4): set allow_draft_layout 1 to train on it anyway')
+        try:
+            package.check_rows(c['game'], self.info)
+        except package.RowsMismatch as e:
+            raise RowsRefused(str(e)) from None
+        if not (self.info.get('tails') or self.info.get('option_pointers')):
+            return
+        if c.get('arch', 'mlp') != 'tokens':
+            raise RowsRefused(f'game {c["game"]!r} has variable-length rows (tail segments / pointer overrides): arch '
+                              f'{c.get("arch", "mlp")!r} cannot read them; arch \'tokens\' only (R4)')
+        if not int(c.get('shard_sparse', 0) or 0):
+            raise RowsRefused(f'game {c["game"]!r} has variable-length rows: its shards are sparse only (shard_sparse 1; '
+                              f'a dense shard would drop the tails for an older reader, R8)')
+
     def resign_metrics(self, it, out, results, remote=None):
         """Self-play resignation (zero/resign.py, docs/az.md 27), only when it is on (the metrics of before
         otherwise): `resign` = the iteration's accepted games resigned, the no-resign games, where those would
@@ -940,7 +990,7 @@ class Run:
             lg.evaluators(it, evs)                 # the slots' past checkpoints (guarded)
         st0 = drv.stats()
         meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
-                **shard_format(c)}
+                **shard_format(c, self.info)}
         writer = ShardWriter(d, 'r00', rows=c['shard_rows'], meta=meta, bad_dir=self.debug_dir())
         tstats = TargetStats()
         spec = G.spec_json(c['spec'])
@@ -1314,6 +1364,9 @@ class Run:
             kw['aux_older'] = older
         if c.get('window_sparse'):
             kw['sparse'] = True
+        lay = getattr(model, 'config', {}).get('layout')
+        if lay is not None and (any(s.get('tail') for s in lay.get('segments', [])) or lay.get('option_pointers')):
+            kw['layout'] = lay                     # (variable-length rows: the shards' tails and overrides, docs/az.md 43)
         W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it,
                    cache=self.wcache if c.get('window_cache') else None, **kw)
         load_s = time.time() - t1
@@ -1356,16 +1409,17 @@ class Run:
             for g in opt.param_groups:
                 g['lr'] = g_lr
             idx, b = next(feed)
+            rk = forward_kw(b)                     # (variable-length rows: tail / ov; {} without - the calls of before)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
                 if static:
-                    o = model.forward_static(b['x'], b['n_players'], b['full'], b['ntok'], aux=bool(aw))
+                    o = model.forward_static(b['x'], b['n_players'], b['full'], b['ntok'], aux=bool(aw), **rk)
                     plog, vlog, mp = o[:3]
                     if aw:
                         ap = o[3]
                 elif aw:
-                    plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True)
+                    plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True, **rk)
                 else:
-                    plog, vlog, mp = model(b['x'], b['n_players'])
+                    plog, vlog, mp = model(b['x'], b['n_players'], **rk)
             plog, vlog, mp = plog.float(), vlog.float(), mp.float()
             logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)
             if nview:
@@ -1458,6 +1512,14 @@ class Run:
                 out['readers'] = {'targets': [r['target'] for r in readers], 'detach': bool(model.reader_detach)}
                 if r_added:
                     out['readers']['added'] = True
+            if W.tail is not None or W.ov is not None:
+                # variable-length rows (docs/az.md 43.3): the window's tails and the network's gates (g = max(theta, 0))
+                tc = W.tail.counts() if W.tail is not None else np.zeros(0, np.int64)
+                out['tail'] = {'rows': int(np.count_nonzero(tc)), 'tokens': int(tc.sum()), 'max': int(tc.max(initial=0)),
+                               'overrides': int(W.ov.NO) if W.ov is not None else 0}
+                g = getattr(model, 'gate', None)
+                if isinstance(g, torch.Tensor) and g.numel():
+                    out['tail']['gates'] = [round(float(v), 5) for v in g.detach().clamp(min=0).cpu()]
             return out
         return model, ost, stats
 
@@ -1875,6 +1937,9 @@ class Run:
     def loop(self):
         c = self.cfg
         run = self.run
+        # variable-length rows (docs/az.md 43): a draft layout, a stale build, an arch or shard format that cannot
+        # carry them - refused before any work (exit 78); nothing for a game without them
+        self.check_rows()
         start = latest_iter(run)
         if start is None:
             save(self.new_model(), model_path(run, 0), {'iter': 0})
@@ -1989,6 +2054,12 @@ class Run:
             _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
             self.remote.drain()
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})
+
+
+class RowsRefused(EncodingMismatch):
+    """A run whose game or layout has variable-length rows it cannot train exactly (docs/az.md 43: a draft layout, a
+    build disagreeing with its layout, an arch other than 'tokens', dense shards): refused like an EncodingMismatch
+    (exit 78), never started."""
 
 
 class AnchorRefused(EncodingMismatch):

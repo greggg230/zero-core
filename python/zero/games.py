@@ -34,8 +34,16 @@ def engine():
 
 
 def info(game):
-    """{name, num_actions, num_features, min_players, max_players, bots, max_seats}."""
+    """{name, num_actions, num_features, min_players, max_players, bots, max_seats, aux_layout, aux_width, tails,
+    option_pointers, max_row_tokens, head_tokens} (the last four: variable-length rows, docs/search.md 1.4 - [],
+    False, None, 0 for a game without them)."""
     return dict(engine().game_info_of(game))
+
+
+def tail_widths(info):
+    """A game's tail segments {seg: (width, head, k)} (`rows.layout_tails`' form) from its info, None without."""
+    t = info.get('tails') or []
+    return {int(x['seg']): (int(x['width']), int(x['head']), k) for k, x in enumerate(t)} or None
 
 
 def spec_json(spec):
@@ -212,14 +220,19 @@ class Driver:
     def __init__(self, game, seats, spec=None, **kw):
         self.game = game
         self.d = engine().SearchDriver(game, seats, spec=spec_json(spec), **kw)
+        # (a game with tail segments: the batches know their widths, `LeafBatch.tail`; docs/search.md 2.15)
+        inf = dict(self.d.info())
+        self.tails = tail_widths(inf)
+        if inf.get('tails') or inf.get('option_pointers'):
+            package.check_rows(game, inf)           # (R15: the build's rows against the package's layout)
 
     def next_batch(self):
         r = self.d.next_batch()
-        return None if r is None else LeafBatch(*r)
+        return None if r is None else LeafBatch(*r, tails=self.tails) if self.tails else LeafBatch(*r)
 
     def poll_batch(self):
         r = self.d.poll_batch()
-        return None if r is None else LeafBatch(*r)
+        return None if r is None else LeafBatch(*r, tails=self.tails) if self.tails else LeafBatch(*r)
 
     def submit(self, bid, priors, value, margin, aux=None):
         """`aux`: the root belief rows' auxiliary outputs (docs/search.md 3.8), when the batch has some."""

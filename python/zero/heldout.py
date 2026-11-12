@@ -42,6 +42,7 @@ import time
 import numpy as np
 
 from .data import Window, read_shard, shard_paths, shard_rows, write_shard
+from . import rows as R
 from .protocol import MAX_SEATS
 
 
@@ -92,7 +93,11 @@ class HeldOut:
         if game is not None and self.game is not None and game != self.game:
             raise ValueError(f'held-out shards of the game {self.game!r}, not {game!r}')
         self.check(features, actions)
-        self.W = Window(self.paths, self.features, self.actions)
+        # variable-length rows (docs/az.md 43): a set of v2 shards loads their tails and overrides (one kind of
+        # them for the whole set), the network's layout given at `evaluate` (R9); a v1 set: the window of before
+        lay = _set_layout(metas)
+        self.W = Window(self.paths, self.features, self.actions, layout=lay) if lay else \
+            Window(self.paths, self.features, self.actions)
         self.name = set_name(self.paths)
         self.sources = sorted({m.get('heldout', {}).get('from', m.get('iter')) for m in metas}, key=str)
 
@@ -108,10 +113,25 @@ class HeldOut:
         """`losses` of `model` (a net.load-ed network) on the set -> dict (+ rows, set, seconds)."""
         from .distill import outputs
         self.check(model.features, model.config.get('actions'), 'the checkpoint')
+        if self.W.tail is not None or self.W.ov is not None:
+            lay = getattr(model, 'config', {}).get('layout')
+            if lay is None:
+                raise ValueError('a held-out set with tails / pointer overrides: the checkpoint has no token layout '
+                                 '(it would read the heads alone; R9)')
+            self.W.use_layout(lay)
         t0 = time.time()
         out = losses(outputs(model, self.W, device, batch=batch), self.W)
         out.update(set=self.name, seconds=round(time.time() - t0, 2))
         return out
+
+
+def _set_layout(metas):
+    """The shards' tail segments and overrides as a loading layout (`rows.shard_layout`), None for v1 shards;
+    shards of different ones refused."""
+    keys = {json.dumps([m.get('t_segs'), bool(m.get('option_pointers'))]) for m in metas}
+    if len(keys) > 1:
+        raise ValueError(f'held-out shards of different variable-length rows (t_segs / option_pointers): {sorted(keys)}')
+    return R.shard_layout(metas[0])
 
 
 def losses(O, W):
@@ -196,13 +216,22 @@ def make(src, out, rows=8192, seed=0):
     with np.load(paths[0]) as z0:
         if 'aux' in z0.files:
             aw = int(z0['aux'].shape[1])
-    W = Window(paths, F, A, budget_rows=int(rows), seed=int(seed), aux_width=aw)
+    lay = _set_layout(metas)
+    kw = {'layout': lay} if lay else {}            # (variable-length rows: their tails and overrides kept, docs/az.md 43)
+    W = Window(paths, F, A, budget_rows=int(rows), seed=int(seed), aux_width=aw, **kw)
     s = {'x': W.x, 'player': W.player, 'n_players': W.n_players, 'opt_off': W.opt_off, 'opt_action': W.opt_action,
          'pi': W.pi, 'z': W.z, 'q': W.q, 'sc': W.sc, 'net': np.zeros(W.N, np.int32)}
     if aw and bool(W.aux_mask.all()):
         s['aux'] = W.aux
+    if W.tail is not None:
+        s.update(t_off=W.tail.off, t_seg=W.tail.seg, t_slot=W.tail.slot, t_val=W.tail.val)
+    if W.ov is not None:
+        s.update(ov_off=W.ov.off, ov_opt=W.ov.opt, ov_tok=W.ov.tok)
     iters = sorted({m.get('iter') for m in metas if m.get('iter') is not None})
     meta = {k: metas[0][k] for k in ('game', 'features', 'actions') if k in metas[0]}
+    if lay:
+        meta.update({k: metas[0][k] for k in ('t_segs', 'option_pointers', 'max_row_tokens') if k in metas[0]},
+                    x_format='sparse')
     meta['heldout'] = {'from': iters[0] if len(iters) == 1 else iters, 'paths': [os.path.basename(p) for p in paths],
                        'rows': int(W.N), 'of': int(W.loaded), 'seed': int(seed)}
     os.makedirs(os.path.dirname(os.path.abspath(out)) or '.', exist_ok=True)
