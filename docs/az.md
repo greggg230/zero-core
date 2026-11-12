@@ -5280,4 +5280,37 @@ evaluates.
 
 A game whose `chained()` is false (every game but MTG Zero's `mtg` with `"game_episodes": true`, and the toy
 `toy_match`) never reaches the new code: no hook is called, no row gains a key; `check_checkpoint_compat` and the toy's
-golden digests are unchanged (42.6).
+golden digests are unchanged (42.5).
+
+### 42.4 Costs
+
+None for a game that does not chain (one `can_concede()` call per counted resign search: a default `true`). A chained
+game: the samples of a contest's episodes wait in its slot until the contest ends (as a whole-match episode's did:
+the same memory, the rows only labelled earlier); `next_episode` clones the state once per episode; one game is made
+from the run's spec when the run asks whether it chains (`games.chained`, cached), at the first evaluation and at
+each remote worker's hello.
+
+### 42.5 Tests and checks
+
+* Rust `driver::tests::chain` (8, docs/search.md 2.14) and `tests/test_chained.py` (10: the bindings; both drivers'
+  rows and labels; h2h's and the resign tally's games; the loop's contests, per-game metrics and the evaluation's match
+  and per-game numbers; a replay of a whole match; remote self-play with an older worker refused; the remote
+  evaluation's marker; the Delver stack - rolling, sparse batches, the shard writer thread, sparse shards and window,
+  information-set merging with root-view values, value-only samples, the root's belief, resignation, the eval cache,
+  paired Elo - and the league plus a remote evaluation, all on `toy_match`).
+* Off by default: `cargo test` 152 passed (144 + the 8); `check_checkpoint_compat --package zero --net random --game
+  toy` f9ca5c3 -> da86087 identical (visits b1b86b689ab98313, cq d02691e9e005a5d5, vs random dcf8b2b840d45e66). The
+  only Python call that changed shape is guarded: `Run.play_match` / `play_matches` take `games` only when the
+  evaluation spec chains (a subclass overriding them with the old signature - co-training's `PrimaryRun` - is called as
+  before).
+* The full suite on the shared desktop (2026-11-11, other agents' jobs and a live run on it): two failures, each
+  load-dependent - `test_gumbel.py::test_python_driver_refuses_a_visits_target` passed alone, and
+  `test_forks.py::test_an_older_worker_is_refused` fails the same way on f9ca5c3 (the worker's hello came after the
+  run's two short iterations ended). MTG Zero's gates on its branch `bo3-game-episodes` (its ENGINE.md 112.5).
+
+### 42.6 Measured (the toy, desktop CPU, 2026-11-11, heavily shared)
+
+`toy_match` at toy-smoke scale (`--game toy_match`, 24 contests an iteration, 8 sims): 2.5 games per contest (60 games
+of 24 contests, 1-3 drawn), ~6.8 samples per game; the evaluation reports, e.g., iteration 2 vs random: matches 4.0/4,
+games 8.5/9 (`per_game`); the Elo log `iter_0002 vs iter_0001: 2.0/4 (games 4.0/8)`. MTG Zero's best-of-three smoke:
+its ENGINE.md 112.5.

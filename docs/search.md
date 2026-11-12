@@ -554,10 +554,10 @@ before game 2 among them) z = 1, its game-1 and game-3 rows z = 0; the same cont
 quotas (contests counted); resignation concedes the game and the match goes on, never at the start choice; branching
 refused; bots' contests and the move log; the search at game 1's last decision evaluates only the root and backs up
 each option's game result exactly (nothing past the game's end is expanded); `next_episode` by the rules.
-`tests/test_chained.py` (8): the bindings, the Rust and Python drivers' rows and labels, h2h's and the resign
+`tests/test_chained.py` (10): the bindings, the Rust and Python drivers' rows and labels, h2h's and the resign
 tally's games, the loop (contests, per-game metrics, the evaluation's match and per-game numbers), a replay of a whole
-match, remote self-play (the shared quota; an older worker refused by its hello) and remote evaluation (its result's
-`episodes` checked).
+match, remote self-play (the shared quota; an older worker refused by its hello), remote evaluation (its result's
+`episodes` checked), the Delver stack and the league on a chained game (docs/az.md 42.5).
 
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
