@@ -210,3 +210,53 @@ def test_a_remote_evaluation_must_report_the_episodes(tmp_path):
     with pytest.raises(RuntimeError, match='one episode'):
         ev._evaluate(1)
     assert package.active() is not None
+
+
+def test_the_delver_stack_on_a_chained_game(tmp_path):
+    """What MTG Zero's Delver runs use, on the toy match (each with its own metrics): rolling self-play, sparse batches,
+    the shard writer thread, sparse shards and window, information-set merging with root-view values, value-only samples
+    (next_q), the root's belief (an auxiliary head), resignation (each game resigned, the match going on), the eval cache,
+    paired Elo games - every iteration exactly its quota of contests, every shard's rows the contests' games' samples."""
+    run = tmp_path / 'stack'
+    p = run_loop(run, '--iters', '2', '--game', 'toy_match', '--rolling', '1', '--games', '24', '--sparse', '1',
+                 '--shard-writer-thread', '1', '--shard-sparse', '1', '--window-sparse', '1', '--selfplay-infoset-merge', '1',
+                 '--selfplay-leaf-value-view', 'root', '--selfplay-view-samples', '0.5', '--aux-next-card-w', '0.5',
+                 '--selfplay-belief-tilt', '1', '--selfplay-resign-t', '0.3', '--selfplay-resign-k', '2',
+                 '--eval-cache', '4096', '--elo-paired', '1', '--elo-games', '4', timeout=900)
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    m = read_metrics(str(run))
+    for r in m[1:]:
+        sp = r['selfplay']
+        assert sp['games'] == 24 and sp['episodes']['contests'] == 24, sp.get('episodes')
+        assert sp['samples'] > 0 and sp['view']['samples'] > 0 and sp['merge']['links'] > 0
+        assert sp['resign']['games'] == sp['episodes']['games'], (sp['resign'], sp['episodes'])
+    assert sum(r['selfplay']['episodes']['resigned'] for r in m[1:]) > 0
+    n = 0
+    for dp, _, fs in os.walk(run / 'data'):
+        for f in fs:
+            if f.endswith('.npz'):
+                with np.load(os.path.join(dp, f)) as z:
+                    n += len(z['player'])
+    assert n == sum(r['selfplay']['samples'] for r in m[1:])
+    for r in m:
+        assert r['eval_yard']['per_game']['games'] >= 2 * r['eval_yard']['games']
+
+
+def test_the_league_and_a_remote_evaluation_on_a_chained_game(tmp_path):
+    """The self-play league (an older checkpoint in a share of the contests, its seat unrecorded) and remote evaluation
+    (the remote 'local': its results carry `episodes`, recorded with their per-game numbers)."""
+    run = tmp_path / 'lg'
+    p = run_loop(run, '--iters', '3', '--game', 'toy_match', '--games', '16', '--conc', '16', '--selfplay-league', '0.25',
+                 '--selfplay-league-pool', '1,2', '--eval-games', '4', '--eval-random-games', '0', '--elo-games', '2',
+                 timeout=900)
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    m = read_metrics(str(run))
+    assert all(r['selfplay']['games'] == 16 and r['selfplay']['episodes']['contests'] == 16 for r in m[1:])
+    assert any(r['selfplay'].get('league', {}).get('games', 0) > 0 for r in m[2:]), [r['selfplay'].get('league') for r in m]
+    rem = tmp_path / 'rem'
+    p = run_loop(rem, '--iters', '1', '--game', 'toy_match', '--eval-remote', 'local',
+                 env={'ZERO_REMOTE_WORKDIR': str(tmp_path / 'mirror')}, timeout=900)
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    ev = [json.loads(line) for line in open(rem / 'evals.jsonl')]
+    assert sorted(e['iter'] for e in ev) == [0, 1]
+    assert all(e['eval_yard']['games'] == 8 and e['eval_yard']['per_game']['games'] >= 16 for e in ev)
