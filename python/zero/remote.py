@@ -6,7 +6,7 @@ Local side (`RemoteEval`, a thread of the run process): each evaluated iteration
 the remote's mirror of the run (`<workdir>/<run name>`: config.json with the remote's overrides,
 the checkpoints the evaluation needs), evaluated there with `python -m <pkg>.az.remote eval
 <mirror> <iter>`, and its result appended to the run's `evals.jsonl` ({iter, eval_yard,
-eval_random, elo, time, host, seconds}); the mirror's Elo pool files (elo/, or elo/<rule>/ for an
+eval_random, elo, extras (the game package's other yardsticks, docs/az.md 40), time, host, seconds}); the mirror's Elo pool files (elo/, or elo/<rule>/ for an
 eval_select other than 'visits', docs/az.md 5.4) and models/index.json are copied back (the
 remote owns the run's Elo while `eval_remote` is on), models/best.pt is set to the checkpoint that
 index.json names best (as elo.tag_checkpoints does where the pool is fitted), and the game package's
@@ -211,6 +211,7 @@ class RemoteEval:
         self.queued = set()
         self.shipped = None
         self.anchors_shipped = set()               # (label, local path) put this session (docs/az.md 20.1)
+        self.inputs_shipped = {}                   # the package's inputs put this session: rel -> (size, mtime) (az.md 40)
         self.lock = threading.Lock()
         self.th = threading.Thread(target=self._loop, name='zero-remote-eval', daemon=True)
         self.th.start()
@@ -290,6 +291,7 @@ class RemoteEval:
         if self.shipped is None:
             self.t.mkdirs(self.rdir + '/models', self.rdir + '/' + pool)
             self.shipped = set(self.t.listdir(self.rdir + '/models'))
+            self.inputs_shipped = {}
             if 'results.json' not in self.t.listdir(self.rdir + '/' + pool):
                 # a new mirror (or a new rule's pool on it): the pool's Elo so far (results incl. the
                 # evaluations logged here before eval_remote) and the run's metrics, so the remote
@@ -322,6 +324,7 @@ class RemoteEval:
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, indent=1)
         self.t.put(tmp, self.rdir + '/config.json')
+        self._ship_inputs(it)
         e = max(1, int(c['eval_every']))
         # every checkpoint Run.elo_update may play up to `it` (each evaluated one and its opponents:
         # every offset of elo.OFFSETS, or elo_offsets' raw ones)
@@ -332,6 +335,30 @@ class RemoteEval:
             if fn not in self.shipped and os.path.exists(model_path(self.R.run, k)):
                 self.t.put(model_path(self.R.run, k), self.rdir + '/models/' + fn)
                 self.shipped.add(fn)
+
+    def _ship_inputs(self, it):
+        """The game package's inputs of this evaluation (`GamePackage.remote_eval_inputs`, docs/az.md 40): each file
+        of the run put at the same path in the mirror, again whenever its size or modification time changed since
+        this session put it. A missing file fails the evaluation (RuntimeError: logged, retried). A package that
+        registers no inputs reads nothing here (`_ship` as before the hook)."""
+        if not package.active().remote_eval_inputs:
+            return
+        rels = package.active().remote_eval_inputs_of(self.R.cfg['game'], self.R, it)
+        if not rels:
+            return
+        for rel in rels:
+            src = os.path.join(self.R.run, *rel.split('/'))
+            if not os.path.isfile(src):
+                raise RuntimeError(f"{rel}: the game package's remote_eval_inputs names no file of the run: not evaluated")
+            st = os.stat(src)
+            key = (st.st_size, st.st_mtime_ns)
+            if self.inputs_shipped.get(rel) == key:
+                continue
+            d = rel.rpartition('/')[0]
+            if d:
+                self.t.mkdirs(f'{self.rdir}/{d}')
+            self.t.put(src, f'{self.rdir}/{rel}')
+            self.inputs_shipped[rel] = key
 
     def _fetch_files(self, it):
         """The game package's files of this evaluation (`GamePackage.remote_eval_files`, docs/az.md 5.2):
@@ -370,7 +397,9 @@ class RemoteEval:
             raise RuntimeError(f"the remote evaluated with the move rule {got!r}, the run's eval_select is {tag!r} "
                                f"(its checkout is not the run's code?): not recorded")
         row = {'iter': it, 'time': time.time(), 'host': self.name, 'seconds': round(time.time() - t0, 1)}
-        for k in ('eval_yard', 'eval_random', 'elo', 'elo_anchored'):
+        # extras: the game package's other yardsticks (GamePackage.evals), run on the remote with the rest of
+        # Run.evaluate - recorded here as a local evaluation records them in metrics.jsonl (docs/az.md 40)
+        for k in ('eval_yard', 'eval_random', 'elo', 'elo_anchored', 'extras'):
             if k in m:
                 row[k] = m[k]
         self._fetch_files(it)
@@ -400,6 +429,11 @@ class RemoteEval:
             a = row['elo_anchored']
             self.R.log(f'iter {it} elo anchored {a["elo"]:.0f} +-{1.96 * a["se"]:.0f}{elo.pool_note(tag)} '
                        f'(remote {self.name})')
+        from .run import _fmt
+        for name, r in (row.get('extras') or {}).items():
+            what = (f'EXTRA EVAL FAILED: {r["error"]}' if isinstance(r, dict) and 'error' in r and len(r) == 1
+                    else _fmt(r) if isinstance(r, dict) else json.dumps(r))
+            self.R.log(f'iter {it} {name} (remote {self.name}): {what}')
 
 
 class RemoteNetEval(RemoteEval):

@@ -909,6 +909,58 @@ fn queued_setups_replace_the_spec_and_carry_their_tags() {
 }
 
 #[test]
+fn set_spec_plays_the_new_spec_in_the_games_started_after_it() {
+    // docs/search.md 2.13: a rolling driver told a new spec between phases starts its next games with it, and the
+    // games in flight keep theirs: game g started after the switch is game g of a driver made with the new spec
+    // (the same streams), every earlier game is the old spec's
+    let mut c = cfg(vec![SeatCfg::Bot("heuristic".into())], vec![vec![0, 0]], &[]);
+    c.record = false;
+    c.rolling = true;
+    c.concurrency = 3;
+    let new = r#"{"food": [20, 0]}"#;
+    let phases = |switch: Option<&str>, initial: &str| {
+        let mut cc = c.clone();
+        cc.spec = initial.into();
+        let mut d = Driver::<ToyGame>::new(cc).unwrap();
+        d.resume(6, 0).unwrap();
+        let (mut rows, _) = run(&mut d);
+        let started = d.stats().games_finished + d.in_flight().games as u64;
+        if let Some(s) = switch {
+            d.set_spec(s).unwrap();
+        }
+        d.resume(6, 0).unwrap();
+        rows.extend(run(&mut d).0);
+        rows.sort_by_key(|r| r.gid);
+        (rows, started)
+    };
+    let (switched, g0) = phases(Some(new), "{}");
+    let (old, _) = phases(None, "{}");
+    let (fresh, _) = phases(None, new);
+    assert!(g0 > 6 && switched.iter().any(|r| r.gid as u64 >= g0), "games on both sides of the switch");
+    let by = |v: &[GameResult], g: u32| v.iter().find(|r| r.gid == g).map(|r| (r.steps, r.scores.clone()));
+    let mut changed = 0;
+    for r in &switched {
+        let want = if (r.gid as u64) < g0 { by(&old, r.gid) } else { by(&fresh, r.gid) };
+        if let Some(w) = want {
+            assert_eq!((r.steps, r.scores.clone()), w, "game {} (started {} the switch)", r.gid, if (r.gid as u64) < g0 { "before" } else { "after" });
+        }
+        changed += (r.gid as u64 >= g0 && by(&old, r.gid).is_some_and(|o| o != (r.steps, r.scores.clone()))) as u32;
+    }
+    assert!(changed > 0, "the new spec changed a game");
+    // refused: a bad spec (the old one kept), a running phase, a driver that is not rolling
+    let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
+    assert!(d.set_spec(r#"{"food": "x"}"#).is_err());
+    d.resume(4, 0).unwrap();
+    assert!(d.set_spec(new).unwrap_err().contains("phase"));
+    run(&mut d);
+    d.set_spec(new).unwrap();
+    let mut plain = c.clone();
+    plain.rolling = false;
+    plain.games = vec![vec![0, 0]; 2];
+    assert!(Driver::<ToyGame>::new(plain).unwrap().set_spec(new).unwrap_err().contains("rolling"));
+}
+
+#[test]
 fn queued_setups_are_shared_between_the_groups() {
     // a queue_only driver of 2 groups x 8 slots fed 8 setups (as an evaluation's matches arrive):
     // each group gets 4 of them, so the groups' batches alternate at full size (the first group
@@ -4021,7 +4073,7 @@ fn value_choice_pick_takes_the_best_or_draws_by_the_softmax() {
     }
 }
 
-// ------------------------------------------------------------------ a rolling driver's first game id (2.13)
+// ------------------------------------------------------------------ a rolling driver's first game id (2.14)
 
 /// (gid, steps, result, records) of every game a rolling queue_only driver plays for `n` queued setups.
 fn rolling_games(first: Option<u32>, n: usize) -> Vec<(u32, u64, Vec<f32>, Vec<(Vec<f32>, Vec<u16>, Vec<f32>, [f32; MAX_SEATS])>)> {
