@@ -666,7 +666,8 @@ impl FuzzProgress {
             "chunks": self.chunks, "yields": self.yields, "yield_ms_max": (self.yield_ms_max * 10.0).round() / 10.0,
             "rss_mb": crate::job::rss_mb() + self.children_rss_mb, "wall_s": (self.wall_s * 10.0).round() / 10.0,
             "cpu_s": self.cpu_s.round(), "seeds_per_s": if self.wall_s > 0.0 { ((self.seeds as f64 / self.wall_s) * 10.0).round() / 10.0 } else { 0.0 },
-            "provider": "none",
+            // (CPU work: an agent takes any other provider for a GPU job and holds it back on a PC without one)
+            "provider": "cpu",
         })
     }
 }
@@ -1218,6 +1219,12 @@ mod tests {
         assert_eq!(r.missing(0, 15).0, vec![(0, 1), (12, 15)]);
         assert_eq!(Ranges(vec![(2, 4), (6, 8)]).missing(3, 7).0, vec![(4, 6)]);
         assert_eq!(r.total(), 11);
+    }
+
+    #[test]
+    fn a_fuzz_job_reports_cpu_work() {
+        // the agent's gpu_job(): a provider other than "cpu" means a GPU job (paused on a PC without a GPU)
+        assert_eq!(FuzzProgress::default().stats()["provider"], "cpu");
     }
 
     #[test]

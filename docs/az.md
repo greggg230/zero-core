@@ -5462,7 +5462,8 @@ whatever is on the PC.
     done; `end` {reason, stats, unfinished {seeds}} - the agent builds the 5.1 summary and its `x-ids` from the failures
     and `end` (agent 0.1.3). The worker writes the same summary to `out_dir/fuzz-final.json` and announces it as a
     `records` file only when the job asks (`announce_result`: announcing it to agent 0.1.3 would credit the seeds twice
-    over in `units_done`). Stats: games = seeds, failures, chunks, cpu_s, children's rss.
+    over in `units_done`). Stats: games = seeds, failures, chunks, cpu_s, children's rss, provider "cpu" (CPU work: an
+    agent takes any other provider for a GPU job and holds it back on a PC without one - found by phase 1's end to end).
   * Test faults: env `ZERO_FARM_TEST_FAULT=panic:S,abort:S,overflow:S,hang:S` injects them at seeds, taken only by a
     build with debug assertions whose process has `ZERO_FARM_ALLOW_TEST_FAULTS=1`; anywhere else the key is refused.
   * CLI: `fuzz` (a job from flags; `--keep-chunks`), `fuzz-check --mode M --env K=V ...` (what a campaign means and
