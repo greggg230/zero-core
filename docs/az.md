@@ -5906,9 +5906,12 @@ self-play, 200 games each, v6 and v7, the shard writer thread on and off, and wi
 in submit order and every shard's arrays identical to ec8ecf0's (ec8ecf0 reproduced its own twice).
 `tests/test_pack.py` (CPU): the packers against the numpy path, bit for bit (random batches, presence flags at 0.5
 and just above, float16 tails, the long-row return, the refusals); `tests/test_tail_graphs.py`'s launches in flight
-and dense = sparse, `test_token_graphs.py`, `test_tail_amp.py`; the core's pytest; toy-smoke (MLP, tokens, static
-tokens) byte for byte and `check_checkpoint_compat --package zero` (random, a toy MLP, a toy token network)
-identical against ec8ecf0.
+and dense = sparse, `test_token_graphs.py`, `test_tail_amp.py`; the core's pytest (its timed `test_remoteplay` cases
+failed beside other sessions' builds and pass alone, as ec8ecf0's; `test_graphs_match_eager_and_follow_new_weights`
+fails now and then before and after alike - graphs against eager by 3.7e-5 where it allows 2e-5); toy-smoke (MLP,
+tokens, static tokens) byte for byte and `check_checkpoint_compat --package zero` (random, a toy MLP, a toy token
+network) identical against ec8ecf0; `smoke_all.sh --with-this-core --build-only`: Glass Road, Caverna and Kingdom
+Builder Zero build (MTG Zero's v6 and v7 checkouts were built on it for the measurements).
 
 **Measured** (the same self-play, 200 games, configurations alternated, `sp_table` guard: the GPU otherwise idle, the
 host quiet; the desktop's RTX 5090; two clean rounds - a third ran beside other sessions' builds and is left out):
