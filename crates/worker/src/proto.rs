@@ -4,7 +4,7 @@
 //! <worker> serve                         aw/1: JSON lines in (op) / out (ev); stdout JSON only, stderr the log
 //! <worker> selfplay --settings F (--model M | --uniform) --games N [--gid-base G] [--seed S] [--net N]
 //!          [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
-//!          [--ort-dll PATH] [--spinning 0|1] [--record-batches N --record-file F] [--sha256 H]
+//!          [--ort-dll PATH] [--spinning 0|1] [--record-batches N --record-file F] [--sha256 H (the model file's)]
 //!          [--status-s X] [--stdin-control] [--reference R]   one job from flags (the same runner; events on stdout)
 //! <worker> eval --settings F (--model GEN=M ... | --uniform) --seats JSON --games N [--gid-base G] [--seed S]
 //!          [--paired] [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
@@ -31,9 +31,10 @@
 //! `serve`: `hello` first (aw, build_id, game, kinds, zero_onnx, pid), then one `job` line (`op` job:
 //! lease_id, kind 'selfplay', settings, games, gid_base, seed, model, reference (the self-test's set:
 //! answered before the first batch, `selftest` {provider, max_abs, ok}; a failure is fatal), threads, out_dir;
-//! optional gen - the rows' network id, default the graph's `checkpoint_iter` -, sha256, conc,
-//! groups, infer_threads, spinning, prefix); during it `yield` -> `yielded` (no batch started, the
-//! session dropped), `resume` -> `resumed`, `finish`, `quit`, `checkpoint` {gen, model, sha256?},
+//! optional gen - the rows' network id, default the graph's `checkpoint_iter` -, sha256 - the model FILE's,
+//! checked before the file is loaded -, conc, groups, infer_threads, spinning, prefix); during it `yield` ->
+//! `yielded` (no batch started, the session dropped), `resume` -> `resumed`, `finish`, `quit`, `checkpoint`
+//! {gen, model, sha256? (the file's), reference?},
 //! `ping` -> `status`; events `fin`, `shard` (seq, path under out_dir, games, rows, bytes, gids:
 //! half-open [a, b) ranges), `status` every <= 10 s (PROTOCOL.md 3 Stats fields), `end` (reason, stats,
 //! unfinished {gids: [[a, b)]}), `error` (message, fatal). The process exits after `end` (or a fatal
@@ -199,6 +200,15 @@ fn checkpoint_iter(model: &Path, ort: &OrtCfg) -> Result<u32, String> {
     it.and_then(|v| v.parse::<u32>().ok()).ok_or_else(|| format!("{}: no checkpoint_iter in its metadata: give the job's gen", model.display()))
 }
 
+/// `checkpoint_iter` of a model whose file's sha256 (when the job gives one) is checked first: ONNX Runtime
+/// reads no byte of a file the job's hash doesn't name.
+fn checkpoint_iter_checked(model: &Path, ort: &OrtCfg, sha256: Option<&str>) -> Result<u32, String> {
+    if let Some(h) = sha256 {
+        crate::job::check_file_sha256(model, h, None)?;
+    }
+    checkpoint_iter(model, ort)
+}
+
 fn job_from_value(v: &Value, base: &Path) -> Result<Job, String> {
     let o = v.as_object().ok_or("job: a JSON object")?;
     let kind = o.get("kind").and_then(|k| k.as_str()).unwrap_or("");
@@ -236,7 +246,7 @@ fn job_from_value(v: &Value, base: &Path) -> Result<Job, String> {
     };
     let net = match (u("gen"), &eval) {
         (Some(g), _) => g as u32,
-        (None, EvalKind::Onnx { model, ort, .. }) => checkpoint_iter(model, ort)?,
+        (None, EvalKind::Onnx { model, ort, sha256, .. }) => checkpoint_iter_checked(model, ort, sha256.as_deref())?,
         (None, EvalKind::Uniform) => 0,
     };
     let lease = o.get("lease_id").and_then(|x| x.as_str()).unwrap_or("job").to_string();
@@ -703,7 +713,7 @@ fn selfplay_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     };
     let net = match (a.num::<u32>("--net")?, &eval) {
         (Some(n), _) => n,
-        (None, EvalKind::Onnx { model, ort, .. }) => checkpoint_iter(model, ort)?,
+        (None, EvalKind::Onnx { model, ort, sha256, .. }) => checkpoint_iter_checked(model, ort, sha256.as_deref())?,
         (None, EvalKind::Uniform) => 0,
     };
     let mut meta = Map::new();
@@ -883,7 +893,7 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
         let s = ort::session::Session::builder(env).map_err(|e| e.to_string())?.commit_from_file(&model).map_err(|e| e.to_string())?;
         let md = s.metadata().map_err(|e| e.to_string())?;
         let num = |k: &str| md.custom(k).and_then(|v| v.parse::<usize>().ok()).ok_or_else(|| format!("{}: metadata {k}", model.display()));
-        let want = crate::eval::Expect { game: md.custom("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false, sha256: None };
+        let want = crate::eval::Expect { game: md.custom("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false };
         drop(md);
         OrtEvaluator::load(&model, ort, &want)?
     };

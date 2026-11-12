@@ -204,7 +204,7 @@ mod tests {
         write(&p, &[0, 1, 2, 3], &[0.25, 0.75]);
         let r = load(&p).unwrap();
         assert_eq!((r.rows, r.batches.len(), r.batches[0].xs_idx.clone()), (3, 1, vec![0, 2, 4]));
-        let want = Expect { game: "toy".into(), features: 5, actions: 4, aux_width: 2, belief: true, sha256: None };
+        let want = Expect { game: "toy".into(), features: 5, actions: 4, aux_width: 2, belief: true };
         check_meta(&r, &want, &[("checkpoint_sha256".into(), "ab".into())]).unwrap();
         assert!(check_meta(&r, &want, &[("checkpoint_sha256".into(), "cd".into())]).unwrap_err().contains("made for checkpoint ab"));
         assert!(check_meta(&r, &Expect { game: "mtg".into(), ..want.clone() }, &[]).is_err());

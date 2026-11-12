@@ -79,8 +79,6 @@ pub struct Expect {
     /// graph must then answer it: its aux width = the game's).
     pub aux_width: usize,
     pub belief: bool,
-    /// The checkpoint the job names (`checkpoint_sha256`), if any.
-    pub sha256: Option<String>,
 }
 
 /// ONNX Runtime's settings for a session.
@@ -220,11 +218,6 @@ impl OrtEvaluator {
         }
         if want.belief && w != want.aux_width {
             return Err(format!("{}: a seat takes the root's belief but the network has no auxiliary head for the game's targets (aux_width {w}, need {}): HeadMissing", path.display(), want.aux_width));
-        }
-        if let Some(h) = &want.sha256 {
-            if get("checkpoint_sha256") != Some(h.as_str()) {
-                return Err(format!("{}: checkpoint_sha256 {:?}, the job names {h}", path.display(), get("checkpoint_sha256")));
-            }
         }
         for name in ["x_ptr", "x_idx", "x_val", "n_players", "belief"] {
             if !session.inputs().iter().any(|i| i.name() == name) {

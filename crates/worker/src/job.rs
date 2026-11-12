@@ -38,8 +38,9 @@ pub const INFLIGHT: usize = 2;
 
 #[derive(Clone, Debug)]
 pub enum EvalKind {
-    /// A `zero-onnx/1` graph through ONNX Runtime; `reference`: its checkpoint's reference set, answered
-    /// before the first real batch (the per-machine self-test, `selftest`).
+    /// A `zero-onnx/1` graph through ONNX Runtime; `sha256`: the model file's (checked before it is loaded);
+    /// `reference`: its checkpoint's reference set, answered before the first real batch (the per-machine
+    /// self-test, `selftest`).
     Onnx { model: PathBuf, ort: OrtCfg, sha256: Option<String>, reference: Option<PathBuf> },
     /// `infer.UniformEvaluator` (tests and the plumbing gate).
     Uniform,
@@ -75,6 +76,7 @@ pub struct Job {
 pub struct Checkpoint {
     pub gen: u32,
     pub model: PathBuf,
+    /// The model file's sha256 (checked before it is loaded).
     pub sha256: Option<String>,
     /// Its reference set (the self-test runs before the new network answers a batch).
     pub reference: Option<PathBuf>,
@@ -299,15 +301,33 @@ pub fn ranges(gids: &[u32]) -> Vec<(u32, u32)> {
     out
 }
 
+/// A model file's sha256 against the job's (`sha256` on a job, `checkpoint` or `models[gen]` line: always the
+/// FILE's sha256 - the lease's - for self-play and eval alike; the graph's `checkpoint_sha256` metadata, the
+/// torch checkpoint's, is never compared with it). The error names the file and the job's hash, never the
+/// file's own (a job must not learn the hash of a file it named; zero-farm security review H3).
+pub(crate) fn check_file_sha256(model: &std::path::Path, want: &str, gen: Option<u32>) -> Result<(), String> {
+    let b = std::fs::read(model).map_err(|e| format!("{}: {e}", model.display()))?;
+    let got = crate::proto::sha256_hex(&b);
+    if got.eq_ignore_ascii_case(want) {
+        return Ok(());
+    }
+    let what = gen.map_or(String::new(), |g| format!("gen {g}: "));
+    Err(format!("{what}{}: the file's sha256 is not the job's ({want})", model.display()))
+}
+
 /// The job's evaluator; a network with a reference set first passes the self-test (`selftest`: the
 /// event, and an error - the job's end - if it fails: a worker never plays with an evaluator that
 /// doesn't answer as torch does). `gen`: the network's generation in an eval job (the event names it).
+/// A model with a `sha256` is checked against it first (`check_file_sha256`).
 pub(crate) fn build_eval(kind: &EvalKind, want: &Expect, sink: &dyn Sink, progress: &Mutex<Progress>, gen: Option<u32>) -> Result<Box<dyn Evaluator>, String> {
     Ok(match kind {
         EvalKind::Uniform => Box::new(Uniform),
         EvalKind::Onnx { model, ort, sha256, reference } => {
-            let mut w = want.clone();
-            w.sha256 = sha256.clone();
+            // the model FILE's sha256, before ONNX Runtime reads a byte of it (self-play and eval alike)
+            if let Some(h) = sha256 {
+                check_file_sha256(model, h, gen)?;
+            }
+            let w = want.clone();
             let mut ev = OrtEvaluator::load(model, ort.clone(), &w)?;
             match reference {
                 Some(r) => {
@@ -655,7 +675,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let info = (game.info)();
     let cfg = job_driver_cfg(game, job)?;
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
-    let want = Expect { game: info.name.to_string(), features: info.num_features, actions: info.num_actions, aux_width: info.aux.iter().map(|a| a.1).sum(), belief, sha256: None };
+    let want = Expect { game: info.name.to_string(), features: info.num_features, actions: info.num_actions, aux_width: info.aux.iter().map(|a| a.1).sum(), belief };
     let ev = build_eval(&job.eval, &want, sink, &progress, None)?;
     sink.log(&format!("job {}: {} games from gid {}, seed {}, net {}; driver: conc {}, threads {}, groups {}, sparse; evaluator: {}", job.lease_id, job.games, job.gid_base, job.seed, job.net, cfg.concurrency, cfg.threads, cfg.groups, ev.describe()));
     {
@@ -775,4 +795,41 @@ pub fn do_resume(ctl: &Control, link: Option<&EvalLink>) -> Result<bool, String>
         l.restore()?;
     }
     Ok(ctl.set_yielded(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Quiet;
+    impl Sink for Quiet {
+        fn event(&self, _: Value) {}
+        fn log(&self, _: &str) {}
+    }
+
+    #[test]
+    fn a_models_sha256_is_its_files_checked_before_it_is_loaded() {
+        let d = std::env::temp_dir().join(format!("zero-worker-sha-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("model.onnx");
+        std::fs::write(&p, b"not a graph").unwrap();
+        let good = crate::proto::sha256_hex(b"not a graph");
+        assert!(check_file_sha256(&p, &good, None).is_ok());
+        assert!(check_file_sha256(&p, &good.to_uppercase(), None).is_ok());
+        let bad = "0".repeat(64);
+        let e = check_file_sha256(&p, &bad, Some(2)).unwrap_err();
+        assert!(e.starts_with("gen 2: ") && e.contains("not the job's") && !e.contains(&good), "{e}");
+        assert!(check_file_sha256(&d.join("missing.onnx"), &good, None).is_err());
+        // a wrong hash ends the job before ONNX Runtime is touched (there is no runtime here at all; the right hash
+        // reaching the loader is the worker's integration tests': MTG Zero tests/test_worker_farm.py)
+        let want = Expect { game: "toy".into(), features: 1, actions: 1, aux_width: 0, belief: false };
+        let ort = OrtCfg { dylib: d.join("no-onnxruntime.dll"), intra_threads: 1, spinning: false };
+        let progress = Mutex::new(Progress::default());
+        let kind = EvalKind::Onnx { model: p.clone(), ort, sha256: Some(bad.clone()), reference: None };
+        match build_eval(&kind, &want, &Quiet, &progress, Some(1)) {
+            Err(e) => assert!(e.starts_with("gen 1: ") && e.contains("not the job's"), "{e}"),
+            Ok(_) => panic!("a model whose file is not the job's sha256 was loaded"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
