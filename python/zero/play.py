@@ -25,8 +25,17 @@ root: its simulations wait) - and deals its worlds by the batch's auxiliary answ
 temp_moves decisions; an evaluation seat's at `gumbel_scale`, every decision) and sequential halving
 at the root instead of Dirichlet noise, temperature and the move rule; its move is the halving's
 winner, its root value the improved policy's (`mcts.gumbel_choose`, `gumbel_q`).
+
+Variable-length rows (a game with tail segments or pointer overrides, docs/search.md 2.15; `mcts.rows_of`): every
+row - a leaf's own, a value-only row, a root belief row, a record - is `encode_row` of its state with its tail and,
+for a row with options, its overrides against them (`mcts.leaf_row`; the Rust tree's seats: `SearchTree.simulate(...,
+rows=True)`, the same rows); batches and samples carry them as the Rust driver's (`t_off` / `t_seg` / `t_slot` /
+`t_val`, `ov_off` / `ov_opt` / `ov_tok`; `row_arrays`), and a row past the game's `max_row_tokens` aborts its game
+(no samples, `abort_reason` 'max_row_tokens', counted in `aborted_row_tokens`, one stderr line) - never a truncated
+row. A game without them: every path of before.
 """
 import random
+import sys
 
 import numpy as np
 
@@ -155,17 +164,24 @@ class PySearch:
     def redet(self):
         return self.t.redet
 
-    def simulate(self, game, rng, seat):
+    def simulate(self, game, rng, seat, rk=None):
         """-> None (a terminal, backed up) or (decider, features, options, the viewer's features when
-        the leaf takes a root-view value, else None)."""
+        the leaf takes a root-view value, else None, rows): `rows` None for a game without variable-length rows
+        (`rk` None), else (tail, ov, the value-only row's tail), `mcts.leaf_row`'s (docs/search.md 2.15)."""
         r = mcts.simulate(self.t, rng, seat.c_puct, seat.chance_k, seat.margin_w)
         if r is None:
             return None
         node, leaf, path = r
         v = self.t.viewer
-        vx = leaf.encode(v) if seat.leaf_value_view == 'root' and node.player != v else None
-        self.pending = (node, path, None if vx is None else v)
-        return node.player, leaf.encode(node.player), node.acts, vx
+        if rk is None:
+            vx = leaf.encode(v) if seat.leaf_value_view == 'root' and node.player != v else None
+            self.pending = (node, path, None if vx is None else v)
+            return node.player, leaf.encode(node.player), node.acts, vx, None
+        vrow = seat.leaf_value_view == 'root' and node.player != v
+        vx, vt, _ = mcts.leaf_row(leaf, v, rk) if vrow else (None, None, None)
+        self.pending = (node, path, v if vrow else None)
+        x, t, ov = mcts.leaf_row(leaf, node.player, rk, opts=bool(node.acts))
+        return node.player, x, node.acts, vx, (t, ov, vt)
 
     def expand(self, priors, value, margin, seat):
         node, path, vp = self.pending
@@ -248,13 +264,18 @@ class RsSearch:
     def redet(self):
         return self.t.redet
 
-    def simulate(self, game, rng, seat):
+    def simulate(self, game, rng, seat, rk=None):
+        if rk is not None:
+            # (variable-length rows, docs/search.md 2.15: the tree's leaf rows with their tails and overrides)
+            return self.t.simulate(game, seat.c_puct, seat.chance_k, seat.margin_w,
+                                   root_view=seat.leaf_value_view == 'root', rows=True)
         if seat.leaf_value_view == 'root':
-            return self.t.simulate(game, seat.c_puct, seat.chance_k, seat.margin_w, root_view=True)
+            r = self.t.simulate(game, seat.c_puct, seat.chance_k, seat.margin_w, root_view=True)
+            return None if r is None else tuple(r) + (None,)
         r = self.t.simulate(game, seat.c_puct, seat.chance_k, seat.margin_w)
         if r is None:
             return None
-        return r[0], r[1], r[2], None
+        return r[0], r[1], r[2], None, None
 
     def expand(self, priors, value, margin, seat):
         was = self.t.root_expanded
@@ -327,7 +348,7 @@ def make_bot(game, name, rng):
 
 class Slot:
     __slots__ = ('gid', 'rng', 'np_rng', 'search_rng', 'game', 'n', 'seats', 'bots', 'trees', 'sims', 'target',
-                 'full', 'records', 'decisions', 'steps', 'view_wait', 'belief')
+                 'full', 'records', 'decisions', 'steps', 'view_wait', 'belief', 'abort')
 
     def __init__(self, gid, game, spec, seats, rng):
         from .games import engine
@@ -349,14 +370,22 @@ class Slot:
         self.steps = 0
         self.view_wait = []                 # value-only records waiting for (record index, observer)'s next search
         self.belief = False                 # the current search takes the root's belief
+        self.abort = None                   # the driver aborted the game ('max_row_tokens', docs/search.md 2.15)
 
 
 class PyDriver:
     """seat_fn(game_index) -> list of seats (NNSeat or a bot name), one per player."""
 
     def __init__(self, game, n_games, seat_fn, spec=None, concurrency=64, seed=0, record=False, max_steps=100_000):
-        from .games import spec_json
+        from . import package
+        from .games import info, spec_json
         self.game = game
+        inf = info(game)
+        # the game's variable-length rows (docs/search.md 2.15; None: none, every path of before), checked against
+        # the package's layout as the Rust driver's (R15)
+        self.rk = mcts.rows_of(inf)
+        package.check_rows(game, inf)
+        self.aborted_row_tokens = 0         # games aborted by the row limit
         self.seed = seed
         self.spec = spec_json(spec)
         self.n_games = n_games
@@ -446,7 +475,7 @@ class PyDriver:
         for slot in self.active:
             while True:
                 g = slot.game
-                if g.over or slot.steps >= self.max_steps:
+                if g.over or slot.steps >= self.max_steps or slot.abort:
                     finished.append(slot)
                     break
                 legal = g.legal()
@@ -476,44 +505,70 @@ class PyDriver:
         """One step of seat p's search into `need`: its root belief row alone (a reused root waiting for
         its belief, docs/search.md 3.8), or its next leaf (with the root belief row after a fresh root's
         own leaf) -> True when the slot waits for a batch, False after a terminal walk."""
-        bx = None
+        bx = bt = None
+        rk = self.rk
         if slot.belief and not tree.has_belief:
-            bx = g.encode(p)                # the root's features: the decider's own view
+            bx, bt, _ = mcts.leaf_row(g, p, rk)     # the root's features: the decider's own view
+            if rk is not None and self._over(slot, 'belief', bt):
+                return False
             if tree.expanded:
-                need.setdefault(seat.key, []).append((slot, seat, tree, p, None, None, None, bx))
+                need.setdefault(seat.key, []).append((slot, seat, tree, p, None, None, None, bx, None, bt))
                 self.belief_rows += 1
                 return True
-        r = tree.simulate(g, slot.search_rng, seat)
+        r = tree.simulate(g, slot.search_rng, seat, rk)
         if r is None:
             if bx is not None:
                 raise RuntimeError("internal: a fresh root's first walk did not stop at the root")
             slot.sims += 1
             return False
-        player, x, acts, vx = r
-        need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts, vx, bx))
+        player, x, acts, vx, rows = r
+        if rows is not None and (self._over(slot, 'leaf', rows[0]) or self._over(slot, 'value', rows[2])):
+            return False
+        need.setdefault(seat.key, []).append((slot, seat, tree, player, x, acts, vx, bx, rows, bt))
         self.belief_rows += bx is not None
         return True
 
+    def _over(self, slot, kind, tail):
+        """A row of the slot's game (`kind`, its `tail`) past the game's row limit (docs/search.md 2.15): the game is
+        aborted - it ends at the round's top, no samples, counted and logged - as the Rust driver's; -> whether."""
+        cap = self.rk.over(tail)
+        if cap is None:
+            return False
+        self._abort(slot, f'its {kind} row has capacity {cap} > {self.rk.limit}')
+        return True
+
+    def _abort(self, slot, why):
+        """Abort the slot's game for the row limit (docs/search.md 2.15; `why`: the row, for the log line)."""
+        print(f'max_row_tokens: game {slot.gid} (driver seed {self.seed}) aborted: {why}', file=sys.stderr, flush=True)
+        slot.abort = 'max_row_tokens'
+        self.aborted_row_tokens += 1
+
     def _leaf_batches(self, need):
-        """Queue one network batch per key of `need` ({key: [(slot, seat, tree, player, x, acts, vx, bx)]}):
-        each leaf's row, then (a root-view value) its value-only row of the tree's viewer, then (a
-        fresh root's belief) its root belief row; x None: a root belief row alone."""
+        """Queue one network batch per key of `need` ({key: [(slot, seat, tree, player, x, acts, vx, bx, rows,
+        bt)]}): each leaf's row, then (a root-view value) its value-only row of the tree's viewer, then (a
+        fresh root's belief) its root belief row; x None: a root belief row alone. `rows` / `bt`: the leaf's rows'
+        and the belief row's tails and overrides (a game with variable-length rows, docs/search.md 2.15)."""
+        rk = self.rk
+        no_ov = (np.zeros(0, np.int32), np.zeros(0, np.int64)) if rk is not None and rk.pointers else None
         for key, items in need.items():
             # rows: each leaf's, then (root-view values) its value-only row of the tree's viewer, then
-            # (the root's belief) the root's belief row
-            rows, refs = [], []
+            # (the root's belief) the root's belief row - each with its (tail, overrides)
+            rows, refs, tails = [], [], []
             for it in items:
-                slot, seat, tree, player, x, acts, vx, bx = it
+                slot, seat, tree, player, x, acts, vx, bx, lr, bt = it
                 b = vb = bb = None
                 if x is not None:
                     b = len(rows)
                     rows.append((x, acts, player, slot, ROW_LEAF))
+                    tails.append((None, None) if lr is None else (lr[0], lr[1]))
                     if vx is not None:
                         rows.append((vx, [], tree.t.viewer, slot, ROW_VALUE))
+                        tails.append((None, None) if lr is None else (lr[2], no_ov))
                     vb = len(rows) - 1
                 if bx is not None:
                     bb = len(rows)
                     rows.append((bx, [], player, slot, ROW_BELIEF))
+                    tails.append((bt, no_ov))
                 refs.append((slot, seat, tree, b, vb, bb))
             off = np.zeros(len(rows) + 1, np.int32)
             off[1:] = np.cumsum([len(r[1]) for r in rows])
@@ -524,7 +579,10 @@ class PyDriver:
                  'n_players': np.asarray([r[3].n for r in rows], np.int32),
                  'gid': np.asarray([r[3].gid for r in rows], np.int64),
                  'extra': np.asarray([r[4] for r in rows], np.uint8)}
-            lb = LeafBatch(self.next_bid, key, 'nn', a)
+            if rk is not None:
+                a.update(row_arrays(tails, rk))
+            lb = LeafBatch(self.next_bid, key, 'nn', a, tails=rk.widths) if rk is not None else \
+                LeafBatch(self.next_bid, key, 'nn', a)
             self.outstanding[self.next_bid] = (lb, refs)
             self.next_bid += 1
             self.queue.append(lb)
@@ -563,7 +621,7 @@ class PyDriver:
             for i, o in slot.view_wait:
                 if o == p:
                     r = slot.records[i]
-                    slot.records[i] = r[:4] + (None if rw is None else list(rw),)
+                    slot.records[i] = r[:4] + (None if rw is None else list(rw),) + r[5:]
                 else:
                     keep.append((i, o))
             slot.view_wait = keep
@@ -584,15 +642,31 @@ class PyDriver:
             i = tree.choose(seat)
         if self.record and seat.selfplay and seat.record and slot.full:
             pi = tree.target(seat)
-            slot.records.append((slot.game.encode(p), list(acts), pi, p, rw))
+            rk = self.rk
+            if rk is None:
+                slot.records.append((slot.game.encode(p), list(acts), pi, p, rw))
+            else:
+                # (variable-length rows, docs/search.md 2.15: the record's tail and overrides; past the limit the
+                # game is aborted, as the Rust driver's records)
+                x, t, ov = mcts.leaf_row(slot.game, p, rk, opts=True)
+                if self._over(slot, 'record', t):
+                    return
+                slot.records.append((x, list(acts), pi, p, rw, t, ov))
             if seat.view_samples > 0 and view_pick(self.seed, slot.gid, slot.decisions, seat.view_samples):
                 for o in range(slot.n):
                     so = slot.seats[o]
                     if o == p or not (isinstance(so, NNSeat) and so.selfplay and so.record):
                         continue
+                    if rk is None:
+                        rec = (slot.game.encode(o), [], [], o, None)
+                    else:
+                        x, t, ov = mcts.leaf_row(slot.game, o, rk)
+                        if self._over(slot, 'record', t):
+                            return
+                        rec = (x, [], [], o, None, t, ov)
                     if seat.view_sample_target == 'next_q':
                         slot.view_wait.append((len(slot.records), o))
-                    slot.records.append((slot.game.encode(o), [], [], o, None))
+                    slot.records.append(rec)
         slot.decisions += 1
         self._apply(slot, acts[i])
 
@@ -611,27 +685,57 @@ class PyDriver:
     def _finish(self, slot):
         g = slot.game
         n = slot.n
-        over = g.over and not g.aborted     # (an aborted game has no result: as unfinished)
+        # (an aborted game has no result: as unfinished; so has one the driver aborted for the row limit)
+        over = g.over and not g.aborted and not slot.abort
         if over and g.deferred:
             raise RuntimeError(f'game {slot.gid}: a deferred terminal (the Python reference driver does not park games; '
                                f'the Rust driver does, docs/search.md 2.8)')
         res = list(g.result()) if over else [1.0 / n] * n
-        self.results.append({'gid': slot.gid, 'n': n, 'over': over, 'aborted': bool(g.aborted), 'result': res, 'scores': g.scores(),
+        self.results.append({'gid': slot.gid, 'n': n, 'over': over, 'aborted': bool(g.aborted) or slot.abort is not None,
+                             'result': res, 'scores': g.scores(),
                              'steps': slot.steps, 'decisions': slot.decisions, 'ext_moves': 0,
                              'rounds': g.rounds, 'samples': len(slot.records) if self.record and over else 0})
+        if slot.abort:
+            self.results[-1]['abort_reason'] = slot.abort
         if self.record and over and slot.records:
             margins = [g.margin(i) for i in range(n)]
-            self.samples.append(_sample_arrays(slot.records, res, margins, n))
+            self.samples.append(_sample_arrays(slot.records, res, margins, n, self.rk))
 
 
-def _sample_arrays(records, res, margins, n):
+def row_arrays(rows, rk):
+    """The batch / sample keys of rows' variable-length parts (docs/search.md 2.4, 2.15): {'t_off' int64 [N + 1],
+    't_seg' uint16, 't_slot' uint32, 't_val' float32} with tail segments and {'ov_off' int64 [N + 1], 'ov_opt' int32,
+    'ov_tok' int64} with pointer overrides - the Rust driver's arrays. `rows`: per row (tail, ov) as `mcts.leaf_row`
+    gives them; `rk`: the game's `mcts.Rows`."""
+    out = {}
+    N = len(rows)
+    if rk.widths:
+        ts = [t for t, _ in rows]
+        if any(t is None for t in ts):
+            raise ValueError('row_arrays: a row without its tail (a game with tail segments)')
+        off = np.zeros(N + 1, np.int64)
+        off[1:] = np.cumsum([len(t['t_seg']) for t in ts])
+        cat = lambda k, dt: np.concatenate([np.zeros(0, dt)] + [np.asarray(t[k], dt) for t in ts])  # noqa: E731
+        out.update(t_off=off, t_seg=cat('t_seg', np.uint16), t_slot=cat('t_slot', np.uint32), t_val=cat('t_val', np.float32))
+    if rk.pointers:
+        os_ = [o for _, o in rows]
+        if any(o is None for o in os_):
+            raise ValueError('row_arrays: a row without its overrides (a game with pointer overrides)')
+        off = np.zeros(N + 1, np.int64)
+        off[1:] = np.cumsum([len(o[0]) for o in os_])
+        out.update(ov_off=off, ov_opt=np.concatenate([np.zeros(0, np.int32)] + [np.asarray(o[0], np.int32) for o in os_]),
+                   ov_tok=np.concatenate([np.zeros(0, np.int64)] + [np.asarray(o[1], np.int64) for o in os_]))
+    return out
+
+
+def _sample_arrays(records, res, margins, n, rk=None):
     N = len(records)
     z = np.zeros((N, MAX_SEATS), np.float32)
     q = np.zeros((N, MAX_SEATS), np.float32)
     sc = np.zeros((N, MAX_SEATS), np.float32)
     off = np.zeros(N + 1, np.int64)
     acts, pis = [], []
-    for k, (_, a, pi, mover, rq) in enumerate(records):
+    for k, (_, a, pi, mover, rq, *_rows) in enumerate(records):
         acts.extend(a)
         pis.extend(pi)
         off[k + 1] = len(acts)
@@ -640,8 +744,12 @@ def _sample_arrays(records, res, margins, n):
             z[k, j] = res[s]
             q[k, j] = rq[s] if rq is not None else res[s]
             sc[k, j] = margins[s]
-    return {'x': np.stack([r[0] for r in records]).astype(np.float32),
-            'player': np.asarray([r[3] for r in records], np.int32),
-            'n_players': np.full(N, n, np.int32), 'opt_off': off,
-            'opt_action': np.asarray(acts, np.int32), 'pi': np.asarray(pis, np.float32),
-            'z': z, 'q': q, 'sc': sc, 'net': np.zeros(N, np.uint32)}
+    out = {'x': np.stack([r[0] for r in records]).astype(np.float32),
+           'player': np.asarray([r[3] for r in records], np.int32),
+           'n_players': np.full(N, n, np.int32), 'opt_off': off,
+           'opt_action': np.asarray(acts, np.int32), 'pi': np.asarray(pis, np.float32),
+           'z': z, 'q': q, 'sc': sc, 'net': np.zeros(N, np.uint32)}
+    if rk is not None:
+        # (variable-length rows, docs/search.md 2.15: each record's tail and overrides, as the Rust driver's samples)
+        out.update(row_arrays([(r[5], r[6]) for r in records], rk))
+    return out

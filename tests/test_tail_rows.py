@@ -45,18 +45,12 @@ def test_encode_refuses_a_tail_and_encode_row_carries_it():
     assert np.array_equal(small.encode(0), small.encode_row(0)[0])     # no tail: encode is the head
 
 
-def test_a_python_driven_tree_refuses_tail_games():
+def test_a_head_only_caller_of_a_python_driven_tree_is_refused():
+    # (the tree's leaves carry their rows with simulate(rows=True): tests/test_tail_search.py, as the lookahead's)
     g = E.Game('toy_tail', None, 2, 0)
     t = g.search_tree(True, 0)
-    with pytest.raises(RuntimeError, match='carry no tail'):
+    with pytest.raises(RuntimeError, match='rows=True'):
         t.simulate(g, 1.0, 0, 0.0, False)
-
-
-def test_the_lookahead_refuses_tail_rows():
-    g = E.Game('toy_tail', {'items0': 9}, 2, 0)
-    with pytest.raises(Exception, match='tail rows not supported yet'):
-        lk = E.Lookahead(g, {'plies': 1, 'worlds': 1}, seed=0)
-        lk.next_batch()
 
 
 def test_pack_and_rows_containers():

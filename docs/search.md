@@ -493,9 +493,8 @@ scratch (then `sparse_scan`), the tail sealed (sorted by (seg, slot); a duplicat
 of a non-tail segment panics: an engine bug, the game named by the worker). A row with options gets its overrides
 from `option_overrides(viewer, opts)`, checked (option indexes ascending and in range, tokens -1 or packed; else a
 panic). A merged tree's shared leaf row (3.16) carries the tail of the same encoding (`Tree::leaf_obs_tail`), its
-overrides computed from the state. Lookahead and value-choice rows (3.9, 3.17) are refused when they have a tail or
-an override (`lookahead::look_encode`: `Err("lookahead: tail rows not supported yet")`, R12, P1 of the plan); so is
-a Python-driven `SearchTree` leaf (head-only rows).
+overrides computed from the state. Lookahead and value-choice rows (3.9, 3.17) and a Python-driven tree's leaves carry
+theirs too (below: "The lookahead and the Python search"; R12's refusal of P1 is gone, 2026-11-12).
 
 **Batches** (`Batch`, the binding's dict; a game with tails / pointers only): `t_off` i64 [B+1] (B + 1 offsets even
 if every row's tail is empty), `t_seg` u16, `t_slot` u32, `t_val` f32 (each token's floats, `width(seg)` each,
@@ -527,10 +526,40 @@ kind and its capacity. This holds for every row kind, the records included. A tr
 **Stats:** `tail_rows` (rows sent with at least one tail token), `tail_tokens`, `tail_max` (the most in one row),
 `aborted_row_tokens` (the binding's `stats()` reports them for a game with tails only).
 
+**The lookahead and the Python search** (2026-11-12; P1's refusals R12 and of the Python-driven trees removed):
+
+* **The lookahead** (3.9: the driver's lookahead seats, its value choices 3.17, the position API `Lookahead`): every
+  row is `lookahead::look_encode` - `encode_row`, the tail sealed, a row with options its overrides against them
+  (checked) - and `RowSink::row_tail` hands the tail and overrides to the sink (`put_row`): the driver's sink into its
+  leaf buffer (the batch's arrays, as any row's: dense or sparse), the position API into the round's arrays (the
+  dict of `Lookahead.next_batch()` adds `t_off` / `t_seg` / `t_slot` / `t_val` and `ov_off` / `ov_opt` / `ov_tok`;
+  `Lookahead.info()` names the game's tail segments; `zero.lookahead.drive` and `evaluate_position` pass them to the
+  evaluator as `tail=` / `ov=`). **Keys** (K3): the leaf values' dedup and the information-set groups key a row by
+  `lookahead::look_key` - `obs_hash_row` of its head, tail and overrides (a group's: its overrides against the
+  member's options, which the key holds too); a game without tails or pointer overrides keeps `obs_hash` of `encode`
+  (K1: its groups, dedup and rows are those of before). **The limit:** a lookahead or value-choice row past it aborts
+  its game in the driver (the step's rows taken back, the lookahead dropped; the stderr line names the row kind
+  'lookahead' / 'value choice'); the position API raises (`next_batch()`: RuntimeError "max_row_tokens: ...").
+* **A Python-driven tree** (`SearchTree`): `simulate(..., rows=True)` returns a fifth item, the leaf's rows (tail,
+  ov, vtail): the decider's row's tail (`Game.encode_row`'s dict; None without tail segments), its overrides against
+  the leaf's options ((ov_opt, ov_tok); None without pointer overrides) and the value-only row's tail (root-view
+  values) - the driver's rows of that leaf (`dynapi::LeafRows`); for a game without them the item is None. A game
+  with them refuses `simulate` without `rows=True` (RuntimeError): a head-only caller never drops a tail. The
+  reference tree (`mcts.py`) reads the same rows: `mcts.rows_of(info)` (None without), `mcts.leaf_row(g, viewer, rk,
+  opts)`.
+* **The Python driver** (`play.PyDriver`, its 'py' and 'rs' seats) sends every row kind with its tail and overrides,
+  batches and samples with the Rust driver's keys (`play.row_arrays`), and aborts a game whose row passes the limit
+  (`abort_reason` 'max_row_tokens', not over, no samples, `PyDriver.aborted_row_tokens`, one stderr line) - and so
+  its consumers: `zero.replay` (a replay of an aborted game gains `abort_reason`; a replay of before is unchanged),
+  `zero.parity` (`spec`, a stand-in reading every tail token and override, 6), `zero.targets quality`
+  (`search_many`).
+
 **Tests:** `crates/search/src/driver/tests/tail.rs` (the toy below through the driver: rows sorted and every override
 pointing at a token of its row, records and sample arrays, dense = sparse, the cache and the merged trees with tails,
-the limit, the lookahead's refusal, a game without tails has no array, the key properties), `tail.rs` and
-`toy_tail.rs`'s unit tests.
+the limit, a game without tails has no array, the key properties; the lookahead: its rows with tails and overrides,
+dedup on = off and the value rows sent = the distinct rows of a run without dedup - a key without the tail fails it,
+checked by mutation -, a lookahead seat's games dense = sparse, a lookahead row past the limit aborts its game),
+`tail.rs` and `toy_tail.rs`'s unit tests; `tests/test_tail_search.py` (the Python side, 6).
 
 ### 2.12 Sparse rows without full-row scans (`SearchGame::encode_sparse`; MTG Zero's Delver mirror, 2026-11-04)
 

@@ -215,13 +215,21 @@ def prior_positions(model, game, spec, n, seed=0, keep=0.15, device='cpu'):
 def search_many(games, ev, sims, seeds, c_puct=1.0, chance_k=0, noise=None):
     """One Rust search tree per game, `sims` simulations each, the leaves of all trees
     evaluated in one batch per round. noise = (alpha, eps): root Dirichlet noise once the root
-    is expanded (as self-play's full searches). -> the trees."""
+    is expanded (as self-play's full searches). A game with tail segments / pointer overrides (docs/search.md
+    2.15): the leaves' rows carry their tails and overrides (`SearchTree.simulate(rows=True)`); a leaf row past the
+    game's row limit raises (a position has no game to abort). -> the trees."""
+    from .mcts import rows_of
+    from .play import row_arrays
+    rk = rows_of(dict(games[0].info())) if games else None
     trees = [g.search_tree(True, int(s)) for g, s in zip(games, seeds)]
     for _ in range(sims):
         leaves = []
         for k, (g, t) in enumerate(zip(games, trees)):
-            r = t.simulate(g, c_puct, chance_k)
+            r = t.simulate(g, c_puct, chance_k, rows=True) if rk is not None else t.simulate(g, c_puct, chance_k)
             if r is not None:
+                if rk is not None and rk.over(r[4][0]) is not None:
+                    raise ValueError(f'max_row_tokens: a leaf row of position {k} has capacity {rk.capacity(r[4][0])} > '
+                                     f'{rk.limit} (docs/search.md 2.15)')
                 leaves.append((k, r))
         if not leaves:
             continue
@@ -229,8 +237,15 @@ def search_many(games, ev, sims, seeds, c_puct=1.0, chance_k=0, noise=None):
         off = np.zeros(len(acts) + 1, np.int32)
         off[1:] = np.cumsum([len(a) for a in acts])
         npl = np.asarray([games[k].n_players for k, _ in leaves], np.int32)
+        kw = {}
+        if rk is not None:
+            # (variable-length rows: the leaves' tails and overrides, as the evaluator takes them)
+            from .rows import Overrides, Tail
+            ra = row_arrays([r[4][:2] for _, r in leaves], rk)
+            kw = eval_kw(Tail.from_arrays(ra, rk.widths) if rk.widths else None,
+                         Overrides.from_arrays(ra) if rk.pointers else None)
         pri, val, mar = ev.evaluate(np.stack([r[1] for _, r in leaves]), npl, off,
-                                    np.concatenate([np.asarray(a, np.int32) for a in acts]))
+                                    np.concatenate([np.asarray(a, np.int32) for a in acts]), **kw)
         for b, (k, _) in enumerate(leaves):
             t = trees[k]
             was = t.root_expanded

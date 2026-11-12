@@ -24,6 +24,7 @@ use pyo3::types::{PyDict, PyList};
 use zero_search::driver::{noresign_pick, root_floor, sample_arrays_rows, view_pick, Batch, BranchCfg, DriverCfg, KeyKind, StartsCfg, LeafView, NnSeat, PolicyTarget, Record, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
 use zero_search::lookahead::{LookCfg, Outcome};
+use zero_search::tail::TailRow;
 use zero_search::{SearchGame, MAX_SEATS};
 
 /// For `engine_module!` (the game crate needs its own `pyo3` dependency too: the PyO3 macros
@@ -548,18 +549,11 @@ impl PyGame {
     /// (docs/search.md 1.4).
     fn encode_row<'py>(&self, py: Python<'py>, viewer: usize) -> PyResult<(Bound<'py, numpy::PyArray1<f32>>, Bound<'py, PyDict>)> {
         let (x, t) = self.g.encode_row(viewer);
-        let d = PyDict::new(py);
-        d.set_item("t_seg", t.seg.into_pyarray(py))?;
-        d.set_item("t_slot", t.slot.into_pyarray(py))?;
-        d.set_item("t_val", t.val.into_pyarray(py))?;
-        Ok((x.into_pyarray(py), d))
+        Ok((x.into_pyarray(py), tail_dict(py, t)?))
     }
     /// (ov_opt int32 [NO], ov_tok int64 [NO]): `viewer`'s pointer overrides against `legal()` (docs/search.md 2.15).
     fn option_overrides<'py>(&self, py: Python<'py>, viewer: usize) -> (Bound<'py, numpy::PyArray1<i32>>, Bound<'py, numpy::PyArray1<i64>>) {
-        let ov = self.g.option_overrides(viewer);
-        let opt: Vec<i32> = ov.iter().map(|o| o.0 as i32).collect();
-        let tok: Vec<i64> = ov.iter().map(|o| o.1).collect();
-        (opt.into_pyarray(py), tok.into_pyarray(py))
+        ov_arrays(py, &self.g.option_overrides(viewer))
     }
     fn export_state(&self) -> String {
         self.g.export_state()
@@ -572,6 +566,22 @@ impl PyGame {
     fn search_tree(&self, redet: bool, seed: u64) -> PyResult<PySearchTree> {
         Ok(PySearchTree { t: self.g.new_tree(redet, seed).map_err(verr)? })
     }
+}
+
+/// A sealed row tail as `Game.encode_row`'s dict {'t_seg' u16, 't_slot' u32, 't_val' f32} (docs/search.md 2.15).
+fn tail_dict(py: Python<'_>, t: TailRow) -> PyResult<Bound<'_, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("t_seg", t.seg.into_pyarray(py))?;
+    d.set_item("t_slot", t.slot.into_pyarray(py))?;
+    d.set_item("t_val", t.val.into_pyarray(py))?;
+    Ok(d)
+}
+
+/// A row's pointer overrides as `Game.option_overrides`' (ov_opt int32 [NO], ov_tok int64 [NO]).
+fn ov_arrays<'py>(py: Python<'py>, ov: &[(u32, i64)]) -> (Bound<'py, numpy::PyArray1<i32>>, Bound<'py, numpy::PyArray1<i64>>) {
+    let opt: Vec<i32> = ov.iter().map(|o| o.0 as i32).collect();
+    let tok: Vec<i64> = ov.iter().map(|o| o.1).collect();
+    (opt.into_pyarray(py), tok.into_pyarray(py))
 }
 
 impl PyGame {
@@ -604,10 +614,29 @@ impl PySearchTree {
     /// `root_view` (docs/search.md 3.6): a 4-tuple, the 4th the leaf's features from the tree's
     /// viewer (the root decider) when another seat decides it, else None; `expand` then takes the
     /// value and margin of those features (relative to the viewer), the priors of the decider's.
-    #[pyo3(signature = (game, c_puct, chance_k=0, margin_w=0.0, root_view=false))]
-    fn simulate<'py>(&mut self, py: Python<'py>, game: &PyGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool) -> PyResult<Option<Bound<'py, pyo3::types::PyTuple>>> {
-        match self.t.simulate(&*game.g, c_puct, chance_k, margin_w, root_view).map_err(rerr)? {
+    /// `rows` (docs/search.md 2.15): a 5-tuple (decider, features, legal actions, the viewer's features or None,
+    /// rows), `rows` None for a game without tail segments or pointer overrides, else (tail, ov, vtail): the
+    /// decider's row's tail {'t_seg', 't_slot', 't_val'} (`Game.encode_row`'s; None without tail segments), its
+    /// overrides (ov_opt int32, ov_tok int64) against the leaf's options (`Game.option_overrides`'; None without
+    /// pointer overrides) and the viewer's value-only row's tail (None without one). Required for a game with
+    /// them (RuntimeError otherwise: a head-only caller never drops them).
+    #[pyo3(signature = (game, c_puct, chance_k=0, margin_w=0.0, root_view=false, rows=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn simulate<'py>(&mut self, py: Python<'py>, game: &PyGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool, rows: bool) -> PyResult<Option<Bound<'py, pyo3::types::PyTuple>>> {
+        match self.t.simulate(&*game.g, c_puct, chance_k, margin_w, root_view, rows).map_err(rerr)? {
             None => Ok(None),
+            Some(l) if rows => {
+                let r: Option<PyObject> = match l.rows {
+                    None => None,
+                    Some(lr) => {
+                        let tail = lr.tail.map(|t| tail_dict(py, t)).transpose()?;
+                        let ov = lr.ov.map(|ov| ov_arrays(py, &ov));
+                        let vtail = lr.vtail.map(|t| tail_dict(py, t)).transpose()?;
+                        Some((tail, ov, vtail).into_pyobject(py)?.into_any().unbind())
+                    }
+                };
+                Ok(Some((l.player, l.x.into_pyarray(py), l.acts, l.vx.map(|v| v.into_pyarray(py)), r).into_pyobject(py)?))
+            }
             Some(l) if root_view => Ok(Some((l.player, l.x.into_pyarray(py), l.acts, l.vx.map(|v| v.into_pyarray(py))).into_pyobject(py)?)),
             Some(l) => Ok(Some((l.player, l.x.into_pyarray(py), l.acts).into_pyobject(py)?)),
         }
@@ -1358,7 +1387,9 @@ impl PyLookahead {
 
     /// The next round's rows - {x [b, F], opt_off, opt_action, player, n_players, extra} (a network
     /// batch as the driver's; `x` a view of an array the lookahead reuses: valid until the next
-    /// round) - or None when the decision is made.
+    /// round), with each row's tail (`t_off` [b + 1], `t_seg`, `t_slot`, `t_val`) for a game with tail segments
+    /// and its overrides (`ov_off` [b + 1], `ov_opt`, `ov_tok`) for one with pointer overrides (docs/search.md 2.4,
+    /// 2.15; a row past the game's row limit raises) - or None when the decision is made.
     fn next_batch<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         let l = &mut self.l;
         let Some(n) = py.allow_threads(|| l.step()).map_err(rerr)? else { return Ok(None) };
@@ -1383,6 +1414,19 @@ impl PyLookahead {
         a.set_item("player", r.player.to_vec().into_pyarray(py))?;
         a.set_item("n_players", r.n_players.to_vec().into_pyarray(py))?;
         a.set_item("extra", r.extra.to_vec().into_pyarray(py))?;
+        if !r.t_off.is_empty() {
+            // variable-length rows (docs/search.md 2.15; a game with tail segments only)
+            a.set_item("t_off", r.t_off.to_vec().into_pyarray(py))?;
+            a.set_item("t_seg", r.t_seg.to_vec().into_pyarray(py))?;
+            a.set_item("t_slot", r.t_slot.to_vec().into_pyarray(py))?;
+            a.set_item("t_val", r.t_val.to_vec().into_pyarray(py))?;
+        }
+        if !r.ov_off.is_empty() {
+            // (a game with pointer overrides only)
+            a.set_item("ov_off", r.ov_off.to_vec().into_pyarray(py))?;
+            a.set_item("ov_opt", r.ov_opt.to_vec().into_pyarray(py))?;
+            a.set_item("ov_tok", r.ov_tok.to_vec().into_pyarray(py))?;
+        }
         Ok(Some(a))
     }
 
@@ -1462,5 +1506,10 @@ impl PyLookahead {
     #[getter]
     fn belief(&self) -> Option<Vec<f32>> {
         self.l.belief()
+    }
+
+    /// The game's facts (`game_info_of`'s dict: its tail segments and pointer overrides name the rows' keys).
+    fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        info_dict(py, &self.l.info())
     }
 }

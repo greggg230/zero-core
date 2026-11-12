@@ -187,7 +187,7 @@ class RecordingDriver(PyDriver):
                 continue
             while True:
                 g = slot.game
-                if g.over or slot.steps >= self.max_steps:
+                if g.over or slot.steps >= self.max_steps or slot.abort:
                     finished.append(slot)
                     break
                 legal = g.legal()
@@ -271,7 +271,15 @@ class RecordingDriver(PyDriver):
         if seat.belief_tilt:
             kw = dict(belief_tilt=seat.belief_tilt, belief_clip=seat.belief_clip, belief_mix=seat.belief_mix)
         la = G.engine().Lookahead(slot.game, look, seed=slot.search_rng.getrandbits(63), lines=False, **kw)
-        LA.drive(la, self.look_ev[seat.key])
+        try:
+            LA.drive(la, self.look_ev[seat.key])
+        except RuntimeError as e:
+            if not str(e).startswith('max_row_tokens'):
+                raise
+            # (a lookahead row past the game's row limit: the game is aborted, as the Rust driver's lookahead seats -
+            # docs/search.md 2.15)
+            self._abort(slot, f'its lookahead row: {e}')
+            return
         r = la.result()
         opts = [[int(o['action']), round(float(o['mean']), 5), round(float(o['sd']), 5)] for o in r['options']]
         a, guarded = (a_mcts if r['outcome'] == 'mcts' else int(r['outcome'])), False
@@ -306,6 +314,10 @@ class RecordingDriver(PyDriver):
             'frames': slot.frames, 'result': [float(x) for x in g.result()] if over else None,
             'scores': [float(x) for x in g.scores()], 'rounds': int(g.rounds), 'over': bool(over)})
         self.replays[-1]['final'] = len(self.replays[-1]['states']) - 1
+        if slot.abort:
+            # (the driver aborted the game: a row past the game's max_row_tokens, docs/search.md 2.15 - not over,
+            # no result; a replay of before has no such key)
+            self.replays[-1]['abort_reason'] = slot.abort
 
 
 def default_aux_render(pred, state, seat, frame, top=12):

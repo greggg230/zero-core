@@ -35,6 +35,13 @@
   alternating), both searching with the same network and settings (and move rule): ~50% within
   error.
 
+Variable-length rows (a game with tail segments / pointer overrides, docs/search.md 2.15; `--game toy_tail`): both
+trees' leaves carry their rows' tails and overrides (`mcts.leaf_row`, `SearchTree.simulate(rows=True)`) and the
+stand-in `LinearEval` reads them (its value every tail token's floats, its priors each override and its target
+token's floats), so the statistics above compare the searches of the full rows; `rows_tv` the power check (the Rust
+tree fed its rows without their tails and overrides). `spec`: the positions' game spec (toy_tail: `{"items0": 9}`,
+every row with a tail).
+
   python -m zero.parity positions [--sims 128 --reps 32 --chance-k 0 --cq-c-scale 1.0]
   python -m zero.parity positions --game toy_team --players 4     (deferred leaves, teams of 2)
   python -m zero.parity forced [--k 4 --sims 96 --reps 24]         (root minimum visits)
@@ -59,26 +66,75 @@ from .protocol import MAX_SEATS
 
 class LinearEval:
     """Deterministic stand-in evaluator: priors = softmax(x Wp[:, acts]), value of the decider =
-    sigmoid(x wv), the rest split evenly; margin 0."""
+    sigmoid(x wv), the rest split evenly; margin 0. `tails` (a game's `info['tails']`; docs/search.md 2.15): it
+    takes each row's `tail` and `ov` too (`mcts.leaf_row`'s) - every tail token adds its floats . wt[seg] (scaled by
+    its slot) to the value's logit, every override adds wo[0] (the generic logit) or wo[1] + its target token's
+    floats . wt[seg] to its option's prior logit -, so a search that dropped any of them would differ. Its extra
+    weights are drawn after Wp and wv: without tails, the evaluator of before."""
 
-    def __init__(self, num_features, num_actions, seed=0, scale=1.0):
+    def __init__(self, num_features, num_actions, seed=0, scale=1.0, tails=None):
         r = np.random.default_rng(seed)
         self.Wp = r.normal(0, scale, (num_features, num_actions))
         self.wv = r.normal(0, scale, num_features)
+        self.widths = {int(t['seg']): int(t['width']) for t in tails or []}
+        if self.widths:
+            self.wt = {k: r.normal(0, 4 * scale, w) for k, w in sorted(self.widths.items())}
+            self.wo = r.normal(0, 4 * scale, 2)
 
-    def __call__(self, x, acts, n):
+    def _row(self, k, tail, ov):
+        """The row's tail and overrides -> (the value logit's term, each option's prior logit term)."""
+        v, lg, tok = 0.0, np.zeros(k), {}
+        if tail is not None:
+            o = 0
+            val = np.asarray(tail['t_val'], np.float64)
+            for s_, l_ in zip(np.asarray(tail['t_seg']).tolist(), np.asarray(tail['t_slot']).tolist()):
+                w = self.widths[s_]
+                d = float(val[o:o + w] @ self.wt[s_])
+                o += w
+                v += d * (1 + 0.25 * (l_ % 3))
+                tok[(s_, l_)] = d
+        if ov is not None:
+            for i, t in zip(np.asarray(ov[0]).tolist(), np.asarray(ov[1]).tolist()):
+                lg[i] += self.wo[0] if t < 0 else self.wo[1] + tok.get(((t >> 40) & 0xffff, t & 0xffffffff), 0.0)
+        return v, lg
+
+    def __call__(self, x, acts, n, tail=None, ov=None):
+        dv, dl = self._row(len(acts), tail, ov) if (tail is not None or ov is not None) else (0.0, 0.0)
         if len(acts):
-            lg = x.astype(np.float64) @ self.Wp[:, acts]
+            lg = x.astype(np.float64) @ self.Wp[:, acts] + dl
             e = np.exp(lg - lg.max())
             pri = (e / e.sum()).tolist()
         else:                                      # a deferred terminal: a value, no priors
             pri = []
-        w = 1.0 / (1.0 + math.exp(-float(x.astype(np.float64) @ self.wv)))
+        w = 1.0 / (1.0 + math.exp(-(float(x.astype(np.float64) @ self.wv) + dv)))
         v = [0.0] * MAX_SEATS
         v[0] = w
         for j in range(1, n):
             v[j] = (1 - w) / (n - 1)
         return pri, v, [0.0] * MAX_SEATS
+
+
+def stand_in(game, seed=1, scale=0.15):
+    """The parity checks' `LinearEval` of a game (its tail segments: it reads the rows' tails and overrides)."""
+    info = engine().game_info_of(game)
+    return LinearEval(info['num_features'], info['num_actions'], seed=seed, scale=scale, tails=info.get('tails') or None)
+
+
+def _rows(g):
+    """The game's variable-length rows (`mcts.rows_of`; None: none)."""
+    return mcts.rows_of(dict(g.info()))
+
+
+def _row_kw(rk, tail, ov):
+    """An evaluator call's row keywords: none without variable-length rows (the call of before)."""
+    if rk is None:
+        return {}
+    if rk.over(tail) is not None:
+        raise ValueError(f'max_row_tokens: a leaf row of capacity {rk.capacity(tail)} > {rk.limit} (docs/search.md 2.15)')
+    return {'tail': tail, 'ov': ov}
+
+
+_NO_OV = (np.zeros(0, np.int32), np.zeros(0, np.int64))
 
 
 def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0,
@@ -97,6 +153,7 @@ def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
         t.set_belief((np.asarray(belief[0], np.float32), belief[1], belief[2]), belief[3], g, rng)
     if gumbel is not None:
         t.set_gumbel(gumbel[0], sims, gumbel[1], gumbel[2], gumbel[3])
+    rk = _rows(g)
     for _ in range(sims):
         r = mcts.simulate(t, rng, c_puct, chance_k)
         if r is None:
@@ -104,10 +161,12 @@ def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
         node, leaf, path = r
         if worlds is not None and leaf.rounds == g.rounds:
             worlds.append(np.asarray(leaf.aux_target(t.viewer)))
-        pri, v, m = ev(leaf.encode(node.player), node.acts, g.n_players)
+        x, tl, ov = mcts.leaf_row(leaf, node.player, rk, opts=bool(node.acts))
+        pri, v, m = ev(x, node.acts, g.n_players, **_row_kw(rk, tl, ov))
         vp = None
         if root_view and node.player != t.viewer:
-            _, v, m = ev(leaf.encode(t.viewer), [], g.n_players)
+            vx, vt, _ = mcts.leaf_row(leaf, t.viewer, rk)
+            _, v, m = ev(vx, [], g.n_players, **_row_kw(rk, vt, None if rk is None or not rk.pointers else _NO_OV))
             vp = t.viewer
         mcts.expand_and_backup(node, path, pri, v, m, g.n_players, team=t.team, tree=t, value_player=vp)
     out = (np.asarray(t.root.Nv, float), mcts.root_win(t.root))
@@ -117,8 +176,10 @@ def search_py(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
 
 
 def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tree=False, root_min=0,
-              root_view=False, belief=None, gumbel=None):
-    """`search_py` with the Rust tree (`<package>._engine.SearchTree`; `gumbel`: as there)."""
+              root_view=False, belief=None, gumbel=None, drop_rows=False):
+    """`search_py` with the Rust tree (`<package>._engine.SearchTree`; `gumbel`: as there). `drop_rows`: its leaves'
+    rows evaluated without their tails and overrides (a power check of variable-length rows' parity)."""
+    rk = _rows(g)
     t = g.search_tree(redet, seed)
     t.set_root_min(root_min)
     if belief is not None:
@@ -126,13 +187,21 @@ def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
     if gumbel is not None:
         t.set_gumbel(gumbel[0], sims, list(gumbel[1]), gumbel[2], gumbel[3])
     for _ in range(sims):
-        r = t.simulate(g, c_puct, chance_k, root_view=True) if root_view else t.simulate(g, c_puct, chance_k)
+        if rk is not None:
+            r = t.simulate(g, c_puct, chance_k, root_view=root_view, rows=True)
+        else:
+            r = t.simulate(g, c_puct, chance_k, root_view=True) if root_view else t.simulate(g, c_puct, chance_k)
         if r is None:
             continue
         p, x, acts = r[:3]
-        pri, v, m = ev(x, acts, g.n_players)
+        rr = (None, None, None) if rk is None else r[4]
+        if rk is not None and drop_rows:
+            # (the power check: the rows without their tails and overrides)
+            et = {'t_seg': np.zeros(0, np.uint16), 't_slot': np.zeros(0, np.uint32), 't_val': np.zeros(0, np.float32)}                 if rk.widths else None
+            rr = (et, _NO_OV if rk.pointers else None, et)
+        pri, v, m = ev(x, acts, g.n_players, **_row_kw(rk, rr[0], rr[1]))
         if root_view and r[3] is not None:
-            _, v, m = ev(r[3], [], g.n_players)
+            _, v, m = ev(r[3], [], g.n_players, **_row_kw(rk, rr[2], None if rk is None or not rk.pointers else _NO_OV))
         t.expand(pri, v, m)
     out = (np.asarray(t.root_visits, float), t.root_win())
     if cq is not None:
@@ -140,15 +209,16 @@ def search_rs(g, ev, sims, seed, c_puct=1.0, chance_k=0, redet=True, cq=None, tr
     return out + (t,) if tree else out
 
 
-def sample_positions(game='toy', n=12, seed=0, players=2, depth=(5, 60)):
-    """Positions from random play at varying depths (the decider has >= 3 options)."""
+def sample_positions(game='toy', n=12, seed=0, players=2, depth=(5, 60), spec=None):
+    """Positions from random play at varying depths (the decider has >= 3 options); `spec`: the game's spec
+    (None: its default)."""
     E = engine()
     rng = random.Random(seed)
     out = []
     k = 0
     lo, hi = depth
     while len(out) < n:
-        g = E.Game(game, None, players, 10_000 + seed * 1000 + k)
+        g = E.Game(game, spec, players, 10_000 + seed * 1000 + k)
         k += 1
         depth = rng.randrange(lo, hi)
         for _ in range(depth):
@@ -165,16 +235,16 @@ def tv(a, b):
 
 
 def positions(game="toy", n=12, sims=96, reps=24, chance_k=0, c_puct_rs=1.0, seed=0, verbose=False, scale=0.15,
-              cq=(50.0, 1.0), players=2, depth=(5, 60)):
+              cq=(50.0, 1.0), players=2, depth=(5, 60), spec=None, drop_rows=False):
     """-> dict(tv_rs_py, tv_py_py, win_diff, tv_cq_rs_py, tv_cq_py_py) averaged over the
     positions (tv_cq_*: the same for the mean completed-Q targets with cq = (c_visit, c_scale)).
     `players` / `depth`: the positions' player count and random-play depth range (toy_team: 4
-    players, depth 0-8, so that searches reach its deferred terminals)."""
-    info = engine().game_info_of(game)
-    ev = LinearEval(info["num_features"], info["num_actions"], seed=1, scale=scale)
+    players, depth 0-8, so that searches reach its deferred terminals). `spec`: the game's (toy_tail: rows with
+    tails); `drop_rows`: the Rust tree's rows without their tails and overrides (a power check)."""
+    ev = stand_in(game, scale=scale)
     res = {'tv_rs_py': [], 'tv_py_py': [], 'win_diff': [], 'tv_cq_rs_py': [], 'tv_cq_py_py': []}
-    for i, g in enumerate(sample_positions(game, n, seed, players, depth)):
-        rs = [search_rs(g, ev, sims, 1000 + r, c_puct_rs, chance_k, cq=cq) for r in range(reps)]
+    for i, g in enumerate(sample_positions(game, n, seed, players, depth, spec)):
+        rs = [search_rs(g, ev, sims, 1000 + r, c_puct_rs, chance_k, cq=cq, drop_rows=drop_rows) for r in range(reps)]
         pa = [search_py(g, ev, sims, 2000 + r, 1.0, chance_k, cq=cq) for r in range(reps)]
         pb = [search_py(g, ev, sims, 3000 + r, 1.0, chance_k, cq=cq) for r in range(reps)]
         mr, ma, mb = (np.mean([x[0] for x in s], 0) for s in (rs, pa, pb))
@@ -285,7 +355,8 @@ def forced(game='toy', n=10, sims=96, reps=24, k=4, seed=0, scale=0.15, eps=0.00
                                                                  'reps': reps, 'k': k}
 
 
-def root_view(game='toy', n=10, sims=96, reps=24, seed=0, scale=0.15, cq=(50.0, 1.0), verbose=False, rs_view=True):
+def root_view(game='toy', n=10, sims=96, reps=24, seed=0, scale=0.15, cq=(50.0, 1.0), verbose=False, rs_view=True,
+              spec=None):
     """Root-view leaf values in both trees (docs/search.md 3.6): positions of random play, the
     stand-in `LinearEval` (its value reads the row's features: a viewer's features give another value
     than the decider's), both trees with `root_view`. -> dict: the TVs Rust-Python and Python-Python of
@@ -293,11 +364,10 @@ def root_view(game='toy', n=10, sims=96, reps=24, seed=0, scale=0.15, cq=(50.0, 
     decider's mean root win (`win_diff`), and the TV between the Python tree's root-view and
     mover-view searches (`tv_view`: what the setting changes), averaged over the positions.
     `rs_view` False: the Rust tree searches mover-view (a power check: its TV to Python is then about
-    `tv_view`)."""
-    info = engine().game_info_of(game)
-    ev = LinearEval(info['num_features'], info['num_actions'], seed=1, scale=scale)
+    `tv_view`). `spec`: the game's (toy_tail: the value-only rows carry tails too)."""
+    ev = stand_in(game, scale=scale)
     res = {k: [] for k in ('tv_rs_py', 'tv_py_py', 'tv_cq_rs_py', 'tv_cq_py_py', 'win_diff', 'tv_view')}
-    for i, g in enumerate(sample_positions(game, n, seed)):
+    for i, g in enumerate(sample_positions(game, n, seed, spec=spec)):
         rs = [search_rs(g, ev, sims, 1000 + r, cq=cq, root_view=rs_view) for r in range(reps)]
         pa = [search_py(g, ev, sims, 2000 + r, cq=cq, root_view=True) for r in range(reps)]
         pb = [search_py(g, ev, sims, 3000 + r, cq=cq, root_view=True) for r in range(reps)]
@@ -551,27 +621,31 @@ def select_formula(game='toy', n=8, sims=(4, 8, 24, 64), seed=0, rules=SELECT_RU
 
 
 def h2h(model, games=2000, sims=32, chance_k=0, conc=128, seed=0, game='toy', verbose=True, select='visits',
-        select_min_visits=0, select_c_visit=None, select_c_scale=None):
+        select_min_visits=0, select_c_visit=None, select_c_scale=None, spec=None, device='cpu'):
     """Rust-tree seat vs Python-tree seat, same network and move rule (and the 'cq' rule's own
-    transform select_c_visit / select_c_scale, None: 50 / 1), seats alternating. -> summary."""
+    transform select_c_visit / select_c_scale, None: 50 / 1), seats alternating; `spec` the game's (a game with
+    variable-length rows: both seats' leaves carry them, docs/search.md 2.15). -> summary."""
     import torch
     from .infer import NetEvaluator, drive
     from .net import load
     from .play import NNSeat, PyDriver
     torch.set_num_threads(1)
-    m, _ = load(model)
-    ev = NetEvaluator(m)
+    m, _ = load(model, device)
+    ev = NetEvaluator(m, device)
     kw = dict(select=select, select_min_visits=select_min_visits, select_c_visit=select_c_visit,
               select_c_scale=select_c_scale)
     rs = NNSeat('m', sims, chance_k=chance_k, impl='rs', **kw)
     py = NNSeat('m', sims, chance_k=chance_k, impl='py', **kw)
     t0 = time.time()
-    drv = PyDriver(game, games, lambda g: [rs, py] if g % 2 == 0 else [py, rs], concurrency=conc, seed=seed)
+    drv = PyDriver(game, games, lambda g: [rs, py] if g % 2 == 0 else [py, rs], spec=spec, concurrency=conc, seed=seed)
     drive(drv, {'m': ev})
     rows = drv.take_results()
     sc = [r['result'][0 if r['gid'] % 2 == 0 else 1] for r in rows]
     w = float(np.mean(sc))
     se = float(np.std(sc) / math.sqrt(len(sc)))
+    if any(r['aborted'] for r in rows):
+        raise RuntimeError(f'h2h: {sum(r["aborted"] for r in rows)} of {len(rows)} games aborted (a row past the game\'s '
+                           f'max_row_tokens, docs/search.md 2.15): not a parity sample')
     out = {'rust_score': round(w, 4), 'se': round(se, 4), 'ci95': round(1.96 * se, 4), 'games': len(rows),
            'sims': sims, 'chance_k': chance_k, 'seconds': round(time.time() - t0, 1), 'model': model,
            'select': rs.select_tag}
@@ -594,8 +668,13 @@ def main(argv=None):
     p.add_argument('--depth', type=int, nargs=2, default=[5, 60], help='random-play depth range of the positions')
     p.add_argument('--cq-c-visit', type=float, default=50.0)
     p.add_argument('--cq-c-scale', type=float, default=1.0)
+    p.add_argument('--spec', default=None, help='the game spec (JSON; toy_tail: \'{"items0": 9}\')')
+    p.add_argument('--drop-rows', action='store_true', help='the Rust tree without the rows\' tails (a power check)')
     h = sub.add_parser('h2h')
     h.add_argument('--model', required=True)
+    h.add_argument('--game', default='toy')
+    h.add_argument('--spec', default=None)
+    h.add_argument('--device', default='cpu')
     h.add_argument('--games', type=int, default=2000)
     h.add_argument('--sims', type=int, default=32)
     h.add_argument('--chance-k', type=int, default=0)
@@ -627,6 +706,7 @@ def main(argv=None):
     rv.add_argument('--positions', type=int, default=10)
     rv.add_argument('--sims', type=int, default=96)
     rv.add_argument('--reps', type=int, default=24)
+    rv.add_argument('--spec', default=None)
     gp = sub.add_parser('gumbel')
     gp.add_argument('--game', default='toy')
     gp.add_argument('--positions', type=int, default=10)
@@ -640,14 +720,14 @@ def main(argv=None):
     if a.cmd == 'positions':
         print(json.dumps(positions(a.game, n=a.positions, sims=a.sims, reps=a.reps, chance_k=a.chance_k,
                                    c_puct_rs=a.c_puct_rs, verbose=True, cq=(a.cq_c_visit, a.cq_c_scale),
-                                   players=a.players, depth=tuple(a.depth))))
+                                   players=a.players, depth=tuple(a.depth), spec=a.spec, drop_rows=a.drop_rows)))
     elif a.cmd == 'select':
         print(json.dumps(select_formula(a.game, n=a.positions)))
     elif a.cmd == 'belief':
         print(json.dumps(belief(n=a.positions, sims=a.sims, reps=a.reps, tilt=a.tilt, clip=a.clip, mix=a.mix,
                                 verbose=True)))
     elif a.cmd == 'root_view':
-        print(json.dumps(root_view(a.game, n=a.positions, sims=a.sims, reps=a.reps, verbose=True)))
+        print(json.dumps(root_view(a.game, n=a.positions, sims=a.sims, reps=a.reps, verbose=True, spec=a.spec)))
     elif a.cmd == 'gumbel':
         print(json.dumps(gumbel(a.game, n=a.positions, sims=a.sims, reps=a.reps, m=a.m, scale=a.scale, eps=a.eps,
                                 cq=(50.0, a.cq_c_scale), verbose=True)))
@@ -656,8 +736,9 @@ def main(argv=None):
         print(json.dumps(forced(a.game, n=a.positions, sims=a.sims, reps=a.reps, k=a.k, eps=a.eps,
                                 cq=(50.0, a.cq_c_scale), verbose=True)))
     else:
-        h2h(a.model, a.games, a.sims, a.chance_k, seed=a.seed, select=a.select, select_min_visits=a.select_min_visits,
-            select_c_visit=a.select_c_visit, select_c_scale=a.select_c_scale)
+        h2h(a.model, a.games, a.sims, a.chance_k, seed=a.seed, game=a.game, select=a.select,
+            select_min_visits=a.select_min_visits, select_c_visit=a.select_c_visit, select_c_scale=a.select_c_scale,
+            spec=a.spec, device=a.device)
 
 
 if __name__ == '__main__':

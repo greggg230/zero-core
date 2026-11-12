@@ -756,13 +756,17 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
 }
 
 /// A lookahead's rows into a key's leaf buffer (docs/search.md 3.9): one row each, `encode(viewer)`
-/// with its options (none: value-only), kind as given.
+/// with its options (none: value-only), kind as given; a game with tails / pointer overrides: each row's tail and
+/// overrides (`row_tail`, docs/search.md 2.15), a row past the row limit dropped and its capacity kept in `over`
+/// (the caller aborts the game).
 struct LeafSink<'a> {
     buf: &'a mut LeafBuf,
     gid: u32,
     n: usize,
     /// The last row's features may still be written (sealed at the next row, or on drop).
     open: bool,
+    /// A row passed the row limit: its capacity (the lookahead's step then failed; `look_over`).
+    over: Option<usize>,
 }
 
 impl Drop for LeafSink<'_> {
@@ -801,6 +805,30 @@ impl<G: SearchGame> RowSink<G> for LeafSink<'_> {
         b.extra.pop();
         b.unrow(G::NUM_FEATURES);
     }
+    fn row_tail(&mut self, tail: &TailBuf, ov: &[(u32, i64)]) -> Result<(), String> {
+        let b = &mut *self.buf;
+        if b.tails {
+            b.tb.set_sealed(tail.seg(), tail.slot(), tail.val());
+            if let Some(cap) = b.over() {
+                RowSink::<G>::pop_row(self);
+                self.over = Some(cap);
+                return Err(format!("max_row_tokens: a lookahead row of capacity {cap}"));
+            }
+        }
+        if b.pointers {
+            b.ov_open.clear();
+            b.ov_open.extend_from_slice(ov);
+        }
+        Ok(())
+    }
+}
+
+/// A lookahead's or value choice's row past the row limit (`LeafSink::over`, docs/search.md 2.15): the rows the
+/// game sent this step (from `local`) are taken back, the lookahead dropped and the game aborted.
+fn look_over<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, buf: &mut LeafBuf, local: u32, kind: &str, cap: usize) {
+    buf.truncate_rows(local as usize, G::NUM_FEATURES);
+    slot.look = None;
+    abort_game::<G>(cfg, slot, kind, cap);
 }
 
 /// The lookahead of seat `p`'s pending decision (docs/search.md 3.9): created at the decision's first
@@ -823,11 +851,16 @@ fn look_step<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, seat: &NnSeat, l
     }
     let buf = &mut bufs[seat.key as usize];
     let local = buf.len() as u32;
-    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false };
+    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false, over: None };
     let look = slot.look.as_mut().unwrap();
     let r = look.step(&mut sink, &mut slot.search_rng);
+    let over = sink.over;
     drop(sink);
     let busy = t0.elapsed().as_secs_f64();
+    if let Some(cap) = over {
+        look_over(&sh.cfg, slot, &mut bufs[seat.key as usize], local, "lookahead", cap);
+        return Ok(false);
+    }
     let r = r?;
     if let LookStep::Rows(_) = r {
         lock(&sh.counters.look).busy_s += busy;
@@ -873,10 +906,15 @@ fn value_choice_step<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize,
     }
     let buf = &mut bufs[seat.key as usize];
     let local = buf.len() as u32;
-    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false };
+    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false, over: None };
     let look = slot.look.as_mut().unwrap();
     let r = look.step(&mut sink, &mut slot.search_rng);
+    let over = sink.over;
     drop(sink);
+    if let Some(cap) = over {
+        look_over(cfg, slot, &mut bufs[seat.key as usize], local, "value choice", cap);
+        return Ok(false);
+    }
     if let LookStep::Rows(_) = r? {
         slot.pending = Some(Pending::Look { key: seat.key, local });
         return Ok(true);

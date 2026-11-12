@@ -298,24 +298,184 @@ fn a_row_over_the_limit_aborts_its_game() {
     assert!(Driver::<TailGame>::new(c).err().unwrap().contains("below the game's head tokens 5"));
 }
 
-#[test]
-fn the_lookahead_refuses_tail_rows() {
-    let mut s = seat(8, false);
-    s.look = Some(Box::new(crate::lookahead::LookCfg { plies: 1, worlds: 1, ..Default::default() }));
-    let mut d = Driver::<TailGame>::new(tcfg(s, 2, r#"{"items0": 9}"#)).unwrap();
-    let mut err = None;
+/// A lookahead's rows of one round with their tails and overrides (`RowSink`, docs/search.md 2.15).
+#[derive(Default)]
+struct LookRowsT {
+    x: Vec<f32>,
+    opts: Vec<Vec<u16>>,
+    kind: Vec<u8>,
+    tail: Vec<Vec<(u16, u32, Vec<f32>)>>,
+    ov: Vec<Vec<(u32, i64)>>,
+}
+
+impl crate::lookahead::RowSink<TailGame> for LookRowsT {
+    fn push_row(&mut self, _viewer: usize, opts: &[u16], kind: u8) -> &mut [f32] {
+        self.opts.push(opts.to_vec());
+        self.kind.push(kind);
+        self.tail.push(Vec::new());
+        self.ov.push(Vec::new());
+        let off = self.x.len();
+        self.x.resize(off + TF, 0.0);
+        &mut self.x[off..]
+    }
+    fn pop_row(&mut self) {
+        self.opts.pop();
+        self.kind.pop();
+        self.tail.pop();
+        self.ov.pop();
+        self.x.truncate(self.x.len() - TF);
+    }
+    fn row_tail(&mut self, tail: &crate::tail::TailBuf, ov: &[(u32, i64)]) -> Result<(), String> {
+        let mut off = 0;
+        let t = tail.seg().iter().zip(tail.slot()).map(|(&s, &l)| {
+            let w = width(s);
+            off += w;
+            (s, l, tail.val()[off - w..off].to_vec())
+        });
+        *self.tail.last_mut().unwrap() = t.collect();
+        *self.ov.last_mut().unwrap() = ov.to_vec();
+        Ok(())
+    }
+}
+
+/// The row echo of one row (`echo`'s formula): its value for the row's player and its priors.
+fn echo_row(x: &[f32], tail: &[(u16, u32, Vec<f32>)], ov: &[(u32, i64)], k: usize) -> (f32, Vec<f32>) {
+    let mut h: f32 = x.iter().enumerate().map(|(i, x)| x * ((i * 7 % 13) as f32 - 6.0)).sum();
+    for (s, l, f) in tail {
+        h += (*s as f32 * 1.7 + *l as f32 * 0.3) * f.iter().enumerate().map(|(i, x)| x * ((i * 5 % 11) as f32 - 5.0)).sum::<f32>();
+    }
+    for &(o, t) in ov {
+        h += o as f32 * 0.5 + (t & 0xff) as f32 * 0.25;
+    }
+    let mut p: Vec<f32> = (0..k).map(|i| if ov.iter().any(|o| o.0 as usize == i) { 2.0 } else { 1.0 }).collect();
+    let s: f32 = p.iter().sum();
+    p.iter_mut().for_each(|x| *x /= s);
+    (1.0 / (1.0 + (-h * 0.1).exp()), p)
+}
+
+/// A lookahead of a toy_tail position run to its decision against the row echo -> (each root option's mean, the
+/// stats, every round's rows).
+fn look_tail(settings: &str, spec: &str, seed: u64) -> (Vec<(u16, f64)>, crate::lookahead::LookStats, Vec<LookRowsT>) {
+    use crate::lookahead::{Answers, Look, LookCfg, Step};
+    let g = TailGame::new_game(&TailGame::parse_spec(spec).unwrap(), 2, seed).unwrap();
+    let p = g.to_move().unwrap();
+    let mut l = Look::new(LookCfg::parse(settings).unwrap(), &g, p, None, Vec::new(), vec![1, 2, 3, 4], false).unwrap();
+    let mut rng = Rng::new(0);
+    let mut rounds = Vec::new();
     loop {
-        match d.next_batch(true) {
-            Ok(Some(b)) => echo(&mut d, &b),
-            Ok(None) => break,
-            Err(e) => {
-                err = Some(e);
-                break;
+        let mut rows = LookRowsT::default();
+        match l.step(&mut rows, &mut rng).unwrap() {
+            Step::Done => break,
+            Step::Rows(n) => {
+                assert_eq!(n, rows.kind.len());
+                let (mut pri, mut val, mut opt_off) = (Vec::new(), vec![0.0; n * MAX_SEATS], vec![0i32]);
+                for i in 0..n {
+                    let (v, pr) = echo_row(&rows.x[i * TF..(i + 1) * TF], &rows.tail[i], &rows.ov[i], rows.opts[i].len());
+                    pri.extend(pr);
+                    opt_off.push(pri.len() as i32);
+                    val[i * MAX_SEATS] = v;
+                    val[i * MAX_SEATS + 1] = 1.0 - v;
+                }
+                l.answer(&Answers { base: 0, opt_off: &opt_off, priors: &pri, value: &val, aux: &[], aux_row: &[], aux_width: 0 }).unwrap();
+                rounds.push(rows);
             }
         }
     }
-    let e = err.expect("refused");
-    assert!(e.contains("lookahead: tail rows not supported yet"), "{e}");
+    let o = l.options().unwrap().into_iter().map(|o| (o.act, o.mean)).collect();
+    (o, l.stats().clone(), rounds)
+}
+
+/// The bits of a row (head, tail) as a key for exact comparisons.
+fn row_bits(x: &[f32], tail: &[(u16, u32, Vec<f32>)]) -> Vec<u32> {
+    let mut k: Vec<u32> = x.iter().map(|v| v.to_bits()).collect();
+    for (s, l, f) in tail {
+        k.extend([u32::MAX, *s as u32, *l]);
+        k.extend(f.iter().map(|v| v.to_bits()));
+    }
+    k
+}
+
+#[test]
+fn the_lookahead_carries_tail_rows_and_keys_them_exactly() {
+    // 9 items: every row has tail tokens; ADD's new items are tail tokens whose values differ by world, so leaves
+    // whose heads are equal differ in their tails only - a key that dropped the tail would share their values
+    for (settings, spec) in [(r#""plies": 2, "worlds": 4"#, r#"{"items0": 9}"#), (r#""plies": 3, "worlds": 4, "topk": 3"#, r#"{"items0": 6}"#), (r#""plies": 2, "worlds": 4, "mode": "world""#, r#"{"items0": 9}"#)] {
+        let (on, st_on, rounds) = look_tail(&format!("{{{settings}, \"dedup\": true}}"), spec, 5);
+        let (off, st_off, rounds_off) = look_tail(&format!("{{{settings}, \"dedup\": false}}"), spec, 5);
+        assert_eq!(on, off, "{settings}: the shared rows' values are their own rows' values");
+        assert!(st_on.value_dups > 0 && st_off.value_dups == 0, "{settings}");
+        let mut tails = 0;
+        for r in &rounds {
+            for i in 0..r.kind.len() {
+                let t = &r.tail[i];
+                tails += !t.is_empty() as usize;
+                for w in t.windows(2) {
+                    assert!((w[0].0, w[0].1) < (w[1].0, w[1].1), "sorted, unique");
+                }
+                let x = &r.x[i * TF..(i + 1) * TF];
+                assert!(r.ov[i].is_empty() || !r.opts[i].is_empty(), "overrides only on a row with options");
+                for &(o, tok) in &r.ov[i] {
+                    assert!((o as usize) < r.opts[i].len());
+                    let (s, c, l) = unpack_tok(tok);
+                    assert_eq!((s, c), (0, 0));
+                    if (l as usize) < HEAD {
+                        assert_eq!(x[8 + l as usize * W_ITEM], 1.0, "a present head slot");
+                    } else {
+                        assert!(t.iter().any(|z| z.0 == 0 && z.1 == l), "the target tail token is in the row");
+                    }
+                }
+            }
+        }
+        assert!(tails > 0, "{settings}: tail rows");
+        // exact dedup: the value rows sent with it are the distinct value rows (head and tail) of the run without it
+        let distinct = |rs: &[LookRowsT]| {
+            let mut v: Vec<Vec<u32>> = rs.iter().flat_map(|r| (0..r.kind.len()).filter(|&i| r.opts[i].is_empty()).map(move |i| row_bits(&r.x[i * TF..(i + 1) * TF], &r.tail[i]))).collect();
+            let n = v.len();
+            v.sort();
+            v.dedup();
+            (n, v.len())
+        };
+        let (sent, uniq) = distinct(&rounds);
+        assert_eq!(sent, uniq, "{settings}: no two value rows of the same observation sent");
+        let (_, uniq_off) = distinct(&rounds_off);
+        assert_eq!(sent, uniq_off, "{settings}: every distinct observation sent once");
+    }
+}
+
+#[test]
+fn a_lookahead_seat_plays_tail_games() {
+    let mut s = seat(8, false);
+    // (topk: prior rows with options, so overrides too)
+    s.look = Some(Box::new(crate::lookahead::LookCfg { plies: 2, worlds: 2, topk: 3, ..Default::default() }));
+    let mut out = Vec::new();
+    for sparse in [false, true] {
+        let mut c = tcfg(s.clone(), 4, r#"{"items0": 9, "max_moves": 10}"#);
+        c.sparse = sparse;
+        let mut d = Driver::<TailGame>::new(c).unwrap();
+        let (res, _, rows) = run_tail(&mut d);
+        assert_eq!(res.len(), 4);
+        assert!(res.iter().all(|r| r.over && !r.aborted), "the games end normally");
+        assert!(rows.iter().any(|r| !r.2.is_empty()) && rows.iter().any(|r| !r.3.is_empty()), "tail rows and overrides");
+        let st = d.stats();
+        assert!(st.look.decisions > 0 && st.tail_rows > 0, "{} {}", st.look.decisions, st.tail_rows);
+        out.push((res.iter().map(|r| (r.steps, r.scores.clone())).collect::<Vec<_>>(), rows));
+    }
+    assert_eq!(out[0], out[1], "dense and sparse batches: the same rows, the same games");
+}
+
+#[test]
+fn a_lookahead_row_over_the_limit_aborts_its_game() {
+    // 7 items: the root's row fits a limit of 8 (5 + 3 tail tokens), the lookahead's leaf after ADD 1 does not
+    let mut s = seat(8, false);
+    s.look = Some(Box::new(crate::lookahead::LookCfg { plies: 1, worlds: 1, ..Default::default() }));
+    let mut c = tcfg(s, 3, r#"{"items0": 7}"#);
+    c.max_row_tokens = Some(8);
+    let mut d = Driver::<TailGame>::new(c).unwrap();
+    let (res, _, rows) = run_tail(&mut d);
+    assert_eq!(res.len(), 3);
+    assert!(res.iter().all(|r| r.aborted && !r.over && r.abort_reason == Some("max_row_tokens")));
+    assert!(rows.iter().all(|r| 5 + r.2.len() <= 8), "no row over the limit is sent");
+    assert_eq!(d.stats().aborted_row_tokens, 3);
 }
 
 #[test]

@@ -5306,13 +5306,18 @@ section is the data path of lane X (shards, window, run, tools, remotes); 43.5-4
   `Run.shard_meta` (format v2 for a resolver game with tails) and `CoRun.loop` runs both games' `check_rows`;
   `zero/tools/distill.py` builds its window with the student's layout; `tools/selfplay_digest.py` hashes each
   record's tail and overrides (a game without them: the digest of before). `tools/reader_measure.py` (the toy's
-  reader study) reads with `encode` and a window without a layout: refused for a game with tails (R1, R11).
-* **Not yet for a game with tails** (refused loudly, never a silent drop): the Python search - `play.PyDriver` and
-  the `SearchTree` binding (its leaves are head-only rows) and `mcts.py`'s reference, which reads `encode` (R1) - and
-  so `zero.replay` (the AI replays, and every game package's replay publisher built on it), `zero.parity` (Rust vs
-  Python search parity, its `h2h` of a Rust and a Python seat) and `zero.targets quality` (reference searches through
-  `SearchTree`; `targets sharpness` uses the driver and works). The position API's `Lookahead` refuses tail rows
-  (R12, P1 of the plan).
+  reader study) is the toy's only (`games.info('toy')`, its features by `encode`): no game with tails reaches it, and
+  its window without a layout would refuse one (R1, R11).
+* **The Python search and the lookahead** (2026-11-12; until then refused for a game with tails: P1 of the plan, R12)
+  carry every row's tail and overrides, as the Rust driver's rows (docs/search.md 2.15, "The lookahead and the Python
+  search"): the `SearchTree` binding (`simulate(..., rows=True)`; refused without it for such a game), `mcts.py`'s
+  reference tree (`mcts.leaf_row`), `play.PyDriver` (batches, samples, the row limit aborting a game) - and so
+  `zero.replay` (the AI replays, every game package's replay publisher built on it, lookahead seats included),
+  `zero.parity` (positions, root views, its `h2h` of a Rust and a Python seat: `--game` / `--spec`) and `zero.targets
+  quality`; the lookahead in the driver (lookahead seats, value choices) and the position API `Lookahead`
+  (`next_batch()`'s `t_*` / `ov_*`, `info()`; `zero.lookahead.drive` / `evaluate_position` pass them to the
+  evaluator), its dedup and information-set keys covering them (K3). An evaluator given to the position API or to
+  `drive` must take `tail=` / `ov=` (`NetEvaluator.evaluate` does).
 
 **Off by default / byte identity.** Everything above is keyed on the game declaring tail segments or pointer
 overrides (and `allow_draft_layout` only reads a `draft` key no layout of before has): Glass Road, Caverna, Kingdom
@@ -5323,13 +5328,19 @@ shards are written byte for byte as before (`x_version` 1 or dense). config.json
 mostly none; a hand past 16 cards is ~4% of Delver states), their key mixing, a CSR per batch assembled serially
 (rows without a tail cost an offset), float16 tail floats in shards.
 
-**Tests and checks.** `tests/test_tail_rows.py` (13: the bindings, R1, the tree and lookahead refusals, the
+**Tests and checks.** `tests/test_tail_rows.py` (12: the bindings, R1, a head-only caller of a tree refused, the
 containers, batches / samples / records / take_rows / concat carrying the rows exactly, the cache with sparse batches,
 the limit, games without rows unchanged, R15, R6, the remote split), `tests/test_tail_shards.py` (11: v2 round trip,
 R7-R11, convert, the finite guard, the window's five loads and its batches incl. the static axis and the resolved
 overrides, distill / held-out / bench feeding the rows, v1 shards unchanged), `tests/test_tail_loop.py` (3: toy_tail
 through the run's own self-play phase - synchronous and threaded writer, the same shards - into the window's
-batches, an aborted game, the run's refusals); the Rust tests of docs/search.md 2.15.
+batches, an aborted game, the run's refusals), `tests/test_tail_search.py` (12: the tree binding's leaf rows = the
+game's own and the reference tree's; Rust-Python parity on toy_tail with a stand-in reading every tail token and
+override, and its power check; games without chance identical in both trees, byte for byte, every row and the value-only
+rows; the Python driver's batches and samples - every row's tail its own state's, every pointer in its row -; its
+row limit, at the first row and mid-search; games without rows unchanged; `zero.replay` with a token network, a
+lookahead seat too; the position API's rows and its limit; `targets quality` and `parity h2h` on toy_tail); the Rust
+tests of docs/search.md 2.15.
 
 **Measured** (the desktop, 2026-11-11, other lanes' builds and tests on the CPU). Byte identity: `tools/check_checkpoint_compat.py
 --package zero --game toy` against f9ca5c3 (the base) - `--net random`, `--net uniform` and spec `{"food": [3, 1]}` -
