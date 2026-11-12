@@ -350,6 +350,11 @@ DEFAULTS = dict(
     # network batches evaluated concurrently on this many Python threads (CPU: small networks
     # whose ops cannot keep the cores busy; give the driver as many `groups`); 1 = inline
     infer_workers=1,
+    # infer_token_chunks N > 1 = a token network's CUDA graphs run each batch as at most N chunks of its rows
+    # sorted by their token counts, each padded to its own longest row instead of the batch's (docs/az.md 43.11):
+    # the same rows, their answers moved by float32 rounding (a row's outputs depend on its batch's shape). 0 / 1 =
+    # each batch whole, as before
+    infer_token_chunks=0,
     # sparse 1 = the run's drivers (self-play and matches) send sparse network batches (each row's
     # non-zero features, DriverCfg::sparse, docs/search.md 2.2): the same rows, games and samples; a
     # token network's CUDA graphs scatter them on the device instead of the host copying the dense
@@ -631,7 +636,8 @@ class Run:
 
     def evaluator(self, path):
         m, _ = load(path, self.cfg['infer_device'], game=self.cfg['game'])
-        return NetEvaluator(m, self.cfg['infer_device'], workers=self.cfg.get('infer_workers', 1))
+        return NetEvaluator(m, self.cfg['infer_device'], workers=self.cfg.get('infer_workers', 1),
+                            token_chunks=self.cfg.get('infer_token_chunks', 0))
 
     def nn_seat(self, key, sims, selfplay=False):
         """A network seat at the run's settings: self-play's, or every evaluation's (no noise, no

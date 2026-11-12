@@ -2026,7 +2026,8 @@ class Worker:
         m, _ = load(os.path.join(self.rdir, model), c['infer_device'], game=self.test.get('load_game') or c['game'])
         if self.drv is None:
             R = Run(self.rdir, c)
-            self.evr = NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1))
+            self.evr = NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1),
+                                    token_chunks=c.get('infer_token_chunks', 0))
             seat = R.nn_seat('m', c['sims'], selfplay=True)
             # (a list of hosts, docs/az.md 34: each host's workers K play other games than another host's K)
             seed = int(c['seed']) * 7919 + it + 7_777_777 * (self.k + 1) + int(self.sp.get('seed_salt') or 0)

@@ -262,3 +262,78 @@ def test_the_graphs_refuse_bad_tails_and_overrides():
         old.evaluate(d['x'], d['n_players'], d['opt_off'], d['opt_action'], tail=tl)
     with pytest.raises(ValueError):
         old.fast.launch(d['x'], d['n_players'], d['opt_off'], d['opt_action'], tail=tl)
+
+
+def dense_lb(d, net):
+    arrays = {'x': d['x'], 'player': np.zeros(len(d['x']), np.int64), 'n_players': d['n_players'],
+              'opt_off': d['opt_off'], 'opt_action': d['opt_action'], 'extra': d['extra']}
+    return leaf_batch(arrays, d, net)
+
+
+@cuda
+def test_the_transfers_beside_the_graphs():
+    """docs/az.md 43.11: each launch's uploads on a copy stream into its buffer set's own staging, its outputs copied
+    out of the graph's and downloaded on a third stream, the input rows zeroed again only where the last sparse batch
+    wrote them. Five launches in flight, sparse and dense mixed (a dense batch leaves the rows written everywhere: the
+    next sparse one zeroes them whole), two of the same graph: each batch's answers are those of the batch alone,
+    bit for bit, and a sparse batch's those of its dense rows."""
+    net = gated_net(seed=21, theta=(0.4, 0.0)).cuda()
+    ev = NetEvaluator(net, 'cuda', graphs=True)
+    ds = [with_values(toy_batch(B, 30 + k, p_tail=0.5, p_mark=0.5, p_offer=0.4), 30 + k)
+          for k, B in enumerate((70, 9, 130, 64, 70))]
+    lbs = [sparse_lb(d, net) if k == 's' else dense_lb(d, net) for d, k in zip(ds, 'sdsss')]
+    alone = [NetEvaluator(net, 'cuda', graphs=True)(lb) for lb in lbs]
+    for _ in range(2):
+        hs = [ev.launch(lb) for lb in lbs]
+        for want, h in zip(alone, hs):
+            assert all(np.array_equal(a, b) for a, b in zip(want, ev.result(h)))
+    for d, lb, want in zip(ds, lbs, alone):
+        assert all(np.array_equal(a, b) for a, b in zip(evaluate(ev, d, net), want))     # dense rows: the same
+    assert ev.fast.streams is not None and len(ev.fast.slots) + len(ev.fast.sslots) >= 5
+
+
+@cuda
+def test_length_sorted_chunks_are_opt_in(monkeypatch):
+    """`token_chunks` (the run setting infer_token_chunks, docs/az.md 43.11; default: the batch whole): a batch's rows
+    sorted by their token counts and cut into chunks of whole ROW_STEP rows, each through its own graph - each
+    chunk's answers those of its rows as a batch of their own, bit for bit; the batch's within float32 rounding of
+    the batch whole (priors, values, margins, the belief rows' auxiliary predictions, value-only rows), dense and
+    sparse alike; the cut only when it saves (`chunk_rows`)."""
+    from zero.infer import CHUNK_FIXED, chunk_rows
+    assert NetEvaluator(gated_net().cuda(), 'cuda', graphs=True).fast.chunks == 1
+    assert chunk_rows([5] * 300, 2) is None                                            # equal rows: no cut
+    cnt = np.array([3] * 150 + [40] * 10)
+    parts = chunk_rows(cnt, 2)
+    assert parts is not None and [len(p) for p in parts] == [128, 32] and set(np.concatenate(parts)) == set(range(160))
+    assert chunk_rows(cnt, 1) is None and CHUNK_FIXED > 0
+    lay = dict(TOY_GATED, max_row_tokens=4096)
+    net = gated_net(lay, 23, theta=(0.5,)).cuda()
+    one = NetEvaluator(net, 'cuda', graphs=True)
+    ch = NetEvaluator(net, 'cuda', graphs=True, token_chunks=3)
+    d = with_values(toy_batch(150, 24, p_tail=0.5, p_mark=0.5), 24)
+    d = _long_rows(d, list(range(0, 150, 9)), 25)                   # (a few long rows: a cut that saves)
+    want = evaluate(one, d, net)
+    got = evaluate(ch, d, net)
+    assert ch.fast.chunked == 1 and close(want, got, 2e-5) and len(got) == 4
+    assert all(np.array_equal(a, b) for a, b in zip(ch(sparse_lb(d, net)), got))                   # sparse: the same
+    # each chunk: its rows alone
+    cnt = infer.token_presence(d['x'], net.present_index()).sum(1) + np.diff(d['t_off'])
+    for rows in chunk_rows(cnt, 3):
+        sub = _take(d, rows, net)
+        alone = evaluate(one, sub, net)
+        off = d['opt_off']
+        oi = np.concatenate([np.arange(off[r], off[r + 1]) for r in rows])
+        belief = np.flatnonzero(d['extra'] == ROW_BELIEF)
+        assert np.array_equal(got[0][oi], alone[0]) and np.array_equal(got[1][rows], alone[1])
+        assert np.array_equal(got[2][rows], alone[2])
+        assert np.array_equal(got[3][np.isin(belief, rows)], alone[3])
+
+
+def _take(d, rows, net):
+    """Rows `rows` of a toy batch `d` (features, options, tail, overrides, kinds)."""
+    tl, ov = tails(net, d)
+    tt, ov = tl.take(rows), ov.take(rows)
+    off, act = take_options(d['opt_off'], d['opt_action'], rows)
+    return dict(d, x=d['x'][rows], n_players=np.asarray(d['n_players'])[rows], opt_off=off, opt_action=act,
+                extra=d['extra'][rows], t_off=tt.off, t_seg=tt.seg, t_slot=tt.slot, t_val=tt.val,
+                ov_off=ov.off, ov_opt=ov.opt, ov_tok=ov.tok)
