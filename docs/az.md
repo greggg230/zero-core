@@ -5317,3 +5317,9 @@ R7-R11, convert, the finite guard, the window's five loads and its batches incl.
 overrides, distill / held-out / bench feeding the rows, v1 shards unchanged), `tests/test_tail_loop.py` (3: toy_tail
 through the run's own self-play phase - synchronous and threaded writer, the same shards - into the window's
 batches, an aborted game, the run's refusals); the Rust tests of docs/search.md 2.15.
+
+**Measured** (the desktop, 2026-11-11, other lanes' builds and tests on the CPU). Byte identity: `tools/check_checkpoint_compat.py
+--package zero --game toy` against f9ca5c3 (the base) - `--net random`, `--net uniform` and spec `{"food": [3, 1]}` -
+identical records and results (visits, cq, vs random). toy_tail, 64 self-play games (32 / 8 sims, a row echo
+evaluator, sparse batches): items0 3 - 33,687 rows, 59% with a tail, 2.2 tokens per such row, at most 8, none
+aborted, 0.8 s; items0 12 - 34,288 rows, 64%, 3.0, at most 13, 0.9 s.

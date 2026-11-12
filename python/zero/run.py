@@ -798,7 +798,7 @@ class Run:
         self.cache_metrics(out, st, st0)
         self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results)
-        self.tail_metrics(it, out, st, st0)
+        self.tail_metrics(it, out, st, st0, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -892,11 +892,12 @@ class Run:
             self.log(f'iter {it} WARNING: selfplay_infoset_merge is on but the merged trees made no link '
                      f'({leaves} leaves): nothing was merged (docs/search.md 3.16)')
 
-    def tail_metrics(self, it, out, st, st0, remote=None):
+    def tail_metrics(self, it, out, st, st0, results=None):
         """Self-play's variable-length rows (docs/az.md 43.3), only for a game with tail segments (the metrics of
         before otherwise): `tail` = this machine's driver's network rows sent with a tail (rows), their tail tokens
-        (tokens), the most in one row so far (max), and the games aborted by the row limit (aborted_row_tokens: never
-        a truncated row) - plus the remote's (`remote`: its counts) -, logged when a game was aborted."""
+        (tokens), the most in one row so far (max), and the games aborted by the row limit (aborted_row_tokens: from
+        the result rows `results` - every source's, a remote's too - else the driver's count; never a truncated row),
+        logged when a game was aborted."""
         if 'tail_rows' not in st:
             return
 
@@ -904,11 +905,8 @@ class Run:
             return st.get(k, 0) - ((st0 or {}).get(k, 0))
         out['tail'] = {'rows': d('tail_rows'), 'tokens': d('tail_tokens'), 'max': st.get('tail_max', 0),
                        'aborted_row_tokens': d('aborted_row_tokens')}
-        if remote:
-            for k in ('rows', 'tokens', 'aborted_row_tokens'):
-                out['tail'][k] += int(remote.get(k, 0))
-            out['tail']['max'] = max(out['tail']['max'], int(remote.get('max', 0)))
-            out['tail']['remote'] = dict(remote)
+        if results is not None:
+            out['tail']['aborted_row_tokens'] = sum(1 for r in results if r.get('abort_reason') == 'max_row_tokens')
         if out['tail']['aborted_row_tokens']:
             self.log(f'iter {it}: {out["tail"]["aborted_row_tokens"]} game(s) aborted by max_row_tokens '
                      f'{self.info.get("max_row_tokens")} (counted, no samples; docs/search.md 2.15)')
@@ -1102,6 +1100,7 @@ class Run:
         self.cache_metrics(out, st, st0)
         self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results, rem.pop('resign', None))
+        self.tail_metrics(it, out, st, st0, results)   # (this machine's driver; every source's aborted games)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],
