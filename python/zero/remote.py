@@ -339,7 +339,10 @@ class RemoteEval:
     def _ship_inputs(self, it):
         """The game package's inputs of this evaluation (`GamePackage.remote_eval_inputs`, docs/az.md 40): each file
         of the run put at the same path in the mirror, again whenever its size or modification time changed since
-        this session put it. A missing file fails the evaluation (RuntimeError: logged, retried)."""
+        this session put it. A missing file fails the evaluation (RuntimeError: logged, retried). A package that
+        registers no inputs reads nothing here (`_ship` as before the hook)."""
+        if not package.active().remote_eval_inputs:
+            return
         rels = package.active().remote_eval_inputs_of(self.R.cfg['game'], self.R, it)
         if not rels:
             return

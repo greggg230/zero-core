@@ -5260,7 +5260,9 @@ games in flight - a new driver per change would drop them; (3) **a remote evalua
 ### 40.3 Off by default
 
 A package declaring none of the three: nothing is asked or shipped - `selfplay_spec` is the run's spec, the drivers are
-made exactly as before (`spec=None`), `set_spec` is never called. With a hook that answers None the same. A package's
+made exactly as before (`spec=None`), `set_spec` is never called, and `RemoteEval._ship` reads no more of the run's
+settings than before (a package with no `remote_eval_inputs` returns before reading `game`: `test_select.py`'s
+`test_remote_ships_raw_offsets` ships with a settings dict that has none). With a hook that answers None the same. A package's
 settings add keys to config.json and nothing else. The driver's spec is read through a lock once per game started:
 the same games (the toy's golden self-play records and MTG Zero's checkpoint compatibility check, its ENGINE.md 112).
 
