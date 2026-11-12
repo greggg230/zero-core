@@ -38,8 +38,9 @@ pub const INFLIGHT: usize = 2;
 
 #[derive(Clone, Debug)]
 pub enum EvalKind {
-    /// A `zero-onnx/1` graph through ONNX Runtime.
-    Onnx { model: PathBuf, ort: OrtCfg, sha256: Option<String> },
+    /// A `zero-onnx/1` graph through ONNX Runtime; `reference`: its checkpoint's reference set, answered
+    /// before the first real batch (the per-machine self-test, `selftest`).
+    Onnx { model: PathBuf, ort: OrtCfg, sha256: Option<String>, reference: Option<PathBuf> },
     /// `infer.UniformEvaluator` (tests and the plumbing gate).
     Uniform,
 }
@@ -75,6 +76,8 @@ pub struct Checkpoint {
     pub gen: u32,
     pub model: PathBuf,
     pub sha256: Option<String>,
+    /// Its reference set (the self-test runs before the new network answers a batch).
+    pub reference: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -172,6 +175,8 @@ pub struct Progress {
     pub wall_s: f64,
     pub provider: String,
     pub finished_gids: Vec<u32>,
+    /// The last self-test's largest difference.
+    pub selftest_max_abs: Option<f64>,
 }
 
 impl Progress {
@@ -186,6 +191,7 @@ impl Progress {
             "yields": self.yields, "yield_ms_max": (self.yield_ms_max * 10.0).round() / 10.0,
             "rows": self.rows, "shards": self.shards, "sims": self.sims, "games_started": self.started,
             "infer_rows": self.infer_rows, "wall_s": (self.wall_s * 10.0).round() / 10.0,
+            "selftest_max_abs": self.selftest_max_abs.map(|m| if m.is_finite() { json!(m) } else { json!("inf") }),
             "leaves_per_s": if self.wall_s > 0.0 { ((self.leaves as f64 / self.wall_s) * 10.0).round() / 10.0 } else { 0.0 },
         })
     }
@@ -293,13 +299,43 @@ pub fn ranges(gids: &[u32]) -> Vec<(u32, u32)> {
     out
 }
 
-fn build_eval(kind: &EvalKind, want: &Expect) -> Result<Box<dyn Evaluator>, String> {
+/// The job's evaluator; a network with a reference set first passes the self-test (`selftest`: the
+/// event, and an error - the job's end - if it fails: a worker never plays with an evaluator that
+/// doesn't answer as torch does).
+fn build_eval(kind: &EvalKind, want: &Expect, sink: &dyn Sink, progress: &Mutex<Progress>) -> Result<Box<dyn Evaluator>, String> {
     Ok(match kind {
         EvalKind::Uniform => Box::new(Uniform),
-        EvalKind::Onnx { model, ort, sha256 } => {
+        EvalKind::Onnx { model, ort, sha256, reference } => {
             let mut w = want.clone();
             w.sha256 = sha256.clone();
-            Box::new(OrtEvaluator::load(model, ort.clone(), &w)?)
+            let mut ev = OrtEvaluator::load(model, ort.clone(), &w)?;
+            match reference {
+                Some(r) => {
+                    let t0 = Instant::now();
+                    let set = crate::selftest::load(r)?;
+                    crate::selftest::check_meta(&set, &w, &ev.meta)?;
+                    let st = crate::selftest::run(&mut ev, &set)?;
+                    // (the self-test's batches are not the job's)
+                    ev.calls = 0;
+                    ev.rows = 0;
+                    ev.run_s = 0.0;
+                    ev.batch_ms.clear();
+                    let max_abs = if st.max_abs.is_finite() { json!(st.max_abs) } else { json!("inf") };
+                    sink.event(json!({"ev": "selftest", "provider": "cpu", "max_abs": max_abs, "ok": st.ok, "rows": st.rows,
+                                      "items": {"priors": st.items[0], "value": st.items[1], "margin": st.items[2], "aux": st.items[3]},
+                                      "seconds": (t0.elapsed().as_secs_f64() * 1000.0).round() / 1000.0}));
+                    progress.lock().unwrap().selftest_max_abs = Some(st.max_abs);
+                    if !st.ok {
+                        return Err(format!(
+                            "selftest failed: the network's answers on this machine differ from torch's by {:e} (> {:e}; priors {:e}, value {:e}, margin {:e}, aux {:e}) on {} reference rows ({}): not playing with this evaluator",
+                            st.max_abs, crate::selftest::TOL, st.items[0], st.items[1], st.items[2], st.items[3], st.rows, r.display()
+                        ));
+                    }
+                    sink.log(&format!("selftest passed: max abs {:e} on {} rows ({})", st.max_abs, st.rows, r.display()));
+                }
+                None => sink.log("no reference set: the self-test is skipped"),
+            }
+            Box::new(ev)
         }
     })
 }
@@ -607,7 +643,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let cfg = job_driver_cfg(game, job)?;
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
     let want = Expect { game: info.name.to_string(), features: info.num_features, actions: info.num_actions, aux_width: info.aux.iter().map(|a| a.1).sum(), belief, sha256: None };
-    let ev = build_eval(&job.eval, &want)?;
+    let ev = build_eval(&job.eval, &want, sink, &progress)?;
     sink.log(&format!("job {}: {} games from gid {}, seed {}, net {}; driver: conc {}, threads {}, groups {}, sparse; evaluator: {}", job.lease_id, job.games, job.gid_base, job.seed, job.net, cfg.concurrency, cfg.threads, cfg.groups, ev.describe()));
     {
         let mut p = progress.lock().unwrap();
@@ -649,7 +685,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
                 let new = build_eval(&EvalKind::Onnx { model: c.model.clone(), ort: match &r.job.eval {
                     EvalKind::Onnx { ort, .. } => ort.clone(),
                     EvalKind::Uniform => return Err("checkpoint: a uniform-evaluator job has no network to switch".into()),
-                }, sha256: c.sha256.clone() }, &r.want)?;
+                }, sha256: c.sha256.clone(), reference: c.reference.clone() }, &r.want, r.sink, &r.progress)?;
                 let (t, rx) = channel();
                 r.link.tx.send(Req::Swap(new, t)).map_err(|_| "the evaluator thread is gone".to_string())?;
                 let _ = rx.recv();

@@ -94,10 +94,69 @@ pub struct OrtCfg {
 
 static ENV: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
 
+/// The MSVC runtime ONNX Runtime's Windows build imports (msvcp140, msvcp140_1, vcruntime140,
+/// vcruntime140_1), in load order (each after what it imports).
+pub const MSVC_RUNTIME: &[&str] = &["vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll"];
+
+/// Windows: the MSVC runtime DLLs found next to the ONNX Runtime library (a runtime pack's app-local
+/// copies) loaded first, by full path, so ONNX Runtime binds to them and not to whatever older copy the
+/// PC's system directory holds (an ONNX Runtime built with toolset 14.4x crashes on an older
+/// msvcp140's `_Mtx_lock`). The worker itself links the CRT statically (`+crt-static`), so nothing has
+/// loaded another copy before. -> the files loaded.
+#[cfg(windows)]
+fn preload_msvc_runtime(dir: &Path) -> Result<Vec<String>, String> {
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
+        fn GetLastError() -> u32;
+    }
+    let mut out = Vec::new();
+    for n in MSVC_RUNTIME {
+        let p = dir.join(n);
+        if !p.is_file() {
+            continue;
+        }
+        let w: Vec<u16> = p.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
+        if unsafe { LoadLibraryW(w.as_ptr()) }.is_null() {
+            return Err(format!("{}: LoadLibrary failed (error {})", p.display(), unsafe { GetLastError() }));
+        }
+        out.push(p.display().to_string());
+    }
+    Ok(out)
+}
+
+/// The full path of a loaded module, by its file name (Windows; else None).
+pub fn module_path(name: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+            fn GetModuleFileNameW(h: *mut core::ffi::c_void, buf: *mut u16, n: u32) -> u32;
+        }
+        let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        let h = unsafe { GetModuleHandleW(w.as_ptr()) };
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; 1024];
+        let n = unsafe { GetModuleFileNameW(h, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        (n > 0).then(|| String::from_utf16_lossy(&buf[..n]))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        None
+    }
+}
+
 /// The process's ONNX Runtime environment, the library loaded from `dylib` (once; a second call with
-/// another library is an error).
+/// another library is an error). On Windows the MSVC runtime next to it is loaded first
+/// (`preload_msvc_runtime`).
 pub fn ort_env(dylib: &Path) -> Result<&'static ort::environment::Environment, String> {
     let r = ENV.get_or_init(|| {
+        #[cfg(windows)]
+        if let Some(d) = dylib.parent().filter(|d| !d.as_os_str().is_empty()) {
+            preload_msvc_runtime(d)?;
+        }
         let b = ort::init_from(dylib).map_err(|e| format!("ONNX Runtime {}: {e}", dylib.display()))?;
         b.with_name("zero-worker").build().map_err(|e| format!("ONNX Runtime environment: {e}"))
     });

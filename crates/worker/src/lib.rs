@@ -16,13 +16,18 @@
 //!   and the uniform evaluator;
 //! * `job`: a self-play job's loop (the remote worker's), its control (yield / resume / finish / quit /
 //!   checkpoint);
-//! * `shard` / `npz`: zero-core's shard format; `proto`: the agent<->worker protocol `aw/1` and the CLI.
+//! * `shard` / `npz`: zero-core's shard format; `proto`: the agent<->worker protocol `aw/1` and the CLI;
+//! * `fuzz`: fuzz jobs - a game's fuzz loops over a lease's seeds in supervised chunk processes
+//!   (the game registers a [`fuzz::FuzzGame`]: `zero_worker::main_with`);
+//! * `selftest`: the per-machine check of a network's answers against torch's (`reference.npz`).
 pub mod classify;
 pub mod eval;
+pub mod fuzz;
 pub mod job;
 pub mod npz;
 pub mod proto;
 pub mod pyjson;
+pub mod selftest;
 pub mod settings;
 pub mod shard;
 
@@ -47,8 +52,37 @@ impl GameEntry {
 pub const AW: u32 = 1;
 pub const ZERO_ONNX: &[u32] = &[1];
 
-/// The worker binary's entry point: `args` from the command line -> the exit status.
+/// What a worker binary runs: its games' self-play (and later eval) jobs, and its game's fuzz loops.
+pub struct Worker {
+    pub games: &'static [GameEntry],
+    /// The game repo (`hello`'s `game`, e.g. 'mtg').
+    pub repo: &'static str,
+    /// Self-play jobs (a fuzz-profile build leaves them out: kinds `["fuzz"]`).
+    pub selfplay: bool,
+    pub fuzz: Option<&'static dyn fuzz::FuzzGame>,
+}
+
+impl Worker {
+    /// The job kinds `hello` announces.
+    pub fn kinds(&self) -> Vec<&'static str> {
+        let mut k = Vec::new();
+        if self.selfplay {
+            k.push("selfplay");
+        }
+        if self.fuzz.is_some() {
+            k.push("fuzz");
+        }
+        k
+    }
+}
+
+/// The worker binary's entry point (self-play only): `args` from the command line -> the exit status.
 pub fn main(games: &'static [GameEntry], repo: &'static str) -> i32 {
+    main_with(Box::leak(Box::new(Worker { games, repo, selfplay: true, fuzz: None })))
+}
+
+/// The worker binary's entry point.
+pub fn main_with(w: &'static Worker) -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    proto::cli(games, repo, &args)
+    proto::cli_with(w, &args)
 }

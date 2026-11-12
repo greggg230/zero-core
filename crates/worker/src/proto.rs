@@ -5,16 +5,23 @@
 //! <worker> selfplay --settings F (--model M | --uniform) --games N [--gid-base G] [--seed S] [--net N]
 //!          [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
 //!          [--ort-dll PATH] [--spinning 0|1] [--record-batches N --record-file F] [--sha256 H]
-//!          [--status-s X] [--stdin-control]        one job from flags (the same runner; events on stdout)
+//!          [--status-s X] [--stdin-control] [--reference R]   one job from flags (the same runner; events on stdout)
 //! <worker> check-config <config.json> [--json]     classify every setting; exit 1 on unknown / unsupported
 //! <worker> driver-cfg <config.json> --seed S --net N   the Python remote worker's DriverCfg (Debug text)
 //! <worker> eval-batches --model M --batches F --out F [--threads T] [--ort-dll P]
 //!                                                  answers to recorded batches (the evaluator's gate)
-//! <worker> info                                    games, protocol, ONNX Runtime
+//! <worker> info [--runtime-dir D | --ort-dll P]     games, protocol, ONNX Runtime (and where its DLLs came from)
+//! <worker> fuzz --mode M [--env K=V ...] --first F --count N [--threads T] [--chunk C]
+//!          [--seed-timeout S] [--out DIR] [--work DIR] [--keep-chunks] [--stdin-control]
+//!                                                  a fuzz job from flags (events on stdout)
+//! <worker> fuzz-check --mode M [--env K=V ...] [--seed S] [--commit C]
+//!                                                  what a campaign's mode and env mean, and a repro
+//! <worker> fuzz-chunk <spec.json>                  one chunk of a fuzz job (the supervisor's child)
 //! ```
 //!
 //! `serve`: `hello` first (aw, build_id, game, kinds, zero_onnx, pid), then one `job` line (`op` job:
-//! lease_id, kind 'selfplay', settings, games, gid_base, seed, model, reference, threads, out_dir;
+//! lease_id, kind 'selfplay', settings, games, gid_base, seed, model, reference (the self-test's set:
+//! answered before the first batch, `selftest` {provider, max_abs, ok}; a failure is fatal), threads, out_dir;
 //! optional gen - the rows' network id, default the graph's `checkpoint_iter` -, sha256, conc,
 //! groups, infer_threads, spinning, prefix); during it `yield` -> `yielded` (no batch started, the
 //! session dropped), `resume` -> `resumed`, `finish`, `quit`, `checkpoint` {gen, model, sha256?},
@@ -31,8 +38,9 @@ use serde_json::{json, Map, Value};
 
 use crate::eval::{ort_env, ort_version, OrtCfg, OrtEvaluator};
 use crate::job::{do_resume, do_yield, run_job, Checkpoint, Control, EvalKind, EvalLink, Job, Outcome, Progress, Sink};
+use crate::fuzz::{FuzzControl, FuzzShared};
 use crate::settings::Settings;
-use crate::{classify, GameEntry, AW, ZERO_ONNX};
+use crate::{classify, GameEntry, Worker, AW, ZERO_ONNX};
 
 /// JSON lines on stdout (one writer at a time), the log on stderr.
 pub struct Stdout {
@@ -64,6 +72,9 @@ impl Args<'_> {
     }
     fn num<T: std::str::FromStr>(&self, k: &str) -> Result<Option<T>, String> {
         self.get(k).map(|s| s.parse::<T>().map_err(|_| format!("{k} {s:?}: a number"))).transpose()
+    }
+    fn all(&self, k: &str) -> Vec<&str> {
+        self.v.windows(2).filter(|w| w[0] == k).map(|w| w[1].as_str()).collect()
     }
     fn positional(&self) -> Option<&str> {
         self.v.first().filter(|a| !a.starts_with("--")).map(|s| s.as_str())
@@ -104,7 +115,7 @@ pub fn ort_dylib_in(given: Option<&str>, runtime_dir: Option<&str>) -> PathBuf {
 
 /// The build id: the first 24 hex digits of sha256(manifest.json) next to the executable (PROTOCOL.md
 /// 2), else env ZERO_FARM_BUILD_ID, else 'unsigned-dev'.
-fn build_id() -> String {
+pub fn build_id() -> String {
     if let Some(p) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("manifest.json"))) {
         if let Ok(b) = std::fs::read(&p) {
             return sha256_hex(&b)[..24].to_string();
@@ -192,10 +203,19 @@ fn job_from_value(v: &Value, base: &Path) -> Result<Job, String> {
     let games = u("games").ok_or("job: games")?;
     let threads = u("threads").unwrap_or(1).max(1) as usize;
     let out_dir = base.join(o.get("out_dir").and_then(|x| x.as_str()).unwrap_or("out"));
-    let ort = OrtCfg { dylib: ort_dylib_in(o.get("ort_dylib").and_then(|x| x.as_str()), o.get("runtime_dir").and_then(|x| x.as_str())), intra_threads: u("infer_threads").map_or(threads, |t| t as usize), spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false) };
+    // ONNX Runtime comes from the job's runtime pack (`runtime_dir`, or ZEROFARM_RUNTIME_DIR the agent
+    // sets), never from anything else on the PC (a Python environment, PATH, the build's own directory)
+    let rt = o.get("runtime_dir").and_then(|x| x.as_str()).map(String::from).or_else(|| std::env::var("ZEROFARM_RUNTIME_DIR").ok().filter(|v| !v.is_empty()));
+    let dylib = match (&rt, o.get("model").and_then(|m| m.as_str())) {
+        (Some(d), _) => ort_dylib_in(None, Some(d)),
+        (None, Some(_)) => return Err("job: a network job needs its runtime pack (runtime_dir or ZEROFARM_RUNTIME_DIR)".into()),
+        (None, None) => PathBuf::new(),
+    };
+    let ort = OrtCfg { dylib, intra_threads: u("infer_threads").map_or(threads, |t| t as usize), spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false) };
     let sha256 = o.get("sha256").and_then(|x| x.as_str()).map(String::from);
+    let reference = o.get("reference").and_then(|x| x.as_str()).map(|r| base.join(r));
     let eval = match o.get("model").and_then(|m| m.as_str()) {
-        Some(m) => EvalKind::Onnx { model: base.join(m), ort, sha256 },
+        Some(m) => EvalKind::Onnx { model: base.join(m), ort, sha256, reference },
         None if o.get("uniform").and_then(|x| x.as_bool()) == Some(true) => EvalKind::Uniform,
         None => return Err("job: no model (a self-play job needs its network)".into()),
     };
@@ -258,7 +278,7 @@ fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress
             let gen = line.get("gen").and_then(|x| x.as_u64());
             let model = line.get("model").and_then(|x| x.as_str());
             match (gen, model) {
-                (Some(g), Some(m)) => ctl.checkpoint(Checkpoint { gen: g as u32, model: base.join(m), sha256: line.get("sha256").and_then(|x| x.as_str()).map(String::from) }),
+                (Some(g), Some(m)) => ctl.checkpoint(Checkpoint { gen: g as u32, model: base.join(m), sha256: line.get("sha256").and_then(|x| x.as_str()).map(String::from), reference: line.get("reference").and_then(|x| x.as_str()).map(|r| base.join(r)) }),
                 _ => sink.event(json!({"ev": "error", "message": "checkpoint: gen and model are required", "fatal": false})),
             }
         }
@@ -348,9 +368,10 @@ fn stdin_lines(sink: Arc<Stdout>) -> std::sync::mpsc::Receiver<Option<Value>> {
     rx
 }
 
-fn serve(games: &'static [GameEntry], repo: &str) -> i32 {
+fn serve(w: &'static Worker) -> i32 {
+    let games = w.games;
     let sink = Arc::new(Stdout { mu: Mutex::new(()) });
-    sink.event(json!({"ev": "hello", "aw": AW, "build_id": build_id(), "game": repo, "kinds": ["selfplay"], "zero_onnx": ZERO_ONNX, "pid": std::process::id(), "games": games.iter().map(|g| g.name).collect::<Vec<_>>()}));
+    sink.event(json!({"ev": "hello", "aw": AW, "build_id": build_id(), "game": w.repo, "kinds": w.kinds(), "zero_onnx": if w.selfplay { json!(ZERO_ONNX) } else { json!([]) }, "pid": std::process::id(), "games": games.iter().map(|g| g.name).collect::<Vec<_>>()}));
     let rx = stdin_lines(sink.clone());
     let base = std::env::current_dir().unwrap_or_default();
     loop {
@@ -360,6 +381,15 @@ fn serve(games: &'static [GameEntry], repo: &str) -> i32 {
         };
         match line.get("op").and_then(|x| x.as_str()) {
             Some("job") => {
+                let kind = line.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                match (kind, w.fuzz) {
+                    ("fuzz", Some(fg)) => return serve_fuzz(fg, &line, sink, rx, base),
+                    ("selfplay", _) if w.selfplay => {}
+                    _ => {
+                        sink.event(json!({"ev": "error", "message": format!("job kind {kind:?}: this worker build runs {:?}", w.kinds()), "fatal": true}));
+                        return 1;
+                    }
+                }
                 let job = match job_from_value(&line, &base).and_then(|j| Ok((game_of(games, &j.settings)?, j))) {
                     Ok(x) => x,
                     Err(e) => {
@@ -391,6 +421,141 @@ fn serve(games: &'static [GameEntry], repo: &str) -> i32 {
     }
 }
 
+/// Control lines during a fuzz job.
+fn fuzz_control(line: &Value, ctl: &FuzzControl, shared: &FuzzShared, sink: &dyn Sink) {
+    match line.get("op").and_then(|x| x.as_str()).unwrap_or("") {
+        "yield" => {
+            match shared.do_yield() {
+                Some(ms) => sink.log(&format!("yielded in {ms:.0} ms (chunk processes suspended)")),
+                None => sink.log("yield: already yielded"),
+            }
+            sink.event(json!({"ev": "yielded"}));
+        }
+        "resume" => {
+            shared.do_resume();
+            sink.event(json!({"ev": "resumed"}));
+        }
+        "finish" => ctl.finish(),
+        "quit" => ctl.quit(),
+        "ping" => {
+            let s = shared.progress.lock().unwrap().stats();
+            sink.event(json!({"ev": "status", "stats": s}));
+        }
+        "checkpoint" => sink.event(json!({"ev": "error", "message": "checkpoint: a fuzz job has no network", "fatal": false})),
+        "job" => sink.event(json!({"ev": "error", "message": "a second job line: one job per worker process", "fatal": false})),
+        other => sink.event(json!({"ev": "error", "message": format!("unknown op {other:?}"), "fatal": false})),
+    }
+}
+
+fn fuzz_end_event(o: &crate::fuzz::FuzzOutcome) -> Value {
+    json!({"ev": "end", "reason": o.reason, "stats": o.stats, "unfinished": {"seeds": o.unfinished.json()}})
+}
+
+/// Run a fuzz job on a thread while this thread reads control lines (None: none) and emits a status
+/// line every 10 s.
+fn run_fuzz_with_control(fg: &'static dyn crate::fuzz::FuzzGame, job: crate::fuzz::FuzzJob, sink: Arc<Stdout>, lines: Option<std::sync::mpsc::Receiver<Option<Value>>>) -> Result<crate::fuzz::FuzzOutcome, String> {
+    let ctl = Arc::new(FuzzControl::default());
+    let shared = Arc::new(FuzzShared::default());
+    let (c2, s2, k2) = (ctl.clone(), shared.clone(), sink.clone());
+    let worker = std::thread::Builder::new()
+        .name("zero-worker-fuzz".into())
+        .spawn(move || crate::fuzz::run_fuzz(fg, &job, &c2, &*k2, &s2))
+        .map_err(|e| format!("spawn: {e}"))?;
+    let mut t_status = Instant::now();
+    let mut eof = false;
+    while !worker.is_finished() {
+        match &lines {
+            Some(rx) if !eof => match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Some(v)) => fuzz_control(&v, &ctl, &shared, &*sink),
+                Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    eof = true;
+                    sink.log("stdin closed: quitting the job");
+                    shared.do_resume();
+                    ctl.quit();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            },
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+        if t_status.elapsed().as_secs_f64() >= 10.0 {
+            t_status = Instant::now();
+            let s = shared.progress.lock().unwrap().stats();
+            sink.event(json!({"ev": "status", "stats": s}));
+        }
+    }
+    worker.join().map_err(|_| "the fuzz thread panicked".to_string())?
+}
+
+fn serve_fuzz(fg: &'static dyn crate::fuzz::FuzzGame, line: &Value, sink: Arc<Stdout>, rx: std::sync::mpsc::Receiver<Option<Value>>, base: PathBuf) -> i32 {
+    let job = match crate::fuzz::job_from_value(line, &base).and_then(|j| fg.plan(&j.mode, &j.env).map(|_| j)) {
+        Ok(j) => j,
+        Err(e) => {
+            sink.event(json!({"ev": "error", "message": e, "fatal": true}));
+            return 1;
+        }
+    };
+    match run_fuzz_with_control(fg, job, sink.clone(), Some(rx)) {
+        Ok(o) => {
+            sink.event(fuzz_end_event(&o));
+            0
+        }
+        Err(e) => {
+            sink.event(json!({"ev": "error", "message": e, "fatal": true}));
+            1
+        }
+    }
+}
+
+fn env_args(a: &Args) -> Result<Vec<(String, String)>, String> {
+    a.all("--env").iter().map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or_else(|| format!("--env {kv:?}: K=V"))).collect()
+}
+
+fn fuzz_cli(fg: &'static dyn crate::fuzz::FuzzGame, a: &Args) -> Result<i32, String> {
+    let (env, fault) = crate::fuzz::split_env(env_args(a)?)?;
+    let base = std::env::current_dir().unwrap_or_default();
+    let job = crate::fuzz::FuzzJob {
+        lease_id: a.get("--lease").unwrap_or("cli").to_string(),
+        campaign: a.get("--campaign").map(String::from),
+        mode: a.get("--mode").ok_or("--mode M")?.to_string(),
+        env,
+        first: a.num("--first")?.ok_or("--first F")?,
+        count: a.num("--count")?.ok_or("--count N")?,
+        threads: a.num("--threads")?.unwrap_or(1),
+        chunk: a.num("--chunk")?,
+        seed_timeout_s: a.num("--seed-timeout")?.unwrap_or(300.0),
+        out_dir: base.join(a.get("--out").unwrap_or("out")),
+        work_dir: base.join(a.get("--work").unwrap_or("fuzz")),
+        announce_result: a.has("--announce"),
+        keep_chunks: a.has("--keep-chunks"),
+        fault,
+    };
+    fg.plan(&job.mode, &job.env)?;
+    let sink = Arc::new(Stdout { mu: Mutex::new(()) });
+    let lines = a.has("--stdin-control").then(|| stdin_lines(sink.clone()));
+    let o = run_fuzz_with_control(fg, job, sink.clone(), lines)?;
+    sink.event(fuzz_end_event(&o));
+    Ok(0)
+}
+
+fn fuzz_check(fg: &'static dyn crate::fuzz::FuzzGame, a: &Args) -> Result<i32, String> {
+    let (env, fault) = crate::fuzz::split_env(env_args(a)?)?;
+    let mode = a.get("--mode").ok_or("--mode M")?;
+    let plan = fg.plan(mode, &env)?;
+    let (commit, profile) = match a.get("--commit") {
+        Some(c) => (c.to_string(), a.get("--profile").unwrap_or(fg.profile()).to_string()),
+        None => crate::fuzz::build_identity(fg)?,
+    };
+    let seed: u64 = a.num("--seed")?.unwrap_or(10_000_000);
+    let mut renv = env.clone();
+    if !fault.is_empty() {
+        renv.push((crate::fuzz::FAULT_KEY.into(), crate::fuzz::faults_text(&fault)));
+    }
+    println!("{}", json!({"mode": plan.mode, "loop": plan.kind, "min_chunk": plan.min_chunk, "count_var": plan.count_var,
+                          "env": env.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(), "profile": profile, "commit": commit,
+                          "repro": fg.repro(&plan, &renv, seed, &commit, &profile)}));
+    Ok(0)
+}
+
 fn selfplay_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     let settings = read_settings(a.get("--settings").ok_or("--settings <config.json>")?)?;
     let game = game_of(games, &settings)?;
@@ -399,7 +564,7 @@ fn selfplay_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     let eval = if a.has("--uniform") {
         EvalKind::Uniform
     } else {
-        EvalKind::Onnx { model: PathBuf::from(a.get("--model").ok_or("--model <onnx> or --uniform")?), ort: ort.clone(), sha256: a.get("--sha256").map(String::from) }
+        EvalKind::Onnx { model: PathBuf::from(a.get("--model").ok_or("--model <onnx> or --uniform")?), ort: ort.clone(), sha256: a.get("--sha256").map(String::from), reference: a.get("--reference").map(PathBuf::from) }
     };
     let net = match (a.num::<u32>("--net")?, &eval) {
         (Some(n), _) => n,
@@ -535,34 +700,56 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
-fn info_cli(games: &'static [GameEntry], repo: &str, a: &Args) -> Result<i32, String> {
-    let dylib = ort_dylib(a.get("--ort-dll"));
+fn info_cli(games: &'static [GameEntry], repo: &str, kinds: Vec<&'static str>, a: &Args) -> Result<i32, String> {
+    let dylib = ort_dylib_in(a.get("--ort-dll"), a.get("--runtime-dir"));
     let ort = match ort_env(&dylib) {
-        Ok(_) => json!({"dylib": dylib.display().to_string(), "version": ort_version()}),
+        Ok(_) => {
+            // where each library came from (the runtime pack's check on a clean PC)
+            let mods: Map<String, Value> = ["onnxruntime.dll"].iter().chain(crate::eval::MSVC_RUNTIME).map(|n| (n.to_string(), json!(crate::eval::module_path(n)))).collect();
+            json!({"dylib": dylib.display().to_string(), "version": ort_version(), "modules": mods})
+        }
         Err(e) => json!({"dylib": dylib.display().to_string(), "error": e}),
     };
     let gs: Vec<Value> = games.iter().map(|g| {
         let i = (g.info)();
         json!({"name": i.name, "features": i.num_features, "actions": i.num_actions, "aux": i.aux.iter().map(|x| json!([x.0, x.1])).collect::<Vec<_>>()})
     }).collect();
-    println!("{}", json!({"repo": repo, "aw": AW, "zero_onnx": ZERO_ONNX, "build_id": build_id(), "games": gs, "onnxruntime": ort}));
+    println!("{}", json!({"repo": repo, "aw": AW, "zero_onnx": ZERO_ONNX, "build_id": build_id(), "games": gs, "onnxruntime": ort, "kinds": kinds}));
     Ok(0)
 }
 
 pub fn cli(games: &'static [GameEntry], repo: &'static str, args: &[String]) -> i32 {
+    cli_with(Box::leak(Box::new(Worker { games, repo, selfplay: true, fuzz: None })), args)
+}
+
+pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
+    let (games, repo) = (w.games, w.repo);
     let (cmd, rest) = match args.split_first() {
         Some((c, r)) => (c.as_str(), r),
         None => ("", &[][..]),
     };
     let a = Args { v: rest };
+    let no_fuzz = || Err::<i32, String>("this worker build has no fuzz loops".into());
     let r = match cmd {
-        "serve" => return serve(games, repo),
+        "serve" => return serve(w),
+        "fuzz-chunk" => {
+            return match (w.fuzz, a.positional()) {
+                (Some(fg), Some(spec)) => crate::fuzz::chunk_main(fg, spec),
+                _ => {
+                    eprintln!("usage: <worker> fuzz-chunk <spec.json> (a fuzz build's)");
+                    2
+                }
+            }
+        }
+        "fuzz" => w.fuzz.map_or_else(no_fuzz, |fg| fuzz_cli(fg, &a)),
+        "fuzz-check" => w.fuzz.map_or_else(no_fuzz, |fg| fuzz_check(fg, &a)),
+        "selfplay" if !w.selfplay => Err("this worker build runs fuzz jobs only (a fuzz-profile build)".into()),
         "selfplay" => selfplay_cli(games, &a),
         "check-config" => check_config(games, &a),
         "driver-cfg" => driver_cfg_cli(games, &a),
         "eval-batches" => eval_batches(&a),
-        "info" => info_cli(games, repo, &a),
-        _ => Err("usage: <worker> serve | selfplay ... | check-config <config.json> | driver-cfg <config.json> | eval-batches ... | info (zero-core crates/worker/src/proto.rs)".into()),
+        "info" => info_cli(games, repo, w.kinds(), &a),
+        _ => Err("usage: <worker> serve | selfplay ... | fuzz ... | fuzz-check ... | check-config <config.json> | driver-cfg <config.json> | eval-batches ... | info (zero-core crates/worker/src/proto.rs)".into()),
     };
     match r {
         Ok(code) => code,

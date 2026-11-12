@@ -203,3 +203,49 @@ def test_toy_games_through_the_graph(tmp_path):
     res = drv.take_results()
     assert len(res) == 16 and all(r['over'] for r in res)
     assert seen['batches'] > 0 and seen['belief'] > 0 and seen['value'] > 0 and seen['worst'] < 2e-5
+
+
+def test_reference_set(tmp_path):
+    """`--reference N` (zero-farm's per-machine self-test): N rows of the recorded batches, whole batches spread
+    over the file (leaf, value-only and belief rows), the driver's sparse arrays and dtypes, torch's eager
+    answers; the graph through onnxruntime within 2e-5 of them (`check_reference`, what a worker checks);
+    a corrupted answer is caught; too few rows, or no belief row for a network with an auxiliary head, refused."""
+    m = tok_net(TOK_LAYOUT)
+    path = str(tmp_path / 'm.onnx')
+    info = {'checkpoint': 'toy', 'checkpoint_sha256': 'cd' * 32}
+    OX.export(m, path, 'packed', info)
+    B = 300
+    rows = rows_of(tok_x(B, 4).numpy(), np.random.default_rng(3).integers(2, 5, B), kinds_of(B, 5), TOK_A)
+    rows.batch_off = np.array([0, 50, 120, 200, 260, 300], np.int64)
+    ref = str(tmp_path / 'reference.npz')
+    meta = OX.write_reference(m, [rows], ref, 100, info)
+    assert meta['rows'] == 100 and meta['batches'] == 2 and meta['belief_rows'] > 0 and meta['value_rows'] > 0
+    assert meta['checkpoint_sha256'] == 'cd' * 32 and meta['game'] == 'toy' and meta['aux_width'] == 8
+    with np.load(ref) as z:
+        assert set(z.files) == {'meta', 'xs_off', 'xs_idx', 'xs_val', 'n_players', 'extra', 'opt_off', 'opt_action', 'batch_off',
+                                'priors', 'value', 'margin', 'aux'}
+        dt = {k: z[k].dtype for k in z.files if k != 'meta'}
+        assert dt == {'xs_off': np.int64, 'xs_idx': np.int32, 'xs_val': np.float32, 'n_players': np.int64, 'extra': np.uint8,
+                      'opt_off': np.int64, 'opt_action': np.int32, 'batch_off': np.int64, 'priors': np.float32,
+                      'value': np.float32, 'margin': np.float32, 'aux': np.float32}
+        assert list(z['batch_off']) == [0, 50, 100]
+        assert len(z['priors']) == len(z['opt_action']) == z['opt_off'][-1]
+        assert z['value'].shape == z['margin'].shape == (100, 8) and z['aux'].shape == (meta['belief_rows'], 8)
+        # the rows are the file's: batch 0 whole, then batch 2's first 50 rows
+        idx = np.concatenate([np.arange(0, 50), np.arange(120, 170)])
+        want = rows.take(idx)
+        assert np.array_equal(z['xs_val'], want.xs_val) and np.array_equal(z['extra'], want.extra)
+        arrays = {k: z[k] for k in z.files}
+    chk = OX.check_reference(path, ref, threads=1)
+    assert chk['max_abs'] < 2e-5, chk
+    arrays['priors'] = arrays['priors'].copy()
+    arrays['priors'][3] += 1e-3
+    bad = str(tmp_path / 'bad.npz')
+    with open(bad, 'wb') as f:
+        np.savez(f, **arrays)
+    assert OX.check_reference(path, bad, threads=1)['priors'] > 2e-5
+    with pytest.raises(ValueError, match='fewer'):
+        OX.write_reference(m, [rows], str(tmp_path / 'x.npz'), 10_000)
+    plain = rows_of(tok_x(B, 4).numpy(), np.full(B, 3), kinds_of(B, 1, belief=False), TOK_A)
+    with pytest.raises(ValueError, match='belief'):
+        OX.write_reference(m, [plain], str(tmp_path / 'y.npz'), 64)

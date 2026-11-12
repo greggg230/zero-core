@@ -54,6 +54,19 @@ zeroed before they are decoded and its token is zero (NaN or junk there changes 
 CUDA graphs' host copy, docs/az.md 10.6). Conv (`GridNet`) and MLP (`Net`) networks have no packing:
 their forward on the densified rows.
 
+The reference set (`--reference N`, `write_reference`; zero-farm's per-machine self-test, DESIGN.md 2.1
+point 5): N real network batch rows - whole batches a driver recorded (`tools/onnx_record.py`, or a
+worker's `--record-batches`), taken spread over the files - with torch's answers to them (the eager
+`infer.NetEvaluator` on the CPU, batch by batch: what a run's own workers answer), in
+`reference.npz`: `meta` (JSON: zero_onnx, game, features, actions, aux_width, checkpoint,
+checkpoint_sha256, rows, belief / value rows, batches, tol, sources, torch), the rows as the driver
+sends them (`xs_off` i64 [R+1], `xs_idx` i32, `xs_val` f32, `n_players` i64 [R], `extra` u8 [R],
+`opt_off` i64 [R+1], `opt_action` i32), `batch_off` i64 [K+1], and the answers: `priors` f32 [options],
+`value` f32 [R, 8], `margin` f32 [R, 8], `aux` f32 [belief rows, W]. A worker answers it through its own
+evaluator before it plays and must match within 2e-5 (zero_worker `selftest`); the exporter checks the
+graph against it through onnxruntime first (`check_reference`), so a checkpoint whose graph fails is
+never published.
+
 Exporter: torch 2.x's dynamo-based `torch.onnx.export(..., dynamo=True)` (needs `onnx` and
 `onnxscript`), opset 18 (LayerNormalization, exact GELU through Erf, the attention decomposed into
 MatMul / Softmax with the boolean mask). Only this module and `zero.onnx_parity` import onnx /
@@ -64,6 +77,7 @@ import hashlib
 import json
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -406,6 +420,116 @@ def export_checkpoint(path, out, packing='packed', game=None, allow_mismatch=Fal
     return export(m, out, packing, info)
 
 
+REFERENCE_TOL = 2e-5
+
+
+def reference_rows(rows_list, n):
+    """`n` real rows of recorded batch files (`onnx_parity.Rows`): whole recorded batches spread over the
+    files (every k-th batch first, then the others), the last one cut to make `n` -> (Rows, batch_off)."""
+    from .onnx_parity import cat
+    batches = []
+    for ri, rows in enumerate(rows_list):
+        bo = rows.batch_off if rows.batch_off is not None else np.arange(0, rows.B + 64, 64).clip(max=rows.B)
+        bo = np.unique(np.asarray(bo, np.int64))
+        batches += [(ri, int(a), int(b)) for a, b in zip(bo[:-1], bo[1:]) if b > a]
+    if not batches:
+        raise ValueError('no recorded batches')
+    total = sum(b - a for _, a, b in batches)
+    if total < n:
+        raise ValueError(f'the batch files hold {total} rows, fewer than the {n} asked')
+    per = total / len(batches)
+    stride = max(1, int(len(batches) // max(1, int(np.ceil(n / per)))))
+    order = batches[::stride] + [b for i, b in enumerate(batches) if i % stride]
+    parts, offs, got = [], [0], 0
+    for ri, a, b in order:
+        if got >= n:
+            break
+        b = min(b, a + (n - got))
+        parts.append(rows_list[ri].take(np.arange(a, b)))
+        got += b - a
+        offs.append(got)
+    return cat(parts, source='+'.join(sorted({r.source for r in rows_list}))), np.asarray(offs, np.int64)
+
+
+def write_reference(net, rows_list, out, n=256, info=None, tol=REFERENCE_TOL):
+    """The reference set of `net` (module docs) from recorded batch files -> its metadata. Every belief
+    row gets the auxiliary answer; a network with an auxiliary head needs belief rows among the `n`."""
+    import numpy as np
+    from .infer import NetEvaluator
+    from .onnx_parity import eager_answer
+    from .protocol import ROW_BELIEF, ROW_VALUE
+    rows, bo = reference_rows(rows_list, n)
+    net = copy.deepcopy(net).float().cpu().eval()
+    layout = [list(t) for t in (getattr(net, 'aux_layout', None) or [])]
+    n_belief = int((rows.extra == ROW_BELIEF).sum())
+    if layout and n_belief == 0:
+        raise ValueError(f'the {n} reference rows hold no belief row: the auxiliary head would go untested (more rows, or batches with belief rows)')
+    ev = NetEvaluator(net, 'cpu')
+    pri, val, mar, aux = [], [], [], []
+    for a, b in zip(bo[:-1], bo[1:]):
+        ans = eager_answer(ev, rows.take(np.arange(a, b)))
+        pri.append(np.asarray(ans[0], np.float32))
+        val.append(np.asarray(ans[1], np.float32))
+        mar.append(np.asarray(ans[2], np.float32))
+        if len(ans) > 3 and ans[3] is not None:
+            aux.append(np.asarray(ans[3], np.float32))
+    W = sum(int(t[1]) for t in layout)
+    aux = np.concatenate(aux) if aux else np.zeros((0, W), np.float32)
+    meta = {'zero_onnx': '1', 'game': str(net.config.get('game')), 'features': int(net.config['features']),
+            'actions': int(net.config['actions']), 'aux_width': W, 'rows': int(rows.B), 'belief_rows': n_belief,
+            'value_rows': int((rows.extra == ROW_VALUE).sum()), 'batches': int(len(bo) - 1), 'tol': tol,
+            'sources': rows.source, 'torch': torch.__version__, 'answers': 'infer.NetEvaluator, eager, CPU'}
+    for k, v in (info or {}).items():
+        meta[str(k)] = v
+    arrays = {'meta': np.array(json.dumps(meta)), 'xs_off': rows.xs_off.astype(np.int64), 'xs_idx': rows.xs_idx.astype(np.int32),
+              'xs_val': rows.xs_val.astype(np.float32), 'n_players': rows.n_players.astype(np.int64),
+              'extra': rows.extra.astype(np.uint8), 'opt_off': rows.opt_off.astype(np.int64),
+              'opt_action': rows.opt_action.astype(np.int32), 'batch_off': bo, 'priors': np.concatenate(pri),
+              'value': np.concatenate(val), 'margin': np.concatenate(mar), 'aux': aux.astype(np.float32)}
+    tmp = f'{out}.{os.getpid()}.tmp'
+    with open(tmp, 'wb') as f:
+        np.savez(f, **arrays)
+    os.replace(tmp, out)
+    return meta
+
+
+def load_reference(path):
+    """reference.npz -> (onnx_parity.Rows, batch_off, (priors, value, margin, aux), meta)."""
+    import numpy as np
+    from .onnx_parity import Rows
+    with np.load(path) as z:
+        meta = json.loads(str(z['meta']))
+        rows = Rows(z['xs_off'], z['xs_idx'], z['xs_val'], z['n_players'], z['opt_off'], z['opt_action'], z['extra'],
+                    meta['features'], batch_off=z['batch_off'], source=os.path.basename(path))
+        return rows, z['batch_off'], (z['priors'], z['value'], z['margin'], z['aux']), meta
+
+
+def check_reference(onnx_path, ref_path, threads=4):
+    """The graph through onnxruntime (CPU EP, the worker's generic step, batch by batch) against the
+    reference set's torch answers -> {max_abs, priors, value, margin, aux} (the worker's self-test,
+    in Python)."""
+    import numpy as np
+    from .onnx_parity import answer, run_chunked, session
+    rows, bo, want, meta = load_reference(ref_path)
+    sess = session(onnx_path, threads)
+    got = [[], [], [], []]
+    for a, b in zip(bo[:-1], bo[1:]):
+        sub = rows.take(np.arange(a, b))
+        ans = answer(run_chunked(sess, sub), sub)
+        for i, v in enumerate(ans):
+            got[i].append(np.asarray(v, np.float32))
+    out = {}
+    for i, k in enumerate(('priors', 'value', 'margin', 'aux')):
+        g = np.concatenate(got[i]) if got[i] else np.zeros_like(want[i])
+        w = np.asarray(want[i], np.float32)
+        if g.shape != w.shape or not np.isfinite(g).all() or not np.isfinite(w).all():
+            out[k] = float('inf')
+        else:
+            out[k] = float(np.abs(g.astype(np.float64) - w.astype(np.float64)).max()) if w.size else 0.0
+    out['max_abs'] = max(out.values())
+    return out
+
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description='Export a checkpoint to a zero-onnx/1 ONNX graph (docs/az.md 41).')
@@ -416,10 +540,37 @@ def main(argv=None):
     ap.add_argument('--id', default=None, help='the checkpoint id in the metadata (default: its file name)')
     ap.add_argument('--allow-mismatch', action='store_true',
                     help='skip the encoding guard (no game package for this checkpoint in this process)')
+    ap.add_argument('--reference', type=int, default=0, metavar='N',
+                    help='also write the reference set: N real batch rows with torch\'s answers (zero-farm\'s per-machine self-test)')
+    ap.add_argument('--reference-batches', nargs='+', default=None, metavar='NPZ',
+                    help='recorded driver batches (tools/onnx_record.py or a worker\'s --record-batches) the rows come from')
+    ap.add_argument('--reference-out', default=None, help='where (default: reference.npz next to OUT)')
+    ap.add_argument('--threads', type=int, default=4, help='onnxruntime threads of the reference check')
     a = ap.parse_args(argv)
-    meta = export_checkpoint(a.checkpoint, a.out, a.packing, a.game, a.allow_mismatch, a.id)
-    print(json.dumps({'out': a.out, 'bytes': os.path.getsize(a.out), **meta}))
+    if a.reference and not a.reference_batches:
+        ap.error('--reference needs --reference-batches')
+    m, info = load_checkpoint(a.checkpoint, a.game, a.allow_mismatch)
+    if a.id:
+        info['checkpoint'] = a.id
+    meta = export(m, a.out, a.packing, info)
+    res = {'out': a.out, 'bytes': os.path.getsize(a.out), **meta}
+    ok = True
+    if a.reference:
+        from .onnx_parity import Rows
+        ref = a.reference_out or os.path.join(os.path.dirname(os.path.abspath(a.out)), 'reference.npz')
+        rmeta = write_reference(m, [Rows.load(b) for b in a.reference_batches], ref, a.reference, info)
+        chk = check_reference(a.out, ref, a.threads)
+        ok = chk['max_abs'] <= REFERENCE_TOL
+        res['reference'] = {'path': ref, 'bytes': os.path.getsize(ref), 'sha256': file_sha256(ref), 'rows': rmeta['rows'],
+                            'belief_rows': rmeta['belief_rows'], 'value_rows': rmeta['value_rows'], 'batches': rmeta['batches'],
+                            'onnxruntime_vs_torch': chk, 'passed': ok}
+    print(json.dumps(res))
+    if not ok:
+        print(f'REFERENCE CHECK FAILED: the graph differs from torch by {res["reference"]["onnxruntime_vs_torch"]["max_abs"]:g} '
+              f'(> {REFERENCE_TOL:g}) on the reference rows: do not publish this checkpoint', file=__import__('sys').stderr)
+        return 1
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
