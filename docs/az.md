@@ -5348,6 +5348,17 @@ identical records and results (visits, cq, vs random). toy_tail, 64 self-play ga
 evaluator, sparse batches): items0 3 - 33,687 rows, 59% with a tail, 2.2 tokens per such row, at most 8, none
 aborted, 0.8 s; items0 12 - 34,288 rows, 64%, 3.0, at most 13, 0.9 s.
 
+**Measured, the Python search and the lookahead** (the desktop, 2026-11-12, other sessions' tests and runs on the
+CPU). Byte identity for games without tails, against f9ca5c3: `check_checkpoint_compat --package zero` with
+`--net random`, `--net uniform`, spec `{"food": [3, 1]}`, a toy MLP and a toy token checkpoint - identical; and 20
+goldens of the consumers this change touches, each the same JSON in both checkouts: `zero.parity` (positions with
+chance_k 0 and 2, toy_team's deferred leaves, root views, Gumbel, the floor, the belief, the select / cq / Gumbel
+formulas, `h2h` with a checkpoint), `PyDriver` self-play with 'py' and 'rs' seats (root views, value-only samples,
+'cq': every batch's and sample's arrays hashed), `zero.replay` (an MLP vs random, a token network vs itself, a
+lookahead seat), the position API (`evaluate_position`, every round's rows) and `targets quality`. Parity on
+toy_tail: docs/search.md 6 (Rust-Python at the Python-Python floor; rows without their tails told apart at TV 0.59;
+games without chance identical byte for byte in both trees; h2h 50.15% +-2.19 and 50.20% +-2.19).
+
 ### 43.5 The layout keys and the network's tail tokens (`net.tokens_layout`, `net.TokenNet`; lane Y, 2026-11-11)
 
 (43.1-43.4: the rows, the driver, the shards and the run, lane X; 43.5-43.8: the network, its gates, inference and

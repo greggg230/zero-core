@@ -271,8 +271,8 @@ class SkewEval:
     def __init__(self, base, eps=0.001):
         self.base, self.eps = base, eps
 
-    def __call__(self, x, acts, n):
-        pri, v, m = self.base(x, acts, n)
+    def __call__(self, x, acts, n, **rows):
+        pri, v, m = self.base(x, acts, n, **rows)
         if len(pri) >= 2:
             b = int(np.argmax(pri))
             rest = sum(p for i, p in enumerate(pri) if i != b)
@@ -299,8 +299,7 @@ def forced(game='toy', n=10, sims=96, reps=24, k=4, seed=0, scale=0.15, eps=0.00
     mean root win without the forced walks (`win_diff`), averaged over the positions; `starved_k0`:
     the share of options without a visit at k 0 (Rust). `k_rs`: another floor for the Rust tree (a
     power check)."""
-    info = engine().game_info_of(game)
-    ev = SkewEval(LinearEval(info['num_features'], info['num_actions'], seed=1, scale=scale), eps)
+    ev = SkewEval(stand_in(game, scale=scale), eps)
     E = engine()
     rng = random.Random(seed)
     pos = []
@@ -471,8 +470,7 @@ def gumbel(game='toy', n=10, sims=64, reps=32, m=16, scale=1.0, seed=0, ev_scale
     mean root value (`gumbel_q`, `q_diff`), the share of repetitions whose moves agree (`agree_*`);
     `budget_ok`: every search walked exactly sims - 1 root walks over min(m, options) options. `m_rs`:
     another m for the Rust tree (a power check)."""
-    info = engine().game_info_of(game)
-    ev = LinearEval(info['num_features'], info['num_actions'], seed=1, scale=ev_scale)
+    ev = stand_in(game, scale=ev_scale)
     if eps is not None:
         ev = SkewEval(ev, eps)
     names = ('tv', 'tv_walks', 'tv_cq', 'tv_move')
@@ -525,10 +523,10 @@ def gumbel_formula(game='toy', n=8, sims=(2, 5, 17, 64), ms=(1, 2, 4, 16), seed=
     Rust tree's move and root value - and the next root walk: the Rust tree's next simulation's root
     option (its path, `edge_outs` / visits) - exactly but on near-ties. -> {checked, agree, near_ties,
     q_max_diff, mismatches}."""
-    info = engine().game_info_of(game)
-    ev = LinearEval(info['num_features'], info['num_actions'], seed=1, scale=scale)
+    ev = stand_in(game, scale=scale)
     out = {'checked': 0, 'agree': 0, 'near_ties': 0, 'q_max_diff': 0.0, 'mismatches': []}
     for k, g in enumerate(sample_positions(game, n, seed)):
+        rk = _rows(g)
         for ns in sims:
             for m in ms:
                 noise = list(np.random.default_rng(31 * k + ns + m).gumbel(size=len(g.legal())))
@@ -556,9 +554,10 @@ def gumbel_formula(game='toy', n=8, sims=(2, 5, 17, 64), ms=(1, 2, 4, 16), seed=
                 # simulation takes (its walks per option before and after)
                 nxt = mcts.gumbel_select(pt)
                 before = list(t.gumbel_visits)
-                leaf = t.simulate(g, 1.0)
+                leaf = t.simulate(g, 1.0, rows=True) if rk is not None else t.simulate(g, 1.0)
                 if leaf is not None:
-                    t.expand(*ev(leaf[1], leaf[2], g.n_players))
+                    rw = {} if rk is None else _row_kw(rk, leaf[4][0], leaf[4][1])
+                    t.expand(*ev(leaf[1], leaf[2], g.n_players, **rw))
                 took = [i for i, (a, b) in enumerate(zip(before, t.gumbel_visits)) if b != a]
                 sc = mcts.gumbel_scores(pt)
                 for what, a, b in (('move', py, rs), ('walk', nxt, took[0] if took else -1)):
@@ -576,8 +575,7 @@ def cq_formula(game='toy', n=8, sims=64, seed=0, cq_settings=((50.0, 1.0), (50.0
     """The Python `completed_q_policy` on Rust roots' statistics (P0, N, W, network value) vs
     the Rust tree's own target, at each prior exponent of `prior_ws` (docs/search.md 3.13). -> max
     |difference|."""
-    info = engine().game_info_of(game)
-    ev = LinearEval(info["num_features"], info["num_actions"], seed=1, scale=scale)
+    ev = stand_in(game, scale=scale)
     worst = 0.0
     for k, g in enumerate(sample_positions(game, n, seed)):
         *_, t = search_rs(g, ev, sims, 500 + k, tree=True)
@@ -598,8 +596,7 @@ def select_formula(game='toy', n=8, sims=(4, 8, 24, 64), seed=0, rules=SELECT_RU
     agree, near_ties, mismatches}: a disagreement counts as a near-tie when the two options'
     logits are within `eps` (f64 rounding of ln / exp between the platforms' libm), else it is a
     mismatch (listed)."""
-    info = engine().game_info_of(game)
-    ev = LinearEval(info["num_features"], info["num_actions"], seed=1, scale=scale)
+    ev = stand_in(game, scale=scale)
     out = {'checked': 0, 'agree': 0, 'near_ties': 0, 'mismatches': []}
     for k, g in enumerate(sample_positions(game, n, seed)):
         for ns in sims:

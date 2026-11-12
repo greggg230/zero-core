@@ -1159,6 +1159,10 @@ positions/s): 5-30 s a 6-ply decision. Here the same lookahead is Rust inside th
 of the driver whose rows go through the same batches as MCTS leaves (one GPU batch for every game in
 flight), and a position API for the lab.
 
+(Variable-length rows - a game with tail segments or pointer overrides: every lookahead row carries its tail and
+overrides, its keys cover them, a row past the row limit aborts the game or raises: 2.15, "The lookahead and the
+Python search", 2026-11-12. The lab's own Python lookahead reads `encode` and is refused on such a state, R1.)
+
 **Semantics** (the lab's, ported exactly; `crates/search/src/lookahead.rs`):
 
 * **Plies** are decisions with >= 2 options, of either seat: a move is `tree::transition` (single-option
@@ -2052,6 +2056,29 @@ seat in `PyDriver`, the same network, seats alternating (docs/az.md 6.2): **49.9
 toy proof run's iteration 4; the same figures as Caverna Zero's to the last digit, since the
 code, the seeds and the reproduced network are the same), and 49.91% +-1.32 over 4000 games
 with chance_k 0 at a fresh seed with the stronger iteration 12.
+
+**Variable-length rows** (2.15; `python -m zero.parity positions --game toy_tail --spec '{"items0": 9}'`, `root_view`,
+`h2h --game toy_tail`; `tests/test_tail_search.py`), 2026-11-12: both trees' leaves carry their rows' tails and
+overrides, and the stand-in `LinearEval(tails=)` reads every tail token's floats into its value and every override
+(and its target token's floats) into its option's prior. 12 toy_tail positions (every row with a tail), 96 simulations,
+24 repetitions per position and tree:
+
+| setting | TV(Rust, Python) | TV(Python, Python) floor | root win \|Rust - Python\| | cq TV (floor) |
+|---|---|---|---|---|
+| chance_k 0, c_scale 1 | 0.0100 | 0.0091 | 0.0018 | 0.038 (0.030) |
+| chance_k 0, c_scale 0.1 | | | | 0.013 (0.011) |
+| chance_k 2, c_scale 0.1 | 0.0172 | 0.0118 | 0.0020 | 0.020 (0.015) |
+| root-view values (10 positions) | 0.0094 | 0.0071 | 0.0011 | 0.006 (0.018) |
+| power: the Rust tree's rows without tails and overrides | 0.593 | 0.0091 | 0.046 | 0.633 (0.011) |
+
+(The stand-in's values are far apart on these positions, so its c_scale 1 targets are near one-hot and their TV is
+noise: on one position whose cq TV read 0.065 against a floor of 0.004 at 32 repetitions, 96 repetitions gave root
+visit means 44.31 +-0.29 / 44.57 +-0.32 / 44.68 +-0.30 for Rust / Python / Python on its two contested options; the
+test uses c_scale 0.1.) **Exactly**: 45 items and 20 moves leave nothing to chance (`ADD` is never legal), and the
+Python driver's 'py' and 'rs' seats then send the same rows, byte for byte - heads, tails, overrides and, with
+root-view values, the value-only rows - in the same order and play the same games (mover and root view, 3 games of
+~380 rows each, ~600 with root view). In games (`h2h --game toy_tail --spec '{"items0": 6, "max_moves": 24}' --sims 16`, a random
+32 x 2 token network of the toy's layout): 50.15% +-2.19 and 50.20% +-2.19 (95%, 2000 games each, seeds 0 and 1).
 
 ## 7. Throughput (desktop, 2026-10-11, other projects' training runs on the CPU and GPU)
 
