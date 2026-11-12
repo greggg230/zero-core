@@ -17,6 +17,13 @@ control lines come from here; the watchdog is off). Its shards are those of `zer
 <the same config.json> --uniform --games N --seed <the remote worker's seed> --net <iter - 1>
 --record-batches B`. Compared: every shard's arrays and cut points, the meta keys of the format, and
 the first B batches (every array). Exit 1 on a difference.
+
+With `--model <graph.onnx> --ort-dll <onnxruntime.dll> [--infer-threads T]` both sides answer with that zero-onnx/1
+graph instead (Python: zero.onnx_eval.OnnxEvaluator through onnxruntime, T intra-op threads; native: the same graph
+through the runtime's ONNX Runtime, T threads): settings whose seats need the network's auxiliary head - a root belief
+(`selfplay_belief_tilt(s)`: a deck tilt, MTG Zero's best-of-three) - which the uniform evaluator has not. The graph's
+raw outputs are the same library's on the same batches, and both sides' softmax is the exact one (docs/az.md 44.2):
+the rows must still be byte-identical.
 """
 import argparse
 import glob
@@ -40,7 +47,11 @@ def py_side(a, mirror, it):
 
     class Recording:
         def __init__(self):
-            self.u = UniformEvaluator()
+            if a.model:
+                from zero.onnx_eval import OnnxEvaluator
+                self.u = OnnxEvaluator(a.model, threads=a.infer_threads)
+            else:
+                self.u = UniformEvaluator()
 
         def __call__(self, lb):
             if len(rec['batches']) < rec['n']:
@@ -160,7 +171,12 @@ def main():
     ap.add_argument('--iter', type=int, default=81)
     ap.add_argument('--set', action='append', default=[], help='key=JSON value: a setting changed for both sides')
     ap.add_argument('--threads', type=int, default=None, help='both sides\' search threads (the config\'s if unset)')
+    ap.add_argument('--model', help='a zero-onnx/1 graph both sides answer with (default: the uniform evaluator)')
+    ap.add_argument('--ort-dll', help='with --model: the native side\'s onnxruntime.dll (the Python side: onnxruntime)')
+    ap.add_argument('--infer-threads', type=int, default=4, help='with --model: ONNX Runtime\'s intra-op threads, both sides')
     a = ap.parse_args()
+    if a.model and not a.ort_dll:
+        ap.error('--model needs --ort-dll')
     it = a.iter
     mirror = os.path.join(a.out, 'py')
     native = os.path.join(a.out, 'native')
@@ -190,9 +206,10 @@ def main():
     print(f'Python remote worker: {py_s:.1f} s', flush=True)
     save_batches(os.path.join(a.out, 'py_batches.npz'), batches)
     t0 = time.time()
-    cmd = [a.worker, 'selfplay', '--settings', os.path.join(mirror, 'config.json'), '--uniform', '--games', str(a.games),
+    cmd = [a.worker, 'selfplay', '--settings', os.path.join(mirror, 'config.json'), '--games', str(a.games),
            '--seed', str(seed), '--net', str(it - 1), '--threads', str(cfg['threads']), '--out', native,
            '--record-batches', str(a.batches), '--record-file', os.path.join(a.out, 'native_batches.npz')]
+    cmd += ['--model', a.model, '--ort-dll', a.ort_dll, '--infer-threads', str(a.infer_threads)] if a.model else ['--uniform']
     p = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
     with open(os.path.join(a.out, 'native.log'), 'w', encoding='utf-8') as f:
         f.write(p.stdout + '\n--- stderr\n' + p.stderr)
