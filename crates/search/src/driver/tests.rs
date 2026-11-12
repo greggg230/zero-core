@@ -4073,3 +4073,6 @@ fn value_choice_pick_takes_the_best_or_draws_by_the_softmax() {
         assert!((f - p).abs() < 0.01, "option {i}: {f} against {p}");
     }
 }
+
+// chained episodes (docs/search.md 2.14): the toy match through the driver
+mod chain;

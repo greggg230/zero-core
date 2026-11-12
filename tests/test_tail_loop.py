@@ -95,3 +95,27 @@ def test_the_run_refuses_what_cannot_carry_the_rows(tmp_path, monkeypatch):
     assert issubclass(RUN.RowsRefused, RUN.EncodingMismatch)
     # the toy and its layout: nothing to refuse
     RUN.Run(str(tmp_path), cfg(game='toy', spec={}, arch='mlp', shard_sparse=0)).check_rows()
+
+
+def test_chained_contests_carry_the_rows_into_shards_and_batches(tmp_path):
+    """toy_tail as chained contests (spec `episodes`, docs/az.md 42 with 43) through the run's self-play phase: one row
+    a contest, every game's samples behind it with their tails and overrides in the v2 shards (synchronous and on the
+    writer thread, array for array), the window and its batches resolving every override; a later game over the row
+    limit ends its contest aborted, the earlier games' samples kept."""
+    out, paths = selfplay(tmp_path / 'a', spec={'items0': 6, 'max_moves': 12, 'episodes': 2}, games=6, conc=6)
+    assert out['games'] == 6 and out['samples'] > 0 and paths
+    assert out['episodes']['games'] == 12 and out['episodes']['contests'] == 6
+    assert out['tail']['rows'] > 0 and out['tail']['aborted_row_tokens'] == 0
+    out2, paths2 = selfplay(tmp_path / 'b', spec={'items0': 6, 'max_moves': 12, 'episodes': 2}, games=6, conc=6,
+                            shard_writer_thread=1)
+    for p, q in zip(paths, paths2):
+        a, b = data.read_shard(p, dense=False), data.read_shard(q, dense=False)
+        assert sorted(a) == sorted(b) and all(np.array_equal(a[k], b[k]) for k in a if k != 'meta')
+    W = data.Window(paths, 72, 16, layout=LAY)
+    assert W.N == out['samples'] and W.tail.NT == sum(int(data.read_shard(p)['t_ptr'][-1]) for p in paths) > 0
+    for idx, b in data.batches(W, np.random.default_rng(0), 3, 16, tokens=(R.present_index(LAY), 8)):
+        assert len(b['ov']['row']) == W.ov.take(idx).NO
+    out, paths = selfplay(tmp_path / 'c', spec={'items0': 6, 'max_moves': 8, 'episodes': 3, 'items_step': 70}, games=4,
+                          conc=4)
+    assert out['games'] == 4 and out['unfinished'] == 4 and out['tail']['aborted_row_tokens'] == 4
+    assert out['samples'] > 0 and sum(data.shard_rows(p) for p in paths) == out['samples']

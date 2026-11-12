@@ -234,6 +234,43 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn active_seat(&self) -> Option<usize> {
         None
     }
+    /// **Chained episodes** (opt-in; docs/search.md 1.3, docs/az.md 42): this game's episodes are the parts of one
+    /// contest (MTG Zero: the games of a best-of-three match, each its own episode). An episode ends where `to_move()`
+    /// is None, and the search and the driver treat that state as any terminal: its `result()` and `margin()` are the
+    /// episode's (its records' z and sc, the values a simulation backs up there). Then the driver asks `next_episode`
+    /// how the contest goes on, and hands the contest out as one result row (docs/search.md 2.14). Default false: an
+    /// episode is a whole game, and nothing below is called.
+    fn chained(&self) -> bool {
+        false
+    }
+    /// A chained game's next episode, from the state where this one ended: `conceded` None when it ended by the rules
+    /// (`to_move()` None, neither deferred nor aborted), Some(seat) when that seat resigned it (the driver's resign
+    /// rule, docs/search.md 3.14, at a decision `can_concede()` allowed: the state is that decision's, before its move)
+    /// - the game counts the episode as lost by that seat. -> `Next::Continue(state)`: the contest goes on, the state's
+    /// first decision is the next episode's; `Next::Over(result)`: the contest is over, its result per seat (as
+    /// `result()`: it sums to 1, ties split). A function of the state alone (the contest replays from its seed and
+    /// actions). Default: the contest is this one episode; a concession is an error.
+    fn next_episode(&self, conceded: Option<usize>) -> Result<Next<Self>, String> {
+        match conceded {
+            None => Ok(Next::Over(self.result())),
+            Some(s) => Err(format!("{}: seat {s} conceded, but the game does not chain its episodes", Self::NAME)),
+        }
+    }
+    /// The self-play resign rule may count the pending decision's search (docs/search.md 3.14): a chained game marks
+    /// the decisions where no episode is in progress to concede false (MTG Zero: sideboarding between the games of a
+    /// match). Their searches neither extend nor break the rule's run. Default true (every decision).
+    fn can_concede(&self) -> bool {
+        true
+    }
+}
+
+/// What follows a chained game's episode (`SearchGame::next_episode`, docs/search.md 1.3).
+#[derive(Clone, Debug)]
+pub enum Next<G> {
+    /// The contest goes on: the state its next episode starts from.
+    Continue(G),
+    /// The contest is over: its result per seat.
+    Over([f32; MAX_SEATS]),
 }
 
 /// The root's belief of a search (docs/search.md 3.8): the network's auxiliary predictions for the

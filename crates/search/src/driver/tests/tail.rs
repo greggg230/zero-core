@@ -551,3 +551,85 @@ fn tail_keys_extend_the_head_key() {
     let c = obs_hash_row((1, 2), 8, &[0, 2], &[1, 2], &[1.0, 2.0, 3.0], &[]);
     assert!(a != b && b != c && a != c);
 }
+
+/// A record's tail tokens as `tail_of` gives a batch row's: (seg, slot, floats).
+fn record_tail(s: &Record) -> Vec<(u16, u32, Vec<f32>)> {
+    let mut off = 0;
+    (0..s.tail.len())
+        .map(|j| {
+            let w = width(s.tail.seg[j]);
+            let v = s.tail.val[off..off + w].to_vec();
+            off += w;
+            (s.tail.seg[j], s.tail.slot[j], v)
+        })
+        .collect()
+}
+
+/// A row as bits: player, head, tail tokens, overrides.
+fn row_key(p: i32, x: &[f32], t: &[(u16, u32, Vec<f32>)], o: &[(u32, i64)]) -> Vec<u64> {
+    let mut k = vec![p as u64];
+    k.extend(x.iter().map(|v| v.to_bits() as u64));
+    for (s, l, f) in t {
+        k.push(u64::MAX);
+        k.push(*s as u64);
+        k.push(*l as u64);
+        k.extend(f.iter().map(|v| v.to_bits() as u64));
+    }
+    for (i, tok) in o {
+        k.push(u64::MAX - 1);
+        k.push(*i as u64);
+        k.push(*tok as u64);
+    }
+    k
+}
+
+#[test]
+fn chained_contests_carry_every_episodes_tails_and_overrides() {
+    // a contest of three toy_tail games (docs/search.md 2.14 with 2.15): every episode's records keep their own tail
+    // and overrides - each record's row one the network was sent for its player, head, tail tokens and overrides bit
+    // for bit -, the contest's one row carries them all behind it, the sample arrays' CSRs exactly theirs; dense and
+    // sparse batches alike
+    for sparse in [false, true] {
+        let mut c = tcfg(seat(24, true), 8, r#"{"items0": 9, "max_moves": 16, "episodes": 3}"#);
+        c.sparse = sparse;
+        let mut d = Driver::<TailGame>::new(c).unwrap();
+        let (res, smp, rows) = run_tail(&mut d);
+        assert_eq!(res.len(), 8);
+        assert!(res.iter().all(|r| r.over && !r.aborted && r.abort_reason.is_none() && r.episodes.len() == 3), "{res:?}");
+        assert!(res.iter().all(|r| r.samples == r.episodes.iter().map(|e| e.samples).sum::<u32>() && r.episodes.iter().all(|e| e.over && e.samples > 0)));
+        assert_eq!(smp.len(), res.iter().map(|r| r.samples as usize).sum::<usize>());
+        let seen: std::collections::HashSet<Vec<u64>> = rows.iter().map(|(p, x, t, o)| row_key(*p, x, t, o)).collect();
+        for s in &smp {
+            assert!(seen.contains(&row_key(s.player as i32, &s.x, &record_tail(s), &s.ov)), "a record's row the network never saw");
+            crate::driver::check_overrides(&s.ov, s.opts.len());
+        }
+        assert!(smp.iter().filter(|s| !s.tail.is_empty()).count() > smp.len() / 4 && smp.iter().any(|s| !s.ov.is_empty()));
+        let a = sample_arrays_rows(&smp, TF, true, true);
+        assert_eq!(a.t_off.len(), smp.len() + 1);
+        assert_eq!(a.t_seg, smp.iter().flat_map(|s| s.tail.seg.iter().copied()).collect::<Vec<_>>());
+        assert_eq!(a.t_slot, smp.iter().flat_map(|s| s.tail.slot.iter().copied()).collect::<Vec<_>>());
+        assert_eq!(a.t_val, smp.iter().flat_map(|s| s.tail.val.iter().copied()).collect::<Vec<_>>());
+        assert_eq!(a.ov_tok, smp.iter().flat_map(|s| s.ov.iter().map(|o| o.1)).collect::<Vec<_>>());
+        for k in 0..smp.len() {
+            assert_eq!((a.t_off[k + 1] - a.t_off[k]) as usize, smp[k].tail.len());
+            assert_eq!((a.ov_off[k + 1] - a.ov_off[k]) as usize, smp[k].ov.len());
+        }
+    }
+}
+
+#[test]
+fn a_later_episode_over_the_row_limit_ends_the_contest_aborted() {
+    // game 2 starts from 6 + 70 items (`items_step`): its first row passes the limit - an aborted episode, no samples of
+    // its own; the contest unfinished, aborted for the row limit, game 1's samples kept behind its row
+    let mut d = Driver::<TailGame>::new(tcfg(seat(16, true), 4, r#"{"items0": 6, "max_moves": 10, "episodes": 3, "items_step": 70}"#)).unwrap();
+    let (res, smp, _) = run_tail(&mut d);
+    assert_eq!(res.len(), 4);
+    for r in &res {
+        assert!(!r.over && r.aborted && r.abort_reason == Some("max_row_tokens") && r.episodes.len() == 2, "{r:?}");
+        assert!(r.episodes[0].over && !r.episodes[0].aborted && r.episodes[0].samples > 0);
+        assert!(!r.episodes[1].over && r.episodes[1].aborted && r.episodes[1].samples == 0);
+        assert_eq!(r.samples, r.episodes[0].samples);
+    }
+    assert_eq!(smp.len(), res.iter().map(|r| r.samples as usize).sum::<usize>());
+    assert_eq!(d.stats().aborted_row_tokens, 4);
+}

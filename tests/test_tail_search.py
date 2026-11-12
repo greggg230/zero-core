@@ -324,3 +324,39 @@ def test_targets_quality_and_parity_h2h_on_tail_games(tail_ckpt):
                    verbose=False)
     assert h['games'] == 8 and 0.0 <= h['rust_score'] <= 1.0
     assert CountingEvaluator.seen['tail_tokens'] > 0
+
+
+@pytest.mark.parametrize('impl', ['py', 'rs'])
+def test_the_python_driver_chains_episodes_with_their_tails(impl):
+    """toy_tail as a chained contest of games (spec `episodes`, docs/az.md 42 with 43): every episode's samples keep
+    their own tails and overrides (each sample's tail its head's), the contest's one row counts them; a later game
+    over the row limit (`items_step`) is an aborted episode: the contest unfinished, aborted for the limit, the
+    earlier game's samples kept."""
+    seat = play.NNSeat('m', sims=12, selfplay=True, impl=impl, temp_moves=4)
+    d = play.PyDriver('toy_tail', 4, lambda k: [seat, seat], spec={'items0': 8, 'max_moves': 12, 'episodes': 2},
+                      concurrency=4, seed=3, record=True)
+    while (b := d.next_batch()) is not None:
+        d.submit(b.id, *_echo(b))
+    s = d.take_samples()
+    protocol.validate_samples(s, 72, tails=WIDTHS)
+    st = R.Tail.from_arrays(s, WIDTHS)
+    for i in range(len(s['player'])):
+        t = st.take([i])
+        assert _consistent(s['x'][i], {'t_seg': t.seg, 't_slot': t.slot, 't_val': t.val})
+    assert (st.counts() > 0).any() and R.Overrides.from_arrays(s).NO > 0
+    res = d.take_results()
+    assert len(res) == 4 and all(r['over'] and len(r['episodes']) == 2 and 'abort_reason' not in r for r in res)
+    assert sum(r['samples'] for r in res) == len(s['player'])
+    assert all(r['samples'] == sum(e['samples'] for e in r['episodes']) for r in res)
+    d = play.PyDriver('toy_tail', 2, lambda k: [seat, seat], concurrency=2, seed=3, record=True,
+                      spec={'items0': 6, 'max_moves': 8, 'episodes': 3, 'items_step': 70})
+    while (b := d.next_batch()) is not None:
+        d.submit(b.id, *_echo(b))
+    res = d.take_results()
+    assert len(res) == 2 and d.aborted_row_tokens == 2
+    for r in res:
+        assert r['aborted'] and not r['over'] and r['abort_reason'] == 'max_row_tokens' and len(r['episodes']) == 2
+        assert r['episodes'][0]['over'] and r['episodes'][0]['samples'] > 0
+        assert r['episodes'][1]['aborted'] and not r['episodes'][1]['over'] and r['episodes'][1]['samples'] == 0
+    s = d.take_samples()
+    assert len(s['player']) == sum(r['samples'] for r in res) and 't_off' in s

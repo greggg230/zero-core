@@ -330,9 +330,10 @@ TOY_TAIL_TOKENS_BASE = dict(TOY_TAIL_TOKENS, segments=TOY_TAIL_TOKENS['segments'
 
 # the core's own package: the toy games, zero._engine (crates/toy_py, tools/build_py.sh)
 CORE = GamePackage('zero', 'Zero Core', CORE_ROOT, engine='zero._engine', run_module='zero.run', game='toy',
-                   dashboard_port=None, hub_id=None, env_prefix='ZERO',
-                   tokens={'toy': TOY_TOKENS, 'toy_tail': TOY_TAIL_TOKENS},
-                   aux={'toy': TOY_AUX}, readers={'toy': TOY_READERS})
+                    dashboard_port=None, hub_id=None, env_prefix='ZERO',
+                    tokens={'toy': TOY_TOKENS, 'toy_tail': TOY_TAIL_TOKENS},
+                    aux={'toy': TOY_AUX, 'toy_match': TOY_AUX}, readers={'toy': TOY_READERS})
+# (toy_match, the core's chained-episodes game, docs/az.md 42: the toy's features first, so the toy's target too)
 
 
 class RowsMismatch(ValueError):

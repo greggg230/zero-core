@@ -84,8 +84,9 @@ def new_tally():
 
 def tally(rows, acc):
     """Add finished-game rows (accepted ones) to `acc` (new_tally). A row without `resign` (a game whose seats do
-    not resign) counts in `games` only."""
-    for r in rows:
+    not resign) counts in `games` only. A chained game's contest (docs/az.md 42) counts its episodes, each with its
+    own `resign`: the rule resigns a game of the contest, never the contest."""
+    for r in (e for row in rows for e in (row.get('episodes') or [row])):
         acc['games'] += 1
         x = r.get('resign')
         if not x:

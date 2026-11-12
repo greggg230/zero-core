@@ -52,6 +52,46 @@ def spec_json(spec):
     return spec if isinstance(spec, str) else json.dumps(spec)
 
 
+_CHAINED = {}
+
+
+def chained(game, spec, players=2):
+    """Whether `game` with `spec` chains its episodes (`SearchGame::chained`, docs/search.md 1.3, docs/az.md 42: a
+    contest of several episodes, e.g. MTG Zero's best-of-three with `"game_episodes": true`), asked of a game made
+    from the spec (cached). An engine built before chained episodes has no `chained`: False."""
+    key = (package.active().engine, game, spec_json(spec), int(players))
+    got = _CHAINED.get(key)
+    if got is None:
+        g = engine().Game(game, spec_json(spec), int(players), 0)
+        got = _CHAINED[key] = bool(getattr(g, 'chained', False))
+    return got
+
+
+def episodes_tag(game, spec, players=2):
+    """What a remote worker's hello and a remote evaluation's result report of a spec's episodes (docs/az.md 42):
+    'chained' when its games chain their episodes, '' otherwise (an older checkout reports nothing)."""
+    return 'chained' if chained(game, spec, players) else ''
+
+
+def episode_rows(r, me):
+    """A result row's games for seat `me` (docs/az.md 42): a chained contest's episodes as (score, margin, over),
+    nothing for any other row. `margin` = the episode's `margins[me]` (the game's own, e.g. a life difference)."""
+    return [(e['result'][me], e['margins'][me], e['over']) for e in r.get('episodes') or ()]
+
+
+def summarize_games(rows):
+    """Per-game numbers of a chained evaluation (docs/az.md 42) from `episode_rows`: {games, win, se, score, margin,
+    draws, unfinished}; None without any (an evaluation of whole games)."""
+    n = len(rows)
+    if not n:
+        return None
+    w = sum(r[0] for r in rows) / n
+    return {'games': n, 'win': round(w, 4), 'se': round((max(w * (1 - w), 1e-9) / n) ** 0.5, 4),
+            'score': sum(r[0] for r in rows), 'margin': round(sum(r[1] for r in rows) / n, 3),
+            'draws': sum(1 for r in rows if r[2] and abs(r[0] - 0.5) < 1e-6),
+            'unfinished': sum(1 for r in rows if not r[2])}
+
+
 # External players: name -> factory(seed) -> callable(LeafBatch) -> list of payload strings.
 def _toyheur(seed=0):
     from .toybots import heuristic_external

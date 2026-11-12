@@ -155,6 +155,14 @@ def _value_choice_of(cfg):
     return value_choice_tag(cfg.get('selfplay_value_choice_worlds', 0) or 0, cfg.get('selfplay_value_choice_temp', 0.0) or 0.0)
 
 
+def _episodes_of(cfg):
+    """A run's self-play episodes (docs/az.md 42; '' unless its spec's games chain their episodes, 'chained'): what a
+    worker's hello reports and the run checks - an older checkout would play a whole contest (MTG Zero: a
+    best-of-three match) as one episode, every row labelled with the contest's result, in silence."""
+    from .games import episodes_tag
+    return episodes_tag(cfg['game'], cfg.get('spec', ''), (cfg.get('players') or [2])[0])
+
+
 def _forks_of(fk):
     """A run's branched games and archive starts as its driver plays them (`forks.fingerprint` of a Run's
     `forks`, '' when off): what a worker's hello reports and the run checks (docs/az.md 24)."""
@@ -1202,6 +1210,11 @@ class RemotePlay:
                     # a checkout without value choices would search them as any decision, recorded, in silence:
                     # never used (docs/az.md 39)
                     s.no_value_choice = ev.get('value_choice')
+                want_e = _episodes_of(self.R.cfg) if self.mode == 'selfplay' else ''
+                if want_e and ev.get('episodes') != want_e:
+                    # a checkout without chained episodes would play a whole contest as one episode, its rows
+                    # labelled with the contest's result, in silence: never used (docs/az.md 42)
+                    s.no_episodes = ev.get('episodes')
                 if h.fails or s.k == 0:
                     h.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {h.rdir})')
             elif kind == 'status':
@@ -1358,6 +1371,13 @@ class RemotePlay:
             h.fail_log(f'worker {k} REFUSED: its checkout plays self-play information-set merging as '
                        f'{s.no_merge!r}, the run as {_merge_of(self.R.cfg)!r} (an older checkout has none: '
                        f'docs/az.md 30); killed, retried in 10 minutes')
+            s.kill()
+            return
+        if hasattr(s, 'no_episodes'):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout plays the episodes of the run\'s spec as {s.no_episodes!r}, the '
+                       f'run as {_episodes_of(self.R.cfg)!r} (an older checkout plays a whole contest as one episode: '
+                       f'docs/az.md 42); killed, retried in 10 minutes')
             s.kill()
             return
         if hasattr(s, 'no_value_choice'):
@@ -2398,7 +2418,8 @@ class Worker:
                       **({} if self.test.get('no_merge') else {'merge': _merge_of(self.cfg)}),
                       **({} if self.test.get('no_value_choice') else {'value_choice': _value_choice_of(self.cfg)}),
                       # (variable-length rows: this checkout carries tails and overrides end to end, R13)
-                      **({} if self.test.get('no_tails') else {'caps': ['tails']}))
+                      **({} if self.test.get('no_tails') else {'caps': ['tails']}),
+                      **({} if self.test.get('no_episodes') else {'episodes': _episodes_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

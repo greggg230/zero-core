@@ -348,7 +348,7 @@ def make_bot(game, name, rng):
 
 class Slot:
     __slots__ = ('gid', 'rng', 'np_rng', 'search_rng', 'game', 'n', 'seats', 'bots', 'trees', 'sims', 'target',
-                 'full', 'records', 'decisions', 'steps', 'view_wait', 'belief', 'abort')
+                 'full', 'records', 'decisions', 'steps', 'view_wait', 'belief', 'abort', 'chain')
 
     def __init__(self, gid, game, spec, seats, rng):
         from .games import engine
@@ -371,6 +371,9 @@ class Slot:
         self.view_wait = []                 # value-only records waiting for (record index, observer)'s next search
         self.belief = False                 # the current search takes the root's belief
         self.abort = None                   # the driver aborted the game ('max_row_tokens', docs/search.md 2.15)
+        # a chained game's contest so far (docs/search.md 2.14): its episodes, their samples, its counts, its result
+        self.chain = {'episodes': [], 'samples': [], 'steps': 0, 'decisions': 0, 'result': None} if getattr(
+            self.game, 'chained', False) else None
 
 
 class PyDriver:
@@ -476,6 +479,8 @@ class PyDriver:
             while True:
                 g = slot.game
                 if g.over or slot.steps >= self.max_steps or slot.abort:
+                    if self._episode_end(slot):
+                        continue                    # (a chained game's next episode, docs/search.md 2.14)
                     finished.append(slot)
                     break
                 legal = g.legal()
@@ -682,9 +687,64 @@ class PyDriver:
         slot.sims = 0
         slot.target = None
 
+    def _episode_end(self, slot):
+        """A chained game's episode ended (docs/search.md 2.14; the Rust driver's `finish_episode`): its records
+        labelled with its outcome into the contest's samples, its row into the contest's episodes; -> True when the slot
+        goes on with the next episode (`next_episode`'s state: fresh trees and records, decisions and moves counted from
+        0), False when the contest is over or the episode was cut / aborted (`_finish` hands out the contest's row). A
+        game that does not chain: False, nothing done."""
+        ch = slot.chain
+        if ch is None:
+            return False
+        g = slot.game
+        n = slot.n
+        # (an episode the driver aborted for the row limit, docs/search.md 2.15: aborted, no samples, the contest ends)
+        over = g.over and not g.aborted and not slot.abort
+        res = list(g.result()) if over else [1.0 / n] * n
+        margins = [g.margin(i) for i in range(n)] if over else [0.0] * n
+        k = len(slot.records) if self.record and over else 0
+        if k:
+            # (each record's tail and overrides with it, as `_finish`'s samples: docs/search.md 2.15)
+            ch['samples'].append(_sample_arrays(slot.records, res, margins, n, self.rk))
+        ch['episodes'].append({'over': over, 'aborted': bool(g.aborted) or slot.abort is not None, 'result': res,
+                               'margins': margins,
+                               'steps': slot.steps, 'decisions': slot.decisions, 'ext_moves': 0, 'rounds': g.rounds,
+                               'samples': k})
+        ch['steps'] += slot.steps
+        ch['decisions'] += slot.decisions
+        nxt, ch['result'] = g.next_episode() if over else (None, None)
+        if nxt is None:
+            return False
+        slot.game = nxt
+        slot.trees.clear()
+        slot.sims = 0
+        slot.target = None
+        slot.full = True
+        slot.belief = False
+        slot.records = []
+        slot.view_wait = []
+        slot.decisions = 0
+        slot.steps = 0
+        return True
+
     def _finish(self, slot):
         g = slot.game
         n = slot.n
+        ch = slot.chain
+        if ch is not None:
+            # a chained game's contest (docs/search.md 2.14): one row, the episodes' samples behind it (an episode the
+            # driver aborted for the row limit ends the contest unfinished, docs/search.md 2.15)
+            r = ch['result']
+            self.results.append({'gid': slot.gid, 'n': n, 'over': r is not None,
+                                 'aborted': bool(r is None and (g.aborted or slot.abort is not None)),
+                                 'result': list(r) if r is not None else [1.0 / n] * n,
+                                 'scores': g.scores(), 'steps': ch['steps'], 'decisions': ch['decisions'],
+                                 'ext_moves': 0, 'rounds': g.rounds, 'samples': sum(e['samples'] for e in ch['episodes']),
+                                 'episodes': ch['episodes']})
+            if slot.abort:
+                self.results[-1]['abort_reason'] = slot.abort
+            self.samples.extend(ch['samples'])
+            return
         # (an aborted game has no result: as unfinished; so has one the driver aborted for the row limit)
         over = g.over and not g.aborted and not slot.abort
         if over and g.deferred:

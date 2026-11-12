@@ -23,7 +23,14 @@
 //!
 //! Chance: each added item's value, key `CHANCE | value` (forceable). `determinize` reseeds the future values
 //! only (perfect information otherwise). `encode` panics on a state with a tail (R1): more than 4 items or a mark.
-use crate::game::{SearchGame, MAX_SEATS};
+//!
+//! Chained episodes (opt-in, spec `"episodes": k` > 1; docs/search.md 1.3, 2.14 - variable-length rows across a
+//! contest's episodes): a contest of k games, each an episode; game e (from 0) starts from `items0 + e * items_step`
+//! items (spec `items_step`, default 0: a later game can pass the row limit) drawn from the contest's RNG, the other
+//! player to move first; the contest's result splits its points by game wins (a drawn game half each), a conceded
+//! game lost by its conceding seat. The encoding is the game's alone (the contest is not observed). Without
+//! `episodes` (or 1) the game of before, byte for byte.
+use crate::game::{Next, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
 use crate::tail::{pack_tok, TailBuf, TailSeg};
 
@@ -52,6 +59,10 @@ pub static TAILS: [TailSeg; 2] = [TailSeg { seg: SEG_ITEMS, name: "items", width
 pub struct TailSpec {
     pub items0: usize,
     pub max_moves: u32,
+    /// Games of a chained contest (1: not chained).
+    pub episodes: u32,
+    /// Items more at each later game's start.
+    pub items_step: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -74,6 +85,15 @@ pub struct TailGame {
     over: bool,
     rng: Rng,
     forced: Vec<u64>,
+    /// A chained contest (`episodes` > 1): its spec, the games played before this one and their points per seat.
+    contest: Option<Box<Contest>>,
+}
+
+#[derive(Clone, Debug)]
+struct Contest {
+    spec: TailSpec,
+    played: u32,
+    points: [f32; 2],
 }
 
 impl TailGame {
@@ -128,11 +148,13 @@ impl SearchGame for TailGame {
     fn parse_spec(json: &str) -> Result<TailSpec, String> {
         let v: serde_json::Value = if json.trim().is_empty() { serde_json::json!({}) } else { serde_json::from_str(json).map_err(|e| format!("toy_tail spec: {e}"))? };
         let o = v.as_object().ok_or("toy_tail spec: a JSON object")?;
-        let mut spec = TailSpec { items0: 3, max_moves: 40 };
+        let mut spec = TailSpec { items0: 3, max_moves: 40, episodes: 1, items_step: 0 };
         for (k, x) in o {
             match k.as_str() {
                 "items0" => spec.items0 = x.as_u64().filter(|&n| n <= 100_000).ok_or("toy_tail spec: items0 is an integer 0..100000")? as usize,
                 "max_moves" => spec.max_moves = x.as_u64().filter(|&n| (1..=10_000).contains(&n)).ok_or("toy_tail spec: max_moves is an integer 1..10000")? as u32,
+                "episodes" => spec.episodes = x.as_u64().filter(|&n| (1..=9).contains(&n)).ok_or("toy_tail spec: episodes is an integer 1..9")? as u32,
+                "items_step" => spec.items_step = x.as_u64().filter(|&n| n <= 100_000).ok_or("toy_tail spec: items_step is an integer 0..100000")? as usize,
                 _ => return Err(format!("toy_tail spec: unknown key {k:?}")),
             }
         }
@@ -145,7 +167,8 @@ impl SearchGame for TailGame {
         }
         let mut rng = Rng::new(seed);
         let items = (0..spec.items0).map(|_| Item { value: 1 + rng.below(9) as u8, mark: 0 }).collect();
-        Ok(TailGame { items, scores: [0; 2], moves: 0, max_moves: spec.max_moves, cur: 0, page: 0, adds: [false; 2], over: false, rng, forced: Vec::new() })
+        let contest = (spec.episodes > 1).then(|| Box::new(Contest { spec: spec.clone(), played: 0, points: [0.0; 2] }));
+        Ok(TailGame { items, scores: [0; 2], moves: 0, max_moves: spec.max_moves, cur: 0, page: 0, adds: [false; 2], over: false, rng, forced: Vec::new(), contest })
     }
 
     fn num_players(&self) -> usize {
@@ -289,11 +312,56 @@ impl SearchGame for TailGame {
     }
 
     fn export_state(&self) -> String {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "items": self.items.iter().map(|it| [it.value, it.mark]).collect::<Vec<_>>(),
             "scores": self.scores, "moves": self.moves, "to_move": self.cur, "page": self.page, "over": self.over,
-        })
-        .to_string()
+        });
+        if let Some(c) = &self.contest {
+            v["game"] = serde_json::json!(c.played);
+            v["points"] = serde_json::json!(c.points);
+        }
+        v.to_string()
+    }
+
+    fn chained(&self) -> bool {
+        self.contest.is_some()
+    }
+
+    fn next_episode(&self, conceded: Option<usize>) -> Result<Next<Self>, String> {
+        let Some(c) = &self.contest else {
+            return match conceded {
+                None => Ok(Next::Over(self.result())),
+                Some(s) => Err(format!("toy_tail: seat {s} conceded, but the game does not chain its episodes")),
+            };
+        };
+        let r = match conceded {
+            None if self.over => self.result(),
+            None => return Err("toy_tail: next_episode before the game's end".into()),
+            Some(p) if p < 2 && !self.over => {
+                let mut r = [0.0; MAX_SEATS];
+                r[1 - p] = 1.0;
+                r
+            }
+            Some(p) => return Err(format!("toy_tail: seat {p} concedes, but no game is in progress")),
+        };
+        let mut c = c.clone();
+        c.points[0] += r[0];
+        c.points[1] += r[1];
+        c.played += 1;
+        if c.played >= c.spec.episodes {
+            let mut out = [0.0; MAX_SEATS];
+            match c.points[0].partial_cmp(&c.points[1]) {
+                Some(std::cmp::Ordering::Greater) => out[0] = 1.0,
+                Some(std::cmp::Ordering::Less) => out[1] = 1.0,
+                _ => out[..2].fill(0.5),
+            }
+            return Ok(Next::Over(out));
+        }
+        let mut rng = Rng::new(self.rng.clone().next_u64() ^ 0x6570_6973_6f64_6500 ^ c.played as u64);
+        let n = c.spec.items0 + c.played as usize * c.spec.items_step;
+        let items = (0..n).map(|_| Item { value: 1 + rng.below(9) as u8, mark: 0 }).collect();
+        let cur = (c.played % 2) as u8;
+        Ok(Next::Continue(TailGame { items, scores: [0; 2], moves: 0, max_moves: c.spec.max_moves, cur, page: 0, adds: [false; 2], over: false, rng, forced: Vec::new(), contest: Some(c) }))
     }
 }
 
