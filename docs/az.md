@@ -5605,3 +5605,107 @@ job before any game. zero_search unchanged.
 phase 0a's recorded batches: 256 rows (7 belief, 60 value-only) in 3 batches, 357 KB; onnxruntime vs torch 4.6e-6 (margin;
 priors 4.5e-7, value 1.2e-6, aux 2.7e-7); `mtgz-worker`'s self-test on it 4.59e-6 in 0.16 s; with one prior off by 1e-3 the
 job stops before its first game.
+
+### 42.2 Eval jobs and farm head-to-heads (no setting; zero-farm phase 2, 2026-11-12)
+
+**Why.** An A/B of two checkpoints (zero.h2h) costs hours of a desktop's CPU; zero-farm (PROTOCOL.md 5.2, rev 5)
+lets friends' idle PCs play the games of an evaluation match. Each eval lease is a block of the match's game ids;
+the native worker plays exactly those games of the match a run's own evaluation would play, and the desktop reads
+the rows like a local match.
+
+**What it does** (`zero_worker::evaljob`, `zero.farm_eval`, `zero.farm_h2h`):
+
+* **The games**: an eval job of games `gid_base .. gid_base + games` between two seats (`{"net": <gen>}` - a
+  network of the job's `models` - or `{"bot": <name>}`, a built-in bot; `ext:` refused) is `Run.play_match`'s
+  match: seats `Run.nn_seat(key, c['eval_sims'])` ('m' in seats[0], 'o' in seats[1]; `settings::eval_seat`, the
+  `games.nn_seat` port the self-play seat now shares), game g with `seats` for even g and the seats swapped for
+  odd g, `Run.driver(table, seed, conc=min(conc, games), paired)` - the run's `eval_spec`, threads, groups,
+  max_steps (`settings::eval_driver_cfg`; a job's own threads / conc / groups over the run's, as for self-play).
+  The worker plays the lease as a rolling `queue_only` driver with the lease's setups all queued before its first
+  resume and `set_first_gid(gid_base)` (docs/search.md 2.14): with one group, the fixed table's batches in its
+  order. `eval_spec` must be set (Python falls back to the game package's `eval_specs` hook, which a worker cannot
+  run): the desktop resolves it (`farm_eval.resolve_eval_spec`, `Run.driver`'s rule).
+* **The networks**: one ONNX Runtime session per generation of the job's `models`, each file's sha256 checked
+  and each self-tested before any game (`selftest` with its `gen`; a failure is fatal); a batch goes to its key's
+  generation (`ByKey`). Stats' `selftest_max_abs` is the largest of them.
+* **The rows**: one JSON line per game, `{"gid", "pair", "seats", "result", "margin", "rounds", "over"}` (`pair`
+  gid // 2, null unpaired; `seats` that game's order; `result` per seat in it; `margin` seat 0's score minus the
+  best other seat's, `Run.play_match`'s margin from seat 0) exactly as `json.dumps(row, separators=(',', ':'))`
+  writes it (`evaljob::row_json` = `farm_eval.row_json`). Files `e_SSS.jsonl` of whole pairs, every 16 complete
+  games or 120 s and at the end, each announced by `evals` (`shard`'s fields). `finish` drops the queued setups
+  (`Driver::clear_queue`) and the games in flight finish; `quit` ends the driver's phase and flushes what
+  finished (a pair's lone game too); yield / resume as for self-play; `checkpoint` is refused (non-fatal).
+* **check-config --eval** (`classify::classify_eval`): the settings an evaluation match reads
+  (`settings::EVAL_READS`, 33) are `play`, every other known setting unused (`trainer`: a self-play feature that is
+  Python-only does not change an evaluation's games), unknown keys refused; then the match's driver is built (the
+  seats' checks, the eval spec, the bots of the game). `serve` refuses an eval job whose settings fail it.
+  `tests/test_worker_settings.py::test_eval_jobs_read_what_an_evaluation_match_reads` checks EVAL_READS against
+  the keys `Run.nn_seat` and `Run.driver` read (an instrumented dict over the variants that read conditional
+  ones). A game package's own run settings (`GamePackage.settings`, 40) are classified by the worker binary
+  (`Worker::package_settings`; MTG Zero lists its 13).
+* **The softmax** (`eval::softmax_exact` / `onnx_parity.exact_softmax`): the generic step's exp is now computed
+  through a fixed sequence of float64 IEEE operations (Cody-Waite reduction by ln 2, the degree-13 Taylor
+  polynomial by Horner, an exact scaling by 2^n, one rounding to float32; no libm, no FMA) and the sum in float32
+  in order, so the native worker on any machine and numpy compute the same priors bit for bit. numpy's float32
+  `exp` differs from it in the last bit on 32% of 150k points in [-110, 0] (and so did the CRT's `expf` the worker
+  used): one bit of a prior can turn a searched move, and the gate compares games byte for byte. The new exp equals
+  float64 `exp` rounded to float32 on all 150k points. Every evaluator that uses the generic step (the worker's,
+  `OnnxEvaluator`, `check_reference`) uses it; `infer.segment_softmax_np` (torch's evaluators) is unchanged.
+* **`python -m zero.farm_h2h`** (game packages wrap it: `python -m mtgz.az.farm_h2h`): `--a`, `--b`, `--games`,
+  `--build`, `--runtime` [`--config` | `--preset`] [`--sims`] [`--name`] [`--seed`] ...: the settings (default: A's
+  run's config.json, resolved; `--sims` sets eval_sims; eval_spec resolved; the seats checked), both checkpoints
+  exported (`onnx_export`, packed) with reference sets (256 rows of a short recorded self-play of A, or
+  `--reference-batches`; checked through onnxruntime, 2e-5), the run `h2h-<slug>` put with `eval: null`, the
+  graphs and reference sets uploaded, gens 1 (A) and 2 (B) registered, then the eval batch (`checkpoints [1, 2]`,
+  seats [{"net": 1}, {"net": 2}], paired); then it polls the results, reads each chunk as the coordinator credits
+  it (its `ids` rows, plus its `also` entries' rows: a pair counts only when both games come from one lease),
+  acks what it saved and prints a progress line, and at the end A's score +- the pair se, the Elo difference with
+  its 95% interval, the games and the machines, and the JSON line `zero.h2h.summary` gives (plus `elo_95`,
+  `machines`, `run`). `--resume NAME` re-attaches (every step idempotent, state in `~/.zero-farm/h2h/<run>/`),
+  `--cancel NAME` pauses the run. The admin token is read from `~/.config/zero-farm/admin_token` and never printed.
+
+**Not zero.h2h's seats.** zero.h2h builds its seats from `games.nn_seat(key, sims, c_puct, chance_k)` and the
+checkpoint's run's rule keys (`run_rule`), and plays the game package's default spec unless `--spec`: it leaves out
+the run's `margin_w`, `redet` and `eval_cache` and its `eval_spec`. A farm head-to-head plays the run's own
+evaluation (Run.play_match's seats and spec) - the same as zero.h2h for a run whose margin_w is 0, redet on,
+eval_cache 0, when zero.h2h is given `--spec <eval_spec>`. The readout's fields are zero.h2h's, so the numbers
+compare directly.
+
+**Off by default.** Nothing in a run changes: an eval job is a worker's, `zero.farm_h2h` a desktop command.
+The softmax change touches only the ONNX evaluators (the worker's and `OnnxEvaluator`, the farm's), never a run's
+torch inference.
+
+**Tests and checks.** zero_search: `a_queued_rolling_driver_plays_a_fixed_tables_match_batch_for_batch`,
+`clear_queue_starts_no_new_game` (153 pass). `cargo test -p zero_worker`: 17 unit (the exp equals float64's rounded,
+the softmax, check-config's eval classes and package settings, compact JSON) + 5 eval job tests on the toy game
+(the rows, whole pairs per file, a lease of games 6.. equal to the whole match's rows, yield / resume changes
+nothing, quit / finish, network against the bot, the refusals) + the 4 job tests. `tests/test_farm_h2h.py` (a fake
+coordinator that plays the batch with the uploaded graphs and hands it out as the coordinator credits it). MTG
+Zero: `tests/test_worker_farm.py` (an eval job over aw/1 byte-identical to the Python path on small random MTG
+networks, a lease of the second pair, network against the heuristic bot; check-config --eval and the package's
+settings).
+
+**The eval gate** (`tools/worker_eval_gate.py`): the Python path - `farm_eval.match_driver` (Run.play_match's
+driver) driven by `infer.drive` with `OnnxEvaluator` on the same graphs - against `mtgz-worker eval`, the same
+settings (groups 1), seeds, search threads (4) and ONNX Runtime threads (4); every row compared byte for byte, and
+the first 60 batches each side sent in every array.
+
+**Measured** (2026-11-12, the desktop, CPU only, shared with the live runs): the eval gate, eoe1 iter 80 (A) against iter 70 (B), eoe1's settings
+with groups 1 and 4 search + 4 ONNX Runtime threads on both sides, eval_sims 32, the 'cq' rule, paired:
+
+| case | games | rows identical | batches compared | native | Python | readout (zero.h2h.summary) |
+|---|---|---|---|---|---|---|
+| iter 80 vs iter 70, seed 31 | 20 | **20 of 20** | 60, identical | 190 s | 230 s | A 0.500 +- 0.105 (pairs: 2 both won, 6 split, 2 both lost) |
+| iter 80 vs iter 70, seed 1031 | 40 | **40 of 40** | 60, identical | 881 s | 698 s | A 0.550 +- 0.050, Elo +35 (95%: -34 .. +106) |
+| iter 80 vs the heuristic bot, seed 7 | 12 | **12 of 12** | 60, identical | 27 s | 34 s | iter 80 scores 1 of 12 (eoe1's own evaluation: 22 +- 4% of 100) |
+
+(the desktop at 100% CPU during the second; both sides' self-tests 7.0e-6 / 4.6e-6.) **A lease is the match's games**:
+leases of games 0..10 and 10..20 (conc 10 instead of 20: other batches) played the same 20 rows, byte for byte, as the
+20-game match. **Settings, every preset and run config** (`tools/driver_settings_dump.py --compare-worker --eval`): the
+eval driver of 82 of 82 MTG Zero presets and run configs is the same in the worker as in Python (`toy-cotrain-smoke`
+refused by both before); the self-play path after the seat port's refactor: 76 agree, 6 refused as Python-only, 0
+different (as before). **End to end** (MTG Zero ENGINE.md 114.4): a local coordinator (rev 5) and the real agent engine
+(0.2.4) with the published worker build played a farm_h2h batch of 8 games in two leases (groups 3, the runtime
+pack's ONNX Runtime): every per-gen self-test passed, all 8 games credited, and the 8 rows are byte-identical to a local
+Python evaluation of the same 8 games in one driver. The exact exp equals float64 `exp` rounded to float32 on 150,479
+points of [-110, 0]; numpy's float32 `exp` differs from it on 47,643 of them.

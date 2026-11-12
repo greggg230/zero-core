@@ -435,7 +435,8 @@ def progress_line(d, st, t0, n0, es=None):
     from . import farm_eval as FE
     rows = rows_of(d)
     n = len(rows)
-    rate = (n - n0) / max(1e-9, (time.time() - t0) / 60)
+    # (games per minute since the batch was put: a re-attached watch counts the games already in too)
+    rate = n / max(1e-9, (time.time() - st.get('created', t0)) / 60)
     if rows and len(rows) >= 2:
         try:
             s = FE.summary(rows, True, {'net': 1})
