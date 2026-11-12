@@ -26,7 +26,7 @@ use serde_json::{json, Map, Value};
 use zero_search::driver::{Batch, NnSeat, SeatCfg};
 use zero_search::dynapi::DynDriver;
 
-use crate::eval::{Answer, Evaluator, Expect, OrtCfg, OrtEvaluator, Uniform};
+use crate::eval::{Answer, Evaluator, Expect, OrtCfg, Uniform};
 use crate::settings::{selfplay_driver_cfg, spec_of, Settings};
 use crate::shard::{GameSamples, Npy, ShardWriter, Written};
 use crate::GameEntry;
@@ -322,53 +322,7 @@ pub(crate) fn check_file_sha256(model: &std::path::Path, want: &str, gen: Option
 pub(crate) fn build_eval(kind: &EvalKind, want: &Expect, sink: &dyn Sink, progress: &Mutex<Progress>, gen: Option<u32>) -> Result<Box<dyn Evaluator>, String> {
     Ok(match kind {
         EvalKind::Uniform => Box::new(Uniform),
-        EvalKind::Onnx { model, ort, sha256, reference } => {
-            // the model FILE's sha256, before ONNX Runtime reads a byte of it (self-play and eval alike)
-            if let Some(h) = sha256 {
-                check_file_sha256(model, h, gen)?;
-            }
-            let w = want.clone();
-            let mut ev = OrtEvaluator::load(model, ort.clone(), &w)?;
-            match reference {
-                Some(r) => {
-                    let t0 = Instant::now();
-                    let set = crate::selftest::load(r)?;
-                    crate::selftest::check_meta(&set, &w, &ev.meta)?;
-                    let st = crate::selftest::run(&mut ev, &set)?;
-                    // (the self-test's batches are not the job's)
-                    ev.calls = 0;
-                    ev.rows = 0;
-                    ev.run_s = 0.0;
-                    ev.batch_ms.clear();
-                    let max_abs = if st.max_abs.is_finite() { json!(st.max_abs) } else { json!("inf") };
-                    let mut ev_line = json!({"ev": "selftest", "provider": "cpu", "max_abs": max_abs, "ok": st.ok, "rows": st.rows,
-                                      "items": {"priors": st.items[0], "value": st.items[1], "margin": st.items[2], "aux": st.items[3]},
-                                      "seconds": (t0.elapsed().as_secs_f64() * 1000.0).round() / 1000.0});
-                    if let Some(g) = gen {
-                        ev_line["gen"] = json!(g);
-                    }
-                    sink.event(ev_line);
-                    progress.lock().unwrap().selftest_max_abs = Some(st.max_abs);
-                    if !st.ok {
-                        return Err(format!(
-                            "selftest failed{}: the network's answers on this machine differ from torch's by {:e} (> {:e}; priors {:e}, value {:e}, margin {:e}, aux {:e}) on {} reference rows ({}): not playing with this evaluator",
-                            gen.map_or(String::new(), |g| format!(" (gen {g})")),
-                            st.max_abs,
-                            crate::selftest::TOL,
-                            st.items[0],
-                            st.items[1],
-                            st.items[2],
-                            st.items[3],
-                            st.rows,
-                            r.display()
-                        ));
-                    }
-                    sink.log(&format!("selftest passed{}: max abs {:e} on {} rows ({})", gen.map_or(String::new(), |g| format!(" (gen {g})")), st.max_abs, st.rows, r.display()));
-                }
-                None => sink.log("no reference set: the self-test is skipped"),
-            }
-            Box::new(ev)
-        }
+        EvalKind::Onnx { model, ort, sha256, reference } => crate::session::build_evaluator(model, ort, sha256.as_deref(), reference.as_deref(), want, sink, progress, gen)?,
     })
 }
 
@@ -682,10 +636,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         let mut p = progress.lock().unwrap();
         p.concurrency = cfg.concurrency;
         p.threads = cfg.threads;
-        p.provider = match &job.eval {
-            EvalKind::Uniform => "uniform".into(),
-            EvalKind::Onnx { .. } => "cpu".into(),
-        };
+        p.provider = ev.provider();
     }
     if cfg.concurrency == 0 {
         return Err("conc 0: no game would ever start (the setup cap is the games in flight)".into());
@@ -823,7 +774,7 @@ mod tests {
         // a wrong hash ends the job before ONNX Runtime is touched (there is no runtime here at all; the right hash
         // reaching the loader is the worker's integration tests': MTG Zero tests/test_worker_farm.py)
         let want = Expect { game: "toy".into(), features: 1, actions: 1, aux_width: 0, belief: false };
-        let ort = OrtCfg { dylib: d.join("no-onnxruntime.dll"), intra_threads: 1, spinning: false };
+        let ort = OrtCfg::cpu(d.join("no-onnxruntime.dll"), 1, false);
         let progress = Mutex::new(Progress::default());
         let kind = EvalKind::Onnx { model: p.clone(), ort, sha256: Some(bad.clone()), reference: None };
         match build_eval(&kind, &want, &Quiet, &progress, Some(1)) {
