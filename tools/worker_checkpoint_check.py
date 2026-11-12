@@ -48,7 +48,7 @@ def main():
         p.stdin.write(json.dumps(o) + '\n')
         p.stdin.flush()
 
-    send({'op': 'job', 'lease_id': 'l_ck', 'kind': 'selfplay', 'settings': settings, 'games': a.games, 'gid_base': 0,
+    send({'op': 'job', 'lease_id': 'l_ck', 'kind': 'selfplay', 'output': 'shards', 'settings': settings, 'games': a.games, 'gid_base': 0,
           'seed': a.seed, 'gen': a.gen, 'model': os.path.abspath(a.onnx), 'threads': a.threads, 'out_dir': 'out'})
     while not any(e['ev'] == 'fin' for e in events):
         if any(e['ev'] == 'error' for e in events):

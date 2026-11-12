@@ -57,7 +57,7 @@ def run(a, settings, out, do_yield):
 
     hello = wait_for(lambda e: e['ev'] == 'hello', 10)
     times['hello_s'] = None if hello is None else round(hello['_t'], 3)
-    send({'op': 'job', 'lease_id': 'l_check', 'kind': 'selfplay', 'settings': settings, 'games': a.games, 'gid_base': 0,
+    send({'op': 'job', 'lease_id': 'l_check', 'kind': 'selfplay', 'output': 'shards', 'settings': settings, 'games': a.games, 'gid_base': 0,
           'seed': a.seed, 'model': os.path.abspath(a.onnx), 'reference': None, 'threads': a.threads, 'out_dir': 'out'})
     if do_yield:
         wait_for(lambda e: e['ev'] == 'fin', 3600)

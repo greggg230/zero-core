@@ -56,7 +56,7 @@ def native(a, cfg, out, seed, net):
                          bufsize=1)
     events = []
     threading.Thread(target=lambda: [events.append(json.loads(ln)) for ln in p.stdout if ln.strip()], daemon=True).start()
-    job = {'op': 'job', 'lease_id': 'bench', 'kind': 'selfplay', 'settings': cfg, 'games': 1_000_000, 'gid_base': 0,
+    job = {'op': 'job', 'lease_id': 'bench', 'kind': 'selfplay', 'output': 'shards', 'settings': cfg, 'games': 1_000_000, 'gid_base': 0,
            'seed': seed, 'gen': net, 'model': os.path.abspath(a.onnx), 'threads': int(cfg['threads']), 'out_dir': 'out'}
     if a.infer_threads:
         job['infer_threads'] = a.infer_threads
