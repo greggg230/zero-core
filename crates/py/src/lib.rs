@@ -321,6 +321,18 @@ fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyRes
     }))
 }
 
+/// A result row's resignation (`ResignInfo`, docs/search.md 3.14) as a dict.
+fn resign_dict<'py>(py: Python<'py>, rs: &zero_search::driver::ResignInfo) -> PyResult<Bound<'py, PyDict>> {
+    let rd = PyDict::new(py);
+    rd.set_item("resigned", rs.resigned)?;
+    rd.set_item("noresign", rs.noresign)?;
+    rd.set_item("winner", rs.winner)?;
+    rd.set_item("decision", rs.decision)?;
+    rd.set_item("step", rs.step)?;
+    rd.set_item("records", rs.records)?;
+    Ok(rd)
+}
+
 fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("name", i.name)?;
@@ -534,6 +546,24 @@ impl PyGame {
     }
     fn apply_external(&mut self, payload: &str) -> PyResult<Vec<u64>> {
         self.g.apply_external(payload).map_err(verr)
+    }
+    /// The game chains its episodes (`SearchGame::chained`, docs/search.md 1.3): an episode ends where it is over, and
+    /// `next_episode` says how the contest goes on.
+    #[getter]
+    fn chained(&self) -> bool {
+        self.g.chained()
+    }
+    /// A chained game's next episode from this ended one (`conceded`: the seat that resigned it, at a decision in
+    /// progress; None: it is over) -> (the next episode's game, None), or (None, the contest's result per seat).
+    #[pyo3(signature = (conceded=None))]
+    fn next_episode(&self, conceded: Option<usize>) -> PyResult<(Option<PyGame>, Option<Vec<f32>>)> {
+        let (g, r) = self.g.next_episode(conceded).map_err(verr)?;
+        Ok((g.map(|g| PyGame { g }), r))
+    }
+    /// The self-play resign rule may count the pending decision (`SearchGame::can_concede`).
+    #[getter]
+    fn can_concede(&self) -> bool {
+        self.g.can_concede()
     }
     /// A Rust search tree for the pending decision.
     #[pyo3(signature = (redet=true, seed=0))]
@@ -980,16 +1010,30 @@ impl PySearchDriver {
                 // a game started from an archive entry (DriverCfg::starts)
                 d.set_item("start", j)?;
             }
+            if !r.episodes.is_empty() {
+                // a chained game's contest (SearchGame::chained, docs/search.md 2.14): its episodes
+                let eps = PyList::empty(py);
+                for e in &r.episodes {
+                    let ed = PyDict::new(py);
+                    ed.set_item("over", e.over)?;
+                    ed.set_item("aborted", e.aborted)?;
+                    ed.set_item("result", e.result.clone())?;
+                    ed.set_item("margins", e.margins.clone())?;
+                    ed.set_item("steps", e.steps)?;
+                    ed.set_item("decisions", e.decisions)?;
+                    ed.set_item("ext_moves", e.ext_moves)?;
+                    ed.set_item("rounds", e.rounds)?;
+                    ed.set_item("samples", e.samples)?;
+                    if let Some(rs) = &e.resign {
+                        ed.set_item("resign", resign_dict(py, rs)?)?;
+                    }
+                    eps.append(ed)?;
+                }
+                d.set_item("episodes", eps)?;
+            }
             if let Some(rs) = &r.resign {
                 // self-play resignation (NnSeat::resign_t, docs/search.md 3.14): only when the game's seats resign
-                let rd = PyDict::new(py);
-                rd.set_item("resigned", rs.resigned)?;
-                rd.set_item("noresign", rs.noresign)?;
-                rd.set_item("winner", rs.winner)?;
-                rd.set_item("decision", rs.decision)?;
-                rd.set_item("step", rs.step)?;
-                rd.set_item("records", rs.records)?;
-                d.set_item("resign", rd)?;
+                d.set_item("resign", resign_dict(py, rs)?)?;
             }
             out.append(d)?;
         }

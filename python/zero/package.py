@@ -315,7 +315,8 @@ TOY_READERS = [{'target': 'next_card', 'inputs': [[0, 6], [25, 6]], 'hidden': 32
 # the core's own package: the toy game, zero._engine (crates/toy_py, tools/build_py.sh)
 CORE = GamePackage('zero', 'Zero Core', CORE_ROOT, engine='zero._engine', run_module='zero.run', game='toy',
                    dashboard_port=None, hub_id=None, env_prefix='ZERO', tokens={'toy': TOY_TOKENS},
-                   aux={'toy': TOY_AUX}, readers={'toy': TOY_READERS})
+                   aux={'toy': TOY_AUX, 'toy_match': TOY_AUX}, readers={'toy': TOY_READERS})
+# (toy_match, the core's chained-episodes game, docs/az.md 42: the toy's features first, so the toy's target too)
 
 def default_episodes(payload):
     """The resolver specs of a deferred terminal: its payload's "episodes" (each a JSON string,

@@ -178,6 +178,31 @@ the next round's card, hidden until its round (a one-hot over the 6 cards; zero 
 Default: no targets (`AUX` empty). The loss of each segment is the game package's (zero/package.py
 `aux`). A driver created with `aux` records it (2.4); `Game.aux_target(viewer)` returns it.
 
+### 1.3 Chained episodes (opt-in; MTG Zero's best-of-three, one episode per game, 2026-11-11)
+
+A game whose **contest** is played as several **episodes** (docs/az.md 42): MTG Zero's best-of-three match with
+`"game_episodes": true`, each game of the match its own episode for the search and for training, the match still the
+unit self-play plays and evaluation measures. Three hooks, all with defaults that change nothing:
+
+* `chained()`: the game's episodes chain (MTG Zero: from its spec). Default false - nothing below is ever called.
+* An episode ends where `to_move()` is None. That state is an ordinary terminal for the search and the driver: a
+  simulation that reaches it backs up its `result()` / `margin()` (the episode's: MTG Zero's game result and life
+  margin), and its records' z and sc are those values. The tree needs nothing new - the game simply stops at an
+  episode's end instead of running on into the next one.
+* `next_episode(conceded) -> Result<Next<Self>, String>`, asked once an episode ended: `Next::Continue(state)` - the
+  contest goes on from `state` (MTG Zero: the match after game g, sideboarding for game g+1 begun; its first
+  decisions are the next episode's) - or `Next::Over(result)`, the contest's result per seat (MTG Zero: the match's,
+  by game wins). `conceded` is None when the episode ended by the rules; Some(seat) when that seat resigned it (the
+  driver's resign rule, 3.14, at a decision in progress): the game counts the episode as lost by that seat (MTG
+  Zero: CR 104.3a, the game conceded) and goes on as after any other end. A function of the state (the contest
+  replays from its seed and actions); an error stops the driver, naming the game.
+* `can_concede()`: whether the resign rule may count the pending decision's search (default true). A chained game
+  marks the decisions where no episode is in progress false (MTG Zero: sideboarding between games): they neither
+  extend nor break the rule's run.
+
+Bindings: `Game.chained`, `Game.can_concede`, `Game.next_episode(conceded=None)` -> `(next game, None)` or
+`(None, contest result)` (a game that does not chain, or an episode that has not ended: ValueError).
+
 ## 2. The driver protocol (Python <-> Rust)
 
 ```python
@@ -505,6 +530,47 @@ does, so a driver that is never told plays its spec as before (the shared spec i
 game started: the same games). Test: `driver::tests::set_spec_plays_the_new_spec_in_the_games_started_after_it`
 (the toy's extra food from the switch: games started before it equal the old spec's driver, games after it the new
 spec's; the refusals).
+
+### 2.14 Chained episodes: a contest per slot, one row per contest (`SearchGame::chained`; MTG Zero's best-of-three, 2026-11-11)
+
+No setting: a game that chains its episodes (1.3) is played this way by every driver; any other game exactly as before.
+
+* **A slot plays a contest.** When an episode of a chained game ends, its records are labelled with that episode's
+  outcome (`emit`: z = its `result()`, or a resignation's; q = the root search's estimate; sc = its `margin()`) and
+  kept in the slot, then the slot plays `next_episode`'s state as the next episode with the **same gid, seats, bots
+  and random streams** (the contest replays from the gid's streams as a game does) and fresh trees, records,
+  evaluation cache (3.12) and resignation counter. An episode counts its own searched decisions (`temp_moves`, the
+  Gumbel noise's horizon, the view-sample draw) and real moves (`max_steps`) from 0; the move log (2.5) runs on
+  across the contest.
+* **One result row per contest** (2.5), handed out when the contest ends, with every episode's samples right behind
+  it (2.4: a row's samples follow it - `workqueue.split_games`, the shard writer and remote self-play read them so):
+  `result` = the contest's (`Next::Over`), `over` = it finished, `scores` / `rounds` = its final state's, `steps` /
+  `decisions` / `ext_moves` / `samples` = the episodes' sums, `resign` None, `episodes` = one dict per episode (`over`,
+  `aborted`, `result`, `margins`, `steps`, `decisions`, `ext_moves`, `rounds`, `samples`, `resign`). An episode cut at
+  `max_steps` or aborted ends the contest unfinished (`over` false, the result a draw, as an unfinished game); the
+  episodes before it keep their labelled samples. The key `episodes` exists only for a chained game.
+* **Counting**: a rolling driver's quota (2.6), `finished_games`, the queued setups (2.9: one setup = one contest) and
+  every caller count contests. Evaluation rows are contests, so a win rate over them is the contest's (MTG Zero: the
+  match win rate); the run adds the games' numbers from `episodes` (docs/az.md 42).
+* **Resignation** (3.14): a resigned episode's z is the resignation's, and the contest continues from
+  `next_episode(Some(loser))`. Each episode has its own counter (its `resign` in `episodes`); the no-resign draw is by
+  gid, so the contest's. A decision with `can_concede()` false is not counted.
+* **Refused** (a driver error naming the game): branched games (2.11: `branch` set) with a chained game, and a chained
+  game at a deferred terminal (1.1). Archive starts (2.11) start a contest from the entry's spec.
+* **`play.PyDriver`** (and the replay recorder) chains the same way: one row per contest with `episodes`, each
+  episode's samples labelled by it; a replay holds the whole contest (`games`: each episode's result).
+
+**Tests.** `driver::tests::chain` (8, the toy `toy_match`): every record's z and sc are its own game's, the start
+choice between games (the first decision of the next episode) labelled with the next game's outcome, the match's
+rules, the row's sums; the user's case - a match lost 1-2 by game 2's winner: its game-2 rows (its start choice
+before game 2 among them) z = 1, its game-1 and game-3 rows z = 0; the same contests on 1 or 4 threads and in rolling
+quotas (contests counted); resignation concedes the game and the match goes on, never at the start choice; branching
+refused; bots' contests and the move log; the search at game 1's last decision evaluates only the root and backs up
+each option's game result exactly (nothing past the game's end is expanded); `next_episode` by the rules.
+`tests/test_chained.py` (10): the bindings, the Rust and Python drivers' rows and labels, h2h's and the resign
+tally's games, the loop (contests, per-game metrics, the evaluation's match and per-game numbers), a replay of a whole
+match, remote self-play (the shared quota; an older worker refused by its hello), remote evaluation (its result's
+`episodes` checked), the Delver stack and the league on a chained game (docs/az.md 42.5).
 
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
@@ -1810,6 +1876,18 @@ with more match wins (`result` 1/T or 0 per seat, 1/2T each on a draw), margin =
 reshuffles it); each later offer is a chance key `round << 32 | mask` (`force_chance` deals a
 queued offer if its cards are undealt). `result()` / `margin()` panic before `resolve`. 16
 actions (card ids), 64 features. Bots: `random`, `greedy` (the most food).
+
+### 5.2 The toy match: "Toy match" (`crates/search/src/toy_match.rs`, `toy_match`)
+
+The core's test bed for chained episodes (1.3, 2.14), shaped like MTG Zero's best-of-three with one episode per game:
+two players, games of the toy until a player has won two or three games have been played (a drawn game counts), the
+match's result by game wins. Before each later game the loser of the previous one (after a draw: who chose for it,
+or game 1's start player) chooses who starts (`A_FIRST` 18 / `A_SECOND` 19, Magic's play-or-draw analogue): the first
+decision of the next episode, during which no game is in progress (`can_concede` false). The next game's seed comes
+from the match's RNG (`determinize` reseeds it), its setup is a revelation key. An episode ends at a game's end
+(`result` / `margin` the game's); a concession counts the game in progress as lost. 20 actions, the toy's features + 6
+(game / 3, my wins / 2, the other's / 2, draws / 3, a choice pending, I choose); the toy's `next_card` target. Spec
+`{}`. Bots: `random`, `heuristic` (the toy's; it chooses to start).
 
 ## 6. Parity: Rust search vs Python reference
 

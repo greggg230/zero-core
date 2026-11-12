@@ -418,6 +418,10 @@ def summary(rs, paired=False):
         out['variance_ratio'] = round(var / (vg / 2), 4) if vg > 0 and ps['n'] > 1 else None
         out['pairs'] = ps
     out['elo_se'] = round(400 / math.log(10) * out['se'] / (s * (1 - s)), 1)
+    # a game that chains its episodes (docs/az.md 42): the rows above are contests (matches), A's games beside them
+    pg = G.summarize_games([g for r in rs for g in G.episode_rows(r, r['gid'] % 2)])
+    if pg is not None:
+        out['per_game'] = pg
     return out
 
 
