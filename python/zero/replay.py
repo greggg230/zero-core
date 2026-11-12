@@ -45,6 +45,8 @@ Each game -> one JSON object (format 'zero-replay/1'), written gzipped to `--out
                    Zero: `belief` {for, n, cards: [[name, expected count], ...]}), by default
                    aux: {<target>: [[column, value], ...]} (its 12 largest values)}
   final    index of the final state; result (per seat), scores, rounds, over
+  games    a game that chains its episodes (docs/az.md 42): the replay holds the whole contest (a match, its
+           episodes one after the other), `result` the contest's, `games` each episode's result
 
 A lookahead seat (`--lookahead SETTINGS` / `record(lookahead=)`; docs/search.md 3.9): the checkpoint's seat
 decides by the exhaustive lookahead per information set (its settings as `zero.lookahead.parse` reads
@@ -187,6 +189,10 @@ class RecordingDriver(PyDriver):
             while True:
                 g = slot.game
                 if g.over or slot.steps >= self.max_steps:
+                    if slot.chain is not None and slot.last_state != g.export_state():
+                        self._state(slot)           # (a chained game's episode end: its final state, docs/az.md 42)
+                    if self._episode_end(slot):
+                        continue                    # (the match goes on in the same replay)
                     finished.append(slot)
                     break
                 legal = g.legal()
@@ -295,10 +301,18 @@ class RecordingDriver(PyDriver):
         super()._finish(slot)
         g = slot.game
         over = g.over
+        res = [float(x) for x in g.result()] if over else None
+        if slot.chain is not None:
+            # a chained game (docs/az.md 42): the replay is the whole contest, its result the contest's, and `games`
+            # the result of each of its episodes
+            r = slot.chain['result']
+            over, res = r is not None, ([float(x) for x in r] if r is not None else None)
         self.replays.append({
             'gid': slot.gid, 'states': slot.states + ([] if slot.last_state == g.export_state() else [json.loads(g.export_state())]),
-            'frames': slot.frames, 'result': [float(x) for x in g.result()] if over else None,
+            'frames': slot.frames, 'result': res,
             'scores': [float(x) for x in g.scores()], 'rounds': int(g.rounds), 'over': bool(over)})
+        if slot.chain is not None:
+            self.replays[-1]['games'] = [[float(x) for x in e['result']] for e in slot.chain['episodes']]
         self.replays[-1]['final'] = len(self.replays[-1]['states']) - 1
 
 

@@ -5225,3 +5225,59 @@ self-play records, docs/search.md 3.17); config.json gains the four keys.
 in Python and in the Rust driver, h2h's run rule and tag, the hello's fingerprint; a seat with the setting plays the
 toy's games (which mark no value choice) exactly as one without, making none. The search: docs/search.md 3.17's Rust
 tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.
+
+## 42. Chained episodes: one game of a match per episode (`SearchGame::chained`, `next_episode`; MTG Zero's best-of-three Delver mirror, 2026-11-11)
+
+(Section 40 is taken by `feat/extra-evals` and `feat/selfplay-spec-hook`, 41 by `farm`.) **No run setting**: the game
+decides, by its spec, whether its episodes chain (MTG Zero: the `mtg` spec key `"game_episodes": true`, its ENGINE.md
+112). A game that never says so plays and trains exactly as before.
+
+### 42.1 Why (the user's decision, 2026-11-11)
+
+MTG Zero adds best-of-three with sideboarding to its Delver mirror. Until now its best-of-three episode was the whole
+match: the search ran through a game's end into sideboarding and the next game, and every row's value target was the
+match's result. The user decided the label is the **per-game outcome**: without draws a player's match-win chance after
+a game is a fixed amount plus a positive multiple of its chance to win that game, so maximizing each game is
+match-optimal; per-game labels are much less noisy (game 3's luck no longer lands on game 2's rows), and they keep the
+value head's meaning that of the best-of-one line the run is warm-started from (its search settings were tuned on that
+scale). The value target stays `(1 - value_q) z + value_q q_root`; z becomes the row's own game's result, and the search
+treats a game's end as terminal, so `q_root` is on the same scale. Matches, not games, stay the unit a run plays and
+evaluates.
+
+### 42.2 What it does (docs/search.md 1.3, 2.14)
+
+* **The game** (`SearchGame`, all opt-in, defaults = before): `chained()` - this game's episodes are parts of one
+  contest; an episode ends where the game's `to_move()` is None, and the search backs up that state's `result()` and
+  `margin()` as at any terminal (nothing changes in the tree); `next_episode(conceded)` - the state the next episode of
+  the contest starts from (`Next::Continue`), or the contest's result when it is over (`Next::Over`); `conceded` is the
+  seat that resigned the episode (below), None when the episode ended by the rules; `can_concede()` - the self-play
+  resign rule may count the pending decision (default true).
+* **The driver** (Rust, `driver/worker.rs`): at a chained game's episode end, its records are labelled with that
+  episode's outcome (z, q, sc as for any game) and kept in the slot; the slot plays the next episode from
+  `next_episode`'s state with the same gid, seats, bots and random streams, fresh trees and records, its evaluation
+  cache emptied, its searched decisions (`temp_moves`, the view-sample draw) and real moves (`max_steps`) counted from 0
+  again. When the contest ends, its **one result row** goes out with every episode's samples behind it (the contract
+  `workqueue.split_games` and the shard writer read: a row's samples follow it): `result` the contest's, `over` whether
+  it finished, `scores` / `rounds` of its final state, `steps` / `decisions` / `ext_moves` / `samples` summed, and
+  `episodes`, one entry per episode (`over`, `aborted`, `result`, `margins`, `steps`, `decisions`, `ext_moves`,
+  `rounds`, `samples`, `resign`). An episode cut at `max_steps` or aborted ends the contest unfinished (as a game: not
+  over, a draw in the row); the episodes before it keep their samples. Rolling quotas, queued setups, the shared queue,
+  the remote workers, the shard writer and the league count and carry contests.
+* **Resignation** (section 27): a resigning seat concedes the episode: the episode's z is the resignation's, and the
+  contest continues from `next_episode(Some(loser))` (MTG: CR 104.3a, the game conceded, the next game's sideboarding).
+  The resign counter is per episode (the no-resign draw is the contest's); a decision the game marks `can_concede()`
+  false (MTG: sideboarding between games, where no game is in progress) is not counted.
+* **Evaluation**: the yardstick, random, Elo, anchor and h2h games are contests, so their rows, win rates and Elo are
+  the **match** win rates; the run adds per-game numbers (`per_game` in `eval_yard` / `eval_random`, h2h's report).
+* **Refused** (a driver error, never silent): branched games (`selfplay_branch`, section 24) and deferred terminals in a
+  chained game.
+* **Remote**: a self-play worker's hello reports the chaining of the run's spec (`episodes`), and a remote evaluation
+  its result (`episodes`): a checkout that would play whole matches as one episode is refused.
+* **The Python driver** (`play.PyDriver`, the replay recorder) chains the same way: a replay holds the whole match.
+* **The toy** `toy_match`: best of three toy games, chained, for the core's own tests.
+
+### 42.3 Off by default
+
+A game whose `chained()` is false (every game but MTG Zero's `mtg` with `"game_episodes": true`, and the toy
+`toy_match`) never reaches the new code: no hook is called, no row gains a key; `check_checkpoint_compat` and the toy's
+golden digests are unchanged (42.6).

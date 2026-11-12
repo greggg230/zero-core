@@ -444,6 +444,14 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     if slot.resign.is_some() && team != 1 {
         return Err(format!("resign_t: {} plays teams (team_size {team}): resignation is for two-player games of two sides", G::NAME));
     }
+    // chained episodes (docs/search.md 2.14): the contest's accumulator; branched games are refused with them
+    slot.chain = None;
+    if game.chained() {
+        if cfg.branch.is_some() {
+            return Err(format!("branch: {} chains its episodes (a contest of several, docs/search.md 2.14): branched games are not built for chained episodes", G::NAME));
+        }
+        slot.chain = Some(Box::default());
+    }
     slot.gid = gid;
     slot.n = n;
     slot.rng = Rng::new(base.next_u64());
@@ -1193,8 +1201,10 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     slot.decisions += 1;
     // self-play resignation (docs/search.md 3.14): a resigning seat's full search - exactly the searches that
     // make its records - counts with its root win vector (a record's q); when the rule fires the game ends
-    // here, before the move, every record kept (a no-resign game only notes where it would have)
-    if let Some(rs) = slot.resign.as_mut().filter(|_| seat.resign_t > 0.0 && slot.full && slot.dev_left == 0) {
+    // here, before the move, every record kept (a no-resign game only notes where it would have). A decision
+    // the game marks `can_concede` false (a chained game between its episodes, docs/search.md 2.14) is not counted.
+    let concedable = slot.resign.is_some() && slot.game.as_ref().unwrap().can_concede();
+    if let Some(rs) = slot.resign.as_mut().filter(|_| seat.resign_t > 0.0 && slot.full && slot.dev_left == 0 && concedable) {
         let w = if gumbel {
             tree.gumbel_q()
         } else if pruned.is_some() {
@@ -1264,6 +1274,9 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
 /// emits them later).
 fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>, n_: &mut Tally) -> Result<(), String> {
     let cfg = &sh.cfg;
+    if slot.chain.is_some() {
+        return finish_episode(cfg, slot, results, samples);
+    }
     let g = slot.game.take().unwrap();
     // (a resigned game is over: its result is the resignation's, docs/search.md 3.14; an aborted
     // game has no result: not over, so it emits no samples, `SearchGame::aborted`)
@@ -1305,6 +1318,103 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
         if let Some(fp) = f.point.take() {
             spawn_branch(sh, slot, gid, f, fp, start)?;
             n_.branches += 1;
+        }
+    }
+    Ok(())
+}
+
+/// A chained game's episode ended (docs/search.md 2.14), by the rules, by a resignation, at `max_steps` or aborted: its
+/// records labelled with its outcome (`emit`'s z, q, sc) into the contest's samples, its row into the contest's
+/// episodes. An episode that ended (over) continues the contest from `next_episode`'s state in the same slot - the
+/// same gid, seats, bots and random streams; fresh trees, records, evaluation cache, resignation counter; searched
+/// decisions and real moves counted from 0 again; the move log goes on -; otherwise (the contest over, or an episode
+/// cut or aborted) the contest's one result row goes out with every episode's samples behind it.
+fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>) -> Result<(), String> {
+    let g = slot.game.take().unwrap();
+    let resign = slot.resign.take();
+    let resigned = resign.as_ref().is_some_and(|r| r.resigned);
+    let over = (g.to_move().is_none() && !g.aborted()) || resigned;
+    if over && !resigned && g.deferred() {
+        return Err(format!("{}: a chained game at a deferred terminal (chained episodes take their outcome from the game, docs/search.md 2.14)", G::NAME));
+    }
+    let mut ch = slot.chain.take().ok_or("internal: a chained episode without its contest")?;
+    let n = slot.n;
+    let records = std::mem::take(&mut slot.records);
+    let rq = std::mem::take(&mut slot.rq);
+    let rs = resign.as_ref().map(|r| r.info());
+    let loser = match rs.as_ref().filter(|_| resigned).map(|r| r.winner) {
+        Some(Some(w)) => Some(1 - w as usize),
+        Some(None) => return Err("internal: a resignation without a favoured seat".into()),
+        None => None,
+    };
+    let done = Done { gid: slot.gid, tag: None, n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: Vec::new(), branch: None, start: None, resign: rs };
+    let row = emit(cfg.record, &g, over, done, records, rq, &mut ch.samples);
+    // (an aborted episode's margin is never asked: `SearchGame::aborted`)
+    let margins: Vec<f32> = if over { (0..n).map(|i| g.margin(i)).collect() } else { vec![0.0; n] };
+    ch.steps += row.steps;
+    ch.decisions += row.decisions;
+    ch.ext_moves += row.ext_moves;
+    ch.episodes.push(EpisodeRow { over: row.over, aborted: row.aborted, result: row.result, margins, steps: row.steps, decisions: row.decisions, ext_moves: row.ext_moves, rounds: row.rounds, samples: row.samples, resign: row.resign });
+    slot.view_wait.clear();
+    slot.drop_trees();
+    slot.look = None;
+    slot.look_mcts = false;
+    slot.look_guard = None;
+    slot.pending = None;
+    slot.ext_payload = None;
+    slot.legal_ok = false;
+    slot.sims = 0;
+    slot.target = None;
+    let next = if over { Some(g.next_episode(loser).map_err(|e| format!("next_episode: {e}"))?) } else { None };
+    match next {
+        Some(Next::Continue(ng)) => {
+            if ng.num_players() != n {
+                return Err(format!("next_episode: {} players, the contest has {n}", ng.num_players()));
+            }
+            slot.game = Some(ng);
+            slot.full = true;
+            slot.minor = false;
+            slot.belief = false;
+            slot.decisions = 0;
+            slot.ext_moves = 0;
+            slot.steps = 0;
+            // (a new episode is a new game for the evaluation cache, docs/search.md 3.12, and for the resign rule,
+            // whose no-resign draw is the contest's: by gid)
+            slot.cache.clear();
+            slot.resign = resign_state(cfg, slot.gid);
+            slot.chain = Some(ch);
+        }
+        other => {
+            let contest = match other {
+                Some(Next::Over(r)) => Some(r),
+                _ => None,
+            };
+            let row = GameResult {
+                gid: slot.gid,
+                n,
+                over: contest.is_some(),
+                aborted: !resigned && g.to_move().is_none() && g.aborted(),
+                result: contest.map_or_else(|| vec![1.0 / n as f32; n], |r| r[..n].to_vec()),
+                scores: (0..n).map(|i| g.score(i)).collect(),
+                steps: ch.steps,
+                decisions: ch.decisions,
+                ext_moves: ch.ext_moves,
+                rounds: g.rounds(),
+                samples: ch.samples.len() as u32,
+                tag: slot.tag.take(),
+                moves: std::mem::take(&mut slot.moves),
+                branch: None,
+                start: slot.start_ix.take(),
+                resign: None,
+                episodes: std::mem::take(&mut ch.episodes),
+            };
+            results.push(row);
+            samples.append(&mut ch.samples);
+            slot.fork = None;
+            slot.branch = None;
+            slot.dev_left = 0;
+            slot.dev_now = false;
+            slot.gid = NO_GAME;
         }
     }
     Ok(())
@@ -1420,6 +1530,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         branch: d.branch,
         start: d.start,
         resign: d.resign,
+        episodes: Vec::new(),
     };
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();

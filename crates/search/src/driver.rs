@@ -65,7 +65,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockRead
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::game::{make_bot, Belief, Bot, SearchGame, MAX_SEATS};
+use crate::game::{make_bot, Belief, Bot, Next, SearchGame, MAX_SEATS};
 use crate::lookahead::{Look, LookCfg};
 use crate::rng::{split64, Rng};
 use crate::tree::Tree;
@@ -809,6 +809,27 @@ pub struct GameResult {
     /// A game started from an archive entry (`DriverCfg::starts`): the entry's index; None otherwise.
     pub start: Option<u32>,
     /// Self-play resignation (`NnSeat::resign_t`, docs/search.md 3.14): None unless the game's seats resign.
+    /// A chained contest's row: None (each episode's is in `episodes`).
+    pub resign: Option<ResignInfo>,
+    /// A chained game's contest (`SearchGame::chained`, docs/search.md 2.14): its episodes in order; empty for
+    /// every other game. The row itself is the contest's (`result` its result, the counts summed).
+    pub episodes: Vec<EpisodeRow>,
+}
+
+/// One episode of a chained contest (`GameResult::episodes`, docs/search.md 2.14): its outcome and counts.
+#[derive(Clone, Debug)]
+pub struct EpisodeRow {
+    /// Ended by the rules or by a resignation (else cut at `max_steps`, or aborted: the contest's last episode).
+    pub over: bool,
+    pub aborted: bool,
+    /// Its result per seat (its records' z; a draw when not over) and `margin(seat)` at its end (their sc).
+    pub result: Vec<f32>,
+    pub margins: Vec<f32>,
+    pub steps: u64,
+    pub decisions: u32,
+    pub ext_moves: u32,
+    pub rounds: u32,
+    pub samples: u32,
     pub resign: Option<ResignInfo>,
 }
 
@@ -1249,6 +1270,19 @@ struct Slot<G: SearchGame> {
     cache: HashMap<(u16, u32, u128), Cached>,
     /// Self-play resignation (docs/search.md 3.14): the game's counter, None unless its seats resign.
     resign: Option<ResignState>,
+    /// A chained game's contest in progress (`SearchGame::chained`, docs/search.md 2.14); None for every other game.
+    chain: Option<Box<Chain>>,
+}
+
+/// A chained game's contest in progress (`Slot::chain`, docs/search.md 2.14): its finished episodes, their samples
+/// (labelled with each episode's outcome, handed out behind the contest's one row) and its counts so far.
+#[derive(Default)]
+struct Chain {
+    episodes: Vec<EpisodeRow>,
+    samples: Vec<Record>,
+    steps: u64,
+    decisions: u32,
+    ext_moves: u32,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -1296,6 +1330,7 @@ impl<G: SearchGame> Slot<G> {
             start_ix: None,
             cache: HashMap::new(),
             resign: None,
+            chain: None,
         }
     }
     fn drop_tree(&mut self, q: usize) {
