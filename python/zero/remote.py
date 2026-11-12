@@ -396,6 +396,13 @@ class RemoteEval:
         if m.get('eval_yard') and got != tag:
             raise RuntimeError(f"the remote evaluated with the move rule {got!r}, the run's eval_select is {tag!r} "
                                f"(its checkout is not the run's code?): not recorded")
+        want_e = eval_episodes(self.R.cfg)
+        if want_e and m.get('episodes') != want_e:
+            # an older checkout would evaluate a whole contest as one episode (its search across the games): never
+            # recorded (docs/az.md 42)
+            raise RuntimeError(f"the remote evaluated the episodes of the run's evaluation spec as "
+                               f"{m.get('episodes')!r}, the run as {want_e!r} (an older checkout plays a whole contest "
+                               f"as one episode: docs/az.md 42): not recorded")
         row = {'iter': it, 'time': time.time(), 'host': self.name, 'seconds': round(time.time() - t0, 1)}
         # extras: the game package's other yardsticks (GamePackage.evals), run on the remote with the rest of
         # Run.evaluate - recorded here as a local evaluation records them in metrics.jsonl (docs/az.md 40)
@@ -575,6 +582,14 @@ def _alive(pid):
         return True
 
 
+def eval_episodes(cfg):
+    """The episodes of a run's evaluation spec (docs/az.md 42; `games.episodes_tag`: 'chained' or ''): what a remote
+    evaluation's result reports and the run checks."""
+    from . import games as G
+    spec = cfg.get('eval_spec') or package.active().eval_spec_of(cfg['game'], cfg.get('spec', ''))
+    return G.episodes_tag(cfg['game'], spec, (cfg.get('players') or [2])[0])
+
+
 def evaluate_mirror(rdir, it):
     """Run.evaluate + Run.elo_update of iteration `it` on the mirror `rdir`. -> the metrics row."""
     from .run import Run, append_metrics
@@ -591,6 +606,9 @@ def evaluate_mirror(rdir, it):
     if me:
         m['elo'] = elo.row(me, R.eval_tag())
     m['time'] = time.time()
+    ep = eval_episodes(cfg)
+    if ep:
+        m['episodes'] = ep                         # (docs/az.md 42: the run checks it)
     append_metrics(rdir, m)
     return m
 

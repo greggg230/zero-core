@@ -1,4 +1,4 @@
-"""The native worker's check-config table (crates/worker/src/run_settings.json, docs/az.md 42) classifies
+"""The native worker's check-config table (crates/worker/src/run_settings.json, docs/az.md 44) classifies
 exactly zero-core's run settings: a setting added to zero.run.DEFAULTS without a class there fails here,
 so no future setting is ignored by a native worker in silence (zero-farm DESIGN.md 2.1 point 4)."""
 import json
@@ -22,7 +22,7 @@ def test_every_run_setting_is_classified():
     missing = sorted(core - set(keys))
     stale = sorted(set(keys) - core)
     assert not missing, (f'run settings without a class in {TABLE}: {missing} - classify each (play / trainer / '
-                         f'python_only / param) and, if play, make the native worker read it (docs/az.md 42)')
+                         f'python_only / param) and, if play, make the native worker read it (docs/az.md 44)')
     assert not stale, f'{TABLE} classifies settings zero.run no longer has: {stale}'
 
 

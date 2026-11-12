@@ -10,12 +10,13 @@
 //!   playout-cap randomisation, temperature, training records, rolling mode, arena (several
 //!   network keys), external seats.
 //! * `toy`: "Mini Cavern", the toy game the stack is proven on; `toy_team`: a two-team game
-//!   with a deferred result decided by toy matches (deferred terminals, teams, co-training).
+//!   with a deferred result decided by toy matches (deferred terminals, teams, co-training); `toy_match`: a best of
+//!   three toy games, each game its own episode (chained episodes, docs/search.md 1.3).
 //! * `lookahead`: the exhaustive lookahead per information set (docs/search.md 3.9; a seat's opt-in
 //!   `lookahead`), its rows batched through the driver like MCTS leaves.
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
 //! * `record`: game records (a game's seed, real moves and search outputs) and their replay into the
-//!   training rows the driver emitted (docs/search.md 2.15; zero-farm's self-play records).
+//!   training rows the driver emitted (docs/search.md 2.17; zero-farm's self-play records).
 //! * `settings`: the driver's settings from JSON - seats, branch, starts, a whole `DriverCfg` (the one
 //!   parser the bindings and native workers share; docs/search.md 4.1).
 pub mod driver;
@@ -27,6 +28,7 @@ pub mod record;
 pub mod rng;
 pub mod settings;
 pub mod toy;
+pub mod toy_match;
 pub mod toy_team;
 pub mod tree;
 
@@ -40,5 +42,5 @@ pub(crate) mod peek_game;
 #[cfg(test)]
 pub(crate) mod counter_game;
 
-pub use game::{belief_weight, team_of, Belief, Bot, SearchGame, MAX_SEATS};
+pub use game::{belief_weight, team_of, Belief, Bot, Next, SearchGame, MAX_SEATS};
 pub use rng::Rng;

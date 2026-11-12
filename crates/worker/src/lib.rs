@@ -1,4 +1,4 @@
-//! zero-core's native worker (zero-farm, docs/az.md 42): a game's worker binary is one call -
+//! zero-core's native worker (zero-farm, docs/az.md 44): a game's worker binary is one call -
 //!
 //! ```ignore
 //! static GAMES: &[zero_worker::GameEntry] = &[zero_worker::GameEntry::of::<engine::az::MtgAz>("mtg"), ...];

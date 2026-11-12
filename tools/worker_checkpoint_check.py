@@ -1,4 +1,4 @@
-"""The native worker's `checkpoint` op (aw/1, zero-farm PROTOCOL.md 5) with a real network (docs/az.md 42): a
+"""The native worker's `checkpoint` op (aw/1, zero-farm PROTOCOL.md 5) with a real network (docs/az.md 44): a
 self-play job is told after its first finished game to switch to `--model2` as generation `gen + 1`; the job must
 end 'done' with every game, rows searched before the switch carrying the old id and rows after it the new one
 (the remote worker's phase change: the games in flight go on, their searches restart with the new network).

@@ -2,7 +2,7 @@
 //! integer stays an integer and a float a float, and `dumps` writes Python's `json.dumps` text (its
 //! defaults: `", "` / `": "` separators, `ensure_ascii`, floats as `repr(float)`). A run's settings
 //! reach the game's spec through `zero.games.spec_json` (a dict `json.dumps`'d), so a native worker
-//! reproduces that text byte for byte (docs/az.md 42).
+//! reproduces that text byte for byte (docs/az.md 44).
 use std::fmt::Write;
 
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};

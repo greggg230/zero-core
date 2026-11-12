@@ -1,4 +1,4 @@
-"""Signed definitions on zero-farm (zero-farm PROTOCOL.md 7, rev 6; docs/az.md 42.3): what a run or a campaign lets
+"""Signed definitions on zero-farm (zero-farm PROTOCOL.md 7, rev 6; docs/az.md 44.3): what a run or a campaign lets
 friends' PCs download and run, signed on the desktop with the data key (the coordinator never holds it), and the
 desktop's coordinator client the farm tools share.
 

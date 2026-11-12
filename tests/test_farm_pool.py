@@ -1,4 +1,4 @@
-"""zero.farm_pool (docs/az.md 43): the farm pool of a run's self-play against a fake coordinator - each iteration's
+"""zero.farm_pool (docs/az.md 45): the farm pool of a run's self-play against a fake coordinator - each iteration's
 checkpoint published (exported, uploaded, a new definition version, then registered current), the farm's records
 replayed into ordinary shards of data/iter_i/ whose rows equal, bit for bit, the shards the farm's games would have
 written directly (auxiliary targets and value-only rows included), the iteration's quota counted with the run's own

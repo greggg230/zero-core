@@ -717,7 +717,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         drv.set_first_gid(job.gid_base)?;
     }
     if job.output.records() {
-        // (every game's seed, real moves and setup: what its record replays from; zero-core docs/search.md 2.15)
+        // (every game's seed, real moves and setup: what its record replays from; zero-core docs/search.md 2.17)
         drv.set_trace(true)?;
     }
     drv.resume(BIG, job.net)?;

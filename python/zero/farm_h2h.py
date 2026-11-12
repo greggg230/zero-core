@@ -1,4 +1,4 @@
-"""A head-to-head of two checkpoints on zero-farm (friends' idle PCs; zero-farm PROTOCOL.md 5.2, docs/az.md 42.2):
+"""A head-to-head of two checkpoints on zero-farm (friends' idle PCs; zero-farm PROTOCOL.md 5.2, docs/az.md 44.2):
 the readout zero.h2h gives on this machine, played by the farm's native workers.
 
   python -m zero.farm_h2h --a runs/eoe1/models/iter_0080.pt --b runs/eoe1/models/iter_0070.pt --games 400 \

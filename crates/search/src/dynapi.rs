@@ -4,7 +4,7 @@
 use std::any::Any;
 
 use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight, KeyKind, Record, Select, ROW_BELIEF};
-use crate::game::{bot_names, Belief, SearchGame, MAX_SEATS};
+use crate::game::{bot_names, Belief, Next, SearchGame, MAX_SEATS};
 use crate::lookahead::{Answers, Line, Look, LookCfg, LookStats, OptionValue, Outcome, RowSink, Step};
 use crate::rng::Rng;
 use crate::tree::{leaf_values_team, Scratch, Sim, Tree, Walk};
@@ -58,8 +58,14 @@ pub trait DynGame: Send + Sync {
     fn team_size(&self) -> usize;
     /// `SearchGame::aux_target` for `viewer` (`aux_width()` floats; none: empty).
     fn aux_target(&self, viewer: usize) -> Vec<f32>;
-    /// `SearchGame::record_setup` (docs/search.md 2.15).
+    /// `SearchGame::record_setup` (docs/search.md 2.17).
     fn record_setup(&self) -> String;
+    /// Chained episodes (`SearchGame::chained`, `next_episode`, `can_concede`; docs/search.md 1.3): the next
+    /// episode's state (Ok((Some(game), None))) or the contest's result (Ok((None, Some(result per seat)))).
+    fn chained(&self) -> bool;
+    #[allow(clippy::type_complexity)]
+    fn next_episode(&self, conceded: Option<usize>) -> Result<(Option<Box<dyn DynGame>>, Option<Vec<f32>>), String>;
+    fn can_concede(&self) -> bool;
     /// A search tree for this game's pending decision.
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String>;
     /// The lookahead of this game's pending decision (docs/search.md 3.9; `lookahead::Look::new`):
@@ -154,6 +160,29 @@ impl<G: SearchGame> DynGame for G {
     }
     fn record_setup(&self) -> String {
         SearchGame::record_setup(self)
+    }
+    fn chained(&self) -> bool {
+        SearchGame::chained(self)
+    }
+    fn next_episode(&self, conceded: Option<usize>) -> Result<(Option<Box<dyn DynGame>>, Option<Vec<f32>>), String> {
+        let n = SearchGame::num_players(self);
+        if !SearchGame::chained(self) {
+            return Err(format!("{}: next_episode of a game that does not chain its episodes (docs/search.md 1.3)", G::NAME));
+        }
+        if let Some(s) = conceded {
+            if s >= n || SearchGame::to_move(self).is_none() {
+                return Err(format!("next_episode: seat {s} concedes, but it is not a seat of a decision in progress"));
+            }
+        } else if SearchGame::to_move(self).is_some() || SearchGame::aborted(self) || SearchGame::deferred(self) {
+            return Err("next_episode: the episode has not ended (to_move is set, or it is aborted / deferred)".into());
+        }
+        Ok(match SearchGame::next_episode(self, conceded)? {
+            Next::Continue(g) => (Some(Box::new(g)), None),
+            Next::Over(r) => (None, Some(r[..n].to_vec())),
+        })
+    }
+    fn can_concede(&self) -> bool {
+        SearchGame::can_concede(self)
     }
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String> {
         let viewer = SearchGame::to_move(self).ok_or("the game is over")?;
@@ -667,7 +696,7 @@ pub trait DynDriver: Send + Sync {
     fn resume(&mut self, quota: u64, net: u32) -> Result<(), String>;
     /// A rolling driver's first game id (`Driver::set_first_gid`).
     fn set_first_gid(&mut self, gid: u32) -> Result<(), String>;
-    /// Trace every game (`Driver::set_trace`, docs/search.md 2.15).
+    /// Trace every game (`Driver::set_trace`, docs/search.md 2.17).
     fn set_trace(&mut self, on: bool) -> Result<(), String>;
     /// Rolling mode, between phases: the games started from now on play `spec` (`Driver::set_spec`).
     fn set_spec(&mut self, spec: &str) -> Result<(), String>;

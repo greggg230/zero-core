@@ -24,7 +24,7 @@ decks) - without a run config.json, the game package's default spec (`GamePackag
 Caverna {"full": true}, Glass Road {"intro": false}). Each side's seat also takes its run's
 `margin_w`, `redet` and `eval_cache` (`Run.nn_seat`'s; without a run config margin_w 0, redet on, no
 cache), so an h2h of a run's checkpoints plays the games of its evaluation and of a zero.farm_h2h
-at the same settings (docs/az.md 42.3; before 2026-11-12 these four were the package's defaults).
+at the same settings (docs/az.md 44.3; before 2026-11-12 these four were the package's defaults).
 Prints one JSON line: A's score (+- 1 se), its mean score margin, the Elo difference, each
 side's rule (`select_a`, `select_b`: e.g. 'cq-n4-v50-s0.3'). The models are only read.
 
@@ -133,7 +133,7 @@ def run_settings(ckpt):
 
 def run_seat_keys(ckpt):
     """The evaluation seat keys `Run.nn_seat` takes from a checkpoint's run besides its move rule (`run_rule`):
-    margin_w, redet, eval_cache (docs/az.md 42.3) - {} without a run config (the seat of before: margin_w 0, redet
+    margin_w, redet, eval_cache (docs/az.md 44.3) - {} without a run config (the seat of before: margin_w 0, redet
     on, no cache)."""
     c = run_settings(ckpt)
     if not c:
@@ -393,7 +393,7 @@ def _load_pair(a, b, device, game):
 
 
 def _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b):
-    # (each side's run's margin_w, redet and eval_cache: Run.nn_seat's evaluation seat, docs/az.md 42.3)
+    # (each side's run's margin_w, redet and eval_cache: Run.nn_seat's evaluation seat, docs/az.md 44.3)
     sa = G.nn_seat('a', sims if sims_a is None else int(sims_a), c_puct, chance_k=chance_k, **run_seat_keys(a))
     sb = G.nn_seat('b', sims if sims_b is None else int(sims_b), c_puct, chance_k=chance_k, **run_seat_keys(b))
     sa.update(run_rule(a) if seat_a is None else seat_a)
@@ -472,6 +472,10 @@ def summary(rs, paired=False):
         out['variance_ratio'] = round(var / (vg / 2), 4) if vg > 0 and ps['n'] > 1 else None
         out['pairs'] = ps
     out['elo_se'] = round(400 / math.log(10) * out['se'] / (s * (1 - s)), 1)
+    # a game that chains its episodes (docs/az.md 42): the rows above are contests (matches), A's games beside them
+    pg = G.summarize_games([g for r in rs for g in G.episode_rows(r, r['gid'] % 2)])
+    if pg is not None:
+        out['per_game'] = pg
     return out
 
 
@@ -538,7 +542,7 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     if paired and games % 2:
         raise ValueError(f'paired games: an even number of games ({games})')
     ma, mb, game = _load_pair(a, b, device, game)
-    spec = match_spec(a, b, game, spec)            # (A's run's evaluation spec unless given: Run.driver's, docs/az.md 42.3)
+    spec = match_spec(a, b, game, spec)            # (A's run's evaluation spec unless given: Run.driver's, docs/az.md 44.3)
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
     mr = _max_rows(sa, sb, max_rows)
     sp = _sparse(sa, sb, sparse)
@@ -599,7 +603,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
             raise ValueError(f'sprt: elo1 ({e1}) must be > elo0 ({e0})')
         lo, hi = sprt_bounds(alpha, beta)
     ma, mb, game = _load_pair(a, b, device, game)
-    spec = match_spec(a, b, game, spec)            # (A's run's evaluation spec unless given: Run.driver's, docs/az.md 42.3)
+    spec = match_spec(a, b, game, spec)            # (A's run's evaluation spec unless given: Run.driver's, docs/az.md 44.3)
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
     mr = _max_rows(sa, sb, max_rows)
     sp = _sparse(sa, sb, sparse)

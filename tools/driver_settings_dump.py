@@ -1,7 +1,7 @@
 """Dump the driver settings (`SearchDriver`'s `DriverCfg`, `<engine>.driver_settings`) a game package's
 runs build, for every preset and run config given - the evidence that a change to the seat parser (or to
 the run settings -> seat code) changes no seat (zero-farm phase 0b: the parser moved from zero_py into
-zero_search, docs/az.md 42).
+zero_search, docs/az.md 44).
 
     python tools/driver_settings_dump.py --root <game checkout> --package mtgz.az --configs <runs dir>... \
         --out old.json [--cfg-dir <dir for the resolved configs>]
@@ -29,7 +29,7 @@ builds from them, each as `driver_settings` text (or 'ERROR: ...' when the setti
 `selfplay_remote` was built and compares its text with it (the native worker's settings -> driver path,
 a Rust port of the run's self-play seat; exit 1 on a difference); with `--eval`, also `<worker> driver-cfg
 <cfg_eval> --eval --seats ... --games 6 --seed S --paired` against `eval_farm` (the eval job's port of
-Run.nn_seat(key, eval_sims) and the match's driver, docs/az.md 42.2). Reads the configs only.
+Run.nn_seat(key, eval_sims) and the match's driver, docs/az.md 44.2). Reads the configs only.
 """
 import argparse
 import glob

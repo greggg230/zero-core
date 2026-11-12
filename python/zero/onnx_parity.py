@@ -161,7 +161,7 @@ def absent_nan(model, rows):
 
 # ---------------------------------------------------------------- answers
 # The exact exponential of the generic step's softmax (the native worker's `eval::exp_f32`, zero-farm
-# docs/az.md 42.2): exp of a float32 through a fixed sequence of float64 IEEE operations - Cody-Waite
+# docs/az.md 44.2): exp of a float32 through a fixed sequence of float64 IEEE operations - Cody-Waite
 # reduction by ln 2, the Taylor polynomial of degree 13 by Horner, an exact scaling by 2^n, one rounding to
 # float32 - with no libm and no fused multiply-add, so numpy here and the Rust worker on any machine compute
 # the same bits (numpy's float32 `exp` and the C library's `expf` differ in the last bit now and then, and a

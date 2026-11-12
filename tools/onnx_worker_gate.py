@@ -1,4 +1,4 @@
-"""Parity gate 2 (b), the evaluator's numerics (zero-farm phase 0b, docs/az.md 42): on the same recorded
+"""Parity gate 2 (b), the evaluator's numerics (zero-farm phase 0b, docs/az.md 44): on the same recorded
 network batches, the native worker's answers (`<worker> eval-batches`: ONNX Runtime + its Rust
 post-processing) vs the Python reference (`zero.onnx_eval.OnnxEvaluator`: the same graph through
 onnxruntime + numpy, `onnx_parity.answer`) - within ~1e-6 - and vs torch (`infer.NetEvaluator`, eager, CPU,

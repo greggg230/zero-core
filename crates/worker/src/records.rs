@@ -1,4 +1,4 @@
-//! Self-play records (zero-farm DESIGN.md 6.1, PROTOCOL.md 5 `records`; zero-core docs/search.md 2.15): a job's
+//! Self-play records (zero-farm DESIGN.md 6.1, PROTOCOL.md 5 `records`; zero-core docs/search.md 2.17): a job's
 //! finished games as what replays them - each game's seed, every real move and only the search's outputs -
 //! instead of their sample rows. The trainer rebuilds the rows (`zero_search::record::replay`, the engine module's
 //! `replay_rows`) bit for bit as the shards would hold them, and replay is its validation.

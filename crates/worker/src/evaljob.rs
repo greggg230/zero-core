@@ -1,4 +1,4 @@
-//! An eval job (zero-farm PROTOCOL.md 5.2, docs/az.md 42.2): games `gid_base .. gid_base + games` of an
+//! An eval job (zero-farm PROTOCOL.md 5.2, docs/az.md 44.2): games `gid_base .. gid_base + games` of an
 //! evaluation match between two seats - networks (one ONNX Runtime session per generation of the job's
 //! `models`, each self-tested first) or built-in bots - played as Python's `Run.play_match` plays them
 //! (`Run.nn_seat(key, eval_sims)` seats, `Run.driver(table, seed, conc, paired)`: `settings::

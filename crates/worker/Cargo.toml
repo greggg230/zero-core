@@ -2,7 +2,7 @@
 name = "zero_worker"
 version = "0.1.0"
 edition = "2021"
-description = "Zero Core: the native self-play worker library (zero-farm): any run's settings, a zero-onnx/1 network through ONNX Runtime on the CPU, zero-core's sample shards, the agent<->worker protocol aw/1 (docs/az.md 42)"
+description = "Zero Core: the native self-play worker library (zero-farm): any run's settings, a zero-onnx/1 network through ONNX Runtime on the CPU, zero-core's sample shards, the agent<->worker protocol aw/1 (docs/az.md 44)"
 publish = false
 
 [dependencies]

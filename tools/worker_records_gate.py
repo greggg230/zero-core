@@ -1,4 +1,4 @@
-"""Gate 3 (zero-farm phase 3; docs/az.md 43.4): a native worker's game records rebuild, bit for bit, the shard rows it
+"""Gate 3 (zero-farm phase 3; docs/az.md 45.4): a native worker's game records rebuild, bit for bit, the shard rows it
 would have written.
 
   python tools/worker_records_gate.py --worker <mtgz-worker.exe> --settings <run config.json> --package mtgz.az

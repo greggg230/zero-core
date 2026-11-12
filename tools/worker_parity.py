@@ -1,4 +1,4 @@
-"""Parity gate 2 (a), the plumbing (zero-farm phase 0b, docs/az.md 42): the native worker's self-play job vs
+"""Parity gate 2 (a), the plumbing (zero-farm phase 0b, docs/az.md 44): the native worker's self-play job vs
 the Python remote worker on a run's real settings, both with the uniform evaluator (exact arithmetic in
 both languages), the same seed and deterministic settings (groups 1: the batch order is then fixed) -
 the sample rows and the first network batches sent to the evaluator must be byte-identical.

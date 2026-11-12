@@ -28,7 +28,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5; `--graphs`: 10.6) |
 | `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6) |
-| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B), at a run's evaluation settings (each side's run's margin_w / redet / eval_cache, A's run's eval spec: section 42.3); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
+| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B), at a run's evaluation settings (each side's run's margin_w / redet / eval_cache, A's run's eval spec: section 44.3); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
 | `heldout.py` | Held-out losses (section 20.2): a frozen set of sample rows (`make`), a checkpoint's value cross-entropy / accuracy / Brier against z and policy cross-entropy / top-1 against the recorded targets, decision and value-only rows apart (`HeldOut`, `losses`); `python -m <pkg>.az.heldout make | eval` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
@@ -38,7 +38,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `forks.py` | Branched self-play games and archive starts (section 24): the settings, the archive file (`zero-archive/1`: its entries' patches over the run's spec), the self-play driver's `branch` / `starts`, the remote hello's fingerprint, the tallies and `selfplay.forks` |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `onnx_export.py`, `onnx_parity.py` | zero-onnx/1 (section 41): any network (`TokenNet`, `GridNet`, `Net`) exported to one self-contained ONNX graph that takes the driver's sparse batch (`export`, `export_checkpoint`; `python -m zero.onnx_export`), and its parity gate against torch on real batches (`python -m zero.onnx_parity`); `tools/onnx_record.py` records a self-play's batches, `tools/onnx_bench.py` times ONNX Runtime against torch. Need onnx / onnxscript / onnxruntime; nothing on a run's path imports them |
-| `farm_def.py`, `farm_eval.py`, `farm_h2h.py`, `farm_report.py` | zero-farm on the desktop (sections 42.2, 42.3): signed definitions (`definition/1` documents, versions, the archive, `farm-release define`) and the coordinator client; eval jobs' games and rows in Python terms; a head-to-head of two checkpoints played on the farm; the own machines' work for the farm's admin page |
+| `farm_def.py`, `farm_eval.py`, `farm_h2h.py`, `farm_report.py` | zero-farm on the desktop (sections 44.2, 44.3): signed definitions (`definition/1` documents, versions, the archive, `farm-release define`) and the coordinator client; eval jobs' games and rows in Python terms; a head-to-head of two checkpoints played on the farm; the own machines' work for the farm's admin page |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
 
 Repository tools (`tools/`): `build_engine.sh` (the PyO3 build every repo's `build_py.sh`
@@ -145,7 +145,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A comma-separated list = several hosts, each its own workers, mirror and shards, consumers `<name>/w<k>`, metrics `selfplay.remotes` (one name: exactly as before); a name `<prefix>:<arg>` calls the package's callable remote `<prefix>:`; the run directory's `selfplay_remotes` file (one name per line) replaces the list, is re-read at every phase start (hosts join and leave a live run) and alone turns remote self-play on (section 34). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6; a list too, never the file); its own is refused |
 | `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
-| `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900 | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 43): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s |
+| `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900 | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); seconds the end of a phase waits for the remote's last shards (later ones are dropped) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: those whose inference is CUDA / MPS - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -5450,7 +5450,97 @@ target on a token, an MLP and a conv network; a network without the head (aux [B
 dtypes, dynamic dimensions and metadata; real toy games driven through the graph (sparse driver batches with
 value-only and belief rows, every answer validated and within 2e-5 of eager).
 
-## 42. The native self-play worker: zero_worker, one settings parser, parity gate 2 (no setting; zero-farm phase 0b, 2026-11-11)
+## 42. Chained episodes: one game of a match per episode (`SearchGame::chained`, `next_episode`; MTG Zero's best-of-three Delver mirror, 2026-11-11)
+
+(Section 40 is taken by `feat/extra-evals` and `feat/selfplay-spec-hook`, 41 by `farm`.) **No run setting**: the game
+decides, by its spec, whether its episodes chain (MTG Zero: the `mtg` spec key `"game_episodes": true`, its ENGINE.md
+121). A game that never says so plays and trains exactly as before.
+
+### 42.1 Why (the user's decision, 2026-11-11)
+
+MTG Zero adds best-of-three with sideboarding to its Delver mirror. Until now its best-of-three episode was the whole
+match: the search ran through a game's end into sideboarding and the next game, and every row's value target was the
+match's result. The user decided the label is the **per-game outcome**: without draws a player's match-win chance after
+a game is a fixed amount plus a positive multiple of its chance to win that game, so maximizing each game is
+match-optimal; per-game labels are much less noisy (game 3's luck no longer lands on game 2's rows), and they keep the
+value head's meaning that of the best-of-one line the run is warm-started from (its search settings were tuned on that
+scale). The value target stays `(1 - value_q) z + value_q q_root`; z becomes the row's own game's result, and the search
+treats a game's end as terminal, so `q_root` is on the same scale. Matches, not games, stay the unit a run plays and
+evaluates.
+
+### 42.2 What it does (docs/search.md 1.3, 2.14)
+
+* **The game** (`SearchGame`, all opt-in, defaults = before): `chained()` - this game's episodes are parts of one
+  contest; an episode ends where the game's `to_move()` is None, and the search backs up that state's `result()` and
+  `margin()` as at any terminal (nothing changes in the tree); `next_episode(conceded)` - the state the next episode of
+  the contest starts from (`Next::Continue`), or the contest's result when it is over (`Next::Over`); `conceded` is the
+  seat that resigned the episode (below), None when the episode ended by the rules; `can_concede()` - the self-play
+  resign rule may count the pending decision (default true).
+* **The driver** (Rust, `driver/worker.rs`): at a chained game's episode end, its records are labelled with that
+  episode's outcome (z, q, sc as for any game) and kept in the slot; the slot plays the next episode from
+  `next_episode`'s state with the same gid, seats, bots and random streams, fresh trees and records, its evaluation
+  cache emptied, its searched decisions (`temp_moves`, the view-sample draw) and real moves (`max_steps`) counted from 0
+  again. When the contest ends, its **one result row** goes out with every episode's samples behind it (the contract
+  `workqueue.split_games` and the shard writer read: a row's samples follow it): `result` the contest's, `over` whether
+  it finished, `scores` / `rounds` of its final state, `steps` / `decisions` / `ext_moves` / `samples` summed, and
+  `episodes`, one entry per episode (`over`, `aborted`, `result`, `margins`, `steps`, `decisions`, `ext_moves`,
+  `rounds`, `samples`, `resign`). An episode cut at `max_steps` or aborted ends the contest unfinished (as a game: not
+  over, a draw in the row); the episodes before it keep their samples. Rolling quotas, queued setups, the shared queue,
+  the remote workers, the shard writer and the league count and carry contests.
+* **Resignation** (section 27): a resigning seat concedes the episode: the episode's z is the resignation's, and the
+  contest continues from `next_episode(Some(loser))` (MTG: CR 104.3a, the game conceded, the next game's sideboarding).
+  The resign counter is per episode (the no-resign draw is the contest's); a decision the game marks `can_concede()`
+  false (MTG: sideboarding between games, where no game is in progress) is not counted.
+* **Evaluation**: the yardstick, random, Elo, anchor and h2h games are contests, so their rows, win rates and Elo are
+  the **match** win rates; the run adds per-game numbers (`per_game` in `eval_yard` / `eval_random`, h2h's report).
+* **Refused** (a driver error, never silent): branched games (`selfplay_branch`, section 24) and deferred terminals in a
+  chained game.
+* **Remote**: a self-play worker's hello reports the chaining of the run's spec (`episodes`), and a remote evaluation
+  its result (`episodes`): a checkout that would play whole matches as one episode is refused.
+* **The Python driver** (`play.PyDriver`, the replay recorder) chains the same way: a replay holds the whole match.
+* **The toy** `toy_match`: best of three toy games, chained, for the core's own tests.
+
+### 42.3 Off by default
+
+A game whose `chained()` is false (every game but MTG Zero's `mtg` with `"game_episodes": true`, and the toy
+`toy_match`) never reaches the new code: no hook is called, no row gains a key; `check_checkpoint_compat` and the toy's
+golden digests are unchanged (42.5).
+
+### 42.4 Costs
+
+None for a game that does not chain (one `can_concede()` call per counted resign search: a default `true`). A chained
+game: the samples of a contest's episodes wait in its slot until the contest ends (as a whole-match episode's did:
+the same memory, the rows only labelled earlier); `next_episode` clones the state once per episode; one game is made
+from the run's spec when the run asks whether it chains (`games.chained`, cached), at the first evaluation and at
+each remote worker's hello.
+
+### 42.5 Tests and checks
+
+* Rust `driver::tests::chain` (8, docs/search.md 2.14) and `tests/test_chained.py` (10: the bindings; both drivers'
+  rows and labels; h2h's and the resign tally's games; the loop's contests, per-game metrics and the evaluation's match
+  and per-game numbers; a replay of a whole match; remote self-play with an older worker refused; the remote
+  evaluation's marker; the Delver stack - rolling, sparse batches, the shard writer thread, sparse shards and window,
+  information-set merging with root-view values, value-only samples, the root's belief, resignation, the eval cache,
+  paired Elo - and the league plus a remote evaluation, all on `toy_match`).
+* Off by default: `cargo test` 152 passed (144 + the 8); `check_checkpoint_compat --package zero --net random --game
+  toy` f9ca5c3 -> da86087 identical (visits b1b86b689ab98313, cq d02691e9e005a5d5, vs random dcf8b2b840d45e66). The
+  only Python call that changed shape is guarded: `Run.play_match` / `play_matches` take `games` only when the
+  evaluation spec chains (a subclass overriding them with the old signature - co-training's `PrimaryRun` - is called as
+  before).
+* The full suite (97770ee, the shared desktop, 2026-11-12): **452 passed, 11 skipped, 0 failed** (1,976 s). Earlier
+  runs beside other agents' gates and a live run saw load-dependent failures that pass alone - e.g.
+  `test_forks.py::test_an_older_worker_is_refused`, which fails the same way on f9ca5c3 under that load (the worker's
+  hello came after the run's two short iterations ended). MTG Zero's gates on its branch `bo3-game-episodes` (its
+  ENGINE.md 121.5: checkpoint_compat identical, digests unchanged, the three other games built against this core).
+
+### 42.6 Measured (the toy, desktop CPU, 2026-11-11, heavily shared)
+
+`toy_match` at toy-smoke scale (`--game toy_match`, 24 contests an iteration, 8 sims): 2.5 games per contest (60 games
+of 24 contests, 1-3 drawn), ~6.8 samples per game; the evaluation reports, e.g., iteration 2 vs random: matches 4.0/4,
+games 8.5/9 (`per_game`); the Elo log `iter_0002 vs iter_0001: 2.0/4 (games 4.0/8)`. MTG Zero's best-of-three smoke:
+its ENGINE.md 121.5.
+
+## 44. The native self-play worker: zero_worker, one settings parser, parity gate 2 (no setting; zero-farm phase 0b, 2026-11-11)
 
 **Why.** zero-farm's worker (section 41) plays a run's self-play games on a friend's PC with no Python and no
 torch, for any run's settings, and its rows must be the rows a Python remote worker (5.3) would have written. So
@@ -5463,7 +5553,7 @@ a setting the worker cannot honour is refused loudly, and the worker is proven a
   converts its dicts to JSON and calls it. Two tightenings for inputs no caller makes: a bot / external seat with
   another key is refused (it was ignored), a non-finite float is refused. `<engine>.driver_settings(seats, ...)`
   gives the `DriverCfg` a `SearchDriver` would get, as text (a diagnostic).
-* **`Driver::set_first_gid`** (docs/search.md 2.14): a rolling driver's games numbered from a given id, so a farm job
+* **`Driver::set_first_gid`** (docs/search.md 2.16): a rolling driver's games numbered from a given id, so a farm job
   is a block `gid_base..` of one run-wide numbering (each game's streams derive from (seed, gid)).
 * **`crates/worker` (zero_worker)**, a workspace member outside `default-members` (this repo's `cargo test` and the
   games' builds never compile ONNX Runtime): `settings` (a run's settings -> the remote worker's self-play driver:
@@ -5540,7 +5630,7 @@ work; zero-farm docs/phase0b-worker.md has the tables).
   skipped (`tests/test_worker_shards.py`: the worker's shards pass `RemotePlay._check` and load into `Window`), the
   digests unchanged (53839c837bbaf034), `--test az` 48 passed.
 
-### 42.1 Fuzz jobs, the per-machine self-test, the runtime pack (no setting; zero-farm phase 1, 2026-11-12)
+### 44.1 Fuzz jobs, the per-machine self-test, the runtime pack (no setting; zero-farm phase 1, 2026-11-12)
 
 **Why.** zero-farm phase 1 puts friends' PCs on fuzzing first (zero-farm DESIGN.md 6: fixed seeds of a game's own
 fuzz loops, no network, no training data at stake), and every network job must first prove, on that PC, that its
@@ -5608,7 +5698,7 @@ phase 0a's recorded batches: 256 rows (7 belief, 60 value-only) in 3 batches, 35
 priors 4.5e-7, value 1.2e-6, aux 2.7e-7); `mtgz-worker`'s self-test on it 4.59e-6 in 0.16 s; with one prior off by 1e-3 the
 job stops before its first game.
 
-### 42.2 Eval jobs and farm head-to-heads (no setting; zero-farm phase 2, 2026-11-12)
+### 44.2 Eval jobs and farm head-to-heads (no setting; zero-farm phase 2, 2026-11-12)
 
 **Why.** An A/B of two checkpoints (zero.h2h) costs hours of a desktop's CPU; zero-farm (PROTOCOL.md 5.2, rev 5)
 lets friends' idle PCs play the games of an evaluation match. Each eval lease is a block of the match's game ids;
@@ -5624,7 +5714,7 @@ the rows like a local match.
   odd g, `Run.driver(table, seed, conc=min(conc, games), paired)` - the run's `eval_spec`, threads, groups,
   max_steps (`settings::eval_driver_cfg`; a job's own threads / conc / groups over the run's, as for self-play).
   The worker plays the lease as a rolling `queue_only` driver with the lease's setups all queued before its first
-  resume and `set_first_gid(gid_base)` (docs/search.md 2.14): with one group, the fixed table's batches in its
+  resume and `set_first_gid(gid_base)` (docs/search.md 2.16): with one group, the fixed table's batches in its
   order. `eval_spec` must be set (Python falls back to the game package's `eval_specs` hook, which a worker cannot
   run): the desktop resolves it (`farm_eval.resolve_eval_spec`, `Run.driver`'s rule).
 * **The networks**: one ONNX Runtime session per generation of the job's `models`, each file's sha256 checked
@@ -5671,7 +5761,7 @@ checkpoint's run's rule keys (`run_rule`), and plays the game package's default 
 the run's `margin_w`, `redet` and `eval_cache` and its `eval_spec`. A farm head-to-head plays the run's own
 evaluation (Run.play_match's seats and spec) - the same as zero.h2h for a run whose margin_w is 0, redet on,
 eval_cache 0, when zero.h2h is given `--spec <eval_spec>`. The readout's fields are zero.h2h's, so the numbers
-compare directly. (Since 42.3 zero.h2h plays a run's evaluation itself: its seats and spec are these.)
+compare directly. (Since 44.3 zero.h2h plays a run's evaluation itself: its seats and spec are these.)
 
 **Off by default.** Nothing in a run changes: an eval job is a worker's, `zero.farm_h2h` a desktop command.
 The softmax change touches only the ONNX evaluators (the worker's and `OnnxEvaluator`, the farm's), never a run's
@@ -5712,7 +5802,7 @@ pack's ONNX Runtime): every per-gen self-test passed, all 8 games credited, and 
 Python evaluation of the same 8 games in one driver. The exact exp equals float64 `exp` rounded to float32 on 150,479
 points of [-110, 0]; numpy's float32 `exp` differs from it on 47,643 of them.
 
-### 42.3 Signed definitions, one meaning of a model's sha256, zero.h2h = a run's evaluation, farm_report (no setting; zero-farm phase 2b, 2026-11-12)
+### 44.3 Signed definitions, one meaning of a model's sha256, zero.h2h = a run's evaluation, farm_report (no setting; zero-farm phase 2b, 2026-11-12)
 
 **Why.** zero-farm's security review (2026-11-12, findings H2, H3, M2) found that the coordinator - or anyone with its
 admin token - chose everything a friend's PC downloads and runs: the job JSON, the networks (any ONNX file with a
@@ -5769,7 +5859,7 @@ agents build their job lines only from its templates. The desktop tools have to 
   (`Run.nn_seat`'s; `run_seat_keys`, the run's settings resolved as the run and farm_h2h resolve them,
   `run_settings`), and the match is played at A's run's evaluation spec (`Run.driver`'s rule: `eval_spec`, else the
   game package's eval spec of the run's spec; `run_eval_spec`, `match_spec`, a note when B's run evaluates at another)
-  unless `--spec`. 42.2's "Not zero.h2h's seats" no longer holds: an h2h of a run's checkpoints plays the games of its
+  unless `--spec`. 44.2's "Not zero.h2h's seats" no longer holds: an h2h of a run's checkpoints plays the games of its
   evaluation and of a farm head-to-head at the same settings. **A deliberate change of a tool** (no run plays or trains
   differently): for a run with margin_w != 0, redet off, an evaluation cache or an eval spec of its own (MTG Zero: every
   run - its evaluation decks), zero.h2h's games differ from before; without a run config.json nothing changes.

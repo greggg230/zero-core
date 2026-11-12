@@ -1,5 +1,5 @@
 {
- "_doc": "zero-farm check-config (docs/az.md 42): every zero-core run setting (zero.run DEFAULTS) classified for a native SELF-PLAY worker. play = read by the worker, supported; trainer = deliberately unused by a self-play worker (training, evaluation, orchestration, Python inference, network shape - the network is the ONNX graph); python_only = play-affecting but implemented in Python only: unsupported unless off (falsy); param = a setting of a python_only switch, unused while the switch is off. Game-package settings: aux_<target>_w (play: the driver records the target) and reader_<target> (trainer: the reader is in the graph), for the game's auxiliary targets. Any other key is unknown. tests/test_worker_settings.py fails when DEFAULTS and this table differ.",
+ "_doc": "zero-farm check-config (docs/az.md 44): every zero-core run setting (zero.run DEFAULTS) classified for a native SELF-PLAY worker. play = read by the worker, supported; trainer = deliberately unused by a self-play worker (training, evaluation, orchestration, Python inference, network shape - the network is the ONNX graph); python_only = play-affecting but implemented in Python only: unsupported unless off (falsy); param = a setting of a python_only switch, unused while the switch is off. Game-package settings: aux_<target>_w (play: the driver records the target) and reader_<target> (trainer: the reader is in the graph), for the game's auxiliary targets. Any other key is unknown. tests/test_worker_settings.py fails when DEFAULTS and this table differ.",
  "keys": {
   "game": {
    "class": "play",
@@ -483,63 +483,63 @@
   },
   "pool_build": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_runtime": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_worker": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_url": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_max_stale": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_quota": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_slack": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_games_per_lease": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_priority": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_needs_ram_mb": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_poll_s": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_key": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_farm_release": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_expires_days": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "pool_live_s": {
    "class": "trainer",
-   "why": "orchestration (the farm pool, docs/az.md 43)"
+   "why": "orchestration (the farm pool, docs/az.md 45)"
   },
   "selfplay_local": {
    "class": "trainer",

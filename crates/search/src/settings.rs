@@ -5,7 +5,7 @@
 //! settings) both call it, so a seat setting reaches every driver in one change.
 //!
 //! The rules are the bindings' since the beginning (moved here unchanged, zero-farm phase 0b,
-//! docs/az.md 42), in JSON terms:
+//! docs/az.md 44), in JSON terms:
 //! * a missing setting or `null` is its default;
 //! * an integer setting takes a JSON integer in range or a boolean (Python's `int` accepts `True`), a
 //!   float setting any number or a boolean, a text setting a string; anything else is an error;

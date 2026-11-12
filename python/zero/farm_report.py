@@ -1,5 +1,5 @@
 """python -m zero.farm_report: what the owner's own machines contributed, for zero-farm's admin page
-(docs/az.md 42.3).
+(docs/az.md 44.3).
 
 zero-farm's coordinator counts the work its agents do. The owner's own machines - this desktop playing
 its runs, the MacBook, rented Vast boxes, all driven through zero-core's SSH remotes (zero.remote,
@@ -827,7 +827,7 @@ def task_install_argv(pythonw, python_dir, args, name=TASK_NAME):
         f'$s = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes '
         f'{TASK_LIMIT_MIN}) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries',
         f'Register-ScheduledTask -TaskName {_ps_quote(name)} -Description '
-        f'{_ps_quote("zero.farm_report: the own machines' contributions to zero-farm (zero-core docs/az.md 42.3)")} '
+        f'{_ps_quote("zero.farm_report: the own machines' contributions to zero-farm (zero-core docs/az.md 44.3)")} '
         '-Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null',
         f"Write-Output ('registered ' + {_ps_quote(name)})",
     ])

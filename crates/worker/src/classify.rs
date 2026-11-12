@@ -1,7 +1,7 @@
 //! `check-config`: every run setting classified for a native self-play worker, from the explicit
 //! table `run_settings.json` (one entry per zero-core `zero.run.DEFAULTS` key; zero-core's
 //! tests/test_worker_settings.py fails when the two differ, so a new setting can never be ignored in
-//! silence - docs/az.md 42).
+//! silence - docs/az.md 44).
 //!
 //! Classes: `play` (read by the worker and supported), `trainer` (deliberately unused by a self-play
 //! worker), `python_only` (play-affecting, implemented in Python only: unsupported unless off),
@@ -11,7 +11,7 @@
 //! them with their classes: `Worker::package_settings`). A key in no class is unknown. Unknown keys and
 //! python_only switches that are on make the check fail.
 //!
-//! An eval job (`classify_eval`, docs/az.md 42.2) reads only the settings of an evaluation match
+//! An eval job (`classify_eval`, docs/az.md 44.2) reads only the settings of an evaluation match
 //! (`settings::EVAL_READS`: `Run.nn_seat(key, eval_sims)` and `Run.driver` of a match): those are `play`,
 //! every other known setting `trainer` (unused by the job, whatever its value: a self-play feature that is
 //! Python-only does not change an evaluation's games), unknown keys unknown.

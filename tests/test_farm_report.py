@@ -1,4 +1,4 @@
-"""zero.farm_report (docs/az.md 42.3): the own machines' contributions, from run directories built here
+"""zero.farm_report (docs/az.md 44.3): the own machines' contributions, from run directories built here
 in the real formats (metrics.jsonl: zero.run.Run.finish_iter + zero.remoteplay's records; evals.jsonl:
 zero.remote.RemoteEval; Elo pools: zero.elo), a fake ssh runner, a fake HTTP transport. Nothing here
 reaches the network, the Mac or a real run."""
@@ -400,7 +400,7 @@ def test_install_command_exact():
                     "$s = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan "
                     "-Minutes 4) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; "
                     "Register-ScheduledTask -TaskName 'ZeroFarmReport' -Description 'zero.farm_report: the own "
-                    "machines'' contributions to zero-farm (zero-core docs/az.md 42.3)' -Action $a -Trigger $t "
+                    "machines'' contributions to zero-farm (zero-core docs/az.md 44.3)' -Action $a -Trigger $t "
                     "-Principal $p -Settings $s -Force | Out-Null; Write-Output ('registered ' + 'ZeroFarmReport')"]
     assert 'SYSTEM' not in argv[-1]
     assert fr.task_uninstall_argv() == [

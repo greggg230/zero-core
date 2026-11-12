@@ -1,5 +1,5 @@
 """The native worker's protocol (aw/1, zero-farm PROTOCOL.md 5) end to end with a real network (zero-farm phase
-0b, docs/az.md 42): `<worker> serve` is given the same self-play job twice - once left alone, once with a
+0b, docs/az.md 44): `<worker> serve` is given the same self-play job twice - once left alone, once with a
 `yield` after its first finished games and a `resume` a few seconds later - and the two jobs' shards must be
 byte-identical (deterministic settings: groups 1). Also checked: `hello` first and within 10 s, `yielded`
 within 2 s of `yield`, `status` lines at least every 30 s, `end` with reason 'done' and no unfinished games,

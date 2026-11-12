@@ -1,4 +1,4 @@
-"""zero.farm_def (zero-farm PROTOCOL.md 7, docs/az.md 42.3): definition/1 documents (their checks), the version
+"""zero.farm_def (zero-farm PROTOCOL.md 7, docs/az.md 44.3): definition/1 documents (their checks), the version
 (the coordinator's current or the archive's newest, + 1), the archive (written once, never other bytes under a
 version), signing and publishing through farm-release (a stub: tests/farm_release_stub.py) with the admin token in
 its environment only, and the check that the coordinator names the published version."""

@@ -1,4 +1,4 @@
-"""The farm pool (zero-farm DESIGN.md 7, docs/az.md 43): a run's self-play also on friends' idle PCs, through the
+"""The farm pool (zero-farm DESIGN.md 7, docs/az.md 45): a run's self-play also on friends' idle PCs, through the
 zero-farm coordinator - `selfplay_remote` names `pool:<farm run>` (alone or in a list with remote hosts).
 
 Unlike a remote host it has no sessions and never holds a share of the iteration's quota: it is one thread of the
@@ -12,7 +12,7 @@ run process (`Pool`, owned by zero.remoteplay.RemotePlay) that
    with farm-release - and only then the gen registered current (`PUT .../checkpoint/<gen>`): farm leases switch
    only to gens a definition names. The run on the coordinator is created on the first publish (`selfplay`:
    quota `pool_quota` (default the run's `games`), slack, max_stale, games per lease, needs).
-2. **ingests** records (zero-farm PROTOCOL.md 5 `records`, zero-core docs/search.md 2.15): it polls
+2. **ingests** records (zero-farm PROTOCOL.md 5 `records`, zero-core docs/search.md 2.17): it polls
    `GET .../results`, downloads each self-play chunk, checks its header (the run's game, features, actions, spec,
    auxiliary targets, base seed and worker build), replays every credited game through the engine
    (`<pkg>._engine.replay_rows`: the rows bit for bit as the worker's shards would hold them; replay is the
@@ -31,7 +31,7 @@ run process (`Pool`, owned by zero.remoteplay.RemotePlay) that
 
 The run never waits for the pool: RemotePlay.end closes the pool's shards of the iteration with whatever it accepted.
 
-Settings (zero.run DEFAULTS, docs/az.md 43): `pool_build` (the worker build id, required), `pool_runtime` (its runtime
+Settings (zero.run DEFAULTS, docs/az.md 45): `pool_build` (the worker build id, required), `pool_runtime` (its runtime
 build), `pool_worker` (that build's signed executable on this machine: its `check-config` picks the template's
 settings), `pool_url` (default zero.farm_def.URL), `pool_max_stale`, `pool_quota`, `pool_slack`,
 `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key` (the data key; default

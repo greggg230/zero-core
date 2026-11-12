@@ -23,7 +23,7 @@ both machines pull an iteration's work from one shared queue (zero/workqueue.py)
 Run settings: `selfplay_remote` (a name in the game package's `remotes`; 'local' = this machine,
 the tests; '' = off; a comma-separated list = several hosts, and the run directory's `selfplay_remotes`
 file replaces the list at every phase start: docs/az.md 34; a name `pool:<farm run>` is the zero-farm pool,
-friends' idle PCs through the farm's coordinator: zero/farm_pool.py, docs/az.md 43 - it has no sessions and
+friends' idle PCs through the farm's coordinator: zero/farm_pool.py, docs/az.md 45 - it has no sessions and
 holds no share of the quota: its games count as they arrive), `selfplay_local` (0: this machine takes no
 games while a remote worker takes work, docs/az.md 34.4), `selfplay_remote_procs` (worker processes per
 host; 0 = the remote's `procs`),
@@ -139,6 +139,14 @@ def _value_choice_of(cfg):
     checks (docs/az.md 39) - an older checkout would search the game's value choices as any decision in silence."""
     from .mcts import value_choice_tag
     return value_choice_tag(cfg.get('selfplay_value_choice_worlds', 0) or 0, cfg.get('selfplay_value_choice_temp', 0.0) or 0.0)
+
+
+def _episodes_of(cfg):
+    """A run's self-play episodes (docs/az.md 42; '' unless its spec's games chain their episodes, 'chained'): what a
+    worker's hello reports and the run checks - an older checkout would play a whole contest (MTG Zero: a
+    best-of-three match) as one episode, every row labelled with the contest's result, in silence."""
+    from .games import episodes_tag
+    return episodes_tag(cfg['game'], cfg.get('spec', ''), (cfg.get('players') or [2])[0])
 
 
 def _forks_of(fk):
@@ -524,7 +532,7 @@ class RemotePlay:
         self.multi = bool(from_file or len(hnames) >= 2)
         self.listed = names                        # the names that should play
         self.hosts = {}                            # name -> Host (the resolved ones, in the order they joined)
-        self.pools = {}                            # name -> farm_pool.Pool ('pool:<farm run>', docs/az.md 43)
+        self.pools = {}                            # name -> farm_pool.Pool ('pool:<farm run>', docs/az.md 45)
         self.resolving = set()                     # names resolving on a thread now
         self.restored = {}                         # a list of hosts: restored rates of consumers not here yet
         if mode != 'selfplay' and len(hnames) != len(names):
@@ -834,7 +842,7 @@ class RemotePlay:
                         and sh.provisional(h.cname(k), st.get('leaves'), st['run_s']):
                     h.log(f'worker {k}: first measured at {st["leaves"] / st["run_s"]:.0f} leaves/s in '
                           f'{st["run_s"]:.0f}s of its phase')
-        # (a farm pool takes work while its records arrive: farm_pool.Pool.live, docs/az.md 43)
+        # (a farm pool takes work while its records arrive: farm_pool.Pool.live, docs/az.md 45)
         taking += sum(1 for p in self.pools.values() if p.live())
         if not self.local_play and 'local' in sh.c:
             off = taking > 0
@@ -1124,7 +1132,7 @@ class RemotePlay:
             out['remotes'] = {name: self._record(hout, hends, hc, hlate, hprev, wait_s, lead_s, hcaps, hheld, hout_n)
                               for name, hout, hends, hc, hlate, hprev, hcaps, hheld, hout_n in per}
         if self.pools:
-            # the farm pools' share (docs/az.md 43): closed with what they accepted - the run never waits for them
+            # the farm pools' share (docs/az.md 45): closed with what they accepted - the run never waits for them
             pls = {p.name: p.end_phase(it) for p in list(self.pools.values())}
             out['pools'] = {n: {k: v for k, v in r.items() if k != 'stale'} for n, r in pls.items()}
             out['games'] = out.get('games', 0) + sum(r['games'] for r in pls.values())
@@ -1236,6 +1244,11 @@ class RemotePlay:
                     # a checkout without value choices would search them as any decision, recorded, in silence:
                     # never used (docs/az.md 39)
                     s.no_value_choice = ev.get('value_choice')
+                want_e = _episodes_of(self.R.cfg) if self.mode == 'selfplay' else ''
+                if want_e and ev.get('episodes') != want_e:
+                    # a checkout without chained episodes would play a whole contest as one episode, its rows
+                    # labelled with the contest's result, in silence: never used (docs/az.md 42)
+                    s.no_episodes = ev.get('episodes')
                 if h.fails or s.k == 0:
                     h.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {h.rdir})')
             elif kind == 'status':
@@ -1392,6 +1405,13 @@ class RemotePlay:
             h.fail_log(f'worker {k} REFUSED: its checkout plays self-play information-set merging as '
                        f'{s.no_merge!r}, the run as {_merge_of(self.R.cfg)!r} (an older checkout has none: '
                        f'docs/az.md 30); killed, retried in 10 minutes')
+            s.kill()
+            return
+        if hasattr(s, 'no_episodes'):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout plays the episodes of the run\'s spec as {s.no_episodes!r}, the '
+                       f'run as {_episodes_of(self.R.cfg)!r} (an older checkout plays a whole contest as one episode: '
+                       f'docs/az.md 42); killed, retried in 10 minutes')
             s.kill()
             return
         if hasattr(s, 'no_value_choice'):
@@ -2422,7 +2442,8 @@ class Worker:
                       **({} if self.test.get('no_forks') else {'forks': _forks_of(self._forks())}),
                       **({} if self.test.get('no_resign') else {'resign': _resign_of(self.cfg)}),
                       **({} if self.test.get('no_merge') else {'merge': _merge_of(self.cfg)}),
-                      **({} if self.test.get('no_value_choice') else {'value_choice': _value_choice_of(self.cfg)}))
+                      **({} if self.test.get('no_value_choice') else {'value_choice': _value_choice_of(self.cfg)}),
+                      **({} if self.test.get('no_episodes') else {'episodes': _episodes_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None

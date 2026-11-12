@@ -1,4 +1,4 @@
-"""zero-farm eval jobs on the desktop's side (docs/az.md 42.2, zero-farm PROTOCOL.md 5.2): what an eval job's
+"""zero-farm eval jobs on the desktop's side (docs/az.md 44.2, zero-farm PROTOCOL.md 5.2): what an eval job's
 games are in Python terms, their result rows, and the readout of a head-to-head.
 
 An eval job plays games `gid_base .. gid_base + games` of an evaluation match between two seats, each

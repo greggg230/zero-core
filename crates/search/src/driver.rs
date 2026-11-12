@@ -65,7 +65,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockRead
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::game::{make_bot, Belief, Bot, SearchGame, MAX_SEATS};
+use crate::game::{make_bot, Belief, Bot, Next, SearchGame, MAX_SEATS};
 use crate::lookahead::{Look, LookCfg};
 pub use crate::record::{GameTrace, TraceStep};
 use crate::rng::{split64, Rng};
@@ -810,10 +810,32 @@ pub struct GameResult {
     /// A game started from an archive entry (`DriverCfg::starts`): the entry's index; None otherwise.
     pub start: Option<u32>,
     /// Self-play resignation (`NnSeat::resign_t`, docs/search.md 3.14): None unless the game's seats resign.
+    /// A chained contest's row: None (each episode's is in `episodes`).
     pub resign: Option<ResignInfo>,
-    /// The game's trace (`Driver::set_trace`, docs/search.md 2.15): its seed, real moves and setup record -
-    /// what replays it (`record::replay`). None while tracing is off (the default).
+    /// A chained game's contest (`SearchGame::chained`, docs/search.md 2.14): its episodes in order; empty for
+    /// every other game. The row itself is the contest's (`result` its result, the counts summed).
+    pub episodes: Vec<EpisodeRow>,
+    /// The game's trace (`Driver::set_trace`, docs/search.md 2.17): its seed, real moves (a contest's episode
+    /// boundaries included) and setup record - what replays it (`record::replay`). None while tracing is off (the
+    /// default).
     pub trace: Option<Box<GameTrace>>,
+}
+
+/// One episode of a chained contest (`GameResult::episodes`, docs/search.md 2.14): its outcome and counts.
+#[derive(Clone, Debug)]
+pub struct EpisodeRow {
+    /// Ended by the rules or by a resignation (else cut at `max_steps`, or aborted: the contest's last episode).
+    pub over: bool,
+    pub aborted: bool,
+    /// Its result per seat (its records' z; a draw when not over) and `margin(seat)` at its end (their sc).
+    pub result: Vec<f32>,
+    pub margins: Vec<f32>,
+    pub steps: u64,
+    pub decisions: u32,
+    pub ext_moves: u32,
+    pub rounds: u32,
+    pub samples: u32,
+    pub resign: Option<ResignInfo>,
 }
 
 /// One recorded root decision with its targets.
@@ -832,7 +854,7 @@ pub struct Record {
     /// The decider's auxiliary targets at this decision (`DriverCfg::aux`), else empty.
     pub aux: Vec<f32>,
     /// The real moves of its game played before this decision (`GameResult::trace`'s steps; docs/search.md
-    /// 2.15) while the driver traces its games (`Driver::set_trace`), else 0.
+    /// 2.17) while the driver traces its games (`Driver::set_trace`), else 0.
     pub step: u32,
 }
 
@@ -1257,9 +1279,24 @@ struct Slot<G: SearchGame> {
     cache: HashMap<(u16, u32, u128), Cached>,
     /// Self-play resignation (docs/search.md 3.14): the game's counter, None unless its seats resign.
     resign: Option<ResignState>,
-    /// The game's real moves so far (`Driver::set_trace`, docs/search.md 2.15; None: not traced) and its seed.
+    /// The game's real moves so far (`Driver::set_trace`, docs/search.md 2.17; None: not traced) and its seed; a
+    /// chained contest's episode boundaries among them (`TraceStep::Next`) and each ended episode's setup record.
     trace: Option<Vec<TraceStep>>,
+    trace_setups: Vec<String>,
     game_seed: u64,
+    /// A chained game's contest in progress (`SearchGame::chained`, docs/search.md 2.14); None for every other game.
+    chain: Option<Box<Chain>>,
+}
+
+/// A chained game's contest in progress (`Slot::chain`, docs/search.md 2.14): its finished episodes, their samples
+/// (labelled with each episode's outcome, handed out behind the contest's one row) and its counts so far.
+#[derive(Default)]
+struct Chain {
+    episodes: Vec<EpisodeRow>,
+    samples: Vec<Record>,
+    steps: u64,
+    decisions: u32,
+    ext_moves: u32,
 }
 
 impl<G: SearchGame> Slot<G> {
@@ -1308,7 +1345,9 @@ impl<G: SearchGame> Slot<G> {
             cache: HashMap::new(),
             resign: None,
             trace: None,
+            trace_setups: Vec::new(),
             game_seed: 0,
+            chain: None,
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -2049,7 +2088,7 @@ impl<G: SearchGame> Driver<G> {
     /// A rolling driver's first game id (before its first `resume`; default 0): its games are `gid`,
     /// `gid + 1`, ... - each game's random streams derive from (seed, gid) as ever, so a block of game
     /// ids played by one driver plays exactly those games of a driver started at 0 (a native worker's
-    /// job of games `gid_base..`, zero-farm; docs/search.md 2.14). Nothing changes when never called.
+    /// job of games `gid_base..`, zero-farm; docs/search.md 2.16). Nothing changes when never called.
     pub fn set_first_gid(&mut self, gid: u32) -> Result<(), String> {
         if !self.sh.cfg.rolling {
             return Err("set_first_gid: a rolling driver's (a fixed table's games are 0..games)".into());
@@ -2061,7 +2100,7 @@ impl<G: SearchGame> Driver<G> {
         Ok(())
     }
 
-    /// Trace every game (docs/search.md 2.15, zero-farm's self-play records): each finished game's result row
+    /// Trace every game (docs/search.md 2.17, zero-farm's self-play records): each finished game's result row
     /// carries its seed, its real moves (single-option steps and external answers included) and the game's
     /// setup record (`GameResult::trace`), and each training record the moves played before its decision
     /// (`Record::step`) - what `record::replay` rebuilds the rows from. A rolling driver's, before its first
@@ -2076,7 +2115,7 @@ impl<G: SearchGame> Driver<G> {
             return Err("set_trace: before the first resume (games have started)".into());
         }
         if on && (self.sh.cfg.branch.is_some() || self.sh.cfg.starts.is_some()) {
-            return Err("set_trace: branched games and archive starts are not replayable from a seed (docs/search.md 2.15)".into());
+            return Err("set_trace: branched games and archive starts are not replayable from a seed (docs/search.md 2.17)".into());
         }
         self.sh.trace.store(on, Ordering::SeqCst);
         Ok(())
@@ -2365,7 +2404,7 @@ impl<G: SearchGame> Driver<G> {
         self.queue.len()
     }
 
-    /// Drop every queued setup not started yet -> how many (docs/search.md 2.14: a native worker's eval job
+    /// Drop every queued setup not started yet -> how many (docs/search.md 2.16: a native worker's eval job
     /// asked to finish starts no new game; the games in flight play on). Nothing else changes.
     pub fn clear_queue(&mut self) -> usize {
         let n = self.queue.len();

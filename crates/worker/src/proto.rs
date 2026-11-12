@@ -34,7 +34,7 @@
 //! answered before the first batch, `selftest` {provider, max_abs, ok}; a failure is fatal), threads, out_dir;
 //! optional gen - the rows' network id, default the graph's `checkpoint_iter` -, sha256 - the model FILE's,
 //! checked before the file is loaded -, conc, groups, infer_threads, spinning, prefix, output - 'records' (the
-//! default from zero-farm phase 3: game records, `records` events; zero-core docs/search.md 2.15), 'shards'
+//! default from zero-farm phase 3: game records, `records` events; zero-core docs/search.md 2.17), 'shards'
 //! (sample shards, `shard` events) or 'both'); during it `yield` ->
 //! `yielded` (no batch started, the session dropped), `resume` -> `resumed`, `finish`, `quit`, `checkpoint`
 //! {gen, model, sha256? (the file's), reference?},

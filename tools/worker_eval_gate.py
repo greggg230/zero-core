@@ -1,4 +1,4 @@
-"""The eval gate (zero-farm phase 2, docs/az.md 42.2): the native worker's eval job against the Python path of
+"""The eval gate (zero-farm phase 2, docs/az.md 44.2): the native worker's eval job against the Python path of
 an evaluation match - `Run.play_match`'s driver (zero.farm_eval.match_driver: Run.nn_seat(key, eval_sims)
 seats, Run.driver(table, seed, conc, paired)) driven by `infer.drive` with zero-core's `OnnxEvaluator` on the
 same ONNX graphs - at deterministic settings (groups 1): every result row must be byte-identical.
@@ -11,9 +11,9 @@ same ONNX graphs - at deterministic settings (groups 1): every result row must b
 `--settings`: the eval job's settings (a run's resolved config with `eval_spec` set: zero.farm_eval.
 resolve_eval_spec), given as they are to both sides (the worker reads the same file); `--threads` is both
 sides' search threads (the job's threads over the settings'), `--infer-threads` ONNX Runtime's intra-op
-threads on both sides (the same pieces and threads: the graph's outputs bit for bit, docs/az.md 42 gate b).
+threads on both sides (the same pieces and threads: the graph's outputs bit for bit, docs/az.md 44 gate b).
 The Python side plays games 0..N in one driver (a fixed table: Run.play_match's own); the native side one
-eval job of games 0..N (a rolling queue_only driver, docs/search.md 2.14). Compared: each game's row (bytes),
+eval job of games 0..N (a rolling queue_only driver, docs/search.md 2.16). Compared: each game's row (bytes),
 and the first `--batches` network batches each side sent (every array; diagnostics). Writes
 <out>/python.jsonl, <out>/native/e_*.jsonl, <out>/gate.json; exit 1 on a difference.
 """

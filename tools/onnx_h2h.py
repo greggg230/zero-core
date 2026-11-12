@@ -1,4 +1,4 @@
-"""Parity gate 2 (c), behaviour (zero-farm phase 0b, docs/az.md 42): a head-to-head of a checkpoint's
+"""Parity gate 2 (c), behaviour (zero-farm phase 0b, docs/az.md 44): a head-to-head of a checkpoint's
 zero-onnx/1 graph through onnxruntime (`zero.onnx_eval.OnnxEvaluator`, side A) against the checkpoint itself
 through torch (`infer.NetEvaluator`, side B) - the same network, so A's score should be 0.5 within its se.
 zero.h2h's match (paired games, the evaluation seats) with side A's evaluator swapped; CPU only.

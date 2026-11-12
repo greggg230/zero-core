@@ -196,7 +196,7 @@ pub fn transition_with<G: SearchGame>(g: &mut G, a: u16, forced: Option<&[u64]>,
 }
 
 /// `transition_with`, calling `each(action)` after every step it makes - `a`, then each single-option
-/// decision it steps (the driver's trace of a live game's real moves, docs/search.md 2.15).
+/// decision it steps (the driver's trace of a live game's real moves, docs/search.md 2.17).
 pub fn transition_each<G: SearchGame>(g: &mut G, a: u16, forced: Option<&[u64]>, key: &mut Vec<u64>, legal: &mut Vec<u16>, auto: impl Fn(usize) -> bool, mut each: impl FnMut(u16)) -> Result<(), String> {
     key.clear();
     legal.clear();

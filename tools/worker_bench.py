@@ -1,4 +1,4 @@
-"""Self-play throughput of the native worker against the Python remote worker (zero-farm phase 0b, docs/az.md 42):
+"""Self-play throughput of the native worker against the Python remote worker (zero-farm phase 0b, docs/az.md 44):
 the same run settings (with the overrides given, e.g. a friend-class 8 threads), the same seed and network
 (the native side its zero-onnx/1 graph through ONNX Runtime, the Python side the checkpoint through torch on
 the CPU), each side a rolling self-play for `--minutes`, the runs interleaved for `--rounds` rounds (native,

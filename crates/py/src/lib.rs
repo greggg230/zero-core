@@ -40,7 +40,7 @@ pub struct GameEntry {
     pub new_game: fn(&str, usize, u64) -> Result<Box<dyn DynGame>, String>,
     pub new_driver: fn(DriverCfg) -> Result<Box<dyn DynDriver>, String>,
     pub info: fn() -> GameInfo,
-    /// `zero_search::record::replay_json` of the game type (docs/search.md 2.15).
+    /// `zero_search::record::replay_json` of the game type (docs/search.md 2.17).
     pub replay: fn(&str, &str, bool) -> Result<Replayed, String>,
 }
 
@@ -213,6 +213,18 @@ fn starts_json(d: &Bound<'_, PyDict>) -> PyResult<Value> {
         }
     }
     Ok(Value::Object(m))
+}
+
+/// A result row's resignation (`ResignInfo`, docs/search.md 3.14) as a dict.
+fn resign_dict<'py>(py: Python<'py>, rs: &zero_search::driver::ResignInfo) -> PyResult<Bound<'py, PyDict>> {
+    let rd = PyDict::new(py);
+    rd.set_item("resigned", rs.resigned)?;
+    rd.set_item("noresign", rs.noresign)?;
+    rd.set_item("winner", rs.winner)?;
+    rd.set_item("decision", rs.decision)?;
+    rd.set_item("step", rs.step)?;
+    rd.set_item("records", rs.records)?;
+    Ok(rd)
 }
 
 fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>> {
@@ -428,6 +440,24 @@ impl PyGame {
     }
     fn apply_external(&mut self, payload: &str) -> PyResult<Vec<u64>> {
         self.g.apply_external(payload).map_err(verr)
+    }
+    /// The game chains its episodes (`SearchGame::chained`, docs/search.md 1.3): an episode ends where it is over, and
+    /// `next_episode` says how the contest goes on.
+    #[getter]
+    fn chained(&self) -> bool {
+        self.g.chained()
+    }
+    /// A chained game's next episode from this ended one (`conceded`: the seat that resigned it, at a decision in
+    /// progress; None: it is over) -> (the next episode's game, None), or (None, the contest's result per seat).
+    #[pyo3(signature = (conceded=None))]
+    fn next_episode(&self, conceded: Option<usize>) -> PyResult<(Option<PyGame>, Option<Vec<f32>>)> {
+        let (g, r) = self.g.next_episode(conceded).map_err(verr)?;
+        Ok((g.map(|g| PyGame { g }), r))
+    }
+    /// The self-play resign rule may count the pending decision (`SearchGame::can_concede`).
+    #[getter]
+    fn can_concede(&self) -> bool {
+        self.g.can_concede()
     }
     /// A Rust search tree for the pending decision.
     #[pyo3(signature = (redet=true, seed=0))]
@@ -718,7 +748,7 @@ fn driver_cfg(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concur
 /// The driver settings `SearchDriver(game, seats, ...)` would be built with, as the Rust `DriverCfg`'s
 /// pretty Debug text (a diagnostic: no driver is made, the game is not checked): the seat dicts parsed,
 /// the distinct seats in one table. zero-farm's settings tools compare it across parsers and with the
-/// native worker's (docs/az.md 42).
+/// native worker's (docs/az.md 44).
 #[pyfunction]
 #[pyo3(signature = (seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None))]
 #[allow(clippy::too_many_arguments)]
@@ -850,12 +880,12 @@ impl PySearchDriver {
         Ok(out)
     }
 
-    /// Trace every game (`Driver::set_trace`, docs/search.md 2.15): before the first resume.
+    /// Trace every game (`Driver::set_trace`, docs/search.md 2.17): before the first resume.
     fn set_trace(&mut self, on: bool) -> PyResult<()> {
         self.d.set_trace(on).map_err(verr)
     }
 
-    /// A traced driver's finished games (docs/search.md 2.15): take_results and take_samples at one point, with each
+    /// A traced driver's finished games (docs/search.md 2.17): take_results and take_samples at one point, with each
     /// game's record (`zero_search::record::game_json`, JSON text) -> (rows, records, samples dict or None).
     fn take_game_records<'py>(&mut self, py: Python<'py>) -> PyResult<(Bound<'py, PyList>, Vec<String>, Option<PyObject>)> {
         let rows = self.d.take_results();
@@ -1019,7 +1049,7 @@ fn samples_dict(py: Python<'_>, recs: Vec<Record>, f: usize) -> PyResult<Option<
     Ok(Some(a.into_any().unbind()))
 }
 
-/// One game record replayed (docs/search.md 2.15, zero-farm's self-play records: `zero_search::record`): game
+/// One game record replayed (docs/search.md 2.17, zero-farm's self-play records: `zero_search::record`): game
 /// `game` with spec `spec` (JSON text), `record` one game's record (JSON text), `aux` its rows carry the
 /// auxiliary targets -> (the rows as `take_samples` gives them - None for a game without samples -, the game's
 /// facts {gid, n, seed, over, aborted, resigned, result, rounds, steps, setup, rows}). A record replay refuses
@@ -1091,16 +1121,30 @@ fn result_row<'py>(py: Python<'py>, r: &zero_search::driver::GameResult) -> PyRe
         // a game started from an archive entry (DriverCfg::starts)
         d.set_item("start", j)?;
     }
+    if !r.episodes.is_empty() {
+        // a chained game's contest (SearchGame::chained, docs/search.md 2.14): its episodes
+        let eps = PyList::empty(py);
+        for e in &r.episodes {
+            let ed = PyDict::new(py);
+            ed.set_item("over", e.over)?;
+            ed.set_item("aborted", e.aborted)?;
+            ed.set_item("result", e.result.clone())?;
+            ed.set_item("margins", e.margins.clone())?;
+            ed.set_item("steps", e.steps)?;
+            ed.set_item("decisions", e.decisions)?;
+            ed.set_item("ext_moves", e.ext_moves)?;
+            ed.set_item("rounds", e.rounds)?;
+            ed.set_item("samples", e.samples)?;
+            if let Some(rs) = &e.resign {
+                ed.set_item("resign", resign_dict(py, rs)?)?;
+            }
+            eps.append(ed)?;
+        }
+        d.set_item("episodes", eps)?;
+    }
     if let Some(rs) = &r.resign {
         // self-play resignation (NnSeat::resign_t, docs/search.md 3.14): only when the game's seats resign
-        let rd = PyDict::new(py);
-        rd.set_item("resigned", rs.resigned)?;
-        rd.set_item("noresign", rs.noresign)?;
-        rd.set_item("winner", rs.winner)?;
-        rd.set_item("decision", rs.decision)?;
-        rd.set_item("step", rs.step)?;
-        rd.set_item("records", rs.records)?;
-        d.set_item("resign", rd)?;
+        d.set_item("resign", resign_dict(py, rs)?)?;
     }
     Ok(d)
 }

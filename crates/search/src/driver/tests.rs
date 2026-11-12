@@ -4149,7 +4149,7 @@ fn batches_and_games(d: &mut Driver<ToyGame>) -> (Vec<(u16, Vec<i64>, Vec<f32>)>
 
 #[test]
 fn a_queued_rolling_driver_plays_a_fixed_tables_match_batch_for_batch() {
-    // zero-farm's eval job (docs/search.md 2.14): a match of n games, seats [a, b] for even game ids and
+    // zero-farm's eval job (docs/search.md 2.16): a match of n games, seats [a, b] for even game ids and
     // [b, a] for odd ones (Run.play_match's table), played by a rolling queue_only driver whose table is
     // those two rows (game gid takes row gid % 2) with all n setups (the driver's spec) queued before its
     // first resume: with one group it sends the fixed-table driver's batches, in its order, and plays its
@@ -4212,7 +4212,7 @@ fn clear_queue_starts_no_new_game() {
     assert_eq!(ids, vec![0, 1, 2], "the games in flight finished, none started after");
 }
 
-// ---- traced games and their records (Driver::set_trace, record::replay; docs/search.md 2.15) ----
+// ---- traced games and their records (Driver::set_trace, record::replay; docs/search.md 2.17) ----
 
 /// The traced self-play of `seat` (a rolling toy driver with auxiliary targets): phases of `quota` games with
 /// networks 0, 0, 1 (a new search epoch: games in flight cross networks), answered by `answer_lead` (decisive
@@ -4378,3 +4378,5 @@ fn set_trace_before_games_and_never_with_branches() {
     let mut d = Driver::<ToyGame>::new(c).unwrap();
     assert!(d.set_trace(true).unwrap_err().contains("branched"));
 }
+// chained episodes (docs/search.md 2.14): the toy match through the driver
+mod chain;

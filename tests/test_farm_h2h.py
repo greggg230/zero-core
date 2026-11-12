@@ -1,4 +1,4 @@
-"""zero.farm_h2h (docs/az.md 42.2) against a fake coordinator: the settings resolved (eval_spec, eval_sims), both
+"""zero.farm_h2h (docs/az.md 44.2) against a fake coordinator: the settings resolved (eval_spec, eval_sims), both
 checkpoints exported with their reference sets, the run / artifacts / gens / eval batch put in order, the
 results polled, downloaded, credited as the coordinator credits them (a pair only from one lease: a lone game
 held by its chunk and completed by a later chunk's `also`; dup_ids; other kinds ignored) and acked,
@@ -6,7 +6,7 @@ the readout (zero.h2h.summary's fields) of the farm's rows; --resume reads the s
 the admin token never printed. The fake plays the batch's games with zero.farm_eval.match_driver and the
 uploaded graphs (OnnxEvaluator): what a native worker plays (tools/worker_eval_gate.py).
 
-Signed definitions (zero-farm PROTOCOL.md 7, docs/az.md 42.3): farm-release is a stub (tests/farm_release_stub.py)
+Signed definitions (zero-farm PROTOCOL.md 7, docs/az.md 44.3): farm-release is a stub (tests/farm_release_stub.py)
 that records its arguments and registers the definition with the fake coordinator, which then accepts the eval batch
 only when its job is the definition's template and its gens are the definition's files."""
 import hashlib
@@ -274,7 +274,7 @@ def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
 
 
 def test_zero_h2h_plays_the_runs_evaluation(tmp_path, monkeypatch, capsys):
-    """zero.h2h of a run's checkpoints plays Run.play_match's games (docs/az.md 42.3): each side's seat takes its run's
+    """zero.h2h of a run's checkpoints plays Run.play_match's games (docs/az.md 44.3): each side's seat takes its run's
     margin_w, redet and eval_cache, the match A's run's evaluation spec - so its rows equal the farm's Python path
     (farm_eval.match_driver at the settings farm_h2h puts) game for game."""
     import torch

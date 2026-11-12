@@ -1,7 +1,7 @@
 """`OnnxEvaluator`: a `zero-onnx/1` graph (zero/onnx_export.py, docs/az.md 41) answering the driver's network
 batches through onnxruntime on the CPU, with the generic step every zero-core evaluator does - a drop-in
 for `infer.NetEvaluator` wherever a LeafBatch evaluator is taken (`infer.drive`, zero.h2h's seats, a remote
-worker), and the Python reference of the native worker's evaluator (zero-farm parity gate 2, docs/az.md 42).
+worker), and the Python reference of the native worker's evaluator (zero-farm parity gate 2, docs/az.md 44).
 
     ev = OnnxEvaluator('eoe1_iter_0080.packed.onnx', threads=1)
     drive(driver, {'m': ev})

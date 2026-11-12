@@ -1,4 +1,4 @@
-"""Edge cases of the seat / driver settings parser, old module vs new (zero-farm phase 0b, docs/az.md 42):
+"""Edge cases of the seat / driver settings parser, old module vs new (zero-farm phase 0b, docs/az.md 44):
 each case's `driver_settings` text from two builds of an engine module (e.g. the toy module of the commit
 before zero_search::settings and of the commit after) - identical, or both refused (the messages may
 differ), or listed as a deliberate change.
@@ -71,7 +71,7 @@ def cases():
 
 
 DELIBERATE = {
-    # zero_search::settings is stricter than the old bindings for inputs no caller makes (docs/az.md 42)
+    # zero_search::settings is stricter than the old bindings for inputs no caller makes (docs/az.md 44)
     'bot with another key', 'starts list entries',
 }
 

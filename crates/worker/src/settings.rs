@@ -5,9 +5,9 @@
 //! record=True, rolling=True, net, queue_only=True)`), then zero_search's shared parser
 //! (`settings::driver_cfg`) - so the seat dict is the Python one, key for key and type for type, and
 //! its parsing is the same code. tools/driver_settings_dump.py `--compare-worker` checks every
-//! preset and run config against the Python path (docs/az.md 42).
+//! preset and run config against the Python path (docs/az.md 44).
 //!
-//! Evaluation (zero-farm eval jobs, docs/az.md 42.2): `eval_seat` is `Run.nn_seat(key, sims)` (the same
+//! Evaluation (zero-farm eval jobs, docs/az.md 44.2): `eval_seat` is `Run.nn_seat(key, sims)` (the same
 //! `games.nn_seat` port), `eval_driver_cfg` the driver of `Run.play_match` / zero.h2h's seat order, and
 //! `eval_lease_cfg` how a lease of its games is played.
 //!
@@ -733,7 +733,7 @@ pub fn eval_driver_cfg(c: &Settings, info: &GameInfo, seats: &[EvalSeat], games:
 /// rows (the graph reads them; the same rows). With every game's setup (the eval spec) queued before its
 /// first resume and `set_first_gid(gid_base)` it plays games gid_base.. of the match - with one group the
 /// fixed table's batches in its order (zero_search `a_queued_rolling_driver_plays_a_fixed_tables_match_
-/// batch_for_batch`, docs/search.md 2.14).
+/// batch_for_batch`, docs/search.md 2.16).
 pub fn eval_lease_cfg(mut m: DriverCfg) -> DriverCfg {
     m.games.truncate(2);
     if m.games.len() == 1 {
