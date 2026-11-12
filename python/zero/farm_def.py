@@ -196,36 +196,88 @@ def checkpoint_entry(model, reference=None):
     return out
 
 
+# zero-farm's agent/common/src/definition.rs (farm-release define and the agent check exactly this): the keys a job
+# template may have, per kind - never a per-lease field (gid_base, games, seed / first, count: the coordinator's) - and
+# nothing path-like anywhere in it.
+TEMPLATE_KEYS = {'selfplay': ('settings',), 'eval': ('settings', 'seats', 'paired'), 'fuzz': ('mode', 'env', 'announce_result')}
+MAX_ID = 1 << 53
+MAX_CHECKPOINT_FILE_BYTES = 1 << 30
+
+
+def looks_like_path(s):
+    """A string a worker could take for a file path (definition.rs `looks_like_path`): a separator, `..`, or a drive
+    (`C:` at its start). Job templates carry none: paths on a job line are only ever the agent's own."""
+    return '\\' in s or '/' in s or '..' in s or (len(s) >= 2 and s[0].isascii() and s[0].isalpha() and s[1] == ':')
+
+
+def check_no_paths(v, at, depth=0):
+    """Every string and object key in `v` free of path-like text (definition.rs `check_no_paths`)."""
+    if depth > 32:
+        raise ValueError(f'{at}: nested too deeply')
+    if isinstance(v, str):
+        if looks_like_path(v):
+            raise ValueError(f'{at}: {v[:60]!r} looks like a file path (a job template carries none)')
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            check_no_paths(x, f'{at}[{i}]', depth + 1)
+    elif isinstance(v, dict):
+        for k, x in v.items():
+            if looks_like_path(str(k)):
+                raise ValueError(f'{at}: key {str(k)[:60]!r} looks like a file path')
+            check_no_paths(x, f'{at}.{k}', depth + 1)
+
+
+def _is_name(s, n, extra):
+    return isinstance(s, str) and 0 < len(s) <= n and all((c.isascii() and c.isalnum()) or c in extra for c in s)
+
+
+def seat_gens(seats):
+    """An eval template's seats (2 to 16, each {"net": gen} or {"bot": a built-in bot's name}) -> the gens named."""
+    if not isinstance(seats, list) or not 2 <= len(seats) <= 16:
+        raise ValueError('seats: a list of 2 to 16 seats')
+    gens = []
+    for i, s in enumerate(seats):
+        if not isinstance(s, dict) or ('net' in s) == ('bot' in s):
+            raise ValueError(f'seat {i}: exactly one of net and bot')
+        if 'net' in s:
+            g = s['net']
+            if isinstance(g, bool) or not isinstance(g, int) or g < 0:
+                raise ValueError(f'seat {i}: net is a generation number')
+            if g not in gens:
+                gens.append(g)
+        elif not _is_name(s['bot'], 64, '_.:-') or s['bot'].startswith('ext:'):
+            raise ValueError(f'seat {i}: bot {s["bot"]!r} is not a built-in bot name')
+    return gens
+
+
 def _check_job(kind, job):
+    """A job template (definition.rs `check_template`): only its kind's keys, the right types, no path-like text."""
     if job is None:
         return
     if not isinstance(job, dict):
         raise ValueError(f'jobs.{kind}: an object or null')
-    if kind == 'fuzz':
-        if set(job) != {'mode', 'env'}:
-            raise ValueError(f'jobs.fuzz: exactly mode and env ({sorted(job)})')
-        if not isinstance(job['mode'], str) or not re.match(r'^[A-Za-z0-9_.:-]{1,64}$', job['mode']):
-            raise ValueError(f'jobs.fuzz.mode {job["mode"]!r}')
-        env = job['env']
-        if not isinstance(env, dict) or len(env) > 64:
-            raise ValueError('jobs.fuzz.env: an object of at most 64 variables')
-        for k, v in env.items():
-            if not re.match(r'^[A-Za-z_][A-Za-z0-9_]{0,63}$', k) or not isinstance(v, str) or len(v) > 1024:
-                raise ValueError(f'jobs.fuzz.env: {k!r}={v!r}')
-        return
-    if not isinstance(job.get('settings'), dict):
+    extra = sorted(set(job) - set(TEMPLATE_KEYS[kind]))
+    if extra:
+        raise ValueError(f'jobs.{kind}: {extra} not allowed (a {kind} template has only {TEMPLATE_KEYS[kind]}; the '
+                         f'per-lease fields are the coordinator\'s)')
+    if kind in ('selfplay', 'eval') and not isinstance(job.get('settings'), dict):
         raise ValueError(f'jobs.{kind}: settings (an object)')
     if kind == 'eval':
-        if not isinstance(job.get('seats'), list) or not 2 <= len(job['seats']) <= 16:
-            raise ValueError('jobs.eval: seats, a list of 2 to 16 seats')
-        for s in job['seats']:
-            if not isinstance(s, dict) or len({'net', 'bot'} & set(s)) != 1:
-                raise ValueError(f'jobs.eval: seat {s!r}: {{"net": <gen>}} or {{"bot": <name>}}')
+        seat_gens(job.get('seats'))
         if not isinstance(job.get('paired'), bool):
-            raise ValueError('jobs.eval: paired (a boolean)')
-    for k in ('gid_base', 'games', 'first', 'count'):
-        if k in job:
-            raise ValueError(f'jobs.{kind}: {k} is a per-lease field (the coordinator\'s), not the template\'s')
+            raise ValueError('jobs.eval: paired (true or false)')
+    if kind == 'fuzz':
+        if not _is_name(job.get('mode'), 128, '_.-'):
+            raise ValueError(f'jobs.fuzz.mode {job.get("mode")!r}: a mode name')
+        env = job.get('env', {})
+        if not isinstance(env, dict):
+            raise ValueError('jobs.fuzz.env: an object')
+        for k, v in env.items():
+            if not _is_name(k, 64, '_') or not isinstance(v, str) or len(v.encode()) > 4096:
+                raise ValueError(f'jobs.fuzz.env: {k!r}={v!r}')
+        if 'announce_result' in job and not isinstance(job['announce_result'], bool):
+            raise ValueError('jobs.fuzz.announce_result: true or false')
+    check_no_paths(job, f'jobs.{kind}')
 
 
 def validate(doc):
@@ -237,19 +289,21 @@ def validate(doc):
     if not isinstance(doc.get('id'), str) or not SLUG_RE.match(doc['id']):
         raise ValueError(f'id {doc.get("id")!r}: [a-z0-9][a-z0-9-]{{0,62}}')
     v = doc.get('version')
-    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= MAX_ID:
         raise ValueError(f'version {v!r}: an integer >= 1')
-    for k in ('created',):
-        if isinstance(doc.get(k), bool) or not isinstance(doc.get(k), int):
-            raise ValueError(f'{k}: integer Unix seconds')
+    c = doc.get('created')
+    if isinstance(c, bool) or not isinstance(c, int) or c <= 0:
+        raise ValueError('created: integer Unix seconds')
     e = doc.get('expires')
     if e is not None and (isinstance(e, bool) or not isinstance(e, int) or e <= doc['created']):
         raise ValueError(f'expires {e!r}: null or integer Unix seconds after created')
-    if not isinstance(doc.get('game'), str) or not doc['game']:
-        raise ValueError('game')
+    if not isinstance(doc.get('game'), str) or not SLUG_RE.match(doc['game']):
+        raise ValueError(f'game {doc.get("game")!r}: a slug - the worker builds\' game ("mtg"), not a run\'s settings '
+                         f'game ("mtg_eoe")')
     b = doc.get('builds')
-    if not isinstance(b, list) or not b or len(set(b)) != len(b) or not all(isinstance(x, str) and BUILD_RE.match(x) for x in b):
-        raise ValueError(f'builds {b!r}: distinct worker build_ids (24 hex)')
+    if (not isinstance(b, list) or not 1 <= len(b) <= 64 or len(set(b)) != len(b)
+            or not all(isinstance(x, str) and BUILD_RE.match(x) for x in b)):
+        raise ValueError(f'builds {b!r}: 1 to 64 distinct worker build_ids (24 hex)')
     rt = doc.get('runtime')
     if rt is not None and not (isinstance(rt, str) and BUILD_RE.match(rt)):
         raise ValueError(f'runtime {rt!r}: a runtime build_id or null')
@@ -261,14 +315,13 @@ def validate(doc):
             raise ValueError(f'checkpoints[{g!r}]')
         if set(c) != {'model_sha256', 'model_size', 'reference_sha256', 'reference_size'}:
             raise ValueError(f'checkpoints[{g}]: model_sha256, model_size, reference_sha256, reference_size')
-        if not SHA_RE.match(str(c['model_sha256'])) or isinstance(c['model_size'], bool) or not isinstance(c['model_size'], int) \
-                or c['model_size'] <= 0:
-            raise ValueError(f'checkpoints[{g}]: the model\'s sha256 and size')
+        size_ok = lambda n: not isinstance(n, bool) and isinstance(n, int) and 0 < n <= MAX_CHECKPOINT_FILE_BYTES
+        if not SHA_RE.match(str(c['model_sha256'])) or not size_ok(c['model_size']):
+            raise ValueError(f'checkpoints[{g}]: the model\'s sha256 and size (1 B to 1 GiB)')
         if (c['reference_sha256'] is None) != (c['reference_size'] is None):
             raise ValueError(f'checkpoints[{g}]: the reference set\'s sha256 and size, both or neither')
-        if c['reference_sha256'] is not None and (not SHA_RE.match(str(c['reference_sha256']))
-                                                  or not isinstance(c['reference_size'], int) or c['reference_size'] <= 0):
-            raise ValueError(f'checkpoints[{g}]: the reference set\'s sha256 and size')
+        if c['reference_sha256'] is not None and (not SHA_RE.match(str(c['reference_sha256'])) or not size_ok(c['reference_size'])):
+            raise ValueError(f'checkpoints[{g}]: the reference set\'s sha256 and size (1 B to 1 GiB)')
     jobs = doc.get('jobs')
     if not isinstance(jobs, dict) or set(jobs) != set(JOB_KINDS):
         raise ValueError(f'jobs: exactly {JOB_KINDS} (null when unused)')
@@ -282,7 +335,7 @@ def validate(doc):
     if doc['kind'] == 'run' and 'fuzz' in on:
         raise ValueError('a run\'s definition: no fuzz job')
     if jobs['eval'] is not None:
-        nets = {str(s['net']) for s in jobs['eval']['seats'] if 'net' in s}
+        nets = {str(g) for g in seat_gens(jobs['eval']['seats'])}
         if not nets <= set(cks):
             raise ValueError(f'jobs.eval names gens {sorted(nets - set(cks))} the definition has no checkpoint for')
     return doc
@@ -433,6 +486,28 @@ def write(doc, root=None):
 
 # ---------------------------------------------------------------- signing and publishing
 
+def exe_argv(path, *args):
+    """The argv that runs the executable `path` (a `.py` path: with this Python - the tests' stand-ins)."""
+    if path.lower().endswith('.py'):
+        return [sys.executable, path, *args]
+    return [path, *args]
+
+
+def define_result(out):
+    """farm-release define's result: its one JSON line ({kind, id, version, key, sha256, signature, published}), the
+    last line of `out` that is a JSON object with a version - or None."""
+    for ln in reversed((out or '').splitlines()):
+        ln = ln.strip()
+        if ln.startswith('{'):
+            try:
+                d = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(d, dict) and 'version' in d:
+                return d
+    return None
+
+
 class FarmRelease:
     """zero-farm's `farm-release` (the desktop's signing tool). `path`: the executable (default
     `farm_release_path()`); a `.py` path runs with this Python (a stand-in, e.g. the tests' stub)."""
@@ -441,9 +516,7 @@ class FarmRelease:
         self.path = path or farm_release_path()
 
     def argv(self, *args):
-        if self.path.lower().endswith('.py'):
-            return [sys.executable, self.path, *args]
-        return [self.path, *args]
+        return exe_argv(self.path, *args)
 
     def define(self, path, key, url=None, token=None, publish=True):
         """`farm-release define <path> --key <key> [--publish --url <url>]`, the admin token in the environment
@@ -465,7 +538,7 @@ class FarmRelease:
         if token:
             out = out.replace(token, '<admin token>')
         if p.returncode != 0:
-            raise SystemExit(f'farm-release define {os.path.basename(os.path.dirname(path))} failed (exit {p.returncode}):\n'
+            raise SystemExit(f'farm-release define {path} failed (exit {p.returncode}):\n'
                              f'{out.strip()}')
         return out.strip()
 
@@ -488,10 +561,13 @@ def publish(client, info, key=None, farm_release=None, log=None):
     log = log or (lambda m: print('# ' + m, file=sys.stderr, flush=True))
     fr = farm_release if isinstance(farm_release, FarmRelease) else FarmRelease(farm_release)
     out = fr.define(info['path'], key or data_key_path(), client.url, client.token, publish=True)
-    if out:
-        log(f'farm-release: {out.splitlines()[-1][:300]}')
+    res = define_result(out)
+    want = {'kind': info['kind'], 'id': info['id'], 'version': info['version'], 'key': info['key'], 'sha256': info['sha256'],
+            'published': True}
+    if res is None or any(res.get(k) != v for k, v in want.items()):
+        raise SystemExit(f'farm-release define: its result {res} is not {want} (its output: {out[-500:]!r})')
     if not os.path.exists(info['path'] + '.minisig'):
-        log(f'note: no {os.path.basename(info["path"])}.minisig next to {info["path"]} (farm-release keeps none here)')
+        raise SystemExit(f'farm-release define left no signature next to {info["path"]}')
     cur, ans = remote_current(client, info['kind'], info['id'])
     if cur is None:
         log(f'note: the coordinator\'s answer for {info["kind"]} {info["id"]} names no definition (a coordinator before rev 6?)')

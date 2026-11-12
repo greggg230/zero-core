@@ -21,7 +21,7 @@ def _ck():
 
 
 def _eval():
-    return {'settings': {'game': 'toy', 'eval_sims': 4}, 'seats': [{'net': 1}, {'net': 2}], 'paired': True, 'seed': 1}
+    return {'settings': {'game': 'toy', 'eval_sims': 4}, 'seats': [{'net': 1}, {'net': 2}], 'paired': True}
 
 
 class Fake:
@@ -62,6 +62,15 @@ def test_documents_and_their_checks():
         dict(builds=[B, B]),
         dict(runtime='nope'),
         dict(jobs={'eval': dict(_eval(), games=10)}),                                     # a per-lease field
+        dict(jobs={'eval': dict(_eval(), seed=1)}),                                       # (the seed is one too)
+        dict(jobs={'eval': dict(_eval(), settings={'resolver_init': 'runs/x/models/iter_0001.pt'})}),   # a path
+        dict(jobs={'eval': dict(_eval(), settings={'spec': 'C:decks'})}),                 # a drive
+        dict(jobs={'eval': dict(_eval(), settings={'x': ['a', 'b..c']})}),                # '..' in a list
+        dict(jobs={'eval': dict(_eval(), settings={'a/b': 1})}),                          # a key
+        dict(jobs={'eval': dict(_eval(), seats=[{'net': 1}, {'bot': 'ext:jsbot'}])}),     # an external bot
+        dict(jobs={'selfplay': {'settings': {}, 'seats': []}}),                           # not a self-play key
+        dict(game='mtg_eoe'),                                                             # a settings game: not a slug
+        dict(checkpoints={'1': dict(_ck(), model_size=(1 << 30) + 1), '2': _ck()}),       # over 1 GiB
         dict(jobs={'eval': dict(_eval(), seats=[{'net': 1}, {'net': 3}])}),               # gen 3 is not signed
         dict(jobs={'eval': dict(_eval(), paired='yes')}),
         dict(jobs={}),                                                                    # no job at all
@@ -77,10 +86,14 @@ def test_documents_and_their_checks():
         kw.update(over)
         with pytest.raises(ValueError):
             FD.definition(**kw)
-    with pytest.raises(ValueError):
-        FD.definition('campaign', 'c', 1, 'mtg', [B], jobs={'fuzz': {'mode': 'x-games', 'env': {'A B': '1'}}})
-    with pytest.raises(ValueError):
-        FD.definition('campaign', 'c', 1, 'mtg', [B], jobs={'fuzz': {'mode': 'x-games', 'env': {}, 'first': 3}})
+    for fz in ({'mode': 'x-games', 'env': {'A B': '1'}}, {'mode': 'x-games', 'env': {}, 'first': 3},
+               {'mode': 'vast:games', 'env': {}}, {'mode': 'x-games', 'env': {'FUZZ_DECK_CHOICE_BY': 'E:/decks.json'}},
+               {'mode': 'x-games', 'announce_result': 'yes'}):
+        with pytest.raises(ValueError):
+            FD.definition('campaign', 'c', 1, 'mtg', [B], jobs={'fuzz': fz})
+    FD.definition('campaign', 'c', 1, 'mtg', [B], jobs={'fuzz': {'mode': 'x-games', 'announce_result': False}})
+    assert FD.looks_like_path('C:') and FD.looks_like_path('..') and not FD.looks_like_path('cq-n4-v50')
+    assert not FD.looks_like_path('{"sealed":{"set":"eoe"},"decks":"eval"}')
 
 
 def test_versions_the_archive_and_publishing(tmp_path, monkeypatch, capsys):
@@ -94,6 +107,8 @@ def test_versions_the_archive_and_publishing(tmp_path, monkeypatch, capsys):
     assert info['path'] == os.path.join(str(tmp_path / 'definitions'), 'campaign', 'cmp', '1', 'definition.json')
     out = FD.publish(cl, info)
     assert out['published']
+    assert FD.define_result('noise\n{"kind": "campaign", "version": 1}\n') == {'kind': 'campaign', 'version': 1}
+    assert FD.define_result('no json here') is None
     calls = STUB.calls(stub['log'])
     assert calls[-1]['argv'] == ['define', info['path'], '--key', stub['key'], '--publish', '--url', 'http://fake']
     assert calls[-1]['token_ok'] and TOKEN not in json.dumps(calls)

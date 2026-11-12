@@ -2,9 +2,9 @@
 the readout zero.h2h gives on this machine, played by the farm's native workers.
 
   python -m zero.farm_h2h --a runs/eoe1/models/iter_0080.pt --b runs/eoe1/models/iter_0070.pt --games 400 \
-      --build <worker build_id> --runtime <runtime build_id> [--config <run>/config.json | --preset NAME]
-      [--sims 32] [--name SLUG] [--seed 1] [--games-per-lease auto] [--priority 1] [--needs-ram-mb 1500]
-      [--reference-batches NPZ ...] [--worker <mtgz-worker.exe>] [--url https://farm.greggg230.com] [--no-wait]
+      --build <worker build_id> --runtime <runtime build_id> --worker <that build's mtgz-worker.exe>
+      [--config <run>/config.json | --preset NAME] [--sims 32] [--name SLUG] [--games-per-lease auto] [--priority 1]
+      [--needs-ram-mb 1500] [--reference-batches NPZ ...] [--url https://farm.greggg230.com] [--no-wait]
       [--key <data key>] [--farm-release <farm-release.exe>] [--expires-days 30] [--defs-dir DIR]
   python -m zero.farm_h2h --resume NAME        (re-attach: poll, download, print the readout)
   python -m zero.farm_h2h --cancel NAME        (pause the run: its leases are cancelled at their next beat)
@@ -15,7 +15,10 @@ What it does:
    models/), resolved as a run resolves them; `--sims` sets eval_sims; `eval_spec` resolved (the game
    package's eval spec of the run's spec, `Run.driver`'s rule: a worker cannot run the package's Python hook).
    Both seats play the run's evaluation seat (`Run.nn_seat(key, eval_sims)`), paired games: exactly the
-   games of `Run.play_match` / an Elo match at those settings (zero.farm_eval).
+   games of `Run.play_match` / an Elo match at those settings (zero.farm_eval). The job keeps only the settings
+   the worker build's own `check-config --eval --json` calls `play` (`play_settings`: zero-farm PROTOCOL.md 7 -
+   a signed template carries no trainer-only key and nothing path-like); `--worker` is that build's executable.
+   The batch's base seed is the coordinator's, from the run's name (`coordinator_seed`): a template has no seed.
 2. Both checkpoints exported to zero-onnx/1 (zero.onnx_export, 'packed') with their reference sets (256 rows
    of recorded batches - `--reference-batches`, else a short self-play of A recorded here, CPU - with torch's
    answers, checked through onnxruntime: <= 2e-5, else nothing is published).
@@ -24,8 +27,8 @@ What it does:
    their graphs' and reference sets' sha256 and sizes, `jobs.eval` = the batch's job; the next version, signed with
    the data key and published by `farm-release define --publish`; it expires after `--expires-days`); the graphs
    and reference sets uploaded (`PUT /v1/admin/artifact/ckpt/<run>/<gen>/...`), registered as gens 1 (A) and 2 (B),
-   then the eval batch: `checkpoints [1, 2]`, its job {settings, seats [{"net": 1}, {"net": 2}], paired, seed} -
-   the definition's template exactly (the coordinator issues leases only within it), `--games`.
+   then the eval batch: `checkpoints [1, 2]`, its job {settings, seats [{"net": 1}, {"net": 2}], paired} - the
+   definition's template exactly (the coordinator issues leases only within it), `--games`.
 4. It polls `GET /v1/admin/run/<run>/results`, downloads each eval file (first copy of a game id wins;
    `dup_ids` skipped), acks what it saved, and prints a progress line; at the end the readout: A's score +- its
    standard error (pair-aware: the se of the pair scores), the Elo difference with its 95% interval, the games,
@@ -181,9 +184,70 @@ def load_state(d):
 
 def eval_job(st):
     """The eval batch's job object - also, exactly, the signed definition's `jobs.eval` template (PROTOCOL.md 7: an
-    agent builds its job line from the template plus only `gid_base`, `games` and `seed`; `seed` here is the run's
-    base seed, which the coordinator copies into every lease)."""
-    return {'settings': st['settings'], 'seats': [{'net': 1}, {'net': 2}], 'paired': True, 'seed': st['seed']}
+    agent builds its job line from the template - settings, seats, paired: nothing else - plus only the lease's
+    `gid_base`, `games` and `seed`)."""
+    return {'settings': st['settings'], 'seats': [{'net': 1}, {'net': 2}], 'paired': True}
+
+
+def coordinator_seed(run):
+    """The run's base seed as the coordinator derives it from the run's name (32-bit FNV-1a; zero-farm coordinator
+    book.ts `baseSeed`): a rev 6 template carries no seed, so a head-to-head's games are fixed by its name (and
+    settings and networks). Every lease of the run carries it; workers derive each game's seed from (seed, gid)."""
+    h = 0x811c9dc5
+    for ch in run:
+        h ^= ord(ch)
+        h = (h * 0x01000193) & 0xffffffff
+    return h
+
+
+def worker_json(worker, *args):
+    """`<worker> args...` -> (exit status, its JSON output or None, its output text)."""
+    import subprocess
+    p = subprocess.run(FD.exe_argv(worker, *args), capture_output=True, text=True, encoding='utf-8', errors='replace',
+                       timeout=600)
+    try:
+        out = json.loads(p.stdout)
+    except ValueError:
+        out = None
+    return p.returncode, out, (p.stdout or '') + (p.stderr or '')
+
+
+def play_settings(worker, build_id, cfg, d):
+    """The eval template's settings: only those the worker build's own `check-config --eval` classifies `play` (what
+    an evaluation match reads - zero_worker EVAL_READS; never a trainer-only key or a path, which farm-release refuses
+    in a template), checked again by the worker on their own, and giving the seats every setting gives
+    (`Run.nn_seat`). `worker` must be that build's executable (its `info` names `build_id` and the kind eval)."""
+    from . import farm_eval as FE
+    rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
+    if rc != 0 or not isinstance(info, dict):
+        raise SystemExit(f'{worker} info: {text.strip()[-500:]}')
+    if info.get('build_id') != build_id or 'eval' not in (info.get('kinds') or []):
+        raise SystemExit(f'{worker} is build {info.get("build_id")} ({info.get("kinds")}), not the eval-capable worker '
+                         f'build {build_id}: give --worker the signed build\'s executable')
+    os.makedirs(d, exist_ok=True)
+    full = os.path.join(d, 'settings-run.json')
+    with open(full, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f)
+    rc, out, text = worker_json(worker, 'check-config', full, '--eval', '--json')
+    if rc != 0 or not isinstance(out, dict) or out.get('failures'):
+        raise SystemExit(f'the worker refuses the settings for an eval job:\n{text.strip()[-3000:]}')
+    status = {s['key']: s['status'] for s in out.get('settings') or []}
+    play = {k: v for k, v in cfg.items() if status.get(k) == 'play'}
+    missing = sorted(set(out.get('eval_reads') or []) - set(play))
+    if missing:
+        raise SystemExit(f'the settings lack {missing}, which an eval job reads')
+    path = os.path.join(d, 'settings.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(play, f)
+    rc, out, text = worker_json(worker, 'check-config', path, '--eval', '--json')
+    if rc != 0 or not isinstance(out, dict) or out.get('failures') or \
+            any(s['status'] != 'play' for s in out.get('settings') or []):
+        raise SystemExit(f'the worker refuses the eval job\'s own settings:\n{text.strip()[-3000:]}')
+    seats = [{'net': 1}, {'net': 2}]
+    if FE.seat_dicts(play, seats) != FE.seat_dicts(cfg, seats):
+        raise SystemExit('the play settings give other seats than the run\'s settings (EVAL_READS is not what '
+                         'Run.nn_seat reads: tests/test_worker_settings.py)')
+    return play
 
 
 def run_body(st, eval_on=True):
@@ -429,13 +493,13 @@ def main(argv=None, client=None):
     ap.add_argument('--name', help='the run is h2h-<name> (default: h2h-<run>-<A>v<B>)')
     ap.add_argument('--build', help='the worker build_id (a registered release worker build)')
     ap.add_argument('--runtime', help='the runtime pack build_id the worker build requires')
-    ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--games-per-lease', default='auto')
     ap.add_argument('--priority', type=float, default=1.0)
     ap.add_argument('--needs-threads', type=int, default=1)
     ap.add_argument('--needs-ram-mb', type=int, default=1500)
     ap.add_argument('--reference-batches', nargs='+')
-    ap.add_argument('--worker', help='a local worker exe: its check-config --eval checks the settings first')
+    ap.add_argument('--worker', help="the worker build's executable (its signed build directory's): its check-config "
+                    "--eval picks the eval job's settings")
     ap.add_argument('--resume', metavar='NAME')
     ap.add_argument('--cancel', metavar='NAME')
     ap.add_argument('--url', default=os.environ.get('FARM_URL', URL))
@@ -480,8 +544,9 @@ def main(argv=None, client=None):
         ap.error('--a, --b and --games (or --resume / --cancel NAME)')
     if a.games < 2 or a.games % 2:
         ap.error('--games: an even number (paired games: each deal from both seats)')
-    if not (a.build and a.runtime):
-        ap.error('--build and --runtime: the worker build and the runtime pack it requires')
+    if not (a.build and a.runtime and a.worker):
+        ap.error('--build, --runtime and --worker: the worker build, the runtime pack it requires and the build '
+                 'executable')
     # the worker build's manifest first (fail before the export): its game is the definition's, and it must require
     # this runtime
     cl = client or Client(a.url)
@@ -498,22 +563,16 @@ def main(argv=None, client=None):
     d = state_dir(a, run)
     if os.path.exists(os.path.join(d, 'state.json')):
         raise SystemExit(f'{run} exists ({d}): --resume {run}, or another --name')
-    if a.worker:
-        import subprocess
-        os.makedirs(d, exist_ok=True)
-        cp = os.path.join(d, 'settings.json')
-        with open(cp, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f)
-        p = subprocess.run([a.worker, 'check-config', cp, '--eval'], capture_output=True, text=True, encoding='utf-8')
-        if p.returncode != 0:
-            raise SystemExit(f'the worker refuses the settings:\n{p.stdout}{p.stderr}')
-    log(f'{run}: {game}, {a.games} paired games, eval_sims {cfg["eval_sims"]}, eval spec {cfg["eval_spec"][:80]}')
+    run_cfg = cfg
+    cfg = play_settings(a.worker, a.build, run_cfg, d)
+    log(f'{run}: {game}, {a.games} paired games, eval_sims {cfg["eval_sims"]}, eval spec {cfg["eval_spec"][:80]}; '
+        f'{len(cfg)} of the run\'s {len(run_cfg)} settings are the eval job\'s (the worker\'s check-config: play)')
     if a.reference_batches:
         from .onnx_parity import Rows
         rows_list = [Rows.load(p) for p in a.reference_batches]
     else:
         log('recording reference rows (a short self-play of A, CPU)')
-        rows_list = [record_rows(ma, game, cfg['spec'], threads=a.threads)]
+        rows_list = [record_rows(ma, game, run_cfg['spec'], threads=a.threads)]
     gens = {}
     for gen, ck in (('1', a.a), ('2', a.b)):
         rid = f'{os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(ck))))}/{os.path.basename(ck)}'
@@ -521,7 +580,7 @@ def main(argv=None, client=None):
         log(f'gen {gen}: {ck} exported, reference max abs {gens[gen]["check"]["max_abs"]:.2e}')
     gpl = a.games_per_lease if a.games_per_lease == 'auto' else int(a.games_per_lease)
     st = {'run': run, 'url': a.url, 'a': os.path.abspath(a.a), 'b': os.path.abspath(a.b), 'game': game,
-          'games': a.games, 'seed': a.seed, 'build_id': a.build, 'runtime': a.runtime, 'priority': a.priority,
+          'games': a.games, 'seed': coordinator_seed(run), 'build_id': a.build, 'runtime': a.runtime, 'priority': a.priority,
           'games_per_lease': gpl, 'needs': {'threads': a.needs_threads, 'ram_mb': a.needs_ram_mb}, 'batch': 'h2h',
           'settings': cfg, 'select': _tag(FE.seat_dicts(cfg, [{'net': 1}, {'net': 2}])[0]), 'gens': gens,
           'created': time.time(), 'cursor': 0, 'build_game': build_game}

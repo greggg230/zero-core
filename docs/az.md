@@ -28,7 +28,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5; `--graphs`: 10.6) |
 | `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6) |
-| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
+| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B), at a run's evaluation settings (each side's run's margin_w / redet / eval_cache, A's run's eval spec: section 42.3); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
 | `heldout.py` | Held-out losses (section 20.2): a frozen set of sample rows (`make`), a checkpoint's value cross-entropy / accuracy / Brier against z and policy cross-entropy / top-1 against the recorded targets, decision and value-only rows apart (`HeldOut`, `losses`); `python -m <pkg>.az.heldout make | eval` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
@@ -38,6 +38,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `forks.py` | Branched self-play games and archive starts (section 24): the settings, the archive file (`zero-archive/1`: its entries' patches over the run's spec), the self-play driver's `branch` / `starts`, the remote hello's fingerprint, the tallies and `selfplay.forks` |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
 | `onnx_export.py`, `onnx_parity.py` | zero-onnx/1 (section 41): any network (`TokenNet`, `GridNet`, `Net`) exported to one self-contained ONNX graph that takes the driver's sparse batch (`export`, `export_checkpoint`; `python -m zero.onnx_export`), and its parity gate against torch on real batches (`python -m zero.onnx_parity`); `tools/onnx_record.py` records a self-play's batches, `tools/onnx_bench.py` times ONNX Runtime against torch. Need onnx / onnxscript / onnxruntime; nothing on a run's path imports them |
+| `farm_def.py`, `farm_eval.py`, `farm_h2h.py`, `farm_report.py` | zero-farm on the desktop (sections 42.2, 42.3): signed definitions (`definition/1` documents, versions, the archive, `farm-release define`) and the coordinator client; eval jobs' games and rows in Python terms; a head-to-head of two checkpoints played on the farm; the own machines' work for the farm's admin page |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
 
 Repository tools (`tools/`): `build_engine.sh` (the PyO3 build every repo's `build_py.sh`
@@ -5669,7 +5670,7 @@ checkpoint's run's rule keys (`run_rule`), and plays the game package's default 
 the run's `margin_w`, `redet` and `eval_cache` and its `eval_spec`. A farm head-to-head plays the run's own
 evaluation (Run.play_match's seats and spec) - the same as zero.h2h for a run whose margin_w is 0, redet on,
 eval_cache 0, when zero.h2h is given `--spec <eval_spec>`. The readout's fields are zero.h2h's, so the numbers
-compare directly.
+compare directly. (Since 42.3 zero.h2h plays a run's evaluation itself: its seats and spec are these.)
 
 **Off by default.** Nothing in a run changes: an eval job is a worker's, `zero.farm_h2h` a desktop command.
 The softmax change touches only the ONNX evaluators (the worker's and `OnnxEvaluator`, the farm's), never a run's
@@ -5709,3 +5710,121 @@ different (as before). **End to end** (MTG Zero ENGINE.md 114.4): a local coordi
 pack's ONNX Runtime): every per-gen self-test passed, all 8 games credited, and the 8 rows are byte-identical to a local
 Python evaluation of the same 8 games in one driver. The exact exp equals float64 `exp` rounded to float32 on 150,479
 points of [-110, 0]; numpy's float32 `exp` differs from it on 47,643 of them.
+
+### 42.3 Signed definitions, one meaning of a model's sha256, zero.h2h = a run's evaluation, farm_report (no setting; zero-farm phase 2b, 2026-11-12)
+
+**Why.** zero-farm's security review (2026-11-12, findings H2, H3, M2) found that the coordinator - or anyone with its
+admin token - chose everything a friend's PC downloads and runs: the job JSON, the networks (any ONNX file with a
+matching hash it also wrote), the worker build. PROTOCOL.md rev 6 section 7 moves that choice to the desktop: every
+run or campaign the farm works on is described by a **definition** signed with a data key the coordinator never holds;
+agents build their job lines only from its templates. The desktop tools have to produce those definitions.
+
+**What it does.**
+
+* **`zero.farm_def`** (desktop only): `definition/1` documents - kind (`run` | `campaign`), id, version, created,
+  expires, game, builds (the worker builds allowed), runtime, checkpoints (`{"<gen>": {model_sha256, model_size,
+  reference_sha256, reference_size}}`), jobs (`selfplay` / `eval` / `fuzz` templates, exact; null when unused) -
+  checked exactly as zero-farm's `agent/common/src/definition.rs` checks them (`farm-release define` refuses to sign,
+  and an agent to run, anything else; `validate`): a template holds only its kind's keys (self-play `settings`; eval
+  `settings`, `seats`, `paired`; fuzz `mode`, `env`, `announce_result` - never a per-lease field such as `seed`),
+  **no string or key anywhere in a template looks like a path** (`/`, `\`, `..`, a drive `C:`: `looks_like_path`), seats
+  `{"net": gen}` / `{"bot": a built-in name}` whose gens are all signed checkpoints, `game` a slug, 1 to 64 distinct
+  24-hex builds, files of 1 B to 1 GiB, a campaign fuzz-only, a run never fuzz. The **version** is strictly increasing
+  per (kind, id): the coordinator's current one (`GET /v1/admin/run|campaign/{id}` -> `definition`) or the archive's
+  newest, whichever is larger, + 1. The **archive** `~/.zero-farm/definitions/<kind>/<id>/<version>/definition.json`
+  keeps every definition as written (the signed bytes, never re-serialised; a version is never rewritten with other
+  bytes), with farm-release's `definition.json.minisig` and, once published, `published.json` (url, version, sha256:
+  `published_to`). **Publishing** is zero-farm's `farm-release define <definition.json> --key <data key> --publish
+  --url <url>` (`--farm-release` / env ZEROFARM_FARM_RELEASE, default `E:/cargo-target/zero-farm/main/release/
+  farm-release.exe`; the data key `~/.config/zero-farm/data.key`); the admin token (`~/.config/zero-farm/admin_token`)
+  goes to it in its environment (ZEROFARM_ADMIN_TOKEN), never on its command line, and is scrubbed from its output.
+  Its one JSON result line must name this kind, id, version, key and sha256 with `published: true`, the signature must
+  be next to the file, and the coordinator's answer must then name the version as current (an older coordinator names
+  none: a note). The farm tools' HTTP client (`Client`) now lives here.
+* **`zero.farm_h2h`** puts the run, then **its definition** (builds [the worker build], the runtime, gens 1 and 2 with
+  their graphs' and reference sets' sha256 and sizes, `jobs.eval` = {settings, seats, paired}), then the gens, then the
+  eval batch whose job object **is** the template (`eval_job`): the coordinator issues leases only within it.
+  * **Its settings are the eval job's only**: the run's resolved settings minus everything the worker build's own
+    `check-config --eval --json` does not call `play` (`play_settings`: what an evaluation match reads, zero_worker's
+    EVAL_READS, 33 keys; eoe1: 33 of 167), checked again by the worker on their own, and giving the seats every setting
+    gives (`Run.nn_seat`). No trainer-only key (`preset`, `spec`, `resolver_init`, paths) reaches a definition.
+    `--worker` - the worker build's executable, whose `info` must name the build and the kind eval - is now required.
+  * **No `--seed`**: a template carries no seed, so the batch's base seed is the coordinator's, derived from the run's
+    name (32-bit FNV-1a, zero-farm `baseSeed`; `coordinator_seed`, kept in the state): the same name replays the same
+    games.
+  * The definition's `game` is the worker build's (its signed manifest, `GET /v1/admin/artifact/builds/<id>/
+    manifest.json`, checked against the build id: "mtg" for every MTG Zero run, as PROTOCOL.md 7's example has it - a
+    run's settings game "mtg_eoe" is not even a slug), and `--runtime` must be the runtime pack that manifest requires
+    (`worker_game`, checked before the export). Once per head-to-head (state `definition`; `--resume` publishes an
+    unpublished one, never a second version); `--expires-days` (30), `--key`, `--farm-release`, `--defs-dir`.
+* **A model's `sha256` is its file's** (`zero_worker`): the self-play job line's `sha256`, the `checkpoint` line's and
+  an eval job's `models[gen].sha256` all name the model FILE's sha256 (the lease's, the definition's `model_sha256`),
+  checked by `job::check_file_sha256` before ONNX Runtime reads the file (and before a job without `gen` reads the
+  graph's `checkpoint_iter`). Phase 0b's self-play line compared it with the graph's `checkpoint_sha256` metadata
+  instead (the torch checkpoint's hash), an eval job with the file: one meaning now, and the graph's checkpoint hash
+  stays metadata (`Expect.sha256` is gone). The error names the job's hash, never the file's (no hash of a file a job
+  names leaves a PC: H3).
+* **`zero.h2h` plays a run's evaluation.** Each side's seat takes its run's `margin_w`, `redet` and `eval_cache`
+  (`Run.nn_seat`'s; `run_seat_keys`, the run's settings resolved as the run and farm_h2h resolve them,
+  `run_settings`), and the match is played at A's run's evaluation spec (`Run.driver`'s rule: `eval_spec`, else the
+  game package's eval spec of the run's spec; `run_eval_spec`, `match_spec`, a note when B's run evaluates at another)
+  unless `--spec`. 42.2's "Not zero.h2h's seats" no longer holds: an h2h of a run's checkpoints plays the games of its
+  evaluation and of a farm head-to-head at the same settings. **A deliberate change of a tool** (no run plays or trains
+  differently): for a run with margin_w != 0, redet off, an evaluation cache or an eval spec of its own (MTG Zero: every
+  run - its evaluation decks), zero.h2h's games differ from before; without a run config.json nothing changes.
+* **`python -m zero.farm_report`**: the owner's own machines on zero-farm's admin page. The coordinator counts only its
+  agents' work; the desktop playing its runs, the MacBook and rented Vast boxes - all driven through zero-core's SSH
+  remotes - were invisible there. Every 5 minutes (the Task Scheduler task ZeroFarmReport, `--install-task`: the
+  current user, logged on, never SYSTEM; `pythonw -m zero.farm_report`, no window; `--uninstall-task`) it reads the run
+  directories changed in the last 24 h (the config's roots, default `~/<game>/runs` and `E:/<game>/runs` of the zero
+  games; each real directory once) and POSTs `{reporter, t, sources}` to `/v1/admin/external` with the admin token, one
+  source per machine (`id`, `name`, `kind` local | ssh | vast, `hardware`, `online`, `working_on` ["run:<id>"],
+  `selfplay_games`, `eval_games`, `fuzz_seeds` in the last 1 h and 24 h, `busy_h_24h`). Self-play games are each
+  metrics row's `selfplay.games` (this machine) and `selfplay.remotes.<name>.games` / `selfplay.remote.games` (the games
+  the shared quota accepted, each counted once), timed at the end of the self-play phase (`time - seconds +
+  phases.selfplay_s`); eval games each evaluation's `eval_*.games` and `extras.*.games` plus its Elo matches from the
+  pools' results.json, local from the metrics row or remote from the evals.jsonl row under its `host`. A fork's copied
+  rows count once, for the run that played them (the oldest directory); a run that lived on a Vast box
+  (`ON_VAST*.json`) credits that box; Vast hardware from mtg-zero tools/vast.py's ledger. The Mac's fuzz seeds come
+  from one read-only ssh that parses its fuzz farm's `logs/farm.log` chunk lines; an unreachable Mac is `online: false`
+  with null seeds and never fails the report. `busy_h_24h` is the union of a machine's work intervals (iterations,
+  remote self-play running time and linger, remote evaluations, fuzz chunks), so at most 24. Stdlib only (the task
+  imports nothing heavy); 5xx and network errors retried 3 times, a 4xx never; the token never printed or logged;
+  `--dry-run` prints the report.
+
+**Off by default.** No run setting; nothing in a run changes. The worker's `sha256` change touches only jobs that send
+one (the agent sends it from the definition from rev 6 on); zero.h2h's change is called out above; farm_report only
+reads run directories.
+
+**Costs.** One `farm-release` call (a signature, an upload of a few KB, a registration) per definition version;
+farm_report about 1 s every 5 minutes (one ssh).
+
+**Tests and checks.** `tests/test_farm_def.py` (4: documents and their refusals - every rule of definition.rs above:
+a seed, a path in settings, a drive, `..` in a list, a key with `/`, an external bot, a non-slug game, a 1 GiB + 1
+file, fuzz modes and env; a worker build's game from its manifest (another build's manifest, a runtime build, another
+runtime: refused); versions, the archive and its published marker, publishing through `tests/farm_release_stub.py` - a
+stand-in farm-release that checks a definition with `farm_def.validate`, records its arguments, checks the token
+arrived in its environment, writes a signature, registers the definition in a state file a fake coordinator reads and
+prints the real tool's JSON line -, the coordinator naming another version, a failing farm-release, the token
+scrubbed). `tests/test_farm_h2h.py` (3): the end to end with the stub and `tests/worker_stub.py` (a worker's `info` and
+`check-config --eval --json` by EVAL_READS), a fake coordinator that plays the batch at the name's seed and accepts it
+only when its job is the definition's template and each registered gen the definition's file; the job's settings are
+exactly EVAL_READS and path-free; a runtime the build doesn't require is refused before the export;
+`test_zero_h2h_plays_the_runs_evaluation` - a toy run with margin_w 0.5, redet 0, eval_cache 64, chance_k 1, c_puct
+1.5: zero.h2h's seats equal `Run.nn_seat`'s key for key, its 8 paired games equal `farm_eval.match_driver`'s row for
+row, and the spec rules (with the old seats the same run's games differ: checked by hand). `tests/test_farm_report.py`
+(17: fixture runs in the real formats with local, mac, vast:line, vast:w1, vast, gpu:1 and one-host rows, a
+co-training resolver, a fork, a box-hosted run, rows without `time`, a stale run, a name clash, Elo pools; a fake Mac
+online and offline and the real fuzz-log parser; a fake transport for the body, the bearer, retries and redaction;
+dry run; the exact install / uninstall commands, mocked; a light import). `cargo test -p zero_worker`: 18 unit (new:
+`a_models_sha256_is_its_files_checked_before_it_is_loaded`) + 5 eval job + 4 job. MTG Zero (ENGINE.md 114.5):
+`tests/test_worker_farm.py` sends the file's sha256 on a self-play job (a wrong one - the graph's checkpoint hash,
+which phase 0b accepted - ends the job before the graph is read) and `farm_h2h.play_settings` with the real
+mtgz-worker; `tests/test_farm_campaign.py` (fuzz campaigns with definitions).
+
+**Measured** (2026-11-12, the desktop): the real `farm-release define` (zero-farm `agent` branch, 0.2.5; sign only,
+nothing published) signs eoe1 80 v 70's head-to-head definition and the live fuzz campaign's, both made by these tools
+(MTG Zero ENGINE.md 114.5). farm_report: a real dry run in about 1 s with the Mac's ssh (eoe2e: 4,800 self-play games
+and 1.06 busy h on the desktop, 632 eval games on the Mac, 303,410 fuzz seeds in 24 h); replayed on 11-07's runs with
+mac + vast:line + vast:w1 (6 runs, 0.5 s) it reproduced an independent recount exactly (318,511 / 63,268 / 905,122 /
+962,469 self-play games in 24 h).

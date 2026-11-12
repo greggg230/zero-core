@@ -1,6 +1,8 @@
 """A stand-in for zero-farm's `farm-release define` (zero-farm PROTOCOL.md 7) in tests: it records its arguments,
-checks the admin token arrived in its environment (never in its arguments), writes a fake signature next to the
-definition and fakes the coordinator's registration in a JSON state file the tests' fake coordinator reads.
+checks the admin token arrived in its environment (never in its arguments), refuses what the real one refuses
+(zero.farm_def.validate, which mirrors zero-farm's definition.rs), writes a fake signature next to the definition,
+fakes the coordinator's registration in a JSON state file the tests' fake coordinator reads, and prints the real
+tool's one JSON result line ({kind, id, version, key, sha256, signature, published}).
 
   python farm_release_stub.py define <definition.json> --key <data key> [--publish --url URL]
 
@@ -52,15 +54,22 @@ def main(argv):
     with open(path, 'rb') as f:
         b = f.read()
     doc = json.loads(b)
-    if doc.get('definition') != 1 or doc.get('kind') not in ('run', 'campaign') or not isinstance(doc.get('version'), int):
-        print('not a definition/1 document', file=sys.stderr)
+    # (zero.farm_def.validate mirrors zero-farm's definition.rs, which the real farm-release checks before signing)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'python'))
+    from zero.farm_def import validate
+    try:
+        validate(doc)
+    except ValueError as e:
+        print(f'{path}: {e}', file=sys.stderr)
         return 1
     sha = hashlib.sha256(b).hexdigest()
-    with open(path + '.minisig', 'w', encoding='utf-8', newline='\n') as f:
-        f.write(f'untrusted comment: stub signature\nSTUB\ntrusted comment: kind={doc["kind"]} id={doc["id"]} '
-                f'version={doc["version"]} sha256={sha}\nSTUB\n')
+    sig = path + '.minisig'
+    with open(sig, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(f'untrusted comment: stub signature\nSTUB\ntrusted comment: definition=1 kind={doc["kind"]} id={doc["id"]} '
+                f'version={doc["version"]}\nSTUB\n')
     key = f'defs/{doc["kind"]}/{doc["id"]}/{doc["version"]}/definition.json'
-    print(f'signed {path} (version {doc["version"]}, sha256 {sha})')
+    result = {'kind': doc['kind'], 'id': doc['id'], 'version': doc['version'], 'key': key, 'sha256': sha, 'signature': sig,
+              'published': 'publish' in flags}
     if 'publish' in flags:
         if not flags.get('url') or not tok:
             print('--publish needs --url and ZEROFARM_ADMIN_TOKEN', file=sys.stderr)
@@ -79,7 +88,7 @@ def main(argv):
         if sp:
             with open(sp, 'w', encoding='utf-8') as f:
                 json.dump(st, f)
-        print(f'registered {k} version {doc["version"]} at {flags["url"]} ({key})')
+    print(json.dumps(result))                     # (the real tool's one result line)
     return 0
 
 

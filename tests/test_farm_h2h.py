@@ -23,6 +23,7 @@ pytest.importorskip('onnxruntime')
 
 from zero import farm_def as FD, farm_eval as FE, farm_h2h as FH, games as G  # noqa: E402
 import farm_release_stub as STUB  # noqa: E402
+import worker_stub as WSTUB  # noqa: E402
 
 TOKEN = 'secret-admin-token-xyz'
 INFO = G.info('toy')
@@ -31,6 +32,15 @@ RT = 'c' * 24
 MANIFEST = json.dumps({'manifest': 1, 'kind': 'worker', 'version': 'toy-test', 'game': 'zero-toy', 'requires_runtime': RT,
                        'entry': 'w.exe', 'files': []}).encode()
 BID = hashlib.sha256(MANIFEST).hexdigest()[:24]
+WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker_stub.py')   # (info, check-config --eval)
+
+
+def base_seed(run):
+    """The coordinator's base seed of a run whose job sets none (zero-farm book.ts baseSeed: FNV-1a of the name)."""
+    h = 0x811c9dc5
+    for ch in run:
+        h = ((h ^ ord(ch)) * 0x01000193) & 0xffffffff
+    return h
 
 
 def _ckpts(tmp_path):
@@ -146,7 +156,7 @@ class Fake:
                 with open(path, 'wb') as f:
                     f.write(self.objects[self.ckpts[(run, gen)]['model']])
                 evs[key] = OnnxEvaluator(path, threads=1)
-            drv = FE.match_driver(job['settings'], job['seats'], ev['games'], job['seed'], paired=job['paired'])
+            drv = FE.match_driver(job['settings'], job['seats'], ev['games'], base_seed(run), paired=job['paired'])
             drive(drv, evs)
             self.played = {r['gid']: FE.row(r, job['seats'], True) for r in drv.take_results()}
         # a self-play result of another kind first (ignored)
@@ -178,12 +188,13 @@ class Fake:
 def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv('ZEROFARM_ADMIN_TOKEN', TOKEN)
     stub = STUB.setup(monkeypatch, tmp_path, TOKEN)
+    monkeypatch.setenv('WORKER_STUB_BUILD', BID)
     a, b = _ckpts(tmp_path)
     fake = Fake()
     cl = FH.Client('http://fake', transport=fake)
     st_dir = str(tmp_path / 'state')
     rc = FH.main(['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', RT, '--state-dir', st_dir,
-                  '--poll', '0', '--threads', '1', '--seed', '3'], client=cl)
+                  '--poll', '0', '--threads', '1', '--worker', WORKER, '--name', 'tr-3v5'], client=cl)
     assert rc == 0
     out, err = capsys.readouterr()
     assert TOKEN not in out + err and TOKEN not in json.dumps(fake.runs)
@@ -219,8 +230,13 @@ def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
     ev = fake.runs[run]['eval']
     assert ev['games'] == 10 and ev['batch'] == 'h2h'
     job = ev['job']
-    assert job['seats'] == [{'net': 1}, {'net': 2}] and job['paired'] is True and job['seed'] == 3
+    assert job == {'settings': job['settings'], 'seats': [{'net': 1}, {'net': 2}], 'paired': True}   # (no seed: the name's)
+    st0 = json.load(open(os.path.join(st_dir, run, 'state.json'), encoding='utf-8'))
+    assert st0['seed'] == base_seed(run) == FH.coordinator_seed(run)
     s = job['settings']
+    # only what the worker's check-config --eval calls play: no trainer-only key (preset, paths), nothing path-like
+    assert set(s) == set(WSTUB.eval_reads()) and 'preset' not in s and 'spec' not in s
+    FD.check_no_paths(s, 'settings')
     assert s['eval_sims'] == 6 and s['game'] == 'toy' and s['eval_spec'] and s['eval_select'] == 'cq'
     # the readout: zero.h2h.summary of the farm's rows (each game once: the duplicates of lease 3 skipped)
     full = json.loads(out.strip().splitlines()[-1])
@@ -247,12 +263,13 @@ def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
     # a runtime the build does not require: refused before the export, nothing put
     n = len(fake.calls)
     with pytest.raises(SystemExit, match='requires runtime'):
-        FH.main(['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', 'd' * 24, '--state-dir', st_dir,
+        FH.main(['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', 'd' * 24, '--worker', WORKER, '--state-dir', st_dir,
                  '--name', 'other'], client=cl)
     assert [c for c in fake.calls[n:] if c[0] != 'GET'] == [] and not os.path.exists(os.path.join(st_dir, 'h2h-other'))
     # a second start of the same run is refused (resume it)
     with pytest.raises(SystemExit):
-        FH.main(['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', RT, '--state-dir', st_dir],
+        FH.main(['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', RT, '--worker', WORKER, '--state-dir', st_dir,
+                 '--name', 'tr-3v5'],
                 client=cl)
 
 
