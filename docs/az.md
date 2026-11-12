@@ -5429,3 +5429,70 @@ work; zero-farm docs/phase0b-worker.md has the tables).
   more failed only under the load (timeouts, phase caps) and passed alone or rerun. mtg-zero: pytest 271 passed, 1
   skipped (`tests/test_worker_shards.py`: the worker's shards pass `RemotePlay._check` and load into `Window`), the
   digests unchanged (53839c837bbaf034), `--test az` 48 passed.
+
+### 42.1 Fuzz jobs, the per-machine self-test, the runtime pack (no setting; zero-farm phase 1, 2026-11-12)
+
+**Why.** zero-farm phase 1 puts friends' PCs on fuzzing first (zero-farm DESIGN.md 6: fixed seeds of a game's own
+fuzz loops, no network, no training data at stake), and every network job must first prove, on that PC, that its
+evaluator answers as torch does (DESIGN.md 2.1 point 5) and load ONNX Runtime from a verified runtime pack, never from
+whatever is on the PC.
+
+**What.**
+* **Fuzz jobs** (`zero_worker::fuzz`; zero-farm PROTOCOL.md 5 `fuzz` and 5.1). A game binary registers a `FuzzGame`
+  (`zero_worker::main_with(&Worker { games, repo, selfplay, fuzz: Some(&MyFuzz) })`): `plan(mode, env)` - which of its
+  loops a job means, refusing settings the loop would ignore -, `run_chunk(plan, env, first, count, hooks)` - the loop
+  over a range of seeds, seed by seed through `ChunkHooks` (before / passed / side_failure) -, `repro(...)` and
+  `profile()`. The rest is game-agnostic: the lease's seeds are cut into chunks (at least the loop's `min_chunk`, so its
+  checks over a whole chunk keep their meaning; default max(min_chunk, count / 4 threads)) and up to `threads` chunk
+  processes run at a time (`<worker> fuzz-chunk <spec>`, one thread each, no console window, the worker's priority class
+  and EcoQoS state, `SetErrorMode` so a crash shows no dialog), each writing one progress line per seed (start / pass /
+  fail / side) to a file and its stdout + stderr (the loop's report, the panic hook's messages) to a log.
+  * A seed that panics ends its chunk (as the game's own loop stops at a failing seed): a `failure` event {seed, mode,
+    panic (the hook's text of the first panic recorded during that seed), site (that panic's `file:line`, '/'), repro,
+    output_tail (the log's last 200 lines / 32 KB)} and the chunk goes on from the next seed in a new process. A panic
+    outside the loop's per-seed catch while a seed is in play is that seed's failure; after the last seed (the chunk's
+    own checks) it is a chunk failure (repro + ` (the chunk: <count var>=n)`).
+  * A chunk process that dies without unwinding (abort, stack overflow) or plays one seed past `seed_timeout_s` of CPU
+    time (default 300 s; CPU time, so a PC that starves the worker is not a hang) is cut at that seed: the seeds before
+    it passed, the seed runs alone, and only if it crashes or hangs again is it the failure (`crash exit <code>` /
+    `HANG <mode>`, tools/fuzz_farm.py's names); either way the job goes on after it. No seed can take a lease down or be
+    handed out for ever.
+  * `yield` suspends the chunk processes (NtSuspendProcess; their CPU clocks stop) before `yielded`; `resume` resumes
+    them; `finish` lets each finish its seed; `quit` (or stdin closing) kills them. `fin` every second with the seeds
+    done; `end` {reason, stats, unfinished {seeds}} - the agent builds the 5.1 summary and its `x-ids` from the failures
+    and `end` (agent 0.1.3). The worker writes the same summary to `out_dir/fuzz-final.json` and announces it as a
+    `records` file only when the job asks (`announce_result`: announcing it to agent 0.1.3 would credit the seeds twice
+    over in `units_done`). Stats: games = seeds, failures, chunks, cpu_s, children's rss.
+  * Test faults: env `ZERO_FARM_TEST_FAULT=panic:S,abort:S,overflow:S,hang:S` injects them at seeds, taken only by a
+    build with debug assertions whose process has `ZERO_FARM_ALLOW_TEST_FAULTS=1`; anywhere else the key is refused.
+  * CLI: `fuzz` (a job from flags; `--keep-chunks`), `fuzz-check --mode M --env K=V ...` (what a campaign means and
+    its repro), `fuzz-chunk` (the child). A build's engine commit and profile come from its signed `manifest.json`
+    (else `ZERO_FARM_ENGINE_COMMIT` / `ZERO_FARM_PROFILE`); a manifest whose profile is not the compiled one is refused.
+* **Self-test** (`zero_worker::selftest`, PROTOCOL.md 5 `selftest`): a job or `checkpoint` line's `reference` (the
+  checkpoint's `reference.npz`, below) is answered by the job's own evaluator - this PC, this ONNX Runtime, this
+  provider - before its first batch, batch by batch as recorded; event `selftest` {provider, max_abs, ok, rows, items:
+  priors / value / margin / aux}; max_abs past 2e-5 (or not finite) is a fatal error: nothing is played. Stats
+  `selftest_max_abs`. The set's game / features / actions and checkpoint sha256 must be the network's.
+* **The reference set** (`zero.onnx_export --reference N --reference-batches <recorded batches>`, `write_reference`,
+  `check_reference`; section 41): N real rows of recorded driver batches (whole batches spread over the files, the last
+  cut) with torch's eager answers (`NetEvaluator`, CPU, batch by batch), `reference.npz` (meta, the driver's sparse
+  arrays, `batch_off`, priors / value / margin / aux); the export checks the graph through onnxruntime against it and
+  exits 1 past 2e-5, so a checkpoint whose graph fails is never published.
+* **ONNX Runtime from the runtime pack only**: `serve` loads it from the job's `runtime_dir` or `ZEROFARM_RUNTIME_DIR` (a
+  network job without either is refused); on Windows the MSVC runtime next to `onnxruntime.dll` (the pack's app-local
+  copies) is loaded first by full path, so ONNX Runtime binds to it whatever the PC's System32 holds (ONNX Runtime 1.31.1
+  is linked with toolset 14.44 and imports `_Mtx_lock`: an older msvcp140 crashes it). `info --runtime-dir D` says
+  where each DLL came from.
+
+**Tests and checks.** `cargo test -p zero_worker` (14 unit + 4 job tests: the self-test passing, failing on a 1e-3 prior
+and on NaN, a corrupted reference file refused, id ranges, faults refused without the switch); `tests/test_onnx.py` 17
+(`test_reference_set`: the rows are the file's, dtypes, ORT within 2e-5, a corrupted answer caught, too few rows / no
+belief row for an auxiliary head refused). mtg-zero's `tests/test_worker_farm.py` runs it all through `mtgz-worker serve`
+(ENGINE.md 114.2 there): fuzz over aw/1, refusals, yield / resume / quit, injected panic / abort / stack overflow / hang
+isolated to their seeds, the self-test passing with a small random MTG network and a corrupted reference stopping the
+job before any game. zero_search unchanged.
+
+**Measured** (2026-11-12, the desktop, CPU only, busy with the live Delver run): eoe1 iter 80's reference set from
+phase 0a's recorded batches: 256 rows (7 belief, 60 value-only) in 3 batches, 357 KB; onnxruntime vs torch 4.6e-6 (margin;
+priors 4.5e-7, value 1.2e-6, aux 2.7e-7); `mtgz-worker`'s self-test on it 4.59e-6 in 0.16 s; with one prior off by 1e-3 the
+job stops before its first game.
