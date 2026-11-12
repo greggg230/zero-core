@@ -7,8 +7,9 @@
 //! than `CHUNK` rows is run in pieces of at most `CHUNK` rows, the rows ordered by their non-zero
 //! count (stable), each piece's outputs put back in row order (zero-core `onnx_parity.run_chunked`,
 //! needing nothing of the network); then per row with options a float32 max-subtracted softmax of its
-//! legal options' logits (`onnx_parity.answer` / `infer.segment_softmax_np`), value and margin as the
-//! graph gives them, and the auxiliary outputs of the root belief rows (`ROW_BELIEF`) only, in row order.
+//! legal options' logits ([`softmax_exact`], the same bits as zero-core's `onnx_parity.exact_softmax`:
+//! zero-farm's eval gate compares games byte for byte), value and margin as the graph gives them, and the
+//! auxiliary outputs of the root belief rows (`ROW_BELIEF`) only, in row order.
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -324,8 +325,75 @@ impl OrtEvaluator {
     }
 }
 
+// The exact exponential of the softmax (`exp_f32`): exp of a float32 through float64 arithmetic of a fixed
+// sequence of IEEE operations (Cody-Waite reduction by ln 2, the Taylor polynomial of degree 13 by Horner,
+// an exact scaling by 2^n, one rounding to float32) - no libm, no FMA - so that every machine and numpy
+// (zero-core `onnx_parity.exp_f32`) compute the same bits. Its error before the final rounding is ~5e-16
+// relative: the float32 result is the correctly rounded exp except within ~1e-15 of a rounding boundary.
+const INV_LN2: f64 = f64::from_bits(0x3ff7_1547_652b_82fe);
+/// ln 2 split (fdlibm's ln2_hi / ln2_lo): n * LN2_HI is exact for |n| < 2^21.
+const LN2_HI: f64 = f64::from_bits(0x3fe6_2e42_fee0_0000);
+const LN2_LO: f64 = f64::from_bits(0x3dea_39ef_3579_3c76);
+/// 1 / k!, k = 0..=13 (each the correctly rounded quotient).
+const EXP_C: [f64; 14] = [
+    f64::from_bits(0x3ff0_0000_0000_0000),
+    f64::from_bits(0x3ff0_0000_0000_0000),
+    f64::from_bits(0x3fe0_0000_0000_0000),
+    f64::from_bits(0x3fc5_5555_5555_5555),
+    f64::from_bits(0x3fa5_5555_5555_5555),
+    f64::from_bits(0x3f81_1111_1111_1111),
+    f64::from_bits(0x3f56_c16c_16c1_6c17),
+    f64::from_bits(0x3f2a_01a0_1a01_a01a),
+    f64::from_bits(0x3efa_01a0_1a01_a01a),
+    f64::from_bits(0x3ec7_1de3_a556_c734),
+    f64::from_bits(0x3e92_7e4f_b778_9f5c),
+    f64::from_bits(0x3e5a_e645_67f5_44e4),
+    f64::from_bits(0x3e21_eed8_eff8_d898),
+    f64::from_bits(0x3de6_1246_13a8_6d09),
+];
+
+/// exp(d) as float32 for a max-subtracted logit d <= 0 (module docs: the same bits everywhere). NaN stays
+/// NaN; below -150 (far under float32's smallest subnormal) it is 0.
+pub fn exp_f32(d: f32) -> f32 {
+    if d.is_nan() {
+        return f32::NAN;
+    }
+    let x = d as f64;
+    if x < -150.0 {
+        return 0.0;
+    }
+    let n = (x * INV_LN2 + 0.5).floor();
+    let r = (x - n * LN2_HI) - n * LN2_LO;
+    let mut p = EXP_C[13];
+    for k in (0..13).rev() {
+        p = p * r + EXP_C[k];
+    }
+    // 2^n exactly (n in [-217, 0] here; the result is a normal float64)
+    (p * f64::from_bits(((n as i64 + 1023) as u64) << 52)) as f32
+}
+
+/// The softmax of one row's legal logits, in place (zero-core `onnx_parity.exact_softmax`): m the largest
+/// (NaN propagates), each e = `exp_f32(l - m)` (the difference in float32), their sum in float32 in order,
+/// each e / sum in float32.
+pub fn softmax_exact(v: &mut [f32]) {
+    let mut m = f32::NEG_INFINITY;
+    for &l in v.iter() {
+        if l.is_nan() || l > m {
+            m = l;
+        }
+    }
+    let mut s = 0f32;
+    for p in v.iter_mut() {
+        *p = exp_f32(*p - m);
+        s += *p;
+    }
+    for p in v.iter_mut() {
+        *p /= s;
+    }
+}
+
 /// The generic step (zero-core `onnx_parity.answer`): per row with options the float32 softmax of its
-/// legal options' logits (max subtracted), value and margin as given, the belief rows' aux in row order.
+/// legal options' logits (`softmax_exact`), value and margin as given, the belief rows' aux in row order.
 pub fn answer(b: &Batch, actions: usize, aux_w: usize, policy: &[f32], value: Vec<f32>, margin: Vec<f32>, aux: &[f32]) -> Result<Answer, String> {
     let mut priors = Vec::with_capacity(*b.opt_off.last().unwrap_or(&0) as usize);
     for r in 0..b.b {
@@ -334,24 +402,14 @@ pub fn answer(b: &Batch, actions: usize, aux_w: usize, policy: &[f32], value: Ve
             continue;
         }
         let start = priors.len();
-        let mut m = f32::NEG_INFINITY;
         for k in lo..hi {
             let a = b.opt_action[k] as usize;
             if a >= actions {
                 return Err(format!("row {r}: action {a} beyond the network's {actions}"));
             }
-            let l = policy[r * actions + a];
-            m = m.max(l);
-            priors.push(l);
+            priors.push(policy[r * actions + a]);
         }
-        let mut s = 0f32;
-        for p in &mut priors[start..] {
-            *p = (*p - m).exp();
-            s += *p;
-        }
-        for p in &mut priors[start..] {
-            *p /= s;
-        }
+        softmax_exact(&mut priors[start..]);
     }
     let mut ax = Vec::new();
     for r in 0..b.b {
@@ -390,5 +448,41 @@ impl Evaluator for OrtEvaluator {
     }
     fn describe(&self) -> String {
         format!("onnx {} ({} intra-op threads, spinning {})", self.path.display(), self.cfg.intra_threads, self.cfg.spinning)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exp_f32_is_the_rounded_exponential() {
+        assert_eq!(exp_f32(0.0), 1.0);
+        assert_eq!(exp_f32(-200.0), 0.0);
+        assert_eq!(exp_f32(f32::NEG_INFINITY), 0.0);
+        assert!(exp_f32(f32::NAN).is_nan());
+        // against float64's exp rounded to float32: equal, or (within ~1e-15 of a rounding boundary) one ulp
+        let mut worst = 0u32;
+        let mut x = 0f32;
+        while x > -110.0 {
+            let want = (x as f64).exp() as f32;
+            let got = exp_f32(x);
+            let ulps = (want.to_bits() as i64 - got.to_bits() as i64).unsigned_abs() as u32;
+            worst = worst.max(ulps);
+            x -= 0.000_731;
+        }
+        assert!(worst <= 1, "{worst} ulps");
+    }
+
+    #[test]
+    fn softmax_exact_sums_to_one_and_keeps_order() {
+        let mut v = vec![1.5f32, -0.25, 3.0, 3.0, -40.0];
+        softmax_exact(&mut v);
+        let s: f32 = v.iter().sum();
+        assert!((s - 1.0).abs() < 1e-6, "{s}");
+        assert!(v[2] == v[3] && v[2] > v[0] && v[0] > v[1] && v[1] > v[4] && v[4] > 0.0);
+        let mut n = vec![1.0f32, f32::NAN];
+        softmax_exact(&mut n);
+        assert!(n.iter().all(|x| x.is_nan()));
     }
 }

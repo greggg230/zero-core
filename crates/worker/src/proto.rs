@@ -6,8 +6,17 @@
 //!          [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
 //!          [--ort-dll PATH] [--spinning 0|1] [--record-batches N --record-file F] [--sha256 H]
 //!          [--status-s X] [--stdin-control] [--reference R]   one job from flags (the same runner; events on stdout)
-//! <worker> check-config <config.json> [--json]     classify every setting; exit 1 on unknown / unsupported
+//! <worker> eval --settings F (--model GEN=M ... | --uniform) --seats JSON --games N [--gid-base G] [--seed S]
+//!          [--paired] [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
+//!          [--reference GEN=R ...] [--sha256 GEN=H ...] [--ort-dll PATH] [--spinning 0|1] [--flush-games N]
+//!          [--record-batches N --record-file F] [--status-s X] [--stdin-control]
+//!                                                  one eval job from flags (events on stdout)
+//! <worker> check-config <config.json> [--json] [--eval [--seats JSON]]
+//!                                                  classify every setting (for self-play, or for an eval
+//!                                                  job); exit 1 on unknown / unsupported
 //! <worker> driver-cfg <config.json> --seed S --net N   the Python remote worker's DriverCfg (Debug text)
+//! <worker> driver-cfg <config.json> --eval --seats JSON --games N --seed S [--paired] [--lease]
+//!                                                  Run.play_match's DriverCfg (--lease: the eval job's)
 //! <worker> eval-batches --model M --batches F --out F [--threads T] [--ort-dll P]
 //!                                                  answers to recorded batches (the evaluator's gate)
 //! <worker> info [--runtime-dir D | --ort-dll P]     games, protocol, ONNX Runtime (and where its DLLs came from)
@@ -29,6 +38,12 @@
 //! half-open [a, b) ranges), `status` every <= 10 s (PROTOCOL.md 3 Stats fields), `end` (reason, stats,
 //! unfinished {gids: [[a, b)]}), `error` (message, fatal). The process exits after `end` (or a fatal
 //! error, status 1).
+//!
+//! An eval job (PROTOCOL.md 5.2, `evaljob`): kind 'eval', settings, seats ([{"net": gen} | {"bot": name}] x 2),
+//! paired, games, gid_base, seed, models ({"<gen>": {"model", "sha256"?, "reference"?}}: every one loaded and
+//! self-tested - `selftest` with its `gen` -, the file's sha256 checked), threads, out_dir, runtime_dir and
+//! the tuning fields; its settings must pass `check-config --eval` (else a fatal error); `evals` events (as
+//! `shard`'s, JSON-lines result files) instead of `shard`; `checkpoint` is refused (non-fatal).
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -249,6 +264,81 @@ fn job_from_value(v: &Value, base: &Path) -> Result<Job, String> {
     })
 }
 
+/// `GEN=VALUE` pairs of a flag (`--model 1=a.onnx`).
+fn gen_pairs(a: &Args, k: &str) -> Result<Vec<(u32, String)>, String> {
+    a.all(k).iter().map(|kv| kv.split_once('=').and_then(|(g, v)| g.parse::<u32>().ok().map(|g| (g, v.to_string()))).ok_or_else(|| format!("{k} {kv:?}: GEN=VALUE"))).collect()
+}
+
+fn seats_of_value(v: &Value) -> Result<Vec<crate::settings::EvalSeat>, String> {
+    v.as_array().ok_or("seats: a list of two seats")?.iter().map(crate::settings::EvalSeat::parse).collect()
+}
+
+/// The job line of an eval job (PROTOCOL.md 5.2).
+fn eval_job_from_value(v: &Value, base: &Path) -> Result<crate::evaljob::EvalJob, String> {
+    use crate::evaljob::{EvalJob, ModelSpec};
+    let o = v.as_object().ok_or("job: a JSON object")?;
+    let settings = match o.get("_raw").and_then(|r| r.as_str()) {
+        Some(raw) => match crate::pyjson::PyJson::parse(raw)?.get("settings") {
+            Some(s @ crate::pyjson::PyJson::Dict(_)) => Settings { raw: s.clone() },
+            _ => return Err("job: settings must be an object".into()),
+        },
+        None => Settings::from_value(o.get("settings").ok_or("job: no settings")?)?,
+    };
+    let u = |k: &str| o.get(k).and_then(|x| x.as_u64());
+    let games = u("games").ok_or("job: games")?;
+    let threads = u("threads").unwrap_or(1).max(1) as usize;
+    let seats = seats_of_value(o.get("seats").ok_or("job: no seats")?)?;
+    let mut models = std::collections::BTreeMap::new();
+    if let Some(m) = o.get("models") {
+        for (g, x) in m.as_object().ok_or("job: models is an object {\"<gen>\": {model, sha256, reference}}")? {
+            let gen: u32 = g.parse().map_err(|_| format!("job: models key {g:?}: a generation"))?;
+            let model = x.get("model").and_then(|p| p.as_str()).ok_or_else(|| format!("job: models[{g}] has no model"))?;
+            models.insert(gen, ModelSpec { model: base.join(model), sha256: x.get("sha256").and_then(|h| h.as_str()).map(String::from), reference: x.get("reference").and_then(|r| r.as_str()).map(|r| base.join(r)) });
+        }
+    }
+    let uniform = o.get("uniform").and_then(|x| x.as_bool()) == Some(true);
+    let rt = o.get("runtime_dir").and_then(|x| x.as_str()).map(String::from).or_else(|| std::env::var("ZEROFARM_RUNTIME_DIR").ok().filter(|v| !v.is_empty()));
+    let ort = if uniform || models.is_empty() {
+        None
+    } else {
+        let d = rt.ok_or("job: a network job needs its runtime pack (runtime_dir or ZEROFARM_RUNTIME_DIR)")?;
+        Some(OrtCfg { dylib: ort_dylib_in(None, Some(&d)), intra_threads: u("infer_threads").map_or(threads, |t| t as usize), spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false) })
+    };
+    Ok(EvalJob {
+        lease_id: o.get("lease_id").and_then(|x| x.as_str()).unwrap_or("job").to_string(),
+        settings,
+        seats,
+        models,
+        ort,
+        games,
+        gid_base: u("gid_base").unwrap_or(0) as u32,
+        seed: u("seed").unwrap_or(0),
+        paired: o.get("paired").and_then(|x| x.as_bool()).unwrap_or(false),
+        search_threads: Some(threads),
+        conc: u("conc").map(|x| x as usize),
+        groups: u("groups").map(|x| x as usize),
+        out_dir: base.join(o.get("out_dir").and_then(|x| x.as_str()).unwrap_or("out")),
+        prefix: o.get("prefix").and_then(|x| x.as_str()).unwrap_or("e").to_string(),
+        flush_games: u("flush_games").unwrap_or(16).max(1) as usize,
+        flush_s: 120.0,
+        record_batches: None,
+        status_s: 10.0,
+    })
+}
+
+/// An eval job's settings as check-config --eval checks them: every setting classified for an eval job, the
+/// evaluation spec set, the match's driver built (its seats: `Run.nn_seat`'s checks) -> the failures.
+fn eval_settings_failures(w: &Worker, game: &GameEntry, s: &Settings, seats: &[crate::settings::EvalSeat]) -> Result<Vec<String>, String> {
+    let info = (game.info)();
+    let others: Vec<_> = w.games.iter().filter(|g| g.name != game.name).map(|g| (g.info)()).collect();
+    let v = classify::classify_eval(s, &info, &others, w.package_settings)?;
+    let mut bad: Vec<String> = classify::failures(&v).iter().map(|x| format!("{} = {}: {} ({})", x.key, x.value, x.status, x.why)).collect();
+    if let Err(e) = crate::settings::eval_driver_cfg(s, &info, seats, 2, 0, true, None, None, None) {
+        bad.push(format!("the evaluation match: {e}"));
+    }
+    Ok(bad)
+}
+
 fn end_event(o: &Outcome) -> Value {
     json!({"ev": "end", "reason": o.reason, "stats": o.stats, "unfinished": {"gids": o.unfinished.iter().map(|r| [r.0, r.1]).collect::<Vec<_>>()}})
 }
@@ -294,19 +384,35 @@ fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress
 /// Run `job` on a thread while this thread reads control lines from `lines` (None: no control) and
 /// emits a status line every `status_s` -> the outcome.
 fn run_with_control(game: &'static GameEntry, mut job: Job, sink: Arc<Stdout>, lines: Option<std::sync::mpsc::Receiver<Option<Value>>>, base: PathBuf) -> Result<Outcome, String> {
+    // (the status lines come from the control thread, which also runs while the job waits on its search threads)
+    let status_s = job.status_s;
+    job.status_s = f64::INFINITY;
+    with_control(status_s, sink, lines, base, move |ctl, sink, progress, link_out| run_job(game, &job, ctl, sink, progress, link_out))
+}
+
+/// An eval job on a thread while this thread reads control lines (as `run_with_control`).
+fn run_eval_with_control(game: &'static GameEntry, mut job: crate::evaljob::EvalJob, sink: Arc<Stdout>, lines: Option<std::sync::mpsc::Receiver<Option<Value>>>, base: PathBuf) -> Result<Outcome, String> {
+    let status_s = job.status_s;
+    job.status_s = f64::INFINITY;
+    with_control(status_s, sink, lines, base, move |ctl, sink, progress, link_out| crate::evaljob::run_eval_job(game, &job, ctl, sink, progress, link_out))
+}
+
+type JobFn = dyn FnOnce(&Control, &dyn Sink, Arc<Mutex<Progress>>, &dyn Fn(EvalLink)) -> Result<Outcome, String> + Send;
+
+/// Run a network job (`run`) on a thread while this thread reads control lines from `lines` (None: no
+/// control) and emits a status line every `status_s` -> the outcome.
+fn with_control(status_s: f64, sink: Arc<Stdout>, lines: Option<std::sync::mpsc::Receiver<Option<Value>>>, base: PathBuf, run: impl FnOnce(&Control, &dyn Sink, Arc<Mutex<Progress>>, &dyn Fn(EvalLink)) -> Result<Outcome, String> + Send + 'static) -> Result<Outcome, String> {
+    let run: Box<JobFn> = Box::new(run);
     let ctl = Arc::new(Control::default());
     let link: Arc<Mutex<Option<EvalLink>>> = Arc::new(Mutex::new(None));
     let progress = Arc::new(Mutex::new(Progress::default()));
-    // (the status lines come from this thread, which also runs while the job waits on its search threads)
-    let status_s = job.status_s;
-    job.status_s = f64::INFINITY;
     let (c2, l2, p2, s2) = (ctl.clone(), link.clone(), progress.clone(), sink.clone());
     let worker = std::thread::Builder::new()
         .name("zero-worker-job".into())
         .spawn(move || {
             let lk = l2.clone();
             let c3 = c2.clone();
-            run_job(game, &job, &c2, &*s2, p2, &move |l| {
+            run(&c2, &*s2, p2, &move |l| {
                 // (a yield that came while the evaluator was loading: release it now)
                 if c3.is_yielded() {
                     l.release();
@@ -384,6 +490,7 @@ fn serve(w: &'static Worker) -> i32 {
                 let kind = line.get("kind").and_then(|k| k.as_str()).unwrap_or("");
                 match (kind, w.fuzz) {
                     ("fuzz", Some(fg)) => return serve_fuzz(fg, &line, sink, rx, base),
+                    ("eval", _) if w.selfplay => return serve_eval(w, &line, sink, rx, base),
                     ("selfplay", _) if w.selfplay => {}
                     _ => {
                         sink.event(json!({"ev": "error", "message": format!("job kind {kind:?}: this worker build runs {:?}", w.kinds()), "fatal": true}));
@@ -417,6 +524,34 @@ fn serve(w: &'static Worker) -> i32 {
             Some("yield") => sink.event(json!({"ev": "yielded"})),
             Some("resume") => sink.event(json!({"ev": "resumed"})),
             other => sink.event(json!({"ev": "error", "message": format!("op {other:?} before a job"), "fatal": false})),
+        }
+    }
+}
+
+fn serve_eval(w: &'static Worker, line: &Value, sink: Arc<Stdout>, rx: std::sync::mpsc::Receiver<Option<Value>>, base: PathBuf) -> i32 {
+    let job = eval_job_from_value(line, &base).and_then(|j| {
+        let game = game_of(w.games, &j.settings)?;
+        let bad = eval_settings_failures(w, game, &j.settings, &j.seats)?;
+        if !bad.is_empty() {
+            return Err(format!("the eval job's settings are refused (check-config --eval): {}", bad.join("; ")));
+        }
+        Ok((game, j))
+    });
+    let (game, job) = match job {
+        Ok(x) => x,
+        Err(e) => {
+            sink.event(json!({"ev": "error", "message": e, "fatal": true}));
+            return 1;
+        }
+    };
+    match run_eval_with_control(game, job, sink.clone(), Some(rx), base) {
+        Ok(o) => {
+            sink.event(end_event(&o));
+            0
+        }
+        Err(e) => {
+            sink.event(json!({"ev": "error", "message": e, "fatal": true}));
+            1
         }
     }
 }
@@ -604,13 +739,96 @@ fn selfplay_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
-fn check_config(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
+fn eval_cli(w: &'static Worker, a: &Args) -> Result<i32, String> {
+    use crate::evaljob::{EvalJob, ModelSpec};
+    let settings = read_settings(a.get("--settings").ok_or("--settings <config.json>")?)?;
+    let game = game_of(w.games, &settings)?;
+    let threads: usize = a.num("--threads")?.unwrap_or(1);
+    let seats = seats_of_value(&serde_json::from_str::<Value>(a.get("--seats").ok_or("--seats '[{\"net\": 1}, {\"net\": 2}]'")?).map_err(|e| format!("--seats: {e}"))?)?;
+    let refs: std::collections::BTreeMap<u32, String> = gen_pairs(a, "--reference")?.into_iter().collect();
+    let shas: std::collections::BTreeMap<u32, String> = gen_pairs(a, "--sha256")?.into_iter().collect();
+    let mut models = std::collections::BTreeMap::new();
+    for (g, m) in gen_pairs(a, "--model")? {
+        models.insert(g, ModelSpec { model: PathBuf::from(m), sha256: shas.get(&g).cloned(), reference: refs.get(&g).map(PathBuf::from) });
+    }
+    let uniform = a.has("--uniform");
+    if uniform {
+        for s in &seats {
+            if let crate::settings::EvalSeat::Net(g) = s {
+                models.entry(*g).or_insert(ModelSpec { model: PathBuf::from("uniform"), sha256: None, reference: None });
+            }
+        }
+    }
+    let ort = (!uniform).then(|| OrtCfg { dylib: ort_dylib(a.get("--ort-dll")), intra_threads: a.num("--infer-threads").ok().flatten().unwrap_or(threads), spinning: a.get("--spinning") == Some("1") });
+    let record = match (a.num::<usize>("--record-batches")?, a.get("--record-file")) {
+        (Some(n), Some(f)) => Some((PathBuf::from(f), n)),
+        (None, None) => None,
+        _ => return Err("--record-batches N and --record-file F go together".into()),
+    };
+    let job = EvalJob {
+        lease_id: a.get("--lease").unwrap_or("cli").to_string(),
+        settings,
+        seats,
+        models,
+        ort,
+        games: a.num("--games")?.ok_or("--games N")?,
+        gid_base: a.num("--gid-base")?.unwrap_or(0),
+        seed: a.num("--seed")?.unwrap_or(0),
+        paired: a.has("--paired"),
+        search_threads: a.num("--search-threads")?.or(Some(threads)),
+        conc: a.num("--conc")?,
+        groups: a.num("--groups")?,
+        out_dir: PathBuf::from(a.get("--out").unwrap_or("out")),
+        prefix: a.get("--prefix").unwrap_or("e").to_string(),
+        flush_games: a.num("--flush-games")?.unwrap_or(16),
+        flush_s: a.num("--flush-s")?.unwrap_or(120.0),
+        record_batches: record,
+        status_s: a.num("--status-s")?.unwrap_or(10.0),
+    };
+    let bad = eval_settings_failures(w, game, &job.settings, &job.seats)?;
+    if !bad.is_empty() {
+        return Err(format!("the eval job's settings are refused (check-config --eval): {}", bad.join("; ")));
+    }
+    let sink = Arc::new(Stdout { mu: Mutex::new(()) });
+    let lines = a.has("--stdin-control").then(|| stdin_lines(sink.clone()));
+    let o = run_eval_with_control(game, job, sink.clone(), lines, std::env::current_dir().unwrap_or_default())?;
+    sink.event(end_event(&o));
+    Ok(0)
+}
+
+fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
+    let games = w.games;
     let path = a.positional().ok_or("check-config <config.json>")?;
     let s = read_settings(path)?;
     let game = game_of(games, &s)?;
     let info = (game.info)();
     let others: Vec<_> = games.iter().filter(|g| g.name != game.name).map(|g| (g.info)()).collect();
-    let v = classify::classify(&s, &info, &others)?;
+    if a.has("--eval") {
+        let seats = match a.get("--seats") {
+            Some(t) => seats_of_value(&serde_json::from_str::<Value>(t).map_err(|e| format!("--seats: {e}"))?)?,
+            None => vec![crate::settings::EvalSeat::Net(1), crate::settings::EvalSeat::Net(2)],
+        };
+        let v = classify::classify_eval(&s, &info, &others, w.package_settings)?;
+        let bad = classify::failures(&v);
+        let built = crate::settings::eval_driver_cfg(&s, &info, &seats, 2, 0, true, None, None, None).err();
+        if a.has("--json") {
+            let rows: Vec<Value> = v.iter().map(|x| json!({"key": x.key, "value": x.value, "status": x.status, "why": x.why})).collect();
+            println!("{}", json!({"game": info.name, "job": "eval", "settings": rows, "failures": bad.iter().map(|x| &x.key).collect::<Vec<_>>(), "driver_error": built, "eval_reads": crate::settings::EVAL_READS}));
+        } else {
+            for st in ["play", "trainer", "unknown", "unsupported"] {
+                let ks: Vec<&str> = v.iter().filter(|x| x.status == st).map(|x| x.key.as_str()).collect();
+                println!("{st} ({}): {}", ks.len(), ks.join(", "));
+            }
+            for x in &bad {
+                println!("REFUSED {} = {}: {} ({})", x.key, x.value, x.status, x.why);
+            }
+            if let Some(e) = &built {
+                println!("REFUSED: the evaluation match: {e}");
+            }
+        }
+        return Ok(if bad.is_empty() && built.is_none() { 0 } else { 1 });
+    }
+    let v = classify::classify_with(&s, &info, &others, w.package_settings)?;
     let bad = classify::failures(&v);
     // the settings must also build the driver (the Python remote worker's checks)
     let built = crate::settings::selfplay_driver_cfg(&s, &info, 0, 0).err();
@@ -635,6 +853,13 @@ fn check_config(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
 fn driver_cfg_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     let s = read_settings(a.positional().ok_or("driver-cfg <config.json>")?)?;
     let game = game_of(games, &s)?;
+    if a.has("--eval") {
+        let seats = seats_of_value(&serde_json::from_str::<Value>(a.get("--seats").ok_or("--seats JSON")?).map_err(|e| format!("--seats: {e}"))?)?;
+        let m = crate::settings::eval_driver_cfg(&s, &(game.info)(), &seats, a.num("--games")?.ok_or("--games N")?, a.num("--seed")?.unwrap_or(0), a.has("--paired"), a.num("--conc")?, a.num("--threads")?, a.num("--groups")?)?;
+        let cfg = if a.has("--lease") { crate::settings::eval_lease_cfg(m) } else { m };
+        println!("{cfg:#?}");
+        return Ok(0);
+    }
     let cfg = crate::settings::selfplay_driver_cfg(&s, &(game.info)(), a.num("--seed")?.unwrap_or(0), a.num("--net")?.unwrap_or(0))?;
     println!("{cfg:#?}");
     Ok(0)
@@ -719,7 +944,7 @@ fn info_cli(games: &'static [GameEntry], repo: &str, kinds: Vec<&'static str>, a
 }
 
 pub fn cli(games: &'static [GameEntry], repo: &'static str, args: &[String]) -> i32 {
-    cli_with(Box::leak(Box::new(Worker { games, repo, selfplay: true, fuzz: None })), args)
+    cli_with(Box::leak(Box::new(Worker { games, repo, selfplay: true, fuzz: None, package_settings: &[] })), args)
 }
 
 pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
@@ -743,13 +968,14 @@ pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
         }
         "fuzz" => w.fuzz.map_or_else(no_fuzz, |fg| fuzz_cli(fg, &a)),
         "fuzz-check" => w.fuzz.map_or_else(no_fuzz, |fg| fuzz_check(fg, &a)),
-        "selfplay" if !w.selfplay => Err("this worker build runs fuzz jobs only (a fuzz-profile build)".into()),
+        "selfplay" | "eval" if !w.selfplay => Err("this worker build runs fuzz jobs only (a fuzz-profile build)".into()),
         "selfplay" => selfplay_cli(games, &a),
-        "check-config" => check_config(games, &a),
+        "eval" => eval_cli(w, &a),
+        "check-config" => check_config(w, &a),
         "driver-cfg" => driver_cfg_cli(games, &a),
         "eval-batches" => eval_batches(&a),
         "info" => info_cli(games, repo, w.kinds(), &a),
-        _ => Err("usage: <worker> serve | selfplay ... | fuzz ... | fuzz-check ... | check-config <config.json> | driver-cfg <config.json> | eval-batches ... | info (zero-core crates/worker/src/proto.rs)".into()),
+        _ => Err("usage: <worker> serve | selfplay ... | eval ... | fuzz ... | fuzz-check ... | check-config <config.json> | driver-cfg <config.json> | eval-batches ... | info (zero-core crates/worker/src/proto.rs)".into()),
     };
     match r {
         Ok(code) => code,

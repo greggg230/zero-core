@@ -4128,3 +4128,86 @@ fn first_gid_plays_the_same_games() {
         answer(&mut d, &b);
     }
 }
+
+// ------------------------------------------------------------------ an eval job's driver (2.14)
+
+/// Every batch a driver sends - (key, gid per row, the rows' features) - with `answer_skewed`'s answers,
+/// and its finished games (gid, steps, result, scores, rounds).
+#[allow(clippy::type_complexity)]
+fn batches_and_games(d: &mut Driver<ToyGame>) -> (Vec<(u16, Vec<i64>, Vec<f32>)>, Vec<(u32, u64, Vec<f32>, Vec<f32>, u32)>) {
+    let mut bs = Vec::new();
+    let mut gs = Vec::new();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        bs.push((b.key, b.gid.clone(), b.x.clone()));
+        answer_skewed(d, &b);
+        gs.extend(d.take_results().into_iter().map(|r| (r.gid, r.steps, r.result, r.scores, r.rounds)));
+    }
+    gs.extend(d.take_results().into_iter().map(|r| (r.gid, r.steps, r.result, r.scores, r.rounds)));
+    gs.sort_by_key(|g| g.0);
+    (bs, gs)
+}
+
+#[test]
+fn a_queued_rolling_driver_plays_a_fixed_tables_match_batch_for_batch() {
+    // zero-farm's eval job (docs/search.md 2.14): a match of n games, seats [a, b] for even game ids and
+    // [b, a] for odd ones (Run.play_match's table), played by a rolling queue_only driver whose table is
+    // those two rows (game gid takes row gid % 2) with all n setups (the driver's spec) queued before its
+    // first resume: with one group it sends the fixed-table driver's batches, in its order, and plays its
+    // games - paired or not, and from a first game id: a lease's games are those of the whole match.
+    let seats = vec![nn(0, 12, false), nn(1, 6, false)];
+    let keys: &[(&str, KeyKind)] = &[("m", KeyKind::Nn), ("o", KeyKind::Nn)];
+    for paired in [true, false] {
+        for (n, conc) in [(12usize, 16usize), (12, 5), (9, 4)] {
+            let table: Vec<Vec<u16>> = (0..n).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+            let mut f = cfg(seats.clone(), table, keys);
+            (f.groups, f.record, f.paired, f.concurrency) = (1, false, paired, conc);
+            let mut fixed = Driver::<ToyGame>::new(f.clone()).unwrap();
+            let want = batches_and_games(&mut fixed);
+            let mut r = f.clone();
+            (r.rolling, r.queue_only, r.games, r.concurrency) = (true, true, vec![vec![0, 1], vec![1, 0]], conc.min(n));
+            let mut d = Driver::<ToyGame>::new(r.clone()).unwrap();
+            for k in 0..n {
+                d.enqueue(&format!("e{k}"), "{}").unwrap();
+            }
+            d.resume(1 << 62, 0).unwrap();
+            let got = batches_and_games(&mut d);
+            assert_eq!(got.1.len(), n);
+            assert_eq!(got.0, want.0, "paired {paired}, n {n}, conc {conc}: the batches");
+            assert_eq!(got.1, want.1, "paired {paired}, n {n}, conc {conc}: the games");
+            // games 4.. of the match from a driver of their own (set_first_gid): the same games
+            let mut d = Driver::<ToyGame>::new(r).unwrap();
+            d.set_first_gid(4).unwrap();
+            for k in 4..n {
+                d.enqueue(&format!("e{k}"), "{}").unwrap();
+            }
+            d.resume(1 << 62, 0).unwrap();
+            let tail = batches_and_games(&mut d).1;
+            let want_tail: Vec<_> = want.1.iter().filter(|g| g.0 >= 4).cloned().collect();
+            assert_eq!(tail.iter().map(|g| (g.0, &g.2, &g.3)).collect::<Vec<_>>(), want_tail.iter().map(|g| (g.0, &g.2, &g.3)).collect::<Vec<_>>(), "a lease of games 4..{n}: their results");
+        }
+    }
+}
+
+#[test]
+fn clear_queue_starts_no_new_game() {
+    let mut c = cfg(vec![nn(0, 8, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    (c.rolling, c.queue_only, c.record, c.concurrency, c.groups) = (true, true, false, 3, 1);
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    for k in 0..10 {
+        d.enqueue(&format!("e{k}"), "{}").unwrap();
+    }
+    d.resume(1 << 62, 0).unwrap();
+    let b = d.next_batch(true).unwrap().unwrap();
+    assert_eq!(d.queued(), 7, "three games started");
+    assert_eq!(d.clear_queue(), 7);
+    answer(&mut d, &b);
+    let mut games = d.take_results();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer(&mut d, &b);
+        games.extend(d.take_results());
+    }
+    games.extend(d.take_results());
+    let mut ids: Vec<u32> = games.iter().map(|g| g.gid).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1, 2], "the games in flight finished, none started after");
+}

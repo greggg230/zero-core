@@ -81,18 +81,18 @@ pub struct Checkpoint {
 }
 
 #[derive(Default)]
-struct CtlState {
-    yielded: bool,
-    quit: bool,
-    finish: bool,
-    checkpoint: Option<Checkpoint>,
+pub(crate) struct CtlState {
+    pub(crate) yielded: bool,
+    pub(crate) quit: bool,
+    pub(crate) finish: bool,
+    pub(crate) checkpoint: Option<Checkpoint>,
 }
 
 /// The job's control state, shared by the agent's line reader and the job.
 #[derive(Default)]
 pub struct Control {
-    s: Mutex<CtlState>,
-    cv: Condvar,
+    pub(crate) s: Mutex<CtlState>,
+    pub(crate) cv: Condvar,
 }
 
 impl Control {
@@ -120,7 +120,7 @@ impl Control {
     }
 }
 
-enum Req {
+pub(crate) enum Req {
     Eval(Batch),
     Release(Sender<()>),
     Restore(Sender<Result<(), String>>),
@@ -133,7 +133,7 @@ enum Req {
 /// The evaluator thread's handle (the agent's yield / resume reach it too).
 #[derive(Clone)]
 pub struct EvalLink {
-    tx: Sender<Req>,
+    pub(crate) tx: Sender<Req>,
 }
 
 impl EvalLink {
@@ -301,8 +301,8 @@ pub fn ranges(gids: &[u32]) -> Vec<(u32, u32)> {
 
 /// The job's evaluator; a network with a reference set first passes the self-test (`selftest`: the
 /// event, and an error - the job's end - if it fails: a worker never plays with an evaluator that
-/// doesn't answer as torch does).
-fn build_eval(kind: &EvalKind, want: &Expect, sink: &dyn Sink, progress: &Mutex<Progress>) -> Result<Box<dyn Evaluator>, String> {
+/// doesn't answer as torch does). `gen`: the network's generation in an eval job (the event names it).
+pub(crate) fn build_eval(kind: &EvalKind, want: &Expect, sink: &dyn Sink, progress: &Mutex<Progress>, gen: Option<u32>) -> Result<Box<dyn Evaluator>, String> {
     Ok(match kind {
         EvalKind::Uniform => Box::new(Uniform),
         EvalKind::Onnx { model, ort, sha256, reference } => {
@@ -321,17 +321,29 @@ fn build_eval(kind: &EvalKind, want: &Expect, sink: &dyn Sink, progress: &Mutex<
                     ev.run_s = 0.0;
                     ev.batch_ms.clear();
                     let max_abs = if st.max_abs.is_finite() { json!(st.max_abs) } else { json!("inf") };
-                    sink.event(json!({"ev": "selftest", "provider": "cpu", "max_abs": max_abs, "ok": st.ok, "rows": st.rows,
+                    let mut ev_line = json!({"ev": "selftest", "provider": "cpu", "max_abs": max_abs, "ok": st.ok, "rows": st.rows,
                                       "items": {"priors": st.items[0], "value": st.items[1], "margin": st.items[2], "aux": st.items[3]},
-                                      "seconds": (t0.elapsed().as_secs_f64() * 1000.0).round() / 1000.0}));
+                                      "seconds": (t0.elapsed().as_secs_f64() * 1000.0).round() / 1000.0});
+                    if let Some(g) = gen {
+                        ev_line["gen"] = json!(g);
+                    }
+                    sink.event(ev_line);
                     progress.lock().unwrap().selftest_max_abs = Some(st.max_abs);
                     if !st.ok {
                         return Err(format!(
-                            "selftest failed: the network's answers on this machine differ from torch's by {:e} (> {:e}; priors {:e}, value {:e}, margin {:e}, aux {:e}) on {} reference rows ({}): not playing with this evaluator",
-                            st.max_abs, crate::selftest::TOL, st.items[0], st.items[1], st.items[2], st.items[3], st.rows, r.display()
+                            "selftest failed{}: the network's answers on this machine differ from torch's by {:e} (> {:e}; priors {:e}, value {:e}, margin {:e}, aux {:e}) on {} reference rows ({}): not playing with this evaluator",
+                            gen.map_or(String::new(), |g| format!(" (gen {g})")),
+                            st.max_abs,
+                            crate::selftest::TOL,
+                            st.items[0],
+                            st.items[1],
+                            st.items[2],
+                            st.items[3],
+                            st.rows,
+                            r.display()
                         ));
                     }
-                    sink.log(&format!("selftest passed: max abs {:e} on {} rows ({})", st.max_abs, st.rows, r.display()));
+                    sink.log(&format!("selftest passed{}: max abs {:e} on {} rows ({})", gen.map_or(String::new(), |g| format!(" (gen {g})")), st.max_abs, st.rows, r.display()));
                 }
                 None => sink.log("no reference set: the self-test is skipped"),
             }
@@ -341,7 +353,8 @@ fn build_eval(kind: &EvalKind, want: &Expect, sink: &dyn Sink, progress: &Mutex<
 }
 
 /// The evaluator thread: answers in the order asked.
-fn spawn_eval(mut ev: Box<dyn Evaluator>) -> (EvalLink, Receiver<(u64, Result<Answer, String>, f64)>, std::thread::JoinHandle<()>) {
+#[allow(clippy::type_complexity)]
+pub(crate) fn spawn_eval(mut ev: Box<dyn Evaluator>) -> (EvalLink, Receiver<(u64, Result<Answer, String>, f64)>, std::thread::JoinHandle<()>) {
     let (tx, rx) = channel::<Req>();
     let (atx, arx) = channel();
     let h = std::thread::Builder::new()
@@ -376,7 +389,7 @@ fn spawn_eval(mut ev: Box<dyn Evaluator>) -> (EvalLink, Receiver<(u64, Result<An
 }
 
 /// The recorded network batches (`tools/onnx_record.py`'s npz).
-struct Recorder {
+pub(crate) struct Recorder {
     path: PathBuf,
     max: usize,
     batches: usize,
@@ -394,10 +407,10 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn new(path: PathBuf, max: usize) -> Recorder {
+    pub(crate) fn new(path: PathBuf, max: usize) -> Recorder {
         Recorder { path, max, batches: 0, xs_off: vec![0], xs_idx: vec![], xs_val: vec![], n_players: vec![], player: vec![], gid: vec![], extra: vec![], opt_off: vec![0], opt_action: vec![], batch_off: vec![0], ids: vec![] }
     }
-    fn add(&mut self, b: &Batch) {
+    pub(crate) fn add(&mut self, b: &Batch) {
         if self.batches >= self.max {
             return;
         }
@@ -420,7 +433,7 @@ impl Recorder {
         self.ids.push(b.id as i64);
         self.batches += 1;
     }
-    fn write(&self, meta: &Value) -> Result<(), String> {
+    pub(crate) fn write(&self, meta: &Value) -> Result<(), String> {
         let f32n = |v: &[f32]| Npy { descr: "<f4".into(), shape: vec![v.len()], data: v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let u8n = |v: &[u8]| Npy { descr: "|u1".into(), shape: vec![v.len()], data: v.to_vec() };
         let members = vec![
@@ -643,7 +656,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let cfg = job_driver_cfg(game, job)?;
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
     let want = Expect { game: info.name.to_string(), features: info.num_features, actions: info.num_actions, aux_width: info.aux.iter().map(|a| a.1).sum(), belief, sha256: None };
-    let ev = build_eval(&job.eval, &want, sink, &progress)?;
+    let ev = build_eval(&job.eval, &want, sink, &progress, None)?;
     sink.log(&format!("job {}: {} games from gid {}, seed {}, net {}; driver: conc {}, threads {}, groups {}, sparse; evaluator: {}", job.lease_id, job.games, job.gid_base, job.seed, job.net, cfg.concurrency, cfg.threads, cfg.groups, ev.describe()));
     {
         let mut p = progress.lock().unwrap();
@@ -685,7 +698,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
                 let new = build_eval(&EvalKind::Onnx { model: c.model.clone(), ort: match &r.job.eval {
                     EvalKind::Onnx { ort, .. } => ort.clone(),
                     EvalKind::Uniform => return Err("checkpoint: a uniform-evaluator job has no network to switch".into()),
-                }, sha256: c.sha256.clone(), reference: c.reference.clone() }, &r.want, r.sink, &r.progress)?;
+                }, sha256: c.sha256.clone(), reference: c.reference.clone() }, &r.want, r.sink, &r.progress, None)?;
                 let (t, rx) = channel();
                 r.link.tx.send(Req::Swap(new, t)).map_err(|_| "the evaluator thread is gone".to_string())?;
                 let _ = rx.recv();

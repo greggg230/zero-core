@@ -29,6 +29,7 @@ Needs onnx, onnxscript and onnxruntime (CPU build); nothing on a run's path impo
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -159,13 +160,67 @@ def absent_nan(model, rows):
 
 
 # ---------------------------------------------------------------- answers
+# The exact exponential of the generic step's softmax (the native worker's `eval::exp_f32`, zero-farm
+# docs/az.md 42.2): exp of a float32 through a fixed sequence of float64 IEEE operations - Cody-Waite
+# reduction by ln 2, the Taylor polynomial of degree 13 by Horner, an exact scaling by 2^n, one rounding to
+# float32 - with no libm and no fused multiply-add, so numpy here and the Rust worker on any machine compute
+# the same bits (numpy's float32 `exp` and the C library's `expf` differ in the last bit now and then, and a
+# prior's last bit can change a searched move). Its error before the rounding is ~5e-16 relative.
+_INV_LN2 = 1.4426950408889634
+_LN2_HI = 0.6931471803691238                       # fdlibm's ln2_hi: n * _LN2_HI exact for |n| < 2^21
+_LN2_LO = 1.9082149292705877e-10
+_EXP_C = tuple(1.0 / math.factorial(k) for k in range(14))
+
+
+def exp_f32(d):
+    """exp(d) for max-subtracted float32 logits d <= 0 -> float32 (the worker's `exp_f32`, bit for bit): NaN
+    stays NaN, below -150 it is 0."""
+    d = np.asarray(d, np.float32)
+    x = d.astype(np.float64)
+    nan = np.isnan(x)
+    low = x < -150.0
+    x = np.where(nan | low, 0.0, x)
+    n = np.floor(x * _INV_LN2 + 0.5)
+    r = (x - n * _LN2_HI) - n * _LN2_LO
+    p = np.full_like(r, _EXP_C[13])
+    for c in reversed(_EXP_C[:13]):
+        p = p * r + c
+    y = np.ldexp(p, n.astype(np.int64)).astype(np.float32)
+    y[low] = 0.0
+    y[nan] = np.nan
+    return y
+
+
+def exact_softmax(logits, off):
+    """The generic step's softmax of a flat float32 array over the segments of `off` (empty segments hold
+    nothing), the native worker's `softmax_exact` bit for bit: per segment m = the largest logit (NaN
+    propagates), e = `exp_f32(l - m)` (the difference in float32), their float32 sum in order (not numpy's
+    pairwise sum), e / sum in float32."""
+    off = np.asarray(off, np.int64)
+    lg = np.asarray(logits, np.float32)
+    cnt = np.diff(off)
+    starts = off[:-1]
+    keep = cnt > 0
+    cnt, starts = cnt[keep], starts[keep]
+    if not len(cnt):
+        return np.zeros(0, np.float32)
+    mx = np.maximum.reduceat(lg, starts)
+    e = exp_f32(lg - np.repeat(mx, cnt))
+    s = np.zeros(len(cnt), np.float32)
+    for j in range(int(cnt.max())):
+        k = np.flatnonzero(cnt > j)
+        s[k] = s[k] + e[starts[k] + j]
+    return (e / np.repeat(s, cnt)).astype(np.float32)
+
+
 def answer(outs, rows):
     """The worker's generic step on the graph's outputs (policy, value, margin, aux) -> what an evaluator
-    returns: (priors [options] - each row's legal logits softmaxed per segment, float32 -, value [B, 8],
-    margin [B, 8]) plus the belief rows' auxiliary answers when the batch has belief rows."""
+    returns: (priors [options] - each row's legal logits softmaxed per segment, float32, `exact_softmax`: the
+    native worker's bits -, value [B, 8], margin [B, 8]) plus the belief rows' auxiliary answers when the batch
+    has belief rows."""
     policy, value, margin, aux = outs
     r = np.repeat(np.arange(rows.B), np.diff(rows.opt_off))
-    pri = segment_softmax_np(policy[r, rows.opt_action], rows.opt_off)
+    pri = exact_softmax(policy[r, rows.opt_action], rows.opt_off)
     br = belief_rows(rows.extra)
     out = (pri, value, margin)
     return out + (aux[br],) if len(br) else out

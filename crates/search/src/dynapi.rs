@@ -674,6 +674,8 @@ pub trait DynDriver: Send + Sync {
     fn pending(&self) -> usize;
     fn enqueue(&mut self, tag: &str, spec: &str) -> Result<(), String>;
     fn queued(&self) -> usize;
+    /// Drop the queued setups not started yet (`Driver::clear_queue`) -> how many.
+    fn clear_queue(&mut self) -> usize;
     fn stats(&self) -> DriverStats;
     fn in_flight(&self) -> InFlight;
     /// Evaluator keys in index order, and whether each is external.
@@ -731,6 +733,9 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     }
     fn queued(&self) -> usize {
         Driver::queued(self)
+    }
+    fn clear_queue(&mut self) -> usize {
+        Driver::clear_queue(self)
     }
     fn stats(&self) -> DriverStats {
         Driver::stats(self)

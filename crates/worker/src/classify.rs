@@ -6,8 +6,15 @@
 //! Classes: `play` (read by the worker and supported), `trainer` (deliberately unused by a self-play
 //! worker), `python_only` (play-affecting, implemented in Python only: unsupported unless off),
 //! `param` (a setting of a python_only switch: unused while it is off), and the game's own
-//! `aux_<target>_w` (play) / `reader_<target>` (trainer) for its auxiliary targets. A key in no
-//! class is unknown. Unknown keys and python_only switches that are on make the check fail.
+//! `aux_<target>_w` (play) / `reader_<target>` (trainer) for its auxiliary targets, and the game
+//! package's own run settings (zero-core `GamePackage.settings`, docs/az.md 40; the worker binary lists
+//! them with their classes: `Worker::package_settings`). A key in no class is unknown. Unknown keys and
+//! python_only switches that are on make the check fail.
+//!
+//! An eval job (`classify_eval`, docs/az.md 42.2) reads only the settings of an evaluation match
+//! (`settings::EVAL_READS`: `Run.nn_seat(key, eval_sims)` and `Run.driver` of a match): those are `play`,
+//! every other known setting `trainer` (unused by the job, whatever its value: a self-play feature that is
+//! Python-only does not change an evaluation's games), unknown keys unknown.
 use serde_json::Value;
 use zero_search::dynapi::GameInfo;
 
@@ -15,6 +22,10 @@ use crate::pyjson::PyJson;
 use crate::settings::{truthy, Settings};
 
 pub const TABLE: &str = include_str!("run_settings.json");
+
+/// A game package's own run settings (zero-core `GamePackage.settings`): (name, class, why), class `play`,
+/// `trainer`, `python_only` or `param:<its switch>` (the table's classes).
+pub type PackageSettings = &'static [(&'static str, &'static str, &'static str)];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Class {
@@ -70,7 +81,25 @@ pub struct Verdict {
 /// registers (a game package's settings `aux_<t>_w` / `reader_<t>` exist for every game's targets:
 /// another game's are harmless while off - Python ignores them - and refused when on).
 pub fn classify(c: &Settings, info: &GameInfo, others: &[GameInfo]) -> Result<Vec<Verdict>, String> {
-    let (keys, pats) = table()?;
+    classify_with(c, info, others, &[])
+}
+
+/// `classify` with the game package's own settings.
+pub fn classify_with(c: &Settings, info: &GameInfo, others: &[GameInfo], package: PackageSettings) -> Result<Vec<Verdict>, String> {
+    let (mut keys, pats) = table()?;
+    for (k, cl, why) in package {
+        if keys.iter().any(|e| e.0 == *k) {
+            return Err(format!("the game package's setting {k} is a zero-core run setting too"));
+        }
+        let class = match *cl {
+            "play" => Class::Play,
+            "trainer" => Class::Trainer,
+            "python_only" => Class::PythonOnly,
+            p if p.starts_with("param:") => Class::Param(p[6..].to_string()),
+            other => return Err(format!("the game package's setting {k}: class {other:?}")),
+        };
+        keys.push((k.to_string(), Entry { class, why: format!("the game package's: {why}") }));
+    }
     let mut out = Vec::new();
     let null = PyJson::Null;
     for k in c.keys() {
@@ -114,6 +143,24 @@ pub fn classify(c: &Settings, info: &GameInfo, others: &[GameInfo]) -> Result<Ve
     Ok(out)
 }
 
+/// Every setting of `c` for an eval job (module docs): the settings an evaluation match reads are `play`,
+/// every other known one `trainer` (unused), unknown keys and another game's settings as `classify` says.
+pub fn classify_eval(c: &Settings, info: &GameInfo, others: &[GameInfo], package: PackageSettings) -> Result<Vec<Verdict>, String> {
+    let mut v = classify_with(c, info, others, package)?;
+    for x in &mut v {
+        if crate::settings::EVAL_READS.contains(&x.key.as_str()) {
+            if x.status != "unsupported" {
+                x.status = "play";
+                x.why = "read by an evaluation match (Run.nn_seat(key, eval_sims), Run.driver of a match)".into();
+            }
+        } else if matches!(x.status, "play" | "trainer" | "off" | "unsupported") && !(x.key == "game" && x.status == "unsupported") {
+            x.why = format!("not read by an evaluation match ({})", x.why);
+            x.status = "trainer";
+        }
+    }
+    Ok(v)
+}
+
 /// The failing verdicts (unknown keys, python_only switches on).
 pub fn failures(v: &[Verdict]) -> Vec<&Verdict> {
     v.iter().filter(|x| matches!(x.status, "unknown" | "unsupported")).collect()
@@ -147,7 +194,17 @@ mod tests {
         assert_eq!(st, vec![("game", "play"), ("sims", "play"), ("lr", "trainer"), ("selfplay_league", "off"), ("selfplay_league_pool", "off"), ("resolver", "unsupported"), ("aux_deck_w", "play"), ("reader_deck", "trainer"), ("aux_hand_w", "unsupported"), ("bogus", "unknown")]);
         assert_eq!(failures(&v).len(), 3);
         let c = Settings::parse(r#"{"game": "t", "aux_hand_w": 0.0, "aux_cards_w": 0.0}"#).unwrap();
-        let st: Vec<&str> = classify(&c, &info, &[other]).unwrap().iter().map(|x| x.status).collect();
+        let st: Vec<&str> = classify(&c, &info, &[other.clone()]).unwrap().iter().map(|x| x.status).collect();
         assert_eq!(st, vec!["play", "off", "unknown"]);
+        // a game package's own settings; an eval job's reading of the same settings
+        const PKG: PackageSettings = &[("deck_every", "python_only", "a self-play spec hook"), ("deck_window", "param:deck_every", "its window"), ("real_games", "trainer", "an extra evaluation")];
+        let c = Settings::parse(r#"{"game": "t", "sims": 4, "eval_sims": 8, "eval_select": "cq", "selfplay_league": 0.5, "resolver": "x", "deck_every": 2, "deck_window": 4, "real_games": 1, "aux_deck_w": 0.5, "bogus": 1}"#).unwrap();
+        let vv = classify_with(&c, &info, &[other.clone()], PKG).unwrap();
+        let st: Vec<(&str, &str)> = vv.iter().map(|x| (x.key.as_str(), x.status)).collect();
+        assert_eq!(st, vec![("game", "play"), ("sims", "play"), ("eval_sims", "trainer"), ("eval_select", "trainer"), ("selfplay_league", "unsupported"), ("resolver", "unsupported"), ("deck_every", "unsupported"), ("deck_window", "off"), ("real_games", "trainer"), ("aux_deck_w", "play"), ("bogus", "unknown")]);
+        let vv = classify_eval(&c, &info, &[other], PKG).unwrap();
+        let st: Vec<(&str, &str)> = vv.iter().map(|x| (x.key.as_str(), x.status)).collect();
+        assert_eq!(st, vec![("game", "play"), ("sims", "trainer"), ("eval_sims", "play"), ("eval_select", "play"), ("selfplay_league", "trainer"), ("resolver", "trainer"), ("deck_every", "trainer"), ("deck_window", "trainer"), ("real_games", "trainer"), ("aux_deck_w", "trainer"), ("bogus", "unknown")]);
+        assert!(classify_with(&c, &info, &[], &[("sims", "play", "x")]).is_err());
     }
 }

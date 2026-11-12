@@ -2328,6 +2328,14 @@ impl<G: SearchGame> Driver<G> {
         self.queue.len()
     }
 
+    /// Drop every queued setup not started yet -> how many (docs/search.md 2.14: a native worker's eval job
+    /// asked to finish starts no new game; the games in flight play on). Nothing else changes.
+    pub fn clear_queue(&mut self) -> usize {
+        let n = self.queue.len();
+        self.queue.clear();
+        n
+    }
+
     pub fn take_samples(&mut self) -> Vec<Record> {
         self.emitted += self.samples.len() as u64;
         std::mem::take(&mut self.samples)

@@ -9,7 +9,7 @@ worker), and the Python reference of the native worker's evaluator (zero-farm pa
 A batch's rows go to the graph as CSR (`x_ptr` / `x_idx` / `x_val`; a dense batch's non-zeros are taken),
 batches over `chunk` rows in pieces of at most `chunk` rows grouped by non-zero count
 (`onnx_parity.run_chunked`), then `onnx_parity.answer`: each row's legal logits softmaxed per segment in
-float32 (max subtracted), value and margin as the graph gives them, the root belief rows' auxiliary
+float32 (`onnx_parity.exact_softmax`: the native worker's bits), value and margin as the graph gives them, the root belief rows' auxiliary
 outputs (a graph without the head refuses such a batch: net.HeadMissing). Session: CPU EP, `threads`
 intra-op threads, inter-op 1, sequential, all graph optimizations (the native worker's). `expect`
 checks the graph's metadata as the native worker does (game, features, actions).

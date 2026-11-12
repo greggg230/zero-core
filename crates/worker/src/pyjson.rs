@@ -111,11 +111,18 @@ impl PyJson {
     /// Python's `json.dumps(self)` (its default arguments).
     pub fn dumps(&self) -> String {
         let mut s = String::new();
-        self.dump_into(&mut s);
+        self.dump_into(&mut s, ", ", ": ");
         s
     }
 
-    fn dump_into(&self, s: &mut String) {
+    /// Python's `json.dumps(self, separators=(',', ':'))`.
+    pub fn dumps_compact(&self) -> String {
+        let mut s = String::new();
+        self.dump_into(&mut s, ",", ":");
+        s
+    }
+
+    fn dump_into(&self, s: &mut String, item: &str, kv: &str) {
         match self {
             PyJson::Null => s.push_str("null"),
             PyJson::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
@@ -128,9 +135,9 @@ impl PyJson {
                 s.push('[');
                 for (i, x) in v.iter().enumerate() {
                     if i > 0 {
-                        s.push_str(", ");
+                        s.push_str(item);
                     }
-                    x.dump_into(s);
+                    x.dump_into(s, item, kv);
                 }
                 s.push(']');
             }
@@ -138,11 +145,11 @@ impl PyJson {
                 s.push('{');
                 for (i, (k, x)) in v.iter().enumerate() {
                     if i > 0 {
-                        s.push_str(", ");
+                        s.push_str(item);
                     }
                     dump_str(k, s);
-                    s.push_str(": ");
-                    x.dump_into(s);
+                    s.push_str(kv);
+                    x.dump_into(s, item, kv);
                 }
                 s.push('}');
             }
@@ -227,5 +234,7 @@ mod tests {
         // (Python: json.dumps(json.loads(that)) - ensure_ascii escapes, a surrogate pair beyond the BMP)
         let want = "{\"sealed\": {\"set\": \"eoe\", \"best_share\": 0.5, \"n\": [1, 2.0, true, null]}, \"max_turns\": 60, \"\\u00e9\": \"\\u00fc\\n\\ud834\\udd1e\"}";
         assert_eq!(j.dumps(), want);
+        // (json.dumps(..., separators=(',', ':')))
+        assert_eq!(PyJson::parse(r#"{"a": [1, 2.5, {"b": null}], "c": "x"}"#).unwrap().dumps_compact(), r#"{"a":[1,2.5,{"b":null}],"c":"x"}"#);
     }
 }
