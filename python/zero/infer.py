@@ -393,6 +393,10 @@ class TokenGraphRunner:
             # a padded tail entry: row 0, the first tail segment, slot its head count, floats 0
             self.pad_seg = model.tails[0] if model.tails else 0
             self.pad_slot = int(self.seg_count[self.pad_seg])
+            # the layout's tables `_check_ov_host` reads, on the host once (a read of the device's per batch would wait
+            # for the graphs in flight)
+            self.seg_nk = model.seg_nk.cpu().numpy()
+            self.pos_seg = model.pos_seg.cpu().numpy()
             self.tinp = None                         # shared device inputs of the tails / overrides
             self.tbufs = {}                          # pinned host tails / overrides per buffer set
 
@@ -446,18 +450,17 @@ class TokenGraphRunner:
 
     def _tinputs(self, NTp, NOp):
         """The shared device inputs of tails and overrides, at least NTp / NOp entries (a graph keeps views
-        of the ones it was captured with, as of `_inputs`')."""
+        of the ones it was captured with, as of `_inputs`'): the tail's integers [3 * entries] (a graph of NTp
+        entries: its rows, segments, slots in turn - one upload), its floats [entries, Wt], the overrides'
+        integers [4 * entries] (rows, actions, refs, columns in turn)."""
         ti = self.tinp
         if ti is None or ti[0] < NTp or ti[1] < NOp:
             ct = max(NTp, 256, ti[0] if ti else 0)
             co = max(NOp, 256, ti[1] if ti else 0)
             L, dev = torch.long, self.dev
             with torch.inference_mode(False):
-                self.tinp = (ct, co,
-                             {'row': torch.zeros(ct, dtype=L, device=dev), 'seg': torch.zeros(ct, dtype=L, device=dev),
-                              'slot': torch.zeros(ct, dtype=L, device=dev),
-                              'val': torch.zeros((ct, self.Wt), device=dev)},
-                             {k: torch.zeros(co, dtype=L, device=dev) for k in ('row', 'act', 'ref', 'col')})
+                self.tinp = (ct, co, torch.zeros(3 * ct, dtype=L, device=dev), torch.zeros((ct, self.Wt), device=dev),
+                             torch.zeros(4 * co, dtype=L, device=dev))
         return self.tinp
 
     def _pad_inputs(self, tail, ov):
@@ -480,11 +483,14 @@ class TokenGraphRunner:
         if g is None:
             _, X, N, FULL, NT = self._inputs(Bp)
             x, n, full, ntok = X[:Bp], N[:Bp], FULL[:Bp * Tp].view(Bp, Tp), NT[:Bp]
-            tail = ov = None
+            tail = ov = tint = oint = None
             if NTp is not None:                      # (a network with tails or overrides, docs/az.md 43.7)
-                _, _, TI, OI = self._tinputs(NTp, NOp)
-                tail = {k: v[:NTp] for k, v in TI.items()} if self.net.tails else None
-                ov = {k: v[:NOp] for k, v in OI.items()} if self.net.option_pointers else None
+                _, _, TI, TV, OI = self._tinputs(NTp, NOp)
+                tint, oint = TI[:3 * NTp], OI[:4 * NOp]
+                if self.net.tails:
+                    tail = {'row': tint[:NTp], 'seg': tint[NTp:2 * NTp], 'slot': tint[2 * NTp:], 'val': TV[:NTp]}
+                if self.net.option_pointers:
+                    ov = {k: oint[i * NOp:(i + 1) * NOp] for i, k in enumerate(('row', 'act', 'ref', 'col'))}
             with torch.inference_mode(False), torch.no_grad():
                 full.zero_()
                 ntok.fill_(1)
@@ -498,7 +504,7 @@ class TokenGraphRunner:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
                     out, aux = self._run(x, n, full, ntok, tail, ov)
-            g = self.graphs[key] = (graph, x, n, full, ntok, out, aux) + (() if NTp is None else (tail, ov))
+            g = self.graphs[key] = (graph, x, n, full, ntok, out, aux) + (() if NTp is None else (tail, ov, tint, oint))
             self.captures += 1
         return g
 
@@ -690,8 +696,7 @@ class TokenGraphRunner:
         the column one its segment has, ref -1 or a token, the action in [0, actions]."""
         r, a, ref, col = (np.asarray(res[k], np.int64) for k in ('row', 'act', 'ref', 'col'))
         n_tok = self.n_tok
-        nk = self.net.seg_nk.cpu().numpy()
-        pos_seg = self.net.pos_seg.cpu().numpy()
+        nk, pos_seg = self.seg_nk, self.pos_seg
         bad = (ref < -1) | (ref == 0) | (ref >= n_tok + NT) | (r < 0) | (r >= B) | (a < 0) | (a > self.A) | (col < 0)
         rc = np.clip(r, 0, B - 1)
         hd = (ref > 0) & (ref < n_tok)
@@ -712,13 +717,13 @@ class TokenGraphRunner:
     def _tbuf(self, key, NTp, NOp):
         """A buffer set's pinned host tails / overrides (reused with the set: after its launch's result)."""
         b = self.tbufs.get(key)
-        if b is None or b['row'].shape[0] < NTp or b['orow'].shape[0] < NOp:
-            ct = max(NTp, 256, 0 if b is None else b['row'].shape[0])
-            co = max(NOp, 256, 0 if b is None else b['orow'].shape[0])
+        if b is None or b['val'].shape[0] < NTp or b['oint'].shape[0] < 4 * NOp:
+            ct = max(NTp, 256, 0 if b is None else b['val'].shape[0])
+            co = max(NOp, 256, 0 if b is None else b['oint'].shape[0] // 4)
             with torch.inference_mode(False):
-                b = self.tbufs[key] = {k: torch.empty(ct, dtype=torch.int64).pin_memory() for k in ('row', 'seg', 'slot')}
-                b['val'] = torch.empty((ct, self.Wt), dtype=torch.float32).pin_memory()
-                b.update({k: torch.empty(co, dtype=torch.int64).pin_memory() for k in ('orow', 'act', 'ref', 'col')})
+                b = self.tbufs[key] = {'tint': torch.empty(3 * ct, dtype=torch.int64).pin_memory(),
+                                       'val': torch.empty((ct, self.Wt), dtype=torch.float32).pin_memory(),
+                                       'oint': torch.empty(4 * co, dtype=torch.int64).pin_memory()}
         return b
 
     def _launch_tails(self, x, sp, n_players, opt_off, opt_action, brows, tail, ov):
@@ -849,7 +854,7 @@ class TokenGraphRunner:
             slot, (_, pin_n, pin_full, pin_ntok, pin_out, pin_aux, pin_b, pin_fi, pin_val) = self._sslot(Bp, nnz)
             key = ('s', slot)
         tb = self._tbuf(key, NTp, NOp)
-        graph, xs, ns, fs, ts_, out, aux, tin, oin = self._graph(Bp, Tp, NTp, NOp)
+        graph, xs, ns, fs, ts_, out, aux, tin, oin, tint, oint = self._graph(Bp, Tp, NTp, NOp)
         if x is not None:
             self._copy_rows(x, P, pin_x[:B].numpy())
         else:
@@ -867,18 +872,18 @@ class TokenGraphRunner:
         if nb:
             pin_b[:nb].numpy()[:] = brows
         if tin is not None and NTp:
-            for k, v, pad in (('row', tr, 0), ('seg', ts, self.pad_seg), ('slot', tsl, self.pad_slot)):
-                a = tb[k][:NTp].numpy()
-                a[:NT] = v
-                a[NT:] = pad
+            a = tb['tint'][:3 * NTp].numpy().reshape(3, NTp)       # (the graph's rows, segments, slots in turn)
+            for i, (v, pad) in enumerate(((tr, 0), (ts, self.pad_seg), (tsl, self.pad_slot))):
+                a[i, :NT] = v
+                a[i, NT:] = pad
             a = tb['val'][:NTp].numpy()
             a[:NT] = tv
             a[NT:] = 0.0
         if oin is not None and NOp:
-            for k, kk, pad in (('row', 'orow', 0), ('act', 'act', self.A), ('ref', 'ref', -1), ('col', 'col', 0)):
-                a = tb[kk][:NOp].numpy()
-                a[:NO] = res[k]
-                a[NO:] = pad
+            a = tb['oint'][:4 * NOp].numpy().reshape(4, NOp)       # (rows, actions, refs, columns in turn)
+            for i, (k, pad) in enumerate((('row', 0), ('act', self.A), ('ref', -1), ('col', 0))):
+                a[i, :NO] = res[k]
+                a[i, NO:] = pad
         with torch.inference_mode(False):
             if x is not None:
                 xs[:B].copy_(pin_x[:B], non_blocking=True)
@@ -892,11 +897,10 @@ class TokenGraphRunner:
             fs.view(-1).copy_(pin_full[:Bp * Tp], non_blocking=True)
             ts_.copy_(pin_ntok[:Bp], non_blocking=True)
             if tin is not None and NTp:
-                for k in ('row', 'seg', 'slot', 'val'):
-                    tin[k].copy_(tb[k][:NTp], non_blocking=True)
+                tint.copy_(tb['tint'][:3 * NTp], non_blocking=True)
+                tin['val'].copy_(tb['val'][:NTp], non_blocking=True)
             if oin is not None and NOp:
-                for k, kk in (('row', 'orow'), ('act', 'act'), ('ref', 'ref'), ('col', 'col')):
-                    oin[k].copy_(tb[kk][:NOp], non_blocking=True)
+                oint.copy_(tb['oint'][:4 * NOp], non_blocking=True)
             graph.replay()
             pin_out[:B].copy_(out[:B], non_blocking=True)
             if nb:

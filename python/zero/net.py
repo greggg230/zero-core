@@ -1543,6 +1543,9 @@ class TokenNet(nn.Module):
         NT, NO = self._tail_args(tail, ov)
         # (tails / overrides: their checks and the explicit attention's decision first, one host sync before this
         # forward queues its work - the device then waits only for what came before it: docs/az.md 43.9)
+        side = self._side_stream(x) if NT or NO else None
+        if side is not None:
+            return self._static_side(x, n_players, full, ntok, aux, tail, ov, NT, NO, side)
         prep = self._static_prep(B, full, ntok, tail, ov, NT, NO) if NT or NO else None
         rraw = ent = None
         if self.readers is not None:
@@ -1573,6 +1576,71 @@ class TokenNet(nn.Module):
         idt = torch.cat(ids, 1).gather(1, full) if ids is not None else None
         z, pol = self._trunk(h, ntok, full, idt)
         return self._heads(z, pol, n_players, aux, None, rraw)
+
+    def _seg_major(self, dev):
+        """Per head position of the full token axis (int64 [n_tok] each, on `dev`, built once per device: an attribute,
+        not a buffer): the slots of the token tensors before its segment's (the global token's 1 first), its segment's
+        count, its slot - `_static_ext`'s places in the token tensors flattened in turn."""
+        cache = getattr(self, '_segmaj', None)
+        if cache is None or cache[0] != dev:
+            cum, cnt, slot, before = [0], [1], [0], 1
+            for s in self.segs:
+                k = s['count']
+                cum += [before] * k
+                cnt += [k] * k
+                slot += list(range(k))
+                before += k
+            cache = self._segmaj = (dev,) + tuple(torch.tensor(v, dtype=torch.long, device=dev) for v in (cum, cnt, slot))
+        return cache[1:]
+
+    def _side_stream(self, x):
+        """`_static_side`'s second stream (inference on CUDA: no gradients), one per device; None otherwise."""
+        if not x.is_cuda or torch.is_grad_enabled():
+            return None
+        cache = getattr(self, '_side', None)
+        if cache is None or cache[0] != x.device:
+            cache = self._side = (x.device, torch.cuda.Stream(x.device))
+        return cache[1]
+
+    def _static_side(self, x, n_players, full, ntok, aux, tail, ov, NT, NO, side):
+        """`forward_static` of a batch with tail tokens or overrides in inference on CUDA (the graphs; docs/az.md 43.11):
+        the work beside the head slots' input maps - the inputs' checks and maps (`_static_prep`), the tail's embedding,
+        the global token, the slots' identities: many small kernels, each of which would hold the device alone - on a
+        second stream while the head slots' maps run on this one, joined before the tokens are gathered. The same
+        kernels on the same inputs, each tensor's operations in the same order: `forward_static`'s values, bit for
+        bit."""
+        B = x.shape[0]
+        main = torch.cuda.current_stream(x.device)
+        rraw = ent = None
+        if self.readers is not None:
+            rraw, ent = _read(self, x)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            prep = self._static_prep(B, full, ntok, tail, ov, NT, NO)
+            if NT:
+                prep['temb'] = self._tail_embed(prep['tailc'], static=True)
+        g = self._global(x, ent)
+        ident = self._static_identities(x)
+        maps, start = [], 1
+        for j, (s, lin) in enumerate(zip(self.segs, self.seg_in)):
+            o, k, w = s['offset'], s['count'], s['width']
+            if not k:                                # (a tail-only segment: no head slots)
+                continue
+            maps.append((j, lin(x[:, o:o + k * w].reshape(B, k, w)) + self.pos[start:start + k]))
+            start += k
+        main.wait_stream(side)
+        toks = [(g + self.pos[0])[:, None]]
+        ids = [torch.full((B, 1), self.vocab, dtype=torch.long, device=x.device)] if self.n_id else None
+        for j, t in maps:
+            if self.segs[j]['id'] is not None:
+                i, e = ident[j]
+                t = t + e
+            else:
+                i = torch.full((B, self.segs[j]['count']), self.vocab, dtype=torch.long, device=x.device)
+            if ids is not None:
+                ids.append(i)
+            toks.append(t)
+        return self._static_ext(x, n_players, full, ntok, aux, tail, NT, toks, ids, rraw, prep)
 
     def _static_prep(self, B, full, ntok, tail, ov, NT, NO):
         """`forward_static`'s inputs of a batch with tail tokens or overrides, before anything else (docs/az.md 43.5):
@@ -1660,13 +1728,21 @@ class TokenNet(nn.Module):
         B, dev = x.shape[0], x.device
         n_tok, d, T = self.n_tok, self.d, full.shape[1]
         tl, tj = prep['tl'], prep['tj']
-        # the tokens: gathered from cat(every head slot [B * n_tok, d], the tail tokens [NT, d])
-        idx = torch.arange(B, device=dev)[:, None] * n_tok + full.clamp(0, n_tok - 1)
-        src = torch.cat(toks, 1).reshape(B * n_tok, d)
+        fc = full.clamp(0, n_tok - 1)
         if NT:
-            idx = torch.where(tl, B * n_tok + tj, idx)
+            # the tokens: gathered from cat(each segment's head slots [B * count, d] in turn - the global token's [B, d]
+            # first -, the tail tokens [NT, d]) by B * (the slots before the segment's) + b * count + slot (a head
+            # position) or B * n_tok + j (tail token j): one copy of the embeddings (docs/az.md 43.11)
+            cum, cnt, slot = self._seg_major(dev)
+            idx = torch.where(tl, B * n_tok + tj, B * cum[fc] + torch.arange(B, device=dev)[:, None] * cnt[fc] + slot[fc])
             # (the tail's segments clamped: a bad tail is refused at `_static_flags`, before the trunk)
-            src = torch.cat([src, self._tail_embed(prep['tailc'], static=True)])
+            temb = prep.get('temb')                  # (`_static_side`'s)
+            src = torch.cat([t.reshape(-1, d) for t in toks]
+                            + [self._tail_embed(prep['tailc'], static=True) if temb is None else temb])
+        else:
+            # (overrides only: cat(every head slot [B * n_tok, d]) by b * n_tok + p)
+            idx = torch.arange(B, device=dev)[:, None] * n_tok + fc
+            src = torch.cat(toks, 1).reshape(B * n_tok, d)
         h = src.index_select(0, idx.reshape(-1)).view(B, T, d)
         idt = None
         if ids is not None:
