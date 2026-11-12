@@ -5368,7 +5368,7 @@ a setting the worker cannot honour is refused loudly, and the worker is proven a
   job's games in all, `infer._drive_pipelined` with 2 batches in flight submitted in launch order, the evaluator on
   its own thread; yield / resume / finish / quit / checkpoint), `shard` (zero/data.py's format), `proto` (the CLI and
   zero-farm's agent<->worker protocol `aw/1`: `serve`). A game's worker binary is `zero_worker::main(GAMES, repo)`.
-* **`check-config`**: every `zero.run.DEFAULTS` key is `play` (51 keys: read and supported), `trainer` (86:
+* **`check-config`**: every `zero.run.DEFAULTS` key is `play` (49 keys: read and supported), `trainer` (85:
   training, evaluation, orchestration, Python inference, network shape - the network is the graph), `python_only`
   (the league, branched games, archive starts, co-training: refused unless off) or `param` (a python_only switch's
   settings); `aux_<target>_w` play, `reader_<target>` trainer; anything else is unknown and refused.
@@ -5406,3 +5406,26 @@ a setting the worker cannot honour is refused loudly, and the worker is proven a
   `OnnxEvaluator` priors <= 1.8e-7, value / margin / aux bit-identical; vs torch <= 1.34e-5 (margin); (c) behaviour:
   below. `tools/worker_serve_check.py`: aw/1 with eoe1 iter 80's graph, a yield after the first finished game and a
   resume 3 s later - the same shards byte for byte as the job left alone, `yielded` 31 ms after `yield`.
+
+**Measured** (2026-11-11, the desktop: i9-13900K, CPU only, 90-100% busy with the live Delver run and other agents'
+work; zero-farm docs/phase0b-worker.md has the tables).
+* **Throughput at 8 threads** (`tools/worker_bench.py`, eoe1's settings with threads 8, groups 2, conc 256,
+  torch_threads 1, infer_workers 1; the native side ONNX Runtime with 8 intra-op threads; 10 minutes per run,
+  interleaved, 2 rounds): native 1,368 / 1,281 leaves/s, Python remote worker (torch eager) 911 / 859 (rounds 0 / 1; the
+  CPU 92-100% busy) - **1.50x**, about 390 vs 260 games/h at 12,250 leaves an eoe1 game; the native worker is
+  inference-bound (its evaluator busy 592 of 599 s); peak working set 1.5 GB at conc 256.
+* **Gate 2 (c), behaviour** (`tools/onnx_h2h.py`: eoe1 iter 80's graph through onnxruntime against the checkpoint
+  through torch, CPU, 32 simulations, the evaluation seats, eoe1's evaluation spec, paired): 100 games in 74.7 min
+  (batches of 20 under a 60-minute budget, the fifth started at 58 min), A = the graph through onnxruntime (4 threads),
+  B = the checkpoint through torch: **0.500 +- 0.000** (paired se), pentanomial [0, 0, 50, 0, 0] - every pair split, no
+  result decided by the evaluator (95% bound on decided pairs 6%, |score - 0.5| < 0.03); mean margin -0.1, so not every
+  pair was played move for move alike, but no difference changed a result.
+* Session load 0.2-0.4 s; `yield` -> `yielded` 31 ms, `resume` 0.4 s; the binary (mtgz-worker.exe) 23.7 MB, ONNX Runtime
+  1.31.1's DLL 19.3 MB (+ the MSVC runtime: MSVCP140, VCRUNTIME140, VCRUNTIME140_1, ~0.9 MB).
+* **zero-core pytest** (venv, CUDA hidden; all 472 tests, in parts - the full run reached 347 of 469 in 117 min on the
+  loaded desktop, the rest and the files with failures ran again at eec96bc): every test passes or fails the same way on
+  the old code (f60664c) - 5 that need a GPU (CPU-only session), `test_a_dying_worker_gives_its_accepted_games_back`
+  (the same quota assertion alone, old and new), `test_graphs_match_eager_and_follow_new_weights` (flaky on both); 13
+  more failed only under the load (timeouts, phase caps) and passed alone or rerun. mtg-zero: pytest 271 passed, 1
+  skipped (`tests/test_worker_shards.py`: the worker's shards pass `RemotePlay._check` and load into `Window`), the
+  digests unchanged (53839c837bbaf034), `--test az` 48 passed.
