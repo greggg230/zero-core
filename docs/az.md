@@ -5382,8 +5382,8 @@ extended positions (0 the global token, 1 + ... the head slots, `n_tok + j` the 
 gathered from cat(every head slot [B * n_tok, d], the tail tokens [NT, d]); the tail embedding is a few dozen kernels
 whatever the number of tail segments (`_tail_embed_static`: every tail segment's input map on every token as one
 product - their weights in one zero-padded matrix -, every position map as one, each identity layout's digits decoded
-once, each token's own picked by its segment; a loop over the 13 tail segments of a v7-like layout cost a training
-step ~1,250 kernel launches, ~35 ms more on the desktop). Padded tail entries (row 0, the first tail segment, slot
+once, each token's own picked by its segment - one autograd node, 43.9; a loop over the 13 tail segments of a
+v7-like layout cost a training step ~1,250 kernel launches, ~35 ms more on the desktop). Padded tail entries (row 0, the first tail segment, slot
 its count, floats 0) and padded overrides (action `actions`, ref -1) are allowed. `present_index()` stays the head's.
 
 ### 43.6 Gates: new kinds of token, exactly inert at a widen (`gate`)
@@ -5400,8 +5400,9 @@ gated segment s) or 0 (padding):
 At g = 0 a gated token changes no other token, the pooling or any logit, exactly; it still attends as a query.
 **Paths:** without gated segments, today's bool-mask SDPA; with gated tokens present, SDPA with the float mask log w
 (-inf at 0) in inference and in training once every present gate is > 0, and an explicit math attention
-(`TBlock.forward_weighted`, the same formula) in training while a present gate is exactly 0 (SDPA's mask would give
-the gate no finite gradient there; one host sync decides). The static forward weighs every token whenever the
+(`TBlock.forward_weighted`, the same formula, one autograd node with its backward by hand: 43.9) in training while a
+present gate is exactly 0 (SDPA's mask would give the gate no finite gradient there; forward_static's flags decide,
+read without draining the device: 43.9). The static forward weighs every token whenever the
 network has gated segments and the batch has tail tokens (no data-dependent branch; with weights 0 / 1 the float mask
 is the bool mask's computation). At g = 0 the gate is the only parameter of its segment with a gradient (the
 segment's own maps get exactly none until it opens).
@@ -5451,7 +5452,8 @@ gates them anyway); the layout gaining `option_pointers` / `max_row_tokens`; `dr
 zero `ptr` rows. Refused: everything 10.3 refuses, plus a segment losing its tail or changing its gate or columns, a
 new segment with head slots or not at the end, the layout losing `option_pointers`, a limit below the head. A
 tail-only segment's pointer columns are a matrix product of their own (`TokenNet.ptr_parts`: rows of the same `ptr`),
-so a widened network computes the old columns by the products of before (one wider product rounded them differently).
+so a widened network computes the old columns by the products of before (one wider product rounded them differently);
+with gradients on (training) the head is one product (43.9).
 
 **Exactness** (`tests/test_tail_net.py`): a network of the toy's layout without tails widened onto the toy's tail
 layout (tail on items, option_pointers, the gated marks) computes the old outputs bit for bit (policy, value, margin,
@@ -5528,3 +5530,56 @@ loaded by three other sessions' test suites throughout):
   `toy_tail` runs end to end with a token network (2 iterations, CPU eager; and CUDA graphs + sparse batches +
   train_static + a sparse window): self-play with tail tokens (up to 21 a row) and overrides through `NetEvaluator`,
   v2 shards, training on them (the window's overrides resolved: 227), Elo matches.
+
+### 43.9 The static training step with tails and gates: its cost brought down (2026-11-12)
+
+**Why.** With gated tokens on 23% of the rows (a synthetic Delver-like batch: a random 128 x 4 network on MTG Zero's
+layout v6 widened onto a v7-like layout - tails on the 7 capped segments, 6 gated tail-only segments, option_pointers),
+a `train_static` step of 512 rows cost +45% of v6's, in the steady state too (every gate > 0), not just the gated-at-0
+phase (+56%) - against the design's +10-25%. The step is bound by the host's dispatch (~11 ms of kernels in a ~30 ms
+step, the GPU shared), and the tails' path added ~200 launches, ~815 aten operations, two host syncs and ~45 autograd
+nodes a step: per-segment loops (13 tail segments), the per-parameter assembly of the tail embedding and its
+backward, the checks.
+
+**What** (`net.py`; the math unchanged):
+
+* The static tail embedding is **one autograd node** (`_TailEmbed`): its forward runs the ops of before, unrecorded;
+  its backward the same gradients in ~12 operations (the input maps' and the positions' products, one scatter of the
+  gradient shared by both, the per-parameter gradients as views of one buffer by `split` / `unbind`; `tail_base`'s
+  gradient is the biases' - both sum the gradient over a segment's tokens -, the identity embedding's one `index_add`).
+* psi's sin / cos part comes from a table of its 256 values (n mod 256; computed once per device by psi's own ops:
+  the same floats); a tail token's identity digits are decoded by two products for all its digits (the same
+  identities for one-hot or empty digit blocks, what encoders write).
+* forward_static's checks (R5) and the explicit attention's decision are **0-d flags computed before anything else**,
+  read once - copied to pinned memory behind a CUDA event and waited for just before the trunk, when the device is
+  long past them (no drained pipeline; a bad batch is still refused before the trunk, every index clamped until
+  then). The gates' token weights are one gather from the gate vector extended by a 1.
+* With gradients on, the pointer head is one product (its row-slice parts, 43.8, are for the widen's bit-exact
+  evaluation; training does not need them).
+* The explicit weighted attention (a present gate exactly 0) is **one autograd node** (`_WeightedAttention`): the
+  forward the explicit math of before, op for op, on [B heads, T, .] batched products; the backward by hand (dv =
+  a^T dO; R = (dO v^T - D) / Z; dw_j = sum e_ij R_ij; ds = p R; dq, dk from ds).
+
+**Numerics** (the same seeded networks and batches through 391165e and this code, toy layouts with overrides into head
+slots, tail tokens and a gated segment with pointer columns, and the Delver-like network, gates 0 and 0.5, CUDA):
+every inference output - `forward_static`, `forward`, hence the CUDA graphs - **bit for bit** (policy, value, margin,
+the auxiliary head); training outputs and every parameter's gradient within float32 rounding, at most 4.2e-7 of their
+scale (the pointer head's one product, the sums of `tail_base`'s / the embedding's / the gates' gradients in another
+order, the explicit attention's backward by hand).
+
+**Measured** (the training step, 512 rows, T 48, forward + backward; the configurations alternated step by step,
+shuffled, 200 repetitions each, two runs each; the desktop's RTX 5090 shared with other sessions; medians):
+
+| step (vs v6, two runs) | before (391165e) | after |
+|---|---:|---:|
+| v6 (no tails) | 27.5 ms | 27.5 ms |
+| v7, no tail token in the batch (the code of before) | +0% / -2% | -2% / +7% (noise) |
+| v7, gated tokens g = 0.5 (steady state) | +45% / +45% | **+11% / +12%** |
+| v7, gated tokens + ungated tails on 4% of rows | +45% / +48% | +14% / +16% |
+| v7, gated tokens g = 0 (the explicit attention) | +56% / +57% | +22% / +21% |
+
+Per step at g = 0.5: launches 706 -> 643 (v6: 502), aten operations 3,173 -> 2,876 (2,354), host syncs 2 -> 0
+waits on a drained pipeline. Inference (the graphs' replay) is unchanged.
+
+Tests: `tests/test_tail_net.py`'s gradient test forces the explicit attention through `_explicit_flag` (static and
+eager); every tail test passes; the equivalence above is a scratch script (`perf_equiv.py`, not committed).

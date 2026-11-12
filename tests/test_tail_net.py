@@ -729,7 +729,7 @@ def test_gradients_reach_the_gates(static, monkeypatch):
     assert not calls and (gpos != 0).all() and torch.isfinite(gpos).all()
     for k in ('tail_base', 'pos_tail.1.weight', 'pos_tail.2.weight', 'seg_in.1.weight', 'seg_in.2.weight'):
         assert w.get_parameter(k).grad.abs().sum() > 0 and torch.isfinite(w.get_parameter(k).grad).all(), k
-    monkeypatch.setattr(TokenNet, '_explicit', lambda self, gi: True)
+    monkeypatch.setattr(TokenNet, '_explicit_flag', lambda self, gi, clean=False: torch.ones((), dtype=torch.bool, device=gi.device))
     w2 = _gate_net([0.6, 0.3])
     out_math = run(w2)
     assert maxdiff(out_sdpa, out_math) < 1e-5
