@@ -5774,3 +5774,64 @@ Tests (`tests/test_tail_train.py`): a gated network's state at iteration 2 is th
 and every moment equal, in the same process and through a resume (a new Run of the directory) - failing without the
 fix (no state loaded); a state that does not fit is refused, deleting it starts a fresh one, a state of another
 iteration is said.
+
+### 43.11 Inference speed of variable-length rows, and the transfers beside every graph (2026-11-12)
+
+**Why.** MTG Zero's layout v7 against v6, the same Delver line through its real self-play (MTG Zero's lane Z harness:
+the run's settings, CUDA graphs, 200 games from checkpoint 0 of the widened fork, conc 768, both on this core):
+v6 65.9k leaves/s, v7 56.4k (-14.4%; decisions/s -15.2%), the GPU 87-88% busy in both. Per batch (Nsight Systems,
+300 captured self-play batches of each, 224 rows on average): v6 2,650 us in its graph and 303 us between graphs,
+v7 2,893 and 345 - before the trunk +109 us (the wider head slots and globals of v7's encoding, about 2% on their
+own; the tail's checks and embedding), the trunk +106 us (tail tokens push the batch's longest row over a 16-token
+step in 15% of the batches: +3.3% token slots, +6.4% of the attention's), after it +28 us, between graphs +42 us
+(the tail's and overrides' uploads, wider rows to zero). Not the attention: SDPA runs the same memory-efficient
+kernel for v6's boolean mask and v7's float mask (log w).
+
+**Bit for bit** (every output of 300 captured v6 and v7 self-play batches unchanged, 2.4M values each):
+
+* `TokenGraphRunner` reads the layout tables its override check needs (`seg_nk`, `pos_seg`) once: a batch with
+  overrides (11% of v7's) read them from the device, waiting for the graphs in flight.
+* `forward_static` in inference on CUDA (`TokenNet._static_side`; no gradients): the inputs' checks and maps
+  (`_static_prep`) and the tail's embedding on a second stream while the head slots' input maps run on the first,
+  joined before the gather - the same kernels on the same inputs (a CUDA graph captures the fork as two branches).
+* `_static_ext` gathers from one copy of the token embeddings (each segment's flattened in turn, then the tail; the
+  index `B * before + b * count + slot`), not a copy of the head slots copied again with the tail.
+* A batch's tail integers (rows, segments, slots) are one upload, its overrides' (rows, actions, refs, columns) one.
+* **The transfers beside the graphs** (every token network): a launch's uploads go on a copy stream into device
+  staging of its own buffer set (a set is reused only after its launch's result), overlapping the graph before; the
+  device stream waits for them, copies them into the graph's inputs (a few us), replays, copies its outputs out of
+  the graph's (the next replay of the same graph may overwrite them), and a download stream brings them back. A
+  sparse batch's rows are zeroed again only where the last sparse batch wrote them (its non-zeros' places, kept on
+  the device; wholly after a dense batch), not all [B, F] floats - the same rows `zero_(); index_copy_` built.
+
+**Opt-in: length-sorted chunks** (`infer_token_chunks` N, run setting, default 0; `NetEvaluator(token_chunks=)`;
+`infer.chunk_rows`). A graph pads every row to the batch's longest: Delver's self-play rows hold 14.6 head tokens
+on average (15.5 with v7's tails) and the batch's padded T is 72 (74), so ~80% of the trunk's token slots are
+padding. With N > 1 a batch's rows are sorted by token count and cut into at most N pieces of whole 64 rows (the
+last any size), each through its own graph of its own longest row - where the cut saves by the estimate (slots x (1
++ T / 256) + 4096 a graph). On the captured batches two chunks halve the token slots and cut the attention's to
+36%. A row's outputs depend on the shape of the batch it runs in (10.6), so the answers move by float32 rounding:
+on the 300 captured batches each, priors by at most 6.6e-6, values 6.6e-7, margins 1.1e-6, the belief rows'
+auxiliary predictions 5.1e-7 (the same order as the row's own batch-to-batch spread); hence opt-in. Each chunk's
+answers are those of its rows as a batch of their own, bit for bit; long rows (43.7) and pieces (`max_rows`) work
+within each chunk.
+
+**Not done.** Moving v7's stack source references and evaluation context out of the stack / trigger slots into
+gated tokens (MTG Zero's proposal): the head-only ablation puts the whole width growth at ~2%, the move would take
+~0.6% of it and add tokens (a longer longest row) - not worth it for speed.
+
+**Measured** (the same harness; the GPU and the host otherwise idle unless said):
+
+| self-play, 200 games | leaves/s | vs v6 |
+|---|---:|---:|
+| v6, before | 65.9k | |
+| v7, before | 56.4k | -14.4% |
+| v7, the first four changes above | 58.1k (v6 65.3k) | -11.0% |
+
+The transfers beside the graphs and the chunks are measured when the shared GPU is free (a live run held it).
+
+**Tests** (`tests/test_tail_graphs.py`): five launches in flight, sparse and dense mixed, two of one graph: each
+batch's answers those of the batch alone, bit for bit, and a sparse batch's those of its dense rows; the chunks:
+off by default, `chunk_rows` cuts only where it saves, each chunk's answers its rows' alone bit for bit, the batch
+within rounding of the batch whole (priors, values, margins, belief rows, value-only rows, long rows), dense =
+sparse.
