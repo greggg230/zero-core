@@ -5303,10 +5303,11 @@ each remote worker's hello.
   only Python call that changed shape is guarded: `Run.play_match` / `play_matches` take `games` only when the
   evaluation spec chains (a subclass overriding them with the old signature - co-training's `PrimaryRun` - is called as
   before).
-* The full suite on the shared desktop (2026-11-11, other agents' jobs and a live run on it): two failures, each
-  load-dependent - `test_gumbel.py::test_python_driver_refuses_a_visits_target` passed alone, and
-  `test_forks.py::test_an_older_worker_is_refused` fails the same way on f9ca5c3 (the worker's hello came after the
-  run's two short iterations ended). MTG Zero's gates on its branch `bo3-game-episodes` (its ENGINE.md 121.5).
+* The full suite (97770ee, the shared desktop, 2026-11-12): **452 passed, 11 skipped, 0 failed** (1,976 s). Earlier
+  runs beside other agents' gates and a live run saw load-dependent failures that pass alone - e.g.
+  `test_forks.py::test_an_older_worker_is_refused`, which fails the same way on f9ca5c3 under that load (the worker's
+  hello came after the run's two short iterations ended). MTG Zero's gates on its branch `bo3-game-episodes` (its
+  ENGINE.md 121.5: checkpoint_compat identical, digests unchanged, the three other games built against this core).
 
 ### 42.6 Measured (the toy, desktop CPU, 2026-11-11, heavily shared)
 
