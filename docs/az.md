@@ -5339,3 +5339,70 @@ on batches of 1-150 rows with NaN in absent slots; a reader declared `belief` pl
 target on a token, an MLP and a conv network; a network without the head (aux [B, 0]); the interface's names,
 dtypes, dynamic dimensions and metadata; real toy games driven through the graph (sparse driver batches with
 value-only and belief rows, every answer validated and within 2e-5 of eager).
+
+## 42. The native self-play worker: zero_worker, one settings parser, parity gate 2 (no setting; zero-farm phase 0b, 2026-11-11)
+
+**Why.** zero-farm's worker (section 41) plays a run's self-play games on a friend's PC with no Python and no
+torch, for any run's settings, and its rows must be the rows a Python remote worker (5.3) would have written. So
+every play-affecting rule has one implementation, in Rust, shared by both (zero-farm DESIGN.md 2.1 points 3-4),
+a setting the worker cannot honour is refused loudly, and the worker is proven against the Python remote worker.
+
+**What.**
+* **One settings parser** (`zero_search::settings`, docs/search.md 4.1): the seat dicts, `branch` / `starts` and
+  the `DriverCfg` with its de-duplicated seat table, over serde_json values - moved from `zero_py`, which now
+  converts its dicts to JSON and calls it. Two tightenings for inputs no caller makes: a bot / external seat with
+  another key is refused (it was ignored), a non-finite float is refused. `<engine>.driver_settings(seats, ...)`
+  gives the `DriverCfg` a `SearchDriver` would get, as text (a diagnostic).
+* **`Driver::set_first_gid`** (docs/search.md 2.13): a rolling driver's games numbered from a given id, so a farm job
+  is a block `gid_base..` of one run-wide numbering (each game's streams derive from (seed, gid)).
+* **`crates/worker` (zero_worker)**, a workspace member outside `default-members` (this repo's `cargo test` and the
+  games' builds never compile ONNX Runtime): `settings` (a run's settings -> the remote worker's self-play driver:
+  a port of `Run.nn_seat(selfplay=True)` / `games.nn_seat` with the `mcts` checks and `Run.driver(..., rolling,
+  queue_only)`, Python's value rules, the spec as `json.dumps` writes it; parsed by `zero_search::settings`),
+  `classify` (`check-config`, the explicit table `run_settings.json`), `eval` (`OrtEvaluator`: `ort` 2.0.0-rc.15,
+  `load-dynamic`, ONNX Runtime 1.31; the graph's metadata checked - zero_onnx, game, features, actions, aux_width,
+  checkpoint_sha256 -, batches over 64 rows in pieces grouped by non-zero count, the float32 max-subtracted softmax
+  of each row's options, value / margin as given, the belief rows' aux; session inter-op 1, sequential,
+  optimization ALL, intra-op threads and spinning configurable; `Uniform` = `infer.UniformEvaluator`), `job` (the
+  remote worker's loop - resume, `pump` after every submitted batch, setups capped at `conc` in flight and the
+  job's games in all, `infer._drive_pipelined` with 2 batches in flight submitted in launch order, the evaluator on
+  its own thread; yield / resume / finish / quit / checkpoint), `shard` (zero/data.py's format), `proto` (the CLI and
+  zero-farm's agent<->worker protocol `aw/1`: `serve`). A game's worker binary is `zero_worker::main(GAMES, repo)`.
+* **`check-config`**: every `zero.run.DEFAULTS` key is `play` (51 keys: read and supported), `trainer` (86:
+  training, evaluation, orchestration, Python inference, network shape - the network is the graph), `python_only`
+  (the league, branched games, archive starts, co-training: refused unless off) or `param` (a python_only switch's
+  settings); `aux_<target>_w` play, `reader_<target>` trainer; anything else is unknown and refused.
+  `tests/test_worker_settings.py` fails when DEFAULTS and the table differ, so no setting is ever ignored in silence.
+  (Python's `resolve_config` keeps unknown keys silently: five mtg-zero run configs carry settings of other branches -
+  `selfplay_league_fixed`, `selfplay_explore`, `selfplay_temp_late`, `selfplay_sims_light`, `selfplay_opp_model` -
+  that this core would ignore; the worker refuses them.)
+* **`zero.onnx_eval.OnnxEvaluator`**: the graph through onnxruntime as a NetEvaluator-compatible LeafBatch evaluator
+  (the Python reference of the native one; the desktop's evaluator of a graph). Tools: `driver_settings_dump.py`,
+  `seat_parser_edges.py`, `worker_parity.py` (gate 2 a), `onnx_worker_gate.py` (b), `onnx_h2h.py` (c),
+  `worker_serve_check.py` (aw/1 with a real network), `worker_bench.py` (throughput).
+
+**Off by default.** Nothing changes for a run: the same seats and drivers (below), `set_first_gid` never called.
+
+**Tests and checks** (2026-11-11, the desktop busy with the live Delver run, CPU only).
+* **The parser move changes no seat:** `tools/driver_settings_dump.py` over every mtg-zero preset and every run
+  `config.json` under `C:/.../mtg-zero/runs` and `E:/mtg-zero/runs` (79 cases; the drivers of a remote self-play
+  worker, of this machine's self-play, of the evaluation against the yardstick and random, of the Elo matches,
+  of the bots' reference games): old parser (f60664c) vs new (f508146), **468 drivers identical**, 1 case refused
+  by both (`toy-cotrain-smoke`: its game is not in mtgz's module). `tools/seat_parser_edges.py` (47 edge cases,
+  the toy module of each commit): 45 identical or refused by both, the 2 deliberate changes listed.
+* **The worker's port of the run settings -> driver** (`driver-cfg` vs the Python remote worker's DriverCfg, the
+  same 79 cases): 72 identical (or refused by both), 6 refused by the worker as Python-only (4 league runs, 2 with
+  branched games / archive starts), 0 different.
+* `cargo test -p zero_search` (`first_gid_plays_the_same_games` new; the timing test
+  `a_slow_step_holds_up_its_own_group_only` failed once on the loaded desktop, passes alone 3 of 3), `cargo test -p
+  zero_worker` (11 unit + 4 job tests on the toy game: yield / resume gives the same shards, a gid block plays those
+  games, the shards hold every game, quit / finish), `tests/test_worker_settings.py`; the checkpoint-compat
+  goldens old (f60664c) vs new, toy: identical (visits 169 samples, records b1b86b689ab98313; cq d02691e9e005a5d5;
+  vs random 3.0/16, dcf8b2b840d45e66); toy_team identical (no samples). The full pytest: below.
+* **Parity gate 2** (zero-farm docs/phase0b-worker.md has every number): (a) plumbing, `tools/worker_parity.py` on
+  eoe1's settings with groups 1, the uniform evaluator, 48 games: zero-core's `remoteplay.Worker` and `mtgz-worker
+  selfplay` wrote **byte-identical shards** (2 shards, 14,136 rows) and sent **identical first 300 batches**; (b)
+  evaluator, `tools/onnx_worker_gate.py`, 440 recorded eoe1 batches (33,901 rows, 751 belief rows): native vs
+  `OnnxEvaluator` priors <= 1.8e-7, value / margin / aux bit-identical; vs torch <= 1.34e-5 (margin); (c) behaviour:
+  below. `tools/worker_serve_check.py`: aw/1 with eoe1 iter 80's graph, a yield after the first finished game and a
+  resume 3 s later - the same shards byte for byte as the job left alone, `yielded` 31 ms after `yield`.

@@ -41,6 +41,18 @@ Elo, dashboard, tools - comes from the pinned core (docs/pinning.md).
 3. Check the trait contract with the toy-style tests (features invariant under `determinize`,
    legal actions unchanged, chance keys canonical) and the core's parity tools:
    `python -m <pkg>.az.parity positions --game mygame` (Rust vs Python search statistics).
+4. Optional, for zero-farm (friends' PCs playing the run's games, docs/az.md 42): a native worker binary,
+   `worker/` with `zero_worker` (path `third_party/zero-core/crates/worker`), `zero_search`, the engine crate
+   (and an allocator such as mimalloc), kept out of the workspace's `default-members` (it pulls in ONNX
+   Runtime). `worker/src/main.rs`:
+
+   ```rust
+   static GAMES: &[zero_worker::GameEntry] = &[zero_worker::GameEntry::of::<mygame_engine::az::MyGameAz>("mygame")];
+   fn main() { std::process::exit(zero_worker::main(GAMES, "mygame")) }
+   ```
+
+   Then `<worker> check-config runs/<run>/config.json`, and `tools/worker_parity.py` (the worker against
+   the Python remote worker) before a friend's PC plays the game.
 
 ## 3. Python
 

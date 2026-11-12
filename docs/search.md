@@ -218,7 +218,8 @@ visits, section 3.5; `leaf_value_view` whose view its leaves' values come from, 
 `belief_fast` the root's belief of its searches, section 3.8; `lookahead` a dict of the exhaustive
 lookahead's settings that decides the seat's moves instead of MCTS, section 3.9). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
-key one external player. A key cannot be both.
+key one external player. A key cannot be both. The parser (its value rules, unknown keys refused) is
+`zero_search::settings`, section 4.1.
 
 ### 2.2 Network batches
 
@@ -492,6 +493,20 @@ dense hash); `driver::tests::sparse_rows_from_encode_sparse_are_the_dense_rows` 
 rows, HiddenMull with root-view and belief rows, eval_cache 0 and 4096: every batch's rows densified equal
 the dense driver's, the same games, records, cache hits and rows); the golden digests (dense) unchanged.
 MTG Zero checks its own states (ENGINE.md 89: 10k Delver leaf rows, pairs and keys equal).
+
+### 2.13 A rolling driver's first game id (`set_first_gid`; zero-farm, 2026-11-11)
+
+No setting: a call only native workers make (zero-farm's `zero_worker`, docs/az.md 42); a driver never asked
+numbers its games from 0, as before.
+
+`Driver::set_first_gid(g)` / `DynDriver::set_first_gid` - a rolling driver, before its first `resume` - makes
+its games `g, g + 1, ...` (the order its slots start them, as ever). Every random stream of a game derives from
+(driver seed, gid) (`worker::init_slot`), so a block of game ids played by one driver is exactly those games of
+a driver started at 0 with the same seed and evaluator answers: a farm job of games `gid_base .. gid_base + n`
+(zero-farm PROTOCOL.md 5) is a slice of one run-wide game numbering, and a game a friend's PC did not finish
+can be played again elsewhere as the same game. Refused on a fixed-table driver (its games are `0..games`) and
+after the first `resume`. Test: `first_gid_plays_the_same_games` (games 4..7 of a driver from 0 == a driver
+from 4, record for record).
 
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
@@ -1765,6 +1780,22 @@ determinize / encode / result / margin / score / export_state / apply_external /
 --game glassroad` work (the Python side finds the module through the game package,
 `zero.package`). Keep `"toy"` registered: the shims' tests and tools use it. The game's engine
 crate depends on `zero_search` for the trait.
+
+### 4.1 The settings parser (`zero_search::settings`; zero-farm phase 0b, 2026-11-11)
+
+The driver's settings - the seat dicts of 2.1, `branch` / `starts` of 2.11, a whole `DriverCfg` with its
+de-duplicated seat table - are parsed by one Rust module over serde_json values, `zero_search::settings`
+(`SEAT_KEYS`, `parse_seat`, `parse_branch`, `parse_starts`, `driver_cfg`). The bindings call it (`zero_py`
+converts its Python dicts to JSON: `to_json`; `starts`' dict specs keep Python's `json.dumps` text) and so does a
+native worker (`zero_worker`, from a run's `config.json`): a new seat setting is one change for both. The
+rules are the bindings' since the beginning: a missing setting or null is its default; an integer setting takes
+an integer in range or a boolean (Python's `int` takes `True`), a float setting any number or a boolean, a text
+setting a string; a flag (`selfplay`, `redet`, `record`, `belief_fast`, `infoset_merge`, branch's `differ`) is
+Python-truthy; an unknown setting is an error - a network seat's (not in `SEAT_KEYS`), a bot or external seat's
+(anything but `bot` / `external`: it used to be ignored), branch's, starts'. A non-finite float is refused (JSON
+has none). `<engine>.driver_settings(seats, ...)` returns the `DriverCfg` a `SearchDriver` would get, as text,
+without making a driver (a diagnostic; `tools/driver_settings_dump.py` compares it across parsers and with the
+native worker's `driver-cfg`).
 
 ## 5. The toy game: "Mini Cavern" (`crates/search/src/toy.rs`)
 
