@@ -5835,3 +5835,103 @@ batch's answers those of the batch alone, bit for bit, and a sparse batch's thos
 off by default, `chunk_rows` cuts only where it saves, each chunk's answers its rows' alone bit for bit, the batch
 within rounding of the batch whole (priors, values, margins, belief rows, value-only rows, long rows), dense =
 sparse.
+
+### 43.12 Self-play's host work per batch: what the GPU waited for, and the drive loop's thread (2026-11-12)
+
+**Why.** 43.11's self-play (the Delver line's settings: sparse batches, CUDA graphs, conc 768, 16 threads in 4
+groups, sims 64 / 16, the belief tilt, root-view leaves; 200 games from checkpoint 0, this machine only) kept the
+GPU 88-90% busy, v7 10% behind v6; the suspect was the host's work per batch on the one Python thread that drives
+the search (polling the driver, building and launching a batch, reading its answers back, handing them over).
+
+**The profile** (ec8ecf0; the drive loop's thread timed by phase, every graph replay timed by CUDA events,
+`E:/zero-scratch/varlen-host/prof_sp.py`; 200 games, ~12,700 batches of 186-190 leaves (224 rows); per batch):
+
+| | v6 | v7 |
+|---|---:|---:|
+| the thread: build and launch | 1,913 us | 2,270 us |
+| read the answers back (`result`) | 186 | 162 |
+| hand them to the driver (`submit`) | 79 | 75 |
+| poll the driver (the next batch, its LeafBatch) | 15 | 16 |
+| wait for the GPU | 666 | 780 |
+| the GPU: in the graph | 2,575 | 2,862 |
+| between graphs, median / mean | 150 / 286 | 179 / 443 |
+| between graphs over 1 ms (a new shape's capture: 8 / 30), the run's total | 1.1 s | 3.2 s |
+
+* The search is never the limit: 1 poll in ~12,700 found the next group not ready, the driver waited 0.04 s in all.
+* The thread was not the limit either, at first: it waited for the GPU ~0.7 ms a batch. **The GPU waited for its
+  inputs.** Device events around the work between two graphs (the replay bench of 43.11's 300 captured v7 batches,
+  two in flight): the outputs' copy 7 us, the wait for the next launch's uploads **132 us** (181 in self-play),
+  the scatter of the non-zeros 14, the inputs' copies 12. The uploads had been queued ~1 ms before the graph ended.
+  On this machine (Windows, WDDM) a download queued on the copy engine waits there for its graph, and an upload
+  queued after it waits behind it (a probe: a 1.3 MB upload queued during a 3.2 ms graph ends 75 us after it
+  starts; with the graph's own download queued first, 70-85 us after the graph); every launch had queued its
+  download right after its replay, so the next launch's uploads crossed only once the graph before had ended.
+  Separate small uploads cost the copy engine too: 9 of a 1.3 MB batch 280 us, one 72 us.
+* With that wait gone (below), **the thread became the limit**: the next launch was built only after the graph before
+  had ended in a third or more of the batches (`late launches`), the GPU idle meanwhile - building a v7 launch took
+  1.4-1.5 ms on a quiet host (the replay bench), 2.1-2.6 ms in self-play beside the 16 search threads: numpy's passes
+  over the batch's ~51,000 non-zeros (the presence flags 257 us, the token positions 192, the padded tail 107, the
+  flat indexes, `rows.resolve` 51 even without an override) and ~30 torch calls of 5-20 us each (nine uploads, six
+  copies, the scatter, the downloads, the events).
+
+**What** (`infer.TokenGraphRunner`, `rows.resolve`, the engine module; every answer bit for bit):
+
+* **A launch's download is queued by the next launch** just before its replay - after its upload and its inputs'
+  copy, waiting on an event recorded there - or by its own `result` when no launch came first (`_Down`,
+  `_flush_downs`, `_wait_down`). The download runs during the next graph; nothing is queued on the copy engine
+  ahead of an upload or the inputs' copy any more.
+* **One upload, one copy.** A launch's inputs are one pinned int64 buffer per buffer set: the non-zeros' flat
+  indexes, their values (float32), the root belief rows, then the graph's own inputs at its key's layout
+  (`_layout`: n, ntok, full; with tails / overrides tint, oint, tval - regions of 256 bytes, an allocation's own
+  alignment). One upload on the copy stream into the set's staging; on the device stream one copy into the graph's
+  region of one shared input buffer (`_ibuf`; a graph keeps the views it was captured with), the scatter reading
+  the staging. The same values reach the same kernels.
+* **The sparse batch packed in Rust, off the GIL** (`pack_sparse_tokens`, `pack_tail_tokens` in every engine
+  module: `zero_py`, `crates/py/src/pack.rs`): the presence flags (a bitset per row), each row's token count and
+  positions (`token_index` / `token_index_tail`), the flat indexes and values, and the tail padded with
+  `_check_tail_host`'s checks - written straight into the set's pinned words; a batch with a row of more than
+  LONG_T tokens comes back unlaunched and goes the numpy way (its rows split, 43.7). The dense path is numpy, as
+  before. A build of an older core under this one has no packers: TokenGraphRunner says so (rebuild the engine).
+* `rows.resolve` returns at once for a batch without overrides (89% of v7's); `SearchDriver.submit` releases the
+  GIL while it hands the answers over (the shard writer thread runs meanwhile; only the drive loop's thread calls
+  the driver).
+
+Not changed: the options' softmax stays numpy (`segment_softmax_np`: a Rust exp is not numpy's float32 exp, bit
+for bit), and so does the dense path. A third batch in flight (`ZERO_INFLIGHT=3`, the existing env) gave the same
+games and shards here (below); it stays opt-in - `GraphRunner`'s two fixed host slots (a conv network's) would be
+overwritten by it (10.6).
+
+**Identity.** The answers of the 300 captured v6 and v7 batches (sha256 of every answer in order): ec8ecf0's. Real
+self-play, 200 games each, v6 and v7, the shard writer thread on and off, and with `ZERO_INFLIGHT=3`: every answer
+in submit order and every shard's arrays identical to ec8ecf0's (ec8ecf0 reproduced its own twice).
+`tests/test_pack.py` (CPU): the packers against the numpy path, bit for bit (random batches, presence flags at 0.5
+and just above, float16 tails, the long-row return, the refusals); `tests/test_tail_graphs.py`'s launches in flight
+and dense = sparse, `test_token_graphs.py`, `test_tail_amp.py`; the core's pytest; toy-smoke (MLP, tokens, static
+tokens) byte for byte and `check_checkpoint_compat --package zero` (random, a toy MLP, a toy token network)
+identical against ec8ecf0.
+
+**Measured** (the same self-play, 200 games, configurations alternated, `sp_table` guard: the GPU otherwise idle, the
+host quiet; the desktop's RTX 5090; two clean rounds - a third ran beside other sessions' builds and is left out):
+
+| self-play, 200 games | leaves/s, the 2 rounds | mean | |
+|---|---:|---:|---|
+| v5 (its own build, fb1d70e) | 63.8k, 63.4k | 63.6k | |
+| v6, before (ec8ecf0) | 65.8k, 66.0k | 65.9k | |
+| v7, before | 54.8k, 56.8k | 55.8k | -15.3% against v6 |
+| v6, after | 68.2k, 69.8k | 69.0k | +4.7% |
+| v7, after | 60.5k, 62.0k | 61.2k | +9.7%; -11.3% against v6 after (-7.1% against v6 before) |
+
+Per batch after (the profile above, quiet; before in brackets): v6 launch 889 us (1,913), result 172 (186), submit
+58 (79), the thread waits for the GPU 1,547 us (666); between graphs median 22 us (150), mean 48 (286); the GPU in a
+graph 98.2% of the time (90.0%); a launch late for its graph in 1.3% of the batches. v7 launch 1,515 us (2,270),
+between graphs median 24 us (179), mean 130 (443: the 30 captures of new shapes are 1.2 s of the 39.5); in a graph
+95.8% of the time (86.6%), launches late in 7%.
+
+**What is left.** v7's distance to v6 is now the GPU's: 11-13% more time in each graph (43.11: the wider head slots,
+the tail's checks and embedding, longer rows) and 22 more shapes to capture (a one-off each: ~1.2 s of a 200-game
+measurement, nothing in a long run). The graphs' matrix products run in float32 on the SIMT cores
+(`cutlass_80_simt_sgemm`, ~40% of a graph's time): TF32 would be a large cut, not bit for bit (opt-in if wanted).
+On the host, a v7 launch still builds a `rows.Tail` and `rows.Overrides` per batch with their checks and makes ~20
+torch calls; the dense path (not self-play's) is numpy as before.
+
+**Tests.** `tests/test_pack.py` (new); `cargo test -p zero_py` (`pack.rs`'s own).

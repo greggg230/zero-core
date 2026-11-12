@@ -21,7 +21,7 @@ docs/search.md 8-9: hidden hands, simultaneous choices, revelation keys).
 | `crates/search/src/toy_team.rs` | "Toy team", a two-team game with a deferred result decided by toy games (section 5.1) |
 | `crates/search/src/dynapi.rs` | Object-safe wrappers (`DynGame`, `DynTree`, `DynDriver`, `DynLook`) so the bindings hold any game |
 | `crates/search/src/rng.rs`, `noise.rs` | xoshiro256++ / splitmix64, Gamma / Dirichlet, Gumbel |
-| `crates/py/src/lib.rs` | `zero_py`: `Game`, `SearchTree`, `SearchDriver`, `Lookahead` (3.9), `game_names()`, `game_info_of()`, `lookahead_settings()`, the `engine_module!` macro (section 4) |
+| `crates/py/src/lib.rs` | `zero_py`: `Game`, `SearchTree`, `SearchDriver`, `Lookahead` (3.9), `game_names()`, `game_info_of()`, `lookahead_settings()`, `pack_sparse_tokens()` / `pack_tail_tokens()` (`pack.rs`: a token network's sparse batch packed for its CUDA graphs, docs/az.md 43.12), the `engine_module!` macro (section 4) |
 | `crates/toy_py/src/lib.rs` | the core's own module `zero._engine` (`toy`, `toy_team`) |
 | `python/zero/mcts.py`, `play.py` | Python reference MCTS and driver (`PyDriver`, seats searching with the Python or the Rust tree) |
 | `python/zero/protocol.py` | Leaf-batch protocol: `LeafBatch`, validators, `MAX_SEATS` |
@@ -1881,7 +1881,8 @@ with `zero_py`, `zero_search` (path dependencies into the pinned core,
 `pyo3 = { version = "0.23", features = ["extension-module"] }` as dependencies. That gives
 Python `Game('glassroad', spec, players, seed)` (clone / legal / step / force_chance /
 determinize / encode / result / margin / score / export_state / apply_external / search_tree),
-`SearchDriver('glassroad', seats, spec=...)`, `game_names()`, `game_info_of('glassroad')` and
+`SearchDriver('glassroad', seats, spec=...)`, `game_names()`, `game_info_of('glassroad')`,
+`pack_sparse_tokens` / `pack_tail_tokens` (`zero.infer.TokenGraphRunner`'s packers, docs/az.md 43.12) and
 `MAX_SEATS`, and makes the Python reference MCTS, `PyDriver`, the parity check and `run.py
 --game glassroad` work (the Python side finds the module through the game package,
 `zero.package`). Keep `"toy"` registered: the shims' tests and tools use it. The game's engine

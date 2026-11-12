@@ -397,6 +397,13 @@ class TokenGraphRunner:
     memory pool and one set of device inputs (the graphs run in order on one stream). The graphs
     read the model's own parameters: `set_weights` (load_state_dict, in place) needs no refresh.
 
+    Per launch (docs/az.md 43.12): one upload of one pinned int64 buffer (a sparse batch's non-zeros, the
+    belief rows, the graph's integer inputs and tail floats at its key's `_layout`) and one device copy into
+    the graph's region of the shared inputs; a sparse batch packed by the engine module's
+    `pack_sparse_tokens` / `pack_tail_tokens` (Rust, off the GIL; the dense path numpy); a launch's
+    download queued by the next launch just before its replay (or at its result), never ahead of an
+    upload on the copy engine.
+
     float32 (`amp`: bfloat16 autocast, for measurements only - never a default). The answers
     are eager's up to float32 rounding (other matrix shapes: docs/az.md 10.6 has the measured
     differences); deterministic for a given batch."""
