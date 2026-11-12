@@ -1,8 +1,10 @@
 """Training a network with gates (docs/az.md 43.6): the run logs the gate values (`train.tail.gates`, by segment) and the
 steps whose batches held each gated segment's tokens, warns when a gate is still exactly 0 after GATE_STUCK_STEPS of
 them, and keeps the gates out of AdamW's weight decay (their own optimizer group, last; every other group as before)."""
+import copy
 import os
 
+import pytest
 import torch
 
 from zero import package
@@ -69,3 +71,79 @@ def test_a_network_without_gates_keeps_the_optimizer_of_before(tmp_path):
     out = R._selfplay(1)
     _, ost, _ = R.train_model(1, out['samples'])
     assert len(ost['param_groups']) == 1 and ost['param_groups'][0]['weight_decay'] == R.cfg['wd']
+
+
+def _loaded_states(monkeypatch):
+    """Every optimizer state `torch.optim.AdamW.load_state_dict` loads, as the optimizer holds it right after."""
+    got = []
+    orig = torch.optim.AdamW.load_state_dict
+
+    def load(self, state):
+        orig(self, state)
+        got.append(copy.deepcopy(self.state_dict()))       # (the training steps after it update it in place)
+    monkeypatch.setattr(torch.optim.AdamW, 'load_state_dict', load)
+    return got
+
+
+def _same_state(a, b):
+    """Two optimizer state dicts with the same groups (hyper-parameters, parameter counts) and every moment equal."""
+    ga, gb = a['param_groups'], b['param_groups']
+    assert [len(g['params']) for g in ga] == [len(g['params']) for g in gb]
+    assert [g['weight_decay'] for g in ga] == [g['weight_decay'] for g in gb]
+    ia = [i for g in ga for i in g['params']]
+    ib = [i for g in gb for i in g['params']]
+    for i, j in zip(ia, ib):
+        sa, sb = a['state'][i], b['state'][j]
+        assert set(sa) == set(sb)
+        for k in sa:
+            assert torch.equal(torch.as_tensor(sa[k]).cpu(), torch.as_tensor(sb[k]).cpu()), (i, k)
+
+
+def test_a_gated_networks_optimizer_state_reloads_exactly(tmp_path, monkeypatch):
+    """A network with gates (their group last, without decay) trains iteration 2 from iteration 1's optimizer state, its
+    groups and moments exactly as saved - in the same process and through a resume (a new Run for the directory, as a
+    restarted run) - never a fresh optimizer (docs/az.md 43.10)."""
+    monkeypatch.setitem(package.CORE.tokens, 'toy_tail', TOY_GATED)
+    R, out = gated_run(tmp_path, 0.3, wd=0.5)
+    R.train(1, out['samples'])
+    saved = torch.load(str(tmp_path / 'models' / 'opt_latest.pt'), weights_only=False)
+    assert saved['iter'] == 1 and saved['state']['param_groups'][-1]['weight_decay'] == 0.0
+    got = _loaded_states(monkeypatch)
+    out2 = R._selfplay(2)
+    R.train_model(2, out2['samples'])
+    assert len(got) == 1
+    _same_state(saved['state'], got[0])
+    # through a resume: a new process's Run reads the state from disk
+    R2 = RUN.Run(str(tmp_path), R.cfg)
+    R2.train_model(2, out2['samples'])
+    assert len(got) == 2
+    _same_state(saved['state'], got[1])
+    log = open(os.path.join(str(tmp_path), 'log.txt'), encoding='utf-8').read() if os.path.exists(
+        os.path.join(str(tmp_path), 'log.txt')) else ''
+    assert 'fresh optimizer' not in log
+
+
+def test_an_optimizer_state_that_does_not_fit_is_refused(tmp_path, monkeypatch):
+    """The state saved with the last checkpoint not fitting its network is refused (OptimizerStateMismatch: an
+    EncodingMismatch, exit 78), never a fresh optimizer in silence; deleting it starts one deliberately; a state of
+    another iteration is said and replaced by a fresh one."""
+    monkeypatch.setitem(package.CORE.tokens, 'toy_tail', TOY_GATED)
+    R, out = gated_run(tmp_path, 0.3)
+    R.train(1, out['samples'])
+    path = str(tmp_path / 'models' / 'opt_latest.pt')
+    saved = torch.load(path, weights_only=False)
+    bad = {'iter': saved['iter'], 'state': {'param_groups': saved['state']['param_groups'],
+                                             'state': {i: {k: (v[..., :1] if torch.is_tensor(v) and v.dim() else v)
+                                                           for k, v in st.items()}
+                                                       for i, st in saved['state']['state'].items()}}}
+    torch.save(bad, path)
+    out2 = R._selfplay(2)
+    with pytest.raises(RUN.OptimizerStateMismatch, match='does not fit'):
+        R.train_model(2, out2['samples'])
+    assert issubclass(RUN.OptimizerStateMismatch, RUN.EncodingMismatch)
+    os.remove(path)
+    R.train_model(2, out2['samples'])                # (deliberately fresh)
+    torch.save(dict(saved, iter=0), path)
+    R.train_model(2, out2['samples'])
+    log = open(os.path.join(str(tmp_path), 'log.txt'), encoding='utf-8').read()
+    assert 'the optimizer state is of iteration 0, not 1: fresh optimizer' in log

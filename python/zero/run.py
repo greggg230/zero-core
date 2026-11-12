@@ -1353,48 +1353,66 @@ class Run:
             opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'], **okw)
         opt_path = os.path.join(self.run, 'models', 'opt_latest.pt')
         fresh = True
+        o = None
         if os.path.exists(opt_path):
             try:
                 o = torch.load(opt_path, map_location=dev, weights_only=False)
-                if o.get('iter') == it - 1:
-                    groups = o['state'].get('param_groups') or []
-                    k = len(groups)
-                    if more:
-                        # a widened head (docs/az.md 37): each saved group is one part of this network (the
-                        # trunk, the head of before, the readers, an earlier widen's part) - matched by its
-                        # parameters' shapes, its moments kept; the parts it lacks start fresh
-                        at = match_opt_groups(o['state'], pgroups)
-                        if at is None:
-                            raise ValueError(f'it belongs to another network ({opt_state_mismatch(model, o["state"])})')
-                        ordered = [pgroups[j] for j in at]
-                        opt = torch.optim.AdamW(ordered[0] if len(ordered) == 1 and ordered[0] is not gates
-                                                else [group(g) for g in ordered],
-                                                lr=c['lr'], weight_decay=c['wd'], **okw)
-                        opt.load_state_dict(o['state'])
-                        for j, g in enumerate(pgroups):
-                            if j not in at:
-                                opt.add_param_group(group(g))
-                    elif 0 < k < len(pgroups) and [len(g.get('params', [])) for g in groups] == [len(g) for g in pgroups[:k]]:
-                        # the state of the network before its head (and / or readers): kept for it, the new
-                        # parts start fresh
-                        bad = opt_state_mismatch(model, o['state'], params=[p for g in pgroups[:k] for p in g])
-                        if bad:
-                            raise ValueError(f'it belongs to another network ({bad})')
-                        opt = torch.optim.AdamW(trunk if k == 1 else [group(g) for g in pgroups[:k]], lr=c['lr'],
-                                                weight_decay=c['wd'], **okw)
-                        opt.load_state_dict(o['state'])
-                        for g in pgroups[k:]:
-                            opt.add_param_group(group(g))
-                    else:
-                        # (the state of this network: its moments as its parameters; another network's,
-                        # e.g. of another encoding, would load and fail at the first step, docs/az.md 10.4)
-                        bad = opt_state_mismatch(model, o['state'])
-                        if bad:
-                            raise ValueError(f'it belongs to another network ({bad})')
-                        opt.load_state_dict(o['state'])
-                    fresh = False
             except Exception as e:                 # noqa: BLE001
-                self.log(f'iter {it}: optimizer state not loaded ({e}); fresh optimizer')
+                raise OptimizerStateMismatch(f'iter {it}: the optimizer state {opt_path} cannot be read ({e}). Refused: '
+                                             f'delete it to start a fresh optimizer deliberately.') from None
+        if o is not None and o.get('iter') != it - 1:
+            # (a state of another checkpoint - e.g. the run stopped between writing the checkpoint and its state -:
+            # nothing of this network to keep)
+            self.log(f'iter {it}: the optimizer state is of iteration {o.get("iter")}, not {it - 1}: fresh optimizer')
+        elif o is not None:
+            try:
+                groups = o['state'].get('param_groups') or []
+                k = len(groups)
+                if more or gates:
+                    # a widened head (docs/az.md 37): each saved group is one part of this network (the
+                    # trunk, the head of before, the readers, an earlier widen's part) - matched by its
+                    # parameters' shapes, its moments kept; the parts it lacks start fresh. A network with
+                    # gates (docs/az.md 43.6) too: its groups end with the gates', in the order of their history
+                    # (a head or readers added later come after them) - matched, never assumed
+                    at = match_opt_groups(o['state'], pgroups)
+                    if at is None:
+                        why = opt_state_mismatch(model, o['state'], params=[p for g in pgroups for p in g])
+                        raise ValueError(f'it belongs to another network ({why or "its groups fit none of the network"})')
+                    ordered = [pgroups[j] for j in at]
+                    opt = torch.optim.AdamW(ordered[0] if len(ordered) == 1 and ordered[0] is not gates
+                                            else [group(g) for g in ordered],
+                                            lr=c['lr'], weight_decay=c['wd'], **okw)
+                    opt.load_state_dict(o['state'])
+                    for j, g in enumerate(pgroups):
+                        if j not in at:
+                            opt.add_param_group(group(g))
+                elif 0 < k < len(pgroups) and [len(g.get('params', [])) for g in groups] == [len(g) for g in pgroups[:k]]:
+                    # the state of the network before its head (and / or readers): kept for it, the new
+                    # parts start fresh
+                    bad = opt_state_mismatch(model, o['state'], params=[p for g in pgroups[:k] for p in g])
+                    if bad:
+                        raise ValueError(f'it belongs to another network ({bad})')
+                    opt = torch.optim.AdamW(trunk if k == 1 else [group(g) for g in pgroups[:k]], lr=c['lr'],
+                                            weight_decay=c['wd'], **okw)
+                    opt.load_state_dict(o['state'])
+                    for g in pgroups[k:]:
+                        opt.add_param_group(group(g))
+                else:
+                    # (the state of this network: its moments as its parameters, in the optimizer's order;
+                    # another network's, e.g. of another encoding, would load and fail at the first step,
+                    # docs/az.md 10.4)
+                    bad = opt_state_mismatch(model, o['state'], params=[p for g in pgroups for p in g])
+                    if bad:
+                        raise ValueError(f'it belongs to another network ({bad})')
+                    opt.load_state_dict(o['state'])
+                fresh = False
+            except Exception as e:                 # noqa: BLE001
+                # the state saved with checkpoint it - 1 does not fit its network: a fresh optimizer would drop the
+                # moments in silence, every iteration (docs/az.md 43.10) - refused (exit 78, not restarted)
+                raise OptimizerStateMismatch(
+                    f'iter {it}: the optimizer state saved with checkpoint {it - 1} ({opt_path}) does not fit its network '
+                    f'({e}). Refused: a fresh optimizer would drop the moments in silence. Delete {opt_path} to start a '
+                    f'fresh optimizer deliberately (a network that changed: fork_run starts one).') from None
         lr = lr_at(c, it)
         paths = self.window_shards(it)
         aw = sum(w for _, w, _ in self.aux)
@@ -2117,6 +2135,12 @@ class Run:
             _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
             self.remote.drain()
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})
+
+
+class OptimizerStateMismatch(EncodingMismatch):
+    """The optimizer state saved with the run's last checkpoint (`models/opt_latest.pt`, its iteration's) does not fit
+    the checkpoint's network (docs/az.md 43.10): training on with a fresh optimizer would drop its moments in silence -
+    refused (exit 78, not restarted). Deleting the file starts a fresh optimizer deliberately."""
 
 
 class RowsRefused(EncodingMismatch):

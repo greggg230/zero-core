@@ -318,6 +318,12 @@ def distill(student, W, T, steps, batch=512, lr=5e-4, lr_min=1e-5, warmup=500, w
     else:
         o = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=wd)
     if opt is not None:
+        # (the moments in the optimizer's own order - the gates' group last -: a state that does not fit is refused,
+        # never trained on from a fresh optimizer in silence, docs/az.md 43.10)
+        from .run import opt_state_mismatch
+        bad = opt_state_mismatch(student, opt, params=[p for g in o.param_groups for p in g['params']])
+        if bad:
+            raise ValueError(f'distill: the optimizer state to continue does not fit the student ({bad})')
         o.load_state_dict(opt)
     amp = use_amp(student, device)
     rng = np.random.default_rng(seed * 7919 + start)

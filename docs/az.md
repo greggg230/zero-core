@@ -1253,7 +1253,9 @@ encoding.`
   **not** restart it (state `refused`: a restart would refuse again).
 * **The optimizer state** (`opt_latest.pt`): loaded only if its moments have the shapes of the
   checked network's parameters (`run.opt_state_mismatch`; torch checks the counts only, and another
-  network's state would fail at the first step); else logged, fresh optimizer.
+  network's state would fail at the first step); else (since 2026-11-12, 43.10) the run is refused
+  (`run.OptimizerStateMismatch`, exit 78) - deleting the file starts a fresh optimizer deliberately; a state
+  of another iteration is logged and replaced by a fresh one.
 * **The evaluator's last line** (`infer.NetEvaluator`): a leaf batch whose rows are not as wide
   as the network's input raises EncodingMismatch (one comparison per batch), whatever loaded the
   network.
@@ -5633,3 +5635,34 @@ at gates 0 and > 0 with tails and overrides into gated and ungated tokens (finit
 loss lower, float32's outputs within bfloat16's precision, the explicit attention exactly while a gate is 0); a
 train_static step at shut gates with and without overrides (lane Z's case); the graphs' bfloat16 mode with tails;
 `Run.train_model` on toy_tail on CUDA with autocast forced on, eager and train_static.
+
+### 43.10 The optimizer state of a network with gates (2026-11-12)
+
+**The bug** (391165e - 9ab650f; found by MTG Zero's lane Z on CPU toy_tail runs): the gates' AdamW group comes last
+(43.6: no weight decay), but `train_model` checked a reloaded state's moments against the network's parameters in
+the network's own order - so a network with gates never matched its own state ("exp_avg of parameter 2: (1025,
+32), the parameter (7,)"), and every iteration silently started a fresh optimizer, one log line each: a v7 run
+would have reset its moments every generation.
+
+**The fix** (`run.py`):
+
+* a network with gates loads its state through `match_opt_groups` (as a widened head does, 37): each saved group
+  matched to one of the network's by its parameters' count and shapes, the optimizer built in the saved order (the
+  gates' group last, a head or readers added later after it), the groups it lacks fresh; the same network's state
+  is compared in the optimizer's own group order (`opt_state_mismatch(..., params=)`);
+* **an optimizer state saved with the last checkpoint that does not fit its network refuses the run**
+  (`OptimizerStateMismatch`, an EncodingMismatch: exit 78, not restarted), naming the file: a fresh optimizer is
+  never started in silence. Deleting the file starts one deliberately; a network that changes legitimately keeps or
+  extends its state (a head or readers added, a widened head) or comes with none (`fork_run` writes no state for a
+  fork, `--net` removes it); an unreadable state is refused too; a state of another iteration (a stop between
+  writing a checkpoint and its state) is logged and replaced by a fresh one;
+* `zero.distill`'s resume checks the state it continues the same way (ValueError).
+
+Co-training trains through `train_model` (both networks), a resume after PAUSE or a restart reloads the same file,
+`fork_run --source` copies a state only when it belongs to the forked checkpoint, and the fused AdamW of
+`train_static` has the same groups: all covered by the above.
+
+Tests (`tests/test_tail_train.py`): a gated network's state at iteration 2 is the saved one, groups, weight decay
+and every moment equal, in the same process and through a resume (a new Run of the directory) - failing without the
+fix (no state loaded); a state that does not fit is refused, deleting it starts a fresh one, a state of another
+iteration is said.
