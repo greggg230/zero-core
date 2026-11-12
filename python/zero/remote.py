@@ -6,7 +6,7 @@ Local side (`RemoteEval`, a thread of the run process): each evaluated iteration
 the remote's mirror of the run (`<workdir>/<run name>`: config.json with the remote's overrides,
 the checkpoints the evaluation needs), evaluated there with `python -m <pkg>.az.remote eval
 <mirror> <iter>`, and its result appended to the run's `evals.jsonl` ({iter, eval_yard,
-eval_random, elo, time, host, seconds}); the mirror's Elo pool files (elo/, or elo/<rule>/ for an
+eval_random, elo, extras (the game package's other yardsticks, docs/az.md 40), time, host, seconds}); the mirror's Elo pool files (elo/, or elo/<rule>/ for an
 eval_select other than 'visits', docs/az.md 5.4) and models/index.json are copied back (the
 remote owns the run's Elo while `eval_remote` is on), models/best.pt is set to the checkpoint that
 index.json names best (as elo.tag_checkpoints does where the pool is fitted), and the game package's
@@ -397,7 +397,9 @@ class RemoteEval:
             raise RuntimeError(f"the remote evaluated with the move rule {got!r}, the run's eval_select is {tag!r} "
                                f"(its checkout is not the run's code?): not recorded")
         row = {'iter': it, 'time': time.time(), 'host': self.name, 'seconds': round(time.time() - t0, 1)}
-        for k in ('eval_yard', 'eval_random', 'elo', 'elo_anchored'):
+        # extras: the game package's other yardsticks (GamePackage.evals), run on the remote with the rest of
+        # Run.evaluate - recorded here as a local evaluation records them in metrics.jsonl (docs/az.md 40)
+        for k in ('eval_yard', 'eval_random', 'elo', 'elo_anchored', 'extras'):
             if k in m:
                 row[k] = m[k]
         self._fetch_files(it)
@@ -427,6 +429,11 @@ class RemoteEval:
             a = row['elo_anchored']
             self.R.log(f'iter {it} elo anchored {a["elo"]:.0f} +-{1.96 * a["se"]:.0f}{elo.pool_note(tag)} '
                        f'(remote {self.name})')
+        from .run import _fmt
+        for name, r in (row.get('extras') or {}).items():
+            what = (f'EXTRA EVAL FAILED: {r["error"]}' if isinstance(r, dict) and 'error' in r and len(r) == 1
+                    else _fmt(r) if isinstance(r, dict) else json.dumps(r))
+            self.R.log(f'iter {it} {name} (remote {self.name}): {what}')
 
 
 class RemoteNetEval(RemoteEval):

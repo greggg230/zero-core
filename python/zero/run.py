@@ -416,12 +416,15 @@ _CORE_PRESETS = dict(PRESETS)
 def apply_package(pkg):
     """The game package's run presets and DEFAULTS overrides (zero.package.register calls this;
     so does importing this module), and the weight setting of each of its auxiliary targets
-    (`aux_<name>_w`, default 0 = off; docs/az.md 15). Unknown setting names are an error."""
+    (`aux_<name>_w`, default 0 = off; docs/az.md 15), and the package's own run settings
+    (`GamePackage.settings`, docs/az.md 40; a name the core already has is an error). Unknown setting
+    names are an error."""
     known = dict(_CORE_DEFAULTS, **pkg.aux_settings(), **pkg.reader_settings())
     # the package's own run settings (GamePackage.settings, docs/az.md 40): new names only
     clash = sorted(set(getattr(pkg, 'settings', {})) & set(known))
     if clash:
-        raise ValueError(f'{pkg.name}: package settings {clash} are names of the core\'s run settings')
+        raise ValueError(f'{pkg.name}: the package\'s settings {clash} are run settings of the core already '
+                         f'(names of the core\'s, an auxiliary target\'s or a reader\'s)')
     known.update(getattr(pkg, 'settings', {}))
     bad = sorted(set(pkg.defaults) - set(known))
     if bad:
@@ -1644,8 +1647,12 @@ class Run:
         """The game package's other yardsticks of checkpoint `it` (GamePackage.evals): measured
         and logged under m['extras'][name], never fed back. One that raises does not stop the
         run (a yardstick, not the loop): its error is logged (EXTRA EVAL FAILED) and recorded as
-        m['extras'][name] = {'error': ...}."""
-        for name, fn in package.active().evals_of(self.cfg['game']).items():
+        m['extras'][name] = {'error': ...}. One with a cadence of its own (GamePackage.evals_every,
+        docs/az.md 40) runs only when it is due and is passed over silently otherwise."""
+        pkg = package.active()
+        for name, fn in pkg.evals_of(self.cfg['game']).items():
+            if not pkg.eval_due(name, self.cfg, it):
+                continue
             t0 = time.time()
             try:
                 r = fn(self, it)

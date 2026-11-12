@@ -67,7 +67,20 @@ class GamePackage:
                     as {"error": ...}, the run goes on); measuring only, never a training
                     signal. By convention the dict holds `value` (the dashboard's series),
                     optional `label`, `pct` (a share: shown as a percentage) and `refs`
-                    ({name: value}: reference lines, e.g. baselines on the same positions)
+                    ({name: value}: reference lines, e.g. baselines on the same positions).
+                    A remote evaluation (zero.remote, docs/az.md 5.2) runs them on the remote and
+                    brings `extras` back into the run's evals.jsonl (docs/az.md 40)
+    settings        {name: default}: run settings of the package's own (docs/az.md 40), e.g. an extra
+                    evaluation's options or its hooks' (`selfplay_specs`) - zero.run adds them to
+                    DEFAULTS (a flag each `--name`, saved in the run's config.json, presets and the
+                    package's defaults may set them, shipped to a remote evaluation's mirror with the
+                    rest); a name of the core's, an auxiliary target's or a reader's is refused. The
+                    core never reads them: the package's hooks and evaluations do. Default none
+    evals_every     {eval name: run setting}: an extra evaluation (`evals`) with a cadence of its own
+                    (docs/az.md 40): it runs only on evaluated iterations that are multiples of the
+                    setting's value, and never - silently: no log line, no `extras` key - while the
+                    value is 0. The setting must be one of `settings` with an integer default.
+                    Without an entry an extra evaluation runs on every evaluated iteration, as before
     aux             game -> its auxiliary training targets (docs/az.md 15): [{name, width, loss}, ...]
                     in the order of the game's `SearchGame::AUX` segments (the engine computes
                     them: a run checks the names and widths against it), loss 'multinomial' |
@@ -94,10 +107,6 @@ class GamePackage:
                     (logged, retried). Paths are relative and '/'-separated, formatted with
                     `iter` = the evaluated iteration ('games/eval-iter_{iter:04d}.jsonl': MTG Zero's
                     game log of the evaluation's games). Default none: the copies of before
-    settings        the package's own run settings {name: default} (docs/az.md 40): added to
-                    zero.run.DEFAULTS (so presets, flags `--name` and config.json carry them, as the
-                    core's); a name of the core's, an auxiliary target's or a reader's is an error. Read
-                    only by the package's hooks. Default none
     selfplay_specs  game -> fn(run, it) -> spec JSON or None, or 'module:attr' (docs/az.md 40): the
                     spec of iteration `it`'s self-play (`run`: the `zero.run.Run`), asked at the start
                     of each local self-play phase; None = the run's spec (as before). A rolling driver
@@ -118,7 +127,7 @@ class GamePackage:
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
-                 remote_eval_inputs=None):
+                 remote_eval_inputs=None, evals_every=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -154,6 +163,21 @@ class GamePackage:
         self.settings = dict(settings or {})
         self.selfplay_specs = dict(selfplay_specs or {})
         self.remote_eval_inputs = dict(remote_eval_inputs or {})
+        self.evals_every = dict(evals_every or {})
+        for ev, s in self.evals_every.items():
+            d = self.settings.get(s)
+            if s not in self.settings or not isinstance(d, int) or isinstance(d, bool) or d < 0:
+                raise ValueError(f'{name}: evals_every of {ev!r}: {s!r} is not one of the package\'s settings with an '
+                                 f'integer default >= 0')
+
+    def eval_due(self, name, cfg, it):
+        """Whether the extra evaluation `name` runs on the evaluated iteration `it` of a run with settings
+        `cfg` (`evals_every`: a multiple of its setting's value, never at 0; without an entry: always)."""
+        s = self.evals_every.get(name)
+        if s is None:
+            return True
+        n = int(cfg.get(s, self.settings[s]) or 0)
+        return n > 0 and int(it) % n == 0
 
     def selfplay_spec_fn(self, game):
         """`game`'s self-play spec hook fn(run, it) -> spec JSON or None (`selfplay_specs`), or None."""
