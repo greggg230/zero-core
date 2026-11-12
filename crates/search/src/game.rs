@@ -2,6 +2,7 @@
 //! from a game (docs/search.md 1). The toy game (`toy.rs`) and each game's AZ decision layer
 //! (Caverna Zero, Glass Road Zero) implement it.
 use crate::rng::Rng;
+pub use crate::tail::{TailBuf, TailSeg};
 
 /// Value / margin vectors are fixed arrays of this many seats (Caverna: up to 7 players; Glass
 /// Road 1-4): the protocol and the network's value head always carry 8.
@@ -88,6 +89,29 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn encode_sparse(&self, viewer: usize, scratch: &mut [f32], idx: &mut Vec<u32>, val: &mut Vec<f32>) {
         self.encode(viewer, scratch);
         sparse_scan(scratch, idx, val);
+    }
+    /// Tail segments (docs/search.md 1.4). Default: none - every path below is the path of before.
+    const TAILS: &'static [TailSeg] = &[];
+    /// The rows carry pointer overrides (`option_overrides`). Default false.
+    const OPTION_POINTERS: bool = false;
+    /// A row's capacity 1 + Σ head slots + its tail tokens may not pass this (docs/search.md 2.15). Required finite
+    /// when `TAILS` is non-empty (a const assert in the driver).
+    const MAX_ROW_TOKENS: usize = usize::MAX;
+    /// `encode(viewer)` as the head, plus the tail tokens (`tail` empty on entry, any order: the driver sorts and
+    /// validates). `head` is zeroed by the caller. Default: `encode` and no tokens.
+    ///
+    /// With `TAILS` non-empty, `encode` must return the head of `encode_row` and **panic if the tail would be
+    /// non-empty** (the refusal of head-only callers, R1), and the driver never calls `encode_sparse`: it calls
+    /// `encode_row` into its scratch row, then `sparse_scan`.
+    fn encode_row(&self, viewer: usize, head: &mut [f32], tail: &mut TailBuf) {
+        let _ = tail;
+        self.encode(viewer, head)
+    }
+    /// The pointer overrides of `viewer`'s row (docs/search.md 2.15): (index in `legal`, packed token or -1),
+    /// appended to `out` (empty on entry), indexes ascending. Called only for a row with options and only when
+    /// `OPTION_POINTERS`. `legal` is `legal_actions()`, in its order. Default: none.
+    fn option_overrides(&self, viewer: usize, legal: &[u16], out: &mut Vec<(u32, i64)>) {
+        let _ = (viewer, legal, out);
     }
     /// Rounds played so far (reports).
     fn rounds(&self) -> u32 {

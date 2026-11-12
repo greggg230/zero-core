@@ -178,6 +178,29 @@ the next round's card, hidden until its round (a one-hot over the 6 cards; zero 
 Default: no targets (`AUX` empty). The loss of each segment is the game package's (zero/package.py
 `aux`). A driver created with `aux` records it (2.4); `Game.aux_target(viewer)` returns it.
 
+### 1.4 Variable-length rows: tail tokens and pointer overrides (opt-in; MTG Zero's layout v7, 2026-11-11)
+
+A token-layout game whose sets have no fixed size (MTG: a hand past 16 cards, a stack past 8, delayed triggers)
+declares **tail segments**. Its network row is then the fixed-width **head** (`encode`, `NUM_FEATURES` floats,
+as before) plus a **tail** of extra tokens, one per object past a segment's head slots or of a tail-only
+segment (count 0), and, with `OPTION_POINTERS`, the row's **pointer overrides**. The API is frozen in
+`varlen_api.md` (the mtg-zero scratch notes); the trait items, all defaulted, follow `encode_sparse`:
+
+| Item | Default | Meaning |
+|---|---|---|
+| `const TAILS: &[TailSeg]` | `&[]` | the layout's tail segments in layout order: `{seg, name, width, head}` (`seg` = the segment's index in the layout's `segments`, `head` = its head slots) |
+| `const OPTION_POINTERS: bool` | false | rows carry pointer overrides |
+| `const MAX_ROW_TOKENS: usize` | `usize::MAX` | the resource limit of a row's capacity `1 + Σ head + tail` (2.15); must be finite with `TAILS` (a compile-time assert in `Driver::new`, R3) |
+| `fn encode_row(viewer, head, tail: &mut TailBuf)` | `encode(viewer, head)`, no token | the head plus the tail tokens: `tail.token(seg, slot)` returns a zeroed slice of the segment's width; any order (the driver seals: sorted by (seg, slot), a duplicate or a slot inside the head panics, R2) |
+| `fn option_overrides(viewer, legal, out)` | none | `(index in legal, tok)`, ascending: `tok = tail::pack_tok(seg, col, slot)` = `(seg << 40) \| (col << 32) \| slot`, or -1 = the generic logit. Only for rows with options, only with `OPTION_POINTERS` |
+
+* `encode` stays required. A game with tails returns `encode_row`'s head from it and **panics when the tail would
+  be non-empty** (R1): a head-only caller can never silently drop tokens. `encode_sparse` is not called for such a
+  game: the driver encodes `encode_row` into its scratch row and scans it (`sparse_scan`).
+* Module `tail` holds `TailSeg`, `TailBuf` (the encoder's buffer), `TailRow` (a sealed row in a `Record`),
+  `pack_tok` / `unpack_tok` and `tail_mix` (the observation keys, 2.15).
+* A game without `TAILS` and `OPTION_POINTERS` takes every path of before, byte for byte.
+
 ## 2. The driver protocol (Python <-> Rust)
 
 ```python

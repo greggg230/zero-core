@@ -845,7 +845,7 @@ impl PySearchDriver {
         }
         let branch = branch.map(parse_branch).transpose()?;
         let starts = starts.map(parse_starts).transpose()?;
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts };
+        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts, max_row_tokens: None };
         let d = new_driver(game, cfg).map_err(verr)?;
         let nfeat = d.info().num_features;
         Ok(PySearchDriver { d, nfeat })

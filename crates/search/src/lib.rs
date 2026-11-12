@@ -13,6 +13,8 @@
 //!   with a deferred result decided by toy matches (deferred terminals, teams, co-training).
 //! * `lookahead`: the exhaustive lookahead per information set (docs/search.md 3.9; a seat's opt-in
 //!   `lookahead`), its rows batched through the driver like MCTS leaves.
+//! * `tail`: variable-length rows (docs/search.md 1.4, 2.15): a row's tail tokens past the fixed-width head and
+//!   its pointer overrides (`SearchGame::TAILS`, `encode_row`, `option_overrides`).
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
 pub mod driver;
 pub mod dynapi;
@@ -20,6 +22,7 @@ pub mod game;
 pub mod lookahead;
 pub mod noise;
 pub mod rng;
+pub mod tail;
 pub mod toy;
 pub mod toy_team;
 pub mod tree;
@@ -35,4 +38,5 @@ pub(crate) mod peek_game;
 pub(crate) mod counter_game;
 
 pub use game::{belief_weight, team_of, Belief, Bot, SearchGame, MAX_SEATS};
+pub use tail::{pack_tok, unpack_tok, TailBuf, TailRow, TailSeg};
 pub use rng::Rng;

@@ -68,6 +68,7 @@ use std::time::Instant;
 use crate::game::{make_bot, Belief, Bot, SearchGame, MAX_SEATS};
 use crate::lookahead::{Look, LookCfg};
 use crate::rng::{split64, Rng};
+use crate::tail::TailRow;
 use crate::tree::Tree;
 
 mod worker;
@@ -778,6 +779,10 @@ pub struct DriverCfg {
     pub branch: Option<BranchCfg>,
     /// Archive starts (docs/search.md 2.11, `StartsCfg`). None (the default): nothing changes.
     pub starts: Option<StartsCfg>,
+    /// The resource limit of a row (docs/search.md 2.15): None = the game's `SearchGame::MAX_ROW_TOKENS`; tests may
+    /// set it lower, never higher (refused). A row whose capacity `1 + Σ head slots + tail tokens` passes it aborts
+    /// its game. Without `TAILS` no row has a tail and nothing changes.
+    pub max_row_tokens: Option<usize>,
 }
 
 /// A finished game (docs/search.md 2.5).
@@ -827,6 +832,11 @@ pub struct Record {
     pub net: u32,
     /// The decider's auxiliary targets at this decision (`DriverCfg::aux`), else empty.
     pub aux: Vec<f32>,
+    /// The row's tail tokens (docs/search.md 2.15; empty without `SearchGame::TAILS`).
+    pub tail: TailRow,
+    /// The row's pointer overrides against `opts` (docs/search.md 2.15; empty without
+    /// `SearchGame::OPTION_POINTERS`).
+    pub ov: Vec<(u32, i64)>,
 }
 
 /// The kind of a network batch row (`Batch::extra`, docs/search.md 2.2): a leaf's own row (or a
@@ -870,6 +880,18 @@ pub struct Batch {
     pub xs_val: Vec<f32>,
     /// External batches: the exported state per row.
     pub states: Vec<String>,
+    /// Network batches of a game with `SearchGame::TAILS` (docs/search.md 2.15; else all empty): row b's tail
+    /// tokens are `[t_off[b], t_off[b + 1])` of `t_seg` / `t_slot` (B + 1 offsets even if every row's tail is
+    /// empty), their floats consecutive in `t_val` (`width(seg)` each).
+    pub t_off: Vec<i64>,
+    pub t_seg: Vec<u16>,
+    pub t_slot: Vec<u32>,
+    pub t_val: Vec<f32>,
+    /// With `SearchGame::OPTION_POINTERS` (else empty): row b's overrides are `[ov_off[b], ov_off[b + 1])` of
+    /// `ov_opt` (the option's index in the row) / `ov_tok` (`tail::pack_tok`, or -1: the generic logit).
+    pub ov_off: Vec<i64>,
+    pub ov_opt: Vec<i32>,
+    pub ov_tok: Vec<i64>,
 }
 
 /// Rows of one chunk for one key.
@@ -1074,17 +1096,20 @@ struct ParkedRecord {
     pi: Vec<f32>,
     net: u32,
     aux: Vec<f32>,
+    tail: TailRow,
+    ov: Vec<(u32, i64)>,
 }
 
 impl ParkedRecord {
     fn park(r: Record) -> ParkedRecord {
-        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux }
+        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux, tail: r.tail, ov: r.ov }
     }
     fn unpark(self) -> Record {
-        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux }
+        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux, tail: self.tail, ov: self.ov }
     }
     fn bytes(&self) -> usize {
         std::mem::size_of::<Self>() + self.x.len() * 2 + self.opts.len() * 2 + self.pi.len() * 4 + self.aux.len() * 4
+            + self.tail.seg.len() * 6 + self.tail.val.len() * 4 + self.ov.len() * 16
     }
 }
 
@@ -1625,6 +1650,12 @@ pub struct DriverStats {
     /// network rows their one-ply lookaheads sent (all 0 without).
     pub value_choices: u64,
     pub value_choice_rows: u64,
+    /// Variable-length rows (docs/search.md 2.15; all 0 without `SearchGame::TAILS`): network rows sent with at
+    /// least one tail token, their tail tokens, the most in one row, games aborted by `max_row_tokens`.
+    pub tail_rows: u64,
+    pub tail_tokens: u64,
+    pub tail_max: u64,
+    pub aborted_row_tokens: u64,
 }
 
 /// The games in progress.
@@ -1676,6 +1707,13 @@ pub struct Driver<G: SearchGame> {
 
 impl<G: SearchGame> Driver<G> {
     pub fn new(cfg: DriverCfg) -> Result<Driver<G>, String> {
+        // R3 (docs/search.md 2.15): a game with tail segments declares a finite row limit
+        const { assert!(G::TAILS.is_empty() || G::MAX_ROW_TOKENS != usize::MAX, "a game with TAILS must set a finite MAX_ROW_TOKENS") };
+        if let Some(m) = cfg.max_row_tokens {
+            if m > G::MAX_ROW_TOKENS {
+                return Err(format!("max_row_tokens {m} is above the game's {} (it may only lower it)", G::MAX_ROW_TOKENS));
+            }
+        }
         let spec = G::parse_spec(&cfg.spec)?;
         for (g, s) in cfg.games.iter().enumerate() {
             if !(G::MIN_PLAYERS..=G::MAX_PLAYERS.min(MAX_SEATS)).contains(&s.len()) {
@@ -2338,6 +2376,10 @@ impl<G: SearchGame> Driver<G> {
             starts: c.starts.load(Ordering::Relaxed),
             value_choices: c.value_choices.load(Ordering::Relaxed),
             value_choice_rows: c.value_choice_rows.load(Ordering::Relaxed),
+            tail_rows: 0,
+            tail_tokens: 0,
+            tail_max: 0,
+            aborted_row_tokens: 0,
         }
     }
 
@@ -2401,6 +2443,17 @@ pub struct SampleArrays {
     /// Auxiliary targets [n * aw] (`DriverCfg::aux`; aw = 0: none recorded).
     pub aw: usize,
     pub aux: Vec<f32>,
+    /// Variable-length rows (docs/search.md 2.15): `tails` - the game declares `TAILS`, so the `t_*` arrays are
+    /// present (`t_off` n + 1 entries); `pointers` - `OPTION_POINTERS`, so the `ov_*` arrays are. Else all empty.
+    pub tails: bool,
+    pub pointers: bool,
+    pub t_off: Vec<i64>,
+    pub t_seg: Vec<u16>,
+    pub t_slot: Vec<u32>,
+    pub t_val: Vec<f32>,
+    pub ov_off: Vec<i64>,
+    pub ov_opt: Vec<i32>,
+    pub ov_tok: Vec<i64>,
 }
 
 pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
@@ -2421,6 +2474,15 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
         net: Vec::with_capacity(n),
         aw,
         aux: Vec::with_capacity(n * aw),
+        tails: false,
+        pointers: false,
+        t_off: Vec::new(),
+        t_seg: Vec::new(),
+        t_slot: Vec::new(),
+        t_val: Vec::new(),
+        ov_off: Vec::new(),
+        ov_opt: Vec::new(),
+        ov_tok: Vec::new(),
     };
     for r in recs {
         debug_assert_eq!(r.x.len(), f);

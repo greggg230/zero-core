@@ -620,6 +620,12 @@ fn mix(a: &mut u64, b: &mut u64, i: u64, v: u64) {
     *b = (b.wrapping_add(k ^ (i << 1))).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
 }
 
+/// `mix` for the tail's key mixing (`tail::tail_mix`, docs/search.md 2.15).
+#[inline(always)]
+pub(crate) fn obs_mix(a: &mut u64, b: &mut u64, i: u64, v: u64) {
+    mix(a, b, i, v)
+}
+
 /// `obs_hash`'s finish over the encoding's length `n`.
 #[inline(always)]
 fn obs_finish(a: u64, b: u64, n: usize) -> u128 {

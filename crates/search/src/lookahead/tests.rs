@@ -314,6 +314,7 @@ fn driver_cfg(seats: Vec<SeatCfg>, games: usize, threads: usize) -> DriverCfg {
         sparse: false,
         branch: None,
         starts: None,
+        max_row_tokens: None,
     }
 }
 

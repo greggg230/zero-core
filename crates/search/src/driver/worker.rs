@@ -1144,7 +1144,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             aux.resize(G::aux_width(), 0.0);
             g.aux_target(p, &mut aux);
         }
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux });
+        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, tail: TailRow::default(), ov: Vec::new() });
         slot.rq.push(if gumbel {
             tree.gumbel_q()
         } else if pruned.is_some() {
@@ -1172,7 +1172,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                 if seat.view_target == ViewTarget::NextQ {
                     slot.view_wait.push((slot.records.len() as u32, o as u8));
                 }
-                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux });
+                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, tail: TailRow::default(), ov: Vec::new() });
                 slot.rq.push(None);
                 n.view_recorded += 1;
             }
