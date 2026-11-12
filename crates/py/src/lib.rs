@@ -194,7 +194,9 @@ fn starts_json(d: &Bound<'_, PyDict>) -> PyResult<Value> {
             let mut list = Vec::new();
             for e in x.try_iter()? {
                 let e = e?;
-                let pair = (e.downcast::<PyTuple>().is_ok() || e.downcast::<PyList>().is_ok()).then(|| e.extract::<(String, Bound<'_, PyAny>)>().ok()).flatten();
+                // (a tuple or a list of two: the id, the spec)
+                let two: Option<Vec<Bound<'_, PyAny>>> = if e.downcast::<PyTuple>().is_ok() || e.downcast::<PyList>().is_ok() { e.try_iter()?.collect::<PyResult<Vec<_>>>().ok() } else { None };
+                let pair = two.filter(|v| v.len() == 2).and_then(|v| Some((v[0].extract::<String>().ok()?, v[1].clone())));
                 list.push(match pair {
                     Some((id, sp)) => Value::Array(vec![Value::String(id), Value::String(spec_json(Some(&sp))?)]),
                     None => to_json(&e)?,

@@ -84,7 +84,7 @@ def main():
     # deliberate differences, shown separately
     extra = {
         'bot with another key': ([[{'bot': 'random', 'sims': 8}, {}]], {}),
-        'starts list entries': ([[{'sims': 8, 'selfplay': True}] * 2], dict(record=True, starts={'p': 0.1, 'specs': [['a', '{}']]})),
+        'starts list entries': ([[{'sims': 8, 'selfplay': True}] * 2], dict(record=True, starts={'p': 0.1, 'specs': [['a', {'z': 1, 'a': [1, 2.5]}]]})),
     }
     bad = 0
     for name, (seats, kw) in list(cs.items()) + list(extra.items()):
