@@ -2023,7 +2023,14 @@ another class or decider, not a root option: the tree as it was), `without_answe
 (CounterAuto matches through the driver: complete, the same across thread counts, fewer leaves than with the forced
 answer opaque - the reused roots' evaluations saved). MTG Zero: `engine/tests/autopass_reuse.rs` (its ENGINE.md 149).
 
-**Measured.** MEASURED
+**Measured** (the desktop, 2026-11-13, MTG Zero's `engine/tests/autopass_reuse.rs`, its ENGINE.md 149.3: 30 games per
+pool of heuristic play, the mover's search through the real move at every live transition after the other player's
+pass, each walk's observation generated from its own path against the walks the reused root holds). Forced passes:
+cube 2,585 transitions, 339,433 walks observed the line, the reuse of before held 98.9% of them, the line 100% (at every
+transition); the Delver mirror 3,063 transitions, 379,724 walks, 98.1% before, 100% after. Asked-and-passed (before:
+the tree dropped): 1,630 / 1,927 transitions, every walk of the line reused. The line and merge cost 2.6 us a transition
+(the old lookup 0.5 us); the Delver search smoke (2.2 million simulations with a uniform evaluator) ran at the same
+38-42 us a simulation before and after.
 
 Code: `game.rs` (`ANSWERS`, `decision_tag`, `answer_obs`, `key_obs`, `KeyObs`), `tree.rs` (`Node::tag`, `tag_of`,
 `advance_tagged`, `follow`, `line_start` / `line_answer` / `line_advance` / `line_reach`, `line_nodes`, `absorb`,
