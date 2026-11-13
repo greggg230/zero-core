@@ -6306,6 +6306,21 @@ one `<base>/HEAD`: the shared-target hazard (cargo's workspace-relative dep-info
 another's module) as the default. Now a detached checkout gets `detached-<its directory's name>` (a branch: its name as
 before, `/` -> `_`; not a git checkout: `nogit`), as MTG Zero's own `tools/build_py.sh` now names it.
 
+### 47.14 The compat goldens' random network for a game with tail segments (integration of 2026-11-13)
+
+`selfplay_digest.py --net random` built an MLP (64 x 2) for every game, and `NetEvaluator` refuses any network but a
+token network of the game's tail segments for a game that declares them (43.8, R4): so `check_checkpoint_compat
+--net random` could not run on any MTG Zero commit since layout v7, at either pin - and with it neither the
+`search-core` nor the `optin-core` tier's compat step of MTG Zero's `tools/gate.py` (lanes C2 and D of the Fable
+review both met it and compared with `--net uniform` by hand: 47.12's checks, MTG Zero ENGINE.md 144.4 and 145.5).
+Now `--net random` for a game with tail segments (`games.info(game)['tails']` not empty) is a token network of the
+game package's object layout (`net.make_net(..., arch='tokens', hidden=32, blocks=1, heads=2, ff=64)`, torch seed 0,
+the evaluator `'random tokens'`), small so that a CPU at 1 thread plays MTG's goldens in minutes; every other game
+keeps the MLP of before (the same seed, the same digests). Both sides of a compat check run the tool beside it, so
+the network is the same on both when the two checkouts' layouts are (a layout change differs, as an MLP's width
+change always did). Test: `tests/test_run_infra.py::test_a_random_network_for_a_game_with_tails_is_a_token_network`
+(toy_tail: the token network, samples and tails recorded, a checkout against itself identical; the toy: the MLP).
+
 ## 48. Self-play's host costs after layout v7: tail rows scanned at encode, the phase's time split (the 2026-11-12 performance review, MTG Zero lane D; branch `perf/fable-1112`)
 
 (Numbered 44 on its branch `perf/fable-1112` and in that branch's commit messages; renumbered 48 when it was merged

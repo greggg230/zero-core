@@ -20,8 +20,10 @@ and after (the same names are shims of the core), and on zero-core itself (`--ro
   alternating, evaluation settings (no noise): results digest and the network's score.
 
 Evaluators: 'uniform' (exact arithmetic: uniform priors, value 1/n), 'random' (a randomly
-initialised network, torch seed 0, 64 x 2), or a checkpoint (`--model`). The torch evaluators
-run on the CPU with 1 thread.
+initialised network, torch seed 0: an MLP 64 x 2, or for a game with tail segments - which
+refuses any network but a token network of its layout, docs/az.md 43.8 R4 - a token network of
+the package's object layout, d 32, 1 layer, 2 heads: 'random tokens', docs/az.md 47.14), or a
+checkpoint (`--model`). The torch evaluators run on the CPU with 1 thread.
 """
 import argparse
 import hashlib
@@ -140,12 +142,20 @@ def main(argv=None):
     else:
         game = a.game or 'toy'
         info = G.info(game)
-        if a.net == 'random':
+        if a.net == 'random' and info.get('tails'):
+            # a game with tail segments takes a token network of its layout only (NetEvaluator's R4, docs/az.md
+            # 43.8: an MLP would drop every row's tail): a random one of the package's object layout, small enough
+            # for a CPU at 1 thread (d 32, 1 layer, 2 heads, ff 64; docs/az.md 47.14)
+            torch.manual_seed(0)
+            ev = infer.NetEvaluator(net.make_net(info, game, arch='tokens', hidden=32, blocks=1, heads=2, ff=64), 'cpu')
+            out['evaluator'] = 'random tokens'
+        elif a.net == 'random':
             torch.manual_seed(0)
             ev = infer.NetEvaluator(net.Net(info['num_features'], info['num_actions'], 64, 2, game=game).eval(), 'cpu')
+            out['evaluator'] = 'random'
         else:
             ev = infer.UniformEvaluator()
-        out['evaluator'] = a.net
+            out['evaluator'] = 'uniform'
     spec = a.spec if a.spec is not None else ''
     out.update(game=game, spec=spec, games=a.games, sims=a.sims, sims_fast=a.sims_fast, p_full=a.p_full,
                chance_k=a.chance_k, seed=a.seed, targets={})

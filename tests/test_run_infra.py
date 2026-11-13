@@ -543,3 +543,31 @@ def test_check_checkpoint_compat_names_the_arrays_it_compared():
     assert r.stdout.count('  arrays hashed: aux, n_players, net, opt_action, pi, player, q, sc, x, z') == 2, r.stdout
     res = json.loads(r.stdout.strip().splitlines()[-1])
     assert res['identical'] is True and 'aux' in res['arrays']
+
+
+def test_a_random_network_for_a_game_with_tails_is_a_token_network():
+    """`--net random` for a game with tail segments (toy_tail): a random token network of the package's layout -
+    NetEvaluator refuses an MLP for such a game (docs/az.md 43.8 R4), so the compat goldens could not run on one
+    (MTG Zero's layout v7: gate.py's compat step, docs/az.md 47.14). The toy keeps its MLP; check_checkpoint_compat
+    of a checkout against itself is identical with it."""
+    e = dict(os.environ, PYTHONIOENCODING='utf-8', CUDA_VISIBLE_DEVICES='-1')
+    e.pop('PYTHONPATH', None)
+    core = os.path.join(ROOT, 'python')
+    small = ['--games', '4', '--sims', '4', '--targets', 'visits', '--match-games', '2']
+    out = {}
+    for game in ('toy', 'toy_tail'):
+        r = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'selfplay_digest.py'), '--root', core,
+                            '--package', 'zero', '--game', game, '--net', 'random', *small], cwd=ROOT,
+                           capture_output=True, text=True, timeout=300, env=e)
+        assert r.returncode == 0, r.stdout + r.stderr
+        out[game] = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out['toy']['evaluator'] == 'random' and out['toy_tail']['evaluator'] == 'random tokens'
+    t = out['toy_tail']['targets']['visits']
+    assert t['samples'] > 0 and {'t_seg', 't_slot', 't_val'} <= set(t['arrays'])
+    r = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'check_checkpoint_compat.py'), '--old', core, '--new',
+                        core, '--package', 'zero', '--net', 'random', '--game', 'toy_tail', *small], cwd=ROOT,
+                       capture_output=True, text=True, timeout=600, env=e)
+    assert r.returncode == 0, r.stdout + r.stderr
+    res = json.loads(r.stdout.strip().splitlines()[-1])
+    assert res['identical'] is True and res['evaluator'] == 'random tokens'
+    assert res['arrays'] == out['toy_tail']['targets']['visits']['arrays']
