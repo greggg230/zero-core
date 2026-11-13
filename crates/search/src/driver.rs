@@ -1004,7 +1004,8 @@ impl LeafBuf {
     }
     /// A new row: `g.encode(viewer)` (dense: into `x`; sparse: `encode_sparse`, its non-zeros appended
     /// without a scan of the whole row, docs/search.md 2.12); a game with tails: `encode_row` into `x` or the
-    /// scratch row, its tail sealed into `tb` (docs/search.md 2.15). `seal` or `unrow` it afterwards. -> the row's
+    /// scratch row, then (sparse) the scratch row's non-zeros appended at once by `game::sparse_scan`, its tail
+    /// sealed into `tb` (docs/search.md 2.15). `seal` or `unrow` it afterwards. -> the row's
     /// capacity when it passes the limit (`1 + Σ head + tail` > `max_row_tokens`: the caller unrows it and aborts
     /// the game), else None.
     fn encode_row<G: SearchGame>(&mut self, g: &G, viewer: usize) -> Option<usize> {
@@ -1013,8 +1014,14 @@ impl LeafBuf {
             self.tb.clear();
             self.open = None;
             if self.sparse {
+                // the head's non-zeros appended at once, as `encode_sparse`'s are (docs/search.md 2.12, 2.15): the
+                // scratch row is scanned (and zeroed again) here, so the row's key reads its pairs
+                // (`obs_state_sparse`: the dense key), a cached row is truncated instead of the scratch zeroed, and
+                // `seal` only counts
                 self.zeroed_scratch(f);
                 g.encode_row(viewer, &mut self.scratch, &mut self.tb);
+                self.open = Some(self.xs_idx.len());
+                crate::game::sparse_scan(&mut self.scratch, &mut self.xs_idx, &mut self.xs_val);
             } else {
                 let off = self.x.len();
                 self.x.resize(off + f, 0.0);

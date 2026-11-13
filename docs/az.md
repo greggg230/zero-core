@@ -6104,3 +6104,33 @@ step cost +21-22% of v6's where the steady state's is +11-12%) plus one recomput
 one by > 0.2 nats (3 seeds, eager; and train_static), the widen exact at step 0; a noise segment does no harm and its
 gate stays below 0.25. `tests/test_tail_net.py::test_gradients_reach_the_gates`: with the shadow every gated segment's
 maps get a gradient at g = 0; without it (`gate_shadow` 0) exactly none, the forward the same bit for bit.
+
+## 44. Self-play's host costs after layout v7: tail rows scanned at encode, the phase's time split, records as their non-zeros (the 2026-11-12 performance review, MTG Zero lane D; branch `perf/fable-1112`)
+
+The 2026-11-12 review of MTG Zero (its perf slice: `perf.md`, the patches P2 and P5) measured zero-core's driver on
+the live run's spec (the constructed Delver best-of-three, layout v7) with an instantaneous evaluator and found two
+costs this window's work had added - v7's tails had switched MTG's rows off the sparse path of docs/search.md 2.12,
+and every record kept a dense row of 56,384 floats for as long as its contest lasted - and a phase whose metrics could
+not say what it waited for (32k leaves/s in the live run against 61k in 43.12's quiet benchmark of the same network).
+44.1 and 44.2 are behaviour-preserving (the same batches, samples, results and shards); 44.3 changes a public Rust
+struct (`Record`) and every game that reads a record's row must follow it when it bumps its pin.
+
+### 44.1 Tail rows scanned when they are encoded (driver; no setting)
+
+**Why.** For a game with `TAILS` a sparse buffer (`sparse` 1) left an `encode_row` row in its dense scratch until
+`seal`: the evaluation cache's key (3.12) was `obs_state` over all `NUM_FEATURES` floats, a cached row zeroed the whole
+scratch again and a sent row was scanned at `seal`. A game without tails has had its pairs at once since 2.12.
+
+**What.** `LeafBuf::encode_row` (tails, sparse) runs `game::sparse_scan` right after `encode_row` and marks the row open,
+as `encode_sparse` does: the key reads the pairs (`obs_state_sparse`, the same key), `unrow` truncates, `seal` counts.
+docs/search.md 2.15 already said so ("the driver ... calls `encode_row` into its scratch row, then `sparse_scan`").
+
+**Checks.** The same batches, samples and results: the review's driver hash (MTG Zero's `engine/tests/driver_bench.rs`,
+every batch's rows, options, tails, overrides, every sample and result over 40,000 batches) `f8cfeb414c6c3322` before
+and after (MTG Zero ENGINE.md 145). `driver::tail_tests::a_sparse_tail_row_is_scanned_when_encoded` (new): the open row
+is its pairs at once, the scratch zeros again, the key the dense row's, the pairs `sparse_scan`'s of the dense row,
+`unrow` / `seal`. The existing `dense_and_sparse_rows_are_the_same` and
+`the_evaluation_cache_keys_cover_tails_and_overrides` (sparse vs dense: the same rows, games and cache hits) pass.
+
+**Measured** (MTG Zero v7 Delver Bo3, desktop CPU, the review): the row's key 5.46 -> 1.15 us, seal or un-row 4.33 ->
+~0, encode + scan 4.45 -> 9.6 us; rows in all 23.2 -> 17.5 us per simulation. ENGINE.md 145 has this branch's A/B.

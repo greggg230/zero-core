@@ -241,6 +241,43 @@ fn the_evaluation_cache_keys_cover_tails_and_overrides() {
     assert_eq!(h1, h2, "dense and sparse rows have equal keys");
 }
 
+/// A sparse buffer of a game with tails takes an `encode_row` row's non-zeros at once (docs/search.md 2.15; the
+/// 2026-11-12 review's P2: layout v7's tails had switched MTG's rows off the sparse path of 2.12): the row is open
+/// as its pairs and the scratch row zeros again, its key is the dense row's, its pairs are `sparse_scan`'s of the
+/// dense row, `unrow` takes back only them and `seal` counts them.
+#[test]
+fn a_sparse_tail_row_is_scanned_when_encoded() {
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let mut g = TailGame::new_game(&TailGame::parse_spec(r#"{"items0": 9}"#).unwrap(), 2, 5).unwrap();
+    let (mut rng, mut legal, mut keys) = (Rng::new(1), Vec::new(), Vec::new());
+    let mut tails = 0;
+    while g.to_move().is_some() {
+        for viewer in 0..2 {
+            let mut sb = LeafBuf::new::<TailGame>(true, usize::MAX);
+            let mut db = LeafBuf::new::<TailGame>(false, usize::MAX);
+            assert_eq!(sb.encode_row(&g, viewer), None);
+            assert_eq!(db.encode_row(&g, viewer), None);
+            tails += (sb.tb.len() > 0) as u32;
+            assert_eq!(sb.open, Some(0), "the row's pairs, at once");
+            assert!(sb.scratch.iter().all(|v| v.to_bits() == 0), "the scratch row zeros again");
+            assert_eq!(sb.row_hash(TF), db.row_hash(TF), "the dense row's key");
+            let (mut idx, mut val) = (Vec::new(), Vec::new());
+            let mut x = db.x.clone();
+            crate::game::sparse_scan(&mut x, &mut idx, &mut val);
+            assert_eq!((&sb.xs_idx, bits(&sb.xs_val)), (&idx, bits(&val)));
+            sb.unrow(TF);
+            assert!(sb.xs_idx.is_empty() && sb.xs_val.is_empty() && sb.open.is_none() && sb.tb.len() == 0);
+            assert_eq!(sb.encode_row(&g, viewer), None);
+            sb.seal();
+            assert_eq!(sb.xs_nnz, [idx.len() as u32]);
+            assert_eq!((&sb.xs_idx, bits(&sb.xs_val)), (&idx, bits(&val)));
+        }
+        g.legal_actions(&mut legal);
+        g.step(legal[rng.below(legal.len() as u32) as usize], &mut keys).unwrap();
+    }
+    assert!(tails > 0, "rows with tail tokens");
+}
+
 #[test]
 fn merged_trees_share_their_encoded_tails() {
     // information-set merging with the leaf rows taken from the merged tree's encoding (tail included) or encoded
