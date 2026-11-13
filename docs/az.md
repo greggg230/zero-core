@@ -6112,8 +6112,7 @@ the live run's spec (the constructed Delver best-of-three, layout v7) with an in
 costs this window's work had added - v7's tails had switched MTG's rows off the sparse path of docs/search.md 2.12,
 and every record kept a dense row of 56,384 floats for as long as its contest lasted - and a phase whose metrics could
 not say what it waited for (32k leaves/s in the live run against 61k in 43.12's quiet benchmark of the same network).
-44.1 and 44.2 are behaviour-preserving (the same batches, samples, results and shards); 44.3 changes a public Rust
-struct (`Record`) and every game that reads a record's row must follow it when it bumps its pin.
+44.1 and 44.2 are behaviour-preserving (the same batches, samples, results and shards).
 
 ### 44.1 Tail rows scanned when they are encoded (driver; no setting)
 
@@ -6134,3 +6133,23 @@ is its pairs at once, the scratch zeros again, the key the dense row's, the pair
 
 **Measured** (MTG Zero v7 Delver Bo3, desktop CPU, the review): the row's key 5.46 -> 1.15 us, seal or un-row 4.33 ->
 ~0, encode + scan 4.45 -> 9.6 us; rows in all 23.2 -> 17.5 us per simulation. ENGINE.md 145 has this branch's A/B.
+
+### 44.2 Where a self-play phase's seconds went (`selfplay.timing`; metrics only)
+
+**Why.** `infer_s` is the evaluator's whole call time; the driver's counters (`busy_s`, `wait_s`, `assemble_s`) were
+never written, so a phase at half the benchmark's leaves/s could not say whether it waited for the network, for the
+search threads or for neither (the GIL, the writer, the remote threads).
+
+**What.** Each self-play phase (plain, rolling, the shared queue's local driver) writes `selfplay.timing`: `busy_s` (the
+search threads' seconds in their chunks) and `busy_share` (of threads x the phase's seconds), `assemble_s` (batch
+assembly), `wait_s` (the driving thread's seconds blocked in `next_batch` for a group's searches) and `wait_share`,
+`infer_share` (`infer_s` over the phase), `launch_s` / `result_s` (of the evaluator's seconds, those of its CUDA
+graphs' launches - packing, the upload, the replay queued - and of their results - the wait for the device and the
+download; `NetEvaluator.launch_s` / `result_s`, reset per phase), `batches`, `threads`. A search-bound phase shows
+`wait_share` high and `busy_share` near 1; an inference-bound one sits in `result_s` with idle search threads; a phase
+with neither high spends its time in the driving thread itself. The other keys are unchanged.
+
+**Tests.** `test_loop.py::test_selfplay_metrics_split_the_phase_time` (the toy smoke's phases: the keys, shares within
+[0, 1], CPU: no launches), the shared queue's local driver in `test_shard_thread.py`.
+
+**Not measured here**: the live run's split (it needs a run on this commit; the GPU was busy with that run).
