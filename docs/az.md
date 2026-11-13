@@ -144,14 +144,14 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A comma-separated list = several hosts, each its own workers, mirror and shards, consumers `<name>/w<k>`, metrics `selfplay.remotes` (one name: exactly as before); a name `<prefix>:<arg>` calls the package's callable remote `<prefix>:`; the run directory's `selfplay_remotes` file (one name per line) replaces the list, is re-read at every phase start (hosts join and leave a live run) and alone turns remote self-play on (section 34). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6; a list too, never the file); its own is refused |
 | `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
-| `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); seconds the end of a phase waits for the remote's last shards (later ones are dropped) |
+| `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: those whose inference is CUDA / MPS - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
 | `selfplay_remote_linger` | 0 | 1 = the workers play on with their checkpoint between phases (while the run trains); those games count for the next iteration, one checkpoint stale (5.3) |
 | `selfplay_local_linger` | 0 | 1 = this machine's self-play plays on too while the run trains (a thread; CUDA batches on their own stream): its finished games count for the next iteration, one checkpoint stale, as the remote's linger (5.3, 10.10). Needs `selfplay_remote`; single-game runs without the league |
 | `shard_writer_thread`, `shard_writer_queue_mb` | 0, 4096 | 1 = self-play's training records are converted and written into shards on a writer thread of their own (`zero/shardthread.py`): the thread that drives the search only takes them (`SearchDriver.take_records`: moved, not copied), splits them per game and queues them, at most `shard_writer_queue_mb` MB (it waits while the queue is full, counted). The same shards byte for byte; the caller's timing changes which games finish when (a rolling or shared quota's). This machine's self-play (plain, rolling, the shared queue), the local linger and the remote's workers (their config's); metrics `selfplay.shard_writer`, `linger.samples_s`, `selfplay.remote.shard_writer`. Single-game runs (co-training refused). 0 = taken, converted and written between batches, as before (31) |
 | `selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` | 30, 3, 3600 | co-training (11.6): a worker backing off this many seconds gives its outstanding matches back; a match outstanding on a worker longer than this many of its expected latencies (at least 120 s; 0 = the timeout only) is requeued, and at the latest after `selfplay_remote_timeout` s of the worker's running time |
-| `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed |
+| `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed. A `cuda` / `mps` device (also `heldout_device`) the machine does not have refuses the run at its start (exit 78, 47.7; before 2026-11-12 training fell back to the CPU in silence) |
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
 | `sparse` | 0 | 1 = the run's drivers (self-play and matches) send sparse network batches (each row's non-zero features; docs/search.md 2.2): the same rows, games and samples; a token network's CUDA graphs scatter them on the device, other evaluators densify them (10.7) |
 | `eval_cache` | 0 | N > 0 = every network seat (self-play and evaluation) keeps its game's network answers, at most N per game, by a hash of each row's features and options, and answers a repeated row from them instead of sending it (docs/search.md 3.12; the same answers up to float rounding at another batch shape) (25) |
@@ -186,9 +186,15 @@ settings a run has not stored yet; a run directory keeps its settings across cod
   another encoding than this build's (the encoding guard, section 10.4); state `refused`, and the
   supervisor ends instead of restarting it.
 * **Resume semantics**: an iteration interrupted before its checkpoint is replayed from the
-  start (its data directory is cleared); one interrupted after the checkpoint was written
-  (`models/iter_N.json` holds its self-play / training stats) finishes its evaluation and Elo
-  matches on restart. Self-play games in progress are dropped (the toy: seconds of work).
+  start (its data directory is cleared) - unless its self-play phase had finished: then
+  `data/iter_N/DONE.json` records the phase and its shards, and a resume that finds the directory
+  exactly as recorded trains on it instead of playing the phase again (47.1, 2026-11-12); one
+  interrupted after the checkpoint was written (`models/iter_N.json` holds its self-play / training
+  stats) finishes its evaluation and Elo matches on restart. Self-play games in progress are
+  dropped (the toy: seconds of work).
+* **The supervisor gives up on a deterministic failure**: the same crash (the run's error text in
+  `run_state.json`, decimals masked) `<P>_SUPERVISE_SAME_CRASHES` times in a row (default 3; 0 =
+  never) ends it with state `refused` and the error (47.2).
 * `run_state.json` / `supervisor_state.json` (pid + creation time, state, timings) feed
   `runctl.run_status` (running / stopping / pausing / paused / resuming / starting /
   restarting / stopped), shown on the dashboard with Pause / Resume buttons and by
@@ -202,6 +208,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
 | `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15, `head_widened` {from, added} the iteration that widened it and per target its `rows` while the window holds shards of an older layout, section 37; with a reader on, `reader_<target>` its loss, `reader_<target>_hit`, and `readers`: the targets, `detach`, `added` the iteration that added them, section 36); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'; with `eval_games` 0 `eval_yard` has 0 games: the iteration is still evaluated, section 20.1), `elo` (`select`: its pool unless 'visits'), `elo_anchored` (with `elo_anchors`: the rating of the fit with the anchors fixed, section 20.1), `heldout` (with `heldout_shards`: the held-out losses, section 20.2), `phases` (seconds per phase), `seconds` |
 | `models/iter_NNNN.pt` | checkpoints (atomic; `extra['aux_older']`: the layouts a widened auxiliary head had, section 37); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
+| `data/iter_NNNN/DONE.json` | the iteration's self-play phase finished: its metrics, seconds and every shard (bytes, rows) of the directory (47.1); a resume before the checkpoint trains on the directory when it matches |
 | `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15; with `shard_sparse` the features as `x_ptr` / `x_idx` / `x_val` instead of `x`: section 32): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
 | `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
 | `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
@@ -351,7 +358,9 @@ yardsticks, the Elo matches and reference games - to another machine while the r
   and retried every `RETRY_S` (300 s) on the thread; later iterations queue behind it.
 * **Restart**: the evaluated iterations without a result (no `eval_yard` in metrics.jsonl, no row
   in evals.jsonl) are queued again. A run that has finished its iterations waits for its queue
-  (progress phase `remote evaluations`, at most 6 hours) unless STOP exists.
+  (progress phase `remote evaluations`, rewritten every poll) with no time limit unless STOP exists;
+  STOP during that wait logs the iterations not recorded and ends the run aborted, never `done`
+  (47.3; before 2026-11-12: at most 6 hours, then `done` with the evaluations missing and no line).
 * **On or off at a restart**: `--eval-remote <name>` (the evaluations made here so far are kept:
   a new mirror starts from them) or `--eval-remote ''` (the run evaluates here again, from its
   `elo/` as the remote last left it).
@@ -521,9 +530,11 @@ REFUSED the run's checkpoint ...` and plays on alone.
 * **Arrival**: fetch threads (one per worker) copy each announced shard of the running phase under a
   temporary name (`*.tmp.npz`: never a loadable shard name), check it - **the non-finite guard**
   (4.1) and the run's game / features / actions - and rename it into `data/iter_i/` beside the
-  run's own `r00` shards, then tell the worker to delete its copy. Only while phase i accepts: a
-  shard announced or still in flight after `end(it)`'s deadline is dropped (`late`, or `late_prev`
-  when it was announced after the phase closed), never moved into another iteration. **Staleness:
+  run's own `r00` shards, then tell the worker to delete its copy. Only while phase i accepts:
+  `end(it)` waits for every shard of the phase while the run goes on (47.4) and, once STOP is there,
+  at most `selfplay_remote_wait` s more; a shard announced or still in flight after that is dropped
+  (`late`, or `late_prev` when it was announced after the phase closed; the record says `cut`),
+  never moved into another iteration. **Staleness:
   same phase only** - a shard of phase i holds the games the run accepted for phase i, searched
   with checkpoint i-1 and (carried over) earlier ones, exactly what the run's own rolling driver puts
   into `data/iter_i/`. Every arrived shard's `net` column goes into the iteration's **staleness
@@ -565,7 +576,8 @@ REFUSED the run's checkpoint ...` and plays on alone.
   commit) is read when the run starts, and the remote command checks it again (MTG Zero: `python -m
   mtgz.az.remote selfplay` refuses other code than the run's, as `eval` does).
 * **Settings** (section 1.2): `selfplay_remote`, `selfplay_remote_procs` (0), `selfplay_remote_wait`
-  (30 s: how long the end of a phase waits for the last shards), `selfplay_remote_inflight` (1.0),
+  (30 s: how long the end of a phase still waits for the last shards once STOP is there; without STOP it waits for
+  all of them, 47.4), `selfplay_remote_inflight` (1.0),
   `selfplay_remote_batch` ('auto') and `selfplay_remote_batch_inflight` (2.0: a batch-bound
   consumer's games in iterations; 1 = as the others), `selfplay_remote_linger` (0), and co-training's `selfplay_remote_giveback` (30 s),
   `selfplay_remote_overdue` (3) and `selfplay_remote_timeout` (3,600 s, the ceiling). **An existing
@@ -2043,10 +2055,13 @@ the MacBook plays a share of the 4v4 run's drafted matches with the play network
   over its measured rate), at least `OVERDUE_MIN_S` (120 s), at most `selfplay_remote_timeout` s
   (default 3600: the first design's only limit) - of that worker's **running time** (its `active_s`,
   which stops between phases and while it backs off, so a long evaluation phase here does not time
-  episodes out). A requeued episode may still finish on the worker: whichever copy's row comes
-  second is dropped (`Coordinator.dupe_ok`; `duplicates_dropped`), so an episode is counted once and
-  played at worst twice (its second copy's samples are kept: valid self-play of the same
-  checkpoint). A row of an unknown tag that was never requeued is still an error.
+  episodes out). A requeued episode may still finish on the worker: every copy's row after the
+  first is dropped (`Coordinator.dupe_ok` counts a spare per requeue; `duplicates_dropped`), so an
+  episode is counted once and played once per copy (the later copies' samples are kept: valid
+  self-play of the same checkpoint); a requeued episode never goes back to the worker it was taken
+  from, and a worker ignores an `enqueue` of a tag it still holds (47.5; before 2026-11-12 one spare
+  per tag: an episode requeued twice aborted the run or was counted twice). A row of an unknown tag,
+  or a second row of an episode that was never requeued, is still an error.
 * **Linger** (`selfplay_remote_linger` 1 in `resolver_cfg`): the workers play their outstanding
   episodes on while the run trains; their rows go into the coordinator at once (their events wait,
   ready, for the next phase), their samples into the next iteration's shards (5.3).
@@ -6077,6 +6092,19 @@ widen stays exact at step 0. Between 0 and the shadow, training's forward is the
 same values up to rounding, 43.6). A network without gates never reaches this code. A deliberate change of the
 gradients of networks with gates (feat/varlen only: no run has trained one).
 
+**The open path's gradients change too** (a correction, the Fable review of 2026-11-12; 47.11). The backward recomputes
+p, Z and the attention output with the shadow weights for the whole batch, so the dq, dk, dv of every *ungated* token
+come from an attention the forward did not run - not only the gated segments' maps and the gate move, as the
+paragraphs above read. The review's probe (the core's toy, a gated segment at theta 0, CPU): forward bit-identical with
+and without the shadow; the gradient of every parameter outside the gated segments' own maps and the gates changes by
+**2.6%** overall without overrides into gated segments (cosine 0.99966) and **4.0%** with them (cosine 0.99922) -
+`blocks.*.ln1` 8-12%, `blocks.*.qkv` 6-9%, and with overrides `pk.weight` **37%**, `pq.weight` 30%, `ptr.weight`
+15%. It lasts as long as any present gate sits below the shadow: for a segment with nothing to read (MTG Zero's
+`graveyard_order` in a Delver mirror without Shallow Grave: tokens in 72% of rows) that is for good. A standing bias of
+the trunk's gradients, small and deliberate-by-construction but not stated before; not changed (it would change
+default training): an opt-in that confines the shadow to the gated tokens' key / value gradients and the gate's own is
+proposed in 47.11.
+
 **Compared** (`tests/test_tail_gates.py`'s toy, a sweep of 5 seeds x 800 steps, CPU, 2026-11-12): toy_tail's layout
 widened by a gated segment whose tokens carry a bit as the parity of a one-hot code's index (no feature of a random
 input map carries it on average; the bit is worth ~0.4 nats a row), and the same segment carrying noise. Held-out loss
@@ -6104,3 +6132,176 @@ step cost +21-22% of v6's where the steady state's is +11-12%) plus one recomput
 one by > 0.2 nats (3 seeds, eager; and train_static), the widen exact at step 0; a noise segment does no harm and its
 gate stays below 0.25. `tests/test_tail_net.py::test_gradients_reach_the_gates`: with the shadow every gated segment's
 maps get a gradient at g = 0; without it (`gate_shadow` 0) exactly none, the forward the same bit for bit.
+
+## 47. The run loop at its edges: the Fable review's fixes (2026-11-12)
+
+(Numbered 46 on its branch `fix/core-infra-1112` and in that branch's commit messages; renumbered 47 when it was merged
+into `integrate/fable-1112`, because the AMD branches already use 44-46. Every "46.N" there is 47.N here.)
+
+The Fable review of 2026-11-12 (mtg-zero's slice 5, "Python run loop & infrastructure") found the core's loop sound
+where it runs alone and wrong at its edges: a remote machine, an interrupted iteration, a fork, the supervisor. Every
+fix below is in Python or the tools (no Rust, no search or self-play change: the games, searches and recorded samples
+are the same), several change what the loop does by default - each is said. Tests:
+`tests/test_run_infra.py` (new) and `tests/test_remoteplay.py`. MTG Zero's ENGINE.md 144 has the pin.
+
+### 47.1 A finished self-play phase is never played again: `data/iter_N/DONE.json`
+
+**Why.** A PAUSE or a crash during training threw away the iteration's finished self-play phase: the resume dropped
+`data/iter_N` (no checkpoint N) and played it again - the largest phase of an iteration, on a shared desktop where
+pauses are routine.
+
+**What.** When a phase ends (its writer closed; with a remote, its last shards in) the loop writes
+`data/iter_N/DONE.json` - the phase's metrics, its seconds and every shard of the directory (name -> bytes, rows) -
+atomically, and refuses to write it when the shards' rows do not add up to the phase's samples. A resume of iteration N
+(no checkpoint N) reads it first: when the directory holds exactly the shards it records (the same names, bytes and rows,
+adding up to its samples) the loop logs `iter N: its self-play phase finished before the interruption (DONE.json: ...):
+not played again, training on it` and trains; the metrics row is the phase's, marked `selfplay_resumed`, its seconds
+counted. A marker that does not match (a shard gone or added, another iteration's, unreadable) is logged and the phase is
+played again, as before. A co-training run writes one in `data/` and one in `resolver/data/` and resumes from them only
+when both match. A phase cut by STOP (47.4) gets none. Default: on (it changes nothing but the replay).
+
+### 47.2 The supervisor gives up on the same crash
+
+**Why.** A deterministic failure (a NonFinite training step: the same window, the same seed) was restarted forever -
+five crashes, fifteen minutes' wait, again - each time replaying the iteration's self-play (47.1 makes the replay cheap,
+not the loop finite), on the desktop or on a rented box billing by the hour.
+
+**What.** `tools/supervise.py` keys each crash by the run's own error text (`run_state.json`, written by the run when
+it aborts; decimals masked, so a NonFinite's losses differing in the last digits on a GPU still match; a run killed
+without writing one - the stall watchdog, a segfault - never counts). The same key `<P>_SUPERVISE_SAME_CRASHES` times in
+a row (default **3**; 0 = never give up, the supervisor of before) ends it: logged, `supervisor_state.json` state
+`refused` with `why` and `error` (the dashboard then reads the run's `aborted`). PAUSE, STOP, exit 78 as before.
+
+### 47.3 Remote evaluation: the end-of-run drain and the transport
+
+* **The drain** (`RemoteEval.drain`, `run.drain_remote_evals`). A finished run waited at most 6 hours for its queued
+  remote evaluations, then ignored the answer: phase `idle`, `done`, exit 0, the last evaluations missing from
+  `evals.jsonl` and the pool, no line. Now it waits with no time limit while the run goes on (a remote asleep for a night
+  is waited for; the rule: a bounded drain only after a stop request), rewriting `progress.json` every poll (the stall
+  watchdog sees the wait; before, a long evaluation wrote nothing and `<P>_SUPERVISE_STALL` could kill the run mid-drain).
+  PAUSE ends the wait (the restart queues the missing ones again). STOP during it: the iterations not recorded are logged
+  (`remote evaluations NOT recorded (STOP during the end-of-run wait): remote <name>: iterations [...]`) and the run
+  ends aborted (`RemoteEvalsMissing`), never `done`; a restart queues and waits for them. Co-training's resolver queue
+  and `draft_eval_net_remote` the same.
+* **The transport** (`Transport.listdir`, `Transport.get`). A failed `ssh ls` read as an empty directory: `_ship` took the
+  mirror for new and put this machine's `results.json` / `metrics.jsonl` over the mirror's, re-shipping every checkpoint;
+  a failed copy read as "no such file", and `_evaluate` ignored the pool files' copy altogether (this machine's pool
+  could stay older than the mirror's, and the next new-mirror ship put it back there). Now a listing that fails raises
+  (`[]` only for a directory that is not there), a copy that fails raises unless the file is checked to be absent (False),
+  and an evaluation whose `results.json`, `ratings.json` (and `anchored.json` with anchors) does not arrive fails - logged
+  and retried like any failure.
+
+### 47.4 Remote self-play: the end of a phase waits for its shards
+
+**Why.** A worker's game counts for the quota when the run answers its `fin` line; its samples travel later, in a shard
+(an scp each). `end(it)` waited `selfplay_remote_wait` (30 s) for the last shards and dropped the rest - in normal
+operation on a slow link (MTG Zero's tools/vast.py logged it), so an iteration trained on fewer games than `games`, shown
+only as `late` / `SHORT`. A bounded drain timeout that fired without a stop request.
+
+**What.** `end(it)` waits until every worker of the phase has sent its end (its shards announced) or is gone, and every
+announced shard is fetched (accepted, rejected, quarantined or failed) - no time limit while the run goes on. PAUSE ends
+the wait at once (Paused: the iteration is replayed, no DONE marker). Once STOP is there, `selfplay_remote_wait` s more
+at most (logged `iteration N: STOP while the phase's last shards travel: waiting at most Ws more`); what is not back is
+dropped as before and the remote record says `cut` (that phase gets no DONE marker, 47.1). A worker that dies is
+waited for no longer; its accepted games not in a shard are lost as before (`lost`, the quota short). A hung worker is
+the session watchdog's (silent for `STALL_S`: killed). **Default changed**: the 30 s bound applies only after STOP.
+
+### 47.5 Co-training: an episode requeued more than once
+
+**Why.** `Coordinator.dupe_ok` was a set: one spare copy per requeued tag. A match overdue on a slow worker was requeued
+and, in the same manager tick, handed straight back to that worker (its room freed, the local driver at its cap); overdue
+again, three copies were in flight. The third row either found its event resolved - `RuntimeError: a resolver result
+row with an unknown tag`, the run aborted and replayed the iteration - or arrived while it was open and was accepted
+again: `outstanding` decremented twice (the backpressure's count drifted, below zero) and the match counted twice.
+
+**What.** `dupe_ok` counts a spare per requeue; the first row fills the episode's slot and every later copy is dropped
+against a spare (`duplicates_dropped`). A row for a filled slot (or a resolved event) with no spare left raises (`a
+second resolver result row for ... which was never requeued`), as an unknown tag does. A session remembers the tags
+requeued away from it (overdue, given back) and `take_for_remote(n, skip)` never hands them back to it - they wait at
+the front for the local driver or another worker. A worker ignores an `enqueue` of a tag it still holds (one row
+answers both).
+
+### 47.6 fork_run --iter K: the Elo pools cut at K, the fork's own window
+
+* **The pools.** `fork_run --source A --dest B --iter K` copied every pool's `results.json` and `ratings.json` whole: the
+  pairs and `logged` names of the source's checkpoints after K came along. The fork's own `iter_K+1`... carry the same
+  names, so `elo.has` found the source's games for them (their Elo matches never played, their ratings another network's)
+  and `logged` kept their evaluations out of the pool: the fork's Elo curve for its first iterations was the source's,
+  and an A/B read off it compared the source with itself. Now every pool is cut at K (`fork_run.cut_pool`: the pairs
+  naming a checkpoint after K and those `logged` names dropped; a rule's pool begun after K loses its `since`; anchors and
+  their calibration games kept), printed when anything was dropped, and `ratings.json` is not copied (refit at the fork's
+  first evaluation).
+* **The window.** The data directories followed the source's `window` only: `--set window=12` or `min_window_samples`
+  were not read, so the fork's first trainings saw a smaller window than the same run would. Now `window_dirs` follows
+  `window_shards`' rule with the fork's settings (window of K + 1, more while the rows are under `min_window_samples`),
+  at least what was copied before, and never a quarantined `*.bad.npz` or a `*.tmp.npz`. An optimizer state of another
+  iteration than K is skipped with a line (before: in silence).
+
+### 47.7 A device the machine does not have refuses the run
+
+`train_device` (and `heldout_device`) `cuda` without a working CUDA silently became `cpu`: a rented box without a driver
+trained every iteration on the CPU at a fraction of the speed, the only sign `"device": "cpu"` in the train metrics.
+Now `run.check_devices` refuses the run at its start - `DeviceRefused` (an EncodingMismatch: exit 78, not restarted) -
+for `train_device`, `heldout_device` or `infer_device` naming `cuda` / `mps` that torch cannot use (a co-training run:
+both networks' settings), and training never falls back.
+
+### 47.8 State files written atomically
+
+`config.json` (and a co-training run's `resolver/config.json`) was rewritten in place at every start: a kill during the
+write left a truncated file every restart then died on. `_write_json` returned silently after 20 `PermissionError`s,
+leaving its temporary file - also for `models/iter_N.json`, the partial metrics a resume needs. Now both configs go
+through `_write_json` (a temporary file, then a rename), `models/iter_N.json` and `DONE.json` are written `strict` (the
+error raised), and `progress.json`'s rare miss is said on stderr, the temporary file removed either way.
+
+### 47.9 Self-play metrics of a rolling phase
+
+A rolling driver's counters (`minor`, `belief_rows`) cover every game in flight during the phase, and the phase's finished
+games include ones begun in an earlier phase: `minor_per_game` (minor / finished games) and `belief.per_decision` (belief
+rows / the finished games' decisions) divided one population by another - unbiased in a steady phase, wrong for a short
+measurement or a first iteration (the 11-10 review's 120-game measurement was off by ~9x). Now the ratios stay where they
+are exact - a fresh, non-rolling driver that started and finished every game of the phase (the default `rolling` 0: the
+metrics of before) - and a rolling or shared phase (and co-training) reports the counts: `selfplay.minor` instead of
+`minor_per_game`, `selfplay.belief` = `{rows}` without `per_decision`. An exact per-game figure there needs per-game
+counters in the driver's result rows (a Rust change; not made).
+
+### 47.10 A worker's accept it cannot fill
+
+A remote worker answered an `accept` of more games than it held by cutting it in silence (`n = min(n, held)`) - the quota
+would count games that never arrive ("should not happen"). Now it notes it and sends `unaccepted` for the difference,
+which the run gives back to the quota.
+
+### 47.11 Not changed here
+
+* **The gate shadow's open-path gradients** (43.14's correction). Proposed opt-in, not built: a setting (say
+  `gate_shadow_scope` 'all' = today, 'gated') under which the attention's backward runs twice while a present gate is
+  below the shadow - once with the true weights (dq for every query, dk / dv of every ungated token) and once with the
+  shadow weights (dk / dv of the gated tokens and the gate's own dw) - so the trunk's gradients are the true ones and only
+  the gated segments learn as if open. Costs: a second attention backward a layer for as long as a gate stays shut (on
+  top of 43.14's explicit-attention cost); the pooling's and the pointer blend's shadow terms reach the trunk through the
+  gated tokens' hidden states and would need the same split. Default training unchanged until a run asks for it.
+* Improvements of the review not taken: a gap in the data window (I3), the optimizer state saved with its checkpoint
+  (I5), a build identity in the remote hello (I6), a remote evaluation retried after it finished (I9), a pausing run's
+  stall limit (I10), a persistent shard-fetch channel and a window row cache (O2, O3).
+
+### 47.12 The compat goldens record and hash the auxiliary targets (`tools/selfplay_digest.py`)
+
+`check_checkpoint_compat` is the byte-identity proof of the core gates ("identical ... samples > 0"), but
+`selfplay_digest.py` built its drivers without `aux=True` and hashed x, player, n_players, z, q, sc, net, opt_action,
+pi and the tails / overrides - not the auxiliary targets (15) that MTG Zero's Delver and EoE runs train on
+(`aux_belief_w`, the deck targets): a change to what self-play records for them passed as identical. Now a game whose
+engine computes auxiliary targets (`aux_layout` not empty) is recorded with them and each row's `aux` is hashed after
+the rest; a game without them hashes exactly the bytes of before (the toy's `toy_tail`: visits `1edf08ce1f646b68`, cq
+`c6fb4902cbac6275` with the old and the new tool). Each target's entry names the arrays hashed (`arrays`), the compat
+check prints them per side (`  arrays hashed: ...`, a line of its own: the gate's parser reads the target lines as
+before) and in its result line (`arrays`). Both sides run the new tool (the one beside the compat check), so the
+comparison stays like for like; the toy's and MTG Zero's digests change (they hash `aux` now). Tests:
+`tests/test_run_infra.py::test_the_records_digest_hashes_auxiliary_targets_and_nothing_else_changes`,
+`::test_check_checkpoint_compat_names_the_arrays_it_compared`.
+
+### 47.13 A detached checkout's default target dir (`tools/build_engine.sh`)
+
+The default `CARGO_TARGET_DIR` was `<default target dir>/<branch>` with the branch from `git rev-parse --abbrev-ref
+HEAD` - `HEAD` in every detached checkout (a game's pinned run worktrees, the `*-base` ones), so all of them built into
+one `<base>/HEAD`: the shared-target hazard (cargo's workspace-relative dep-info, one checkout's build installed as
+another's module) as the default. Now a detached checkout gets `detached-<its directory's name>` (a branch: its name as
+before, `/` -> `_`; not a git checkout: `nogit`), as MTG Zero's own `tools/build_py.sh` now names it.

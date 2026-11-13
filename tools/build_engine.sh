@@ -8,7 +8,8 @@
 #   e.g. bash third_party/zero-core/tools/build_engine.sh "$ROOT" grz grz_py E:/cargo-target/glassroad-zero
 #
 # Environment: PYTHON (interpreter to build for and check with; default `python`),
-# CARGO_TARGET_DIR (default: <default target dir>/<branch>, or <root>/target without one).
+# CARGO_TARGET_DIR (default: <default target dir>/<branch> - a detached checkout: detached-<its directory's
+# name>, never one `HEAD` dir shared by every detached worktree -, or <root>/target without one; docs/az.md 47.13).
 # Windows locks a loaded .pyd: if the copy fails, the old file is renamed out of the way
 # (running processes keep using it; new ones get the new build).
 set -euo pipefail
@@ -16,8 +17,10 @@ ROOT="$1"
 PKGDIR="$2"
 CRATE="$3"
 TDEF="${4:-}"
-BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '_' || true)"
-BRANCH="${BRANCH:-nogit}"
+BRANCH="$(git -C "$ROOT" symbolic-ref -q --short HEAD 2>/dev/null | tr '/' '_' || true)"
+if [ -z "$BRANCH" ]; then
+  if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then BRANCH="detached-$(basename "$ROOT")"; else BRANCH=nogit; fi
+fi
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
   if [ -n "$TDEF" ]; then CARGO_TARGET_DIR="$TDEF/$BRANCH"; else CARGO_TARGET_DIR="$ROOT/target"; fi
 fi

@@ -75,7 +75,7 @@ import torch
 import torch.nn.functional as F
 
 from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, resign as RS, runctl
-from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths
+from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths, shard_rows
 from .rows import forward_kw
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
@@ -582,6 +582,15 @@ def window_iters(cfg, it):
     return min(cfg['window'], 1 + it // 2) if cfg['window_grow'] else cfg['window']
 
 
+def minor_metrics(st, st0, results, exact):
+    """A self-play phase's minor decisions (self-play seats with sims_minor) from its driver's counter: `minor_per_game`
+    over the finished games when `exact` - the phase's driver started and finished every game it played (a fresh,
+    non-rolling driver) -, else `minor`, the phase's count over every game in flight (a rolling driver's games carry
+    over between phases: its counter and its finished games are not the same games; docs/az.md 47.9)."""
+    minor = st.get('minor', 0) - ((st0 or {}).get('minor', 0))
+    return {'minor_per_game': minor / max(1, len(results))} if exact else {'minor': minor}
+
+
 def summarize(rows):
     """rows: (score, margin, rounds, over) of the evaluated player."""
     n = len(rows)
@@ -859,7 +868,7 @@ class Run:
                'leaves': leaves, 'leaves_per_s': leaves / max(secs, 1e-9),
                'games_per_h': len(results) / max(secs, 1e-9) * 3600, 'seconds': secs,
                'infer_s': ev.seconds, 'avg_batch': ev.leaves / max(1, ev.calls),
-               'minor_per_game': (st.get('minor', 0) - (st0.get('minor', 0) if st0 else 0)) / max(1, len(results)),
+               **minor_metrics(st, st0, results, exact=st0 is None),
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
@@ -918,14 +927,18 @@ class Run:
 
     def belief_metrics(self, out, st, st0, results):
         """Self-play's root-belief metrics (docs/az.md 18), only when it is on (the metrics of before
-        otherwise): `belief` = {rows: root belief rows sent by this machine's driver, per_decision: per
-        searched decision of its finished games}."""
+        otherwise): `belief` = {rows: root belief rows sent by this machine's driver in the phase, per_decision: per
+        searched decision of its finished games - only when the phase's driver started and finished every game it
+        played (`st0` None: a rolling driver's rows also count the games still in flight, and its finished games
+        include ones begun in an earlier phase: no exact ratio, docs/az.md 47.9)}."""
         from .mcts import belief_tilts
         if not float(self.cfg.get('selfplay_belief_tilt', 0.0) or 0.0) and not belief_tilts(self.cfg, 'selfplay'):
             return
         rows = st.get('belief_rows', 0) - ((st0 or {}).get('belief_rows', 0))
-        dec = sum(r.get('decisions', 0) for r in results)
-        out['belief'] = {'rows': rows, 'per_decision': round(rows / max(1, dec), 4)}
+        out['belief'] = {'rows': rows}
+        if st0 is None:
+            dec = sum(r.get('decisions', 0) for r in results)
+            out['belief']['per_decision'] = round(rows / max(1, dec), 4)
 
     def cache_metrics(self, out, st, st0):
         """Self-play's evaluation-cache metrics (docs/az.md 25), only when it is on (the metrics of before
@@ -1174,8 +1187,10 @@ class Run:
         secs = time.time() - t0                    # this machine's phase (the remote's wait not counted)
         _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
         util = acc['util'][0] / acc['util'][1] if acc['util'][1] else None
+        # (the remote's last shards: waited for while the run goes on; PAUSE ends the wait, STOP bounds it, az.md 47.4)
         rem = rsp.end(it, local={'units': acc['finished'], 'run_s': secs, 'util': util,
-                                 'leaves': drv.stats()['leaves'] - st0['leaves']})
+                                 'leaves': drv.stats()['leaves'] - st0['leaves']},
+                      check=lambda: self.check('remote shards'))
         _write_json(prog, {'iter': it, 'phase': 'train', 'time': time.time()})
         results = acc['results']
         st = drv.stats()
@@ -1190,7 +1205,7 @@ class Run:
                'leaves': leaves, 'leaves_per_s': leaves / max(secs, 1e-9),
                'games_per_h': len(results) / max(secs, 1e-9) * 3600, 'seconds': secs,
                'infer_s': ev.seconds, 'avg_batch': ev.leaves / max(1, ev.calls),
-               'minor_per_game': (st.get('minor', 0) - st0.get('minor', 0)) / max(1, len(results)),
+               **minor_metrics(st, st0, results, exact=False),
                'target': tstats.summary(c.get('policy_target', 'visits'))}
         self.view_metrics(out, st, st0, leaves)
         self.belief_metrics(out, st, st0, results)
@@ -1351,9 +1366,7 @@ class Run:
         """`train` without saving -> (model, optimizer state, stats(): the metrics dict, timed when
         called). Co-training trains both networks before either is saved (zero/cotrain.py)."""
         c = self.cfg
-        dev = c['train_device']
-        if dev == 'cuda' and not torch.cuda.is_available():
-            dev = 'cpu'
+        dev = c['train_device']                    # (never another device than the setting's: DeviceRefused at the start)
         t0 = time.time()
         model, _ = load(model_path(self.run, it - 1), dev, game=c['game'])
         added = False
@@ -2058,8 +2071,6 @@ class Run:
         from .heldout import HeldOut, fmt
         c = self.cfg
         dev = c.get('heldout_device') or c['train_device']
-        if dev == 'cuda' and not torch.cuda.is_available():
-            dev = 'cpu'
         try:
             if self.heldout is None:
                 self.heldout = HeldOut(c['heldout_shards'], game=c['game'])
@@ -2077,6 +2088,23 @@ class Run:
     # ---------------------------------------------------------------- the loop
     def partial_path(self, it):
         return os.path.join(self.run, 'models', f'iter_{it:04d}.json')
+
+    def phase_dir(self, it):
+        return os.path.join(self.run, 'data', f'iter_{it:04d}')
+
+    def phase_done(self, it, quiet=False):
+        """Iteration `it` (no checkpoint yet) resumes: its self-play phase's DONE.json record when the phase finished
+        before the interruption and its data directory is exactly as the marker records it (read_phase_done; logged
+        unless `quiet`), else None - the phase is played (again), as before the marker (docs/az.md 47.1)."""
+        rec, why = read_phase_done(self.phase_dir(it), it)
+        if rec is not None and not quiet:
+            self.log(f'iter {it}: its self-play phase finished before the interruption ({PHASE_DONE}: '
+                     f'{len(rec["shards"])} shards, {phase_samples(rec["selfplay"])} samples, as recorded): not played '
+                     f'again, training on it')
+        elif why:
+            self.log(f'iter {it}: {os.path.join(self.phase_dir(it), PHASE_DONE)} does not match its directory ({why}): '
+                     f'the phase is played again')
+        return rec
 
     def finish_iter(self, it, m, t0):
         """The checkpoint exists: evaluation, Elo, metrics."""
@@ -2116,6 +2144,7 @@ class Run:
     def loop(self):
         c = self.cfg
         run = self.run
+        check_devices(c)                           # (a CUDA setting on a machine without CUDA: refused, exit 78)
         # variable-length rows (docs/az.md 43): a draft layout, a stale build, an arch or shard format that cannot
         # carry them - refused before any work (exit 78); nothing for a game without them
         self.check_rows()
@@ -2206,32 +2235,43 @@ class Run:
                 self.log('STOP file found; exiting')
                 break
             t0 = time.time()
-            sp = self.selfplay(it)
-            self.log(f'iter {it} selfplay: {_fmt(sp)}')
+            # a phase that finished before a PAUSE / crash in its training (data/iter_N/DONE.json, verified against the
+            # directory, docs/az.md 47.1): trained on as it is, never played again
+            done_rec = self.phase_done(it)
+            if done_rec is not None:
+                sp, sp_s = done_rec['selfplay'], float(done_rec['selfplay_s'])
+            else:
+                sp = self.selfplay(it)
+                sp_s = time.time() - t0
+                self.log(f'iter {it} selfplay: {_fmt(sp)}')
+                if not (sp.get('remote') or {}).get('cut'):
+                    mark_phase_done(self, it, sp, sp_s)
             t1 = time.time()
             self.linger_start(it)                  # (selfplay_local_linger: self-play on while it trains)
             try:
-                tr = self.train(it, sp['samples'] + sp.get('remote', {}).get('samples', 0))
+                tr = self.train(it, phase_samples(sp))
             except BaseException:
                 self.linger_stop(quiet=True)
                 raise
             t2 = time.time()
             lg = self.linger_stop()
             self.log(f'iter {it} train: {_fmt(tr)}')
-            m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': t1 - t0, 'train_s': t2 - t1},
-                 'resumed_seconds': 0}
+            resumed = sp_s if done_rec is not None else 0
+            m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': sp_s, 'train_s': t2 - t1},
+                 'resumed_seconds': resumed}
+            if done_rec is not None:
+                m['selfplay_resumed'] = True       # (its phase played by an earlier process: DONE.json)
             if lg is not None:
                 m['linger'] = lg
                 self.log(f'iter {it} local linger: {lg["games"]} games in {lg["seconds"]:.1f}s while training '
                          f'({lg["leaves"] / max(lg["seconds"], 1e-9):.0f} leaves/s; {lg["held"]} held for iter {it + 1})')
-            _write_json(self.partial_path(it), dict(m, resumed_seconds=time.time() - t0))
+            _write_json(self.partial_path(it), dict(m, resumed_seconds=time.time() - t0 + resumed), strict=True)
             self.early_remote(it + 1)
             self.finish_iter(it, m, t0)
         if self.rsp is not None:
             self.rsp.close()                       # no more self-play: the remote's workers quit
         if self.remote is not None and not os.path.exists(stop):
-            _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
-            self.remote.drain()
+            drain_remote_evals(run, [self.remote], self.check, self.log)
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})
 
 
@@ -2239,6 +2279,23 @@ class OptimizerStateMismatch(EncodingMismatch):
     """The optimizer state saved with the run's last checkpoint (`models/opt_latest.pt`, its iteration's) does not fit
     the checkpoint's network (docs/az.md 43.10): training on with a fresh optimizer would drop its moments in silence -
     refused (exit 78, not restarted). Deleting the file starts a fresh optimizer deliberately."""
+
+
+class DeviceRefused(EncodingMismatch):
+    """A device setting (train_device, heldout_device, infer_device) names CUDA or MPS and this machine has none
+    (docs/az.md 47.7): refused at the run's start (exit 78, not restarted) - never trained on the CPU in silence at a
+    fraction of the speed (a rented box without a working driver bills on)."""
+
+
+def check_devices(cfg, where=''):
+    """The run's device settings against this machine (DeviceRefused; `where`: a prefix, e.g. 'resolver_cfg: ')."""
+    for k in ('train_device', 'heldout_device', 'infer_device'):
+        v = str(cfg.get(k) or '')
+        ok = (torch.cuda.is_available() if v.startswith('cuda') else
+              torch.backends.mps.is_available() if v.startswith('mps') else True)
+        if not ok:
+            raise DeviceRefused(f'{where}{k} {v!r}: this machine has no {v.split(":")[0].upper()} device that torch can use '
+                                f'(torch {torch.__version__}): refused - fix the driver, or set {k} cpu deliberately')
 
 
 class RowsRefused(EncodingMismatch):
@@ -2351,16 +2408,119 @@ def last_rates(rows):
     return None
 
 
-def _write_json(path, obj):
+PHASE_DONE = 'DONE.json'
+
+
+def phase_samples(sp):
+    """The samples a self-play phase's metrics say its data directory holds: this machine's and the remote's."""
+    return int(sp['samples']) + int((sp.get('remote') or {}).get('samples', 0))
+
+
+def write_phase_done(d, it, sp, secs):
+    """Iteration `it`'s self-play phase is over and its data directory `d` complete: `d`/DONE.json (docs/az.md 47.1)
+    records the phase's metrics `sp`, its seconds and every shard in `d` (name -> bytes, rows), written atomically. A
+    resume that finds it - and finds `d` exactly as it records - trains on `d` instead of playing the phase again.
+    The shards' rows must add up to the metrics' samples, else RuntimeError (never a marker for a directory that
+    does not hold what the phase reported)."""
+    shards = {os.path.basename(p): {'bytes': os.path.getsize(p), 'rows': shard_rows(p)} for p in shard_paths(d)}
+    rows = sum(v['rows'] for v in shards.values())
+    if rows != phase_samples(sp):
+        raise RuntimeError(f'{d}: its shards hold {rows} samples, the phase reported {phase_samples(sp)}: no '
+                           f'{PHASE_DONE} written')
+    os.makedirs(d, exist_ok=True)
+    _write_json(os.path.join(d, PHASE_DONE), {'iter': it, 'selfplay': sp, 'selfplay_s': secs, 'shards': shards,
+                                              'time': time.time()}, strict=True)
+
+
+def read_phase_done(d, it):
+    """-> (the DONE.json record of iteration `it`'s finished self-play phase, None) when `d` holds exactly the shards it
+    records (the same names, bytes and rows, adding up to its samples); else (None, why) - why '' when there is no
+    marker (write_phase_done)."""
+    p = os.path.join(d, PHASE_DONE)
+    if not os.path.exists(p):
+        return None, ''
+    try:
+        with open(p, encoding='utf-8') as f:
+            rec = json.load(f)
+        if rec.get('iter') != it:
+            return None, f'it is of iteration {rec.get("iter")}'
+        want = rec['shards']
+        have = {os.path.basename(x): x for x in shard_paths(d)}
+        if set(have) != set(want):
+            extra, gone = sorted(set(have) - set(want)), sorted(set(want) - set(have))
+            return None, f'the shards differ (not in it: {extra[:4]}; missing: {gone[:4]})'
+        for name, x in have.items():
+            got = {'bytes': os.path.getsize(x), 'rows': shard_rows(x)}
+            if got != {'bytes': want[name]['bytes'], 'rows': want[name]['rows']}:
+                return None, f'{name} is {got}, it records {want[name]}'
+        if sum(v['rows'] for v in want.values()) != phase_samples(rec['selfplay']):
+            return None, f'its shards do not add up to its samples ({phase_samples(rec["selfplay"])})'
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return None, f'unreadable ({type(e).__name__}: {e})'
+    return rec, None
+
+
+def mark_phase_done(R, it, sp, secs):
+    """write_phase_done of run `R`'s iteration `it`; a directory that does not hold the samples its phase reported gets no
+    marker and a WARNING in the log (an accounting bug to report: the metrics and the data disagree) - the resume then
+    plays the phase again, as before the marker."""
+    try:
+        write_phase_done(R.phase_dir(it), it, sp, secs)
+    except RuntimeError as e:
+        R.log(f"iter {it}: WARNING {e} - the phase's metrics and its data directory disagree (a bug: report it); a resume "
+              f"before checkpoint {it} plays the phase again")
+
+
+class RemoteEvalsMissing(RuntimeError):
+    """The run's last iteration is done but remote evaluations are not recorded (STOP during the end-of-run wait,
+    docs/az.md 47.3): the run ends aborted, never 'done' - a restart queues them again and waits for them."""
+
+
+def drain_remote_evals(run, queues, check, log_fn):
+    """The end of a run with remote evaluations (zero.remote's RemoteEval / RemoteNetEval `queues`): wait for every
+    queued one to come back - no time limit while the run goes on (docs/az.md 47.3), progress.json rewritten every
+    poll (the stall watchdog sees the wait), `check` the pause check (PAUSE ends the wait: Paused). STOP during the
+    wait: the iterations not recorded are logged and RemoteEvalsMissing raised (the run never says 'done' with
+    evaluations missing)."""
+    prog = os.path.join(run, 'progress.json')
+    _write_json(prog, {'phase': 'remote evaluations', 'time': time.time()})
+    missing = {}
+    for q in queues:
+        ok = q.drain(check=lambda: check('remote evaluations'), stop=lambda: runctl.stop_requested(run),
+                     on_poll=lambda left, q=q: _write_json(prog, {'phase': 'remote evaluations', 'remote': q.name,
+                                                                  'queued': left, 'time': time.time()}))
+        if not ok:
+            missing[q.name] = q.pending()
+    if missing:
+        what = '; '.join(f'remote {n}: iterations {its}' for n, its in missing.items())
+        log_fn(f'remote evaluations NOT recorded (STOP during the end-of-run wait): {what} - restart the run to queue '
+               f'and wait for them (docs/az.md 47.3)')
+        raise RemoteEvalsMissing(f'remote evaluations not recorded (STOP during the end-of-run wait): {what}')
+
+
+def _write_json(path, obj, strict=False, indent=None):
+    """`obj` into `path` atomically (a temporary file, then a rename; a reader holding the file open on Windows is
+    waited for). A file nobody could replace for ~1 s: `strict` (a file a resume needs - models/iter_N.json, a phase's
+    DONE.json) raises the PermissionError; otherwise (progress.json: rewritten again in seconds) the temporary file is
+    removed and the miss logged to stderr - never left behind."""
     tmp = path + f'.{os.getpid()}.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(obj, f)
+        json.dump(obj, f, indent=indent)
+    err = None
     for k in range(20):
         try:
             os.replace(tmp, path)
             return
-        except PermissionError:
+        except PermissionError as e:
+            err = e
             time.sleep(0.05)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    if strict:
+        raise err
+    print(f'{path}: not rewritten ({type(err).__name__}: {err}); the next write replaces it', file=sys.stderr, flush=True)
 
 
 UNSET = 'none'
@@ -2558,8 +2718,8 @@ def main(argv=None):
         with open(cfg_path) as f:
             saved = json.load(f)
     cfg = resolve_config(args, saved)
-    with open(cfg_path, 'w') as f:
-        json.dump(cfg, f, indent=1)
+    # (atomically: a kill mid-write would leave a truncated config.json every restart dies on)
+    _write_json(cfg_path, cfg, strict=True, indent=1)
     torch.set_num_threads(max(1, int(cfg['torch_threads'])))
     below_normal()
     runctl.write_state(run, 'run', state='running')

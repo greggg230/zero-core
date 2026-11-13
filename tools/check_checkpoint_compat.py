@@ -10,7 +10,9 @@ Runs tools/selfplay_digest.py (next to this script) once per checkout, each in i
 process importing only that checkout (its `<pkg>/_engine.pyd` must be built: tools/build_py.sh),
 with fixed seeds: self-play records + results for policy_target 'visits' and 'cq' (the
 checkpoint as the evaluator; CPU, 1 torch thread) and a match against the built-in random bot.
-Exit status 0 when every digest is identical, 1 otherwise (the differing fields are printed).
+Exit status 0 when every digest is identical, 1 otherwise (the differing fields are printed). The
+sample arrays compared are named (`arrays hashed: ...` per side, `arrays` in the result line): a game
+whose engine computes auxiliary targets has them recorded and hashed too (docs/az.md 47.12).
 The checkpoint and the checkouts are only read (Python bytecode is not written). The game and
 spec default to the checkpoint's game and the game's 2p spec ('{"intro": false}' Glass Road,
 '{"full": true}' Caverna) - pass --spec to override. Extra arguments go to selfplay_digest.py.
@@ -81,11 +83,14 @@ def main(argv=None):
         print(f'{side}: {r["root"]} ({r["seconds"]} s; engine {r["engine"]})', flush=True)
         for t, d in r['targets'].items():
             print(f'  {t}: {d["samples"]} samples, records {d["records"][:16]}, results {d["results"][:16]}')
+        arrays = sorted({k for d in r['targets'].values() for k in d.get('arrays', ())})
+        print(f'  arrays hashed: {", ".join(arrays) or "(not named: a selfplay_digest.py from before 47.12)"}')
         if r.get('match'):
             print(f'  vs random: {r["match"]["score"]}/{r["match"]["games"]}, results {r["match"]["results"][:16]}')
     bad = compare(res['old'], res['new'])
+    arrays = sorted({k for d in res['new']['targets'].values() for k in d.get('arrays', ())})
     print(json.dumps({'game': game, 'spec': spec, 'evaluator': res['new']['evaluator'] if not a.model else a.model,
-                      'identical': not bad, 'differences': bad}))
+                      'arrays': arrays, 'identical': not bad, 'differences': bad}))
     return 0 if not bad else 1
 
 

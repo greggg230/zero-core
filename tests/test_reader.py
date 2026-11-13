@@ -387,6 +387,10 @@ def test_reader_settings_at_their_defaults_change_nothing(tmp_path):
         sa = sorted(os.listdir(a / 'data' / d))
         assert sa == sorted(os.listdir(b / 'data' / d))
         for f in sa:
+            if f == 'DONE.json':                       # (the phase's marker, docs/az.md 47.1: its seconds and time
+                ja, jb = (json.load(open(x / 'data' / d / f))['shards'] for x in (a, b))    # differ, its shards not)
+                assert ja == jb
+                continue
             assert open(a / 'data' / d / f, 'rb').read() == open(b / 'data' / d / f, 'rb').read()
     for f in ('iter_0001.pt', 'iter_0002.pt'):
         x = torch.load(str(a / 'models' / f), weights_only=False)

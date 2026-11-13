@@ -18,9 +18,11 @@
       checkpoints <= K that its Elo matches need (and, with the self-play league in the fork's
       settings - e.g. --set selfplay_league=0.25 -, every one its league may play: docs/az.md 14),
       the optimizer state when it belongs to K, the
-      window's sample shards (hard links on the same volume, --copy to copy), Elo results (every
-      pool: elo/ and elo/<rule>/), metrics up to K and the source's config.json with the --set
-      overrides. The source is only read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
+      window's sample shards (those the fork's first training reads by its settings - window,
+      min_window_samples, after --set -; hard links on the same volume, --copy to copy), Elo results
+      cut at K (every pool: elo/ and elo/<rule>/ - pairs and `logged` names of checkpoints after K
+      dropped, the fork plays its own; ratings refit at its first evaluation), metrics up to K and
+      the source's config.json with the --set overrides. The source is only read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
       (setting `resolver`, docs/az.md 11) is copied with its resolver network: the same of
       <source>/resolver/ into <dest>/resolver/ (K: an iteration where both have a checkpoint).
 
@@ -227,12 +229,59 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None, al
     print(f'next: python tools/supervise.py {dest}   (resumes after iteration {it})')
 
 
+def _late(name, it):
+    """Whether an Elo player's name is a checkpoint after iteration `it` ('iter_JJJJ', J > it)."""
+    return name.startswith('iter_') and name[5:].isdigit() and int(name[5:]) > it
+
+
+def cut_pool(res, it):
+    """A pool's results (elo.load_results) as of checkpoint `it`: the pairs naming a checkpoint after `it` and those
+    checkpoints' `logged` names dropped - a fork's own checkpoints after `it` carry the same names, so the source's
+    games would stand in for the fork's Elo matches (never played) and keep its evaluations out of the pool; a rule's
+    pool begun after `it` loses its `since` (set again by the fork's first evaluation). In place; -> (pairs, names)
+    dropped."""
+    pairs = res.get('pairs', {})
+    keep = {k: v for k, v in pairs.items() if not any(_late(p, it) for p in k.split('|'))}
+    dropped = len(pairs) - len(keep)
+    res['pairs'] = keep
+    names = 0
+    if 'logged' in res:
+        kept = [x for x in res['logged'] if not _late(x, it)]
+        names = len(res['logged']) - len(kept)
+        res['logged'] = kept
+    if res.get('since') is not None and res['since'] > it:
+        del res['since']
+    return dropped, names
+
+
+def window_dirs(source, it, settings):
+    """The source's data directories (newest first, <= `it`) that the fork's first training (iteration it + 1)
+    may read by the fork's `settings` - `window_shards`' rule: window_iters of it + 1, more while the rows are under
+    min_window_samples (the fork's own new directory counted with no rows) - and at least the source's window plus
+    one more directory (what was copied before)."""
+    from ..data import shard_paths, shard_rows
+    from ..run import window_iters
+    dirs = sorted(glob.glob(os.path.join(source, 'data', 'iter_*')), reverse=True)
+    dirs = [d for d in dirs if int(os.path.basename(d)[5:9]) <= it]
+    w = max(window_iters(settings, it + 1), 1)
+    least = int(settings.get('min_window_samples') or 0)
+    out, n = [], 0
+    for k, d in enumerate(dirs, start=1):        # (k = 0: the fork's iteration it + 1, not there yet)
+        if k > w and n >= least:
+            break
+        out.append(d)
+        n += sum(shard_rows(p) for p in shard_paths(d))
+    return out
+
+
 def _copy_run(source, dest, it, cfg, copy, settings=None):
     """Checkpoint `it` and those its Elo matches need (and, with the self-play league in `settings` -
     the fork's: the source's config with the --set overrides -, every past checkpoint its league may
-    play, zero/league.py), its optimizer state, the window's shards, Elo results, metrics up to `it`
-    -> (checkpoints, data dirs, metrics rows)."""
+    play, zero/league.py), its optimizer state, the window's shards (by the fork's settings,
+    window_dirs), Elo results cut at `it` (cut_pool), metrics up to `it` -> (checkpoints, data dirs,
+    metrics rows)."""
     from .. import elo, league
+    from ..data import shard_paths
     from ..run import model_path, read_metrics, window_iters
     e = max(1, int(cfg.get('eval_every', 1)))
     need = {it} | {it - off * e for off in elo.OFFSETS if it - off * e >= 0}
@@ -249,20 +298,35 @@ def _copy_run(source, dest, it, cfg, copy, settings=None):
         o = torch.load(opt, map_location='cpu', weights_only=False)
         if o.get('iter') == it:
             shutil.copy2(opt, os.path.join(dest, 'models', 'opt_latest.pt'))
-    dirs = sorted(glob.glob(os.path.join(source, 'data', 'iter_*')), reverse=True)
-    dirs = [d for d in dirs if int(os.path.basename(d)[5:9]) <= it][:max(window_iters(cfg, it + 1), 1) + 1]
+        else:
+            print(f"{opt}: the optimizer state is of iteration {o.get('iter')}, not {it}: not copied (the fork's first "
+                  f"training starts a fresh optimizer)")
+    s = dict(cfg, **(settings or {}))
+    s.setdefault('min_window_samples', 0)
+    dirs = window_dirs(source, it, s)
+    # (and what was copied before: the source's window and one more directory)
+    old = sorted(glob.glob(os.path.join(source, 'data', 'iter_*')), reverse=True)
+    old = [d for d in old if int(os.path.basename(d)[5:9]) <= it][:max(window_iters(cfg, it + 1), 1) + 1]
+    dirs = sorted(set(dirs) | set(old), reverse=True)
     for d in dirs:
-        for p in glob.glob(os.path.join(d, '*.npz')):
+        for p in shard_paths(d):               # (never a quarantined *.bad.npz or a *.tmp.npz)
             _link(p, os.path.join(dest, 'data', os.path.basename(d), os.path.basename(p)), copy)
-    # every Elo pool: elo/ ('visits') and elo/<rule>/ (another evaluation move rule, docs/az.md 5.4)
+    # every Elo pool: elo/ ('visits') and elo/<rule>/ (another evaluation move rule, docs/az.md 5.4), cut at `it`
+    # (ratings.json not copied: refit from the cut pool at the fork's first evaluation)
     pools = [''] + sorted(d for d in os.listdir(os.path.join(source, 'elo'))
                           if os.path.isdir(os.path.join(source, 'elo', d))) if os.path.isdir(os.path.join(source, 'elo')) else ['']
     for sub in pools:
-        for f in ('results.json', 'ratings.json'):
-            p = os.path.join(source, 'elo', sub, f)
-            if os.path.exists(p):
-                os.makedirs(os.path.join(dest, 'elo', sub), exist_ok=True)
-                shutil.copy2(p, os.path.join(dest, 'elo', sub, f))
+        p = os.path.join(source, 'elo', sub, 'results.json')
+        if os.path.exists(p):
+            with open(p) as f:
+                res = json.load(f)
+            dp, dn = cut_pool(res, it)
+            os.makedirs(os.path.join(dest, 'elo', sub), exist_ok=True)
+            with open(os.path.join(dest, 'elo', sub, 'results.json'), 'w') as f:
+                json.dump(res, f, indent=1)
+            if dp or dn:
+                print(f"elo/{sub + '/' if sub else ''}results.json: {dp} pairs and {dn} evaluations of checkpoints after "
+                      f"{it} dropped (the fork plays its own)")
     rows = [m for m in read_metrics(source) if m['iter'] <= it]
     with open(os.path.join(dest, 'metrics.jsonl'), 'w', encoding='utf-8') as f:
         for m in rows:

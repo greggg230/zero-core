@@ -25,7 +25,8 @@ the tests; '' = off; a comma-separated list = several hosts, and the run directo
 file replaces the list at every phase start: docs/az.md 34), `selfplay_local` (0: this machine takes no
 games while a remote worker takes work, docs/az.md 34.4), `selfplay_remote_procs` (worker processes per
 host; 0 = the remote's `procs`),
-`selfplay_remote_wait` (seconds the end of a phase waits for the remote's last shards),
+`selfplay_remote_wait` (seconds the end of a phase still waits for the remote's last shards once STOP is
+there; without STOP it waits for them all, docs/az.md 47.4),
 `selfplay_remote_inflight` (each machine's in-flight cap, in iterations of its throughput),
 `selfplay_remote_batch` ('auto': the consumers whose inference is CUDA / MPS are batch-bound;
 'local', 'remote', 'all', 'none') and `selfplay_remote_batch_inflight` (a batch-bound consumer's
@@ -45,7 +46,8 @@ overrides (run settings for the workers: concurrency, threads, groups, inference
 default to at most 8192 rows), env}.
 
 Local side (`RemotePlay`: threads of the run process; the main thread never waits for the remote
-except in `end`, bounded by `selfplay_remote_wait`). Each remote is a `Host` (its spec, transport,
+except in `end`: until the phase's last shards are in, PAUSE, or `selfplay_remote_wait` after STOP). Each remote
+is a `Host` (its spec, transport,
 mirror, sessions); one remote's workers are the consumers 'w0', 'w1', ... as they always were, a list
 of hosts' '<name>/w<k>' (docs/az.md 34: hosts join - resolved on a thread - and leave at phase starts):
 
@@ -60,9 +62,11 @@ of hosts' '<name>/w<k>' (docs/az.md 34: hosts join - resolved on a thread - and 
   and sends a worker its own (`cap`, single-game) or assigns it matches under it (co-training);
 * `begin(it)`: the sessions get `phase it` (their drivers' new search epoch with checkpoint i-1);
   `end(it)` (or the quota met, single-game): they get `end it`, finish their phase (games in flight
-  carry over, as the run's own rolling driver's do) and flush their shards; `end` waits for the
-  shards announced in phase i at most `selfplay_remote_wait` s: what is not back by then is dropped
-  (a shard of phase i never enters another iteration);
+  carry over, as the run's own rolling driver's do) and flush their shards; `end` waits for every
+  shard announced in phase i while the run goes on (a worker that dies is waited for no longer;
+  PAUSE ends the wait, the iteration is replayed); once STOP is there, at most
+  `selfplay_remote_wait` s more, then what is not back is dropped (a shard of phase i never enters
+  another iteration; docs/az.md 47.4);
 * fetch threads (one per worker) copy each announced shard (a temporary name), check it (the
   non-finite guard, zero/finite.py, and the run's game / features / actions) and rename it into
   `data/iter_i/` - only while phase i accepts. A non-finite shard is quarantined to `<run>/debug/`
@@ -288,6 +292,7 @@ class Session:
         self.started = _now()
         self.pinged = _now()
         self.assigned = {}                         # co-training: tag -> (worker active_s then, spec)
+        self.gave = set()                          # co-training: tags requeued away from it (never handed back)
         self.handled = False
         # single-game: games the worker reported finished (it holds them until accepted), accepted
         self.fin = 0
@@ -1013,13 +1018,20 @@ class RemotePlay:
                              'seconds': round(max((e.get('linger') or {}).get('seconds', 0.0) for e in ends), 1)}
         return out
 
-    def end(self, it, local=None):
-        """Iteration `it`'s self-play ended here: the remote's phase ends too; waits at most
-        `selfplay_remote_wait` s for its last shards. `local`: this machine's phase ({units, run_s,
+    def end(self, it, local=None, check=None):
+        """Iteration `it`'s self-play ended here: the remote's phase ends too; waits for its last
+        shards - every worker of the phase has sent its end (its shards announced) or is gone, and
+        every announced shard is fetched (accepted, rejected, quarantined or failed) - with no time
+        limit while the run goes on (docs/az.md 47.4: a bounded drain only after a stop request).
+        Once STOP is there, at most `selfplay_remote_wait` s more: what is not back by then is dropped
+        and the record says `cut`. `check`: called every poll (the run's pause check: PAUSE ends the
+        wait at once - Paused, the iteration replayed). `local`: this machine's phase ({units, run_s,
         util}: the shared queue's measurement). -> the remote's share (metrics), with `queue`: the
         consumers' caps, rates and the remote rows' staleness; with a list of hosts also `remotes`,
         each host's share (docs/az.md 34)."""
+        from .runctl import stop_requested
         t0 = _now()
+        cut = False
         with self.mu:
             self.want = None
             if self.q is not None and self.q['it'] == it:
@@ -1030,12 +1042,21 @@ class RemotePlay:
                 if s.end_sent != it:
                     s.send({'cmd': 'end', 'iter': it})
                     s.end_sent = it
-            deadline = t0 + self.wait_s
+            deadline = None                        # (set once STOP is seen: then at most selfplay_remote_wait s)
             while True:
                 done = all(it in s.ended or not s.alive() for s in targets) and self.cur['pending'] == 0
-                if done or _now() >= deadline:
+                if done:
                     break
-                self.mu.wait(min(0.25, max(0.01, deadline - _now())))
+                if check is not None:
+                    check()
+                if deadline is None and stop_requested(self.R.run):
+                    deadline = _now() + self.wait_s
+                    self.log(f'iteration {it}: STOP while the phase\'s last shards travel: waiting at most '
+                             f'{self.wait_s:g}s more for them')
+                if deadline is not None and _now() >= deadline:
+                    cut = True
+                    break
+                self.mu.wait(0.25)
             self.accepting = None
             cur = dict(self.cur)
             ends = [s.ended.get(it) for s in targets]
@@ -1106,6 +1127,8 @@ class RemotePlay:
             out['remotes'] = {name: self._record(hout, hends, hc, hlate, hprev, wait_s, lead_s, hcaps, hheld, hout_n)
                               for name, hout, hends, hc, hlate, hprev, hcaps, hheld, hout_n in per}
         out['queue'] = qblock
+        if cut:
+            out['cut'] = True                      # (STOP: the phase ended with shards still out, docs/az.md 47.4)
         if self.fatal is not None:
             raise self.fatal
         return out
@@ -1595,7 +1618,11 @@ class RemotePlay:
         room = cap - len(s.assigned)
         if room <= 0:
             return
-        items = co.take_for_remote(room)
+        # (an episode requeued away from this worker - overdue there, or given back - never goes back to it: in the
+        # tick that requeued it its room is free again, and it would play it twice, docs/az.md 47.5)
+        with self.mu:
+            skip = frozenset(s.gave)
+        items = co.take_for_remote(room, skip)
         if not items:
             return
         act = float(s.status.get('active_s', 0.0))
@@ -1614,6 +1641,7 @@ class RemotePlay:
         with self.mu:
             back = [(tag, spec) for tag, (_t, spec) in s.assigned.items()]
             s.assigned.clear()
+            s.gave.update(tag for tag, _ in back)
             s.gave_back = True
         if back:
             self.co.requeue(back)
@@ -1644,6 +1672,7 @@ class RemotePlay:
             late = [(tag, spec) for tag, (t, spec) in s.assigned.items() if act - t > lim]
             for tag, _ in late:
                 del s.assigned[tag]
+                s.gave.add(tag)
         if late:
             self.co.requeue(late)
             with self.mu:
@@ -1829,6 +1858,7 @@ class Worker:
         self.closing = False
         self.stash = None                          # a phase command that came while ending a phase
         self.backlog = []                          # episodes queued before the driver exists
+        self.holding = set()                       # co-training: the tags enqueued here whose rows are not sent yet
         self.drv = self.evr = None
         self.active_s = 0.0                        # running time in phases (back-offs excluded)
         self.t_status = 0.0
@@ -1913,6 +1943,11 @@ class Worker:
     def _control(self, msg, ph):
         cmd = msg.get('cmd')
         if cmd == 'enqueue':
+            if msg['tag'] in self.holding:
+                # (co-training: an episode it still plays, sent again - never played twice here; its one row answers both)
+                self.note(f'enqueue of {msg["tag"]} ignored: this worker still holds it')
+                return
+            self.holding.add(msg['tag'])
             self.enq += 1
             if self.drv is None:
                 self.backlog.append((msg['tag'], msg['spec']))
@@ -2139,7 +2174,13 @@ class Worker:
             self.note(f'accept {msg} with no open phase {msg.get("iter")} here: given back')
             self.emit('unaccepted', iter=msg.get('iter'), n=n)    # the run counts them again
             return
-        n = min(n, len(self.held))
+        if n > len(self.held):
+            # (should not happen: the run accepts only games this worker said it finished) - never a silent cut, the
+            # quota would count games that never arrive: the difference is given back
+            short = n - len(self.held)
+            self.note(f'accept {msg} with {len(self.held)} games held: {short} given back')
+            self.emit('unaccepted', iter=msg.get('iter'), n=short)
+            n = len(self.held)
         for _ in range(n):
             row, sd = self.held.popleft()
             ph['bw'].add(sd, 1)
@@ -2175,6 +2216,7 @@ class Worker:
             die_rows = int(self.test.get('die_after_rows') or 0)
             for row, sd in games:
                 self.emit('row', row=row)
+                self.holding.discard(row.get('tag'))
                 self.rows_out += 1
                 if sd is not None:
                     ph['samples'] += sample_rows(sd)
