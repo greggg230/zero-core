@@ -363,7 +363,9 @@ def test_remote_evaluation_refused_by_the_remote_build(v4, tmp_path, monkeypatch
     rv = remote.RemoteEval(fake, 'local')
     monkeypatch.setattr(rv, '_evaluate', evaluate)
     rv.enqueue(0)
-    assert rv.drain(timeout=20)
+    import time
+    t_end = time.time() + 20                       # (drain has no time limit of its own, docs/az.md 46.3: the test's bound)
+    assert rv.drain(stop=lambda: time.time() > t_end, poll_s=0.05)
     assert calls == [0, 0] and "REFUSED by the remote's build" in logs[0] and str(ex) in logs[0]
 
 
