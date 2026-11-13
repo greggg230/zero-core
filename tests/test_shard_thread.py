@@ -378,6 +378,9 @@ def test_shared_queue_local_linger_and_remote_workers(tmp_path):
         assert not glob.glob(str(run / 'data' / f'iter_{it:04d}' / '*.tmp.npz'))
     rw = [r['selfplay']['remote'].get('shard_writer') for r in m[1:]]
     assert any(w and w['workers'] >= 1 and w['rows'] > 0 for w in rw), rw
+    from test_loop import check_timing
+    for r in m[1:]:
+        check_timing(r['selfplay'])                # (the shared queue's local driver, docs/az.md 48.2)
     assert json.load(open(tmp_path / 'mirror' / 'sq' / 'config.json'))['shard_writer_thread'] == 1
 
 

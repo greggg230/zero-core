@@ -878,6 +878,7 @@ class Run:
         self.resign_metrics(it, out, results)
         self.tail_metrics(it, out, st, st0, results)
         self.episode_metrics(it, out, results)
+        self.timing_metrics(out, st, st0, ev, secs)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
             out['league'] = self.league_metrics(it, plan, L.tally(L.League.attribute(results, kinds, plan['slots'])),
@@ -901,6 +902,27 @@ class Run:
         self.log(f'iter {it} shard writer thread: caller {w["samples_s"]:.2f}s in the samples ({w["waits"]} waits for '
                  f'room, {w["wait_s"]:.2f}s; {w["close_s"]:.2f}s at the end), writer {w["writer_s"]:.2f}s, queue peak '
                  f'{w["queue_peak_mb"]:.0f} of {w["queue_mb"]:.0f} MB')
+
+    def timing_metrics(self, out, st, st0, ev, secs):
+        """Where self-play's seconds went (docs/az.md 48.2): `timing` = this machine's driver's search threads' seconds
+        in their chunks (busy_s; busy_share of threads x the phase's seconds), its batch assembly (assemble_s), the
+        driving thread's seconds blocked in next_batch for a group's searches (wait_s, wait_share of the phase), and of
+        the evaluator's seconds (infer_s, infer_share) those of its CUDA graphs' launches (launch_s: packing, upload,
+        replay queued) and results (result_s: the wait for the device and the download), and the batches. A
+        search-bound phase waits (wait_share high, busy_share near 1); an inference-bound one sits in result_s with
+        idle search threads. The evaluator's launch_s / result_s are reset here (its other counters by the caller)."""
+        def d(k):
+            return st.get(k, 0) - ((st0 or {}).get(k, 0))
+        secs = max(float(secs), 1e-9)
+        thr = max(1, int(st.get('threads', 1) or 1))
+        launch, result = float(getattr(ev, 'launch_s', 0.0)), float(getattr(ev, 'result_s', 0.0))
+        out['timing'] = {'busy_s': round(d('busy_s'), 3), 'busy_share': round(d('busy_s') / (thr * secs), 4),
+                         'assemble_s': round(d('assemble_s'), 3), 'wait_s': round(d('wait_s'), 3),
+                         'wait_share': round(d('wait_s') / secs, 4), 'infer_share': round(float(getattr(ev, 'seconds', 0.0)) / secs, 4),
+                         'launch_s': round(launch, 3), 'result_s': round(result, 3), 'batches': d('batches'),
+                         'threads': thr}
+        if hasattr(ev, 'launch_s'):
+            ev.launch_s = ev.result_s = 0.0
 
     def view_metrics(self, out, st, st0, leaves):
         """Self-play's root-view metrics (docs/az.md 16), only when a setting is on (the metrics of
@@ -1215,6 +1237,7 @@ class Run:
         self.resign_metrics(it, out, results, rem.pop('resign', None))
         self.tail_metrics(it, out, st, st0, results)   # (this machine's driver; every source's aborted games)
         self.episode_metrics(it, out, results)
+        self.timing_metrics(out, st, st0, ev, secs)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
                           'restart_sims': st['restart_sims'] - st0['restart_sims'],

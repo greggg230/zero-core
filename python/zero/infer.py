@@ -1399,6 +1399,10 @@ class NetEvaluator:
         self.leaves = 0
         self.seconds = 0.0
         self.graph_calls = 0                         # batches answered by the CUDA graphs
+        # of `seconds`, those of the CUDA graphs' `launch` (packing, the upload, the replay queued) and `result` (the
+        # wait for the device and the download) in drive's pipelined loop: self-play's `timing` metrics (docs/az.md 48.2)
+        self.launch_s = 0.0
+        self.result_s = 0.0
         # eager batches on worker threads (module docstring); None: computed in launch()
         self.workers = max(1, int(workers)) if self.fast is None else 1
         self.pool = None
@@ -1743,7 +1747,9 @@ class NetEvaluator:
         if lb.a.get('xs_val') is not None and self._graphable(lb.opt_off, belief_rows(extra)):
             t0 = time.perf_counter()
             h = self._launch_sparse(lb)
-            self.seconds += time.perf_counter() - t0
+            dt = time.perf_counter() - t0
+            self.seconds += dt
+            self.launch_s += dt
             return h
         tl = _lb_tail(lb)
         if self.max_rows is not None and lb.B > self.max_rows:
@@ -1759,9 +1765,13 @@ class NetEvaluator:
                 self._check_head()
             h = ('g', self.fast.launch(lb.x, lb.n_players, lb.opt_off, lb.opt_action, *((brows,) if len(brows) else ()),
                                        **self._tail_kw(*tl)), lb.B)
+            dt = time.perf_counter() - t0
+            self.seconds += dt
+            self.launch_s += dt
         else:
+            # (evaluated now: `evaluate` counts its own seconds - added here too, they were counted twice before
+            # 2026-11-13, docs/az.md 48.2)
             h = ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra, *tl), 0)
-        self.seconds += time.perf_counter() - t0
         return h
 
     def result(self, h):
@@ -1777,7 +1787,9 @@ class NetEvaluator:
             self.calls += len(res)
             self.graph_calls += len(res)
             self.leaves += B
-            self.seconds += time.perf_counter() - t0
+            dt = time.perf_counter() - t0
+            self.seconds += dt
+            self.result_s += dt
             if len(res) == 1:
                 return res[0]
             out = (np.concatenate([r[0] for r in res]).astype(np.float32, copy=False),
@@ -1789,7 +1801,9 @@ class NetEvaluator:
         self.calls += 1
         self.graph_calls += 1
         self.leaves += B
-        self.seconds += time.perf_counter() - t0
+        dt = time.perf_counter() - t0
+        self.seconds += dt
+        self.result_s += dt
         return r
 
 

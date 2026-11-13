@@ -6305,3 +6305,64 @@ HEAD` - `HEAD` in every detached checkout (a game's pinned run worktrees, the `*
 one `<base>/HEAD`: the shared-target hazard (cargo's workspace-relative dep-info, one checkout's build installed as
 another's module) as the default. Now a detached checkout gets `detached-<its directory's name>` (a branch: its name as
 before, `/` -> `_`; not a git checkout: `nogit`), as MTG Zero's own `tools/build_py.sh` now names it.
+
+## 48. Self-play's host costs after layout v7: tail rows scanned at encode, the phase's time split (the 2026-11-12 performance review, MTG Zero lane D; branch `perf/fable-1112`)
+
+(Numbered 44 on its branch `perf/fable-1112` and in that branch's commit messages; renumbered 48 when it was merged
+into `integrate/fable-1112`, because the AMD branches already use 44-46. Every "44.N" there is 48.N here. This pin has
+the branch's head c275a1e: 48.1 and 48.2. The branch's next commit a77cacf (P5, records as their non-zeros, its 44.3 and
+44.4) is not in it: zero-farm's worker reads the dense `Record`.)
+
+The 2026-11-12 review of MTG Zero (its perf slice: `perf.md`, the patches P2 and P5) measured zero-core's driver on
+the live run's spec (the constructed Delver best-of-three, layout v7) with an instantaneous evaluator and found two
+costs this window's work had added - v7's tails had switched MTG's rows off the sparse path of docs/search.md 2.12,
+and every record kept a dense row of 56,384 floats for as long as its contest lasted - and a phase whose metrics could
+not say what it waited for (32k leaves/s in the live run against 61k in 43.12's quiet benchmark of the same network).
+48.1 and 48.2 are behaviour-preserving (the same batches, samples, results and shards).
+
+### 48.1 Tail rows scanned when they are encoded (driver; no setting)
+
+**Why.** For a game with `TAILS` a sparse buffer (`sparse` 1) left an `encode_row` row in its dense scratch until
+`seal`: the evaluation cache's key (3.12) was `obs_state` over all `NUM_FEATURES` floats, a cached row zeroed the whole
+scratch again and a sent row was scanned at `seal`. A game without tails has had its pairs at once since 2.12.
+
+**What.** `LeafBuf::encode_row` (tails, sparse) runs `game::sparse_scan` right after `encode_row` and marks the row open,
+as `encode_sparse` does: the key reads the pairs (`obs_state_sparse`, the same key), `unrow` truncates, `seal` counts.
+docs/search.md 2.15 already said so ("the driver ... calls `encode_row` into its scratch row, then `sparse_scan`").
+
+**Checks.** The same batches, samples and results: the review's driver hash (MTG Zero's `engine/tests/driver_bench.rs`,
+every batch's rows, options, tails, overrides, every sample and result over 40,000 batches) `f8cfeb414c6c3322` before
+and after (MTG Zero ENGINE.md 145). `driver::tail_tests::a_sparse_tail_row_is_scanned_when_encoded` (new): the open row
+is its pairs at once, the scratch zeros again, the key the dense row's, the pairs `sparse_scan`'s of the dense row,
+`unrow` / `seal`. The existing `dense_and_sparse_rows_are_the_same` and
+`the_evaluation_cache_keys_cover_tails_and_overrides` (sparse vs dense: the same rows, games and cache hits) pass.
+
+**Measured** (MTG Zero v7 Delver Bo3, desktop CPU, the review): the row's key 5.46 -> 1.15 us, seal or un-row 4.33 ->
+~0, encode + scan 4.45 -> 9.6 us; rows in all 23.2 -> 17.5 us per simulation. ENGINE.md 145 has this branch's A/B.
+
+### 48.2 Where a self-play phase's seconds went (`selfplay.timing`; metrics only)
+
+**Why.** `infer_s` is the evaluator's whole call time; the driver's counters (`busy_s`, `wait_s`, `assemble_s`) were
+never written, so a phase at half the benchmark's leaves/s could not say whether it waited for the network, for the
+search threads or for neither (the GIL, the writer, the remote threads).
+
+**What.** Each self-play phase (plain, rolling, the shared queue's local driver) writes `selfplay.timing`: `busy_s` (the
+search threads' seconds in their chunks) and `busy_share` (of threads x the phase's seconds), `assemble_s` (batch
+assembly), `wait_s` (the driving thread's seconds blocked in `next_batch` for a group's searches) and `wait_share`,
+`infer_share` (`infer_s` over the phase), `launch_s` / `result_s` (of the evaluator's seconds, those of its CUDA
+graphs' launches - packing, the upload, the replay queued - and of their results - the wait for the device and the
+download; `NetEvaluator.launch_s` / `result_s`, reset per phase), `batches`, `threads`. A search-bound phase shows
+`wait_share` high and `busy_share` near 1; an inference-bound one sits in `result_s` with idle search threads; a phase
+with neither high spends its time in the driving thread itself. The other keys are unchanged.
+
+**A fix in `infer_s`** (2026-11-13): for a batch evaluated at once in drive's pipelined loop (an eager evaluator: CPU,
+or a network without graphs) `NetEvaluator.launch` added the time `evaluate` had already counted, so `infer_s` read
+about twice the truth (the toy smoke's `infer_share` 1.6, the MTG smoke's 1.8). It is counted once now. The CUDA graphs'
+path (MTG Zero's runs) was right and is unchanged. Comparisons of two runs' metrics leave `timing` out with the other
+timing keys (`test_select_scale.py`).
+
+**Tests.** `test_loop.py::test_selfplay_metrics_split_the_phase_time` (the toy smoke's phases: the keys, shares within
+[0, 1] - `infer_share` included, which the double count failed -, CPU: no launches), the shared queue's local driver in
+`test_shard_thread.py`.
+
+**Not measured here**: the live run's split (it needs a run on this commit; the GPU was busy with that run).

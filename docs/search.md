@@ -514,7 +514,10 @@ overrides. Nothing of this exists for a game without them: no array, no key, no 
 
 **Rows.** Every row kind - a leaf's own row (`ROW_LEAF`), a value-only row (`ROW_VALUE`), a root belief row
 (`ROW_BELIEF`), the root's record - is `encode_row` of its state: the head into the batch's dense row or the sparse
-scratch (then `sparse_scan`), the tail sealed (sorted by (seg, slot); a duplicate, a slot inside the head or a token
+scratch (then `sparse_scan` at once, 2026-11-12: the row's non-zeros are its open row, as `encode_sparse`'s are in 2.12 -
+the key reads the pairs, a cached row is truncated, `seal` counts; before, the scratch stayed dense until `seal`, so a
+v7 MTG row was hashed over all 56,384 floats and a cached one zeroed them again: key 5.46 -> 1.15 us a row, seal or
+un-row 4.33 -> ~0, the 2026-11-12 review's P2), the tail sealed (sorted by (seg, slot); a duplicate, a slot inside the head or a token
 of a non-tail segment panics: an engine bug, the game named by the worker). A row with options gets its overrides
 from `option_overrides(viewer, opts)`, checked (option indexes ascending and in range, tokens -1 or packed; else a
 panic). A merged tree's shared leaf row (3.16) carries the tail of the same encoding (`Tree::leaf_obs_tail`), its

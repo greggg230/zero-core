@@ -46,6 +46,24 @@ def test_iterations_metrics_and_elo(smoke_run):
     assert runctl.read_state(str(smoke_run), 'run')['state'] == 'done'
 
 
+def check_timing(sp):
+    """A self-play phase's `timing` block (docs/az.md 48.2): the driver's search threads' and the caller's seconds, the
+    evaluator's split, all within the phase."""
+    t = sp['timing']
+    assert set(t) == {'busy_s', 'busy_share', 'assemble_s', 'wait_s', 'wait_share', 'infer_share', 'launch_s', 'result_s',
+                      'batches', 'threads'}, t
+    assert t['busy_s'] > 0 and 0 < t['busy_share'] <= 1.05 and t['threads'] >= 1 and t['batches'] > 0, t
+    assert 0 <= t['wait_s'] and 0 <= t['wait_share'] <= 1.05 and 0 <= t['infer_share'] <= 1.05 and t['assemble_s'] >= 0, t
+    # (CPU evaluators: no CUDA graph launches)
+    assert t['launch_s'] == 0 and t['result_s'] == 0, t
+
+
+def test_selfplay_metrics_split_the_phase_time(smoke_run):
+    m = read_metrics(str(smoke_run))
+    for r in m[1:]:
+        check_timing(r['selfplay'])
+
+
 def test_window_cache_trains_the_same_network(smoke_run):
     """Run setting window_cache: training from the cached window (the second training of the same
     iteration reuses every shard) gives the network of training without it, weight for weight."""
