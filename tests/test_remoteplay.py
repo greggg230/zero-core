@@ -341,23 +341,68 @@ def test_local_linger_plays_while_the_run_trains(tmp_path):
     assert p.returncode != 0 and 'selfplay_local_linger: needs selfplay_remote' in p.stderr, p.stderr
 
 
-def test_late_shards_are_dropped(tmp_path):
-    """A remote slower than selfplay_remote_wait: its shards of phase i come after the phase closed
-    and are dropped (reported as late), never in iteration i or any later one; the run waits at
-    most the deadline."""
-    run = tmp_path / 'late'
-    # phases of ~6 s; every shard announced 3 s after it is written: after its phase's 0.5 s deadline
-    p = run_loop(run, '--iters', '4', '--conc', '64', '--games', '1500', '--selfplay-remote', 'local',
+def test_slow_shards_are_waited_for(tmp_path):
+    """A remote whose shards travel slowly (each announced 3 s after it is written; selfplay_remote_wait 0.5): the end
+    of a phase waits for every one of them while the run goes on (docs/az.md 46.4: a bounded drain only after a stop
+    request - before, the 0.5 s deadline dropped them in normal operation): none is late, every one joins its
+    iteration."""
+    run = tmp_path / 'slow'
+    p = run_loop(run, '--iters', '3', '--conc', '64', '--games', '1500', '--selfplay-remote', 'local',
                  '--selfplay-remote-wait', '0.5', env=env_for(tmp_path, {'delay_shard_s': 3}))
     assert p.returncode == 0, p.stdout + p.stderr
     m = read_metrics(str(run))
     rem = [r['selfplay']['remote'] for r in m[1:]]
-    assert not remote_shards(run)
-    assert sum(r['samples'] for r in rem) == 0
-    assert sum(r['late'] + r['late_prev'] for r in rem) >= 1, rem
-    assert all(r['wait_s'] < 3 for r in rem), rem
+    assert all(r['late'] == 0 and r['late_prev'] == 0 and 'cut' not in r for r in rem), rem
+    assert sum(r['samples'] for r in rem) > 0 and len(remote_shards(run)) == sum(r['shards'] for r in rem), rem
+    assert any(r['wait_s'] > 2.5 for r in rem if r['shards']), rem
     log = (run / 'log.txt').read_text(encoding='utf-8')
-    assert re.search(r'worker 0: shard m00-[0-9a-f]{4}_000\.npz of iteration \d came after its phase closed: dropped', log)
+    assert 'came after its phase closed' not in log
+
+
+def test_stop_bounds_the_wait_for_the_last_shards(tmp_path):
+    """STOP while a phase's last shards travel: the wait ends within selfplay_remote_wait, what is not back is dropped
+    (the record says `cut`, the iteration short), the iteration trains on what arrived - no DONE.json for it (never
+    resumed from a cut phase) - and the run stops after it."""
+    run = tmp_path / 'stop'
+    out_path = tmp_path / 'stop.out'
+    e = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH, **env_for(tmp_path, {'delay_shard_s': 3}))
+    with open(out_path, 'w', encoding='utf-8') as out:
+        proc = subprocess.Popen([sys.executable, '-m', 'zero.run', '--run', str(run), '--preset', 'toy-smoke',
+                                 '--iters', '6', '--conc', '64', '--games', '1500', '--eval-games', '8',
+                                 '--eval-random-games', '4', '--elo-games', '4', '--ref-games', '8',
+                                 '--selfplay-remote', 'local', '--selfplay-remote-wait', '0.5'],
+                                cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, env=e)
+        try:
+            deadline, it, seen = time.time() + 240, None, {}
+            while time.time() < deadline and proc.poll() is None:
+                try:
+                    prog = json.load(open(run / 'progress.json'))
+                except (OSError, ValueError):
+                    prog = {}
+                if prog.get('phase') == 'selfplay':      # (the remote's games of the phase: its last shard travels)
+                    seen[prog.get('iter')] = (prog.get('remote') or {}).get('games', 0)
+                if prog.get('phase') == 'remote shards' and seen.get(prog.get('iter'), 0) > 0:
+                    it = prog['iter']
+                    (run / 'STOP').write_text('')
+                    break
+                time.sleep(0.05)
+            assert it is not None, out_path.read_text(encoding='utf-8')[-3000:]
+            proc.wait(timeout=180)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    assert proc.returncode == 0, out_path.read_text(encoding='utf-8')[-3000:]
+    m = read_metrics(str(run))
+    assert [r['iter'] for r in m] == list(range(it + 1))
+    rem, q = m[it]['selfplay']['remote'], m[it]['selfplay']['queue']
+    # (the worker's last shard - its accepted games' samples - not back: its end never came, the iteration short)
+    assert rem.get('cut') is True and rem['ended'] == 0 and rem['wait_s'] < 3, rem
+    assert q['short'] > 0, q
+    assert not (run / 'data' / f'iter_{it:04d}' / 'DONE.json').exists()
+    assert it == 1 or (run / 'data' / f'iter_{it - 1:04d}' / 'DONE.json').exists()
+    log = (run / 'log.txt').read_text(encoding='utf-8')
+    assert f"iteration {it}: STOP while the phase's last shards travel: waiting at most 0.5s more" in log
+    assert 'STOP file found; exiting' in log
 
 
 DEAD = textwrap.dedent('''

@@ -6,6 +6,10 @@
   game repo's root; the core alone: `python -m zero.run`) and restarts it (resuming from the
   newest checkpoint) whenever it exits with an error, after killing any orphaned workers;
 * backs off if it keeps crashing (5 crashes within an hour -> wait 15 minutes);
+* gives up on a deterministic failure: the same crash (the run's own error text in run_state.json, its
+  decimals masked - a NonFinite's losses differ in the last digits on a GPU) <P>_SUPERVISE_SAME_CRASHES
+  times in a row (default 3; 0 = never) ends the supervisor - state 'refused', with the error - instead
+  of replaying the iteration forever (docs/az.md 46.2);
 * pause / resume (zero/runctl.py): when the run exits paused (status 75: a PAUSE file in
   the run dir; tools/pause_run.py, the dashboard's Pause button) - or a PAUSE file is
   present when it would (re)start the run - it waits, polling every second, until PAUSE is
@@ -34,6 +38,7 @@ run command (tests: a fake run).
 import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -113,6 +118,16 @@ def wait_run(run, p, stall_s):
             return code if code else 1
 
 
+def crash_key(run, pid):
+    """The crash of run process `pid` as a comparable key: its own error text (run_state.json, written by the run
+    when it aborts) with the decimals masked; None when that process wrote no error (killed, a segfault, the stall
+    watchdog: never counted as the same crash)."""
+    st = runctl.read_state(run, 'run') or {}
+    if st.get('pid') != pid or st.get('state') != 'aborted' or not st.get('error'):
+        return None
+    return re.sub(r'[-+]?\d*\.\d+(?:[eE][-+]?\d+)?', '#', str(st['error']))
+
+
 def wait_resume(run, poll_s):
     """The run is paused: wait until its PAUSE file is removed -> True (relaunch now), or
     False if a STOP file appears meanwhile (the supervisor ends; the run stays paused)."""
@@ -160,6 +175,8 @@ def main(argv=None):
     backoff_s = float(pkg.env('SUPERVISE_BACKOFF', 900))
     poll_s = float(pkg.env('SUPERVISE_POLL', 1))
     stall_s = float(pkg.env('SUPERVISE_STALL', 0))
+    same_n = int(float(pkg.env('SUPERVISE_SAME_CRASHES', 3)))
+    last_key, same = None, 0
     cmd = json.loads(pkg.env('SUPERVISE_CMD')) if pkg.env('SUPERVISE_CMD') else \
         [sys.executable, '-m', pkg.run_module]
     name = pkg.run_module
@@ -200,6 +217,16 @@ def main(argv=None):
             if not wait_resume(run, poll_s):
                 return
             continue
+        key = crash_key(run, p.pid)
+        same = same + 1 if key is not None and key == last_key else (1 if key is not None else 0)
+        last_key = key
+        if same_n > 0 and same >= same_n:
+            err = (runctl.read_state(run, 'run') or {}).get('error', '')
+            log(run, f'the same crash {same} times in a row ({err[:400]}): a deterministic failure, not restarting - '
+                     f'supervisor done (fix the cause, then start the supervisor again; docs/az.md 46.2)')
+            runctl.write_state(run, 'supervisor', state='refused', run_pid=None, why=f'the same crash {same} times in a row',
+                               error=err[:1000])
+            return
         now = time.time()
         crashes = [t for t in crashes if now - t < 3600] + [now]
         wait = backoff_s if len(crashes) >= 5 else wait_s

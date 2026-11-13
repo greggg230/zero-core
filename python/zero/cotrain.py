@@ -65,8 +65,9 @@ from .finite import NonFinite, check_state
 from .infer import drive
 from .net import (EncodingMismatch, check_checkpoint, check_encoding, layout_sans_identity, load, save, tokens_layout,
                   widen)
-from .run import (DEFAULTS, PRESETS, Run, _fmt, _fmt_queue, _fmt_remote, _write_json, check_eval_settings, last_rates,
-                  latest_iter, log, model_path, read_metrics, summarize)
+from .run import (DEFAULTS, PRESETS, Run, _fmt, _fmt_queue, _fmt_remote, _write_json, check_devices, check_eval_settings,
+                  drain_remote_evals, last_rates, latest_iter, log, mark_phase_done, minor_metrics, model_path,
+                  read_metrics, summarize)
 from .workqueue import lag_hist
 
 BIG = 1 << 62                                      # a resolver driver's quota: its phases end by end_phase()
@@ -123,8 +124,11 @@ class Coordinator:
     zero/workqueue.py: kept up to date by the remote's manager) bounds the episodes outstanding on the
     local driver (queued in it or playing), and the coordinator keeps the local driver's room under
     it in reserve: a remote consumer takes only what is queued beyond that (the local driver never
-    waits while a remote holds its share). A requeued tag may come back twice (the remote finishes
-    it after all): the second row is dropped (`dup_dropped`)."""
+    waits while a remote holds its share). A requeued tag may come back more than once (the remote
+    finishes it after all; requeued k times, k + 1 copies can be in flight): `dupe_ok` counts each
+    tag's spare copies (one per requeue), the first row fills the episode's slot and every later one
+    is dropped against a spare (`dup_dropped`). A row for a filled slot (or an event already
+    resolved) with no spare left is an error, as an unknown tag is."""
 
     def __init__(self, episodes, results):
         self.episodes_of, self.results_of = episodes, results
@@ -145,7 +149,7 @@ class Coordinator:
         self.local_out = 0                         # episodes fed to the local driver whose rows are not back
         self.util = [0.0, 0]                       # local_out / local_cap, sampled (the shared queue's measure)
         self.remote_rows = []                      # the remote's accepted rows (taken by the run)
-        self.dupe_ok = set()                       # requeued tags: a second row for them is dropped
+        self.dupe_ok = {}                          # requeued tag -> its spare copies (one per requeue): dropped
         self.dup_dropped = 0
         self.ev_total = 0                          # events parked so far and their episodes (matches per event)
         self.ep_total = 0
@@ -227,12 +231,18 @@ class Coordinator:
                 tag = r.get('tag')
                 g, _, k = (tag or '').partition('/')
                 ev = self.events.get(int(g)) if g.isdigit() else None
-                if tag in self.dupe_ok and (ev is None or (k.isdigit() and int(k) in ev['rows'])):
-                    self.dupe_ok.discard(tag)      # the second copy of a requeued episode
+                if self.dupe_ok.get(tag, 0) > 0 and (ev is None or (k.isdigit() and int(k) in ev['rows'])):
+                    # a later copy of a requeued episode (its slot filled, or its event resolved): one spare used
+                    self.dupe_ok[tag] -= 1
+                    if not self.dupe_ok[tag]:
+                        del self.dupe_ok[tag]
                     self.dup_dropped += 1
                     continue
                 if ev is None or not k.isdigit():
                     raise RuntimeError(f'a resolver result row with an unknown tag {tag!r}: {r}')
+                if int(k) in ev['rows']:
+                    # (never counted twice: `outstanding` and the metrics would drift)
+                    raise RuntimeError(f'a second resolver result row for {tag!r}, which was never requeued: {r}')
                 ev['rows'][int(k)] = r
                 self.outstanding -= 1
                 kept.append(r)
@@ -253,25 +263,36 @@ class Coordinator:
         return rows
 
     # ---- a remote consumer (zero.remoteplay's threads)
-    def take_for_remote(self, n):
+    def take_for_remote(self, n, skip=()):
         """Up to `n` queued episodes (tag, spec) for the remote, oldest first - beyond the local
-        driver's room under its cap, which stays here for it."""
+        driver's room under its cap, which stays here for it. `skip`: tags this consumer must not
+        get (a worker's own requeued ones: it was too slow with them or gave them back), left where
+        they are for the other consumers."""
         with self.cv:
             reserve = 0 if self.local_cap is None else max(0, self.local_cap - self.local_out)
             k = min(n, max(0, len(self.to_queue) - reserve))
-            return [self.to_queue.popleft() for _ in range(k)]
+            if not skip:
+                return [self.to_queue.popleft() for _ in range(k)]
+            out, kept = [], []
+            while self.to_queue and len(out) < k:
+                item = self.to_queue.popleft()
+                (kept if item[0] in skip else out).append(item)
+            self.to_queue.extendleft(reversed(kept))
+            return out
 
     def collect_rows(self, rows):
         """The remote's result rows -> how many were taken (the rest: duplicates dropped)."""
         return self._accept(rows, self.remote_rows)
 
     def requeue(self, items):
-        """Episodes the remote lost or did not finish in time, back at the front of the queue (a
-        later row of the remote's copy, or of this one, is dropped)."""
+        """Episodes the remote lost or did not finish in time, back at the front of the queue: one
+        more spare copy each (whichever copies finish after the first are dropped, however many
+        times the episode was requeued)."""
         with self.cv:
             for tag, spec in reversed(items):
                 self.to_queue.appendleft((tag, spec))
-            self.dupe_ok.update(tag for tag, _ in items)
+            for tag, _ in items:
+                self.dupe_ok[tag] = self.dupe_ok.get(tag, 0) + 1
             self.cv.notify_all()
 
     def take_remote_rows(self):
@@ -694,9 +715,10 @@ class CoRun:
         rem = None
         if rsp is not None:
             _write_json(prog, {'iter': it, 'phase': 'remote shards', 'time': time.time()})
-            try:                                   # at most selfplay_remote_wait s
+            try:                                   # (PAUSE ends the wait, STOP bounds it: docs/az.md 46.4)
                 rem = rsp.end(it, local={'units': len(matches), 'run_s': secs, 'util': co.take_util(),
-                                         'leaves': rdrv.stats()['leaves'] - rst0['leaves']})
+                                         'leaves': rdrv.stats()['leaves'] - rst0['leaves']},
+                              check=lambda: self.check('remote shards'))
             except NonFinite as e:
                 raise NonFinite(f'{self.label("r")}: {e}') from e
         rrows = co.take_remote_rows()
@@ -715,7 +737,7 @@ class CoRun:
                    'leaves': leaves, 'leaves_per_s': leaves / max(secs, 1e-9),
                    'games_per_h': len(rows) / max(secs, 1e-9) * 3600, 'seconds': secs,
                    'infer_s': ev.seconds, 'avg_batch': ev.leaves / max(1, ev.calls),
-                   'minor_per_game': (st.get('minor', 0) - st0.get('minor', 0)) / max(1, len(rows)),
+                   **minor_metrics(st, st0, rows, exact=False),     # (rolling drivers: the count, az.md 46.9)
                    'target': ts.summary(X.cfg.get('policy_target', 'visits')),
                    'rolling': {'in_flight': 0, 'restarts': st['restarts'] - st0['restarts'],
                                'restart_sims': st['restart_sims'] - st0['restart_sims'],
@@ -815,9 +837,10 @@ class CoRun:
     def loop(self):
         c, rc, run = self.cfg, self.rcfg, self.run
         P, R = self.P, self.R
+        check_devices(c)                           # (both networks' devices: DeviceRefused, exit 78)
+        check_devices(rc, 'resolver_cfg: ')
         os.makedirs(os.path.join(R.run, 'models'), exist_ok=True)
-        with open(os.path.join(R.run, 'config.json'), 'w') as f:
-            json.dump(rc, f, indent=1)
+        _write_json(os.path.join(R.run, 'config.json'), rc, strict=True, indent=1)   # (atomically, as the run's)
         # variable-length rows (docs/az.md 43): both games' refusals at start (a draft layout, a stale build, an arch
         # or shard format that cannot carry them; RowsRefused, exit 78) - nothing for games without them
         for X in (P, R):
@@ -887,18 +910,33 @@ class CoRun:
                 self.log('STOP file found; exiting')
                 break
             t0 = time.time()
-            sp_p, sp_r = self.selfplay(it)
-            self.log(f'iter {it} selfplay: {_fmt(sp_p)}')
-            self.log(f'[resolver] iter {it} selfplay: {_fmt(sp_r)}')
+            # both phases finished before a PAUSE / crash in training (each data directory's DONE.json, verified,
+            # docs/az.md 46.1): trained on as they are, never played again
+            recs = [X.phase_done(it, quiet=True) for X in (P, R)]
+            if all(r is not None for r in recs):
+                (sp_p, sp_r), sp_s = (r['selfplay'] for r in recs), float(recs[0]['selfplay_s'])
+                self.log(f'iter {it}: both self-play phases finished before the interruption (DONE.json in data/ and '
+                         f'resolver/data/, as recorded): not played again, training on them')
+                resumed = sp_s
+            else:
+                sp_p, sp_r = self.selfplay(it)
+                sp_s, resumed = time.time() - t0, 0.0
+                self.log(f'iter {it} selfplay: {_fmt(sp_p)}')
+                self.log(f'[resolver] iter {it} selfplay: {_fmt(sp_r)}')
+                if not (sp_r.get('remote') or {}).get('cut'):
+                    for X, sp in ((R, sp_r), (P, sp_p)):
+                        mark_phase_done(X, it, sp, sp_s)
             t1 = time.time()
             tr_p, tr_r = self.train(it, sp_p, sp_r)
             self.log(f'iter {it} train: {_fmt(tr_p)}')
             self.log(f'[resolver] iter {it} train: {_fmt(tr_r)}')
             t2 = time.time()
             for X, sp, tr in ((P, sp_p, tr_p), (R, sp_r, tr_r)):
-                m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': t1 - t0, 'train_s': t2 - t1},
-                     'resumed_seconds': time.time() - t0}
-                _write_json(X.partial_path(it), m)
+                m = {'iter': it, 'selfplay': sp, 'train': tr, 'phases': {'selfplay_s': sp_s, 'train_s': t2 - t1},
+                     'resumed_seconds': time.time() - t0 + resumed}
+                if resumed:
+                    m['selfplay_resumed'] = True
+                _write_json(X.partial_path(it), m, strict=True)
             if R.rsp is not None and self.sp is not None and it < c['iters'] and not os.path.exists(stop) \
                     and not os.path.exists(os.path.join(run, 'PAUSE')):
                 # both checkpoints are written: the remote goes on with the queued episodes with the
@@ -909,7 +947,6 @@ class CoRun:
             R.rsp.close()                          # no more self-play: the remote's workers quit
         waits = [q for q in (R.remote, self.netremote) if q is not None]
         if waits and not os.path.exists(stop):
-            _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
-            for q in waits:
-                q.drain(check=lambda: self.check('remote evaluations'))
+            # (no time limit while the run goes on; STOP: the missing ones logged, the run ends aborted, az.md 46.3)
+            drain_remote_evals(run, waits, self.check, self.log)
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})

@@ -162,7 +162,8 @@ class Transport:
             raise RuntimeError(f'mv {dst} on {self.s["host"]}: {r.stderr.strip()[-300:]}')
 
     def get(self, src, dst):
-        """Copy a remote file here (False if it does not exist)."""
+        """Copy a remote file here -> True; False only when it does not exist there. A copy that fails for another
+        reason (the link, the remote asleep) raises RuntimeError: never read as "no such file" (docs/az.md 46.3)."""
         if self.local:
             if not os.path.exists(src):
                 return False
@@ -172,14 +173,26 @@ class Transport:
         r = subprocess.run(['scp', '-q', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20', f'{self.s["host"]}:{src}', dst + '.tmp'],
                            capture_output=True, text=True, timeout=600)
         if r.returncode:
-            return False
+            try:
+                os.remove(dst + '.tmp')
+            except OSError:
+                pass
+            t = self._ssh(f'if [ -e {shlex.quote(src)} ]; then echo yes; else echo no; fi', 60)
+            if t.returncode == 0 and t.stdout.strip() == 'no':
+                return False
+            raise RuntimeError(f'scp {self.s["host"]}:{src} failed (exit {r.returncode}): {r.stderr.strip()[-300:]}')
         os.replace(dst + '.tmp', dst)
         return True
 
     def listdir(self, d):
+        """The names in remote directory `d` ([] when it does not exist). A listing that fails (ssh's own failure, the
+        remote asleep) raises RuntimeError: never read as an empty directory (docs/az.md 46.3)."""
         if self.local:
             return os.listdir(d) if os.path.isdir(d) else []
-        r = self._ssh(f'ls {shlex.quote(d)} 2>/dev/null', 60)
+        q = shlex.quote(d)
+        r = self._ssh(f'if [ -d {q} ]; then ls {q}; fi', 60)
+        if r.returncode:
+            raise RuntimeError(f'ls {d} on {self.s["host"]} failed (exit {r.returncode}): {(r.stderr or "").strip()[-300:]}')
         return r.stdout.split()
 
     def run_module(self, module, args, timeout):
@@ -249,19 +262,29 @@ class RemoteEval:
             if k not in done and os.path.exists(model_path(self.R.run, k)):
                 self.enqueue(k)
 
-    def drain(self, timeout=6 * 3600, check=None):
-        """Wait until every queued evaluation has a result (the run finished its iterations).
-        `check`: called every poll (a co-training run's pause check: PAUSE ends the wait, the
-        restart queues the missing evaluations again)."""
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            with self.lock:
-                if not self.queued:
-                    return True
+    def pending(self):
+        """The iterations queued and not recorded yet (sorted)."""
+        with self.lock:
+            return sorted(self.queued)
+
+    def drain(self, check=None, stop=None, on_poll=None, poll_s=2.0):
+        """Wait until every queued evaluation has a result (the run finished its iterations) -> True. No time limit
+        while the run goes on (docs/az.md 46.3: a remote asleep for a night is waited for; a bounded drain only after
+        a stop request): False at once when `stop()` says STOP is there (the missing evaluations are queued again
+        by a restart). `check`: called every poll (the run's pause check: PAUSE ends the wait, Paused; the restart
+        queues them again). `on_poll(pending)`: called every poll (the run's progress.json: the stall watchdog,
+        <P>_SUPERVISE_STALL, sees the wait alive)."""
+        while True:
+            left = self.pending()
+            if not left:
+                return True
+            if stop is not None and stop():
+                return False
+            if on_poll is not None:
+                on_poll(left)
             if check is not None:
                 check()
-            time.sleep(2)
-        return False
+            time.sleep(poll_s)
 
     # ---- the worker
     def _loop(self):
@@ -421,7 +444,10 @@ class RemoteEval:
         os.makedirs(elo.pool_dir(self.R.run, tag), exist_ok=True)
         files = ('results.json', 'ratings.json') + (('anchored.json',) if self.R.cfg.get('elo_anchors') else ())
         for fn in files:
-            self.t.get(f'{self.rdir}/{pool}/{fn}', os.path.join(elo.pool_dir(self.R.run, tag), fn))
+            # (every one written by the evaluation just run: one that does not arrive fails it - retried - rather than
+            # leaving this machine's pool older than the mirror's, which a later new-mirror ship would put back there)
+            if not self.t.get(f'{self.rdir}/{pool}/{fn}', os.path.join(elo.pool_dir(self.R.run, tag), fn)):
+                raise RuntimeError(f'the mirror has no {pool}/{fn} after its evaluation: not recorded')
         mdir = os.path.join(self.R.run, 'models')
         if not self.t.get(self.rdir + '/models/index.json', os.path.join(mdir, 'index.json')):
             raise RuntimeError('the mirror has no models/index.json after its evaluation: not recorded')
