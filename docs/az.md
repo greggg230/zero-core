@@ -5919,3 +5919,57 @@ nothing published) signs eoe1 80 v 70's head-to-head definition and the live fuz
 and 1.06 busy h on the desktop, 632 eval games on the Mac, 303,410 fuzz seeds in 24 h); replayed on 11-07's runs with
 mac + vast:line + vast:w1 (6 runs, 0.5 s) it reproduced an independent recount exactly (318,511 / 63,268 / 905,122 /
 962,469 self-play games in 24 h).
+
+## 45. Self-play records and the farm pool (`pool:<farm run>` in `selfplay_remote`, `pool_*`; zero-farm phase 3, 2026-11-12)
+
+### 45.1 Why
+
+zero-farm's friends' PCs (zero-farm DESIGN.md 6.1, 7) play a run's self-play with the native worker (44). A shard of an
+EoE game is ~25 KB of rows a friend's upload would carry and the trainer could not check; the game's record - its seed,
+every real move and only what the search produced - is ~2 KB, and replaying it on the trainer rebuilds every row exactly
+and is its validation. The trainer's side is one more kind of remote: the farm pool.
+
+### 45.2 What it does
+
+* **Records** (docs/search.md 2.17): `Driver::set_trace` and `zero_search::record` (`game_json`, `replay`, `game_seed`):
+  a record replays into the rows the driver emitted, bit for bit (features, options, auxiliary targets, z, sc; pi, q, net
+  from the record as float16 / their ids), a chained contest's episodes included (42); `<pkg>._engine.replay_rows`.
+* **The worker** (`zero_worker::records`): a served self-play job writes records (`records` events; `output: shards` the
+  shards of before, `both` for the gate); the selfplay CLI's default stays shards.
+* **The pool** (`zero/farm_pool.py`): a `selfplay_remote` name `pool:<farm run>` - alone or next to remote hosts, in the
+  setting or the `selfplay_remotes` file (34) - makes a thread of the run that publishes each iteration's checkpoint on
+  zero-farm (exported with its reference set, uploaded, a new signed definition version that adds the gen, and only then
+  the gen registered current: leases switch only to gens a definition names), polls the farm's results, replays every
+  credited game of every records chunk (the header's game, features, actions, spec, auxiliary targets, the farm run's base
+  seed and worker build checked; each game's seed must be its game id's), refuses a chunk whose any game fails (counted per
+  machine, kept in `<run>/debug/pool/`), holds the games and lets the open iteration's quota take them oldest first exactly
+  as a remote worker's (RemotePlay.accept_pool), writing their rows as ordinary shards (`data/iter_i/pool-<machine>_SSS.npz`,
+  meta `source` 'pool', `machine`, `farm_run`), drops a game whose oldest row's network is older than `i - 1 -
+  pool_max_stale`, and posts the generation's running total (accepted + held) before each ack. It never holds a share of
+  the quota and the run never waits for it: RemotePlay.end closes its shards with what it accepted. With `selfplay_local` 0,
+  the pool counts as a remote taking work while a valid game arrived within `pool_live_s` (this machine then only trains;
+  when the farm goes quiet it plays again).
+
+### 45.3 Off by default
+
+No `pool:` name: nothing of it runs and nothing changes (`set_trace` is never called; `Record::step` stays 0; the pool_*
+settings are unused, classified `trainer` for check-config).
+
+### 45.4 Tests and checks
+
+* zero_search: `traced_games_replay_to_their_rows_bit_for_bit`, `tracing_changes_no_game_and_no_row`,
+  `a_tampered_record_is_refused`, `set_trace_before_games_and_never_with_branches`,
+  `chain::traced_contests_replay_to_their_rows_bit_for_bit`; zero_worker `records_replay_to_the_shards_rows_bit_for_bit`
+  (sparse and dense), `a_served_job_writes_records_only`; `tests/test_farm_pool.py` (3: a fake coordinator; the publish
+  order, the pool's shards == shards of the same games written directly over two iterations, a tampered record refused,
+  the total before the ack, a stale game dropped, `selfplay_local` 0); `tools/worker_records_gate.py` (gate 3: a worker's
+  records replayed by the trainer's path == its own shards of the same games, bit for bit).
+* Gate 3 (MTG Zero, the desktop, 2026-11-12): eoe1's settings with iter 80's graph and a network switch to gen 81 after 8
+  games - 48 games, 5,471 rows with auxiliary targets, nets 80 / 81, 39 of 39 arrays identical in 3 files, 48 games' decks
+  compared; records 97.5 KB vs shards 1.17 MB. MTG Zero's tests (mtg-smoke, delver-smoke, eoe-smoke, eoe-choice-smoke with
+  value-only rows) and the best-of-three run's settings: MTG Zero ENGINE.md 114.6-114.7.
+
+### 45.5 Costs
+
+A traced game keeps its moves (2 bytes an action; an EoE game ~530) and calls `record_setup` once per game (episode). The
+pool's replay: ~19 ms an EoE game here (0.91 s for gate 3's 48), its held games' rows kept compacted (sparse float16).

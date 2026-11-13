@@ -117,6 +117,7 @@ def main(argv=None):
     ap.add_argument('--set', action='append', default=[])
     ap.add_argument('--out', default=None)
     ap.add_argument('--json')
+    ap.add_argument('--replay-only', action='store_true', help='replay and compare only: the worker files already in --out/worker')
     a = ap.parse_args(argv)
     if not a.uniform and not a.model:
         ap.error('--model or --uniform')
@@ -141,8 +142,11 @@ def main(argv=None):
     with open(sp, 'w', encoding='utf-8') as f:
         json.dump(cfg, f)
     wout = os.path.join(out, 'worker')
-    events, end, secs, switched = run_worker(a, sp, wout)
-    print(f'# worker: {end["stats"]["games"]} games in {secs:.0f} s; switched: {switched}', flush=True)
+    if a.replay_only:
+        secs, switched = 0.0, None
+    else:
+        events, end, secs, switched = run_worker(a, sp, wout)
+        print(f'# worker: {end["stats"]["games"]} games in {secs:.0f} s; switched: {switched}', flush=True)
 
     rc = dict(DEFAULTS)
     rc.update(cfg)
