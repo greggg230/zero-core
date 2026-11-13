@@ -7,6 +7,16 @@ use crate::tree::{leaf_values_team, transition_with, Scratch as SimScratch, Sim,
 struct WScratch<G: SearchGame> {
     game: Option<G>,
     sim: SimScratch,
+    rec: RecScratch,
+}
+
+/// A record's row (`record_features`): the dense row it is encoded into (`NUM_FEATURES` zeros between calls: the scan
+/// zeroes it again; emptied after a panic) and its pairs before they are copied out at their size.
+#[derive(Default)]
+struct RecScratch {
+    row: Vec<f32>,
+    idx: Vec<u32>,
+    val: Vec<f32>,
 }
 
 /// Queue-job flag: fill job of chunk `c & !FILL` (else: search job of chunk c).
@@ -17,7 +27,7 @@ pub(super) fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
 }
 
 pub(super) fn worker<G: SearchGame>(sh: Arc<Shared<G>>) {
-    let mut scratch = WScratch { game: None, sim: SimScratch::default() };
+    let mut scratch = WScratch { game: None, sim: SimScratch::default(), rec: RecScratch::default() };
     loop {
         let job = {
             let mut q = lock(&sh.queue);
@@ -51,6 +61,7 @@ pub(super) fn worker<G: SearchGame>(sh: Arc<Shared<G>>) {
             Err(p) => {
                 sh.fail(format!("search worker panicked: {}", panic_msg(p)));
                 scratch.game = None;
+                scratch.rec = RecScratch::default();
             }
         }
         sh.counters.busy_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -227,8 +238,9 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
             advance_slot(sh, slot, &mut ch.bufs, &mut ch.results, &mut ch.samples, &mut ch.parked, scratch, &mut n)
         }))
         .unwrap_or_else(|p| {
-            // the scratch world may be mid-transition
+            // the scratch world may be mid-transition (and a record's row mid-encoding)
             scratch.game = None;
+            scratch.rec = RecScratch::default();
             Err(format!("search worker panicked: {}", panic_msg(p)))
         });
         if let Some(gid) = gid {
@@ -596,7 +608,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         }
         if slot.sims >= slot.target.unwrap() {
             n.minor += slot.minor as u64;
-            decide(cfg, slot, seat, p, &mut scratch.sim.key, n, &sh.counters.look)?;
+            decide(cfg, slot, seat, p, &mut scratch.sim.key, &mut scratch.rec, n, &sh.counters.look)?;
             continue;
         }
         let walk = Walk { c_puct: seat.c_puct, chance_k: seat.chance_k, margin_w: seat.margin_w };
@@ -1024,6 +1036,20 @@ fn record_row<G: SearchGame>(g: &G, viewer: usize, opts: &[u16], x: &mut [f32]) 
     (tb.to_row(), ov)
 }
 
+/// A record's row as its non-zeros (`Record::x_idx` / `x_val`, docs/search.md 2.4): `record_row` into the scratch
+/// row, then `game::sparse_scan` (which zeroes it again) - the same pairs whatever the driver's batches are.
+fn record_features<G: SearchGame>(rs: &mut RecScratch, g: &G, viewer: usize, opts: &[u16]) -> (Vec<u32>, Vec<f32>, TailRow, Vec<(u32, i64)>) {
+    if rs.row.len() != G::NUM_FEATURES {
+        rs.row.clear();
+        rs.row.resize(G::NUM_FEATURES, 0.0);
+    }
+    let (tail, ov) = record_row(g, viewer, opts, &mut rs.row);
+    rs.idx.clear();
+    rs.val.clear();
+    crate::game::sparse_scan(&mut rs.row, &mut rs.idx, &mut rs.val);
+    (rs.idx.clone(), rs.val.clone(), tail, ov)
+}
+
 /// The capacity of a record's row when it passes the row limit (docs/search.md 2.15).
 fn record_over<G: SearchGame>(cfg: &DriverCfg, tail: &TailRow) -> Option<usize> {
     if G::TAILS.is_empty() {
@@ -1192,7 +1218,7 @@ fn deviate<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, p: usize, key: &m
 /// Choose the move after the search; the training record (`n.recorded`) and value-only records
 /// (`n.view_recorded`) it makes.
 #[allow(clippy::too_many_arguments)]
-fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize, key: &mut Vec<u64>, n: &mut Tally, look: &Mutex<LookTotals>) -> Result<(), String> {
+fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize, key: &mut Vec<u64>, rs: &mut RecScratch, n: &mut Tally, look: &Mutex<LookTotals>) -> Result<(), String> {
     if slot.dev_now {
         return deviate(cfg, slot, p, key, n);
     }
@@ -1271,8 +1297,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             PolicyTarget::CompletedQ { c_visit, c_scale, prior_w } => tree.cq_target_w(root, c_visit, c_scale, prior_w),
         };
         let g = slot.game.as_ref().unwrap();
-        let mut x = vec![0.0f32; G::NUM_FEATURES];
-        let (tail, ov) = record_row(g, p, acts, &mut x);
+        let (x_idx, x_val, tail, ov) = record_features(rs, g, p, acts);
         if let Some(cap) = record_over::<G>(cfg, &tail) {
             abort_game::<G>(cfg, slot, "record", cap);
             return Ok(());
@@ -1283,7 +1308,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             aux.resize(G::aux_width(), 0.0);
             g.aux_target(p, &mut aux);
         }
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, tail, ov });
+        slot.records.push(Record { x_idx, x_val, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, tail, ov });
         slot.rq.push(if gumbel {
             tree.gumbel_q()
         } else if pruned.is_some() {
@@ -1300,8 +1325,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                 if o == p || !nn_seat(cfg, slot.gid, o).is_some_and(|s| s.selfplay && s.record) {
                     continue;
                 }
-                let mut x = vec![0.0f32; G::NUM_FEATURES];
-                let (tail, _) = record_row(g, o, &[], &mut x);
+                let (x_idx, x_val, tail, _) = record_features(rs, g, o, &[]);
                 if let Some(cap) = record_over::<G>(cfg, &tail) {
                     abort_game::<G>(cfg, slot, "record", cap);
                     return Ok(());
@@ -1315,7 +1339,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                 if seat.view_target == ViewTarget::NextQ {
                     slot.view_wait.push((slot.records.len() as u32, o as u8));
                 }
-                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, tail, ov: Vec::new() });
+                slot.records.push(Record { x_idx, x_val, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, tail, ov: Vec::new() });
                 slot.rq.push(None);
                 n.view_recorded += 1;
             }

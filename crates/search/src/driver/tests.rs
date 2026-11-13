@@ -118,7 +118,9 @@ fn selfplay_records_and_is_reproducible_across_threads() {
     let total: u32 = r1.iter().map(|r| r.samples).sum();
     assert_eq!(total as usize, s1.len());
     for s in &s1 {
-        assert_eq!(s.x.len(), ToyGame::NUM_FEATURES);
+        // (the row as its non-zeros: ascending feature indexes of the toy's row)
+        assert!(s.x_idx.windows(2).all(|w| w[0] < w[1]) && s.x_idx.iter().all(|&i| (i as usize) < ToyGame::NUM_FEATURES));
+        assert_eq!(s.x_idx.len(), s.x_val.len());
         assert_eq!(s.pi.len(), s.opts.len());
         assert!((s.pi.iter().sum::<f32>() - 1.0).abs() < 1e-4);
         assert!((s.z[0] + s.z[1] - 1.0).abs() < 1e-6);
@@ -229,9 +231,14 @@ fn external_errors_stop_the_driver() {
     assert!(e.contains("external move failed"), "{e}");
 }
 
-/// FNV-1a over the records' bytes (a stable digest: std's hasher may change between Rust
+/// FNV-1a over the toy's records' bytes (a stable digest: std's hasher may change between Rust
 /// versions).
 fn records_digest(recs: &[Record]) -> u64 {
+    records_digest_w(recs, ToyGame::NUM_FEATURES)
+}
+
+/// `records_digest` of records of rows of `f` features.
+fn records_digest_w(recs: &[Record], f: usize) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     let mut eat = |b: &[u8]| {
         for &x in b {
@@ -240,7 +247,8 @@ fn records_digest(recs: &[Record]) -> u64 {
         }
     };
     for r in recs {
-        for v in r.x.iter().chain(&r.pi).chain(&r.z).chain(&r.q).chain(&r.sc) {
+        // (the dense row's floats, as the records held them before they kept their non-zeros: the goldens stand)
+        for v in r.features(f).iter().chain(&r.pi).chain(&r.z).chain(&r.q).chain(&r.sc) {
             eat(&v.to_bits().to_le_bytes());
         }
         eat(&[r.player, r.n_players]);
@@ -295,7 +303,7 @@ fn completed_q_changes_only_the_policy_targets() {
     let (mut differ, mut hv, mut hc) = (0, 0.0, 0.0);
     let ent = |p: &[f32]| -p.iter().filter(|&&x| x > 0.0).map(|&x| x as f64 * (x as f64).ln()).sum::<f64>() / (p.len() as f64).ln();
     for (a, b) in sv.iter().zip(&sc) {
-        assert_eq!((&a.x, a.player, a.n_players, &a.opts, a.z, a.q, a.sc, a.net), (&b.x, b.player, b.n_players, &b.opts, b.z, b.q, b.sc, b.net));
+        assert_eq!((&a.x_idx, &a.x_val, a.player, a.n_players, &a.opts, a.z, a.q, a.sc, a.net), (&b.x_idx, &b.x_val, b.player, b.n_players, &b.opts, b.z, b.q, b.sc, b.net));
         assert_eq!(b.pi.len(), b.opts.len());
         assert!((b.pi.iter().sum::<f32>() - 1.0).abs() < 1e-5 && b.pi.iter().all(|x| x.is_finite() && *x >= 0.0));
         differ += (a.pi != b.pi) as usize;
@@ -359,7 +367,7 @@ fn cq_prior_w_changes_only_the_recorded_targets() {
         assert_eq!(sb.len(), s1.len());
         let (mut differ, mut worst, mut multi) = (0, 0.0f64, 0);
         for ((a, b), e) in s1.iter().zip(&sb).zip(&s0) {
-            assert_eq!((&a.x, a.player, a.n_players, &a.opts, a.z, a.q, a.sc, a.net), (&b.x, b.player, b.n_players, &b.opts, b.z, b.q, b.sc, b.net));
+            assert_eq!((&a.x_idx, &a.x_val, a.player, a.n_players, &a.opts, a.z, a.q, a.sc, a.net), (&b.x_idx, &b.x_val, b.player, b.n_players, &b.opts, b.z, b.q, b.sc, b.net));
             assert!((b.pi.iter().sum::<f32>() - 1.0).abs() < 1e-5 && b.pi.iter().all(|x| x.is_finite() && *x >= 0.0));
             differ += (a.pi != b.pi) as usize;
             // ln pi_beta - ln pi_1 = (beta - 1) ln P0 + a constant per root (ln P0 = ln pi_E + a constant)
@@ -398,7 +406,7 @@ fn cq_prior_w_changes_only_the_recorded_targets() {
         assert!(sa.len() == sb.len() && !sa.is_empty());
         let mut differ = 0;
         for (a, b) in sa.iter().zip(&sb) {
-            assert_eq!((&a.x, a.player, &a.opts, a.z, a.q, a.sc), (&b.x, b.player, &b.opts, b.z, b.q, b.sc));
+            assert_eq!((&a.x_idx, &a.x_val, a.player, &a.opts, a.z, a.q, a.sc), (&b.x_idx, &b.x_val, b.player, &b.opts, b.z, b.q, b.sc));
             differ += (a.pi != b.pi) as usize;
         }
         assert!(differ * 2 > sa.len(), "{differ} of {}", sa.len());
@@ -840,7 +848,7 @@ fn deferred_games_park_and_resolve_with_their_samples() {
         assert!((s.q[..4].iter().sum::<f32>() - 1.0).abs() < 1e-3);
         assert_eq!((s.z[0], s.sc[0]), (s.z[2], s.sc[2]));
         assert!((s.sc[0] + s.sc[1]).abs() < 1e-6);
-        assert!(s.x.iter().all(|&v| f16_to_f32(f32_to_f16(v)) == v));
+        assert!(s.x_val.iter().all(|&v| f16_to_f32(f32_to_f16(v)) == v));
     }
     let st = d.stats();
     assert_eq!((st.parked, st.parked_bytes, st.resolved, st.games_finished), (0, 0, 6, 6));
@@ -1442,7 +1450,7 @@ fn select_transform_moves_only_the_moves_never_the_targets() {
     let (mut differ, mut checked, mut worst) = (0, 0, 0.0f64);
     for ((a, b), e) in sa.iter().zip(&sb).zip(&se) {
         for r in [b, e] {
-            assert_eq!((&a.x, a.player, a.n_players, &a.opts, a.z, a.q, a.sc, a.net), (&r.x, r.player, r.n_players, &r.opts, r.z, r.q, r.sc, r.net));
+            assert_eq!((&a.x_idx, &a.x_val, a.player, a.n_players, &a.opts, a.z, a.q, a.sc, a.net), (&r.x_idx, &r.x_val, r.player, r.n_players, &r.opts, r.z, r.q, r.sc, r.net));
         }
         differ += (a.pi != b.pi) as usize;
         // ln pi_s = ln P0 + s (c_visit + max N) completedQ - ln Z_s, so per option
@@ -1514,7 +1522,7 @@ fn an_unrecorded_seat_plays_the_same_games_and_records_nothing() {
         let want: Vec<&Record> = a.iter().filter(|r| r.player == me).collect();
         assert_eq!(want.len(), b.len(), "game {g}");
         for (x, y) in want.iter().zip(b) {
-            assert_eq!((&x.x, x.player, x.n_players, &x.opts, &x.pi, x.z, x.q, x.sc, x.net), (&y.x, y.player, y.n_players, &y.opts, &y.pi, y.z, y.q, y.sc, y.net));
+            assert_eq!((&x.x_idx, &x.x_val, x.player, x.n_players, &x.opts, &x.pi, x.z, x.q, x.sc, x.net), (&y.x_idx, &y.x_val, y.player, y.n_players, &y.opts, &y.pi, y.z, y.q, y.sc, y.net));
         }
         kept += b.len();
         dropped += a.len() - b.len();
@@ -1662,7 +1670,7 @@ fn root_min_visits_selfplay_targets_and_moves() {
     let (r4, s4, hands4) = mull_run(mull_seat(4, true, cq, Select::Visits), 160, true);
     assert_eq!(hands, hands4);
     assert_eq!((s0.len(), s4.len()), (320, 320));
-    let bad = |r: &Record| r.x[0] == 0.0 && r.x[3] == 0.0;
+    let bad = |r: &Record| r.feature(0) == 0.0 && r.feature(3) == 0.0;
     let i_mull = MULL as usize;
     // without the floor MULL is never visited: its completed-Q target stays at its prior
     assert!(s0.iter().all(|r| r.pi[i_mull] < 0.01), "k 0: a MULL target above its prior");
@@ -1679,7 +1687,7 @@ fn root_min_visits_selfplay_targets_and_moves() {
             assert!(r.pi[i_mull] < 1e-3, "a good hand's cq target: {:?}", r.pi);
             // a good hand's root value q: KEEP's walks alone (deterministic here: the value of
             // keeping), the forced MULL walks (worth ~0.14 less) left out
-            let want = 0.5 + 0.3 * (r.x[0] - r.x[1]);
+            let want = 0.5 + 0.3 * (r.feature(0) - r.feature(1));
             assert!((r.q[0] - want).abs() < 1e-5, "a good hand's q {} (KEEP's value {want})", r.q[0]);
         }
     }
@@ -1817,7 +1825,7 @@ fn aux_records_the_decider_targets_and_changes_nothing_else() {
         }
     }
     for r in &smp {
-        let t = at.get(&r.x.iter().map(|v| v.to_bits()).collect::<Vec<u32>>()).expect("a recorded decision of the game");
+        let t = at.get(&r.features(ToyGame::NUM_FEATURES).iter().map(|v| v.to_bits()).collect::<Vec<u32>>()).expect("a recorded decision of the game");
         assert_eq!(&r.aux, t, "a record's target is the decider's at that decision");
     }
     // a game without auxiliary targets refuses aux
@@ -1891,7 +1899,7 @@ fn root_view_off_and_value_samples_leave_the_searches_alone() {
         assert!(!d.opts.is_empty() && v.opts.is_empty() && v.pi.is_empty());
         assert_eq!(v.player, 1 - d.player);
         assert!((v.z[0] + d.z[0] - 1.0).abs() < 1e-6, "z in the observer's perspective");
-        assert_ne!(v.x, d.x, "the observer's view of the state");
+        assert_ne!((&v.x_idx, &v.x_val), (&d.x_idx, &d.x_val), "the observer's view of the state");
     }
     assert_eq!(res.iter().map(|r| r.samples as usize).sum::<usize>(), recs.len());
 }
@@ -1950,7 +1958,7 @@ fn root_view_values_read_the_root_deciders_hand() {
     // search of before) it reads that seat's hand in the sampled world and none of the keeper's:
     // 1 - (0.5 + 0.3 (q1 - 0.5)) with the sampled q1 0 or 1. From the root decider's view: 0.5 +
     // 0.3 (q0 - 0.5), its own hand, in every world.
-    let first = |recs: &[Record]| -> Vec<(f32, f32)> { recs.iter().filter(|r| r.player == 0 && r.x[1] == 0.0).map(|r| (r.x[0], r.q[0])).collect() };
+    let first = |recs: &[Record]| -> Vec<(f32, f32)> { recs.iter().filter(|r| r.player == 0 && r.feature(1) == 0.0).map(|r| (r.feature(0), r.q[0])).collect() };
     let (rm, vm, sm) = hmull_run(hmull_seat(2, LeafView::Mover, 0.0, ViewTarget::NextQ), 200, 11);
     let (rr, vr, sr) = hmull_run(hmull_seat(2, LeafView::Root, 0.0, ViewTarget::NextQ), 200, 11);
     assert_eq!((vm, sm.view_rows), (0, 0));
@@ -1987,7 +1995,7 @@ fn value_only_samples_and_their_targets() {
             assert_eq!((d0.player, v1.player, d1.player, v0.player), (0, 1, 1, 0));
             assert!(v1.opts.is_empty() && v0.opts.is_empty() && v1.pi.is_empty() && !d0.opts.is_empty());
             // the views: seat 1 before seat 0's move (nobody decided), seat 0 before seat 1's
-            assert_eq!((v1.x[1], v0.x[1], d1.x[1]), (0.0, 1.0, 1.0));
+            assert_eq!((v1.feature(1), v0.feature(1), d1.feature(1)), (0.0, 1.0, 1.0));
             assert_eq!(v1.z, d1.z);
             assert_eq!(v0.z, d0.z);
             assert_eq!(v0.q, v0.z);
@@ -2226,7 +2234,7 @@ fn hmull_belief_seat(sims: u32, tilt: f64, view: LeafView, redet: bool) -> SeatC
 
 /// The mean root value q of seat 1's decisions after seat 0 kept (its records), for its own hand.
 fn seat1_q(recs: &[Record]) -> f64 {
-    let v: Vec<f64> = recs.iter().filter(|r| r.player == 1 && r.x[3] == 0.0).map(|r| r.q[0] as f64).collect();
+    let v: Vec<f64> = recs.iter().filter(|r| r.player == 1 && r.feature(3) == 0.0).map(|r| r.q[0] as f64).collect();
     v.iter().sum::<f64>() / v.len() as f64
 }
 
@@ -2451,7 +2459,7 @@ fn gumbel_mulligan_selfplay_and_evaluation() {
     };
     let (rs, ss, hands) = mull_run(gumbel_mull(true, 1.0, 1.0), 160, true);
     assert_eq!(ss.len(), 320);
-    let bad = |r: &Record| r.x[0] == 0.0 && r.x[3] == 0.0;
+    let bad = |r: &Record| r.feature(0) == 0.0 && r.feature(3) == 0.0;
     let i_mull = MULL as usize;
     let (mut nb, mut high) = (0, 0);
     for r in &ss {
@@ -2460,7 +2468,7 @@ fn gumbel_mulligan_selfplay_and_evaluation() {
             high += (r.pi[i_mull] > 0.9) as usize;
         } else {
             assert!(r.pi[i_mull] < 1e-3, "a good hand's cq target: {:?}", r.pi);
-            let want = 0.5 + 0.3 * (r.x[0] - r.x[1]);
+            let want = 0.5 + 0.3 * (r.feature(0) - r.feature(1));
             assert!((r.q[0] - want).abs() < 1e-5, "a good hand's q {} (KEEP's value {want})", r.q[0]);
         }
     }
@@ -3088,7 +3096,7 @@ fn resigned_games_end_where_the_rule_fires_with_its_outcome() {
             // its records: the twin's first ones, z the resignation's (relative to each record's decider)
             assert_eq!(s.len(), x.records as usize);
             for (a, b) in s.iter().zip(s0) {
-                assert_eq!((&a.x, &a.pi, &a.opts, a.player, a.q, a.net), (&b.x, &b.pi, &b.opts, b.player, b.q, b.net));
+                assert_eq!((&a.x_idx, &a.x_val, &a.pi, &a.opts, a.player, a.q, a.net), (&b.x_idx, &b.x_val, &b.pi, &b.opts, b.player, b.q, b.net));
                 for j in 0..2 {
                     assert_eq!(a.z[j], z[(a.player as usize + j) % 2]);
                 }
@@ -3800,7 +3808,7 @@ fn infoset_merge_selfplay_resigns_and_branches() {
         assert!(x.resigned && x.winner == Some(w) && (x.decision, x.step, x.records) == (x0.decision, x0.step, x0.records));
         assert_eq!(s.len(), x.records as usize);
         for (a, b) in s.iter().zip(s0) {
-            assert_eq!((&a.x, &a.pi, &a.opts, a.player, a.q), (&b.x, &b.pi, &b.opts, b.player, b.q));
+            assert_eq!((&a.x_idx, &a.x_val, &a.pi, &a.opts, a.player, a.q), (&b.x_idx, &b.x_val, &b.pi, &b.opts, b.player, b.q));
         }
     }
     assert!((4..=38).contains(&resigned), "{resigned} of 40 games resigned");

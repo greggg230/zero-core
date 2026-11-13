@@ -845,7 +845,13 @@ pub struct EpisodeRow {
 /// One recorded root decision with its targets.
 #[derive(Clone, Debug)]
 pub struct Record {
-    pub x: Vec<f32>,
+    /// The row's features as their non-zeros (docs/search.md 2.4): ascending feature indexes and their values, every
+    /// float of `encode_row(viewer)` whose bits are not 0 (`game::sparse_scan`'s pairs; -0.0 kept). `features` /
+    /// `write_features` lay the dense row out bit for bit, `feature` reads one float. A record is held for as long as
+    /// its game (a chained contest: every episode) is in flight: an MTG v7 row is ~220 non-zeros of 56,384 floats,
+    /// 1.8 KB instead of 225 KB (the dense `x: Vec<f32>` of before, 2026-11-12).
+    pub x_idx: Vec<u32>,
+    pub x_val: Vec<f32>,
     pub player: u8,
     pub n_players: u8,
     pub opts: Vec<u16>,
@@ -862,6 +868,33 @@ pub struct Record {
     /// The row's pointer overrides against `opts` (docs/search.md 2.15; empty without
     /// `SearchGame::OPTION_POINTERS`).
     pub ov: Vec<(u32, i64)>,
+}
+
+impl Record {
+    /// Feature `i` of the row (0.0 where it holds no non-zero).
+    pub fn feature(&self, i: usize) -> f32 {
+        match self.x_idx.binary_search(&(i as u32)) {
+            Ok(k) => self.x_val[k],
+            Err(_) => 0.0,
+        }
+    }
+    /// The row's non-zeros scattered into `out`, which holds the row's width of zeros: the dense row bit for bit. A
+    /// feature index past `out` panics (a row of another width).
+    pub fn write_features(&self, out: &mut [f32]) {
+        debug_assert_eq!(self.x_idx.len(), self.x_val.len());
+        if let Some(&last) = self.x_idx.last() {
+            assert!((last as usize) < out.len(), "a record with feature {last} for rows of {} features", out.len());
+        }
+        for (&i, &v) in self.x_idx.iter().zip(&self.x_val) {
+            out[i as usize] = v;
+        }
+    }
+    /// The dense row of `f` features.
+    pub fn features(&self, f: usize) -> Vec<f32> {
+        let mut x = vec![0.0f32; f];
+        self.write_features(&mut x);
+        x
+    }
 }
 
 /// The kind of a network batch row (`Batch::extra`, docs/search.md 2.2): a leaf's own row (or a
@@ -1281,7 +1314,8 @@ pub fn f16_to_f32(h: u16) -> f32 {
 /// A parked game's training record: the features as float16 (what the sample shards store
 /// anyway: the round trip changes nothing written).
 struct ParkedRecord {
-    x: Vec<u16>,
+    x_idx: Vec<u32>,
+    x_val: Vec<u16>,
     player: u8,
     n_players: u8,
     opts: Vec<u16>,
@@ -1294,13 +1328,13 @@ struct ParkedRecord {
 
 impl ParkedRecord {
     fn park(r: Record) -> ParkedRecord {
-        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux, tail: r.tail, ov: r.ov }
+        ParkedRecord { x_idx: r.x_idx, x_val: r.x_val.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux, tail: r.tail, ov: r.ov }
     }
     fn unpark(self) -> Record {
-        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux, tail: self.tail, ov: self.ov }
+        Record { x_idx: self.x_idx, x_val: self.x_val.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux, tail: self.tail, ov: self.ov }
     }
     fn bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.x.len() * 2 + self.opts.len() * 2 + self.pi.len() * 4 + self.aux.len() * 4
+        std::mem::size_of::<Self>() + self.x_idx.len() * 6 + self.opts.len() * 2 + self.pi.len() * 4 + self.aux.len() * 4
             + self.tail.seg.len() * 6 + self.tail.val.len() * 4 + self.ov.len() * 16
     }
 }
@@ -2677,7 +2711,13 @@ impl<G: SearchGame> Drop for Driver<G> {
 pub struct SampleArrays {
     pub n: usize,
     pub f: usize,
+    /// The dense rows [n * f] (`sample_arrays_rows`), or empty (`sample_arrays_pairs`).
     pub x: Vec<f32>,
+    /// `sample_arrays_pairs` (else all empty): row k's non-zero features are `xs_idx[xs_off[k]..xs_off[k + 1]]`
+    /// (ascending) with values `xs_val[..]` - each record's `x_idx` / `x_val` (docs/search.md 2.4).
+    pub xs_off: Vec<i64>,
+    pub xs_idx: Vec<u32>,
+    pub xs_val: Vec<f32>,
     pub player: Vec<i32>,
     pub n_players: Vec<i32>,
     pub opt_off: Vec<i64>,
@@ -2713,12 +2753,26 @@ pub fn sample_arrays(recs: &[Record], f: usize) -> SampleArrays {
 /// if every tail is empty) and / or pointer overrides (`pointers`: the `ov_*` arrays; docs/search.md 2.15). A
 /// record carrying what its flag leaves out is refused (a panic: never a silent drop).
 pub fn sample_arrays_rows(recs: &[Record], f: usize, tails: bool, pointers: bool) -> SampleArrays {
+    sample_arrays_of(recs, f, tails, pointers, false)
+}
+
+/// `sample_arrays_rows` with the features as each record's non-zeros (`xs_off` n + 1 offsets, `xs_idx`, `xs_val`;
+/// `x` empty): the dense rows' floats whose bits are not 0, without the n x f array (docs/search.md 2.4).
+pub fn sample_arrays_pairs(recs: &[Record], f: usize, tails: bool, pointers: bool) -> SampleArrays {
+    sample_arrays_of(recs, f, tails, pointers, true)
+}
+
+fn sample_arrays_of(recs: &[Record], f: usize, tails: bool, pointers: bool, pairs: bool) -> SampleArrays {
     let n = recs.len();
     let aw = recs.first().map_or(0, |r| r.aux.len());
+    let nnz = if pairs { recs.iter().map(|r| r.x_idx.len()).sum() } else { 0 };
     let mut s = SampleArrays {
         n,
         f,
-        x: Vec::with_capacity(n * f),
+        x: if pairs { Vec::new() } else { vec![0.0; n * f] },
+        xs_off: if pairs { Vec::with_capacity(n + 1) } else { Vec::new() },
+        xs_idx: Vec::with_capacity(nnz),
+        xs_val: Vec::with_capacity(nnz),
         player: Vec::with_capacity(n),
         n_players: Vec::with_capacity(n),
         opt_off: vec![0],
@@ -2746,9 +2800,18 @@ pub fn sample_arrays_rows(recs: &[Record], f: usize, tails: bool, pointers: bool
     if pointers {
         s.ov_off.push(0);
     }
-    for r in recs {
-        debug_assert_eq!(r.x.len(), f);
-        s.x.extend_from_slice(&r.x);
+    if pairs {
+        s.xs_off.push(0);
+    }
+    for (k, r) in recs.iter().enumerate() {
+        if pairs {
+            assert!(r.x_idx.last().is_none_or(|&i| (i as usize) < f), "a record with feature {:?} for rows of {f} features", r.x_idx.last());
+            s.xs_idx.extend_from_slice(&r.x_idx);
+            s.xs_val.extend_from_slice(&r.x_val);
+            s.xs_off.push(s.xs_idx.len() as i64);
+        } else {
+            r.write_features(&mut s.x[k * f..(k + 1) * f]);
+        }
         s.player.push(r.player as i32);
         s.n_players.push(r.n_players as i32);
         s.opt_action.extend(r.opts.iter().map(|&a| a as i32));

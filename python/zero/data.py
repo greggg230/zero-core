@@ -521,10 +521,20 @@ class ShardWriter:
         if has_rows(s) and not (self.sparse and _rows_shard(self.meta)):
             raise ValueError('ShardWriter: samples with tails / pointer overrides need a sparse format v2 writer '
                              '(meta `shard_format(cfg, info)` with shard_sparse 1; R8)')
+        if 'xs_val' in s and not self.sparse:
+            raise ValueError('ShardWriter: samples given as their non-zeros (SampleRecords.arrays(sparse=True)) for a '
+                             'dense shard writer')
         if self.sparse:
-            x = s['x']
-            s = {k: v for k, v in s.items() if k != 'x'}
-            s['xs'] = SparseRows.from_dense(x, x.shape[1])
+            if 'xs_val' in s:
+                # (a SampleRecords' arrays as their non-zeros: no dense rows made, docs/az.md 44.4)
+                pk = ('xs_off', 'xs_idx', 'xs_val', 'n_features')
+                xs = SparseRows.from_pairs(*(s[k] for k in pk))
+                s = {k: v for k, v in s.items() if k not in pk}
+            else:
+                x = s['x']
+                s = {k: v for k, v in s.items() if k != 'x'}
+                xs = SparseRows.from_dense(x, x.shape[1])
+            s['xs'] = xs
         self.buf.append(s)
         self.nbuf += len(s['player'])
         if self.nbuf >= self.rows:
@@ -665,6 +675,30 @@ class SparseRows:
         idx = np.concatenate([g[1] for g in got]) if got else np.zeros(0, itype)
         val = np.concatenate([g[2] for g in got]) if got else np.zeros(0, np.float16)
         return cls(indptr, idx, val, F)
+
+    @classmethod
+    def from_pairs(cls, off, idx, val, F):
+        """Rows given as their float32 non-zeros (`SampleRecords.arrays(sparse=True)`: `xs_off` [N + 1], `xs_idx`
+        ascending in each row, `xs_val`) -> exactly `from_dense` of their dense float32 rows of width F, without
+        those rows: the values cast to float16, a value whose cast is +0.0 dropped (a -0.0 kept), the columns in
+        from_dense's index dtype (docs/az.md 44.4). A column >= F is refused."""
+        F = int(F)
+        off = np.asarray(off, np.int64)
+        idx = np.asarray(idx)
+        N = len(off) - 1
+        if N < 0 or (N and (off[0] != 0 or off[-1] != len(idx))) or len(idx) != len(val):
+            raise ValueError(f'SparseRows.from_pairs: offsets {off[:1]}..{off[-1:]} for {len(idx)} columns and '
+                             f'{len(val)} values')
+        if len(idx) and int(idx.max()) >= F:
+            raise ValueError(f'SparseRows.from_pairs: column {int(idx.max())} of rows of {F} features')
+        itype = np.uint16 if F <= 1 << 16 else np.int32
+        v = np.asarray(val, np.float32).astype(np.float16)
+        keep = v.view(np.uint16) != 0
+        if keep.all():
+            return cls(off.copy(), idx.astype(itype), v, F)
+        cnt = np.bincount(np.repeat(np.arange(N), np.diff(off))[keep], minlength=N)
+        indptr = np.concatenate([np.zeros(1, np.int64), np.cumsum(cnt, dtype=np.int64)])
+        return cls(indptr, idx[keep].astype(itype), v[keep], F)
 
     def _pos(self, rows):
         rows = np.asarray(rows, np.int64)

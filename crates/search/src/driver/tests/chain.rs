@@ -60,7 +60,7 @@ fn match_cfg(seat: SeatCfg, games: usize) -> DriverCfg {
 
 /// A record's features show a pending start choice (the match block's flag).
 fn at_choice(r: &Record) -> bool {
-    r.x[toy::NUM_FEATURES + 4] > 0.5
+    r.feature(toy::NUM_FEATURES + 4) > 0.5
 }
 
 /// The checks every contest row must pass: the match's rules (36.1's analogue), the row's sums, and each record
@@ -168,7 +168,7 @@ fn chained_contests_replay_across_threads_and_count_in_rolling_quotas() {
         c.groups = groups;
         run_rows(&mut Driver::<ToyMatch>::new(c).unwrap(), &|d, b| answer(d, b))
     };
-    let key = |(r, s): &(GameResult, Vec<Record>)| (r.gid, r.steps, r.result.clone(), r.episodes.iter().map(|e| (e.steps, e.samples, e.result.clone())).collect::<Vec<_>>(), records_digest(s));
+    let key = |(r, s): &(GameResult, Vec<Record>)| (r.gid, r.steps, r.result.clone(), r.episodes.iter().map(|e| (e.steps, e.samples, e.result.clone())).collect::<Vec<_>>(), records_digest_w(s, crate::toy_match::NUM_FEATURES));
     let a: Vec<_> = mk(1, 1).iter().map(key).collect();
     let b: Vec<_> = mk(4, 3).iter().map(key).collect();
     assert_eq!(a, b);

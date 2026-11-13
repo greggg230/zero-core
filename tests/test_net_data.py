@@ -318,6 +318,32 @@ def _shard_pair(tmp_path, name, parts, compress=0, rows=10 ** 6):
     return dp, sp, dres, sres
 
 
+def test_sparse_rows_from_pairs_equal_from_dense():
+    """SparseRows.from_pairs (a SampleRecords' float32 non-zeros, docs/az.md 44.4) is from_dense of the dense rows
+    bit for bit: values cast to float16 (underflows to +0.0 dropped, to -0.0 kept, overflows to inf, NaN), columns in
+    from_dense's dtype for narrow and wide rows, empty rows and an empty batch."""
+    import pytest
+    from zero.data import SparseRows
+    rng = np.random.default_rng(7)
+    special = np.array([0.0, -0.0, 1e-9, -1e-9, 3e-8, 7e4, -1e6, np.inf, np.nan, 1.0, 0.5, -2.0], np.float32)
+    for F, N in [(37, 50), (70000, 20), (5, 0), (12, 3)]:
+        x = np.zeros((N, F), np.float32)
+        if N:
+            m = rng.random((N, F)) < min(0.3, 40 / F)
+            m[0] = False                                   # an empty row
+            x[m] = rng.choice(special, int(m.sum())) * rng.choice([1, 1, 3.7], int(m.sum())).astype(np.float32)
+        bits = x.view(np.uint32)
+        off = np.concatenate([[0], np.cumsum((bits != 0).sum(1))]).astype(np.int64)
+        r, c = np.nonzero(bits)
+        a = SparseRows.from_dense(x, F)
+        b = SparseRows.from_pairs(off, c.astype(np.uint32), x[r, c], F)
+        assert a.F == b.F and a.idx.dtype == b.idx.dtype and a.val.dtype == b.val.dtype == np.float16
+        assert np.array_equal(a.indptr, b.indptr) and np.array_equal(a.idx, b.idx)
+        assert np.array_equal(a.val.view(np.uint16), b.val.view(np.uint16))
+    with pytest.raises(ValueError, match='column'):
+        SparseRows.from_pairs(np.array([0, 1]), np.array([9], np.uint32), np.array([1.0], np.float32), 9)
+
+
 def test_sparse_shards_round_trip(tmp_path):
     """Run setting shard_sparse: a sparse shard (x_ptr / x_idx / x_val, meta x_format) reads back as the
     dense shard of the same samples, every array and the features bit for bit (-0.0 kept, a value whose

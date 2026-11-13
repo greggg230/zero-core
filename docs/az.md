@@ -6112,7 +6112,8 @@ the live run's spec (the constructed Delver best-of-three, layout v7) with an in
 costs this window's work had added - v7's tails had switched MTG's rows off the sparse path of docs/search.md 2.12,
 and every record kept a dense row of 56,384 floats for as long as its contest lasted - and a phase whose metrics could
 not say what it waited for (32k leaves/s in the live run against 61k in 43.12's quiet benchmark of the same network).
-44.1 and 44.2 are behaviour-preserving (the same batches, samples, results and shards).
+44.1 and 44.2 are behaviour-preserving (the same batches, samples, results and shards); so are 44.3 and 44.4, but
+44.3 changes a public Rust struct (`Record`): a game that reads a record's row in Rust follows it when it bumps its pin.
 
 ### 44.1 Tail rows scanned when they are encoded (driver; no setting)
 
@@ -6160,3 +6161,61 @@ timing keys (`test_select_scale.py`).
 `test_shard_thread.py`.
 
 **Not measured here**: the live run's split (it needs a run on this commit; the GPU was busy with that run).
+
+### 44.3 A record holds its row's non-zeros (`Record::x_idx` / `x_val`; an API change, no setting)
+
+**Why.** Every recorded decision (and value-only sample) allocated `vec![0.0; NUM_FEATURES]` and kept it until its
+game ended - for a chained contest (2.14) until the last episode: 225 KB a record for MTG's v7 rows, 177 KB on v6,
+~220 of whose 56,384 floats are non-zero. The review's driver at 1,536 games in flight (4 groups, 7.77M simulations,
+68,634 records in flight) peaked at 12.9 and 16.0 GB of working set, 5.4 GB with records as their non-zeros; the live
+run's process held 40 GB.
+
+**What.** `Record { x: Vec<f32>, .. }` is now `Record { x_idx: Vec<u32>, x_val: Vec<f32>, .. }`: the ascending feature
+indexes and values of every float of the row whose bits are not 0 (`game::sparse_scan`'s pairs, -0.0 kept), whatever
+the driver's batches are (dense or sparse). The worker encodes a record's row into a scratch row of its own (`decide`'s
+`RecScratch`, per worker thread: `NUM_FEATURES` zeros between records, the scan zeroes it again, emptied after a panic)
+and copies the pairs out at their size. A parked record (2.8) keeps its pairs with float16 values. `Record::feature(i)`
+reads one float, `write_features(out)` / `features(f)` lay the dense row out bit for bit; `sample_arrays_rows` (and so
+`take_samples`, `SampleRecords.arrays()`) gives the same dense `x` array as before, value for value, and
+`SampleRecords.nbytes` (the writer queue's measure, 31) counts 8 bytes a non-zero instead of 4 a float. The Python
+API is unchanged.
+
+**A game that bumps its pin onto this** and reads `Record::x` in Rust (MTG Zero's engine tests did: its driver
+benchmark and four tests; the zero-core toys' tests) must move to `feature(i)`, `features(f)` or the pairs; reading
+`x` no longer compiles (never a silently empty row). Games that use the records only through Python (Caverna Zero,
+Glass Road Zero, Kingdom Builder Zero) need nothing. The farm worker (zero-onnx) reads the dense record, so it takes
+this change on its own schedule.
+
+**Checks.** The golden records digests (`GOLDEN_RECORDS` and the others: they hash the dense rows' floats, through
+`features`) are unchanged, and so is every other driver test; `RecScratch` is exercised by every recording test (the
+dense toys and the sparse ones). MTG Zero's driver hash (ENGINE.md 145) is EQUAL: it hashes every sample's non-zero
+features, from the dense row before and from the pairs after. `cargo test -p zero_search`, the bindings' tests
+(`test_shard_thread.py`, `test_tail_rows.py`: take_records + arrays() = take_samples, array for array;
+`SampleRecords.nbytes` at least 8 bytes a non-zero).
+
+**Measured.** ENGINE.md 145.4 (peak working set and search time, A/B on the same work).
+
+### 44.4 The records handed to a sparse shard writer as their non-zeros (`SampleRecords.arrays(sparse=True)`; no setting)
+
+**Why.** With `shard_writer_thread` and `shard_sparse` (the live run's) the writer thread turned a SampleRecords into
+take_samples' dense float32 `x` [n, F] (225 KB a row, 56,384 floats each) only for `ShardWriter.add` to scan it back
+into its non-zeros (`SparseRows.from_dense`): 56 us a row in numpy against 0.8 us for the non-zeros themselves - the
+live run's `shard_writer.writer_s` of 17.9 s per iteration (120k rows). It runs on the writer thread, so it costs a
+core, not phase time.
+
+**What.** `SampleRecords.arrays(sparse=True)` (Rust `sample_arrays_pairs`) gives the same dict with the features as the
+records' pairs - `xs_off` i64 [n + 1], `xs_idx` u32, `xs_val` f32, `n_features` (a sparse batch's keys) - instead of
+`x`. `zero/shardthread.py` asks for it when its writer keeps its rows' non-zeros (`ShardWriter.sparse`), and
+`ShardWriter.add` makes its `SparseRows` with `SparseRows.from_pairs`: the values cast to float16, those whose cast is
++0.0 dropped (a -0.0 kept), the columns in from_dense's dtype - exactly `from_dense` of the dense rows, without them
+(a value from_dense keeps has non-zero float32 bits and a non-zero float16 cast; the pairs are every float with
+non-zero bits). A dense writer is never handed the pairs (refused if it is). `take_samples` and `arrays()` are
+unchanged.
+
+**Checks.** `test_shard_thread.py`: the threaded writer's shards byte for byte the synchronous writer's for a sparse
+writer too (`x_format` sparse: pairs on one side, from_dense on the other), the sparse writer gets the pairs;
+`test_net_data.py::test_sparse_rows_from_pairs_equal_from_dense` (random rows with -0.0, float16 underflows to +0.0
+and -0.0, overflows to inf, NaN, wide F); `test_tail_rows.py`: `arrays(sparse=True)`'s pairs scatter to
+`arrays()`'s `x`, with tails and overrides.
+
+**Measured** (desktop CPU, 2026-11-12, numpy 2.x): ENGINE.md 145.4.

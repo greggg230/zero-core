@@ -62,12 +62,14 @@ def item_bytes(s):
     return int(s.nbytes)
 
 
-def to_arrays(s, half=True):
+def to_arrays(s, half=True, sparse=False):
     """A queued item -> the sample dict a ShardWriter takes (None: none): a SampleRecords converted
     (take_samples' arrays); `half`: float32 features cast to float16 (the type `compact` stores: the
-    same values, so the same shard bytes, in half the memory while the writer buffers them)."""
+    same values, so the same shard bytes, in half the memory while the writer buffers them). `sparse` (a writer
+    that keeps its rows' non-zeros): a SampleRecords' features as their non-zeros (`arrays(sparse=True)`: the
+    dense float32 rows never made, docs/az.md 44.4; the writer's SparseRows are from_dense's of them, bit for bit)."""
     if s is not None and not isinstance(s, dict):
-        s = s.arrays()
+        s = s.arrays(sparse=True) if sparse else s.arrays()
     if half and s is not None and getattr(s.get('x'), 'dtype', None) == np.float32:
         s = dict(s, x=s['x'].astype(np.float16))
     return s
@@ -219,8 +221,10 @@ class ThreadedShardWriter:
             try:
                 self.games += g
                 if s is not None:
-                    # (a writer that keeps its rows' non-zeros, `sparse`, casts them itself: no dense copy)
-                    s = to_arrays(s, half=not getattr(self.w, 'sparse', False))
+                    # (a writer that keeps its rows' non-zeros, `sparse`, takes a SampleRecords' non-zeros and
+                    # casts them itself: no dense copy)
+                    sp = bool(getattr(self.w, 'sparse', False))
+                    s = to_arrays(s, half=not sp, sparse=sp)
                     if self.on_item is not None:
                         self.on_item(s)
                     self.w.add(s)

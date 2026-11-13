@@ -186,7 +186,7 @@ fn toy_tail_rows_carry_tails_and_overrides() {
 #[test]
 #[should_panic(expected = "a record with tail tokens")]
 fn head_only_sample_arrays_refuse_a_tail() {
-    let r = Record { x: vec![0.0; 2], player: 0, n_players: 2, opts: vec![], pi: vec![], z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: 0, aux: vec![], tail: TailRow { seg: vec![0], slot: vec![4], val: vec![1.0; 16] }, ov: vec![] };
+    let r = Record { x_idx: vec![], x_val: vec![], player: 0, n_players: 2, opts: vec![], pi: vec![], z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: 0, aux: vec![], tail: TailRow { seg: vec![0], slot: vec![4], val: vec![1.0; 16] }, ov: vec![] };
     sample_arrays(&[r], 2);
 }
 
@@ -205,7 +205,7 @@ fn dense_and_sparse_rows_are_the_same() {
     assert_eq!(w0, w1, "the same rows: heads, tails, overrides");
     assert_eq!(s0.len(), s1.len());
     for (a, b) in s0.iter().zip(&s1) {
-        assert_eq!((&a.x, &a.tail, &a.ov), (&b.x, &b.tail, &b.ov));
+        assert_eq!((&a.x_idx, &a.x_val, &a.tail, &a.ov), (&b.x_idx, &b.x_val, &b.tail, &b.ov));
     }
 }
 
@@ -214,7 +214,7 @@ fn dense_and_sparse_rows_are_the_same() {
 type Digest = (Vec<(u32, u64, Vec<f32>, u32)>, Vec<String>);
 
 fn digest(res: &[GameResult], smp: &[Record]) -> Digest {
-    let mut s: Vec<String> = smp.iter().map(|s| format!("{:?}", (&s.x, &s.tail, &s.ov, &s.pi, s.player, &s.z))).collect();
+    let mut s: Vec<String> = smp.iter().map(|s| format!("{:?}", (&s.x_idx, &s.x_val, &s.tail, &s.ov, &s.pi, s.player, &s.z))).collect();
     s.sort();
     (res.iter().map(|r| (r.gid, r.steps, r.scores.clone(), r.samples)).collect(), s)
 }
@@ -637,7 +637,7 @@ fn chained_contests_carry_every_episodes_tails_and_overrides() {
         assert_eq!(smp.len(), res.iter().map(|r| r.samples as usize).sum::<usize>());
         let seen: std::collections::HashSet<Vec<u64>> = rows.iter().map(|(p, x, t, o)| row_key(*p, x, t, o)).collect();
         for s in &smp {
-            assert!(seen.contains(&row_key(s.player as i32, &s.x, &record_tail(s), &s.ov)), "a record's row the network never saw");
+            assert!(seen.contains(&row_key(s.player as i32, &s.features(TF), &record_tail(s), &s.ov)), "a record's row the network never saw");
             crate::driver::check_overrides(&s.ov, s.opts.len());
         }
         assert!(smp.iter().filter(|s| !s.tail.is_empty()).count() > smp.len() / 4 && smp.iter().any(|s| !s.ov.is_empty()));

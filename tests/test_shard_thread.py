@@ -66,7 +66,9 @@ def test_take_records_gives_take_samples_arrays():
         assert (sa is None) == (sb is None)
         if sb is not None:
             assert len(sb) == sample_rows(sa) == sample_rows(sb) > 0
-            assert sb.nbytes >= sa['x'].nbytes and item_bytes(sb) == sb.nbytes
+            # (the records hold their rows' non-zeros, 8 bytes each, not the dense rows: docs/az.md 44.3)
+            nnz = int((sa['x'].view(np.uint32) != 0).sum())
+            assert 8 * nnz <= sb.nbytes and item_bytes(sb) == sb.nbytes
     ga, gb = per_game(a, False), per_game(b, True)
     assert len(ga) == len(gb) and sum(1 for s in ga if s is not None) > 10
     rows = 0
@@ -106,17 +108,20 @@ def test_split_records_errors_like_split_games():
     assert split_records([], None) == []
 
 
+@pytest.mark.parametrize('sparse', [False, True])
 @pytest.mark.parametrize('compress', [0, 1])
 @pytest.mark.parametrize('kind', ['records', 'dicts'])
-def test_threaded_writer_writes_the_synchronous_shards_byte_for_byte(tmp_path, kind, compress):
+def test_threaded_writer_writes_the_synchronous_shards_byte_for_byte(tmp_path, kind, compress, sparse):
     """The same items (per game, as the shared queue hands them; or whole takes) through a ShardWriter and
     through a ThreadedShardWriter (a queue bound smaller than one item: every add waits): the same files,
-    byte for byte, the same on_write calls (path names, rows, bytes) and counts; the queue's metrics."""
+    byte for byte, the same on_write calls (path names, rows, bytes) and counts; the queue's metrics. A sparse
+    writer (`x_format` sparse): the threaded one takes the records' non-zeros (`arrays(sparse=True)`, docs/az.md
+    44.4), the synchronous one scans take_samples' dense rows (`SparseRows.from_dense`) - the same shards."""
     takes_s = toy_takes(lambda d: d.take_samples(), games=24)
     takes_r = toy_takes(lambda d: d.take_records(), games=24)
     sync_items = per_game(takes_s, False)
     thr_items = per_game(takes_r, kind == 'records') if kind == 'records' else per_game(takes_s, False)
-    meta = {'game': 'toy', 'iter': 3}
+    meta = {'game': 'toy', 'iter': 3, **({'x_format': 'sparse'} if sparse else {})}
     calls = {'sync': [], 'thr': []}
     sw = ShardWriter(str(tmp_path / 'sync'), 'r00', rows=97, meta=meta, compress=compress,
                      on_write=lambda p, r, b: calls['sync'].append((os.path.basename(p), r, b)))
@@ -453,13 +458,13 @@ def test_loop_fails_on_nonfinite_samples_from_the_writer_thread(tmp_path):
 
 def test_a_writer_keeping_non_zeros_gets_the_float32_rows(tmp_path):
     """The float16 cast is for a writer that buffers dense rows; one keeping its rows' non-zeros (an attribute
-    `sparse` true, as zero-core feat/sparse-shards' ShardWriter) gets the driver's float32 features to cast
-    itself (no dense float16 copy)."""
+    `sparse` true, as zero-core feat/sparse-shards' ShardWriter) gets the records' float32 non-zeros to cast
+    itself (`SampleRecords.arrays(sparse=True)`: no dense rows at all, docs/az.md 44.4)."""
     got = []
 
     class Sparse(ShardWriter):
         def add(self, s):
-            got.append(s['x'].dtype)
+            got.append(('x' in s, s['xs_val'].dtype, s['xs_idx'].dtype, s['xs_off'].dtype, int(s['n_features'])))
             super().add(s)
     takes = toy_takes(lambda d: d.take_records(), games=8)
     # (a real sparse writer: its meta asks for the format - data.shard_format, run setting shard_sparse - and
@@ -470,4 +475,11 @@ def test_a_writer_keeping_non_zeros_gets_the_float32_rows(tmp_path):
     for _, s in takes:
         tw.add(s)
     tw.close()
-    assert got and set(got) == {np.dtype(np.float32)}
+    assert got and set(got) == {(False, np.dtype(np.float32), np.dtype(np.uint32), np.dtype(np.int64), G.info('toy')['num_features'])}
+
+
+def test_a_dense_writer_refuses_the_non_zeros(tmp_path):
+    takes = toy_takes(lambda d: d.take_records(), games=4)
+    s = next(r for _, r in takes if r is not None).arrays(sparse=True)
+    with pytest.raises(ValueError, match='dense shard writer'):
+        ShardWriter(str(tmp_path / 'd'), 'r00', rows=1000, meta={'game': 'toy'}).add(s)

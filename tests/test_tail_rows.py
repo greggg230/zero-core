@@ -171,6 +171,17 @@ def test_records_split_and_arrays_equal_take_samples():
     for k in a:
         assert np.array_equal(a[k], b[k]), k
     assert 't_off' in b and 'ov_off' in b
+    # the features as the records' non-zeros (docs/az.md 44.4): every other array the same, the pairs the dense rows'
+    recs = [r for r in run(lambda d: d.take_records()) if r is not None]
+    ps = [r.arrays(sparse=True) for r in recs]
+    assert all('x' not in p and p['n_features'] == a['x'].shape[1] for p in ps)
+    x = np.concatenate([protocol.densify(p['xs_off'], p['xs_idx'], p['xs_val'], p['n_features']) for p in ps])
+    assert np.array_equal(x.view(np.uint32), a['x'].view(np.uint32))
+    rest = protocol.concat_samples([{k: v for k, v in p.items() if not k.startswith('xs_') and k != 'n_features'} for p in ps])
+    for k in rest:
+        assert np.array_equal(a[k], rest[k]), k
+    nz = np.concatenate([p['xs_val'] for p in ps])
+    assert len(nz) == int((a['x'].view(np.uint32) != 0).sum()) and (nz.view(np.uint32) != 0).all()
 
 
 def test_eval_cache_and_sparse_batches_keep_the_rows():

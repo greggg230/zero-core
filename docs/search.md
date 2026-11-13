@@ -356,6 +356,13 @@ conversion for both, built and the records freed off the GIL), once - a second c
 either as before. So the thread that drives the search pays only the move, and a writer thread pays
 the copy into the dense arrays (MTG: 37,620 floats a row).
 
+A `Record` holds its row as its non-zeros (2026-11-13, docs/az.md 44.3): `x_idx` / `x_val`, the ascending indexes and
+values of every float whose bits are not 0 (`game::sparse_scan`'s pairs), whatever the batches are; `feature(i)`,
+`features(f)` and `write_features(out)` lay the dense row out bit for bit, and `sample_arrays_rows` gives `x` as before.
+`SampleRecords.arrays(sparse=True)` (`sample_arrays_pairs`, docs/az.md 44.4) gives the features as those pairs -
+`xs_off` i64 [N+1], `xs_idx` u32, `xs_val` f32, `n_features`, a sparse batch's keys - instead of `x`: a sparse shard
+writer's input, the dense rows never made.
+
 ### 2.5 Results (`take_results`)
 
 `{gid, n, over, result, scores, steps, decisions, ext_moves, rounds, samples, tag}`; a game cut
