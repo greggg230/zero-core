@@ -319,14 +319,16 @@ def build(out, extra_nets):
             for opt in ('basic', 'disable'):
                 variants.append(dict(e, name=f'stage_full_opt{opt}', opt=opt, dump=False, providers=['amdgpu', 'migraphx', 'dml', 'openvino', 'tensorrt_rtx'],
                                      note=f'the whole probe graph, graph optimisation level {opt} (the factory uses all)'))
-    rows_seen = {}
+    rows_seen, models_seen = {}, {}
     for spec in extra_nets:
         name, rest = spec.split('=', 1)
         parts = rest.split(',')
         opts = dict(p.split('=', 1) for p in parts[1:])
-        mpath = parts[0]
-        mname = f'm/{name}.onnx'
-        members[mname] = u8(open(mpath, 'rb').read())
+        mpath = os.path.abspath(parts[0])
+        if mpath not in models_seen:            # (one graph, several variants: stored once)
+            models_seen[mpath] = f'm/{name}.onnx'
+            members[models_seen[mpath]] = u8(open(mpath, 'rb').read())
+        mname = models_seen[mpath]
         rpath = os.path.abspath(opts['rows'])
         if rpath not in rows_seen:
             rows_seen[rpath] = f'r/rows{len(rows_seen)}.npz'
