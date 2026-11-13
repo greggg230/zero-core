@@ -686,6 +686,23 @@ static LOG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 /// Build a session for `b`, with the node placement read from ONNX Runtime's log when `capture`.
 fn build(rt: &Runtime, model: &Path, b: &Binding, threads: usize, spinning: bool, capture: bool) -> Result<(Session, Vec<(String, String)>), String> {
+    if matches!(b, Binding::Cpu) {
+        return build_retry(rt, model, b, threads, spinning, capture);
+    }
+    // a GPU provider's graph partitioning (TensorRT-RTX's) recurses deeper than a thread's default stack: build on
+    // a thread with the worker's big stack, whatever thread asked (the job's, the evaluator's after a yield)
+    std::thread::scope(|sc| {
+        std::thread::Builder::new()
+            .name("zero-worker-session".into())
+            .stack_size(crate::MAIN_STACK)
+            .spawn_scoped(sc, || build_retry(rt, model, b, threads, spinning, capture))
+            .map_err(|e| format!("spawn the session builder: {e}"))?
+            .join()
+            .map_err(|_| "the session builder panicked".to_string())?
+    })
+}
+
+fn build_retry(rt: &Runtime, model: &Path, b: &Binding, threads: usize, spinning: bool, capture: bool) -> Result<(Session, Vec<(String, String)>), String> {
     let r = build_once(rt, model, b, threads, spinning, capture);
     if let (Err(e), Binding::Named(ProviderKind::TensorRtRtx, _)) = (&r, b) {
         if e.contains("Failed to load provider") && NVRTX_EXCLUDE_OK.swap(false, std::sync::atomic::Ordering::Relaxed) {
