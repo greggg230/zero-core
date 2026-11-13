@@ -31,6 +31,14 @@ The model's metadata (`metadata`): zero_onnx=1, protocol, game, arch, features, 
 aux_layout (JSON [[name, width, loss], ...]), aux_width, packing, checkpoint, checkpoint_sha256,
 opset, exporter, torch.
 
+zero-onnx/2 (docs/az.md 46; `ZeroOnnx2`, `onnx_version`): a token network with tail segments, pointer overrides or
+gates - MTG Zero's layout v7 - takes zero-onnx/1's inputs plus the driver's options and variable-length rows as they
+are (`opt_off` i64 [B+1], `opt_action` i32, `t_off` i64 [B+1], `t_seg` i32, `t_slot` i64, `t_val` f32 - each tail
+token's floats consecutive -, `ov_off` i64 [B+1], `ov_opt` i32, `ov_tok` i64) and answers zero-onnx/1's outputs
+plus `refused` i64 [B] (per row, the tail tokens and overrides the network refuses: 0 everywhere, or the batch is
+refused); metadata zero_onnx=2 and the network's `tails`, `option_pointers`, `max_row_tokens`, `tail_width`,
+`gates`. Packing 'packed' only. Every other network exports zero-onnx/1, the same file as before.
+
 How a token network (`net.TokenNet`) packs its objects inside the graph (`packing`):
 
 * 'mask': every slot of the full token axis is a token (the global token and all 170 of MTG
@@ -90,6 +98,12 @@ OPSET = 18
 INPUTS = ('x_ptr', 'x_idx', 'x_val', 'n_players', 'belief')
 HOST_INPUTS = ('tok_full', 'tok_n')
 OUTPUTS = ('policy', 'value', 'margin', 'aux')
+# zero-onnx/2 (docs/az.md 46): a token network with variable-length token sets - the driver's options, tail tokens and
+# pointer overrides as more inputs, and per row the inputs the network refuses as one more output
+PROTOCOL2 = 'zero-onnx/2'
+VARLEN_INPUTS = ('opt_off', 'opt_action', 't_off', 't_seg', 't_slot', 't_val', 'ov_off', 'ov_opt', 'ov_tok')
+INPUTS2 = INPUTS + VARLEN_INPUTS
+OUTPUTS2 = OUTPUTS + ('refused',)
 PACKINGS = ('mask', 'compact', 'packed', 'host')
 
 
@@ -141,6 +155,8 @@ def slot_tokens(net, x, entry=None):
     ids = [torch.full((B, 1), net.vocab, dtype=torch.long, device=x.device)] if net.n_id else None
     start = 1
     for s, lin in zip(net.segs, net.seg_in):
+        if not s['count']:
+            continue                       # (a tail-only segment: no head slot, no feature; docs/az.md 43.5)
         o, k, w = s['offset'], s['count'], s['width']
         sl = x[:, o:o + k * w].reshape(B, k, w)
         p = sl[..., s['present']] > 0.5 if s['present'] is not None else None
@@ -260,6 +276,8 @@ class ZeroOnnx(nn.Module):
     """A network behind the zero-onnx/1 interface (module docstring): `forward(x_ptr, x_idx, x_val,
     n_players, belief[, tok_full, tok_n])` -> (policy, value, margin, aux)."""
 
+    VERSION = 1
+
     def __init__(self, net, packing='packed'):
         super().__init__()
         self.net = net
@@ -267,7 +285,7 @@ class ZeroOnnx(nn.Module):
         if not isinstance(net, (TokenNet, GridNet, Net)):
             raise TypeError(f'zero-onnx: no export for a {type(net).__name__} (TokenNet, GridNet, Net)')
         vf = varlen_features(net)
-        if vf:      # (R14, docs/az.md 43.8: the fixed-width interface would drop them in silence)
+        if vf and self.VERSION == 1:  # (R14, docs/az.md 43.8: the fixed-width interface would drop them: zero-onnx/2)
             raise ValueError(f'zero-onnx/1: a network with variable-length token sets ({"; ".join(vf)}) has no zero-onnx/1 graph')
         if self.tokens and packing not in PACKINGS:
             raise ValueError(f'zero-onnx: packing {packing!r} (one of {PACKINGS})')
@@ -320,6 +338,361 @@ class ZeroOnnx(nn.Module):
         return plog.float(), value, mar, aux
 
 
+
+# ---------------------------------------------------------------- zero-onnx/2: variable-length rows (docs/az.md 46)
+def onnx_version(net):
+    """The zero-onnx version a network exports as: 2 for a token network with variable-length token sets (tail
+    segments, pointer overrides, gates: `net.varlen_features`), 1 for every other network (the graph of before)."""
+    return 2 if varlen_features(net) else 1
+
+
+def _csr_rows(off, n):
+    """Each of the `n` elements' row of a CSR over rows (`off` [B+1]), with no data-dependent shape and no scatter
+    with a reduction (`densify`'s way: in the merged sequence of the elements and the B row ends, row b's end at
+    off[b+1] + b; a scatter of ones there, a running sum, a scatter to unique slots)."""
+    B = off.shape[0] - 1
+    dev = off.device
+    ends = off[1:] + torch.arange(B, dtype=torch.int64, device=dev)
+    marks = torch.zeros(n + B, dtype=torch.int64, device=dev).scatter(0, ends, torch.ones_like(ends))
+    count = marks.cumsum(0)
+    slot = torch.where(marks > 0, torch.full_like(count, n), torch.arange(n + B, dtype=torch.int64, device=dev) - count)
+    return torch.zeros(n + 1, dtype=torch.int64, device=dev).scatter(0, slot, count)[:n]
+
+
+def _row_sum(flag, off):
+    """Per row of a CSR (`off` [B+1]) the number of its elements with `flag` (exact integers: a running sum read at
+    the offsets, no scatter)."""
+    cs = torch.cat([torch.zeros(1, dtype=torch.int64, device=flag.device), flag.long().cumsum(0)])
+    return cs.index_select(0, off[1:]) - cs.index_select(0, off[:-1])
+
+
+def _iclamp(x, lo=None, hi=None):
+    """An int64 tensor clamped to [lo, hi] by Where: ONNX Runtime 1.31.1's CPU Clip and Min on int64 answer wrongly
+    around 2^32 (measured: Clip(4294967295, min 0) gave 0, Min(x, 4294967295) gave 4294967295 for every x), and a
+    tail slot is any u32, a packed token up to 2^56. `lo` / `hi` ints or the graph's symbolic sizes."""
+    if lo is not None:
+        x = torch.where(x < lo, torch.full_like(x, lo), x)
+    if hi is not None:
+        x = torch.where(x > hi, torch.full_like(x, hi), x)
+    return x
+
+
+def _prev(a):
+    """`a` shifted by one (element i: a[i - 1]; element 0: a[0]) - no slice of a possibly empty axis."""
+    i = _iclamp(torch.arange(a.shape[0], device=a.device) - 1, 0)
+    return a.index_select(0, i)
+
+
+def _psi2(n, pow2, sc):
+    """`TokenNet._psi` of int64 offsets n in [0, 2^32): the 32 binary digits by integer division (exact for every
+    u32: `//` exports as ONNX's integer Div; `torch.div` with a rounding mode would go through floats and `>>` by a
+    tensor does not export), log2(n + 1) / 32 computed in float64 and rounded, the sin / cos part read from psi's own
+    table of n mod 256 (`sc`, `TokenNet._psi_sc`: the same floats)."""
+    bits = torch.remainder(n[:, None] // pow2[None, :], 2).to(torch.float32)
+    lg = (torch.log2(n.to(torch.float64) + 1.0) / 32.0).to(torch.float32)[:, None]
+    return torch.cat([bits, lg, sc.index_select(0, torch.remainder(n, 256))], 1)
+
+
+def _pointer2(net, hid):
+    """`TokenNet._pointer` as inference runs it (no gradients): each part of `ptr_parts` a product of its own."""
+    parts = getattr(net, 'ptr_parts', None)
+    if not parts or len(parts) == 1:
+        return net.ptr(hid)
+    W, b = net.ptr.weight, net.ptr.bias
+    return torch.cat([F.linear(hid, W[a:e], b[a:e]) for a, e in parts], -1)
+
+
+def _lerp(a, b, w):
+    """torch.lerp(a, b, w) (float32, w in [0, 1]) as ATen computes it: a + w (b - a) below 0.5, b - (b - a) (1 - w)
+    from 0.5 - exactly a at w = 0 and exactly b at w = 1 (docs/az.md 43.6's blend)."""
+    return torch.where(w < 0.5, a + w * (b - a), b - (b - a) * (1.0 - w))
+
+
+def _outputs(net, layout, B, plog, vlog, mar, raw, n_players, belief):
+    """The interface's policy, value, margin and aux from the network's heads (`ZeroOnnx.forward`'s last step)."""
+    S = net.seats
+    dev = plog.device
+    seat = torch.arange(MAX_SEATS, device=dev)[None, :]
+    val = torch.softmax(vlog.float(), 1)
+    mar = mar.float()
+    if S < MAX_SEATS:
+        val = F.pad(val, (0, MAX_SEATS - S))
+        mar = F.pad(mar, (0, MAX_SEATS - S))
+    value = torch.where(seat < n_players[:, None], val, torch.zeros_like(val))
+    if layout:
+        pred = aux_answer(net, raw)
+        aux = torch.cat([pred[t[0]].float() for t in layout], 1)
+        aux = torch.where(belief[:, None], aux, torch.zeros_like(aux))
+    else:
+        aux = torch.zeros(B, 0, dtype=torch.float32, device=dev)
+    return plog.float(), value, mar, aux
+
+
+class ZeroOnnx2(ZeroOnnx):
+    """A token network with variable-length token sets behind the zero-onnx/2 interface (module docstring, docs/az.md
+    46): `forward(x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot, t_val, ov_off,
+    ov_opt, ov_tok)` -> (policy, value, margin, aux, refused). Packing 'packed' only (each row's tail tokens follow
+    its present head tokens in the packed list)."""
+
+    VERSION = 2
+
+    def __init__(self, net, packing='packed'):
+        super().__init__(net, packing)
+        if not self.tokens:
+            raise TypeError(f'zero-onnx/2: a token network\'s interface (got a {type(net).__name__})')
+        if not varlen_features(net):
+            raise ValueError('zero-onnx/2: a network without variable-length token sets exports as zero-onnx/1')
+        if self.packing != 'packed':
+            raise ValueError(f'zero-onnx/2: packing {self.packing!r}: only \'packed\' (the tails follow each row\'s '
+                             f'present head tokens in the packed list)')
+        segs = net.segs
+        S, D = len(segs), net.d
+        lt = lambda v: torch.tensor(v, dtype=torch.long)
+        start, c0, nk, p, c = [], [], [], 1, 0
+        for s in segs:
+            k = len(s['actions']) + ('id_actions' in s) + int(s.get('columns', 0) or 0)
+            start.append(p)
+            c0.append(c)
+            nk.append(k)
+            p += s['count']
+            c += k
+        tk = [-1] * S
+        gi = [-1] * S
+        for k, j in enumerate(net.tails):
+            tk[j] = k
+        for k, j in enumerate(net.gated):
+            gi[j] = k
+        istail = [bool(s.get('tail')) for s in segs]
+        self.register_buffer('v_width', lt([s['width'] if t else 0 for s, t in zip(segs, istail)]), persistent=False)
+        self.register_buffer('v_istail', torch.tensor(istail), persistent=False)
+        self.register_buffer('v_count', lt([s['count'] for s in segs]), persistent=False)
+        self.register_buffer('v_start', lt(start), persistent=False)
+        self.register_buffer('v_c0', lt(c0), persistent=False)
+        self.register_buffer('v_nk', lt(nk), persistent=False)
+        self.register_buffer('v_tk', lt(tk), persistent=False)
+        self.register_buffer('v_gi', lt(gi), persistent=False)
+        self.register_buffer('v_pow2', torch.tensor([1 << j for j in range(32)], dtype=torch.long), persistent=False)
+        self.Wt = int(getattr(net, 't_width', 0) or 0)
+        if net.tails:
+            # the tail segments' input maps and position maps as one product each (`_TailEmbed`'s matrices: segment
+            # k's rows k d .. (k + 1) d, its weights in its first `width` columns, zeros after)
+            K = len(net.tails)
+            W = torch.zeros(K * D, self.Wt)
+            b = torch.zeros(K * D)
+            P = torch.zeros(K * D, net.pos_tail[0].weight.shape[1])
+            for k, j in enumerate(net.tails):
+                w = segs[j]['width']
+                W[k * D:(k + 1) * D, :w] = net.seg_in[j].weight.detach()
+                b[k * D:(k + 1) * D] = net.seg_in[j].bias.detach()
+                P[k * D:(k + 1) * D] = net.pos_tail[k].weight.detach()
+            self.register_buffer('v_tW', W, persistent=False)
+            self.register_buffer('v_tb', b, persistent=False)
+            self.register_buffer('v_tP', P, persistent=False)
+            self.register_buffer('v_sc', net._psi_sc(torch.device('cpu')).clone(), persistent=False)
+        if net.gated:
+            # inference's gate weights g = max(theta, 0) (docs/az.md 43.6)
+            self.register_buffer('v_g', net.gate.detach().clamp(min=0).float().clone(), persistent=False)
+
+    def _tail_embed(self, val, segc, slot):
+        """Tail tokens' embeddings [NT, d] (`TokenNet._tail_embed`: the segment's input map of its floats + its
+        position tail_base[k] + pos_tail[k](psi(slot - count)) + its identity's embedding)."""
+        net = self.net
+        NT, D = val.shape[0], net.d
+        k = _iclamp(self.v_tk.index_select(0, segc), 0)
+        n = _iclamp(slot - self.v_count.index_select(0, segc), 0, (1 << 32) - 1)
+        pick = k[:, None, None].expand(NT, 1, D)
+        x = F.linear(val, self.v_tW, self.v_tb).view(NT, -1, D).gather(1, pick).squeeze(1)
+        pos = F.linear(_psi2(n, self.v_pow2, self.v_sc), self.v_tP).view(NT, -1, D).gather(1, pick).squeeze(1)
+        t = x + (net.tail_base.index_select(0, k) + pos)
+        for j in net.tails:
+            s = net.segs[j]
+            if s['id'] is None:
+                continue
+            i = _identity(val[:, :s['width']], s['id'], net.vocab)
+            t = t + torch.where((segc == j)[:, None], net.emb(i), torch.zeros((), dtype=t.dtype))
+        return t
+
+    def _trunk2(self, h, pres, ids, opt_off, opt_action, t_off, t_seg, t_slot, t_val, ov_off, ov_opt, ov_tok):
+        """`_trunk_packed` with each row's tail tokens after its present head tokens, the gated tokens weighted
+        (docs/az.md 43.6) and the pointer overrides applied (43.7) -> (z [B, 2 d], logits [B, actions + 1], refused
+        [B]: per row its tail tokens and overrides the network refuses - R5 / R6, which torch raises on)."""
+        net = self.net
+        B, NTOK, D = h.shape
+        dev = h.device
+        S = len(net.segs)
+        A1 = net.actions + 1
+        NT = t_seg.shape[0]
+        NO = ov_opt.shape[0]
+        L = t_val.shape[0]
+        # ---- the tail tokens, checked (R5: a tail segment's, a slot past its head and below 2^32, each row's sorted
+        # by (segment, slot) without a duplicate; the floats as many as the tokens' widths)
+        seg = t_seg.long()
+        segc = _iclamp(seg, 0, S - 1)
+        slot = t_slot.long()
+        trow = _csr_rows(t_off, NT)
+        tw = self.v_width.index_select(0, segc)
+        key = segc * (1 << 32) + _iclamp(slot, 0, (1 << 32) - 1)
+        first = torch.arange(NT, device=dev) == 0
+        tbad = ((segc != seg) | ~self.v_istail.index_select(0, segc) | (slot < self.v_count.index_select(0, segc))
+                | (slot >= (1 << 32)) | (~first & (_prev(trow) == trow) & (key <= _prev(key))))
+        # (the sum with a 0 appended: ONNX Runtime 1.31.1 reduces an empty axis to a wrong shape - measured)
+        lbad = (torch.cat([tw, tw.new_zeros(1)]).sum() != L).long()
+        # ---- their floats [NT, Wt] (each token's width(seg) floats, consecutive in t_val) and embeddings
+        if net.tails:
+            voff = tw.cumsum(0) - tw
+            ar = torch.arange(self.Wt, device=dev)
+            inw = ar[None, :] < tw[:, None]
+            tv = torch.cat([t_val, t_val.new_zeros(1)])
+            cidx = _iclamp(voff[:, None] + ar[None, :], 0, L)
+            val = torch.where(inw, tv.index_select(0, cidx.reshape(-1)).view(NT, self.Wt), torch.zeros((), dtype=tv.dtype))
+            # (embedded with one sentinel token after the batch's - the first tail segment's first slot, floats 0 -,
+            # dropped after: no empty axis, whose reductions ONNX Runtime 1.31.1 answers with a wrong shape)
+            j0 = net.tails[0]
+            te = self._tail_embed(torch.cat([val, val.new_zeros(1, self.Wt)]),
+                                  torch.cat([segc, torch.full((1,), j0, dtype=torch.long, device=dev)]),
+                                  torch.cat([slot, torch.full((1,), int(net.segs[j0]['count']), dtype=torch.long, device=dev)]))[:NT]
+        else:
+            te = h.new_zeros(NT, D)
+        # ---- the packed list: the N present head tokens (row-major, layout order), then the NT tail tokens
+        flat = pres.reshape(-1)
+        sel = torch.nonzero(flat).squeeze(1)
+        N = sel.shape[0]
+        torch._check(N >= 2)
+        row_h = sel // NTOK
+        slot_h = sel - row_h * NTOK
+        n_h = pres.sum(1)
+        n_t = t_off[1:] - t_off[:-1]
+        n = n_h + n_t
+        T = _iclamp(n.max(), 2).item()                           # (a data-dependent shape: dynamic in the graph)
+        torch._check(T >= 2)
+        torch._check(T <= NTOK + NT)
+        start_h = n_h.cumsum(0) - n_h
+        ar = torch.arange(T, device=dev)[None, :]
+        is_h = ar < n_h[:, None]
+        valid = ar < n[:, None]
+        gidx = torch.where(is_h, start_h[:, None] + ar,
+                           torch.where(valid, N + t_off[:-1][:, None] + (ar - n_h[:, None]), torch.full_like(ar, N + NT)))
+        back = torch.cat([row_h * T + (torch.arange(N, device=dev) - start_h.index_select(0, row_h)),
+                          trow * T + n_h.index_select(0, trow) + (torch.arange(NT, device=dev) - t_off.index_select(0, trow))])
+        rows = torch.cat([row_h, trow])
+        hp = torch.cat([h.reshape(B * NTOK, D).index_select(0, sel), te])
+        if net.gated:
+            # (a token's weight: 1, a gated segment's g, 0 padding - the attention's float mask log w, the pooling)
+            gi = self.v_gi.index_select(0, segc)
+            wt = torch.where(gi >= 0, self.v_g.index_select(0, _iclamp(gi, 0)), torch.ones((), dtype=torch.float32))
+            wpad = torch.cat([torch.ones(N, dtype=torch.float32, device=dev), wt,
+                              torch.zeros(1, dtype=torch.float32, device=dev)]).index_select(0, gidx.reshape(-1)).view(B, T)
+            bias = torch.log(wpad)[:, None, None, :].to(h.dtype)
+        else:
+            bias = torch.where(valid, 0.0, float('-inf'))[:, None, None, :].to(h.dtype)
+        H = net.blocks[0].h
+        hd = D // H
+        for blk in net.blocks:
+            qkv = blk.qkv(blk.ln1(hp))
+            qkv = torch.cat([qkv, qkv.new_zeros(1, 3 * D)]).index_select(0, gidx.reshape(-1))
+            q, k, v = qkv.view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+            s = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5) + bias
+            a = torch.matmul(torch.softmax(s, -1), v).transpose(1, 2).reshape(B * T, D)
+            hp = hp + blk.out(a.index_select(0, back))
+            hp = hp + blk.ff2(F.gelu(blk.ff1(blk.ln2(hp))))
+        hp = net.ln(hp)
+        # the pooling through the padded rows (no scatter-add: ONNX Runtime's CPU ScatterND add races, docs/az.md 41)
+        pad = torch.cat([hp, hp.new_zeros(1, D)]).index_select(0, gidx.reshape(-1)).view(B, T, D)
+        if net.gated:
+            zm = (pad * wpad[..., None]).sum(1) / wpad.sum(1, keepdim=True)
+        else:
+            zm = pad.sum(1) / n[:, None].to(hp.dtype)
+        z = torch.cat([pad[:, 0], zm], 1)
+        gen = F.pad(net.gen(z), (0, 1))
+        # the static scatter of the head tokens' actions (a tail token has none: docs/az.md 43.7)
+        cols = net.tok_cols.index_select(0, slot_h)
+        acts = net.tok_acts.index_select(0, slot_h)
+        if net.n_id:
+            it = ids.reshape(-1).index_select(0, sel)
+            ia = net.tok_idbase.index_select(0, slot_h) + it
+            ia = torch.where((it < net.vocab) & (ia < net.actions), ia, net.actions)
+            acts = torch.where(net.tok_isid.index_select(0, slot_h), ia[:, None], acts)
+        acts = torch.where(cols >= 0, acts, net.actions)
+        P = _pointer2(net, F.gelu(net.pk(hp) + net.pq(z).index_select(0, rows)))
+        C = P.shape[1]
+        lg = P[:N].gather(1, _iclamp(cols, 0))
+        pol = gen.reshape(-1).scatter(0, (row_h[:, None] * A1 + acts).reshape(-1), lg.reshape(-1))
+        if net.option_pointers:
+            # ---- the overrides (docs/az.md 43.7): each one's row, its option's action, its target token (a present
+            # head slot or a tail token of its row) and column; checked as rows.resolve and TokenNet._ov_index check
+            # (one sentinel override after the batch's - row 0, option -1: refused, writing row 0's dummy column, and
+            # left out of `refused` - so no axis is ever empty: ONNX Runtime's reductions of one answer a wrong shape)
+            orow = torch.cat([_csr_rows(ov_off, NO), torch.zeros(1, dtype=torch.long, device=dev)])
+            opt = torch.cat([ov_opt.long(), torch.full((1,), -1, dtype=torch.long, device=dev)])
+            nopt = opt_off[1:] - opt_off[:-1]
+            obad = (opt < 0) | (opt >= nopt.index_select(0, orow))
+            # (a refused override's action: the dummy column `actions`, at the front of the options' actions)
+            oa = torch.cat([torch.full((1,), net.actions, dtype=torch.long, device=dev), opt_action.long()])
+            act = oa.index_select(0, torch.where(obad, 0, opt_off.index_select(0, orow) + opt + 1))
+            tok = torch.cat([ov_tok, torch.full((1,), -1, dtype=torch.long, device=dev)])
+            isgen = tok == -1
+            tc = _iclamp(tok, 0)
+            # (integer `//` and remainder: exact in ONNX - `torch.div` with a rounding mode goes through floats)
+            s_ = tc // (1 << 40)
+            c_ = torch.remainder(tc // (1 << 32), 256)
+            l_ = torch.remainder(tc, 1 << 32)
+            sc_ = _iclamp(s_, 0, S - 1)
+            head = l_ < self.v_count.index_select(0, sc_)
+            pos = _iclamp(self.v_start.index_select(0, sc_) + l_, 0, NTOK - 1)
+            fpos = orow * NTOK + pos
+            hpres = flat.index_select(0, fpos)
+            hidx = (flat.long().cumsum(0) - 1).index_select(0, fpos)
+            # a tail target: the token of its row with that (segment, slot) - a match against every tail token (and
+            # one that matches nothing, so an empty tail is no empty axis)
+            tr_ = torch.cat([trow, torch.full((1,), -1, dtype=torch.long, device=dev)])
+            ts_ = torch.cat([seg, torch.full((1,), -1, dtype=torch.long, device=dev)])
+            tl_ = torch.cat([slot, torch.full((1,), -1, dtype=torch.long, device=dev)])
+            eq = (tr_[None, :] == orow[:, None]) & (ts_[None, :] == s_[:, None]) & (tl_[None, :] == l_[:, None])
+            found = eq.any(1)
+            tidx = N + eq.long().argmax(1)
+            obad = obad | (tok < -1) | (~isgen & ((s_ >= S) | (c_ >= self.v_nk.index_select(0, sc_))
+                                                   | (head & ~hpres) | (~head & ~found)))
+            p = _iclamp(torch.where(head, hidx, tidx), 0, N + NT - 1)
+            gcol = _iclamp(self.v_c0.index_select(0, sc_) + c_, 0, C - 1)
+            v = P.reshape(-1).index_select(0, p * C + gcol)
+            g0 = gen.reshape(-1).index_select(0, orow * A1 + act)
+            if net.gated:
+                gi_ = self.v_gi.index_select(0, sc_)
+                isg = ~isgen & (gi_ >= 0)
+                bw = self.v_g.index_select(0, _iclamp(gi_, 0)).clamp(max=1.0)
+                v = torch.where(isg, _lerp(g0, v, bw), v)
+            ovv = torch.where(isgen, g0, v)
+            # one override per (row, action): a second is refused (which of two would win is not defined), so every
+            # write below goes to its own place; a refused one writes the row's dummy column
+            ar_o = torch.arange(NO + 1, device=dev)
+            dummy = orow * A1 + net.actions
+            okey = torch.where(obad, dummy, orow * A1 + act)
+            mark = torch.full((B * A1,), -1, dtype=torch.long, device=dev).scatter(0, okey, ar_o)
+            obad = obad | (mark.index_select(0, okey) != ar_o)
+            okey = torch.where(obad, dummy, orow * A1 + act)
+            pol = pol.scatter(0, okey, ovv)
+            oref = _row_sum(obad[:NO], ov_off)
+        else:
+            oref = ov_off[1:] - ov_off[:-1]                       # (a network without pointers refuses every one)
+        refused = _row_sum(tbad, t_off) + oref + lbad
+        return z, pol.view(B, A1), refused
+
+    def forward(self, x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot, t_val,
+                ov_off, ov_opt, ov_tok):
+        net = self.net
+        x = densify(x_ptr, x_idx, x_val, net.features)
+        aux = bool(self.layout)
+        rraw = ent = None
+        if net.readers is not None:
+            rraw, ent = _read(net, x)
+        h, pres, ids = slot_tokens(net, x, ent)
+        z, pol, refused = self._trunk2(h, pres, ids, opt_off, opt_action, t_off, t_seg, t_slot, t_val, ov_off, ov_opt,
+                                       ov_tok)
+        r = net._heads(z, pol, n_players, aux, None, rraw)
+        policy, value, margin, aux_out = _outputs(net, self.layout, x.shape[0], r[0], r[1], r[2],
+                                                  r[3] if aux else None, n_players, belief)
+        return policy, value, margin, aux_out, refused
+
 def example_inputs(net, packing):
     """Inputs to trace with: 3 rows, 7 non-zeros (distinct sizes, none 0 / 1: nothing specialised), every
     row a valid one (the token network's identities and flags aside: the values are not looked at)."""
@@ -343,6 +716,52 @@ def dynamic_shapes(packing):
     else:
         d.update(tok_full=None, tok_n=None)
     return d
+
+
+def example_inputs2(net):
+    """zero-onnx/2's inputs to trace with: `example_inputs`' rows, 5 options, 4 tail tokens (the first tail segment's,
+    rows 0 and 2; or segment 0's for a network without tail segments: refused, still traced), 6 tail floats per
+    token, 2 overrides (generic): every size distinct and none 0 / 1 (nothing specialised)."""
+    args = list(example_inputs(net, 'packed'))
+    A = int(net.actions)
+    j = net.tails[0] if net.tails else 0
+    w = net.segs[j]['width'] if net.tails else 6
+    c = net.segs[j]['count']
+    args += [torch.tensor([0, 2, 3, 5], dtype=torch.int64), torch.tensor([0, 1, 0, 1, 2], dtype=torch.int32) % A,
+             torch.tensor([0, 2, 2, 4], dtype=torch.int64), torch.full((4,), j, dtype=torch.int32),
+             torch.tensor([c, c + 1, c, c + 2], dtype=torch.int64), torch.zeros(4 * w),
+             torch.tensor([0, 1, 1, 2], dtype=torch.int64), torch.tensor([1, 0], dtype=torch.int32),
+             torch.tensor([-1, -1], dtype=torch.int64)]
+    return tuple(args)
+
+
+def dynamic_shapes2():
+    """zero-onnx/2's dynamic dimensions: B, nnz, K (options), NT (tail tokens), L (tail floats), NO (overrides)."""
+    B = torch.export.Dim('B', min=1, max=1 << 20)
+    N = torch.export.Dim('nnz', min=1, max=1 << 30)
+    K = torch.export.Dim('K', min=0, max=1 << 30)
+    NT = torch.export.Dim('NT', min=0, max=1 << 24)
+    L = torch.export.Dim('L', min=0, max=1 << 30)
+    NO = torch.export.Dim('NO', min=0, max=1 << 24)
+    return {'x_ptr': {0: B + 1}, 'x_idx': {0: N}, 'x_val': {0: N}, 'n_players': {0: B}, 'belief': {0: B},
+            'opt_off': {0: B + 1}, 'opt_action': {0: K}, 't_off': {0: B + 1}, 't_seg': {0: NT}, 't_slot': {0: NT},
+            't_val': {0: L}, 'ov_off': {0: B + 1}, 'ov_opt': {0: NO}, 'ov_tok': {0: NO}}
+
+
+def metadata2(net, extra=None):
+    """zero-onnx/2's metadata: `metadata`'s, version 2, plus what a worker checks against its game (`tails`
+    [[segment, name, width, head slots], ...] - the game's `game_info()['tails']` -, `option_pointers`) and what the
+    network reads (`max_row_tokens`, `tail_width`, `gates` {segment: g}); `extra` last, as given."""
+    meta = metadata(net, 'packed')
+    meta.update({'zero_onnx': '2', 'protocol': PROTOCOL2, 'inputs': json.dumps(list(INPUTS2)),
+                 'outputs': json.dumps(list(OUTPUTS2)),
+                 'tails': json.dumps([[int(j), str(n), int(w), int(h)] for j, n, w, h in net.tail_segments()]),
+                 'option_pointers': json.dumps(bool(net.option_pointers)),
+                 'max_row_tokens': json.dumps(net.config['layout'].get('max_row_tokens')),
+                 'tail_width': str(int(getattr(net, 't_width', 0) or 0)), 'gates': json.dumps(net.gates())})
+    for k, v in (extra or {}).items():
+        meta[str(k)] = v if isinstance(v, str) else json.dumps(v)
+    return meta
 
 
 def file_sha256(path):
@@ -474,16 +893,24 @@ def portable_file(src, dst):
 
 def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=True):
     """Export `net` (a TokenNet, GridNet or Net, as loaded: `net.load` / `load_checkpoint`) to the ONNX
-    file `path` (zero-onnx/1; one file, no external data; written atomically) -> its metadata. `packing`:
-    a token network's ('mask', 'compact', 'host'; module docstring), ignored for the others. `extra`:
+    file `path` (one file, no external data; written atomically) -> its metadata: zero-onnx/1, or zero-onnx/2 for
+    a token network with variable-length token sets (`onnx_version`; docs/az.md 46). `packing`: a token network's
+    ('mask', 'compact', 'host'; module docstring; zero-onnx/2: 'packed' only), ignored for the others. `extra`:
     more metadata (the checkpoint's id and sha256: `export_checkpoint`). `make_portable`: `portable`'s
     rewrites (metadata `portable` 1), which change no answer and let the GPU providers run the graph."""
-    import onnx
     net = copy.deepcopy(net).float().cpu().eval()
     for p in net.parameters():
         p.requires_grad_(False)
     if isinstance(net, TokenNet):
         net.chunk = 1 << 30                       # (forward's chunking is never traced; set for clarity)
+    if onnx_version(net) == 2:
+        # (variable-length token sets: zero-onnx/2, docs/az.md 46)
+        mod = ZeroOnnx2(net, packing).eval()
+        args, names, outs, dyn = example_inputs2(net), list(INPUTS2), list(OUTPUTS2), dynamic_shapes2()
+        with torch.no_grad():
+            prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=opset, input_names=names,
+                                     output_names=outs, dynamic_shapes=dyn, optimize=True, verbose=False)
+        return _save(prog.model_proto, metadata2(net, extra), path, opset, make_portable)
     mod = ZeroOnnx(net, packing).eval()
     packing = mod.packing
     args = example_inputs(net, packing)
@@ -494,8 +921,13 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
     with torch.no_grad():
         prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=opset, input_names=names,
                                  output_names=list(OUTPUTS), dynamic_shapes=dyn, optimize=True, verbose=False)
-    model = prog.model_proto
-    meta = metadata(net, packing, extra)
+    return _save(prog.model_proto, metadata(net, packing, extra), path, opset, make_portable)
+
+
+def _save(model, meta, path, opset, make_portable):
+    """The exported model with its metadata (`portable`'s rewrites first), checked, written atomically -> the
+    metadata."""
+    import onnx
     meta['opset'] = str(opset)
     if make_portable:
         portable(model)
@@ -540,7 +972,8 @@ REFERENCE_TOL = 2e-5
 
 def reference_rows(rows_list, n):
     """`n` real rows of recorded batch files (`onnx_parity.Rows`): whole recorded batches spread over the
-    files (every k-th batch first, then the others), the last one cut to make `n` -> (Rows, batch_off)."""
+    files (every k-th batch first, then the others; rows with tail tokens or pointer overrides: the batches holding
+    overrides first, then those holding tail tokens - a stable order), the last one cut to make `n` -> (Rows, batch_off)."""
     from .onnx_parity import cat
     batches = []
     for ri, rows in enumerate(rows_list):
@@ -555,6 +988,14 @@ def reference_rows(rows_list, n):
     per = total / len(batches)
     stride = max(1, int(len(batches) // max(1, int(np.ceil(n / per)))))
     order = batches[::stride] + [b for i, b in enumerate(batches) if i % stride]
+
+    def lacks(ri, a, b):
+        """(no override, no tail token) of a batch: the ones holding overrides first (rarer), then tail tokens."""
+        r = rows_list[ri]
+        return tuple(x is None or int(x.off[b] - x.off[a]) == 0 for x in (r.ov, r.tail))
+    if any(r.tail is not None or r.ov is not None for r in rows_list):
+        # (zero-onnx/2's self-test must answer tail tokens and overrides: the batches holding them first)
+        order = sorted(order, key=lambda b: lacks(*b))
     parts, offs, got = [], [0], 0
     for ri, a, b in order:
         if got >= n:
@@ -579,6 +1020,16 @@ def write_reference(net, rows_list, out, n=256, info=None, tol=REFERENCE_TOL):
     n_belief = int((rows.extra == ROW_BELIEF).sum())
     if layout and n_belief == 0:
         raise ValueError(f'the {n} reference rows hold no belief row: the auxiliary head would go untested (more rows, or batches with belief rows)')
+    v2 = onnx_version(net) == 2
+    if v2:
+        # (zero-onnx/2: the self-test answers tail tokens and overrides too - never a reference set without them)
+        st = rows.tail_stats()
+        if net.tails and not st['tail_tokens']:
+            raise ValueError(f'the {n} reference rows hold no tail token: the network\'s tail segments would go untested '
+                             f'(record batches with tail tokens)')
+        if net.option_pointers and not st['overrides']:
+            raise ValueError(f'the {n} reference rows hold no pointer override: the network\'s overrides would go untested '
+                             f'(record batches with overrides)')
     ev = NetEvaluator(net, 'cpu')
     pri, val, mar, aux = [], [], [], []
     for a, b in zip(bo[:-1], bo[1:]):
@@ -590,10 +1041,14 @@ def write_reference(net, rows_list, out, n=256, info=None, tol=REFERENCE_TOL):
             aux.append(np.asarray(ans[3], np.float32))
     W = sum(int(t[1]) for t in layout)
     aux = np.concatenate(aux) if aux else np.zeros((0, W), np.float32)
-    meta = {'zero_onnx': '1', 'game': str(net.config.get('game')), 'features': int(net.config['features']),
+    meta = {'zero_onnx': '2' if v2 else '1', 'game': str(net.config.get('game')), 'features': int(net.config['features']),
             'actions': int(net.config['actions']), 'aux_width': W, 'rows': int(rows.B), 'belief_rows': n_belief,
             'value_rows': int((rows.extra == ROW_VALUE).sum()), 'batches': int(len(bo) - 1), 'tol': tol,
             'sources': rows.source, 'torch': torch.__version__, 'answers': 'infer.NetEvaluator, eager, CPU'}
+    if v2:
+        meta.update(rows.tail_stats())
+        meta['t_segs'] = [[int(j), str(nm), int(w), int(h)] for j, nm, w, h in net.tail_segments()]
+        meta['option_pointers'] = bool(net.option_pointers)
     for k, v in (info or {}).items():
         meta[str(k)] = v
     arrays = {'meta': np.array(json.dumps(meta)), 'xs_off': rows.xs_off.astype(np.int64), 'xs_idx': rows.xs_idx.astype(np.int32),
@@ -601,6 +1056,17 @@ def write_reference(net, rows_list, out, n=256, info=None, tol=REFERENCE_TOL):
               'extra': rows.extra.astype(np.uint8), 'opt_off': rows.opt_off.astype(np.int64),
               'opt_action': rows.opt_action.astype(np.int32), 'batch_off': bo, 'priors': np.concatenate(pri),
               'value': np.concatenate(val), 'margin': np.concatenate(mar), 'aux': aux.astype(np.float32)}
+    if v2:
+        # the rows' tail tokens (the driver's arrays: each token's floats consecutive) and overrides (docs/az.md 46)
+        from .onnx_parity import model_tail_kw
+        kw = model_tail_kw(net, rows)
+        if 'tail' in kw:
+            tl = kw['tail']
+            arrays.update(t_off=tl.off.astype(np.int64), t_seg=tl.seg.astype(np.uint16), t_slot=tl.slot.astype(np.uint32),
+                          t_val=tl.val.astype(np.float32))
+        if 'ov' in kw:
+            o = kw['ov']
+            arrays.update(ov_off=o.off.astype(np.int64), ov_opt=o.opt.astype(np.int32), ov_tok=o.tok.astype(np.int64))
     tmp = f'{out}.{os.getpid()}.tmp'
     with open(tmp, 'wb') as f:
         np.savez(f, **arrays)
@@ -611,11 +1077,12 @@ def write_reference(net, rows_list, out, n=256, info=None, tol=REFERENCE_TOL):
 def load_reference(path):
     """reference.npz -> (onnx_parity.Rows, batch_off, (priors, value, margin, aux), meta)."""
     import numpy as np
-    from .onnx_parity import Rows
+    from .onnx_parity import Rows, recorded_rows
     with np.load(path) as z:
         meta = json.loads(str(z['meta']))
+        tail, ov = recorded_rows({k: z[k] for k in z.files if k != 'meta'}, meta)
         rows = Rows(z['xs_off'], z['xs_idx'], z['xs_val'], z['n_players'], z['opt_off'], z['opt_action'], z['extra'],
-                    meta['features'], batch_off=z['batch_off'], source=os.path.basename(path))
+                    meta['features'], batch_off=z['batch_off'], source=os.path.basename(path), tail=tail, ov=ov)
         return rows, z['batch_off'], (z['priors'], z['value'], z['margin'], z['aux']), meta
 
 

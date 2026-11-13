@@ -1,5 +1,8 @@
-"""Parity gate 1 of zero-onnx/1 (docs/az.md 41): a network's exported ONNX graph, run by ONNX Runtime's
-CPU execution provider, against torch on real network batches - new code is right only if it matches.
+"""Parity gate 1 of zero-onnx/1 and /2 (docs/az.md 41, 46): a network's exported ONNX graph, run by ONNX Runtime's
+CPU execution provider, against torch on real network batches - new code is right only if it matches. Rows with
+tail tokens and pointer overrides (zero-onnx/2: `Rows.tail` / `.ov`, recorded batch files and v2 shards that carry
+them) go to the graph and to torch with them, a case of their own (`varlen`), and a graph that refuses any of them
+fails the case (`Refused`).
 
   python -m zero.onnx_parity <checkpoint> --batches <file.npz> [<file.npz> ...] [--packing mask,compact,packed,host]
       [--sizes 1,7,64,256,1024] [--tol 2e-5] [--onnx-dir DIR] [--reuse] [--game G] [--allow-mismatch]
@@ -48,10 +51,11 @@ CHUNK = 64
 class Rows:
     """Network batch rows in the driver's sparse form (protocol.py): xs_off i64 [B+1], xs_idx i32,
     xs_val f32, n_players i64 [B], opt_off i64 [B+1], opt_action i32, extra u8 [B]; `features` F;
-    `batch_off` the recorded batches' first rows (None: not recorded batches)."""
+    `batch_off` the recorded batches' first rows (None: not recorded batches); `tail` / `ov` the rows' tail
+    tokens and pointer overrides (`rows.Tail` / `rows.Overrides`, docs/search.md 2.15; None: a game without)."""
 
     def __init__(self, xs_off, xs_idx, xs_val, n_players, opt_off, opt_action, extra, features, batch_off=None,
-                 source=''):
+                 source='', tail=None, ov=None):
         self.xs_off = np.asarray(xs_off, np.int64)
         self.xs_idx = np.asarray(xs_idx, np.int32)
         self.xs_val = np.asarray(xs_val, np.float32)
@@ -62,6 +66,18 @@ class Rows:
         self.F = int(features)
         self.batch_off = batch_off
         self.source = source
+        self.tail = tail
+        self.ov = ov
+        for k, v in (('tail', tail), ('ov', ov)):
+            if v is not None and v.N != self.B:
+                raise ValueError(f'Rows: a {k} of {v.N} rows for {self.B} rows')
+
+    def tail_stats(self):
+        """{tail_rows, tail_tokens, override_rows, overrides} of the rows (zeros without)."""
+        tc = self.tail.counts() if self.tail is not None else np.zeros(self.B, np.int64)
+        oc = self.ov.counts() if self.ov is not None else np.zeros(self.B, np.int64)
+        return {'tail_rows': int((tc > 0).sum()), 'tail_tokens': int(tc.sum()), 'override_rows': int((oc > 0).sum()),
+                'overrides': int(oc.sum())}
 
     @property
     def B(self):
@@ -76,7 +92,8 @@ class Rows:
         xi, oi = sel(xa, xb).astype(np.int64), sel(oa, ob).astype(np.int64)
         return Rows(np.concatenate([[0], np.cumsum(xb - xa)]), self.xs_idx[xi], self.xs_val[xi], self.n_players[idx],
                     np.concatenate([[0], np.cumsum(ob - oa)]), self.opt_action[oi], self.extra[idx], self.F,
-                    source=self.source)
+                    source=self.source, tail=None if self.tail is None else self.tail.take(idx),
+                    ov=None if self.ov is None else self.ov.take(idx))
 
     def dense(self):
         x = np.zeros((self.B, self.F), np.float32)
@@ -84,11 +101,12 @@ class Rows:
         return x
 
     @classmethod
-    def from_dense(cls, x, n_players, opt_off, opt_action, extra, source=''):
+    def from_dense(cls, x, n_players, opt_off, opt_action, extra, source='', tail=None, ov=None):
         nz = x != 0                                    # (NaN != 0: kept)
         r, c = np.nonzero(nz)
         off = np.concatenate([[0], np.cumsum(nz.sum(1))])
-        return cls(off, c.astype(np.int32), x[r, c], n_players, opt_off, opt_action, extra, x.shape[1], source=source)
+        return cls(off, c.astype(np.int32), x[r, c], n_players, opt_off, opt_action, extra, x.shape[1], source=source,
+                   tail=tail, ov=ov)
 
     @classmethod
     def load(cls, path, max_rows=4096, belief_every=8):
@@ -98,10 +116,13 @@ class Rows:
             files = set(z.files)
             if 'xs_off' in files:
                 meta = json.loads(str(z['meta']))
+                tail, ov = recorded_rows({k: z[k] for k in files if k != 'meta'}, meta)
                 return cls(z['xs_off'], z['xs_idx'], z['xs_val'], z['n_players'], z['opt_off'], z['opt_action'],
-                           z['extra'], meta['features'], batch_off=z['batch_off'], source=os.path.basename(path))
-        from .data import read_shard
+                           z['extra'], meta['features'], batch_off=z['batch_off'], source=os.path.basename(path),
+                           tail=tail, ov=ov)
+        from .data import read_shard, shard_tail
         s = read_shard(path, dense=False)
+        stail, sov = shard_tail(s)
         if 'x' in s:
             x = s['x']
             N = min(len(x), max_rows)
@@ -129,18 +150,52 @@ class Rows:
                         rows.append(i - a)
                         kinds.append(ROW_BELIEF)
                         oo.append(oo[-1])
-            parts.append(cls.from_dense(xx[rows], np.asarray(npl, np.int64)[a + np.asarray(rows)], np.asarray(oo),
-                                        np.concatenate(aa).astype(np.int32), np.asarray(kinds, np.uint8)))
+            src = a + np.asarray(rows)
+            kinds = np.asarray(kinds, np.uint8)
+            # (a v2 shard's tails and overrides: a belief copy has its leaf row's tail and no option, so no override)
+            pt = None if stail is None else stail.take(src)
+            po = None if sov is None else _ov_rows(sov, src, kinds)
+            parts.append(cls.from_dense(xx[rows], np.asarray(npl, np.int64)[src], np.asarray(oo),
+                                        np.concatenate(aa).astype(np.int32), kinds, tail=pt, ov=po))
         return cat(parts, source=os.path.basename(path))
+
+
+def _ov_rows(ov, src, kinds):
+    """The overrides of rows `src` of `ov`, none for a belief copy (`kinds` ROW_BELIEF: no options)."""
+    from .rows import Overrides
+    parts = [Overrides.empty(1) if k == ROW_BELIEF else ov.take(np.array([r])) for r, k in zip(src, kinds)]
+    return Overrides.concat(parts) if parts else Overrides.empty(0)
+
+
+def recorded_rows(z, meta):
+    """A recorded batch file's (tools/onnx_record.py, a reference set) tails and overrides -> (`rows.Tail` or None,
+    `rows.Overrides` or None): `t_off` / `t_seg` / `t_slot` / `t_val` with meta `t_segs` [[segment, name, width, head
+    slots], ...], `ov_off` / `ov_opt` / `ov_tok` (docs/search.md 2.15); None for a file without."""
+    from .rows import Overrides, Tail
+    tail = ov = None
+    if 't_off' in z:
+        segs = meta.get('t_segs')
+        if not segs:
+            raise ValueError('a recorded file with tail tokens but no t_segs in its meta')
+        widths = {int(s): (int(w), int(h), k) for k, (s, _n, w, h) in enumerate(segs)}
+        tail = Tail(z['t_off'], z['t_seg'], z['t_slot'], z['t_val'], widths)
+    if 'ov_off' in z:
+        ov = Overrides(z['ov_off'], z['ov_opt'], z['ov_tok'])
+    return tail, ov
 
 
 def cat(parts, source=''):
     """Rows of several Rows objects, in order."""
+    from .rows import Overrides, Tail
     xo = np.concatenate([[0], np.cumsum(np.concatenate([np.diff(p.xs_off) for p in parts]))])
     oo = np.concatenate([[0], np.cumsum(np.concatenate([np.diff(p.opt_off) for p in parts]))])
+    if len({(p.tail is None, p.ov is None) for p in parts}) != 1:
+        raise ValueError('cat: rows with and without tails / overrides')
     return Rows(xo, np.concatenate([p.xs_idx for p in parts]), np.concatenate([p.xs_val for p in parts]),
                 np.concatenate([p.n_players for p in parts]), oo, np.concatenate([p.opt_action for p in parts]),
-                np.concatenate([p.extra for p in parts]), parts[0].F, source=source)
+                np.concatenate([p.extra for p in parts]), parts[0].F, source=source,
+                tail=None if parts[0].tail is None else Tail.concat([p.tail for p in parts]),
+                ov=None if parts[0].ov is None else Overrides.concat([p.ov for p in parts]))
 
 
 def absent_nan(model, rows):
@@ -148,15 +203,15 @@ def absent_nan(model, rows):
     a flag) - a token network must never read them."""
     x = rows.dense()
     for s in model.segs:
-        if s['present'] is None:
-            continue
+        if s['present'] is None or not s['count']:
+            continue                                   # (a tail-only segment has no head slot: docs/az.md 43.5)
         o, k, w = s['offset'], s['count'], s['width']
         v = x[:, o:o + k * w].reshape(-1, k, w)
         absent = v[..., s['present']] <= 0.5
         keep = v[..., s['present']].copy()
         v[absent] = np.nan
         v[..., s['present']] = keep
-    return Rows.from_dense(x, rows.n_players, rows.opt_off, rows.opt_action, rows.extra, rows.source)
+    return Rows.from_dense(x, rows.n_players, rows.opt_off, rows.opt_action, rows.extra, rows.source, rows.tail, rows.ov)
 
 
 # ---------------------------------------------------------------- answers
@@ -213,12 +268,23 @@ def exact_softmax(logits, off):
     return (e / np.repeat(s, cnt)).astype(np.float32)
 
 
+class Refused(ValueError):
+    """A zero-onnx/2 graph refused some of a batch's tail tokens / overrides (its `refused` output; docs/az.md 46):
+    what torch raises on (R5 / R6), never answered."""
+
+
 def answer(outs, rows):
-    """The worker's generic step on the graph's outputs (policy, value, margin, aux) -> what an evaluator
+    """The worker's generic step on the graph's outputs (policy, value, margin, aux[, refused]) -> what an evaluator
     returns: (priors [options] - each row's legal logits softmaxed per segment, float32, `exact_softmax`: the
     native worker's bits -, value [B, 8], margin [B, 8]) plus the belief rows' auxiliary answers when the batch
-    has belief rows."""
-    policy, value, margin, aux = outs
+    has belief rows. A zero-onnx/2 graph's `refused` must be 0 on every row (`Refused` otherwise)."""
+    policy, value, margin, aux = outs[:4]
+    if len(outs) > 4:
+        ref = np.asarray(outs[4])
+        if ref.any():
+            bad = np.flatnonzero(ref)
+            raise Refused(f'the graph refused {int(ref.sum())} tail token(s) / override(s) in {len(bad)} row(s) '
+                          f'(first: row {int(bad[0])}): not tokens / targets the network takes (R5 / R6, docs/az.md 46)')
     r = np.repeat(np.arange(rows.B), np.diff(rows.opt_off))
     pri = exact_softmax(policy[r, rows.opt_action], rows.opt_off)
     br = belief_rows(rows.extra)
@@ -226,11 +292,34 @@ def answer(outs, rows):
     return out + (aux[br],) if len(br) else out
 
 
-def feeds(rows, packing=None, pidx=None, junk=False, seed=0):
+def varlen_feeds(rows):
+    """zero-onnx/2's more inputs for `rows` (docs/az.md 46): the options, the tail tokens (each one's floats
+    consecutive, as the driver sends them) and the overrides - empty CSRs for rows without."""
+    B = rows.B
+    t, o = rows.tail, rows.ov
+    z = np.zeros(B + 1, np.int64)
+    return {'opt_off': rows.opt_off.astype(np.int64), 'opt_action': rows.opt_action.astype(np.int32),
+            't_off': z if t is None else t.off.astype(np.int64),
+            't_seg': np.zeros(0, np.int32) if t is None else t.seg.astype(np.int32),
+            't_slot': np.zeros(0, np.int64) if t is None else t.slot.astype(np.int64),
+            't_val': np.zeros(0, np.float32) if t is None else t.val.astype(np.float32),
+            'ov_off': z if o is None else o.off.astype(np.int64),
+            'ov_opt': np.zeros(0, np.int32) if o is None else o.opt.astype(np.int32),
+            'ov_tok': np.zeros(0, np.int64) if o is None else o.tok.astype(np.int64)}
+
+
+def is_v2(sess):
+    """The session's graph takes zero-onnx/2's inputs."""
+    return any(i.name == 't_off' for i in sess.get_inputs())
+
+
+def feeds(rows, packing=None, pidx=None, junk=False, seed=0, v2=False):
     """ONNX Runtime's inputs for `rows` (zero-onnx/1; 'host' also tok_full / tok_n from the host's packing,
-    `junk`: padding positions hold random slots)."""
+    `junk`: padding positions hold random slots; `v2`: zero-onnx/2's, `varlen_feeds`)."""
     f = {'x_ptr': rows.xs_off, 'x_idx': rows.xs_idx, 'x_val': rows.xs_val, 'n_players': rows.n_players,
          'belief': rows.extra == ROW_BELIEF}
+    if v2:
+        f.update(varlen_feeds(rows))
     if packing == 'host':
         P = presence_sparse(rows, pidx)
         n = P.sum(1)
@@ -249,13 +338,14 @@ def run_chunked(sess, rows, chunk=64, packing=None, pidx=None):
     non-zero count (a worker-side policy that needs nothing of the network: a row's outputs depend only on
     it; rows of similar size pad less in a token network's attention, as the eager evaluator's chunks of
     64 rows sorted by token count) -> (policy, value, margin, aux) in the rows' order."""
+    v2 = is_v2(sess)
     if rows.B <= chunk:
-        return sess.run(None, feeds(rows, packing, pidx))
+        return sess.run(None, feeds(rows, packing, pidx, v2=v2))
     order = np.argsort(np.diff(rows.xs_off), kind='stable')
     outs = None
     for a in range(0, rows.B, chunk):
         idx = order[a:a + chunk]
-        o = sess.run(None, feeds(rows.take(idx), packing, pidx))
+        o = sess.run(None, feeds(rows.take(idx), packing, pidx, v2=v2))
         if outs is None:
             outs = [np.empty((rows.B,) + v.shape[1:], v.dtype) for v in o]
         for dst, v in zip(outs, o):
@@ -280,18 +370,51 @@ def presence_sparse(rows, pidx):
     return P
 
 
+def model_tail_kw(model, rows):
+    """The rows' tail / overrides as `NetEvaluator.evaluate` takes them for `model` ({} for a network without; an
+    empty one for rows without what the network needs)."""
+    from .rows import Overrides, Tail
+    kw = {}
+    if getattr(model, 'tails', None):
+        w = {j: (wd, c, k) for k, (j, _n, wd, c) in enumerate(model.tail_segments())}
+        kw['tail'] = rows.tail if rows.tail is not None else Tail.empty(rows.B, w)
+    elif rows.tail is not None:
+        kw['tail'] = rows.tail                         # (refused by the network: R5)
+    if getattr(model, 'option_pointers', False):
+        kw['ov'] = rows.ov if rows.ov is not None else Overrides.empty(rows.B)
+    elif rows.ov is not None:
+        kw['ov'] = rows.ov
+    return kw
+
+
 @torch.inference_mode()
 def static_answer(model, rows):
     """torch `TokenNet.forward_static` on the host-packed rows (`infer.token_presence` / `token_index`, padding
-    0) with `infer.TokenGraphRunner`'s post-processing, on the CPU -> an evaluator's answer."""
+    0; with tails `rows.token_full` - each row's tail tokens after its head tokens - and the overrides resolved by
+    `rows.resolve`) with `infer.TokenGraphRunner`'s post-processing, on the CPU -> an evaluator's answer."""
     from .net import aux_answer
     x = rows.dense()
     P = token_presence(x, model.present_index())
-    n = P.sum(1)
-    full = token_index(P, np.zeros((rows.B, int(n.max())), np.int64))
     layout = list(getattr(model, 'aux_layout', None) or [])
-    r = model.forward_static(torch.from_numpy(x), torch.from_numpy(rows.n_players), torch.from_numpy(full),
-                             torch.from_numpy(n.astype(np.int64)), aux=bool(layout))
+    kw = model_tail_kw(model, rows)
+    if kw:
+        from . import rows as R
+        from .infer import ov_torch
+        tc = kw['tail'].counts() if 'tail' in kw else np.zeros(rows.B, np.int64)
+        full, n = R.token_full(P, tc, model.n_tok, 1)
+        tk = {}
+        if 'tail' in kw:
+            tk['tail'] = kw['tail'].to_torch('cpu')
+        if 'ov' in kw:
+            tk['ov'] = ov_torch(R.resolve(kw.get('tail'), kw['ov'], rows.opt_off, rows.opt_action, model.config['layout'],
+                                          present=P), 'cpu')
+        r = model.forward_static(torch.from_numpy(x), torch.from_numpy(rows.n_players), torch.from_numpy(full),
+                                 torch.from_numpy(n.astype(np.int64)), aux=bool(layout), **tk)
+    else:
+        n = P.sum(1)
+        full = token_index(P, np.zeros((rows.B, int(n.max())), np.int64))
+        r = model.forward_static(torch.from_numpy(x), torch.from_numpy(rows.n_players), torch.from_numpy(full),
+                                 torch.from_numpy(n.astype(np.int64)), aux=bool(layout))
     S = model.seats
     value = np.zeros((rows.B, MAX_SEATS), np.float32)
     margin = np.zeros((rows.B, MAX_SEATS), np.float32)
@@ -307,8 +430,9 @@ def static_answer(model, rows):
 
 
 def eager_answer(ev, rows):
-    """The eager evaluator's answer (`NetEvaluator.evaluate` on the densified rows)."""
-    return ev.evaluate(rows.dense(), rows.n_players, rows.opt_off.astype(np.int32), rows.opt_action, rows.extra)
+    """The eager evaluator's answer (`NetEvaluator.evaluate` on the densified rows, with their tails and overrides)."""
+    return ev.evaluate(rows.dense(), rows.n_players, rows.opt_off.astype(np.int32), rows.opt_action, rows.extra,
+                       **model_tail_kw(ev.model, rows))
 
 
 def diffs(a, b):
@@ -352,7 +476,9 @@ def check_invariants(got, rows):
 
 
 def cases(model, rows, sizes, tokens, recorded=3):
-    """(name, rows, junk) of the gate on `rows` (module docstring)."""
+    """(name, rows, junk) of the gate on `rows` (module docstring); rows with tail tokens or overrides also as a
+    case of their own, every such row of the file (at most 1,024; 'varlen', and 'varlen-nan'), and the rows with
+    overrides alone (at most 1,024; 'overrides': much rarer than tail tokens in a real game)."""
     R = rows.B
     out = []
     for s in sizes:
@@ -362,6 +488,19 @@ def cases(model, rows, sizes, tokens, recorded=3):
         out.append((f'B{s}', sub, False))
         if tokens:
             out.append((f'B{s}-nan', absent_nan(model, sub), True))
+    if rows.tail is not None or rows.ov is not None:
+        has = np.zeros(R, bool)
+        if rows.tail is not None:
+            has |= rows.tail.counts() > 0
+        if rows.ov is not None:
+            has |= rows.ov.counts() > 0
+        idx = np.flatnonzero(has)[:1024]
+        if len(idx):
+            sub = rows.take(idx)
+            out.append(('varlen', sub, False))
+            out.append(('varlen-nan', absent_nan(model, sub), True))
+        if rows.ov is not None and rows.ov.NO:
+            out.append(('overrides', rows.take(np.flatnonzero(rows.ov.counts() > 0)[:1024]), False))
     if rows.batch_off is not None:
         bo = rows.batch_off
         for k in range(min(recorded, len(bo) - 1)):
@@ -377,7 +516,9 @@ def run_gate(model, onnx_paths, rows_list, sizes=SIZES, tol=TOL, threads=4, log=
     torch.set_num_threads(threads)
     ev = NetEvaluator(model, 'cpu')
     sess = {p: session(path, threads) for p, path in onnx_paths.items()}
+    v2 = {p: is_v2(s) for p, s in sess.items()}
     pidx = model.present_index() if tokens else None
+    gated = set(getattr(model, 'gated', None) or [])
     results, ok = [], True
     for rows in rows_list:
         if rows.F != model.features:
@@ -396,16 +537,20 @@ def run_gate(model, onnx_paths, rows_list, sizes=SIZES, tol=TOL, threads=4, log=
                     secs = time.perf_counter() - t0
                     again = run_chunked(s, sub, CHUNK)
                 else:
-                    f = feeds(sub, p, pidx, junk=junk and p == 'host')
+                    f = feeds(sub, p, pidx, junk=junk and p == 'host', v2=v2[chunked or p])
                     outs = s.run(None, f)
                     secs = time.perf_counter() - t0
                     again = s.run(None, f)
-                got = answer(outs, sub)
-                bad = check_invariants(got, sub)
+                try:
+                    got = answer(outs, sub)
+                except Refused as e:
+                    got, bad = None, str(e)
+                else:
+                    bad = check_invariants(got, sub)
                 if bad is None and not all(np.array_equal(u, v, equal_nan=True) for u, v in zip(outs, again)):
                     bad = 'not deterministic: the same inputs twice gave other outputs'
-                d_e = diffs(got, eager)
-                d_s = diffs(got, static) if tokens else None
+                d_e = diffs(got, eager) if got is not None else [float('inf')] * len(eager)
+                d_s = (diffs(got, static) if got is not None else [float('inf')] * len(static)) if tokens else None
                 worst = max(d_e + (d_s or []))
                 fail = bad is not None or worst > tol
                 ok &= not fail
@@ -415,6 +560,10 @@ def run_gate(model, onnx_paths, rows_list, sizes=SIZES, tol=TOL, threads=4, log=
                      'ort_vs_eager': dict(zip(ITEMS, d_e)), 'ort_vs_static': dict(zip(ITEMS, d_s)) if tokens else None,
                      'static_vs_eager': dict(zip(ITEMS, base)) if tokens else None, 'max': worst,
                      'ort_ms': round(secs * 1e3, 2), 'pass': not fail}
+                if sub.tail is not None or sub.ov is not None:
+                    r.update(sub.tail_stats())
+                    r['gated_tokens'] = int(np.isin(sub.tail.seg.astype(np.int64), list(gated)).sum()) \
+                        if sub.tail is not None and gated else 0
                 if bad:
                     r['invariant'] = bad
                 results.append(r)
@@ -436,7 +585,7 @@ def summarize(results):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description='zero-onnx/1 parity gate: ONNX Runtime (CPU EP) vs torch (docs/az.md 41)')
+    ap = argparse.ArgumentParser(description='zero-onnx parity gate: ONNX Runtime (CPU EP) vs torch (docs/az.md 41, 46)')
     ap.add_argument('checkpoint')
     ap.add_argument('--batches', nargs='+', required=True)
     ap.add_argument('--packing', default='mask,compact,packed,host')
@@ -457,6 +606,9 @@ def main(argv=None):
     stem = os.path.splitext(os.path.basename(a.checkpoint))[0]
     from .net import TokenNet
     packs = [p for p in a.packing.split(',') if p] if isinstance(model, TokenNet) else ['none']
+    if OX.onnx_version(model) == 2 and packs != ['packed']:
+        print(f'zero-onnx/2 (variable-length token sets): packing \'packed\' only (not {packs})', file=sys.stderr)
+        packs = ['packed']
     paths, export_s = {}, {}
     for p in packs:
         path = os.path.join(d, f'{stem}.{p}.onnx')

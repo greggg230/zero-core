@@ -5,8 +5,9 @@ Unlike a remote host it has no sessions and never holds a share of the iteration
 run process (`Pool`, owned by zero.remoteplay.RemotePlay) that
 
 1. **publishes** checkpoint it - 1 when iteration it's self-play begins (RemotePlay.begin, right after the
-   checkpoint is written): the checkpoint exported to zero-onnx/1 with its reference set (zero.onnx_export, checked
-   through onnxruntime) under `<run>/pool/<farm run>/ckpt/<gen>/`, uploaded (`ckpt/<farm run>/<gen>/...`), a NEW
+   checkpoint is written): the checkpoint exported to zero-onnx/1 (or /2, docs/az.md 46) with its reference set
+   (zero.onnx_export, checked through onnxruntime) under `<run>/pool/<farm run>/ckpt/<gen>/`, uploaded
+   (`ckpt/<farm run>/<gen>/...`), a NEW
    signed definition version (zero.farm_def: the worker build, its runtime, the gen and up to `pool_max_stale` gens
    before it, the self-play template {settings: the worker build's own `check-config` play settings}) published
    with farm-release - and only then the gen registered current (`PUT .../checkpoint/<gen>`): farm leases switch

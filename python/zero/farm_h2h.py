@@ -19,7 +19,7 @@ What it does:
    the worker build's own `check-config --eval --json` calls `play` (`play_settings`: zero-farm PROTOCOL.md 7 -
    a signed template carries no trainer-only key and nothing path-like); `--worker` is that build's executable.
    The batch's base seed is the coordinator's, from the run's name (`coordinator_seed`): a template has no seed.
-2. Both checkpoints exported to zero-onnx/1 (zero.onnx_export, 'packed') with their reference sets (256 rows
+2. Both checkpoints exported to zero-onnx/1 or /2 (zero.onnx_export, 'packed') with their reference sets (256 rows
    of recorded batches - `--reference-batches`, else a short self-play of A recorded here, CPU - with torch's
    answers, checked through onnxruntime: <= 2e-5, else nothing is published).
 3. The run `h2h-<slug>` (`PUT /v1/admin/run/h2h-<slug>`, selfplay null, the worker build and runtime); its signed
@@ -99,15 +99,24 @@ def settings_of(a, ckpt_a, game):
 
 # ---------------------------------------------------------------- reference sets
 
+VARLEN_KEYS = ('t_off', 't_seg', 't_slot', 't_val', 'ov_off', 'ov_opt', 'ov_tok')
+MAX_RECORD_BATCHES = 4096
+
+
 def record_rows(model, game, spec, rows=320, conc=32, sims=16, threads=4, seed=1):
     """`rows` real network batch rows (whole batches) of a short self-play of `model` (tools/onnx_record.py's
     seats: root belief rows when the network has the auxiliary head, root-view leaf values with view samples)
-    -> onnx_parity.Rows with batch_off."""
+    -> onnx_parity.Rows with batch_off. A game with variable-length rows: the batches' tail tokens and overrides
+    too, and the self-play goes on until the rows hold at least one tail token and one override of each kind the
+    network takes (zero-onnx/2's self-test answers them, docs/az.md 46) - refused (RuntimeError) when
+    `MAX_RECORD_BATCHES` batches hold none."""
     import numpy as np
     from . import games as G
     from .infer import NetEvaluator, drive
     from .onnx_parity import Rows
     ev = NetEvaluator(model, 'cpu')
+    need_t = bool(getattr(model, 'tails', None))
+    need_o = bool(getattr(model, 'option_pointers', False))
     tilt = 1.0 if getattr(model, 'aux_layout', None) else 0.0
     seat = G.nn_seat('m', sims, selfplay=True, sims_fast=max(1, sims // 2), p_full=0.25, leaf_value_view='root',
                      view_samples=0.5, belief_tilt=tilt)
@@ -120,24 +129,44 @@ def record_rows(model, game, spec, rows=320, conc=32, sims=16, threads=4, seed=1
 
     def rec(lb):
         keep.append({k: np.array(lb.a[k]) for k in ('xs_off', 'xs_idx', 'xs_val', 'n_players', 'extra', 'opt_off',
-                                                     'opt_action')})
+                                                     'opt_action') + VARLEN_KEYS if k in lb.a})
         return ev(lb)
 
+    def have(k):
+        return sum(int(b[k][-1]) for b in keep if k in b)
+
     def check():
-        if sum(len(b['n_players']) for b in keep) >= rows and len(keep) >= 2:
+        if sum(len(b['n_players']) for b in keep) >= rows and len(keep) >= 2 \
+                and (not need_t or have('t_off')) and (not need_o or have('ov_off')):
             raise Enough()
+        if len(keep) >= MAX_RECORD_BATCHES:
+            raise RuntimeError(f'record_rows: {len(keep)} batches with {have("t_off")} tail tokens and '
+                               f'{have("ov_off")} overrides: the network\'s {"tails" if need_t else ""}'
+                               f'{" and " if need_t and need_o else ""}{"overrides" if need_o else ""} would go untested')
 
     os.environ['ZERO_INFLIGHT'] = '1'
     try:
         drive(drv, {'m': rec}, check=check)
     except Enough:
         pass
+    if (need_t and not have('t_off')) or (need_o and not have('ov_off')):
+        raise RuntimeError(f'record_rows: the self-play ended after {len(keep)} batches with {have("t_off")} tail tokens '
+                           f'and {have("ov_off")} overrides: the network\'s variable-length rows would go untested')
     n = [len(b['n_players']) for b in keep]
     xs_off = np.concatenate([[0], np.cumsum(np.concatenate([np.diff(b['xs_off']) for b in keep]))])
     opt_off = np.concatenate([[0], np.cumsum(np.concatenate([np.diff(b['opt_off']) for b in keep]))])
     cat = lambda k: np.concatenate([b[k] for b in keep])
+    tail = ov = None
+    if 't_off' in keep[0]:
+        from .rows import Tail
+        w = {int(x['seg']): (int(x['width']), int(x['head']), k) for k, x in enumerate(G.info(game)['tails'])}
+        tail = Tail.concat([Tail.from_arrays(b, w) for b in keep])
+    if 'ov_off' in keep[0]:
+        from .rows import Overrides
+        ov = Overrides.concat([Overrides.from_arrays(b) for b in keep])
     return Rows(xs_off, cat('xs_idx'), cat('xs_val'), cat('n_players'), opt_off, cat('opt_action'), cat('extra'),
-                model.features, batch_off=np.concatenate([[0], np.cumsum(n)]).astype(np.int64), source='farm_h2h')
+                model.features, batch_off=np.concatenate([[0], np.cumsum(n)]).astype(np.int64), source='farm_h2h',
+                tail=tail, ov=ov)
 
 
 def export(ckpt, gen, out_dir, game, rows_list, ckpt_id, threads=4, checkpoint_iter=None):

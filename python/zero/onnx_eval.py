@@ -1,5 +1,5 @@
-"""`OnnxEvaluator`: a `zero-onnx/1` graph (zero/onnx_export.py, docs/az.md 41) answering the driver's network
-batches through onnxruntime on the CPU, with the generic step every zero-core evaluator does - a drop-in
+"""`OnnxEvaluator`: a `zero-onnx/1` or `zero-onnx/2` graph (zero/onnx_export.py, docs/az.md 41, 46) answering the
+driver's network batches through onnxruntime on the CPU, with the generic step every zero-core evaluator does - a drop-in
 for `infer.NetEvaluator` wherever a LeafBatch evaluator is taken (`infer.drive`, zero.h2h's seats, a remote
 worker), and the Python reference of the native worker's evaluator (zero-farm parity gate 2, docs/az.md 44).
 
@@ -12,8 +12,13 @@ batches over `chunk` rows in pieces of at most `chunk` rows grouped by non-zero 
 float32 (`onnx_parity.exact_softmax`: the native worker's bits), value and margin as the graph gives them, the root belief rows' auxiliary
 outputs (a graph without the head refuses such a batch: net.HeadMissing). Session: CPU EP, `threads`
 intra-op threads, inter-op 1, sequential, all graph optimizations (the native worker's). `expect`
-checks the graph's metadata as the native worker does (game, features, actions).
+checks the graph's metadata as the native worker does (game, features, actions). A zero-onnx/2 graph also takes
+each batch's options, tail tokens and pointer overrides (the LeafBatch's `t_*` / `ov_*`, docs/search.md 2.15; its
+`tails` metadata gives the tail segments' widths) and refuses a batch whose tail tokens or overrides it does not take
+(`onnx_parity.Refused`); a zero-onnx/1 graph refuses a batch that has any (R14).
 """
+import json
+
 import numpy as np
 
 from .onnx_parity import Rows, answer, run_chunked, session
@@ -25,8 +30,13 @@ class OnnxEvaluator:
         self.path = str(path)
         self.sess = session(self.path, threads)
         self.meta = dict(self.sess.get_modelmeta().custom_metadata_map)
-        if self.meta.get('zero_onnx') != '1':
-            raise ValueError(f'{path}: zero_onnx {self.meta.get("zero_onnx")!r}: not a zero-onnx/1 graph')
+        if self.meta.get('zero_onnx') not in ('1', '2'):
+            raise ValueError(f'{path}: zero_onnx {self.meta.get("zero_onnx")!r}: not a zero-onnx/1 or /2 graph')
+        self.v2 = self.meta['zero_onnx'] == '2'
+        self.widths = None
+        if self.v2:
+            # (the tail segments' widths and head slots: {segment: (width, head, k)}, rows.Tail's)
+            self.widths = {int(s): (int(w), int(h), k) for k, (s, _n, w, h) in enumerate(json.loads(self.meta['tails']))}
         for k, v in (expect or {}).items():
             if str(self.meta.get(k)) != str(v):
                 raise ValueError(f'{path}: metadata {k} {self.meta.get(k)!r}, expected {v!r}')
@@ -39,9 +49,14 @@ class OnnxEvaluator:
     def rows(self, lb):
         """The batch as `onnx_parity.Rows` (its sparse rows; a dense batch's non-zeros)."""
         a = lb.a
-        if 't_off' in a or 'ov_off' in a:      # (R14, docs/az.md 43.8: never a tail or an override dropped in silence)
-            raise ValueError(f'{self.path}: a batch with variable-length rows (tail tokens / pointer overrides) for a '
-                             f'zero-onnx/1 graph')
+        tail = ov = None
+        if 't_off' in a or 'ov_off' in a:
+            if not self.v2:               # (R14, docs/az.md 43.8: never a tail or an override dropped in silence)
+                raise ValueError(f'{self.path}: a batch with variable-length rows (tail tokens / pointer overrides) for a '
+                                 f'zero-onnx/1 graph')
+            from .rows import Overrides, Tail
+            tail = Tail.from_arrays(a, self.widths) if 't_off' in a else None
+            ov = Overrides.from_arrays(a) if 'ov_off' in a else None
         extra = a.get('extra')
         extra = np.zeros(lb.B, np.uint8) if extra is None else extra
         if 'xs_val' in a:
@@ -50,12 +65,12 @@ class OnnxEvaluator:
                 raise EncodingMismatch(f'a sparse batch of {int(a["n_features"]):,} features per row for a graph of '
                                        f'{self.features:,}')
             return Rows(a['xs_off'], a['xs_idx'], a['xs_val'], a['n_players'], a['opt_off'], a['opt_action'], extra,
-                        self.features)
+                        self.features, tail=tail, ov=ov)
         x = np.asarray(a['x'], np.float32)
         if x.shape[1] != self.features:
             from .net import EncodingMismatch
             raise EncodingMismatch(f'a batch of {x.shape[1]:,} features per row for a graph of {self.features:,}')
-        return Rows.from_dense(x, a['n_players'], a['opt_off'], a['opt_action'], extra)
+        return Rows.from_dense(x, a['n_players'], a['opt_off'], a['opt_action'], extra, tail=tail, ov=ov)
 
     def answer_rows(self, rows):
         if len(belief_rows(rows.extra)) and not self.aux_width:
@@ -69,10 +84,13 @@ class OnnxEvaluator:
     def __call__(self, lb):
         return self.answer_rows(self.rows(lb))
 
-    def evaluate(self, x, n_players, opt_off, opt_action, extra=None):
-        """NetEvaluator.evaluate's signature (dense rows)."""
+    def evaluate(self, x, n_players, opt_off, opt_action, extra=None, tail=None, ov=None):
+        """NetEvaluator.evaluate's signature (dense rows; `tail` / `ov`: `rows.Tail` / `rows.Overrides`)."""
+        if (tail is not None or ov is not None) and not self.v2:
+            raise ValueError(f'{self.path}: tail tokens / pointer overrides for a zero-onnx/1 graph (R14)')
         extra = np.zeros(len(x), np.uint8) if extra is None else np.asarray(extra, np.uint8)
-        return self.answer_rows(Rows.from_dense(np.asarray(x, np.float32), n_players, opt_off, opt_action, extra))
+        return self.answer_rows(Rows.from_dense(np.asarray(x, np.float32), n_players, opt_off, opt_action, extra,
+                                                tail=tail, ov=ov))
 
     def launch(self, lb):                          # (infer.drive's pipelining: computed at once)
         return self(lb)

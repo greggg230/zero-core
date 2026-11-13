@@ -6734,3 +6734,126 @@ the pool's shards the same files, every replayed row the same bytes (`record_row
 pytest files (`test_farm_pool`, `test_farm_def`, `test_farm_h2h`, `test_farm_report`, `test_worker_settings`,
 `test_onnx`) and varlen's tail files (`test_tail_rows`, `test_tail_shards`, `test_tail_loop`, `test_tail_remote`,
 `test_pack`) on the merged tree.
+
+## 46. zero-onnx/2: variable-length rows as one ONNX graph, and the native worker that feeds it (no setting; zero-farm, MTG Zero's layout v7, 2026-11-12)
+
+**Why.** MTG Zero's best-of-three run moves to layout v7 (section 43): rows with tail tokens past the fixed-width head,
+gated tail-only segments and pointer overrides. zero-onnx/1 (section 41) takes the head only - its exporter refuses
+such a network (R14, 45.6) -, so the farm needs a graph that takes the whole row, and a worker that feeds it.
+
+### 46.1 The interface
+
+A token network with tail segments, pointer overrides or gates (`net.varlen_features`) exports as **zero-onnx/2**
+(`onnx_export.onnx_version`); every other network exports zero-onnx/1, the same graph as before (46.4). zero-onnx/2's
+inputs are zero-onnx/1's five plus the driver's arrays of docs/search.md 2.15, all always fed (empty CSRs for rows
+without):
+
+| | name | type | shape | |
+|---|---|---|---|---|
+| in | `opt_off` | i64 | [B+1] | the rows' options (driver i32: widened) |
+| in | `opt_action` | i32 | [K] | each option's action |
+| in | `t_off` | i64 | [B+1] | the rows' tail tokens (B + 1 zeros for a game without tail segments) |
+| in | `t_seg` | i32 | [NT] | each token's segment (driver u16) |
+| in | `t_slot` | i64 | [NT] | its slot (driver u32: every u32 exact) |
+| in | `t_val` | f32 | [L] | each token's `width(seg)` floats, consecutive (the driver's) |
+| in | `ov_off` | i64 | [B+1] | the rows' pointer overrides |
+| in | `ov_opt` | i32 | [NO] | the option (its index in its row) |
+| in | `ov_tok` | i64 | [NO] | the target, packed: segment at bit 40, column at bit 32, slot below; -1: the generic logit |
+| out | `policy`, `value`, `margin`, `aux` | | | zero-onnx/1's (the policy with the overrides applied) |
+| out | `refused` | i64 | [B] | per row, its tail tokens and overrides the network refuses (below); 0 everywhere or the batch is refused |
+
+Metadata: zero-onnx/1's, `zero_onnx` '2', `protocol` 'zero-onnx/2', and `tails` (JSON [[segment, name, width, head
+slots], ...]: the game's `game_info()['tails']`), `option_pointers`, `max_row_tokens`, `tail_width`, `gates` ({segment:
+g}). Packing: `packed` only.
+
+### 46.2 What the graph computes (`ZeroOnnx2`)
+
+What the eager evaluator computes (`NetEvaluator`: `rows.resolve` on the host, then `TokenNet.forward`, 43.5-43.7), in
+the `packed` graph of 41, with nothing of a network's own in the worker:
+
+* **The tail tokens.** Each token's row from `t_off` and its floats from `t_val` (each segment's width a table of the
+  graph: a token's `width(seg)` floats at the running sum of the widths before it, zeros up to the widest tail
+  segment), embedded as a head slot is: the segment's input map + its identity's embedding + `tail_base[k] +
+  pos_tail[k](psi(slot - count))` - every tail segment's maps as one product, each token's own picked by its segment
+  (`_TailEmbed`'s matrices); psi's 32 binary digits by integer division (ONNX's BitShift takes unsigned integers
+  only; exact for every u32), log2(n + 1) / 32 in float64 and rounded, the sin / cos part from psi's own table.
+* **The packed list.** The N present head tokens (row-major, layout order) then the NT tail tokens; each row's tail
+  tokens follow its head tokens in the padded rows of the attention and the pooling (gathered in and back: no
+  scatter-add, 41's rule). A gated segment's tokens weigh g = max(theta, 0) (inference's gate values, constants of
+  the graph): the attention's float mask log w (-inf at g = 0: such a token changes nothing, exactly) and the pooling's
+  weighted mean; without gated segments the boolean mask and the plain mean of before.
+* **The overrides.** Each override's row from `ov_off`, its action `opt_action[opt_off[row] + opt]`, its target from
+  `ov_tok` (a head slot: its place in the full token axis, `1 + Σ_{s' < s} count(s') + slot`, which must be present in its row; a tail token: the one of its row with
+  that (segment, slot), found by matching every tail token), its pointer logit in its column, a gated target's blended
+  with the generic logit as `torch.lerp` computes it (exactly the generic at g = 0, the pointer at 1); -1: the generic
+  logit of before the static scatter. Written after the static scatter of the head slots' actions (a tail token has no
+  static action), one write per (row, action).
+* **`refused`.** What torch raises on (R5, R6: `TokenNet._check_tail`, `rows.resolve`, `TokenNet._ov_index`) is counted
+  per row instead - a tail token of a segment without a tail or outside the network, a slot at or past 2^32 or inside
+  its segment's head, a row's tokens not sorted by (segment, slot) or repeated; tail floats that do not fit the
+  tokens' widths (every row); an override of an option outside its row, a token below -1, a segment or column out of
+  range, a target head slot not present, a tail token the row lacks, a second override of the same action (which of
+  two would win is not defined). A refused override writes the dummy column. The worker and `onnx_parity.answer` refuse
+  a batch with any (`Refused`): never an answer torch would not give.
+
+### 46.3 The parity gate, the reference set, the Python evaluator
+
+`zero.onnx_parity` takes rows with tails and overrides (`Rows.tail` / `.ov`: `rows.Tail` / `rows.Overrides`; recorded
+batch files with `t_off` .. `ov_tok` and their meta's `t_segs`, v2 shards) and runs the gate on them: eager
+(`NetEvaluator` with the rows' tails and overrides) and `forward_static` (`rows.token_full`, `rows.resolve`) against
+the graph, every case twice; cases `varlen` (every row of the file with a tail token or an override, at most 1,024)
+and `overrides` (the rows with overrides: far rarer in a real game) besides the sizes, with their counts (rows with
+tails, tokens, overrides, gated tokens) in the result; a graph's nonzero `refused` fails the case (`Refused`). `OnnxEvaluator` takes zero-onnx/2 graphs (the batch's arrays, the graph's `tails`
+metadata for the widths) and refuses tails or overrides for a zero-onnx/1 graph. The reference set of a zero-onnx/2
+network (`write_reference`) holds its rows' tails and overrides (`t_off` i64, `t_seg` u16, `t_slot` u32, `t_val` f32,
+`ov_off` i64, `ov_opt` i32, `ov_tok` i64; meta `t_segs`, `option_pointers`, the counts), the batches holding overrides first,
+then those holding tail tokens; a set without a tail token (a network with tail segments) or an override (with option_pointers) is
+refused - a worker's self-test must answer them. `farm_h2h.record_rows` (the pool's rows) records on until its rows
+hold both (at most 4,096 batches, else it fails); `tools/onnx_record.py` keeps them (`--min-tail-rows`,
+`--min-overrides`).
+
+### 46.4 Off by default; tests and checks; measured (the export)
+
+**Off by default.** A network without tail segments, pointer overrides or gates exports zero-onnx/1 as before: the same
+graph (below), its code untouched but for the R14 refusal and `slot_tokens` skipping tail-only segments (none in such a
+network). Nothing on a run's path imports these modules.
+
+**Problems met** (each handled in the code): ONNX Runtime 1.31.1's CPU `Clip` and `Min` on int64 answer wrongly
+outside the int32 range (Clip(4294967295, min 0) = 0; Clip(x, 0, 2^32 - 1) = 2^32 - 1 for every x; zero-onnx/1 only
+clips small values) - the graph clamps integers by Where (`_iclamp`); `torch.div(..., rounding_mode=...)` on int64
+exports through floats (a packed token decoded wrongly, measured), `//` and remainder export as integer ops (`>>` by a tensor does not export);
+ONNX Runtime reduces an empty axis to a wrong shape (ReduceSum over the last axis of a [0, 10] tensor gave [0, 10]) - a
+sentinel tail token and override keep every axis non-empty; a v7 game's override rows are rare (151 overrides in 76,647
+rows of 800 recorded batches, against 55,168 tail tokens), so the gate has a case of them and the reference set takes
+their batches first.
+
+**Tests.** `tests/test_onnx2.py` (9): parity on the toy's layouts - tails on items with identities and overrides into
+tail items, a gated tail-only segment shut and opened, a gated segment with a pointer column (the blend, g in (0, 1)) -
+on batches of 1-150 rows with leaf, value-only and belief rows, NaN in absent slots, the 64-row pieces, every case
+twice; slots up to 2^32 - 1, one row, batches with no tail token or no override; every refusal counted on its own row
+(an option out of its row, an absent head slot, a missing tail token, a column out of range, a second override of an
+action, a token below -1, a tail token outside the network or at a head slot, floats that do not fit); the interface,
+dtypes, metadata, no ScatterND reduction, a network without varlen features still zero-onnx/1; real toy_tail driver
+batches through `OnnxEvaluator` (games to the end within 2e-5 of eager); the reference set with tails and overrides
+and its refusal. `tests/test_onnx.py` (17, zero-onnx/1) unchanged and passing.
+
+**Measured** (2026-11-13, the desktop's CPU beside other sessions' builds and the live run; onnxruntime 1.31.1, torch
+2.11.0):
+
+* *The v6 export (pb1's path).* MTG Zero's best-of-three run pb1, iteration 82 (layout v6), exported as the pool does
+  (packed, its checkpoint id and iteration) with b0930da's code and with this tree's: zero-onnx/1, not byte-identical
+  (10,737,231 vs 10,746,295 bytes) only because the exporter writes each node's source annotations - stack traces with
+  the exporting checkout's file paths and line numbers (`pkg.torch.onnx.stack_trace` etc.); without them the two graphs
+  are byte-identical (every node, attribute, initializer, input and output) and the model metadata identical; their
+  outputs on the pool's own gen-82 reference rows (256, whole batches and 64-row pieces) bit for bit the same. The same
+  holds against the graph the live pool published for gen 82.
+* *The gate on real v7 rows.* pb1 iteration 67 widened onto layout v7 by `fork_run` (gates exactly 0; 56,384 features,
+  belief + deck head, 16 tail segments, option pointers), 800 driver batches recorded by `tools/onnx_record.py` from a
+  CPU self-play of the best-of-three spec (76,647 rows: 50,442 leaf, 24,884 value-only, 1,321 belief; 36,774 rows with
+  tail tokens, 55,168 tokens; 151 overrides in 42 rows): **15 + 8 cases (pieces), 0 failed**, worst ORT vs torch priors
+  5.5e-6, value 6.3e-7, margin 6.0e-7, aux 2.5e-7; run twice, the same results and the graph byte for byte the same
+  (export deterministic); the 42 override rows alone (151 overrides, 579 tail tokens): worst 1.0e-6. The same network
+  with every gate opened to 0.37 (the weighted attention and pooling, the blend): 15 + 8 cases passed, worst priors
+  5.5e-6, margin 7.2e-7; its override rows 1.0e-6. Every output over all 800 batches (whole and in 64-row pieces) hashed
+  in two processes: bit for bit the same. The reference set (256 rows of 3 batches: 189 rows with 386 tail tokens, 2 with
+  8 overrides): ORT within 1.9e-6 of torch. Export 51-55 s; the graph 17.6 MB.
