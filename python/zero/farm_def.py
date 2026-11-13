@@ -206,8 +206,10 @@ MAX_CHECKPOINT_FILE_BYTES = 1 << 30
 
 def looks_like_path(s):
     """A string a worker could take for a file path (definition.rs `looks_like_path`): a separator, `..`, or a drive
-    (`C:` at its start). Job templates carry none: paths on a job line are only ever the agent's own."""
-    return '\\' in s or '/' in s or '..' in s or (len(s) >= 2 and s[0].isascii() and s[0].isalpha() and s[1] == ':')
+    (`C:` at its start). Job templates carry none: paths on a job line are only ever the agent's own. The Oracle name
+    separator ' // ' (a split, adventure or double-faced card's name, in a game spec: 'Rough // Tumble') is not one."""
+    t = s.replace(' // ', '')
+    return '\\' in t or '/' in t or '..' in s or (len(s) >= 2 and s[0].isascii() and s[0].isalpha() and s[1] == ':')
 
 
 def check_no_paths(v, at, depth=0):

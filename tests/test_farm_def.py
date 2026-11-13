@@ -94,6 +94,9 @@ def test_documents_and_their_checks():
     FD.definition('campaign', 'c', 1, 'mtg', [B], jobs={'fuzz': {'mode': 'x-games', 'announce_result': False}})
     assert FD.looks_like_path('C:') and FD.looks_like_path('..') and not FD.looks_like_path('cq-n4-v50')
     assert not FD.looks_like_path('{"sealed":{"set":"eoe"},"decks":"eval"}')
+    # (cards named with the Oracle separator " // " in a game spec are not paths: the Delver 75's Rough // Tumble)
+    assert not FD.looks_like_path('{"decks":{"p0":["Rough // Tumble","Tamiyo, Inquisitive Student // Tamiyo, Seasoned Scholar"]}}')
+    assert FD.looks_like_path('a //b') and FD.looks_like_path('x // ../y') and FD.looks_like_path('a/b')
 
 
 def test_versions_the_archive_and_publishing(tmp_path, monkeypatch, capsys):
