@@ -361,6 +361,18 @@ pub fn line(r: &Value) -> String {
             s.push_str(&format!(": {}", bad.join("; ")));
         }
     }
+    // a GPU provider that failed: the nodes it left to the CPU, by name (the log is all a remote PC sends back; the
+    // partition's edges follow from them and the graph)
+    if r["ok"] != json!(true) && r["provider"] != json!("cpu") {
+        if let Some(n) = r["cpu_nodes"].as_array().filter(|n| !n.is_empty()) {
+            let names: Vec<&str> = n.iter().filter_map(Value::as_str).collect();
+            let mut t = names.join(", ");
+            if t.len() > 3000 {
+                t = format!("{}...", t.chars().take(3000).collect::<String>());
+            }
+            s.push_str(&format!(" | nodes on the CPU: {t}"));
+        }
+    }
     if let Some(b) = r["batches"].as_object() {
         let mut b: Vec<(&String, &Value)> = b.iter().collect();
         b.sort_by_key(|(n, _)| n.parse::<usize>().unwrap_or(usize::MAX));

@@ -375,7 +375,11 @@ impl Runtime {
             *g = Some(st.clone());
             return st;
         }
-        let want = |name: &str| ensure_ready && ProviderKind::of_ort_name(name).is_some_and(|k| wanted.contains(&k));
+        // (installed providers are NotReady in every process until it asks: made usable here; a download only when
+        // `ensure_ready`)
+        let want = |name: &str, st: &crate::winml::Ready| {
+            ProviderKind::of_ort_name(name).is_some_and(|k| wanted.contains(&k)) && (ensure_ready || *st == crate::winml::Ready::NotReady)
+        };
         match crate::winml::list(&self.dir, &want) {
             Ok(eps) => {
                 for e in &eps {

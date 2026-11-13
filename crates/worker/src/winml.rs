@@ -6,8 +6,11 @@
 //! copy must already be loaded) and `DirectML.dll`. On Windows 10 and older Windows 11 builds the catalog lists
 //! nothing (or fails): DirectML and the CPU, built into Windows ML's ONNX Runtime, remain.
 //!
-//! A provider is used only if Windows ML says it is certified; `ensure_ready` (the probe, never a job) lets
-//! Windows ML download and install it (`WinMLEpEnsureReady`, synchronous).
+//! A provider is used only if Windows ML says it is certified. `WinMLEpEnsureReady` (synchronous) does two things:
+//! for a provider not on the PC (`NotPresent`) it downloads and installs it - only when `ensure_ready` (the probe,
+//! never a job); for an installed one (`NotReady`: every installed provider in a process that has not asked yet) it
+//! makes it usable in this process - a local step, done for every wanted provider (else a job, or any process but
+//! the probe's, would never see a catalog provider: found on an AMD PC, 2026-11-13).
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -45,7 +48,7 @@ impl CatalogEp {
 }
 
 /// The catalog's providers, `ensure` naming the ones to make ready (download / install) first.
-pub fn list(runtime_dir: &Path, ensure: &dyn Fn(&str) -> bool) -> Result<Vec<CatalogEp>, String> {
+pub fn list(runtime_dir: &Path, ensure: &dyn Fn(&str, &Ready) -> bool) -> Result<Vec<CatalogEp>, String> {
     #[cfg(windows)]
     {
         win::list(&runtime_dir.join(DLL), ensure)
@@ -149,7 +152,7 @@ mod win {
 
     struct Ctx<'a> {
         api: &'a Api,
-        ensure: &'a dyn Fn(&str) -> bool,
+        ensure: &'a dyn Fn(&str, &Ready) -> bool,
         out: Vec<CatalogEp>,
     }
 
@@ -165,7 +168,7 @@ mod win {
             certified: i.certification == 1,
             ensure: None,
         };
-        if e.ready != Ready::Ready && (ctx.ensure)(&e.name) {
+        if e.ready != Ready::Ready && (ctx.ensure)(&e.name, &e.ready) {
             let hr = (ctx.api.ensure_ready)(ep);
             e.ensure = Some(if hr >= 0 { "ok".into() } else { format!("hresult 0x{:08x}", hr as u32) });
             let mut s = -1;
@@ -186,7 +189,7 @@ mod win {
         1 // continue
     }
 
-    pub fn list(dll: &Path, ensure: &dyn Fn(&str) -> bool) -> Result<Vec<CatalogEp>, String> {
+    pub fn list(dll: &Path, ensure: &dyn Fn(&str, &Ready) -> bool) -> Result<Vec<CatalogEp>, String> {
         unsafe {
             let api = api(dll)?;
             let mut cat: Catalog = std::ptr::null_mut();
