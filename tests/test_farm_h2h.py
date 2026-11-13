@@ -388,14 +388,14 @@ def test_cli_alternates_min_agent_and_gpu_lease_size(tmp_path, monkeypatch):
             FH.main(start + ['--name', 'bad'] + extra, client=cl)
     assert fake.calls == [] and not os.path.exists(os.path.join(sdir, 'h2h-bad'))
     rc = FH.main(start + ['--name', 'canary', '--no-wait', '--alt', ALT, '--min-agent', '0.2.10',
-                          '--gpu-games-per-lease', '64'], client=cl)
+                          '--gpu-games-per-lease', '64', '--gpu', 'required'], client=cl)
     assert rc == 0
     alts = [{'build_id': ALT, 'runtime': _sha(CUDA), 'when': {'vendor': 'nvidia'}}]
     puts = [json.loads(d) for m, p, d in fake.raw if m == 'PUT' and p == f'/v1/admin/run/{run}']
     assert len(puts) == 2 and all(x['min_agent'] == '0.2.10' and x['alternates'] == alts for x in puts)
     assert list(puts[1])[:6] == ['game', 'build_id', 'runtime', 'priority', 'min_agent', 'alternates']
     ev = puts[1]['eval']
-    assert ev['gpu_games_per_lease'] == 64 and ev['games_per_lease'] == 'auto'
+    assert ev['gpu_games_per_lease'] == 64 and ev['games_per_lease'] == 'auto' and ev['gpu'] == 'required'
     assert list(ev) == ['batch', 'games', 'checkpoints', 'games_per_lease', 'gpu_games_per_lease', 'gpu', 'needs', 'job']
     assert STUB.current(stub['state'], 'run', run)['doc']['builds'] == [BID, ALT]
     st = FH.load_state(os.path.join(sdir, run))
@@ -403,8 +403,8 @@ def test_cli_alternates_min_agent_and_gpu_lease_size(tmp_path, monkeypatch):
     FH.main(['--cancel', 'canary', '--state-dir', sdir], client=cl)
     last = json.loads([d for m, p, d in fake.raw if m == 'PUT' and p == f'/v1/admin/run/{run}'][-1])
     assert last['state'] == 'paused' and last['min_agent'] == '0.2.10' and last['alternates'] == alts
-    assert last['eval']['gpu_games_per_lease'] == 64
-    for extra in (['--min-agent', '0.2.11'], ['--gpu-games-per-lease', 'auto']):
+    assert last['eval']['gpu_games_per_lease'] == 64 and last['eval']['gpu'] == 'required'
+    for extra in (['--min-agent', '0.2.11'], ['--gpu-games-per-lease', 'auto'], ['--gpu', 'any']):
         with pytest.raises(SystemExit):
             FH.main(['--resume', 'canary', '--state-dir', sdir] + extra, client=cl)
     # 'auto' is a size too; the parse of a setting or flag

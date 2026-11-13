@@ -7,7 +7,7 @@ the readout zero.h2h gives on this machine, played by the farm's native workers.
       [--needs-ram-mb 1500] [--reference-batches NPZ ...] [--url https://farm.greggg230.com] [--no-wait]
       [--key <data key>] [--farm-release <farm-release.exe>] [--expires-days 30] [--defs-dir DIR]
       [--alt <alternate worker build_id> ...] [--alt-vendor nvidia|amd|intel] [--min-agent 0.2.10]
-      [--gpu-games-per-lease N|auto]
+      [--gpu-games-per-lease N|auto] [--gpu any|preferred|required]
   python -m zero.farm_h2h --resume NAME        (re-attach: poll, download, print the readout)
   python -m zero.farm_h2h --cancel NAME        (pause the run: its leases are cancelled at their next beat)
   (python -m <pkg>.az.farm_h2h ...: the game package registered; or --package <pkg>.az [--root <checkout>])
@@ -43,7 +43,9 @@ What it does:
    `--min-agent` (PROTOCOL rev 9): the run's `min_agent` - its leases go only to agents at or above it (a canary-only
    head-to-head: 0.2.10); `--gpu-games-per-lease` (rev 11, 9.4): the eval batch's `gpu_games_per_lease` (the games
    of a GPU lease, `auto` or a number). Each goes into every PUT of the run only when given (otherwise the body is
-   as before), kept in state.json like the alternates.
+   as before), kept in state.json like the alternates. `--gpu` (PROTOCOL 8, rev 7): the eval batch's `gpu` routing
+   setting (default `any`, as before); `required` keeps the head-to-head on PCs GPU-eligible for it - with a CUDA
+   alternate and a CPU-only default pack, only the PCs that take the alternate. Kept in state.json too.
 4. It polls `GET /v1/admin/run/<run>/results`, downloads each eval file (first copy of a game id wins;
    `dup_ids` skipped), acks what it saved, and prints a progress line; at the end the readout: A's score +- its
    standard error (pair-aware: the se of the pair scores), the Elo difference with its 95% interval, the games,
@@ -371,7 +373,7 @@ def run_body(st, eval_on=True):
         ev = {'batch': st['batch'], 'games': st['games'], 'checkpoints': [1, 2], 'games_per_lease': st['games_per_lease']}
         if st.get('gpu_games_per_lease') is not None:
             ev['gpu_games_per_lease'] = st['gpu_games_per_lease']
-        ev.update(gpu='any', needs=st['needs'], job=eval_job(st))
+        ev.update(gpu=st.get('gpu') or 'any', needs=st['needs'], job=eval_job(st))
         b['eval'] = ev
     return b
 
@@ -647,6 +649,9 @@ def main(argv=None, client=None):
     ap.add_argument('--gpu-games-per-lease', metavar='N|auto',
                     help="the eval batch's gpu_games_per_lease (PROTOCOL rev 11, 9.4): the games of a GPU lease; "
                     'default: left out (GPU leases sized as before)')
+    ap.add_argument('--gpu', choices=('any', 'preferred', 'required'),
+                    help="the eval batch's gpu routing setting (PROTOCOL 8): required = only PCs GPU-eligible for it "
+                    '(with a CUDA alternate and a CPU default pack: the PCs that take the alternate); default any')
     a = ap.parse_args(argv)
     if a.min_agent is not None and not FD.SEMVER_RE.match(a.min_agent):
         ap.error(f'--min-agent {a.min_agent!r}: a version like 0.2.10')
@@ -664,8 +669,8 @@ def main(argv=None, client=None):
     if a.alt_vendor and not a.alt:
         ap.error('--alt-vendor: with --alt (the alternates it applies to)')
     if a.resume or a.cancel:
-        if a.alt or a.min_agent is not None or a.gpu_games_per_lease is not None:
-            ap.error('--alt, --alt-vendor, --min-agent, --gpu-games-per-lease: only when a head-to-head starts (--resume '
+        if a.alt or a.min_agent is not None or a.gpu_games_per_lease is not None or a.gpu is not None:
+            ap.error('--alt, --alt-vendor, --min-agent, --gpu-games-per-lease, --gpu: only when a head-to-head starts (--resume '
                      'and --cancel keep what it started with)')
         name = a.resume or a.cancel
         run = name if name.startswith('h2h-') else f'h2h-{name}'
@@ -728,7 +733,7 @@ def main(argv=None, client=None):
           'games_per_lease': gpl, 'needs': {'threads': a.needs_threads, 'ram_mb': a.needs_ram_mb}, 'batch': 'h2h',
           'settings': cfg, 'select': _tag(FE.seat_dicts(cfg, [{'net': 1}, {'net': 2}])[0]), 'gens': gens,
           'created': time.time(), 'cursor': 0, 'build_game': build_game, 'alternates': alternates,
-          'min_agent': a.min_agent, 'gpu_games_per_lease': gpu_per_lease}
+          'min_agent': a.min_agent, 'gpu_games_per_lease': gpu_per_lease, 'gpu': a.gpu or 'any'}
     save_state(d, st)
     setup(cl, d, st, log, opts)
     if a.no_wait:
