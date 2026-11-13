@@ -226,6 +226,8 @@ def test_the_pool_publishes_ingests_counts_and_holds(pool):
         assert fake.runs[FARM]['selfplay']['max_stale'] == 1 and fake.runs[FARM]['selfplay']['quota'] == 24
         first_put = next(b for m, p, b in fake.calls if m == 'PUT' and p == f'/v1/admin/run/{FARM}')
         assert first_put['selfplay'] is None, 'no self-play before a definition signs a gen'
+        # (zero-farm PROTOCOL rev 9: the farm run's leases go only to agents that take its template)
+        assert all(b['min_agent'] == '0.2.8' for m, p, b in fake.calls if m == 'PUT' and p == f'/v1/admin/run/{FARM}')
         # this machine plays 4 of the iteration's 24 games itself
         assert rp.accept_local(1, 4) == 4
         by = {gid: (t, sd) for gid, t, sd in games}

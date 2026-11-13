@@ -302,11 +302,13 @@ DEFAULTS = dict(
     # coordinator ('' = zero.farm_def.URL), the generations a farm game may lag (accepted into iteration i while
     # its network >= i - 1 - pool_max_stale), the coordinator's quota per generation (0 = games) and slack, games
     # per lease ('auto' or n), the run's priority on the farm, the RAM a lease needs (0 = the coordinator's
-    # default), seconds between result polls, the data key and farm-release ('' = zero.farm_def's), and the
-    # definitions' expiry in days (0 = never)
+    # default), seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the
+    # definitions' expiry in days (0 = never), and the oldest farm agent the run's leases may go to (zero-farm
+    # PROTOCOL rev 9; '' = none: 0.2.8 is the first agent that takes records' templates naming split or
+    # double-faced cards, rev 8)
     pool_build='', pool_runtime='', pool_worker='', pool_url='', pool_max_stale=1, pool_quota=0, pool_slack=0.1,
     pool_games_per_lease='auto', pool_priority=1.0, pool_needs_ram_mb=0, pool_poll_s=10.0, pool_key='',
-    pool_farm_release='', pool_expires_days=30,
+    pool_farm_release='', pool_expires_days=30, pool_min_agent='0.2.8',
     # with selfplay_local 0, the pool counts as a remote taking work while a valid game arrived within this many
     # seconds (this machine then only trains; when the farm goes quiet it plays again: the run never stalls)
     pool_live_s=900.0,

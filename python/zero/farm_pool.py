@@ -35,13 +35,16 @@ Settings (zero.run DEFAULTS, docs/az.md 45): `pool_build` (the worker build id, 
 build), `pool_worker` (that build's signed executable on this machine: its `check-config` picks the template's
 settings), `pool_url` (default zero.farm_def.URL), `pool_max_stale`, `pool_quota`, `pool_slack`,
 `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key` (the data key; default
-zero.farm_def's), `pool_farm_release` (farm-release; default zero.farm_def's), `pool_expires_days`. The admin token as
+zero.farm_def's), `pool_farm_release` (farm-release; default zero.farm_def's), `pool_expires_days`, `pool_min_agent`
+(the farm run's `min_agent`, zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; default 0.2.8, the
+first agent that accepts a template naming a split or double-faced card; '' = none). The admin token as
 the farm tools read it (zero.farm_def.read_token). State: `<run>/pool/<farm run>/state.json`.
 """
 import gzip
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -50,6 +53,8 @@ from collections import deque
 from . import farm_def as FD
 
 PREFIX = 'pool:'
+# (as the coordinator checks a version: zero-farm coordinator util.ts)
+SEMVER_RE = re.compile(r'^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,64})?$')
 PAGE = 200                          # results per GET
 
 
@@ -152,6 +157,9 @@ class Pool:
         self.key = str(setting('pool_key') or '') or None
         self.farm_release = str(setting('pool_farm_release') or '') or None
         self.expires_days = setting('pool_expires_days')
+        self.min_agent = str(setting('pool_min_agent') or '').strip() or None
+        if self.min_agent and not SEMVER_RE.match(self.min_agent):
+            raise SystemExit(f'selfplay_remote {name!r}: pool_min_agent {self.min_agent!r} is not a version like 0.2.8')
         self.client = client or FD.Client(self.url)
         self.exporter = exporter or self._export
         self.definer = definer or self._define
@@ -283,7 +291,7 @@ class Pool:
         if self.needs_ram:
             sp['needs'] = {'ram_mb': self.needs_ram}
         return {'game': self.R.cfg['game'], 'build_id': self.build, 'runtime': self.runtime, 'priority': self.priority,
-                'selfplay': sp, 'eval': None, 'state': 'active'}
+                'min_agent': self.min_agent, 'selfplay': sp, 'eval': None, 'state': 'active'}
 
     def _publish(self, gen):
         """Gen `gen` (checkpoint `gen`) exported, uploaded, signed into a new definition version and registered
@@ -304,7 +312,8 @@ class Pool:
             self.client.call('PUT', f'/v1/admin/run/{self.farm}', body=body)
             st['run_put'] = True
             self._save()
-            self.log(f'farm run {self.farm} created (worker build {self.build}, runtime {self.runtime})')
+            self.log(f'farm run {self.farm} created (worker build {self.build}, runtime {self.runtime}, '
+                     f'min_agent {self.min_agent or "none"})')
         g = st['gens'].setdefault(str(gen), {})
         if not g.get('model'):
             ckpt = model_path(self.R.run, gen)

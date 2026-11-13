@@ -541,6 +541,10 @@
    "class": "trainer",
    "why": "orchestration (the farm pool, docs/az.md 45)"
   },
+  "pool_min_agent": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 45)"
+  },
   "selfplay_local": {
    "class": "trainer",
    "why": "orchestration"
