@@ -49,12 +49,16 @@ def features(B, g):
     x[:, 6:18] = 0
     x[torch.arange(B), 6 + torch.randint(12, (B,), generator=g)] = 1.0
     x[:, 19:43] = torch.randint(0, 3, (B, 24), generator=g).float() * 0.25
+    # each row's units have distinct identities (a permutation of the 12), as a real game's objects do: two present
+    # units with one identity would score the same identity action twice, a scatter to one slot with two values,
+    # which ONNX leaves undefined (the CPU keeps the last write, GPU providers any; zero-farm AMD/CUDA work)
+    ids = torch.stack([torch.randperm(12, generator=g) for _ in range(B)])
     for s in range(12):
         o = 43 + 9 * s
         x[:, o] = (torch.rand(B, generator=g) < 0.5).float()
         x[:, o + 1:o + 8] = 0
-        x[torch.arange(B), o + 1 + torch.randint(3, (B,), generator=g)] = 1.0
-        x[torch.arange(B), o + 4 + torch.randint(4, (B,), generator=g)] = 1.0
+        x[torch.arange(B), o + 1 + ids[:, s] // 4] = 1.0
+        x[torch.arange(B), o + 4 + ids[:, s] % 4] = 1.0
     for s in range(3):
         o = 151 + 4 * s
         x[:, o + 3] = (torch.rand(B, generator=g) < 0.7).float()

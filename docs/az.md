@@ -6748,6 +6748,42 @@ from `tools/onnx_probe_graph.py`: every operator of eoe1's and Delver's graphs) 
 **Tests and checks.** `cargo test -p zero_worker`; measured on an RTX 5090, an Intel UHD 770 and an RTX 4070 Ti
 (Windows 10): zero-farm-notes phase4-gpu.md (DirectML and CUDA pass; TensorRT-RTX 1.2 refuses both packings).
 
+### 44.5 The probe's graph variants: one round trip to a PC we can't reach (no setting; zero-farm AMD GPU work, 2026-11-12)
+
+**Why.** Windows ML's AMD GPU providers (AMDGPUExecutionProvider 1.8.65 and the deprecated MIGraphX one) install on a
+friend's RX 9070 XT and then fail on the probe graph (`hipMemcpyWithStream(output_data, gpu_resource.data(),
+resource_shape.bytes(), DeviceToDevice)`: "invalid argument" - the copy ONNX Runtime's MIGraphX provider makes for the
+partition outputs MIGraphX did not bind as `#output_N` program parameters), and DirectML passes there at a tenth of the
+CPU's speed. That PC is reached only through canary builds and the agent's probe: each question costs a release and a
+friend's day, so one build has to answer many.
+
+**What it does.** A diagnostic worker build embeds a variants archive: `ZERO_PROBE_VARIANTS=<variants.npz>` when it
+is built (`crates/worker/build.rs`); `tools/onnx_probe_variants.py OUT.npz [--net NAME=MODEL,rows=REF[,static=1]...]`
+makes it. It is never committed (it may hold real networks). `probe-providers` then runs, after its own report (logged
+first), every variant on every provider the runtime pack offers (`probe_variants.rs`): each (group, provider) in a
+child process (`probe-variant`; a provider that crashes the process costs one variant and the child is started again),
+one worker-log line per variant as it finishes, the whole set under `--variants-deadline` (780 s of the agent's 900).
+The probe's verdict (`providers`, `results`) is unchanged; the variants go under `variants`. Kinds:
+* `raw`: any graph with its inputs and expected outputs (ONNX Runtime's CPU answers made with the archive): micro graphs
+  each testing one way a provider can mishandle an output (an alias of an input, a constant or Shape output, broadcast /
+  transposed / reshaped views, an empty output or batch, a scalar, int64 / int32 / bool outputs, chained outputs), one
+  operator each as our graphs use them, the probe graph cut after 1/8 ... 8/8 of its nodes (outputs = the tensors
+  crossing the cut) on its 1, 7, 64 and 120-row reference batches, the whole graph at lower graph optimisation levels,
+  and an `ORT_MIGRAPHX_DUMP_MODEL_OPS` run whose partition files are read back (inputs, outputs);
+* `net`: a zero-onnx/1 graph on real rows (a reference set cycled to batches of 4 ... 1,024): a GPU provider's answers
+  against the CPU's on the same graph (max abs per output, twice bit-identical) and rows/s per batch size, the CPU at
+  1/2/4/8 threads; `static` = one session per batch size with free-dimension overrides `B`, `B + 1`, `nnz` and the batch
+  padded by one dummy row carrying the padding non-zeros (feature 0, value 0); the job's own networks are taken from the
+  agent's cache (`<root>\cache\ckpt\<run>\<gen>\`, the newest gen of each run).
+`session::variant_session` binds a provider exactly as the factory does (the same session options; dimension overrides
+and an optimisation level on top).
+
+**Off by default.** Without `ZERO_PROBE_VARIANTS` at build time nothing is embedded and `probe-providers` runs as before.
+
+**Tests and checks.** `cargo test -p zero_worker probe_variants` (npy round trip incl. 0-d / empty / bool, the static
+batch's dummy row, NaN handling, the log line); a local run on the desktop (Windows ML pack, CPU + DirectML on the RTX
+5090 and the UHD 770): 141 results in 47 s, every micro graph and cut passing on DirectML.
+
 ## 45. Self-play records and the farm pool (`pool:<farm run>` in `selfplay_remote`, `pool_*`; zero-farm phase 3, 2026-11-12)
 
 ### 45.1 Why
