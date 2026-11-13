@@ -17,18 +17,21 @@
 //! (the `DriverCfg` a `SearchDriver` would get, as text: a diagnostic) and `MAX_SEATS`.
 use std::sync::OnceLock;
 
-use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyString, PyTuple};
 use serde_json::{Map, Value};
 
-use zero_search::driver::{noresign_pick, root_floor, sample_arrays, view_pick, Batch, DriverCfg, Record, Select, BELIEF_CLIP};
+use zero_search::driver::{noresign_pick, root_floor, sample_arrays_rows, view_pick, Batch, DriverCfg, Record, Select, BELIEF_CLIP};
 use zero_search::settings::{self, DriverArgs};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
 use zero_search::lookahead::{LookCfg, Outcome};
 use zero_search::record::Replayed;
+use zero_search::tail::TailRow;
 use zero_search::{SearchGame, MAX_SEATS};
+
+mod pack;
 
 /// For `engine_module!` (the game crate needs its own `pyo3` dependency too: the PyO3 macros
 /// refer to `::pyo3`).
@@ -95,6 +98,8 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(completed_q_policy_of, m)?)?;
     m.add_function(wrap_pyfunction!(replay_rows, m)?)?;
     m.add_function(wrap_pyfunction!(game_seed_of, m)?)?;
+    m.add_function(wrap_pyfunction!(pack_sparse_tokens, m)?)?;
+    m.add_function(wrap_pyfunction!(pack_tail_tokens, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
     m.add("BELIEF_CLIP", BELIEF_CLIP)?;
     Ok(())
@@ -238,6 +243,20 @@ fn info_dict<'py>(py: Python<'py>, i: &GameInfo) -> PyResult<Bound<'py, PyDict>>
     d.set_item("max_seats", MAX_SEATS)?;
     d.set_item("aux_layout", i.aux.clone())?;
     d.set_item("aux_width", i.aux.iter().map(|s| s.1).sum::<usize>())?;
+    // variable-length rows (docs/search.md 1.4): empty / False / None / 0 for a game without them
+    let tails = PyList::empty(py);
+    for t in &i.tails {
+        let td = PyDict::new(py);
+        td.set_item("seg", t.seg)?;
+        td.set_item("name", t.name)?;
+        td.set_item("width", t.width)?;
+        td.set_item("head", t.head)?;
+        tails.append(td)?;
+    }
+    d.set_item("tails", tails)?;
+    d.set_item("option_pointers", i.option_pointers)?;
+    d.set_item("max_row_tokens", i.max_row_tokens)?;
+    d.set_item("head_tokens", i.head_tokens)?;
     Ok(d)
 }
 
@@ -293,6 +312,75 @@ fn completed_q_policy_of(p0: Vec<f32>, n: Vec<u32>, w: Vec<f64>, v: f64, c_visit
         return Err(PyValueError::new_err(format!("completed_q_policy: {} priors, {} visit counts, {} value sums", p0.len(), n.len(), w.len())));
     }
     Ok(zero_search::tree::completed_q_policy_w(&p0, &n, &w, v, c_visit, c_scale, prior_w))
+}
+
+fn contiguous<T>(r: Result<T, numpy::NotContiguousError>, what: &str) -> PyResult<T> {
+    r.map_err(|_| PyValueError::new_err(format!("{what}: a contiguous array")))
+}
+
+/// A token network's sparse batch packed for its CUDA graphs, off the GIL (`pack::sparse`; `zero.infer.TokenGraphRunner`,
+/// docs/az.md 43.12): the non-zeros' flat indexes and values into `fi` / `val`, each row's tokens into `ntok`
+/// (padding rows 1), the token positions into `full` (row stride Tp), the head presence into `pres` when given ->
+/// (Tp, the longest row's tokens); Tp = 0 when a row is longer than `long_t` (>= 0).
+#[pyfunction]
+#[pyo3(signature = (xs_off, xs_idx, xs_val, nfeat, flag_col, base, t_off, long_t, t_step, fi, val, ntok, full, pres=None))]
+#[allow(clippy::too_many_arguments)]
+fn pack_sparse_tokens(
+    py: Python<'_>,
+    xs_off: PyReadonlyArray1<'_, i64>,
+    xs_idx: PyReadonlyArray1<'_, u32>,
+    xs_val: PyReadonlyArray1<'_, f32>,
+    nfeat: usize,
+    flag_col: PyReadonlyArray1<'_, i64>,
+    base: PyReadonlyArray1<'_, bool>,
+    t_off: Option<PyReadonlyArray1<'_, i64>>,
+    long_t: i64,
+    t_step: usize,
+    mut fi: PyReadwriteArray1<'_, i64>,
+    mut val: PyReadwriteArray1<'_, f32>,
+    mut ntok: PyReadwriteArray1<'_, i64>,
+    mut full: PyReadwriteArray1<'_, i64>,
+    mut pres: Option<PyReadwriteArray1<'_, bool>>,
+) -> PyResult<(usize, usize)> {
+    let (a, i, v) = (contiguous(xs_off.as_slice(), "xs_off")?, contiguous(xs_idx.as_slice(), "xs_idx")?, contiguous(xs_val.as_slice(), "xs_val")?);
+    let (fc, bs) = (contiguous(flag_col.as_slice(), "flag_col")?, contiguous(base.as_slice(), "base")?);
+    let t = match &t_off {
+        Some(t) => Some(contiguous(t.as_slice(), "t_off")?),
+        None => None,
+    };
+    let (fo, vo) = (contiguous(fi.as_slice_mut(), "fi")?, contiguous(val.as_slice_mut(), "val")?);
+    let (no, uo) = (contiguous(ntok.as_slice_mut(), "ntok")?, contiguous(full.as_slice_mut(), "full")?);
+    let po = match pres.as_mut() {
+        Some(p) => Some(contiguous(p.as_slice_mut(), "pres")?),
+        None => None,
+    };
+    py.allow_threads(move || pack::sparse(a, i, v, nfeat, fc, bs, t, long_t, t_step, fo, vo, no, uo, po)).map_err(verr)
+}
+
+/// A batch's tail tokens padded for a graph of `ntp` entries, off the GIL (`pack::tail`, docs/az.md 43.12): rows,
+/// segments, slots into `tint` [3 * ntp], the floats into `tval` [ntp * wt], with TokenGraphRunner's checks.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn pack_tail_tokens(
+    py: Python<'_>,
+    t_off: PyReadonlyArray1<'_, i64>,
+    t_seg: PyReadonlyArray1<'_, u16>,
+    t_slot: PyReadonlyArray1<'_, u32>,
+    t_val: PyReadonlyArray1<'_, f32>,
+    width: PyReadonlyArray1<'_, i64>,
+    net_tail: PyReadonlyArray1<'_, bool>,
+    head: PyReadonlyArray1<'_, i64>,
+    wt: usize,
+    ntp: usize,
+    pad_seg: i64,
+    pad_slot: i64,
+    mut tint: PyReadwriteArray1<'_, i64>,
+    mut tval: PyReadwriteArray1<'_, f32>,
+) -> PyResult<()> {
+    let (o, s, l, v) = (contiguous(t_off.as_slice(), "t_off")?, contiguous(t_seg.as_slice(), "t_seg")?, contiguous(t_slot.as_slice(), "t_slot")?, contiguous(t_val.as_slice(), "t_val")?);
+    let (w, nt, h) = (contiguous(width.as_slice(), "width")?, contiguous(net_tail.as_slice(), "net_tail")?, contiguous(head.as_slice(), "head")?);
+    let (ti, tv) = (contiguous(tint.as_slice_mut(), "tint")?, contiguous(tval.as_slice_mut(), "tval")?);
+    py.allow_threads(move || pack::tail(o, s, l, v, w, nt, h, wt, ntp, pad_seg, pad_slot, ti, tv)).map_err(verr)
 }
 
 /// A lookahead's settings checked (docs/search.md 3.9; a dict or its JSON) -> their canonical JSON
@@ -432,8 +520,19 @@ impl PyGame {
         let t: Vec<(String, f64)> = tilts.unwrap_or_default().into_iter().collect();
         self.g.determinize_with(viewer, seed, p, tilt, clip, &t).map_err(verr)
     }
-    fn encode<'py>(&self, py: Python<'py>, viewer: usize) -> Bound<'py, numpy::PyArray1<f32>> {
-        self.g.encode(viewer).into_pyarray(py)
+    /// The head (`NUM_FEATURES` floats); ValueError for a state whose row has a tail (R1: use `encode_row`).
+    fn encode<'py>(&self, py: Python<'py>, viewer: usize) -> PyResult<Bound<'py, numpy::PyArray1<f32>>> {
+        Ok(self.g.encode(viewer).map_err(verr)?.into_pyarray(py))
+    }
+    /// (head f32 [F], {'t_seg': u16 [NT], 't_slot': u32 [NT], 't_val': f32 [...]}): the row with its sealed tail
+    /// (docs/search.md 1.4).
+    fn encode_row<'py>(&self, py: Python<'py>, viewer: usize) -> PyResult<(Bound<'py, numpy::PyArray1<f32>>, Bound<'py, PyDict>)> {
+        let (x, t) = self.g.encode_row(viewer);
+        Ok((x.into_pyarray(py), tail_dict(py, t)?))
+    }
+    /// (ov_opt int32 [NO], ov_tok int64 [NO]): `viewer`'s pointer overrides against `legal()` (docs/search.md 2.15).
+    fn option_overrides<'py>(&self, py: Python<'py>, viewer: usize) -> (Bound<'py, numpy::PyArray1<i32>>, Bound<'py, numpy::PyArray1<i64>>) {
+        ov_arrays(py, &self.g.option_overrides(viewer))
     }
     fn export_state(&self) -> String {
         self.g.export_state()
@@ -466,6 +565,22 @@ impl PyGame {
     }
 }
 
+/// A sealed row tail as `Game.encode_row`'s dict {'t_seg' u16, 't_slot' u32, 't_val' f32} (docs/search.md 2.15).
+fn tail_dict(py: Python<'_>, t: TailRow) -> PyResult<Bound<'_, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("t_seg", t.seg.into_pyarray(py))?;
+    d.set_item("t_slot", t.slot.into_pyarray(py))?;
+    d.set_item("t_val", t.val.into_pyarray(py))?;
+    Ok(d)
+}
+
+/// A row's pointer overrides as `Game.option_overrides`' (ov_opt int32 [NO], ov_tok int64 [NO]).
+fn ov_arrays<'py>(py: Python<'py>, ov: &[(u32, i64)]) -> (Bound<'py, numpy::PyArray1<i32>>, Bound<'py, numpy::PyArray1<i64>>) {
+    let opt: Vec<i32> = ov.iter().map(|o| o.0 as i32).collect();
+    let tok: Vec<i64> = ov.iter().map(|o| o.1).collect();
+    (opt.into_pyarray(py), tok.into_pyarray(py))
+}
+
 impl PyGame {
     fn not_deferred(&self, what: &str) -> PyResult<()> {
         if self.g.deferred() {
@@ -496,10 +611,29 @@ impl PySearchTree {
     /// `root_view` (docs/search.md 3.6): a 4-tuple, the 4th the leaf's features from the tree's
     /// viewer (the root decider) when another seat decides it, else None; `expand` then takes the
     /// value and margin of those features (relative to the viewer), the priors of the decider's.
-    #[pyo3(signature = (game, c_puct, chance_k=0, margin_w=0.0, root_view=false))]
-    fn simulate<'py>(&mut self, py: Python<'py>, game: &PyGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool) -> PyResult<Option<Bound<'py, pyo3::types::PyTuple>>> {
-        match self.t.simulate(&*game.g, c_puct, chance_k, margin_w, root_view).map_err(rerr)? {
+    /// `rows` (docs/search.md 2.15): a 5-tuple (decider, features, legal actions, the viewer's features or None,
+    /// rows), `rows` None for a game without tail segments or pointer overrides, else (tail, ov, vtail): the
+    /// decider's row's tail {'t_seg', 't_slot', 't_val'} (`Game.encode_row`'s; None without tail segments), its
+    /// overrides (ov_opt int32, ov_tok int64) against the leaf's options (`Game.option_overrides`'; None without
+    /// pointer overrides) and the viewer's value-only row's tail (None without one). Required for a game with
+    /// them (RuntimeError otherwise: a head-only caller never drops them).
+    #[pyo3(signature = (game, c_puct, chance_k=0, margin_w=0.0, root_view=false, rows=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn simulate<'py>(&mut self, py: Python<'py>, game: &PyGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool, rows: bool) -> PyResult<Option<Bound<'py, pyo3::types::PyTuple>>> {
+        match self.t.simulate(&*game.g, c_puct, chance_k, margin_w, root_view, rows).map_err(rerr)? {
             None => Ok(None),
+            Some(l) if rows => {
+                let r: Option<PyObject> = match l.rows {
+                    None => None,
+                    Some(lr) => {
+                        let tail = lr.tail.map(|t| tail_dict(py, t)).transpose()?;
+                        let ov = lr.ov.map(|ov| ov_arrays(py, &ov));
+                        let vtail = lr.vtail.map(|t| tail_dict(py, t)).transpose()?;
+                        Some((tail, ov, vtail).into_pyobject(py)?.into_any().unbind())
+                    }
+                };
+                Ok(Some((l.player, l.x.into_pyarray(py), l.acts, l.vx.map(|v| v.into_pyarray(py)), r).into_pyobject(py)?))
+            }
             Some(l) if root_view => Ok(Some((l.player, l.x.into_pyarray(py), l.acts, l.vx.map(|v| v.into_pyarray(py))).into_pyobject(py)?)),
             Some(l) => Ok(Some((l.player, l.x.into_pyarray(py), l.acts).into_pyobject(py)?)),
         }
@@ -732,7 +866,7 @@ impl PySearchTree {
 /// The `DriverCfg` of `SearchDriver(game, seats, ...)`'s arguments (the seat dicts parsed, the
 /// distinct seats de-duplicated into one table).
 #[allow(clippy::too_many_arguments)]
-fn driver_cfg(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>) -> PyResult<DriverCfg> {
+fn driver_cfg(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>, max_row_tokens: Option<usize>) -> PyResult<DriverCfg> {
     let spec = spec_json(spec)?;
     let mut games = Vec::with_capacity(seats.len());
     for g in seats.iter() {
@@ -741,7 +875,7 @@ fn driver_cfg(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concur
     }
     let branch = branch.map(|b| to_json(b.as_any())).transpose()?;
     let starts = starts.map(starts_json).transpose()?;
-    let args = DriverArgs { spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse };
+    let args = DriverArgs { spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, max_row_tokens };
     settings::driver_cfg(&games, branch.as_ref(), starts.as_ref(), args).map_err(verr)
 }
 
@@ -750,10 +884,10 @@ fn driver_cfg(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concur
 /// the distinct seats in one table. zero-farm's settings tools compare it across parsers and with the
 /// native worker's (docs/az.md 44).
 #[pyfunction]
-#[pyo3(signature = (seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None))]
+#[pyo3(signature = (seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None, max_row_tokens=None))]
 #[allow(clippy::too_many_arguments)]
-fn driver_settings(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>) -> PyResult<String> {
-    let cfg = driver_cfg(seats, spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts)?;
+fn driver_settings(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>, max_row_tokens: Option<usize>) -> PyResult<String> {
+    let cfg = driver_cfg(seats, spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts, max_row_tokens)?;
     Ok(format!("{cfg:#?}"))
 }
 
@@ -767,18 +901,34 @@ fn driver_settings(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, c
 pub struct PySearchDriver {
     d: Box<dyn DynDriver>,
     nfeat: usize,
+    /// The game declares tail segments / pointer overrides (docs/search.md 2.15): the batches, samples and stats
+    /// carry their keys.
+    rows: RowKinds,
+}
+
+/// Which variable-length arrays a game's batches and samples carry (docs/search.md 2.15).
+#[derive(Clone, Copy)]
+struct RowKinds {
+    tails: bool,
+    pointers: bool,
+}
+
+impl RowKinds {
+    fn of(i: &GameInfo) -> RowKinds {
+        RowKinds { tails: !i.tails.is_empty(), pointers: i.option_pointers }
+    }
 }
 
 #[pymethods]
 impl PySearchDriver {
     #[new]
-    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None))]
+    #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None, max_row_tokens=None))]
     #[allow(clippy::too_many_arguments)]
-    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        let cfg = driver_cfg(seats, spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts)?;
+    fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>, max_row_tokens: Option<usize>) -> PyResult<Self> {
+        let cfg = driver_cfg(seats, spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts, max_row_tokens)?;
         let d = new_driver(game, cfg).map_err(verr)?;
-        let nfeat = d.info().num_features;
-        Ok(PySearchDriver { d, nfeat })
+        let info = d.info();
+        Ok(PySearchDriver { d, nfeat: info.num_features, rows: RowKinds::of(&info) })
     }
 
     /// (id, key, kind, arrays) with kind 'nn' | 'ext', or None when every game has finished
@@ -798,8 +948,9 @@ impl PySearchDriver {
     /// Network evaluation of batch `id`: priors f32 [options], value / margin f32 [B, MAX_SEATS];
     /// `aux` f32 [belief rows, aux_width]: the auxiliary outputs of its root belief rows (`extra` ==
     /// ROW_BELIEF, docs/search.md 3.8), in row order - required when it has some.
+    /// Releases the GIL while it hands the answers over (docs/az.md 43.12).
     #[pyo3(signature = (id, priors, value, margin, aux=None))]
-    fn submit(&mut self, id: u64, priors: PyReadonlyArray1<'_, f32>, value: PyReadonlyArray2<'_, f32>, margin: PyReadonlyArray2<'_, f32>, aux: Option<PyReadonlyArray2<'_, f32>>) -> PyResult<()> {
+    fn submit(&mut self, py: Python<'_>, id: u64, priors: PyReadonlyArray1<'_, f32>, value: PyReadonlyArray2<'_, f32>, margin: PyReadonlyArray2<'_, f32>, aux: Option<PyReadonlyArray2<'_, f32>>) -> PyResult<()> {
         if value.shape()[1] != MAX_SEATS || margin.shape()[1] != MAX_SEATS {
             return Err(PyValueError::new_err(format!("value / margin must be [B, {MAX_SEATS}]")));
         }
@@ -810,7 +961,8 @@ impl PySearchDriver {
             Some(a) => a.as_slice().map_err(|e| PyValueError::new_err(format!("aux: {e}")))?,
             None => &[],
         };
-        self.d.submit(id, p, v, m, a).map_err(verr)
+        let d = &mut self.d;
+        py.allow_threads(move || d.submit(id, p, v, m, a)).map_err(verr)
     }
 
     /// Answers of external batch `id`: one payload string per request.
@@ -905,13 +1057,13 @@ impl PySearchDriver {
         if a != recs.len() {
             return Err(rerr(format!("{} samples left over after the finished games", recs.len() - a)));
         }
-        let s = samples_dict(py, recs, self.nfeat)?;
+        let s = samples_dict(py, recs, self.nfeat, self.rows)?;
         Ok((out, texts, s))
     }
 
     /// Training sample arrays (docs/search.md 2.4) or None.
     fn take_samples(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        samples_dict(py, self.d.take_samples(), self.nfeat)
+        samples_dict(py, self.d.take_samples(), self.nfeat, self.rows)
     }
 
     /// The training records as the driver holds them, or None (docs/search.md 2.4): take_samples
@@ -923,7 +1075,7 @@ impl PySearchDriver {
         if recs.is_empty() {
             return None;
         }
-        Some(PySampleRecords::new(recs, self.nfeat))
+        Some(PySampleRecords::new(recs, self.nfeat, self.rows))
     }
 
     /// Throughput counters.
@@ -977,6 +1129,13 @@ impl PySearchDriver {
         d.set_item("starts", s.starts)?;
         d.set_item("value_choices", s.value_choices)?;
         d.set_item("value_choice_rows", s.value_choice_rows)?;
+        if self.rows.tails {
+            // variable-length rows (docs/search.md 2.15; only a game with tail segments)
+            d.set_item("tail_rows", s.tail_rows)?;
+            d.set_item("tail_tokens", s.tail_tokens)?;
+            d.set_item("tail_max", s.tail_max)?;
+            d.set_item("aborted_row_tokens", s.aborted_row_tokens)?;
+        }
         if s.look.decisions > 0 {
             // the lookahead seats' counters (docs/search.md 3.9; only a driver with lookahead decisions)
             let l = &s.look;
@@ -1021,12 +1180,12 @@ impl PySearchDriver {
 /// take_samples' dict of `recs` (docs/search.md 2.4), None if there are none: the arrays built and
 /// the records freed off the GIL. `SearchDriver.take_samples` and `SampleRecords.arrays` (one
 /// conversion for both).
-fn samples_dict(py: Python<'_>, recs: Vec<Record>, f: usize) -> PyResult<Option<PyObject>> {
+fn samples_dict(py: Python<'_>, recs: Vec<Record>, f: usize, rows: RowKinds) -> PyResult<Option<PyObject>> {
     if recs.is_empty() {
         return Ok(None);
     }
     let s = py.allow_threads(move || {
-        let s = sample_arrays(&recs, f);
+        let s = sample_arrays_rows(&recs, f, rows.tails, rows.pointers);
         drop(recs);
         s
     });
@@ -1046,13 +1205,26 @@ fn samples_dict(py: Python<'_>, recs: Vec<Record>, f: usize) -> PyResult<Option<
         // the auxiliary targets (a driver created with aux=True; docs/search.md 1.2)
         a.set_item("aux", s.aux.into_pyarray(py).reshape([n, s.aw])?)?;
     }
+    if s.tails {
+        // variable-length rows (docs/search.md 2.15): the records' tail CSR (n + 1 offsets)
+        a.set_item("t_off", s.t_off.into_pyarray(py))?;
+        a.set_item("t_seg", s.t_seg.into_pyarray(py))?;
+        a.set_item("t_slot", s.t_slot.into_pyarray(py))?;
+        a.set_item("t_val", s.t_val.into_pyarray(py))?;
+    }
+    if s.pointers {
+        a.set_item("ov_off", s.ov_off.into_pyarray(py))?;
+        a.set_item("ov_opt", s.ov_opt.into_pyarray(py))?;
+        a.set_item("ov_tok", s.ov_tok.into_pyarray(py))?;
+    }
     Ok(Some(a.into_any().unbind()))
 }
 
 /// One game record replayed (docs/search.md 2.17, zero-farm's self-play records: `zero_search::record`): game
 /// `game` with spec `spec` (JSON text), `record` one game's record (JSON text), `aux` its rows carry the
 /// auxiliary targets -> (the rows as `take_samples` gives them - None for a game without samples -, the game's
-/// facts {gid, n, seed, over, aborted, resigned, result, rounds, steps, setup, rows}). A record replay refuses
+/// facts {gid, n, seed, over, aborted, resigned, result, rounds, steps, setup, rows; abort_reason for a game the
+/// driver aborted at its row limit}). A record replay refuses
 /// raises ValueError with the reason (the record is rejected whole).
 #[pyfunction]
 #[pyo3(signature = (game, spec, record, aux=false))]
@@ -1067,13 +1239,17 @@ fn replay_rows(py: Python<'_>, game: &str, spec: &str, record: &str, aux: bool) 
     info.set_item("over", rp.over)?;
     info.set_item("aborted", rp.aborted)?;
     info.set_item("resigned", rp.resigned)?;
+    if let Some(why) = rp.abort_reason {
+        // the driver aborted the game at its row limit (docs/search.md 2.15): no samples of its own
+        info.set_item("abort_reason", why)?;
+    }
     info.set_item("result", rp.result.clone())?;
     info.set_item("rounds", rp.rounds)?;
     info.set_item("steps", rp.steps)?;
     info.set_item("setup", rp.setup.clone())?;
     info.set_item("rows", rp.records.len())?;
-    let nfeat = (e.info)().num_features;
-    let s = samples_dict(py, rp.records, nfeat)?;
+    let gi = (e.info)();
+    let s = samples_dict(py, rp.records, gi.num_features, RowKinds::of(&gi))?;
     Ok((s, info.into_any().unbind()))
 }
 
@@ -1146,13 +1322,17 @@ fn result_row<'py>(py: Python<'py>, r: &zero_search::driver::GameResult) -> PyRe
         // self-play resignation (NnSeat::resign_t, docs/search.md 3.14): only when the game's seats resign
         d.set_item("resign", resign_dict(py, rs)?)?;
     }
+    if let Some(why) = r.abort_reason {
+        // the driver aborted the game (docs/search.md 2.15: "max_row_tokens")
+        d.set_item("abort_reason", why)?;
+    }
     Ok(d)
 }
 
 /// The bytes a record holds (itself and its arrays' contents): `SampleRecords.nbytes`, a bounded
 /// queue's measure.
 fn record_bytes(r: &Record) -> usize {
-    std::mem::size_of::<Record>() + 4 * r.x.len() + 2 * r.opts.len() + 4 * r.pi.len() + 4 * r.aux.len()
+    std::mem::size_of::<Record>() + 4 * r.x.len() + 2 * r.opts.len() + 4 * r.pi.len() + 4 * r.aux.len() + 6 * r.tail.seg.len() + 4 * r.tail.val.len() + 12 * r.ov.len()
 }
 
 /// Training records taken from a driver as they are (`SearchDriver.take_records`, docs/search.md
@@ -1164,14 +1344,15 @@ fn record_bytes(r: &Record) -> usize {
 pub struct PySampleRecords {
     recs: Vec<Record>,
     nfeat: usize,
+    rows: RowKinds,
     bytes: usize,
     used: bool,
 }
 
 impl PySampleRecords {
-    fn new(recs: Vec<Record>, nfeat: usize) -> PySampleRecords {
+    fn new(recs: Vec<Record>, nfeat: usize, rows: RowKinds) -> PySampleRecords {
         let bytes = recs.iter().map(record_bytes).sum();
-        PySampleRecords { recs, nfeat, bytes, used: false }
+        PySampleRecords { recs, nfeat, rows, bytes, used: false }
     }
 
     fn check(&self) -> PyResult<()> {
@@ -1208,9 +1389,9 @@ impl PySampleRecords {
             )));
         }
         self.used = true;
-        let nfeat = self.nfeat;
+        let (nfeat, rows) = (self.nfeat, self.rows);
         let mut rest = std::mem::take(&mut self.recs).into_iter();
-        Ok(sizes.iter().map(|&k| PySampleRecords::new(rest.by_ref().take(k).collect(), nfeat)).collect())
+        Ok(sizes.iter().map(|&k| PySampleRecords::new(rest.by_ref().take(k).collect(), nfeat, rows)).collect())
     }
 
     /// take_samples' dict of these records (docs/search.md 2.4), built off the GIL; once (a second
@@ -1218,7 +1399,7 @@ impl PySampleRecords {
     fn arrays(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         self.check()?;
         self.used = true;
-        samples_dict(py, std::mem::take(&mut self.recs), self.nfeat)
+        samples_dict(py, std::mem::take(&mut self.recs), self.nfeat, self.rows)
     }
 }
 
@@ -1247,6 +1428,18 @@ impl PySearchDriver {
         a.set_item("opt_off", b.opt_off.into_pyarray(py))?;
         a.set_item("opt_action", b.opt_action.into_pyarray(py))?;
         a.set_item("extra", b.extra.into_pyarray(py))?;
+        if self.rows.tails {
+            // variable-length rows (docs/search.md 2.15): the rows' tail CSR (B + 1 offsets)
+            a.set_item("t_off", b.t_off.into_pyarray(py))?;
+            a.set_item("t_seg", b.t_seg.into_pyarray(py))?;
+            a.set_item("t_slot", b.t_slot.into_pyarray(py))?;
+            a.set_item("t_val", b.t_val.into_pyarray(py))?;
+        }
+        if self.rows.pointers {
+            a.set_item("ov_off", b.ov_off.into_pyarray(py))?;
+            a.set_item("ov_opt", b.ov_opt.into_pyarray(py))?;
+            a.set_item("ov_tok", b.ov_tok.into_pyarray(py))?;
+        }
         Ok(Some((b.id, key, "nn", a).into_pyobject(py)?.into_any().unbind()))
     }
 }
@@ -1291,7 +1484,9 @@ impl PyLookahead {
 
     /// The next round's rows - {x [b, F], opt_off, opt_action, player, n_players, extra} (a network
     /// batch as the driver's; `x` a view of an array the lookahead reuses: valid until the next
-    /// round) - or None when the decision is made.
+    /// round), with each row's tail (`t_off` [b + 1], `t_seg`, `t_slot`, `t_val`) for a game with tail segments
+    /// and its overrides (`ov_off` [b + 1], `ov_opt`, `ov_tok`) for one with pointer overrides (docs/search.md 2.4,
+    /// 2.15; a row past the game's row limit raises) - or None when the decision is made.
     fn next_batch<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         let l = &mut self.l;
         let Some(n) = py.allow_threads(|| l.step()).map_err(rerr)? else { return Ok(None) };
@@ -1316,6 +1511,19 @@ impl PyLookahead {
         a.set_item("player", r.player.to_vec().into_pyarray(py))?;
         a.set_item("n_players", r.n_players.to_vec().into_pyarray(py))?;
         a.set_item("extra", r.extra.to_vec().into_pyarray(py))?;
+        if !r.t_off.is_empty() {
+            // variable-length rows (docs/search.md 2.15; a game with tail segments only)
+            a.set_item("t_off", r.t_off.to_vec().into_pyarray(py))?;
+            a.set_item("t_seg", r.t_seg.to_vec().into_pyarray(py))?;
+            a.set_item("t_slot", r.t_slot.to_vec().into_pyarray(py))?;
+            a.set_item("t_val", r.t_val.to_vec().into_pyarray(py))?;
+        }
+        if !r.ov_off.is_empty() {
+            // (a game with pointer overrides only)
+            a.set_item("ov_off", r.ov_off.to_vec().into_pyarray(py))?;
+            a.set_item("ov_opt", r.ov_opt.to_vec().into_pyarray(py))?;
+            a.set_item("ov_tok", r.ov_tok.to_vec().into_pyarray(py))?;
+        }
         Ok(Some(a))
     }
 
@@ -1395,5 +1603,10 @@ impl PyLookahead {
     #[getter]
     fn belief(&self) -> Option<Vec<f32>> {
         self.l.belief()
+    }
+
+    /// The game's facts (`game_info_of`'s dict: its tail segments and pointer overrides name the rows' keys).
+    fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        info_dict(py, &self.l.info())
     }
 }

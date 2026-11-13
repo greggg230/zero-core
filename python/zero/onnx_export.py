@@ -82,7 +82,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .net import GridNet, Net, TokenNet, _read, aux_answer
+from .net import GridNet, Net, TokenNet, _read, aux_answer, varlen_features
 from .protocol import MAX_SEATS
 
 PROTOCOL = 'zero-onnx/1'
@@ -266,6 +266,9 @@ class ZeroOnnx(nn.Module):
         self.tokens = isinstance(net, TokenNet)
         if not isinstance(net, (TokenNet, GridNet, Net)):
             raise TypeError(f'zero-onnx: no export for a {type(net).__name__} (TokenNet, GridNet, Net)')
+        vf = varlen_features(net)
+        if vf:      # (R14, docs/az.md 43.8: the fixed-width interface would drop them in silence)
+            raise ValueError(f'zero-onnx/1: a network with variable-length token sets ({"; ".join(vf)}) has no zero-onnx/1 graph')
         if self.tokens and packing not in PACKINGS:
             raise ValueError(f'zero-onnx: packing {packing!r} (one of {PACKINGS})')
         self.packing = packing if self.tokens else None

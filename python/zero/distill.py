@@ -65,9 +65,10 @@ import torch.nn.functional as F
 
 from . import auxtarget as AUX
 from .data import batches
+from .rows import forward_kw
 from .finite import NonFinite
 from .infer import use_amp
-from .net import aux_layout, aux_predict, make_net
+from .net import NO_DECAY, aux_layout, aux_predict, make_net, no_decay_params
 from .protocol import MAX_SEATS
 
 
@@ -126,13 +127,17 @@ def outputs(model, W, device=None, batch=1024):
     amp = use_amp(model, device)
     for lo in range(0, N, batch):
         rows = np.arange(lo, min(N, lo + batch))
-        x = torch.from_numpy(W.features(rows).astype(np.float32)).to(device)
+        xn = W.features(rows).astype(np.float32)
+        x = torch.from_numpy(xn).to(device)
         n = torch.from_numpy(W.n_players[rows]).to(device)
+        # (variable-length rows, docs/az.md 43: the window's tails and overrides; {} without - the calls of before)
+        rk = W.row_inputs(rows, device, xn) if getattr(W, 'tail', None) is not None or getattr(W, 'ov', None) is not None \
+            else {}
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
             if layout:
-                plog, vlog, mar, raw = model(x, n, aux=True)
+                plog, vlog, mar, raw = model(x, n, aux=True, **rk)
             else:
-                plog, vlog, mar = model(x, n)
+                plog, vlog, mar = model(x, n, **rk)
         if layout:
             pred = aux_predict(layout, raw)
             aux[rows] = torch.cat([pred[name] for name, _, _ in layout], 1).cpu().numpy()
@@ -221,11 +226,12 @@ def losses(model, b, teacher_w=1.0, value_q=0.5, margin_w=0.5, amp=False, view=F
     teacher's predictions."""
     layout = getattr(model, 'aux_layout', None) or []
     aux = bool(layout) and 'taux' in b
+    rk = forward_kw(b)                             # (variable-length rows: the batch's tail / ov, docs/az.md 43)
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
         if aux:
-            plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True)
+            plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True, **rk)
         else:
-            plog, vlog, mp = model(b['x'], b['n_players'])
+            plog, vlog, mp = model(b['x'], b['n_players'], **rk)
     plog, vlog, mp = plog.float(), vlog.float(), mp.float()
     S = model.seats
     logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)
@@ -305,8 +311,19 @@ def distill(student, W, T, steps, batch=512, lr=5e-4, lr_min=1e-5, warmup=500, w
     view = view_rows(W) > 0
     kw = {'view': view, 'aux_w': aux_w, 'aux_teacher_w': aux_teacher_w} if view or 'aux' in T else {}
     student.to(device).train()
-    o = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=wd)
+    gates = no_decay_params(student)             # (docs/az.md 43.6: the gates undecayed; none: the optimizer of before)
+    if gates:
+        o = torch.optim.AdamW([{'params': [p for n, p in student.named_parameters() if n not in NO_DECAY]},
+                               {'params': gates, 'weight_decay': 0.0}], lr=lr, weight_decay=wd)
+    else:
+        o = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=wd)
     if opt is not None:
+        # (the moments in the optimizer's own order - the gates' group last -: a state that does not fit is refused,
+        # never trained on from a fresh optimizer in silence, docs/az.md 43.10)
+        from .run import opt_state_mismatch
+        bad = opt_state_mismatch(student, opt, params=[p for g in o.param_groups for p in g['params']])
+        if bad:
+            raise ValueError(f'distill: the optimizer state to continue does not fit the student ({bad})')
         o.load_state_dict(opt)
     amp = use_amp(student, device)
     rng = np.random.default_rng(seed * 7919 + start)

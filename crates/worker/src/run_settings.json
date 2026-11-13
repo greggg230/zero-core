@@ -601,6 +601,14 @@
    "class": "trainer",
    "why": "Python inference threads"
   },
+  "infer_token_chunks": {
+   "class": "trainer",
+   "why": "Python inference: the CUDA graphs' length-sorted chunks (docs/az.md 43.11); the native worker answers through its graph in its own pieces"
+  },
+  "allow_draft_layout": {
+   "class": "trainer",
+   "why": "a run's start refuses a draft token layout unless set (docs/az.md 43.4); a worker plays its build's game rows"
+  },
   "selfplay_league": {
    "class": "python_only",
    "off": 0.0,

@@ -7,6 +7,7 @@ use crate::driver::{Batch, Driver, DriverCfg, DriverStats, GameResult, InFlight,
 use crate::game::{bot_names, Belief, Next, SearchGame, MAX_SEATS};
 use crate::lookahead::{Answers, Line, Look, LookCfg, LookStats, OptionValue, Outcome, RowSink, Step};
 use crate::rng::Rng;
+use crate::tail::{TailBuf, TailRow, TailSeg};
 use crate::tree::{leaf_values_team, Scratch, Sim, Tree, Walk};
 
 /// Static facts about a game type.
@@ -20,10 +21,28 @@ pub struct GameInfo {
     pub bots: Vec<&'static str>,
     /// Auxiliary target segments (name, width) (`SearchGame::AUX`; empty: none).
     pub aux: Vec<(&'static str, usize)>,
+    /// Variable-length rows (docs/search.md 1.4): the tail segments (`SearchGame::TAILS`, empty: none), pointer
+    /// overrides, the row limit (None: `usize::MAX`, no limit) and the head tokens (`HEAD_TOKENS`).
+    pub tails: Vec<TailSeg>,
+    pub option_pointers: bool,
+    pub max_row_tokens: Option<usize>,
+    pub head_tokens: usize,
 }
 
 pub fn game_info<G: SearchGame>() -> GameInfo {
-    GameInfo { name: G::NAME, num_actions: G::NUM_ACTIONS, num_features: G::NUM_FEATURES, min_players: G::MIN_PLAYERS, max_players: G::MAX_PLAYERS.min(MAX_SEATS), bots: bot_names::<G>(), aux: G::AUX.to_vec() }
+    GameInfo {
+        name: G::NAME,
+        num_actions: G::NUM_ACTIONS,
+        num_features: G::NUM_FEATURES,
+        min_players: G::MIN_PLAYERS,
+        max_players: G::MAX_PLAYERS.min(MAX_SEATS),
+        bots: bot_names::<G>(),
+        aux: G::AUX.to_vec(),
+        tails: G::TAILS.to_vec(),
+        option_pointers: G::OPTION_POINTERS,
+        max_row_tokens: (G::MAX_ROW_TOKENS != usize::MAX).then_some(G::MAX_ROW_TOKENS),
+        head_tokens: G::HEAD_TOKENS,
+    }
 }
 
 /// One game, any type.
@@ -44,7 +63,14 @@ pub trait DynGame: Send + Sync {
     /// floats), `tilt`, `clip` and the per-target tilts `tilts` ((target, alpha), docs/search.md
     /// 3.8.1; empty: none).
     fn determinize_with(&mut self, viewer: usize, seed: u64, pred: &[f32], tilt: f64, clip: f64, tilts: &[(String, f64)]) -> Result<(), String>;
-    fn encode(&self, viewer: usize) -> Vec<f32>;
+    /// `SearchGame::encode` (the head): refused (Err, R1) for a state whose row has a tail (docs/search.md 1.4) -
+    /// a head-only caller never silently drops tokens.
+    fn encode(&self, viewer: usize) -> Result<Vec<f32>, String>;
+    /// `SearchGame::encode_row`: the head and the sealed tail (docs/search.md 1.4).
+    fn encode_row(&self, viewer: usize) -> (Vec<f32>, TailRow);
+    /// `SearchGame::option_overrides` of `viewer`'s row against `legal_actions()` (docs/search.md 2.15; checked;
+    /// none for a game without `OPTION_POINTERS` or a decision without options).
+    fn option_overrides(&self, viewer: usize) -> Vec<(u32, i64)>;
     fn rounds(&self) -> u32;
     fn export_state(&self) -> String;
     fn apply_external(&mut self, payload: &str) -> Result<Vec<u64>, String>;
@@ -122,10 +148,38 @@ impl<G: SearchGame> DynGame for G {
         SearchGame::determinize_with(self, viewer, &mut Rng::new(seed), &b);
         Ok(())
     }
-    fn encode(&self, viewer: usize) -> Vec<f32> {
+    fn encode(&self, viewer: usize) -> Result<Vec<f32>, String> {
+        if G::TAILS.is_empty() {
+            let mut v = vec![0.0; G::NUM_FEATURES];
+            SearchGame::encode(self, viewer, &mut v);
+            return Ok(v);
+        }
+        let (v, t) = DynGame::encode_row(self, viewer);
+        if !t.is_empty() {
+            return Err(format!("{}: encode of a state whose row has {} tail tokens (use encode_row)", G::NAME, t.len()));
+        }
+        Ok(v)
+    }
+    fn encode_row(&self, viewer: usize) -> (Vec<f32>, TailRow) {
         let mut v = vec![0.0; G::NUM_FEATURES];
-        SearchGame::encode(self, viewer, &mut v);
-        v
+        let mut tb = TailBuf::new(G::TAILS);
+        SearchGame::encode_row(self, viewer, &mut v, &mut tb);
+        tb.seal();
+        (v, tb.to_row())
+    }
+    fn option_overrides(&self, viewer: usize) -> Vec<(u32, i64)> {
+        let mut out = Vec::new();
+        if !G::OPTION_POINTERS {
+            return out;
+        }
+        let mut legal = Vec::new();
+        self.legal_actions(&mut legal);
+        if legal.is_empty() {
+            return out;
+        }
+        SearchGame::option_overrides(self, viewer, &legal, &mut out);
+        crate::driver::check_overrides(&out, legal.len());
+        out
     }
     fn rounds(&self) -> u32 {
         SearchGame::rounds(self)
@@ -202,7 +256,8 @@ impl<G: SearchGame> DynGame for G {
             let (t, c, _) = belief.ok_or("lookahead: belief predictions without the belief's tilt / clip / mix")?;
             l.set_belief(belief_of::<G>(&p, t, c, &[])?)?;
         }
-        Ok(Box::new(LookBox { l, rng: Rng::new(seed), buf: RowsBuf { n: SearchGame::num_players(self), ..Default::default() }, waiting: false }))
+        let buf = RowsBuf { n: SearchGame::num_players(self), tails: !G::TAILS.is_empty(), pointers: G::OPTION_POINTERS, ..Default::default() };
+        Ok(Box::new(LookBox { l, rng: Rng::new(seed), buf, waiting: false }))
     }
 }
 
@@ -232,12 +287,24 @@ fn belief_of<G: SearchGame>(pred: &[f32], tilt: f64, clip: f64, tilts: &[(String
 }
 
 /// A leaf of a Python-driven search: decider, features, legal actions; with root-view values
-/// (docs/search.md 3.6) the features of the tree's viewer when another seat decides the leaf.
+/// (docs/search.md 3.6) the features of the tree's viewer when another seat decides the leaf; for a game with
+/// tail segments or pointer overrides its rows' tails and overrides (`rows`, docs/search.md 2.15; None otherwise).
 pub struct Leaf {
     pub player: usize,
     pub x: Vec<f32>,
     pub acts: Vec<u16>,
     pub vx: Option<Vec<f32>>,
+    pub rows: Option<LeafRows>,
+}
+
+/// A Python-driven leaf's variable-length rows (docs/search.md 2.15), as the driver's rows of the same leaf:
+/// `tail` the decider's row's sealed tail (None: the game has no tail segments), `ov` its pointer overrides
+/// against the leaf's options (None: no `OPTION_POINTERS`; empty for a leaf without options), `vtail` the
+/// value-only row's tail (`Leaf::vx`'s; a value-only row has no options, so no overrides).
+pub struct LeafRows {
+    pub tail: Option<TailRow>,
+    pub ov: Option<Vec<(u32, i64)>>,
+    pub vtail: Option<TailRow>,
 }
 
 /// One search tree driven from Python (parity tests, mixed Rust-vs-Python matches).
@@ -245,8 +312,10 @@ pub trait DynTree: Send + Sync {
     fn set_base(&mut self, live: &dyn DynGame) -> Result<(), String>;
     /// One simulation: None if it ended in a terminal state (backed up), else the leaf to
     /// evaluate (then `expand`). `root_view`: a leaf of another seat than the viewer also gets
-    /// the viewer's features (`Leaf::vx`), whose value `expand` then takes.
-    fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool) -> Result<Option<Leaf>, String>;
+    /// the viewer's features (`Leaf::vx`), whose value `expand` then takes. `rows`: the caller takes the leaf's
+    /// tails and overrides (`Leaf::rows`, docs/search.md 2.15) - required for a game with tail segments or
+    /// pointer overrides (Err without it: a head-only caller never drops them), ignored for any other.
+    fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool, rows: bool) -> Result<Option<Leaf>, String>;
     /// Evaluate the last leaf: priors over its options, value / margin relative to its decider
     /// (to the viewer when the leaf came with `vx`).
     fn expand(&mut self, priors: &[f32], value: &[f32], margin: &[f32], margin_w: f64) -> Result<(), String>;
@@ -328,9 +397,14 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
         self.t.set_base(g, &mut self.rng);
         Ok(())
     }
-    fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool) -> Result<Option<Leaf>, String> {
+    fn simulate(&mut self, live: &dyn DynGame, c_puct: f64, chance_k: u32, margin_w: f64, root_view: bool, rows: bool) -> Result<Option<Leaf>, String> {
         if self.leaf.is_some() {
             return Err("expand the previous leaf first".into());
+        }
+        let tails = !G::TAILS.is_empty() || G::OPTION_POINTERS;
+        if tails && !rows {
+            // (a head-only caller would drop the leaves' tails and overrides: refused before any walk)
+            return Err(format!("{}: its leaves carry tail tokens / pointer overrides: simulate(..., rows=True) takes them (docs/search.md 2.15)", G::NAME));
         }
         let live = downcast::<G>(live)?;
         let g = self.scratch.get_or_insert_with(|| live.clone());
@@ -338,18 +412,43 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
         match self.t.simulate(live, g, &mut self.rng, &w, &mut self.sc)? {
             Sim::Terminal => Ok(None),
             Sim::Leaf { node, player } => {
-                let mut x = vec![0.0; G::NUM_FEATURES];
-                g.encode(player, &mut x);
                 let viewer = self.t.viewer;
-                let vx = (root_view && player != viewer).then(|| {
-                    let mut v = vec![0.0; G::NUM_FEATURES];
-                    g.encode(viewer, &mut v);
-                    v
-                });
+                // (a merged tree's growth leaf: this world's options, docs/search.md 3.16)
+                let acts = self.t.leaf_acts(node).to_vec();
+                let vrow = root_view && player != viewer;
+                let (x, vx, lr) = if !tails {
+                    let mut x = vec![0.0; G::NUM_FEATURES];
+                    g.encode(player, &mut x);
+                    let vx = vrow.then(|| {
+                        let mut v = vec![0.0; G::NUM_FEATURES];
+                        g.encode(viewer, &mut v);
+                        v
+                    });
+                    (x, vx, None)
+                } else {
+                    // the driver's rows of this leaf (docs/search.md 2.15): `encode_row`, the overrides of the
+                    // decider's row against the leaf's options (checked), the value-only row's tail
+                    let (x, t) = DynGame::encode_row(&*g, player);
+                    let ov = G::OPTION_POINTERS.then(|| {
+                        let mut ov = Vec::new();
+                        if !acts.is_empty() {
+                            SearchGame::option_overrides(&*g, player, &acts, &mut ov);
+                            crate::driver::check_overrides(&ov, acts.len());
+                        }
+                        ov
+                    });
+                    let (vx, vt) = if vrow {
+                        let (v, t) = DynGame::encode_row(&*g, viewer);
+                        (Some(v), Some(t))
+                    } else {
+                        (None, None)
+                    };
+                    let has = !G::TAILS.is_empty();
+                    (x, vx, Some(LeafRows { tail: has.then_some(t), ov, vtail: vt.filter(|_| has) }))
+                };
                 // (the value's seat: the viewer with a value-only row, else the decider)
                 self.leaf = Some((node, if vx.is_some() { viewer } else { player }));
-                // (a merged tree's growth leaf: this world's options, docs/search.md 3.16)
-                Ok(Some(Leaf { player, x, acts: self.t.leaf_acts(node).to_vec(), vx }))
+                Ok(Some(Leaf { player, x, acts, vx, rows: lr }))
             }
         }
     }
@@ -533,6 +632,15 @@ pub struct LookRows<'a> {
     pub player: &'a [i32],
     pub n_players: &'a [i32],
     pub extra: &'a [u8],
+    /// Variable-length rows (docs/search.md 2.15; the batch keys of 2.4): the tail CSR (`t_off` B + 1 offsets) for a
+    /// game with tail segments, the override CSR (`ov_off`) for one with pointer overrides; empty otherwise.
+    pub t_off: &'a [i64],
+    pub t_seg: &'a [u16],
+    pub t_slot: &'a [u32],
+    pub t_val: &'a [f32],
+    pub ov_off: &'a [i64],
+    pub ov_opt: &'a [i32],
+    pub ov_tok: &'a [i64],
 }
 
 /// One lookahead driven from Python (the position API, docs/search.md 3.9).
@@ -552,9 +660,13 @@ pub trait DynLook: Send + Sync {
     fn belief(&self) -> Option<Vec<f32>>;
     /// The settings of the stage that ran (`LookCfg::to_json`).
     fn cfg_json(&self) -> String;
+    /// The game's facts (its tail segments, pointer overrides: the rows' keys).
+    fn info(&self) -> GameInfo;
 }
 
-/// The rows of a round in Python's arrays (`DynLook::step`).
+/// The rows of a round in Python's arrays (`DynLook::step`). A game with tail segments / pointer overrides: each
+/// row's tail and overrides too (`row_tail`; `t_n` / `ov_n` per row, 0 until set), every row checked against the
+/// game's row limit (docs/search.md 2.15: the position API raises, there is no game to abort).
 #[derive(Default)]
 struct RowsBuf {
     x: Vec<f32>,
@@ -565,6 +677,17 @@ struct RowsBuf {
     extra: Vec<u8>,
     opt_off: Vec<i32>,
     n_players: Vec<i32>,
+    tails: bool,
+    pointers: bool,
+    t_n: Vec<u32>,
+    t_seg: Vec<u16>,
+    t_slot: Vec<u32>,
+    t_val: Vec<f32>,
+    ov_n: Vec<u32>,
+    ov_opt: Vec<i32>,
+    ov_tok: Vec<i64>,
+    t_off: Vec<i64>,
+    ov_off: Vec<i64>,
 }
 
 impl RowsBuf {
@@ -576,6 +699,34 @@ impl RowsBuf {
         self.extra.clear();
         self.opt_off.clear();
         self.n_players.clear();
+        self.t_n.clear();
+        self.t_seg.clear();
+        self.t_slot.clear();
+        self.t_val.clear();
+        self.ov_n.clear();
+        self.ov_opt.clear();
+        self.ov_tok.clear();
+        self.t_off.clear();
+        self.ov_off.clear();
+    }
+    /// The CSR offsets of the rows' tails and overrides (B + 1 each; a game without them: none).
+    fn offsets(&mut self) {
+        if self.tails {
+            self.t_off.push(0);
+            let mut o = 0i64;
+            for &k in &self.t_n {
+                o += k as i64;
+                self.t_off.push(o);
+            }
+        }
+        if self.pointers {
+            self.ov_off.push(0);
+            let mut o = 0i64;
+            for &k in &self.ov_n {
+                o += k as i64;
+                self.ov_off.push(o);
+            }
+        }
     }
 }
 
@@ -585,6 +736,12 @@ impl<G: SearchGame> RowSink<G> for RowsBuf {
         self.opt_action.extend(opts.iter().map(|&a| a as i32));
         self.player.push(viewer as i32);
         self.extra.push(kind);
+        if self.tails {
+            self.t_n.push(0);
+        }
+        if self.pointers {
+            self.ov_n.push(0);
+        }
         let off = self.x.len();
         self.x.resize(off + G::NUM_FEATURES, 0.0);
         &mut self.x[off..]
@@ -595,6 +752,40 @@ impl<G: SearchGame> RowSink<G> for RowsBuf {
         self.player.pop();
         self.extra.pop();
         self.x.truncate(self.x.len() - G::NUM_FEATURES);
+        if self.tails {
+            let nt = self.t_n.pop().unwrap_or(0) as usize;
+            let k = self.t_seg.len() - nt;
+            let w: usize = self.t_seg[k..].iter().map(|&s| G::TAILS.iter().find(|t| t.seg == s).map_or(0, |t| t.width)).sum();
+            self.t_seg.truncate(k);
+            self.t_slot.truncate(k);
+            self.t_val.truncate(self.t_val.len() - w);
+        }
+        if self.pointers {
+            let no = self.ov_n.pop().unwrap_or(0) as usize;
+            self.ov_opt.truncate(self.ov_opt.len() - no);
+            self.ov_tok.truncate(self.ov_tok.len() - no);
+        }
+    }
+    fn row_tail(&mut self, tail: &TailBuf, ov: &[(u32, i64)]) -> Result<(), String> {
+        if self.tails {
+            let cap = G::HEAD_TOKENS + tail.len();
+            if cap > G::MAX_ROW_TOKENS {
+                RowSink::<G>::pop_row(self);
+                return Err(format!("max_row_tokens: a lookahead row of {} has capacity {cap} > {} (docs/search.md 2.15; the position API has no game to abort)", G::NAME, G::MAX_ROW_TOKENS));
+            }
+            *self.t_n.last_mut().ok_or("internal: a row tail without a row")? = tail.len() as u32;
+            self.t_seg.extend_from_slice(tail.seg());
+            self.t_slot.extend_from_slice(tail.slot());
+            self.t_val.extend_from_slice(tail.val());
+        }
+        if self.pointers {
+            *self.ov_n.last_mut().ok_or("internal: row overrides without a row")? = ov.len() as u32;
+            for &(o, t) in ov {
+                self.ov_opt.push(o as i32);
+                self.ov_tok.push(t);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -623,6 +814,7 @@ impl<G: SearchGame> DynLook for LookBox<G> {
                     buf.opt_off.push(o);
                 }
                 buf.n_players.resize(b, buf.n as i32);
+                buf.offsets();
                 self.waiting = true;
                 Ok(Some(b))
             }
@@ -630,7 +822,22 @@ impl<G: SearchGame> DynLook for LookBox<G> {
     }
     fn rows(&self) -> LookRows<'_> {
         let b = &self.buf;
-        LookRows { b: b.extra.len(), x: &b.x, opt_off: &b.opt_off, opt_action: &b.opt_action, player: &b.player, n_players: &b.n_players, extra: &b.extra }
+        LookRows {
+            b: b.extra.len(),
+            x: &b.x,
+            opt_off: &b.opt_off,
+            opt_action: &b.opt_action,
+            player: &b.player,
+            n_players: &b.n_players,
+            extra: &b.extra,
+            t_off: &b.t_off,
+            t_seg: &b.t_seg,
+            t_slot: &b.t_slot,
+            t_val: &b.t_val,
+            ov_off: &b.ov_off,
+            ov_opt: &b.ov_opt,
+            ov_tok: &b.ov_tok,
+        }
     }
     fn submit(&mut self, priors: &[f32], value: &[f32], aux: &[f32]) -> Result<(), String> {
         if !self.waiting {
@@ -681,6 +888,9 @@ impl<G: SearchGame> DynLook for LookBox<G> {
     }
     fn cfg_json(&self) -> String {
         self.l.cfg().to_json()
+    }
+    fn info(&self) -> GameInfo {
+        game_info::<G>()
     }
 }
 

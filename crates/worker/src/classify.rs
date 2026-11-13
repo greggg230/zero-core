@@ -186,9 +186,9 @@ mod tests {
 
     #[test]
     fn verdicts() {
-        let info = GameInfo { name: "t", num_actions: 2, num_features: 2, min_players: 2, max_players: 2, bots: vec![], aux: vec![("deck", 3)] };
+        let info = GameInfo { name: "t", num_actions: 2, num_features: 2, min_players: 2, max_players: 2, bots: vec![], aux: vec![("deck", 3)], tails: vec![], option_pointers: false, max_row_tokens: None, head_tokens: 0 };
         let c = Settings::parse(r#"{"game": "t", "sims": 4, "lr": 0.1, "selfplay_league": 0.0, "selfplay_league_pool": "2,4", "resolver": "x", "aux_deck_w": 0.5, "reader_deck": 1, "aux_hand_w": 1, "bogus": 1}"#).unwrap();
-        let other = GameInfo { name: "o", num_actions: 2, num_features: 2, min_players: 2, max_players: 2, bots: vec![], aux: vec![("hand", 3)] };
+        let other = GameInfo { name: "o", num_actions: 2, num_features: 2, min_players: 2, max_players: 2, bots: vec![], aux: vec![("hand", 3)], tails: vec![], option_pointers: false, max_row_tokens: None, head_tokens: 0 };
         let v = classify(&c, &info, &[other.clone()]).unwrap();
         let st: Vec<(&str, &str)> = v.iter().map(|x| (x.key.as_str(), x.status)).collect();
         assert_eq!(st, vec![("game", "play"), ("sims", "play"), ("lr", "trainer"), ("selfplay_league", "off"), ("selfplay_league_pool", "off"), ("resolver", "unsupported"), ("aux_deck_w", "play"), ("reader_deck", "trainer"), ("aux_hand_w", "unsupported"), ("bogus", "unknown")]);

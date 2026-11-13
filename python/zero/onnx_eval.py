@@ -39,6 +39,9 @@ class OnnxEvaluator:
     def rows(self, lb):
         """The batch as `onnx_parity.Rows` (its sparse rows; a dense batch's non-zeros)."""
         a = lb.a
+        if 't_off' in a or 'ov_off' in a:      # (R14, docs/az.md 43.8: never a tail or an override dropped in silence)
+            raise ValueError(f'{self.path}: a batch with variable-length rows (tail tokens / pointer overrides) for a '
+                             f'zero-onnx/1 graph')
         extra = a.get('extra')
         extra = np.zeros(lb.B, np.uint8) if extra is None else extra
         if 'xs_val' in a:

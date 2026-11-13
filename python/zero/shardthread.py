@@ -28,6 +28,9 @@ half-written (nor its temporary file) - drops the rest and is joined. `close()` 
 the writer's last shard (`ShardWriter.close` on the writer thread) and the thread, then returns
 ShardWriter.close's counts: every shard is on disk before the window can read it.
 
+Variable-length rows (docs/az.md 43): the records carry their tails and overrides (`Record::tail` / `ov`), which
+`split_records` moves with them and `SampleRecords.arrays()` returns as `t_*` / `ov_*` (the writer: format v2).
+
 `games`: the remote worker's count of games added since its last shard (as remoteplay._BgWriter's;
 `add(s, games)` counts them on the writer thread before the item reaches the ShardWriter, so its
 `on_write` callback reads the games of exactly the shard it announces).

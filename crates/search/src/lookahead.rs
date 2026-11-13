@@ -60,6 +60,7 @@ use serde_json::Value;
 use crate::driver::{ROW_BELIEF, ROW_LEAF};
 use crate::game::{Belief, SearchGame, MAX_SEATS};
 use crate::rng::{split64, Rng};
+use crate::tail::TailBuf;
 use crate::tree::{deal, transition};
 
 const NIL: u32 = u32::MAX;
@@ -452,18 +453,49 @@ pub enum Outcome {
 }
 
 /// Where the network rows of a lookahead go (`Look::step`): one row = `g.encode(viewer)`, the
-/// options `opts` (empty: a value-only row), its kind (`ROW_LEAF`, `ROW_BELIEF`).
+/// options `opts` (empty: a value-only row), its kind (`ROW_LEAF`, `ROW_BELIEF`) - and, for a game with tail
+/// segments or pointer overrides, the row's sealed tail and its overrides (`row_tail`, docs/search.md 2.15).
 pub trait RowSink<G: SearchGame> {
     /// A new row (`viewer`'s, its options, its kind) -> its `NUM_FEATURES` features, zeroed, for the
     /// caller to encode.
     fn push_row(&mut self, viewer: usize, opts: &[u16], kind: u8) -> &mut [f32];
     /// Drop the last row pushed (a leaf whose observation another row has: `dedup`).
     fn pop_row(&mut self);
-    /// A row of `g.encode(viewer)`.
-    fn row(&mut self, g: &G, viewer: usize, opts: &[u16], kind: u8) {
-        let x = self.push_row(viewer, opts, kind);
-        g.encode(viewer, x);
+    /// The last row's sealed tail tokens and pointer overrides (docs/search.md 2.15): called once, right after its
+    /// features were written (`put_row`), for a game with `TAILS` or `OPTION_POINTERS` only. Err when the row
+    /// passes the sink's row limit (`HEAD_TOKENS + tail` > `max_row_tokens`; the row is then dropped): the driver
+    /// aborts the row's game, the position API raises - a truncated row is never sent.
+    fn row_tail(&mut self, tail: &TailBuf, ov: &[(u32, i64)]) -> Result<(), String>;
+}
+
+/// The game has variable-length rows: tail segments or pointer overrides (docs/search.md 2.15).
+#[inline(always)]
+fn has_rows<G: SearchGame>() -> bool {
+    !G::TAILS.is_empty() || G::OPTION_POINTERS
+}
+
+/// A lookahead row's tail tokens and pointer overrides (docs/search.md 2.15): the scratch `look_encode` fills
+/// (untouched for a game without tails or pointer overrides).
+pub struct RowTail {
+    pub tb: TailBuf,
+    pub ov: Vec<(u32, i64)>,
+}
+
+impl RowTail {
+    pub fn new<G: SearchGame>() -> RowTail {
+        RowTail { tb: TailBuf::new(G::TAILS), ov: Vec::new() }
     }
+}
+
+/// A row into `sink`: `viewer`'s features of `g` (`look_encode`) with its options `opts` and kind, then (a game with
+/// tails or pointer overrides) its tail and overrides (`RowSink::row_tail`).
+pub fn put_row<G: SearchGame>(sink: &mut dyn RowSink<G>, rt: &mut RowTail, g: &G, viewer: usize, opts: &[u16], kind: u8) -> Result<(), String> {
+    let x = sink.push_row(viewer, opts, kind);
+    look_encode(g, viewer, opts, x, rt);
+    if has_rows::<G>() {
+        sink.row_tail(&rt.tb, &rt.ov)?;
+    }
+    Ok(())
 }
 
 /// The network's answers to a round's rows (`Look::answer`): rows `base..base + n` of a batch with
@@ -560,6 +592,8 @@ pub struct Look<G: SearchGame> {
     keep_lines: bool,
     minors: HashMap<u32, Vec<(u8, u16)>>,
     xbuf: Vec<f32>,
+    /// A row's tail and overrides (`look_encode`; a game with tails or pointer overrides, docs/search.md 2.15).
+    rt: RowTail,
     key: Vec<u64>,
     legal: Vec<u16>,
     /// `dedup`: per observation hash the value, or the members waiting for the row sent this round;
@@ -578,6 +612,13 @@ enum VEntry {
 /// independent multiply-xorshift lanes, finished by `split64`. The encodings are sparse (a Delver
 /// position: ~150 non-zero floats of 37,620): blocks of zero bits are skipped (an OR over the block).
 pub fn obs_hash(x: &[f32]) -> u128 {
+    let (a, b) = obs_state(x);
+    obs_finish(a, b, x.len())
+}
+
+/// `obs_hash`'s two lanes after the pairs of `x`, before `obs_finish` (a row's tail continues them:
+/// `tail::tail_mix`, docs/search.md 2.15).
+pub(crate) fn obs_state(x: &[f32]) -> (u64, u64) {
     // SAFETY: f32 and u32 have the same size and alignment; the bits are read, never written
     let u: &[u32] = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u32, x.len()) };
     let (mut a, mut b) = OBS_SEED;
@@ -605,7 +646,7 @@ pub fn obs_hash(x: &[f32]) -> u128 {
             mix(&mut a, &mut b, base + j as u64, v);
         }
     }
-    obs_finish(a, b, x.len())
+    (a, b)
 }
 
 /// `obs_hash`'s two lanes before any pair.
@@ -620,9 +661,15 @@ fn mix(a: &mut u64, b: &mut u64, i: u64, v: u64) {
     *b = (b.wrapping_add(k ^ (i << 1))).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
 }
 
+/// `mix` for the tail's key mixing (`tail::tail_mix`, docs/search.md 2.15).
+#[inline(always)]
+pub(crate) fn obs_mix(a: &mut u64, b: &mut u64, i: u64, v: u64) {
+    mix(a, b, i, v)
+}
+
 /// `obs_hash`'s finish over the encoding's length `n`.
 #[inline(always)]
-fn obs_finish(a: u64, b: u64, n: usize) -> u128 {
+pub(crate) fn obs_finish(a: u64, b: u64, n: usize) -> u128 {
     let n = n as u64;
     ((split64(a ^ n) as u128) << 64) | split64(b ^ n.rotate_left(17)) as u128
 }
@@ -632,6 +679,12 @@ fn obs_finish(a: u64, b: u64, n: usize) -> u128 {
 /// mixing of the same (pair index, bits) as the dense hash, so the same key: `obs_hash_sparse` of a row's
 /// non-zeros == `obs_hash` of the row (the evaluation cache's key is either, docs/search.md 3.12).
 pub fn obs_hash_sparse(idx: &[u32], val: &[f32], n: usize) -> u128 {
+    let (a, b) = obs_state_sparse(idx, val);
+    obs_finish(a, b, n)
+}
+
+/// `obs_hash_sparse`'s two lanes before `obs_finish` (`obs_state` of the dense row).
+pub(crate) fn obs_state_sparse(idx: &[u32], val: &[f32]) -> (u64, u64) {
     debug_assert_eq!(idx.len(), val.len());
     let (mut a, mut b) = OBS_SEED;
     let mut k = 0;
@@ -654,7 +707,45 @@ pub fn obs_hash_sparse(idx: &[u32], val: &[f32], n: usize) -> u128 {
             mix(&mut a, &mut b, (i >> 1) as u64, v);
         }
     }
+    (a, b)
+}
+
+/// The observation key of a row with a tail and overrides (docs/search.md 2.15, K1-K3): the head's lanes
+/// (`obs_state` / `obs_state_sparse`), the tail and overrides mixed in (`tail::tail_mix`), finished over the
+/// head's `n` floats. An empty tail without overrides is exactly `obs_hash` of the head.
+pub fn obs_hash_row(head: (u64, u64), n: usize, seg: &[u16], slot: &[u32], val: &[f32], ov: &[(u32, i64)]) -> u128 {
+    let (mut a, mut b) = head;
+    crate::tail::tail_mix(&mut a, &mut b, seg, slot, val, ov);
     obs_finish(a, b, n)
+}
+
+/// A lookahead row (docs/search.md 2.15): `encode(viewer)` into `x` (zeroed) for a game without tails or pointer
+/// overrides (the path of before, `rt` untouched); otherwise `encode_row` into `x` with its tail sealed into `rt.tb`
+/// and, for a row with options `opts` (`viewer`'s legal actions), its overrides against them into `rt.ov`, checked
+/// (an engine bug panics, as the driver's rows).
+pub fn look_encode<G: SearchGame>(g: &G, viewer: usize, opts: &[u16], x: &mut [f32], rt: &mut RowTail) {
+    if !has_rows::<G>() {
+        g.encode(viewer, x);
+        return;
+    }
+    rt.tb.clear();
+    rt.ov.clear();
+    g.encode_row(viewer, x, &mut rt.tb);
+    rt.tb.seal();
+    if G::OPTION_POINTERS && !opts.is_empty() {
+        g.option_overrides(viewer, opts, &mut rt.ov);
+        crate::driver::check_overrides(&rt.ov, opts.len());
+    }
+}
+
+/// The observation key of a lookahead row `look_encode` made (`x` and `rt`; docs/search.md 2.15, K1-K3): `obs_hash`
+/// of the features for a game without tails or pointer overrides (the key of before); else `obs_hash_row` with the
+/// row's tail and overrides (an empty tail without overrides: `obs_hash` of the head, K1).
+pub fn look_key<G: SearchGame>(x: &[f32], rt: &RowTail) -> u128 {
+    if !has_rows::<G>() {
+        return obs_hash(x);
+    }
+    obs_hash_row(obs_state(x), x.len(), rt.tb.seg(), rt.tb.slot(), rt.tb.val(), &rt.ov)
 }
 
 /// The first index of the largest prior (Python's `max(range(n), key=p.__getitem__)`).
@@ -774,6 +865,7 @@ impl<G: SearchGame> Look<G> {
             keep_lines,
             minors: HashMap::new(),
             xbuf: vec![0.0; G::NUM_FEATURES],
+            rt: RowTail::new::<G>(),
             key: Vec::new(),
             legal: Vec::new(),
             vcache: HashMap::new(),
@@ -1096,9 +1188,11 @@ impl<G: SearchGame> Look<G> {
             let gi = match self.cfg.mode {
                 Mode::World => None,
                 Mode::Infoset => {
+                    // (the observation: the row of our decision, its tail and its overrides against the options
+                    // included - docs/search.md 2.15, K3; a game without them: `obs_hash` of `encode`, as before)
                     self.xbuf.iter_mut().for_each(|x| *x = 0.0);
-                    g.encode(self.viewer, &mut self.xbuf);
-                    let k = (obs_hash(&self.xbuf), legal.clone());
+                    look_encode(g, self.viewer, &legal, &mut self.xbuf, &mut self.rt);
+                    let k = (look_key::<G>(&self.xbuf, &self.rt), legal.clone());
                     match by_key.get(&k) {
                         Some(&gi) => Some(gi),
                         None => {
@@ -1264,20 +1358,20 @@ impl<G: SearchGame> Look<G> {
                     if matches!(q, Req::RootPrior) {
                         g.legal_actions(&mut self.legal);
                     }
-                    sink.row(g, self.viewer, &self.legal, if matches!(q, Req::Belief) { ROW_BELIEF } else { ROW_LEAF });
+                    put_row(sink, &mut self.rt, g, self.viewer, &self.legal, if matches!(q, Req::Belief) { ROW_BELIEF } else { ROW_LEAF })?;
                 }
                 Req::Prior(m) => {
                     let g = self.mems[m as usize].g.as_deref().ok_or("internal: a prior row without a game")?;
                     self.legal.clear();
                     g.legal_actions(&mut self.legal);
                     let p = g.to_move().ok_or("internal: a prior row at a finished game")?;
-                    sink.row(g, p, &self.legal, ROW_LEAF);
+                    put_row(sink, &mut self.rt, g, p, &self.legal, ROW_LEAF)?;
                     self.st.prior_rows += 1;
                 }
                 Req::Group(gi) => {
                     let rep = self.groups[gi as usize].members[0];
                     let g = self.mems[rep as usize].g.as_deref().ok_or("internal: a group prior row without a game")?;
-                    sink.row(g, self.viewer, &self.groups[gi as usize].acts, ROW_LEAF);
+                    put_row(sink, &mut self.rt, g, self.viewer, &self.groups[gi as usize].acts, ROW_LEAF)?;
                     self.st.prior_rows += 1;
                 }
                 Req::Value(_) => return Err("internal: a value in the prior queue".into()),
@@ -1289,12 +1383,13 @@ impl<G: SearchGame> Look<G> {
             let g = self.mems[m as usize].g.take().ok_or("internal: a value row without a game")?;
             self.live_games -= 1;
             if !self.cfg.dedup {
-                sink.row(&g, self.viewer, &[], ROW_LEAF);
+                put_row(sink, &mut self.rt, &g, self.viewer, &[], ROW_LEAF)?;
             } else {
-                // (encoded in place, the row dropped again when its observation was sent already)
+                // (encoded in place, the row dropped again when its observation was sent already; its key covers
+                // its tail, docs/search.md 2.15 K3)
                 let x = sink.push_row(self.viewer, &[], ROW_LEAF);
-                g.encode(self.viewer, x);
-                let h = obs_hash(x);
+                look_encode(&*g, self.viewer, &[], x, &mut self.rt);
+                let h = look_key::<G>(x, &self.rt);
                 match self.vcache.get_mut(&h) {
                     Some(VEntry::Val(v)) => {
                         sink.pop_row();
@@ -1309,6 +1404,9 @@ impl<G: SearchGame> Look<G> {
                         continue;
                     }
                     None => {
+                        if has_rows::<G>() {
+                            sink.row_tail(&self.rt.tb, &self.rt.ov)?;
+                        }
                         self.vcache.insert(h, VEntry::Wait(Vec::new()));
                         self.vhash.insert(m, h);
                     }

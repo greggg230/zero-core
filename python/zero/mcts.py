@@ -24,7 +24,9 @@ Simulation (one network evaluation each, strictly sequential within a tree)
    lowest index. If chance_k > 0 and the edge holds >= chance_k sampled keys, force one
    (uniform over the list) via `force_chance`; otherwise sample fresh and append the key (if
    non-empty). Terminal -> back up the result; else descend to (or create) the child.
-3. Unexpanded node -> leaf: the network evaluates `g.encode(decider)`; the reply expands the
+3. Unexpanded node -> leaf: the network evaluates `g.encode(decider)` (a game with tail segments or
+   pointer overrides: its row, `leaf_row` - `encode_row` and the overrides against the leaf's options,
+   docs/search.md 2.15); the reply expands the
    node and is backed up: N_i += 1, W_i += util[decider of that node], tot += 1, wsum += win.
    util = team_size * win + margin_w * tanh(margin) (`team_size`: seats per team, 1 but for
    team games; win = the value / result, summing to 1).
@@ -186,6 +188,51 @@ def deal(g, tree, rng):
         g.determinize_with(tree.viewer, rng.getrandbits(63), b[0], b[1], b[2], *((b[3],) if len(b) > 3 and b[3] else ()))
     else:
         g.determinize(tree.viewer, rng.getrandbits(63))
+
+
+class Rows:
+    """A game's variable-length rows (docs/search.md 1.4, 2.15): `widths` its tail segments {seg: (width, head, k)}
+    (`games.tail_widths`; None without), `pointers` its pointer overrides, `head` its head tokens (`HEAD_TOKENS`)
+    and `limit` its row limit (`max_row_tokens`; None: none)."""
+    __slots__ = ('widths', 'pointers', 'head', 'limit')
+
+    def __init__(self, widths, pointers, head, limit):
+        self.widths, self.pointers, self.head, self.limit = widths, bool(pointers), int(head), limit
+
+    def capacity(self, tail):
+        """A row's capacity: its head tokens plus its tail tokens (`tail`: `leaf_row`'s, None: none)."""
+        return self.head + (0 if tail is None else len(tail['t_seg']))
+
+    def over(self, tail):
+        """The row's capacity when it passes the limit (the Rust driver aborts its game), else None."""
+        c = self.capacity(tail)
+        return c if self.limit is not None and c > self.limit else None
+
+
+def rows_of(info):
+    """A game's `Rows` from its info (`games.info` / `game_info_of`), None for a game without tail segments or
+    pointer overrides: every caller then takes the path of before (`encode`, no tail, no key)."""
+    if not (info.get('tails') or info.get('option_pointers')):
+        return None
+    t = info.get('tails') or []
+    widths = {int(x['seg']): (int(x['width']), int(x['head']), k) for k, x in enumerate(t)} or None
+    return Rows(widths, info.get('option_pointers'), info.get('head_tokens') or 0, info.get('max_row_tokens'))
+
+
+def leaf_row(g, viewer, rk, opts=False):
+    """`viewer`'s network row of game `g` (docs/search.md 2.15) -> (x f32 [F], tail, ov): `encode(viewer)`, None,
+    None for a game without variable-length rows (`rk` None: the call of before); else `encode_row` - the tail
+    {'t_seg', 't_slot', 't_val'} (None without tail segments) - and, with pointer overrides, (ov_opt, ov_tok): the
+    overrides against `g.legal()` for a row with options (`opts`: the decider's own row), empty for a row without
+    (a value-only or belief row, a deferred terminal's)."""
+    if rk is None:
+        return g.encode(viewer), None, None
+    import numpy as np
+    x, t = g.encode_row(viewer)
+    ov = None
+    if rk.pointers:
+        ov = g.option_overrides(viewer) if opts else (np.zeros(0, np.int32), np.zeros(0, np.int64))
+    return x, (t if rk.widths else None), ov
 
 
 def transition(g, a, forced=None):

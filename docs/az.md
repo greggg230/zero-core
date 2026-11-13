@@ -119,6 +119,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
 | `window_cache`, `window_sparse` | 0, 0 | 1 = the window's shards stay in RAM between iterations (zero/data.py WindowCache); 1 = the window keeps each row's features as their non-zeros - the same window and batches in a fraction of the RAM for a sparse encoding, and with `window_cache` every shard cached whole also over budget, so an iteration loads only its new shards (10.8). The budget still counts dense rows |
 | `shard_sparse` | 0 | 1 = self-play writes each shard's features as their non-zeros (`x_ptr` / `x_idx` / `x_val`, meta `x_format` 'sparse'; every other array as before; this machine's shards and a remote's): the dense rows bit for bit in ~1/25 of the disk on MTG Zero's Delver line, written ~4-5x faster with the float32 rows never buffered. Every reader takes both formats, so a window may mix them; an older checkout cannot read a sparse shard (`data.convert_shard` makes it dense again) (32) |
+| `allow_draft_layout` | 0 | 1 = a run may train on a game package's token layout marked `draft` (variable-length rows: MTG Zero's layout v7 while it is built, R16); 0: such a run is refused at start (exit 78). A layout without `draft` - every layout of before - is unaffected (43.4) |
 | `train_static` | 0 | 1 = a token network trains through its static forward (`TokenNet.forward_static`, the inference graphs': each batch one chunk of its longest row's tokens, no host sync) with a fused AdamW on CUDA, and a sparse window's batches travel as their non-zeros (dense on the device): the same batches and losses, the updates up to float32 rounding; ~2.8x a step on MTG Zero's Delver network (10.9). Another network is refused |
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
@@ -1260,7 +1261,9 @@ encoding.`
   **not** restart it (state `refused`: a restart would refuse again).
 * **The optimizer state** (`opt_latest.pt`): loaded only if its moments have the shapes of the
   checked network's parameters (`run.opt_state_mismatch`; torch checks the counts only, and another
-  network's state would fail at the first step); else logged, fresh optimizer.
+  network's state would fail at the first step); else (since 2026-11-12, 43.10) the run is refused
+  (`run.OptimizerStateMismatch`, exit 78) - deleting the file starts a fresh optimizer deliberately; a state
+  of another iteration is logged and replaced by a fresh one.
 * **The evaluator's last line** (`infer.NetEvaluator`): a leaf batch whose rows are not as wide
   as the network's input raises EncodingMismatch (one comparison per batch), whatever loaded the
   network.
@@ -5563,6 +5566,684 @@ of 24 contests, 1-3 drawn), ~6.8 samples per game; the evaluation reports, e.g.,
 games 8.5/9 (`per_game`); the Elo log `iter_0002 vs iter_0001: 2.0/4 (games 4.0/8)`. MTG Zero's best-of-three smoke:
 its ENGINE.md 121.5.
 
+## 43. Variable-length rows: tail tokens and pointer overrides in shards, the window and the run (`allow_draft_layout` in 43.4; MTG Zero's layout v7, 2026-11-11)
+
+**Why.** MTG Zero's rule is that the engine **and the network's input** are exact in every reachable state. Fixed
+slot caps (a hand past 16 cards, a stack past 8, waiting triggers past 4) and new kinds of state (delayed triggers,
+the opponent's triggers, links, exile offers) need a variable-length **tail** of tokens after today's fixed-width row
+(the **head**), and options about objects past a cap need **pointer overrides** (docs/search.md 1.4, 2.15). This
+section is the data path of lane X (shards, window, run, tools, remotes); 43.5-43.8 are the network's (lane Y).
+
+### 43.1 Rows on the host and shard format v2
+
+* `zero.rows`: `Tail` (CSR over rows: `off`, `seg` u16, `slot` u32, `val` float32 / float16, `widths`) and
+  `Overrides` (`off`, `opt` i32, `tok` i64), with `take` / `concat` / `nbytes` / `padded` / `to_torch`; `pack_tok`,
+  `unpack_tok`, `layout_tails`, `resolve` (overrides -> the network's `ov`: each target's extended position - a head
+  slot's place in the full token axis, a tail token's `n_tok` + its index in the batch's tail; refuses an absent head
+  slot, a missing tail token, a column out of range, an option out of its row: R6), `token_full` (a static forward's
+  `full` / `ntok` with each row's tail tokens after its head tokens), `game_row` (a game's `encode_row` and
+  overrides for an evaluator), `shard_layout`.
+* The bindings (docs/search.md 2.15): batch and sample dicts carry `t_off` / `t_seg` / `t_slot` / `t_val` and
+  `ov_off` / `ov_opt` / `ov_tok` for a game with them only; `LeafBatch.tail` / `.ov`; `Game.encode_row`,
+  `Game.option_overrides`; `Game.encode` raises ValueError on a state with a tail (R1); `game_info()` adds `tails`,
+  `option_pointers`, `max_row_tokens`, `head_tokens`. `protocol.concat_samples` and `take_rows` carry the CSRs
+  (re-offset); `validate_rows` checks them.
+* **Shard format v2** (`zero/data.py`): written iff the game declares tails or pointer overrides (`shard_format(cfg,
+  info)` adds the meta `t_segs` [[seg, name, width, head], ...], `option_pointers`, `max_row_tokens`), always sparse
+  (`x_version` 2): version 1's members plus `t_ptr` int64 [N+1], `t_seg` uint16, `t_slot` uint32, `t_val` float16
+  (dense per token), `ov_ptr` int64 [N+1], `ov_opt` int32, `ov_tok` int64. A dense shard with tails is refused at the
+  setting (`shard_format`), at `ShardWriter.add` and at `write_shard` (R8): an older reader would read `x` and ignore
+  the tail. Version 1 readers refuse version 2 (their `x_version` check); this build reads both and refuses a newer
+  one (R7). `read_shard` returns the v2 members with the features (`head_only=True` drops them: an explicit choice);
+  `shard_features` - the features alone - is refused for a shard with any tail token or override unless `head_only`
+  (R10). `convert_shard` keeps v2 (never dense). The non-finite guard reads `t_val` (zero/finite.py).
+
+### 43.2 The window and training
+
+* `Window(..., layout=<the network's normalised layout>)`: with tail segments or pointer overrides it loads every
+  shard's tails and overrides (`Window.tail`, `Window.ov`) through the dense, sparse, cached (`WindowCache`, its key
+  names the tail segments) and subsampled loads, its `nbytes` counting them; a shard of other tail segments, or one
+  without them (v1), is refused (R9: a v7 network trains on v2 shards only - a fork starts a fresh window). Without a
+  layout, a shard with any tail token or override is refused (R11: never a silent drop).
+* `Window.batch(idx, tokens=None, coo=False)` adds `'tail'` (the network's `tail`, unpadded) and `'ov'` (resolved,
+  the head slots' presence read from the features) and with `tokens` builds `full` / `ntok` by `rows.token_full`;
+  `Window.row_inputs` gives the same for any rows (distill's outputs); `use_layout` swaps in the network's layout for
+  a window loaded from its shards' `t_segs` (a held-out set). `data.batches` moves the nested dicts to the device.
+* `run.train_model` passes `tail` / `ov` to `forward` / `forward_static` only when the batch has them
+  (`rows.forward_kw`: the calls of before otherwise); `distill.outputs` / `losses`, `heldout` (sets made from v2
+  shards keep their tails; `HeldOut.evaluate` takes the network's layout, R9), `targets`, `bench --shard` (the rows'
+  tails through `infer` and `train`) and `replay` (the root's `encode_row`) pass them through.
+
+### 43.3 The run: refusals and metrics
+
+* At start (`Run.check_rows`, before any work; `RowsRefused`, an EncodingMismatch: exit 78, not restarted): a layout
+  marked `draft` without `allow_draft_layout` (R16, 43.4); a build whose rows differ from its package's layout -
+  tails, pointers, limit or `HEAD_TOKENS` vs the layout's 1 + Σ count, a stale build with 0 included (R15:
+  `package.check_rows`, also run by `games.Driver` and at `register` when the engine is loaded); a game with tails or
+  overrides with an arch other than 'tokens' (R4) or with `shard_sparse` 0 (R8).
+* The row limit (docs/search.md 2.15): a game whose row passes `max_row_tokens` is aborted (no samples), counted and
+  logged, never truncated.
+* Metrics, only for a game with tail segments: self-play `tail` = {rows sent with a tail, their tokens, the most in
+  one row, `aborted_row_tokens`} (a line in the log when a game was aborted); training `tail` = {the window's rows
+  with a tail, tokens, max, overrides, and when the network has gated segments its `gates` {segment: g}, `gate_steps`
+  {segment: training steps whose batch held its tokens} and `gates_stuck` (43.6)}.
+
+### 43.4 Draft layouts, remotes, the toy
+
+* **`allow_draft_layout`** (run setting, default 0): a package layout with `"draft": true` (MTG Zero's v7 until this
+  project ends) is refused by a run at start (R16; `tools/fork_run.py --allow-draft` is lane Y's). 1 trains on it
+  anyway. Off by default; a layout without `draft` is unaffected either way.
+* **Remote self-play**: a worker's hello carries `caps: ['tails']`; for a game with tails or overrides a worker
+  without it (an older checkout) is refused, logged and retried in 10 minutes (R13), as the other capability checks.
+  The worker's samples are split per game with their tails (`remoteplay.split_games_rows`; its shards are v2).
+  **Remote evaluation**: the result line carries `caps`; an older remote's result for such a game is refused
+  (`RemoteRefused`) and retried.
+* **The toy** `toy_tail` (docs/search.md 5.3) with its layout `package.TOY_TAIL_TOKENS` is registered in the core's
+  package and engine.
+* **Other readers of samples and shards:** `workqueue.split_games(rows, s, widths)` cuts a dict's tail and override
+  CSRs with their games (`protocol.take_rows`; a tail without the game's widths is refused - the run's shared-queue
+  self-play and its local linger pass `games.tail_widths(info)`); co-training's writers take the meta of
+  `Run.shard_meta` (format v2 for a resolver game with tails) and `CoRun.loop` runs both games' `check_rows`;
+  `zero/tools/distill.py` builds its window with the student's layout; `tools/selfplay_digest.py` hashes each
+  record's tail and overrides (a game without them: the digest of before). `tools/reader_measure.py` (the toy's
+  reader study) is the toy's only (`games.info('toy')`, its features by `encode`): no game with tails reaches it, and
+  its window without a layout would refuse one (R1, R11).
+* **The Python search and the lookahead** (2026-11-12; until then refused for a game with tails: P1 of the plan, R12)
+  carry every row's tail and overrides, as the Rust driver's rows (docs/search.md 2.15, "The lookahead and the Python
+  search"): the `SearchTree` binding (`simulate(..., rows=True)`; refused without it for such a game), `mcts.py`'s
+  reference tree (`mcts.leaf_row`), `play.PyDriver` (batches, samples, the row limit aborting a game) - and so
+  `zero.replay` (the AI replays, every game package's replay publisher built on it, lookahead seats included),
+  `zero.parity` (positions, root views, its `h2h` of a Rust and a Python seat: `--game` / `--spec`) and `zero.targets
+  quality`; the lookahead in the driver (lookahead seats, value choices) and the position API `Lookahead`
+  (`next_batch()`'s `t_*` / `ov_*`, `info()`; `zero.lookahead.drive` / `evaluate_position` pass them to the
+  evaluator), its dedup and information-set keys covering them (K3). An evaluator given to the position API or to
+  `drive` must take `tail=` / `ov=` (`NetEvaluator.evaluate` does).
+
+**Off by default / byte identity.** Everything above is keyed on the game declaring tail segments or pointer
+overrides (and `allow_draft_layout` only reads a `draft` key no layout of before has): Glass Road, Caverna, Kingdom
+Builder, the toy and every existing MTG Zero layout produce no new array, key, meta, metric or stats key, and their
+shards are written byte for byte as before (`x_version` 1 or dense). config.json gains `allow_draft_layout`.
+
+**Costs.** For a game without tails: a few constant-false branches. With them: the tail tokens' floats per row (MTG:
+mostly none; a hand past 16 cards is ~4% of Delver states), their key mixing, a CSR per batch assembled serially
+(rows without a tail cost an offset), float16 tail floats in shards.
+
+**Tests and checks.** `tests/test_tail_rows.py` (12: the bindings, R1, a head-only caller of a tree refused, the
+containers, batches / samples / records / take_rows / concat carrying the rows exactly, the cache with sparse batches,
+the limit, games without rows unchanged, R15, R6, the remote split), `tests/test_tail_shards.py` (11: v2 round trip,
+R7-R11, convert, the finite guard, the window's five loads and its batches incl. the static axis and the resolved
+overrides, distill / held-out / bench feeding the rows, v1 shards unchanged), `tests/test_tail_loop.py` (3: toy_tail
+through the run's own self-play phase - synchronous and threaded writer, the same shards - into the window's
+batches, an aborted game, the run's refusals), `tests/test_tail_search.py` (12: the tree binding's leaf rows = the
+game's own and the reference tree's; Rust-Python parity on toy_tail with a stand-in reading every tail token and
+override, and its power check; games without chance identical in both trees, byte for byte, every row and the value-only
+rows; the Python driver's batches and samples - every row's tail its own state's, every pointer in its row -; its
+row limit, at the first row and mid-search; games without rows unchanged; `zero.replay` with a token network, a
+lookahead seat too; the position API's rows and its limit; `targets quality` and `parity h2h` on toy_tail); the Rust
+tests of docs/search.md 2.15.
+
+**Measured** (the desktop, 2026-11-11, other lanes' builds and tests on the CPU). Byte identity: `tools/check_checkpoint_compat.py
+--package zero --game toy` against f9ca5c3 (the base) - `--net random`, `--net uniform` and spec `{"food": [3, 1]}` -
+identical records and results (visits, cq, vs random). toy_tail, 64 self-play games (32 / 8 sims, a row echo
+evaluator, sparse batches): items0 3 - 33,687 rows, 59% with a tail, 2.2 tokens per such row, at most 8, none
+aborted, 0.8 s; items0 12 - 34,288 rows, 64%, 3.0, at most 13, 0.9 s.
+
+**Measured, the Python search and the lookahead** (the desktop, 2026-11-12, other sessions' tests and runs on the
+CPU). Byte identity for games without tails, against f9ca5c3: `check_checkpoint_compat --package zero` with
+`--net random`, `--net uniform`, spec `{"food": [3, 1]}`, a toy MLP and a toy token checkpoint - identical; and 20
+goldens of the consumers this change touches, each the same JSON in both checkouts: `zero.parity` (positions with
+chance_k 0 and 2, toy_team's deferred leaves, root views, Gumbel, the floor, the belief, the select / cq / Gumbel
+formulas, `h2h` with a checkpoint), `PyDriver` self-play with 'py' and 'rs' seats (root views, value-only samples,
+'cq': every batch's and sample's arrays hashed), `zero.replay` (an MLP vs random, a token network vs itself, a
+lookahead seat), the position API (`evaluate_position`, every round's rows) and `targets quality`. Parity on
+toy_tail: docs/search.md 6 (Rust-Python at the Python-Python floor; rows without their tails told apart at TV 0.59;
+games without chance identical byte for byte in both trees; h2h 50.15% +-2.19 and 50.20% +-2.19).
+
+### 43.5 The layout keys and the network's tail tokens (`net.tokens_layout`, `net.TokenNet`; lane Y, 2026-11-11)
+
+(43.1-43.4: the rows, the driver, the shards and the run, lane X; 43.5-43.8: the network, its gates, inference and
+the widen, lane Y.) Everything here is opt-in: a layout without the new keys normalises as before, a network without
+tail segments has no new parameter and runs the code of before line for line, and a tail network's batch with no
+tail token and no override runs that code too.
+
+**Layout keys** (each stored in the normalised layout only when set):
+
+| Key | Where | Meaning |
+|---|---|---|
+| `tail: true` | segment | its slots >= `count` come as tail tokens |
+| `count: 0`, `offset: null` | segment | a tail-only segment (needs `tail`; claims no feature) |
+| `gate: true` | segment | a gated segment (43.6); only with `count` 0 |
+| `columns: k` | segment | k pointer columns after its action pairs (and identity column), no static table; needs `option_pointers` |
+| `option_pointers: true` | layout | rows carry pointer overrides (43.7) |
+| `max_row_tokens: n` | layout | required with a tail segment, >= 1 + sum(count); the driver aborts a game past it |
+| `draft: true` | layout | refused by run launches and fork_run unless allowed (43.8); not part of the encoding |
+
+The action collision check covers head slots only (a tail token never gets a static action).
+
+**Parameters** (all absent without tail segments): `seg_in.{i}` for every segment (tail-only too); `tail_base`
+[n_tail, d] (a head-ful segment's row starts as its last head slot's `pos`, a tail-only one's N(0, 0.02));
+`pos_tail.{k}.weight` [d, 49] (N(0, 0.02), no bias); `gate` [n_gated] (43.6); `ptr` with a row per pointer column.
+
+**A tail token** at slot s of tail segment k (head count c) is embedded as a head slot: the segment's input map of its
+floats + its identity's embedding + its position `tail_base[k] + pos_tail[k](psi(s - c))`, where psi(n) for n in
+[0, 2^32) is its 32 binary digits (computed from the int64 slot on the device: exact for every u32), log2(n + 1) / 32,
+and sin / cos(2 pi (n mod 2^j) / 2^j) for j = 1..8 (interleaved sin_1, cos_1, ...; float64, then float32).
+
+**Inputs** (the API's 2.6): `forward(x, n_players, aux=False, aux_rows=None, tail=None, ov=None)` and
+`forward_static(x, n_players, full, ntok, aux=False, tail=None, ov=None)`. `tail = {'row', 'seg', 'slot': int64 [NT],
+'val': float32 [NT, Wt]}` (rows ascending; Wt the widest tail segment's width, a token's floats first) is required,
+possibly empty, iff the network has a tail segment; `ov` (43.7) iff `option_pointers`. Refused (ValueError, R5): a
+missing or unexpected `tail` / `ov`, a token of a segment without a tail or at a head slot, rows out of order, the
+wrong float width, an override whose target is not a present token of its row with that column - in eager always
+(host syncs), in `forward_static` outside a CUDA graph capture (one host sync; inside a capture the host checked).
+
+**Packing.** Eager: each row's tail tokens follow its head tokens (`n` counts them), the rows sorted by token count
+and chunked as before; a segment's tail tokens are embedded by one product of their own. Static: `full` holds
+extended positions (0 the global token, 1 + ... the head slots, `n_tok + j` the batch's tail token j); the tokens are
+gathered from cat(every head slot [B * n_tok, d], the tail tokens [NT, d]); the tail embedding is a few dozen kernels
+whatever the number of tail segments (`_tail_embed_static`: every tail segment's input map on every token as one
+product - their weights in one zero-padded matrix -, every position map as one, each identity layout's digits decoded
+once, each token's own picked by its segment - one autograd node, 43.9; a loop over the 13 tail segments of a
+v7-like layout cost a training step ~1,250 kernel launches, ~35 ms more on the desktop). Padded tail entries (row 0, the first tail segment, slot
+its count, floats 0) and padded overrides (action `actions`, ref -1) are allowed. `present_index()` stays the head's.
+
+### 43.6 Gates: new kinds of token, exactly inert at a widen (`gate`)
+
+A gated segment s has a gate theta_s, g_s = max(theta_s, 0) with a straight-through gradient (backward the
+identity: a gate pushed below 0 comes back). A token weighs 1 (the global token, every ungated token), g_s (a token of
+gated segment s) or 0 (padding):
+
+* attention: p_ij = exp(s_ij - m_i) w_j, out_i = sum_j p_ij v_j / sum_j p_ij, m_i the max over the non-padding keys;
+* pooling: z_mean = sum_t w_t h_t / sum_t w_t;
+* an override into a gated segment's token: gen[a] + min(g_s, 1) (ptr - gen[a]), as `torch.lerp`: exactly the generic
+  logit at 0, exactly the pointer logit at 1.
+
+At g = 0 a gated token changes no other token, the pooling or any logit, exactly; it still attends as a query.
+**Paths:** without gated segments, today's bool-mask SDPA; with gated tokens present, SDPA with the float mask log w
+(-inf at 0) in inference and in training once every present gate is above the shadow (43.14; > 0 without it), and an
+explicit math attention (`TBlock.forward_weighted`, the same formula, one autograd node with its backward by hand:
+43.9) in training while a present gate is below it (SDPA's mask would give the gate no finite gradient at 0;
+forward_static's flags decide, read without draining the device: 43.9). The static forward weighs every token whenever the
+network has gated segments and the batch has tail tokens (no data-dependent branch; with weights 0 / 1 the float mask
+is the bool mask's computation). At g = 0 the gate is the only parameter of its segment with a gradient (the
+segment's own maps get exactly none until it opens) - unless a shut gate's shadow is on (43.14, the default), which
+back-propagates a shut segment as if its weight were the shadow, the forward unchanged.
+
+**In a run** (2026-11-12, the coordinator's decisions; the API's change log): `TokenNet.gates()` -> {segment: g} is
+logged every iteration as `train.tail.gates`, with `train.tail.gate_steps` (per gated segment, the training steps
+whose batch held its tokens); a gate still exactly 0 after `run.GATE_STUCK_STEPS` = 100 such steps is said loudly - a
+`WARNING gate <segment> still exactly 0 after N training steps ...` line in the run's log and `train.tail.gates_stuck`.
+The gates are **not weight-decayed** (`net.NO_DECAY`, `no_decay_params`): AdamW gets them as a group of their own, last,
+with `weight_decay` 0 (a scalar gate decayed would be biased shut); every other parameter stays in the groups of
+before, so a network without gates has the optimizer of before, its groups and their order (check_checkpoint_compat:
+identical). `zero.distill` does the same for a student with gates.
+
+Built fresh, a gate is 1; a widen sets each new segment's gate to exactly 0 (43.8).
+
+### 43.7 Pointer overrides, the evaluator and the CUDA graphs (`infer.py`)
+
+**Overrides in the network.** `ov = {'row', 'act' (the option's action), 'ref' (the target's extended position;
+-1 = the generic logit), 'col' (the target segment's pointer column)}`, int64 [NO], resolved on the host
+(`rows.resolve`, lane X). After the static scatter of head slots' actions, each override's action gets its target
+token's logit in its column (a gated target's blended, 43.6) or, ref -1, the generic logit saved before the scatter.
+A tail token has no static action: it scores only through overrides. A row that fits the old caps lists none.
+
+**`NetEvaluator`.** `evaluate(x, n_players, opt_off, opt_action, extra=None, tail=None, ov=None)` (`rows.Tail` /
+`rows.Overrides`; `__call__` / `launch` take them from `LeafBatch.tail` / `.ov`; `max_rows` pieces and worker threads
+cut them with the batch; `aux(x, n, tail=)` / `reader(...)` take the rows' tail and give an empty override set).
+Refusals: a network without tails or pointers given either (R5); at construction, a game whose `game_info()['tails']`
+is non-empty with any network but a token network with exactly those tail segments (`TokenNet.tail_segments()`;
+ValueError, R4).
+
+**`TokenGraphRunner`** (`launch(..., tail=None, ov=None)`, `launch_sparse(..., tail=None, ov=None)`): the host packs
+the head presence as before plus each row's tail tokens (`token_index_tail`), checks the tail and the resolved
+overrides (what a graph cannot check: a target a present head slot or a tail token of the same row, its column), pads
+the tail to NTp and the overrides to NOp in {0} U {16 * 2^k} (`tail_bucket`) and uploads only the tail floats and the
+overrides beside the rows; one graph per (rows, tokens, tail tokens, overrides). A batch with no tail token and no
+override runs the graph (rows, tokens, 0, 0): the static forward of before. **Rows of more than `LONG_T` = 128
+tokens** are evaluated eagerly (`_eager_rows`, in groups whose attention matrices stay under `LONG_BYTES` = 512 MB),
+the other rows through the graphs, the answers merged in row order (`_Split`); `long_rows` counts them.
+
+### 43.8 The widen, the encoding guard, fork_run; tests, checks, measured
+
+**Widen** (`net.widen(old, ..., layout=, ungated=False)`, `token_feature_map`, `_widen_tokens`). Allowed beyond 10.3:
+a segment gaining `tail` (its head unchanged; its `tail_base` row starts at the old network's last head slot, its
+`pos_tail` fresh: no old row reads them); tail-only segments appended after the old ones (fresh `seg_in`, positions,
+and a gate exactly 0 - `gate: true` written into the widened layout unless `ungated=True`, which refuses a layout that
+gates them anyway); the layout gaining `option_pointers` / `max_row_tokens`; `draft` changing. New pointer columns get
+zero `ptr` rows. Refused: everything 10.3 refuses, plus a segment losing its tail or changing its gate or columns, a
+new segment with head slots or not at the end, the layout losing `option_pointers`, a limit below the head. A
+tail-only segment's pointer columns are a matrix product of their own (`TokenNet.ptr_parts`: rows of the same `ptr`),
+so a widened network computes the old columns by the products of before (one wider product rounded them differently);
+with gradients on (training) the head is one product (43.9).
+
+**Exactness** (`tests/test_tail_net.py`): a network of the toy's layout without tails widened onto the toy's tail
+layout (tail on items, option_pointers, the gated marks) computes the old outputs bit for bit (policy, value, margin,
+the auxiliary head; CPU and CUDA; also saved and loaded) on rows without tails (eager and static) and on rows whose
+only new tokens are gated marks (static at the same T; eager when a chunk's length is the same; to float rounding
+otherwise, < 1e-5); through the CUDA graphs bit for bit on rows with gated marks. A tail network widened by gated
+segments with pointer columns: bit for bit in eager on rows with tail tokens, overrides into head slots, tail tokens
+and the gated segment; to rounding in static there (the tail embedding is one product over every tail token, and the
+old batch has fewer); the gated segment's overrides exactly the generic logit at g = 0 and exactly the pointer logit
+at g = 1 (as the same network with the segment ungated).
+
+**Exporters (R14)**: `net.varlen_features(model)` names a network's tail segments, pointer overrides and gates;
+`zero.webexport` (the browser players' weights) refuses a network with any of them (ValueError: its fixed-width rows
+would drop them). zero-onnx (`zero/onnx_export.py`) is on the `farm` branch, not in this tree: **whichever of `farm`
+and `feat/varlen` lands second adds the same refusal there** (in the exporter's constructor, beside its
+`isinstance(net, TokenNet)` check: `varlen_features(net)` non-empty -> ValueError).
+
+**Remote self-play (R13)**: `tests/test_tail_remote.py` - a local worker with a token network plays toy_tail, its v2
+shards carry tails (and the run trains on them and their overrides); a worker whose hello reports no capability
+'tails' (the tests' `no_tails`) is refused, and this machine plays every game.
+
+**Encoding guard** (10.4): the segments' `tail` / `gate` / `columns` and the layout's `option_pointers` /
+`max_row_tokens` are compared with the build's layout (absent on both sides for every layout before them);
+`layout_sans_identity` drops `draft` with `name` / `version`.
+
+**fork_run**: `tools/fork_run.py <src.pt> <run> [--ungated] [--allow-draft]`: the widen above onto the game's layout,
+checked by the guard before it is written - so a game's layout must declare `gate: true` on its new segments for the
+gated fork (else the fork is refused, or `--ungated`); a `draft` layout is refused unless `--allow-draft` (R16; a
+continuation `--source` too, unless the run's settings set `allow_draft_layout`).
+
+**Tests.** `tests/test_tail_net.py` (21): layout keys and validation, psi's exactness, both exactness tests above (CPU
+and CUDA), tails changing only their rows, static = eager with every kind of padding, the gates' gradients (eager and
+static; g = 0 explicit, g < 0 straight-through, g > 0 SDPA; inference never explicit), overrides' logits, the R5
+refusals, widen refusals, the ungated widen, the guard, the evaluator (eager, pieces, LeafBatch, aux, R4, R5),
+fork_run. `tests/test_tail_graphs.py` (8): the host packing, graphs = eager (dense and sparse, pieces, value-only and
+belief rows, g = 0 and > 0, deterministic), a batch without tails through the graph of before, the widen through the
+graphs, long rows eager beside the graphs, new weights / gates in place, the host refusals. Both build their rows
+from tensors and the toy's literal layout; `zero.rows` (lane X) is used when present, else a stub of its frozen API.
+
+**Measured** (desktop RTX 5090 shared with another session's run, 8-17% busy; three interleaved rounds, medians).
+A random 128 x 4 network on MTG Zero's layout v6 (44,212 features) against its widen onto a v7-like layout (tails on
+the 7 capped segments, 6 gated tail-only segments of 60-230 floats, option_pointers), synthetic Delver-like rows
+(~15-25 present head tokens; 1-2 gated `delayed` tokens on 23% of the rows; 1-15 ungated hand tail tokens on 4%):
+
+| per batch | v6 | v7, no tail token | v7, gated g = 0 | v7, gated + tails |
+|---|---:|---:|---:|---:|
+| eager inference, 192 rows | 34.8 ms | 30.8 | 40.1 | 43.8 |
+| train_static step, 512 rows, T 48 | 28.5 | 28.1 | 42.7 (g = 0.5: 39.7) | 45.5 |
+| graphs, 144 rows: replay / whole call | 1.66 / 3.63 | 1.71 / 3.80 | 1.87 / 4.68 | 1.90 / 4.98 |
+| graphs, 512 rows: replay / whole call | 2.57 / 7.36 | 2.65 / 7.56 | 2.80 / 9.00 | 3.57 / 10.24 |
+
+So: a tail network's batch without tail tokens costs what v6's does (the code of before); gated tokens cost the
+graphs' replay +6-9% and the host ~1 ms a call (the tail's packing, checks and four more uploads: hidden behind the
+device by drive's two batches in flight when the device is the bound), and a training step +40-50% in this
+synthetic (the tail embedding's and the weighted trunk's ~230 more kernels, at ~27 us a launch on this shared GPU;
+the explicit attention at g = 0 another ~3 ms). The toy's 32 x 2 network: graphs 1.6 -> 2.0 (no tail token) -> 3.0 ms
+(gated) a 144-row call.
+
+**Checks** (tier "opt-in core feature with byte-identical defaults"; the desktop, 2026-11-11, a38fc7f; the machine
+loaded by three other sessions' test suites throughout):
+
+* `pytest tests`: 476 passed, 4 failed, 2 errors (1 h 44 min). The remote and co-training timing tests - two
+  co-training remote-evaluation fixtures timed out, a host of `test_multi_remote` got no game, `test_remoteplay`'s
+  dying worker's share, a co-training run's subprocess exit 0xC0000005 in `test_encoding_guard` - each passed alone
+  afterwards; `test_token_graphs::test_graphs_match_eager_and_follow_new_weights` (graphs against eager: 3.7e-5
+  against its bar 2e-5) fails the same way, the same value, on f9ca5c3 on this shared GPU (4 of 4 runs each; earlier
+  1 of 3 passed on f9ca5c3). The new tests 29 passed; test_net_data / test_token_graphs / test_encoding_guard 57
+  passed in a targeted run.
+* `check_checkpoint_compat --package zero` (roots `<checkout>/python`) against f9ca5c3: a toy token checkpoint with
+  the auxiliary head, a toy MLP checkpoint and `random`: identical (records visits / cq, results, the match).
+* `smoke_all.sh --with-this-core --build-only`: glassroad-zero, caverna-zero, kingdombuilder-zero build (3 of 3,
+  GREEN).
+* With lane X's `feat/varlen-rows` (1c33d53) merged in a scratch worktree: both lanes' tail tests 56 passed, and
+  `toy_tail` runs end to end with a token network (2 iterations, CPU eager; and CUDA graphs + sparse batches +
+  train_static + a sparse window): self-play with tail tokens (up to 21 a row) and overrides through `NetEvaluator`,
+  v2 shards, training on them (the window's overrides resolved: 227), Elo matches.
+
+### 43.9 The static training step with tails and gates: its cost brought down (2026-11-12)
+
+**Why.** With gated tokens on 23% of the rows (a synthetic Delver-like batch: a random 128 x 4 network on MTG Zero's
+layout v6 widened onto a v7-like layout - tails on the 7 capped segments, 6 gated tail-only segments, option_pointers),
+a `train_static` step of 512 rows cost +45% of v6's, in the steady state too (every gate > 0), not just the gated-at-0
+phase (+56%) - against the design's +10-25%. The step is bound by the host's dispatch (~11 ms of kernels in a ~30 ms
+step, the GPU shared), and the tails' path added ~200 launches, ~815 aten operations, two host syncs and ~45 autograd
+nodes a step: per-segment loops (13 tail segments), the per-parameter assembly of the tail embedding and its
+backward, the checks.
+
+**What** (`net.py`; the math unchanged):
+
+* The static tail embedding is **one autograd node** (`_TailEmbed`): its forward runs the ops of before, unrecorded;
+  its backward the same gradients in ~12 operations (the input maps' and the positions' products, one scatter of the
+  gradient shared by both, the per-parameter gradients as views of one buffer by `split` / `unbind`; `tail_base`'s
+  gradient is the biases' - both sum the gradient over a segment's tokens -, the identity embedding's one `index_add`).
+* psi's sin / cos part comes from a table of its 256 values (n mod 256; computed once per device by psi's own ops:
+  the same floats); a tail token's identity digits are decoded by two products for all its digits (the same
+  identities for one-hot or empty digit blocks, what encoders write).
+* forward_static's checks (R5) and the explicit attention's decision are **0-d flags computed before anything else**,
+  read once - copied to pinned memory behind a CUDA event and waited for just before the trunk, when the device is
+  long past them (no drained pipeline; a bad batch is still refused before the trunk, every index clamped until
+  then). The gates' token weights are one gather from the gate vector extended by a 1.
+* With gradients on, the pointer head is one product (its row-slice parts, 43.8, are for the widen's bit-exact
+  evaluation; training does not need them).
+* The explicit weighted attention (a present gate exactly 0) is **one autograd node** (`_WeightedAttention`): the
+  forward the explicit math of before, op for op, on [B heads, T, .] batched products; the backward by hand (dv =
+  a^T dO; R = (dO v^T - D) / Z; dw_j = sum e_ij R_ij; ds = p R; dq, dk from ds).
+
+**Numerics** (the same seeded networks and batches through 391165e and this code, toy layouts with overrides into head
+slots, tail tokens and a gated segment with pointer columns, and the Delver-like network, gates 0 and 0.5, CUDA):
+every inference output - `forward_static`, `forward`, hence the CUDA graphs - **bit for bit** (policy, value, margin,
+the auxiliary head); training outputs and every parameter's gradient within float32 rounding, at most 4.2e-7 of their
+scale (the pointer head's one product, the sums of `tail_base`'s / the embedding's / the gates' gradients in another
+order, the explicit attention's backward by hand).
+
+**Measured** (the training step, 512 rows, T 48, forward + backward; the configurations alternated step by step,
+shuffled, 200 repetitions each, two runs each; the desktop's RTX 5090 shared with other sessions; medians):
+
+| step (vs v6, two runs) | before (391165e) | after |
+|---|---:|---:|
+| v6 (no tails) | 27.5 ms | 27.5 ms |
+| v7, no tail token in the batch (the code of before) | +0% / -2% | -2% / +7% (noise) |
+| v7, gated tokens g = 0.5 (steady state) | +45% / +45% | **+11% / +12%** |
+| v7, gated tokens + ungated tails on 4% of rows | +45% / +48% | +14% / +16% |
+| v7, gated tokens g = 0 (the explicit attention) | +56% / +57% | +22% / +21% |
+
+Per step at g = 0.5: launches 706 -> 643 (v6: 502), aten operations 3,173 -> 2,876 (2,354), host syncs 2 -> 0
+waits on a drained pipeline. Inference (the graphs' replay) is unchanged.
+
+Tests: `tests/test_tail_net.py`'s gradient test forces the explicit attention through `_explicit_flag` (static and
+eager); every tail test passes; the equivalence above is a scratch script (`perf_equiv.py`, not committed).
+
+**Autocast** (2026-11-12, found by MTG Zero's lane Z). `run.py` and `zero.distill` train a token network in float32
+(`infer.use_amp` turns bfloat16 autocast on for the conv network only), but any caller under CUDA autocast - and the
+graphs' measurement mode `TokenGraphRunner(amp=True)` - crashed on a gated network: the pointer blend's `torch.lerp`
+of bfloat16 logits by a float32 gate weight, and `_WeightedAttention`'s backward (float32 gradient, bfloat16 saved
+operands) whenever a present gate is 0. Fixed:
+
+* the blend runs in float32 and is cast back: bfloat16 / float16 logits are exact in float32, so it is still exactly
+  the generic logit at g = 0 and exactly the pointer logit at g = 1 (`tests/test_tail_amp.py` compares them bit for bit
+  under bfloat16, static and eager, training and inference);
+* both autograd nodes (`_TailEmbed`, `_WeightedAttention`) are `torch.amp.custom_fwd(cast_inputs=float32)` /
+  `custom_bwd`: float32 inside under autocast, their backward in the forward's autocast state; the identity digits are
+  decoded with autocast off (exact integers); eager's token weights are in the gates' dtype;
+* the eager forward's per-chunk accumulators take each chunk's outputs in their dtype (`.to`, a no-op without
+  autocast): a token network's eager forward crashed under autocast before this project too (f9ca5c3: `index_copy_`
+  of bfloat16 logits into float32), now it runs.
+
+Without autocast nothing changes (forward outputs and gradients bit for bit; the gates' and the identity embedding's
+gradients sum by atomics: they vary run to run in the last bits, as fd8e246's). The float32 mask log w and the gated
+pooling are float32 (the gates' dtype); SDPA under autocast casts the mask to bfloat16 (-inf and 0 exact). float16
+autocast still fails in `_heads` (its absent seats' -1e9 overflows float16: every network kind, before this project
+too; no caller uses float16) - with that mask made float16-safe the varlen paths run under float16 as well.
+
+Tests: `tests/test_tail_amp.py` (13, CUDA): the blend's exactness; AdamW steps under bfloat16 for eager and static
+at gates 0 and > 0 with tails and overrides into gated and ungated tokens (finite gradients, the gates' non-zero, the
+loss lower, float32's outputs within bfloat16's precision, the explicit attention exactly while a gate is 0); a
+train_static step at shut gates with and without overrides (lane Z's case); the graphs' bfloat16 mode with tails;
+`Run.train_model` on toy_tail on CUDA with autocast forced on, eager and train_static.
+
+### 43.10 The optimizer state of a network with gates (2026-11-12)
+
+**The bug** (391165e - 9ab650f; found by MTG Zero's lane Z on CPU toy_tail runs): the gates' AdamW group comes last
+(43.6: no weight decay), but `train_model` checked a reloaded state's moments against the network's parameters in
+the network's own order - so a network with gates never matched its own state ("exp_avg of parameter 2: (1025,
+32), the parameter (7,)"), and every iteration silently started a fresh optimizer, one log line each: a v7 run
+would have reset its moments every generation.
+
+**The fix** (`run.py`):
+
+* a network with gates loads its state through `match_opt_groups` (as a widened head does, 37): each saved group
+  matched to one of the network's by its parameters' count and shapes, the optimizer built in the saved order (the
+  gates' group last, a head or readers added later after it), the groups it lacks fresh; the same network's state
+  is compared in the optimizer's own group order (`opt_state_mismatch(..., params=)`);
+* **an optimizer state saved with the last checkpoint that does not fit its network refuses the run**
+  (`OptimizerStateMismatch`, an EncodingMismatch: exit 78, not restarted), naming the file: a fresh optimizer is
+  never started in silence. Deleting the file starts one deliberately; a network that changes legitimately keeps or
+  extends its state (a head or readers added, a widened head) or comes with none (`fork_run` writes no state for a
+  fork, `--net` removes it); an unreadable state is refused too; a state of another iteration (a stop between
+  writing a checkpoint and its state) is logged and replaced by a fresh one;
+* `zero.distill`'s resume checks the state it continues the same way (ValueError).
+
+Co-training trains through `train_model` (both networks), a resume after PAUSE or a restart reloads the same file,
+`fork_run --source` copies a state only when it belongs to the forked checkpoint, and the fused AdamW of
+`train_static` has the same groups: all covered by the above.
+
+Tests (`tests/test_tail_train.py`): a gated network's state at iteration 2 is the saved one, groups, weight decay
+and every moment equal, in the same process and through a resume (a new Run of the directory) - failing without the
+fix (no state loaded); a state that does not fit is refused, deleting it starts a fresh one, a state of another
+iteration is said.
+
+### 43.11 Inference speed of variable-length rows, and the transfers beside every graph (2026-11-12)
+
+**Why.** MTG Zero's layout v7 against v6, the same Delver line through its real self-play (MTG Zero's lane Z harness:
+the run's settings, CUDA graphs, 200 games from checkpoint 0 of the widened fork, conc 768, both on this core):
+v6 65.9k leaves/s, v7 56.4k (-14.4%; decisions/s -15.2%), the GPU 87-88% busy in both. Per batch (Nsight Systems,
+300 captured self-play batches of each, 224 rows on average): v6 2,650 us in its graph and 303 us between graphs,
+v7 2,893 and 345 - before the trunk +109 us (the wider head slots and globals of v7's encoding, about 2% on their
+own; the tail's checks and embedding), the trunk +106 us (tail tokens push the batch's longest row over a 16-token
+step in 15% of the batches: +3.3% token slots, +6.4% of the attention's), after it +28 us, between graphs +42 us
+(the tail's and overrides' uploads, wider rows to zero). Not the attention: SDPA runs the same memory-efficient
+kernel for v6's boolean mask and v7's float mask (log w).
+
+**Bit for bit** (every output of 300 captured v6 and v7 self-play batches unchanged, 2.4M values each):
+
+* `TokenGraphRunner` reads the layout tables its override check needs (`seg_nk`, `pos_seg`) once: a batch with
+  overrides (11% of v7's) read them from the device, waiting for the graphs in flight.
+* `forward_static` in inference on CUDA (`TokenNet._static_side`; no gradients): the inputs' checks and maps
+  (`_static_prep`) and the tail's embedding on a second stream while the head slots' input maps run on the first,
+  joined before the gather - the same kernels on the same inputs (a CUDA graph captures the fork as two branches).
+* `_static_ext` gathers from one copy of the token embeddings (each segment's flattened in turn, then the tail; the
+  index `B * before + b * count + slot`), not a copy of the head slots copied again with the tail.
+* A batch's tail integers (rows, segments, slots) are one upload, its overrides' (rows, actions, refs, columns) one.
+* **The transfers beside the graphs** (every token network): a launch's uploads go on a copy stream into device
+  staging of its own buffer set (a set is reused only after its launch's result), overlapping the graph before; the
+  device stream waits for them, copies them into the graph's inputs (a few us), replays, copies its outputs out of
+  the graph's (the next replay of the same graph may overwrite them), and a download stream brings them back. A
+  sparse batch's rows are zeroed again only where the last sparse batch wrote them (its non-zeros' places, kept on
+  the device; wholly after a dense batch), not all [B, F] floats - the same rows `zero_(); index_copy_` built.
+
+**Opt-in: length-sorted chunks** (`infer_token_chunks` N, run setting, default 0; `NetEvaluator(token_chunks=)`;
+`infer.chunk_rows`). A graph pads every row to the batch's longest: Delver's self-play rows hold 14.6 head tokens
+on average (15.5 with v7's tails) and the batch's padded T is 72 (74), so ~80% of the trunk's token slots are
+padding. With N > 1 a batch's rows are sorted by token count and cut into at most N pieces of whole 64 rows (the
+last any size), each through its own graph of its own longest row - where the cut saves by the estimate (slots x (1
++ T / 256) + 4096 a graph). On the captured batches two chunks halve the token slots and cut the attention's to
+36%. A row's outputs depend on the shape of the batch it runs in (10.6), so the answers move by float32 rounding:
+on the 300 captured batches each, priors by at most 6.6e-6, values 6.6e-7, margins 1.1e-6, the belief rows'
+auxiliary predictions 5.1e-7 (the same order as the row's own batch-to-batch spread); hence opt-in. Each chunk's
+answers are those of its rows as a batch of their own, bit for bit; long rows (43.7) and pieces (`max_rows`) work
+within each chunk.
+
+**Not done.** Moving v7's stack source references and evaluation context out of the stack / trigger slots into
+gated tokens (MTG Zero's proposal): the head-only ablation puts the whole width growth at ~2%, the move would take
+~0.6% of it and add tokens (a longer longest row) - not worth it for speed.
+
+**Measured** (the same harness; the GPU and the host otherwise idle unless said):
+
+| self-play, 200 games | leaves/s | vs v6 |
+|---|---:|---:|
+| v6, before | 65.9k | |
+| v7, before | 56.4k | -14.4% |
+| v7, the first four changes above | 58.1k (v6 65.3k) | -11.0% |
+
+The transfers beside the graphs and the chunks are measured when the shared GPU is free (a live run held it).
+
+**Tests** (`tests/test_tail_graphs.py`): five launches in flight, sparse and dense mixed, two of one graph: each
+batch's answers those of the batch alone, bit for bit, and a sparse batch's those of its dense rows; the chunks:
+off by default, `chunk_rows` cuts only where it saves, each chunk's answers its rows' alone bit for bit, the batch
+within rounding of the batch whole (priors, values, margins, belief rows, value-only rows, long rows), dense =
+sparse.
+
+### 43.12 Self-play's host work per batch: what the GPU waited for, and the drive loop's thread (2026-11-12)
+
+**Why.** 43.11's self-play (the Delver line's settings: sparse batches, CUDA graphs, conc 768, 16 threads in 4
+groups, sims 64 / 16, the belief tilt, root-view leaves; 200 games from checkpoint 0, this machine only) kept the
+GPU 88-90% busy, v7 10% behind v6; the suspect was the host's work per batch on the one Python thread that drives
+the search (polling the driver, building and launching a batch, reading its answers back, handing them over).
+
+**The profile** (ec8ecf0; the drive loop's thread timed by phase, every graph replay timed by CUDA events,
+`E:/zero-scratch/varlen-host/prof_sp.py`; 200 games, ~12,700 batches of 186-190 leaves (224 rows); per batch):
+
+| | v6 | v7 |
+|---|---:|---:|
+| the thread: build and launch | 1,913 us | 2,270 us |
+| read the answers back (`result`) | 186 | 162 |
+| hand them to the driver (`submit`) | 79 | 75 |
+| poll the driver (the next batch, its LeafBatch) | 15 | 16 |
+| wait for the GPU | 666 | 780 |
+| the GPU: in the graph | 2,575 | 2,862 |
+| between graphs, median / mean | 150 / 286 | 179 / 443 |
+| between graphs over 1 ms (a new shape's capture: 8 / 30), the run's total | 1.1 s | 3.2 s |
+
+* The search is never the limit: 1 poll in ~12,700 found the next group not ready, the driver waited 0.04 s in all.
+* The thread was not the limit either, at first: it waited for the GPU ~0.7 ms a batch. **The GPU waited for its
+  inputs.** Device events around the work between two graphs (the replay bench of 43.11's 300 captured v7 batches,
+  two in flight): the outputs' copy 7 us, the wait for the next launch's uploads **132 us** (181 in self-play),
+  the scatter of the non-zeros 14, the inputs' copies 12. The uploads had been queued ~1 ms before the graph ended.
+  On this machine (Windows, WDDM) a download queued on the copy engine waits there for its graph, and an upload
+  queued after it waits behind it (a probe: a 1.3 MB upload queued during a 3.2 ms graph ends 75 us after it
+  starts; with the graph's own download queued first, 70-85 us after the graph); every launch had queued its
+  download right after its replay, so the next launch's uploads crossed only once the graph before had ended.
+  Separate small uploads cost the copy engine too: 9 of a 1.3 MB batch 280 us, one 72 us.
+* With that wait gone (below), **the thread became the limit**: the next launch was built only after the graph before
+  had ended in a third or more of the batches (`late launches`), the GPU idle meanwhile - building a v7 launch took
+  1.4-1.5 ms on a quiet host (the replay bench), 2.1-2.6 ms in self-play beside the 16 search threads: numpy's passes
+  over the batch's ~51,000 non-zeros (the presence flags 257 us, the token positions 192, the padded tail 107, the
+  flat indexes, `rows.resolve` 51 even without an override) and ~30 torch calls of 5-20 us each (nine uploads, six
+  copies, the scatter, the downloads, the events).
+
+**What** (`infer.TokenGraphRunner`, `rows.resolve`, the engine module; every answer bit for bit):
+
+* **A launch's download is queued by the next launch** just before its replay - after its upload and its inputs'
+  copy, waiting on an event recorded there - or by its own `result` when no launch came first (`_Down`,
+  `_flush_downs`, `_wait_down`). The download runs during the next graph; nothing is queued on the copy engine
+  ahead of an upload or the inputs' copy any more.
+* **One upload, one copy.** A launch's inputs are one pinned int64 buffer per buffer set: the non-zeros' flat
+  indexes, their values (float32), the root belief rows, then the graph's own inputs at its key's layout
+  (`_layout`: n, ntok, full; with tails / overrides tint, oint, tval - regions of 256 bytes, an allocation's own
+  alignment). One upload on the copy stream into the set's staging; on the device stream one copy into the graph's
+  region of one shared input buffer (`_ibuf`; a graph keeps the views it was captured with), the scatter reading
+  the staging. The same values reach the same kernels.
+* **The sparse batch packed in Rust, off the GIL** (`pack_sparse_tokens`, `pack_tail_tokens` in every engine
+  module: `zero_py`, `crates/py/src/pack.rs`): the presence flags (a bitset per row), each row's token count and
+  positions (`token_index` / `token_index_tail`), the flat indexes and values, and the tail padded with
+  `_check_tail_host`'s checks - written straight into the set's pinned words; a batch with a row of more than
+  LONG_T tokens comes back unlaunched and goes the numpy way (its rows split, 43.7). The dense path is numpy, as
+  before. A build of an older core under this one has no packers: TokenGraphRunner says so (rebuild the engine).
+* `rows.resolve` returns at once for a batch without overrides (89% of v7's); `SearchDriver.submit` releases the
+  GIL while it hands the answers over (the shard writer thread runs meanwhile; only the drive loop's thread calls
+  the driver).
+
+Not changed: the options' softmax stays numpy (`segment_softmax_np`: a Rust exp is not numpy's float32 exp, bit
+for bit), and so does the dense path. A third batch in flight (`ZERO_INFLIGHT=3`, the existing env) gave the same
+games and shards here (below); it stays opt-in - `GraphRunner`'s two fixed host slots (a conv network's) would be
+overwritten by it (10.6).
+
+**Identity.** The answers of the 300 captured v6 and v7 batches (sha256 of every answer in order): ec8ecf0's. Real
+self-play, 200 games each, v6 and v7, the shard writer thread on and off, and with `ZERO_INFLIGHT=3`: every answer
+in submit order and every shard's arrays identical to ec8ecf0's (ec8ecf0 reproduced its own twice).
+`tests/test_pack.py` (CPU): the packers against the numpy path, bit for bit (random batches, presence flags at 0.5
+and just above, float16 tails, the long-row return, the refusals); `tests/test_tail_graphs.py`'s launches in flight
+and dense = sparse, `test_token_graphs.py`, `test_tail_amp.py`; the core's pytest (its timed `test_remoteplay` cases
+failed beside other sessions' builds and pass alone, as ec8ecf0's; `test_graphs_match_eager_and_follow_new_weights`
+fails now and then before and after alike - graphs against eager by 3.7e-5 where it allows 2e-5); toy-smoke (MLP,
+tokens, static tokens) byte for byte and `check_checkpoint_compat --package zero` (random, a toy MLP, a toy token
+network) identical against ec8ecf0; `smoke_all.sh --with-this-core --build-only`: Glass Road, Caverna and Kingdom
+Builder Zero build (MTG Zero's v6 and v7 checkouts were built on it for the measurements).
+
+**Measured** (the same self-play, 200 games, configurations alternated, `sp_table` guard: the GPU otherwise idle, the
+host quiet; the desktop's RTX 5090; two clean rounds - a third ran beside other sessions' builds and is left out):
+
+| self-play, 200 games | leaves/s, the 2 rounds | mean | |
+|---|---:|---:|---|
+| v5 (its own build, fb1d70e) | 63.8k, 63.4k | 63.6k | |
+| v6, before (ec8ecf0) | 65.8k, 66.0k | 65.9k | |
+| v7, before | 54.8k, 56.8k | 55.8k | -15.3% against v6 |
+| v6, after | 68.2k, 69.8k | 69.0k | +4.7% |
+| v7, after | 60.5k, 62.0k | 61.2k | +9.7%; -11.3% against v6 after (-7.1% against v6 before) |
+
+Per batch after (the profile above, quiet; before in brackets): v6 launch 889 us (1,913), result 172 (186), submit
+58 (79), the thread waits for the GPU 1,547 us (666); between graphs median 22 us (150), mean 48 (286); the GPU in a
+graph 98.2% of the time (90.0%); a launch late for its graph in 1.3% of the batches. v7 launch 1,515 us (2,270),
+between graphs median 24 us (179), mean 130 (443: the 30 captures of new shapes are 1.2 s of the 39.5); in a graph
+95.8% of the time (86.6%), launches late in 7%.
+
+**What is left.** v7's distance to v6 is now the GPU's: 11-13% more time in each graph (43.11: the wider head slots,
+the tail's checks and embedding, longer rows) and 22 more shapes to capture (a one-off each: ~1.2 s of a 200-game
+measurement, nothing in a long run). The graphs' matrix products run in float32 on the SIMT cores
+(`cutlass_80_simt_sgemm`, ~40% of a graph's time): TF32 would be a large cut, not bit for bit (opt-in if wanted).
+On the host, a v7 launch still builds a `rows.Tail` and `rows.Overrides` per batch with their checks and makes ~20
+torch calls; the dense path (not self-play's) is numpy as before.
+
+**Tests.** `tests/test_pack.py` (new); `cargo test -p zero_py` (`pack.rs`'s own).
+
+### 43.13 Chained episodes with variable-length rows (the merge of `feat/match-episodes-int` 2aab098, 2026-11-12)
+
+Section 42's chained contests and this section's rows meet in the driver's records: a record carries its own row -
+head, tail tokens (`TailRow`), overrides - so a contest's episodes' records, kept in the slot until the contest ends
+and handed out behind its one row, carry every episode's tails and overrides exactly; the sample arrays' CSRs (v2
+shards, the writer thread, the window) are built from them as from any game's. The row limit (43.5, docs/search.md
+2.15) ends an **episode** as aborted: no samples of its own, the contest unfinished (not over, a draw in its row),
+`aborted` with `abort_reason` `max_row_tokens` on the contest's row, the earlier episodes' samples kept; counted once
+in `tail.aborted_row_tokens` (a contest). The Python driver (`play.PyDriver`, the replay recorder) the same: its
+chained episodes' samples carry the rows' arrays (a merge that dropped them is what `tests/test_tail_search.py`'s
+chained test catches), its row-limit abort ends the contest.
+
+The core's test bed: `toy_tail`'s opt-in spec keys `episodes` (a contest of k games, chained) and `items_step` (game
+e starts from `items0 + e * items_step` items, so a later game can pass the limit); without them the game of before,
+byte for byte. Tests: Rust `driver::tail_tests` - a contest's records each a row the network was sent (head, tail
+tokens and overrides, bit for bit; dense and sparse batches), the arrays' CSRs theirs; a later game over the limit
+ends its contest aborted with game 1's samples kept -, `tests/test_tail_search.py` (the Python driver, both seat
+implementations) and `tests/test_tail_loop.py` (the run's self-play phase: one row a contest, v2 shards synchronous and
+on the writer thread array for array, the window's batches, the aborted contest).
+
+### 43.14 A shut gate's shadow: a widen's new segments learn while their gates are shut (2026-11-12)
+
+**Why.** At g = 0 a gated segment's tokens change nothing (43.6), so its own maps get exactly no gradient and the gate
+is its only learning parameter. Right after a widen those maps are random: the gate's straight-through gradient
+measures opening onto random features - noise around 0 for a trained network - and nothing ever makes the features
+useful. MTG Zero's GPU smokes of the widened Delver 3198 (2 iterations, ~100-160 steps each) pushed some gates below 0
+(links -0.007, library_known -0.018 to -0.023, graveyard_order -0.0012 to -0.0075) and others up (delayed +0.004 to
++0.024), which ones varying by run: a random walk, and a segment whose gate wanders below 0 never learns, so its gate
+never has a reason to open. A fresh network is not affected (its gates start at 1).
+
+**What** (`net.GATE_SHADOW` = 0.1; a model's `gate_shadow` attribute overrides it, 0 = the gradients of before). In
+training, a gated segment whose gate is below the shadow is **back-propagated as if its weight were the shadow**
+while the forward keeps g = max(theta, 0) exactly:
+
+* the attention runs as the explicit math (43.6, 43.9) whenever a present gate is below the shadow (before: exactly
+  0); its node's backward takes the shadow weights - p, Z and the attention output recomputed with them - so the
+  segment's keys and values (its maps, positions, base, identities) get the gradient of weight `GATE_SHADOW`, and the
+  gate's own gradient is taken there (how much more of the segment would help);
+* the pooling adds `(h - h.detach()) * (w_shadow - w)`, the blend of an override into such a segment
+  `(ptr - ptr.detach()) * (shadow - min(g, 1))`: + 0 in the forward, exactly, and the shadow's gradient into the token
+  and the pointer logit.
+
+Every forward is unchanged, bit for bit (inference, and training's at g = 0: the same explicit path as before); the
+widen stays exact at step 0. Between 0 and the shadow, training's forward is the explicit math instead of SDPA (the
+same values up to rounding, 43.6). A network without gates never reaches this code. A deliberate change of the
+gradients of networks with gates (feat/varlen only: no run has trained one).
+
+**Compared** (`tests/test_tail_gates.py`'s toy, a sweep of 5 seeds x 800 steps, CPU, 2026-11-12): toy_tail's layout
+widened by a gated segment whose tokens carry a bit as the parity of a one-hot code's index (no feature of a random
+input map carries it on average; the bit is worth ~0.4 nats a row), and the same segment carrying noise. Held-out loss
+(the old network without the segment: 0.671 on the informative task, 0.525 on the noise one):
+
+| variant | informative: loss | gate at the end | went below 0 | steps to read the bit | noise: loss | gate |
+|---|---:|---:|---:|---:|---:|---:|
+| before (no shadow) | 0.416 (2 of 5 runs never read it: 0.671) | -0.40 .. +0.09 | 3 / 5 | 200-300, or never | 0.525 | -0.003 .. +0.025 |
+| shadow 0.03 | 0.246 (5 / 5) | +0.06 .. +0.11 | 0 / 5 | 200 | 0.525 | -0.002 .. +0.015 |
+| **shadow 0.1** | 0.246 (5 / 5) | +0.05 .. +0.10 | 0 / 5 | 200 | 0.525 | -0.001 .. +0.015 |
+| shadow 0.3 | 0.246 (5 / 5) | +0.03 .. +0.10 | 0 / 5 | 200 | 0.525 | -0.001 .. +0.016 |
+| floor: theta >= 0.05 after each step | 0.246 (5 / 5) | +0.10 .. +0.15 | 0 / 5 | 200 | 0.525 | 0.05 (forced open) |
+| shadow 0.1 + the new segment's maps zero at the widen | 0.246 (5 / 5) | +0.06 .. +0.07 | 0 / 5 | 100-200 | 0.525 | -0.006 .. +0.004 |
+
+The shadow reads the bit every time at any weight from 0.03 to 0.3, and leaves a noise segment's gate at ~0. A floor
+works too but holds every gate open (a noise segment for good) and changes the forward at the first step; zero maps
+at the widen are a little faster on this toy and change the widen's weights (not its outputs) - not taken: the
+shadow alone is enough, and lane Z's existing v7 forks keep their meaning.
+
+**Costs.** While a present gate is below the shadow, training runs the explicit attention (43.9: the g = 0 phase's
+step cost +21-22% of v6's where the steady state's is +11-12%) plus one recomputed product a layer in its backward; a gate that stays shut
+(a segment with nothing to read) keeps that cost. Inference: none.
+
+**Tests.** `tests/test_tail_gates.py` (new): an informative gated segment opens and its widened network beats the old
+one by > 0.2 nats (3 seeds, eager; and train_static), the widen exact at step 0; a noise segment does no harm and its
+gate stays below 0.25. `tests/test_tail_net.py::test_gradients_reach_the_gates`: with the shadow every gated segment's
+maps get a gradient at g = 0; without it (`gate_shadow` 0) exactly none, the forward the same bit for bit.
+
 ## 44. The native self-play worker: zero_worker, one settings parser, parity gate 2 (no setting; zero-farm phase 0b, 2026-11-11)
 
 **Why.** zero-farm's worker (section 41) plays a run's self-play games on a friend's PC with no Python and no
@@ -6021,3 +6702,35 @@ settings are unused, classified `trainer` for check-config).
 
 A traced game keeps its moves (2 bytes an action; an EoE game ~530) and calls `record_setup` once per game (episode). The
 pool's replay: ~19 ms an EoE game here (0.91 s for gate 3's 48), its held games' rows kept compacted (sparse float16).
+
+### 45.6 Records, the pool and variable-length rows (the merge of `feat/varlen` e5e1bb0 into `farm`, 2026-11-12)
+
+**Why.** MTG Zero's layout v7 (section 43) puts tail tokens and pointer overrides in the rows; its best-of-three run moves
+to it with the farm attached, so the farm's records, pool and worker must carry them.
+
+**The merge** (a merge commit, `farm` b0930da + `feat/varlen` e5e1bb0; base 2aab098). Conflicts, each resolved so both
+sides' behaviour survives: the driver's `Record` / its parked copy / the slot / `Done` / `GameResult` carry the farm's
+`step` and `trace` and varlen's `tail`, `ov`, `row_abort` and `abort_reason` (a traced game aborted at the row limit
+ends with its trace; a chained contest's trace and abort as each side had them); the bindings keep the farm's seat
+parser (`zero_search::settings`, 44) and gain varlen's `max_row_tokens` (`DriverArgs::max_row_tokens`, None: the game's
+limit - what every run uses), packers and row kinds, and `take_results`' rows their `abort_reason`; `ShardWriter.add`
+keeps varlen's R8 refusal and the farm's sample dicts that bring their features as `xs`; section 43 before 44 and 45.
+Run settings: `allow_draft_layout` and `infer_token_chunks` classified `trainer` for check-config (44).
+
+**What changed on the farm's side.** Records and `replay_rows` (docs/search.md 2.17): every replayed row is the driver's
+record row - head, tail tokens, overrides - and `replay_rows` / `take_game_records` return the `t_*` / `ov_*` arrays; a
+game aborted at the row limit has a record (`abort_reason`) that replays as aborted. The pool (45.2) checks a game's
+rows as `write_shard` would (the tail floats through the non-finite guard) and writes format v2 shards
+(`shard_format(cfg, info)`: the meta's `t_segs`, `option_pointers`, `max_row_tokens`; R8). A row-limit abort counts as
+a game, as a remote worker's does (its row in `fin`, no samples). zero-onnx/1's exporter refuses a network with tail
+segments, pointer overrides or gates and `OnnxEvaluator` a batch with either (R14, 43.8: zero-onnx/2 is section 46);
+until the native worker reads them (section 46) it refuses a game with tails or pointer overrides at its driver's
+settings (`settings::refuse_varlen`).
+
+**Off by default.** Nothing changes for a game without tail segments or pointer overrides: records are the same text,
+the pool's shards the same files, every replayed row the same bytes (`record_row` is `encode` for such a game).
+
+**Tests.** `driver::trace_tail_tests` (3, docs/search.md 2.17); zero_search's and zero_worker's suites, the farm's
+pytest files (`test_farm_pool`, `test_farm_def`, `test_farm_h2h`, `test_farm_report`, `test_worker_settings`,
+`test_onnx`) and varlen's tail files (`test_tail_rows`, `test_tail_shards`, `test_tail_loop`, `test_tail_remote`,
+`test_pack`) on the merged tree.

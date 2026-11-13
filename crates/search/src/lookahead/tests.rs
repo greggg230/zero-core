@@ -26,6 +26,9 @@ impl<G: SearchGame> RowSink<G> for Rows {
         self.kind.pop();
         self.x.truncate(self.x.len() - G::NUM_FEATURES);
     }
+    fn row_tail(&mut self, _tail: &TailBuf, _ov: &[(u32, i64)]) -> Result<(), String> {
+        Err("the test sink carries no tail rows (Peek has none)".into())
+    }
 }
 
 /// The belief `peek_eval`'s stand-in answers for a belief row: coin 1 at 0.7.
@@ -314,6 +317,7 @@ fn driver_cfg(seats: Vec<SeatCfg>, games: usize, threads: usize) -> DriverCfg {
         sparse: false,
         branch: None,
         starts: None,
+        max_row_tokens: None,
     }
 }
 

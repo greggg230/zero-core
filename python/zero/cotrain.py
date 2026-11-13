@@ -60,7 +60,7 @@ import numpy as np
 
 from . import games as G
 from . import package
-from .data import ShardWriter, TargetStats, shard_format
+from .data import ShardWriter, TargetStats
 from .finite import NonFinite, check_state
 from .infer import drive
 from .net import (EncodingMismatch, check_checkpoint, check_encoding, layout_sans_identity, load, save, tokens_layout,
@@ -622,8 +622,8 @@ class CoRun:
         pdrv.resume(c['games'], it - 1)
         writers, tstats = {}, {}
         for k, X in (('p', P), ('r', R)):
-            meta = {'game': X.cfg['game'], 'features': X.info['num_features'], 'actions': X.info['num_actions'],
-                    'iter': it, 'net': 'primary' if k == 'p' else 'resolver', **shard_format(X.cfg)}
+            # (`Run.shard_meta`: with the game's info, so a resolver game with variable-length rows writes format v2)
+            meta = X.shard_meta(it, net='primary' if k == 'p' else 'resolver')
             writers[k] = ShardWriter(os.path.join(X.run, 'data', f'iter_{it:04d}'), 'r00', rows=X.cfg['shard_rows'],
                                      meta=meta, bad_dir=X.debug_dir())
             tstats[k] = TargetStats()
@@ -818,6 +818,10 @@ class CoRun:
         os.makedirs(os.path.join(R.run, 'models'), exist_ok=True)
         with open(os.path.join(R.run, 'config.json'), 'w') as f:
             json.dump(rc, f, indent=1)
+        # variable-length rows (docs/az.md 43): both games' refusals at start (a draft layout, a stale build, an arch
+        # or shard format that cannot carry them; RowsRefused, exit 78) - nothing for games without them
+        for X in (P, R):
+            X.check_rows()
         start = self.latest()
         if start is None:
             self.first_checkpoints()

@@ -113,13 +113,15 @@ def _graphs_out(out, evs, graphs):
 
 
 def bench_infer(game='toy', device='cpu', hidden=128, blocks=3, batches=(64, 256, 1024), seconds=1.0, arch='mlp',
-                heads=4, ff=0, xs=None, model=None, workers=1, ops=False, graphs=None):
+                heads=4, ff=0, xs=None, model=None, workers=1, ops=False, graphs=None, tail=None):
     """xs: feature rows to sample the batches from (real positions; a token network's cost
     depends on how many objects they hold), else random normal features. `model`: a checkpoint
     (else a fresh network of the given size); `workers` > 1: that many batches evaluated at once
     on Python threads (each its own rows, `torch_threads` intra-op threads each: run setting
     infer_workers); `ops`: the operators and multiply-adds per leaf of one forward pass per batch
-    size (`count_ops`); `graphs`: the evaluators' CUDA graphs (None: their default)."""
+    size (`count_ops`); `graphs`: the evaluators' CUDA graphs (None: their default). `tail` (`rows.Tail` of `xs`'s
+    rows; docs/az.md 43): each batch's rows' tails go with them, and a network with pointer overrides gets none
+    (the batches' options are made up)."""
     info = G.info(game)
     m, desc = _net(game, model, arch, hidden, blocks, heads, ff)
     out = dict({'what': 'inference', 'device': device}, **desc, torch_threads=torch.get_num_threads(), leaves_per_s={})
@@ -129,17 +131,39 @@ def bench_infer(game='toy', device='cpu', hidden=128, blocks=3, batches=(64, 256
         out['ops'], out['macs_per_leaf'] = {}, {}
     rng = np.random.default_rng(0)
     evs = [NetEvaluator(m, device, graphs=graphs) for _ in range(max(1, workers))]
+    lay = getattr(m, 'config', {}).get('layout') or {}
+    rkw = {}                                       # (variable-length rows of the batch drawn last: tail / ov)
     for B in batches:
         def rows():
             if xs is None:
                 return rng.normal(size=(B, info['num_features'])).astype(np.float32)
-            return np.ascontiguousarray(xs[rng.choice(len(xs), B)], dtype=np.float32)
+            idx = rng.choice(len(xs), B)
+            if tail is not None or lay.get('option_pointers'):
+                from .rows import Overrides, eval_kw
+                rkw.clear()
+                rkw.update(eval_kw(tail.take(idx) if tail is not None else None,
+                                   Overrides.empty(B) if lay.get('option_pointers') else None))
+            return np.ascontiguousarray(xs[idx], dtype=np.float32)
         n = np.full(B, 2, np.int32)
         k = 6
         off = np.arange(B + 1, dtype=np.int32) * k
         act = np.tile(np.arange(k, dtype=np.int32), B)
         if workers <= 1:
             ev, x = evs[0], rows()
+            if rkw:
+                if ops:
+                    raise ValueError('bench infer --ops with tails: not supported')
+                for _ in range(3):
+                    ev.evaluate(x, n, off, act, **rkw)
+                t0 = time.time()
+                c = 0
+                while time.time() - t0 < seconds:
+                    ev.evaluate(x, n, off, act, **rkw)
+                    c += 1
+                if device == 'cuda':
+                    torch.cuda.synchronize()
+                out['leaves_per_s'][B] = round(B * c / (time.time() - t0))
+                continue
             if ops:
                 dev = next(m.parameters()).device
                 o = count_ops(m, torch.from_numpy(x).to(dev), torch.from_numpy(n.astype(np.int64)).to(dev))
@@ -158,6 +182,8 @@ def bench_infer(game='toy', device='cpu', hidden=128, blocks=3, batches=(64, 256
             _graphs_out(out, evs, graphs)
             continue
         import threading
+        if tail is not None:
+            raise ValueError('bench infer --workers with tails: not supported (one worker)')
         xb = [rows() for _ in evs]
         if ops:
             dev = next(m.parameters()).device
@@ -193,23 +219,33 @@ def bench_infer(game='toy', device='cpu', hidden=128, blocks=3, batches=(64, 256
 
 
 def bench_train(xs, game='toy', device='cpu', hidden=128, blocks=3, arch='mlp', heads=4, ff=0, model=None, batch=512,
-                steps=5):
+                steps=5, tail=None):
     """Seconds per training step (forward, a policy / value loss, backward, AdamW) at `batch` rows of
-    `xs`, and the operators of one step (`OpCount`)."""
+    `xs`, and the operators of one step (`OpCount`). `tail` (`rows.Tail` of `xs`'s rows): the rows' tails go with
+    them (a network with pointer overrides gets none)."""
     m, desc = _net(game, model, arch, hidden, blocks, heads, ff)
     m.to(device).train()
     opt = torch.optim.AdamW(m.parameters(), lr=1e-4)
     rng = np.random.default_rng(0)
     A = m.config['actions']
 
+    lay = m.config.get('layout') or {}
+    rk = {}
+
     def step(x):
-        plog, vlog, mp = m(x, torch.full((len(x),), 2, dtype=torch.long, device=device))
+        plog, vlog, mp = m(x, torch.full((len(x),), 2, dtype=torch.long, device=device), **rk)
         loss = torch.logsumexp(plog, 1).mean() + torch.logsumexp(vlog, 1).mean() + (mp ** 2).mean()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(m.parameters(), 5.0)
         opt.step()
-    x = torch.from_numpy(np.ascontiguousarray(xs[rng.choice(len(xs), batch)], dtype=np.float32)).to(device)
+    idx = rng.choice(len(xs), batch)
+    x = torch.from_numpy(np.ascontiguousarray(xs[idx], dtype=np.float32)).to(device)
+    if tail is not None:
+        rk['tail'] = tail.take(idx).to_torch(device)
+    if lay.get('option_pointers'):
+        z = torch.zeros(0, dtype=torch.long, device=device)
+        rk['ov'] = {'row': z, 'act': z, 'ref': z, 'col': z}
     step(x)
     c = OpCount()
     with c:
@@ -248,10 +284,27 @@ def bench_selfplay(model, game='toy', threads=4, games=400, sims=64, conc=256, s
 
 
 def _shard_rows(paths):
-    """The first 8,192 rows of each shard's features (float16; a dense or a sparse shard)."""
-    from .data import shard_features
-    parts = [shard_features(p, slice(0, 8192)) for p in paths]
-    return np.concatenate(parts) if len(parts) > 1 else parts[0]
+    """The first 8,192 rows of each shard's features (float16; a dense or a sparse shard) -> (rows, their tails: a
+    `rows.Tail` for version 2 shards with tail segments, else None; docs/az.md 43)."""
+    from .data import read_shard, shard_features, shard_tail
+    from .rows import Tail
+    parts, tails = [], []
+    for p in paths:
+        with np.load(p) as z:
+            v2 = 't_ptr' in z.files
+        if not v2:
+            parts.append(shard_features(p, slice(0, 8192)))
+            tails.append(None)
+            continue
+        s = read_shard(p)
+        n = min(8192, len(s['player']))
+        parts.append(s['x'][:n])
+        t, _ = shard_tail(s)
+        tails.append(t.take(np.arange(n)) if t is not None else None)
+    if any(t is not None for t in tails) and any(t is None for t in tails):
+        raise ValueError('bench --shard: shards with and without tail segments mixed')
+    tail = Tail.concat(tails) if tails[0] is not None else None
+    return (np.concatenate(parts) if len(parts) > 1 else parts[0]), tail
 
 
 def main(argv=None):
@@ -286,16 +339,20 @@ def main(argv=None):
     if a.what == 'search':
         r = bench_search(game=a.game, threads=a.threads, games=a.games, sims=a.sims, conc=a.conc, spec=a.spec)
     elif a.what == 'infer':
-        xs = _shard_rows(a.shard) if a.shard else None
+        xs, tail = _shard_rows(a.shard) if a.shard else (None, None)
         kw = {'batches': tuple(int(b) for b in a.batches.split(','))} if a.batches else {}
+        if tail is not None:
+            kw['tail'] = tail                      # (variable-length rows, docs/az.md 43)
         r = bench_infer(game=a.game, device=a.device, hidden=a.hidden, blocks=a.blocks, arch=a.arch, heads=a.heads, ff=a.ff,
                         xs=xs, model=a.model, workers=a.workers, seconds=a.seconds, ops=a.ops,
                         graphs=None if a.graphs is None else bool(a.graphs), **kw)
     elif a.what == 'train':
         if not a.shard:
             ap.error('train: --shard (real positions) is required')
-        r = bench_train(_shard_rows(a.shard), game=a.game, device=a.device, hidden=a.hidden, blocks=a.blocks, arch=a.arch,
-                        heads=a.heads, ff=a.ff, model=a.model, batch=a.batch, steps=a.steps)
+        xs, tail = _shard_rows(a.shard)
+        r = bench_train(xs, game=a.game, device=a.device, hidden=a.hidden, blocks=a.blocks, arch=a.arch,
+                        heads=a.heads, ff=a.ff, model=a.model, batch=a.batch, steps=a.steps,
+                        **({'tail': tail} if tail is not None else {}))
     else:
         r = bench_selfplay(a.model, game=a.game, threads=a.threads, games=a.games, sims=a.sims, conc=a.conc, spec=a.spec,
                            hidden=a.hidden, blocks=a.blocks, device=a.device, arch=a.arch, heads=a.heads, ff=a.ff,

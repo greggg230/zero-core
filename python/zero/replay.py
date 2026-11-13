@@ -74,6 +74,7 @@ import numpy as np
 from . import games as G, package
 from . import lookahead as LA
 from .infer import NetEvaluator, drive
+from .rows import game_row
 from .mcts import belief_settings, gumbel_tag, select_settings
 from .net import load
 from .play import NNSeat, PyDriver, Slot
@@ -188,7 +189,7 @@ class RecordingDriver(PyDriver):
                 continue
             while True:
                 g = slot.game
-                if g.over or slot.steps >= self.max_steps:
+                if g.over or slot.steps >= self.max_steps or slot.abort:
                     if slot.chain is not None and slot.last_state != g.export_state():
                         self._state(slot)           # (a chained game's episode end: its final state, docs/az.md 42)
                     if self._episode_end(slot):
@@ -254,8 +255,13 @@ class RecordingDriver(PyDriver):
             # the auxiliary head at the root, for the decider: one forward pass of the root's features
             # (the search's own evaluations never compute the head, and a reused tree's root was
             # evaluated during an earlier search)
-            x = np.asarray(slot.game.encode(p), np.float32)[None]
-            pred = {k: v[0] for k, v in ev.aux(x, np.asarray([slot.n], np.int64)).items()}
+            # (a game with tail segments: encode_row, its tail with the row - docs/az.md 43; else encode, as before)
+            inf = getattr(self, '_rows_info', None)
+            if inf is None:
+                inf = self._rows_info = G.info(self.game)
+            x, tail, ov = game_row(slot.game, p, G.tail_widths(inf), False)
+            rk = {'tail': tail} if tail is not None else {}
+            pred = {k: v[0] for k, v in ev.aux(x, np.asarray([slot.n], np.int64), **rk).items()}
             f.update(self.aux_render(pred, slot.states[f['s']], p, f))
         look = getattr(seat, 'look', None)
         if look is None:
@@ -271,7 +277,15 @@ class RecordingDriver(PyDriver):
         if seat.belief_tilt:
             kw = dict(belief_tilt=seat.belief_tilt, belief_clip=seat.belief_clip, belief_mix=seat.belief_mix)
         la = G.engine().Lookahead(slot.game, look, seed=slot.search_rng.getrandbits(63), lines=False, **kw)
-        LA.drive(la, self.look_ev[seat.key])
+        try:
+            LA.drive(la, self.look_ev[seat.key])
+        except RuntimeError as e:
+            if not str(e).startswith('max_row_tokens'):
+                raise
+            # (a lookahead row past the game's row limit: the game is aborted, as the Rust driver's lookahead seats -
+            # docs/search.md 2.15)
+            self._abort(slot, f'its lookahead row: {e}')
+            return
         r = la.result()
         opts = [[int(o['action']), round(float(o['mean']), 5), round(float(o['sd']), 5)] for o in r['options']]
         a, guarded = (a_mcts if r['outcome'] == 'mcts' else int(r['outcome'])), False
@@ -314,6 +328,10 @@ class RecordingDriver(PyDriver):
         if slot.chain is not None:
             self.replays[-1]['games'] = [[float(x) for x in e['result']] for e in slot.chain['episodes']]
         self.replays[-1]['final'] = len(self.replays[-1]['states']) - 1
+        if slot.abort:
+            # (the driver aborted the game: a row past the game's max_row_tokens, docs/search.md 2.15 - not over,
+            # no result; a replay of before has no such key)
+            self.replays[-1]['abort_reason'] = slot.abort
 
 
 def default_aux_render(pred, state, seat, frame, top=12):

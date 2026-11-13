@@ -285,7 +285,7 @@ def load_into(ev, path, c):
     if ev is not None and getattr(ev.model, 'config', None) == m.config:
         ev.set_weights(m.state_dict())
         return ev
-    return NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1))
+    return NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1), token_chunks=c.get('infer_token_chunks', 0))
 
 
 def tally(rows, into=None):

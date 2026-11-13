@@ -76,10 +76,11 @@ import torch.nn.functional as F
 
 from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, resign as RS, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths
+from .rows import forward_kw
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
-from .net import (EncodingMismatch, add_aux, add_reader, aux_layout, check_belief_head, check_checkpoint, load, make_net,
-                  reader_layout, save)
+from .net import (NO_DECAY, EncodingMismatch, add_aux, add_reader, aux_layout, check_belief_head, check_checkpoint, load,
+                  make_net, no_decay_params, reader_layout, save)
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
 from .shardthread import MB, SampleClock, ThreadedShardWriter, split_records
@@ -149,6 +150,10 @@ DEFAULTS = dict(
     # fraction of the disk and write time for sparse encodings (MTG's ~0.7% non-zero). Every reader takes
     # both formats, so a window may mix them (docs/az.md 32). 0 = dense shards, byte for byte as before
     shard_sparse=0,
+    # allow_draft_layout 1 = a run may train on a game package's token layout marked `draft` (variable-length rows,
+    # docs/az.md 43.4: MTG Zero's layout v7 while it is built; R16). 0 (the default): such a run is refused at start
+    # (exit 78); a layout without `draft` - every layout of before - is unaffected either way
+    allow_draft_layout=0,
     # train_prefetch n > 0 = training batches built n steps ahead on a background thread while the
     # device trains (zero/data.py batches: the same batches in the same order)
     train_prefetch=0,
@@ -361,6 +366,11 @@ DEFAULTS = dict(
     # network batches evaluated concurrently on this many Python threads (CPU: small networks
     # whose ops cannot keep the cores busy; give the driver as many `groups`); 1 = inline
     infer_workers=1,
+    # infer_token_chunks N > 1 = a token network's CUDA graphs run each batch as at most N chunks of its rows
+    # sorted by their token counts, each padded to its own longest row instead of the batch's (docs/az.md 43.11):
+    # the same rows, their answers moved by float32 rounding (a row's outputs depend on its batch's shape). 0 / 1 =
+    # each batch whole, as before
+    infer_token_chunks=0,
     # sparse 1 = the run's drivers (self-play and matches) send sparse network batches (each row's
     # non-zero features, DriverCfg::sparse, docs/search.md 2.2): the same rows, games and samples; a
     # token network's CUDA graphs scatter them on the device instead of the host copying the dense
@@ -533,6 +543,34 @@ def opt_state_mismatch(model, state, params=None):
     return None
 
 
+# a gate still exactly 0 after this many training steps whose batches held its segment's tokens: a warning in the
+# run's log and `train.tail.gates_stuck` (docs/az.md 43.6)
+GATE_STUCK_STEPS = 100
+
+
+def gated_rows(model, W):
+    """Per gated segment of `model` (`TokenNet.gated`, in order) a bool [W.N] of the window's rows holding its tail
+    tokens; [] for a network without gates or a window without tails."""
+    gated = list(getattr(model, 'gated', None) or [])
+    if not gated or getattr(W, 'tail', None) is None:
+        return []
+    tail = W.tail
+    row = np.repeat(np.arange(tail.N), tail.counts())
+    seg = tail.seg.astype(np.int64)
+    out = []
+    for j in gated:
+        has = np.zeros(tail.N, bool)
+        has[row[seg == j]] = True
+        out.append(has)
+    return out
+
+
+def stuck_gates(gates, steps):
+    """The gated segments whose gate (`TokenNet.gates()`: {name: g}) is still exactly 0 after GATE_STUCK_STEPS training
+    steps that held their tokens (`steps`, in the same order) -> [name, ...]."""
+    return [n for (n, g), k in zip(gates.items(), steps) if g == 0.0 and k >= GATE_STUCK_STEPS]
+
+
 def match_opt_groups(state, pgroups):
     """Which of the parameter groups `pgroups` (lists of parameters) an optimizer state dict's groups belong
     to, in the saved order -> [an index of `pgroups` per saved group], or None when a saved group fits none
@@ -614,7 +652,8 @@ class Run:
 
     def evaluator(self, path):
         m, _ = load(path, self.cfg['infer_device'], game=self.cfg['game'])
-        return NetEvaluator(m, self.cfg['infer_device'], workers=self.cfg.get('infer_workers', 1))
+        return NetEvaluator(m, self.cfg['infer_device'], workers=self.cfg.get('infer_workers', 1),
+                            token_chunks=self.cfg.get('infer_token_chunks', 0))
 
     def nn_seat(self, key, sims, selfplay=False):
         """A network seat at the run's settings: self-play's, or every evaluation's (no noise, no
@@ -749,8 +788,7 @@ class Run:
         t0 = time.time()
         seat = self.nn_seat('m', c['sims'], selfplay=True)
         rng = np.random.default_rng(c['seed'] * 1_000_003 + it)
-        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
-                **shard_format(c)}
+        meta = self.shard_meta(it)
         lg = self.league
         if c['rolling']:
             if self.roll is None:
@@ -845,6 +883,7 @@ class Run:
         self.cache_metrics(out, st, st0)
         self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results)
+        self.tail_metrics(it, out, st, st0, results)
         self.episode_metrics(it, out, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         if lg is not None:
@@ -939,6 +978,57 @@ class Run:
             self.log(f'iter {it} WARNING: selfplay_infoset_merge is on but the merged trees made no link '
                      f'({leaves} leaves): nothing was merged (docs/search.md 3.16)')
 
+    def tail_metrics(self, it, out, st, st0, results=None):
+        """Self-play's variable-length rows (docs/az.md 43.3), only for a game with tail segments (the metrics of
+        before otherwise): `tail` = this machine's driver's network rows sent with a tail (rows), their tail tokens
+        (tokens), the most in one row so far (max), and the games aborted by the row limit (aborted_row_tokens: from
+        the result rows `results` - every source's, a remote's too - else the driver's count; never a truncated row),
+        logged when a game was aborted."""
+        if 'tail_rows' not in st:
+            return
+
+        def d(k):
+            return st.get(k, 0) - ((st0 or {}).get(k, 0))
+        out['tail'] = {'rows': d('tail_rows'), 'tokens': d('tail_tokens'), 'max': st.get('tail_max', 0),
+                       'aborted_row_tokens': d('aborted_row_tokens')}
+        if results is not None:
+            out['tail']['aborted_row_tokens'] = sum(1 for r in results if r.get('abort_reason') == 'max_row_tokens')
+        if out['tail']['aborted_row_tokens']:
+            self.log(f'iter {it}: {out["tail"]["aborted_row_tokens"]} game(s) aborted by max_row_tokens '
+                     f'{self.info.get("max_row_tokens")} (counted, no samples; docs/search.md 2.15)')
+
+    def shard_meta(self, it, **extra):
+        """The meta of iteration `it`'s self-play shards: game, features, actions, iter, `extra` (in its order), then the
+        shard format's keys (`data.shard_format` of the run's settings and game: sparse, and for a game with
+        variable-length rows format v2's `t_segs` / `option_pointers` / `max_row_tokens`, docs/az.md 43) - the meta of
+        before, key for key, for a game without them."""
+        c = self.cfg
+        return {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
+                **extra, **shard_format(c, self.info)}
+
+    def check_rows(self):
+        """Variable-length rows at the run's start (docs/az.md 43): refused (RowsRefused, exit 78) before any work - a
+        package layout marked `draft` without allow_draft_layout (R16); the game's build disagreeing with its layout
+        (tails, pointers, limit, head tokens: R15); a game with tails or overrides with an arch other than 'tokens'
+        (R4) or dense shards (shard_sparse 0, R8). Nothing for a game and layout without them."""
+        c = self.cfg
+        lay = package.active().tokens_of(c['game'])
+        if lay is not None and lay.get('draft') and not int(c.get('allow_draft_layout', 0) or 0):
+            raise RowsRefused(f'game {c["game"]!r}: its token layout {lay.get("name")!r} version {lay.get("version")} is a '
+                              f'draft (R16, docs/az.md 43.4): set allow_draft_layout 1 to train on it anyway')
+        try:
+            package.check_rows(c['game'], self.info)
+        except package.RowsMismatch as e:
+            raise RowsRefused(str(e)) from None
+        if not (self.info.get('tails') or self.info.get('option_pointers')):
+            return
+        if c.get('arch', 'mlp') != 'tokens':
+            raise RowsRefused(f'game {c["game"]!r} has variable-length rows (tail segments / pointer overrides): arch '
+                              f'{c.get("arch", "mlp")!r} cannot read them; arch \'tokens\' only (R4)')
+        if not int(c.get('shard_sparse', 0) or 0):
+            raise RowsRefused(f'game {c["game"]!r} has variable-length rows: its shards are sparse only (shard_sparse 1; '
+                              f'a dense shard would drop the tails for an older reader, R8)')
+
     def resign_metrics(self, it, out, results, remote=None):
         """Self-play resignation (zero/resign.py, docs/az.md 27), only when it is on (the metrics of before
         otherwise): `resign` = the iteration's accepted games resigned, the no-resign games, where those would
@@ -1009,8 +1099,7 @@ class Run:
             plan = lg.plan(it)
             lg.evaluators(it, evs)                 # the slots' past checkpoints (guarded)
         st0 = drv.stats()
-        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
-                **shard_format(c)}
+        meta = self.shard_meta(it)
         writer = ShardWriter(d, 'r00', rows=c['shard_rows'], meta=meta, bad_dir=self.debug_dir())
         tstats = TargetStats()
         spec = G.spec_json(c['spec'])
@@ -1025,7 +1114,10 @@ class Run:
         # and written on the writer thread; None = here, between batches, as before
         tw = self.shard_thread(drv, writer, on_item=tally)
         clock = SampleClock() if tw is not None else contextlib.nullcontext()
-        take, split = (drv.take_samples, split_games) if tw is None else (drv.take_records, split_records)
+        # (variable-length rows: a dict's tails cut with their games, docs/az.md 43)
+        tws = G.tail_widths(self.info)
+        take, split = (drv.take_samples, lambda r, x: split_games(r, x, tws)) if tw is None else \
+            (drv.take_records, split_records)
 
         def accept():
             """The held games, oldest first, as many as the quota takes."""
@@ -1122,6 +1214,7 @@ class Run:
         self.cache_metrics(out, st, st0)
         self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results, rem.pop('resign', None))
+        self.tail_metrics(it, out, st, st0, results)   # (this machine's driver; every source's aborted games)
         self.episode_metrics(it, out, results)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
         out['rolling'] = {'in_flight': drv.in_flight()['games'], 'restarts': st['restarts'] - st0['restarts'],
@@ -1194,7 +1287,9 @@ class Run:
         # writer thread converts them); None = their sample arrays taken here, as before
         on = bool(c.get('shard_writer_thread'))
         clock = st['clock'] = SampleClock() if on else contextlib.nullcontext()
-        take, split = (drv.take_records, split_records) if on else (drv.take_samples, split_games)
+        tws = G.tail_widths(self.info)              # (variable-length rows: a dict's tails cut with their games)
+        take, split = (drv.take_records, split_records) if on else (drv.take_samples,
+                                                                       lambda r, x: split_games(r, x, tws))
 
         def pump(lb=None):
             with clock:
@@ -1316,59 +1411,85 @@ class Run:
         okw = {'fused': True} if static and str(dev).startswith('cuda') else {}
         heads = [p for n, p in model.named_parameters() if n.startswith('aux_head.')]
         rdrs = [p for n, p in model.named_parameters() if n.startswith('readers.')]
-        trunk = [p for n, p in model.named_parameters() if not n.startswith('aux_') and not n.startswith('readers.')]
+        trunk = [p for n, p in model.named_parameters() if not n.startswith('aux_') and not n.startswith('readers.')
+                 and n not in NO_DECAY]
         # a widened head's later parts (docs/az.md 37): a group each, after the readers
         more = [[p for n, p in model.named_parameters() if n.startswith(f'aux_more.{k}.')]
                 for k in range(len(getattr(model, 'aux_more', None) or []))]
+        # the gates (docs/az.md 43.6): a group of their own, last, without weight decay (a network without gates:
+        # the groups of before)
+        gates = no_decay_params(model)
+
+        def group(g):
+            return {'params': g, 'weight_decay': 0.0} if g is gates else {'params': g}
         # parameter groups: the network of before, its auxiliary head, its readers (each when it has them)
-        pgroups = [g for g in [trunk, heads, rdrs] + more if g]
+        pgroups = [g for g in [trunk, heads, rdrs] + more + [gates] if g]
         if len(pgroups) > 1:
-            opt = torch.optim.AdamW([{'params': g} for g in pgroups], lr=c['lr'], weight_decay=c['wd'], **okw)
+            opt = torch.optim.AdamW([group(g) for g in pgroups], lr=c['lr'], weight_decay=c['wd'], **okw)
         else:
             opt = torch.optim.AdamW(model.parameters(), lr=c['lr'], weight_decay=c['wd'], **okw)
         opt_path = os.path.join(self.run, 'models', 'opt_latest.pt')
         fresh = True
+        o = None
         if os.path.exists(opt_path):
             try:
                 o = torch.load(opt_path, map_location=dev, weights_only=False)
-                if o.get('iter') == it - 1:
-                    groups = o['state'].get('param_groups') or []
-                    k = len(groups)
-                    if more:
-                        # a widened head (docs/az.md 37): each saved group is one part of this network (the
-                        # trunk, the head of before, the readers, an earlier widen's part) - matched by its
-                        # parameters' shapes, its moments kept; the parts it lacks start fresh
-                        at = match_opt_groups(o['state'], pgroups)
-                        if at is None:
-                            raise ValueError(f'it belongs to another network ({opt_state_mismatch(model, o["state"])})')
-                        ordered = [pgroups[j] for j in at]
-                        opt = torch.optim.AdamW(ordered[0] if len(ordered) == 1 else [{'params': g} for g in ordered],
-                                                lr=c['lr'], weight_decay=c['wd'], **okw)
-                        opt.load_state_dict(o['state'])
-                        for j, g in enumerate(pgroups):
-                            if j not in at:
-                                opt.add_param_group({'params': g})
-                    elif 0 < k < len(pgroups) and [len(g.get('params', [])) for g in groups] == [len(g) for g in pgroups[:k]]:
-                        # the state of the network before its head (and / or readers): kept for it, the new
-                        # parts start fresh
-                        bad = opt_state_mismatch(model, o['state'], params=[p for g in pgroups[:k] for p in g])
-                        if bad:
-                            raise ValueError(f'it belongs to another network ({bad})')
-                        opt = torch.optim.AdamW(trunk if k == 1 else [{'params': g} for g in pgroups[:k]], lr=c['lr'],
-                                                weight_decay=c['wd'], **okw)
-                        opt.load_state_dict(o['state'])
-                        for g in pgroups[k:]:
-                            opt.add_param_group({'params': g})
-                    else:
-                        # (the state of this network: its moments as its parameters; another network's,
-                        # e.g. of another encoding, would load and fail at the first step, docs/az.md 10.4)
-                        bad = opt_state_mismatch(model, o['state'])
-                        if bad:
-                            raise ValueError(f'it belongs to another network ({bad})')
-                        opt.load_state_dict(o['state'])
-                    fresh = False
             except Exception as e:                 # noqa: BLE001
-                self.log(f'iter {it}: optimizer state not loaded ({e}); fresh optimizer')
+                raise OptimizerStateMismatch(f'iter {it}: the optimizer state {opt_path} cannot be read ({e}). Refused: '
+                                             f'delete it to start a fresh optimizer deliberately.') from None
+        if o is not None and o.get('iter') != it - 1:
+            # (a state of another checkpoint - e.g. the run stopped between writing the checkpoint and its state -:
+            # nothing of this network to keep)
+            self.log(f'iter {it}: the optimizer state is of iteration {o.get("iter")}, not {it - 1}: fresh optimizer')
+        elif o is not None:
+            try:
+                groups = o['state'].get('param_groups') or []
+                k = len(groups)
+                if more or gates:
+                    # a widened head (docs/az.md 37): each saved group is one part of this network (the
+                    # trunk, the head of before, the readers, an earlier widen's part) - matched by its
+                    # parameters' shapes, its moments kept; the parts it lacks start fresh. A network with
+                    # gates (docs/az.md 43.6) too: its groups end with the gates', in the order of their history
+                    # (a head or readers added later come after them) - matched, never assumed
+                    at = match_opt_groups(o['state'], pgroups)
+                    if at is None:
+                        why = opt_state_mismatch(model, o['state'], params=[p for g in pgroups for p in g])
+                        raise ValueError(f'it belongs to another network ({why or "its groups fit none of the network"})')
+                    ordered = [pgroups[j] for j in at]
+                    opt = torch.optim.AdamW(ordered[0] if len(ordered) == 1 and ordered[0] is not gates
+                                            else [group(g) for g in ordered],
+                                            lr=c['lr'], weight_decay=c['wd'], **okw)
+                    opt.load_state_dict(o['state'])
+                    for j, g in enumerate(pgroups):
+                        if j not in at:
+                            opt.add_param_group(group(g))
+                elif 0 < k < len(pgroups) and [len(g.get('params', [])) for g in groups] == [len(g) for g in pgroups[:k]]:
+                    # the state of the network before its head (and / or readers): kept for it, the new
+                    # parts start fresh
+                    bad = opt_state_mismatch(model, o['state'], params=[p for g in pgroups[:k] for p in g])
+                    if bad:
+                        raise ValueError(f'it belongs to another network ({bad})')
+                    opt = torch.optim.AdamW(trunk if k == 1 else [group(g) for g in pgroups[:k]], lr=c['lr'],
+                                            weight_decay=c['wd'], **okw)
+                    opt.load_state_dict(o['state'])
+                    for g in pgroups[k:]:
+                        opt.add_param_group(group(g))
+                else:
+                    # (the state of this network: its moments as its parameters, in the optimizer's order;
+                    # another network's, e.g. of another encoding, would load and fail at the first step,
+                    # docs/az.md 10.4)
+                    bad = opt_state_mismatch(model, o['state'], params=[p for g in pgroups for p in g])
+                    if bad:
+                        raise ValueError(f'it belongs to another network ({bad})')
+                    opt.load_state_dict(o['state'])
+                fresh = False
+            except Exception as e:                 # noqa: BLE001
+                # the state saved with checkpoint it - 1 does not fit its network: a fresh optimizer would drop the
+                # moments in silence, every iteration (docs/az.md 43.10) - refused (exit 78, not restarted)
+                raise OptimizerStateMismatch(
+                    f'iter {it}: the optimizer state saved with checkpoint {it - 1} ({opt_path}) does not fit its network '
+                    f'({e}). Refused: a fresh optimizer would drop the moments in silence. Delete {opt_path} to start a '
+                    f'fresh optimizer deliberately (a network that changed: fork_run starts one).') from None
         lr = lr_at(c, it)
         paths = self.window_shards(it)
         aw = sum(w for _, w, _ in self.aux)
@@ -1385,6 +1506,9 @@ class Run:
             kw['aux_older'] = older
         if c.get('window_sparse'):
             kw['sparse'] = True
+        lay = getattr(model, 'config', {}).get('layout')
+        if lay is not None and (any(s.get('tail') for s in lay.get('segments', [])) or lay.get('option_pointers')):
+            kw['layout'] = lay                     # (variable-length rows: the shards' tails and overrides, docs/az.md 43)
         W = Window(paths, model.features, model.config['actions'], budget_rows=budget, seed=it,
                    cache=self.wcache if c.get('window_cache') else None, **kw)
         load_s = time.time() - t1
@@ -1421,22 +1545,29 @@ class Run:
         # (a sparse window: the static training's batches travel as their non-zeros, dense on the device)
         feed = batches(W, rng, steps, c['batch'], dev, c.get('train_prefetch', 0), tokens=tokens,
                        coo=static and W.sparse)
+        # the gated segments (docs/az.md 43.6): per segment the window's rows holding its tokens, and the steps whose
+        # batch held some (a gate still exactly 0 after GATE_STUCK_STEPS of them is said loudly)
+        gseen = gated_rows(model, W)
+        gsteps = [0] * len(gseen)
         for step in range(steps):
             self.check('training')
             g_lr = lr * min(1.0, (step + 1) / c['lr_warmup_steps']) if fresh and c['lr_warmup_steps'] else lr
             for g in opt.param_groups:
                 g['lr'] = g_lr
             idx, b = next(feed)
+            for k, has in enumerate(gseen):
+                gsteps[k] += bool(has[idx].any())
+            rk = forward_kw(b)                     # (variable-length rows: tail / ov; {} without - the calls of before)
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
                 if static:
-                    o = model.forward_static(b['x'], b['n_players'], b['full'], b['ntok'], aux=bool(aw))
+                    o = model.forward_static(b['x'], b['n_players'], b['full'], b['ntok'], aux=bool(aw), **rk)
                     plog, vlog, mp = o[:3]
                     if aw:
                         ap = o[3]
                 elif aw:
-                    plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True)
+                    plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True, **rk)
                 else:
-                    plog, vlog, mp = model(b['x'], b['n_players'])
+                    plog, vlog, mp = model(b['x'], b['n_players'], **rk)
             plog, vlog, mp = plog.float(), vlog.float(), mp.float()
             logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)
             if nview:
@@ -1529,7 +1660,25 @@ class Run:
                 out['readers'] = {'targets': [r['target'] for r in readers], 'detach': bool(model.reader_detach)}
                 if r_added:
                     out['readers']['added'] = True
+            if W.tail is not None or W.ov is not None:
+                # variable-length rows (docs/az.md 43.3): the window's tails and the network's gates (g = max(theta, 0))
+                tc = W.tail.counts() if W.tail is not None else np.zeros(0, np.int64)
+                out['tail'] = {'rows': int(np.count_nonzero(tc)), 'tokens': int(tc.sum()), 'max': int(tc.max(initial=0)),
+                               'overrides': int(W.ov.NO) if W.ov is not None else 0}
+                gates_ = model.gates() if hasattr(model, 'gates') else {}
+                if gates_:
+                    out['tail']['gates'] = {k: round(v, 6) for k, v in gates_.items()}
+                    out['tail']['gate_steps'] = dict(zip(gates_, gsteps))
+                    stuck = stuck_gates(gates_, gsteps)
+                    if stuck:
+                        out['tail']['gates_stuck'] = stuck
             return out
+        stuck = stuck_gates(model.gates(), gsteps) if gseen else []
+        if stuck:
+            self.log(f'iter {it}: WARNING gate{"s" if len(stuck) > 1 else ""} {", ".join(stuck)} still exactly 0 after '
+                     f'{", ".join(str(gsteps[list(model.gates()).index(n)]) for n in stuck)} training steps whose batches '
+                     f'held {"their" if len(stuck) > 1 else "its"} tokens: the segment changes nothing yet (docs/az.md '
+                     f'43.6; an opening gate needs a gradient pushing it up)')
         return model, ost, stats
 
     def opt_path(self):
@@ -1983,6 +2132,9 @@ class Run:
     def loop(self):
         c = self.cfg
         run = self.run
+        # variable-length rows (docs/az.md 43): a draft layout, a stale build, an arch or shard format that cannot
+        # carry them - refused before any work (exit 78); nothing for a game without them
+        self.check_rows()
         start = latest_iter(run)
         if start is None:
             save(self.new_model(), model_path(run, 0), {'iter': 0})
@@ -2097,6 +2249,18 @@ class Run:
             _write_json(os.path.join(run, 'progress.json'), {'phase': 'remote evaluations', 'time': time.time()})
             self.remote.drain()
         _write_json(os.path.join(run, 'progress.json'), {'phase': 'idle', 'time': time.time()})
+
+
+class OptimizerStateMismatch(EncodingMismatch):
+    """The optimizer state saved with the run's last checkpoint (`models/opt_latest.pt`, its iteration's) does not fit
+    the checkpoint's network (docs/az.md 43.10): training on with a fresh optimizer would drop its moments in silence -
+    refused (exit 78, not restarted). Deleting the file starts a fresh optimizer deliberately."""
+
+
+class RowsRefused(EncodingMismatch):
+    """A run whose game or layout has variable-length rows it cannot train exactly (docs/az.md 43: a draft layout, a
+    build disagreeing with its layout, an arch other than 'tokens', dense shards): refused like an EncodingMismatch
+    (exit 78), never started."""
 
 
 class AnchorRefused(EncodingMismatch):

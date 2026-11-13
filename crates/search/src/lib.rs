@@ -14,6 +14,8 @@
 //!   three toy games, each game its own episode (chained episodes, docs/search.md 1.3).
 //! * `lookahead`: the exhaustive lookahead per information set (docs/search.md 3.9; a seat's opt-in
 //!   `lookahead`), its rows batched through the driver like MCTS leaves.
+//! * `tail`: variable-length rows (docs/search.md 1.4, 2.15): a row's tail tokens past the fixed-width head and
+//!   its pointer overrides (`SearchGame::TAILS`, `encode_row`, `option_overrides`).
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
 //! * `record`: game records (a game's seed, real moves and search outputs) and their replay into the
 //!   training rows the driver emitted (docs/search.md 2.17; zero-farm's self-play records).
@@ -27,7 +29,9 @@ pub mod noise;
 pub mod record;
 pub mod rng;
 pub mod settings;
+pub mod tail;
 pub mod toy;
+pub mod toy_tail;
 pub mod toy_match;
 pub mod toy_team;
 pub mod tree;
@@ -43,4 +47,5 @@ pub(crate) mod peek_game;
 pub(crate) mod counter_game;
 
 pub use game::{belief_weight, team_of, Belief, Bot, Next, SearchGame, MAX_SEATS};
+pub use tail::{pack_tok, unpack_tok, TailBuf, TailRow, TailSeg};
 pub use rng::Rng;

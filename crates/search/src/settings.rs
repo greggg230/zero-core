@@ -303,11 +303,13 @@ pub struct DriverArgs {
     pub aux: bool,
     pub paired: bool,
     pub sparse: bool,
+    /// The driver's row limit (`DriverCfg::max_row_tokens`, docs/search.md 2.15; None: the game's own).
+    pub max_row_tokens: Option<usize>,
 }
 
 impl Default for DriverArgs {
     fn default() -> DriverArgs {
-        DriverArgs { spec: "{}".into(), concurrency: 64, seed: 0, record: false, threads: 4, groups: 2, max_steps: 100_000, rolling: false, net: 0, queue_only: false, move_log: 0, aux: false, paired: false, sparse: false }
+        DriverArgs { spec: "{}".into(), concurrency: 64, seed: 0, record: false, threads: 4, groups: 2, max_steps: 100_000, rolling: false, net: 0, queue_only: false, move_log: 0, aux: false, paired: false, sparse: false, max_row_tokens: None }
     }
 }
 
@@ -334,8 +336,8 @@ pub fn driver_cfg(seats: &[Vec<Value>], branch: Option<&Value>, starts: Option<&
     }
     let branch = branch.map(parse_branch).transpose()?;
     let starts = starts.map(parse_starts).transpose()?;
-    let DriverArgs { spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse } = a;
-    Ok(DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts })
+    let DriverArgs { spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, max_row_tokens } = a;
+    Ok(DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts, max_row_tokens })
 }
 
 #[cfg(test)]

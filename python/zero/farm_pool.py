@@ -407,7 +407,7 @@ class Pool:
 
     def _chunk(self, r):
         """One self-play result chunk: its credited games replayed and held (module docstring)."""
-        from .data import compact, compact_sparse, shard_format
+        from .data import _rows_shard, compact, compact_rows, compact_sparse, shard_format
         from .finite import shard_problems
         E = self._engine()
         body = self.client.call('GET', f'/v1/admin/artifact/{r["key"]}', raw=True)
@@ -431,7 +431,8 @@ class Pool:
         except ValueError:
             return self._refuse(r, 'the spec is not JSON', body)
         ids = [tuple(x) for x in (r.get('ids') or [])]
-        sparse = shard_format(self.R.cfg).get('x_format') == 'sparse'
+        fmt = shard_format(self.R.cfg, self.R.info)     # (a game with tails / overrides: format v2, docs/az.md 43)
+        sparse = fmt.get('x_format') == 'sparse'
         machine = r.get('machine_id') or '?'
         keep = []
         for ln in lines:
@@ -459,6 +460,8 @@ class Pool:
                     s['xs'] = _sparse_rows(s)
                     del s['x']
                     c, _cols = compact_sparse(s)
+                    if _rows_shard(fmt):
+                        c.update(compact_rows(s, fmt))      # (the tails' floats as stored: float16)
                 else:
                     s['x'] = s['x'].astype('float16')
                     c = compact(s)
@@ -508,9 +511,11 @@ class Pool:
                 w = self.writers.get(key)
                 if w is None:
                     d = os.path.join(self.R.run, 'data', f'iter_{it:04d}')
+                    # (format v2's keys for a game with tails / overrides, docs/az.md 43: `shard_format` with the game's
+                    # info, as Run.shard_meta)
                     meta = {'game': self.R.cfg['game'], 'features': self.R.info['num_features'],
                             'actions': self.R.info['num_actions'], 'iter': it, 'source': 'pool', 'machine': m,
-                            'farm_run': self.farm, **shard_format(self.R.cfg)}
+                            'farm_run': self.farm, **shard_format(self.R.cfg, self.R.info)}
                     pre = 'pool-' + ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in m)
 
                     def wrote(*a, **k):

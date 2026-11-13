@@ -146,13 +146,24 @@ def replay_line(world, moves, reveal=None):
 
 def drive(la, ev):
     """Answer a `Lookahead`'s rounds with evaluator `ev` (NetEvaluator.evaluate's contract) until it
-    decides -> (rounds, rows)."""
+    decides -> (rounds, rows). A game with tail segments / pointer overrides (docs/search.md 2.15): each round's
+    rows carry their tails and overrides (`t_*`, `ov_*`), passed to `ev` as `tail=` / `ov=` (`rows.Tail` /
+    `rows.Overrides`); a row past the game's row limit raises in `next_batch` (RuntimeError 'max_row_tokens: ...')."""
     rounds = rows = 0
+    widths = None
     while True:
         b = la.next_batch()
         if b is None:
             return rounds, rows
-        out = ev.evaluate(b['x'], b['n_players'], b['opt_off'], b['opt_action'], b['extra'])
+        kw = {}
+        if 't_off' in b or 'ov_off' in b:
+            from . import rows as R
+            from .games import tail_widths
+            if widths is None:
+                widths = tail_widths(dict(la.info()))
+            kw = R.eval_kw(R.Tail.from_arrays(b, widths) if 't_off' in b else None,
+                           R.Overrides.from_arrays(b) if 'ov_off' in b else None)
+        out = ev.evaluate(b['x'], b['n_players'], b['opt_off'], b['opt_action'], b['extra'], **kw)
         la.submit(out[0], out[1], out[3] if len(out) > 3 else None)
         rounds += 1
         rows += len(b['player'])

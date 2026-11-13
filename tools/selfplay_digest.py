@@ -37,20 +37,39 @@ def _mod(pkg, name):
     raise ModuleNotFoundError(f'{pkg}: no module {name}')
 
 
-def records_digest(parts, np):
+def records_digest(parts, np, widths=None):
     """sha256 over the sample rows (each row's arrays), rows sorted by their own hash (the order
-    games finish in may depend on thread timing; the rows may not)."""
+    games finish in may depend on thread timing; the rows may not). A row's tail tokens and pointer
+    overrides (variable-length rows, docs/az.md 43: `t_*` / `ov_*`, only in a game with them; `widths`
+    its tail segments {seg: (width, ...)}) are hashed with it - a game without them: the digest of before."""
     rows = []
     for s in parts:
         if s is None or not len(s['player']):
             continue
         off = s['opt_off']
+        tv = None
+        if 't_off' in s:
+            if not widths:
+                raise SystemExit("records_digest: samples with tail tokens need the game's tail widths")
+            lut = np.zeros(max(widths) + 1, np.int64)
+            for g, w in widths.items():
+                lut[g] = w[0] if isinstance(w, (tuple, list)) else w
+            tv = np.concatenate([[0], np.cumsum(lut[np.asarray(s['t_seg'], np.int64)])])
         for b in range(len(s['player'])):
             h = hashlib.sha256()
             for k in ('x', 'player', 'n_players', 'z', 'q', 'sc', 'net'):
                 h.update(np.ascontiguousarray(s[k][b]).tobytes())
             for k in ('opt_action', 'pi'):
                 h.update(np.ascontiguousarray(s[k][off[b]:off[b + 1]]).tobytes())
+            if tv is not None:
+                t0, t1 = int(s['t_off'][b]), int(s['t_off'][b + 1])
+                for k in ('t_seg', 't_slot'):
+                    h.update(np.ascontiguousarray(s[k][t0:t1]).tobytes())
+                h.update(np.ascontiguousarray(s['t_val'][tv[t0]:tv[t1]]).tobytes())
+            if 'ov_off' in s:
+                o0, o1 = int(s['ov_off'][b]), int(s['ov_off'][b + 1])
+                for k in ('ov_opt', 'ov_tok'):
+                    h.update(np.ascontiguousarray(s[k][o0:o1]).tobytes())
             rows.append(h.hexdigest())
     rows.sort()
     return len(rows), hashlib.sha256(''.join(rows).encode()).hexdigest()
@@ -126,7 +145,8 @@ def main(argv=None):
         parts = []
         infer.drive(drv, {'m': ev}, on_batch=lambda lb: parts.append(drv.take_samples()))
         parts.append(drv.take_samples())
-        n, d = records_digest(parts, np)
+        tw = G.tail_widths(G.info(game)) if hasattr(G, 'tail_widths') else None    # (variable-length rows)
+        n, d = records_digest(parts, np, tw)
         res = drv.take_results()
         out['targets'][target] = {'samples': n, 'records': d, 'results': results_digest(res), 'games': len(res)}
     if a.match_games:

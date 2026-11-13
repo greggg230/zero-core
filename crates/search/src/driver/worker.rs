@@ -110,6 +110,8 @@ struct Tally {
     /// Value choices (docs/search.md 3.17) and their lookaheads' rows.
     value_choices: u64,
     value_choice_rows: u64,
+    /// Games aborted by the row limit (docs/search.md 2.15).
+    row_aborts: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -258,6 +260,9 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     }
     if n.belief_rows > 0 {
         k.belief_rows.fetch_add(n.belief_rows, Ordering::Relaxed);
+    }
+    if n.row_aborts > 0 {
+        k.aborted_row_tokens.fetch_add(n.row_aborts, Ordering::Relaxed);
     }
     if n.value_choices > 0 {
         k.value_choices.fetch_add(n.value_choices, Ordering::Relaxed);
@@ -530,7 +535,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         // (a game that resigned at its last decision ends here: docs/search.md 3.14)
         let resigned = slot.resign.as_ref().is_some_and(|r| r.resigned);
         let g = slot.game.as_ref().unwrap();
-        let Some(p) = g.to_move().filter(|_| slot.steps < cfg.max_steps && !resigned) else {
+        let Some(p) = g.to_move().filter(|_| slot.steps < cfg.max_steps && !resigned && !slot.row_abort) else {
             finish(sh, slot, results, samples, parked, n)?;
             if slot.game.is_some() {
                 // the game drew a branch (docs/search.md 2.11): its slot plays it now
@@ -611,7 +616,10 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
         if brow && tree.expanded(tree.root) {
             let buf = &mut bufs[seat.key as usize];
             let local = buf.len() as u32;
-            push_belief_row(buf, live, p, slot.n, slot.gid);
+            if let Some(cap) = push_belief_row(buf, live, p, slot.n, slot.gid) {
+                row_over(cfg, slot, buf, local, "belief", cap);
+                continue;
+            }
             n.belief_rows += 1;
             slot.pending = Some(Pending::Belief { key: seat.key, local, seat: p });
             return Ok(());
@@ -641,7 +649,11 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 // (information-set merging, docs/search.md 3.16: the leaf's row of the viewer - its own row at a
                 // viewer's leaf, the value-only row at another seat's - as the merged tree encoded it, not again)
                 let shared = leaf_obs(sh, tree, node);
-                encode_leaf_row(buf, sg, player, shared.filter(|_| player == tree.viewer), n);
+                if let Some(cap) = encode_leaf_row(buf, sg, player, shared.filter(|_| player == tree.viewer), n) {
+                    row_over(cfg, slot, buf, local, "leaf", cap);
+                    continue;
+                }
+                buf.overrides(sg, player, acts);
                 let lkey = cache_key(buf.row_hash(G::NUM_FEATURES), acts);
                 let leaf = slot.cache.get(&(seat.key, slot.net, lkey)).cloned();
                 if leaf.is_some() {
@@ -658,7 +670,10 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
                 let (mut vkey, mut view) = (None, None);
                 if vrow {
-                    encode_leaf_row(buf, sg, tree.viewer, shared, n);
+                    if let Some(cap) = encode_leaf_row(buf, sg, tree.viewer, shared, n) {
+                        row_over(cfg, slot, buf, local, "value", cap);
+                        continue;
+                    }
                     let k = cache_key(buf.row_hash(G::NUM_FEATURES), &[]);
                     view = slot.cache.get(&(seat.key, slot.net, k)).cloned();
                     if view.is_some() {
@@ -690,7 +705,10 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                     if node != tree.root {
                         return Err("internal: a fresh root's first leaf is not the root".into());
                     }
-                    push_belief_row(buf, live, p, slot.n, slot.gid);
+                    if let Some(cap) = push_belief_row(buf, live, p, slot.n, slot.gid) {
+                        row_over(cfg, slot, buf, local, "belief", cap);
+                        continue;
+                    }
                     n.belief_rows += 1;
                 }
                 let lkey = leaf.is_none().then_some(lkey);
@@ -703,9 +721,13 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 let local = buf.len() as u32;
                 // (the leaf's row of the viewer from the merged tree's encoding: as with the eval cache, above)
                 let shared = leaf_obs(sh, tree, node);
-                encode_leaf_row(buf, sg, player, shared.filter(|_| player == tree.viewer), n);
-                buf.seal();
+                if let Some(cap) = encode_leaf_row(buf, sg, player, shared.filter(|_| player == tree.viewer), n) {
+                    row_over(cfg, slot, buf, local, "leaf", cap);
+                    continue;
+                }
                 let acts = tree.leaf_acts(node);
+                buf.overrides(sg, player, acts);
+                buf.seal();
                 buf.nopt.push(acts.len() as i32);
                 buf.opt_action.extend(acts.iter().map(|&a| a as i32));
                 buf.player.push(player as i32);
@@ -716,7 +738,10 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 // value-only row (no options) of the tree's viewer, the root decider, right after it
                 let vrow = seat.leaf_value_view == LeafView::Root && player != tree.viewer;
                 if vrow {
-                    encode_leaf_row(buf, sg, tree.viewer, shared, n);
+                    if let Some(cap) = encode_leaf_row(buf, sg, tree.viewer, shared, n) {
+                        row_over(cfg, slot, buf, local, "value", cap);
+                        continue;
+                    }
                     buf.seal();
                     buf.nopt.push(0);
                     buf.player.push(tree.viewer as i32);
@@ -730,7 +755,10 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                     if node != tree.root {
                         return Err("internal: a fresh root's first leaf is not the root".into());
                     }
-                    push_belief_row(buf, live, p, slot.n, slot.gid);
+                    if let Some(cap) = push_belief_row(buf, live, p, slot.n, slot.gid) {
+                        row_over(cfg, slot, buf, local, "belief", cap);
+                        continue;
+                    }
                     n.belief_rows += 1;
                 }
                 slot.pending = Some(Pending::Leaf { key: seat.key, local, seat: p, node, vrow, brow, part: None });
@@ -742,13 +770,17 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
 }
 
 /// A lookahead's rows into a key's leaf buffer (docs/search.md 3.9): one row each, `encode(viewer)`
-/// with its options (none: value-only), kind as given.
+/// with its options (none: value-only), kind as given; a game with tails / pointer overrides: each row's tail and
+/// overrides (`row_tail`, docs/search.md 2.15), a row past the row limit dropped and its capacity kept in `over`
+/// (the caller aborts the game).
 struct LeafSink<'a> {
     buf: &'a mut LeafBuf,
     gid: u32,
     n: usize,
     /// The last row's features may still be written (sealed at the next row, or on drop).
     open: bool,
+    /// A row passed the row limit: its capacity (the lookahead's step then failed; `look_over`).
+    over: Option<usize>,
 }
 
 impl Drop for LeafSink<'_> {
@@ -787,6 +819,30 @@ impl<G: SearchGame> RowSink<G> for LeafSink<'_> {
         b.extra.pop();
         b.unrow(G::NUM_FEATURES);
     }
+    fn row_tail(&mut self, tail: &TailBuf, ov: &[(u32, i64)]) -> Result<(), String> {
+        let b = &mut *self.buf;
+        if b.tails {
+            b.tb.set_sealed(tail.seg(), tail.slot(), tail.val());
+            if let Some(cap) = b.over() {
+                RowSink::<G>::pop_row(self);
+                self.over = Some(cap);
+                return Err(format!("max_row_tokens: a lookahead row of capacity {cap}"));
+            }
+        }
+        if b.pointers {
+            b.ov_open.clear();
+            b.ov_open.extend_from_slice(ov);
+        }
+        Ok(())
+    }
+}
+
+/// A lookahead's or value choice's row past the row limit (`LeafSink::over`, docs/search.md 2.15): the rows the
+/// game sent this step (from `local`) are taken back, the lookahead dropped and the game aborted.
+fn look_over<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, buf: &mut LeafBuf, local: u32, kind: &str, cap: usize) {
+    buf.truncate_rows(local as usize, G::NUM_FEATURES);
+    slot.look = None;
+    abort_game::<G>(cfg, slot, kind, cap);
 }
 
 /// The lookahead of seat `p`'s pending decision (docs/search.md 3.9): created at the decision's first
@@ -809,11 +865,16 @@ fn look_step<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, seat: &NnSeat, l
     }
     let buf = &mut bufs[seat.key as usize];
     let local = buf.len() as u32;
-    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false };
+    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false, over: None };
     let look = slot.look.as_mut().unwrap();
     let r = look.step(&mut sink, &mut slot.search_rng);
+    let over = sink.over;
     drop(sink);
     let busy = t0.elapsed().as_secs_f64();
+    if let Some(cap) = over {
+        look_over(&sh.cfg, slot, &mut bufs[seat.key as usize], local, "lookahead", cap);
+        return Ok(false);
+    }
     let r = r?;
     if let LookStep::Rows(_) = r {
         lock(&sh.counters.look).busy_s += busy;
@@ -859,10 +920,15 @@ fn value_choice_step<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize,
     }
     let buf = &mut bufs[seat.key as usize];
     let local = buf.len() as u32;
-    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false };
+    let mut sink = LeafSink { buf, gid: slot.gid, n: slot.n, open: false, over: None };
     let look = slot.look.as_mut().unwrap();
     let r = look.step(&mut sink, &mut slot.search_rng);
+    let over = sink.over;
     drop(sink);
+    if let Some(cap) = over {
+        look_over(cfg, slot, &mut bufs[seat.key as usize], local, "value choice", cap);
+        return Ok(false);
+    }
     if let LookStep::Rows(_) = r? {
         slot.pending = Some(Pending::Look { key: seat.key, local });
         return Ok(true);
@@ -908,37 +974,98 @@ fn guard_move(means: &[(u16, f64)], margin: f64, a: u16) -> (u16, bool) {
 
 /// The merged tree's encoding of the walk's leaf from its viewer (`Tree::leaf_obs`; None when off, when the walk did
 /// not encode its leaf, or when a test turned the reuse off).
-fn leaf_obs<'t, G: SearchGame>(sh: &Shared<G>, tree: &'t Tree<G>, node: u32) -> Option<(&'t [u32], &'t [f32])> {
+fn leaf_obs<'t, G: SearchGame>(sh: &Shared<G>, tree: &'t Tree<G>, node: u32) -> Option<ObsRow<'t>> {
     #[cfg(test)]
     if sh.counters.share_off.load(Ordering::Relaxed) {
         return None;
     }
     let _ = sh;
-    tree.leaf_obs(node)
+    let (idx, val) = tree.leaf_obs(node)?;
+    let tail = if G::TAILS.is_empty() { None } else { Some(tree.leaf_obs_tail(node)?) };
+    Some(ObsRow { idx, val, tail })
+}
+
+/// A merged tree's encoding of a leaf (`leaf_obs`): the head's non-zero pairs and, for a game with tails, the
+/// sealed tail of the same encoding (docs/search.md 2.15).
+#[derive(Clone, Copy)]
+struct ObsRow<'t> {
+    idx: &'t [u32],
+    val: &'t [f32],
+    tail: Option<(&'t [u16], &'t [u32], &'t [f32])>,
+}
+
+/// A row of the slot's game passed the row limit (docs/search.md 2.15, 6): the open row and every row the game
+/// sent this step (from `local`) are taken back and the game is aborted.
+fn row_over<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, buf: &mut LeafBuf, local: u32, kind: &str, cap: usize) {
+    buf.unrow(G::NUM_FEATURES);
+    buf.truncate_rows(local as usize, G::NUM_FEATURES);
+    abort_game::<G>(cfg, slot, kind, cap);
+}
+
+/// Abort the slot's game for the row limit: it ends at the advance loop's top as aborted (`GameResult::aborted`,
+/// reason `max_row_tokens`, no samples), counted (`aborted_row_tokens`) and logged (one stderr line).
+fn abort_game<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, kind: &str, cap: usize) {
+    let limit = cfg.max_row_tokens.unwrap_or(G::MAX_ROW_TOKENS);
+    eprintln!("max_row_tokens: game {} (driver seed {}) aborted: its {kind} row has capacity {cap} > {limit}", slot.gid, cfg.seed);
+    slot.row_abort = true;
+    slot.pending = None;
+}
+
+/// A record's row (docs/search.md 2.15): `encode(viewer)` into `x` (zeroed) for a game without tails or pointer
+/// overrides; else `encode_row` with its sealed tail and the overrides against `opts` (a row with options).
+/// Also a replayed record's (`record::replay`, docs/search.md 2.17): the same row bit for bit.
+pub(crate) fn record_row<G: SearchGame>(g: &G, viewer: usize, opts: &[u16], x: &mut [f32]) -> (TailRow, Vec<(u32, i64)>) {
+    if G::TAILS.is_empty() && !G::OPTION_POINTERS {
+        g.encode(viewer, x);
+        return (TailRow::default(), Vec::new());
+    }
+    let mut tb = crate::tail::TailBuf::new(G::TAILS);
+    g.encode_row(viewer, x, &mut tb);
+    tb.seal();
+    let mut ov = Vec::new();
+    if G::OPTION_POINTERS && !opts.is_empty() {
+        g.option_overrides(viewer, opts, &mut ov);
+        check_overrides(&ov, opts.len());
+    }
+    (tb.to_row(), ov)
+}
+
+/// The capacity of a record's row when it passes the row limit (docs/search.md 2.15).
+fn record_over<G: SearchGame>(cfg: &DriverCfg, tail: &TailRow) -> Option<usize> {
+    if G::TAILS.is_empty() {
+        return None;
+    }
+    let cap = G::HEAD_TOKENS + tail.len();
+    (cap > cfg.max_row_tokens.unwrap_or(G::MAX_ROW_TOKENS)).then_some(cap)
 }
 
 /// A leaf's row of `viewer` into `buf` (sealed by the caller): `encode(viewer)` of `g`, or `shared` - the merged
 /// tree's `encode_sparse(viewer)` of the same state (docs/search.md 3.16), the same row bit for bit by that
 /// contract, one encode fewer.
-fn encode_leaf_row<G: SearchGame>(buf: &mut LeafBuf, g: &G, viewer: usize, shared: Option<(&[u32], &[f32])>, n: &mut Tally) {
+/// -> the row's capacity when it passes the row limit (`LeafBuf::encode_row`; the row is still open).
+fn encode_leaf_row<G: SearchGame>(buf: &mut LeafBuf, g: &G, viewer: usize, shared: Option<ObsRow>, n: &mut Tally) -> Option<usize> {
     match shared {
-        Some((idx, val)) => {
-            buf.push_pairs(idx, val, G::NUM_FEATURES);
+        Some(o) => {
             n.merge_shared += 1;
+            buf.push_pairs(o.idx, o.val, G::NUM_FEATURES, o.tail)
         }
         None => buf.encode_row(g, viewer),
     }
 }
 
 /// A root belief row (`ROW_BELIEF`, docs/search.md 3.8): `encode(p)` of the live game, no options.
-fn push_belief_row<G: SearchGame>(buf: &mut LeafBuf, live: &G, p: usize, n: usize, gid: u32) {
-    buf.encode_row(live, p);
+/// -> the row's capacity when it passes the row limit (the row taken back: nothing pushed).
+fn push_belief_row<G: SearchGame>(buf: &mut LeafBuf, live: &G, p: usize, n: usize, gid: u32) -> Option<usize> {
+    if let Some(cap) = buf.encode_row(live, p) {
+        return Some(cap);
+    }
     buf.seal();
     buf.nopt.push(0);
     buf.player.push(p as i32);
     buf.n_players.push(n as i32);
     buf.gid.push(gid as i64);
     buf.extra.push(ROW_BELIEF);
+    None
 }
 
 /// Start the search for the pending decision of seat `p` (legal actions in `slot.legal`).
@@ -1151,7 +1278,11 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         };
         let g = slot.game.as_ref().unwrap();
         let mut x = vec![0.0f32; G::NUM_FEATURES];
-        g.encode(p, &mut x);
+        let (tail, ov) = record_row(g, p, acts, &mut x);
+        if let Some(cap) = record_over::<G>(cfg, &tail) {
+            abort_game::<G>(cfg, slot, "record", cap);
+            return Ok(());
+        }
         // the decider's auxiliary targets from the true state (a label only: never in `x`)
         let mut aux = Vec::new();
         if cfg.aux {
@@ -1159,7 +1290,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             g.aux_target(p, &mut aux);
         }
         let step = slot.trace.as_ref().map_or(0, |t| t.len() as u32);
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step });
+        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov });
         slot.rq.push(if gumbel {
             tree.gumbel_q()
         } else if pruned.is_some() {
@@ -1177,7 +1308,11 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                     continue;
                 }
                 let mut x = vec![0.0f32; G::NUM_FEATURES];
-                g.encode(o, &mut x);
+                let (tail, _) = record_row(g, o, &[], &mut x);
+                if let Some(cap) = record_over::<G>(cfg, &tail) {
+                    abort_game::<G>(cfg, slot, "record", cap);
+                    return Ok(());
+                }
                 // (with auxiliary targets: the observer's, as a decider's are the decider's)
                 let mut aux = Vec::new();
                 if cfg.aux {
@@ -1187,7 +1322,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                 if seat.view_target == ViewTarget::NextQ {
                     slot.view_wait.push((slot.records.len() as u32, o as u8));
                 }
-                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step });
+                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov: Vec::new() });
                 slot.rq.push(None);
                 n.view_recorded += 1;
             }
@@ -1291,19 +1426,22 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
 fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>, n_: &mut Tally) -> Result<(), String> {
     let cfg = &sh.cfg;
     if slot.chain.is_some() {
-        return finish_episode(cfg, slot, results, samples);
+        return finish_episode(cfg, slot, results, samples, n_);
     }
     let g = slot.game.take().unwrap();
     // (a resigned game is over: its result is the resignation's, docs/search.md 3.14; an aborted
     // game has no result: not over, so it emits no samples, `SearchGame::aborted`)
     let resign = slot.resign.take();
-    let over = (g.to_move().is_none() && !g.aborted()) || resign.as_ref().is_some_and(|r| r.resigned);
+    // (a game aborted by the row limit has no result either: docs/search.md 2.15)
+    let row_abort = std::mem::take(&mut slot.row_abort);
+    n_.row_aborts += row_abort as u64;
+    let over = !row_abort && ((g.to_move().is_none() && !g.aborted()) || resign.as_ref().is_some_and(|r| r.resigned));
     let gid = slot.gid;
     let start = slot.start_ix.take();
     let fork = slot.fork.take();
     // the game's trace (docs/search.md 2.17): its seed, real moves, setup record and - over - its margins
     let trace = slot.trace.take().map(|steps| Box::new(GameTrace { seed: slot.game_seed, steps, setup: g.record_setup(), margins: if over && !g.deferred() { (0..slot.n).map(|i| g.margin(i)).collect() } else { Vec::new() }, episode_setups: Vec::new() }));
-    let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start, resign: resign.as_ref().map(|r| r.info()), trace };
+    let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start, resign: resign.as_ref().map(|r| r.info()), trace, abort: row_abort.then_some("max_row_tokens") };
     slot.dev_left = 0;
     slot.dev_now = false;
     let records = std::mem::take(&mut slot.records);
@@ -1349,12 +1487,17 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
 /// episodes. An episode that ended (over) continues the contest from `next_episode`'s state in the same slot - the
 /// same gid, seats, bots and random streams; fresh trees, records, evaluation cache, resignation counter; searched
 /// decisions and real moves counted from 0 again; the move log goes on -; otherwise (the contest over, or an episode
-/// cut or aborted) the contest's one result row goes out with every episode's samples behind it.
-fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>) -> Result<(), String> {
+/// cut or aborted) the contest's one result row goes out with every episode's samples behind it. An episode aborted by
+/// the row limit (docs/search.md 2.15) is an aborted episode: no samples of its own, the contest unfinished, the
+/// contest's row `aborted` with the reason.
+fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, n_: &mut Tally) -> Result<(), String> {
     let g = slot.game.take().unwrap();
     let resign = slot.resign.take();
     let resigned = resign.as_ref().is_some_and(|r| r.resigned);
-    let over = (g.to_move().is_none() && !g.aborted()) || resigned;
+    let row_abort = std::mem::take(&mut slot.row_abort);
+    n_.row_aborts += row_abort as u64;
+    let abort = row_abort.then_some("max_row_tokens");
+    let over = !row_abort && ((g.to_move().is_none() && !g.aborted()) || resigned);
     if over && !resigned && g.deferred() {
         return Err(format!("{}: a chained game at a deferred terminal (chained episodes take their outcome from the game, docs/search.md 2.14)", G::NAME));
     }
@@ -1368,7 +1511,7 @@ fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &
         Some(None) => return Err("internal: a resignation without a favoured seat".into()),
         None => None,
     };
-    let done = Done { gid: slot.gid, tag: None, n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: Vec::new(), branch: None, start: None, resign: rs, trace: None };
+    let done = Done { gid: slot.gid, tag: None, n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: Vec::new(), branch: None, start: None, resign: rs, trace: None, abort };
     // (a traced contest, docs/search.md 2.17: each ended episode's setup record)
     if slot.trace.is_some() {
         slot.trace_setups.push(g.record_setup());
@@ -1422,7 +1565,7 @@ fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &
                 gid: slot.gid,
                 n,
                 over: contest.is_some(),
-                aborted: !resigned && g.to_move().is_none() && g.aborted(),
+                aborted: row_abort || (!resigned && g.to_move().is_none() && g.aborted()),
                 result: contest.map_or_else(|| vec![1.0 / n as f32; n], |r| r[..n].to_vec()),
                 scores: (0..n).map(|i| g.score(i)).collect(),
                 steps: ch.steps,
@@ -1435,6 +1578,7 @@ fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &
                 branch: None,
                 start: slot.start_ix.take(),
                 resign: None,
+                abort_reason: abort,
                 episodes: std::mem::take(&mut ch.episodes),
                 // the contest's trace: its seed, every real move and episode boundary, each episode's setup record
                 // (the last one's is the contest's)
@@ -1531,6 +1675,8 @@ pub(super) struct Done {
     pub resign: Option<ResignInfo>,
     /// The game's trace (`Driver::set_trace`, docs/search.md 2.17).
     pub trace: Option<Box<GameTrace>>,
+    /// The driver aborted the game (`GameResult::abort_reason`; docs/search.md 2.15).
+    pub abort: Option<&'static str>,
 }
 
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
@@ -1556,7 +1702,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         gid: d.gid,
         n,
         over,
-        aborted: g.to_move().is_none() && g.aborted(),
+        aborted: d.abort.is_some() || (g.to_move().is_none() && g.aborted()),
         result: res[..n].to_vec(),
         scores: (0..n).map(|i| g.score(i)).collect(),
         steps: d.steps,
@@ -1570,6 +1716,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         start: d.start,
         resign: d.resign,
         trace: d.trace,
+        abort_reason: d.abort,
         episodes: Vec::new(),
     };
     if emit {
@@ -1641,6 +1788,11 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
         bt.opt_off = vec![0; b + 1];
         bt.opt_action = vec![0; nopt];
         bt.extra = vec![ROW_LEAF; b];
+        if !G::TAILS.is_empty() || G::OPTION_POINTERS {
+            // variable-length rows (docs/search.md 2.15): the tail and override CSRs, assembled here (they are
+            // short: most rows have none); B + 1 offsets even if every row's are empty
+            tail_csr::<G>(&sh.counters, &chunks, k, b, &mut bt);
+        }
         let dest = Dest {
             x: bt.x.as_mut_ptr(),
             player: bt.player.as_mut_ptr(),
@@ -1661,6 +1813,47 @@ fn plan_assembly<G: SearchGame>(sh: &Shared<G>, g: usize) -> usize {
     drop(chunks);
     *lock(&grp.asm) = Some(asm);
     n
+}
+
+/// A network batch's tail (`G::TAILS`) and override (`G::OPTION_POINTERS`) arrays from the chunks' buffers of key
+/// `k` in chunk order (the rows' order); the tail counters.
+fn tail_csr<G: SearchGame>(c: &Counters, chunks: &[MutexGuard<'_, Chunk<G>>], k: usize, b: usize, bt: &mut Batch) {
+    if !G::TAILS.is_empty() {
+        let (mut rows, mut toks, mut most) = (0u64, 0u64, 0u64);
+        bt.t_off.reserve(b + 1);
+        bt.t_off.push(0);
+        for ch in chunks {
+            let x = &ch.bufs[k];
+            assert_eq!(x.t_nt.len(), x.len(), "internal: a network row without its tail count");
+            bt.t_seg.extend_from_slice(&x.t_seg);
+            bt.t_slot.extend_from_slice(&x.t_slot);
+            bt.t_val.extend_from_slice(&x.t_val);
+            for &nt in &x.t_nt {
+                bt.t_off.push(*bt.t_off.last().unwrap() + nt as i64);
+                rows += (nt > 0) as u64;
+                toks += nt as u64;
+                most = most.max(nt as u64);
+            }
+        }
+        if rows > 0 {
+            c.tail_rows.fetch_add(rows, Ordering::Relaxed);
+            c.tail_tokens.fetch_add(toks, Ordering::Relaxed);
+            c.tail_max.fetch_max(most, Ordering::Relaxed);
+        }
+    }
+    if G::OPTION_POINTERS {
+        bt.ov_off.reserve(b + 1);
+        bt.ov_off.push(0);
+        for ch in chunks {
+            let x = &ch.bufs[k];
+            assert_eq!(x.ov_n.len(), x.len(), "internal: a network row without its override count");
+            bt.ov_opt.extend_from_slice(&x.ov_opt);
+            bt.ov_tok.extend_from_slice(&x.ov_tok);
+            for &no in &x.ov_n {
+                bt.ov_off.push(*bt.ov_off.last().unwrap() + no as i64);
+            }
+        }
+    }
 }
 
 /// Fill job: copy chunk `c`'s rows of every network key into the group's batches.

@@ -33,6 +33,7 @@ fn cfg(seats: Vec<SeatCfg>, games: Vec<Vec<u16>>, keys: &[(&str, KeyKind)]) -> D
         sparse: false,
         branch: None,
         starts: None,
+        max_row_tokens: None,
     }
 }
 

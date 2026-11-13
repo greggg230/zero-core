@@ -18,6 +18,8 @@
 //!  "steps": [action (u16) | "external answer" (string) | {"next": conceding seat | null} (a chained contest's
 //!            episode boundary: SearchGame::next_episode), ...],
 //!  "over": bool, "aborted": bool, "resigned": winner seat | null,
+//!  "abort_reason": "max_row_tokens" (only a game the driver aborted at its row limit, docs/search.md 2.15: not
+//!                  over, no samples of its own; left out otherwise),
 //!  "result": [f32 bits per seat], "margin": [f32 bits per seat] (over games; else []), "rounds": u32,
 //!  "setup": "<SearchGame::record_setup>" (left out when empty),
 //!  "episodes": [{"over", "aborted", "resigned", "result", "margin", "rounds", "setup"}, ...] (a chained contest's
@@ -32,9 +34,15 @@
 //! setup that differs from the record's - per episode of a chained contest too, and the contest's own result
 //! from `next_episode` - any of them rejects the whole record. The search's outputs (`pi`, `q`) can't be checked
 //! without searching again; they are checked to be finite and in [0, 1].
+//!
+//! A game with variable-length rows (docs/search.md 2.15: `SearchGame::TAILS` / `OPTION_POINTERS`) replays each
+//! row as the driver built it - the head, its sealed tail tokens and its pointer overrides against the row's
+//! options (`driver::record_row`) - and refuses a row past the game's `MAX_ROW_TOKENS` (the driver would have
+//! aborted that game: no samples). A game the driver aborted at the limit (`abort_reason`) replays to a game still
+//! in progress, as the driver left it.
 use serde_json::{json, Map, Value};
 
-use crate::driver::{f16_to_f32, f32_to_f16, GameResult, Record};
+use crate::driver::{f16_to_f32, f32_to_f16, record_row, GameResult, Record};
 use crate::game::{Next, SearchGame, MAX_SEATS};
 
 /// The record format's version (`records/1`).
@@ -121,6 +129,10 @@ pub fn game_json(row: &GameResult, samples: &[Record]) -> Result<Value, String> 
     o.insert("over".into(), json!(row.over));
     o.insert("aborted".into(), json!(row.aborted));
     o.insert("resigned".into(), json!(resigned));
+    if let Some(why) = row.abort_reason {
+        // (a game the driver aborted at its row limit, docs/search.md 2.15; the key exists only then)
+        o.insert("abort_reason".into(), json!(why));
+    }
     o.insert("result".into(), Value::Array(bits32(&row.result)));
     o.insert("margin".into(), Value::Array(bits32(&t.margins)));
     o.insert("rounds".into(), json!(row.rounds));
@@ -158,6 +170,8 @@ pub struct Replayed {
     pub over: bool,
     pub aborted: bool,
     pub resigned: Option<u8>,
+    /// The driver aborted the game at its row limit ("max_row_tokens", docs/search.md 2.15).
+    pub abort_reason: Option<&'static str>,
     pub result: Vec<f32>,
     pub rounds: u32,
     /// Real moves replayed (a contest's episode boundaries included).
@@ -228,9 +242,15 @@ fn ep_of(o: &Map<String, Value>, n: usize) -> Result<Ep, String> {
 /// The end of an episode (a whole game's, or a contest's episode) checked against the record's `e`, as the driver
 /// ended it (driver::worker::finish / finish_episode, emit) -> (its result: the samples' z, its margins: their sc).
 /// `chained`: a contest's episode (its margins are zeros when it is not over, the driver's `EpisodeRow`).
-fn end_episode<G: SearchGame>(g: &G, e: &Ep, n: usize, samples: usize, chained: bool, what: &str) -> Result<(Vec<f32>, Vec<f32>), String> {
+/// `row_abort`: the driver aborted it at its row limit (the record's `abort_reason`; docs/search.md 2.15) - not over,
+/// aborted, the game still in progress where the driver stopped it.
+fn end_episode<G: SearchGame>(g: &G, e: &Ep, n: usize, samples: usize, chained: bool, row_abort: bool, what: &str) -> Result<(Vec<f32>, Vec<f32>), String> {
     if e.resigned.is_some() && (!e.over || e.aborted) {
         return Err(format!("record: {what}: a resigned episode is over and not aborted"));
+    }
+    if row_abort && (e.over || !e.aborted || e.resigned.is_some() || g.to_move().is_none()) {
+        return Err(format!("record: {what}: aborted at the row limit, so aborted, not over, not resigned and still in progress (over {}, aborted {}, resigned {:?}, the replay {})",
+                           e.over, e.aborted, e.resigned, if g.to_move().is_none() { "ended" } else { "in progress" }));
     }
     if samples > 0 && !e.over {
         return Err(format!("record: {what}: samples from an episode without a result (one cut short emits none)"));
@@ -253,7 +273,7 @@ fn end_episode<G: SearchGame>(g: &G, e: &Ep, n: usize, samples: usize, chained: 
             if ended && !g.aborted() {
                 return Err(format!("record: {what}: without a result, but its replay finished with one"));
             }
-            if e.aborted != (ended && g.aborted()) {
+            if e.aborted != (row_abort || (ended && g.aborted())) {
                 return Err(format!("record: {what}: aborted {}, the replay {}", e.aborted, ended && g.aborted()));
             }
             vec![1.0 / n as f32; n]
@@ -307,6 +327,15 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
     }
     let seed = field(o, "seed")?.as_u64().ok_or("record: seed is not a u64")?;
     let top = ep_of(o, n)?;
+    let abort_reason: Option<&'static str> = match o.get("abort_reason") {
+        None => None,
+        Some(Value::String(s)) if s == "max_row_tokens" => Some("max_row_tokens"),
+        Some(v) => return Err(format!("record: abort_reason {v} (the only reason a driver aborts a game is \"max_row_tokens\")")),
+    };
+    if abort_reason.is_some() && (G::TAILS.is_empty() || top.over || !top.aborted) {
+        return Err(format!("record: aborted at the row limit: {} (over {}, aborted {})", if G::TAILS.is_empty() { format!("{} has no tail tokens, so no row limit", G::NAME) } else { "so aborted and not over".to_string() }, top.over, top.aborted));
+    }
+    let row_abort = abort_reason.is_some();
     if top.result.len() != n {
         return Err(format!("record: a result of {} seats in a game of {n}", top.result.len()));
     }
@@ -383,7 +412,10 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
                 return Err(format!("record: value-only sample {j} (step {k}) of seat {p}: the game has {to_move:?} to move"));
             }
             let mut x = vec![0.0f32; G::NUM_FEATURES];
-            g.encode(p, &mut x);
+            let (tail, ov) = record_row(&g, p, &opts, &mut x);
+            if !G::TAILS.is_empty() && G::HEAD_TOKENS + tail.len() > G::MAX_ROW_TOKENS {
+                return Err(format!("record: sample {j} (step {k}): a row of capacity {} > max_row_tokens {} (the driver aborts such a game: no samples)", G::HEAD_TOKENS + tail.len(), G::MAX_ROW_TOKENS));
+            }
             let mut a = Vec::new();
             if aux {
                 a.resize(G::aux_width(), 0.0);
@@ -393,7 +425,7 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
             for (c, &h) in q[j * n..(j + 1) * n].iter().enumerate() {
                 qv[c] = f16_to_f32(h as u16);
             }
-            records.push(Record { x, player: p as u8, n_players: n as u8, opts, pi: pis, z: [0.0; MAX_SEATS], q: qv, sc: [0.0; MAX_SEATS], net: net[j] as u32, aux: a, step: k as u32 });
+            records.push(Record { x, player: p as u8, n_players: n as u8, opts, pi: pis, z: [0.0; MAX_SEATS], q: qv, sc: [0.0; MAX_SEATS], net: net[j] as u32, aux: a, step: k as u32, tail, ov });
             j += 1;
         }
         if k == steps.len() {
@@ -421,7 +453,7 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
                 if conceded != want {
                     return Err(format!("record: step {k}: episode {ep} conceded by {conceded:?}, its outcome says {want:?}"));
                 }
-                let (res, margins) = end_episode(&g, e, n, j - ep_first, true, &format!("episode {ep}"))?;
+                let (res, margins) = end_episode(&g, e, n, j - ep_first, true, false, &format!("episode {ep}"))?;
                 label(&mut records[ep_first..j], &res, &margins, n);
                 g = match g.next_episode(conceded).map_err(|e| format!("record: step {k}: next_episode: {e}"))? {
                     Next::Continue(ng) if ng.num_players() == n => ng,
@@ -463,7 +495,7 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
             return Err(format!("record: {} episodes replayed, the record lists {}", ep + 1, eps.len()));
         }
         let e = &eps[ep];
-        let (res, margins) = end_episode(&g, e, n, j - ep_first, true, &format!("episode {ep}"))?;
+        let (res, margins) = end_episode(&g, e, n, j - ep_first, true, row_abort, &format!("episode {ep}"))?;
         label(&mut records[ep_first..j], &res, &margins, n);
         let loser = match e.resigned {
             Some(w) if n == 2 => Some(1 - w as usize),
@@ -481,7 +513,7 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
         if top.over != contest.is_some() || top.resigned.is_some() || !top.margin.is_empty() {
             return Err(format!("record: the contest's over {} (resigned {:?}, margins {}), its replay {}", top.over, top.resigned, top.margin.len(), contest.is_some()));
         }
-        let aborted = e.resigned.is_none() && g.to_move().is_none() && g.aborted();
+        let aborted = row_abort || (e.resigned.is_none() && g.to_move().is_none() && g.aborted());
         if top.aborted != aborted {
             return Err(format!("record: the contest's aborted {}, its replay {aborted}", top.aborted));
         }
@@ -497,11 +529,11 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
         }
         r
     } else {
-        let (res, margins) = end_episode(&g, &top, n, j, false, "the game")?;
+        let (res, margins) = end_episode(&g, &top, n, j, false, row_abort, "the game")?;
         label(&mut records[..], &res, &margins, n);
         res
     };
-    Ok(Replayed { gid, n, seed, over: top.over, aborted: top.aborted, resigned: top.resigned, result, rounds: top.rounds, steps: steps.len(), setup: top.setup, episodes: eps.len().max(1), records })
+    Ok(Replayed { gid, n, seed, over: top.over, aborted: top.aborted, resigned: top.resigned, abort_reason, result, rounds: top.rounds, steps: steps.len(), setup: top.setup, episodes: eps.len().max(1), records })
 }
 
 /// The seed of game `gid` of a driver seeded `seed` (`SearchGame::new_game`'s, as the driver starts it:

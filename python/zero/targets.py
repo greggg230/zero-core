@@ -38,6 +38,7 @@ import torch
 from . import games as G
 from . import mcts, package
 from .infer import NetEvaluator, drive
+from .rows import eval_kw, game_row, sample_rows
 from .net import load
 from .protocol import concat_samples
 
@@ -88,11 +89,14 @@ def network_prior(model, s, device='cpu'):
     pri = []
     B = 2048
     off = np.asarray(s['opt_off'], np.int64)
+    widths = G.tail_widths(G.info(m.config.get('game') or package.active().game)) if 't_off' in s else None
     for a in range(0, len(s['player']), B):
         b = min(len(s['player']), a + B)
         o = off[a:b + 1]
+        # (variable-length rows, docs/az.md 43: the samples' tails and overrides; none: the call of before)
+        rk = eval_kw(*sample_rows(s, widths, a, b)) if 't_off' in s or 'ov_off' in s else {}
         p, _, _ = ev.evaluate(np.ascontiguousarray(s['x'][a:b], np.float32), np.asarray(s['n_players'][a:b], np.int32),
-                              (o - o[0]).astype(np.int32), np.asarray(s['opt_action'][o[0]:o[-1]], np.int32))
+                              (o - o[0]).astype(np.int32), np.asarray(s['opt_action'][o[0]:o[-1]], np.int32), **rk)
         pri.append(p)
     return np.concatenate(pri).astype(np.float64)
 
@@ -186,6 +190,8 @@ def prior_positions(model, game, spec, n, seed=0, keep=0.15, device='cpu'):
     m, _ = load(model, device, game=game)
     ev = NetEvaluator(m, device)
     rng = np.random.default_rng(seed)
+    inf = G.info(game)
+    widths, pointers = G.tail_widths(inf), bool(inf.get('option_pointers'))
     out, k = [], 0
     while len(out) < n:
         g = G.engine().Game(game, spec, 2, seed * 100_003 + k)
@@ -193,8 +199,10 @@ def prior_positions(model, game, spec, n, seed=0, keep=0.15, device='cpu'):
         while not g.over and len(out) < n:
             legal = g.legal()
             if len(legal) > 1:
-                pri, _, _ = ev.evaluate(g.encode(g.to_move)[None], np.array([g.n_players], np.int32),
-                                        np.array([0, len(legal)], np.int32), np.asarray(legal, np.int32))
+                x, tail, ov = game_row(g, g.to_move, widths, pointers)      # (encode_row with tails, docs/az.md 43)
+                pri, _, _ = ev.evaluate(x, np.array([g.n_players], np.int32),
+                                        np.array([0, len(legal)], np.int32), np.asarray(legal, np.int32),
+                                        **eval_kw(tail, ov))
                 if rng.random() < keep:
                     out.append(g.clone())
                 a = legal[int(rng.choice(len(legal), p=pri / pri.sum()))]
@@ -207,13 +215,21 @@ def prior_positions(model, game, spec, n, seed=0, keep=0.15, device='cpu'):
 def search_many(games, ev, sims, seeds, c_puct=1.0, chance_k=0, noise=None):
     """One Rust search tree per game, `sims` simulations each, the leaves of all trees
     evaluated in one batch per round. noise = (alpha, eps): root Dirichlet noise once the root
-    is expanded (as self-play's full searches). -> the trees."""
+    is expanded (as self-play's full searches). A game with tail segments / pointer overrides (docs/search.md
+    2.15): the leaves' rows carry their tails and overrides (`SearchTree.simulate(rows=True)`); a leaf row past the
+    game's row limit raises (a position has no game to abort). -> the trees."""
+    from .mcts import rows_of
+    from .play import row_arrays
+    rk = rows_of(dict(games[0].info())) if games else None
     trees = [g.search_tree(True, int(s)) for g, s in zip(games, seeds)]
     for _ in range(sims):
         leaves = []
         for k, (g, t) in enumerate(zip(games, trees)):
-            r = t.simulate(g, c_puct, chance_k)
+            r = t.simulate(g, c_puct, chance_k, rows=True) if rk is not None else t.simulate(g, c_puct, chance_k)
             if r is not None:
+                if rk is not None and rk.over(r[4][0]) is not None:
+                    raise ValueError(f'max_row_tokens: a leaf row of position {k} has capacity {rk.capacity(r[4][0])} > '
+                                     f'{rk.limit} (docs/search.md 2.15)')
                 leaves.append((k, r))
         if not leaves:
             continue
@@ -221,8 +237,15 @@ def search_many(games, ev, sims, seeds, c_puct=1.0, chance_k=0, noise=None):
         off = np.zeros(len(acts) + 1, np.int32)
         off[1:] = np.cumsum([len(a) for a in acts])
         npl = np.asarray([games[k].n_players for k, _ in leaves], np.int32)
+        kw = {}
+        if rk is not None:
+            # (variable-length rows: the leaves' tails and overrides, as the evaluator takes them)
+            from .rows import Overrides, Tail
+            ra = row_arrays([r[4][:2] for _, r in leaves], rk)
+            kw = eval_kw(Tail.from_arrays(ra, rk.widths) if rk.widths else None,
+                         Overrides.from_arrays(ra) if rk.pointers else None)
         pri, val, mar = ev.evaluate(np.stack([r[1] for _, r in leaves]), npl, off,
-                                    np.concatenate([np.asarray(a, np.int32) for a in acts]))
+                                    np.concatenate([np.asarray(a, np.int32) for a in acts]), **kw)
         for b, (k, _) in enumerate(leaves):
             t = trees[k]
             was = t.root_expanded

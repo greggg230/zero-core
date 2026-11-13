@@ -114,6 +114,23 @@ from .workqueue import Shares, lag_hist, merge_hist, split_games
 TAG = 'ZERO_SP '
 
 
+def _rows_of(info):
+    """Whether a game (`games.info`) has variable-length rows (tail segments / pointer overrides, docs/az.md 43): its
+    workers must report the capability 'tails' in their hello's `caps` (R13)."""
+    return bool(info and (info.get('tails') or info.get('option_pointers')))
+
+
+def _tail_widths(info):
+    """`games.tail_widths` (imported when used)."""
+    from .games import tail_widths
+    return tail_widths(info)
+
+
+def split_games_rows(rows, s, widths):
+    """`workqueue.split_games` with the game's tail widths (variable-length rows, docs/az.md 43: every key carried)."""
+    return split_games(rows, s, widths)
+
+
 def _belief_of(cfg):
     """The root-belief keys of a run's self-play seat (`run.belief_keys`, {} when off): what a worker's
     hello reports and the run checks (docs/az.md 18.5)."""
@@ -1239,6 +1256,10 @@ class RemotePlay:
                     # a checkout without self-play information-set merging would search unmerged in silence:
                     # never used (docs/az.md 30)
                     s.no_merge = ev.get('merge')
+                if _rows_of(getattr(self.R, 'info', None)) and 'tails' not in (ev.get('caps') or []):
+                    # a checkout without variable-length rows would drop the game's tails / overrides, or refuse
+                    # mid-phase: never used (R13, docs/az.md 43.4)
+                    s.no_tails = True
                 want_v = _value_choice_of(self.R.cfg) if self.mode == 'selfplay' else ''
                 if want_v and ev.get('value_choice') != want_v:
                     # a checkout without value choices would search them as any decision, recorded, in silence:
@@ -1419,6 +1440,13 @@ class RemotePlay:
             h.fail_log(f'worker {k} REFUSED: its checkout plays self-play value choices as {s.no_value_choice!r}, the '
                        f'run as {_value_choice_of(self.R.cfg)!r} (an older checkout has none: docs/az.md 39); killed, '
                        f'retried in 10 minutes')
+            s.kill()
+            return
+        if getattr(s, 'no_tails', False):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout reports no capability \'tails\' and the run\'s game has '
+                       f'variable-length rows (tail segments / pointer overrides: an older checkout would drop them; R13, '
+                       f'docs/az.md 43.4); killed, retried in 10 minutes')
             s.kill()
             return
         if hasattr(s, 'no_belief'):
@@ -2073,7 +2101,8 @@ class Worker:
         m, _ = load(os.path.join(self.rdir, model), c['infer_device'], game=self.test.get('load_game') or c['game'])
         if self.drv is None:
             R = Run(self.rdir, c)
-            self.evr = NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1))
+            self.evr = NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1),
+                                    token_chunks=c.get('infer_token_chunks', 0))
             seat = R.nn_seat('m', c['sims'], selfplay=True)
             # (a list of hosts, docs/az.md 34: each host's workers K play other games than another host's K)
             seed = int(c['seed']) * 7919 + it + 7_777_777 * (self.k + 1) + int(self.sp.get('seed_salt') or 0)
@@ -2190,7 +2219,7 @@ class Worker:
         if self.lg_on:
             from .league import League
             League.attribute(rows, self.lg_kinds, self.lg_slots)     # (the slots' checkpoints now)
-        games = split_records(rows, s) if self.threaded else split_games(rows, s)
+        games = split_records(rows, s) if self.threaded else split_games_rows(rows, s, _tail_widths(self.info))
         from .forks import setups
         self.taken += setups(rows)                 # (a branch is its game's second row: zero/forks.py)
         if ph['closed']:
@@ -2343,7 +2372,7 @@ class Worker:
         c = self.cfg
         drv = self.drv
         meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'],
-                'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid, **shard_format(c),
+                'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid, **shard_format(c, self.info),
                 **({'remote': self.sp['remote']} if self.sp.get('remote') else {})}   # (a list of hosts: its name)
         box = {}
         writer = ShardWriter(os.path.join(self.rdir, 'data', f'iter_{it:04d}'), self.prefix, rows=int(c['shard_rows']),
@@ -2443,6 +2472,8 @@ class Worker:
                       **({} if self.test.get('no_resign') else {'resign': _resign_of(self.cfg)}),
                       **({} if self.test.get('no_merge') else {'merge': _merge_of(self.cfg)}),
                       **({} if self.test.get('no_value_choice') else {'value_choice': _value_choice_of(self.cfg)}),
+                      # (variable-length rows: this checkout carries tails and overrides end to end, R13)
+                      **({} if self.test.get('no_tails') else {'caps': ['tails']}),
                       **({} if self.test.get('no_episodes') else {'episodes': _episodes_of(self.cfg)}))
             while not self.closing:
                 if self.stash is not None:
