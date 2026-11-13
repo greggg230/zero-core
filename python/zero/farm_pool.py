@@ -7,20 +7,20 @@ run process (`Pool`, owned by zero.remoteplay.RemotePlay) that
 1. **publishes** checkpoint it - 1 when iteration it's self-play begins (RemotePlay.begin, right after the
    checkpoint is written): the checkpoint exported to zero-onnx/1 (or /2, docs/az.md 46) with its reference set
    (zero.onnx_export, checked through onnxruntime) under `<run>/pool/<farm run>/ckpt/<gen>/`, uploaded
-   (`ckpt/<farm run>/<gen>/...`), a NEW
-   signed definition version (zero.farm_def: the worker build, its runtime, the gen and up to `pool_max_stale` gens
-   before it, the self-play template {settings: the worker build's own `check-config` play settings}) published
-   with farm-release - and only then the gen registered current (`PUT .../checkpoint/<gen>`): farm leases switch
-   only to gens a definition names. The run on the coordinator is created on the first publish (`selfplay`:
-   quota `pool_quota` (default the run's `games`), slack, max_stale, games per lease, needs).
+   (`ckpt/<farm run>/<gen>/...`), a NEW signed definition version (zero.farm_def: the worker build and its
+   alternates' builds, its runtime, the gen and up to `pool_max_stale` gens before it, the self-play template
+   {settings: the worker build's own `check-config` play settings}) published with farm-release - and only then the
+   gen registered current (`PUT .../checkpoint/<gen>`): farm leases switch only to gens a definition names. The run
+   on the coordinator is created on the first publish (`selfplay`: quota `pool_quota` (default the run's `games`),
+   slack, max_stale, games per lease, needs).
 2. **ingests** records (zero-farm PROTOCOL.md 5 `records`, zero-core docs/search.md 2.17): it polls
    `GET .../results`, downloads each self-play chunk, checks its header (the run's game, features, actions, spec,
-   auxiliary targets, base seed and worker build), replays every credited game through the engine
-   (`<pkg>._engine.replay_rows`: the rows bit for bit as the worker's shards would hold them; replay is the
-   validation: an illegal move, a wrong decider or option count, another result, margin or setup - and a game seed
-   that is not its id's - refuses the whole record) and keeps the game, its rows compacted, until the quota takes
-   it. A refused record is counted against its machine (`<run>/debug/pool/refused.jsonl`, the chunk kept under
-   `<run>/debug/pool/<machine>/`).
+   auxiliary targets, base seed and worker build - the default's or an alternate's), replays every credited game
+   through the engine (`<pkg>._engine.replay_rows`: the rows bit for bit as the worker's shards would hold them;
+   replay is the validation: an illegal move, a wrong decider or option count, another result, margin or setup - and
+   a game seed that is not its id's - refuses the whole record) and keeps the game, its rows compacted, until the
+   quota takes it. A refused record is counted against its machine (`<run>/debug/pool/refused.jsonl`, the chunk kept
+   under `<run>/debug/pool/<machine>/`).
 3. **counts** accepted games toward the iteration's quota exactly as a remote worker's (RemotePlay.accept_pool:
    oldest first, as many as the quota still needs; the rest held for the next iteration), writes their rows as
    ordinary shards into `data/iter_i/` (`pool-<machine>_SSS.npz`, meta source 'pool', machine), and tells the
@@ -38,14 +38,27 @@ settings), `pool_url` (default zero.farm_def.URL), `pool_max_stale`, `pool_quota
 `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key` (the data key; default
 zero.farm_def's), `pool_farm_release` (farm-release; default zero.farm_def's), `pool_expires_days`, `pool_min_agent`
 (the farm run's `min_agent`, zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; default 0.2.8, the
-first agent that accepts a template naming a split or double-faced card; '' = none). The admin token as
-the farm tools read it (zero.farm_def.read_token). State: `<run>/pool/<farm run>/state.json`.
+first agent that accepts a template naming a split or double-faced card; '' = none), `pool_alternates` and
+`pool_alt_vendor` (below), `pool_gpu_games_per_lease` (the farm run's `selfplay.gpu_games_per_lease`, PROTOCOL rev
+11, 9.4: the games of a GPU lease, 'auto' or a number; '' = the key left out, GPU leases sized as before). The admin
+token as the farm tools read it (zero.farm_def.read_token). State: `<run>/pool/<farm run>/state.json`.
+
+Run alternates (zero-farm PROTOCOL rev 11, 9.4): `pool_alternates` (worker build ids, comma-separated or a list, in
+order of preference, at most 4; '' = none) names worker builds that are the same engine signed for another runtime pack
+(the CUDA pack: offered only to PCs with an NVIDIA GPU that may run GPU work, agents from 0.2.10). On the first publish
+of a pool process they are checked (zero.farm_def.run_alternates: a worker of the default build's game requiring a
+runtime pack; `when.vendor` the pack's `gpu.vendor`, else `pool_alt_vendor`, '' = none), then sent in every PUT of the
+farm run (`"alternates"`) and their builds added to every definition version's `builds` after the default one (its
+`runtime` stays the default pack). A record whose header names an alternate's build is accepted like the default's
+(the same engine; its manifest, next to the executable, gives the worker its build id). Changed on a resumed run, the
+new alternates (or `pool_gpu_games_per_lease`) are PUT again once the next gen's definition (which lists their
+builds) is registered (state `put_extras`: what the last self-play PUT carried of them). None (the default): no
+`alternates` key and builds [pool_build] - every PUT body and definition exactly as before.
 """
 import gzip
 import hashlib
 import json
 import os
-import re
 import threading
 import time
 import traceback
@@ -54,8 +67,7 @@ from collections import deque
 from . import farm_def as FD
 
 PREFIX = 'pool:'
-# (as the coordinator checks a version: zero-farm coordinator util.ts)
-SEMVER_RE = re.compile(r'^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,64})?$')
+SEMVER_RE = FD.SEMVER_RE                    # (as the coordinator checks a version: zero-farm coordinator util.ts)
 PAGE = 200                          # results per GET
 
 
@@ -86,6 +98,14 @@ def _spec_value(s):
 
 def _in_ranges(g, ranges):
     return any(a <= g < b for a, b in ranges)
+
+
+def alternate_ids(v):
+    """`pool_alternates` -> its worker build ids: a comma- (or space-) separated string or a list; ''/None/[] = none."""
+    if v is None:
+        return []
+    items = v.replace(',', ' ').split() if isinstance(v, str) else [str(x).strip() for x in v]
+    return [x for x in items if x]
 
 
 def play_settings(worker, build_id, cfg, d):
@@ -161,6 +181,21 @@ class Pool:
         self.min_agent = str(setting('pool_min_agent') or '').strip() or None
         if self.min_agent and not SEMVER_RE.match(self.min_agent):
             raise SystemExit(f'selfplay_remote {name!r}: pool_min_agent {self.min_agent!r} is not a version like 0.2.8')
+        # run alternates (module docstring): their ids here, checked against their manifests on the first publish
+        self.alt_builds = alternate_ids(setting('pool_alternates'))
+        bad = [b for b in self.alt_builds if not FD.BUILD_RE.match(b)]
+        if bad or len(self.alt_builds) > FD.MAX_ALTERNATES or len(set(self.alt_builds)) != len(self.alt_builds):
+            raise SystemExit(f'selfplay_remote {name!r}: pool_alternates {self.alt_builds}: up to {FD.MAX_ALTERNATES} '
+                             f'distinct worker build ids (24 hex)')
+        self.alt_vendor = str(setting('pool_alt_vendor') or '').strip() or None
+        if self.alt_vendor and self.alt_vendor not in FD.VENDORS:
+            raise SystemExit(f'selfplay_remote {name!r}: pool_alt_vendor {self.alt_vendor!r}: one of {FD.VENDORS}')
+        self.alternates = None                    # (PUT form, from run_alternates on the first publish)
+        self.builds = None
+        try:                                      # GPU leases' games (PROTOCOL rev 11, 9.4; None: the key left out)
+            self.gpu_per_lease = FD.gpu_games_per_lease(setting('pool_gpu_games_per_lease'))
+        except ValueError as e:
+            raise SystemExit(f'selfplay_remote {name!r}: pool_{e}') from None
         self.client = client or FD.Client(self.url)
         self.exporter = exporter or self._export
         self.definer = definer or self._define
@@ -217,7 +252,8 @@ class Pool:
         return t is not None and time.time() - t < self.live_s
 
     def describe(self):
-        return f'{self.name!r} (farm {self.url}, build {self.build}, max_stale {self.max_stale})'
+        alts = f', alternates {",".join(self.alt_builds)}' if self.alt_builds else ''
+        return f'{self.name!r} (farm {self.url}, build {self.build}{alts}, max_stale {self.max_stale})'
 
     # ------------------------------------------------------------ the run's side (RemotePlay)
     def begin(self, it):
@@ -287,12 +323,28 @@ class Pool:
         return FD.publish(client, info, key=self.key, farm_release=self.farm_release, log=self.log)
 
     def _selfplay_body(self, play):
-        sp = {'quota': self.quota, 'slack': self.slack, 'max_stale': self.max_stale, 'games_per_lease': self.per_lease,
-              'gpu': 'any', 'job': {}}
+        sp = {'quota': self.quota, 'slack': self.slack, 'max_stale': self.max_stale, 'games_per_lease': self.per_lease}
+        if self.gpu_per_lease is not None:          # (PROTOCOL rev 11; None: the key is absent, the body of before)
+            sp['gpu_games_per_lease'] = self.gpu_per_lease
+        sp.update(gpu='any', job={})
         if self.needs_ram:
             sp['needs'] = {'ram_mb': self.needs_ram}
-        return {'game': self.R.cfg['game'], 'build_id': self.build, 'runtime': self.runtime, 'priority': self.priority,
-                'min_agent': self.min_agent, 'selfplay': sp, 'eval': None, 'state': 'active'}
+        b = {'game': self.R.cfg['game'], 'build_id': self.build, 'runtime': self.runtime, 'priority': self.priority,
+             'min_agent': self.min_agent}
+        if self.alternates:                         # (PROTOCOL rev 11; none: the key is absent, the body of before)
+            b['alternates'] = self.alternates
+        b.update(selfplay=sp, eval=None, state='active')
+        return b
+
+    def _put_extras(self):
+        """The rev 11 fields this pool's PUTs carry beyond the body of before ({} with the defaults): a state's
+        `put_extras` is what the last self-play PUT sent (absent: none of them)."""
+        out = {}
+        if self.alternates:
+            out['alternates'] = self.alternates
+        if self.gpu_per_lease is not None:
+            out['gpu_games_per_lease'] = self.gpu_per_lease
+        return out
 
     def _publish(self, gen):
         """Gen `gen` (checkpoint `gen`) exported, uploaded, signed into a new definition version and registered
@@ -307,13 +359,19 @@ class Pool:
         if not st.get('build_game'):
             st['build_game'] = FD.worker_game(self.client, self.build, self.runtime) if self.runtime else self.R.cfg['game']
             self._save()
+        if self.alternates is None:
+            # (none: [], [pool_build] without a call)
+            self.alternates, self.builds = FD.run_alternates(self.client, self.build, self.runtime, self.alt_builds,
+                                                             self.alt_vendor)
         if not st['run_put']:
             body = self._selfplay_body(st['play'])
             body['selfplay'] = None
             self.client.call('PUT', f'/v1/admin/run/{self.farm}', body=body)
             st['run_put'] = True
             self._save()
-            self.log(f'farm run {self.farm} created (worker build {self.build}, runtime {self.runtime}, '
+            alts = ''.join(f', alternate {x["build_id"]} (runtime {x["runtime"]}, {x["when"]["vendor"]})'
+                           for x in self.alternates)
+            self.log(f'farm run {self.farm} created (worker build {self.build}, runtime {self.runtime}{alts}, '
                      f'min_agent {self.min_agent or "none"})')
         g = st['gens'].setdefault(str(gen), {})
         if not g.get('model'):
@@ -338,7 +396,7 @@ class Pool:
                 cks = {str(x): {'model_sha256': st['gens'][str(x)]['sha256'], 'model_size': st['gens'][str(x)]['model_size'],
                                 'reference_sha256': st['gens'][str(x)]['reference_sha256'],
                                 'reference_size': st['gens'][str(x)]['reference_size']} for x in keep}
-                d = FD.prepare(self.client, 'run', self.farm, game=st['build_game'], builds=[self.build], runtime=self.runtime,
+                d = FD.prepare(self.client, 'run', self.farm, game=st['build_game'], builds=self.builds, runtime=self.runtime,
                                checkpoints=cks, jobs={'selfplay': {'settings': st['play']}, 'eval': None, 'fuzz': None},
                                expires_days=self.expires_days, root=os.path.join(self.dir, 'definitions'))
                 g['definition'] = d
@@ -353,9 +411,16 @@ class Pool:
                                'reference_sha256': g['reference_sha256']})
         g['registered'] = True
         st['current_gen'] = gen
-        if not st['selfplay_put']:
+        # (alternates or pool_gpu_games_per_lease changed on a resumed run: PUT again, now that a definition lists the
+        # alternates' builds; a state without `put_extras` sent neither)
+        extras = self._put_extras()
+        if not st['selfplay_put'] or st.get('put_extras', {}) != extras:
             self.client.call('PUT', f'/v1/admin/run/{self.farm}', body=self._selfplay_body(st['play']))
             st['selfplay_put'] = True
+            if extras:
+                st['put_extras'] = extras
+            else:
+                st.pop('put_extras', None)
         self._save()
         self.log(f'gen {gen} registered current: farm self-play plays it')
         with self.mu:
@@ -424,6 +489,8 @@ class Pool:
         want = {'records': 1, 'game': self.R.cfg['game'], 'features': info['num_features'],
                 'actions': info['num_actions'], 'aux': self.aux, 'seed': self.seed, 'build_id': self.build}
         got = {k: h.get(k) for k in want}
+        if got['build_id'] in self.alt_builds:
+            want['build_id'] = got['build_id']     # an alternate's worker: the same engine for another runtime pack
         if got != want:
             return self._refuse(r, f'header {got}, the run wants {want}', body)
         try:

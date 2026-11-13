@@ -75,6 +75,7 @@ class Fake:
 
     def __init__(self):
         self.runs, self.objects, self.ckpts, self.results, self.calls, self.accepts = {}, {}, {}, [], [], []
+        self.raw = []                                      # (method, path, request body bytes)
         self.acked = 0
         self.mu = threading.Lock()
 
@@ -94,6 +95,7 @@ class Fake:
         body = json.loads(data) if data and headers.get('content-type') == 'application/json' else None
         with self.mu:
             self.calls.append((method, p, body))
+            self.raw.append((method, p, data))
             if method == 'PUT' and p.startswith('/v1/admin/artifact/'):
                 self.objects[p[len('/v1/admin/artifact/'):]] = data
                 return 200, b'{"ok": true}'
@@ -303,6 +305,115 @@ def check_shards(R, d, by_machine, by, it):
                     continue
                 assert x[k].dtype == y[k].dtype and x[k].shape == y[k].shape and x[k].tobytes() == y[k].tobytes(), (m, k)
         assert read_shard(got[0])['meta']['source'] == 'pool'
+
+
+class QuotaRP:
+    """The parts of zero.remoteplay.RemotePlay a Pool calls: iteration 1 open, a quota of `quota` games."""
+
+    def __init__(self, R, quota=100):
+        self.R, self.quota, self.taken = R, quota, 0
+
+    def pool_iteration(self):
+        return 1
+
+    def accept_pool(self, it, name, n):
+        if self.taken + n > self.quota:
+            return False
+        self.taken += n
+        return True
+
+
+def _manifests(*mans):
+    raws = [json.dumps(m).encode() for m in mans]
+    return [(hashlib.sha256(r).hexdigest()[:24], r) for r in raws]
+
+
+def test_pool_alternates_in_the_puts_definitions_and_records(pool):
+    """pool_alternates and pool_gpu_games_per_lease (zero-farm PROTOCOL rev 11, 9.4). Without them (the defaults) every
+    PUT of the farm run is, byte for byte, the body of before and each definition's builds are [pool_build]. Resumed
+    with an alternate (the worker signed for the CUDA pack) and a GPU lease size: the next gen's definition lists the
+    alternate's build after the default one (runtime unchanged), the run is PUT again with `alternates` and
+    `selfplay.gpu_games_per_lease` once that definition is registered, and the alternate's records are accepted
+    (another build's are refused); the next start with the same settings PUTs nothing more."""
+    fake, R, published = pool
+    w = {'manifest': 1, 'kind': 'worker', 'version': 'toy-test', 'game': 'zero-toy', 'entry': 'w.exe', 'files': []}
+    (rt, rt_raw), (cuda, cuda_raw) = _manifests(
+        {'manifest': 1, 'kind': 'runtime', 'version': 'cpu-test', 'files': []},
+        {'manifest': 1, 'kind': 'runtime', 'version': 'cuda-test', 'min_agent': '0.2.10',
+         'gpu': {'vendor': 'nvidia', 'min_driver': '527.41', 'providers': ['cuda']}, 'files': []})
+    (build, build_raw), (alt, alt_raw) = _manifests(dict(w, requires_runtime=rt), dict(w, requires_runtime=cuda))
+    for bid, raw in ((rt, rt_raw), (cuda, cuda_raw), (build, build_raw), (alt, alt_raw)):
+        fake.objects[f'builds/{bid}/manifest.json'] = raw
+    R.cfg.update(pool_build=build, pool_runtime=rt)
+    name = f'pool:{FARM}'
+    run_puts = lambda: [d for m, p, d in fake.raw if m == 'PUT' and p == f'/v1/admin/run/{FARM}']
+
+    def stop(p):
+        p.close()
+        p.th.join(10)
+        assert not p.th.is_alive()
+    # no alternates: the bodies of before (b0930da's _selfplay_body), byte for byte
+    p = FP.Pool(QuotaRP(R), name)
+    try:
+        p.begin(1)
+        wait(lambda: 0 in fake.ckpts and len(run_puts()) == 2, 'gen 0 registered, the run PUT twice')
+    finally:
+        stop(p)
+    sp = {'quota': 24, 'slack': 0.1, 'max_stale': 1, 'games_per_lease': 'auto', 'gpu': 'any', 'job': {}}
+    old = {'game': 'toy', 'build_id': build, 'runtime': rt, 'priority': 1.0, 'min_agent': '0.2.8', 'selfplay': sp,
+           'eval': None, 'state': 'active'}
+    assert run_puts() == [json.dumps(dict(old, selfplay=None)).encode(), json.dumps(old).encode()]
+    doc0 = published[0]
+    assert doc0['builds'] == [build] and doc0['runtime'] == rt and doc0['game'] == 'zero-toy'
+    assert doc0 == FD.definition('run', FARM, doc0['version'], 'zero-toy', [build], rt, doc0['checkpoints'], doc0['jobs'],
+                                 doc0['created'], doc0['expires'])
+    st = json.load(open(os.path.join(R.run, 'pool', FARM, 'state.json')))
+    assert 'put_extras' not in st
+    # a bad setting is refused when the pool starts
+    for k, v in (('pool_alternates', 'xyz'), ('pool_alternates', f'{alt},{alt}'), ('pool_alternates', [alt] * 5),
+                 ('pool_alt_vendor', 'NVIDIA'), ('pool_gpu_games_per_lease', 'lots'), ('pool_gpu_games_per_lease', -2)):
+        R.cfg[k] = v
+        with pytest.raises(SystemExit, match=k):
+            FP.Pool(QuotaRP(R), name)
+        R.cfg[k] = DEFAULTS[k]
+    assert FP.alternate_ids(f' {alt}, {build} ') == [alt, build] and FP.alternate_ids([alt]) == [alt] and FP.alternate_ids('') == []
+    # resumed with the CUDA alternate (a comma-separated setting) and GPU leases of 'auto' size (PROTOCOL rev 11)
+    R.cfg.update(pool_alternates=alt, pool_gpu_games_per_lease='auto')
+    rp = QuotaRP(R)
+    p = FP.Pool(rp, name)
+    try:
+        assert alt in p.describe()
+        p.begin(2)
+        wait(lambda: 1 in fake.ckpts and len(run_puts()) == 3, 'gen 1 registered, the run PUT again')
+        want = [{'build_id': alt, 'runtime': cuda, 'when': {'vendor': 'nvidia'}}]
+        put = json.loads(run_puts()[-1])
+        assert put == dict(old, alternates=want, selfplay=dict(sp, gpu_games_per_lease='auto'))
+        assert list(put)[:6] == ['game', 'build_id', 'runtime', 'priority', 'min_agent', 'alternates']
+        assert list(put['selfplay']) == ['quota', 'slack', 'max_stale', 'games_per_lease', 'gpu_games_per_lease', 'gpu', 'job']
+        doc1 = published[-1]
+        assert doc1['builds'] == [build, alt] and doc1['runtime'] == rt and set(doc1['checkpoints']) == {'0', '1'}
+        i_reg = next(i for i, (m, pth, _) in enumerate(fake.calls) if pth == f'/v1/admin/run/{FARM}/checkpoint/1')
+        i_put = max(i for i, (m, pth, _) in enumerate(fake.calls) if m == 'PUT' and pth == f'/v1/admin/run/{FARM}')
+        assert i_reg < i_put, 'PUT with the alternate once a definition lists its build'
+        wait(lambda: p.st.get('put_extras') == {'alternates': want, 'gpu_games_per_lease': 'auto'}, 'what was PUT kept')
+        # records: the alternate's worker build is accepted, another build refused
+        seed = FP.coordinator_seed(FARM)
+        games = farm_games(4, seed)
+        fake.add('m_gpu', [[0, max(g for g, _, _ in games) + 1]], records_file(header(seed, build=alt), [t for _, t, _ in games]))
+        fake.add('m_x', [[100, 101]], records_file(header(seed, build='e' * 24), [json.dumps(dict(json.loads(games[0][1]), gid=100))]))
+        wait(lambda: rp.taken == 4 and p.st['refused'].get('m_x') == 1, 'the alternate\'s games accepted, the other refused')
+        assert p.st['refused'] == {'m_x': 1}
+    finally:
+        stop(p)
+    # the same alternates on the next start: no extra PUT
+    n = len(run_puts())
+    p = FP.Pool(QuotaRP(R), name)
+    try:
+        p.begin(3)
+        wait(lambda: 2 in fake.ckpts, 'gen 2 registered')
+    finally:
+        stop(p)
+    assert len(run_puts()) == n and published[-1]['builds'] == [build, alt]
 
 
 def test_selfplay_local_0_leaves_the_games_to_a_delivering_farm(pool):

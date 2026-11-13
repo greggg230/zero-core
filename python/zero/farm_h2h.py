@@ -6,6 +6,8 @@ the readout zero.h2h gives on this machine, played by the farm's native workers.
       [--config <run>/config.json | --preset NAME] [--sims 32] [--name SLUG] [--games-per-lease auto] [--priority 1]
       [--needs-ram-mb 1500] [--reference-batches NPZ ...] [--url https://farm.greggg230.com] [--no-wait]
       [--key <data key>] [--farm-release <farm-release.exe>] [--expires-days 30] [--defs-dir DIR]
+      [--alt <alternate worker build_id> ...] [--alt-vendor nvidia|amd|intel] [--min-agent 0.2.10]
+      [--gpu-games-per-lease N|auto]
   python -m zero.farm_h2h --resume NAME        (re-attach: poll, download, print the readout)
   python -m zero.farm_h2h --cancel NAME        (pause the run: its leases are cancelled at their next beat)
   (python -m <pkg>.az.farm_h2h ...: the game package registered; or --package <pkg>.az [--root <checkout>])
@@ -29,6 +31,17 @@ What it does:
    and reference sets uploaded (`PUT /v1/admin/artifact/ckpt/<run>/<gen>/...`), registered as gens 1 (A) and 2 (B),
    then the eval batch: `checkpoints [1, 2]`, its job {settings, seats [{"net": 1}, {"net": 2}], paired} - the
    definition's template exactly (the coordinator issues leases only within it), `--games`.
+   Run alternates (zero-farm PROTOCOL rev 11, 9.4; zero.farm_def.run_alternates): each `--alt` names a worker build
+   that is the same engine signed for another runtime pack (the CUDA pack: offered only to PCs with an NVIDIA GPU that
+   may run GPU work, agents from 0.2.10). Checked before the export (a worker of the build's game requiring a runtime
+   pack); `when.vendor` is the pack's `gpu.vendor`, else `--alt-vendor` (for a pack without `gpu`; a different one is
+   refused). They go into every PUT of the run (`"alternates"`, omitted without any: the body is then as before) and
+   their builds into the definition's `builds` after the default one (its `runtime` stays the default pack); kept in
+   state.json, so `--resume` and `--cancel` keep them (they are fixed when a head-to-head starts).
+   `--min-agent` (PROTOCOL rev 9): the run's `min_agent` - its leases go only to agents at or above it (a canary-only
+   head-to-head: 0.2.10); `--gpu-games-per-lease` (rev 11, 9.4): the eval batch's `gpu_games_per_lease` (the games
+   of a GPU lease, `auto` or a number). Each goes into every PUT of the run only when given (otherwise the body is
+   as before), kept in state.json like the alternates.
 4. It polls `GET /v1/admin/run/<run>/results`, downloads each eval file (first copy of a game id wins;
    `dup_ids` skipped), acks what it saved, and prints a progress line; at the end the readout: A's score +- its
    standard error (pair-aware: the se of the pair scores), the Elo difference with its 95% interval, the games,
@@ -283,26 +296,35 @@ def play_settings(worker, build_id, cfg, d):
 
 
 def run_body(st, eval_on=True):
-    """The run's PUT body (the eval batch once the definition is published and the gens are registered)."""
-    b = {'game': st['game'], 'build_id': st['build_id'], 'runtime': st['runtime'], 'priority': st['priority'],
-         'selfplay': None, 'eval': None, 'state': st.get('run_state', 'active')}
+    """The run's PUT body (the eval batch once the definition is published and the gens are registered); its
+    `min_agent` (PROTOCOL rev 9), `alternates` (rev 11) and the batch's `gpu_games_per_lease` (rev 11) only when the
+    head-to-head has them (else the keys are absent: the body of before)."""
+    b = {'game': st['game'], 'build_id': st['build_id'], 'runtime': st['runtime'], 'priority': st['priority']}
+    if st.get('min_agent'):
+        b['min_agent'] = st['min_agent']
+    if st.get('alternates'):
+        b['alternates'] = st['alternates']
+    b.update(selfplay=None, eval=None, state=st.get('run_state', 'active'))
     if eval_on:
-        b['eval'] = {'batch': st['batch'], 'games': st['games'], 'checkpoints': [1, 2],
-                     'games_per_lease': st['games_per_lease'], 'gpu': 'any', 'needs': st['needs'],
-                     'job': eval_job(st)}
+        ev = {'batch': st['batch'], 'games': st['games'], 'checkpoints': [1, 2], 'games_per_lease': st['games_per_lease']}
+        if st.get('gpu_games_per_lease') is not None:
+            ev['gpu_games_per_lease'] = st['gpu_games_per_lease']
+        ev.update(gpu='any', needs=st['needs'], job=eval_job(st))
+        b['eval'] = ev
     return b
 
 
 def definition_fields(st):
-    """The run's definition (PROTOCOL.md 7): the worker build, its runtime, gens 1 and 2 (each graph's and reference
-    set's sha256 and size) and the eval template; no self-play, no fuzz."""
+    """The run's definition (PROTOCOL.md 7): the worker build (then its alternates' builds, rev 11), its runtime, gens 1
+    and 2 (each graph's and reference set's sha256 and size) and the eval template; no self-play, no fuzz."""
     cks = {}
     for gen in ('1', '2'):
         g = st['gens'][gen]
         cks[gen] = {'model_sha256': g['sha256'], 'model_size': g.get('model_size') or os.path.getsize(g['model']),
                     'reference_sha256': g['reference_sha256'],
                     'reference_size': g.get('reference_size') or os.path.getsize(g['reference'])}
-    return {'game': st['build_game'], 'builds': [st['build_id']], 'runtime': st['runtime'], 'checkpoints': cks,
+    builds = [st['build_id']] + [x['build_id'] for x in st.get('alternates') or []]
+    return {'game': st['build_game'], 'builds': builds, 'runtime': st['runtime'], 'checkpoints': cks,
             'jobs': {'selfplay': None, 'eval': eval_job(st), 'fuzz': None}}
 
 
@@ -335,7 +357,10 @@ def setup(cl, d, st, log, opts=None):
         cl.call('PUT', f'/v1/admin/run/{run}', body=run_body(st, eval_on=False))
         st['run_put'] = True
         save_state(d, st)
-        log(f'run {run} created (worker build {st["build_id"]}, runtime {st["runtime"]})')
+        alts = ''.join(f', alternate {x["build_id"]} (runtime {x["runtime"]}, {x["when"]["vendor"]})'
+                       for x in st.get('alternates') or [])
+        ma = f', min_agent {st["min_agent"]}' if st.get('min_agent') else ''
+        log(f'run {run} created (worker build {st["build_id"]}, runtime {st["runtime"]}{alts}{ma})')
     define(cl, d, st, log, opts)
     for gen in ('1', '2'):
         g = st['gens'][gen]
@@ -548,14 +573,38 @@ def main(argv=None, client=None):
     ap.add_argument('--expires-days', type=float, default=EXPIRES_DAYS,
                     help=f'the definition expires after this many days (default {EXPIRES_DAYS}; 0 = never)')
     ap.add_argument('--defs-dir', help='the definitions archive (default: env ZEROFARM_DEFS_DIR, else ~/.zero-farm/definitions)')
+    ap.add_argument('--alt', action='append', metavar='BUILD_ID',
+                    help='a run alternate (zero-farm PROTOCOL rev 11, 9.4): a worker build of the same engine signed '
+                    'for another runtime pack, offered only to PCs with that pack\'s GPU vendor; repeatable, in order '
+                    f'of preference, at most {FD.MAX_ALTERNATES}')
+    ap.add_argument('--alt-vendor', choices=FD.VENDORS,
+                    help='the GPU vendor of the alternates whose pack names none (no `gpu` in its manifest)')
+    ap.add_argument('--min-agent', metavar='VERSION',
+                    help="the run's min_agent (zero-farm PROTOCOL rev 9): its leases go only to agents at or above it "
+                    '(e.g. 0.2.10: canary agents only); default none')
+    ap.add_argument('--gpu-games-per-lease', metavar='N|auto',
+                    help="the eval batch's gpu_games_per_lease (PROTOCOL rev 11, 9.4): the games of a GPU lease; "
+                    'default: left out (GPU leases sized as before)')
     a = ap.parse_args(argv)
+    if a.min_agent is not None and not FD.SEMVER_RE.match(a.min_agent):
+        ap.error(f'--min-agent {a.min_agent!r}: a version like 0.2.10')
+    try:
+        gpu_per_lease = FD.gpu_games_per_lease(a.gpu_games_per_lease)
+    except ValueError:
+        ap.error(f'--gpu-games-per-lease {a.gpu_games_per_lease!r}: "auto" or a number of games, 1 to '
+                 f'{FD.MAX_LEASE_GAMES:,}')
     opts = {'key': a.key, 'farm_release': a.farm_release, 'expires_days': a.expires_days, 'defs_dir': a.defs_dir}
     log = lambda m: print('# ' + m, file=sys.stderr, flush=True)
     if a.root:
         sys.path.insert(0, os.path.abspath(a.root))
     if a.package:
         __import__(a.package)
+    if a.alt_vendor and not a.alt:
+        ap.error('--alt-vendor: with --alt (the alternates it applies to)')
     if a.resume or a.cancel:
+        if a.alt or a.min_agent is not None or a.gpu_games_per_lease is not None:
+            ap.error('--alt, --alt-vendor, --min-agent, --gpu-games-per-lease: only when a head-to-head starts (--resume '
+                     'and --cancel keep what it started with)')
         name = a.resume or a.cancel
         run = name if name.startswith('h2h-') else f'h2h-{name}'
         d = state_dir(a, run)
@@ -580,9 +629,10 @@ def main(argv=None, client=None):
         ap.error('--build, --runtime and --worker: the worker build, the runtime pack it requires and the build '
                  'executable')
     # the worker build's manifest first (fail before the export): its game is the definition's, and it must require
-    # this runtime
+    # this runtime; then the alternates' (each a worker of that game requiring its own pack)
     cl = client or Client(a.url)
     build_game = FD.worker_game(cl, a.build, a.runtime)
+    alternates, _builds = FD.run_alternates(cl, a.build, a.runtime, a.alt, a.alt_vendor)
     import torch
     torch.set_num_threads(max(1, a.threads))
     from . import farm_eval as FE
@@ -615,7 +665,8 @@ def main(argv=None, client=None):
           'games': a.games, 'seed': coordinator_seed(run), 'build_id': a.build, 'runtime': a.runtime, 'priority': a.priority,
           'games_per_lease': gpl, 'needs': {'threads': a.needs_threads, 'ram_mb': a.needs_ram_mb}, 'batch': 'h2h',
           'settings': cfg, 'select': _tag(FE.seat_dicts(cfg, [{'net': 1}, {'net': 2}])[0]), 'gens': gens,
-          'created': time.time(), 'cursor': 0, 'build_game': build_game}
+          'created': time.time(), 'cursor': 0, 'build_game': build_game, 'alternates': alternates,
+          'min_agent': a.min_agent, 'gpu_games_per_lease': gpu_per_lease}
     save_state(d, st)
     setup(cl, d, st, log, opts)
     if a.no_wait:

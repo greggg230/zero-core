@@ -176,6 +176,81 @@ def test_a_worker_builds_game_from_its_manifest(monkeypatch):
             FD.worker_game(cl, b, rt)
 
 
+def _manifests(*mans):
+    """{build_id: manifest bytes} (a build id is sha256[:24] of its manifest's bytes) and the ids in order."""
+    import hashlib
+    raws = [json.dumps(m).encode() for m in mans]
+    ids = [hashlib.sha256(r).hexdigest()[:24] for r in raws]
+    return dict(zip(ids, raws)), ids
+
+
+def test_run_alternates_from_their_manifests():
+    """A run's alternates (zero-farm PROTOCOL rev 11, 9.4): each a worker build of the default build's game that
+    requires a runtime pack; `when.vendor` the pack's `gpu.vendor`, else the caller's vendor (a pack without `gpu`);
+    the definition's builds the default then the alternates'. Refused: a vendor that differs from the pack's, a pack
+    without one and no vendor, an alternate without `requires_runtime`, of another game, not a worker, requiring a
+    build that is not a runtime pack, the default build again, a duplicate, more than 4."""
+    cpu = {'manifest': 1, 'kind': 'runtime', 'version': 'ort-1.31.1-cpu', 'files': []}
+    cuda = {'manifest': 1, 'kind': 'runtime', 'version': 'cuda-12.8-cudnn-9.28-ort-1.24.4', 'min_agent': '0.2.10',
+            'gpu': {'vendor': 'nvidia', 'min_driver': '527.41', 'providers': ['cuda']}, 'files': []}
+    winml = {'manifest': 1, 'kind': 'runtime', 'version': 'winml', 'files': []}
+    packs, (rt_cpu, rt_cuda, rt_winml) = _manifests(cpu, cuda, winml)
+    w = {'manifest': 1, 'kind': 'worker', 'version': 'mtg-1', 'game': 'mtg', 'entry': 'mtgz-worker.exe', 'files': []}
+    builds, (b_cpu, b_cuda, b_winml, b_none, b_other, b_rt, b_badpack) = _manifests(
+        dict(w, requires_runtime=rt_cpu), dict(w, requires_runtime=rt_cuda), dict(w, requires_runtime=rt_winml),
+        w, dict(w, game='zero-toy', requires_runtime=rt_cuda), dict(cuda, version='x'),
+        dict(w, requires_runtime='ab' * 12, version='mtg-2'))
+    objs = {**packs, **builds, 'ab' * 12: json.dumps(w).encode()}    # ('ab' * 12, b_badpack's pack: not that build's)
+    seen = []
+
+    def t(method, url, headers, data):
+        bid = url.split('/builds/')[1].split('/')[0]
+        seen.append(bid)
+        return (200, objs[bid]) if bid in objs else (404, b'{"error": "not_found"}')
+    cl = FD.Client('http://fake', token=TOKEN, transport=t)
+    # none: the default build alone, nothing fetched
+    assert FD.run_alternates(cl, b_cpu, rt_cpu, []) == ([], [b_cpu]) and FD.run_alternates(cl, b_cpu, rt_cpu, None) == ([], [b_cpu])
+    assert seen == []
+    # the CUDA pack names its vendor; an explicit one must agree
+    want = [{'build_id': b_cuda, 'runtime': rt_cuda, 'when': {'vendor': 'nvidia'}}]
+    assert FD.run_alternates(cl, b_cpu, rt_cpu, [b_cuda]) == (want, [b_cpu, b_cuda])
+    assert FD.run_alternates(cl, b_cpu, rt_cpu, [b_cuda], 'nvidia') == (want, [b_cpu, b_cuda])
+    assert seen[:3] == [b_cpu, b_cuda, rt_cuda]
+    # a pack without gpu: the caller's vendor; two alternates in order of preference
+    alts, bs = FD.run_alternates(cl, b_cpu, rt_cpu, [b_winml], 'amd')
+    assert alts == [{'build_id': b_winml, 'runtime': rt_winml, 'when': {'vendor': 'amd'}}] and bs == [b_cpu, b_winml]
+    # (an alternate may require the default's pack - only the same (build, runtime) is the default - given a vendor)
+    assert FD.run_alternates(cl, b_winml, rt_winml, [b_cpu], 'intel')[0][0]['runtime'] == rt_cpu
+    # the definition takes the builds (its format unchanged; its runtime stays the default pack)
+    d = FD.definition('run', 'r', 1, 'mtg', FD.run_alternates(cl, b_cpu, rt_cpu, [b_cuda])[1], rt_cpu,
+                      {'1': _ck(), '2': _ck()}, {'eval': _eval()}, created=1000)
+    assert d['builds'] == [b_cpu, b_cuda] and d['runtime'] == rt_cpu
+    assert not FD.same_content(d, dict(d, builds=[b_cpu])), 'a change of builds is a change of content (a new version)'
+    for alt, vendor, why in (
+            ([b_cuda], 'amd', 'is for nvidia GPUs, not amd'),          # the pack's own vendor differs
+            ([b_winml], None, 'names no GPU vendor'),                    # a pack without gpu, no vendor given
+            ([b_cuda, b_winml], 'amd', 'is for nvidia GPUs'),            # (one vendor for every alternate)
+            ([b_none], None, 'requires no runtime pack'),                # requires_runtime missing
+            ([b_other], None, "a worker of 'zero-toy'"),                 # another game
+            ([b_rt], None, 'not a worker'),                              # a runtime build as the alternate
+            ([b_badpack], None, 'not that build'),                       # its pack's manifest is not that build's
+            ([b_cpu], None, "the run's own build"),
+            ([b_cuda, b_cuda], None, 'listed twice'),
+            ([b_cuda] * 5, None, 'at most 4'),
+            ([b_cuda], 'NVIDIA', 'one of'),                              # not a profile vendor name
+            (['nope'], None, 'a build_id')):
+        with pytest.raises(SystemExit, match=why):
+            FD.run_alternates(cl, b_cpu, rt_cpu, alt, vendor)
+    # a requires_runtime naming a worker build, not a pack
+    builds2, (b_wpack,) = _manifests(dict(w, requires_runtime=b_cpu, version='mtg-3'))
+    objs.update(builds2)
+    with pytest.raises(SystemExit, match="a 'worker' build, not a runtime pack"):
+        FD.run_alternates(cl, b_cpu, rt_cpu, [b_wpack])
+    # worker_game keeps refusing a default build whose pack is not the run's runtime
+    with pytest.raises(SystemExit, match='requires runtime'):
+        FD.worker_game(cl, b_cuda, rt_cpu)
+
+
 def test_checkpoint_entries(tmp_path):
     m, r = tmp_path / 'model.onnx', tmp_path / 'reference.npz'
     m.write_bytes(b'graph' * 10)

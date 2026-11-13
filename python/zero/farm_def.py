@@ -26,6 +26,11 @@ its template (`zero.farm_h2h`'s eval job is the template itself).
   ZEROFARM_ADMIN_TOKEN, else the file ~/.config/zero-farm/admin_token.
 * After publishing, the coordinator's answer must name this version as current (when it names a definition at all:
   a coordinator before rev 6 names none, and `farm-release define --publish` fails against it anyway).
+* Run alternates (zero-farm PROTOCOL rev 11, 9.4; `run_alternates`): a run keeps its default worker build and runtime
+  pack and may name up to 4 alternates - the same engine signed again with another `requires_runtime` (one signed worker
+  manifest per pack, 9.1), offered only to PCs with an adapter of `when.vendor` (the pack's `gpu.vendor`, 9.2). The
+  definition's format is unchanged: it authorizes an alternate by listing its worker build in `builds` (its `runtime`
+  stays the default pack; an agent from 0.2.10 accepts a listed build with the pack that build requires, PROTOCOL 7).
 """
 import hashlib
 import json
@@ -47,6 +52,13 @@ KINDS = ('run', 'campaign')
 JOB_KINDS = ('selfplay', 'eval', 'fuzz')
 MULTIPART = 90 << 20                    # bigger artifacts go up in parts (a Worker request's limit ~100 MB)
 PART = 32 << 20
+MAX_ALTERNATES = 4                      # a run's alternates (PROTOCOL rev 11, 9.4)
+# a version as the coordinator checks one (zero-farm coordinator util.ts): a run's `min_agent` (PROTOCOL rev 9)
+SEMVER_RE = re.compile(r'^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,64})?$')
+MAX_LEASE_GAMES = 100_000               # games per lease (PROTOCOL 7: 1 to 100,000)
+# the vendor names of an agent's profile (`gpus[].vendor`, PROTOCOL 9.2): an alternate's `when.vendor` is one of them
+# (any other name would match no PC, and the alternate would never be offered)
+VENDORS = ('nvidia', 'amd', 'intel')
 
 
 # ---------------------------------------------------------------- paths and secrets
@@ -393,7 +405,8 @@ def build_manifest(client, build_id):
 def worker_game(client, build_id, runtime):
     """The game (repo) of a worker build - a definition's `game` (PROTOCOL.md 7: "mtg" for any MTG Zero run, as the
     build's manifest says, not a run's settings game such as "mtg_eoe") - checked: a worker build, and `runtime` the
-    runtime pack it requires (when it requires one)."""
+    runtime pack it requires (when it requires one). For a run's default build; its alternates are checked against
+    their own packs (`run_alternates`)."""
     m = build_manifest(client, build_id)
     if m.get('kind') != 'worker':
         raise SystemExit(f'build {build_id} is a {m.get("kind")!r} build, not a worker')
@@ -403,6 +416,76 @@ def worker_game(client, build_id, runtime):
     if not m.get('game'):
         raise SystemExit(f'worker build {build_id}: its manifest names no game')
     return m['game']
+
+
+def gpu_games_per_lease(v):
+    """A run's `selfplay` / `eval` `gpu_games_per_lease` (zero-farm PROTOCOL rev 11, 9.4: the games of a GPU lease) from
+    a setting or flag: None, '' or 0 -> None (the key is left out: GPU leases sized as before); 'auto'; or a number of
+    games, 1 to 100,000 (an int or its digits). Anything else: ValueError."""
+    if v is None or (isinstance(v, str) and v.strip() in ('', '0')) or (type(v) is int and v == 0):
+        return None
+    if isinstance(v, str) and v.strip() == 'auto':
+        return 'auto'
+    if isinstance(v, str) and v.strip().isdigit():
+        v = int(v.strip())
+    if type(v) is not int or not 1 <= v <= MAX_LEASE_GAMES:
+        raise ValueError(f'gpu_games_per_lease {v!r}: "auto" or a number of games, 1 to {MAX_LEASE_GAMES:,}')
+    return v
+
+
+def run_alternates(client, build_id, runtime, alt_builds, vendor=None):
+    """A run's alternates (zero-farm PROTOCOL rev 11, 9.4) from their worker build ids, in order of preference ->
+    (alternates, builds): `alternates` for the run's PUT (`[{"build_id", "runtime", "when": {"vendor"}}]`, [] for
+    none) and `builds` for its definition (the default `build_id`, then each alternate's: the definition authorizes
+    an alternate by listing its build, its `runtime` staying the default pack - section 7 point 4).
+
+    Each alternate's signed manifest (`build_manifest`) must be a worker build of the default build's game that
+    requires a runtime pack (`requires_runtime`: the alternate's `runtime`), and that pack's manifest a runtime build.
+    `when.vendor` is the pack's `gpu.vendor` (9.2), else `vendor` (the caller's, for a pack without `gpu`, which loads
+    anywhere); both given and different, or neither, is refused, as is a vendor that is not a profile vendor name
+    (`VENDORS`). At most `MAX_ALTERNATES`, none the default build and none listed twice (the coordinator refuses an
+    alternate equal to the default or to another; a definition's builds are distinct, at most 64: `validate`). No
+    alternates: ([], [build_id]) and nothing is fetched."""
+    alt_builds = list(alt_builds or [])
+    if not alt_builds:
+        return [], [build_id]
+    if len(alt_builds) > MAX_ALTERNATES:
+        raise SystemExit(f'{len(alt_builds)} alternates: at most {MAX_ALTERNATES} (PROTOCOL 9.4)')
+    if vendor is not None and vendor not in VENDORS:
+        raise SystemExit(f'vendor {vendor!r}: one of {VENDORS} (an agent profile\'s GPU vendor names)')
+    base = build_manifest(client, build_id)
+    if base.get('kind') != 'worker' or not base.get('game'):
+        raise SystemExit(f'build {build_id}: not a worker build that names its game')
+    out, seen = [], {build_id}
+    for b in alt_builds:
+        if b in seen:
+            raise SystemExit(f'alternate {b}: ' + ('the run\'s own build' if b == build_id else 'listed twice'))
+        seen.add(b)
+        m = build_manifest(client, b)
+        if m.get('kind') != 'worker':
+            raise SystemExit(f'alternate {b} is a {m.get("kind")!r} build, not a worker')
+        if m.get('game') != base['game']:
+            raise SystemExit(f'alternate {b} is a worker of {m.get("game")!r}, the run\'s build {build_id} of '
+                             f'{base["game"]!r}')
+        rt = m.get('requires_runtime')
+        if not rt:
+            raise SystemExit(f'alternate {b}: its manifest requires no runtime pack (an alternate is a worker build '
+                             f'signed for another pack, PROTOCOL 9.1)')
+        pack = build_manifest(client, rt)
+        if pack.get('kind') != 'runtime':
+            raise SystemExit(f'alternate {b} requires {rt}, a {pack.get("kind")!r} build, not a runtime pack')
+        gpu = pack.get('gpu')
+        own = gpu.get('vendor') if isinstance(gpu, dict) else None
+        if own and vendor and own != vendor:
+            raise SystemExit(f'alternate {b}: its pack {rt} ({pack.get("version")}) is for {own} GPUs, not {vendor}')
+        v = own or vendor
+        if not v:
+            raise SystemExit(f'alternate {b}: its pack {rt} ({pack.get("version")}) names no GPU vendor (no `gpu`): '
+                             f'give the vendor whose PCs take it')
+        if v not in VENDORS:
+            raise SystemExit(f'alternate {b}: its pack {rt} names GPU vendor {v!r}, not one of {VENDORS}')
+        out.append({'build_id': b, 'runtime': rt, 'when': {'vendor': v}})
+    return out, [build_id] + [a['build_id'] for a in out]
 
 
 # ---------------------------------------------------------------- versions

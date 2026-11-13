@@ -146,7 +146,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A comma-separated list = several hosts, each its own workers, mirror and shards, consumers `<name>/w<k>`, metrics `selfplay.remotes` (one name: exactly as before); a name `<prefix>:<arg>` calls the package's callable remote `<prefix>:`; the run directory's `selfplay_remotes` file (one name per line) replaces the list, is re-read at every phase start (hosts join and leave a live run) and alone turns remote self-play on (section 34). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6; a list too, never the file); its own is refused |
 | `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
-| `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8 | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none) |
+| `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); seconds the end of a phase waits for the remote's last shards (later ones are dropped) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: those whose inference is CUDA / MPS - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -6678,6 +6678,24 @@ and is its validation. The trainer's side is one more kind of remote: the farm p
   farm run, so its leases go only to agents at or above it - 0.2.8 is the first agent that accepts a signed template naming
   a split or double-faced card ("Rough // Tumble", rev 8), which an older agent refuses; agents of an older stable release
   keep their other work (fuzz). '' sends none.
+* **Run alternates** (`pool_alternates`, `pool_alt_vendor`, default '' = none; zero-farm PROTOCOL rev 11, 9.4): worker
+  builds that are the same engine signed again for another runtime pack (one signed worker manifest per pack, 9.1) - the
+  CUDA pack, which the coordinator offers only to PCs with an NVIDIA GPU that may run GPU work (agents from 0.2.10), the
+  run's default pack to every other PC. `zero.farm_def.run_alternates` checks each from its manifest and its pack's (a
+  worker of the default build's game that requires a runtime pack) and takes `when.vendor` from the pack's `gpu.vendor`,
+  else `pool_alt_vendor` (a pack without `gpu`; a different vendor than the pack's is refused). They go into every `PUT`
+  of the farm run (`"alternates": [{"build_id", "runtime", "when": {"vendor"}}]`) and their builds into every
+  definition version's `builds` after `pool_build` (definition/1 unchanged: its `runtime` stays the default pack; an
+  agent accepts a listed build with the pack that build requires). Records whose header names an alternate's build
+  are accepted like the default's. Changed on a resumed run, the run is `PUT` again once the next gen's definition
+  (which lists the new builds) is registered. `zero.farm_h2h` takes the same as `--alt BUILD_ID` (repeatable) and
+  `--alt-vendor`, kept in its state for `--resume` / `--cancel`. None (the default): no `alternates` key, builds
+  `[pool_build]` - every `PUT` body and definition byte for byte as before (tests/test_farm_pool.py, test_farm_h2h.py).
+* **GPU lease size** (`pool_gpu_games_per_lease`, default '' = left out; zero-farm PROTOCOL rev 11, 9.4): the farm run's
+  `selfplay.gpu_games_per_lease` - the games of a lease the coordinator sizes for a GPU (`auto`: from the machine's bench
+  of the run's network, capped by the run's staleness window; or a number). Like the alternates it is `PUT` again on a
+  resumed run when it changed (state `put_extras`). `zero.farm_h2h` takes `--gpu-games-per-lease` for its eval batch,
+  and `--min-agent` for its run's `min_agent` (rev 9: a canary-only head-to-head); each is sent only when given.
 
 ### 45.3 Off by default
 
@@ -6689,10 +6707,13 @@ settings are unused, classified `trainer` for check-config).
 * zero_search: `traced_games_replay_to_their_rows_bit_for_bit`, `tracing_changes_no_game_and_no_row`,
   `a_tampered_record_is_refused`, `set_trace_before_games_and_never_with_branches`,
   `chain::traced_contests_replay_to_their_rows_bit_for_bit`; zero_worker `records_replay_to_the_shards_rows_bit_for_bit`
-  (sparse and dense), `a_served_job_writes_records_only`; `tests/test_farm_pool.py` (3: a fake coordinator; the publish
+  (sparse and dense), `a_served_job_writes_records_only`; `tests/test_farm_pool.py` (4: a fake coordinator; the publish
   order, the pool's shards == shards of the same games written directly over two iterations, a tampered record refused,
-  the total before the ack, a stale game dropped, `selfplay_local` 0); `tools/worker_records_gate.py` (gate 3: a worker's
-  records replayed by the trainer's path == its own shards of the same games, bit for bit).
+  the total before the ack, a stale game dropped, `selfplay_local` 0; run alternates: the farm run's PUT bodies without
+  any byte for byte those of before, with one and a GPU lease size in every PUT and definition after a resume,
+  its records accepted);
+  `tools/worker_records_gate.py` (gate 3: a worker's records replayed by the trainer's path == its own shards of the same
+  games, bit for bit).
 * Gate 3 (MTG Zero, the desktop, 2026-11-12): eoe1's settings with iter 80's graph and a network switch to gen 81 after 8
   games - 48 games, 5,471 rows with auxiliary targets, nets 80 / 81, 39 of 39 arrays identical in 3 files, 48 games' decks
   compared; records 97.5 KB vs shards 1.17 MB. MTG Zero's tests (mtg-smoke, delver-smoke, eoe-smoke, eoe-choice-smoke with

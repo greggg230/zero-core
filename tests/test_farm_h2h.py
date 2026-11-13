@@ -33,6 +33,16 @@ MANIFEST = json.dumps({'manifest': 1, 'kind': 'worker', 'version': 'toy-test', '
                        'entry': 'w.exe', 'files': []}).encode()
 BID = hashlib.sha256(MANIFEST).hexdigest()[:24]
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker_stub.py')   # (info, check-config --eval)
+# run alternates (zero-farm PROTOCOL rev 11, 9.4): the same worker signed for the CUDA pack (whose manifest names its
+# GPU vendor), and for a pack without `gpu`
+_sha = lambda b: hashlib.sha256(b).hexdigest()[:24]
+CUDA = json.dumps({'manifest': 1, 'kind': 'runtime', 'version': 'cuda-test', 'min_agent': '0.2.10',
+                   'gpu': {'vendor': 'nvidia', 'min_driver': '527.41', 'providers': ['cuda']}, 'files': []}).encode()
+PLAIN = json.dumps({'manifest': 1, 'kind': 'runtime', 'version': 'plain-test', 'files': []}).encode()
+ALT_MANIFEST = MANIFEST.replace(RT.encode(), _sha(CUDA).encode())
+ALT_PLAIN_MANIFEST = MANIFEST.replace(RT.encode(), _sha(PLAIN).encode())
+ALT, ALT_PLAIN = _sha(ALT_MANIFEST), _sha(ALT_PLAIN_MANIFEST)
+MANIFESTS = {_sha(m): m for m in (MANIFEST, CUDA, PLAIN, ALT_MANIFEST, ALT_PLAIN_MANIFEST)}
 
 
 def base_seed(run):
@@ -64,6 +74,7 @@ class Fake:
     # leases: (lo, hi, machine, the chunk files' first games): lease 0 splits pair (2, 3) across its two chunks
     def __init__(self, leases=((0, 6, 'm_a', (0, 3)), (6, 10, 'm_b', (6,)), (4, 8, 'm_b', (4,)))):
         self.runs, self.objects, self.ckpts, self.results, self.calls = {}, {}, {}, [], []
+        self.raw = []                                      # (method, path, request body bytes)
         self.leases = list(leases)
         self.acked = 0
         self.played = None
@@ -77,6 +88,7 @@ class Fake:
         u = urlparse(url)
         p, q = u.path, parse_qs(u.query)
         self.calls.append((method, p))
+        self.raw.append((method, p, data))
         body = json.loads(data) if data and headers.get('content-type') == 'application/json' else None
         ok = lambda x: (200, json.dumps(x).encode())
         m = re.match(r'^/v1/admin/run/([a-z0-9-]+)$', p)
@@ -92,6 +104,8 @@ class Fake:
                 doc = df['doc']
                 assert doc['jobs']['eval'] == body['eval']['job'] and body['build_id'] in doc['builds']
                 assert doc['runtime'] == body['runtime'] and set(doc['checkpoints']) == {'1', '2'}
+                # rev 11: an alternate is authorized by its build in the definition's builds
+                assert all(x['build_id'] in doc['builds'] for x in body.get('alternates') or [])
             self.runs[run] = body
             return ok({'ok': True, 'created': True})
         if m and method == 'GET':
@@ -109,8 +123,9 @@ class Fake:
             self.objects[m.group(1)] = data
             return ok({'ok': True, 'key': m.group(1), 'size': len(data)})
         if m and method == 'GET':
-            if m.group(1) == f'builds/{BID}/manifest.json':
-                return 200, MANIFEST
+            mm = re.match(r'^builds/([0-9a-f]{24})/manifest\.json$', m.group(1))
+            if mm and mm.group(1) in MANIFESTS:
+                return 200, MANIFESTS[mm.group(1)]
             return 200, self.objects[m.group(1)]
         m = re.match(r'^/v1/admin/run/([a-z0-9-]+)/checkpoint/(\d+)$', p)
         if m and method == 'PUT':
@@ -200,6 +215,8 @@ def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
     assert TOKEN not in out + err and TOKEN not in json.dumps(fake.runs)
     run = 'h2h-tr-3v5'
     assert run in fake.runs
+    # no --alt: no alternates in any PUT of the run (zero-farm PROTOCOL rev 11), its definition's builds the build alone
+    assert all('alternates' not in json.loads(d) for m, p, d in fake.raw if m == 'PUT' and p == f'/v1/admin/run/{run}')
     # the order: run, gen 1 (model, reference, checkpoint), gen 2, the eval batch
     puts = [c for c in fake.calls if c[0] == 'PUT']
     assert puts[0] == ('PUT', f'/v1/admin/run/{run}') and puts[-1] == ('PUT', f'/v1/admin/run/{run}')
@@ -271,6 +288,131 @@ def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
         FH.main(['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', RT, '--worker', WORKER, '--state-dir', st_dir,
                  '--name', 'tr-3v5'],
                 client=cl)
+
+
+def _old_run_body(st, eval_on=True):
+    """farm_h2h.run_body before run alternates (zero-farm PROTOCOL rev 11): a run without any must PUT these bytes."""
+    b = {'game': st['game'], 'build_id': st['build_id'], 'runtime': st['runtime'], 'priority': st['priority'],
+         'selfplay': None, 'eval': None, 'state': st.get('run_state', 'active')}
+    if eval_on:
+        b['eval'] = {'batch': st['batch'], 'games': st['games'], 'checkpoints': [1, 2],
+                     'games_per_lease': st['games_per_lease'], 'gpu': 'any', 'needs': st['needs'],
+                     'job': FH.eval_job(st)}
+    return b
+
+
+def test_run_alternates_in_every_put_and_the_definition(tmp_path, monkeypatch):
+    """--alt (zero-farm PROTOCOL rev 11, 9.4): each alternate - checked from its manifest and its pack's, `when.vendor`
+    the pack's GPU vendor, else --alt-vendor - goes into every PUT of the run and its build into the definition's
+    builds after the default one (the runtime stays the default pack); kept in the state for --resume / --cancel;
+    refused before anything is put (a pack without a vendor and no --alt-vendor, another vendor than the pack's).
+    Without alternates the run's PUT bodies are byte for byte those of before."""
+    monkeypatch.setenv('ZEROFARM_ADMIN_TOKEN', TOKEN)
+    stub = STUB.setup(monkeypatch, tmp_path, TOKEN)
+    fake = Fake()
+    cl = FH.Client('http://fake', transport=fake)
+    alts, builds = FD.run_alternates(cl, BID, RT, [ALT])
+    assert alts == [{'build_id': ALT, 'runtime': _sha(CUDA), 'when': {'vendor': 'nvidia'}}] and builds == [BID, ALT]
+    # a head-to-head's state as main() leaves it (stand-in graph and reference files), then the coordinator's side
+    run, sdir = 'h2h-alt', str(tmp_path / 'state')
+    gens = {}
+    for gen in ('1', '2'):
+        gd = tmp_path / 'g' / gen
+        gd.mkdir(parents=True)
+        (gd / 'model.onnx').write_bytes(f'graph {gen}'.encode())
+        (gd / 'reference.npz').write_bytes(f'rows of {gen}'.encode())
+        m, r = str(gd / 'model.onnx'), str(gd / 'reference.npz')
+        gens[gen] = {'model': m, 'sha256': FD.file_sha256(m), 'model_size': os.path.getsize(m), 'reference': r,
+                     'reference_sha256': FD.file_sha256(r), 'reference_size': os.path.getsize(r),
+                     'checkpoint': str(gd / f'iter_000{gen}.pt')}
+    st = {'run': run, 'url': 'http://fake', 'a': 'a.pt', 'b': 'b.pt', 'game': 'toy', 'games': 10, 'seed': FH.coordinator_seed(run),
+          'build_id': BID, 'runtime': RT, 'priority': 1.0, 'games_per_lease': 'auto', 'needs': {'threads': 1, 'ram_mb': 1500},
+          'batch': 'h2h', 'settings': {'game': 'toy', 'eval_sims': 4}, 'select': 'cq', 'gens': gens, 'created': 0.0,
+          'cursor': 0, 'build_game': 'zero-toy', 'alternates': alts}
+    d = os.path.join(sdir, run)
+    FH.save_state(d, st)
+    FH.setup(cl, d, st, lambda m: None)
+    puts = [json.loads(b) for m, p, b in fake.raw if m == 'PUT' and p == f'/v1/admin/run/{run}']
+    assert len(puts) == 2 and all(b['alternates'] == alts for b in puts)
+    assert list(puts[1]) == ['game', 'build_id', 'runtime', 'priority', 'alternates', 'selfplay', 'eval', 'state']
+    doc = STUB.current(stub['state'], 'run', run)['doc']
+    assert doc['builds'] == [BID, ALT] and doc['runtime'] == RT          # (definition/1 unchanged: no new field)
+    assert set(doc) == {'definition', 'kind', 'id', 'version', 'created', 'expires', 'game', 'builds', 'runtime',
+                        'checkpoints', 'jobs'}
+    # --cancel (from the state) keeps them; --alt is only for a start
+    FH.main(['--cancel', run, '--state-dir', sdir], client=cl)
+    last = json.loads([b for m, p, b in fake.raw if m == 'PUT' and p == f'/v1/admin/run/{run}'][-1])
+    assert last['state'] == 'paused' and last['alternates'] == alts
+    for argv in (['--resume', run, '--alt', ALT], ['--cancel', run, '--alt-vendor', 'amd'],
+                 ['--a', 'a.pt', '--b', 'b.pt', '--games', '10', '--build', BID, '--runtime', RT, '--worker', WORKER,
+                  '--alt-vendor', 'nvidia']):
+        with pytest.raises(SystemExit):
+            FH.main(argv + ['--state-dir', sdir], client=cl)
+    # refused from the manifests before the export, nothing put: a pack without gpu needs --alt-vendor; a pack's own
+    # vendor wins over another; (with the vendor given, a gpu-less pack's alternate is that vendor's)
+    n = len(fake.calls)
+    start = ['--a', 'a.pt', '--b', 'b.pt', '--games', '10', '--build', BID, '--runtime', RT, '--worker', WORKER,
+             '--state-dir', sdir, '--name', 'refused']
+    for extra, why in ((['--alt', ALT_PLAIN], 'names no GPU vendor'), (['--alt', ALT, '--alt-vendor', 'amd'], 'not amd'),
+                       (['--alt', ALT, '--alt', ALT], 'listed twice')):
+        with pytest.raises(SystemExit, match=why):
+            FH.main(start + extra, client=cl)
+    assert [c for c in fake.calls[n:] if c[0] != 'GET'] == [] and not os.path.exists(os.path.join(sdir, 'h2h-refused'))
+    assert FD.run_alternates(cl, BID, RT, [ALT_PLAIN], 'amd')[0] == [{'build_id': ALT_PLAIN, 'runtime': _sha(PLAIN),
+                                                                      'when': {'vendor': 'amd'}}]
+    # no alternates, min_agent or GPU lease size (none given - as main() keeps them - or a state from before them): the
+    # bodies of before, byte for byte, builds [BID]
+    for s in (dict(st, alternates=[], min_agent=None, gpu_games_per_lease=None), {k: v for k, v in st.items() if k != 'alternates'}):
+        for on in (False, True):
+            assert json.dumps(FH.run_body(s, on)).encode() == json.dumps(_old_run_body(s, on)).encode()
+        assert FH.definition_fields(s)['builds'] == [BID]
+
+
+def test_cli_alternates_min_agent_and_gpu_lease_size(tmp_path, monkeypatch):
+    """A head-to-head started with --alt, --min-agent (PROTOCOL rev 9: a canary-only run) and --gpu-games-per-lease
+    (rev 11, 9.4): every PUT of the run carries `min_agent` and `alternates`, the eval batch `gpu_games_per_lease`
+    (after `games_per_lease`); the definition lists the alternate's build; the state keeps all three, so --cancel
+    sends them again; --resume and --cancel refuse new ones; bad values are refused before anything is put."""
+    monkeypatch.setenv('ZEROFARM_ADMIN_TOKEN', TOKEN)
+    stub = STUB.setup(monkeypatch, tmp_path, TOKEN)
+    monkeypatch.setenv('WORKER_STUB_BUILD', BID)
+    a, b = _ckpts(tmp_path)
+    fake = Fake()
+    cl = FH.Client('http://fake', transport=fake)
+    sdir, run = str(tmp_path / 'state'), 'h2h-canary'
+    start = ['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', RT, '--state-dir', sdir, '--threads', '1',
+             '--worker', WORKER]
+    for extra in (['--min-agent', '0.2'], ['--min-agent', 'v0.2.10'], ['--gpu-games-per-lease', 'lots'],
+                  ['--gpu-games-per-lease', '-3'], ['--gpu-games-per-lease', '100001']):
+        with pytest.raises(SystemExit):
+            FH.main(start + ['--name', 'bad'] + extra, client=cl)
+    assert fake.calls == [] and not os.path.exists(os.path.join(sdir, 'h2h-bad'))
+    rc = FH.main(start + ['--name', 'canary', '--no-wait', '--alt', ALT, '--min-agent', '0.2.10',
+                          '--gpu-games-per-lease', '64'], client=cl)
+    assert rc == 0
+    alts = [{'build_id': ALT, 'runtime': _sha(CUDA), 'when': {'vendor': 'nvidia'}}]
+    puts = [json.loads(d) for m, p, d in fake.raw if m == 'PUT' and p == f'/v1/admin/run/{run}']
+    assert len(puts) == 2 and all(x['min_agent'] == '0.2.10' and x['alternates'] == alts for x in puts)
+    assert list(puts[1])[:6] == ['game', 'build_id', 'runtime', 'priority', 'min_agent', 'alternates']
+    ev = puts[1]['eval']
+    assert ev['gpu_games_per_lease'] == 64 and ev['games_per_lease'] == 'auto'
+    assert list(ev) == ['batch', 'games', 'checkpoints', 'games_per_lease', 'gpu_games_per_lease', 'gpu', 'needs', 'job']
+    assert STUB.current(stub['state'], 'run', run)['doc']['builds'] == [BID, ALT]
+    st = FH.load_state(os.path.join(sdir, run))
+    assert (st['min_agent'], st['gpu_games_per_lease'], st['alternates']) == ('0.2.10', 64, alts)
+    FH.main(['--cancel', 'canary', '--state-dir', sdir], client=cl)
+    last = json.loads([d for m, p, d in fake.raw if m == 'PUT' and p == f'/v1/admin/run/{run}'][-1])
+    assert last['state'] == 'paused' and last['min_agent'] == '0.2.10' and last['alternates'] == alts
+    assert last['eval']['gpu_games_per_lease'] == 64
+    for extra in (['--min-agent', '0.2.11'], ['--gpu-games-per-lease', 'auto']):
+        with pytest.raises(SystemExit):
+            FH.main(['--resume', 'canary', '--state-dir', sdir] + extra, client=cl)
+    # 'auto' is a size too; the parse of a setting or flag
+    assert FD.gpu_games_per_lease('auto') == 'auto' and FD.gpu_games_per_lease(' 24 ') == 24
+    assert FD.gpu_games_per_lease(None) is None and FD.gpu_games_per_lease('') is None and FD.gpu_games_per_lease(0) is None
+    for bad in ('x', 1.5, True, -1, 100_001, [64]):
+        with pytest.raises(ValueError):
+            FD.gpu_games_per_lease(bad)
 
 
 def test_zero_h2h_plays_the_runs_evaluation(tmp_path, monkeypatch, capsys):

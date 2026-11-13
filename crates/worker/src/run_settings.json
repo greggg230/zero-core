@@ -545,6 +545,18 @@
    "class": "trainer",
    "why": "orchestration (the farm pool, docs/az.md 45)"
   },
+  "pool_alternates": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 45)"
+  },
+  "pool_alt_vendor": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 45)"
+  },
+  "pool_gpu_games_per_lease": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool, docs/az.md 45)"
+  },
   "selfplay_local": {
    "class": "trainer",
    "why": "orchestration"
