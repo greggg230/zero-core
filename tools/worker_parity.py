@@ -56,7 +56,8 @@ def py_side(a, mirror, it):
         def __call__(self, lb):
             if len(rec['batches']) < rec['n']:
                 rec['batches'].append({k: np.array(lb.a[k]) for k in ('xs_off', 'xs_idx', 'xs_val', 'n_players', 'player',
-                                                                        'gid', 'extra', 'opt_off', 'opt_action')})
+                                                                        'gid', 'extra', 'opt_off', 'opt_action') + VARLEN
+                                       if k in lb.a})
             return self.u(lb)
 
     class W(RP.Worker):
@@ -98,19 +99,43 @@ def py_side(a, mirror, it):
     return rec['batches'], w.k, time.time() - t0
 
 
+VARLEN = ('t_off', 't_seg', 't_slot', 't_val', 'ov_off', 'ov_opt', 'ov_tok')   # (docs/az.md 46)
+
+
 def save_batches(path, batches):
     import numpy as np
-    out = {k: [] for k in ('xs_idx', 'xs_val', 'n_players', 'player', 'gid', 'extra', 'opt_action')}
-    xs_off, opt_off, bo = [0], [0], [0]
+    keys = ('xs_idx', 'xs_val', 'n_players', 'player', 'gid', 'extra', 'opt_action')
+    keys += tuple(k for k in ('t_seg', 't_slot', 't_val', 'ov_opt', 'ov_tok') if batches and k in batches[0])
+    out = {k: [] for k in keys}
+    offs = {k: [0] for k in ('xs_off', 'opt_off', 't_off', 'ov_off') if not batches or k in batches[0]}
+    bo = [0]
     for b in batches:
         for k in out:
             out[k].append(b[k])
-        xs_off.extend((xs_off[-1] + np.asarray(b['xs_off'][1:], np.int64)).tolist())
-        opt_off.extend((opt_off[-1] + np.asarray(b['opt_off'][1:], np.int64)).tolist())
+        for k, o in offs.items():
+            o.extend((o[-1] + np.asarray(b[k][1:], np.int64)).tolist())
         bo.append(bo[-1] + len(b['n_players']))
-    np.savez(path, meta=json.dumps({'source': 'python remote worker'}), xs_off=np.array(xs_off, np.int64),
-             opt_off=np.array(opt_off, np.int64), batch_off=np.array(bo, np.int64),
+    np.savez(path, meta=json.dumps({'source': 'python remote worker'}), batch_off=np.array(bo, np.int64),
+             **{k: np.array(o, np.int64) for k, o in offs.items()},
              **{k: np.concatenate(v) if v else np.zeros(0) for k, v in out.items()})
+
+
+def varlen_slice(z, b0, b1):
+    """Rows [b0, b1) of a recorded batch file's tail tokens and overrides as the driver's batch arrays (each tail
+    token's floats by its segment's width, the meta's t_segs; {} for a file without)."""
+    import numpy as np
+    out = {}
+    if 't_off' in z.files:
+        width = {int(s): int(w) for s, _n, w, _h in json.loads(str(z['meta']))['t_segs']}
+        to, ts = z['t_off'], z['t_seg']
+        vo = np.concatenate([[0], np.cumsum([width[int(s)] for s in ts])]).astype(np.int64)
+        a, e = int(to[b0]), int(to[b1])
+        out.update(t_off=to[b0:b1 + 1] - to[b0], t_seg=ts[a:e], t_slot=z['t_slot'][a:e], t_val=z['t_val'][vo[a]:vo[e]])
+    if 'ov_off' in z.files:
+        oo = z['ov_off']
+        a, e = int(oo[b0]), int(oo[b1])
+        out.update(ov_off=oo[b0:b1 + 1] - oo[b0], ov_opt=z['ov_opt'][a:e], ov_tok=z['ov_tok'][a:e])
+    return out
 
 
 def compare(py_shards, rs_shards, py_batches, rs_batch_file, nb):
@@ -119,7 +144,8 @@ def compare(py_shards, rs_shards, py_batches, rs_batch_file, nb):
     if len(py_shards) != len(rs_shards):
         bad.append(f'{len(py_shards)} Python shards, {len(rs_shards)} native')
     rows = 0
-    fmt = ('game', 'features', 'actions', 'rows', 'x_format', 'x_version', 'x_cols', 'x_nnz')
+    fmt = ('game', 'features', 'actions', 'rows', 'x_format', 'x_version', 'x_cols', 'x_nnz', 't_segs', 'option_pointers',
+           'max_row_tokens')
     for p, r in zip(py_shards, rs_shards):
         with np.load(p) as zp, np.load(r) as zr:
             mp, mr = json.loads(str(zp['meta'])), json.loads(str(zr['meta']))
@@ -149,6 +175,10 @@ def compare(py_shards, rs_shards, py_batches, rs_batch_file, nb):
             mine = {'xs_off': xo - xo[0], 'xs_idx': z['xs_idx'][xo[0]:xo[-1]], 'xs_val': z['xs_val'][xo[0]:xo[-1]],
                     'n_players': z['n_players'][b0:b1], 'player': z['player'][b0:b1], 'gid': z['gid'][b0:b1],
                     'extra': z['extra'][b0:b1], 'opt_off': oo - oo[0], 'opt_action': z['opt_action'][oo[0]:oo[-1]]}
+            mine.update(varlen_slice(z, b0, b1))
+            if set(k for k in VARLEN if k in a) != set(k for k in VARLEN if k in mine):
+                bad.append(f'batch {i}: tail / override arrays {sorted(k for k in a if k in VARLEN)} vs {sorted(k for k in mine if k in VARLEN)}')
+                break
             for k, v in mine.items():
                 pv = np.asarray(a[k])
                 if pv.astype(np.float64).tobytes() != np.asarray(v).astype(np.float64).tobytes() and not (

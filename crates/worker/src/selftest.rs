@@ -11,14 +11,16 @@
 //! `xs_idx` i32, `xs_val` f32, `n_players` i64 [R], `extra` u8 [R] - ROW_BELIEF rows want the auxiliary
 //! answer -, `opt_off` i64 [R+1], `opt_action` i32), `batch_off` i64 [K+1] (the rows' batches, as
 //! recorded), and torch's answers: `priors` f32 [options], `value` f32 [R, 8], `margin` f32 [R, 8],
-//! `aux` f32 [belief rows, W].
+//! `aux` f32 [belief rows, W]. A zero-onnx/2 network's (zero-core docs/az.md 46) also the rows' tail tokens and
+//! overrides as the driver sends them (`read_batches`).
 use std::path::Path;
 
 use serde_json::Value;
 use zero_search::driver::{Batch, ROW_BELIEF};
 
 use crate::eval::{Answer, Evaluator, Expect};
-use crate::npz::read_npz;
+use crate::npz::{read_npz, Arr};
+use std::collections::BTreeMap;
 
 /// The largest difference allowed on any number (the parity gate's, DESIGN.md 8.3).
 pub const TOL: f64 = 2e-5;
@@ -31,16 +33,25 @@ pub struct Reference {
     pub rows: usize,
 }
 
-/// Load `reference.npz` (every array checked against the others' shapes).
-pub fn load(path: &Path) -> Result<Reference, String> {
-    let z = read_npz(path).map_err(|e| format!("reference {}: {e}", path.display()))?;
-    let g = |k: &str| z.get(k).ok_or_else(|| format!("reference {}: no {k}", path.display()));
-    let meta: Value = serde_json::from_str(&g("meta")?.text()?).map_err(|e| format!("reference meta: {e}"))?;
+/// Recorded network batches (a reference set's, or a recorded batch file's - zero-core tools/onnx_record.py's
+/// format): each batch as the driver sent it, with its tail tokens and overrides when the file has them.
+pub struct Recorded {
+    pub batches: Vec<Batch>,
+    pub rows: usize,
+    pub options: usize,
+    pub belief_rows: usize,
+}
+
+/// The batches of an npz's rows (`what`: the file, for messages; every array checked against the others): `xs_off` ..
+/// `batch_off` and, when present, the tail tokens (`t_off` i64 [R+1], `t_seg`, `t_slot`, `t_val` - each token's floats
+/// consecutive, its width from the meta's `t_segs` [[segment, name, width, head slots], ...]) and the overrides
+/// (`ov_off` i64 [R+1], `ov_opt`, `ov_tok`; zero-core docs/az.md 46).
+pub fn read_batches(z: &BTreeMap<String, Arr>, meta: &Value, what: &str) -> Result<Recorded, String> {
+    let g = |k: &str| z.get(k).ok_or_else(|| format!("{what}: no {k}"));
     let (xs_off, xs_idx, xs_val) = (g("xs_off")?.i64s()?, g("xs_idx")?.i64s()?, g("xs_val")?.f32s()?);
     let (np_, extra, opt_off, opt_action, bo) = (g("n_players")?.i64s()?, g("extra")?.i64s()?, g("opt_off")?.i64s()?, g("opt_action")?.i64s()?, g("batch_off")?.i64s()?);
-    let want = Answer { priors: g("priors")?.f32s()?, value: g("value")?.f32s()?, margin: g("margin")?.f32s()?, aux: g("aux")?.f32s()? };
     let rows = np_.len();
-    let bad = |what: &str| Err(format!("reference {}: {what}", path.display()));
+    let bad = |m: &str| Err(format!("{what}: {m}"));
     if rows == 0 || xs_off.len() != rows + 1 || opt_off.len() != rows + 1 || extra.len() != rows {
         return bad("the rows' arrays disagree");
     }
@@ -53,13 +64,37 @@ pub fn load(path: &Path) -> Result<Reference, String> {
     if bo.first() != Some(&0) || bo.last().copied() != Some(rows as i64) || bo.windows(2).any(|w| w[0] >= w[1]) {
         return bad("batch_off must cover the rows in non-empty batches");
     }
-    let n_belief = extra.iter().filter(|&&e| e == ROW_BELIEF as i64).count();
-    let ms = zero_search::MAX_SEATS;
-    if want.priors.len() != opt_action.len() || want.value.len() != rows * ms || want.margin.len() != rows * ms {
-        return bad("torch's answers disagree with the rows");
+    // variable-length rows: each tail token's first float by its segment's width
+    let opt_arr = |k: &str| -> Result<Option<Vec<i64>>, String> { z.get(k).map(|a| a.i64s()).transpose() };
+    let (t_off, t_seg, t_slot) = (opt_arr("t_off")?, opt_arr("t_seg")?, opt_arr("t_slot")?);
+    let t_val = z.get("t_val").map(|a| a.f32s()).transpose()?;
+    let (ov_off, ov_opt, ov_tok) = (opt_arr("ov_off")?, opt_arr("ov_opt")?, opt_arr("ov_tok")?);
+    let mut voff = vec![0usize];
+    if let (Some(to), Some(ts), Some(tl), Some(tv)) = (&t_off, &t_seg, &t_slot, &t_val) {
+        let mut width = std::collections::HashMap::new();
+        for e in meta.get("t_segs").and_then(|v| v.as_array()).ok_or_else(|| format!("{what}: tail tokens without t_segs"))? {
+            let a = e.as_array().filter(|a| a.len() == 4).ok_or_else(|| format!("{what}: t_segs entry {e}"))?;
+            width.insert(a[0].as_i64().unwrap_or(-1), a[2].as_u64().unwrap_or(0) as usize);
+        }
+        if to.len() != rows + 1 || to[0] != 0 || to.windows(2).any(|w| w[0] > w[1]) || *to.last().unwrap() as usize != ts.len() || tl.len() != ts.len() {
+            return bad("the tail tokens' arrays disagree");
+        }
+        for s in ts {
+            let w = *width.get(s).ok_or_else(|| format!("{what}: a tail token of segment {s}, not in t_segs"))?;
+            voff.push(voff.last().unwrap() + w);
+        }
+        if *voff.last().unwrap() != tv.len() {
+            return bad("the tail floats disagree with the tokens' widths");
+        }
+    } else if t_off.is_some() || t_seg.is_some() || t_slot.is_some() || t_val.is_some() {
+        return bad("t_off, t_seg, t_slot and t_val come together");
     }
-    if (n_belief == 0 && !want.aux.is_empty()) || (n_belief > 0 && want.aux.len() % n_belief != 0) {
-        return bad("the auxiliary answers disagree with the belief rows");
+    if let (Some(oo), Some(op), Some(ot)) = (&ov_off, &ov_opt, &ov_tok) {
+        if oo.len() != rows + 1 || oo[0] != 0 || oo.windows(2).any(|w| w[0] > w[1]) || *oo.last().unwrap() as usize != op.len() || ot.len() != op.len() {
+            return bad("the overrides' arrays disagree");
+        }
+    } else if ov_off.is_some() || ov_opt.is_some() || ov_tok.is_some() {
+        return bad("ov_off, ov_opt and ov_tok come together");
     }
     let mut batches = Vec::new();
     for k in 0..bo.len() - 1 {
@@ -76,9 +111,42 @@ pub fn load(path: &Path) -> Result<Reference, String> {
         b.extra = extra[r0..r1].iter().map(|&x| x as u8).collect();
         b.player = vec![0; r1 - r0];
         b.gid = vec![0; r1 - r0];
+        if let (Some(to), Some(ts), Some(tl), Some(tv)) = (&t_off, &t_seg, &t_slot, &t_val) {
+            let (a, e) = (to[r0] as usize, to[r1] as usize);
+            b.t_off = to[r0..=r1].iter().map(|&x| x - to[r0]).collect();
+            b.t_seg = ts[a..e].iter().map(|&x| x as u16).collect();
+            b.t_slot = tl[a..e].iter().map(|&x| x as u32).collect();
+            b.t_val = tv[voff[a]..voff[e]].to_vec();
+        }
+        if let (Some(oo), Some(op), Some(ot)) = (&ov_off, &ov_opt, &ov_tok) {
+            let (a, e) = (oo[r0] as usize, oo[r1] as usize);
+            b.ov_off = oo[r0..=r1].iter().map(|&x| x - oo[r0]).collect();
+            b.ov_opt = op[a..e].iter().map(|&x| x as i32).collect();
+            b.ov_tok = ot[a..e].to_vec();
+        }
         batches.push(b);
     }
-    Ok(Reference { meta, batches, want, rows })
+    let belief_rows = extra.iter().filter(|&&e| e == ROW_BELIEF as i64).count();
+    Ok(Recorded { batches, rows, options: opt_action.len(), belief_rows })
+}
+
+/// Load `reference.npz` (every array checked against the others' shapes).
+pub fn load(path: &Path) -> Result<Reference, String> {
+    let z = read_npz(path).map_err(|e| format!("reference {}: {e}", path.display()))?;
+    let g = |k: &str| z.get(k).ok_or_else(|| format!("reference {}: no {k}", path.display()));
+    let meta: Value = serde_json::from_str(&g("meta")?.text()?).map_err(|e| format!("reference meta: {e}"))?;
+    let rec = read_batches(&z, &meta, &format!("reference {}", path.display()))?;
+    let want = Answer { priors: g("priors")?.f32s()?, value: g("value")?.f32s()?, margin: g("margin")?.f32s()?, aux: g("aux")?.f32s()? };
+    let (rows, n_belief) = (rec.rows, rec.belief_rows);
+    let bad = |what: &str| Err(format!("reference {}: {what}", path.display()));
+    let ms = zero_search::MAX_SEATS;
+    if want.priors.len() != rec.options || want.value.len() != rows * ms || want.margin.len() != rows * ms {
+        return bad("torch's answers disagree with the rows");
+    }
+    if (n_belief == 0 && !want.aux.is_empty()) || (n_belief > 0 && want.aux.len() % n_belief != 0) {
+        return bad("the auxiliary answers disagree with the belief rows");
+    }
+    Ok(Reference { meta, batches: rec.batches, want, rows })
 }
 
 /// The reference set belongs to the network and the game the job plays: its game / features / actions
@@ -209,7 +277,7 @@ mod tests {
         write(&p, &[0, 1, 2, 3], &[0.25, 0.75]);
         let r = load(&p).unwrap();
         assert_eq!((r.rows, r.batches.len(), r.batches[0].xs_idx.clone()), (3, 1, vec![0, 2, 4]));
-        let want = Expect { game: "toy".into(), features: 5, actions: 4, aux_width: 2, belief: true };
+        let want = Expect { game: "toy".into(), features: 5, actions: 4, aux_width: 2, belief: true, tails: vec![], option_pointers: false };
         check_meta(&r, &want, &[("checkpoint_sha256".into(), "ab".into())]).unwrap();
         assert!(check_meta(&r, &want, &[("checkpoint_sha256".into(), "cd".into())]).unwrap_err().contains("made for checkpoint ab"));
         assert!(check_meta(&r, &Expect { game: "mtg".into(), ..want.clone() }, &[]).is_err());

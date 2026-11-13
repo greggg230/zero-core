@@ -152,7 +152,7 @@ def main(argv=None):
     rc.update(cfg)
     game = rc['game']
     spec = G.spec_json(rc['spec'])
-    fmt = shard_format(rc)
+    fmt = shard_format(rc, G.info(game))       # (format v2 for a game with tails / overrides, docs/az.md 43.1)
     recs = sorted(glob.glob(os.path.join(wout, 'g_*.rec.jsonl.gz')))
     shards = sorted(p for p in glob.glob(os.path.join(wout, 'g_*.npz')) if not p.endswith('.bad.npz'))
     rep = {'worker': a.worker, 'settings': a.settings, 'set': parse_set(a.set), 'game': game, 'games': 0, 'rows': 0,

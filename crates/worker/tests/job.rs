@@ -240,7 +240,7 @@ fn records_replay_to_the_shards_rows_bit_for_bit() {
                 .filter(|g| !g.records.is_empty())
                 .collect();
             let f = <zero_search::toy::ToyGame as zero_search::SearchGame>::NUM_FEATURES;
-            let (arrays, _, probs) = zero_worker::shard::shard_arrays(&games, f, sparse);
+            let (arrays, _, probs) = zero_worker::shard::shard_arrays(&games, f, sparse, None).unwrap();
             assert!(probs.is_empty());
             let z = read_npz(&sw.path).unwrap();
             assert_eq!(z.len() - 1, arrays.len(), "the same members");

@@ -26,6 +26,7 @@ import sys
 import time
 
 KEYS = ('xs_off', 'xs_idx', 'xs_val', 'n_players', 'player', 'gid', 'extra', 'opt_off', 'opt_action')
+VARLEN = ('t_off', 't_seg', 't_slot', 't_val', 'ov_off', 'ov_opt', 'ov_tok')   # (variable-length rows, docs/az.md 46)
 
 
 def gen_pairs(vals, what):
@@ -54,7 +55,7 @@ def python_side(a, cfg, seats, models):
 
         def __call__(self, lb):
             if len(rec) < a.batches:
-                rec.append({k: np.array(lb.a[k]) for k in KEYS})
+                rec.append({k: np.array(lb.a[k]) for k in KEYS + VARLEN if k in lb.a})
             return self.ev(lb)
 
         def launch(self, lb):
@@ -123,7 +124,13 @@ def compare_batches(py, bf):
         nat = {'xs_off': xo[r0:r1 + 1] - xo[r0], 'xs_idx': z['xs_idx'][xo[r0]:xo[r1]], 'xs_val': z['xs_val'][xo[r0]:xo[r1]],
                'n_players': z['n_players'][r0:r1], 'player': z['player'][r0:r1], 'gid': z['gid'][r0:r1],
                'extra': z['extra'][r0:r1], 'opt_off': oo[r0:r1 + 1] - oo[r0], 'opt_action': z['opt_action'][oo[r0]:oo[r1]]}
-        for key in KEYS:
+        from worker_parity import varlen_slice
+        nat.update(varlen_slice(z, r0, r1))
+        keys = KEYS + tuple(x for x in VARLEN if x in nat or x in py[k])
+        for key in keys:
+            if key not in nat or key not in py[k]:
+                return {'compared': k + 1, 'first_difference': {'batch': k, 'array': key, 'python': key in py[k],
+                                                                 'native': key in nat}}
             a, b = np.asarray(py[k][key]), np.asarray(nat[key])
             if a.shape != b.shape or not np.array_equal(a.astype(np.float64), b.astype(np.float64)):
                 return {'compared': k + 1, 'first_difference': {'batch': k, 'array': key, 'python': list(a.shape),

@@ -40,7 +40,7 @@ pub const INFLIGHT: usize = 2;
 
 #[derive(Clone, Debug)]
 pub enum EvalKind {
-    /// A `zero-onnx/1` graph through ONNX Runtime; `sha256`: the model file's (checked before it is loaded);
+    /// A `zero-onnx/1` or `/2` graph through ONNX Runtime; `sha256`: the model file's (checked before it is loaded);
     /// `reference`: its checkpoint's reference set, answered before the first real batch (the per-machine
     /// self-test, `selftest`).
     Onnx { model: PathBuf, ort: OrtCfg, sha256: Option<String>, reference: Option<PathBuf> },
@@ -384,11 +384,22 @@ pub(crate) struct Recorder {
     opt_action: Vec<i32>,
     batch_off: Vec<i64>,
     ids: Vec<i64>,
+    /// Variable-length rows (zero-core docs/search.md 2.15; tools/onnx_record.py's arrays): the tail tokens and the
+    /// overrides, kept when the batches carry them.
+    t_off: Vec<i64>,
+    t_seg: Vec<u16>,
+    t_slot: Vec<u32>,
+    t_val: Vec<f32>,
+    ov_off: Vec<i64>,
+    ov_opt: Vec<i32>,
+    ov_tok: Vec<i64>,
+    tails: bool,
+    pointers: bool,
 }
 
 impl Recorder {
     pub(crate) fn new(path: PathBuf, max: usize) -> Recorder {
-        Recorder { path, max, batches: 0, xs_off: vec![0], xs_idx: vec![], xs_val: vec![], n_players: vec![], player: vec![], gid: vec![], extra: vec![], opt_off: vec![0], opt_action: vec![], batch_off: vec![0], ids: vec![] }
+        Recorder { path, max, batches: 0, xs_off: vec![0], xs_idx: vec![], xs_val: vec![], n_players: vec![], player: vec![], gid: vec![], extra: vec![], opt_off: vec![0], opt_action: vec![], batch_off: vec![0], ids: vec![], t_off: vec![0], t_seg: vec![], t_slot: vec![], t_val: vec![], ov_off: vec![0], ov_opt: vec![], ov_tok: vec![], tails: false, pointers: false }
     }
     pub(crate) fn add(&mut self, b: &Batch) {
         if self.batches >= self.max {
@@ -409,14 +420,42 @@ impl Recorder {
             self.opt_off.push(ob + b.opt_off[r + 1] as i64);
         }
         self.opt_action.extend_from_slice(&b.opt_action);
+        if !b.t_off.is_empty() {
+            self.tails = true;
+            let tb = *self.t_off.last().unwrap();
+            for r in 0..b.b {
+                self.t_off.push(tb + b.t_off[r + 1]);
+            }
+            self.t_seg.extend_from_slice(&b.t_seg);
+            self.t_slot.extend_from_slice(&b.t_slot);
+            self.t_val.extend_from_slice(&b.t_val);
+        }
+        if !b.ov_off.is_empty() {
+            self.pointers = true;
+            let vb = *self.ov_off.last().unwrap();
+            for r in 0..b.b {
+                self.ov_off.push(vb + b.ov_off[r + 1]);
+            }
+            self.ov_opt.extend_from_slice(&b.ov_opt);
+            self.ov_tok.extend_from_slice(&b.ov_tok);
+        }
         self.batch_off.push(self.batch_off.last().unwrap() + b.b as i64);
         self.ids.push(b.id as i64);
         self.batches += 1;
     }
-    pub(crate) fn write(&self, meta: &Value) -> Result<(), String> {
+    /// The file (`meta`: the job's; with variable-length rows `info`'s `t_segs` / `option_pointers` added).
+    pub(crate) fn write(&self, meta: &Value, info: &zero_search::dynapi::GameInfo) -> Result<(), String> {
         let f32n = |v: &[f32]| Npy { descr: "<f4".into(), shape: vec![v.len()], data: v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let u8n = |v: &[u8]| Npy { descr: "|u1".into(), shape: vec![v.len()], data: v.to_vec() };
-        let members = vec![
+        let mut meta = meta.clone();
+        if self.tails || self.pointers {
+            if let Some(fmt) = crate::shard::RowsFmt::of(info) {
+                for (k, v) in fmt.meta() {
+                    meta[k] = v;
+                }
+            }
+        }
+        let mut members = vec![
             ("meta", Npy::unicode(&meta.to_string())),
             ("xs_off", Npy::i64(&self.xs_off, vec![self.xs_off.len()])),
             ("xs_idx", Npy::i32(&self.xs_idx, vec![self.xs_idx.len()])),
@@ -430,6 +469,17 @@ impl Recorder {
             ("batch_off", Npy::i64(&self.batch_off, vec![self.batch_off.len()])),
             ("batch_id", Npy::i64(&self.ids, vec![self.ids.len()])),
         ];
+        if self.tails {
+            members.push(("t_off", Npy::i64(&self.t_off, vec![self.t_off.len()])));
+            members.push(("t_seg", Npy::u16(&self.t_seg, vec![self.t_seg.len()])));
+            members.push(("t_slot", Npy::u32(&self.t_slot, vec![self.t_slot.len()])));
+            members.push(("t_val", f32n(&self.t_val)));
+        }
+        if self.pointers {
+            members.push(("ov_off", Npy::i64(&self.ov_off, vec![self.ov_off.len()])));
+            members.push(("ov_opt", Npy::i32(&self.ov_opt, vec![self.ov_opt.len()])));
+            members.push(("ov_tok", Npy::i64(&self.ov_tok, vec![self.ov_tok.len()])));
+        }
         crate::shard::write_npz(&self.path, &members, 1).map(|_| ())
     }
 }
@@ -648,7 +698,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let info = (game.info)();
     let cfg = job_driver_cfg(game, job)?;
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
-    let want = Expect { game: info.name.to_string(), features: info.num_features, actions: info.num_actions, aux_width: info.aux.iter().map(|a| a.1).sum(), belief };
+    let want = Expect::of(&info, belief);
     let ev = build_eval(&job.eval, &want, sink, &progress, None)?;
     sink.log(&format!("job {}: {} games from gid {}, seed {}, net {}; driver: conc {}, threads {}, groups {}, sparse; evaluator: {}", job.lease_id, job.games, job.gid_base, job.seed, job.net, cfg.concurrency, cfg.threads, cfg.groups, ev.describe()));
     {
@@ -694,7 +744,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     } else {
         None
     };
-    let writer = ShardWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, meta, sparse, info.num_features, 1)?;
+    let writer = ShardWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, meta, sparse, info.num_features, 1, crate::shard::RowsFmt::of(&info))?;
     let (link, answers, eval_thread) = spawn_eval(ev);
     link_out(link.clone());
     let mut r = Run { job, sink, ctl, drv, link, answers, pending: VecDeque::new(), writer, rec, spec, cap, enq: 0, finished: 0, stop_topup: false, ended: false, switching: None, progress: progress.clone(), recorder: job.record_batches.as_ref().map(|(p, n)| Recorder::new(p.clone(), *n)), want, t0, t_status: Instant::now(), fin_unsent: 0 };
@@ -737,7 +787,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         Ok(())
     })();
     let rec_res = match (&r.recorder, &res) {
-        (Some(rc), Ok(())) => rc.write(&json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker"})),
+        (Some(rc), Ok(())) => rc.write(&json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker"}), &info),
         _ => Ok(()),
     };
     r.snapshot();
@@ -815,7 +865,7 @@ mod tests {
         assert!(check_file_sha256(&d.join("missing.onnx"), &good, None).is_err());
         // a wrong hash ends the job before ONNX Runtime is touched (there is no runtime here at all; the right hash
         // reaching the loader is the worker's integration tests': MTG Zero tests/test_worker_farm.py)
-        let want = Expect { game: "toy".into(), features: 1, actions: 1, aux_width: 0, belief: false };
+        let want = Expect { game: "toy".into(), features: 1, actions: 1, aux_width: 0, belief: false, tails: vec![], option_pointers: false };
         let ort = OrtCfg::cpu(d.join("no-onnxruntime.dll"), 1, false);
         let progress = Mutex::new(Progress::default());
         let kind = EvalKind::Onnx { model: p.clone(), ort, sha256: Some(bad.clone()), reference: None };

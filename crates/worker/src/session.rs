@@ -411,7 +411,7 @@ impl Runtime {
 
 /// What [`create_session`] builds.
 pub struct SessionSpec<'a> {
-    /// A `zero-onnx/1` graph.
+    /// A `zero-onnx/1` or `/2` graph.
     pub model: &'a Path,
     /// Its reference set (`reference.npz`); required to accept any GPU provider.
     pub reference: Option<&'a Path>,
@@ -752,16 +752,60 @@ fn metadata(s: &Session) -> Result<Vec<(String, String)>, String> {
 pub fn expect_of(meta: &[(String, String)], path: &Path) -> Result<Expect, String> {
     let get = |k: &str| meta.iter().find(|e| e.0 == k).map(|e| e.1.clone());
     let num = |k: &str| get(k).and_then(|v| v.parse::<usize>().ok()).ok_or_else(|| format!("{}: metadata {k}", path.display()));
-    Ok(Expect { game: get("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false })
+    // (zero-onnx/2: its tail segments and overrides as declared - `varlen_of` then checks them against themselves)
+    let mut tails = Vec::new();
+    if let Some(t) = get("tails") {
+        let v: Value = serde_json::from_str(&t).map_err(|e| format!("{}: metadata tails: {e}", path.display()))?;
+        for e in v.as_array().into_iter().flatten() {
+            let a = e.as_array().filter(|a| a.len() == 4).ok_or_else(|| format!("{}: metadata tails entry {e}", path.display()))?;
+            tails.push((a[0].as_u64().unwrap_or(0) as u16, a[1].as_str().unwrap_or_default().to_string(), a[2].as_u64().unwrap_or(0) as usize, a[3].as_u64().unwrap_or(0) as usize));
+        }
+    }
+    Ok(Expect { game: get("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false, tails, option_pointers: get("option_pointers").as_deref() == Some("true") })
 }
 
-/// The graph's metadata and inputs / outputs checked against `want` (phase 0a's "For phase 0b" point 1).
+/// zero-onnx/2's more inputs (zero-core docs/az.md 46): the driver's options, tail tokens and pointer overrides.
+pub const VARLEN_INPUTS: [&str; 9] = ["opt_off", "opt_action", "t_off", "t_seg", "t_slot", "t_val", "ov_off", "ov_opt", "ov_tok"];
+
+/// A zero-onnx/2 graph's tail segments' widths by segment index (0: not a tail segment) from its metadata (`tails`
+/// [[segment, name, width, head slots], ...]), checked against the game's (`Expect::tails`, `option_pointers`); None
+/// for a zero-onnx/1 graph, which a game with tail segments or pointer overrides refuses (its rows would be dropped).
+pub fn varlen_of(meta: &[(String, String)], path: &Path, want: &Expect) -> Result<Option<Vec<usize>>, String> {
+    let get = |k: &str| meta.iter().find(|e| e.0 == k).map(|e| e.1.as_str());
+    if get("zero_onnx") != Some("2") {
+        if !want.tails.is_empty() || want.option_pointers {
+            return Err(format!("{}: a zero-onnx/{} graph for game {:?}, whose rows have tail tokens / pointer overrides (zero-onnx/2's, zero-core docs/az.md 46)", path.display(), get("zero_onnx").unwrap_or("?"), want.game));
+        }
+        return Ok(None);
+    }
+    let tails: Value = serde_json::from_str(get("tails").ok_or_else(|| format!("{}: a zero-onnx/2 graph without metadata tails", path.display()))?).map_err(|e| format!("{}: metadata tails: {e}", path.display()))?;
+    let mut have: Vec<(u16, String, usize, usize)> = Vec::new();
+    for t in tails.as_array().ok_or_else(|| format!("{}: metadata tails is not a list", path.display()))? {
+        let a = t.as_array().filter(|a| a.len() == 4).ok_or_else(|| format!("{}: metadata tails entry {t}", path.display()))?;
+        let n = |v: &Value| v.as_u64().ok_or_else(|| format!("{}: metadata tails entry {t}", path.display()));
+        have.push((n(&a[0])? as u16, a[1].as_str().unwrap_or_default().to_string(), n(&a[2])? as usize, n(&a[3])? as usize));
+    }
+    let pointers = get("option_pointers") == Some("true");
+    if have != want.tails || pointers != want.option_pointers {
+        return Err(format!("{}: the network's tail segments {have:?} / pointer overrides {pointers}, the game's {:?} / {} (another layout)", path.display(), want.tails, want.option_pointers));
+    }
+    let mut widths = vec![0usize; have.iter().map(|t| t.0 as usize + 1).max().unwrap_or(0)];
+    for (s, _, w, _) in &have {
+        widths[*s as usize] = *w;
+    }
+    Ok(Some(widths))
+}
+
+/// The graph's metadata and inputs / outputs checked against `want` (phase 0a's "For phase 0b" point 1; zero-onnx/2:
+/// its more inputs and the output `refused`, zero-core docs/az.md 46).
 fn check_graph(s: &Session, meta: &[(String, String)], path: &Path, want: &Expect) -> Result<(usize, usize), String> {
     let get = |k: &str| meta.iter().find(|e| e.0 == k).map(|e| e.1.as_str());
-    let num = |k: &str| -> Result<usize, String> { get(k).ok_or_else(|| format!("{}: no metadata {k:?} (not a zero-onnx/1 graph)", path.display()))?.parse().map_err(|_| format!("{}: metadata {k} {:?}", path.display(), get(k))) };
-    if get("zero_onnx") != Some("1") {
-        return Err(format!("{}: zero_onnx {:?}: this worker reads zero-onnx/1", path.display(), get("zero_onnx")));
-    }
+    let num = |k: &str| -> Result<usize, String> { get(k).ok_or_else(|| format!("{}: no metadata {k:?} (not a zero-onnx graph)", path.display()))?.parse().map_err(|_| format!("{}: metadata {k} {:?}", path.display(), get(k))) };
+    let v2 = match get("zero_onnx") {
+        Some("1") => false,
+        Some("2") => true,
+        v => return Err(format!("{}: zero_onnx {v:?}: this worker reads zero-onnx/1 and zero-onnx/2", path.display())),
+    };
     if get("game") != Some(want.game.as_str()) {
         return Err(format!("{}: a network of game {:?}, the job plays {:?}", path.display(), get("game"), want.game));
     }
@@ -778,13 +822,15 @@ fn check_graph(s: &Session, meta: &[(String, String)], path: &Path, want: &Expec
     if want.belief && w != want.aux_width {
         return Err(format!("{}: a seat takes the root's belief but the network has no auxiliary head for the game's targets (aux_width {w}, need {}): HeadMissing", path.display(), want.aux_width));
     }
-    for name in ["x_ptr", "x_idx", "x_val", "n_players", "belief"] {
-        if !s.inputs().iter().any(|i| i.name() == name) {
+    let more: &[&str] = if v2 { &VARLEN_INPUTS } else { &[] };
+    for name in ["x_ptr", "x_idx", "x_val", "n_players", "belief"].iter().chain(more) {
+        if !s.inputs().iter().any(|i| i.name() == *name) {
             return Err(format!("{}: no input {name:?}", path.display()));
         }
     }
-    for name in ["policy", "value", "margin", "aux"] {
-        if !s.outputs().iter().any(|o| o.name() == name) {
+    let outs: &[&str] = if v2 { &["policy", "value", "margin", "aux", "refused"] } else { &["policy", "value", "margin", "aux"] };
+    for name in outs {
+        if !s.outputs().iter().any(|o| o.name() == *name) {
             return Err(format!("{}: no output {name:?}", path.display()));
         }
     }
@@ -808,6 +854,8 @@ pub struct InferenceSession {
     pub meta: Vec<(String, String)>,
     actions: usize,
     aux_w: usize,
+    /// A zero-onnx/2 graph: its tail segments' widths by segment index (`varlen_of`); None: zero-onnx/1.
+    widths: Option<Vec<usize>>,
     /// Calls, rows, seconds in session.run (and the post-processing), per batch durations (ms).
     pub calls: u64,
     pub rows: u64,
@@ -973,6 +1021,10 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
         Ok(x) => x,
         Err(e) => return Tried::Fatal(e),
     };
+    let widths = match varlen_of(&meta, spec.model, &want_graph) {
+        Ok(x) => x,
+        Err(e) => return Tried::Fatal(e),
+    };
     if let Some(r) = reference {
         if let Err(e) = crate::selftest::check_meta(r, &want_graph, &meta) {
             return Tried::Fatal(e);
@@ -994,6 +1046,7 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
         meta,
         actions,
         aux_w,
+        widths,
         calls: 0,
         rows: 0,
         run_s: 0.0,
@@ -1095,15 +1148,46 @@ impl InferenceSession {
         let np: Vec<i64> = idx.iter().map(|&r| b.n_players[r] as i64).collect();
         let bel: Vec<bool> = idx.iter().map(|&r| b.extra[r] == ROW_BELIEF).collect();
         let (actions, aux_w) = (self.actions, self.aux_w);
+        let vr = match &self.widths {
+            Some(w) => Some(varlen_piece(b, idx, w)?),
+            None => None,
+        };
+        let v2 = vr.is_some();
         let s = self.ensure()?;
-        let inputs = ort::inputs![
+        let mut inputs = ort::inputs![
             "x_ptr" => Tensor::from_array((vec![n as i64 + 1], x_ptr)).map_err(oerr)?,
             "x_idx" => Tensor::from_array((vec![nnz as i64], x_idx)).map_err(oerr)?,
             "x_val" => Tensor::from_array((vec![nnz as i64], x_val)).map_err(oerr)?,
             "n_players" => Tensor::from_array((vec![n as i64], np)).map_err(oerr)?,
             "belief" => Tensor::from_array((vec![n as i64], bel)).map_err(oerr)?,
         ];
+        if let Some(v) = vr {
+            // zero-onnx/2 (zero-core docs/az.md 46): the piece's options, tail tokens and overrides, as the driver sent them
+            let len = |k: usize| vec![k as i64];
+            inputs.extend(ort::inputs![
+                "opt_off" => Tensor::from_array((len(v.opt_off.len()), v.opt_off)).map_err(oerr)?,
+                "opt_action" => Tensor::from_array((len(v.opt_action.len()), v.opt_action)).map_err(oerr)?,
+                "t_off" => Tensor::from_array((len(v.t_off.len()), v.t_off)).map_err(oerr)?,
+                "t_seg" => Tensor::from_array((len(v.t_seg.len()), v.t_seg)).map_err(oerr)?,
+                "t_slot" => Tensor::from_array((len(v.t_slot.len()), v.t_slot)).map_err(oerr)?,
+                "t_val" => Tensor::from_array((len(v.t_val.len()), v.t_val)).map_err(oerr)?,
+                "ov_off" => Tensor::from_array((len(v.ov_off.len()), v.ov_off)).map_err(oerr)?,
+                "ov_opt" => Tensor::from_array((len(v.ov_opt.len()), v.ov_opt)).map_err(oerr)?,
+                "ov_tok" => Tensor::from_array((len(v.ov_tok.len()), v.ov_tok)).map_err(oerr)?,
+            ]);
+        }
         let out = s.run(inputs).map_err(oerr)?;
+        if v2 {
+            // (a zero-onnx/2 graph's `refused`: per row the tail tokens / overrides it does not take - torch raises on
+            // them, R5 / R6: never answered)
+            let (shape, data) = out["refused"].try_extract_tensor::<i64>().map_err(oerr)?;
+            if shape.len() != 1 || shape[0] as usize != n {
+                return Err(format!("output refused: shape {shape:?}, want [{n}]"));
+            }
+            if let Some(k) = data.iter().position(|&x| x != 0) {
+                return Err(format!("the network refused {} tail token(s) / pointer override(s) of this batch (first: row {}): not tokens / targets it takes (zero-core docs/az.md 46)", data.iter().sum::<i64>(), idx[k]));
+            }
+        }
         let take = |name: &str, w: usize| -> Result<Vec<f32>, String> {
             let (shape, data) = out[name].try_extract_tensor::<f32>().map_err(oerr)?;
             if shape.len() != 2 || shape[0] as usize != n || shape[1] as usize != w {
@@ -1112,6 +1196,11 @@ impl InferenceSession {
             Ok(data.to_vec())
         };
         Ok((take("policy", actions)?, take("value", MAX_SEATS)?, take("margin", MAX_SEATS)?, take("aux", aux_w)?))
+    }
+
+    /// A zero-onnx/2 graph (zero-core docs/az.md 46).
+    pub fn is_v2(&self) -> bool {
+        self.widths.is_some()
     }
 
     /// The graph's raw outputs for a whole batch, in row order: a batch of more than `chunk` rows (`CHUNK` on the
@@ -1176,6 +1265,66 @@ impl InferenceSession {
         }
         Ok(a)
     }
+}
+
+/// zero-onnx/2's more inputs for rows `idx` of a batch (zero-core docs/az.md 46), each CSR rebased: the options
+/// (`opt_off` i64, `opt_action` i32), the tail tokens (`t_off` i64, `t_seg` i32, `t_slot` i64, `t_val` f32 - each
+/// token's `width(seg)` floats, consecutive, `widths` the graph's) and the overrides (`ov_off` i64, `ov_opt` i32,
+/// `ov_tok` i64). A batch of a game without tail segments (or without overrides) has empty CSRs of B + 1 zeros.
+#[derive(Debug)]
+pub struct VarlenPiece {
+    pub opt_off: Vec<i64>,
+    pub opt_action: Vec<i32>,
+    pub t_off: Vec<i64>,
+    pub t_seg: Vec<i32>,
+    pub t_slot: Vec<i64>,
+    pub t_val: Vec<f32>,
+    pub ov_off: Vec<i64>,
+    pub ov_opt: Vec<i32>,
+    pub ov_tok: Vec<i64>,
+}
+
+pub fn varlen_piece(b: &Batch, idx: &[usize], widths: &[usize]) -> Result<VarlenPiece, String> {
+    let mut v = VarlenPiece { opt_off: vec![0], opt_action: Vec::new(), t_off: vec![0], t_seg: Vec::new(), t_slot: Vec::new(), t_val: Vec::new(), ov_off: vec![0], ov_opt: Vec::new(), ov_tok: Vec::new() };
+    let tails = !b.t_off.is_empty();
+    let ovs = !b.ov_off.is_empty();
+    if (tails && b.t_off.len() != b.b + 1) || (ovs && b.ov_off.len() != b.b + 1) {
+        return Err(format!("a batch of {} rows with {} tail / {} override offsets", b.b, b.t_off.len(), b.ov_off.len()));
+    }
+    // each tail token's first float (its segment's width, the graph's)
+    let mut voff = Vec::with_capacity(b.t_seg.len() + 1);
+    voff.push(0usize);
+    for &s in &b.t_seg {
+        let w = widths.get(s as usize).copied().unwrap_or(0);
+        if w == 0 {
+            return Err(format!("a tail token of segment {s}: not one of the network's tail segments"));
+        }
+        voff.push(voff.last().unwrap() + w);
+    }
+    if *voff.last().unwrap() != b.t_val.len() {
+        return Err(format!("{} tail floats for tail tokens of {}", b.t_val.len(), voff.last().unwrap()));
+    }
+    for &r in idx {
+        let (o0, o1) = (b.opt_off[r] as usize, b.opt_off[r + 1] as usize);
+        v.opt_action.extend_from_slice(&b.opt_action[o0..o1]);
+        v.opt_off.push(v.opt_action.len() as i64);
+        if tails {
+            for j in b.t_off[r] as usize..b.t_off[r + 1] as usize {
+                v.t_seg.push(b.t_seg[j] as i32);
+                v.t_slot.push(b.t_slot[j] as i64);
+                v.t_val.extend_from_slice(&b.t_val[voff[j]..voff[j + 1]]);
+            }
+        }
+        v.t_off.push(v.t_seg.len() as i64);
+        if ovs {
+            for j in b.ov_off[r] as usize..b.ov_off[r + 1] as usize {
+                v.ov_opt.push(b.ov_opt[j]);
+                v.ov_tok.push(b.ov_tok[j]);
+            }
+        }
+        v.ov_off.push(v.ov_opt.len() as i64);
+    }
+    Ok(v)
 }
 
 impl Evaluator for InferenceSession {
@@ -1322,5 +1471,37 @@ mod tests {
                 ("CPUExecutionProvider".to_string(), "Shape (/pack/Shape_1)".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn a_pieces_tails_and_overrides_are_its_rows_rebased() {
+        // 3 rows: row 0 two tail tokens (segment 0, width 3; segment 2, width 1), row 1 none, row 2 one (segment 0);
+        // overrides: row 0 one, row 2 two
+        let mut b = Batch::default();
+        b.b = 3;
+        b.opt_off = vec![0, 2, 3, 6];
+        b.opt_action = vec![10, 11, 12, 13, 14, 15];
+        b.t_off = vec![0, 2, 2, 3];
+        b.t_seg = vec![0, 2, 0];
+        b.t_slot = vec![5, 0, 4_294_967_295];
+        b.t_val = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        b.ov_off = vec![0, 1, 1, 3];
+        b.ov_opt = vec![1, 0, 2];
+        b.ov_tok = vec![-1, (2 << 40) | 7, -1];
+        let widths = vec![3, 0, 1];
+        let v = varlen_piece(&b, &[2, 0], &widths).unwrap();
+        assert_eq!((v.opt_off, v.opt_action), (vec![0, 3, 5], vec![13, 14, 15, 10, 11]));
+        assert_eq!((v.t_off, v.t_seg, v.t_slot), (vec![0, 1, 3], vec![0, 0, 2], vec![4_294_967_295, 5, 0]));
+        assert_eq!(v.t_val, vec![5.0, 6.0, 7.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!((v.ov_off, v.ov_opt, v.ov_tok), (vec![0, 2, 3], vec![0, 2, 1], vec![(2 << 40) | 7, -1, -1]));
+        // a game without tails (empty CSR in the batch): B + 1 zeros
+        let mut c = b.clone();
+        (c.t_off, c.t_seg, c.t_slot, c.t_val) = (vec![], vec![], vec![], vec![]);
+        assert_eq!(varlen_piece(&c, &[1, 2], &widths).unwrap().t_off, vec![0, 0, 0]);
+        // a token of a segment the network has no tail for, and floats that do not fit the tokens
+        assert!(varlen_piece(&b, &[0], &[3, 0, 0]).unwrap_err().contains("segment 2"));
+        let mut d = b.clone();
+        d.t_val.pop();
+        assert!(varlen_piece(&d, &[0], &widths).is_err());
     }
 }

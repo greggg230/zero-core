@@ -24,16 +24,6 @@ use zero_search::settings::{driver_cfg, DriverArgs};
 use crate::pyjson::PyJson;
 
 pub const BELIEF_CLIP: f64 = 20.0;
-
-/// A game with variable-length rows (docs/search.md 2.15: tail tokens, pointer overrides) is refused: this
-/// worker's graphs (zero-onnx/1) and shards carry the fixed-width head only, and a row's tail must never be
-/// dropped in silence.
-pub fn refuse_varlen(info: &GameInfo) -> Result<(), String> {
-    if info.tails.is_empty() && !info.option_pointers {
-        return Ok(());
-    }
-    Err(format!("{}: variable-length rows (tail tokens / pointer overrides, docs/search.md 2.15): unsupported by this worker build", info.name))
-}
 pub const VALUE_CHOICE_MAX_WORLDS: f64 = 1024.0;
 
 /// A run's settings (`config.json`): a JSON object, keys in file order.
@@ -692,7 +682,6 @@ pub fn eval_spec_of(c: &Settings) -> Result<String, String> {
 /// [`eval_lease_cfg`] does.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_driver_cfg(c: &Settings, info: &GameInfo, seats: &[EvalSeat], games: u64, seed: u64, paired: bool, conc: Option<usize>, threads: Option<usize>, groups: Option<usize>) -> Result<DriverCfg, String> {
-    refuse_varlen(info)?;
     if seats.len() != 2 {
         return Err(format!("an eval job has 2 seats (got {}): a match of two players, seats swapped between games", seats.len()));
     }
@@ -762,7 +751,6 @@ pub fn eval_lease_cfg(mut m: DriverCfg) -> DriverCfg {
 /// `seed`, `net`): rolling, queue_only, recording, the run's player counts. The Python-only features
 /// (the self-play league, branched games, archive starts) refuse: `check-config` lists them.
 pub fn selfplay_driver_cfg(c: &Settings, info: &GameInfo, seed: u64, net: u32) -> Result<DriverCfg, String> {
-    refuse_varlen(info)?;
     if py_float("selfplay_league", c.get_or_falsy("selfplay_league", &PyJson::Int(0)))? > 0.0 {
         return Err("selfplay_league: the self-play league is Python-only (zero/league.py): unsupported by the native worker".into());
     }

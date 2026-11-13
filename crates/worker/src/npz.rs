@@ -125,6 +125,7 @@ impl Arr {
             "<i4" => Ok(self.data.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap()) as i64).collect()),
             "<i2" => Ok(self.data.chunks_exact(2).map(|c| i16::from_le_bytes(c.try_into().unwrap()) as i64).collect()),
             "<u2" => Ok(self.data.chunks_exact(2).map(|c| u16::from_le_bytes(c.try_into().unwrap()) as i64).collect()),
+            "<u4" => Ok(self.data.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as i64).collect()),
             "|i1" => Ok(self.data.iter().map(|&x| x as i8 as i64).collect()),
             "|u1" | "|b1" => Ok(self.data.iter().map(|&x| x as i64).collect()),
             d => Err(format!("dtype {d}: not an integer array")),

@@ -928,8 +928,9 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
     let z = read_npz(Path::new(a.get("--batches").ok_or("--batches")?))?;
     let g = |k: &str| z.get(k).ok_or_else(|| format!("batches: no {k}"));
     let meta: Value = serde_json::from_str(&g("meta")?.text()?).map_err(|e| format!("batches meta: {e}"))?;
-    let (xs_off, xs_idx, xs_val) = (g("xs_off")?.i64s()?, g("xs_idx")?.i64s()?, g("xs_val")?.f32s()?);
-    let (np_, extra, opt_off, opt_action, bo) = (g("n_players")?.i64s()?, g("extra")?.i64s()?, g("opt_off")?.i64s()?, g("opt_action")?.i64s()?, g("batch_off")?.i64s()?);
+    // (the driver's batches as recorded, their tail tokens and overrides included: zero-core docs/az.md 46)
+    let rec = crate::selftest::read_batches(&z, &meta, "batches")?;
+    let extra: Vec<u8> = rec.batches.iter().flat_map(|b| b.extra.iter().copied()).collect();
     // the graph's own metadata as the expectation (the gate compares answers, not the game); GPU providers
     // need the network's reference set (--reference)
     let reference = a.get("--reference").map(PathBuf::from);
@@ -940,22 +941,9 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
     let (mut pri, mut val, mut mar, mut aux) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut secs = Vec::new();
     for rep in 0..reps {
-        for k in 0..bo.len() - 1 {
-            let (r0, r1) = (bo[k] as usize, bo[k + 1] as usize);
-            let mut b = zero_search::driver::Batch::default();
-            b.id = k as u64;
-            b.b = r1 - r0;
-            b.xs_off = xs_off[r0..=r1].iter().map(|&x| x - xs_off[r0]).collect();
-            b.xs_idx = xs_idx[xs_off[r0] as usize..xs_off[r1] as usize].iter().map(|&x| x as u32).collect();
-            b.xs_val = xs_val[xs_off[r0] as usize..xs_off[r1] as usize].to_vec();
-            b.n_players = np_[r0..r1].iter().map(|&x| x as i32).collect();
-            b.opt_off = opt_off[r0..=r1].iter().map(|&x| (x - opt_off[r0]) as i32).collect();
-            b.opt_action = opt_action[opt_off[r0] as usize..opt_off[r1] as usize].iter().map(|&x| x as i32).collect();
-            b.extra = extra[r0..r1].iter().map(|&x| x as u8).collect();
-            b.player = vec![0; r1 - r0];
-            b.gid = vec![0; r1 - r0];
+        for b in &rec.batches {
             let t0 = Instant::now();
-            let ans = ev.evaluate(&b)?;
+            let ans = ev.evaluate(b)?;
             secs.push(t0.elapsed().as_secs_f64());
             if rep == 0 {
                 pri.extend(ans.priors);
@@ -966,11 +954,11 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
         }
     }
     let f32n = |v: &[f32], shape: Vec<usize>| Npy { descr: "<f4".into(), shape, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-    let rows = *bo.last().unwrap() as usize;
+    let rows = rec.rows;
     let w = if rows > 0 && !aux.is_empty() { aux.len() / extra.iter().filter(|&&e| e == 2).count().max(1) } else { 0 };
-    let info = json!({"model": model.display().to_string(), "ort": ort_version(), "provider": ev.provider().wire(), "selftest": ev.selftest().to_json(), "threads": threads, "batches": bo.len() - 1, "rows": rows, "reps": reps, "seconds": secs, "source": meta});
+    let info = json!({"model": model.display().to_string(), "ort": ort_version(), "provider": ev.provider().wire(), "selftest": ev.selftest().to_json(), "threads": threads, "batches": rec.batches.len(), "rows": rows, "reps": reps, "seconds": secs, "source": meta});
     write_npz(Path::new(a.get("--out").ok_or("--out")?), &[("meta", Npy::unicode(&info.to_string())), ("priors", f32n(&pri, vec![pri.len()])), ("value", f32n(&val, vec![rows, 8])), ("margin", f32n(&mar, vec![rows, 8])), ("aux", f32n(&aux, vec![aux.len() / w.max(1), w]))], 1)?;
-    println!("{}", json!({"batches": bo.len() - 1, "rows": rows, "seconds": secs.iter().sum::<f64>(), "ort": ort_version()}));
+    println!("{}", json!({"batches": rec.batches.len(), "rows": rows, "seconds": secs.iter().sum::<f64>(), "ort": ort_version()}));
     Ok(0)
 }
 

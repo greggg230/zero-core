@@ -1,6 +1,6 @@
 //! Evaluators of the driver's network batches - the evaluator trait, the generic post-processing every
 //! zero-core evaluator does, and the uniform evaluator (`infer.UniformEvaluator`, exact arithmetic: the
-//! plumbing gate's). The ONNX Runtime evaluator of a `zero-onnx/1` graph is `crate::session`'s
+//! plumbing gate's). The ONNX Runtime evaluator of a `zero-onnx/1` or `/2` graph is `crate::session`'s
 //! `InferenceSession` (zero-farm PROTOCOL.md 8: one session factory, any execution provider).
 //!
 //! An ONNX Runtime evaluator answers a sparse batch (`DriverCfg::sparse`): a batch of more than `CHUNK`
@@ -69,7 +69,7 @@ impl Evaluator for Uniform {
     }
 }
 
-/// What a `zero-onnx/1` graph must declare for a run (phase 0a's "For phase 0b" point 1).
+/// What a `zero-onnx/1` or `/2` graph must declare for a run (phase 0a's "For phase 0b" point 1).
 #[derive(Clone, Debug)]
 pub struct Expect {
     pub game: String,
@@ -79,6 +79,25 @@ pub struct Expect {
     /// graph must then answer it: its aux width = the game's).
     pub aux_width: usize,
     pub belief: bool,
+    /// The game's variable-length rows (zero-core docs/search.md 2.15): its tail segments (segment, name, width, head
+    /// slots) and whether its rows carry pointer overrides - a zero-onnx/2 graph must declare the same (docs/az.md 46).
+    pub tails: Vec<(u16, String, usize, usize)>,
+    pub option_pointers: bool,
+}
+
+impl Expect {
+    /// What a network of game `info` must declare (`belief`: a seat takes the root belief).
+    pub fn of(info: &zero_search::dynapi::GameInfo, belief: bool) -> Expect {
+        Expect {
+            game: info.name.to_string(),
+            features: info.num_features,
+            actions: info.num_actions,
+            aux_width: info.aux.iter().map(|a| a.1).sum(),
+            belief,
+            tails: info.tails.iter().map(|t| (t.seg, t.name.to_string(), t.width, t.head)).collect(),
+            option_pointers: info.option_pointers,
+        }
+    }
 }
 
 /// ONNX Runtime's settings for a job's sessions (`crate::session::create_session` builds them).

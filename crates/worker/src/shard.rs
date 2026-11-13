@@ -65,6 +65,9 @@ impl Npy {
     pub fn u16(v: &[u16], shape: Vec<usize>) -> Npy {
         Npy { descr: "<u2".into(), shape, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
     }
+    pub fn u32(v: &[u32], shape: Vec<usize>) -> Npy {
+        Npy { descr: "<u4".into(), shape, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
+    }
     pub fn i32(v: &[i32], shape: Vec<usize>) -> Npy {
         Npy { descr: "<i4".into(), shape, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() }
     }
@@ -157,16 +160,52 @@ pub fn write_npz(path: &Path, members: &[(&str, Npy)], level: u32) -> Result<u64
     Ok(off + central.len() as u64 + end.len() as u64)
 }
 
+/// Shard format v2 of a game with variable-length rows (zero-core data.py `rows_meta`, docs/az.md 43.1): its tail
+/// segments (segment, name, width, head slots), pointer overrides, row limit; the shard's meta keys `t_segs`,
+/// `option_pointers`, `max_row_tokens` and its members `t_ptr` .. `ov_tok`.
+#[derive(Clone, Debug)]
+pub struct RowsFmt {
+    pub tails: Vec<(u16, String, usize, usize)>,
+    pub option_pointers: bool,
+    pub max_row_tokens: Option<usize>,
+}
+
+impl RowsFmt {
+    /// A game's format v2, None for a game without tail segments or pointer overrides (the format of before).
+    pub fn of(info: &zero_search::dynapi::GameInfo) -> Option<RowsFmt> {
+        if info.tails.is_empty() && !info.option_pointers {
+            return None;
+        }
+        Some(RowsFmt { tails: info.tails.iter().map(|t| (t.seg, t.name.to_string(), t.width, t.head)).collect(), option_pointers: info.option_pointers, max_row_tokens: info.max_row_tokens })
+    }
+    /// The meta keys of `shard_format(cfg, info)`, in its order.
+    pub fn meta(&self) -> Vec<(&'static str, Value)> {
+        vec![
+            ("t_segs", Value::from(self.tails.iter().map(|(s, n, w, h)| serde_json::json!([s, n, w, h])).collect::<Vec<_>>())),
+            ("option_pointers", Value::from(self.option_pointers)),
+            ("max_row_tokens", self.max_row_tokens.map_or(Value::Null, Value::from)),
+        ]
+    }
+}
+
 /// One finished game's samples.
 pub struct GameSamples {
     pub gid: u32,
     pub records: Vec<Record>,
 }
 
-/// The shard arrays of `games`' samples (data.py's `compact` / `compact_sparse`) -> (members without
-/// meta, meta additions, non-finite problems).
-pub fn shard_arrays(games: &[GameSamples], f: usize, sparse: bool) -> (Vec<(&'static str, Npy)>, Map<String, Value>, Vec<String>) {
+/// The shard arrays of `games`' samples (data.py's `compact` / `compact_sparse`; with `v2`, format v2's members
+/// after them, `compact_rows`) -> (members without meta, meta additions, non-finite problems). Records with tail
+/// tokens or overrides need `v2` (and sparse) - else Err: never dropped in silence (data.py R8).
+#[allow(clippy::type_complexity)]
+pub fn shard_arrays(games: &[GameSamples], f: usize, sparse: bool, v2: Option<&RowsFmt>) -> Result<(Vec<(&'static str, Npy)>, Map<String, Value>, Vec<String>), String> {
     let recs: Vec<&Record> = games.iter().flat_map(|g| g.records.iter()).collect();
+    if v2.is_some() && !sparse {
+        return Err("tail tokens / pointer overrides need a sparse shard (shard_sparse 1; zero-core docs/az.md 43.1, R8)".into());
+    }
+    if v2.is_none() && recs.iter().any(|r| !r.tail.seg.is_empty() || !r.ov.is_empty()) {
+        return Err("samples with tail tokens / pointer overrides for a shard of format 1: they would be dropped (zero-core data.py R8)".into());
+    }
     let n = recs.len();
     let mut out: Vec<(&'static str, Npy)> = Vec::new();
     let mut extra = Map::new();
@@ -191,7 +230,7 @@ pub fn shard_arrays(games: &[GameSamples], f: usize, sparse: bool) -> (Vec<(&'st
             let row = ptr.partition_point(|&p| p <= k as i64) - 1;
             probs.push(format!("x: non-finite value at row {row}, column {}", idx[k]));
         }
-        extra.insert("x_version".into(), Value::from(1));
+        extra.insert("x_version".into(), Value::from(if v2.is_some() { 2 } else { 1 }));
         extra.insert("x_cols".into(), Value::from(f));
         extra.insert("x_nnz".into(), Value::from(val.len()));
         let nnz = val.len();
@@ -253,7 +292,40 @@ pub fn shard_arrays(games: &[GameSamples], f: usize, sparse: bool) -> (Vec<(&'st
         }
         out.push(("aux", Npy::f16(&v, vec![n, aw])));
     }
-    (out, extra, probs)
+    if let Some(fmt) = v2 {
+        // format v2 (data.py `compact_rows`): t_ptr int64 [N+1], t_seg uint16, t_slot uint32, t_val float16 (each
+        // token's floats), ov_ptr int64 [N+1], ov_opt int32, ov_tok int64 - empty CSRs for the kind the game lacks
+        let (mut tp, mut ts, mut tl, mut tv) = (vec![0i64], Vec::new(), Vec::new(), Vec::new());
+        let (mut op, mut oo, mut ot) = (vec![0i64], Vec::new(), Vec::new());
+        for r in &recs {
+            if !fmt.tails.is_empty() {
+                ts.extend_from_slice(&r.tail.seg);
+                tl.extend_from_slice(&r.tail.slot);
+                tv.extend(r.tail.val.iter().map(|&x| f16::from_f32(x)));
+            } else if !r.tail.seg.is_empty() {
+                return Err("samples with tail tokens for a game without tail segments".into());
+            }
+            tp.push(ts.len() as i64);
+            if fmt.option_pointers {
+                oo.extend(r.ov.iter().map(|o| o.0 as i32));
+                ot.extend(r.ov.iter().map(|o| o.1));
+            } else if !r.ov.is_empty() {
+                return Err("samples with pointer overrides for a game without them".into());
+            }
+            op.push(oo.len() as i64);
+        }
+        if let Some(k) = bad(&tv) {
+            probs.push(format!("t_val: non-finite tail float {k}"));
+        }
+        out.push(("t_ptr", Npy::i64(&tp, vec![n + 1])));
+        out.push(("t_seg", Npy::u16(&ts, vec![ts.len()])));
+        out.push(("t_slot", Npy::u32(&tl, vec![tl.len()])));
+        out.push(("t_val", Npy::f16(&tv, vec![tv.len()])));
+        out.push(("ov_ptr", Npy::i64(&op, vec![n + 1])));
+        out.push(("ov_opt", Npy::i32(&oo, vec![oo.len()])));
+        out.push(("ov_tok", Npy::i64(&ot, vec![ot.len()])));
+    }
+    Ok((out, extra, probs))
 }
 
 /// A written shard.
@@ -278,6 +350,8 @@ pub struct ShardWriter {
     sparse: bool,
     features: usize,
     level: u32,
+    /// Format v2 (a game with variable-length rows), None: the format of before.
+    v2: Option<RowsFmt>,
     buf: Vec<GameSamples>,
     nbuf: usize,
     /// Games added since the last shard that had no samples (counted with the next shard).
@@ -287,9 +361,14 @@ pub struct ShardWriter {
 }
 
 impl ShardWriter {
-    pub fn new(dir: &Path, prefix: &str, rows: usize, meta: Map<String, Value>, sparse: bool, features: usize, level: u32) -> Result<ShardWriter, String> {
+    /// `v2`: format v2 for a game with variable-length rows (`RowsFmt::of`; refused with dense shards, R8).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(dir: &Path, prefix: &str, rows: usize, meta: Map<String, Value>, sparse: bool, features: usize, level: u32, v2: Option<RowsFmt>) -> Result<ShardWriter, String> {
+        if v2.is_some() && !sparse {
+            return Err("a game with tail tokens / pointer overrides: its shards are sparse only (shard_sparse 1; zero-core docs/az.md 43.1, R8)".into());
+        }
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        Ok(ShardWriter { dir: dir.to_path_buf(), prefix: prefix.to_string(), rows: rows.max(1), meta, sparse, features, level, buf: Vec::new(), nbuf: 0, empty_games: Vec::new(), seq: 0, written: Vec::new() })
+        Ok(ShardWriter { dir: dir.to_path_buf(), prefix: prefix.to_string(), rows: rows.max(1), meta, sparse, features, level, v2, buf: Vec::new(), nbuf: 0, empty_games: Vec::new(), seq: 0, written: Vec::new() })
     }
 
     /// A finished game's samples (data.py `ShardWriter.add`: a shard at `rows` samples) -> the shard
@@ -313,11 +392,17 @@ impl ShardWriter {
         }
         let games = std::mem::take(&mut self.buf);
         self.nbuf = 0;
-        let (arrays, extra, probs) = shard_arrays(&games, self.features, self.sparse);
+        let (arrays, extra, probs) = shard_arrays(&games, self.features, self.sparse, self.v2.as_ref())?;
         let rows: usize = games.iter().map(|g| g.records.len()).sum();
         let mut meta = self.meta.clone();
         if self.sparse {
             meta.insert("x_format".into(), Value::String("sparse".into()));
+        }
+        if let Some(fmt) = &self.v2 {
+            // (`shard_format(cfg, info)`'s keys after x_format)
+            for (k, v) in fmt.meta() {
+                meta.insert(k.into(), v);
+            }
         }
         meta.insert("rows".into(), Value::from(rows));
         meta.extend(extra);

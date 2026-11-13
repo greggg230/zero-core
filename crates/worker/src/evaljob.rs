@@ -356,7 +356,7 @@ impl EvalRun<'_> {
 /// with its `gen`; a failure ends the job before any game), keyed to the driver's keys.
 fn build_evaluators(game: &GameEntry, job: &EvalJob, keys: &[(String, KeyKind)], belief: bool, sink: &dyn Sink, progress: &Mutex<Progress>) -> Result<ByKey, String> {
     let info = (game.info)();
-    let want = Expect { game: info.name.to_string(), features: info.num_features, actions: info.num_actions, aux_width: info.aux.iter().map(|a| a.1).sum(), belief };
+    let want = Expect::of(&info, belief);
     let mut evs: Vec<(u32, Box<dyn Evaluator>)> = Vec::new();
     let mut worst: Option<f64> = None;
     for (gen, m) in &job.models {
@@ -458,7 +458,7 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
         r.write_file(rest)
     })();
     let rec_res = match (&r.recorder, &res) {
-        (Some(rc), Ok(())) => rc.write(&json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker eval"})),
+        (Some(rc), Ok(())) => rc.write(&json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker eval"}), &info),
         _ => Ok(()),
     };
     r.snapshot();

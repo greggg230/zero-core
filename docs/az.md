@@ -6857,3 +6857,54 @@ and its refusal. `tests/test_onnx.py` (17, zero-onnx/1) unchanged and passing.
   5.5e-6, margin 7.2e-7; its override rows 1.0e-6. Every output over all 800 batches (whole and in 64-row pieces) hashed
   in two processes: bit for bit the same. The reference set (256 rows of 3 batches: 189 rows with 386 tail tokens, 2 with
   8 overrides): ORT within 1.9e-6 of torch. Export 51-55 s; the graph 17.6 MB.
+
+### 46.5 The native worker (`zero_worker`, docs/az.md 44)
+
+* **zero-onnx/1 and /2.** A worker build declares `zero_onnx: [1, 2]` (the manifest, `info`, the hello). A graph's
+  metadata says which (`session::check_graph`: zero-onnx/2's more inputs and the output `refused`), and
+  `session::varlen_of` checks a zero-onnx/2 graph's `tails` / `option_pointers` against the game's (`Expect::tails`,
+  `option_pointers`, from its `GameInfo`); a game with tail segments or pointer overrides refuses a zero-onnx/1 graph.
+* **Feeding it.** Each piece of a batch (the CPU's 64 rows by non-zero count, a GPU's whole batch) gets its rows'
+  options, tail tokens and overrides rebased (`session::varlen_piece`: each token's floats by the graph's widths; a
+  token of a segment the graph has no tail for, or floats that do not fit, is an error), the driver's arrays as they
+  are (u16 / u32 widened). A nonzero `refused` is the batch's error (the job's end, as any evaluator error): never an
+  answer torch would not give.
+* **The self-test and eval-batches** read a file's tail tokens and overrides (`selftest::read_batches`, one reader for
+  both: the meta's `t_segs` for the widths); the recorder (`--record-batches`) keeps them (tools/onnx_record.py's
+  arrays, the meta's `t_segs`, `option_pointers`).
+* **Shards: format v2** for a game with tail segments or pointer overrides (`shard::RowsFmt`, data.py's `rows_meta`):
+  sparse only (a dense shard is refused, R8), `x_version` 2, the meta's `t_segs` / `option_pointers` /
+  `max_row_tokens` after `x_format`, the members `t_ptr` int64, `t_seg` uint16, `t_slot` uint32, `t_val` float16,
+  `ov_ptr` int64, `ov_opt` int32, `ov_tok` int64 after `aux` (empty CSRs for the kind the game lacks), the tail floats
+  through the non-finite check; samples with tails or overrides for a shard of format 1 are refused. Records need no
+  change (the trainer's replay rebuilds the rows, 45.6); a game aborted at the row limit - the driver's own abort,
+  `max_row_tokens` (the game's: a worker never lowers it) - is recorded with its `abort_reason`, as a Python remote
+  worker's driver aborts it.
+* The step-1 guard (`settings::refuse_varlen`) is gone.
+
+### 46.6 Tests and checks; measured (the worker)
+
+**Tests.** `cargo test -p zero_worker`: 24 unit (`a_pieces_tails_and_overrides_are_its_rows_rebased`), 5 eval-job, 6 job
+(`records_replay_to_the_shards_rows_bit_for_bit` unchanged), and `tests/job_tail.rs` (3: toy_tail's shards are format v2
+- x_version 2, the meta's keys, the members' dtypes - and the records replay into exactly those arrays, tail tokens and
+overrides included; games aborted at the row limit are recorded with their `abort_reason` and replay as aborted, no
+shard; a dense shard of tail rows refused). `examples/zw_toy.rs`: the core's toy games as a worker binary.
+
+**Measured** (2026-11-13, the desktop):
+
+* *Gate 2 (a) on toy_tail* (`tools/worker_parity.py --package zero`, the native `zw_toy` against `remoteplay.Worker`,
+  24 games, groups 1): with the uniform evaluator the shards (273 rows) and the first 162 batches identical; with a
+  toy_tail checkpoint's zero-onnx/2 graph on both sides (the native worker through the CPU runtime pack's ONNX Runtime
+  1.31.1, Python through onnxruntime) the format v2 shards (272 rows, 3,353 tail tokens, 826 overrides) byte for byte
+  identical and the first 161 batches (of 3,289 rows with 40,425 tail tokens and 10,054 overrides) identical.
+* *The self-test on real v7 rows* (`zw_probe probe-providers` with the v7 graph and its reference set, Windows ML's
+  ONNX Runtime 1.28.3): the CPU passes, max abs 2.1e-6 against torch, twice bit-identical. **DirectML (the Intel UHD
+  770) is refused by the self-test**: the graph's `refused` is nonzero (63 in the first reference batch) and the
+  answers off by up to 0.29. Placement (onnxruntime-directml 1.24.4's verbose log): 1,866 nodes on DirectML, 53 on the
+  CPU (ScatterElements 10, Reshape 8, Add 8, Mod 7, Squeeze 6, Equal 3, Mul 2, Div 2, Concat 2, Cast 2, Sub, Log, Gather).
+  The cause, measured on the toy's debug graph: DirectML computes int64 in 32 bits - a packed override token (segment
+  at bit 40) and any value past 2^31 come out wrong (Where, Less, Mul on int64), so every override of a v7 row (its
+  segments are 2 and up) is misread. The worker then plays on the CPU (the factory's fallback). Not changed here: a
+  graph DirectML could run would take the override tokens as int32 fields (or keep the integer work off DirectML) - an
+  interface change for the owner to decide (zero-farm's GPU work); CUDA computes int64 natively (not measured: the
+  desktop's GPU belongs to the live run).

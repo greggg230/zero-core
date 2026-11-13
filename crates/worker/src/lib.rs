@@ -5,7 +5,7 @@
 //! fn main() { std::process::exit(zero_worker::main(GAMES, "mtg")) }
 //! ```
 //!
-//! It plays self-play jobs of any run's settings with a `zero-onnx/1` network through ONNX Runtime on
+//! It plays self-play jobs of any run's settings with a `zero-onnx/1` or `/2` network (docs/az.md 41, 46) through ONNX Runtime on
 //! the CPU (no Python, no torch) and writes zero-core's sample shards. Game-agnostic: everything here
 //! is zero_search plus ONNX Runtime; the game crate only registers its `SearchGame` types.
 //!
@@ -61,7 +61,7 @@ impl GameEntry {
 
 /// The protocol version this crate speaks (zero-farm PROTOCOL.md 5) and the network files it reads.
 pub const AW: u32 = 1;
-pub const ZERO_ONNX: &[u32] = &[1];
+pub const ZERO_ONNX: &[u32] = &[1, 2];
 
 /// What a worker binary runs: its games' self-play and eval jobs, and its game's fuzz loops.
 pub struct Worker {

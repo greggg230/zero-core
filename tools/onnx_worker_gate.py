@@ -41,7 +41,7 @@ def main():
     from zero.infer import NetEvaluator
     from zero.net import load
     from zero.onnx_eval import OnnxEvaluator
-    from zero.onnx_parity import Rows
+    from zero.onnx_parity import Rows, model_tail_kw
     os.makedirs(a.out, exist_ok=True)
     ort_py = OnnxEvaluator(a.onnx, threads=a.threads)
     model, _ = load(a.checkpoint, 'cpu', game=ort_py.meta['game'])
@@ -63,7 +63,7 @@ def main():
         for b in range(len(bo) - 1):
             sub = rows.take(np.arange(bo[b], bo[b + 1]))
             r = ort_py.answer_rows(sub)
-            t = tev.evaluate(sub.dense(), sub.n_players, sub.opt_off, sub.opt_action, sub.extra)
+            t = tev.evaluate(sub.dense(), sub.n_players, sub.opt_off, sub.opt_action, sub.extra, **model_tail_kw(model, sub))
             for d, x in ((py, r), (th, t)):
                 for i, k in enumerate(keys):
                     if i < len(x):
