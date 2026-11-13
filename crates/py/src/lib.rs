@@ -664,6 +664,20 @@ impl PyGame {
     fn can_concede(&self) -> bool {
         self.g.can_concede()
     }
+    /// Observable answers (docs/search.md 3.18): `SearchGame::ANSWERS`.
+    #[getter]
+    fn answers(&self) -> bool {
+        self.g.answers()
+    }
+    /// The pending decision's class (`tree::tag_of`; 0 without `answers`).
+    #[getter]
+    fn decision_tag(&self) -> u16 {
+        self.g.decision_tag()
+    }
+    /// How `viewer` observes chance key `key` (`SearchGame::key_obs`): 'plain', 'answer' or 'opaque'.
+    fn key_obs(&self, key: u64, viewer: usize) -> &'static str {
+        self.g.key_obs(key, viewer)
+    }
     /// A Rust search tree for the pending decision.
     #[pyo3(signature = (redet=true, seed=0))]
     fn search_tree(&self, redet: bool, seed: u64) -> PyResult<PySearchTree> {
@@ -761,6 +775,12 @@ impl PySearchTree {
     }
     fn advance(&mut self, a: u16, key: Vec<u64>, game: &PyGame) -> PyResult<bool> {
         self.t.advance(a, &key, &*game.g).map_err(verr)
+    }
+    /// The driver's reuse after a real move (`Tree::follow`, docs/search.md 3.18): seat `mover` took `a` at a decision
+    /// of class `tag`, the transition's keys `key`, the seats it stepped through single options `stepped` (bits),
+    /// `game` the game after it. -> whether the tree survives.
+    fn follow(&mut self, mover: usize, a: u16, tag: u16, key: Vec<u64>, stepped: u32, game: &PyGame) -> PyResult<bool> {
+        self.t.follow(mover, a, tag, &key, stepped, &*game.g).map_err(verr)
     }
     #[getter]
     fn root_acts(&self) -> Vec<u16> {

@@ -299,7 +299,7 @@ impl<G: SearchGame> Tree<G> {
             Some(l) => {
                 let k = self.link_node(l);
                 if on_path(&sc.path, k) {
-                    let a = self.push_node(&sc.key, p, &sc.legal, h);
+                    let a = self.push_node(&sc.key, p, &sc.legal, h, 0);
                     let m = self.merge.as_mut().unwrap();
                     m.links[l as usize].node = a;
                     m.count.aliases += 1;
@@ -316,12 +316,12 @@ impl<G: SearchGame> Tree<G> {
                         k
                     }
                     Some(_) => {
-                        let a = self.push_node(&sc.key, p, &sc.legal, h);
+                        let a = self.push_node(&sc.key, p, &sc.legal, h, 0);
                         self.merge.as_mut().unwrap().count.aliases += 1;
                         a
                     }
                     None => {
-                        let k = self.push_node(&sc.key, p, &sc.legal, h);
+                        let k = self.push_node(&sc.key, p, &sc.legal, h, 0);
                         let m = self.merge.as_mut().unwrap();
                         m.nobs[k as usize] = Some(ok);
                         m.map.insert(ok, k);
@@ -364,7 +364,7 @@ impl<G: SearchGame> Tree<G> {
         if let Some(l) = self.find_link(node, i, key, v, &[], h) {
             return self.link_node(l);
         }
-        let k = self.push_node(key, v, &[], h);
+        let k = self.push_node(key, v, &[], h, 0);
         let si = self.nodes[node as usize].stat_off as usize + i;
         self.push_link(si, key, v, &[], h, k);
         k
@@ -535,10 +535,11 @@ impl<G: SearchGame> Tree<G> {
 
     /// `advance` with the live game after the move (`live`: its next decision is (`player`, `legal`)). A merged tree
     /// (docs/search.md 3.16) finds the new root by the real signature, else by the real observation (`live`'s
-    /// `encode(viewer)`), only for the same viewer, then rebuilds its map (or compacts); otherwise `advance`.
+    /// `encode(viewer)`), only for the same viewer, then rebuilds its map (or compacts); otherwise `advance_tagged`
+    /// (the live decision's class, docs/search.md 3.18).
     pub fn advance_in(&mut self, a: u16, key: &[u64], player: usize, legal: &[u16], live: &G) -> bool {
         if self.merge.is_none() {
-            return self.advance(a, key, player, legal);
+            return self.advance_tagged(a, key, player, legal, tag_of(live));
         }
         let root = self.root;
         if !self.expanded(root) || player != self.viewer {

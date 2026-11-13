@@ -262,6 +262,47 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn can_concede(&self) -> bool {
         true
     }
+    /// **Observable answers** (opt-in; docs/search.md 3.18): the game answers some decisions itself when their seat has
+    /// a single option and keys that answer (MTG Zero's `KEY_AUTO`), and some such answers are observed by the other
+    /// seats exactly as the same answer chosen among several (MTG Zero: a pass of priority). A search node is then
+    /// one world's view of an observation only: in a world where that seat had alternatives the tree holds the
+    /// seat's node, in another its keyed answer. With `ANSWERS` the driver reuses a tree by the observation: across
+    /// such answers of the other seats, asked or answered by the game alike, the new root merges every node the real
+    /// line reaches (`Tree::line_advance`), and a tree is never reused across an answer the observation cannot place
+    /// (`KeyObs::Opaque`). Default false: none of it runs (the reuse of before, bit for bit).
+    const ANSWERS: bool = false;
+    /// The class of the pending decision (MTG Zero: its decision kind): part of a search node's signature with
+    /// `ANSWERS` (a node is one class of decision of its decider), and `answer_obs`'s `tag`. Default 0.
+    fn decision_tag(&self) -> u16 {
+        0
+    }
+    /// What every other seat observes of `seat` answering `a` at a decision of class `tag`, when that answer is
+    /// observed alike in every world whatever the seat's alternatives were (MTG Zero: a pass of priority), in the
+    /// form of the chance key the game emits when it makes that answer itself (`key_obs` `Answer`); None (the
+    /// default): not such an answer - a tree is not reused across it.
+    fn answer_obs(seat: usize, tag: u16, a: u16) -> Option<u64> {
+        let _ = (seat, tag, a);
+        None
+    }
+    /// How `viewer` (a tree's root decider) observes the chance key `key` of a real transition (`KeyObs`; default
+    /// `Plain`). Only read with `ANSWERS`.
+    fn key_obs(key: u64, viewer: usize) -> KeyObs {
+        let _ = (key, viewer);
+        KeyObs::Plain
+    }
+}
+
+/// How a tree's viewer observes one chance key of a real transition (`SearchGame::key_obs`, docs/search.md 3.18).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyObs {
+    /// As it is: two worlds share a node only where it is equal.
+    Plain,
+    /// Another seat's answer the game made itself (it had a single option), observed exactly as that seat choosing
+    /// the same answer among several: `SearchGame::answer_obs` of that answer is this key.
+    Answer,
+    /// Another seat's answer the game made itself whose chosen counterpart the observation cannot place (MTG Zero:
+    /// a single option naming a hidden card's slot): a tree is not reused across it.
+    Opaque,
 }
 
 /// What follows a chained game's episode (`SearchGame::next_episode`, docs/search.md 1.3).

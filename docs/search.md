@@ -71,6 +71,10 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn apply_external(&mut self, payload: &str, chance: &mut Vec<u64>) -> Result<(), String> { Err(..) }
     fn bot_names() -> &'static [&'static str] { &[] }               // built-in bots ('random' is generic)
     fn make_bot(spec: &Self::Spec, name: &str, seed: u64) -> Option<Box<dyn Bot<Self>>> { None }
+    const ANSWERS: bool = false;                                    // observable answers: reuse by the observation (3.18)
+    fn decision_tag(&self) -> u16 { 0 }                             // the decision's class (with ANSWERS: in the signature)
+    fn answer_obs(seat: usize, tag: u16, a: u16) -> Option<u64> { None } // an answer observed alike, forced or chosen
+    fn key_obs(key: u64, viewer: usize) -> KeyObs { KeyObs::Plain } // Plain / Answer / Opaque
 }
 pub trait Bot<G>: Send { fn choose(&mut self, g: &G, legal: &[u16]) -> u16; }
 ```
@@ -106,6 +110,9 @@ Changes from the original sketch (Caverna Zero DESIGN.md 5), and why:
   core's `toy_team`) are unaffected: the golden records are unchanged, and a single-game run
   (toy-smoke, rolling and classic, with margin_w / chance_k / cq) produces the same metrics,
   checkpoints, optimizer state and sample shards byte for byte as zero-core 681ba8d.
+* `ANSWERS`, `decision_tag`, `answer_obs`, `key_obs` (2026-11-12, MTG Zero's Fable review: section 3.18): a game
+  that answers single-option decisions itself and keys them reuses trees by the observation. Games that do not
+  implement them (every game but MTG Zero) are unaffected: every class 0, the reuse of before.
 * `bot_names` / `make_bot`: game-specific built-in bots (the toy heuristic; Glass Road could
   add a Rust port of the JS bot later, Glass Road Zero DESIGN.md 6).
 * NUM_ACTIONS / NUM_FEATURES / players stay associated constants (one Rust type per game; the
@@ -714,7 +721,10 @@ match, remote self-play (the shared quota; an older worker refused by its hello)
   the seat's move rule (section 3.3; the default argmax (N, P0) with the first maximum on
   ties); tree reuse: after a real move the tree
   survives only for the seat that moved, if it decides again next, with `redet`, and if the
-  child for (action, real chance key, next decision) exists.
+  child for (action, real chance key, next decision) exists. A game with observable answers
+  (`SearchGame::ANSWERS`, section 3.18) reuses by the observation instead: a tree follows its real
+  line across the other seats' answers observed alike in every world (forced or chosen), and its
+  new root merges every node that line reaches.
 * **Value target** (training): `(1 - q) z + q q_root`, `q = value_q * min(1, iter /
   value_q_warmup)`.
 * **Policy target** of a recorded decision: the seat's `policy_target` (section 3.1).
@@ -1932,6 +1942,104 @@ Code: `game.rs` (`SearchGame::value_choice`), `driver.rs` (`NnSeat::value_choice
 `value_choice_rows`), `driver/worker.rs` (`value_choice_step`), the bindings (seat keys, stats); Python `games.nn_seat`,
 `mcts.check_value_choice` / `value_choice_tag`, `run.py` (the four settings, `value_choice_keys`), `elo.eval_tag`,
 `h2h.py` (`run_rule`, `_tag`), `remoteplay.py` (`_value_choice_of`, the hello guard).
+
+### 3.18 Observable answers: tree reuse by the observation (`SearchGame::ANSWERS`; MTG Zero's Fable review, 2026-11-12)
+
+**Why.** A game may answer a decision itself when its seat has a single option and key that answer (MTG Zero's
+`auto_single` and `KEY_AUTO`, its ENGINE.md 10): the next node's signature has to show it, because whether the seat had
+an alternative can depend on its hidden cards (no castable instant in its hand). In a world where that seat has
+alternatives the tree holds the seat's node instead; when it answers the same, the viewer's next decision sits under
+that node's option. One observation of the viewer - "the other seat passed" - is several nodes of the tree. The reuse
+of before (section 3: the child for the real action, the real key and the next decision) took the live key's child
+alone: only the worlds where the other seat had no alternative, a fact of its hidden cards the viewer does not have.
+Fable's review of MTG Zero measured it (its hidden.md, follow-up "auto_single"): at live transitions where the
+opponent's priority was answered by the engine and the mover decided again, 3.6% (cube) and 5.6% (the Delver mirror)
+of the mover's worlds would have asked the opponent instead, and the reused subtree held none of them - a bias toward
+"the opponent has nothing" in the positions where open mana matters. And when the real opponent was asked and passed,
+the tree was dropped: whether a tree was reused at all depended on the opponent's hidden hand.
+
+**What it does.** A game opts in with `const ANSWERS: bool = true` and three hooks:
+
+* `decision_tag(&self) -> u16`: the pending decision's class (MTG Zero: its decision kind; a controlled turn's, the
+  deck choice's and sideboarding's apart). With `ANSWERS` it is part of every node's signature (`Node::tag`,
+  `tree::tag_of`; compared exactly, not hashed): a node is one class of decision of its decider. Without, every tag is
+  0 - every signature of before.
+* `answer_obs(seat, tag, a) -> Option<u64>`: what every other seat observes of `seat` answering `a` at a decision of
+  class `tag`, when that answer is observed alike in every world whatever the seat's alternatives were, in the form of
+  the key the game emits when it makes that answer itself. MTG Zero: a pass of priority, `KEY_AUTO(seat, Priority,
+  PASS)`; everything else None.
+* `key_obs(key, viewer) -> KeyObs`: how a tree's viewer observes a chance key of a real transition: `Plain` (as it
+  is), `Answer` (another seat's answer the game made itself, observed alike when chosen: `answer_obs` gives this very
+  key), `Opaque` (another seat's forced answer whose chosen counterpart the observation cannot place - MTG Zero: any
+  other single option it was given, e.g. a choice naming a hidden card's slot).
+
+The driver then reuses trees by the observation (`Tree::follow`, called for every tree after every real move in
+`driver/worker.rs` `apply`, and by zero.play's `PyDriver` through `SearchTree.follow`):
+
+1. **The line.** A tree's seat moves: the line starts (`Tree::line_start`): the root option taken, then the real
+   transition's keys. Another seat moves while the line is in flight: its answer must be observable
+   (`answer_obs(mover, tag_of(before), a)` is Some), the observation joins the line as an answer, then that transition's
+   keys (`line_answer`). Any key `Opaque`, an answer that is not observable, or a seat other than the tree's own stepped
+   through a single option by the transition itself (no key records it: `transition_with`'s `auto` closure collects the
+   seats) ends the line: the tree is dropped. So a tree now survives the other seats' decisions while each is an
+   observable answer (a pass), asked or forced alike - the reuse decision depends on the observation only.
+2. **The new root.** The tree's seat decides again (`line_advance(player, legal, tag)`): `line_nodes` walks from the root
+   option through every child whose key is the line's next entries; a child that ends the line and is the viewer's
+   decision of that signature (options, class) is found; a child that stops where the line holds an answer, decided by
+   another seat, is passed through each of its options whose `answer_obs` is that answer. An answer the game made
+   itself is a plain entry of the child's key there (that world had the single option); one the seat chose is that
+   seat's node and option. Every found node ends the line, so none lies on another's path.
+3. **The merge.** The first found node (in the tree's child order) becomes the root and absorbs the others
+   (`Tree::absorb`, iterative): visits N and value sums W per option, `tot`, `wsum` and the sampled outcomes add up, and
+   each child of the absorbed node joins the root's edge or is absorbed into its twin there (the same signature), down
+   the whole subtree. The kept node's network values (P, P0, `vec`) stay: the network's for one world of the same
+   observation (the viewer's encoding is the same in all of them). An unexpanded node takes the other's expansion; a
+   deferred terminal keeps its one evaluation.
+
+**The weight.** Every world of the observation keeps the walks it had: the merged root holds exactly the walks of the
+old search through the real move whose own path observed the real line - the forced-answer worlds' and, through the
+other seat's node, the chosen ones' in the share the search's own choice at that node gave them. That is the weighting
+any surviving subtree carries (the old search's posterior under its own model of the other seat), now with no world of
+the observation left out; new simulations are dealt by `determinize` as at any reused root. Within a search nothing
+changes (the nodes, the walks, the signatures - but the class, which splits only worlds whose decisions of the same
+options differ in class).
+
+**Off by default.** `ANSWERS` false (every game but MTG Zero): `tag_of` is 0, `follow` is the reuse of before
+(`advance_in` for the mover's tree when it decides again), the line is never started - the trees and games of before,
+bit for bit (the golden digests: `infoset_merge_off_changes_nothing`, `golden_selfplay`, every toy test). A merged tree
+(3.16) keeps its own reuse by the observation (`advance_in`); it ignores classes. The Python reference tree
+(`mcts.py`, `PySearch`) has no observable answers: for a game with them it is never reused across another seat's answer
+(`PySearch.follow`: a key the viewer observes as one, or a seat stepped through) - less reuse, no world left out.
+
+**Costs.** One `decision_tag` per node reached by a walk (MTG Zero: a field read). Per real move and tree: the line's
+entries (a few keys) and, when its seat decides again, a walk of the edge's children (the line's answers fan out
+through the other seat's option lists) and the merge - linear in the merged subtrees, once per reuse. Trees in flight
+are held while the other seats decide (one more tree per slot at most).
+
+**Tests.** Rust: `tree::tests::line_reuse_merges_the_forced_and_the_chosen_answer` (`counter_game::CounterAuto`: the
+counter game with seat 1's lone ALLOW answered and keyed by the game; the walks of the forced child and of every seat-1
+node's ALLOW counted from the tree's edges; the reuse of before held the forced ones only, the line all of them, the
+merged root's visits the sums; a real seat 1 that held a counter and allowed gives the same root bit for bit;
+compaction keeps it; the search goes on from it), `line_reuse_refuses_what_it_cannot_place` (an opaque forced answer,
+another class or decider, not a root option: the tree as it was), `without_answers_the_line_is_the_reuse_of_before`
+(the plain counter game: line = `advance`, bit for bit), `driver::tests::observable_answers_reuse_trees_by_the_observation`
+(CounterAuto matches through the driver: complete, the same across thread counts, fewer leaves than with the forced
+answer opaque - the reused roots' evaluations saved). MTG Zero: `engine/tests/autopass_reuse.rs` (its ENGINE.md 149).
+
+**Measured** (the desktop, 2026-11-13, MTG Zero's `engine/tests/autopass_reuse.rs`, its ENGINE.md 149.3: 30 games per
+pool of heuristic play, the mover's search through the real move at every live transition after the other player's
+pass, each walk's observation generated from its own path against the walks the reused root holds). Forced passes:
+cube 2,585 transitions, 339,433 walks observed the line, the reuse of before held 98.9% of them, the line 100% (at every
+transition); the Delver mirror 3,063 transitions, 379,724 walks, 98.1% before, 100% after. Asked-and-passed (before:
+the tree dropped): 1,630 / 1,927 transitions, every walk of the line reused. The line and merge cost 2.6 us a transition
+(the old lookup 0.5 us); the Delver search smoke (2.2 million simulations with a uniform evaluator) ran at the same
+38-42 us a simulation before and after.
+
+Code: `game.rs` (`ANSWERS`, `decision_tag`, `answer_obs`, `key_obs`, `KeyObs`), `tree.rs` (`Node::tag`, `tag_of`,
+`advance_tagged`, `follow`, `line_start` / `line_answer` / `line_advance` / `line_reach`, `line_nodes`, `absorb`,
+`tag`, `key_of`), `tree/merge.rs` (`advance_in` with the class), `driver/worker.rs` (`apply`), `counter_game.rs`
+(`CounterAuto`), `dynapi.rs` / `crates/py` (`Game.answers`, `decision_tag`, `key_obs`, `SearchTree.follow`), Python
+`mcts.transition(seats=)`, `play.PyDriver._apply`, `PySearch.follow`, `RsSearch.follow`.
 
 ## 4. Bindings and registering a game
 

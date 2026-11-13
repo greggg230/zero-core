@@ -2,7 +2,7 @@
 //! assembly, finished games and training records.
 use super::*;
 use crate::lookahead::{Answers, Outcome, RowSink, Step as LookStep};
-use crate::tree::{leaf_values_team, transition_with, Scratch as SimScratch, Sim, Walk};
+use crate::tree::{leaf_values_team, tag_of, transition_with, Scratch as SimScratch, Sim, Walk};
 
 struct WScratch<G: SearchGame> {
     game: Option<G>,
@@ -1366,16 +1366,29 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
         // (the move log, a diagnostic: every caller has the decision's legal actions in slot.legal)
         slot.moves.push((p as u8, a, slot.legal.clone()));
     }
-    transition_with(g, a, None, key, &mut slot.legal, |q| !is_external(cfg, gid, q)).map_err(|e| format!("move {a} failed: {e}"))?;
+    // (observable answers, docs/search.md 3.18: the mover's decision class, and the seats the transition stepped
+    // through single options itself - no key records those)
+    let tag = tag_of(&*g);
+    let stepped = std::cell::Cell::new(0u32);
+    transition_with(g, a, None, key, &mut slot.legal, |q| {
+        let auto = !is_external(cfg, gid, q);
+        if auto {
+            stepped.set(stepped.get() | 1 << q);
+        }
+        auto
+    })
+    .map_err(|e| format!("move {a} failed: {e}"))?;
+    let stepped = stepped.get();
     slot.legal_ok = true;
     slot.steps += 1;
     slot.look_mcts = false;
     slot.look_guard = None;
     let nxt = g.to_move();
     for q in 0..slot.n {
-        // (a merged tree finds the next root by the real observation too: `Tree::advance_in`, docs/search.md 3.16)
+        // (a merged tree finds the next root by the real observation too: `Tree::advance_in`, docs/search.md 3.16; a
+        // game with observable answers follows each tree's real line, 3.18: `Tree::follow`)
         let keep = match (slot.trees[q].as_mut(), nxt) {
-            (Some(t), Some(np)) => q == p && np == p && t.redet && t.advance_in(a, key, np, &slot.legal, slot.game.as_ref().unwrap()),
+            (Some(t), Some(_)) => t.follow(p, a, tag, key, stepped, slot.game.as_ref().unwrap(), &slot.legal),
             _ => false,
         };
         if !keep {

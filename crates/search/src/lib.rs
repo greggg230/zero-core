@@ -40,6 +40,6 @@ pub(crate) mod peek_game;
 #[cfg(test)]
 pub(crate) mod counter_game;
 
-pub use game::{belief_weight, team_of, Belief, Bot, Next, SearchGame, MAX_SEATS};
+pub use game::{belief_weight, team_of, Belief, Bot, KeyObs, Next, SearchGame, MAX_SEATS};
 pub use tail::{pack_tok, unpack_tok, TailBuf, TailRow, TailSeg};
 pub use rng::Rng;

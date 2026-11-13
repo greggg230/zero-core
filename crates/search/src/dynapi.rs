@@ -90,6 +90,11 @@ pub trait DynGame: Send + Sync {
     #[allow(clippy::type_complexity)]
     fn next_episode(&self, conceded: Option<usize>) -> Result<(Option<Box<dyn DynGame>>, Option<Vec<f32>>), String>;
     fn can_concede(&self) -> bool;
+    /// Observable answers (docs/search.md 3.18): `SearchGame::ANSWERS`, the pending decision's class (`tree::tag_of`),
+    /// and how `viewer` observes a chance key (`SearchGame::key_obs`: 'plain', 'answer' or 'opaque').
+    fn answers(&self) -> bool;
+    fn decision_tag(&self) -> u16;
+    fn key_obs(&self, key: u64, viewer: usize) -> &'static str;
     /// A search tree for this game's pending decision.
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String>;
     /// The lookahead of this game's pending decision (docs/search.md 3.9; `lookahead::Look::new`):
@@ -233,6 +238,19 @@ impl<G: SearchGame> DynGame for G {
     fn can_concede(&self) -> bool {
         SearchGame::can_concede(self)
     }
+    fn answers(&self) -> bool {
+        G::ANSWERS
+    }
+    fn decision_tag(&self) -> u16 {
+        crate::tree::tag_of(self)
+    }
+    fn key_obs(&self, key: u64, viewer: usize) -> &'static str {
+        match G::key_obs(key, viewer) {
+            crate::game::KeyObs::Plain => "plain",
+            crate::game::KeyObs::Answer => "answer",
+            crate::game::KeyObs::Opaque => "opaque",
+        }
+    }
     fn new_tree(&self, redet: bool, seed: u64) -> Result<Box<dyn DynTree>, String> {
         let viewer = SearchGame::to_move(self).ok_or("the game is over")?;
         let mut rng = Rng::new(seed);
@@ -318,6 +336,10 @@ pub trait DynTree: Send + Sync {
     /// Move the root to the child for real action `a`, chance key `key` and the decision of
     /// `after` (the game after the move). False = no such subtree.
     fn advance(&mut self, a: u16, key: &[u64], after: &dyn DynGame) -> Result<bool, String>;
+    /// The driver's reuse after a real move (`Tree::follow`, docs/search.md 3.18): seat `mover` took `a` at a decision
+    /// of class `tag`, the transition's keys `key`, the seats it stepped through single options `stepped` (bits),
+    /// `after` the game after it. False = the tree does not survive.
+    fn follow(&mut self, mover: usize, a: u16, tag: u16, key: &[u64], stepped: u32, after: &dyn DynGame) -> Result<bool, String>;
     fn root_acts(&self) -> Vec<u16>;
     fn root_player(&self) -> usize;
     fn root_visits(&self) -> Vec<u32>;
@@ -479,6 +501,11 @@ impl<G: SearchGame> DynTree for TreeBox<G> {
         let legal = DynGame::legal(g);
         // (a merged tree finds the new root by the real observation too: docs/search.md 3.16)
         Ok(self.t.advance_in(a, key, p, &legal, g))
+    }
+    fn follow(&mut self, mover: usize, a: u16, tag: u16, key: &[u64], stepped: u32, after: &dyn DynGame) -> Result<bool, String> {
+        let g = downcast::<G>(after)?;
+        let legal = DynGame::legal(g);
+        Ok(self.t.follow(mover, a, tag, key, stepped, g, &legal))
     }
     fn root_acts(&self) -> Vec<u16> {
         self.t.acts(self.t.root).to_vec()
