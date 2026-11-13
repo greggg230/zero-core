@@ -206,7 +206,7 @@ def _training_files(run):
     return out
 
 
-TIMING = ('seconds', 'time', 'phases', 'resumed_seconds')
+TIMING = ('seconds', 'time', 'phases', 'resumed_seconds', 'timing')
 
 
 def _no_timing(m):

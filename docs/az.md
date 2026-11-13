@@ -6149,7 +6149,14 @@ download; `NetEvaluator.launch_s` / `result_s`, reset per phase), `batches`, `th
 `wait_share` high and `busy_share` near 1; an inference-bound one sits in `result_s` with idle search threads; a phase
 with neither high spends its time in the driving thread itself. The other keys are unchanged.
 
+**A fix in `infer_s`** (2026-11-13): for a batch evaluated at once in drive's pipelined loop (an eager evaluator: CPU,
+or a network without graphs) `NetEvaluator.launch` added the time `evaluate` had already counted, so `infer_s` read
+about twice the truth (the toy smoke's `infer_share` 1.6, the MTG smoke's 1.8). It is counted once now. The CUDA graphs'
+path (MTG Zero's runs) was right and is unchanged. Comparisons of two runs' metrics leave `timing` out with the other
+timing keys (`test_select_scale.py`).
+
 **Tests.** `test_loop.py::test_selfplay_metrics_split_the_phase_time` (the toy smoke's phases: the keys, shares within
-[0, 1], CPU: no launches), the shared queue's local driver in `test_shard_thread.py`.
+[0, 1] - `infer_share` included, which the double count failed -, CPU: no launches), the shared queue's local driver in
+`test_shard_thread.py`.
 
 **Not measured here**: the live run's split (it needs a run on this commit; the GPU was busy with that run).

@@ -1765,10 +1765,13 @@ class NetEvaluator:
                 self._check_head()
             h = ('g', self.fast.launch(lb.x, lb.n_players, lb.opt_off, lb.opt_action, *((brows,) if len(brows) else ()),
                                        **self._tail_kw(*tl)), lb.B)
-            self.launch_s += time.perf_counter() - t0
+            dt = time.perf_counter() - t0
+            self.seconds += dt
+            self.launch_s += dt
         else:
+            # (evaluated now: `evaluate` counts its own seconds - added here too, they were counted twice before
+            # 2026-11-13, docs/az.md 44.2)
             h = ('d', self.evaluate(lb.x, lb.n_players, lb.opt_off, lb.opt_action, extra, *tl), 0)
-        self.seconds += time.perf_counter() - t0
         return h
 
     def result(self, h):
