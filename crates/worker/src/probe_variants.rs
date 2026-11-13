@@ -147,7 +147,8 @@ fn resolve(manifest: &Value, dir: &Path, plan: &Plan) -> Vec<Value> {
         }
         out.push(v);
     }
-    for (label, model, rows) in &plan.cache_nets {
+    let n_cache = manifest["cache_nets"].as_u64().map(|n| n as usize).unwrap_or(usize::MAX);
+    for (label, model, rows) in plan.cache_nets.iter().take(n_cache) {
         out.push(json!({"name": format!("cache_{label}"), "group": "cache", "kind": "net", "model": model.display().to_string(),
                         "rows": rows.display().to_string(), "batches": [4, 16, 64, 256, 1024], "static": false, "tol": crate::selftest::TOL,
                         "cpu_threads": plan.cpu_threads, "budget_s": 240, "note": "the job's own graph from the agent's cache",
@@ -852,8 +853,14 @@ fn run_net(rt: &'static crate::session::Runtime, v: &Value, p: ProviderKind, wan
             Ok(x)
         })();
         let x = res.unwrap_or_else(|e| json!({"why": e}));
+        let failed = x.get("why").is_some();
         all_ok &= x["max_abs"].as_f64().is_some_and(|m| m <= tol) && x["deterministic"] == json!(true);
         bmap.insert(n.to_string(), x);
+        // (`stop_on_fail`: no further sessions of a provider that already failed - one failing session at most on a PC
+        // where failures are risky)
+        if failed && v["stop_on_fail"] == json!(true) {
+            break;
+        }
     }
     r["ok"] = json!(all_ok);
     if !all_ok {

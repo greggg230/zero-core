@@ -46,6 +46,8 @@ pub struct Opts {
     pub variants_only: Vec<String>,
     /// Seconds from the probe's start after which no variant is started (the agent stops a probe at 900).
     pub variants_deadline_s: f64,
+    /// The providers the variants may use (None: `providers`): a variant also names its own.
+    pub variant_providers: Option<Vec<ProviderKind>>,
 }
 
 /// A batch of `n` rows cycled from the reference set's rows (timing only).
@@ -266,7 +268,16 @@ pub fn run(o: &Opts) -> Result<Value, String> {
         cpu_threads.sort_unstable();
         cpu_threads.dedup();
         let mut provs = vec![ProviderKind::Cpu];
-        provs.extend(ProviderKind::ALL.iter().copied().filter(|p| p.is_gpu() && o.providers.contains(p) && rt.offers(*p)));
+        let allowed = o.variant_providers.as_deref().unwrap_or(&o.providers);
+        // (a catalog provider the probe itself did not register but the catalog lists as installed: the children
+        // make it ready themselves)
+        let listed = |p: ProviderKind| {
+            crate::session::CATALOG.contains(&p)
+                && v["catalog"]["eps"].as_array().into_iter().flatten().any(|e| {
+                    e["name"].as_str().and_then(ProviderKind::of_ort_name) == Some(p) && matches!(e["ready"].as_str(), Some("Ready") | Some("NotReady")) && e["certified"] == json!(true)
+                })
+        };
+        provs.extend(ProviderKind::ALL.iter().copied().filter(|p| p.is_gpu() && allowed.contains(p) && (rt.offers(*p) || listed(*p))));
         let plan = crate::probe_variants::Plan {
             dylib: &o.dylib,
             adapters: &adapters,

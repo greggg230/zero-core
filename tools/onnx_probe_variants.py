@@ -277,10 +277,10 @@ def u8(b):
     return np.frombuffer(b, dtype=np.uint8)
 
 
-def build(out, extra_nets):
+def build(out, extra_nets, only_nets=False, cache_nets=None):
     members = {}
     variants = []
-    raw = copy_group() + ops_group() + stage_group(os.path.join(HERE, '..', 'crates', 'worker', 'probe', 'probe.onnx'),
+    raw = [] if only_nets else copy_group() + ops_group() + stage_group(os.path.join(HERE, '..', 'crates', 'worker', 'probe', 'probe.onnx'),
                                                     os.path.join(HERE, '..', 'crates', 'worker', 'probe', 'probe_reference.npz'))
     for v in raw:
         mname = f"m/{v['name']}.onnx"
@@ -338,10 +338,15 @@ def build(out, extra_nets):
              'tol': float(opts.get('tol', 2e-5)), 'note': opts.get('note', ''), 'budget_s': float(opts.get('budget', 150))}
         if 'providers' in opts:
             e['providers'] = opts['providers'].split('+')
+        if opts.get('stop_on_fail') == '1':
+            e['stop_on_fail'] = True
         variants.append(e)
     # the order the worker runs the groups in ("cache": the job's own networks from the agent's cache)
     order = ['copy', 'ops', 'stage', 'cache', 'real', 'probe_net']
-    members['manifest'] = u8(json.dumps({'version': 1, 'order': order, 'variants': variants}).encode())
+    manifest = {'version': 1, 'order': order, 'variants': variants}
+    if cache_nets is not None:
+        manifest['cache_nets'] = cache_nets      # the job's own networks from the agent's cache: at most this many
+    members['manifest'] = u8(json.dumps(manifest).encode())
     tmp = out + '.tmp.npz'
     np.savez_compressed(tmp, **members)
     os.replace(tmp, out)
@@ -351,9 +356,11 @@ def build(out, extra_nets):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('out')
-    ap.add_argument('--net', action='append', default=[], help='NAME=MODEL.onnx,rows=REF.npz[,static=1][,group=G][,providers=a+b][,batches=16+64][,budget=S][,note=T]')
+    ap.add_argument('--net', action='append', default=[], help='NAME=MODEL.onnx,rows=REF.npz[,static=1][,group=G][,providers=a+b][,batches=16+64][,budget=S][,stop_on_fail=1][,note=T]')
+    ap.add_argument('--only-nets', action='store_true', help='no micro / stage groups: the --net graphs only')
+    ap.add_argument('--cache-nets', type=int, help="time at most this many of the agent cache's real networks (default: the worker's)")
     a = ap.parse_args()
-    variants, size = build(a.out, a.net)
+    variants, size = build(a.out, a.net, a.only_nets, a.cache_nets)
     groups = {}
     for v in variants:
         groups.setdefault(v['group'], []).append(v['name'])

@@ -969,7 +969,7 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
 fn probe_cli(a: &Args) -> Result<i32, String> {
     let providers = match a.get("--providers") {
         Some(s) => s.split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| ProviderKind::parse(n).ok_or_else(|| format!("--providers: unknown provider {n:?}"))).collect::<Result<Vec<_>, _>>()?,
-        None => ProviderKind::ALL.to_vec(),
+        None => ProviderKind::PROBE_DEFAULT.to_vec(),
     };
     let o = crate::probe::Opts {
         dylib: ort_dylib_in(a.get("--ort-dll"), a.get("--runtime-dir")),
@@ -985,6 +985,9 @@ fn probe_cli(a: &Args) -> Result<i32, String> {
         variants: a.has("--variants") || (crate::probe_variants::embedded() && !a.has("--no-variants") && a.get("--model").is_none()),
         variants_only: a.get("--variants-only").map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
         variants_deadline_s: a.num("--variants-deadline")?.unwrap_or(780.0),
+        // (a diagnostic build's variants name their own providers - the agent's --providers narrows only the probe's
+        // own verdict, so a targeted variant can still reach a provider the agent no longer probes by default)
+        variant_providers: Some(ProviderKind::ALL.to_vec()),
     };
     let v = crate::probe::run(&o)?;
     eprint!("{}", crate::probe::report(&v));
