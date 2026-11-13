@@ -19,7 +19,9 @@ What it does:
    Both seats play the run's evaluation seat (`Run.nn_seat(key, eval_sims)`), paired games: exactly the
    games of `Run.play_match` / an Elo match at those settings (zero.farm_eval). The job keeps only the settings
    the worker build's own `check-config --eval --json` calls `play` (`play_settings`: zero-farm PROTOCOL.md 7 -
-   a signed template carries no trainer-only key and nothing path-like); `--worker` is that build's executable.
+   a signed template carries no trainer-only key and nothing path-like); `--worker` is that build's executable. A
+   worker build older than a setting calls it "unknown": when this zero-core's crates/worker/src/run_settings.json
+   classifies it trainer-only, that is logged and ignored (it never reaches the worker), any other failure refuses.
    The batch's base seed is the coordinator's, from the run's name (`coordinator_seed`): a template has no seed.
 2. Both checkpoints exported to zero-onnx/1 or /2 (zero.onnx_export, 'packed') with their reference sets (256 rows
    of recorded batches - `--reference-batches`, else a short self-play of A recorded here, CPU - with torch's
@@ -257,12 +259,72 @@ def worker_json(worker, *args):
     return p.returncode, out, (p.stdout or '') + (p.stderr or '')
 
 
-def play_settings(worker, build_id, cfg, d):
+# this zero-core's settings table (the one its worker builds embed: crates/worker/src/run_settings.json)
+RUN_SETTINGS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'crates',
+                            'worker', 'src', 'run_settings.json')
+
+
+def load_run_settings(path=None):
+    """This zero-core's settings table ({"keys": {key: {"class", ...}}, "patterns": [...]}), or None when it isn't
+    there (no source checkout)."""
+    try:
+        with open(path or RUN_SETTINGS, encoding='utf-8') as f:
+            t = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return t if isinstance(t, dict) and isinstance(t.get('keys'), dict) else None
+
+
+def setting_class(key, table):
+    """A run setting's class in a settings table: its own entry, else the first pattern (prefix, suffix) it matches,
+    else None (a setting this zero-core doesn't know)."""
+    e = table['keys'].get(key)
+    if isinstance(e, dict):
+        return e.get('class')
+    for p in table.get('patterns') or []:
+        if key.startswith(p.get('prefix', '')) and key.endswith(p.get('suffix', '')):
+            return p.get('class')
+    return None
+
+
+def config_refused(rc, out, build_id, log, table=None):
+    """Does a worker build's `check-config --json` answer (exit status `rc`, its JSON `out`) on a run's FULL settings
+    refuse them? A failure whose key the worker calls "unknown" but this zero-core's settings table
+    (`load_run_settings`, or `table`) classifies "trainer" is not a refusal: a worker build older than the setting
+    doesn't know it, and a template carries only the keys the worker calls "play", so the worker never gets it -
+    each is logged ("worker build X doesn't know trainer-only setting K: ignored"). Any other failure, a driver error,
+    or a failed exit without failures refuses as before; without the table (no source checkout) every failure does."""
+    if not isinstance(out, dict):
+        return True
+    fails = list(out.get('failures') or [])
+    if not fails:
+        return rc != 0
+    if out.get('driver_error'):
+        return True
+    table = load_run_settings() if table is None else table
+    if table is None:
+        return True
+    status = {s.get('key'): s.get('status') for s in out.get('settings') or [] if isinstance(s, dict)}
+    if any(not (status.get(k) == 'unknown' and setting_class(k, table) == 'trainer') for k in fails):
+        return True
+    for k in fails:
+        log(f'worker build {build_id} doesn\'t know trainer-only setting {k}: ignored')
+    return False
+
+
+def _stderr_log(m):
+    print('# ' + m, file=sys.stderr, flush=True)
+
+
+def play_settings(worker, build_id, cfg, d, log=None):
     """The eval template's settings: only those the worker build's own `check-config --eval` classifies `play` (what
     an evaluation match reads - zero_worker EVAL_READS; never a trainer-only key or a path, which farm-release refuses
     in a template), checked again by the worker on their own, and giving the seats every setting gives
-    (`Run.nn_seat`). `worker` must be that build's executable (its `info` names `build_id` and the kind eval)."""
+    (`Run.nn_seat`). `worker` must be that build's executable (its `info` names `build_id` and the kind eval). A
+    setting the build doesn't know but this zero-core classifies trainer-only is logged and left out
+    (`config_refused`)."""
     from . import farm_eval as FE
+    log = log or _stderr_log
     rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
     if rc != 0 or not isinstance(info, dict):
         raise SystemExit(f'{worker} info: {text.strip()[-500:]}')
@@ -274,7 +336,7 @@ def play_settings(worker, build_id, cfg, d):
     with open(full, 'w', encoding='utf-8') as f:
         json.dump(cfg, f)
     rc, out, text = worker_json(worker, 'check-config', full, '--eval', '--json')
-    if rc != 0 or not isinstance(out, dict) or out.get('failures'):
+    if config_refused(rc, out, build_id, log):
         raise SystemExit(f'the worker refuses the settings for an eval job:\n{text.strip()[-3000:]}')
     status = {s['key']: s['status'] for s in out.get('settings') or []}
     play = {k: v for k, v in cfg.items() if status.get(k) == 'play'}
@@ -646,7 +708,7 @@ def main(argv=None, client=None):
     if os.path.exists(os.path.join(d, 'state.json')):
         raise SystemExit(f'{run} exists ({d}): --resume {run}, or another --name')
     run_cfg = cfg
-    cfg = play_settings(a.worker, a.build, run_cfg, d)
+    cfg = play_settings(a.worker, a.build, run_cfg, d, log)
     log(f'{run}: {game}, {a.games} paired games, eval_sims {cfg["eval_sims"]}, eval spec {cfg["eval_spec"][:80]}; '
         f'{len(cfg)} of the run\'s {len(run_cfg)} settings are the eval job\'s (the worker\'s check-config: play)')
     if a.reference_batches:

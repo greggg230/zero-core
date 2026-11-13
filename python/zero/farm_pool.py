@@ -108,11 +108,14 @@ def alternate_ids(v):
     return [x for x in items if x]
 
 
-def play_settings(worker, build_id, cfg, d):
+def play_settings(worker, build_id, cfg, d, log=None):
     """The self-play template's settings: the keys the worker build's own `check-config --json` calls `play` (what
     its self-play driver reads; never a trainer-only key or a path, which farm-release refuses in a template),
-    checked again on their own, and giving the driver every setting gives (`driver-cfg`)."""
-    from .farm_h2h import worker_json
+    checked again on their own, and giving the driver every setting gives (`driver-cfg`). A setting the build
+    doesn't know but this zero-core classifies trainer-only is logged and left out (zero.farm_h2h.config_refused:
+    a worker build older than the pool's own settings)."""
+    from .farm_h2h import _stderr_log, config_refused, worker_json
+    log = log or _stderr_log
     rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
     if rc != 0 or not isinstance(info, dict):
         raise SystemExit(f'{worker} info: {text.strip()[-500:]}')
@@ -124,7 +127,7 @@ def play_settings(worker, build_id, cfg, d):
     with open(full, 'w', encoding='utf-8') as f:
         json.dump(cfg, f)
     rc, out, text = worker_json(worker, 'check-config', full, '--json')
-    if rc != 0 or not isinstance(out, dict) or out.get('failures'):
+    if config_refused(rc, out, build_id, log):
         raise SystemExit(f'the worker refuses the run\'s settings for self-play:\n{text.strip()[-3000:]}')
     status = {s['key']: s['status'] for s in out.get('settings') or []}
     play = {k: v for k, v in cfg.items() if status.get(k) == 'play'}
@@ -199,7 +202,8 @@ class Pool:
         self.client = client or FD.Client(self.url)
         self.exporter = exporter or self._export
         self.definer = definer or self._define
-        self.settings_of = settings_of or (lambda: play_settings(self.worker, self.build, dict(c), os.path.join(self.dir, 'settings')))
+        self.settings_of = settings_of or (lambda: play_settings(self.worker, self.build, dict(c),
+                                                                 os.path.join(self.dir, 'settings'), self.log))
         self.dir = os.path.join(self.R.run, 'pool', self.farm)
         self.debug = os.path.join(self.R.run, 'debug', 'pool')
         os.makedirs(self.dir, exist_ok=True)

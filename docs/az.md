@@ -6696,6 +6696,12 @@ and is its validation. The trainer's side is one more kind of remote: the farm p
   of the run's network, capped by the run's staleness window; or a number). Like the alternates it is `PUT` again on a
   resumed run when it changed (state `put_extras`). `zero.farm_h2h` takes `--gpu-games-per-lease` for its eval batch,
   and `--min-agent` for its run's `min_agent` (rev 9: a canary-only head-to-head); each is sent only when given.
+* **A worker build older than a setting**: its `check-config` calls a setting it doesn't know "unknown", a failure. When
+  this zero-core's `crates/worker/src/run_settings.json` classifies that setting `trainer` (the pool's own `pool_*`), the
+  pool's and `zero.farm_h2h`'s template check logs it ("worker build X doesn't know trainer-only setting K: ignored") and
+  carries on: a template carries only the keys the worker calls `play`, so the worker never gets it. Any other failure
+  refuses as before, and so does every failure without the table (no source checkout). So an already published worker
+  build keeps working with a trainer that has newer trainer-only settings (`zero.farm_h2h.config_refused`).
 
 ### 45.3 Off by default
 

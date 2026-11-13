@@ -415,6 +415,46 @@ def test_cli_alternates_min_agent_and_gpu_lease_size(tmp_path, monkeypatch):
             FD.gpu_games_per_lease(bad)
 
 
+def test_an_old_workers_unknown_trainer_only_settings_are_ignored(tmp_path, monkeypatch):
+    """A worker build older than a run setting calls it "unknown" in check-config --eval: when this zero-core's
+    crates/worker/src/run_settings.json classifies it trainer-only (pool_alternates), that is logged and the eval
+    template is exactly a current worker's (the worker never gets the key); an "unknown" setting the desktop
+    classifies play, or doesn't know at all, still refuses - as does any "unknown" setting without the table (no
+    source checkout)."""
+    import argparse
+    from zero import run as R
+    monkeypatch.setenv('WORKER_STUB_BUILD', BID)
+    monkeypatch.delenv('WORKER_STUB_UNKNOWN', raising=False)
+    # (a run's settings as settings_of resolves them)
+    cfg = FE.resolve_eval_spec(R.resolve_config(argparse.Namespace(**{k: None for k in R.DEFAULTS}), {'game': 'toy'}))
+    lines = []
+    new = FH.play_settings(WORKER, BID, cfg, str(tmp_path / 'new'), lines.append)
+    assert lines == [] and 'pool_alternates' not in new
+    monkeypatch.setenv('WORKER_STUB_UNKNOWN', 'pool_alternates,pool_gpu_games_per_lease')
+    assert FH.play_settings(WORKER, BID, cfg, str(tmp_path / 'old'), lines.append) == new
+    assert lines == [f'worker build {BID} doesn\'t know trainer-only setting pool_alternates: ignored',
+                     f'worker build {BID} doesn\'t know trainer-only setting pool_gpu_games_per_lease: ignored']
+    table = FH.load_run_settings()
+    play_key = next(k for k in cfg if FH.setting_class(k, table) == 'play')
+    for c, unknown in ((cfg, f'pool_alternates,{play_key}'), (dict(cfg, no_such_setting=1), 'no_such_setting')):
+        monkeypatch.setenv('WORKER_STUB_UNKNOWN', unknown)
+        with pytest.raises(SystemExit, match='refuses the settings'):
+            FH.play_settings(WORKER, BID, c, str(tmp_path / 'bad'), lines.append)
+    monkeypatch.setenv('WORKER_STUB_UNKNOWN', 'pool_alternates')
+    monkeypatch.setattr(FH, 'RUN_SETTINGS', str(tmp_path / 'no-checkout' / 'run_settings.json'))
+    with pytest.raises(SystemExit, match='refuses the settings'):
+        FH.play_settings(WORKER, BID, cfg, str(tmp_path / 'strict'), lines.append)
+    # only "unknown" is excused (not "unsupported"), never with a driver error, never a failed exit without failures
+    row = lambda st: {'failures': ['pool_alternates'], 'driver_error': None,
+                      'settings': [{'key': 'pool_alternates', 'status': st}]}
+    log = lines.append
+    assert not FH.config_refused(1, row('unknown'), BID, log, table) and FH.config_refused(1, row('unsupported'), BID, log, table)
+    assert FH.config_refused(1, dict(row('unknown'), driver_error='no'), BID, log, table)
+    assert FH.config_refused(1, {'failures': [], 'settings': []}, BID, log, table) and FH.config_refused(0, None, BID, log, table)
+    assert not FH.config_refused(0, {'failures': [], 'settings': []}, BID, log, table)
+    assert FH.setting_class('reader_deck', table) == 'trainer' and FH.setting_class('no_such_setting', table) is None
+
+
 def test_zero_h2h_plays_the_runs_evaluation(tmp_path, monkeypatch, capsys):
     """zero.h2h of a run's checkpoints plays Run.play_match's games (docs/az.md 44.3): each side's seat takes its run's
     margin_w, redet and eval_cache, the match A's run's evaluation spec - so its rows equal the farm's Python path

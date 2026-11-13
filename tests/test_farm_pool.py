@@ -174,7 +174,7 @@ def pool(tmp_path, monkeypatch):
 
     monkeypatch.setattr(FP.Pool, '_export', export)
     monkeypatch.setattr(FP.Pool, '_define', define)
-    monkeypatch.setattr(FP, 'play_settings', lambda worker, build, cfg, d: {'game': 'toy', 'spec': '', 'players': [2]})
+    monkeypatch.setattr(FP, 'play_settings', lambda worker, build, cfg, d, log=None: {'game': 'toy', 'spec': '', 'players': [2]})
     cfg = dict(DEFAULTS, game='toy', games=24, players=[2], spec='', shard_rows=40, shard_sparse=1, sparse=1,
                selfplay_remote=f'pool:{FARM}', pool_build=BUILD, pool_poll_s=0.05, pool_url='http://fake')
     run = tmp_path / 'run'
@@ -414,6 +414,29 @@ def test_pool_alternates_in_the_puts_definitions_and_records(pool):
     finally:
         stop(p)
     assert len(run_puts()) == n and published[-1]['builds'] == [build, alt]
+
+
+def test_play_settings_of_a_worker_older_than_trainer_settings(tmp_path, monkeypatch):
+    """A worker build older than the pool's own settings (pool_alternates, pool_alt_vendor, pool_gpu_games_per_lease)
+    calls them "unknown" in check-config: this zero-core's run_settings.json classifies them trainer-only, so each is
+    logged and the template is exactly a current worker's; an "unknown" setting the desktop classifies play, or one
+    it doesn't know at all, still refuses."""
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker_stub.py')
+    monkeypatch.setenv('WORKER_STUB_BUILD', BUILD)
+    monkeypatch.delenv('WORKER_STUB_UNKNOWN', raising=False)
+    cfg = dict(DEFAULTS, game='toy', players=[2], spec='')
+    lines = []
+    new = FP.play_settings(worker, BUILD, cfg, str(tmp_path / 'new'), lines.append)
+    assert lines == [] and new and not any(k.startswith('pool_') for k in new)
+    trainer = ['pool_alternates', 'pool_alt_vendor', 'pool_gpu_games_per_lease']
+    monkeypatch.setenv('WORKER_STUB_UNKNOWN', ','.join(trainer))
+    assert FP.play_settings(worker, BUILD, cfg, str(tmp_path / 'old'), lines.append) == new
+    assert lines == [f'worker build {BUILD} doesn\'t know trainer-only setting {k}: ignored' for k in trainer]
+    play_key = next(k for k in new if k != 'game')
+    for c, unknown in ((cfg, f'pool_alternates,{play_key}'), (dict(cfg, no_such_setting=1), 'no_such_setting')):
+        monkeypatch.setenv('WORKER_STUB_UNKNOWN', unknown)
+        with pytest.raises(SystemExit, match='refuses the run\'s settings'):
+            FP.play_settings(worker, BUILD, c, str(tmp_path / 'bad'), lines.append)
 
 
 def test_selfplay_local_0_leaves_the_games_to_a_delivering_farm(pool):
