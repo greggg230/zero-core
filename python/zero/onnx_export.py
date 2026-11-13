@@ -32,12 +32,20 @@ aux_layout (JSON [[name, width, loss], ...]), aux_width, packing, checkpoint, ch
 opset, exporter, torch.
 
 zero-onnx/2 (docs/az.md 46; `ZeroOnnx2`, `onnx_version`): a token network with tail segments, pointer overrides or
-gates - MTG Zero's layout v7 - takes zero-onnx/1's inputs plus the driver's options and variable-length rows as they
-are (`opt_off` i64 [B+1], `opt_action` i32, `t_off` i64 [B+1], `t_seg` i32, `t_slot` i64, `t_val` f32 - each tail
-token's floats consecutive -, `ov_off` i64 [B+1], `ov_opt` i32, `ov_tok` i64) and answers zero-onnx/1's outputs
-plus `refused` i64 [B] (per row, the tail tokens and overrides the network refuses: 0 everywhere, or the batch is
-refused); metadata zero_onnx=2 and the network's `tails`, `option_pointers`, `max_row_tokens`, `tail_width`,
-`gates`. Packing 'packed' only. Every other network exports zero-onnx/1, the same file as before.
+gates - MTG Zero's layout v7 - takes zero-onnx/1's inputs plus the driver's options and variable-length rows
+(`opt_off` i64 [B+1], `opt_action` i32, `t_off` i64 [B+1], `t_seg` i32, each tail slot as `t_slot_hi` / `t_slot_lo`
+i32 - its high and low 16 bits, `slot_pieces` -, `t_val` f32 - each tail token's floats consecutive -, `ov_off` i64
+[B+1], `ov_opt` i32, and each packed override token as `ov_seg` / `ov_col` / `ov_slot_hi` / `ov_slot_lo` i32,
+`override_pieces`) and answers zero-onnx/1's outputs plus `refused` i64 [B] (per row, the tail tokens and overrides
+the network refuses: 0 everywhere, or the batch is refused); metadata zero_onnx=2 and the network's `tails`,
+`option_pointers`, `max_row_tokens`, `tail_width`, `gates`. Packing 'packed' only. No integer in the graph reaches
+2^31 (DirectML computes int64 in 32 bits): the host splits slots and tokens, the exporter refuses a constant outside
+int32 (`check_int32`), the feeder a piece too large (`int32_bound`). Every other network exports zero-onnx/1, the
+same graph as before.
+
+Every exported graph is written without the exporter's per-node annotations (`strip_annotations`: stack traces with
+the exporting checkout's file paths and line numbers, doc strings): the same checkpoint exports to the same bytes from
+any checkout, and no graph carries a local path.
 
 How a token network (`net.TokenNet`) packs its objects inside the graph (`packing`):
 
@@ -101,7 +109,9 @@ OUTPUTS = ('policy', 'value', 'margin', 'aux')
 # zero-onnx/2 (docs/az.md 46): a token network with variable-length token sets - the driver's options, tail tokens and
 # pointer overrides as more inputs, and per row the inputs the network refuses as one more output
 PROTOCOL2 = 'zero-onnx/2'
-VARLEN_INPUTS = ('opt_off', 'opt_action', 't_off', 't_seg', 't_slot', 't_val', 'ov_off', 'ov_opt', 'ov_tok')
+VARLEN_INPUTS = ('opt_off', 'opt_action', 't_off', 't_seg', 't_slot_hi', 't_slot_lo', 't_val', 'ov_off', 'ov_opt',
+                 'ov_seg', 'ov_col', 'ov_slot_hi', 'ov_slot_lo')
+INT32_MAX = (1 << 31) - 1
 INPUTS2 = INPUTS + VARLEN_INPUTS
 OUTPUTS2 = OUTPUTS + ('refused',)
 PACKINGS = ('mask', 'compact', 'packed', 'host')
@@ -366,10 +376,41 @@ def _row_sum(flag, off):
     return cs.index_select(0, off[1:]) - cs.index_select(0, off[:-1])
 
 
+def slot_pieces(slot):
+    """Tail slots (u32: any integers, one outside [0, 2^32) given a high half of -1, which the graph refuses as it
+    refused such a slot) as zero-onnx/2's two int32 inputs: (slot >> 16, slot & 0xffff)."""
+    s = np.asarray(slot).astype(np.int64)
+    hi = np.where((s < 0) | (s >= 1 << 32), -1, s >> 16)
+    return hi.astype(np.int32), (s & 0xffff).astype(np.int32)
+
+
+def override_pieces(tok):
+    """The driver's packed override tokens (`rows.pack_tok`: seg << 40 | col << 32 | slot; -1 the generic logit) as
+    zero-onnx/2's four int32 inputs (seg, col, slot >> 16, slot & 0xffff): -1 -> (-1, 0, 0, 0), any other negative ->
+    (-2, 0, 0, 0) (refused, as the packed token was); seg is tok >> 40 whole (one past the network's segments is
+    refused, not masked) - zero_worker's `override_pieces`."""
+    t = np.asarray(tok, np.int64)
+    pos = t >= 0
+    tc = np.where(pos, t, 0)
+    seg = np.where(pos, tc >> 40, np.where(t == -1, -1, -2))
+    return (seg.astype(np.int32), ((tc >> 32) & 0xff).astype(np.int32), ((tc >> 16) & 0xffff).astype(np.int32),
+            (tc & 0xffff).astype(np.int32))
+
+
+def int32_bound(B, nnz, features, actions, tail_width, t_off, NT, L, K, NO):
+    """An upper bound of every integer a zero-onnx/2 graph computes on a piece (docs/az.md 46.2; zero_worker's
+    `int32_bound`): the densified rows' flat index B (F + 1), the packed token list's and the padded rows' indices
+    B (F + 1 + the most tail tokens of a row), the policy's B (A + 1), the tail floats' (NT + 1) Wt and L + 1, the
+    options' K + 1, the overrides' NO + 1, the merged CSR sequence's nnz + B. A feeder refuses a piece at 2^31 or more."""
+    t_max = int(np.diff(np.asarray(t_off, np.int64)).max()) if len(t_off) > 1 else 0
+    return max(int(nnz) + B, B * (int(features) + 1 + t_max), B * (int(actions) + 1), (int(NT) + 1) * int(tail_width),
+               int(L) + 1, int(K) + 1, int(NO) + 1)
+
+
 def _iclamp(x, lo=None, hi=None):
-    """An int64 tensor clamped to [lo, hi] by Where: ONNX Runtime 1.31.1's CPU Clip and Min on int64 answer wrongly
-    around 2^32 (measured: Clip(4294967295, min 0) gave 0, Min(x, 4294967295) gave 4294967295 for every x), and a
-    tail slot is any u32, a packed token up to 2^56. `lo` / `hi` ints or the graph's symbolic sizes."""
+    """An int64 tensor clamped to [lo, hi] by Where (ONNX Runtime 1.31.1's CPU Clip and Min on int64 answer wrongly
+    around 2^32 - measured: Clip(4294967295, min 0) gave 0, Min(x, 4294967295) gave 4294967295 for every x -; Where
+    is exact everywhere). `lo` / `hi` ints or the graph's symbolic sizes."""
     if lo is not None:
         x = torch.where(x < lo, torch.full_like(x, lo), x)
     if hi is not None:
@@ -383,14 +424,22 @@ def _prev(a):
     return a.index_select(0, i)
 
 
-def _psi2(n, pow2, sc):
-    """`TokenNet._psi` of int64 offsets n in [0, 2^32): the 32 binary digits by integer division (exact for every
-    u32: `//` exports as ONNX's integer Div; `torch.div` with a rounding mode would go through floats and `>>` by a
-    tensor does not export), log2(n + 1) / 32 computed in float64 and rounded, the sin / cos part read from psi's own
-    table of n mod 256 (`sc`, `TokenNet._psi_sc`: the same floats)."""
-    bits = torch.remainder(n[:, None] // pow2[None, :], 2).to(torch.float32)
-    lg = (torch.log2(n.to(torch.float64) + 1.0) / 32.0).to(torch.float32)[:, None]
-    return torch.cat([bits, lg, sc.index_select(0, torch.remainder(n, 256))], 1)
+def _psi2(hi, lo, pow2, sc):
+    """`TokenNet._psi` of offsets n = hi 2^16 + lo in [0, 2^32), given as their 16-bit halves (int64 in [0, 2^16): no
+    integer reaches 2^31): the 32 binary digits by integer division of each half (`//` exports as ONNX's integer Div;
+    `torch.div` with a rounding mode would go through floats and `>>` by a tensor does not export; `pow2` 2^0 .. 2^15),
+    log2(n + 1) / 32 computed in float64 (n exact there) and rounded, the sin / cos part read from psi's own table of
+    n mod 256 = lo mod 256 (`sc`, `TokenNet._psi_sc`: the same floats)."""
+    bits = torch.cat([torch.remainder(lo[:, None] // pow2[None, :], 2), torch.remainder(hi[:, None] // pow2[None, :], 2)],
+                     1).to(torch.float32)
+    n = hi.to(torch.float64) * 65536.0 + lo.to(torch.float64)
+    lg = (torch.log2(n + 1.0) / 32.0).to(torch.float32)[:, None]
+    return torch.cat([bits, lg, sc.index_select(0, torch.remainder(lo, 256))], 1)
+
+
+def _lt2(ahi, alo, bhi, blo):
+    """(ahi, alo) < (bhi, blo) for 16-bit halves: a < b on the whole numbers, no integer formed."""
+    return (ahi < bhi) | ((ahi == bhi) & (alo < blo))
 
 
 def _pointer2(net, hid):
@@ -430,8 +479,9 @@ def _outputs(net, layout, B, plog, vlog, mar, raw, n_players, belief):
 
 class ZeroOnnx2(ZeroOnnx):
     """A token network with variable-length token sets behind the zero-onnx/2 interface (module docstring, docs/az.md
-    46): `forward(x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot, t_val, ov_off,
-    ov_opt, ov_tok)` -> (policy, value, margin, aux, refused). Packing 'packed' only (each row's tail tokens follow
+    46): `forward(x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo, t_val,
+    ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo)` -> (policy, value, margin, aux, refused); no integer of
+    the graph reaches 2^31 (docs/az.md 46.2). Packing 'packed' only (each row's tail tokens follow
     its present head tokens in the packed list)."""
 
     VERSION = 2
@@ -463,15 +513,25 @@ class ZeroOnnx2(ZeroOnnx):
         for k, j in enumerate(net.gated):
             gi[j] = k
         istail = [bool(s.get('tail')) for s in segs]
+        # (no integer of the graph reaches 2^31, docs/az.md 46.2: the sizes its integers are built from, checked here;
+        # the graph's constants by check_int32, a piece's sizes by int32_bound)
+        if S >= 1 << 15 or p + c >= 1 << 30 or int(net.actions) >= 1 << 30:
+            raise ValueError(f'zero-onnx/2: {S} segments, {p} head tokens, {c} pointer columns, {net.actions} actions: '
+                             f'past the graph\'s int32 integers')
+        for s in segs:
+            if s['id'] is not None and int(np.prod(s['id']['radix'], dtype=np.float64)) >= 1 << 30:
+                raise ValueError(f'zero-onnx/2: segment {s["name"]!r}: identity radix {s["id"]["radix"]} past int32')
+        counts = [int(s['count']) for s in segs]
         self.register_buffer('v_width', lt([s['width'] if t else 0 for s, t in zip(segs, istail)]), persistent=False)
         self.register_buffer('v_istail', torch.tensor(istail), persistent=False)
-        self.register_buffer('v_count', lt([s['count'] for s in segs]), persistent=False)
+        self.register_buffer('v_count_hi', lt([k >> 16 for k in counts]), persistent=False)
+        self.register_buffer('v_count_lo', lt([k & 0xffff for k in counts]), persistent=False)
         self.register_buffer('v_start', lt(start), persistent=False)
         self.register_buffer('v_c0', lt(c0), persistent=False)
         self.register_buffer('v_nk', lt(nk), persistent=False)
         self.register_buffer('v_tk', lt(tk), persistent=False)
         self.register_buffer('v_gi', lt(gi), persistent=False)
-        self.register_buffer('v_pow2', torch.tensor([1 << j for j in range(32)], dtype=torch.long), persistent=False)
+        self.register_buffer('v_pow2', torch.tensor([1 << j for j in range(16)], dtype=torch.long), persistent=False)
         self.Wt = int(getattr(net, 't_width', 0) or 0)
         if net.tails:
             # the tail segments' input maps and position maps as one product each (`_TailEmbed`'s matrices: segment
@@ -493,16 +553,24 @@ class ZeroOnnx2(ZeroOnnx):
             # inference's gate weights g = max(theta, 0) (docs/az.md 43.6)
             self.register_buffer('v_g', net.gate.detach().clamp(min=0).float().clone(), persistent=False)
 
-    def _tail_embed(self, val, segc, slot):
+    def _tail_embed(self, val, segc, shi, slo):
         """Tail tokens' embeddings [NT, d] (`TokenNet._tail_embed`: the segment's input map of its floats + its
-        position tail_base[k] + pos_tail[k](psi(slot - count)) + its identity's embedding)."""
+        position tail_base[k] + pos_tail[k](psi(slot - count)) + its identity's embedding); the slots as 16-bit halves
+        (`shi`, `slo` in [0, 2^16)), slot - count by halves with a borrow (clamped at 0: a slot below its head is
+        refused)."""
         net = self.net
         NT, D = val.shape[0], net.d
         k = _iclamp(self.v_tk.index_select(0, segc), 0)
-        n = _iclamp(slot - self.v_count.index_select(0, segc), 0, (1 << 32) - 1)
+        dlo = slo - self.v_count_lo.index_select(0, segc)
+        borrow = (dlo < 0).long()
+        dlo = dlo + borrow * 65536
+        dhi = shi - self.v_count_hi.index_select(0, segc) - borrow
+        neg = dhi < 0
+        dhi = torch.where(neg, 0, dhi)
+        dlo = torch.where(neg, 0, dlo)
         pick = k[:, None, None].expand(NT, 1, D)
         x = F.linear(val, self.v_tW, self.v_tb).view(NT, -1, D).gather(1, pick).squeeze(1)
-        pos = F.linear(_psi2(n, self.v_pow2, self.v_sc), self.v_tP).view(NT, -1, D).gather(1, pick).squeeze(1)
+        pos = F.linear(_psi2(dhi, dlo, self.v_pow2, self.v_sc), self.v_tP).view(NT, -1, D).gather(1, pick).squeeze(1)
         t = x + (net.tail_base.index_select(0, k) + pos)
         for j in net.tails:
             s = net.segs[j]
@@ -512,10 +580,12 @@ class ZeroOnnx2(ZeroOnnx):
             t = t + torch.where((segc == j)[:, None], net.emb(i), torch.zeros((), dtype=t.dtype))
         return t
 
-    def _trunk2(self, h, pres, ids, opt_off, opt_action, t_off, t_seg, t_slot, t_val, ov_off, ov_opt, ov_tok):
+    def _trunk2(self, h, pres, ids, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo, t_val, ov_off, ov_opt,
+                ov_seg, ov_col, ov_slot_hi, ov_slot_lo):
         """`_trunk_packed` with each row's tail tokens after its present head tokens, the gated tokens weighted
         (docs/az.md 43.6) and the pointer overrides applied (43.7) -> (z [B, 2 d], logits [B, actions + 1], refused
-        [B]: per row its tail tokens and overrides the network refuses - R5 / R6, which torch raises on)."""
+        [B]: per row its tail tokens and overrides the network refuses - R5 / R6, which torch raises on). Slots and
+        override tokens in int32 pieces (`slot_pieces`, `override_pieces`): no integer here reaches 2^31."""
         net = self.net
         B, NTOK, D = h.shape
         dev = h.device
@@ -524,17 +594,22 @@ class ZeroOnnx2(ZeroOnnx):
         NT = t_seg.shape[0]
         NO = ov_opt.shape[0]
         L = t_val.shape[0]
-        # ---- the tail tokens, checked (R5: a tail segment's, a slot past its head and below 2^32, each row's sorted
-        # by (segment, slot) without a duplicate; the floats as many as the tokens' widths)
+        H16 = 65535
+        one = lambda v: torch.full((1,), v, dtype=torch.long, device=dev)  # noqa: E731
+        # ---- the tail tokens, checked (R5: a tail segment's, a slot past its head and below 2^32 - halves in
+        # [0, 2^16) -, each row's sorted by (segment, slot) without a duplicate; the floats as many as the tokens' widths)
         seg = t_seg.long()
         segc = _iclamp(seg, 0, S - 1)
-        slot = t_slot.long()
+        shi, slo = t_slot_hi.long(), t_slot_lo.long()
+        sok = (shi >= 0) & (shi <= H16) & (slo >= 0) & (slo <= H16)
+        shi, slo = _iclamp(shi, 0, H16), _iclamp(slo, 0, H16)
         trow = _csr_rows(t_off, NT)
         tw = self.v_width.index_select(0, segc)
-        key = segc * (1 << 32) + _iclamp(slot, 0, (1 << 32) - 1)
+        k1 = segc * 65536 + shi                                   # (segment, slot) as (k1, slo): k1 < S 2^16 < 2^31
         first = torch.arange(NT, device=dev) == 0
-        tbad = ((segc != seg) | ~self.v_istail.index_select(0, segc) | (slot < self.v_count.index_select(0, segc))
-                | (slot >= (1 << 32)) | (~first & (_prev(trow) == trow) & (key <= _prev(key))))
+        below = _lt2(shi, slo, self.v_count_hi.index_select(0, segc), self.v_count_lo.index_select(0, segc))
+        tbad = ((segc != seg) | ~self.v_istail.index_select(0, segc) | below | ~sok
+                | (~first & (_prev(trow) == trow) & ~_lt2(_prev(k1), _prev(slo), k1, slo)))
         # (the sum with a 0 appended: ONNX Runtime 1.31.1 reduces an empty axis to a wrong shape - measured)
         lbad = (torch.cat([tw, tw.new_zeros(1)]).sum() != L).long()
         # ---- their floats [NT, Wt] (each token's width(seg) floats, consecutive in t_val) and embeddings
@@ -548,9 +623,9 @@ class ZeroOnnx2(ZeroOnnx):
             # (embedded with one sentinel token after the batch's - the first tail segment's first slot, floats 0 -,
             # dropped after: no empty axis, whose reductions ONNX Runtime 1.31.1 answers with a wrong shape)
             j0 = net.tails[0]
-            te = self._tail_embed(torch.cat([val, val.new_zeros(1, self.Wt)]),
-                                  torch.cat([segc, torch.full((1,), j0, dtype=torch.long, device=dev)]),
-                                  torch.cat([slot, torch.full((1,), int(net.segs[j0]['count']), dtype=torch.long, device=dev)]))[:NT]
+            c0 = int(net.segs[j0]['count'])
+            te = self._tail_embed(torch.cat([val, val.new_zeros(1, self.Wt)]), torch.cat([segc, one(j0)]),
+                                  torch.cat([shi, one(c0 >> 16)]), torch.cat([slo, one(c0 & 0xffff)]))[:NT]
         else:
             te = h.new_zeros(NT, D)
         # ---- the packed list: the N present head tokens (row-major, layout order), then the NT tail tokens
@@ -622,39 +697,48 @@ class ZeroOnnx2(ZeroOnnx):
             # head slot or a tail token of its row) and column; checked as rows.resolve and TokenNet._ov_index check
             # (one sentinel override after the batch's - row 0, option -1: refused, writing row 0's dummy column, and
             # left out of `refused` - so no axis is ever empty: ONNX Runtime's reductions of one answer a wrong shape)
-            orow = torch.cat([_csr_rows(ov_off, NO), torch.zeros(1, dtype=torch.long, device=dev)])
-            opt = torch.cat([ov_opt.long(), torch.full((1,), -1, dtype=torch.long, device=dev)])
+            orow = torch.cat([_csr_rows(ov_off, NO), one(0)])
+            opt = torch.cat([ov_opt.long(), one(-1)])
             nopt = opt_off[1:] - opt_off[:-1]
             obad = (opt < 0) | (opt >= nopt.index_select(0, orow))
-            # (a refused override's action: the dummy column `actions`, at the front of the options' actions)
-            oa = torch.cat([torch.full((1,), net.actions, dtype=torch.long, device=dev), opt_action.long()])
-            act = oa.index_select(0, torch.where(obad, 0, opt_off.index_select(0, orow) + opt + 1))
-            tok = torch.cat([ov_tok, torch.full((1,), -1, dtype=torch.long, device=dev)])
-            isgen = tok == -1
-            tc = _iclamp(tok, 0)
-            # (integer `//` and remainder: exact in ONNX - `torch.div` with a rounding mode goes through floats)
-            s_ = tc // (1 << 40)
-            c_ = torch.remainder(tc // (1 << 32), 256)
-            l_ = torch.remainder(tc, 1 << 32)
+            # (a refused override's action: the dummy column `actions`, at the front of the options' actions; a refused
+            # option replaced by 0 before the sum, so no sum leaves the options' range)
+            oa = torch.cat([one(net.actions), opt_action.long()])
+            act = oa.index_select(0, torch.where(obad, 0, opt_off.index_select(0, orow) + torch.where(obad, 0, opt) + 1))
+            # the target token's pieces (`override_pieces`): seg -1 the generic logit, below -1 refused; col and the
+            # slot's halves clamped to their fields before any arithmetic
+            s_ = torch.cat([ov_seg.long(), one(-1)])
+            col = torch.cat([ov_col.long(), one(0)])
+            ohi = torch.cat([ov_slot_hi.long(), one(0)])
+            olo = torch.cat([ov_slot_lo.long(), one(0)])
+            isgen = s_ == -1
+            pok = (col >= 0) & (col <= 255) & (ohi >= 0) & (ohi <= H16) & (olo >= 0) & (olo <= H16)
+            c_ = _iclamp(col, 0, 255)
+            ohi, olo = _iclamp(ohi, 0, H16), _iclamp(olo, 0, H16)
             sc_ = _iclamp(s_, 0, S - 1)
-            head = l_ < self.v_count.index_select(0, sc_)
+            head = _lt2(ohi, olo, self.v_count_hi.index_select(0, sc_), self.v_count_lo.index_select(0, sc_))
+            # (a head target's slot as one integer only where it is below its segment's head: < 2^30)
+            l_ = torch.where(head, ohi, 0) * 65536 + torch.where(head, olo, 0)
             pos = _iclamp(self.v_start.index_select(0, sc_) + l_, 0, NTOK - 1)
             fpos = orow * NTOK + pos
             hpres = flat.index_select(0, fpos)
             hidx = (flat.long().cumsum(0) - 1).index_select(0, fpos)
             # a tail target: the token of its row with that (segment, slot) - a match against every tail token (and
             # one that matches nothing, so an empty tail is no empty axis)
-            tr_ = torch.cat([trow, torch.full((1,), -1, dtype=torch.long, device=dev)])
-            ts_ = torch.cat([seg, torch.full((1,), -1, dtype=torch.long, device=dev)])
-            tl_ = torch.cat([slot, torch.full((1,), -1, dtype=torch.long, device=dev)])
-            eq = (tr_[None, :] == orow[:, None]) & (ts_[None, :] == s_[:, None]) & (tl_[None, :] == l_[:, None])
+            tr_ = torch.cat([trow, one(-1)])
+            ts_ = torch.cat([seg, one(-1)])
+            th_ = torch.cat([shi, one(-1)])
+            tl_ = torch.cat([slo, one(-1)])
+            eq = ((tr_[None, :] == orow[:, None]) & (ts_[None, :] == s_[:, None]) & (th_[None, :] == ohi[:, None])
+                  & (tl_[None, :] == olo[:, None]))
             found = eq.any(1)
             tidx = N + eq.long().argmax(1)
-            obad = obad | (tok < -1) | (~isgen & ((s_ >= S) | (c_ >= self.v_nk.index_select(0, sc_))
-                                                   | (head & ~hpres) | (~head & ~found)))
+            obad = obad | (s_ < -1) | (~isgen & ((s_ >= S) | ~pok | (c_ >= self.v_nk.index_select(0, sc_))
+                                                  | (head & ~hpres) | (~head & ~found)))
             p = _iclamp(torch.where(head, hidx, tidx), 0, N + NT - 1)
             gcol = _iclamp(self.v_c0.index_select(0, sc_) + c_, 0, C - 1)
-            v = P.reshape(-1).index_select(0, p * C + gcol)
+            # (the target's row of the pointer logits, then its column: no flat index p C + col)
+            v = P.index_select(0, p).gather(1, gcol[:, None]).squeeze(1)
             g0 = gen.reshape(-1).index_select(0, orow * A1 + act)
             if net.gated:
                 gi_ = self.v_gi.index_select(0, sc_)
@@ -677,8 +761,8 @@ class ZeroOnnx2(ZeroOnnx):
         refused = _row_sum(tbad, t_off) + oref + lbad
         return z, pol.view(B, A1), refused
 
-    def forward(self, x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot, t_val,
-                ov_off, ov_opt, ov_tok):
+    def forward(self, x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo,
+                t_val, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo):
         net = self.net
         x = densify(x_ptr, x_idx, x_val, net.features)
         aux = bool(self.layout)
@@ -686,8 +770,8 @@ class ZeroOnnx2(ZeroOnnx):
         if net.readers is not None:
             rraw, ent = _read(net, x)
         h, pres, ids = slot_tokens(net, x, ent)
-        z, pol, refused = self._trunk2(h, pres, ids, opt_off, opt_action, t_off, t_seg, t_slot, t_val, ov_off, ov_opt,
-                                       ov_tok)
+        z, pol, refused = self._trunk2(h, pres, ids, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo, t_val,
+                                       ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo)
         r = net._heads(z, pol, n_players, aux, None, rraw)
         policy, value, margin, aux_out = _outputs(net, self.layout, x.shape[0], r[0], r[1], r[2],
                                                   r[3] if aux else None, n_players, belief)
@@ -727,11 +811,12 @@ def example_inputs2(net):
     j = net.tails[0] if net.tails else 0
     w = net.segs[j]['width'] if net.tails else 6
     c = net.segs[j]['count']
+    hi, lo = slot_pieces([c, c + 1, c, c + 2])
+    i32 = lambda v: torch.as_tensor(np.asarray(v, np.int32))  # noqa: E731
     args += [torch.tensor([0, 2, 3, 5], dtype=torch.int64), torch.tensor([0, 1, 0, 1, 2], dtype=torch.int32) % A,
-             torch.tensor([0, 2, 2, 4], dtype=torch.int64), torch.full((4,), j, dtype=torch.int32),
-             torch.tensor([c, c + 1, c, c + 2], dtype=torch.int64), torch.zeros(4 * w),
-             torch.tensor([0, 1, 1, 2], dtype=torch.int64), torch.tensor([1, 0], dtype=torch.int32),
-             torch.tensor([-1, -1], dtype=torch.int64)]
+             torch.tensor([0, 2, 2, 4], dtype=torch.int64), torch.full((4,), j, dtype=torch.int32), i32(hi), i32(lo),
+             torch.zeros(4 * w), torch.tensor([0, 1, 1, 2], dtype=torch.int64), torch.tensor([1, 0], dtype=torch.int32)]
+    args += [i32(x) for x in override_pieces([-1, -1])]
     return tuple(args)
 
 
@@ -744,8 +829,9 @@ def dynamic_shapes2():
     L = torch.export.Dim('L', min=0, max=1 << 30)
     NO = torch.export.Dim('NO', min=0, max=1 << 24)
     return {'x_ptr': {0: B + 1}, 'x_idx': {0: N}, 'x_val': {0: N}, 'n_players': {0: B}, 'belief': {0: B},
-            'opt_off': {0: B + 1}, 'opt_action': {0: K}, 't_off': {0: B + 1}, 't_seg': {0: NT}, 't_slot': {0: NT},
-            't_val': {0: L}, 'ov_off': {0: B + 1}, 'ov_opt': {0: NO}, 'ov_tok': {0: NO}}
+            'opt_off': {0: B + 1}, 'opt_action': {0: K}, 't_off': {0: B + 1}, 't_seg': {0: NT},
+            't_slot_hi': {0: NT}, 't_slot_lo': {0: NT}, 't_val': {0: L}, 'ov_off': {0: B + 1}, 'ov_opt': {0: NO},
+            'ov_seg': {0: NO}, 'ov_col': {0: NO}, 'ov_slot_hi': {0: NO}, 'ov_slot_lo': {0: NO}}
 
 
 def metadata2(net, extra=None):
@@ -873,10 +959,15 @@ def portable(model):
 
 
 def portable_file(src, dst):
-    """`portable` on an exported file (written atomically; metadata `portable` 1) -> the rewrites."""
+    """`portable` on an exported file (written atomically; metadata `portable` 1; the exporter's annotations stripped:
+    `strip_annotations`) -> the rewrites."""
     import onnx
     model = onnx.load(src)
     stats = portable(model)
+    strip_annotations(model)
+    if any(e.key == 'zero_onnx' and e.value == '2' for e in model.metadata_props):
+        int32_slices(model)
+        check_int32(model)
     for e in model.metadata_props:
         if e.key == 'portable':
             break
@@ -910,7 +1001,7 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
         with torch.no_grad():
             prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=opset, input_names=names,
                                      output_names=outs, dynamic_shapes=dyn, optimize=True, verbose=False)
-        return _save(prog.model_proto, metadata2(net, extra), path, opset, make_portable)
+        return _save(prog.model_proto, metadata2(net, extra), path, opset, make_portable, int32=True)
     mod = ZeroOnnx(net, packing).eval()
     packing = mod.packing
     args = example_inputs(net, packing)
@@ -924,14 +1015,191 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
     return _save(prog.model_proto, metadata(net, packing, extra), path, opset, make_portable)
 
 
-def _save(model, meta, path, opset, make_portable):
-    """The exported model with its metadata (`portable`'s rewrites first), checked, written atomically -> the
-    metadata."""
+def strip_annotations(model):
+    """Remove what the exporter writes for debugging only - each node's `metadata_props` (`pkg.torch.onnx.stack_trace`
+    with the exporting checkout's file paths and line numbers, name scopes, class hierarchy, fx node, the rewriter's
+    rule names) and every doc string (model, graph, nodes, inputs / outputs / value infos, initializers, functions,
+    subgraphs) - so a checkpoint exports to the same bytes from any checkout and no graph carries a local path. No node,
+    attribute, initializer, name or the model's own metadata changes. In place -> the number of entries removed."""
+    k = 0
+
+    def clean(x):
+        nonlocal k
+        if getattr(x, 'doc_string', ''):
+            x.doc_string = ''
+            k += 1
+        if hasattr(x, 'metadata_props') and len(x.metadata_props):
+            k += len(x.metadata_props)
+            del x.metadata_props[:]
+
+    def graph(g):
+        clean(g)
+        for n in g.node:
+            node(n)
+        for v in list(g.input) + list(g.output) + list(g.value_info):
+            clean(v)
+        for i in g.initializer:
+            clean(i)
+
+    def node(n):
+        clean(n)
+        for a in n.attribute:
+            if a.HasField('g'):
+                graph(a.g)
+            for sg in a.graphs:
+                graph(sg)
+
+    model.doc_string = ''
+    graph(model.graph)
+    for f in model.functions:
+        f.doc_string = ''
+        for n in f.node:
+            node(n)
+        if hasattr(f, 'metadata_props'):
+            k += len(f.metadata_props)
+            del f.metadata_props[:]
+    return k
+
+
+def int32_slices(model):
+    """zero-onnx/2: a Slice's start / end constant outside int32 (the exporter's 2^63 - 1 for "to the end") replaced by
+    the int32 bound of its sign - the same slice for every axis below 2^31 elements (ONNX clamps them to the axis), and
+    no zero-onnx/2 axis reaches 2^31 (`int32_bound`). In place -> the number of inputs replaced."""
+    from onnx import numpy_helper
+    g = model.graph
+    inits = {i.name: i for i in g.initializer}
+    consts = {n.output[0]: n for n in g.node if n.op_type == 'Constant' and n.attribute and n.attribute[0].name == 'value'}
+    used = {x for n in g.node for x in list(n.input) + list(n.output)} | set(inits) | {i.name for i in g.input}
+    k = 0
+    for n in g.node:
+        if n.op_type != 'Slice':
+            continue
+        for j in (1, 2):
+            if j >= len(n.input) or not n.input[j]:
+                continue
+            name = n.input[j]
+            t = inits[name] if name in inits else (consts[name].attribute[0].t if name in consts else None)
+            if t is None:
+                continue
+            a = numpy_helper.to_array(t)
+            if a.dtype != np.int64 or not ((a > INT32_MAX) | (a < -INT32_MAX - 1)).any():
+                continue
+            b = np.clip(a, -INT32_MAX - 1, INT32_MAX).astype(np.int64)
+            i = 0
+            while f'int32/{name}/{i}' in used:
+                i += 1
+            new = f'int32/{name}/{i}'
+            used.add(new)
+            g.initializer.append(numpy_helper.from_array(b, new))
+            n.input[j] = new
+            k += 1
+    read = {x for n in g.node for x in n.input} | {o.name for o in g.output}
+    keep = [i for i in g.initializer if i.name in read]
+    if len(keep) != len(g.initializer):
+        del g.initializer[:]
+        g.initializer.extend(keep)
+    return k
+
+
+def check_int32(model):
+    """zero-onnx/2's refusal (docs/az.md 46.2): a graph with an integer constant outside int32 (an initializer, a
+    Constant's value / value_int(s), a ConstantOfShape's value, any tensor attribute; in subgraphs and functions too) or
+    any BitShift is not exported - DirectML computes int64 in 32 bits, so such a value would be read wrong there. ->
+    the number of integer constants checked."""
+    from onnx import AttributeProto, numpy_helper
+    bad, k = [], 0
+
+    def chk(where, a):
+        nonlocal k
+        a = np.asarray(a)
+        if a.dtype.kind not in 'iu' or not a.size:
+            return
+        k += 1
+        if int(a.min()) < -INT32_MAX - 1 or int(a.max()) > INT32_MAX:
+            bad.append(f'{where} ({a.dtype}, {int(a.min())} .. {int(a.max())})')
+
+    def nodes(ns, scope):
+        for n in ns:
+            if n.op_type == 'BitShift':
+                bad.append(f'{scope}{n.name}: BitShift')
+            for a in n.attribute:
+                if a.type == AttributeProto.TENSOR:
+                    chk(f'{scope}{n.name}.{a.name}', numpy_helper.to_array(a.t))
+                elif a.type == AttributeProto.TENSORS:
+                    for t in a.tensors:
+                        chk(f'{scope}{n.name}.{a.name}', numpy_helper.to_array(t))
+                elif n.op_type == 'Constant' and a.type == AttributeProto.INT:
+                    chk(f'{scope}{n.name}.{a.name}', np.array([a.i]))
+                elif n.op_type == 'Constant' and a.type == AttributeProto.INTS:
+                    chk(f'{scope}{n.name}.{a.name}', np.array(a.ints, np.int64))
+                if a.HasField('g'):
+                    graph(a.g, f'{scope}{n.name}/')
+                for sg in a.graphs:
+                    graph(sg, f'{scope}{n.name}/')
+
+    def graph(g, scope=''):
+        for i in g.initializer:
+            chk(f'{scope}initializer {i.name}', numpy_helper.to_array(i))
+        nodes(g.node, scope)
+
+    graph(model.graph)
+    for f in model.functions:
+        nodes(f.node, f'{f.name}/')
+    if bad:
+        raise ValueError(f'zero-onnx/2: {len(bad)} integer constant(s) outside int32 or shift(s) in the graph (DirectML '
+                         f'computes int64 in 32 bits; docs/az.md 46.2): ' + '; '.join(bad[:8]))
+    return k
+
+
+def int64_max(model, feeds, threads=4):
+    """The largest |value| of every int64 tensor a graph computes on the given inputs - the runtime half of
+    zero-onnx/2's int32 rule beside `check_int32` (docs/az.md 46.7). `model`: a ModelProto (not changed: a copy has
+    each int64 intermediate, typed by ONNX shape inference, made a graph output) or a path; `feeds`: input dicts
+    (`onnx_parity.feeds`), run by ONNX Runtime's CPU EP -> {'tensors': int64 tensors read, 'untyped': outputs shape
+    inference could not type (not read), 'max_abs': the largest |value|, 'top': [(name, max_abs), ...] the 8 largest}.
+    Every value must stay below 2^31."""
+    import onnx
+    import onnxruntime as ort
+    m = onnx.ModelProto()
+    if isinstance(model, (str, os.PathLike)):
+        m.CopyFrom(onnx.load(model))
+    else:
+        m.CopyFrom(model)
+    mi = onnx.shape_inference.infer_shapes(m)
+    types = {v.name: v.type.tensor_type.elem_type for v in list(mi.graph.value_info) + list(mi.graph.input) + list(mi.graph.output)}
+    have = {o.name for o in m.graph.output}
+    inits = {i.name for i in m.graph.initializer}
+    outs = [o for n in m.graph.node for o in n.output if o and o not in have and o not in inits]
+    names = [o for o in outs if types.get(o) == onnx.TensorProto.INT64]
+    for nm in names:
+        m.graph.output.append(onnx.helper.make_tensor_value_info(nm, onnx.TensorProto.INT64, None))
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = int(threads)
+    so.inter_op_num_threads = 1
+    sess = ort.InferenceSession(m.SerializeToString(), so, providers=['CPUExecutionProvider'])
+    onames = [o.name for o in sess.get_outputs()]
+    best = {}
+    for f in feeds:
+        for nm, v in zip(onames, sess.run(None, f)):
+            if v.dtype == np.int64 and v.size:
+                best[nm] = max(best.get(nm, 0), int(np.abs(v).max()))
+    top = sorted(best.items(), key=lambda kv: -kv[1])
+    return {'tensors': len(best), 'untyped': sum(1 for o in outs if o not in types), 'max_abs': top[0][1] if top else 0,
+            'top': top[:8]}
+
+
+def _save(model, meta, path, opset, make_portable, int32=False):
+    """The exported model with its metadata (`portable`'s rewrites first; the exporter's annotations stripped;
+    zero-onnx/2: `int32_slices` then `check_int32`), checked, written atomically -> the metadata."""
     import onnx
     meta['opset'] = str(opset)
     if make_portable:
         portable(model)
         meta['portable'] = '1'
+    strip_annotations(model)
+    if int32:
+        int32_slices(model)
+        check_int32(model)
     del model.metadata_props[:]
     for k, v in meta.items():
         e = model.metadata_props.add()
@@ -1022,7 +1290,8 @@ def write_reference(net, rows_list, out, n=256, info=None, tol=REFERENCE_TOL):
         raise ValueError(f'the {n} reference rows hold no belief row: the auxiliary head would go untested (more rows, or batches with belief rows)')
     v2 = onnx_version(net) == 2
     if v2:
-        # (zero-onnx/2: the self-test answers tail tokens and overrides too - never a reference set without them)
+        # (zero-onnx/2: the self-test answers tail tokens and overrides too - never a reference set without them; the
+        # files keep the driver's arrays - packed override tokens, u32 slots -, the feeders split them)
         st = rows.tail_stats()
         if net.tails and not st['tail_tokens']:
             raise ValueError(f'the {n} reference rows hold no tail token: the network\'s tail segments would go untested '

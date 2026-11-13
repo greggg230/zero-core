@@ -180,18 +180,56 @@ def test_the_graph_refuses_what_the_network_refuses(tmp_path):
     t = base.tail
     rt = next(b for b in range(12) if t.counts()[b] >= 2)
     j = int(t.off[rt])
-    for seg, slot in ((7, 9), (0, 1)):
+    for seg, slot in ((7, 9), (0, 1), (0, 1 << 32), (0, -1)):              # (and slots outside u32: a high half -1)
         s2, l2 = t.seg.astype(np.int64).copy(), t.slot.astype(np.int64).copy()
         s2[j], l2[j] = seg, slot
         rows = OP.Rows(base.xs_off, base.xs_idx, base.xs_val, base.n_players, base.opt_off, base.opt_action, base.extra,
                        base.F, tail=None, ov=base.ov)
         f = OP.feeds(rows, v2=True)
-        f.update(t_off=t.off, t_seg=s2.astype(np.int32), t_slot=l2, t_val=t.val.astype(np.float32))
+        hi, lo = OX.slot_pieces(l2)
+        f.update(t_off=t.off, t_seg=s2.astype(np.int32), t_slot_hi=hi, t_slot_lo=lo, t_val=t.val.astype(np.float32))
         ref = np.asarray(sess.run(None, f)[4])
         assert ref[rt] >= 1, (seg, slot, ref)
     f = OP.feeds(base, v2=True)
     f['t_val'] = f['t_val'][:-1]                                             # one float short
     assert (np.asarray(sess.run(None, f)[4]) >= 1).all()
+    # pieces outside their fields (no host splits a token so; the graph refuses them, never reads them wrapped)
+    for key, val in (('t_slot_lo', 1 << 16), ('t_slot_hi', -3), ('t_slot_hi', 1 << 16)):
+        f = OP.feeds(base, v2=True)
+        f[key] = f[key].copy()
+        f[key][j] = val
+        assert np.asarray(sess.run(None, f)[4])[rt] >= 1, (key, val)
+    rv = next(b for b in range(12) if base.ov.counts()[b] > 0 and base.ov.tok[base.ov.off[b]] >= 0)
+    jv = int(base.ov.off[rv])
+    for key, val in (('ov_col', 256), ('ov_col', -1), ('ov_slot_lo', 1 << 16), ('ov_slot_hi', -1), ('ov_seg', -5)):
+        f = OP.feeds(base, v2=True)
+        f[key] = f[key].copy()
+        f[key][jv] = val
+        ref = np.asarray(sess.run(None, f)[4])
+        assert ref[rv] == 1 and ref.sum() == 1, (key, val, ref)
+
+
+def test_int32_pieces_and_the_piece_bound():
+    """The host's split (zero_worker's `override_pieces` / slot halves): every piece in int32, the packed token and the
+    slot back from them exactly; -1 the generic logit, other negatives refused (-2); seg whole. The piece bound
+    (`int32_bound`, the numbers of zero_worker's unit test) and a piece over 2^31 refused by the feeder."""
+    toks = [int(RW.pack_tok(s, c, l)) for s, c, l in ((0, 0, 0), (2, 7, (1 << 32) - 1), (65535, 255, 65536), (17, 3, 123456789))]
+    seg, col, hi, lo = OX.override_pieces(toks)
+    assert all(x.dtype == np.int32 and (x >= 0).all() for x in (seg, col, hi, lo))
+    back = (seg.astype(np.int64) << 40) | (col.astype(np.int64) << 32) | (hi.astype(np.int64) << 16) | lo
+    assert back.tolist() == toks
+    assert [x.tolist() for x in OX.override_pieces([-1, -7, 1 << 60])] == [[-1, -2, 1 << 20], [0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    h, l_ = OX.slot_pieces(np.array([0, 5, 65536, (1 << 32) - 1, 1 << 32, -1], np.int64))
+    assert h.tolist() == [0, 0, 1, 65535, -1, -1] and l_[:4].tolist() == [0, 5, 0, 65535]
+    t_off = np.array([0, 1, 3])
+    assert OX.int32_bound(2, 9, 100, 4, 3, t_off, 3, 7, 5, 3) == 2 * (100 + 1 + 2)
+    assert OX.int32_bound(2, 9, 1, 4, 3, t_off, 3, 7, 5, 3) == (3 + 1) * 3
+    assert OX.int32_bound(2, 9, 1, 100, 3, t_off, 3, 7, 5, 3) == 2 * (100 + 1)
+    net = rand_net(OFFERS, seed=7)
+    rows = gate_rows(net, toy_batch(12, seed=9), np.full(12, ROW_LEAF, np.uint8))
+    assert set(OP.varlen_feeds(rows, {'actions': A, 'tail_width': 16})) == set(OX.VARLEN_INPUTS)
+    with pytest.raises(ValueError, match='2\\^31'):
+        OP.varlen_feeds(rows, {'actions': (1 << 31) // 12, 'tail_width': 16})
 
 
 def test_interface_metadata_and_v1_unchanged(tmp_path):
@@ -206,10 +244,26 @@ def test_interface_metadata_and_v1_unchanged(tmp_path):
     T = onnx.TensorProto
     assert list(ins) == list(OX.INPUTS2)
     assert ins == {'x_ptr': T.INT64, 'x_idx': T.INT32, 'x_val': T.FLOAT, 'n_players': T.INT64, 'belief': T.BOOL,
-                   'opt_off': T.INT64, 'opt_action': T.INT32, 't_off': T.INT64, 't_seg': T.INT32, 't_slot': T.INT64,
-                   't_val': T.FLOAT, 'ov_off': T.INT64, 'ov_opt': T.INT32, 'ov_tok': T.INT64}
+                   'opt_off': T.INT64, 'opt_action': T.INT32, 't_off': T.INT64, 't_seg': T.INT32, 't_slot_hi': T.INT32,
+                   't_slot_lo': T.INT32, 't_val': T.FLOAT, 'ov_off': T.INT64, 'ov_opt': T.INT32, 'ov_seg': T.INT32,
+                   'ov_col': T.INT32, 'ov_slot_hi': T.INT32, 'ov_slot_lo': T.INT32}
     assert [o.name for o in m.graph.output] == list(OX.OUTPUTS2)
     assert m.graph.output[4].type.tensor_type.elem_type == T.INT64
+    # no integer constant outside int32, no shift (DirectML computes int64 in 32 bits); the check refuses one
+    assert OX.check_int32(m) > 0 and not any(n.op_type == 'BitShift' for n in m.graph.node)
+    m2 = onnx.load(path)
+    m2.graph.initializer.append(onnx.numpy_helper.from_array(np.array([1 << 40], np.int64), 'big'))
+    with pytest.raises(ValueError, match='outside int32'):
+        OX.check_int32(m2)
+    m3 = onnx.load(path)
+    m3.graph.node.append(onnx.helper.make_node('Constant', [], ['c3'], value_ints=[0, -(1 << 31) - 1]))
+    with pytest.raises(ValueError, match='outside int32'):
+        OX.check_int32(m3)
+    # the runtime half: every int64 value the graph computes on real-looking rows (tails, overrides) below 2^31
+    rows = gate_rows(net, toy_batch(40, seed=9, p_head=0.5, p_offer=0.5), kinds_of(40, 5))
+    r = OX.int64_max(m, [OP.feeds(rows, v2=True), OP.feeds(rows.take(np.arange(7)), v2=True)], threads=1)
+    assert r['tensors'] > 50 and r['untyped'] == 0 and 0 < r['max_abs'] < 1 << 31, r
+    assert len(m.graph.output) == len(OX.OUTPUTS2)                           # (the model given is not changed)
     md = {p.key: p.value for p in m.metadata_props}
     assert md['zero_onnx'] == '2' and json.loads(md['tails']) == [[0, 'items', 16, 4], [1, 'marks', 4, 0], [2, 'offers', 4, 0]]
     assert md['option_pointers'] == 'true' and md['max_row_tokens'] == '64' and md['tail_width'] == '16'
@@ -222,6 +276,13 @@ def test_interface_metadata_and_v1_unchanged(tmp_path):
     assert OX.onnx_version(plain) == 1
     p1, m1 = export(plain, tmp_path, 'v1')
     assert m1['zero_onnx'] == '1' and [i.name for i in onnx.load(p1).graph.input] == list(OX.INPUTS)
+    # both graphs without the exporter's annotations (stack traces with the checkout's paths, doc strings)
+    for p in (path, p1):
+        g = onnx.load(p)
+        assert not g.doc_string and not g.graph.doc_string
+        assert not any(len(n.metadata_props) or n.doc_string for n in g.graph.node), p
+        assert not any(len(v.metadata_props) or v.doc_string for v in list(g.graph.value_info) + list(g.graph.input))
+        assert b'stack_trace' not in open(p, 'rb').read() and b'onnx_export.py' not in open(p, 'rb').read()
     with pytest.raises(ValueError, match='zero-onnx/1'):
         OX.ZeroOnnx(net)
     with pytest.raises(ValueError, match='zero-onnx/1'):

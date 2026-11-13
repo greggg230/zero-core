@@ -764,8 +764,9 @@ pub fn expect_of(meta: &[(String, String)], path: &Path) -> Result<Expect, Strin
     Ok(Expect { game: get("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false, tails, option_pointers: get("option_pointers").as_deref() == Some("true") })
 }
 
-/// zero-onnx/2's more inputs (zero-core docs/az.md 46): the driver's options, tail tokens and pointer overrides.
-pub const VARLEN_INPUTS: [&str; 9] = ["opt_off", "opt_action", "t_off", "t_seg", "t_slot", "t_val", "ov_off", "ov_opt", "ov_tok"];
+/// zero-onnx/2's more inputs (zero-core docs/az.md 46): the driver's options, tail tokens and pointer overrides, every
+/// slot and override token in int32 pieces (`varlen_piece`).
+pub const VARLEN_INPUTS: [&str; 13] = ["opt_off", "opt_action", "t_off", "t_seg", "t_slot_hi", "t_slot_lo", "t_val", "ov_off", "ov_opt", "ov_seg", "ov_col", "ov_slot_hi", "ov_slot_lo"];
 
 /// A zero-onnx/2 graph's tail segments' widths by segment index (0: not a tail segment) from its metadata (`tails`
 /// [[segment, name, width, head slots], ...]), checked against the game's (`Expect::tails`, `option_pointers`); None
@@ -854,6 +855,8 @@ pub struct InferenceSession {
     pub meta: Vec<(String, String)>,
     actions: usize,
     aux_w: usize,
+    /// Features per row (a zero-onnx/2 piece's `int32_bound`).
+    features: usize,
     /// A zero-onnx/2 graph: its tail segments' widths by segment index (`varlen_of`); None: zero-onnx/1.
     widths: Option<Vec<usize>>,
     /// Calls, rows, seconds in session.run (and the post-processing), per batch durations (ms).
@@ -1046,6 +1049,7 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
         meta,
         actions,
         aux_w,
+        features: want_graph.features,
         widths,
         calls: 0,
         rows: 0,
@@ -1149,7 +1153,14 @@ impl InferenceSession {
         let bel: Vec<bool> = idx.iter().map(|&r| b.extra[r] == ROW_BELIEF).collect();
         let (actions, aux_w) = (self.actions, self.aux_w);
         let vr = match &self.widths {
-            Some(w) => Some(varlen_piece(b, idx, w)?),
+            Some(w) => {
+                let v = varlen_piece(b, idx, w)?;
+                let m = int32_bound(n, nnz, self.features, actions, w.iter().copied().max().unwrap_or(0), &v);
+                if m >= 1 << 31 {
+                    return Err(format!("a piece of {n} rows whose integers could reach {m} in the graph: zero-onnx/2 keeps every integer below 2^31 (zero-core docs/az.md 46.2; smaller pieces)"));
+                }
+                Some(v)
+            }
             None => None,
         };
         let v2 = vr.is_some();
@@ -1162,18 +1173,23 @@ impl InferenceSession {
             "belief" => Tensor::from_array((vec![n as i64], bel)).map_err(oerr)?,
         ];
         if let Some(v) = vr {
-            // zero-onnx/2 (zero-core docs/az.md 46): the piece's options, tail tokens and overrides, as the driver sent them
+            // zero-onnx/2 (zero-core docs/az.md 46): the piece's options, tail tokens and overrides (slots and override
+            // tokens in int32 pieces)
             let len = |k: usize| vec![k as i64];
             inputs.extend(ort::inputs![
                 "opt_off" => Tensor::from_array((len(v.opt_off.len()), v.opt_off)).map_err(oerr)?,
                 "opt_action" => Tensor::from_array((len(v.opt_action.len()), v.opt_action)).map_err(oerr)?,
                 "t_off" => Tensor::from_array((len(v.t_off.len()), v.t_off)).map_err(oerr)?,
                 "t_seg" => Tensor::from_array((len(v.t_seg.len()), v.t_seg)).map_err(oerr)?,
-                "t_slot" => Tensor::from_array((len(v.t_slot.len()), v.t_slot)).map_err(oerr)?,
+                "t_slot_hi" => Tensor::from_array((len(v.t_slot_hi.len()), v.t_slot_hi)).map_err(oerr)?,
+                "t_slot_lo" => Tensor::from_array((len(v.t_slot_lo.len()), v.t_slot_lo)).map_err(oerr)?,
                 "t_val" => Tensor::from_array((len(v.t_val.len()), v.t_val)).map_err(oerr)?,
                 "ov_off" => Tensor::from_array((len(v.ov_off.len()), v.ov_off)).map_err(oerr)?,
                 "ov_opt" => Tensor::from_array((len(v.ov_opt.len()), v.ov_opt)).map_err(oerr)?,
-                "ov_tok" => Tensor::from_array((len(v.ov_tok.len()), v.ov_tok)).map_err(oerr)?,
+                "ov_seg" => Tensor::from_array((len(v.ov_seg.len()), v.ov_seg)).map_err(oerr)?,
+                "ov_col" => Tensor::from_array((len(v.ov_col.len()), v.ov_col)).map_err(oerr)?,
+                "ov_slot_hi" => Tensor::from_array((len(v.ov_slot_hi.len()), v.ov_slot_hi)).map_err(oerr)?,
+                "ov_slot_lo" => Tensor::from_array((len(v.ov_slot_lo.len()), v.ov_slot_lo)).map_err(oerr)?,
             ]);
         }
         let out = s.run(inputs).map_err(oerr)?;
@@ -1268,24 +1284,69 @@ impl InferenceSession {
 }
 
 /// zero-onnx/2's more inputs for rows `idx` of a batch (zero-core docs/az.md 46), each CSR rebased: the options
-/// (`opt_off` i64, `opt_action` i32), the tail tokens (`t_off` i64, `t_seg` i32, `t_slot` i64, `t_val` f32 - each
-/// token's `width(seg)` floats, consecutive, `widths` the graph's) and the overrides (`ov_off` i64, `ov_opt` i32,
-/// `ov_tok` i64). A batch of a game without tail segments (or without overrides) has empty CSRs of B + 1 zeros.
+/// (`opt_off` i64, `opt_action` i32), the tail tokens (`t_off` i64, `t_seg` i32, the slot as `t_slot_hi` / `t_slot_lo`
+/// i32 - its high and low 16 bits -, `t_val` f32 - each token's `width(seg)` floats, consecutive, `widths` the graph's)
+/// and the overrides (`ov_off` i64, `ov_opt` i32, the driver's packed token as `ov_seg` / `ov_col` / `ov_slot_hi` /
+/// `ov_slot_lo` i32: `override_pieces`). No integer of 2^31 or more goes to the graph (DirectML computes int64 in 32
+/// bits). A batch of a game without tail segments (or without overrides) has empty CSRs of B + 1 zeros.
 #[derive(Debug)]
 pub struct VarlenPiece {
     pub opt_off: Vec<i64>,
     pub opt_action: Vec<i32>,
     pub t_off: Vec<i64>,
     pub t_seg: Vec<i32>,
-    pub t_slot: Vec<i64>,
+    pub t_slot_hi: Vec<i32>,
+    pub t_slot_lo: Vec<i32>,
     pub t_val: Vec<f32>,
     pub ov_off: Vec<i64>,
     pub ov_opt: Vec<i32>,
-    pub ov_tok: Vec<i64>,
+    pub ov_seg: Vec<i32>,
+    pub ov_col: Vec<i32>,
+    pub ov_slot_hi: Vec<i32>,
+    pub ov_slot_lo: Vec<i32>,
+}
+
+/// The driver's packed override token (`tail::pack_tok`: `seg << 40 | col << 32 | slot`, -1 the generic logit) as
+/// zero-onnx/2's int32 pieces (seg, col, slot >> 16, slot & 0xffff): -1 -> (-1, 0, 0, 0); any other negative -> (-2,
+/// 0, 0, 0), which the graph refuses as it refused the packed token; seg is `tok >> 40` whole (a value past the
+/// network's segments is refused, not masked).
+pub fn override_pieces(tok: i64) -> [i32; 4] {
+    if tok < 0 {
+        return [if tok == -1 { -1 } else { -2 }, 0, 0, 0];
+    }
+    [(tok >> 40) as i32, ((tok >> 32) & 0xff) as i32, ((tok >> 16) & 0xffff) as i32, (tok & 0xffff) as i32]
+}
+
+/// An upper bound of every integer a zero-onnx/2 graph computes on a piece of `n` rows (`nnz` non-zeros of `features`
+/// per row, `actions`, tail width `tail_width`; zero-core docs/az.md 46.2): the densified rows' flat index n (F + 1),
+/// the packed token list's and the padded rows' indices n (F + 1 + the most tail tokens of a row), the policy's
+/// n (A + 1), the tail floats' (NT + 1) Wt and L + 1, the options' K + 1, the overrides' NO + 1, the merged CSR
+/// sequence's nnz + n.
+pub fn int32_bound(n: usize, nnz: usize, features: usize, actions: usize, tail_width: usize, v: &VarlenPiece) -> u64 {
+    let t_max = v.t_off.windows(2).map(|w| (w[1] - w[0]) as u64).max().unwrap_or(0);
+    let (n, f) = (n as u64, features as u64);
+    [nnz as u64 + n, n * (f + 1 + t_max), n * (actions as u64 + 1), (v.t_seg.len() as u64 + 1) * tail_width as u64, v.t_val.len() as u64 + 1, v.opt_action.len() as u64 + 1, v.ov_opt.len() as u64 + 1]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
 }
 
 pub fn varlen_piece(b: &Batch, idx: &[usize], widths: &[usize]) -> Result<VarlenPiece, String> {
-    let mut v = VarlenPiece { opt_off: vec![0], opt_action: Vec::new(), t_off: vec![0], t_seg: Vec::new(), t_slot: Vec::new(), t_val: Vec::new(), ov_off: vec![0], ov_opt: Vec::new(), ov_tok: Vec::new() };
+    let mut v = VarlenPiece {
+        opt_off: vec![0],
+        opt_action: Vec::new(),
+        t_off: vec![0],
+        t_seg: Vec::new(),
+        t_slot_hi: Vec::new(),
+        t_slot_lo: Vec::new(),
+        t_val: Vec::new(),
+        ov_off: vec![0],
+        ov_opt: Vec::new(),
+        ov_seg: Vec::new(),
+        ov_col: Vec::new(),
+        ov_slot_hi: Vec::new(),
+        ov_slot_lo: Vec::new(),
+    };
     let tails = !b.t_off.is_empty();
     let ovs = !b.ov_off.is_empty();
     if (tails && b.t_off.len() != b.b + 1) || (ovs && b.ov_off.len() != b.b + 1) {
@@ -1311,7 +1372,8 @@ pub fn varlen_piece(b: &Batch, idx: &[usize], widths: &[usize]) -> Result<Varlen
         if tails {
             for j in b.t_off[r] as usize..b.t_off[r + 1] as usize {
                 v.t_seg.push(b.t_seg[j] as i32);
-                v.t_slot.push(b.t_slot[j] as i64);
+                v.t_slot_hi.push((b.t_slot[j] >> 16) as i32);
+                v.t_slot_lo.push((b.t_slot[j] & 0xffff) as i32);
                 v.t_val.extend_from_slice(&b.t_val[voff[j]..voff[j + 1]]);
             }
         }
@@ -1319,7 +1381,11 @@ pub fn varlen_piece(b: &Batch, idx: &[usize], widths: &[usize]) -> Result<Varlen
         if ovs {
             for j in b.ov_off[r] as usize..b.ov_off[r + 1] as usize {
                 v.ov_opt.push(b.ov_opt[j]);
-                v.ov_tok.push(b.ov_tok[j]);
+                let [s, c, hi, lo] = override_pieces(b.ov_tok[j]);
+                v.ov_seg.push(s);
+                v.ov_col.push(c);
+                v.ov_slot_hi.push(hi);
+                v.ov_slot_lo.push(lo);
             }
         }
         v.ov_off.push(v.ov_opt.len() as i64);
@@ -1490,10 +1556,27 @@ mod tests {
         b.ov_tok = vec![-1, (2 << 40) | 7, -1];
         let widths = vec![3, 0, 1];
         let v = varlen_piece(&b, &[2, 0], &widths).unwrap();
-        assert_eq!((v.opt_off, v.opt_action), (vec![0, 3, 5], vec![13, 14, 15, 10, 11]));
-        assert_eq!((v.t_off, v.t_seg, v.t_slot), (vec![0, 1, 3], vec![0, 0, 2], vec![4_294_967_295, 5, 0]));
+        assert_eq!((v.opt_off.clone(), v.opt_action.clone()), (vec![0, 3, 5], vec![13, 14, 15, 10, 11]));
+        // (slots in 16-bit halves: 2^32 - 1 is (65535, 65535); no piece reaches 2^31)
+        assert_eq!((v.t_off.clone(), v.t_seg.clone()), (vec![0, 1, 3], vec![0, 0, 2]));
+        assert_eq!((v.t_slot_hi.clone(), v.t_slot_lo.clone()), (vec![65535, 0, 0], vec![65535, 5, 0]));
         assert_eq!(v.t_val, vec![5.0, 6.0, 7.0, 1.0, 2.0, 3.0, 4.0]);
-        assert_eq!((v.ov_off, v.ov_opt, v.ov_tok), (vec![0, 2, 3], vec![0, 2, 1], vec![(2 << 40) | 7, -1, -1]));
+        assert_eq!((v.ov_off.clone(), v.ov_opt.clone()), (vec![0, 2, 3], vec![0, 2, 1]));
+        assert_eq!((v.ov_seg.clone(), v.ov_col.clone(), v.ov_slot_hi.clone(), v.ov_slot_lo.clone()), (vec![2, -1, -1], vec![0, 0, 0], vec![0, 0, 0], vec![7, 0, 0]));
+        // the bound: 2 rows, 9 non-zeros of 100 features, 4 actions, tail width 3, at most 2 tail tokens a row
+        assert_eq!(int32_bound(2, 9, 100, 4, 3, &v), 2 * (100 + 1 + 2));
+        assert_eq!(int32_bound(2, 9, 1, 4, 3, &v), (3 + 1) * 3);
+        assert_eq!(int32_bound(2, 9, 1, 100, 3, &v), 2 * (100 + 1));
+        // the packed token's pieces, back to the token exactly; seg whole (bits past 16 kept for the graph to refuse)
+        for (s, c, l) in [(0u64, 0u64, 0u64), (2, 7, 4_294_967_295), (65535, 255, 65536), (17, 3, 123_456_789)] {
+            let tok = ((s << 40) | (c << 32) | l) as i64;
+            let [ps, pc, hi, lo] = override_pieces(tok);
+            assert_eq!(((ps as i64) << 40) | ((pc as i64) << 32) | ((hi as i64) << 16) | lo as i64, tok);
+            assert!([ps, pc, hi, lo].iter().all(|&x| (0..1 << 24).contains(&x)));
+        }
+        assert_eq!(override_pieces(1i64 << 60), [1 << 20, 0, 0, 0]);
+        assert_eq!(override_pieces(-1), [-1, 0, 0, 0]);
+        assert_eq!(override_pieces(-7), [-2, 0, 0, 0]);
         // a game without tails (empty CSR in the batch): B + 1 zeros
         let mut c = b.clone();
         (c.t_off, c.t_seg, c.t_slot, c.t_val) = (vec![], vec![], vec![], vec![]);

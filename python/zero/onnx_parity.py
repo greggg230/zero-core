@@ -292,20 +292,40 @@ def answer(outs, rows):
     return out + (aux[br],) if len(br) else out
 
 
-def varlen_feeds(rows):
+def varlen_feeds(rows, sizes=None):
     """zero-onnx/2's more inputs for `rows` (docs/az.md 46): the options, the tail tokens (each one's floats
-    consecutive, as the driver sends them) and the overrides - empty CSRs for rows without."""
+    consecutive, as the driver sends them; the slots as int32 halves, `onnx_export.slot_pieces`) and the overrides (the
+    packed tokens as int32 pieces, `override_pieces`) - empty CSRs for rows without. `sizes` ({actions, tail_width}:
+    `graph_sizes`): the piece refused at `int32_bound` >= 2^31, as zero_worker refuses it."""
+    from .onnx_export import INT32_MAX, int32_bound, override_pieces, slot_pieces
     B = rows.B
     t, o = rows.tail, rows.ov
     z = np.zeros(B + 1, np.int64)
-    return {'opt_off': rows.opt_off.astype(np.int64), 'opt_action': rows.opt_action.astype(np.int32),
-            't_off': z if t is None else t.off.astype(np.int64),
-            't_seg': np.zeros(0, np.int32) if t is None else t.seg.astype(np.int32),
-            't_slot': np.zeros(0, np.int64) if t is None else t.slot.astype(np.int64),
-            't_val': np.zeros(0, np.float32) if t is None else t.val.astype(np.float32),
-            'ov_off': z if o is None else o.off.astype(np.int64),
-            'ov_opt': np.zeros(0, np.int32) if o is None else o.opt.astype(np.int32),
-            'ov_tok': np.zeros(0, np.int64) if o is None else o.tok.astype(np.int64)}
+    e = np.zeros(0, np.int32)
+    hi, lo = slot_pieces(t.slot) if t is not None else (e, e)
+    ov = override_pieces(o.tok) if o is not None else (e, e, e, e)
+    f = {'opt_off': rows.opt_off.astype(np.int64), 'opt_action': rows.opt_action.astype(np.int32),
+         't_off': z if t is None else t.off.astype(np.int64),
+         't_seg': e if t is None else t.seg.astype(np.int32), 't_slot_hi': hi, 't_slot_lo': lo,
+         't_val': np.zeros(0, np.float32) if t is None else t.val.astype(np.float32),
+         'ov_off': z if o is None else o.off.astype(np.int64),
+         'ov_opt': e if o is None else o.opt.astype(np.int32),
+         'ov_seg': ov[0], 'ov_col': ov[1], 'ov_slot_hi': ov[2], 'ov_slot_lo': ov[3]}
+    if sizes is not None:
+        m = int32_bound(B, len(rows.xs_idx), rows.F, sizes['actions'], sizes['tail_width'], f['t_off'],
+                        len(f['t_seg']), len(f['t_val']), len(f['opt_action']), len(f['ov_opt']))
+        if m > INT32_MAX:
+            raise ValueError(f'a piece of {B} rows whose integers could reach {m} in the graph: zero-onnx/2 keeps every '
+                             f'integer below 2^31 (docs/az.md 46.2; smaller pieces)')
+    return f
+
+
+def graph_sizes(sess):
+    """A zero-onnx/2 session's {actions, tail_width} (`varlen_feeds`' bound); None for a zero-onnx/1 graph."""
+    if not any(i.name == 't_off' for i in sess.get_inputs()):
+        return None
+    m = sess.get_modelmeta().custom_metadata_map
+    return {'actions': int(m['actions']), 'tail_width': int(m.get('tail_width') or 0)}
 
 
 def is_v2(sess):
@@ -315,11 +335,12 @@ def is_v2(sess):
 
 def feeds(rows, packing=None, pidx=None, junk=False, seed=0, v2=False):
     """ONNX Runtime's inputs for `rows` (zero-onnx/1; 'host' also tok_full / tok_n from the host's packing,
-    `junk`: padding positions hold random slots; `v2`: zero-onnx/2's, `varlen_feeds`)."""
+    `junk`: padding positions hold random slots; `v2`: zero-onnx/2's, `varlen_feeds` - a `graph_sizes` dict also
+    checks the piece's `int32_bound`)."""
     f = {'x_ptr': rows.xs_off, 'x_idx': rows.xs_idx, 'x_val': rows.xs_val, 'n_players': rows.n_players,
          'belief': rows.extra == ROW_BELIEF}
     if v2:
-        f.update(varlen_feeds(rows))
+        f.update(varlen_feeds(rows, v2 if isinstance(v2, dict) else None))
     if packing == 'host':
         P = presence_sparse(rows, pidx)
         n = P.sum(1)
@@ -338,7 +359,7 @@ def run_chunked(sess, rows, chunk=64, packing=None, pidx=None):
     non-zero count (a worker-side policy that needs nothing of the network: a row's outputs depend only on
     it; rows of similar size pad less in a token network's attention, as the eager evaluator's chunks of
     64 rows sorted by token count) -> (policy, value, margin, aux) in the rows' order."""
-    v2 = is_v2(sess)
+    v2 = graph_sizes(sess)
     if rows.B <= chunk:
         return sess.run(None, feeds(rows, packing, pidx, v2=v2))
     order = np.argsort(np.diff(rows.xs_off), kind='stable')
@@ -516,7 +537,7 @@ def run_gate(model, onnx_paths, rows_list, sizes=SIZES, tol=TOL, threads=4, log=
     torch.set_num_threads(threads)
     ev = NetEvaluator(model, 'cpu')
     sess = {p: session(path, threads) for p, path in onnx_paths.items()}
-    v2 = {p: is_v2(s) for p, s in sess.items()}
+    v2 = {p: graph_sizes(s) for p, s in sess.items()}
     pidx = model.present_index() if tokens else None
     gated = set(getattr(model, 'gated', None) or [])
     results, ok = [], True

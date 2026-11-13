@@ -6746,7 +6746,7 @@ such a network (R14, 45.6) -, so the farm needs a graph that takes the whole row
 A token network with tail segments, pointer overrides or gates (`net.varlen_features`) exports as **zero-onnx/2**
 (`onnx_export.onnx_version`); every other network exports zero-onnx/1, the same graph as before (46.4). zero-onnx/2's
 inputs are zero-onnx/1's five plus the driver's arrays of docs/search.md 2.15, all always fed (empty CSRs for rows
-without):
+without), every slot and override token in int32 pieces (no integer of the graph reaches 2^31: 46.7):
 
 | | name | type | shape | |
 |---|---|---|---|---|
@@ -6754,11 +6754,11 @@ without):
 | in | `opt_action` | i32 | [K] | each option's action |
 | in | `t_off` | i64 | [B+1] | the rows' tail tokens (B + 1 zeros for a game without tail segments) |
 | in | `t_seg` | i32 | [NT] | each token's segment (driver u16) |
-| in | `t_slot` | i64 | [NT] | its slot (driver u32: every u32 exact) |
+| in | `t_slot_hi`, `t_slot_lo` | i32 | [NT] | its slot (driver u32) as its high and low 16 bits (`slot_pieces`) |
 | in | `t_val` | f32 | [L] | each token's `width(seg)` floats, consecutive (the driver's) |
 | in | `ov_off` | i64 | [B+1] | the rows' pointer overrides |
 | in | `ov_opt` | i32 | [NO] | the option (its index in its row) |
-| in | `ov_tok` | i64 | [NO] | the target, packed: segment at bit 40, column at bit 32, slot below; -1: the generic logit |
+| in | `ov_seg`, `ov_col`, `ov_slot_hi`, `ov_slot_lo` | i32 | [NO] | the target (the driver's packed token: segment at bit 40, column at bit 32, slot below) as its segment, column and the slot's halves (`override_pieces`); segment -1: the generic logit (token -1), -2: any other negative token (refused) |
 | out | `policy`, `value`, `margin`, `aux` | | | zero-onnx/1's (the policy with the overrides applied) |
 | out | `refused` | i64 | [B] | per row, its tail tokens and overrides the network refuses (below); 0 everywhere or the batch is refused |
 
@@ -6775,24 +6775,25 @@ the `packed` graph of 41, with nothing of a network's own in the worker:
   graph: a token's `width(seg)` floats at the running sum of the widths before it, zeros up to the widest tail
   segment), embedded as a head slot is: the segment's input map + its identity's embedding + `tail_base[k] +
   pos_tail[k](psi(slot - count))` - every tail segment's maps as one product, each token's own picked by its segment
-  (`_TailEmbed`'s matrices); psi's 32 binary digits by integer division (ONNX's BitShift takes unsigned integers
-  only; exact for every u32), log2(n + 1) / 32 in float64 and rounded, the sin / cos part from psi's own table.
+  (`_TailEmbed`'s matrices); slot - count by 16-bit halves with a borrow, psi's 32 binary digits by integer division
+  of each half (ONNX's BitShift takes unsigned integers only), log2(n + 1) / 32 in float64 (n exact there) and
+  rounded, the sin / cos part from psi's own table (n mod 256 = the low half's).
 * **The packed list.** The N present head tokens (row-major, layout order) then the NT tail tokens; each row's tail
   tokens follow its head tokens in the padded rows of the attention and the pooling (gathered in and back: no
   scatter-add, 41's rule). A gated segment's tokens weigh g = max(theta, 0) (inference's gate values, constants of
   the graph): the attention's float mask log w (-inf at g = 0: such a token changes nothing, exactly) and the pooling's
   weighted mean; without gated segments the boolean mask and the plain mean of before.
 * **The overrides.** Each override's row from `ov_off`, its action `opt_action[opt_off[row] + opt]`, its target from
-  `ov_tok` (a head slot: its place in the full token axis, `1 + Σ_{s' < s} count(s') + slot`, which must be present in its row; a tail token: the one of its row with
+  its pieces (a head slot: its place in the full token axis, `1 + Σ_{s' < s} count(s') + slot`, which must be present in its row; a tail token: the one of its row with
   that (segment, slot), found by matching every tail token), its pointer logit in its column, a gated target's blended
   with the generic logit as `torch.lerp` computes it (exactly the generic at g = 0, the pointer at 1); -1: the generic
   logit of before the static scatter. Written after the static scatter of the head slots' actions (a tail token has no
   static action), one write per (row, action).
 * **`refused`.** What torch raises on (R5, R6: `TokenNet._check_tail`, `rows.resolve`, `TokenNet._ov_index`) is counted
-  per row instead - a tail token of a segment without a tail or outside the network, a slot at or past 2^32 or inside
-  its segment's head, a row's tokens not sorted by (segment, slot) or repeated; tail floats that do not fit the
-  tokens' widths (every row); an override of an option outside its row, a token below -1, a segment or column out of
-  range, a target head slot not present, a tail token the row lacks, a second override of the same action (which of
+  per row instead - a tail token of a segment without a tail or outside the network, a slot at or past 2^32 (a piece
+  outside [0, 2^16)) or inside its segment's head, a row's tokens not sorted by (segment, slot) or repeated; tail floats that do not fit the
+  tokens' widths (every row); an override of an option outside its row, a token below -1 (segment piece -2), a
+  segment or column out of range (a piece outside its field), a target head slot not present, a tail token the row lacks, a second override of the same action (which of
   two would win is not defined). A refused override writes the dummy column. The worker and `onnx_parity.answer` refuse
   a batch with any (`Refused`): never an answer torch would not give.
 
@@ -6815,7 +6816,7 @@ hold both (at most 4,096 batches, else it fails); `tools/onnx_record.py` keeps t
 ### 46.4 Off by default; tests and checks; measured (the export)
 
 **Off by default.** A network without tail segments, pointer overrides or gates exports zero-onnx/1 as before: the same
-graph (below), its code untouched but for the R14 refusal and `slot_tokens` skipping tail-only segments (none in such a
+graph (below; since 46.7 without the exporter's per-node annotations, byte for byte the earlier graph with them removed), its code untouched but for the R14 refusal and `slot_tokens` skipping tail-only segments (none in such a
 network). Nothing on a run's path imports these modules.
 
 **Problems met** (each handled in the code): ONNX Runtime 1.31.1's CPU `Clip` and `Min` on int64 answer wrongly
@@ -6907,4 +6908,93 @@ shard; a dense shard of tail rows refused). `examples/zw_toy.rs`: the core's toy
   segments are 2 and up) is misread. The worker then plays on the CPU (the factory's fallback). Not changed here: a
   graph DirectML could run would take the override tokens as int32 fields (or keep the integer work off DirectML) - an
   interface change for the owner to decide (zero-farm's GPU work); CUDA computes int64 natively (not measured: the
-  desktop's GPU belongs to the live run).
+  desktop's GPU belongs to the live run). **Fixed before any zero-onnx/2 graph was published: 46.7** (int32 pieces;
+  DirectML then passes).
+
+### 46.7 int32 integers (DirectML) and the exporter's annotations stripped (2026-11-13)
+
+**Why.** DirectML computes int64 in 32 bits (46.6): the first zero-onnx/2 interface fed the packed override tokens
+(segment at bit 40) and u32 slots as int64, and decoded them in the graph with constants of 2^32 and 2^40, so on
+DirectML every override of a v7 row was misread and the self-test refused the provider. Fixed before any zero-onnx/2
+graph was published, so the format needs no third version for it. Separately, the exporter writes each node's source
+annotations - stack traces with the exporting checkout's file paths and line numbers -, so a graph's bytes depended on
+where it was exported from and every graph carried a local path (the published ones too: the committed probe graph,
+46.5, and the pool's).
+
+**What changed.**
+
+* *The interface* (46.1): every tail slot as `t_slot_hi` / `t_slot_lo` (i32: its high and low 16 bits) and every
+  packed override token as `ov_seg` / `ov_col` / `ov_slot_hi` / `ov_slot_lo` (i32), split on the host:
+  `onnx_export.slot_pieces` / `override_pieces` (Python) and `session::override_pieces` / `varlen_piece` (the worker),
+  the same pieces. Token -1 is segment -1 (the generic logit); any other negative token segment -2 (refused, as the
+  packed token was); a token's segment is `tok >> 40` whole (one past the network's segments refused, not masked); a
+  slot outside u32 a high half of -1 (refused). Records, shards (format v2), the driver's packed `ov` arrays and the
+  reference-set files are unchanged - only the graph's inputs.
+* *The graph* (46.2) never forms an integer of 2^31 or more: slots compared and ordered by halves (a row's (segment,
+  slot) order as (segment 2^16 + high, low)), slot - count by halves with a borrow, psi's 32 digits by integer division
+  of each half (2^0 .. 2^15), log2(n + 1) in float64 from the halves (n exact there), n mod 256 from the low half; a head
+  target's slot formed only where it is below its segment's head; a target's pointer logit by row then column (no flat
+  index row C + column); a refused option replaced by 0 before its sum. Pieces outside their fields are refused, never
+  read wrapped.
+* *Export-time refusal* (`check_int32`, zero-onnx/2 only): any integer constant outside int32 - an initializer, a
+  Constant's value / value_int(s), a ConstantOfShape's value, any tensor attribute, in subgraphs and functions too - or
+  any BitShift refuses the export. The exporter's one such constant, a Slice's "to the end" end of 2^63 - 1, is
+  rewritten first to 2^31 - 1 (`int32_slices`: the same slice for every axis below 2^31 elements); the network's own
+  sizes are checked when the module is built (segments below 2^15, head tokens + pointer columns and actions below 2^30,
+  identity radix products below 2^30).
+* *The sizes that grow with a piece* are bounded on the host: `int32_bound` (Python) / `session::int32_bound` (the
+  worker), an upper bound of every integer the graph computes on a piece of B rows - the densified rows' flat index
+  B (F + 1), the packed token list's and the padded rows' indices B (F + 1 + the most tail tokens of a row), the
+  policy's B (A + 1), the tail floats' (NT + 1) Wt and L + 1, the options' K + 1, the overrides' NO + 1, the merged CSR
+  sequence's nnz + B; a feeder refuses a piece at 2^31 or more (an error, never a silent overflow). MTG Zero v7 in a GPU
+  piece of 1,024 rows: B (F + 1) = 57.7 M, about 2.7 % of 2^31.
+* *Annotations* (`strip_annotations`, every export, zero-onnx/1 and /2, also `portable_file`): each node's
+  `metadata_props` (`pkg.torch.onnx.stack_trace`, name scopes, class hierarchy, fx node, the rewriter's rule names) and
+  every doc string removed; no node, attribute, initializer, name or model metadata changes. The worker and the agent
+  read only the model's own metadata (`session::meta`), never a doc string. The model metadata carries no path
+  (`checkpoint` is the file name or the run's id; the reference set's `sources` file names). The committed probe graph
+  regenerated by `tools/onnx_probe_graph.py` (measured below).
+
+**Tests.** `tests/test_onnx2.py` (10; one new, two extended): the interface's int32 inputs and dtypes; no integer
+constant outside int32 and no BitShift in an exported graph, `check_int32` refusing one added to it (an initializer of
+2^40, a Constant's int beyond -2^31); `int64_max` on toy rows with tails and overrides (every int64 intermediate below
+2^31, the model given unchanged); the host's split (every piece in int32, the packed token and the slot back from them
+exactly; -1, other negatives, a segment past 16 bits) and `int32_bound` (the worker's numbers), a piece over 2^31
+refused by the feeder; pieces outside their fields refused (a slot of 2^32 or -1, a half of 2^16 or -3, a column of 256
+or -1, a segment -5), counted on their own row; zero-onnx/1 and /2 graphs without node annotations or doc strings (no
+`stack_trace`, no source file name in the bytes). The other earlier tests unchanged and passing; `tests/test_onnx.py`
+(17). `cargo test -p zero_worker`: the unit test also checks `override_pieces` (the token back from its pieces for
+segments up to 2^16 - 1, columns up to 255, slots up to 2^32 - 1) and `int32_bound`.
+
+**Measured** (2026-11-13, the desktop; onnxruntime 1.31.1 CPU, Windows ML's 1.28.3 for DirectML, torch 2.11.0):
+
+* *The v1 path, stripped.* pb1 iteration 82 exported by this tree: 10,151,753 bytes, two exports byte-identical;
+  b0930da's export of it with its 5,075 annotation entries removed by `strip_annotations`: **byte-identical** (sha256
+  0c37f0c6...), outputs bit for bit on the pool's 256 gen-82 reference rows (whole batches and 64-row pieces); the
+  graph the live pool published for gen 82, stripped: byte-identical too, its metadata identical. The committed probe
+  graph stripped (1,898 entries) is byte for byte the one `tools/onnx_probe_graph.py` now writes, its reference set
+  byte-identical: the probe graph is replaced by the stripped one (an earlier commit's blob keeps the old annotations
+  in history).
+* *The v7 graph* (pb1 iteration 67 widened, 46.4): 1,983 nodes, no integer constant outside int32, no BitShift; its
+  reference set (256 rows: 189 with 386 tail tokens, 8 overrides) within 1.8e-6 of torch. **Every int64 value it
+  computes** on all 800 recorded batches (76,647 rows; 654 int64 tensors, all typed): at most 7,217,152 (a 128-row
+  batch's flat densify index, 128 x 56,384), 0.34 % of 2^31.
+* *The gate on real v7 rows* (the 800 batches): **16 + 8 cases (pieces), 0 failed** - the `overrides` case now in it (42
+  rows, 151 overrides, 579 tail tokens: 6.9e-7) -, worst priors 5.5e-6, value 6.3e-7, margin 6.7e-7, aux 2.5e-7; run
+  twice, every case's result the same and the gate's graphs byte for byte the same; every gate opened to 0.37: 16 + 8
+  passed, worst priors 5.5e-6, margin 7.2e-7, its override rows 6.9e-7. Every output over the 800 batches (whole and in
+  64-row pieces) hashed in two processes: bit for bit the same.
+* *Gate 2 (a) on toy_tail* with a zero-onnx/2 graph on both sides: the shards (272 rows) and the first 161 batches
+  identical, as before the change.
+* *The native self-test on real v7 rows* (`zw_probe probe-providers`, the v7 graph and its reference set): the CPU
+  (the CPU runtime pack, ONNX Runtime 1.31.1) passes, max abs 1.8e-6, deterministic. **DirectML (the Intel UHD 770,
+  Windows ML's ONNX Runtime 1.28.3) passes the self-test: max abs 8.3e-7, deterministic**, 55 nodes left to the CPU
+  (ScatterElements 10, Add 9, Reshape 8, Mod 6, Squeeze 6, Cast 3, Equal 3, Mul 3, Concat 2, Div 2, Gather, Log, Sub),
+  1,949 on DirectML; 326 rows/s against the CPU's 1,057 (an integrated GPU: speed not measured on a real GPU here).
+* *Every int64 intermediate on DirectML* (onnxruntime-directml 1.24.4, each int64 intermediate also a graph output,
+  against the CPU EP on the reference set's batches): all 654 equal on the two batches with overrides; on the third
+  (no override, so 8 intermediates of zero elements) DirectML mishandles the zero-size graph outputs the
+  instrumentation adds - without those 8, all 647 equal; the plain graph answers that batch right (`refused` 0, as the
+  self-test above). So no int64 operation DirectML runs disagrees with the CPU near the old failure (the override
+  tokens' decode) or anywhere else. (A zero-size *output* of a real graph would meet the same DirectML limitation:
+  zero-onnx/1's `aux` [B, 0] of a network without the auxiliary head - unchanged here, for the GPU work.)
