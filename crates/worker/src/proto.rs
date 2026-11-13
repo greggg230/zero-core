@@ -27,6 +27,10 @@
 //!                                                  (zero-farm PROTOCOL.md 8; `probe`): JSON on stdout (or
 //!                                                  FILE), a report on stderr; exit 0 even when only the CPU
 //!                                                  passes, 2 when not even the CPU does
+//!          [--variants | --no-variants] [--variants-only a,b] [--variants-deadline S]
+//!                                                  then a diagnostic build's embedded graph variants
+//!                                                  (`probe_variants`; each provider in child processes:
+//!                                                  `probe-variant --ort-dll D --spec F --out F`)
 //! <worker> fuzz --mode M [--env K=V ...] --first F --count N [--threads T] [--chunk C]
 //!          [--seed-timeout S] [--out DIR] [--work DIR] [--keep-chunks] [--stdin-control]
 //!                                                  a fuzz job from flags (events on stdout)
@@ -977,6 +981,10 @@ fn probe_cli(a: &Args) -> Result<i32, String> {
         ensure_ready: a.has("--ensure-ready"),
         reps: a.num("--reps")?.unwrap_or(5),
         bench_rows: a.get("--bench-rows").map(|s| s.split(',').filter_map(|x| x.trim().parse::<usize>().ok()).filter(|&n| n > 0).collect()).unwrap_or_default(),
+        // (a diagnostic build's embedded graph variants run after the built-in graph's probe unless --no-variants)
+        variants: a.has("--variants") || (crate::probe_variants::embedded() && !a.has("--no-variants") && a.get("--model").is_none()),
+        variants_only: a.get("--variants-only").map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
+        variants_deadline_s: a.num("--variants-deadline")?.unwrap_or(780.0),
     };
     let v = crate::probe::run(&o)?;
     eprint!("{}", crate::probe::report(&v));
@@ -1043,6 +1051,11 @@ pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
         "info" => info_cli(games, repo, w.kinds(), &a),
         "probe-providers" if !w.selfplay => Err("this worker build runs fuzz jobs only (a fuzz-profile build): no network".into()),
         "probe-providers" => probe_cli(&a),
+        // (one child of probe-providers' graph variants: probe_variants.rs)
+        "probe-variant" if w.selfplay => match (a.get("--spec"), a.get("--out")) {
+            (Some(spec), Some(out)) => crate::probe_variants::child_main(&ort_dylib_in(a.get("--ort-dll"), a.get("--runtime-dir")), Path::new(spec), Path::new(out)),
+            _ => Err("usage: <worker> probe-variant --ort-dll D --spec spec.json --out out.jsonl (probe-providers' child)".into()),
+        },
         _ => Err("usage: <worker> serve | selfplay ... | eval ... | fuzz ... | fuzz-check ... | check-config <config.json> | driver-cfg <config.json> | eval-batches ... | info | probe-providers ... (zero-core crates/worker/src/proto.rs)".into()),
     };
     match r {

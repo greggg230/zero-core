@@ -33,6 +33,7 @@ pub mod gpu;
 pub mod job;
 pub mod npz;
 pub mod probe;
+pub mod probe_variants;
 pub mod proto;
 pub mod pyjson;
 pub mod records;

@@ -47,6 +47,11 @@ fn parse_npy(raw: &[u8]) -> Result<Arr, String> {
     Ok(Arr { descr, shape, data: raw[start + hl..].to_vec() })
 }
 
+/// One `.npy` file's bytes (a lone member: the probe's graph variants).
+pub fn parse_npy_bytes(raw: &[u8]) -> Result<Arr, String> {
+    parse_npy(raw)
+}
+
 /// Every member of an npz (stored or deflated), by name without `.npy`.
 pub fn read_npz(path: &Path) -> Result<BTreeMap<String, Arr>, String> {
     let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;

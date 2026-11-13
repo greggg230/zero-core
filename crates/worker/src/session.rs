@@ -1510,6 +1510,59 @@ pub fn read_metadata(runtime_dylib: &Path, model: &Path) -> Result<Vec<(String, 
     metadata(&s)
 }
 
+/// A plain ONNX Runtime session of any graph on one provider and adapter: the probe's graph variants
+/// (`probe_variants`; zero-farm PROTOCOL 8 `probe-providers`). The provider is bound exactly as the factory binds
+/// it (same session options), with no self-test and no zero-onnx checks; `dims` are free-dimension overrides
+/// (a variant's static shapes: ONNX Runtime then folds the shape arithmetic), `opt` another graph optimisation
+/// level than the factory's (`All`). -> (session, the node placement
+/// for a GPU provider, the adapter used).
+pub fn variant_session(
+    rt: &'static Runtime,
+    model: &Path,
+    p: ProviderKind,
+    want: Option<&GpuDevice>,
+    adapters: &[Adapter],
+    threads: usize,
+    dims: &[(String, i64)],
+    opt: Option<GraphOptimizationLevel>,
+) -> Result<(Session, Vec<(String, String)>, Option<GpuDevice>), String> {
+    let adapter = if p.is_gpu() { Some(pick_adapter(p, want, adapters)?) } else { None };
+    let binding = bind(rt, p, adapter.as_ref(), adapters)?;
+    let capture = p.is_gpu();
+    let go = || -> Result<(Session, Vec<(String, String)>), String> {
+        let _one = capture.then(|| BUILD.lock().unwrap_or_else(|e| e.into_inner()));
+        let id = format!("zv-{}-{}", std::process::id(), LOG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        if capture {
+            *CAPTURE.lock().unwrap() = Some((id.clone(), Vec::new()));
+        }
+        let r = builder(rt, &binding, threads, false, capture.then_some(id.as_str())).and_then(|mut sb| {
+            for (k, v) in dims {
+                sb = sb.with_dimension_override(k, *v).map_err(oerr)?;
+            }
+            if let Some(l) = opt {
+                sb = sb.with_optimization_level(l).map_err(oerr)?;
+            }
+            sb.commit_from_file(model).map_err(|e| format!("{}: {}", model.display(), oerr(e)))
+        });
+        let lines = if capture { CAPTURE.lock().unwrap().take().map(|c| c.1).unwrap_or_default() } else { Vec::new() };
+        Ok((r?, parse_placements(&lines)))
+    };
+    let (s, placed) = if capture {
+        std::thread::scope(|sc| {
+            std::thread::Builder::new()
+                .name("zero-worker-variant".into())
+                .stack_size(crate::MAIN_STACK)
+                .spawn_scoped(sc, go)
+                .map_err(|e| format!("spawn the session builder: {e}"))?
+                .join()
+                .map_err(|_| "the session builder panicked".to_string())?
+        })?
+    } else {
+        go()?
+    };
+    Ok((s, placed, adapter.as_ref().map(GpuDevice::of)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

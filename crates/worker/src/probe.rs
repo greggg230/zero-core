@@ -40,6 +40,12 @@ pub struct Opts {
     pub reps: usize,
     /// Batch sizes to time (rows cycled from the reference set; empty: the reference's own batches).
     pub bench_rows: Vec<usize>,
+    /// Run the embedded graph variants afterwards (`probe_variants`; a diagnostic build's default).
+    pub variants: bool,
+    /// Only the variants whose name starts with one of these (empty: all).
+    pub variants_only: Vec<String>,
+    /// Seconds from the probe's start after which no variant is started (the agent stops a probe at 900).
+    pub variants_deadline_s: f64,
 }
 
 /// A batch of `n` rows cycled from the reference set's rows (timing only).
@@ -232,7 +238,7 @@ pub fn run(o: &Opts) -> Result<Value, String> {
         .chain([crate::winml::DLL].iter())
         .map(|n| (n.to_string(), json!(crate::eval::module_path(n).map(|p| if Path::new(&p).parent() == Some(rt.dir.as_path()) { "pack" } else { "elsewhere" }))))
         .collect();
-    Ok(json!({
+    let mut v = json!({
         "probe": 1,
         "build_id": crate::proto::build_id(),
         "ort": crate::session::ort_version(),
@@ -247,13 +253,50 @@ pub fn run(o: &Opts) -> Result<Value, String> {
         "results": results,
         "providers": providers,
         "error": fatal,
+        "variants": Value::Null,
         "seconds": r4(t0.elapsed().as_secs_f64()),
-    }))
+    });
+    // the graph variants (a diagnostic build): every provider this pack offers on this PC, passed or not; the
+    // probe's own report goes to the log first (the agent stops a probe that outlives its 15 minutes)
+    if o.variants && v["error"].is_null() && crate::probe_variants::embedded() {
+        eprint!("{}", report(&v));
+        let work = base.join(format!("zero-probe-variants-{}", std::process::id()));
+        let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let mut cpu_threads: Vec<usize> = [1, o.threads, 4, 8, logical / 2].into_iter().filter(|&t| t >= 1 && t <= logical).collect();
+        cpu_threads.sort_unstable();
+        cpu_threads.dedup();
+        let mut provs = vec![ProviderKind::Cpu];
+        provs.extend(ProviderKind::ALL.iter().copied().filter(|p| p.is_gpu() && o.providers.contains(p) && rt.offers(*p)));
+        let plan = crate::probe_variants::Plan {
+            dylib: &o.dylib,
+            adapters: &adapters,
+            gpu: o.gpu,
+            providers: provs,
+            threads: o.threads,
+            cpu_threads,
+            deadline: t0 + std::time::Duration::from_secs_f64(o.variants_deadline_s.max(10.0)),
+            work: &work,
+            cache_nets: crate::probe_variants::cache_nets(2),
+            only: o.variants_only.clone(),
+        };
+        v["variants"] = crate::probe_variants::run_all(&plan);
+        let _ = std::fs::remove_dir_all(&work);
+        v["seconds"] = json!(r4(t0.elapsed().as_secs_f64()));
+    }
+    Ok(v)
 }
 
 /// The report for a person (the worker log): one line per provider and adapter.
 pub fn report(v: &Value) -> String {
     let mut out = String::new();
+    let va = &v["variants"];
+    if va.is_object() {
+        // (the provider lines went to the log before the variants, each variant's line as it finished)
+        out.push_str(&format!("probe-providers: variants: {} result(s), {} skipped, {} s{}\n", va["results"].as_array().map(|a| a.len()).unwrap_or(0),
+            va["skipped"].as_array().map(|a| a.len()).unwrap_or(0), va["seconds"], va["error"].as_str().map(|e| format!("; error: {e}")).unwrap_or_default()));
+        out.push_str(&format!("  providers: {} ({} s)\n", v["providers"], v["seconds"]));
+        return out;
+    }
     out.push_str(&format!("probe-providers: ONNX Runtime {} ({} compiled in: {}), graph {}, {} rows\n", v["ort"].as_str().unwrap_or("?"),
         v["available"].as_array().map(|a| a.len()).unwrap_or(0), v["available"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
         v["graph"].as_str().unwrap_or("?"), v["rows"]));
