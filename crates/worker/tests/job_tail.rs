@@ -2,12 +2,13 @@
 //! docs/search.md 2.15, docs/az.md 46) with the uniform evaluator (no ONNX Runtime): the shards are format v2 (x_version 2,
 //! the meta's t_segs / option_pointers / max_row_tokens, the members t_ptr .. ov_tok after aux) and hold every row's
 //! tail tokens and overrides; the records replay into exactly those rows; games aborted at the row limit are recorded
-//! (abort_reason) and replay as aborted, with no samples; dense shards are refused for such a game.
+//! (abort_reason) and replay as aborted, with no samples; dense shards are refused for such a game. `toy_tail_wide` (20
+//! more gated tail-only segments, indices 2 .. 21: past MTG Zero's v7) needs no worker change (docs/az.md 46.7).
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Map, Value};
-use zero_search::toy_tail::TailGame;
+use zero_search::toy_tail::{TailGame, TailWideGame};
 use zero_search::SearchGame;
 use zero_worker::job::{run_job, Control, EvalKind, Job, Progress, Sink};
 use zero_worker::npz::read_npz;
@@ -16,6 +17,7 @@ use zero_worker::settings::Settings;
 use zero_worker::GameEntry;
 
 static TAIL: GameEntry = GameEntry::of::<TailGame>("toy_tail");
+static WIDE: GameEntry = GameEntry::of::<TailWideGame>("toy_tail_wide");
 
 #[derive(Default)]
 struct Events(Mutex<Vec<Value>>);
@@ -28,8 +30,12 @@ impl Sink for Events {
 }
 
 fn job(dir: &Path, spec: &str, games: u64, sparse: bool) -> Job {
+    job_of("toy_tail", dir, spec, games, sparse)
+}
+
+fn job_of(game: &str, dir: &Path, spec: &str, games: u64, sparse: bool) -> Job {
     let settings = Settings::from_value(&json!({
-        "game": "toy_tail", "spec": spec, "players": [2], "conc": 6, "threads": 2, "groups": 2, "max_steps": 10000,
+        "game": game, "spec": spec, "players": [2], "conc": 6, "threads": 2, "groups": 2, "max_steps": 10000,
         "sims": 12, "sims_fast": 4, "p_full": 0.5, "c_puct": 1.0, "alpha": 0.3, "eps": 0.25, "temp_moves": 10,
         "chance_k": 0, "margin_w": 0.0, "redet": 1, "shard_rows": 120, "shard_sparse": sparse as i32, "sparse": 0,
         "selfplay_view_samples": 0.5
@@ -62,9 +68,13 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn run(j: &Job) -> Result<zero_worker::job::Outcome, String> {
+    run_of(&TAIL, j)
+}
+
+fn run_of(g: &GameEntry, j: &Job) -> Result<zero_worker::job::Outcome, String> {
     let ctl = Control::default();
     let ev = Events::default();
-    run_job(&TAIL, j, &ctl, &ev, Arc::new(Mutex::new(Progress::default())), &|_| {})
+    run_job(g, j, &ctl, &ev, Arc::new(Mutex::new(Progress::default())), &|_| {})
 }
 
 fn read_records(p: &Path) -> (Value, Vec<String>) {
@@ -148,4 +158,43 @@ fn dense_shards_are_refused_for_a_game_with_tails() {
     j.output = Output::Shards;
     let e = run(&j).err().expect("a dense shard of tail rows");
     assert!(e.contains("sparse"), "{e}");
+}
+
+#[test]
+fn new_tail_segments_need_no_worker_change() {
+    // toy_tail_wide: 22 tail segments (items, marks, x02 .. x21 - indices past MTG Zero's v7): the shards are format v2
+    // with the game's 22 segments in their meta, tokens of every extra segment among the rows, and the records replay to
+    // exactly the shards' arrays - no worker code knows the segments (all from the game's GameInfo / TAILS)
+    let d = tmp("wide");
+    let j = job_of("toy_tail_wide", &d, r#"{"items0": 12}"#, 16, true);
+    let o = run_of(&WIDE, &j).unwrap();
+    assert_eq!(o.reason, "done");
+    assert!(!o.shards.is_empty() && o.records.len() == o.shards.len());
+    let fmt = zero_worker::shard::RowsFmt::of(&(WIDE.info)()).unwrap();
+    let mut segs = std::collections::BTreeSet::new();
+    for (rw, sw) in o.records.iter().zip(&o.shards) {
+        let z = read_npz(&sw.path).unwrap();
+        let meta: Value = serde_json::from_str(&z["meta"].text().unwrap()).unwrap();
+        let ts = meta["t_segs"].as_array().unwrap();
+        assert_eq!(ts.len(), 22);
+        assert_eq!((ts[2].clone(), ts[21].clone()), (json!([2, "x02", 4, 0]), json!([21, "x21", 4, 0])));
+        assert_eq!(meta["max_row_tokens"], json!(TailWideGame::MAX_ROW_TOKENS));
+        segs.extend(z["t_seg"].data.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])));
+        let (h, lines) = read_records(&rw.path);
+        let games: Vec<zero_worker::shard::GameSamples> = lines
+            .iter()
+            .map(|l| {
+                let rp = zero_search::record::replay_json::<TailWideGame>(h["spec"].as_str().unwrap(), l, false).unwrap();
+                zero_worker::shard::GameSamples { gid: rp.gid, records: rp.records }
+            })
+            .filter(|g| !g.records.is_empty())
+            .collect();
+        let (arrays, _, probs) = zero_worker::shard::shard_arrays(&games, TailWideGame::NUM_FEATURES, true, Some(&fmt)).unwrap();
+        assert!(probs.is_empty());
+        assert_eq!(z.len() - 1, arrays.len());
+        for (name, a) in &arrays {
+            assert_eq!(z[*name].data, a.data, "{name}: rebuilt rows == the shard's");
+        }
+    }
+    assert_eq!(segs, (0u16..22).collect(), "tokens of every segment among the rows");
 }

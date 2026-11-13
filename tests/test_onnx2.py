@@ -349,3 +349,68 @@ def test_reference_set_with_tails_and_overrides(tmp_path):
     none.batch_off = rows.batch_off
     with pytest.raises(ValueError, match='tail token'):
         OX.write_reference(net, [none], str(tmp_path / 'x.npz'), 80)
+
+
+def test_new_tail_segments_need_no_code_change(tmp_path):
+    """Tail segments past layout v7's (docs/az.md 46.7): `toy_tail_wide` - toy_tail plus 20 gated tail-only segments
+    x02 .. x21, more tail segments than MTG Zero's v7 and indices past its highest - exports, plays through
+    `OnnxEvaluator` and replays its records with no code of the exporter, the evaluator or the records knowing them
+    (everything from the network's layout, the graph's metadata and the driver's arrays): the graph's `tails` are the
+    game's, every answer within 2e-5 of eager with the gates open, the extra segments' tokens in the rows, and every
+    game's record replays to the driver's rows byte for byte."""
+    from zero.onnx_eval import OnnxEvaluator
+    from zero.package import TOY_TAIL_WIDE_TOKENS
+    from zero.workqueue import split_games
+    info = G.info('toy_tail_wide')
+    segs = [t['seg'] for t in info['tails']]
+    assert segs == list(range(22)) and info['max_row_tokens'] == 96
+    net = rand_net(TOY_TAIL_WIDE_TOKENS, seed=8)
+    assert net.tails == list(range(22)) and net.gated == list(range(2, 22))
+    with torch.no_grad():
+        net.gate.copy_(torch.linspace(0.15, 1.3, 20))
+    path, meta = export(net, tmp_path)
+    assert meta['zero_onnx'] == '2'
+    assert json.loads(meta['tails']) == [[t['seg'], t['name'], t['width'], t['head']] for t in info['tails']]
+    assert len(json.loads(meta['gates'])) == 20 and meta['max_row_tokens'] == '96'
+    oe = OnnxEvaluator(path, threads=1, expect={'game': 'toy', 'features': info['num_features']})
+    ev = NetEvaluator(net, 'cpu')
+    seat = G.nn_seat('m', 8, selfplay=True, sims_fast=4, p_full=0.5, leaf_value_view='root', view_samples=0.5)
+    spec = '{"items0": 12}'
+    # (a traced rolling driver, as the farm's: each finished game's record and samples)
+    drv = G.Driver('toy_tail_wide', [[seat, seat]], spec=spec, concurrency=6, threads=2, groups=1, seed=7,
+                   record=True, sparse=True, rolling=True)
+    drv.set_trace(True)
+    seen = {'batches': 0, 'extra': 0, 'segs': set(), 'ovs': 0, 'worst': 0.0}
+
+    def graph(lb):
+        got = oe(lb)
+        seen['worst'] = max([seen['worst']] + OP.diffs(got, ev(lb)))
+        seen['batches'] += 1
+        t = lb.a['t_seg']
+        seen['extra'] += int((t >= 2).sum())
+        seen['segs'] |= set(int(s) for s in np.unique(t))
+        seen['ovs'] += int(lb.a['ov_off'][-1])
+        return got
+    games = []
+    while len(games) < 10:
+        drv.resume(10 - len(games), 0)
+        drive(drv, {'m': graph})
+        rows, texts, s = drv.take_game_records()
+        games += [(sd, text) for (_row, sd), text in zip(split_games(rows, s, G.tail_widths(info)), texts)]
+    assert seen['extra'] > 200 and seen['segs'] == set(range(22)) and seen['ovs'] > 0 and seen['worst'] < 2e-5, seen
+    E = G.engine()
+    n = extra = 0
+    for sd, text in games[:10]:
+        s2, _info = E.replay_rows('toy_tail_wide', spec, text, True)
+        if sd is None:
+            assert s2 is None
+            continue
+        assert set(s2) == set(sd)
+        for k in sd:
+            a, b = np.asarray(sd[k]), np.asarray(s2[k])
+            if k in ('pi', 'q'):
+                a, b = a.astype(np.float16), b.astype(np.float16)    # (a record carries them as float16, as shards do)
+            assert a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes(), k
+        n += 1
+        extra += int((np.asarray(sd['t_seg']) >= 2).sum())
+    assert n == 10 and extra > 100, (n, extra)

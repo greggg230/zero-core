@@ -327,11 +327,18 @@ TOY_TAIL_TOKENS = {"vocab": 16, "name": "toy_tail", "version": 1, "option_pointe
                    "globals": [{"name": "globals", "offset": 0, "count": 8}]}
 # the same without `marks` (the widen test adds it, gated)
 TOY_TAIL_TOKENS_BASE = dict(TOY_TAIL_TOKENS, segments=TOY_TAIL_TOKENS['segments'][:1])
+# `toy_tail_wide` (crates/search/src/toy_tail.rs; docs/az.md 46.7): toy_tail with 20 more gated tail-only segments
+# after `marks`, x02 .. x21 (indices 2 .. 21, width 4: present, value / 9, marked, position / 8) - more tail segments
+# than MTG Zero's layout v7 and indices past its highest; rows of at most 96 tokens
+TOY_TAIL_WIDE_TOKENS = dict(TOY_TAIL_TOKENS, name="toy_tail_wide", max_row_tokens=96,
+                            segments=TOY_TAIL_TOKENS['segments'] + [
+                                {"name": f"x{j:02d}", "offset": None, "count": 0, "width": 4, "present": 0, "id": None,
+                                 "actions": [], "tail": True, "gate": True} for j in range(2, 22)])
 
 # the core's own package: the toy games, zero._engine (crates/toy_py, tools/build_py.sh)
 CORE = GamePackage('zero', 'Zero Core', CORE_ROOT, engine='zero._engine', run_module='zero.run', game='toy',
                     dashboard_port=None, hub_id=None, env_prefix='ZERO',
-                    tokens={'toy': TOY_TOKENS, 'toy_tail': TOY_TAIL_TOKENS},
+                    tokens={'toy': TOY_TOKENS, 'toy_tail': TOY_TAIL_TOKENS, 'toy_tail_wide': TOY_TAIL_WIDE_TOKENS},
                     aux={'toy': TOY_AUX, 'toy_match': TOY_AUX}, readers={'toy': TOY_READERS})
 # (toy_match, the core's chained-episodes game, docs/az.md 42: the toy's features first, so the toy's target too)
 

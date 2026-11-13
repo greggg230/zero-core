@@ -2121,6 +2121,12 @@ section 1.4, literally); `TOY_TAIL_TOKENS_BASE` is the same without `marks`. Spe
 (1.3, 2.14; the contest's result by game wins, the other player starting each later game) and `"items_step"` starts
 game e from `items0 + e * items_step` items (docs/az.md 43.13); without them the game of before.
 
+`toy_tail_wide` (`TailWideGame`, layout `zero.package.TOY_TAIL_WIDE_TOKENS`; 2026-11-13): the same game with 20 more
+tail-only segments after `marks`, `x02` .. `x21` (indices 2 .. 21, width 4, gated in the layout), each item also a
+token of segment `2 + (value + position) mod 20` at slot `position`; `MAX_ROW_TOKENS` 96. More tail segments than MTG
+Zero's layout v7 and indices past its highest: the proof that new tail segments need no worker, exporter or records
+change (docs/az.md 46.7). `toy_tail` is the same generic game with no extra segment, byte for byte as before.
+
 ## 6. Parity: Rust search vs Python reference
 
 `python -m zero.parity positions` (also `tests/test_mcts.py`): 8-12 positions from random
