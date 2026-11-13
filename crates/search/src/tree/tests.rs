@@ -1465,3 +1465,143 @@ fn a_repeated_observation_on_the_walks_path_gets_a_fresh_node() {
     }
     assert!(aliases > 0, "no walk met its own observation");
 }
+
+// ---------------------------------------------------------------- reuse by the observation (docs/search.md 3.18)
+
+use crate::counter_game::{CounterAuto, CounterSpec, AUTO_ALLOW};
+
+fn auto_net(g: &CounterAuto<false>, viewer: usize, opts: &[u16]) -> (Vec<f32>, [f32; MAX_SEATS]) {
+    counter_net(&g.0, viewer, opts)
+}
+
+/// Every expanded node under the root: its options' visits add up to its backups.
+fn visits_consistent<G: SearchGame>(t: &Tree<G>) {
+    let mut order = vec![t.root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(nd) = order.pop() {
+        if !seen.insert(nd) || !t.expanded(nd) || t.acts(nd).is_empty() {
+            continue;
+        }
+        assert_eq!(t.visits(nd).iter().sum::<u32>(), t.tot(nd), "node {nd}");
+        for i in 0..t.acts(nd).len() {
+            order.extend(t.kids(nd, i).into_iter().map(|(_, c)| c));
+        }
+    }
+}
+
+/// From the tree's own edges: the walks through (root, CAST) that saw seat 1 allow the cast and went through seat 0's
+/// next round - (under the forced answer's child, under the seat-1 nodes' ALLOW edges, the seat-0 nodes of the latter).
+fn allowed_walks(t: &Tree<CounterAuto<false>>) -> (u32, u32, Vec<u32>) {
+    let (mut forced, mut chosen, mut nodes) = (0, 0, Vec::new());
+    for (key, c) in t.kids(t.root, 0) {
+        if key == [AUTO_ALLOW] && t.player(c) == 0 {
+            assert_eq!(t.tag(c), 1);
+            forced += t.tot(c);
+        } else if key.is_empty() && t.player(c) == 1 {
+            assert_eq!(t.tag(c), 2);
+            let j = t.acts(c).iter().position(|&a| a == ALLOW).unwrap();
+            for (k2, c2) in t.kids(c, j) {
+                if k2.is_empty() && t.player(c2) == 0 {
+                    chosen += t.tot(c2);
+                    nodes.push(c2);
+                }
+            }
+        }
+    }
+    (forced, chosen, nodes)
+}
+
+#[test]
+fn line_reuse_merges_the_forced_and_the_chosen_answer() {
+    // seat 0 casts; the real seat 1 holds no counter, so its ALLOW is answered by the game and keyed. The tree of
+    // before reused only the forced answer's child - the worlds where seat 1 holds nothing; by the observation the
+    // new root also merges seat 0's next round under every seat-1 node's ALLOW (it held a counter and allowed). A
+    // real seat 1 that held one and chose to allow gives the same root, bit for bit.
+    let legal = [CAST, HOLD];
+    for s in 0..8u64 {
+        let live = CounterAuto::<false>(Counter::with_spec(CounterSpec { rounds: 3, forget: false }, false, false));
+        let mut rng = Rng::new(s);
+        let mut t = Tree::new(&live, 0, &legal, true, &mut rng);
+        assert_eq!(t.tag(t.root), 1);
+        let mut log = Vec::new();
+        rv_search(&mut t, &live, 600, &mut rng, &W, &auto_net, &mut log);
+        let (forced, chosen, nodes) = allowed_walks(&t);
+        assert!(forced > 0 && chosen > 0 && nodes.len() >= 2, "seed {s}: {forced} {chosen} {nodes:?}");
+        // the reuse of before: the forced worlds alone
+        let mut old = t.clone();
+        assert!(old.advance_tagged(CAST, &[AUTO_ALLOW], 0, &legal, 1));
+        assert_eq!(old.tot(old.root), forced);
+        // by the observation, from the real (forced) line
+        let mut a = t.clone();
+        assert!(a.line_start(CAST, &[AUTO_ALLOW]) && a.line_on());
+        let found = a.line_reach(&legal, 1);
+        assert_eq!(found.len(), 1 + nodes.len());
+        assert!(found.contains(&old.root), "the forced child is merged");
+        let want: Vec<u32> = (0..2).map(|i| found.iter().map(|&f| t.n_of(f, i)).sum()).collect();
+        assert!(a.line_advance(0, &legal, 1) && !a.line_on());
+        assert_eq!(a.root, found[0]);
+        assert_eq!(a.tot(a.root), forced + chosen);
+        assert_eq!(a.visits(a.root), want);
+        visits_consistent(&a);
+        // a real seat 1 that held a counter and allowed: the same root
+        let mut b = t.clone();
+        assert!(b.line_start(CAST, &[]) && b.line_answer(AUTO_ALLOW, &[]));
+        assert!(b.line_advance(0, &legal, 1));
+        assert_eq!(dump(&a), dump(&b), "seed {s}");
+        // compaction keeps it, and the search goes on from it
+        let mut c = a.clone();
+        c.compact();
+        assert_eq!(dump(&a), dump(&c));
+        let mut next = live.clone();
+        next.step(CAST, &mut Vec::new()).unwrap();
+        assert_eq!(next.to_move(), Some(0));
+        rv_search(&mut c, &next, 200, &mut rng, &W, &auto_net, &mut log);
+        assert_eq!(c.tot(c.root), forced + chosen + 200);
+        visits_consistent(&c);
+    }
+}
+
+#[test]
+fn line_reuse_refuses_what_it_cannot_place() {
+    let legal = [CAST, HOLD];
+    let live = CounterAuto::<true>(Counter::with_hand(false, false));
+    let mut rng = Rng::new(3);
+    let mut t = Tree::new(&live, 0, &legal, true, &mut rng);
+    let mut log = Vec::new();
+    let net = |g: &CounterAuto<true>, v: usize, o: &[u16]| counter_net(&g.0, v, o);
+    rv_search(&mut t, &live, 200, &mut rng, &W, &net, &mut log);
+    // an opaque forced answer: no line
+    assert!(!t.line_start(CAST, &[AUTO_ALLOW]) && !t.line_on());
+    assert!(!t.line_advance(0, &legal, 1));
+    // an answer that is not observable alike (`answer_obs` None) never reaches the tree; a line without one
+    // through a real other seat's node finds nothing to merge: another decider next, or another class
+    let mut u = t.clone();
+    assert!(u.line_start(HOLD, &[]));
+    assert!(!u.line_advance(0, &legal, 2), "another class");
+    assert!(u.line_start(HOLD, &[]));
+    assert!(!u.line_advance(1, &legal, 1), "another decider");
+    // not a root option
+    assert!(!u.line_start(ALLOW, &[]));
+    assert_eq!(dump(&u), dump(&t), "a refused line leaves the tree as it was");
+}
+
+#[test]
+fn without_answers_the_line_is_the_reuse_of_before() {
+    // the plain counter game (no `ANSWERS`): every tag 0, and a line without answers reaches exactly `advance`'s child
+    let legal = [CAST, HOLD];
+    for s in 0..6u64 {
+        let g = Counter::with_hand(s % 2 == 0, s % 3 == 0);
+        let mut rng = Rng::new(s);
+        let mut t = Tree::new(&g, 0, &legal, true, &mut rng);
+        let mut log = Vec::new();
+        rv_search(&mut t, &g, 300, &mut rng, &W, &counter_net, &mut log);
+        assert_eq!(t.tag(t.root), 0);
+        for (a, key) in [(HOLD, Vec::<u64>::new()), (CAST, Vec::new())] {
+            let mut x = t.clone();
+            let mut y = t.clone();
+            let ok = x.advance(a, &key, 0, &legal);
+            assert_eq!(y.line_start(a, &key) && y.line_advance(0, &legal, 0), ok);
+            assert_eq!(dump(&x), dump(&y));
+        }
+    }
+}

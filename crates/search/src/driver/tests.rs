@@ -4076,3 +4076,60 @@ fn value_choice_pick_takes_the_best_or_draws_by_the_softmax() {
 
 // chained episodes (docs/search.md 2.14): the toy match through the driver
 mod chain;
+
+// ---------------------------------------------------------------- reuse by the observation (docs/search.md 3.18)
+
+use crate::counter_game::CounterAuto;
+
+/// A counter match with observable answers (`CounterAuto<OPAQUE>`), key a vs key b, seats alternating, the
+/// counter stand-in network. -> (results, stats).
+fn counter_auto_match<const OPAQUE: bool>(games: usize, spec: &str, seed: u64, threads: usize, selfplay: bool) -> (Vec<GameResult>, DriverStats, Vec<Record>) {
+    let gs = (0..games).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+    let mut c = cfg(vec![nn(0, 24, selfplay), nn(1, 24, selfplay)], gs, &[("a", KeyKind::Nn), ("b", KeyKind::Nn)]);
+    c.spec = spec.into();
+    c.seed = seed;
+    c.record = selfplay;
+    c.threads = threads;
+    let mut d = Driver::<CounterAuto<OPAQUE>>::new(c).unwrap();
+    let f = Counter::NUM_FEATURES;
+    let (mut res, mut recs) = (Vec::new(), Vec::new());
+    while let Some(b) = d.next_batch(true).unwrap() {
+        let mut pri = Vec::new();
+        let mut v = vec![0.0; b.b * MAX_SEATS];
+        for r in 0..b.b {
+            let opts: Vec<u16> = b.opt_action[b.opt_off[r] as usize..b.opt_off[r + 1] as usize].iter().map(|&a| a as u16).collect();
+            let (p, val) = counter_eval(&b.x[r * f..(r + 1) * f], &opts);
+            pri.extend(p);
+            v[r * MAX_SEATS..(r + 1) * MAX_SEATS].copy_from_slice(&val);
+        }
+        d.submit(b.id, &pri, &v, &vec![0.0; b.b * MAX_SEATS]).unwrap();
+        res.extend(d.take_results());
+        recs.extend(d.take_samples());
+    }
+    res.extend(d.take_results());
+    recs.extend(d.take_samples());
+    res.sort_by_key(|r| r.gid);
+    (res, d.stats(), recs)
+}
+
+#[test]
+fn observable_answers_reuse_trees_by_the_observation() {
+    // the driver follows each tree's real line across the other seat's ALLOW, forced (keyed) or chosen, and reuses it
+    // when its seat decides again: the games play out, the same across thread counts, and differ from the games
+    // whose forced answer is opaque (no reuse across it) - where a reused root's evaluation is saved, fewer leaves
+    for spec in [r#"{"rounds": 4}"#, r#"{"rounds": 6, "forget": true}"#] {
+        let (r0, s0, _) = counter_auto_match::<false>(120, spec, 7, 2, false);
+        assert_eq!(r0.len(), 120);
+        assert!(r0.iter().all(|r| r.over));
+        let (r1, s1, _) = counter_auto_match::<false>(120, spec, 7, 1, false);
+        assert_eq!(results_digest(&r1), results_digest(&r0), "{spec}: threads");
+        assert_eq!(s1.leaves, s0.leaves);
+        let (r2, s2, _) = counter_auto_match::<true>(120, spec, 7, 2, false);
+        assert_eq!(r2.len(), 120);
+        assert!(s0.leaves < s2.leaves, "{spec}: {} leaves with the line, {} without", s0.leaves, s2.leaves);
+    }
+    // self-play seats recording their decisions
+    let (r, _, recs) = counter_auto_match::<false>(40, r#"{"rounds": 4}"#, 3, 2, true);
+    assert_eq!(r.len(), 40);
+    assert!(!recs.is_empty());
+}

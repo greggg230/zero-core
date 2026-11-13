@@ -55,13 +55,19 @@
 //! visited most), the root value `gumbel_q` (the improved policy's value). A reused root's earlier
 //! visits count in Q and sigma but not in the schedule (this search's walks are counted apart).
 //!
+//! **Observable answers** (`SearchGame::ANSWERS`, docs/search.md 3.18; off by default): a node's signature also holds
+//! its decision's class (`tag_of`), and the driver reuses a tree by the observation (`Tree::follow`): the real line -
+//! the viewer's move, then the other seats' answers observed alike whether the game made them (a keyed single option)
+//! or the seat chose them (its node's option) - and the new root merges every node it reaches (`line_advance`,
+//! `absorb`). Off, every class is 0 and `follow` is the reuse of before.
+//!
 //! **Information-set merging** (`Tree::set_merge`, docs/search.md 3.16; off by default, `merge.rs`): an edge's
 //! children become links (the signature above) to nodes merged by the root decider's observation - the tree is
 //! then a DAG, the other seats' nodes subset-armed over the union of their worlds' options. Off, nothing of it
 //! runs: the tree of before, bit for bit.
 use std::hash::{Hash, Hasher};
 
-use crate::game::{Belief, SearchGame, MAX_SEATS};
+use crate::game::{Belief, KeyObs, SearchGame, MAX_SEATS};
 use crate::noise;
 use crate::rng::Rng;
 
@@ -99,6 +105,8 @@ struct Out {
 #[derive(Clone, Debug)]
 struct Node {
     player: u8,
+    /// The decision's class (`SearchGame::decision_tag`, with `ANSWERS` only; else 0): part of the signature.
+    tag: u16,
     acts_off: u32,
     nacts: u32,
     key_off: u32,
@@ -186,6 +194,16 @@ fn sig_hash(key: &[u64], player: usize, acts: &[u16]) -> u64 {
     player.hash(&mut h);
     acts.hash(&mut h);
     h.finish()
+}
+
+/// A node's decision class (`SearchGame::decision_tag`): with `ANSWERS` only (docs/search.md 3.18), else 0 - every
+/// signature of before.
+pub fn tag_of<G: SearchGame>(g: &G) -> u16 {
+    if G::ANSWERS {
+        g.decision_tag()
+    } else {
+        0
+    }
 }
 
 /// `step(a)`, then auto-step single-option decisions while `auto(seat)` holds; the chance keys
@@ -397,6 +415,17 @@ struct GumbelRoot {
     walks: u32,
 }
 
+/// The real line since the root (docs/search.md 3.18; `Tree::line_start`): the root option the viewer took, then what
+/// it observed - the real transitions' keys and the other seats' answers - and which entries are answers (another
+/// seat's answer, made by the game or chosen: `SearchGame::key_obs` `Answer`, `answer_obs`).
+#[derive(Clone, Debug, Default)]
+struct Line {
+    on: bool,
+    opt: u32,
+    obs: Vec<u64>,
+    ans: Vec<bool>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Tree<G: SearchGame> {
     /// The root decider (whose information set the tree searches).
@@ -431,6 +460,8 @@ pub struct Tree<G: SearchGame> {
     gumbel: Option<Box<GumbelRoot>>,
     /// Information-set merging (`set_merge`, docs/search.md 3.16; None = the tree of before).
     merge: Option<Box<Merge>>,
+    /// The real line in flight since the root (docs/search.md 3.18; off: none).
+    line: Line,
 }
 
 /// Deal a world for `viewer` (docs/search.md 3.8): `determinize_with` the belief, but a `mix` share
@@ -466,6 +497,7 @@ impl<G: SearchGame> Default for Tree<G> {
             belief_mix: 0.0,
             gumbel: None,
             merge: None,
+            line: Line::default(),
         }
     }
 }
@@ -491,7 +523,8 @@ impl<G: SearchGame> Tree<G> {
         self.outs.clear();
         // (the merge state goes: `set_merge` after a reset turns it on again, docs/search.md 3.16)
         self.merge = None;
-        self.root = self.push_node(&[], viewer, legal, 0);
+        self.line_clear();
+        self.root = self.push_node(&[], viewer, legal, 0, tag_of(game));
         self.set_root_min(0);
         self.belief = None;
         self.belief_mix = 0.0;
@@ -746,7 +779,7 @@ impl<G: SearchGame> Tree<G> {
         }
     }
 
-    fn push_node(&mut self, key: &[u64], player: usize, acts: &[u16], hash: u64) -> u32 {
+    fn push_node(&mut self, key: &[u64], player: usize, acts: &[u16], hash: u64, tag: u16) -> u32 {
         let id = self.nodes.len() as u32;
         let acts_off = self.acts.len() as u32;
         self.acts.extend_from_slice(acts);
@@ -754,6 +787,7 @@ impl<G: SearchGame> Tree<G> {
         self.keys.extend_from_slice(key);
         self.nodes.push(Node {
             player: player as u8,
+            tag,
             acts_off,
             nacts: acts.len() as u32,
             key_off,
@@ -776,19 +810,19 @@ impl<G: SearchGame> Tree<G> {
         &self.keys[nd.key_off as usize..(nd.key_off + nd.key_len) as usize]
     }
 
-    fn node_matches(&self, id: u32, hash: u64, key: &[u64], player: usize, acts: &[u16]) -> bool {
+    fn node_matches(&self, id: u32, hash: u64, key: &[u64], player: usize, acts: &[u16], tag: u16) -> bool {
         let nd = &self.nodes[id as usize];
-        nd.hash == hash && nd.player as usize == player && self.node_key(id) == key && self.acts(id) == acts
+        nd.hash == hash && nd.player as usize == player && nd.tag == tag && self.node_key(id) == key && self.acts(id) == acts
     }
 
-    fn find_kid(&self, node: u32, i: usize, key: &[u64], player: usize, acts: &[u16], hash: u64) -> Option<u32> {
+    fn find_kid(&self, node: u32, i: usize, key: &[u64], player: usize, acts: &[u16], tag: u16, hash: u64) -> Option<u32> {
         let so = self.nodes[node as usize].stat_off;
         if so == NIL {
             return None;
         }
         let mut k = self.stats[so as usize + i].kid;
         while k != NIL {
-            if self.node_matches(k, hash, key, player, acts) {
+            if self.node_matches(k, hash, key, player, acts, tag) {
                 return Some(k);
             }
             k = self.nodes[k as usize].next;
@@ -804,6 +838,14 @@ impl<G: SearchGame> Tree<G> {
     }
     pub fn player(&self, node: u32) -> usize {
         self.nodes[node as usize].player as usize
+    }
+    /// The node's decision class (`tag_of`; 0 without `SearchGame::ANSWERS`).
+    pub fn tag(&self, node: u32) -> u16 {
+        self.nodes[node as usize].tag
+    }
+    /// The chance key of the transition that reached the node (its signature's key; the root's is empty).
+    pub fn key_of(&self, node: u32) -> &[u64] {
+        self.node_key(node)
     }
     pub fn expanded(&self, node: u32) -> bool {
         self.nodes[node as usize].stat_off != NIL
@@ -1160,10 +1202,10 @@ impl<G: SearchGame> Tree<G> {
                     let k = if self.merge.is_some() {
                         self.deferred_child(node, i, &sc.key, h)
                     } else {
-                        match self.find_kid(node, i, &sc.key, v, &[], h) {
+                        match self.find_kid(node, i, &sc.key, v, &[], 0, h) {
                             Some(k) => k,
                             None => {
-                                let k = self.push_node(&sc.key, v, &[], h);
+                                let k = self.push_node(&sc.key, v, &[], h, 0);
                                 self.nodes[k as usize].next = self.stats[si].kid;
                                 self.stats[si].kid = k;
                                 k
@@ -1192,10 +1234,11 @@ impl<G: SearchGame> Tree<G> {
                 node = k;
                 continue;
             }
-            node = match self.find_kid(node, i, &sc.key, p, &sc.legal, h) {
+            let tg = tag_of(g);
+            node = match self.find_kid(node, i, &sc.key, p, &sc.legal, tg, h) {
                 Some(k) => k,
                 None => {
-                    let k = self.push_node(&sc.key, p, &sc.legal, h);
+                    let k = self.push_node(&sc.key, p, &sc.legal, h, tg);
                     self.nodes[k as usize].next = self.stats[si].kid;
                     self.stats[si].kid = k;
                     k
@@ -1298,26 +1341,266 @@ impl<G: SearchGame> Tree<G> {
 
     /// Move the root to the subtree reached by real action `a` with real chance key `key` and
     /// next decision (`player`, `legal`). Returns false (tree unchanged) if it does not exist.
+    /// (A game with `ANSWERS`: a next decision of class 0, `advance_tagged`.)
     pub fn advance(&mut self, a: u16, key: &[u64], player: usize, legal: &[u16]) -> bool {
+        self.advance_tagged(a, key, player, legal, 0)
+    }
+
+    /// `advance` to a next decision of class `tag` (`tag_of` the live game after the move; docs/search.md 3.18).
+    pub fn advance_tagged(&mut self, a: u16, key: &[u64], player: usize, legal: &[u16], tag: u16) -> bool {
         let root = self.root;
         if !self.expanded(root) {
             return false;
         }
         let Some(i) = self.acts(root).iter().position(|&x| x == a) else { return false };
-        match self.find_kid(root, i, key, player, legal, sig_hash(key, player, legal)) {
+        match self.find_kid(root, i, key, player, legal, tag, sig_hash(key, player, legal)) {
             Some(k) => {
-                self.root = k;
                 self.viewer = player;
-                self.set_root_min(0);
-                self.belief = None;
-                self.belief_mix = 0.0;
-                self.gumbel = None;
-                if self.nodes.len() > COMPACT_AT {
-                    self.compact();
-                }
+                self.reroot(k);
                 true
             }
             None => false,
+        }
+    }
+
+    /// The root is `k` now (a reuse): the search's root settings go, a big tree is compacted.
+    fn reroot(&mut self, k: u32) {
+        self.root = k;
+        self.line_clear();
+        self.set_root_min(0);
+        self.belief = None;
+        self.belief_mix = 0.0;
+        self.gumbel = None;
+        if self.nodes.len() > COMPACT_AT {
+            self.compact();
+        }
+    }
+
+    // ---------------------------------------------------------------- reuse by the observation (docs/search.md 3.18)
+
+    fn line_clear(&mut self) {
+        self.line.on = false;
+        self.line.obs.clear();
+        self.line.ans.clear();
+    }
+
+    /// The real line is in flight (`line_start`, not yet `line_advance`d or broken).
+    pub fn line_on(&self) -> bool {
+        self.line.on
+    }
+
+    /// Start the real line (docs/search.md 3.18): the viewer took root option `a` and its real transition's keys were
+    /// `key`. false (no line, the tree is not reusable): a merged tree (3.16, `advance_in`), the root is not expanded,
+    /// `a` is not a root option, or `key` holds an answer the observation cannot place (`KeyObs::Opaque`).
+    pub fn line_start(&mut self, a: u16, key: &[u64]) -> bool {
+        self.line_clear();
+        let root = self.root;
+        if self.merge.is_some() || !self.expanded(root) {
+            return false;
+        }
+        let Some(i) = self.acts(root).iter().position(|&x| x == a) else { return false };
+        self.line.on = true;
+        self.line.opt = i as u32;
+        self.line_keys(key)
+    }
+
+    /// The line goes on with another seat's real answer, observed as `obs` (`SearchGame::answer_obs`), and the keys
+    /// of the transition after it. false: no line in flight, or an `Opaque` key (the line is over).
+    pub fn line_answer(&mut self, obs: u64, key: &[u64]) -> bool {
+        if !self.line.on {
+            return false;
+        }
+        self.line.obs.push(obs);
+        self.line.ans.push(true);
+        self.line_keys(key)
+    }
+
+    fn line_keys(&mut self, key: &[u64]) -> bool {
+        for &k in key {
+            match G::key_obs(k, self.viewer) {
+                KeyObs::Plain => {
+                    self.line.obs.push(k);
+                    self.line.ans.push(false);
+                }
+                KeyObs::Answer => {
+                    self.line.obs.push(k);
+                    self.line.ans.push(true);
+                }
+                KeyObs::Opaque => {
+                    self.line_clear();
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The nodes the line in flight reaches if the viewer decides next at (`legal`, class `tag`): `line_advance`'s
+    /// new root and the nodes merged into it, in that order (a diagnostic; empty without a line).
+    pub fn line_reach(&self, legal: &[u16], tag: u16) -> Vec<u32> {
+        let mut found = Vec::new();
+        if self.line.on {
+            self.line_nodes(self.root, self.line.opt as usize, 0, legal, tag, &mut found);
+        }
+        found
+    }
+
+    /// The viewer decides again, at (`player` = the viewer, `legal`, class `tag`): the new root is every node the line
+    /// reaches (`line_reach`) merged into the first (`absorb`). false (tree unchanged; the line is over either way):
+    /// no line in flight, another decider, or no node.
+    pub fn line_advance(&mut self, player: usize, legal: &[u16], tag: u16) -> bool {
+        if !self.line.on || player != self.viewer {
+            self.line_clear();
+            return false;
+        }
+        let found = self.line_reach(legal, tag);
+        self.line_clear();
+        let Some(&k) = found.first() else { return false };
+        for &o in &found[1..] {
+            self.absorb(k, o);
+        }
+        self.reroot(k);
+        true
+    }
+
+    /// A real move, for the tree of seat `viewer` (the driver's reuse; docs/search.md 3.3, 3.16, 3.18): seat `mover`
+    /// took `a` at a decision of class `tag` (`tag_of` before the move); the transition's keys `key`; `stepped` the
+    /// seats the transition stepped through single options itself (bits); `live` the game after it, its next
+    /// decision's options `legal`. -> whether the tree survives: rooted at its viewer's next decision, or (with
+    /// `ANSWERS`) its line in flight. Without `ANSWERS`, and for a merged tree, the reuse of before: the mover's tree
+    /// when it decides again, by `advance_in`. With it, the tree follows its real line - its viewer's own move
+    /// (`line_start`), then the other seats' moves while each is an answer observed alike in every world
+    /// (`answer_obs`; an answer stepped through without a key cannot be, so `stepped` holding another seat ends the
+    /// line) - and is rerooted by it when its viewer decides again (`line_advance`).
+    pub fn follow(&mut self, mover: usize, a: u16, tag: u16, key: &[u64], stepped: u32, live: &G, legal: &[u16]) -> bool {
+        let Some(np) = live.to_move() else { return false };
+        let q = self.viewer;
+        if !G::ANSWERS || self.merge.is_some() {
+            return q == mover && np == mover && self.redet && self.advance_in(a, key, np, legal, live);
+        }
+        let on = self.redet
+            && stepped & !(1u32 << q) == 0
+            && if q == mover {
+                self.line_start(a, key)
+            } else {
+                G::answer_obs(mover, tag, a).is_some_and(|o| self.line_answer(o, key))
+            };
+        on && (np != q || self.line_advance(np, legal, tag_of(live)))
+    }
+
+    /// The nodes the line reaches from (node, option i), its entries from `j` on consumed: a child whose key is the
+    /// line's next entries either ends it - the viewer's decision (`legal`, `tag`): found - or stops at another seat's
+    /// node where the line holds an answer, and the walk goes on through each of that node's options observed as
+    /// that answer (`answer_obs`: the seat chose it). An answer the game made itself is a plain entry of a child's key
+    /// there (that world had the single option). A found node never lies on another's path (each ends the line).
+    fn line_nodes(&self, node: u32, i: usize, j: usize, legal: &[u16], tag: u16, out: &mut Vec<u32>) {
+        let so = self.nodes[node as usize].stat_off;
+        if so == NIL {
+            return;
+        }
+        let n = self.line.obs.len();
+        let mut k = self.stats[so as usize + i].kid;
+        while k != NIL {
+            let kk = self.node_key(k);
+            let end = j + kk.len();
+            if end <= n && self.line.obs[j..end] == *kk {
+                let nd = &self.nodes[k as usize];
+                let pl = nd.player as usize;
+                if end == n {
+                    if pl == self.viewer && nd.tag == tag && self.acts(k) == legal {
+                        out.push(k);
+                    }
+                } else if self.line.ans[end] && pl != self.viewer {
+                    let want = self.line.obs[end];
+                    for (b, &a) in self.acts(k).iter().enumerate() {
+                        if G::answer_obs(pl, nd.tag, a) == Some(want) {
+                            self.line_nodes(k, b, end + 1, legal, tag, out);
+                        }
+                    }
+                }
+            }
+            k = self.nodes[k as usize].next;
+        }
+    }
+
+    /// The child of (`dst`, option i) with the signature of node `c` (key, decider, class, options), if any.
+    fn twin_kid(&self, dst: u32, i: usize, c: u32) -> Option<u32> {
+        let so = self.nodes[dst as usize].stat_off;
+        let cn = &self.nodes[c as usize];
+        let mut k = self.stats[so as usize + i].kid;
+        while k != NIL {
+            let kn = &self.nodes[k as usize];
+            if kn.hash == cn.hash && kn.player == cn.player && kn.tag == cn.tag && self.node_key(k) == self.node_key(c) && self.acts(k) == self.acts(c) {
+                return Some(k);
+            }
+            k = kn.next;
+        }
+        None
+    }
+
+    /// Merge the subtree of `src` into `dst` (the same signature, disjoint subtrees): the walks of both add up - visits
+    /// N, value sums W, backups `tot` and `wsum`, the sampled outcomes - and each child of `src` joins `dst`'s edge or
+    /// merges into its twin there. `dst` keeps its network values (priors, `vec`: the network's for one world of the
+    /// same observation); an unexpanded `dst` takes `src`'s, and a deferred terminal's node (no options) keeps its one
+    /// evaluation.
+    fn absorb(&mut self, dst: u32, src: u32) {
+        let mut todo = vec![(dst, src)];
+        while let Some((d, s)) = todo.pop() {
+            debug_assert!(d != s && self.nodes[d as usize].player == self.nodes[s as usize].player && self.acts(d) == self.acts(s));
+            if !self.expanded(s) {
+                continue;
+            }
+            if !self.expanded(d) {
+                let sn = self.nodes[s as usize].clone();
+                let dn = &mut self.nodes[d as usize];
+                dn.stat_off = sn.stat_off;
+                dn.vec = sn.vec;
+                dn.wsum = sn.wsum;
+                dn.tot = sn.tot;
+                continue;
+            }
+            let nacts = self.nodes[d as usize].nacts as usize;
+            if nacts == 0 {
+                continue;
+            }
+            let (ds, ss) = (self.nodes[d as usize].stat_off as usize, self.nodes[s as usize].stat_off as usize);
+            let (stot, swsum) = (self.nodes[s as usize].tot, self.nodes[s as usize].wsum);
+            let dn = &mut self.nodes[d as usize];
+            dn.tot += stot;
+            for j in 0..MAX_SEATS {
+                dn.wsum[j] += swsum[j];
+            }
+            for i in 0..nacts {
+                let st = self.stats[ss + i];
+                {
+                    let dt = &mut self.stats[ds + i];
+                    dt.n += st.n;
+                    dt.w += st.w;
+                }
+                if st.outs != NIL {
+                    // (the source's records, newest first, then the destination's)
+                    let mut o = st.outs;
+                    while self.outs[o as usize].next != NIL {
+                        o = self.outs[o as usize].next;
+                    }
+                    self.outs[o as usize].next = self.stats[ds + i].outs;
+                    let dt = &mut self.stats[ds + i];
+                    dt.outs = st.outs;
+                    dt.nouts += st.nouts;
+                }
+                let mut c = st.kid;
+                while c != NIL {
+                    let next = self.nodes[c as usize].next;
+                    match self.twin_kid(d, i, c) {
+                        Some(t) => todo.push((t, c)),
+                        None => {
+                            self.nodes[c as usize].next = self.stats[ds + i].kid;
+                            self.stats[ds + i].kid = c;
+                        }
+                    }
+                    c = next;
+                }
+            }
         }
     }
 

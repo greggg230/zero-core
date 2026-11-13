@@ -234,6 +234,17 @@ class PySearch:
         """The root option the seat's move rule takes (the reference formula, `mcts.select_node`)."""
         return mcts.select_node(self.t.root, seat.select, seat.select_min_visits, *seat.select_transform)
 
+    def follow(self, q, p, a, tag, key, stepped, game):
+        """The driver's reuse after a real move (the Rust `Tree::follow`): the reuse of before - the mover's tree
+        when it decides again. The reference tree has no observable answers (docs/search.md 3.18): for a game with
+        them it is never reused across another seat's answer (a key the viewer observes as one, or a single option
+        stepped through), so no world of the observation is ever left out of it."""
+        if game.over or not (q == p and game.to_move == p and self.t.redet):
+            return False
+        if getattr(game, 'answers', False) and (stepped & ~(1 << q) or any(game.key_obs(k, q) != 'plain' for k in key)):
+            return False
+        return self.advance(a, key, game)
+
     def advance(self, a, key, game):
         child = mcts.advance(self.t.root, a, key, game.to_move, game.legal())
         if child is None:
@@ -324,6 +335,12 @@ class RsSearch:
         if game.over:
             return False
         return self.t.advance(a, list(key), game)
+
+    def follow(self, q, p, a, tag, key, stepped, game):
+        """The driver's reuse after a real move: the Rust tree's own (`Tree::follow`, docs/search.md 3.18)."""
+        if game.over:
+            return False
+        return self.t.follow(p, a, tag, list(key), stepped, game)
 
 
 SEARCH = {'py': PySearch, 'rs': RsSearch}
@@ -678,11 +695,17 @@ class PyDriver:
     def _apply(self, slot, a):
         g = slot.game
         p = g.to_move
-        key, legal = mcts.transition(g, a)
+        # (the mover's decision class and the seats stepped through single options: the reuse, docs/search.md 3.18)
+        tag = g.decision_tag if getattr(g, 'answers', False) else 0
+        seats = []
+        key, legal = mcts.transition(g, a, seats=seats)
+        stepped = 0
+        for s in seats:
+            stepped |= 1 << s
         slot.steps += 1
         for q in list(slot.trees):
             tree = slot.trees[q]
-            if not (q == p and not g.over and g.to_move == p and tree.redet and tree.advance(a, key, g)):
+            if not tree.follow(q, p, a, tag, key, stepped, g):
                 del slot.trees[q]
         slot.sims = 0
         slot.target = None

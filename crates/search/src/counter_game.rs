@@ -204,3 +204,78 @@ pub fn counter_eval(x: &[f32], opts: &[u16]) -> (Vec<f32>, [f32; MAX_SEATS]) {
     val[1] = 1.0 - v;
     (pri, val)
 }
+
+/// The key of seat 1's `ALLOW` answered by the game (`CounterAuto`).
+pub const AUTO_ALLOW: u64 = 0xA110;
+
+/// `Counter` with observable answers (docs/search.md 3.18): a seat 1 with no counter left is answered by the game
+/// itself and the answer keyed `AUTO_ALLOW` (MTG Zero's `auto_single` and `KEY_AUTO`), and an `ALLOW` is observed
+/// by seat 0 alike, forced or chosen (`answer_obs`). Seat 0's decisions are class 1, seat 1's class 2. `OPAQUE`:
+/// the forced answer is `KeyObs::Opaque` instead (no reuse across it).
+#[derive(Clone, Debug)]
+pub struct CounterAuto<const OPAQUE: bool>(pub Counter);
+
+impl<const OPAQUE: bool> SearchGame for CounterAuto<OPAQUE> {
+    type Spec = CounterSpec;
+    const NAME: &'static str = if OPAQUE { "counter_opaque" } else { "counter_auto" };
+    const NUM_ACTIONS: usize = 5;
+    const NUM_FEATURES: usize = 8;
+    const MIN_PLAYERS: usize = 2;
+    const MAX_PLAYERS: usize = 2;
+    const ANSWERS: bool = true;
+
+    fn parse_spec(json: &str) -> Result<CounterSpec, String> {
+        Counter::parse_spec(json)
+    }
+    fn new_game(spec: &CounterSpec, players: usize, seed: u64) -> Result<Self, String> {
+        Counter::new_game(spec, players, seed).map(CounterAuto)
+    }
+    fn num_players(&self) -> usize {
+        2
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)?;
+        let mut l = Vec::new();
+        self.0.legal_actions(&mut l);
+        if self.0.pending && l == [ALLOW] {
+            chance.push(AUTO_ALLOW);
+            self.0.step(ALLOW, chance)?;
+        }
+        Ok(())
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.0.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.0.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn decision_tag(&self) -> u16 {
+        1 + self.0.pending as u16
+    }
+    fn answer_obs(seat: usize, tag: u16, a: u16) -> Option<u64> {
+        (seat == 1 && tag == 2 && a == ALLOW).then_some(AUTO_ALLOW)
+    }
+    fn key_obs(key: u64, viewer: usize) -> crate::game::KeyObs {
+        use crate::game::KeyObs;
+        match (key, viewer) {
+            (AUTO_ALLOW, 0) if OPAQUE => KeyObs::Opaque,
+            (AUTO_ALLOW, 0) => KeyObs::Answer,
+            _ => KeyObs::Plain,
+        }
+    }
+}

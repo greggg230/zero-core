@@ -235,9 +235,10 @@ def leaf_row(g, viewer, rk, opts=False):
     return x, (t if rk.widths else None), ov
 
 
-def transition(g, a, forced=None):
+def transition(g, a, forced=None, seats=None):
     """step(a), then auto-step single-option decisions -> (chance key tuple, legal actions of
-    the pending decision or None when over)."""
+    the pending decision or None when over). `seats` (a list): each auto-stepped decision's seat is
+    appended (the driver's reuse, docs/search.md 3.18)."""
     if forced:
         g.force_chance(list(forced))
     key = list(g.step(a))
@@ -246,6 +247,8 @@ def transition(g, a, forced=None):
         legal = g.legal()
         if len(legal) != 1:
             break
+        if seats is not None:
+            seats.append(g.to_move)
         key += g.step(legal[0])
         legal = None
     if forced:
