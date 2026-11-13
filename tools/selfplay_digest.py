@@ -11,7 +11,11 @@ and after (the same names are shims of the core), and on zero-core itself (`--ro
 
 * per policy target ('visits', 'cq'): the number of recorded samples and the sha256 of the
   self-play records (every sample array, rows in a canonical order) and of the game results
-  (gid, steps, scores, decisions, rounds) - self-play of `--games` games with the evaluator;
+  (gid, steps, scores, decisions, rounds) - self-play of `--games` games with the evaluator -, and
+  `arrays`: the sample arrays hashed. A game whose engine computes auxiliary targets (`aux_layout`,
+  docs/az.md 15: MTG Zero's belief and deck targets, which its runs train on) is recorded with them
+  (the driver's `aux`) and each row's `aux` is hashed too; a game without them: the digest of before,
+  byte for byte (docs/az.md 46.12);
 * `match`: the network (or the uniform evaluator) vs the built-in 'random' bot, seats
   alternating, evaluation settings (no noise): results digest and the network's score.
 
@@ -37,11 +41,16 @@ def _mod(pkg, name):
     raise ModuleNotFoundError(f'{pkg}: no module {name}')
 
 
-def records_digest(parts, np, widths=None):
+BASE_ARRAYS = ('x', 'player', 'n_players', 'z', 'q', 'sc', 'net', 'opt_action', 'pi')
+
+
+def records_digest(parts, np, widths=None, seen=None):
     """sha256 over the sample rows (each row's arrays), rows sorted by their own hash (the order
     games finish in may depend on thread timing; the rows may not). A row's tail tokens and pointer
     overrides (variable-length rows, docs/az.md 43: `t_*` / `ov_*`, only in a game with them; `widths`
-    its tail segments {seg: (width, ...)}) are hashed with it - a game without them: the digest of before."""
+    its tail segments {seg: (width, ...)}) and its auxiliary targets (`aux`, a driver recording them,
+    docs/az.md 46.12) are hashed with it, after the rest - a game without them: the digest of before.
+    `seen`: a set that receives the names of the arrays hashed."""
     rows = []
     for s in parts:
         if s is None or not len(s['player']):
@@ -70,7 +79,12 @@ def records_digest(parts, np, widths=None):
                 o0, o1 = int(s['ov_off'][b]), int(s['ov_off'][b + 1])
                 for k in ('ov_opt', 'ov_tok'):
                     h.update(np.ascontiguousarray(s[k][o0:o1]).tobytes())
+            if 'aux' in s:
+                h.update(np.ascontiguousarray(s['aux'][b]).tobytes())
             rows.append(h.hexdigest())
+        if seen is not None:
+            seen.update(BASE_ARRAYS)
+            seen.update(k for k in ('t_seg', 't_slot', 't_val', 'ov_opt', 'ov_tok', 'aux') if k in s)
     rows.sort()
     return len(rows), hashlib.sha256(''.join(rows).encode()).hexdigest()
 
@@ -135,20 +149,26 @@ def main(argv=None):
     spec = a.spec if a.spec is not None else ''
     out.update(game=game, spec=spec, games=a.games, sims=a.sims, sims_fast=a.sims_fast, p_full=a.p_full,
                chance_k=a.chance_k, seed=a.seed, targets={})
+    # the game's auxiliary targets, recorded and hashed as the runs that train on them record them (docs/az.md 46.12;
+    # a game without them, or a checkout from before them: none, as before)
+    aux = {'aux': True} if (G.info(game).get('aux_layout') or []) else {}
+    out['aux'] = bool(aux)
     for target in [t for t in a.targets.split(',') if t]:
         kw = dict(selfplay=True, temp_moves=a.temp_moves, sims_fast=a.sims_fast, p_full=a.p_full, chance_k=a.chance_k)
         if target != 'visits':
             kw.update(policy_target=target, cq_c_visit=50.0, cq_c_scale=1.0)
         seat = G.nn_seat('m', a.sims, **kw)
         drv = G.Driver(game, [[seat, seat]] * a.games, spec=spec, concurrency=a.games, seed=a.seed, record=True,
-                       threads=a.threads, groups=a.groups, max_steps=a.max_steps)
+                       threads=a.threads, groups=a.groups, max_steps=a.max_steps, **aux)
         parts = []
         infer.drive(drv, {'m': ev}, on_batch=lambda lb: parts.append(drv.take_samples()))
         parts.append(drv.take_samples())
         tw = G.tail_widths(G.info(game)) if hasattr(G, 'tail_widths') else None    # (variable-length rows)
-        n, d = records_digest(parts, np, tw)
+        seen = set()
+        n, d = records_digest(parts, np, tw, seen)
         res = drv.take_results()
-        out['targets'][target] = {'samples': n, 'records': d, 'results': results_digest(res), 'games': len(res)}
+        out['targets'][target] = {'samples': n, 'records': d, 'results': results_digest(res), 'games': len(res),
+                                  'arrays': sorted(seen)}
     if a.match_games:
         nn = G.nn_seat('m', a.sims, chance_k=a.chance_k)
         bot = {'bot': 'random'}

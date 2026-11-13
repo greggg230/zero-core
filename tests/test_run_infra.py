@@ -475,3 +475,71 @@ def test_rolling_phases_report_counters_not_mixed_ratios(tmp_path):
     assert p.returncode == 0, p.stdout + p.stderr
     m = read_metrics(str(run))
     assert 'minor_per_game' in m[1]['selfplay'] and 'minor' not in m[1]['selfplay']
+
+
+# ---------------------------------------------------------------- the compat goldens' auxiliary targets (docs/az.md 46.12)
+
+def _digest_tool():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('_c2_selfplay_digest', os.path.join(ROOT, 'tools', 'selfplay_digest.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_records_digest_hashes_auxiliary_targets_and_nothing_else_changes():
+    """records_digest: a row's `aux` is hashed after the rest (a different target -> a different digest); samples
+    without `aux` give the digest of before (the same bytes hashed in the same order); `seen` names the arrays."""
+    sd = _digest_tool()
+    rng = np.random.default_rng(3)
+    s = {'x': rng.random((3, 5), dtype=np.float32), 'player': np.array([0, 1, 0], np.int64),
+         'n_players': np.full(3, 2, np.int64), 'z': rng.random((3, 2), dtype=np.float32),
+         'q': rng.random((3, 2), dtype=np.float32), 'sc': rng.random((3, 2), dtype=np.float32),
+         'net': np.zeros(3, np.int64), 'opt_off': np.array([0, 2, 3, 5]), 'opt_action': np.arange(5),
+         'pi': rng.random(5, dtype=np.float32)}
+    seen = set()
+    n, plain = sd.records_digest([s], np, None, seen)
+    assert n == 3 and seen == set(sd.BASE_ARRAYS)
+    import hashlib                                   # (the digest of before: the base arrays only, in their order)
+    rows = []
+    for b in range(3):
+        h = hashlib.sha256()
+        for k in ('x', 'player', 'n_players', 'z', 'q', 'sc', 'net'):
+            h.update(np.ascontiguousarray(s[k][b]).tobytes())
+        for k in ('opt_action', 'pi'):
+            h.update(np.ascontiguousarray(s[k][s['opt_off'][b]:s['opt_off'][b + 1]]).tobytes())
+        rows.append(h.hexdigest())
+    assert plain == hashlib.sha256(''.join(sorted(rows)).encode()).hexdigest()
+    a = dict(s, aux=rng.random((3, 4), dtype=np.float32))
+    seen = set()
+    _, with_aux = sd.records_digest([a], np, None, seen)
+    assert with_aux != plain and 'aux' in seen
+    b = dict(a, aux=a['aux'].copy())
+    b['aux'][1, 2] += 1.0
+    assert sd.records_digest([b], np)[1] != with_aux
+
+
+def test_check_checkpoint_compat_names_the_arrays_it_compared():
+    """selfplay_digest records a game's auxiliary targets when its engine computes them (the toy's next_card) and
+    names the arrays; check_checkpoint_compat prints them per side and in its result line."""
+    e = dict(os.environ, PYTHONIOENCODING='utf-8', CUDA_VISIBLE_DEVICES='-1')
+    e.pop('PYTHONPATH', None)
+    core = os.path.join(ROOT, 'python')
+    small = ['--games', '4', '--sims', '4', '--targets', 'visits', '--match-games', '2']
+    out = {}
+    for game in ('toy', 'toy_tail'):
+        r = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'selfplay_digest.py'), '--root', core,
+                            '--package', 'zero', '--game', game, *small], cwd=ROOT, capture_output=True, text=True,
+                           timeout=300, env=e)
+        assert r.returncode == 0, r.stdout + r.stderr
+        out[game] = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out['toy']['aux'] is True and 'aux' in out['toy']['targets']['visits']['arrays']
+    assert out['toy_tail']['aux'] is False and 'aux' not in out['toy_tail']['targets']['visits']['arrays']
+    assert {'t_seg', 't_slot', 't_val'} <= set(out['toy_tail']['targets']['visits']['arrays'])
+    r = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'check_checkpoint_compat.py'), '--old', core, '--new',
+                        core, '--package', 'zero', '--net', 'uniform', '--game', 'toy', *small], cwd=ROOT,
+                       capture_output=True, text=True, timeout=600, env=e)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.count('  arrays hashed: aux, n_players, net, opt_action, pi, player, q, sc, x, z') == 2, r.stdout
+    res = json.loads(r.stdout.strip().splitlines()[-1])
+    assert res['identical'] is True and 'aux' in res['arrays']

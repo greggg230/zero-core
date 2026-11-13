@@ -6137,8 +6137,8 @@ maps get a gradient at g = 0; without it (`gate_shadow` 0) exactly none, the for
 
 The Fable review of 2026-11-12 (mtg-zero's slice 5, "Python run loop & infrastructure") found the core's loop sound
 where it runs alone and wrong at its edges: a remote machine, an interrupted iteration, a fork, the supervisor. Every
-fix below is in Python (no Rust, no search or self-play change: the games, searches and recorded samples are the same,
-`tools/check_checkpoint_compat.py` byte-identical), several change what the loop does by default - each is said. Tests:
+fix below is in Python or the tools (no Rust, no search or self-play change: the games, searches and recorded samples
+are the same), several change what the loop does by default - each is said. Tests:
 `tests/test_run_infra.py` (new) and `tests/test_remoteplay.py`. MTG Zero's ENGINE.md 144 has the pin.
 
 ### 46.1 A finished self-play phase is never played again: `data/iter_N/DONE.json`
@@ -6276,5 +6276,29 @@ which the run gives back to the quota.
   the gated segments learn as if open. Costs: a second attention backward a layer for as long as a gate stays shut (on
   top of 43.14's explicit-attention cost); the pooling's and the pointer blend's shadow terms reach the trunk through the
   gated tokens' hidden states and would need the same split. Default training unchanged until a run asks for it.
-* The review's remaining core items owned elsewhere: `tools/build_engine.sh`'s shared `<base>/HEAD` target dir (B7) and
-  `tools/selfplay_digest.py`'s missing auxiliary targets (B14) - the review lanes' tool owner.
+* Improvements of the review not taken: a gap in the data window (I3), the optimizer state saved with its checkpoint
+  (I5), a build identity in the remote hello (I6), a remote evaluation retried after it finished (I9), a pausing run's
+  stall limit (I10), a persistent shard-fetch channel and a window row cache (O2, O3).
+
+### 46.12 The compat goldens record and hash the auxiliary targets (`tools/selfplay_digest.py`)
+
+`check_checkpoint_compat` is the byte-identity proof of the core gates ("identical ... samples > 0"), but
+`selfplay_digest.py` built its drivers without `aux=True` and hashed x, player, n_players, z, q, sc, net, opt_action,
+pi and the tails / overrides - not the auxiliary targets (15) that MTG Zero's Delver and EoE runs train on
+(`aux_belief_w`, the deck targets): a change to what self-play records for them passed as identical. Now a game whose
+engine computes auxiliary targets (`aux_layout` not empty) is recorded with them and each row's `aux` is hashed after
+the rest; a game without them hashes exactly the bytes of before (the toy's `toy_tail`: visits `1edf08ce1f646b68`, cq
+`c6fb4902cbac6275` with the old and the new tool). Each target's entry names the arrays hashed (`arrays`), the compat
+check prints them per side (`  arrays hashed: ...`, a line of its own: the gate's parser reads the target lines as
+before) and in its result line (`arrays`). Both sides run the new tool (the one beside the compat check), so the
+comparison stays like for like; the toy's and MTG Zero's digests change (they hash `aux` now). Tests:
+`tests/test_run_infra.py::test_the_records_digest_hashes_auxiliary_targets_and_nothing_else_changes`,
+`::test_check_checkpoint_compat_names_the_arrays_it_compared`.
+
+### 46.13 A detached checkout's default target dir (`tools/build_engine.sh`)
+
+The default `CARGO_TARGET_DIR` was `<default target dir>/<branch>` with the branch from `git rev-parse --abbrev-ref
+HEAD` - `HEAD` in every detached checkout (a game's pinned run worktrees, the `*-base` ones), so all of them built into
+one `<base>/HEAD`: the shared-target hazard (cargo's workspace-relative dep-info, one checkout's build installed as
+another's module) as the default. Now a detached checkout gets `detached-<its directory's name>` (a branch: its name as
+before, `/` -> `_`; not a git checkout: `nogit`), as MTG Zero's own `tools/build_py.sh` now names it.
