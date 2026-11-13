@@ -615,16 +615,17 @@ class TBlock(nn.Module):
         h = h + self.out(a.transpose(1, 2).reshape(B, T, D))
         return h + self.ff2(F.gelu(self.ff1(self.ln2(h))))
 
-    def forward_weighted(self, h, w4, pad3):
+    def forward_weighted(self, h, w4, pad3, wsh4=None):
         """`forward` with weighted keys, as an explicit math attention (docs/az.md 43.6: training while a present gate
         is exactly 0, where SDPA's float mask log w would give the gate no finite gradient): p_ij = exp(s_ij - m_i) *
         w_j, out_i = sum_j p_ij v_j / sum_j p_ij, m_i the max over the non-padding keys; w4 [B, 1, 1, T] the keys'
         weights (1 ungated, g gated, 0 padding), pad3 [B heads, 1, T] the padding keys (`_trunk_ext` builds it once
-        for every block). One autograd node (`_WeightedAttention`)."""
+        for every block); wsh4 (or None) the weights the backward takes (a shut gate's shadow, `GATE_SHADOW`). One
+        autograd node (`_WeightedAttention`)."""
         B, T, D = h.shape
         # (q, k, v contiguous by one copy of the three: the batched products' [B H, T, dh] views without a copy each)
         q, k, v = self.qkv(self.ln1(h)).view(B, T, 3, self.h, D // self.h).permute(2, 0, 3, 1, 4).contiguous()
-        a = _WeightedAttention.apply(q, k, v, w4, pad3)
+        a = _WeightedAttention.apply(q, k, v, w4, pad3, wsh4)
         h = h + self.out(a.transpose(1, 2).reshape(B, T, D))
         return h + self.ff2(F.gelu(self.ff1(self.ln2(h))))
 
@@ -635,11 +636,12 @@ class _WeightedAttention(torch.autograd.Function):
     with m the max over the non-padding keys, p = e w, out = p v / sum_j p); the backward its gradients by hand: with
     a = p / Z, A = dO v^T, D_i = dO_i . out_i, R = (A - D) / Z - dv = a^T dO, dw_j = sum_{h,i} e_ij R_ij, ds = p R,
     dq = ds k / sqrt(dh), dk = ds^T q / sqrt(dh) (~16 operations a layer, where autograd's chain of the explicit
-    math ran ~25 nodes: docs/az.md 43.9)."""
+    math ran ~25 nodes: docs/az.md 43.9). `wsh4` (a shut gate's shadow, docs/az.md 43.14): the backward is that of
+    the weights wsh4 (p, Z and out recomputed with them) - the forward is w4's, unchanged."""
 
     @staticmethod
     @torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)
-    def forward(ctx, q, k, v, w4, pad3):
+    def forward(ctx, q, k, v, w4, pad3, wsh4=None):
         B, H, T, dh = q.shape
         scale = 1.0 / math.sqrt(dh)
         # (on [B H, T, .]: the batched products torch.matmul runs for these 4-d operands, one call each)
@@ -651,9 +653,15 @@ class _WeightedAttention(torch.autograd.Function):
         p = e * w3
         Z = p.sum(-1, keepdim=True)
         out = torch.bmm(p, v3) / Z
+        res = out.view(B, H, T, dh)
+        if wsh4 is not None:
+            # (the backward's point: the shadow weights' p, Z and attention output)
+            p = e * wsh4.expand(B, H, 1, T).reshape(B * H, 1, T)
+            Z = p.sum(-1, keepdim=True)
+            out = torch.bmm(p, v3) / Z
         ctx.save_for_backward(q3, k3, v3, e, p, Z, out)
         ctx.dims = (B, H, T, dh, scale)
-        return out.view(B, H, T, dh)
+        return res
 
     @staticmethod
     @torch.amp.custom_bwd(device_type='cuda')
@@ -666,7 +674,7 @@ class _WeightedAttention(torch.autograd.Function):
         dw = (e * R).sum(1).view(B, H, T).sum(1)[:, None, None, :] if ctx.needs_input_grad[3] else None
         ds = (p * R) * scale
         dq, dk = torch.bmm(ds, k3), torch.bmm(ds.transpose(1, 2), q3)
-        return dq.view(B, H, T, dh), dk.view(B, H, T, dh), dv.view(B, H, T, dh), dw, None
+        return dq.view(B, H, T, dh), dk.view(B, H, T, dh), dv.view(B, H, T, dh), dw, None, None
 
 
 class _TailEmbed(torch.autograd.Function):
@@ -733,6 +741,14 @@ class _TailEmbed(torch.autograd.Function):
 # tail token positions (docs/az.md 43.5): psi(n), n = slot - count in [0, 2^32): its 32 binary digits,
 # log2(n + 1) / 32, and sin / cos(2 pi (n mod 2^j) / 2^j) for j = 1..8 (interleaved: sin_1, cos_1, sin_2, ...)
 PSI = 49
+
+# A shut gate's shadow (docs/az.md 43.14): in training, the tokens of a gated segment whose gate is below GATE_SHADOW
+# are back-propagated as if their weight were GATE_SHADOW (the attention's keys and values, the pooling, a pointer
+# override's blend) while the forward keeps their weight g = max(theta, 0) exactly - so a segment whose gate sits at
+# 0 (a widen's new segment, or one pushed below 0) still learns features, and its gate's gradient measures them
+# instead of the widen's random maps. A model's `gate_shadow` attribute overrides it; 0 = off (the gradients of
+# before). Inference, and every forward, unchanged.
+GATE_SHADOW = 0.1
 
 
 def _capturing(t):
@@ -1112,13 +1128,19 @@ class TokenNet(nn.Module):
 
     def _explicit_flag(self, gi, clean=False):
         """`_explicit`'s decision as a 0-d bool tensor (no host sync; `gi` outside [0, G): not gated - `clean`: already
-        in [0, G], G for not gated), None when gradients are off."""
+        in [0, G], G for not gated), None when gradients are off. A present gate at 0 - or below the shadow
+        (`GATE_SHADOW`, docs/az.md 43.14), whose backward the explicit attention takes - decides it."""
         if not (torch.is_grad_enabled() and self.gate.requires_grad):
             return None
         G = len(self.gated)
         idx = gi if clean else torch.where((gi >= 0) & (gi < G), gi, G)
         pres = torch.zeros(G + 1, dtype=torch.bool, device=gi.device).index_fill(0, idx, True)
-        return ((self.gate <= 0) & pres[:G]).any()
+        sh = self._shadow()
+        return (((self.gate < sh) if sh > 0 else (self.gate <= 0)) & pres[:G]).any()
+
+    def _shadow(self):
+        """The shut gates' shadow weight (`GATE_SHADOW`, a model's `gate_shadow`; 0 = off)."""
+        return float(getattr(self, 'gate_shadow', GATE_SHADOW))
 
     def _tail_args(self, tail, ov):
         """The refusals of a forward's `tail` / `ov` (R5, docs/az.md 43.5) -> (NT, NO)."""
@@ -1345,6 +1367,7 @@ class TokenNet(nn.Module):
         column (a gated target's blended: gen + min(g, 1) (ptr - gen)) or, ref -1, the generic logit."""
         Tc = hc.shape[1]
         keep = torch.arange(Tc, device=hc.device)[None, :] < nr[:, None]
+        wsh = wsh4 = None                                             # (a shut gate's shadow, docs/az.md 43.14)
         if w is None:
             k4 = keep[:, None, None, :]
             for blk in self.blocks:
@@ -1354,8 +1377,13 @@ class TokenNet(nn.Module):
             H = self.blocks[0].h
             w4 = w[:, None, None, :]
             pad3 = ~keep[:, None, None, :].expand(-1, H, 1, -1).reshape(-1, 1, Tc)
+            sh = self._shadow() if torch.is_grad_enabled() else 0.0
+            if sh > 0:
+                # a shut gate's shadow (docs/az.md 43.14): gated tokens below it back-propagated at weight `sh`
+                wsh = torch.where(keep & (w < sh), torch.full_like(w, sh), w)
+                wsh4 = wsh[:, None, None, :]
             for blk in self.blocks:
-                hc = blk.forward_weighted(hc, w4, pad3)
+                hc = blk.forward_weighted(hc, w4, pad3, wsh4)
         else:
             m4 = torch.log(w)[:, None, None, :]
             for blk in self.blocks:
@@ -1365,6 +1393,9 @@ class TokenNet(nn.Module):
             zm = hc.sum(1) / nr[:, None].to(hc.dtype)
         else:
             zm = (hc * w[..., None]).sum(1) / w.sum(1, keepdim=True)
+            if explicit and wsh4 is not None:
+                # (the pooling's shadow: + 0 in the forward, the gradient of weight `sh` into a shut gated token)
+                zm = zm + ((hc - hc.detach()) * (wsh - w).detach()[..., None]).sum(1) / w.sum(1, keepdim=True)
         zc = torch.cat([hc[:, 0], zm], 1)
         gen = F.pad(self.gen(zc), (0, 1))
         fcl = fc.clamp(max=self.n_tok) if self.tails else fc        # (n_tok: a tail token's, no action)
@@ -1381,9 +1412,16 @@ class TokenNet(nn.Module):
             r, a, p, gc, isg, bw, isgen = ov
             v, g0 = P[r, p, gc], gen[r, a]
             if isg is not None:
+                ptr = v
                 # gen + min(g, 1) (ptr - gen) as torch.lerp, in the gates' float32 and cast back: exactly gen at 0 and
                 # exactly ptr at 1 in every dtype (autocast's bfloat16 / float16 logits are exact in float32)
                 v = torch.where(isg, torch.lerp(g0.float(), v.float(), bw.float()).to(v.dtype), v)
+                sh = self._shadow() if torch.is_grad_enabled() else 0.0
+                if sh > 0:
+                    # (the blend's shadow, docs/az.md 43.14: + 0 in the forward, the pointer logit of a target gated
+                    # below `sh` given the gradient of weight `sh`)
+                    low = isg & (bw < sh)
+                    v = v + torch.where(low, (ptr - ptr.detach()) * (sh - bw).detach().to(ptr.dtype), torch.zeros_like(ptr))
             pc = pc.index_put((r, a), torch.where(isgen, g0, v))
         return zc, pc
 

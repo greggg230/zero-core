@@ -5621,13 +5621,14 @@ gated segment s) or 0 (padding):
 
 At g = 0 a gated token changes no other token, the pooling or any logit, exactly; it still attends as a query.
 **Paths:** without gated segments, today's bool-mask SDPA; with gated tokens present, SDPA with the float mask log w
-(-inf at 0) in inference and in training once every present gate is > 0, and an explicit math attention
-(`TBlock.forward_weighted`, the same formula, one autograd node with its backward by hand: 43.9) in training while a
-present gate is exactly 0 (SDPA's mask would give the gate no finite gradient there; forward_static's flags decide,
-read without draining the device: 43.9). The static forward weighs every token whenever the
+(-inf at 0) in inference and in training once every present gate is above the shadow (43.14; > 0 without it), and an
+explicit math attention (`TBlock.forward_weighted`, the same formula, one autograd node with its backward by hand:
+43.9) in training while a present gate is below it (SDPA's mask would give the gate no finite gradient at 0;
+forward_static's flags decide, read without draining the device: 43.9). The static forward weighs every token whenever the
 network has gated segments and the batch has tail tokens (no data-dependent branch; with weights 0 / 1 the float mask
 is the bool mask's computation). At g = 0 the gate is the only parameter of its segment with a gradient (the
-segment's own maps get exactly none until it opens).
+segment's own maps get exactly none until it opens) - unless a shut gate's shadow is on (43.14, the default), which
+back-propagates a shut segment as if its weight were the shadow, the forward unchanged.
 
 **In a run** (2026-11-12, the coordinator's decisions; the API's change log): `TokenNet.gates()` -> {segment: g} is
 logged every iteration as `train.tail.gates`, with `train.tail.gate_steps` (per gated segment, the training steps
@@ -6048,3 +6049,58 @@ tokens and overrides, bit for bit; dense and sparse batches), the arrays' CSRs t
 ends its contest aborted with game 1's samples kept -, `tests/test_tail_search.py` (the Python driver, both seat
 implementations) and `tests/test_tail_loop.py` (the run's self-play phase: one row a contest, v2 shards synchronous and
 on the writer thread array for array, the window's batches, the aborted contest).
+
+### 43.14 A shut gate's shadow: a widen's new segments learn while their gates are shut (2026-11-12)
+
+**Why.** At g = 0 a gated segment's tokens change nothing (43.6), so its own maps get exactly no gradient and the gate
+is its only learning parameter. Right after a widen those maps are random: the gate's straight-through gradient
+measures opening onto random features - noise around 0 for a trained network - and nothing ever makes the features
+useful. MTG Zero's GPU smokes of the widened Delver 3198 (2 iterations, ~100-160 steps each) pushed some gates below 0
+(links -0.007, library_known -0.018 to -0.023, graveyard_order -0.0012 to -0.0075) and others up (delayed +0.004 to
++0.024), which ones varying by run: a random walk, and a segment whose gate wanders below 0 never learns, so its gate
+never has a reason to open. A fresh network is not affected (its gates start at 1).
+
+**What** (`net.GATE_SHADOW` = 0.1; a model's `gate_shadow` attribute overrides it, 0 = the gradients of before). In
+training, a gated segment whose gate is below the shadow is **back-propagated as if its weight were the shadow**
+while the forward keeps g = max(theta, 0) exactly:
+
+* the attention runs as the explicit math (43.6, 43.9) whenever a present gate is below the shadow (before: exactly
+  0); its node's backward takes the shadow weights - p, Z and the attention output recomputed with them - so the
+  segment's keys and values (its maps, positions, base, identities) get the gradient of weight `GATE_SHADOW`, and the
+  gate's own gradient is taken there (how much more of the segment would help);
+* the pooling adds `(h - h.detach()) * (w_shadow - w)`, the blend of an override into such a segment
+  `(ptr - ptr.detach()) * (shadow - min(g, 1))`: + 0 in the forward, exactly, and the shadow's gradient into the token
+  and the pointer logit.
+
+Every forward is unchanged, bit for bit (inference, and training's at g = 0: the same explicit path as before); the
+widen stays exact at step 0. Between 0 and the shadow, training's forward is the explicit math instead of SDPA (the
+same values up to rounding, 43.6). A network without gates never reaches this code. A deliberate change of the
+gradients of networks with gates (feat/varlen only: no run has trained one).
+
+**Compared** (`tests/test_tail_gates.py`'s toy, a sweep of 5 seeds x 800 steps, CPU, 2026-11-12): toy_tail's layout
+widened by a gated segment whose tokens carry a bit as the parity of a one-hot code's index (no feature of a random
+input map carries it on average; the bit is worth ~0.4 nats a row), and the same segment carrying noise. Held-out loss
+(the old network without the segment: 0.671 on the informative task, 0.525 on the noise one):
+
+| variant | informative: loss | gate at the end | went below 0 | steps to read the bit | noise: loss | gate |
+|---|---:|---:|---:|---:|---:|---:|
+| before (no shadow) | 0.416 (2 of 5 runs never read it: 0.671) | -0.40 .. +0.09 | 3 / 5 | 200-300, or never | 0.525 | -0.003 .. +0.025 |
+| shadow 0.03 | 0.246 (5 / 5) | +0.06 .. +0.11 | 0 / 5 | 200 | 0.525 | -0.002 .. +0.015 |
+| **shadow 0.1** | 0.246 (5 / 5) | +0.05 .. +0.10 | 0 / 5 | 200 | 0.525 | -0.001 .. +0.015 |
+| shadow 0.3 | 0.246 (5 / 5) | +0.03 .. +0.10 | 0 / 5 | 200 | 0.525 | -0.001 .. +0.016 |
+| floor: theta >= 0.05 after each step | 0.246 (5 / 5) | +0.10 .. +0.15 | 0 / 5 | 200 | 0.525 | 0.05 (forced open) |
+| shadow 0.1 + the new segment's maps zero at the widen | 0.246 (5 / 5) | +0.06 .. +0.07 | 0 / 5 | 100-200 | 0.525 | -0.006 .. +0.004 |
+
+The shadow reads the bit every time at any weight from 0.03 to 0.3, and leaves a noise segment's gate at ~0. A floor
+works too but holds every gate open (a noise segment for good) and changes the forward at the first step; zero maps
+at the widen are a little faster on this toy and change the widen's weights (not its outputs) - not taken: the
+shadow alone is enough, and lane Z's existing v7 forks keep their meaning.
+
+**Costs.** While a present gate is below the shadow, training runs the explicit attention (43.9: the g = 0 phase's
+step cost +21-22% of v6's where the steady state's is +11-12%) plus one recomputed product a layer in its backward; a gate that stays shut
+(a segment with nothing to read) keeps that cost. Inference: none.
+
+**Tests.** `tests/test_tail_gates.py` (new): an informative gated segment opens and its widened network beats the old
+one by > 0.2 nats (3 seeds, eager; and train_static), the widen exact at step 0; a noise segment does no harm and its
+gate stays below 0.25. `tests/test_tail_net.py::test_gradients_reach_the_gates`: with the shadow every gated segment's
+maps get a gradient at g = 0; without it (`gate_shadow` 0) exactly none, the forward the same bit for bit.

@@ -691,8 +691,10 @@ def _gate_net(theta):
 def test_gradients_reach_the_gates(static, monkeypatch):
     """At g = 0 (a widen) training runs the explicit attention and every gate gets a non-zero gradient - through
     the attention's keys, the pooling and the pointer blend -; so does a gate pushed below 0 (straight-through);
-    with every present gate > 0 training runs SDPA with the float mask (finite gradients), the explicit path's
-    outputs up to rounding; inference never runs the explicit path. Eager and static."""
+    with every present gate above the shadow (docs/az.md 43.14) training runs SDPA with the float mask (finite
+    gradients), the explicit path's outputs up to rounding; inference never runs the explicit path. A shut gate's
+    segment learns (its maps get the gradient of the shadow weight) while the forward is that of g = 0, bit for bit;
+    without the shadow (`gate_shadow` 0) its maps get exactly none. Eager and static."""
     calls = []
     orig = TBlock.forward_weighted
     monkeypatch.setattr(TBlock, 'forward_weighted', lambda self, *a: calls.append(1) or orig(self, *a))
@@ -706,16 +708,25 @@ def test_gradients_reach_the_gates(static, monkeypatch):
             return w.forward_static(x, n, full, ntok, aux=True, tail=tl, ov=ov)
         return w(x, n, aux=True, tail=tl, ov=ov)
 
-    def grads(theta):
+    def grads(theta, shadow=None):
         w = _gate_net(theta)
+        if shadow is not None:
+            w.gate_shadow = shadow
         out = run(w)
         (out[0][:, :A].sum() + (out[1] ** 2).sum() + out[2].sum() + out[3].sum()).backward()
         return w, out, w.gate.grad.clone()
 
     w, out0, g0 = grads([0.0, 0.0])
     assert calls and (g0 != 0).all() and torch.isfinite(g0).all()
-    # (at g = 0 a gated segment's own parameters get exactly no gradient - its tokens change nothing -, the
-    # ungated tail segment's do)
+    # a shut gate's shadow: the gated segments' own parameters learn (the ungated tail segment's as ever)
+    for k in ('pos_tail.0.weight', 'seg_in.0.weight', 'pos_tail.1.weight', 'pos_tail.2.weight', 'seg_in.1.weight',
+              'seg_in.2.weight'):
+        assert w.get_parameter(k).grad.abs().sum() > 0 and torch.isfinite(w.get_parameter(k).grad).all(), k
+    assert (w.tail_base.grad.abs().sum(1) > 0).all()
+    # without it (gate_shadow 0): at g = 0 a gated segment's own parameters get exactly no gradient - its tokens
+    # change nothing -, the ungated tail segment's do; the forward is the same, bit for bit
+    w, out_off, _ = grads([0.0, 0.0], shadow=0.0)
+    assert all(torch.equal(a, b) for a, b in zip(out0, out_off))
     for k in ('pos_tail.0.weight', 'seg_in.0.weight'):
         assert w.get_parameter(k).grad.abs().sum() > 0, k
     assert w.tail_base.grad[0].abs().sum() > 0 and not w.tail_base.grad[1:].any()
