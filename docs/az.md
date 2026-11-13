@@ -5450,6 +5450,29 @@ target on a token, an MLP and a conv network; a network without the head (aux [B
 dtypes, dynamic dimensions and metadata; real toy games driven through the graph (sparse driver batches with
 value-only and belief rows, every answer validated and within 2e-5 of eager).
 
+### 41.1 Graphs every GPU provider runs, with the same answers (no setting; zero-farm phase 4, 2026-11-12)
+
+**Why.** zero-farm's GPU providers met the export: DirectML answered the identity decoding's `digits @ arange` (a
+MatMul with a 1-D constant operand) with zeros and threw on Reshape allowzero=1 (the dynamo exporter's `view`);
+TensorRT's ONNX parser refused the whole graph for densify's ScatterElements reduction='add' ("Unsupported
+reduction type").
+
+**What it does.** `densify` finds each non-zero's row without a scatter-add: in the merged sequence of the non-zeros
+and the B row ends, row b's end sits at x_ptr[b+1] + b (distinct even for empty rows); a scatter of ones there, a
+running sum, and a scatter to unique slots give every non-zero its row (integers: the same rows). `portable(model)`,
+applied by `export` (metadata `portable` 1): MatMul(A, 1-D constant w) -> Squeeze(MatMul(A, w[:, None]), -1) (the
+same GEMM on the CPU); Reshape allowzero=1 -> allowzero=0 on `Where(Equal(S, 0), -1, S)` (equal for every shape with
+at most one zero; two would raise, never answer differently), a constant shape without zeros just flips the flag.
+`python -m zero.onnx_export --rewrite IN OUT` applies it to an exported file; `--no-portable` skips it.
+
+**Off by default.** Not a setting: the answers are the same (below); a run's training never sees the exporter.
+
+**Tests and checks.** The new export of eoe1 iter 80 against phase 2's published one, ONNX Runtime 1.31.1 CPU, 4
+threads: 137 of 137 pieces (7,713 real driver rows) bit-identical on every output. Gate 1 re-run
+(`zero.onnx_parity`): eoe1 `packed` 23 + 11 cases, worst margin 1.22e-5, `mask` 1.39e-5; Delver deep8 `packed`
+4.0e-6; none failed, every case twice bit-identical. DirectML then runs both nets within 9e-6 of torch.
+`tools/onnx_probe_graph.py` writes the worker's built-in probe graph (44.4).
+
 ## 42. Chained episodes: one game of a match per episode (`SearchGame::chained`, `next_episode`; MTG Zero's best-of-three Delver mirror, 2026-11-11)
 
 (Section 40 is taken by `feat/extra-evals` and `feat/selfplay-spec-hook`, 41 by `farm`.) **No run setting**: the game
@@ -5919,6 +5942,27 @@ nothing published) signs eoe1 80 v 70's head-to-head definition and the live fuz
 and 1.06 busy h on the desktop, 632 eval games on the Mac, 303,410 fuzz seeds in 24 h); replayed on 11-07's runs with
 mac + vast:line + vast:w1 (6 runs, 0.5 s) it reproduced an independent recount exactly (318,511 / 63,268 / 905,122 /
 962,469 self-play games in 24 h).
+
+### 44.4 One session factory for every execution provider; probe-providers (no setting; zero-farm phase 4, 2026-11-12)
+
+**Why.** zero-farm PROTOCOL.md 8 (rev 7): friends' GPUs of every vendor, each accepted only if it answers as the
+CPU and torch do.
+
+**What it does.** `session::create_session` builds every ONNX Runtime session of the worker (jobs through
+`build_evaluator`, the gate tools, `read_metadata`): the job line's `providers` in order (cpu last), each built on
+the job's adapter (`gpu`, a LUID) and accepted only if the reference set answers within 2e-5 twice, bit-identical
+(a GPU provider never without a reference set, never when ONNX Runtime gives it no node); the nodes it leaves to the
+CPU come from ONNX Runtime's verbose node placement and go into the `selftest` event. DirectML (built into Windows
+ML's ONNX Runtime), CUDA and a standalone TensorRT-RTX by name; Windows ML's catalog providers (TensorRT-RTX, AMD
+GPU, MIGraphX, OpenVINO; `winml.rs`, the flat C API) as plugin libraries bound by LUID. GPU providers take whole
+batches (up to `GPU_CHUNK` 1,024 rows), the CPU keeps 64-row pieces. `release_device` drops the session (yield).
+`probe-providers` runs the factory's steps per provider and adapter on a built-in graph (`crates/worker/probe/`,
+from `tools/onnx_probe_graph.py`: every operator of eoe1's and Delver's graphs) or a real network, and times them.
+
+**Off by default.** A job line without `providers` is `["cpu"]`: the same CPU session as before.
+
+**Tests and checks.** `cargo test -p zero_worker`; measured on an RTX 5090, an Intel UHD 770 and an RTX 4070 Ti
+(Windows 10): zero-farm-notes phase4-gpu.md (DirectML and CUDA pass; TensorRT-RTX 1.2 refuses both packings).
 
 ## 45. Self-play records and the farm pool (`pool:<farm run>` in `selfplay_remote`, `pool_*`; zero-farm phase 3, 2026-11-12)
 

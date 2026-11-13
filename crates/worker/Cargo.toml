@@ -13,5 +13,8 @@ half = "2"
 flate2 = "1"
 crc32fast = "1"
 # ONNX Runtime, loaded at run time from the library the worker is pointed at (load-dynamic: no
-# download, no link-time dependency); api-31 = ONNX Runtime 1.31's C API (older libraries refuse)
-ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-31"] }
+# download, no link-time dependency). api-23: the C API of ONNX Runtime 1.23, the oldest a runtime pack
+# carries (TensorRT-RTX's own build 1.23.2; Windows ML 2.5's is 1.28.3, the CPU pack's 1.31.1: newer
+# libraries serve older API versions). The provider features only add ort's registration code (nothing is
+# linked; zero-farm PROTOCOL.md 8).
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-23", "directml", "cuda", "nvrtx", "openvino", "migraphx"] }

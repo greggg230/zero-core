@@ -151,6 +151,16 @@ impl Evaluator for ByKey {
     fn describe(&self) -> String {
         self.evs.iter().map(|(g, e)| format!("gen {g}: {}", e.describe())).collect::<Vec<_>>().join("; ")
     }
+    fn provider(&self) -> String {
+        // (the networks' providers; one name when they agree, as they do on one PC)
+        let mut p: Vec<String> = self.evs.iter().map(|(_, e)| e.provider()).collect();
+        p.dedup();
+        if p.is_empty() {
+            "uniform".into()
+        } else {
+            p.join("+")
+        }
+    }
 }
 
 struct EvalRun<'a> {
@@ -407,7 +417,7 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
         let mut p = progress.lock().unwrap();
         p.concurrency = cfg.concurrency;
         p.threads = cfg.threads;
-        p.provider = if job.ort.is_some() { "cpu".into() } else { "uniform".into() };
+        p.provider = ev.provider();
     }
     let mut drv = (game.new_driver)(cfg)?;
     drv.set_first_gid(job.gid_base)?;

@@ -21,6 +21,12 @@
 //! <worker> eval-batches --model M --batches F --out F [--threads T] [--ort-dll P]
 //!                                                  answers to recorded batches (the evaluator's gate)
 //! <worker> info [--runtime-dir D | --ort-dll P]     games, protocol, ONNX Runtime (and where its DLLs came from)
+//! <worker> probe-providers [--runtime-dir D | --ort-dll P] [--model M --reference R] [--providers a,b]
+//!          [--gpu LUID] [--threads T] [--reps N] [--bench-rows 64,256,...] [--ensure-ready] [--json FILE]
+//!                                                  which execution providers pass the self-test on this PC
+//!                                                  (zero-farm PROTOCOL.md 8; `probe`): JSON on stdout (or
+//!                                                  FILE), a report on stderr; exit 0 even when only the CPU
+//!                                                  passes, 2 when not even the CPU does
 //! <worker> fuzz --mode M [--env K=V ...] --first F --count N [--threads T] [--chunk C]
 //!          [--seed-timeout S] [--out DIR] [--work DIR] [--keep-chunks] [--stdin-control]
 //!                                                  a fuzz job from flags (events on stdout)
@@ -55,7 +61,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
-use crate::eval::{ort_env, ort_version, OrtCfg, OrtEvaluator};
+use crate::eval::OrtCfg;
+use crate::session::{ort_version, GpuDevice, ProviderKind};
 use crate::job::{do_resume, do_yield, run_job, Checkpoint, Control, EvalKind, EvalLink, Job, Outcome, Progress, Sink};
 use crate::fuzz::{FuzzControl, FuzzShared};
 use crate::settings::Settings;
@@ -195,12 +202,42 @@ fn read_settings(path: &str) -> Result<Settings, String> {
     Settings::parse(&std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| format!("{path}: {e}"))
 }
 
-/// The rows' network id from a graph's metadata (`checkpoint_iter`), read without a session.
+/// The rows' network id from a graph's metadata (`checkpoint_iter`; a CPU session of the session factory).
 fn checkpoint_iter(model: &Path, ort: &OrtCfg) -> Result<u32, String> {
-    let env = ort_env(&ort.dylib)?;
-    let s = ort::session::Session::builder(env).map_err(|e| e.to_string())?.commit_from_file(model).map_err(|e| format!("{}: {e}", model.display()))?;
-    let it = s.metadata().map_err(|e| e.to_string())?.custom("checkpoint_iter");
+    let meta = crate::session::read_metadata(&ort.dylib, model)?;
+    let it = meta.iter().find(|(k, _)| k == "checkpoint_iter").map(|(_, v)| v.clone());
     it.and_then(|v| v.parse::<u32>().ok()).ok_or_else(|| format!("{}: no checkpoint_iter in its metadata: give the job's gen", model.display()))
+}
+
+/// The job line's `providers` and `gpu` (zero-farm PROTOCOL.md 8; absent: the CPU only).
+fn job_ort(o: &Map<String, Value>, dylib: PathBuf, threads: usize) -> Result<OrtCfg, String> {
+    let u = |k: &str| o.get(k).and_then(|x| x.as_u64());
+    Ok(OrtCfg {
+        dylib,
+        intra_threads: u("infer_threads").map_or(threads, |t| t as usize),
+        spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false),
+        providers: crate::session::parse_providers(o.get("providers")).map_err(|e| format!("job: {e}"))?,
+        device: GpuDevice::from_json(o.get("gpu")).map_err(|e| format!("job: {e}"))?,
+    })
+}
+
+/// The command line's `--providers a,b,...` and `--gpu <luid hex>` (default: the CPU only).
+fn cli_ort(a: &Args, dylib: PathBuf, threads: usize, spinning: bool) -> Result<OrtCfg, String> {
+    let providers = match a.get("--providers") {
+        Some(s) => {
+            let mut v = Vec::new();
+            for n in s.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                v.push(ProviderKind::parse(n).ok_or_else(|| format!("--providers: unknown provider {n:?}"))?);
+            }
+            crate::session::normalize(&v)
+        }
+        None => vec![ProviderKind::Cpu],
+    };
+    let device = match a.get("--gpu") {
+        Some(l) => Some(GpuDevice { luid: crate::gpu::parse_luid(l).ok_or("--gpu: an adapter LUID in hex")?, vendor: String::new(), name: String::new() }),
+        None => None,
+    };
+    Ok(OrtCfg { dylib, intra_threads: threads, spinning, providers, device })
 }
 
 /// `checkpoint_iter` of a model whose file's sha256 (when the job gives one) is checked first: ONNX Runtime
@@ -239,7 +276,7 @@ fn job_from_value(v: &Value, base: &Path) -> Result<Job, String> {
         (None, Some(_)) => return Err("job: a network job needs its runtime pack (runtime_dir or ZEROFARM_RUNTIME_DIR)".into()),
         (None, None) => PathBuf::new(),
     };
-    let ort = OrtCfg { dylib, intra_threads: u("infer_threads").map_or(threads, |t| t as usize), spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false) };
+    let ort = job_ort(o, dylib, threads)?;
     let sha256 = o.get("sha256").and_then(|x| x.as_str()).map(String::from);
     let reference = o.get("reference").and_then(|x| x.as_str()).map(|r| base.join(r));
     let eval = match o.get("model").and_then(|m| m.as_str()) {
@@ -317,7 +354,7 @@ fn eval_job_from_value(v: &Value, base: &Path) -> Result<crate::evaljob::EvalJob
         None
     } else {
         let d = rt.ok_or("job: a network job needs its runtime pack (runtime_dir or ZEROFARM_RUNTIME_DIR)")?;
-        Some(OrtCfg { dylib: ort_dylib_in(None, Some(&d)), intra_threads: u("infer_threads").map_or(threads, |t| t as usize), spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false) })
+        Some(job_ort(o, ort_dylib_in(None, Some(&d)), threads)?)
     };
     Ok(EvalJob {
         lease_id: o.get("lease_id").and_then(|x| x.as_str()).unwrap_or("job").to_string(),
@@ -710,7 +747,7 @@ fn selfplay_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     let settings = read_settings(a.get("--settings").ok_or("--settings <config.json>")?)?;
     let game = game_of(games, &settings)?;
     let threads: usize = a.num("--threads")?.unwrap_or(1);
-    let ort = OrtCfg { dylib: ort_dylib(a.get("--ort-dll")), intra_threads: a.num("--infer-threads")?.unwrap_or(threads), spinning: a.get("--spinning") == Some("1") };
+    let ort = cli_ort(a, ort_dylib(a.get("--ort-dll")), a.num("--infer-threads")?.unwrap_or(threads), a.get("--spinning") == Some("1"))?;
     let eval = if a.has("--uniform") {
         EvalKind::Uniform
     } else {
@@ -775,7 +812,7 @@ fn eval_cli(w: &'static Worker, a: &Args) -> Result<i32, String> {
             }
         }
     }
-    let ort = (!uniform).then(|| OrtCfg { dylib: ort_dylib(a.get("--ort-dll")), intra_threads: a.num("--infer-threads").ok().flatten().unwrap_or(threads), spinning: a.get("--spinning") == Some("1") });
+    let ort = if uniform { None } else { Some(cli_ort(a, ort_dylib(a.get("--ort-dll")), a.num("--infer-threads").ok().flatten().unwrap_or(threads), a.get("--spinning") == Some("1"))?) };
     let record = match (a.num::<usize>("--record-batches")?, a.get("--record-file")) {
         (Some(n), Some(f)) => Some((PathBuf::from(f), n)),
         (None, None) => None,
@@ -887,22 +924,18 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
     use crate::shard::{write_npz, Npy};
     let model = PathBuf::from(a.get("--model").ok_or("--model")?);
     let threads: usize = a.num("--threads")?.unwrap_or(4);
-    let ort = OrtCfg { dylib: ort_dylib(a.get("--ort-dll")), intra_threads: threads, spinning: a.get("--spinning") == Some("1") };
+    let ort = cli_ort(a, ort_dylib(a.get("--ort-dll")), threads, a.get("--spinning") == Some("1"))?;
     let z = read_npz(Path::new(a.get("--batches").ok_or("--batches")?))?;
     let g = |k: &str| z.get(k).ok_or_else(|| format!("batches: no {k}"));
     let meta: Value = serde_json::from_str(&g("meta")?.text()?).map_err(|e| format!("batches meta: {e}"))?;
     let (xs_off, xs_idx, xs_val) = (g("xs_off")?.i64s()?, g("xs_idx")?.i64s()?, g("xs_val")?.f32s()?);
     let (np_, extra, opt_off, opt_action, bo) = (g("n_players")?.i64s()?, g("extra")?.i64s()?, g("opt_off")?.i64s()?, g("opt_action")?.i64s()?, g("batch_off")?.i64s()?);
-    let mut ev = {
-        // the graph's own metadata as the expectation (the gate compares answers, not the game)
-        let env = ort_env(&ort.dylib)?;
-        let s = ort::session::Session::builder(env).map_err(|e| e.to_string())?.commit_from_file(&model).map_err(|e| e.to_string())?;
-        let md = s.metadata().map_err(|e| e.to_string())?;
-        let num = |k: &str| md.custom(k).and_then(|v| v.parse::<usize>().ok()).ok_or_else(|| format!("{}: metadata {k}", model.display()));
-        let want = crate::eval::Expect { game: md.custom("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false };
-        drop(md);
-        OrtEvaluator::load(&model, ort, &want)?
-    };
+    // the graph's own metadata as the expectation (the gate compares answers, not the game); GPU providers
+    // need the network's reference set (--reference)
+    let reference = a.get("--reference").map(PathBuf::from);
+    let spec = crate::session::SessionSpec { model: &model, reference: reference.as_deref(), providers: &ort.providers, device: ort.device.clone(), intra_threads: threads, runtime: &ort.dylib, spinning: ort.spinning, expect: None };
+    let mut ev = crate::session::create_session(&spec).map_err(|e| e.0)?;
+    eprintln!("eval-batches: {}", ev.describe());
     let reps: usize = a.num("--reps")?.unwrap_or(1);
     let (mut pri, mut val, mut mar, mut aux) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut secs = Vec::new();
@@ -935,19 +968,48 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
     let f32n = |v: &[f32], shape: Vec<usize>| Npy { descr: "<f4".into(), shape, data: v.iter().flat_map(|x| x.to_le_bytes()).collect() };
     let rows = *bo.last().unwrap() as usize;
     let w = if rows > 0 && !aux.is_empty() { aux.len() / extra.iter().filter(|&&e| e == 2).count().max(1) } else { 0 };
-    let info = json!({"model": model.display().to_string(), "ort": ort_version(), "threads": threads, "batches": bo.len() - 1, "rows": rows, "reps": reps, "seconds": secs, "source": meta});
+    let info = json!({"model": model.display().to_string(), "ort": ort_version(), "provider": ev.provider().wire(), "selftest": ev.selftest().to_json(), "threads": threads, "batches": bo.len() - 1, "rows": rows, "reps": reps, "seconds": secs, "source": meta});
     write_npz(Path::new(a.get("--out").ok_or("--out")?), &[("meta", Npy::unicode(&info.to_string())), ("priors", f32n(&pri, vec![pri.len()])), ("value", f32n(&val, vec![rows, 8])), ("margin", f32n(&mar, vec![rows, 8])), ("aux", f32n(&aux, vec![aux.len() / w.max(1), w]))], 1)?;
     println!("{}", json!({"batches": bo.len() - 1, "rows": rows, "seconds": secs.iter().sum::<f64>(), "ort": ort_version()}));
     Ok(0)
 }
 
+fn probe_cli(a: &Args) -> Result<i32, String> {
+    let providers = match a.get("--providers") {
+        Some(s) => s.split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| ProviderKind::parse(n).ok_or_else(|| format!("--providers: unknown provider {n:?}"))).collect::<Result<Vec<_>, _>>()?,
+        None => ProviderKind::ALL.to_vec(),
+    };
+    let o = crate::probe::Opts {
+        dylib: ort_dylib_in(a.get("--ort-dll"), a.get("--runtime-dir")),
+        model: a.get("--model").map(PathBuf::from),
+        reference: a.get("--reference").map(PathBuf::from),
+        providers,
+        gpu: a.get("--gpu").map(|l| crate::gpu::parse_luid(l).ok_or("--gpu: an adapter LUID in hex")).transpose()?,
+        threads: a.num("--threads")?.unwrap_or(4),
+        ensure_ready: a.has("--ensure-ready"),
+        reps: a.num("--reps")?.unwrap_or(5),
+        bench_rows: a.get("--bench-rows").map(|s| s.split(',').filter_map(|x| x.trim().parse::<usize>().ok()).filter(|&n| n > 0).collect()).unwrap_or_default(),
+    };
+    let v = crate::probe::run(&o)?;
+    eprint!("{}", crate::probe::report(&v));
+    match a.get("--json") {
+        Some(f) => {
+            let tmp = format!("{f}.tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?).map_err(|e| format!("{tmp}: {e}"))?;
+            std::fs::rename(&tmp, f).map_err(|e| format!("{f}: {e}"))?;
+        }
+        None => println!("{v}"),
+    }
+    Ok(if v["error"].is_null() { 0 } else { 2 })
+}
+
 fn info_cli(games: &'static [GameEntry], repo: &str, kinds: Vec<&'static str>, a: &Args) -> Result<i32, String> {
     let dylib = ort_dylib_in(a.get("--ort-dll"), a.get("--runtime-dir"));
-    let ort = match ort_env(&dylib) {
-        Ok(_) => {
+    let ort = match crate::session::runtime(&dylib) {
+        Ok(rt) => {
             // where each library came from (the runtime pack's check on a clean PC)
-            let mods: Map<String, Value> = ["onnxruntime.dll"].iter().chain(crate::eval::MSVC_RUNTIME).map(|n| (n.to_string(), json!(crate::eval::module_path(n)))).collect();
-            json!({"dylib": dylib.display().to_string(), "version": ort_version(), "modules": mods})
+            let mods: Map<String, Value> = ["onnxruntime.dll"].iter().chain(crate::session::PRELOAD).map(|n| (n.to_string(), json!(crate::eval::module_path(n)))).collect();
+            json!({"dylib": dylib.display().to_string(), "version": ort_version(), "modules": mods, "available": rt.available})
         }
         Err(e) => json!({"dylib": dylib.display().to_string(), "error": e}),
     };
@@ -991,7 +1053,9 @@ pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
         "driver-cfg" => driver_cfg_cli(games, &a),
         "eval-batches" => eval_batches(&a),
         "info" => info_cli(games, repo, w.kinds(), &a),
-        _ => Err("usage: <worker> serve | selfplay ... | eval ... | fuzz ... | fuzz-check ... | check-config <config.json> | driver-cfg <config.json> | eval-batches ... | info (zero-core crates/worker/src/proto.rs)".into()),
+        "probe-providers" if !w.selfplay => Err("this worker build runs fuzz jobs only (a fuzz-profile build): no network".into()),
+        "probe-providers" => probe_cli(&a),
+        _ => Err("usage: <worker> serve | selfplay ... | eval ... | fuzz ... | fuzz-check ... | check-config <config.json> | driver-cfg <config.json> | eval-batches ... | info | probe-providers ... (zero-core crates/worker/src/proto.rs)".into()),
     };
     match r {
         Ok(code) => code,

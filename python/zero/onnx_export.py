@@ -95,14 +95,21 @@ PACKINGS = ('mask', 'compact', 'packed', 'host')
 
 def densify(x_ptr, x_idx, x_val, features):
     """Sparse rows (CSR: `x_ptr` [B+1], `x_idx` [nnz], `x_val` [nnz]) -> f32 [B, features], with no
-    data-dependent shape: each non-zero's row is the number of row ends x_ptr[1..B] at or before it (a
-    scatter-add of ones at the ends - an empty row's end repeats - and a running sum), then one scatter
-    of the values (protocol.densify)."""
+    data-dependent shape and no scatter with a reduction (TensorRT's ONNX parser refuses one and with it the
+    whole graph; DirectML runs none): each non-zero's row is the number of row ends before it. In the merged
+    sequence of the nnz non-zeros and the B row ends, row b's end sits at x_ptr[b + 1] + b (distinct even
+    for empty rows): a scatter of ones there and a running sum count the ends up to each merged position; a
+    non-zero at merged position j is non-zero j - count[j], its row count[j] (a scatter to unique slots, the
+    ends' writes to one spare slot). Then one scatter of the values (protocol.densify). Integers throughout:
+    the same rows as the earlier scatter-add (zero-farm PROTOCOL.md 8; docs/az.md 41.1)."""
     B = x_ptr.shape[0] - 1
     nnz = x_idx.shape[0]
-    ends = x_ptr[1:]                                              # (the last row's end, nnz, marks the spare slot)
-    marks = torch.zeros(nnz + 1, dtype=torch.int64, device=x_ptr.device).scatter_add(0, ends, torch.ones_like(ends))
-    rows = marks.cumsum(0)[:nnz]
+    dev = x_ptr.device
+    ends = x_ptr[1:] + torch.arange(B, dtype=torch.int64, device=dev)
+    marks = torch.zeros(nnz + B, dtype=torch.int64, device=dev).scatter(0, ends, torch.ones_like(ends))
+    count = marks.cumsum(0)
+    slot = torch.where(marks > 0, torch.full_like(count, nnz), torch.arange(nnz + B, dtype=torch.int64, device=dev) - count)
+    rows = torch.zeros(nnz + 1, dtype=torch.int64, device=dev).scatter(0, slot, count)[:nnz]
     flat = rows * features + x_idx.long()
     return torch.zeros(B * features, dtype=torch.float32, device=x_val.device).scatter(0, flat, x_val).view(B, features)
 
@@ -361,11 +368,113 @@ def metadata(net, packing, extra=None):
     return meta
 
 
-def export(net, path, packing='packed', extra=None, opset=OPSET):
+def portable(model):
+    """Rewrite an exported graph so that every GPU execution provider runs it, keeping every answer bit
+    for bit (zero-farm PROTOCOL.md 8; docs/az.md 41.1) -> {rewrite: count}. In place.
+
+    * A MatMul whose second operand is a 1-D constant (the identity digits' `digits @ arange`): DirectML
+      answers it with zeros. -> MatMul(A, w[:, None]) then Squeeze(-1): the same product, one more axis
+      (ONNX Runtime's CPU kernel promotes a 1-D operand to [K, 1] itself: the same GEMM, the same bits).
+    * A Reshape with allowzero=1 (the dynamo exporter's `view`): DirectML fails on it at run time. ->
+      allowzero=0 on the shape with its zeros turned into -1 (`Where(Equal(S, 0), -1, S)`; a constant shape
+      without zeros is kept as it is). The same output for every shape with at most one zero - the only
+      zero an exported shape holds is the empty token list of a piece without present tokens; a shape with
+      two zeros would raise an error, never answer differently.
+    """
+    import numpy as np
+    from onnx import helper, numpy_helper
+    g = model.graph
+    inits = {i.name: i for i in g.initializer}
+    consts = {n.output[0]: n for n in g.node if n.op_type == 'Constant' and n.attribute and n.attribute[0].name == 'value'}
+    used = {x for n in g.node for x in list(n.input) + list(n.output)} | set(inits) | {i.name for i in g.input}
+
+    def const(name):
+        if name in inits:
+            return numpy_helper.to_array(inits[name])
+        if name in consts:
+            return numpy_helper.to_array(consts[name].attribute[0].t)
+        return None
+
+    def fresh(base):
+        k = 0
+        while f'portable/{base}/{k}' in used:
+            k += 1
+        n = f'portable/{base}/{k}'
+        used.add(n)
+        return n
+
+    def init(base, arr):
+        n = fresh(base)
+        g.initializer.append(numpy_helper.from_array(arr, n))
+        return n
+
+    stats = {'matmul_1d': 0, 'reshape_allowzero': 0, 'reshape_const': 0}
+    out = []
+    zero = minus1 = axes = None
+    for n in g.node:
+        if n.op_type == 'MatMul' and len(n.input) == 2:
+            w = const(n.input[1])
+            if w is not None and w.ndim == 1:
+                axes = axes or init('axes_last', np.array([-1], np.int64))
+                col = init('col', np.ascontiguousarray(w.reshape(-1, 1)))
+                mid = fresh('mm2d')
+                out.append(helper.make_node('MatMul', [n.input[0], col], [mid], name=n.name))
+                out.append(helper.make_node('Squeeze', [mid, axes], [n.output[0]], name=fresh('squeeze')))
+                stats['matmul_1d'] += 1
+                continue
+        if n.op_type == 'Reshape':
+            az = next((a for a in n.attribute if a.name == 'allowzero'), None)
+            if az is not None and az.i == 1:
+                s = const(n.input[1])
+                if s is not None and not (s == 0).any():
+                    az.i = 0
+                    stats['reshape_const'] += 1
+                elif s is None:
+                    zero = zero or init('zero', np.array(0, np.int64))
+                    minus1 = minus1 or init('minus1', np.array(-1, np.int64))
+                    eq, s2 = fresh('is0'), fresh('shape')
+                    out.append(helper.make_node('Equal', [n.input[1], zero], [eq], name=fresh('equal')))
+                    out.append(helper.make_node('Where', [eq, minus1, n.input[1]], [s2], name=fresh('where')))
+                    az.i = 0
+                    n.input[1] = s2
+                    stats['reshape_allowzero'] += 1
+        out.append(n)
+    del g.node[:]
+    g.node.extend(out)
+    # initializers no node reads any more (the 1-D operands replaced)
+    read = {x for n in g.node for x in n.input} | {o.name for o in g.output}
+    keep = [i for i in g.initializer if i.name in read]
+    if len(keep) != len(g.initializer):
+        del g.initializer[:]
+        g.initializer.extend(keep)
+    return stats
+
+
+def portable_file(src, dst):
+    """`portable` on an exported file (written atomically; metadata `portable` 1) -> the rewrites."""
+    import onnx
+    model = onnx.load(src)
+    stats = portable(model)
+    for e in model.metadata_props:
+        if e.key == 'portable':
+            break
+    else:
+        e = model.metadata_props.add()
+        e.key = 'portable'
+    e.value = '1'
+    onnx.checker.check_model(model)
+    tmp = f'{dst}.{os.getpid()}.tmp'
+    onnx.save_model(model, tmp, save_as_external_data=False)
+    os.replace(tmp, dst)
+    return stats
+
+
+def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=True):
     """Export `net` (a TokenNet, GridNet or Net, as loaded: `net.load` / `load_checkpoint`) to the ONNX
     file `path` (zero-onnx/1; one file, no external data; written atomically) -> its metadata. `packing`:
     a token network's ('mask', 'compact', 'host'; module docstring), ignored for the others. `extra`:
-    more metadata (the checkpoint's id and sha256: `export_checkpoint`)."""
+    more metadata (the checkpoint's id and sha256: `export_checkpoint`). `make_portable`: `portable`'s
+    rewrites (metadata `portable` 1), which change no answer and let the GPU providers run the graph."""
     import onnx
     net = copy.deepcopy(net).float().cpu().eval()
     for p in net.parameters():
@@ -385,6 +494,9 @@ def export(net, path, packing='packed', extra=None, opset=OPSET):
     model = prog.model_proto
     meta = metadata(net, packing, extra)
     meta['opset'] = str(opset)
+    if make_portable:
+        portable(model)
+        meta['portable'] = '1'
     del model.metadata_props[:]
     for k, v in meta.items():
         e = model.metadata_props.add()
@@ -546,13 +658,19 @@ def main(argv=None):
                     help='recorded driver batches (tools/onnx_record.py or a worker\'s --record-batches) the rows come from')
     ap.add_argument('--reference-out', default=None, help='where (default: reference.npz next to OUT)')
     ap.add_argument('--threads', type=int, default=4, help='onnxruntime threads of the reference check')
+    ap.add_argument('--no-portable', action='store_true', help="skip portable()'s rewrites (they change no answer)")
+    ap.add_argument('--rewrite', action='store_true',
+                    help="CHECKPOINT is an exported .onnx: write it to OUT with portable()'s rewrites (no torch)")
     a = ap.parse_args(argv)
+    if a.rewrite:
+        print(json.dumps({'out': a.out, 'rewrites': portable_file(a.checkpoint, a.out)}))
+        return 0
     if a.reference and not a.reference_batches:
         ap.error('--reference needs --reference-batches')
     m, info = load_checkpoint(a.checkpoint, a.game, a.allow_mismatch)
     if a.id:
         info['checkpoint'] = a.id
-    meta = export(m, a.out, a.packing, info)
+    meta = export(m, a.out, a.packing, info, make_portable=not a.no_portable)
     res = {'out': a.out, 'bytes': os.path.getsize(a.out), **meta}
     ok = True
     if a.reference:

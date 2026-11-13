@@ -133,6 +133,11 @@ fn max_abs(a: &[f32], b: &[f32]) -> f64 {
     })
 }
 
+/// The largest |got - want| per item (priors, value, margin, aux; inf when not finite or a size differs).
+pub fn compare(got: &Answer, want: &Answer) -> [f64; 4] {
+    [max_abs(&got.priors, &want.priors), max_abs(&got.value, &want.value), max_abs(&got.margin, &want.margin), max_abs(&got.aux, &want.aux)]
+}
+
 /// Answer the reference set with `ev` (batch by batch, as the driver's batches are answered) and compare.
 pub fn run(ev: &mut dyn Evaluator, r: &Reference) -> Result<SelfTest, String> {
     let mut got = Answer::default();
@@ -143,7 +148,7 @@ pub fn run(ev: &mut dyn Evaluator, r: &Reference) -> Result<SelfTest, String> {
         got.margin.extend(a.margin);
         got.aux.extend(a.aux);
     }
-    let items = [max_abs(&got.priors, &r.want.priors), max_abs(&got.value, &r.want.value), max_abs(&got.margin, &r.want.margin), max_abs(&got.aux, &r.want.aux)];
+    let items = compare(&got, &r.want);
     let m = items.iter().cloned().fold(0.0f64, f64::max);
     Ok(SelfTest { max_abs: m, items, rows: r.rows, ok: m <= TOL })
 }
