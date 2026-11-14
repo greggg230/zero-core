@@ -29,7 +29,7 @@ auxiliary answer = `aux[belief rows]` - `NetEvaluator.evaluate`'s answer.
 
 The model's metadata (`metadata`): zero_onnx=1, protocol, game, arch, features, actions, seats,
 aux_layout (JSON [[name, width, loss], ...]), aux_width, packing, checkpoint, checkpoint_sha256,
-opset, exporter, torch.
+opset, unique_scatters, exporter, torch.
 
 zero-onnx/2 (docs/az.md 46; `ZeroOnnx2`, `onnx_version`): a token network with tail segments, pointer overrides or
 gates - MTG Zero's layout v7 - takes zero-onnx/1's inputs plus the driver's options and variable-length rows
@@ -46,6 +46,13 @@ same graph as before.
 Every exported graph is written without the exporter's per-node annotations (`strip_annotations`: stack traces with
 the exporting checkout's file paths and line numbers, doc strings): the same checkpoint exports to the same bytes from
 any checkout, and no graph carries a local path.
+
+Every graph a GPU provider runs as the CPU does (docs/az.md 41.2; metadata `unique_scatters` 1 - every packing but
+'compact' and 'host', whose policy scatter is `TokenNet._trunk`'s): every scatter writes unique indices into data with
+a place for each (`_csr_rows`' spare places for the row ends; the policy's last writer of each action made explicit,
+`_scatter_last`; a refused pointer override to a spare place of its own), no integer leaves int32 (`check_int32` on
+every export, zero-onnx/1 too), opset 17 (`opset17`: DirectML runs ScatterElements up to version 16). The CPU's answers
+are the earlier graph's, bit for bit; `scatter_writes` checks a graph's scatters on real inputs.
 
 How a token network (`net.TokenNet`) packs its objects inside the graph (`packing`):
 
@@ -84,9 +91,9 @@ graph against it through onnxruntime first (`check_reference`), so a checkpoint 
 never published.
 
 Exporter: torch 2.x's dynamo-based `torch.onnx.export(..., dynamo=True)` (needs `onnx` and
-`onnxscript`), opset 18 (LayerNormalization, exact GELU through Erf, the attention decomposed into
-MatMul / Softmax with the boolean mask). Only this module and `zero.onnx_parity` import onnx /
-onnxruntime; nothing on a run's path does.
+`onnxscript`) at opset 18, rewritten to opset 17 (`opset17`; LayerNormalization, exact GELU through Erf, the attention
+decomposed into MatMul / Softmax with the boolean mask, the policy's per-row sort a TopK). Only this module and
+`zero.onnx_parity` import onnx / onnxruntime; nothing on a run's path does.
 """
 import copy
 import hashlib
@@ -102,7 +109,9 @@ from .net import GridNet, Net, TokenNet, _read, aux_answer, varlen_features
 from .protocol import MAX_SEATS
 
 PROTOCOL = 'zero-onnx/1'
-OPSET = 18
+OPSET = 17
+# what torch's dynamo exporter writes (`opset17` rewrites it to OPSET)
+EXPORTER_OPSET = 18
 INPUTS = ('x_ptr', 'x_idx', 'x_val', 'n_players', 'belief')
 HOST_INPUTS = ('tok_full', 'tok_n')
 OUTPUTS = ('policy', 'value', 'margin', 'aux')
@@ -117,25 +126,81 @@ OUTPUTS2 = OUTPUTS + ('refused',)
 PACKINGS = ('mask', 'compact', 'packed', 'host')
 
 
+def _csr_rows(off, n):
+    """Each of the `n` elements' row of a CSR over rows (`off` [B+1]), with no data-dependent shape, no scatter with a
+    reduction (TensorRT's ONNX parser refuses one and with it the whole graph; DirectML runs none) and every scatter
+    writing unique indices into data with a place for each (docs/az.md 41.2: a GPU provider refuses more indices than
+    places and leaves the winner of a duplicate undefined). In the merged sequence of the n elements and the B row ends,
+    row b's end sits at off[b+1] + b (distinct even for empty rows): a scatter of ones there and a running sum count the
+    ends up to each merged position; an element at merged position j is element j - count[j], its row count[j] - a
+    scatter of the rows to the elements' places [0, n) and the ends' to their own spare places n + (their index), then
+    the first n read by a Gather (not a Slice: DirectML's graph fusion fails on Scatter -> Slice -> Mul). Integers below
+    n + B: the same rows as the earlier one-spare-slot scatter and the scatter-add before it (docs/az.md 41.1)."""
+    B = off.shape[0] - 1
+    dev = off.device
+    ends = off[1:] + torch.arange(B, dtype=torch.int64, device=dev)
+    marks = torch.zeros(n + B, dtype=torch.int64, device=dev).scatter(0, ends, torch.ones_like(ends))
+    count = marks.cumsum(0)
+    slot = torch.where(marks > 0, count + (n - 1), torch.arange(n + B, dtype=torch.int64, device=dev) - count)
+    rows = torch.zeros(n + B, dtype=torch.int64, device=dev).scatter(0, slot, count)
+    return rows.index_select(0, torch.arange(n, dtype=torch.int64, device=dev))
+
+
 def densify(x_ptr, x_idx, x_val, features):
     """Sparse rows (CSR: `x_ptr` [B+1], `x_idx` [nnz], `x_val` [nnz]) -> f32 [B, features], with no
-    data-dependent shape and no scatter with a reduction (TensorRT's ONNX parser refuses one and with it the
-    whole graph; DirectML runs none): each non-zero's row is the number of row ends before it. In the merged
-    sequence of the nnz non-zeros and the B row ends, row b's end sits at x_ptr[b + 1] + b (distinct even
-    for empty rows): a scatter of ones there and a running sum count the ends up to each merged position; a
-    non-zero at merged position j is non-zero j - count[j], its row count[j] (a scatter to unique slots, the
-    ends' writes to one spare slot). Then one scatter of the values (protocol.densify). Integers throughout:
-    the same rows as the earlier scatter-add (zero-farm PROTOCOL.md 8; docs/az.md 41.1)."""
+    data-dependent shape and no scatter with a reduction: each non-zero's row from `_csr_rows` (a scatter of ones at
+    the row ends, a running sum, a scatter to unique places), then one scatter of the values (protocol.densify; unique
+    indices: a row's feature indexes ascend). Integers throughout: the same rows as the earlier scatter-add (zero-farm
+    PROTOCOL.md 8; docs/az.md 41.1, 41.2)."""
     B = x_ptr.shape[0] - 1
-    nnz = x_idx.shape[0]
-    dev = x_ptr.device
-    ends = x_ptr[1:] + torch.arange(B, dtype=torch.int64, device=dev)
-    marks = torch.zeros(nnz + B, dtype=torch.int64, device=dev).scatter(0, ends, torch.ones_like(ends))
-    count = marks.cumsum(0)
-    slot = torch.where(marks > 0, torch.full_like(count, nnz), torch.arange(nnz + B, dtype=torch.int64, device=dev) - count)
-    rows = torch.zeros(nnz + 1, dtype=torch.int64, device=dev).scatter(0, slot, count)[:nnz]
+    rows = _csr_rows(x_ptr, x_idx.shape[0])
     flat = rows * features + x_idx.long()
     return torch.zeros(B * features, dtype=torch.float32, device=x_val.device).scatter(0, flat, x_val).view(B, features)
+
+
+def _scatter_last(base, idx, val):
+    """base [B, S].scatter(1, idx [B, L], val [B, L]) as the CPU computes it when a row's indices repeat - the last write
+    of a row (the highest position) wins, as in torch's CPU scatter and ONNX Runtime's sequential CPU kernel - with every
+    write to its own place (docs/az.md 41.2): a GPU provider writes in parallel, so ONNX leaves the winner of a duplicate
+    undefined. The writes of each row sorted by (index, position) (TopK on index L + position: unique keys, so no tie
+    to break; no integer division); the last of each index's run writes its place, every other write its own spare
+    place S + its sorted position past the row's end; the first S places read back by a Gather. Every integer below
+    S L + L (`L` static: the caller checks it against int32). The same answer as the plain scatter, bit for bit."""
+    B, S = base.shape
+    L = idx.shape[1]
+    dev = idx.device
+    pos = torch.arange(L, dtype=torch.int64, device=dev)
+    p = torch.sort(idx * L + pos[None, :], dim=1).indices
+    g = idx.gather(1, p)
+    nxt = g.index_select(1, torch.clamp(pos + 1, max=L - 1))          # (the next write of the sorted row)
+    last = (g != nxt) | (pos == L - 1)[None, :]
+    tgt = torch.where(last, g, (S + pos)[None, :])
+    out = torch.cat([base, base.new_zeros(B, L)], 1).scatter(1, tgt, val.gather(1, p))
+    return out.index_select(1, torch.arange(S, dtype=torch.int64, device=dev))
+
+
+def _policy_full(gen, acts, lg, flat, cpos, n_tok):
+    """The static scatter of a packed token list's pointer logits into the policy, per row (`_scatter_last`): gen [B, A1]
+    (the generic logits, the dummy column last), acts / lg [N, K] each packed head token's actions (the dummy column
+    `A1 - 1` for none) and logits, flat [B n_tok] the full token axis's presence, cpos [B n_tok] a present position's
+    packed index. Each row's writes laid out on its full token axis ([B, n_tok K]: absent slots write the dummy column) -
+    a row's packed tokens are in layout order, so a write's place on the axis orders the row's writes as the packed
+    list's flat scatter did: the same last writer of every action, bit for bit."""
+    B, A1 = gen.shape
+    N, K = acts.shape
+    fidx = torch.where(flat, cpos, N)
+    a = torch.cat([acts, acts.new_full((1, K), A1 - 1)]).index_select(0, fidx).view(B, n_tok * K)
+    v = torch.cat([lg, lg.new_zeros(1, K)]).index_select(0, fidx).view(B, n_tok * K)
+    return _scatter_last(gen, a, v)
+
+
+def _check_policy_keys(net):
+    """`_scatter_last`'s integers below 2^31 (DirectML computes int64 in 32 bits; docs/az.md 46.7, 41.2): the policy's
+    sort keys reach (actions + 1) n_tok K."""
+    K = int(net.tok_cols.shape[1])
+    if (int(net.actions) + 2) * int(net.n_tok) * K > INT32_MAX:
+        raise ValueError(f'zero-onnx: {net.actions} actions x {net.n_tok} token positions x {K} pointer columns: the '
+                         f'policy scatter\'s keys pass int32 (docs/az.md 41.2)')
 
 
 def _identity(sl, idspec, vocab):
@@ -212,7 +277,7 @@ def _trunk_mask(net, h, keep, ids):
         acts = torch.where(net.tok_isid[None], ia[..., None], acts)
     acts = torch.where(keep[..., None] & (cols >= 0), acts, net.actions)
     lg = net.ptr(F.gelu(net.pk(h) + net.pq(z)[:, None])).gather(2, cols.clamp(min=0))
-    return z, pc.scatter(1, acts.flatten(1), lg.flatten(1))
+    return z, _scatter_last(pc, acts.flatten(1), lg.flatten(1))
 
 
 def _row_tokens(pres, n_tok):
@@ -233,8 +298,9 @@ def _trunk_packed(net, h, pres, ids):
     """`TokenNet._trunk` with the tokens packed (in-graph compaction without padding): the per-token layers
     (LayerNorms, the attention's projections, the MLPs, the pointer head) run on the batch's N present tokens
     [N, d] (row-major, each row's in layout order), only the attention and the pooling on the rows padded to
-    the longest (gathered in, gathered back). N >= 2 is assumed while tracing (MTG Zero's rows hold the global
-    and the context token: N >= 2 B); the graph keeps no such guard. -> (z [B, 2 d], logits [B, actions + 1])."""
+    the longest (gathered in, gathered back), the policy's scatter per row on the full token axis (`_policy_full`).
+    N >= 2 is assumed while tracing (MTG Zero's rows hold the global and the context token: N >= 2 B); the graph keeps
+    no such guard. -> (z [B, 2 d], logits [B, actions + 1])."""
     B, NT, D = h.shape
     flat = pres.reshape(-1)
     sel = torch.nonzero(flat).squeeze(1)                          # [N] the present tokens, row-major
@@ -277,9 +343,7 @@ def _trunk_packed(net, h, pres, ids):
         acts = torch.where(net.tok_isid.index_select(0, slot), ia[:, None], acts)
     acts = torch.where(cols >= 0, acts, net.actions)
     lg = net.ptr(F.gelu(net.pk(hp) + net.pq(z).index_select(0, row))).gather(1, cols.clamp(min=0))
-    A1 = net.actions + 1
-    pol = pc.reshape(-1).scatter(0, (row[:, None] * A1 + acts).reshape(-1), lg.reshape(-1)).view(B, A1)
-    return z, pol
+    return z, _policy_full(pc, acts, lg, flat, cpos, NT)
 
 
 class ZeroOnnx(nn.Module):
@@ -300,6 +364,8 @@ class ZeroOnnx(nn.Module):
         if self.tokens and packing not in PACKINGS:
             raise ValueError(f'zero-onnx: packing {packing!r} (one of {PACKINGS})')
         self.packing = packing if self.tokens else None
+        if self.packing in ('mask', 'packed'):
+            _check_policy_keys(net)
         self.layout = list(getattr(net, 'aux_layout', None) or [])
         self.W = sum(int(w) for _, w, _ in self.layout)
 
@@ -356,19 +422,6 @@ def onnx_version(net):
     return 2 if varlen_features(net) else 1
 
 
-def _csr_rows(off, n):
-    """Each of the `n` elements' row of a CSR over rows (`off` [B+1]), with no data-dependent shape and no scatter
-    with a reduction (`densify`'s way: in the merged sequence of the elements and the B row ends, row b's end at
-    off[b+1] + b; a scatter of ones there, a running sum, a scatter to unique slots)."""
-    B = off.shape[0] - 1
-    dev = off.device
-    ends = off[1:] + torch.arange(B, dtype=torch.int64, device=dev)
-    marks = torch.zeros(n + B, dtype=torch.int64, device=dev).scatter(0, ends, torch.ones_like(ends))
-    count = marks.cumsum(0)
-    slot = torch.where(marks > 0, torch.full_like(count, n), torch.arange(n + B, dtype=torch.int64, device=dev) - count)
-    return torch.zeros(n + 1, dtype=torch.int64, device=dev).scatter(0, slot, count)[:n]
-
-
 def _row_sum(flag, off):
     """Per row of a CSR (`off` [B+1]) the number of its elements with `flag` (exact integers: a running sum read at
     the offsets, no scatter)."""
@@ -400,11 +453,12 @@ def override_pieces(tok):
 def int32_bound(B, nnz, features, actions, tail_width, t_off, NT, L, K, NO):
     """An upper bound of every integer a zero-onnx/2 graph computes on a piece (docs/az.md 46.2; zero_worker's
     `int32_bound`): the densified rows' flat index B (F + 1), the packed token list's and the padded rows' indices
-    B (F + 1 + the most tail tokens of a row), the policy's B (A + 1), the tail floats' (NT + 1) Wt and L + 1, the
-    options' K + 1, the overrides' NO + 1, the merged CSR sequence's nnz + B. A feeder refuses a piece at 2^31 or more."""
+    B (F + 1 + the most tail tokens of a row), the policy's B (A + 1) and the overrides' NO + 1 after it (a refused
+    override's spare place, docs/az.md 46.8), the tail floats' (NT + 1) Wt and L + 1, the options' K + 1, the merged CSR
+    sequence's nnz + B. A feeder refuses a piece at 2^31 or more."""
     t_max = int(np.diff(np.asarray(t_off, np.int64)).max()) if len(t_off) > 1 else 0
-    return max(int(nnz) + B, B * (int(features) + 1 + t_max), B * (int(actions) + 1), (int(NT) + 1) * int(tail_width),
-               int(L) + 1, int(K) + 1, int(NO) + 1)
+    return max(int(nnz) + B, B * (int(features) + 1 + t_max), B * (int(actions) + 1) + int(NO) + 1,
+               (int(NT) + 1) * int(tail_width), int(L) + 1, int(K) + 1)
 
 
 def _iclamp(x, lo=None, hi=None):
@@ -691,7 +745,8 @@ class ZeroOnnx2(ZeroOnnx):
         P = _pointer2(net, F.gelu(net.pk(hp) + net.pq(z).index_select(0, rows)))
         C = P.shape[1]
         lg = P[:N].gather(1, _iclamp(cols, 0))
-        pol = gen.reshape(-1).scatter(0, (row_h[:, None] * A1 + acts).reshape(-1), lg.reshape(-1))
+        cposh = flat.long().cumsum(0) - 1                         # a present head position's packed index
+        pol = _policy_full(gen, acts, lg, flat, cposh, NTOK).reshape(-1)
         if net.option_pointers:
             # ---- the overrides (docs/az.md 43.7): each one's row, its option's action, its target token (a present
             # head slot or a tail token of its row) and column; checked as rows.resolve and TokenNet._ov_index check
@@ -722,7 +777,7 @@ class ZeroOnnx2(ZeroOnnx):
             pos = _iclamp(self.v_start.index_select(0, sc_) + l_, 0, NTOK - 1)
             fpos = orow * NTOK + pos
             hpres = flat.index_select(0, fpos)
-            hidx = (flat.long().cumsum(0) - 1).index_select(0, fpos)
+            hidx = cposh.index_select(0, fpos)
             # a tail target: the token of its row with that (segment, slot) - a match against every tail token (and
             # one that matches nothing, so an empty tail is no empty axis)
             tr_ = torch.cat([trow, one(-1)])
@@ -746,15 +801,18 @@ class ZeroOnnx2(ZeroOnnx):
                 bw = self.v_g.index_select(0, _iclamp(gi_, 0)).clamp(max=1.0)
                 v = torch.where(isg, _lerp(g0, v, bw), v)
             ovv = torch.where(isgen, g0, v)
-            # one override per (row, action): a second is refused (which of two would win is not defined), so every
-            # write below goes to its own place; a refused one writes the row's dummy column
+            # one override per (row, action): of two with the same place (a refused one's: its row's dummy column) all
+            # but the last are refused (which of two would win is not defined) - every later override compared with
+            # every earlier one (no scatter: the last writer of a duplicate is what a GPU leaves undefined, docs/az.md
+            # 46.8); then every write goes to its own place: an accepted one to its action, a refused one to its own
+            # spare place past the policy (B A1 + its index; `int32_bound`'s B (A + 1) + NO + 1), read off by a Gather
             ar_o = torch.arange(NO + 1, device=dev)
-            dummy = orow * A1 + net.actions
-            okey = torch.where(obad, dummy, orow * A1 + act)
-            mark = torch.full((B * A1,), -1, dtype=torch.long, device=dev).scatter(0, okey, ar_o)
-            obad = obad | (mark.index_select(0, okey) != ar_o)
-            okey = torch.where(obad, dummy, orow * A1 + act)
-            pol = pol.scatter(0, okey, ovv)
+            okey = torch.where(obad, orow * A1 + net.actions, orow * A1 + act)
+            later = (okey[None, :] == okey[:, None]) & (ar_o[None, :] > ar_o[:, None])
+            obad = obad | later.any(1)
+            okey = torch.where(obad, B * A1 + ar_o, orow * A1 + act)
+            pol = torch.cat([pol, pol.new_zeros(NO + 1)]).scatter(0, okey, ovv).index_select(
+                0, torch.arange(B * A1, dtype=torch.int64, device=dev))
             oref = _row_sum(obad[:NO], ov_off)
         else:
             oref = ov_off[1:] - ov_off[:-1]                       # (a network without pointers refuses every one)
@@ -868,6 +926,7 @@ def metadata(net, packing, extra=None):
             'aux_layout': json.dumps(layout), 'aux_width': str(sum(int(t[1]) for t in layout)),
             'inputs': json.dumps(list(INPUTS) + (list(HOST_INPUTS) if packing == 'host' else [])),
             'outputs': json.dumps(list(OUTPUTS)), 'packing': str(packing or 'none'), 'opset': str(OPSET),
+            'unique_scatters': '0' if packing in ('compact', 'host') else '1',
             'exporter': 'torch.onnx.export(dynamo=True)', 'torch': torch.__version__}
     if packing == 'host':
         meta['present_index'] = json.dumps(net.present_index())
@@ -988,7 +1047,9 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
     a token network with variable-length token sets (`onnx_version`; docs/az.md 46). `packing`: a token network's
     ('mask', 'compact', 'host'; module docstring; zero-onnx/2: 'packed' only), ignored for the others. `extra`:
     more metadata (the checkpoint's id and sha256: `export_checkpoint`). `make_portable`: `portable`'s
-    rewrites (metadata `portable` 1), which change no answer and let the GPU providers run the graph."""
+    rewrites (metadata `portable` 1), which change no answer and let the GPU providers run the graph. `opset`: 17 (the
+    default: the exporter's opset-18 graph rewritten by `opset17`, docs/az.md 41.2) or 18 (as the exporter writes it).
+    Every scatter of the mask and packed graphs writes unique indices (metadata `unique_scatters` 1; docs/az.md 41.2)."""
     net = copy.deepcopy(net).float().cpu().eval()
     for p in net.parameters():
         p.requires_grad_(False)
@@ -999,9 +1060,9 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
         mod = ZeroOnnx2(net, packing).eval()
         args, names, outs, dyn = example_inputs2(net), list(INPUTS2), list(OUTPUTS2), dynamic_shapes2()
         with torch.no_grad():
-            prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=opset, input_names=names,
+            prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=EXPORTER_OPSET, input_names=names,
                                      output_names=outs, dynamic_shapes=dyn, optimize=True, verbose=False)
-        return _save(prog.model_proto, metadata2(net, extra), path, opset, make_portable, int32=True)
+        return _save(prog.model_proto, metadata2(net, extra), path, opset, make_portable)
     mod = ZeroOnnx(net, packing).eval()
     packing = mod.packing
     args = example_inputs(net, packing)
@@ -1010,7 +1071,7 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
     if packing != 'host':
         dyn = {k: v for k, v in dyn.items() if k in names}
     with torch.no_grad():
-        prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=opset, input_names=names,
+        prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=EXPORTER_OPSET, input_names=names,
                                  output_names=list(OUTPUTS), dynamic_shapes=dyn, optimize=True, verbose=False)
     return _save(prog.model_proto, metadata(net, packing, extra), path, opset, make_portable)
 
@@ -1188,9 +1249,141 @@ def int64_max(model, feeds, threads=4):
             'top': top[:8]}
 
 
-def _save(model, meta, path, opset, make_portable, int32=False):
+def scatter_writes(model, feeds, threads=4):
+    """The runtime half of `unique_scatters` (docs/az.md 41.2): what every ScatterElements / ScatterND of a graph writes
+    on the given inputs - a copy of the model (`model`: a ModelProto, not changed, or a path) with each scatter's data
+    and indices also graph outputs, run by ONNX Runtime's CPU EP -> {'scatters': scatter nodes, 'runs': node runs read,
+    'writes': indices written, 'duplicates': writes to a place another write of the same run also writes (a GPU leaves
+    the winner undefined), 'over': runs with more indices along the axis than the data has places (DirectML refuses
+    them), 'nodes': {node: [writes, duplicates, over]}}. Both must be 0 for a graph a GPU provider runs as the CPU does."""
+    import onnx
+    import onnxruntime as ort
+    m = onnx.ModelProto()
+    m.CopyFrom(onnx.load(model) if isinstance(model, (str, os.PathLike)) else model)
+    have = {o.name for o in m.graph.output}
+    sc = []
+    for n in m.graph.node:
+        if n.op_type in ('ScatterElements', 'ScatterND'):
+            axis = next((a.i for a in n.attribute if a.name == 'axis'), 0)
+            sc.append((n.name or n.output[0], n.op_type, axis, n.input[0], n.input[1]))
+            for x in (n.input[0], n.input[1]):
+                if x not in have:
+                    m.graph.output.append(onnx.helper.make_empty_tensor_value_info(x))
+                    have.add(x)
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = int(threads)
+    so.inter_op_num_threads = 1
+    sess = ort.InferenceSession(m.SerializeToString(), so, providers=['CPUExecutionProvider'])
+    onames = [o.name for o in sess.get_outputs()]
+    out = {'scatters': len(sc), 'runs': 0, 'writes': 0, 'duplicates': 0, 'over': 0, 'nodes': {}}
+    for f in feeds:
+        got = dict(zip(onames, sess.run(None, f)))
+        for name, op, axis, d, i in sc:
+            data, idx = np.asarray(got[d]), np.asarray(got[i]).astype(np.int64)
+            if op == 'ScatterElements':
+                ax = axis % data.ndim
+                coords = list(np.indices(idx.shape, sparse=False))
+                coords[ax] = np.where(idx < 0, idx + data.shape[ax], idx)
+                tgt = np.ravel_multi_index([c.reshape(-1) for c in coords], data.shape) if idx.size else np.zeros(0, np.int64)
+                over = idx.shape[ax] > data.shape[ax]
+            else:
+                k = idx.shape[-1]
+                ix = idx.reshape(-1, k)
+                ix = np.where(ix < 0, ix + np.asarray(data.shape[:k]), ix)
+                tgt = np.ravel_multi_index(ix.T, data.shape[:k]) if ix.size else np.zeros(0, np.int64)
+                over = False
+            dup = int(tgt.size - np.unique(tgt).size)
+            rec = out['nodes'].setdefault(name, [0, 0, 0])
+            rec[0] += int(tgt.size)
+            rec[1] += dup
+            rec[2] += int(over)
+            out['runs'] += 1
+            out['writes'] += int(tgt.size)
+            out['duplicates'] += dup
+            out['over'] += int(over)
+    return out
+
+
+# the operators of opset 18 whose axes moved from an attribute to an input (opset 13's form below 18)
+_REDUCE_AXES18 = ('ReduceL1', 'ReduceL2', 'ReduceLogSum', 'ReduceLogSumExp', 'ReduceMax', 'ReduceMean', 'ReduceMin',
+                  'ReduceProd', 'ReduceSumSquare')
+
+
+def opset17(model):
+    """An exported opset-18 graph as opset 17, in place (docs/az.md 41.2: DirectML registers ScatterElements up to version
+    16, so under opset 18 it leaves every scatter to the CPU; torch 2.11's exporter writes opset 18 whatever it is asked
+    and onnx's version converter has no Pad 18 -> 17 adapter) -> {operator: nodes rewritten}. Every node whose operator
+    has another version under opset 17 than under 18 (`onnx.defs`) is rewritten to its opset-17 form or refused:
+    ReduceMax / Mean / Min / ... -18's constant `axes` input -> the `axes` attribute (`noop_with_empty_axes` dropped, a
+    1 refused), ScatterElements / ScatterND -18 with reduction none / add / mul as they are (version 16), Pad -18 without
+    its `axes` input as it is (version 13); anything else (Split's num_outputs, Resize-18, ...) raises. The same
+    computation: each rewritten node computes what it did. Checked by onnx.checker's full check (strict shape
+    inference) under opset 17."""
+    import onnx
+    from onnx import defs, helper, numpy_helper
+    g = model.graph
+    ver = {o.domain or 'ai.onnx': o.version for o in model.opset_import}
+    if ver.get('ai.onnx') == 17:
+        return {}
+    if ver.get('ai.onnx') != 18:
+        raise ValueError(f'opset17: an opset-{ver.get("ai.onnx")} graph (the exporter writes 18)')
+    consts = {i.name: numpy_helper.to_array(i) for i in g.initializer}
+    for n in g.node:
+        if n.op_type == 'Constant' and n.attribute and n.attribute[0].name == 'value':
+            consts[n.output[0]] = numpy_helper.to_array(n.attribute[0].t)
+    stats = {}
+
+    def nodes(ns, where):
+        for n in ns:
+            for a in n.attribute:
+                if a.HasField('g') or len(a.graphs):
+                    raise ValueError(f'opset17: {where}{n.name} ({n.op_type}) has a subgraph')
+            if n.domain not in ('', 'ai.onnx'):
+                continue
+            if defs.get_schema(n.op_type, 18, '').since_version == defs.get_schema(n.op_type, 17, '').since_version:
+                continue
+            if n.op_type in _REDUCE_AXES18:
+                noop = next((a.i for a in n.attribute if a.name == 'noop_with_empty_axes'), 0)
+                axes = None
+                if len(n.input) > 1 and n.input[1]:
+                    if n.input[1] not in consts:
+                        raise ValueError(f'opset17: {where}{n.name} ({n.op_type}): axes not a constant')
+                    axes = [int(x) for x in np.atleast_1d(consts[n.input[1]])]
+                    del n.input[1:]
+                if noop and not axes:
+                    raise ValueError(f'opset17: {where}{n.name} ({n.op_type}): noop_with_empty_axes=1 without axes')
+                keep = [a for a in n.attribute if a.name != 'noop_with_empty_axes']
+                del n.attribute[:]
+                n.attribute.extend(keep)
+                if axes:
+                    n.attribute.append(helper.make_attribute('axes', axes))
+            elif n.op_type in ('ScatterElements', 'ScatterND'):
+                red = next((a.s.decode() for a in n.attribute if a.name == 'reduction'), 'none')
+                if red not in ('none', 'add', 'mul'):
+                    raise ValueError(f'opset17: {where}{n.name} ({n.op_type}): reduction {red!r} (opset 18 only)')
+            elif n.op_type == 'Pad':
+                if len(n.input) > 3 and n.input[3]:
+                    raise ValueError(f'opset17: {where}{n.name} (Pad): an axes input (opset 18 only)')
+            else:
+                raise ValueError(f'opset17: {where}{n.name} ({n.op_type}): changed in opset 18, no opset-17 form here')
+            stats[n.op_type] = stats.get(n.op_type, 0) + 1
+
+    nodes(g.node, '')
+    for f in model.functions:
+        nodes(f.node, f'{f.name}/')
+        for o in f.opset_import:
+            if o.domain in ('', 'ai.onnx'):
+                o.version = 17
+    for o in model.opset_import:
+        if o.domain in ('', 'ai.onnx'):
+            o.version = 17
+    onnx.checker.check_model(model, full_check=True)
+    return stats
+
+
+def _save(model, meta, path, opset, make_portable, int32=True):
     """The exported model with its metadata (`portable`'s rewrites first; the exporter's annotations stripped;
-    zero-onnx/2: `int32_slices` then `check_int32`), checked, written atomically -> the metadata."""
+    `int32_slices` then `check_int32`; `opset17` for opset 17), checked, written atomically -> the metadata."""
     import onnx
     meta['opset'] = str(opset)
     if make_portable:
@@ -1200,6 +1393,10 @@ def _save(model, meta, path, opset, make_portable, int32=False):
     if int32:
         int32_slices(model)
         check_int32(model)
+    if opset == 17:
+        opset17(model)
+    elif opset != 18:
+        raise ValueError(f'zero-onnx: opset {opset} (17, the default, or 18)')
     del model.metadata_props[:]
     for k, v in meta.items():
         e = model.metadata_props.add()

@@ -1,7 +1,8 @@
 """zero-farm's provider probe graph (zero-farm PROTOCOL.md 8: `probe-providers` runs "a small built-in graph and
 self-test per candidate provider and adapter"): a small token network built as `zero.onnx_export` exports any run's
-TokenNet - the `packed` packing (NonZero / TopK compaction, GatherElements / ScatterElements, CumSum, identity
-digits decoded by Round / Cast, boolean-mask attention, exact GELU, LayerNorm), a reader and an auxiliary head
+TokenNet - the `packed` packing (NonZero / TopK compaction, GatherElements / ScatterElements writing unique indices,
+the policy's per-row sort by TopK, CumSum, identity digits decoded by Round / Cast, boolean-mask attention, exact GELU,
+LayerNorm; opset 17, docs/az.md 41.2), a reader and an auxiliary head
 (softmax and exp targets) - so a provider that runs it runs every operator a real network's graph uses; plus its
 reference set (`write_reference`: torch's eager answers on the CPU). The worker embeds both files
 (`crates/worker/probe/`); `--check GRAPH` lists the operators of a real graph the probe graph lacks.

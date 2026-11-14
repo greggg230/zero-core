@@ -1320,12 +1320,12 @@ pub fn override_pieces(tok: i64) -> [i32; 4] {
 /// An upper bound of every integer a zero-onnx/2 graph computes on a piece of `n` rows (`nnz` non-zeros of `features`
 /// per row, `actions`, tail width `tail_width`; zero-core docs/az.md 46.2): the densified rows' flat index n (F + 1),
 /// the packed token list's and the padded rows' indices n (F + 1 + the most tail tokens of a row), the policy's
-/// n (A + 1), the tail floats' (NT + 1) Wt and L + 1, the options' K + 1, the overrides' NO + 1, the merged CSR
-/// sequence's nnz + n.
+/// n (A + 1) and the overrides' NO + 1 after it (a refused override's spare place, docs/az.md 46.8), the tail floats'
+/// (NT + 1) Wt and L + 1, the options' K + 1, the merged CSR sequence's nnz + n.
 pub fn int32_bound(n: usize, nnz: usize, features: usize, actions: usize, tail_width: usize, v: &VarlenPiece) -> u64 {
     let t_max = v.t_off.windows(2).map(|w| (w[1] - w[0]) as u64).max().unwrap_or(0);
     let (n, f) = (n as u64, features as u64);
-    [nnz as u64 + n, n * (f + 1 + t_max), n * (actions as u64 + 1), (v.t_seg.len() as u64 + 1) * tail_width as u64, v.t_val.len() as u64 + 1, v.opt_action.len() as u64 + 1, v.ov_opt.len() as u64 + 1]
+    [nnz as u64 + n, n * (f + 1 + t_max), n * (actions as u64 + 1) + v.ov_opt.len() as u64 + 1, (v.t_seg.len() as u64 + 1) * tail_width as u64, v.t_val.len() as u64 + 1, v.opt_action.len() as u64 + 1]
         .into_iter()
         .max()
         .unwrap_or(0)
@@ -1563,10 +1563,11 @@ mod tests {
         assert_eq!(v.t_val, vec![5.0, 6.0, 7.0, 1.0, 2.0, 3.0, 4.0]);
         assert_eq!((v.ov_off.clone(), v.ov_opt.clone()), (vec![0, 2, 3], vec![0, 2, 1]));
         assert_eq!((v.ov_seg.clone(), v.ov_col.clone(), v.ov_slot_hi.clone(), v.ov_slot_lo.clone()), (vec![2, -1, -1], vec![0, 0, 0], vec![0, 0, 0], vec![7, 0, 0]));
-        // the bound: 2 rows, 9 non-zeros of 100 features, 4 actions, tail width 3, at most 2 tail tokens a row
+        // the bound: 2 rows, 9 non-zeros of 100 features, 4 actions, tail width 3, at most 2 tail tokens a row, 3
+        // overrides (their spare places after the policy's)
         assert_eq!(int32_bound(2, 9, 100, 4, 3, &v), 2 * (100 + 1 + 2));
-        assert_eq!(int32_bound(2, 9, 1, 4, 3, &v), (3 + 1) * 3);
-        assert_eq!(int32_bound(2, 9, 1, 100, 3, &v), 2 * (100 + 1));
+        assert_eq!(int32_bound(2, 9, 1, 1, 3, &v), (3 + 1) * 3);
+        assert_eq!(int32_bound(2, 9, 1, 100, 3, &v), 2 * (100 + 1) + 3 + 1);
         // the packed token's pieces, back to the token exactly; seg whole (bits past 16 kept for the graph to refuse)
         for (s, c, l) in [(0u64, 0u64, 0u64), (2, 7, 4_294_967_295), (65535, 255, 65536), (17, 3, 123_456_789)] {
             let tok = ((s << 40) | (c << 32) | l) as i64;

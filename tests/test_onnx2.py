@@ -5,7 +5,8 @@ overrides (`zero.onnx_export.ZeroOnnx2`), run by ONNX Runtime's CPU execution pr
 identities, a gated tail-only segment at g = 0 and opened, an overridden gated segment's blend, slots near 2^32),
 batches without any tail token or override, one row; what the network refuses is refused row by row (`refused`);
 real toy_tail driver batches through `OnnxEvaluator`; the reference set with tails and overrides; a network without
-them still zero-onnx/1. Skipped without onnx / onnxscript / onnxruntime."""
+them still zero-onnx/1; every scatter writing unique indices, opset 17 (docs/az.md 46.8). Skipped without onnx /
+onnxscript / onnxruntime."""
 import json
 
 import numpy as np
@@ -176,6 +177,11 @@ def test_the_graph_refuses_what_the_network_refuses(tmp_path):
     r0 = next(b for b in range(12) if o.counts()[b] > 0)
     out, ref = run(with_ov(r0, int(o.opt[o.off[r0]]), int(o.tok[o.off[r0]])))
     assert ref[r0] == 1 and ref.sum() == 1, ref
+    # (refused overrides - the sentinel, the repeated action, the bad ones above - each write a place of their own:
+    # every scatter of the graph unique, docs/az.md 46.8)
+    sw = OX.scatter_writes(path, [OP.feeds(r, v2=True) for r in bad + [with_ov(r0, int(o.opt[o.off[r0]]),
+                                                                              int(o.tok[o.off[r0]]))]], threads=1)
+    assert sw['scatters'] == 9 and sw['duplicates'] == 0 and sw['over'] == 0, sw
     # tail tokens: of a segment without a tail (none here: segment 3 does not exist), at a head slot, out of order
     t = base.tail
     rt = next(b for b in range(12) if t.counts()[b] >= 2)
@@ -223,8 +229,8 @@ def test_int32_pieces_and_the_piece_bound():
     assert h.tolist() == [0, 0, 1, 65535, -1, -1] and l_[:4].tolist() == [0, 5, 0, 65535]
     t_off = np.array([0, 1, 3])
     assert OX.int32_bound(2, 9, 100, 4, 3, t_off, 3, 7, 5, 3) == 2 * (100 + 1 + 2)
-    assert OX.int32_bound(2, 9, 1, 4, 3, t_off, 3, 7, 5, 3) == (3 + 1) * 3
-    assert OX.int32_bound(2, 9, 1, 100, 3, t_off, 3, 7, 5, 3) == 2 * (100 + 1)
+    assert OX.int32_bound(2, 9, 1, 1, 3, t_off, 3, 7, 5, 3) == (3 + 1) * 3
+    assert OX.int32_bound(2, 9, 1, 100, 3, t_off, 3, 7, 5, 3) == 2 * (100 + 1) + 3 + 1   # (+ the overrides' spares)
     net = rand_net(OFFERS, seed=7)
     rows = gate_rows(net, toy_batch(12, seed=9), np.full(12, ROW_LEAF, np.uint8))
     assert set(OP.varlen_feeds(rows, {'actions': A, 'tail_width': 16})) == set(OX.VARLEN_INPUTS)
@@ -264,7 +270,12 @@ def test_interface_metadata_and_v1_unchanged(tmp_path):
     r = OX.int64_max(m, [OP.feeds(rows, v2=True), OP.feeds(rows.take(np.arange(7)), v2=True)], threads=1)
     assert r['tensors'] > 50 and r['untyped'] == 0 and 0 < r['max_abs'] < 1 << 31, r
     assert len(m.graph.output) == len(OX.OUTPUTS2)                           # (the model given is not changed)
+    # every scatter writes unique indices with a place for each (docs/az.md 46.8); opset 17
+    sw = OX.scatter_writes(m, [OP.feeds(rows, v2=True), OP.feeds(rows.take(np.arange(7)), v2=True)], threads=1)
+    assert sw['scatters'] == 9 and sw['writes'] > 0 and sw['duplicates'] == 0 and sw['over'] == 0, sw
+    assert [(o.domain, o.version) for o in m.opset_import if o.domain in ('', 'ai.onnx')] == [('', 17)]
     md = {p.key: p.value for p in m.metadata_props}
+    assert md['opset'] == '17' and md['unique_scatters'] == '1' and meta['opset'] == '17'
     assert md['zero_onnx'] == '2' and json.loads(md['tails']) == [[0, 'items', 16, 4], [1, 'marks', 4, 0], [2, 'offers', 4, 0]]
     assert md['option_pointers'] == 'true' and md['max_row_tokens'] == '64' and md['tail_width'] == '16'
     assert json.loads(md['gates']) == {'marks': 1.0, 'offers': 1.0}

@@ -3,7 +3,8 @@ batch (`zero.onnx_export`), run by ONNX Runtime's CPU execution provider, answer
 (`zero.onnx_parity`): token networks in each packing (plain and id_actions layouts, NaN in absent slots,
 junk in the host's padding, batches of 1 row), readers and a widened auxiliary head, MLP and conv
 networks, a network without the head; real toy games through the graph; the in-graph densify; the
-metadata. Skipped without onnx / onnxscript / onnxruntime (they are not run dependencies)."""
+metadata; every scatter writing unique indices (the policy's last writer explicit), opset 17 (docs/az.md 41.2). Skipped
+without onnx / onnxscript / onnxruntime (they are not run dependencies)."""
 import json
 
 import numpy as np
@@ -89,17 +90,102 @@ def test_densify_in_onnx_runtime(tmp_path):
             assert np.array_equal(sess.run(None, {'x_ptr': off, 'x_idx': idx, 'x_val': val})[0], densify(off, idx, val, 50))
 
 
+def test_scatter_last_is_the_cpu_scatter(tmp_path):
+    """`_scatter_last` (docs/az.md 41.2): a row's repeated indices resolved as the CPU's sequential scatter resolves them
+    (the last write of the row wins) - in torch and through ONNX Runtime at opset 17 (`opset17`), bit for bit - with
+    every write to its own place (`scatter_writes`: no duplicate, never more indices than places), where the plain
+    scatter's writes collide and outnumber the places."""
+    import onnx
+    import onnxruntime as ort
+
+    class M(torch.nn.Module):
+        def __init__(self, unique):
+            super().__init__()
+            self.unique = unique
+
+        def forward(self, base, idx, val):
+            return OX._scatter_last(base, idx, val) if self.unique else base.scatter(1, idx, val)
+    B = torch.export.Dim('B', min=1)
+    ex = (torch.zeros(3, 9), torch.zeros(3, 12, dtype=torch.int64), torch.zeros(3, 12))
+    paths = {}
+    for unique in (True, False):
+        prog = torch.onnx.export(M(unique), ex, None, dynamo=True, opset_version=OX.EXPORTER_OPSET,
+                                 input_names=['base', 'idx', 'val'],
+                                 dynamic_shapes={'base': {0: B}, 'idx': {0: B}, 'val': {0: B}}, verbose=False)
+        m = prog.model_proto
+        assert OX.opset17(m).get('ScatterElements') == 1 and m.opset_import[0].version == 17
+        paths[unique] = str(tmp_path / f'{unique}.onnx')
+        onnx.save(m, paths[unique])
+    sess = ort.InferenceSession(paths[True], providers=['CPUExecutionProvider'])
+    rng = np.random.default_rng(3)
+    for B_ in (1, 5, 64):
+        base = rng.normal(size=(B_, 9)).astype(np.float32)
+        idx = rng.integers(0, 9, (B_, 12))                       # 12 writes a row into 9 places: repeats in every row
+        val = rng.normal(size=(B_, 12)).astype(np.float32)
+        want = base.copy()
+        for b in range(B_):
+            for j in range(12):
+                want[b, idx[b, j]] = val[b, j]                    # (the sequential scatter: the last write wins)
+        got = OX._scatter_last(torch.from_numpy(base), torch.from_numpy(idx), torch.from_numpy(val)).numpy()
+        f = {'base': base, 'idx': idx, 'val': val}
+        assert np.array_equal(got, want) and np.array_equal(sess.run(None, f)[0], want)
+        u, p = OX.scatter_writes(paths[True], [f], threads=1), OX.scatter_writes(paths[False], [f], threads=1)
+        assert u['scatters'] == 1 and u['writes'] == 12 * B_ and u['duplicates'] == 0 and u['over'] == 0, u
+        assert p['duplicates'] > 0 and p['over'] == 1, p
+
+
+def test_opset17():
+    """`opset17` (docs/az.md 41.2): an opset-18 graph's ReduceMax with its axes as an input becomes opset 13's form (the
+    axes an attribute) and computes the same; an operator opset 18 changed that has no opset-17 form here (Split with
+    num_outputs) is refused, as is a ScatterElements reduction opset 18 added."""
+    import onnxruntime as ort
+    from onnx import TensorProto as T, helper as H, numpy_helper as NH
+
+    def model(nodes, inits=()):
+        g = H.make_graph(nodes, 'g', [H.make_tensor_value_info('x', T.FLOAT, [2, 3])],
+                         [H.make_tensor_value_info('y', T.FLOAT, [2])], list(inits))
+        return H.make_model(g, opset_imports=[H.make_opsetid('', 18)], ir_version=10)
+    m = model([H.make_node('ReduceMax', ['x', 'ax'], ['y'], keepdims=0)], [NH.from_array(np.array([1], np.int64), 'ax')])
+    x = np.arange(6, dtype=np.float32).reshape(2, 3)
+    want = ort.InferenceSession(m.SerializeToString(), providers=['CPUExecutionProvider']).run(None, {'x': x})[0]
+    assert OX.opset17(m) == {'ReduceMax': 1}
+    assert m.opset_import[0].version == 17 and list(m.graph.node[0].input) == ['x']
+    got = ort.InferenceSession(m.SerializeToString(), providers=['CPUExecutionProvider']).run(None, {'x': x})[0]
+    assert np.array_equal(got, want)
+    split = model([H.make_node('Split', ['x'], ['y', 'z'], axis=1, num_outputs=2)])
+    with pytest.raises(ValueError, match='Split'):
+        OX.opset17(split)
+    sc = model([H.make_node('ScatterElements', ['x', 'i', 'x'], ['y'], axis=1, reduction='max')],
+               [NH.from_array(np.zeros((2, 3), np.int64), 'i')])
+    with pytest.raises(ValueError, match='reduction'):
+        OX.opset17(sc)
+
+
 @pytest.mark.parametrize('layout', ['plain', 'id_actions'])
 @pytest.mark.parametrize('packing', OX.PACKINGS)
 def test_token_network_parity(tmp_path, layout, packing):
     """A token network (auxiliary head, random output layers) in each packing: ORT's answers are forward_static's
     and eager's within 2e-5 on batches of 1, 7, 64 and 150 rows with leaf, value-only and belief rows, as they
-    are and with NaN in every absent slot (and junk in the host's padding)."""
+    are and with NaN in every absent slot (and junk in the host's padding). Opset 17; the mask and packed graphs'
+    scatters write unique indices (`scatter_writes`, docs/az.md 41.2) - with id_actions on rows where two present units
+    score the same action (their identities repeat), so the gate also checks the policy's last writer - and keep every
+    integer constant in int32."""
+    import onnx
     m = tok_net(TOK_LAYOUT if layout == 'plain' else TOK_LAYOUT_ID)
     path = str(tmp_path / f'{packing}.onnx')
-    OX.export(m, path, packing, {'checkpoint': 'toy'})
+    meta = OX.export(m, path, packing, {'checkpoint': 'toy'})
+    assert meta['opset'] == '17' and meta['unique_scatters'] == ('1' if packing in ('mask', 'packed') else '0')
+    assert OX.check_int32(onnx.load(path)) > 0
     B = 150
-    rows = rows_of(tok_x(B, 3).numpy(), np.random.default_rng(1).integers(2, 5, B), kinds_of(B, 2), TOK_A)
+    x = tok_x(B, 3)
+    rows = rows_of(x.numpy(), np.random.default_rng(1).integers(2, 5, B), kinds_of(B, 2), TOK_A)
+    if layout == 'id_actions':
+        _, pres, ids = OX.slot_tokens(m, x)
+        unit = [[i for i, p in zip(ids[b, 2:6].tolist(), pres[b, 2:6].tolist()) if p and i < 12] for b in range(B)]
+        assert sum(len(u) != len(set(u)) for u in unit) >= 20     # (rows whose policy writes repeat an action)
+    if packing in ('mask', 'packed'):
+        sw = OX.scatter_writes(path, [OP.feeds(rows.take(np.arange(s))) for s in (1, 7, B)], threads=1)
+        assert sw['scatters'] == 4 and sw['writes'] > 0 and sw['duplicates'] == 0 and sw['over'] == 0, sw
     ok, res = OP.run_gate(m, {packing: path}, [rows], sizes=(1, 7, 64, 150), threads=1, **QUIET)
     assert ok, [r for r in res if not r['pass']]
     assert {r['case'] for r in res} >= {'B1', 'B1-nan', 'B150', 'B150-nan'}
@@ -164,7 +250,8 @@ def test_interface_and_metadata(tmp_path):
     meta = {e.key: e.value for e in p.metadata_props}
     assert meta['zero_onnx'] == '1' and meta['protocol'] == 'zero-onnx/1' and meta['game'] == 'toy'
     assert int(meta['features']) == TOK_F and int(meta['actions']) == TOK_A and meta['checkpoint'] == 'iter_0007.pt'
-    assert meta['checkpoint_sha256'] == 'ab' * 32 and int(meta['opset']) >= 18
+    assert meta['checkpoint_sha256'] == 'ab' * 32 and meta['opset'] == '17' and meta['unique_scatters'] == '1'
+    assert [(o.domain, o.version) for o in p.opset_import if o.domain in ('', 'ai.onnx')] == [('', 17)]
     assert len(p.graph.initializer) and not any(t.data_location == T.EXTERNAL for t in p.graph.initializer)
 
 
