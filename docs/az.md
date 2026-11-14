@@ -5476,6 +5476,109 @@ threads: 137 of 137 pieces (7,713 real driver rows) bit-identical on every outpu
 4.0e-6; none failed, every case twice bit-identical. DirectML then runs both nets within 9e-6 of torch.
 `tools/onnx_probe_graph.py` writes the worker's built-in probe graph (44.4).
 
+### 41.2 Graphs a GPU provider runs as the CPU does: every scatter unique, opset 17 (no setting; zero-farm's DirectML work, 2026-11-13)
+
+**Why.** zero-farm wants friends' AMD (and Intel, NVIDIA) GPUs through DirectML, the one GPU provider every Windows PC
+has. Two properties of the exported graphs break a GPU provider as soon as their ScatterElements run on the GPU. They
+were hidden: DirectML registers ScatterElements up to version 16 only, so under opset 18 it left every scatter (4 in a
+zero-onnx/1 graph, 10 in Delver's v7 graph) to the CPU, with copies to the CPU and back around each. Measured in a
+DirectML lab (onnxruntime-directml 1.24.4 and Windows ML's ONNX Runtime 1.28.3, an RTX 5090 and an Intel UHD 770) with
+the same graphs at opset 17:
+
+* *More indices than places.* densify's second scatter wrote nnz + B indices into nnz + 1 places (all B row ends to the
+  one spare slot nnz). DirectML refuses an index tensor longer than its data along the axis ("The parameter is
+  incorrect": at run time with dynamic shapes, at session creation with static ones): every batch of two rows or more.
+* *Repeated indices.* The policy scatter writes every token column without an action to the dummy column, and where two
+  tokens score the same action (identity actions of two equal cards; the probe network's units) a real column twice
+  with different logits. ONNX leaves the winner of a repeated index undefined; ONNX Runtime's CPU kernel and torch's CPU
+  scatter write in order (the last write wins: the answers every gate compares with), a GPU in parallel - 64 writes to
+  two places, values 1..64: the CPU kept [32, 64], the RTX 5090 [1, 33], the UHD 770 [17, 49]; the probe graph at one row
+  (the only size densify did not fail at) came out 0.0205 off the CPU's policy.
+* DirectML's static graph fusion also fails on Scatter -> Slice -> Mul in one partition (each piece alone compiles), and
+  it has no int64 Mod (torch's int64 `//` exports Div with a Mod fix-up; `rounding_mode='trunc'` goes through float32 and
+  is wrong past 2^24, measured).
+
+**What it does** (`zero.onnx_export`; the interfaces unchanged):
+
+* *Row ends to places of their own* (`_csr_rows`, densify's and zero-onnx/2's CSRs): the row ends' writes go to spare
+  places n + (the end's index) - data n + B, every index unique - and the first n are read back by a Gather
+  (`index_select`), not a Slice. The same rows.
+* *The policy's last writer made explicit* (`_scatter_last`): per row, the writes sorted by (action, position) - one TopK
+  over the key action L + position (unique keys: no tie to break; no division) -, the last write of each action's run
+  writes its place, every other write its own spare place past the row's end (A + 1 + its sorted position), the first
+  A + 1 places read back by a Gather. The packed graph lays each row's writes out on its full token axis (`_policy_full`:
+  [B, n_tok K], an absent slot writing the dummy column): a row's packed tokens are in layout order, so a write's place on
+  the axis orders the row's writes exactly as the packed list's flat scatter did - the same last writer of every action,
+  bit for bit; the mask packing scatters its own [B, n_tok K] the same way. The keys are per row and stay below
+  (A + 2) n_tok K whatever the batch (`_check_policy_keys` when the module is built; MTG Zero: 1,025 x 850, 0.04 % of
+  2^31 - a key over the whole batch would reach ~10^11 at 1,024 rows).
+* *Every integer in int32, zero-onnx/1 too* (46.7's rule): `int32_slices` and `check_int32` run on every export (a
+  zero-onnx/1 graph held one integer outside int32, the exporter's Slice "to the end" 2^63 - 1).
+* *Opset 17* (`opset17`, `OPSET` 17): torch 2.11's exporter writes opset 18 whatever it is asked (onnx's version
+  converter has no Pad 18 -> 17 adapter), so the export asks for 18 (`EXPORTER_OPSET`) and rewrites the graph: every node
+  whose operator has another version under opset 17 than under 18 (`onnx.defs`) gets its opset-17 form - the Reduce
+  operators' constant axes input back to the attribute (`noop_with_empty_axes` dropped), ScatterElements / ScatterND
+  with reduction none, add or mul as version 16, Pad without its axes input as version 13 - or is refused (Split with
+  num_outputs, Resize-18, a reduction opset 18 added, ...); onnx.checker's full check after. `export(opset=18)` keeps
+  the exporter's graph.
+* Metadata `unique_scatters` '1' (every packing but `compact` and `host`, which call `TokenNet._trunk` and its plain
+  policy scatter: '0'; measured, not used). `scatter_writes(model, feeds)`: what every scatter of a graph writes on real
+  inputs (duplicates, more indices than places) - the runtime check beside `int64_max`.
+* Not changed: what a graph answers on the CPU (below), the interfaces and reference sets, `portable_file` (old files
+  keep their scatters). The packed trunk's int64 floor division (a token's row `sel // n_tok`) stays: DirectML leaves
+  its Mod fix-up to the CPU, exactly (below).
+
+**On by default** (not a setting): an exporter change - nothing on a run's path imports it - whose graphs answer every
+input on the CPU bit for bit as before (below). `export(..., opset=18)` gives the exporter's opset.
+
+**Costs.** The graphs grow a little: MTG Zero's pb1 iteration 82 from 996 to 1,014 nodes and 10,151,753 to 10,183,556
+bytes (+0.3 %), Delver's v7 graph from 1,983 to 2,014 nodes (+33 KB); the export time unchanged (v7: 25-32 s). On the CPU the
+policy's per-row sort (a TopK over n_tok K = 850 keys a row for MTG Zero) and the [B, n_tok K] gathers cost about what
+the batch's noise hides: the native worker's CPU runtime pack (ONNX Runtime 1.31.1, 4 threads, the reference rows cycled
+to batches of 16 / 64 / 256 / 1,024; two runs of each graph, interleaved): pb1 1,247-1,329 / 1,331-1,758 / 2,141-2,436 /
+2,108-2,394 rows/s against the earlier graph's 1,312-1,313 / 1,385-1,387 / 2,024-2,186 / 2,409-2,490; whole reference
+batches 2,173-2,251 against 2,040-2,132.
+
+**Tests.** `tests/test_onnx.py` (19; two new, two extended): `_scatter_last` against the sequential scatter (12 writes
+a row into 9 places) in torch and through ONNX Runtime at opset 17, bit for bit, and `scatter_writes` finding no
+duplicate and no excess index where the plain scatter has both; `opset17` (a ReduceMax's axes input to the attribute,
+the same answer; Split with num_outputs and a ScatterElements reduction of opset 18 refused); every packing's graph at
+opset 17 with its `unique_scatters` and `check_int32` passing, the mask and packed graphs' four scatters unique on
+batches of 1, 7 and 150 rows - with id_actions on rows where two present units score the same action (so the parity gate
+also checks the policy's last writer against torch); the interface test's opset and metadata. The committed probe graph
+regenerated (`tools/onnx_probe_graph.py`; its reference set byte-identical).
+
+**Measured** (2026-11-13, the desktop beside the live run and other sessions' jobs; ONNX Runtime 1.31.1 CPU, Windows
+ML's 1.28.3 for DirectML, torch 2.11.0; the earlier graphs: ec2d1b9's export, the `farm` head before this change):
+
+* *The CPU's answers, bit for bit.* MTG Zero's best-of-three run pb1, iteration 82 (layout v6, 44,212 features,
+  1,024 actions; exported as the pool exports it; two exports byte-identical) against ec2d1b9's graph on the pool's 256
+  gen-82 reference rows - each recorded batch as it is, the 256 rows at once, windows of 2 to 256 rows, the worker's
+  64-row pieces, every row alone: 310 cases - every output bit-identical, at 4 and at 1 intra-op threads, each graph run in
+  two processes (the four hashes equal). Against torch's answers (the reference set): max abs 1.0e-6. The probe graph
+  (`tools/onnx_probe_graph.py`): its reference rows and 12 more seeds' (2,496 rows), 3,016 cases with every row alone,
+  bit-identical the same way - on rows where the earlier graph's policy scatter wrote 7,832 repeated real actions (the
+  units' identity actions), so the explicit last writer is the CPU's; pb1's rows repeat only the dummy column.
+* *The scatters* (`scatter_writes`, the same rows): the earlier pb1 graph wrote 27,384 repeated indices in 32 scatter
+  runs (504 by densify's row ends, 26,880 by the policy into the dummy column) and had 8 runs with more indices than
+  places (every densify of more than one row); the new one 0 and 0 (635,872 writes). The probe graph: 74,349 repeats and
+  78 excess runs before, 0 and 0 now.
+* *int32.* `check_int32`: the new pb1 graph's 80 integer constants all in int32 (the earlier graph held the Slice end
+  2^63 - 1); `int64_max` on the reference rows' batches, pieces and the 256-row piece: 11,318,272 (the densify index,
+  256 x 44,212: 0.53 % of 2^31), the policy's sort keys at most 871,249.
+* *DirectML* (`zw_probe probe-providers`, Windows ML's ONNX Runtime 1.28.3, the self-test on the gen-82 reference set:
+  the RTX 5090 - shared with a live training run - and the Intel UHD 770): the new graph passes in every run (UHD 5 of
+  5, 5090 4 of 4; also on the reference rows regrouped into batches of 96 and 256 rows), max abs 6.0e-7 (5090) and
+  8.6e-7 (UHD), deterministic; ScatterElements gone from the nodes DirectML leaves to the CPU (15 left: Concat 2, Gather 2,
+  Reshape 3, Squeeze 3, Add, Equal, Mod, Mul, Sub - shapes and the packed trunk's int64 `//`), against 17 with 4
+  ScatterElements before. Rows per second by batch size (16 / 64 / 256 / 1,024 rows; the bench rows are not checked
+  against the CPU, the self-test's are): RTX 5090 267 / 890 / 4,307 / 12,706 against the earlier graph's
+  236 / 909 / 2,585 / 4,669 (2.7x at 1,024 rows); UHD 770 203 / 494 / 1,005 / 1,195 against 192 / 499 / 889 / 1,089.
+  The same runtime's CPU EP: 1,103-1,225 / 1,342-1,511 / 2,104-2,105 / 2,127-2,308.
+* *A network without the auxiliary head* (`aux` [B, 0], the probe network without its head and reader): DirectML passes
+  the self-test on both adapters, new and earlier graph alike (2 runs each): the zero-size output is no problem for the
+  worker's DirectML session (46.7's instrumentation, with its zero-size intermediates as outputs, was).
+
 ## 42. Chained episodes: one game of a match per episode (`SearchGame::chained`, `next_episode`; MTG Zero's best-of-three Delver mirror, 2026-11-11)
 
 (Section 40 is taken by `feat/extra-evals` and `feat/selfplay-spec-hook`, 41 by `farm`.) **No run setting**: the game
@@ -7041,3 +7144,75 @@ gains toy_tail_wide (below).
   4,912 of them in the extra segments, 791 overrides) and 166 batches (107,567 tail tokens, 59,402 extra) identical;
   gate 3 with that graph: the native worker's records rebuild its shards (24 games, 315 rows, 9,163 tail tokens, 5,138
   extra), all 19 arrays identical.
+
+### 46.8 zero-onnx/2 with every scatter unique, at opset 17 (2026-11-13)
+
+**Why.** 41.2's two problems in the zero-onnx/2 graph, besides densify's and the policy's: its tail and override CSRs
+(`_csr_rows`, the same row-end scatter as densify's), and the check for a second override of one (row, action), which
+scattered each override's index and leaned on the CPU's last writer to find the repeats. With them on the CPU (opset 18),
+DirectML left 10 ScatterElements of Delver's v7 graph to the CPU (46.7).
+
+**What changed** (`ZeroOnnx2`; the interface unchanged):
+
+* The tail and override CSRs through 41.2's `_csr_rows` (row ends to places of their own, a Gather back).
+* The static scatter of the head tokens' actions per row on the full head token axis (41.2's `_policy_full`, `_scatter_last`).
+* A second override of one (row, action) found by comparing every override with every later one ([NO + 1]^2 booleans,
+  as the tail-target match already compares overrides with tail tokens): the same overrides refused (of two with one
+  place, all but the last; a refused one's place is its row's dummy column, as before). Every override then writes its
+  own place - an accepted one its action, a refused one a spare place past the policy (B (A + 1) + its index, read off
+  by a Gather) instead of its row's dummy column, which no output reads. So `int32_bound` (Python) and
+  `session::int32_bound` (the worker) bound the policy with its spares, B (A + 1) + NO + 1, instead of the terms B (A + 1)
+  and NO + 1 apart (the feeders refuse a piece at 2^31 as before).
+* 9 ScatterElements (10 before: the repeat-finding scatter is gone), opset 17, `unique_scatters` '1'.
+
+**Tests.** `tests/test_onnx2.py` (11; three extended): the graph's nine scatters unique (`scatter_writes`) on rows with
+tails and overrides and on every refusal case's rows (the sentinel override, a repeated action, an option out of its
+row, an absent head slot, a missing tail token, a column out of range, a token -2); opset 17 and `unique_scatters`;
+`int32_bound`'s new term (the worker's numbers). `cargo test -p zero_worker`: the unit test's `int32_bound` numbers.
+
+**Measured** (2026-11-13, as 41.2):
+
+* *The CPU's answers, bit for bit.* pb1 iteration 67 widened onto layout v7 (46.4; gates 0) and its copy with every
+  gate at 0.37: the new graphs against ec2d1b9's on the 800 recorded batches (76,647 rows, 55,168 tail tokens, 151
+  overrides) - every batch as it is and in 64-row pieces, windows to 1,000 rows, the whole file in 1,024-row pieces,
+  the first 1,000 (gates 0.37: 300) rows alone: 2,805 (2,105) cases - every output bit-identical (`refused` included),
+  each graph run in two processes. The reference sets the two trees write (256 rows: 189 with 386 tail tokens, 8
+  overrides) are byte-identical; ORT vs torch 1.8e-6.
+* *The gate* (`zero.onnx_parity`, the 800 batches), run twice: 16 + 8 cases (pieces), 0 failed, worst priors 5.5e-6,
+  value 6.3e-7, margin 6.7e-7, aux 2.5e-7 - 46.7's numbers -, the `overrides` case (42 rows, 151 overrides) 6.9e-7; the two
+  runs the same case for case, their exports byte-identical; gates at 0.37: 16 + 8 passed, priors 5.5e-6, margin 7.2e-7.
+  toy_tail_wide (22 tail segments, gates 0.5) on the native worker's recorded batches, twice: 16 + 7 cases passed (worst
+  margin 9.5e-7), the exports byte-identical; toy_tail: 16 + 7 passed; both toy graphs against ec2d1b9's on those batches
+  (3,266 and 3,289 rows, every row alone too): bit-identical, two processes each.
+* *The scatters and int32* (the 800 batches, their 64-row pieces and 1,024-row pieces: 2,471 feeds): ec2d1b9's graph wrote
+  9,675,231 repeated indices (the three CSRs' row ends and the policy's dummy column) and had 7,410 runs with more indices
+  than places; the new graph 0 and 0 over 304,146,057 writes. `check_int32`: 131 constants, all in int32; `int64_max`:
+  57,737,216 (a 1,024-row piece's densify index, 1,024 x 56,384: 2.7 % of 2^31), 671 int64 tensors, all typed. The two toy
+  graphs alike (0 repeats, int64 at most 1,376,256).
+* *The native worker.* The self-test on the new v7 graph and its reference set (the CPU runtime pack, ONNX Runtime
+  1.31.1): passes, max abs 1.8e-6, deterministic. Gate 2 (a) with new graphs on both sides (`tools/worker_parity.py`, the
+  native `zw_toy` against `remoteplay.Worker`, 24 games): toy_tail - shards (272 rows) and the first 161 batches
+  identical -, toy_tail_wide - 273 rows, 166 batches identical; gate 3 with the wide graph: the native worker's records
+  rebuild its shards (24 games, 315 rows), all 19 arrays identical. `cargo test -p zero_worker`: 24 + 5 + 6 + 4 passed.
+* *DirectML* (as 41.2; Delver v7's reference set). Placement: ScatterElements gone from the CPU's nodes (48 left on the
+  UHD 770, 45 on the RTX 5090: the shapes, psi's float64 and int64 `//`; 55 and 52 with 10 ScatterElements before). The
+  self-test is **flaky for the earlier and the new graph alike**: on the UHD 770 the new graph passed 3 of 5 runs and the
+  earlier 4 of 5 (8.3e-7), every failure 0.0078 in the priors, the same for both graphs; on the RTX 5090 the new graph
+  passed 3 of 6 (one failure 0.80, two runs within tolerance but not deterministic), the earlier 5 of 6 (one run not
+  deterministic); the reference rows regrouped into one 256-row batch: the new graph passed, the earlier failed (0.016).
+  When it passes, rows per second (16 / 64 / 256 / 1,024 rows, the reference rows' features cycled - no tail token, no
+  override): RTX 5090 99 / 382 / 1,390 / 4,775 against the earlier graph's 88 / 301 / 818 / 2,197 (2.2x at 1,024 rows);
+  UHD 770 83 / 261 / 536 / 719 against 81 / 236 / 493 / 629; the same runtime's CPU EP 1,439-1,600 / 1,151-1,480 /
+  1,765-1,833 / 1,931-1,945. Only the priors,
+  only batches with overrides (the reference batch without one passes alone): onnxruntime-directml 1.24.4 (the UHD 770)
+  gives a row's overrides one common wrong value - row 67's three overrides (CPU -0.99, -1.59, -2.48) all 7.60 in some
+  runs, -4.73 in others, row 71's five all -3.95 in one run of the earlier graph - while the same graph with its integer
+  intermediates made outputs answers right (a DirectML fusion problem in the override
+  path, not one of its operators: ArgMax, ScatterElements and TopK alone answer as the CPU at these sizes). The worker's
+  self-test refuses DirectML whenever it happens (the factory's fallback to the CPU). Not fixed here: the override path
+  is the same in both graphs. toy_tail_wide's graphs (22 tail segments; gates 0 or 0.5) fail DirectML's self-test in
+  18 of 20 runs on the UHD 770, ec2d1b9's and the new alike (value and margin off by up to 0.7: the trunk with gated
+  segments), toy_tail's pass 12 of 12 - both for the GPU work.
+* *CPU speed* (as 41.2's costs; v7, its reference rows cycled): 1,512-1,593 / 1,378-1,388 / 1,792-1,932 / 2,023-2,039
+  rows/s at 16 / 64 / 256 / 1,024 rows against the earlier graph's 1,628-1,687 / 1,224-1,591 / 1,836-1,870 /
+  2,014-2,127 - the same within the noise of the busy machine.
