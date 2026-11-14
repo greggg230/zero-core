@@ -7216,3 +7216,15 @@ row, an absent head slot, a missing tail token, a column out of range, a token -
 * *CPU speed* (as 41.2's costs; v7, its reference rows cycled): 1,512-1,593 / 1,378-1,388 / 1,792-1,932 / 2,023-2,039
   rows/s at 16 / 64 / 256 / 1,024 rows against the earlier graph's 1,628-1,687 / 1,224-1,591 / 1,836-1,870 /
   2,014-2,127 - the same within the noise of the busy machine.
+
+**DirectML refused for zero-onnx/2 (2026-11-13).** On batches with pointer overrides DirectML intermittently returns all
+of a row's overrides as one shared wrong value (the self-test passed 3-5 of 5-6 runs on the RTX 5090 and the UHD 770,
+with this graph and the one before it alike), so a passing self-test does not make later override batches right: the
+search would get wrong targets, which no replay catches. The worker's session factory therefore refuses DirectML for any
+graph whose metadata says `zero_onnx` 2 (`session::provider_refusal` / `refused`): a skip with the reason, never an error
+- `create_session` goes on to the next provider (CUDA, the CPU), and `probe-providers` reports an ordinary result entry
+(`ok` false, `why` "dml: zero-onnx/2's pointer-override path ..."), which an agent caches as a failed provider.
+zero-onnx/1 on DirectML stays allowed (9 of 9 self-tests passed). Lifting the refusal needs a fix of the override path
+(or a restructure that avoids DirectML's fusion there), proven by at least 50 consecutive identical, correct runs on
+override batches on both adapters. Test: `session::tests::directml_is_refused_for_zero_onnx_2_only` (the refusal, its
+skip form and the probe's result entry).

@@ -969,6 +969,26 @@ pub fn create_session(spec: &SessionSpec) -> Result<InferenceSession, SessionErr
 /// The providers Windows ML's catalog brings.
 pub const CATALOG: [ProviderKind; 4] = [ProviderKind::TensorRtRtx, ProviderKind::AmdGpu, ProviderKind::MiGraphX, ProviderKind::OpenVino];
 
+/// Why `p` is refused for a graph with metadata `meta` whatever its self-test says, if it is: DirectML on a zero-onnx/2
+/// graph. Measured 2026-11-13 (onnxruntime-directml 1.24.4 and Windows ML's ORT 1.28.3; RTX 5090, Intel UHD 770): on
+/// batches with pointer overrides, all of a row's overrides intermittently come back as one shared wrong value (the
+/// self-test passed 3-5 of 5-6 runs, with the GPU-safe export and the one before it alike), so a session that passes can
+/// still answer later override batches wrongly - wrong search targets, not a replay mismatch. Lifting it needs a fix of the
+/// override path proven by >= 50 consecutive identical, correct runs on override batches on both adapters
+/// (docs/az.md 46.8). zero-onnx/1 on DirectML stays allowed.
+pub fn provider_refusal(p: ProviderKind, meta: &[(String, String)]) -> Option<String> {
+    let v2 = meta.iter().any(|(k, v)| k == "zero_onnx" && v == "2");
+    (p == ProviderKind::DirectMl && v2).then(|| "dml: zero-onnx/2's pointer-override path answers intermittently wrong on DirectML (refused, docs/az.md 46.8)".to_string())
+}
+
+/// The factory's answer for a refused provider: a skip, never an error - `create_session` goes on to the next provider
+/// (the refusal in the session's `attempts` and its `selftest` event's `tried`), and `probe-providers` reports it as an
+/// ordinary result entry with `ok` false and the `why` (an agent caches that as a failed provider; a refusal is not a
+/// probe that failed to run).
+pub fn refused(p: ProviderKind, meta: &[(String, String)], device: Option<GpuDevice>) -> Option<Tried> {
+    provider_refusal(p, meta).map(|why| Tried::Skip(Attempt { provider: p, device, why, selftest: None }))
+}
+
 /// One provider's try (`create_session`'s loop; the probe's per-adapter test).
 pub enum Tried {
     /// Built (and self-tested when there is a reference set: `selftest().ok` says whether it passed).
@@ -1032,6 +1052,11 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
         if let Err(e) = crate::selftest::check_meta(r, &want_graph, &meta) {
             return Tried::Fatal(e);
         }
+    }
+    // (a provider known to answer a kind of graph wrongly on some batches: refused before any self-test, which it could
+    // pass by luck)
+    if let Some(t) = refused(p, &meta, device.clone()) {
+        return t;
     }
     let fallback: Vec<String> = if p.is_gpu() { placements.iter().filter(|(prov, _)| prov == "CPUExecutionProvider").map(|(_, n)| n.clone()).collect() } else { Vec::new() };
     let mut s = InferenceSession {
@@ -1488,6 +1513,31 @@ pub fn read_metadata(runtime_dylib: &Path, model: &Path) -> Result<Vec<(String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directml_is_refused_for_zero_onnx_2_only() {
+        let m = |v: &str| vec![("zero_onnx".to_string(), v.to_string()), ("game".to_string(), "mtg".to_string())];
+        let why = provider_refusal(ProviderKind::DirectMl, &m("2")).expect("dml refused for zero-onnx/2");
+        assert!(why.starts_with("dml:") && why.contains("46.8"), "{why}");
+        assert_eq!(provider_refusal(ProviderKind::DirectMl, &m("1")), None);
+        for p in [ProviderKind::Cpu, ProviderKind::Cuda, ProviderKind::TensorRtRtx, ProviderKind::OpenVino] {
+            assert_eq!(provider_refusal(p, &m("2")), None, "{p:?}");
+        }
+        assert_eq!(provider_refusal(ProviderKind::DirectMl, &[]), None);
+        // the factory's form: a skip with the reason (create_session tries the next provider), not a fatal error
+        match refused(ProviderKind::DirectMl, &m("2"), None) {
+            Some(Tried::Skip(at)) => assert!(at.provider == ProviderKind::DirectMl && at.why == why && at.selftest.is_none()),
+            Some(Tried::Fatal(e)) => panic!("a refusal must not end the job: {e}"),
+            _ => panic!("dml on zero-onnx/2 must be refused as a skip"),
+        }
+        assert!(refused(ProviderKind::DirectMl, &m("1"), None).is_none());
+        // and probe-providers' entry for it: an ordinary result, ok false with the why
+        if let Some(Tried::Skip(at)) = refused(ProviderKind::DirectMl, &m("2"), None) {
+            let mut r = json!({"provider": "dml", "gpu": null});
+            crate::probe::skipped_entry(&mut r, &at);
+            assert_eq!((r["ok"].clone(), r["why"].as_str().map(String::from)), (json!(false), Some(why)));
+        }
+    }
 
     #[test]
     fn provider_lists_end_with_the_cpu() {

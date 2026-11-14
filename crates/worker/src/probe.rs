@@ -82,6 +82,12 @@ fn bench_sizes(s: &mut crate::session::InferenceSession, r: &crate::selftest::Re
     Ok(out)
 }
 
+/// A provider the factory skipped (not usable here, or refused): an ordinary result entry, `ok` false with the `why`.
+pub fn skipped_entry(r: &mut Value, at: &crate::session::Attempt) {
+    r["ok"] = json!(false);
+    r["why"] = json!(at.why);
+}
+
 fn r4(x: f64) -> f64 {
     (x * 1e4).round() / 1e4
 }
@@ -201,10 +207,7 @@ pub fn run(o: &Opts) -> Result<Value, String> {
                     }
                     s.release_device();
                 }
-                Tried::Skip(at) => {
-                    r["ok"] = json!(false);
-                    r["why"] = json!(at.why);
-                }
+                Tried::Skip(at) => skipped_entry(&mut r, &at),
                 Tried::Fatal(e) => {
                     r["ok"] = json!(false);
                     r["why"] = json!(e.clone());
