@@ -88,9 +88,9 @@ def farm(tmp_path):
     b = str(r1 / 'beta')
     beta_rows = [
         mrow(5, NOW - 2 * H, 400, secs=300, sp_s=200,
-             remote={'host': 'greggkeithley@100.95.248.116', 'games': 40, 'running_s': 190.0, 'seconds': 195.0},
+             remote={'host': 'user@mac-host', 'games': 40, 'running_s': 190.0, 'seconds': 195.0},
              eval_yard=ey(50), eval_random=dict(ey(10), opp='random'), extras={'x': {'games': 6, 'win': 1.0}}),
-        mrow(6, NOW - 10 * 60, 500, remote={'host': 'greggkeithley@100.95.248.116', 'games': 50, 'running_s': 90.0}),
+        mrow(6, NOW - 10 * 60, 500, remote={'host': 'user@mac-host', 'games': 50, 'running_s': 90.0}),
     ]
     beta_rows[0]['phases'].update(eval_s=40.0, elo_s=10.0)
     jsonl(os.path.join(b, 'metrics.jsonl'), beta_rows)
@@ -133,6 +133,9 @@ def farm(tmp_path):
                  'deadline': NOW + 2 * H}})
     cfg = str(tmp_path / 'farm_report.json')
     jdump(cfg, {'vast_ledger': ledger, 'url': 'https://farm.example',
+                'local': {'hardware': 'i9-13900K / RTX 5090'},
+                'sources': {'mac': {'name': 'MacBook Pro', 'kind': 'ssh', 'hardware': 'M4 Max 16-core / 64 GB'}},
+                'aliases': {'user@mac-host': 'mac'},
                 'fuzz': {'host': 'mac-test', 'python': '$HOME/py', 'farm': '$HOME/farm'}})
     tok = str(tmp_path / 'admin_token')
     with open(tok, 'w', encoding='utf-8') as f:
@@ -425,3 +428,18 @@ def test_install_and_uninstall_task_mocked(tmp_path, capsys):
     assert fr.main(['--uninstall-task'], runner=runner) == 0 and calls == [fr.task_uninstall_argv()]
     calls.clear()
     assert fr.main(['--install-task', '--task-root', str(tmp_path)], runner=runner) == 2 and calls == []
+
+
+def test_pool_remotes_left_out():
+    """zero.remoteplay records 'mac,pool:<run>' as one host with the pool's games under `pools`: the Mac
+    gets the rest, the pool (farm PCs, counted by the coordinator itself) nothing."""
+    r = {'host': 'mac,pool:run1', 'games': 299, 'running_s': 205.8,
+         'pools': {'pool:run1': {'farm_run': 'run1', 'games': 54}}}
+    (name, got), = fr.remote_records({'games': 1051, 'remote': r})
+    assert name == 'mac' and got['games'] == 245 and got['running_s'] == 205.8 and r['games'] == 299
+    assert fr.remote_records({'remote': {'host': 'pool:run1', 'games': 9, 'pools': {'pool:run1': {'games': 9}}}}) == []
+    assert fr.remote_records({'remote': {'host': ['mac', 'pool:run1'], 'games': 10,
+                                         'pools': {'pool:run1': {'games': 4}}}})[0][1]['games'] == 6
+    got = fr.remote_records({'remotes': {'mac': {'games': 3}, 'pool:run1': {'games': 5}}})
+    assert [n for n, _ in got] == ['mac']
+    assert fr.remote_records({'remote': {'host': 'a,b', 'games': 7}}) == [('a,b', {'host': 'a,b', 'games': 7})]

@@ -138,14 +138,14 @@ DEFAULTS = {
     'reporter': 'desktop',
     'url': DEFAULT_URL,
     'roots': None,                 # None: default_roots()
-    'local': {'id': 'desktop', 'name': 'Desktop', 'hardware': 'i9-13900K / RTX 5090'},
-    'sources': {'mac': {'name': 'MacBook Pro', 'kind': 'ssh', 'hardware': 'M4 Max 16-core / 64 GB'}},
-    'aliases': {'greggkeithley@100.95.248.116': 'mac'},
+    'local': {'id': 'desktop', 'name': 'Desktop', 'hardware': None},
+    'sources': {},                 # {id: {name, kind, hardware}}: the machines' details live in the config file
+    'aliases': {},                 # {recorded remote name ('user@host'): source id}
     'local_names': ['local', 'gpu:*'],
     'vast_names': ['vast', 'vast:*'],
     'vast_ledger': os.path.join('~', '.config', 'vastai', 'mtgz_boxes.json'),
     'vast_gpu': 'RTX 5090',
-    'fuzz': {'source': 'mac', 'host': 'greggkeithley@100.95.248.116', 'ssh': 'ssh',
+    'fuzz': {'source': 'mac', 'host': None, 'ssh': 'ssh',          # host None: no fuzz-farm probe
              'python': '$HOME/.venvs/dominion-zero/bin/python', 'farm': '$HOME/mtgz-fuzzfarm', 'timeout': 90},
 }
 
@@ -504,19 +504,34 @@ def eval_games(row):
     return n
 
 
+def is_pool(name):
+    """A zero-farm pool remote (`pool:<run>`): its games are the farm PCs', which the coordinator
+    counts itself, so the own-machines report leaves them out."""
+    return str(name).startswith('pool:')
+
+
 def remote_records(sp):
     """[(remote name, its record)] of a self-play record: selfplay.remotes (a list of hosts), else
-    selfplay.remote under its host."""
+    selfplay.remote under its host. Pool remotes (`pool:<run>`) are left out: a record of several
+    hosts recorded together (a list, or zero.remoteplay's 'mac,pool:<run>' string) gives its other
+    hosts the record's games minus its `pools`' games."""
     rems = sp.get('remotes')
     if isinstance(rems, dict) and rems:
-        return [(str(n), r) for n, r in rems.items() if isinstance(r, dict)]
+        return [(str(n), r) for n, r in rems.items() if isinstance(r, dict) and not is_pool(n)]
     r = sp.get('remote')
     if not isinstance(r, dict):
         return []
     h = r.get('host')
-    if isinstance(h, list):                # (several hosts recorded without their shares: kept together)
-        h = h[0] if len(h) == 1 else ','.join(str(x) for x in h)
-    return [(str(h or 'remote'), r)]
+    hosts = [str(x) for x in h] if isinstance(h, list) else str(h or 'remote').split(',')
+    hosts = [x.strip() for x in hosts if x.strip()] or ['remote']
+    own = [x for x in hosts if not is_pool(x)]
+    if not own:
+        return []
+    if len(own) == len(hosts):             # (several hosts recorded without their shares: kept together)
+        return [(','.join(own), r)]
+    pools = r.get('pools') if isinstance(r.get('pools'), dict) else {}
+    pooled = sum(_num(p.get('games')) or 0 for n, p in pools.items() if isinstance(p, dict) and is_pool(n))
+    return [(','.join(own), dict(r, games=max(0, (_num(r.get('games')) or 0) - pooled)))]
 
 
 # ------------------------------------------------------------------ the report
