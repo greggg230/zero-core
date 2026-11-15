@@ -22,7 +22,8 @@
       min_window_samples, after --set -; hard links on the same volume, --copy to copy), Elo results
       cut at K (every pool: elo/ and elo/<rule>/ - pairs and `logged` names of checkpoints after K
       dropped, the fork plays its own; ratings refit at its first evaluation), metrics up to K and
-      the source's config.json with the --set overrides. The source is only read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
+      the source's config.json with the --set overrides (then the game package's `on_fork` hook, docs/az.md 49).
+      The source is only read. Then: python tools/supervise.py runs/b (the run resumes after K). A co-training run
       (setting `resolver`, docs/az.md 11) is copied with its resolver network: the same of
       <source>/resolver/ into <dest>/resolver/ (K: an iteration where both have a checkpoint).
 
@@ -178,6 +179,7 @@ def install_net(dest, it, net, game, settings=None):
 
 
 def continuation(source, dest, it=None, overrides=None, copy=False, net=None, allow_draft=False):
+    from .. import package
     from ..run import DEFAULTS, latest_iter, model_path
     if os.path.exists(os.path.join(dest, 'config.json')):
         raise SystemExit(f'{dest} already holds a run')
@@ -219,6 +221,9 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None, al
     if size:
         cfg.update(size)
     cfg.update(overrides or {})
+    hook = package.active().fork_hook()
+    if hook is not None:                           # (the game package's: e.g. its companion's settings, az.md 49)
+        hook(source, dest, it, cfg, dict(overrides or {}))
     with open(os.path.join(dest, 'config.json'), 'w') as f:
         json.dump(cfg, f, indent=1)
     print(f'{source} @ iter {it} -> {dest}: {len(need)} checkpoints, {len(dirs)} data iterations, {len(rows)} metrics rows'

@@ -7,6 +7,8 @@ supervisor_state.json (with the process creation time, so a reused pid is never 
 also searches every process's command line (slow on Windows: ~15 s; for processes that predate
 the state files). For a clean stop after the
 current iteration use `touch runs/toy1/STOP`; to pause, tools/pause_run.py.
+The supervisor's companion (docs/az.md 49: e.g. MTG Zero's delverai publisher, recorded in supervisor_state.json)
+is left out of the kill: it notices its supervisor is gone, posts the run as stopped and exits by itself.
 """
 import os
 import sys
@@ -59,6 +61,12 @@ def from_state(run):
     return sups, runs
 
 
+def companion_pid(run):
+    """The pid of the supervisor's companion process (supervisor_state.json `companion`, alive), else None."""
+    c = (runctl.read_state(run, 'supervisor') or {}).get('companion') or {}
+    return int(c['pid']) if c.get('pid') and runctl.alive(c) else None
+
+
 def scan(run):
     """Every python process whose command line names this run (slow on Windows)."""
     want = os.path.normcase(os.path.abspath(run))
@@ -91,9 +99,15 @@ def main(argv=None):
         s2, r2 = scan(run)
         sups += [p for p in s2 if p.pid not in {q.pid for q in sups}]
         runs += [p for p in r2 if p.pid not in {q.pid for q in runs}]
+    comp = companion_pid(run)
     for p in sups + runs:                       # the supervisor first: it must not restart the run
         try:
             kids = p.children(recursive=True)
+            if comp is not None and any(k.pid == comp for k in kids):
+                # (the companion and its own children: left to end themselves)
+                spared = {comp} | {c.pid for c in psutil.Process(comp).children(recursive=True)}
+                kids = [k for k in kids if k.pid not in spared]
+                print(f'left the companion {comp} to post its last state and exit by itself')
             for k in kids:
                 k.kill()
             p.kill()

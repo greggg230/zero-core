@@ -120,6 +120,19 @@ class GamePackage:
                     same paths in the mirror before it (`RemoteEval._ship`; each again when its size or
                     modification time changed). A missing file fails the evaluation (logged, retried).
                     Default none: the shipping of before
+    companion       fn(run, cfg) -> {name, cmd, log, env} or None, or 'module:attr' (docs/az.md 49): a process
+                    the supervisor (zero.tools.supervise) keeps beside the run - MTG Zero's delverai publisher -,
+                    asked at every start of the run once the run has written its config.json (`run`: the run
+                    directory, absolute; `cfg`: its config): `cmd` the command (a list; cwd the game repo's root),
+                    `name` its name in the supervisor's log and state ('companion'), `log` its console file in the
+                    run directory ('<name>_console.txt'), `env` more environment variables. None: no companion (the
+                    supervisor stops one it runs). An exception is the companion refusing to start: the supervisor
+                    logs it loudly and the run goes on without it (a companion is never worth the run).
+                    Default none: no companion
+    on_fork         fn(source, dest, it, cfg, overrides) or 'module:attr' (docs/az.md 49): called by
+                    `tools/fork_run.py --source` after the fork's files are copied and before its config.json is
+                    written (`cfg`: the fork's settings, the --set overrides applied - the hook may change them in
+                    place; `overrides`: the --set settings). Default none
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
@@ -127,7 +140,7 @@ class GamePackage:
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
-                 remote_eval_inputs=None, evals_every=None):
+                 remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -164,11 +177,38 @@ class GamePackage:
         self.selfplay_specs = dict(selfplay_specs or {})
         self.remote_eval_inputs = dict(remote_eval_inputs or {})
         self.evals_every = dict(evals_every or {})
+        self.companion = companion
+        self.on_fork = on_fork
         for ev, s in self.evals_every.items():
             d = self.settings.get(s)
             if s not in self.settings or not isinstance(d, int) or isinstance(d, bool) or d < 0:
                 raise ValueError(f'{name}: evals_every of {ev!r}: {s!r} is not one of the package\'s settings with an '
                                  f'integer default >= 0')
+
+    def companion_of(self, run, cfg):
+        """The run's companion process (`companion`, docs/az.md 49): {name, cmd, log, env} with the defaults
+        filled in, or None. Exceptions of the hook propagate (the supervisor logs them)."""
+        f = self.companion
+        if f is None:
+            return None
+        if isinstance(f, str):
+            f = self.companion = resolve(f)
+        spec = f(run, cfg)
+        if not spec:
+            return None
+        cmd = spec.get('cmd')
+        if not isinstance(cmd, (list, tuple)) or not cmd or not all(isinstance(x, str) for x in cmd):
+            raise ValueError(f'{self.name}: companion of {run}: cmd {cmd!r} is not a non-empty list of strings')
+        name = str(spec.get('name') or 'companion')
+        return {'name': name, 'cmd': list(cmd), 'log': str(spec.get('log') or f'{name}_console.txt'),
+                'env': {str(k): str(v) for k, v in (spec.get('env') or {}).items()}}
+
+    def fork_hook(self):
+        """`on_fork` resolved (docs/az.md 49), or None."""
+        f = self.on_fork
+        if isinstance(f, str):
+            f = self.on_fork = resolve(f)
+        return f
 
     def eval_due(self, name, cfg, it):
         """Whether the extra evaluation `name` runs on the evaluated iteration `it` of a run with settings
