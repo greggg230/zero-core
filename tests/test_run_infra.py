@@ -420,6 +420,25 @@ sys.exit(1)
 '''
 
 
+def test_the_orphan_sweep_spares_processes_older_than_the_launch():
+    """kill_orphans(pid, since) kills the processes whose parent pid is `pid` only when they were created after the
+    launch: an older one's parent was another process that had this pid (Windows reuses pids and keeps a dead parent's
+    pid); this test's own child stands for both (docs/az.md 47.2)."""
+    import time
+    from zero.tools import supervise as S
+    t0 = time.time()
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+    try:
+        time.sleep(0.5)
+        assert S.kill_orphans(os.getpid(), since=time.time()) == 0      # created before that launch: spared
+        assert child.poll() is None
+        assert S.kill_orphans(os.getpid(), since=t0) == 1               # created after it: the launch's orphan
+        assert child.wait(timeout=30) is not None
+    finally:
+        if child.poll() is None:
+            child.kill()
+
+
 LAUNCHER = '''import subprocess, sys
 sys.exit(subprocess.run([sys.executable] + sys.argv[1:]).returncode)
 '''

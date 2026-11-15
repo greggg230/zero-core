@@ -7341,6 +7341,16 @@ one or its process started after the launch (`started` >= the launch time: only 
 `crash_key` reads it, and the orphan sweep also takes that pid's children. Test: `test_the_supervisor_gives_up_on_
 the_same_crash_three_times[True]` (a launcher script in between); both interpreters pass test_run_infra.py (23).
 
+**The orphan sweep spares older processes (farm-int, 2026-11-14).** `kill_orphans(pid)` killed every process whose
+parent pid was the exited run's pid. Windows reuses pids quickly and keeps a dead parent's pid as a process's parent
+pid, so a process tree whose long-dead parent once had that number was killed too: on 2026-11-14 a live run's
+supervisor (its parent, `launch_hidden.py`, long gone) and its run vanished without an exit line while supervisor
+tests on the same machine churned ~1,000 short supervised processes (the venv launcher case above, restarting every
+0.1 s). `kill_orphans(pid, since)` kills only processes created after `since`, the time the supervisor launched the
+run: the run's own orphans are always younger than it. (psutil's `children()`, used by the stall watchdog on a live
+process, already compares creation times.) Test: `test_the_orphan_sweep_spares_processes_older_than_the_launch`
+(the test's own child, spared with a later `since`, swept with an earlier one).
+
 ### 47.3 Remote evaluation: the end-of-run drain and the transport
 
 * **The drain** (`RemoteEval.drain`, `run.drain_remote_evals`). A finished run waited at most 6 hours for its queued

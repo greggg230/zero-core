@@ -59,8 +59,13 @@ def keep_awake():
         ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
 
 
-def kill_orphans(pid):
-    """Pool workers of a dead run keep its pid as their parent pid."""
+def kill_orphans(pid, since):
+    """Pool workers of a dead run keep its pid as their parent pid - and so does any process whose own parent, long
+    dead, had that number before (Windows reuses pids quickly and keeps a dead parent's pid as the parent pid): only
+    processes created after `since` (the time the supervisor launched the run, just before it) can be the run's, so
+    only those are killed. Without that check a run's exit killed an unrelated process tree whose dead parent's pid the
+    run had been given - on 2026-11-14 a live run's supervisor and run, when a test churned ~1,000 short supervised
+    processes on the same machine (docs/az.md 47.2)."""
     try:                                   # one snapshot (~0.1 s); process_iter's first pass takes ~10 s on Windows
         from psutil import _psplatform
         kids = [c for c, pp in _psplatform.ppid_map().items() if pp == pid]
@@ -70,6 +75,8 @@ def kill_orphans(pid):
     for c in kids:
         try:
             p = psutil.Process(c)
+            if p.create_time() < since:     # (an older process: its parent was another process with this pid)
+                continue
             for k in p.children(recursive=True):
                 k.kill()
             p.kill()
@@ -209,11 +216,11 @@ def main(argv=None):
         runctl.write_state(run, 'supervisor', state='running', run_pid=p.pid)
         code = wait_run(run, p, stall_s)
         out.close()
-        killed = kill_orphans(p.pid)
+        killed = kill_orphans(p.pid, since)
         # (a launcher's child - a Windows venv's interpreter - is the run whose pool workers outlive it: launched_state)
         st = launched_state(run, p.pid, since)
         if st and isinstance(st.get('pid'), int) and st['pid'] != p.pid:
-            killed += kill_orphans(st['pid'])
+            killed += kill_orphans(st['pid'], since)
         log(run, f'{name} exited with code {code}; killed {killed} orphaned workers')
         if code == 0:
             log(run, 'clean exit (finished or STOP file); supervisor done')
