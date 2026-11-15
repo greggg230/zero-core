@@ -239,6 +239,10 @@ DEFAULTS = dict(
     # never recorded (the network cannot see the options). The Elo pool's name gets '-vc<worlds>[t<temp>]'. 0 worlds
     # = off (the default: the decision searched as any other, today's searches bit for bit)
     selfplay_value_choice_worlds=0, selfplay_value_choice_temp=0.0, eval_value_choice_worlds=0, eval_value_choice_temp=0.0,
+    # an eval job's rows carry their games' records (docs/az.md 50; zero-farm analysis campaigns): every real move, the
+    # seat, result and setup of each game, replayed on the desktop. Native eval jobs only (the worker's
+    # `evaljob`); a Python match refuses it. 0 = off (the default: the rows of before)
+    eval_trace=0,
     # readers (docs/az.md 36): the game package's `readers`, each turned on by its run setting
     # `reader_<target>` (default 0 = off: the network of before) - a small branch of the network reading
     # declared features, trained by its auxiliary target's loss (aux_<target>_w > 0), its prediction an

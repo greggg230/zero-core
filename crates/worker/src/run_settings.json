@@ -397,6 +397,10 @@
    "class": "trainer",
    "why": "evaluation (eval jobs, phase 2)"
   },
+  "eval_trace": {
+   "class": "trainer",
+   "why": "evaluation: an eval job's rows carry their games' records (docs/az.md 50, analysis campaigns)"
+  },
   "eval_root_search": {
    "class": "trainer",
    "why": "evaluation (eval jobs, phase 2)"

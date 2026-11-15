@@ -658,7 +658,18 @@ pub const EVAL_READS: &[&str] = &[
     "eval_select_c_scale", "eval_root_min_visits", "root_min_visits_max_actions", "eval_leaf_value_view",
     "eval_root_search", "gumbel_m", "eval_gumbel_scale", "eval_cache", "eval_infoset_merge", "eval_belief_tilt",
     "belief_clip", "belief_mix", "belief_fast", "eval_belief_tilts", "eval_value_choice_worlds", "eval_value_choice_temp",
+    "eval_trace",
 ];
+
+/// The eval setting `eval_trace` (docs/az.md 50): the job's rows carry their games' records (`evaljob` module docs).
+/// Python's `bool(c.get('eval_trace', 0))`: missing or falsy = off; a value that is not a bool or a number refused.
+pub fn eval_trace_of(c: &Settings) -> Result<bool, String> {
+    match c.get("eval_trace") {
+        None | Some(PyJson::Null) => Ok(false),
+        Some(v @ (PyJson::Bool(_) | PyJson::Int(_) | PyJson::Float(_))) => Ok(truthy(v)),
+        Some(v) => Err(format!("eval_trace {}: 0 / 1 (an eval job's rows carry their games' records)", v.dumps())),
+    }
+}
 
 /// The evaluation games' spec: the run's `eval_spec` (`zero.games.spec_json`: a dict as `json.dumps` writes
 /// it). Python falls back to the game package's `eval_specs` hook (Python code) when it is unset, so an eval

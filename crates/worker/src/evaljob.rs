@@ -15,7 +15,17 @@
 //! `pair` = gid / 2 (null unpaired), `seats` this game's seats in its order, `result` per seat in that
 //! order (1 win, 0.5 draw, 0 loss), `margin` seat 0's score minus the best other seat's (`Run.play_match`'s
 //! margin from seat 0), as `json.dumps(row, separators=(',', ':'))` writes it - zero.farm_eval's `row_json`
-//! bit for bit. A file `<prefix>_SSS.jsonl` (rows by gid) is written every `flush_games` complete games
+//! bit for bit.
+//!
+//! Traced rows (the eval setting `eval_trace`, docs/az.md 50; zero-farm analysis campaigns, PROTOCOL.md 5.3): with it
+//! on the driver traces its games (`Driver::set_trace`, docs/search.md 2.17: it changes no game) and each row ends with
+//! two more keys, `"digest"` - the first 16 hex of the SHA-256 of the record's compact JSON with its keys sorted
+//! (serde_json's text here; Python's `json.dumps(rec, sort_keys=True, separators=(',', ':'), ensure_ascii=False)`,
+//! zero.farm_eval `trace_digest`) - and `"rec"`, the game's record (`zero_search::record::game_json` without samples:
+//! gid, players, seed, every real move, the result, margins, rounds, setup) - what the desktop replays
+//! (`zero_search::record::replay`, the binding's `replay_rows`). Off (the default) the rows are what they were.
+//!
+//! A file `<prefix>_SSS.jsonl` (rows by gid) is written every `flush_games` complete games
 //! (a pair is complete when both its games are in) or `flush_s` seconds, and at the end; the event `evals`
 //! announces it. `finish`: no new game starts (the queue is dropped), the games in flight finish; `quit`:
 //! the driver's phase ends now, finished games are flushed (a pair's lone game too), the rest is
@@ -29,11 +39,12 @@ use std::time::Instant;
 use serde_json::json;
 use zero_search::driver::{Batch, GameResult, KeyKind, NnSeat, SeatCfg};
 use zero_search::dynapi::DynDriver;
+use zero_search::record::game_json;
 
 use crate::eval::{Answer, Evaluator, Expect, OrtCfg, Uniform};
 use crate::job::{build_eval, missing_ranges, peak_rss_mb, ranges, spawn_eval, Control, EvalKind, EvalLink, Outcome, Progress, Recorder, Req, Sink, BIG, INFLIGHT};
 use crate::pyjson::PyJson;
-use crate::settings::{eval_driver_cfg, eval_lease_cfg, eval_spec_of, EvalSeat, Settings};
+use crate::settings::{eval_driver_cfg, eval_lease_cfg, eval_spec_of, eval_trace_of, EvalSeat, Settings};
 use crate::shard::Written;
 use crate::GameEntry;
 
@@ -125,6 +136,15 @@ pub fn row_json(gid: u32, paired: bool, seats: [&EvalSeat; 2], r: &GameResult) -
     .dumps_compact()
 }
 
+/// A traced game's two extra keys (module docs): `,"digest":"<16 hex>","rec":<record>` inserted before the row's
+/// closing brace.
+pub fn traced_row_json(row: &str, r: &GameResult) -> Result<String, String> {
+    let rec = serde_json::to_string(&game_json(r, &[])?).map_err(|e| e.to_string())?;
+    let digest = &crate::proto::sha256_hex(rec.as_bytes())[..16];
+    let body = row.strip_suffix('}').ok_or("internal: a row that is not a JSON object")?;
+    Ok(format!("{body},\"digest\":\"{digest}\",\"rec\":{rec}}}"))
+}
+
 /// The evaluators of the driver's keys: one per generation, a key ('m': seat 0's network, 'o': seat 1's)
 /// answered by its generation's.
 struct ByKey {
@@ -186,6 +206,8 @@ struct EvalRun<'a> {
     since: Option<Instant>,
     seq: u64,
     written: Vec<Written>,
+    /// Rows carry their game's record (`eval_trace`).
+    trace: bool,
 }
 
 impl EvalRun<'_> {
@@ -270,7 +292,10 @@ impl EvalRun<'_> {
                 p.finished_gids.push(r.gid);
                 p.decisions += r.decisions as u64;
             }
-            let row = row_json(r.gid, self.job.paired, self.job.seats_of(r.gid), &r);
+            let mut row = row_json(r.gid, self.job.paired, self.job.seats_of(r.gid), &r);
+            if self.trace {
+                row = traced_row_json(&row, &r)?;
+            }
             self.rows.insert(r.gid, row);
         }
         self.finished += n;
@@ -399,13 +424,15 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
     let cfg = eval_lease_cfg(m);
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
     let spec = eval_spec_of(&job.settings)?;
+    let trace = eval_trace_of(&job.settings)?;
     let ev = build_evaluators(game, job, &cfg.keys, belief, sink, &progress)?;
     sink.log(&format!(
-        "eval job {}: games {}..{} ({}), seed {}, seats {:?}; driver: conc {}, threads {}, groups {}; evaluators: {}",
+        "eval job {}: games {}..{} ({}{}), seed {}, seats {:?}; driver: conc {}, threads {}, groups {}; evaluators: {}",
         job.lease_id,
         job.gid_base,
         job.gid_base as u64 + job.games,
         if job.paired { "paired" } else { "unpaired" },
+        if trace { ", traced" } else { "" },
         job.seed,
         job.seats,
         cfg.concurrency,
@@ -421,6 +448,10 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
     }
     let mut drv = (game.new_driver)(cfg)?;
     drv.set_first_gid(job.gid_base)?;
+    if trace {
+        // (every game's seed, real moves and setup: its record, replayed on the desktop; docs/search.md 2.17)
+        drv.set_trace(true)?;
+    }
     for k in 0..job.games {
         drv.enqueue(&format!("{}:{}", job.lease_id, job.gid_base as u64 + k), &spec)?;
     }
@@ -448,6 +479,7 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
         since: None,
         seq: 0,
         written: Vec::new(),
+        trace,
     };
     let res = (|| -> Result<(), String> {
         r.pump()?;
