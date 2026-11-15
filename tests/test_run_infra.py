@@ -420,17 +420,28 @@ sys.exit(1)
 '''
 
 
-def test_the_supervisor_gives_up_on_the_same_crash_three_times(tmp_path):
+LAUNCHER = '''import subprocess, sys
+sys.exit(subprocess.run([sys.executable] + sys.argv[1:]).returncode)
+'''
+
+
+@pytest.mark.parametrize('launcher', [False, True])
+def test_the_supervisor_gives_up_on_the_same_crash_three_times(tmp_path, launcher):
     """A run that crashes the same way every time (its error text, decimals masked): after the third in a row the
     supervisor stops - state 'refused' with the error - instead of restarting it forever; a different crash first
-    does not count."""
+    does not count. Also when the launched process only starts the run as its child (a Windows venv's python.exe is
+    such a launcher: the run state's pid is not the launched pid; supervise.launched_state)."""
     run = tmp_path / 'sup'
     run.mkdir()
     (run / 'config.json').write_text('{}')
     fake = tmp_path / 'fake.py'
     fake.write_text(SAME_CRASH)
+    cmd = [sys.executable, str(fake)]
+    if launcher:
+        (tmp_path / 'launcher.py').write_text(LAUNCHER)
+        cmd = [sys.executable, str(tmp_path / 'launcher.py'), str(fake)]
     env = dict(os.environ, ZERO_SUPERVISE_WAIT='0.1', ZERO_SUPERVISE_BACKOFF='0.1', CORE_PY=os.path.join(ROOT, 'python'),
-               ZERO_SUPERVISE_CMD=json.dumps([sys.executable, str(fake)]))
+               ZERO_SUPERVISE_CMD=json.dumps(cmd))
     sup = subprocess.run([sys.executable, 'tools/supervise.py', str(run)], cwd=ROOT, env=env, timeout=120)
     assert sup.returncode == 0
     assert (run / 'count').read_text() == 'xxxx'

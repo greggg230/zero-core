@@ -118,12 +118,24 @@ def wait_run(run, p, stall_s):
             return code if code else 1
 
 
-def crash_key(run, pid):
-    """The crash of run process `pid` as a comparable key: its own error text (run_state.json, written by the run
-    when it aborts) with the decimals masked; None when that process wrote no error (killed, a segfault, the stall
-    watchdog: never counted as the same crash)."""
+def launched_state(run, pid, since):
+    """run_state.json when the run process the supervisor launched at `since` (pid `pid`) wrote it, else None. The
+    process that writes it can be a child of `pid`: a Windows venv's python.exe is a launcher that starts the base
+    interpreter as its child (zero-farm's venv runs the pool's run so), so the state's pid is accepted when it is
+    `pid` or its process started after the launch (only the supervisor launches the run; docs/az.md 47.2)."""
     st = runctl.read_state(run, 'run') or {}
-    if st.get('pid') != pid or st.get('state') != 'aborted' or not st.get('error'):
+    started = st.get('started')
+    if st.get('pid') == pid or (isinstance(started, (int, float)) and started >= since):
+        return st
+    return None
+
+
+def crash_key(run, pid, since=float('inf')):
+    """The crash of run process `pid` (launched at `since`) as a comparable key: its own error text (run_state.json,
+    written by the run when it aborts: `launched_state`) with the decimals masked; None when that process wrote no
+    error (killed, a segfault, the stall watchdog: never counted as the same crash)."""
+    st = launched_state(run, pid, since) or {}
+    if st.get('state') != 'aborted' or not st.get('error'):
         return None
     return re.sub(r'[-+]?\d*\.\d+(?:[eE][-+]?\d+)?', '#', str(st['error']))
 
@@ -191,12 +203,17 @@ def main(argv=None):
             if not wait_resume(run, poll_s):
                 return
         out = open(os.path.join(run, 'stdout.txt'), 'a', encoding='utf-8')
+        since = time.time()
         p = subprocess.Popen(cmd + ['--run', run] + extra, cwd=pkg.root, stdout=out, stderr=subprocess.STDOUT, env=env)
         log(run, f'started {name} pid {p.pid}')
         runctl.write_state(run, 'supervisor', state='running', run_pid=p.pid)
         code = wait_run(run, p, stall_s)
         out.close()
         killed = kill_orphans(p.pid)
+        # (a launcher's child - a Windows venv's interpreter - is the run whose pool workers outlive it: launched_state)
+        st = launched_state(run, p.pid, since)
+        if st and isinstance(st.get('pid'), int) and st['pid'] != p.pid:
+            killed += kill_orphans(st['pid'])
         log(run, f'{name} exited with code {code}; killed {killed} orphaned workers')
         if code == 0:
             log(run, 'clean exit (finished or STOP file); supervisor done')
@@ -217,7 +234,7 @@ def main(argv=None):
             if not wait_resume(run, poll_s):
                 return
             continue
-        key = crash_key(run, p.pid)
+        key = crash_key(run, p.pid, since)
         same = same + 1 if key is not None and key == last_key else (1 if key is not None else 0)
         last_key = key
         if same_n > 0 and same >= same_n:

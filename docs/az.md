@@ -7332,6 +7332,15 @@ without writing one - the stall watchdog, a segfault - never counts). The same k
 a row (default **3**; 0 = never give up, the supervisor of before) ends it: logged, `supervisor_state.json` state
 `refused` with `why` and `error` (the dashboard then reads the run's `aborted`). PAUSE, STOP, exit 78 as before.
 
+**A launcher's child is the run (farm-int, 2026-11-14).** The key was read only when `run_state.json`'s pid was the pid
+the supervisor launched. A Windows venv's `python.exe` is a launcher that starts the base interpreter as its child -
+the zero-farm venv runs a farm-attached run's supervisor and run so (docs/az.md 45) - so the run's pid never matched:
+the same crash restarted forever there, and the run's orphaned pool workers (children of the launcher's child) were
+not killed. `supervise.launched_state(run, pid, since)`: the state is the launched run's when its pid is the launched
+one or its process started after the launch (`started` >= the launch time: only the supervisor launches the run);
+`crash_key` reads it, and the orphan sweep also takes that pid's children. Test: `test_the_supervisor_gives_up_on_
+the_same_crash_three_times[True]` (a launcher script in between); both interpreters pass test_run_infra.py (23).
+
 ### 47.3 Remote evaluation: the end-of-run drain and the transport
 
 * **The drain** (`RemoteEval.drain`, `run.drain_remote_evals`). A finished run waited at most 6 hours for its queued
