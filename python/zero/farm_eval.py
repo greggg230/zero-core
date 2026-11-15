@@ -143,12 +143,14 @@ def check_digest(row):
     return row
 
 
-def replay_trace(row, game, spec, engine, seed, paired=True):
+def replay_trace(row, game, spec, engine, seed, paired=True, samples=False, aux=False):
     """Replay a traced row's record through the game's engine (`engine.replay_rows(game, spec, record)`, zero-core
     docs/search.md 2.17: every move legal, the result, margins, rounds and setup the record's) and check it against
     the row: the game's seed is `game_seed_of(seed, gid, paired)` (the lease's base seed), the replayed result is the
     row's (seat order of the row) and the record has no samples (an eval game records none) -> the replay's facts;
-    TraceMismatch on any difference."""
+    TraceMismatch on any difference. `samples`: a self-play record (a play job with search samples, docs/az.md 50):
+    its samples replayed too (`aux`: with the auxiliary targets, as its file's header says) - every sample's decider,
+    kind and policy length checked by the replay."""
     import struct
     check_digest(row)
     rec = row['rec']
@@ -157,10 +159,10 @@ def replay_trace(row, game, spec, engine, seed, paired=True):
     if rec.get('seed') != want:
         raise TraceMismatch(f'game {g}: record seed {rec.get("seed")}, the campaign\'s game seed is {want}')
     try:
-        samples, info = engine.replay_rows(game, spec, json.dumps(rec, separators=SEP), False)
+        got, info = engine.replay_rows(game, spec, json.dumps(rec, separators=SEP), bool(aux) and bool(samples))
     except ValueError as e:
         raise TraceMismatch(f'game {g}: the replay refuses its record: {e}') from None
-    if samples is not None or info.get('rows'):
+    if not samples and (got is not None or info.get('rows')):
         raise TraceMismatch(f'game {g}: its record has samples (an eval game records none)')
     f32 = lambda bits: struct.unpack('<f', struct.pack('<I', int(bits) & 0xffffffff))[0]
     rres = [float(f32(b)) for b in rec.get('result') or []]

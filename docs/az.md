@@ -7657,7 +7657,7 @@ they were. A Python match (`zero.farm_eval.match_driver`) refuses it: traced row
 The desktop side (`zero.farm_eval`): `trace_digest(rec)`; `check_digest(row)` (the row is traced, its record is its
 game and hashes to its digest); `replay_trace(row, game, spec, engine, seed, paired)` - the record replayed through
 the game's engine (`replay_rows`: every move legal, the result, margins, rounds and setup the record's), its seed the
-lease's game seed, the replayed result, rounds and `over` the row's, no samples; `TraceMismatch` on any difference;
+lease's game seed, the replayed result, rounds and `over` the row's, no samples (with `samples=True`, a self-play record: its samples replayed and checked too, `aux` as its file's header says - the farm's play jobs with search samples); `TraceMismatch` on any difference;
 `games_digest(rows)` - SHA-256 over `gid:digest` lines in gid order, first 16 hex: a set of games has one digest
 however it was cut into leases and whoever played it.
 

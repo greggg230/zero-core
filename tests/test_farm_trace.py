@@ -82,3 +82,25 @@ def test_a_python_match_refuses_eval_trace():
     cfg = dict(DEFAULTS, game='toy', eval_spec='{}', eval_trace=1)
     with pytest.raises(ValueError, match='eval_trace'):
         FE.match_driver(cfg, [{'net': 1}, {'net': 2}], 4, 7)
+
+
+def test_self_play_records_replay_with_their_samples():
+    """A play job with search samples (the farm's self-play records): replay_trace checks the samples too (samples=True,
+    aux as the file says); the eval rule (no samples) refuses such a record."""
+    seat = G.nn_seat('m', 8, selfplay=True, sims_fast=2, p_full=0.5)
+    drv = G.Driver('toy', [[seat, seat]], spec='', concurrency=4, seed=SEED, record=True, threads=2, groups=1,
+                   rolling=True, aux=True)
+    drv.set_trace(True)
+    drv.resume(4, 0)
+    drive(drv, {'m': Uniform()})
+    rows, texts, _ = drv.take_game_records()
+    assert texts
+    for r, t in zip(rows, texts):
+        rec = json.loads(t)
+        assert rec['samples']['step'], 'self-play rows'
+        row = FE.row(r, [{'net': 1}, {'net': 1}], False)
+        row.update(digest=FE.trace_digest(rec), rec=rec)
+        info = FE.replay_trace(row, 'toy', '{}', E, SEED, paired=False, samples=True, aux=True)
+        assert info['rows'] == len(rec['samples']['step'])
+        with pytest.raises(FE.TraceMismatch, match='has samples'):
+            FE.replay_trace(row, 'toy', '{}', E, SEED, paired=False)
