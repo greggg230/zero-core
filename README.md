@@ -7,9 +7,12 @@ it. Each one supplies only its rules engine and how the game looks to a network:
 | Game repo | Package | Game |
 |---|---|---|
 | [mtg-zero](https://github.com/greggg230/mtg-zero) | `mtgz` | Magic: The Gathering: team cube drafting and constructed play |
-| [kingdombuilder-zero](https://github.com/greggg230/kingdombuilder-zero) | `kbz` | Kingdom Builder |
-| [caverna-zero](https://github.com/greggg230/caverna-zero) | `cvz` | Caverna |
-| [glassroad-zero](https://github.com/greggg230/glassroad-zero) | `grz` | Glass Road |
+| kingdombuilder-zero (private) | `kbz` | Kingdom Builder |
+| caverna-zero (private) | `cvz` | Caverna |
+| glassroad-zero (private) | `grz` | Glass Road |
+
+zero-core and mtg-zero are public under the MIT license ([`LICENSE`](LICENSE)); the other game repos are
+private for now, so their links would not open.
 
 > **Which repo do you want?** If you want to train or play one of the games, start in **that
 > game's repo**. It pulls in the exact zero-core commit it needs as a git submodule, so you
@@ -131,7 +134,7 @@ PYTHONPATH=python python -m zero.dashboard --runs runs --port 8000    # then ope
 | `tools/` | `build_engine.sh` (every repo's PyO3 build), `build_py.sh`, `smoke_all.sh` (core + every game), `selfplay_digest.py` / `check_checkpoint_compat.py` (old vs new checkout), the run-control scripts |
 | `tests/` | the toy tests (Rust vs Python search parity, loop resume / STOP / PAUSE, supervisor, fork, policy targets, external seats, ...) |
 | `docs/` | see below |
-| `dashboard/` | `zerodash`, the cross-game dashboard (a separate package; its `projects.json` lists the maintainer's machines and paths) |
+| `dashboard/` | `zerodash`, the cross-game dashboard (a separate package; it reads the machine's own projects file, `~/.config/zero/projects.json`, never committed: `dashboard/projects.example.json` is the template) |
 
 ## Docs: what to read when
 
@@ -170,10 +173,12 @@ example `python -m mtgz.az.run`, `python -m mtgz.az.h2h` and `python -m mtgz.az.
 ## Things that look odd but are intentional
 
 * **The E: drive, the Mac, Tailscale and "the desktop".** The docs often mention the
-  maintainer's machines: `E:/cargo-target/...` as the default Windows build dir, a MacBook used
+  maintainer's machines: `E:/cargo-target/...` as a Windows build dir, a MacBook used
   as a remote worker (`eval_remote` / `selfplay_remote` = `mac`), and port numbers registered
   in a local hub. None of these is required. Set `CARGO_TARGET_DIR` and leave the remote
-  settings empty.
+  settings empty. A machine's own settings (a big scratch disk, a Mac's ssh target) live in the
+  untracked `~/.config/zero/local.env` (template: [`tools/local.env.example`](tools/local.env.example)),
+  never in the repo.
 * **Never a global install.** `zero` is never `pip install`ed. Each game checkout puts its own
   pinned copy on `sys.path` (`<pkg>/__init__.py`), so two games, or a live run and a branch
   being edited, can't change each other's behaviour.

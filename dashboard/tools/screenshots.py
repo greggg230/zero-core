@@ -38,7 +38,7 @@ class SampleMachine:
                            'warn_below_gb': 15},
                           {'label': 'E:', 'path': 'E:/', 'free_gb': 1388.0, 'total_gb': 3726.0, 'warn': False,
                            'warn_below_gb': None}],
-                'mac': {'label': 'Mac', 'host': 'greggkeithley@100.95.248.116', 'load': [3.12, 2.87, 2.65],
+                'mac': {'label': 'Mac', 'host': 'user@mac', 'load': [3.12, 2.87, 2.65],
                         'uptime': '9:53  up 6 days', 'time': self.now - 20, 'age_s': 20},
                 'sampled': self.now - 4, 'age_s': 4}
 
@@ -47,14 +47,14 @@ def make_mirror(run_dir, now):
     """Turn the az6_cq copy into what St. Pete's mac_sync leaves on the desktop for a run on the
     Mac (MAC_SYNC + mac_state.json; the run and its supervisor alive there)."""
     with open(os.path.join(run_dir, 'MAC_SYNC'), 'w', encoding='utf-8') as f:
-        json.dump({'host': 'greggkeithley@100.95.248.116', 'remote': '/Users/greggkeithley/stpete-zero/runs/az6_cq',
+        json.dump({'host': 'user@mac', 'remote': '/Users/user/stpete-zero/runs/az6_cq',
                    'ctl_mirrored': {'PAUSE': None, 'STOP': None}, 'last_pass': '2026-10-12 09:49:40'}, f)
     sup = {'pid': 51234, 'started': now - 4000, 'since': now - 3999, 'state': 'running', 'run_pid': 51240}
     run = {'pid': 51240, 'started': now - 3999, 'since': now - 3998, 'state': 'running'}
     with open(os.path.join(run_dir, 'mac_state.json'), 'w', encoding='utf-8') as f:
         json.dump({'run': run, 'run_alive': True, 'supervisor': sup, 'supervisor_alive': True, 'pause': False,
-                   'stop': False, 'host': 'greggkeithley@100.95.248.116',
-                   'remote': '/Users/greggkeithley/stpete-zero/runs/az6_cq', 'checked': now - 220}, f)
+                   'stop': False, 'host': 'user@mac',
+                   'remote': '/Users/user/stpete-zero/runs/az6_cq', 'checked': now - 220}, f)
 
 
 def build(tmp, mirror=False):

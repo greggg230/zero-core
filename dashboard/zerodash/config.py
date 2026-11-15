@@ -1,4 +1,5 @@
-"""projects.json: which projects and runs the dashboard shows.
+"""projects.json: which projects and runs the dashboard shows (the machine's own file, never committed:
+$ZERODASH_CONFIG or ~/.config/zero/projects.json; dashboard/projects.example.json is a template).
 
     {
       "title": "Zero dashboard",
@@ -12,7 +13,7 @@
       "projects": [{
         "id": "glassroad", "name": "Glass Road Zero",
         "repo": "C:/Users/.../glassroad-zero",
-        "dashboard": "http://desktop-j05412i:5280",    the game's own dashboard
+        "dashboard": "http://localhost:5280",          the game's own dashboard
         "roots": ["C:/Users/.../glassroad-zero/runs"], every run directory (config.json or
                                                        metrics.jsonl) under these; the same
                                                        directory reached twice (a junction) is
@@ -29,7 +30,7 @@
                                                        stale_after_min, hidden)
         "remote_runs": [{                              runs on another host (the Mac)
           "name": "az6_cq",
-          "ssh": "greggkeithley@100.95.248.116",       default: mac.ssh
+          "ssh": "user@mac",                           default: mac.ssh
           "path": "~/stpete-zero/runs/az6_cq",         the run directory on that host
           "mirror": "C:/Users/.../mac_mirror/az6_cq",  a local copy of its files that a separate
                                                        sync keeps fresh (metrics, logs, progress,

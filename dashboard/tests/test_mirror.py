@@ -14,12 +14,12 @@ RUN = {'pid': 51240, 'started': 1791822000.9, 'since': 1791822003.0, 'state': 'r
 def make_mirror(fx, run='az6_cq', run_alive=True, sup_alive=True, checked_ago=8, rs=RUN, ss=SUP):
     d = fx.dir('stpete', run)
     with open(os.path.join(d, 'MAC_SYNC'), 'w', encoding='utf-8') as f:
-        json.dump({'host': 'greggkeithley@100.95.248.116', 'remote': f'/Users/greggkeithley/stpete-zero/runs/{run}',
+        json.dump({'host': 'user@mac', 'remote': f'/Users/user/stpete-zero/runs/{run}',
                    'ctl_mirrored': {'PAUSE': None, 'STOP': None}, 'last_pass': '2026-10-12 09:53:12'}, f)
     with open(os.path.join(d, 'mac_state.json'), 'w', encoding='utf-8') as f:
         json.dump({'run': rs, 'run_alive': run_alive, 'supervisor': ss, 'supervisor_alive': sup_alive,
-                   'pause': False, 'stop': False, 'host': 'greggkeithley@100.95.248.116',
-                   'remote': f'/Users/greggkeithley/stpete-zero/runs/{run}', 'checked': fx.now - checked_ago}, f)
+                   'pause': False, 'stop': False, 'host': 'user@mac',
+                   'remote': f'/Users/user/stpete-zero/runs/{run}', 'checked': fx.now - checked_ago}, f)
     return d
 
 
@@ -27,7 +27,7 @@ def test_mirror_running_on_the_mac(fx):
     make_mirror(fx)
     r = fx.runs(fx.dash(alive={}))['stpete/az6_cq']       # nothing alive here: the Mac's state counts
     assert r['state'] == 'running' and r['run_alive'] and r['supervisor_alive'] and r['source'] == 'state files'
-    assert r['remote']['kind'] == 'mirror' and r['remote']['host'] == 'greggkeithley@100.95.248.116'
+    assert r['remote']['kind'] == 'mirror' and r['remote']['host'] == 'user@mac'
     assert r['remote']['probe_age_s'] == 8 and r['remote']['error'] is None
     assert r['pause_supported'] and r['can_pause']          # a mirror honours PAUSE (pause: "auto")
     assert not fx.runs()['stpete/az5']['pause_supported']   # an old local run: STOP only
@@ -36,10 +36,10 @@ def test_mirror_running_on_the_mac(fx):
 def test_mirror_pause_and_resume_write_the_mirror(fx):
     d = make_mirror(fx)
     dash = fx.dash(alive={})
-    res = dash.pause('stpete', 'az6_cq', by='zerodash 100.64.0.7')
+    res = dash.pause('stpete', 'az6_cq', by='zerodash 192.0.2.7')
     assert res['changed'] and res['run']['state'] == 'pausing'
     with open(os.path.join(d, 'PAUSE'), encoding='utf-8') as f:
-        assert json.load(f)['by'] == 'zerodash 100.64.0.7'
+        assert json.load(f)['by'] == 'zerodash 192.0.2.7'
     # mac_sync forwards it; the Mac's run pauses and exits; the next pass says so
     make_mirror(fx, rs=dict(RUN, state='paused'), run_alive=False, ss=dict(SUP, state='paused', run_pid=None))
     assert fx.runs(dash)['stpete/az6_cq']['state'] == 'paused'

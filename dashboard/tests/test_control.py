@@ -32,13 +32,13 @@ def pause_of(fx, key):
 
 def test_pause_and_resume_one_run(fx):
     d = fx.dash()
-    res = d.pause('glassroad', 'grz2p_cq_s512', by='zerodash 100.64.0.7')
+    res = d.pause('glassroad', 'grz2p_cq_s512', by='zerodash 192.0.2.7')
     assert res['ok'] and res['changed'] and res['run']['state'] == 'pausing'
-    assert pause_of(fx, 'glassroad/grz2p_cq_s512') == {'time': fx.now, 'by': 'zerodash 100.64.0.7'}
+    assert pause_of(fx, 'glassroad/grz2p_cq_s512') == {'time': fx.now, 'by': 'zerodash 192.0.2.7'}
     assert not glob.glob(fx.path('glassroad', 'grz2p_cq_s512', 'PAUSE.*'))          # no temp file left
     # pausing again keeps the original pause
-    res = d.pause('glassroad', 'grz2p_cq_s512', by='zerodash 100.64.0.9')
-    assert not res['changed'] and pause_of(fx, 'glassroad/grz2p_cq_s512')['by'] == 'zerodash 100.64.0.7'
+    res = d.pause('glassroad', 'grz2p_cq_s512', by='zerodash 192.0.2.9')
+    assert not res['changed'] and pause_of(fx, 'glassroad/grz2p_cq_s512')['by'] == 'zerodash 192.0.2.7'
     res = d.resume('glassroad', 'grz2p_cq_s512')
     assert res['changed'] and pause_of(fx, 'glassroad/grz2p_cq_s512') is None
     assert res['run']['state'] == 'running'
@@ -108,11 +108,11 @@ def test_resume_all_leaves_hand_pauses_alone(fx):
     os.remove(fx.path('caverna', 'cvz2p_cq', 'PAUSE'))
     fx.write_json('caverna', 'cvz2p_cq', 'PAUSE', {'time': fx.now + 60, 'by': 'tools/pause_run.py'})
     os.remove(fx.path('glassroad', 'grz2p_cq_s512', 'PAUSE'))
-    d.pause('glassroad', 'grz2p_cq_s512', by='zerodash 100.64.0.7')
+    d.pause('glassroad', 'grz2p_cq_s512', by='zerodash 192.0.2.7')
     res = d.resume_all()
     assert res['resumed'] == []
     assert pause_of(fx, 'caverna/cvz2p_cq')['by'] == 'tools/pause_run.py'
-    assert pause_of(fx, 'glassroad/grz2p_cq_s512')['by'] == 'zerodash 100.64.0.7'
+    assert pause_of(fx, 'glassroad/grz2p_cq_s512')['by'] == 'zerodash 192.0.2.7'
     for key in HAND_PAUSED:
         assert pause_of(fx, key) is not None, key
 

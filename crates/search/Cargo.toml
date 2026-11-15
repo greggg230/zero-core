@@ -2,6 +2,7 @@
 name = "zero_search"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Zero Core: game-agnostic MCTS + batched self-play driver (docs/search.md)"
 
 [dependencies]

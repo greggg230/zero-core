@@ -71,8 +71,9 @@ removed (it resumes from its newest checkpoint).
 
 ## 4. Process
 
-* Repos are private on GitHub (`greggg230/zero-core`, `greggg230/glassroad-zero`,
-  `greggg230/caverna-zero`); the desktop checkouts track them as `origin`. Cloud agents
+* zero-core and mtg-zero are public on GitHub (`greggg230/zero-core`, `greggg230/mtg-zero`, MIT); the other game
+  repos (`greggg230/glassroad-zero`, `greggg230/caverna-zero`, ...) are private. The desktop checkouts track them as
+  `origin`. Nothing tied to one person's machines is committed (AGENTS.md "Private details"). Cloud agents
   (Claude Code on the web) work on branches and push them; the orchestrator (desktop) fetches,
   runs the checks that need the desktop (live checkpoints, the E: parity traces, the GPU, live
   run dirs, the Mac), merges into `main`, and switches games at restart points of their runs.

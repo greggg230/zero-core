@@ -2,6 +2,7 @@
 name = "zero_py"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Zero Core: the PyO3 classes behind every game's Python module <package>._engine (search driver, trees, game objects); a game's cdylib is one engine_module! call"
 publish = false
 
