@@ -113,7 +113,7 @@ pub fn row_json(gid: u32, paired: bool, seats: [&EvalSeat; 2], r: &GameResult) -
     // (Python: sc[0] - max(sc[j] for j != 0), floats)
     let best_other = sc.iter().skip(1).copied().fold(f64::NEG_INFINITY, |a, b| if b > a { b } else { a });
     let margin = if sc.len() > 1 { sc[0] - best_other } else { 0.0 };
-    PyJson::Dict(vec![
+    let mut d = vec![
         ("gid".into(), PyJson::Int(gid as i128)),
         ("pair".into(), if paired { PyJson::Int((gid / 2) as i128) } else { PyJson::Null }),
         ("seats".into(), PyJson::List(seats.iter().map(|s| s.pyjson()).collect())),
@@ -121,8 +121,13 @@ pub fn row_json(gid: u32, paired: bool, seats: [&EvalSeat; 2], r: &GameResult) -
         ("margin".into(), PyJson::Float(margin)),
         ("rounds".into(), PyJson::Int(r.rounds as i128)),
         ("over".into(), PyJson::Bool(r.over)),
-    ])
-    .dumps_compact()
+    ];
+    if r.abort_reason == Some("panic") {
+        // a game dropped after a panic inside it (zero-core docs/search.md 2.18): not a result (the row of before for
+        // every other game)
+        d.push(("abort_reason".into(), PyJson::Str("panic".into())));
+    }
+    PyJson::Dict(d).dumps_compact()
 }
 
 /// The evaluators of the driver's keys: one per generation, a key ('m': seat 0's network, 'o': seat 1's)
@@ -262,6 +267,9 @@ impl EvalRun<'_> {
         let res = self.drv.take_results();
         if !self.drv.take_samples().is_empty() {
             return Err("internal: an eval driver recorded samples".into());
+        }
+        for f in self.drv.take_failures() {
+            self.sink.log(&format!("game failure (dropped after a panic): {f}"));
         }
         let n = res.len() as u64;
         for r in res {

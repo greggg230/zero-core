@@ -674,9 +674,10 @@ impl SearchGame for PanicToy {
 }
 
 /// Drive a `PanicToy` self-play run (`groups` groups, the game sleeping `sleep_ms` before its
-/// panic, the caller sleeping `answer_ms` before each answer) on a thread; its outcome must come
-/// back within 30 s (a hang fails the test instead of hanging it).
-fn panicking_run(groups: usize, sleep_ms: u64, answer_ms: u64) -> String {
+/// panic, the caller sleeping `answer_ms` before each answer) on a thread; it must finish within
+/// 30 s (a hang fails the test instead of hanging it) -> its result rows (by gid), samples and
+/// failures, or the driver's error.
+fn panicking_run(groups: usize, sleep_ms: u64, answer_ms: u64) -> Result<(Vec<GameResult>, Vec<Record>, Vec<GameFailure>, DriverStats), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]; 8], &[("m", KeyKind::Nn)]);
@@ -686,33 +687,78 @@ fn panicking_run(groups: usize, sleep_ms: u64, answer_ms: u64) -> String {
         c.threads = 2;
         c.groups = groups;
         let mut d = Driver::<PanicToy>::new(c).unwrap();
+        let (mut res, mut smp) = (Vec::new(), Vec::new());
         let r = loop {
             match d.next_batch(true) {
                 Ok(Some(b)) => {
                     std::thread::sleep(std::time::Duration::from_millis(answer_ms));
                     answer(&mut d, &b);
+                    res.extend(d.take_results());
+                    smp.extend(d.take_samples());
                 }
-                Ok(None) => break Err("the run finished without the panic".to_string()),
-                Err(e) => break Ok(e),
+                Ok(None) => {
+                    res.extend(d.take_results());
+                    smp.extend(d.take_samples());
+                    res.sort_by_key(|r: &GameResult| r.gid);
+                    break Ok((res, smp, d.take_failures(), d.stats()));
+                }
+                Err(e) => break Err(e),
             }
         };
         drop(d);
         let _ = tx.send(r);
     });
     match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-        Ok(r) => r.unwrap(),
+        Ok(r) => r,
         Err(_) => panic!("next_batch hung after a game panicked (groups {groups}, game sleep {sleep_ms} ms, caller delay {answer_ms} ms)"),
     }
 }
 
+/// docs/search.md 2.18: a game that panics (an engine bug) is dropped - an aborted result row, reason "panic", no
+/// samples, and a failure record with what replays it - and the run goes on: every other game plays exactly as it
+/// would have (the same rows and samples as the plain toy's run with the same seed). With the caller already waiting
+/// for the panicking group (the game sleeps first), the caller busy when it panics (answers delayed), and both with
+/// two groups.
 #[test]
-fn a_panicking_game_fails_the_run_instead_of_hanging_it() {
-    // the caller already waiting for the panicking group (the game sleeps first), the caller
-    // busy when it panics (answers delayed), and both with two groups
+fn a_panicking_game_is_dropped_and_the_run_goes_on() {
+    let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]; 8], &[("m", KeyKind::Nn)]);
+    c.seed = PANIC_SEED;
+    c.concurrency = 8;
+    c.threads = 2;
+    let mut plain = Driver::<ToyGame>::new(c).unwrap();
+    let (want, _) = run(&mut plain);
+    let target = Rng::new(split64(PANIC_SEED ^ split64(PANIC_GID as u64 + 1))).next_u64();
     for (groups, sleep_ms, answer_ms) in [(1, 300, 0), (1, 0, 20), (2, 300, 0), (2, 0, 20), (1, 0, 0)] {
-        let e = panicking_run(groups, sleep_ms, answer_ms);
-        let want = format!("game {PANIC_GID} (driver seed {PANIC_SEED}): search worker panicked: toy engine bug at step {PANIC_STEP}");
-        assert!(e.contains(&want), "groups {groups}, sleep {sleep_ms}, delay {answer_ms}: {e}");
+        let at = format!("groups {groups}, sleep {sleep_ms}, delay {answer_ms}");
+        let (res, smp, fails, st) = panicking_run(groups, sleep_ms, answer_ms).unwrap_or_else(|e| panic!("{at}: the run failed: {e}"));
+        assert_eq!(res.iter().map(|r| r.gid).collect::<Vec<_>>(), (0..8).collect::<Vec<_>>(), "{at}: one row per game");
+        let bad = &res[PANIC_GID as usize];
+        assert!(bad.aborted && !bad.over && bad.samples == 0 && bad.abort_reason == Some("panic"), "{at}: the dropped game's row {bad:?}");
+        assert_eq!(st.game_panics, 1, "{at}");
+        assert_eq!(fails.len(), 1, "{at}: one failure record");
+        let f = &fails[0];
+        assert_eq!((f.gid, f.driver_seed, f.game_seed, f.players), (PANIC_GID, PANIC_SEED, target, 2), "{at}");
+        assert_eq!(f.spec, sleep_ms.to_string(), "{at}: the spec it started from");
+        assert!(f.message.contains(&format!("toy engine bug at step {PANIC_STEP}")), "{at}: {}", f.message);
+        assert!(f.steps.len() < PANIC_STEP as usize, "{at}: {} real moves before the panic", f.steps.len());
+        let j = f.to_json();
+        assert_eq!((j["gid"].as_u64(), j["steps"].as_array().map(|a| a.len())), (Some(PANIC_GID as u64), Some(f.steps.len())), "{at}: {j}");
+        // the real moves replay on a fresh game of the same seed (they were legal there)
+        let mut g = ToyGame::new_game(&Default::default(), 2, f.game_seed).unwrap();
+        let mut key = Vec::new();
+        for s in &f.steps {
+            let TraceStep::Act(a) = s else { panic!("{at}: a toy game has only actions: {s:?}") };
+            let mut legal = Vec::new();
+            g.legal_actions(&mut legal);
+            assert!(legal.contains(a), "{at}: move {a} not legal in the replay");
+            g.step(*a, &mut key).unwrap();
+        }
+        // every other game: exactly the plain toy's row and samples
+        for (r, w) in res.iter().zip(&want).filter(|(r, _)| r.gid != PANIC_GID) {
+            assert_eq!((r.gid, r.over, &r.result, r.steps, r.samples, r.decisions), (w.gid, w.over, &w.result, w.steps, w.samples, w.decisions), "{at}: game {}", r.gid);
+        }
+        let wn: usize = want.iter().filter(|w| w.gid != PANIC_GID).map(|w| w.samples as usize).sum();
+        assert_eq!(smp.len(), wn, "{at}: the samples of the other games, none of the dropped one's");
     }
 }
 

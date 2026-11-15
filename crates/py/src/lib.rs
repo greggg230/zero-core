@@ -1052,6 +1052,13 @@ impl PySearchDriver {
         Ok(out)
     }
 
+    /// The games dropped after a panic inside them since the last call (docs/search.md 2.18): one JSON string each
+    /// ({"gid", "driver_seed", "game_seed", "players", "spec", "tag", "start", "branch", "steps", "message"}) - what
+    /// replays the game up to its panic. Their rows came out of take_results as aborted rows (abort_reason "panic").
+    fn take_failures(&mut self) -> Vec<String> {
+        self.d.take_failures()
+    }
+
     /// Trace every game (`Driver::set_trace`, docs/search.md 2.17): before the first resume.
     fn set_trace(&mut self, on: bool) -> PyResult<()> {
         self.d.set_trace(on).map_err(verr)
@@ -1155,6 +1162,10 @@ impl PySearchDriver {
             d.set_item("tail_tokens", s.tail_tokens)?;
             d.set_item("tail_max", s.tail_max)?;
             d.set_item("aborted_row_tokens", s.aborted_row_tokens)?;
+        }
+        if s.game_panics > 0 {
+            // games dropped after a panic (docs/search.md 2.18; only once there was one: the dict of before otherwise)
+            d.set_item("game_panics", s.game_panics)?;
         }
         if s.look.decisions > 0 {
             // the lookahead seats' counters (docs/search.md 3.9; only a driver with lookahead decisions)
