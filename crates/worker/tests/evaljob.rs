@@ -215,3 +215,61 @@ fn network_against_a_bot_and_refusals() {
     assert!(EvalSeat::parse(&json!({"net": 1, "bot": "x"})).is_err());
     assert_eq!(EvalSeat::parse(&json!({"net": 7})).unwrap(), EvalSeat::Net(7));
 }
+
+/// `eval_trace` (docs/az.md 50): every row is the untraced row plus `digest` and `rec`; tracing changes no game; each
+/// record replays to its row's result from its game's seed (`record::game_seed` of the lease's seed and its gid,
+/// paired); the digest is the SHA-256 of the record's sorted-key compact JSON; a lease's traced rows are the whole
+/// match's; a bad value is refused.
+#[test]
+fn traced_rows_are_the_rows_plus_their_records() {
+    use zero_search::record::{game_seed, replay_json};
+    use zero_search::toy::ToyGame;
+    let (a, b, c) = (tmp("untraced"), tmp("traced"), tmp("traced-tail"));
+    let mut jt = job(&b, 10, 0, nets());
+    let mut s: Value = serde_json::from_str(&settings().raw.dumps()).unwrap();
+    s["eval_trace"] = json!(1);
+    jt.settings = Settings::from_value(&s).unwrap();
+    let (oa, _) = run(&job(&a, 10, 0, nets()), |_, _, _, _| {});
+    let (ob, _) = run(&jt, |_, _, _, _| {});
+    let mut jc = jt.clone();
+    jc.out_dir = c.clone();
+    jc.gid_base = 4;
+    jc.games = 6;
+    let (oc, _) = run(&jc, |_, _, _, _| {});
+    let (ra, rb, rc) = (rows(&oa).0, rows(&ob).0, rows(&oc).0);
+    assert_eq!(ra.keys().collect::<Vec<_>>(), rb.keys().collect::<Vec<_>>());
+    for (g, line) in &rb {
+        let plain = ra[g].strip_suffix('}').unwrap();
+        assert!(line.starts_with(&format!("{plain},\"digest\":\"")), "game {g}: the untraced row, then digest and rec\n{line}\n{}", ra[g]);
+        let v: Value = serde_json::from_str(line).unwrap();
+        let rec = serde_json::to_string(&v["rec"]).unwrap();
+        assert!(line.ends_with(&format!(",\"rec\":{rec}}}")), "game {g}: rec is the last key, as written");
+        assert_eq!(v["digest"].as_str().unwrap(), &zero_worker::proto::sha256_hex(rec.as_bytes())[..16]);
+        assert_eq!(v["rec"]["gid"], json!(g));
+        assert_eq!(v["rec"]["seed"].as_u64().unwrap(), game_seed(31, *g, true), "game {g}: the game's seed");
+        let rp = replay_json::<ToyGame>("{}", &rec, false).unwrap_or_else(|e| panic!("game {g}: {e}"));
+        let res: Vec<f64> = v["result"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        assert_eq!(rp.result.iter().map(|&x| x as f64).collect::<Vec<_>>(), res, "game {g}: the replay's result is the row's");
+        assert_eq!(rp.rounds as u64, v["rounds"].as_u64().unwrap());
+        assert!(rp.records.is_empty(), "an eval game records no samples");
+        // a tampered move is refused
+        let mut bad = v["rec"].clone();
+        let steps = bad["steps"].as_array_mut().unwrap();
+        if let Some(Value::Number(n)) = steps.first().cloned() {
+            steps[0] = json!(n.as_u64().unwrap() + 1000);
+            assert!(replay_json::<ToyGame>("{}", &serde_json::to_string(&bad).unwrap(), false).is_err(), "game {g}: a bad move replays");
+        }
+    }
+    for (g, line) in &rc {
+        assert_eq!(&rb[g], line, "game {g}: a lease's traced row == the whole match's");
+    }
+    let mut s2 = s.clone();
+    s2["eval_trace"] = json!("yes");
+    let mut jbad = jt.clone();
+    jbad.settings = Settings::from_value(&s2).unwrap();
+    jbad.out_dir = tmp("traced-bad");
+    let ctl = Control::default();
+    let ev = Events::default();
+    let e = run_eval_job(&TOY, &jbad, &ctl, &ev, Arc::new(Mutex::new(Progress::default())), &|_| {}).err().unwrap();
+    assert!(e.contains("eval_trace"), "{e}");
+}

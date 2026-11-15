@@ -158,6 +158,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
 | `sparse` | 0 | 1 = the run's drivers (self-play and matches) send sparse network batches (each row's non-zero features; docs/search.md 2.2): the same rows, games and samples; a token network's CUDA graphs scatter them on the device, other evaluators densify them (10.7) |
 | `eval_cache` | 0 | N > 0 = every network seat (self-play and evaluation) keeps its game's network answers, at most N per game, by a hash of each row's features and options, and answers a repeated row from them instead of sending it (docs/search.md 3.12; the same answers up to float rounding at another batch shape) (25) |
+| `eval_trace` | 0 | 1 = a native eval job's rows carry each game's record and its digest (zero-farm analysis campaigns: every real move, replayed on the desktop); the Python match refuses it; games unchanged (50) |
 | `resolver` | '' | co-training (section 11): the resolver game, whose episodes decide this game's deferred terminals ('' = a single-game run: this loop, line for line) |
 | `resolver_cfg` | {} | the resolver's settings (a JSON object of these same settings: spec, players, network, search, training, evaluation; `preset` names one), saved nested in config.json; resolved into `<run>/resolver/config.json` |
 | `resolver_init` | '' | the checkpoint the resolver's network starts from ('' = fresh); a single-game run's checkpoint works (widened if the game grew) |
@@ -7629,3 +7630,78 @@ STOP -> 'stopped', it stays up and sees the run paused then goes on to 'finished
 and the run finishes, a companion exiting 3 is restarted 3 times then given up loudly, `{}` = none, a new supervisor
 stops the companion a killed one left, `supervisor_end`'s states, the hook's validation; `test_loop.py`'s and
 `test_run_infra.py`'s supervisor tests unchanged.
+
+## 50. Traced eval games: an eval job's rows carry their records (`eval_trace`; zero-farm analysis campaigns, 2026-11-15)
+
+**Why.** Analyses of play (how often a sideboard card is cast, what a checkpoint does in a spot, a head-to-head's
+games) need every move of every game, and so far they ran on the desktop beside the live run. zero-farm's eval jobs
+(44.2) already play fixed networks on friends' PCs, but report only one result row per game. With the game's record
+on its row, the desktop gets the moves for the price of a replay (milliseconds a game), and can check the farm's
+games by replaying them.
+
+**What.** The run setting `eval_trace` (default 0) is read by an eval job only (`settings::EVAL_READS`; class
+`trainer` for self-play, so a pool's template never carries it). On, `zero_worker::evaljob` traces its driver's
+games (`Driver::set_trace`, docs/search.md 2.17: the eval lease's driver is rolling, so it can; tracing changes no
+game) and each result row gains two keys after `over`:
+
+* `digest`: the first 16 hex of the SHA-256 of the record's compact JSON with its keys sorted (serde_json's text of the
+  record, which has sorted keys and no floats; Python's `json.dumps(rec, sort_keys=True, separators=(',', ':'),
+  ensure_ascii=False)` is the same text: `zero.farm_eval.trace_digest`);
+* `rec`: the game's record (`zero_search::record::game_json` without samples - gid, players, the game's seed
+  `record::game_seed(seed, gid, paired)`, every real move, over / aborted / resigned, the result and margins as f32
+  bits, rounds, the game's setup record; a chained contest's episodes).
+
+A value that is not a bool or a number is refused (`settings::eval_trace_of`). Off, the rows are byte for byte what
+they were. A Python match (`zero.farm_eval.match_driver`) refuses it: traced rows are the native worker's.
+
+The desktop side (`zero.farm_eval`): `trace_digest(rec)`; `check_digest(row)` (the row is traced, its record is its
+game and hashes to its digest); `replay_trace(row, game, spec, engine, seed, paired)` - the record replayed through
+the game's engine (`replay_rows`: every move legal, the result, margins, rounds and setup the record's), its seed the
+lease's game seed, the replayed result, rounds and `over` the row's, no samples (with `samples=True`, a self-play record: its samples replayed and checked too, `aux` as its file's header says - the farm's play jobs with search samples); `TraceMismatch` on any difference;
+`games_digest(rows)` - SHA-256 over `gid:digest` lines in gid order, first 16 hex: a set of games has one digest
+however it was cut into leases and whoever played it.
+
+**Costs.** None while off. On: a Delver best-of-one record is ~2-3 KB of JSON (250-350 moves and the two decks), so a
+10-game lease file grows from ~2 KB to ~25 KB; tracing itself is a push per real move.
+
+**Tests.** zero_worker `traced_rows_are_the_rows_plus_their_records` (toy, paired: every traced row is the untraced
+row plus `digest` and `rec`, the digest the SHA-256 of the record's text, each record's seed its game's, each record
+replays to its row's result and rounds with no samples, a tampered move refused, a lease's traced rows the whole
+match's, a bad value refused); `tests/test_farm_trace.py` (Python's digest equals serde_json's text hashed, rows replay,
+the games' digest ignores order, tampered digest / move / seed / result refused, a Python match refuses the setting);
+`test_worker_settings.py` (the table classifies it, EVAL_READS = what the match reads).
+
+**Measured** (2026-11-15, the desktop, MTG Zero's mtgz-worker on the Delver run pb2's checkpoints 96 vs 0 at 64
+simulations, 4 threads): 4 traced paired games in 285 s; 252-332 moves each; replay and check of all 4 well under a
+second; a record described move by move (the engine's view, each option in words) in 0.07 s.
+
+## 51. The live-run fence: process-churning tests skip beside a live run (`runctl.live_supervisors`, the `live_run_hazard` mark; MTG Zero's migration phase 0, 2026-11-15)
+
+**Why.** On 2026-11-14 a supervisor-test storm (~1,000 short-lived processes from `tests/test_run_infra.py` and a
+crash-loop repro) recycled a live run's parent pid on the desktop, and a test supervisor's orphan sweep killed the live
+run's whole tree (47.2). The sweep's creation-time check (76c548f) fixed that path; this keeps the whole class of tests
+- the ones that start real supervisors or churn processes - away from a machine with a live run.
+
+**What.** `zero.runctl.live_supervisors()` lists the supervisors running on this machine (one process scan, a few
+seconds on Windows): any Python process whose program is a `tools/supervise.py` (any game's copy) or
+`-m zero.tools.supervise`; a tool that merely passes `--supervised` (a companion) is not one. `live_run_fence_reason()`
+says why the fence is up (None when it is down); `fence_items(config, items)` is the conftest hook's body: every
+collected test marked `@pytest.mark.live_run_hazard` is skipped with that reason, which starts `live-run fence:` (MTG
+Zero's `tools/gate.py` counts those in pytest's `-rs` lines and names them in a gate's final line as skips). The scan
+runs only when a marked test was collected. Overrides: `ZERO_ALLOW_LIVE_RUN_HAZARD=1` runs the marked tests anyway (a
+quiet machine where the only "live" supervisor is your own), `ZERO_LIVE_RUNS=0` / `1` replaces the scan (tests). The fence is
+Windows-only by default (`ZERO_LIVE_RUN_FENCE=1` puts it up on any platform, `0` never): the hazard is Windows's (a
+dead parent's pid kept as the parent pid and recycled), while macOS and Linux re-parent orphans - and the Mac hosts
+other projects' long runs (a St. Pete Zero supervisor 34 days old on 2026-11-15) yet is where MTG Zero's gate runs
+these tests beside a live desktop run.
+
+**Marked.** `tests/test_companion.py`: every test that starts `tools/supervise.py` (9); `test_run_infra.py`: the orphan
+sweep and the same-crash give-up; `test_loop.py`: the supervisor with a fake run, the stall watchdog, `kill_run`;
+`test_encoding_guard.py`: the supervisor that does not restart a refused run. A new test that starts a supervisor or
+spawns processes in a loop gets the mark (`tests/test_live_fence.py` checks the supervisor tests carry it).
+
+**Off by default?** Nothing changes for a run, a game or a machine without a live supervisor: the tests run as before.
+**Tests.** `tests/test_live_fence.py`: which command lines are supervisors, the overrides and the reason, only marked
+items fenced and only beside a live run (no scan without a marked item), the marks present. Checked by hand on the
+desktop beside delver-bo3-pb2: the orphan-sweep test is skipped with the reason naming the two live runs, and passes
+with `ZERO_LIVE_RUNS=0`.
