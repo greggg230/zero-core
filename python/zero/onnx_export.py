@@ -1438,7 +1438,11 @@ REFERENCE_TOL = 2e-5
 def reference_rows(rows_list, n):
     """`n` real rows of recorded batch files (`onnx_parity.Rows`): whole recorded batches spread over the
     files (every k-th batch first, then the others; rows with tail tokens or pointer overrides: the batches holding
-    overrides first, then those holding tail tokens - a stable order), the last one cut to make `n` -> (Rows, batch_off)."""
+    overrides first, then those holding tail tokens - a stable order), the last one cut to make `n` -> (Rows, batch_off).
+    Every kind of row the self-test must answer that the files hold is in: the first batch (in that order) holding an
+    override, one holding a belief row and one holding a tail token come first - before, the override and tail
+    batches could fill the `n` rows without a belief row, and write_reference refused a network with an auxiliary
+    head (the farm pool's export of delver-bo3-pb2's gen 40, 2026-11-14; docs/az.md 46.9)."""
     from .onnx_parity import cat
     batches = []
     for ri, rows in enumerate(rows_list):
@@ -1461,6 +1465,20 @@ def reference_rows(rows_list, n):
     if any(r.tail is not None or r.ov is not None for r in rows_list):
         # (zero-onnx/2's self-test must answer tail tokens and overrides: the batches holding them first)
         order = sorted(order, key=lambda b: lacks(*b))
+    from .protocol import ROW_BELIEF
+
+    def holds(ri, a, b):
+        """(override, belief row, tail token) held by a batch."""
+        r = rows_list[ri]
+        no_ov, no_tail = lacks(ri, a, b)
+        return (not no_ov, r.extra is not None and bool((np.asarray(r.extra[a:b]) == ROW_BELIEF).any()), not no_tail)
+    first = []
+    for k in range(3):
+        if not any(holds(*c)[k] for c in first):
+            hit = next((c for c in order if holds(*c)[k]), None)
+            if hit is not None and hit not in first:
+                first.append(hit)
+    order = first + [c for c in order if c not in first]
     parts, offs, got = [], [0], 0
     for ri, a, b in order:
         if got >= n:

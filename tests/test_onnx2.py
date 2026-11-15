@@ -362,6 +362,23 @@ def test_reference_set_with_tails_and_overrides(tmp_path):
         OX.write_reference(net, [none], str(tmp_path / 'x.npz'), 80)
 
 
+def test_the_reference_rows_hold_a_belief_row_when_the_files_do():
+    """reference_rows takes one batch of each kind the self-test answers first - an override, a belief row, a tail
+    token - before the rest: rows whose only belief rows sit in the last batch still give a reference set with one
+    (before, the override and tail batches filled it: write_reference refused a network with an auxiliary head - the
+    farm pool's export of delver-bo3-pb2's gen 40, docs/az.md 46.9)."""
+    net = rand_net(OFFERS, seed=4)
+    B = 200
+    kinds = np.full(B, ROW_LEAF, np.uint8)
+    kinds[176:180] = ROW_BELIEF                    # belief rows in the last batch only
+    rows = gate_rows(net, toy_batch(B, seed=6, p_tail=0.1, p_mark=0.1, p_gen=0.05, p_offer=0.1), kinds)
+    rows.batch_off = np.array([0, 40, 90, 130, 170, 200], np.int64)
+    got, bo = OX.reference_rows([rows], 80)
+    st = got.tail_stats()
+    assert int((got.extra == ROW_BELIEF).sum()) == 4 and st['overrides'] > 0 and st['tail_tokens'] > 0
+    assert int(bo[-1]) == 80
+
+
 def test_new_tail_segments_need_no_code_change(tmp_path):
     """Tail segments past layout v7's (docs/az.md 46.7): `toy_tail_wide` - toy_tail plus 20 gated tail-only segments
     x02 .. x21, more tail segments than MTG Zero's v7 and indices past its highest - exports, plays through

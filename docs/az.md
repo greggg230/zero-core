@@ -7293,6 +7293,19 @@ zero-onnx/1 on DirectML stays allowed (9 of 9 self-tests passed). Lifting the re
 override batches on both adapters. Test: `session::tests::directml_is_refused_for_zero_onnx_2_only` (the refusal, its
 skip form and the probe's result entry).
 
+### 46.9 A reference set holds every kind of row the self-test answers (farm-int, 2026-11-14)
+
+**Why.** `reference_rows` ordered the recorded batches with overrides first, then tail tokens, and cut at `n`. Real
+batches of a layout v7 run hold tail tokens nearly everywhere, so the batches holding overrides and tails could fill the
+256 rows without a single belief row, and `write_reference` refused a network with an auxiliary head ("the 256
+reference rows hold no belief row"). The farm pool of MTG Zero's delver-bo3-pb2 exported gens 36-39 and then failed on
+gen 40, retrying the whole export (a few minutes of CPU self-play in `farm_h2h.record_rows`) every time: no new
+generation reached the farm.
+
+**What.** The first batch (in the existing order) holding an override, the first holding a belief row and the first
+holding a tail token are taken before the rest. Nothing else changes: the same batches when they already covered every
+kind. Test: `test_the_reference_rows_hold_a_belief_row_when_the_files_do` (belief rows only in the last batch).
+
 ## 47. The run loop at its edges: the Fable review's fixes (2026-11-12)
 
 (Numbered 46 on its branch `fix/core-infra-1112` and in that branch's commit messages; renumbered 47 when it was merged
