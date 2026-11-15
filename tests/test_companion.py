@@ -124,6 +124,7 @@ sys.exit(subprocess.run([sys.executable] + sys.argv[1:]).returncode)
 '''
 
 
+@pytest.mark.live_run_hazard
 @pytest.mark.parametrize('launcher', [False, True])
 def test_one_companion_across_a_crash_and_it_ends_finished(tmp_path, launcher):
     """The run crashes once and is restarted: the same companion goes on (one per run); the run finishes: the
@@ -147,6 +148,7 @@ def test_one_companion_across_a_crash_and_it_ends_finished(tmp_path, launcher):
     assert (run / 'fakepub_console.txt').exists()
 
 
+@pytest.mark.live_run_hazard
 def test_stop_ends_the_companion_stopped(tmp_path):
     run = _run(tmp_path, 'until-stop')
     sup = subprocess.Popen([sys.executable, 'tools/supervise.py', str(run)], cwd=ROOT, env=_env(tmp_path))
@@ -161,6 +163,7 @@ def test_stop_ends_the_companion_stopped(tmp_path):
     assert runctl.read_state(str(run), 'supervisor')['ended'] == 'stopped'
 
 
+@pytest.mark.live_run_hazard
 def test_the_companion_stays_up_while_the_run_is_paused(tmp_path):
     """PAUSE: the run exits 75, the supervisor waits, the companion stays (it sees the run paused); resumed, the same
     companion goes on to the run's end."""
@@ -188,6 +191,7 @@ def _kill_runs(run):
         psutil.Process(rs['pid']).kill()
 
 
+@pytest.mark.live_run_hazard
 def test_a_killed_supervisor_leaves_a_companion_that_ends_itself_stopped(tmp_path):
     run = _run(tmp_path, 'forever')
     sup = subprocess.Popen([sys.executable, 'tools/supervise.py', str(run)], cwd=ROOT, env=_env(tmp_path))
@@ -203,6 +207,7 @@ def test_a_killed_supervisor_leaves_a_companion_that_ends_itself_stopped(tmp_pat
         _kill_runs(run)
 
 
+@pytest.mark.live_run_hazard
 def test_kill_run_spares_the_companion_which_ends_itself_stopped(tmp_path):
     run = _run(tmp_path, 'forever')
     env = _env(tmp_path)
@@ -220,6 +225,7 @@ def test_kill_run_spares_the_companion_which_ends_itself_stopped(tmp_path):
         _kill_runs(run)
 
 
+@pytest.mark.live_run_hazard
 def test_a_companion_that_cannot_start_is_loud_and_the_run_goes_on(tmp_path):
     run = _run(tmp_path, 'finish')
     env = _env(tmp_path, companion={'name': 'nopub', 'cmd': [str(tmp_path / 'no-such-program.exe')]})
@@ -231,6 +237,7 @@ def test_a_companion_that_cannot_start_is_loud_and_the_run_goes_on(tmp_path):
     assert 'COMPANION NOT STARTED (nopub): its command failed' in (run / 'supervisor.log').read_text()
 
 
+@pytest.mark.live_run_hazard
 def test_a_companion_that_keeps_exiting_is_restarted_three_times_then_given_up(tmp_path):
     run = _run(tmp_path, 'until-stop')
     sup = subprocess.Popen([sys.executable, 'tools/supervise.py', str(run)], cwd=ROOT,
@@ -248,6 +255,7 @@ def test_a_companion_that_keeps_exiting_is_restarted_three_times_then_given_up(t
     assert 'exited with code 3 4 times within an hour' in log and 'COMPANION NOT STARTED (fakepub)' in err
 
 
+@pytest.mark.live_run_hazard
 def test_none_means_no_companion_and_the_run_as_before(tmp_path):
     run = _run(tmp_path, 'finish')
     sup = subprocess.run([sys.executable, 'tools/supervise.py', str(run)], cwd=ROOT, env=_env(tmp_path, companion={}),
@@ -257,6 +265,7 @@ def test_none_means_no_companion_and_the_run_as_before(tmp_path):
     assert 'companion fakepub' not in log and 'COMPANION' not in log
 
 
+@pytest.mark.live_run_hazard
 def test_a_new_supervisor_stops_the_companion_a_killed_one_left(tmp_path):
     run = _run(tmp_path, 'finish')
     left = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])

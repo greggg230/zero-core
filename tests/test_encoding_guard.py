@@ -199,6 +199,7 @@ def test_optimizer_state_of_another_network_is_not_loaded():
 
 
 # ---------------------------------------------------------------- runs
+@pytest.mark.live_run_hazard
 def test_run_resume_refuses_exits_78_and_the_supervisor_does_not_restart(v4, tmp_path):
     tok, _ = v4
     run = tmp_path / 'v4run'
