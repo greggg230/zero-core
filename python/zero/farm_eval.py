@@ -13,6 +13,11 @@ A result row (one JSON line per game, `row_json`): `{"gid", "pair", "seats", "re
 "over"}` - `pair` gid // 2 (None unpaired), `seats` that game's seats in its order, `result` per seat in that
 order, `margin` seat 0's score minus the best other seat's, `json.dumps(row, separators=(',', ':'))`.
 
+Traced rows (the eval setting `eval_trace`, docs/az.md 50; zero-farm analysis campaigns): each row also carries
+`digest` (`trace_digest` of its record) and `rec` (the game's record, zero-core docs/search.md 2.17: seed, every real
+move, result, margins, rounds, setup) - `replay_trace` plays it back through the game's engine (`replay_rows`) and
+checks it against the row. Only the native worker writes them (a Python match refuses the setting).
+
 `h2h_rows` turns rows into zero.h2h's (A in seat gid % 2) so `zero.h2h.summary` reads a farm head-to-head
 exactly as a local one; `elo_interval` is the 95% interval of the Elo difference.
 """
@@ -71,6 +76,9 @@ def match_driver(cfg, seats, games, seed, paired=True):
     """`Run.play_match`'s driver for `games` games (ids 0..games) of the match between `seats` at settings
     `cfg` (the eval job's: `job_cfg`). The evaluators: one per network seat key ('m' seats[0], 'o' seats[1])."""
     from . import run as R
+    if cfg.get('eval_trace'):
+        raise ValueError('eval_trace: traced rows are the native worker\'s (zero_worker evaljob); a Python match '
+                         'plays the same games untraced (tracing changes no game, docs/search.md 2.17)')
     if not cfg.get('eval_spec'):
         raise ValueError('eval_spec is unset: resolve it first (resolve_eval_spec): a worker cannot run the game '
                          'package\'s eval_specs hook')
@@ -97,6 +105,71 @@ def row(r, seats, paired):
     return {'gid': g, 'pair': g // 2 if paired else None, 'seats': seats_of(seats, g),
             'result': [float(x) for x in r['result']], 'margin': margin, 'rounds': int(r['rounds']),
             'over': bool(r['over'])}
+
+
+def trace_digest(rec):
+    """A game record's digest (docs/az.md 50): the first 16 hex of the SHA-256 of its compact JSON with sorted keys
+    (`zero_worker::evaljob::traced_row_json` hashes serde_json's text of the same object, which is this text)."""
+    import hashlib
+    text = json.dumps(rec, sort_keys=True, separators=SEP, ensure_ascii=False)
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+
+
+def games_digest(rows):
+    """The digest of a set of traced games (a lease's, a campaign's): SHA-256 over 'gid:digest' lines in gid order,
+    first 16 hex - the same games give the same digest whoever played them and however they were cut into leases."""
+    import hashlib
+    h = hashlib.sha256()
+    for r in sorted(rows, key=lambda r: int(r['gid'])):
+        h.update(f"{int(r['gid'])}:{r['digest']}\n".encode())
+    return h.hexdigest()[:16]
+
+
+class TraceMismatch(ValueError):
+    """A traced row that its own record does not support (a wrong digest, or a replay that refuses it)."""
+
+
+def check_digest(row):
+    """A traced row's `digest` is its record's (`trace_digest`) and the record is this game's (gid) -> the row;
+    TraceMismatch otherwise."""
+    rec = row.get('rec')
+    if not isinstance(rec, dict) or not isinstance(row.get('digest'), str):
+        raise TraceMismatch(f'game {row.get("gid")}: not a traced row (no rec / digest: eval_trace off?)')
+    if rec.get('gid') != row.get('gid'):
+        raise TraceMismatch(f'game {row.get("gid")}: its record is game {rec.get("gid")}')
+    d = trace_digest(rec)
+    if d != row['digest']:
+        raise TraceMismatch(f'game {row["gid"]}: digest {row["digest"]} but its record hashes to {d}')
+    return row
+
+
+def replay_trace(row, game, spec, engine, seed, paired=True):
+    """Replay a traced row's record through the game's engine (`engine.replay_rows(game, spec, record)`, zero-core
+    docs/search.md 2.17: every move legal, the result, margins, rounds and setup the record's) and check it against
+    the row: the game's seed is `game_seed_of(seed, gid, paired)` (the lease's base seed), the replayed result is the
+    row's (seat order of the row) and the record has no samples (an eval game records none) -> the replay's facts;
+    TraceMismatch on any difference."""
+    import struct
+    check_digest(row)
+    rec = row['rec']
+    g = int(row['gid'])
+    want = engine.game_seed_of(int(seed), g, bool(paired))
+    if rec.get('seed') != want:
+        raise TraceMismatch(f'game {g}: record seed {rec.get("seed")}, the campaign\'s game seed is {want}')
+    try:
+        samples, info = engine.replay_rows(game, spec, json.dumps(rec, separators=SEP), False)
+    except ValueError as e:
+        raise TraceMismatch(f'game {g}: the replay refuses its record: {e}') from None
+    if samples is not None or info.get('rows'):
+        raise TraceMismatch(f'game {g}: its record has samples (an eval game records none)')
+    f32 = lambda bits: struct.unpack('<f', struct.pack('<I', int(bits) & 0xffffffff))[0]
+    rres = [float(f32(b)) for b in rec.get('result') or []]
+    if rec.get('over') and [float(x) for x in row['result']] != rres:
+        raise TraceMismatch(f'game {g}: row result {row["result"]}, record result {rres}')
+    if bool(rec.get('over')) != bool(row.get('over')) or int(rec.get('rounds', -1)) != int(row.get('rounds', -2)):
+        raise TraceMismatch(f'game {g}: row over/rounds {row.get("over")}/{row.get("rounds")}, record '
+                            f'{rec.get("over")}/{rec.get("rounds")}')
+    return info
 
 
 def row_json(d):
