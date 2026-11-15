@@ -16,7 +16,8 @@ State files, written atomically and read by the dashboard and tools/pause_run.py
 * <run>/run_state.json        - the run process: pid, started (process creation time),
   state (running | pausing | paused | done | aborted | refused), since, and the pause timings
 * <run>/supervisor_state.json - tools/supervise.py: pid, started, state (running | paused |
-  resuming | restarting | done | refused), run_pid, since
+  resuming | restarting | done | refused), run_pid, since; at a terminal state `ended` (finished | stopped |
+  refused | gave_up) and, with a companion process (docs/az.md 49), `companion` / `companion_error`
 
 `run_status(run)` combines them with the control files and the processes' liveness into one
 state: running / pausing / paused / resuming / starting / restarting / stopping / stopped
@@ -223,6 +224,44 @@ def run_status(run):
                   }.get(rst, 'No run process (killed or crashed).')
     out.update(state=st, detail=detail)
     return out
+
+
+# ------------------------------------------------------------------ a companion's end (docs/az.md 49)
+
+# the supervisor's terminal states and how it ended (supervisor_state.json `ended`): 'finished' (the run reached its
+# last iteration), 'stopped' (STOP, the supervisor ended or interrupted), 'refused' (the run refused its checkpoint),
+# 'gave_up' (the same crash again and again)
+SUPERVISOR_DONE = ('done', 'refused')
+COMPANION_ENV = ('ZERO_SUPERVISOR_PID', 'ZERO_SUPERVISOR_STARTED', 'ZERO_COMPANION_RUN')
+
+
+def supervisor_end(run=None, pid=None, started=None):
+    """For a companion process the supervisor started (zero.tools.supervise, docs/az.md 49): None while its
+    supervisor goes on (the run running, paused, restarting), else how the run ended - the supervisor's `ended`
+    ('finished', 'stopped', 'refused', 'gave_up') once it wrote a terminal state, 'stopped' when the supervisor is
+    gone without one (killed: its process no longer exists) or another supervisor took the run over. `run`, `pid`,
+    `started`: default the environment the supervisor gives its companion (ZERO_COMPANION_RUN, ZERO_SUPERVISOR_PID,
+    ZERO_SUPERVISOR_STARTED: the supervisor's pid and process creation time)."""
+    run = run or os.environ.get(COMPANION_ENV[2])
+    pid = int(pid if pid is not None else os.environ.get(COMPANION_ENV[0]) or 0)
+    if started is None and os.environ.get(COMPANION_ENV[1]):
+        started = float(os.environ[COMPANION_ENV[1]])
+    if not run or not pid:
+        raise ValueError('supervisor_end: no run / supervisor pid (not started by a supervisor?)')
+
+    def ended():
+        st = read_state(run, 'supervisor') or {}
+        if st.get('pid') == pid and st.get('state') in SUPERVISOR_DONE:
+            return st.get('ended') or 'stopped'
+        if st.get('pid') not in (None, pid):
+            return 'stopped'                       # another supervisor's run now
+        return None
+    e = ended()
+    if e:
+        return e
+    if not alive({'pid': pid, 'started': started}):
+        return ended() or 'stopped'                # (a terminal state written just before it exited wins)
+    return None
 
 
 # ------------------------------------------------------------------ the run process's watch

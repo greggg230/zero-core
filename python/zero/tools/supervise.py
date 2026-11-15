@@ -28,6 +28,18 @@
   pick a limit well above the longest of those (e.g. 3600).
 A STOP file left over from an earlier stop is moved to STOP.old when the supervisor starts
 (starting it again means: run); a PAUSE file is kept (the run stays paused until it goes).
+* a companion process (docs/az.md 49; the game package's `companion` hook, e.g. MTG Zero's delverai publisher,
+  or <P>_SUPERVISE_COMPANION: a JSON {name, cmd, log, env}, tests): started from the game repo's root when the run
+  has written its config.json (asked again at every start of the run: the same command keeps the running one, a
+  changed command restarts it, None stops it), hidden and below normal priority, its console in <run>/<log>; one per
+  run across the run's restarts, crashes and pauses (it stays up while the run is paused); one that exits while the
+  run goes on is started again, at most 3 times an hour. The supervisor's terminal state says how the run ended
+  (`ended` in supervisor_state.json: finished / stopped / refused / gave_up) - the companion reads it
+  (runctl.supervisor_end), does its last work and exits; the supervisor waits for it (<P>_SUPERVISE_COMPANION_WAIT
+  seconds after a finished run, 3600; <P>_SUPERVISE_COMPANION_STOP_WAIT otherwise, 120) and then kills it. A
+  companion that cannot start (its hook raises, its command fails) is logged loudly (COMPANION NOT STARTED) and the
+  run goes on: deliberately no reason to stop training. A companion left by an earlier supervisor of the run (one
+  killed abruptly: its companion notices that and exits by itself) is stopped when a new supervisor starts.
 The run's console output goes to <run>/stdout.txt in UTF-8. Logs to <run>/supervisor.log;
 its state (for the dashboard) is in <run>/supervisor_state.json. The environment variables use
 the game package's prefix (GRZ_, CVZ_; the core: ZERO_): <P>_SUPERVISE_WAIT /
@@ -94,17 +106,25 @@ def last_activity(run, since):
     return t
 
 
-def wait_run(run, p, stall_s):
+def wait_run(run, p, stall_s, tick=None, tick_s=5.0):
     """Wait for the run process `p` to exit -> its exit code. With stall_s > 0 a run without
-    progress for stall_s seconds (no PAUSE requested) is killed with its children first."""
-    if stall_s <= 0:
+    progress for stall_s seconds (no PAUSE requested) is killed with its children first. `tick()`: called every
+    `tick_s` seconds meanwhile (the companion's care)."""
+    if stall_s <= 0 and tick is None:
         return p.wait()
     t0 = time.time()
+    step = min(max(stall_s / 10, 0.05), 30) if stall_s > 0 else 30
+    if tick is not None:
+        step = min(step, tick_s)
     while True:
         try:
-            return p.wait(timeout=min(max(stall_s / 10, 0.05), 30))
+            return p.wait(timeout=step)
         except subprocess.TimeoutExpired:
             pass
+        if tick is not None:
+            tick()
+        if stall_s <= 0:
+            continue
         idle = time.time() - last_activity(run, t0)
         if idle > stall_s and not runctl.pause_requested(run):
             log(run, f'stall watchdog: no progress for {ago(idle)} (limit {ago(stall_s)}): killing pid {p.pid}')
@@ -128,9 +148,10 @@ def crash_key(run, pid):
     return re.sub(r'[-+]?\d*\.\d+(?:[eE][-+]?\d+)?', '#', str(st['error']))
 
 
-def wait_resume(run, poll_s):
+def wait_resume(run, poll_s, tick=None):
     """The run is paused: wait until its PAUSE file is removed -> True (relaunch now), or
-    False if a STOP file appears meanwhile (the supervisor ends; the run stays paused)."""
+    False if a STOP file appears meanwhile (the supervisor ends; the run stays paused). `tick()`: called at every
+    poll (the companion's care: it stays up while the run is paused)."""
     pause = runctl.pause_path(run)
     t0 = time.time()
     since = runctl.pause_since(run) or t0
@@ -139,12 +160,189 @@ def wait_resume(run, poll_s):
         if runctl.stop_requested(run):
             log(run, 'STOP file present while paused: supervisor done (the run stays paused; relaunching the '
                      'supervisor waits for PAUSE to be removed)')
-            runctl.write_state(run, 'supervisor', state='done')
+            runctl.write_state(run, 'supervisor', state='done', ended='stopped')
             return False
+        if tick is not None:
+            tick()
         time.sleep(poll_s)
     log(run, f'PAUSE removed after {ago(time.time() - since)} paused: resuming the run')
     runctl.write_state(run, 'supervisor', state='resuming')
     return True
+
+
+def kill_tree(pid):
+    """Kill process `pid` and its descendants -> True if it was there."""
+    try:
+        p = psutil.Process(pid)
+        for k in p.children(recursive=True):
+            try:
+                k.kill()
+            except psutil.NoSuchProcess:
+                pass
+        p.kill()
+        return True
+    except psutil.NoSuchProcess:
+        return False
+
+
+class Companion:
+    """The run's companion process (docs/az.md 49): at most one, kept across the run's restarts.
+
+    `sync(cfg)` at every start of the run (its config.json written): starts it, keeps it (the same command), restarts
+    it (another command) or stops it (none); `check()` while the run goes on or is paused: one that exited is started
+    again (at most `restarts` times an hour); `finish(ended, wait_s)` when the supervisor ends: the companion reads the
+    supervisor's terminal state and exits by itself - waited for, then killed. Its pid and creation time are in the
+    supervisor's state (`companion`), so a new supervisor stops one that an abruptly killed supervisor left."""
+
+    def __init__(self, run, pkg, restarts=3):
+        self.run = run
+        self.pkg = pkg
+        self.p = None
+        self.spec = None
+        self.out = None
+        self.restarts = restarts
+        self.deaths = []
+        self.gave_up = False
+        self.override = pkg.env('SUPERVISE_COMPANION')
+
+    def resolve(self, cfg):
+        """-> the companion spec for the run's settings `cfg`, or None; raises when the hook refuses."""
+        if self.override is not None:
+            spec = json.loads(self.override)
+            if not spec:
+                return None
+            name = str(spec.get('name') or 'companion')
+            return {'name': name, 'cmd': [str(x) for x in spec['cmd']], 'log': str(spec.get('log') or f'{name}_console.txt'),
+                    'env': {str(k): str(v) for k, v in (spec.get('env') or {}).items()}}
+        return self.pkg.companion_of(os.path.abspath(self.run), cfg)
+
+    def wanted(self):
+        """Whether this game package can have a companion at all (a hook, or the environment's override): without
+        one the supervisor waits for the run as before."""
+        return self.pkg.companion is not None or self.override is not None
+
+    def alive(self):
+        return self.p is not None and self.p.poll() is None
+
+    def _state(self):
+        runctl.write_state(self.run, 'supervisor', companion=(
+            {'name': self.spec['name'], 'pid': self.p.pid, 'started': runctl._proc_started(self.p.pid),
+             'cmd': self.spec['cmd']} if self.alive() else None))
+
+    def _start(self):
+        spec = self.spec
+        env = dict(os.environ, PYTHONIOENCODING='utf-8', **spec['env'])
+        env.update({runctl.COMPANION_ENV[0]: str(os.getpid()),
+                    runctl.COMPANION_ENV[1]: repr(runctl._proc_started() or 0.0),
+                    runctl.COMPANION_ENV[2]: os.path.abspath(self.run)})
+        kw = {}
+        if os.name == 'nt':
+            # hidden (no console window) and below normal priority: the run comes first
+            kw['creationflags'] = 0x08000000 | 0x00004000      # CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
+        else:
+            kw['preexec_fn'] = lambda: os.nice(10)
+        self.out = open(os.path.join(self.run, spec['log']), 'a', encoding='utf-8')
+        try:
+            self.p = subprocess.Popen(spec['cmd'], cwd=self.pkg.root, stdout=self.out, stderr=subprocess.STDOUT,
+                                      stdin=subprocess.DEVNULL, env=env, **kw)
+        except OSError as e:
+            self.out.close()
+            self.p = None
+            self.gave_up = True
+            self.loud(f'its command failed: {e!r}')
+            return False
+        log(self.run, f"companion {spec['name']} started: pid {self.p.pid}, console {spec['log']}: "
+                      f"{' '.join(spec['cmd'])}")
+        self._state()
+        return True
+
+    def loud(self, why):
+        """The companion could not start: said loudly (the log, the state, stderr); the run goes on."""
+        name = (self.spec or {}).get('name', 'companion')
+        log(self.run, f'COMPANION NOT STARTED ({name}): {why} - the run goes on without it (a companion is never '
+                      f'worth stopping the run for; docs/az.md 49)')
+        runctl.write_state(self.run, 'supervisor', companion=None, companion_error=f'{name}: {why}'[:1000])
+        print(f'supervise: COMPANION NOT STARTED ({name}): {why}', file=sys.stderr, flush=True)
+
+    def sync(self, cfg):
+        """The run (re)started with the settings `cfg`: the companion they ask for, running."""
+        try:
+            spec = self.resolve(cfg)
+        except Exception as e:                 # noqa: BLE001 - a refusing hook must not take the supervisor down
+            self.stop('its hook refused')
+            self.spec = None
+            self.loud(f'{type(e).__name__}: {e}')
+            return
+        except SystemExit as e:                # (a hook reusing a command line's refusal)
+            self.stop('its hook refused')
+            self.spec = None
+            self.loud(f'SystemExit: {e}')
+            return
+        if spec is None:
+            if self.alive():
+                self.stop('the run asks for none now')
+            self.spec = None
+            return
+        if self.alive() and spec['cmd'] == self.spec['cmd']:
+            return                             # one per run: the running one goes on
+        if self.alive():
+            self.stop('its command changed')
+        self.spec, self.deaths, self.gave_up = spec, [], False
+        runctl.write_state(self.run, 'supervisor', companion_error=None)
+        self._start()
+
+    def check(self):
+        """While the run goes on (or is paused): a companion that exited is started again, at most `restarts` times
+        an hour."""
+        if self.spec is None or self.p is None or self.gave_up or self.p.poll() is None:
+            return
+        code = self.p.returncode
+        self.out.close()
+        now = time.time()
+        self.deaths = [t for t in self.deaths if now - t < 3600] + [now]
+        if len(self.deaths) > self.restarts:
+            self.gave_up = True
+            self.loud(f'it exited with code {code} {len(self.deaths)} times within an hour (see {self.spec["log"]}): '
+                      f'not started again until the run restarts with another command for it')
+            return
+        log(self.run, f"companion {self.spec['name']} exited with code {code} while the run goes on: starting it again")
+        self._start()
+
+    def stop(self, why):
+        if not self.alive():
+            return
+        log(self.run, f"companion {self.spec['name']} pid {self.p.pid} stopped: {why}")
+        kill_tree(self.p.pid)
+        self.p.wait()
+        self.out.close()
+        self._state()
+
+    def finish(self, ended, wait_s):
+        """The supervisor ends (its terminal state, with `ended`, already written): wait up to `wait_s` seconds for
+        the companion to do its last work and exit, then kill it."""
+        if not self.alive():
+            return
+        name, pid = self.spec['name'], self.p.pid
+        log(self.run, f'waiting up to {ago(wait_s)} for companion {name} (pid {pid}) to end (the run: {ended})')
+        try:
+            code = self.p.wait(timeout=wait_s)
+            log(self.run, f'companion {name} ended with code {code}')
+        except subprocess.TimeoutExpired:
+            log(self.run, f'companion {name} pid {pid} still running after {ago(wait_s)}: killed')
+            kill_tree(pid)
+            self.p.wait()
+        self.out.close()
+        runctl.write_state(self.run, 'supervisor', companion=None)
+
+
+def stop_left_companion(run, st):
+    """A companion that an earlier supervisor of the run left (`st`: that supervisor's state, read before this one
+    writes its own) and that is still alive - that supervisor was killed and the companion has not noticed yet - is
+    stopped: a new one starts with the run."""
+    c = (st or {}).get('companion') or {}
+    if c.get('pid') and runctl.alive(c) and not runctl.alive(st):
+        kill_tree(int(c['pid']))
+        log(run, f"stopped companion {c.get('name')} pid {c['pid']} left by supervisor {st.get('pid')}")
 
 
 def main(argv=None):
@@ -163,10 +361,29 @@ def main(argv=None):
     extra = argv[1:]
     os.makedirs(run, exist_ok=True)
     keep_awake()
-    crashes = []
     log(run, f'supervisor {os.getpid()} starting: {run} {" ".join(extra)}; open-file limit '
              f'{runctl.raise_nofile() or "n/a"} (soft, hard)')
+    stop_left_companion(run, runctl.read_state(run, 'supervisor'))
     runctl.write_state(run, 'supervisor', state='starting', run_pid=None, args=extra)
+    comp = Companion(run, pkg)
+    ended = 'stopped'
+    try:
+        ended = supervise(run, extra, pkg, comp)
+    except BaseException as e:
+        # the supervisor itself failed or was interrupted (Ctrl+C): a terminal state for the companion to read
+        log(run, f'supervisor ended by {type(e).__name__}: {e}')
+        runctl.write_state(run, 'supervisor', state='done', run_pid=None, ended='stopped')
+        raise
+    finally:
+        wait = float(pkg.env('SUPERVISE_COMPANION_WAIT', 3600) if ended == 'finished'
+                     else pkg.env('SUPERVISE_COMPANION_STOP_WAIT', 120))
+        comp.finish(ended, wait)
+
+
+def supervise(run, extra, pkg, comp):
+    """The supervisor's loop -> how the run ended ('finished', 'stopped', 'refused', 'gave_up'), also written as the
+    terminal state's `ended`."""
+    crashes = []
     stop = os.path.join(run, 'STOP')
     if os.path.exists(stop):
         os.replace(stop, stop + '.old')
@@ -175,6 +392,7 @@ def main(argv=None):
     backoff_s = float(pkg.env('SUPERVISE_BACKOFF', 900))
     poll_s = float(pkg.env('SUPERVISE_POLL', 1))
     stall_s = float(pkg.env('SUPERVISE_STALL', 0))
+    tick_s = float(pkg.env('SUPERVISE_COMPANION_POLL', 5))
     same_n = int(float(pkg.env('SUPERVISE_SAME_CRASHES', 3)))
     last_key, same = None, 0
     cmd = json.loads(pkg.env('SUPERVISE_CMD')) if pkg.env('SUPERVISE_CMD') else \
@@ -185,37 +403,62 @@ def main(argv=None):
     core = os.path.join(package.CORE_ROOT, 'python')
     env = dict(os.environ, PYTHONIOENCODING='utf-8',
                PYTHONPATH=os.pathsep.join([core] + [p for p in [os.environ.get('PYTHONPATH')] if p]))
+
+    def done(state='done', **kw):
+        runctl.write_state(run, 'supervisor', state=state, run_pid=None, **kw)
+        return kw['ended']
+
     while True:
         if runctl.pause_requested(run):
             log(run, 'PAUSE file present: the run stays paused until it is removed')
-            if not wait_resume(run, poll_s):
-                return
+            if not wait_resume(run, poll_s, comp.check):
+                return 'stopped'
         out = open(os.path.join(run, 'stdout.txt'), 'a', encoding='utf-8')
         p = subprocess.Popen(cmd + ['--run', run] + extra, cwd=pkg.root, stdout=out, stderr=subprocess.STDOUT, env=env)
         log(run, f'started {name} pid {p.pid}')
         runctl.write_state(run, 'supervisor', state='running', run_pid=p.pid)
-        code = wait_run(run, p, stall_s)
+        synced = [False]
+
+        def tick():
+            # the companion follows the run's settings of this start: asked once the run has written its config.json
+            # (its state file names this process); then kept alive
+            if not synced[0]:
+                rs = runctl.read_state(run, 'run') or {}
+                if rs.get('pid') == p.pid:
+                    synced[0] = True
+                    try:
+                        with open(os.path.join(run, 'config.json'), encoding='utf-8') as f:
+                            cfg = json.load(f)
+                    except (OSError, ValueError) as e:
+                        comp.loud(f'the run\'s config.json unreadable: {e!r}')
+                        return
+                    comp.sync(cfg)
+                    return
+            comp.check()
+        code = wait_run(run, p, stall_s, tick if comp.wanted() else None, tick_s)
         out.close()
         killed = kill_orphans(p.pid)
         log(run, f'{name} exited with code {code}; killed {killed} orphaned workers')
+        if comp.wanted() and not synced[0]:
+            tick()                             # (a run that ended within the first poll: its companion all the same)
         if code == 0:
-            log(run, 'clean exit (finished or STOP file); supervisor done')
-            runctl.write_state(run, 'supervisor', state='done', run_pid=None)
-            return
+            if os.path.exists(stop):
+                log(run, 'clean exit (STOP file); supervisor done')
+                return done(ended='stopped')
+            log(run, 'clean exit (finished); supervisor done')
+            return done(ended='finished')
         if os.path.exists(stop):
             log(run, 'STOP file present; not restarting')
-            runctl.write_state(run, 'supervisor', state='done', run_pid=None)
-            return
+            return done(ended='stopped')
         if code == runctl.EXIT_REFUSED:
             log(run, f'the run REFUSED its checkpoint (exit code {code}: a network of another encoding than this '
                      f"build's, see log.txt; docs/az.md 10.4): not restarting, supervisor done")
-            runctl.write_state(run, 'supervisor', state='refused', run_pid=None)
-            return
+            return done('refused', ended='refused')
         if code == runctl.EXIT_PAUSED or runctl.pause_requested(run):
             log(run, f'run paused (exit code {code}): waiting for the PAUSE file to be removed '
                      f'(polling every {poll_s:g}s)')
-            if not wait_resume(run, poll_s):
-                return
+            if not wait_resume(run, poll_s, comp.check):
+                return 'stopped'
             continue
         key = crash_key(run, p.pid)
         same = same + 1 if key is not None and key == last_key else (1 if key is not None else 0)
@@ -224,15 +467,16 @@ def main(argv=None):
             err = (runctl.read_state(run, 'run') or {}).get('error', '')
             log(run, f'the same crash {same} times in a row ({err[:400]}): a deterministic failure, not restarting - '
                      f'supervisor done (fix the cause, then start the supervisor again; docs/az.md 47.2)')
-            runctl.write_state(run, 'supervisor', state='refused', run_pid=None, why=f'the same crash {same} times in a row',
-                               error=err[:1000])
-            return
+            return done('refused', why=f'the same crash {same} times in a row', error=err[:1000], ended='gave_up')
         now = time.time()
         crashes = [t for t in crashes if now - t < 3600] + [now]
         wait = backoff_s if len(crashes) >= 5 else wait_s
         log(run, f'crash #{len(crashes)} in the last hour; restarting in {wait}s')
         runctl.write_state(run, 'supervisor', state='restarting', run_pid=None, restart_at=now + wait)
-        time.sleep(wait)
+        t_end = time.time() + wait
+        while time.time() < t_end:             # (the companion stays cared for during the wait)
+            time.sleep(max(0.0, min(tick_s, t_end - time.time())))
+            comp.check()
 
 
 if __name__ == '__main__':

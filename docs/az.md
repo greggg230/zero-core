@@ -6381,3 +6381,57 @@ timing keys (`test_select_scale.py`).
 `test_shard_thread.py`.
 
 **Not measured here**: the live run's split (it needs a run on this commit; the GPU was busy with that run).
+
+## 49. The run's companion process: one per run, started and ended by the supervisor (`GamePackage.companion`, `on_fork`; MTG Zero's delverai publisher, 2026-11-14)
+
+**Why.** MTG Zero publishes each Delver run to its site with a publisher process. It was started by hand per run, ran
+until someone killed it, and on 2026-11-14 a new run had none at all until the user asked why it was missing from the
+site. A process that belongs to a run should start with the run, live through its restarts and pauses, and end with
+it - the supervisor is the one thing that sees all of those.
+
+**What.** A game package may declare `companion`: fn(run, cfg) -> `{name, cmd, log, env}` or None (`'module:attr'`;
+`GamePackage.companion_of` fills the defaults: name 'companion', log '<name>_console.txt', and checks `cmd` is a
+non-empty list of strings). `zero.tools.supervise`:
+
+* asks it at every start of the run, once the run has written its `config.json` (`run_state.json` names the run
+  process just started), with that config: the companion follows the run's own settings of this start;
+* starts it from the game repo's root (the run's checkout: the same code as the run), hidden (`CREATE_NO_WINDOW`) and
+  below normal priority (`nice 10` elsewhere), stdin closed, its console appended to `<run>/<log>`, with
+  `ZERO_SUPERVISOR_PID`, `ZERO_SUPERVISOR_STARTED` (the supervisor's process creation time) and `ZERO_COMPANION_RUN` (the
+  run directory, absolute) in its environment;
+* keeps ONE per run: a restart of the run (a crash, a pause) with the same command keeps the running companion; a
+  changed command stops it and starts the new one; None stops it. One that exits while the run goes on (or is paused)
+  is started again, at most 3 times within an hour, then given up until the run's next start with another command;
+* records it in `supervisor_state.json` (`companion`: name, pid, started, cmd; `companion_error`), so a new supervisor
+  stops a companion an abruptly killed one left, and `tools/kill_run.py` leaves the companion (and its children) out of
+  its tree kill;
+* ends with the run: every terminal state of the supervisor now says how the run ended - `ended` 'finished' (the run
+  exited 0 without a STOP file: its last iteration), 'stopped' (STOP, STOP while paused, the supervisor interrupted or
+  failing), 'refused' (exit 78), 'gave_up' (the same crash again and again, 47.2) - and the supervisor then waits for
+  the companion to exit by itself, `<P>_SUPERVISE_COMPANION_WAIT` seconds after a finished run (3600: its last work, e.g.
+  a final recording) and `<P>_SUPERVISE_COMPANION_STOP_WAIT` (120) otherwise, and kills it after that.
+
+The companion's side is `runctl.supervisor_end()`: None while its supervisor goes on (running, paused, restarting), else
+`ended` once the supervisor wrote a terminal state, and 'stopped' when the supervisor process is gone without one (pid +
+creation time, so a reused pid does not count) or another supervisor now runs the run. A paused run keeps its companion.
+
+**Never a reason to stop training (deliberate).** A companion that cannot start - the hook raises (e.g. MTG Zero's: no
+upload key, a bad setting), its command fails, it keeps exiting - is said loudly (`COMPANION NOT STARTED (<name>): ...`
+in supervisor.log and on stderr, `companion_error` in the state) and the run goes on without it. This is the one place
+where the core prefers a degraded run to a refusal: the companion only reports on the run.
+
+`on_fork`: fn(source, dest, it, cfg, overrides) (`'module:attr'`), called by `tools/fork_run.py --source` after the copy
+and before the fork's config.json is written; it may change the fork's settings in place (MTG Zero: a fork of a
+publishing run publishes as a side run and records its lineage).
+
+**Off by default.** A package without `companion` (every game but MTG Zero today) is supervised exactly as before: no
+poll, the same waits, the same files - plus the `ended` field in the terminal state. `<P>_SUPERVISE_COMPANION` (a JSON
+spec, `{}` = none) overrides the hook (tests); `<P>_SUPERVISE_COMPANION_POLL` (5 s) is how often the supervisor looks
+after it.
+
+**Tests.** `tests/test_companion.py` (fake runs and companions): one companion across a crash and its 'finished' end,
+STOP -> 'stopped', it stays up and sees the run paused then goes on to 'finished' with the same pid, a killed supervisor
+-> the companion ends itself 'stopped', `kill_run` spares it and it ends 'stopped', a command that cannot start is loud
+and the run finishes, a companion exiting 3 is restarted 3 times then given up loudly, `{}` = none, a new supervisor
+stops the companion a killed one left, `supervisor_end`'s states, the hook's validation; `test_loop.py`'s and
+`test_run_infra.py`'s supervisor tests unchanged.
