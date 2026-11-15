@@ -67,11 +67,13 @@ use std::time::Instant;
 
 use crate::game::{make_bot, Belief, Bot, Next, SearchGame, MAX_SEATS};
 use crate::lookahead::{Look, LookCfg};
+pub use crate::record::{GameTrace, TraceStep};
 use crate::rng::{split64, Rng};
 use crate::tail::{TailBuf, TailRow};
 use crate::tree::Tree;
 
 mod worker;
+pub(crate) use worker::record_row;
 use worker::worker;
 
 const NO_GAME: u32 = u32::MAX;
@@ -823,6 +825,10 @@ pub struct GameResult {
     /// A chained game's contest (`SearchGame::chained`, docs/search.md 2.14): its episodes in order; empty for
     /// every other game. The row itself is the contest's (`result` its result, the counts summed).
     pub episodes: Vec<EpisodeRow>,
+    /// The game's trace (`Driver::set_trace`, docs/search.md 2.17): its seed, real moves (a contest's episode
+    /// boundaries included) and setup record - what replays it (`record::replay`). None while tracing is off (the
+    /// default).
+    pub trace: Option<Box<GameTrace>>,
 }
 
 /// One episode of a chained contest (`GameResult::episodes`, docs/search.md 2.14): its outcome and counts.
@@ -857,6 +863,9 @@ pub struct Record {
     pub net: u32,
     /// The decider's auxiliary targets at this decision (`DriverCfg::aux`), else empty.
     pub aux: Vec<f32>,
+    /// The real moves of its game played before this decision (`GameResult::trace`'s steps; docs/search.md
+    /// 2.17) while the driver traces its games (`Driver::set_trace`), else 0.
+    pub step: u32,
     /// The row's tail tokens (docs/search.md 2.15; empty without `SearchGame::TAILS`).
     pub tail: TailRow,
     /// The row's pointer overrides against `opts` (docs/search.md 2.15; empty without
@@ -1288,16 +1297,17 @@ struct ParkedRecord {
     pi: Vec<f32>,
     net: u32,
     aux: Vec<f32>,
+    step: u32,
     tail: TailRow,
     ov: Vec<(u32, i64)>,
 }
 
 impl ParkedRecord {
     fn park(r: Record) -> ParkedRecord {
-        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux, tail: r.tail, ov: r.ov }
+        ParkedRecord { x: r.x.iter().map(|&v| f32_to_f16(v)).collect(), player: r.player, n_players: r.n_players, opts: r.opts, pi: r.pi, net: r.net, aux: r.aux, step: r.step, tail: r.tail, ov: r.ov }
     }
     fn unpark(self) -> Record {
-        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux, tail: self.tail, ov: self.ov }
+        Record { x: self.x.iter().map(|&h| f16_to_f32(h)).collect(), player: self.player, n_players: self.n_players, opts: self.opts, pi: self.pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: self.net, aux: self.aux, step: self.step, tail: self.tail, ov: self.ov }
     }
     fn bytes(&self) -> usize {
         std::mem::size_of::<Self>() + self.x.len() * 2 + self.opts.len() * 2 + self.pi.len() * 4 + self.aux.len() * 4
@@ -1466,6 +1476,11 @@ struct Slot<G: SearchGame> {
     cache: HashMap<(u16, u32, u128), Cached>,
     /// Self-play resignation (docs/search.md 3.14): the game's counter, None unless its seats resign.
     resign: Option<ResignState>,
+    /// The game's real moves so far (`Driver::set_trace`, docs/search.md 2.17; None: not traced) and its seed; a
+    /// chained contest's episode boundaries among them (`TraceStep::Next`) and each ended episode's setup record.
+    trace: Option<Vec<TraceStep>>,
+    trace_setups: Vec<String>,
+    game_seed: u64,
     /// A row of the game passed `max_row_tokens` (docs/search.md 2.15): the game ends as aborted at the
     /// advance loop's top (`GameResult::aborted`, no samples).
     row_abort: bool,
@@ -1529,6 +1544,9 @@ impl<G: SearchGame> Slot<G> {
             start_ix: None,
             cache: HashMap::new(),
             resign: None,
+            trace: None,
+            trace_setups: Vec::new(),
+            game_seed: 0,
             row_abort: false,
             chain: None,
         }
@@ -1764,6 +1782,8 @@ struct Shared<G: SearchGame> {
     counters: Counters,
     epoch: AtomicU32,
     net: AtomicU32,
+    /// Games started from now on are traced (`Driver::set_trace`).
+    trace: AtomicBool,
 }
 
 impl<G: SearchGame> Shared<G> {
@@ -1898,6 +1918,8 @@ pub struct Driver<G: SearchGame> {
     outstanding: HashMap<u64, Outstanding>,
     next_bid: u64,
     next_gid: u32,
+    /// A rolling driver's first `resume` happened (`set_first_gid` only before it).
+    resumed: bool,
     results: Vec<GameResult>,
     samples: Vec<Record>,
     wait_ns: u64,
@@ -2118,6 +2140,7 @@ impl<G: SearchGame> Driver<G> {
             counters: Counters::default(),
             epoch: AtomicU32::new(0),
             net: AtomicU32::new(net),
+            trace: AtomicBool::new(false),
         });
         let mut workers = Vec::new();
         for k in 0..threads {
@@ -2134,6 +2157,7 @@ impl<G: SearchGame> Driver<G> {
             outstanding: HashMap::new(),
             next_bid: 0,
             next_gid: 0,
+            resumed: false,
             results: Vec::new(),
             samples: Vec::new(),
             wait_ns: 0,
@@ -2275,12 +2299,49 @@ impl<G: SearchGame> Driver<G> {
         }
         self.quota = quota;
         self.phase_games = 0;
+        self.resumed = true;
         if self.sh.net.swap(net, Ordering::SeqCst) != net {
             self.sh.epoch.fetch_add(1, Ordering::SeqCst);
         }
         for g in 0..self.gstate.len() {
             self.dispatch(g);
         }
+        Ok(())
+    }
+
+    /// A rolling driver's first game id (before its first `resume`; default 0): its games are `gid`,
+    /// `gid + 1`, ... - each game's random streams derive from (seed, gid) as ever, so a block of game
+    /// ids played by one driver plays exactly those games of a driver started at 0 (a native worker's
+    /// job of games `gid_base..`, zero-farm; docs/search.md 2.16). Nothing changes when never called.
+    pub fn set_first_gid(&mut self, gid: u32) -> Result<(), String> {
+        if !self.sh.cfg.rolling {
+            return Err("set_first_gid: a rolling driver's (a fixed table's games are 0..games)".into());
+        }
+        if self.resumed {
+            return Err("set_first_gid: before the first resume (games have started)".into());
+        }
+        self.next_gid = gid;
+        Ok(())
+    }
+
+    /// Trace every game (docs/search.md 2.17, zero-farm's self-play records): each finished game's result row
+    /// carries its seed, its real moves (single-option steps and external answers included) and the game's
+    /// setup record (`GameResult::trace`), and each training record the moves played before its decision
+    /// (`Record::step`) - what `record::replay` rebuilds the rows from. A rolling driver's, before its first
+    /// resume. Not with
+    /// branched games or archive starts (their games don't start from a seed alone) nor deferred results
+    /// (a parked game's trace: not kept). Never called: nothing changes.
+    pub fn set_trace(&mut self, on: bool) -> Result<(), String> {
+        if !self.sh.cfg.rolling {
+            return Err("set_trace: a rolling driver's (a fixed table's games start with the driver)".into());
+        }
+        if self.resumed {
+            return Err("set_trace: before the first resume (games have started)".into());
+        }
+        if on && (self.sh.cfg.branch.is_some() || self.sh.cfg.starts.is_some()) {
+            return Err("set_trace: branched games and archive starts are not replayable from a seed (docs/search.md 2.17)".into());
+        }
+        self.sh.trace.store(on, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2505,7 +2566,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None, abort: None };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None, trace: None, abort: None };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
@@ -2565,6 +2626,14 @@ impl<G: SearchGame> Driver<G> {
     /// Setups queued and not started yet.
     pub fn queued(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Drop every queued setup not started yet -> how many (docs/search.md 2.16: a native worker's eval job
+    /// asked to finish starts no new game; the games in flight play on). Nothing else changes.
+    pub fn clear_queue(&mut self) -> usize {
+        let n = self.queue.len();
+        self.queue.clear();
+        n
     }
 
     pub fn take_samples(&mut self) -> Vec<Record> {
@@ -2787,3 +2856,7 @@ mod tests;
 #[cfg(test)]
 #[path = "driver/tests/tail.rs"]
 mod tail_tests;
+// game records of variable-length rows (docs/search.md 2.15, 2.17)
+#[cfg(test)]
+#[path = "driver/tests/trace_tail.rs"]
+mod trace_tail_tests;

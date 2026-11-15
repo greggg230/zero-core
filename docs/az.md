@@ -28,7 +28,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5; `--graphs`: 10.6) |
 | `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6) |
-| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
+| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B), at a run's evaluation settings (each side's run's margin_w / redet / eval_cache, A's run's eval spec: section 44.3); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
 | `heldout.py` | Held-out losses (section 20.2): a frozen set of sample rows (`make`), a checkpoint's value cross-entropy / accuracy / Brier against z and policy cross-entropy / top-1 against the recorded targets, decision and value-only rows apart (`HeldOut`, `losses`); `python -m <pkg>.az.heldout make | eval` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
 | `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
@@ -37,6 +37,8 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `league.py` | The self-play league (section 14): the league games' kinds and seat tables (classic, rolling), the iteration's picks of past checkpoints (`League.plan`: uniform or pfsp), the slots' evaluators (guarded), the games' attribution and `selfplay.league` |
 | `forks.py` | Branched self-play games and archive starts (section 24): the settings, the archive file (`zero-archive/1`: its entries' patches over the run's spec), the self-play driver's `branch` / `starts`, the remote hello's fingerprint, the tallies and `selfplay.forks` |
 | `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
+| `onnx_export.py`, `onnx_parity.py` | zero-onnx/1 (section 41): any network (`TokenNet`, `GridNet`, `Net`) exported to one self-contained ONNX graph that takes the driver's sparse batch (`export`, `export_checkpoint`; `python -m zero.onnx_export`), and its parity gate against torch on real batches (`python -m zero.onnx_parity`); `tools/onnx_record.py` records a self-play's batches, `tools/onnx_bench.py` times ONNX Runtime against torch. Need onnx / onnxscript / onnxruntime; nothing on a run's path imports them |
+| `farm_def.py`, `farm_eval.py`, `farm_h2h.py`, `farm_report.py` | zero-farm on the desktop (sections 44.2, 44.3): signed definitions (`definition/1` documents, versions, the archive, `farm-release define`) and the coordinator client; eval jobs' games and rows in Python terms; a head-to-head of two checkpoints played on the farm; the own machines' work for the farm's admin page |
 | `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
 
 Repository tools (`tools/`): `build_engine.sh` (the PyO3 build every repo's `build_py.sh`
@@ -144,6 +146,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A comma-separated list = several hosts, each its own workers, mirror and shards, consumers `<name>/w<k>`, metrics `selfplay.remotes` (one name: exactly as before); a name `<prefix>:<arg>` calls the package's callable remote `<prefix>:`; the run directory's `selfplay_remotes` file (one name per line) replaces the list, is re-read at every phase start (hosts join and leave a live run) and alone turns remote self-play on (section 34). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6; a list too, never the file); its own is refused |
 | `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
+| `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: those whose inference is CUDA / MPS - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -5352,6 +5355,245 @@ The merge (`feat/eoe-run2`): both test files unchanged and passing (the clash me
 settings of the core already (names of the core's, ...)"); the full suite, and MTG Zero's integration of both
 (`eoe-run2-int`, its ENGINE.md 126).
 
+## 41. zero-onnx/1: a network as one self-contained ONNX graph, and its parity gate (no setting; zero-farm phase 0a, 2026-11-11)
+
+**Why.** zero-farm (friends' idle Windows PCs doing a run's self-play and evaluation games) runs the search in a
+native Rust worker with ONNX Runtime: no Python, no torch. The worker must serve any run, including runs with
+networks not designed yet, without code of its own per network. So the network travels as a graph that takes
+the driver's batch exactly as the driver produces it and returns what every zero-core evaluator returns before
+its generic last step; everything specific to an architecture - TokenNet's packing of its objects, readers,
+heads, the auxiliary targets' transforms - is inside the graph, exported from the `net.py` the run trains.
+
+**What.** `zero.onnx_export` (the interface is in its docstring):
+
+| | name | type | shape | |
+|---|---|---|---|---|
+| in | `x_ptr` | i64 | [B+1] | the sparse batch's row offsets (`xs_off`, a driver with `sparse`) |
+| in | `x_idx` | i32 | [nnz] | feature indexes, ascending per row (`xs_idx`) |
+| in | `x_val` | f32 | [nnz] | (`xs_val`) |
+| in | `n_players` | i64 | [B] | |
+| in | `belief` | bool | [B] | the root belief rows (`extra` == ROW_BELIEF) |
+| out | `policy` | f32 | [B, A] | raw logits |
+| out | `value` | f32 | [B, 8] | softmax over the seats present, 0 beyond n_players |
+| out | `margin` | f32 | [B, 8] | |
+| out | `aux` | f32 | [B, W] | `net.aux_answer` per target in the head's layout, 0 on rows without `belief`; W = 0 without a head |
+
+The worker's generic step (`onnx_parity.answer`, the same for every network): each row's priors are the
+max-subtracted float32 softmax of `policy[row, legal actions]`; value and margin as they are; the auxiliary
+answer is `aux[belief rows]`. Metadata: zero_onnx=1, protocol, game, arch, features, actions, seats, aux_layout,
+aux_width, packing, checkpoint, checkpoint_sha256, opset, exporter, torch. `export(net, path)` takes a loaded
+network (`load_checkpoint` = `net.load`: built from the config - TokenNet's token tables, `gidx` and the reader
+indexes rebuilt, not saved -, the encoding guard, the head widened to the game's targets, section 37). The
+densify is in the graph (a scatter-add of ones at the row ends and a running sum give each non-zero's row: no
+data-dependent shape). An absent slot's floats are never part of the arithmetic (its identity digits zeroed
+before the round-to-integer decode, its token replaced by zero), so NaN or junk there changes nothing.
+
+A token network packs its objects inside the graph in one of four ways (`packing`; the first three need nothing
+but the interface):
+
+* `mask`: every slot is a token (170 for MTG Zero), the absent ones masked out of the attention as keys and of
+  the pooling; static shapes but B.
+* `compact`: the present tokens gathered in layout order (TopK over the presence; T = the batch's longest row, a
+  data-dependent shape), then `forward_static`'s trunk on rows padded to T.
+* `packed` (the default): the batch's N present tokens as one list [N, d] (NonZero) for every per-token layer
+  (the LayerNorms, the projections, the MLPs, the pointer head: 2-D Gemms), only the attention and the pooling on
+  rows padded to T (gathered in and back).
+* `host`: `forward_static`'s signature kept as two more inputs (`tok_full`, `tok_n`, packed by the caller with
+  `token_presence` / `token_index`; metadata `present_index`) - the worker would carry TokenNet's packing, so it
+  is measured, not used.
+
+`GridNet` and `Net` have no packing (their forward on the densified rows). Exporter: torch's dynamo-based
+`torch.onnx.export(dynamo=True)` (onnxscript), opset 18, IR 10, one file (no external data), checked by
+`onnx.checker`.
+
+**The gate** (`python -m zero.onnx_parity <checkpoint> --batches <file> ...`): ONNX Runtime's CPU EP against
+torch on real batches - recorded driver batches (`tools/onnx_record.py`: a short CPU self-play's sparse
+LeafBatches with root-view value rows and root belief rows, under the game checkout's own core) or shard rows.
+Per file: batches of 1, 7, 64, 256 and 1,024 rows, each as it is and with NaN in every absent slot's floats
+(the host packing also with junk in its padding positions), and the first recorded batches as the driver sent
+them; a batch over 64 rows is also answered in pieces of 64 rows grouped by their non-zero count (the worker's
+chunking, `run_chunked`). Each is compared with `forward_static` on the host-packed rows and with the eager
+`NetEvaluator`: priors, value, margin and the belief rows' auxiliary answers within 2e-5 max abs (10.6's
+graphs-vs-eager tolerance), value exactly 0 beyond n_players, one auxiliary row per belief row, and the graph
+deterministic (each case run twice, bit-identical outputs). Exit 1 on a failure.
+
+**Not a setting.** Nothing on a run's path imports these modules (onnx, onnxscript and onnxruntime are not run
+dependencies; `tests/test_onnx.py` skips without them); no existing module changed.
+
+**Measured** (2026-11-11, the desktop's i9-13900K, CPU only, onnxruntime 1.31.1, torch 2.11.0, beside a live
+Delver run and an EoE race: the CPU 33-100% busy, so the numbers are noisy; the methods interleaved; zero-farm
+docs/phase0a-onnx.md has every cell):
+
+* *Gate*: MTG Zero's eoe1 iteration 80 (`mtg_eoe`, layout v6 'eoe', 44,212 features, 4 layers, the deck reader,
+  aux belief + deck, W = 2,048) on 60 recorded driver batches of the main-branch build (every 40th batch of a
+  sims-4 self-play, 7,457 rows: 1,479 value-only, 547 belief), 80 early-game driver batches and 2,048 rows of its
+  iteration-80 shard; the Delver deep8 iteration 3293 (`mtg`, layout v5, 37,620 features, 8 layers, aux belief,
+  W = 1,024) on 4,096 rows of the held-out shard r3-2b_iter0197fresh (value-only rows as stored, a belief copy
+  after every 8th leaf row): **every packing passes**, worst ORT-vs-torch difference 1.5e-5 (eoe1's margin;
+  priors <= 4.6e-6). Against a float64 forward the ORT answers are as close as torch's own (eoe1 margin, 64 rows:
+  ORT 4.6e-6, torch 9.9e-6): the ORT-torch difference is two float32 roundings, not an error of either.
+* *Speed* (leaves/s, from the sparse rows to an evaluator's answer; 1 thread, the least disturbed measurement):
+
+  | net | B | torch eager | ORT mask | ORT compact | ORT packed | ORT packed, 64-row chunks |
+  |---|---|---|---|---|---|---|
+  | eoe1 | 16 | 535 | 92 | 567 | 719 | 683 |
+  | eoe1 | 64 | 515 | 76 | 468 | 716 | 642 |
+  | eoe1 | 256 | 818 | 82 | 419 | 570 | 874 |
+  | Delver deep8 | 16 | 466 | 50 | 485 | 784 | 592 |
+  | Delver deep8 | 64 | 273 | 41 | 180 | 453 | 461 |
+  | Delver deep8 | 256 | 498 | 40 | 143 | 335 | 575 |
+
+  A second run (torch and `packed` only, 12 calls per cell, the CPU 96-100% busy) gave 0.90-1.49x torch eager at
+  1 thread: over both runs `packed` (with the 64-row chunks at 256 rows) is 1.09-1.69x torch eager for 16-64 rows
+  and 0.90-1.26x at 256 rows, where the eager evaluator already sorts rows into 64-row chunks. With 4 and 8
+  intra-op threads ORT scales (eoe1, 64 rows, packed: 716 -> 1,095 -> 1,932) while torch's eager evaluator
+  collapses on the saturated machine (section 7; 515 -> 121 -> 91). `mask` computes all 170 tokens
+  (the rows hold 15-22 on average): 5-10x slower. `compact` and `host` pad every row to the batch's longest and
+  are 1.3-2.5x slower than `packed`; the host's packing itself costs 0.2-1.6 ms per batch (numpy). Session load
+  0.2-0.4 s; the files 13.4 MB (eoe1) and 9.7 MB (Delver), the checkpoints' size.
+
+**Problems met** (each handled in the code; zero-farm docs/phase0a-onnx.md has the details): the data-dependent
+T needs `.item()` + `torch._check` (and T >= 2, or the attention's broadcast check cannot be decided); slicing
+`x_ptr[1:-1]` made the tracer guard B >= 3 (the row ends `x_ptr[1:]` do not); **ONNX Runtime's CPU ScatterND with
+`reduction='add'` races on duplicate indices with several threads** (lost updates: wrong sums at 8 threads,
+measured) - `index_add` / `index_put(accumulate=True)` must not appear in an export (the packed pooling goes
+through the padded rows), which is why the gate runs every case twice; an absolute tolerance only means
+something for outputs of order 1 (a test network with large random weights gets margins of ~170 and Poisson
+rates of 1e6, whose float32 rounding alone exceeds 2e-5 in torch and ORT alike).
+
+**Tests and checks.** `tests/test_onnx.py` (16): the in-graph densify against protocol.densify (torch and ORT,
+empty rows, 4 threads, repeated); a token network in each packing (plain and id_actions layouts) through the gate
+on batches of 1-150 rows with NaN in absent slots; a reader declared `belief` plus a head widened by a Poisson
+target on a token, an MLP and a conv network; a network without the head (aux [B, 0]); the interface's names,
+dtypes, dynamic dimensions and metadata; real toy games driven through the graph (sparse driver batches with
+value-only and belief rows, every answer validated and within 2e-5 of eager).
+
+### 41.1 Graphs every GPU provider runs, with the same answers (no setting; zero-farm phase 4, 2026-11-12)
+
+**Why.** zero-farm's GPU providers met the export: DirectML answered the identity decoding's `digits @ arange` (a
+MatMul with a 1-D constant operand) with zeros and threw on Reshape allowzero=1 (the dynamo exporter's `view`);
+TensorRT's ONNX parser refused the whole graph for densify's ScatterElements reduction='add' ("Unsupported
+reduction type").
+
+**What it does.** `densify` finds each non-zero's row without a scatter-add: in the merged sequence of the non-zeros
+and the B row ends, row b's end sits at x_ptr[b+1] + b (distinct even for empty rows); a scatter of ones there, a
+running sum, and a scatter to unique slots give every non-zero its row (integers: the same rows). `portable(model)`,
+applied by `export` (metadata `portable` 1): MatMul(A, 1-D constant w) -> Squeeze(MatMul(A, w[:, None]), -1) (the
+same GEMM on the CPU); Reshape allowzero=1 -> allowzero=0 on `Where(Equal(S, 0), -1, S)` (equal for every shape with
+at most one zero; two would raise, never answer differently), a constant shape without zeros just flips the flag.
+`python -m zero.onnx_export --rewrite IN OUT` applies it to an exported file; `--no-portable` skips it.
+
+**Off by default.** Not a setting: the answers are the same (below); a run's training never sees the exporter.
+
+**Tests and checks.** The new export of eoe1 iter 80 against phase 2's published one, ONNX Runtime 1.31.1 CPU, 4
+threads: 137 of 137 pieces (7,713 real driver rows) bit-identical on every output. Gate 1 re-run
+(`zero.onnx_parity`): eoe1 `packed` 23 + 11 cases, worst margin 1.22e-5, `mask` 1.39e-5; Delver deep8 `packed`
+4.0e-6; none failed, every case twice bit-identical. DirectML then runs both nets within 9e-6 of torch.
+`tools/onnx_probe_graph.py` writes the worker's built-in probe graph (44.4).
+
+### 41.2 Graphs a GPU provider runs as the CPU does: every scatter unique, opset 17 (no setting; zero-farm's DirectML work, 2026-11-13)
+
+**Why.** zero-farm wants friends' AMD (and Intel, NVIDIA) GPUs through DirectML, the one GPU provider every Windows PC
+has. Two properties of the exported graphs break a GPU provider as soon as their ScatterElements run on the GPU. They
+were hidden: DirectML registers ScatterElements up to version 16 only, so under opset 18 it left every scatter (4 in a
+zero-onnx/1 graph, 10 in Delver's v7 graph) to the CPU, with copies to the CPU and back around each. Measured in a
+DirectML lab (onnxruntime-directml 1.24.4 and Windows ML's ONNX Runtime 1.28.3, an RTX 5090 and an Intel UHD 770) with
+the same graphs at opset 17:
+
+* *More indices than places.* densify's second scatter wrote nnz + B indices into nnz + 1 places (all B row ends to the
+  one spare slot nnz). DirectML refuses an index tensor longer than its data along the axis ("The parameter is
+  incorrect": at run time with dynamic shapes, at session creation with static ones): every batch of two rows or more.
+* *Repeated indices.* The policy scatter writes every token column without an action to the dummy column, and where two
+  tokens score the same action (identity actions of two equal cards; the probe network's units) a real column twice
+  with different logits. ONNX leaves the winner of a repeated index undefined; ONNX Runtime's CPU kernel and torch's CPU
+  scatter write in order (the last write wins: the answers every gate compares with), a GPU in parallel - 64 writes to
+  two places, values 1..64: the CPU kept [32, 64], the RTX 5090 [1, 33], the UHD 770 [17, 49]; the probe graph at one row
+  (the only size densify did not fail at) came out 0.0205 off the CPU's policy.
+* DirectML's static graph fusion also fails on Scatter -> Slice -> Mul in one partition (each piece alone compiles), and
+  it has no int64 Mod (torch's int64 `//` exports Div with a Mod fix-up; `rounding_mode='trunc'` goes through float32 and
+  is wrong past 2^24, measured).
+
+**What it does** (`zero.onnx_export`; the interfaces unchanged):
+
+* *Row ends to places of their own* (`_csr_rows`, densify's and zero-onnx/2's CSRs): the row ends' writes go to spare
+  places n + (the end's index) - data n + B, every index unique - and the first n are read back by a Gather
+  (`index_select`), not a Slice. The same rows.
+* *The policy's last writer made explicit* (`_scatter_last`): per row, the writes sorted by (action, position) - one TopK
+  over the key action L + position (unique keys: no tie to break; no division) -, the last write of each action's run
+  writes its place, every other write its own spare place past the row's end (A + 1 + its sorted position), the first
+  A + 1 places read back by a Gather. The packed graph lays each row's writes out on its full token axis (`_policy_full`:
+  [B, n_tok K], an absent slot writing the dummy column): a row's packed tokens are in layout order, so a write's place on
+  the axis orders the row's writes exactly as the packed list's flat scatter did - the same last writer of every action,
+  bit for bit; the mask packing scatters its own [B, n_tok K] the same way. The keys are per row and stay below
+  (A + 2) n_tok K whatever the batch (`_check_policy_keys` when the module is built; MTG Zero: 1,025 x 850, 0.04 % of
+  2^31 - a key over the whole batch would reach ~10^11 at 1,024 rows).
+* *Every integer in int32, zero-onnx/1 too* (46.7's rule): `int32_slices` and `check_int32` run on every export (a
+  zero-onnx/1 graph held one integer outside int32, the exporter's Slice "to the end" 2^63 - 1).
+* *Opset 17* (`opset17`, `OPSET` 17): torch 2.11's exporter writes opset 18 whatever it is asked (onnx's version
+  converter has no Pad 18 -> 17 adapter), so the export asks for 18 (`EXPORTER_OPSET`) and rewrites the graph: every node
+  whose operator has another version under opset 17 than under 18 (`onnx.defs`) gets its opset-17 form - the Reduce
+  operators' constant axes input back to the attribute (`noop_with_empty_axes` dropped), ScatterElements / ScatterND
+  with reduction none, add or mul as version 16, Pad without its axes input as version 13 - or is refused (Split with
+  num_outputs, Resize-18, a reduction opset 18 added, ...); onnx.checker's full check after. `export(opset=18)` keeps
+  the exporter's graph.
+* Metadata `unique_scatters` '1' (every packing but `compact` and `host`, which call `TokenNet._trunk` and its plain
+  policy scatter: '0'; measured, not used). `scatter_writes(model, feeds)`: what every scatter of a graph writes on real
+  inputs (duplicates, more indices than places) - the runtime check beside `int64_max`.
+* Not changed: what a graph answers on the CPU (below), the interfaces and reference sets, `portable_file` (old files
+  keep their scatters). The packed trunk's int64 floor division (a token's row `sel // n_tok`) stays: DirectML leaves
+  its Mod fix-up to the CPU, exactly (below).
+
+**On by default** (not a setting): an exporter change - nothing on a run's path imports it - whose graphs answer every
+input on the CPU bit for bit as before (below). `export(..., opset=18)` gives the exporter's opset.
+
+**Costs.** The graphs grow a little: MTG Zero's pb1 iteration 82 from 996 to 1,014 nodes and 10,151,753 to 10,183,556
+bytes (+0.3 %), Delver's v7 graph from 1,983 to 2,014 nodes (+33 KB); the export time unchanged (v7: 25-32 s). On the CPU the
+policy's per-row sort (a TopK over n_tok K = 850 keys a row for MTG Zero) and the [B, n_tok K] gathers cost about what
+the batch's noise hides: the native worker's CPU runtime pack (ONNX Runtime 1.31.1, 4 threads, the reference rows cycled
+to batches of 16 / 64 / 256 / 1,024; two runs of each graph, interleaved): pb1 1,247-1,329 / 1,331-1,758 / 2,141-2,436 /
+2,108-2,394 rows/s against the earlier graph's 1,312-1,313 / 1,385-1,387 / 2,024-2,186 / 2,409-2,490; whole reference
+batches 2,173-2,251 against 2,040-2,132.
+
+**Tests.** `tests/test_onnx.py` (19; two new, two extended): `_scatter_last` against the sequential scatter (12 writes
+a row into 9 places) in torch and through ONNX Runtime at opset 17, bit for bit, and `scatter_writes` finding no
+duplicate and no excess index where the plain scatter has both; `opset17` (a ReduceMax's axes input to the attribute,
+the same answer; Split with num_outputs and a ScatterElements reduction of opset 18 refused); every packing's graph at
+opset 17 with its `unique_scatters` and `check_int32` passing, the mask and packed graphs' four scatters unique on
+batches of 1, 7 and 150 rows - with id_actions on rows where two present units score the same action (so the parity gate
+also checks the policy's last writer against torch); the interface test's opset and metadata. The committed probe graph
+regenerated (`tools/onnx_probe_graph.py`; its reference set byte-identical).
+
+**Measured** (2026-11-13, the desktop beside the live run and other sessions' jobs; ONNX Runtime 1.31.1 CPU, Windows
+ML's 1.28.3 for DirectML, torch 2.11.0; the earlier graphs: ec2d1b9's export, the `farm` head before this change):
+
+* *The CPU's answers, bit for bit.* MTG Zero's best-of-three run pb1, iteration 82 (layout v6, 44,212 features,
+  1,024 actions; exported as the pool exports it; two exports byte-identical) against ec2d1b9's graph on the pool's 256
+  gen-82 reference rows - each recorded batch as it is, the 256 rows at once, windows of 2 to 256 rows, the worker's
+  64-row pieces, every row alone: 310 cases - every output bit-identical, at 4 and at 1 intra-op threads, each graph run in
+  two processes (the four hashes equal). Against torch's answers (the reference set): max abs 1.0e-6. The probe graph
+  (`tools/onnx_probe_graph.py`): its reference rows and 12 more seeds' (2,496 rows), 3,016 cases with every row alone,
+  bit-identical the same way - on rows where the earlier graph's policy scatter wrote 7,832 repeated real actions (the
+  units' identity actions), so the explicit last writer is the CPU's; pb1's rows repeat only the dummy column.
+* *The scatters* (`scatter_writes`, the same rows): the earlier pb1 graph wrote 27,384 repeated indices in 32 scatter
+  runs (504 by densify's row ends, 26,880 by the policy into the dummy column) and had 8 runs with more indices than
+  places (every densify of more than one row); the new one 0 and 0 (635,872 writes). The probe graph: 74,349 repeats and
+  78 excess runs before, 0 and 0 now.
+* *int32.* `check_int32`: the new pb1 graph's 80 integer constants all in int32 (the earlier graph held the Slice end
+  2^63 - 1); `int64_max` on the reference rows' batches, pieces and the 256-row piece: 11,318,272 (the densify index,
+  256 x 44,212: 0.53 % of 2^31), the policy's sort keys at most 871,249.
+* *DirectML* (`zw_probe probe-providers`, Windows ML's ONNX Runtime 1.28.3, the self-test on the gen-82 reference set:
+  the RTX 5090 - shared with a live training run - and the Intel UHD 770): the new graph passes in every run (UHD 5 of
+  5, 5090 4 of 4; also on the reference rows regrouped into batches of 96 and 256 rows), max abs 6.0e-7 (5090) and
+  8.6e-7 (UHD), deterministic; ScatterElements gone from the nodes DirectML leaves to the CPU (15 left: Concat 2, Gather 2,
+  Reshape 3, Squeeze 3, Add, Equal, Mod, Mul, Sub - shapes and the packed trunk's int64 `//`), against 17 with 4
+  ScatterElements before. Rows per second by batch size (16 / 64 / 256 / 1,024 rows; the bench rows are not checked
+  against the CPU, the self-test's are): RTX 5090 267 / 890 / 4,307 / 12,706 against the earlier graph's
+  236 / 909 / 2,585 / 4,669 (2.7x at 1,024 rows); UHD 770 203 / 494 / 1,005 / 1,195 against 192 / 499 / 889 / 1,089.
+  The same runtime's CPU EP: 1,103-1,225 / 1,342-1,511 / 2,104-2,105 / 2,127-2,308.
+* *A network without the auxiliary head* (`aux` [B, 0], the probe network without its head and reader): DirectML passes
+  the self-test on both adapters, new and earlier graph alike (2 runs each): the zero-size output is no problem for the
+  worker's DirectML session (46.7's instrumentation, with its zero-size intermediates as outputs, was).
+
 ## 42. Chained episodes: one game of a match per episode (`SearchGame::chained`, `next_episode`; MTG Zero's best-of-three Delver mirror, 2026-11-11)
 
 (Section 40 is taken by `feat/extra-evals` and `feat/selfplay-spec-hook`, 41 by `farm`.) **No run setting**: the game
@@ -6132,6 +6374,924 @@ step cost +21-22% of v6's where the steady state's is +11-12%) plus one recomput
 one by > 0.2 nats (3 seeds, eager; and train_static), the widen exact at step 0; a noise segment does no harm and its
 gate stays below 0.25. `tests/test_tail_net.py::test_gradients_reach_the_gates`: with the shadow every gated segment's
 maps get a gradient at g = 0; without it (`gate_shadow` 0) exactly none, the forward the same bit for bit.
+
+## 44. The native self-play worker: zero_worker, one settings parser, parity gate 2 (no setting; zero-farm phase 0b, 2026-11-11)
+
+**Why.** zero-farm's worker (section 41) plays a run's self-play games on a friend's PC with no Python and no
+torch, for any run's settings, and its rows must be the rows a Python remote worker (5.3) would have written. So
+every play-affecting rule has one implementation, in Rust, shared by both (zero-farm DESIGN.md 2.1 points 3-4),
+a setting the worker cannot honour is refused loudly, and the worker is proven against the Python remote worker.
+
+**What.**
+* **One settings parser** (`zero_search::settings`, docs/search.md 4.1): the seat dicts, `branch` / `starts` and
+  the `DriverCfg` with its de-duplicated seat table, over serde_json values - moved from `zero_py`, which now
+  converts its dicts to JSON and calls it. Two tightenings for inputs no caller makes: a bot / external seat with
+  another key is refused (it was ignored), a non-finite float is refused. `<engine>.driver_settings(seats, ...)`
+  gives the `DriverCfg` a `SearchDriver` would get, as text (a diagnostic).
+* **`Driver::set_first_gid`** (docs/search.md 2.16): a rolling driver's games numbered from a given id, so a farm job
+  is a block `gid_base..` of one run-wide numbering (each game's streams derive from (seed, gid)).
+* **`crates/worker` (zero_worker)**, a workspace member outside `default-members` (this repo's `cargo test` and the
+  games' builds never compile ONNX Runtime): `settings` (a run's settings -> the remote worker's self-play driver:
+  a port of `Run.nn_seat(selfplay=True)` / `games.nn_seat` with the `mcts` checks and `Run.driver(..., rolling,
+  queue_only)`, Python's value rules, the spec as `json.dumps` writes it; parsed by `zero_search::settings`),
+  `classify` (`check-config`, the explicit table `run_settings.json`), `eval` (`OrtEvaluator`: `ort` 2.0.0-rc.15,
+  `load-dynamic`, ONNX Runtime 1.31; the graph's metadata checked - zero_onnx, game, features, actions, aux_width,
+  checkpoint_sha256 -, batches over 64 rows in pieces grouped by non-zero count, the float32 max-subtracted softmax
+  of each row's options, value / margin as given, the belief rows' aux; session inter-op 1, sequential,
+  optimization ALL, intra-op threads and spinning configurable; `Uniform` = `infer.UniformEvaluator`), `job` (the
+  remote worker's loop - resume, `pump` after every submitted batch, setups capped at `conc` in flight and the
+  job's games in all, `infer._drive_pipelined` with 2 batches in flight submitted in launch order, the evaluator on
+  its own thread; yield / resume / finish / quit / checkpoint), `shard` (zero/data.py's format), `proto` (the CLI and
+  zero-farm's agent<->worker protocol `aw/1`: `serve`). A game's worker binary is `zero_worker::main(GAMES, repo)`.
+* **`check-config`**: every `zero.run.DEFAULTS` key is `play` (49 keys: read and supported), `trainer` (85:
+  training, evaluation, orchestration, Python inference, network shape - the network is the graph), `python_only`
+  (the league, branched games, archive starts, co-training: refused unless off) or `param` (a python_only switch's
+  settings); `aux_<target>_w` play, `reader_<target>` trainer; anything else is unknown and refused.
+  `tests/test_worker_settings.py` fails when DEFAULTS and the table differ, so no setting is ever ignored in silence.
+  (Python's `resolve_config` keeps unknown keys silently: five mtg-zero run configs carry settings of other branches -
+  `selfplay_league_fixed`, `selfplay_explore`, `selfplay_temp_late`, `selfplay_sims_light`, `selfplay_opp_model` -
+  that this core would ignore; the worker refuses them.)
+* **`zero.onnx_eval.OnnxEvaluator`**: the graph through onnxruntime as a NetEvaluator-compatible LeafBatch evaluator
+  (the Python reference of the native one; the desktop's evaluator of a graph). Tools: `driver_settings_dump.py`,
+  `seat_parser_edges.py`, `worker_parity.py` (gate 2 a), `onnx_worker_gate.py` (b), `onnx_h2h.py` (c),
+  `worker_serve_check.py` (aw/1 with a real network), `worker_bench.py` (throughput).
+
+**Off by default.** Nothing changes for a run: the same seats and drivers (below), `set_first_gid` never called.
+
+**Tests and checks** (2026-11-11, the desktop busy with the live Delver run, CPU only).
+* **The parser move changes no seat:** `tools/driver_settings_dump.py` over every mtg-zero preset and every run
+  `config.json` under `C:/.../mtg-zero/runs` and `E:/mtg-zero/runs` (79 cases; the drivers of a remote self-play
+  worker, of this machine's self-play, of the evaluation against the yardstick and random, of the Elo matches,
+  of the bots' reference games): old parser (f60664c) vs new (f508146), **468 drivers identical**, 1 case refused
+  by both (`toy-cotrain-smoke`: its game is not in mtgz's module). `tools/seat_parser_edges.py` (47 edge cases,
+  the toy module of each commit): 45 identical or refused by both, the 2 deliberate changes listed.
+* **The worker's port of the run settings -> driver** (`driver-cfg` vs the Python remote worker's DriverCfg, the
+  same 79 cases): 72 identical (or refused by both), 6 refused by the worker as Python-only (4 league runs, 2 with
+  branched games / archive starts), 0 different.
+* `cargo test -p zero_search` (`first_gid_plays_the_same_games` new; the timing test
+  `a_slow_step_holds_up_its_own_group_only` failed once on the loaded desktop, passes alone 3 of 3), `cargo test -p
+  zero_worker` (11 unit + 4 job tests on the toy game: yield / resume gives the same shards, a gid block plays those
+  games, the shards hold every game, quit / finish), `tests/test_worker_settings.py`; the checkpoint-compat
+  goldens old (f60664c) vs new, toy: identical (visits 169 samples, records b1b86b689ab98313; cq d02691e9e005a5d5;
+  vs random 3.0/16, dcf8b2b840d45e66); toy_team identical (no samples). The full pytest: below.
+* **Parity gate 2** (zero-farm docs/phase0b-worker.md has every number): (a) plumbing, `tools/worker_parity.py` on
+  eoe1's settings with groups 1, the uniform evaluator, 48 games: zero-core's `remoteplay.Worker` and `mtgz-worker
+  selfplay` wrote **byte-identical shards** (2 shards, 14,136 rows) and sent **identical first 300 batches**; (b)
+  evaluator, `tools/onnx_worker_gate.py`, 440 recorded eoe1 batches (33,901 rows, 751 belief rows): native vs
+  `OnnxEvaluator` priors <= 1.8e-7, value / margin / aux bit-identical; vs torch <= 1.34e-5 (margin); (c) behaviour:
+  below. `tools/worker_serve_check.py`: aw/1 with eoe1 iter 80's graph, a yield after the first finished game and a
+  resume 3 s later - the same shards byte for byte as the job left alone, `yielded` 31 ms after `yield`.
+
+**Measured** (2026-11-11, the desktop: i9-13900K, CPU only, 90-100% busy with the live Delver run and other agents'
+work; zero-farm docs/phase0b-worker.md has the tables).
+* **Throughput at 8 threads** (`tools/worker_bench.py`, eoe1's settings with threads 8, groups 2, conc 256,
+  torch_threads 1, infer_workers 1; the native side ONNX Runtime with 8 intra-op threads; 10 minutes per run,
+  interleaved, 2 rounds): native 1,368 / 1,281 leaves/s, Python remote worker (torch eager) 911 / 859 (rounds 0 / 1; the
+  CPU 92-100% busy) - **1.50x**, about 390 vs 260 games/h at 12,250 leaves an eoe1 game; the native worker is
+  inference-bound (its evaluator busy 592 of 599 s); peak working set 1.5 GB at conc 256.
+* **Gate 2 (c), behaviour** (`tools/onnx_h2h.py`: eoe1 iter 80's graph through onnxruntime against the checkpoint
+  through torch, CPU, 32 simulations, the evaluation seats, eoe1's evaluation spec, paired): 100 games in 74.7 min
+  (batches of 20 under a 60-minute budget, the fifth started at 58 min), A = the graph through onnxruntime (4 threads),
+  B = the checkpoint through torch: **0.500 +- 0.000** (paired se), pentanomial [0, 0, 50, 0, 0] - every pair split, no
+  result decided by the evaluator (95% bound on decided pairs 6%, |score - 0.5| < 0.03); mean margin -0.1, so not every
+  pair was played move for move alike, but no difference changed a result.
+* Session load 0.2-0.4 s; `yield` -> `yielded` 31 ms, `resume` 0.4 s; the binary (mtgz-worker.exe) 23.7 MB, ONNX Runtime
+  1.31.1's DLL 19.3 MB (+ the MSVC runtime: MSVCP140, VCRUNTIME140, VCRUNTIME140_1, ~0.9 MB).
+* **zero-core pytest** (venv, CUDA hidden; all 472 tests, in parts - the full run reached 347 of 469 in 117 min on the
+  loaded desktop, the rest and the files with failures ran again at eec96bc): every test passes or fails the same way on
+  the old code (f60664c) - 5 that need a GPU (CPU-only session), `test_a_dying_worker_gives_its_accepted_games_back`
+  (the same quota assertion alone, old and new), `test_graphs_match_eager_and_follow_new_weights` (flaky on both); 13
+  more failed only under the load (timeouts, phase caps) and passed alone or rerun. mtg-zero: pytest 271 passed, 1
+  skipped (`tests/test_worker_shards.py`: the worker's shards pass `RemotePlay._check` and load into `Window`), the
+  digests unchanged (53839c837bbaf034), `--test az` 48 passed.
+
+### 44.1 Fuzz jobs, the per-machine self-test, the runtime pack (no setting; zero-farm phase 1, 2026-11-12)
+
+**Why.** zero-farm phase 1 puts friends' PCs on fuzzing first (zero-farm DESIGN.md 6: fixed seeds of a game's own
+fuzz loops, no network, no training data at stake), and every network job must first prove, on that PC, that its
+evaluator answers as torch does (DESIGN.md 2.1 point 5) and load ONNX Runtime from a verified runtime pack, never from
+whatever is on the PC.
+
+**What.**
+* **Fuzz jobs** (`zero_worker::fuzz`; zero-farm PROTOCOL.md 5 `fuzz` and 5.1). A game binary registers a `FuzzGame`
+  (`zero_worker::main_with(&Worker { games, repo, selfplay, fuzz: Some(&MyFuzz) })`): `plan(mode, env)` - which of its
+  loops a job means, refusing settings the loop would ignore -, `run_chunk(plan, env, first, count, hooks)` - the loop
+  over a range of seeds, seed by seed through `ChunkHooks` (before / passed / side_failure) -, `repro(...)` and
+  `profile()`. The rest is game-agnostic: the lease's seeds are cut into chunks (at least the loop's `min_chunk`, so its
+  checks over a whole chunk keep their meaning; default max(min_chunk, count / 4 threads)) and up to `threads` chunk
+  processes run at a time (`<worker> fuzz-chunk <spec>`, one thread each, no console window, the worker's priority class
+  and EcoQoS state, `SetErrorMode` so a crash shows no dialog), each writing one progress line per seed (start / pass /
+  fail / side) to a file and its stdout + stderr (the loop's report, the panic hook's messages) to a log.
+  * A seed that panics ends its chunk (as the game's own loop stops at a failing seed): a `failure` event {seed, mode,
+    panic (the hook's text of the first panic recorded during that seed), site (that panic's `file:line`, '/'), repro,
+    output_tail (the log's last 200 lines / 32 KB)} and the chunk goes on from the next seed in a new process. A panic
+    outside the loop's per-seed catch while a seed is in play is that seed's failure; after the last seed (the chunk's
+    own checks) it is a chunk failure (repro + ` (the chunk: <count var>=n)`).
+  * A chunk process that dies without unwinding (abort, stack overflow) or plays one seed past `seed_timeout_s` of CPU
+    time (default 300 s; CPU time, so a PC that starves the worker is not a hang) is cut at that seed: the seeds before
+    it passed, the seed runs alone, and only if it crashes or hangs again is it the failure (`crash exit <code>` /
+    `HANG <mode>`, tools/fuzz_farm.py's names); either way the job goes on after it. No seed can take a lease down or be
+    handed out for ever.
+  * `yield` suspends the chunk processes (NtSuspendProcess; their CPU clocks stop) before `yielded`; `resume` resumes
+    them; `finish` lets each finish its seed; `quit` (or stdin closing) kills them. `fin` every second with the seeds
+    done; `end` {reason, stats, unfinished {seeds}} - the agent builds the 5.1 summary and its `x-ids` from the failures
+    and `end` (agent 0.1.3). The worker writes the same summary to `out_dir/fuzz-final.json` and announces it as a
+    `records` file only when the job asks (`announce_result`: announcing it to agent 0.1.3 would credit the seeds twice
+    over in `units_done`). Stats: games = seeds, failures, chunks, cpu_s, children's rss, provider "cpu" (CPU work: an
+    agent takes any other provider for a GPU job and holds it back on a PC without one - found by phase 1's end to end).
+  * Test faults: env `ZERO_FARM_TEST_FAULT=panic:S,abort:S,overflow:S,hang:S` injects them at seeds, taken only by a
+    build with debug assertions whose process has `ZERO_FARM_ALLOW_TEST_FAULTS=1`; anywhere else the key is refused.
+  * CLI: `fuzz` (a job from flags; `--keep-chunks`), `fuzz-check --mode M --env K=V ...` (what a campaign means and
+    its repro), `fuzz-chunk` (the child). A build's engine commit and profile come from its signed `manifest.json`
+    (else `ZERO_FARM_ENGINE_COMMIT` / `ZERO_FARM_PROFILE`); a manifest whose profile is not the compiled one is refused.
+* **Self-test** (`zero_worker::selftest`, PROTOCOL.md 5 `selftest`): a job or `checkpoint` line's `reference` (the
+  checkpoint's `reference.npz`, below) is answered by the job's own evaluator - this PC, this ONNX Runtime, this
+  provider - before its first batch, batch by batch as recorded; event `selftest` {provider, max_abs, ok, rows, items:
+  priors / value / margin / aux}; max_abs past 2e-5 (or not finite) is a fatal error: nothing is played. Stats
+  `selftest_max_abs`. The set's game / features / actions and checkpoint sha256 must be the network's.
+* **The reference set** (`zero.onnx_export --reference N --reference-batches <recorded batches>`, `write_reference`,
+  `check_reference`; section 41): N real rows of recorded driver batches (whole batches spread over the files, the last
+  cut) with torch's eager answers (`NetEvaluator`, CPU, batch by batch), `reference.npz` (meta, the driver's sparse
+  arrays, `batch_off`, priors / value / margin / aux); the export checks the graph through onnxruntime against it and
+  exits 1 past 2e-5, so a checkpoint whose graph fails is never published.
+* **ONNX Runtime from the runtime pack only**: `serve` loads it from the job's `runtime_dir` or `ZEROFARM_RUNTIME_DIR` (a
+  network job without either is refused); on Windows the MSVC runtime next to `onnxruntime.dll` (the pack's app-local
+  copies) is loaded first by full path, so ONNX Runtime binds to it whatever the PC's System32 holds (ONNX Runtime 1.31.1
+  is linked with toolset 14.44 and imports `_Mtx_lock`: an older msvcp140 crashes it). `info --runtime-dir D` says
+  where each DLL came from.
+
+**Tests and checks.** `cargo test -p zero_worker` (14 unit + 4 job tests: the self-test passing, failing on a 1e-3 prior
+and on NaN, a corrupted reference file refused, id ranges, faults refused without the switch); `tests/test_onnx.py` 17
+(`test_reference_set`: the rows are the file's, dtypes, ORT within 2e-5, a corrupted answer caught, too few rows / no
+belief row for an auxiliary head refused). mtg-zero's `tests/test_worker_farm.py` runs it all through `mtgz-worker serve`
+(ENGINE.md 114.2 there): fuzz over aw/1, refusals, yield / resume / quit, injected panic / abort / stack overflow / hang
+isolated to their seeds, the self-test passing with a small random MTG network and a corrupted reference stopping the
+job before any game. zero_search unchanged.
+
+**Measured** (2026-11-12, the desktop, CPU only, busy with the live Delver run): eoe1 iter 80's reference set from
+phase 0a's recorded batches: 256 rows (7 belief, 60 value-only) in 3 batches, 357 KB; onnxruntime vs torch 4.6e-6 (margin;
+priors 4.5e-7, value 1.2e-6, aux 2.7e-7); `mtgz-worker`'s self-test on it 4.59e-6 in 0.16 s; with one prior off by 1e-3 the
+job stops before its first game.
+
+### 44.2 Eval jobs and farm head-to-heads (no setting; zero-farm phase 2, 2026-11-12)
+
+**Why.** An A/B of two checkpoints (zero.h2h) costs hours of a desktop's CPU; zero-farm (PROTOCOL.md 5.2, rev 5)
+lets friends' idle PCs play the games of an evaluation match. Each eval lease is a block of the match's game ids;
+the native worker plays exactly those games of the match a run's own evaluation would play, and the desktop reads
+the rows like a local match.
+
+**What it does** (`zero_worker::evaljob`, `zero.farm_eval`, `zero.farm_h2h`):
+
+* **The games**: an eval job of games `gid_base .. gid_base + games` between two seats (`{"net": <gen>}` - a
+  network of the job's `models` - or `{"bot": <name>}`, a built-in bot; `ext:` refused) is `Run.play_match`'s
+  match: seats `Run.nn_seat(key, c['eval_sims'])` ('m' in seats[0], 'o' in seats[1]; `settings::eval_seat`, the
+  `games.nn_seat` port the self-play seat now shares), game g with `seats` for even g and the seats swapped for
+  odd g, `Run.driver(table, seed, conc=min(conc, games), paired)` - the run's `eval_spec`, threads, groups,
+  max_steps (`settings::eval_driver_cfg`; a job's own threads / conc / groups over the run's, as for self-play).
+  The worker plays the lease as a rolling `queue_only` driver with the lease's setups all queued before its first
+  resume and `set_first_gid(gid_base)` (docs/search.md 2.16): with one group, the fixed table's batches in its
+  order. `eval_spec` must be set (Python falls back to the game package's `eval_specs` hook, which a worker cannot
+  run): the desktop resolves it (`farm_eval.resolve_eval_spec`, `Run.driver`'s rule).
+* **The networks**: one ONNX Runtime session per generation of the job's `models`, each file's sha256 checked
+  and each self-tested before any game (`selftest` with its `gen`; a failure is fatal); a batch goes to its key's
+  generation (`ByKey`). Stats' `selftest_max_abs` is the largest of them.
+* **The rows**: one JSON line per game, `{"gid", "pair", "seats", "result", "margin", "rounds", "over"}` (`pair`
+  gid // 2, null unpaired; `seats` that game's order; `result` per seat in it; `margin` seat 0's score minus the
+  best other seat's, `Run.play_match`'s margin from seat 0) exactly as `json.dumps(row, separators=(',', ':'))`
+  writes it (`evaljob::row_json` = `farm_eval.row_json`). Files `e_SSS.jsonl` of whole pairs, every 16 complete
+  games or 120 s and at the end, each announced by `evals` (`shard`'s fields). `finish` drops the queued setups
+  (`Driver::clear_queue`) and the games in flight finish; `quit` ends the driver's phase and flushes what
+  finished (a pair's lone game too); yield / resume as for self-play; `checkpoint` is refused (non-fatal).
+* **check-config --eval** (`classify::classify_eval`): the settings an evaluation match reads
+  (`settings::EVAL_READS`, 33) are `play`, every other known setting unused (`trainer`: a self-play feature that is
+  Python-only does not change an evaluation's games), unknown keys refused; then the match's driver is built (the
+  seats' checks, the eval spec, the bots of the game). `serve` refuses an eval job whose settings fail it.
+  `tests/test_worker_settings.py::test_eval_jobs_read_what_an_evaluation_match_reads` checks EVAL_READS against
+  the keys `Run.nn_seat` and `Run.driver` read (an instrumented dict over the variants that read conditional
+  ones). A game package's own run settings (`GamePackage.settings`, 40) are classified by the worker binary
+  (`Worker::package_settings`; MTG Zero lists its 13).
+* **The softmax** (`eval::softmax_exact` / `onnx_parity.exact_softmax`): the generic step's exp is now computed
+  through a fixed sequence of float64 IEEE operations (Cody-Waite reduction by ln 2, the degree-13 Taylor
+  polynomial by Horner, an exact scaling by 2^n, one rounding to float32; no libm, no FMA) and the sum in float32
+  in order, so the native worker on any machine and numpy compute the same priors bit for bit. numpy's float32
+  `exp` differs from it in the last bit on 32% of 150k points in [-110, 0] (and so did the CRT's `expf` the worker
+  used): one bit of a prior can turn a searched move, and the gate compares games byte for byte. The new exp equals
+  float64 `exp` rounded to float32 on all 150k points. Every evaluator that uses the generic step (the worker's,
+  `OnnxEvaluator`, `check_reference`) uses it; `infer.segment_softmax_np` (torch's evaluators) is unchanged.
+* **`python -m zero.farm_h2h`** (game packages wrap it: `python -m mtgz.az.farm_h2h`): `--a`, `--b`, `--games`,
+  `--build`, `--runtime` [`--config` | `--preset`] [`--sims`] [`--name`] [`--seed`] ...: the settings (default: A's
+  run's config.json, resolved; `--sims` sets eval_sims; eval_spec resolved; the seats checked), both checkpoints
+  exported (`onnx_export`, packed) with reference sets (256 rows of a short recorded self-play of A, or
+  `--reference-batches`; checked through onnxruntime, 2e-5), the run `h2h-<slug>` put with `eval: null`, the
+  graphs and reference sets uploaded, gens 1 (A) and 2 (B) registered, then the eval batch (`checkpoints [1, 2]`,
+  seats [{"net": 1}, {"net": 2}], paired); then it polls the results, reads each chunk as the coordinator credits
+  it (its `ids` rows, plus its `also` entries' rows: a pair counts only when both games come from one lease),
+  acks what it saved and prints a progress line, and at the end A's score +- the pair se, the Elo difference with
+  its 95% interval, the games and the machines, and the JSON line `zero.h2h.summary` gives (plus `elo_95`,
+  `machines`, `run`). `--resume NAME` re-attaches (every step idempotent, state in `~/.zero-farm/h2h/<run>/`),
+  `--cancel NAME` pauses the run. The admin token is read from `~/.config/zero-farm/admin_token` and never printed.
+
+**Not zero.h2h's seats.** zero.h2h builds its seats from `games.nn_seat(key, sims, c_puct, chance_k)` and the
+checkpoint's run's rule keys (`run_rule`), and plays the game package's default spec unless `--spec`: it leaves out
+the run's `margin_w`, `redet` and `eval_cache` and its `eval_spec`. A farm head-to-head plays the run's own
+evaluation (Run.play_match's seats and spec) - the same as zero.h2h for a run whose margin_w is 0, redet on,
+eval_cache 0, when zero.h2h is given `--spec <eval_spec>`. The readout's fields are zero.h2h's, so the numbers
+compare directly. (Since 44.3 zero.h2h plays a run's evaluation itself: its seats and spec are these.)
+
+**Off by default.** Nothing in a run changes: an eval job is a worker's, `zero.farm_h2h` a desktop command.
+The softmax change touches only the ONNX evaluators (the worker's and `OnnxEvaluator`, the farm's), never a run's
+torch inference.
+
+**Tests and checks.** zero_search: `a_queued_rolling_driver_plays_a_fixed_tables_match_batch_for_batch`,
+`clear_queue_starts_no_new_game` (153 pass). `cargo test -p zero_worker`: 17 unit (the exp equals float64's rounded,
+the softmax, check-config's eval classes and package settings, compact JSON) + 5 eval job tests on the toy game
+(the rows, whole pairs per file, a lease of games 6.. equal to the whole match's rows, yield / resume changes
+nothing, quit / finish, network against the bot, the refusals) + the 4 job tests. `tests/test_farm_h2h.py` (a fake
+coordinator that plays the batch with the uploaded graphs and hands it out as the coordinator credits it). MTG
+Zero: `tests/test_worker_farm.py` (an eval job over aw/1 byte-identical to the Python path on small random MTG
+networks, a lease of the second pair, network against the heuristic bot; check-config --eval and the package's
+settings).
+
+**The eval gate** (`tools/worker_eval_gate.py`): the Python path - `farm_eval.match_driver` (Run.play_match's
+driver) driven by `infer.drive` with `OnnxEvaluator` on the same graphs - against `mtgz-worker eval`, the same
+settings (groups 1), seeds, search threads (4) and ONNX Runtime threads (4); every row compared byte for byte, and
+the first 60 batches each side sent in every array.
+
+**Measured** (2026-11-12, the desktop, CPU only, shared with the live runs): the eval gate, eoe1 iter 80 (A) against iter 70 (B), eoe1's settings
+with groups 1 and 4 search + 4 ONNX Runtime threads on both sides, eval_sims 32, the 'cq' rule, paired:
+
+| case | games | rows identical | batches compared | native | Python | readout (zero.h2h.summary) |
+|---|---|---|---|---|---|---|
+| iter 80 vs iter 70, seed 31 | 20 | **20 of 20** | 60, identical | 190 s | 230 s | A 0.500 +- 0.105 (pairs: 2 both won, 6 split, 2 both lost) |
+| iter 80 vs iter 70, seed 1031 | 40 | **40 of 40** | 60, identical | 881 s | 698 s | A 0.550 +- 0.050, Elo +35 (95%: -34 .. +106) |
+| iter 80 vs the heuristic bot, seed 7 | 12 | **12 of 12** | 60, identical | 27 s | 34 s | iter 80 scores 1 of 12 (eoe1's own evaluation: 22 +- 4% of 100) |
+
+(the desktop at 100% CPU during the second; both sides' self-tests 7.0e-6 / 4.6e-6.) **A lease is the match's games**:
+leases of games 0..10 and 10..20 (conc 10 instead of 20: other batches) played the same 20 rows, byte for byte, as the
+20-game match. **Settings, every preset and run config** (`tools/driver_settings_dump.py --compare-worker --eval`): the
+eval driver of 82 of 82 MTG Zero presets and run configs is the same in the worker as in Python (`toy-cotrain-smoke`
+refused by both before); the self-play path after the seat port's refactor: 76 agree, 6 refused as Python-only, 0
+different (as before). **End to end** (MTG Zero ENGINE.md 114.4): a local coordinator (rev 5) and the real agent engine
+(0.2.4) with the published worker build played a farm_h2h batch of 8 games in two leases (groups 3, the runtime
+pack's ONNX Runtime): every per-gen self-test passed, all 8 games credited, and the 8 rows are byte-identical to a local
+Python evaluation of the same 8 games in one driver. The exact exp equals float64 `exp` rounded to float32 on 150,479
+points of [-110, 0]; numpy's float32 `exp` differs from it on 47,643 of them.
+
+### 44.3 Signed definitions, one meaning of a model's sha256, zero.h2h = a run's evaluation, farm_report (no setting; zero-farm phase 2b, 2026-11-12)
+
+**Why.** zero-farm's security review (2026-11-12, findings H2, H3, M2) found that the coordinator - or anyone with its
+admin token - chose everything a friend's PC downloads and runs: the job JSON, the networks (any ONNX file with a
+matching hash it also wrote), the worker build. PROTOCOL.md rev 6 section 7 moves that choice to the desktop: every
+run or campaign the farm works on is described by a **definition** signed with a data key the coordinator never holds;
+agents build their job lines only from its templates. The desktop tools have to produce those definitions.
+
+**What it does.**
+
+* **`zero.farm_def`** (desktop only): `definition/1` documents - kind (`run` | `campaign`), id, version, created,
+  expires, game, builds (the worker builds allowed), runtime, checkpoints (`{"<gen>": {model_sha256, model_size,
+  reference_sha256, reference_size}}`), jobs (`selfplay` / `eval` / `fuzz` templates, exact; null when unused) -
+  checked exactly as zero-farm's `agent/common/src/definition.rs` checks them (`farm-release define` refuses to sign,
+  and an agent to run, anything else; `validate`): a template holds only its kind's keys (self-play `settings`; eval
+  `settings`, `seats`, `paired`; fuzz `mode`, `env`, `announce_result` - never a per-lease field such as `seed`),
+  **no string or key anywhere in a template looks like a path** (`/`, `\`, `..`, a drive `C:`: `looks_like_path`), seats
+  `{"net": gen}` / `{"bot": a built-in name}` whose gens are all signed checkpoints, `game` a slug, 1 to 64 distinct
+  24-hex builds, files of 1 B to 1 GiB, a campaign fuzz-only, a run never fuzz. The **version** is strictly increasing
+  per (kind, id): the coordinator's current one (`GET /v1/admin/run|campaign/{id}` -> `definition`) or the archive's
+  newest, whichever is larger, + 1. The **archive** `~/.zero-farm/definitions/<kind>/<id>/<version>/definition.json`
+  keeps every definition as written (the signed bytes, never re-serialised; a version is never rewritten with other
+  bytes), with farm-release's `definition.json.minisig` and, once published, `published.json` (url, version, sha256:
+  `published_to`). **Publishing** is zero-farm's `farm-release define <definition.json> --key <data key> --publish
+  --url <url>` (`--farm-release` / env ZEROFARM_FARM_RELEASE, default `E:/cargo-target/zero-farm/main/release/
+  farm-release.exe`; the data key `~/.config/zero-farm/data.key`); the admin token (`~/.config/zero-farm/admin_token`)
+  goes to it in its environment (ZEROFARM_ADMIN_TOKEN), never on its command line, and is scrubbed from its output.
+  Its one JSON result line must name this kind, id, version, key and sha256 with `published: true`, the signature must
+  be next to the file, and the coordinator's answer must then name the version as current (an older coordinator names
+  none: a note). The farm tools' HTTP client (`Client`) now lives here.
+* **`zero.farm_h2h`** puts the run, then **its definition** (builds [the worker build], the runtime, gens 1 and 2 with
+  their graphs' and reference sets' sha256 and sizes, `jobs.eval` = {settings, seats, paired}), then the gens, then the
+  eval batch whose job object **is** the template (`eval_job`): the coordinator issues leases only within it.
+  * **Its settings are the eval job's only**: the run's resolved settings minus everything the worker build's own
+    `check-config --eval --json` does not call `play` (`play_settings`: what an evaluation match reads, zero_worker's
+    EVAL_READS, 33 keys; eoe1: 33 of 167), checked again by the worker on their own, and giving the seats every setting
+    gives (`Run.nn_seat`). No trainer-only key (`preset`, `spec`, `resolver_init`, paths) reaches a definition.
+    `--worker` - the worker build's executable, whose `info` must name the build and the kind eval - is now required.
+  * **No `--seed`**: a template carries no seed, so the batch's base seed is the coordinator's, derived from the run's
+    name (32-bit FNV-1a, zero-farm `baseSeed`; `coordinator_seed`, kept in the state): the same name replays the same
+    games.
+  * The definition's `game` is the worker build's (its signed manifest, `GET /v1/admin/artifact/builds/<id>/
+    manifest.json`, checked against the build id: "mtg" for every MTG Zero run, as PROTOCOL.md 7's example has it - a
+    run's settings game "mtg_eoe" is not even a slug), and `--runtime` must be the runtime pack that manifest requires
+    (`worker_game`, checked before the export). Once per head-to-head (state `definition`; `--resume` publishes an
+    unpublished one, never a second version); `--expires-days` (30), `--key`, `--farm-release`, `--defs-dir`.
+* **A model's `sha256` is its file's** (`zero_worker`): the self-play job line's `sha256`, the `checkpoint` line's and
+  an eval job's `models[gen].sha256` all name the model FILE's sha256 (the lease's, the definition's `model_sha256`),
+  checked by `job::check_file_sha256` before ONNX Runtime reads the file (and before a job without `gen` reads the
+  graph's `checkpoint_iter`). Phase 0b's self-play line compared it with the graph's `checkpoint_sha256` metadata
+  instead (the torch checkpoint's hash), an eval job with the file: one meaning now, and the graph's checkpoint hash
+  stays metadata (`Expect.sha256` is gone). The error names the job's hash, never the file's (no hash of a file a job
+  names leaves a PC: H3).
+* **`zero.h2h` plays a run's evaluation.** Each side's seat takes its run's `margin_w`, `redet` and `eval_cache`
+  (`Run.nn_seat`'s; `run_seat_keys`, the run's settings resolved as the run and farm_h2h resolve them,
+  `run_settings`), and the match is played at A's run's evaluation spec (`Run.driver`'s rule: `eval_spec`, else the
+  game package's eval spec of the run's spec; `run_eval_spec`, `match_spec`, a note when B's run evaluates at another)
+  unless `--spec`. 44.2's "Not zero.h2h's seats" no longer holds: an h2h of a run's checkpoints plays the games of its
+  evaluation and of a farm head-to-head at the same settings. **A deliberate change of a tool** (no run plays or trains
+  differently): for a run with margin_w != 0, redet off, an evaluation cache or an eval spec of its own (MTG Zero: every
+  run - its evaluation decks), zero.h2h's games differ from before; without a run config.json nothing changes.
+* **`python -m zero.farm_report`**: the owner's own machines on zero-farm's admin page. The coordinator counts only its
+  agents' work; the desktop playing its runs, the MacBook and rented Vast boxes - all driven through zero-core's SSH
+  remotes - were invisible there. Every 5 minutes (the Task Scheduler task ZeroFarmReport, `--install-task`: the
+  current user, logged on, never SYSTEM; `pythonw -m zero.farm_report`, no window; `--uninstall-task`) it reads the run
+  directories changed in the last 24 h (the config's roots, default `~/<game>/runs` and `E:/<game>/runs` of the zero
+  games; each real directory once) and POSTs `{reporter, t, sources}` to `/v1/admin/external` with the admin token, one
+  source per machine (`id`, `name`, `kind` local | ssh | vast, `hardware`, `online`, `working_on` ["run:<id>"],
+  `selfplay_games`, `eval_games`, `fuzz_seeds` in the last 1 h and 24 h, `busy_h_24h`). Self-play games are each
+  metrics row's `selfplay.games` (this machine) and `selfplay.remotes.<name>.games` / `selfplay.remote.games` (the games
+  the shared quota accepted, each counted once), timed at the end of the self-play phase (`time - seconds +
+  phases.selfplay_s`); eval games each evaluation's `eval_*.games` and `extras.*.games` plus its Elo matches from the
+  pools' results.json, local from the metrics row or remote from the evals.jsonl row under its `host`. A fork's copied
+  rows count once, for the run that played them (the oldest directory); a run that lived on a Vast box
+  (`ON_VAST*.json`) credits that box; Vast hardware from mtg-zero tools/vast.py's ledger. The Mac's fuzz seeds come
+  from one read-only ssh that parses its fuzz farm's `logs/farm.log` chunk lines; an unreachable Mac is `online: false`
+  with null seeds and never fails the report. `busy_h_24h` is the union of a machine's work intervals (iterations,
+  remote self-play running time and linger, remote evaluations, fuzz chunks), so at most 24. Stdlib only (the task
+  imports nothing heavy); 5xx and network errors retried 3 times, a 4xx never; the token never printed or logged;
+  `--dry-run` prints the report.
+
+**Off by default.** No run setting; nothing in a run changes. The worker's `sha256` change touches only jobs that send
+one (the agent sends it from the definition from rev 6 on); zero.h2h's change is called out above; farm_report only
+reads run directories.
+
+**Costs.** One `farm-release` call (a signature, an upload of a few KB, a registration) per definition version;
+farm_report about 1 s every 5 minutes (one ssh).
+
+**Tests and checks.** `tests/test_farm_def.py` (4: documents and their refusals - every rule of definition.rs above:
+a seed, a path in settings, a drive, `..` in a list, a key with `/`, an external bot, a non-slug game, a 1 GiB + 1
+file, fuzz modes and env; a worker build's game from its manifest (another build's manifest, a runtime build, another
+runtime: refused); versions, the archive and its published marker, publishing through `tests/farm_release_stub.py` - a
+stand-in farm-release that checks a definition with `farm_def.validate`, records its arguments, checks the token
+arrived in its environment, writes a signature, registers the definition in a state file a fake coordinator reads and
+prints the real tool's JSON line -, the coordinator naming another version, a failing farm-release, the token
+scrubbed). `tests/test_farm_h2h.py` (3): the end to end with the stub and `tests/worker_stub.py` (a worker's `info` and
+`check-config --eval --json` by EVAL_READS), a fake coordinator that plays the batch at the name's seed and accepts it
+only when its job is the definition's template and each registered gen the definition's file; the job's settings are
+exactly EVAL_READS and path-free; a runtime the build doesn't require is refused before the export;
+`test_zero_h2h_plays_the_runs_evaluation` - a toy run with margin_w 0.5, redet 0, eval_cache 64, chance_k 1, c_puct
+1.5: zero.h2h's seats equal `Run.nn_seat`'s key for key, its 8 paired games equal `farm_eval.match_driver`'s row for
+row, and the spec rules (with the old seats the same run's games differ: checked by hand). `tests/test_farm_report.py`
+(17: fixture runs in the real formats with local, mac, vast:line, vast:w1, vast, gpu:1 and one-host rows, a
+co-training resolver, a fork, a box-hosted run, rows without `time`, a stale run, a name clash, Elo pools; a fake Mac
+online and offline and the real fuzz-log parser; a fake transport for the body, the bearer, retries and redaction;
+dry run; the exact install / uninstall commands, mocked; a light import). `cargo test -p zero_worker`: 18 unit (new:
+`a_models_sha256_is_its_files_checked_before_it_is_loaded`) + 5 eval job + 4 job. MTG Zero (ENGINE.md 114.5):
+`tests/test_worker_farm.py` sends the file's sha256 on a self-play job (a wrong one - the graph's checkpoint hash,
+which phase 0b accepted - ends the job before the graph is read) and `farm_h2h.play_settings` with the real
+mtgz-worker; `tests/test_farm_campaign.py` (fuzz campaigns with definitions).
+
+**Measured** (2026-11-12, the desktop): the real `farm-release define` (zero-farm `agent` branch, 0.2.5; sign only,
+nothing published) signs eoe1 80 v 70's head-to-head definition and the live fuzz campaign's, both made by these tools
+(MTG Zero ENGINE.md 114.5). farm_report: a real dry run in about 1 s with the Mac's ssh (eoe2e: 4,800 self-play games
+and 1.06 busy h on the desktop, 632 eval games on the Mac, 303,410 fuzz seeds in 24 h); replayed on 11-07's runs with
+mac + vast:line + vast:w1 (6 runs, 0.5 s) it reproduced an independent recount exactly (318,511 / 63,268 / 905,122 /
+962,469 self-play games in 24 h).
+
+### 44.4 One session factory for every execution provider; probe-providers (no setting; zero-farm phase 4, 2026-11-12)
+
+**Why.** zero-farm PROTOCOL.md 8 (rev 7): friends' GPUs of every vendor, each accepted only if it answers as the
+CPU and torch do.
+
+**What it does.** `session::create_session` builds every ONNX Runtime session of the worker (jobs through
+`build_evaluator`, the gate tools, `read_metadata`): the job line's `providers` in order (cpu last), each built on
+the job's adapter (`gpu`, a LUID) and accepted only if the reference set answers within 2e-5 twice, bit-identical
+(a GPU provider never without a reference set, never when ONNX Runtime gives it no node); the nodes it leaves to the
+CPU come from ONNX Runtime's verbose node placement and go into the `selftest` event. DirectML (built into Windows
+ML's ONNX Runtime), CUDA and a standalone TensorRT-RTX by name; Windows ML's catalog providers (TensorRT-RTX, AMD
+GPU, MIGraphX, OpenVINO; `winml.rs`, the flat C API) as plugin libraries bound by LUID. GPU providers take whole
+batches (up to `GPU_CHUNK` 1,024 rows), the CPU keeps 64-row pieces. `release_device` drops the session (yield).
+`probe-providers` runs the factory's steps per provider and adapter on a built-in graph (`crates/worker/probe/`,
+from `tools/onnx_probe_graph.py`: every operator of eoe1's and Delver's graphs) or a real network, and times them.
+
+**Off by default.** A job line without `providers` is `["cpu"]`: the same CPU session as before.
+
+**Tests and checks.** `cargo test -p zero_worker`; measured on an RTX 5090, an Intel UHD 770 and an RTX 4070 Ti
+(Windows 10): zero-farm-notes phase4-gpu.md (DirectML and CUDA pass; TensorRT-RTX 1.2 refuses both packings).
+
+### 44.5 The probe's graph variants: one round trip to a PC we can't reach (no setting; zero-farm AMD GPU work, 2026-11-12)
+
+**Why.** Windows ML's AMD GPU providers (AMDGPUExecutionProvider 1.8.65 and the deprecated MIGraphX one) install on a
+friend's RX 9070 XT and then fail on the probe graph (`hipMemcpyWithStream(output_data, gpu_resource.data(),
+resource_shape.bytes(), DeviceToDevice)`: "invalid argument" - the copy ONNX Runtime's MIGraphX provider makes for the
+partition outputs MIGraphX did not bind as `#output_N` program parameters), and DirectML passes there at a tenth of the
+CPU's speed. That PC is reached only through canary builds and the agent's probe: each question costs a release and a
+friend's day, so one build has to answer many.
+
+**What it does.** A diagnostic worker build embeds a variants archive: `ZERO_PROBE_VARIANTS=<variants.npz>` when it
+is built (`crates/worker/build.rs`); `tools/onnx_probe_variants.py OUT.npz [--net NAME=MODEL,rows=REF[,static=1]...]`
+makes it. It is never committed (it may hold real networks). `probe-providers` then runs, after its own report (logged
+first), every variant on every provider the runtime pack offers (`probe_variants.rs`): each (group, provider) in a
+child process (`probe-variant`; a provider that crashes the process costs one variant and the child is started again),
+one worker-log line per variant as it finishes, the whole set under `--variants-deadline` (780 s of the agent's 900).
+The probe's verdict (`providers`, `results`) is unchanged; the variants go under `variants`. Kinds:
+* `raw`: any graph with its inputs and expected outputs (ONNX Runtime's CPU answers made with the archive): micro graphs
+  each testing one way a provider can mishandle an output (an alias of an input, a constant or Shape output, broadcast /
+  transposed / reshaped views, an empty output or batch, a scalar, int64 / int32 / bool outputs, chained outputs), one
+  operator each as our graphs use them, the probe graph cut after 1/8 ... 8/8 of its nodes (outputs = the tensors
+  crossing the cut) on its 1, 7, 64 and 120-row reference batches, the whole graph at lower graph optimisation levels,
+  and an `ORT_MIGRAPHX_DUMP_MODEL_OPS` run whose partition files are read back (inputs, outputs);
+* `net`: a zero-onnx/1 graph on real rows (a reference set cycled to batches of 4 ... 1,024): a GPU provider's answers
+  against the CPU's on the same graph (max abs per output, twice bit-identical) and rows/s per batch size, the CPU at
+  1/2/4/8 threads; `static` = one session per batch size with free-dimension overrides `B`, `B + 1`, `nnz` and the batch
+  padded by one dummy row carrying the padding non-zeros (feature 0, value 0); the job's own networks are taken from the
+  agent's cache (`<root>\cache\ckpt\<run>\<gen>\`, the newest gen of each run).
+`session::variant_session` binds a provider exactly as the factory does (the same session options; dimension overrides
+and an optimisation level on top).
+
+**Off by default.** Without `ZERO_PROBE_VARIANTS` at build time nothing is embedded and `probe-providers` runs as before.
+
+**Tests and checks.** `cargo test -p zero_worker probe_variants` (npy round trip incl. 0-d / empty / bool, the static
+batch's dummy row, NaN handling, the log line); a local run on the desktop (Windows ML pack, CPU + DirectML on the RTX
+5090 and the UHD 770): 141 results in 47 s, every micro graph and cut passing on DirectML.
+
+## 45. Self-play records and the farm pool (`pool:<farm run>` in `selfplay_remote`, `pool_*`; zero-farm phase 3, 2026-11-12)
+
+### 45.1 Why
+
+zero-farm's friends' PCs (zero-farm DESIGN.md 6.1, 7) play a run's self-play with the native worker (44). A shard of an
+EoE game is ~25 KB of rows a friend's upload would carry and the trainer could not check; the game's record - its seed,
+every real move and only what the search produced - is ~2 KB, and replaying it on the trainer rebuilds every row exactly
+and is its validation. The trainer's side is one more kind of remote: the farm pool.
+
+### 45.2 What it does
+
+* **Records** (docs/search.md 2.17): `Driver::set_trace` and `zero_search::record` (`game_json`, `replay`, `game_seed`):
+  a record replays into the rows the driver emitted, bit for bit (features, options, auxiliary targets, z, sc; pi, q, net
+  from the record as float16 / their ids), a chained contest's episodes included (42); `<pkg>._engine.replay_rows`.
+* **The worker** (`zero_worker::records`): a served self-play job writes records (`records` events; `output: shards` the
+  shards of before, `both` for the gate); the selfplay CLI's default stays shards.
+* **The pool** (`zero/farm_pool.py`): a `selfplay_remote` name `pool:<farm run>` - alone or next to remote hosts, in the
+  setting or the `selfplay_remotes` file (34) - makes a thread of the run that publishes each iteration's checkpoint on
+  zero-farm (exported with its reference set, uploaded, a new signed definition version that adds the gen, and only then
+  the gen registered current: leases switch only to gens a definition names), polls the farm's results, replays every
+  credited game of every records chunk (the header's game, features, actions, spec, auxiliary targets, the farm run's base
+  seed and worker build checked; each game's seed must be its game id's), refuses a chunk whose any game fails (counted per
+  machine, kept in `<run>/debug/pool/`), holds the games and lets the open iteration's quota take them oldest first exactly
+  as a remote worker's (RemotePlay.accept_pool), writing their rows as ordinary shards (`data/iter_i/pool-<machine>_SSS.npz`,
+  meta `source` 'pool', `machine`, `farm_run`), drops a game whose oldest row's network is older than `i - 1 -
+  pool_max_stale`, and posts the generation's running total (accepted + held) before each ack. It never holds a share of
+  the quota and the run never waits for it: RemotePlay.end closes its shards with what it accepted. With `selfplay_local` 0,
+  the pool counts as a remote taking work while a valid game arrived within `pool_live_s` (this machine then only trains;
+  when the farm goes quiet it plays again).
+* **The farm run's `min_agent`** (`pool_min_agent`, default 0.2.8; zero-farm PROTOCOL rev 9): sent with every `PUT` of the
+  farm run, so its leases go only to agents at or above it - 0.2.8 is the first agent that accepts a signed template naming
+  a split or double-faced card ("Rough // Tumble", rev 8), which an older agent refuses; agents of an older stable release
+  keep their other work (fuzz). '' sends none.
+* **Run alternates** (`pool_alternates`, `pool_alt_vendor`, default '' = none; zero-farm PROTOCOL rev 11, 9.4): worker
+  builds that are the same engine signed again for another runtime pack (one signed worker manifest per pack, 9.1) - the
+  CUDA pack, which the coordinator offers only to PCs with an NVIDIA GPU that may run GPU work (agents from 0.2.10), the
+  run's default pack to every other PC. `zero.farm_def.run_alternates` checks each from its manifest and its pack's (a
+  worker of the default build's game that requires a runtime pack) and takes `when.vendor` from the pack's `gpu.vendor`,
+  else `pool_alt_vendor` (a pack without `gpu`; a different vendor than the pack's is refused). They go into every `PUT`
+  of the farm run (`"alternates": [{"build_id", "runtime", "when": {"vendor"}}]`) and their builds into every
+  definition version's `builds` after `pool_build` (definition/1 unchanged: its `runtime` stays the default pack; an
+  agent accepts a listed build with the pack that build requires). Records whose header names an alternate's build
+  are accepted like the default's. Changed on a resumed run, the run is `PUT` again once the next gen's definition
+  (which lists the new builds) is registered. `zero.farm_h2h` takes the same as `--alt BUILD_ID` (repeatable) and
+  `--alt-vendor`, kept in its state for `--resume` / `--cancel`. None (the default): no `alternates` key, builds
+  `[pool_build]` - every `PUT` body and definition byte for byte as before (tests/test_farm_pool.py, test_farm_h2h.py).
+* **GPU lease size** (`pool_gpu_games_per_lease`, default '' = left out; zero-farm PROTOCOL rev 11, 9.4): the farm run's
+  `selfplay.gpu_games_per_lease` - the games of a lease the coordinator sizes for a GPU (`auto`: from the machine's bench
+  of the run's network, capped by the run's staleness window; or a number). Like the alternates it is `PUT` again on a
+  resumed run when it changed (state `put_extras`). `zero.farm_h2h` takes `--gpu-games-per-lease` for its eval batch,
+  and `--min-agent` for its run's `min_agent` (rev 9: a canary-only head-to-head); each is sent only when given.
+* **A worker build older than a setting**: its `check-config` calls a setting it doesn't know "unknown", a failure. When
+  this zero-core's `crates/worker/src/run_settings.json` classifies that setting `trainer` (the pool's own `pool_*`), the
+  pool's and `zero.farm_h2h`'s template check logs it ("worker build X doesn't know trainer-only setting K: ignored") and
+  carries on: a template carries only the keys the worker calls `play`, so the worker never gets it. Any other failure
+  refuses as before, and so does every failure without the table (no source checkout). So an already published worker
+  build keeps working with a trainer that has newer trainer-only settings (`zero.farm_h2h.config_refused`).
+
+### 45.3 Off by default
+
+No `pool:` name: nothing of it runs and nothing changes (`set_trace` is never called; `Record::step` stays 0; the pool_*
+settings are unused, classified `trainer` for check-config).
+
+### 45.4 Tests and checks
+
+* zero_search: `traced_games_replay_to_their_rows_bit_for_bit`, `tracing_changes_no_game_and_no_row`,
+  `a_tampered_record_is_refused`, `set_trace_before_games_and_never_with_branches`,
+  `chain::traced_contests_replay_to_their_rows_bit_for_bit`; zero_worker `records_replay_to_the_shards_rows_bit_for_bit`
+  (sparse and dense), `a_served_job_writes_records_only`; `tests/test_farm_pool.py` (4: a fake coordinator; the publish
+  order, the pool's shards == shards of the same games written directly over two iterations, a tampered record refused,
+  the total before the ack, a stale game dropped, `selfplay_local` 0; run alternates: the farm run's PUT bodies without
+  any byte for byte those of before, with one and a GPU lease size in every PUT and definition after a resume,
+  its records accepted);
+  `tools/worker_records_gate.py` (gate 3: a worker's records replayed by the trainer's path == its own shards of the same
+  games, bit for bit).
+* Gate 3 (MTG Zero, the desktop, 2026-11-12): eoe1's settings with iter 80's graph and a network switch to gen 81 after 8
+  games - 48 games, 5,471 rows with auxiliary targets, nets 80 / 81, 39 of 39 arrays identical in 3 files, 48 games' decks
+  compared; records 97.5 KB vs shards 1.17 MB. MTG Zero's tests (mtg-smoke, delver-smoke, eoe-smoke, eoe-choice-smoke with
+  value-only rows) and the best-of-three run's settings: MTG Zero ENGINE.md 114.6-114.7.
+
+### 45.5 Costs
+
+A traced game keeps its moves (2 bytes an action; an EoE game ~530) and calls `record_setup` once per game (episode). The
+pool's replay: ~19 ms an EoE game here (0.91 s for gate 3's 48), its held games' rows kept compacted (sparse float16).
+
+### 45.6 Records, the pool and variable-length rows (the merge of `feat/varlen` e5e1bb0 into `farm`, 2026-11-12)
+
+**Why.** MTG Zero's layout v7 (section 43) puts tail tokens and pointer overrides in the rows; its best-of-three run moves
+to it with the farm attached, so the farm's records, pool and worker must carry them.
+
+**The merge** (a merge commit, `farm` b0930da + `feat/varlen` e5e1bb0; base 2aab098). Conflicts, each resolved so both
+sides' behaviour survives: the driver's `Record` / its parked copy / the slot / `Done` / `GameResult` carry the farm's
+`step` and `trace` and varlen's `tail`, `ov`, `row_abort` and `abort_reason` (a traced game aborted at the row limit
+ends with its trace; a chained contest's trace and abort as each side had them); the bindings keep the farm's seat
+parser (`zero_search::settings`, 44) and gain varlen's `max_row_tokens` (`DriverArgs::max_row_tokens`, None: the game's
+limit - what every run uses), packers and row kinds, and `take_results`' rows their `abort_reason`; `ShardWriter.add`
+keeps varlen's R8 refusal and the farm's sample dicts that bring their features as `xs`; section 43 before 44 and 45.
+Run settings: `allow_draft_layout` and `infer_token_chunks` classified `trainer` for check-config (44).
+
+**What changed on the farm's side.** Records and `replay_rows` (docs/search.md 2.17): every replayed row is the driver's
+record row - head, tail tokens, overrides - and `replay_rows` / `take_game_records` return the `t_*` / `ov_*` arrays; a
+game aborted at the row limit has a record (`abort_reason`) that replays as aborted. The pool (45.2) checks a game's
+rows as `write_shard` would (the tail floats through the non-finite guard) and writes format v2 shards
+(`shard_format(cfg, info)`: the meta's `t_segs`, `option_pointers`, `max_row_tokens`; R8). A row-limit abort counts as
+a game, as a remote worker's does (its row in `fin`, no samples). zero-onnx/1's exporter refuses a network with tail
+segments, pointer overrides or gates and `OnnxEvaluator` a batch with either (R14, 43.8: zero-onnx/2 is section 46);
+until the native worker reads them (section 46) it refuses a game with tails or pointer overrides at its driver's
+settings (`settings::refuse_varlen`).
+
+**Off by default.** Nothing changes for a game without tail segments or pointer overrides: records are the same text,
+the pool's shards the same files, every replayed row the same bytes (`record_row` is `encode` for such a game).
+
+**Tests.** `driver::trace_tail_tests` (3, docs/search.md 2.17); zero_search's and zero_worker's suites, the farm's
+pytest files (`test_farm_pool`, `test_farm_def`, `test_farm_h2h`, `test_farm_report`, `test_worker_settings`,
+`test_onnx`) and varlen's tail files (`test_tail_rows`, `test_tail_shards`, `test_tail_loop`, `test_tail_remote`,
+`test_pack`) on the merged tree.
+
+## 46. zero-onnx/2: variable-length rows as one ONNX graph, and the native worker that feeds it (no setting; zero-farm, MTG Zero's layout v7, 2026-11-12)
+
+**Why.** MTG Zero's best-of-three run moves to layout v7 (section 43): rows with tail tokens past the fixed-width head,
+gated tail-only segments and pointer overrides. zero-onnx/1 (section 41) takes the head only - its exporter refuses
+such a network (R14, 45.6) -, so the farm needs a graph that takes the whole row, and a worker that feeds it.
+
+### 46.1 The interface
+
+A token network with tail segments, pointer overrides or gates (`net.varlen_features`) exports as **zero-onnx/2**
+(`onnx_export.onnx_version`); every other network exports zero-onnx/1, the same graph as before (46.4). zero-onnx/2's
+inputs are zero-onnx/1's five plus the driver's arrays of docs/search.md 2.15, all always fed (empty CSRs for rows
+without), every slot and override token in int32 pieces (no integer of the graph reaches 2^31: 46.7):
+
+| | name | type | shape | |
+|---|---|---|---|---|
+| in | `opt_off` | i64 | [B+1] | the rows' options (driver i32: widened) |
+| in | `opt_action` | i32 | [K] | each option's action |
+| in | `t_off` | i64 | [B+1] | the rows' tail tokens (B + 1 zeros for a game without tail segments) |
+| in | `t_seg` | i32 | [NT] | each token's segment (driver u16) |
+| in | `t_slot_hi`, `t_slot_lo` | i32 | [NT] | its slot (driver u32) as its high and low 16 bits (`slot_pieces`) |
+| in | `t_val` | f32 | [L] | each token's `width(seg)` floats, consecutive (the driver's) |
+| in | `ov_off` | i64 | [B+1] | the rows' pointer overrides |
+| in | `ov_opt` | i32 | [NO] | the option (its index in its row) |
+| in | `ov_seg`, `ov_col`, `ov_slot_hi`, `ov_slot_lo` | i32 | [NO] | the target (the driver's packed token: segment at bit 40, column at bit 32, slot below) as its segment, column and the slot's halves (`override_pieces`); segment -1: the generic logit (token -1), -2: any other negative token (refused) |
+| out | `policy`, `value`, `margin`, `aux` | | | zero-onnx/1's (the policy with the overrides applied) |
+| out | `refused` | i64 | [B] | per row, its tail tokens and overrides the network refuses (below); 0 everywhere or the batch is refused |
+
+Metadata: zero-onnx/1's, `zero_onnx` '2', `protocol` 'zero-onnx/2', and `tails` (JSON [[segment, name, width, head
+slots], ...]: the game's `game_info()['tails']`), `option_pointers`, `max_row_tokens`, `tail_width`, `gates` ({segment:
+g}). Packing: `packed` only.
+
+### 46.2 What the graph computes (`ZeroOnnx2`)
+
+What the eager evaluator computes (`NetEvaluator`: `rows.resolve` on the host, then `TokenNet.forward`, 43.5-43.7), in
+the `packed` graph of 41, with nothing of a network's own in the worker:
+
+* **The tail tokens.** Each token's row from `t_off` and its floats from `t_val` (each segment's width a table of the
+  graph: a token's `width(seg)` floats at the running sum of the widths before it, zeros up to the widest tail
+  segment), embedded as a head slot is: the segment's input map + its identity's embedding + `tail_base[k] +
+  pos_tail[k](psi(slot - count))` - every tail segment's maps as one product, each token's own picked by its segment
+  (`_TailEmbed`'s matrices); slot - count by 16-bit halves with a borrow, psi's 32 binary digits by integer division
+  of each half (ONNX's BitShift takes unsigned integers only), log2(n + 1) / 32 in float64 (n exact there) and
+  rounded, the sin / cos part from psi's own table (n mod 256 = the low half's).
+* **The packed list.** The N present head tokens (row-major, layout order) then the NT tail tokens; each row's tail
+  tokens follow its head tokens in the padded rows of the attention and the pooling (gathered in and back: no
+  scatter-add, 41's rule). A gated segment's tokens weigh g = max(theta, 0) (inference's gate values, constants of
+  the graph): the attention's float mask log w (-inf at g = 0: such a token changes nothing, exactly) and the pooling's
+  weighted mean; without gated segments the boolean mask and the plain mean of before.
+* **The overrides.** Each override's row from `ov_off`, its action `opt_action[opt_off[row] + opt]`, its target from
+  its pieces (a head slot: its place in the full token axis, `1 + Σ_{s' < s} count(s') + slot`, which must be present in its row; a tail token: the one of its row with
+  that (segment, slot), found by matching every tail token), its pointer logit in its column, a gated target's blended
+  with the generic logit as `torch.lerp` computes it (exactly the generic at g = 0, the pointer at 1); -1: the generic
+  logit of before the static scatter. Written after the static scatter of the head slots' actions (a tail token has no
+  static action), one write per (row, action).
+* **`refused`.** What torch raises on (R5, R6: `TokenNet._check_tail`, `rows.resolve`, `TokenNet._ov_index`) is counted
+  per row instead - a tail token of a segment without a tail or outside the network, a slot at or past 2^32 (a piece
+  outside [0, 2^16)) or inside its segment's head, a row's tokens not sorted by (segment, slot) or repeated; tail floats that do not fit the
+  tokens' widths (every row); an override of an option outside its row, a token below -1 (segment piece -2), a
+  segment or column out of range (a piece outside its field), a target head slot not present, a tail token the row lacks, a second override of the same action (which of
+  two would win is not defined). A refused override writes the dummy column. The worker and `onnx_parity.answer` refuse
+  a batch with any (`Refused`): never an answer torch would not give.
+
+### 46.3 The parity gate, the reference set, the Python evaluator
+
+`zero.onnx_parity` takes rows with tails and overrides (`Rows.tail` / `.ov`: `rows.Tail` / `rows.Overrides`; recorded
+batch files with `t_off` .. `ov_tok` and their meta's `t_segs`, v2 shards) and runs the gate on them: eager
+(`NetEvaluator` with the rows' tails and overrides) and `forward_static` (`rows.token_full`, `rows.resolve`) against
+the graph, every case twice; cases `varlen` (every row of the file with a tail token or an override, at most 1,024)
+and `overrides` (the rows with overrides: far rarer in a real game) besides the sizes, with their counts (rows with
+tails, tokens, overrides, gated tokens) in the result; a graph's nonzero `refused` fails the case (`Refused`). `OnnxEvaluator` takes zero-onnx/2 graphs (the batch's arrays, the graph's `tails`
+metadata for the widths) and refuses tails or overrides for a zero-onnx/1 graph. The reference set of a zero-onnx/2
+network (`write_reference`) holds its rows' tails and overrides (`t_off` i64, `t_seg` u16, `t_slot` u32, `t_val` f32,
+`ov_off` i64, `ov_opt` i32, `ov_tok` i64; meta `t_segs`, `option_pointers`, the counts), the batches holding overrides first,
+then those holding tail tokens; a set without a tail token (a network with tail segments) or an override (with option_pointers) is
+refused - a worker's self-test must answer them. `farm_h2h.record_rows` (the pool's rows) records on until its rows
+hold both (at most 4,096 batches, else it fails); `tools/onnx_record.py` keeps them (`--min-tail-rows`,
+`--min-overrides`).
+
+### 46.4 Off by default; tests and checks; measured (the export)
+
+**Off by default.** A network without tail segments, pointer overrides or gates exports zero-onnx/1 as before: the same
+graph (below; since 46.7 without the exporter's per-node annotations, byte for byte the earlier graph with them removed), its code untouched but for the R14 refusal and `slot_tokens` skipping tail-only segments (none in such a
+network). Nothing on a run's path imports these modules.
+
+**Problems met** (each handled in the code): ONNX Runtime 1.31.1's CPU `Clip` and `Min` on int64 answer wrongly
+outside the int32 range (Clip(4294967295, min 0) = 0; Clip(x, 0, 2^32 - 1) = 2^32 - 1 for every x; zero-onnx/1 only
+clips small values) - the graph clamps integers by Where (`_iclamp`); `torch.div(..., rounding_mode=...)` on int64
+exports through floats (a packed token decoded wrongly, measured), `//` and remainder export as integer ops (`>>` by a tensor does not export);
+ONNX Runtime reduces an empty axis to a wrong shape (ReduceSum over the last axis of a [0, 10] tensor gave [0, 10]) - a
+sentinel tail token and override keep every axis non-empty; a v7 game's override rows are rare (151 overrides in 76,647
+rows of 800 recorded batches, against 55,168 tail tokens), so the gate has a case of them and the reference set takes
+their batches first.
+
+**Tests.** `tests/test_onnx2.py` (9): parity on the toy's layouts - tails on items with identities and overrides into
+tail items, a gated tail-only segment shut and opened, a gated segment with a pointer column (the blend, g in (0, 1)) -
+on batches of 1-150 rows with leaf, value-only and belief rows, NaN in absent slots, the 64-row pieces, every case
+twice; slots up to 2^32 - 1, one row, batches with no tail token or no override; every refusal counted on its own row
+(an option out of its row, an absent head slot, a missing tail token, a column out of range, a second override of an
+action, a token below -1, a tail token outside the network or at a head slot, floats that do not fit); the interface,
+dtypes, metadata, no ScatterND reduction, a network without varlen features still zero-onnx/1; real toy_tail driver
+batches through `OnnxEvaluator` (games to the end within 2e-5 of eager); the reference set with tails and overrides
+and its refusal. `tests/test_onnx.py` (17, zero-onnx/1) unchanged and passing.
+
+**Measured** (2026-11-13, the desktop's CPU beside other sessions' builds and the live run; onnxruntime 1.31.1, torch
+2.11.0):
+
+* *The v6 export (pb1's path).* MTG Zero's best-of-three run pb1, iteration 82 (layout v6), exported as the pool does
+  (packed, its checkpoint id and iteration) with b0930da's code and with this tree's: zero-onnx/1, not byte-identical
+  (10,737,231 vs 10,746,295 bytes) only because the exporter writes each node's source annotations - stack traces with
+  the exporting checkout's file paths and line numbers (`pkg.torch.onnx.stack_trace` etc.); without them the two graphs
+  are byte-identical (every node, attribute, initializer, input and output) and the model metadata identical; their
+  outputs on the pool's own gen-82 reference rows (256, whole batches and 64-row pieces) bit for bit the same. The same
+  holds against the graph the live pool published for gen 82.
+* *The gate on real v7 rows.* pb1 iteration 67 widened onto layout v7 by `fork_run` (gates exactly 0; 56,384 features,
+  belief + deck head, 16 tail segments, option pointers), 800 driver batches recorded by `tools/onnx_record.py` from a
+  CPU self-play of the best-of-three spec (76,647 rows: 50,442 leaf, 24,884 value-only, 1,321 belief; 36,774 rows with
+  tail tokens, 55,168 tokens; 151 overrides in 42 rows): **15 + 8 cases (pieces), 0 failed**, worst ORT vs torch priors
+  5.5e-6, value 6.3e-7, margin 6.0e-7, aux 2.5e-7; run twice, the same results and the graph byte for byte the same
+  (export deterministic); the 42 override rows alone (151 overrides, 579 tail tokens): worst 1.0e-6. The same network
+  with every gate opened to 0.37 (the weighted attention and pooling, the blend): 15 + 8 cases passed, worst priors
+  5.5e-6, margin 7.2e-7; its override rows 1.0e-6. Every output over all 800 batches (whole and in 64-row pieces) hashed
+  in two processes: bit for bit the same. The reference set (256 rows of 3 batches: 189 rows with 386 tail tokens, 2 with
+  8 overrides): ORT within 1.9e-6 of torch. Export 51-55 s; the graph 17.6 MB.
+
+### 46.5 The native worker (`zero_worker`, docs/az.md 44)
+
+* **zero-onnx/1 and /2.** A worker build declares `zero_onnx: [1, 2]` (the manifest, `info`, the hello). A graph's
+  metadata says which (`session::check_graph`: zero-onnx/2's more inputs and the output `refused`), and
+  `session::varlen_of` checks a zero-onnx/2 graph's `tails` / `option_pointers` against the game's (`Expect::tails`,
+  `option_pointers`, from its `GameInfo`); a game with tail segments or pointer overrides refuses a zero-onnx/1 graph.
+* **Feeding it.** Each piece of a batch (the CPU's 64 rows by non-zero count, a GPU's whole batch) gets its rows'
+  options, tail tokens and overrides rebased (`session::varlen_piece`: each token's floats by the graph's widths; a
+  token of a segment the graph has no tail for, or floats that do not fit, is an error), the driver's arrays as they
+  are (u16 / u32 widened). A nonzero `refused` is the batch's error (the job's end, as any evaluator error): never an
+  answer torch would not give.
+* **The self-test and eval-batches** read a file's tail tokens and overrides (`selftest::read_batches`, one reader for
+  both: the meta's `t_segs` for the widths); the recorder (`--record-batches`) keeps them (tools/onnx_record.py's
+  arrays, the meta's `t_segs`, `option_pointers`).
+* **Shards: format v2** for a game with tail segments or pointer overrides (`shard::RowsFmt`, data.py's `rows_meta`):
+  sparse only (a dense shard is refused, R8), `x_version` 2, the meta's `t_segs` / `option_pointers` /
+  `max_row_tokens` after `x_format`, the members `t_ptr` int64, `t_seg` uint16, `t_slot` uint32, `t_val` float16,
+  `ov_ptr` int64, `ov_opt` int32, `ov_tok` int64 after `aux` (empty CSRs for the kind the game lacks), the tail floats
+  through the non-finite check; samples with tails or overrides for a shard of format 1 are refused. Records need no
+  change (the trainer's replay rebuilds the rows, 45.6); a game aborted at the row limit - the driver's own abort,
+  `max_row_tokens` (the game's: a worker never lowers it) - is recorded with its `abort_reason`, as a Python remote
+  worker's driver aborts it.
+* The step-1 guard (`settings::refuse_varlen`) is gone.
+
+### 46.6 Tests and checks; measured (the worker)
+
+**Tests.** `cargo test -p zero_worker`: 24 unit (`a_pieces_tails_and_overrides_are_its_rows_rebased`), 5 eval-job, 6 job
+(`records_replay_to_the_shards_rows_bit_for_bit` unchanged), and `tests/job_tail.rs` (3: toy_tail's shards are format v2
+- x_version 2, the meta's keys, the members' dtypes - and the records replay into exactly those arrays, tail tokens and
+overrides included; games aborted at the row limit are recorded with their `abort_reason` and replay as aborted, no
+shard; a dense shard of tail rows refused). `examples/zw_toy.rs`: the core's toy games as a worker binary.
+
+**Measured** (2026-11-13, the desktop):
+
+* *Gate 2 (a) on toy_tail* (`tools/worker_parity.py --package zero`, the native `zw_toy` against `remoteplay.Worker`,
+  24 games, groups 1): with the uniform evaluator the shards (273 rows) and the first 162 batches identical; with a
+  toy_tail checkpoint's zero-onnx/2 graph on both sides (the native worker through the CPU runtime pack's ONNX Runtime
+  1.31.1, Python through onnxruntime) the format v2 shards (272 rows, 3,353 tail tokens, 826 overrides) byte for byte
+  identical and the first 161 batches (of 3,289 rows with 40,425 tail tokens and 10,054 overrides) identical.
+* *The self-test on real v7 rows* (`zw_probe probe-providers` with the v7 graph and its reference set, Windows ML's
+  ONNX Runtime 1.28.3): the CPU passes, max abs 2.1e-6 against torch, twice bit-identical. **DirectML (the Intel UHD
+  770) is refused by the self-test**: the graph's `refused` is nonzero (63 in the first reference batch) and the
+  answers off by up to 0.29. Placement (onnxruntime-directml 1.24.4's verbose log): 1,866 nodes on DirectML, 53 on the
+  CPU (ScatterElements 10, Reshape 8, Add 8, Mod 7, Squeeze 6, Equal 3, Mul 2, Div 2, Concat 2, Cast 2, Sub, Log, Gather).
+  The cause, measured on the toy's debug graph: DirectML computes int64 in 32 bits - a packed override token (segment
+  at bit 40) and any value past 2^31 come out wrong (Where, Less, Mul on int64), so every override of a v7 row (its
+  segments are 2 and up) is misread. The worker then plays on the CPU (the factory's fallback). Not changed here: a
+  graph DirectML could run would take the override tokens as int32 fields (or keep the integer work off DirectML) - an
+  interface change for the owner to decide (zero-farm's GPU work); CUDA computes int64 natively (not measured: the
+  desktop's GPU belongs to the live run). **Fixed before any zero-onnx/2 graph was published: 46.7** (int32 pieces;
+  DirectML then passes).
+
+### 46.7 int32 integers (DirectML) and the exporter's annotations stripped (2026-11-13)
+
+**Why.** DirectML computes int64 in 32 bits (46.6): the first zero-onnx/2 interface fed the packed override tokens
+(segment at bit 40) and u32 slots as int64, and decoded them in the graph with constants of 2^32 and 2^40, so on
+DirectML every override of a v7 row was misread and the self-test refused the provider. Fixed before any zero-onnx/2
+graph was published, so the format needs no third version for it. Separately, the exporter writes each node's source
+annotations - stack traces with the exporting checkout's file paths and line numbers -, so a graph's bytes depended on
+where it was exported from and every graph carried a local path (the published ones too: the committed probe graph,
+46.5, and the pool's).
+
+**What changed.**
+
+* *The interface* (46.1): every tail slot as `t_slot_hi` / `t_slot_lo` (i32: its high and low 16 bits) and every
+  packed override token as `ov_seg` / `ov_col` / `ov_slot_hi` / `ov_slot_lo` (i32), split on the host:
+  `onnx_export.slot_pieces` / `override_pieces` (Python) and `session::override_pieces` / `varlen_piece` (the worker),
+  the same pieces. Token -1 is segment -1 (the generic logit); any other negative token segment -2 (refused, as the
+  packed token was); a token's segment is `tok >> 40` whole (one past the network's segments refused, not masked); a
+  slot outside u32 a high half of -1 (refused). Records, shards (format v2), the driver's packed `ov` arrays and the
+  reference-set files are unchanged - only the graph's inputs.
+* *The graph* (46.2) never forms an integer of 2^31 or more: slots compared and ordered by halves (a row's (segment,
+  slot) order as (segment 2^16 + high, low)), slot - count by halves with a borrow, psi's 32 digits by integer division
+  of each half (2^0 .. 2^15), log2(n + 1) in float64 from the halves (n exact there), n mod 256 from the low half; a head
+  target's slot formed only where it is below its segment's head; a target's pointer logit by row then column (no flat
+  index row C + column); a refused option replaced by 0 before its sum. Pieces outside their fields are refused, never
+  read wrapped.
+* *Export-time refusal* (`check_int32`, zero-onnx/2 only): any integer constant outside int32 - an initializer, a
+  Constant's value / value_int(s), a ConstantOfShape's value, any tensor attribute, in subgraphs and functions too - or
+  any BitShift refuses the export. The exporter's one such constant, a Slice's "to the end" end of 2^63 - 1, is
+  rewritten first to 2^31 - 1 (`int32_slices`: the same slice for every axis below 2^31 elements); the network's own
+  sizes are checked when the module is built (segments below 2^15, head tokens + pointer columns and actions below 2^30,
+  identity radix products below 2^30).
+* *The sizes that grow with a piece* are bounded on the host: `int32_bound` (Python) / `session::int32_bound` (the
+  worker), an upper bound of every integer the graph computes on a piece of B rows - the densified rows' flat index
+  B (F + 1), the packed token list's and the padded rows' indices B (F + 1 + the most tail tokens of a row), the
+  policy's B (A + 1), the tail floats' (NT + 1) Wt and L + 1, the options' K + 1, the overrides' NO + 1, the merged CSR
+  sequence's nnz + B; a feeder refuses a piece at 2^31 or more (an error, never a silent overflow). MTG Zero v7 in a GPU
+  piece of 1,024 rows: B (F + 1) = 57.7 M, about 2.7 % of 2^31.
+* *Annotations* (`strip_annotations`, every export, zero-onnx/1 and /2, also `portable_file`): each node's
+  `metadata_props` (`pkg.torch.onnx.stack_trace`, name scopes, class hierarchy, fx node, the rewriter's rule names) and
+  every doc string removed; no node, attribute, initializer, name or model metadata changes. The worker and the agent
+  read only the model's own metadata (`session::meta`), never a doc string. The model metadata carries no path
+  (`checkpoint` is the file name or the run's id; the reference set's `sources` file names). The committed probe graph
+  regenerated by `tools/onnx_probe_graph.py` (measured below).
+
+**Tests.** `tests/test_onnx2.py` (11; two new, two extended): the interface's int32 inputs and dtypes; no integer
+constant outside int32 and no BitShift in an exported graph, `check_int32` refusing one added to it (an initializer of
+2^40, a Constant's int beyond -2^31); `int64_max` on toy rows with tails and overrides (every int64 intermediate below
+2^31, the model given unchanged); the host's split (every piece in int32, the packed token and the slot back from them
+exactly; -1, other negatives, a segment past 16 bits) and `int32_bound` (the worker's numbers), a piece over 2^31
+refused by the feeder; pieces outside their fields refused (a slot of 2^32 or -1, a half of 2^16 or -3, a column of 256
+or -1, a segment -5), counted on their own row; zero-onnx/1 and /2 graphs without node annotations or doc strings (no
+`stack_trace`, no source file name in the bytes); toy_tail_wide (below). The other earlier tests unchanged and passing;
+`tests/test_onnx.py` (17). `cargo test -p zero_worker`: the unit test also checks `override_pieces` (the token back from
+its pieces for segments up to 2^16 - 1, columns up to 255, slots up to 2^32 - 1) and `int32_bound`; `tests/job_tail.rs`
+gains toy_tail_wide (below).
+
+**Measured** (2026-11-13, the desktop; onnxruntime 1.31.1 CPU, Windows ML's 1.28.3 for DirectML, torch 2.11.0):
+
+* *The v1 path, stripped.* pb1 iteration 82 exported by this tree: 10,151,753 bytes, two exports byte-identical;
+  b0930da's export of it with its 5,075 annotation entries removed by `strip_annotations`: **byte-identical** (sha256
+  0c37f0c6...), outputs bit for bit on the pool's 256 gen-82 reference rows (whole batches and 64-row pieces); the
+  graph the live pool published for gen 82, stripped: byte-identical too, its metadata identical. The committed probe
+  graph stripped (1,898 entries) is byte for byte the one `tools/onnx_probe_graph.py` now writes, its reference set
+  byte-identical: the probe graph is replaced by the stripped one (an earlier commit's blob keeps the old annotations
+  in history).
+* *The v7 graph* (pb1 iteration 67 widened, 46.4): 1,983 nodes, no integer constant outside int32, no BitShift; its
+  reference set (256 rows: 189 with 386 tail tokens, 8 overrides) within 1.8e-6 of torch. **Every int64 value it
+  computes** on all 800 recorded batches (76,647 rows; 654 int64 tensors, all typed): at most 7,217,152 (a 128-row
+  batch's flat densify index, 128 x 56,384), 0.34 % of 2^31.
+* *The gate on real v7 rows* (the 800 batches): **16 + 8 cases (pieces), 0 failed** - the `overrides` case now in it (42
+  rows, 151 overrides, 579 tail tokens: 6.9e-7) -, worst priors 5.5e-6, value 6.3e-7, margin 6.7e-7, aux 2.5e-7; run
+  twice, every case's result the same and the gate's graphs byte for byte the same; every gate opened to 0.37: 16 + 8
+  passed, worst priors 5.5e-6, margin 7.2e-7, its override rows 6.9e-7. Every output over the 800 batches (whole and in
+  64-row pieces) hashed in two processes: bit for bit the same.
+* *Gate 2 (a) on toy_tail* with a zero-onnx/2 graph on both sides: the shards (272 rows) and the first 161 batches
+  identical, as before the change.
+* *The native self-test on real v7 rows* (`zw_probe probe-providers`, the v7 graph and its reference set): the CPU
+  (the CPU runtime pack, ONNX Runtime 1.31.1) passes, max abs 1.8e-6, deterministic. **DirectML (the Intel UHD 770,
+  Windows ML's ONNX Runtime 1.28.3) passes the self-test: max abs 8.3e-7, deterministic**, 55 nodes left to the CPU
+  (ScatterElements 10, Add 9, Reshape 8, Mod 6, Squeeze 6, Cast 3, Equal 3, Mul 3, Concat 2, Div 2, Gather, Log, Sub),
+  1,949 on DirectML; 326 rows/s against the CPU's 1,057 (an integrated GPU: speed not measured on a real GPU here).
+* *Every int64 intermediate on DirectML* (onnxruntime-directml 1.24.4, each int64 intermediate also a graph output,
+  against the CPU EP on the reference set's batches): all 654 equal on the two batches with overrides; on the third
+  (no override, so 8 intermediates of zero elements) DirectML mishandles the zero-size graph outputs the
+  instrumentation adds - without those 8, all 647 equal; the plain graph answers that batch right (`refused` 0, as the
+  self-test above). So no int64 operation DirectML runs disagrees with the CPU near the old failure (the override
+  tokens' decode) or anywhere else. (A zero-size *output* of a real graph would meet the same DirectML limitation:
+  zero-onnx/1's `aux` [B, 0] of a network without the auxiliary head - unchanged here, for the GPU work.)
+* *New tail segments need no code change* (MTG Zero may add gated tail-only segments to layout v7 before a run starts):
+  no code of the exporter, `onnx_eval`, `onnx_parity`, the worker's session, shards, records or replay names a segment
+  or assumes a count, an index or a width - each comes from the network's layout (the graph's metadata `tails`,
+  `gates`, `tail_width`) or the game's `TAILS` and the driver's arrays; the limits are the format's (a segment index
+  u16, 256 pointer columns a segment, fewer than 2^15 segments in a graph). Proven on `toy_tail_wide` (docs/search.md
+  5.3: toy_tail with 20 more gated tail-only segments, indices 2 .. 21 - more tail segments than v7 and indices past its
+  highest; `toy_tail` the same generic game, its self-play digest of 24 games - both policy targets' records and
+  results, the match - identical before and after): `tests/test_onnx2.py` (its graph's `tails` the game's, 10 traced
+  games through `OnnxEvaluator` within 2e-5 of eager with the gates at 0.15 .. 1.3, tokens of all 22 segments, every
+  game's record replayed to the driver's rows byte for byte), `tests/job_tail.rs` (the native job's format v2 shards
+  with the 22 segments in their meta and tokens of each, the records replayed to exactly the shards' arrays); gate 2 (a)
+  with a 1-iteration toy_tail_wide run's graph (gates opened to 0.5) on both sides: shards (273 rows, 8,877 tail tokens,
+  4,912 of them in the extra segments, 791 overrides) and 166 batches (107,567 tail tokens, 59,402 extra) identical;
+  gate 3 with that graph: the native worker's records rebuild its shards (24 games, 315 rows, 9,163 tail tokens, 5,138
+  extra), all 19 arrays identical.
+
+### 46.8 zero-onnx/2 with every scatter unique, at opset 17 (2026-11-13)
+
+**Why.** 41.2's two problems in the zero-onnx/2 graph, besides densify's and the policy's: its tail and override CSRs
+(`_csr_rows`, the same row-end scatter as densify's), and the check for a second override of one (row, action), which
+scattered each override's index and leaned on the CPU's last writer to find the repeats. With them on the CPU (opset 18),
+DirectML left 10 ScatterElements of Delver's v7 graph to the CPU (46.7).
+
+**What changed** (`ZeroOnnx2`; the interface unchanged):
+
+* The tail and override CSRs through 41.2's `_csr_rows` (row ends to places of their own, a Gather back).
+* The static scatter of the head tokens' actions per row on the full head token axis (41.2's `_policy_full`, `_scatter_last`).
+* A second override of one (row, action) found by comparing every override with every later one ([NO + 1]^2 booleans,
+  as the tail-target match already compares overrides with tail tokens): the same overrides refused (of two with one
+  place, all but the last; a refused one's place is its row's dummy column, as before). Every override then writes its
+  own place - an accepted one its action, a refused one a spare place past the policy (B (A + 1) + its index, read off
+  by a Gather) instead of its row's dummy column, which no output reads. So `int32_bound` (Python) and
+  `session::int32_bound` (the worker) bound the policy with its spares, B (A + 1) + NO + 1, instead of the terms B (A + 1)
+  and NO + 1 apart (the feeders refuse a piece at 2^31 as before).
+* 9 ScatterElements (10 before: the repeat-finding scatter is gone), opset 17, `unique_scatters` '1'.
+
+**Tests.** `tests/test_onnx2.py` (11; three extended): the graph's nine scatters unique (`scatter_writes`) on rows with
+tails and overrides and on every refusal case's rows (the sentinel override, a repeated action, an option out of its
+row, an absent head slot, a missing tail token, a column out of range, a token -2); opset 17 and `unique_scatters`;
+`int32_bound`'s new term (the worker's numbers). `cargo test -p zero_worker`: the unit test's `int32_bound` numbers.
+
+**Measured** (2026-11-13, as 41.2):
+
+* *The CPU's answers, bit for bit.* pb1 iteration 67 widened onto layout v7 (46.4; gates 0) and its copy with every
+  gate at 0.37: the new graphs against ec2d1b9's on the 800 recorded batches (76,647 rows, 55,168 tail tokens, 151
+  overrides) - every batch as it is and in 64-row pieces, windows to 1,000 rows, the whole file in 1,024-row pieces,
+  the first 1,000 (gates 0.37: 300) rows alone: 2,805 (2,105) cases - every output bit-identical (`refused` included),
+  each graph run in two processes. The reference sets the two trees write (256 rows: 189 with 386 tail tokens, 8
+  overrides) are byte-identical; ORT vs torch 1.8e-6.
+* *The gate* (`zero.onnx_parity`, the 800 batches), run twice: 16 + 8 cases (pieces), 0 failed, worst priors 5.5e-6,
+  value 6.3e-7, margin 6.7e-7, aux 2.5e-7 - 46.7's numbers -, the `overrides` case (42 rows, 151 overrides) 6.9e-7; the two
+  runs the same case for case, their exports byte-identical; gates at 0.37: 16 + 8 passed, priors 5.5e-6, margin 7.2e-7.
+  toy_tail_wide (22 tail segments, gates 0.5) on the native worker's recorded batches, twice: 16 + 7 cases passed (worst
+  margin 9.5e-7), the exports byte-identical; toy_tail: 16 + 7 passed; both toy graphs against ec2d1b9's on those batches
+  (3,266 and 3,289 rows, every row alone too): bit-identical, two processes each.
+* *The scatters and int32* (the 800 batches, their 64-row pieces and 1,024-row pieces: 2,471 feeds): ec2d1b9's graph wrote
+  9,675,231 repeated indices (the three CSRs' row ends and the policy's dummy column) and had 7,410 runs with more indices
+  than places; the new graph 0 and 0 over 304,146,057 writes. `check_int32`: 131 constants, all in int32; `int64_max`:
+  57,737,216 (a 1,024-row piece's densify index, 1,024 x 56,384: 2.7 % of 2^31), 671 int64 tensors, all typed. The two toy
+  graphs alike (0 repeats, int64 at most 1,376,256).
+* *The native worker.* The self-test on the new v7 graph and its reference set (the CPU runtime pack, ONNX Runtime
+  1.31.1): passes, max abs 1.8e-6, deterministic. Gate 2 (a) with new graphs on both sides (`tools/worker_parity.py`, the
+  native `zw_toy` against `remoteplay.Worker`, 24 games): toy_tail - shards (272 rows) and the first 161 batches
+  identical -, toy_tail_wide - 273 rows, 166 batches identical; gate 3 with the wide graph: the native worker's records
+  rebuild its shards (24 games, 315 rows), all 19 arrays identical. `cargo test -p zero_worker`: 24 + 5 + 6 + 4 passed.
+* *DirectML* (as 41.2; Delver v7's reference set). Placement: ScatterElements gone from the CPU's nodes (48 left on the
+  UHD 770, 45 on the RTX 5090: the shapes, psi's float64 and int64 `//`; 55 and 52 with 10 ScatterElements before). The
+  self-test is **flaky for the earlier and the new graph alike**: on the UHD 770 the new graph passed 3 of 5 runs and the
+  earlier 4 of 5 (8.3e-7), every failure 0.0078 in the priors, the same for both graphs; on the RTX 5090 the new graph
+  passed 3 of 6 (one failure 0.80, two runs within tolerance but not deterministic), the earlier 5 of 6 (one run not
+  deterministic); the reference rows regrouped into one 256-row batch: the new graph passed, the earlier failed (0.016).
+  When it passes, rows per second (16 / 64 / 256 / 1,024 rows, the reference rows' features cycled - no tail token, no
+  override): RTX 5090 99 / 382 / 1,390 / 4,775 against the earlier graph's 88 / 301 / 818 / 2,197 (2.2x at 1,024 rows);
+  UHD 770 83 / 261 / 536 / 719 against 81 / 236 / 493 / 629; the same runtime's CPU EP 1,439-1,600 / 1,151-1,480 /
+  1,765-1,833 / 1,931-1,945. Only the priors,
+  only batches with overrides (the reference batch without one passes alone): onnxruntime-directml 1.24.4 (the UHD 770)
+  gives a row's overrides one common wrong value - row 67's three overrides (CPU -0.99, -1.59, -2.48) all 7.60 in some
+  runs, -4.73 in others, row 71's five all -3.95 in one run of the earlier graph - while the same graph with its integer
+  intermediates made outputs answers right (a DirectML fusion problem in the override
+  path, not one of its operators: ArgMax, ScatterElements and TopK alone answer as the CPU at these sizes). The worker's
+  self-test refuses DirectML whenever it happens (the factory's fallback to the CPU). Not fixed here: the override path
+  is the same in both graphs. toy_tail_wide's graphs (22 tail segments; gates 0 or 0.5) fail DirectML's self-test in
+  18 of 20 runs on the UHD 770, ec2d1b9's and the new alike (value and margin off by up to 0.7: the trunk with gated
+  segments), toy_tail's pass 12 of 12 - both for the GPU work.
+* *CPU speed* (as 41.2's costs; v7, its reference rows cycled): 1,512-1,593 / 1,378-1,388 / 1,792-1,932 / 2,023-2,039
+  rows/s at 16 / 64 / 256 / 1,024 rows against the earlier graph's 1,628-1,687 / 1,224-1,591 / 1,836-1,870 /
+  2,014-2,127 - the same within the noise of the busy machine.
+
+**DirectML refused for zero-onnx/2 (2026-11-13).** On batches with pointer overrides DirectML intermittently returns all
+of a row's overrides as one shared wrong value (the self-test passed 3-5 of 5-6 runs on the RTX 5090 and the UHD 770,
+with this graph and the one before it alike), so a passing self-test does not make later override batches right: the
+search would get wrong targets, which no replay catches. The worker's session factory therefore refuses DirectML for any
+graph whose metadata says `zero_onnx` 2 (`session::provider_refusal` / `refused`): a skip with the reason, never an error
+- `create_session` goes on to the next provider (CUDA, the CPU), and `probe-providers` reports an ordinary result entry
+(`ok` false, `why` "dml: zero-onnx/2's pointer-override path ..."), which an agent caches as a failed provider.
+zero-onnx/1 on DirectML stays allowed (9 of 9 self-tests passed). Lifting the refusal needs a fix of the override path
+(or a restructure that avoids DirectML's fusion there), proven by at least 50 consecutive identical, correct runs on
+override batches on both adapters. Test: `session::tests::directml_is_refused_for_zero_onnx_2_only` (the refusal, its
+skip form and the probe's result entry).
 
 ## 47. The run loop at its edges: the Fable review's fixes (2026-11-12)
 

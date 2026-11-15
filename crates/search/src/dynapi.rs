@@ -84,6 +84,8 @@ pub trait DynGame: Send + Sync {
     fn team_size(&self) -> usize;
     /// `SearchGame::aux_target` for `viewer` (`aux_width()` floats; none: empty).
     fn aux_target(&self, viewer: usize) -> Vec<f32>;
+    /// `SearchGame::record_setup` (docs/search.md 2.17).
+    fn record_setup(&self) -> String;
     /// Chained episodes (`SearchGame::chained`, `next_episode`, `can_concede`; docs/search.md 1.3): the next
     /// episode's state (Ok((Some(game), None))) or the contest's result (Ok((None, Some(result per seat)))).
     fn chained(&self) -> bool;
@@ -214,6 +216,9 @@ impl<G: SearchGame> DynGame for G {
         let mut v = vec![0.0; G::aux_width()];
         SearchGame::aux_target(self, viewer, &mut v);
         v
+    }
+    fn record_setup(&self) -> String {
+        SearchGame::record_setup(self)
     }
     fn chained(&self) -> bool {
         SearchGame::chained(self)
@@ -926,6 +931,10 @@ pub trait DynDriver: Send + Sync {
     fn finished(&self) -> bool;
     fn paused(&self) -> bool;
     fn resume(&mut self, quota: u64, net: u32) -> Result<(), String>;
+    /// A rolling driver's first game id (`Driver::set_first_gid`).
+    fn set_first_gid(&mut self, gid: u32) -> Result<(), String>;
+    /// Trace every game (`Driver::set_trace`, docs/search.md 2.17).
+    fn set_trace(&mut self, on: bool) -> Result<(), String>;
     /// Rolling mode, between phases: the games started from now on play `spec` (`Driver::set_spec`).
     fn set_spec(&mut self, spec: &str) -> Result<(), String>;
     fn end_phase(&mut self);
@@ -938,6 +947,8 @@ pub trait DynDriver: Send + Sync {
     fn pending(&self) -> usize;
     fn enqueue(&mut self, tag: &str, spec: &str) -> Result<(), String>;
     fn queued(&self) -> usize;
+    /// Drop the queued setups not started yet (`Driver::clear_queue`) -> how many.
+    fn clear_queue(&mut self) -> usize;
     fn stats(&self) -> DriverStats;
     fn in_flight(&self) -> InFlight;
     /// Evaluator keys in index order, and whether each is external.
@@ -966,6 +977,12 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     fn resume(&mut self, quota: u64, net: u32) -> Result<(), String> {
         Driver::resume(self, quota, net)
     }
+    fn set_first_gid(&mut self, gid: u32) -> Result<(), String> {
+        Driver::set_first_gid(self, gid)
+    }
+    fn set_trace(&mut self, on: bool) -> Result<(), String> {
+        Driver::set_trace(self, on)
+    }
     fn set_spec(&mut self, spec: &str) -> Result<(), String> {
         Driver::set_spec(self, spec)
     }
@@ -992,6 +1009,9 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     }
     fn queued(&self) -> usize {
         Driver::queued(self)
+    }
+    fn clear_queue(&mut self) -> usize {
+        Driver::clear_queue(self)
     }
     fn stats(&self) -> DriverStats {
         Driver::stats(self)

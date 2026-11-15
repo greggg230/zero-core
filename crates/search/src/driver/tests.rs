@@ -4074,6 +4074,311 @@ fn value_choice_pick_takes_the_best_or_draws_by_the_softmax() {
     }
 }
 
+// ------------------------------------------------------------------ a rolling driver's first game id (2.14)
+
+/// (gid, steps, result, records) of every game a rolling queue_only driver plays for `n` queued setups.
+fn rolling_games(first: Option<u32>, n: usize) -> Vec<(u32, u64, Vec<f32>, Vec<(Vec<f32>, Vec<u16>, Vec<f32>, [f32; MAX_SEATS])>)> {
+    let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    c.queue_only = true;
+    c.concurrency = 3;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    if let Some(g) = first {
+        d.set_first_gid(g).unwrap();
+    }
+    d.resume(n as u64, 0).unwrap();
+    for k in 0..n {
+        d.enqueue(&format!("s{k}"), "{}").unwrap();
+    }
+    let mut out = Vec::new();
+    let mut take = |d: &mut Driver<ToyGame>| {
+        let res = d.take_results();
+        let mut recs = d.take_samples().into_iter();
+        for r in res {
+            let rr: Vec<_> = recs.by_ref().take(r.samples as usize).map(|x| (x.x, x.opts, x.pi, x.q)).collect();
+            out.push((r.gid, r.steps, r.result, rr));
+        }
+        assert!(recs.next().is_none());
+    };
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer(&mut d, &b);
+        take(&mut d);
+    }
+    take(&mut d);
+    out.sort_by_key(|g| g.0);
+    out
+}
+
+#[test]
+fn first_gid_plays_the_same_games() {
+    let all = rolling_games(None, 7);
+    assert_eq!(all.iter().map(|g| g.0).collect::<Vec<_>>(), (0..7).collect::<Vec<u32>>());
+    let tail = rolling_games(Some(4), 3);
+    assert_eq!(tail.iter().map(|g| g.0).collect::<Vec<_>>(), vec![4, 5, 6]);
+    assert!(all[4..].iter().zip(&tail).all(|(a, b)| a == b), "games 4..7 of a driver from 0 == a driver from 4");
+    assert!(all[4..].iter().any(|g| !g.3.is_empty()), "the games recorded samples");
+    // only a rolling driver, only before its first resume
+    let mut fixed = Driver::<ToyGame>::new(cfg(vec![nn(0, 4, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)])).unwrap();
+    assert!(fixed.set_first_gid(3).is_err());
+    let mut c = cfg(vec![nn(0, 4, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    c.rolling = true;
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    d.resume(1, 0).unwrap();
+    assert!(d.set_first_gid(3).is_err());
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer(&mut d, &b);
+    }
+}
+
+// ------------------------------------------------------------------ an eval job's driver (2.14)
+
+/// Every batch a driver sends - (key, gid per row, the rows' features) - with `answer_skewed`'s answers,
+/// and its finished games (gid, steps, result, scores, rounds).
+#[allow(clippy::type_complexity)]
+fn batches_and_games(d: &mut Driver<ToyGame>) -> (Vec<(u16, Vec<i64>, Vec<f32>)>, Vec<(u32, u64, Vec<f32>, Vec<f32>, u32)>) {
+    let mut bs = Vec::new();
+    let mut gs = Vec::new();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        bs.push((b.key, b.gid.clone(), b.x.clone()));
+        answer_skewed(d, &b);
+        gs.extend(d.take_results().into_iter().map(|r| (r.gid, r.steps, r.result, r.scores, r.rounds)));
+    }
+    gs.extend(d.take_results().into_iter().map(|r| (r.gid, r.steps, r.result, r.scores, r.rounds)));
+    gs.sort_by_key(|g| g.0);
+    (bs, gs)
+}
+
+#[test]
+fn a_queued_rolling_driver_plays_a_fixed_tables_match_batch_for_batch() {
+    // zero-farm's eval job (docs/search.md 2.16): a match of n games, seats [a, b] for even game ids and
+    // [b, a] for odd ones (Run.play_match's table), played by a rolling queue_only driver whose table is
+    // those two rows (game gid takes row gid % 2) with all n setups (the driver's spec) queued before its
+    // first resume: with one group it sends the fixed-table driver's batches, in its order, and plays its
+    // games - paired or not, and from a first game id: a lease's games are those of the whole match.
+    let seats = vec![nn(0, 12, false), nn(1, 6, false)];
+    let keys: &[(&str, KeyKind)] = &[("m", KeyKind::Nn), ("o", KeyKind::Nn)];
+    for paired in [true, false] {
+        for (n, conc) in [(12usize, 16usize), (12, 5), (9, 4)] {
+            let table: Vec<Vec<u16>> = (0..n).map(|g| if g % 2 == 0 { vec![0, 1] } else { vec![1, 0] }).collect();
+            let mut f = cfg(seats.clone(), table, keys);
+            (f.groups, f.record, f.paired, f.concurrency) = (1, false, paired, conc);
+            let mut fixed = Driver::<ToyGame>::new(f.clone()).unwrap();
+            let want = batches_and_games(&mut fixed);
+            let mut r = f.clone();
+            (r.rolling, r.queue_only, r.games, r.concurrency) = (true, true, vec![vec![0, 1], vec![1, 0]], conc.min(n));
+            let mut d = Driver::<ToyGame>::new(r.clone()).unwrap();
+            for k in 0..n {
+                d.enqueue(&format!("e{k}"), "{}").unwrap();
+            }
+            d.resume(1 << 62, 0).unwrap();
+            let got = batches_and_games(&mut d);
+            assert_eq!(got.1.len(), n);
+            assert_eq!(got.0, want.0, "paired {paired}, n {n}, conc {conc}: the batches");
+            assert_eq!(got.1, want.1, "paired {paired}, n {n}, conc {conc}: the games");
+            // games 4.. of the match from a driver of their own (set_first_gid): the same games
+            let mut d = Driver::<ToyGame>::new(r).unwrap();
+            d.set_first_gid(4).unwrap();
+            for k in 4..n {
+                d.enqueue(&format!("e{k}"), "{}").unwrap();
+            }
+            d.resume(1 << 62, 0).unwrap();
+            let tail = batches_and_games(&mut d).1;
+            let want_tail: Vec<_> = want.1.iter().filter(|g| g.0 >= 4).cloned().collect();
+            assert_eq!(tail.iter().map(|g| (g.0, &g.2, &g.3)).collect::<Vec<_>>(), want_tail.iter().map(|g| (g.0, &g.2, &g.3)).collect::<Vec<_>>(), "a lease of games 4..{n}: their results");
+        }
+    }
+}
+
+#[test]
+fn clear_queue_starts_no_new_game() {
+    let mut c = cfg(vec![nn(0, 8, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    (c.rolling, c.queue_only, c.record, c.concurrency, c.groups) = (true, true, false, 3, 1);
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    for k in 0..10 {
+        d.enqueue(&format!("e{k}"), "{}").unwrap();
+    }
+    d.resume(1 << 62, 0).unwrap();
+    let b = d.next_batch(true).unwrap().unwrap();
+    assert_eq!(d.queued(), 7, "three games started");
+    assert_eq!(d.clear_queue(), 7);
+    answer(&mut d, &b);
+    let mut games = d.take_results();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer(&mut d, &b);
+        games.extend(d.take_results());
+    }
+    games.extend(d.take_results());
+    let mut ids: Vec<u32> = games.iter().map(|g| g.gid).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1, 2], "the games in flight finished, none started after");
+}
+
+// ---- traced games and their records (Driver::set_trace, record::replay; docs/search.md 2.17) ----
+
+/// The traced self-play of `seat` (a rolling toy driver with auxiliary targets): phases of `quota` games with
+/// networks 0, 0, 1 (a new search epoch: games in flight cross networks), answered by `answer_lead` (decisive
+/// values: resignations fire). -> every (result row, its samples) in the order the driver gave them.
+fn traced_games(seat: SeatCfg, trace: bool, quota: u64) -> Vec<(GameResult, Vec<Record>)> {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    (c.rolling, c.concurrency, c.groups, c.threads, c.aux) = (true, 10, 2, 3, true);
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    if trace {
+        d.set_trace(true).unwrap();
+    }
+    let mut out = Vec::new();
+    let take = |d: &mut Driver<ToyGame>, out: &mut Vec<(GameResult, Vec<Record>)>| {
+        let rows = d.take_results();
+        let mut s = d.take_samples().into_iter();
+        for r in rows {
+            let k = r.samples as usize;
+            let mine: Vec<Record> = s.by_ref().take(k).collect();
+            assert_eq!(mine.len(), k);
+            out.push((r, mine));
+        }
+        assert!(s.next().is_none());
+    };
+    for net in [0u32, 0, 1] {
+        d.resume(quota, net).unwrap();
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer_lead(&mut d, &b);
+            take(&mut d, &mut out);
+        }
+        take(&mut d, &mut out);
+    }
+    out
+}
+
+fn record_seat() -> SeatCfg {
+    with_resign(with_view(nn(0, 16, true), LeafView::Mover, 0.5, ViewTarget::NextQ), 0.25, 2, 0.25)
+}
+
+fn f16s(v: &[f32]) -> Vec<u16> {
+    v.iter().map(|&x| f32_to_f16(x)).collect()
+}
+
+/// A replayed row against the driver's: every value a shard stores, bit for bit (pi and q: their float16, the
+/// record's precision and the shard's).
+fn same_row(a: &Record, b: &Record) -> Result<(), String> {
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let chk = |what: &str, ok: bool| if ok { Ok(()) } else { Err(format!("{what} differs")) };
+    chk("x", bits(&a.x) == bits(&b.x))?;
+    chk("player", a.player == b.player)?;
+    chk("n_players", a.n_players == b.n_players)?;
+    chk("opts", a.opts == b.opts)?;
+    chk("pi", f16s(&a.pi) == f16s(&b.pi))?;
+    chk("z", bits(&a.z) == bits(&b.z))?;
+    chk("q", f16s(&a.q) == f16s(&b.q))?;
+    chk("sc", bits(&a.sc) == bits(&b.sc))?;
+    chk("net", a.net == b.net)?;
+    chk("aux", bits(&a.aux) == bits(&b.aux))?;
+    chk("step", a.step == b.step)
+}
+
+#[test]
+fn traced_games_replay_to_their_rows_bit_for_bit() {
+    let games = traced_games(record_seat(), true, 30);
+    let spec = ToyGame::parse_spec("{}").unwrap();
+    let (mut rows, mut views, mut resigned, mut nets) = (0, 0, 0, std::collections::HashSet::new());
+    for (r, s) in &games {
+        let rec = crate::record::game_json(r, s).unwrap();
+        // through its text, as a record travels
+        let rec: serde_json::Value = serde_json::from_str(&rec.to_string()).unwrap();
+        let rp = crate::record::replay::<ToyGame>(&spec, &rec, true).unwrap_or_else(|e| panic!("game {}: {e}", r.gid));
+        assert_eq!((rp.gid, rp.n, rp.over, rp.rounds), (r.gid, r.n, r.over, r.rounds));
+        assert_eq!(rp.result.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), r.result.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        assert_eq!(rp.records.len(), s.len());
+        for (k, (a, b)) in rp.records.iter().zip(s).enumerate() {
+            same_row(a, b).unwrap_or_else(|e| panic!("game {} row {k}: {e}", r.gid));
+        }
+        rows += s.len();
+        views += s.iter().filter(|x| x.opts.is_empty()).count();
+        resigned += r.resign.as_ref().is_some_and(|x| x.resigned) as usize;
+        nets.extend(s.iter().map(|x| x.net));
+        // the game's seed is its game id's (a worker can't choose its games)
+        assert_eq!(rp.seed, crate::record::game_seed(7, r.gid, false));
+        // every real move is in the trace (single-option steps too): at least the driver's applied moves
+        assert!(rp.steps >= r.steps as usize);
+    }
+    assert!(games.len() >= 90 && rows > 0, "{} games, {rows} rows", games.len());
+    assert!(views > 0, "value-only rows recorded and replayed");
+    assert!(resigned > 0, "resigned games replayed");
+    assert_eq!(nets.len(), 2, "rows of both networks");
+}
+
+#[test]
+fn tracing_changes_no_game_and_no_row() {
+    let a = traced_games(record_seat(), false, 20);
+    let b = traced_games(record_seat(), true, 20);
+    assert_eq!(a.len(), b.len());
+    for ((ra, sa), (rb, sb)) in a.iter().zip(&b) {
+        assert!(ra.trace.is_none() && rb.trace.is_some());
+        assert_eq!((ra.gid, ra.steps, ra.decisions, &ra.result, ra.rounds), (rb.gid, rb.steps, rb.decisions, &rb.result, rb.rounds));
+        assert_eq!(sa.len(), sb.len());
+        for (x, y) in sa.iter().zip(sb) {
+            assert_eq!(x.step, 0, "untraced rows have no step");
+            let mut y = y.clone();
+            y.step = 0;
+            same_row(x, &y).unwrap();
+            assert_eq!(x.pi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), y.pi.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+            assert_eq!(x.q.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), y.q.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+    }
+}
+
+#[test]
+fn a_tampered_record_is_refused() {
+    let games = traced_games(record_seat(), true, 12);
+    let spec = ToyGame::parse_spec("{}").unwrap();
+    let (r, s) = games.iter().find(|(r, s)| s.len() >= 2 && !r.resign.as_ref().is_some_and(|x| x.resigned)).unwrap();
+    let good = crate::record::game_json(r, s).unwrap();
+    assert!(crate::record::replay::<ToyGame>(&spec, &good, true).is_ok());
+    let bad = |f: &dyn Fn(&mut serde_json::Value), want: &str| {
+        let mut v = good.clone();
+        f(&mut v);
+        let e = crate::record::replay::<ToyGame>(&spec, &v, true).err().unwrap_or_else(|| panic!("accepted: {want}"));
+        assert!(e.contains(want), "{want}: {e}");
+    };
+    // another game's moves: an illegal action, or a game that ends otherwise
+    bad(&|v| v["seed"] = serde_json::json!(v["seed"].as_u64().unwrap() ^ 1), "record: ");
+    bad(&|v| {
+        let st = v["steps"].as_array_mut().unwrap();
+        let k = st.len() / 2;
+        st[k] = serde_json::json!(65000);
+    }, "is not one of");
+    bad(&|v| {
+        v["steps"].as_array_mut().unwrap().pop();
+    }, "record: ");
+    bad(&|v| v["steps"].as_array_mut().unwrap().push(serde_json::json!(0)), "after the game ended");
+    bad(&|v| v["result"][0] = serde_json::json!(0.25f32.to_bits()), "result");
+    bad(&|v| v["margin"][0] = serde_json::json!(9.0f32.to_bits()), "margins");
+    bad(&|v| v["rounds"] = serde_json::json!(99), "rounds");
+    bad(&|v| v["setup"] = serde_json::json!("decks"), "setup");
+    // the search's outputs: out of [0, 1] or not finite; one policy value too many or too few
+    bad(&|v| v["samples"]["q"][0] = serde_json::json!(f32_to_f16(1.5)), "q value");
+    bad(&|v| v["samples"]["pi"][0] = serde_json::json!(0x7e00), "policy value");
+    bad(&|v| v["samples"]["pi"].as_array_mut().unwrap().push(serde_json::json!(0)), "left over");
+    bad(&|v| {
+        v["samples"]["pi"].as_array_mut().unwrap().pop();
+    }, "policy");
+    // a row at another decision, of another seat, or of another kind
+    bad(&|v| v["samples"]["player"][0] = serde_json::json!(1 - v["samples"]["player"][0].as_u64().unwrap()), "sample 0");
+    bad(&|v| v["samples"]["kind"][0] = serde_json::json!(1), "record: ");
+    // a game cut short has no samples; a resignation needs a game that isn't over
+    bad(&|v| v["over"] = serde_json::json!(false), "without a result");
+    bad(&|v| v["resigned"] = serde_json::json!(0), "resigned");
+}
+
+#[test]
+fn set_trace_before_games_and_never_with_branches() {
+    let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    (c.rolling, c.concurrency) = (true, 4);
+    let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
+    d.resume(2, 0).unwrap();
+    assert!(d.set_trace(true).unwrap_err().contains("before the first resume"));
+    c.branch = Some(BranchCfg { p: 0.5, moves: 2, temp: 1.0, differ: false });
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    assert!(d.set_trace(true).unwrap_err().contains("branched"));
+}
 // chained episodes (docs/search.md 2.14): the toy match through the driver
 mod chain;
 

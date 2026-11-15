@@ -2,7 +2,7 @@
 //! assembly, finished games and training records.
 use super::*;
 use crate::lookahead::{Answers, Outcome, RowSink, Step as LookStep};
-use crate::tree::{leaf_values_team, tag_of, transition_with, Scratch as SimScratch, Sim, Walk};
+use crate::tree::{leaf_values_team, tag_of, transition_each, Scratch as SimScratch, Sim, Walk};
 
 struct WScratch<G: SearchGame> {
     game: Option<G>,
@@ -439,7 +439,8 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     let seats = game_seats(cfg, gid);
     let n = seats.len();
     slot.tag = setup.as_ref().map(|s| s.tag.clone());
-    let game = G::new_game(spec, n, base.next_u64())?;
+    let game_seed = base.next_u64();
+    let game = G::new_game(spec, n, game_seed)?;
     let team = game.team_size();
     #[allow(clippy::manual_is_multiple_of)] // (rustc < 1.87 on other machines)
     let divides = team != 0 && n % team == 0;
@@ -494,6 +495,10 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     slot.look_mcts = false;
     slot.look_guard = None;
     slot.cache.clear();
+    // (the game's trace, docs/search.md 2.17: its seed and real moves)
+    slot.game_seed = game_seed;
+    slot.trace = sh.trace.load(Ordering::Relaxed).then(Vec::new);
+    slot.trace_setups.clear();
     Ok(())
 }
 
@@ -1008,7 +1013,8 @@ fn abort_game<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, kind: &str, ca
 
 /// A record's row (docs/search.md 2.15): `encode(viewer)` into `x` (zeroed) for a game without tails or pointer
 /// overrides; else `encode_row` with its sealed tail and the overrides against `opts` (a row with options).
-fn record_row<G: SearchGame>(g: &G, viewer: usize, opts: &[u16], x: &mut [f32]) -> (TailRow, Vec<(u32, i64)>) {
+/// Also a replayed record's (`record::replay`, docs/search.md 2.17): the same row bit for bit.
+pub(crate) fn record_row<G: SearchGame>(g: &G, viewer: usize, opts: &[u16], x: &mut [f32]) -> (TailRow, Vec<(u32, i64)>) {
     if G::TAILS.is_empty() && !G::OPTION_POINTERS {
         g.encode(viewer, x);
         return (TailRow::default(), Vec::new());
@@ -1283,7 +1289,8 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             aux.resize(G::aux_width(), 0.0);
             g.aux_target(p, &mut aux);
         }
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, tail, ov });
+        let step = slot.trace.as_ref().map_or(0, |t| t.len() as u32);
+        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov });
         slot.rq.push(if gumbel {
             tree.gumbel_q()
         } else if pruned.is_some() {
@@ -1315,7 +1322,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                 if seat.view_target == ViewTarget::NextQ {
                     slot.view_wait.push((slot.records.len() as u32, o as u8));
                 }
-                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, tail, ov: Vec::new() });
+                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov: Vec::new() });
                 slot.rq.push(None);
                 n.view_recorded += 1;
             }
@@ -1367,16 +1374,29 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
         slot.moves.push((p as u8, a, slot.legal.clone()));
     }
     // (observable answers, docs/search.md 3.18: the mover's decision class, and the seats the transition stepped
-    // through single options itself - no key records those)
+    // through single options itself - no key records those; the trace of a live game's real moves, 2.17)
     let tag = tag_of(&*g);
     let stepped = std::cell::Cell::new(0u32);
-    transition_with(g, a, None, key, &mut slot.legal, |q| {
-        let auto = !is_external(cfg, gid, q);
-        if auto {
-            stepped.set(stepped.get() | 1 << q);
-        }
-        auto
-    })
+    let trace = &mut slot.trace;
+    transition_each(
+        g,
+        a,
+        None,
+        key,
+        &mut slot.legal,
+        |q| {
+            let auto = !is_external(cfg, gid, q);
+            if auto {
+                stepped.set(stepped.get() | 1 << q);
+            }
+            auto
+        },
+        |s| {
+            if let Some(t) = trace.as_mut() {
+                t.push(TraceStep::Act(s));
+            }
+        },
+    )
     .map_err(|e| format!("move {a} failed: {e}"))?;
     let stepped = stepped.get();
     slot.legal_ok = true;
@@ -1405,6 +1425,9 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
     key.clear();
     let g = slot.game.as_mut().unwrap();
     g.apply_external(payload, key).map_err(|e| format!("external move failed: {e} (payload {payload:?})"))?;
+    if let Some(t) = slot.trace.as_mut() {
+        t.push(TraceStep::Ext(payload.to_string()));
+    }
     slot.ext_moves += 1;
     slot.steps += 1;
     slot.legal_ok = false;
@@ -1436,7 +1459,9 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
     let gid = slot.gid;
     let start = slot.start_ix.take();
     let fork = slot.fork.take();
-    let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start, resign: resign.as_ref().map(|r| r.info()), abort: row_abort.then_some("max_row_tokens") };
+    // the game's trace (docs/search.md 2.17): its seed, real moves, setup record and - over - its margins
+    let trace = slot.trace.take().map(|steps| Box::new(GameTrace { seed: slot.game_seed, steps, setup: g.record_setup(), margins: if over && !g.deferred() { (0..slot.n).map(|i| g.margin(i)).collect() } else { Vec::new() }, episode_setups: Vec::new() }));
+    let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start, resign: resign.as_ref().map(|r| r.info()), trace, abort: row_abort.then_some("max_row_tokens") };
     slot.dev_left = 0;
     slot.dev_now = false;
     let records = std::mem::take(&mut slot.records);
@@ -1456,6 +1481,9 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
         }
         if resign.is_some() {
             return Err("resign_t: a game with deferred terminals cannot resign (its outcome comes from outside: docs/search.md 3.14)".into());
+        }
+        if done.trace.is_some() {
+            return Err("set_trace: a game at a deferred terminal can't be traced (its result comes from outside: docs/search.md 2.17)".into());
         }
         let payload = g.deferred_payload().map_err(|e| format!("deferred_payload: {e}"))?;
         let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(ParkedRecord::park).collect() } else { Vec::new() };
@@ -1503,7 +1531,11 @@ fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &
         Some(None) => return Err("internal: a resignation without a favoured seat".into()),
         None => None,
     };
-    let done = Done { gid: slot.gid, tag: None, n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: Vec::new(), branch: None, start: None, resign: rs, abort };
+    let done = Done { gid: slot.gid, tag: None, n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: Vec::new(), branch: None, start: None, resign: rs, trace: None, abort };
+    // (a traced contest, docs/search.md 2.17: each ended episode's setup record)
+    if slot.trace.is_some() {
+        slot.trace_setups.push(g.record_setup());
+    }
     let row = emit(cfg.record, &g, over, done, records, rq, &mut ch.samples);
     // (an aborted episode's margin is never asked: `SearchGame::aborted`)
     let margins: Vec<f32> = if over { (0..n).map(|i| g.margin(i)).collect() } else { vec![0.0; n] };
@@ -1526,6 +1558,10 @@ fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &
         Some(Next::Continue(ng)) => {
             if ng.num_players() != n {
                 return Err(format!("next_episode: {} players, the contest has {n}", ng.num_players()));
+            }
+            // (the trace's episode boundary: what replays `next_episode`, the loser if a seat conceded)
+            if let Some(t) = slot.trace.as_mut() {
+                t.push(TraceStep::Next(loser.map(|l| l as u8)));
             }
             slot.game = Some(ng);
             slot.full = true;
@@ -1564,6 +1600,12 @@ fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &
                 resign: None,
                 abort_reason: abort,
                 episodes: std::mem::take(&mut ch.episodes),
+                // the contest's trace: its seed, every real move and episode boundary, each episode's setup record
+                // (the last one's is the contest's)
+                trace: slot.trace.take().map(|steps| {
+                    let eps = std::mem::take(&mut slot.trace_setups);
+                    Box::new(GameTrace { seed: slot.game_seed, steps, setup: eps.last().cloned().unwrap_or_default(), margins: Vec::new(), episode_setups: eps })
+                }),
             };
             results.push(row);
             samples.append(&mut ch.samples);
@@ -1633,6 +1675,7 @@ fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut
     slot.resign = resign_state(cfg, gid);
     slot.dev_left = moves;
     slot.dev_now = false;
+    slot.trace = None;
     Ok(())
 }
 
@@ -1650,6 +1693,8 @@ pub(super) struct Done {
     /// Self-play resignation (docs/search.md 3.14): `resigned` = the game ended by the rule (over, its
     /// result the winner's).
     pub resign: Option<ResignInfo>,
+    /// The game's trace (`Driver::set_trace`, docs/search.md 2.17).
+    pub trace: Option<Box<GameTrace>>,
     /// The driver aborted the game (`GameResult::abort_reason`; docs/search.md 2.15).
     pub abort: Option<&'static str>,
 }
@@ -1690,6 +1735,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         branch: d.branch,
         start: d.start,
         resign: d.resign,
+        trace: d.trace,
         abort_reason: d.abort,
         episodes: Vec::new(),
     };

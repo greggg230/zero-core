@@ -521,7 +521,7 @@ class ShardWriter:
         if has_rows(s) and not (self.sparse and _rows_shard(self.meta)):
             raise ValueError('ShardWriter: samples with tails / pointer overrides need a sparse format v2 writer '
                              '(meta `shard_format(cfg, info)` with shard_sparse 1; R8)')
-        if self.sparse:
+        if self.sparse and 'x' in s:          # (a dict may bring its features as SparseRows already: 'xs')
             x = s['x']
             s = {k: v for k, v in s.items() if k != 'x'}
             s['xs'] = SparseRows.from_dense(x, x.shape[1])

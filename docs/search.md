@@ -274,7 +274,8 @@ visits, section 3.5; `leaf_value_view` whose view its leaves' values come from, 
 `belief_fast` the root's belief of its searches, section 3.8; `lookahead` a dict of the exhaustive
 lookahead's settings that decides the seat's moves instead of MCTS, section 3.9). Evaluator keys: every distinct
 network `key` is one evaluator (arena / Elo matches: `'m'` vs `'o'`), every distinct external
-key one external player. A key cannot be both.
+key one external player. A key cannot be both. The parser (its value rules, unknown keys refused) is
+`zero_search::settings`, section 4.1.
 
 ### 2.2 Network batches
 
@@ -685,6 +686,95 @@ each option's game result exactly (nothing past the game's end is expanded); `ne
 tally's games, the loop (contests, per-game metrics, the evaluation's match and per-game numbers), a replay of a whole
 match, remote self-play (the shared quota; an older worker refused by its hello), remote evaluation (its result's
 `episodes` checked), the Delver stack and the league on a chained game (docs/az.md 42.5).
+
+### 2.16 A rolling driver's first game id (`set_first_gid`; zero-farm, 2026-11-11)
+
+No setting: a call only native workers make (zero-farm's `zero_worker`, docs/az.md 44); a driver never asked
+numbers its games from 0, as before.
+
+`Driver::set_first_gid(g)` / `DynDriver::set_first_gid` - a rolling driver, before its first `resume` - makes
+its games `g, g + 1, ...` (the order its slots start them, as ever). Every random stream of a game derives from
+(driver seed, gid) (`worker::init_slot`), so a block of game ids played by one driver is exactly those games of
+a driver started at 0 with the same seed and evaluator answers: a farm job of games `gid_base .. gid_base + n`
+(zero-farm PROTOCOL.md 5) is a slice of one run-wide game numbering, and a game a friend's PC did not finish
+can be played again elsewhere as the same game. Refused on a fixed-table driver (its games are `0..games`) and
+after the first `resume`. Test: `first_gid_plays_the_same_games` (games 4..7 of a driver from 0 == a driver
+from 4, record for record).
+
+**An eval job's match as a rolling driver** (zero-farm phase 2, 2026-11-12; docs/az.md 44.2). A match's
+fixed-table driver (`Run.play_match`: game g takes `games[g]`, ids 0..n) cannot start at a lease's first id, so
+the worker plays a lease of it as a rolling `queue_only` driver whose table is the match's first two rows (game
+gid takes row gid % 2: the seats of every game id, swapped between the games of a pair), with the lease's setups
+(the driver's spec) all queued before its first `resume` and `set_first_gid(gid_base)`. With one group it sends
+the fixed table's batches in the fixed table's order and plays its games: a queue that never runs dry starts a
+game in every free slot exactly when the fixed driver starts its next game id (`queue_share` gives one group
+every queued setup), and the game's streams are its gid's either way. Test:
+`a_queued_rolling_driver_plays_a_fixed_tables_match_batch_for_batch` (paired and unpaired, conc above and below
+the games, a lease from game 4: every batch's key, rows and features, every game's steps, result, scores and
+rounds). With more groups the fixed driver serves them round-robin and a `queue_only` driver whichever is ready
+first: the same games, batches in a timing-dependent order.
+
+`Driver::clear_queue()` / `DynDriver::clear_queue` drops the queued setups not started yet (-> how many): the
+eval job's `finish` (no new game starts; the games in flight play on). Nothing else changes; nothing calls it
+but the worker. Test: `clear_queue_starts_no_new_game`.
+
+### 2.17 Traced games and game records (`set_trace`, `zero_search::record`; zero-farm phase 3, 2026-11-12)
+
+No setting: a call only zero-farm's native worker makes (its self-play job's records, docs/az.md 45); a driver never
+asked traces nothing and every game, row and batch is what it was.
+
+**Why.** A friend's PC uploads what replays a game instead of its sample rows (zero-farm DESIGN.md 6.1): the live game
+is never determinized (only search clones are), so `new_game(spec, n, seed)` and the real moves rebuild every state,
+and with it every row's features, options, auxiliary targets, `z` and `sc`. Only what the search produced has to
+travel: each row's policy target, root value and network id. A record is ~20-40x smaller than its rows, and its replay
+on the trainer is the validation.
+
+**What it does.** `Driver::set_trace(true)` (`DynDriver::set_trace`, the binding's `SearchDriver.set_trace`) - a
+rolling driver, before its first `resume`; refused on a fixed table (its games start with the driver), with branched
+games or archive starts (they don't start from a seed alone) - makes every game the driver starts keep its seed (the
+`new_game` seed of `worker::init_slot`: `record::game_seed(seed, gid, paired)`) and every real move: each action
+`apply` steps, the single-option decisions `transition_each` steps after it, and an external seat's answer (as its
+payload). A finished game's `GameResult::trace` holds them with the game's `SearchGame::record_setup` (what the game
+built from its seed, compared on replay: MTG Zero's per-seat decks; default empty) and, for a game that ended with a
+result, each seat's `margin`. Each training record's `Record::step` is the number of real moves before its decision
+(0 when not tracing). A game at a deferred terminal is refused (its result comes from outside).
+
+`record::game_json(row, samples)` is one game's record (`records/1`, module docs of `crates/search/src/record.rs`):
+gid, players, seed, steps (actions and external answers), over / aborted / resigned (the winner), the result and
+margins as f32 bits, rounds, setup, and per sample its step, decider, kind (0 leaf / 1 value-only), network id, the
+policy target over its options and `q` per seat as float16 bits (the shard's own precision). `record::replay::<G>`
+plays it back on a copy of `new_game`'s game (a game may do what only its live game does: MTG Zero's EoE game log is
+written by the live game only): every action must be legal, every leaf sample's decider the step's seat with at least
+two options and exactly its policy's length, every value-only sample's decider another seat; the result, the margins,
+the rounds and the setup must equal the record's; `pi` and `q` must be finite and in [0, 1]. It returns the rows
+exactly as the driver emitted them (`x` = `encode(decider)`, the options, `z` and `sc` from the replayed end, the
+auxiliary targets with `aux`; `pi`, `q`, `net` from the record), or why the record is refused. The binding's
+`replay_rows(game, spec, record, aux)` returns them as `take_samples`' dict; `take_game_records()` returns a traced
+driver's finished rows, their records and their samples at one point; `game_seed_of(seed, gid)`.
+
+**Tests.** `traced_games_replay_to_their_rows_bit_for_bit` (toy, rolling, auxiliary targets, value-only rows,
+resignations, a new network mid-phase: every replayed row equal to the driver's - features, options, `z`, `sc`,
+auxiliary targets bit for bit, `pi` and `q` as float16 - and every game seed its id's), `tracing_changes_no_game_and_no_row`
+(the same games, rows and policy bits traced or not), `a_tampered_record_is_refused` (seed, an action, a missing or extra
+move, result, margin, rounds, setup, `q` and `pi` out of range, a policy value too many or too few, a row of another seat
+or kind, samples of a game without a result, a resignation of a finished game),
+`set_trace_before_games_and_never_with_branches`; zero_worker's `records_replay_to_the_shards_rows_bit_for_bit` and
+zero.farm_pool's tests (docs/az.md 45).
+
+**Variable-length rows** (2.15; the merge of `feat/varlen` e5e1bb0 into `farm`, 2026-11-12). A record carries no row, so
+nothing of a row's tail travels: `replay` builds every row with the driver's own record row (`driver::record_row`:
+`encode_row` with its sealed tail, and a row with options its pointer overrides against them), so the replayed records
+carry the tails and overrides bit for bit and `replay_rows` / `take_game_records` give them as `take_samples` does (the
+`t_*` / `ov_*` arrays, `sample_arrays_rows`; the head-only `sample_arrays` is never used for them). A replayed row past
+the game's `MAX_ROW_TOKENS` refuses the record (the driver aborts such a game: it has no samples). A game the driver
+aborted at its row limit (a row past it, 2.15) has a record too - its moves up to the abort, `aborted` true, no samples
+of its own - with one more key, `"abort_reason": "max_row_tokens"` (written only then: every other record is the same
+text as before); its replay must end in a game still in progress (the driver stopped it mid-game), and a contest's
+last episode likewise (the earlier episodes' samples kept). An `abort_reason` other than "max_row_tokens", one on a game
+without tail segments, or an aborted game in progress without it are refused. Tests:
+`driver::trace_tail_tests` - toy_tail's traced games (dense and sparse batches: rows with tail tokens and overrides)
+replay to their rows bit for bit, head, tail tokens and overrides included; games aborted at the first row, mid-game
+(a driver's lower limit) and a contest's later episode replay as aborted; a wrong or missing reason is refused.
 
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
@@ -2065,6 +2155,22 @@ determinize / encode / result / margin / score / export_state / apply_external /
 `zero.package`). Keep `"toy"` registered: the shims' tests and tools use it. The game's engine
 crate depends on `zero_search` for the trait.
 
+### 4.1 The settings parser (`zero_search::settings`; zero-farm phase 0b, 2026-11-11)
+
+The driver's settings - the seat dicts of 2.1, `branch` / `starts` of 2.11, a whole `DriverCfg` with its
+de-duplicated seat table - are parsed by one Rust module over serde_json values, `zero_search::settings`
+(`SEAT_KEYS`, `parse_seat`, `parse_branch`, `parse_starts`, `driver_cfg`). The bindings call it (`zero_py`
+converts its Python dicts to JSON: `to_json`; `starts`' dict specs keep Python's `json.dumps` text) and so does a
+native worker (`zero_worker`, from a run's `config.json`): a new seat setting is one change for both. The
+rules are the bindings' since the beginning: a missing setting or null is its default; an integer setting takes
+an integer in range or a boolean (Python's `int` takes `True`), a float setting any number or a boolean, a text
+setting a string; a flag (`selfplay`, `redet`, `record`, `belief_fast`, `infoset_merge`, branch's `differ`) is
+Python-truthy; an unknown setting is an error - a network seat's (not in `SEAT_KEYS`), a bot or external seat's
+(anything but `bot` / `external`: it used to be ignored), branch's, starts'. A non-finite float is refused (JSON
+has none). `<engine>.driver_settings(seats, ...)` returns the `DriverCfg` a `SearchDriver` would get, as text,
+without making a driver (a diagnostic; `tools/driver_settings_dump.py` compares it across parsers and with the
+native worker's `driver-cfg`).
+
 ## 5. The toy game: "Mini Cavern" (`crates/search/src/toy.rs`)
 
 Built (for Caverna Zero) to exercise what a Rosenberg-style game needs: 2-4 players; worker placement over 6 rounds with
@@ -2125,6 +2231,12 @@ row. `encode` panics on a state with a tail (R1). Its token layout is `zero.pack
 section 1.4, literally); `TOY_TAIL_TOKENS_BASE` is the same without `marks`. Spec `"episodes": k` (> 1) chains k games as one contest
 (1.3, 2.14; the contest's result by game wins, the other player starting each later game) and `"items_step"` starts
 game e from `items0 + e * items_step` items (docs/az.md 43.13); without them the game of before.
+
+`toy_tail_wide` (`TailWideGame`, layout `zero.package.TOY_TAIL_WIDE_TOKENS`; 2026-11-13): the same game with 20 more
+tail-only segments after `marks`, `x02` .. `x21` (indices 2 .. 21, width 4, gated in the layout), each item also a
+token of segment `2 + (value + position) mod 20` at slot `position`; `MAX_ROW_TOKENS` 96. More tail segments than MTG
+Zero's layout v7 and indices past its highest: the proof that new tail segments need no worker, exporter or records
+change (docs/az.md 46.7). `toy_tail` is the same generic game with no extra segment, byte for byte as before.
 
 ## 6. Parity: Rust search vs Python reference
 

@@ -234,6 +234,14 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn active_seat(&self) -> Option<usize> {
         None
     }
+    /// What the game built from its seed that a game record carries (docs/search.md 2.17, zero-farm's
+    /// self-play records): text the game defines (MTG Zero: each seat's deck), compared with the replayed
+    /// game's at the end of a replay (`record::replay`) - so a record whose setup another machine built
+    /// differently (another platform's libm in a deck builder) is refused, not trained on. Called on a
+    /// finished (or resigned) game. Default empty: nothing to record.
+    fn record_setup(&self) -> String {
+        String::new()
+    }
     /// **Chained episodes** (opt-in; docs/search.md 1.3, docs/az.md 42): this game's episodes are the parts of one
     /// contest (MTG Zero: the games of a best-of-three match, each its own episode). An episode ends where `to_move()`
     /// is None, and the search and the driver treat that state as any terminal: its `result()` and `margin()` are the

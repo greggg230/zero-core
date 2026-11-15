@@ -17,12 +17,18 @@
 //! * `tail`: variable-length rows (docs/search.md 1.4, 2.15): a row's tail tokens past the fixed-width head and
 //!   its pointer overrides (`SearchGame::TAILS`, `encode_row`, `option_overrides`).
 //! * `dynapi`: object-safe wrappers for the bindings (crate `zero_py`).
+//! * `record`: game records (a game's seed, real moves and search outputs) and their replay into the
+//!   training rows the driver emitted (docs/search.md 2.17; zero-farm's self-play records).
+//! * `settings`: the driver's settings from JSON - seats, branch, starts, a whole `DriverCfg` (the one
+//!   parser the bindings and native workers share; docs/search.md 4.1).
 pub mod driver;
 pub mod dynapi;
 pub mod game;
 pub mod lookahead;
 pub mod noise;
+pub mod record;
 pub mod rng;
+pub mod settings;
 pub mod tail;
 pub mod toy;
 pub mod toy_tail;

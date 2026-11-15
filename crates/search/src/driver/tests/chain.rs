@@ -379,3 +379,60 @@ fn next_episode_continues_the_match_or_ends_it() {
         }
     }
 }
+
+#[test]
+fn traced_contests_replay_to_their_rows_bit_for_bit() {
+    // a traced rolling driver of toy matches (docs/search.md 2.17): every contest's record - its episode boundaries,
+    // each episode's outcome and setup, resignations conceding a game while the match goes on - replays into the
+    // rows the driver emitted, each labelled by its own game's outcome, and the match's result
+    let seat = with_resign(with_view(nn(0, 16, true), LeafView::Mover, 0.5, ViewTarget::NextQ), 0.45, 1, 0.2);
+    let mut c = match_cfg(seat, 1);
+    (c.rolling, c.concurrency, c.groups, c.threads, c.aux) = (true, 8, 2, 3, true);
+    let mut d = Driver::<ToyMatch>::new(c).unwrap();
+    d.set_trace(true).unwrap();
+    let mut rows: Vec<(GameResult, Vec<Record>)> = Vec::new();
+    let take = |d: &mut Driver<ToyMatch>, rows: &mut Vec<(GameResult, Vec<Record>)>| {
+        let rs = d.take_results();
+        let smp = d.take_samples();
+        let mut a = 0;
+        for r in rs {
+            let k = r.samples as usize;
+            rows.push((r, smp[a..a + k].to_vec()));
+            a += k;
+        }
+    };
+    for net in [0u32, 0, 1] {
+        d.resume(12, net).unwrap();
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer_lead_match(&mut d, &b);
+            take(&mut d, &mut rows);
+        }
+        take(&mut d, &mut rows);
+    }
+    let spec = ToyMatch::parse_spec("{}").unwrap();
+    let (mut multi, mut conceded, mut views) = (0, 0, 0);
+    for (r, s) in &rows {
+        let rec: serde_json::Value = serde_json::from_str(&crate::record::game_json(r, s).unwrap().to_string()).unwrap();
+        let rp = crate::record::replay::<ToyMatch>(&spec, &rec, true).unwrap_or_else(|e| panic!("contest {}: {e}", r.gid));
+        assert_eq!((rp.episodes, rp.over), (r.episodes.len(), r.over));
+        assert_eq!(rp.result.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), r.result.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        assert_eq!(rp.records.len(), s.len());
+        for (k, (a, b)) in rp.records.iter().zip(s).enumerate() {
+            super::same_row(a, b).unwrap_or_else(|e| panic!("contest {} row {k}: {e}", r.gid));
+        }
+        multi += (r.episodes.len() > 1) as usize;
+        conceded += r.episodes.iter().filter(|e| e.resign.as_ref().is_some_and(|x| x.resigned)).count();
+        views += s.iter().filter(|x| x.opts.is_empty()).count();
+        // a tampered episode outcome or boundary is refused
+        let mut bad = rec.clone();
+        bad["episodes"][0]["result"][0] = serde_json::json!(0.5f32.to_bits());
+        assert!(crate::record::replay::<ToyMatch>(&spec, &bad, true).is_err());
+        if let Some(i) = rec["steps"].as_array().unwrap().iter().position(|v| v.is_object()) {
+            let mut bad = rec.clone();
+            bad["steps"].as_array_mut().unwrap().remove(i);
+            assert!(crate::record::replay::<ToyMatch>(&spec, &bad, true).is_err(), "an episode boundary dropped");
+        }
+    }
+    assert!(rows.len() >= 36, "{} contests", rows.len());
+    assert!(multi > 0 && conceded > 0 && views > 0, "contests of several games {multi}, conceded games {conceded}, value rows {views}");
+}

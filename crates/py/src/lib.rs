@@ -13,17 +13,21 @@
 //! `pyo3 = { version = "0.23", features = ["extension-module"] }`). The module exposes `Game`,
 //! `SearchTree`, `SearchDriver`, `SampleRecords` (`SearchDriver.take_records`), `Lookahead` (the
 //! position API of docs/search.md 3.9),
-//! `game_names()`, `game_info_of(name)`, `lookahead_settings(settings)` and `MAX_SEATS`.
+//! `game_names()`, `game_info_of(name)`, `lookahead_settings(settings)`, `driver_settings(seats, ...)`
+//! (the `DriverCfg` a `SearchDriver` would get, as text: a diagnostic) and `MAX_SEATS`.
 use std::sync::OnceLock;
 
 use numpy::{IntoPyArray, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyString, PyTuple};
+use serde_json::{Map, Value};
 
-use zero_search::driver::{noresign_pick, root_floor, sample_arrays_rows, view_pick, Batch, BranchCfg, DriverCfg, KeyKind, StartsCfg, LeafView, NnSeat, PolicyTarget, Record, RootSearch, SeatCfg, Select, ViewTarget, BELIEF_CLIP};
+use zero_search::driver::{noresign_pick, root_floor, sample_arrays_rows, view_pick, Batch, DriverCfg, Record, Select, BELIEF_CLIP};
+use zero_search::settings::{self, DriverArgs};
 use zero_search::dynapi::{boxed_driver, boxed_game, game_info, DynDriver, DynGame, DynLook, DynTree, GameInfo};
 use zero_search::lookahead::{LookCfg, Outcome};
+use zero_search::record::Replayed;
 use zero_search::tail::TailRow;
 use zero_search::{SearchGame, MAX_SEATS};
 
@@ -39,11 +43,13 @@ pub struct GameEntry {
     pub new_game: fn(&str, usize, u64) -> Result<Box<dyn DynGame>, String>,
     pub new_driver: fn(DriverCfg) -> Result<Box<dyn DynDriver>, String>,
     pub info: fn() -> GameInfo,
+    /// `zero_search::record::replay_json` of the game type (docs/search.md 2.17).
+    pub replay: fn(&str, &str, bool) -> Result<Replayed, String>,
 }
 
 impl GameEntry {
     pub const fn of<G: SearchGame>(name: &'static str) -> GameEntry {
-        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G> }
+        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G>, replay: zero_search::record::replay_json::<G> }
     }
 }
 
@@ -81,6 +87,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_class::<PySampleRecords>()?;
     m.add_class::<PyLookahead>()?;
     m.add_function(wrap_pyfunction!(lookahead_settings, m)?)?;
+    m.add_function(wrap_pyfunction!(driver_settings, m)?)?;
     m.add_function(wrap_pyfunction!(game_names, m)?)?;
     m.add_function(wrap_pyfunction!(game_info_of, m)?)?;
     m.add_function(wrap_pyfunction!(root_floor_of, m)?)?;
@@ -89,6 +96,8 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(belief_weight_of, m)?)?;
     m.add_function(wrap_pyfunction!(gumbel_sequence_of, m)?)?;
     m.add_function(wrap_pyfunction!(completed_q_policy_of, m)?)?;
+    m.add_function(wrap_pyfunction!(replay_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(game_seed_of, m)?)?;
     m.add_function(wrap_pyfunction!(pack_sparse_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(pack_tail_tokens, m)?)?;
     m.add("MAX_SEATS", MAX_SEATS)?;
@@ -144,186 +153,71 @@ fn spec_json(spec: Option<&Bound<'_, PyAny>>) -> PyResult<String> {
     }
 }
 
-fn get<'py, T: FromPyObject<'py>>(d: &Bound<'py, PyDict>, k: &str, default: T) -> PyResult<T> {
-    match d.get_item(k)? {
-        Some(v) if !v.is_none() => v.extract(),
-        _ => Ok(default),
+/// A Python value as JSON for the shared settings parser (`zero_search::settings`): None, bool, str,
+/// int, float (finite: JSON has no NaN / inf), list / tuple, dict with string keys; an int-like
+/// (`__index__`, e.g. numpy's) as an integer, a float-like as a float. Another type is an error.
+fn to_json(v: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if v.is_none() {
+        return Ok(Value::Null);
     }
+    if let Ok(b) = v.downcast::<PyBool>() {
+        return Ok(Value::Bool(b.is_true()));
+    }
+    if let Ok(s) = v.downcast::<PyString>() {
+        return Ok(Value::String(s.to_str()?.to_owned()));
+    }
+    if let Ok(d) = v.downcast::<PyDict>() {
+        let mut m = Map::new();
+        for (k, x) in d.iter() {
+            let k: String = k.extract().map_err(|_| PyValueError::new_err(format!("a setting's name is a string, not {}", k.repr().map_or_else(|_| "?".into(), |r| r.to_string()))))?;
+            m.insert(k, to_json(&x)?);
+        }
+        return Ok(Value::Object(m));
+    }
+    if v.downcast::<PyList>().is_ok() || v.downcast::<PyTuple>().is_ok() {
+        return v.try_iter()?.map(|x| to_json(&x?)).collect::<PyResult<Vec<_>>>().map(Value::Array);
+    }
+    let float = |f: f64| serde_json::Number::from_f64(f).map(Value::Number).ok_or_else(|| PyValueError::new_err(format!("setting value {f}: not a finite number (JSON has no NaN / inf)")));
+    if v.downcast::<PyFloat>().is_ok() {
+        return float(v.extract::<f64>()?);
+    }
+    if let Ok(i) = v.extract::<i64>() {
+        return Ok(Value::from(i));
+    }
+    if let Ok(u) = v.extract::<u64>() {
+        return Ok(Value::from(u));
+    }
+    if let Ok(f) = v.extract::<f64>() {
+        return float(f);
+    }
+    Err(PyValueError::new_err(format!("setting value {}: not a JSON value (None, bool, str, int, float, list, dict)", v.repr().map_or_else(|_| "?".into(), |r| r.to_string()))))
 }
 
-/// The seat key `belief_tilts` ({target: alpha}, docs/search.md 3.8.1): sorted by name; absent or None:
-/// none.
-fn belief_tilts_of(d: &Bound<'_, PyDict>) -> PyResult<Vec<(String, f64)>> {
-    match d.get_item("belief_tilts")? {
-        Some(v) if !v.is_none() => {
-            let m: std::collections::BTreeMap<String, f64> =
-                v.extract().map_err(|_| PyValueError::new_err("belief_tilts: a dict {target: alpha}"))?;
-            Ok(m.into_iter().collect())
-        }
-        _ => Ok(Vec::new()),
-    }
-}
-
-fn flag(d: &Bound<'_, PyDict>, k: &str, default: bool) -> PyResult<bool> {
-    match d.get_item(k)? {
-        Some(v) if !v.is_none() => v.is_truthy(),
-        _ => Ok(default),
-    }
-}
-
-const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "belief_tilts", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge", "value_choice_worlds", "value_choice_temp"];
-
-fn key_index(keys: &mut Vec<(String, KeyKind)>, name: String, kind: KeyKind) -> PyResult<u16> {
-    match keys.iter().position(|k| k.0 == name) {
-        Some(i) if keys[i].1 == kind => Ok(i as u16),
-        Some(_) => Err(PyValueError::new_err(format!("evaluator key {name:?} used for both a network and an external seat"))),
-        None => {
-            keys.push((name, kind));
-            Ok((keys.len() - 1) as u16)
+/// `starts` as JSON with each entry's spec as Python gave it to the game since the beginning
+/// (`spec_json`: a string as it is, None "{}", a dict `json.dumps`'d - its key order and spacing
+/// kept); anything else as it is (the parser says what is wrong).
+fn starts_json(d: &Bound<'_, PyDict>) -> PyResult<Value> {
+    let mut m = Map::new();
+    for (k, x) in d.iter() {
+        let k: String = k.extract().map_err(|_| PyValueError::new_err("starts: a setting's name is a string"))?;
+        if k == "specs" && x.downcast::<PyString>().is_err() {
+            let mut list = Vec::new();
+            for e in x.try_iter()? {
+                let e = e?;
+                // (a tuple or a list of two: the id, the spec)
+                let two: Option<Vec<Bound<'_, PyAny>>> = if e.downcast::<PyTuple>().is_ok() || e.downcast::<PyList>().is_ok() { e.try_iter()?.collect::<PyResult<Vec<_>>>().ok() } else { None };
+                let pair = two.filter(|v| v.len() == 2).and_then(|v| Some((v[0].extract::<String>().ok()?, v[1].clone())));
+                list.push(match pair {
+                    Some((id, sp)) => Value::Array(vec![Value::String(id), Value::String(spec_json(Some(&sp))?)]),
+                    None => to_json(&e)?,
+                });
+            }
+            m.insert(k, Value::Array(list));
+        } else {
+            m.insert(k, to_json(&x)?);
         }
     }
-}
-
-/// `branch` dict {p, moves, temp, differ} (docs/search.md 2.11; another key is an error).
-fn parse_branch(d: &Bound<'_, PyDict>) -> PyResult<BranchCfg> {
-    for k in d.keys() {
-        let k: String = k.extract()?;
-        if !["p", "moves", "temp", "differ"].contains(&k.as_str()) {
-            return Err(PyValueError::new_err(format!("branch: unknown key {k:?} (p, moves, temp, differ)")));
-        }
-    }
-    let p: f64 = d.get_item("p")?.ok_or_else(|| PyValueError::new_err("branch: p (the share of games that branch) is required"))?.extract()?;
-    let b = BranchCfg { p, moves: get(d, "moves", 3u32)?, temp: get(d, "temp", 2.0f64)?, differ: flag(d, "differ", false)? };
-    b.check().map_err(PyValueError::new_err)?;
-    Ok(b)
-}
-
-/// `starts` dict {p, specs: [(id, spec JSON or dict), ...]} (docs/search.md 2.11).
-fn parse_starts(d: &Bound<'_, PyDict>) -> PyResult<StartsCfg> {
-    for k in d.keys() {
-        let k: String = k.extract()?;
-        if !["p", "specs"].contains(&k.as_str()) {
-            return Err(PyValueError::new_err(format!("starts: unknown key {k:?} (p, specs)")));
-        }
-    }
-    let p: f64 = d.get_item("p")?.ok_or_else(|| PyValueError::new_err("starts: p (the share of games started from the archive) is required"))?.extract()?;
-    let list = d.get_item("specs")?.ok_or_else(|| PyValueError::new_err("starts: specs ([(id, spec), ...]) is required"))?;
-    let mut specs = Vec::new();
-    for e in list.try_iter()? {
-        let e = e?;
-        let (id, sp): (String, Bound<'_, PyAny>) = e.extract().map_err(|_| PyValueError::new_err("starts: each entry is (id, spec)"))?;
-        specs.push((id, spec_json(Some(&sp))?));
-    }
-    let c = StartsCfg { p, specs };
-    c.check().map_err(PyValueError::new_err)?;
-    Ok(c)
-}
-
-/// Seat dict: {'bot': name} | {'external': key} | network seat settings (SEAT_KEYS).
-fn parse_seat(d: &Bound<'_, PyDict>, keys: &mut Vec<(String, KeyKind)>) -> PyResult<SeatCfg> {
-    if let Some(b) = d.get_item("bot")? {
-        return Ok(SeatCfg::Bot(b.extract()?));
-    }
-    if let Some(e) = d.get_item("external")? {
-        return Ok(SeatCfg::External(key_index(keys, e.extract()?, KeyKind::External)?));
-    }
-    for k in d.keys() {
-        let k: String = k.extract()?;
-        if !SEAT_KEYS.contains(&k.as_str()) {
-            return Err(PyValueError::new_err(format!("seat: unknown setting {k:?} (bot, external, {SEAT_KEYS:?})")));
-        }
-    }
-    let key = key_index(keys, get(d, "key", "m".to_string())?, KeyKind::Nn)?;
-    let sims_fast: Option<u32> = match d.get_item("sims_fast")? {
-        Some(v) if !v.is_none() => Some(v.extract()?),
-        _ => None,
-    };
-    let sims_minor: Option<u32> = match d.get_item("sims_minor")? {
-        Some(v) if !v.is_none() => Some(v.extract()?),
-        _ => None,
-    };
-    // training target of recorded decisions: 'visits' (default) | 'cq' (docs/search.md 3.1)
-    let (cq_c_visit, cq_c_scale) = (get(d, "cq_c_visit", 50.0f64)?, get(d, "cq_c_scale", 1.0f64)?);
-    let policy_target = PolicyTarget::parse(&get(d, "policy_target", "visits".to_string())?, cq_c_visit, cq_c_scale).map_err(verr)?;
-    // the prior's exponent beta in the 'cq' target (docs/search.md 3.13; absent: 1.0, the target of before)
-    let policy_target = policy_target.with_prior_w(get(d, "cq_prior_w", 1.0f64)?).map_err(verr)?;
-    let select: String = get(d, "select", "visits".to_string())?;
-    for k in ["select_c_visit", "select_c_scale"] {
-        if select == "visits" && matches!(d.get_item(k)?, Some(v) if !v.is_none()) {
-            return Err(PyValueError::new_err(format!("{k}: a setting of select 'cq' ('visits' has no completed-Q transform)")));
-        }
-    }
-    // the root search: 'puct' (default) | 'gumbel' with its settings (docs/search.md 3.7; sigma's
-    // transform absent: the seat's cq_c_visit, cq_c_scale)
-    let root_search: String = get(d, "root_search", "puct".to_string())?;
-    for k in ["gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale"] {
-        if root_search != "gumbel" && matches!(d.get_item(k)?, Some(v) if !v.is_none()) {
-            return Err(PyValueError::new_err(format!("{k}: a setting of root_search 'gumbel'")));
-        }
-    }
-    let root_search = RootSearch::parse(&root_search, get(d, "gumbel_m", 16u32)?, get(d, "gumbel_scale", 1.0f64)?, get(d, "gumbel_c_visit", cq_c_visit)?, get(d, "gumbel_c_scale", cq_c_scale)?).map_err(verr)?;
-    // the exhaustive lookahead (docs/search.md 3.9): a dict of its settings (or their JSON), None = off
-    let look = match d.get_item("lookahead")? {
-        Some(v) if !v.is_none() => Some(Box::new(LookCfg::parse(&spec_json(Some(&v))?).map_err(verr)?)),
-        _ => None,
-    };
-    Ok(SeatCfg::Nn(NnSeat {
-        key,
-        sims: get(d, "sims", 100u32)?,
-        c_puct: get(d, "c_puct", 1.0f64)?,
-        selfplay: flag(d, "selfplay", false)?,
-        alpha: get(d, "alpha", 0.3f64)?,
-        eps: get(d, "eps", 0.25f64)?,
-        temp_moves: get(d, "temp_moves", 30u32)?,
-        sims_fast,
-        p_full: get(d, "p_full", 1.0f64)?,
-        sims_minor,
-        chance_k: get(d, "chance_k", 0u32)?,
-        margin_w: get(d, "margin_w", 0.0f64)?,
-        redet: flag(d, "redet", true)?,
-        policy_target,
-        // the rule of the moves it does not sample: 'visits' (default) | 'cq' with the guard
-        // select_min_visits and the completed-Q transform select_c_visit, select_c_scale (absent:
-        // the target's cq_c_visit, cq_c_scale; docs/search.md 3.3)
-        select: Select::parse(&select, get(d, "select_min_visits", 0u32)?, get(d, "select_c_visit", cq_c_visit)?, get(d, "select_c_scale", cq_c_scale)?).map_err(verr)?,
-        // whether its full searches are recorded (absent: true; false: a league opponent, a
-        // past checkpoint whose moves are not the current policy's, docs/az.md 14)
-        record: flag(d, "record", true)?,
-        // root minimum visits of its full searches (0 = off) on roots of up to
-        // root_min_visits_max_actions options (docs/search.md 3.5)
-        root_min_visits: get(d, "root_min_visits", 0u32)?,
-        root_min_visits_max_actions: get(d, "root_min_visits_max_actions", 4u32)?,
-        // whose view a leaf's value comes from: 'mover' (default) | 'root' (docs/search.md 3.6)
-        leaf_value_view: LeafView::parse(&get(d, "leaf_value_view", "mover".to_string())?).map_err(verr)?,
-        // value-only samples: a share of the recorded decisions (0 = off) and their q target
-        view_samples: get(d, "view_samples", 0.0f64)?,
-        view_target: ViewTarget::parse(&get(d, "view_sample_target", "next_q".to_string())?).map_err(verr)?,
-        // the root's belief (docs/search.md 3.8): its tilt (0 = off), clip, uniform share, and
-        // whether fast and minor searches take it too
-        belief_tilt: get(d, "belief_tilt", 0.0f64)?,
-        belief_clip: get(d, "belief_clip", BELIEF_CLIP)?,
-        belief_mix: get(d, "belief_mix", 0.0f64)?,
-        belief_fast: flag(d, "belief_fast", false)?,
-        // per-target tilts of the root's belief ({target: alpha}, docs/search.md 3.8.1; absent: none),
-        // sorted by name; checked against the game's targets by the driver
-        belief_tilts: belief_tilts_of(d)?,
-        root_search,
-        look,
-        // the game's evaluation cache: at most this many answers per game (0 = off; docs/search.md 3.12)
-        eval_cache: get(d, "eval_cache", 0u32)?,
-        // self-play resignation (docs/search.md 3.14): the threshold t (0 = off), the consecutive decided
-        // full searches k, the share of games that never resign (checked by the driver)
-        resign_t: get(d, "resign_t", 0.0f64)?,
-        resign_k: get(d, "resign_k", 5u32)?,
-        resign_noresign: get(d, "resign_noresign", 0.1f64)?,
-        // information-set merging (docs/search.md 3.16; absent: false, the tree of before; checked by the driver:
-        // root-view leaf values, an evaluation seat)
-        infoset_merge: flag(d, "infoset_merge", false)?,
-        // value choices (docs/search.md 3.17; absent: 0 worlds, off): the worlds that value each option of a
-        // decision the game marks, and the temperature of the choice (0: the best mean value)
-        value_choice_worlds: get(d, "value_choice_worlds", 0u32)?,
-        value_choice_temp: get(d, "value_choice_temp", 0.0f64)?,
-    }))
+    Ok(Value::Object(m))
 }
 
 /// A result row's resignation (`ResignInfo`, docs/search.md 3.14) as a dict.
@@ -989,6 +883,34 @@ impl PySearchTree {
 
 // ------------------------------------------------------------------------ SearchDriver
 
+/// The `DriverCfg` of `SearchDriver(game, seats, ...)`'s arguments (the seat dicts parsed, the
+/// distinct seats de-duplicated into one table).
+#[allow(clippy::too_many_arguments)]
+fn driver_cfg(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>, max_row_tokens: Option<usize>) -> PyResult<DriverCfg> {
+    let spec = spec_json(spec)?;
+    let mut games = Vec::with_capacity(seats.len());
+    for g in seats.iter() {
+        let row: Vec<Bound<'_, PyDict>> = g.extract()?;
+        games.push(row.iter().map(|s| to_json(s.as_any())).collect::<PyResult<Vec<_>>>()?);
+    }
+    let branch = branch.map(|b| to_json(b.as_any())).transpose()?;
+    let starts = starts.map(starts_json).transpose()?;
+    let args = DriverArgs { spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, max_row_tokens };
+    settings::driver_cfg(&games, branch.as_ref(), starts.as_ref(), args).map_err(verr)
+}
+
+/// The driver settings `SearchDriver(game, seats, ...)` would be built with, as the Rust `DriverCfg`'s
+/// pretty Debug text (a diagnostic: no driver is made, the game is not checked): the seat dicts parsed,
+/// the distinct seats in one table. zero-farm's settings tools compare it across parsers and with the
+/// native worker's (docs/az.md 44).
+#[pyfunction]
+#[pyo3(signature = (seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None, max_row_tokens=None))]
+#[allow(clippy::too_many_arguments)]
+fn driver_settings(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>, max_row_tokens: Option<usize>) -> PyResult<String> {
+    let cfg = driver_cfg(seats, spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts, max_row_tokens)?;
+    Ok(format!("{cfg:#?}"))
+}
+
 /// The batched driver (docs/search.md 2). `seats` = per game a list of seat dicts; `aux`: record
 /// the game's auxiliary targets with the samples (`take_samples()['aux']`, docs/search.md 1.2);
 /// `paired`: games 2k and 2k + 1 share every random stream (the deal), `DriverCfg::paired`;
@@ -1023,29 +945,7 @@ impl PySearchDriver {
     #[pyo3(signature = (game, seats, spec=None, concurrency=64, seed=0, record=false, threads=4, groups=2, max_steps=100_000, rolling=false, net=0, queue_only=false, move_log=0, aux=false, paired=false, sparse=false, branch=None, starts=None, max_row_tokens=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(game: &str, seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, concurrency: usize, seed: u64, record: bool, threads: usize, groups: usize, max_steps: u64, rolling: bool, net: u32, queue_only: bool, move_log: u32, aux: bool, paired: bool, sparse: bool, branch: Option<&Bound<'_, PyDict>>, starts: Option<&Bound<'_, PyDict>>, max_row_tokens: Option<usize>) -> PyResult<Self> {
-        let spec = spec_json(spec)?;
-        let mut keys = Vec::new();
-        let mut table: Vec<SeatCfg> = Vec::new();
-        let mut games = Vec::with_capacity(seats.len());
-        for g in seats.iter() {
-            let row: Vec<Bound<'_, PyDict>> = g.extract()?;
-            let mut ix = Vec::with_capacity(row.len());
-            for s in row {
-                let sc = parse_seat(&s, &mut keys)?;
-                let i = match table.iter().position(|x| *x == sc) {
-                    Some(i) => i,
-                    None => {
-                        table.push(sc);
-                        table.len() - 1
-                    }
-                };
-                ix.push(i as u16);
-            }
-            games.push(ix);
-        }
-        let branch = branch.map(parse_branch).transpose()?;
-        let starts = starts.map(parse_starts).transpose()?;
-        let cfg = DriverCfg { spec, seats: table, games, keys, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts, max_row_tokens };
+        let cfg = driver_cfg(seats, spec, concurrency, seed, record, threads, groups, max_steps, rolling, net, queue_only, move_log, aux, paired, sparse, branch, starts, max_row_tokens)?;
         let d = new_driver(game, cfg).map_err(verr)?;
         let info = d.info();
         Ok(PySearchDriver { d, nfeat: info.num_features, rows: RowKinds::of(&info) })
@@ -1147,73 +1047,38 @@ impl PySearchDriver {
     fn take_results<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let out = PyList::empty(py);
         for r in self.d.take_results() {
-            let d = PyDict::new(py);
-            d.set_item("gid", r.gid)?;
-            d.set_item("n", r.n)?;
-            d.set_item("over", r.over)?;
-            d.set_item("aborted", r.aborted)?;
-            d.set_item("result", r.result)?;
-            d.set_item("scores", r.scores)?;
-            d.set_item("steps", r.steps)?;
-            d.set_item("decisions", r.decisions)?;
-            d.set_item("ext_moves", r.ext_moves)?;
-            d.set_item("rounds", r.rounds)?;
-            d.set_item("samples", r.samples)?;
-            d.set_item("tag", r.tag)?;
-            if !r.moves.is_empty() {
-                // DriverCfg::move_log (a diagnostic): [(seat, action, legal actions)]
-                d.set_item("moves", r.moves)?;
-            }
-            if let Some(b) = &r.branch {
-                // a branch game (DriverCfg::branch, docs/search.md 2.11)
-                let bd = PyDict::new(py);
-                bd.set_item("at", b.at)?;
-                bd.set_item("of", b.of)?;
-                bd.set_item("decision", b.decision)?;
-                bd.set_item("step", b.step)?;
-                bd.set_item("action", b.action)?;
-                bd.set_item("moves", b.moves)?;
-                bd.set_item("played", b.played)?;
-                bd.set_item("same_first", b.same_first)?;
-                bd.set_item("start", b.start)?;
-                d.set_item("branch", bd)?;
-            }
-            if let Some(j) = r.start {
-                // a game started from an archive entry (DriverCfg::starts)
-                d.set_item("start", j)?;
-            }
-            if !r.episodes.is_empty() {
-                // a chained game's contest (SearchGame::chained, docs/search.md 2.14): its episodes
-                let eps = PyList::empty(py);
-                for e in &r.episodes {
-                    let ed = PyDict::new(py);
-                    ed.set_item("over", e.over)?;
-                    ed.set_item("aborted", e.aborted)?;
-                    ed.set_item("result", e.result.clone())?;
-                    ed.set_item("margins", e.margins.clone())?;
-                    ed.set_item("steps", e.steps)?;
-                    ed.set_item("decisions", e.decisions)?;
-                    ed.set_item("ext_moves", e.ext_moves)?;
-                    ed.set_item("rounds", e.rounds)?;
-                    ed.set_item("samples", e.samples)?;
-                    if let Some(rs) = &e.resign {
-                        ed.set_item("resign", resign_dict(py, rs)?)?;
-                    }
-                    eps.append(ed)?;
-                }
-                d.set_item("episodes", eps)?;
-            }
-            if let Some(rs) = &r.resign {
-                // self-play resignation (NnSeat::resign_t, docs/search.md 3.14): only when the game's seats resign
-                d.set_item("resign", resign_dict(py, rs)?)?;
-            }
-            if let Some(why) = r.abort_reason {
-                // the driver aborted the game (docs/search.md 2.15: "max_row_tokens")
-                d.set_item("abort_reason", why)?;
-            }
-            out.append(d)?;
+            out.append(result_row(py, &r)?)?;
         }
         Ok(out)
+    }
+
+    /// Trace every game (`Driver::set_trace`, docs/search.md 2.17): before the first resume.
+    fn set_trace(&mut self, on: bool) -> PyResult<()> {
+        self.d.set_trace(on).map_err(verr)
+    }
+
+    /// A traced driver's finished games (docs/search.md 2.17): take_results and take_samples at one point, with each
+    /// game's record (`zero_search::record::game_json`, JSON text) -> (rows, records, samples dict or None).
+    fn take_game_records<'py>(&mut self, py: Python<'py>) -> PyResult<(Bound<'py, PyList>, Vec<String>, Option<PyObject>)> {
+        let rows = self.d.take_results();
+        let recs = self.d.take_samples();
+        let out = PyList::empty(py);
+        let mut texts = Vec::with_capacity(rows.len());
+        let mut a = 0usize;
+        for r in &rows {
+            let b = a + r.samples as usize;
+            if b > recs.len() {
+                return Err(rerr(format!("game {} has {} samples, {} left", r.gid, r.samples, recs.len() - a)));
+            }
+            texts.push(zero_search::record::game_json(r, &recs[a..b]).map_err(rerr)?.to_string());
+            out.append(result_row(py, r)?)?;
+            a = b;
+        }
+        if a != recs.len() {
+            return Err(rerr(format!("{} samples left over after the finished games", recs.len() - a)));
+        }
+        let s = samples_dict(py, recs, self.nfeat, self.rows)?;
+        Ok((out, texts, s))
     }
 
     /// Training sample arrays (docs/search.md 2.4) or None.
@@ -1373,6 +1238,115 @@ fn samples_dict(py: Python<'_>, recs: Vec<Record>, f: usize, rows: RowKinds) -> 
         a.set_item("ov_tok", s.ov_tok.into_pyarray(py))?;
     }
     Ok(Some(a.into_any().unbind()))
+}
+
+/// One game record replayed (docs/search.md 2.17, zero-farm's self-play records: `zero_search::record`): game
+/// `game` with spec `spec` (JSON text), `record` one game's record (JSON text), `aux` its rows carry the
+/// auxiliary targets -> (the rows as `take_samples` gives them - None for a game without samples -, the game's
+/// facts {gid, n, seed, over, aborted, resigned, result, rounds, steps, setup, rows; abort_reason for a game the
+/// driver aborted at its row limit}). A record replay refuses
+/// raises ValueError with the reason (the record is rejected whole).
+#[pyfunction]
+#[pyo3(signature = (game, spec, record, aux=false))]
+fn replay_rows(py: Python<'_>, game: &str, spec: &str, record: &str, aux: bool) -> PyResult<(Option<PyObject>, PyObject)> {
+    let e = entry(game).map_err(verr)?;
+    let (spec, record) = (spec.to_string(), record.to_string());
+    let rp = py.allow_threads(move || (e.replay)(&spec, &record, aux)).map_err(verr)?;
+    let info = PyDict::new(py);
+    info.set_item("gid", rp.gid)?;
+    info.set_item("n", rp.n)?;
+    info.set_item("seed", rp.seed)?;
+    info.set_item("over", rp.over)?;
+    info.set_item("aborted", rp.aborted)?;
+    info.set_item("resigned", rp.resigned)?;
+    if let Some(why) = rp.abort_reason {
+        // the driver aborted the game at its row limit (docs/search.md 2.15): no samples of its own
+        info.set_item("abort_reason", why)?;
+    }
+    info.set_item("result", rp.result.clone())?;
+    info.set_item("rounds", rp.rounds)?;
+    info.set_item("steps", rp.steps)?;
+    info.set_item("setup", rp.setup.clone())?;
+    info.set_item("rows", rp.records.len())?;
+    let gi = (e.info)();
+    let s = samples_dict(py, rp.records, gi.num_features, RowKinds::of(&gi))?;
+    Ok((s, info.into_any().unbind()))
+}
+
+/// The seed of game `gid` of a driver seeded `seed` (`zero_search::record::game_seed`: what `new_game` gets).
+#[pyfunction]
+#[pyo3(signature = (seed, gid, paired=false))]
+fn game_seed_of(seed: u64, gid: u32, paired: bool) -> u64 {
+    zero_search::record::game_seed(seed, gid, paired)
+}
+
+/// A finished game's row as `take_results` gives it (docs/search.md 2.5).
+fn result_row<'py>(py: Python<'py>, r: &zero_search::driver::GameResult) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("gid", r.gid)?;
+    d.set_item("n", r.n)?;
+    d.set_item("over", r.over)?;
+    d.set_item("aborted", r.aborted)?;
+    d.set_item("result", r.result.clone())?;
+    d.set_item("scores", r.scores.clone())?;
+    d.set_item("steps", r.steps)?;
+    d.set_item("decisions", r.decisions)?;
+    d.set_item("ext_moves", r.ext_moves)?;
+    d.set_item("rounds", r.rounds)?;
+    d.set_item("samples", r.samples)?;
+    d.set_item("tag", r.tag.clone())?;
+    if !r.moves.is_empty() {
+        // DriverCfg::move_log (a diagnostic): [(seat, action, legal actions)]
+        d.set_item("moves", r.moves.clone())?;
+    }
+    if let Some(b) = &r.branch {
+        // a branch game (DriverCfg::branch, docs/search.md 2.11)
+        let bd = PyDict::new(py);
+        bd.set_item("at", b.at)?;
+        bd.set_item("of", b.of)?;
+        bd.set_item("decision", b.decision)?;
+        bd.set_item("step", b.step)?;
+        bd.set_item("action", b.action)?;
+        bd.set_item("moves", b.moves)?;
+        bd.set_item("played", b.played)?;
+        bd.set_item("same_first", b.same_first)?;
+        bd.set_item("start", b.start)?;
+        d.set_item("branch", bd)?;
+    }
+    if let Some(j) = r.start {
+        // a game started from an archive entry (DriverCfg::starts)
+        d.set_item("start", j)?;
+    }
+    if !r.episodes.is_empty() {
+        // a chained game's contest (SearchGame::chained, docs/search.md 2.14): its episodes
+        let eps = PyList::empty(py);
+        for e in &r.episodes {
+            let ed = PyDict::new(py);
+            ed.set_item("over", e.over)?;
+            ed.set_item("aborted", e.aborted)?;
+            ed.set_item("result", e.result.clone())?;
+            ed.set_item("margins", e.margins.clone())?;
+            ed.set_item("steps", e.steps)?;
+            ed.set_item("decisions", e.decisions)?;
+            ed.set_item("ext_moves", e.ext_moves)?;
+            ed.set_item("rounds", e.rounds)?;
+            ed.set_item("samples", e.samples)?;
+            if let Some(rs) = &e.resign {
+                ed.set_item("resign", resign_dict(py, rs)?)?;
+            }
+            eps.append(ed)?;
+        }
+        d.set_item("episodes", eps)?;
+    }
+    if let Some(rs) = &r.resign {
+        // self-play resignation (NnSeat::resign_t, docs/search.md 3.14): only when the game's seats resign
+        d.set_item("resign", resign_dict(py, rs)?)?;
+    }
+    if let Some(why) = r.abort_reason {
+        // the driver aborted the game (docs/search.md 2.15: "max_row_tokens")
+        d.set_item("abort_reason", why)?;
+    }
+    Ok(d)
 }
 
 /// The bytes a record holds (itself and its arrays' contents): `SampleRecords.nbytes`, a bounded

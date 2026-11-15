@@ -186,7 +186,7 @@ fn toy_tail_rows_carry_tails_and_overrides() {
 #[test]
 #[should_panic(expected = "a record with tail tokens")]
 fn head_only_sample_arrays_refuse_a_tail() {
-    let r = Record { x: vec![0.0; 2], player: 0, n_players: 2, opts: vec![], pi: vec![], z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: 0, aux: vec![], tail: TailRow { seg: vec![0], slot: vec![4], val: vec![1.0; 16] }, ov: vec![] };
+    let r = Record { x: vec![0.0; 2], player: 0, n_players: 2, opts: vec![], pi: vec![], z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: 0, aux: vec![], step: 0, tail: TailRow { seg: vec![0], slot: vec![4], val: vec![1.0; 16] }, ov: vec![] };
     sample_arrays(&[r], 2);
 }
 

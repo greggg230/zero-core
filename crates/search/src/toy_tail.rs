@@ -30,6 +30,12 @@
 //! player to move first; the contest's result splits its points by game wins (a drawn game half each), a conceded
 //! game lost by its conceding seat. The encoding is the game's alone (the contest is not observed). Without
 //! `episodes` (or 1) the game of before, byte for byte.
+//!
+//! `toy_tail_wide` (`TailWideGame`, layout `package.TOY_TAIL_WIDE_TOKENS`): the same game with `WIDE_EXTRA` more
+//! tail-only segments after `marks` - `x02` .. `x21` (indices 2 .. 21, width 4, no head) -, more tail segments than
+//! MTG Zero's layout v7 and indices past its highest, so new tail segments are proven to need no worker or exporter
+//! change (docs/az.md 46.7). Each item at position `pos` also gives a token of segment `2 + (value + pos) mod
+//! WIDE_EXTRA`, slot `pos`: present, value / 9, marked, pos / 8. Rows of at most 96 tokens; all else toy_tail's.
 use crate::game::{Next, SearchGame, MAX_SEATS};
 use crate::rng::Rng;
 use crate::tail::{pack_tok, TailBuf, TailSeg};
@@ -54,6 +60,36 @@ const ITEMS_OFF: usize = 8;
 const CHANCE: u64 = 0x7461_696c_0000_0000;
 
 pub static TAILS: [TailSeg; 2] = [TailSeg { seg: SEG_ITEMS, name: "items", width: W_ITEM, head: HEAD }, TailSeg { seg: SEG_MARKS, name: "marks", width: W_MARK, head: 0 }];
+/// `toy_tail_wide`'s tail-only segments after `marks` (module docs).
+pub const WIDE_EXTRA: usize = 20;
+pub const W_X: usize = 4;
+const fn xseg(seg: u16, name: &'static str) -> TailSeg {
+    TailSeg { seg, name, width: W_X, head: 0 }
+}
+pub static WIDE_TAILS: [TailSeg; 2 + WIDE_EXTRA] = [
+    TailSeg { seg: SEG_ITEMS, name: "items", width: W_ITEM, head: HEAD },
+    TailSeg { seg: SEG_MARKS, name: "marks", width: W_MARK, head: 0 },
+    xseg(2, "x02"),
+    xseg(3, "x03"),
+    xseg(4, "x04"),
+    xseg(5, "x05"),
+    xseg(6, "x06"),
+    xseg(7, "x07"),
+    xseg(8, "x08"),
+    xseg(9, "x09"),
+    xseg(10, "x10"),
+    xseg(11, "x11"),
+    xseg(12, "x12"),
+    xseg(13, "x13"),
+    xseg(14, "x14"),
+    xseg(15, "x15"),
+    xseg(16, "x16"),
+    xseg(17, "x17"),
+    xseg(18, "x18"),
+    xseg(19, "x19"),
+    xseg(20, "x20"),
+    xseg(21, "x21"),
+];
 
 #[derive(Clone, Debug)]
 pub struct TailSpec {
@@ -72,8 +108,13 @@ struct Item {
     mark: u8,
 }
 
+/// The game with `X` extra tail-only segments: `TailGame` (0, `toy_tail`) or `TailWideGame` (`WIDE_EXTRA`,
+/// `toy_tail_wide`); no other X.
+pub type TailGame = TailGameOf<0>;
+pub type TailWideGame = TailGameOf<WIDE_EXTRA>;
+
 #[derive(Clone, Debug)]
-pub struct TailGame {
+pub struct TailGameOf<const X: usize> {
     items: Vec<Item>,
     scores: [i32; 2],
     moves: u32,
@@ -96,7 +137,7 @@ struct Contest {
     points: [f32; 2],
 }
 
-impl TailGame {
+impl<const X: usize> TailGameOf<X> {
     fn value(&mut self) -> u8 {
         while let Some(k) = (!self.forced.is_empty()).then(|| self.forced.remove(0)) {
             let v = k ^ CHANCE;
@@ -133,16 +174,16 @@ impl TailGame {
     }
 }
 
-impl SearchGame for TailGame {
+impl<const X: usize> SearchGame for TailGameOf<X> {
     type Spec = TailSpec;
-    const NAME: &'static str = "toy_tail";
+    const NAME: &'static str = if X == 0 { "toy_tail" } else { "toy_tail_wide" };
     const NUM_ACTIONS: usize = NUM_ACTIONS;
     const NUM_FEATURES: usize = NUM_FEATURES;
     const MIN_PLAYERS: usize = 2;
     const MAX_PLAYERS: usize = 2;
-    const TAILS: &'static [TailSeg] = &TAILS;
+    const TAILS: &'static [TailSeg] = if X == 0 { &TAILS } else { &WIDE_TAILS };
     const OPTION_POINTERS: bool = true;
-    const MAX_ROW_TOKENS: usize = 64;
+    const MAX_ROW_TOKENS: usize = if X == 0 { 64 } else { 96 };
     const HEAD_TOKENS: usize = 1 + HEAD;
 
     fn parse_spec(json: &str) -> Result<TailSpec, String> {
@@ -168,7 +209,8 @@ impl SearchGame for TailGame {
         let mut rng = Rng::new(seed);
         let items = (0..spec.items0).map(|_| Item { value: 1 + rng.below(9) as u8, mark: 0 }).collect();
         let contest = (spec.episodes > 1).then(|| Box::new(Contest { spec: spec.clone(), played: 0, points: [0.0; 2] }));
-        Ok(TailGame { items, scores: [0; 2], moves: 0, max_moves: spec.max_moves, cur: 0, page: 0, adds: [false; 2], over: false, rng, forced: Vec::new(), contest })
+        const { assert!(X == 0 || X == WIDE_EXTRA, "toy_tail: X is 0 or WIDE_EXTRA") };
+        Ok(Self { items, scores: [0; 2], moves: 0, max_moves: spec.max_moves, cur: 0, page: 0, adds: [false; 2], over: false, rng, forced: Vec::new(), contest })
     }
 
     fn num_players(&self) -> usize {
@@ -269,7 +311,7 @@ impl SearchGame for TailGame {
 
     fn encode(&self, viewer: usize, out: &mut [f32]) {
         // (R1: a head-only caller never gets a row whose tail it would drop)
-        let mut tb = TailBuf::new(&TAILS);
+        let mut tb = TailBuf::new(Self::TAILS);
         self.encode_row(viewer, out, &mut tb);
         assert!(tb.is_empty(), "toy_tail: encode of a state with {} tail tokens (use encode_row)", tb.len());
     }
@@ -296,6 +338,16 @@ impl SearchGame for TailGame {
                 t[0] = 1.0;
                 t[1] = pos as f32 / 8.0;
                 t[2] = (it.mark == viewer as u8 + 1) as u8 as f32;
+            }
+        }
+        if X > 0 {
+            // (toy_tail_wide: each item's token in one of the extra segments, module docs)
+            for (pos, it) in self.items.iter().enumerate() {
+                let t = tail.token(2 + ((it.value as usize + pos) % X) as u16, pos as u32);
+                t[0] = 1.0;
+                t[1] = it.value as f32 / 9.0;
+                t[2] = (it.mark > 0) as u8 as f32;
+                t[3] = pos as f32 / 8.0;
             }
         }
     }
@@ -361,7 +413,7 @@ impl SearchGame for TailGame {
         let n = c.spec.items0 + c.played as usize * c.spec.items_step;
         let items = (0..n).map(|_| Item { value: 1 + rng.below(9) as u8, mark: 0 }).collect();
         let cur = (c.played % 2) as u8;
-        Ok(Next::Continue(TailGame { items, scores: [0; 2], moves: 0, max_moves: c.spec.max_moves, cur, page: 0, adds: [false; 2], over: false, rng, forced: Vec::new(), contest: Some(c) }))
+        Ok(Next::Continue(Self { items, scores: [0; 2], moves: 0, max_moves: c.spec.max_moves, cur, page: 0, adds: [false; 2], over: false, rng, forced: Vec::new(), contest: Some(c) }))
     }
 }
 
