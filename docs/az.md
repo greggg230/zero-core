@@ -7629,3 +7629,31 @@ STOP -> 'stopped', it stays up and sees the run paused then goes on to 'finished
 and the run finishes, a companion exiting 3 is restarted 3 times then given up loudly, `{}` = none, a new supervisor
 stops the companion a killed one left, `supervisor_end`'s states, the hook's validation; `test_loop.py`'s and
 `test_run_infra.py`'s supervisor tests unchanged.
+
+## 51. The live-run fence: process-churning tests skip beside a live run (`runctl.live_supervisors`, the `live_run_hazard` mark; MTG Zero's migration phase 0, 2026-11-15)
+
+**Why.** On 2026-11-14 a supervisor-test storm (~1,000 short-lived processes from `tests/test_run_infra.py` and a
+crash-loop repro) recycled a live run's parent pid on the desktop, and a test supervisor's orphan sweep killed the live
+run's whole tree (47.2). The sweep's creation-time check (76c548f) fixed that path; this keeps the whole class of tests
+- the ones that start real supervisors or churn processes - away from a machine with a live run.
+
+**What.** `zero.runctl.live_supervisors()` lists the supervisors running on this machine (one process scan, a few
+seconds on Windows): any Python process whose program is a `tools/supervise.py` (any game's copy) or
+`-m zero.tools.supervise`; a tool that merely passes `--supervised` (a companion) is not one. `live_run_fence_reason()`
+says why the fence is up (None when it is down); `fence_items(config, items)` is the conftest hook's body: every
+collected test marked `@pytest.mark.live_run_hazard` is skipped with that reason, which starts `live-run fence:` (MTG
+Zero's `tools/gate.py` counts those in pytest's `-rs` lines and names them in a gate's final line as skips). The scan
+runs only when a marked test was collected. Overrides: `ZERO_ALLOW_LIVE_RUN_HAZARD=1` runs the marked tests anyway (a
+quiet machine where the only "live" supervisor is your own), `ZERO_LIVE_RUNS=0` / `1` replaces the scan (tests). On the
+Mac (no supervisor there; macOS also re-parents orphans to launchd, so the pid-reuse case does not exist) they run.
+
+**Marked.** `tests/test_companion.py`: every test that starts `tools/supervise.py` (9); `test_run_infra.py`: the orphan
+sweep and the same-crash give-up; `test_loop.py`: the supervisor with a fake run, the stall watchdog, `kill_run`;
+`test_encoding_guard.py`: the supervisor that does not restart a refused run. A new test that starts a supervisor or
+spawns processes in a loop gets the mark (`tests/test_live_fence.py` checks the supervisor tests carry it).
+
+**Off by default?** Nothing changes for a run, a game or a machine without a live supervisor: the tests run as before.
+**Tests.** `tests/test_live_fence.py`: which command lines are supervisors, the overrides and the reason, only marked
+items fenced and only beside a live run (no scan without a marked item), the marks present. Checked by hand on the
+desktop beside delver-bo3-pb2: the orphan-sweep test is skipped with the reason naming the two live runs, and passes
+with `ZERO_LIVE_RUNS=0`.

@@ -420,6 +420,7 @@ sys.exit(1)
 '''
 
 
+@pytest.mark.live_run_hazard
 def test_the_orphan_sweep_spares_processes_older_than_the_launch():
     """kill_orphans(pid, since) kills the processes whose parent pid is `pid` only when they were created after the
     launch: an older one's parent was another process that had this pid (Windows reuses pids and keeps a dead parent's
@@ -444,6 +445,7 @@ sys.exit(subprocess.run([sys.executable] + sys.argv[1:]).returncode)
 '''
 
 
+@pytest.mark.live_run_hazard
 @pytest.mark.parametrize('launcher', [False, True])
 def test_the_supervisor_gives_up_on_the_same_crash_three_times(tmp_path, launcher):
     """A run that crashes the same way every time (its error text, decimals masked): after the third in a row the

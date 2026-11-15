@@ -264,6 +264,97 @@ def supervisor_end(run=None, pid=None, started=None):
     return None
 
 
+# ------------------------------------------------------------------ live runs on this machine (docs/az.md 51)
+
+LIVE_ENV = 'ZERO_LIVE_RUNS'                 # '0': report none, '1': report one (tests, overrides); unset: look
+HAZARD_ENV = 'ZERO_ALLOW_LIVE_RUN_HAZARD'   # '1': run the live-run-hazard tests even beside a live run
+
+
+def _supervisor_target(cmd):
+    """The run directory a supervisor command line supervises ('' when it names none), or None when the command is
+    not a supervisor: `python [opts] tools/supervise.py <run> ...` (any game's copy) or `python [opts] -m
+    zero.tools.supervise <run> ...`. Only the interpreter's first program counts (a tool that merely passes a path
+    ending in supervise.py is not a supervisor)."""
+    k = 1
+    while k < len(cmd):
+        a = cmd[k]
+        if a == '-m':
+            if k + 1 < len(cmd) and cmd[k + 1] == 'zero.tools.supervise':
+                rest = [x for x in cmd[k + 2:] if not x.startswith('-')]
+                return rest[0] if rest else ''
+            return None
+        if a in ('-c',):
+            return None
+        if a.startswith('-'):
+            k += 1
+            continue
+        if os.path.basename(a.replace('\\', '/')) == 'supervise.py':
+            rest = [x for x in cmd[k + 1:] if not x.startswith('-')]
+            return rest[0] if rest else ''
+        return None
+    return None
+
+
+def live_supervisors():
+    """The supervisors (zero.tools.supervise, any game's tools/supervise.py) running on this machine ->
+    [{'pid', 'run', 'cmd'}] (a Windows venv's launcher and its child are both listed). A live supervisor is what a
+    process-churning test must not run beside: on 2026-11-14 a test storm recycled a live run's parent pid and a
+    test supervisor's orphan sweep killed the live run (docs/az.md 47.2; the sweep's creation-time check fixed that
+    case, the fence keeps the whole class away: docs/az.md 51). ZERO_LIVE_RUNS=0 / 1 overrides the look (tests).
+    One process scan: a few seconds on Windows."""
+    v = os.environ.get(LIVE_ENV, '').strip()
+    if v in ('0', '1'):
+        return [{'pid': 0, 'run': f'({LIVE_ENV}=1)', 'cmd': []}] if v == '1' else []
+    import psutil
+    out = []
+    me = os.getpid()
+    for p in psutil.process_iter(['name']):
+        name = (p.info.get('name') or '').lower()
+        if not name.startswith('python') or p.pid == me:
+            continue
+        try:
+            cmd = p.cmdline()
+        except Exception:                          # noqa: BLE001 - gone, or not ours to read
+            continue
+        run = _supervisor_target(cmd)
+        if run is not None:
+            out.append({'pid': p.pid, 'run': run, 'cmd': cmd})
+    return out
+
+
+FENCE_PREFIX = 'live-run fence:'
+
+
+def live_run_fence_reason(sups=None):
+    """Why the live-run-hazard tests are skipped here (None: they run): a live supervisor on this machine
+    (`sups`: live_supervisors(), looked up when None), unless ZERO_ALLOW_LIVE_RUN_HAZARD=1. The reason starts
+    FENCE_PREFIX (tools count the fenced tests in pytest's -rs lines: mtg-zero's tools/gate.py)."""
+    if os.environ.get(HAZARD_ENV, '').strip() == '1':
+        return None
+    sups = live_supervisors() if sups is None else sups
+    if not sups:
+        return None
+    runs = sorted({s['run'] for s in sups})
+    return (f'{FENCE_PREFIX} {len(runs)} live run(s) on this machine ({", ".join(runs)[:160]}); the test starts '
+            f'supervisors or churns processes (docs/az.md 51): run it where no run is live, or set {HAZARD_ENV}=1')
+
+
+def fence_items(config, items):
+    """The pytest hook body (a conftest's pytest_collection_modifyitems): the items marked `live_run_hazard` are
+    skipped with live_run_fence_reason() while a supervisor is live on this machine. Looks only when such an item
+    was collected (the scan costs seconds)."""
+    marked = [it for it in items if it.get_closest_marker('live_run_hazard')]
+    if not marked:
+        return 0
+    why = live_run_fence_reason()
+    if not why:
+        return 0
+    import pytest
+    for it in marked:
+        it.add_marker(pytest.mark.skip(reason=why))
+    return len(marked)
+
+
 # ------------------------------------------------------------------ the run process's watch
 
 class PauseWatch:

@@ -78,6 +78,9 @@ digests). An agent's commit ends with its own `Co-Authored-By:` trailer.
   (`eval_remote` / `selfplay_remote` = `mac`), the hub and its port registry, Tailscale. You
   don't need any of it. Remote settings default to empty, meaning "everything on this
   machine".
+* **Live runs on the same machine.** Tests that start real supervisors or churn processes carry
+  `@pytest.mark.live_run_hazard` and are skipped while a supervisor is live on the machine (`docs/az.md` 51); mark any
+  new one. `ZERO_ALLOW_LIVE_RUN_HAZARD=1` runs them anyway: only where no one else's run is live.
 * **Long tests.** The full pytest run takes ~10 minutes. Use `-k` while iterating, then run it
   all once before you push. `tests/test_remoteplay.py` times real threads and can fail on a
   loaded machine: rerun it alone before you call it a regression.
