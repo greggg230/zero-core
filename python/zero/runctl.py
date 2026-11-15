@@ -268,6 +268,7 @@ def supervisor_end(run=None, pid=None, started=None):
 
 LIVE_ENV = 'ZERO_LIVE_RUNS'                 # '0': report none, '1': report one (tests, overrides); unset: look
 HAZARD_ENV = 'ZERO_ALLOW_LIVE_RUN_HAZARD'   # '1': run the live-run-hazard tests even beside a live run
+FENCE_ENV = 'ZERO_LIVE_RUN_FENCE'          # '1': fence on any platform; '0': never (default: Windows only)
 
 
 def _supervisor_target(cmd):
@@ -327,9 +328,15 @@ FENCE_PREFIX = 'live-run fence:'
 
 def live_run_fence_reason(sups=None):
     """Why the live-run-hazard tests are skipped here (None: they run): a live supervisor on this machine
-    (`sups`: live_supervisors(), looked up when None), unless ZERO_ALLOW_LIVE_RUN_HAZARD=1. The reason starts
+    (`sups`: live_supervisors(), looked up when None) on Windows (ZERO_LIVE_RUN_FENCE=1: any platform, 0: never),
+    unless ZERO_ALLOW_LIVE_RUN_HAZARD=1. The reason starts
     FENCE_PREFIX (tools count the fenced tests in pytest's -rs lines: mtg-zero's tools/gate.py)."""
     if os.environ.get(HAZARD_ENV, '').strip() == '1':
+        return None
+    # Windows only by default: the hazard is Windows's (a dead parent's pid kept and recycled: 47.2); macOS and Linux
+    # re-parent orphans, so the Mac - which hosts other projects' long runs - runs these tests (docs/az.md 51)
+    fence = os.environ.get(FENCE_ENV, '').strip()
+    if fence == '0' or (fence != '1' and os.name != 'nt'):
         return None
     sups = live_supervisors() if sups is None else sups
     if not sups:

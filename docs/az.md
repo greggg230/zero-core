@@ -7644,8 +7644,11 @@ says why the fence is up (None when it is down); `fence_items(config, items)` is
 collected test marked `@pytest.mark.live_run_hazard` is skipped with that reason, which starts `live-run fence:` (MTG
 Zero's `tools/gate.py` counts those in pytest's `-rs` lines and names them in a gate's final line as skips). The scan
 runs only when a marked test was collected. Overrides: `ZERO_ALLOW_LIVE_RUN_HAZARD=1` runs the marked tests anyway (a
-quiet machine where the only "live" supervisor is your own), `ZERO_LIVE_RUNS=0` / `1` replaces the scan (tests). On the
-Mac (no supervisor there; macOS also re-parents orphans to launchd, so the pid-reuse case does not exist) they run.
+quiet machine where the only "live" supervisor is your own), `ZERO_LIVE_RUNS=0` / `1` replaces the scan (tests). The fence is
+Windows-only by default (`ZERO_LIVE_RUN_FENCE=1` puts it up on any platform, `0` never): the hazard is Windows's (a
+dead parent's pid kept as the parent pid and recycled), while macOS and Linux re-parent orphans - and the Mac hosts
+other projects' long runs (a St. Pete Zero supervisor 34 days old on 2026-11-15) yet is where MTG Zero's gate runs
+these tests beside a live desktop run.
 
 **Marked.** `tests/test_companion.py`: every test that starts `tools/supervise.py` (9); `test_run_infra.py`: the orphan
 sweep and the same-crash give-up; `test_loop.py`: the supervisor with a fake run, the stall watchdog, `kill_run`;

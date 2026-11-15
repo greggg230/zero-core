@@ -30,12 +30,19 @@ def test_a_supervisor_is_known_by_its_program(cmd, run):
 
 def test_the_override_and_the_reason(monkeypatch):
     monkeypatch.delenv(runctl.HAZARD_ENV, raising=False)
+    monkeypatch.setenv(runctl.FENCE_ENV, '1')                # (whatever this platform)
     monkeypatch.setenv(runctl.LIVE_ENV, '0')
     assert runctl.live_supervisors() == [] and runctl.live_run_fence_reason() is None
     monkeypatch.setenv(runctl.LIVE_ENV, '1')
     why = runctl.live_run_fence_reason()
     assert why.startswith(runctl.FENCE_PREFIX) and runctl.HAZARD_ENV in why
     monkeypatch.setenv(runctl.HAZARD_ENV, '1')
+    assert runctl.live_run_fence_reason() is None
+    monkeypatch.delenv(runctl.HAZARD_ENV)
+    monkeypatch.setenv(runctl.FENCE_ENV, '0')
+    assert runctl.live_run_fence_reason() is None
+    monkeypatch.delenv(runctl.FENCE_ENV)
+    monkeypatch.setattr(runctl.os, 'name', 'posix')          # the Mac: other projects' runs live there, no pid hazard
     assert runctl.live_run_fence_reason() is None
 
 
@@ -52,6 +59,7 @@ class Item:
 
 def test_only_the_marked_tests_are_fenced_and_only_beside_a_live_run(monkeypatch):
     monkeypatch.delenv(runctl.HAZARD_ENV, raising=False)
+    monkeypatch.setenv(runctl.FENCE_ENV, '1')
     looked = []
     real = runctl.live_supervisors
     monkeypatch.setattr(runctl, 'live_supervisors', lambda: looked.append(1) or real())
