@@ -7709,7 +7709,7 @@ with `ZERO_LIVE_RUNS=0`.
 ## 52. Remote self-play follows the game package's phase spec (`RemotePlay.spec_of`, the farm pool's per-gen template; MTG Zero's best-of-three pb3, 2026-11-15)
 
 **Why.** 40's `selfplay_specs` hook lets a game package change the self-play spec between iterations (MTG Zero: EoE's
-deck evaluator version; pb3's matchup model's choice table, its ENGINE.md 168), but remote self-play - the remote
+deck evaluator version; pb3's matchup model's choice table, its ENGINE.md 167), but remote self-play - the remote
 hosts' workers (34) and the farm pool (45) - played the run's spec, so a run with a remote refused a changed spec. pb3
 must have the farm and the Mac, so they follow the phase spec.
 
