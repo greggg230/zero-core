@@ -1149,6 +1149,10 @@ impl PySearchDriver {
         d.set_item("starts", s.starts)?;
         d.set_item("value_choices", s.value_choices)?;
         d.set_item("value_choice_rows", s.value_choice_rows)?;
+        if s.teacher_decisions > 0 {
+            // (docs/search.md 3.19: only a game with teacher decisions; every other stats dict as before)
+            d.set_item("teacher_decisions", s.teacher_decisions)?;
+        }
         if self.rows.tails {
             // variable-length rows (docs/search.md 2.15; only a game with tail segments)
             d.set_item("tail_rows", s.tail_rows)?;

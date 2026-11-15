@@ -91,13 +91,17 @@ def test_a_phases_driver_is_made_with_the_hooks_spec(tmp_path, hook, monkeypatch
         real([], seed=0, spec='{}')
 
 
-def test_remote_selfplay_refuses_a_changed_spec(tmp_path, hook):
+def test_remote_selfplay_follows_a_changed_spec(tmp_path, hook, monkeypatch):
+    """docs/az.md 52 (was: refused): with a remote the phase goes to the shared queue, whose RemotePlay asks the
+    phase spec once per iteration (`RemotePlay.spec_of`); tests/test_farm_pool.py covers the remote side."""
     calls, answers = hook
     R = toy_run(tmp_path, rolling=1)
     R.rsp = object()
     answers[1] = '{"food": [1, 0]}'
-    with pytest.raises(RuntimeError, match='remote self-play'):
-        R.selfplay(1)
+    shared = []
+    monkeypatch.setattr(R, 'selfplay_shared', lambda it: shared.append(it) or {})
+    R.selfplay(1)
+    assert shared == [1]
 
 
 def test_package_settings_are_run_settings(tmp_path):

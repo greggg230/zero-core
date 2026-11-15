@@ -7629,3 +7629,40 @@ STOP -> 'stopped', it stays up and sees the run paused then goes on to 'finished
 and the run finishes, a companion exiting 3 is restarted 3 times then given up loudly, `{}` = none, a new supervisor
 stops the companion a killed one left, `supervisor_end`'s states, the hook's validation; `test_loop.py`'s and
 `test_run_infra.py`'s supervisor tests unchanged.
+
+## 52. Remote self-play follows the game package's phase spec (`RemotePlay.spec_of`, the farm pool's per-gen template; MTG Zero's best-of-three pb3, 2026-11-15)
+
+**Why.** 40's `selfplay_specs` hook lets a game package change the self-play spec between iterations (MTG Zero: EoE's
+deck evaluator version; pb3's matchup model's choice table, its ENGINE.md 168), but remote self-play - the remote
+hosts' workers (34) and the farm pool (45) - played the run's spec, so a run with a remote refused a changed spec. pb3
+must have the farm and the Mac, so they follow the phase spec.
+
+**What changed** (every run whose hook answers the run's spec, or has no hook, is byte-identical: no new message key,
+no new definition, the same template):
+
+* `Run._selfplay` with a remote no longer refuses a phase spec; `selfplay_shared` queues the iteration's local setups
+  with `rsp.spec_of(it)`.
+* `RemotePlay.begin(it)` asks the hook once per iteration, on the run's thread (`_phase_spec`: `Run.selfplay_spec`;
+  `specs[it]` None for the run's spec), before any host or pool sees the iteration. A host's `phase` message carries
+  `"spec"` only when the iteration's spec is not the run's; a remote worker's `_phase` takes it (else the run's) for
+  every setup it queues from then on (games in flight, lingering ones included, keep theirs).
+* The farm pool: `Pool.begin(it, spec)` records the iteration's phase spec; `_publish(gen)` (the checkpoint of
+  iteration gen + 1) makes the self-play template's play settings for that spec when it differs from the last
+  definition's (`_play_of`: the run's settings with the spec replaced, checked by the worker build's `check-config`
+  as any template) and stores it in the gen's state (`gens[gen]['spec']`); every later definition carries the template
+  of its gen's spec. Ingest accepts a record whose header names the run's spec or any gen's spec of this pool
+  (`known_spec`) and replays it with that spec; any other spec is refused as before ("played with another spec").
+  A pool whose template has no `spec` key (a game whose worker does not take the spec as a play setting) never
+  changes its template.
+
+**Hazards.** A remote worker of an older zero-core ignores the message key and keeps playing the run's spec: its rows
+are of the run's spec, not the phase's - accepted (they are legal self-play of the run's spec), but not the phase's
+games; update every remote checkout with the run's commit (MTG Zero's tools/mac.sh does). A farm agent plays the
+template its lease's definition names: games of the previous gen's spec in flight across a switch are accepted (their
+spec is known).
+
+**Tests.** `test_farm_pool.py::test_the_pool_follows_the_phase_spec_of_the_game_package` (iteration 1 the run's spec,
+iteration 2 a phase spec: gen 1's definition template plays it, its records accepted and replayed with it, a record of
+an unknown spec refused, the hook asked once per iteration), `::test_a_remote_worker_takes_the_phase_spec` (the
+`phase` message's spec, else the run's), `test_package_hooks.py::test_remote_selfplay_follows_a_changed_spec` (was:
+refused).

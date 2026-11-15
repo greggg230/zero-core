@@ -4053,6 +4053,119 @@ fn value_choices_are_valued_by_a_one_ply_lookahead_and_never_recorded() {
     assert!(bad(SeatCfg::Nn(look)));
 }
 
+/// The toy with its two-option decisions marked teacher decisions (`SearchGame::teacher_policy`, docs/search.md
+/// 3.19): the policy weighs the options 1 and 3 (the second option the move); `bad` gives a malformed policy.
+#[derive(Clone)]
+struct TeacherToy(ToyGame, u8);
+
+impl SearchGame for TeacherToy {
+    type Spec = <ToyGame as SearchGame>::Spec;
+    const NAME: &'static str = "teachertoy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    fn parse_spec(json: &str) -> Result<Self::Spec, String> {
+        ToyGame::parse_spec(json)
+    }
+    fn new_game(spec: &Self::Spec, players: usize, seed: u64) -> Result<Self, String> {
+        ToyGame::new_game(spec, players, seed).map(|g| TeacherToy(g, TEACHER_MODE.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+    fn num_players(&self) -> usize {
+        self.0.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)
+    }
+    fn force_chance(&mut self, forced: &[u64]) {
+        self.0.force_chance(forced)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.0.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.0.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn teacher_policy(&self, legal: &[u16], out: &mut Vec<f32>) -> bool {
+        if self.1 == 0 || legal.len() != 2 {
+            return false;
+        }
+        match self.1 {
+            1 => out.extend([1.0, 3.0]),
+            2 => out.extend([1.0]),
+            3 => out.extend([0.0, f32::NAN]),
+            _ => out.extend([0.0, 0.0]),
+        }
+        true
+    }
+}
+
+/// TeacherToy's mode for the games the next driver makes (0 none, 1 a policy, 2-4 malformed; only
+/// `teacher_decisions_play_and_record_the_games_policy_without_a_search` makes TeacherToy games).
+static TEACHER_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[test]
+fn teacher_decisions_play_and_record_the_games_policy_without_a_search() {
+    let go = |mode: u8, seat: SeatCfg, threads: usize| {
+        TEACHER_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+        let mut c = cfg(vec![seat], vec![vec![0, 0]; 24], &[("m", KeyKind::Nn)]);
+        c.seed = 2026;
+        c.threads = threads;
+        let mut d = Driver::<TeacherToy>::new(c).unwrap();
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut d)));
+        let st = d.stats();
+        (out, st)
+    };
+    // off (the default): the hook answers false - the toy's golden self-play records, no teacher decision
+    let (out, st) = go(0, nn(0, 16, true), 1);
+    let (_, recs) = out.unwrap();
+    assert_eq!((recs.len(), records_digest(&recs)), GOLDEN_RECORDS);
+    assert_eq!(st.teacher_decisions, 0);
+    // on: every two-option decision is the policy's second option, recorded with the policy normalised, q = z
+    let (out, st) = go(1, nn(0, 16, true), 1);
+    let (res, recs) = out.unwrap();
+    assert_eq!(res.len(), 24);
+    assert!(res.iter().all(|r| r.over));
+    assert!(st.teacher_decisions > 0);
+    let taught: Vec<&Record> = recs.iter().filter(|r| r.opts.len() == 2).collect();
+    assert_eq!(taught.len() as u64, st.teacher_decisions, "every teacher decision of the recording seat is recorded");
+    for r in &taught {
+        assert_eq!(r.pi, vec![0.25, 0.75]);
+        assert_eq!(r.q, r.z, "a teacher row has no root value: q is the outcome");
+    }
+    assert!(recs.iter().any(|r| r.opts.len() != 2), "the other decisions are searched and recorded");
+    // reproducible
+    let (out1, _) = go(1, nn(0, 16, true), 1);
+    let (res1, recs1) = out1.unwrap();
+    assert_eq!(results_digest(&res1), results_digest(&res));
+    assert_eq!(records_digest(&recs1), records_digest(&recs));
+    // an evaluation seat plays the policy and records nothing
+    let (out_e, st_e) = go(1, nn(0, 16, false), 1);
+    let (res_e, recs_e) = out_e.unwrap();
+    assert!(res_e.iter().all(|r| r.over) && recs_e.is_empty() && st_e.teacher_decisions > 0);
+    // a malformed policy is an error, never a search
+    for mode in [2u8, 3, 4] {
+        let (out, _) = go(mode, nn(0, 16, true), 1);
+        assert!(out.is_err(), "mode {mode}: a malformed teacher policy must fail the driver");
+    }
+    TEACHER_MODE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[test]
 fn value_choice_pick_takes_the_best_or_draws_by_the_softmax() {
     let opts = [(5u16, 0.5), (7, 0.6), (9, 0.6)];

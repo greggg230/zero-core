@@ -7,6 +7,8 @@ use crate::tree::{leaf_values_team, tag_of, transition_each, Scratch as SimScrat
 struct WScratch<G: SearchGame> {
     game: Option<G>,
     sim: SimScratch,
+    /// A teacher decision's policy (docs/search.md 3.19).
+    teach: Vec<f32>,
 }
 
 /// Queue-job flag: fill job of chunk `c & !FILL` (else: search job of chunk c).
@@ -17,7 +19,7 @@ pub(super) fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
 }
 
 pub(super) fn worker<G: SearchGame>(sh: Arc<Shared<G>>) {
-    let mut scratch = WScratch { game: None, sim: SimScratch::default() };
+    let mut scratch = WScratch { game: None, sim: SimScratch::default(), teach: Vec::new() };
     loop {
         let job = {
             let mut q = lock(&sh.queue);
@@ -110,6 +112,8 @@ struct Tally {
     /// Value choices (docs/search.md 3.17) and their lookaheads' rows.
     value_choices: u64,
     value_choice_rows: u64,
+    /// Teacher decisions played (docs/search.md 3.19).
+    teacher: u64,
     /// Games aborted by the row limit (docs/search.md 2.15).
     row_aborts: u64,
 }
@@ -267,6 +271,9 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     if n.value_choices > 0 {
         k.value_choices.fetch_add(n.value_choices, Ordering::Relaxed);
         k.value_choice_rows.fetch_add(n.value_choice_rows, Ordering::Relaxed);
+    }
+    if n.teacher > 0 {
+        k.teacher_decisions.fetch_add(n.teacher, Ordering::Relaxed);
     }
     if n.branches > 0 || n.dev_moves > 0 || n.starts > 0 {
         k.branches.fetch_add(n.branches, Ordering::Relaxed);
@@ -573,6 +580,14 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             continue;
         }
         let seat = nn_seat(cfg, slot.gid, p).ok_or("internal: a seat without a player")?;
+        if slot.target.is_none() {
+            // a teacher decision (docs/search.md 3.19): the game names the move; no search
+            scratch.teach.clear();
+            if slot.game.as_ref().unwrap().teacher_policy(&slot.legal, &mut scratch.teach) {
+                teacher_step(cfg, slot, seat, p, &scratch.teach, &mut scratch.sim.key, n)?;
+                continue;
+            }
+        }
         if seat.value_choice_worlds > 0 && slot.target.is_none() && slot.game.as_ref().unwrap().value_choice() {
             // a value choice (docs/search.md 3.17): a one-ply lookahead values the options, the seat
             // chooses by the values; never recorded
@@ -957,6 +972,55 @@ fn value_choice_step<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize,
 /// The guarded player's move (`LookCfg::guard`): the MCTS move `a`, unless the lookahead's best root
 /// option (the first best mean) has a mean over the MCTS move's above the margin -> (the move, whether
 /// the lookahead's). An MCTS move the lookahead did not expand (a capped root) stays.
+/// A teacher decision of seat `p` (docs/search.md 3.19): `pi` is the game's policy over `slot.legal`. Checked (one
+/// weight per option, finite, >= 0, a positive sum; anything else an error naming the game's policy, never a
+/// fallback to the search), normalised; the move is its first largest weight. A recording self-play seat records
+/// the decision as a search's would be (the decider's row, its auxiliary targets, the options) with this policy as
+/// its target and no root value (`q` = the outcome); no branch reservoir, no resignation count. The decision counts
+/// toward `temp_moves` as any decision.
+fn teacher_step<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: usize, pi: &[f32], key: &mut Vec<u64>, n: &mut Tally) -> Result<(), String> {
+    let legal = &slot.legal;
+    if pi.len() != legal.len() || pi.iter().any(|w| !w.is_finite() || *w < 0.0) {
+        return Err(format!("{}: a teacher policy {pi:?} over {} options (one finite weight >= 0 per legal action)", G::NAME, legal.len()));
+    }
+    let tot: f64 = pi.iter().map(|&w| w as f64).sum();
+    if tot <= 0.0 {
+        return Err(format!("{}: a teacher policy of total weight {tot} (it must be positive)", G::NAME));
+    }
+    let mut i = 0;
+    for (k, &w) in pi.iter().enumerate() {
+        if w > pi[i] {
+            i = k;
+        }
+    }
+    let a = legal[i];
+    // (every teacher decision of a recording seat: no search, so no fast / full draw)
+    let rec = cfg.record && seat.selfplay && seat.record && slot.dev_left == 0;
+    if rec {
+        let target: Vec<f32> = pi.iter().map(|&w| (w as f64 / tot) as f32).collect();
+        let g = slot.game.as_ref().unwrap();
+        let opts = legal.clone();
+        let mut x = vec![0.0f32; G::NUM_FEATURES];
+        let (tail, ov) = record_row(g, p, &opts, &mut x);
+        if let Some(cap) = record_over::<G>(cfg, &tail) {
+            abort_game::<G>(cfg, slot, "record", cap);
+            return Ok(());
+        }
+        let mut aux = Vec::new();
+        if cfg.aux {
+            aux.resize(G::aux_width(), 0.0);
+            g.aux_target(p, &mut aux);
+        }
+        let step = slot.trace.as_ref().map_or(0, |t| t.len() as u32);
+        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts, pi: target, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov });
+        slot.rq.push(None);
+        n.recorded += 1;
+    }
+    n.teacher += 1;
+    slot.decisions += 1;
+    apply(cfg, slot, a, key)
+}
+
 fn guard_move(means: &[(u16, f64)], margin: f64, a: u16) -> (u16, bool) {
     let Some(&(_, m)) = means.iter().find(|x| x.0 == a) else { return (a, false) };
     let mut best = means[0];

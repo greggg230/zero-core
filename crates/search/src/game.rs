@@ -146,6 +146,20 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn value_choice(&self) -> bool {
         false
     }
+    /// A **teacher decision** (docs/search.md 3.19; opt-in, default none): the game itself names the
+    /// pending decision's move as a policy over `legal` (the driver's `legal_actions()`, in its order),
+    /// written to `out` (empty on entry: exactly one weight per legal action, finite, >= 0, a positive
+    /// sum) -> true. A network seat then plays the policy's first largest weight without searching, and a
+    /// recording self-play seat records the decision with that policy (normalised) as its policy target
+    /// and no root value (its `q` is the outcome, as a value-only row's). MTG Zero: a best-of-three seat
+    /// that sideboards by a matchup model's choice table (its ENGINE.md 168). Called at every network
+    /// seat's real decision with two or more options, before any search: keep it cheap. Never called
+    /// inside a search's simulations (a tree expands the decision with the network's priors). Default:
+    /// no decision is.
+    fn teacher_policy(&self, legal: &[u16], out: &mut Vec<f32>) -> bool {
+        let _ = (legal, out);
+        false
+    }
     /// The game is over (`to_move()` None) but its result comes from outside: episodes of
     /// another game decide it (docs/search.md 1.1). Until `resolve`, the search treats this
     /// terminal as a leaf the network evaluates and the driver parks the game; nothing calls

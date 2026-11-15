@@ -788,10 +788,8 @@ class Run:
 
     def _selfplay(self, it):
         if self.rsp is not None:
-            # (remote self-play's workers play the run's spec: a phase's spec of the package's is refused)
-            if self.selfplay_spec(it) != self.cfg['spec']:
-                raise RuntimeError('selfplay_specs: the game package changed the self-play spec, which remote self-play '
-                                   'does not follow (docs/az.md 40)')
+            # (remote self-play follows the phase's spec of the package's: RemotePlay.begin asks it once per iteration
+            # and sends it to the workers and the farm pool, docs/az.md 52)
             return self.selfplay_shared(it)        # with a remote: the shared queue (docs/az.md 5.3)
         c = self.cfg
         spec = self.selfplay_spec(it)
@@ -1141,8 +1139,9 @@ class Run:
         meta = self.shard_meta(it)
         writer = ShardWriter(d, 'r00', rows=c['shard_rows'], meta=meta, bad_dir=self.debug_dir())
         tstats = TargetStats()
-        spec = G.spec_json(c['spec'])
         rsp.begin(it)                              # (a no-op if the remote began it early)
+        # (the iteration's spec: the game package's phase spec, or the run's - docs/az.md 40, 52)
+        spec = G.spec_json(rsp.spec_of(it))
         prog = os.path.join(self.run, 'progress.json')
         acc = {'results': [], 'stale': {}, 'finished': 0, 'util': [0.0, 0], 't': 0.0, 'league': {}}
 

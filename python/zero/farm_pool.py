@@ -202,8 +202,10 @@ class Pool:
         self.client = client or FD.Client(self.url)
         self.exporter = exporter or self._export
         self.definer = definer or self._define
-        self.settings_of = settings_of or (lambda: play_settings(self.worker, self.build, dict(c),
-                                                                 os.path.join(self.dir, 'settings'), self.log))
+        self.settings_of = settings_of or (lambda spec=None: play_settings(
+            self.worker, self.build, dict(c) if spec is None else dict(c, spec=spec),
+            os.path.join(self.dir, 'settings'), self.log))
+        self.phase_specs = {}                      # iteration -> its phase spec, None = the run's (docs/az.md 52)
         self.dir = os.path.join(self.R.run, 'pool', self.farm)
         self.debug = os.path.join(self.R.run, 'debug', 'pool')
         os.makedirs(self.dir, exist_ok=True)
@@ -260,10 +262,36 @@ class Pool:
         return f'{self.name!r} (farm {self.url}, build {self.build}{alts}, max_stale {self.max_stale})'
 
     # ------------------------------------------------------------ the run's side (RemotePlay)
-    def begin(self, it):
-        """Iteration `it`'s self-play begins: checkpoint it - 1 is published on the pool's thread (never waited for)."""
+    def begin(self, it, spec=None):
+        """Iteration `it`'s self-play begins: checkpoint it - 1 is published on the pool's thread (never waited for).
+        `spec`: the iteration's phase spec of the game package's (docs/az.md 52; None: the run's) - the definition that
+        signs gen it - 1 carries it in its self-play template, and the records played with it are accepted."""
+        with self.mu:
+            self.phase_specs[it] = spec
         self.want = it
         self.wake.set()
+
+    def _gen_spec(self, gen):
+        """The spec gen `gen`'s leases play (the phase spec of iteration gen + 1, else the run's): JSON text."""
+        with self.mu:
+            s = self.phase_specs.get(gen + 1)
+        return s if s is not None else self.R.cfg['spec']
+
+    def _play_of(self, spec):
+        """The template's play settings for `spec`: the run's settings (`settings_of()`, as before) for the run's spec,
+        else the same with the spec replaced, checked by the worker build (`settings_of(spec)`)."""
+        if spec == self.R.cfg['spec']:
+            return self.settings_of()
+        return self.settings_of(spec)
+
+    def known_spec(self, s):
+        """The spec of a record's header among the specs this pool's gens were defined with (docs/az.md 52), as the
+        run's text -> the text, or None."""
+        want = _spec_value(s)
+        for x in [self.spec] + [g.get('spec') for g in self.st['gens'].values() if g.get('spec')]:
+            if _spec_value(x) == want:
+                return x
+        return None
 
     def end_phase(self, it):
         """Iteration `it`'s self-play ended (RemotePlay.end): its pool shards are closed -> its share (metrics)."""
@@ -360,6 +388,14 @@ class Pool:
         if st.get('play') is None:
             st['play'] = self.settings_of()
             self._save()
+        # (docs/az.md 52: a gen whose iteration plays another spec than the last definition's gets a template of its own;
+        # a pool of the run's spec only never comes here)
+        gspec = self._gen_spec(gen)
+        play = st['play']
+        if 'spec' in play and _spec_value(play['spec']) != _spec_value(gspec):
+            play = st['play'] = self._play_of(gspec)
+            self._save()
+            self.log(f'gen {gen}: the self-play template plays the game package\'s phase spec {hashlib.sha256(gspec.encode()).hexdigest()[:12]}')
         if not st.get('build_game'):
             st['build_game'] = FD.worker_game(self.client, self.build, self.runtime) if self.runtime else self.R.cfg['game']
             self._save()
@@ -378,6 +414,9 @@ class Pool:
             self.log(f'farm run {self.farm} created (worker build {self.build}, runtime {self.runtime}{alts}, '
                      f'min_agent {self.min_agent or "none"})')
         g = st['gens'].setdefault(str(gen), {})
+        if gspec != self.R.cfg['spec'] and g.get('spec') != gspec:
+            g['spec'] = gspec                      # (the records of this gen's leases may carry it: known_spec)
+            self._save()
         if not g.get('model'):
             ckpt = model_path(self.R.run, gen)
             t0 = time.time()
@@ -498,7 +537,9 @@ class Pool:
         if got != want:
             return self._refuse(r, f'header {got}, the run wants {want}', body)
         try:
-            if _spec_value(h.get('spec')) != _spec_value(self.spec):
+            # (the run's spec, or a phase spec a gen of this pool was defined with: docs/az.md 52)
+            rspec = self.known_spec(h.get('spec'))
+            if rspec is None:
                 return self._refuse(r, 'the records were played with another spec', body)
         except ValueError:
             return self._refuse(r, 'the spec is not JSON', body)
@@ -516,7 +557,7 @@ class Pool:
                 continue                           # (not credited to this chunk: another copy counts)
             t0 = time.time()
             try:
-                s, g = E.replay_rows(self.R.cfg['game'], self.spec, ln, self.aux)
+                s, g = E.replay_rows(self.R.cfg['game'], rspec, ln, self.aux)
             except ValueError as e:
                 return self._refuse(r, f'replay: {e}', body, gid)
             dt = time.time() - t0

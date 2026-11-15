@@ -502,6 +502,7 @@ class RemotePlay:
     def __init__(self, R, name, mode='selfplay', mirror=None):
         from .run import DEFAULTS
         self.R, self.name, self.mode = R, name, mode
+        self.specs = {}                            # iteration -> its phase spec, None = the run's (docs/az.md 52)
         c = R.cfg
         self.mirror = mirror or os.path.basename(os.path.normpath(R.run))
 
@@ -891,6 +892,7 @@ class RemotePlay:
         The run calls it as soon as checkpoint it - 1 is written (before its evaluation) and again
         when its own phase starts (then a no-op). Single-game: the iteration's quota opens; the hosts
         follow the selfplay_remotes file (docs/az.md 34)."""
+        self._phase_spec(it)
         with self.mu:
             if self.fatal is not None:
                 raise self.fatal
@@ -918,7 +920,25 @@ class RemotePlay:
             self.mu.notify_all()
             pools = list(self.pools.values())
         for p in pools:
-            p.begin(it)                            # (checkpoint it - 1 published on the pool's thread)
+            p.begin(it, self.specs.get(it))        # (checkpoint it - 1 published on the pool's thread)
+
+    def _phase_spec(self, it):
+        """Iteration `it`'s self-play spec (docs/az.md 52): the game package's phase spec (`Run.selfplay_spec`, the
+        `selfplay_specs` hook, docs/az.md 40), asked once per iteration here, on the run's thread, and kept in
+        `specs` - None for the run's own spec (then every message and definition is what it was)."""
+        if self.mode != 'selfplay' or it in self.specs:
+            return
+        f = getattr(self.R, 'selfplay_spec', None)
+        s = f(it) if f is not None else None
+        with self.mu:
+            self.specs[it] = None if s is None or s == self.R.cfg.get('spec') else s
+            for k in [k for k in self.specs if k < it - 8]:
+                del self.specs[k]
+
+    def spec_of(self, it):
+        """The spec iteration `it` plays (its phase spec, else the run's)."""
+        s = self.specs.get(it)
+        return s if s is not None else self.R.cfg['spec']
 
     # ---- single-game: the quota
     def need(self, it):
@@ -1496,6 +1516,8 @@ class RemotePlay:
             with self.mu:
                 if self.want == want and s.alive() and not h.retired:
                     msg = {'cmd': 'phase', 'iter': want, 'model': f'models/iter_{want - 1:04d}.pt'}
+                    if self.specs.get(want) is not None:
+                        msg['spec'] = self.specs[want]     # (the phase's spec of the package's, docs/az.md 52)
                     if self.R.league is not None and self.mode == 'selfplay':
                         msg['league'] = self.R.league.files(want)   # {key: models/iter_j.pt} (shipped)
                     s.send(msg)
@@ -2407,8 +2429,12 @@ class Worker:
 
     def _phase(self, msg):
         from .data import ShardWriter, shard_format
+        from .games import spec_json
         from .infer import drive
         it = int(msg['iter'])
+        # (the phase's spec, docs/az.md 52: the run's, unless the run sends the game package's phase spec; the setups
+        # queued from now on play it, the games in flight keep theirs)
+        self.spec = spec_json(msg['spec'] if msg.get('spec') is not None else self.cfg.get('spec'))
         self._load(it, msg['model'], msg.get('league'))
         self._cleanup()
         c = self.cfg

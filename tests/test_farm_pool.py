@@ -44,11 +44,11 @@ class Hashed:
         return pri, v, np.zeros((lb.B, 8), np.float32)
 
 
-def farm_games(n, seed, net=0, sims=8):
+def farm_games(n, seed, net=0, sims=8, spec=''):
     """A farm worker's games 0..n-1 (a traced rolling toy driver seeded as the farm's: auxiliary targets, value-only
     rows) -> [(gid, record text, the game's samples dict or None)] in the order they finished."""
     seat = G.nn_seat('m', sims, selfplay=True, sims_fast=2, p_full=0.5, view_samples=0.5)
-    drv = G.Driver('toy', [[seat, seat]], spec='', concurrency=6, seed=seed, record=True, threads=2, groups=1,
+    drv = G.Driver('toy', [[seat, seat]], spec=spec, concurrency=6, seed=seed, record=True, threads=2, groups=1,
                    rolling=True, aux=True)
     drv.set_trace(True)
     out = []
@@ -437,6 +437,73 @@ def test_play_settings_of_a_worker_older_than_trainer_settings(tmp_path, monkeyp
         monkeypatch.setenv('WORKER_STUB_UNKNOWN', unknown)
         with pytest.raises(SystemExit, match='refuses the run\'s settings'):
             FP.play_settings(worker, BUILD, c, str(tmp_path / 'bad'), lines.append)
+
+
+def test_the_pool_follows_the_phase_spec_of_the_game_package(pool, monkeypatch):
+    """docs/az.md 52: an iteration whose phase spec (the game package's selfplay_specs hook, through Run.selfplay_spec)
+    differs from the run's gets a definition whose self-play template plays it; the records played with it are
+    accepted and replayed with it, a spec no gen was defined with is refused; the run's own spec stays accepted."""
+    from zero.remoteplay import RemotePlay
+    fake, R, published = pool
+    monkeypatch.setattr(FP, 'play_settings', lambda worker, build, cfg, d, log=None: {'game': 'toy', 'spec': cfg['spec'],
+                                                                                      'players': [2]})
+    phase = '{"food": [20, 0]}'
+    asked = []
+
+    def selfplay_spec(it):
+        asked.append(it)
+        return phase if it >= 2 else R.cfg['spec']
+    R.selfplay_spec = selfplay_spec
+    seed = FP.coordinator_seed(FARM)
+    rp = RemotePlay(R, R.cfg['selfplay_remote'])
+    try:
+        rp.begin(1)
+        wait(lambda: 0 in fake.ckpts, 'gen 0 registered')
+        assert published[-1]['jobs']['selfplay']['settings']['spec'] == '', 'iteration 1 plays the run\'s spec'
+        assert rp.spec_of(1) == R.cfg['spec'] and rp.specs[1] is None
+        rp.accept_local(1, 24)
+        rp.end(1)
+        rp.begin(2)
+        rp.begin(2)                                # (a second begin of one iteration asks nothing again)
+        assert asked == [1, 2]
+        wait(lambda: 1 in fake.ckpts, 'gen 1 registered')
+        assert published[-1]['jobs']['selfplay']['settings']['spec'] == phase, 'gen 1\'s template plays the phase spec'
+        assert rp.spec_of(2) == phase
+        st = json.load(open(os.path.join(R.run, 'pool', FARM, 'state.json')))
+        assert st['gens']['1']['spec'] == phase and 'spec' not in st['gens']['0']
+        p = rp.pools[f'pool:{FARM}']
+        assert p.known_spec(phase) == phase and p.known_spec('') == p.spec and p.known_spec('{"food": [3, 0]}') is None
+        games = farm_games(6, seed, net=1, spec=phase)
+        hi = max(g for g, _, _ in games) + 1
+        fake.add('m_a', [[0, hi]], records_file(header(seed, spec=phase), [t for _, t, _ in games]), gen=1)
+        wait(lambda: rp.need(2) == 24 - 6, 'the phase spec\'s games accepted')
+        other = farm_games(2, seed, net=1, spec='{"food": [3, 0]}')
+        fake.add('m_c', [[0, max(g for g, _, _ in other) + 1]], records_file(header(seed, spec='{"food": [3, 0]}'),
+                                                                              [t for _, t, _ in other]), gen=1)
+        wait(lambda: json.load(open(os.path.join(R.run, 'pool', FARM, 'state.json'))).get('refused', {}).get('m_c') == 1,
+             'a record of an unknown spec refused')
+    finally:
+        rp.close()
+
+
+def test_a_remote_worker_takes_the_phase_spec(monkeypatch):
+    """docs/az.md 52: a remote self-play worker's `phase` message may carry the phase's spec - the setups it queues
+    from then on play it; without the key, the run's."""
+    from zero.remoteplay import Worker
+
+    class Stop(Exception):
+        pass
+    w = object.__new__(Worker)
+    w.cfg = {'spec': '{"food": [1, 0]}'}
+
+    def load(*a, **k):
+        raise Stop()
+    w._load = load
+    for msg, want in (({'cmd': 'phase', 'iter': 2, 'model': 'm', 'spec': '{"food": [20, 0]}'}, '{"food": [20, 0]}'),
+                      ({'cmd': 'phase', 'iter': 3, 'model': 'm'}, '{"food": [1, 0]}')):
+        with pytest.raises(Stop):
+            w._phase(msg)
+        assert json.loads(w.spec) == json.loads(want)
 
 
 def test_selfplay_local_0_leaves_the_games_to_a_delivering_farm(pool):

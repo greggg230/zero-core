@@ -2131,6 +2131,42 @@ Code: `game.rs` (`ANSWERS`, `decision_tag`, `answer_obs`, `key_obs`, `KeyObs`), 
 (`CounterAuto`), `dynapi.rs` / `crates/py` (`Game.answers`, `decision_tag`, `key_obs`, `SearchTree.follow`), Python
 `mcts.transition(seats=)`, `play.PyDriver._apply`, `PySearch.follow`, `RsSearch.follow`.
 
+### 3.19 Teacher decisions: the game names the move and its policy target (`SearchGame::teacher_policy`; MTG Zero's best-of-three sideboarding by a matchup model, 2026-11-15)
+
+Opt-in by the game: a game that does not override `teacher_policy` (every game but MTG Zero's `mtg` / `mtg_eoe` with a
+spec's `"sideboard_table"`) makes every decision, record, row and digest what it was - the toy's golden self-play
+records hold with the hook consulted (`teacher_decisions_play_and_record_the_games_policy_without_a_search`).
+
+**Why.** MTG Zero's best-of-three run pb3 sideboards a seat by a matchup model trained on the run's own game results
+(its ENGINE.md 168): the model's choice is a 60-card deck, reached by the sideboarding decisions' canonical path. The
+model's choice must be played and must also become the decisions' policy targets, so that the network's prior learns
+it (and unlearns an inherited choice the value head never judged: the search alone kept following that prior). The
+EoE deck choice by an evaluator (3.17's neighbour, MTG Zero ENGINE.md 112) has no decision at all and teaches the
+network nothing; a value choice (3.17) is never recorded.
+
+**What it does.** At a network seat's real decision with two or more options (after single-option steps, external
+seats and bots; before value choices, lookahead seats and any search), the driver asks
+`teacher_policy(legal, out)`. When the game answers true, `out` is a weight per legal action (finite, >= 0, a positive
+sum; anything else fails the driver loudly, naming the policy - never a fallback to the search), and the driver
+(`worker::teacher_step`): plays the first largest weight; for a recording self-play seat records the decision as a
+search's would be - the decider's row (`record_row`, tails and pointer overrides included), its options, its
+auxiliary targets - with the normalised weights as the policy target and no root value (its `q` is the outcome, as a
+value-only row's: `emit`'s None); counts it in `Stats::teacher_decisions` (the binding's stats dict carries
+`teacher_decisions` only when it is non-zero, so every other dict is as before) and toward `temp_moves`. No branch
+reservoir and no resignation count (neither is a search's). Evaluation seats play the policy and record nothing. The
+hook is never asked inside a search: a tree expands a teacher decision with the network's priors, as any decision of
+the other seat (the game's teacher is its real moves' policy, not a model of the opponent).
+
+**Records and the farm.** A teacher row is a leaf row of a record (2.17) like a searched one: its policy target travels
+in the record, the trainer's replay rebuilds its row - nothing new in the format; the native worker (zero_worker) runs
+this driver, so it plays and records teacher decisions exactly as the Python run does.
+
+**Tests** (`driver/tests.rs`): `teacher_decisions_play_and_record_the_games_policy_without_a_search` - a toy whose
+two-option decisions are teacher decisions (weights 1 and 3): off, the golden records; on, every two-option decision is
+the second option, recorded with [0.25, 0.75] and q = z, the other decisions searched and recorded, reproducible,
+an evaluation seat plays it and records nothing; a policy of the wrong length, a NaN and an all-zero policy fail the
+driver.
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:
