@@ -441,10 +441,10 @@ def supervise(run, extra, pkg, comp):
 
         def tick():
             # the companion follows the run's settings of this start: asked once the run has written its config.json
-            # (its state file names this process); then kept alive
+            # (its state file names this process - or, under a launcher such as a Windows venv's python.exe, its child:
+            # launched_state); then kept alive
             if not synced[0]:
-                rs = runctl.read_state(run, 'run') or {}
-                if rs.get('pid') == p.pid:
+                if launched_state(run, p.pid, since) is not None:
                     synced[0] = True
                     try:
                         with open(os.path.join(run, 'config.json'), encoding='utf-8') as f:

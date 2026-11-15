@@ -7349,7 +7349,9 @@ tests on the same machine churned ~1,000 short supervised processes (the venv la
 0.1 s). `kill_orphans(pid, since)` kills only processes created after `since`, the time the supervisor launched the
 run: the run's own orphans are always younger than it. (psutil's `children()`, used by the stall watchdog on a live
 process, already compares creation times.) Test: `test_the_orphan_sweep_spares_processes_older_than_the_launch`
-(the test's own child, spared with a later `since`, swept with an earlier one).
+(the test's own child, spared with a later `since`, swept with an earlier one). The companion (section 49) is asked once the run of this start wrote its state - through
+`launched_state` too, else under a venv launcher it never started (merge of feat/run-companion into farm-int; test:
+`test_one_companion_across_a_crash_and_it_ends_finished[True]`).
 
 ### 47.3 Remote evaluation: the end-of-run drain and the transport
 

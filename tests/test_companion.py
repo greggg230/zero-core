@@ -119,12 +119,23 @@ def _wait(cond, timeout=60, what=''):
     raise AssertionError(f'timed out waiting for {what}')
 
 
-def test_one_companion_across_a_crash_and_it_ends_finished(tmp_path):
+LAUNCHER = '''import subprocess, sys
+sys.exit(subprocess.run([sys.executable] + sys.argv[1:]).returncode)
+'''
+
+
+@pytest.mark.parametrize('launcher', [False, True])
+def test_one_companion_across_a_crash_and_it_ends_finished(tmp_path, launcher):
     """The run crashes once and is restarted: the same companion goes on (one per run); the run finishes: the
     supervisor's terminal state says `ended` 'finished', the companion reads it, says so and exits, and the
-    supervisor waited for it."""
+    supervisor waited for it. Also when the launched process starts the run as its child (a Windows venv's
+    python.exe: the run state's pid is not the launched one; supervise.launched_state, docs/az.md 47.2)."""
     run = _run(tmp_path, 'crash-then-finish')
-    sup = subprocess.run([sys.executable, 'tools/supervise.py', str(run)], cwd=ROOT, env=_env(tmp_path), timeout=120)
+    env = _env(tmp_path)
+    if launcher:
+        (tmp_path / 'launcher.py').write_text(LAUNCHER)
+        env['ZERO_SUPERVISE_CMD'] = json.dumps([sys.executable, str(tmp_path / 'launcher.py'), str(tmp_path / 'fake_run.py')])
+    sup = subprocess.run([sys.executable, 'tools/supervise.py', str(run)], cwd=ROOT, env=env, timeout=120)
     assert sup.returncode == 0
     assert (run / 'starts').read_text() == 'xx'
     ev = _events(run)
