@@ -56,6 +56,7 @@ JOB_KINDS = ('selfplay', 'eval', 'fuzz')
 MULTIPART = 90 << 20                    # bigger artifacts go up in parts (a Worker request's limit ~100 MB)
 PART = 32 << 20
 MAX_ALTERNATES = 4                      # a run's alternates (PROTOCOL rev 11, 9.4)
+FEATURE_ROLLING = 'rolling'               # a worker build that plays rolling self-play jobs (`info` features, PROTOCOL rev 15, 10.5)
 # a version as the coordinator checks one (zero-farm coordinator util.ts): a run's `min_agent` (PROTOCOL rev 9)
 SEMVER_RE = re.compile(r'^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,64})?$')
 MAX_LEASE_GAMES = 100_000               # games per lease (PROTOCOL 7: 1 to 100,000)

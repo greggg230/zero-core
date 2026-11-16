@@ -1101,3 +1101,68 @@ pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Events(Mutex<Vec<Value>>);
+    impl Sink for Events {
+        fn event(&self, v: Value) {
+            self.0.lock().unwrap().push(v);
+        }
+        fn log(&self, _: &str) {}
+    }
+
+    fn line(extra: Value) -> Value {
+        let mut v = json!({"op": "job", "kind": "selfplay", "settings": {"game": "toy"}, "games": 8, "uniform": true});
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    }
+
+    #[test]
+    fn a_job_line_is_rolling_only_with_rolling_true() {
+        let base = Path::new(".");
+        let j = job_from_value(&line(json!({})), base).unwrap();
+        assert!(j.rolling.is_none(), "no key: a classic job");
+        assert!(job_from_value(&line(json!({"rolling": false, "flush_s": 5})), base).unwrap().rolling.is_none());
+        let r = job_from_value(&line(json!({"rolling": true})), base).unwrap().rolling.unwrap();
+        assert_eq!(r.flush_s, 120.0);
+        let r = job_from_value(&line(json!({"rolling": true, "flush_s": 30})), base).unwrap().rolling.unwrap();
+        assert_eq!(r.flush_s, 30.0);
+        for bad in [json!({"rolling": "yes"}), json!({"rolling": true, "flush_s": 0}), json!({"rolling": true, "flush_s": "x"})] {
+            assert!(job_from_value(&line(bad.clone()), base).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn extend_reaches_a_rolling_job_only() {
+        let (ctl, link, progress, ev) = (Control::default(), Mutex::new(None), Mutex::new(Progress::default()), Events::default());
+        let base = Path::new(".");
+        // a classic job: an unknown op, a non-fatal error, as before rolling jobs existed
+        control(&json!({"op": "extend", "games": 40}), &ctl, &link, &progress, &ev, base, false);
+        let e = ev.0.lock().unwrap().clone();
+        assert_eq!(e, vec![json!({"ev": "error", "message": "unknown op \"extend\"", "fatal": false})]);
+        assert!(ctl.s.lock().unwrap().extend.is_none());
+        // a rolling job: raised, never lowered
+        control(&json!({"op": "extend", "games": 40}), &ctl, &link, &progress, &ev, base, true);
+        control(&json!({"op": "extend", "games": 30}), &ctl, &link, &progress, &ev, base, true);
+        assert_eq!(ctl.s.lock().unwrap().extend, Some(40));
+        control(&json!({"op": "extend"}), &ctl, &link, &progress, &ev, base, true);
+        let e = ev.0.lock().unwrap().clone();
+        assert_eq!(e.len(), 2);
+        assert_eq!((e[1]["ev"].as_str(), e[1]["fatal"].as_bool()), (Some("error"), Some(false)));
+    }
+
+    #[test]
+    fn a_selfplay_build_announces_rolling() {
+        static G: &[GameEntry] = &[];
+        let w = Worker { games: G, repo: "toy", selfplay: true, fuzz: None, package_settings: &[] };
+        assert_eq!(w.features(), vec!["rolling"]);
+        let f = Worker { selfplay: false, ..w };
+        assert!(f.features().is_empty(), "a fuzz-only build plays no self-play jobs");
+    }
+}
