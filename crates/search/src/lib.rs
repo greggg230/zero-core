@@ -26,6 +26,7 @@ pub mod dynapi;
 pub mod game;
 pub mod lookahead;
 pub mod noise;
+pub mod panic_site;
 pub mod record;
 pub mod rng;
 pub mod settings;

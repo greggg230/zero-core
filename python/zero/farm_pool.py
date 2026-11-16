@@ -543,6 +543,12 @@ class Pool:
                 return self._refuse(r, 'the records were played with another spec', body)
         except ValueError:
             return self._refuse(r, 'the spec is not JSON', body)
+        fails = h.get('failures') or []
+        if isinstance(fails, list) and fails:
+            # games the worker dropped after a panic (docs/search.md 2.19): to the run's game_failures.jsonl (source
+            # 'pool': never the machine), with the worker's build
+            self.rp.add_failures('pool', [dict(f, build=h.get('build_id')) for f in fails if isinstance(f, dict)])
+            self.log(f'{len(fails)} self-play game(s) dropped after a panic on a farm PC: to {"game_failures.jsonl"}')
         ids = [tuple(x) for x in (r.get('ids') or [])]
         fmt = shard_format(self.R.cfg, self.R.info)     # (a game with tails / overrides: format v2, docs/az.md 43)
         sparse = fmt.get('x_format') == 'sparse'

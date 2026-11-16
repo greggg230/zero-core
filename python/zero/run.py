@@ -1044,29 +1044,44 @@ class Run:
                      f'{self.info.get("max_row_tokens")} (counted, no samples; docs/search.md 2.15)')
 
     def failure_metrics(self, it, out, results, drv):
-        """Games dropped after a panic inside them (docs/search.md 2.18): an engine bug costs that game, not the run.
-        The driver ends such a game as an aborted row (abort_reason 'panic', no samples) and keeps what replays it;
-        here, only when there was one (the metrics of before otherwise): `game_failures` = this iteration's dropped
-        games among `results` (every source's rows, a remote's too), every failure record of this machine's driver
-        appended to <run>/game_failures.jsonl (one JSON object a line: gid, seeds, spec, real moves, message, + iter),
-        logged. More than GAME_FAILURE_LIMIT of an iteration's games dropped (at least 3) is not a rare bug but a broken
-        build: the run fails loudly, as it did on the first panic before (a silent run of dropped games is worse)."""
-        fails = [json.loads(x) for x in drv.take_failures()] if hasattr(drv, 'take_failures') else []
+        """Games dropped after a panic inside them (docs/search.md 2.18, 2.19): an engine bug costs that game, not the
+        run. The driver ends such a game as an aborted row (abort_reason 'panic', no samples) and keeps what replays it.
+        Here: every failure record of this machine's driver ('local') and of the remote self-play's executors (a
+        remote's workers and the zero-farm pool: `RemotePlay.take_failures`, source = the remote's name / 'pool') is
+        appended to <run>/game_failures.jsonl (zero.game_failure.record: one JSON object a line with its replay command),
+        logged; `panics` (always) = the iteration's dropped games - the aborted rows among `results` (this machine's and
+        a remote's) or, if more, the records of this machine and its remotes, plus the pool's (whose dropped games come
+        back as records only) -, `game_failures` = the aborted rows among `results`, only when there was a failure. More than
+        GAME_FAILURE_LIMIT of an iteration's games dropped (at least 3) is not a rare bug but a broken build: the run
+        fails loudly, as it did on the first panic before (a silent run of dropped games is worse)."""
+        from . import game_failure as GF
+        fails = [(json.loads(x), 'local') for x in drv.take_failures()] if hasattr(drv, 'take_failures') else []
+        rsp = getattr(self, 'rsp', None)
+        if rsp is not None and hasattr(rsp, 'take_failures'):
+            fails += rsp.take_failures()
         n = sum(1 for r in results if r.get('abort_reason') == 'panic')
+        pool = sum(1 for _, src in fails if src == 'pool')
+        out['panics'] = max(n, len(fails) - pool) + pool
         if not fails and not n:
             return
         if fails:
             path = os.path.join(self.run, GAME_FAILURES)
-            with open(path, 'a', encoding='utf-8') as f:
-                for x in fails:
-                    f.write(json.dumps({**x, 'iter': it, 'time': round(time.time(), 3)}) + '\n')
+            commit, build = GF.local_ids()
+            try:
+                from . import package
+                pkg = package.active().name
+            except Exception:                      # noqa: BLE001 - (no package registered: the core's toys)
+                pkg = 'zero'
+            game = getattr(self, 'cfg', {}).get('game')
+            GF.append(path, lambda first: [GF.record(x, it=it, source=src, game=game, engine_commit=commit, build=build,
+                                                     path=path, line=first + k, pkg=pkg) for k, (x, src) in enumerate(fails)])
         out['game_failures'] = n
-        for x in fails:
-            self.log(f'iter {it}: game {x["gid"]} (driver seed {x["driver_seed"]}) dropped after a panic at real move '
-                     f'{len(x["steps"])}: {str(x["message"])[:300]} (replay: {GAME_FAILURES})')
+        for x, src in fails:
+            self.log(f'iter {it}: game {x["gid"]} ({src}, driver seed {x["driver_seed"]}) dropped after a panic at real '
+                     f'move {len(x.get("steps") or [])}: {str(x["message"])[:300]} (replay: {GAME_FAILURES})')
         limit = max(3, int(len(results) * GAME_FAILURE_LIMIT))
-        self.log(f'iter {it}: {n} of {len(results)} game(s) dropped after a panic (no samples; at most {limit} an '
-                 f'iteration; docs/search.md 2.18)')
+        self.log(f'iter {it}: {out["panics"]} game(s) dropped after a panic ({n} of {len(results)} rows here; no samples; '
+                 f'at most {limit} an iteration; docs/search.md 2.18)')
         if n > limit:
             raise RuntimeError(f'iter {it}: {n} of {len(results)} self-play games panicked (more than {limit}): a broken '
                                f'build, not a rare bug - see {GAME_FAILURES} in the run directory')

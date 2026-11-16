@@ -536,6 +536,9 @@ class RemotePlay:
         self.events = None                         # co-training: events per iteration (the primary's games)
         self.q = None                              # single-game: the open phase's quota
         self.mu = threading.Condition()
+        # games the remote executors dropped after a panic (docs/search.md 2.19): (failure dict, source) until the run
+        # takes them (Run.failure_metrics: <run>/game_failures.jsonl)
+        self.failures = []
         self.want = None                           # the iteration whose phase should run (None: between)
         self.accepting = None                      # the iteration whose shards are taken in
         self.co = None
@@ -595,6 +598,18 @@ class RemotePlay:
     def procs(self):
         """Worker processes on every host together."""
         return sum(h.procs for h in self.hosts.values())
+
+    def add_failures(self, source, fails):
+        """A remote executor's dropped games (docs/search.md 2.19): failure dicts (`GameFailure::to_json`'s, plus the
+        executor's engine_commit / build when it knows them) from `source` ('pool', or a remote's name)."""
+        with self.mu:
+            self.failures.extend((f, source) for f in fails)
+
+    def take_failures(self):
+        """The failures added since the last call, as [(failure dict, source)]."""
+        with self.mu:
+            out, self.failures = self.failures, []
+        return out
 
     def describe(self):
         """The hosts for the log ('mac' (host, 2 worker(s), mirror ...), ...)."""
@@ -1346,6 +1361,12 @@ class RemotePlay:
             elif kind == 'row':
                 rows = [ev['row']]
                 s.assigned.pop(ev['row'].get('tag'), None)
+            elif kind == 'failure':                    # a game the worker dropped after a panic (docs/search.md 2.19)
+                f = dict(ev.get('failure') or {})
+                for k in ('engine_commit', 'build'):
+                    if ev.get(k):
+                        f[k] = ev[k]
+                self.failures.append((f, h.name))
             elif kind == 'end':
                 s.ended[ev['iter']] = ev
             elif kind == 'error':
@@ -1983,6 +2004,16 @@ class Worker:
             except (OSError, ValueError):
                 self.closing = True
 
+    def _failure(self, text):
+        """A dropped game's failure record to the run (`failure` event) with this checkout's commit and engine build."""
+        from . import game_failure as GF
+        try:
+            f = json.loads(text)
+        except ValueError:
+            f = {'message': str(text)}
+        commit, build = GF.local_ids()
+        self.emit('failure', failure=f, engine_commit=commit, build=build)
+
     def note(self, msg):
         """The worker's own log (<mirror>/w<K>.log) and stderr."""
         line = time.strftime('%Y-%m-%d %H:%M:%S ') + f'[w{self.k} {self.sid} pid {os.getpid()}] {msg}'
@@ -2485,9 +2516,11 @@ class Worker:
                 rows = drv.take_results()
                 s = drv.take_records() if self.threaded else drv.take_samples()
                 # games dropped after a panic (docs/search.md 2.18): their rows go back as aborted rows (abort_reason
-                # 'panic', no samples; the run counts them); their replay records into this worker's log
+                # 'panic', no samples; the run counts them); their replay records into this worker's log and to the run
+                # (a `failure` event: the run's game_failures.jsonl, docs/search.md 2.19)
                 for x in drv.take_failures():
                     print(f'remote self-play: game failure (dropped after a panic): {x}', file=sys.stderr, flush=True)
+                    self._failure(x)
                 if rows:
                     self._finished(ph, rows, s)
                 elif s is not None:

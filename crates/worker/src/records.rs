@@ -11,6 +11,11 @@
 //!  "games", "rows", "gids" ([[a, b), ...]), "gen" (the oldest network of its rows, or null)}
 //! ```
 //!
+//! and, only in a file written after a game of the job was dropped after a panic (zero-core docs/search.md 2.18),
+//! `"failures"`: those games' failure records (`GameFailure::to_json`) since the last file - a key older readers
+//! ignore (the desktop's pool collector appends them to the run's game_failures.jsonl). A dropped game itself is in
+//! no file (no samples, no trace).
+//!
 //! then one game record per line (`zero_search::record::game_json`), in the order the games finished. Like the
 //! shard writer it cuts a file once it holds `rows` training rows (whole games) and writes the rest at the end;
 //! games without rows (cut short or aborted) are recorded too: they are finished games of the job's ids.
@@ -64,6 +69,8 @@ pub struct RecordWriter {
     gids: Vec<u32>,
     nbuf: usize,
     gen: Option<u32>,
+    /// Failure records of dropped games (module docs) for the next file.
+    failures: Vec<Value>,
     pub seq: usize,
     pub written: Vec<Written>,
 }
@@ -73,7 +80,7 @@ impl RecordWriter {
     /// lease, build_id); `rows`: a file once this many rows are held (whole games).
     pub fn new(dir: &Path, prefix: &str, rows: usize, header: Map<String, Value>, level: u32) -> Result<RecordWriter, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        Ok(RecordWriter { dir: dir.to_path_buf(), prefix: prefix.to_string(), rows: rows.max(1), header, level, lines: Vec::new(), gids: Vec::new(), nbuf: 0, gen: None, seq: 0, written: Vec::new() })
+        Ok(RecordWriter { dir: dir.to_path_buf(), prefix: prefix.to_string(), rows: rows.max(1), header, level, lines: Vec::new(), gids: Vec::new(), nbuf: 0, gen: None, failures: Vec::new(), seq: 0, written: Vec::new() })
     }
 
     /// A finished game (its trace on) and its samples -> the file written, if any.
@@ -91,6 +98,16 @@ impl RecordWriter {
         Ok(None)
     }
 
+    /// A game dropped after a panic: its failure record rides in the next file's header (module docs).
+    pub fn add_failure(&mut self, f: Value) {
+        self.failures.push(f);
+    }
+
+    /// Failure records no file holds yet (a file is written only with a game in it).
+    pub fn pending_failures(&self) -> usize {
+        self.failures.len()
+    }
+
     pub fn flush(&mut self) -> Result<Option<Written>, String> {
         if self.lines.is_empty() {
             return Ok(None);
@@ -105,6 +122,9 @@ impl RecordWriter {
         h["rows"] = json!(rows);
         h["gids"] = json!(ranges(&gids).into_iter().map(|r| [r.0, r.1]).collect::<Vec<_>>());
         h["gen"] = json!(gen);
+        if !self.failures.is_empty() {
+            h["failures"] = Value::Array(std::mem::take(&mut self.failures));
+        }
         let name = format!("{}_{:03}.rec.jsonl.gz", self.prefix, self.seq);
         let path = self.dir.join(&name);
         let tmp = self.dir.join(format!("{name}.{}.tmp", std::process::id()));

@@ -853,11 +853,19 @@ pub struct GameFailure {
     pub steps: Vec<TraceStep>,
     /// The panic's message.
     pub message: String,
+    /// Where it panicked: the panic's `file:line:col` (`panic_site`'s hook), None when another panic hook replaced it.
+    pub site: Option<String>,
+    /// `"move"`: inside one of the game's real moves (the action played and the single-option decisions stepped after
+    /// it); `"search"`: anywhere else in the game's step (its search's simulations, encoding, the game's start).
+    pub phase: &'static str,
+    /// A `"move"` panic inside the chosen action itself (not a single-option decision after it): that action, the
+    /// next one after `steps` (`record::replay_failure` plays it).
+    pub panic_move: Option<u16>,
 }
 
 impl GameFailure {
     /// One JSON object: `{"gid", "driver_seed", "game_seed", "players", "spec", "tag", "start", "branch", "steps",
-    /// "message"}`, the steps as a trace record's (`record::steps_json`).
+    /// "message", "site", "phase", "panic_move"}`, the steps as a trace record's (`record::steps_json`).
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "gid": self.gid,
@@ -870,6 +878,9 @@ impl GameFailure {
             "branch": self.branch.as_ref().map(|b| serde_json::json!({"at": b.at, "of": b.of, "decision": b.decision, "step": b.step, "action": b.action})),
             "steps": crate::record::steps_json(&self.steps),
             "message": self.message,
+            "site": self.site,
+            "phase": self.phase,
+            "panic_move": self.panic_move,
         })
     }
 }
@@ -1585,6 +1596,9 @@ struct Slot<G: SearchGame> {
     /// after a panic is replayed from (`GameFailure::steps`); never handed out otherwise. A branch's: its moves since
     /// its branch point.
     fail_log: Vec<TraceStep>,
+    /// While a real move is applied (docs/search.md 2.18): its action and `fail_log`'s length before it - a panic then
+    /// is a `"move"` panic (`GameFailure::phase`, `panic_move`).
+    in_move: Option<(u16, usize)>,
     /// The JSON of the spec the game started from (its queued setup's, else the driver's): `GameFailure::spec`.
     spec_json: Arc<String>,
 }
@@ -1651,6 +1665,7 @@ impl<G: SearchGame> Slot<G> {
             row_abort: false,
             chain: None,
             fail_log: Vec::new(),
+            in_move: None,
             spec_json: Arc::new(String::new()),
         }
     }
@@ -2063,6 +2078,8 @@ pub struct Driver<G: SearchGame> {
 
 impl<G: SearchGame> Driver<G> {
     pub fn new(cfg: DriverCfg) -> Result<Driver<G>, String> {
+        // (a dropped game's failure names where it panicked: docs/search.md 2.18)
+        crate::panic_site::install();
         // R3 (docs/search.md 2.15): a game with tail segments declares a finite row limit
         const { assert!(G::TAILS.is_empty() || (G::MAX_ROW_TOKENS != usize::MAX && G::HEAD_TOKENS > 0 && G::HEAD_TOKENS <= G::MAX_ROW_TOKENS), "a game with TAILS must set a finite MAX_ROW_TOKENS and its HEAD_TOKENS (1 + every segment's head slots, at most MAX_ROW_TOKENS)") };
         if let Some(m) = cfg.max_row_tokens {
