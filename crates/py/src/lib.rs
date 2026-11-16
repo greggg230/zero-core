@@ -1068,7 +1068,8 @@ impl PySearchDriver {
     }
 
     /// A traced driver's finished games (docs/search.md 2.17): take_results and take_samples at one point, with each
-    /// game's record (`zero_search::record::game_json`, JSON text) -> (rows, records, samples dict or None).
+    /// game's record (`zero_search::record::game_json`, JSON text; "" for a game dropped after a panic: no record,
+    /// docs/search.md 2.18) -> (rows, records, samples dict or None).
     fn take_game_records<'py>(&mut self, py: Python<'py>) -> PyResult<(Bound<'py, PyList>, Vec<String>, Option<PyObject>)> {
         let rows = self.d.take_results();
         let recs = self.d.take_samples();
@@ -1080,7 +1081,12 @@ impl PySearchDriver {
             if b > recs.len() {
                 return Err(rerr(format!("game {} has {} samples, {} left", r.gid, r.samples, recs.len() - a)));
             }
-            texts.push(zero_search::record::game_json(r, &recs[a..b]).map_err(rerr)?.to_string());
+            // (a game dropped after a panic has no trace, docs/search.md 2.18: its row, an empty text - no record)
+            if r.abort_reason == Some("panic") && r.trace.is_none() {
+                texts.push(String::new());
+            } else {
+                texts.push(zero_search::record::game_json(r, &recs[a..b]).map_err(rerr)?.to_string());
+            }
             out.append(result_row(py, r)?)?;
             a = b;
         }
