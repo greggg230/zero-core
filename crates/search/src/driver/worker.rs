@@ -129,6 +129,9 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     for slot in ch.slots.iter_mut() {
         let gid = slot.start.or(Some(slot.gid)).filter(|&x| x != NO_GAME);
         let t0 = Instant::now();
+        // what this step adds to the chunk's rows and outputs, taken back if the game panics (docs/search.md 2.18)
+        let snaps: Vec<[usize; 18]> = ch.bufs.iter().map(|b| b.snap()).collect();
+        let outs = (ch.results.len(), ch.samples.len(), ch.parked.len());
         // a panic inside the game (an engine bug) is caught here, per game, so the message
         // names the game to replay and the chunk's lock is never poisoned
         let r = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
@@ -229,7 +232,20 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
         .unwrap_or_else(|p| {
             // the scratch world may be mid-transition
             scratch.game = None;
-            Err(format!("search worker panicked: {}", panic_msg(p)))
+            let msg = panic_msg(p);
+            let Some(gid) = gid else {
+                return Err(format!("search worker panicked: {msg}"));
+            };
+            // the game panicked (docs/search.md 2.18): what it sent this step is taken back, it is dropped (an aborted
+            // result row, reason "panic", no samples) and its failure kept for replay; the run goes on
+            for (b, s) in ch.bufs.iter_mut().zip(&snaps) {
+                b.rollback(s);
+            }
+            ch.results.truncate(outs.0);
+            ch.samples.truncate(outs.1);
+            ch.parked.truncate(outs.2);
+            drop_game(sh, slot, gid, msg, &mut ch.results);
+            Ok(())
         });
         if let Some(gid) = gid {
             let ns = t0.elapsed().as_nanos() as u64;
@@ -412,6 +428,8 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     let spec_now = lock(&sh.spec).clone();
     let mut spec = setup.as_ref().map_or(&*spec_now, |s| &s.spec);
     let stream = if cfg.paired { gid / 2 } else { gid };
+    // (the spec's JSON, for a dropped game's failure record: docs/search.md 2.18)
+    slot.spec_json = setup.as_ref().map_or_else(|| lock(&sh.spec_json).clone(), |s| s.json.clone());
     // archive starts (docs/search.md 2.11): the game's own start stream, never `base`
     slot.start_ix = None;
     if let Some(sc) = &cfg.starts {
@@ -499,7 +517,81 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     slot.game_seed = game_seed;
     slot.trace = sh.trace.load(Ordering::Relaxed).then(Vec::new);
     slot.trace_setups.clear();
+    slot.fail_log.clear();
     Ok(())
+}
+
+/// Drop the slot's game `gid` after a panic inside it (docs/search.md 2.18): its failure (seed, spec, real moves, the
+/// message) is kept for `Driver::take_failures`, counted (`game_panics`) and logged (one stderr line); its result row
+/// is an aborted row (reason `"panic"`, not over, no samples - a chained contest's finished episodes' samples go too);
+/// the slot is free for the next game. The game itself is never touched again (it may be mid-transition).
+fn drop_game<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, msg: String, results: &mut Vec<GameResult>) {
+    let cfg = &sh.cfg;
+    let n = slot.n.max(cfg.games[gid as usize % cfg.games.len()].len());
+    eprintln!("game panic: game {gid} (driver seed {}) dropped after {} real moves: {msg}", cfg.seed, slot.fail_log.len());
+    let spec = if slot.spec_json.is_empty() { lock(&sh.spec_json).to_string() } else { slot.spec_json.to_string() };
+    lock(&sh.failures).push(GameFailure {
+        gid,
+        driver_seed: cfg.seed,
+        game_seed: slot.game_seed,
+        players: n,
+        spec,
+        tag: slot.tag.clone(),
+        start: slot.start_ix,
+        branch: slot.branch.clone(),
+        steps: std::mem::take(&mut slot.fail_log),
+        message: msg,
+    });
+    sh.counters.game_panics.fetch_add(1, Ordering::Relaxed);
+    let mut draw = vec![0.0; n];
+    draw.fill(1.0 / n as f32);
+    results.push(GameResult {
+        gid,
+        n,
+        over: false,
+        aborted: true,
+        result: draw,
+        scores: vec![0.0; n],
+        steps: slot.steps,
+        decisions: slot.decisions,
+        ext_moves: slot.ext_moves,
+        rounds: 0,
+        samples: 0,
+        tag: slot.tag.take(),
+        moves: std::mem::take(&mut slot.moves),
+        branch: slot.branch.take(),
+        start: slot.start_ix.take(),
+        resign: None,
+        abort_reason: Some("panic"),
+        episodes: Vec::new(),
+        trace: None,
+    });
+    slot.game = None;
+    slot.start = None;
+    slot.setup = None;
+    slot.chain = None;
+    slot.resign = None;
+    slot.fork = None;
+    slot.row_abort = false;
+    slot.dev_left = 0;
+    slot.dev_now = false;
+    slot.records.clear();
+    slot.rq.clear();
+    slot.view_wait.clear();
+    slot.drop_trees();
+    slot.look = None;
+    slot.look_mcts = false;
+    slot.look_guard = None;
+    slot.pending = None;
+    slot.ext_payload = None;
+    slot.legal_ok = false;
+    slot.target = None;
+    slot.sims = 0;
+    slot.cache.clear();
+    slot.trace = None;
+    slot.trace_setups.clear();
+    slot.spec_json = Arc::new(String::new());
+    slot.gid = NO_GAME;
 }
 
 /// Expand the slot's pending leaf with its evaluation and back it up. `vrow`: `value` / `margin`
@@ -1378,6 +1470,7 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
     let tag = tag_of(&*g);
     let stepped = std::cell::Cell::new(0u32);
     let trace = &mut slot.trace;
+    let fail_log = &mut slot.fail_log;
     transition_each(
         g,
         a,
@@ -1395,6 +1488,7 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
             if let Some(t) = trace.as_mut() {
                 t.push(TraceStep::Act(s));
             }
+            fail_log.push(TraceStep::Act(s));
         },
     )
     .map_err(|e| format!("move {a} failed: {e}"))?;
@@ -1428,6 +1522,7 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
     if let Some(t) = slot.trace.as_mut() {
         t.push(TraceStep::Ext(payload.to_string()));
     }
+    slot.fail_log.push(TraceStep::Ext(payload.to_string()));
     slot.ext_moves += 1;
     slot.steps += 1;
     slot.legal_ok = false;
@@ -1563,6 +1658,7 @@ fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &
             if let Some(t) = slot.trace.as_mut() {
                 t.push(TraceStep::Next(loser.map(|l| l as u8)));
             }
+            slot.fail_log.push(TraceStep::Next(loser.map(|l| l as u8)));
             slot.game = Some(ng);
             slot.full = true;
             slot.minor = false;
@@ -1676,6 +1772,8 @@ fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut
     slot.dev_left = moves;
     slot.dev_now = false;
     slot.trace = None;
+    // (a branch's failure log: its moves since its branch point, docs/search.md 2.18)
+    slot.fail_log.clear();
     Ok(())
 }
 

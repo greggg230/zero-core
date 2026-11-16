@@ -582,6 +582,11 @@ impl Run<'_> {
         if rows.is_empty() && !recs.is_empty() {
             return Err("samples without finished games".into());
         }
+        // games dropped after a panic (zero-core docs/search.md 2.18): each failure's replay record into the log; their
+        // rows carry no samples and no trace, so they go into neither the records nor the shards
+        for f in self.drv.take_failures() {
+            self.sink.log(&format!("game failure (dropped after a panic): {f}"));
+        }
         let mut it = recs.into_iter();
         let n = rows.len() as u64;
         for r in rows {
@@ -595,6 +600,9 @@ impl Run<'_> {
                 let mut p = self.progress.lock().unwrap();
                 p.finished_gids.push(r.gid);
                 p.decisions += r.decisions as u64;
+            }
+            if r.abort_reason == Some("panic") {
+                continue;
             }
             if let Some(rw) = self.rec.as_mut() {
                 if let Some(w) = rw.add(&r, &records)? {

@@ -86,6 +86,10 @@ from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
 from .shardthread import MB, SampleClock, ThreadedShardWriter, split_records
 
 BIG = 1 << 62                                      # a rolling driver's quota when its phases end by end_phase()
+# Games dropped after a panic (docs/search.md 2.18): their replay records, one JSON object a line, in the run directory;
+# more than this share of an iteration's games (at least 3) fails the run (Run.failure_metrics).
+GAME_FAILURES = 'game_failures.jsonl'
+GAME_FAILURE_LIMIT = 0.05
 
 DEFAULTS = dict(
     preset='',
@@ -901,6 +905,7 @@ class Run:
         self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results)
         self.tail_metrics(it, out, st, st0, results)
+        self.failure_metrics(it, out, results, drv)
         self.episode_metrics(it, out, results)
         self.timing_metrics(out, st, st0, ev, secs)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
@@ -1039,6 +1044,34 @@ class Run:
         if out['tail']['aborted_row_tokens']:
             self.log(f'iter {it}: {out["tail"]["aborted_row_tokens"]} game(s) aborted by max_row_tokens '
                      f'{self.info.get("max_row_tokens")} (counted, no samples; docs/search.md 2.15)')
+
+    def failure_metrics(self, it, out, results, drv):
+        """Games dropped after a panic inside them (docs/search.md 2.18): an engine bug costs that game, not the run.
+        The driver ends such a game as an aborted row (abort_reason 'panic', no samples) and keeps what replays it;
+        here, only when there was one (the metrics of before otherwise): `game_failures` = this iteration's dropped
+        games among `results` (every source's rows, a remote's too), every failure record of this machine's driver
+        appended to <run>/game_failures.jsonl (one JSON object a line: gid, seeds, spec, real moves, message, + iter),
+        logged. More than GAME_FAILURE_LIMIT of an iteration's games dropped (at least 3) is not a rare bug but a broken
+        build: the run fails loudly, as it did on the first panic before (a silent run of dropped games is worse)."""
+        fails = [json.loads(x) for x in drv.take_failures()] if hasattr(drv, 'take_failures') else []
+        n = sum(1 for r in results if r.get('abort_reason') == 'panic')
+        if not fails and not n:
+            return
+        if fails:
+            path = os.path.join(self.run, GAME_FAILURES)
+            with open(path, 'a', encoding='utf-8') as f:
+                for x in fails:
+                    f.write(json.dumps({**x, 'iter': it, 'time': round(time.time(), 3)}) + '\n')
+        out['game_failures'] = n
+        for x in fails:
+            self.log(f'iter {it}: game {x["gid"]} (driver seed {x["driver_seed"]}) dropped after a panic at real move '
+                     f'{len(x["steps"])}: {str(x["message"])[:300]} (replay: {GAME_FAILURES})')
+        limit = max(3, int(len(results) * GAME_FAILURE_LIMIT))
+        self.log(f'iter {it}: {n} of {len(results)} game(s) dropped after a panic (no samples; at most {limit} an '
+                 f'iteration; docs/search.md 2.18)')
+        if n > limit:
+            raise RuntimeError(f'iter {it}: {n} of {len(results)} self-play games panicked (more than {limit}): a broken '
+                               f'build, not a rare bug - see {GAME_FAILURES} in the run directory')
 
     def shard_meta(self, it, **extra):
         """The meta of iteration `it`'s self-play shards: game, features, actions, iter, `extra` (in its order), then the
@@ -1260,6 +1293,7 @@ class Run:
         self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results, rem.pop('resign', None))
         self.tail_metrics(it, out, st, st0, results)   # (this machine's driver; every source's aborted games)
+        self.failure_metrics(it, out, results, drv)
         self.episode_metrics(it, out, results)
         self.timing_metrics(out, st, st0, ev, secs)
         ev.seconds, ev.calls, ev.leaves = 0.0, 0, 0
