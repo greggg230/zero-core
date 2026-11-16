@@ -10,10 +10,13 @@ given) for:
   farm machine ids (`m_` + 26 base32 characters), home-directory paths that name a user
   (`C:/Users/<name>`, `/c/Users/<name>`, `/Users/<name>`; placeholders such as `<user>` pass),
   Windows' and macOS's default PC host names (`DESKTOP-` + 7 characters, `<Name>s-MacBook-Pro`), and
-  ssh targets written as `user@<IP>`;
+  ssh targets written as `user@<IP>`. A line carrying the marker `privacy-check: allow`, or a whole file
+  with `privacy-check: allow-file` in its first 5 lines, is spared these generic rules (synthetic data
+  that must look real, e.g. a redactor and its tests; never for real names);
 * the machine's LOCAL patterns: one regex per line (case-insensitive, `#` comments) in the untracked
   file ~/.config/zero/privacy_patterns.txt ($ZERO_PRIVACY_PATTERNS for another): the real names of
-  hosts, farm machines and accounts. They are never committed (that would publish them);
+  hosts, farm machines and accounts; they apply to every file, markers or not. They are never
+  committed (that would publish them);
   tools/privacy_patterns.example.txt shows the format.
 
 Binary files are skipped. Prints each finding as `path:line: [rule] excerpt`, then one line
@@ -28,7 +31,8 @@ import subprocess
 import sys
 
 USER_PLACEHOLDERS = (r'<[^<>\s/\\]*>|\.\.\.|\*|%USERNAME%|%USERPROFILE%|\$\{?USER(?:NAME)?\}?|USER(?:NAME)?|'
-                     r'user|you|me|someone|example|Public|Default|All Users|runner|runneradmin')
+                     r'user|you|me|someone|example|Public|Default|All Users|runner|runneradmin|[A-Za-z]')
+ALLOW = 'privacy-check: allow'     # a line carrying this is skipped (synthetic test data of a redactor, ...)
 _SEP = r'(?:\\\\|\\|/)'
 _END = r'(?=[\\/"\'`\s,;:)\]}]|$)'
 
@@ -83,16 +87,24 @@ def scan_text(text, rules):
     hits = []
     for rule, rx in rules:
         for m in rx.finditer(text):
+            s = text.rfind('\n', 0, m.start()) + 1
+            e = text.find('\n', m.end())
+            if ALLOW in text[s:len(text) if e < 0 else e]:
+                continue
             line = text.count('\n', 0, m.start()) + 1
-            a = max(text.rfind('\n', 0, m.start()) + 1, m.start() - 60)
+            a = max(s, m.start() - 60)
             b = text.find('\n', m.end())
             b = min(len(text) if b < 0 else b, m.end() + 60)
             hits.append((line, rule, text[a:b].strip()))
     return sorted(hits)
 
 
+ALLOW_FILE = 'privacy-check: allow-file'
+
+
 def scan(root, paths, rules):
     """-> (files scanned, [(path, line, rule, excerpt)])."""
+    generic = {id(rx) for _, rx in GENERIC}
     findings, n = [], 0
     for rel in paths:
         full = os.path.join(root, rel)
@@ -104,7 +116,10 @@ def scan(root, paths, rules):
             continue
         n += 1
         text = data.decode('utf-8', 'replace')
-        findings.extend((rel.replace('\\', '/'), *h) for h in scan_text(text, rules))
+        use = rules
+        if ALLOW_FILE in '\n'.join(text.split('\n', 5)[:5]):
+            use = [r for r in rules if id(r[1]) not in generic]
+        findings.extend((rel.replace('\\', '/'), *h) for h in scan_text(text, use))
     return n, findings
 
 
