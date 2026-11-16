@@ -18,7 +18,7 @@
 //! flight go on; their searches restart with the new network, each row keeps the id of the network
 //! that searched it).
 //!
-//! A rolling job (`Job::rolling`, zero-farm PROTOCOL.md 10.5, zero-core docs/az.md 55) does not end when its `games`
+//! A rolling job (`Job::rolling`, zero-farm PROTOCOL.md 10.5, zero-core docs/az.md 54) does not end when its `games`
 //! are done: it keeps up to `conc` games in flight while ids are left, then idles (the control thread still answers
 //! `ping` and sends `status`) until `extend` raises its games or `finish` / `quit` ends it; `low` asks for more ids
 //! once per games value when fewer than `conc` are left; a records file (and a shard) is also written `flush_s`

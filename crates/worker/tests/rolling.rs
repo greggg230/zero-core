@@ -1,4 +1,4 @@
-//! Rolling self-play jobs (zero-farm PROTOCOL.md 10.5, zero-core docs/az.md 55) on the toy game with the uniform
+//! Rolling self-play jobs (zero-farm PROTOCOL.md 10.5, zero-core docs/az.md 54) on the toy game with the uniform
 //! evaluator (no ONNX Runtime): the job keeps `conc` games in flight while ids are left, sends `low` once per games
 //! value, idles when every released id is played (no `end`), takes `extend` (never lower), writes a records file
 //! `flush_s` after its first game finished even while idle, switches networks in place at a `checkpoint` (each row

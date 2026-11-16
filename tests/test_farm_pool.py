@@ -526,7 +526,7 @@ def test_selfplay_local_0_leaves_the_games_to_a_delivering_farm(pool):
         rp.close()
 
 
-# ---------------------------------------------------------------- rolling leases (zero-farm PROTOCOL rev 15, docs/az.md 55)
+# ---------------------------------------------------------------- rolling leases (zero-farm PROTOCOL rev 15, docs/az.md 54)
 STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker_stub.py')
 
 
@@ -582,7 +582,8 @@ def test_pool_rolling_checks_the_worker_and_puts_rolling(pool, monkeypatch):
     assert list(puts[-1]['selfplay'])[-1] == 'rolling'
     assert p.st['put_extras']['rolling'] == roll
     lines = '\n'.join(R.lines)
-    assert f"alternate {other}'s executable is not the default build's" in lines and f'alternate {alt}' not in lines
+    assert f"alternate {other}'s executable is not the default build's" in lines
+    assert f"alternate {alt}'s executable" not in lines, "the default build's executable: covered"
     assert 'the worker build plays rolling jobs' in lines
 
 
