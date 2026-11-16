@@ -940,6 +940,9 @@ pub trait DynDriver: Send + Sync {
     fn end_phase(&mut self);
     fn take_results(&mut self) -> Vec<GameResult>;
     fn take_samples(&mut self) -> Vec<Record>;
+    /// The games dropped after a panic since the last call (`Driver::take_failures`, docs/search.md 2.18), each
+    /// one's `GameFailure::to_json` as a JSON string.
+    fn take_failures(&mut self) -> Vec<String>;
     /// Deferred results and queued setups (`Driver::take_deferred`, `resolve`, `pending`,
     /// `enqueue`, `queued`).
     fn take_deferred(&mut self) -> Vec<(u32, String)>;
@@ -994,6 +997,9 @@ impl<G: SearchGame> DynDriver for Driver<G> {
     }
     fn take_samples(&mut self) -> Vec<Record> {
         Driver::take_samples(self)
+    }
+    fn take_failures(&mut self) -> Vec<String> {
+        Driver::take_failures(self).iter().map(|f| f.to_json().to_string()).collect()
     }
     fn take_deferred(&mut self) -> Vec<(u32, String)> {
         Driver::take_deferred(self)

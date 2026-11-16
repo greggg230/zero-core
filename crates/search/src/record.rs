@@ -84,6 +84,19 @@ fn bits32(v: &[f32]) -> Vec<Value> {
     v.iter().map(|x| json!(x.to_bits())).collect()
 }
 
+/// A trace's steps as a record holds them: an action as its number, an external answer as its payload string, an
+/// episode boundary as `{"next": <the conceding seat or null>}` (also a dropped game's, `GameFailure::to_json`).
+pub fn steps_json(steps: &[TraceStep]) -> Vec<Value> {
+    steps
+        .iter()
+        .map(|s| match s {
+            TraceStep::Act(a) => json!(a),
+            TraceStep::Ext(p) => json!(p),
+            TraceStep::Next(c) => json!({"next": c}),
+        })
+        .collect()
+}
+
 /// The record of finished game `row` (its trace on: `Driver::set_trace`) and its emitted samples (`row.samples`
 /// of them, in order, as `take_samples` gave them) - one JSON object (module docs).
 pub fn game_json(row: &GameResult, samples: &[Record]) -> Result<Value, String> {
@@ -92,15 +105,7 @@ pub fn game_json(row: &GameResult, samples: &[Record]) -> Result<Value, String> 
         return Err(format!("game {}: {} samples given, its row says {}", row.gid, samples.len(), row.samples));
     }
     let n = row.n;
-    let steps: Vec<Value> = t
-        .steps
-        .iter()
-        .map(|s| match s {
-            TraceStep::Act(a) => json!(a),
-            TraceStep::Ext(p) => json!(p),
-            TraceStep::Next(c) => json!({"next": c}),
-        })
-        .collect();
+    let steps = steps_json(&t.steps);
     let (mut st, mut pl, mut kind, mut net, mut pi, mut q) = (vec![], vec![], vec![], vec![], vec![], vec![]);
     for r in samples {
         if r.n_players as usize != n {

@@ -831,6 +831,49 @@ pub struct GameResult {
     pub trace: Option<Box<GameTrace>>,
 }
 
+/// A game the driver dropped after a panic inside it (docs/search.md 2.18): an engine bug costs that game, not the
+/// run. Its result row is an aborted row (`GameResult::abort_reason` `"panic"`, no samples); this is what replays it up
+/// to the panic: the game's seed and spec, its real moves in order (`steps`, as a trace's - a chained contest's episode
+/// boundaries among them), the driver's seed and the game's id.
+#[derive(Clone, Debug)]
+pub struct GameFailure {
+    pub gid: u32,
+    /// The driver's seed (`DriverCfg::seed`) and the game's (`SearchGame::new_game`'s).
+    pub driver_seed: u64,
+    pub game_seed: u64,
+    pub players: usize,
+    /// The JSON of the spec it started from (its queued setup's, else the driver's), and the setup's tag.
+    pub spec: String,
+    pub tag: Option<String>,
+    /// The archive entry it started from (`DriverCfg::starts`), if any: its spec is that entry's.
+    pub start: Option<u32>,
+    /// A branch game (`DriverCfg::branch`): its branch point; `steps` are its moves since that point.
+    pub branch: Option<BranchInfo>,
+    /// The real moves played before the panic (`TraceStep`s, as `GameTrace::steps`).
+    pub steps: Vec<TraceStep>,
+    /// The panic's message.
+    pub message: String,
+}
+
+impl GameFailure {
+    /// One JSON object: `{"gid", "driver_seed", "game_seed", "players", "spec", "tag", "start", "branch", "steps",
+    /// "message"}`, the steps as a trace record's (`record::steps_json`).
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "gid": self.gid,
+            "driver_seed": self.driver_seed,
+            "game_seed": self.game_seed,
+            "players": self.players,
+            "spec": self.spec,
+            "tag": self.tag,
+            "start": self.start,
+            "branch": self.branch.as_ref().map(|b| serde_json::json!({"at": b.at, "of": b.of, "decision": b.decision, "step": b.step, "action": b.action})),
+            "steps": crate::record::steps_json(&self.steps),
+            "message": self.message,
+        })
+    }
+}
+
 /// One episode of a chained contest (`GameResult::episodes`, docs/search.md 2.14): its outcome and counts.
 #[derive(Clone, Debug)]
 pub struct EpisodeRow {
@@ -1165,6 +1208,56 @@ impl LeafBuf {
             self.x.truncate(self.x.len() - f);
         }
     }
+    /// Every array's length now: what `rollback` returns the buffer to (docs/search.md 2.18).
+    fn snap(&self) -> [usize; 18] {
+        [
+            self.x.len(),
+            self.player.len(),
+            self.n_players.len(),
+            self.gid.len(),
+            self.nopt.len(),
+            self.opt_action.len(),
+            self.extra.len(),
+            self.states.len(),
+            self.xs_nnz.len(),
+            self.xs_idx.len(),
+            self.xs_val.len(),
+            self.t_nt.len(),
+            self.t_seg.len(),
+            self.t_slot.len(),
+            self.t_val.len(),
+            self.ov_n.len(),
+            self.ov_opt.len(),
+            self.ov_tok.len(),
+        ]
+    }
+    /// Back to a `snap`: every row (sealed or open, of any kind) added since is dropped - a game that panicked takes
+    /// back what it sent this step, whatever it was doing (docs/search.md 2.18). The rows before are untouched.
+    fn rollback(&mut self, s: &[usize; 18]) {
+        self.x.truncate(s[0]);
+        self.player.truncate(s[1]);
+        self.n_players.truncate(s[2]);
+        self.gid.truncate(s[3]);
+        self.nopt.truncate(s[4]);
+        self.opt_action.truncate(s[5]);
+        self.extra.truncate(s[6]);
+        self.states.truncate(s[7]);
+        self.xs_nnz.truncate(s[8]);
+        self.xs_idx.truncate(s[9]);
+        self.xs_val.truncate(s[10]);
+        self.t_nt.truncate(s[11]);
+        self.t_seg.truncate(s[12]);
+        self.t_slot.truncate(s[13]);
+        self.t_val.truncate(s[14]);
+        self.ov_n.truncate(s[15]);
+        self.ov_opt.truncate(s[16]);
+        self.ov_tok.truncate(s[17]);
+        // (an open row: its tail, overrides and the sparse scratch row)
+        self.open = None;
+        self.tb.clear();
+        self.ov_open.clear();
+        self.scratch.iter_mut().for_each(|v| *v = 0.0);
+    }
     /// Drop every sealed row from `local` on (a game aborted by the row limit takes back the rows it sent this
     /// step, docs/search.md 2.15); no row may be open.
     fn truncate_rows(&mut self, local: usize, f: usize) {
@@ -1224,6 +1317,8 @@ pub fn check_overrides(ov: &[(u32, i64)], nopt: usize) {
 struct Setup<G: SearchGame> {
     tag: String,
     spec: G::Spec,
+    /// The spec's JSON as queued (a dropped game's failure record names it: `GameFailure::spec`).
+    json: Arc<String>,
 }
 
 /// f32 -> IEEE half precision bits, rounding to nearest even (numpy's `astype(float16)`); NaN
@@ -1486,6 +1581,12 @@ struct Slot<G: SearchGame> {
     row_abort: bool,
     /// A chained game's contest in progress (`SearchGame::chained`, docs/search.md 2.14); None for every other game.
     chain: Option<Box<Chain>>,
+    /// The game's real moves so far, kept whether or not the driver traces (docs/search.md 2.18): what a game dropped
+    /// after a panic is replayed from (`GameFailure::steps`); never handed out otherwise. A branch's: its moves since
+    /// its branch point.
+    fail_log: Vec<TraceStep>,
+    /// The JSON of the spec the game started from (its queued setup's, else the driver's): `GameFailure::spec`.
+    spec_json: Arc<String>,
 }
 
 /// A chained game's contest in progress (`Slot::chain`, docs/search.md 2.14): its finished episodes, their samples
@@ -1549,6 +1650,8 @@ impl<G: SearchGame> Slot<G> {
             game_seed: 0,
             row_abort: false,
             chain: None,
+            fail_log: Vec::new(),
+            spec_json: Arc::new(String::new()),
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -1697,6 +1800,8 @@ struct Counters {
     branches: AtomicU64,
     dev_moves: AtomicU64,
     starts: AtomicU64,
+    /// Games dropped after a panic inside them (docs/search.md 2.18).
+    game_panics: AtomicU64,
 }
 
 /// The lookahead seats' counters summed over their decisions (`DriverStats::look`, docs/search.md
@@ -1786,6 +1891,10 @@ struct Shared<G: SearchGame> {
     net: AtomicU32,
     /// Games started from now on are traced (`Driver::set_trace`).
     trace: AtomicBool,
+    /// The JSON of `spec` (`DriverCfg::spec`, or the last `set_spec`'s): `GameFailure::spec`.
+    spec_json: Mutex<Arc<String>>,
+    /// The games dropped after a panic and not taken yet (`Driver::take_failures`, docs/search.md 2.18).
+    failures: Mutex<Vec<GameFailure>>,
 }
 
 impl<G: SearchGame> Shared<G> {
@@ -1898,6 +2007,9 @@ pub struct DriverStats {
     pub tail_tokens: u64,
     pub tail_max: u64,
     pub aborted_row_tokens: u64,
+    /// Games dropped after a panic inside them (docs/search.md 2.18): each one an aborted result row (reason
+    /// `"panic"`, no samples) and a `GameFailure` (`Driver::take_failures`).
+    pub game_panics: u64,
 }
 
 /// The games in progress.
@@ -1963,6 +2075,7 @@ impl<G: SearchGame> Driver<G> {
             return Err(format!("max_row_tokens {row_limit} is below the game's head tokens {} (no row would fit)", G::HEAD_TOKENS));
         }
         let spec = G::parse_spec(&cfg.spec)?;
+        let spec_json = cfg.spec.clone();
         for (g, s) in cfg.games.iter().enumerate() {
             if !(G::MIN_PLAYERS..=G::MAX_PLAYERS.min(MAX_SEATS)).contains(&s.len()) {
                 return Err(format!("game {g}: {} seats ({} supports {}..{})", s.len(), G::NAME, G::MIN_PLAYERS, G::MAX_PLAYERS));
@@ -2145,6 +2258,8 @@ impl<G: SearchGame> Driver<G> {
             epoch: AtomicU32::new(0),
             net: AtomicU32::new(net),
             trace: AtomicBool::new(false),
+            spec_json: Mutex::new(Arc::new(spec_json)),
+            failures: Mutex::new(Vec::new()),
         });
         let mut workers = Vec::new();
         for k in 0..threads {
@@ -2606,6 +2721,7 @@ impl<G: SearchGame> Driver<G> {
             }
         }
         *lock(&self.sh.spec) = Arc::new(s);
+        *lock(&self.sh.spec_json) = Arc::new(spec.to_string());
         Ok(())
     }
 
@@ -2616,7 +2732,7 @@ impl<G: SearchGame> Driver<G> {
     pub fn enqueue(&mut self, tag: &str, spec: &str) -> Result<(), String> {
         self.check_error()?;
         let s = G::parse_spec(spec).map_err(|e| format!("enqueue {tag:?}: {e}"))?;
-        self.queue.push_back(Setup { tag: tag.to_string(), spec: s });
+        self.queue.push_back(Setup { tag: tag.to_string(), spec: s, json: Arc::new(spec.to_string()) });
         if !self.pausing() {
             for g in 0..self.gstate.len() {
                 if self.gstate[g] == GState::Idle {
@@ -2701,7 +2817,15 @@ impl<G: SearchGame> Driver<G> {
             tail_tokens: c.tail_tokens.load(Ordering::Relaxed),
             tail_max: c.tail_max.load(Ordering::Relaxed),
             aborted_row_tokens: c.aborted_row_tokens.load(Ordering::Relaxed),
+            game_panics: c.game_panics.load(Ordering::Relaxed),
         }
+    }
+
+    /// The games dropped after a panic since the last call (docs/search.md 2.18), oldest first: what replays each one
+    /// up to its panic (`GameFailure::to_json`). Their result rows came out of `take_results` as aborted rows (reason
+    /// `"panic"`, no samples).
+    pub fn take_failures(&mut self) -> Vec<GameFailure> {
+        std::mem::take(&mut *lock(&self.sh.failures))
     }
 
     /// The games in progress. Never waits for a search thread: a chunk being searched right now

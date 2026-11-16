@@ -2484,6 +2484,10 @@ class Worker:
             with ph['clock']:
                 rows = drv.take_results()
                 s = drv.take_records() if self.threaded else drv.take_samples()
+                # games dropped after a panic (docs/search.md 2.18): their rows go back as aborted rows (abort_reason
+                # 'panic', no samples; the run counts them); their replay records into this worker's log
+                for x in drv.take_failures():
+                    print(f'remote self-play: game failure (dropped after a panic): {x}', file=sys.stderr, flush=True)
                 if rows:
                     self._finished(ph, rows, s)
                 elif s is not None:

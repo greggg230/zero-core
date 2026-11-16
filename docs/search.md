@@ -776,6 +776,49 @@ without tail segments, or an aborted game in progress without it are refused. Te
 replay to their rows bit for bit, head, tail tokens and overrides included; games aborted at the first row, mid-game
 (a driver's lower limit) and a contest's later episode replay as aborted; a wrong or missing reason is refused.
 
+### 2.18 A panicking game is dropped, not the run (`take_failures`; MTG Zero's fuzz depth decision, 2026-11-15)
+
+A deliberate behaviour change, on a panic only: before, a panic inside one game (an engine bug) failed the whole driver
+("game G (driver seed S): search worker panicked: ...") and with it the run. Now that game is dropped and the run goes
+on. No setting: a game that does not panic plays, records and reports exactly as before (nothing is read or written
+on its path but one more `Vec` push per real move).
+
+**Why.** MTG Zero's user decided (2026-11-15, decision D1) that the gate fuzzes ~2,000 games per pool and the 20k depth
+runs continuously on the farm instead: a rare engine bug may then reach a live run, and it must cost one game, not the
+run (a crashed run costs hours and a restart ritual).
+
+**What it does.** `run_chunk` (driver/worker.rs) already caught a panic per game; on one it now
+* takes back everything the game sent this step - every key's rows, sealed or open (`LeafBuf::snap` / `rollback`, the
+  other games' rows of the chunk untouched), and any result row, samples or parked game it emitted in the step;
+* keeps a `GameFailure`: the game id, the driver's seed, the game's seed (`new_game`'s), the players, the JSON of the spec
+  it started from (its queued setup's, else the driver's current one: `set_spec` updates it), the setup's tag, the archive
+  entry or branch point if any, the real moves before the panic as trace steps (`Act` / `Ext` / `Next`, kept for every
+  game in `Slot::fail_log` whether or not the driver traces, 2.17 - never handed out otherwise) and the panic's message;
+  counted (`DriverStats::game_panics`) and logged (one stderr line "game panic: game G (driver seed S) dropped after N real
+  moves: <message>");
+* ends the game as an aborted result row: `aborted` true, not over, `abort_reason` `"panic"`, a draw's result, no samples,
+  no trace (a chained contest's finished episodes' samples go too); the slot starts the next game.
+`Driver::take_failures()` hands the failures out once (`DynDriver::take_failures`: each as `GameFailure::to_json`'s
+string; the binding's `take_failures()`; the binding's `stats()` has `game_panics` once there was one). A panic outside
+a game's step (batch assembly, `resolve`) and every error a game returns (`Err`) still fail the driver.
+
+Who reads them: `zero.run` (`Run.failure_metrics`, after each iteration's self-play) appends every failure of its driver
+to `<run>/game_failures.jsonl` with the iteration, logs each one, puts `game_failures` (the dropped rows among the
+iteration's results, a remote's included) into the metrics, and fails the run when more than `GAME_FAILURE_LIMIT` (5%) of
+an iteration's games - at least 3 - panicked: a broken build, not a rare bug, stays loud. The native worker
+(`zero_worker`) logs each failure (self-play and eval jobs), writes a dropped game into neither its records nor its
+shards, and marks an eval row `"abort_reason": "panic"` (only then: every other row is the same text); the remote
+self-play worker prints them into its log. Replay: `new_game(spec, players, game_seed)` and the steps reproduce the game
+up to its panic when the panic came from a real move (a panic inside a search simulation needs the search's state too:
+the record names the game, the moves bring it to the decision).
+
+**Tests.** `a_panicking_game_is_dropped_and_the_run_goes_on` (PanicToy, which replaced
+`a_panicking_game_fails_the_run_instead_of_hanging_it`: with the caller waiting for the panicking group, the caller busy,
+one and two groups: the run finishes, the dropped game's row is aborted with reason "panic" and no samples, one failure
+with the right ids, seeds, spec and message, its moves legal on a fresh game of its seed, and every other game's row and
+the samples exactly the plain toy's run with the same seed); `tests/test_game_failures.py` (the run's file, metrics, log
+and the storm limit, with a fake driver: no process is started).
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),
