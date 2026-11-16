@@ -58,6 +58,7 @@ fn job_of(game: &str, dir: &Path, spec: &str, games: u64, sparse: bool) -> Job {
         record_batches: None,
         status_s: 0.0,
         output: Output::Both,
+        rolling: None,
     }
 }
 

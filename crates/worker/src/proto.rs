@@ -6,7 +6,8 @@
 //!          [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
 //!          [--ort-dll PATH] [--spinning 0|1] [--record-batches N --record-file F] [--sha256 H (the model file's)]
 //!          [--status-s X] [--stdin-control] [--reference R] [--output shards|records|both (default shards)]
-//!                                                  one job from flags (the same runner; events on stdout)
+//!          [--rolling [--flush-s X]]               one job from flags (the same runner; events on stdout;
+//!                                                  --rolling: a rolling job, `extend` on stdin)
 //! <worker> eval --settings F (--model GEN=M ... | --uniform) --seats JSON --games N [--gid-base G] [--seed S]
 //!          [--paired] [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
 //!          [--reference GEN=R ...] [--sha256 GEN=H ...] [--ort-dll PATH] [--spinning 0|1] [--flush-games N]
@@ -39,7 +40,8 @@
 //! <worker> fuzz-chunk <spec.json>                  one chunk of a fuzz job (the supervisor's child)
 //! ```
 //!
-//! `serve`: `hello` first (aw, build_id, game, kinds, zero_onnx, pid), then one `job` line (`op` job:
+//! `serve`: `hello` first (aw, build_id, game, kinds, zero_onnx, pid, features - `["rolling"]` in a build with
+//! self-play: zero-farm PROTOCOL.md 10.5), then one `job` line (`op` job:
 //! lease_id, kind 'selfplay', settings, games, gid_base, seed, model, reference (the self-test's set:
 //! answered before the first batch, `selftest` {provider, max_abs, ok}; a failure is fatal), threads, out_dir;
 //! optional gen - the rows' network id, default the graph's `checkpoint_iter` -, sha256 - the model FILE's,
@@ -48,7 +50,10 @@
 //! (sample shards, `shard` events) or 'both'); during it `yield` ->
 //! `yielded` (no batch started, the session dropped), `resume` -> `resumed`, `finish`, `quit`, `checkpoint`
 //! {gen, model, sha256? (the file's), reference?},
-//! `ping` -> `status`; events `fin`, `records` / `shard` (seq, path under out_dir, games, rows, bytes, gids:
+//! `ping` -> `status`; a rolling job (`rolling: true`, `flush_s` - default 120 -; `job::Rolling`): `extend` {games: the
+//! new total, never lower}, the event `low` {started, games} once per games value when fewer than conc ids are left to
+//! start, a records file also `flush_s` after its first game finished, a `checkpoint` built and self-tested in the
+//! background, `end` `finish` | `quit` (never `done`); a classic job answers `extend` with a non-fatal error; events `fin`, `records` / `shard` (seq, path under out_dir, games, rows, bytes, gids:
 //! half-open [a, b) ranges, gen: the oldest network of its rows), `status` every <= 10 s (PROTOCOL.md 3 Stats fields), `end` (reason, stats,
 //! unfinished {gids: [[a, b)]}), `error` (message, fatal). The process exits after `end` (or a fatal
 //! error, status 1).
@@ -317,7 +322,23 @@ fn job_from_value(v: &Value, base: &Path) -> Result<Job, String> {
         status_s: 10.0,
         // (zero-farm phase 3: a served self-play job writes game records unless its line says otherwise)
         output: crate::records::Output::parse(o.get("output").and_then(|x| x.as_str()).unwrap_or("records"))?,
+        rolling: rolling_of(o)?,
     })
+}
+
+/// The job line's `rolling: true` and `flush_s` (zero-farm PROTOCOL.md 10.5; absent or false: a classic job).
+fn rolling_of(o: &Map<String, Value>) -> Result<Option<crate::job::Rolling>, String> {
+    match o.get("rolling") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(None),
+        Some(Value::Bool(true)) => {
+            let flush_s = match o.get("flush_s") {
+                None | Some(Value::Null) => crate::job::Rolling::default().flush_s,
+                Some(v) => v.as_f64().filter(|x| x.is_finite() && *x > 0.0).ok_or_else(|| format!("job: flush_s {v}: a number of seconds > 0"))?,
+            };
+            Ok(Some(crate::job::Rolling { flush_s }))
+        }
+        Some(v) => Err(format!("job: rolling {v}: true or false")),
+    }
 }
 
 /// `GEN=VALUE` pairs of a flag (`--model 1=a.onnx`).
@@ -399,10 +420,19 @@ fn end_event(o: &Outcome) -> Value {
     json!({"ev": "end", "reason": o.reason, "stats": o.stats, "unfinished": {"gids": o.unfinished.iter().map(|r| [r.0, r.1]).collect::<Vec<_>>()}})
 }
 
-/// Control lines during a job (yield / resume / finish / quit / checkpoint / ping).
-fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress: &Mutex<Progress>, sink: &dyn Sink, base: &Path) {
+/// Control lines during a job (yield / resume / finish / quit / checkpoint / ping; a rolling job's `extend`).
+fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress: &Mutex<Progress>, sink: &dyn Sink, base: &Path, rolling: bool) {
     let op = line.get("op").and_then(|x| x.as_str()).unwrap_or("");
     match op {
+        // (a classic job: `extend` is an unknown op, as before - the non-fatal error below)
+        "extend" if rolling => match line.get("games").and_then(|x| x.as_u64()) {
+            Some(g) => {
+                if !ctl.extend(g) {
+                    sink.log(&format!("extend to {g}: not above the games asked before (ignored)"));
+                }
+            }
+            None => sink.event(json!({"ev": "error", "message": "extend: games (the job's new total) is required", "fatal": false})),
+        },
         "yield" => {
             let l = link.lock().unwrap().clone();
             match do_yield(ctl, l.as_ref(), progress) {
@@ -443,21 +473,22 @@ fn run_with_control(game: &'static GameEntry, mut job: Job, sink: Arc<Stdout>, l
     // (the status lines come from the control thread, which also runs while the job waits on its search threads)
     let status_s = job.status_s;
     job.status_s = f64::INFINITY;
-    with_control(status_s, sink, lines, base, move |ctl, sink, progress, link_out| run_job(game, &job, ctl, sink, progress, link_out))
+    let rolling = job.rolling.is_some();
+    with_control(status_s, sink, lines, base, rolling, move |ctl, sink, progress, link_out| run_job(game, &job, ctl, sink, progress, link_out))
 }
 
 /// An eval job on a thread while this thread reads control lines (as `run_with_control`).
 fn run_eval_with_control(game: &'static GameEntry, mut job: crate::evaljob::EvalJob, sink: Arc<Stdout>, lines: Option<std::sync::mpsc::Receiver<Option<Value>>>, base: PathBuf) -> Result<Outcome, String> {
     let status_s = job.status_s;
     job.status_s = f64::INFINITY;
-    with_control(status_s, sink, lines, base, move |ctl, sink, progress, link_out| crate::evaljob::run_eval_job(game, &job, ctl, sink, progress, link_out))
+    with_control(status_s, sink, lines, base, false, move |ctl, sink, progress, link_out| crate::evaljob::run_eval_job(game, &job, ctl, sink, progress, link_out))
 }
 
 type JobFn = dyn FnOnce(&Control, &dyn Sink, Arc<Mutex<Progress>>, &dyn Fn(EvalLink)) -> Result<Outcome, String> + Send;
 
 /// Run a network job (`run`) on a thread while this thread reads control lines from `lines` (None: no
-/// control) and emits a status line every `status_s` -> the outcome.
-fn with_control(status_s: f64, sink: Arc<Stdout>, lines: Option<std::sync::mpsc::Receiver<Option<Value>>>, base: PathBuf, run: impl FnOnce(&Control, &dyn Sink, Arc<Mutex<Progress>>, &dyn Fn(EvalLink)) -> Result<Outcome, String> + Send + 'static) -> Result<Outcome, String> {
+/// control) and emits a status line every `status_s` -> the outcome. `rolling`: a rolling self-play job (`extend`).
+fn with_control(status_s: f64, sink: Arc<Stdout>, lines: Option<std::sync::mpsc::Receiver<Option<Value>>>, base: PathBuf, rolling: bool, run: impl FnOnce(&Control, &dyn Sink, Arc<Mutex<Progress>>, &dyn Fn(EvalLink)) -> Result<Outcome, String> + Send + 'static) -> Result<Outcome, String> {
     let run: Box<JobFn> = Box::new(run);
     let ctl = Arc::new(Control::default());
     let link: Arc<Mutex<Option<EvalLink>>> = Arc::new(Mutex::new(None));
@@ -482,7 +513,7 @@ fn with_control(status_s: f64, sink: Arc<Stdout>, lines: Option<std::sync::mpsc:
     while !worker.is_finished() {
         match &lines {
             Some(rx) if !eof => match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Some(v)) => control(&v, &ctl, &link, &progress, &*sink, &base),
+                Ok(Some(v)) => control(&v, &ctl, &link, &progress, &*sink, &base, rolling),
                 Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     // stdin closed: the agent is gone - stop now
                     eof = true;
@@ -533,7 +564,7 @@ fn stdin_lines(sink: Arc<Stdout>) -> std::sync::mpsc::Receiver<Option<Value>> {
 fn serve(w: &'static Worker) -> i32 {
     let games = w.games;
     let sink = Arc::new(Stdout { mu: Mutex::new(()) });
-    sink.event(json!({"ev": "hello", "aw": AW, "build_id": build_id(), "game": w.repo, "kinds": w.kinds(), "zero_onnx": if w.selfplay { json!(ZERO_ONNX) } else { json!([]) }, "pid": std::process::id(), "games": games.iter().map(|g| g.name).collect::<Vec<_>>()}));
+    sink.event(json!({"ev": "hello", "aw": AW, "build_id": build_id(), "game": w.repo, "kinds": w.kinds(), "zero_onnx": if w.selfplay { json!(ZERO_ONNX) } else { json!([]) }, "pid": std::process::id(), "games": games.iter().map(|g| g.name).collect::<Vec<_>>(), "features": w.features()}));
     let rx = stdin_lines(sink.clone());
     let base = std::env::current_dir().unwrap_or_default();
     loop {
@@ -788,6 +819,7 @@ fn selfplay_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
         record_batches: record,
         status_s: a.num("--status-s")?.unwrap_or(10.0),
         output: crate::records::Output::parse(a.get("--output").unwrap_or("shards"))?,
+        rolling: if a.has("--rolling") { Some(crate::job::Rolling { flush_s: a.num("--flush-s")?.unwrap_or(crate::job::Rolling::default().flush_s) }) } else { None },
     };
     let sink = Arc::new(Stdout { mu: Mutex::new(()) });
     let lines = a.has("--stdin-control").then(|| stdin_lines(sink.clone()));
@@ -1002,7 +1034,7 @@ fn probe_cli(a: &Args) -> Result<i32, String> {
     Ok(if v["error"].is_null() { 0 } else { 2 })
 }
 
-fn info_cli(games: &'static [GameEntry], repo: &str, kinds: Vec<&'static str>, a: &Args) -> Result<i32, String> {
+fn info_cli(games: &'static [GameEntry], repo: &str, kinds: Vec<&'static str>, features: Vec<&'static str>, a: &Args) -> Result<i32, String> {
     let dylib = ort_dylib_in(a.get("--ort-dll"), a.get("--runtime-dir"));
     let ort = match crate::session::runtime(&dylib) {
         Ok(rt) => {
@@ -1016,7 +1048,7 @@ fn info_cli(games: &'static [GameEntry], repo: &str, kinds: Vec<&'static str>, a
         let i = (g.info)();
         json!({"name": i.name, "features": i.num_features, "actions": i.num_actions, "aux": i.aux.iter().map(|x| json!([x.0, x.1])).collect::<Vec<_>>()})
     }).collect();
-    println!("{}", json!({"repo": repo, "aw": AW, "zero_onnx": ZERO_ONNX, "build_id": build_id(), "games": gs, "onnxruntime": ort, "kinds": kinds}));
+    println!("{}", json!({"repo": repo, "aw": AW, "zero_onnx": ZERO_ONNX, "build_id": build_id(), "games": gs, "onnxruntime": ort, "kinds": kinds, "features": features}));
     Ok(0)
 }
 
@@ -1051,7 +1083,7 @@ pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
         "check-config" => check_config(w, &a),
         "driver-cfg" => driver_cfg_cli(games, &a),
         "eval-batches" => eval_batches(&a),
-        "info" => info_cli(games, repo, w.kinds(), &a),
+        "info" => info_cli(games, repo, w.kinds(), w.features(), &a),
         "probe-providers" if !w.selfplay => Err("this worker build runs fuzz jobs only (a fuzz-profile build): no network".into()),
         "probe-providers" => probe_cli(&a),
         // (one child of probe-providers' graph variants: probe_variants.rs)
