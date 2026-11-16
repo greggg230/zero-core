@@ -152,7 +152,7 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     /// sum) -> true. A network seat then plays the policy's first largest weight without searching, and a
     /// recording self-play seat records the decision with that policy (normalised) as its policy target
     /// and no root value (its `q` is the outcome, as a value-only row's). MTG Zero: a best-of-three seat
-    /// that sideboards by a matchup model's choice table (its ENGINE.md 167). Called at every network
+    /// that sideboards by a matchup model's choice table (its ENGINE.md 168). Called at every network
     /// seat's real decision with two or more options, before any search: keep it cheap. Never called
     /// inside a search's simulations (a tree expands the decision with the network's priors). Default:
     /// no decision is.

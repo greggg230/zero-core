@@ -2138,7 +2138,7 @@ spec's `"sideboard_table"`) makes every decision, record, row and digest what it
 records hold with the hook consulted (`teacher_decisions_play_and_record_the_games_policy_without_a_search`).
 
 **Why.** MTG Zero's best-of-three run pb3 sideboards a seat by a matchup model trained on the run's own game results
-(its ENGINE.md 167): the model's choice is a 60-card deck, reached by the sideboarding decisions' canonical path. The
+(its ENGINE.md 168): the model's choice is a 60-card deck, reached by the sideboarding decisions' canonical path. The
 model's choice must be played and must also become the decisions' policy targets, so that the network's prior learns
 it (and unlearns an inherited choice the value head never judged: the search alone kept following that prior). The
 EoE deck choice by an evaluator (3.17's neighbour, MTG Zero ENGINE.md 112) has no decision at all and teaches the
