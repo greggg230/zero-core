@@ -1050,6 +1050,17 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
     rewrites (metadata `portable` 1), which change no answer and let the GPU providers run the graph. `opset`: 17 (the
     default: the exporter's opset-18 graph rewritten by `opset17`, docs/az.md 41.2) or 18 (as the exporter writes it).
     Every scatter of the mask and packed graphs writes unique indices (metadata `unique_scatters` 1; docs/az.md 41.2)."""
+    mod, args, names, outs, dyn, meta_of = _export_module(net, packing)
+    with torch.no_grad():
+        prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=EXPORTER_OPSET, input_names=names,
+                                 output_names=outs, dynamic_shapes=dyn, optimize=True, verbose=False)
+    return _save(prog.model_proto, meta_of(extra), path, opset, make_portable)
+
+
+def _export_module(net, packing='packed'):
+    """What `export` traces for `net`: (the interface module - ZeroOnnx2 for zero-onnx/2, else ZeroOnnx - around a
+    float32 CPU eval copy of `net`, the example inputs, the input names, the output names, the dynamic shapes, `extra` ->
+    the graph's metadata)."""
     net = copy.deepcopy(net).float().cpu().eval()
     for p in net.parameters():
         p.requires_grad_(False)
@@ -1058,11 +1069,8 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
     if onnx_version(net) == 2:
         # (variable-length token sets: zero-onnx/2, docs/az.md 46)
         mod = ZeroOnnx2(net, packing).eval()
-        args, names, outs, dyn = example_inputs2(net), list(INPUTS2), list(OUTPUTS2), dynamic_shapes2()
-        with torch.no_grad():
-            prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=EXPORTER_OPSET, input_names=names,
-                                     output_names=outs, dynamic_shapes=dyn, optimize=True, verbose=False)
-        return _save(prog.model_proto, metadata2(net, extra), path, opset, make_portable)
+        return (mod, example_inputs2(net), list(INPUTS2), list(OUTPUTS2), dynamic_shapes2(),
+                lambda extra: metadata2(net, extra))
     mod = ZeroOnnx(net, packing).eval()
     packing = mod.packing
     args = example_inputs(net, packing)
@@ -1070,10 +1078,7 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
     dyn = dynamic_shapes(packing)
     if packing != 'host':
         dyn = {k: v for k, v in dyn.items() if k in names}
-    with torch.no_grad():
-        prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=EXPORTER_OPSET, input_names=names,
-                                 output_names=list(OUTPUTS), dynamic_shapes=dyn, optimize=True, verbose=False)
-    return _save(prog.model_proto, metadata(net, packing, extra), path, opset, make_portable)
+    return mod, args, names, list(OUTPUTS), dyn, lambda extra: metadata(net, packing, extra)
 
 
 def strip_annotations(model):
@@ -1397,16 +1402,27 @@ def _save(model, meta, path, opset, make_portable, int32=True):
         opset17(model)
     elif opset != 18:
         raise ValueError(f'zero-onnx: opset {opset} (17, the default, or 18)')
+    _write_metadata(model, meta)
+    onnx.checker.check_model(model)
+    _write_model(model, path)
+    return meta
+
+
+def _write_metadata(model, meta):
+    """The graph's metadata replaced by `meta` (in its order) and its producer named. In place."""
     del model.metadata_props[:]
     for k, v in meta.items():
         e = model.metadata_props.add()
         e.key, e.value = k, v
     model.producer_name = 'zero-core zero.onnx_export'
-    onnx.checker.check_model(model)
+
+
+def _write_model(model, path):
+    """One file, no external data, written atomically."""
+    import onnx
     tmp = f'{path}.{os.getpid()}.tmp'
     onnx.save_model(model, tmp, save_as_external_data=False)
     os.replace(tmp, path)
-    return meta
 
 
 def load_checkpoint(path, game=None, allow_mismatch=False):
@@ -1430,6 +1446,281 @@ def export_checkpoint(path, out, packing='packed', game=None, allow_mismatch=Fal
     if checkpoint_id:
         info['checkpoint'] = checkpoint_id
     return export(m, out, packing, info)
+
+
+# ---------------------------------------------------------------- the weight-swap template (docs/az.md 53)
+TEMPLATE = 1                       # the template's format and its classification (`export_template`)
+_PROBE_SEED = 0x5eed
+
+
+def module_tensors(mod):
+    """Every tensor of an interface module (`_export_module`) by the name the exporter gives its initializer: its
+    parameters and buffers (non-persistent ones too: ZeroOnnx2's `v_*`, computed from the weights at construction), the
+    first name of a shared tensor -> {name: tensor}."""
+    out = {}
+    for k, v in list(mod.named_parameters()) + list(mod.named_buffers()):
+        out.setdefault(k, v.detach())
+    return out
+
+
+def _versions():
+    from importlib import metadata as md
+    out = {'torch': torch.__version__}
+    for k in ('onnx', 'onnxscript', 'onnx-ir'):
+        try:
+            out[k] = md.version(k)
+        except md.PackageNotFoundError:
+            out[k] = None
+    return out
+
+
+def _code_sha256():
+    """This zero-core's Python (every zero/*.py: the network, the interface, the exporter's rewrites), hashed."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    h = hashlib.sha256()
+    for name in sorted(f for f in os.listdir(d) if f.endswith('.py')):
+        with open(os.path.join(d, name), 'rb') as f:
+            h.update(name.encode() + b'\0' + hashlib.sha256(f.read()).digest())
+    return h.hexdigest()
+
+
+def export_fingerprint(net, packing='packed', opset=OPSET, make_portable=True):
+    """The architecture fingerprint a weight-swap template is kept under (docs/az.md 53) -> (sha256 hex, its fields):
+    the network's class and config (its layout, sizes, heads, auxiliary targets), the interface module, the packing,
+    every module tensor's name, shape and dtype, the export settings (opset, portable), the exporter's versions (torch,
+    onnx, onnxscript, onnx-ir), this zero-core's Python and TEMPLATE. Two checkpoints with the same fingerprint export
+    to the same graph but for their weights; any other change gives another fingerprint (a fresh full export)."""
+    mod = _export_module(net, packing)[0]
+    fields = {'template': TEMPLATE, 'class': type(net).__name__, 'module': type(mod).__name__,
+              'config': json.loads(json.dumps(net.config, sort_keys=True, default=str)),
+              'aux_layout': [list(t) for t in (getattr(net, 'aux_layout', None) or [])], 'packing': mod.packing,
+              'opset': int(opset), 'portable': bool(make_portable),
+              'tensors': [[k, list(v.shape), str(v.dtype)] for k, v in module_tensors(mod).items()],
+              'versions': _versions(), 'code': _code_sha256()}
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest(), fields
+
+
+def _tensor_bytes(t):
+    return np.ascontiguousarray(t.detach().cpu().numpy()).tobytes()
+
+
+def _init_is(init, t):
+    """Is initializer `init` exactly tensor `t` (dtype, shape, raw bytes)?"""
+    from onnx import helper
+    a = t.detach().cpu().numpy()
+    return (helper.tensor_dtype_to_np_dtype(init.data_type) == a.dtype and list(init.dims) == list(a.shape)
+            and init.HasField('raw_data') and init.raw_data == _tensor_bytes(t))
+
+
+def _without_data(model):
+    """A copy of `model` with every initializer's data and the model's metadata cleared (the graph's structure, names,
+    dtypes and shapes; a swap writes the metadata of its own network: `gates` holds the gates' values)."""
+    import onnx
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    del m.metadata_props[:]
+    for i in m.graph.initializer:
+        for f in ('raw_data', 'float_data', 'int32_data', 'int64_data', 'double_data', 'uint64_data', 'string_data'):
+            i.ClearField(f)
+    return m
+
+
+_CODE_BASE = 1 << 22               # the coded weights' first value (`_weights_like`; exact float32 integers up to 2^24)
+
+
+def _weight_sources(mod):
+    """The weights a graph can be computed from: the interface module's network's floating-point state (its parameters
+    and saved buffers), by the exporter's names (`net.<key>`) in the network's order -> [(name, float32 tensor)]."""
+    return [(f'net.{k}', v.detach()) for k, v in mod.net.state_dict().items() if v.is_floating_point()]
+
+
+def _weights_like(net, how, seed=_PROBE_SEED):
+    """A float32 CPU copy of `net` with every floating-point state tensor replaced: 'random' (N(0, 0.5^2), independent
+    of the network's values: no exact 0 or 1, either sign) or 'coded' (element i of the network's floating-point state,
+    in `_weight_sources`' order, = 2^22 + i: a value names the element it came from)."""
+    p = copy.deepcopy(net).float().cpu()
+    g = torch.Generator().manual_seed(seed)
+    k = 0
+    with torch.no_grad():
+        for t in p.state_dict(keep_vars=True).values():
+            if not t.is_floating_point():
+                continue
+            if how == 'random':
+                t.copy_(torch.randn(t.shape, generator=g) * 0.5)
+            else:
+                t.copy_((_CODE_BASE + torch.arange(k, k + t.numel(), dtype=torch.float64)).reshape(t.shape))
+                k += t.numel()
+    if how == 'coded' and _CODE_BASE + k > 1 << 24:
+        raise ValueError(f'weight-swap template: {k} weights, past the coded export\'s {(1 << 24) - _CODE_BASE}')
+    return p
+
+
+def _bits(a):
+    a = np.ascontiguousarray(a)
+    return a.view(np.uint8).reshape(a.shape + (a.dtype.itemsize,)) if a.dtype.itemsize else a
+
+
+def export_template(net, path, packing='packed', opset=OPSET, make_portable=True):
+    """The weight-swap template of `net`'s architecture (docs/az.md 53): the graph `export` writes for it with random
+    weights, written to `path`, its derived-weight recipes to `<path>.recipes.npz` -> the template's description
+    {template, fingerprint, fields, weights, derived, constants, sha256, recipes_sha256}.
+
+    The architecture is exported twice, with random weights and with coded ones (`_weights_like`), and the two graphs
+    compared. They must be the same graph (nodes, names, inputs and outputs, attributes, opset, functions, metadata:
+    everything but the initializers' data); an initializer with the same bytes in both is a constant (an arange, a
+    shape, a table built from the config); one that differs must be either exactly a module tensor of each by its name
+    (`module_tensors`: a weight, or a buffer the interface computes from the weights - `weights`), or elements picked
+    from the weights (a slice, a transpose, a concatenation the exporter folded; `derived`: each element either the same
+    in both - a constant - or a code naming one weight element, the same pick reproducing the random export's values
+    exactly); anything else raises ValueError, naming them: the exporter computed something from the weights that a swap
+    cannot rebuild, and no template is made. Random weights hold no exact 0 or 1, so the template is the graph of a
+    network whose values trigger none of the exporter's value-dependent rewrites (a Gemm's all-zero bias dropped, for
+    one): `swap_export` writes that graph for every checkpoint. `constants`: the module tensors among the constants (a
+    swap checks they are unchanged)."""
+    import onnx
+    from onnx import numpy_helper
+    fp, fields = export_fingerprint(net, packing, opset, make_portable)
+    rnd, cod = _weights_like(net, 'random'), _weights_like(net, 'coded')
+    cpath = f'{path}.coded.{os.getpid()}.onnx'
+    try:
+        export(rnd, path, packing, None, opset, make_portable)
+        export(cod, cpath, packing, None, opset, make_portable)
+        a, b = onnx.load(path), onnx.load(cpath)
+    finally:
+        if os.path.exists(cpath):
+            os.remove(cpath)
+    if _without_data(a).SerializeToString() != _without_data(b).SerializeToString():
+        raise ValueError(f'weight-swap template: the graph depends on the weights\' values ({len(a.graph.node)} vs '
+                         f'{len(b.graph.node)} nodes, {len(a.graph.initializer)} vs {len(b.graph.initializer)} '
+                         f'initializers, random vs coded weights): no template')
+    ma, mb = _export_module(rnd, packing)[0], _export_module(cod, packing)[0]
+    ta, tb = module_tensors(ma), module_tensors(mb)
+    sa = np.concatenate([t.numpy().ravel() for _, t in _weight_sources(ma)])
+    weights, consts, bad, recipes = [], [], [], {}
+    for ia, ib in zip(a.graph.initializer, b.graph.initializer):
+        if ia.SerializeToString() == ib.SerializeToString():
+            if ia.name in ta:
+                if not _init_is(ia, ta[ia.name]):
+                    bad.append(f'{ia.name} (a constant named as a module tensor it is not)')
+                consts.append(ia.name)
+            continue
+        if ia.name in ta and ia.name in tb and _init_is(ia, ta[ia.name]) and _init_is(ib, tb[ia.name]):
+            weights.append(ia.name)
+            continue
+        A, B = numpy_helper.to_array(ia), numpy_helper.to_array(ib)
+        if A.dtype != np.float32 or B.shape != A.shape:
+            bad.append(f'{ia.name} ({A.dtype} {list(A.shape)})')
+            continue
+        same = (_bits(A) == _bits(B)).all(-1)
+        c = B[~same].astype(np.float64)
+        idx = np.full(A.shape, -1, np.int64)
+        if not (np.all(c == np.floor(c)) and np.all(c >= _CODE_BASE) and np.all(c < _CODE_BASE + sa.size)):
+            bad.append(f'{ia.name} ({A.dtype} {list(A.shape)}: not elements of the weights)')
+            continue
+        idx[~same] = (c - _CODE_BASE).astype(np.int64)
+        if not np.array_equal(_bits(sa[idx[~same]]), _bits(A[~same])):
+            bad.append(f'{ia.name} ({A.dtype} {list(A.shape)}: the pick does not give the random export\'s values)')
+            continue
+        recipes[ia.name] = idx
+    if bad:
+        raise ValueError(f'weight-swap template: {len(bad)} initializer(s) the weights change that a swap cannot '
+                         f'rebuild, no template: ' + '; '.join(bad[:8]))
+    if not weights and not recipes:
+        raise ValueError('weight-swap template: no initializer depends on the weights')
+    rpath = f'{path}.recipes.npz'
+    tmp = f'{rpath}.{os.getpid()}.tmp'
+    with open(tmp, 'wb') as f:
+        np.savez(f, **{f'r{k}': v for k, v in enumerate(recipes.values())})
+    os.replace(tmp, rpath)
+    return {'template': TEMPLATE, 'fingerprint': fp, 'fields': fields, 'weights': weights,
+            'derived': list(recipes), 'constants': consts,
+            'sources': [[k, list(t.shape)] for k, t in _weight_sources(ma)], 'sha256': file_sha256(path),
+            'recipes_sha256': file_sha256(rpath)}
+
+
+def swap_export(net, template_path, template, path, packing='packed', extra=None, opset=OPSET, make_portable=True):
+    """`net` written to `path` from a weight-swap template (`export_template`: the template's graph `template_path`, its
+    recipes beside it, its description `template`; docs/az.md 53): each weight initializer replaced by `net`'s module
+    tensor of its name, each derived one rebuilt by its recipe from `net`'s weights, the metadata `net`'s and `extra`'s
+    (as `export` writes it), then checked (`check_swapped`) -> the metadata. Refused (ValueError, nothing written) when
+    `net`'s fingerprint is not the template's, a template file is not the template's (sha256), a weight has no tensor of
+    its name or another dtype or shape, or a module tensor the template holds constant changed."""
+    import onnx
+    if template.get('template') != TEMPLATE:
+        raise ValueError(f'weight-swap template format {template.get("template")}, this zero-core reads {TEMPLATE}')
+    fp, _ = export_fingerprint(net, packing, opset, make_portable)
+    if fp != template['fingerprint']:
+        raise ValueError(f'weight-swap: the network\'s fingerprint {fp[:16]} is not the template\'s '
+                         f'{template["fingerprint"][:16]} (another architecture or exporter: a new template)')
+    rpath = f'{template_path}.recipes.npz'
+    if file_sha256(template_path) != template['sha256'] or file_sha256(rpath) != template['recipes_sha256']:
+        raise ValueError(f'weight-swap: {template_path} or its recipes are not the template\'s (sha256)')
+    mod, _a, _n, _o, _d, meta_of = _export_module(net, packing)
+    ts = module_tensors(mod)
+    src = _weight_sources(mod)
+    if [[k, list(t.shape)] for k, t in src] != template['sources']:
+        raise ValueError('weight-swap: the network\'s weights are not the template\'s (names or shapes)')
+    model = onnx.load(template_path)
+    inits = {i.name: i for i in model.graph.initializer}
+    want = list(template['weights'])
+    bad = [f'{k} (no initializer)' for k in want + template['derived'] if k not in inits]
+    bad += [f'{k} (no tensor)' for k in want if k not in ts]
+    for k in want:
+        if k in inits and k in ts:
+            i, a = inits[k], np.ascontiguousarray(ts[k].cpu().numpy())
+            dt = onnx.helper.tensor_dtype_to_np_dtype(i.data_type)
+            if dt != a.dtype or list(i.dims) != list(a.shape) or not i.HasField('raw_data'):
+                bad.append(f'{k} ({a.dtype} {list(a.shape)}, the graph\'s {dt} {list(i.dims)})')
+            else:
+                i.raw_data = a.tobytes()
+    if template['derived']:
+        flat = np.concatenate([t.cpu().numpy().astype(np.float32, copy=False).ravel() for _, t in src])
+        with np.load(rpath) as z:
+            for n, k in enumerate(template['derived']):
+                if k not in inits:
+                    continue
+                i, idx = inits[k], z[f'r{n}']
+                if onnx.helper.tensor_dtype_to_np_dtype(i.data_type) != np.float32 or list(i.dims) != list(idx.shape) \
+                        or not i.HasField('raw_data') or idx.max(initial=-1) >= flat.size:
+                    bad.append(f'{k} (its recipe does not fit the graph)')
+                    continue
+                a = np.frombuffer(i.raw_data, np.float32).reshape(idx.shape).copy()
+                a[idx >= 0] = flat[idx[idx >= 0]]
+                i.raw_data = a.tobytes()
+    for k in template['constants']:
+        if k not in inits or k not in ts or not _init_is(inits[k], ts[k]):
+            bad.append(f'{k} (held constant by the template, changed)')
+    if bad:
+        raise ValueError(f'weight-swap: {len(bad)} tensor(s) do not match the template: ' + '; '.join(bad[:8]))
+    meta = meta_of(extra)
+    meta['opset'] = str(opset)
+    if make_portable:
+        meta['portable'] = '1'
+    _write_metadata(model, meta)
+    check_swapped(model, opset, make_portable)
+    _write_model(model, path)
+    return meta
+
+
+def check_swapped(model, opset=OPSET, make_portable=True):
+    """The graph checks of a swapped graph (docs/az.md 53): `portable` (on a copy) finds nothing left to rewrite (every
+    GPU-safe form in place), `int32_slices` nothing to replace, `check_int32` passes (no integer constant outside int32,
+    no BitShift), the opset is `opset`, and onnx.checker's full check (strict shape inference) passes -> `portable`'s
+    stats (all 0). ValueError otherwise."""
+    import onnx
+    m = onnx.ModelProto()
+    m.CopyFrom(model)
+    stats = portable(m) if make_portable else {}
+    if any(stats.values()):
+        raise ValueError(f'swapped graph: portable would still rewrite {stats}')
+    if int32_slices(m):
+        raise ValueError('swapped graph: a Slice bound outside int32')
+    check_int32(m)
+    ver = {o.domain or 'ai.onnx': o.version for o in model.opset_import}
+    if ver.get('ai.onnx') != int(opset):
+        raise ValueError(f'swapped graph: opset {ver.get("ai.onnx")}, not {opset}')
+    onnx.checker.check_model(model, full_check=True)
+    return stats
 
 
 REFERENCE_TOL = 2e-5
@@ -1493,11 +1784,20 @@ def reference_rows(rows_list, n):
 def write_reference(net, rows_list, out, n=256, info=None, tol=REFERENCE_TOL):
     """The reference set of `net` (module docs) from recorded batch files -> its metadata. Every belief
     row gets the auxiliary answer; a network with an auxiliary head needs belief rows among the `n`."""
+    rows, bo = reference_rows(rows_list, n)
+    return write_reference_rows(net, rows, bo, out, info, tol)
+
+
+def write_reference_rows(net, rows, bo, out, info=None, tol=REFERENCE_TOL):
+    """`write_reference` on rows already taken (`reference_rows`: the rows and their batches `bo`) -> its metadata: the
+    reference set of `net` on those positions, torch's answers batch by batch. The farm pool keeps a run's positions
+    and answers each new checkpoint on them (docs/az.md 53): any network of the architecture answers any rows of its
+    encoding, so positions recorded with an older checkpoint are as valid a self-test as new ones."""
     import numpy as np
     from .infer import NetEvaluator
     from .onnx_parity import eager_answer
     from .protocol import ROW_BELIEF, ROW_VALUE
-    rows, bo = reference_rows(rows_list, n)
+    n = int(rows.B)
     net = copy.deepcopy(net).float().cpu().eval()
     layout = [list(t) for t in (getattr(net, 'aux_layout', None) or [])]
     n_belief = int((rows.extra == ROW_BELIEF).sum())

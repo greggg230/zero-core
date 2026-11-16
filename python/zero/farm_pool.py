@@ -6,7 +6,8 @@ run process (`Pool`, owned by zero.remoteplay.RemotePlay) that
 
 1. **publishes** checkpoint it - 1 when iteration it's self-play begins (RemotePlay.begin, right after the
    checkpoint is written): the checkpoint exported to zero-onnx/1 (or /2, docs/az.md 46) with its reference set
-   (zero.onnx_export, checked through onnxruntime) under `<run>/pool/<farm run>/ckpt/<gen>/`, uploaded
+   (zero.onnx_export, checked through onnxruntime; by weight swap into the architecture's template, on the run's kept
+   reference positions: zero.farm_h2h.export_cached, docs/az.md 53) under `<run>/pool/<farm run>/ckpt/<gen>/`, uploaded
    (`ckpt/<farm run>/<gen>/...`), a NEW signed definition version (zero.farm_def: the worker build and its
    alternates' builds, its runtime, the gen and up to `pool_max_stale` gens before it, the self-play template
    {settings: the worker build's own `check-config` play settings}) published with farm-release - and only then the
@@ -144,6 +145,19 @@ def play_settings(worker, build_id, cfg, d, log=None):
         raise SystemExit('the play settings give another self-play driver than the run\'s settings:\n'
                          f'{a[2][-1500:]}\n---\n{b[2][-1500:]}')
     return play
+
+
+def export_breakdown(ex):
+    """The "gen N exported" line's per-step timing (docs/az.md 53): ': load 0.1 s, swap 0.4 s, reference 0.5 s, check
+    1.2 s (graph by weight swap; reference positions of gen 12)' from an exporter's `steps`, `graph` and `positions`;
+    '' without steps (an exporter that reports none)."""
+    st = ex.get('steps') or {}
+    if not st:
+        return ''
+    how = {'template': "the architecture's template built first", 'swap': 'graph by weight swap'}.get(ex.get('graph'))
+    tail = '; '.join(x for x in (how, None if ex.get('positions') is None else
+                                 f'reference positions of gen {ex["positions"]}') if x)
+    return ': ' + ', '.join(f'{k} {v:g} s' for k, v in st.items()) + (f' ({tail})' if tail else '')
 
 
 class Pool:
@@ -344,12 +358,12 @@ class Pool:
 
     # ---- publishing
     def _export(self, ckpt, gen, out_dir):
+        """Gen `gen`'s graph and reference set (zero.farm_h2h.export_cached, docs/az.md 53: the architecture's
+        weight-swap template under <pool>/export/, the run's reference positions kept there)."""
         from . import games as G
-        from .farm_h2h import export, record_rows
-        from .onnx_export import load_checkpoint
-        m, _ = load_checkpoint(ckpt, self.R.cfg['game'])
-        rows = record_rows(m, self.R.cfg['game'], G.spec_json(self.R.cfg['spec']))
-        return export(ckpt, gen, out_dir, self.R.cfg['game'], [rows], f'{self.farm}/{gen}', checkpoint_iter=gen)
+        from .farm_h2h import export_cached
+        return export_cached(ckpt, gen, out_dir, self.R.cfg['game'], G.spec_json(self.R.cfg['spec']),
+                             os.path.join(self.dir, 'export'), f'{self.farm}/{gen}', checkpoint_iter=gen)
 
     def _define(self, client, info):
         return FD.publish(client, info, key=self.key, farm_release=self.farm_release, log=self.log)
@@ -423,8 +437,10 @@ class Pool:
             ex = self.exporter(ckpt, gen, os.path.join(self.dir, 'ckpt', str(gen)))
             g.update({k: ex[k] for k in ('model', 'sha256', 'model_size', 'reference', 'reference_sha256', 'reference_size')})
             g['export_s'] = round(time.time() - t0, 1)
+            if ex.get('steps'):
+                g['export_steps'] = ex['steps']
             self._save()
-            self.log(f'gen {gen} exported ({g["export_s"]} s, {g["sha256"][:12]})')
+            self.log(f'gen {gen} exported ({g["export_s"]} s, {g["sha256"][:12]}){export_breakdown(ex)}')
         keys = {'model': f'ckpt/{self.farm}/{gen}/model.onnx', 'reference': f'ckpt/{self.farm}/{gen}/reference.npz'}
         if not g.get('uploaded'):
             self.client.put_artifact(keys['model'], g['model'], g['sha256'])

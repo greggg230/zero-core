@@ -7742,3 +7742,85 @@ iteration 2 a phase spec: gen 1's definition template plays it, its records acce
 an unknown spec refused, the hook asked once per iteration), `::test_a_remote_worker_takes_the_phase_spec` (the
 `phase` message's spec, else the run's), `test_package_hooks.py::test_remote_selfplay_follows_a_changed_spec` (was:
 refused).
+
+## 53. The farm pool's per-generation export by weight swap (`onnx_export.export_template` / `swap_export`, `farm_h2h.export_cached`; MTG Zero's pb3, 2026-11-15)
+
+**Why.** The farm pool (45) exports every new checkpoint of its run: `load_checkpoint`, `farm_h2h.record_rows` (the
+reference positions: a short self-play of the new network, ~1,490 small CPU forwards) and `farm_h2h.export` (the dynamo
+trace, onnxscript's optimizer - its rewriter alone ~50 s, 309k `try_rewrite` calls -, the GPU-safe / portable rewrites,
+the checks, reference.npz). On MTG Zero's delver-bo3-pb3 (layout v7, 8 x 128 TokenNet, zero-onnx/2) that was 96-175 s
+per gen beside the live run, the farm's leases staying on the old gen meanwhile. A run's architecture never changes
+between gens: only the weights do.
+
+**What it does** (`Pool._export` -> `farm_h2h.export_cached`; the h2h CLI's `export` is unchanged):
+
+* **The template, once per architecture** (`export_template`, cached under `<run>/pool/<farm run>/export/<fp[:16]>/`
+  as `template.onnx`, `template.onnx.recipes.npz`, `template.json`). The key is `export_fingerprint`: the network's
+  class and config, the interface module (ZeroOnnx / ZeroOnnx2), the packing, every module tensor's name, shape and
+  dtype, the opset and `portable`, the exporter's versions (torch, onnx, onnxscript, onnx-ir), the sha256 of this
+  zero-core's `zero/*.py` and `TEMPLATE`. The architecture is exported twice with `export` itself - random weights
+  (N(0, 0.5^2): no exact 0 or 1) and coded weights (element i of the network's float state = 2^22 + i) - and the two
+  graphs must be the same graph but for the initializers' data and the model metadata (the metadata's `gates` holds the
+  gates' values; a swap writes its own network's metadata). Each initializer is then classified: the same bytes in both
+  = a constant (shapes, aranges, the layout's tables: `v_width`, `net.tok_cols`, ...); exactly a module tensor of its
+  name in both = a **weight** (the network's parameters, and the buffers ZeroOnnx2 computes from them at construction:
+  `v_tW`, `v_tb`, `v_tP`, `v_g`); a float initializer whose changed elements are codes = a **derived** weight (a slice,
+  transpose or concatenation of weights the optimizer folded: on pb3 the pointer head's parts `slice_158..161` and 11
+  folded `val_*`), kept as an index recipe that must reproduce the random export's values exactly. Anything else (an
+  initializer computed from the weights by arithmetic) raises: no template, the export fails loudly.
+* **Every gen: the swap** (`swap_export`): refused unless the network's fingerprint is the template's and the template
+  files are the ones described (sha256); each weight replaced by the network's module tensor of its name (dtype and
+  shape checked, else refused), each derived one rebuilt by its recipe, every module tensor the template holds constant
+  checked unchanged, the metadata written as `export` writes it (`metadata2` / `metadata` with the checkpoint's
+  `extra`, `opset`, `portable`), then `check_swapped`: `portable` on a copy rewrites nothing (every GPU-safe form in
+  place), `int32_slices` replaces nothing, `check_int32` (zero-onnx/2's int32 rule), the opset, onnx.checker's full
+  check. Then `check_reference` against torch within `REFERENCE_TOL` as before (nothing published otherwise).
+* **Invalidation, not fallback.** A changed fingerprint (another layout - a widen -, network size, export setting,
+  exporter version, a re-pin to another zero-core) names another cache directory: a new template is built there. A
+  swap that fails raises; there is no "full export instead" path.
+* **The reference positions, once per architecture and spec** (`positions-<sha256(spec)[:12]>.npz` + `.json` beside
+  the template: the first gen's reference.npz and its provenance): `record_rows` + `reference_rows` run only when they
+  are missing; every gen writes its own answers on them (`write_reference_rows`: `write_reference` without the row
+  selection - torch's eager answers batch by batch as recorded, what a run's workers answer; 0.4 s on pb3). The
+  reference.npz is the one of before: the same arrays, dtypes and meta keys (`sources` 'farm_h2h'; `checkpoint`,
+  `checkpoint_sha256`, `checkpoint_iter` the new gen's, so the worker's `check_meta` still matches its graph). Positions
+  recorded with an older gen are as valid a self-test: the worker answers the rows through the new graph and compares
+  with the new network's torch answers; the rows only need the kinds the architecture takes (belief rows with an
+  auxiliary head, tail tokens, overrides), which `write_reference_rows` checks every gen as before, and the fingerprint
+  fixes the architecture. No zero-onnx contract, metadata key or reference array changed: agents and workers need no
+  change.
+* **The log line** names each step: `gen 17 exported (2.2 s, ffe2cc54ea77): load 0.11 s, swap 0.39 s, reference 0.43 s,
+  check 1.24 s (graph by weight swap; reference positions of gen 15)` (`farm_pool.export_breakdown`); state.json keeps
+  them as `export_steps`.
+
+**What a published graph is now.** The template's graph is the one the exporter writes for a network whose values
+trigger none of its value-dependent rewrites. onnxscript's optimizer has such rewrites: a Gemm whose bias is all zeros
+loses its bias input. pb3's pointer head has a part of one column (a widened pointer column, all zeros in every gen so
+far), so its fresh exports drop that Gemm's bias; its swapped graphs keep it (`slice_161` = [0.0]). Compared on pb3's
+gens 14, 16 and 17 (each against a fresh `export` of the same checkpoint): the same metadata, every common initializer
+byte for byte, the same 2,136 nodes but that Gemm's third input (and 4 node names after it: the exporter's counter), and
+the raw graph outputs bit for bit identical on the gen's 256 published reference rows (x + 0 = x); `check_reference`
+gives the fresh graph's max |diff| (3.0e-6, 2.5e-6, 2.0e-6). Where no such rewrite fires (the tests' random networks),
+the swapped file is the full export's byte for byte. The refactor of `export` (`_export_module`, `_write_metadata`,
+`_write_model`) changes no byte: pb3's gen 17 exports to the same sha256 (838b36da...) before and after. The pb3 release
+worker's own self-test (`probe-providers --model --reference`, CPU) passes the swapped gen 17 (2.9e-6).
+
+**Costs.** The first gen of an architecture: two full exports (~90 s beside the live run) + the positions' self-play
+(~60-90 s) + one swap; ~10 MB per template on disk. Every later gen: ~2.2 s.
+
+**Measured** (pb3 iter_0015..0017, the live run on the same machine, 2026-11-15): before, 96-175 s per gen (a profile of
+gen 17: load 0.1 s, record_rows 58.3 s, export 92.8 s). Now: gen 15 (template built, positions recorded) 179.9 s
+(template 88.7 s, record_rows 86.0 s, swap 0.4 s, reference 0.5 s, check 1.4 s); gens 16 and 17 2.3 s and 2.2 s
+(load 0.1, swap 0.4, reference 0.4, check 1.2-1.3).
+
+**Tests.** `tests/test_farm_export.py`: `test_swap_equals_a_full_export` (a zero-onnx/2 network with tails, gates and
+overrides: the swapped file is `export`'s byte for byte, the same answers), `test_derived_weights_and_a_value_dependent_rewrite`
+(a pointer head in parts: the folded slices rebuilt by recipe; a part with an all-zero bias: the general graph answers
+bit for bit as the full export's, within the reference tolerance), `test_fingerprint_invalidation` (other weights: the
+same fingerprint; another size, opset, exporter version or zero-core Python: another; a swap onto the old template
+refused, nothing written), `test_refusal_on_mismatched_tensors` (a weight without its tensor, other weight sources, a
+wrong template file or format, a constant module tensor changed: refused, nothing written), `test_reference_reuse`
+(toy_tail checkpoints through `export_cached`: the first builds the template and records the positions, the second
+swaps and answers the same positions without a self-play - the same row arrays, its own checkpoint in the meta, within
+the tolerance -, the kept positions answered by the first network give the first reference set exactly, another
+architecture gets a template of its own).

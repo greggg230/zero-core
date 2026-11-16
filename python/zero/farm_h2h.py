@@ -209,6 +209,96 @@ def export(ckpt, gen, out_dir, game, rows_list, ckpt_id, threads=4, checkpoint_i
             'checkpoint': os.path.abspath(ckpt), 'checkpoint_sha256': info['checkpoint_sha256']}
 
 
+def _write_json(path, obj):
+    tmp = f'{path}.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+
+
+def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, threads=4, checkpoint_iter=None, n=256):
+    """`export`'s files for the farm pool's every new checkpoint of a run, fast (docs/az.md 53): `ckpt` ->
+    <out_dir>/model.onnx + reference.npz -> `export`'s dict plus `steps` (seconds per step: load, template, swap,
+    record_rows, reference, check), `graph` ('template': this checkpoint built the architecture's template first,
+    'swap') and `positions` (the gen whose self-play recorded the reference positions).
+
+    * The graph: the architecture's weight-swap template (zero.onnx_export.export_template: the full export, once per
+      architecture fingerprint) under `<cache_dir>/<fingerprint[:16]>/`, the checkpoint's weights swapped in
+      (`swap_export`, which checks the graph as an export is checked). A new fingerprint (another layout, network, export
+      setting, exporter version or zero-core) is a new template, never a fallback: a swap that fails raises.
+    * The reference set: its positions (`n` rows of whole batches of a short self-play, `record_rows` + `reference_rows`)
+      recorded once per architecture and the run's spec (`positions-<spec sha256[:12]>.npz` beside the template: the
+      first reference set written there), each checkpoint's torch answers written on them (`write_reference_rows`) - the
+      reference.npz of before, the same arrays and meta.
+    * The check of before: the graph through onnxruntime against the reference set, within REFERENCE_TOL, else nothing
+      is published."""
+    import shutil
+    from .onnx_export import (REFERENCE_TOL, check_reference, export_fingerprint, export_template, load_checkpoint,
+                              load_reference, reference_rows, swap_export, write_reference_rows)
+    steps = {}
+
+    def lap(k, t0):
+        steps[k] = round(time.time() - t0, 2)
+        return time.time()
+    t = time.time()
+    os.makedirs(out_dir, exist_ok=True)
+    m, info = load_checkpoint(ckpt, game)
+    info['checkpoint'] = ckpt_id
+    if checkpoint_iter is not None:
+        info['checkpoint_iter'] = str(int(checkpoint_iter))
+    model = os.path.join(out_dir, 'model.onnx')
+    ref = os.path.join(out_dir, 'reference.npz')
+    fp, _ = export_fingerprint(m)
+    d = os.path.join(cache_dir, fp[:16])
+    os.makedirs(d, exist_ok=True)
+    tpl, tj = os.path.join(d, 'template.onnx'), os.path.join(d, 'template.json')
+    t = lap('load', t)
+    if os.path.exists(tj):
+        with open(tj, encoding='utf-8') as f:
+            template = json.load(f)
+        if template.get('fingerprint') != fp:
+            raise ValueError(f'{tj}: the template of fingerprint {str(template.get("fingerprint"))[:16]}, not {fp[:16]}')
+        graph = 'swap'
+    else:
+        template = export_template(m, tpl)
+        template['made_from'] = {'gen': gen, 'checkpoint': ckpt_id}
+        _write_json(tj, template)
+        graph = 'template'
+        t = lap('template', t)
+    swap_export(m, tpl, template, model, 'packed', info)
+    t = lap('swap', t)
+    sk = hashlib.sha256(str(spec).encode()).hexdigest()
+    pos, pj = os.path.join(d, f'positions-{sk[:12]}.npz'), os.path.join(d, f'positions-{sk[:12]}.json')
+    made = None
+    if os.path.exists(pj):
+        with open(pj, encoding='utf-8') as f:
+            pinfo = json.load(f)
+        if pinfo.get('spec_sha256') != sk:
+            raise ValueError(f'{pj}: positions of spec {str(pinfo.get("spec_sha256"))[:12]}, not {sk[:12]}')
+        rows, bo, _w, pm = load_reference(pos)
+        rows.source = pm['sources']
+    else:
+        rows, bo = reference_rows([record_rows(m, game, spec)], n)
+        pinfo = made = {'gen': gen, 'checkpoint': ckpt_id, 'spec_sha256': sk, 'rows': int(rows.B)}
+        t = lap('record_rows', t)
+    write_reference_rows(m, rows, bo, ref, info)
+    t = lap('reference', t)
+    chk = check_reference(model, ref, threads)
+    t = lap('check', t)
+    if not chk['max_abs'] <= REFERENCE_TOL:
+        raise SystemExit(f'gen {gen} ({ckpt}): the graph differs from torch by {chk["max_abs"]:g} on its reference '
+                         f'set (> {REFERENCE_TOL:g}): not published')
+    if made is not None:
+        tmp = f'{pos}.{os.getpid()}.tmp'
+        shutil.copyfile(ref, tmp)
+        os.replace(tmp, pos)
+        _write_json(pj, made)
+    return {'model': model, 'sha256': file_sha256(model), 'model_size': os.path.getsize(model), 'reference': ref,
+            'reference_sha256': file_sha256(ref), 'reference_size': os.path.getsize(ref), 'check': chk,
+            'checkpoint': os.path.abspath(ckpt), 'checkpoint_sha256': info['checkpoint_sha256'], 'steps': steps,
+            'graph': graph, 'positions': pinfo['gen']}
+
+
 # ---------------------------------------------------------------- state
 
 def state_dir(a, run):
