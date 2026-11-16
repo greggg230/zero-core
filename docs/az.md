@@ -7793,6 +7793,18 @@ between gens: only the weights do.
   check 1.24 s (graph by weight swap; reference positions of gen 15)` (`farm_pool.export_breakdown`); state.json keeps
   them as `export_steps`.
 
+**A behaviour change, called out: `record_rows` gives ZERO_INFLIGHT back.** `record_rows` drives its recording with
+`ZERO_INFLIGHT=1` (one network batch at a time) and used to leave it set in `os.environ` for the rest of the process.
+In a run with a farm pool that is the run process: from its first export on (gen 0, minutes into iteration 1), the
+run's own `drive` - its local self-play - went one batch at a time instead of the documented two in flight, and every
+subprocess it started inherited it (MTG Zero's pb3 run process holds ZERO_INFLIGHT=1, read from its environment block
+on 2026-11-15). With the positions kept, `record_rows` runs once per architecture, so the leak would have come and gone
+with the cache: it now restores the previous value (unset: removed) when its self-play ends. A run with a farm pool
+therefore drives its self-play two batches in flight again - the default, what every run without a pool does; a run that
+wants the one-at-a-time behaviour it had sets `ZERO_INFLIGHT=1` in its environment. (In the zero-core test session the
+leak, from `test_farm_h2h`'s end-to-end head-to-head, made `test_shard_thread::test_rolling_run_quotas_exact`'s run
+finish 97 games for a quota of 96 - deterministically, as `ZERO_INFLIGHT=1` alone does.)
+
 **What a published graph is now.** The template's graph is the one the exporter writes for a network whose values
 trigger none of its value-dependent rewrites. onnxscript's optimizer has such rewrites: a Gemm whose bias is all zeros
 loses its bias input. pb3's pointer head has a part of one column (a widened pointer column, all zeros in every gen so
@@ -7820,7 +7832,7 @@ bit for bit as the full export's, within the reference tolerance), `test_fingerp
 same fingerprint; another size, opset, exporter version or zero-core Python: another; a swap onto the old template
 refused, nothing written), `test_refusal_on_mismatched_tensors` (a weight without its tensor, other weight sources, a
 wrong template file or format, a constant module tensor changed: refused, nothing written), `test_reference_reuse`
-(toy_tail checkpoints through `export_cached`: the first builds the template and records the positions, the second
+(toy_tail checkpoints through `export_cached`: the first builds the template and records the positions - ZERO_INFLIGHT given back -, the second
 swaps and answers the same positions without a self-play - the same row arrays, its own checkpoint in the meta, within
 the tolerance -, the kept positions answered by the first network give the first reference set exactly, another
 architecture gets a template of its own).

@@ -161,9 +161,7 @@ def test_reference_reuse(tmp_path, monkeypatch):
     before (the same arrays, its own checkpoint in the meta), within the tolerance of its graph; answering the kept
     positions with the first network gives the first reference set's answers exactly (the positions round-trip); a
     network of another architecture gets a template of its own."""
-    # (record_rows sets ZERO_INFLIGHT=1 for its self-play and leaves it set: restored after this test, or the later
-    # tests' run processes inherit it - test_shard_thread's rolling quotas and test_remoteplay's did)
-    monkeypatch.setenv('ZERO_INFLIGHT', os.environ.get('ZERO_INFLIGHT', '2'))
+    monkeypatch.delenv('ZERO_INFLIGHT', raising=False)
     cache = str(tmp_path / 'export')
     ck = []
     for s in (1, 2):
@@ -173,6 +171,9 @@ def test_reference_reuse(tmp_path, monkeypatch):
     a = FH.export_cached(ck[0], 1, str(tmp_path / 'ckpt' / '1'), GAME, SPEC, cache, 'farm/1', threads=1,
                          checkpoint_iter=1, n=64)
     assert a['graph'] == 'template' and a['positions'] == 1
+    # record_rows drove its self-play one batch at a time and gave the process its setting back (before, ZERO_INFLIGHT=1
+    # stayed set: the run's own self-play, and later tests' run processes, went one batch at a time)
+    assert 'ZERO_INFLIGHT' not in os.environ
     assert set(a['steps']) == {'load', 'template', 'swap', 'record_rows', 'reference', 'check'}
     calls = []
     with monkeypatch.context() as mp:
