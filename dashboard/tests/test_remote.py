@@ -19,7 +19,7 @@ from zerodash.remote import RemoteRun, SshError, SshRunner, parse_etime, parse_p
 
 SH = posix_shell()
 needs_sh = pytest.mark.skipif(SH is None, reason='no POSIX sh to stand in for the remote shell')
-MAC = 'greggkeithley@100.95.248.116'
+MAC = 'user@mac'
 
 
 class ShellSsh:
@@ -84,7 +84,7 @@ def test_ssh_runner_without_ssh(monkeypatch):
 def test_quoting():
     assert qpath('~/stpete-zero/runs/az6_cq') == '"$HOME"/stpete-zero/runs/az6_cq'
     assert qpath("~/my runs/it's") == '"$HOME"/\'my runs/it\'"\'"\'s\''
-    assert qpath('/Users/g/x y') == "'/Users/g/x y'"
+    assert qpath('/Users/user/x y') == "'/Users/user/x y'"
     assert qpath('~') == '"$HOME"'
 
 
@@ -119,7 +119,7 @@ def test_unreachable_host_falls_back_to_the_mirror(fx, tmp_path):
     mirror = fx.dir('glassroad', 'grz2p_cq')          # has a PAUSE
     cfg = remote_cfg(fx, mirror)
     ssh = ShellSsh(str(tmp_path))
-    ssh.fail = 'ssh: connect to host 100.95.248.116 port 22: Operation timed out'
+    ssh.fail = 'ssh: connect to host 192.0.2.10 port 22: Operation timed out'
     d = fx.dash(cfg=cfg, ssh=ssh)
     for rr in d.remote.values():
         rr.refresh()
@@ -188,10 +188,10 @@ def test_remote_pause_resume_over_ssh(fx, tmp_path):
     ssh = ShellSsh(home, alive={145772: 1791820497.7519355, 150264: 1791820497.9998765}, now=fx.now)
     d = fx.dash(cfg=remote_cfg(fx, mirror), ssh=ssh)
     d.remote[('stpete', 'az6_cq@mac')].refresh()
-    res = d.pause('stpete', 'az6_cq@mac', by='zerodash 100.64.0.7')
+    res = d.pause('stpete', 'az6_cq@mac', by='zerodash 192.0.2.7')
     assert res['changed'] and res['run']['state'] == 'pausing'
     with open(os.path.join(rdir, 'PAUSE'), encoding='utf-8') as f:
-        assert json.load(f) == {'time': fx.now, 'by': 'zerodash 100.64.0.7'}
+        assert json.load(f) == {'time': fx.now, 'by': 'zerodash 192.0.2.7'}
     assert not os.path.exists(os.path.join(mirror, 'PAUSE'))          # written on the host only
     assert not [f for f in os.listdir(rdir) if 'tmp' in f]
     assert not d.pause('stpete', 'az6_cq@mac', by='zerodash other')['changed']   # an existing PAUSE stays

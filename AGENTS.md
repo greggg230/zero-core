@@ -51,6 +51,24 @@ Bash on Windows. Every script is bash.
 7. **Never touch a live run.** Runs train from their own pinned worktrees. Don't edit, delete or
    resume anything under someone's `runs/` unless you were asked to. `runs/` is gitignored.
 
+## Private details: never in the repo
+
+This repo is public (MIT), and so is mtg-zero. **Nothing tied to a person's machines is committed**, in code,
+tests, fixtures, data, docs or commit messages: no farm machines (friends' PC names or handles, machine ids `m_...`,
+their CPUs/GPUs, per-machine game counts), no host names (the desktop's, the Mac's), no IP or Tailscale addresses or
+MagicDNS names, no ssh targets, no home-directory paths with a user name (`C:/Users/<name>`, `/Users/<name>`). Write
+"a farm PC", "PC A", "the Mac", `C:/Users/<user>/...` or `~/...` instead; machine-specific notes belong in the
+maintainer's private notes. A machine's own settings live in the untracked `~/.config/zero/local.env`
+(`zero.local_config`, `tools/local_env.sh`; template `tools/local.env.example`): `ZERO_BIG_DISK`, `MTGZ_MAC`, ...;
+zerodash reads `~/.config/zero/projects.json` (template `dashboard/projects.example.json`). Paths recorded into
+committed files go through `zero.local_config.portable_path` (home as `~`).
+
+`python tools/privacy_check.py` scans every tracked file for these (a committed generic set: tailnet IPs and names,
+farm machine ids, home paths with a user name, default PC host names, `user@<IP>`; plus the machine's own untracked
+patterns in `~/.config/zero/privacy_patterns.txt`, which hold the real names and are never committed). It runs in
+the test suite (`tests/test_privacy.py`); a finding fails it. Fix the file, never the pattern. Test data uses
+placeholders (`user@mac`, `192.0.2.x`, `/Users/user`).
+
 ## Documenting a change
 
 The docs are a lab notebook, and each feature gets a numbered, dated section:
@@ -70,8 +88,9 @@ digests). An agent's commit ends with its own `Co-Authored-By:` trailer.
 
 * **One `CARGO_TARGET_DIR` per checkout.** Two checkouts sharing a target dir can silently reuse
   each other's build (cargo's dep-info paths are workspace-relative), so a worktree "tests" code
-  it doesn't contain. `tools/build_py.sh` defaults to `E:/cargo-target/zero-core/<branch>` on
-  Windows (the maintainer's machine) and to `<repo>/target` elsewhere. Set it explicitly.
+  it doesn't contain. `tools/build_py.sh` defaults to `$ZERO_BIG_DISK/cargo-target/zero-core/<branch>` on
+  Windows when the machine names a big disk (`~/.config/zero/local.env`) and to `<repo>/target` otherwise. Set it
+  explicitly.
 * **Windows locks a loaded `.pyd`.** `build_engine.sh` moves the old one aside (`*.old`) if a
   running process holds it. Processes started earlier keep the old build.
 * **`docs/` mention the maintainer's setup**: the desktop, the E: drive, a MacBook remote

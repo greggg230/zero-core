@@ -147,8 +147,8 @@ def test_fit_fixed_is_fit_with_one_fixed_and_recovers_ratings():
 
 def test_parse_anchors():
     assert elo.parse_anchors('') == [] and elo.parse_anchors(None) == []
-    got = elo.parse_anchors('E:/x/r/models/iter_0192.pt, b160=C:/Users/G K/a.pt')
-    assert got == [('iter_0192', 'E:/x/r/models/iter_0192.pt'), ('b160', 'C:/Users/G K/a.pt')]
+    got = elo.parse_anchors('E:/x/r/models/iter_0192.pt, b160=C:/Users/user/my runs/a.pt')
+    assert got == [('iter_0192', 'E:/x/r/models/iter_0192.pt'), ('b160', 'C:/Users/user/my runs/a.pt')]
     assert elo.parse_anchors(['a=x.pt', 'y.pt']) == [('a', 'x.pt'), ('y', 'y.pt')]
     with pytest.raises(ValueError):
         elo.parse_anchors('a=x.pt,a=y.pt')

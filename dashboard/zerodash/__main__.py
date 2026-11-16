@@ -5,12 +5,13 @@ Binds 0.0.0.0 by default (reached over Tailscale; hub id zero_dash, port 5200).
 snapshot) with fixtures/../projects.fixtures.json: the controls act on the copy.
 """
 import argparse
+import os
 import atexit
 import shutil
 import sys
 import tempfile
 
-from . import DEFAULT_CONFIG, config, fixtures
+from . import DEFAULT_CONFIG, EXAMPLE_CONFIG, config, fixtures
 from .app import create_app
 from .machine import Machine
 from .model import Dashboard
@@ -21,7 +22,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog='python -m zerodash', description='Cross-game Zero dashboard')
     ap.add_argument('--host', default='0.0.0.0')
     ap.add_argument('--port', type=int, default=5200)
-    ap.add_argument('--config', default=None, help=f'projects.json (default: {DEFAULT_CONFIG})')
+    ap.add_argument('--config', default=None, help=f'projects.json (default: $ZERODASH_CONFIG, else {DEFAULT_CONFIG}; '
+                    f'format: {EXAMPLE_CONFIG})')
     ap.add_argument('--fixtures', action='store_true', help='serve a copy of the fixtures snapshot')
     ap.add_argument('--no-machine', action='store_true', help='no machine strip (nvidia-smi, ssh uptime)')
     a = ap.parse_args(argv)
@@ -39,7 +41,11 @@ def main(argv=None):
         liveness = fixtures.liveness(snap)
         print(f'zerodash: fixtures snapshot copied to {tmp}')
     else:
-        cfg = config.load(a.config or DEFAULT_CONFIG)
+        path = a.config or DEFAULT_CONFIG
+        if not os.path.isfile(path):
+            raise SystemExit(f'zerodash: no projects file at {path}: copy {EXAMPLE_CONFIG} there (or set '
+                             f'ZERODASH_CONFIG / pass --config), or run --fixtures')
+        cfg = config.load(path)
     machine = None if a.no_machine else Machine(cfg, ssh=ssh)
     dash = Dashboard(cfg, liveness=liveness, ssh=ssh, machine=machine)
     dash.start()

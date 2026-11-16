@@ -19,8 +19,8 @@ its template (`zero.farm_h2h`'s eval job is the template itself).
 * Every definition is kept, as written and signed, in `<defs>/<kind>/<id>/<version>/definition.json` (`defs_root`:
   env ZEROFARM_DEFS_DIR, else ~/.zero-farm/definitions); its bytes are never re-serialised.
 * `farm-release define <definition.json> --key <data key> --publish --url <url>` signs, uploads and registers it
-  (`FarmRelease`; the executable: env ZEROFARM_FARM_RELEASE, else E:/cargo-target/zero-farm/main/release/
-  farm-release.exe; a `.py` path runs with this Python - the tests' stub). The admin token goes to it in the
+  (`FarmRelease`; the executable: env ZEROFARM_FARM_RELEASE, else <ZERO_BIG_DISK>/cargo-target/zero-farm/main/release/
+  farm-release.exe (zero.local_config), else farm-release on PATH; a `.py` path runs with this Python - the tests' stub). The admin token goes to it in the
   environment (ZEROFARM_ADMIN_TOKEN), never on its command line, and is never printed.
 * The data key: env ZEROFARM_DATA_KEY, else ~/.config/zero-farm/data.key. The admin token: env
   ZEROFARM_ADMIN_TOKEN, else the file ~/.config/zero-farm/admin_token.
@@ -42,8 +42,11 @@ import time
 import urllib.error
 import urllib.request
 
+from . import local_config
+
 URL = 'https://farm.greggg230.com'
-FARM_RELEASE = 'E:/cargo-target/zero-farm/main/release/farm-release.exe'
+FARM_RELEASE = local_config.big_disk_path('cargo-target/zero-farm/main/release/farm-release.exe',
+                                         default='farm-release')
 SLUG_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,62}$')
 BUILD_RE = re.compile(r'^[0-9a-f]{24}$')
 SHA_RE = re.compile(r'^[0-9a-f]{64}$')

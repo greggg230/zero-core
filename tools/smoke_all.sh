@@ -31,16 +31,18 @@
 # 29); a game not found is listed as missing in the summary. An explicit game path that does not
 # exist, or is not a game repo, fails as well.
 #
-# Env: SMOKE_DIR (scratch runs / worktrees; default E:/zero-smoke on Windows, /tmp/zero-smoke),
+# Env: SMOKE_DIR (scratch runs / worktrees; default $ZERO_BIG_DISK/zero-smoke on Windows with a big disk
+# named in ~/.config/zero/local.env, else /tmp/zero-smoke),
 # SKIP_CORE=1 (games only), SKIP_GAMES=1 (= --core-only), SMOKE_GAMES_ROOT (above), SKIP_CARGO=1,
 # SKIP_SMOKE=1, CARGO_BUILD_JOBS (default 8), PYTHON (default python), SMOKE_TARGET (the cargo
-# target dirs' last component on Windows, E:/cargo-target/<repo>/<SMOKE_TARGET>; default smoke:
+# target dirs' last component on Windows, $ZERO_BIG_DISK/cargo-target/<repo>/<SMOKE_TARGET>; default smoke:
 # give concurrent or scratch smokes their own, a target dir shared by two checkouts can silently
 # reuse the other's build).
 # Exit status: the number of failed steps (0 = green; finding no game counts as one); 2 = bad
 # arguments.
 set -uo pipefail
 CORE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$CORE/tools/local_env.sh"
 PY="${PYTHON:-python}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-8}"
 export PYTHONIOENCODING=utf-8
@@ -110,7 +112,8 @@ LOOKED=""
 for r in ${ROOTS[@]+"${ROOTS[@]}"}; do LOOKED="${LOOKED:+$LOOKED; }$r"; done
 
 case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*|Windows_NT) WIN=1; SMOKE_DIR="${SMOKE_DIR:-E:/zero-smoke}"; TBASE="E:/cargo-target" ;;
+  MINGW*|MSYS*|CYGWIN*|Windows_NT) WIN=1; SMOKE_DIR="${SMOKE_DIR:-${ZERO_BIG_DISK:+$ZERO_BIG_DISK/zero-smoke}}"
+    SMOKE_DIR="${SMOKE_DIR:-/tmp/zero-smoke}"; TBASE="${ZERO_BIG_DISK:+$ZERO_BIG_DISK/cargo-target}" ;;
   *) WIN=0; SMOKE_DIR="${SMOKE_DIR:-/tmp/zero-smoke}"; TBASE="" ;;
 esac
 CORE_SHA="$(git -C "$CORE" rev-parse --short HEAD 2>/dev/null)"

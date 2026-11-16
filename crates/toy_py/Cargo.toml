@@ -2,6 +2,7 @@
 name = "zero_toy_py"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Zero Core's own Python module zero._engine: the toy game only (the core's tests, toy runs)"
 publish = false
 

@@ -51,8 +51,8 @@ def test_state_shape(client, fx):
     assert j['now'] == fx.now and j['refresh_s'] == 15
     assert [p['id'] for p in j['projects']] == ['stpete', 'dominion', 'caverna', 'glassroad']
     links = {p['id']: p['dashboard'] for p in j['projects']}
-    assert links == {'stpete': 'http://desktop-j05412i:5230', 'dominion': 'http://desktop-j05412i:5240',
-                     'caverna': 'http://desktop-j05412i:5260', 'glassroad': 'http://desktop-j05412i:5280'}
+    assert links == {'stpete': 'http://desktop:5230', 'dominion': 'http://desktop:5240',
+                     'caverna': 'http://desktop:5260', 'glassroad': 'http://desktop:5280'}
     assert j['pause_all'] == {'ids': [], 'runs': []}
     assert j['machine']['cpu']['percent'] == 12.5
     for p in j['projects']:

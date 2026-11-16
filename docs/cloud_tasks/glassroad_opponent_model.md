@@ -1,5 +1,8 @@
 # Task: Glass Road opponent model (hand choice + hand beliefs) on zero-core
 
+> Historical: the prompt as it was given to a cloud session in October 2026, when these repos were private. Kept
+> as a record; the repos named here are not all public, and the machine-specific details have been removed.
+
 Start on `greggg230/zero-core` (+ `greggg230/glassroad-zero`) with this prompt:
 
 ---

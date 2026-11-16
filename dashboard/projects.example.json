@@ -7,14 +7,14 @@
     {"path": "C:/", "label": "C:", "warn_below_gb": 15},
     {"path": "E:/", "label": "E:"}
   ],
-  "mac": {"ssh": "greggkeithley@100.95.248.116", "label": "Mac"},
+  "mac": {"ssh": "user@mac", "label": "Mac"},
   "projects": [
     {
       "id": "stpete",
       "name": "St. Pete Zero",
-      "repo": "C:/Users/Gregg Keithley/stpete-zero",
-      "dashboard": "http://desktop-j05412i:5230",
-      "roots": ["C:/Users/Gregg Keithley/stpete-zero/runs", "E:/stpete-zero/runs"],
+      "repo": "~/stpete-zero",
+      "dashboard": "http://localhost:5230",
+      "roots": ["~/stpete-zero/runs", "E:/stpete-zero/runs"],
       "pause": "auto",
       "pause_note": "no pause (STOP only)",
       "yardstick": {"key": "eval_shrewd", "label": "Shrewd"},
@@ -23,36 +23,36 @@
     {
       "id": "dominion",
       "name": "Dominion Zero",
-      "repo": "C:/Users/Gregg Keithley/dominion-zero",
-      "dashboard": "http://desktop-j05412i:5240",
-      "roots": ["C:/Users/Gregg Keithley/dominion-zero/runs"],
+      "repo": "~/dominion-zero",
+      "dashboard": "http://localhost:5240",
+      "roots": ["~/dominion-zero/runs"],
       "pause": true,
       "yardstick": {"key": "eval_bmu", "label": "BMU"}
     },
     {
       "id": "caverna",
       "name": "Caverna Zero",
-      "repo": "C:/Users/Gregg Keithley/caverna-zero",
-      "dashboard": "http://desktop-j05412i:5260",
-      "roots": ["C:/Users/Gregg Keithley/caverna-zero/runs"],
+      "repo": "~/caverna-zero",
+      "dashboard": "http://localhost:5260",
+      "roots": ["~/caverna-zero/runs"],
       "pause": true,
       "yardstick": {"key": "eval_yard", "label": "JS bot"}
     },
     {
       "id": "glassroad",
       "name": "Glass Road Zero",
-      "repo": "C:/Users/Gregg Keithley/glassroad-zero",
-      "dashboard": "http://desktop-j05412i:5280",
-      "roots": ["C:/Users/Gregg Keithley/glassroad-zero/runs"],
+      "repo": "~/glassroad-zero",
+      "dashboard": "http://localhost:5280",
+      "roots": ["~/glassroad-zero/runs"],
       "pause": true,
       "yardstick": {"key": "eval_yard", "label": "JS bot"}
     },
     {
       "id": "kingdombuilder",
       "name": "Kingdom Builder Zero",
-      "repo": "C:/Users/Gregg Keithley/kingdombuilder-zero",
-      "dashboard": "http://desktop-j05412i:5300",
-      "roots": ["C:/Users/Gregg Keithley/kingdombuilder-zero/runs"],
+      "repo": "~/kingdombuilder-zero",
+      "dashboard": "http://localhost:5300",
+      "roots": ["~/kingdombuilder-zero/runs"],
       "pause": true,
       "yardstick": {"key": "eval_yard", "label": "JS bot"}
     }

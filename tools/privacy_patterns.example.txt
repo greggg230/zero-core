@@ -1,0 +1,10 @@
+# Extra patterns for tools/privacy_check.py, beyond its committed generic set (tailnet IPs and
+# names, farm machine ids, home-directory paths with a user name, default PC host names, user@IP).
+# Copy to ~/.config/zero/privacy_patterns.txt (or $ZERO_PRIVACY_PATTERNS) and list the real names
+# that must never reach a public repo: your surname, your machines' host names, friends' farm
+# machine names, account names. One Python regex per line, matched case-insensitively; '#'
+# comments. This file stays untracked: committing the real names as patterns would publish them.
+#
+#my-surname
+#my-desktop-hostname
+#friends_pc_name

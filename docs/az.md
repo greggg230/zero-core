@@ -4182,7 +4182,7 @@ nothing built): the games found beside the main checkout, from a worktree and fr
 worktree of its superproject, the no-game failure and `--core-only`, explicit paths - 5 passed; the worktree,
 submodule, no-game and explicit-path cases fail against the old script. On the desktop: the old script (aa10733) from `zero-core-wt/smoke-fix` and from an MTG Zero worktree's
 `third_party/zero-core`, `SKIP_CORE=1 ... --with-this-core --build-only`, printed an empty summary and GREEN
-(exit 0); the new one (7d3dbd8) finds `C:/Users/Gregg Keithley/{glassroad,caverna,kingdombuilder}-zero` from
+(exit 0); the new one (7d3dbd8) finds `C:/Users/<user>/{glassroad,caverna,kingdombuilder}-zero` from
 both, and with `SMOKE_GAMES_ROOT` pointing at a missing directory exits 1 without GREEN (dry run and real
 run). MTG Zero's fixed gate step (its ENGINE.md 90: the three repos passed explicitly, an "ok <game>: build"
 line required for each), run for real against 7d3dbd8 at IDLE priority with 2 build jobs: PASS in 159 s,
@@ -4226,7 +4226,7 @@ changes in ~10% of contested decisions (prior max < 0.7; 8% of all decisions) an
 uniformly drawn positions: an effect on ~1% of the evaluation seat's moves, if any.
 
 **The evaluation-only h2h** (the GPU's, after the A/B; from an MTG Zero checkout whose zero-core has this branch -
-`C:/Users/Gregg Keithley/mtg-zero-wt/infoset-build` is one, built): the same checkpoint on both sides, the run's
+`C:/Users/<user>/mtg-zero-wt/infoset-build` is one, built): the same checkpoint on both sides, the run's
 evaluation seat (32 simulations, cq rule guard 4 c_scale 0.3, root-view values, the root's belief tilt 1 / clip 20 /
 mix 0.25), side A merged:
 
@@ -6780,7 +6780,7 @@ from `tools/onnx_probe_graph.py`: every operator of eoe1's and Delver's graphs) 
 ### 44.5 The probe's graph variants: one round trip to a PC we can't reach (no setting; zero-farm AMD GPU work, 2026-11-12)
 
 **Why.** Windows ML's AMD GPU providers (AMDGPUExecutionProvider 1.8.65 and the deprecated MIGraphX one) install on a
-friend's RX 9070 XT and then fail on the probe graph (`hipMemcpyWithStream(output_data, gpu_resource.data(),
+farm PC's AMD GPU and then fail on the probe graph (`hipMemcpyWithStream(output_data, gpu_resource.data(),
 resource_shape.bytes(), DeviceToDevice)`: "invalid argument" - the copy ONNX Runtime's MIGraphX provider makes for the
 partition outputs MIGraphX did not bind as `#output_N` program parameters), and DirectML passes there at a tenth of the
 CPU's speed. That PC is reached only through canary builds and the agent's probe: each question costs a release and a

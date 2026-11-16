@@ -17,6 +17,10 @@ import os
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 DASHBOARD_DIR = os.path.dirname(PACKAGE_DIR)
-DEFAULT_CONFIG = os.path.join(DASHBOARD_DIR, 'projects.json')
+# The machine's own projects file stays out of the repository (it names the machine's paths and hosts; AGENTS.md
+# "Private details"): $ZERODASH_CONFIG, else ~/.config/zero/projects.json. projects.example.json shows the format.
+DEFAULT_CONFIG = os.path.expanduser(os.environ.get('ZERODASH_CONFIG') or os.path.join('~', '.config', 'zero',
+                                                                                     'projects.json'))
+EXAMPLE_CONFIG = os.path.join(DASHBOARD_DIR, 'projects.example.json')
 FIXTURES_CONFIG = os.path.join(DASHBOARD_DIR, 'projects.fixtures.json')
 FIXTURES_DIR = os.path.join(DASHBOARD_DIR, 'fixtures')

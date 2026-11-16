@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from zerodash import DEFAULT_CONFIG, FIXTURES_CONFIG, config
+from zerodash import DASHBOARD_DIR, DEFAULT_CONFIG, EXAMPLE_CONFIG, FIXTURES_CONFIG, config
 from zerodash.machine import GPU_QUERY, Machine, parse_gpu, parse_uptime
 
 
@@ -43,7 +43,7 @@ def test_machine_sample_with_mocked_tools(monkeypatch, tmp_path):
         calls.append(argv)
         return 0, '5727, 32607, 148.43, 85\n'
     cfg = {'disks': [{'path': str(tmp_path), 'label': 'T:', 'warn_below_gb': 10 ** 9}],
-           'mac': {'ssh': 'greggkeithley@100.95.248.116', 'label': 'Mac'}}
+           'mac': {'ssh': 'user@mac', 'label': 'Mac'}}
     ssh = FakeSsh((0, '10:01  up 3 days, load averages: 2.31 2.10 1.95\n', ''))
     m = Machine(cfg, runner=runner, ssh=ssh, clock=lambda: 1000.0)
     m.sample()
@@ -52,10 +52,10 @@ def test_machine_sample_with_mocked_tools(monkeypatch, tmp_path):
     assert calls == [['C:/fake/nvidia-smi.exe'] + GPU_QUERY]
     assert s['gpu']['gpus'][0]['util_pct'] == 85.0
     assert s['disks'][0]['warn'] and s['disks'][0]['free_gb'] > 0           # under the (huge) threshold
-    assert s['mac']['load'] == [2.31, 2.10, 1.95] and ssh.calls == [('greggkeithley@100.95.248.116', 'uptime')]
+    assert s['mac']['load'] == [2.31, 2.10, 1.95] and ssh.calls == [('user@mac', 'uptime')]
     assert s['age_s'] == 0.0 and s['cpu']['cores'] >= 1
     # the Mac stops answering: the error, and the last load seen
-    ssh.result = (255, '', 'ssh: connect to host 100.95.248.116 port 22: Operation timed out')
+    ssh.result = (255, '', 'ssh: connect to host 192.0.2.10 port 22: Operation timed out')
     m.sample_mac_now()
     mac = m.snapshot()['mac']
     assert mac['error'].endswith('Operation timed out') and mac['last_load'] == [2.31, 2.10, 1.95]
@@ -72,17 +72,23 @@ def test_nvidia_smi_failing(monkeypatch):
     assert Machine({}, runner=lambda a, timeout=10: (9, '')).sample_gpu() == {'error': 'nvidia-smi exited with status 9'}
 
 
-def test_desktop_config_loads():
-    cfg = config.load(DEFAULT_CONFIG)
+def test_example_config_loads():
+    """The template of the machine's own projects file (the real one is never committed: AGENTS.md)."""
+    cfg = config.load(EXAMPLE_CONFIG)
     ids = [p['id'] for p in cfg['projects']]
-    assert ids == ['stpete', 'dominion', 'caverna', 'glassroad']
+    assert ids == ['stpete', 'dominion', 'caverna', 'glassroad', 'kingdombuilder']
     st = cfg['projects'][0]
-    assert st['pause'] == 'auto' and st['roots'][0].replace('\\', '/') == 'C:/Users/Gregg Keithley/stpete-zero/runs'
-    assert {p['id']: p['pause'] for p in cfg['projects'][1:]} == {'dominion': True, 'caverna': True, 'glassroad': True}
-    assert {p['id']: p['dashboard'].rsplit(':', 1)[1] for p in cfg['projects']} == \
-        {'stpete': '5230', 'dominion': '5240', 'caverna': '5260', 'glassroad': '5280'}
-    assert cfg['mac']['ssh'] == 'greggkeithley@100.95.248.116'
+    assert st['pause'] == 'auto' and st['roots'][0].replace(os.sep, '/').endswith('/stpete-zero/runs')
+    assert os.path.isabs(st['roots'][0])                   # ~ expanded
+    assert {p['id']: p['pause'] for p in cfg['projects'][1:]} ==         {'dominion': True, 'caverna': True, 'glassroad': True, 'kingdombuilder': True}
+    assert {p['id']: p['dashboard'].rsplit(':', 1)[1] for p in cfg['projects']} ==         {'stpete': '5230', 'dominion': '5240', 'caverna': '5260', 'glassroad': '5280', 'kingdombuilder': '5300'}
+    assert cfg['mac']['ssh'] == 'user@mac'
     assert cfg['disks'][0]['warn_below_gb'] == 15
+
+
+def test_default_config_is_outside_the_repo():
+    assert not os.path.normcase(os.path.abspath(DEFAULT_CONFIG)).startswith(
+        os.path.normcase(os.path.abspath(DASHBOARD_DIR)) + os.sep)
 
 
 def test_fixtures_config_is_relative():
@@ -92,12 +98,12 @@ def test_fixtures_config_is_relative():
 
 
 def test_remote_run_config(tmp_path):
-    raw = {'mac': {'ssh': 'greggkeithley@100.95.248.116'}, 'projects': [{
+    raw = {'mac': {'ssh': 'user@mac'}, 'projects': [{
         'id': 'stpete', 'roots': ['runs'], 'pause': 'auto',
         'remote_runs': [{'name': 'az6_cq', 'path': '~/stpete-zero/runs/az6_cq', 'mirror': 'mirror/az6_cq'}]}]}
     cfg = config.normalize(raw, str(tmp_path))
     rr = cfg['projects'][0]['remote_runs'][0]
-    assert rr['id'] == 'az6_cq@mac' and rr['ssh'] == 'greggkeithley@100.95.248.116' and rr['pause'] is True
+    assert rr['id'] == 'az6_cq@mac' and rr['ssh'] == 'user@mac' and rr['pause'] is True
     assert rr['mirror'] == os.path.normpath(os.path.join(str(tmp_path), 'mirror/az6_cq'))
     bad = json.loads(json.dumps(raw))
     bad['projects'][0]['remote_runs'][0]['ssh'] = '-oProxyCommand=evil'

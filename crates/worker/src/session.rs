@@ -67,7 +67,7 @@ impl ProviderKind {
     ];
 
     /// What `probe-providers` tries when no `--providers` names them: every provider but AMD's two Windows ML catalog
-    /// providers (AMDGPUExecutionProvider and the deprecated MIGraphX one). Measured on an RX 9070 XT (2026-11-13):
+    /// providers (AMDGPUExecutionProvider and the deprecated MIGraphX one). Measured on a farm PC's AMD GPU (2026-11-13):
     /// they mishandle zero-size tensors, 0-d scalars and NonZero, and crash on TopK / Range with data-dependent sizes,
     /// so no zero-onnx graph passes on them, and a run of repeated failing sessions very likely took that PC (or its
     /// GPU driver) down twice. They stay available when named explicitly (`--providers amdgpu`).
