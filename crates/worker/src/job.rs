@@ -957,6 +957,10 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         loop {
             r.drive()?;
             if r.job.rolling.is_some() {
+                if r.ended {
+                    // (quit while a switch was armed: no swap, the driver is never resumed after its end)
+                    r.switching = None;
+                }
                 if let Some(c) = r.switching.take() {
                     // a rolling job's phase change: the evaluator its checkpoint built (and self-tested) in the
                     // background swapped in, the driver resumed with its id
