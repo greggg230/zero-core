@@ -859,6 +859,10 @@ setting; a game without a panic plays, records and reports exactly as before (th
   and the storm limit are unchanged. `zero.game_failure.failure_key(site, message)` is the dedup key (the site and the
   first message line's first 120 characters, digits masked: MTG Zero's fuzz farm's).
 * `take_game_records` gives a dropped game an empty record text (it has no trace).
+* (A test-order fix found by the gate: `zero.farm_h2h.record_rows` set `ZERO_INFLIGHT=1` for its recording and left it
+  set, so every later driver of the process and every run process it started inherited it; the core pytest's
+  `test_shard_thread::test_rolling_run_quotas_exact` then saw 97 games for 96 after `test_farm_h2h.py`. It restores the
+  process's own value now.)
 
 **Tests.** `a_panicking_game_is_dropped_and_the_run_goes_on` also checks the site (this test file's `panic!` line), the
 phase, and that `replay_failure` of the failure panics again with the same message; `tests/test_game_failures.py` (8:

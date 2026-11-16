@@ -161,11 +161,19 @@ def record_rows(model, game, spec, rows=320, conc=32, sims=16, threads=4, seed=1
                                f'{have("ov_off")} overrides: the network\'s {"tails" if need_t else ""}'
                                f'{" and " if need_t and need_o else ""}{"overrides" if need_o else ""} would go untested')
 
+    # (one batch at a time for the recording, then the process's own setting back: left at 1 it reached every later
+    # driver of the process and the run processes it starts - a rolling run's quota off by one in the core tests)
+    old_inflight = os.environ.get('ZERO_INFLIGHT')
     os.environ['ZERO_INFLIGHT'] = '1'
     try:
         drive(drv, {'m': rec}, check=check)
     except Enough:
         pass
+    finally:
+        if old_inflight is None:
+            os.environ.pop('ZERO_INFLIGHT', None)
+        else:
+            os.environ['ZERO_INFLIGHT'] = old_inflight
     if (need_t and not have('t_off')) or (need_o and not have('ov_off')):
         raise RuntimeError(f'record_rows: the self-play ended after {len(keep)} batches with {have("t_off")} tail tokens '
                            f'and {have("ov_off")} overrides: the network\'s variable-length rows would go untested')
