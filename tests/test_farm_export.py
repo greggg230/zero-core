@@ -161,6 +161,9 @@ def test_reference_reuse(tmp_path, monkeypatch):
     before (the same arrays, its own checkpoint in the meta), within the tolerance of its graph; answering the kept
     positions with the first network gives the first reference set's answers exactly (the positions round-trip); a
     network of another architecture gets a template of its own."""
+    # (record_rows sets ZERO_INFLIGHT=1 for its self-play and leaves it set: restored after this test, or the later
+    # tests' run processes inherit it - test_shard_thread's rolling quotas and test_remoteplay's did)
+    monkeypatch.setenv('ZERO_INFLIGHT', os.environ.get('ZERO_INFLIGHT', '2'))
     cache = str(tmp_path / 'export')
     ck = []
     for s in (1, 2):
@@ -172,9 +175,10 @@ def test_reference_reuse(tmp_path, monkeypatch):
     assert a['graph'] == 'template' and a['positions'] == 1
     assert set(a['steps']) == {'load', 'template', 'swap', 'record_rows', 'reference', 'check'}
     calls = []
-    monkeypatch.setattr(FH, 'record_rows', lambda *x, **k: calls.append(1))
-    b = FH.export_cached(ck[1], 2, str(tmp_path / 'ckpt' / '2'), GAME, SPEC, cache, 'farm/2', threads=1,
-                         checkpoint_iter=2, n=64)
+    with monkeypatch.context() as mp:
+        mp.setattr(FH, 'record_rows', lambda *x, **k: calls.append(1))
+        b = FH.export_cached(ck[1], 2, str(tmp_path / 'ckpt' / '2'), GAME, SPEC, cache, 'farm/2', threads=1,
+                             checkpoint_iter=2, n=64)
     assert not calls and b['graph'] == 'swap' and b['positions'] == 1
     assert set(b['steps']) == {'load', 'swap', 'reference', 'check'}
     assert b['check']['max_abs'] < OX.REFERENCE_TOL
@@ -203,6 +207,5 @@ def test_reference_reuse(tmp_path, monkeypatch):
     # another architecture: a template of its own
     p = str(tmp_path / 'iter_0003.pt')
     N.save(toy_tail_net(3, hidden=24), p, {'iter': 3})
-    monkeypatch.undo()
     c = FH.export_cached(p, 3, str(tmp_path / 'ckpt' / '3'), GAME, SPEC, cache, 'farm/3', threads=1, n=64)
     assert c['graph'] == 'template' and c['positions'] == 3 and len(os.listdir(cache)) == 2
