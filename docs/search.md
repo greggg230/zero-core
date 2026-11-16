@@ -819,6 +819,57 @@ with the right ids, seeds, spec and message, its moves legal on a fresh game of 
 the samples exactly the plain toy's run with the same seed); `tests/test_game_failures.py` (the run's file, metrics, log
 and the storm limit, with a fake driver: no process is started).
 
+### 2.19 One failure queue for every executor: the site, the replay, the farm worker's and the remote's failures (2026-11-16)
+
+Completes 2.18 for MTG Zero's continuous fuzz decision (its ENGINE.md 172): every dropped game, wherever it was played,
+becomes one line of `<run>/game_failures.jsonl` that names where it panicked and replays it with one command. No
+setting; a game without a panic plays, records and reports exactly as before (the digests are equal).
+
+* **Where and when.** `GameFailure` gains `site` (the panic's `file:line:col`: `zero_search::panic_site`, a panic hook
+  installed once by `Driver::new` in front of the current one - it notes the location in a thread-local and calls the
+  previous hook unchanged; the worker takes the note after catching the game's panic on the same thread; None if a later
+  hook does not chain), `phase` (`"move"`: inside a real move - the chosen action or a single-option step after it -,
+  else `"search"`: the simulations, encoding, the game's start) and `panic_move` (a `"move"` panic in the chosen action
+  itself: that action). `to_json` carries the three.
+* **The replay.** `record::replay_failure(spec, failure, rollouts, seed, max_steps)`: the game from its spec, players
+  and seed, its real moves (episode boundaries through `next_episode`), a `"move"` panic's action and the single-option
+  steps after it, then `rollouts` random continuations (each its own stream of `seed`; every second one determinized
+  from the decider's view first; each step builds the decider's row and option overrides as a search leaf does: the
+  encodings run too) - a panic is not caught. The binding `replay_failure(game, failure_json, rollouts=64, seed=0,
+  max_steps=20000)` raises it as PanicException (a failure it cannot replay - an archive start, a branch game, an
+  illegal recorded move - raises ValueError). A `"search"` panic that depends on the search's own state (its worlds, its
+  tree) may not reproduce from rollouts: the replay then says "not reproduced", never "fixed".
+* **The native worker** (`zero_worker`, self-play jobs) puts each dropped game's failure into the next records file's
+  header, `"failures": [GameFailure::to_json, ...]` - a key older readers ignore, no agent or coordinator change; a
+  failure after the job's last finished game stays in the worker's log (a file needs a game). `zero.farm_pool` reads
+  it (`header_failures`: each with the worker's `build` = its build_id) once the header is accepted.
+* **The remote self-play worker** (`zero.remoteplay.Worker`) sends each failure as a `failure` event with its
+  checkout's commit and engine module hash; the run side keeps it with the remote's name as its source (an older run
+  ignores the event; an older worker sends none).
+* **The run** (`Run.failure_metrics`): this machine's failures ('local') and `RemotePlay.take_failures()` (a remote's
+  name, 'pool') go to `game_failures.jsonl` through `zero.game_failure.record` - one JSON object a line: `t`, `iter`,
+  `source`, `game`, `game_id`, `driver_seed`, `game_seed`, `players`, `spec`, `moves`, `phase`, `panic_move`, `tag`,
+  `start`, `branch`, `message`, `site` (the hook's, else the "panicked at" in the message, else "unknown"),
+  `engine_commit` (the checkout's HEAD; a remote's own), `build` (the engine module's sha256[:24]; the farm worker's
+  build_id), `repro` = `python -m <package>.az.game_failure replay "<absolute file>" --line N` (exit 101 and the panic's
+  text: reproduced; 0: not reproduced; 2: the line cannot be replayed). A test fault's panic message names its arming
+  setting (`[test fault NAME=VALUE]`, NAME ending in `_TEST_PANIC`); the replay arms it the same way. The metric
+  `panics` (`selfplay.panics`) is written every iteration: the aborted rows among the results, or the records of this
+  machine and its remotes if more, plus the pool's (whose dropped games come back as records only). `game_failures`
+  and the storm limit are unchanged. `zero.game_failure.failure_key(site, message)` is the dedup key (the site and the
+  first message line's first 120 characters, digits masked: MTG Zero's fuzz farm's).
+* `take_game_records` gives a dropped game an empty record text (it has no trace).
+* (A test-order fix found by the gate: `zero.farm_h2h.record_rows` set `ZERO_INFLIGHT=1` for its recording and left it
+  set, so every later driver of the process and every run process it started inherited it; the core pytest's
+  `test_shard_thread::test_rolling_run_quotas_exact` then saw 97 games for 96 after `test_farm_h2h.py`. It restores the
+  process's own value now.)
+
+**Tests.** `a_panicking_game_is_dropped_and_the_run_goes_on` also checks the site (this test file's `panic!` line), the
+phase, and that `replay_failure` of the failure panics again with the same message; `tests/test_game_failures.py` (8:
+the record's fields and repro line numbers, a remote's and the pool's failures with their sources and builds,
+`panics`, the dedup key, the remote worker's `failure` event reaching the run). On real games: MTG Zero's
+`engine/tests/selfplay_panic.rs` and `tests/test_selfplay_panic.py` (its ENGINE.md 172).
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),

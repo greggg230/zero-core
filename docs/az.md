@@ -7793,7 +7793,7 @@ between gens: only the weights do.
   check 1.24 s (graph by weight swap; reference positions of gen 15)` (`farm_pool.export_breakdown`); state.json keeps
   them as `export_steps`.
 
-**A behaviour change, called out: `record_rows` gives ZERO_INFLIGHT back.** `record_rows` drives its recording with
+**A behaviour change, called out: `record_rows` gives ZERO_INFLIGHT back.** (feat/panic-queue 8ae31f8, docs/search.md 2.19, made the same fix the same day for the same test failure; this branch merges it, the one implementation kept.) `record_rows` drives its recording with
 `ZERO_INFLIGHT=1` (one network batch at a time) and used to leave it set in `os.environ` for the rest of the process.
 In a run with a farm pool that is the run process: from its first export on (gen 0, minutes into iteration 1), the
 run's own `drive` - its local self-play - went one batch at a time instead of the documented two in flight, and every

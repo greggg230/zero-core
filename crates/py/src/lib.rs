@@ -45,11 +45,13 @@ pub struct GameEntry {
     pub info: fn() -> GameInfo,
     /// `zero_search::record::replay_json` of the game type (docs/search.md 2.17).
     pub replay: fn(&str, &str, bool) -> Result<Replayed, String>,
+    /// `zero_search::record::replay_failure_json` of the game type (docs/search.md 2.18).
+    pub replay_failure: fn(&str, u32, u64, u32) -> Result<String, String>,
 }
 
 impl GameEntry {
     pub const fn of<G: SearchGame>(name: &'static str) -> GameEntry {
-        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G>, replay: zero_search::record::replay_json::<G> }
+        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G>, replay: zero_search::record::replay_json::<G>, replay_failure: zero_search::record::replay_failure_json::<G> }
     }
 }
 
@@ -97,6 +99,7 @@ pub fn init_module(m: &Bound<'_, PyModule>, games: &'static [GameEntry]) -> PyRe
     m.add_function(wrap_pyfunction!(gumbel_sequence_of, m)?)?;
     m.add_function(wrap_pyfunction!(completed_q_policy_of, m)?)?;
     m.add_function(wrap_pyfunction!(replay_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(replay_failure, m)?)?;
     m.add_function(wrap_pyfunction!(game_seed_of, m)?)?;
     m.add_function(wrap_pyfunction!(pack_sparse_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(pack_tail_tokens, m)?)?;
@@ -1065,7 +1068,8 @@ impl PySearchDriver {
     }
 
     /// A traced driver's finished games (docs/search.md 2.17): take_results and take_samples at one point, with each
-    /// game's record (`zero_search::record::game_json`, JSON text) -> (rows, records, samples dict or None).
+    /// game's record (`zero_search::record::game_json`, JSON text; "" for a game dropped after a panic: no record,
+    /// docs/search.md 2.18) -> (rows, records, samples dict or None).
     fn take_game_records<'py>(&mut self, py: Python<'py>) -> PyResult<(Bound<'py, PyList>, Vec<String>, Option<PyObject>)> {
         let rows = self.d.take_results();
         let recs = self.d.take_samples();
@@ -1077,7 +1081,12 @@ impl PySearchDriver {
             if b > recs.len() {
                 return Err(rerr(format!("game {} has {} samples, {} left", r.gid, r.samples, recs.len() - a)));
             }
-            texts.push(zero_search::record::game_json(r, &recs[a..b]).map_err(rerr)?.to_string());
+            // (a game dropped after a panic has no trace, docs/search.md 2.18: its row, an empty text - no record)
+            if r.abort_reason == Some("panic") && r.trace.is_none() {
+                texts.push(String::new());
+            } else {
+                texts.push(zero_search::record::game_json(r, &recs[a..b]).map_err(rerr)?.to_string());
+            }
             out.append(result_row(py, r)?)?;
             a = b;
         }
@@ -1286,6 +1295,19 @@ fn replay_rows(py: Python<'_>, game: &str, spec: &str, record: &str, aux: bool) 
     let gi = (e.info)();
     let s = samples_dict(py, rp.records, gi.num_features, RowKinds::of(&gi))?;
     Ok((s, info.into_any().unbind()))
+}
+
+/// A dropped game's failure replayed (docs/search.md 2.18, `zero_search::record::replay_failure`): game `game`,
+/// `failure` one failure record (JSON text: `GameFailure::to_json`'s object, its own `spec`), `rollouts` random
+/// continuations from where it panicked (seeded `seed`, at most `max_steps` steps each) -> the replay's facts as a
+/// JSON string when nothing panicked. A panic in the engine is not caught: it raises PanicException (the
+/// reproduction); a failure that cannot be replayed raises ValueError.
+#[pyfunction]
+#[pyo3(signature = (game, failure, rollouts=64, seed=0, max_steps=20000))]
+fn replay_failure(py: Python<'_>, game: &str, failure: &str, rollouts: u32, seed: u64, max_steps: u32) -> PyResult<String> {
+    let e = entry(game).map_err(verr)?;
+    let failure = failure.to_string();
+    py.allow_threads(move || (e.replay_failure)(&failure, rollouts, seed, max_steps)).map_err(verr)
 }
 
 /// The seed of game `gid` of a driver seeded `seed` (`zero_search::record::game_seed`: what `new_game` gets).

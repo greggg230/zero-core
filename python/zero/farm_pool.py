@@ -85,6 +85,15 @@ def coordinator_seed(run):
     return h
 
 
+def header_failures(h):
+    """A records file header's `failures` (games the worker dropped after a panic, docs/search.md 2.19; absent in
+    files of older workers and of jobs without one) -> failure dicts, each with the worker's `build` (its build_id)."""
+    fails = h.get('failures') if isinstance(h, dict) else None
+    if not isinstance(fails, list):
+        return []
+    return [dict(f, build=h.get('build_id')) for f in fails if isinstance(f, dict)]
+
+
 def read_records(body):
     """A records file's bytes (gzip'd JSON lines) -> (header, [game record text, ...])."""
     lines = gzip.decompress(body).decode('utf-8').splitlines()
@@ -559,6 +568,12 @@ class Pool:
                 return self._refuse(r, 'the records were played with another spec', body)
         except ValueError:
             return self._refuse(r, 'the spec is not JSON', body)
+        fails = header_failures(h)
+        if fails:
+            # games the worker dropped after a panic (docs/search.md 2.19): to the run's game_failures.jsonl (source
+            # 'pool': never the machine), with the worker's build
+            self.rp.add_failures('pool', fails)
+            self.log(f'{len(fails)} self-play game(s) dropped after a panic on a farm PC: to game_failures.jsonl')
         ids = [tuple(x) for x in (r.get('ids') or [])]
         fmt = shard_format(self.R.cfg, self.R.info)     # (a game with tails / overrides: format v2, docs/az.md 43)
         sparse = fmt.get('x_format') == 'sparse'

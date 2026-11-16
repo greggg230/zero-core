@@ -237,6 +237,8 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
             // the scratch world may be mid-transition
             scratch.game = None;
             let msg = panic_msg(p);
+            // (where: the hook's note of this thread's last panic - this one; crate::panic_site)
+            let site = crate::panic_site::take();
             let Some(gid) = gid else {
                 return Err(format!("search worker panicked: {msg}"));
             };
@@ -248,7 +250,7 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
             ch.results.truncate(outs.0);
             ch.samples.truncate(outs.1);
             ch.parked.truncate(outs.2);
-            drop_game(sh, slot, gid, msg, &mut ch.results);
+            drop_game(sh, slot, gid, msg, site, &mut ch.results);
             Ok(())
         });
         if let Some(gid) = gid {
@@ -525,6 +527,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     slot.trace = sh.trace.load(Ordering::Relaxed).then(Vec::new);
     slot.trace_setups.clear();
     slot.fail_log.clear();
+    slot.in_move = None;
     Ok(())
 }
 
@@ -532,8 +535,14 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
 /// message) is kept for `Driver::take_failures`, counted (`game_panics`) and logged (one stderr line); its result row
 /// is an aborted row (reason `"panic"`, not over, no samples - a chained contest's finished episodes' samples go too);
 /// the slot is free for the next game. The game itself is never touched again (it may be mid-transition).
-fn drop_game<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, msg: String, results: &mut Vec<GameResult>) {
+fn drop_game<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, msg: String, site: Option<String>, results: &mut Vec<GameResult>) {
     let cfg = &sh.cfg;
+    // inside a real move: the chosen action itself when nothing of it reached the log, else a single-option step after it
+    let (phase, panic_move) = match slot.in_move.take() {
+        Some((a, len)) if slot.fail_log.len() == len => ("move", Some(a)),
+        Some(_) => ("move", None),
+        None => ("search", None),
+    };
     let n = slot.n.max(cfg.games[gid as usize % cfg.games.len()].len());
     eprintln!("game panic: game {gid} (driver seed {}) dropped after {} real moves: {msg}", cfg.seed, slot.fail_log.len());
     let spec = if slot.spec_json.is_empty() { lock(&sh.spec_json).to_string() } else { slot.spec_json.to_string() };
@@ -548,6 +557,9 @@ fn drop_game<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, msg: S
         branch: slot.branch.clone(),
         steps: std::mem::take(&mut slot.fail_log),
         message: msg,
+        site,
+        phase,
+        panic_move,
     });
     sh.counters.game_panics.fetch_add(1, Ordering::Relaxed);
     let mut draw = vec![0.0; n];
@@ -1534,6 +1546,8 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
     let tag = tag_of(&*g);
     let stepped = std::cell::Cell::new(0u32);
     let trace = &mut slot.trace;
+    // (a panic inside this transition is a "move" panic: GameFailure::phase, docs/search.md 2.18)
+    slot.in_move = Some((a, slot.fail_log.len()));
     let fail_log = &mut slot.fail_log;
     transition_each(
         g,
@@ -1556,6 +1570,7 @@ fn apply<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, a: u16, key: &mut V
         },
     )
     .map_err(|e| format!("move {a} failed: {e}"))?;
+    slot.in_move = None;
     let stepped = stepped.get();
     slot.legal_ok = true;
     slot.steps += 1;
@@ -1838,6 +1853,7 @@ fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut
     slot.trace = None;
     // (a branch's failure log: its moves since its branch point, docs/search.md 2.18)
     slot.fail_log.clear();
+    slot.in_move = None;
     Ok(())
 }
 

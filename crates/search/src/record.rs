@@ -555,3 +555,132 @@ pub fn replay_json<G: SearchGame>(spec: &str, rec: &str, aux: bool) -> Result<Re
     let v: Value = serde_json::from_str(rec).map_err(|e| format!("record: not JSON: {e}"))?;
     replay::<G>(&sp, &v, aux)
 }
+
+/// What `replay_failure` did when nothing panicked: the real moves replayed, whether the recorded `"move"` panic's
+/// action was played, and the random rollouts' count and steps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FailureReplay {
+    pub steps: usize,
+    pub move_played: bool,
+    pub rollouts: u32,
+    pub rollout_steps: u64,
+}
+
+/// Replay a dropped game's failure (`driver::GameFailure::to_json`, docs/search.md 2.18) of game type `G` - the game
+/// from its spec, players and seed, its real moves (`steps`; an episode boundary as `next_episode`), then where it
+/// panicked: a `"move"` panic's action (`panic_move`) and the single-option decisions after it; then `rollouts`
+/// random continuations of the reached state (rollout r: its own stream of `seed`; every second one determinized from
+/// the decider's view first, as a search's world; each step encodes the decider's row and its option overrides as a
+/// search leaf does; at most `max_steps` steps; through a chained contest's episodes). A panic is NOT caught: it
+/// reaches the caller (the point - the engine module's binding turns it into Python's PanicException). Without one ->
+/// what was replayed; an error when the failure cannot be replayed (an archive start or a branch game: their prefix is
+/// not in the record; an illegal recorded move).
+pub fn replay_failure<G: SearchGame>(spec: &G::Spec, f: &Value, rollouts: u32, seed: u64, max_steps: u32) -> Result<FailureReplay, String> {
+    let o = f.as_object().ok_or("failure: not a JSON object")?;
+    if !o.get("start").map_or(true, Value::is_null) || !o.get("branch").map_or(true, Value::is_null) {
+        return Err("failure: an archive start's or a branch game's moves begin after a prefix the record does not hold".into());
+    }
+    let n = uint(field(o, "players")?, "players", MAX_SEATS as u64)? as usize;
+    let game_seed = field(o, "game_seed")?.as_u64().ok_or("failure: game_seed is not a u64")?;
+    let steps = field(o, "steps")?.as_array().ok_or("failure: steps is not a list")?;
+    let mut g = G::new_game(spec, n, game_seed).map_err(|e| format!("failure: new_game: {e}"))?.clone();
+    let mut legal: Vec<u16> = Vec::new();
+    let mut chance: Vec<u64> = Vec::new();
+    for (k, s) in steps.iter().enumerate() {
+        chance.clear();
+        match s {
+            Value::Object(m) => {
+                let conceded = match m.get("next") {
+                    Some(Value::Null) => None,
+                    Some(v) => Some(uint(v, "next", n as u64 - 1)? as usize),
+                    None => return Err(format!("failure: step {k}: {s} is not an episode boundary")),
+                };
+                g = match g.next_episode(conceded).map_err(|e| format!("failure: step {k}: next_episode: {e}"))? {
+                    Next::Continue(ng) => ng,
+                    Next::Over(_) => return Err(format!("failure: step {k}: the contest ended here, the record goes on")),
+                };
+            }
+            Value::String(p) => g.apply_external(p, &mut chance).map_err(|e| format!("failure: step {k}: external answer: {e}"))?,
+            v => {
+                let a = uint(v, "step", u16::MAX as u64)? as u16;
+                legal.clear();
+                g.legal_actions(&mut legal);
+                if !legal.contains(&a) {
+                    return Err(format!("failure: step {k}: action {a} is not legal ({} legal actions)", legal.len()));
+                }
+                g.step(a, &mut chance).map_err(|e| format!("failure: step {k}: action {a}: {e}"))?;
+            }
+        }
+    }
+    let mut move_played = false;
+    if o.get("phase").and_then(Value::as_str) == Some("move") {
+        if let Some(a) = o.get("panic_move").and_then(Value::as_u64) {
+            let a = a as u16;
+            legal.clear();
+            g.legal_actions(&mut legal);
+            if !legal.contains(&a) {
+                return Err(format!("failure: the panic's move {a} is not legal after the recorded moves"));
+            }
+            chance.clear();
+            g.step(a, &mut chance).map_err(|e| format!("failure: the panic's move {a}: {e}"))?;
+            move_played = true;
+        }
+        // (the single-option decisions the driver steps itself after a real move: tree::transition_each)
+        while g.to_move().is_some() {
+            legal.clear();
+            g.legal_actions(&mut legal);
+            if legal.len() != 1 {
+                break;
+            }
+            chance.clear();
+            g.step(legal[0], &mut chance).map_err(|e| format!("failure: a single-option step after the move: {e}"))?;
+        }
+    }
+    let mut x = vec![0.0f32; G::NUM_FEATURES];
+    let mut total = 0u64;
+    for r in 0..rollouts {
+        let mut rng = crate::rng::Rng::new(crate::rng::split64(seed ^ crate::rng::split64(r as u64 + 1)));
+        let mut w = g.clone();
+        if r % 2 == 1 {
+            if let Some(p) = w.to_move() {
+                w.determinize(p, &mut rng);
+            }
+        }
+        for _ in 0..max_steps {
+            let p = match w.to_move() {
+                Some(p) => p,
+                None if w.chained() => match w.next_episode(None) {
+                    Ok(Next::Continue(ng)) => {
+                        w = ng;
+                        continue;
+                    }
+                    _ => break,
+                },
+                None => break,
+            };
+            legal.clear();
+            w.legal_actions(&mut legal);
+            if legal.is_empty() {
+                break;
+            }
+            let _ = record_row(&w, p, &legal, &mut x);
+            let a = legal[rng.below(legal.len() as u32) as usize];
+            chance.clear();
+            if w.step(a, &mut chance).is_err() {
+                break;
+            }
+            total += 1;
+        }
+    }
+    Ok(FailureReplay { steps: steps.len(), move_played, rollouts, rollout_steps: total })
+}
+
+/// `replay_failure` from JSON text: the failure's own spec (`spec`, `SearchGame::parse_spec`) -> its result as JSON
+/// (`{"steps", "move_played", "rollouts", "rollout_steps"}`).
+pub fn replay_failure_json<G: SearchGame>(failure: &str, rollouts: u32, seed: u64, max_steps: u32) -> Result<String, String> {
+    let v: Value = serde_json::from_str(failure).map_err(|e| format!("failure: not JSON: {e}"))?;
+    let spec = v.get("spec").and_then(Value::as_str).ok_or("failure: no spec")?;
+    let sp = G::parse_spec(spec)?;
+    let r = replay_failure::<G>(&sp, &v, rollouts, seed, max_steps)?;
+    Ok(json!({"steps": r.steps, "move_played": r.move_played, "rollouts": r.rollouts, "rollout_steps": r.rollout_steps}).to_string())
+}

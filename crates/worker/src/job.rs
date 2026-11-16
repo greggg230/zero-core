@@ -582,10 +582,14 @@ impl Run<'_> {
         if rows.is_empty() && !recs.is_empty() {
             return Err("samples without finished games".into());
         }
-        // games dropped after a panic (zero-core docs/search.md 2.18): each failure's replay record into the log; their
-        // rows carry no samples and no trace, so they go into neither the records nor the shards
+        // games dropped after a panic (zero-core docs/search.md 2.18): each failure's replay record into the log and into
+        // the next records file's header (`failures`, records.rs); their rows carry no samples and no trace, so they go
+        // into neither the records nor the shards
         for f in self.drv.take_failures() {
             self.sink.log(&format!("game failure (dropped after a panic): {f}"));
+            if let Some(rw) = self.rec.as_mut() {
+                rw.add_failure(serde_json::from_str(&f).unwrap_or_else(|_| serde_json::Value::String(f.clone())));
+            }
         }
         let mut it = recs.into_iter();
         let n = rows.len() as u64;
@@ -788,6 +792,10 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         r.pump()?;
         if let Some(w) = r.rec.as_mut().map(|rw| rw.flush()).transpose()?.flatten() {
             r.emit_file("records", w);
+        }
+        if let Some(n) = r.rec.as_ref().map(|rw| rw.pending_failures()).filter(|&n| n > 0) {
+            // (a file is written only with a game in it: failures after the job's last finished game stay in the log)
+            r.sink.log(&format!("{n} game failure(s) after the last finished game: in this log only, in no records file"));
         }
         if let Some(w) = r.writer.flush()? {
             r.emit_file("shard", w);

@@ -743,6 +743,19 @@ fn a_panicking_game_is_dropped_and_the_run_goes_on() {
         assert!(f.steps.len() < PANIC_STEP as usize, "{at}: {} real moves before the panic", f.steps.len());
         let j = f.to_json();
         assert_eq!((j["gid"].as_u64(), j["steps"].as_array().map(|a| a.len())), (Some(PANIC_GID as u64), Some(f.steps.len())), "{at}: {j}");
+        // where (the panic hook's note: this file's panic! line) and in which phase
+        let site = f.site.clone().unwrap_or_default();
+        assert!(site.contains("tests.rs:"), "{at}: site {site:?}");
+        assert!(matches!(f.phase, "move" | "search"), "{at}: phase {}", f.phase);
+        assert!(f.panic_move.is_none() || f.phase == "move", "{at}");
+        assert_eq!((j["site"].as_str(), j["phase"].as_str()), (Some(site.as_str()), Some(f.phase)), "{at}: {j}");
+        // the record replays the panic (record::replay_failure: the moves, then the move or the rollouts)
+        let rep = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::record::replay_failure::<PanicToy>(&0, &j, 8, 1, 200)));
+        let msg = match rep {
+            Err(p) => super::worker::panic_msg(p),
+            Ok(r) => panic!("{at}: the replay did not panic: {r:?}"),
+        };
+        assert!(msg.contains(&format!("toy engine bug at step {PANIC_STEP}")), "{at}: {msg}");
         // the real moves replay on a fresh game of the same seed (they were legal there)
         let mut g = ToyGame::new_game(&Default::default(), 2, f.game_seed).unwrap();
         let mut key = Vec::new();
