@@ -126,3 +126,15 @@ def test_bash_reads_the_file_like_python(tmp_path):
     r = subprocess.run(['bash', '-c', script], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == 'E:|user@mac host|/from/env'
+
+
+def test_markers_spare_synthetic_data_from_the_generic_rules_only(tmp_path):
+    """`privacy-check: allow` on a line or `privacy-check: allow-file` in a file's first 5 lines (a redactor and its
+    tests); the machine's local patterns still apply there."""
+    tok = 'ssh jdoe@' + '10.9.8.7'
+    (tmp_path / 'a.md').write_text(f'fine\n{tok}\n{tok}  # privacy-check: allow\n', encoding='utf-8')
+    (tmp_path / 'b.rs').write_text(f'// privacy-check: allow-file\n{tok}\nsecret_host_7\n', encoding='utf-8')
+    local = [('local pattern 1', PC.re.compile('secret_host_[0-9]+', PC.re.I))]
+    n, findings = PC.scan(str(tmp_path), ['a.md', 'b.rs'], list(PC.GENERIC) + local)
+    assert n == 2 and [(p, line, r) for p, line, r, _ in findings] == [('a.md', 2, 'ssh-user-at-ip'),
+                                                                       ('b.rs', 3, 'local pattern 1')]
