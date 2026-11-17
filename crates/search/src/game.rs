@@ -160,6 +160,18 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
         let _ = (legal, out);
         false
     }
+    /// A **value-only decision** (docs/search.md 3.20; opt-in, default none): the pending decision is searched and
+    /// played as any other, but a recording self-play seat records it WITHOUT its policy target - as a value-only
+    /// row of the decider (its own view, no options, no policy; its `q` the search's root value, its auxiliary
+    /// targets as a decision's), so the network's value head learns from the position and its policy nothing. MTG
+    /// Zero: the pile picks of a Doomsday resolution its self-play training wheel forces (ENGINE.md 180.12), whose
+    /// searches know the forcing and whose visit counts would teach the policy against the pick it must learn. Asked
+    /// on the real game at a network seat's searched decision (two or more options) when it is recorded, and by
+    /// `record::replay` at every sample's step; never inside a search. A teacher decision (`teacher_policy`) is
+    /// recorded with its policy whatever this says. Default: no decision is.
+    fn value_only_decision(&self) -> bool {
+        false
+    }
     /// The game is over (`to_move()` None) but its result comes from outside: episodes of
     /// another game decide it (docs/search.md 1.1). Until `resolve`, the search treats this
     /// terminal as a leaf the network evaluates and the driver parks the game; nothing calls

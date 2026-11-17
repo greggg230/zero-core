@@ -1780,6 +1780,8 @@ struct Counters {
     value_choice_rows: AtomicU64,
     /// Teacher decisions played (docs/search.md 3.19).
     teacher_decisions: AtomicU64,
+    /// Value-only decisions recorded (docs/search.md 3.20).
+    value_only_decisions: AtomicU64,
     /// Variable-length rows (docs/search.md 2.15): rows sent with a tail, their tokens, the most in one row,
     /// games aborted by the row limit.
     tail_rows: AtomicU64,
@@ -2016,6 +2018,9 @@ pub struct DriverStats {
     pub value_choice_rows: u64,
     /// Teacher decisions played by network seats (`SearchGame::teacher_policy`, docs/search.md 3.19; 0 without).
     pub teacher_decisions: u64,
+    /// Searched decisions a recording self-play seat recorded without their policy target, as value-only rows of
+    /// the decider (`SearchGame::value_only_decision`, docs/search.md 3.20; 0 without).
+    pub value_only_decisions: u64,
     /// Variable-length rows (docs/search.md 2.15; all 0 without `SearchGame::TAILS`): network rows sent with at
     /// least one tail token, their tail tokens, the most in one row, games aborted by `max_row_tokens`.
     pub tail_rows: u64,
@@ -2830,6 +2835,7 @@ impl<G: SearchGame> Driver<G> {
             value_choices: c.value_choices.load(Ordering::Relaxed),
             value_choice_rows: c.value_choice_rows.load(Ordering::Relaxed),
             teacher_decisions: c.teacher_decisions.load(Ordering::Relaxed),
+            value_only_decisions: c.value_only_decisions.load(Ordering::Relaxed),
             tail_rows: c.tail_rows.load(Ordering::Relaxed),
             tail_tokens: c.tail_tokens.load(Ordering::Relaxed),
             tail_max: c.tail_max.load(Ordering::Relaxed),

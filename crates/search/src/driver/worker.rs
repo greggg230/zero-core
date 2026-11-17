@@ -114,6 +114,8 @@ struct Tally {
     value_choice_rows: u64,
     /// Teacher decisions played (docs/search.md 3.19).
     teacher: u64,
+    /// Value-only decisions recorded without their policy target (docs/search.md 3.20).
+    value_only: u64,
     /// Games aborted by the row limit (docs/search.md 2.15).
     row_aborts: u64,
 }
@@ -292,6 +294,9 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     }
     if n.teacher > 0 {
         k.teacher_decisions.fetch_add(n.teacher, Ordering::Relaxed);
+    }
+    if n.value_only > 0 {
+        k.value_only_decisions.fetch_add(n.value_only, Ordering::Relaxed);
     }
     if n.branches > 0 || n.dev_moves > 0 || n.starts > 0 {
         k.branches.fetch_add(n.branches, Ordering::Relaxed);
@@ -1439,14 +1444,22 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     // (a branch records nothing before its deviation moves are played: docs/search.md 2.11)
     let rec = cfg.record && seat.selfplay && seat.record && slot.full && slot.dev_left == 0;
     if rec {
-        let pi: Vec<f32> = match seat.policy_target {
-            PolicyTarget::Visits if tot > 0 => nv.iter().map(|&c| (c as f64 / tot as f64) as f32).collect(),
-            PolicyTarget::Visits => p0.clone(),
-            PolicyTarget::CompletedQ { c_visit, c_scale, prior_w } => tree.cq_target_w(root, c_visit, c_scale, prior_w),
-        };
         let g = slot.game.as_ref().unwrap();
+        // a value-only decision (docs/search.md 3.20, opt-in by the game): the decider's row without its options and
+        // policy target - a value-only row of the seat to move; its q, auxiliary targets and everything else as below
+        let vonly = g.value_only_decision();
+        let (opts, pi): (&[u16], Vec<f32>) = if vonly {
+            (&[], Vec::new())
+        } else {
+            let pi = match seat.policy_target {
+                PolicyTarget::Visits if tot > 0 => nv.iter().map(|&c| (c as f64 / tot as f64) as f32).collect(),
+                PolicyTarget::Visits => p0.clone(),
+                PolicyTarget::CompletedQ { c_visit, c_scale, prior_w } => tree.cq_target_w(root, c_visit, c_scale, prior_w),
+            };
+            (acts, pi)
+        };
         let mut x = vec![0.0f32; G::NUM_FEATURES];
-        let (tail, ov) = record_row(g, p, acts, &mut x);
+        let (tail, ov) = record_row(g, p, opts, &mut x);
         if let Some(cap) = record_over::<G>(cfg, &tail) {
             abort_game::<G>(cfg, slot, "record", cap);
             return Ok(());
@@ -1458,7 +1471,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             g.aux_target(p, &mut aux);
         }
         let step = slot.trace.as_ref().map_or(0, |t| t.len() as u32);
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: acts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov });
+        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: opts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov });
         slot.rq.push(if gumbel {
             tree.gumbel_q()
         } else if pruned.is_some() {
@@ -1467,6 +1480,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             tree.win(root)
         });
         n.recorded += 1;
+        n.value_only += vonly as u64;
         // value-only samples (docs/search.md 3.6): the real state from every other recording
         // seat's view, in its perspective, no options; q per the seat's view_target
         if seat.view_samples > 0.0 && view_pick(cfg.seed, slot.gid, slot.decisions, seat.view_samples) {
