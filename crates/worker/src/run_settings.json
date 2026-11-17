@@ -629,6 +629,10 @@
    "class": "trainer",
    "why": "training: TF32 matmuls in the training step (docs/az.md 57)"
   },
+  "dup_action_reduce": {
+   "class": "trainer",
+   "why": "network shape: how a token network reduces duplicate action claims (docs/az.md 58); a property of the checkpoint the ONNX graph is exported from, so the graph carries it"
+  },
   "allow_draft_layout": {
    "class": "trainer",
    "why": "a run's start refuses a draft token layout unless set (docs/az.md 43.4); a worker plays its build's game rows"

@@ -8118,7 +8118,10 @@ duplicate claims - a deliberate change, made at a fork.
 next to the trunk. The export's graphs gain one TopK per row over the row's writes (MTG Zero: n_tok K = 850), the size
 of the sort 41.2 already measured. Farm workers need no rebuild: the graph carries the reduction in ONNX Runtime's
 ordinary operators (TopK, Gather, ScatterElements without reduction); the pool exports a 'max' checkpoint under a new
-template fingerprint (its config differs: one full export, 53).
+template fingerprint (its config differs: one full export, 53). In check-config's table
+(`crates/worker/src/run_settings.json`) `dup_action_reduce` is `trainer` (the graph carries it): a worker build older
+than the key calls it unknown, and the pool and `farm_h2h` drop a key this core's table calls trainer-only before a job
+reaches it (as `infer_precision`, 57), so the farm's existing builds serve a 'max' run.
 
 ### 58.1 Tests and checks
 
