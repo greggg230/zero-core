@@ -205,8 +205,40 @@ class Tail:
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device)
         return {'row': t(row), 'seg': t(seg), 'slot': t(slot), 'val': t(val)}
 
+    def to_torch_flat(self, device):
+        """`to_torch`'s tail (unpadded) for a transfer: 'row' / 'seg' / 'slot' as there, the floats as stored ('vflat':
+        `val`, float16 or float32, no padding columns) and each token's first float ('voff' int64 [NT + 1]) instead of
+        'val' [NT, Wt]. `expand_tail` makes 'val' of them on their device: `to_torch`'s bit for bit (a float16 is exact
+        in float32). The training feed's upload (`data.batches`, docs/az.md 57.3): fewer bytes, no host padding."""
+        import torch
+        row = np.repeat(np.arange(self.N, dtype=np.int64), self.counts())
+        t = lambda a: torch.from_numpy(np.ascontiguousarray(a)).to(device)
+        return {'row': t(row), 'seg': t(self.seg.astype(np.int64)), 'slot': t(self.slot.astype(np.int64)),
+                'vflat': t(self.val), 'voff': t(self.voff())}
+
     def __repr__(self):
         return f'Tail(N={self.N}, NT={self.NT}, segs={sorted(self.widths)})'
+
+
+def expand_tail(b, wt):
+    """A batch dict whose 'tail' is `Tail.to_torch_flat`'s -> the same dict with that tail as `Tail.to_torch`'s ('val'
+    float32 [NT, wt], `wt` the widest tail segment: each token's floats in its first columns, zeros after), made on the
+    tensors' device without a host sync (index_copy_). Any other batch (no tail, or a padded one) is returned as is."""
+    tl = b.get('tail')
+    if not isinstance(tl, dict) or 'vflat' not in tl:
+        return b
+    import torch
+    tl = dict(tl)
+    vflat, voff = tl.pop('vflat'), tl.pop('voff')
+    nt = voff.numel() - 1
+    val = torch.zeros(nt * wt, dtype=torch.float32, device=vflat.device)
+    n = vflat.numel()
+    if n:
+        k = torch.arange(n, device=vflat.device)
+        tok = torch.searchsorted(voff[1:], k, right=True)    # each float's token
+        val.index_copy_(0, tok * wt + (k - voff[tok]), vflat.float())
+    tl['val'] = val.view(nt, wt)
+    return dict(b, tail=tl)
 
 
 class Overrides:

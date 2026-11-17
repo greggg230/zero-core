@@ -621,6 +621,14 @@
    "class": "trainer",
    "why": "Python inference: the CUDA graphs' length-sorted chunks (docs/az.md 43.11); the native worker answers through its graph in its own pieces"
   },
+  "infer_precision": {
+   "class": "trainer",
+   "why": "Python inference on CUDA: bfloat16 autocast / TF32 matmuls in the run's own evaluators (docs/az.md 57); the native worker answers through its ONNX graph in float32"
+  },
+  "train_tf32": {
+   "class": "trainer",
+   "why": "training: TF32 matmuls in the training step (docs/az.md 57)"
+  },
   "allow_draft_layout": {
    "class": "trainer",
    "why": "a run's start refuses a draft token layout unless set (docs/az.md 43.4); a worker plays its build's game rows"

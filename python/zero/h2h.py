@@ -479,11 +479,14 @@ def summary(rs, paired=False):
     return out
 
 
-def _evaluators(ma, mb, device, graphs, max_rows=None):
+def _evaluators(ma, mb, device, graphs, max_rows=None, precision=None):
     """Each side's NetEvaluator; `graphs` None (each one's default), a bool for both, or (a, b) (None:
-    that side's default); `max_rows`: batches evaluated in pieces of at most that many rows."""
+    that side's default); `max_rows`: batches evaluated in pieces of at most that many rows; `precision` both sides'
+    arithmetic (NetEvaluator's, the run setting infer_precision: docs/az.md 57; None: 'fp32')."""
     ga, gb = graphs if isinstance(graphs, (tuple, list)) else (graphs, graphs)
     kw = {} if max_rows is None else {'max_rows': int(max_rows)}
+    if precision is not None and precision != 'fp32':
+        kw['precision'] = precision
     return {'a': NetEvaluator(ma, device, graphs=ga, **kw), 'b': NetEvaluator(mb, device, graphs=gb, **kw)}
 
 
@@ -517,6 +520,13 @@ def _look_out(out, sa, sb, stats, max_rows, evs=None):
         out['max_rows'] = max_rows
 
 
+def _precision_out(out, evs):
+    """`precision`: the sides' network arithmetic when it is not float32 (docs/az.md 57)."""
+    p = {getattr(ev, 'precision', 'fp32') for ev in evs.values()}
+    if p != {'fp32'}:
+        out['precision'] = '/'.join(sorted(p))
+
+
 def _graphs_used(out, evs, graphs):
     """`graphs_a` / `graphs_b`: each side's CUDA-graph batches over its batches (with `graphs` given)."""
     if graphs is None or (isinstance(graphs, (tuple, list)) and all(g is None for g in graphs)):
@@ -528,7 +538,7 @@ def _graphs_used(out, evs, graphs):
 
 def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None,
           spec=None, conc=None, seat_a=None, seat_b=None, max_steps=5000, move_log=0, rows=False, paired=False,
-          sims_a=None, sims_b=None, graphs=None, max_rows=None, sparse=None):
+          sims_a=None, sims_b=None, graphs=None, max_rows=None, sparse=None, precision=None):
     """Checkpoint `a` vs checkpoint `b` (paths), `games` 2-player games, seats alternating. -> dict.
     `seat_a` / `seat_b`: each side's move-rule seat settings ({'select': 'cq', 'select_min_visits':
     2, ...}; {} = the default rule; None = its checkpoint's run's eval_select, `run_rule`).
@@ -538,7 +548,8 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     `sims_b`: a side's simulations (None: `sims`). `graphs`: the sides' CUDA graphs (`_evaluators`;
     given: `graphs_a` / `graphs_b` in the output). A seat dict with `lookahead` is a lookahead side
     (docs/search.md 3.9: the output's `lookahead_*`, `look`); `max_rows` the evaluators' (`_max_rows`);
-    `sparse` the driver's sparse batches (None: with a lookahead side; docs/search.md 2.2)."""
+    `sparse` the driver's sparse batches (None: with a lookahead side; docs/search.md 2.2). `precision`: both sides'
+    network arithmetic ('fp32' | 'tf32' | 'bf16', docs/az.md 57; None: 'fp32'; another is named in the output)."""
     if paired and games % 2:
         raise ValueError(f'paired games: an even number of games ({games})')
     ma, mb, game = _load_pair(a, b, device, game)
@@ -546,7 +557,7 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
     mr = _max_rows(sa, sb, max_rows)
     sp = _sparse(sa, sb, sparse)
-    evs = _evaluators(ma, mb, device, graphs, mr)
+    evs = _evaluators(ma, mb, device, graphs, mr, precision)
     t0 = time.time()
     st = []
     rs = _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, st, sp)
@@ -556,6 +567,7 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     _graphs_used(out, evs, graphs)
     _look_out(out, sa, sb, st, mr, evs)
     _merge_out(out, sa, sb, st)
+    _precision_out(out, evs)
     if sp:
         out['sparse'] = True
     if paired:
@@ -582,7 +594,7 @@ def _sides_sims(out, sims_a, sims_b):
 def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, beta=0.05, target_se=None, sims=64,
                chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None, spec=None, conc=None,
                seat_a=None, seat_b=None, max_steps=5000, paired=False, sims_a=None, sims_b=None, on_batch=None,
-               rows=False, graphs=None, max_rows=None, sparse=None):
+               rows=False, graphs=None, max_rows=None, sparse=None, precision=None):
     """`match` in batches of `batch_games` until decided: `sprt` (elo0, elo1) - the log-likelihood ratio
     (`sprt_llr`) leaves `sprt_bounds(alpha, beta)` - or `se` <= `target_se`, or `max_games` played. Batch k
     is seeded seed + 7919 k (batch 0: `seed`, the plain match's games). -> `match`'s dict over every game,
@@ -607,7 +619,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
     mr = _max_rows(sa, sb, max_rows)
     sp = _sparse(sa, sb, sparse)
-    evs = _evaluators(ma, mb, device, graphs, mr)
+    evs = _evaluators(ma, mb, device, graphs, mr, precision)
     t0 = time.time()
     st = []
     rs, batches, stop, llr = [], [], None, None
@@ -645,6 +657,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     _graphs_used(out, evs, graphs)
     _look_out(out, sa, sb, st, mr, evs)
     _merge_out(out, sa, sb, st)
+    _precision_out(out, evs)
     if sp:
         out['sparse'] = True
     if paired:
@@ -726,6 +739,9 @@ def main(argv=None):
     for side in ('a', 'b'):
         ap.add_argument(f'--{side}-graphs', type=int, default=None, choices=[0, 1],
                         help=f"side {side.upper()}'s CUDA graphs (over --graphs)")
+    ap.add_argument('--precision', default=None, choices=['fp32', 'tf32', 'bf16'],
+                    help="both sides' network arithmetic on CUDA (the run setting infer_precision, docs/az.md 57; "
+                         "default fp32)")
     ap.add_argument('--lookahead', default=None, metavar='SETTINGS',
                     help="both sides lookahead seats (docs/search.md 3.9; zero.lookahead.parse, e.g. "
                          "plies=6,worlds=8,opp=best,mode=infoset,budget=200000)")
@@ -854,13 +870,13 @@ def main(argv=None):
                          a.target_se, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device, spec=a.spec,
                          seat_a=sides[0], seat_b=sides[1], paired=a.paired, sims_a=a.a_sims, sims_b=a.b_sims,
                          on_batch=lambda r: print('# batch ' + json.dumps(r), file=sys.stderr, flush=True), graphs=graphs,
-                         max_rows=a.max_rows, conc=a.conc, groups=a.groups, sparse=a.sparse)
+                         max_rows=a.max_rows, conc=a.conc, groups=a.groups, sparse=a.sparse, precision=a.precision)
         print(json.dumps(out), flush=True)
         return
     print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
                            spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log, paired=a.paired,
                            sims_a=a.a_sims, sims_b=a.b_sims, graphs=graphs, max_rows=a.max_rows, conc=a.conc,
-                           groups=a.groups, sparse=a.sparse)), flush=True)
+                           groups=a.groups, sparse=a.sparse, precision=a.precision)), flush=True)
 
 
 if __name__ == '__main__':

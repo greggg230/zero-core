@@ -2209,6 +2209,7 @@ class Worker:
         m, _ = load(os.path.join(self.rdir, model), c['infer_device'], game=self.test.get('load_game') or c['game'])
         if self.drv is None:
             R = Run(self.rdir, c)
+            # (float32 whatever the run's infer_precision: a remote worker's inference is its own, docs/az.md 57)
             self.evr = NetEvaluator(m, c['infer_device'], workers=c.get('infer_workers', 1),
                                     token_chunks=c.get('infer_token_chunks', 0))
             seat = R.nn_seat('m', c['sims'], selfplay=True)

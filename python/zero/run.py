@@ -74,7 +74,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, resign as RS, runctl
+from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, precision as PR, resign as RS, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths, shard_rows
 from .rows import forward_kw
 from .finite import NonFinite, check_state, head
@@ -386,6 +386,12 @@ DEFAULTS = dict(
     # the same rows, their answers moved by float32 rounding (a row's outputs depend on its batch's shape). 0 / 1 =
     # each batch whole, as before
     infer_token_chunks=0,
+    # infer_precision 'bf16' | 'tf32' = the run's CUDA evaluators (self-play, its league seats, its evaluation and Elo
+    # matches; not a remote worker's) compute in bfloat16 autocast / with TF32 matmuls (docs/az.md 57): their answers
+    # move by that rounding. 'fp32' = float32, as before
+    infer_precision='fp32',
+    # train_tf32 1 = the training step's float32 matmuls as TF32 on CUDA (docs/az.md 57); 0 = float32, as before
+    train_tf32=0,
     # sparse 1 = the run's drivers (self-play and matches) send sparse network batches (each row's
     # non-zero features, DriverCfg::sparse, docs/search.md 2.2): the same rows, games and samples; a
     # token network's CUDA graphs scatter them on the device instead of the host copying the dense
@@ -677,7 +683,8 @@ class Run:
     def evaluator(self, path):
         m, _ = load(path, self.cfg['infer_device'], game=self.cfg['game'])
         return NetEvaluator(m, self.cfg['infer_device'], workers=self.cfg.get('infer_workers', 1),
-                            token_chunks=self.cfg.get('infer_token_chunks', 0))
+                            token_chunks=self.cfg.get('infer_token_chunks', 0),
+                            precision=self.cfg.get('infer_precision', 'fp32'))
 
     def nn_seat(self, key, sims, selfplay=False):
         """A network seat at the run's settings: self-play's, or every evaluation's (no noise, no
@@ -1653,61 +1660,62 @@ class Run:
             idx, b = next(feed)
             for k, has in enumerate(gseen):
                 gsteps[k] += bool(has[idx].any())
-            rk = forward_kw(b)                     # (variable-length rows: tail / ov; {} without - the calls of before)
-            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
-                if static:
-                    o = model.forward_static(b['x'], b['n_players'], b['full'], b['ntok'], aux=bool(aw), **rk)
-                    plog, vlog, mp = o[:3]
-                    if aw:
-                        ap = o[3]
-                elif aw:
-                    plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True, **rk)
+            with PR.train_scope(c, dev):           # (train_tf32 / infer_precision 'tf32': docs/az.md 57; else no context)
+                rk = forward_kw(b)                     # (variable-length rows: tail / ov; {} without - the calls of before)
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
+                    if static:
+                        o = model.forward_static(b['x'], b['n_players'], b['full'], b['ntok'], aux=bool(aw), **rk)
+                        plog, vlog, mp = o[:3]
+                        if aw:
+                            ap = o[3]
+                    elif aw:
+                        plog, vlog, mp, ap = model(b['x'], b['n_players'], aux=True, **rk)
+                    else:
+                        plog, vlog, mp = model(b['x'], b['n_players'], **rk)
+                plog, vlog, mp = plog.float(), vlog.float(), mp.float()
+                logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)
+                if nview:
+                    dec = b['mask'].any(1).float()                         # rows with options: decisions
+                    lp = (-(b['pi'] * logp).sum(1) * dec).sum() / dec.sum().clamp(min=1.0)
                 else:
-                    plog, vlog, mp = model(b['x'], b['n_players'], **rk)
-            plog, vlog, mp = plog.float(), vlog.float(), mp.float()
-            logp = F.log_softmax(plog.masked_fill(~b['mask'], -1e9), dim=1)
-            if nview:
-                dec = b['mask'].any(1).float()                         # rows with options: decisions
-                lp = (-(b['pi'] * logp).sum(1) * dec).sum() / dec.sum().clamp(min=1.0)
-            else:
-                lp = -(b['pi'] * logp).sum(1).mean()
-            zt = ((1 - vq) * b['z'] + vq * b['q'])[:, :S]
-            lv = -(zt * F.log_softmax(vlog, dim=1).clamp(min=-1e4)).sum(1).mean()
-            present = (torch.arange(S, device=b['x'].device)[None, :] < b['n_players'][:, None]).float()
-            lm = (((mp - b['sc'][:, :S]) ** 2) * present).sum(1).mean() / 2
-            loss = lp + lv + mw * lm
-            terms = [lp.detach(), lv.detach(), lm.detach()]
-            if aw:
-                # (a window with shards of an older layout: each target's rows, docs/az.md 37)
-                tkw = {'tmask': b['aux_tmask']} if 'aux_tmask' in b else {}
-                la = AUX.losses(self.aux, ap.float(), b['aux'], b['aux_mask'], **tkw)
-                for name, v in la.items():
-                    if self.aux_w[name] > 0:
-                        loss = loss + self.aux_w[name] * v['loss']
-                    terms.append(v['loss'].detach())
-                # the readers: their targets' losses on their own outputs (docs/az.md 36)
-                lr_ = {}
-                for name, lay, rsl, tsl in rcols:
-                    rkw = {'tmask': b['aux_tmask'][:, tidx[name]:tidx[name] + 1]} if tkw else {}
-                    lr_[name] = AUX.losses(lay, ap[:, rsl].float(), b['aux'][:, tsl], b['aux_mask'], **rkw)[name]
-                    loss = loss + self.aux_w[name] * lr_[name]['loss']
-                    terms.append(lr_[name]['loss'].detach())
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            # the non-finite guard (docs/az.md 4.1): one device sync per step, before the step
-            if not bool(torch.isfinite(torch.stack(terms + [gnorm.float()])).all()):
-                with torch.no_grad():
-                    per = {'policy': -(b['pi'] * logp).sum(1),
-                           'value': -(zt * F.log_softmax(vlog, dim=1).clamp(min=-1e4)).sum(1),
-                           'margin': (((mp - b['sc'][:, :S]) ** 2) * present).sum(1) / 2}
-                named = {'policy': lp, 'value': lv, 'margin': lm}
+                    lp = -(b['pi'] * logp).sum(1).mean()
+                zt = ((1 - vq) * b['z'] + vq * b['q'])[:, :S]
+                lv = -(zt * F.log_softmax(vlog, dim=1).clamp(min=-1e4)).sum(1).mean()
+                present = (torch.arange(S, device=b['x'].device)[None, :] < b['n_players'][:, None]).float()
+                lm = (((mp - b['sc'][:, :S]) ** 2) * present).sum(1).mean() / 2
+                loss = lp + lv + mw * lm
+                terms = [lp.detach(), lv.detach(), lm.detach()]
                 if aw:
-                    named.update({f'aux_{name}': v['loss'] for name, v in la.items()})
-                    named.update({f'reader_{name}': v['loss'] for name, v in lr_.items()})
-                self.nonfinite_step(it, step, steps, b, idx, W, model, named,
-                                    gnorm, per, dict(lr=g_lr, value_q=vq, margin_loss_w=mw, amp=amp, device=dev))
-            opt.step()
+                    # (a window with shards of an older layout: each target's rows, docs/az.md 37)
+                    tkw = {'tmask': b['aux_tmask']} if 'aux_tmask' in b else {}
+                    la = AUX.losses(self.aux, ap.float(), b['aux'], b['aux_mask'], **tkw)
+                    for name, v in la.items():
+                        if self.aux_w[name] > 0:
+                            loss = loss + self.aux_w[name] * v['loss']
+                        terms.append(v['loss'].detach())
+                    # the readers: their targets' losses on their own outputs (docs/az.md 36)
+                    lr_ = {}
+                    for name, lay, rsl, tsl in rcols:
+                        rkw = {'tmask': b['aux_tmask'][:, tidx[name]:tidx[name] + 1]} if tkw else {}
+                        lr_[name] = AUX.losses(lay, ap[:, rsl].float(), b['aux'][:, tsl], b['aux_mask'], **rkw)[name]
+                        loss = loss + self.aux_w[name] * lr_[name]['loss']
+                        terms.append(lr_[name]['loss'].detach())
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                # the non-finite guard (docs/az.md 4.1): one device sync per step, before the step
+                if not bool(torch.isfinite(torch.stack(terms + [gnorm.float()])).all()):
+                    with torch.no_grad():
+                        per = {'policy': -(b['pi'] * logp).sum(1),
+                               'value': -(zt * F.log_softmax(vlog, dim=1).clamp(min=-1e4)).sum(1),
+                               'margin': (((mp - b['sc'][:, :S]) ** 2) * present).sum(1) / 2}
+                    named = {'policy': lp, 'value': lv, 'margin': lm}
+                    if aw:
+                        named.update({f'aux_{name}': v['loss'] for name, v in la.items()})
+                        named.update({f'reader_{name}': v['loss'] for name, v in lr_.items()})
+                    self.nonfinite_step(it, step, steps, b, idx, W, model, named,
+                                        gnorm, per, dict(lr=g_lr, value_q=vq, margin_loss_w=mw, amp=amp, device=dev))
+                opt.step()
             if step >= steps - last:
                 with torch.no_grad():
                     p = logp.exp()
@@ -1745,6 +1753,8 @@ class Run:
                        value_q=vq, seconds=secs, samples_per_s=steps * c['batch'] / max(secs - load_s, 1e-9), device=dev)
             if nview:
                 out['window_view_samples'] = nview
+            if c.get('train_tf32') and torch.device(dev).type == 'cuda':
+                out['tf32'] = True                 # (docs/az.md 57)
             if aw:
                 out['aux'] = dict(AUX.window_stats(W, self.aux), weights=dict(self.aux_w))
                 if added:
@@ -2724,6 +2734,12 @@ def resolve_config(args, saved):
                else 'not with the self-play league (selfplay_league 0)' if L.enabled(cfg) else None)
         if why:
             raise SystemExit(f'selfplay_local_linger: {why}')
+    try:
+        cfg['infer_precision'] = PR.check(cfg.get('infer_precision'))
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    if cfg.get('train_tf32', 0) not in (0, 1, True, False):
+        raise SystemExit(f"train_tf32 {cfg.get('train_tf32')!r}: 0 or 1 (docs/az.md 57)")
     if cfg.get('shard_writer_thread') or (isinstance(cfg.get('resolver_cfg'), dict)
                                           and cfg['resolver_cfg'].get('shard_writer_thread')):
         if cfg.get('resolver'):

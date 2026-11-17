@@ -156,6 +156,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` | 30, 3, 3600 | co-training (11.6): a worker backing off this many seconds gives its outstanding matches back; a match outstanding on a worker longer than this many of its expected latencies (at least 120 s; 0 = the timeout only) is requeued, and at the latest after `selfplay_remote_timeout` s of the worker's running time |
 | `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed. A `cuda` / `mps` device (also `heldout_device`) the machine does not have refuses the run at its start (exit 78, 47.7; before 2026-11-12 training fell back to the CPU in silence) |
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
+| `infer_precision` | 'fp32' | 'bf16' / 'tf32' = the run's own CUDA evaluators (self-play, league seats, evaluation and Elo matches; zero.h2h `precision`) compute in bfloat16 autocast / with TF32 matmuls: their answers move by that rounding; a remote worker and a CPU / MPS evaluator stay float32 (57) |
+| `train_tf32` | 0 | 1 = the training step's float32 matmuls as TF32 on CUDA (57) |
 | `sparse` | 0 | 1 = the run's drivers (self-play and matches) send sparse network batches (each row's non-zero features; docs/search.md 2.2): the same rows, games and samples; a token network's CUDA graphs scatter them on the device, other evaluators densify them (10.7) |
 | `eval_cache` | 0 | N > 0 = every network seat (self-play and evaluation) keeps its game's network answers, at most N per game, by a hash of each row's features and options, and answers a repeated row from them instead of sending it (docs/search.md 3.12; the same answers up to float rounding at another batch shape) (25) |
 | `eval_trace` | 0 | 1 = a native eval job's rows carry each game's record and its digest (zero-farm analysis campaigns: every real move, replayed on the desktop); the Python match refuses it; games unchanged (50) |
@@ -7980,3 +7982,74 @@ Replayed on pb3's log up to the 16:37 restart: the threshold is 18.9 min (median
 16:56, not after 93 minutes. Tests: `test_stall_watch.py` (the 11-16 shape, midnight, restarts, a new run's fallback,
 `--once`'s exit codes, a dump without py-spy). A real dump of a sleeping Python process with py-spy 0.4 on Windows
 named the function it slept in.
+
+## 57. Network arithmetic: bfloat16 / TF32 inference, TF32 training, the feed's flat tails (`infer_precision`, `train_tf32`; MTG Zero's speed review SP2 / T2 / T4, 2026-11-17)
+
+**Why.** MTG Zero's pb3 measurements (2026-11-16, the desktop's RTX 5090, the run's own build and settings) found
+self-play GPU-bound in float32 and training's step dominated by its matmuls and the tail floats' upload. The user
+accepted the arithmetic rounding (2026-11-17): bfloat16 for self-play / evaluation inference, TF32 for training. These
+change the network's arithmetic, not the game or the search. Branch `feat/precision`.
+
+### 57.1 `infer_precision` 'fp32' | 'tf32' | 'bf16' (default 'fp32')
+
+`NetEvaluator(precision=)` (`zero.precision`): 'bf16' = bfloat16 autocast around every forward of the evaluator - a
+token network's CUDA graphs captured under it (`TokenGraphRunner(amp=True)`, the measurement flag of 43.11 made a
+setting), the eager path (`evaluate`, `aux`, `reader`) under it too; 'tf32' = TF32 float32 matmuls while a graph is
+warmed up and captured (a replay keeps the kernels of its capture, whatever the flag is then) and around every eager
+forward. A conv network (`GridNet`) is in bfloat16 already (`use_amp`). On a CPU / MPS evaluator the setting is
+ignored (float32, said on stderr).
+
+Who follows it: `Run.evaluator` - self-play (rolling and not), the league's past checkpoints (`league.evaluator`),
+`Run.play_match` / the Elo matches and anchors; `zero.h2h.match` / `sequential` take `precision` (CLI `--precision`)
+for **both** sides (MTG Zero's yardsticks pass the run's), the output naming it when not 'fp32'. Both sides of every
+evaluation compute at the same precision, so a rating compares networks, not arithmetic. **Not** a remote worker
+(`remoteplay.Worker`: float32 whatever the run says; the Mac's MPS / CPU inference is float32 anyway) and not the
+farm (zero-farm workers run their ONNX graph in float32; `run_settings.json` classifies both keys `trainer`: a worker
+build that does not know them ignores them, 44). Neither of those was bit-identical to the desktop's CUDA graphs
+before (float32 rounding of other kernels), so their rows differ from this machine's as before, by more.
+Checkpoints carry no precision: a run may change the setting at a restart (its later self-play, Elo and yardstick
+games at the new one; the paired h2h of 57.5 measured no strength difference).
+
+**The TF32 flag is process-wide** (`torch.backends.cuda.matmul.allow_tf32`; cuBLAS reads it when a matmul is
+issued, from any thread), unlike autocast (thread-local). A run trains while its local linger self-plays on another
+thread (5.3), so every block that sets it holds one process lock (`precision.matmul_tf32`), restoring the flag
+after; with `infer_precision` 'tf32' or `train_tf32` the training step holds it too, at its own value
+(`precision.train_scope`): a capture on the linger thread waits for the step (and a step for a capture) instead of
+leaking TF32 into it or float32 into it. Without either setting the step takes no lock (the code of before).
+
+### 57.2 `train_tf32` 0 | 1 (default 0)
+
+`Run.train_model`'s step (forward, losses, backward, clipping, the optimizer step) inside `matmul_tf32(True)` on a
+CUDA training device (ignored on the CPU); the iteration's training metrics carry `"tf32": true`. bfloat16 training
+is not offered: slower than TF32 on the 5090 and 6x the drift (below), with MTG Zero's NaN history in bfloat16.
+
+### 57.3 The training feed's tail floats travel flat (no setting: exact)
+
+`data.batches` on a CUDA device with a window holding tails (43.3): each batch's tail floats go up as the window
+stores them (float16, no padding columns: `Window.batch(flat_tail=True)` -> `rows.Tail.to_torch_flat`, 'vflat' and
+each token's first float 'voff') and are padded on the device into the `[NT, Wt]` float32 tensor the network takes
+(`rows.expand_tail`: `searchsorted` + `index_copy_`, no host sync). The same batches bit for bit - a float16 is exact
+in float32, and the scatter puts each float where `Tail.padded` does - so it is not a setting (`batches(flat_tail=)`
+forces it either way; None: auto). Other paths (`Window.batch` alone, `row_inputs`, distill's `Taught` windows, the
+CPU) are unchanged.
+
+### 57.4 Tests and checks
+
+`tests/test_precision.py`: the settings' defaults and refusals; a CPU evaluator stays float32 (bit for bit); the
+flag scoped, restored on an exception, re-entrant, and a second thread's block held off while one runs; the training
+scope (no context without either setting); on CUDA, 'fp32' is the evaluator of before bit for bit, 'tf32' / 'bf16'
+within their rounding of it (graphs deterministic), bf16 visibly different, the flag off after every capture and
+forward, a TF32-captured graph replaying its TF32 answers with the flag off; h2h's sides and output; `expand_tail` =
+`to_torch` bit for bit (float16 and float32 stores, rows without tails, no tail token at all, CPU and CUDA); the feed
+with flat tails = the feed of before bit for bit (dense and coo windows, prefetch 0 / 2, static and plain batches,
+CPU forced and CUDA auto); auto on CUDA only. Defaults byte-identical: MTG Zero's checkpoint_compat gate.
+
+### 57.5 Measured (MTG Zero's pb3, 2026-11-16, the desktop's RTX 5090; `sp2_measurements_2026-11-16`)
+
+* Self-play, pb3 settings, conc 1536: TF32 +12%, bf16 +26% (mixed host load) to +33% (quiet host) leaves/s; at conc
+  2048 +25% / +50-75%. Replayed batches: graph 5.32 ms fp32, 4.40 TF32, 3.28 bf16. bf16 makes self-play host-bound.
+* Rounding against fp32 on 135k real rows: TF32 priors max 6.2e-3 (20 top moves of 114k changed), bf16 7.0e-2
+  (258 changed). Paired h2h against fp32 (1,600 games each, SE 0.009): TF32 +3.5 +- 6.2 Elo, bf16 0.0 +- 6.4: no loss.
+* Training (train_bench, batch 512): flat tails -10% a step (79.4 -> 71.4 ms; the blocking upload 9.4 -> 5.5 ms),
+  batches bit-identical; TF32 GPU step -15 to -20%, end-network drift 4x the run's own GPU nondeterminism, last-200
+  loss +0.005%, no NaN; bfloat16 6x the drift and slower than TF32.

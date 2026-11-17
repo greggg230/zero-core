@@ -67,6 +67,7 @@ external player's latency at each search step. Caverna: 200 games vs the JS bot 
 bot decision) 129 s inline -> 110 s async, same games (run.py `ext_groups`, docs/az.md 5); the
 Glass Road JS bot (~0.1 s per decision): 12.4 -> 3.75 min.
 """
+import contextlib
 import copy
 import os
 import time
@@ -117,13 +118,23 @@ def _fold(model):
     return m
 
 
+def _capture_ctx(tf32):
+    """A graph's warm-up and capture: under TF32 matmuls when `tf32` (infer_precision 'tf32', docs/az.md 57), else as
+    before (no context)."""
+    if not tf32:
+        return contextlib.nullcontext()
+    from .precision import matmul_tf32
+    return matmul_tf32(True)
+
+
 class GraphRunner:
     """CUDA graphs of a GridNet's evaluation (see the module docstring). `evaluate` has
     NetEvaluator.evaluate's contract; `refresh()` after the source model's weights changed (the
     folded weights are rewritten in place: the captured graphs keep reading them)."""
 
-    def __init__(self, model):
+    def __init__(self, model, tf32=False):
         self.base = model
+        self.tf32 = bool(tf32)                       # captured under TF32 matmuls (infer_precision 'tf32', docs/az.md 57)
         self.dev = next(model.parameters()).device
         self.net = _fold(model)
         self.F = model.features
@@ -160,15 +171,16 @@ class GraphRunner:
         if g is None:
             x = torch.zeros((Bp, self.F), device=self.dev)
             n = torch.full((Bp,), 2, dtype=torch.int64, device=self.dev)
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side), torch.no_grad():
-                for _ in range(2):                   # warm-up (cuDNN picks its kernels)
-                    self._run(x, n)
-            torch.cuda.current_stream().wait_stream(side)
-            graph = torch.cuda.CUDAGraph()
-            with torch.no_grad(), torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
-                out = self._run(x, n)
+            with _capture_ctx(self.tf32):
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side), torch.no_grad():
+                    for _ in range(2):               # warm-up (cuDNN picks its kernels)
+                        self._run(x, n)
+                torch.cuda.current_stream().wait_stream(side)
+                graph = torch.cuda.CUDAGraph()
+                with torch.no_grad(), torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
+                    out = self._run(x, n)
             g = self.graphs[Bp] = (graph, x, n, out)
         return g
 
@@ -404,11 +416,13 @@ class TokenGraphRunner:
     download queued by the next launch just before its replay (or at its result), never ahead of an
     upload on the copy engine.
 
-    float32 (`amp`: bfloat16 autocast, for measurements only - never a default). The answers
+    float32 by default. `amp`: bfloat16 autocast around the forward the graphs capture; `tf32`: TF32 matmuls while a
+    graph is captured (its replays keep those kernels) - the run setting infer_precision 'bf16' / 'tf32' (opt-in,
+    docs/az.md 57: the answers move by that rounding). The answers
     are eager's up to float32 rounding (other matrix shapes: docs/az.md 10.6 has the measured
     differences); deterministic for a given batch."""
 
-    def __init__(self, model, amp=False, chunks=1):
+    def __init__(self, model, amp=False, chunks=1, tf32=False):
         from .net import TokenNet
         if not isinstance(model, TokenNet):
             raise TypeError(f'TokenGraphRunner: a token network (net.TokenNet), not {type(model).__name__}')
@@ -422,6 +436,7 @@ class TokenGraphRunner:
         self.A = model.config['actions']
         self.S = model.seats
         self.amp = bool(amp)
+        self.tf32 = bool(tf32)
         self.layout = list(getattr(model, 'aux_layout', None) or [])
         self.W = sum(int(w) for _, w, _ in self.layout)
         self.pidx = np.asarray(model.present_index(), np.int64)
@@ -726,15 +741,16 @@ class TokenGraphRunner:
                 full.zero_()
                 ntok.fill_(1)
                 self._pad_inputs(tail, ov)
-                side = torch.cuda.Stream()
-                side.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(side):
-                    for _ in range(2):               # warm-up (cuBLAS, the attention kernels)
-                        self._run(x, n, full, ntok, tail, ov)
-                torch.cuda.current_stream().wait_stream(side)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
-                    out, aux = self._run(x, n, full, ntok, tail, ov)
+                with _capture_ctx(self.tf32):
+                    side = torch.cuda.Stream()
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        for _ in range(2):           # warm-up (cuBLAS, the attention kernels)
+                            self._run(x, n, full, ntok, tail, ov)
+                    torch.cuda.current_stream().wait_stream(side)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=self.pool, capture_error_mode=CAPTURE_MODE):
+                        out, aux = self._run(x, n, full, ntok, tail, ov)
             g = self.graphs[key] = (graph, x, reg, o, out, aux)
             self.captures += 1
         return g
@@ -1369,10 +1385,14 @@ class NetEvaluator:
     takes each batch's tail and overrides (`LeafBatch.tail` / `.ov`, `rows.Tail` / `rows.Overrides`; the
     overrides resolved on the host, `rows.resolve`); every other network refuses a batch that carries them,
     and the evaluator of a game that declares tails (`game_info()['tails']`) refuses at its construction any
-    network but a token network with the same tail segments (ValueError, R4)."""
+    network but a token network with the same tail segments (ValueError, R4).
+
+    `precision` (the run setting infer_precision, docs/az.md 57; opt-in): 'fp32' (default: as before), 'bf16'
+    (bfloat16 autocast around every forward, the CUDA graphs' captures included) or 'tf32' (TF32 matmuls in every
+    eager forward and graph capture); on a CPU / MPS evaluator float32 whatever it says (said on stderr)."""
 
     def __init__(self, model, device='cpu', graphs=None, workers=1, allow_mismatch=False, max_rows=None,
-                 token_chunks=1):
+                 token_chunks=1, precision='fp32'):
         if max_rows is not None and int(max_rows) < 1:
             raise ValueError(f'max_rows {max_rows}: at least 1 (None: every batch whole)')
         # a token network's CUDA graphs: each batch as at most this many length-sorted chunks (docs/az.md 43.11;
@@ -1383,7 +1403,13 @@ class NetEvaluator:
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
         self.width = None if allow_mismatch else getattr(model, 'features', None)
-        self.amp = use_amp(model, self.device)
+        from .precision import check
+        self.precision = check(precision)
+        if self.precision != 'fp32' and self.device.type != 'cuda':
+            _say(f'infer_precision {self.precision!r} on a {self.device.type} evaluator: float32 (CUDA only, docs/az.md 57)')
+            self.precision = 'fp32'
+        self.amp = use_amp(model, self.device) or self.precision == 'bf16'
+        self.tf32 = self.precision == 'tf32'
         self._check_game_tails()
         if getattr(model, 'config', {}).get('arch') == 'tokens':
             self.fast = self._token_graphs(graphs)
@@ -1393,7 +1419,7 @@ class NetEvaluator:
             elif graphs and getattr(model, 'config', {}).get('arch') != 'grid':
                 raise ValueError(f"CUDA graphs asked for an arch {getattr(model, 'config', {}).get('arch', 'mlp')!r} "
                                  f"network: conv ('grid') and token ('tokens') networks have them")
-            self.fast = GraphRunner(self.model) if graphs else None
+            self.fast = GraphRunner(self.model, tf32=self.tf32) if graphs else None
         self.fast_aux = isinstance(self.fast, TokenGraphRunner)   # its graphs answer root belief rows too
         self.calls = 0
         self.leaves = 0
@@ -1491,9 +1517,24 @@ class NetEvaluator:
             return None
         if self.device.type != 'cuda':
             raise ValueError(f'token network CUDA graphs asked for on a {self.device.type} evaluator (CUDA only)')
-        _say(f'token network CUDA graphs on (float32; batches padded to {ROW_STEP} rows x {T_STEP} tokens'
+        arith = {'fp32': 'float32', 'bf16': 'bfloat16 autocast', 'tf32': 'TF32 matmuls'}[self.precision]
+        _say(f'token network CUDA graphs on ({arith}; batches padded to {ROW_STEP} rows x {T_STEP} tokens'
              + (f'; at most {self.token_chunks} length-sorted chunks a batch' if self.token_chunks > 1 else '') + ')')
-        return TokenGraphRunner(self.model, chunks=self.token_chunks)
+        return self._token_runner()
+
+    def _token_runner(self):
+        return TokenGraphRunner(self.model, chunks=self.token_chunks, amp=self.amp, tf32=self.tf32)
+
+    def _fwd_ctx(self):
+        """An eager forward's arithmetic: bfloat16 autocast when `amp`, TF32 matmuls when `tf32` (docs/az.md 57)."""
+        ac = torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp)
+        if not self.tf32:
+            return ac
+        from .precision import matmul_tf32
+        st = contextlib.ExitStack()
+        st.enter_context(matmul_tf32(True))
+        st.enter_context(ac)
+        return st
 
     def set_weights(self, state_dict):
         """New weights in place. The auxiliary head's (training only, `net.add_aux`) are optional both
@@ -1523,9 +1564,9 @@ class NetEvaluator:
         self.model = model.to(self.device).eval()
         self._check_game_tails()
         if isinstance(self.fast, TokenGraphRunner):
-            self.fast = TokenGraphRunner(self.model, chunks=self.token_chunks)
+            self.fast = self._token_runner()
         elif self.fast is not None:
-            self.fast = GraphRunner(self.model)
+            self.fast = GraphRunner(self.model, tf32=self.tf32)
 
     def _check_width(self, x):
         if self.width is not None and x.shape[1] != self.width:
@@ -1607,7 +1648,7 @@ class NetEvaluator:
         xt = torch.from_numpy(x).to(dev, non_blocking=True)
         nt = torch.from_numpy(n_players.astype(np.int64)).to(dev)
         tk = self._torch_tail(kw, opt_off, opt_action)
-        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
+        with self._fwd_ctx():
             if len(brows):
                 plog, vlog, mar, raw = self.model(xt, nt, aux=True, aux_rows=torch.from_numpy(brows).to(dev), **tk)
             else:
@@ -1722,7 +1763,7 @@ class NetEvaluator:
             if self.model.option_pointers:
                 # (the auxiliary outputs read no policy logit: no options, so no overrides - an empty set)
                 tk['ov'] = {k: torch.zeros(0, dtype=torch.long, device=self.device) for k in ('row', 'act', 'ref', 'col')}
-        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp):
+        with self._fwd_ctx():
             return self.model(xt, nt, aux=True, **tk)[3]
 
     @torch.inference_mode()

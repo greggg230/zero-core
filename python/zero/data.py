@@ -826,15 +826,25 @@ def _run_all(fn, n, threads):
         return [f.result() for f in futs]
 
 
-def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False):
+def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False, flat_tail=None):
     """A training's `n` batches: `size` window rows drawn from `rng` (uniform, with replacement),
     one draw per batch in order -> (rows, W.batch(rows, device, tokens)). `prefetch` > 0: drawn and
     built up to that many batches ahead on a background thread (as CPU tensors, moved to `device` as
     they are taken) while the caller trains on the current one - the same draws, the same
     batches. A failure there is raised here; closing the generator (or dropping it) stops the
     thread. `coo` (a sparse window): each batch's features travel as their non-zeros and are
-    scattered into the dense rows on `device` (`Window.batch`'s `coo`: the same rows, bit for bit)."""
+    scattered into the dense rows on `device` (`Window.batch`'s `coo`: the same rows, bit for bit).
+    A window with tails on a CUDA `device` (`flat_tail` None: auto; True / False forces it): each batch's tail floats
+    travel as stored, unpadded (`Window.batch`'s `flat_tail`), and are padded on the device (`rows.expand_tail`):
+    the same batches, bit for bit, ~40% less upload (docs/az.md 57.3)."""
+    if flat_tail is None:
+        flat_tail = isinstance(W, Window) and W.tail is not None and torch.device(device).type == 'cuda'
+    flat_tail = bool(flat_tail)
+    wt = max(W.tail.widths.values(), default=0) if flat_tail else 0
+
     def build(idx, dev):                       # (a window-like `W` without the options: the call of before)
+        if flat_tail:
+            return W.batch(idx, dev, tokens=tokens, coo=coo, flat_tail=True)
         return W.batch(idx, dev, tokens=tokens, coo=coo) if tokens is not None or coo else W.batch(idx, dev)
 
     def to(b):
@@ -842,11 +852,16 @@ def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False):
             # (a window's 'tail' / 'ov' are dicts of tensors: variable-length rows, docs/az.md 43)
             b = {k: ({j: u.to(device) for j, u in v.items()} if isinstance(v, dict) else v.to(device))
                  for k, v in b.items()}
-        return dense_coo(b, W.F) if coo else b
+        b = dense_coo(b, W.F) if coo else b
+        return R.expand_tail(b, wt) if flat_tail else b
     if not prefetch:
         for _ in range(n):
             idx = rng.integers(W.N, size=size)
-            yield idx, to(build(idx, 'cpu')) if coo else build(idx, device)
+            if coo:
+                yield idx, to(build(idx, 'cpu'))
+            else:
+                b = build(idx, device)
+                yield idx, R.expand_tail(b, wt) if flat_tail else b
         return
     q = queue.Queue(maxsize=prefetch)
     stop = threading.Event()
@@ -1155,7 +1170,7 @@ class Window:
                                              present=R.presence(np.asarray(x), self.layout)), device)
         return out
 
-    def batch(self, idx, device='cpu', tokens=None, coo=False):
+    def batch(self, idx, device='cpu', tokens=None, coo=False, flat_tail=False):
         """The training batch of window rows `idx` (tensors on `device`). `tokens` (a token network's
         static forward, run setting train_static: (TokenNet.present_index() as an int64 array, T step))
         adds each row's tokens as `TokenNet.forward_static` takes them: 'full' [B, T] (their positions in
@@ -1165,7 +1180,9 @@ class Window:
         device -, the tokens read from them.
         A window with tails / overrides (`layout`): 'tail' (`rows.Tail.to_torch`: the network's `tail`, unpadded) and
         'ov' (`rows.resolve`d: the network's `ov`, a pointer to an absent head slot or a missing tail token refused);
-        with `tokens`, each row's tail tokens follow its head tokens in 'full' (`rows.token_full`)."""
+        with `tokens`, each row's tail tokens follow its head tokens in 'full' (`rows.token_full`). `flat_tail`: the
+        tail as `rows.Tail.to_torch_flat`'s ('vflat' / 'voff' for 'val': `rows.expand_tail` pads it on the device;
+        `batches`' upload, docs/az.md 57.3)."""
         B = len(idx)
         off = self.opt_off
         starts = off[idx]
@@ -1206,7 +1223,7 @@ class Window:
         else:
             tokens_p = tokens
         if tail is not None:
-            out['tail'] = tail.to_torch(device)
+            out['tail'] = tail.to_torch_flat(device) if flat_tail else tail.to_torch(device)
         if tokens_p is not None:
             pidx, step = tokens_p
             has = pidx >= 0
