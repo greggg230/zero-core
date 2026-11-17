@@ -69,6 +69,35 @@ from .finite import check_state
 from .protocol import MAX_SEATS
 
 AUX_LOSSES = ('multinomial', 'poisson', 'mse')
+# the run setting dup_action_reduce (docs/az.md 58): how a token network reduces two tokens' logits for one action -
+# 'legacy' (the plain scatter: TokenNet's `dup_reduce` None) or 'max'
+DUP_REDUCE = ('legacy', 'max')
+
+
+def check_dup_reduce(v):
+    """A token network's `dup_reduce` (docs/az.md 58): None / 'legacy' -> None (the plain scatter of before), 'max' ->
+    'max'; anything else ValueError."""
+    if v is None or v == 'legacy':
+        return None
+    if v == 'max':
+        return 'max'
+    raise ValueError(f'dup_action_reduce {v!r}: one of {DUP_REDUCE} (docs/az.md 58)')
+
+
+def set_dup_reduce(model, v):
+    """`model` (a token network) reducing duplicate action claims by `v` (`check_dup_reduce`'s values): the attribute
+    and its config entry (none for 'legacy': a legacy network's config as before) - the weights untouched, every output
+    of a row without a duplicate claim unchanged. -> whether anything changed. A network of another architecture has no
+    such scatter: unchanged (False)."""
+    v = check_dup_reduce(v)
+    if not isinstance(model, TokenNet) or getattr(model, 'dup_reduce', None) == v:
+        return False
+    model.dup_reduce = v
+    if v is None:
+        model.config.pop('dup_reduce', None)
+    else:
+        model.config['dup_reduce'] = v
+    return True
 
 
 def aux_layout(aux):
@@ -809,11 +838,17 @@ class TokenNet(nn.Module):
     """
 
     def __init__(self, features, actions, layout, d=128, layers=3, heads=4, ff=256, seats=MAX_SEATS, game='toy',
-                 head=128, arch='tokens', aux=None, readers=None, aux_parts=None):
+                 head=128, arch='tokens', aux=None, readers=None, aux_parts=None, dup_reduce=None):
         super().__init__()
         lay = tokens_layout(layout, features, actions)
         self.config = {'arch': 'tokens', 'features': features, 'actions': actions, 'layout': lay, 'd': d,
                        'layers': layers, 'heads': heads, 'ff': ff, 'seats': seats, 'game': game, 'head': head}
+        # the policy logit of an action two tokens score (docs/az.md 58): None = the plain scatter of before (the last
+        # write on the CPU, an undefined one on CUDA; absent from the config, so a legacy checkpoint is byte-identical),
+        # 'max' = the largest of the claims on every device and in the export
+        self.dup_reduce = check_dup_reduce(dup_reduce)
+        if self.dup_reduce is not None:
+            self.config['dup_reduce'] = self.dup_reduce
         if d % heads:
             raise ValueError(f'tokens: d {d} is not a multiple of heads {heads}')
         self.features, self.seats, self.actions, self.d = features, seats, actions, d
@@ -1343,7 +1378,26 @@ class TokenNet(nn.Module):
             acts = torch.where(self.tok_isid[fc], ia[..., None], acts)
         acts = torch.where(keep[..., None] & (cols >= 0), acts, self.actions)
         lg = self.ptr(F.gelu(self.pk(hc) + self.pq(zc)[:, None])).gather(2, cols.clamp(min=0))
-        return zc, pc.scatter(1, acts.flatten(1), lg.flatten(1))
+        return zc, self._scatter_policy(pc, acts.flatten(1), lg.flatten(1))
+
+    def _scatter_policy(self, base, idx, val):
+        """The static scatter of the pointer logits into the policy: base [B, actions + 1] (the generic logits, the dummy
+        column last), idx / val [B, L] each write's action and logit. Where two writes of a row name the same action
+        (two tokens claiming one action: two equal cards' identity action), `dup_reduce` decides (docs/az.md 58): None
+        the plain scatter (which write survives is up to the device: the last on the CPU, undefined on CUDA), 'max' the
+        largest claim - an order-free, exact reduction (the answer is one of the inputs), so every device and the ONNX
+        export (`onnx_export._scatter_max`) answer it bit for bit from the same logits. An action nobody writes keeps
+        its generic logit either way."""
+        if self.dup_reduce is None:
+            return base.scatter(1, idx, val)
+        # (the claims reduced apart from `base`: scatter_reduce's backward would share an action's gradient with a
+        # generic logit equal to its largest claim - every one at a new network's zero output layers -, where the plain
+        # scatter gives an overwritten generic logit none; the written places then taken from the claims)
+        val = val.to(base.dtype)
+        top = torch.full_like(base, float('-inf')).scatter_reduce(1, idx, val, 'amax', include_self=False)
+        hit = torch.zeros(base.shape, dtype=torch.bool, device=base.device).scatter(
+            1, idx, torch.ones(idx.shape, dtype=torch.bool, device=base.device))
+        return torch.where(hit, top, base)
 
     def _pointer(self, hid):
         """The pointer head's logits of every column ([..., columns]): `ptr`, its rows in parts (`ptr_parts`):
@@ -1407,7 +1461,7 @@ class TokenNet(nn.Module):
             acts = torch.where(self.tok_isid[fcl], ia[..., None], acts)
         acts = torch.where(keep[..., None] & (cols >= 0), acts, self.actions)
         P = self._pointer(F.gelu(self.pk(hc) + self.pq(zc)[:, None]))   # [Bc, Tc, columns]
-        pc = gen.scatter(1, acts.flatten(1), P.gather(2, cols.clamp(min=0)).flatten(1))
+        pc = self._scatter_policy(gen, acts.flatten(1), P.gather(2, cols.clamp(min=0)).flatten(1))
         if ov is not None:
             r, a, p, gc, isg, bw, isgen = ov
             v, g0 = P[r, p, gc], gen[r, a]
@@ -2221,12 +2275,14 @@ def _grid_index(cfg):
     return planes, [i for i in range(cfg['features']) if i not in inplane]
 
 
-def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0, aux=None, readers=None):
+def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0, aux=None, readers=None,
+             dup_reduce=None):
     """A new network for `game` (info = games.info(game)): 'mlp' (`Net`, hidden x blocks), 'grid'
     (`GridNet` over the game package's board planes, ch x blocks) or 'tokens' (`TokenNet` over
     the game package's object layout: d = hidden, layers = blocks, heads, ff (0: 2 x hidden)); `aux`:
     its auxiliary targets (`aux_layout`; None: no auxiliary head, the network of before); `readers`:
-    its readers (`reader_layout`, docs/az.md 36; None: none, the network of before)."""
+    its readers (`reader_layout`, docs/az.md 36; None: none, the network of before); `dup_reduce`: a token network's
+    reduction of duplicate action claims (`check_dup_reduce`, docs/az.md 58; None / 'legacy': the network of before)."""
     kw = {'aux': aux} if aux else {}
     if readers:
         kw['readers'] = readers
@@ -2241,6 +2297,8 @@ def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0,
         layout = package.active().tokens_of(game)
         if not layout:
             raise SystemExit(f"arch 'tokens': the game package has no object layout for {game!r} (GamePackage.tokens)")
+        if check_dup_reduce(dup_reduce) is not None:
+            kw['dup_reduce'] = check_dup_reduce(dup_reduce)
         return TokenNet(F_, A_, layout, d=hidden, layers=blocks, heads=heads, ff=ff or 2 * hidden, game=game,
                         **kw).eval()
     if arch != 'mlp':

@@ -80,7 +80,7 @@ from .rows import forward_kw
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
 from .net import (NO_DECAY, EncodingMismatch, add_aux, add_reader, aux_layout, check_belief_head, check_checkpoint, load,
-                  make_net, no_decay_params, reader_layout, save)
+                  check_dup_reduce, make_net, no_decay_params, reader_layout, save, set_dup_reduce)
 from .protocol import MAX_SEATS
 from .runctl import EXIT_PAUSED, EXIT_REFUSED, Paused
 from .shardthread import MB, SampleClock, ThreadedShardWriter, split_records
@@ -392,6 +392,12 @@ DEFAULTS = dict(
     infer_precision='fp32',
     # train_tf32 1 = the training step's float32 matmuls as TF32 on CUDA (docs/az.md 57); 0 = float32, as before
     train_tf32=0,
+    # dup_action_reduce 'max' = the run's token network scores an action two of its tokens claim (two equal cards'
+    # identity action) by the largest claim, the same on every device and in the farm's export (docs/az.md 58): a
+    # network property - a new run's network is built with it, a fork's / resumed run's checkpoint gets it at its next
+    # training (its weights untouched), every checkpoint it trains carries it. 'legacy' = the plain scatter of before
+    # (undefined on CUDA which claim survives) and leaves a checkpoint's own rule as it is
+    dup_action_reduce='legacy',
     # sparse 1 = the run's drivers (self-play and matches) send sparse network batches (each row's
     # non-zero features, DriverCfg::sparse, docs/search.md 2.2): the same rows, games and samples; a
     # token network's CUDA graphs scatter them on the device instead of the host copying the dense
@@ -678,7 +684,8 @@ class Run:
         c = self.cfg
         torch.manual_seed(c['seed'])
         return make_net(self.info, c['game'], c.get('arch', 'mlp'), c['hidden'], c['blocks'], c['ch'], c.get('heads', 4),
-                        c.get('ff', 0), aux=self.aux or None, readers=self.readers or None)
+                        c.get('ff', 0), aux=self.aux or None, readers=self.readers or None,
+                        dup_reduce=c.get('dup_action_reduce', 'legacy') if c.get('arch') == 'tokens' else None)
 
     def evaluator(self, path):
         m, _ = load(path, self.cfg['infer_device'], game=self.cfg['game'])
@@ -1505,6 +1512,12 @@ class Run:
                      f'unchanged)')
         if readers:
             model.reader_detach = bool(c.get('reader_detach', 1))
+        # dup_action_reduce 'max' (docs/az.md 58): a checkpoint without it (a fork's, a run that turned it on) gets it
+        # here - its weights as they were - and every checkpoint trained from here on carries it
+        if check_dup_reduce(c.get('dup_action_reduce', 'legacy')) is not None and set_dup_reduce(
+                model, c['dup_action_reduce']):
+            self.log(f'iter {it}: checkpoint {it - 1} reduces duplicate action claims by {c["dup_action_reduce"]!r} from '
+                     f'here on (dup_action_reduce, docs/az.md 58)')
         model.train()
         static = bool(c.get('train_static'))
         if static and not hasattr(model, 'forward_static'):
@@ -2740,6 +2753,12 @@ def resolve_config(args, saved):
         raise SystemExit(str(e)) from None
     if cfg.get('train_tf32', 0) not in (0, 1, True, False):
         raise SystemExit(f"train_tf32 {cfg.get('train_tf32')!r}: 0 or 1 (docs/az.md 57)")
+    try:
+        check_dup_reduce(cfg.get('dup_action_reduce', 'legacy'))
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    if cfg.get('dup_action_reduce', 'legacy') != 'legacy' and cfg.get('arch', 'mlp') != 'tokens':
+        raise SystemExit(f"dup_action_reduce {cfg['dup_action_reduce']!r}: a token network's (arch tokens; docs/az.md 58)")
     if cfg.get('shard_writer_thread') or (isinstance(cfg.get('resolver_cfg'), dict)
                                           and cfg['resolver_cfg'].get('shard_writer_thread')):
         if cfg.get('resolver'):

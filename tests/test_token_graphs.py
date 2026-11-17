@@ -21,10 +21,10 @@ CUDA = torch.cuda.is_available()
 AUX = [['a', 5, 'multinomial'], ['b', 3, 'mse']]
 
 
-def net(layout=TOK_LAYOUT_ID, aux=AUX, seed=0):
+def net(layout=TOK_LAYOUT_ID, aux=AUX, seed=0, dup_reduce=None):
     """A small token network with random policy, value, margin and auxiliary output layers."""
     torch.manual_seed(seed)
-    m = TokenNet(TOK_F, TOK_A, layout, d=16, layers=2, heads=2, ff=32, head=16, aux=aux).eval()
+    m = TokenNet(TOK_F, TOK_A, layout, d=16, layers=2, heads=2, ff=32, head=16, aux=aux, dup_reduce=dup_reduce).eval()
     with torch.no_grad():
         for lin in [m.gen, m.ptr, m.val[-1], m.mar[-1]] + ([m.aux_head[2]] if aux else []):
             lin.weight.normal_(0, 0.3)
@@ -167,10 +167,19 @@ def close(a, b, tol=2e-5):
         assert u.shape == v.shape and u.dtype == v.dtype and np.abs(u - v).max() <= tol, np.abs(u - v).max()
 
 
+# The two tests below compare the graphs with eager inference to 2e-5. With TOK_LAYOUT_ID two present units of a row
+# can claim the same identity action, and under the legacy plain scatter (dup_reduce None) which claim survives is
+# undefined on CUDA: eager and the graphs could keep different copies' logits (~4e-5 apart; docs/az.md 58). So legacy
+# is tested on rows without duplicate claims (TOK_LAYOUT: every action a slot's own), and 'max' - deterministic on
+# every device - on the identity layout, duplicates included.
+GRAPH_NETS = {'legacy': dict(layout=TOK_LAYOUT), 'max': dict(layout=TOK_LAYOUT_ID, dup_reduce='max')}
+
+
 @pytest.mark.skipif(not CUDA, reason='CUDA graphs need CUDA')
-def test_graphs_match_eager_and_follow_new_weights():
+@pytest.mark.parametrize('dup', sorted(GRAPH_NETS))
+def test_graphs_match_eager_and_follow_new_weights(dup):
     import copy
-    m = net().cuda()
+    m = net(**GRAPH_NETS[dup]).cuda()
     eager = NetEvaluator(m, 'cuda', graphs=False)
     fast = NetEvaluator(copy.deepcopy(m), 'cuda', graphs=True)
     assert isinstance(fast.fast, TokenGraphRunner) and eager.fast is None
@@ -194,11 +203,12 @@ def test_graphs_match_eager_and_follow_new_weights():
 
 
 @pytest.mark.skipif(not CUDA, reason='CUDA graphs need CUDA')
-def test_absent_slots_are_never_read():
+@pytest.mark.parametrize('dup', sorted(GRAPH_NETS))
+def test_absent_slots_are_never_read(dup):
     """The host copies the features outside the segments and the present slots only: an absent slot's
     floats (here NaN, its present flag aside) change nothing, eager or through the graphs, before and
-    after batches that filled those slots."""
-    m = net().cuda()
+    after batches that filled those slots (legacy on rows without duplicate claims: GRAPH_NETS)."""
+    m = net(**GRAPH_NETS[dup]).cuda()
     eager = NetEvaluator(m, 'cuda', graphs=False)
     fast = NetEvaluator(m, 'cuda', graphs=True)
     x, npl, off, act, kind = a_batch(m, 50, 61)

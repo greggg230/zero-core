@@ -52,7 +52,9 @@ Every graph a GPU provider runs as the CPU does (docs/az.md 41.2; metadata `uniq
 a place for each (`_csr_rows`' spare places for the row ends; the policy's last writer of each action made explicit,
 `_scatter_last`; a refused pointer override to a spare place of its own), no integer leaves int32 (`check_int32` on
 every export, zero-onnx/1 too), opset 17 (`opset17`: DirectML runs ScatterElements up to version 16). The CPU's answers
-are the earlier graph's, bit for bit; `scatter_writes` checks a graph's scatters on real inputs.
+are the earlier graph's, bit for bit; `scatter_writes` checks a graph's scatters on real inputs. A token network with
+`dup_reduce` 'max' (docs/az.md 58) gets the largest claim of each action instead of the last (`_scatter_max`: the writes
+sorted by value, then the same unique scatter; metadata `dup_reduce` 'max'); 'mask' and 'packed' only.
 
 How a token network (`net.TokenNet`) packs its objects inside the graph (`packing`):
 
@@ -179,19 +181,39 @@ def _scatter_last(base, idx, val):
     return out.index_select(1, torch.arange(S, dtype=torch.int64, device=dev))
 
 
-def _policy_full(gen, acts, lg, flat, cpos, n_tok):
+def _scatter_max(base, idx, val):
+    """base [B, S].scatter_reduce(1, idx [B, L], val [B, L], 'amax', include_self=False) - TokenNet's policy scatter
+    under `dup_reduce` 'max' (docs/az.md 58) - with every write to its own place: the writes of each row put in
+    ascending order of their values (a sort: TopK), then `_scatter_last` - the last write of each index in that order is
+    its largest. The answer is one of the writes (no arithmetic), so the same as torch's on every device, bit for bit;
+    equal values tie to equal bits. Every scatter unique, no accumulate scatter (docs/az.md 41.2)."""
+    p = torch.sort(val, dim=1).indices
+    return _scatter_last(base, idx.gather(1, p), val.gather(1, p))
+
+
+def _scatter_policy(net, base, idx, val):
+    """The policy's static scatter as `net` (a TokenNet) computes it (`TokenNet._scatter_policy`, docs/az.md 58): its
+    `dup_reduce` None the CPU's last writer (`_scatter_last`, the graphs of before), 'max' the largest claim
+    (`_scatter_max`)."""
+    if getattr(net, 'dup_reduce', None) == 'max':
+        return _scatter_max(base, idx, val)
+    return _scatter_last(base, idx, val)
+
+
+def _policy_full(gen, acts, lg, flat, cpos, n_tok, net=None):
     """The static scatter of a packed token list's pointer logits into the policy, per row (`_scatter_last`): gen [B, A1]
     (the generic logits, the dummy column last), acts / lg [N, K] each packed head token's actions (the dummy column
     `A1 - 1` for none) and logits, flat [B n_tok] the full token axis's presence, cpos [B n_tok] a present position's
     packed index. Each row's writes laid out on its full token axis ([B, n_tok K]: absent slots write the dummy column) -
     a row's packed tokens are in layout order, so a write's place on the axis orders the row's writes as the packed
-    list's flat scatter did: the same last writer of every action, bit for bit."""
+    list's flat scatter did: the same last writer of every action, bit for bit. `net`'s `dup_reduce` 'max': the largest
+    claim of every action instead (`_scatter_policy`; the order then does not matter)."""
     B, A1 = gen.shape
     N, K = acts.shape
     fidx = torch.where(flat, cpos, N)
     a = torch.cat([acts, acts.new_full((1, K), A1 - 1)]).index_select(0, fidx).view(B, n_tok * K)
     v = torch.cat([lg, lg.new_zeros(1, K)]).index_select(0, fidx).view(B, n_tok * K)
-    return _scatter_last(gen, a, v)
+    return _scatter_policy(net, gen, a, v)
 
 
 def _check_policy_keys(net):
@@ -277,7 +299,7 @@ def _trunk_mask(net, h, keep, ids):
         acts = torch.where(net.tok_isid[None], ia[..., None], acts)
     acts = torch.where(keep[..., None] & (cols >= 0), acts, net.actions)
     lg = net.ptr(F.gelu(net.pk(h) + net.pq(z)[:, None])).gather(2, cols.clamp(min=0))
-    return z, _scatter_last(pc, acts.flatten(1), lg.flatten(1))
+    return z, _scatter_policy(net, pc, acts.flatten(1), lg.flatten(1))
 
 
 def _row_tokens(pres, n_tok):
@@ -343,7 +365,7 @@ def _trunk_packed(net, h, pres, ids):
         acts = torch.where(net.tok_isid.index_select(0, slot), ia[:, None], acts)
     acts = torch.where(cols >= 0, acts, net.actions)
     lg = net.ptr(F.gelu(net.pk(hp) + net.pq(z).index_select(0, row))).gather(1, cols.clamp(min=0))
-    return z, _policy_full(pc, acts, lg, flat, cpos, NT)
+    return z, _policy_full(pc, acts, lg, flat, cpos, NT, net)
 
 
 class ZeroOnnx(nn.Module):
@@ -366,6 +388,10 @@ class ZeroOnnx(nn.Module):
         self.packing = packing if self.tokens else None
         if self.packing in ('mask', 'packed'):
             _check_policy_keys(net)
+        elif self.packing and getattr(net, 'dup_reduce', None) is not None:
+            # (their policy scatter is TokenNet._trunk's own: scatter_reduce, an opset-18 reduction opset17 refuses)
+            raise ValueError(f'zero-onnx: packing {self.packing!r} has no export of dup_reduce '
+                             f'{net.dup_reduce!r} (docs/az.md 58): mask or packed')
         self.layout = list(getattr(net, 'aux_layout', None) or [])
         self.W = sum(int(w) for _, w, _ in self.layout)
 
@@ -746,7 +772,7 @@ class ZeroOnnx2(ZeroOnnx):
         C = P.shape[1]
         lg = P[:N].gather(1, _iclamp(cols, 0))
         cposh = flat.long().cumsum(0) - 1                         # a present head position's packed index
-        pol = _policy_full(gen, acts, lg, flat, cposh, NTOK).reshape(-1)
+        pol = _policy_full(gen, acts, lg, flat, cposh, NTOK, net).reshape(-1)
         if net.option_pointers:
             # ---- the overrides (docs/az.md 43.7): each one's row, its option's action, its target token (a present
             # head slot or a tail token of its row) and column; checked as rows.resolve and TokenNet._ov_index check
@@ -930,6 +956,8 @@ def metadata(net, packing, extra=None):
             'exporter': 'torch.onnx.export(dynamo=True)', 'torch': torch.__version__}
     if packing == 'host':
         meta['present_index'] = json.dumps(net.present_index())
+    if getattr(net, 'dup_reduce', None) is not None:
+        meta['dup_reduce'] = str(net.dup_reduce)  # (docs/az.md 58; absent: the plain scatter's last writer, as before)
     for k, v in (extra or {}).items():
         meta[str(k)] = v if isinstance(v, str) else json.dumps(v)
     return meta

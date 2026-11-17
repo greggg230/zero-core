@@ -158,6 +158,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
 | `infer_precision` | 'fp32' | 'bf16' / 'tf32' = the run's own CUDA evaluators (self-play, league seats, evaluation and Elo matches; zero.h2h `precision`) compute in bfloat16 autocast / with TF32 matmuls: their answers move by that rounding; a remote worker and a CPU / MPS evaluator stay float32 (57) |
 | `train_tf32` | 0 | 1 = the training step's float32 matmuls as TF32 on CUDA (57) |
+| `dup_action_reduce` | 'legacy' | 'max' = a token network scores an action two of its tokens claim (two equal cards' identity action) by the largest claim - the same answer on every device and in the farm's export; a network property recorded in the checkpoint (a new run's network built with it, a fork's / resumed run's at its next training); 'legacy' = the plain scatter (CUDA keeps an undefined claim) (58) |
 | `sparse` | 0 | 1 = the run's drivers (self-play and matches) send sparse network batches (each row's non-zero features; docs/search.md 2.2): the same rows, games and samples; a token network's CUDA graphs scatter them on the device, other evaluators densify them (10.7) |
 | `eval_cache` | 0 | N > 0 = every network seat (self-play and evaluation) keeps its game's network answers, at most N per game, by a hash of each row's features and options, and answers a repeated row from them instead of sending it (docs/search.md 3.12; the same answers up to float rounding at another batch shape) (25) |
 | `eval_trace` | 0 | 1 = a native eval job's rows carry each game's record and its digest (zero-farm analysis campaigns: every real move, replayed on the desktop); the Python match refuses it; games unchanged (50) |
@@ -8053,3 +8054,85 @@ CPU forced and CUDA auto); auto on CUDA only. Defaults byte-identical: MTG Zero'
 * Training (train_bench, batch 512): flat tails -10% a step (79.4 -> 71.4 ms; the blocking upload 9.4 -> 5.5 ms),
   batches bit-identical; TF32 GPU step -15 to -20%, end-network drift 4x the run's own GPU nondeterminism, last-200
   loss +0.005%, no NaN; bfloat16 6x the drift and slower than TF32.
+
+## 58. Duplicate action claims reduced by their largest (`dup_action_reduce` 'max'; MTG Zero's token-graph flake, 2026-11-17)
+
+**Why.** A token network scores an action from the token that claims it: a slot's own actions, and in a segment with
+`id_actions` its identity's action (43). Two tokens can claim the same action - two equal cards in hand both claim
+"cast X" -, and the policy's static scatter (`TokenNet._trunk`, `_trunk_ext`) then writes that action's logit twice.
+Which write survives is up to the device: the CPU (torch's and ONNX Runtime's sequential kernels) keeps the last, CUDA
+an undefined one (41.2's "repeated indices"). So the same network answers such a row differently on a GPU, in a CPU
+worker and through the farm's export, and its CUDA graphs and its eager forward can keep different copies' logits:
+`tests/test_token_graphs.py`'s two graphs-against-eager tests failed in about half the runs (3.66e-5 against their
+2e-5; MTG Zero ENGINE.md 183.4), and every MTG self-play row with two copies of a card in hand carried the coin flip.
+The user chose to fix it at the next fork (2026-11-17), opt-in.
+
+**The reduction: the largest claim.** The copies are one action: the network should give it one logit, whatever slots
+the copies sit in. Of the candidates:
+
+* *first / last by token index* - deterministic, and 'last' is what the CPU and the export already answer, but not
+  symmetric in the copies: the action's prior is that of whichever copy the layout puts last, the other copies' logits
+  are thrown away and get no gradient, so the slot order (a nuisance) decides what the network learns.
+* *mean* (or log-sum-exp) - symmetric, every copy trained, but a sum: its float rounding depends on the order of the
+  additions (CUDA's atomic scatter-add is not deterministic from three copies on), and the export would need an
+  accumulate scatter, which a GPU-safe graph cannot have (41.2; ONNX Runtime's CPU ScatterND add races). Log-sum-exp
+  would also give a duplicated card more prior mass than a single copy (two copies are not two moves).
+* *max* - symmetric (any order of the copies, the same answer), exact (the answer is one of the claims: no rounding,
+  so CPU, CUDA, MPS and ONNX Runtime agree bit for bit from the same logits), and a no-op when the copies agree (equal
+  cards in different slots should). Its gradient goes to the largest claim (equal claims share it): the copy the policy
+  actually used.
+
+So 'max'. An action no token claims keeps its generic logit, as before; the dummy column (padding, empty slots) is
+sliced off either way.
+
+**What it does.** A token network's `dup_reduce` (`TokenNet(dup_reduce=)`, `net.check_dup_reduce` /
+`set_dup_reduce`): None - the plain scatter of before - or 'max'. `TokenNet._scatter_policy`, under every forward
+(eager in any chunking, `forward_static` and so the CUDA graphs, the variable-length trunk): with 'max' the claims are
+reduced apart from the generic logits (`scatter_reduce(..., 'amax', include_self=False)` into -inf), the written places
+then taken from that, the rest from the generic logits. (A `scatter_reduce` straight into the generic logits would
+share an action's gradient with a generic logit equal to its largest claim - every one at a new network's zero output
+layers -, where the plain scatter gives an overwritten generic logit none.) The export (`zero.onnx_export`, zero-onnx/1
+'mask' / 'packed' and zero-onnx/2): `_scatter_max` - each row's writes put in ascending order of their values (a sort:
+TopK), then 41.2's `_scatter_last`, whose last writer of each action in that order is its largest. Every scatter stays
+unique, no accumulate scatter, opset 17; metadata `dup_reduce` 'max'. 'compact' and 'host' (`_trunk`'s own scatter, an
+opset-18 reduction there) refuse it.
+
+**A network property, versioned in the checkpoint.** The reduction is part of what the network computes, so it lives in
+the network's config (`config['dup_reduce']`, absent for None): every consumer of a checkpoint - the run's evaluators,
+its Elo and league seats, `zero.h2h`, the farm pool's export and so the farm workers - follows the checkpoint it loads,
+and a 'max' network trained on CUDA is evaluated as it was trained, everywhere. The run setting `dup_action_reduce`
+('legacy' default | 'max') decides it for the run's own networks: a new run's network is built with it
+(`make_net(dup_reduce=)`), and a run resumed or forked with 'max' turns it on in the checkpoint its next training loads
+(`Run.train_model`: the weights untouched; logged "iter N: checkpoint N-1 reduces duplicate action claims by 'max'
+..."), so every checkpoint it trains from then on carries it. The self-play before that first training plays the parent
+checkpoint with its own rule. 'legacy' never strips 'max' from a checkpoint (a network keeps the rule it was trained
+with). Refused for a run whose network is not a token network.
+
+**Off by default.** 'legacy': the network, its config, its checkpoints and its export are those of before, byte for
+byte (the plain scatter; no config key; no metadata key; the traced graph unchanged). Turn it on for a new run or a
+fork: `--dup-action-reduce max` (or `"dup_action_reduce": "max"` in a new run's config; `fork_run.py --source ...
+--set dup_action_reduce=max`). Not in a live run's config: its next training would change the policy of every row with
+duplicate claims - a deliberate change, made at a fork.
+
+**Costs.** The policy scatter becomes a `scatter_reduce`, a boolean scatter and a `where` over [B, actions + 1]: noise
+next to the trunk. The export's graphs gain one TopK per row over the row's writes (MTG Zero: n_tok K = 850), the size
+of the sort 41.2 already measured. Farm workers need no rebuild: the graph carries the reduction in ONNX Runtime's
+ordinary operators (TopK, Gather, ScatterElements without reduction); the pool exports a 'max' checkpoint under a new
+template fingerprint (its config differs: one full export, 53).
+
+### 58.1 Tests and checks
+
+`tests/test_dup_reduce.py`: the setting's default and refusals (an unknown rule, a non-token run); the config entry
+(absent for legacy, recorded for 'max', kept through save / load / build, `set_dup_reduce` on and off with the weights
+untouched); on rows where two units claim the same identity action (>= 15 of 120 rows), 'max' = the largest claim and
+legacy = the CPU's last write, every other logit and every row without a duplicate bit-identical in both modes; 'max'
+in every forward (chunked, `forward_static`) and its gradient (the largest claim only, ties shared, an overwritten
+generic logit none); the CPU evaluator's repeats; on CUDA (skipped without one) eager and the graphs the same bits over
+20 repeats and within 2e-5 of the CPU; the export: `_scatter_max` = torch's amax bit for bit (ties included), in torch
+and through ONNX Runtime at opset 17, every write to its own place; zero-onnx/1 'mask' and 'packed' and zero-onnx/2
+(tails with identity actions on the head items, the gated blend) through `onnx_parity`'s gate within 2e-5 on rows full of
+duplicate claims, every scatter unique, the metadata, 'compact' refused; a token run started with 'max' (both of its
+checkpoints carry it) and a legacy run resumed with it (checkpoint 1 legacy, 2 'max', the log line).
+`tests/test_token_graphs.py`'s two graphs-against-eager tests run per mode: legacy on rows without duplicate claims
+(the plain layout: on duplicates its outcome is undefined on CUDA), 'max' on the identity layout, duplicates included -
+tolerances unchanged.
