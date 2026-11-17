@@ -601,6 +601,10 @@
    "class": "trainer",
    "why": "the Python writer's queue"
   },
+  "game_records": {
+   "class": "trainer",
+   "why": "the run keeps the records of the games its quota accepts (docs/az.md 59); a farm worker's game records already hold every move, and the pool writes them"
+  },
   "infer_device": {
    "class": "trainer",
    "why": "Python inference device (the native worker: ONNX Runtime CPU)"

@@ -870,6 +870,29 @@ the record's fields and repro line numbers, a remote's and the pool's failures w
 `panics`, the dedup key, the remote worker's `failure` event reaching the run). On real games: MTG Zero's
 `engine/tests/selfplay_panic.rs` and `tests/test_selfplay_panic.py` (its ENGINE.md 172).
 
+### 2.20 The game log: every finished game's moves on its result row (`set_game_log`; MTG Zero's game database, 2026-11-17)
+
+**Why.** MTG Zero wants a database of every self-play game (its `tools/gamedb.py`): what a game did - its piles, its
+counters, how it ended - is in its moves, and today a local or remote driver keeps no moves of its games (only the farm's
+traced games do, 2.17, and those become rows). Turning the trace on is not the answer: it changes the training records
+(`Record::step`) and must be set before the first resume.
+
+**What it does.** `Driver::set_game_log(on)` (Python `SearchDriver.set_game_log`): every game that finishes from then on
+carries `GameResult::log` = `GameLog {seed, steps, setup, spec, nets}` - the game's seed, every real move (as a trace's:
+single-option steps and external answers included, a chained contest's episode boundaries), `record_setup` at its end,
+the JSON of the spec it started from (its queued setup's, else the driver's at its start) and the smallest and largest
+network id of its records. The moves are the failure log the driver keeps for every game anyway (2.18): nothing about
+the game, its search, its records or its samples changes, and it can be turned on or off at any time (a game in flight
+has its whole log). Not with branched games or archive starts (refused: a branch's log starts at its branch point).
+`take_results` (and `take_game_records`) give the row's `log` as a dict: `seed`, `actions` (bytes: each move a
+little-endian u16; None when a step is not an action, then `steps`: the trace record's JSON list as text), `n_actions`,
+`setup`, `spec`, `nets` ([lo, hi] or None). Off (the default) a row has no `log` key: nothing changes.
+
+**Tests.** `driver::tests::the_game_log_changes_no_game_and_no_row` (log on from the second phase of a rolling driver
+against off: the same games, every record bit for bit), `a_game_log_is_the_games_trace` (with the trace on too: seed,
+moves and setup equal the trace's; the networks the records'; the moves replay the game from its seed to its end),
+`set_game_log_never_with_branches`. Its use: `zero/gamerec.py`, docs/az.md 59.
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),
