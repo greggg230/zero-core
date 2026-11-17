@@ -4225,6 +4225,182 @@ fn teacher_decisions_play_and_record_the_games_policy_without_a_search() {
     TEACHER_MODE.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The toy with its two-option decisions marked value-only decisions (`SearchGame::value_only_decision`, docs/search.md
+/// 3.20) when its mode (`VONLY_MODE` at `new_game`) is 1; 2 also names them teacher decisions (policy 1, 3).
+#[derive(Clone)]
+struct VonlyToy(ToyGame, u8);
+
+impl VonlyToy {
+    fn two_options(&self) -> bool {
+        let mut l = Vec::new();
+        self.0.legal_actions(&mut l);
+        l.len() == 2
+    }
+}
+
+impl SearchGame for VonlyToy {
+    type Spec = <ToyGame as SearchGame>::Spec;
+    const NAME: &'static str = "vonlytoy";
+    const NUM_ACTIONS: usize = ToyGame::NUM_ACTIONS;
+    const NUM_FEATURES: usize = ToyGame::NUM_FEATURES;
+    const MIN_PLAYERS: usize = ToyGame::MIN_PLAYERS;
+    const MAX_PLAYERS: usize = ToyGame::MAX_PLAYERS;
+    const AUX: &'static [(&'static str, usize)] = ToyGame::AUX;
+    fn parse_spec(json: &str) -> Result<Self::Spec, String> {
+        ToyGame::parse_spec(json)
+    }
+    fn new_game(spec: &Self::Spec, players: usize, seed: u64) -> Result<Self, String> {
+        ToyGame::new_game(spec, players, seed).map(|g| VonlyToy(g, VONLY_MODE.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+    fn num_players(&self) -> usize {
+        self.0.num_players()
+    }
+    fn to_move(&self) -> Option<usize> {
+        self.0.to_move()
+    }
+    fn legal_actions(&self, out: &mut Vec<u16>) {
+        self.0.legal_actions(out)
+    }
+    fn step(&mut self, a: u16, chance: &mut Vec<u64>) -> Result<(), String> {
+        self.0.step(a, chance)
+    }
+    fn force_chance(&mut self, forced: &[u64]) {
+        self.0.force_chance(forced)
+    }
+    fn result(&self) -> [f32; MAX_SEATS] {
+        self.0.result()
+    }
+    fn margin(&self, seat: usize) -> f32 {
+        self.0.margin(seat)
+    }
+    fn score(&self, seat: usize) -> f32 {
+        self.0.score(seat)
+    }
+    fn determinize(&mut self, viewer: usize, rng: &mut crate::rng::Rng) {
+        self.0.determinize(viewer, rng)
+    }
+    fn encode(&self, viewer: usize, out: &mut [f32]) {
+        self.0.encode(viewer, out)
+    }
+    fn aux_target(&self, viewer: usize, out: &mut [f32]) {
+        self.0.aux_target(viewer, out)
+    }
+    fn value_only_decision(&self) -> bool {
+        self.1 != 0 && self.two_options()
+    }
+    fn teacher_policy(&self, legal: &[u16], out: &mut Vec<f32>) -> bool {
+        if self.1 != 2 || legal.len() != 2 {
+            return false;
+        }
+        out.extend([1.0, 3.0]);
+        true
+    }
+}
+
+/// VonlyToy's mode for the games made next (only
+/// `value_only_decisions_play_the_same_games_and_record_the_rows_without_their_policy` makes VonlyToy games).
+static VONLY_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[test]
+fn value_only_decisions_play_the_same_games_and_record_the_rows_without_their_policy() {
+    use std::sync::atomic::Ordering::Relaxed;
+    // traced self-play of 24 games (a rolling driver, one thread: the samples in a fixed order) -> each game's row and its samples
+    let go = |mode: u8, seat: SeatCfg| {
+        VONLY_MODE.store(mode, Relaxed);
+        let mut c = cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+        (c.seed, c.threads, c.aux, c.rolling) = (2026, 1, true, true);
+        let mut d = Driver::<VonlyToy>::new(c).unwrap();
+        d.set_trace(true).unwrap();
+        d.resume(24, 0).unwrap();
+        let mut out: Vec<(GameResult, Vec<Record>)> = Vec::new();
+        let take = |d: &mut Driver<VonlyToy>, out: &mut Vec<(GameResult, Vec<Record>)>| {
+            let rows = d.take_results();
+            let mut s = d.take_samples().into_iter();
+            for r in rows {
+                let mine: Vec<Record> = s.by_ref().take(r.samples as usize).collect();
+                out.push((r, mine));
+            }
+            assert!(s.next().is_none());
+        };
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer(&mut d, &b);
+            take(&mut d, &mut out);
+        }
+        take(&mut d, &mut out);
+        (out, d.stats())
+    };
+    let flat = |g: &[(GameResult, Vec<Record>)]| -> (Vec<GameResult>, Vec<Record>) {
+        let mut res: Vec<GameResult> = g.iter().map(|x| x.0.clone()).collect();
+        res.sort_by_key(|r| r.gid);
+        (res, g.iter().flat_map(|x| x.1.clone()).collect())
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    // off (the default): the hook answers false - no value-only decision
+    let (off, st) = go(0, nn(0, 16, true));
+    assert_eq!(st.value_only_decisions, 0);
+    let (res0, recs0) = flat(&off);
+    // on: the same games, move for move; the same rows, each two-option decision's without its options and policy
+    let (on, st) = go(1, nn(0, 16, true));
+    let (res1, recs1) = flat(&on);
+    assert!(res1.len() == 24 && res1.iter().all(|r| r.over));
+    assert_eq!(results_digest(&res1), results_digest(&res0), "a value-only decision is searched and played as before");
+    assert_eq!(res1.iter().map(|r| (r.steps, r.decisions)).collect::<Vec<_>>(), res0.iter().map(|r| (r.steps, r.decisions)).collect::<Vec<_>>());
+    assert_eq!(recs1.len(), recs0.len(), "every recorded decision still makes a row");
+    let mut vonly = 0u64;
+    for (a, b) in recs0.iter().zip(&recs1) {
+        assert_eq!((bits(&a.x), a.player, bits(&a.z), bits(&a.q), bits(&a.sc), bits(&a.aux), a.step, a.net), (bits(&b.x), b.player, bits(&b.z), bits(&b.q), bits(&b.sc), bits(&b.aux), b.step, b.net));
+        if a.opts.len() == 2 {
+            assert!(b.opts.is_empty() && b.pi.is_empty() && b.ov.is_empty(), "a value-only decision's row has no options and no policy");
+            vonly += 1;
+        } else {
+            assert_eq!((&a.opts, bits(&a.pi)), (&b.opts, bits(&b.pi)));
+        }
+    }
+    assert!(vonly > 0);
+    // (counted as recorded: a rolling driver's games past the quota record too, their rows never emitted)
+    assert!(st.value_only_decisions >= vonly, "every value-only decision of the recording seat counted");
+    // the records replay to those rows (the decider's own value-only rows accepted where the game says so) ...
+    let spec = VonlyToy::parse_spec("{}").unwrap();
+    let mut refused = 0;
+    for (r, s) in &on {
+        let rec: serde_json::Value = serde_json::from_str(&crate::record::game_json(r, s).unwrap().to_string()).unwrap();
+        VONLY_MODE.store(1, Relaxed);
+        let rp = crate::record::replay::<VonlyToy>(&spec, &rec, true).unwrap_or_else(|e| panic!("game {}: {e}", r.gid));
+        assert_eq!(rp.records.len(), s.len());
+        for (k, (a, b)) in rp.records.iter().zip(s).enumerate() {
+            same_row(a, b).unwrap_or_else(|e| panic!("game {} row {k}: {e}", r.gid));
+        }
+        // ... and are refused by a game without value-only decisions there (a build that disagrees)
+        if s.iter().any(|x| x.opts.is_empty()) {
+            VONLY_MODE.store(0, Relaxed);
+            let e = crate::record::replay::<VonlyToy>(&spec, &rec, true).err().expect("the seat to move's value-only sample at an ordinary decision");
+            assert!(e.contains("not a value-only decision"), "{e}");
+            refused += 1;
+        }
+    }
+    assert!(refused > 0);
+    // a leaf sample at a value-only decision is refused (a build that recorded the policy)
+    let (r, s) = off.iter().find(|(_, s)| s.iter().any(|x| x.opts.len() == 2)).unwrap();
+    let rec = crate::record::game_json(r, s).unwrap();
+    VONLY_MODE.store(1, Relaxed);
+    let e = crate::record::replay::<VonlyToy>(&spec, &rec, true).err().expect("a policy at a value-only decision");
+    assert!(e.contains("recorded without a policy"), "{e}");
+    // a teacher decision keeps its policy whatever the hook says (and replays)
+    let (tch, st) = go(2, nn(0, 16, true));
+    assert_eq!(st.value_only_decisions, 0);
+    assert!(st.teacher_decisions > 0);
+    for (r, s) in &tch {
+        assert!(s.iter().filter(|x| x.opts.len() == 2).all(|x| x.pi == vec![0.25, 0.75]));
+        let rec = crate::record::game_json(r, s).unwrap();
+        VONLY_MODE.store(2, Relaxed);
+        crate::record::replay::<VonlyToy>(&spec, &rec, true).unwrap_or_else(|e| panic!("game {}: {e}", r.gid));
+    }
+    // an evaluation seat records nothing
+    let (ev, st) = go(1, nn(0, 16, false));
+    assert!(ev.iter().all(|(r, s)| r.over && s.is_empty()) && st.value_only_decisions == 0);
+    VONLY_MODE.store(0, Relaxed);
+}
+
 #[test]
 fn value_choice_pick_takes_the_best_or_draws_by_the_softmax() {
     let opts = [(5u16, 0.5), (7, 0.6), (9, 0.6)];

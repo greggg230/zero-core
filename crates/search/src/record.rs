@@ -35,6 +35,11 @@
 //! from `next_episode` - any of them rejects the whole record. The search's outputs (`pi`, `q`) can't be checked
 //! without searching again; they are checked to be finite and in [0, 1].
 //!
+//! A value-only decision (docs/search.md 3.20, `SearchGame::value_only_decision`) is a value-only sample (kind 1) of
+//! the seat to move: the replay accepts one only where the game says so (and the decision has two or more options),
+//! and refuses a leaf sample there (unless the game names the decision's policy: a teacher decision, 3.19). Nothing new
+//! in the format.
+//!
 //! A game with variable-length rows (docs/search.md 2.15: `SearchGame::TAILS` / `OPTION_POINTERS`) replays each
 //! row as the driver built it - the head, its sealed tail tokens and its pointer overrides against the row's
 //! options (`driver::record_row`) - and refuses a row past the game's `MAX_ROW_TOKENS` (the driver would have
@@ -410,10 +415,24 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
                 if pk + legal.len() > pi.len() {
                     return Err(format!("record: sample {j} (step {k}) has {} options, the policy {} values left", legal.len(), pi.len() - pk));
                 }
+                // (a value-only decision is recorded without its policy, docs/search.md 3.20 - unless a teacher names it)
+                if g.value_only_decision() {
+                    let mut t = Vec::new();
+                    if !g.teacher_policy(&legal, &mut t) {
+                        return Err(format!("record: sample {j} (step {k}): seat {p}'s decision is a value-only decision (recorded without a policy), the record has its policy"));
+                    }
+                }
                 opts = legal.clone();
                 pis = pi[pk..pk + legal.len()].iter().map(|&h| f16_to_f32(h as u16)).collect();
                 pk += legal.len();
-            } else if to_move.is_none() || to_move == Some(p) {
+            } else if to_move == Some(p) {
+                // the decider's own value-only row: only at a value-only decision it searched (docs/search.md 3.20)
+                legal.clear();
+                g.legal_actions(&mut legal);
+                if !g.value_only_decision() || legal.len() < 2 {
+                    return Err(format!("record: value-only sample {j} (step {k}) of seat {p}, the seat to move, at a decision of {} option(s) that is {}a value-only decision", legal.len(), if g.value_only_decision() { "" } else { "not " }));
+                }
+            } else if to_move.is_none() {
                 return Err(format!("record: value-only sample {j} (step {k}) of seat {p}: the game has {to_move:?} to move"));
             }
             let mut x = vec![0.0f32; G::NUM_FEATURES];

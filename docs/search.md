@@ -2261,6 +2261,52 @@ the second option, recorded with [0.25, 0.75] and q = z, the other decisions sea
 an evaluation seat plays it and records nothing; a policy of the wrong length, a NaN and an all-zero policy fail the
 driver.
 
+### 3.20 Value-only decisions: searched and played, recorded without their policy target (`SearchGame::value_only_decision`; MTG Zero's Doomsday training wheel, 2026-11-16)
+
+Opt-in by the game: a game that does not override `value_only_decision` (every game but MTG Zero's `mtg` with a spec's
+`"forced_find"`) makes every decision, record, row and digest what it was - the toy's golden self-play records hold
+with the hook consulted (`visits_records_unchanged` and the other golden tests, unchanged), and no run setting is
+involved.
+
+**Why.** MTG Zero's Doomsday training wheel (its ENGINE.md 180) forces a share of Doomsday's piles to hold Thassa's
+Oracle. The forcing is decided by the game's seed, the same in every search world, so the Doomsday player's own search
+at the resolution's earlier picks knows the Oracle arrives at the last pick anyway: its visits at the pick that offers
+the Oracle are indifferent between it and the other cards, and as policy targets they would train the policy against
+the very pick the wheel is there to teach. The positions themselves are what the wheel wants the value net to see
+(an Oracle pile wins), so the rows must stay - without their policy targets.
+
+**What it does.** At a network seat's searched decision (two or more options), after the search, a recording
+self-play seat (the rows `decide` makes: full searches, `record` on, not a branch's deviation) asks the real game
+`value_only_decision()`. When true the decision's record is the decider's row (`record_row(g, p, &[])`: the head and
+its tail tokens, no options, so no pointer overrides) with no options and no policy - a value-only row of the seat to
+move - its `q` the search's root value (as a decision's: `tree.win`, the pruned or Gumbel value per the seat), its
+auxiliary targets the decider's. Nothing else changes: the search, its budget, the move (the visit counts or the
+seat's rule), the temperature, root noise, the branch reservoir and the resignation count are a decision's as before,
+so a game plays move for move as it would without the hook. Counted in `Stats::value_only_decisions` (the binding's
+stats dict carries `value_only_decisions` only when it is non-zero). Evaluation seats record nothing, as always. A
+teacher decision (3.19) is recorded with its policy whatever the hook says (the teacher's policy is its point). The
+hook is never asked inside a search.
+
+**The trainer.** A row without options is a value-only row (3.6, docs/az.md 16): no policy loss, its value and margin
+losses and auxiliary targets as any row's; once a window holds any, the policy loss and the entropy are means over the
+decisions (the rows with options). Nothing new in the shards (the row's option count is 0), the trainer, distillation
+or the held-out sets (which count such a row among the 'view' rows).
+
+**Records and the farm.** Nothing new in the format (2.17): the row is a value-only sample (kind 1) of the seat to move.
+`record::replay` accepts a value-only sample of the seat to move only where the replayed game says the decision is a
+value-only decision with two or more options, and refuses a leaf sample there (unless the game names the decision's
+policy: a teacher decision) - so a record from a build that disagrees about the hook is refused, never trained on.
+The native worker (zero_worker) runs this driver and writes its records with `game_json`, so it records value-only
+decisions exactly as the Python run does.
+
+**Tests** (`driver/tests.rs`): `value_only_decisions_play_the_same_games_and_record_the_rows_without_their_policy` - a
+toy whose two-option decisions are value-only decisions: off, none counted; on, the same games (results, steps,
+decisions) and the same rows in the same order (x, player, z, q, sc, aux, step, net bit for bit), each two-option
+decision's without options, policy or overrides and every other row's options and policy unchanged; the traced records
+replay to those rows bit for bit, are refused by the game without the hook (the seat to move's value-only sample) and
+the records made without the hook are refused by the game with it (a policy at a value-only decision); with the
+decisions also teacher decisions, the teacher's policy is recorded and replays; an evaluation seat records nothing.
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:

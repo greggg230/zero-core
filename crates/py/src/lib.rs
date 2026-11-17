@@ -1169,6 +1169,10 @@ impl PySearchDriver {
             // (docs/search.md 3.19: only a game with teacher decisions; every other stats dict as before)
             d.set_item("teacher_decisions", s.teacher_decisions)?;
         }
+        if s.value_only_decisions > 0 {
+            // (docs/search.md 3.20: only a game with value-only decisions; every other stats dict as before)
+            d.set_item("value_only_decisions", s.value_only_decisions)?;
+        }
         if self.rows.tails {
             // variable-length rows (docs/search.md 2.15; only a game with tail segments)
             d.set_item("tail_rows", s.tail_rows)?;
