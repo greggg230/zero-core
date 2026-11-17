@@ -8064,7 +8064,10 @@ Which write survives is up to the device: the CPU (torch's and ONNX Runtime's se
 an undefined one (41.2's "repeated indices"). So the same network answers such a row differently on a GPU, in a CPU
 worker and through the farm's export, and its CUDA graphs and its eager forward can keep different copies' logits:
 `tests/test_token_graphs.py`'s two graphs-against-eager tests failed in about half the runs (3.66e-5 against their
-2e-5; MTG Zero ENGINE.md 183.4), and every MTG self-play row with two copies of a card in hand carried the coin flip.
+2e-5; MTG Zero ENGINE.md 183.4). It needs a layout where two tokens can claim one action: `id_actions` (MTG Zero's team
+draft, the toy fixtures, the farm's probe network) or two slots sharing a static action. MTG Zero's constructed layout
+(v7) has neither - a hand slot's cast action is that slot's own, so two equal cards in hand are two actions - and its
+pointer overrides are one per option: measured, 0 duplicate claims in 186,644 network rows of pb3's best-of-one (58.2).
 The user chose to fix it at the next fork (2026-11-17), opt-in.
 
 **The reduction: the largest claim.** The copies are one action: the network should give it one logit, whatever slots
@@ -8139,3 +8142,14 @@ checkpoints carry it) and a legacy run resumed with it (checkpoint 1 legacy, 2 '
 `tests/test_token_graphs.py`'s two graphs-against-eager tests run per mode: legacy on rows without duplicate claims
 (the plain layout: on duplicates its outcome is undefined on CUDA), 'max' on the identity layout, duplicates included -
 tolerances unchanged.
+
+### 58.2 Measured (2026-11-17)
+
+MTG Zero's pb3, iteration 155 (layout v7), against the same weights with `dup_reduce` 'max', the best-of-one
+yardstick's spec and seats, paired deals, 64 simulations, on the Mac's CPU (h2h.sequential; the desktop's GPU was the
+metagame run's): every one of the 186,644 network rows both sides evaluated was counted for duplicate claims of a real
+action in the policy scatter - **0** (each side). With no duplicate claim 'max' is the plain scatter bit for bit (one
+claim: its own value, its full gradient; the generic logit of a claimed action overwritten, no gradient), so the two
+sides answered every row identically and played the same games: 16 games, 8 pairs, every pair split (score 0.500,
+pentanomial [0, 0, 8, 0, 0]). A longer match could only repeat that: for MTG constructed runs the setting changes
+nothing but the guarantee. It matters where a layout has `id_actions` (team draft) and for the core's own tests.
