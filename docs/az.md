@@ -7923,7 +7923,10 @@ Tests: `test_workqueue.py::test_a_cpu_worker_whose_rate_grows_with_its_inflight_
 curves - the desktop ~300 s a match at any in-flight, a Mac worker 330 s + n / 0.58: the share rule falls
 monotonically from ~100 to the floor of 4 with a >10x lower rate; batch-bound it holds 70-110 with its matches within
 2 horizons, its rate >4x, the phase shorter; a faster desktop moves the fixed point down, one too fast for the worker
-sends it to its floor), `::test_auto_makes_every_remote_worker_batch_bound`.
+sends it to its floor), `::test_auto_makes_every_remote_worker_batch_bound`,
+`test_remoteplay.py::test_a_batch_bound_lingering_worker_stays_within_two_checkpoints` (a real worker under 'auto',
+lingering: its rows at most 2 checkpoints old). The share-rule tests of before (`test_caps_follow_throughput_...`,
+`test_linger_plays_through_training`, `test_multi_remote.py::test_one_remote_is_exactly_as_before`) run with 'none'.
 
 ### 56.2 `elo_games` 0: the anchor games only
 
