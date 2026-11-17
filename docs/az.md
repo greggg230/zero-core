@@ -158,6 +158,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
 | `infer_precision` | 'fp32' | 'bf16' / 'tf32' = the run's own CUDA evaluators (self-play, league seats, evaluation and Elo matches; zero.h2h `precision`) compute in bfloat16 autocast / with TF32 matmuls: their answers move by that rounding; a remote worker and a CPU / MPS evaluator stay float32 (57) |
 | `train_tf32` | 0 | 1 = the training step's float32 matmuls as TF32 on CUDA (57) |
+| `game_records` | 0 | 1 = every self-play game an iteration's quota accepts - this machine's, the remote workers', the farm pool's - kept as what replays it (seed, every move, setup, spec, outcome, resignation, networks) in `<run>/records/iter_NNNN/*.jsonl.gz` (`zero/gamerec.py`), outside the training window, for a game database; read from the driver's game log (docs/search.md 2.20): the same games, search, shards and checkpoints byte for byte; metrics `selfplay.records`. 0 = none, as before (59) |
 | `dup_action_reduce` | 'legacy' | 'max' = a token network scores an action two of its tokens claim (two equal cards' identity action) by the largest claim - the same answer on every device and in the farm's export; a network property recorded in the checkpoint (a new run's network built with it, a fork's / resumed run's at its next training); 'legacy' = the plain scatter (CUDA keeps an undefined claim) (58) |
 | `sparse` | 0 | 1 = the run's drivers (self-play and matches) send sparse network batches (each row's non-zero features; docs/search.md 2.2): the same rows, games and samples; a token network's CUDA graphs scatter them on the device, other evaluators densify them (10.7) |
 | `eval_cache` | 0 | N > 0 = every network seat (self-play and evaluation) keeps its game's network answers, at most N per game, by a hash of each row's features and options, and answers a repeated row from them instead of sending it (docs/search.md 3.12; the same answers up to float rounding at another batch shape) (25) |
@@ -8153,3 +8154,65 @@ claim: its own value, its full gradient; the generic logit of a claimed action o
 sides answered every row identically and played the same games: 16 games, 8 pairs, every pair split (score 0.500,
 pentanomial [0, 0, 8, 0, 0]). A longer match could only repeat that: for MTG constructed runs the setting changes
 nothing but the guarantee. It matters where a layout has `id_actions` (team draft) and for the core's own tests.
+
+## 59. Game records: every accepted self-play game kept as what replays it (`game_records`; MTG Zero's game database, 2026-11-17)
+
+**Why.** MTG Zero wants every self-play game of a run in a database (its `tools/gamedb.py`, its ENGINE.md 187):
+"how often does a Doomsday pile hold card X since iteration 120?" should be one query. Before this a run kept no move
+of its games: this machine's and a remote's self-play only wrote shards (rows without a game id, rolling off with the
+window), and the farm's records - which do hold every move - were turned into shards and dropped.
+
+**What it does** (`zero/gamerec.py`). With `game_records` 1 every game an iteration's quota accepts is one JSON line
+of `<run>/records/iter_NNNN/<source>-<pid>.jsonl.gz` (format and fields in the module's docstring): its seed, every
+action (little-endian u16, base64), the spec by key (a spec line before its first game in each file), its setup record
+(MTG Zero: the decks and the metagame's pairing), over / aborted, the resignation's winner, the result, the decisions,
+the networks its samples were searched with, and for a farm game its machine as a short hash (never the id). Per
+executor:
+* **this machine** (`_selfplay`, plain or rolling, and the shared queue's `selfplay_shared`, its local linger
+  included): the driver's game log on (`SearchDriver.set_game_log`, docs/search.md 2.20), each accepted row's log
+  written as it is accepted (source `local`);
+* **a remote's workers** (zero/remoteplay.py): the worker's driver logs its games; when the run accepts some of them
+  (`accept`) the worker sends their records in one `records` event (the specs once) and the run writes them (source:
+  the consumer's name, `w0` or `<host>/w0`). Its `hello` says `records` 1; a worker on an older checkout sends none:
+  the run logs it and plays on (records only observe) and the iteration's DONE.json counts its games as `missing`;
+* **the farm pool** (zero/farm_pool.py): the farm's records already hold every move (docs/search.md 2.17), so no worker
+  change: the pool keeps each replayed game's moves and outcome (not its samples) and writes them when the quota
+  accepts the game (source `pool:<farm run>`); a stale or unaccepted game writes none. Lock order: the records writer's
+  lock is innermost (below `Pool.mu`, docs/az.md 55; it calls nothing back).
+When the phase ends (after the remote's last shards, before the data directory's DONE.json) `records/iter_NNNN/DONE.json`
+lists this process's files of the iteration with each source's records and the games each source's quota accepted
+(`accepted`; a gap is `missing`, logged). A reader takes only the files DONE.json lists: a file of an interrupted attempt
+(another pid) is never read, and a file cut short by a crash yields the lines before the cut (`read_file`). The phase's
+metrics gain `records` {games, bytes, seconds, by_source}. The records are outside `data/` and never rolled off by
+`keep_data`: the database deletes them once ingested (its `prune --delete-raw`). `game_records` is trainer-only in the
+worker's settings table (the farm's builds older than it call it unknown; the pool drops such a key, 57).
+
+**Off by default**: no file, no row log, nothing changes. **Byte identity**: the games' moves come from the failure log
+the driver keeps for every game anyway (docs/search.md 2.18), so the games, search, rows, shards and checkpoints are
+those of a run without records.
+
+**Costs.** Per game: a copy of its moves when it finishes (the driver's `Vec` of real moves), one dict on its result
+row, one JSON line gzip'd when it is accepted (on the thread that accepts it: the run's main thread for this machine's
+games, a remote host's reader thread, the pool's thread). Disk: ~150 bytes a game for MTG Zero's metagame self-play
+(59.2), ~0.3 MB an iteration of 2,000 games; the records stay until the database deletes them.
+
+### 59.1 Tests and checks
+
+`tests/test_gamerec.py`: two toy runs, records off and on - off writes no `records/`, the same shards array for array
+and the same weights; on, every iteration's records = its accepted games (each once), each replays from its seed to its
+result, the networks within the iteration's; a remote 'local' worker's games recorded under `w0` and the iteration's
+DONE.json `accepted` = its records per source; a worker without records (the test hook `no_records`): its games
+`missing`, the log line, the run on; the farm pool's accepted games (20 of 30: the quota's) recorded with their moves,
+seeds, setups, results and networks equal the farm records', the machine hashed and absent from the record; the reader:
+DONE.json's files only, a cut gzip read to the cut. Driver tests: docs/search.md 2.20.
+
+### 59.2 Measured
+
+2026-11-17, the desktop's CPU beside MTG Zero's live metagame run (its ENGINE.md 187.4). The toy runs of the tests: 24
+games an iteration, ~2.6 KB of records. MTG Zero, 64 self-play games of the metagame run's iteration
+156 network (its run settings, 64 simulations, resignation on; CPU, 32 in flight) played twice from the same seed with
+the game log on and off: the same 64 games and the same 2,968 rows byte for byte; wall 797.8 s on vs 812.2 s off (noise:
+the log costs nothing measurable); the records 9,489 bytes (148 bytes a game, 123 actions a game, 48 of 64 resigned),
+written in 0.020 s (0.3 ms a game: ~0.6 s of an iteration of 2,000 games). The legacy-meta3-ddwheel-smoke run (3
+iterations, 16 games each, a fresh net: 727 actions a game) with records on and off: the same shards and checkpoints
+(every weight), records 7.2-7.9 KB an iteration written in 0.002-0.004 s.
