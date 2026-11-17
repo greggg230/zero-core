@@ -4727,6 +4727,100 @@ fn set_trace_before_games_and_never_with_branches() {
     let mut d = Driver::<ToyGame>::new(c).unwrap();
     assert!(d.set_trace(true).unwrap_err().contains("branched"));
 }
+// ---- game logs (Driver::set_game_log; docs/search.md 2.20) ----
+
+/// `traced_games` with the game log on or off (and the trace on or off).
+fn logged_games(seat: SeatCfg, trace: bool, log: bool, quota: u64) -> Vec<(GameResult, Vec<Record>)> {
+    let mut c = cfg(vec![seat], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    (c.rolling, c.concurrency, c.groups, c.threads, c.aux) = (true, 10, 2, 3, true);
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    if trace {
+        d.set_trace(true).unwrap();
+    }
+    let mut out = Vec::new();
+    let take = |d: &mut Driver<ToyGame>, out: &mut Vec<(GameResult, Vec<Record>)>| {
+        let rows = d.take_results();
+        let mut s = d.take_samples().into_iter();
+        for r in rows {
+            let mine: Vec<Record> = s.by_ref().take(r.samples as usize).collect();
+            out.push((r, mine));
+        }
+    };
+    for (k, net) in [0u32, 0, 1].into_iter().enumerate() {
+        // (on after the first phase's games began: a game started before still logs every move - the failure log)
+        if log && k == 1 {
+            d.set_game_log(true).unwrap();
+        }
+        d.resume(quota, net).unwrap();
+        while let Some(b) = d.next_batch(true).unwrap() {
+            answer_lead(&mut d, &b);
+            take(&mut d, &mut out);
+        }
+        take(&mut d, &mut out);
+    }
+    out
+}
+
+#[test]
+fn the_game_log_changes_no_game_and_no_row() {
+    let a = logged_games(record_seat(), false, false, 20);
+    let b = logged_games(record_seat(), false, true, 20);
+    assert_eq!(a.len(), b.len());
+    let mut logged = 0;
+    for ((ra, sa), (rb, sb)) in a.iter().zip(&b) {
+        assert!(ra.log.is_none() && rb.trace.is_none());
+        logged += rb.log.is_some() as usize;
+        assert_eq!((ra.gid, ra.steps, ra.decisions, &ra.result, ra.rounds, ra.samples), (rb.gid, rb.steps, rb.decisions, &rb.result, rb.rounds, rb.samples));
+        assert_eq!(sa.len(), sb.len());
+        for (x, y) in sa.iter().zip(sb) {
+            same_row(x, y).unwrap();
+            assert_eq!(x.pi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), y.pi.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+            assert_eq!(x.q.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), y.q.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+    }
+    assert!(logged > 0 && logged < b.len(), "games finishing after set_game_log are logged ({logged} of {})", b.len());
+}
+
+#[test]
+fn a_game_log_is_the_games_trace() {
+    // with the trace on too: each log holds exactly the trace's seed, moves and setup; its networks are its samples'
+    let games = logged_games(record_seat(), true, true, 30);
+    let mut n = 0;
+    for (r, s) in &games {
+        let Some(l) = &r.log else { continue };
+        let t = r.trace.as_ref().unwrap();
+        assert_eq!((l.seed, &l.steps, &l.setup), (t.seed, &t.steps, &t.setup), "game {}", r.gid);
+        assert_eq!(l.spec.as_str(), "{}");
+        let nets = s.iter().map(|x| x.net).fold(None, |a: Option<(u32, u32)>, k| Some(a.map_or((k, k), |(lo, hi)| (lo.min(k), hi.max(k)))));
+        if !s.is_empty() {
+            assert_eq!(l.nets, nets, "game {}", r.gid);
+        }
+        // the log alone replays the game to its end (the moves from its seed)
+        let spec = ToyGame::parse_spec("{}").unwrap();
+        let mut g = ToyGame::new_game(&spec, r.n, l.seed).unwrap();
+        let mut ch = Vec::new();
+        for st in &l.steps {
+            let TraceStep::Act(a) = st else { panic!("toy games have only actions") };
+            g.step(*a, &mut ch).unwrap();
+        }
+        assert_eq!(g.to_move().is_none(), r.over && !r.resign.as_ref().is_some_and(|x| x.resigned), "game {}", r.gid);
+        n += 1;
+    }
+    assert!(n >= 40, "{n} logged games");
+}
+
+#[test]
+fn set_game_log_never_with_branches() {
+    let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
+    (c.rolling, c.concurrency) = (true, 4);
+    let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
+    d.resume(2, 0).unwrap();
+    d.set_game_log(true).unwrap();
+    d.set_game_log(false).unwrap();
+    c.branch = Some(BranchCfg { p: 0.5, moves: 2, temp: 1.0, differ: false });
+    let mut d = Driver::<ToyGame>::new(c).unwrap();
+    assert!(d.set_game_log(true).unwrap_err().contains("branched"));
+}
 // chained episodes (docs/search.md 2.14): the toy match through the driver
 mod chain;
 

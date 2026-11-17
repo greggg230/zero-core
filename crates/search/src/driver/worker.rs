@@ -589,6 +589,7 @@ fn drop_game<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, msg: S
         abort_reason: Some("panic"),
         episodes: Vec::new(),
         trace: None,
+        log: None,
     });
     slot.game = None;
     slot.start = None;
@@ -1634,7 +1635,7 @@ fn apply_external<G: SearchGame>(slot: &mut Slot<G>, payload: &str, key: &mut Ve
 fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, parked: &mut Vec<Parked<G>>, n_: &mut Tally) -> Result<(), String> {
     let cfg = &sh.cfg;
     if slot.chain.is_some() {
-        return finish_episode(cfg, slot, results, samples, n_);
+        return finish_episode(sh, slot, results, samples, n_);
     }
     let g = slot.game.take().unwrap();
     // (a resigned game is over: its result is the resignation's, docs/search.md 3.14; an aborted
@@ -1649,7 +1650,9 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
     let fork = slot.fork.take();
     // the game's trace (docs/search.md 2.17): its seed, real moves, setup record and - over - its margins
     let trace = slot.trace.take().map(|steps| Box::new(GameTrace { seed: slot.game_seed, steps, setup: g.record_setup(), margins: if over && !g.deferred() { (0..slot.n).map(|i| g.margin(i)).collect() } else { Vec::new() }, episode_setups: Vec::new() }));
-    let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start, resign: resign.as_ref().map(|r| r.info()), trace, abort: row_abort.then_some("max_row_tokens") };
+    // the game's log (docs/search.md 2.20): its real moves as the failure log kept them (not a branch's: refused)
+    let log = game_log(sh, slot, &g, &slot.records);
+    let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start, resign: resign.as_ref().map(|r| r.info()), trace, abort: row_abort.then_some("max_row_tokens"), log };
     slot.dev_left = 0;
     slot.dev_now = false;
     let records = std::mem::take(&mut slot.records);
@@ -1698,7 +1701,8 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
 /// cut or aborted) the contest's one result row goes out with every episode's samples behind it. An episode aborted by
 /// the row limit (docs/search.md 2.15) is an aborted episode: no samples of its own, the contest unfinished, the
 /// contest's row `aborted` with the reason.
-fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, n_: &mut Tally) -> Result<(), String> {
+fn finish_episode<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<GameResult>, samples: &mut Vec<Record>, n_: &mut Tally) -> Result<(), String> {
+    let cfg = &sh.cfg;
     let g = slot.game.take().unwrap();
     let resign = slot.resign.take();
     let resigned = resign.as_ref().is_some_and(|r| r.resigned);
@@ -1719,7 +1723,7 @@ fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &
         Some(None) => return Err("internal: a resignation without a favoured seat".into()),
         None => None,
     };
-    let done = Done { gid: slot.gid, tag: None, n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: Vec::new(), branch: None, start: None, resign: rs, trace: None, abort };
+    let done = Done { gid: slot.gid, tag: None, n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: Vec::new(), branch: None, start: None, resign: rs, trace: None, abort, log: None };
     // (a traced contest, docs/search.md 2.17: each ended episode's setup record)
     if slot.trace.is_some() {
         slot.trace_setups.push(g.record_setup());
@@ -1795,6 +1799,8 @@ fn finish_episode<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, results: &
                     let eps = std::mem::take(&mut slot.trace_setups);
                     Box::new(GameTrace { seed: slot.game_seed, steps, setup: eps.last().cloned().unwrap_or_default(), margins: Vec::new(), episode_setups: eps })
                 }),
+                // the contest's log (docs/search.md 2.20): every episode's real moves and boundaries, its samples' networks
+                log: game_log(sh, slot, &g, &ch.samples),
             };
             results.push(row);
             samples.append(&mut ch.samples);
@@ -1889,6 +1895,20 @@ pub(super) struct Done {
     pub trace: Option<Box<GameTrace>>,
     /// The driver aborted the game (`GameResult::abort_reason`; docs/search.md 2.15).
     pub abort: Option<&'static str>,
+    /// The game's log (`Driver::set_game_log`, docs/search.md 2.20).
+    pub log: Option<Box<GameLog>>,
+}
+
+/// A finishing game's log (`Driver::set_game_log`, docs/search.md 2.20) while the driver logs games, else None: its
+/// seed, its real moves (`fail_log`: kept for every game, docs/search.md 2.18), `record_setup` now, the spec it started
+/// from and the network ids of its records (`records`: the game's or contest's samples).
+fn game_log<G: SearchGame>(sh: &Shared<G>, slot: &Slot<G>, g: &G, records: &[Record]) -> Option<Box<GameLog>> {
+    if !sh.game_log.load(Ordering::Relaxed) {
+        return None;
+    }
+    let spec = if slot.spec_json.is_empty() { lock(&sh.spec_json).clone() } else { slot.spec_json.clone() };
+    let nets = records.iter().map(|r| r.net).fold(None, |a: Option<(u32, u32)>, n| Some(a.map_or((n, n), |(lo, hi)| (lo.min(n), hi.max(n)))));
+    Some(Box::new(GameLog { seed: slot.game_seed, steps: slot.fail_log.clone(), setup: g.record_setup(), spec, nets }))
 }
 
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
@@ -1928,6 +1948,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
         start: d.start,
         resign: d.resign,
         trace: d.trace,
+        log: d.log,
         abort_reason: d.abort,
         episodes: Vec::new(),
     };

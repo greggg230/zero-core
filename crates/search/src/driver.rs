@@ -829,6 +829,28 @@ pub struct GameResult {
     /// boundaries included) and setup record - what replays it (`record::replay`). None while tracing is off (the
     /// default).
     pub trace: Option<Box<GameTrace>>,
+    /// The game's log (`Driver::set_game_log`, docs/search.md 2.20): its seed, every real move, its setup record, the
+    /// spec it started from and the networks its samples were searched with - what a game database replays. None
+    /// while the log is off (the default).
+    pub log: Option<Box<GameLog>>,
+}
+
+/// A finished game's log (`Driver::set_game_log`, docs/search.md 2.20): what replays it, for a record of every game
+/// (MTG Zero's game database). Read from the game's real moves the driver keeps anyway (its failure log, 2.18):
+/// nothing about the game, its search or its samples changes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GameLog {
+    /// The game's seed (`SearchGame::new_game`'s).
+    pub seed: u64,
+    /// Every real move in order (single-option steps and external answers included; a chained contest's episode
+    /// boundaries), as a trace's.
+    pub steps: Vec<TraceStep>,
+    /// `SearchGame::record_setup` at the game's end.
+    pub setup: String,
+    /// The JSON of the spec the game started from (its queued setup's, else the driver's at its start).
+    pub spec: Arc<String>,
+    /// The smallest and largest network id of the game's emitted samples (None: it emitted none).
+    pub nets: Option<(u32, u32)>,
 }
 
 /// A game the driver dropped after a panic inside it (docs/search.md 2.18): an engine bug costs that game, not the
@@ -1908,6 +1930,8 @@ struct Shared<G: SearchGame> {
     net: AtomicU32,
     /// Games started from now on are traced (`Driver::set_trace`).
     trace: AtomicBool,
+    /// Games finishing from now on carry their log (`Driver::set_game_log`, docs/search.md 2.20).
+    game_log: AtomicBool,
     /// The JSON of `spec` (`DriverCfg::spec`, or the last `set_spec`'s): `GameFailure::spec`.
     spec_json: Mutex<Arc<String>>,
     /// The games dropped after a panic and not taken yet (`Driver::take_failures`, docs/search.md 2.18).
@@ -2280,6 +2304,7 @@ impl<G: SearchGame> Driver<G> {
             epoch: AtomicU32::new(0),
             net: AtomicU32::new(net),
             trace: AtomicBool::new(false),
+            game_log: AtomicBool::new(false),
             spec_json: Mutex::new(Arc::new(spec_json)),
             failures: Mutex::new(Vec::new()),
         });
@@ -2483,6 +2508,19 @@ impl<G: SearchGame> Driver<G> {
             return Err("set_trace: branched games and archive starts are not replayable from a seed (docs/search.md 2.17)".into());
         }
         self.sh.trace.store(on, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Log every game (docs/search.md 2.20, MTG Zero's game database): each game that finishes from now on carries
+    /// its seed, every real move, its setup record, its spec and its samples' networks (`GameResult::log`) - read from
+    /// the real moves the driver keeps for every game anyway (its failure log), so nothing about the games, their
+    /// search or their samples changes, and it may be turned on or off at any time. Not with branched games or archive
+    /// starts (a branch's moves begin at its branch point). Never called: nothing changes.
+    pub fn set_game_log(&mut self, on: bool) -> Result<(), String> {
+        if on && (self.sh.cfg.branch.is_some() || self.sh.cfg.starts.is_some()) {
+            return Err("set_game_log: branched games and archive starts are not replayable from a seed (docs/search.md 2.20)".into());
+        }
+        self.sh.game_log.store(on, Ordering::SeqCst);
         Ok(())
     }
 
@@ -2707,7 +2745,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None, trace: None, abort: None };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None, trace: None, abort: None, log: None };
         let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();

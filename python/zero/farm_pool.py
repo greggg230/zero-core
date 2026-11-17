@@ -73,6 +73,7 @@ import traceback
 from collections import deque
 
 from . import farm_def as FD
+from . import gamerec as GR
 
 PREFIX = 'pool:'
 SEMVER_RE = FD.SEMVER_RE                    # (as the coordinator checks a version: zero-farm coordinator util.ts)
@@ -587,6 +588,7 @@ class Pool:
             self.rp.add_failures('pool', fails)
             self.log(f'{len(fails)} self-play game(s) dropped after a panic on a farm PC: to game_failures.jsonl')
         ids = [tuple(x) for x in (r.get('ids') or [])]
+        gr = self.R.gamerecs() if hasattr(self.R, 'gamerecs') else None
         fmt = shard_format(self.R.cfg, self.R.info)     # (a game with tails / overrides: format v2, docs/az.md 43)
         sparse = fmt.get('x_format') == 'sparse'
         machine = r.get('machine_id') or '?'
@@ -625,8 +627,12 @@ class Pool:
                 if probs:
                     return self._refuse(r, f'game {gid}: non-finite rows: {"; ".join(probs)}', body, gid)
                 net = int(s['net'].min())
-            keep.append({'gid': gid, 'machine': machine, 'net': net if net is not None else r.get('gen'), 's': s,
-                         'rows': g['rows'], 'replay_s': dt})
+            item = {'gid': gid, 'machine': machine, 'net': net if net is not None else r.get('gen'), 's': s,
+                    'rows': g['rows'], 'replay_s': dt}
+            if gr is not None:
+                # game_records (docs/az.md 59): the record's moves and outcome, written if the quota accepts the game
+                item['rec'] = GR.from_farm(json.loads(ln), rspec, 0, self.name, machine)
+            keep.append(item)
         with self.mu:
             self.held.extend(keep)
             self.cur['records'] += len(keep)
@@ -686,6 +692,9 @@ class Pool:
         self.cur['replay_s'] += g['replay_s']
         m = g['machine']
         self.cur['machines'][m] = self.cur['machines'].get(m, 0) + 1
+        if g.get('rec') is not None:
+            # (game_records: Records' lock is innermost, below Pool.mu - it calls nothing back)
+            self.R.gamerecs().add(it, self.name, [g['rec']])
         if g['s'] is None:
             return
         key = (it, m)

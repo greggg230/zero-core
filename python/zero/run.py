@@ -74,7 +74,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import auxtarget as AUX, elo, forks as FK, games as G, league as L, package, precision as PR, resign as RS, runctl
+from . import auxtarget as AUX, elo, forks as FK, gamerec as GR, games as G, league as L, package, precision as PR, resign as RS, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths, shard_rows
 from .rows import forward_kw
 from .finite import NonFinite, check_state, head
@@ -360,6 +360,12 @@ DEFAULTS = dict(
     # local linger and the remote workers (their config's); single-game runs. 0 = the samples taken, converted
     # and written between batches, as before
     shard_writer_thread=0, shard_writer_queue_mb=4096,
+    # game_records 1 = every self-play game an iteration's quota accepts - this machine's, the remote workers', the farm
+    # pool's - is kept as what replays it (its seed, every real move, its setup, spec, outcome and networks) in
+    # <run>/records/iter_NNNN/*.jsonl.gz, outside the training window, for a game database (zero/gamerec.py, docs/az.md
+    # 59). Read from the driver's game log (SearchDriver.set_game_log): the same games, search and shards, byte for
+    # byte. 0 = no records, as before
+    game_records=0,
     # branched self-play games and archive starts (zero/forks.py, docs/az.md 24, docs/search.md 2.11):
     # selfplay_branch p = a share p of the games each spawn one branch game from a copy of their state at
     # a uniformly drawn decision of theirs: 1..selfplay_branch_moves deviation moves sampled from the
@@ -669,6 +675,7 @@ class Run:
         self.anchor_sha = {}                       # anchor path -> ((size, mtime), sha256)
         self.linger = None                         # selfplay_local_linger: the lingering thread's state
         self.writers = []                          # shard_writer_thread: the self-play phase's writer threads
+        self._gamerec = None                       # game_records: the run's records writer (gamerecs)
         # branched games and archive starts (zero/forks.py): the self-play driver's settings, None when off
         self.forks = FK.setup(run, cfg)
 
@@ -796,9 +803,28 @@ class Run:
         except BaseException:
             for tw in self.writers:
                 tw.abort()
+            if getattr(self, '_gamerec', None) is not None:
+                self._gamerec.abort()              # (no DONE.json: the iteration's records are played again)
             raise
         finally:
             self.writers = []
+
+    def gamerecs(self):
+        """game_records (docs/az.md 59): the run's records writer (zero.gamerec.Records), None when off. (getattr: a
+        caller's stand-in Run with only a cfg has none.)"""
+        if not self.cfg.get('game_records'):
+            return None
+        if getattr(self, '_gamerec', None) is None:
+            self._gamerec = GR.Records(self.run, self.log)
+        return self._gamerec
+
+    def records_close(self, it, out, accepted):
+        """game_records: iteration `it`'s records closed (their DONE.json) and their summary into the phase's metrics."""
+        gr = self.gamerecs()
+        if gr is None:
+            return
+        out['records'] = r = gr.close(it, accepted)
+        self.log(f'iter {it} game records: {r["games"]} games, {r["bytes"] / 1e6:.2f} MB, {r["seconds"]:.2f}s')
 
     def selfplay_spec(self, it):
         """Iteration `it`'s self-play spec (docs/az.md 40): the game package's `selfplay_specs` hook's answer, else
@@ -848,6 +874,8 @@ class Run:
             drv, ev = self.roll, self.roll_ev
             evs, kinds = self.roll_evs, self.roll_kinds
             st0 = drv.stats()
+            if self.gamerecs() is not None:
+                drv.set_game_log(True)             # (game_records, docs/az.md 59: the games finishing from now on)
             drv.resume(c['games'], it - 1)
             prefix = 'r00'
         else:
@@ -857,6 +885,8 @@ class Run:
             else:
                 games, kinds = [[seat] * int(p) for p in counts], None
             drv = self.driver(games, seed=c['seed'] * 1_000_003 + it, record=True, spec=spec if spec != c['spec'] else None)
+            if self.gamerecs() is not None:
+                drv.set_game_log(True)             # (game_records, docs/az.md 59)
             ev = self.evaluator(model_path(self.run, it - 1))
             evs = {'m': ev}
             st0 = None
@@ -933,6 +963,9 @@ class Run:
                               'restart_sims': st['restart_sims'] - st0['restart_sims'],
                               'dropped_leaves': st['dropped_leaves'] - st0['dropped_leaves']}
         self.writer_metrics(it, out, tw, clock)
+        if self.gamerecs() is not None:
+            self.gamerecs().add_rows(it, 'local', results)
+            self.records_close(it, out, {'local': len(results)})
         return out
 
     def writer_metrics(self, it, out, tw, clock):
@@ -1201,6 +1234,9 @@ class Run:
             m, _ = load(model_path(self.run, it - 1), 'cpu', game=c['game'])
             self.roll_ev.set_network(m)
         drv, ev, evs = self.roll, self.roll_ev, self.roll_evs
+        gr = self.gamerecs()
+        if gr is not None:
+            drv.set_game_log(True)                 # (game_records, docs/az.md 59: the games finishing from now on)
         if lg is not None:
             plan = lg.plan(it)
             lg.evaluators(it, evs)                 # the slots' past checkpoints (guarded)
@@ -1229,9 +1265,11 @@ class Run:
         def accept():
             """The held games, oldest first, as many as the quota takes."""
             a = rsp.accept_local(it, len(self.held))
+            took = []
             for _ in range(a):
                 row, sd = self.held.popleft()
                 acc['results'].append(row)
+                took.append(row)
                 if lg is not None:
                     L.tally([row], acc['league'])
                 if sd is not None and tw is not None:
@@ -1240,6 +1278,8 @@ class Run:
                     tstats.add(sd)
                     writer.add(sd)
                     lag_hist(sd['net'], it, acc['stale'])
+            if gr is not None and took:
+                gr.add_rows(it, 'local', took)
 
         def pump(lb=None):
             with clock:
@@ -1334,6 +1374,9 @@ class Run:
         qb = rem.pop('queue')
         total = len(results) + rem['games']
         cons = qb['consumers']
+        if gr is not None:
+            # (every source's accepted games' records; `accepted` per consumer: a gap is a source without records)
+            self.records_close(it, out, dict((qb.get('quota') or {}).get('by') or {}, local=len(results)))
         cons.setdefault('local', {})['games'] = len(results)
         for n, v in cons.items():
             if n != 'local':

@@ -1067,6 +1067,14 @@ impl PySearchDriver {
         self.d.set_trace(on).map_err(verr)
     }
 
+    /// Log every game that finishes from now on (`Driver::set_game_log`, docs/search.md 2.20): its result row (take_results,
+    /// take_game_records) carries `log` = {"seed", "actions": bytes (each real move a little-endian u16; None when a step
+    /// is not an action, then "steps": a JSON list as a trace record's), "n_actions", "setup", "spec" (the JSON of the
+    /// spec it started from), "nets": [lo, hi] or None}. Nothing about the games or their samples changes.
+    fn set_game_log(&mut self, on: bool) -> PyResult<()> {
+        self.d.set_game_log(on).map_err(verr)
+    }
+
     /// A traced driver's finished games (docs/search.md 2.17): take_results and take_samples at one point, with each
     /// game's record (`zero_search::record::game_json`, JSON text; "" for a game dropped after a panic: no record,
     /// docs/search.md 2.18) -> (rows, records, samples dict or None).
@@ -1387,6 +1395,37 @@ fn result_row<'py>(py: Python<'py>, r: &zero_search::driver::GameResult) -> PyRe
         // the driver aborted the game (docs/search.md 2.15: "max_row_tokens")
         d.set_item("abort_reason", why)?;
     }
+    if let Some(l) = &r.log {
+        // the game's log (Driver::set_game_log, docs/search.md 2.20): only while it is on
+        d.set_item("log", log_dict(py, l)?)?;
+    }
+    Ok(d)
+}
+
+/// A result row's game log (`GameLog`, docs/search.md 2.20) as a dict: its actions packed as little-endian u16 bytes
+/// when every step is an action (else None and `steps`, the trace record's JSON list as text).
+fn log_dict<'py>(py: Python<'py>, l: &zero_search::driver::GameLog) -> PyResult<Bound<'py, PyDict>> {
+    use zero_search::driver::TraceStep;
+    let d = PyDict::new(py);
+    d.set_item("seed", l.seed)?;
+    let acts: Option<Vec<u8>> = l.steps.iter().try_fold(Vec::with_capacity(2 * l.steps.len()), |mut v, s| match s {
+        TraceStep::Act(a) => {
+            v.extend_from_slice(&a.to_le_bytes());
+            Some(v)
+        }
+        _ => None,
+    });
+    match acts {
+        Some(b) => d.set_item("actions", pyo3::types::PyBytes::new(py, &b))?,
+        None => {
+            d.set_item("actions", py.None())?;
+            d.set_item("steps", Value::Array(zero_search::record::steps_json(&l.steps)).to_string())?;
+        }
+    }
+    d.set_item("n_actions", l.steps.len())?;
+    d.set_item("setup", &l.setup)?;
+    d.set_item("spec", l.spec.as_str())?;
+    d.set_item("nets", l.nets.map(|(a, b)| vec![a, b]))?;
     Ok(d)
 }
 

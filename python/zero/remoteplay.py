@@ -1306,6 +1306,13 @@ class RemotePlay:
         kind = ev.get('ev')
         rows = None
         h = s.h
+        if kind == 'records':
+            # game_records (docs/az.md 59): a worker's accepted games, written outside mu (the writer's lock is innermost)
+            gr = self.R.gamerecs() if hasattr(self.R, 'gamerecs') else None
+            if gr is not None:
+                specs = ev.get('specs') or {}
+                gr.add(ev.get('iter'), s.name, [(r, specs[r['spec']]) for r in ev.get('recs') or []])
+            return
         with self.mu:
             if kind == 'hello':
                 s.hello = ev
@@ -1348,6 +1355,10 @@ class RemotePlay:
                     # a checkout without chained episodes would play a whole contest as one episode, its rows
                     # labelled with the contest's result, in silence: never used (docs/az.md 42)
                     s.no_episodes = ev.get('episodes')
+                if self.R.cfg.get('game_records') and self.mode == 'selfplay' and not ev.get('records'):
+                    # a checkout without game records plays on (records only observe): its accepted games are the
+                    # records' DONE.json `missing` (docs/az.md 59)
+                    h.log(f'worker {s.k}: this checkout sends no game records: its games are not recorded')
                 if h.fails or s.k == 0:
                     h.log(f'worker {s.k} up (pid {ev.get("pid")} on {ev.get("host")}, mirror {h.rdir})')
             elif kind == 'status':
@@ -2221,6 +2232,8 @@ class Worker:
             if self.lg_on:
                 table, self.lg_kinds = L.rolling_table(c, seat)    # the run's league table
             self.drv = R.driver(table, seed=seed, record=True, rolling=True, net=it - 1, queue_only=True)
+            if self.cfg.get('game_records') and self.mode == 'selfplay' and not self.test.get('no_records'):
+                self.drv.set_game_log(True)        # (game_records, docs/az.md 59: _accept sends the records)
             for tag, spec in self.backlog:
                 self.drv.enqueue(tag, spec)
             self.backlog = []
@@ -2310,10 +2323,16 @@ class Worker:
             self.note(f'accept {msg} with {len(self.held)} games held: {short} given back')
             self.emit('unaccepted', iter=msg.get('iter'), n=short)
             n = len(self.held)
+        recs, specs = [], {}
         for _ in range(n):
             row, sd = self.held.popleft()
             ph['bw'].add(sd, 1)
             ph['accepted'] += 1
+            if row.get('log'):
+                from .gamerec import from_row
+                rec, spec = from_row(row, ph['it'], '')
+                recs.append(rec)
+                specs[rec['spec']] = spec
             if self.lg_on:
                 from .league import tally
                 tally([row], ph['league'])
@@ -2323,6 +2342,9 @@ class Worker:
             if ph.get('resign') is not None:
                 from .resign import tally as rtally
                 rtally([row], ph['resign'])
+        if recs:
+            # game_records (docs/az.md 59): the accepted games' records, the run writes them (one line, their specs once)
+            self.emit('records', iter=ph['it'], recs=recs, specs=specs)
         die = int(self.test.get('die_after_accepts') or 0)
         if die and ph['accepted'] >= die:
             self.note('test: dying with accepted games in no shard yet')
@@ -2600,7 +2622,9 @@ class Worker:
                       **({} if self.test.get('no_value_choice') else {'value_choice': _value_choice_of(self.cfg)}),
                       # (variable-length rows: this checkout carries tails and overrides end to end, R13)
                       **({} if self.test.get('no_tails') else {'caps': ['tails']}),
-                      **({} if self.test.get('no_episodes') else {'episodes': _episodes_of(self.cfg)}))
+                      **({} if self.test.get('no_episodes') else {'episodes': _episodes_of(self.cfg)}),
+                      # (game_records, docs/az.md 59: this checkout sends its accepted games' records)
+                      **({} if self.test.get('no_records') else {'records': 1}))
             while not self.closing:
                 if self.stash is not None:
                     msg, self.stash = self.stash, None
