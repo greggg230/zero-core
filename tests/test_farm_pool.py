@@ -526,6 +526,59 @@ def test_selfplay_local_0_leaves_the_games_to_a_delivering_farm(pool):
         rp.close()
 
 
+def test_progress_polling_never_deadlocks_a_draining_backlog(pool):
+    """The pb3 hang (docs/az.md 55): the run's thread polls RemotePlay.progress (RemotePlay.mu, then each pool's mu)
+    while the pool's thread drains a large held backlog into the quota (once Pool.mu, then RemotePlay.mu per game) -
+    the ABBA deadlock. With the lock order (Pool.mu innermost, never held across a RemotePlay call) both finish."""
+    import sys
+    from zero.remoteplay import RemotePlay
+    fake, R, published = pool
+    n = 4000
+    R.cfg['games'] = n
+    rp = RemotePlay(R, R.cfg['selfplay_remote'])
+    p = rp.pools[f'pool:{FARM}']
+    stuck = False
+    old = sys.getswitchinterval()
+    try:
+        rp.begin(1)
+        wait(lambda: 0 in fake.ckpts, 'gen 0 registered')
+        # the backlog (as after a long pause): games without rows, so the drain is all lock traffic
+        with p.mu:
+            p.held.extend({'gid': i, 'machine': 'm', 'net': None, 's': None, 'rows': 0, 'replay_s': 0.0}
+                          for i in range(n))
+        done = threading.Event()
+        polls = [0]
+
+        def poll():
+            while not done.is_set():
+                rp.progress()
+                polls[0] += 1
+
+        def drain():
+            p._drain()
+            done.set()
+
+        sys.setswitchinterval(1e-5)            # (many thread switches: the race at almost every game)
+        ths = [threading.Thread(target=poll, daemon=True), threading.Thread(target=drain, daemon=True)]
+        for th in ths:
+            th.start()
+        end = time.time() + 30                 # (one deadline for both: a deadlock fails the test in 30 s)
+        for th in ths:
+            th.join(max(0.0, end - time.time()))
+        stuck = any(th.is_alive() for th in ths)
+        assert not stuck, f'deadlock: progress() and the drain hung ({polls[0]} polls, {len(p.held)} games held)'
+        assert polls[0] > 0
+        sys.setswitchinterval(old)
+        wait(lambda: rp.need(1) == 0, 'the quota met')
+        assert rp.q['by'] == {f'pool:{FARM}': n} and not p.held
+        out = rp.end(1)
+        assert out['pools'][f'pool:{FARM}']['games'] == n
+    finally:
+        sys.setswitchinterval(old)
+        if not stuck:                           # (a deadlocked RemotePlay.mu would hang close: the threads are daemons)
+            rp.close()
+
+
 # ---------------------------------------------------------------- rolling leases (zero-farm PROTOCOL rev 15, docs/az.md 54)
 STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker_stub.py')
 

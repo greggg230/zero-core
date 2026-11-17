@@ -67,6 +67,13 @@ default's - the same sha256 in its signed manifest - is that executable, another
 held game's rows searched with a network older than i - 1 - `pool_max_stale` are dropped (`stale_rows_dropped`), the
 rest of the game is kept, and the game is dropped (`stale_dropped`) only when none is left - a rolling lease lives
 for hours, switching networks in place, so its games straddle generations.
+
+Lock order (docs/az.md 55; the pb3 hang of 2026-11-16): `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu`, outermost first.
+`Pool.mu` is innermost: a Pool never calls into its RemotePlay (`pool_iteration`, `accept_pool`, `add_failures`) while
+it holds `Pool.mu`, and RemotePlay may call the Pool methods that take only `Pool.mu` (`close`, `begin`, `progress`)
+with or without its own mu. `Pool.dmu` (the drain lock) is held across a whole `_drain`, so a game the quota accepted
+is in its shard writer before `end_phase` (which takes `dmu` first) closes the iteration's writers: RemotePlay never
+calls `end_phase` holding its mu. The methods RemotePlay calls under its mu that take no Pool lock: `live`, `describe`.
 """
 import gzip
 import hashlib
@@ -343,7 +350,9 @@ class Pool:
         self.spec = G.spec_json(c['spec'])
         self.players = [int(p) for p in c['players']]
         self.aux = bool(getattr(self.R, 'aux', None))
+        # (lock order, module docstring: dmu -> RemotePlay.mu -> mu; never a RemotePlay call while holding mu)
         self.mu = threading.Lock()                 # the held games, the iteration's writers, the counters
+        self.dmu = threading.Lock()                # a whole _drain; end_phase waits for it (accepted games written)
         self.held = deque()                        # games replayed, waiting for a quota: dicts (below)
         self.writers = {}                          # (iteration, machine) -> ShardWriter
         self.cur = self._counters(None)
@@ -423,8 +432,9 @@ class Pool:
         return None
 
     def end_phase(self, it):
-        """Iteration `it`'s self-play ended (RemotePlay.end): its pool shards are closed -> its share (metrics)."""
-        with self.mu:
+        """Iteration `it`'s self-play ended (RemotePlay.end, never under its mu): its pool shards are closed -> its share
+        (metrics). Waits for a running `_drain` (dmu): every game the quota accepted is written first."""
+        with self.dmu, self.mu:
             ws = [(k, w) for k, w in self.writers.items() if k[0] == it]
             for k, _ in ws:
                 del self.writers[k]
@@ -449,6 +459,8 @@ class Pool:
                     'error': self.error}
 
     def close(self):
+        """(RemotePlay may call it under its mu: takes only mu, never dmu.) A drain that is accepting meanwhile closes
+        the writers it opens after this (`_drain`: `closed` read under mu)."""
         self.closed = True
         self.wake.set()
         with self.mu:
@@ -776,61 +788,87 @@ class Pool:
         return G.tail_widths(self.R.info or {})
 
     def _drain(self):
-        """Held games, oldest first, into the open iteration's quota (RemotePlay.accept_pool); the stale ones dropped."""
+        """Held games, oldest first, into the open iteration's quota (RemotePlay.accept_pool); the stale ones dropped.
+        Lock order (module docstring): RemotePlay is called with `mu` released - each game is chosen under `mu`, offered
+        to the quota without it, then written under `mu` again; `dmu` is held throughout (`end_phase` waits for it).
+        Only this thread takes games out of `held`, so the game offered is still its head when it is written."""
+        with self.dmu:
+            it = self.rp.pool_iteration()
+            if it is None:
+                return
+            with self.mu:
+                if self.cur['it'] != it:
+                    self.cur = self._counters(it)
+            while True:
+                with self.mu:
+                    g = None if self.closed else self._head(it)
+                if g is None:
+                    break
+                if not self.rp.accept_pool(it, self.name, 1):     # (RemotePlay.mu: never under self.mu)
+                    break
+                with self.mu:
+                    assert self.held and self.held[0] is g, 'a held game left the queue during its acceptance'
+                    self.held.popleft()
+                    self._accepted(it, g)
+                    if self.closed:                # (closed meanwhile: the writers this drain opened are closed too)
+                        for w in self.writers.values():
+                            w.close()
+                        self.writers.clear()
+                        break
+
+    def _head(self, it):
+        """(mu held) The oldest held game that iteration `it` may take, the stale ones before it dropped (None: none).
+        Rolling: a stale game's rows judged one by one - the head replaced by what is left of it."""
         import numpy as np
+        lim = it - 1 - self.max_stale
+        while self.held:
+            g = self.held[0]
+            if g['net'] is not None and g['net'] < lim:
+                if self.rolling is not None and g['s'] is not None:
+                    # (rolling: judged per row - the rows of a network too old dropped, the rest of the game kept)
+                    nets = np.asarray(g['s']['net'])
+                    ok = np.flatnonzero(nets >= lim)
+                    self.cur['stale_rows_dropped'] += len(nets) - len(ok)
+                    if len(ok):
+                        s = keep_rows(g['s'], ok, self._tail_widths())
+                        g = self.held[0] = dict(g, s=s, rows=len(ok), net=int(np.asarray(s['net']).min()))
+                if g['net'] < lim:
+                    self.held.popleft()
+                    self.cur['stale_dropped'] += 1
+                    continue
+            return g
+        return None
+
+    def _accepted(self, it, g):
+        """(mu held) Held game `g`, accepted by iteration `it`'s quota: counted and its rows into the machine's shards."""
         from .data import ShardWriter, shard_format
         from .workqueue import lag_hist
-        it = self.rp.pool_iteration()
-        if it is None:
+        self.st['accepted_total'] = self.st.get('accepted_total', 0) + 1
+        self.cur['games'] += 1
+        self.cur['replay_s'] += g['replay_s']
+        m = g['machine']
+        self.cur['machines'][m] = self.cur['machines'].get(m, 0) + 1
+        if g['s'] is None:
             return
-        lim = it - 1 - self.max_stale
-        with self.mu:
-            if self.cur['it'] != it:
-                self.cur = self._counters(it)
-            while self.held:
-                g = self.held[0]
-                if g['net'] is not None and g['net'] < lim:
-                    if self.rolling is not None and g['s'] is not None:
-                        # (rolling: judged per row - the rows of a network too old dropped, the rest of the game kept)
-                        nets = np.asarray(g['s']['net'])
-                        ok = np.flatnonzero(nets >= lim)
-                        self.cur['stale_rows_dropped'] += len(nets) - len(ok)
-                        if len(ok):
-                            s = keep_rows(g['s'], ok, self._tail_widths())
-                            g = self.held[0] = dict(g, s=s, rows=len(ok), net=int(np.asarray(s['net']).min()))
-                    if g['net'] < lim:
-                        self.held.popleft()
-                        self.cur['stale_dropped'] += 1
-                        continue
-                if not self.rp.accept_pool(it, self.name, 1):
-                    break
-                self.held.popleft()
-                self.st['accepted_total'] = self.st.get('accepted_total', 0) + 1
-                self.cur['games'] += 1
-                self.cur['replay_s'] += g['replay_s']
-                m = g['machine']
-                self.cur['machines'][m] = self.cur['machines'].get(m, 0) + 1
-                if g['s'] is None:
-                    continue
-                key = (it, m)
-                w = self.writers.get(key)
-                if w is None:
-                    d = os.path.join(self.R.run, 'data', f'iter_{it:04d}')
-                    # (format v2's keys for a game with tails / overrides, docs/az.md 43: `shard_format` with the game's
-                    # info, as Run.shard_meta)
-                    meta = {'game': self.R.cfg['game'], 'features': self.R.info['num_features'],
-                            'actions': self.R.info['num_actions'], 'iter': it, 'source': 'pool', 'machine': m,
-                            'farm_run': self.farm, **shard_format(self.R.cfg, self.R.info)}
-                    pre = 'pool-' + ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in m)
+        key = (it, m)
+        w = self.writers.get(key)
+        if w is None:
+            d = os.path.join(self.R.run, 'data', f'iter_{it:04d}')
+            # (format v2's keys for a game with tails / overrides, docs/az.md 43: `shard_format` with the game's
+            # info, as Run.shard_meta)
+            meta = {'game': self.R.cfg['game'], 'features': self.R.info['num_features'],
+                    'actions': self.R.info['num_actions'], 'iter': it, 'source': 'pool', 'machine': m,
+                    'farm_run': self.farm, **shard_format(self.R.cfg, self.R.info)}
+            pre = 'pool-' + ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in m)
 
-                    def wrote(*a, **k):
-                        self.cur['shards'] += 1
-                    w = ShardWriter(d, pre, rows=self.R.cfg['shard_rows'], meta=meta, bad_dir=self.R.debug_dir(),
-                                    on_write=wrote)
-                    self.writers[key] = w
-                w.add(g['s'])
-                self.cur['rows'] += g['rows']
-                lag_hist(g['s']['net'], it, self.cur['stale'])
+            def wrote(*a, **k):
+                self.cur['shards'] += 1
+            w = ShardWriter(d, pre, rows=self.R.cfg['shard_rows'], meta=meta, bad_dir=self.R.debug_dir(),
+                            on_write=wrote)
+            self.writers[key] = w
+        w.add(g['s'])
+        self.cur['rows'] += g['rows']
+        lag_hist(g['s']['net'], it, self.cur['stale'])
 
 
 def _sparse_rows(s):
