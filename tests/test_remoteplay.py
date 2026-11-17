@@ -304,10 +304,11 @@ def test_a_dying_worker_gives_its_accepted_games_back(tmp_path):
 def test_linger_plays_through_training(tmp_path):
     """selfplay_remote_linger 1: between phases (the run trains, evaluates) the worker plays on with
     its checkpoint; the games it finishes then count for the next iteration (its quota takes them
-    first) and their rows are one checkpoint behind it; quotas stay exact."""
+    first) and their rows are one checkpoint behind it; quotas stay exact. (selfplay_remote_batch 'none': the share
+    rule's one-checkpoint bound; a batch-bound worker's is two, docs/az.md 56.1.)"""
     run = tmp_path / 'lg'
     p = run_loop(run, '--iters', '4', *PAIR, '--selfplay-remote', 'local', '--selfplay-remote-linger', '1',
-                 env=pair_env(tmp_path))
+                 '--selfplay-remote-batch', 'none', env=pair_env(tmp_path))
     assert p.returncode == 0, p.stdout + p.stderr
     m = read_metrics(str(run))
     check_quota(m, 192)
@@ -373,6 +374,21 @@ def test_pause_next_finishes_the_iteration_then_pauses(tmp_path):
     t = subprocess.run([sys.executable, 'tools/pause_run.py', str(run), '--resume'], cwd=ROOT, capture_output=True,
                        text=True, env=dict(os.environ, PYTHONPATH=PYPATH))
     assert t.returncode == 0 and not (run / 'PAUSE_NEXT').exists(), t.stdout + t.stderr
+
+
+def test_a_batch_bound_lingering_worker_stays_within_two_checkpoints(tmp_path):
+    """Under 'auto' a remote worker is batch-bound (docs/az.md 56.1): lingering, its rows stay within
+    batch_inflight (2) checkpoints - the staleness bound - and the quotas exact."""
+    run = tmp_path / 'lgb'
+    p = run_loop(run, '--iters', '4', *PAIR, '--selfplay-remote', 'local', '--selfplay-remote-linger', '1',
+                 env=pair_env(tmp_path))
+    assert p.returncode == 0, p.stdout + p.stderr
+    m = read_metrics(str(run))
+    check_quota(m, 192)
+    for r in m[2:]:
+        q = r['selfplay']['queue']
+        assert q['rates']['w0'].get('batch') is True, q['rates']
+        assert max((int(k) for k in q['staleness']['remote']), default=0) <= 2, q['staleness']
 
 
 def test_local_linger_plays_while_the_run_trains(tmp_path):
