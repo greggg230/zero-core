@@ -732,7 +732,8 @@ class RemotePlay:
         for n in [n for n in self.hosts if n not in names]:
             self._retire(self.hosts[n])
         for n in [n for n in self.pools if n not in names]:
-            self.pools.pop(n).close()              # (its held games are dropped: never counted)
+            # (its held games are dropped: never counted; under mu - Pool.close takes only Pool.mu, never Pool.dmu)
+            self.pools.pop(n).close()
             self.R.log(f'farm pool {n}: removed')
         for n in [n for n in names if is_pool(n) and n not in self.pools]:
             try:
@@ -980,7 +981,8 @@ class RemotePlay:
 
     def accept_pool(self, it, who, n):
         """The farm pool `who` brings `n` more games (zero/farm_pool.py): how many count for iteration `it` (as a
-        remote worker's: as many as the quota still needs)."""
+        remote worker's: as many as the quota still needs). Takes mu: a pool calls it (and `pool_iteration`,
+        `add_failures`) never holding its own `Pool.mu` - the lock order of zero/farm_pool.py (docs/az.md 55)."""
         with self.mu:
             a = self._take(it, who, n)
             self._close_if_met()
@@ -1206,6 +1208,7 @@ class RemotePlay:
                               for name, hout, hends, hc, hlate, hprev, hcaps, hheld, hout_n in per}
         if self.pools:
             # the farm pools' share (docs/az.md 45): closed with what they accepted - the run never waits for them
+            # (outside mu: end_phase takes Pool.dmu, which a draining pool holds while it calls accept_pool)
             pls = {p.name: p.end_phase(it) for p in list(self.pools.values())}
             out['pools'] = {n: {k: v for k, v in r.items() if k != 'stale'} for n, r in pls.items()}
             out['games'] = out.get('games', 0) + sum(r['games'] for r in pls.values())
@@ -1252,8 +1255,10 @@ class RemotePlay:
                     r.pop('quota', None)
                     rems[h.name] = r
                 out['remotes'] = rems
-            if self.pools:
-                out['pools'] = {p.name: p.progress() for p in self.pools.values()}
+            pools = list(self.pools.values())
+        if pools:
+            # (after mu: a pool's lock is taken outside RemotePlay.mu where it can be - lock order, zero/farm_pool.py)
+            out['pools'] = {p.name: p.progress() for p in pools}
         return out
 
     def close(self):

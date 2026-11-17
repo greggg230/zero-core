@@ -7836,3 +7836,51 @@ wrong template file or format, a constant module tensor changed: refused, nothin
 swaps and answers the same positions without a self-play - the same row arrays, its own checkpoint in the meta, within
 the tolerance -, the kept positions answered by the first network give the first reference set exactly, another
 architecture gets a template of its own).
+
+## 55. The farm pool's lock order: `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu` (no setting; MTG Zero's pb3 hang, 2026-11-16)
+
+(Section 54 is the rolling-leases branch's; this fix is on both lines.)
+
+**Why.** MTG Zero's delver-bo3-pb3 hung for 91 minutes in iteration self-play. A py-spy dump showed an ABBA deadlock
+between two locks:
+
+* the run's thread in `RemotePlay.progress` (the pump's progress.json poll) held `RemotePlay.mu` and called
+  `Pool.progress`, which waited for `Pool.mu`;
+* the pool's thread in `Pool._drain` held `Pool.mu` for its whole loop and called `RemotePlay.accept_pool` once per
+  held game, which waited for `RemotePlay.mu`;
+* every worker reader thread (`_event`) then queued on `RemotePlay.mu` too.
+
+The window had always been there. A 2 h pause made it wide: 736 farm games were held when the run resumed, so one
+`_drain` held `Pool.mu` across 736 `accept_pool` calls while progress was polled.
+
+**The rule** (zero/farm_pool.py's module docstring, outermost first): `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu`.
+
+* `Pool.mu` is innermost. A Pool never calls into its RemotePlay (`pool_iteration`, `accept_pool`, `add_failures`)
+  while it holds `Pool.mu`.
+* RemotePlay may call the Pool methods that take only `Pool.mu` (`close`, `begin`, `progress`) with or without its own
+  mu. The ones that take no Pool lock are `live` and `describe`. Where it can, it calls them after releasing its mu:
+  `progress` now collects the pools' records after `RemotePlay.mu` is released, so a pool writing a shard under its own
+  mu never stalls the reader threads.
+* `Pool.dmu` (the drain lock) is held across a whole `_drain`. `end_phase` takes it first, so RemotePlay never calls
+  `end_phase` while it holds its mu (`RemotePlay.end` calls it after the wait). `close` never takes `dmu`, because
+  `_membership` calls it while holding `RemotePlay.mu`.
+
+**What `_drain` does now.** For each game it does three steps:
+
+1. under `Pool.mu`, `_head(it)`: the stale games at the front are dropped (counted as before) and the oldest game the
+   iteration may take is chosen;
+2. without `Pool.mu`, it is offered to the quota (`accept_pool(it, name, 1)`). A refusal ends the drain, as before;
+3. under `Pool.mu` again, `_accepted(it, g)`: the game is taken off `held`, counted and written to its machine's shard
+   writer.
+
+Only the pool's thread takes games out of `held`, so the game offered is still its head when it is written; an assert
+checks this. Because `dmu` is held across all three steps, a game the quota accepted is in its writer before
+`end_phase` closes the iteration's writers. A `close` that lands in the middle is caught: the drain reads `closed`
+under `Pool.mu` before each offer and after each write. If the pool was closed, it closes the writers it opened and
+stops. The games accepted, their order, the stale drops, the shards and the metrics are the same as before. Only the
+locking changed.
+
+**Test.** `test_farm_pool.py::test_progress_polling_never_deadlocks_a_draining_backlog` builds a real RemotePlay with a
+pool and 4,000 held games. One thread polls `progress()` in a loop while another thread drains the backlog (thread
+switch interval 10 us), with one 30 s deadline for both. Before the fix it deadlocked: 66 polls, 3,999 games still
+held. After the fix both threads finish, the quota is met by the pool's 4,000 games, and `end` reports them.
