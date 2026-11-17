@@ -289,7 +289,8 @@ def test_one_remote_is_exactly_as_before(tmp_path):
     the remote record's and the queue's keys of before (captured from the code before the hosts, d499716),
     the log lines of before, shards named m<KK>-<sid>_SSS.npz, no host name or seed salt in the mirror."""
     run = tmp_path / 'one'
-    p = run_hosts(tmp_path, run, '--iters', '2', *TOY, '--selfplay-remote', 'a')
+    # ('none': the share rule for the CPU toy's driver and worker, as 'auto' was before docs/az.md 56.1)
+    p = run_hosts(tmp_path, run, '--iters', '2', *TOY, '--selfplay-remote', 'a', '--selfplay-remote-batch', 'none')
     assert p.returncode == 0, p.stdout + p.stderr
     m = read_metrics(str(run))
     check_quota(m, 600)

@@ -5,6 +5,7 @@ held-out losses (zero.heldout) - and each one off = the run of before."""
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -207,6 +208,25 @@ def test_run_with_anchors_paired_elo_and_heldout(base_run, tmp_path):
                  '--heldout-shards', str(d / 'ho.npz'))
     assert p.returncode == 78 and 'not the network it was fixed with' in p.stdout + p.stderr + open(
         run / 'log.txt', encoding='utf-8').read()
+
+
+def test_elo_games_0_plays_the_anchor_games_only(base_run, tmp_path):
+    """elo_games 0 (docs/az.md 56.2): no checkpoint-against-checkpoint Elo matches - the pool holds the anchors'
+    calibration and each evaluated checkpoint's anchor games, nothing else - and the anchored ratings come out as
+    with them."""
+    d = base_run
+    run = tmp_path / 'only'
+    p = run_loop(run, '--iters', '3', '--elo-paired', '1', '--elo-games', '0', *anchored_flags(d))
+    assert p.returncode == 0, p.stdout + p.stderr
+    res = json.load(open(run / 'elo' / 'results.json'))
+    pairs = {k for k, (_, n) in res['pairs'].items() if n}
+    want = {'anchor:a1|anchor:a3'} | {f'{a}|iter_{k:04d}' for k in (1, 2, 3) for a in ('anchor:a1', 'anchor:a3')}
+    assert {k for k in pairs if 'iter_' in k or 'anchor:' in k} == want, pairs
+    assert not any(k.count('iter_') == 2 for k in res['pairs']), res['pairs']
+    ar = json.load(open(run / 'elo' / 'anchored.json'))
+    assert read_metrics(str(run))[3]['elo_anchored']['elo'] == ar['ratings']['iter_0003']['elo']
+    log = open(run / 'log.txt', encoding='utf-8').read()
+    assert 'vs anchor:a1' in log and not re.search(r'elo match iter_\d+ vs iter_', log)
 
 
 def test_anchor_and_heldout_refusals_and_settings(base_run, tmp_path):

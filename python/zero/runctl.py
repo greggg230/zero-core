@@ -10,6 +10,12 @@ Two control files in a run directory:
   removed, then relaunches the run, which resumes from its newest checkpoint (an iteration
   interrupted before its checkpoint is replayed; one interrupted after it finishes its
   evaluation).
+* PAUSE_NEXT - pause at the next iteration boundary instead (docs/az.md 56.3): the current
+  iteration finishes - its self-play phase with every remote shard, its training, its
+  checkpoint, its evaluation and metrics row - and no work of the next one starts (no remote
+  head start, no lingering); then the run itself turns PAUSE_NEXT into PAUSE and exits with
+  EXIT_PAUSED as above. Resuming (removing PAUSE) loses no finished work. A PAUSE created
+  meanwhile pauses at once, as always; removing PAUSE_NEXT before the boundary cancels it.
 
 State files, written atomically and read by the dashboard and tools/pause_run.py:
 
@@ -29,6 +35,7 @@ import threading
 import time
 
 PAUSE = 'PAUSE'
+PAUSE_NEXT = 'PAUSE_NEXT'         # pause at the next iteration boundary (docs/az.md 56.3)
 STOP = 'STOP'
 EXIT_PAUSED = 75                  # sysexits EX_TEMPFAIL: "try again later"
 EXIT_REFUSED = 78                 # sysexits EX_CONFIG: the run refused its checkpoint (a network of another
@@ -77,6 +84,15 @@ def stop_requested(run):
     return os.path.exists(os.path.join(run, STOP))
 
 
+def pause_next_path(run):
+    return os.path.join(run, PAUSE_NEXT)
+
+
+def pause_next_requested(run):
+    """A pause at the next iteration boundary is pending (<run>/PAUSE_NEXT, docs/az.md 56.3)."""
+    return os.path.exists(pause_next_path(run))
+
+
 def is_run_dir(run):
     """A directory a run has used (config.json or metrics.jsonl): only those get a PAUSE."""
     return os.path.isdir(run) and any(os.path.isfile(os.path.join(run, f)) for f in ('config.json', 'metrics.jsonl'))
@@ -99,13 +115,41 @@ def request_pause(run, by=''):
     return True
 
 
-def request_resume(run):
-    """Remove <run>/PAUSE -> True if there was one."""
-    try:
-        os.remove(pause_path(run))
-        return True
-    except FileNotFoundError:
+def request_pause_next(run, by=''):
+    """Create <run>/PAUSE_NEXT (JSON {"time", "by"}, as PAUSE; an existing one is left as it is): the run pauses
+    at its next iteration boundary (docs/az.md 56.3) -> True if it was created now."""
+    p = pause_next_path(run)
+    if os.path.exists(p):
         return False
+    tmp = p + f'.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump({'time': time.time(), 'by': by}, f)
+    try:
+        os.replace(tmp, p)
+    except OSError:
+        os.remove(tmp)
+        raise
+    return True
+
+
+def pause_next_since(run):
+    """When the boundary pause was asked for (PAUSE_NEXT's time), or None."""
+    try:
+        return os.path.getmtime(pause_next_path(run))
+    except OSError:
+        return None
+
+
+def request_resume(run):
+    """Remove <run>/PAUSE (and a pending PAUSE_NEXT) -> True if there was either."""
+    had = False
+    for p in (pause_next_path(run), pause_path(run)):
+        try:
+            os.remove(p)
+            had = True
+        except FileNotFoundError:
+            pass
+    return had
 
 
 def pause_since(run):
@@ -193,8 +237,9 @@ def run_status(run):
     s_alive = alive(ss)
     pause, stop = pause_requested(run), stop_requested(run)
     since = pause_since(run) if pause else None
+    nxt = pause_next_requested(run)
     out = {'pause': pause, 'stop': stop, 'paused_since': since, 'run': rs, 'supervisor': ss,
-           'run_alive': r_alive, 'supervisor_alive': s_alive, 'resumable': s_alive}
+           'run_alive': r_alive, 'supervisor_alive': s_alive, 'resumable': s_alive, 'pause_next': nxt}
     if rs is None and ss is None:
         out.update(state=None, detail="This run's process predates pause / resume (no state files).")
         return out
@@ -203,6 +248,8 @@ def run_status(run):
             st, detail = 'pausing', 'Stopping at the next pause point.'
         elif stop:
             st, detail = 'stopping', 'STOP file: the run ends after the current iteration.'
+        elif nxt:
+            st, detail = 'pausing', 'PAUSE_NEXT file: the run pauses at the end of the current iteration.'
         else:
             st, detail = 'running', ''
     elif pause:

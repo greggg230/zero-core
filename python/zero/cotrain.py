@@ -58,6 +58,7 @@ from collections import deque
 
 import numpy as np
 
+from . import runctl
 from . import games as G
 from . import package
 from .data import ShardWriter, TargetStats
@@ -909,6 +910,8 @@ class CoRun:
             if os.path.exists(stop):
                 self.log('STOP file found; exiting')
                 break
+            if runctl.pause_next_requested(run):
+                Run.pause_at_boundary(self, it - 1)    # (PAUSE_NEXT, docs/az.md 56.3: raises Paused)
             t0 = time.time()
             # both phases finished before a PAUSE / crash in training (each data directory's DONE.json, verified,
             # docs/az.md 47.1): trained on as they are, never played again
@@ -938,7 +941,7 @@ class CoRun:
                     m['selfplay_resumed'] = True
                 _write_json(X.partial_path(it), m, strict=True)
             if R.rsp is not None and self.sp is not None and it < c['iters'] and not os.path.exists(stop) \
-                    and not os.path.exists(os.path.join(run, 'PAUSE')):
+                    and not os.path.exists(os.path.join(run, 'PAUSE')) and not runctl.pause_next_requested(run):
                 # both checkpoints are written: the remote goes on with the queued episodes with the
                 # resolver's checkpoint it (iteration it + 1's) while the networks are evaluated here
                 R.rsp.begin(it + 1, self.sp['co'])

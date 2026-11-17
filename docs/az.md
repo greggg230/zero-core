@@ -124,7 +124,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
 | `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
 | `eval_games`, `eval_sims`, `eval_random_games`, `eval_every` | 200, 32, 50, 1 | evaluation vs the yardstick and vs random (`eval_random_games` 0: no random match; the reference games still rate the random bot unless `ref_games` is 0) |
-| `elo_games`, `ref_games` | 100, 400 | games per Elo match (checkpoints 1, 2, 4 ... 32 evaluations back, i.e. x `eval_every` iterations; or `elo_offsets`); random vs yardstick reference games (once per Elo pool) |
+| `elo_games`, `ref_games` | 100, 400 | games per Elo match (checkpoints 1, 2, 4 ... 32 evaluations back, i.e. x `eval_every` iterations; or `elo_offsets`; 0 = no checkpoint-vs-checkpoint matches, with `elo_anchors` the anchor games only: 56.2); random vs yardstick reference games (once per Elo pool) |
 | `elo_opponents`, `elo_sims`, `elo_together` | 0, 0, 0 | cheaper Elo (CPU runs): play only the first k of the offsets 1, 2, 4 ... 32 (0 = all); Elo matches at elo_sims (0 = eval_sims); 1 = an iteration's Elo matches in one driver (one evaluator key per opponent: the checkpoint's batches hold the leaves of every match; other seeds than separate matches) |
 | `elo_offsets` | '' | raw Elo offsets ('1,2,4,8'): each evaluated checkpoint k plays the checkpoints k-1, k-2, k-4, k-8 (those that exist) whatever `eval_every`, instead of evaluations back; `elo_opponents` is then not used; checkpoints never evaluated are rated through these games only and are never `best.pt` (section 5.4). '' = the default above, unchanged |
 | `eval_select`, `eval_select_min_visits` | visits, 0 | the move rule of every evaluation seat (docs/search.md 3.3): 'visits' = argmax (N, P0) (AlphaZero's; the default: today's moves bit for bit) or 'cq' = the argmax of the completed-Q target's logits (with `cq_c_visit`, `cq_c_scale`) among the options with at least `eval_select_min_visits` visits (0 = all). The yardstick, random and Elo matches (here or on the `eval_remote`), co-training's evaluations (the resolver's: `resolver_cfg`), and by default `zero.h2h` / `zero.replay` of the run's checkpoints. Recorded in the evaluations (`select`, absent = 'visits'); one Elo pool per rule (section 5.4) |
@@ -149,7 +149,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
-| `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: those whose inference is CUDA / MPS - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
+| `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: this machine's driver when its inference is CUDA / MPS, and every remote worker on any device (56.1) - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
 | `selfplay_remote_linger` | 0 | 1 = the workers play on with their checkpoint between phases (while the run trains); those games count for the next iteration, one checkpoint stale (5.3) |
 | `selfplay_local_linger` | 0 | 1 = this machine's self-play plays on too while the run trains (a thread; CUDA batches on their own stream): its finished games count for the next iteration, one checkpoint stale, as the remote's linger (5.3, 10.10). Needs `selfplay_remote`; single-game runs without the league |
 | `shard_writer_thread`, `shard_writer_queue_mb` | 0, 4096 | 1 = self-play's training records are converted and written into shards on a writer thread of their own (`zero/shardthread.py`): the thread that drives the search only takes them (`SearchDriver.take_records`: moved, not copied), splits them per game and queues them, at most `shard_writer_queue_mb` MB (it waits while the queue is full, counted). The same shards byte for byte; the caller's timing changes which games finish when (a rolling or shared quota's). This machine's self-play (plain, rolling, the shared queue), the local linger and the remote's workers (their config's); metrics `selfplay.shard_writer`, `linger.samples_s`, `selfplay.remote.shard_writer`. Single-game runs (co-training refused). 0 = taken, converted and written between batches, as before (31) |
@@ -186,6 +186,11 @@ settings a run has not stored yet; a run directory keeps its settings across cod
   supervisor then polls PAUSE every second and relaunches the run the moment it is removed
   (not a crash: no delay, no back-off); a run started while PAUSE exists exits 75 at once.
   Measured in `tests/test_loop.py`: paused mid self-play and exited in a few seconds.
+* **PAUSE_NEXT** (56.3): pause at the next iteration boundary instead - the current iteration finishes (its
+  self-play phase with every remote shard, training, checkpoint, evaluation, metrics row), nothing of the next one
+  starts (no remote head start, no lingering), then the run creates PAUSE itself and exits 75 as above.
+  `tools/pause_run.py --wait` asks for it and waits; `--now` is the immediate PAUSE. Removing PAUSE resumes; removing
+  PAUSE_NEXT before the boundary cancels it.
 * **Refused** (exit status **78**, `runctl.EXIT_REFUSED`): the run's checkpoint is a network of
   another encoding than this build's (the encoding guard, section 10.4); state `refused`, and the
   supervisor ends instead of restarting it.
@@ -429,9 +434,9 @@ REFUSED the run's checkpoint ...` and plays on alone.
   in its first phase (`PROVISIONAL_S`, env `ZERO_RSP_PROVISIONAL_S`). A restart takes the rates and
   head starts from the run's last metrics row (`selfplay.queue.rates`; a row of the first design,
   `selfplay.remote` without `queue`: this machine's games per second and the remote's per worker).
-* **Batch-bound consumers** (`selfplay_remote_batch`: `auto`, the default, = the consumers whose
-  inference runs on CUDA / MPS - MTG Zero's desktop driver; `local`, `remote`, `all`, `none` choose
-  explicitly): such a consumer's network batches hold its games' leaves and a network call costs
+* **Batch-bound consumers** (`selfplay_remote_batch`: `auto`, the default, = this machine's driver
+  when its inference runs on CUDA / MPS - MTG Zero's desktop driver - and, since 56.1, every remote
+  worker on any device; `local`, `remote`, `all`, `none` choose explicitly): such a consumer's network batches hold its games' leaves and a network call costs
   about the same whatever its batch, so its leaves per second grow with its games in flight and its
   games take about as long at any in-flight. The cap above then sets its throughput, not its
   latency: a cap that starts small measures a small rate, which gives a small cap again, and it
@@ -7884,3 +7889,91 @@ locking changed.
 pool and 4,000 held games. One thread polls `progress()` in a loop while another thread drains the backlog (thread
 switch interval 10 us), with one 30 s deadline for both. Before the fix it deadlocked: 66 polls, 3,999 games still
 held. After the fix both threads finish, the quota is met by the pool's 4,000 games, and `end` reports them.
+
+## 56. Iteration speed and run safety: remote workers batch-bound, anchor-only Elo, the boundary pause, the stall alarm (`selfplay_remote_batch` 'auto', `elo_games` 0, `PAUSE_NEXT`, `tools/stall_watch.py`; MTG Zero's speed review of pb3, 2026-11-16)
+
+**Why.** A review of pb3's iteration time (MTG Zero, 2026-11-16) found three losses outside the iteration itself: the
+Mac's share of self-play collapsing (its caps spiralling down), Mac time spent on Elo games that carry no information,
+and a 93-minute hang nobody noticed, after pauses that could only stop mid-phase. Same branch as the lock-order fix
+(55).
+
+### 56.1 Remote workers are batch-bound under 'auto' (a deliberate change of the default)
+
+`selfplay_remote_batch` 'auto' made only CUDA / MPS consumers batch-bound, on the model's assumption that a CPU
+consumer's rate is its cores' whatever its in-flight. A remote worker's driver batches its own games' leaves, so on
+the CPU too its network batches - and its rate - grow with its in-flight until its cores are full. Under the share
+rule (`cap = inflight x rate x horizon`, `inflight` 1) such a worker spirals: a smaller cap, smaller batches, a smaller
+rate, a smaller cap. The iteration converges only where its games last one horizon, and a worker whose games cannot
+finish in one horizon at any in-flight (a minimum game latency above it) is driven to its floor. pb3 (`metrics.jsonl`,
+`selfplay.remote`): when the desktop doubled its speed the horizon halved and the Mac's caps fell from ~100 to 9-11 a
+worker over ~100 iterations, its leaves/s from 5,869 to 1,032 and its accepted matches from 283 to 18 an iteration,
+with 7 of its 16 cores busy (under-fed, not overloaded).
+
+Now 'auto' makes **every remote worker batch-bound, on any device**; this machine's driver stays device-based
+(`RemotePlay.batch_bound`). The batch rule `max(inflight x share, min(slots, batch_inflight x share))` is the same
+fixed point with `batch_inflight` horizons and the slots as its ceiling: the cap settles where the worker's games last
+`batch_inflight` (2) horizons (Little's law). That is the **staleness bound**: a remote worker's rows are at most about
+two checkpoints old (the shared-queue line's staleness histogram shows it), inside the farm pool's `max_stale` (pb3:
+4); a worker too slow even for that still falls to its floor. Cost: a worker that is already core-bound (its rate flat
+in its in-flight; delver1's Mac at 340-768 games) holds two horizons of games instead of one - older rows, no more
+throughput. The old 'auto' is `selfplay_remote_batch` 'local' with a CUDA / MPS driver here (MTG Zero's desktop) and 'none' with a CPU one: the share rule for the workers exactly as before. Runs without a
+remote, or with only CUDA / MPS remotes, are unchanged.
+
+Tests: `test_workqueue.py::test_a_cpu_worker_whose_rate_grows_with_its_inflight_spirals_unless_batch_bound` (pb3's
+curves - the desktop ~300 s a match at any in-flight, a Mac worker 330 s + n / 0.58: the share rule falls
+monotonically from ~100 to the floor of 4 with a >10x lower rate; batch-bound it holds 70-110 with its matches within
+2 horizons, its rate >4x, the phase shorter; a faster desktop moves the fixed point down, one too fast for the worker
+sends it to its floor), `::test_auto_makes_every_remote_worker_batch_bound`.
+
+### 56.2 `elo_games` 0: the anchor games only
+
+`elo_games` 0 skips every checkpoint-against-checkpoint Elo match (the `elo_offsets` / `elo_opponents` games);
+with `elo_anchors` each evaluated checkpoint plays only its anchor games (and the anchors' one-time calibration), and
+the anchored fit is made from those. Before, 0 was not a usable value. pb3's Mac phase was 2 opponents x 24 paired
+contests + 100 anchor games every 16 iterations (1,283-1,961 s, Mac self-play stopped meanwhile); its unanchored Elo
+had a standard error of 220-560 and no decision read it. The unanchored ratings (`ratings.json`, `best.pt`) then rest
+on whatever games the pool has (the anchor games, the yardstick's if `eval_games` > 0). Test:
+`test_measure.py::test_elo_games_0_plays_the_anchor_games_only`.
+
+### 56.3 PAUSE_NEXT: a pause at the iteration boundary
+
+PAUSE stops at the next pause point - in pb3 0.1-0.7 s after the file appears, inside self-play: the partial phase is
+played again and the Mac's shards still travelling are dropped (11-15: three shards; 11-16 14:28 the same).
+`<run>/PAUSE_NEXT` (runctl `request_pause_next`, JSON `{"time", "by"}` as PAUSE) asks for the boundary instead:
+
+* the loop checks it between iterations (`Run.pause_at_boundary`, also co-training's loop): iteration N has its
+  checkpoint, evaluation and metrics row, and `RemotePlay.end` waited for every shard of its phase (a pause point
+  would have cut that wait); PAUSE is created (first, so there is never a moment with neither), PAUSE_NEXT removed,
+  the pause watch triggered, `Paused` raised: exit 75, the supervisor waits for PAUSE's removal as for any pause;
+* while it is there nothing of iteration N + 1 starts: no remote head start (`early_remote`), no local linger, and
+  the workers' `end` carries `"linger": false` so they end their phase instead of lingering (a worker of an older
+  zero-core ignores the key; its lingering games are then dropped at the pause);
+* games unfinished at the boundary are not kept (in flight, or finished beyond the quota and held: their count is in
+  the log line), as at any restart. Nothing of a finished iteration is lost; the resumed run goes on with N + 1.
+* `tools/pause_run.py --wait` asks for PAUSE_NEXT and waits (default timeout 3600 s), `--boundary` asks without
+  waiting, `--now` is the immediate PAUSE (with or without `--wait`), `--resume` removes PAUSE and a pending
+  PAUSE_NEXT. `run_status` says `pausing` while PAUSE_NEXT waits. A run started with PAUSE_NEXT present pauses before
+  any work.
+
+Test: `test_remoteplay.py::test_pause_next_finishes_the_iteration_then_pauses` (asked during iteration 2's self-play
+with a lingering remote worker: metrics [0, 1, 2], exit 75, PAUSE by PAUSE_NEXT, no shard dropped, no iteration 3
+data; resumed, iteration 2 is not played again; the tool's flags).
+
+### 56.4 `tools/stall_watch.py`: an outside stall alarm with stack dumps
+
+pb3 hung 93 minutes on 11-16 (the lock-order deadlock, 55) while its iterations took ~5.5 minutes; MTG Zero's
+watch_run.sh alarms after 75 minutes of no write, and remote status lines kept writing. `zero.tools.stall_watch`
+reads only the run (log.txt's `iter N train:` and `run ... starting after iter N` lines, progress.json, the control
+and state files) and alarms when the time since the newer of the last iteration's end and the last start passes
+`max(3 x median, 1.5 x longest, 600 s)` over the last 32 iteration intervals (an interval across a restart is left
+out; with fewer than 3, 75 minutes). `longest` keeps evaluation iterations from false alarms. No alarm while PAUSE is
+there or once progress.json is 'idle'. On an alarm it dumps the stacks of the run's Python processes (the run process,
+its children, the supervisor) with `py-spy dump` when py-spy is installed (the PATH, or this Python's user scripts),
+plus each process's state, threads, CPU seconds and memory (psutil), into a new directory (default the temp
+directory's `zero-stall/`), prints `STALL ...` with the directory and exits (`--once`: exit 3). Without py-spy it says
+so (`pip install --user py-spy`).
+
+Replayed on pb3's log up to the 16:37 restart: the threshold is 18.9 min (median 332 s, longest 758 s): the alarm at
+16:56, not after 93 minutes. Tests: `test_stall_watch.py` (the 11-16 shape, midnight, restarts, a new run's fallback,
+`--once`'s exit codes, a dump without py-spy). A real dump of a sleeping Python process with py-spy 0.4 on Windows
+named the function it slept in.

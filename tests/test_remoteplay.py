@@ -174,9 +174,11 @@ def test_caps_follow_throughput_and_rows_stay_within_one_checkpoint(tmp_path):
     every iteration exactly its 192 games; the next caps are the model's (inflight x rate x (head
     start + the joint phase)), the slower consumer the smaller share; once the caps are measured the
     rows are within one checkpoint of the iteration's (at 768 slots each, every slot full - the old
-    behaviour - drifts to a mean lag of 2 and more, docs/az.md 5.3)."""
+    behaviour - drifts to a mean lag of 2 and more, docs/az.md 5.3). The share rule for both: selfplay_remote_batch
+    'none', what 'auto' was for the CPU toy before docs/az.md 56.1 made remote workers batch-bound."""
     run = tmp_path / 'pair'
-    p = run_loop(run, '--iters', '5', *PAIR, '--selfplay-remote', 'local', env=pair_env(tmp_path))
+    p = run_loop(run, '--iters', '5', *PAIR, '--selfplay-remote', 'local', '--selfplay-remote-batch', 'none',
+                 env=pair_env(tmp_path))
     assert p.returncode == 0, p.stdout + p.stderr
     m = read_metrics(str(run))
     check_quota(m, 192)
@@ -317,6 +319,60 @@ def test_linger_plays_through_training(tmp_path):
         assert st['remote'].get('1', 0) > 0 and st['summary']['mean'] <= 1.0, st
     wl = (tmp_path / 'mirror' / 'lg' / 'w00.log').read_text(encoding='utf-8')
     assert 'lingering between phases' in wl and '; lingering' in wl
+
+
+def test_pause_next_finishes_the_iteration_then_pauses(tmp_path):
+    """PAUSE_NEXT (docs/az.md 56.3): asked during iteration 2's self-play, with a remote worker that lingers, the run
+    finishes iteration 2 - every remote shard of its phase fetched (none dropped), its training, checkpoint and
+    metrics row - starts nothing of iteration 3 (no remote head start; the worker told not to linger) and only then
+    pauses: PAUSE created by the run, PAUSE_NEXT gone, exit 75. Resumed, it goes on with iteration 3: iteration 2's
+    phase is never played again. tools/pause_run.py --wait does the same and waits for it."""
+    run = tmp_path / 'pn'
+    run.mkdir()
+    console = open(tmp_path / 'pn.out', 'w+', encoding='utf-8')
+    e = dict(os.environ, PYTHONIOENCODING='utf-8', PYTHONPATH=PYPATH,
+             **pair_env(tmp_path, test=None))
+    proc = subprocess.Popen([sys.executable, '-m', 'zero.run', '--run', str(run), '--preset', 'toy-smoke', '--iters', '4',
+                             *PAIR, '--eval-games', '8', '--eval-random-games', '4', '--elo-games', '4',
+                             '--ref-games', '8', '--selfplay-remote', 'local', '--selfplay-remote-linger', '1'],
+                            cwd=ROOT, stdout=console, stderr=subprocess.STDOUT, text=True, env=e)
+    deadline = time.time() + 240
+    while time.time() < deadline:
+        try:
+            pr = json.load(open(run / 'progress.json'))
+        except (OSError, ValueError):
+            pr = {}
+        if pr.get('iter') == 2 and pr.get('phase') == 'selfplay':
+            break
+        time.sleep(0.05)
+    assert runctl.request_pause_next(str(run), by='test')
+    assert runctl.run_status(str(run))['state'] == 'pausing' and runctl.run_status(str(run))['pause_next']
+    proc.wait(timeout=240)
+    console.seek(0)
+    out = console.read()
+    console.close()
+    log = open(run / 'log.txt', encoding='utf-8').read()
+    assert proc.returncode == runctl.EXIT_PAUSED, out + log[-3000:]
+    assert [r['iter'] for r in read_metrics(str(run))] == [0, 1, 2], log[-3000:]
+    assert (run / 'PAUSE').exists() and not (run / 'PAUSE_NEXT').exists()
+    assert json.load(open(run / 'PAUSE'))['by'].startswith('PAUSE_NEXT')
+    assert 'PAUSE_NEXT: iteration 2 is finished and nothing of iteration 3 has started' in log
+    assert 'came after its phase closed' not in log and 'iter 3 selfplay' not in log
+    assert runctl.read_state(str(run), 'run')['state'] == 'paused'
+    assert not os.path.exists(run / 'data' / 'iter_0003') or not os.listdir(run / 'data' / 'iter_0003')
+    runctl.request_resume(str(run))
+    p = run_loop(run, '--iters', '3', *PAIR, '--selfplay-remote', 'local', env=pair_env(tmp_path))
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert [r['iter'] for r in read_metrics(str(run))] == [0, 1, 2, 3]
+    log = open(run / 'log.txt', encoding='utf-8').read()
+    assert log.count('iter 2 selfplay:') == 1 and log.count('iter 3 selfplay:') == 1
+    # the tool: --wait asks for the boundary (PAUSE_NEXT); here the run is not running, so it times out and says so
+    t = subprocess.run([sys.executable, 'tools/pause_run.py', str(run), '--wait', '--timeout', '1'], cwd=ROOT,
+                       capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=PYPATH))
+    assert t.returncode == 0 and 'PAUSE_NEXT created' in t.stdout and (run / 'PAUSE_NEXT').exists(), t.stdout + t.stderr
+    t = subprocess.run([sys.executable, 'tools/pause_run.py', str(run), '--resume'], cwd=ROOT, capture_output=True,
+                       text=True, env=dict(os.environ, PYTHONPATH=PYPATH))
+    assert t.returncode == 0 and not (run / 'PAUSE_NEXT').exists(), t.stdout + t.stderr
 
 
 def test_local_linger_plays_while_the_run_trains(tmp_path):

@@ -201,6 +201,58 @@ def test_batch_cap_formula_bounds_and_cpu_consumers_unchanged():
     assert json.loads(json.dumps(sh.state()))['local']['slots'] == 32
 
 
+# pb3 (MTG Zero, 2026-11-16; its metrics.jsonl `selfplay.remote`): the desktop finishes ~5 matches/s at 1536 in
+# flight, its matches ~300 s whatever its in-flight (CUDA, batch-bound); each of the Mac's three CPU workers takes
+# ~330 s for a match at any in-flight plus 1 / 0.58 s per match it holds (~500 s at 100 in flight, ~355 s at 14: its
+# network batches shrink with its cap, so its rate does too)
+PB3_DESKTOP = lambda n: 290.0 + 0.01 * n                # noqa: E731
+PB3_MAC = lambda n: 330.0 + n / 0.58                    # noqa: E731
+
+
+def pb3(batch):
+    return {'local': (2, 1536, True, PB3_DESKTOP, 1536 / PB3_DESKTOP(1536)),
+            **{f'w{k}': (4, 192, batch, PB3_MAC, 100 / PB3_MAC(100)) for k in range(3)}}
+
+
+def test_a_cpu_worker_whose_rate_grows_with_its_inflight_spirals_unless_batch_bound():
+    """The Mac's cap spiral of pb3 (docs/az.md 56.1): from ~100 games a worker, the share rule (a CPU worker not
+    batch-bound) shrinks the caps phase after phase - a smaller cap, smaller batches, a smaller rate, a smaller cap -
+    down to the floor, because its matches never finish within one horizon (~250 s) at any in-flight; its throughput
+    falls >10x. Batch-bound (what 'auto' makes of a remote worker now), its cap settles where its matches last
+    `batch_inflight` (2) horizons - the staleness bound - near its pre-spiral ~90, its rate several times the
+    spiral's, the phase shorter."""
+    old = simulate(pb3(False), units=1350, phases=40)
+    caps = [r['caps']['w0'] for r in old]
+    assert caps[0] < 100 and caps[-1] == 4 and all(b <= a for a, b in zip(caps, caps[1:])), caps
+    assert old[-1]['rates']['w0'] < 0.1 * old[0]['rates']['w0'] / (old[0]['caps']['w0'] / 100), old[-1]['rates']
+    new = simulate(pb3(True), units=1350, phases=40)
+    last = new[-1]
+    assert all(70 <= r['caps']['w0'] <= 110 for r in new[5:]), [r['caps']['w0'] for r in new]
+    for w in ('w0', 'w1', 'w2'):
+        assert last['lat'][w] <= 2.0 * 1.03, last           # within batch_inflight horizons (the staleness bound)
+        assert last['rates'][w] > 4 * old[-1]['rates'][w], (last['rates'], old[-1]['rates'])
+    assert last['caps']['local'] == 1536 and last['secs'] < old[-1]['secs'], (last, old[-1])
+    # a faster desktop (a shorter horizon) moves the fixed point down, not to the floor, while the matches still
+    # fit in two horizons; one that cannot fit them even at its floor falls to the floor as any other
+    fast = simulate(dict(pb3(True), local=(2, 1536, True, lambda n: 200.0 + 0.01 * n, 7.0)), units=1350, phases=40)
+    assert 4 < fast[-1]['caps']['w0'] < last['caps']['w0'] and fast[-1]['lat']['w0'] <= 2.0 * 1.05, fast[-1]
+    slow = simulate(dict(pb3(True), local=(2, 1536, True, lambda n: 120.0 + 0.01 * n, 12.0)), units=1350, phases=40)
+    assert slow[-1]['caps']['w0'] == 4, slow[-1]
+
+
+def test_auto_makes_every_remote_worker_batch_bound():
+    """selfplay_remote_batch 'auto': a remote worker is batch-bound on any device (docs/az.md 56.1); this machine's
+    driver only on CUDA / MPS; the explicit modes as before."""
+    from types import SimpleNamespace
+    from zero.remoteplay import RemotePlay
+    bb = lambda mode, who, dev: RemotePlay.batch_bound(SimpleNamespace(batch=mode), who, dev)  # noqa: E731
+    assert bb('auto', 'remote', 'cpu') and bb('auto', 'remote', 'mps') and bb('auto', 'local', 'cuda')
+    assert not bb('auto', 'local', 'cpu')
+    assert bb('local', 'local', 'cpu') and not bb('local', 'remote', 'cuda')
+    assert bb('remote', 'remote', 'cpu') and not bb('remote', 'local', 'cuda')
+    assert bb('all', 'local', 'cpu') and not bb('none', 'remote', 'cuda')
+
+
 def test_a_backoff_gives_a_batch_bound_desktop_the_quota_at_once():
     """A Mac worker backing off for a phase: its cap is 0 and the desktop takes the rest at once (here
     its slots, as before); the next phase the shares come back."""

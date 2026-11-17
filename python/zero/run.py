@@ -278,6 +278,8 @@ DEFAULTS = dict(
     # the checkpoints that many ITERATIONS back instead, whatever eval_every (every iteration writes
     # one; elo_opponents is not used): the ones never evaluated are rated through these games only
     # and are never models/best.pt (docs/az.md 5)
+    # elo_games 0: no checkpoint-against-checkpoint Elo matches at all - with elo_anchors, the anchor games only
+    # (docs/az.md 56.2)
     elo_opponents=0, elo_sims=0, elo_together=0, elo_offsets='',
     # fixed anchors (docs/az.md 20.1): frozen checkpoints ('path' or 'label=path', comma-separated; '' =
     # off: nothing changes) every evaluated checkpoint of the pool plays elo_anchor_games games against
@@ -370,9 +372,10 @@ DEFAULTS = dict(
     selfplay_branch=0.0, selfplay_branch_moves=3, selfplay_branch_temp=2.0, selfplay_branch_differ=0, selfplay_archive='',
     selfplay_archive_p=0.1,
     # ... except a batch-bound machine's (its network batches grow with its games in flight, so a
-    # smaller cap only starves it: 'auto' = the ones inferring on CUDA / MPS; 'local' | 'remote' |
-    # 'all' | 'none'): its slots while its games take at most this many iterations (its throughput
-    # share x this; 1 = as the others)
+    # smaller cap only starves it: 'auto' = this machine's driver inferring on CUDA / MPS and every
+    # remote worker, whatever its device - docs/az.md 56.1; 'local' | 'remote' | 'all' | 'none'): its
+    # slots while its games take at most this many iterations (its throughput share x this; 1 = as the
+    # others)
     selfplay_remote_batch='auto', selfplay_remote_batch_inflight=2.0,
     infer_device='cpu', train_device='cpu', seed=0,
     # network batches evaluated concurrently on this many Python threads (CPU: small networks
@@ -1359,10 +1362,11 @@ class Run:
         finished games are held, with their samples, for iteration it + 1's quota (which takes the held
         games first): one checkpoint stale, as a remote's linger. Its network batches run on a CUDA stream
         of their own (the training's are on the default one). Never after the last iteration, nor with
-        STOP or PAUSE there, nor more games held than an iteration's quota."""
+        STOP, PAUSE or PAUSE_NEXT there, nor more games held than an iteration's quota."""
         c = self.cfg
         if not c.get('selfplay_local_linger') or self.rsp is None or self.roll is None or it >= c['iters'] \
-                or runctl.stop_requested(self.run) or runctl.pause_requested(self.run):
+                or runctl.stop_requested(self.run) or runctl.pause_requested(self.run) \
+                or runctl.pause_next_requested(self.run):
             return
         st = self.linger = {'stop': threading.Event(), 'games': 0, 'error': None, 't0': time.time(),
                             'leaves0': self.roll.stats()['leaves']}
@@ -2005,7 +2009,8 @@ class Run:
         elo.save_results(self.run, res, tag=tag)
         e = max(1, int(c['eval_every']))
         since = res.get('since', 0)
-        todo = [(k, j) for k in range(e, latest + 1, e) if k >= since
+        # (elo_games 0: no checkpoint-vs-checkpoint matches - the anchors' games alone, docs/az.md 56.2)
+        todo = [(k, j) for k in range(e, latest + 1, e) if k >= since and c['elo_games']
                 for j in elo.opponents(k, e, c.get('elo_offsets', ''), c.get('elo_opponents', 0))
                 if j >= 0 and os.path.exists(model_path(self.run, j))
                 and os.path.exists(model_path(self.run, k))
@@ -2305,12 +2310,33 @@ class Run:
     def early_remote(self, nxt):
         """Checkpoint nxt - 1 is written: the remote starts iteration nxt's self-play with it now,
         while this machine evaluates (docs/az.md 5.3: on-policy, the checkpoint this machine's
-        phase nxt will use). Not after the last iteration, nor when STOP or PAUSE is there."""
+        phase nxt will use). Not after the last iteration, nor when STOP, PAUSE or PAUSE_NEXT is there."""
         if self.rsp is not None and nxt <= self.cfg['iters'] and not runctl.stop_requested(self.run) \
-                and not runctl.pause_requested(self.run):
+                and not runctl.pause_requested(self.run) and not runctl.pause_next_requested(self.run):
             if self.league is not None:
                 self.league.plan(nxt)              # (made here, on the main thread; shipped with the phase)
             self.rsp.begin(nxt)
+
+    def pause_at_boundary(self, last):
+        """PAUSE_NEXT (docs/az.md 56.3): iteration `last` is finished - its checkpoint, evaluation and metrics row
+        written, every remote shard of its phase fetched - and nothing of the next one has started (no remote head
+        start, no lingering: early_remote and the lingers refuse while PAUSE_NEXT is there). PAUSE_NEXT becomes
+        PAUSE (PAUSE first: never a moment with neither) and the run pauses: Paused, exit 75; the supervisor
+        relaunches it when PAUSE is removed and it resumes after `last`. Only games unfinished at the boundary are
+        not kept - in flight, or finished beyond the iteration's quota and held for the next one (counted here) -
+        as at any restart."""
+        held = len(getattr(self, 'held', None) or ())
+        runctl.request_pause(self.run, by=f'PAUSE_NEXT: the boundary after iteration {last}')
+        try:
+            os.remove(runctl.pause_next_path(self.run))
+        except FileNotFoundError:
+            pass
+        self.log(f'PAUSE_NEXT: iteration {last} is finished and nothing of iteration {last + 1} has started: pausing '
+                 f'at the boundary (PAUSE created; {held} finished game(s) held beyond iteration {last}' + "'" + f's quota '
+                 f'not kept)')
+        if self.pw is not None:
+            self.pw.trigger()                      # (the state file's 'pausing' now, never after main's 'paused')
+        raise Paused(f'at the boundary after iteration {last}')
 
     def _iterations(self, start, done):
         c = self.cfg
@@ -2329,6 +2355,8 @@ class Run:
             if os.path.exists(stop):
                 self.log('STOP file found; exiting')
                 break
+            if runctl.pause_next_requested(run):
+                self.pause_at_boundary(it - 1)     # (raises Paused)
             t0 = time.time()
             # a phase that finished before a PAUSE / crash in its training (data/iter_N/DONE.json, verified against the
             # directory, docs/az.md 47.1): trained on as it is, never played again

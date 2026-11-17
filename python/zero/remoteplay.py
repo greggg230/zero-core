@@ -30,8 +30,9 @@ host; 0 = the remote's `procs`),
 `selfplay_remote_wait` (seconds the end of a phase still waits for the remote's last shards once STOP is
 there; without STOP it waits for them all, docs/az.md 47.4),
 `selfplay_remote_inflight` (each machine's in-flight cap, in iterations of its throughput),
-`selfplay_remote_batch` ('auto': the consumers whose inference is CUDA / MPS are batch-bound;
-'local', 'remote', 'all', 'none') and `selfplay_remote_batch_inflight` (a batch-bound consumer's
+`selfplay_remote_batch` ('auto': this machine's driver when it infers on CUDA / MPS, and every remote
+worker whatever its device - a worker's driver batches its own games' leaves, so a CPU worker's rate grows
+with its in-flight too until its cores are full: docs/az.md 56.1; 'local', 'remote', 'all', 'none') and `selfplay_remote_batch_inflight` (a batch-bound consumer's
 cap is its slots while its games take at most this many iterations, zero/workqueue.py),
 `selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` (co-training),
 `selfplay_remote_linger` (0/1: the workers keep playing with their checkpoint while the run trains;
@@ -189,7 +190,8 @@ OVERDUE_MIN_S = 120.0             # co-training: an episode is never overdue soo
 PROVISIONAL_S = 10.0              # an unmeasured worker's first rate after this much of its running time
                                   # in a phase (its status lines; env ZERO_RSP_PROVISIONAL_S)
 BATCH_MODES = ('auto', 'local', 'remote', 'all', 'none')   # selfplay_remote_batch: which consumers are batch-bound
-BATCH_DEVICES = ('cuda', 'mps')   # 'auto': inference on these batches (its rate grows with its in-flight)
+BATCH_DEVICES = ('cuda', 'mps')   # 'auto': the local driver inferring on these batches (its rate grows with its
+                                  # in-flight); a remote worker is batch-bound on any device (docs/az.md 56.1)
 
 
 def _now():
@@ -794,9 +796,12 @@ class RemotePlay:
     # ---------------------------------------------------------------- the shared queue's model
     def batch_bound(self, who, device):
         """Whether consumer `who` ('local', or 'remote': a worker) inferring on `device` is batch-bound
-        (selfplay_remote_batch; zero/workqueue.py)."""
+        (selfplay_remote_batch; zero/workqueue.py). 'auto': a remote worker always (its driver batches its own
+        games' leaves on its own machine: on the CPU too its rate grows with its in-flight until its cores are
+        full - MTG Zero's pb3, whose Mac fell from 5.9k to 1.0k leaves/s as its caps fell from ~100 to ~10 a
+        worker: docs/az.md 56.1), this machine's driver when it infers on CUDA / MPS."""
         if self.batch == 'auto':
-            return str(device) in BATCH_DEVICES
+            return who == 'remote' or str(device) in BATCH_DEVICES
         return self.batch in ('all', who)
 
     def local(self, lo, hi, device='cpu', slots=None):
@@ -1021,13 +1026,23 @@ class RemotePlay:
         self.mu.notify_all()
         return True
 
+    def _end_msg(self, it):
+        """A worker's `end` of phase `it`; with a boundary pause pending (<run>/PAUSE_NEXT, docs/az.md 56.3)
+        `"linger": false`: the worker ends its phase instead of lingering - the run pauses after this iteration, so
+        a lingering game would only be dropped (a worker of an older zero-core ignores the key and lingers)."""
+        from .runctl import pause_next_requested
+        msg = {'cmd': 'end', 'iter': it}
+        if self.linger and pause_next_requested(self.R.run):
+            msg['linger'] = False
+        return msg
+
     def _close_quota(self):
         """(mu held) The quota is met: every worker in the phase ends it now (its later games wait)."""
         q = self.q
         q['open'] = False
         for s in self._sessions():
             if s.alive() and s.phase == q['it'] and s.end_sent != q['it']:
-                s.send({'cmd': 'end', 'iter': q['it']})
+                s.send(self._end_msg(q['it']))
                 s.end_sent = q['it']
         self.mu.notify_all()
 
@@ -1120,7 +1135,7 @@ class RemotePlay:
             targets = [s for s in self._sessions() if s.alive() and s.phase == it]
             for s in targets:
                 if s.end_sent != it:
-                    s.send({'cmd': 'end', 'iter': it})
+                    s.send(self._end_msg(it))
                     s.end_sent = it
             deadline = None                        # (set once STOP is seen: then at most selfplay_remote_wait s)
             while True:
@@ -2073,7 +2088,7 @@ class Worker:
         elif cmd == 'end':
             if ph is not None:
                 if ph['it'] == msg.get('iter') and not ph['closed']:
-                    if self.linger and not self.closing:
+                    if self.linger and not self.closing and msg.get('linger', True):
                         self._close(ph)            # the phase's shards are done; play on into the next
                     else:
                         self._end_phase(ph)

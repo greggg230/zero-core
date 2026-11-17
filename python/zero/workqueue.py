@@ -37,8 +37,24 @@ iterations (the run setting `selfplay_remote_batch_inflight`, default 2):
 in-flight at `batch_inflight` horizons). `slots`: its driver's slots (`conc`), never the queue a
 co-training consumer's `hi` adds beyond them (a queued match only waits). A batch-bound consumer
 whose games outlast `batch_inflight` horizons even so falls to `lo` as any other; a consumer that is
-not batch-bound (CPU inference: its rate is its cores', whatever its in-flight) keeps the formula
-above exactly.
+not batch-bound (its rate is its cores', whatever its in-flight) keeps the formula above exactly.
+
+**Which consumers are batch-bound** (zero.remoteplay's `selfplay_remote_batch`, 'auto'): this machine's
+driver when it infers on CUDA / MPS, and **every remote worker, on any device** (docs/az.md 56.1). A
+worker's driver batches its own games' leaves, so on the CPU too its network batches - and its rate -
+grow with its in-flight until its cores are full. Treated as not batch-bound, such a worker spirals:
+`cap = inflight x rate x horizon` with a rate that falls with the cap converges only where its games
+last `inflight` horizons, and a worker whose games cannot finish that fast at any in-flight (a minimum
+game latency above one horizon: a faster desktop shortens the horizon) is driven to `lo`. MTG Zero's
+pb3: when the desktop doubled its speed, the Mac's caps fell from ~100 to ~10 a worker in ~100
+iterations, its batches with them, and its leaves/s from 5.9k to 1.0k, 7 of its 16 cores busy. The
+batch rule is the same fixed point with `batch_inflight` horizons instead of `inflight` and its slots
+as the ceiling: the cap settles where the worker's games last `batch_inflight` horizons (by Little's
+law), so the **staleness bound** holds - a worker's rows are at most about `batch_inflight` (2)
+checkpoints old, inside the farm pool's `max_stale` (1-4) - and a worker slower than that still
+falls to `lo`. A worker already core-bound (its rate flat in its in-flight) only holds `batch_inflight`
+instead of `inflight` horizons of games under it: older rows, no more throughput
+(the old 'auto' explicitly: `selfplay_remote_batch` 'local' with a CUDA / MPS driver here, 'none' with a CPU one).
 
 `Shares` is that model; `split_games` cuts a driver's sample dict into its finished games (the
 rows and the samples come out of the driver in the same order, each row counting its own
