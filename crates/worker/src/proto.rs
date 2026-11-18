@@ -224,17 +224,33 @@ fn checkpoint_iter(model: &Path, ort: &OrtCfg) -> Result<u32, String> {
 /// The job line's `providers` and `gpu` (zero-farm PROTOCOL.md 8; absent: the CPU only).
 fn job_ort(o: &Map<String, Value>, dylib: PathBuf, threads: usize) -> Result<OrtCfg, String> {
     let u = |k: &str| o.get(k).and_then(|x| x.as_u64());
+    let intra = u("infer_threads").map_or(threads, |t| t as usize);
+    let providers = crate::session::parse_providers(o.get("providers")).map_err(|e| format!("job: {e}"))?;
+    let (intra_threads, workers) = match o.get("infer_workers") {
+        Some(v) if !v.is_null() => (intra, v.as_u64().filter(|n| (1..=64).contains(n)).ok_or_else(|| format!("job: infer_workers {v}: 1 to 64"))? as usize),
+        _ => default_workers(intra, &providers),
+    };
     Ok(OrtCfg {
         dylib,
-        intra_threads: u("infer_threads").map_or(threads, |t| t as usize),
+        intra_threads,
         spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false),
-        providers: crate::session::parse_providers(o.get("providers")).map_err(|e| format!("job: {e}"))?,
+        providers,
         device: GpuDevice::from_json(o.get("gpu")).map_err(|e| format!("job: {e}"))?,
-        workers: match o.get("infer_workers") {
-            None | Some(Value::Null) => 1,
-            Some(v) => v.as_u64().filter(|n| (1..=64).contains(n)).ok_or_else(|| format!("job: infer_workers {v}: 1 to 64"))? as usize,
-        },
+        workers,
     })
+}
+
+/// A job line without `infer_workers`: (intra-op threads, evaluator threads) for its `infer_threads` T. Windows: (T, 1),
+/// as always. macOS on the CPU (docs/az.md 62.1: one ONNX Runtime session uses an M4's threads poorly, several side by
+/// side do not): T split into sessions of 3 threads, `max(1, T / 3)` of them (T 16: 5 x 3; 12: 4 x 3; under 6: 1 x T).
+pub fn default_workers(intra: usize, providers: &[ProviderKind]) -> (usize, usize) {
+    let cpu_only = providers.iter().all(|p| !p.is_gpu());
+    if cfg!(target_os = "macos") && cpu_only && intra >= 6 {
+        let w = intra / 3;
+        (intra / w, w)
+    } else {
+        (intra, 1)
+    }
 }
 
 /// The command line's `--providers a,b,...` and `--gpu <luid hex>` (default: the CPU only).
@@ -1173,6 +1189,20 @@ pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evaluator_threads_by_default_and_as_asked() {
+        // (docs/az.md 62: the job line's infer_workers, else 1 - but sessions of 3 threads on a Mac's CPU)
+        let cpu = [ProviderKind::Cpu];
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(default_workers(16, &cpu), if mac { (3, 5) } else { (16, 1) });
+        assert_eq!(default_workers(12, &cpu), if mac { (3, 4) } else { (12, 1) });
+        assert_eq!(default_workers(4, &cpu), (4, 1));
+        let o = |v: Value| job_ort(v.as_object().unwrap(), PathBuf::from("x"), 16).map(|c| (c.intra_threads, c.workers));
+        assert_eq!(o(json!({"infer_workers": 4, "infer_threads": 3})), Ok((3, 4)));
+        assert_eq!(o(json!({"infer_threads": 4})), Ok((4, 1)));
+        assert!(o(json!({"infer_workers": 0})).is_err() && o(json!({"infer_workers": 65})).is_err());
+    }
 
     #[derive(Default)]
     struct Events(Mutex<Vec<Value>>);
