@@ -147,7 +147,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A comma-separated list = several hosts, each its own workers, mirror and shards, consumers `<name>/w<k>`, metrics `selfplay.remotes` (one name: exactly as before); a name `<prefix>:<arg>` calls the package's callable remote `<prefix>:`; the run directory's `selfplay_remotes` file (one name per line) replaces the list, is re-read at every phase start (hosts join and leave a live run) and alone turns remote self-play on (section 34). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6; a list too, never the file); its own is refused |
 | `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
-| `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
+| `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
@@ -8590,3 +8590,82 @@ and the template is a current build's plus the declaration, path-free; an unknow
 refused; the eval template the same) and `test_run_setting_classes` (the package first, the table's param and pattern
 classes, unknown keys left out, GamePackage's refusals). The stub (`tests/worker_stub.py`) honours a declaration with
 `WORKER_STUB_FEATURES=setting_classes`. MTG Zero (its ENGINE.md 196): the real worker with and without declarations.
+
+## 62. The worker on macOS (Apple silicon), libm refusals off the reference platform, evaluator threads (`infer_workers`), platform alternates (no setting; zero-farm PROTOCOL rev 17; MTG Zero's macOS farm lane, 2026-11-18)
+
+**Why.** zero-farm rev 17 (its PROTOCOL section 11) lets Macs on Apple silicon take CPU work: their own agent, worker
+builds (`platform: "macos-arm64"`) and runtime packs, and a run's **CPU alternate** `{build_id, runtime, when:
+{platform}}`. The worker built on a Mac unchanged, but five things were wrong or missing there: a CPU session ran on
+CoreML, the fuzz supervisor's hang detection used wall time, the memory and module reports were empty, nothing kept a
+Mac from playing settings whose games replay differently off Windows, and the single evaluator thread made the native
+worker 3.4x slower than the Python remote self-play it is meant to replace on the same Mac.
+
+**What.**
+
+* **`zero_worker::platform`.** `PLATFORM` (`windows-x64`, `macos-arm64`; `info` says it: `"platform"`), `REFERENCE`
+  (`windows-x64`), `ORT_LIB` (`onnxruntime.dll` / `libonnxruntime.dylib` / `.so`: the name in a runtime pack, which
+  `info` and `probe-providers` report the origin of: `ort_modules`). macOS (`platform::darwin`, libSystem through
+  `extern "C"`, no new crate): `usage(pid)` - CPU seconds (`proc_pid_rusage` `RUSAGE_INFO_V4`, whose times are mach
+  absolute ticks: 125/3 ns each on Apple silicon, converted with `mach_timebase_info`), the physical footprint and its
+  peak (what the macOS agent's memory cap reads, PROTOCOL 11.5); `image_path(name)` (dyld's image list).
+* **What changed on macOS only.** The fuzz supervisor's per-seed hang limit counts the chunk process's CPU seconds (it
+  fell back to wall time, so a starved Mac would kill healthy seeds) and its memory the footprint; a chunk's CPU time
+  is the last one read when the process is reaped (macOS and Linux can't read a reaped child's; Windows reads it as
+  before). `rss_mb` / `peak_rss_mb` are the footprint and its peak (they were 0). `module_path` finds a loaded library
+  through dyld (`info --runtime-dir` proves the pack's dylib is the one loaded). **CPU sessions run on the CPU EP**:
+  `ort`'s builders set the EP selection policy MaxEfficiency, under which ONNX Runtime registers the CoreML EP for a
+  session that names no provider - it failed our graphs' empty `where` outputs ("dynamic shape ... zero elements") and
+  is not bit-safe; a `Binding::Cpu` session now asks `PreferCPU` on macOS (Windows unchanged: on the CPU pack the CPU
+  is the only device; whether MaxEfficiency hands a Windows ML pack's "cpu" session to DirectML is not checked here).
+  The worker already loaded `libonnxruntime.dylib` from a job's `runtime_dir`, and already quits a job when its stdin
+  closes (the agent is gone; checked on the Mac: `serve` exits at EOF before a job and quits a running one).
+* **libm refusals.** What the engine alone decides is identical on every platform, except where it calls the C
+  runtime's transcendental functions (`f64::exp`, `powf`, `ln`, ...), whose last bits differ between Windows' and
+  Apple's libm. A game says which settings reach them: `SearchGame::libm_replay(spec) -> Option<String>` (default None:
+  a game whose replay - its setup in `record_setup`, the game itself - would differ; what only steers the search,
+  noise, the prior's softmax, a belief's weights, plays differently but replays exactly, as a network's rounding does)
+  and `FuzzGame::libm_dependence(plan, env)` (default None: a loop whose seeds would play or check differently, so a
+  failure found there would not reproduce on the desktop). `GameEntry::libm_replay` parses a spec and asks the game. A
+  worker off the reference platform refuses them: `check-config` (self-play: `spec`; `--eval`: `eval_spec`; a `REFUSED`
+  line, exit 1), every self-play and eval job (a fatal `error` before anything runs), `fuzz-check` and every fuzz job
+  and chunk (`fuzz::plan_on`). `check-config --platform P` and `fuzz-check --platform P` judge as a worker on `P` would
+  - the desktop's own build tells which runs and campaigns a Mac may take; the JSON of `check-config` then carries
+  `platform` and `libm_refusals` (only with `--platform`, or off the reference: the reference's output is as before).
+* **Evaluator threads: `infer_workers`** (a job line tuning field, PROTOCOL 5's kind, and `selfplay --infer-workers W`;
+  1 to 64, default 1 = as before). The job's network is built `W` times (each session self-tested; only the first's
+  `selftest` event is sent) on `W` evaluator threads; batches go to them in turn, at most `max(INFLIGHT, W)` in flight
+  (`infer._drive_pipelined`'s rule for Python's `infer_workers`), their answers submitted in launch order (a later
+  batch's answer waits for its turn). Each session has the job's `infer_threads`. A checkpoint switch and a rolling
+  job's background build make `W` evaluators; a yield releases them all. Answers do not depend on `W`: the shards of a
+  6-game job (the legacy-meta3 network, groups 1, CPU pack) with 3 evaluator threads are byte-identical to 1's. Eval
+  jobs keep one thread (their networks share it). Why: on an M4 one ONNX Runtime session uses its threads poorly (the
+  graph is ~1,000 small nodes; 1 thread 1,770 rows/s, 3 threads 2,530, 6 threads 2,650, 12 threads in a job slower
+  than 4), while several sessions run side by side (below).
+* **Diagnostics** (environment, unset = nothing changes): `ZERO_ORT_CONFIG="key=value;..."` adds ONNX Runtime session
+  config entries (e.g. `mlas.disable_kleidiai=1`), `ZERO_ORT_PROFILE=<prefix>` writes ONNX Runtime's per-node profile of
+  every session, `ZERO_WORKER_CPU_CHUNK=n` overrides the CPU's 64-row pieces, `ZERO_WORKER_BATCH_HIST=1` adds
+  `batch_rows_hist` (network batches by rows, powers of two) to a self-play job's stats.
+* **The farm pool's alternates per platform** (`farm_def.run_alternates`): an alternate whose manifest names another
+  platform (`PLATFORMS`) needs a pack of the same platform and becomes a CPU alternate `{"build_id", "runtime", "when":
+  {"platform"}}` (no vendor asked for; one per platform; a GPU pack off Windows refused: rev 17's GPU alternates are
+  Windows only). Windows alternates are as before (no `platform` key: existing runs' PUT bodies unchanged). Before a
+  PUT names a platform, `farm_pool.platform_check` asks the pool's own worker (`pool_worker`, a Windows build) to
+  judge the run's settings for it (`check-config --platform`): a libm refusal, or a build too old to judge, stops the
+  pool. So a run attaches a Mac build by adding its id to `pool_alternates`, with no new setting.
+* **Tools.** `tools/worker_bench.py` runs on macOS (the load from `os.getloadavg`, `--nice`, `--runtime-dir`,
+  `--rolling`, `--native-job key=JSON` for the agent's tuning fields, `--sides`) and reports rows/h, batches (rows per
+  batch and their histogram, ms per batch) for both sides (the Python side's evaluator timed in the child: its
+  `launch` + `result`). `tools/worker_records_gate.py` loads the pack's `ORT_LIB`.
+
+**Off by default.** No run setting; Windows builds behave and answer exactly as before (the refusals apply off the
+reference platform or with `--platform`; `infer_workers` defaults to 1; the diagnostics are unset).
+
+**Tests.** `platform::darwin` (macOS: CPU seconds of a 0.5 s spin read as 0.4-0.7 s, not ticks; 64 MB in the
+footprint; libSystem's path); `test_run_alternates_of_another_platform` (the CPU alternate with a CUDA one, refusals:
+a pack of the other platform, an unknown platform, two CPU alternates); the zero_worker suite. MTG Zero (its ENGINE.md
+197): `check-config --platform` on a sealed spec and the metagame, `fuzz-check --platform` on its modes, the farm
+parity on the Mac, the Mac's records replayed on the desktop.
+
+**Measured** (the Mac: an M4 Max laptop, 12 P + 4 E cores, 64 GB, macOS 26.6, CONTENDED: the legacy-meta3-r1 run's
+three Python self-play processes at nice 5 on it throughout, ours at nice 15-20; 2026-11-18): see MTG Zero's ENGINE.md
+197 (the per-process A/B of the native worker against the Python remote worker on the run's own settings and network).
