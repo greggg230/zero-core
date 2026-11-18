@@ -127,7 +127,8 @@ def native(a, cfg, out, seed, net):
             'wall_s': round(secs, 1), 'peak_mb': st.get('peak_rss_mb'), 'infer_batches': nb,
             'batch_rows_mean': round(st['infer_rows'] / nb, 1) if nb else None, 'batch_rows_hist': st.get('batch_rows_hist'),
             'infer_ms_mean': round(st['infer_ms'] / nb, 2) if nb else None, 'infer_ms_p50': st.get('infer_ms_p50'),
-            'infer_ms_p95': st.get('infer_ms_p95'), 'infer_ms': st.get('infer_ms'),
+            'infer_ms_p95': st.get('infer_ms_p95'), 'infer_ms': st.get('infer_ms'), 'search_ms': st.get('search_ms'),
+            'wait_ms': st.get('wait_ms'),
             'job': {k: job[k] for k in ('threads', 'infer_threads', 'conc', 'groups', 'rolling', 'spinning') if k in job}}
 
 
@@ -161,6 +162,8 @@ def python_child(a):
             return (h, lb.B, time.perf_counter() - t)
 
         def result(self, h):
+            # (the main thread's time in launch + result: with infer_workers > 1 the evaluation runs on the evaluator's
+            # own threads between the two, so this is the driver's wait, not the batch's compute time)
             t = time.perf_counter()
             r = self.ev.result(h[0])
             batches.append((h[1], h[2] + time.perf_counter() - t))
