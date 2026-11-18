@@ -56,8 +56,9 @@ new alternates (or `pool_gpu_games_per_lease`) are PUT again once the next gen's
 builds) is registered (state `put_extras`: what the last self-play PUT carried of them). None (the default): no
 `alternates` key and builds [pool_build] - every PUT body and definition exactly as before.
 
-Rolling leases (zero-farm PROTOCOL rev 15, section 10; docs/az.md 54): `pool_rolling` ('' = off, the default: every
-PUT, definition and staleness judgement exactly as before) is the farm run's `selfplay.rolling` - a JSON object with
+Rolling leases (zero-farm PROTOCOL rev 15, section 10; docs/az.md 54): `pool_rolling` ('auto', the default since
+2026-11-17 - a deliberate change, docs/az.md 54.7; '' = off: every PUT, definition and staleness judgement exactly as
+before rolling leases, and what a worker build without the feature `rolling` needs) is the farm run's `selfplay.rolling` - a JSON object with
 the keys `inflight`, `gpu_inflight` (1 to 4,096 or 'auto'), `block`, `max_s`, `flush_s` (`rolling_setting`), or 'auto'
 = {"inflight": "auto", "gpu_inflight": "auto"}. Set, the first publish of a pool process checks that the worker
 build plays rolling jobs (`pool_worker`'s `info` lists the feature `rolling`; each alternate whose executable is the

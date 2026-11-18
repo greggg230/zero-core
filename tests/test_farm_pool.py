@@ -176,7 +176,8 @@ def pool(tmp_path, monkeypatch):
     monkeypatch.setattr(FP.Pool, '_define', define)
     monkeypatch.setattr(FP, 'play_settings', lambda worker, build, cfg, d, log=None: {'game': 'toy', 'spec': '', 'players': [2]})
     cfg = dict(DEFAULTS, game='toy', games=24, players=[2], spec='', shard_rows=40, shard_sparse=1, sparse=1,
-               selfplay_remote=f'pool:{FARM}', pool_build=BUILD, pool_poll_s=0.05, pool_url='http://fake')
+               selfplay_remote=f'pool:{FARM}', pool_build=BUILD, pool_poll_s=0.05, pool_url='http://fake',
+               pool_rolling='')      # classic leases (the default is 'auto' since 2026-11-17: test_default_...)
     run = tmp_path / 'run'
     os.makedirs(run / 'models')
     return fake, Run(run, cfg), published
@@ -638,6 +639,37 @@ def test_pool_rolling_checks_the_worker_and_puts_rolling(pool, monkeypatch):
     assert f"alternate {other}'s executable is not the default build's" in lines
     assert f"alternate {alt}'s executable" not in lines, "the default build's executable: covered"
     assert 'the worker build plays rolling jobs' in lines
+
+
+@pytest.mark.parametrize('setting', ['default', ''])
+def test_default_pool_rolling_is_auto(pool, monkeypatch, setting):
+    """The deliberate default of 2026-11-17 (docs/az.md 54.7): a farm pool with the default `pool_rolling` ('auto')
+    PUTs `selfplay.rolling` {"inflight": "auto", "gpu_inflight": "auto"}; pool_rolling '' PUTs no `rolling` key."""
+    from zero.run import _CORE_DEFAULTS
+    assert _CORE_DEFAULTS['pool_rolling'] == 'auto'
+    fake, R, published = pool
+    if setting == 'default':
+        del R.cfg['pool_rolling']             # (unset: the pool takes DEFAULTS', as for a run that never named it)
+    else:
+        R.cfg['pool_rolling'] = setting
+    R.cfg['pool_worker'] = STUB
+    monkeypatch.setenv('WORKER_STUB_BUILD', BUILD)
+    monkeypatch.setenv('WORKER_STUB_FEATURES', 'rolling')
+    p = FP.Pool(QuotaRP(R), f'pool:{FARM}')
+    try:
+        p.begin(1)
+        wait(lambda: 0 in fake.ckpts and p.st.get('selfplay_put'), 'gen 0 registered')
+    finally:
+        p.close()
+        p.th.join(10)
+    puts = [b for m, pth, b in fake.calls if m == 'PUT' and pth == f'/v1/admin/run/{FARM}']
+    sp = [b['selfplay'] for b in puts if b.get('selfplay')]
+    assert sp
+    if setting == 'default':
+        assert all(s['rolling'] == {'inflight': 'auto', 'gpu_inflight': 'auto'} for s in sp)
+        assert 'the worker build plays rolling jobs' in '\n'.join(R.lines)
+    else:
+        assert all('rolling' not in s for s in sp)
 
 
 class StaleRP(QuotaRP):

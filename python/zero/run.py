@@ -332,11 +332,13 @@ DEFAULTS = dict(
     # and the GPU vendor of those whose pack names none ('' = none), and the games of a GPU lease ('auto' or a
     # number; '' = the key left out: GPU leases sized as before); the farm run's rolling leases (PROTOCOL rev 15:
     # `selfplay.rolling`, a JSON object of inflight / gpu_inflight / block / max_s / flush_s, or 'auto'; staleness
-    # then judged per row; '' = off, classic leases as before; docs/az.md 54)
+    # then judged per row; 'auto' by default since 2026-11-17, a deliberate change: docs/az.md 54.7 - it matters
+    # only with a farm pool attached; '' = off, classic leases as before, and what a worker build without the
+    # feature `rolling` needs: the pool refuses such a build while this is set)
     pool_build='', pool_runtime='', pool_worker='', pool_url='', pool_max_stale=1, pool_quota=0, pool_slack=0.1,
     pool_games_per_lease='auto', pool_priority=1.0, pool_needs_ram_mb=0, pool_poll_s=10.0, pool_key='',
     pool_farm_release='', pool_expires_days=30, pool_min_agent='0.2.8', pool_alternates='', pool_alt_vendor='',
-    pool_gpu_games_per_lease='', pool_rolling='',
+    pool_gpu_games_per_lease='', pool_rolling='auto',
     # with selfplay_local 0, the pool counts as a remote taking work while a valid game arrived within this many
     # seconds (this machine then only trains; when the farm goes quiet it plays again: the run never stalls)
     pool_live_s=900.0,
