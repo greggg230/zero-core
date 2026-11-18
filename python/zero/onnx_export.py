@@ -110,6 +110,115 @@ import torch.nn.functional as F
 from .net import GridNet, Net, TokenNet, _read, aux_answer, varlen_features
 from .protocol import MAX_SEATS
 
+# ---------------------------------------------------------------- fused attention (opt-in; docs/az.md 63)
+# `attention` of `export` / ZeroOnnx2: None (the default: the graph as always - Q K^T and A V as MatMuls, an additive
+# mask, Softmax), 'mha' (ONNX Runtime's com.microsoft MultiHeadAttention, one node per block) or 'attention23' (ONNX's
+# opset-23 Attention; the whole graph at opset 23). The module computes exactly what it always did in torch (the custom
+# op's eager arithmetic is the default path's); only the exported graph differs: the exporter writes a placeholder node
+# (`FUSED_DOMAIN`.FusedAttention) that `fused_attention` rewrites into the chosen operator.
+ATTENTIONS = (None, 'mha', 'attention23')
+FUSED_DOMAIN = 'zero.onnx'
+
+
+@torch.library.custom_op('zero_onnx::fused_attention', mutates_args=())
+def _fused_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, heads: int) -> torch.Tensor:
+    """softmax(Q K^T / sqrt(hd) + bias) V per head: q, k, v [B, T, D] (D = heads x hd), bias [B, 1, 1, T] (additive: 0, a
+    gated key's log weight, -inf for padding) -> [B, T, D]; the default path's arithmetic."""
+    B, T, D = q.shape
+    hd = D // heads
+    qh, kh, vh = (x.reshape(B, T, heads, hd).transpose(1, 2) for x in (q, k, v))
+    s = torch.matmul(qh, kh.transpose(-2, -1)) * (hd ** -0.5) + bias
+    return torch.matmul(torch.softmax(s, -1), vh).transpose(1, 2).reshape(B, T, D)
+
+
+@_fused_attention.register_fake
+def _fused_attention_fake(q, k, v, bias, heads):
+    return torch.empty_like(q)
+
+
+def _fused_attention_onnx(q, k, v, bias, heads: int):
+    """The exporter's translation: the placeholder node (`fused_attention` rewrites it)."""
+    import onnxscript
+    zo = onnxscript.values.Opset(FUSED_DOMAIN, 1)
+    return zo.FusedAttention(q, k, v, bias, num_heads=heads)
+
+
+def fused_attention(model, kind):
+    """The placeholder nodes (`FUSED_DOMAIN`.FusedAttention: q, k, v [B, T, D], bias [B, 1, 1, T] -> [B, T, D]) rewritten
+    into `kind`'s operator, in place -> the nodes rewritten. 'mha': com.microsoft MultiHeadAttention (query, key, value,
+    no bias, no key_padding_mask, attention_bias = bias expanded to [B, 1, T, T]: its kernels take a bias of the query
+    length; scale 1/sqrt(hd)) - opset of the rest unchanged. 'attention23': Attention (q_num_heads = kv_num_heads = heads,
+    attn_mask = bias, broadcast) with the default domain at opset 23 (the opset-18 operators the exporter writes are the
+    same computation there: `opset_bump`)."""
+    from onnx import helper, numpy_helper
+    g = model.graph
+    out, n = [], 0
+    for node in g.node:
+        if node.domain != FUSED_DOMAIN:
+            out.append(node)
+            continue
+        if node.op_type != 'FusedAttention':
+            raise ValueError(f'{FUSED_DOMAIN}.{node.op_type}: no rewrite')
+        heads = next(a.i for a in node.attribute if a.name == 'num_heads')
+        q, k, v, bias = node.input
+        y = node.output[0]
+        t = f'fused{n}'
+        if kind == 'mha':
+            for nm, val in ((f'{t}_i0', [0]), (f'{t}_i1', [1]), (f'{t}_i2', [2]), (f'{t}_one', [1])):
+                g.initializer.append(numpy_helper.from_array(np.asarray(val, np.int64), nm))
+            out += [helper.make_node('Shape', [q], [f'{t}_shape']),
+                    helper.make_node('Gather', [f'{t}_shape', f'{t}_i0'], [f'{t}_b'], axis=0),
+                    helper.make_node('Gather', [f'{t}_shape', f'{t}_i1'], [f'{t}_t'], axis=0),
+                    helper.make_node('Concat', [f'{t}_b', f'{t}_one', f'{t}_t', f'{t}_t'], [f'{t}_s4'], axis=0),
+                    helper.make_node('Expand', [bias, f'{t}_s4'], [f'{t}_bias4']),
+                    helper.make_node('MultiHeadAttention', [q, k, v, '', '', f'{t}_bias4'], [y], domain='com.microsoft',
+                                     num_heads=heads)]
+        elif kind == 'attention23':
+            out.append(helper.make_node('Attention', [q, k, v, bias], [y], q_num_heads=heads, kv_num_heads=heads))
+        else:
+            raise ValueError(f'fused attention {kind!r}: one of {ATTENTIONS[1:]}')
+        n += 1
+    del g.node[:]
+    g.node.extend(out)
+    imp = [o for o in model.opset_import if o.domain != FUSED_DOMAIN]
+    del model.opset_import[:]
+    model.opset_import.extend(imp)
+    if kind == 'mha' and not any(o.domain == 'com.microsoft' for o in imp):
+        model.opset_import.append(helper.make_opsetid('com.microsoft', 1))
+    if kind == 'attention23':
+        opset_bump(model, 23)
+    return n
+
+
+def opset_bump(model, to):
+    """The default domain's opset raised to `to`, in place, for a graph whose operators compute the same there: every
+    node's operator must have no other version between its opset and `to` but versions that only add types (refused
+    otherwise, naming them)."""
+    from onnx import defs
+    cur = next(o.version for o in model.opset_import if o.domain in ('', 'ai.onnx'))
+    # (versions 19-23 that change only the types an operator takes - float8, int4, bfloat16, ... - or add what our
+    # graphs never set; checked against onnx.defs below: an operator not listed with a newer version is refused)
+    same = {'Cast', 'CastLike', 'Constant', 'ConstantOfShape', 'Equal', 'Flatten', 'Identity', 'If', 'Loop', 'Pad',
+            'QuantizeLinear', 'DequantizeLinear', 'Reshape', 'Scan', 'Shape', 'Size', 'Squeeze', 'Transpose', 'Unsqueeze',
+            'Where', 'Gather', 'Expand', 'Concat', 'Slice', 'ReduceMax', 'ReduceMin', 'ReduceSum', 'ReduceMean',
+            'Attention', 'MatMul', 'Add', 'Sub', 'Mul', 'Div', 'Range', 'Less', 'Greater', 'LessOrEqual', 'GreaterOrEqual',
+            'And', 'Or', 'Not', 'Neg', 'Softmax', 'Gemm', 'LayerNormalization', 'Erf', 'Sqrt', 'Pow', 'Log', 'Exp', 'Max',
+            'Min', 'Clip', 'NonZero', 'ScatterND', 'ScatterElements', 'GatherElements', 'GatherND', 'CumSum', 'Split',
+            'Tile', 'TopK', 'ArgMax', 'Abs', 'Sigmoid', 'Tanh', 'Relu', 'Floor', 'Ceil', 'Mod', 'Sign', 'IsNaN', 'IsInf'}
+    bad = set()
+    for node in model.graph.node:
+        if node.domain not in ('', 'ai.onnx'):
+            continue
+        a = defs.get_schema(node.op_type, cur, '').since_version
+        b = defs.get_schema(node.op_type, to, '').since_version
+        if a != b and node.op_type not in same:
+            bad.add(f'{node.op_type} ({a} -> {b})')
+    if bad:
+        raise ValueError(f'opset {cur} -> {to}: operators with another version there: {sorted(bad)}')
+    for o in model.opset_import:
+        if o.domain in ('', 'ai.onnx'):
+            o.version = to
+
 PROTOCOL = 'zero-onnx/1'
 OPSET = 17
 # what torch's dynamo exporter writes (`opset17` rewrites it to OPSET)
@@ -566,8 +675,11 @@ class ZeroOnnx2(ZeroOnnx):
 
     VERSION = 2
 
-    def __init__(self, net, packing='packed'):
+    def __init__(self, net, packing='packed', attention=None):
         super().__init__(net, packing)
+        if attention not in ATTENTIONS:
+            raise ValueError(f'attention {attention!r}: one of {ATTENTIONS}')
+        self.attention = attention
         if not self.tokens:
             raise TypeError(f'zero-onnx/2: a token network\'s interface (got a {type(net).__name__})')
         if not varlen_features(net):
@@ -745,9 +857,14 @@ class ZeroOnnx2(ZeroOnnx):
         for blk in net.blocks:
             qkv = blk.qkv(blk.ln1(hp))
             qkv = torch.cat([qkv, qkv.new_zeros(1, 3 * D)]).index_select(0, gidx.reshape(-1))
-            q, k, v = qkv.view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
-            s = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5) + bias
-            a = torch.matmul(torch.softmax(s, -1), v).transpose(1, 2).reshape(B * T, D)
+            if self.attention:
+                # (opt-in, docs/az.md 63: one fused node in the graph; the same arithmetic in torch)
+                q3, k3, v3 = qkv.view(B, T, 3, D).unbind(2)
+                a = torch.ops.zero_onnx.fused_attention(q3, k3, v3, bias, H).reshape(B * T, D)
+            else:
+                q, k, v = qkv.view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+                s = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5) + bias
+                a = torch.matmul(torch.softmax(s, -1), v).transpose(1, 2).reshape(B * T, D)
             hp = hp + blk.out(a.index_select(0, back))
             hp = hp + blk.ff2(F.gelu(blk.ff1(blk.ln2(hp))))
         hp = net.ln(hp)
@@ -1069,7 +1186,7 @@ def portable_file(src, dst):
     return stats
 
 
-def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=True):
+def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=True, attention=None):
     """Export `net` (a TokenNet, GridNet or Net, as loaded: `net.load` / `load_checkpoint`) to the ONNX
     file `path` (one file, no external data; written atomically) -> its metadata: zero-onnx/1, or zero-onnx/2 for
     a token network with variable-length token sets (`onnx_version`; docs/az.md 46). `packing`: a token network's
@@ -1077,15 +1194,22 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
     more metadata (the checkpoint's id and sha256: `export_checkpoint`). `make_portable`: `portable`'s
     rewrites (metadata `portable` 1), which change no answer and let the GPU providers run the graph. `opset`: 17 (the
     default: the exporter's opset-18 graph rewritten by `opset17`, docs/az.md 41.2) or 18 (as the exporter writes it).
-    Every scatter of the mask and packed graphs writes unique indices (metadata `unique_scatters` 1; docs/az.md 41.2)."""
-    mod, args, names, outs, dyn, meta_of = _export_module(net, packing)
+    Every scatter of the mask and packed graphs writes unique indices (metadata `unique_scatters` 1; docs/az.md 41.2).
+    `attention` (zero-onnx/2 only; default None: as always): 'mha' or 'attention23', a fused attention node per block
+    (`ATTENTIONS`, docs/az.md 63; metadata `attention`)."""
+    mod, args, names, outs, dyn, meta_of = _export_module(net, packing, attention)
+    table = {torch.ops.zero_onnx.fused_attention.default: _fused_attention_onnx} if attention else None
     with torch.no_grad():
         prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=EXPORTER_OPSET, input_names=names,
-                                 output_names=outs, dynamic_shapes=dyn, optimize=True, verbose=False)
-    return _save(prog.model_proto, meta_of(extra), path, opset, make_portable)
+                                 output_names=outs, dynamic_shapes=dyn, optimize=True, verbose=False,
+                                 **({'custom_translation_table': table} if table else {}))
+    meta = meta_of(extra)
+    if attention:
+        meta['attention'] = attention
+    return _save(prog.model_proto, meta, path, opset, make_portable, attention=attention)
 
 
-def _export_module(net, packing='packed'):
+def _export_module(net, packing='packed', attention=None):
     """What `export` traces for `net`: (the interface module - ZeroOnnx2 for zero-onnx/2, else ZeroOnnx - around a
     float32 CPU eval copy of `net`, the example inputs, the input names, the output names, the dynamic shapes, `extra` ->
     the graph's metadata)."""
@@ -1096,9 +1220,11 @@ def _export_module(net, packing='packed'):
         net.chunk = 1 << 30                       # (forward's chunking is never traced; set for clarity)
     if onnx_version(net) == 2:
         # (variable-length token sets: zero-onnx/2, docs/az.md 46)
-        mod = ZeroOnnx2(net, packing).eval()
+        mod = ZeroOnnx2(net, packing, attention).eval()
         return (mod, example_inputs2(net), list(INPUTS2), list(OUTPUTS2), dynamic_shapes2(),
                 lambda extra: metadata2(net, extra))
+    if attention:
+        raise ValueError(f'attention {attention!r}: a zero-onnx/2 graph\'s option (docs/az.md 63)')
     mod = ZeroOnnx(net, packing).eval()
     packing = mod.packing
     args = example_inputs(net, packing)
@@ -1414,10 +1540,14 @@ def opset17(model):
     return stats
 
 
-def _save(model, meta, path, opset, make_portable, int32=True):
+def _save(model, meta, path, opset, make_portable, int32=True, attention=None):
     """The exported model with its metadata (`portable`'s rewrites first; the exporter's annotations stripped;
     `int32_slices` then `check_int32`; `opset17` for opset 17), checked, written atomically -> the metadata."""
     import onnx
+    if attention:
+        fused_attention(model, attention)
+        if attention == 'attention23':
+            opset = 23
     meta['opset'] = str(opset)
     if make_portable:
         portable(model)
@@ -1428,8 +1558,8 @@ def _save(model, meta, path, opset, make_portable, int32=True):
         check_int32(model)
     if opset == 17:
         opset17(model)
-    elif opset != 18:
-        raise ValueError(f'zero-onnx: opset {opset} (17, the default, or 18)')
+    elif opset not in (18, 23) or (opset == 23 and attention != 'attention23'):
+        raise ValueError(f'zero-onnx: opset {opset} (17, the default, or 18; 23 with attention23)')
     _write_metadata(model, meta)
     onnx.checker.check_model(model)
     _write_model(model, path)
@@ -1467,13 +1597,13 @@ def load_checkpoint(path, game=None, allow_mismatch=False):
     return m, info
 
 
-def export_checkpoint(path, out, packing='packed', game=None, allow_mismatch=False, checkpoint_id=None):
+def export_checkpoint(path, out, packing='packed', game=None, allow_mismatch=False, checkpoint_id=None, attention=None):
     """`load_checkpoint` + `export` -> the metadata written. `checkpoint_id`: the id the run publishes
     the checkpoint under (default its file name)."""
     m, info = load_checkpoint(path, game, allow_mismatch)
     if checkpoint_id:
         info['checkpoint'] = checkpoint_id
-    return export(m, out, packing, info)
+    return export(m, out, packing, info, attention=attention)
 
 
 # ---------------------------------------------------------------- the weight-swap template (docs/az.md 53)
@@ -1941,6 +2071,8 @@ def main(argv=None):
     ap.add_argument('--reference-out', default=None, help='where (default: reference.npz next to OUT)')
     ap.add_argument('--threads', type=int, default=4, help='onnxruntime threads of the reference check')
     ap.add_argument('--no-portable', action='store_true', help="skip portable()'s rewrites (they change no answer)")
+    ap.add_argument('--attention', default=None, choices=[x for x in ATTENTIONS if x],
+                    help='zero-onnx/2: a fused attention node per block (docs/az.md 63; default: as always)')
     ap.add_argument('--rewrite', action='store_true',
                     help="CHECKPOINT is an exported .onnx: write it to OUT with portable()'s rewrites (no torch)")
     a = ap.parse_args(argv)
@@ -1952,7 +2084,7 @@ def main(argv=None):
     m, info = load_checkpoint(a.checkpoint, a.game, a.allow_mismatch)
     if a.id:
         info['checkpoint'] = a.id
-    meta = export(m, a.out, a.packing, info, make_portable=not a.no_portable)
+    meta = export(m, a.out, a.packing, info, make_portable=not a.no_portable, attention=a.attention)
     res = {'out': a.out, 'bytes': os.path.getsize(a.out), **meta}
     ok = True
     if a.reference:
