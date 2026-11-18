@@ -268,6 +268,15 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
     fn record_setup(&self) -> String {
         String::new()
     }
+    /// Why replaying a game of `spec` from its record would depend on the platform's libm, else None (the default):
+    /// the engine computes part of what a replay compares - a seat's deck in `record_setup`, the game itself - with
+    /// `f64` transcendental functions (`exp`, `powf`, `ln`, ...), whose last bits differ between C runtimes. A worker
+    /// off the reference platform (Windows x64) refuses such settings (zero-core docs/az.md 62, zero-farm PROTOCOL.md
+    /// 11.4): its records would be refused by the trainer's replay. What only steers the search (noise, the prior's
+    /// softmax, a belief's weights) plays differently there but replays exactly, as a network's rounding does.
+    fn libm_replay(_spec: &Self::Spec) -> Option<String> {
+        None
+    }
     /// **Chained episodes** (opt-in; docs/search.md 1.3, docs/az.md 42): this game's episodes are the parts of one
     /// contest (MTG Zero: the games of a best-of-three match, each its own episode). An episode ends where `to_move()`
     /// is None, and the search and the driver treat that state as any terminal: its `result()` and `margin()` are the

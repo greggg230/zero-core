@@ -219,6 +219,9 @@ pub struct Progress {
     /// The search threads' busy time (the driver's `busy_s`).
     pub search_ms: f64,
     pub batch_ms: Vec<f32>,
+    /// Network batches by rows, in powers of two (bucket k: 2^k <= rows < 2^(k+1)): `status` and `end` show them as
+    /// `batch_rows_hist` only when the environment sets ZERO_WORKER_BATCH_HIST=1 (tools/worker_bench.py).
+    pub batch_rows_log2: [u64; 24],
     pub yields: u64,
     pub yield_ms_max: f64,
     pub concurrency: usize,
@@ -235,7 +238,7 @@ impl Progress {
         let mut ms = self.batch_ms.clone();
         ms.sort_by(|a, b| a.total_cmp(b));
         let q = |p: f64| if ms.is_empty() { Value::Null } else { json!((ms[((ms.len() - 1) as f64 * p).round() as usize] as f64 * 1000.0).round() / 1000.0) };
-        json!({
+        let mut v = json!({
             "games": self.games, "decisions": self.decisions, "leaves": self.leaves, "infer_batches": self.infer_batches, "search_ms": self.search_ms.round(),
             "infer_ms_p50": q(0.5), "infer_ms_p95": q(0.95), "infer_ms": self.infer_ms.round(), "wait_ms": self.wait_ms.round(),
             "rss_mb": rss_mb(), "threads": self.threads, "concurrency": self.concurrency, "provider": self.provider,
@@ -244,7 +247,13 @@ impl Progress {
             "infer_rows": self.infer_rows, "wall_s": (self.wall_s * 10.0).round() / 10.0,
             "selftest_max_abs": self.selftest_max_abs.map(|m| if m.is_finite() { json!(m) } else { json!("inf") }),
             "leaves_per_s": if self.wall_s > 0.0 { ((self.leaves as f64 / self.wall_s) * 10.0).round() / 10.0 } else { 0.0 },
-        })
+        });
+        if batch_hist_on() {
+            let h: serde_json::Map<String, Value> =
+                self.batch_rows_log2.iter().enumerate().filter(|x| *x.1 > 0).map(|(k, n)| ((1u64 << k).to_string(), json!(n))).collect();
+            v["batch_rows_hist"] = Value::Object(h);
+        }
+        v
     }
 }
 
@@ -273,28 +282,48 @@ mod mem {
     }
 }
 
-/// The process's resident set (MB; Windows: the working set; elsewhere /proc's VmRSS), 0 if unknown.
+/// The process's resident set (MB; Windows: the working set; macOS: the physical footprint, what the agent's memory
+/// cap reads; elsewhere /proc's VmRSS), 0 if unknown.
 pub fn rss_mb() -> u64 {
     #[cfg(windows)]
     {
         mem::now().map_or(0, |m| (m.0 >> 20) as u64)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::darwin::usage(std::process::id()).map_or(0, |u| u.footprint >> 20)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).map_or(0, |kb| kb / 1024)
     }
 }
 
-/// The peak working set (MB; Windows only, else 0).
+/// The peak working set (MB; Windows: the peak working set; macOS: the largest physical footprint; else 0).
 pub fn peak_rss_mb() -> u64 {
     #[cfg(windows)]
     {
         mem::now().map_or(0, |m| (m.1 >> 20) as u64)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::darwin::usage(std::process::id()).map_or(0, |u| u.max_footprint >> 20)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         0
     }
+}
+
+/// ZERO_WORKER_BATCH_HIST=1: the stats show the batches' rows (`Progress::batch_rows_log2`).
+fn batch_hist_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZERO_WORKER_BATCH_HIST").as_deref() == Ok("1"))
+}
+
+/// The power-of-two bucket of a batch of `rows` rows (`Progress::batch_rows_log2`).
+pub fn rows_bucket(rows: usize) -> usize {
+    (usize::BITS - 1 - rows.max(1).leading_zeros()).min(23) as usize
 }
 
 /// Events out (`aw/1` lines).
@@ -883,7 +912,11 @@ impl Run<'_> {
                     if b.external {
                         return Err("an external batch: the native worker has no external players".into());
                     }
-                    self.progress.lock().unwrap().infer_rows += b.b as u64;
+                    {
+                        let mut p = self.progress.lock().unwrap();
+                        p.infer_rows += b.b as u64;
+                        p.batch_rows_log2[rows_bucket(b.b)] += 1;
+                    }
                     self.send(b)?;
                     if self.pending.len() >= INFLIGHT {
                         self.finish_oldest()?;

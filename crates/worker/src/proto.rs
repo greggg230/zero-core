@@ -13,9 +13,11 @@
 //!          [--reference GEN=R ...] [--sha256 GEN=H ...] [--ort-dll PATH] [--spinning 0|1] [--flush-games N]
 //!          [--record-batches N --record-file F] [--status-s X] [--stdin-control]
 //!                                                  one eval job from flags (events on stdout)
-//! <worker> check-config <config.json> [--json] [--eval [--seats JSON]]
+//! <worker> check-config <config.json> [--json] [--eval [--seats JSON]] [--platform P]
 //!                                                  classify every setting (for self-play, or for an eval
-//!                                                  job); exit 1 on unknown / unsupported
+//!                                                  job); exit 1 on unknown / unsupported, or (a worker on P,
+//!                                                  default this build's platform) settings whose replay
+//!                                                  depends on the platform's libm (docs/az.md 62)
 //! <worker> driver-cfg <config.json> --seed S --net N   the Python remote worker's DriverCfg (Debug text)
 //! <worker> driver-cfg <config.json> --eval --seats JSON --games N --seed S [--paired] [--lease]
 //!                                                  Run.play_match's DriverCfg (--lease: the eval job's)
@@ -35,8 +37,9 @@
 //! <worker> fuzz --mode M [--env K=V ...] --first F --count N [--threads T] [--chunk C]
 //!          [--seed-timeout S] [--out DIR] [--work DIR] [--keep-chunks] [--stdin-control]
 //!                                                  a fuzz job from flags (events on stdout)
-//! <worker> fuzz-check --mode M [--env K=V ...] [--seed S] [--commit C]
-//!                                                  what a campaign's mode and env mean, and a repro
+//! <worker> fuzz-check --mode M [--env K=V ...] [--seed S] [--commit C] [--platform P]
+//!                                                  what a campaign's mode and env mean, and a repro (an
+//!                                                  error for a loop that would play differently on P)
 //! <worker> fuzz-chunk <spec.json>                  one chunk of a fuzz job (the supervisor's child)
 //! ```
 //!
@@ -413,7 +416,30 @@ fn eval_settings_failures(w: &Worker, game: &GameEntry, s: &Settings, seats: &[c
     if let Err(e) = crate::settings::eval_driver_cfg(s, &info, seats, 2, 0, true, None, None, None) {
         bad.push(format!("the evaluation match: {e}"));
     }
+    bad.extend(libm_refusals(game, s, true, crate::platform::PLATFORM));
     Ok(bad)
+}
+
+/// What a worker on `platform` refuses of the settings because a replay of their games would depend on the
+/// platform's libm (`crate::platform` docs, docs/az.md 62): nothing on the reference platform; elsewhere the spec the
+/// job plays (self-play: `spec`; an eval job: `eval_spec`) when the game says so (`GameEntry::libm_replay`).
+pub fn libm_refusals(game: &GameEntry, s: &Settings, eval: bool, platform: &str) -> Vec<String> {
+    if !crate::platform::off_reference(platform) {
+        return Vec::new();
+    }
+    let (key, spec) = if eval { ("eval_spec", crate::settings::eval_spec_of(s)) } else { ("spec", crate::settings::spec_of(s)) };
+    let Ok(spec) = spec else {
+        return Vec::new(); // (an unreadable spec is the driver's error)
+    };
+    match (game.libm_replay)(&spec) {
+        Ok(None) => Vec::new(),
+        Ok(Some(why)) => vec![format!(
+            "{key}: refused on {platform}: {why} - a game's replay on {} (the trainer's) would differ in the platform's libm and refuse its \
+             records (docs/az.md 62)",
+            crate::platform::REFERENCE
+        )],
+        Err(e) => vec![format!("{key}: {e}")],
+    }
 }
 
 fn end_event(o: &Outcome) -> Value {
@@ -592,6 +618,11 @@ fn serve(w: &'static Worker) -> i32 {
                     }
                 };
                 let (game, job) = job;
+                let refused = libm_refusals(game, &job.settings, false, crate::platform::PLATFORM);
+                if !refused.is_empty() {
+                    sink.event(json!({"ev": "error", "message": format!("the job's settings are refused: {}", refused.join("; ")), "fatal": true}));
+                    return 1;
+                }
                 return match run_with_control(game, job, sink.clone(), Some(rx), base) {
                     Ok(o) => {
                         sink.event(end_event(&o));
@@ -709,7 +740,7 @@ fn run_fuzz_with_control(fg: &'static dyn crate::fuzz::FuzzGame, job: crate::fuz
 }
 
 fn serve_fuzz(fg: &'static dyn crate::fuzz::FuzzGame, line: &Value, sink: Arc<Stdout>, rx: std::sync::mpsc::Receiver<Option<Value>>, base: PathBuf) -> i32 {
-    let job = match crate::fuzz::job_from_value(line, &base).and_then(|j| fg.plan(&j.mode, &j.env).map(|_| j)) {
+    let job = match crate::fuzz::job_from_value(line, &base).and_then(|j| crate::fuzz::plan_on(fg, &j.mode, &j.env, crate::platform::PLATFORM).map(|_| j)) {
         Ok(j) => j,
         Err(e) => {
             sink.event(json!({"ev": "error", "message": e, "fatal": true}));
@@ -751,7 +782,7 @@ fn fuzz_cli(fg: &'static dyn crate::fuzz::FuzzGame, a: &Args) -> Result<i32, Str
         keep_chunks: a.has("--keep-chunks"),
         fault,
     };
-    fg.plan(&job.mode, &job.env)?;
+    crate::fuzz::plan_on(fg, &job.mode, &job.env, crate::platform::PLATFORM)?;
     let sink = Arc::new(Stdout { mu: Mutex::new(()) });
     let lines = a.has("--stdin-control").then(|| stdin_lines(sink.clone()));
     let o = run_fuzz_with_control(fg, job, sink.clone(), lines)?;
@@ -762,7 +793,11 @@ fn fuzz_cli(fg: &'static dyn crate::fuzz::FuzzGame, a: &Args) -> Result<i32, Str
 fn fuzz_check(fg: &'static dyn crate::fuzz::FuzzGame, a: &Args) -> Result<i32, String> {
     let (env, fault) = crate::fuzz::split_env(env_args(a)?)?;
     let mode = a.get("--mode").ok_or("--mode M")?;
-    let plan = fg.plan(mode, &env)?;
+    let platform = match a.get("--platform") {
+        Some(p) => crate::platform::check_name(p)?,
+        None => crate::platform::PLATFORM,
+    };
+    let plan = crate::fuzz::plan_on(fg, mode, &env, platform)?;
     let (commit, profile) = match a.get("--commit") {
         Some(c) => (c.to_string(), a.get("--profile").unwrap_or(fg.profile()).to_string()),
         None => crate::fuzz::build_identity(fg)?,
@@ -781,6 +816,10 @@ fn fuzz_check(fg: &'static dyn crate::fuzz::FuzzGame, a: &Args) -> Result<i32, S
 fn selfplay_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     let settings = read_settings(a.get("--settings").ok_or("--settings <config.json>")?)?;
     let game = game_of(games, &settings)?;
+    let refused = libm_refusals(game, &settings, false, crate::platform::PLATFORM);
+    if !refused.is_empty() {
+        return Err(format!("the settings are refused: {}", refused.join("; ")));
+    }
     let threads: usize = a.num("--threads")?.unwrap_or(1);
     let ort = cli_ort(a, ort_dylib(a.get("--ort-dll")), a.num("--infer-threads")?.unwrap_or(threads), a.get("--spinning") == Some("1"))?;
     let eval = if a.has("--uniform") {
@@ -892,6 +931,21 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
     let game = game_of(games, &s)?;
     let info = (game.info)();
     let others: Vec<_> = games.iter().filter(|g| g.name != game.name).map(|g| (g.info)()).collect();
+    // (a worker on another platform: its libm refusals, docs/az.md 62; the JSON says the platform and them only when
+    // asked for one or off the reference platform - the reference's output is as before)
+    let platform = match a.get("--platform") {
+        Some(p) => crate::platform::check_name(p)?,
+        None => crate::platform::PLATFORM,
+    };
+    let show_platform = a.has("--platform") || crate::platform::off_reference(crate::platform::PLATFORM);
+    let libm = libm_refusals(game, &s, a.has("--eval"), platform);
+    let add_platform = |mut v: Value| {
+        if show_platform {
+            v["platform"] = json!(platform);
+            v["libm_refusals"] = json!(libm);
+        }
+        v
+    };
     if a.has("--eval") {
         let seats = match a.get("--seats") {
             Some(t) => seats_of_value(&serde_json::from_str::<Value>(t).map_err(|e| format!("--seats: {e}"))?)?,
@@ -902,7 +956,7 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
         let built = crate::settings::eval_driver_cfg(&s, &info, &seats, 2, 0, true, None, None, None).err();
         if a.has("--json") {
             let rows: Vec<Value> = v.iter().map(|x| json!({"key": x.key, "value": x.value, "status": x.status, "why": x.why})).collect();
-            println!("{}", json!({"game": info.name, "job": "eval", "settings": rows, "failures": bad.iter().map(|x| &x.key).collect::<Vec<_>>(), "driver_error": built, "eval_reads": crate::settings::EVAL_READS}));
+            println!("{}", add_platform(json!({"game": info.name, "job": "eval", "settings": rows, "failures": bad.iter().map(|x| &x.key).collect::<Vec<_>>(), "driver_error": built, "eval_reads": crate::settings::EVAL_READS})));
         } else {
             for st in ["play", "trainer", "unknown", "unsupported"] {
                 let ks: Vec<&str> = v.iter().filter(|x| x.status == st).map(|x| x.key.as_str()).collect();
@@ -914,8 +968,11 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
             if let Some(e) = &built {
                 println!("REFUSED: the evaluation match: {e}");
             }
+            for r in &libm {
+                println!("REFUSED {r}");
+            }
         }
-        return Ok(if bad.is_empty() && built.is_none() { 0 } else { 1 });
+        return Ok(if bad.is_empty() && built.is_none() && libm.is_empty() { 0 } else { 1 });
     }
     let v = classify::classify_with(&s, &info, &others, w.package_settings)?;
     let bad = classify::failures(&v);
@@ -923,7 +980,7 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
     let built = crate::settings::selfplay_driver_cfg(&s, &info, 0, 0).err();
     if a.has("--json") {
         let rows: Vec<Value> = v.iter().map(|x| json!({"key": x.key, "value": x.value, "status": x.status, "why": x.why})).collect();
-        println!("{}", json!({"game": info.name, "settings": rows, "failures": bad.iter().map(|x| &x.key).collect::<Vec<_>>(), "driver_error": built}));
+        println!("{}", add_platform(json!({"game": info.name, "settings": rows, "failures": bad.iter().map(|x| &x.key).collect::<Vec<_>>(), "driver_error": built})));
     } else {
         for st in ["play", "trainer", "off", "unsupported", "unknown"] {
             let ks: Vec<&str> = v.iter().filter(|x| x.status == st).map(|x| x.key.as_str()).collect();
@@ -935,8 +992,11 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
         if let Some(e) = &built {
             println!("REFUSED: the self-play driver: {e}");
         }
+        for r in &libm {
+            println!("REFUSED {r}");
+        }
     }
-    Ok(if bad.is_empty() && built.is_none() { 0 } else { 1 })
+    Ok(if bad.is_empty() && built.is_none() && libm.is_empty() { 0 } else { 1 })
 }
 
 fn driver_cfg_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
@@ -1039,7 +1099,7 @@ fn info_cli(games: &'static [GameEntry], repo: &str, kinds: Vec<&'static str>, f
     let ort = match crate::session::runtime(&dylib) {
         Ok(rt) => {
             // where each library came from (the runtime pack's check on a clean PC)
-            let mods: Map<String, Value> = ["onnxruntime.dll"].iter().chain(crate::session::PRELOAD).map(|n| (n.to_string(), json!(crate::eval::module_path(n)))).collect();
+            let mods: Map<String, Value> = crate::platform::ort_modules().into_iter().map(|n| (n.to_string(), json!(crate::eval::module_path(n)))).collect();
             json!({"dylib": dylib.display().to_string(), "version": ort_version(), "modules": mods, "available": rt.available})
         }
         Err(e) => json!({"dylib": dylib.display().to_string(), "error": e}),
@@ -1048,7 +1108,7 @@ fn info_cli(games: &'static [GameEntry], repo: &str, kinds: Vec<&'static str>, f
         let i = (g.info)();
         json!({"name": i.name, "features": i.num_features, "actions": i.num_actions, "aux": i.aux.iter().map(|x| json!([x.0, x.1])).collect::<Vec<_>>()})
     }).collect();
-    println!("{}", json!({"repo": repo, "aw": AW, "zero_onnx": ZERO_ONNX, "build_id": build_id(), "games": gs, "onnxruntime": ort, "kinds": kinds, "features": features}));
+    println!("{}", json!({"repo": repo, "aw": AW, "zero_onnx": ZERO_ONNX, "build_id": build_id(), "games": gs, "onnxruntime": ort, "kinds": kinds, "features": features, "platform": crate::platform::PLATFORM}));
     Ok(0)
 }
 

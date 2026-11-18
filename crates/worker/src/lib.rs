@@ -32,6 +32,7 @@ pub mod fuzz;
 pub mod gpu;
 pub mod job;
 pub mod npz;
+pub mod platform;
 pub mod probe;
 pub mod probe_variants;
 pub mod proto;
@@ -52,12 +53,19 @@ pub struct GameEntry {
     pub name: &'static str,
     pub new_driver: fn(DriverCfg) -> Result<Box<dyn DynDriver>, String>,
     pub info: fn() -> GameInfo,
+    /// Why a game of this spec (JSON) would replay differently off the reference platform (`SearchGame::libm_replay`,
+    /// `platform` module docs), else None; an error for a spec the game refuses.
+    pub libm_replay: fn(&str) -> Result<Option<String>, String>,
 }
 
 impl GameEntry {
     pub const fn of<G: SearchGame>(name: &'static str) -> GameEntry {
-        GameEntry { name, new_driver: boxed_driver::<G>, info: game_info::<G> }
+        GameEntry { name, new_driver: boxed_driver::<G>, info: game_info::<G>, libm_replay: libm_replay_of::<G> }
     }
+}
+
+fn libm_replay_of<G: SearchGame>(spec: &str) -> Result<Option<String>, String> {
+    Ok(G::libm_replay(&G::parse_spec(spec)?))
 }
 
 /// The protocol version this crate speaks (zero-farm PROTOCOL.md 5) and the network files it reads.

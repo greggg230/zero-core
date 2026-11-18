@@ -234,10 +234,9 @@ pub fn run(o: &Opts) -> Result<Value, String> {
     // the passed providers in preference order, the CPU last
     let providers: Vec<&str> = ProviderKind::ALL.iter().filter(|p| passed.contains(p)).map(|p| p.wire()).collect();
     // where each library was loaded from: the runtime pack, or elsewhere (System32's DirectML, a CUDA install)
-    let mods: Map<String, Value> = ["onnxruntime.dll"]
-        .iter()
-        .chain(crate::session::PRELOAD)
-        .chain([crate::winml::DLL].iter())
+    let mods: Map<String, Value> = crate::platform::ort_modules()
+        .into_iter()
+        .chain(cfg!(windows).then_some(crate::winml::DLL))
         .map(|n| (n.to_string(), json!(crate::eval::module_path(n).map(|p| if Path::new(&p).parent() == Some(rt.dir.as_path()) { "pack" } else { "elsewhere" }))))
         .collect();
     let mut v = json!({

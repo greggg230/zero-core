@@ -121,7 +121,8 @@ impl OrtCfg {
     }
 }
 
-/// The full path of a loaded module, by its file name (Windows; else None).
+/// The full path of a loaded module, by its file name (Windows: the loader's module; macOS: dyld's image list;
+/// else None).
 pub fn module_path(name: &str) -> Option<String> {
     #[cfg(windows)]
     {
@@ -138,7 +139,11 @@ pub fn module_path(name: &str) -> Option<String> {
         let n = unsafe { GetModuleFileNameW(h, buf.as_mut_ptr(), buf.len() as u32) } as usize;
         (n > 0).then(|| String::from_utf16_lossy(&buf[..n]))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::darwin::image_path(name)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = name;
         None

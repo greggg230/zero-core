@@ -50,6 +50,27 @@ pub trait FuzzGame: Sync {
     fn repro(&self, plan: &FuzzPlan, env: &[(String, String)], seed: u64, commit: &str, profile: &str) -> String;
     /// The cargo profile this binary was built with ('release', 'fuzz' or 'dev').
     fn profile(&self) -> &'static str;
+    /// Why `plan`'s loop with the settings `env` would play differently off the reference platform, else None (the
+    /// default): it computes part of a seed's game or checks with the platform's libm (`crate::platform` docs), so a
+    /// failure found on another platform would not reproduce on the desktop. [`plan_on`] refuses it there.
+    fn libm_dependence(&self, _plan: &FuzzPlan, _env: &[(String, String)]) -> Option<String> {
+        None
+    }
+}
+
+/// `game.plan(mode, env)` for a worker on `platform`: off the reference platform a loop the game says depends on the
+/// platform's libm is refused (`FuzzGame::libm_dependence`, zero-core docs/az.md 62).
+pub fn plan_on(game: &dyn FuzzGame, mode: &str, env: &[(String, String)], platform: &str) -> Result<FuzzPlan, String> {
+    let plan = game.plan(mode, env)?;
+    if crate::platform::off_reference(platform) {
+        if let Some(why) = game.libm_dependence(&plan, env) {
+            return Err(format!(
+                "mode {mode:?}: refused on {platform}: {why} - its seeds would play differently than on {} (the platform's libm), so a failure                  found here would not reproduce there (zero-core docs/az.md 62)",
+                crate::platform::REFERENCE
+            ));
+        }
+    }
+    Ok(plan)
 }
 
 /// A fuzz job's loop, as the game decided it.
@@ -377,7 +398,7 @@ pub fn chunk_main(game: &dyn FuzzGame, spec_path: &str) -> i32 {
         std::process::exit(2)
     }).unwrap_or_default();
     let (first, count) = (spec["first"].as_u64().unwrap_or(0), spec["count"].as_u64().unwrap_or(0));
-    let plan = match game.plan(spec["mode"].as_str().unwrap_or(""), &env) {
+    let plan = match plan_on(game, spec["mode"].as_str().unwrap_or(""), &env, crate::platform::PLATFORM) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("fuzz-chunk: {e}");
@@ -573,6 +594,12 @@ mod os {
     #[cfg(not(target_os = "linux"))]
     const STOP_CONT: (i32, i32) = (17, 19);
 
+    /// CPU seconds (user + system) the process has used: macOS `proc_pid_rusage` (a live or unreaped process).
+    #[cfg(target_os = "macos")]
+    pub fn cpu_s(c: &Child) -> Option<f64> {
+        crate::platform::darwin::usage(c.id()).map(|u| u.cpu_s)
+    }
+    #[cfg(not(target_os = "macos"))]
     pub fn cpu_s(c: &Child) -> Option<f64> {
         // Linux: /proc/<pid>/stat utime + stime (clock ticks); elsewhere unknown (wall time is used)
         let s = std::fs::read_to_string(format!("/proc/{}/stat", c.id())).ok()?;
@@ -588,6 +615,12 @@ mod os {
     pub fn resume(c: &Child) -> bool {
         unsafe { kill(c.id() as i32, STOP_CONT.1) == 0 }
     }
+    /// macOS: the physical footprint (what the agent's memory cap reads, zero-farm PROTOCOL.md 11.5).
+    #[cfg(target_os = "macos")]
+    pub fn working_set_mb(c: &Child) -> u64 {
+        crate::platform::darwin::usage(c.id()).map_or(0, |u| u.footprint >> 20)
+    }
+    #[cfg(not(target_os = "macos"))]
     pub fn working_set_mb(c: &Child) -> u64 {
         std::fs::read_to_string(format!("/proc/{}/status", c.id())).ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())).map_or(0, |kb| kb / 1024)
     }
@@ -697,6 +730,8 @@ struct Running {
     files: Vec<PathBuf>,
     /// The seed being played, the child's CPU seconds and the active wall time when it started.
     cur: Option<(u64, f64, f64)>,
+    /// The child's CPU seconds when last read (macOS and Linux can't read them once `try_wait` reaped it).
+    cpu_seen: f64,
     passed: u64,
     /// Seen in its progress: end (done | stopped at), a failing seed, a chunk failure.
     ended: Option<Value>,
@@ -858,7 +893,7 @@ impl Sup<'_> {
         let stdin = child.stdin.take();
         let pf = std::fs::File::open(&progress).map_err(|e| format!("{}: {e}", progress.display()))?;
         self.shared.progress.lock().unwrap().chunks += 1;
-        Ok(Running { chunk, id, child, stdin, progress: pf, buf: Vec::new(), log: log.clone(), files: vec![spec, progress, log], cur: None, passed: 0, ended: None, failed_seed: None, killed_hang: None, stop_sent: false })
+        Ok(Running { chunk, id, child, stdin, progress: pf, buf: Vec::new(), log: log.clone(), files: vec![spec, progress, log], cur: None, cpu_seen: 0.0, passed: 0, ended: None, failed_seed: None, killed_hang: None, stop_sent: false })
     }
 
     /// New progress lines of `r`.
@@ -918,7 +953,7 @@ impl Sup<'_> {
     /// `r` exited: what its chunk leaves to do.
     fn on_exit(&mut self, mut r: Running, st: std::process::ExitStatus, finishing: bool) -> Result<(), String> {
         self.read_progress(&mut r);
-        self.shared.progress.lock().unwrap().cpu_s += os::cpu_s(&r.child).unwrap_or(0.0);
+        self.shared.progress.lock().unwrap().cpu_s += os::cpu_s(&r.child).unwrap_or(r.cpu_seen);
         let end = r.chunk.first + r.chunk.count;
         let mut keep_files = false;
         let rest_from = |s: u64| Chunk { first: s, count: end - s, confirm: None };
@@ -1023,7 +1058,7 @@ impl FuzzJob {
 
 /// Run a fuzz job to its end (or `quit`).
 pub fn run_fuzz(game: &dyn FuzzGame, job: &FuzzJob, ctl: &FuzzControl, sink: &dyn Sink, shared: &FuzzShared) -> Result<FuzzOutcome, String> {
-    let plan = game.plan(&job.mode, &job.env)?;
+    let plan = plan_on(game, &job.mode, &job.env, crate::platform::PLATFORM)?;
     let (commit, profile) = build_identity(game)?;
     let threads = job.threads.max(1);
     let end = job.first.checked_add(job.count).ok_or("first + count overflows")?;
@@ -1075,8 +1110,12 @@ pub fn run_fuzz(game: &dyn FuzzGame, job: &FuzzJob, ctl: &FuzzControl, sink: &dy
                     c.stop_sent = true;
                 }
                 // a seed past its CPU limit is a hang (CPU time: a starved PC is not hanging)
+                let cpu = os::cpu_s(&c.child);
+                if let Some(x) = cpu {
+                    c.cpu_seen = x;
+                }
                 if let (Some((seed, cpu0, wall0)), None) = (c.cur, c.killed_hang) {
-                    let used = os::cpu_s(&c.child).map(|x| x - cpu0).unwrap_or_else(|| s.active_s() - wall0);
+                    let used = cpu.map(|x| x - cpu0).unwrap_or_else(|| s.active_s() - wall0);
                     if used > job.seed_timeout_s {
                         sink.log(&format!("chunk {}: seed {seed} ran {used:.0} s (limit {:.0} s): killing it (a hang)", c.id, job.seed_timeout_s));
                         let _ = c.child.kill();

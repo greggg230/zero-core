@@ -608,6 +608,12 @@ fn builder(rt: &Runtime, b: &Binding, threads: usize, spinning: bool, log_id: Op
         sb = sb.with_log_level(LogLevel::Verbose).map_err(oerr)?;
     }
     match b {
+        // macOS: ort's builders default to the execution-provider selection policy MaxEfficiency, under which ONNX
+        // Runtime registers the CoreML EP for a session that names no provider (it fails our graphs' empty `where`
+        // outputs and is not bit-safe): a CPU binding takes the CPU, as on Windows (docs/az.md 62)
+        Binding::Cpu if cfg!(target_os = "macos") => {
+            sb = sb.with_auto_device(ort::session::builder::AutoDevicePolicy::PreferCPU).map_err(oerr)?;
+        }
         Binding::Cpu => {}
         Binding::Dml(idx) => {
             sb = sb.with_memory_pattern(false).map_err(oerr)?;
