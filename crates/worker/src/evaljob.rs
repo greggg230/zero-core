@@ -42,7 +42,7 @@ use zero_search::dynapi::DynDriver;
 use zero_search::record::game_json;
 
 use crate::eval::{Answer, Evaluator, Expect, OrtCfg, Uniform};
-use crate::job::{build_eval, missing_ranges, peak_rss_mb, ranges, spawn_eval, Control, EvalKind, EvalLink, Outcome, Progress, Recorder, Req, Sink, BIG, INFLIGHT};
+use crate::job::{build_eval, missing_ranges, peak_rss_mb, ranges, spawn_eval, Control, EvalKind, EvalLink, Outcome, Progress, Recorder, Sink, BIG, INFLIGHT};
 use crate::pyjson::PyJson;
 use crate::settings::{eval_driver_cfg, eval_lease_cfg, eval_spec_of, eval_trace_of, EvalSeat, Settings};
 use crate::shard::Written;
@@ -339,7 +339,7 @@ impl EvalRun<'_> {
             s = self.ctl.cv.wait(s).unwrap();
         }
         self.pending.push_back(b.id);
-        self.link.tx.send(Req::Eval(b)).map_err(|_| "the evaluator thread is gone".to_string())
+        self.link.eval(b)
     }
 
     fn finish_oldest(&mut self) -> Result<(), String> {
@@ -466,7 +466,8 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
         drv.enqueue(&format!("{}:{}", job.lease_id, job.gid_base as u64 + k), &spec)?;
     }
     drv.resume(BIG, 0)?;
-    let (link, answers, eval_thread) = spawn_eval(Box::new(ev));
+    // (one evaluator thread: an eval job's networks share it)
+    let (link, answers, eval_threads) = spawn_eval(vec![Box::new(ev)]);
     link_out(link.clone());
     let mut r = EvalRun {
         job,
@@ -505,9 +506,11 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
     };
     r.snapshot();
     let EvalRun { link, written, .. } = r;
-    let _ = link.tx.send(Req::Stop);
+    link.stop();
     drop(link);
-    let _ = eval_thread.join();
+    for h in eval_threads {
+        let _ = h.join();
+    }
     res?;
     rec_res?;
     let p = progress.lock().unwrap();

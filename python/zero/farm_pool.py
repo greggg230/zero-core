@@ -272,6 +272,31 @@ def play_settings(worker, build_id, cfg, d, log=None):
     return play
 
 
+def platform_check(worker, cfg, d, platform, log=None):
+    """A worker of another platform may take the run's leases only if the run's settings replay exactly there (docs/az.md
+    62, zero-farm PROTOCOL 11.4): the pool's own worker build (pool_worker, the default platform's) judges them as a
+    `platform` worker would (`check-config --platform`, the game's libm rule) - a refusal, or a build too old to judge
+    (its answer names no platform), stops the pool before any PUT names that platform's alternate."""
+    from .farm_h2h import _stderr_log, with_classes, worker_json
+    log = log or _stderr_log
+    if not worker:
+        raise SystemExit(f'a {platform} alternate needs pool_worker (the build\'s executable here) to check the run\'s '
+                         f'settings for {platform}')
+    rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f'settings-{platform}.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(with_classes(info if isinstance(info, dict) else {}, cfg), f)
+    rc, out, text = worker_json(worker, 'check-config', path, '--json', '--platform', platform)
+    if not isinstance(out, dict) or out.get('platform') != platform:
+        raise SystemExit(f'pool_worker {worker} cannot judge the run\'s settings for {platform} (a build before zero-core '
+                         f'docs/az.md 62): no {platform} alternate without that check')
+    if out.get('libm_refusals'):
+        raise SystemExit(f'the run\'s settings would replay differently on {platform} (the platform\'s libm, docs/az.md '
+                         f'62): {"; ".join(out["libm_refusals"])} - leave its {platform} alternate out')
+    log(f'{platform}: the run\'s settings replay exactly there (check-config --platform {platform})')
+
+
 def export_breakdown(ex):
     """The "gen N exported" line's per-step timing (docs/az.md 53): ': load 0.1 s, swap 0.4 s, reference 0.5 s, check
     1.2 s (graph by weight swap; reference positions of gen 12)' from an exporter's `steps`, `graph` and `positions`;
@@ -587,8 +612,10 @@ class Pool:
             self._save()
         if self.alternates is None:
             # (none: [], [pool_build] without a call)
-            self.alternates, self.builds = FD.run_alternates(self.client, self.build, self.runtime, self.alt_builds,
-                                                             self.alt_vendor)
+            alternates, builds = FD.run_alternates(self.client, self.build, self.runtime, self.alt_builds, self.alt_vendor)
+            for p in sorted({x['when'].get('platform') for x in alternates} - {None}):
+                platform_check(self.worker, self.R.cfg, os.path.join(self.dir, 'template'), p, self.log)
+            self.alternates, self.builds = alternates, builds
         if self.rolling is not None and not self.rolling_checked:
             self._check_rolling()
             self.rolling_checked = True
@@ -598,8 +625,8 @@ class Pool:
             self.client.call('PUT', f'/v1/admin/run/{self.farm}', body=body)
             st['run_put'] = True
             self._save()
-            alts = ''.join(f', alternate {x["build_id"]} (runtime {x["runtime"]}, {x["when"]["vendor"]})'
-                           for x in self.alternates)
+            alts = ''.join(f', alternate {x["build_id"]} (runtime {x["runtime"]}, '
+                           f'{" ".join(str(v) for v in x["when"].values())})' for x in self.alternates)
             self.log(f'farm run {self.farm} created (worker build {self.build}, runtime {self.runtime}{alts}, '
                      f'min_agent {self.min_agent or "none"})')
         g = st['gens'].setdefault(str(gen), {})

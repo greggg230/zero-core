@@ -120,9 +120,9 @@ pub(crate) struct CtlState {
     pub(crate) extend: Option<u64>,
 }
 
-/// An evaluator a rolling job's checkpoint built that the job has not swapped in yet: a `yield` releases it too
-/// (no GPU memory held while yielded; it is rebuilt on its first batch).
-type Staged = Arc<Mutex<Option<Box<dyn Evaluator>>>>;
+/// The evaluators (one per evaluator thread) a rolling job's checkpoint built that the job has not swapped in yet: a
+/// `yield` releases them too (no GPU memory held while yielded; each is rebuilt on its first batch).
+type Staged = Arc<Mutex<Option<Vec<Box<dyn Evaluator>>>>>;
 
 /// The job's control state, shared by the agent's line reader and the job.
 #[derive(Default)]
@@ -181,25 +181,81 @@ pub(crate) enum Req {
     Stop,
 }
 
-/// The evaluator thread's handle (the agent's yield / resume reach it too).
+/// The evaluator threads' handle (the agent's yield / resume reach them too): one thread per session (`OrtCfg::workers`,
+/// one unless the job asks for more), batches sent to them in turn.
 #[derive(Clone)]
 pub struct EvalLink {
-    pub(crate) tx: Sender<Req>,
+    txs: Vec<Sender<Req>>,
+    next: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+const GONE: &str = "the evaluator thread is gone";
+
 impl EvalLink {
-    /// After the batches sent so far: drop the session.
+    /// The evaluator threads.
+    pub fn workers(&self) -> usize {
+        self.txs.len()
+    }
+    /// A batch to the next evaluator thread (in turn).
+    pub(crate) fn eval(&self, b: Batch) -> Result<(), String> {
+        let i = self.next.fetch_add(1, Ordering::SeqCst) % self.txs.len();
+        self.txs[i].send(Req::Eval(b)).map_err(|_| GONE.to_string())
+    }
+    /// After the batches sent so far: drop the sessions.
     pub fn release(&self) {
-        let (t, r) = channel();
-        if self.tx.send(Req::Release(t)).is_ok() {
+        let rs: Vec<_> = self.txs.iter().filter_map(|tx| {
+            let (t, r) = channel();
+            tx.send(Req::Release(t)).is_ok().then_some(r)
+        }).collect();
+        for r in rs {
             let _ = r.recv();
         }
     }
     pub fn restore(&self) -> Result<(), String> {
-        let (t, r) = channel();
-        self.tx.send(Req::Restore(t)).map_err(|_| "the evaluator thread is gone".to_string())?;
-        r.recv().map_err(|_| "the evaluator thread is gone".to_string())?
+        let mut rs = Vec::new();
+        for tx in &self.txs {
+            let (t, r) = channel();
+            tx.send(Req::Restore(t)).map_err(|_| GONE.to_string())?;
+            rs.push(r);
+        }
+        let mut out = Ok(());
+        for r in rs {
+            let x = r.recv().map_err(|_| GONE.to_string()).and_then(|x| x);
+            if out.is_ok() {
+                out = x;
+            }
+        }
+        out
     }
+    /// New evaluators, one per thread (after the batches sent so far).
+    pub(crate) fn swap(&self, evs: Vec<Box<dyn Evaluator>>) -> Result<(), String> {
+        if evs.len() != self.txs.len() {
+            return Err(format!("internal: {} evaluators for {} evaluator threads", evs.len(), self.txs.len()));
+        }
+        let mut rs = Vec::new();
+        for (tx, ev) in self.txs.iter().zip(evs) {
+            let (t, r) = channel();
+            tx.send(Req::Swap(ev, t)).map_err(|_| GONE.to_string())?;
+            rs.push(r);
+        }
+        for r in rs {
+            let _ = r.recv();
+        }
+        Ok(())
+    }
+    /// The job is over.
+    pub(crate) fn stop(&self) {
+        for tx in &self.txs {
+            let _ = tx.send(Req::Stop);
+        }
+    }
+}
+
+/// A sink that drops everything (the second and further sessions of a job: the first's events stand for them).
+struct NoSink;
+impl Sink for NoSink {
+    fn event(&self, _: Value) {}
+    fn log(&self, _: &str) {}
 }
 
 /// Throughput counters (zero-farm PROTOCOL.md 3 `Stats`, the ones a self-play job has).
@@ -406,13 +462,39 @@ pub(crate) fn build_eval(kind: &EvalKind, want: &Expect, sink: &dyn Sink, progre
     })
 }
 
-/// The evaluator thread: answers in the order asked.
+/// The job's evaluators: `kind`'s network once per evaluator thread (`OrtCfg::workers`; the uniform evaluator once),
+/// the first reporting to `sink` (its self-test event), the others quietly - each self-tested all the same.
+pub(crate) fn build_evals(kind: &EvalKind, want: &Expect, sink: &dyn Sink, progress: &Mutex<Progress>, gen: Option<u32>) -> Result<Vec<Box<dyn Evaluator>>, String> {
+    let n = match kind {
+        EvalKind::Onnx { ort, .. } => ort.workers.max(1),
+        EvalKind::Uniform => 1,
+    };
+    let mut v = vec![build_eval(kind, want, sink, progress, gen)?];
+    for _ in 1..n {
+        v.push(build_eval(kind, want, &NoSink, progress, gen)?);
+    }
+    Ok(v)
+}
+
+/// The evaluator threads (one per evaluator): each answers its batches in the order asked; the answers of all of them
+/// on one channel, by batch id (the job submits them in launch order).
 #[allow(clippy::type_complexity)]
-pub(crate) fn spawn_eval(mut ev: Box<dyn Evaluator>) -> (EvalLink, Receiver<(u64, Result<Answer, String>, f64)>, std::thread::JoinHandle<()>) {
-    let (tx, rx) = channel::<Req>();
+pub(crate) fn spawn_eval(evs: Vec<Box<dyn Evaluator>>) -> (EvalLink, Receiver<(u64, Result<Answer, String>, f64)>, Vec<std::thread::JoinHandle<()>>) {
     let (atx, arx) = channel();
-    let h = std::thread::Builder::new()
-        .name("zero-worker-eval".into())
+    let mut txs = Vec::new();
+    let mut hs = Vec::new();
+    for (i, ev) in evs.into_iter().enumerate() {
+        let (tx, rx) = channel::<Req>();
+        txs.push(tx);
+        hs.push(spawn_eval_thread(ev, rx, atx.clone(), i));
+    }
+    (EvalLink { txs, next: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }, arx, hs)
+}
+
+#[allow(clippy::type_complexity)]
+fn spawn_eval_thread(mut ev: Box<dyn Evaluator>, rx: Receiver<Req>, atx: Sender<(u64, Result<Answer, String>, f64)>, i: usize) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(if i == 0 { "zero-worker-eval".into() } else { format!("zero-worker-eval-{i}") })
         .spawn(move || {
             for r in rx {
                 match r {
@@ -438,8 +520,7 @@ pub(crate) fn spawn_eval(mut ev: Box<dyn Evaluator>) -> (EvalLink, Receiver<(u64
                 }
             }
         })
-        .expect("spawn the evaluator thread");
-    (EvalLink { tx }, arx, h)
+        .expect("spawn the evaluator thread")
 }
 
 /// The recorded network batches (`tools/onnx_record.py`'s npz).
@@ -585,6 +666,10 @@ struct Run<'a> {
     link: EvalLink,
     answers: Receiver<(u64, Result<Answer, String>, f64)>,
     pending: VecDeque<u64>,
+    /// Answers of later batches that came before the oldest's (several evaluator threads).
+    early: std::collections::HashMap<u64, (Result<Answer, String>, f64)>,
+    /// Batches in flight at most: INFLIGHT, or one per evaluator thread (`infer._drive_pipelined`'s rule).
+    inflight: usize,
     writer: ShardWriter,
     /// The records files (`Job::output` with records).
     rec: Option<RecordWriter>,
@@ -633,13 +718,13 @@ impl Sink for Buffered {
     }
 }
 
-/// A rolling job's next evaluator: the checkpoint's network on the job's runtime and providers (its file's sha256
-/// checked, its self-test passed: `selftest` with `gen`), or the uniform evaluator in a uniform job (tests, the
-/// plumbing gate).
-fn checkpoint_eval(kind: &EvalKind, c: &Checkpoint, want: &Expect, sink: &dyn Sink, progress: &Mutex<Progress>) -> Result<Box<dyn Evaluator>, String> {
+/// A rolling job's next evaluators: the checkpoint's network on the job's runtime and providers (its file's sha256
+/// checked, its self-test passed: `selftest` with `gen`), one per evaluator thread, or the uniform evaluator in a
+/// uniform job (tests, the plumbing gate).
+fn checkpoint_eval(kind: &EvalKind, c: &Checkpoint, want: &Expect, sink: &dyn Sink, progress: &Mutex<Progress>) -> Result<Vec<Box<dyn Evaluator>>, String> {
     match kind {
-        EvalKind::Uniform => Ok(Box::new(Uniform)),
-        EvalKind::Onnx { ort, .. } => build_eval(&EvalKind::Onnx { model: c.model.clone(), ort: ort.clone(), sha256: c.sha256.clone(), reference: c.reference.clone() }, want, sink, progress, Some(c.gen)),
+        EvalKind::Uniform => Ok(vec![Box::new(Uniform)]),
+        EvalKind::Onnx { ort, .. } => build_evals(&EvalKind::Onnx { model: c.model.clone(), ort: ort.clone(), sha256: c.sha256.clone(), reference: c.reference.clone() }, want, sink, progress, Some(c.gen)),
     }
 }
 
@@ -673,13 +758,15 @@ impl Run<'_> {
         let thread = std::thread::Builder::new()
             .name("zero-worker-checkpoint".into())
             .spawn(move || {
-                let mut ev = checkpoint_eval(&kind, &c2, &want, &*o2, &progress)?;
+                let mut evs = checkpoint_eval(&kind, &c2, &want, &*o2, &progress)?;
                 let mut st = staged.lock().unwrap();
                 // (built during a yield: released now, rebuilt on its first batch - do_yield)
                 if flag.load(Ordering::SeqCst) {
-                    ev.release();
+                    for ev in evs.iter_mut() {
+                        ev.release();
+                    }
                 }
-                *st = Some(ev);
+                *st = Some(evs);
                 Ok(())
             })
             .expect("spawn the checkpoint thread");
@@ -875,15 +962,26 @@ impl Run<'_> {
             s = self.ctl.cv.wait(s).unwrap();
         }
         self.pending.push_back(b.id);
-        self.link.tx.send(Req::Eval(b)).map_err(|_| "the evaluator thread is gone".to_string())
+        self.link.eval(b)
     }
 
     fn finish_oldest(&mut self) -> Result<(), String> {
         let want = self.pending.pop_front().expect("a batch in flight");
-        let (id, a, secs) = self.answers.recv().map_err(|_| "the evaluator thread is gone".to_string())?;
-        if id != want {
-            return Err(format!("internal: answer of batch {id}, expected {want}"));
-        }
+        // (several evaluator threads: a later batch's answer may come first - kept until its turn)
+        let (a, secs) = loop {
+            if let Some(x) = self.early.remove(&want) {
+                break x;
+            }
+            let (id, a, secs) = self.answers.recv().map_err(|_| GONE.to_string())?;
+            if id == want {
+                break (a, secs);
+            }
+            if !self.pending.contains(&id) {
+                return Err(format!("internal: answer of batch {id}, expected {want}"));
+            }
+            self.early.insert(id, (a, secs));
+        };
+        let id = want;
         let a = a?;
         {
             let mut p = self.progress.lock().unwrap();
@@ -918,7 +1016,7 @@ impl Run<'_> {
                         p.batch_rows_log2[rows_bucket(b.b)] += 1;
                     }
                     self.send(b)?;
-                    if self.pending.len() >= INFLIGHT {
+                    if self.pending.len() >= self.inflight {
                         self.finish_oldest()?;
                     }
                 }
@@ -935,13 +1033,14 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let cfg = job_driver_cfg(game, job)?;
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
     let want = Expect::of(&info, belief);
-    let ev = build_eval(&job.eval, &want, sink, &progress, None)?;
-    sink.log(&format!("job {}: {} games from gid {}, seed {}, net {}; driver: conc {}, threads {}, groups {}, sparse; evaluator: {}", job.lease_id, job.games, job.gid_base, job.seed, job.net, cfg.concurrency, cfg.threads, cfg.groups, ev.describe()));
+    let evs = build_evals(&job.eval, &want, sink, &progress, None)?;
+    let workers = if evs.len() > 1 { format!(" x {} evaluator threads", evs.len()) } else { String::new() };
+    sink.log(&format!("job {}: {} games from gid {}, seed {}, net {}; driver: conc {}, threads {}, groups {}, sparse; evaluator: {}{workers}", job.lease_id, job.games, job.gid_base, job.seed, job.net, cfg.concurrency, cfg.threads, cfg.groups, evs[0].describe()));
     {
         let mut p = progress.lock().unwrap();
         p.concurrency = cfg.concurrency;
         p.threads = cfg.threads;
-        p.provider = ev.provider();
+        p.provider = evs[0].provider();
     }
     if cfg.concurrency == 0 {
         return Err("conc 0: no game would ever start (the setup cap is the games in flight)".into());
@@ -981,9 +1080,10 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         None
     };
     let writer = ShardWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, meta, sparse, info.num_features, 1, crate::shard::RowsFmt::of(&info))?;
-    let (link, answers, eval_thread) = spawn_eval(ev);
+    let (link, answers, eval_threads) = spawn_eval(evs);
     link_out(link.clone());
-    let mut r = Run { job, sink, ctl, drv, link, answers, pending: VecDeque::new(), writer, rec, spec, cap, enq: 0, finished: 0, stop_topup: false, ended: false, switching: None, progress: progress.clone(), recorder: job.record_batches.as_ref().map(|(p, n)| Recorder::new(p.clone(), *n)), want, t0, t_status: Instant::now(), fin_unsent: 0, games: job.games, low_sent: None, held_since: None, building: None, next_ck: None };
+    let inflight = INFLIGHT.max(link.workers());
+    let mut r = Run { job, sink, ctl, drv, link, answers, pending: VecDeque::new(), early: Default::default(), inflight, writer, rec, spec, cap, enq: 0, finished: 0, stop_topup: false, ended: false, switching: None, progress: progress.clone(), recorder: job.record_batches.as_ref().map(|(p, n)| Recorder::new(p.clone(), *n)), want, t0, t_status: Instant::now(), fin_unsent: 0, games: job.games, low_sent: None, held_since: None, building: None, next_ck: None };
     let res = (|| -> Result<(), String> {
         r.pump()?;
         let mut idle = 0;
@@ -998,9 +1098,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
                     // a rolling job's phase change: the evaluator its checkpoint built (and self-tested) in the
                     // background swapped in, the driver resumed with its id
                     let new = r.ctl.staged.lock().unwrap().take().ok_or("internal: a checkpoint switch without its evaluator")?;
-                    let (t, rx) = channel();
-                    r.link.tx.send(Req::Swap(new, t)).map_err(|_| "the evaluator thread is gone".to_string())?;
-                    let _ = rx.recv();
+                    r.link.swap(new)?;
                     r.drv.resume(BIG, c.gen)?;
                     r.sink.log(&format!("checkpoint {} ({}): the driver resumed with it", c.gen, c.model.display()));
                     if let Some(n) = r.next_ck.take() {
@@ -1024,13 +1122,11 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
             }
             if let Some(c) = r.switching.take() {
                 // the remote worker's phase change: the new network, the driver resumed with its id
-                let new = build_eval(&EvalKind::Onnx { model: c.model.clone(), ort: match &r.job.eval {
+                let new = build_evals(&EvalKind::Onnx { model: c.model.clone(), ort: match &r.job.eval {
                     EvalKind::Onnx { ort, .. } => ort.clone(),
                     EvalKind::Uniform => return Err("checkpoint: a uniform-evaluator job has no network to switch".into()),
                 }, sha256: c.sha256.clone(), reference: c.reference.clone() }, &r.want, r.sink, &r.progress, None)?;
-                let (t, rx) = channel();
-                r.link.tx.send(Req::Swap(new, t)).map_err(|_| "the evaluator thread is gone".to_string())?;
-                let _ = rx.recv();
+                r.link.swap(new)?;
                 r.drv.resume(BIG, c.gen)?;
                 r.sink.log(&format!("checkpoint {} ({}): the driver resumed with it", c.gen, c.model.display()));
                 r.pump()?;
@@ -1066,9 +1162,11 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     r.snapshot();
     let games = r.games;
     let Run { link, writer, rec, .. } = r;
-    let _ = link.tx.send(Req::Stop);
+    link.stop();
     drop(link);
-    let _ = eval_thread.join();
+    for h in eval_threads {
+        let _ = h.join();
+    }
     res?;
     rec_res?;
     let p = progress.lock().unwrap();
@@ -1104,8 +1202,10 @@ pub fn do_yield(ctl: &Control, link: Option<&EvalLink>, progress: &Mutex<Progres
     }
     // (a rolling job's next network, built but not swapped in yet; set_yielded came first: one staged after this
     // sees the flag and is released by its builder)
-    if let Some(e) = ctl.staged.lock().unwrap().as_mut() {
-        e.release();
+    if let Some(evs) = ctl.staged.lock().unwrap().as_mut() {
+        for e in evs.iter_mut() {
+            e.release();
+        }
     }
     let dt = t0.elapsed().as_secs_f64();
     let mut p = progress.lock().unwrap();

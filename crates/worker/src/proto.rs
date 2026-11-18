@@ -4,7 +4,7 @@
 //! <worker> serve                         aw/1: JSON lines in (op) / out (ev); stdout JSON only, stderr the log
 //! <worker> selfplay --settings F (--model M | --uniform) --games N [--gid-base G] [--seed S] [--net N]
 //!          [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
-//!          [--ort-dll PATH] [--spinning 0|1] [--record-batches N --record-file F] [--sha256 H (the model file's)]
+//!          [--ort-dll PATH] [--spinning 0|1] [--infer-workers W] [--record-batches N --record-file F] [--sha256 H (the model file's)]
 //!          [--status-s X] [--stdin-control] [--reference R] [--output shards|records|both (default shards)]
 //!          [--rolling [--flush-s X]]               one job from flags (the same runner; events on stdout;
 //!                                                  --rolling: a rolling job, `extend` on stdin)
@@ -230,6 +230,10 @@ fn job_ort(o: &Map<String, Value>, dylib: PathBuf, threads: usize) -> Result<Ort
         spinning: o.get("spinning").and_then(|x| x.as_bool()).unwrap_or(false),
         providers: crate::session::parse_providers(o.get("providers")).map_err(|e| format!("job: {e}"))?,
         device: GpuDevice::from_json(o.get("gpu")).map_err(|e| format!("job: {e}"))?,
+        workers: match o.get("infer_workers") {
+            None | Some(Value::Null) => 1,
+            Some(v) => v.as_u64().filter(|n| (1..=64).contains(n)).ok_or_else(|| format!("job: infer_workers {v}: 1 to 64"))? as usize,
+        },
     })
 }
 
@@ -249,7 +253,11 @@ fn cli_ort(a: &Args, dylib: PathBuf, threads: usize, spinning: bool) -> Result<O
         Some(l) => Some(GpuDevice { luid: crate::gpu::parse_luid(l).ok_or("--gpu: an adapter LUID in hex")?, vendor: String::new(), name: String::new() }),
         None => None,
     };
-    Ok(OrtCfg { dylib, intra_threads: threads, spinning, providers, device })
+    let workers: usize = a.num("--infer-workers")?.unwrap_or(1);
+    if !(1..=64).contains(&workers) {
+        return Err(format!("--infer-workers {workers}: 1 to 64"));
+    }
+    Ok(OrtCfg { dylib, intra_threads: threads, spinning, providers, device, workers })
 }
 
 /// `checkpoint_iter` of a model whose file's sha256 (when the job gives one) is checked first: ONNX Runtime

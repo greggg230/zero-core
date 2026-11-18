@@ -63,6 +63,9 @@ MAX_LEASE_GAMES = 100_000               # games per lease (PROTOCOL 7: 1 to 100,
 # the vendor names of an agent's profile (`gpus[].vendor`, PROTOCOL 9.2): an alternate's `when.vendor` is one of them
 # (any other name would match no PC, and the alternate would never be offered)
 VENDORS = ('nvidia', 'amd', 'intel')
+# zero-farm PROTOCOL rev 17 (section 11): the platforms a build's manifest may name (absent: windows-x64)
+PLATFORMS = ('windows-x64', 'macos-arm64')
+PLATFORM_DEFAULT = 'windows-x64'
 
 
 # ---------------------------------------------------------------- paths and secrets
@@ -449,7 +452,13 @@ def run_alternates(client, build_id, runtime, alt_builds, vendor=None):
     anywhere); both given and different, or neither, is refused, as is a vendor that is not a profile vendor name
     (`VENDORS`). At most `MAX_ALTERNATES`, none the default build and none listed twice (the coordinator refuses an
     alternate equal to the default or to another; a definition's builds are distinct, at most 64: `validate`). No
-    alternates: ([], [build_id]) and nothing is fetched."""
+    alternates: ([], [build_id]) and nothing is fetched.
+
+    Platforms (PROTOCOL rev 17, 11.4; docs/az.md 62): a build whose manifest names another platform than windows-x64
+    (`platform`, `PLATFORMS`) needs a pack of the same platform; its alternate's `when` says `platform`: a **CPU alternate**
+    (`{"build_id", "runtime", "when": {"platform"}}`: every machine of that platform, no GPU condition; `vendor` is not
+    asked for; its pack has no `gpu` - GPU alternates are windows-x64 only). A Windows build's alternate is as before (no `platform`
+    key: the PUT bodies of existing runs are unchanged). At most one CPU alternate per platform."""
     alt_builds = list(alt_builds or [])
     if not alt_builds:
         return [], [build_id]
@@ -480,6 +489,21 @@ def run_alternates(client, build_id, runtime, alt_builds, vendor=None):
             raise SystemExit(f'alternate {b} requires {rt}, a {pack.get("kind")!r} build, not a runtime pack')
         gpu = pack.get('gpu')
         own = gpu.get('vendor') if isinstance(gpu, dict) else None
+        plat = m.get('platform') or PLATFORM_DEFAULT
+        if plat not in PLATFORMS:
+            raise SystemExit(f'alternate {b}: platform {plat!r}, not one of {PLATFORMS}')
+        if (pack.get('platform') or PLATFORM_DEFAULT) != plat:
+            raise SystemExit(f'alternate {b} is a {plat} build, its pack {rt} ({pack.get("version")}) is for '
+                             f'{pack.get("platform") or PLATFORM_DEFAULT}')
+        if plat != PLATFORM_DEFAULT:
+            when = {'platform': plat}
+            if own:
+                raise SystemExit(f'alternate {b}: a {plat} build with a GPU pack {rt} ({pack.get("version")}): GPU '
+                                 f'alternates are {PLATFORM_DEFAULT} only (PROTOCOL 11.4)')
+            if any(x['when'] == when for x in out):
+                raise SystemExit(f'alternate {b}: a second CPU alternate for {plat} (one per platform, PROTOCOL 11.4)')
+            out.append({'build_id': b, 'runtime': rt, 'when': when})
+            continue
         if own and vendor and own != vendor:
             raise SystemExit(f'alternate {b}: its pack {rt} ({pack.get("version")}) is for {own} GPUs, not {vendor}')
         v = own or vendor

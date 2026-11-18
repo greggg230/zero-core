@@ -593,6 +593,16 @@ fn nvrtx(ord: u32) -> ort::ep::NVRTX {
     ep
 }
 
+/// ZERO_ORT_CONFIG's session config entries (`builder`).
+fn ort_config_env() -> Vec<(String, String)> {
+    std::env::var("ZERO_ORT_CONFIG")
+        .unwrap_or_default()
+        .split(';')
+        .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+        .filter(|(k, _)| !k.is_empty())
+        .collect()
+}
+
 fn builder(rt: &Runtime, b: &Binding, threads: usize, spinning: bool, log_id: Option<&str>) -> Result<SessionBuilder, String> {
     let mut sb = Session::builder(&rt.env).map_err(oerr)?;
     sb = sb.with_intra_threads(threads.max(1)).map_err(oerr)?;
@@ -602,6 +612,11 @@ fn builder(rt: &Runtime, b: &Binding, threads: usize, spinning: bool, log_id: Op
     sb = sb.with_intra_op_spinning(spinning).map_err(oerr)?;
     if !matches!(b, Binding::Cpu) {
         sb = sb.with_deterministic_compute(true).map_err(oerr)?;
+    }
+    // (a diagnostic: ZERO_ORT_CONFIG="key=value;key=value" adds ONNX Runtime session config entries, e.g.
+    // mlas.disable_kleidiai=1 on arm64 - unset, nothing changes; docs/az.md 62)
+    for (k, v) in ort_config_env() {
+        sb = sb.with_config_entry(k, v).map_err(oerr)?;
     }
     if let Some(id) = log_id {
         sb = sb.with_log_id(id).map_err(oerr)?;

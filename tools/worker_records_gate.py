@@ -28,6 +28,8 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ONNX Runtime's library in a runtime pack on this platform (the worker's `platform::ORT_LIB`, docs/az.md 62)
+ORT_LIB = 'onnxruntime.dll' if os.name == 'nt' else ('libonnxruntime.dylib' if sys.platform == 'darwin' else 'libonnxruntime.so')
 
 
 def parse_set(kvs):
@@ -52,7 +54,7 @@ def run_worker(a, settings_path, out):
     if a.uniform:
         args += ['--uniform']
     else:
-        dll = os.path.join(a.runtime_dir, 'onnxruntime.dll') if a.runtime_dir else a.ort_dll
+        dll = os.path.join(a.runtime_dir, ORT_LIB) if a.runtime_dir else a.ort_dll
         args += ['--model', a.model, '--ort-dll', dll]
     if a.net is not None:
         args += ['--net', str(a.net)]

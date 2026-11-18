@@ -112,12 +112,16 @@ pub struct OrtCfg {
     pub providers: Vec<crate::session::ProviderKind>,
     /// The job line's `gpu`: the adapter GPU providers run on.
     pub device: Option<crate::session::GpuDevice>,
+    /// The job line's `infer_workers` (docs/az.md 62; default 1): sessions of the network, each on an evaluator thread
+    /// of its own with `intra_threads` threads, answering the batches in flight in turn (Python's `infer_workers`:
+    /// a CPU's matrix units serve several batches at once better than one batch with more threads).
+    pub workers: usize,
 }
 
 impl OrtCfg {
     /// CPU only (the job lines before PROTOCOL.md rev 7, the tools).
     pub fn cpu(dylib: std::path::PathBuf, intra_threads: usize, spinning: bool) -> OrtCfg {
-        OrtCfg { dylib, intra_threads, spinning, providers: vec![crate::session::ProviderKind::Cpu], device: None }
+        OrtCfg { dylib, intra_threads, spinning, providers: vec![crate::session::ProviderKind::Cpu], device: None, workers: 1 }
     }
 }
 

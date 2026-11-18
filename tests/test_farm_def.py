@@ -251,6 +251,37 @@ def test_run_alternates_from_their_manifests():
         FD.worker_game(cl, b_cuda, rt_cpu)
 
 
+def test_run_alternates_of_another_platform():
+    """zero-farm PROTOCOL rev 17, 11.4 (docs/az.md 62): a macOS build with a macOS pack without `gpu` is a CPU alternate
+    `{"build_id", "runtime", "when": {"platform": "macos-arm64"}}` (no vendor asked for), listed with a Windows CUDA
+    alternate whose `when` is as before (no platform key); the definition's builds take both. Refused: a macOS build
+    with a Windows pack (and the reverse), a platform no one knows, two CPU alternates of one platform."""
+    cpu = {'manifest': 1, 'kind': 'runtime', 'version': 'ort-1.31.1-cpu', 'files': []}
+    mac = {'manifest': 1, 'kind': 'runtime', 'version': 'ort-1.31.1-cpu-macos-arm64', 'platform': 'macos-arm64',
+           'min_agent': '0.3.0', 'files': []}
+    cuda = {'manifest': 1, 'kind': 'runtime', 'version': 'cuda', 'min_agent': '0.2.10',
+            'gpu': {'vendor': 'nvidia', 'min_driver': '527.41', 'providers': ['cuda']}, 'files': []}
+    packs, (rt_cpu, rt_mac, rt_cuda) = _manifests(cpu, mac, cuda)
+    w = {'manifest': 1, 'kind': 'worker', 'version': 'mtg-1', 'game': 'mtg', 'entry': 'mtgz-worker.exe', 'files': []}
+    wm = dict(w, entry='mtgz-worker', platform='macos-arm64', min_agent='0.3.0', version='mtg-1-macos-arm64')
+    builds, (b_cpu, b_cuda, b_mac, b_mac2, b_mac_winpack, b_win_macpack, b_linux) = _manifests(
+        dict(w, requires_runtime=rt_cpu), dict(w, requires_runtime=rt_cuda), dict(wm, requires_runtime=rt_mac),
+        dict(wm, requires_runtime=rt_mac, version='mtg-2-macos-arm64'), dict(wm, requires_runtime=rt_cpu),
+        dict(w, requires_runtime=rt_mac, version='mtg-3'), dict(wm, platform='linux-x64', requires_runtime=rt_mac))
+    objs = {**packs, **builds}
+    cl = FD.Client('http://fake', token=TOKEN, transport=lambda m, url, h, d: (200, objs[url.split('/builds/')[1].split('/')[0]]))
+    alts, bs = FD.run_alternates(cl, b_cpu, rt_cpu, [b_cuda, b_mac])
+    assert alts == [{'build_id': b_cuda, 'runtime': rt_cuda, 'when': {'vendor': 'nvidia'}},
+                    {'build_id': b_mac, 'runtime': rt_mac, 'when': {'platform': 'macos-arm64'}}]
+    assert bs == [b_cpu, b_cuda, b_mac]
+    # (the caller's vendor is for Windows packs without gpu: a macOS CPU alternate never takes it)
+    assert FD.run_alternates(cl, b_cpu, rt_cpu, [b_mac], 'amd')[0] == [alts[1]]
+    for alt, why in (([b_mac_winpack], 'its pack .* is for windows-x64'), ([b_win_macpack], 'its pack .* is for macos-arm64'),
+                     ([b_linux], "platform 'linux-x64'"), ([b_mac, b_mac2], 'a second CPU alternate for macos-arm64')):
+        with pytest.raises(SystemExit, match=why):
+            FD.run_alternates(cl, b_cpu, rt_cpu, alt)
+
+
 def test_checkpoint_entries(tmp_path):
     m, r = tmp_path / 'model.onnx', tmp_path / 'reference.npz'
     m.write_bytes(b'graph' * 10)

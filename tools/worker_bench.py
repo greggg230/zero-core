@@ -62,10 +62,18 @@ def load_sampler_posix(stop, samples):
 
 
 def lower_priority(nice):
-    """A preexec_fn for a child at niceness `nice` (POSIX), else None."""
+    """A preexec_fn for a child at niceness at least `nice` (POSIX; a niced harness's children inherit its own), else
+    None."""
     if not nice or os.name == 'nt':
         return None
-    return lambda: os.nice(nice)
+
+    def f():
+        try:
+            if os.getpriority(os.PRIO_PROCESS, 0) < nice:
+                os.setpriority(os.PRIO_PROCESS, 0, nice)
+        except OSError:
+            pass
+    return f
 
 
 def peak_wset(pid):
@@ -172,7 +180,7 @@ def python_child(a):
             if ev == 'fin':
                 self.ctl.put({'cmd': 'accept', 'iter': kw['iter'], 'n': kw['n']})
             elif ev == 'end' and kw.get('iter') == it:
-                kw = dict(kw, rows=self.rows_out, batches=batch_summary(batches))
+                kw = dict(kw, rows=kw.get('samples'), batches=batch_summary(batches))
                 with open(os.path.join(self.rdir, 'end.json'), 'w', encoding='utf-8') as f:
                     json.dump(kw, f)
                 self.ctl.put({'cmd': 'quit'})
