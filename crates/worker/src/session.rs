@@ -913,10 +913,11 @@ pub struct InferenceSession {
 /// passes its self-test with its own pieces).
 pub const GPU_CHUNK: usize = 1024;
 
-/// The piece size for `p` (`ZERO_WORKER_GPU_CHUNK` overrides the GPU's, for measurements).
+/// The piece size for `p` (`ZERO_WORKER_GPU_CHUNK` overrides the GPU's, `ZERO_WORKER_CPU_CHUNK` the CPU's, for
+/// measurements).
 pub fn chunk_for(p: ProviderKind) -> usize {
     if !p.is_gpu() {
-        return CHUNK;
+        return std::env::var("ZERO_WORKER_CPU_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0).unwrap_or(CHUNK);
     }
     std::env::var("ZERO_WORKER_GPU_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0).unwrap_or(GPU_CHUNK)
 }
