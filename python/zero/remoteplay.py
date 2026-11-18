@@ -156,6 +156,13 @@ def _merge_of(cfg):
     return 'ism' if int(cfg.get('selfplay_infoset_merge', 0) or 0) else ''
 
 
+def _budget_of(cfg):
+    """A run's playout-cap rule (`budget.fingerprint`, '' for the coin): what a worker's hello reports and the run checks
+    (docs/az.md 60) - an older checkout would draw its full searches by the coin in silence."""
+    from .budget import fingerprint
+    return fingerprint(cfg)
+
+
 def _value_choice_of(cfg):
     """A run's self-play value choices (docs/search.md 3.17; '' when off): what a worker's hello reports and the run
     checks (docs/az.md 39) - an older checkout would search the game's value choices as any decision in silence."""
@@ -1347,6 +1354,11 @@ class RemotePlay:
                     # a checkout without variable-length rows would drop the game's tails / overrides, or refuse
                     # mid-phase: never used (R13, docs/az.md 43.4)
                     s.no_tails = True
+                want_u = _budget_of(self.R.cfg) if self.mode == 'selfplay' else ''
+                if want_u and ev.get('budget') != want_u:
+                    # a checkout without the playout cap's rule (or with other settings) would draw its full searches
+                    # by the coin in silence: never used (docs/az.md 60)
+                    s.no_budget = ev.get('budget')
                 want_v = _value_choice_of(self.R.cfg) if self.mode == 'selfplay' else ''
                 if want_v and ev.get('value_choice') != want_v:
                     # a checkout without value choices would search them as any decision, recorded, in silence:
@@ -1530,6 +1542,13 @@ class RemotePlay:
             h.fail_log(f'worker {k} REFUSED: its checkout plays the episodes of the run\'s spec as {s.no_episodes!r}, the '
                        f'run as {_episodes_of(self.R.cfg)!r} (an older checkout plays a whole contest as one episode: '
                        f'docs/az.md 42); killed, retried in 10 minutes')
+            s.kill()
+            return
+        if hasattr(s, 'no_budget'):
+            h.next_try[k] = now + max(self.retry_s, 600.0)
+            h.fail_log(f'worker {k} REFUSED: its checkout draws the full searches of its playout cap as {s.no_budget!r}, the '
+                       f'run as {_budget_of(self.R.cfg)!r} (an older checkout by the coin: docs/az.md 60); killed, '
+                       f'retried in 10 minutes')
             s.kill()
             return
         if hasattr(s, 'no_value_choice'):
@@ -2623,6 +2642,7 @@ class Worker:
                       **({} if self.test.get('no_resign') else {'resign': _resign_of(self.cfg)}),
                       **({} if self.test.get('no_merge') else {'merge': _merge_of(self.cfg)}),
                       **({} if self.test.get('no_value_choice') else {'value_choice': _value_choice_of(self.cfg)}),
+                      **({} if self.test.get('no_budget') else {'budget': _budget_of(self.cfg)}),
                       # (variable-length rows: this checkout carries tails and overrides end to end, R13)
                       **({} if self.test.get('no_tails') else {'caps': ['tails']}),
                       **({} if self.test.get('no_episodes') else {'episodes': _episodes_of(self.cfg)}),

@@ -2330,6 +2330,74 @@ replay to those rows bit for bit, are refused by the game without the hook (the 
 the records made without the hook are refused by the game with it (a policy at a value-only decision); with the
 decisions also teacher decisions, the teacher's policy is recorded and replays; an evaluation seat records nothing.
 
+### 3.21 The playout cap's full searches by the prior's uncertainty (`p_full_rule`; MTG Zero's metagame run, 2026-11-17)
+
+**Why.** Playout cap randomisation gives a self-play decision the full budget `sims` with probability `p_full`
+and the fast one `sims_fast` otherwise, by a coin; only the full searches are recorded. On MTG Zero's metagame network
+the search changes the move (the prior's argmax vs the recorded 'cq' target's) in 4.7% of the decisions, and the
+prior's own uncertainty u = 1 - max P0 predicts which at AUC 0.90: the quarter of the decisions with the largest u
+holds 87% of the move changes. The coin spends three quarters of the full searches on decisions the search does not
+change. `p_full_rule` 'prior_uncertainty' gives the same mean budget to the unsure decisions.
+
+**What it does.** Seat keys `p_full_rule` ('random' | 'prior_uncertainty', `FullRule`), `p_full_floor` (default 0.05),
+`p_full_shape` ('linear' | 'sqrt' | 'square', `UShape`), `p_full_u_mean` (required with the rule; the last three are
+the rule's only: given with 'random' they are refused). For a capped decision (a seat with `sims_fast`, not minor, not
+a branch's deviation) the chance of a full search is
+
+    f = min(1, floor + (p_full - floor) * g(u) / u_mean),   u = 1 - max P0   (`FullRule::full_share`)
+
+P0 the root's priors before any noise (`Tree::priors0`), g the shape. Its mean over the decisions is p_full when
+`u_mean` is the mean of g(u) (the cap at 1 only cuts it down); every decision keeps at least `floor`. The rule is
+stochastic, not a threshold: confident decisions still get some full searches (and records), and the chance is known
+for every decision (an importance weight 1 / f, should the trainer want one: not built, docs/az.md 60).
+
+* **The coin.** `start` draws the decision's coin from the game's stream (`slot.rng`) exactly where the random rule
+  draws it - for minor decisions too - and keeps it (`Slot::cap_draw`); the comparison waits for the root's priors
+  (`choose_budget`). The game's streams are those of the random rule, and a floor equal to `p_full` (f = p_full for
+  every decision) plays the coin's games bit for bit.
+* **The budget waits for the root's evaluation.** A reused root that is expanded has its priors: the budget is chosen
+  in `start`. A fresh root's search first runs one simulation - the root's own evaluation (`Slot::budget_pending`,
+  target 1) - with no root noise, no root floor and the belief of a fast search; then `choose_budget` sets what `start`
+  sets by the draw: the budget (`sims` or `sims_fast`, the game's `sims_divisor` applied), the belief
+  (`takes_belief(full)`), the Dirichlet noise of a full search (on the expanded root: `add_noise` resets each prior
+  from P0, as `start` does on a reused root; the same noise stream, so the same values as at the expansion), the root
+  floor. The root's evaluation counts toward the budget as before. A full search's root belief row goes alone after
+  the root's evaluation (the reused-root path of 3.8) instead of with it: the same answer, one round later. A restarted
+  search (a new network, `restart_search`) keeps the decision's coin and, when the budget was not chosen yet, chooses
+  it again from the new network's priors.
+* **Checks** (`Driver::new`, `FullRule::check`): p_full in (0, 1], the floor in [0, p_full], u_mean finite > 0, a seat
+  with `sims_fast`; not with `root_search` 'gumbel' (its schedule is set from the budget before the root's
+  evaluation).
+* **Determinism.** f is an f64 of the f32 priors with correctly rounded operations only (`sqrt`, `*`, `/`, `+`, `min`;
+  no `powf`), compared with a draw of the game's stream: every executor (threads, groups, batches, this machine, a
+  remote worker, the native farm worker) draws the same full searches.
+
+**Counters** (every capped decision, either rule; `DriverStats::cap_*`, the binding's stats dict `cap_decisions`,
+`cap_full`, `cap_sims`, `cap_g_e6`, `cap_f_e6`, `cap_changed`, `cap_targets` - only for a driver with a playout cap, so
+every other dict is as before): capped decisions, their full searches, their budgets (simulations), the sums of g(u)
+(u for the coin) and of f (p_full for the coin) in millionths, and the recorded targets whose argmax (first maximum)
+is not P0's, of the recorded targets compared. They read the root after the search and move nothing. zero.run reports
+them per self-play phase (`selfplay.budget`, docs/az.md 60).
+
+**Tests** (`driver/tests/budget.rs`): `a_floor_at_p_full_is_the_coin_bit_for_bit` (skewed priors, every shape: the
+coin's games, records, sims, leaves and counters; the golden records), `..._with_the_root_belief_too` (the same games
+and records - as a multiset: the alone belief rows take more rounds -, the same belief rows, all alone),
+`the_rule_matches_p_full_and_moves_the_full_searches_to_unsure_decisions` (u_mean measured with a floor at p_full:
+the drawn share within 4 sd of the chances, their mean within 0.06 of p_full, the budgets 16 / 4, more recorded
+targets off the prior's argmax than the coin's, every shape), `the_rule_plays_the_same_games_at_any_thread_layout`
+(1 x 1 vs 4 threads x 3 groups), `the_rule_keeps_minor_decisions_as_before`, `the_rule_settings_are_checked`,
+`the_seat_parser_reads_the_rule`; `light_decisions_divide_the_simulations_and_are_recorded` (the divisor divides the
+chosen budget); the native worker's port `zero_worker::settings::tests::the_playout_cap_rule_as_python`; pytest
+`tests/test_budget.py`.
+
+**Measured** (docs/az.md 60.3): MTG Zero's metagame network, 64 games a rule - a floor at p_full plays the coin's games;
+the linear rule's recorded targets leave the prior's argmax 3.1 times as often as the coin's (13.1% vs 4.3%), its full
+searches catching ~80% of the target changes (the coin 24%), at a mean chance of 0.258.
+
+Code: `driver.rs` (`FullRule`, `UShape`, `prior_uncertainty`, `NnSeat::p_full_rule`, the counters), `driver/worker.rs`
+(`start`, `choose_budget`, `advance_slot`, `decide`'s counters), `settings.rs` (the seat keys), `crates/py` (the stats),
+`crates/worker/src/settings.rs` (the port of `budget.seat_keys`).
+
 ## 4. Bindings and registering a game
 
 A game's binding crate (`py/` in the game repo, a `cdylib` named `<pkg>_py`) is one macro call:

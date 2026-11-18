@@ -599,6 +599,19 @@ fn light_decisions_divide_the_simulations_and_are_recorded() {
     assert!(recs4.iter().any(|r| r.opts.len() == 2), "light decisions are recorded");
     assert!(st4.leaves < st1.leaves, "{} leaves with divisor 4 vs {}", st4.leaves, st1.leaves);
     assert!(st4.sims < st1.sims);
+    // the playout cap's rule by the prior (docs/search.md 3.21) divides the budget it chooses the same way
+    let rule = |seat: SeatCfg| match seat {
+        SeatCfg::Nn(mut s) => {
+            s.p_full_rule = FullRule::PriorUncertainty { floor: 0.05, shape: UShape::Linear, u_mean: 0.3 };
+            SeatCfg::Nn(s)
+        }
+        s => s,
+    };
+    let (res, _, r4) = go(4, rule(nn(0, 16, true)));
+    assert!(res.iter().all(|r| r.over));
+    assert!(r4.cap_sims < r4.cap_full * 16 + (r4.cap_decisions - r4.cap_full) * 4, "the divisor divides the rule's budgets");
+    let (_, _, r1) = go(1, rule(nn(0, 16, true)));
+    assert_eq!(r1.cap_sims, r1.cap_full * 16 + (r1.cap_decisions - r1.cap_full) * 4);
     // evaluation seats too
     let (_, _, e1) = go(1, nn(0, 16, false));
     let (_, _, e4) = go(4, nn(0, 16, false));
@@ -4823,6 +4836,8 @@ fn set_game_log_never_with_branches() {
 }
 // chained episodes (docs/search.md 2.14): the toy match through the driver
 mod chain;
+// the playout cap's rule by the prior's uncertainty (docs/search.md 3.21)
+mod budget;
 
 // ---------------------------------------------------------------- reuse by the observation (docs/search.md 3.18)
 

@@ -74,7 +74,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import auxtarget as AUX, elo, forks as FK, gamerec as GR, games as G, league as L, package, precision as PR, resign as RS, runctl
+from . import auxtarget as AUX, budget as BU, elo, forks as FK, gamerec as GR, games as G, league as L, package, precision as PR, resign as RS, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths, shard_rows
 from .rows import forward_kw
 from .finite import NonFinite, check_state, head
@@ -115,6 +115,13 @@ DEFAULTS = dict(
     # simulation)
     sims=64, sims_fast=16, p_full=0.25, c_puct=1.0, alpha=0.3, eps=0.25, temp_moves=20,
     chance_k=0, margin_w=0.0, redet=1, max_steps=100_000,
+    # how the playout cap picks its full searches (zero/budget.py, docs/az.md 60, docs/search.md 3.21): 'random' = a
+    # coin of probability p_full per decision, as before | 'prior_uncertainty' = by the root prior's uncertainty u =
+    # 1 - max P0, full with probability min(1, p_full_floor + (p_full - p_full_floor) g(u) / p_full_u_mean), g the
+    # p_full_shape 'linear' | 'sqrt' | 'square', p_full_u_mean the mean of g(u) over the self-play decisions (0 =
+    # unset, required with the rule: selfplay.budget.g_mean measures it) - the same simulations per decision as the
+    # coin, the full searches where the search is likely to change the move
+    p_full_rule='random', p_full_floor=0.05, p_full_shape='linear', p_full_u_mean=0.0,
     # simulations of the game's minor decisions in self-play (SearchGame::minor_decision, e.g.
     # MTG's choice of the land to tap), never recorded; 0 = searched like the others
     sims_minor=0,
@@ -723,7 +730,8 @@ class Run:
                              gumbel_scale=c.get('selfplay_gumbel_scale', 1.0), eval_cache=c.get('eval_cache', 0),
                              cq_prior_w=c.get('cq_prior_w', 1.0),
                              infoset_merge=bool(c.get('selfplay_infoset_merge', 0)),
-                             **belief_keys(c, 'selfplay'), **RS.seat_keys(c), **value_choice_keys(c, 'selfplay'))
+                             **belief_keys(c, 'selfplay'), **RS.seat_keys(c), **value_choice_keys(c, 'selfplay'),
+                             **BU.seat_keys(c))
         return G.nn_seat(key, sims, c['c_puct'], chance_k=c['chance_k'], margin_w=c['margin_w'], redet=bool(c['redet']),
                          cq_c_visit=c.get('cq_c_visit', 50.0), cq_c_scale=c.get('cq_c_scale', 1.0),
                          select=c.get('eval_select', 'visits'), select_min_visits=c.get('eval_select_min_visits', 0),
@@ -960,6 +968,7 @@ class Run:
         self.cache_metrics(out, st, st0)
         self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results)
+        self.budget_metrics(it, out, st, st0)
         self.tail_metrics(it, out, st, st0, results)
         self.failure_metrics(it, out, results, drv)
         self.episode_metrics(it, out, results)
@@ -1193,6 +1202,21 @@ class Run:
                                        'noresign': remote['noresign']}
         self.log(f'iter {it} resign: {RS.fmt(out["resign"])}')
 
+    def budget_metrics(self, it, out, st, st0):
+        """The playout cap of this machine's driver (zero/budget.py, docs/az.md 60), whenever a self-play seat has one:
+        `budget` = the phase's capped decisions, the full share, simulations per decision, the mean chance of a full
+        search, the mean g(u), the recorded targets off the prior's argmax - logged; with the rule, a mean chance off
+        p_full by more than a tenth of it is said loudly (BUDGET DRIFT: p_full_u_mean is stale). (A rolling driver's
+        counters span the games in flight: the phase's searches, not exactly its accepted games'.)"""
+        b = BU.summary(st, st0)
+        if b is None:
+            return
+        out['budget'] = b
+        self.log(f'iter {it} budget: {BU.fmt(b, self.cfg)}')
+        drift = BU.drift(b, self.cfg)
+        if drift:
+            self.log(f'iter {it} BUDGET DRIFT: {drift}')
+
     def episode_metrics(self, it, out, results):
         """A chained game's contests (docs/az.md 42), only when the games chain (the metrics of before otherwise):
         `episodes` = this machine's finished contests' games - how many, per contest, drawn, resigned, unfinished
@@ -1374,6 +1398,7 @@ class Run:
         self.cache_metrics(out, st, st0)
         self.merge_metrics(it, out, st, st0, leaves)
         self.resign_metrics(it, out, results, rem.pop('resign', None))
+        self.budget_metrics(it, out, st, st0)
         self.tail_metrics(it, out, st, st0, results)   # (this machine's driver; every source's aborted games)
         self.failure_metrics(it, out, results, drv)
         self.episode_metrics(it, out, results)
@@ -2832,6 +2857,7 @@ def resolve_config(args, saved):
         raise SystemExit('resolver_cfg: selfplay_branch / selfplay_archive: single-game runs only (not a co-training resolver)')
     # self-play resignation (zero/resign.py): ranges, two-player single-game runs without the league
     RS.check_settings(cfg)
+    BU.check_settings(cfg)
     if isinstance(cfg.get('resolver_cfg'), dict) and RS.enabled(cfg['resolver_cfg']):
         raise SystemExit('resolver_cfg: selfplay_resign_t: single-game runs only (not a co-training resolver)')
     for where, cc in (('', cfg), ('resolver_cfg: ', cfg.get('resolver_cfg') if isinstance(cfg.get('resolver_cfg'), dict)

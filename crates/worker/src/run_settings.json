@@ -41,6 +41,22 @@
    "class": "play",
    "why": "share of full searches (playout cap)"
   },
+  "p_full_rule": {
+   "class": "play",
+   "why": "how the playout cap picks its full searches: the coin, or the root prior's uncertainty (docs/search.md 3.21)"
+  },
+  "p_full_floor": {
+   "class": "play",
+   "why": "the prior-uncertainty rule's least chance of a full search"
+  },
+  "p_full_shape": {
+   "class": "play",
+   "why": "the prior-uncertainty rule's transform g of u"
+  },
+  "p_full_u_mean": {
+   "class": "play",
+   "why": "the prior-uncertainty rule's mean of g(u)"
+  },
   "c_puct": {
    "class": "play",
    "why": "PUCT constant"
