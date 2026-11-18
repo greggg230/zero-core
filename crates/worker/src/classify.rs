@@ -11,6 +11,16 @@
 //! them with their classes: `Worker::package_settings`). A key in no class is unknown. Unknown keys and
 //! python_only switches that are on make the check fail.
 //!
+//! Declared classes (docs/az.md 61): a run's settings may carry `setting_classes` ({key: class}, the trainer's
+//! classification of every setting from its own zero-core table and its game package's `GamePackage.setting_classes`;
+//! zero.farm_h2h.run_setting_classes), signed with the template's settings in the run's definition. It is not a setting
+//! (no verdict). For a key this build does NOT know, its declared class stands in for the table: `trainer` is unused,
+//! `python_only` is off when its value is falsy (else unsupported), `param:<switch>` is off - and `play` stays
+//! **unknown** (a play setting this build cannot implement: rebuild the worker); a key with no declared class stays
+//! unknown. For a key the build knows, a declared class that differs from the build's own is `unsupported` (the
+//! trainer's zero-core classifies it otherwise: never play a setting by an older reading). The declaration itself must
+//! be an object of class strings, else unsupported. The `info` and `hello` feature `setting_classes` announces this.
+//!
 //! An eval job (`classify_eval`, docs/az.md 44.2) reads only the settings of an evaluation match
 //! (`settings::EVAL_READS`: `Run.nn_seat(key, eval_sims)` and `Run.driver` of a match): those are `play`,
 //! every other known setting `trainer` (unused by the job, whatever its value: a self-play feature that is
@@ -22,6 +32,9 @@ use crate::pyjson::PyJson;
 use crate::settings::{truthy, Settings};
 
 pub const TABLE: &str = include_str!("run_settings.json");
+
+/// The settings key holding the trainer's declared classes (module docs; docs/az.md 61).
+pub const CLASSES_KEY: &str = "setting_classes";
 
 /// A game package's own run settings (zero-core `GamePackage.settings`): (name, class, why), class `play`,
 /// `trainer`, `python_only` or `param:<its switch>` (the table's classes).
@@ -35,6 +48,46 @@ pub enum Class {
     PythonOnly,
     /// A setting of a python_only switch.
     Param(String),
+}
+
+impl Class {
+    /// The class as a declaration names it: `play`, `trainer`, `python_only`, `param:<switch>`.
+    pub fn name(&self) -> String {
+        match self {
+            Class::Play => "play".into(),
+            Class::Trainer => "trainer".into(),
+            Class::PythonOnly => "python_only".into(),
+            Class::Param(s) => format!("param:{s}"),
+        }
+    }
+
+    /// A declared class name -> the class (None: not a class).
+    pub fn parse(s: &str) -> Option<Class> {
+        Some(match s {
+            "play" => Class::Play,
+            "trainer" => Class::Trainer,
+            "python_only" => Class::PythonOnly,
+            p if p.starts_with("param:") && p.len() > 6 => Class::Param(p[6..].to_string()),
+            _ => return None,
+        })
+    }
+}
+
+/// The run's declared classes (`setting_classes`): Ok(None) when absent, Err(why) when it is not an object of class
+/// names.
+pub fn declared(c: &Settings) -> Result<Option<Vec<(String, Class)>>, String> {
+    match c.get(CLASSES_KEY) {
+        None | Some(PyJson::Null) => Ok(None),
+        Some(PyJson::Dict(v)) => v
+            .iter()
+            .map(|(k, x)| match x {
+                PyJson::Str(s) => Class::parse(s).map(|cl| (k.clone(), cl)).ok_or_else(|| format!("{k}: {s:?} is not a class (play, trainer, python_only, param:<switch>)")),
+                other => Err(format!("{k}: {} is not a class name", other.dumps())),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(other) => Err(format!("an object {{key: class}}, not {}", other.dumps())),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -102,7 +155,16 @@ pub fn classify_with(c: &Settings, info: &GameInfo, others: &[GameInfo], package
     }
     let mut out = Vec::new();
     let null = PyJson::Null;
+    let decl = declared(c);
+    if let Err(e) = &decl {
+        out.push(Verdict { key: CLASSES_KEY.into(), value: c.get(CLASSES_KEY).map_or(String::new(), |v| v.dumps()), status: "unsupported", why: format!("the run's declared setting classes: {e}") });
+    }
+    let decl = decl.unwrap_or(None);
+    let declared_of = |k: &str| decl.as_ref().and_then(|d| d.iter().find(|e| e.0 == k).map(|e| e.1.clone()));
     for k in c.keys() {
+        if k == CLASSES_KEY {
+            continue;
+        }
         let v = c.get(k).unwrap_or(&null);
         let value = v.dumps();
         let found = keys.iter().find(|e| e.0 == k).map(|e| (e.1.class.clone(), e.1.why.clone())).or_else(|| {
@@ -117,9 +179,24 @@ pub fn classify_with(c: &Settings, info: &GameInfo, others: &[GameInfo], package
                 others.iter().find(|g| g.aux.iter().any(|a| a.0 == t)).map(|g| format!("a setting of {:?}'s auxiliary target {t:?}, which {} has not (Python ignores it)", g.name, info.name))
             })
         };
+        let dc = declared_of(k);
+        // a known key whose declared class differs from this build's own: the trainer reads it otherwise
+        if let (Some((cl, _)), Some(d)) = (&found, &dc) {
+            if cl != d {
+                out.push(Verdict { key: k.to_string(), value, status: "unsupported", why: format!("the run's definition declares it {}, this build {}: rebuild the worker at the trainer's zero-core", d.name(), cl.name()) });
+                continue;
+            }
+        }
+        let unknown_why = || format!("not a zero-core run setting of this build, nor an auxiliary target setting of {} ({:?})", info.name, info.aux.iter().map(|a| a.0).collect::<Vec<_>>());
         let (status, why) = match found {
             None if other().is_some() => (if truthy(v) { "unsupported" } else { "off" }, other().unwrap()),
-            None => ("unknown", format!("not a zero-core run setting of this build, nor an auxiliary target setting of {} ({:?})", info.name, info.aux.iter().map(|a| a.0).collect::<Vec<_>>())),
+            None => match dc {
+                None => ("unknown", unknown_why()),
+                Some(Class::Play) => ("unknown", format!("{}; the run's definition declares it play, which this build cannot play: rebuild the worker", unknown_why())),
+                Some(Class::Trainer) => ("trainer", "unknown to this build; the run's definition declares it trainer-only (setting_classes): unused by a worker".into()),
+                Some(Class::PythonOnly) => (if truthy(v) { "unsupported" } else { "off" }, "unknown to this build; the run's definition declares it python_only (setting_classes)".into()),
+                Some(Class::Param(s)) => ("off", format!("unknown to this build; the run's definition declares it a setting of the python_only switch {s} (setting_classes)")),
+            },
             Some((Class::Play, w)) => ("play", w),
             Some((Class::Trainer, w)) => ("trainer", w),
             Some((Class::PythonOnly, w)) => {
@@ -153,7 +230,7 @@ pub fn classify_eval(c: &Settings, info: &GameInfo, others: &[GameInfo], package
                 x.status = "play";
                 x.why = "read by an evaluation match (Run.nn_seat(key, eval_sims), Run.driver of a match)".into();
             }
-        } else if matches!(x.status, "play" | "trainer" | "off" | "unsupported") && !(x.key == "game" && x.status == "unsupported") {
+        } else if matches!(x.status, "play" | "trainer" | "off" | "unsupported") && !(x.key == "game" && x.status == "unsupported") && x.key != CLASSES_KEY {
             x.why = format!("not read by an evaluation match ({})", x.why);
             x.status = "trainer";
         }
@@ -206,5 +283,47 @@ mod tests {
         let st: Vec<(&str, &str)> = vv.iter().map(|x| (x.key.as_str(), x.status)).collect();
         assert_eq!(st, vec![("game", "play"), ("sims", "trainer"), ("eval_sims", "play"), ("eval_select", "play"), ("selfplay_league", "trainer"), ("resolver", "trainer"), ("deck_every", "trainer"), ("deck_window", "trainer"), ("real_games", "trainer"), ("aux_deck_w", "trainer"), ("bogus", "unknown")]);
         assert!(classify_with(&c, &info, &[], &[("sims", "play", "x")]).is_err());
+    }
+
+    #[test]
+    fn declared_classes() {
+        // docs/az.md 61: a run's declared classes stand in for this build's table on the keys it does not know - a
+        // trainer-only key is unused, a play key stays unknown, an undeclared one too; a known key declared otherwise
+        // than the build classifies it is refused; a malformed declaration is refused; without one, as before
+        let info = GameInfo { name: "t", num_actions: 2, num_features: 2, min_players: 2, max_players: 2, bots: vec![], aux: vec![("deck", 3)], tails: vec![], option_pointers: false, max_row_tokens: None, head_tokens: 0 };
+        const PKG: PackageSettings = &[("deck_every", "python_only", "a hook"), ("real_games", "trainer", "an extra evaluation")];
+        let st = |text: &str| -> Vec<(String, &'static str)> {
+            classify_with(&Settings::parse(text).unwrap(), &info, &[], PKG).unwrap().iter().map(|x| (x.key.clone(), x.status)).collect()
+        };
+        let own = |k: &str, s: &'static str| (k.to_string(), s);
+        // a new trainer-only key: refused without a declaration (an older build), accepted with one
+        assert_eq!(st(r#"{"game": "t", "sims": 4, "new_trainer": {"a": 1}}"#), vec![own("game", "play"), own("sims", "play"), own("new_trainer", "unknown")]);
+        let d = r#""setting_classes": {"game": "play", "sims": "play", "new_trainer": "trainer", "new_play": "play", "new_py": "python_only", "new_par": "param:new_py", "real_games": "trainer", "deck_every": "python_only"}"#;
+        assert_eq!(st(&format!(r#"{{"game": "t", "sims": 4, "new_trainer": {{"a": 1}}, {d}}}"#)), vec![own("game", "play"), own("sims", "play"), own("new_trainer", "trainer")]);
+        // a new play key, declared or not: unknown (the build cannot play it)
+        let v = st(&format!(r#"{{"game": "t", "new_play": 1, "undeclared": 1, {d}}}"#));
+        assert_eq!(v, vec![own("game", "play"), own("new_play", "unknown"), own("undeclared", "unknown")]);
+        // python_only / param declarations: off while off, unsupported when on
+        assert_eq!(st(&format!(r#"{{"game": "t", "new_py": 0, "new_par": 3, {d}}}"#)), vec![own("game", "play"), own("new_py", "off"), own("new_par", "off")]);
+        assert_eq!(st(&format!(r#"{{"game": "t", "new_py": 1, {d}}}"#))[1], own("new_py", "unsupported"));
+        // a known key declared otherwise (the trainer's zero-core reads it as trainer, this build plays it): refused
+        let x = r#""setting_classes": {"sims": "trainer", "real_games": "play"}"#;
+        assert_eq!(st(&format!(r#"{{"game": "t", "sims": 4, "real_games": 1, "lr": 0.1, {x}}}"#)),
+                   vec![own("game", "play"), own("sims", "unsupported"), own("real_games", "unsupported"), own("lr", "trainer")]);
+        // a malformed declaration: refused (eval jobs too), the rest classified as without one
+        for bad in [r#""setting_classes": ["trainer"]"#, r#""setting_classes": {"x": "sometimes"}"#, r#""setting_classes": {"x": 1}"#] {
+            let c = Settings::parse(&format!(r#"{{"game": "t", "sims": 4, {bad}}}"#)).unwrap();
+            for v in [classify_with(&c, &info, &[], PKG).unwrap(), classify_eval(&c, &info, &[], PKG).unwrap()] {
+                assert_eq!(failures(&v).iter().map(|x| (x.key.as_str(), x.status)).collect::<Vec<_>>(), vec![(CLASSES_KEY, "unsupported")], "{bad}");
+            }
+        }
+        // an eval job: the declared trainer-only key unused, the play one unknown
+        let c = Settings::parse(&format!(r#"{{"game": "t", "eval_sims": 8, "new_trainer": 1, "new_play": 1, {d}}}"#)).unwrap();
+        let v: Vec<(String, &str)> = classify_eval(&c, &info, &[], PKG).unwrap().iter().map(|x| (x.key.clone(), x.status)).collect();
+        assert_eq!(v, vec![own("game", "play"), own("eval_sims", "play"), own("new_trainer", "trainer"), own("new_play", "unknown")]);
+        // the declaration changes no driver
+        let a = crate::settings::selfplay_driver_cfg(&Settings::parse(r#"{"game": "t", "sims": 4}"#).unwrap(), &info, 1, 0);
+        let b = crate::settings::selfplay_driver_cfg(&Settings::parse(&format!(r#"{{"game": "t", "sims": 4, {d}}}"#)).unwrap(), &info, 1, 0);
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
 }

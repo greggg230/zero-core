@@ -5,7 +5,10 @@
 `driver-cfg` prints the self-play `play` settings (the same driver for a run's full settings and for those alone).
 Environment: WORKER_STUB_BUILD (the build id `info` names), WORKER_STUB_LOG (JSON lines: argv), WORKER_STUB_UNKNOWN
 (comma-separated settings this build doesn't know - a build older than them: `unknown`, a failure, exit 1),
-WORKER_STUB_FEATURES (comma-separated: `info`'s `features`; unset: none, a build before rolling jobs)."""
+WORKER_STUB_FEATURES (comma-separated: `info`'s `features`; unset: none, a build before rolling jobs). With the feature
+`setting_classes` (docs/az.md 61) check-config honours the settings' declared classes as zero_worker classify does for
+a key this build doesn't know: declared `trainer` -> unused (`trainer`), anything else or undeclared -> `unknown`; the
+`setting_classes` key itself gets no verdict."""
 import json
 import os
 import re
@@ -34,6 +37,10 @@ def unknown():
     return [k for k in os.environ.get('WORKER_STUB_UNKNOWN', '').split(',') if k]
 
 
+def features():
+    return [f for f in os.environ.get('WORKER_STUB_FEATURES', '').split(',') if f]
+
+
 def main(argv):
     log = os.environ.get('WORKER_STUB_LOG')
     if log:
@@ -42,21 +49,24 @@ def main(argv):
     if argv[:1] == ['info']:
         print(json.dumps({'build_id': os.environ.get('WORKER_STUB_BUILD', ''), 'game': 'zero-toy',
                           'kinds': ['selfplay', 'eval', 'fuzz'], 'aw': 1,
-                          'features': [f for f in os.environ.get('WORKER_STUB_FEATURES', '').split(',') if f]}))
+                          'features': features()}))
         return 0
     if argv[:1] == ['check-config'] and '--json' in argv:
         with open(argv[1], encoding='utf-8') as f:
             cfg = json.load(f)
-        old = [k for k in unknown() if k in cfg]
+        decl = cfg.pop('setting_classes', None) if 'setting_classes' in features() else None
+        took = [k for k in unknown() if k in cfg and (decl or {}).get(k) == 'trainer']
+        old = [k for k in unknown() if k in cfg and k not in took]
         if '--eval' in argv:
             reads = eval_reads()
-            st = lambda k: 'unknown' if k in old else 'play' if k in reads else 'trainer'
+            st = lambda k: 'unknown' if k in old else 'play' if k in reads and k not in took else 'trainer'
             out = {'job': 'eval', 'game': cfg.get('game'), 'eval_reads': reads, 'driver_error': None,
                    'failures': [k for k in reads if k not in cfg and k != 'game'] + old}
         else:
-            st = lambda k: 'unknown' if k in old else 'play' if selfplay_play(k) else 'trainer'
+            st = lambda k: 'unknown' if k in old else 'play' if selfplay_play(k) and k not in took else 'trainer'
             out = {'game': cfg.get('game'), 'driver_error': None, 'failures': old}
-        out['settings'] = [{'key': k, 'status': st(k), 'value': json.dumps(v)} for k, v in cfg.items()]
+        out['settings'] = [{'key': k, 'status': st(k), 'value': json.dumps(v),
+                            'why': 'unknown to this build; declared trainer-only' if k in took else ''} for k, v in cfg.items()]
         print(json.dumps(out))
         return 1 if out['failures'] else 0
     if argv[:1] == ['driver-cfg']:

@@ -40,7 +40,7 @@
 //! <worker> fuzz-chunk <spec.json>                  one chunk of a fuzz job (the supervisor's child)
 //! ```
 //!
-//! `serve`: `hello` first (aw, build_id, game, kinds, zero_onnx, pid, features - `["rolling"]` in a build with
+//! `serve`: `hello` first (aw, build_id, game, kinds, zero_onnx, pid, features - `["rolling", "setting_classes"]` in a build with
 //! self-play: zero-farm PROTOCOL.md 10.5), then one `job` line (`op` job:
 //! lease_id, kind 'selfplay', settings, games, gid_base, seed, model, reference (the self-test's set:
 //! answered before the first batch, `selftest` {provider, max_abs, ok}; a failure is fatal), threads, out_dir;
@@ -1161,7 +1161,7 @@ mod tests {
     fn a_selfplay_build_announces_rolling() {
         static G: &[GameEntry] = &[];
         let w = Worker { games: G, repo: "toy", selfplay: true, fuzz: None, package_settings: &[] };
-        assert_eq!(w.features(), vec!["rolling"]);
+        assert_eq!(w.features(), vec!["rolling", "setting_classes"]);
         let f = Worker { selfplay: false, ..w };
         assert!(f.features().is_empty(), "a fuzz-only build plays no self-play jobs");
     }

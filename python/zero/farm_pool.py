@@ -232,8 +232,11 @@ def play_settings(worker, build_id, cfg, d, log=None):
     its self-play driver reads; never a trainer-only key or a path, which farm-release refuses in a template),
     checked again on their own, and giving the driver every setting gives (`driver-cfg`). A setting the build
     doesn't know but this zero-core classifies trainer-only is logged and left out (zero.farm_h2h.config_refused:
-    a worker build older than the pool's own settings)."""
-    from .farm_h2h import _stderr_log, config_refused, worker_json
+    a worker build older than the pool's own settings). A build announcing the feature `setting_classes` checks the
+    settings with the trainer's declared classes - its own table and the game package's - and the template carries
+    them, signed with it (zero.farm_h2h.with_classes, docs/az.md 61): a game package's new trainer-only setting needs no
+    new worker build."""
+    from .farm_h2h import CLASSES_KEY, _stderr_log, config_refused, log_declared, with_classes, worker_json
     log = log or _stderr_log
     rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
     if rc != 0 or not isinstance(info, dict):
@@ -243,13 +246,17 @@ def play_settings(worker, build_id, cfg, d, log=None):
                          f'{build_id}: pool_worker must be that build\'s executable')
     os.makedirs(d, exist_ok=True)
     full = os.path.join(d, 'settings-run.json')
+    run = with_classes(info, cfg)
     with open(full, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f)
+        json.dump(run, f)
     rc, out, text = worker_json(worker, 'check-config', full, '--json')
     if config_refused(rc, out, build_id, log):
         raise SystemExit(f'the worker refuses the run\'s settings for self-play:\n{text.strip()[-3000:]}')
+    log_declared(out, build_id, log)
     status = {s['key']: s['status'] for s in out.get('settings') or []}
-    play = {k: v for k, v in cfg.items() if status.get(k) == 'play'}
+    play = {k: v for k, v in cfg.items() if status.get(k) == 'play' and k != CLASSES_KEY}
+    if CLASSES_KEY in run:                     # (the declaration signed with the template: docs/az.md 61)
+        play[CLASSES_KEY] = run[CLASSES_KEY]
     path = os.path.join(d, 'settings.json')
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(play, f)

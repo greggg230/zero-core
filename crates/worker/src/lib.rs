@@ -91,10 +91,11 @@ impl Worker {
     }
 
     /// The protocol features `hello` and `info` announce (zero-farm PROTOCOL.md 10.5): `rolling` - rolling self-play
-    /// jobs (`job::Rolling`) - in a build with self-play.
+    /// jobs (`job::Rolling`) - and `setting_classes` - check-config honours a run's declared setting classes
+    /// (`classify`, docs/az.md 61) - in a build with self-play.
     pub fn features(&self) -> Vec<&'static str> {
         if self.selfplay {
-            vec![FEATURE_ROLLING]
+            vec![FEATURE_ROLLING, FEATURE_SETTING_CLASSES]
         } else {
             Vec::new()
         }
@@ -103,6 +104,10 @@ impl Worker {
 
 /// The feature name of rolling self-play jobs (zero-farm PROTOCOL.md 10.5).
 pub const FEATURE_ROLLING: &str = "rolling";
+
+/// The feature name of declared setting classes (`classify::CLASSES_KEY`, docs/az.md 61): a trainer adds its classes
+/// to a run's settings only for a build that announces it.
+pub const FEATURE_SETTING_CLASSES: &str = "setting_classes";
 
 /// The worker binary's entry point (self-play only): `args` from the command line -> the exit status.
 pub fn main(games: &'static [GameEntry], repo: &'static str) -> i32 {

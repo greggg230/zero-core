@@ -76,6 +76,12 @@ class GamePackage:
                     package's defaults may set them, shipped to a remote evaluation's mirror with the
                     rest); a name of the core's, an auxiliary target's or a reader's is refused. The
                     core never reads them: the package's hooks and evaluations do. Default none
+    setting_classes {name: class} for `settings` (docs/az.md 61): how a native farm worker treats each of them -
+                    'play' (its self-play reads it), 'trainer' (unused by a worker: the desktop's), 'python_only'
+                    (play-affecting, Python only: refused unless off) or 'param:<switch>' (a setting of a python_only
+                    switch). The trainer declares them with a run's settings to a worker build that announces the
+                    feature `setting_classes` (zero.farm_h2h.run_setting_classes), so a new trainer-only setting needs
+                    no new worker build. Every name must be one of `settings`. Default none (the worker's own table)
     evals_every     {eval name: run setting}: an extra evaluation (`evals`) with a cadence of its own
                     (docs/az.md 40): it runs only on evaluated iterations that are multiples of the
                     setting's value, and never - silently: no log line, no `extras` key - while the
@@ -144,7 +150,8 @@ class GamePackage:
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
-                 remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None, engine_paths=None):
+                 remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None, engine_paths=None,
+                 setting_classes=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -184,6 +191,14 @@ class GamePackage:
         self.companion = companion
         self.on_fork = on_fork
         self.engine_paths = tuple(engine_paths) if engine_paths else None
+        self.setting_classes = dict(setting_classes or {})
+        for k, c in self.setting_classes.items():
+            if k not in self.settings:
+                raise ValueError(f'{name}: setting_classes names {k!r}, which is not one of the package\'s settings')
+            if not isinstance(c, str) or not (c in ('play', 'trainer', 'python_only') or
+                                              (c.startswith('param:') and c[6:] in self.settings)):
+                raise ValueError(f'{name}: setting_classes of {k!r}: {c!r} is not play, trainer, python_only or '
+                                 f'param:<one of the package\'s settings>')
         for ev, s in self.evals_every.items():
             d = self.settings.get(s)
             if s not in self.settings or not isinstance(d, int) or isinstance(d, bool) or d < 0:

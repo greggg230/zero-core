@@ -387,6 +387,70 @@ def setting_class(key, table):
     return None
 
 
+# the key of a run's settings holding the trainer's declared classes, and the worker feature that honours it (docs/az.md
+# 61; zero_worker classify::CLASSES_KEY, FEATURE_SETTING_CLASSES)
+CLASSES_KEY = 'setting_classes'
+FEATURE_SETTING_CLASSES = 'setting_classes'
+
+
+def declared_class(key, table, package=None):
+    """A setting's class as a declaration names it (`play`, `trainer`, `python_only`, `param:<switch>`): the game
+    package's own (`package`: {name: class}, GamePackage.setting_classes), else this zero-core's table (its entry, else
+    the first pattern it matches), else None."""
+    if package and key in package:
+        return package[key]
+    e = table['keys'].get(key)
+    if isinstance(e, dict):
+        c = e.get('class')
+        return f'param:{e.get("of")}' if c == 'param' else c
+    for p in table.get('patterns') or []:
+        if key.startswith(p.get('prefix', '')) and key.endswith(p.get('suffix', '')):
+            return p.get('class')
+    return None
+
+
+def run_setting_classes(cfg, table=None, package=None):
+    """The declared classes of a run's settings (docs/az.md 61): {key: class} for every key of `cfg` that this
+    zero-core's settings table (`load_run_settings`, or `table`) or the active game package's
+    `GamePackage.setting_classes` (or `package`) classifies; a key neither knows is left out (a worker that doesn't know
+    it either refuses it, as before). The trainer adds it to the settings a worker build checks - and to the job
+    template the run's definition signs - when the build announces the feature `setting_classes`: the build then takes
+    a key it doesn't know but the declaration calls trainer-only as unused instead of refusing the run."""
+    table = load_run_settings() if table is None else table
+    if table is None:
+        raise SystemExit(f'no settings table ({RUN_SETTINGS}): the declared setting classes need this zero-core\'s source')
+    if package is None:
+        from . import package as P
+        try:
+            package = dict(getattr(P.active(), 'setting_classes', None) or {})
+        except Exception:            # (no active game package: the core's table alone)
+            package = {}
+    out = {}
+    for k in cfg:
+        if k == CLASSES_KEY:
+            continue
+        c = declared_class(k, table, package)
+        if c is not None:
+            out[k] = c
+    return out
+
+
+def with_classes(info, cfg):
+    """`cfg` with its declared classes (`CLASSES_KEY`) when the worker build's `info` announces the feature
+    `setting_classes`, else `cfg` itself (an older build: its check-config refuses a key it doesn't know, as before)."""
+    if FEATURE_SETTING_CLASSES not in ((info or {}).get('features') or []):
+        return cfg
+    return dict({k: v for k, v in cfg.items() if k != CLASSES_KEY}, **{CLASSES_KEY: run_setting_classes(cfg)})
+
+
+def log_declared(out, build_id, log):
+    """Log each setting a worker build doesn't know and took on the declared classes' word (classify.rs: its why
+    starts "unknown to this build")."""
+    for s in (out or {}).get('settings') or []:
+        if isinstance(s, dict) and str(s.get('why', '')).startswith('unknown to this build'):
+            log(f'worker build {build_id} doesn\'t know setting {s.get("key")}: {s.get("status")} by the declared classes')
+
+
 def config_refused(rc, out, build_id, log, table=None):
     """Does a worker build's `check-config --json` answer (exit status `rc`, its JSON `out`) on a run's FULL settings
     refuse them? A failure whose key the worker calls "unknown" but this zero-core's settings table
@@ -422,7 +486,8 @@ def play_settings(worker, build_id, cfg, d, log=None):
     in a template), checked again by the worker on their own, and giving the seats every setting gives
     (`Run.nn_seat`). `worker` must be that build's executable (its `info` names `build_id` and the kind eval). A
     setting the build doesn't know but this zero-core classifies trainer-only is logged and left out
-    (`config_refused`)."""
+    (`config_refused`). A build announcing `setting_classes` checks the settings with the declared classes and the
+    template carries them (`with_classes`, docs/az.md 61)."""
     from . import farm_eval as FE
     log = log or _stderr_log
     rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
@@ -433,16 +498,20 @@ def play_settings(worker, build_id, cfg, d, log=None):
                          f'build {build_id}: give --worker the signed build\'s executable')
     os.makedirs(d, exist_ok=True)
     full = os.path.join(d, 'settings-run.json')
+    run = with_classes(info, cfg)
     with open(full, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f)
+        json.dump(run, f)
     rc, out, text = worker_json(worker, 'check-config', full, '--eval', '--json')
     if config_refused(rc, out, build_id, log):
         raise SystemExit(f'the worker refuses the settings for an eval job:\n{text.strip()[-3000:]}')
+    log_declared(out, build_id, log)
     status = {s['key']: s['status'] for s in out.get('settings') or []}
-    play = {k: v for k, v in cfg.items() if status.get(k) == 'play'}
+    play = {k: v for k, v in cfg.items() if status.get(k) == 'play' and k != CLASSES_KEY}
     missing = sorted(set(out.get('eval_reads') or []) - set(play))
     if missing:
         raise SystemExit(f'the settings lack {missing}, which an eval job reads')
+    if CLASSES_KEY in run:                     # (the declaration signed with the template: docs/az.md 61)
+        play[CLASSES_KEY] = run[CLASSES_KEY]
     path = os.path.join(d, 'settings.json')
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(play, f)

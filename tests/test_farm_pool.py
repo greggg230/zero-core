@@ -440,6 +440,64 @@ def test_play_settings_of_a_worker_older_than_trainer_settings(tmp_path, monkeyp
             FP.play_settings(worker, BUILD, c, str(tmp_path / 'bad'), lines.append)
 
 
+def test_play_settings_with_declared_setting_classes(tmp_path, monkeypatch):
+    """docs/az.md 61: a game package's new trainer-only setting (GamePackage.setting_classes) that a worker build doesn't
+    know. A build without the feature `setting_classes` (an older one) refuses it, as before - the core's table doesn't
+    know a package setting; a build announcing the feature gets the run's declared classes with the settings: the key
+    declared trainer-only is unused (logged), the template is a current build's plus the declaration (signed with it);
+    an unknown key declared play, or one declared nothing, still refuses."""
+    from zero import farm_def as FD, farm_h2h as FH, package as P
+
+    class Pkg:
+        setting_classes = {'pkg_new_trainer': 'trainer', 'pkg_new_play': 'play'}
+    monkeypatch.setattr(P, 'active', lambda: Pkg())
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker_stub.py')
+    monkeypatch.setenv('WORKER_STUB_BUILD', BUILD)
+    cfg = dict(DEFAULTS, game='toy', players=[2], spec='', pkg_new_trainer={'every': 4})
+    lines = []
+    monkeypatch.delenv('WORKER_STUB_UNKNOWN', raising=False)
+    monkeypatch.delenv('WORKER_STUB_FEATURES', raising=False)
+    base = FP.play_settings(worker, BUILD, cfg, str(tmp_path / 'base'), lines.append)
+    assert FH.CLASSES_KEY not in base and lines == []
+    monkeypatch.setenv('WORKER_STUB_UNKNOWN', 'pkg_new_trainer')
+    with pytest.raises(SystemExit, match='refuses the run\'s settings'):            # an older build: as before
+        FP.play_settings(worker, BUILD, cfg, str(tmp_path / 'old'), lines.append)
+    monkeypatch.setenv('WORKER_STUB_FEATURES', 'rolling,setting_classes')
+    new = FP.play_settings(worker, BUILD, cfg, str(tmp_path / 'new'), lines.append)
+    decl = new.pop(FH.CLASSES_KEY)
+    assert new == base and lines == [f'worker build {BUILD} doesn\'t know setting pkg_new_trainer: trainer by the declared classes']
+    assert decl['pkg_new_trainer'] == 'trainer' and decl['game'] == 'play' and set(decl) <= set(cfg)
+    assert decl == FH.run_setting_classes(cfg) and all(isinstance(v, str) for v in decl.values())
+    FD.check_no_paths(dict(new, **{FH.CLASSES_KEY: decl}), 'settings')      # (a template farm-release would sign)
+    for c, unknown in ((dict(cfg, pkg_new_play=1), 'pkg_new_trainer,pkg_new_play'), (dict(cfg, no_such_setting=1), 'no_such_setting')):
+        monkeypatch.setenv('WORKER_STUB_UNKNOWN', unknown)
+        with pytest.raises(SystemExit, match='refuses the run\'s settings'):
+            FP.play_settings(worker, BUILD, c, str(tmp_path / 'bad'), lines.append)
+    # the eval template the same way (zero.farm_h2h.play_settings)
+    monkeypatch.setenv('WORKER_STUB_UNKNOWN', 'pkg_new_trainer')
+    ev = FH.play_settings(worker, BUILD, dict(cfg, eval_spec='x'), str(tmp_path / 'ev'), lines.append)
+    assert ev[FH.CLASSES_KEY]['pkg_new_trainer'] == 'trainer' and 'pkg_new_trainer' not in ev
+
+
+def test_run_setting_classes():
+    """The declaration: the package's classes first, then the core table's (a param named with its switch), a pattern's
+    class for an auxiliary target's setting, keys neither knows left out; GamePackage refuses a class of a setting it
+    doesn't have or a class that is none."""
+    from zero import farm_h2h as FH
+    from zero.package import GamePackage
+    table = {'keys': {'sims': {'class': 'play'}, 'lr': {'class': 'trainer'}, 'lg': {'class': 'python_only'},
+                      'lg_pool': {'class': 'param', 'of': 'lg'}},
+             'patterns': [{'prefix': 'aux_', 'suffix': '_w', 'class': 'play'}]}
+    got = FH.run_setting_classes({'sims': 1, 'lr': 2, 'lg': 0, 'lg_pool': 3, 'aux_deck_w': 0.5, 'pk': 1, 'zz': 1,
+                                  FH.CLASSES_KEY: {'stale': 'play'}}, table, {'pk': 'trainer'})
+    assert got == {'sims': 'play', 'lr': 'trainer', 'lg': 'python_only', 'lg_pool': 'param:lg', 'aux_deck_w': 'play',
+                   'pk': 'trainer'}
+    GamePackage('p', 'P', '.', settings={'a': 0, 'b': 1}, setting_classes={'a': 'trainer', 'b': 'param:a'})
+    for bad in ({'c': 'trainer'}, {'a': 'sometimes'}, {'a': 'param:zz'}):
+        with pytest.raises(ValueError, match='setting_classes'):
+            GamePackage('p', 'P', '.', settings={'a': 0, 'b': 1}, setting_classes=bad)
+
+
 def test_the_pool_follows_the_phase_spec_of_the_game_package(pool, monkeypatch):
     """docs/az.md 52: an iteration whose phase spec (the game package's selfplay_specs hook, through Run.selfplay_spec)
     differs from the run's gets a definition whose self-play template plays it; the records played with it are

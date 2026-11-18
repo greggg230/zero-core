@@ -8538,3 +8538,55 @@ driver, the bindings (the coin at floor = p_full; the share; the stats only with
 rolling toy run's `budget` metrics, remote workers drawing as this machine and an older checkout refused by its hello
 (`budget` fingerprint). MTG Zero: its farm compatibility smoke (tools/farm_compat.py) with the rule on - the native
 worker vs the Python remote worker and its records replayed by the trainer, byte-identical (its ENGINE.md 189).
+
+## 61. Declared setting classes: a trainer-only setting needs no new worker build (`GamePackage.setting_classes`, the settings key `setting_classes`, the worker feature `setting_classes`; MTG Zero's farm-release work, 2026-11-17)
+
+**Why.** A farm run's self-play template holds the settings the worker build's own `check-config` calls `play`
+(`farm_pool.play_settings`, 45). A build refuses a run whose settings hold a key it doesn't know, even a trainer-only
+one: 57's `config_refused` lets the pool drop such a key when *this* zero-core's table (`run_settings.json`) calls it
+trainer, but a game package's own settings (`GamePackage.settings`, 40) are in no zero-core table. MTG Zero's
+`forced_find_schedule` (its ENGINE.md 180.5, 181.5) was a trainer-only package setting, and every farm run on a commit
+with it needed a new worker build, a CUDA re-sign and the farm gates first. The worker could not tell trainer-only from
+play-affecting; the trainer can.
+
+**What.**
+
+* **The declaration.** `zero.farm_h2h.run_setting_classes(cfg)` -> {key: class} for every key of a run's settings that
+  the trainer classifies: the active game package's `GamePackage.setting_classes` first (new: {name: class} for its
+  `settings`, checked at construction - a name that is not one of its settings, or a class that is none, is refused),
+  then this zero-core's table (an entry's class, a `param` as `param:<switch>`, else a pattern's: `aux_<t>_w` play,
+  `reader_<t>` trainer). Classes: `play`, `trainer`, `python_only`, `param:<switch>`. A key neither knows is left out.
+* **Where it goes.** When the worker build's `info` announces the feature `setting_classes` (new; `hello` too, next to
+  `rolling`), `play_settings` (the pool's self-play template and `farm_h2h`'s eval template) gives the worker's
+  `check-config` the run's settings plus `"setting_classes": {...}`, and the template's settings carry the same
+  declaration: the run's definition signs it with the settings (zero-farm PROTOCOL 7). A build without the feature gets
+  exactly what it got before (no key, `config_refused` as in 57).
+* **The worker** (`zero_worker::classify`; `CLASSES_KEY`). `setting_classes` is not a setting (no verdict; the driver
+  never reads it). For a key the build does **not** know, the declared class stands in for its table: `trainer` is
+  unused; `python_only` is off while its value is falsy (else unsupported); `param:<switch>` is off; **`play` stays
+  unknown** - the build cannot play a setting it doesn't implement - and so does a key with no declared class. For a
+  key the build **does** know, a declared class that differs from the build's own is unsupported (the trainer's
+  zero-core reads the setting otherwise: the build is too old or too new for it). A declaration that is not an object of
+  class names is unsupported - also for an eval job, whose other non-reads are trainer (44.2). The verdict's `why` of a
+  key taken on the declaration's word starts "unknown to this build"; the pool logs each ("worker build X doesn't know
+  setting K: trainer by the declared classes").
+* **The protocol is unchanged.** The declaration is a key inside the template's `settings`, which agents and the
+  coordinator keep as an opaque object (PROTOCOL 7: only path-like text is refused, and class names have none), and
+  agents pass it to the worker as it is. No definition field, no agent change, no `min_agent` bump. The template is
+  checked by the default build's executable; a run's alternates (rev 11) are that executable signed for another pack,
+  so they announce the same features.
+
+**What it buys.** Once a worker build has the feature, a new trainer-only setting of zero-core or of the game package -
+classified in `run_settings.json` or `GamePackage.setting_classes` - reaches farm runs without a new build. A new play
+setting still needs one (the build must implement it), as does a changed class.
+
+**Tests.** `cargo test -p zero_worker` (`classify::tests::declared_classes`): an unknown key declared trainer-only
+accepted, the same key undeclared refused (an older trainer), declared play refused, python_only / param off while off
+and unsupported when on, a known key declared otherwise refused, three malformed declarations refused for self-play and
+eval jobs, an eval job's reading, the driver unchanged by the declaration; `proto` tests: the features. pytest
+`tests/test_farm_pool.py::test_play_settings_with_declared_setting_classes` (the worker stub with and without the
+feature: an older build refuses a package's trainer-only key as before; a build with the feature takes it, logs it,
+and the template is a current build's plus the declaration, path-free; an unknown key declared play, or undeclared,
+refused; the eval template the same) and `test_run_setting_classes` (the package first, the table's param and pattern
+classes, unknown keys left out, GamePackage's refusals). The stub (`tests/worker_stub.py`) honours a declaration with
+`WORKER_STUB_FEATURES=setting_classes`. MTG Zero (its ENGINE.md 196): the real worker with and without declarations.
