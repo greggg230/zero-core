@@ -587,6 +587,7 @@ mod os {
     use std::process::Child;
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;
+        #[cfg(not(target_os = "macos"))]
         fn sysconf(name: i32) -> i64;
     }
     #[cfg(target_os = "linux")]

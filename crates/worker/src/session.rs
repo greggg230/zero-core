@@ -618,6 +618,11 @@ fn builder(rt: &Runtime, b: &Binding, threads: usize, spinning: bool, log_id: Op
     for (k, v) in ort_config_env() {
         sb = sb.with_config_entry(k, v).map_err(oerr)?;
     }
+    // (a diagnostic too: ZERO_ORT_PROFILE=<path prefix> - ONNX Runtime's per-node profile of every session, written
+    // when the session ends)
+    if let Some(p) = std::env::var_os("ZERO_ORT_PROFILE").filter(|p| !p.is_empty()) {
+        sb = sb.with_profiling(p).map_err(oerr)?;
+    }
     if let Some(id) = log_id {
         sb = sb.with_log_id(id).map_err(oerr)?;
         sb = sb.with_log_level(LogLevel::Verbose).map_err(oerr)?;
