@@ -118,6 +118,14 @@ struct Tally {
     value_only: u64,
     /// Games aborted by the row limit (docs/search.md 2.15).
     row_aborts: u64,
+    /// The playout cap (docs/search.md 3.21; `DriverStats::cap_decisions` ...).
+    cap_decisions: u64,
+    cap_full: u64,
+    cap_sims: u64,
+    cap_g_e6: u64,
+    cap_f_e6: u64,
+    cap_changed: u64,
+    cap_targets: u64,
 }
 
 fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WScratch<G>) -> Result<(), String> {
@@ -294,6 +302,15 @@ fn run_chunk<G: SearchGame>(sh: &Shared<G>, g: usize, c: usize, scratch: &mut WS
     }
     if n.teacher > 0 {
         k.teacher_decisions.fetch_add(n.teacher, Ordering::Relaxed);
+    }
+    if n.cap_decisions > 0 {
+        k.cap_decisions.fetch_add(n.cap_decisions, Ordering::Relaxed);
+        k.cap_full.fetch_add(n.cap_full, Ordering::Relaxed);
+        k.cap_sims.fetch_add(n.cap_sims, Ordering::Relaxed);
+        k.cap_g_e6.fetch_add(n.cap_g_e6, Ordering::Relaxed);
+        k.cap_f_e6.fetch_add(n.cap_f_e6, Ordering::Relaxed);
+        k.cap_changed.fetch_add(n.cap_changed, Ordering::Relaxed);
+        k.cap_targets.fetch_add(n.cap_targets, Ordering::Relaxed);
     }
     if n.value_only > 0 {
         k.value_only_decisions.fetch_add(n.value_only, Ordering::Relaxed);
@@ -512,6 +529,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     slot.sims = 0;
     slot.target = None;
     slot.full = true;
+    slot.budget_pending = false;
     slot.minor = false;
     slot.belief = false;
     slot.decisions = 0;
@@ -723,6 +741,10 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
             } else {
                 start(slot, seat, p);
             }
+        }
+        if slot.budget_pending && slot.sims >= slot.target.unwrap() {
+            // (docs/search.md 3.21: the fresh root is evaluated; its priors choose the budget)
+            choose_budget(slot, seat, p);
         }
         if slot.sims >= slot.target.unwrap() {
             n.minor += slot.minor as u64;
@@ -1244,8 +1266,18 @@ fn push_belief_row<G: SearchGame>(buf: &mut LeafBuf, live: &G, p: usize, n: usiz
 
 /// Start the search for the pending decision of seat `p` (legal actions in `slot.legal`).
 fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
-    slot.full = seat.sims_fast.is_none() || slot.rng.unit() < seat.p_full;
-    slot.target = Some(if slot.full { seat.sims } else { seat.sims_fast.unwrap() });
+    // the playout cap's rule by the prior's uncertainty (docs/search.md 3.21): the coin is drawn here, where the
+    // random rule draws it (the same stream position), and compared once the root's priors are known (`choose_budget`)
+    let adaptive = seat.p_full_rule != FullRule::Random && seat.sims_fast.is_some();
+    if adaptive {
+        slot.cap_draw = slot.rng.unit();
+        slot.full = false;
+        slot.target = Some(1);
+    } else {
+        slot.full = seat.sims_fast.is_none() || slot.rng.unit() < seat.p_full;
+        slot.target = Some(if slot.full { seat.sims } else { seat.sims_fast.unwrap() });
+        slot.cap_f = seat.p_full;
+    }
     let game = slot.game.as_ref().unwrap();
     // a minor decision (self-play seats with sims_minor): its own budget, never recorded (the
     // playout-cap draw above is made all the same, so the streams do not depend on it)
@@ -1254,6 +1286,7 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
         slot.full = false;
         slot.target = seat.sims_minor;
     }
+    slot.budget_pending = adaptive && !slot.minor;
     // a lighter decision class (`SearchGame::sims_divisor`): the drawn budget divided
     let div = game.sims_divisor();
     if div > 1 {
@@ -1278,6 +1311,17 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
             }
         }
     }
+    if slot.budget_pending {
+        // (docs/search.md 3.21: a reused root's priors are known now; a fresh root's after its own evaluation, the
+        // search's one simulation until then - no noise, root floor or full search's belief before the budget)
+        let t = slot.trees[p].as_mut().unwrap();
+        if t.expanded(t.root) {
+            choose_budget(slot, seat, p);
+        } else {
+            t.set_root_min(0);
+        }
+        return;
+    }
     // the root minimum visits of this search (docs/search.md 3.5; 0 = off: the tree's walks
     // are PUCT's alone; a reused root's visits count toward the floor)
     let k = root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), slot.target.unwrap());
@@ -1301,11 +1345,35 @@ fn start<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     }
 }
 
+/// The budget of a decision under `FullRule::PriorUncertainty` (docs/search.md 3.21), its root expanded: full when
+/// the coin drawn at `start` is below the chance `full_share` of the root's priors P0 (before any noise); then what
+/// `start` sets by the draw - the budget (the game's divisor applied), the belief, the root noise of a full search
+/// (after the root's evaluation, as `start` adds it to a reused root), the root floor.
+fn choose_budget<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
+    slot.budget_pending = false;
+    let t = slot.trees[p].as_mut().unwrap();
+    let r = t.root;
+    slot.cap_f = seat.p_full_rule.full_share(seat.p_full, &t.priors0(r));
+    slot.full = slot.cap_draw < slot.cap_f;
+    let mut target = if slot.full { seat.sims } else { seat.sims_fast.unwrap() };
+    let div = slot.game.as_ref().unwrap().sims_divisor();
+    if div > 1 {
+        target = (target / div).max(1);
+    }
+    slot.target = Some(target);
+    slot.belief = seat.takes_belief(slot.full);
+    if seat.selfplay && slot.full && seat.root_search == RootSearch::Puct {
+        t.add_noise(r, seat.alpha, seat.eps, &mut slot.noise_rng);
+    }
+    t.set_root_min(root_floor(seat.root_min_visits, seat.root_min_visits_max_actions, slot.full, slot.legal.len(), target));
+}
+
 /// Start a branch's deviation search of seat `p`'s decision (docs/search.md 2.11): the root's own
 /// evaluation alone (one simulation; none when a reused root is expanded already) for the network's
 /// priors - no noise, floor, Gumbel schedule or belief, never recorded.
 fn start_dev<G: SearchGame>(slot: &mut Slot<G>, seat: &NnSeat, p: usize) {
     slot.full = false;
+    slot.budget_pending = false;
     slot.minor = false;
     slot.belief = false;
     slot.dev_now = true;
@@ -1407,6 +1475,15 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
     let p0 = tree.priors0(root);
     let acts = tree.acts(root);
     let tot: u64 = nv.iter().map(|&x| x as u64).sum();
+    // the playout cap's counters (docs/search.md 3.21): every capped decision (sims_fast, not minor)
+    let capped = seat.sims_fast.is_some() && !slot.minor;
+    if capped {
+        n.cap_decisions += 1;
+        n.cap_full += slot.full as u64;
+        n.cap_sims += slot.target.unwrap_or(0) as u64;
+        n.cap_g_e6 += (seat.p_full_rule.g_of(&p0) * 1e6).round() as u64;
+        n.cap_f_e6 += (slot.cap_f.clamp(0.0, 1.0) * 1e6).round() as u64;
+    }
     let i = if nv.is_empty() {
         0
     } else if let Some(i) = tree.gumbel_choose() {
@@ -1457,6 +1534,12 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                 PolicyTarget::Visits => p0.clone(),
                 PolicyTarget::CompletedQ { c_visit, c_scale, prior_w } => tree.cq_target_w(root, c_visit, c_scale, prior_w),
             };
+            if capped && !pi.is_empty() && pi.len() == p0.len() {
+                // (did the search move the target's argmax off the prior's? the first maximum of each)
+                let am = |v: &[f32]| (0..v.len()).fold(0, |b, k| if v[k] > v[b] { k } else { b });
+                n.cap_targets += 1;
+                n.cap_changed += (am(&pi) != am(&p0)) as u64;
+            }
             (acts, pi)
         };
         let mut x = vec![0.0f32; G::NUM_FEATURES];
@@ -1758,6 +1841,7 @@ fn finish_episode<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &m
             slot.fail_log.push(TraceStep::Next(loser.map(|l| l as u8)));
             slot.game = Some(ng);
             slot.full = true;
+            slot.budget_pending = false;
             slot.minor = false;
             slot.belief = false;
             slot.decisions = 0;
@@ -1847,6 +1931,7 @@ fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut
     slot.sims = 0;
     slot.target = None;
     slot.full = true;
+    slot.budget_pending = false;
     slot.minor = false;
     slot.belief = false;
     slot.decisions = fp.decisions;

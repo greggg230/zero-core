@@ -149,7 +149,8 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
             view_sample_target='next_q', belief_tilt=0.0, belief_clip=None, belief_mix=0.0, belief_fast=False,
             belief_tilts=None, root_search='puct', gumbel_m=16, gumbel_scale=1.0, gumbel_c_visit=None, gumbel_c_scale=None,
             eval_cache=0, resign_t=0.0, resign_k=5, resign_noresign=0.1, cq_prior_w=1.0, infoset_merge=False,
-            value_choice_worlds=0, value_choice_temp=0.0):
+            value_choice_worlds=0, value_choice_temp=0.0, p_full_rule='random', p_full_floor=0.05, p_full_shape='linear',
+            p_full_u_mean=None):
     """A network seat dict. policy_target: training target of its recorded decisions, 'visits'
     (the root visit distribution) | 'cq' (Gumbel AlphaZero's completed-Q target with cq_c_visit,
     cq_c_scale; docs/search.md 3.1). sims_minor: simulations of the game's minor decisions
@@ -187,7 +188,11 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     (docs/search.md 3.16; leaf_value_view 'root'; an evaluation or a self-play seat; False = off: no key, the seat
     of before). value_choice_worlds: value choices (docs/search.md 3.17): at a decision the game marks
     (`SearchGame::value_choice`) each option is valued by a one-ply lookahead over this many worlds and chosen at the
-    temperature value_choice_temp (0: the best mean value); never recorded (0 = off: no keys, the seat of before)."""
+    temperature value_choice_temp (0: the best mean value); never recorded (0 = off: no keys, the seat of before).
+    p_full_rule: how the playout cap picks its full searches (docs/search.md 3.21): 'random' (no keys, the seat of
+    before: a coin of probability p_full) | 'prior_uncertainty' (full with probability min(1, p_full_floor + (p_full -
+    p_full_floor) g(u) / p_full_u_mean), u = 1 - max of the root's priors, g the p_full_shape 'linear' | 'sqrt' |
+    'square'; zero/budget.py)."""
     from .mcts import (check_belief, check_belief_tilts, check_cq_prior_w, check_leaf_view, check_merge, check_root_min,
                        check_root_search, check_select, check_select_transform, select_transform)
     check_select(select, select_min_visits)
@@ -211,6 +216,10 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
     check_values(resign_t, resign_k, resign_noresign, what='resign')
     if resign_t and not selfplay:
         raise ValueError(f'resign_t {resign_t!r}: a self-play seat only (evaluations play their games out)')
+    from .budget import check_values as check_budget
+    check_budget(p_full_rule, p_full_floor, p_full_shape, p_full_u_mean, p_full, sims_fast)
+    if p_full_rule != 'random' and root_search == 'gumbel':
+        raise ValueError("p_full_rule 'prior_uncertainty': not built for root_search 'gumbel'")
     d = dict(key=key, sims=sims, c_puct=c_puct, selfplay=selfplay, alpha=alpha, eps=eps, temp_moves=temp_moves,
              sims_fast=sims_fast, p_full=p_full, chance_k=chance_k, margin_w=margin_w, redet=redet)
     sel = select_transform(cq_c_visit, cq_c_scale, select_c_visit, select_c_scale)
@@ -251,6 +260,9 @@ def nn_seat(key='m', sims=64, c_puct=1.0, selfplay=False, alpha=0.3, eps=0.25, t
         d['infoset_merge'] = True
     if value_choice_worlds:
         d.update(value_choice_worlds=int(value_choice_worlds), value_choice_temp=float(value_choice_temp))
+    if p_full_rule != 'random':
+        d.update(p_full_rule=p_full_rule, p_full_floor=float(p_full_floor), p_full_shape=p_full_shape,
+                 p_full_u_mean=float(p_full_u_mean))
     return d
 
 

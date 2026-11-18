@@ -1181,6 +1181,16 @@ impl PySearchDriver {
             // (docs/search.md 3.20: only a game with value-only decisions; every other stats dict as before)
             d.set_item("value_only_decisions", s.value_only_decisions)?;
         }
+        if s.cap_decisions > 0 {
+            // the playout cap (docs/search.md 3.21: a seat with sims_fast; a driver without one, as before)
+            d.set_item("cap_decisions", s.cap_decisions)?;
+            d.set_item("cap_full", s.cap_full)?;
+            d.set_item("cap_sims", s.cap_sims)?;
+            d.set_item("cap_g_e6", s.cap_g_e6)?;
+            d.set_item("cap_f_e6", s.cap_f_e6)?;
+            d.set_item("cap_changed", s.cap_changed)?;
+            d.set_item("cap_targets", s.cap_targets)?;
+        }
         if self.rows.tails {
             // variable-length rows (docs/search.md 2.15; only a game with tail segments)
             d.set_item("tail_rows", s.tail_rows)?;

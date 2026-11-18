@@ -218,6 +218,22 @@ fn value_choice_keys(c: &Settings, pre: &str) -> Result<(PyJson, PyJson), String
     Ok((PyJson::Int(w), PyJson::Float(py_float(&tk, c.get_or_falsy(&tk, &zf))?)))
 }
 
+/// `budget.seat_keys(c)` -> (rule, floor, shape, u_mean) as `games.nn_seat` gets them (rule 'random': off, the
+/// others unread).
+fn budget_keys(c: &Settings) -> Result<(PyJson, PyJson, PyJson, PyJson), String> {
+    let random = PyJson::Str("random".into());
+    let rule = c.get_or_falsy("p_full_rule", &random).clone();
+    if is_str(&rule, "random") {
+        return Ok((random, PyJson::Float(0.05), PyJson::Str("linear".into()), PyJson::Null));
+    }
+    Ok((
+        rule,
+        PyJson::Float(py_float("p_full_floor", c.get_or("p_full_floor", &PyJson::Float(0.05)))?),
+        c.get_or("p_full_shape", &PyJson::Str("linear".into())).clone(),
+        PyJson::Float(py_float("p_full_u_mean", c.req("p_full_u_mean")?)?),
+    ))
+}
+
 /// `games.nn_seat`'s arguments (Python values; the names its keywords).
 struct SeatArgs {
     key: String,
@@ -257,6 +273,7 @@ struct SeatArgs {
     cq_prior_w: PyJson,
     infoset_merge: bool,
     value_choice: (PyJson, PyJson),
+    budget: (PyJson, PyJson, PyJson, PyJson),
 }
 
 /// The self-play seat of a run's settings, as the seat dict Python builds
@@ -311,6 +328,7 @@ pub fn selfplay_seat(c: &Settings, key: &str) -> Result<Value, String> {
         cq_prior_w: g("cq_prior_w", PyJson::Float(1.0)),
         infoset_merge: truthy(c.get_or("selfplay_infoset_merge", &zero)),
         value_choice: value_choice_keys(c, "selfplay")?,
+        budget: budget_keys(c)?,
     })
 }
 
@@ -357,6 +375,7 @@ pub fn eval_seat(c: &Settings, key: &str, sims: &PyJson) -> Result<Value, String
         cq_prior_w: PyJson::Float(1.0),
         infoset_merge: truthy(c.get_or("eval_infoset_merge", &zero)),
         value_choice: value_choice_keys(c, "eval")?,
+        budget: (PyJson::Str("random".into()), PyJson::Float(0.05), PyJson::Str("linear".into()), PyJson::Null),
     })
 }
 
@@ -476,6 +495,35 @@ fn nn_seat(a: SeatArgs) -> Result<Value, String> {
     if truthy(resign_t) && !a.selfplay {
         return Err(format!("resign_t {rt}: a self-play seat only (evaluations play their games out)"));
     }
+    // budget.check_values (docs/search.md 3.21)
+    let (b_rule, b_floor, b_shape, b_mean) = (&a.budget.0, &a.budget.1, &a.budget.2, &a.budget.3);
+    if !(is_str(b_rule, "random") || is_str(b_rule, "prior_uncertainty")) {
+        return Err(format!("p_full_rule {}: one of ('random', 'prior_uncertainty')", b_rule.dumps()));
+    }
+    let budget_on = is_str(b_rule, "prior_uncertainty");
+    if budget_on {
+        if !truthy(&a.sims_fast) {
+            return Err("p_full_rule 'prior_uncertainty': a playout-cap seat's (sims_fast)".into());
+        }
+        if !(is_str(b_shape, "linear") || is_str(b_shape, "sqrt") || is_str(b_shape, "square")) {
+            return Err(format!("p_full_shape {}: one of ('linear', 'sqrt', 'square')", b_shape.dumps()));
+        }
+        let pf = num_val(&a.p_full);
+        if !is_num(&a.p_full) || !(pf > 0.0 && pf <= 1.0) {
+            return Err(format!("p_full {}: in (0, 1] with p_full_rule 'prior_uncertainty'", a.p_full.dumps()));
+        }
+        let fl = num_val(b_floor);
+        if !(0.0..=pf).contains(&fl) {
+            return Err(format!("p_full_floor {}: a share in [0, p_full {pf}] (every decision's least chance of a full search)", b_floor.dumps()));
+        }
+        let um = num_val(b_mean);
+        if !(um.is_finite() && um > 0.0) {
+            return Err(format!("p_full_u_mean {}: the mean > 0 of g(u) over the self-play decisions (measure it: selfplay.budget.g_mean; docs/az.md 60)", b_mean.dumps()));
+        }
+        if is_str(root_search, "gumbel") {
+            return Err("p_full_rule 'prior_uncertainty': not built for root_search 'gumbel'".into());
+        }
+    }
 
     // ---- the dict
     let mut d = Map::new();
@@ -565,6 +613,12 @@ fn nn_seat(a: SeatArgs) -> Result<Value, String> {
     if truthy(vc_worlds) {
         d.insert("value_choice_worlds".into(), Value::from(py_int("value_choice_worlds", vc_worlds)? as i64));
         d.insert("value_choice_temp".into(), f(num_val(vc_temp))?);
+    }
+    if budget_on {
+        d.insert("p_full_rule".into(), val(b_rule)?);
+        d.insert("p_full_floor".into(), f(num_val(b_floor))?);
+        d.insert("p_full_shape".into(), val(b_shape)?);
+        d.insert("p_full_u_mean".into(), f(num_val(b_mean))?);
     }
     Ok(Value::Object(d))
 }
@@ -851,6 +905,33 @@ mod tests {
         assert!(selfplay_driver_cfg(&c, &info(), 3, 1).unwrap().aux);
         c.set("aux_deck_w", PyJson::Float(0.0));
         assert!(selfplay_driver_cfg(&c, &info(), 3, 1).is_err());
+    }
+
+    #[test]
+    fn the_playout_cap_rule_as_python() {
+        // budget.seat_keys (docs/search.md 3.21): 'random' adds nothing (the seat of before), the rule its four keys
+        let mut c = base();
+        c.set("p_full_rule", PyJson::Str("random".into()));
+        c.set("p_full_u_mean", PyJson::Float(0.0));
+        assert_eq!(selfplay_seat(&c, "m").unwrap(), selfplay_seat(&base(), "m").unwrap());
+        c.set("p_full_rule", PyJson::Str("prior_uncertainty".into()));
+        assert!(selfplay_seat(&c, "m").unwrap_err().contains("p_full_u_mean"));
+        c.set("p_full_u_mean", PyJson::Float(0.17));
+        let s = selfplay_seat(&c, "m").unwrap();
+        let o = s.as_object().unwrap();
+        assert_eq!((o["p_full_rule"].as_str(), o["p_full_floor"].as_f64(), o["p_full_shape"].as_str(), o["p_full_u_mean"].as_f64()), (Some("prior_uncertainty"), Some(0.05), Some("linear"), Some(0.17)));
+        assert!(selfplay_driver_cfg(&c, &info(), 3, 1).is_ok());
+        c.set("p_full_shape", PyJson::Str("sqrt".into()));
+        c.set("p_full_floor", PyJson::Int(0));
+        let o = selfplay_seat(&c, "m").unwrap();
+        assert_eq!((o["p_full_shape"].as_str(), o["p_full_floor"].as_f64()), (Some("sqrt"), Some(0.0)));
+        for (k, v, what) in [("p_full_floor", "0.5", "p_full_floor"), ("p_full_shape", "\"cubic\"", "p_full_shape"), ("p_full_rule", "\"coin\"", "p_full_rule"), ("selfplay_root_search", "\"gumbel\"", "gumbel")] {
+            let mut d = c.clone();
+            d.set(k, PyJson::parse(v).unwrap());
+            assert!(selfplay_seat(&d, "m").unwrap_err().contains(what), "{k}");
+        }
+        // evaluations have no playout cap: the rule never reaches them
+        assert!(!eval_seat(&c, "m", &PyJson::Int(32)).unwrap().as_object().unwrap().contains_key("p_full_rule"));
     }
 
     #[test]

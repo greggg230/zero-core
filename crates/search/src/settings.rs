@@ -16,11 +16,11 @@
 //!   `bot` / `external`), branch's, starts'.
 use serde_json::{Map, Value};
 
-use crate::driver::{BranchCfg, DriverCfg, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, StartsCfg, ViewTarget, BELIEF_CLIP};
+use crate::driver::{BranchCfg, DriverCfg, FullRule, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, StartsCfg, ViewTarget, BELIEF_CLIP};
 use crate::lookahead::LookCfg;
 
 /// The settings of a network seat (each `NnSeat` field's key; docs/search.md 3).
-pub const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "belief_tilts", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge", "value_choice_worlds", "value_choice_temp"];
+pub const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "belief_tilts", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge", "value_choice_worlds", "value_choice_temp", "p_full_rule", "p_full_floor", "p_full_shape", "p_full_u_mean"];
 
 /// The settings of a branch (docs/search.md 2.11) and of archive starts.
 pub const BRANCH_KEYS: &[&str] = &["p", "moves", "temp", "differ"];
@@ -210,6 +210,16 @@ pub fn parse_seat(v: &Value, keys: &mut Vec<(String, KeyKind)>) -> Result<SeatCf
         }
     }
     let root_search = RootSearch::parse(root_search, get_u32(d, "gumbel_m", 16)?, get_f64(d, "gumbel_scale", 1.0)?, get_f64(d, "gumbel_c_visit", cq_c_visit)?, get_f64(d, "gumbel_c_scale", cq_c_scale)?)?;
+    // the playout cap's rule (docs/search.md 3.21): 'random' (default, the coin of before) | 'prior_uncertainty' with
+    // its floor, shape and the mean of g(u) (the last three: that rule's only)
+    let p_full_rule = get_str(d, "p_full_rule", "random")?;
+    for k in ["p_full_floor", "p_full_shape", "p_full_u_mean"] {
+        if p_full_rule == "random" && opt(d, k).is_some() {
+            return Err(format!("{k}: a setting of p_full_rule 'prior_uncertainty'"));
+        }
+    }
+    let p_full_u_mean = opt(d, "p_full_u_mean").map(|v| f64_of("p_full_u_mean", v)).transpose()?;
+    let p_full_rule = FullRule::parse(p_full_rule, get_f64(d, "p_full_floor", 0.05)?, get_str(d, "p_full_shape", "linear")?, p_full_u_mean)?;
     // the exhaustive lookahead (docs/search.md 3.9): an object of its settings (or their JSON), null = off
     let look = match opt(d, "lookahead") {
         Some(v) => Some(Box::new(LookCfg::parse(&spec_text(v))?)),
@@ -282,6 +292,8 @@ pub fn parse_seat(v: &Value, keys: &mut Vec<(String, KeyKind)>) -> Result<SeatCf
         // decision the game marks, and the temperature of the choice (0: the best mean value)
         value_choice_worlds: get_u32(d, "value_choice_worlds", 0)?,
         value_choice_temp: get_f64(d, "value_choice_temp", 0.0)?,
+        // the playout cap's rule (docs/search.md 3.21; absent: the random coin of before; checked by the driver)
+        p_full_rule,
     }))
 }
 

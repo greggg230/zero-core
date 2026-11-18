@@ -243,6 +243,101 @@ impl RootSearch {
     }
 }
 
+/// How a seat's playout cap picks its full searches (docs/search.md 3.21, seat key `p_full_rule`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FullRule {
+    /// A coin per decision: full with probability `p_full` (the default, the playout cap of before bit for bit).
+    Random,
+    /// By the root prior's uncertainty u = 1 - max P0 (the network's policy at the root, before any noise): full
+    /// with probability `full_share` = min(1, floor + (p_full - floor) * g(u) / u_mean): `p_full` in expectation
+    /// when `u_mean` is the mean of g(u) over the seat's capped decisions (up to the cap at 1, which only lowers the
+    /// share), and at least `floor` for every decision. The decision's coin is drawn
+    /// where the random rule draws it (the same stream position); its threshold waits for the root's priors.
+    PriorUncertainty { floor: f64, shape: UShape, u_mean: f64 },
+}
+
+/// The transform g of the prior's uncertainty u (`FullRule::PriorUncertainty`): correctly rounded IEEE operations
+/// only (no `powf`), so every platform draws the same full searches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UShape {
+    Linear,
+    Sqrt,
+    Square,
+}
+
+impl UShape {
+    pub fn parse(name: &str) -> Result<UShape, String> {
+        match name {
+            "linear" => Ok(UShape::Linear),
+            "sqrt" => Ok(UShape::Sqrt),
+            "square" => Ok(UShape::Square),
+            _ => Err(format!("p_full_shape {name:?}: 'linear', 'sqrt' or 'square'")),
+        }
+    }
+
+    pub fn apply(self, u: f64) -> f64 {
+        match self {
+            UShape::Linear => u,
+            UShape::Sqrt => u.sqrt(),
+            UShape::Square => u * u,
+        }
+    }
+}
+
+/// The prior's uncertainty u = 1 - max P0 of a root's priors (0 without options).
+pub fn prior_uncertainty(p0: &[f32]) -> f64 {
+    let Some(m) = p0.iter().copied().reduce(f32::max) else { return 0.0 };
+    (1.0 - m as f64).clamp(0.0, 1.0)
+}
+
+impl FullRule {
+    /// From the seat settings `p_full_rule` ('random' | 'prior_uncertainty'), `p_full_floor`, `p_full_shape`,
+    /// `p_full_u_mean` (None: unset).
+    pub fn parse(name: &str, floor: f64, shape: &str, u_mean: Option<f64>) -> Result<FullRule, String> {
+        match name {
+            "random" => Ok(FullRule::Random),
+            "prior_uncertainty" => {
+                let u_mean = u_mean.ok_or("p_full_rule 'prior_uncertainty': needs p_full_u_mean (the mean of g(u) over the seat's capped decisions; docs/search.md 3.21)")?;
+                Ok(FullRule::PriorUncertainty { floor, shape: UShape::parse(shape)?, u_mean })
+            }
+            _ => Err(format!("p_full_rule {name:?}: 'random' or 'prior_uncertainty'")),
+        }
+    }
+
+    /// The rule's check against the seat's `p_full` (`Driver::new`; the bindings' messages).
+    pub fn check(&self, p_full: f64) -> Result<(), String> {
+        if let FullRule::PriorUncertainty { floor, u_mean, .. } = *self {
+            if !(p_full.is_finite() && p_full > 0.0 && p_full <= 1.0) {
+                return Err(format!("p_full {p_full}: in (0, 1] with p_full_rule 'prior_uncertainty'"));
+            }
+            if !(floor.is_finite() && (0.0..=p_full).contains(&floor)) {
+                return Err(format!("p_full_floor {floor}: a share in [0, p_full {p_full}] (every decision's least chance of a full search)"));
+            }
+            if !(u_mean.is_finite() && u_mean > 0.0) {
+                return Err(format!("p_full_u_mean {u_mean}: a finite mean > 0 of g(u) over the seat's capped decisions"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A decision's chance of a full search, from its root priors `p0` (`Random`: `p_full`).
+    pub fn full_share(&self, p_full: f64, p0: &[f32]) -> f64 {
+        match *self {
+            FullRule::Random => p_full,
+            FullRule::PriorUncertainty { floor, shape, u_mean } => (floor + (p_full - floor) * (shape.apply(prior_uncertainty(p0)) / u_mean)).min(1.0),
+        }
+    }
+
+    /// g(u) of a root's priors (`Random`: u itself), for the playout cap's counters.
+    pub fn g_of(&self, p0: &[f32]) -> f64 {
+        let u = prior_uncertainty(p0);
+        match *self {
+            FullRule::Random => u,
+            FullRule::PriorUncertainty { shape, .. } => shape.apply(u),
+        }
+    }
+}
+
 /// Whose information a search leaf's VALUE comes from (docs/search.md 3.6, seat key
 /// `leaf_value_view`). The priors always come from the leaf's decider's own view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -505,12 +600,15 @@ pub struct NnSeat {
     /// The value choice's temperature tau >= 0 (default 0): 0 takes the option of the best mean value (the
     /// first on a tie); tau > 0 draws an option with probability proportional to exp(mean / tau).
     pub value_choice_temp: f64,
+    /// How the playout cap picks its full searches (docs/search.md 3.21; `FullRule::Random`, the default: a coin of
+    /// probability `p_full`). Only with `sims_fast`.
+    pub p_full_rule: FullRule,
 }
 
 impl NnSeat {
     /// Evaluation seat defaults.
     pub fn eval(key: u16, sims: u32) -> NnSeat {
-        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, belief_tilts: Vec::new(), root_search: RootSearch::Puct, look: None, eval_cache: 0, resign_t: 0.0, resign_k: 5, resign_noresign: 0.1, infoset_merge: false, value_choice_worlds: 0, value_choice_temp: 0.0 }
+        NnSeat { key, sims, c_puct: 1.0, selfplay: false, alpha: 0.3, eps: 0.25, temp_moves: 30, sims_fast: None, p_full: 1.0, sims_minor: None, chance_k: 0, margin_w: 0.0, redet: true, policy_target: PolicyTarget::Visits, select: Select::Visits, record: true, root_min_visits: 0, root_min_visits_max_actions: 4, leaf_value_view: LeafView::Mover, view_samples: 0.0, view_target: ViewTarget::NextQ, belief_tilt: 0.0, belief_clip: BELIEF_CLIP, belief_mix: 0.0, belief_fast: false, belief_tilts: Vec::new(), root_search: RootSearch::Puct, look: None, eval_cache: 0, resign_t: 0.0, resign_k: 5, resign_noresign: 0.1, infoset_merge: false, value_choice_worlds: 0, value_choice_temp: 0.0, p_full_rule: FullRule::Random }
     }
 
     /// The value choice's settings' check (`Driver::new`; the bindings' messages): worlds at most
@@ -1555,6 +1653,12 @@ struct Slot<G: SearchGame> {
     sims: u32,
     target: Option<u32>,
     full: bool,
+    /// `FullRule::PriorUncertainty` (docs/search.md 3.21): the current decision's playout-cap coin, drawn where the
+    /// random rule draws it, and whether its budget still waits for the root's priors (the search's target is then
+    /// the root's evaluation alone); `cap_f` the chance of a full search it was given.
+    cap_draw: f64,
+    budget_pending: bool,
+    cap_f: f64,
     /// The current decision is minor (searched with `sims_minor`).
     minor: bool,
     /// The current search takes the root's belief (`NnSeat::takes_belief`, docs/search.md 3.8).
@@ -1654,6 +1758,9 @@ impl<G: SearchGame> Slot<G> {
             sims: 0,
             target: None,
             full: true,
+            cap_draw: 0.0,
+            budget_pending: false,
+            cap_f: 0.0,
             minor: false,
             belief: false,
             decisions: 0,
@@ -1797,6 +1904,16 @@ struct Counters {
     view_recorded: AtomicU64,
     /// Root belief rows sent (`ROW_BELIEF`, docs/search.md 3.8).
     belief_rows: AtomicU64,
+    /// The playout cap (docs/search.md 3.21): capped decisions, their full searches, their budgets, the sums of
+    /// g(u) and of the full-search chance (fixed point, 1e-6), full searches whose recorded target's argmax is not
+    /// the prior's, of the recorded targets compared.
+    cap_decisions: AtomicU64,
+    cap_full: AtomicU64,
+    cap_sims: AtomicU64,
+    cap_g_e6: AtomicU64,
+    cap_f_e6: AtomicU64,
+    cap_changed: AtomicU64,
+    cap_targets: AtomicU64,
     /// Value choices made (docs/search.md 3.17) and their lookaheads' rows.
     value_choices: AtomicU64,
     value_choice_rows: AtomicU64,
@@ -2054,6 +2171,18 @@ pub struct DriverStats {
     /// Games dropped after a panic inside them (docs/search.md 2.18): each one an aborted result row (reason
     /// `"panic"`, no samples) and a `GameFailure` (`Driver::take_failures`).
     pub game_panics: u64,
+    /// The playout cap (docs/search.md 3.21; all 0 without `sims_fast`): searched decisions it applies to (not
+    /// minor, not a branch's deviation), their full searches, their simulation budgets, the sums of g(u) (the
+    /// rule's transform of the prior's uncertainty; u itself for the random rule) and of the chance of a full
+    /// search, both in millionths, recorded full searches whose policy target's argmax is not the prior's argmax,
+    /// and the recorded targets compared.
+    pub cap_decisions: u64,
+    pub cap_full: u64,
+    pub cap_sims: u64,
+    pub cap_g_e6: u64,
+    pub cap_f_e6: u64,
+    pub cap_changed: u64,
+    pub cap_targets: u64,
 }
 
 /// The games in progress.
@@ -2164,6 +2293,16 @@ impl<G: SearchGame> Driver<G> {
                         // whose statistics are the same kind merged or not)
                         if n.leaf_value_view != LeafView::Root {
                             return Err("infoset_merge: needs leaf_value_view 'root' (a merged node of another seat is valued from the root decider's view)".into());
+                        }
+                    }
+                    n.p_full_rule.check(n.p_full)?;
+                    if n.p_full_rule != FullRule::Random {
+                        // (docs/search.md 3.21: the rule picks between the full and the fast budget)
+                        if n.sims_fast.is_none() {
+                            return Err("p_full_rule 'prior_uncertainty': a playout-cap seat's (sims_fast)".into());
+                        }
+                        if matches!(n.root_search, RootSearch::Gumbel { .. }) {
+                            return Err("p_full_rule 'prior_uncertainty': not built for root_search 'gumbel' (its schedule is set before the root's evaluation)".into());
                         }
                     }
                     NnSeat::check_value_choice(n.value_choice_worlds, n.value_choice_temp)?;
@@ -2879,6 +3018,13 @@ impl<G: SearchGame> Driver<G> {
             tail_max: c.tail_max.load(Ordering::Relaxed),
             aborted_row_tokens: c.aborted_row_tokens.load(Ordering::Relaxed),
             game_panics: c.game_panics.load(Ordering::Relaxed),
+            cap_decisions: c.cap_decisions.load(Ordering::Relaxed),
+            cap_full: c.cap_full.load(Ordering::Relaxed),
+            cap_sims: c.cap_sims.load(Ordering::Relaxed),
+            cap_g_e6: c.cap_g_e6.load(Ordering::Relaxed),
+            cap_f_e6: c.cap_f_e6.load(Ordering::Relaxed),
+            cap_changed: c.cap_changed.load(Ordering::Relaxed),
+            cap_targets: c.cap_targets.load(Ordering::Relaxed),
         }
     }
 
