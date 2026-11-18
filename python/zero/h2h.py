@@ -96,7 +96,7 @@ import os
 import sys
 import time
 
-from . import games as G, lookahead as LA, package
+from . import gamerec as GR, games as G, lookahead as LA, package
 from .infer import NetEvaluator, drive
 from .mcts import (belief_settings, belief_tag, belief_tilts, check_belief, check_belief_tilts, check_merge,
                    check_root_search, check_select, check_select_transform, forced_tag, gumbel_tag, merge_tag, select_settings, select_tag, select_transform,
@@ -404,8 +404,18 @@ def _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, s
     return sa, sb
 
 
+def _rec(a, b, sa, sb):
+    """The recording of a match's games (docs/az.md 59.3): (sink, A's player, B's player) while the thread records
+    (`gamerec.recording`), else None (the match of before)."""
+    sink = GR.active()
+    if sink is None:
+        return None
+    return (sink, GR.net_player(a, sink.labels.get('a'), sa, _tag(sa)),
+            GR.net_player(b, sink.labels.get('b'), sb, _tag(sb)))
+
+
 def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, stats_out=None,
-          sparse=False):
+          sparse=False, rec=None, rec_meta=None):
     seats = [[sa, sb] if g % 2 == 0 else [sb, sa] for g in range(games)]
     kw = {'move_log': move_log} if move_log else {}
     if paired:
@@ -414,10 +424,18 @@ def _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps
         kw['sparse'] = True
     drv = G.Driver(game, seats, spec=spec, concurrency=conc or min(games, 1024), seed=seed, threads=threads,
                    groups=groups, max_steps=max_steps, **kw)
+    if rec is not None:
+        drv.set_game_log(True)                     # (game records, docs/az.md 59.3: the games themselves unchanged)
     drive(drv, evs)
     if stats_out is not None:
         stats_out.append(drv.stats())
-    return drv.take_results()
+    rows = drv.take_results()
+    if rec is not None:
+        sink, pa, pb = rec
+        # (A in seat gid % 2; the rows' logs taken out: the caller's rows are a match's without records)
+        sink.add_rows(rows, lambda g: [pa, pb] if g % 2 == 0 else [pb, pa],
+                      dict({'driver_seed': int(seed), 'paired': bool(paired)}, **(rec_meta or {})))
+    return rows
 
 
 LOOK_SUMS = ('decisions', 'nodes', 'leaves', 'prior_rows', 'value_rows', 'value_dups', 'minor_steps', 'groups', 'cut', 'rounds', 'rows',
@@ -560,7 +578,8 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     evs = _evaluators(ma, mb, device, graphs, mr, precision)
     t0 = time.time()
     st = []
-    rs = _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, st, sp)
+    rs = _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, st, sp,
+               _rec(a, b, sa, sb))
     out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb))
     _sides_sims(out, sims_a, sims_b)
@@ -624,6 +643,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     st = []
     rs, batches, stop, llr = [], [], None, None
     k = 0
+    rec = _rec(a, b, sa, sb)
     while stop is None:
         n = min(batch_games, max_games - len(rs))
         if paired:
@@ -631,7 +651,8 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
         if n <= 0:
             stop = 'max_games'
             break
-        got = _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired, st, sp)
+        got = _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired, st, sp,
+                    rec, {'batch': k, 'gid_offset': len(rs)})
         off = len(rs)
         rs += [dict(r, gid=r['gid'] + off) for r in got]
         cur = summary(rs, paired)
@@ -767,6 +788,12 @@ def main(argv=None):
     ap.add_argument('--batch-games', type=int, default=None, help='sequential: games per batch (default --games)')
     ap.add_argument('--max-games', type=int, default=None,
                     help='sequential: at most this many games (default 4 x --games)')
+    ap.add_argument('--records', default=None, metavar='DIR',
+                    help='keep every game as a game record (docs/az.md 59.3) under DIR/<--records-kind>/misc/ (a game '
+                         'database ingests them: MTG Zero tools/gamedb.py ingest --records DIR); the games are the same')
+    ap.add_argument('--records-kind', default='h2h', help="the records' kind (default 'h2h')")
+    ap.add_argument('--label-a', default=None, help="side A's name in the records (default: its checkpoint id)")
+    ap.add_argument('--label-b', default=None, help="side B's name in the records")
     a = ap.parse_args(argv)
     sprt = None
     if a.sprt is not None:
@@ -865,6 +892,21 @@ def main(argv=None):
         graphs = tuple(None if v is None else bool(v)
                        for v in (a.graphs if a.a_graphs is None else a.a_graphs,
                                  a.graphs if a.b_graphs is None else a.b_graphs))
+    sink = None
+    if a.records:
+        try:
+            sink = GR.MatchSink(a.records, a.records_kind, labels={'a': a.label_a, 'b': a.label_b},
+                                meta={'tool': 'h2h'})
+        except ValueError as e:
+            ap.error(str(e))
+    with GR.recording(sink):
+        _main_play(a, seq, sprt, sides, graphs)
+    if sink is not None:
+        print(f'# game records: {sink.stats["games"]} games in {sink.stats["files"]} file(s) under {sink.dir()}',
+              file=sys.stderr, flush=True)
+
+
+def _main_play(a, seq, sprt, sides, graphs):
     if seq:
         out = sequential(a.a, a.b, a.batch_games or a.games, a.max_games or 4 * a.games, sprt, a.alpha, a.beta,
                          a.target_se, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device, spec=a.spec,

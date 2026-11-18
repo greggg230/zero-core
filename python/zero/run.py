@@ -364,7 +364,10 @@ DEFAULTS = dict(
     # pool's - is kept as what replays it (its seed, every real move, its setup, spec, outcome and networks) in
     # <run>/records/iter_NNNN/*.jsonl.gz, outside the training window, for a game database (zero/gamerec.py, docs/az.md
     # 59). Read from the driver's game log (SearchDriver.set_game_log): the same games, search and shards, byte for
-    # byte. 0 = no records, as before
+    # byte. 0 = no records, as before. With it every other game the run plays is kept too (docs/az.md 59.3): its
+    # evaluations' (the yardstick and random games 'eval', the Elo matches 'elo', the anchors' games and calibrations
+    # 'anchor', the reference games 'ref'; a remote evaluation's copied back from its mirror) in
+    # <run>/records/<kind>/iter_NNNN/, each record naming both players and their seats
     game_records=0,
     # branched self-play games and archive starts (zero/forks.py, docs/az.md 24, docs/search.md 2.11):
     # selfplay_branch p = a share p of the games each spawn one branch game from a copy of their state at
@@ -817,6 +820,14 @@ class Run:
         if getattr(self, '_gamerec', None) is None:
             self._gamerec = GR.Records(self.run, self.log)
         return self._gamerec
+
+    def match_sink(self, kind, it):
+        """game_records (docs/az.md 59.3): the writer of iteration `it`'s games of `kind` that are not self-play (an
+        evaluation's), None when off."""
+        if not self.cfg.get('game_records'):
+            return None
+        return GR.MatchSink(os.path.join(self.run, GR.DIR), kind, it=it, src=getattr(self, 'records_src', 'local'),
+                            log=self.log)
 
     def records_close(self, it, out, accepted):
         """game_records: iteration `it`'s records closed (their DONE.json) and their summary into the phase's metrics."""
@@ -1916,19 +1927,23 @@ class Run:
             got = self._eval_chained = G.chained(c['game'], spec, (c.get('players') or [2])[0])
         return got
 
-    def play_match(self, it, opp, n_games, sims, seed, opp_model=None, paired=False, model=None, games=None):
+    def play_match(self, it, opp, n_games, sims, seed, opp_model=None, paired=False, model=None, games=None,
+                   rec=None):
         """Checkpoint `it` against `opp` ('nn' + opp_model, a bot name or 'ext:<name>'), seats
         alternating. -> rows (score, margin, rounds, over) of the checkpoint. `paired`: paired games
         (docs/az.md 20.3); `model`: another network than checkpoint `it` (a path: an anchor's
         calibration, docs/az.md 20.1). A game that chains its episodes (docs/az.md 42) plays contests: a row is
-        a contest (a match), and `games` (a list) receives the checkpoint's games (`games.episode_rows`)."""
+        a contest (a match), and `games` (a list) receives the checkpoint's games (`games.episode_rows`). `rec`:
+        (kind, iteration, the checkpoint's label, the opponent's label) - with game_records its games' records
+        (docs/az.md 59.3; the games are the same)."""
         if n_games <= 0:
             return []
         P = 2
         a = self.nn_seat('m', sims)
         o = self.opp_seat(opp, sims)
         seats = [[a if s == g % P else o for s in range(P)] for g in range(n_games)]
-        evs = {'m': self.evaluator(model or model_path(self.run, it))}
+        mp = model or model_path(self.run, it)
+        evs = {'m': self.evaluator(mp)}
         if opp == 'nn':
             evs['o'] = self.evaluator(opp_model)
         ext = {}
@@ -1936,9 +1951,19 @@ class Run:
             ext[opp[4:]] = G.external(opp[4:], seed)
         drv = self.driver(seats, seed=seed, conc=min(self.cfg['conc'], n_games), groups=self.match_groups(ext),
                           paired=paired)
+        sink = self.match_sink(rec[0], rec[1]) if rec else None
+        if sink is not None:
+            drv.set_game_log(True)                 # (game_records, docs/az.md 59.3)
         drive(drv, evs, ext, check=lambda: self.check('evaluation'))
+        results = drv.take_results()
+        if sink is not None:
+            rule = self.eval_tag()
+            pm = GR.net_player(mp, rec[2], a, rule)
+            po = GR.net_player(opp_model, rec[3], o, rule) if opp == 'nn' else GR.bot_player(opp, rec[3])
+            sink.add_rows(results, lambda g: [pm, po] if g % P == 0 else [po, pm],
+                          {'driver_seed': int(seed), 'paired': bool(paired)})
         rows = []
-        for r in sorted(drv.take_results(), key=lambda r: r['gid']):
+        for r in sorted(results, key=lambda r: r['gid']):
             me = r['gid'] % P
             sc = r['scores']
             rows.append((r['result'][me], sc[me] - max(sc[j] for j in range(len(sc)) if j != me), r['rounds'], r['over']))
@@ -1946,28 +1971,47 @@ class Run:
                 games.extend(G.episode_rows(r, me))
         return rows
 
-    def play_matches(self, it, opps, n_games, sims, seed, paired=False, paths=None, games=None):
+    def play_matches(self, it, opps, n_games, sims, seed, paired=False, paths=None, games=None, rec=None):
         """Checkpoint `it` against each of the checkpoints `opps` (n_games each, seats alternating
         within each match) in ONE driver: every opponent is its own evaluator key, so the
         checkpoint's network batches hold the leaves of all the matches. -> {opp: rows} as
         play_match. `paired`: paired games (n_games even: a pair never spans two opponents);
         `paths`: {opp: its network's path} for opponents that are not checkpoints of the run (the
         anchors, docs/az.md 20.1). `games` (a dict): {opp: the checkpoint's games} of a chained game's contests
-        (docs/az.md 42)."""
+        (docs/az.md 42). `rec`: (kind, iteration, the checkpoint's label, {opp: its label}) - with game_records its
+        games' records (docs/az.md 59.3)."""
         P = 2
         a = self.nn_seat('m', sims)
         evs = {'m': self.evaluator(model_path(self.run, it))}
         seats = []
+        opath = {}
+        oseat = {}
         for t, j in enumerate(opps):
             o = self.nn_seat(f'o{t}', sims)
-            evs[f'o{t}'] = self.evaluator(paths[j] if paths and j in paths else model_path(self.run, j))
+            opath[j] = paths[j] if paths and j in paths else model_path(self.run, j)
+            oseat[j] = o
+            evs[f'o{t}'] = self.evaluator(opath[j])
             seats += [[a if s == g % P else o for s in range(P)] for g in range(n_games)]
         if not seats:
             return {}
         drv = self.driver(seats, seed=seed, conc=min(self.cfg['conc'], len(seats)), paired=paired)
+        sink = self.match_sink(rec[0], rec[1]) if rec else None
+        if sink is not None:
+            drv.set_game_log(True)                 # (game_records, docs/az.md 59.3)
         drive(drv, evs, check=lambda: self.check('evaluation'))
+        results = drv.take_results()
+        if sink is not None:
+            rule = self.eval_tag()
+            pm = GR.net_player(model_path(self.run, it), rec[2], a, rule)
+            po = {j: GR.net_player(opath[j], (rec[3] or {}).get(j, j), oseat[j], rule) for j in opps}
+
+            def players_of(gid):
+                t, g = divmod(gid, n_games)
+                o = po[opps[t]]
+                return [pm, o] if g % P == 0 else [o, pm]
+            sink.add_rows(results, players_of, {'driver_seed': int(seed), 'paired': bool(paired)})
         out = {j: [] for j in opps}
-        for r in sorted(drv.take_results(), key=lambda r: r['gid']):
+        for r in sorted(results, key=lambda r: r['gid']):
             t, g = divmod(r['gid'], n_games)
             me = g % P
             sc = r['scores']
@@ -1977,16 +2021,24 @@ class Run:
                 games.setdefault(opps[t], []).extend(G.episode_rows(r, me))
         return out
 
-    def bots_match(self, a, b, n_games, seed):
-        """Two non-network players (Elo reference games). -> score of a."""
+    def bots_match(self, a, b, n_games, seed, rec_it=None):
+        """Two non-network players (Elo reference games). -> score of a. `rec_it`: with game_records, the records'
+        iteration (kind 'ref', docs/az.md 59.3)."""
         seats = [[G.seat_dict(a), G.seat_dict(b)] if g % 2 == 0 else [G.seat_dict(b), G.seat_dict(a)] for g in range(n_games)]
         ext = {}
         for s in (a, b):
             if G.is_external(s):
                 ext[s[4:]] = G.external(s[4:], seed)
         drv = self.driver(seats, seed=seed, conc=min(self.cfg['conc'], n_games), groups=self.match_groups(ext))
+        sink = self.match_sink('ref', rec_it) if rec_it is not None else None
+        if sink is not None:
+            drv.set_game_log(True)                 # (game_records, docs/az.md 59.3)
         drive(drv, {}, ext, check=lambda: self.check('reference games'))
-        return sum(r['result'][r['gid'] % 2] for r in drv.take_results())
+        results = drv.take_results()
+        if sink is not None:
+            pa, pb = GR.bot_player(a), GR.bot_player(b)
+            sink.add_rows(results, lambda g: [pa, pb] if g % 2 == 0 else [pb, pa], {'driver_seed': int(seed)})
+        return sum(r['result'][r['gid'] % 2] for r in results)
 
     def evaluate(self, it, m):
         c = self.cfg
@@ -1995,7 +2047,7 @@ class Run:
         pg = []
         gk = {'games': pg} if self.eval_chained() else {}       # (docs/az.md 42; else the calls of before)
         m['eval_yard'] = summarize(self.play_match(it, self.yard, c['eval_games'], c['eval_sims'], seed=7919 * it + 1,
-                                                   **gk))
+                                                   rec=('eval', it, elo.ckpt_name(it), self.yard), **gk))
         m['eval_yard']['opp'] = self.yard
         if pg:
             # a chained game's contests (docs/az.md 42): the rows above are matches, these its games
@@ -2007,7 +2059,8 @@ class Run:
             pg = []
             gk = {'games': pg} if self.eval_chained() else {}
             m['eval_random'] = summarize(self.play_match(it, 'random', c['eval_random_games'], c['eval_sims'],
-                                                         seed=7919 * it + 2, **gk))
+                                                         seed=7919 * it + 2, rec=('eval', it, elo.ckpt_name(it), 'random'),
+                                                         **gk))
             if pg:
                 m['eval_random']['per_game'] = G.summarize_games(pg)
             if tag != 'visits':
@@ -2054,7 +2107,7 @@ class Run:
             res.setdefault('select', tag)
             res.setdefault('since', latest)
         if self.yard != 'random' and not elo.has(res, 'random', self.yard) and c['ref_games']:
-            s = self.bots_match('random', self.yard, c['ref_games'], seed=17)
+            s = self.bots_match('random', self.yard, c['ref_games'], seed=17, rec_it=latest)
             elo.add(res, 'random', self.yard, s, c['ref_games'])
             self.log(f'reference: random vs {self.yard}: {s:.1f}/{c["ref_games"]}')
         logged = res.setdefault('logged', [])
@@ -2096,14 +2149,17 @@ class Run:
                 js = [j for kk, j in todo if kk == k]
                 gs = {}
                 gk = {'games': gs} if self.eval_chained() else {}
-                for j, rows in self.play_matches(k, js, c['elo_games'], sims, seed=31 + 7919 * k, **gk, **pk).items():
+                rk = ('elo', latest, elo.ckpt_name(k), {j: elo.ckpt_name(j) for j in js})
+                for j, rows in self.play_matches(k, js, c['elo_games'], sims, seed=31 + 7919 * k, rec=rk, **gk,
+                                                 **pk).items():
                     record(k, j, rows, gs.get(j))
         else:
             for k, j in todo:
                 gs = []
                 gk = {'games': gs} if self.eval_chained() else {}
                 record(k, j, self.play_match(k, 'nn', c['elo_games'], sims, seed=31 + 7919 * k + 101 * j,
-                                             opp_model=model_path(self.run, j), **gk, **pk), gs)
+                                             opp_model=model_path(self.run, j),
+                                             rec=('elo', latest, elo.ckpt_name(k), elo.ckpt_name(j)), **gk, **pk), gs)
         anchors = elo.parse_anchors(c.get('elo_anchors', ''))
         if anchors:
             self.anchor_matches(res, anchors, latest, tag, sims, pk)
@@ -2198,7 +2254,7 @@ class Run:
                             raise AnchorRefused(f'elo_anchors: calibrating {lb!r} needs the fixed anchor {other!r}, '
                                                 f'which is not among elo_anchors (its file is needed)')
                         rows = self.play_match(None, 'nn', ng, sims, seed=97 + 1013 * (i + 1) + 31 * j, opp_model=op,
-                                               model=path, **pk)
+                                               model=path, rec=('anchor', latest, name, other), **pk)
                         sc = sum(r[0] for r in rows)
                         elo.add(res, name, other, sc, len(rows))
                         save()
@@ -2224,7 +2280,8 @@ class Run:
             todo = [(name, path) for name, _, path in named if not elo.has(res, elo.ckpt_name(k), name)]
             if not todo:
                 continue
-            got = self.play_matches(k, [n for n, _ in todo], ng, sims, seed=53 + 7919 * k, paths=dict(todo), **pk)
+            got = self.play_matches(k, [n for n, _ in todo], ng, sims, seed=53 + 7919 * k, paths=dict(todo),
+                                    rec=('anchor', latest, elo.ckpt_name(k), {n: n for n, _ in todo}), **pk)
             for name, rows in got.items():
                 sc = sum(r[0] for r in rows)
                 elo.add(res, elo.ckpt_name(k), name, sc, len(rows))

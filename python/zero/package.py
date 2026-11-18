@@ -129,6 +129,10 @@ class GamePackage:
                     supervisor stops one it runs). An exception is the companion refusing to start: the supervisor
                     logs it loudly and the run goes on without it (a companion is never worth the run).
                     Default none: no companion
+    engine_paths    [path, ...]: the game repo's paths (relative to `root`) whose tracked files are every Rust input of
+                    the game's engine (MTG Zero: engine/, card_ir/, py/, worker/, data/, Cargo.toml, ...). With zero-core's
+                    crates they name the engine that plays a game (`zero.gamerec.engine_id`, docs/az.md 59.4): a game
+                    record replays only on that engine. Default none: records carry no engine id
     on_fork         fn(source, dest, it, cfg, overrides) or 'module:attr' (docs/az.md 49): called by
                     `tools/fork_run.py --source` after the fork's files are copied and before its config.json is
                     written (`cfg`: the fork's settings, the --set overrides applied - the hook may change them in
@@ -140,7 +144,7 @@ class GamePackage:
                  externals=None, decision_kinds=None, replay_url=None, replay_hint=None, replay_opp=None,
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
-                 remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None):
+                 remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None, engine_paths=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -179,6 +183,7 @@ class GamePackage:
         self.evals_every = dict(evals_every or {})
         self.companion = companion
         self.on_fork = on_fork
+        self.engine_paths = tuple(engine_paths) if engine_paths else None
         for ev, s in self.evals_every.items():
             d = self.settings.get(s)
             if s not in self.settings or not isinstance(d, int) or isinstance(d, bool) or d < 0:

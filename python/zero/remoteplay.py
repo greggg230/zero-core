@@ -1311,7 +1311,9 @@ class RemotePlay:
             gr = self.R.gamerecs() if hasattr(self.R, 'gamerecs') else None
             if gr is not None:
                 specs = ev.get('specs') or {}
-                gr.add(ev.get('iter'), s.name, [(r, specs[r['spec']]) for r in ev.get('recs') or []])
+                # (the engine that played them: the worker's build, docs/az.md 59.4; a worker before it sends none)
+                gr.add(ev.get('iter'), s.name, [(r, specs[r['spec']]) for r in ev.get('recs') or []],
+                       build=ev.get('build') or {'remote': s.name, 'engine': None})
             return
         with self.mu:
             if kind == 'hello':
@@ -2344,7 +2346,8 @@ class Worker:
                 rtally([row], ph['resign'])
         if recs:
             # game_records (docs/az.md 59): the accepted games' records, the run writes them (one line, their specs once)
-            self.emit('records', iter=ph['it'], recs=recs, specs=specs)
+            from .gamerec import build_info
+            self.emit('records', iter=ph['it'], recs=recs, specs=specs, build=build_info())
         die = int(self.test.get('die_after_accepts') or 0)
         if die and ph['accepted'] >= die:
             self.note('test: dying with accepted games in no shard yet')

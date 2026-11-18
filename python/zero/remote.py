@@ -404,6 +404,31 @@ class RemoteEval:
                     raise RuntimeError(f"{sub} of the mirror did not arrive (the game package's remote_eval_files): "
                                        f"not recorded")
 
+    def _fetch_records(self, it):
+        """game_records (docs/az.md 59.3): the game records the mirror's evaluation of iteration `it` wrote
+        (`<mirror>/records/<kind>/iter_NNNN/*.jsonl.gz`: its 'eval', 'elo', 'anchor', 'ref' games) copied to the same
+        paths in the run. A file that does not arrive fails the evaluation (logged, retried): its games would be
+        missing from the run's records. -> the files copied."""
+        if not self.R.cfg.get('game_records'):
+            return 0
+        sub = f'iter_{int(it):04d}'
+        n = 0
+        for kind in self.t.listdir(f'{self.rdir}/records'):
+            if kind.startswith('iter_'):
+                continue                           # (self-play records: none in an evaluation's mirror)
+            for name in self.t.listdir(f'{self.rdir}/records/{kind}/{sub}'):
+                if not name.endswith('.jsonl.gz'):
+                    continue                       # (a write in progress: never, the evaluation has ended)
+                dst = os.path.join(self.R.run, 'records', kind, sub, name)
+                if os.path.exists(dst):
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if not self.t.get(f'{self.rdir}/records/{kind}/{sub}/{name}', dst):
+                    raise RuntimeError(f'records/{kind}/{sub}/{name} of the mirror did not arrive (game_records): '
+                                       f'not recorded')
+                n += 1
+        return n
+
     def _evaluate(self, it):
         t0 = time.time()
         self._ship(it)
@@ -440,6 +465,9 @@ class RemoteEval:
             if k in m:
                 row[k] = m[k]
         self._fetch_files(it)
+        nrec = self._fetch_records(it)
+        if nrec:
+            row['records'] = nrec
         pool = elo.pool_dir('', tag).replace(os.sep, '/')
         os.makedirs(elo.pool_dir(self.R.run, tag), exist_ok=True)
         files = ('results.json', 'ratings.json') + (('anchored.json',) if self.R.cfg.get('elo_anchors') else ())
@@ -632,6 +660,7 @@ def evaluate_mirror(rdir, it):
     # {"groups": 1, "elo_games": 50}: fewer, larger inference batches suit a slower GPU)
     cfg.update(_overrides(rdir))
     R = Run(rdir, cfg)
+    R.records_src = 'remote'                       # (game_records: the evaluation's records say where they were played)
     m = {'iter': it}
     R.evaluate(it, m)
     ratings, best = R.elo_update(it, m)

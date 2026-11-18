@@ -158,7 +158,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
 | `infer_precision` | 'fp32' | 'bf16' / 'tf32' = the run's own CUDA evaluators (self-play, league seats, evaluation and Elo matches; zero.h2h `precision`) compute in bfloat16 autocast / with TF32 matmuls: their answers move by that rounding; a remote worker and a CPU / MPS evaluator stay float32 (57) |
 | `train_tf32` | 0 | 1 = the training step's float32 matmuls as TF32 on CUDA (57) |
-| `game_records` | 0 | 1 = every self-play game an iteration's quota accepts - this machine's, the remote workers', the farm pool's - kept as what replays it (seed, every move, setup, spec, outcome, resignation, networks) in `<run>/records/iter_NNNN/*.jsonl.gz` (`zero/gamerec.py`), outside the training window, for a game database; read from the driver's game log (docs/search.md 2.20): the same games, search, shards and checkpoints byte for byte; metrics `selfplay.records`. 0 = none, as before (59) |
+| `game_records` | 0 | 1 = every self-play game an iteration's quota accepts - this machine's, the remote workers', the farm pool's - kept as what replays it (seed, every move, setup, spec, outcome, resignation, networks) in `<run>/records/iter_NNNN/*.jsonl.gz` (`zero/gamerec.py`), outside the training window, for a game database; read from the driver's game log (docs/search.md 2.20): the same games, search, shards and checkpoints byte for byte; metrics `selfplay.records`. With it every other game the run plays is kept too: its evaluations' (`eval`, `elo`, `anchor`, `ref`; a remote evaluation's copied back) in `<run>/records/<kind>/iter_NNNN/`, each record naming both players in their seats (59.3); every records file names the engine that played it (59.4). 0 = none, as before (59) |
 | `dup_action_reduce` | 'legacy' | 'max' = a token network scores an action two of its tokens claim (two equal cards' identity action) by the largest claim - the same answer on every device and in the farm's export; a network property recorded in the checkpoint (a new run's network built with it, a fork's / resumed run's at its next training); 'legacy' = the plain scatter (CUDA keeps an undefined claim) (58) |
 | `sparse` | 0 | 1 = the run's drivers (self-play and matches) send sparse network batches (each row's non-zero features; docs/search.md 2.2): the same rows, games and samples; a token network's CUDA graphs scatter them on the device, other evaluators densify them (10.7) |
 | `eval_cache` | 0 | N > 0 = every network seat (self-play and evaluation) keeps its game's network answers, at most N per game, by a hash of each row's features and options, and answers a repeated row from them instead of sending it (docs/search.md 3.12; the same answers up to float rounding at another batch shape) (25) |
@@ -8216,3 +8216,63 @@ the log costs nothing measurable); the records 9,489 bytes (148 bytes a game, 12
 written in 0.020 s (0.3 ms a game: ~0.6 s of an iteration of 2,000 games). The legacy-meta3-ddwheel-smoke run (3
 iterations, 16 games each, a fresh net: 727 actions a game) with records on and off: the same shards and checkpoints
 (every weight), records 7.2-7.9 KB an iteration written in 0.002-0.004 s.
+
+### 59.3 Every other game (2026-11-17)
+
+**Why.** A run plays more than its self-play: its evaluation (the yardstick and random games, the Elo matches, the fixed
+anchors' games and calibrations, the reference games), and a game repo's own yardsticks and tools play head-to-heads
+through `zero.h2h`. The user asked for all of them in the game database: "record them all".
+
+**What it does** (`zero/gamerec.py`: `MatchSink`, `recording`, `from_match_row`, `from_trace`). A game that is not
+self-play is a record of the self-play record's format plus `kind` (a lower-case name: 'eval', 'elo', 'anchor', 'ref',
+'h2h', a game's own), `it` (the iteration it belongs to: the evaluation's iteration, the measured checkpoint's; null for a
+standalone tool's), `players` - one per seat, in the game's seat order: `{ckpt, sha, label, sims, rule}` for a network
+(`ckpt` '<run>/iter_NNNN' for a run's checkpoint, else the file's name; `sha` sha256[:12] of the file, the identity across
+machines; `label` the caller's name for it: 'iter_0120', an anchor's 'anchor:<label>', a reference's), `{ckpt: null,
+bot, label}` for a bot - and `meta` (the caller's: the driver seed, paired, a match's pairing, chooser, batch). Files:
+`<records>/<kind>/iter_NNNN/<source>-<pid>-<ms>-<n>.jsonl.gz` (`misc/` without an iteration), one per match or batch,
+written whole (a temp file renamed: every `*.jsonl.gz` there is complete, no DONE.json), a build line (59.4), the spec
+lines, the records.
+* **The run's evaluations** (`Run.play_match`, `play_matches`, `bots_match`; their `rec` argument): with `game_records`
+  1 the driver's game log is on and every game goes to `<run>/records/<kind>/iter_NNNN/` - `eval` (the yardstick and
+  random games of `evaluate(it)`: iteration it), `elo` (the Elo matches of `elo_update(latest)`: iteration latest, the
+  checkpoints in `players`), `anchor` (the anchors' games and an anchor's calibration), `ref` (the reference games).
+* **A remote evaluation** (zero/remote.py): the mirror's `Run` plays them with the run's config (game_records shipped)
+  into the mirror's `records/` (source 'remote'); `RemoteEval._fetch_records` copies the evaluated iteration's files to
+  the same paths in the run before the result is recorded (a file that does not arrive fails the evaluation: retried);
+  evals.jsonl's row says `records` (the files copied).
+* **zero.h2h** (`match`, `sequential`): while the thread records (`with gamerec.recording(MatchSink(...)):`) every game
+  of the match is a record, A in seat gid % 2 (the sink's `labels` name A and B; sequential: a file per batch, its
+  `batch` and `gid_offset` in `meta`). The rows the caller gets are those of a match without records (their logs taken
+  out). `python -m zero.h2h A B ... --records DIR [--records-kind h2h] [--label-a X --label-b Y]` from the command line.
+  A game repo's tools record through the same sink (MTG Zero: its yardsticks, keep_h2h, combo statistics; its farm
+  jobs' traced games by `from_trace`).
+
+**Off by default** (`game_records` 0, no sink): the drivers of before, no log, no file. **Byte identity**: the log is the
+failure log the driver keeps for every game anyway (docs/search.md 2.20): the same games, results and Elo pools.
+
+### 59.4 The engine that played: every records file names it
+
+A record replays only on the engine that played it. Every records file - self-play's (the first line of each file; a
+remote worker sends its own in its `records` event, the farm pool writes the run's with the pool's `worker` build id
+beside it: the run's engine replayed and accepted those games) and every other kind's - starts with a build line `{"v":
+1, "kind": "build", "build": build_info()}`: `pkg`, `commit` (the game repo's HEAD), `core` (zero-core's HEAD), `engine`,
+`module` (sha256[:24] of the engine module file). `engine` = `engine_id(root, engine_paths)`: sha256[:16] over the blob
+ids of every tracked file under the game package's `engine_paths` (a new `GamePackage` field: the game's Rust inputs)
+and zero-core's `crates/`, `Cargo.toml`, `Cargo.lock` at HEAD - a Python or docs commit keeps it, an engine change moves
+it; 'dirty' when one of those files has an uncommitted change; null without git or `engine_paths`. Self-play's DONE.json
+names each file's build too. `read_file(path, builds)` / `read_iteration(run, it, builds)` collect them; a file written
+before (5c2d3f39) has none. A database refuses a record of another engine (MTG Zero's `gamedb.py ingest`, its
+`--engine-checkout`).
+
+### 59.5 Tests and checks (59.3-59.4)
+
+`tests/test_gamerec_all.py` (in-process, no run process): `h2h.match` and `sequential` with a sink - the same summary
+and rows as without, every game a record that replays to its result, A in seat gid % 2 with its label, sha, sims, the
+batches' files and offsets; the run's `evaluate` + `elo_update` with `game_records` 0 and 1 (heuristic yardstick, random
+games, Elo offsets, two anchors - one calibrated against the other -, reference games): the same metrics and Elo pool,
+records eval 6 / elo 4 / ref 2 / anchor 10, all replaying, both players named; a remote 'local' evaluation's records
+copied back (source 'remote', evals.jsonl `records`, a second evaluation copies only its new file); `engine_id` (a commit
+outside the engine paths keeps it, an uncommitted engine change is 'dirty', an engine commit moves it); self-play files'
+build lines (this process's, a remote's) and DONE.json's, a file without one; the sink's checks (kinds, temp files never
+read, rows without a log refused).

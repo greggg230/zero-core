@@ -694,7 +694,9 @@ class Pool:
         self.cur['machines'][m] = self.cur['machines'].get(m, 0) + 1
         if g.get('rec') is not None:
             # (game_records: Records' lock is innermost, below Pool.mu - it calls nothing back)
-            self.R.gamerecs().add(it, self.name, [g['rec']])
+            # (the engine: this run's, which replayed the game and whose farm compatibility the worker build has -
+            # its build_id beside it, docs/az.md 59.4)
+            self.R.gamerecs().add(it, self.name, [g['rec']], build=dict(GR.build_info(), worker=self.build))
         if g['s'] is None:
             return
         key = (it, m)
