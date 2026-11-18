@@ -19,7 +19,8 @@ macOS / Linux (docs/az.md 62): the load is the 1-minute load average over the co
 at that niceness (beside a live run), `--runtime-dir` gives the native side its runtime pack (`libonnxruntime.dylib`),
 `--rolling` makes its job a rolling one (zero-farm PROTOCOL.md 10.5: the farm's self-play leases), `--native-job
 key=JSON` adds a field to its job line (the agent's tuning fields `conc`, `groups`, `infer_threads`, `spinning`), and
-`--sides native,python` picks the sides (default both). Beside a live run the numbers are contended: the RATIO of the
+`--sides native,python` picks the sides (default both), `--python-procs N` runs N Python workers at once (the SSH
+self-play's processes; their sums). Beside a live run the numbers are contended: the RATIO of the
 interleaved sides is what they measure.
 """
 import argparse
@@ -185,7 +186,7 @@ def python_child(a):
                     json.dump(kw, f)
                 self.ctl.put({'cmd': 'quit'})
 
-    w = W(a.mirror, 0)
+    w = W(a.mirror, a.proc)
     w.ctl.put({'cmd': 'phase', 'iter': it, 'model': f'models/iter_{it - 1:04d}.pt'})
     threading.Timer(a.minutes * 60, lambda: w.ctl.put({'cmd': 'end', 'iter': it})).start()
     os._exit(w.main())
@@ -207,29 +208,52 @@ def batch_summary(batches):
 
 
 def python_side(a, cfg, out, seed):
+    """The Python remote worker for `--minutes`: `--python-procs` children at once (the SSH self-play's processes, each
+    its own mirror, its worker index its own seeds) -> their sums (leaves, games, rows), the longest seconds, the peak
+    of their largest process and their batches merged."""
     shutil.rmtree(out, ignore_errors=True)
-    os.makedirs(os.path.join(out, 'models'))
-    shutil.copy(a.checkpoint, os.path.join(out, 'models', f'iter_{a.iter - 1:04d}.pt'))
-    with open(os.path.join(out, 'config.json'), 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=1)
-    with open(os.path.join(out, 'selfplay.json'), 'w', encoding='utf-8') as f:
-        json.dump({'mode': 'selfplay', 'locks': [], 'nice': 0, 'run_id': 'bench', 'mirror': 'bench', 'watchdog_s': 1e9,
-                   'linger': False, 'test': {}}, f)
+    procs = []
     t0 = time.time()
-    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), '--python-child', '--mirror', out, '--root', a.root,
-                          '--package', a.package, '--minutes', str(a.minutes), '--iter', str(a.iter)],
-                         stdout=open(os.path.join(out, 'stdout.log'), 'w', encoding='utf-8'),
-                         stderr=open(os.path.join(out, 'stderr.log'), 'w', encoding='utf-8'),
-                         env=dict(os.environ, CUDA_VISIBLE_DEVICES=''), preexec_fn=lower_priority(a.nice))
+    for k in range(a.python_procs):
+        d = out if a.python_procs == 1 else os.path.join(out, f'p{k}')
+        os.makedirs(os.path.join(d, 'models'))
+        shutil.copy(a.checkpoint, os.path.join(d, 'models', f'iter_{a.iter - 1:04d}.pt'))
+        with open(os.path.join(d, 'config.json'), 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=1)
+        with open(os.path.join(d, 'selfplay.json'), 'w', encoding='utf-8') as f:
+            json.dump({'mode': 'selfplay', 'locks': [], 'nice': 0, 'run_id': 'bench', 'mirror': 'bench', 'watchdog_s': 1e9,
+                       'linger': False, 'test': {}}, f)
+        procs.append((d, subprocess.Popen([sys.executable, os.path.abspath(__file__), '--python-child', '--mirror', d, '--root', a.root,
+                                           '--package', a.package, '--minutes', str(a.minutes), '--iter', str(a.iter), '--proc', str(k)],
+                                          stdout=open(os.path.join(d, 'stdout.log'), 'w', encoding='utf-8'),
+                                          stderr=open(os.path.join(d, 'stderr.log'), 'w', encoding='utf-8'),
+                                          env=dict(os.environ, CUDA_VISIBLE_DEVICES=''), preexec_fn=lower_priority(a.nice))))
     peak = 0.0
-    while p.poll() is None:
-        m = peak_wset(p.pid)
-        peak = max(peak, m or 0.0)
+    while any(p.poll() is None for _, p in procs):
+        for _, p in procs:
+            peak = max(peak, peak_wset(p.pid) or 0.0)
         time.sleep(5)
-    with open(os.path.join(out, 'end.json'), encoding='utf-8') as f:
-        end = json.load(f)
-    return {'leaves': end['leaves'], 'games': end['games'], 'rows': end.get('rows'), 'seconds': end['seconds'],
-            'wall_s': round(time.time() - t0, 1), 'peak_mb': round(peak) if peak else None, **(end.get('batches') or {})}
+    ends = []
+    for d, _ in procs:
+        with open(os.path.join(d, 'end.json'), encoding='utf-8') as f:
+            ends.append(json.load(f))
+    bs = [e.get('batches') or {} for e in ends]
+    nb = sum(b.get('infer_batches', 0) for b in bs)
+    merged = {}
+    if nb:
+        hist = {}
+        for b in bs:
+            for k, v in (b.get('batch_rows_hist') or {}).items():
+                hist[k] = hist.get(k, 0) + v
+        merged = {'infer_batches': nb, 'batch_rows_hist': hist,
+                  'batch_rows_mean': round(sum(b['batch_rows_mean'] * b['infer_batches'] for b in bs if b) / nb, 1),
+                  'infer_ms_mean': round(sum(b['infer_ms_mean'] * b['infer_batches'] for b in bs if b) / nb, 2),
+                  'infer_ms_p50': max(b.get('infer_ms_p50') or 0 for b in bs), 'infer_ms_p95': max(b.get('infer_ms_p95') or 0 for b in bs),
+                  'infer_ms': round(sum(b.get('infer_ms') or 0 for b in bs))}
+    secs = max(e['seconds'] for e in ends)
+    return {'leaves': sum(e['leaves'] for e in ends), 'games': sum(e['games'] for e in ends),
+            'rows': sum(e.get('rows') or 0 for e in ends), 'seconds': secs, 'wall_s': round(time.time() - t0, 1),
+            'peak_mb': round(peak) if peak else None, 'procs': a.python_procs, **merged}
 
 
 def main():
@@ -253,6 +277,8 @@ def main():
     ap.add_argument('--native-job', action='append', default=[], help='key=JSON: a field of the native job line')
     ap.add_argument('--nice', type=int, default=0, help='POSIX: both sides at this niceness')
     ap.add_argument('--sides', default='native,python', help='the sides to run, in round 0\'s order')
+    ap.add_argument('--python-procs', type=int, default=1, help='Python remote workers at once (the SSH self-play\'s procs)')
+    ap.add_argument('--proc', type=int, default=0, help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.python_child:
         return python_child(a)
