@@ -240,3 +240,32 @@ def test_self_play_records_files_name_their_engine(tmp_path):
         f.write(json.dumps({'v': 1, 'kind': 'spec', 'spec': rec['spec'], 'json': '{}'}) + '\n' + json.dumps(rec) + '\n')
     b = []
     assert len(GR.read_file(p, b)[1]) == 1 and b == []
+
+
+def test_a_subclass_with_its_own_matches_is_called_as_before(tmp_path):
+    """Co-training's primary overrides play_match / bots_match (its matches are the resolver's episodes): with
+    game_records on they get the calls of before - no `rec` - and record nothing."""
+    calls = []
+
+    class Primary(Run):
+        def play_match(self, it, opp, n_games, sims, seed, opp_model=None):
+            calls.append((opp, n_games))
+            return [(1.0, 1.0, 3, True)] * n_games
+
+        def bots_match(self, a, b, n_games, seed):
+            calls.append((a, b))
+            return n_games / 2
+
+    run = tmp_path / 'runs' / 'r'
+    _ckpts(str(run), 2)
+    cfg = dict(DEFAULTS, **PRESETS['toy-smoke'])
+    cfg.update(game='toy', yardstick='heuristic', eval_games=2, eval_random_games=2, elo_games=2, ref_games=2,
+               game_records=1)
+    R = Primary(str(run), cfg)
+    m = {'iter': 1}
+    R.evaluate(1, m)
+    R.elo_update(1, m)
+    assert ('heuristic', 2) in calls and ('random', 'heuristic') in calls and ('nn', 2) in calls
+    assert not os.path.exists(run / 'records')
+    assert Run(str(run), cfg).rec_kw('play_match', rec=1) == {'rec': 1}
+    assert Run(str(run), dict(cfg, game_records=0)).rec_kw('play_match', rec=1) == {}

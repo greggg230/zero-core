@@ -837,6 +837,14 @@ class Run:
         return GR.MatchSink(os.path.join(self.run, GR.DIR), kind, it=it, src=getattr(self, 'records_src', 'local'),
                             log=self.log)
 
+    def rec_kw(self, fn, **kw):
+        """The keyword that records a match's games (docs/az.md 59.3) for the method `fn` ('play_match',
+        'play_matches', 'bots_match') - kw, when game_records is on and `fn` is this class's own; else {} (the call of
+        before: a subclass's matches - co-training's primary plays its as the resolver's episodes - are not recorded)."""
+        if not self.cfg.get('game_records') or getattr(type(self), fn) is not getattr(Run, fn):
+            return {}
+        return kw
+
     def records_close(self, it, out, accepted):
         """game_records: iteration `it`'s records closed (their DONE.json) and their summary into the phase's metrics."""
         gr = self.gamerecs()
@@ -2072,7 +2080,8 @@ class Run:
         pg = []
         gk = {'games': pg} if self.eval_chained() else {}       # (docs/az.md 42; else the calls of before)
         m['eval_yard'] = summarize(self.play_match(it, self.yard, c['eval_games'], c['eval_sims'], seed=7919 * it + 1,
-                                                   rec=('eval', it, elo.ckpt_name(it), self.yard), **gk))
+                                                   **self.rec_kw('play_match', rec=('eval', it, elo.ckpt_name(it),
+                                                                                    self.yard)), **gk))
         m['eval_yard']['opp'] = self.yard
         if pg:
             # a chained game's contests (docs/az.md 42): the rows above are matches, these its games
@@ -2084,7 +2093,9 @@ class Run:
             pg = []
             gk = {'games': pg} if self.eval_chained() else {}
             m['eval_random'] = summarize(self.play_match(it, 'random', c['eval_random_games'], c['eval_sims'],
-                                                         seed=7919 * it + 2, rec=('eval', it, elo.ckpt_name(it), 'random'),
+                                                         seed=7919 * it + 2,
+                                                         **self.rec_kw('play_match',
+                                                                       rec=('eval', it, elo.ckpt_name(it), 'random')),
                                                          **gk))
             if pg:
                 m['eval_random']['per_game'] = G.summarize_games(pg)
@@ -2132,7 +2143,7 @@ class Run:
             res.setdefault('select', tag)
             res.setdefault('since', latest)
         if self.yard != 'random' and not elo.has(res, 'random', self.yard) and c['ref_games']:
-            s = self.bots_match('random', self.yard, c['ref_games'], seed=17, rec_it=latest)
+            s = self.bots_match('random', self.yard, c['ref_games'], seed=17, **self.rec_kw('bots_match', rec_it=latest))
             elo.add(res, 'random', self.yard, s, c['ref_games'])
             self.log(f'reference: random vs {self.yard}: {s:.1f}/{c["ref_games"]}')
         logged = res.setdefault('logged', [])
@@ -2175,8 +2186,8 @@ class Run:
                 gs = {}
                 gk = {'games': gs} if self.eval_chained() else {}
                 rk = ('elo', latest, elo.ckpt_name(k), {j: elo.ckpt_name(j) for j in js})
-                for j, rows in self.play_matches(k, js, c['elo_games'], sims, seed=31 + 7919 * k, rec=rk, **gk,
-                                                 **pk).items():
+                for j, rows in self.play_matches(k, js, c['elo_games'], sims, seed=31 + 7919 * k,
+                                                 **self.rec_kw('play_matches', rec=rk), **gk, **pk).items():
                     record(k, j, rows, gs.get(j))
         else:
             for k, j in todo:
@@ -2184,7 +2195,8 @@ class Run:
                 gk = {'games': gs} if self.eval_chained() else {}
                 record(k, j, self.play_match(k, 'nn', c['elo_games'], sims, seed=31 + 7919 * k + 101 * j,
                                              opp_model=model_path(self.run, j),
-                                             rec=('elo', latest, elo.ckpt_name(k), elo.ckpt_name(j)), **gk, **pk), gs)
+                                             **self.rec_kw('play_match', rec=('elo', latest, elo.ckpt_name(k),
+                                                                              elo.ckpt_name(j))), **gk, **pk), gs)
         anchors = elo.parse_anchors(c.get('elo_anchors', ''))
         if anchors:
             self.anchor_matches(res, anchors, latest, tag, sims, pk)
@@ -2279,7 +2291,8 @@ class Run:
                             raise AnchorRefused(f'elo_anchors: calibrating {lb!r} needs the fixed anchor {other!r}, '
                                                 f'which is not among elo_anchors (its file is needed)')
                         rows = self.play_match(None, 'nn', ng, sims, seed=97 + 1013 * (i + 1) + 31 * j, opp_model=op,
-                                               model=path, rec=('anchor', latest, name, other), **pk)
+                                               model=path, **self.rec_kw('play_match', rec=('anchor', latest, name,
+                                                                                            other)), **pk)
                         sc = sum(r[0] for r in rows)
                         elo.add(res, name, other, sc, len(rows))
                         save()
@@ -2306,7 +2319,8 @@ class Run:
             if not todo:
                 continue
             got = self.play_matches(k, [n for n, _ in todo], ng, sims, seed=53 + 7919 * k, paths=dict(todo),
-                                    rec=('anchor', latest, elo.ckpt_name(k), {n: n for n, _ in todo}), **pk)
+                                    **self.rec_kw('play_matches', rec=('anchor', latest, elo.ckpt_name(k),
+                                                                       {n: n for n, _ in todo})), **pk)
             for name, rows in got.items():
                 sc = sum(r[0] for r in rows)
                 elo.add(res, elo.ckpt_name(k), name, sc, len(rows))
