@@ -53,6 +53,7 @@ fn job(dir: &Path, games: u64, gid_base: u32, groups: usize, sparse: bool) -> Jo
         record_batches: None,
         status_s: 0.0,
         output: Output::Shards,
+        rolling: None,
     }
 }
 

@@ -17,9 +17,18 @@
 //! driver's phase ends, the new network is loaded and the driver resumes with its id (games in
 //! flight go on; their searches restart with the new network, each row keeps the id of the network
 //! that searched it).
+//!
+//! A rolling job (`Job::rolling`, zero-farm PROTOCOL.md 10.5, zero-core docs/az.md 54) does not end when its `games`
+//! are done: it keeps up to `conc` games in flight while ids are left, then idles (the control thread still answers
+//! `ping` and sends `status`) until `extend` raises its games or `finish` / `quit` ends it; `low` asks for more ids
+//! once per games value when fewer than `conc` are left; a records file (and a shard) is also written `flush_s`
+//! seconds after the first game in it finished; and a `checkpoint` builds and self-tests the new network on a
+//! thread of its own while the games go on with the old one, then does the phase change above. A job without
+//! `rolling` runs exactly as before.
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -73,6 +82,21 @@ pub struct Job {
     pub status_s: f64,
     /// Game records, shards or both (`records`).
     pub output: Output,
+    /// A rolling job (zero-farm PROTOCOL.md 10.5; None: a classic job, exactly as before).
+    pub rolling: Option<Rolling>,
+}
+
+/// A rolling job's settings (the job line's `rolling: true`, `flush_s`).
+#[derive(Clone, Debug)]
+pub struct Rolling {
+    /// The longest a finished game waits in the worker before its file is written (s).
+    pub flush_s: f64,
+}
+
+impl Default for Rolling {
+    fn default() -> Rolling {
+        Rolling { flush_s: 120.0 }
+    }
 }
 
 /// A checkpoint to switch to.
@@ -92,13 +116,22 @@ pub(crate) struct CtlState {
     pub(crate) quit: bool,
     pub(crate) finish: bool,
     pub(crate) checkpoint: Option<Checkpoint>,
+    /// A rolling job's games as `extend` raised them (the largest asked; None: never extended).
+    pub(crate) extend: Option<u64>,
 }
+
+/// An evaluator a rolling job's checkpoint built that the job has not swapped in yet: a `yield` releases it too
+/// (no GPU memory held while yielded; it is rebuilt on its first batch).
+type Staged = Arc<Mutex<Option<Box<dyn Evaluator>>>>;
 
 /// The job's control state, shared by the agent's line reader and the job.
 #[derive(Default)]
 pub struct Control {
     pub(crate) s: Mutex<CtlState>,
     pub(crate) cv: Condvar,
+    /// A rolling job's next evaluator (`Staged`) and the yielded state as its builder thread reads it.
+    staged: Staged,
+    yielded_flag: Arc<AtomicBool>,
 }
 
 impl Control {
@@ -106,6 +139,7 @@ impl Control {
         let mut s = self.s.lock().unwrap();
         s.quit = true;
         s.yielded = false;
+        self.yielded_flag.store(false, Ordering::SeqCst);
         self.cv.notify_all();
     }
     pub fn finish(&self) {
@@ -114,6 +148,16 @@ impl Control {
     pub fn checkpoint(&self, c: Checkpoint) {
         self.s.lock().unwrap().checkpoint = Some(c);
     }
+    /// A rolling job's `extend`: its games become `total` (never lower: a lower or equal total than one asked
+    /// before is ignored here, and the job ignores one not above its games) -> whether it was taken.
+    pub fn extend(&self, total: u64) -> bool {
+        let mut s = self.s.lock().unwrap();
+        if s.extend.is_some_and(|g| g >= total) {
+            return false;
+        }
+        s.extend = Some(total);
+        true
+    }
     pub fn is_yielded(&self) -> bool {
         self.s.lock().unwrap().yielded
     }
@@ -121,6 +165,7 @@ impl Control {
         let mut s = self.s.lock().unwrap();
         let was = s.yielded;
         s.yielded = on;
+        self.yielded_flag.store(on, Ordering::SeqCst);
         self.cv.notify_all();
         was != on
     }
@@ -527,9 +572,129 @@ struct Run<'a> {
     t0: Instant,
     t_status: Instant,
     fin_unsent: u64,
+    /// The job's game ids: `job.games`, raised by a rolling job's `extend`.
+    games: u64,
+    /// A rolling job: the games value `low` was sent for.
+    low_sent: Option<u64>,
+    /// A rolling job: when the first game the writers hold (in no file yet) finished.
+    held_since: Option<Instant>,
+    /// A rolling job's checkpoint whose network is being built, and a newer one asked meanwhile.
+    building: Option<Building>,
+    next_ck: Option<Checkpoint>,
+}
+
+/// A rolling job's next network, built on a thread of its own while the games go on (`Run::start_build`).
+struct Building {
+    ck: Checkpoint,
+    thread: std::thread::JoinHandle<Result<(), String>>,
+    /// The build's events and log lines, sent on by the job when it collects the build.
+    out: Arc<Buffered>,
+}
+
+/// A sink that keeps events and log lines (a background build's; the job's own sink sends them on, in order).
+#[derive(Default)]
+struct Buffered(Mutex<Vec<Result<Value, String>>>);
+
+impl Sink for Buffered {
+    fn event(&self, v: Value) {
+        self.0.lock().unwrap().push(Ok(v));
+    }
+    fn log(&self, msg: &str) {
+        self.0.lock().unwrap().push(Err(msg.to_string()));
+    }
+}
+
+/// A rolling job's next evaluator: the checkpoint's network on the job's runtime and providers (its file's sha256
+/// checked, its self-test passed: `selftest` with `gen`), or the uniform evaluator in a uniform job (tests, the
+/// plumbing gate).
+fn checkpoint_eval(kind: &EvalKind, c: &Checkpoint, want: &Expect, sink: &dyn Sink, progress: &Mutex<Progress>) -> Result<Box<dyn Evaluator>, String> {
+    match kind {
+        EvalKind::Uniform => Ok(Box::new(Uniform)),
+        EvalKind::Onnx { ort, .. } => build_eval(&EvalKind::Onnx { model: c.model.clone(), ort: ort.clone(), sha256: c.sha256.clone(), reference: c.reference.clone() }, want, sink, progress, Some(c.gen)),
+    }
 }
 
 impl Run<'_> {
+    /// Games the writers hold that are in no file yet.
+    fn held(&self) -> usize {
+        match &self.rec {
+            Some(rw) => rw.pending_games(),
+            None => self.writer.pending_games(),
+        }
+    }
+
+    /// A rolling job: write what the writers hold (`flush_s` passed since the first of it finished).
+    fn flush_held(&mut self) -> Result<(), String> {
+        if let Some(w) = self.rec.as_mut().map(|rw| rw.flush()).transpose()?.flatten() {
+            self.emit_file("records", w);
+        }
+        if self.job.output.shards() {
+            if let Some(w) = self.writer.flush()? {
+                self.emit_file("shard", w);
+            }
+        }
+        self.held_since = None;
+        Ok(())
+    }
+
+    /// A rolling job's checkpoint: its network built and self-tested on a thread of its own (into `ctl.staged`).
+    fn start_build(&mut self, c: Checkpoint) {
+        let out = Arc::new(Buffered::default());
+        let (kind, want, progress, staged, flag, o2, c2) = (self.job.eval.clone(), self.want.clone(), self.progress.clone(), self.ctl.staged.clone(), self.ctl.yielded_flag.clone(), out.clone(), c.clone());
+        let thread = std::thread::Builder::new()
+            .name("zero-worker-checkpoint".into())
+            .spawn(move || {
+                let mut ev = checkpoint_eval(&kind, &c2, &want, &*o2, &progress)?;
+                let mut st = staged.lock().unwrap();
+                // (built during a yield: released now, rebuilt on its first batch - do_yield)
+                if flag.load(Ordering::SeqCst) {
+                    ev.release();
+                }
+                *st = Some(ev);
+                Ok(())
+            })
+            .expect("spawn the checkpoint thread");
+        self.sink.log(&format!("checkpoint {} ({}): building its evaluator while the games go on", c.gen, c.model.display()));
+        self.building = Some(Building { ck: c, thread, out });
+    }
+
+    /// A rolling job's checkpoints: one asked starts its build (or waits for the one being built: the newest
+    /// wins); a finished build ends the driver's phase (`switching`: the evaluator is swapped in once the phase
+    /// ended, `run_job`).
+    fn rolling_checkpoint(&mut self, ck: Option<Checkpoint>) -> Result<(), String> {
+        if let Some(c) = ck {
+            if self.building.is_some() || self.switching.is_some() {
+                self.next_ck = Some(c);
+            } else if !self.ended {
+                self.start_build(c);
+            }
+        }
+        if self.building.as_ref().is_some_and(|b| b.thread.is_finished()) {
+            let b = self.building.take().unwrap();
+            let res = b.thread.join().map_err(|_| "the checkpoint thread panicked".to_string())?;
+            for x in std::mem::take(&mut *b.out.0.lock().unwrap()) {
+                match x {
+                    Ok(v) => self.sink.event(v),
+                    Err(m) => self.sink.log(&m),
+                }
+            }
+            // (a failed self-test is fatal, as at the start)
+            res?;
+            if let Some(n) = self.next_ck.take() {
+                // (built, but a newer one came meanwhile: that one instead)
+                self.ctl.staged.lock().unwrap().take();
+                self.sink.log(&format!("checkpoint {}: superseded by {} before the switch", b.ck.gen, n.gen));
+                if !self.ended {
+                    self.start_build(n);
+                }
+            } else if !self.ended {
+                self.drv.end_phase();
+                self.switching = Some(b.ck);
+            }
+        }
+        Ok(())
+    }
+
     fn snapshot(&mut self) {
         let st = self.drv.stats();
         let mut p = self.progress.lock().unwrap();
@@ -559,9 +724,9 @@ impl Run<'_> {
 
     /// The remote worker's `pump`: control, finished games into the shards, setups queued, status.
     fn pump(&mut self) -> Result<(), String> {
-        let (quit, finish, ck) = {
+        let (quit, finish, ck, extend) = {
             let mut s = self.ctl.s.lock().unwrap();
-            (s.quit, s.finish, s.checkpoint.take())
+            (s.quit, s.finish, s.checkpoint.take(), s.extend)
         };
         if quit && !self.ended {
             self.drv.end_phase();
@@ -571,7 +736,15 @@ impl Run<'_> {
         if finish {
             self.stop_topup = true;
         }
-        if let Some(c) = ck {
+        let rolling = self.job.rolling.clone();
+        if rolling.is_some() {
+            // (a rolling job: `extend` raises the games, never lowers them; the checkpoint's network is built in
+            // the background)
+            if let Some(g) = extend.filter(|&g| g > self.games) {
+                self.games = g;
+            }
+            self.rolling_checkpoint(ck)?;
+        } else if let Some(c) = ck {
             if !self.ended {
                 self.drv.end_phase();
                 self.switching = Some(c);
@@ -618,6 +791,14 @@ impl Run<'_> {
                     self.emit_file("shard", w);
                 }
             }
+            if rolling.is_some() {
+                // (the first finished game the writers hold since their last file: flush_s counts from it)
+                if self.held() == 0 {
+                    self.held_since = None;
+                } else if self.held_since.is_none() {
+                    self.held_since = Some(Instant::now());
+                }
+            }
         }
         if it.next().is_some() {
             return Err("samples left over after the finished games".into());
@@ -630,11 +811,21 @@ impl Run<'_> {
         }
         if !self.stop_topup && self.switching.is_none() {
             let outstanding = self.enq - self.finished;
-            let room = self.cap.saturating_sub(outstanding).min(self.job.games - self.enq);
+            let room = self.cap.saturating_sub(outstanding).min(self.games - self.enq);
             for _ in 0..room {
                 let tag = format!("{}:{}", self.job.lease_id, self.enq);
                 self.drv.enqueue(&tag, &self.spec)?;
                 self.enq += 1;
+            }
+        }
+        if let Some(rl) = &rolling {
+            // fewer than conc ids left to start: ask for more, once per games value (PROTOCOL.md 10.5)
+            if !self.stop_topup && self.games - self.enq < self.cap && self.low_sent != Some(self.games) {
+                self.low_sent = Some(self.games);
+                self.sink.event(json!({"ev": "low", "started": self.enq, "games": self.games}));
+            }
+            if self.held_since.is_some_and(|t| t.elapsed().as_secs_f64() >= rl.flush_s) {
+                self.flush_held()?;
             }
         }
         self.snapshot();
@@ -759,12 +950,45 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let writer = ShardWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, meta, sparse, info.num_features, 1, crate::shard::RowsFmt::of(&info))?;
     let (link, answers, eval_thread) = spawn_eval(ev);
     link_out(link.clone());
-    let mut r = Run { job, sink, ctl, drv, link, answers, pending: VecDeque::new(), writer, rec, spec, cap, enq: 0, finished: 0, stop_topup: false, ended: false, switching: None, progress: progress.clone(), recorder: job.record_batches.as_ref().map(|(p, n)| Recorder::new(p.clone(), *n)), want, t0, t_status: Instant::now(), fin_unsent: 0 };
+    let mut r = Run { job, sink, ctl, drv, link, answers, pending: VecDeque::new(), writer, rec, spec, cap, enq: 0, finished: 0, stop_topup: false, ended: false, switching: None, progress: progress.clone(), recorder: job.record_batches.as_ref().map(|(p, n)| Recorder::new(p.clone(), *n)), want, t0, t_status: Instant::now(), fin_unsent: 0, games: job.games, low_sent: None, held_since: None, building: None, next_ck: None };
     let res = (|| -> Result<(), String> {
         r.pump()?;
         let mut idle = 0;
         loop {
             r.drive()?;
+            if r.job.rolling.is_some() {
+                if r.ended {
+                    // (quit while a switch was armed: no swap, the driver is never resumed after its end)
+                    r.switching = None;
+                }
+                if let Some(c) = r.switching.take() {
+                    // a rolling job's phase change: the evaluator its checkpoint built (and self-tested) in the
+                    // background swapped in, the driver resumed with its id
+                    let new = r.ctl.staged.lock().unwrap().take().ok_or("internal: a checkpoint switch without its evaluator")?;
+                    let (t, rx) = channel();
+                    r.link.tx.send(Req::Swap(new, t)).map_err(|_| "the evaluator thread is gone".to_string())?;
+                    let _ = rx.recv();
+                    r.drv.resume(BIG, c.gen)?;
+                    r.sink.log(&format!("checkpoint {} ({}): the driver resumed with it", c.gen, c.model.display()));
+                    if let Some(n) = r.next_ck.take() {
+                        r.start_build(n);
+                    }
+                    idle = 0;
+                    r.pump()?;
+                    continue;
+                }
+                if r.ended || (r.stop_topup && r.enq == r.finished) {
+                    break;
+                }
+                // every released id played (or a queue_only driver with an empty queue): wait for extend, finish,
+                // quit or a checkpoint's build (a pump every 20 ms: flush_s and the build are checked there too)
+                idle += 1;
+                if idle > 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                r.pump()?;
+                continue;
+            }
             if let Some(c) = r.switching.take() {
                 // the remote worker's phase change: the new network, the driver resumed with its id
                 let new = build_eval(&EvalKind::Onnx { model: c.model.clone(), ort: match &r.job.eval {
@@ -807,6 +1031,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         _ => Ok(()),
     };
     r.snapshot();
+    let games = r.games;
     let Run { link, writer, rec, .. } = r;
     let _ = link.tx.send(Req::Stop);
     drop(link);
@@ -814,15 +1039,17 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     res?;
     rec_res?;
     let p = progress.lock().unwrap();
-    let reason = if p.games >= job.games {
+    // (a rolling job never ends 'done': it waits for more ids until finish or quit)
+    let reason = if job.rolling.is_none() && p.games >= job.games {
         "done"
     } else if ctl.s.lock().unwrap().quit {
         "quit"
     } else {
         "finish"
     };
+    // (the job's ids: a rolling job's released ones, its games as extend left them)
     let lo = job.gid_base;
-    let hi = job.gid_base + job.games as u32;
+    let hi = job.gid_base + games as u32;
     let mut stats = p.stats();
     stats["peak_rss_mb"] = json!(peak_rss_mb());
     // (games after the last shard that had no samples - an aborted game -: in no shard's `games`; the remote
@@ -841,6 +1068,11 @@ pub fn do_yield(ctl: &Control, link: Option<&EvalLink>, progress: &Mutex<Progres
     }
     if let Some(l) = link {
         l.release();
+    }
+    // (a rolling job's next network, built but not swapped in yet; set_yielded came first: one staged after this
+    // sees the flag and is released by its builder)
+    if let Some(e) = ctl.staged.lock().unwrap().as_mut() {
+        e.release();
     }
     let dt = t0.elapsed().as_secs_f64();
     let mut p = progress.lock().unwrap();

@@ -577,3 +577,167 @@ def test_progress_polling_never_deadlocks_a_draining_backlog(pool):
         sys.setswitchinterval(old)
         if not stuck:                           # (a deadlocked RemotePlay.mu would hang close: the threads are daemons)
             rp.close()
+
+
+# ---------------------------------------------------------------- rolling leases (zero-farm PROTOCOL rev 15, docs/az.md 54)
+STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker_stub.py')
+
+
+def test_rolling_setting():
+    assert FP.rolling_setting('') is None and FP.rolling_setting(None) is None and FP.rolling_setting('  ') is None
+    assert FP.rolling_setting('auto') == {'inflight': 'auto', 'gpu_inflight': 'auto'}
+    full = {'flush_s': 60, 'inflight': 16, 'gpu_inflight': 'auto', 'block': 4096, 'max_s': 3600}
+    want = {'inflight': 16, 'gpu_inflight': 'auto', 'block': 4096, 'max_s': 3600, 'flush_s': 60}
+    assert FP.rolling_setting(full) == want and list(FP.rolling_setting(full)) == list(want)
+    assert FP.rolling_setting(json.dumps(full)) == want
+    assert FP.rolling_setting({'inflight': 8}) == {'inflight': 8}
+    for bad in ('lots', '[1]', {}, {'inflight': 0}, {'inflight': 4097}, {'inflight': True}, {'inflight': 2.0},
+                {'max_s': 599}, {'flush_s': 5}, {'block': 0}, {'block': 'auto'}, {'speed': 1}):
+        with pytest.raises(ValueError, match='rolling'):
+            FP.rolling_setting(bad)
+
+
+def test_pool_rolling_checks_the_worker_and_puts_rolling(pool, monkeypatch):
+    """pool_rolling: a worker build that does not announce `rolling` is refused loudly (nothing published); one that
+    does: every self-play PUT carries `selfplay.rolling` (and only then: off, test_pool_alternates_... checks the bodies
+    of before byte for byte); an alternate whose executable is the default's is covered, another is logged unchecked."""
+    fake, R, published = pool
+    w = {'manifest': 1, 'kind': 'worker', 'version': 'toy-test', 'game': 'zero-toy', 'entry': 'w.exe'}
+    (rt, rt_raw), (cuda, cuda_raw) = _manifests(
+        {'manifest': 1, 'kind': 'runtime', 'version': 'cpu-test', 'files': []},
+        {'manifest': 1, 'kind': 'runtime', 'version': 'cuda-test', 'gpu': {'vendor': 'nvidia', 'providers': ['cuda']},
+         'files': []})
+    exe = {'path': 'w.exe', 'sha256': 'a' * 64, 'size': 1}
+    (build, build_raw), (alt, alt_raw), (other, other_raw) = _manifests(
+        dict(w, requires_runtime=rt, files=[exe]), dict(w, requires_runtime=cuda, files=[exe]),
+        dict(w, requires_runtime=cuda, version='toy-other', files=[dict(exe, sha256='c' * 64)]))
+    for bid, raw in ((rt, rt_raw), (cuda, cuda_raw), (build, build_raw), (alt, alt_raw), (other, other_raw)):
+        fake.objects[f'builds/{bid}/manifest.json'] = raw
+    roll = {'inflight': 64, 'gpu_inflight': 'auto', 'flush_s': 60}
+    R.cfg.update(pool_build=build, pool_runtime=rt, pool_worker=STUB, pool_rolling=json.dumps(roll),
+                 pool_alternates=f'{alt},{other}')
+    monkeypatch.setenv('WORKER_STUB_BUILD', build)
+    monkeypatch.delenv('WORKER_STUB_FEATURES', raising=False)
+    p = FP.Pool(QuotaRP(R), f'pool:{FARM}')
+    try:
+        assert 'rolling {"inflight": 64' in p.describe()
+        p.begin(1)
+        wait(lambda: p.error and 'pool_rolling' in p.error, 'a worker without rolling refused')
+        assert "not 'rolling'" in p.error and not fake.ckpts and not published
+        assert not any(m == 'PUT' and pth == f'/v1/admin/run/{FARM}' for m, pth, _ in fake.calls), 'nothing PUT'
+        monkeypatch.setenv('WORKER_STUB_FEATURES', 'rolling')
+        wait(lambda: 0 in fake.ckpts and p.st.get('selfplay_put'), 'gen 0 registered once the worker plays rolling jobs')
+    finally:
+        p.close()
+        p.th.join(10)
+    puts = [b for m, pth, b in fake.calls if m == 'PUT' and pth == f'/v1/admin/run/{FARM}']
+    assert puts[0]['selfplay'] is None and puts[-1]['selfplay']['rolling'] == roll
+    assert list(puts[-1]['selfplay'])[-1] == 'rolling'
+    assert p.st['put_extras']['rolling'] == roll
+    lines = '\n'.join(R.lines)
+    assert f"alternate {other}'s executable is not the default build's" in lines
+    assert f"alternate {alt}'s executable" not in lines, "the default build's executable: covered"
+    assert 'the worker build plays rolling jobs' in lines
+
+
+class StaleRP(QuotaRP):
+    def __init__(self, R, it):
+        super().__init__(R)
+        self.it = it
+
+    def pool_iteration(self):
+        return self.it
+
+
+def _held(sd, nets, gid, machine='m_a'):
+    """A held game (as Pool._chunk keeps it: sparse rows) of samples `sd` whose rows' networks are `nets`."""
+    s = {k: np.array(v) for k, v in sd.items()}
+    s['net'] = np.asarray(nets, s['net'].dtype)
+    s['xs'] = FP._sparse_rows(s)
+    del s['x']
+    return {'gid': gid, 'machine': machine, 'net': int(min(nets)), 's': s, 'rows': len(nets), 'replay_s': 0.0}
+
+
+@pytest.mark.parametrize('rolling', [False, True])
+def test_staleness_per_row_with_rolling(pool, rolling):
+    """Iteration 3, max_stale 1: rows of a network < 1 are stale. Classic (pool_rolling off): a game is dropped when its
+    oldest row is stale (as before). Rolling: only the stale rows are dropped, the rest of the game kept (its shard rows
+    == the game's newer rows written directly), the game dropped only when none is left; the staleness histogram
+    counts the kept rows."""
+    from zero.protocol import take_rows
+    fake, R, _ = pool
+    if rolling:
+        R.cfg['pool_rolling'] = 'auto'
+    games = [sd for _, _, sd in farm_games(8, FP.coordinator_seed(FARM)) if sd is not None and len(sd['player']) >= 4][:3]
+    assert len(games) == 3
+    na, nc = len(games[0]['player']), len(games[2]['player'])
+    nets_a = [0] * 2 + [1] * (na - 3) + [2]                  # straddles: 2 stale rows, the rest kept
+    nets_b = [0] * len(games[1]['player'])                   # all stale
+    nets_c = [2] * nc                                        # fresh
+    p = FP.Pool(StaleRP(R, 3), f'pool:{FARM}')
+    try:
+        with p.mu:
+            p.held.extend([_held(games[0], nets_a, 1), _held(games[1], nets_b, 2), _held(games[2], nets_c, 3)])
+        p._drain()
+        for wr in p.writers.values():
+            wr.close()
+        cur = p.cur
+    finally:
+        p.close()
+        p.th.join(10)
+    d = os.path.join(R.run, 'data', 'iter_0003')
+    ref = os.path.join(R.run, 'ref-stale')
+    meta = {'game': 'toy', 'features': INFO['num_features'], 'actions': INFO['num_actions'], 'iter': 3, 'source': 'pool',
+            'machine': 'm_a', 'farm_run': FARM, **shard_format(R.cfg)}
+    w = ShardWriter(ref, 'pool-m_a', rows=R.cfg['shard_rows'], meta=meta)
+    for sd, nets in ((games[0], nets_a), (games[2], nets_c)):
+        s = {k: np.array(v) for k, v in sd.items()}
+        s['net'] = np.asarray(nets, s['net'].dtype)
+        if rolling and sd is games[0]:
+            s = take_rows(s, 2, na)
+        if rolling or sd is games[2]:
+            w.add(s)
+    w.close()
+    want, got = shard_paths(ref), shard_paths(d)
+    assert len(want) == len(got) and want
+    for a, b in zip(want, got):
+        x, y = np.load(a), np.load(b)
+        assert sorted(x.files) == sorted(y.files)
+        for k in x.files:
+            if k != 'meta':
+                assert x[k].tobytes() == y[k].tobytes(), k
+    if rolling:
+        assert (cur['games'], cur['stale_dropped'], cur['stale_rows_dropped']) == (2, 1, 2 + len(nets_b))
+        assert cur['rows'] == na - 2 + nc
+        assert cur['stale'] == {'1': na - 3, '0': 1 + nc}, cur['stale']
+    else:
+        assert (cur['games'], cur['stale_dropped'], cur['stale_rows_dropped']) == (1, 2, 0)
+        assert cur['stale'] == {'0': nc}
+
+
+def test_keep_rows_is_take_rows_for_any_rows():
+    """keep_rows (rolling staleness): any set of a sample dict's rows == the concatenation of protocol.take_rows of
+    their runs, the variable-length rows' CSRs (tails, pointer overrides: toy_tail) and sparse features included."""
+    from test_tail_shards import WIDTHS as widths, samples
+    from zero.data import SparseRows
+    from zero.protocol import concat_samples, take_rows
+    s = samples(n_games=3)
+    assert 't_off' in s and 'ov_off' in s and len(s['player']) > 12
+    n = len(s['player'])
+    for rows in ([0, 2, 3, n - 1], list(range(3, n)), [n // 2], list(range(n))):
+        runs, a = [], rows[0]
+        for i in range(1, len(rows) + 1):
+            if i == len(rows) or rows[i] != rows[i - 1] + 1:
+                runs.append((a, rows[i - 1] + 1))
+                if i < len(rows):
+                    a = rows[i]
+        want = concat_samples([take_rows(s, x, y, widths) for x, y in runs])
+        got = FP.keep_rows(s, rows, widths)
+        assert sorted(got) == sorted(want)
+        for k in want:
+            g, wv = np.asarray(got[k]), np.asarray(want[k])
+            assert g.dtype == wv.dtype and g.shape == wv.shape and g.tobytes() == wv.tobytes(), (rows, k)
+        sp = dict(s, xs=SparseRows.from_dense(s['x'], s['x'].shape[1]))
+        del sp['x']
+        got = FP.keep_rows(sp, rows, widths)
+        assert got['xs'].dense(np.arange(len(rows))).tobytes() == want['x'].astype(np.float16).tobytes()

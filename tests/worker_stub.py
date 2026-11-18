@@ -4,7 +4,8 @@
 `trainer`; for self-play a setting is `play` when crates/worker/src/run_settings.json classifies it so, else `trainer`;
 `driver-cfg` prints the self-play `play` settings (the same driver for a run's full settings and for those alone).
 Environment: WORKER_STUB_BUILD (the build id `info` names), WORKER_STUB_LOG (JSON lines: argv), WORKER_STUB_UNKNOWN
-(comma-separated settings this build doesn't know - a build older than them: `unknown`, a failure, exit 1)."""
+(comma-separated settings this build doesn't know - a build older than them: `unknown`, a failure, exit 1),
+WORKER_STUB_FEATURES (comma-separated: `info`'s `features`; unset: none, a build before rolling jobs)."""
 import json
 import os
 import re
@@ -40,7 +41,8 @@ def main(argv):
             f.write(json.dumps({'argv': argv}) + '\n')
     if argv[:1] == ['info']:
         print(json.dumps({'build_id': os.environ.get('WORKER_STUB_BUILD', ''), 'game': 'zero-toy',
-                          'kinds': ['selfplay', 'eval', 'fuzz'], 'aw': 1}))
+                          'kinds': ['selfplay', 'eval', 'fuzz'], 'aw': 1,
+                          'features': [f for f in os.environ.get('WORKER_STUB_FEATURES', '').split(',') if f]}))
         return 0
     if argv[:1] == ['check-config'] and '--json' in argv:
         with open(argv[1], encoding='utf-8') as f:

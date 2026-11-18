@@ -56,6 +56,18 @@ new alternates (or `pool_gpu_games_per_lease`) are PUT again once the next gen's
 builds) is registered (state `put_extras`: what the last self-play PUT carried of them). None (the default): no
 `alternates` key and builds [pool_build] - every PUT body and definition exactly as before.
 
+Rolling leases (zero-farm PROTOCOL rev 15, section 10; docs/az.md 54): `pool_rolling` ('' = off, the default: every
+PUT, definition and staleness judgement exactly as before) is the farm run's `selfplay.rolling` - a JSON object with
+the keys `inflight`, `gpu_inflight` (1 to 4,096 or 'auto'), `block`, `max_s`, `flush_s` (`rolling_setting`), or 'auto'
+= {"inflight": "auto", "gpu_inflight": "auto"}. Set, the first publish of a pool process checks that the worker
+build plays rolling jobs (`pool_worker`'s `info` lists the feature `rolling`; each alternate whose executable is the
+default's - the same sha256 in its signed manifest - is that executable, another one is checked when it is next to
+`pool_worker`'s build directory, else logged as unchecked) and refuses loudly otherwise; every self-play PUT carries
+`rolling` (also PUT again on a resumed run whose setting changed: `put_extras`); and staleness is judged per row: a
+held game's rows searched with a network older than i - 1 - `pool_max_stale` are dropped (`stale_rows_dropped`), the
+rest of the game is kept, and the game is dropped (`stale_dropped`) only when none is left - a rolling lease lives
+for hours, switching networks in place, so its games straddle generations.
+
 Lock order (docs/az.md 55; the pb3 hang of 2026-11-16): `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu`, outermost first.
 `Pool.mu` is innermost: a Pool never calls into its RemotePlay (`pool_iteration`, `accept_pool`, `add_failures`) while
 it holds `Pool.mu`, and RemotePlay may call the Pool methods that take only `Pool.mu` (`close`, `begin`, `progress`)
@@ -123,6 +135,94 @@ def alternate_ids(v):
         return []
     items = v.replace(',', ' ').split() if isinstance(v, str) else [str(x).strip() for x in v]
     return [x for x in items if x]
+
+
+ROLLING_KEYS = ('inflight', 'gpu_inflight', 'block', 'max_s', 'flush_s')
+_ROLLING_LIMITS = {'inflight': (1, 4096), 'gpu_inflight': (1, 4096), 'block': (1, 1 << 32), 'max_s': (600, 86400),
+                   'flush_s': (10, 3600)}
+
+
+def rolling_setting(v):
+    """The run setting `pool_rolling` -> the farm run's `selfplay.rolling` (zero-farm PROTOCOL 10.1) or None (off):
+    '' / None -> None; 'auto' -> {"inflight": "auto", "gpu_inflight": "auto"}; a dict (or its JSON text) with keys of
+    ROLLING_KEYS: inflight / gpu_inflight 1 to 4,096 or 'auto', block >= 1, max_s 600 to 86,400, flush_s 10 to 3,600
+    (missing keys: the coordinator's defaults). ValueError otherwise (an unknown key, a value out of range)."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    if isinstance(v, str):
+        if v.strip() == 'auto':
+            return {'inflight': 'auto', 'gpu_inflight': 'auto'}
+        try:
+            v = json.loads(v)
+        except ValueError:
+            raise ValueError(f"rolling {v!r}: 'auto' or a JSON object of {ROLLING_KEYS}") from None
+    if not isinstance(v, dict) or not v:
+        raise ValueError(f"rolling {v!r}: 'auto' or a non-empty object of {ROLLING_KEYS}")
+    bad = [k for k in v if k not in ROLLING_KEYS]
+    if bad:
+        raise ValueError(f'rolling: unknown key(s) {bad} (keys: {ROLLING_KEYS})')
+    out = {}
+    for k in ROLLING_KEYS:
+        if k not in v:
+            continue
+        x = v[k]
+        if k in ('inflight', 'gpu_inflight') and x == 'auto':
+            out[k] = x
+            continue
+        lo, hi = _ROLLING_LIMITS[k]
+        if isinstance(x, bool) or not isinstance(x, int) or not lo <= x <= hi:
+            auto = " or 'auto'" if k in ('inflight', 'gpu_inflight') else ''
+            raise ValueError(f'rolling: {k} {x!r}: an integer {lo} to {hi}{auto}')
+        out[k] = x
+    return out
+
+
+def worker_features(worker):
+    """The protocol features a worker executable announces (`<worker> info`'s `features`, zero-farm PROTOCOL 10.5;
+    absent: none) and its build id."""
+    from .farm_h2h import worker_json
+    rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
+    if rc != 0 or not isinstance(info, dict):
+        raise SystemExit(f'{worker} info: {text.strip()[-500:]}')
+    return list(info.get('features') or []), info.get('build_id')
+
+
+def _entry_sha(m):
+    """A worker manifest's executable: its `entry` file's sha256 (None if it lists no such file)."""
+    return next((f.get('sha256') for f in m.get('files') or [] if f.get('path') == m.get('entry')), None)
+
+
+def keep_rows(s, rows, widths=None):
+    """Rows `rows` (ascending indices) of a held game's sample dict: every per-row key, the options' arrays by
+    `opt_off`, the sparse features (`xs`), the tail and override CSRs by their offsets (`widths`: the tail segments,
+    games.tail_widths' form, needed with a tail) - protocol.take_rows for any set of rows."""
+    import numpy as np
+    from .data import SparseRows, _ranges
+    from .protocol import ROW_SAMPLE_KEYS
+    from .rows import Overrides, Tail
+    rows = np.asarray(rows, np.int64)
+    off = np.asarray(s['opt_off'], np.int64)
+    lo, n = off[rows], off[rows + 1] - off[rows]
+    pos = _ranges(lo, n)
+    out = {}
+    for k, v in s.items():
+        if k == 'opt_off':
+            out[k] = np.concatenate([np.zeros(1, np.int64), np.cumsum(n)]).astype(np.asarray(v).dtype)
+        elif k in ('opt_action', 'pi'):
+            out[k] = v[pos]
+        elif isinstance(v, SparseRows):
+            out[k] = v.take(rows)
+        elif k not in ROW_SAMPLE_KEYS:
+            out[k] = v[rows]
+    if 'ov_off' in s:
+        o = Overrides(np.asarray(s['ov_off'], np.int64), s['ov_opt'], s['ov_tok']).take(rows)
+        out.update(ov_off=o.off, ov_opt=o.opt, ov_tok=o.tok)
+    if 't_off' in s:
+        if widths is None:
+            raise ValueError('keep_rows: a sample dict with a tail needs its tail widths')
+        t = Tail.from_arrays(s, widths).take(rows)
+        out.update(t_off=t.off, t_seg=t.seg, t_slot=t.slot, t_val=t.val)
+    return out
 
 
 def play_settings(worker, build_id, cfg, d, log=None):
@@ -229,6 +329,11 @@ class Pool:
             self.gpu_per_lease = FD.gpu_games_per_lease(setting('pool_gpu_games_per_lease'))
         except ValueError as e:
             raise SystemExit(f'selfplay_remote {name!r}: pool_{e}') from None
+        try:                                      # rolling leases (PROTOCOL rev 15, 10; None: off, all as before)
+            self.rolling = rolling_setting(setting('pool_rolling'))
+        except ValueError as e:
+            raise SystemExit(f'selfplay_remote {name!r}: pool_{e}') from None
+        self.rolling_checked = False
         self.client = client or FD.Client(self.url)
         self.exporter = exporter or self._export
         self.definer = definer or self._define
@@ -281,7 +386,7 @@ class Pool:
     @staticmethod
     def _counters(it):
         return {'it': it, 'games': 0, 'rows': 0, 'shards': 0, 'records': 0, 'chunks': 0, 'refused': 0,
-                'stale_dropped': 0, 'machines': {}, 'stale': {}, 'replay_s': 0.0}
+                'stale_dropped': 0, 'stale_rows_dropped': 0, 'machines': {}, 'stale': {}, 'replay_s': 0.0}
 
     def live(self):
         """The farm is delivering: a valid game arrived within `pool_live_s` (selfplay_local 0: this machine plays no
@@ -291,7 +396,8 @@ class Pool:
 
     def describe(self):
         alts = f', alternates {",".join(self.alt_builds)}' if self.alt_builds else ''
-        return f'{self.name!r} (farm {self.url}, build {self.build}{alts}, max_stale {self.max_stale})'
+        roll = f', rolling {json.dumps(self.rolling)}' if self.rolling is not None else ''
+        return f'{self.name!r} (farm {self.url}, build {self.build}{alts}, max_stale {self.max_stale}{roll})'
 
     # ------------------------------------------------------------ the run's side (RemotePlay)
     def begin(self, it, spec=None):
@@ -340,6 +446,8 @@ class Pool:
                    'records': cur['records'], 'chunks': cur['chunks'], 'refused': cur['refused'],
                    'stale_dropped': cur['stale_dropped'], 'held': len(self.held), 'machines': dict(cur['machines']),
                    'replay_s': round(cur['replay_s'], 2), 'gen': self.st.get('current_gen'), 'stale': dict(cur['stale'])}
+            if self.rolling is not None:           # (per-row staleness; off: the metrics of before)
+                out['stale_rows_dropped'] = cur['stale_rows_dropped']
         if self.error:
             out['error'] = self.error
         return out
@@ -396,6 +504,8 @@ class Pool:
         sp.update(gpu='any', job={})
         if self.needs_ram:
             sp['needs'] = {'ram_mb': self.needs_ram}
+        if self.rolling is not None:               # (PROTOCOL rev 15; off: the key is absent, the body of before)
+            sp['rolling'] = self.rolling
         b = {'game': self.R.cfg['game'], 'build_id': self.build, 'runtime': self.runtime, 'priority': self.priority,
              'min_agent': self.min_agent}
         if self.alternates:                         # (PROTOCOL rev 11; none: the key is absent, the body of before)
@@ -411,7 +521,39 @@ class Pool:
             out['alternates'] = self.alternates
         if self.gpu_per_lease is not None:
             out['gpu_games_per_lease'] = self.gpu_per_lease
+        if self.rolling is not None:
+            out['rolling'] = self.rolling
         return out
+
+    def _check_rolling(self):
+        """`pool_rolling` set: the worker build must play rolling jobs (module docstring) - SystemExit otherwise (the
+        pool's thread logs it as refused and tries again; nothing is published meanwhile)."""
+        if not self.worker:
+            raise SystemExit("pool_rolling is set but pool_worker (the build's executable here) is not: its features "
+                             "cannot be checked")
+        feats, bid = worker_features(self.worker)
+        if bid != self.build or FD.FEATURE_ROLLING not in feats:
+            raise SystemExit(f'pool_rolling is set but pool_worker {self.worker} (build {bid}) announces features '
+                             f'{feats}, not {FD.FEATURE_ROLLING!r} of build {self.build}: a worker built before rolling '
+                             f'leases (zero-farm PROTOCOL rev 15) - rebuild it, or unset pool_rolling')
+        if self.alt_builds:
+            base = _entry_sha(FD.build_manifest(self.client, self.build))
+            here = os.path.dirname(os.path.dirname(os.path.abspath(self.worker)))
+            for b in self.alt_builds:
+                m = FD.build_manifest(self.client, b)
+                sha = _entry_sha(m)
+                if sha is not None and sha == base:
+                    continue                       # (the same executable, signed for another pack)
+                exe = os.path.join(here, b, m.get('entry') or '')
+                if m.get('entry') and os.path.isfile(exe) and FD.file_sha256(exe) == sha:
+                    feats, abid = worker_features(exe)
+                    if abid != b or FD.FEATURE_ROLLING not in feats:
+                        raise SystemExit(f'pool_rolling is set but alternate {b} ({exe}) announces features {feats}, '
+                                         f'not {FD.FEATURE_ROLLING!r}')
+                    continue
+                self.log(f"pool_rolling: alternate {b}'s executable is not the default build's and is not here: its "
+                         f"rolling support is unchecked (a worker without it plays its rolling leases as classic ones)")
+        self.log(f'pool_rolling {json.dumps(self.rolling)}: the worker build plays rolling jobs')
 
     def _publish(self, gen):
         """Gen `gen` (checkpoint `gen`) exported, uploaded, signed into a new definition version and registered
@@ -438,6 +580,9 @@ class Pool:
             # (none: [], [pool_build] without a call)
             self.alternates, self.builds = FD.run_alternates(self.client, self.build, self.runtime, self.alt_builds,
                                                              self.alt_vendor)
+        if self.rolling is not None and not self.rolling_checked:
+            self._check_rolling()
+            self.rolling_checked = True
         if not st['run_put']:
             body = self._selfplay_body(st['play'])
             body['selfplay'] = None
@@ -637,6 +782,11 @@ class Pool:
         from . import games as G
         return G.engine()
 
+    def _tail_widths(self):
+        """The game's tail segments (None for a game without tails): `keep_rows`' widths."""
+        from . import games as G
+        return G.tail_widths(self.R.info or {})
+
     def _drain(self):
         """Held games, oldest first, into the open iteration's quota (RemotePlay.accept_pool); the stale ones dropped.
         Lock order (module docstring): RemotePlay is called with `mu` released - each game is chosen under `mu`, offered
@@ -667,13 +817,25 @@ class Pool:
                         break
 
     def _head(self, it):
-        """(mu held) The oldest held game that iteration `it` may take, the stale ones before it dropped (None: none)."""
+        """(mu held) The oldest held game that iteration `it` may take, the stale ones before it dropped (None: none).
+        Rolling: a stale game's rows judged one by one - the head replaced by what is left of it."""
+        import numpy as np
+        lim = it - 1 - self.max_stale
         while self.held:
             g = self.held[0]
-            if g['net'] is not None and g['net'] < it - 1 - self.max_stale:
-                self.held.popleft()
-                self.cur['stale_dropped'] += 1
-                continue
+            if g['net'] is not None and g['net'] < lim:
+                if self.rolling is not None and g['s'] is not None:
+                    # (rolling: judged per row - the rows of a network too old dropped, the rest of the game kept)
+                    nets = np.asarray(g['s']['net'])
+                    ok = np.flatnonzero(nets >= lim)
+                    self.cur['stale_rows_dropped'] += len(nets) - len(ok)
+                    if len(ok):
+                        s = keep_rows(g['s'], ok, self._tail_widths())
+                        g = self.held[0] = dict(g, s=s, rows=len(ok), net=int(np.asarray(s['net']).min()))
+                if g['net'] < lim:
+                    self.held.popleft()
+                    self.cur['stale_dropped'] += 1
+                    continue
             return g
         return None
 
@@ -707,6 +869,7 @@ class Pool:
         w.add(g['s'])
         self.cur['rows'] += g['rows']
         lag_hist(g['s']['net'], it, self.cur['stale'])
+
 
 def _sparse_rows(s):
     """A sample dict's features as the shard writer's SparseRows (the float16 cast's non-zeros, bit for bit):

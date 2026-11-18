@@ -147,6 +147,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A comma-separated list = several hosts, each its own workers, mirror and shards, consumers `<name>/w<k>`, metrics `selfplay.remotes` (one name: exactly as before); a name `<prefix>:<arg>` calls the package's callable remote `<prefix>:`; the run directory's `selfplay_remotes` file (one name per line) replaces the list, is re-read at every phase start (hosts join and leave a live run) and alone turns remote self-play on (section 34). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6; a list too, never the file); its own is refused |
 | `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
+| `pool_rolling` | '' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before (54) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: this machine's driver when its inference is CUDA / MPS, and every remote worker on any device (56.1) - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -6877,6 +6878,8 @@ and is its validation. The trainer's side is one more kind of remote: the farm p
   carries on: a template carries only the keys the worker calls `play`, so the worker never gets it. Any other failure
   refuses as before, and so does every failure without the table (no source checkout). So an already published worker
   build keeps working with a trainer that has newer trainer-only settings (`zero.farm_h2h.config_refused`).
+* **Rolling leases** (`pool_rolling`, default '' = off; zero-farm PROTOCOL rev 15): the farm run's `selfplay.rolling`,
+  the worker's rolling jobs and staleness judged per row: section 54.
 
 ### 45.3 Off by default
 
@@ -7844,9 +7847,111 @@ swaps and answers the same positions without a self-play - the same row arrays, 
 the tolerance -, the kept positions answered by the first network give the first reference set exactly, another
 architecture gets a template of its own).
 
+## 54. Rolling self-play leases: the worker's rolling jobs and the pool's per-row staleness (`pool_rolling`; zero-farm PROTOCOL rev 15, 2026-11-16)
+
+### 54.1 Why
+
+A classic farm self-play lease (45) starts all its games at once and replaces none. Its network batch drains as games
+end: half are done after ~5 min, and the last one or two then run alone at one row per batch for minutes. A lease
+lasts as long as its slowest game whatever its size, so a large GPU lease outlives the staleness window and is refused
+whole. Measured on the farm (MTG Zero's pb3, iterations 83-131, 5.8 h, 2026-11-16; the per-PC data is in the
+maintainer's notes): GPU leases kept **33-34%** of their full-batch rate over a lease and a CPU-only lease **62%**;
+**38-43%** of what the GPU PCs played was thrown away as stale (whole 64-game leases refused by the coordinator, plus
+games the pool dropped); halving a lease's size saved only ~15% of its wall time. Keeping the batch full alone was
+estimated at **3.0x** the GPU PCs' throughput and **1.6x** a CPU PC's.
+
+A *rolling* lease (zero-farm PROTOCOL rev 15, section 10) keeps N games in flight: the worker starts a new game whenever
+one ends, asks for more ids as it goes, switches to each new generation in place, and uploads finished games in small
+chunks. The batch stays full, a new generation costs no restart, and staleness is judged per row instead of per lease.
+
+### 54.2 What it does
+
+**The worker** (`zero_worker`, PROTOCOL 10.5; `job.rs`, `proto.rs`):
+
+* `hello` and `<worker> info` carry `"features": ["rolling"]` in a build with self-play (`Worker::features`; a
+  fuzz-profile build: `[]`).
+* The job line's `"rolling": true` (and `"flush_s"`, default 120 s; `job::Rolling`; the `selfplay` CLI's `--rolling
+  [--flush-s X]`): the job does not end when its `games` are done. It keeps up to `conc` games in flight while ids are
+  left (the loop that already topped up to `conc` - now against the job's current games), then idles - a `pump` every
+  20 ms; the control thread still answers `ping` and sends `status` - until `{"op": "extend", "games": total}` raises the
+  games (ids `[gid_base, gid_base + total)`; a lower or equal total is ignored) or `finish` / `quit` ends it. It sends
+  `{"ev": "low", "started": s, "games": g}` once per games value when fewer than `conc` of its ids are left to start
+  (g - s < conc; not while finishing). `end` is `finish` or `quit`, never `done`; `unfinished` = the released ids not
+  finished.
+* A records file (and with `output` shards / both, a shard: the two stay cut at the same games) is also written
+  `flush_s` seconds after the first game in it finished, checked at every pump, so an idle worker flushes too.
+* `checkpoint` in a rolling job builds the new network's session and runs its self-test (`selftest` with `gen`) on a
+  thread of its own (`Run::start_build`) while the games go on with the old network; its events and log lines are
+  sent when the job collects the build. Then the driver's phase ends and the built evaluator is swapped in exactly as a
+  classic job's switch (games in flight continue, their searches restart on the new network, each row records `net`).
+  A failed self-test (or sha256) is fatal, as at the start. A checkpoint asked while one is built waits for it, and the
+  newest wins (a superseded build is dropped). A `yield` also releases a built evaluator not yet swapped in (no GPU
+  memory held while yielded; it is rebuilt on its first batch). In a uniform-evaluator job the checkpoint switches to
+  the uniform evaluator with the new gen (tests, the plumbing gate); a classic uniform job still refuses one.
+* A job without `rolling` runs exactly as before: the same loop, the same files and rows, `end` `done`, `extend`
+  answered with the non-fatal "unknown op" error of before, the classic checkpoint path (built on the job's thread)
+  unchanged.
+
+**The pool** (`zero/farm_pool.py`; the farm run's side, PROTOCOL 10.1 / 10.7), run setting `pool_rolling`:
+
+* Its value is the farm run's `selfplay.rolling`: a JSON object (or its text) of `inflight` and `gpu_inflight` (1 to
+  4,096 or `auto`), `block` (>= 1), `max_s` (600 to 86,400), `flush_s` (10 to 3,600), missing keys taking the
+  coordinator's defaults; or `auto` = `{"inflight": "auto", "gpu_inflight": "auto"}` (`farm_pool.rolling_setting`;
+  anything else refuses the pool at start).
+* On the first publish of a pool process it checks that the worker build plays rolling jobs: `pool_worker`'s `info`
+  must name `pool_build` and list `rolling`; an alternate (45.2) whose signed manifest names the default's executable
+  (the same sha256) is that executable; another one is checked when its executable is in `pool_worker`'s builds
+  directory (`<builds>/<build id>/<entry>`), else logged as unchecked (a worker without the feature plays a rolling
+  lease as a classic one: PROTOCOL 10.5). A refusal is the pool's error, logged and retried every poll; nothing is PUT,
+  exported or published meanwhile.
+* Every self-play PUT of the farm run carries `selfplay.rolling` (last key); a resumed run whose setting changed is PUT
+  again once the next gen is registered (state `put_extras`, as the alternates).
+* Staleness per row: a held game whose oldest row's network is older than `i - 1 - pool_max_stale` loses those rows
+  (`farm_pool.keep_rows`: any rows of a held sample dict - options, sparse features, tail and override CSRs) and keeps
+  the rest; the game is dropped only when none is left. Dropped rows count in `stale_rows_dropped`, dropped games in
+  `stale_dropped`; the kept rows go into the iteration's staleness histogram (`stale`) as before. The iteration's
+  pool metrics gain `stale_rows_dropped`.
+
+### 54.3 Off by default
+
+`pool_rolling` '' (the default): no check, no `rolling` key in any PUT body (byte for byte the bodies of before), a
+stale game dropped whole as before, the metrics' keys as before. A worker job line without `rolling` is a classic job,
+exactly as before. The coordinator gives rolling leases only for a run with `selfplay.rolling` set and to agents from
+0.2.13 that ask for them (PROTOCOL 10.2).
+
+### 54.4 Costs
+
+A rolling job holds two sessions for a moment at a switch (the new one built while the old one plays). An idle rolling
+worker wakes every 20 ms. Rows train up to `pool_max_stale` generations behind, as before; rows within a game may now
+come from several networks (each row's `net` is the one that searched it).
+
+### 54.5 Tests and checks
+
+* zero_worker `tests/rolling.rs` (7, the toy game, uniform evaluator): idling at the end of the released ids, `extend`
+  (lower / equal ignored), `low` once per games value with g - s < conc, `finish` and `unfinished`; a rolling job's games
+  == the same ids' games of a classic job (one shard per game, byte for byte) with ids released a few at a time; `quit`
+  (released = finished + unfinished); `flush_s` writing held games while idle (and again after an extend); a classic job
+  never flushes by time and ends `done`; two checkpoints while the games go on (rows of nets 7, 9 and 11, a game across a
+  switch, a game's rows' networks never going back); a classic uniform job still refusing a checkpoint. `proto.rs` unit
+  tests: the job line's `rolling` / `flush_s`, `extend` reaching a rolling job only (a classic job's error unchanged),
+  `features`. The existing worker suites (job, job_tail, evaljob) unchanged and passing.
+* `tests/test_farm_pool.py`: `test_rolling_setting`; `test_pool_rolling_checks_the_worker_and_puts_rolling` (a worker
+  without the feature refused with nothing PUT, then gen 0 registered with `rolling` in the PUT; alternates covered /
+  logged unchecked); `test_staleness_per_row_with_rolling` (off: games dropped whole as before; on: a game straddling the
+  window keeps its newer rows - the pool's shard == those rows written directly - the histogram counts the kept rows);
+  `test_keep_rows_is_take_rows_for_any_rows` (toy_tail: tails, overrides, sparse features). The PUT bodies with the
+  setting off stay those of before (`test_pool_alternates_in_the_puts_definitions_and_records`).
+* MTG Zero's farm-compat gate (worker vs Python, byte-identical; classic jobs) on the pin, and its farm gates on the
+  live run's config and checkpoint (MTG Zero ENGINE.md).
+
+### 54.6 Measured
+
+Before: see 54.1 (classic leases on the farm, 2026-11-16). After: to be measured on the farm once the coordinator
+(migration 0011) and agents 0.2.13 hand out rolling leases.
+
 ## 55. The farm pool's lock order: `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu` (no setting; MTG Zero's pb3 hang, 2026-11-16)
 
-(Section 54 is the rolling-leases branch's; this fix is on both lines.)
+(This fix is on both zero-core lines: mtg-zero main's pin and the rolling-leases branch of 54.)
 
 **Why.** MTG Zero's delver-bo3-pb3 hung for 91 minutes in iteration self-play. A py-spy dump showed an ABBA deadlock
 between two locks:
@@ -7874,8 +7979,8 @@ The window had always been there. A 2 h pause made it wide: 736 farm games were 
 
 **What `_drain` does now.** For each game it does three steps:
 
-1. under `Pool.mu`, `_head(it)`: the stale games at the front are dropped (counted as before) and the oldest game the
-   iteration may take is chosen;
+1. under `Pool.mu`, `_head(it)`: the stale games at the front are dropped (counted as before; with `pool_rolling`,
+   judged row by row as in 54, the head replaced by the rows left) and the oldest game the iteration may take is chosen;
 2. without `Pool.mu`, it is offered to the quota (`accept_pool(it, name, 1)`). A refusal ends the drain, as before;
 3. under `Pool.mu` again, `_accepted(it, g)`: the game is taken off `held`, counted and written to its machine's shard
    writer.

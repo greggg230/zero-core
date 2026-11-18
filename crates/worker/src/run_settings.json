@@ -561,6 +561,10 @@
    "class": "trainer",
    "why": "orchestration (the farm pool, docs/az.md 45)"
   },
+  "pool_rolling": {
+   "class": "trainer",
+   "why": "orchestration (the farm pool's rolling leases, docs/az.md 54)"
+  },
   "selfplay_local": {
    "class": "trainer",
    "why": "orchestration"
