@@ -223,8 +223,10 @@ def opset_bump(model, to):
     for node in model.graph.node:
         if node.domain not in ('', 'ai.onnx'):
             continue
-        a = defs.get_schema(node.op_type, cur, '').since_version
         b = defs.get_schema(node.op_type, to, '').since_version
+        if b > cur:
+            continue                      # (an operator new since `cur` - the Attention just written - is `to`'s own)
+        a = defs.get_schema(node.op_type, cur, '').since_version
         if a != b and node.op_type not in same:
             bad.add(f'{node.op_type} ({a} -> {b})')
     if bad:
