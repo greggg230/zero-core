@@ -105,6 +105,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `conc`, `threads`, `groups`, `torch_threads` | 256, 4, 2, 1 | games in flight, search threads, batches in flight, torch intra-op threads (keep 1, section 7) |
 | `ext_groups` | 2 (Glass Road Zero: 8) | groups for matches with an external player (section 5) |
 | `sims`, `sims_fast`, `p_full` | 64, 16, 0.25 | playout-cap randomisation (only `p_full` decisions are training samples) |
+| `p_full_rule`, `p_full_floor`, `p_full_shape`, `p_full_u_mean` | 'random', 0.05, 'linear', 0 | how the playout cap picks its full searches (section 60, docs/search.md 3.21): 'random' = the coin of probability `p_full`, as before; 'prior_uncertainty' = full with probability min(1, floor + (p_full - floor) g(u) / u_mean), u = 1 - max of the root's priors, g the shape ('linear' / 'sqrt' / 'square'), u_mean the measured mean of g(u) (required): the same mean simulations per decision, the full searches on the unsure decisions; metrics `selfplay.budget` (either rule) |
 | `sims_minor` | 0 | simulations of the game's minor decisions in self-play (`SearchGame::minor_decision`, MTG: the land to tap), never recorded; 0 = searched like the others (docs/search.md 1, 3) |
 | `c_puct`, `alpha`, `eps`, `temp_moves` | 1.0, 0.3, 0.25, 20 | PUCT constant (values in [0, 1]), root Dirichlet noise, sampled moves per game |
 | `chance_k`, `margin_w`, `redet`, `max_steps` | 0, 0, 1, 100000 | sampled chance outcomes kept per edge (0 = resample every visit), utility margin credit, fresh determinization per simulation, abandon a game after this many moves |
@@ -8216,3 +8217,120 @@ the log costs nothing measurable); the records 9,489 bytes (148 bytes a game, 12
 written in 0.020 s (0.3 ms a game: ~0.6 s of an iteration of 2,000 games). The legacy-meta3-ddwheel-smoke run (3
 iterations, 16 games each, a fresh net: 727 actions a game) with records on and off: the same shards and checkpoints
 (every weight), records 7.2-7.9 KB an iteration written in 0.002-0.004 s.
+
+## 60. The playout cap's full searches by the prior's uncertainty (`p_full_rule`; MTG Zero's metagame run, 2026-11-17)
+
+**Why.** Playout cap randomisation spends a full search (`sims`) on a coin's `p_full` share of the self-play decisions
+and the fast one (`sims_fast`) on the rest; the full searches are the policy targets. On MTG Zero's metagame network
+(legacy-meta3-r1, iterations 183-188, 160k recorded decisions) the search moved the target's argmax off the prior's in
+4.7% of the decisions, and the prior's own uncertainty u = 1 - max P0 predicts which at AUC 0.90: the quarter of the
+decisions with the largest u holds 87% of those changes (a value-uncertainty head did worse, AUC 0.69). The coin spends
+most full searches where the search agrees with the prior anyway. `p_full_rule` 'prior_uncertainty' spends the same
+simulations on the unsure decisions.
+
+**What it does** (docs/search.md 3.21 for the driver). A capped self-play decision is searched in full with
+probability
+
+    f = min(1, p_full_floor + (p_full - p_full_floor) * g(u) / p_full_u_mean)
+
+g = `p_full_shape` ('linear' u, 'sqrt', 'square'), P0 the root's priors (its own evaluation, before noise). With
+`p_full_u_mean` = the mean of g(u) over the decisions, the mean of f is p_full: the same mean simulations per decision
+and the same records per decision as the coin; every decision keeps at least the floor. The coin is drawn from the
+game's stream where the coin rule draws it; a fresh root's budget is chosen after its own evaluation. Every executor
+(this machine, remote workers, the farm's native worker) draws the same full searches.
+
+| setting | default | meaning |
+|---|---|---|
+| `p_full_rule` | 'random' | 'random' = the coin of before (off); 'prior_uncertainty' = the rule above |
+| `p_full_floor` | 0.05 | the least chance of a full search, in [0, p_full] |
+| `p_full_shape` | 'linear' | g: 'linear' / 'sqrt' / 'square' (correctly rounded operations only: deterministic everywhere) |
+| `p_full_u_mean` | 0 (unset) | the mean of g(u) over the self-play decisions; required with the rule |
+
+**Off by default**: 'random' adds no seat key; the seat dict, the driver's settings, the games, the records, the
+digests and the checkpoints are those of before. With the rule on, a floor equal to p_full is the coin bit for bit
+(the driver test `a_floor_at_p_full_is_the_coin_bit_for_bit`).
+
+### 60.1 The rule and its calibration: why this one
+
+* **Stochastic, not a threshold.** A hard threshold on u would spend every full search on the unsure decisions and none
+  on the confident ones, whose targets (and value rows: only full searches are recorded) would vanish from the window.
+  The floor keeps a fixed share of every kind of decision recorded, and f is known per decision (an importance
+  weight is possible: 60.4).
+* **Linear in u by default.** f is affine in g(u), so the mean of f is p_full exactly when u_mean is g's mean (up to the
+  cap at 1, which only lowers it): no fit, one number. 'square' concentrates harder on the unsure tail (closer to the
+  threshold that maximises the changes captured), 'sqrt' softer (closer to the coin); both are settings.
+* **A fixed mean per run, not a running one.** A running mean of u across games depends on which games finish when
+  (threads, batches, executors): the full searches would differ between this machine, a remote worker and the farm.
+  A mean within one game is reproducible but normalises each game to p_full (a game of hard decisions gets no more)
+  and is noisy early in a game. A run setting is reproducible everywhere and allocates across games; the run reports
+  the measured mean every iteration (`selfplay.budget.g_mean`) and the realised share, so a drift is visible: when the
+  realised share leaves p_full, set `p_full_u_mean` to the reported mean (the next resume uses it). The policy's
+  sharpness moves slowly at a run's learning rate (60.3: the rule's own games read 0.1215 where the coin's read 0.116, on 64 games each).
+* **Measuring it.** With the coin, `selfplay.budget.g_mean` is u's mean (linear g). For another shape, a run (or a
+  smoke) with the rule and `p_full_floor` = `p_full` plays the coin's games exactly and reports that shape's mean.
+
+### 60.2 Metrics (`selfplay.budget`, every self-play phase with a playout cap, either rule)
+
+From this machine's driver counters (docs/search.md 3.21): `decisions` (capped: not minor), `full`, `full_share`,
+`sims_per_decision` (the budgets), `f_mean` (the mean chance: p_full for the coin), `g_mean`, `changed` (the share of
+the recorded targets whose argmax is not the prior's - the search's effect on the targets), `targets`; one log line
+`iter N budget: ...`. A rolling driver's counters span its games in flight (the phase's searches, not exactly its
+accepted games'). Remote workers' and the farm's searches are not in it.
+
+### 60.3 Measured
+
+2026-11-17, the desktop's CPU (fp32, 32 games in flight, 8 search threads, beside other jobs; no GPU), MTG Zero's
+metagame run legacy-meta3-r1 at its checkpoint 207 with its exact self-play seat (64 / 16 simulations, p_full 0.25, 4
+minor, 'cq' targets, root belief, root-view leaf values, resignation 0.02 / 3) and its iteration-208 spec (the wheel
+over), 64 games from one driver seed per rule (MTG Zero's ENGINE.md 189 has the script):
+
+| rule | capped decisions | full share (mean chance) | sims / decision | mean g(u) | targets off the prior's argmax | games / min | decisions / game | records / game | resigned |
+|---|---|---|---|---|---|---|---|---|---|
+| coin | 9,593 | 0.243 (0.250) | 27.68 | u 0.116 | 4.3% | 8.49 | 152.3 | 55.0 | 45 / 64 |
+| floor = p_full, 'sqrt' | 9,593 | 0.243 (0.250) | 27.68 | sqrt 0.259 | 4.3% | 8.56 | 152.3 | 55.0 | 45 / 64 |
+| linear, floor 0.05, u_mean 0.116 | 9,864 | 0.261 (0.258) | 28.53 | u 0.1215 | **13.1%** | 7.66 | 156.2 | 60.9 | 42 / 64 |
+| sqrt, floor 0.05, u_mean 0.259 | 9,151 | 0.254 (0.251) | 28.18 | sqrt 0.261 | 10.9% | 7.62 | 145.1 | 54.7 | 47 / 64 |
+
+* **The coin at floor = p_full**: the same games (decisions, steps, records, resignations, simulations equal); 7 of
+  222,867 leaf rows and one of 2,334 target argmaxes differ - the network's CPU answers move in the last bits with the
+  batch (the full searches' belief rows go in later batches), not the rule.
+* **The search's effect lands in the full searches**: 13.1% of the linear rule's recorded targets leave the prior's
+  argmax against the coin's 4.3% (the 4.7% of the phase-1 study) - 3.1 times as many per full search. Of the target
+  changes a full search everywhere would make (the coin's 4.3% of all capped decisions, its full searches being a
+  uniform sample), the linear rule's full searches catch ~80% (337 of ~422), 'sqrt' ~64%, the coin 24%. Linear is the
+  default.
+* **The budget**: with u_mean measured on the coin's games the linear rule spent a mean chance of 0.258 (3% over
+  p_full; 28.5 sims a decision vs 27.7): its own games' u read 0.1215 (unsure decisions searched in full make
+  slightly different, longer games; 64 games is also noisy - decisions per game 145-156 across the rows). Its fixed
+  point is u_mean ~0.12. The run's `selfplay.budget` and BUDGET DRIFT watch this.
+* **Speed**: 10% fewer games a minute on the CPU (+3% simulations a decision, +5% leaf rows a game, the alone belief
+  rows' extra rounds); on the GPU self-play is leaf-bound (~5%).
+
+### 60.4 Policy targets: the bias, and the weight not built
+
+The full searches - the policy targets and, in this code, the only decision records (value rows too) - concentrate on
+unsure positions: on MTG Zero's network a confident decision (u near 0) is recorded at about the floor's 5% instead of
+25%. Expected effects: the policy keeps learning where the search disagrees with it (the point), confident decisions'
+targets thin out (their policy drifts only through the shared trunk), and the value head sees fewer decided positions.
+Resignation (27) counts full searches only, so games resign later when the decided positions are confident (60.3: the
+games' length).
+
+The unbiased alternative is an importance weight 1 / f on each recorded decision's policy loss (normalised to mean 1),
+which restores the coin's expected gradient at the cost of variance. It is **not built**: f would have to travel with
+every record - a new per-row column in the driver's records, the shards (both formats), the window loaders, the
+trainer's loss, the remote workers' shards and the farm's game records with their replay - which is not cheap; the
+driver already knows f per decision (`Slot::cap_f`), so it is the place to start. An A/B arm 'adapt + weight' waits for
+it; the first A/B compares the coin and the unweighted rule.
+
+### 60.5 Tests and checks
+
+Rust (`driver/tests/budget.rs`, docs/search.md 3.21): the coin bit for bit at floor = p_full (with and without the root
+belief), the share matched with u_mean measured (every shape), more targets off the prior's argmax, the same games at
+any thread layout, minor and light decisions, the checks, the seat parser; the native worker's port
+(`zero_worker::settings::tests::the_playout_cap_rule_as_python`); the worker's settings table
+(`crates/worker/src/run_settings.json`: the four keys 'play' - an older worker build calls them unknown and the pool
+refuses it). pytest `tests/test_budget.py`: the seat dict (off: the seat of before), the refusals in Python and the
+driver, the bindings (the coin at floor = p_full; the share; the stats only with a playout cap), the run settings, a
+rolling toy run's `budget` metrics, remote workers drawing as this machine and an older checkout refused by its hello
+(`budget` fingerprint). MTG Zero: its farm compatibility smoke (tools/farm_compat.py) with the rule on - the native
+worker vs the Python remote worker and its records replayed by the trainer, byte-identical (its ENGINE.md 189).

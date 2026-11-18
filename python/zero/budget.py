@@ -14,7 +14,9 @@ once the root's priors are known: the same games on every executor (this machine
 
 Run settings (zero.run.DEFAULTS): `p_full_rule` ('random' = off: the coin of before, nothing changes),
 `p_full_floor` (0.05), `p_full_shape` ('linear'), `p_full_u_mean` (0 = unset; required with the rule: measure it
-with the random rule's `selfplay.budget.g_mean`, which reports u's mean, or the rule's own for its shape). The
+with the random rule's `selfplay.budget.g_mean`, which reports u's mean, or - for another shape - with the rule at
+`p_full_floor` = `p_full`, which plays the coin's games exactly and reports that shape's mean; the rule's own games
+read it slightly higher: docs/az.md 60.3). The
 self-play seat's keys of the same names (games.nn_seat); evaluations have no playout cap.
 
 Every self-play phase reports the playout cap of this machine's driver as `selfplay.budget` (decisions, the full
