@@ -89,7 +89,20 @@ impl Worker {
         }
         k
     }
+
+    /// The protocol features `hello` and `info` announce (zero-farm PROTOCOL.md 10.5): `rolling` - rolling self-play
+    /// jobs (`job::Rolling`) - in a build with self-play.
+    pub fn features(&self) -> Vec<&'static str> {
+        if self.selfplay {
+            vec![FEATURE_ROLLING]
+        } else {
+            Vec::new()
+        }
+    }
 }
+
+/// The feature name of rolling self-play jobs (zero-farm PROTOCOL.md 10.5).
+pub const FEATURE_ROLLING: &str = "rolling";
 
 /// The worker binary's entry point (self-play only): `args` from the command line -> the exit status.
 pub fn main(games: &'static [GameEntry], repo: &'static str) -> i32 {
