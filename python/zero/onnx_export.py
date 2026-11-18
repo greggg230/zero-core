@@ -136,9 +136,23 @@ def _fused_attention_fake(q, k, v, bias, heads):
     return torch.empty_like(q)
 
 
+def _placeholder_schema():
+    """The placeholder's ONNX schema, registered once (onnxscript builds nodes of registered operators only)."""
+    from onnx import defs
+    if defs.has('FusedAttention', FUSED_DOMAIN):
+        return
+    T = defs.OpSchema.FormalParameter
+    defs.register_schema(defs.OpSchema(
+        'FusedAttention', FUSED_DOMAIN, 1, doc='zero-onnx placeholder: rewritten by onnx_export.fused_attention',
+        inputs=[T('q', 'T'), T('k', 'T'), T('v', 'T'), T('bias', 'T')], outputs=[T('y', 'T')],
+        type_constraints=[('T', ['tensor(float)'], 'float32')],
+        attributes=[defs.OpSchema.Attribute('num_heads', defs.OpSchema.AttrType.INT, 'heads')]))
+
+
 def _fused_attention_onnx(q, k, v, bias, heads: int):
     """The exporter's translation: the placeholder node (`fused_attention` rewrites it)."""
     import onnxscript
+    _placeholder_schema()
     zo = onnxscript.values.Opset(FUSED_DOMAIN, 1)
     return zo.FusedAttention(q, k, v, bias, num_heads=heads)
 
