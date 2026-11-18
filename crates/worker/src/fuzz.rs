@@ -65,7 +65,7 @@ pub fn plan_on(game: &dyn FuzzGame, mode: &str, env: &[(String, String)], platfo
     if crate::platform::off_reference(platform) {
         if let Some(why) = game.libm_dependence(&plan, env) {
             return Err(format!(
-                "mode {mode:?}: refused on {platform}: {why} - its seeds would play differently than on {} (the platform's libm), so a failure                  found here would not reproduce there (zero-core docs/az.md 62)",
+                "mode {mode:?}: refused on {platform}: {why} - its seeds would play differently than on {} (the platform's libm), so a failure found here would not reproduce there (zero-core docs/az.md 62)",
                 crate::platform::REFERENCE
             ));
         }
