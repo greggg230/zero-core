@@ -177,20 +177,22 @@ def fused_attention(model, kind):
         q, k, v, bias = node.input
         y = node.output[0]
         t = f'fused{n}'
-        if kind == 'mha':
-            for nm, val in ((f'{t}_i0', [0]), (f'{t}_i1', [1]), (f'{t}_i2', [2]), (f'{t}_one', [1])):
-                g.initializer.append(numpy_helper.from_array(np.asarray(val, np.int64), nm))
-            out += [helper.make_node('Shape', [q], [f'{t}_shape']),
-                    helper.make_node('Gather', [f'{t}_shape', f'{t}_i0'], [f'{t}_b'], axis=0),
-                    helper.make_node('Gather', [f'{t}_shape', f'{t}_i1'], [f'{t}_t'], axis=0),
-                    helper.make_node('Concat', [f'{t}_b', f'{t}_one', f'{t}_t', f'{t}_t'], [f'{t}_s4'], axis=0),
-                    helper.make_node('Expand', [bias, f'{t}_s4'], [f'{t}_bias4']),
-                    helper.make_node('MultiHeadAttention', [q, k, v, '', '', f'{t}_bias4'], [y], domain='com.microsoft',
-                                     num_heads=heads)]
-        elif kind == 'attention23':
-            out.append(helper.make_node('Attention', [q, k, v, bias], [y], q_num_heads=heads, kv_num_heads=heads))
-        else:
+        if kind not in ATTENTIONS[1:]:
             raise ValueError(f'fused attention {kind!r}: one of {ATTENTIONS[1:]}')
+        # (the bias [B, 1, 1, T] expanded to [B, 1, T, T]: ONNX Runtime's kernels of both operators want the query length
+        # in the mask - its CPU Attention-23 refuses the spec's broadcast)
+        for nm, val in ((f'{t}_i0', [0]), (f'{t}_i1', [1]), (f'{t}_one', [1])):
+            g.initializer.append(numpy_helper.from_array(np.asarray(val, np.int64), nm))
+        out += [helper.make_node('Shape', [q], [f'{t}_shape']),
+                helper.make_node('Gather', [f'{t}_shape', f'{t}_i0'], [f'{t}_b'], axis=0),
+                helper.make_node('Gather', [f'{t}_shape', f'{t}_i1'], [f'{t}_t'], axis=0),
+                helper.make_node('Concat', [f'{t}_b', f'{t}_one', f'{t}_t', f'{t}_t'], [f'{t}_s4'], axis=0),
+                helper.make_node('Expand', [bias, f'{t}_s4'], [f'{t}_bias4'])]
+        if kind == 'mha':
+            out.append(helper.make_node('MultiHeadAttention', [q, k, v, '', '', f'{t}_bias4'], [y], domain='com.microsoft',
+                                        num_heads=heads))
+        else:
+            out.append(helper.make_node('Attention', [q, k, v, f'{t}_bias4'], [y], q_num_heads=heads, kv_num_heads=heads))
         n += 1
     del g.node[:]
     g.node.extend(out)
