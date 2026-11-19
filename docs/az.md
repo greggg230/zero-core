@@ -8987,13 +8987,37 @@ changes. Turn it on: `--eval-remote pool:<farm run>` (a slug of its own, e.g. `<
 set (`pool_build`, `pool_runtime`, `pool_worker` at least); a restart switches either way (a new mirror starts from the
 run's Elo pool, like 5.2's).
 
-**Costs.** On the run's machine: per new network an export by weight swap (seconds; the first of an architecture
-builds its template and records reference positions once) and its upload; per batch a definition signed by
+**Costs.** On the run's machine: per new network an export by weight swap (1.4-1.7 s on MTG Zero's 128 x 8 net; the
+first of an architecture builds its template and records reference positions, 136 s, unless the run's self-play
+pool has them: its `<run>/pool/<farm run>/export/` is copied once into the farm run's own cache) and its upload
+(~16 MB a network, kept under `ckpt/`); per batch a definition signed by
 farm-release and a few coordinator calls, a poll every `eval_pool_poll_s`, the replay of the spot check (milliseconds a
 game); the deadline's games, when the farm does not deliver, at `eval_pool_threads` threads. On the farm: the games,
 in batches one after the other (a batch waits for its last lease; PROTOCOL 12: CPU PCs take eval first, GPU PCs when
 the CPU PCs can't keep up within `eval_horizon_s`). Disk: the batches' rows and result files (the records with every
 move) under `<run>/eval_pool/`.
+
+**Measured** (2026-11-19, the desktop and the real farm; a test run directory holding copies of MTG Zero's
+legacy-meta3-r1 iteration 736 and its two anchors, the run's evaluation settings - eval_sims 32, cq with min visits 4,
+root view, belief tilt 1, eval cache 8192, paired - with 8 games a match instead of 100 and a fresh Elo pool, so the
+second anchor was calibrated first; the test farm run `fe-test-eval-1119` limited to the owner's canary agents
+(min_agent 0.3.3) and Windows builds (the CPU build and its CUDA alternate; a friend's Mac also runs 0.3.3, so no macOS
+alternate), priority 0.1, deadline 2400 s; paused afterwards):
+
+* three batches, one after the other: the calibration (meta256 vs fork0) 288 s from the batch's PUT to its last row,
+  736 vs fork0 696 s, both played by one farm PC (one lease each; that PC plays its self-play on its GPU, so an eval
+  batch waits there until the CPU PCs can't keep up, PROTOCOL 12.2); 736 vs meta256 got no lease (the PC was paused
+  meanwhile), was dropped at its deadline (2,403 s) and its 8 games played on the desktop by the run's worker build at
+  4 threads in 134 s (~395 leaves/s on the CPU);
+* the spot check: 2 of each farm batch's 8 games replayed from seed + moves, all equal (10-20 ms a batch); every row's
+  checks passed; the definitions (one a batch) took 3-4 s each through farm-release; the evaluation 3,675 s in all;
+* the result: 736 vs fork0 6.0/8, vs meta256 5.0/8, anchored Elo 1333 +- 200 (the Mac's evaluation of the same
+  checkpoint with 2 x 100 games: 1346 +- 57); the evals.jsonl row, the pool's results / ratings / anchored files,
+  index.json and 3 records files (16 games src 'farm' with their machine tag, 8 src 'local'), as a remote's;
+* the same games: two of the farm PC's games played again on the desktop by the same build (`<worker> eval`, the same
+  ids, seed and graphs): the same digests, game for game;
+* `check-config --eval --platform macos-arm64` on these eval settings: no libm refusal (the run's macOS alternate may
+  play its evaluation's games).
 
 **Tests and checks.** `tests/test_eval_pool.py`, against a fake coordinator that plays each batch as the native
 worker plays it (`tests/farm_play.py`: a traced rolling driver on the uploaded ONNX graphs) and hands it out as two
@@ -9005,6 +9029,7 @@ records' kinds equal); a restart resumes its batch; a half-delivered batch is dr
 played by the worker (`tests/worker_stub.py eval`), digest for digest the farm's games; a seat-swapped row and a
 tampered move (its digest recomputed: the spot replay refuses it) refuse the batch and its games are played here;
 without a deadline a refused batch fails the evaluation and the retry plays a new batch; the refusals at the start
-(the self-play pool's farm run, no pool_worker, no ONNX Runtime for the deadline, a bad slug). The rest of the suite
+(the self-play pool's farm run, no pool_worker, no ONNX Runtime for the deadline, a bad slug); the export cache
+seeded once from the self-play pool's. The rest of the suite
 (RemoteEval's tests, `test_worker_settings`, `test_farm_report`, `test_gamerec_all`, `test_privacy`) unchanged.
 
