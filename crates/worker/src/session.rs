@@ -913,6 +913,21 @@ pub struct InferenceSession {
     pub chunk: usize,
     /// Non-zeros per piece at most (TensorRT-RTX's profile), None: no limit.
     pub max_nnz: Option<usize>,
+    /// The graph's optional input `t_align` as fed to it (`t_align_for`), None: not fed (its default 1).
+    pub t_align: Option<i64>,
+}
+
+/// The value fed to a fast graph's optional input `t_align` (zero-core docs/az.md 65: its padded rows' token axis a
+/// multiple of it, so that ONNX Runtime's CUDA attention takes its fused float32 kernel): a GPU provider's graph
+/// metadata `t_align` (1 to 16), None on the CPU, for a graph without it, or with `ZERO_WORKER_T_ALIGN` 0 or 1 (a
+/// measurement's override: that value instead of the metadata's).
+pub fn t_align_for(p: ProviderKind, meta: &[(String, String)]) -> Option<i64> {
+    if !p.is_gpu() {
+        return None;
+    }
+    let want = meta.iter().find(|e| e.0 == "t_align").and_then(|e| e.1.parse::<i64>().ok())?;
+    let a = std::env::var("ZERO_WORKER_T_ALIGN").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(want);
+    (2..=16).contains(&a).then_some(a)
 }
 
 /// Rows per piece of a GPU provider's batch: a GPU wants whole batches (the CPU's 64-row pieces cost it a
@@ -1104,6 +1119,7 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
         return t;
     }
     let fallback: Vec<String> = if p.is_gpu() { placements.iter().filter(|(prov, _)| prov == "CPUExecutionProvider").map(|(_, n)| n.clone()).collect() } else { Vec::new() };
+    let t_align = t_align_for(p, &meta);
     let mut s = InferenceSession {
         path: spec.model.to_path_buf(),
         rt,
@@ -1128,6 +1144,7 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
         load_s: build_s,
         chunk: chunk_for(p),
         max_nnz: (p == ProviderKind::TensorRtRtx).then_some(NVRTX_MAX_NNZ),
+        t_align,
     };
     if let Some(r) = reference {
         match self_test(&mut s, r, fallback, build_s) {
@@ -1221,7 +1238,7 @@ impl InferenceSession {
         }
         let np: Vec<i64> = idx.iter().map(|&r| b.n_players[r] as i64).collect();
         let bel: Vec<bool> = idx.iter().map(|&r| b.extra[r] == ROW_BELIEF).collect();
-        let (actions, aux_w) = (self.actions, self.aux_w);
+        let (actions, aux_w, t_align) = (self.actions, self.aux_w, self.t_align);
         let vr = match &self.widths {
             Some(w) => {
                 let v = varlen_piece(b, idx, w)?;
@@ -1261,6 +1278,10 @@ impl InferenceSession {
                 "ov_slot_hi" => Tensor::from_array((len(v.ov_slot_hi.len()), v.ov_slot_hi)).map_err(oerr)?,
                 "ov_slot_lo" => Tensor::from_array((len(v.ov_slot_lo.len()), v.ov_slot_lo)).map_err(oerr)?,
             ]);
+            if let Some(a) = t_align {
+                // (the fast graph's optional input, a GPU's: zero-core docs/az.md 65)
+                inputs.extend(ort::inputs!["t_align" => Tensor::from_array((Vec::<i64>::new(), vec![a])).map_err(oerr)?]);
+            }
         }
         let out = s.run(inputs).map_err(oerr)?;
         if v2 {
@@ -1685,6 +1706,18 @@ mod tests {
                 ("CPUExecutionProvider".to_string(), "Shape (/pack/Shape_1)".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn t_align_is_fed_to_a_gpu_graph_that_names_it() {
+        // (zero-core docs/az.md 65; ZERO_WORKER_T_ALIGN unset in the test environment)
+        let m = vec![("t_align".to_string(), "16".to_string())];
+        assert_eq!(t_align_for(ProviderKind::Cuda, &m), Some(16));
+        assert_eq!(t_align_for(ProviderKind::DirectMl, &m), Some(16));
+        assert_eq!(t_align_for(ProviderKind::Cpu, &m), None);
+        assert_eq!(t_align_for(ProviderKind::Cuda, &[]), None);
+        assert_eq!(t_align_for(ProviderKind::Cuda, &[("t_align".to_string(), "1".to_string())]), None);
+        assert_eq!(t_align_for(ProviderKind::Cuda, &[("t_align".to_string(), "99".to_string())]), None);
     }
 
     #[test]

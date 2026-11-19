@@ -132,8 +132,23 @@ pub fn main(games: &'static [GameEntry], repo: &'static str) -> i32 {
 /// enough to overflow the 1 MB main-thread stack of a Windows process (zero-farm PROTOCOL.md 8).
 pub const MAIN_STACK: usize = 256 << 20;
 
+/// ONNX Runtime's environment variable for the shortest sequence its CUDA MultiHeadAttention runs float32 through the
+/// memory-efficient (cutlass) kernel; shorter ones take the unfused path (separate products, transposes and softmax).
+pub const ORT_EFFICIENT_ATTENTION_FP32: &str = "ORT_MIN_SEQ_LEN_EFFICIENT_ATTENTION_FP32";
+
+/// [`ORT_EFFICIENT_ATTENTION_FP32`]'s value in a worker process unless already set (docs/az.md 65): ONNX Runtime's
+/// default (256) sends a token network's attention (tens of tokens a row) to the unfused path - on a farm PC's NVIDIA
+/// GPU a fast graph's 1,024-row batch took 50.5 ms through it and 40.4 ms through the fused kernel (8 blocks: ~12 ms of
+/// kernels -> 3.2 ms). With an attention bias the fused kernel needs a sequence of a multiple of 16: the fast graph's
+/// `t_align` (`session::t_align_for`). The CPU providers never read it.
+pub const ORT_EFFICIENT_ATTENTION_FP32_MIN: &str = "1";
+
 /// The worker binary's entry point (the command runs on a thread with a [`MAIN_STACK`] stack).
 pub fn main_with(w: &'static Worker) -> i32 {
+    // (before any thread or ONNX Runtime exists: the variable is read when a CUDA session builds its kernels)
+    if std::env::var_os(ORT_EFFICIENT_ATTENTION_FP32).is_none() {
+        std::env::set_var(ORT_EFFICIENT_ATTENTION_FP32, ORT_EFFICIENT_ATTENTION_FP32_MIN);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::thread::Builder::new()
         .name("zero-worker-main".into())
