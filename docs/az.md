@@ -9001,20 +9001,21 @@ move) under `<run>/eval_pool/`.
 legacy-meta3-r1 iteration 736 and its two anchors, the run's evaluation settings - eval_sims 32, cq with min visits 4,
 root view, belief tilt 1, eval cache 8192, paired - with 8 games a match instead of 100 and a fresh Elo pool, so the
 second anchor was calibrated first; the test farm run `fe-test-eval-1119` limited to the owner's canary agents
-(min_agent 0.3.3) and Windows builds (the CPU build and its CUDA alternate; a friend's Mac also runs 0.3.3, so no macOS
-alternate), priority 0.1, deadline 2400 s; paused afterwards):
+(min_agent 0.3.3) and Windows builds (the CPU build and its CUDA alternate; no macOS alternate: min_agent alone could
+not keep a platform's leases to the owner's machines), priority 0.1, deadline 2400 s; paused afterwards):
 
 * three batches, one after the other: the calibration (meta256 vs fork0) 288 s from the batch's PUT to its last row,
-  736 vs fork0 696 s, both played by one farm PC (one lease each; that PC plays its self-play on its GPU, so an eval
-  batch waits there until the CPU PCs can't keep up, PROTOCOL 12.2); 736 vs meta256 got no lease (the PC was paused
-  meanwhile), was dropped at its deadline (2,403 s) and its 8 games played on the desktop by the run's worker build at
-  4 threads in 134 s (~395 leaves/s on the CPU);
+  736 vs fork0 696 s, each one lease on the farm (a farm PC that plays self-play on its GPU takes an eval batch only
+  when the CPU PCs can't keep up, PROTOCOL 12.2: part of the wait); 736 vs meta256 got no lease (the eligible machine
+  was paused meanwhile), was dropped at its deadline (2,403 s) and its 8 games played on the desktop by the run's worker
+  build at 4 threads in 134 s (~395 leaves/s on the CPU);
 * the spot check: 2 of each farm batch's 8 games replayed from seed + moves, all equal (10-20 ms a batch); every row's
   checks passed; the definitions (one a batch) took 3-4 s each through farm-release; the evaluation 3,675 s in all;
 * the result: 736 vs fork0 6.0/8, vs meta256 5.0/8, anchored Elo 1333 +- 200 (the Mac's evaluation of the same
   checkpoint with 2 x 100 games: 1346 +- 57); the evals.jsonl row, the pool's results / ratings / anchored files,
-  index.json and 3 records files (16 games src 'farm' with their machine tag, 8 src 'local'), as a remote's;
-* the same games: two of the farm PC's games played again on the desktop by the same build (`<worker> eval`, the same
+  index.json and 3 records files (the farm's games src 'farm' with their machine tag, the desktop's src 'local'), as a
+  remote's;
+* the same games: two of the farm's games played again on the desktop by the same build (`<worker> eval`, the same
   ids, seed and graphs): the same digests, game for game;
 * `check-config --eval --platform macos-arm64` on these eval settings: no libm refusal (the run's macOS alternate may
   play its evaluation's games).
