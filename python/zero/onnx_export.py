@@ -375,7 +375,43 @@ OUTPUTS2 = OUTPUTS + ('refused',)
 PACKINGS = ('mask', 'compact', 'packed', 'host')
 
 
-def _csr_rows(off, n):
+CUMSUM_BLOCK = 512                 # `_cumsum0`'s blocks (the fast graph's long running sums, docs/az.md 65)
+# the fast graph's optional input `t_align` (docs/az.md 65): its padded rows' token axis a multiple of it (at most
+# T_ALIGN_PAD more than the longest row: `int32_bound`); default 1 (an initializer: the graph as before when not fed).
+# T_ALIGN is what a GPU worker feeds (metadata `t_align`): ONNX Runtime's CUDA MultiHeadAttention runs float32 with an
+# attention bias through its fused kernel only when the sequence is a multiple of 16 (16-byte aligned bias rows).
+T_ALIGN = 16
+T_ALIGN_PAD = 15
+
+
+def _optional_input(model, name, value):
+    """Graph input `name` given an initializer of the same name (`value`, int64 0-d): an input a feeder may leave out
+    (ONNX: an overridable initializer; ONNX Runtime feeds it when given, never folds it). In place."""
+    from onnx import numpy_helper
+    if not any(i.name == name for i in model.graph.input):
+        raise ValueError(f'no graph input {name!r} to give a default')
+    model.graph.initializer.append(numpy_helper.from_array(np.asarray(value, np.int64), name))
+
+
+def _cumsum0(v, blocked=False):
+    """`v.cumsum(0)` of a 1-d integer tensor. `blocked` (the fast graph's, docs/az.md 65): in two levels - running sums
+    within blocks of CUMSUM_BLOCK elements (`v` zero-padded to whole blocks), then over the blocks' totals, added back -,
+    the same integers: ONNX Runtime 1.24.4's CUDA CumSum costs more than linearly in the axis's length (measured on a
+    farm PC's NVIDIA GPU: 0.37 ms over 16k elements, 1.65 ms over 64k, 16.4 ms over 262k - a 1,024-row batch's
+    non-zeros) and 0.18 ms over [464, 512] along its rows; the CPU's runs both forms in linear time. Only for an axis
+    sized by the graph's inputs (non-zeros, tail tokens, overrides, rows): over a data-dependent length (a NonZero's
+    count) the exporter dropped the padding (a [-1, 512] Reshape of 33,830 elements failed on CUDA - measured)."""
+    if not blocked:
+        return v.cumsum(0)
+    n = v.shape[0]
+    k = CUMSUM_BLOCK
+    nb = (n + (k - 1)) // k
+    inner = torch.cat([v, v.new_zeros(nb * k - n)]).view(nb, k).cumsum(1)
+    tot = inner[:, k - 1]
+    return (inner + (tot.cumsum(0) - tot)[:, None]).reshape(-1)[:n]
+
+
+def _csr_rows(off, n, blocked=False):
     """Each of the `n` elements' row of a CSR over rows (`off` [B+1]), with no data-dependent shape, no scatter with a
     reduction (TensorRT's ONNX parser refuses one and with it the whole graph; DirectML runs none) and every scatter
     writing unique indices into data with a place for each (docs/az.md 41.2: a GPU provider refuses more indices than
@@ -384,12 +420,13 @@ def _csr_rows(off, n):
     ends up to each merged position; an element at merged position j is element j - count[j], its row count[j] - a
     scatter of the rows to the elements' places [0, n) and the ends' to their own spare places n + (their index), then
     the first n read by a Gather (not a Slice: DirectML's graph fusion fails on Scatter -> Slice -> Mul). Integers below
-    n + B: the same rows as the earlier one-spare-slot scatter and the scatter-add before it (docs/az.md 41.1)."""
+    n + B: the same rows as the earlier one-spare-slot scatter and the scatter-add before it (docs/az.md 41.1).
+    `blocked`: the running sum in two levels (`_cumsum0`; the fast graph's), the same rows."""
     B = off.shape[0] - 1
     dev = off.device
     ends = off[1:] + torch.arange(B, dtype=torch.int64, device=dev)
     marks = torch.zeros(n + B, dtype=torch.int64, device=dev).scatter(0, ends, torch.ones_like(ends))
-    count = marks.cumsum(0)
+    count = _cumsum0(marks, blocked)
     slot = torch.where(marks > 0, count + (n - 1), torch.arange(n + B, dtype=torch.int64, device=dev) - count)
     rows = torch.zeros(n + B, dtype=torch.int64, device=dev).scatter(0, slot, count)
     return rows.index_select(0, torch.arange(n, dtype=torch.int64, device=dev))
@@ -847,6 +884,7 @@ class ZeroOnnx2(ZeroOnnx):
             raise ValueError(f'attention {attention!r}: one of {ATTENTIONS}')
         self.attention = attention
         self.psi_f32 = False                     # (the fast graph's: float32 only, `_psi2`)
+        self.blocked = False                     # (the fast graph's: long running sums in two levels, `_cumsum0`)
         if not self.tokens:
             raise TypeError(f'zero-onnx/2: a token network\'s interface (got a {type(net).__name__})')
         if not varlen_features(net):
@@ -970,7 +1008,7 @@ class ZeroOnnx2(ZeroOnnx):
         shi, slo = t_slot_hi.long(), t_slot_lo.long()
         sok = (shi >= 0) & (shi <= H16) & (slo >= 0) & (slo <= H16)
         shi, slo = _iclamp(shi, 0, H16), _iclamp(slo, 0, H16)
-        trow = _csr_rows(t_off, NT)
+        trow = _csr_rows(t_off, NT, self.blocked)
         tw = self.v_width.index_select(0, segc)
         k1 = segc * 65536 + shi                                   # (segment, slot) as (k1, slo): k1 < S 2^16 < 2^31
         first = torch.arange(NT, device=dev) == 0
@@ -1019,7 +1057,7 @@ class ZeroOnnx2(ZeroOnnx):
             # head slot or a tail token of its row) and column; checked as rows.resolve and TokenNet._ov_index check
             # (one sentinel override after the batch's - row 0, option -1: refused, writing row 0's dummy column, and
             # left out of `refused` - so no axis is ever empty: ONNX Runtime's reductions of one answer a wrong shape)
-            orow = torch.cat([_csr_rows(ov_off, NO), one(0)])
+            orow = torch.cat([_csr_rows(ov_off, NO, self.blocked), one(0)])
             opt = torch.cat([ov_opt.long(), one(-1)])
             nopt = opt_off[1:] - opt_off[:-1]
             obad = (opt < 0) | (opt >= nopt.index_select(0, orow))
@@ -1233,6 +1271,7 @@ class ZeroOnnx2Fast(ZeroOnnx2):
             raise ValueError(f'fast graph: attention {attention!r} (one of {FAST_ATTENTIONS})')
         super().__init__(net, packing, None if attention == 'matmul' else attention)
         self.psi_f32 = True
+        self.blocked = True
         segs, n_tok = net.segs, int(net.n_tok)
         F_ = int(net.features)
         # the sparse rows read without densifying them (`_inputs`): each feature's kind and place - a head slot's
@@ -1501,7 +1540,7 @@ class ZeroOnnx2Fast(ZeroOnnx2):
         B = x_ptr.shape[0] - 1
         NTOK = net.n_tok
         nnz = x_idx.shape[0]
-        row = _csr_rows(x_ptr, nnz)
+        row = _csr_rows(x_ptr, nnz, True)
         fi = x_idx.long()
         tok = self.f_tok.index_select(0, fi).long()
         col = self.f_col.index_select(0, fi).long()
@@ -1594,7 +1633,7 @@ class ZeroOnnx2Fast(ZeroOnnx2):
         return t, b, j, ident
 
     def forward(self, x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo,
-                t_val, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo):
+                t_val, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo, t_align=None):
         net = self.net
         B = n_players.shape[0]
         dev = x_val.device
@@ -1620,9 +1659,17 @@ class ZeroOnnx2Fast(ZeroOnnx2):
         rk = pres.long().cumsum(1) - 1                             # [B, n_tok] (>= 0: the global token is present)
         n_h = pres.sum(1)
         n = n_h + (t_off[1:] - t_off[:-1])
-        T = _iclamp(n.max(), 2).item()                           # (a data-dependent shape: dynamic in the graph)
+        nmax = _iclamp(n.max(), 2)
+        # `t_align` (optional, default 1: as before; docs/az.md 65): the padded rows' token axis rounded up to a multiple
+        # of it, at most `pad` past the longest row - more padding keys, masked: the same answers up to float32 rounding
+        pad = max(0, min(T_ALIGN_PAD, int(net.features) + 1 - NTOK))   # (`int32_bound`'s B (F + 1 + tail tokens))
+        if t_align is not None:
+            a = _iclamp(t_align.reshape(()), 1, T_ALIGN_PAD + 1)
+            up = (nmax + (a - 1)) // a * a
+            nmax = torch.where(up < nmax + pad, up, nmax + pad)
+        T = nmax.item()                                          # (a data-dependent shape: dynamic in the graph)
         torch._check(T >= 2)
-        torch._check(T <= NTOK + NT)
+        torch._check(T <= NTOK + NT + pad)
         back = torch.cat([row_h * T + rk.reshape(-1).index_select(0, row_h * NTOK + j_h),
                           trow * T + n_h.index_select(0, trow) + (torch.arange(NT, device=dev) - t_off.index_select(0, trow))])
         M = N + NT
@@ -1646,6 +1693,9 @@ class ZeroOnnx2Fast(ZeroOnnx2):
         for blk in net.blocks:
             qkv = blk.qkv(blk.ln1(hp)).index_select(0, gq)
             if self.attention:
+                # (one product split in three: q, k and v each by a product and a gather of its own - no Split - broke
+                # ONNX Runtime 1.24.4's CUDA allocation planner, a ScatterElements' sizes 15,404 against 27,064 at 1,024
+                # rows: measured, docs/az.md 65)
                 q3, k3, v3 = torch.split(qkv.view(B, T, 3 * D), [D, D, D], dim=2)
                 a = torch.ops.zero_onnx.fused_attention(q3, k3, v3, bias4, H).reshape(B * T, D)
             else:
@@ -1674,7 +1724,9 @@ class ZeroOnnx2Fast(ZeroOnnx2):
             # (every write its own action: the present head tokens' pointer logits scattered straight into the generic
             # logits, every other write to a spare place of its own - the plain scatter's answer, bit for bit)
             ok = (cols >= 0) & (acts < net.actions)
-            spare = B * A1 + torch.ones_like(cols).reshape(-1).cumsum(0).view(cols.shape) - 1
+            # (each (token, column) its own spare place B A1 + token C + column: the head tokens' running count ar_h
+            # times the columns, not a running sum over all n_h C writes - ONNX Runtime's CUDA CumSum, docs/az.md 65)
+            spare = B * A1 + ar_h[:, None] * cols.shape[1] + torch.arange(cols.shape[1], device=dev)[None, :]
             dest = torch.where(ok, row_h[:, None] * A1 + acts, spare)
             pol = torch.cat([gen.reshape(-1), torch.zeros_like(lg).reshape(-1)]).scatter(
                 0, dest.reshape(-1), lg.reshape(-1))[:B * A1]
@@ -1765,6 +1817,7 @@ def metadata2(net, extra=None, attention=None, fast=False):
                  'tail_width': str(int(getattr(net, 't_width', 0) or 0)), 'gates': json.dumps(net.gates())})
     if fast:
         meta['fast'] = '1'                       # (docs/az.md 63: ZeroOnnx2Fast's graph)
+        meta['t_align'] = str(T_ALIGN)           # (docs/az.md 65: its optional input, what a GPU feeder gives it)
     if attention:
         meta['attention'] = str(attention)
     for k, v in (extra or {}).items():
@@ -1962,9 +2015,12 @@ def _export_module(net, packing='packed', attention=None, fast=False):
     if onnx_version(net) == 2:
         # (variable-length token sets: zero-onnx/2, docs/az.md 46)
         if fast:
+            # (the fast graph's optional input `t_align` last, traced with 1: docs/az.md 65)
             mod = ZeroOnnx2Fast(net, packing, attention).eval()
-        else:
-            mod = ZeroOnnx2(net, packing, attention).eval()
+            return (mod, tuple(example_inputs2(net)) + (torch.tensor(1, dtype=torch.int64),), list(INPUTS2) + ['t_align'],
+                    list(OUTPUTS2), dict(dynamic_shapes2(), t_align=None),
+                    lambda extra: metadata2(net, extra, attention=attention, fast=fast))
+        mod = ZeroOnnx2(net, packing, attention).eval()
         return (mod, example_inputs2(net), list(INPUTS2), list(OUTPUTS2), dynamic_shapes2(),
                 lambda extra: metadata2(net, extra, attention=attention, fast=fast))
     if attention or fast:
@@ -2301,6 +2357,7 @@ def _save(model, meta, path, opset, make_portable, int32=True, attention=None, g
     if gelu:
         fuse_gelu(model)
         layernorm_instance(model)
+        _optional_input(model, 't_align', 1)     # (the fast graph's optional input: default 1, docs/az.md 65)
     meta['opset'] = str(opset)
     if make_portable:
         portable(model)

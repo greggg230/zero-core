@@ -160,11 +160,15 @@ def test_fast_graph_interface_and_structure(tmp_path):
     g0, g1 = onnx.load(p0), onnx.load(p1)
     sig = lambda g: [(i.name, i.type.tensor_type.elem_type, len(i.type.tensor_type.shape.dim))  # noqa: E731
                      for i in list(g.graph.input) + list(g.graph.output)]
-    assert sig(g0) == sig(g1)
+    # (the fast graph's one more input: the optional `t_align`, int64 0-d with an initializer of its name, 1 - docs/az.md 65)
+    assert [s for s in sig(g1) if s[0] != 't_align'] == sig(g0) and ('t_align', T.INT64, 0) in sig(g1)
+    ta = [i for i in g1.graph.initializer if i.name == 't_align']
+    assert len(ta) == 1 and onnx.numpy_helper.to_array(ta[0]).tolist() == 1
     md0, md1 = ({p.key: p.value for p in g.metadata_props} for g in (g0, g1))
-    assert {k: v for k, v in md1.items() if k not in ('fast', 'attention', 'opset')} == {k: v for k, v in md0.items()
-                                                                                        if k != 'opset'}
+    assert {k: v for k, v in md1.items() if k not in ('fast', 'attention', 'opset', 't_align')} == {
+        k: v for k, v in md0.items() if k != 'opset'}
     assert md1['fast'] == '1' and md1['attention'] == 'mha' and md1['opset'] == '17' and m1meta == md1
+    assert md1['t_align'] == str(OX.T_ALIGN) and 't_align' not in md0
     assert 'fast' not in m0meta and 'attention' not in m0meta
     doubles = [i.name for i in g1.graph.initializer if i.data_type == T.DOUBLE]
     doubles += [n.name for n in g1.graph.node if n.op_type == 'Cast' and any(a.name == 'to' and a.i == T.DOUBLE
@@ -190,6 +194,43 @@ def test_fast_graph_interface_and_structure(tmp_path):
         OX._export_module(rand_net(dict(TOY_TAIL_TOKENS_BASE, segments=[
             {k: v for k, v in TOY_TAIL_TOKENS_BASE['segments'][0].items() if k != 'tail'}], option_pointers=False,
             max_row_tokens=None)), fast=True)
+
+
+def test_fast_graph_cuda_forms(tmp_path):
+    """docs/az.md 65: `_cumsum0` in blocks is the plain running sum on every length (block edges, empty); the fast graph
+    sums the non-zeros', the tail tokens' and the overrides' axes in blocks of CUMSUM_BLOCK (CumSum inputs [., 512]); the
+    default graph does not; its optional input `t_align` changes no answer beyond float32 rounding."""
+    import onnx
+    for n in (0, 1, 7, OX.CUMSUM_BLOCK - 1, OX.CUMSUM_BLOCK, OX.CUMSUM_BLOCK + 1, 3 * OX.CUMSUM_BLOCK + 5, 20000):
+        v = torch.randint(0, 5, (n,), dtype=torch.int64)
+        assert torch.equal(OX._cumsum0(v, True), v.cumsum(0)) and torch.equal(OX._cumsum0(v), v.cumsum(0)), n
+    net = rich_net(RICH, seed=1, readers=READER)
+    p0 = str(tmp_path / 'default.onnx')
+    OX.export(net, p0, 'packed', {'checkpoint': 'toy'})
+    p1, _ = export(net, tmp_path)
+
+    def forms(path):
+        g = onnx.shape_inference.infer_shapes(onnx.load(path)).graph
+        shapes = {v.name: [d.dim_value if d.HasField('dim_value') else None for d in v.type.tensor_type.shape.dim]
+                  for v in list(g.value_info) + list(g.input)}
+        blocked = sum(1 for nd in g.node if nd.op_type == 'CumSum' and (shapes.get(nd.input[0]) or [None])[-1:] ==
+                      [OX.CUMSUM_BLOCK])
+        return blocked
+    assert forms(p0) == 0 and forms(p1) >= 3, (forms(p0), forms(p1))
+    # `t_align`: the same answers fed or not (2 to 16: more padding keys, masked), every row's at float32 rounding
+    import onnxruntime as ort
+    s = ort.InferenceSession(p1, providers=['CPUExecutionProvider'])
+    assert [i.name for i in s.get_overridable_initializers()] == ['t_align'] and 't_align' not in [i.name for i in s.get_inputs()]
+    rows = gate_rows(net, rich_batch(40, 9), kinds_of(40, 5))
+    f = OP.feeds(rows, v2=True)
+    base = s.run(None, f)
+    for a in (1, 2, 5, OX.T_ALIGN, 64):
+        got = s.run(None, dict(f, t_align=np.array(a, np.int64)))
+        for x, y in zip(base, got):
+            if x.dtype == np.float32:
+                assert np.array_equal(np.isnan(x), np.isnan(y)) and np.nanmax(np.abs(x - y)) <= 2e-6, a
+            else:
+                assert np.array_equal(x, y), a
 
 
 def test_fast_weight_swap_template(tmp_path):

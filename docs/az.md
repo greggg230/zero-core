@@ -150,7 +150,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
-| `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface, metadata (plus `fast`, `attention`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
+| `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface (plus the optional input `t_align`, 65), metadata (plus `fast`, `attention`, `t_align`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: this machine's driver when its inference is CUDA / MPS, and every remote worker on any device (56.1) - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -9041,3 +9041,65 @@ setting with `SystemExit`, which RemoteEval's thread (`except Exception`) didn't
 training went on, so the evaluations just stopped. The thread now logs it (`REFUSED (SystemExit): ...`) and retries
 after `RETRY_S` like any failure. Test: test_eval_pool.py `test_a_refusal_raised_as_systemexit_never_ends_the_eval_thread_silently`.
 
+## 65. The fast graph on CUDA: running sums in blocks, its optional input `t_align`, the fused float32 attention (no setting; zero-farm's Windows GPU PCs, 2026-11-19)
+
+**Why.** Measured on a farm PC (an NVIDIA GPU, the farm's CUDA pack; MTG Zero's legacy-meta3-r1 at gen 769, its fast
+graph, the CUDA pack: ONNX Runtime 1.24.4), the native worker played at 0.33x of the trainer's own torch path (bf16 and
+its token CUDA graphs) on the same PC with one worker, 0.43x with three sharing the GPU. A profile of the fast graph's
+kernels (CUPTI through torch.profiler, which sees ONNX Runtime's kernels too) at 1,024 rows: 63 ms a call, 48 ms of GPU
+time, of which ONNX Runtime's CUDA CumSum took 15.5 ms - its cost grows faster than the axis's length (16k elements 0.37
+ms, 64k 1.65 ms, 262k 16.4 ms; [464, 512] along its rows 0.18 ms) and `_csr_rows`' running sum covers a batch's
+non-zeros (237,272 elements) -, the attention ~16 ms through the unfused path (separate products, transposes, softmax),
+cuDNN's InstanceNormalization 2.2 ms (`layernorm_instance`, the Mac's form), 190 host <-> device copies.
+
+**What.** Only the fast graph (`fast`, `pool_export` 'fast') and the worker's CUDA sessions change; the default graph's
+export is as before, byte for byte.
+
+* *Running sums in blocks* (`_cumsum0(v, blocked=True)`, `CUMSUM_BLOCK` 512): within blocks of 512 elements (zero-padded
+  to whole blocks), then over the blocks' totals, added back - the same integers. Only over axes sized by the graph's
+  inputs: `_csr_rows` of the non-zeros, the tail tokens and the overrides (the module's `blocked`, the fast graph's).
+  Over a data-dependent length (a NonZero's count) the exporter dropped the padding (a [-1, 512] Reshape of 33,830
+  elements failed on CUDA): those keep `cumsum`.
+* *The policy scatter's spare places* (the `punique` path): B A1 + token C + column from the head tokens' running count
+  instead of a running sum over all n_h C writes (67,660 elements at 1,024 rows) - the same places.
+* *The optional input `t_align`* (int64 0-d, an initializer of its name holding 1: a feeder may leave it out; metadata
+  `t_align` '16', `T_ALIGN`): the padded rows' token axis rounded up to a multiple of it, at most `T_ALIGN_PAD` (15)
+  past the longest row and never past B (F + 1 + the most tail tokens of a row) - `int32_bound`'s term, unchanged
+  (the cap is min(15, F + 1 - n_tok), F the features). More padding keys, masked: the same answers up to float32
+  rounding (2.4e-7 on the toy's rich layout). Not fed - every CPU worker and every worker of before - the graph is the
+  one of before but for these few integer operations.
+* *The worker* feeds `t_align` (`session::t_align_for`: the graph's metadata value on a GPU provider; never on the
+  CPU; `ZERO_WORKER_T_ALIGN` overrides it for a measurement, 0 or 1 = not fed) and sets ONNX Runtime's
+  ORT_MIN_SEQ_LEN_EFFICIENT_ATTENTION_FP32 to 1 at its start unless set (`lib::ORT_EFFICIENT_ATTENTION_FP32`): ONNX
+  Runtime's default (256) sends tens-of-tokens attention to the unfused path, and its CUDA MultiHeadAttention takes the
+  fused (cutlass) float32 kernel with an attention bias only for a sequence that is a multiple of 16 (a 1,024-row
+  MultiHeadAttention with bias: 64 tokens 1.70 ms unfused, 0.44 ms fused; 61-63, 67, 72 tokens unfused whatever the
+  variable says; 16, 32, 48, 64, 80, ... fused) - hence `t_align`. Both pass the self-test (2e-5) with the CUDA pack:
+  max abs 7.6e-6 on the reference set, as before.
+* *Tried and left out*: q, k and v each from a product and a gather of its own instead of the qkv product's Split (3.6
+  ms of Split copies at 1,024 rows) - right on the CPU, but on CUDA it broke ONNX Runtime 1.24.4's allocation planner (a
+  ScatterElements' sizes 15,404 against 27,064: 63's planner problem); the Split stays.
+
+**Measured** (the farm PC above, paused on the coordinator; gen 769; the farm's CUDA worker build of MTG Zero 85495dc7
+with the env variable set by hand and a measurement copy of the graph whose `t_align` default is 16 - the worker of
+this change feeds it; 5-minute rolling windows, 1,024 games in flight, 1 group, threads 6; three workers: 3 x 384,
+threads 2):
+
+| graph | kernels at 1,024 rows (wall / GPU ms a call) | one worker (leaves/s) | three workers |
+|---|---|---|---|
+| the fast graph of before | 62.9 / 48.0 | 10,842 / 11,176 / 10,838 (three runs) | 14,154 |
+| + blocked running sums | 51.3 / 34.8 | 12,133 | - |
+| + spare places, `t_align` 16, fused attention | 41.3 / 23.4 | 11,975 | 16,935 |
+
+One worker gains ~10%: its calls are now bound by ONNX Runtime's host side (~1,400 nodes launched one by one, 17
+device -> host syncs for the data-dependent shapes: 62.6 ms a call with the GPU ~35% busy). Workers sharing the GPU gain
+~20%. The trainer's torch path on the same PC: 32,665 leaves/s (bf16 + CUDA graphs), 19,977 in float32.
+
+*The CPU*: the old and the new graph's answers on the desktop's CPU pack (ONNX Runtime 1.31.1, 227 rows, 3 threads)
+are identical (max abs 0.0), their times within noise (median 151.5 / 147.5 ms over interleaved windows).
+
+**Tests.** `tests/test_onnx_fast.py::test_fast_graph_cuda_forms` (`_cumsum0` exact at the block edges and empty; the
+fast graph's CumSum over [., 512] at least three times, the default graph's never; `t_align` an overridable
+initializer, the answers fed 1, 2, 5, 16 or 64 within 2e-6 of not fed); `test_fast_graph_interface_and_structure`
+(the one more input and metadata key); the fast and zero-onnx/2 suites (47 passed with test_onnx.py and
+test_worker_settings.py); zero_worker `t_align_is_fed_to_a_gpu_graph_that_names_it`.
