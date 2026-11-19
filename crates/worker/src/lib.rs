@@ -136,7 +136,7 @@ pub const MAIN_STACK: usize = 256 << 20;
 /// memory-efficient (cutlass) kernel; shorter ones take the unfused path (separate products, transposes and softmax).
 pub const ORT_EFFICIENT_ATTENTION_FP32: &str = "ORT_MIN_SEQ_LEN_EFFICIENT_ATTENTION_FP32";
 
-/// [`ORT_EFFICIENT_ATTENTION_FP32`]'s value in a worker process unless already set (docs/az.md 65): ONNX Runtime's
+/// [`ORT_EFFICIENT_ATTENTION_FP32`]'s value in a worker process unless already set (docs/az.md 66): ONNX Runtime's
 /// default (256) sends a token network's attention (tens of tokens a row) to the unfused path - on a farm PC's NVIDIA
 /// GPU a fast graph's 1,024-row batch took 50.5 ms through it and 40.4 ms through the fused kernel (8 blocks: ~12 ms of
 /// kernels -> 3.2 ms). With an attention bias the fused kernel needs a sequence of a multiple of 16: the fast graph's

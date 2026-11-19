@@ -375,8 +375,8 @@ OUTPUTS2 = OUTPUTS + ('refused',)
 PACKINGS = ('mask', 'compact', 'packed', 'host')
 
 
-CUMSUM_BLOCK = 512                 # `_cumsum0`'s blocks (the fast graph's long running sums, docs/az.md 65)
-# the fast graph's optional input `t_align` (docs/az.md 65): its padded rows' token axis a multiple of it (at most
+CUMSUM_BLOCK = 512                 # `_cumsum0`'s blocks (the fast graph's long running sums, docs/az.md 66)
+# the fast graph's optional input `t_align` (docs/az.md 66): its padded rows' token axis a multiple of it (at most
 # T_ALIGN_PAD more than the longest row: `int32_bound`); default 1 (an initializer: the graph as before when not fed).
 # T_ALIGN is what a GPU worker feeds (metadata `t_align`): ONNX Runtime's CUDA MultiHeadAttention runs float32 with an
 # attention bias through its fused kernel only when the sequence is a multiple of 16 (16-byte aligned bias rows).
@@ -394,7 +394,7 @@ def _optional_input(model, name, value):
 
 
 def _cumsum0(v, blocked=False):
-    """`v.cumsum(0)` of a 1-d integer tensor. `blocked` (the fast graph's, docs/az.md 65): in two levels - running sums
+    """`v.cumsum(0)` of a 1-d integer tensor. `blocked` (the fast graph's, docs/az.md 66): in two levels - running sums
     within blocks of CUMSUM_BLOCK elements (`v` zero-padded to whole blocks), then over the blocks' totals, added back -,
     the same integers: ONNX Runtime 1.24.4's CUDA CumSum costs more than linearly in the axis's length (measured on a
     farm PC's NVIDIA GPU: 0.37 ms over 16k elements, 1.65 ms over 64k, 16.4 ms over 262k - a 1,024-row batch's
@@ -1660,7 +1660,7 @@ class ZeroOnnx2Fast(ZeroOnnx2):
         n_h = pres.sum(1)
         n = n_h + (t_off[1:] - t_off[:-1])
         nmax = _iclamp(n.max(), 2)
-        # `t_align` (optional, default 1: as before; docs/az.md 65): the padded rows' token axis rounded up to a multiple
+        # `t_align` (optional, default 1: as before; docs/az.md 66): the padded rows' token axis rounded up to a multiple
         # of it, at most `pad` past the longest row - more padding keys, masked: the same answers up to float32 rounding
         pad = max(0, min(T_ALIGN_PAD, int(net.features) + 1 - NTOK))   # (`int32_bound`'s B (F + 1 + tail tokens))
         if t_align is not None:
@@ -1695,7 +1695,7 @@ class ZeroOnnx2Fast(ZeroOnnx2):
             if self.attention:
                 # (one product split in three: q, k and v each by a product and a gather of its own - no Split - broke
                 # ONNX Runtime 1.24.4's CUDA allocation planner, a ScatterElements' sizes 15,404 against 27,064 at 1,024
-                # rows: measured, docs/az.md 65)
+                # rows: measured, docs/az.md 66)
                 q3, k3, v3 = torch.split(qkv.view(B, T, 3 * D), [D, D, D], dim=2)
                 a = torch.ops.zero_onnx.fused_attention(q3, k3, v3, bias4, H).reshape(B * T, D)
             else:
@@ -1725,7 +1725,7 @@ class ZeroOnnx2Fast(ZeroOnnx2):
             # logits, every other write to a spare place of its own - the plain scatter's answer, bit for bit)
             ok = (cols >= 0) & (acts < net.actions)
             # (each (token, column) its own spare place B A1 + token C + column: the head tokens' running count ar_h
-            # times the columns, not a running sum over all n_h C writes - ONNX Runtime's CUDA CumSum, docs/az.md 65)
+            # times the columns, not a running sum over all n_h C writes - ONNX Runtime's CUDA CumSum, docs/az.md 66)
             spare = B * A1 + ar_h[:, None] * cols.shape[1] + torch.arange(cols.shape[1], device=dev)[None, :]
             dest = torch.where(ok, row_h[:, None] * A1 + acts, spare)
             pol = torch.cat([gen.reshape(-1), torch.zeros_like(lg).reshape(-1)]).scatter(
@@ -1817,7 +1817,7 @@ def metadata2(net, extra=None, attention=None, fast=False):
                  'tail_width': str(int(getattr(net, 't_width', 0) or 0)), 'gates': json.dumps(net.gates())})
     if fast:
         meta['fast'] = '1'                       # (docs/az.md 63: ZeroOnnx2Fast's graph)
-        meta['t_align'] = str(T_ALIGN)           # (docs/az.md 65: its optional input, what a GPU feeder gives it)
+        meta['t_align'] = str(T_ALIGN)           # (docs/az.md 66: its optional input, what a GPU feeder gives it)
     if attention:
         meta['attention'] = str(attention)
     for k, v in (extra or {}).items():
@@ -2015,7 +2015,7 @@ def _export_module(net, packing='packed', attention=None, fast=False):
     if onnx_version(net) == 2:
         # (variable-length token sets: zero-onnx/2, docs/az.md 46)
         if fast:
-            # (the fast graph's optional input `t_align` last, traced with 1: docs/az.md 65)
+            # (the fast graph's optional input `t_align` last, traced with 1: docs/az.md 66)
             mod = ZeroOnnx2Fast(net, packing, attention).eval()
             return (mod, tuple(example_inputs2(net)) + (torch.tensor(1, dtype=torch.int64),), list(INPUTS2) + ['t_align'],
                     list(OUTPUTS2), dict(dynamic_shapes2(), t_align=None),
@@ -2357,7 +2357,7 @@ def _save(model, meta, path, opset, make_portable, int32=True, attention=None, g
     if gelu:
         fuse_gelu(model)
         layernorm_instance(model)
-        _optional_input(model, 't_align', 1)     # (the fast graph's optional input: default 1, docs/az.md 65)
+        _optional_input(model, 't_align', 1)     # (the fast graph's optional input: default 1, docs/az.md 66)
     meta['opset'] = str(opset)
     if make_portable:
         portable(model)

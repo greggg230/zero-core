@@ -917,7 +917,7 @@ pub struct InferenceSession {
     pub t_align: Option<i64>,
 }
 
-/// The value fed to a fast graph's optional input `t_align` (zero-core docs/az.md 65: its padded rows' token axis a
+/// The value fed to a fast graph's optional input `t_align` (zero-core docs/az.md 66: its padded rows' token axis a
 /// multiple of it, so that ONNX Runtime's CUDA attention takes its fused float32 kernel): a GPU provider's graph
 /// metadata `t_align` (1 to 16), None on the CPU, for a graph without it, or with `ZERO_WORKER_T_ALIGN` 0 or 1 (a
 /// measurement's override: that value instead of the metadata's).
@@ -1279,7 +1279,7 @@ impl InferenceSession {
                 "ov_slot_lo" => Tensor::from_array((len(v.ov_slot_lo.len()), v.ov_slot_lo)).map_err(oerr)?,
             ]);
             if let Some(a) = t_align {
-                // (the fast graph's optional input, a GPU's: zero-core docs/az.md 65)
+                // (the fast graph's optional input, a GPU's: zero-core docs/az.md 66)
                 inputs.extend(ort::inputs!["t_align" => Tensor::from_array((Vec::<i64>::new(), vec![a])).map_err(oerr)?]);
             }
         }
@@ -1710,7 +1710,7 @@ mod tests {
 
     #[test]
     fn t_align_is_fed_to_a_gpu_graph_that_names_it() {
-        // (zero-core docs/az.md 65; ZERO_WORKER_T_ALIGN unset in the test environment)
+        // (zero-core docs/az.md 66; ZERO_WORKER_T_ALIGN unset in the test environment)
         let m = vec![("t_align".to_string(), "16".to_string())];
         assert_eq!(t_align_for(ProviderKind::Cuda, &m), Some(16));
         assert_eq!(t_align_for(ProviderKind::DirectMl, &m), Some(16));

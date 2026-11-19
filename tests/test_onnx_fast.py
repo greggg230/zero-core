@@ -160,7 +160,7 @@ def test_fast_graph_interface_and_structure(tmp_path):
     g0, g1 = onnx.load(p0), onnx.load(p1)
     sig = lambda g: [(i.name, i.type.tensor_type.elem_type, len(i.type.tensor_type.shape.dim))  # noqa: E731
                      for i in list(g.graph.input) + list(g.graph.output)]
-    # (the fast graph's one more input: the optional `t_align`, int64 0-d with an initializer of its name, 1 - docs/az.md 65)
+    # (the fast graph's one more input: the optional `t_align`, int64 0-d with an initializer of its name, 1 - docs/az.md 66)
     assert [s for s in sig(g1) if s[0] != 't_align'] == sig(g0) and ('t_align', T.INT64, 0) in sig(g1)
     ta = [i for i in g1.graph.initializer if i.name == 't_align']
     assert len(ta) == 1 and onnx.numpy_helper.to_array(ta[0]).tolist() == 1
@@ -197,7 +197,7 @@ def test_fast_graph_interface_and_structure(tmp_path):
 
 
 def test_fast_graph_cuda_forms(tmp_path):
-    """docs/az.md 65: `_cumsum0` in blocks is the plain running sum on every length (block edges, empty); the fast graph
+    """docs/az.md 66: `_cumsum0` in blocks is the plain running sum on every length (block edges, empty); the fast graph
     sums the non-zeros', the tail tokens' and the overrides' axes in blocks of CUMSUM_BLOCK (CumSum inputs [., 512]); the
     default graph does not; its optional input `t_align` changes no answer beyond float32 rounding."""
     import onnx
