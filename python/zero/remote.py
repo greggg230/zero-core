@@ -210,13 +210,14 @@ class Transport:
 class RemoteEval:
     """The run's evaluations on the remote `name` (see the module docstring). `mirror`: the
     mirror's directory name in the remote's workdir (default the run directory's name; a
-    co-training run's resolver: '<run name>.resolver')."""
+    co-training run's resolver: '<run name>.resolver'). `spec`, `transport`: a remote that is not a name of the game
+    package's (zero.eval_pool's FarmEval: a mirror on this machine, docs/az.md 65)."""
 
-    def __init__(self, R, name, mirror=None):
+    def __init__(self, R, name, mirror=None, spec=None, transport=None):
         self.R = R
         self.name = name
-        self.spec = remote_spec(name)
-        self.t = Transport(self.spec)
+        self.spec = remote_spec(name) if spec is None else spec
+        self.t = Transport(self.spec) if transport is None else transport
         run_name = mirror or os.path.basename(os.path.normpath(R.run))
         self.rdir = self.spec['workdir'].rstrip('/') + '/' + run_name
         self.module = f'{package.active().name}.az.remote' if package.active().name != 'zero' else 'zero.remote'
@@ -432,13 +433,29 @@ class RemoteEval:
     def _evaluate(self, it):
         t0 = time.time()
         self._ship(it)
+        self._record(it, self._result(it), t0)
+
+    def _result(self, it):
+        """The mirror's evaluation of iteration `it` (shipped by `_ship`): `python -m <pkg>.az.remote eval` on the
+        remote -> its metrics row (the ZERO_REMOTE_RESULT line). zero.eval_pool's FarmEval evaluates the mirror here
+        instead (docs/az.md 65)."""
         r = self.t.run_module(self.module, ['eval', self.rdir, str(it)], timeout=4 * 3600)
         if _refused(r) is not None:
             raise _refused(r)
         lines = [ln for ln in (r.stdout or '').splitlines() if ln.startswith(RESULT)]
         if r.returncode or not lines:
             raise RuntimeError(f'exit {r.returncode}: {(r.stderr or r.stdout or "").strip()[-600:]}')
-        m = json.loads(lines[-1][len(RESULT):])
+        return json.loads(lines[-1][len(RESULT):])
+
+    def _row_extras(self, m):
+        """More keys of the evals.jsonl row from the evaluation `m` ({}: the row of before; FarmEval: how its games
+        were played, docs/az.md 65)."""
+        return {}
+
+    def _record(self, it, m, t0):
+        """Iteration `it`'s evaluation `m` (the mirror's metrics row) checked and recorded: the run's evals.jsonl row,
+        the evaluation's files and records, the mirror's Elo pool files, models/index.json and best.pt (module
+        docstring)."""
         info = getattr(self.R, 'info', None) or {}
         if (info.get('tails') or info.get('option_pointers')) and 'tails' not in (m.get('caps') or []):
             # an older remote checkout would have evaluated a game with variable-length rows without them, or not
@@ -464,6 +481,7 @@ class RemoteEval:
         for k in ('eval_yard', 'eval_random', 'elo', 'elo_anchored', 'extras'):
             if k in m:
                 row[k] = m[k]
+        row.update(self._row_extras(m))
         self._fetch_files(it)
         nrec = self._fetch_records(it)
         if nrec:
@@ -651,16 +669,18 @@ def eval_episodes(cfg):
     return G.episodes_tag(cfg['game'], spec, (cfg.get('players') or [2])[0])
 
 
-def evaluate_mirror(rdir, it):
-    """Run.evaluate + Run.elo_update of iteration `it` on the mirror `rdir`. -> the metrics row."""
+def evaluate_mirror(rdir, it, make_run=None, src='remote'):
+    """Run.evaluate + Run.elo_update of iteration `it` on the mirror `rdir`. -> the metrics row. `make_run(rdir, cfg)`:
+    the Run that evaluates (default zero.run.Run; zero.eval_pool's FarmRun plays the matches on the farm, docs/az.md
+    65); `src`: its game records' source."""
     from .run import Run, append_metrics
     with open(os.path.join(rdir, 'config.json'), encoding='utf-8') as f:
         cfg = json.load(f)
     # the remote machine's own settings for every run it evaluates (<workdir>/overrides.json, e.g.
     # {"groups": 1, "elo_games": 50}: fewer, larger inference batches suit a slower GPU)
     cfg.update(_overrides(rdir))
-    R = Run(rdir, cfg)
-    R.records_src = 'remote'                       # (game_records: the evaluation's records say where they were played)
+    R = (make_run or Run)(rdir, cfg)
+    R.records_src = src                            # (game_records: the evaluation's records say where they were played)
     m = {'iter': it}
     R.evaluate(it, m)
     ratings, best = R.elo_update(it, m)

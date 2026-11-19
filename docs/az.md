@@ -144,7 +144,8 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_root_search`, `eval_root_search` | puct, puct | the root search (docs/search.md 3.7, section 19): 'puct' = today's searches bit for bit; 'gumbel' = Gumbel AlphaZero's root - Gumbel noise per root option, sequential halving over the `gumbel_m` options of highest noise + log-prior, the completed-Q sigma - whose move replaces root Dirichlet noise, temperature sampling and the move rule (`*_select`; PUCT stays below the root). Every search of the seat is one (full, fast, minor). The self-play seat (remote self-play and the league seat too: their checkouts must have this core) needs `policy_target` 'cq' (an error otherwise: sequential halving's counts are no policy), its sigma the target's (`cq_c_visit`, `cq_c_scale`); every evaluation seat: sigma the evaluation rule's transform (`eval_select_c_*`, else `cq_c_*`), and its root search names its Elo pool (`gumbel-m16`, `gumbel-m16-v50-s0.3`, `-g1` with noise, `-rv`), self-play's does not. Exclusive with the same side's `*_root_min_visits` (an error). `zero.h2h` / `zero.replay` follow the run's |
 | `gumbel_m`, `selfplay_gumbel_scale`, `eval_gumbel_scale` | 16, 1.0, 0.0 | the Gumbel search's considered options (the paper's and mctx's 16: every option of a smaller root) and its noise scale: self-play's first `temp_moves` searched decisions of a game are searched with `selfplay_gumbel_scale` (1 = the move a sample of the improved policy, the paper's), later ones without - the role temperature had; the evaluation's on every decision (0 = deterministic, the paper's evaluation) |
 | `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
-| `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
+| `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2); `pool:<farm run>`: on zero-farm, section 65). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
+| `eval_pool_deadline_s`, `eval_pool_threads`, `eval_pool_spot`, `eval_pool_games_per_lease`, `eval_pool_poll_s` | 1800, 4, 0.05, auto, 20 | a run's evaluation on the farm, `eval_remote` = `pool:<farm run>` (a farm run of its own, never the self-play pool's; the pool's settings name the worker build, its executable here, runtime, alternates, priority, min_agent, graph; section 65): the seconds after which the games of a batch the farm has not delivered are played here by `pool_worker` (0 = no deadline: wait for the farm), that worker's threads, the share of the farm's games replayed through the engine (at least one a batch), the batches' games per lease ('auto' or a number) and the seconds between result polls; unused unless `eval_remote` names a pool |
 | `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A comma-separated list = several hosts, each its own workers, mirror and shards, consumers `<name>/w<k>`, metrics `selfplay.remotes` (one name: exactly as before); a name `<prefix>:<arg>` calls the package's callable remote `<prefix>:`; the run directory's `selfplay_remotes` file (one name per line) replaces the list, is re-read at every phase start (hosts join and leave a live run) and alone turns remote self-play on (section 34). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6; a list too, never the file); its own is refused |
 | `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
@@ -392,6 +393,7 @@ yardsticks, the Elo matches and reference games - to another machine while the r
   metrics.jsonl (only a mirror without one gets the run's). With `elo_offsets` every raw-offset
   opponent is shipped too.
 * **Co-training runs**: the resolver's evaluation on a remote, section 11.5.
+* **On the farm** (`eval_remote` = `pool:<farm run>`, 2026-11-19): the same mirror, on this machine, its matches played as eval batches of a farm run by friends' PCs and the owner's farm machines; section 65.
 
 Tests: `tests/test_loop.py` (`test_remote_evaluation_local`, `..._continues_a_local_run`),
 `tests/test_select.py` (the rule on a remote, a refused result, raw offsets shipped) and
@@ -8904,3 +8906,105 @@ output both) with the worker before the change, after it, and after it with ZERO
 and the shard byte for byte (1,335 rows, 3,503 searched decisions). `probe-providers` on gen 619 with its reference set,
 before and after: the same max abs on the CPU (6.806e-6) and the CUDA pack (6.258e-6). `cargo test` (zero_search,
 zero_worker); MTG Zero's search-core gate (its digests and farm compat; ENGINE.md 203).
+
+## 65. A run's evaluation on the farm (`eval_remote` = `pool:<farm run>`, `eval_pool_*`; MTG Zero's legacy-meta3-r1, 2026-11-19)
+
+**Why.** A run's checkpoint evaluations (section 5: the anchors' games, the Elo matches, a yardstick against a bot) are
+either played on the run's machine, which trains meanwhile, or on a remote over SSH (5.2: MTG Zero's runs on the
+Mac). The owner's decision (2026-11-19): the Mac is no longer used over SSH; its last SSH use was legacy-meta3-r1's
+anchor evaluation (2 anchors x 100 games at eval_sims 32 every 16 iterations). zero-farm already plays eval batches
+(zero-farm PROTOCOL 5.2) and traced games (5.3, section 50), so the evaluation's games can go to the farm - friends'
+idle PCs and the owner's machines that run the farm agent - instead of one machine.
+
+**What it does.** `eval_remote` = `pool:<farm run>` (`zero/eval_pool.py`):
+
+* **The run's side is RemoteEval's** (5.2): a thread of the run process queues each evaluated iteration (the iteration
+  never waits), ships what the evaluation needs to a mirror, evaluates the mirror with `Run.evaluate` +
+  `Run.elo_update` (the run's own code) and records the result with `RemoteEval._record` - the evals.jsonl row (host
+  `pool:<farm run>`; dashboards and publishers read it unchanged), the Elo pool's files (`elo/<rule>/results.json`,
+  `ratings.json`, `anchored.json`), models/index.json, best.pt, the game records (59.3: `records/<kind>/iter_NNNN/`,
+  kinds `eval` / `elo` / `anchor`, players as a local match names them). The mirror is a directory of this machine
+  (`<run>/eval_pool/<farm run>/mirror/<run name>`; checkpoints and anchors hard-linked where the disk allows) and the
+  evaluation runs in the run process (no torch inference: the export and the engine's replay only). The row has one
+  more key, `eval_pool`: `{farm_run, batches, games, farm, local, local_s, machines, spot}` (how its games were
+  played; machine counts only). `RemoteEval._evaluate` is now `_ship` + `_result` (the remote's command) + `_record`:
+  the same steps, split so FarmEval replaces `_result` alone.
+* **Every match is one eval batch** of the farm run: the evaluation's `Run` is `FarmRun`, whose `play_match` /
+  `play_matches` send each match between two networks, or a network and a built-in bot, to the farm and return the
+  rows a local driver returns ((score, margin, rounds, over) of the evaluated network); a match against an external
+  bot (`ext:`) and the reference games between two bots (no network, once per pool) are played here as before. For a
+  batch: its networks registered as gens of the farm run (a run checkpoint's gen is its iteration; another network, an
+  anchor, gets 900,000,000 + n; exported once with `zero.farm_h2h.export_cached` and the pool's graph `pool_export`,
+  uploaded, `PUT .../checkpoint/<gen>`); a new signed definition (PROTOCOL 7) whose eval template is the batch's job -
+  the worker build's own `check-config --eval` play settings of the run's settings at the match's simulations with
+  `eval_trace` 1 (section 50), seats `[{"net": A}, {"net": B} | {"bot": name}]`, paired as the run's matches are
+  (`elo_paired`); then the batch (`PUT /v1/admin/run/<farm run>` with `eval`: the template plus the match's driver
+  seed as the base seed). The coordinator holds one batch per run, so the evaluation's matches go one after the other.
+* **A farm run of its own** (`selfplay` null), never the run's self-play pool run: the pool PUTs `eval: null` and
+  signs definitions without an eval template every generation (section 45), and a definition's eval template names
+  the batch's seats, so the two would undo each other. The farm run is created on first use with the pool's
+  settings: `pool_build` (the worker build), `pool_runtime`, `pool_worker` (its executable here: check-config, and the
+  deadline's games), `pool_alternates` / `pool_alt_vendor`, `pool_priority`, `pool_min_agent`, `pool_needs_ram_mb`,
+  `pool_url`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_export`. Each platform alternate is checked
+  on the eval settings first (`check-config --eval --platform`, section 62).
+* **Collecting and checking.** Every eval chunk the coordinator lists is downloaded (sha256), its credited rows taken
+  (`ids`, `also`, `dup_ids`: the first copy of a game wins) and each row checked before it counts: its digest is its
+  record's (`farm_eval.check_digest`), its game id is the batch's, its seats are the batch's for that id, its record's
+  seed is its game id's (`game_seed_of(seed, gid, paired)`: a worker cannot choose its games), its result, over and
+  rounds are its record's. When the batch is complete, a **spot check**: `eval_pool_spot` (5%, at least one game) of
+  the farm's games, chosen at random seeded by the batch's name, replayed through the engine from seed + moves
+  (`farm_eval.replay_trace`: every move legal, the result, rounds and setup the record's). Any mismatch refuses the
+  batch: `refused.jsonl`, the batch dropped on the farm, its games played here instead (with no deadline: the
+  evaluation fails, logged, and is retried with a new batch).
+* **Why a rules replay, not a search replay.** The network's arithmetic differs in its last bits across platforms and
+  execution providers (x64 vs arm64, the CPU vs CUDA; PROTOCOL 11.4), so the same game searched on two machines may
+  legitimately choose other moves, and a re-search on the desktop would "refuse" honest games played on a Mac or a
+  GPU. The engine's rules replay exactly on every platform (the farm pool's platform check, made here too), so a
+  replay from seed + moves is valid whoever played the game: it catches bad hardware, transport faults and broken
+  builds, not a network that chose differently (as PROTOCOL 5.3 says of analysis campaigns).
+* **Deadline and fallback.** The games of a batch the farm has not delivered `eval_pool_deadline_s` (1800) seconds
+  after it was put are played here: the batch is dropped on the farm (`eval: null`: its leases are cancelled at their
+  next beat), then the missing game ids, whole pairs, pieces of 64, are played by `pool_worker` (`<worker> eval` with
+  the batch's settings, seats, base seed, game ids and graphs: the same games the farm would have played) with
+  `eval_pool_threads` threads at below-normal priority, its ONNX Runtime the runtime pack next to the worker build
+  (`<builds>/<runtime>/`, refused at the start when it is missing); their rows are checked as the farm's. `0`: no
+  deadline, the evaluation waits for the farm (a stalled farm then stalls the evaluation queue, never training).
+* **Restarts.** The farm state (`<run>/eval_pool/<farm run>/state.json`: the gens and their files, every batch by its
+  match - seats, games, seed, settings) makes every step idempotent: a restarted run's evaluation of the same
+  iteration resumes the batch it was collecting (no second batch), and a finished batch is not played again.
+* **The deals.** A batch's game ids are the farm run's (the coordinator reserves them), so a farm match plays other
+  deals than a local driver of the same seed (game g's seed is `game_seed(seed, gid, paired)`): the same matches,
+  players, game counts, seats and settings, equally random deals, and every record replays from its own seed. A
+  remote's games were never bit-identical to this machine's either (other arithmetic).
+* **The farm report** (`zero.farm_report`): an evals.jsonl row whose host is a pool counts only the games its
+  deadline played here (`eval_pool.local`) as this machine's; the farm PCs' games are the coordinator's to count.
+
+**Off by default.** `eval_remote` '' (here) or a remote name behaves exactly as before: `Run.loop` takes the farm path
+only for a value starting with `pool:`, which no run used; RemoteEval's split into `_result` / `_record` runs the same
+steps in the same order (its tests unchanged), `evaluate_mirror` defaults to `Run` and src 'remote'. The five new
+settings are trainer-only (`crates/worker/src/run_settings.json`), so no worker build needs them and no template
+changes. Turn it on: `--eval-remote pool:<farm run>` (a slug of its own, e.g. `<run>-eval`) with the pool's settings
+set (`pool_build`, `pool_runtime`, `pool_worker` at least); a restart switches either way (a new mirror starts from the
+run's Elo pool, like 5.2's).
+
+**Costs.** On the run's machine: per new network an export by weight swap (seconds; the first of an architecture
+builds its template and records reference positions once) and its upload; per batch a definition signed by
+farm-release and a few coordinator calls, a poll every `eval_pool_poll_s`, the replay of the spot check (milliseconds a
+game); the deadline's games, when the farm does not deliver, at `eval_pool_threads` threads. On the farm: the games,
+in batches one after the other (a batch waits for its last lease; PROTOCOL 12: CPU PCs take eval first, GPU PCs when
+the CPU PCs can't keep up within `eval_horizon_s`). Disk: the batches' rows and result files (the records with every
+move) under `<run>/eval_pool/`.
+
+**Tests and checks.** `tests/test_eval_pool.py`, against a fake coordinator that plays each batch as the native
+worker plays it (`tests/farm_play.py`: a traced rolling driver on the uploaded ONNX graphs) and hands it out as two
+machines' leases with a duplicate chunk: two evaluations of a toy run with two anchors (the yardstick vs a bot, Elo
+matches together, a calibration, both anchors; ten batches, each with its own definition) record what RemoteEval
+records - the evals.jsonl rows, the pool's files, index.json, the game records with farm machine tags - and play the
+same matches as a remote evaluation of the same run (the pool's pairs, game counts and `logged`, the rows' keys and the
+records' kinds equal); a restart resumes its batch; a half-delivered batch is dropped at its deadline and the rest
+played by the worker (`tests/worker_stub.py eval`), digest for digest the farm's games; a seat-swapped row and a
+tampered move (its digest recomputed: the spot replay refuses it) refuse the batch and its games are played here;
+without a deadline a refused batch fails the evaluation and the retry plays a new batch; the refusals at the start
+(the self-play pool's farm run, no pool_worker, no ONNX Runtime for the deadline, a bad slug). The rest of the suite
+(RemoteEval's tests, `test_worker_settings`, `test_farm_report`, `test_gamerec_all`, `test_privacy`) unchanged.
+

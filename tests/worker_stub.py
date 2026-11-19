@@ -1,5 +1,5 @@
 """A stand-in for a game's worker executable in zero-core's tests (no toy worker binary exists): `info`,
-`check-config <settings.json> [--eval] --json` and `driver-cfg <settings.json>` as a native worker answers them. With
+`check-config <settings.json> [--eval] --json` and `driver-cfg <settings.json>` as a native worker answers them, and `eval` (an eval job's games: tests/farm_play.py). With
 --eval every setting in zero_worker's EVAL_READS (crates/worker/src/settings.rs, read here) is `play`, every other one
 `trainer`; for self-play a setting is `play` when crates/worker/src/run_settings.json classifies it so, else `trainer`;
 `driver-cfg` prints the self-play `play` settings (the same driver for a run's full settings and for those alone).
@@ -41,6 +41,43 @@ def features():
     return [f for f in os.environ.get('WORKER_STUB_FEATURES', '').split(',') if f]
 
 
+def eval_job(argv):
+    """`eval --settings F --seats JSON --games N --gid-base G --seed S [--paired] --out D --prefix P --model GEN=M ...`:
+    the games as the native worker plays them (tests/farm_play.py), one result file of traced rows, the events `evals`
+    and `end` on stdout. WORKER_STUB_EVAL_FAIL: exit 3 after a fatal `error` event, nothing played."""
+    flags, models, paired = {}, {}, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--paired':
+            paired = True
+            i += 1
+            continue
+        if a == '--model':
+            g, _, m = argv[i + 1].partition('=')
+            models[int(g)] = m
+        else:
+            flags[a] = argv[i + 1]
+        i += 2
+    if os.environ.get('WORKER_STUB_EVAL_FAIL'):
+        print(json.dumps({'ev': 'error', 'message': os.environ['WORKER_STUB_EVAL_FAIL'], 'fatal': True}))
+        return 3
+    import farm_play
+    with open(flags['--settings'], encoding='utf-8') as f:
+        settings = json.load(f)
+    lo, n = int(flags['--gid-base']), int(flags['--games'])
+    rows = farm_play.play_traced(settings, json.loads(flags['--seats']), lo, lo + n, int(flags['--seed']), paired, models)
+    out = flags.get('--out', 'out')
+    os.makedirs(out, exist_ok=True)
+    name = f'{flags.get("--prefix", "e")}_000.jsonl'
+    with open(os.path.join(out, name), 'w', encoding='utf-8', newline='\n') as f:
+        for r in rows:
+            f.write(json.dumps(r, separators=(',', ':')) + '\n')
+    print(json.dumps({'ev': 'evals', 'seq': 0, 'path': name, 'games': n, 'gids': [[lo, lo + n]]}))
+    print(json.dumps({'ev': 'end', 'reason': 'done', 'stats': {}, 'unfinished': None}))
+    return 0
+
+
 def main(argv):
     log = os.environ.get('WORKER_STUB_LOG')
     if log:
@@ -69,6 +106,8 @@ def main(argv):
                             'why': 'unknown to this build; declared trainer-only' if k in took else ''} for k, v in cfg.items()]
         print(json.dumps(out))
         return 1 if out['failures'] else 0
+    if argv[:1] == ['eval']:
+        return eval_job(argv[1:])
     if argv[:1] == ['driver-cfg']:
         with open(argv[1], encoding='utf-8') as f:
             cfg = json.load(f)

@@ -308,6 +308,16 @@ DEFAULTS = dict(
     # evaluation on another machine (a name in the game package's `remotes`, 'local' for tests;
     # '' = here): the loop queues each evaluated checkpoint and keeps training (zero.remote)
     eval_remote='',
+    # ... or on the farm: eval_remote 'pool:<farm run>' (zero/eval_pool.py, docs/az.md 65; a farm run of its own, never
+    # the self-play pool's) plays every match of the evaluation as an eval batch of that farm run, with the farm pool's
+    # settings (pool_build, pool_runtime, pool_worker, pool_url, pool_key, pool_farm_release, pool_expires_days,
+    # pool_min_agent, pool_alternates, pool_alt_vendor, pool_priority, pool_needs_ram_mb, pool_export); the games of a
+    # batch the farm has not delivered eval_pool_deadline_s seconds after it was put are played here by pool_worker on
+    # the same graphs with eval_pool_threads threads (0 = no deadline: wait for the farm); eval_pool_spot of the farm's
+    # games are replayed through the engine; the batches' games per lease ('auto' or n) and the seconds between polls.
+    # Unused unless eval_remote names a pool
+    eval_pool_deadline_s=1800.0, eval_pool_threads=4, eval_pool_spot=0.05, eval_pool_games_per_lease='auto',
+    eval_pool_poll_s=20.0,
     # self-play on another machine too (a name in the game package's `remotes`, 'local' for tests;
     # '' = off; zero.remoteplay, docs/az.md 5.3): both machines pull the iteration's games (`games`
     # in total) from one shared queue with the same checkpoint, its shards join data/iter_i/; worker
@@ -2441,7 +2451,13 @@ class Run:
             self.log(f'self-play forks (zero/forks.py): {self.forks.describe()}')
         if RS.enabled(c):
             self.log(f'self-play resignation (zero/resign.py): {RS.fingerprint(c)}')
-        if c.get('eval_remote'):
+        if c.get('eval_remote') and str(c['eval_remote']).startswith('pool:'):
+            # the run's evaluation on the farm (zero/eval_pool.py, docs/az.md 65)
+            from .eval_pool import FarmEval
+            self.remote = FarmEval(self, c['eval_remote'])
+            self.remote.backfill(start if start in done else start - 1)
+            self.log(f'evaluations on the farm: {self.remote.describe()}')
+        elif c.get('eval_remote'):
             from .remote import RemoteEval
             self.remote = RemoteEval(self, c['eval_remote'])
             self.remote.backfill(start if start in done else start - 1)

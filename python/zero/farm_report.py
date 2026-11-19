@@ -43,7 +43,8 @@ eval_random, eval_yard_net) and of every `extras.<name>` that records `games`, p
 Elo matches from the run's Elo pools (elo/results.json, elo/<rule>/results.json: the pairs
 `iter_k|iter_j`, j < k, and `iter_k|anchor:<label>`; the pools' yardstick and 'random' pairs are left
 to the eval_* records, which count those games). Local (eval_remote off): the metrics row that holds `eval_yard`,
-this machine's; remote: the evals.jsonl row, its `host`'s. They count at the row's `time`. Not counted:
+this machine's; remote: the evals.jsonl row, its `host`'s; a farm evaluation's row (host `pool:<farm run>`, docs/az.md
+65): only the games its deadline played here (`eval_pool.local`), this machine's. They count at the row's `time`. Not counted:
 an extra yardstick that records no `games` (MTG Zero's real_decks records its 2 x n games as `n`),
 anchor calibration and the one-off reference match.
 
@@ -600,6 +601,15 @@ class Report:
             self.seen.add(key)
             used += 1
             derived += der
+            if is_pool(row.get('host')):
+                # a farm evaluation (eval_remote 'pool:<farm run>', docs/az.md 65): the farm PCs' games are counted by
+                # the coordinator itself; only the games its deadline's fallback played here are this machine's
+                ep = row.get('eval_pool') if isinstance(row.get('eval_pool'), dict) else {}
+                n_local = _num(ep.get('local')) or 0
+                if n_local:
+                    self.busy(self.local, t - (_num(ep.get('local_s')) or 0.0), t, run.id)
+                    self.games(self.local, 'eval', n_local, t, run.id)
+                continue
             src = self.source_of(str(row.get('host') or 'remote'))
             secs = _num(row.get('seconds')) or 0.0
             self.busy(src, t - secs, t, run.id)
