@@ -1144,7 +1144,7 @@ fn teacher_step<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSea
             g.aux_target(p, &mut aux);
         }
         let step = slot.trace.as_ref().map_or(0, |t| t.len() as u32);
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts, pi: target, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov });
+        slot.records.push(Held::pack(Record { x, player: p as u8, n_players: slot.n as u8, opts, pi: target, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov }));
         slot.rq.push(None);
         n.recorded += 1;
     }
@@ -1555,7 +1555,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
             g.aux_target(p, &mut aux);
         }
         let step = slot.trace.as_ref().map_or(0, |t| t.len() as u32);
-        slot.records.push(Record { x, player: p as u8, n_players: slot.n as u8, opts: opts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov });
+        slot.records.push(Held::pack(Record { x, player: p as u8, n_players: slot.n as u8, opts: opts.to_vec(), pi, z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov }));
         slot.rq.push(if gumbel {
             tree.gumbel_q()
         } else if pruned.is_some() {
@@ -1588,7 +1588,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                 if seat.view_target == ViewTarget::NextQ {
                     slot.view_wait.push((slot.records.len() as u32, o as u8));
                 }
-                slot.records.push(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov: Vec::new() });
+                slot.records.push(Held::pack(Record { x, player: o as u8, n_players: slot.n as u8, opts: Vec::new(), pi: Vec::new(), z: [0.0; MAX_SEATS], q: [0.0; MAX_SEATS], sc: [0.0; MAX_SEATS], net: slot.net, aux, step, tail, ov: Vec::new() }));
                 slot.rq.push(None);
                 n.view_recorded += 1;
             }
@@ -1760,7 +1760,7 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
             return Err("set_trace: a game at a deferred terminal can't be traced (its result comes from outside: docs/search.md 2.17)".into());
         }
         let payload = g.deferred_payload().map_err(|e| format!("deferred_payload: {e}"))?;
-        let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(ParkedRecord::park).collect() } else { Vec::new() };
+        let records: Vec<ParkedRecord> = if cfg.record { records.into_iter().map(|h| ParkedRecord::park(h.unpack())).collect() } else { Vec::new() };
         let bytes = records.iter().map(|r| r.bytes()).sum::<usize>() as u64;
         let Done { gid, tag, n, steps, decisions, ext_moves, .. } = done;
         parked.push(Parked { gid, tag, game: g, n, records, rq, steps, decisions, ext_moves, payload, bytes, start });
@@ -1887,7 +1887,7 @@ fn finish_episode<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &m
                 log: game_log(sh, slot, &g, &ch.samples),
             };
             results.push(row);
-            samples.append(&mut ch.samples);
+            samples.extend(std::mem::take(&mut ch.samples).into_iter().map(Held::unpack));
             slot.fork = None;
             slot.branch = None;
             slot.dev_left = 0;
@@ -1987,12 +1987,12 @@ pub(super) struct Done {
 /// A finishing game's log (`Driver::set_game_log`, docs/search.md 2.20) while the driver logs games, else None: its
 /// seed, its real moves (`fail_log`: kept for every game, docs/search.md 2.18), `record_setup` now, the spec it started
 /// from and the network ids of its records (`records`: the game's or contest's samples).
-fn game_log<G: SearchGame>(sh: &Shared<G>, slot: &Slot<G>, g: &G, records: &[Record]) -> Option<Box<GameLog>> {
+fn game_log<G: SearchGame>(sh: &Shared<G>, slot: &Slot<G>, g: &G, records: &[Held]) -> Option<Box<GameLog>> {
     if !sh.game_log.load(Ordering::Relaxed) {
         return None;
     }
     let spec = if slot.spec_json.is_empty() { lock(&sh.spec_json).clone() } else { slot.spec_json.clone() };
-    let nets = records.iter().map(|r| r.net).fold(None, |a: Option<(u32, u32)>, n| Some(a.map_or((n, n), |(lo, hi)| (lo.min(n), hi.max(n)))));
+    let nets = records.iter().map(|r| r.rec.net).fold(None, |a: Option<(u32, u32)>, n| Some(a.map_or((n, n), |(lo, hi)| (lo.min(n), hi.max(n)))));
     Some(Box::new(GameLog { seed: slot.game_seed, steps: slot.fail_log.clone(), setup: g.record_setup(), spec, nets }))
 }
 
@@ -2000,7 +2000,7 @@ fn game_log<G: SearchGame>(sh: &Shared<G>, slot: &Slot<G>, g: &G, records: &[Rec
 /// over and records made): `z` = `result()`, `q` = the root search's win estimate (`z` without
 /// one), `sc` = `margin()`, each relative to the record's decider. A game cut at max_steps
 /// (`over` false) is a draw and emits nothing.
-pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, records: Vec<Record>, rq: Vec<Option<[f64; MAX_SEATS]>>, samples: &mut Vec<Record>) -> GameResult {
+pub(super) fn emit<G: SearchGame, S: FromHeld>(record: bool, g: &G, over: bool, d: Done, records: Vec<Held>, rq: Vec<Option<[f64; MAX_SEATS]>>, samples: &mut Vec<S>) -> GameResult {
     let n = d.n;
     let res: [f32; MAX_SEATS] = if let Some(w) = d.resign.as_ref().filter(|r| r.resigned).and_then(|r| r.winner) {
         // a resigned game (docs/search.md 3.14): the favoured seat wins
@@ -2039,7 +2039,8 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
     };
     if emit {
         let margins: Vec<f32> = (0..n).map(|i| g.margin(i)).collect();
-        for (mut r, rq) in records.into_iter().zip(rq) {
+        for (mut h, rq) in records.into_iter().zip(rq) {
+            let r = &mut h.rec;
             for j in 0..n {
                 let s = (r.player as usize + j) % n;
                 r.z[j] = res[s];
@@ -2049,7 +2050,7 @@ pub(super) fn emit<G: SearchGame>(record: bool, g: &G, over: bool, d: Done, reco
                 };
                 r.sc[j] = margins[s];
             }
-            samples.push(r);
+            samples.push(S::from_held(h));
         }
     }
     row

@@ -1541,6 +1541,80 @@ impl ParkedRecord {
     }
 }
 
+/// A training record a game holds until it hands it out (`Slot::records`, a contest's finished episodes' samples
+/// `Chain::samples`; docs/search.md 2.21): the `Record` with its row `x` and its auxiliary targets `aux` kept sparse -
+/// the positions and values of their floats whose bits are not 0 (a -0.0 or a NaN is kept as it is) - and `unpack`
+/// giving the `Record` back bit for bit. A row is mostly zeros (MTG Zero's layout v7: a few hundred non-zero floats
+/// of 56,384, 220 KB dense), so dense the records of the games in flight were most of a self-play process's memory.
+pub(crate) struct Held {
+    /// The record, its `x` and `aux` empty (their floats in `x_at` / `x_val`, `aux_at` / `aux_val`).
+    pub(crate) rec: Record,
+    x_len: u32,
+    x_at: Vec<u32>,
+    x_val: Vec<f32>,
+    aux_len: u32,
+    aux_at: Vec<u32>,
+    aux_val: Vec<f32>,
+}
+
+/// The positions and values of the floats of `v` whose bits are not 0 (`Held`).
+fn sparse_of(v: &[f32]) -> (Vec<u32>, Vec<f32>) {
+    let nz = v.iter().filter(|x| x.to_bits() != 0).count();
+    let mut at = Vec::with_capacity(nz);
+    let mut val = Vec::with_capacity(nz);
+    for (i, &x) in v.iter().enumerate() {
+        if x.to_bits() != 0 {
+            at.push(i as u32);
+            val.push(x);
+        }
+    }
+    (at, val)
+}
+
+/// The dense floats of `sparse_of`'s positions and values (`len` of them).
+fn dense_of(len: u32, at: &[u32], val: &[f32]) -> Vec<f32> {
+    let mut v = vec![0.0f32; len as usize];
+    for (&i, &x) in at.iter().zip(val) {
+        v[i as usize] = x;
+    }
+    v
+}
+
+impl Held {
+    pub(crate) fn pack(mut rec: Record) -> Held {
+        let (x_at, x_val) = sparse_of(&rec.x);
+        let (aux_at, aux_val) = sparse_of(&rec.aux);
+        let (x_len, aux_len) = (rec.x.len() as u32, rec.aux.len() as u32);
+        rec.x = Vec::new();
+        rec.aux = Vec::new();
+        Held { rec, x_len, x_at, x_val, aux_len, aux_at, aux_val }
+    }
+    pub(crate) fn unpack(self) -> Record {
+        let mut rec = self.rec;
+        rec.x = dense_of(self.x_len, &self.x_at, &self.x_val);
+        rec.aux = dense_of(self.aux_len, &self.aux_at, &self.aux_val);
+        rec
+    }
+}
+
+/// What `worker::emit` hands a game's labelled records out as: dense `Record`s (the driver's samples) or still `Held`
+/// (a contest's finished episodes, handed out with the contest).
+pub(crate) trait FromHeld {
+    fn from_held(h: Held) -> Self;
+}
+
+impl FromHeld for Record {
+    fn from_held(h: Held) -> Record {
+        h.unpack()
+    }
+}
+
+impl FromHeld for Held {
+    fn from_held(h: Held) -> Held {
+        h
+    }
+}
+
 /// A game waiting at its deferred terminal for `Driver::resolve`.
 struct Parked<G: SearchGame> {
     gid: u32,
@@ -1666,7 +1740,7 @@ struct Slot<G: SearchGame> {
     decisions: u32,
     ext_moves: u32,
     steps: u64,
-    records: Vec<Record>,
+    records: Vec<Held>,
     rq: Vec<Option<[f64; MAX_SEATS]>>,
     /// Value-only records waiting for their observer's next search (`ViewTarget::NextQ`):
     /// (record index, observer seat).
@@ -1734,7 +1808,7 @@ struct Slot<G: SearchGame> {
 #[derive(Default)]
 struct Chain {
     episodes: Vec<EpisodeRow>,
-    samples: Vec<Record>,
+    samples: Vec<Held>,
     steps: u64,
     decisions: u32,
     ext_moves: u32,
@@ -2885,7 +2959,7 @@ impl<G: SearchGame> Driver<G> {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
         let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None, trace: None, abort: None, log: None };
-        let records: Vec<Record> = p.records.into_iter().map(ParkedRecord::unpark).collect();
+        let records: Vec<Held> = p.records.into_iter().map(|r| Held::pack(r.unpark())).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
         let row = catch_unwind(AssertUnwindSafe(|| worker::emit(cfg.record, &p.game, true, done, records, p.rq, &mut samples)))
