@@ -228,7 +228,7 @@ def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, threads=4,
     """`export`'s files for the farm pool's every new checkpoint of a run, fast (docs/az.md 53): `ckpt` ->
     <out_dir>/model.onnx + reference.npz -> `export`'s dict plus `steps` (seconds per step: load, template, swap,
     record_rows, reference, check), `graph` ('template': this checkpoint built the architecture's template first,
-    'swap') and `positions` (the gen whose self-play recorded the reference positions).
+    'swap'; the stage, not the variant, which is `variant`) and `positions` (the gen whose self-play recorded the reference positions).
 
     * The graph: the architecture's weight-swap template (zero.onnx_export.export_template: the full export, once per
       architecture fingerprint) under `<cache_dir>/<fingerprint[:16]>/`, the checkpoint's weights swapped in
@@ -268,14 +268,14 @@ def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, threads=4,
             template = json.load(f)
         if template.get('fingerprint') != fp:
             raise ValueError(f'{tj}: the template of fingerprint {str(template.get("fingerprint"))[:16]}, not {fp[:16]}')
-        graph = 'swap'
+        stage = 'swap'
     else:
         template = export_template(m, tpl, graph=graph)
         template['made_from'] = {'gen': gen, 'checkpoint': ckpt_id}
         _write_json(tj, template)
-        graph = 'template'
+        stage = 'template'
         t = lap('template', t)
-    swap_export(m, tpl, template, model, 'packed', info, graph=graph)
+    swap_export(m, tpl, template, model, 'packed', info, graph=graph)   # the variant, never the stage label
     t = lap('swap', t)
     sk = hashlib.sha256(str(spec).encode()).hexdigest()
     pos, pj = os.path.join(d, f'positions-{sk[:12]}.npz'), os.path.join(d, f'positions-{sk[:12]}.json')
@@ -306,7 +306,7 @@ def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, threads=4,
     return {'model': model, 'sha256': file_sha256(model), 'model_size': os.path.getsize(model), 'reference': ref,
             'reference_sha256': file_sha256(ref), 'reference_size': os.path.getsize(ref), 'check': chk,
             'checkpoint': os.path.abspath(ckpt), 'checkpoint_sha256': info['checkpoint_sha256'], 'steps': steps,
-            'graph': graph, 'positions': pinfo['gen']}
+            'graph': stage, 'variant': graph, 'positions': pinfo['gen']}
 
 
 # ---------------------------------------------------------------- state

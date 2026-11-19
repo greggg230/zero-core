@@ -146,8 +146,8 @@ def test_refusal_on_mismatched_tensors(tpl, tmp_path, monkeypatch):
         assert not os.path.exists(out)
     orig = OX.ZeroOnnx2.__init__
 
-    def init(self, n, packing='packed'):
-        orig(self, n, packing)
+    def init(self, n, packing='packed', *rest, **kw):      # (ZeroOnnx2 also takes `attention` since the fast export)
+        orig(self, n, packing, *rest, **kw)
         self.v_width = self.v_width + 1           # (a constant of the layout's, computed otherwise)
     monkeypatch.setattr(OX.ZeroOnnx2, '__init__', init)
     with pytest.raises(ValueError, match='constant'):
