@@ -149,6 +149,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
+| `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface, metadata (plus `fast`, `attention`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: this machine's driver when its inference is CUDA / MPS, and every remote worker on any device (56.1) - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -8669,3 +8670,175 @@ parity on the Mac, the Mac's records replayed on the desktop.
 **Measured** (the Mac: an M4 Max laptop, 12 P + 4 E cores, 64 GB, macOS 26.6, CONTENDED: the legacy-meta3-r1 run's
 three Python self-play processes at nice 5 on it throughout, ours at nice 15-20; 2026-11-18): see MTG Zero's ENGINE.md
 197 (the per-process A/B of the native worker against the Python remote worker on the run's own settings and network).
+
+## 63. The fast zero-onnx/2 graph: TokenNet's arithmetic behind the same interface (`pool_export`, `export(..., fast=True)`; zero-farm's Mac and CPU PCs, 2026-11-18)
+
+**Why.** MTG Zero's farm lane on the Mac (its ENGINE.md 197.5-197.8) found the native worker's zero-onnx/2 graph ~2.5x as
+expensive per batch as TokenNet's own eager forward whatever ran it (ONNX Runtime 1.31.1, libtorch AOTInductor): the
+cost was the graph's arithmetic. Per 64-row piece it zero-filled and scattered the rows into [64, 56,384] floats; mapped,
+decoded and zeroed all 170 head slots of a row (5-10 present); pooled the bags through a dense product over 23 x 1,024
+identities (~77 non-zero a row); computed all 21 tail segments' input maps for every tail token; sorted the policy's
+writes; attended through MatMuls and transposes; and its LayerNormalization runs, on Apple silicon, at a fifth of the
+speed of ONNX Runtime's InstanceNormalization for the same normalization (134 against 26 us on a [350, 128] input, the
+Mac's M4 Max; the desktop's i9: 35 against 45 us). The whole Mac reached 12.6k leaves/s through one native worker
+process (16.4k with two) against ~20k of its SSH self-play (three Python remote workers).
+
+**What.** `ZeroOnnx2Fast` (`zero.onnx_export`; `export(net, path, fast=True[, attention=])`, `_export_module(...,
+fast=True)`): the same interface - inputs, outputs, dtypes, every metadata key and value of the default graph but
+`opset`, plus `fast` '1' and `attention` (workers read neither) - and the same answers within float32 rounding:
+
+* *No densify* (`_inputs`): each non-zero's row (`_csr_rows`) and its feature's kind and place from two int32 tables of
+  the features (a head slot's position and column, a global feature's place, a bag's); the presence flags, a reader's
+  inputs and the present head slots' floats are each one scatter of the non-zeros to unique places (every other
+  non-zero to a spare place of its own: 41.2's rule) - absent slots' floats never reach the arithmetic (NaN there
+  changes nothing, as before).
+* *The head slots where present* (`_slots`, `TokenNet._pack`): one NonZero over every head slot gives the slots
+  row-major and their floats one after the other (each slot its own width; its first float the widths before it); each
+  segment's input map runs on its own present slots (a NonZero of its own, their floats by one Gather) and the maps go
+  back in place by one scatter of unique rows; + the position embedding; the identities decoded once per identity
+  layout by two products (`TokenNet._identity_digits`), + their embedding where the segment has one - TokenNet's order
+  of the additions.
+* *The bags and the global features from the non-zeros* (`_below`, `_runs`, `_bag`, `_gmap`): a row's non-zeros in a
+  range of features are a run of its ascending ones; each row's count below every bound by one scatter per bound of
+  the first non-zero at or past it (no running sum over the non-zeros: below); the runs padded to the batch's longest;
+  the bag weights [B, bags, M] times the identities' embeddings [B, M, d] and the global map's columns times their
+  values: the dense products' non-zero terms only, the bags' totals exactly.
+* *The packed list* (the global tokens, the present head slots row-major, the tail tokens): each token's place
+  in its padded row from the presence's running sum (along the rows: short); the padded rows' tokens by one scatter of
+  unique places; padding keys read a real token (masked by the attention's -inf: no zero row concatenated per block).
+* *The attention* one fused node per block from 63's placeholder (`fused_attention`; the mask [B, 1, T, T] expanded once):
+  `attention` 'mha' (ONNX Runtime's com.microsoft MultiHeadAttention, opset 17 - the default), 'attention23' (ONNX's
+  opset-23 Attention, the whole graph at opset 23: `opset_bump`) or 'matmul' (the default graph's MatMul / Softmax). Then
+  `fuse_gelu` (the exporter's x * (0.5 * (1 + Erf(x / sqrt 2))) - five nodes ONNX Runtime's optimizer does not fuse in
+  this order - as one com.microsoft Gelu) and `layernorm_instance` (each LayerNormalization as InstanceNormalization of
+  x viewed [rows, 1, features], scale 1, bias 0, then x scale + bias).
+* *The tail segments' input maps* in up to three groups of similar width (`_groups`, `_grouped`: the split with the
+  least work; each group one product over its widest member's floats - a token's floats are zeros past its own width,
+  the same terms - and the token's own block picked by a Where per group), where the default graph ran all 21 maps on
+  every tail token; the tail identities decoded once per layout (`_tail_ids`).
+* *The static policy* one scatter of the present head tokens' pointer logits into the generic logits when every static
+  write names its own action (checked at construction from the network's tables: `punique`); else `_policy_full`, the
+  default graph's sorted last writer (identity actions; `dup_reduce` 'max' its largest claim). The overrides' scatter
+  read back by a Slice.
+* *float32 only*: psi's log2(n + 1) / 32 in float32 (`_psi2(..., f32=True)`; n + 1 exact below 2^24).
+* The tail tokens' checks, the gates, the overrides, `refused` and the heads are `ZeroOnnx2`'s own code (`_tails`,
+  `_overrides`, `_tail_embed` / `_tail_maps` / `_tail_ids`, factored out of `_trunk2` and `_tail_embed`; the default
+  graph's operations unchanged - its gen-398 export before and after this change is byte-identical, 19,564,836 bytes).
+* Every scatter unique, no accumulate scatter, every integer in int32 (`check_int32`; the policy scatter's spare places
+  below B (actions + 1 + n_tok K), checked against B (features + 1) at construction). `opset17` now takes Split-18 with
+  its sizes input (version 13's form).
+
+**Two choices made for the CUDA pack** (ONNX Runtime 1.24.4, its CUDA provider; checked with onnxruntime-gpu 1.24.4 and
+the worker's self-test on the desktop's RTX 5090): (1) *No data-dependent count is used as a size or an offset* beyond
+the batch's own (the head segments' counts stay the shapes of their own tensors). Graphs that sized ranges, reshapes or
+offsets by those counts - one NonZero per segment with the floats sliced by running offsets, or one NonZero split by the
+counts - ran right on the CPU but failed or answered wrongly on CUDA ("Shape mismatch attempting to re-use buffer",
+wrong sizes downstream); the same graphs passed with the session's memory reuse off, and keeping one count scalar alive
+as an extra output fixed them: its allocation planner reused live buffers. (2) *No running sum over the non-zeros* but
+`_csr_rows`' own: its CUDA CumSum takes ~45 ns an element (8 ms over a 1,024-row batch's 180k non-zeros, 34 ms for one
+over [180k, 6]); with six of them the fast graph ran at 0.43x the default graph on 1,024-row batches.
+
+**Graph variants by name** (`GRAPHS`, `graph_options`): '' the default graph, 'fast' (MultiHeadAttention, opset 17),
+'fast-att23' (fastest on the CPU; on the CUDA pack 101 of its nodes run on the CPU - no CUDA kernel of Attention-23,
+InstanceNormalization-22, Equal-19, ReduceMax-20, ... -: ~10x slower there), 'fast-matmul'. `export_fingerprint` /
+`export_template` / `swap_export` take `graph` (the fingerprint names a variant, so each has its own weight-swap
+template; '' leaves the fingerprint's fields as they were); `farm_h2h.export_cached(..., graph=)`; `zero.onnx_parity
+--graph`.
+
+**The run setting `pool_export`** ('' by default: the default graph, as before): the graph the farm pool exports each
+generation as. Trainer-only (`run_settings.json`: a worker build without the setting classes has the key dropped by the
+pool (57), one with them gets it declared trainer (61)); no worker, agent, protocol or graph-contract change - a worker
+runs the fast graph as any zero-onnx/2 graph and self-tests it against the same reference set.
+
+**Off by default.** `pool_export` '' and `export(..., fast=False)`: every graph as before, byte for byte (above).
+
+**Costs.** One NonZero per head segment more (11 for MTG Zero: a host sync each on a GPU); the tail width groups and the
+runs' padding compute some zeros; more nodes than the default graph for a tiny network (the toy's), ~35% fewer for MTG
+Zero's. An export ~20 s (the default graph ~45 s), the file 16.3 MB (19.6 MB).
+
+**Tests.** `tests/test_onnx_fast.py` (10; with test_onnx.py, test_onnx2.py and test_worker_settings.py 46 passed):
+parity through the gate (eager and forward_static, 2e-5, every case twice bit-identical, NaN in absent slots, 64-row
+chunks) on the toy's four layouts and on a richer one (bags, three head segments - one without an identity, one always
+present -, globals in two ranges, a reader, gated tails, overrides, slots near 2^32, batches without tails or overrides)
+with each attention form; identity actions and dup_reduce 'max' (the `_policy_full` path) on rows whose claims collide;
+the interface, metadata, float32 only, one fused attention / Gelu per block, no LayerNormalization, int32, unique
+scatters on real rows; the weight-swap template with `graph='fast'` (swapped == fresh, bit for bit).
+`tests/test_onnx2.py::test_the_graph_refuses_what_the_network_refuses` runs on both graphs (every refusal on its own
+row).
+
+**Measured** (2026-11-18; MTG Zero's legacy-meta3-r1, layout v7: 56,384 features, 8 x 128 TokenNet, 21 tail segments,
+14 gated; the Mac: M4 Max, 12 P + 4 E cores, quiet - the run paused, the bench lock held, idle, on AC; the desktop: i9-
+13900K beside live runs, its CPU 90%+ busy and its GPU training: those numbers are noisy):
+
+* *The graph* (gen 398): 2,136 nodes -> 1,373 ('fast'; 'fast-att23' the same, 'fast-matmul' 1,467), 19.6 -> 16.3 MB,
+  no float64 tensor or cast (6 before). By operator, default -> fast (selected): Slice 168 -> 23, Squeeze 115 -> 32, Cast
+  111 -> 44, MatMul 109 -> 6, Greater 106 -> 24, And 105 -> 33, Mul 96 -> 38, ReduceSum 86 -> 7, Round 81 -> 2, Add 185
+  -> 94, Erf 9 -> 0 (Gelu 9), LayerNormalization 17 -> 0 (InstanceNormalization 17), Softmax 11 -> 3 (MultiHeadAttention
+  8), TopK 1 -> 0, Transpose 25 -> 1; NonZero 1 -> 12. ONNX Runtime's kernel profile on the Mac (1 thread, an earlier
+  build of the graph): LayerNormalization 29% of the kernels' time (9.5 ms a batch) before `layernorm_instance`,
+  InstanceNormalization 0.85 ms after.
+* *Answers* (`zero.onnx_parity --graph`: ORT 1.31.1 against eager and forward_static, every case twice bit-identical,
+  NaN in absent slots, 64-row chunks): legacy-meta3-r1 gen 398 on 91,540 rows the Mac's native worker recorded (17,619
+  tail tokens) and its reference set (overrides): 43 cases, 0 failed, worst 8.9e-6 (margin; priors 5.0e-6) (the default graph 4.5e-6 / priors
+  3.8e-6); gen 619: 43 cases, worst 6.6e-6 (value; priors 5.4e-6); delver-bo3-pb3 gen 143 on its reference set (1,048 tail tokens, 20
+  overrides): 22 cases, worst 3.9e-6 (priors) (default 3.0e-6). The worker's self-test (`probe-providers --model --reference`):
+  the desktop's CPU pack 6.0e-6, the Mac's 4.9e-6, the CUDA pack 6.6e-6.
+* *The farm's gates with the network on both sides* (MTG Zero tools/farm_gates.py: gate 2, the native worker against the
+  Python remote worker - 8 games, 350 rows, 200 batches -; gate 3, records -> rows across a network switch, 12 games,
+  724 rows): the desktop (release worker 5307720f, the CPU pack) and the Mac (gate 2: the Mac release worker 20807b12,
+  the macOS pack): every shard array and batch identical - as with the default graph, run the same way.
+* *The weight-swap template* (gen 398, `export_template(graph='fast')`: 37 s, 153 weights, 5 derived, 23 constants), gen
+  619 swapped in (0.36 s): its outputs the fresh fast export's bit for bit.
+* *Per batch, one caller* (ms per recorded batch of ~234 rows in the worker's 64-row pieces; TokenNet = the Python remote
+  worker's evaluator, `infer.NetEvaluator` on the densified rows, its densify not counted; "early" = the first 24
+  batches of a recording, game starts without tail tokens, "spread" = 24 batches spread over it, 45 tail tokens a batch):
+
+  | machine, set | threads | default graph | fast | fast-att23 | fast-matmul | TokenNet |
+  |---|---|---|---|---|---|---|
+  | Mac, early | 1 | 52.4 | 29.5 | 25.9 | 27.0 | 20.1 |
+  | Mac, early | 3 | 39.8 | 25.1 | 21.0 | 23.9 | 16.2 |
+  | Mac, early | 4 | 38.6 | 24.6 | 20.4 | 23.5 | 15.3 |
+  | Mac, spread | 1 | 64.9 | 43.4 | 35.9 | 38.5 | 36.8 |
+  | Mac, spread | 3 | 47.0 | 33.5 | 26.0 | 30.9 | 24.7 |
+  | Mac, spread | 4 | 45.5 | 32.7 | 25.6 | 30.5 | 22.9 |
+  | desktop, early | 1 | 133 | 72 | 69 | 76 | 99 |
+  | desktop, early | 3 | 103 | 61 | 55 | 66 | 62 |
+  | desktop, early | 4 | 117 | 65 | 60 | 68 | 59 |
+  | desktop, spread | 1 | 190 | 107 | 100 | 103 | 135 |
+  | desktop, spread | 3 | 132 | 79 | 76 | 96 | 84 |
+  | desktop, spread | 4 | 139 | 89 | 89 | 105 | 96 |
+
+  (The Mac's two repetitions each, interleaved, within 3%; the desktop's an earlier build of the graph, noisy.) On the Mac
+  ONNX Runtime's MultiHeadAttention costs ~4 ms a batch more than Attention-23 and ~2 ms more than the MatMul form; on the
+  desktop it is the fastest at 3-4 threads. A graph that sliced each segment's slots by running offsets ('seg' in the
+  measurements) took 23.0 / 33.1 ms (early / spread, 1 thread; Attention-23): ~10% under 'fast-att23', but wrong on
+  CUDA (above).
+* *The CUDA pack* (ORT 1.24.4 on the desktop's RTX 5090 while it trained a live run - contended; `probe-providers
+  --providers cuda --bench-rows`): 'fast' passes the self-test (6.6e-6; 37 nodes on the CPU, the default graph's 31)
+  and answers 2,901 / 10,502 / 19,479 / 18,536 rows/s at 64 / 256 / 1,024 / 2,048-row batches against the default
+  graph's 2,097 / 7,553 / 16,584 / 16,765 (1.1-1.4x). 'fast-att23' passes but runs 101 nodes on the CPU: ~10x slower.
+* *The whole Mac* (zero-core tools/worker_bench.py: 5-minute windows, interleaved; leaves/s; the run's Mac settings and
+  gen-398 network; the SSH setup = 3 Python remote workers; native = the Mac release worker 20807b12, the macOS pack,
+  rolling jobs; "2 procs" = two native processes of threads 12, conc 1,152, groups 6, 4 evaluator sessions x 3
+  threads each): the Mac slowed between the two sessions (the SSH setup
+  ~19.5k -> ~18.1k, the same graph 25.2k -> 21.1k): compare within a session.
+
+  | session | side | leaves/s (windows) |
+  |---|---|---|
+  | A (19:06-19:46) | SSH setup | 20,595; 18,453 |
+  | A | native, 1 proc (threads 16, 2,304 games, 12 groups, 5 x 3), the per-segment-offset build (Attention-23) | 18,729; 18,732 |
+  | A | native, 2 procs, the per-segment-offset build (Attention-23) | 25,332; 25,037 |
+  | A | native, 2 procs, the default graph with 63's prototype Attention-23 | 16,639; 14,180 |
+  | B (20:11-21:03) | SSH setup | 17,859; 18,366 |
+  | B | native, 2 procs, 'fast' (MultiHeadAttention) | 17,955 |
+  | B | native, 2 procs, 'fast-att23' | 20,891; 19,984 |
+  | B | native, 3 procs (threads 12, 768 games, 4 groups, 4 x 3), 'fast-att23' | 20,325 |
+  | B | native, 2 procs, 'fast-matmul' | 17,487 |
+  | B | native, 2 procs, the per-segment-offset build | 21,100 |
+  | B | native, 3 procs, 'fast' / 2 procs, 6 x 2 sessions, 'fast' | 17,538 / 17,446 |
+
+  So on the whole Mac 'fast' runs at the SSH setup's rate (0.98x) and 'fast-att23' at 1.1-1.17x it; the default graph
+  managed 16.4k with two processes (the coordinator's clean window, 2026-11-18) against ~20.6k. Under eight concurrent
+  sessions ONNX Runtime's CPU MultiHeadAttention and the MatMul form lose more against Attention-23 than one caller shows
+  (81-84 ms a batch against 70-73). The per-segment-offset graph (CUDA-unsafe) was the best measured (1.18x in session
+  B, 1.24x in A).

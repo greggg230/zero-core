@@ -581,6 +581,10 @@
    "class": "trainer",
    "why": "orchestration (the farm pool's rolling leases, docs/az.md 54)"
   },
+  "pool_export": {
+   "class": "trainer",
+   "why": "orchestration (the graph the farm pool exports each generation as, docs/az.md 63)"
+  },
   "selfplay_local": {
    "class": "trainer",
    "why": "orchestration"

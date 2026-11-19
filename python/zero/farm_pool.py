@@ -368,6 +368,13 @@ class Pool:
         except ValueError as e:
             raise SystemExit(f'selfplay_remote {name!r}: pool_{e}') from None
         self.rolling_checked = False
+        # the graph each gen is exported as (docs/az.md 63: '' the default graph, 'fast' the fast graph)
+        self.export_graph = str(setting('pool_export') or '')
+        try:
+            from .onnx_export import graph_options
+            graph_options(self.export_graph)
+        except ValueError as e:
+            raise SystemExit(f'selfplay_remote {name!r}: pool_export: {e}') from None
         self.client = client or FD.Client(self.url)
         self.exporter = exporter or self._export
         self.definer = definer or self._define
@@ -526,7 +533,8 @@ class Pool:
         from . import games as G
         from .farm_h2h import export_cached
         return export_cached(ckpt, gen, out_dir, self.R.cfg['game'], G.spec_json(self.R.cfg['spec']),
-                             os.path.join(self.dir, 'export'), f'{self.farm}/{gen}', checkpoint_iter=gen)
+                             os.path.join(self.dir, 'export'), f'{self.farm}/{gen}', checkpoint_iter=gen,
+                             graph=self.export_graph)
 
     def _define(self, client, info):
         return FD.publish(client, info, key=self.key, farm_release=self.farm_release, log=self.log)

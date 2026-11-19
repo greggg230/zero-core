@@ -224,7 +224,7 @@ def _write_json(path, obj):
     os.replace(tmp, path)
 
 
-def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, threads=4, checkpoint_iter=None, n=256):
+def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, threads=4, checkpoint_iter=None, n=256, graph=''):
     """`export`'s files for the farm pool's every new checkpoint of a run, fast (docs/az.md 53): `ckpt` ->
     <out_dir>/model.onnx + reference.npz -> `export`'s dict plus `steps` (seconds per step: load, template, swap,
     record_rows, reference, check), `graph` ('template': this checkpoint built the architecture's template first,
@@ -239,7 +239,9 @@ def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, threads=4,
       first reference set written there), each checkpoint's torch answers written on them (`write_reference_rows`) - the
       reference.npz of before, the same arrays and meta.
     * The check of before: the graph through onnxruntime against the reference set, within REFERENCE_TOL, else nothing
-      is published."""
+      is published.
+    * `graph`: the graph variant (zero.onnx_export.GRAPHS: '' the default graph, 'fast' the fast graph - the run setting
+      `pool_export`, docs/az.md 63); part of the fingerprint, so each variant has its own template."""
     import shutil
     from .onnx_export import (REFERENCE_TOL, check_reference, export_fingerprint, export_template, load_checkpoint,
                               load_reference, reference_rows, swap_export, write_reference_rows)
@@ -256,7 +258,7 @@ def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, threads=4,
         info['checkpoint_iter'] = str(int(checkpoint_iter))
     model = os.path.join(out_dir, 'model.onnx')
     ref = os.path.join(out_dir, 'reference.npz')
-    fp, _ = export_fingerprint(m)
+    fp, _ = export_fingerprint(m, graph=graph)
     d = os.path.join(cache_dir, fp[:16])
     os.makedirs(d, exist_ok=True)
     tpl, tj = os.path.join(d, 'template.onnx'), os.path.join(d, 'template.json')
@@ -268,12 +270,12 @@ def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, threads=4,
             raise ValueError(f'{tj}: the template of fingerprint {str(template.get("fingerprint"))[:16]}, not {fp[:16]}')
         graph = 'swap'
     else:
-        template = export_template(m, tpl)
+        template = export_template(m, tpl, graph=graph)
         template['made_from'] = {'gen': gen, 'checkpoint': ckpt_id}
         _write_json(tj, template)
         graph = 'template'
         t = lap('template', t)
-    swap_export(m, tpl, template, model, 'packed', info)
+    swap_export(m, tpl, template, model, 'packed', info, graph=graph)
     t = lap('swap', t)
     sk = hashlib.sha256(str(spec).encode()).hexdigest()
     pos, pj = os.path.join(d, f'positions-{sk[:12]}.npz'), os.path.join(d, f'positions-{sk[:12]}.json')

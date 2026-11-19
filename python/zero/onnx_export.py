@@ -43,6 +43,13 @@ the network refuses: 0 everywhere, or the batch is refused); metadata zero_onnx=
 int32 (`check_int32`), the feeder a piece too large (`int32_bound`). Every other network exports zero-onnx/1, the
 same graph as before.
 
+The fast graph (docs/az.md 63; `export(..., fast=True)`, `ZeroOnnx2Fast`, the run setting `pool_export` 'fast'): a
+zero-onnx/2 network's graph with TokenNet's own arithmetic - the same interface, metadata (plus `fast`, `attention`) and
+answers (within the parity gate's 2e-5) at a fraction of the CPU time: the sparse rows read without densifying them, the
+head slots embedded where present only, the bags and the global features' map from the non-zeros, one fused attention
+node per block (ONNX Runtime's MultiHeadAttention by default; 'attention23' / 'matmul' the other forms), one Gelu node per MLP, the
+layer norms as InstanceNormalization, the static policy one scatter of unique places, float32 only.
+
 Every exported graph is written without the exporter's per-node annotations (`strip_annotations`: stack traces with
 the exporting checkout's file paths and line numbers, doc strings): the same checkpoint exports to the same bytes from
 any checkout, and no graph carries a local path.
@@ -107,23 +114,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .net import GridNet, Net, TokenNet, _read, aux_answer, varlen_features
+from .net import GridNet, Net, TokenNet, _predict, _read, aux_answer, varlen_features
 from .protocol import MAX_SEATS
 
 # ---------------------------------------------------------------- fused attention (opt-in; docs/az.md 63)
-# `attention` of `export` / ZeroOnnx2: None (the default: the graph as always - Q K^T and A V as MatMuls, an additive
-# mask, Softmax), 'mha' (ONNX Runtime's com.microsoft MultiHeadAttention, one node per block) or 'attention23' (ONNX's
-# opset-23 Attention; the whole graph at opset 23). The module computes exactly what it always did in torch (the custom
-# op's eager arithmetic is the default path's); only the exported graph differs: the exporter writes a placeholder node
-# (`FUSED_DOMAIN`.FusedAttention) that `fused_attention` rewrites into the chosen operator.
+# `attention` of `export`: how a graph computes the attention. None (the default graph: Q K^T and A V as MatMuls, an
+# additive mask, Softmax), 'mha' (ONNX Runtime's com.microsoft MultiHeadAttention, one node per block; the graph's opset
+# unchanged) or 'attention23' (ONNX's opset-23 Attention, one node per block; the whole graph at opset 23). The module
+# computes in torch what the default path computes (the custom op's eager arithmetic is that path's); only the exported
+# graph differs: the exporter writes a placeholder node (`FUSED_DOMAIN`.FusedAttention) that `fused_attention` rewrites
+# into the chosen operator. The fast graph (`fast`, docs/az.md 63) takes 'matmul' too (its unfused form).
 ATTENTIONS = (None, 'mha', 'attention23')
+FAST_ATTENTIONS = ('mha', 'attention23', 'matmul')
 FUSED_DOMAIN = 'zero.onnx'
+# a graph variant by name (`graph` of export_template / swap_export / farm_h2h.export_cached; the run setting
+# `pool_export`, docs/az.md 63) -> (attention, fast): '' the default graph; 'fast' the fast graph with com.microsoft
+# MultiHeadAttention at opset 17 (every runtime pack the farm ships runs it on its provider: the CPU packs and the CUDA
+# pack); 'fast-att23' with ONNX's opset-23 Attention (the fastest on the CPU; the CUDA pack's ONNX Runtime 1.24.4 has no
+# CUDA kernel of opset 19-23's versions of a dozen operators, which then run on the CPU); 'fast-matmul' the MatMul form
+GRAPHS = {'': (None, False), 'fast': ('mha', True), 'fast-att23': ('attention23', True), 'fast-matmul': ('matmul', True)}
+
+
+def graph_options(graph):
+    """`GRAPHS[graph]`: (attention, fast); ValueError for another name."""
+    if (graph or '') not in GRAPHS:
+        raise ValueError(f'graph {graph!r}: one of {sorted(GRAPHS)}')
+    return GRAPHS[graph or '']
+
+
+def graph_opset(opset, attention):
+    """The opset a graph is written at: `opset`, or 23 with ONNX's Attention ('attention23')."""
+    return 23 if attention == 'attention23' else int(opset)
 
 
 @torch.library.custom_op('zero_onnx::fused_attention', mutates_args=())
 def _fused_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, heads: int) -> torch.Tensor:
-    """softmax(Q K^T / sqrt(hd) + bias) V per head: q, k, v [B, T, D] (D = heads x hd), bias [B, 1, 1, T] (additive: 0, a
-    gated key's log weight, -inf for padding) -> [B, T, D]; the default path's arithmetic."""
+    """softmax(Q K^T / sqrt(hd) + bias) V per head: q, k, v [B, T, D] (D = heads x hd), bias [B, 1, T, T] (additive: 0, a
+    gated key's log weight, -inf for padding; the same for every query: ONNX Runtime's kernels of both fused operators
+    want the query length in the mask, its CPU Attention-23 refuses the spec's broadcast) -> [B, T, D]; the default
+    path's arithmetic."""
     B, T, D = q.shape
     hd = D // heads
     qh, kh, vh = (x.reshape(B, T, heads, hd).transpose(1, 2) for x in (q, k, v))
@@ -158,13 +187,14 @@ def _fused_attention_onnx(q, k, v, bias, heads: int):
 
 
 def fused_attention(model, kind):
-    """The placeholder nodes (`FUSED_DOMAIN`.FusedAttention: q, k, v [B, T, D], bias [B, 1, 1, T] -> [B, T, D]) rewritten
+    """The placeholder nodes (`FUSED_DOMAIN`.FusedAttention: q, k, v [B, T, D], bias [B, 1, T, T] -> [B, T, D]) rewritten
     into `kind`'s operator, in place -> the nodes rewritten. 'mha': com.microsoft MultiHeadAttention (query, key, value,
-    no bias, no key_padding_mask, attention_bias = bias expanded to [B, 1, T, T]: its kernels take a bias of the query
-    length; scale 1/sqrt(hd)) - opset of the rest unchanged. 'attention23': Attention (q_num_heads = kv_num_heads = heads,
-    attn_mask = bias, broadcast) with the default domain at opset 23 (the opset-18 operators the exporter writes are the
-    same computation there: `opset_bump`)."""
-    from onnx import helper, numpy_helper
+    no bias, no key_padding_mask, attention_bias = bias; scale 1/sqrt(hd)) - the opset of the rest unchanged.
+    'attention23': Attention (q_num_heads = kv_num_heads = heads, attn_mask = bias; scale 1/sqrt(hd)) with the default
+    domain at opset 23 (the operators the exporter writes compute the same there: `opset_bump`)."""
+    from onnx import helper
+    if kind not in ATTENTIONS[1:]:
+        raise ValueError(f'fused attention {kind!r}: one of {ATTENTIONS[1:]}')
     g = model.graph
     out, n = [], 0
     for node in g.node:
@@ -175,24 +205,12 @@ def fused_attention(model, kind):
             raise ValueError(f'{FUSED_DOMAIN}.{node.op_type}: no rewrite')
         heads = next(a.i for a in node.attribute if a.name == 'num_heads')
         q, k, v, bias = node.input
-        y = node.output[0]
-        t = f'fused{n}'
-        if kind not in ATTENTIONS[1:]:
-            raise ValueError(f'fused attention {kind!r}: one of {ATTENTIONS[1:]}')
-        # (the bias [B, 1, 1, T] expanded to [B, 1, T, T]: ONNX Runtime's kernels of both operators want the query length
-        # in the mask - its CPU Attention-23 refuses the spec's broadcast)
-        for nm, val in ((f'{t}_i0', [0]), (f'{t}_i1', [1]), (f'{t}_one', [1])):
-            g.initializer.append(numpy_helper.from_array(np.asarray(val, np.int64), nm))
-        out += [helper.make_node('Shape', [q], [f'{t}_shape']),
-                helper.make_node('Gather', [f'{t}_shape', f'{t}_i0'], [f'{t}_b'], axis=0),
-                helper.make_node('Gather', [f'{t}_shape', f'{t}_i1'], [f'{t}_t'], axis=0),
-                helper.make_node('Concat', [f'{t}_b', f'{t}_one', f'{t}_t', f'{t}_t'], [f'{t}_s4'], axis=0),
-                helper.make_node('Expand', [bias, f'{t}_s4'], [f'{t}_bias4'])]
         if kind == 'mha':
-            out.append(helper.make_node('MultiHeadAttention', [q, k, v, '', '', f'{t}_bias4'], [y], domain='com.microsoft',
-                                        num_heads=heads))
+            out.append(helper.make_node('MultiHeadAttention', [q, k, v, '', '', bias], list(node.output), name=node.name,
+                                        domain='com.microsoft', num_heads=heads))
         else:
-            out.append(helper.make_node('Attention', [q, k, v, f'{t}_bias4'], [y], q_num_heads=heads, kv_num_heads=heads))
+            out.append(helper.make_node('Attention', [q, k, v, bias], list(node.output), name=node.name,
+                                        q_num_heads=heads, kv_num_heads=heads))
         n += 1
     del g.node[:]
     g.node.extend(out)
@@ -204,6 +222,108 @@ def fused_attention(model, kind):
     if kind == 'attention23':
         opset_bump(model, 23)
     return n
+
+
+def fuse_gelu(model):
+    """The exporter's exact GELU - x * (0.5 * (1 + Erf(x / sqrt 2))): Div, Erf, Add, Mul, Mul, each but the last read
+    once - rewritten as one ONNX Runtime com.microsoft Gelu node (the same function, one kernel; its CPU and CUDA
+    providers have had it for years, where ONNX's own Gelu needs opset 20), in place -> the nodes rewritten. ONNX
+    Runtime's CPU optimizer fuses its own pattern (0.5 x (1 + ...)), not this order: the fast graph's five passes over the
+    MLP's hidden units become one."""
+    from onnx import helper, numpy_helper
+    g = model.graph
+    consts = {i.name: numpy_helper.to_array(i) for i in g.initializer}
+    for n in g.node:
+        if n.op_type == 'Constant' and n.attribute and n.attribute[0].name == 'value':
+            consts[n.output[0]] = numpy_helper.to_array(n.attribute[0].t)
+    uses = {}
+    for n in g.node:
+        for x in n.input:
+            uses[x] = uses.get(x, 0) + 1
+    for o in g.output:
+        uses[o.name] = uses.get(o.name, 0) + 1
+    prod = {o: n for n in g.node for o in n.output}
+
+    def const(x, v):
+        a = consts.get(x)
+        return a is not None and a.size == 1 and abs(float(a.reshape(-1)[0]) - v) < 1e-6 * max(1.0, abs(v))
+
+    def other(n, x):
+        return n.input[1] if n.input[0] == x else n.input[0]
+    drop, repl = set(), {}
+    for m2 in g.node:
+        if m2.op_type != 'Mul' or len(m2.input) != 2:
+            continue
+        for a in m2.input:
+            m1 = prod.get(other(m2, a))
+            if m1 is None or m1.op_type != 'Mul' or uses.get(m1.output[0]) != 1:
+                continue
+            ad = next((prod.get(x) for x in m1.input if prod.get(x) is not None and prod[x].op_type == 'Add'), None)
+            if ad is None or not const(other(m1, ad.output[0]), 0.5) or uses.get(ad.output[0]) != 1:
+                continue
+            er = next((prod.get(x) for x in ad.input if prod.get(x) is not None and prod[x].op_type == 'Erf'), None)
+            if er is None or not const(other(ad, er.output[0]), 1.0) or uses.get(er.output[0]) != 1:
+                continue
+            dv = prod.get(er.input[0])
+            if (dv is None or dv.op_type != 'Div' or dv.input[0] != a or not const(dv.input[1], 2.0 ** 0.5)
+                    or uses.get(dv.output[0]) != 1):
+                continue
+            drop.update(id(x) for x in (dv, er, ad, m1))
+            repl[id(m2)] = helper.make_node('Gelu', [a], list(m2.output), name=m2.name, domain='com.microsoft')
+            break
+    if not repl:
+        return 0
+    out = [repl.get(id(n), n) for n in g.node if id(n) not in drop]
+    del g.node[:]
+    g.node.extend(out)
+    if not any(o.domain == 'com.microsoft' for o in model.opset_import):
+        model.opset_import.append(helper.make_opsetid('com.microsoft', 1))
+    return len(repl)
+
+
+def layernorm_instance(model):
+    """Every LayerNormalization over the last axis (scale and bias given, its mean / inverse deviation outputs unused)
+    rewritten as InstanceNormalization of x viewed as [rows, 1, features] - one channel, scale 1, bias 0: the same
+    normalization (the mean and the biased variance over the features, epsilon inside the square root) - then x scale
+    + bias, in place -> the nodes rewritten. ONNX Runtime 1.31.1's CPU LayerNormalization on Apple silicon takes ~5x
+    InstanceNormalization's time (a [350, 128] input: 134 against 26 us on the Mac's M4 Max; on the desktop's i9 35
+    against 45 us - measured 2026-11-18, docs/az.md 63)."""
+    from onnx import helper, numpy_helper
+    g = model.graph
+    used = {x for n in g.node for x in n.input} | {o.name for o in g.output}
+    names = {x for n in g.node for x in list(n.input) + list(n.output)} | {i.name for i in g.initializer}
+    k = 0
+
+    def fresh(base):
+        nonlocal k
+        while f'ln_inst/{base}/{k}' in names:
+            k += 1
+        n = f'ln_inst/{base}/{k}'
+        names.add(n)
+        return n
+    out, n_rw, consts = [], 0, None
+    for n in g.node:
+        ax = next((a.i for a in n.attribute if a.name == 'axis'), -1)
+        if (n.op_type != 'LayerNormalization' or n.domain not in ('', 'ai.onnx') or ax != -1 or len(n.input) < 3
+                or not n.input[2] or any(o in used for o in n.output[1:])):
+            out.append(n)
+            continue
+        if consts is None:
+            consts = (fresh('one'), fresh('zero'), fresh('axis1'))
+            g.initializer.extend([numpy_helper.from_array(np.ones(1, np.float32), consts[0]),
+                                  numpy_helper.from_array(np.zeros(1, np.float32), consts[1]),
+                                  numpy_helper.from_array(np.ones(1, np.int64), consts[2])])
+        eps = next((a.f for a in n.attribute if a.name == 'epsilon'), 1e-5)
+        x3, y3, y2, ys = fresh('x3'), fresh('y3'), fresh('y2'), fresh('ys')
+        out += [helper.make_node('Unsqueeze', [n.input[0], consts[2]], [x3], name=fresh('unsqueeze')),
+                helper.make_node('InstanceNormalization', [x3, consts[0], consts[1]], [y3], name=n.name, epsilon=eps),
+                helper.make_node('Squeeze', [y3, consts[2]], [y2], name=fresh('squeeze')),
+                helper.make_node('Mul', [y2, n.input[1]], [ys], name=fresh('scale')),
+                helper.make_node('Add', [ys, n.input[2]], [n.output[0]], name=fresh('bias'))]
+        n_rw += 1
+    del g.node[:]
+    g.node.extend(out)
+    return n_rw
 
 
 def opset_bump(model, to):
@@ -363,6 +483,29 @@ def _identity(sl, idspec, vocab):
         idx = dig if idx is None else idx * r + dig
         ok = has if ok is None else ok & has
         at += r
+    return torch.where(ok & (idx < vocab), idx, torch.full_like(idx, vocab))
+
+
+def _digit_tables(radix):
+    """An identity layout's (digit values [R, n_digits], digit indicators [R, n_digits], mixed-radix multipliers
+    [n_digits]) - `TokenNet._digit_tables`."""
+    R, nd = sum(radix), len(radix)
+    vals, ind = torch.zeros(R, nd), torch.zeros(R, nd)
+    mult, o = [], 0
+    for k, r in enumerate(radix):
+        vals[o:o + r, k] = torch.arange(r, dtype=torch.float32)
+        ind[o:o + r, k] = 1
+        o += r
+        mult.append(int(np.prod(radix[k + 1:], dtype=np.int64)))
+    return vals, ind, torch.tensor(mult, dtype=torch.long)
+
+
+def _identity_digits(blk, vals, ind, mult, vocab):
+    """Identities [n] of digit blocks blk [n, R] by two products (`TokenNet._identity_digits`: the same identities as
+    `_identity` on one-hot or empty digit blocks, each product summing one exact term per digit), `vocab` = none."""
+    dig = torch.matmul(blk, vals).round().long()
+    ok = (torch.matmul(blk, ind) > 0.5).all(1)
+    idx = (dig * mult).sum(1)
     return torch.where(ok & (idx < vocab), idx, torch.full_like(idx, vocab))
 
 
@@ -631,16 +774,21 @@ def _prev(a):
     return a.index_select(0, i)
 
 
-def _psi2(hi, lo, pow2, sc):
+def _psi2(hi, lo, pow2, sc, f32=False):
     """`TokenNet._psi` of offsets n = hi 2^16 + lo in [0, 2^32), given as their 16-bit halves (int64 in [0, 2^16): no
     integer reaches 2^31): the 32 binary digits by integer division of each half (`//` exports as ONNX's integer Div;
     `torch.div` with a rounding mode would go through floats and `>>` by a tensor does not export; `pow2` 2^0 .. 2^15),
     log2(n + 1) / 32 computed in float64 (n exact there) and rounded, the sin / cos part read from psi's own table of
-    n mod 256 = lo mod 256 (`sc`, `TokenNet._psi_sc`: the same floats)."""
+    n mod 256 = lo mod 256 (`sc`, `TokenNet._psi_sc`: the same floats). `f32` (the fast graph, docs/az.md 63): log2(n + 1)
+    / 32 in float32 (n + 1 exact below 2^24; within a few units in the last place of TokenNet's - no float64 in the
+    graph)."""
     bits = torch.cat([torch.remainder(lo[:, None] // pow2[None, :], 2), torch.remainder(hi[:, None] // pow2[None, :], 2)],
                      1).to(torch.float32)
-    n = hi.to(torch.float64) * 65536.0 + lo.to(torch.float64)
-    lg = (torch.log2(n + 1.0) / 32.0).to(torch.float32)[:, None]
+    if f32:
+        lg = (torch.log2(hi.to(torch.float32) * 65536.0 + lo.to(torch.float32) + 1.0) / 32.0)[:, None]
+    else:
+        n = hi.to(torch.float64) * 65536.0 + lo.to(torch.float64)
+        lg = (torch.log2(n + 1.0) / 32.0).to(torch.float32)[:, None]
     return torch.cat([bits, lg, sc.index_select(0, torch.remainder(lo, 256))], 1)
 
 
@@ -698,6 +846,7 @@ class ZeroOnnx2(ZeroOnnx):
         if attention not in ATTENTIONS:
             raise ValueError(f'attention {attention!r}: one of {ATTENTIONS}')
         self.attention = attention
+        self.psi_f32 = False                     # (the fast graph's: float32 only, `_psi2`)
         if not self.tokens:
             raise TypeError(f'zero-onnx/2: a token network\'s interface (got a {type(net).__name__})')
         if not varlen_features(net):
@@ -779,9 +928,20 @@ class ZeroOnnx2(ZeroOnnx):
         dhi = torch.where(neg, 0, dhi)
         dlo = torch.where(neg, 0, dlo)
         pick = k[:, None, None].expand(NT, 1, D)
-        x = F.linear(val, self.v_tW, self.v_tb).view(NT, -1, D).gather(1, pick).squeeze(1)
-        pos = F.linear(_psi2(dhi, dlo, self.v_pow2, self.v_sc), self.v_tP).view(NT, -1, D).gather(1, pick).squeeze(1)
+        x = self._tail_maps(val, k, pick)
+        pos = F.linear(_psi2(dhi, dlo, self.v_pow2, self.v_sc, self.psi_f32), self.v_tP).view(NT, -1, D).gather(
+            1, pick).squeeze(1)
         t = x + (net.tail_base.index_select(0, k) + pos)
+        return self._tail_ids(t, val, segc)
+
+    def _tail_maps(self, val, k, pick):
+        """Each tail token's segment's input map of its floats val [NT, Wt] (k: its tail index, pick: k as a gather index
+        [NT, 1, d]): every tail segment's map on every token as one product, each token's own picked."""
+        return F.linear(val, self.v_tW, self.v_tb).view(val.shape[0], -1, self.net.d).gather(1, pick).squeeze(1)
+
+    def _tail_ids(self, t, val, segc):
+        """The tail tokens' identity embeddings added to their embeddings t (a token of a segment with an identity)."""
+        net = self.net
         for j in net.tails:
             s = net.segs[j]
             if s['id'] is None:
@@ -790,19 +950,16 @@ class ZeroOnnx2(ZeroOnnx):
             t = t + torch.where((segc == j)[:, None], net.emb(i), torch.zeros((), dtype=t.dtype))
         return t
 
-    def _trunk2(self, h, pres, ids, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo, t_val, ov_off, ov_opt,
-                ov_seg, ov_col, ov_slot_hi, ov_slot_lo):
-        """`_trunk_packed` with each row's tail tokens after its present head tokens, the gated tokens weighted
-        (docs/az.md 43.6) and the pointer overrides applied (43.7) -> (z [B, 2 d], logits [B, actions + 1], refused
-        [B]: per row its tail tokens and overrides the network refuses - R5 / R6, which torch raises on). Slots and
-        override tokens in int32 pieces (`slot_pieces`, `override_pieces`): no integer here reaches 2^31."""
+    def _tails(self, ref, t_off, t_seg, t_slot_hi, t_slot_lo, t_val, embed=None):
+        """The tail tokens, checked, and their embeddings -> (seg, segc (clamped), slot halves shi / slo (clamped), each
+        token's row, tbad (R5 per token), lbad (the floats do not fit the widths), embeddings [NT, d]). `ref`: a tensor of
+        the trunk's dtype and device. `embed`: the embedding of (floats [n, Wt], clamped segments, shi, slo), default
+        `_tail_embed`, run on the tokens and one sentinel token after them (no empty axis)."""
         net = self.net
-        B, NTOK, D = h.shape
-        dev = h.device
+        D = net.d
+        dev = ref.device
         S = len(net.segs)
-        A1 = net.actions + 1
         NT = t_seg.shape[0]
-        NO = ov_opt.shape[0]
         L = t_val.shape[0]
         H16 = 65535
         one = lambda v: torch.full((1,), v, dtype=torch.long, device=dev)  # noqa: E731
@@ -834,80 +991,29 @@ class ZeroOnnx2(ZeroOnnx):
             # dropped after: no empty axis, whose reductions ONNX Runtime 1.31.1 answers with a wrong shape)
             j0 = net.tails[0]
             c0 = int(net.segs[j0]['count'])
-            te = self._tail_embed(torch.cat([val, val.new_zeros(1, self.Wt)]), torch.cat([segc, one(j0)]),
-                                  torch.cat([shi, one(c0 >> 16)]), torch.cat([slo, one(c0 & 0xffff)]))[:NT]
+            te = (embed or self._tail_embed)(torch.cat([val, val.new_zeros(1, self.Wt)]), torch.cat([segc, one(j0)]),
+                                             torch.cat([shi, one(c0 >> 16)]), torch.cat([slo, one(c0 & 0xffff)]))[:NT]
         else:
-            te = h.new_zeros(NT, D)
-        # ---- the packed list: the N present head tokens (row-major, layout order), then the NT tail tokens
-        flat = pres.reshape(-1)
-        sel = torch.nonzero(flat).squeeze(1)
-        N = sel.shape[0]
-        torch._check(N >= 2)
-        row_h = sel // NTOK
-        slot_h = sel - row_h * NTOK
-        n_h = pres.sum(1)
-        n_t = t_off[1:] - t_off[:-1]
-        n = n_h + n_t
-        T = _iclamp(n.max(), 2).item()                           # (a data-dependent shape: dynamic in the graph)
-        torch._check(T >= 2)
-        torch._check(T <= NTOK + NT)
-        start_h = n_h.cumsum(0) - n_h
-        ar = torch.arange(T, device=dev)[None, :]
-        is_h = ar < n_h[:, None]
-        valid = ar < n[:, None]
-        gidx = torch.where(is_h, start_h[:, None] + ar,
-                           torch.where(valid, N + t_off[:-1][:, None] + (ar - n_h[:, None]), torch.full_like(ar, N + NT)))
-        back = torch.cat([row_h * T + (torch.arange(N, device=dev) - start_h.index_select(0, row_h)),
-                          trow * T + n_h.index_select(0, trow) + (torch.arange(NT, device=dev) - t_off.index_select(0, trow))])
-        rows = torch.cat([row_h, trow])
-        hp = torch.cat([h.reshape(B * NTOK, D).index_select(0, sel), te])
-        if net.gated:
-            # (a token's weight: 1, a gated segment's g, 0 padding - the attention's float mask log w, the pooling)
-            gi = self.v_gi.index_select(0, segc)
-            wt = torch.where(gi >= 0, self.v_g.index_select(0, _iclamp(gi, 0)), torch.ones((), dtype=torch.float32))
-            wpad = torch.cat([torch.ones(N, dtype=torch.float32, device=dev), wt,
-                              torch.zeros(1, dtype=torch.float32, device=dev)]).index_select(0, gidx.reshape(-1)).view(B, T)
-            bias = torch.log(wpad)[:, None, None, :].to(h.dtype)
-        else:
-            bias = torch.where(valid, 0.0, float('-inf'))[:, None, None, :].to(h.dtype)
-        H = net.blocks[0].h
-        hd = D // H
-        for blk in net.blocks:
-            qkv = blk.qkv(blk.ln1(hp))
-            qkv = torch.cat([qkv, qkv.new_zeros(1, 3 * D)]).index_select(0, gidx.reshape(-1))
-            if self.attention:
-                # (opt-in, docs/az.md 63: one fused node in the graph; the same arithmetic in torch)
-                q3, k3, v3 = qkv.view(B, T, 3, D).unbind(2)
-                a = torch.ops.zero_onnx.fused_attention(q3, k3, v3, bias, H).reshape(B * T, D)
-            else:
-                q, k, v = qkv.view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
-                s = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5) + bias
-                a = torch.matmul(torch.softmax(s, -1), v).transpose(1, 2).reshape(B * T, D)
-            hp = hp + blk.out(a.index_select(0, back))
-            hp = hp + blk.ff2(F.gelu(blk.ff1(blk.ln2(hp))))
-        hp = net.ln(hp)
-        # the pooling through the padded rows (no scatter-add: ONNX Runtime's CPU ScatterND add races, docs/az.md 41)
-        pad = torch.cat([hp, hp.new_zeros(1, D)]).index_select(0, gidx.reshape(-1)).view(B, T, D)
-        if net.gated:
-            zm = (pad * wpad[..., None]).sum(1) / wpad.sum(1, keepdim=True)
-        else:
-            zm = pad.sum(1) / n[:, None].to(hp.dtype)
-        z = torch.cat([pad[:, 0], zm], 1)
-        gen = F.pad(net.gen(z), (0, 1))
-        # the static scatter of the head tokens' actions (a tail token has none: docs/az.md 43.7)
-        cols = net.tok_cols.index_select(0, slot_h)
-        acts = net.tok_acts.index_select(0, slot_h)
-        if net.n_id:
-            it = ids.reshape(-1).index_select(0, sel)
-            ia = net.tok_idbase.index_select(0, slot_h) + it
-            ia = torch.where((it < net.vocab) & (ia < net.actions), ia, net.actions)
-            acts = torch.where(net.tok_isid.index_select(0, slot_h), ia[:, None], acts)
-        acts = torch.where(cols >= 0, acts, net.actions)
-        P = _pointer2(net, F.gelu(net.pk(hp) + net.pq(z).index_select(0, rows)))
+            te = ref.new_zeros(NT, D)
+        return seg, segc, shi, slo, trow, tbad, lbad, te
+
+    def _overrides(self, pol, gen, P, flat, cposh, N, NTOK, trow, seg, shi, slo, opt_off, opt_action, ov_off, ov_opt, ov_seg,
+                   ov_col, ov_slot_hi, ov_slot_lo, slice_back=False):
+        """The pointer overrides applied to the static policy (`pol` [B A1], flat) -> (pol, per row the overrides
+        refused). `gen` [B, A1] the generic logits, `P` [N + NT, C] every packed token's pointer logits (head tokens
+        first, then the tail tokens), `flat` [B NTOK] the head positions' presence, `cposh` [B NTOK] a present head
+        position's packed index, `trow` / `seg` / `shi` / `slo` the tail tokens' rows, segments and slot halves.
+        `slice_back` (the fast graph): the policy read back from the scatter's buffer by a Slice, not a Gather."""
+        net = self.net
+        B = gen.shape[0]
+        dev = gen.device
+        S = len(net.segs)
+        A1 = net.actions + 1
+        NT = trow.shape[0]
+        NO = ov_opt.shape[0]
         C = P.shape[1]
-        lg = P[:N].gather(1, _iclamp(cols, 0))
-        cposh = flat.long().cumsum(0) - 1                         # a present head position's packed index
-        pol = _policy_full(gen, acts, lg, flat, cposh, NTOK, net).reshape(-1)
+        H16 = 65535
+        one = lambda v: torch.full((1,), v, dtype=torch.long, device=dev)  # noqa: E731
         if net.option_pointers:
             # ---- the overrides (docs/az.md 43.7): each one's row, its option's action, its target token (a present
             # head slot or a tail token of its row) and column; checked as rows.resolve and TokenNet._ov_index check
@@ -972,11 +1078,101 @@ class ZeroOnnx2(ZeroOnnx):
             later = (okey[None, :] == okey[:, None]) & (ar_o[None, :] > ar_o[:, None])
             obad = obad | later.any(1)
             okey = torch.where(obad, B * A1 + ar_o, orow * A1 + act)
-            pol = torch.cat([pol, pol.new_zeros(NO + 1)]).scatter(0, okey, ovv).index_select(
-                0, torch.arange(B * A1, dtype=torch.int64, device=dev))
+            pol = torch.cat([pol, pol.new_zeros(NO + 1)]).scatter(0, okey, ovv)
+            if slice_back:
+                pol = pol[:B * A1]
+            else:
+                pol = pol.index_select(0, torch.arange(B * A1, dtype=torch.int64, device=dev))
             oref = _row_sum(obad[:NO], ov_off)
         else:
             oref = ov_off[1:] - ov_off[:-1]                       # (a network without pointers refuses every one)
+        return pol, oref
+
+    def _trunk2(self, h, pres, ids, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo, t_val, ov_off, ov_opt,
+                ov_seg, ov_col, ov_slot_hi, ov_slot_lo):
+        """`_trunk_packed` with each row's tail tokens after its present head tokens, the gated tokens weighted
+        (docs/az.md 43.6) and the pointer overrides applied (43.7) -> (z [B, 2 d], logits [B, actions + 1], refused
+        [B]: per row its tail tokens and overrides the network refuses - R5 / R6, which torch raises on). Slots and
+        override tokens in int32 pieces (`slot_pieces`, `override_pieces`): no integer here reaches 2^31."""
+        net = self.net
+        B, NTOK, D = h.shape
+        dev = h.device
+        A1 = net.actions + 1
+        NT = t_seg.shape[0]
+        seg, segc, shi, slo, trow, tbad, lbad, te = self._tails(h, t_off, t_seg, t_slot_hi, t_slot_lo, t_val)
+        # ---- the packed list: the N present head tokens (row-major, layout order), then the NT tail tokens
+        flat = pres.reshape(-1)
+        sel = torch.nonzero(flat).squeeze(1)
+        N = sel.shape[0]
+        torch._check(N >= 2)
+        row_h = sel // NTOK
+        slot_h = sel - row_h * NTOK
+        n_h = pres.sum(1)
+        n_t = t_off[1:] - t_off[:-1]
+        n = n_h + n_t
+        T = _iclamp(n.max(), 2).item()                           # (a data-dependent shape: dynamic in the graph)
+        torch._check(T >= 2)
+        torch._check(T <= NTOK + NT)
+        start_h = n_h.cumsum(0) - n_h
+        ar = torch.arange(T, device=dev)[None, :]
+        is_h = ar < n_h[:, None]
+        valid = ar < n[:, None]
+        gidx = torch.where(is_h, start_h[:, None] + ar,
+                           torch.where(valid, N + t_off[:-1][:, None] + (ar - n_h[:, None]), torch.full_like(ar, N + NT)))
+        back = torch.cat([row_h * T + (torch.arange(N, device=dev) - start_h.index_select(0, row_h)),
+                          trow * T + n_h.index_select(0, trow) + (torch.arange(NT, device=dev) - t_off.index_select(0, trow))])
+        rows = torch.cat([row_h, trow])
+        hp = torch.cat([h.reshape(B * NTOK, D).index_select(0, sel), te])
+        if net.gated:
+            # (a token's weight: 1, a gated segment's g, 0 padding - the attention's float mask log w, the pooling)
+            gi = self.v_gi.index_select(0, segc)
+            wt = torch.where(gi >= 0, self.v_g.index_select(0, _iclamp(gi, 0)), torch.ones((), dtype=torch.float32))
+            wpad = torch.cat([torch.ones(N, dtype=torch.float32, device=dev), wt,
+                              torch.zeros(1, dtype=torch.float32, device=dev)]).index_select(0, gidx.reshape(-1)).view(B, T)
+            bias = torch.log(wpad)[:, None, None, :].to(h.dtype)
+        else:
+            bias = torch.where(valid, 0.0, float('-inf'))[:, None, None, :].to(h.dtype)
+        H = net.blocks[0].h
+        hd = D // H
+        if self.attention:
+            bias4 = bias.expand(B, 1, T, T)                       # (once for every block: the fused operators' mask)
+        for blk in net.blocks:
+            qkv = blk.qkv(blk.ln1(hp))
+            qkv = torch.cat([qkv, qkv.new_zeros(1, 3 * D)]).index_select(0, gidx.reshape(-1))
+            if self.attention:
+                # (opt-in, docs/az.md 63: one fused node in the graph; the same arithmetic in torch)
+                q3, k3, v3 = qkv.view(B, T, 3, D).unbind(2)
+                a = torch.ops.zero_onnx.fused_attention(q3, k3, v3, bias4, H).reshape(B * T, D)
+            else:
+                q, k, v = qkv.view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+                s = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5) + bias
+                a = torch.matmul(torch.softmax(s, -1), v).transpose(1, 2).reshape(B * T, D)
+            hp = hp + blk.out(a.index_select(0, back))
+            hp = hp + blk.ff2(F.gelu(blk.ff1(blk.ln2(hp))))
+        hp = net.ln(hp)
+        # the pooling through the padded rows (no scatter-add: ONNX Runtime's CPU ScatterND add races, docs/az.md 41)
+        pad = torch.cat([hp, hp.new_zeros(1, D)]).index_select(0, gidx.reshape(-1)).view(B, T, D)
+        if net.gated:
+            zm = (pad * wpad[..., None]).sum(1) / wpad.sum(1, keepdim=True)
+        else:
+            zm = pad.sum(1) / n[:, None].to(hp.dtype)
+        z = torch.cat([pad[:, 0], zm], 1)
+        gen = F.pad(net.gen(z), (0, 1))
+        # the static scatter of the head tokens' actions (a tail token has none: docs/az.md 43.7)
+        cols = net.tok_cols.index_select(0, slot_h)
+        acts = net.tok_acts.index_select(0, slot_h)
+        if net.n_id:
+            it = ids.reshape(-1).index_select(0, sel)
+            ia = net.tok_idbase.index_select(0, slot_h) + it
+            ia = torch.where((it < net.vocab) & (ia < net.actions), ia, net.actions)
+            acts = torch.where(net.tok_isid.index_select(0, slot_h), ia[:, None], acts)
+        acts = torch.where(cols >= 0, acts, net.actions)
+        P = _pointer2(net, F.gelu(net.pk(hp) + net.pq(z).index_select(0, rows)))
+        lg = P[:N].gather(1, _iclamp(cols, 0))
+        cposh = flat.long().cumsum(0) - 1                         # a present head position's packed index
+        pol = _policy_full(gen, acts, lg, flat, cposh, NTOK, net).reshape(-1)
+        pol, oref = self._overrides(pol, gen, P, flat, cposh, N, NTOK, trow, seg, shi, slo, opt_off, opt_action, ov_off,
+                                    ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo)
         refused = _row_sum(tbad, t_off) + oref + lbad
         return z, pol.view(B, A1), refused
 
@@ -995,6 +1191,509 @@ class ZeroOnnx2(ZeroOnnx):
         policy, value, margin, aux_out = _outputs(net, self.layout, x.shape[0], r[0], r[1], r[2],
                                                   r[3] if aux else None, n_players, belief)
         return policy, value, margin, aux_out, refused
+
+
+class ZeroOnnx2Fast(ZeroOnnx2):
+    """zero-onnx/2 with TokenNet's own arithmetic (`export(..., fast=True)`, docs/az.md 63): the interface, metadata (plus
+    `fast`, `attention`) and answers of `ZeroOnnx2` (within float32 rounding: the parity gate's 2e-5), a graph that does
+    the work the eager `TokenNet.forward` does instead of more:
+
+    * the sparse rows read without densifying them (`_inputs`: the default graph zero-fills and scatters [B, features],
+      MTG Zero's 56,384 floats a row): each non-zero's kind and place from tables of the features - the presence flags,
+      the readers' inputs and the present head slots' floats each one scatter to unique places;
+    * the head slots embedded where present only (`_slots`, `TokenNet._pack`): one NonZero over every head slot, each
+      present slot's floats [n, widest width]; each segment's input map on its own present slots (a NonZero of its own,
+      the maps put back in place by one scatter of unique rows); the identities decoded once per identity layout
+      (`TokenNet._identity_digits`' two products) - where the default graph maps, decodes and zeroes all of a row's
+      slots (MTG Zero's 170);
+    * the global features' map and the bags from the non-zeros (`_gmap`, `_bag`: each row's non-zeros in a range of
+      features are a run of its ascending ones): the dense products' non-zero terms only (MTG Zero's bags: 23 x 1024
+      identities a row, ~77 non-zero);
+    * the packed list (the global tokens, the present head slots row-major, the tail tokens): each token's place in its
+      padded row from the presence's running sum, the padded rows' tokens by one scatter of unique places; padding keys
+      read a real token (masked: no zero row per block);
+    * the attention one fused node per block (`attention`: 'mha' - com.microsoft MultiHeadAttention, opset 17 -,
+      'attention23' - ONNX's Attention, opset 23 -, or 'matmul', the default graph's MatMul / Softmax), its mask built
+      once; one Gelu node per MLP (`fuse_gelu`), the layer norms as InstanceNormalization (`layernorm_instance`);
+    * the tail segments' input maps in up to three groups of similar width (`_groups`: each group one product over its
+      widest member's floats - a token's floats are zeros past its own width: the same terms -, the token's own block
+      picked; the default graph's one product over all of them, 21 x 128 outputs a token for MTG Zero);
+    * the static policy one scatter of unique places when every static write names its own action (the network's
+      tables, checked at construction; else `_policy_full`, the default graph's);
+    * float32 only (`_psi2`'s f32).
+
+    The tail tokens' checks, the gates, the overrides, `refused` and the heads are `ZeroOnnx2`'s. Every scatter unique,
+    no accumulate scatter, int32 integers (docs/az.md 41.2, 46.7). The CUDA pack's ONNX Runtime (1.24.4) shaped two
+    choices (docs/az.md 63): no data-dependent count is used as a size or an offset beyond the batch's own (its
+    allocation planner reused live buffers in graphs that did), and no running sum runs over the non-zeros but
+    `_csr_rows`' (its CumSum takes ~45 ns an element)."""
+
+    def __init__(self, net, packing='packed', attention='mha'):
+        if attention not in FAST_ATTENTIONS:
+            raise ValueError(f'fast graph: attention {attention!r} (one of {FAST_ATTENTIONS})')
+        super().__init__(net, packing, None if attention == 'matmul' else attention)
+        self.psi_f32 = True
+        segs, n_tok = net.segs, int(net.n_tok)
+        F_ = int(net.features)
+        # the sparse rows read without densifying them (`_inputs`): each feature's kind and place - a head slot's
+        # position in the full token axis (>= 1) and its column there, a global feature's place in `gidx` (position -1),
+        # a bag's (-2: `_bag`); per position its present column (-1: always present)
+        G = int(net.gidx.numel())
+        if not G:
+            raise ValueError('fast graph: a token network without global features')
+        # gidx as ranges of consecutive features [(first, end, its place in gidx)] (`_gmap`)
+        gl = net.gidx.tolist()
+        self.g_ranges = []
+        for k, f in enumerate(gl):
+            if k and f == gl[k - 1] + 1:
+                self.g_ranges[-1][1] = f + 1
+            else:
+                self.g_ranges.append([f, f + 1, k])
+        f_tok = torch.full((F_,), -2, dtype=torch.int32)
+        f_col = torch.zeros(F_, dtype=torch.int32)
+        f_tok[net.gidx] = -1
+        f_col[net.gidx] = torch.arange(G, dtype=torch.int32)
+        t_pcol, t_w = [-1] * n_tok, [0] * n_tok
+        always = [False] * n_tok
+        always[0] = True                                          # (the global token)
+        self.heads = []
+        st = 1
+        for j, s in enumerate(segs):
+            k, w, o = int(s['count']), int(s['width']), int(s['offset'] or 0)
+            if not k:
+                continue                                          # (a tail-only segment: no head slot)
+            for i in range(k):
+                t_w[st + i] = w
+                f_tok[o + i * w:o + (i + 1) * w] = st + i
+                f_col[o + i * w:o + (i + 1) * w] = torch.arange(w, dtype=torch.int32)
+                if s['present'] is None:
+                    always[st + i] = True
+                else:
+                    t_pcol[st + i] = int(s['present'])
+            self.heads.append({'seg': j, 'start': st, 'count': k, 'width': w, 'offset': o, 'id': s['id']})
+            st += k
+        lt = lambda v: torch.tensor(v, dtype=torch.long)  # noqa: E731
+        self.register_buffer('f_tok', f_tok, persistent=False)
+        self.register_buffer('f_col', f_col, persistent=False)
+        self.register_buffer('f_always', torch.tensor(always), persistent=False)
+        self.register_buffer('t_pcol', lt(t_pcol), persistent=False)
+        self.register_buffer('t_w', lt(t_w), persistent=False)
+        # a reader's features (docs/az.md 36): each feature's place among its inputs (-1: not one)
+        for n, r in enumerate(net.readers or []):
+            fr = torch.full((F_,), -1, dtype=torch.int32)
+            fr[r.idx] = torch.arange(int(r.idx.numel()), dtype=torch.int32)
+            self.register_buffer(f'f_rd{n}', fr, persistent=False)
+        # identity layouts (radix): one decode per layout - the head segments' present slots grouped by theirs, the
+        # tail tokens per (at, radix) with the segments that use it (TokenNet._tail_embed_static's)
+        self.radixes = []
+
+        def layout(radix):
+            radix = tuple(int(r) for r in radix)
+            if radix not in self.radixes:
+                vals, ind, mult = _digit_tables(radix)
+                k = len(self.radixes)
+                self.register_buffer(f'f_dval{k}', vals, persistent=False)
+                self.register_buffer(f'f_dind{k}', ind, persistent=False)
+                self.register_buffer(f'f_dmul{k}', mult, persistent=False)
+                self.radixes.append(radix)
+            return self.radixes.index(radix)
+        t_lay, t_at = [-1] * n_tok, [0] * n_tok
+        for hs in self.heads:
+            if hs['id'] is not None:
+                for i in range(hs['count']):
+                    t_lay[hs['start'] + i] = layout(hs['id']['radix'])
+                    t_at[hs['start'] + i] = int(hs['id']['at'])
+        self.h_lays = sorted(set(x for x in t_lay if x >= 0))
+        self.register_buffer('t_lay', lt(t_lay), persistent=False)
+        self.register_buffer('t_at', lt(t_at), persistent=False)
+        tid = {}
+        for j in net.tails:
+            if segs[j]['id'] is not None:
+                tid.setdefault((int(segs[j]['id']['at']), layout(segs[j]['id']['radix'])), []).append(j)
+        self.t_ids = []
+        for n, ((at, k), js) in enumerate(tid.items()):
+            uses = torch.zeros(len(segs), dtype=torch.bool)
+            uses[js] = True
+            self.register_buffer(f't_uses{n}', uses, persistent=False)
+            self.t_ids.append((at, k))
+        # the tail segments' input maps in width groups (`_tail_maps`)
+        self.t_groups = []
+        if net.tails:
+            tb = self._groups([int(segs[j]['width']) for j in net.tails], [net.seg_in[j] for j in net.tails], 't')
+            self.register_buffer('t_block', lt(tb), persistent=False)
+        # the bounds of every run (`_runs`: the bag groups', the global features' ranges), counted below at once
+        bounds = sorted({int(x) for lo, hi, _ in self.g_ranges for x in (lo, hi)}
+                        | {int(x) for b in net.bags for x in (b['offset'], b['offset'] + b['count'] * b['width'])})
+        self.r_bound = {x: k for k, x in enumerate(bounds)}
+        self.register_buffer('r_bounds', torch.tensor(bounds, dtype=torch.int32), persistent=False)
+        # each bag group's identity and bag of a feature (its place in the group: tables, no integer division)
+        for n, b in enumerate(net.bags):
+            f = torch.arange(int(b['count']) * int(b['width']))
+            self.register_buffer(f'b_bag{n}', f // int(b['width']), persistent=False)
+            self.register_buffer(f'b_col{n}', f % int(b['width']), persistent=False)
+        # the static policy by one scatter: every static write (a head position's pointer column with an action) names an
+        # action no other write names and no action comes from an identity - each row's writes then go to places of
+        # their own (`forward`; its places below B (actions + 1 + n_tok K) <= B (features + 1): `int32_bound`); else
+        # `_policy_full` (the default graph's sorted last writer, or the largest claim)
+        cols, acts = net.tok_cols[:n_tok], net.tok_acts[:n_tok]
+        src = acts[(cols >= 0) & (acts < int(net.actions))]
+        self.punique = (not net.n_id and int(torch.unique(src).numel()) == int(src.numel())
+                        and int(net.actions) + n_tok * int(cols.shape[1]) <= F_)
+
+    def _groups(self, widths, maps, tag):
+        """Input maps of segments of these `widths` (their nn.Linear `maps`) in up to three groups of similar width - the
+        split with the least work (sum of group members x group width) -, each group's maps one product over its widest
+        member's floats (a token's floats are zeros past its own width: the same terms): buffers `<tag>_W<g>` [members d,
+        width] / `<tag>_b<g>`, the group widths appended to `<tag>_groups` -> each segment's block (its place among the
+        groups' blocks, group after group: `_grouped`)."""
+        K, D = len(widths), self.net.d
+        order = sorted(range(K), key=lambda k: widths[k])
+        best = None
+        for a in range(1, K + 1):
+            for b in range(a, K + 1):
+                parts = [p for p in (order[:a], order[a:b], order[b:]) if p]
+                cost = sum(len(p) * max(widths[k] for k in p) for p in parts)
+                if best is None or cost < best[0]:
+                    best = (cost, parts)
+        block, m = [0] * K, 0
+        for gi, part in enumerate(best[1]):
+            Wg = max(widths[k] for k in part)
+            Wm, bv = torch.zeros(len(part) * D, Wg), torch.zeros(len(part) * D)
+            for q, k in enumerate(part):
+                Wm[q * D:(q + 1) * D, :widths[k]] = maps[k].weight.detach()
+                bv[q * D:(q + 1) * D] = maps[k].bias.detach()
+                block[k] = m + q
+            m += len(part)
+            self.register_buffer(f'{tag}_W{gi}', Wm, persistent=False)
+            self.register_buffer(f'{tag}_b{gi}', bv, persistent=False)
+            getattr(self, f'{tag}_groups').append(Wg)
+        return block
+
+    def _grouped(self, x, tag, block):
+        """Each token's own segment's input map of its floats x [n, width]: every group's product, the token's block
+        (`block` [n]: its place in the groups' blocks, in order) picked from its group's (a Where per group: no
+        concatenation of the groups' outputs)."""
+        n, D = x.shape[0], self.net.d
+        y, base = None, 0
+        for gi, Wg in enumerate(getattr(self, f'{tag}_groups')):
+            W = getattr(self, f'{tag}_W{gi}')
+            K = W.shape[0] // D
+            yg = F.linear(x[:, :Wg], W, getattr(self, f'{tag}_b{gi}')).view(n, K, D)
+            loc = block - base
+            pg = yg.gather(1, _iclamp(loc, 0, K - 1)[:, None, None].expand(n, 1, D)).squeeze(1)
+            y = pg if y is None else torch.where(((loc >= 0) & (loc < K))[:, None], pg, y)
+            base += K
+        return y
+
+    def _ident(self, blk, k):
+        """Identities of digit blocks blk [n, R] of identity layout k (`_identity_digits`)."""
+        return _identity_digits(blk, getattr(self, f'f_dval{k}'), getattr(self, f'f_dind{k}'), getattr(self, f'f_dmul{k}'),
+                                self.net.vocab)
+
+    def _tail_maps(self, val, k, pick):
+        """Each tail token's segment's input map, by width group (`_grouped`)."""
+        return self._grouped(val, 't', self.t_block.index_select(0, k))
+
+    def _tail_ids(self, t, val, segc):
+        """The tail tokens' identity embeddings, each identity layout's digits decoded once for every token
+        (`TokenNet._tail_embed_static`'s: the same identities as the default graph's decode per segment; a token adds
+        exactly its own segment's term, as there)."""
+        net = self.net
+        for n, (at, k) in enumerate(self.t_ids):
+            i = self._ident(val[:, at:at + sum(self.radixes[k])], k)
+            t = t + torch.where(getattr(self, f't_uses{n}').index_select(0, segc)[:, None], net.emb(i),
+                                torch.zeros((), dtype=t.dtype))
+        return t
+
+    def _bag(self, gi, b, below, x_ptr, x_idx, x_val):
+        """`TokenNet._global`'s pooling of one bag group b ([B, count, d + 1]: each bag's count-weighted sum of the
+        identity embeddings, then its total) from the sparse rows: a row's non-zeros inside the group are a run of its
+        ascending features (its first and their number from running sums of `x_idx < bound`, exact integers); the run
+        padded to the batch's longest (M), each non-zero's bag and identity (its feature's place in the group), the
+        weights [B, count, M] (the value where the bag matches, else 0) times the identities' embeddings [B, M, d]: the
+        dense product's non-zero terms, in its order (a zero term adds nothing), and its totals exactly."""
+        net = self.net
+        o, k, w = int(b['offset']), int(b['count']), int(b['width'])
+        B = x_ptr.shape[0] - 1
+        dev = x_val.device
+        f, v, inb = self._runs(o, o + k * w, below, x_ptr, x_idx, x_val)
+        M = f.shape[1]
+        f = torch.where(inb, f - o, 0).reshape(-1)
+        q = getattr(self, f'b_bag{gi}').index_select(0, f).view(B, M)
+        c = getattr(self, f'b_col{gi}').index_select(0, f)
+        hit = (q[:, None, :] == torch.arange(k, device=dev)[None, :, None]) & inb[:, None, :]
+        A = torch.where(hit, v[:, None, :], torch.zeros((), dtype=v.dtype))
+        E = net.emb.weight.index_select(0, c).view(B, M, net.d)
+        return torch.cat([torch.matmul(A, E), A.sum(-1, keepdim=True)], -1)
+
+    def _scatter_rows(self, n, dest, ok, val):
+        """A dense buffer of `n` places from the non-zeros: each non-zero with `ok` to its place `dest`, every other one to a
+        spare place of its own past the end (n + its index: every index unique, docs/az.md 41.2); the first n sliced off
+        (a Slice after a Scatter, which DirectML's graph fusion fails on - it refuses zero-onnx/2 graphs anyway)."""
+        nnz = val.shape[0]
+        dev = val.device
+        at = torch.where(ok, dest, n + torch.arange(nnz, device=dev))
+        buf = torch.zeros(n + nnz, dtype=val.dtype, device=dev).scatter(0, at, val)
+        return buf.index_select(0, torch.arange(n, device=dev))
+
+    def _below(self, x_ptr, x_idx, row):
+        """Each row's non-zeros below each run bound (`r_bounds`) -> [B, bounds]: a row's first non-zero at or past a bound
+        (its features ascend: at most one, the first of its row or one after a non-zero below the bound) marks the place,
+        a scatter of the marks' positions to unique places per bound (a row without one keeps its end); no running sum
+        over the non-zeros (ONNX Runtime 1.24.4's CUDA CumSum takes ~45 ns an element: 8 ms over a 1,024-row batch's 180k
+        non-zeros). `row`: each non-zero's row (`_csr_rows`)."""
+        B = x_ptr.shape[0] - 1
+        nnz = x_idx.shape[0]
+        dev = x_ptr.device
+        f = x_idx.long()
+        ar = torch.arange(nnz, device=dev)
+        prev = f.index_select(0, _iclamp(ar - 1, 0))
+        first = ar == x_ptr.index_select(0, row)
+        bd = self.r_bounds.long()
+        mark = (f[:, None] >= bd[None, :]) & (first[:, None] | (prev[:, None] < bd[None, :]))     # [nnz, bounds]
+        ends = x_ptr[1:]
+        pos = []
+        for k in range(bd.shape[0]):
+            at = torch.where(mark[:, k], row, B + ar)
+            pos.append(torch.cat([ends, ar]).scatter(0, at, ar)[:B])
+        return torch.stack(pos, 1) - x_ptr[:-1][:, None]
+
+    def _runs(self, lo, hi, below, x_ptr, x_idx, x_val):
+        """Each row's non-zeros with a feature in [lo, hi) - a run of its ascending features: its first and their number
+        from the counts below the bounds (`below`, `_below`) -, padded to the batch's longest (M >= 1) -> (features [B, M]
+        (0 in the padding), values [B, M] (0 in the padding), in-run mask [B, M])."""
+        B = x_ptr.shape[0] - 1
+        dev = x_val.device
+        a = below[:, self.r_bound[lo]]
+        n = below[:, self.r_bound[hi]] - a
+        M = _iclamp(n.max(), 1).item()                            # (a data-dependent shape: dynamic in the graph)
+        torch._check(M >= 1)
+        ar = torch.arange(M, device=dev)
+        inb = ar[None, :] < n[:, None]
+        at = torch.where(inb, (x_ptr[:-1] + a)[:, None] + ar[None, :], 0).reshape(-1)
+        f = torch.where(inb, x_idx.index_select(0, at).view(B, M).long(), 0)
+        v = torch.where(inb, x_val.index_select(0, at).view(B, M), torch.zeros((), dtype=x_val.dtype))
+        return f, v, inb
+
+    def _gmap(self, below, x_ptr, x_idx, x_val):
+        """`net.g` of the global features (`gidx`) from the sparse rows: per range of consecutive global features each
+        row's run (`_runs`), the map's columns of its features times their values, summed - the dense product's non-zero
+        terms (a zero term adds nothing) - plus the bias -> [B, d]."""
+        net = self.net
+        B = x_ptr.shape[0] - 1
+        fs, vs = [], []
+        for lo, hi, base in self.g_ranges:
+            f, v, inb = self._runs(lo, hi, below, x_ptr, x_idx, x_val)
+            fs.append(torch.where(inb, f - lo + base, 0))
+            vs.append(v)
+        c, v = torch.cat(fs, 1), torch.cat(vs, 1)
+        W = net.g.weight.t().index_select(0, c.reshape(-1)).view(B, -1, net.d)
+        return torch.matmul(v[:, None, :], W).squeeze(1) + net.g.bias
+
+    def _inputs(self, x_ptr, x_idx, x_val):
+        """What the network reads of the sparse rows, without densifying them (the default graph's [B, features]): each
+        non-zero's row (`_csr_rows`) and its feature's kind and place (the tables) -> (the presence [B, n_tok], each
+        reader's inputs [B, n], the present head slots' floats (row-major, each slot's own width), the
+        present head slots (b, position) (NonZero: the global token aside), each non-zero's row). A non-zero lands in one unique
+        place of one buffer (a row's features ascend, each is one row's once), anything else in a spare place: absent
+        slots' floats never reach the arithmetic. The global features: `_gmap`; the bags: `_bag`."""
+        net = self.net
+        B = x_ptr.shape[0] - 1
+        NTOK = net.n_tok
+        nnz = x_idx.shape[0]
+        row = _csr_rows(x_ptr, nnz)
+        fi = x_idx.long()
+        tok = self.f_tok.index_select(0, fi).long()
+        col = self.f_col.index_select(0, fi).long()
+        rd = []
+        for n, r in enumerate(net.readers or []):
+            p = getattr(self, f'f_rd{n}').index_select(0, fi).long()
+            L = r.idx.shape[0]
+            rd.append(self._scatter_rows(B * L, row * L + p, p >= 0, x_val).view(B, L))
+        # the presence: each slot's present flag (its segment's present column) > 0.5, or a position always present
+        slot = tok >= 1
+        tokc = _iclamp(tok, 0)
+        fp = row * NTOK + tokc
+        flag = slot & (col == self.t_pcol.index_select(0, tokc))
+        pres = (self._scatter_rows(B * NTOK, fp, flag, x_val).view(B, NTOK) > 0.5) | self.f_always[None, :]
+        # the present head slots (the global token aside), row-major: (b, position); each one's own floats one after
+        # the other in that order (its first float `off`: the widths before it)
+        ps = torch.cat([torch.zeros_like(pres[:, :1]), pres[:, 1:]], 1)
+        nz = torch.nonzero(ps)
+        cr = ps.long().cumsum(1)                                 # (two short running sums, not one over B n_tok)
+        rc = cr[:, -1]
+        cs = ((rc.cumsum(0) - rc)[:, None] + cr - 1).reshape(-1) # a present slot's place among them
+        wt = self.t_w.index_select(0, nz[:, 1])
+        off = torch.cat([wt.cumsum(0) - wt, wt.sum(0, keepdim=True)])     # (n + 1: never an empty axis)
+        tot = off[-1].item()                                     # (a data-dependent size: dynamic in the graph)
+        torch._check(tot >= 0)
+        place = off.index_select(0, _iclamp(cs.index_select(0, fp), 0))
+        floats = self._scatter_rows(tot, place + col, slot & ps.reshape(-1).index_select(0, fp), x_val)
+        return pres, rd, floats, nz, row, (ps, cs, off)
+
+    def _read(self, rd):
+        """`net._read` on the readers' inputs [B, n] each -> (their raw outputs, what they add to the global token)."""
+        net = self.net
+        raws, entry = [], None
+        for r, xr in zip(net.readers, rd):
+            raw = r.mlp(xr)
+            raws.append(raw)
+            if r.proj is not None:
+                e = r.proj(_predict(r.spec['loss'], raw.float()))
+                entry = e if entry is None else entry + e
+        return (torch.cat(raws, 1) if len(raws) > 1 else raws[0]), entry
+
+    def _global(self, x_ptr, x_idx, x_val, row, entry):
+        """`TokenNet._global` (the global token's input [B, d] before its position embedding) from the sparse rows: the
+        global features' map (`_gmap`), the bags (`_bag`), the readers' `entry`."""
+        net = self.net
+        below = self._below(x_ptr, x_idx, row)
+        g = self._gmap(below, x_ptr, x_idx, x_val)
+        if net.bag is not None:
+            g = g + net.bag(torch.cat([self._bag(n, b, below, x_ptr, x_idx, x_val) for n, b in enumerate(net.bags)],
+                                      1).flatten(1))
+        if entry is not None:
+            g = g + entry
+        return g
+
+    def _slots(self, floats, nz, psc):
+        """The present head slots' tokens (`TokenNet._pack`: the segment's input map of the slot's floats + its position's
+        embedding + its identity's embedding, a segment with an identity), in the row-major order of `nz` (one NonZero
+        over every head slot): each segment's map on its own present slots - a NonZero of its own, their rows of
+        `floats` by their places (`psc`: the presence without the global token and each position's place in that
+        order) - and put back in place by one scatter of unique rows; the positions' embeddings; each identity layout's
+        digits decoded once for every slot (`_identity_digits`) -> (tokens [n, d], rows [n], positions [n], identities
+        [n] (vocab: none)). No segment's count is used as a size or an offset (only the tensors' own shapes): ONNX
+        Runtime 1.24.4's CUDA allocation planner reused live buffers in graphs that computed with such counts."""
+        net = self.net
+        b, j = nz[:, 0], nz[:, 1]
+        ps, cs, off = psc
+        NTOK = net.n_tok
+        outs, idxs = [], []
+        for hs in self.heads:
+            st, k, w = hs['start'], hs['count'], hs['width']
+            z = torch.nonzero(ps[:, st:st + k])
+            idx = cs.index_select(0, z[:, 0] * NTOK + (z[:, 1] + st))
+            fl = floats.index_select(0, (off.index_select(0, idx)[:, None] + torch.arange(w, device=idx.device)[None, :])
+                                     .reshape(-1)).view(-1, w)
+            outs.append(net.seg_in[hs['seg']](fl))
+            idxs.append(idx)
+        maps = floats.new_zeros(j.shape[0], net.d).index_put((torch.cat(idxs),), torch.cat(outs))
+        t = maps + net.pos.index_select(0, j)
+        lay = self.t_lay.index_select(0, j)
+        ident = torch.full_like(j, net.vocab)
+        for k in self.h_lays:
+            R = sum(self.radixes[k])
+            cols = (off[:-1] + self.t_at.index_select(0, j))[:, None] + torch.arange(R, device=j.device)[None, :]
+            # (a slot without this layout reads the buffer's first floats - inside it: a slot has floats -, replaced)
+            cols = torch.where((lay == k)[:, None], cols, 0)
+            ik = self._ident(floats.index_select(0, cols.reshape(-1)).view(-1, R), k)
+            ident = torch.where(lay == k, ik, ident)
+        if self.h_lays:
+            t = t + torch.where((lay >= 0)[:, None], net.emb(ident), torch.zeros((), dtype=t.dtype))
+        return t, b, j, ident
+
+    def forward(self, x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo,
+                t_val, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo):
+        net = self.net
+        B = n_players.shape[0]
+        dev = x_val.device
+        D, NTOK, A1 = net.d, net.n_tok, net.actions + 1
+        aux = bool(self.layout)
+        pres, rd, floats, nz, row, psc = self._inputs(x_ptr, x_idx, x_val)
+        rraw = ent = None
+        if net.readers is not None:
+            rraw, ent = self._read(rd)
+        g = self._global(x_ptr, x_idx, x_val, row, ent)
+        ts, bs, js, ids_s = self._slots(floats, nz, psc)
+        seg, segc, shi, slo, trow, tbad, lbad, te = self._tails(g, t_off, t_seg, t_slot_hi, t_slot_lo, t_val)
+        NT = t_seg.shape[0]
+        # ---- the packed list: the global tokens (row order), the present head slots (row-major), the tail tokens
+        ar_b = torch.arange(B, device=dev)
+        row_h = torch.cat([ar_b, bs])
+        j_h = torch.cat([torch.zeros_like(ar_b), js])
+        N = row_h.shape[0]
+        torch._check(N >= 2)
+        hp = torch.cat([g + net.pos[0], ts, te])
+        # each token's place in its padded row: a head token's its rank among the row's present positions (layout
+        # order), a tail token's after the row's head tokens; the padded rows' tokens by one scatter of unique places
+        rk = pres.long().cumsum(1) - 1                             # [B, n_tok] (>= 0: the global token is present)
+        n_h = pres.sum(1)
+        n = n_h + (t_off[1:] - t_off[:-1])
+        T = _iclamp(n.max(), 2).item()                           # (a data-dependent shape: dynamic in the graph)
+        torch._check(T >= 2)
+        torch._check(T <= NTOK + NT)
+        back = torch.cat([row_h * T + rk.reshape(-1).index_select(0, row_h * NTOK + j_h),
+                          trow * T + n_h.index_select(0, trow) + (torch.arange(NT, device=dev) - t_off.index_select(0, trow))])
+        M = N + NT
+        rows = torch.cat([row_h, trow])
+        gidx = torch.full((B * T,), M, dtype=torch.long, device=dev).scatter(0, back, torch.arange(M, device=dev))
+        valid = (gidx < M).view(B, T)
+        gq = torch.where(valid.reshape(-1), gidx, 0)              # (a padding key reads token 0: masked)
+        if net.gated:
+            # (a token's weight: 1, a gated segment's g, 0 padding - the attention's float mask log w, the pooling)
+            gi = self.v_gi.index_select(0, segc)
+            wt = torch.where(gi >= 0, self.v_g.index_select(0, _iclamp(gi, 0)), torch.ones((), dtype=torch.float32))
+            wpad = torch.cat([torch.ones(N, dtype=torch.float32, device=dev), wt,
+                              torch.zeros(1, dtype=torch.float32, device=dev)]).index_select(0, gidx).view(B, T)
+            bias = torch.log(wpad)[:, None, None, :].to(hp.dtype)
+        else:
+            bias = torch.where(valid, 0.0, float('-inf'))[:, None, None, :].to(hp.dtype)
+        H = net.blocks[0].h
+        hd = D // H
+        if self.attention:
+            bias4 = bias.expand(B, 1, T, T)
+        for blk in net.blocks:
+            qkv = blk.qkv(blk.ln1(hp)).index_select(0, gq)
+            if self.attention:
+                q3, k3, v3 = torch.split(qkv.view(B, T, 3 * D), [D, D, D], dim=2)
+                a = torch.ops.zero_onnx.fused_attention(q3, k3, v3, bias4, H).reshape(B * T, D)
+            else:
+                q, k, v = qkv.view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+                s = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5) + bias
+                a = torch.matmul(torch.softmax(s, -1), v).transpose(1, 2).reshape(B * T, D)
+            hp = hp + blk.out(a.index_select(0, back))
+            hp = hp + blk.ff2(F.gelu(blk.ff1(blk.ln2(hp))))
+        hp = net.ln(hp)
+        pad = torch.cat([hp, hp.new_zeros(1, D)]).index_select(0, gidx).view(B, T, D)
+        if net.gated:
+            zm = (pad * wpad[..., None]).sum(1) / wpad.sum(1, keepdim=True)
+        else:
+            zm = pad.sum(1) / n[:, None].to(hp.dtype)
+        z = torch.cat([hp[:B], zm], 1)                             # (the global tokens: the list's first B, row order)
+        gen = F.pad(net.gen(z), (0, 1))
+        P = _pointer2(net, F.gelu(net.pk(hp) + net.pq(z).index_select(0, rows)))
+        cposh = gidx.view(B, T).gather(1, rk)                     # a present head position's packed index
+        flat = pres.reshape(-1)
+        cols = net.tok_cols.index_select(0, j_h)
+        acts = net.tok_acts.index_select(0, j_h)
+        # (the head tokens' rows of P by a Gather)
+        ar_h = torch.ones_like(row_h).cumsum(0) - 1
+        lg = P.index_select(0, ar_h).gather(1, _iclamp(cols, 0))
+        if self.punique:
+            # (every write its own action: the present head tokens' pointer logits scattered straight into the generic
+            # logits, every other write to a spare place of its own - the plain scatter's answer, bit for bit)
+            ok = (cols >= 0) & (acts < net.actions)
+            spare = B * A1 + torch.ones_like(cols).reshape(-1).cumsum(0).view(cols.shape) - 1
+            dest = torch.where(ok, row_h[:, None] * A1 + acts, spare)
+            pol = torch.cat([gen.reshape(-1), torch.zeros_like(lg).reshape(-1)]).scatter(
+                0, dest.reshape(-1), lg.reshape(-1))[:B * A1]
+        else:
+            if net.n_id:
+                it = torch.cat([torch.full_like(ar_b, net.vocab), ids_s])
+                ia = net.tok_idbase.index_select(0, j_h) + it
+                ia = torch.where((it < net.vocab) & (ia < net.actions), ia, net.actions)
+                acts = torch.where(net.tok_isid.index_select(0, j_h), ia[:, None], acts)
+            acts = torch.where(cols >= 0, acts, net.actions)
+            pol = _policy_full(gen, acts, lg, flat, cposh.reshape(-1), NTOK, net).reshape(-1)
+        pol, oref = self._overrides(pol, gen, P, flat, cposh.reshape(-1), N, NTOK, trow, seg, shi, slo, opt_off,
+                                    opt_action, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo, slice_back=True)
+        refused = _row_sum(tbad, t_off) + oref + lbad
+        r = net._heads(z, pol.view(B, A1), n_players, aux, None, rraw)
+        policy, value, margin, aux_out = _outputs(net, self.layout, B, r[0], r[1], r[2], r[3] if aux else None, n_players,
+                                                  belief)
+        return policy, value, margin, aux_out, refused
+
 
 def example_inputs(net, packing):
     """Inputs to trace with: 3 rows, 7 non-zeros (distinct sizes, none 0 / 1: nothing specialised), every
@@ -1053,7 +1752,7 @@ def dynamic_shapes2():
             'ov_seg': {0: NO}, 'ov_col': {0: NO}, 'ov_slot_hi': {0: NO}, 'ov_slot_lo': {0: NO}}
 
 
-def metadata2(net, extra=None):
+def metadata2(net, extra=None, attention=None, fast=False):
     """zero-onnx/2's metadata: `metadata`'s, version 2, plus what a worker checks against its game (`tails`
     [[segment, name, width, head slots], ...] - the game's `game_info()['tails']` -, `option_pointers`) and what the
     network reads (`max_row_tokens`, `tail_width`, `gates` {segment: g}); `extra` last, as given."""
@@ -1064,6 +1763,10 @@ def metadata2(net, extra=None):
                  'option_pointers': json.dumps(bool(net.option_pointers)),
                  'max_row_tokens': json.dumps(net.config['layout'].get('max_row_tokens')),
                  'tail_width': str(int(getattr(net, 't_width', 0) or 0)), 'gates': json.dumps(net.gates())})
+    if fast:
+        meta['fast'] = '1'                       # (docs/az.md 63: ZeroOnnx2Fast's graph)
+    if attention:
+        meta['attention'] = str(attention)
     for k, v in (extra or {}).items():
         meta[str(k)] = v if isinstance(v, str) else json.dumps(v)
     return meta
@@ -1204,7 +1907,7 @@ def portable_file(src, dst):
     return stats
 
 
-def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=True, attention=None):
+def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=True, attention=None, fast=False):
     """Export `net` (a TokenNet, GridNet or Net, as loaded: `net.load` / `load_checkpoint`) to the ONNX
     file `path` (one file, no external data; written atomically) -> its metadata: zero-onnx/1, or zero-onnx/2 for
     a token network with variable-length token sets (`onnx_version`; docs/az.md 46). `packing`: a token network's
@@ -1214,35 +1917,58 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
     default: the exporter's opset-18 graph rewritten by `opset17`, docs/az.md 41.2) or 18 (as the exporter writes it).
     Every scatter of the mask and packed graphs writes unique indices (metadata `unique_scatters` 1; docs/az.md 41.2).
     `attention` (zero-onnx/2 only; default None: as always): 'mha' or 'attention23', a fused attention node per block
-    (`ATTENTIONS`, docs/az.md 63; metadata `attention`)."""
-    mod, args, names, outs, dyn, meta_of = _export_module(net, packing, attention)
-    table = {torch.ops.zero_onnx.fused_attention.default: _fused_attention_onnx} if attention else None
+    (`ATTENTIONS`, docs/az.md 63; metadata `attention`). `fast` (zero-onnx/2 only; default False: the graph as always):
+    `ZeroOnnx2Fast`'s graph - TokenNet's own arithmetic, the same interface and answers (docs/az.md 63; metadata `fast`
+    '1' and `attention`, default 'mha': `FAST_ATTENTIONS`)."""
+    attention = fast_attention(attention, fast)
+    mod, args, names, outs, dyn, meta_of = _export_module(net, packing, attention, fast)
+    table = {torch.ops.zero_onnx.fused_attention.default: _fused_attention_onnx} if mod_fused(attention) else None
     with torch.no_grad():
         prog = torch.onnx.export(mod, args, None, dynamo=True, opset_version=EXPORTER_OPSET, input_names=names,
                                  output_names=outs, dynamic_shapes=dyn, optimize=True, verbose=False,
                                  **({'custom_translation_table': table} if table else {}))
     meta = meta_of(extra)
-    if attention:
-        meta['attention'] = attention
-    return _save(prog.model_proto, meta, path, opset, make_portable, attention=attention)
+    return _save(prog.model_proto, meta, path, opset, make_portable, attention=attention if mod_fused(attention) else None,
+                 gelu=fast)
 
 
-def _export_module(net, packing='packed', attention=None):
-    """What `export` traces for `net`: (the interface module - ZeroOnnx2 for zero-onnx/2, else ZeroOnnx - around a
-    float32 CPU eval copy of `net`, the example inputs, the input names, the output names, the dynamic shapes, `extra` ->
-    the graph's metadata)."""
+def fast_attention(attention, fast):
+    """The attention a graph is exported with: `attention` as given, the fast graph's default ('mha') when `fast`
+    and None; refused when it is not one the graph takes (`ATTENTIONS`; the fast graph's `FAST_ATTENTIONS`)."""
+    if fast:
+        attention = FAST_ATTENTIONS[0] if attention is None else attention
+        if attention not in FAST_ATTENTIONS:
+            raise ValueError(f'fast graph: attention {attention!r} (one of {FAST_ATTENTIONS})')
+    elif attention not in ATTENTIONS:
+        raise ValueError(f'attention {attention!r}: one of {ATTENTIONS}')
+    return attention
+
+
+def mod_fused(attention):
+    """Whether `attention` puts a fused node in the graph ('mha', 'attention23'; not None or 'matmul')."""
+    return attention in ATTENTIONS[1:]
+
+
+def _export_module(net, packing='packed', attention=None, fast=False):
+    """What `export` traces for `net`: (the interface module - ZeroOnnx2 for zero-onnx/2 (ZeroOnnx2Fast with `fast`),
+    else ZeroOnnx - around a float32 CPU eval copy of `net`, the example inputs, the input names, the output names, the
+    dynamic shapes, `extra` -> the graph's metadata)."""
     net = copy.deepcopy(net).float().cpu().eval()
     for p in net.parameters():
         p.requires_grad_(False)
     if isinstance(net, TokenNet):
         net.chunk = 1 << 30                       # (forward's chunking is never traced; set for clarity)
+    attention = fast_attention(attention, fast)
     if onnx_version(net) == 2:
         # (variable-length token sets: zero-onnx/2, docs/az.md 46)
-        mod = ZeroOnnx2(net, packing, attention).eval()
+        if fast:
+            mod = ZeroOnnx2Fast(net, packing, attention).eval()
+        else:
+            mod = ZeroOnnx2(net, packing, attention).eval()
         return (mod, example_inputs2(net), list(INPUTS2), list(OUTPUTS2), dynamic_shapes2(),
-                lambda extra: metadata2(net, extra))
-    if attention:
-        raise ValueError(f'attention {attention!r}: a zero-onnx/2 graph\'s option (docs/az.md 63)')
+                lambda extra: metadata2(net, extra, attention=attention, fast=fast))
+    if attention or fast:
+        raise ValueError(f'attention {attention!r}, fast {fast!r}: a zero-onnx/2 graph\'s options (docs/az.md 63)')
     mod = ZeroOnnx(net, packing).eval()
     packing = mod.packing
     args = example_inputs(net, packing)
@@ -1493,7 +2219,8 @@ def opset17(model):
     has another version under opset 17 than under 18 (`onnx.defs`) is rewritten to its opset-17 form or refused:
     ReduceMax / Mean / Min / ... -18's constant `axes` input -> the `axes` attribute (`noop_with_empty_axes` dropped, a
     1 refused), ScatterElements / ScatterND -18 with reduction none / add / mul as they are (version 16), Pad -18 without
-    its `axes` input as it is (version 13); anything else (Split's num_outputs, Resize-18, ...) raises. The same
+    its `axes` input as it is (version 13), Split -18 with its `split` input (the sizes) and no num_outputs as it is
+    (version 13); anything else (Split's num_outputs, Resize-18, ...) raises. The same
     computation: each rewritten node computes what it did. Checked by onnx.checker's full check (strict shape
     inference) under opset 17."""
     import onnx
@@ -1541,6 +2268,9 @@ def opset17(model):
             elif n.op_type == 'Pad':
                 if len(n.input) > 3 and n.input[3]:
                     raise ValueError(f'opset17: {where}{n.name} (Pad): an axes input (opset 18 only)')
+            elif n.op_type == 'Split':
+                if any(a.name == 'num_outputs' for a in n.attribute) or len(n.input) < 2 or not n.input[1]:
+                    raise ValueError(f'opset17: {where}{n.name} (Split): num_outputs or no split input (opset 18 only)')
             else:
                 raise ValueError(f'opset17: {where}{n.name} ({n.op_type}): changed in opset 18, no opset-17 form here')
             stats[n.op_type] = stats.get(n.op_type, 0) + 1
@@ -1558,14 +2288,19 @@ def opset17(model):
     return stats
 
 
-def _save(model, meta, path, opset, make_portable, int32=True, attention=None):
-    """The exported model with its metadata (`portable`'s rewrites first; the exporter's annotations stripped;
-    `int32_slices` then `check_int32`; `opset17` for opset 17), checked, written atomically -> the metadata."""
+def _save(model, meta, path, opset, make_portable, int32=True, attention=None, gelu=False):
+    """The exported model with its metadata (`fused_attention`'s, then with `gelu` (the fast graph's) `fuse_gelu`'s and
+    `layernorm_instance`'s rewrites, then `portable`'s; the
+    exporter's annotations stripped; `int32_slices` then `check_int32`; `opset17` for opset 17), checked, written
+    atomically -> the metadata."""
     import onnx
     if attention:
         fused_attention(model, attention)
         if attention == 'attention23':
             opset = 23
+    if gelu:
+        fuse_gelu(model)
+        layernorm_instance(model)
     meta['opset'] = str(opset)
     if make_portable:
         portable(model)
@@ -1615,13 +2350,14 @@ def load_checkpoint(path, game=None, allow_mismatch=False):
     return m, info
 
 
-def export_checkpoint(path, out, packing='packed', game=None, allow_mismatch=False, checkpoint_id=None, attention=None):
+def export_checkpoint(path, out, packing='packed', game=None, allow_mismatch=False, checkpoint_id=None, attention=None,
+                      fast=False):
     """`load_checkpoint` + `export` -> the metadata written. `checkpoint_id`: the id the run publishes
     the checkpoint under (default its file name)."""
     m, info = load_checkpoint(path, game, allow_mismatch)
     if checkpoint_id:
         info['checkpoint'] = checkpoint_id
-    return export(m, out, packing, info, attention=attention)
+    return export(m, out, packing, info, attention=attention, fast=fast)
 
 
 # ---------------------------------------------------------------- the weight-swap template (docs/az.md 53)
@@ -1660,19 +2396,23 @@ def _code_sha256():
     return h.hexdigest()
 
 
-def export_fingerprint(net, packing='packed', opset=OPSET, make_portable=True):
+def export_fingerprint(net, packing='packed', opset=OPSET, make_portable=True, graph=''):
     """The architecture fingerprint a weight-swap template is kept under (docs/az.md 53) -> (sha256 hex, its fields):
     the network's class and config (its layout, sizes, heads, auxiliary targets), the interface module, the packing,
     every module tensor's name, shape and dtype, the export settings (opset, portable), the exporter's versions (torch,
     onnx, onnxscript, onnx-ir), this zero-core's Python and TEMPLATE. Two checkpoints with the same fingerprint export
-    to the same graph but for their weights; any other change gives another fingerprint (a fresh full export)."""
-    mod = _export_module(net, packing)[0]
+    to the same graph but for their weights; any other change gives another fingerprint (a fresh full export). `graph`: the
+    graph variant (`GRAPHS`; '' the default graph, its fields as before)."""
+    attention, fast = graph_options(graph)
+    mod = _export_module(net, packing, attention, fast)[0]
     fields = {'template': TEMPLATE, 'class': type(net).__name__, 'module': type(mod).__name__,
               'config': json.loads(json.dumps(net.config, sort_keys=True, default=str)),
               'aux_layout': [list(t) for t in (getattr(net, 'aux_layout', None) or [])], 'packing': mod.packing,
               'opset': int(opset), 'portable': bool(make_portable),
               'tensors': [[k, list(v.shape), str(v.dtype)] for k, v in module_tensors(mod).items()],
               'versions': _versions(), 'code': _code_sha256()}
+    if graph:
+        fields['graph'] = graph
     return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest(), fields
 
 
@@ -1736,7 +2476,7 @@ def _bits(a):
     return a.view(np.uint8).reshape(a.shape + (a.dtype.itemsize,)) if a.dtype.itemsize else a
 
 
-def export_template(net, path, packing='packed', opset=OPSET, make_portable=True):
+def export_template(net, path, packing='packed', opset=OPSET, make_portable=True, graph=''):
     """The weight-swap template of `net`'s architecture (docs/az.md 53): the graph `export` writes for it with random
     weights, written to `path`, its derived-weight recipes to `<path>.recipes.npz` -> the template's description
     {template, fingerprint, fields, weights, derived, constants, sha256, recipes_sha256}.
@@ -1752,15 +2492,16 @@ def export_template(net, path, packing='packed', opset=OPSET, make_portable=True
     cannot rebuild, and no template is made. Random weights hold no exact 0 or 1, so the template is the graph of a
     network whose values trigger none of the exporter's value-dependent rewrites (a Gemm's all-zero bias dropped, for
     one): `swap_export` writes that graph for every checkpoint. `constants`: the module tensors among the constants (a
-    swap checks they are unchanged)."""
+    swap checks they are unchanged). `graph`: the graph variant (`GRAPHS`)."""
     import onnx
     from onnx import numpy_helper
-    fp, fields = export_fingerprint(net, packing, opset, make_portable)
+    attention, fast = graph_options(graph)
+    fp, fields = export_fingerprint(net, packing, opset, make_portable, graph)
     rnd, cod = _weights_like(net, 'random'), _weights_like(net, 'coded')
     cpath = f'{path}.coded.{os.getpid()}.onnx'
     try:
-        export(rnd, path, packing, None, opset, make_portable)
-        export(cod, cpath, packing, None, opset, make_portable)
+        export(rnd, path, packing, None, opset, make_portable, attention=attention, fast=fast)
+        export(cod, cpath, packing, None, opset, make_portable, attention=attention, fast=fast)
         a, b = onnx.load(path), onnx.load(cpath)
     finally:
         if os.path.exists(cpath):
@@ -1769,7 +2510,7 @@ def export_template(net, path, packing='packed', opset=OPSET, make_portable=True
         raise ValueError(f'weight-swap template: the graph depends on the weights\' values ({len(a.graph.node)} vs '
                          f'{len(b.graph.node)} nodes, {len(a.graph.initializer)} vs {len(b.graph.initializer)} '
                          f'initializers, random vs coded weights): no template')
-    ma, mb = _export_module(rnd, packing)[0], _export_module(cod, packing)[0]
+    ma, mb = _export_module(rnd, packing, attention, fast)[0], _export_module(cod, packing, attention, fast)[0]
     ta, tb = module_tensors(ma), module_tensors(mb)
     sa = np.concatenate([t.numpy().ravel() for _, t in _weight_sources(ma)])
     weights, consts, bad, recipes = [], [], [], {}
@@ -1814,24 +2555,27 @@ def export_template(net, path, packing='packed', opset=OPSET, make_portable=True
             'recipes_sha256': file_sha256(rpath)}
 
 
-def swap_export(net, template_path, template, path, packing='packed', extra=None, opset=OPSET, make_portable=True):
+def swap_export(net, template_path, template, path, packing='packed', extra=None, opset=OPSET, make_portable=True,
+                graph=''):
     """`net` written to `path` from a weight-swap template (`export_template`: the template's graph `template_path`, its
     recipes beside it, its description `template`; docs/az.md 53): each weight initializer replaced by `net`'s module
     tensor of its name, each derived one rebuilt by its recipe from `net`'s weights, the metadata `net`'s and `extra`'s
     (as `export` writes it), then checked (`check_swapped`) -> the metadata. Refused (ValueError, nothing written) when
     `net`'s fingerprint is not the template's, a template file is not the template's (sha256), a weight has no tensor of
-    its name or another dtype or shape, or a module tensor the template holds constant changed."""
+    its name or another dtype or shape, or a module tensor the template holds constant changed. `graph`: the graph
+    variant (`GRAPHS`), the template's."""
     import onnx
     if template.get('template') != TEMPLATE:
         raise ValueError(f'weight-swap template format {template.get("template")}, this zero-core reads {TEMPLATE}')
-    fp, _ = export_fingerprint(net, packing, opset, make_portable)
+    attention, fast = graph_options(graph)
+    fp, _ = export_fingerprint(net, packing, opset, make_portable, graph)
     if fp != template['fingerprint']:
         raise ValueError(f'weight-swap: the network\'s fingerprint {fp[:16]} is not the template\'s '
                          f'{template["fingerprint"][:16]} (another architecture or exporter: a new template)')
     rpath = f'{template_path}.recipes.npz'
     if file_sha256(template_path) != template['sha256'] or file_sha256(rpath) != template['recipes_sha256']:
         raise ValueError(f'weight-swap: {template_path} or its recipes are not the template\'s (sha256)')
-    mod, _a, _n, _o, _d, meta_of = _export_module(net, packing)
+    mod, _a, _n, _o, _d, meta_of = _export_module(net, packing, attention, fast)
     ts = module_tensors(mod)
     src = _weight_sources(mod)
     if [[k, list(t.shape)] for k, t in src] != template['sources']:
@@ -1869,6 +2613,7 @@ def swap_export(net, template_path, template, path, packing='packed', extra=None
     if bad:
         raise ValueError(f'weight-swap: {len(bad)} tensor(s) do not match the template: ' + '; '.join(bad[:8]))
     meta = meta_of(extra)
+    opset = graph_opset(opset, attention)
     meta['opset'] = str(opset)
     if make_portable:
         meta['portable'] = '1'

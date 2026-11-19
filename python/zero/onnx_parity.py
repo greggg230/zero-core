@@ -6,7 +6,10 @@ fails the case (`Refused`).
 
   python -m zero.onnx_parity <checkpoint> --batches <file.npz> [<file.npz> ...] [--packing mask,compact,packed,host]
       [--sizes 1,7,64,256,1024] [--tol 2e-5] [--onnx-dir DIR] [--reuse] [--game G] [--allow-mismatch]
-      [--threads 4] [--json out.json]
+      [--threads 4] [--graph fast] [--json out.json]
+
+`--graph`: the graph variant of a zero-onnx/2 network (zero.onnx_export.GRAPHS: '' the default graph, 'fast' the fast
+graph and its other attention forms 'fast-att23' / 'fast-matmul', docs/az.md 63).
 
 Batch files: recorded driver batches (tools/onnx_record.py: the driver's sparse rows with their kinds:
 leaf, value-only, root belief) or sample shards (`data.read_shard`; a shard row with no options is a
@@ -618,6 +621,7 @@ def main(argv=None):
     ap.add_argument('--allow-mismatch', action='store_true')
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--max-rows', type=int, default=4096, help='rows read from a shard')
+    ap.add_argument('--graph', default='', help='the graph variant (zero.onnx_export.GRAPHS; docs/az.md 63)')
     ap.add_argument('--json', default=None, help='write the results here')
     a = ap.parse_args(argv)
     from . import onnx_export as OX
@@ -630,18 +634,21 @@ def main(argv=None):
     if OX.onnx_version(model) == 2 and packs != ['packed']:
         print(f'zero-onnx/2 (variable-length token sets): packing \'packed\' only (not {packs})', file=sys.stderr)
         packs = ['packed']
+    attention, fast = OX.graph_options(a.graph)
     paths, export_s = {}, {}
     for p in packs:
-        path = os.path.join(d, f'{stem}.{p}.onnx')
-        if not (a.reuse and os.path.exists(path) and read_metadata(path).get('checkpoint_sha256') == info['checkpoint_sha256']):
+        path = os.path.join(d, f'{stem}.{p}{"." + a.graph if a.graph else ""}.onnx')
+        md = read_metadata(path) if a.reuse and os.path.exists(path) else {}
+        if not (md.get('checkpoint_sha256') == info['checkpoint_sha256'] and md.get('fast', '') == ('1' if fast else '')
+                and md.get('attention') == attention):
             t0 = time.perf_counter()
-            OX.export(model, path, p if p != 'none' else 'mask', info)
+            OX.export(model, path, p if p != 'none' else 'mask', info, attention=attention, fast=fast)
             export_s[p] = round(time.perf_counter() - t0, 1)
         paths[p] = path
     rows_list = [Rows.load(b, a.max_rows) for b in a.batches]
     sizes = [int(s) for s in a.sizes.split(',') if s]
     ok, results = run_gate(model, paths, rows_list, sizes, a.tol, a.threads)
-    summ = {'checkpoint': a.checkpoint, 'sha256': info['checkpoint_sha256'], 'tol': a.tol, 'passed': ok,
+    summ = {'checkpoint': a.checkpoint, 'sha256': info['checkpoint_sha256'], 'tol': a.tol, 'passed': ok, 'graph': a.graph,
             'packings': summarize(results), 'export_seconds': export_s,
             'onnx_bytes': {p: os.path.getsize(v) for p, v in paths.items()}}
     print(json.dumps(summ))
