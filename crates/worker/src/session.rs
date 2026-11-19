@@ -610,6 +610,12 @@ fn builder(rt: &Runtime, b: &Binding, threads: usize, spinning: bool, log_id: Op
     sb = sb.with_parallel_execution(false).map_err(oerr)?;
     sb = sb.with_optimization_level(GraphOptimizationLevel::All).map_err(oerr)?;
     sb = sb.with_intra_op_spinning(spinning).map_err(oerr)?;
+    // No memory patterns, on every provider (docs/az.md 64): ONNX Runtime keeps one per distinct set of input shapes
+    // and never drops one, and a batch's CSR rows give nearly every batch shapes of its own (`x_idx` / `x_val` are
+    // its non-zero count long), so the patterns grew a worker's memory by megabytes a second, for no speed (a pattern
+    // is only reused for shapes seen before). Where the tensors go in memory changes no answer. (A diagnostic:
+    // ZERO_ORT_MEM_PATTERN=1 turns them back on.)
+    sb = sb.with_memory_pattern(std::env::var("ZERO_ORT_MEM_PATTERN").as_deref() == Ok("1")).map_err(oerr)?;
     if !matches!(b, Binding::Cpu) {
         sb = sb.with_deterministic_compute(true).map_err(oerr)?;
     }
@@ -636,6 +642,7 @@ fn builder(rt: &Runtime, b: &Binding, threads: usize, spinning: bool, log_id: Op
         }
         Binding::Cpu => {}
         Binding::Dml(idx) => {
+            // (DirectML needs them off, whatever ZERO_ORT_MEM_PATTERN says)
             sb = sb.with_memory_pattern(false).map_err(oerr)?;
             sb = sb.with_execution_providers([ort::ep::DirectML::default().with_device_id(*idx as i32).build().error_on_failure()]).map_err(oerr)?;
         }
