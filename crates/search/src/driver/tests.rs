@@ -2982,7 +2982,7 @@ fn the_eval_cache_keeps_each_networks_answers_apart() {
         for ch in &g.chunks {
             for slot in &lock(ch).slots {
                 held += slot.cache.len();
-                stale += slot.cache.keys().filter(|k| k.1 != 1).count();
+                stale += slot.cache.nets().filter(|&n| n != 1).count();
             }
         }
     }

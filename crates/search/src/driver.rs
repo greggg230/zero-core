@@ -1688,6 +1688,53 @@ struct Cached {
     margin: [f32; MAX_SEATS],
 }
 
+/// A game's evaluation cache (`NnSeat::eval_cache`, docs/search.md 3.12) as docs/search.md 2.21 keeps it: by (evaluator
+/// key, network id, row key), every answer's floats in one buffer - its options' priors, then the value and the
+/// margin of the game's `n` seats only (a cached answer is read for nothing else: `leaf_values_team`). One entry
+/// costs its key and offsets in the map plus `4 * (options + 2n)` bytes, not a `Cached` (112 bytes a bucket and a
+/// heap block of its own).
+#[derive(Default)]
+struct EvalCache {
+    /// (row key low, high, evaluator key << 32 | network id) -> (start in `vals`, options).
+    at: HashMap<[u64; 3], (u32, u32)>,
+    vals: Vec<f32>,
+}
+
+impl EvalCache {
+    fn key(key: u16, net: u32, k: u128) -> [u64; 3] {
+        [k as u64, (k >> 64) as u64, ((key as u64) << 32) | net as u64]
+    }
+    fn len(&self) -> usize {
+        self.at.len()
+    }
+    /// The network id of every entry (the tests).
+    #[cfg(test)]
+    fn nets(&self) -> impl Iterator<Item = u32> + '_ {
+        self.at.keys().map(|k| k[2] as u32)
+    }
+    fn clear(&mut self) {
+        self.at.clear();
+        self.vals.clear();
+    }
+    /// The cached answer of a game of `n` seats (its value and margin past seat `n` are 0: never read).
+    fn get(&self, key: u16, net: u32, k: u128, n: usize) -> Option<Cached> {
+        let &(s, p) = self.at.get(&EvalCache::key(key, net, k))?;
+        let (s, p) = (s as usize, p as usize);
+        let mut value = [0.0; MAX_SEATS];
+        let mut margin = [0.0; MAX_SEATS];
+        value[..n].copy_from_slice(&self.vals[s + p..s + p + n]);
+        margin[..n].copy_from_slice(&self.vals[s + p + n..s + p + 2 * n]);
+        Some(Cached { priors: self.vals[s..s + p].into(), value, margin })
+    }
+    fn insert(&mut self, key: u16, net: u32, k: u128, c: &Cached, n: usize) {
+        let s = u32::try_from(self.vals.len()).expect("an evaluation cache under 2^32 floats");
+        self.vals.extend_from_slice(&c.priors);
+        self.vals.extend_from_slice(&c.value[..n]);
+        self.vals.extend_from_slice(&c.margin[..n]);
+        self.at.insert(EvalCache::key(key, net, k), (s, c.priors.len() as u32));
+    }
+}
+
 /// A pending leaf's rows with the evaluation cache on (`Pending::Leaf::part`): the leaf row is sent
 /// (`lkey`: its cache key) or cached (`leaf`), and so is the value-only row of `LeafView::Root` (`vkey` /
 /// `view`; neither without one). The rows sent are consecutive from the leaf's `local`, in that order,
@@ -1779,7 +1826,7 @@ struct Slot<G: SearchGame> {
     /// The game's evaluation cache (`NnSeat::eval_cache`, docs/search.md 3.12): by (evaluator key,
     /// network id, row key); emptied as a game starts, as a new search epoch begins (another network)
     /// and when full.
-    cache: HashMap<(u16, u32, u128), Cached>,
+    cache: EvalCache,
     /// Self-play resignation (docs/search.md 3.14): the game's counter, None unless its seats resign.
     resign: Option<ResignState>,
     /// The game's real moves so far (`Driver::set_trace`, docs/search.md 2.17; None: not traced) and its seed; a
@@ -1860,7 +1907,7 @@ impl<G: SearchGame> Slot<G> {
             dev_left: 0,
             dev_now: false,
             start_ix: None,
-            cache: HashMap::new(),
+            cache: EvalCache::default(),
             resign: None,
             trace: None,
             trace_setups: Vec::new(),

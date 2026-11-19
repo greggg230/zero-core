@@ -365,7 +365,7 @@ fn cache_put<G: SearchGame>(slot: &mut Slot<G>, cap: u32, key: u16, k: u128, c: 
         slot.cache.clear();
         n.cache_clears += 1;
     }
-    slot.cache.insert((key, net, k), c);
+    slot.cache.insert(key, net, k, &c, slot.n);
 }
 
 /// The search of seat `seat` takes its root's belief `pred` (the network's auxiliary output for the
@@ -802,7 +802,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                 }
                 buf.overrides(sg, player, acts);
                 let lkey = cache_key(buf.row_hash(G::NUM_FEATURES), acts);
-                let leaf = slot.cache.get(&(seat.key, slot.net, lkey)).cloned();
+                let leaf = slot.cache.get(seat.key, slot.net, lkey, slot.n);
                 if leaf.is_some() {
                     buf.unrow(G::NUM_FEATURES);
                 } else {
@@ -822,7 +822,7 @@ fn advance_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, bufs: &mut [L
                         continue;
                     }
                     let k = cache_key(buf.row_hash(G::NUM_FEATURES), &[]);
-                    view = slot.cache.get(&(seat.key, slot.net, k)).cloned();
+                    view = slot.cache.get(seat.key, slot.net, k, slot.n);
                     if view.is_some() {
                         buf.unrow(G::NUM_FEATURES);
                     } else {
