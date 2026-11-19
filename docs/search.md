@@ -893,6 +893,47 @@ against off: the same games, every record bit for bit), `a_game_log_is_the_games
 moves and setup equal the trace's; the networks the records'; the moves replay the game from its seed to its end),
 `set_game_log_never_with_branches`. Its use: `zero/gamerec.py`, docs/az.md 59.
 
+### 2.21 What a game in flight holds: its records sparse, its evaluation cache in one buffer (no setting; zero-farm's Mac memory, 2026-11-19)
+
+**Why.** zero-farm's native worker needed ~16 MB of memory per game in flight on the Mac (MTG Zero's legacy-meta3-r1
+settings, and still growing after 30 minutes), so memory, not the cores, capped the games in flight. Counted by part
+(a diagnostic build summing what every slot holds, MTG Zero's ENGINE.md 203), most of it was the training records the
+games in flight hold until they end (`Slot::records`): every recorded decision's row `x` dense, `NUM_FEATURES` floats
+- MTG Zero's layout v7 is 56,384 floats, 220 KB, of which ~200 are non-zero - and its auxiliary targets dense too
+(2,048 floats, 8 KB, ~30 non-zero). With the uniform evaluator on the desktop, 256 games in flight held 42k records:
+9.0 GB of rows, 0.35 GB of auxiliary targets, of a process's 11.9 GB. The Python remote worker runs the same driver and
+held the same rows. Next came the evaluation cache (3.12): a `HashMap<(u16, u32, u128), Cached>` costs 112 bytes a
+bucket (a padded 32-byte key, a boxed slice and two `[f32; MAX_SEATS]`) plus a heap block per answer, ~2 MB a game
+once a cache of 8,192 answers has filled.
+
+**What.** Two layouts of the driver's own state; no setting, nothing a game does changes:
+
+* `Held` (driver.rs): a record a game holds keeps `x` and `aux` as the positions and values of their floats whose bits
+  are not 0 (a -0.0 or a NaN is kept as it is). The game hands its records out as before (`worker::emit` labels them,
+  then `Held::unpack` gives the `Record` back bit for bit: the dense row is rebuilt only as the game ends); a contest's
+  finished episodes' samples stay `Held` until the contest ends (2.14); a game parked at a deferred terminal parks its
+  records as before (unpacked, then float16). Recording a row encodes it dense as before (`record_row`) and packs it
+  (one scan of its floats, next to the decision's searches).
+* `EvalCache` (driver.rs): one map from (row key, evaluator key, network id) - three u64, 24 bytes - to an offset and
+  an option count in one float buffer per game holding each answer's priors, then the value and the margin of the
+  game's `n` seats only (`leaf_values_team` reads nothing past seat `n`; `get` gives the other seats 0). One answer
+  costs ~33 bytes a bucket plus `4 * (options + 2n)` bytes. Emptied with the map: as before (3.12).
+
+**Measured** (MTG Zero gen 619 of legacy-meta3-r1, its farm settings: sims 64 / 16 / 4, p_full 0.25, view samples 0.5,
+eval_cache 8,192, auxiliary targets; MTG Zero's ENGINE.md 203 has the runs): a held row is ~1.7 KB (~210 non-zeros)
+instead of 220 KB and its auxiliary targets ~0.23 KB instead of 8 KB; a record, everything else included, ~2.6 KB.
+256 games of the uniform evaluator on the desktop (belief tilt off: that evaluator has no auxiliary head), whose short
+games fill their caches: 11.9 GB -> 1.3 GB with the records held sparse, the caches 1.58 -> 0.70 MB a game in the new
+layout (capacity, ~3,000-4,800 answers a game).
+
+**Tests.** The driver's golden records (`visits_records_unchanged`, the 'cq' goldens, ...: every record bit for bit,
+through `Held`), the evaluation cache's (`the_eval_cache_plays_the_same_games_with_fewer_rows` and the others: the same
+games and records with the cache as without it, at 2 and 4 seats; `the_eval_cache_keeps_each_networks_answers_apart`
+reads the entries' network ids through `EvalCache::nets`), the chained contests' and traces' replays (records
+rebuilt by `record::replay` equal to the samples). MTG Zero: its behaviour digests and farm compat (search-core gate),
+and the same self-play job with the worker before and after the change (24 games of the legacy settings, records and
+shards byte for byte).
+
 ## 3. MCTS semantics (reference: `zero/mcts.py`)
 
 * **Node** = one decision as the search sees it: decider, legal options (fixed for the node),

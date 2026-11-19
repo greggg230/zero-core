@@ -8860,3 +8860,47 @@ row).
   sessions ONNX Runtime's CPU MultiHeadAttention and the MatMul form lose more against Attention-23 than one caller shows
   (81-84 ms a batch against 70-73). The per-segment-offset graph (CUDA-unsafe) was the best measured (1.18x in session
   B, 1.24x in A).
+
+## 64. The native worker's memory: no ONNX Runtime memory patterns, a game's records sparse (no setting; zero-farm's Mac, 2026-11-19)
+
+**Why.** On the Mac a native worker (`zero_worker` + MTG Zero's engine + ONNX Runtime 1.31.1 on the CPU) needed ~16 MB
+per game in flight at MTG Zero's legacy-meta3-r1 settings and kept growing (one worker with 2,304 games in flight:
+12.8 GB at 3 minutes, 22.2 at 7, 29.1 at 15, still +0.5 GB a minute), and memory capped the farm agent's layouts
+there. Counted by part (a diagnostic build summing what every slot of
+the driver holds; MTG Zero's ENGINE.md 203), two causes:
+
+1. *The games' records* (docs/search.md 2.21): every record a game in flight holds kept its feature row dense (MTG
+   Zero's 56,384 floats, 220 KB, ~200 non-zero) and its auxiliary targets dense (8 KB): at the Mac's ~32 records a game
+   in flight, ~7 MB a game. The Python remote worker runs the same driver and held the same rows: in
+   `tools/worker_bench.py`'s runs on the Mac (5-minute windows, conc 768) each of its processes peaked at 8.1-8.6 GB
+   resident (~11 MB a game), and one process matched a native worker at the same leaves/s (6.3 against 6.2 GB after
+   4 minutes). What the native worker had on top was the growth with time (2.).
+2. *ONNX Runtime's memory patterns.* A session with them on (ONNX Runtime's default) plans each run's buffers once per
+   distinct set of input shapes and keeps every plan; a batch's CSR rows (`x_idx` / `x_val`, its non-zero count long)
+   give nearly every batch shapes of its own. So the plans grew a worker's memory for as long as it ran, and none was
+   ever used twice.
+
+**What.** `session::builder` turns memory patterns off for every provider (DirectML had them off already); where the
+tensors go in memory changes no answer. ZERO_ORT_MEM_PATTERN=1 turns them back on (a diagnostic). The driver holds a
+game's records sparse and its evaluation cache in one buffer (docs/search.md 2.21). No setting: the worker's answers,
+games, records and shards are those of before, byte for byte.
+
+**Measured** (gen 619 of MTG Zero's legacy-meta3-r1, its farm settings, the default graph; the worker's footprint as
+the farm agent reads it - macOS: the physical footprint, Windows: private bytes; MTG Zero's ENGINE.md 203 has the whole
+fix on the Mac at steady state and the memory plan it gives the farm agent):
+
+* *The Mac, before* (the release build of 4d622170; one worker at the farm crew's layout: threads 12, 4 sessions x 3
+  threads, 882 games in flight, 4 groups, a rolling job): 11.5 GB at 11 minutes (13 MB a game), still +0.3 GB a minute.
+  *The records sparse alone* (memory patterns still on): 4.5 GB at 11 minutes, still growing ~0.15 GB a minute - the
+  patterns (4 sessions, ~29 batches a second).
+* *The desktop's CPU pack* (ONNX Runtime 1.31.1; 512 games in flight, 2 sessions x 3 threads, 10 minutes side by side):
+  private bytes +651 MB with the patterns, +311 MB without; the same games (83 finished, 4,460 searched decisions each).
+* *The desktop's CUDA pack* (ONNX Runtime 1.24.4, the RTX 5090, one session, 2,304 games in flight, two workers side by
+  side for 2 minutes): private bytes 4.35 -> 9.35 GB in 100 s with the patterns, 3.30 -> 4.07 GB without; the same
+  leaves/s (9,215 and 9,286 a worker).
+
+**Tests and checks.** The same classic self-play job (24 games of the legacy settings, seed 777, conc 24, the CPU pack,
+output both) with the worker before the change, after it, and after it with ZERO_ORT_MEM_PATTERN=1: the records file
+and the shard byte for byte (1,335 rows, 3,503 searched decisions). `probe-providers` on gen 619 with its reference set,
+before and after: the same max abs on the CPU (6.806e-6) and the CUDA pack (6.258e-6). `cargo test` (zero_search,
+zero_worker); MTG Zero's search-core gate (its digests and farm compat; ENGINE.md 203).
