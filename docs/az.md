@@ -8795,11 +8795,11 @@ row).
 
   | machine, set | threads | default graph | fast | fast-att23 | fast-matmul | TokenNet |
   |---|---|---|---|---|---|---|
-  | Mac, early | 1 | 52.4 | 29.5 | 25.9 | 27.0 | 20.1 |
-  | Mac, early | 3 | 39.8 | 25.1 | 21.0 | 23.9 | 16.2 |
+  | Mac, early | 1 | 52.4 | 27.0 | 24.6 | 25.6 | 20.1 |
+  | Mac, early | 3 | 39.8 | 22.9 | 21.1 | 23.9 | 16.2 |
   | Mac, early | 4 | 38.6 | 24.6 | 20.4 | 23.5 | 15.3 |
-  | Mac, spread | 1 | 64.9 | 43.4 | 35.9 | 38.5 | 36.8 |
-  | Mac, spread | 3 | 47.0 | 33.5 | 26.0 | 30.9 | 24.7 |
+  | Mac, spread | 1 | 64.9 | 36.2 | 33.5 | 35.2 | 36.8 |
+  | Mac, spread | 3 | 47.0 | 29.4 | 26.3 | 31.1 | 24.7 |
   | Mac, spread | 4 | 45.5 | 32.7 | 25.6 | 30.5 | 22.9 |
   | desktop, early | 1 | 133 | 72 | 69 | 76 | 99 |
   | desktop, early | 3 | 103 | 61 | 55 | 66 | 62 |
@@ -8808,9 +8808,10 @@ row).
   | desktop, spread | 3 | 132 | 79 | 76 | 96 | 84 |
   | desktop, spread | 4 | 139 | 89 | 89 | 105 | 96 |
 
-  (The Mac's two repetitions each, interleaved, within 3%; the desktop's an earlier build of the graph, noisy.) On the Mac
-  ONNX Runtime's MultiHeadAttention costs ~4 ms a batch more than Attention-23 and ~2 ms more than the MatMul form; on the
-  desktop it is the fastest at 3-4 threads. A graph that sliced each segment's slots by running offsets ('seg' in the
+  (The Mac: two repetitions each, interleaved, within 3%; its 1- and 3-thread fast columns this commit's graph, its
+  4-thread row and the desktop's an earlier build whose slots' floats were padded to the widest - the same answers bit
+  for bit, ~5% slower on the Mac -; the desktop's noisy.) On the Mac ONNX Runtime's MultiHeadAttention costs 2-3 ms a
+  batch more than Attention-23; on the desktop it is the fastest at 3-4 threads. A graph that sliced each segment's slots by running offsets ('seg' in the
   measurements) took 23.0 / 33.1 ms (early / spread, 1 thread; Attention-23): ~10% under 'fast-att23', but wrong on
   CUDA (above).
 * *The CUDA pack* (ORT 1.24.4 on the desktop's RTX 5090 while it trained a live run - contended; `probe-providers
