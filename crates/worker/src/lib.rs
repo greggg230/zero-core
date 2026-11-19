@@ -99,11 +99,12 @@ impl Worker {
     }
 
     /// The protocol features `hello` and `info` announce (zero-farm PROTOCOL.md 10.5): `rolling` - rolling self-play
-    /// jobs (`job::Rolling`) - and `setting_classes` - check-config honours a run's declared setting classes
-    /// (`classify`, docs/az.md 61) - in a build with self-play.
+    /// jobs (`job::Rolling`) -, `setting_classes` - check-config honours a run's declared setting classes
+    /// (`classify`, docs/az.md 61) - and `infer_workers` - a self-play job line's `infer_workers` runs that many
+    /// evaluator threads (docs/az.md 62.1), on every platform - in a build with self-play.
     pub fn features(&self) -> Vec<&'static str> {
         if self.selfplay {
-            vec![FEATURE_ROLLING, FEATURE_SETTING_CLASSES]
+            vec![FEATURE_ROLLING, FEATURE_SETTING_CLASSES, FEATURE_INFER_WORKERS]
         } else {
             Vec::new()
         }
@@ -116,6 +117,11 @@ pub const FEATURE_ROLLING: &str = "rolling";
 /// The feature name of declared setting classes (`classify::CLASSES_KEY`, docs/az.md 61): a trainer adds its classes
 /// to a run's settings only for a build that announces it.
 pub const FEATURE_SETTING_CLASSES: &str = "setting_classes";
+
+/// The feature name of evaluator threads (docs/az.md 62.1): the job line's `infer_workers` W (1 to 64) builds the
+/// network W times on W evaluator threads, on Windows as on macOS. An agent varies W only for a build that announces
+/// it (an older build ignores the field and runs one session; a Mac's build without it splits `infer_threads` itself).
+pub const FEATURE_INFER_WORKERS: &str = "infer_workers";
 
 /// The worker binary's entry point (self-play only): `args` from the command line -> the exit status.
 pub fn main(games: &'static [GameEntry], repo: &'static str) -> i32 {

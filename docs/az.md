@@ -8659,7 +8659,8 @@ worker 3.4x slower than the Python remote self-play it is meant to replace on th
   `launch` + `result`). `tools/worker_records_gate.py` loads the pack's `ORT_LIB`.
 
 **Off by default.** No run setting; Windows builds behave and answer exactly as before (the refusals apply off the
-reference platform or with `--platform`; `infer_workers` defaults to 1; the diagnostics are unset).
+reference platform or with `--platform`; `infer_workers` defaults to 1 there - a Mac's CPU job without it splits its
+threads, 62.1; the diagnostics are unset).
 
 **Tests.** `platform::darwin` (macOS: CPU seconds of a 0.5 s spin read as 0.4-0.7 s, not ticks; 64 MB in the
 footprint; libSystem's path); `test_run_alternates_of_another_platform` (the CPU alternate with a CUDA one, refusals:
@@ -8670,6 +8671,22 @@ parity on the Mac, the Mac's records replayed on the desktop.
 **Measured** (the Mac: an M4 Max laptop, 12 P + 4 E cores, 64 GB, macOS 26.6, CONTENDED: the legacy-meta3-r1 run's
 three Python self-play processes at nice 5 on it throughout, ours at nice 15-20; 2026-11-18): see MTG Zero's ENGINE.md
 197 (the per-process A/B of the native worker against the Python remote worker on the run's own settings and network).
+
+### 62.1 A job line without `infer_workers`, and the `hello` feature `infer_workers` (2026-11-18)
+
+* **The default when a job line has no `infer_workers`** (45c284b; `proto::default_workers`): Windows, and any session
+  with a GPU provider, one evaluator thread with the job's `infer_threads` T, as always. macOS on the CPU: T split into
+  `max(1, T / 3)` sessions of `T / w` threads (16: 5 x 3; 12: 4 x 3; under 6: one session of T), the shape the Mac's
+  measurements above favour. A job line's own `infer_workers` W wins on every platform (W sessions of T threads each).
+* **`hello` and `info` announce `infer_workers`** (`FEATURE_INFER_WORKERS`, beside `rolling` and `setting_classes`, in a
+  build with self-play; a fuzz-only build announces none): the job line's field has worked on every platform since
+  45c284b, so the feature is not platform-gated, and a Windows build from this commit on qualifies too. zero-farm's agent
+  varies a job's evaluator threads (its autotuner) only for a worker that announces it; an older build ignores the
+  field and runs one session, so an agent must not count on it there. Nothing else changes: the job line, the answers
+  (byte-identical for any W, 62 above) and the events are as before. Tests: `proto::tests::
+  hello_announces_infer_workers_on_every_platform` (the `hello` event's features, a fuzz-only build's none, a job line's
+  W honoured), `a_selfplay_build_announces_rolling` (the full list); MTG Zero's `test_worker_farm.py` reads the real
+  build's `info`.
 
 ## 63. The fast zero-onnx/2 graph: TokenNet's arithmetic behind the same interface (`pool_export`, `export(..., fast=True)`; zero-farm's Mac and CPU PCs, 2026-11-18)
 

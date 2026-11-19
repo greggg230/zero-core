@@ -43,8 +43,8 @@
 //! <worker> fuzz-chunk <spec.json>                  one chunk of a fuzz job (the supervisor's child)
 //! ```
 //!
-//! `serve`: `hello` first (aw, build_id, game, kinds, zero_onnx, pid, features - `["rolling", "setting_classes"]` in a build with
-//! self-play: zero-farm PROTOCOL.md 10.5), then one `job` line (`op` job:
+//! `serve`: `hello` first (aw, build_id, game, kinds, zero_onnx, pid, features - `["rolling", "setting_classes",
+//! "infer_workers"]` in a build with self-play: zero-farm PROTOCOL.md 10.5), then one `job` line (`op` job:
 //! lease_id, kind 'selfplay', settings, games, gid_base, seed, model, reference (the self-test's set:
 //! answered before the first batch, `selftest` {provider, max_abs, ok}; a failure is fatal), threads, out_dir;
 //! optional gen - the rows' network id, default the graph's `checkpoint_iter` -, sha256 - the model FILE's,
@@ -611,10 +611,15 @@ fn stdin_lines(sink: Arc<Stdout>) -> std::sync::mpsc::Receiver<Option<Value>> {
     rx
 }
 
+/// `serve`'s first event (the module docs; zero-farm PROTOCOL.md 10.5).
+fn hello(w: &Worker) -> Value {
+    json!({"ev": "hello", "aw": AW, "build_id": build_id(), "game": w.repo, "kinds": w.kinds(), "zero_onnx": if w.selfplay { json!(ZERO_ONNX) } else { json!([]) }, "pid": std::process::id(), "games": w.games.iter().map(|g| g.name).collect::<Vec<_>>(), "features": w.features()})
+}
+
 fn serve(w: &'static Worker) -> i32 {
     let games = w.games;
     let sink = Arc::new(Stdout { mu: Mutex::new(()) });
-    sink.event(json!({"ev": "hello", "aw": AW, "build_id": build_id(), "game": w.repo, "kinds": w.kinds(), "zero_onnx": if w.selfplay { json!(ZERO_ONNX) } else { json!([]) }, "pid": std::process::id(), "games": games.iter().map(|g| g.name).collect::<Vec<_>>(), "features": w.features()}));
+    sink.event(hello(w));
     let rx = stdin_lines(sink.clone());
     let base = std::env::current_dir().unwrap_or_default();
     loop {
@@ -1259,8 +1264,26 @@ mod tests {
     fn a_selfplay_build_announces_rolling() {
         static G: &[GameEntry] = &[];
         let w = Worker { games: G, repo: "toy", selfplay: true, fuzz: None, package_settings: &[] };
-        assert_eq!(w.features(), vec!["rolling", "setting_classes"]);
+        assert_eq!(w.features(), vec!["rolling", "setting_classes", "infer_workers"]);
         let f = Worker { selfplay: false, ..w };
         assert!(f.features().is_empty(), "a fuzz-only build plays no self-play jobs");
+    }
+
+    #[test]
+    fn hello_announces_infer_workers_on_every_platform() {
+        // zero-farm's autotuner varies a job's evaluator threads only for a worker whose hello lists infer_workers
+        // (docs/az.md 62.1): the job line's field works on Windows as on macOS since 45c284b, so the feature is not
+        // platform-gated - this test runs (and must pass) on both.
+        static G: &[GameEntry] = &[];
+        let w = Worker { games: G, repo: "toy", selfplay: true, fuzz: None, package_settings: &[] };
+        let h = hello(&w);
+        assert_eq!(h["ev"], "hello");
+        let feats: Vec<&str> = h["features"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        assert!(feats.contains(&crate::FEATURE_INFER_WORKERS), "hello's features {feats:?}");
+        let f = Worker { selfplay: false, ..w };
+        assert_eq!(hello(&f)["features"], json!([]), "a fuzz-only build plays no self-play jobs");
+        // and the job line's infer_workers is what a job runs, whatever the platform's own default
+        let o = |v: Value| job_ort(v.as_object().unwrap(), PathBuf::from("x"), 8).map(|c| (c.intra_threads, c.workers));
+        assert_eq!(o(json!({"infer_workers": 2, "infer_threads": 4})), Ok((4, 2)));
     }
 }
