@@ -460,3 +460,44 @@ def test_off_by_default_and_the_farm_report(tmp_path):
     assert s['mac']['eval_games']['1h'] == 100                      # (iteration 16's anchor games, on the Mac)
     assert s[rep.local]['eval_games']['1h'] == 6                    # (the fallback's games only)
     assert not any(k.startswith('pool:') for k in s)
+
+def test_a_refusal_raised_as_systemexit_never_ends_the_eval_thread_silently(monkeypatch):
+    """zero.eval_pool / zero.farm_def refuse settings with SystemExit, which `except Exception` doesn't catch: the
+    evaluation thread logs it loudly and retries instead of dying silently while training goes on."""
+    import queue
+    import threading
+    import time as _time
+    from zero import remote as RM
+    monkeypatch.setattr(RM, 'RETRY_S', 0)
+    logs, done = [], []
+    calls = {'n': 0}
+
+    class Stub:
+        name = 'pool:x'
+        shipped = None
+        q = queue.Queue()
+        lock = threading.Lock()
+        queued = {7}
+
+        class R:
+            @staticmethod
+            def log(msg):
+                logs.append(msg)
+
+        def _evaluate(self, it):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise SystemExit('eval_pool: refused for the test')
+            done.append(it)
+
+    st = Stub()
+    st.q.put(7)
+    th = threading.Thread(target=RM.RemoteEval._loop, args=(st,), daemon=True)
+    th.start()
+    for _ in range(200):
+        if done:
+            break
+        _time.sleep(0.01)
+    assert done == [7] and th.is_alive()
+    assert any('REFUSED (SystemExit)' in m and 'refused for the test' in m for m in logs)
+    assert 7 not in st.queued

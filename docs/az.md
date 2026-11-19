@@ -6724,7 +6724,9 @@ agents build their job lines only from its templates. The desktop tools have to 
   metrics row's `selfplay.games` (this machine) and `selfplay.remotes.<name>.games` / `selfplay.remote.games` (the games
   the shared quota accepted, each counted once), timed at the end of the self-play phase (`time - seconds +
   phases.selfplay_s`); eval games each evaluation's `eval_*.games` and `extras.*.games` plus its Elo matches from the
-  pools' results.json, local from the metrics row or remote from the evals.jsonl row under its `host`. A fork's copied
+  pools' results.json, local from the metrics row or remote from the evals.jsonl row under its `host`. A self-play
+  record whose only remotes are pools (`host: []` once the last SSH host is removed, the farm under `pools`) is the
+  farm's games, never an own source (2026-11-19: it was counted as a source named 'remote'). A fork's copied
   rows count once, for the run that played them (the oldest directory); a run that lived on a Vast box
   (`ON_VAST*.json`) credits that box; Vast hardware from mtg-zero tools/vast.py's ledger. The Mac's fuzz seeds come
   from one read-only ssh that parses its fuzz farm's `logs/farm.log` chunk lines; an unreachable Mac is `online: false`
@@ -9033,4 +9035,9 @@ without a deadline a refused batch fails the evaluation and the retry plays a ne
 (the self-play pool's farm run, no pool_worker, no ONNX Runtime for the deadline, a bad slug); the export cache
 seeded once from the self-play pool's. The rest of the suite
 (RemoteEval's tests, `test_worker_settings`, `test_farm_report`, `test_gamerec_all`, `test_privacy`) unchanged.
+
+**Refusals raised as SystemExit (2026-11-19, `fix/eval-thread-report`).** zero.eval_pool and zero.farm_def refuse a
+setting with `SystemExit`, which RemoteEval's thread (`except Exception`) didn't catch: the thread ended silently while
+training went on, so the evaluations just stopped. The thread now logs it (`REFUSED (SystemExit): ...`) and retries
+after `RETRY_S` like any failure. Test: test_eval_pool.py `test_a_refusal_raised_as_systemexit_never_ends_the_eval_thread_silently`.
 

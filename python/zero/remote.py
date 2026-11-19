@@ -300,6 +300,14 @@ class RemoteEval:
                                f"run's encoding? docs/az.md 10.4): {ex}; retry in {RETRY_S}s")
                     self.shipped = None
                     time.sleep(RETRY_S)
+                except SystemExit as ex:
+                    # a refusal raised as SystemExit (zero.eval_pool / zero.farm_def refuse a setting that way) is not an
+                    # Exception: uncaught, it would end this thread silently while training goes on - the evaluations
+                    # would just stop. Logged loudly and retried like any failure.
+                    self.R.log(f'remote eval {self.name} iter {it}: REFUSED (SystemExit): {str(ex)[-400:]}; '
+                               f'evaluations wait for a fix - retry in {RETRY_S}s')
+                    self.shipped = None
+                    time.sleep(RETRY_S)
                 except Exception as ex:                # noqa: BLE001 (logged, retried)
                     self.R.log(f'remote eval {self.name} iter {it}: {type(ex).__name__}: {str(ex)[-400:]}; retry in {RETRY_S}s')
                     self.shipped = None

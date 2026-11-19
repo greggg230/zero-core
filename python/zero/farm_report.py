@@ -523,14 +523,21 @@ def remote_records(sp):
     if not isinstance(r, dict):
         return []
     h = r.get('host')
-    hosts = [str(x) for x in h] if isinstance(h, list) else str(h or 'remote').split(',')
-    hosts = [x.strip() for x in hosts if x.strip()] or ['remote']
+    pools = r.get('pools') if isinstance(r.get('pools'), dict) else {}
+    hosts = [str(x) for x in h] if isinstance(h, list) else str(h or '').split(',')
+    hosts = [x.strip() for x in hosts if x.strip()]
+    if not hosts:
+        # no host named: a record whose only remotes are pools (zero.remoteplay writes `host: []` once the last
+        # SSH host is removed and `pools` lists the farm) is the farm's games, never an own source; a record
+        # without any host information (older ones) stays 'remote'
+        if any(is_pool(n) for n in pools):
+            return []
+        hosts = ['remote']
     own = [x for x in hosts if not is_pool(x)]
     if not own:
         return []
     if len(own) == len(hosts):             # (several hosts recorded without their shares: kept together)
         return [(','.join(own), r)]
-    pools = r.get('pools') if isinstance(r.get('pools'), dict) else {}
     pooled = sum(_num(p.get('games')) or 0 for n, p in pools.items() if isinstance(p, dict) and is_pool(n))
     return [(','.join(own), dict(r, games=max(0, (_num(r.get('games')) or 0) - pooled)))]
 

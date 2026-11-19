@@ -443,3 +443,8 @@ def test_pool_remotes_left_out():
     got = fr.remote_records({'remotes': {'mac': {'games': 3}, 'pool:run1': {'games': 5}}})
     assert [n for n, _ in got] == ['mac']
     assert fr.remote_records({'remote': {'host': 'a,b', 'games': 7}}) == [('a,b', {'host': 'a,b', 'games': 7})]
+    # the last SSH host removed: zero.remoteplay records `host: []` with the pool under `pools` - the farm's games,
+    # never an own source named 'remote' (2026-11-19: 1,598 farm games/h were counted as the owner's)
+    assert fr.remote_records({'remote': {'host': [], 'games': 379, 'pools': {'pool:run1': {'games': 379}}}}) == []
+    assert fr.remote_records({'remote': {'host': '', 'games': 5, 'pools': {'pool:run1': {'games': 5}}}}) == []
+    assert fr.remote_records({'remote': {'games': 7}}) == [('remote', {'games': 7})]   # no host info at all: as before
