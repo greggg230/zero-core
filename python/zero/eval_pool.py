@@ -378,9 +378,31 @@ class FarmMatches:
     def _export(self, ckpt, gen, out_dir):
         from . import games as G
         from .farm_h2h import export_cached
-        return export_cached(ckpt, gen, out_dir, self.cfg['game'], G.spec_json(self.cfg['spec']),
-                             os.path.join(self.dir, 'export'), f'{self.farm}/{gen}', checkpoint_iter=gen,
-                             graph=self.export_graph)
+        cache = os.path.join(self.dir, 'export')
+        self._seed_export_cache(cache)
+        return export_cached(ckpt, gen, out_dir, self.cfg['game'], G.spec_json(self.cfg['spec']), cache,
+                             f'{self.farm}/{gen}', checkpoint_iter=gen, graph=self.export_graph)
+
+    def _seed_export_cache(self, cache):
+        """A run with a farm pool has built the architecture's weight-swap template and recorded its reference
+        positions already (`<run>/pool/<farm run>/export/`, zero.farm_pool): copied once into this farm run's own
+        cache (never written there), so the first export here is a weight swap too, not a template build and a
+        recording (minutes of CPU in the run process). A template of another fingerprint is built here as before."""
+        if os.path.isdir(cache):
+            return
+        run_dir = os.path.dirname(os.path.dirname(self.dir))
+        rem = self.cfg.get('selfplay_remote') or ''
+        names = [x.strip() for x in (rem.split(',') if isinstance(rem, str) else rem) if str(x).strip()]
+        import shutil
+        for n in names:
+            src = os.path.join(run_dir, 'pool', n[len(PREFIX):], 'export') if is_pool(n) else None
+            if src and os.path.isdir(src):
+                tmp = cache + f'.{os.getpid()}.tmp'
+                shutil.rmtree(tmp, ignore_errors=True)
+                shutil.copytree(src, tmp)
+                os.replace(tmp, cache)
+                self.log(f'export cache seeded from the farm pool\'s ({src})')
+                return
 
     def _define(self, client, info):
         return FD.publish(client, info, key=self.key, farm_release=self.farm_release, log=self.log)

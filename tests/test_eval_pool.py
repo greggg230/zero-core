@@ -423,6 +423,17 @@ def test_refusals_at_the_start(tmp_path, monkeypatch):
     exe = builds / BID / 'w.exe'
     exe.write_bytes(b'x')
     assert EP.ort_library(str(exe), RT)[0] == str(builds / RT / 'onnxruntime.dll')
+    # the self-play pool's weight-swap templates and positions: copied once into the farm run's own export cache
+    tpl = os.path.join(run, 'pool', 'tr-sp', 'export', 'f' * 16)
+    os.makedirs(tpl)
+    open(os.path.join(tpl, 'template.json'), 'w').write('{}')
+    fm = EP.FarmMatches(dict(cfg, selfplay_remote='pool:tr-sp'), run, FARM, R.log, client=object())
+    cache = os.path.join(fm.dir, 'export')
+    fm._seed_export_cache(cache)
+    assert os.path.exists(os.path.join(cache, 'f' * 16, 'template.json'))
+    os.remove(os.path.join(tpl, 'template.json'))
+    fm._seed_export_cache(cache)                            # (once: never again, never written back)
+    assert os.path.exists(os.path.join(cache, 'f' * 16, 'template.json'))
 
 
 def test_off_by_default_and_the_farm_report(tmp_path):
