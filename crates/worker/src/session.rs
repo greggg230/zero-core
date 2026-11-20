@@ -841,6 +841,53 @@ pub fn varlen_of(meta: &[(String, String)], path: &Path, want: &Expect) -> Resul
     Ok(Some(widths))
 }
 
+/// A static graph's tokens per row (zero-core docs/az.md 67: metadata `static` 1, its input `t_cap` [T]): from its
+/// metadata `presence` - per head slot after the global token, the feature of its present flag, -1 for one always
+/// present - a row's head tokens are the always-present positions and the flags it has above 0.5, as the graph counts
+/// them; its tokens those plus its tail tokens.
+#[derive(Clone, Debug)]
+pub struct StaticTokens {
+    /// Head positions every row has (the global token and the slots without a flag).
+    pub always: usize,
+    /// Per feature: some slot's present flag.
+    pub flag: Vec<bool>,
+    /// Head positions in all (the global token and every slot).
+    pub n_tok: usize,
+}
+
+impl StaticTokens {
+    /// A piece's T (`t_cap`'s length): the most tokens of its rows (head + tail), at least 2, rounded up to `align`.
+    pub fn t_for(&self, b: &Batch, idx: &[usize], t_off: &[i64], align: usize) -> usize {
+        let mut most = 2usize;
+        for (k, &r) in idx.iter().enumerate() {
+            let (lo, hi) = (b.xs_off[r] as usize, b.xs_off[r + 1] as usize);
+            let heads = self.always + (lo..hi).filter(|&j| self.flag.get(b.xs_idx[j] as usize).copied().unwrap_or(false) && b.xs_val[j] > 0.5).count();
+            most = most.max(heads + (t_off[k + 1] - t_off[k]) as usize);
+        }
+        let a = align.max(1);
+        most.div_ceil(a) * a
+    }
+}
+
+/// A graph's [`StaticTokens`] (metadata `static` 1), None for any other graph.
+pub fn static_of(meta: &[(String, String)], path: &Path, features: usize) -> Result<Option<StaticTokens>, String> {
+    let get = |k: &str| meta.iter().find(|e| e.0 == k).map(|e| e.1.as_str());
+    if get("static") != Some("1") {
+        return Ok(None);
+    }
+    let pres: Vec<i64> = serde_json::from_str(get("presence").ok_or_else(|| format!("{}: a static graph without metadata presence", path.display()))?).map_err(|e| format!("{}: metadata presence: {e}", path.display()))?;
+    let mut flag = vec![false; features];
+    let mut always = 1usize;
+    for &f in &pres {
+        match usize::try_from(f) {
+            Ok(f) if f < features => flag[f] = true,
+            Ok(f) => return Err(format!("{}: metadata presence names feature {f} of {features}", path.display())),
+            Err(_) => always += 1,
+        }
+    }
+    Ok(Some(StaticTokens { always, flag, n_tok: pres.len() + 1 }))
+}
+
 /// The graph's metadata and inputs / outputs checked against `want` (phase 0a's "For phase 0b" point 1; zero-onnx/2:
 /// its more inputs and the output `refused`, zero-core docs/az.md 46).
 fn check_graph(s: &Session, meta: &[(String, String)], path: &Path, want: &Expect) -> Result<(usize, usize), String> {
@@ -868,7 +915,8 @@ fn check_graph(s: &Session, meta: &[(String, String)], path: &Path, want: &Expec
         return Err(format!("{}: a seat takes the root's belief but the network has no auxiliary head for the game's targets (aux_width {w}, need {}): HeadMissing", path.display(), want.aux_width));
     }
     let more: &[&str] = if v2 { &VARLEN_INPUTS } else { &[] };
-    for name in ["x_ptr", "x_idx", "x_val", "n_players", "belief"].iter().chain(more) {
+    let stat: &[&str] = if v2 && get("static") == Some("1") { &["t_cap"] } else { &[] };
+    for name in ["x_ptr", "x_idx", "x_val", "n_players", "belief"].iter().chain(more).chain(stat) {
         if !s.inputs().iter().any(|i| i.name() == *name) {
             return Err(format!("{}: no input {name:?}", path.display()));
         }
@@ -913,8 +961,11 @@ pub struct InferenceSession {
     pub chunk: usize,
     /// Non-zeros per piece at most (TensorRT-RTX's profile), None: no limit.
     pub max_nnz: Option<usize>,
-    /// The graph's optional input `t_align` as fed to it (`t_align_for`), None: not fed (its default 1).
+    /// The graph's optional input `t_align` as fed to it (`t_align_for`), None: not fed (its default 1); a static
+    /// graph's: the multiple its `t_cap` is rounded up to.
     pub t_align: Option<i64>,
+    /// A static graph's tokens per row (`static_of`), None for any other graph.
+    pub static_tok: Option<StaticTokens>,
 }
 
 /// The value fed to a fast graph's optional input `t_align` (zero-core docs/az.md 66: its padded rows' token axis a
@@ -973,10 +1024,16 @@ fn self_test(s: &mut InferenceSession, r: &crate::selftest::Reference, fallback:
     let d = crate::selftest::compare(&a, &r.want);
     let deterministic = same_bits(&a, &b);
     let max = d.iter().cloned().fold(0.0f64, f64::max);
+    // (a float16 graph's tolerances, zero-core docs/az.md 67: its max and the mean per item; deterministic either way)
+    let (tol, mean_tol) = crate::selftest::tol_for(&s.meta)?;
+    let mean_ok = match mean_tol {
+        Some(m) => crate::selftest::compare_mean(&a, &r.want).iter().all(|&x| x <= m),
+        None => true,
+    };
     Ok(SelfTest {
         provider: s.provider,
         max_abs: max as f32,
-        ok: max <= crate::selftest::TOL && deterministic,
+        ok: max <= tol && mean_ok && deterministic,
         cpu_fallback_nodes: fallback,
         items: d,
         rows: r.rows,
@@ -1008,7 +1065,8 @@ pub fn create_session(spec: &SessionSpec) -> Result<InferenceSession, SessionErr
             Tried::Ok(mut s) => {
                 if !s.selftest.ok && p.is_gpu() {
                     let why = if s.selftest.deterministic {
-                        format!("self-test: max abs {:e} > {:e}", s.selftest.max_abs, crate::selftest::TOL)
+                        let tol = crate::selftest::tol_for(&s.meta).map(|t| t.0).unwrap_or(crate::selftest::TOL);
+                        format!("self-test: max abs {:e} (tolerance {:e}; a float16 graph's mean per item at most {:e})", s.selftest.max_abs, tol, crate::selftest::MEAN_TOL_FP16)
                     } else {
                         "self-test: two passes gave different answers (not deterministic)".to_string()
                     };
@@ -1120,6 +1178,10 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
     }
     let fallback: Vec<String> = if p.is_gpu() { placements.iter().filter(|(prov, _)| prov == "CPUExecutionProvider").map(|(_, n)| n.clone()).collect() } else { Vec::new() };
     let t_align = t_align_for(p, &meta);
+    let static_tok = match static_of(&meta, spec.model, want_graph.features) {
+        Ok(x) => x,
+        Err(e) => return Tried::Fatal(e),
+    };
     let mut s = InferenceSession {
         path: spec.model.to_path_buf(),
         rt,
@@ -1145,6 +1207,7 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
         chunk: chunk_for(p),
         max_nnz: (p == ProviderKind::TensorRtRtx).then_some(NVRTX_MAX_NNZ),
         t_align,
+        static_tok,
     };
     if let Some(r) = reference {
         match self_test(&mut s, r, fallback, build_s) {
@@ -1250,6 +1313,19 @@ impl InferenceSession {
             }
             None => None,
         };
+        // (a static graph's t_cap: the piece's most tokens of a row, rounded up to the GPU's t_align - zero-core
+        // docs/az.md 67; its padded rows' places B (T + n_tok + 1) + NT + 1 below 2^31 too)
+        let t_cap = match (&self.static_tok, &vr) {
+            (Some(st), Some(v)) => {
+                let t = st.t_for(b, idx, &v.t_off, t_align.unwrap_or(1) as usize);
+                let m = (n as u64) * (t + st.n_tok + 1) as u64 + v.t_seg.len() as u64 + 1;
+                if m >= 1 << 31 {
+                    return Err(format!("a piece of {n} rows padded to {t} tokens: the static graph's places could reach {m}, past 2^31 (smaller pieces)"));
+                }
+                Some(t)
+            }
+            _ => None,
+        };
         let v2 = vr.is_some();
         let s = self.ensure()?;
         let mut inputs = ort::inputs![
@@ -1278,7 +1354,10 @@ impl InferenceSession {
                 "ov_slot_hi" => Tensor::from_array((len(v.ov_slot_hi.len()), v.ov_slot_hi)).map_err(oerr)?,
                 "ov_slot_lo" => Tensor::from_array((len(v.ov_slot_lo.len()), v.ov_slot_lo)).map_err(oerr)?,
             ]);
-            if let Some(a) = t_align {
+            if let Some(t) = t_cap {
+                // (the static graph's input: only its length is read, zero-core docs/az.md 67)
+                inputs.extend(ort::inputs!["t_cap" => Tensor::from_array((vec![t as i64], vec![0i32; t])).map_err(oerr)?]);
+            } else if let Some(a) = t_align {
                 // (the fast graph's optional input, a GPU's: zero-core docs/az.md 66)
                 inputs.extend(ort::inputs!["t_align" => Tensor::from_array((Vec::<i64>::new(), vec![a])).map_err(oerr)?]);
             }

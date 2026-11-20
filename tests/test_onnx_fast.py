@@ -259,3 +259,34 @@ def test_fast_weight_swap_template(tmp_path):
     assert json.loads(json.dumps(OX.GRAPHS)) and OX.graph_options('fast') == ('mha', True)
     with pytest.raises(ValueError, match='graph'):
         OX.graph_options('fastest')
+
+
+def test_fast_graph_float16(tmp_path):
+    """docs/az.md 67: `to_float16` - the fast graph's float32 arithmetic in float16, its inputs and outputs float32 and
+    its interface unchanged, metadata `precision` 'fp16' (the rest the fp32 graph's); topologically sorted (the ONNX
+    checker passes); its answers within the worker's float16 tolerances of the fp32 graph's on the CPU (priors, value,
+    margin through `onnx_parity.answer`), its refusals the same; the same bytes from the same graph; refused twice."""
+    import onnx
+    import onnxruntime as ort
+    net = rich_net(RICH, seed=1, readers=READER)
+    p, _ = export(net, tmp_path)
+    p16, p16b = str(tmp_path / 'm16.onnx'), str(tmp_path / 'm16b.onnx')
+    meta = OX.to_float16(p, p16)
+    OX.to_float16(p, p16b)
+    assert open(p16, 'rb').read() == open(p16b, 'rb').read()
+    g, g16 = onnx.load(p), onnx.load(p16)
+    sig = lambda m: [(i.name, i.type.tensor_type.elem_type) for i in list(m.graph.input) + list(m.graph.output)]  # noqa: E731
+    assert sig(g) == sig(g16)
+    md, md16 = ({x.key: x.value for x in m.metadata_props} for m in (g, g16))
+    assert md16 == dict(md, precision='fp16') and meta == md16
+    assert any(i.data_type == onnx.TensorProto.FLOAT16 for i in g16.graph.initializer)
+    with pytest.raises(ValueError, match='already'):
+        OX.to_float16(p16, str(tmp_path / 'x.onnx'))
+    rows = gate_rows(net, rich_batch(40, 9), kinds_of(40, 5))
+    f = OP.feeds(rows, v2=True)
+    a = ort.InferenceSession(p, providers=['CPUExecutionProvider']).run(None, f)
+    b = ort.InferenceSession(p16, providers=['CPUExecutionProvider']).run(None, f)
+    assert np.array_equal(a[-1], b[-1])
+    for x, y in zip(OP.answer(a, rows)[:3], OP.answer(b, rows)[:3]):
+        d = np.abs(np.asarray(x, np.float64) - np.asarray(y, np.float64))
+        assert np.nanmax(d) <= 5e-2 and np.nanmean(d) <= 3e-3, (np.nanmax(d), np.nanmean(d))

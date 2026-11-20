@@ -314,6 +314,15 @@ def varlen_feeds(rows, sizes=None):
          'ov_off': z if o is None else o.off.astype(np.int64),
          'ov_opt': e if o is None else o.opt.astype(np.int32),
          'ov_seg': ov[0], 'ov_col': ov[1], 'ov_slot_hi': ov[2], 'ov_slot_lo': ov[3]}
+    if sizes is not None and 'presence' in sizes:
+        # (the static graph's t_cap, docs/az.md 67: its length the most tokens of a row - head positions present by the
+        # metadata's flags plus the row's tail tokens - rounded up to the metadata's t_align, as a GPU feeder does)
+        from .onnx_export import static_t
+        n = presence_sparse(rows, sizes['presence']).sum(1) + np.diff(f['t_off'])
+        T = static_t(n, sizes.get('t_align', 1))
+        f['t_cap'] = np.zeros(T, np.int32)
+        if B * (T + len(sizes['presence']) + 1) + len(f['t_seg']) + 1 > INT32_MAX:
+            raise ValueError(f'a piece of {B} rows padded to {T} tokens: places of the static graph pass 2^31')
     if sizes is not None:
         m = int32_bound(B, len(rows.xs_idx), rows.F, sizes['actions'], sizes['tail_width'], f['t_off'],
                         len(f['t_seg']), len(f['t_val']), len(f['opt_action']), len(f['ov_opt']))
@@ -328,7 +337,12 @@ def graph_sizes(sess):
     if not any(i.name == 't_off' for i in sess.get_inputs()):
         return None
     m = sess.get_modelmeta().custom_metadata_map
-    return {'actions': int(m['actions']), 'tail_width': int(m.get('tail_width') or 0)}
+    out = {'actions': int(m['actions']), 'tail_width': int(m.get('tail_width') or 0)}
+    if m.get('static') == '1':
+        # (the static graph's: what its t_cap is computed from, docs/az.md 67)
+        out['presence'] = json.loads(m['presence'])
+        out['t_align'] = int(m.get('t_align') or 1)
+    return out
 
 
 def is_v2(sess):

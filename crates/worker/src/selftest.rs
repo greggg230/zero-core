@@ -25,6 +25,44 @@ use std::collections::BTreeMap;
 /// The largest difference allowed on any number (the parity gate's, DESIGN.md 8.3).
 pub const TOL: f64 = 2e-5;
 
+/// A float16 graph's largest difference (graph metadata `precision` 'fp16', zero-core docs/az.md 67): its arithmetic
+/// moves the answers by float16's rounding - measured on a live run's network (256 reference rows, the CUDA pack):
+/// priors 4.2e-3, value 8.5e-3, margin 1.0e-2 at most; the user's decision (2026-11-19) to accept reduced precision
+/// on GPU sessions. The session must still answer bit for bit the same twice (`session::self_test`): a provider's
+/// races show there whatever the tolerance.
+pub const TOL_FP16: f64 = 5e-2;
+
+/// A float16 graph's largest mean |difference| over every number of an item (measured: 3e-4 to 6e-4): a provider
+/// that gets a few numbers far wrong passes the max but not this.
+pub const MEAN_TOL_FP16: f64 = 3e-3;
+
+/// A graph's tolerances (its metadata `precision`): (the largest difference on any number, the largest mean difference
+/// per item or None) - [`TOL`] and None for a float32 graph (no `precision`, or 'fp32'), [`TOL_FP16`] and
+/// [`MEAN_TOL_FP16`] for 'fp16'; another value is refused.
+pub fn tol_for(meta: &[(String, String)]) -> Result<(f64, Option<f64>), String> {
+    match meta.iter().find(|e| e.0 == "precision").map(|e| e.1.as_str()) {
+        None | Some("fp32") => Ok((TOL, None)),
+        Some("fp16") => Ok((TOL_FP16, Some(MEAN_TOL_FP16))),
+        Some(p) => Err(format!("graph metadata precision {p:?}: this worker self-tests fp32 and fp16 graphs")),
+    }
+}
+
+/// The mean |got - want| per item (priors, value, margin, aux; 0 for an empty item, inf when a size differs or a
+/// number is not finite).
+pub fn compare_mean(got: &Answer, want: &Answer) -> [f64; 4] {
+    let mean = |a: &[f32], b: &[f32]| -> f64 {
+        if a.len() != b.len() {
+            return f64::INFINITY;
+        }
+        if a.is_empty() {
+            return 0.0;
+        }
+        let s = a.iter().zip(b).fold(0.0f64, |s, (x, y)| s + (*x as f64 - *y as f64).abs());
+        if s.is_finite() { s / a.len() as f64 } else { f64::INFINITY }
+    };
+    [mean(&got.priors, &want.priors), mean(&got.value, &want.value), mean(&got.margin, &want.margin), mean(&got.aux, &want.aux)]
+}
+
 /// A checkpoint's reference set.
 pub struct Reference {
     pub meta: Value,

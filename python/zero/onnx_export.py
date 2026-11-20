@@ -126,13 +126,15 @@ from .protocol import MAX_SEATS
 # into the chosen operator. The fast graph (`fast`, docs/az.md 63) takes 'matmul' too (its unfused form).
 ATTENTIONS = (None, 'mha', 'attention23')
 FAST_ATTENTIONS = ('mha', 'attention23', 'matmul')
+STATIC_ATTENTIONS = ('mha', 'matmul')     # (the static graph's: the GPU's forms, docs/az.md 67)
 FUSED_DOMAIN = 'zero.onnx'
 # a graph variant by name (`graph` of export_template / swap_export / farm_h2h.export_cached; the run setting
 # `pool_export`, docs/az.md 63) -> (attention, fast): '' the default graph; 'fast' the fast graph with com.microsoft
 # MultiHeadAttention at opset 17 (every runtime pack the farm ships runs it on its provider: the CPU packs and the CUDA
 # pack); 'fast-att23' with ONNX's opset-23 Attention (the fastest on the CPU; the CUDA pack's ONNX Runtime 1.24.4 has no
 # CUDA kernel of opset 19-23's versions of a dozen operators, which then run on the CPU); 'fast-matmul' the MatMul form
-GRAPHS = {'': (None, False), 'fast': ('mha', True), 'fast-att23': ('attention23', True), 'fast-matmul': ('matmul', True)}
+GRAPHS = {'': (None, False), 'fast': ('mha', True), 'fast-att23': ('attention23', True), 'fast-matmul': ('matmul', True),
+          'static': ('mha', 'static')}       # (docs/az.md 67: no data-dependent shape, for the GPU)
 
 
 def graph_options(graph):
@@ -1772,6 +1774,137 @@ def dynamic_shapes(packing):
     return d
 
 
+class ZeroOnnx2Static(ZeroOnnx2):
+    """zero-onnx/2 with no data-dependent shape (`export(..., fast='static')`, graph 'static', docs/az.md 67): the default
+    graph's interface plus one input `t_cap` [T] (any dtype; only its length is read) - every row padded to T tokens, a
+    feeder's choice of at least each row's head and tail tokens (metadata `presence`: `TokenNet.present_index`, from
+    which a feeder counts a row's head tokens; `t_align`: the multiple a GPU feeder rounds T up to). For the GPU: no
+    NonZero, no value read back to the host, every size the inputs' own - so nothing waits on the device mid-run and
+    ONNX Runtime can fold every shape computation.
+
+    The arithmetic is `ZeroOnnx2`'s (the default graph: the rows densified, every head slot embedded, the tails, gates,
+    overrides and refusals), laid out as `TokenNet.forward_static` lays it: the padded rows [B T] built once by a scatter
+    of unique places (a row's present head positions at their rank among them, then its tail tokens, the rest a zero
+    row), the blocks run on [B T] (no gather or scatter per block), the pooling masked. The static policy and the
+    overrides are `ZeroOnnx2`'s, fed the head positions in full ([B n_tok]: a position's own pointer logits row, absent
+    ones a zero row) - the same writes in the same order. A row whose tokens pass T is refused (`refused` + 1: a
+    feeder's mistake, never answered)."""
+
+    def __init__(self, net, packing='packed', attention='mha'):
+        if attention not in STATIC_ATTENTIONS:
+            raise ValueError(f'static graph: attention {attention!r} (one of {STATIC_ATTENTIONS})')
+        super().__init__(net, packing, None if attention == 'matmul' else attention)
+
+    def _trunk_static(self, h, pres, ids, T, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo, t_val, ov_off,
+                      ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo):
+        """`ZeroOnnx2._trunk2` on rows padded to T tokens -> (z [B, 2 d], logits [B, actions + 1], refused [B])."""
+        net = self.net
+        B, NTOK, D = h.shape
+        dev = h.device
+        A1 = net.actions + 1
+        NT = t_seg.shape[0]
+        BN = B * NTOK
+        seg, segc, shi, slo, trow, tbad, lbad, te = self._tails(h, t_off, t_seg, t_slot_hi, t_slot_lo, t_val)
+        flat = pres.reshape(-1)
+        n_h = pres.sum(1)
+        n = n_h + (t_off[1:] - t_off[:-1])
+        # ---- the padded rows: each place's source - a head position (b, j) at b T + its rank among the row's present
+        # ones, a tail token after its row's head tokens, every other place the zero row; one scatter of unique places
+        # (a token past T, a row's refusal, to a spare place of its own past B T)
+        ar_bn = torch.arange(BN, device=dev)
+        brow = ar_bn // NTOK
+        rk = (pres.long().cumsum(1) - 1).reshape(-1)              # (a short running sum: along each row's n_tok)
+        hok = flat & (rk < T)
+        dest_h = torch.where(hok, brow * T + rk, B * T + ar_bn)
+        ar_t = torch.arange(NT, device=dev)
+        pos_t = n_h.index_select(0, trow) + (ar_t - t_off.index_select(0, trow))
+        tok = pos_t < T
+        dest_t = torch.where(tok, trow * T + pos_t, B * T + BN + ar_t)
+        zrow = BN + NT
+        gidx = torch.full((B * T + BN + NT,), zrow, dtype=torch.long, device=dev).scatter(
+            0, torch.cat([dest_h, dest_t]), torch.cat([ar_bn, BN + ar_t]))
+        gidx = gidx.index_select(0, torch.arange(B * T, dtype=torch.long, device=dev))
+        hp = torch.cat([h.reshape(BN, D), te, h.new_zeros(1, D)]).index_select(0, gidx)
+        valid = (gidx < zrow).view(B, T)
+        if net.gated:
+            # (a token's weight: 1, a gated segment's g, 0 padding - the attention's float mask log w, the pooling)
+            gi = self.v_gi.index_select(0, segc)
+            wt = torch.where(gi >= 0, self.v_g.index_select(0, _iclamp(gi, 0)), torch.ones((), dtype=torch.float32))
+            wpad = torch.cat([torch.ones(BN, dtype=torch.float32, device=dev), wt,
+                              torch.zeros(1, dtype=torch.float32, device=dev)]).index_select(0, gidx).view(B, T)
+            bias = torch.log(wpad)[:, None, None, :].to(h.dtype)
+        else:
+            bias = torch.where(valid, 0.0, float('-inf'))[:, None, None, :].to(h.dtype)
+        H = net.blocks[0].h
+        hd = D // H
+        if self.attention:
+            bias4 = bias.expand(B, 1, T, T)
+        for blk in net.blocks:
+            qkv = blk.qkv(blk.ln1(hp))
+            if self.attention:
+                q3, k3, v3 = torch.split(qkv.view(B, T, 3 * D), [D, D, D], dim=2)
+                a = torch.ops.zero_onnx.fused_attention(q3, k3, v3, bias4, H).reshape(B * T, D)
+            else:
+                q, k, v = qkv.view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+                s = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5) + bias
+                a = torch.matmul(torch.softmax(s, -1), v).transpose(1, 2).reshape(B * T, D)
+            hp = hp + blk.out(a)
+            hp = hp + blk.ff2(F.gelu(blk.ff1(blk.ln2(hp))))
+        hp = net.ln(hp)
+        pad = hp.view(B, T, D)
+        # (the pooling: a padding place weighs 0 - where the default graph's padding rows are zeros)
+        if net.gated:
+            zm = (pad * wpad[..., None]).sum(1) / wpad.sum(1, keepdim=True)
+        else:
+            zm = (pad * valid[..., None].to(hp.dtype)).sum(1) / n[:, None].to(hp.dtype)
+        z = torch.cat([pad[:, 0], zm], 1)
+        gen = F.pad(net.gen(z), (0, 1))
+        P = _pointer2(net, F.gelu(net.pk(hp) + net.pq(z).index_select(0, torch.arange(B * T, device=dev) // T)))
+        # ---- the head positions in full ([B n_tok]): each one's pointer logits row (absent or past T: a zero row),
+        # its actions; then the tail tokens' rows - `_policy_full` and `_overrides` as the packed list feeds them
+        P0 = torch.cat([P, P.new_zeros(1, P.shape[1])])
+        Ph = P0.index_select(0, torch.where(hok, dest_h, B * T))
+        Pt = P0.index_select(0, torch.where(tok, dest_t, B * T))
+        slot_h = ar_bn - brow * NTOK
+        cols = net.tok_cols.index_select(0, slot_h)
+        acts = net.tok_acts.index_select(0, slot_h)
+        if net.n_id:
+            it = ids.reshape(-1)
+            ia = net.tok_idbase.index_select(0, slot_h) + it
+            ia = torch.where((it < net.vocab) & (ia < net.actions), ia, net.actions)
+            acts = torch.where(net.tok_isid.index_select(0, slot_h), ia[:, None], acts)
+        acts = torch.where(cols >= 0, acts, net.actions)
+        lg = Ph.gather(1, _iclamp(cols, 0))
+        pol = _policy_full(gen, acts, lg, flat, ar_bn, NTOK, net).reshape(-1)
+        pol, oref = self._overrides(pol, gen, torch.cat([Ph, Pt]), flat, ar_bn, BN, NTOK, trow, seg, shi, slo, opt_off,
+                                    opt_action, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo)
+        refused = _row_sum(tbad, t_off) + oref + lbad + (n > T).long()
+        return z, pol.view(B, A1), refused
+
+    def forward(self, x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo,
+                t_val, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo, t_cap):
+        net = self.net
+        x = densify(x_ptr, x_idx, x_val, net.features)
+        aux = bool(self.layout)
+        rraw = ent = None
+        if net.readers is not None:
+            rraw, ent = _read(net, x)
+        h, pres, ids = slot_tokens(net, x, ent)
+        z, pol, refused = self._trunk_static(h, pres, ids, t_cap.shape[0], opt_off, opt_action, t_off, t_seg, t_slot_hi,
+                                             t_slot_lo, t_val, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo)
+        r = net._heads(z, pol, n_players, aux, None, rraw)
+        policy, value, margin, aux_out = _outputs(net, self.layout, x.shape[0], r[0], r[1], r[2],
+                                                  r[3] if aux else None, n_players, belief)
+        return policy, value, margin, aux_out, refused
+
+
+def static_t(n, align=1):
+    """The static graph's T for rows of `n` tokens each (head + tail): their most, at least 2, rounded up to a multiple
+    of `align` (docs/az.md 67)."""
+    t = max(2, int(np.max(n)) if len(n) else 2)
+    return -(-t // max(1, int(align))) * max(1, int(align))
+
+
 def example_inputs2(net):
     """zero-onnx/2's inputs to trace with: `example_inputs`' rows, 5 options, 4 tail tokens (the first tail segment's,
     rows 0 and 2; or segment 0's for a network without tail segments: refused, still traced), 6 tail floats per
@@ -1815,7 +1948,14 @@ def metadata2(net, extra=None, attention=None, fast=False):
                  'option_pointers': json.dumps(bool(net.option_pointers)),
                  'max_row_tokens': json.dumps(net.config['layout'].get('max_row_tokens')),
                  'tail_width': str(int(getattr(net, 't_width', 0) or 0)), 'gates': json.dumps(net.gates())})
-    if fast:
+    if fast == 'static':
+        # (docs/az.md 67: ZeroOnnx2Static's graph - its input t_cap, the head positions' present flags a feeder counts
+        # a row's head tokens with, the multiple a GPU feeder rounds T up to)
+        meta['static'] = '1'
+        meta['inputs'] = json.dumps(list(INPUTS2) + ['t_cap'])
+        meta['presence'] = json.dumps([int(i) for i in net.present_index()])
+        meta['t_align'] = str(T_ALIGN)
+    elif fast:
         meta['fast'] = '1'                       # (docs/az.md 63: ZeroOnnx2Fast's graph)
         meta['t_align'] = str(T_ALIGN)           # (docs/az.md 66: its optional input, what a GPU feeder gives it)
     if attention:
@@ -1982,13 +2122,18 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
                                  **({'custom_translation_table': table} if table else {}))
     meta = meta_of(extra)
     return _save(prog.model_proto, meta, path, opset, make_portable, attention=attention if mod_fused(attention) else None,
-                 gelu=fast)
+                 gelu=bool(fast), instance=fast is True)
 
 
 def fast_attention(attention, fast):
     """The attention a graph is exported with: `attention` as given, the fast graph's default ('mha') when `fast`
-    and None; refused when it is not one the graph takes (`ATTENTIONS`; the fast graph's `FAST_ATTENTIONS`)."""
-    if fast:
+    and None; refused when it is not one the graph takes (`ATTENTIONS`; the fast graph's `FAST_ATTENTIONS`; the static
+    graph's - `fast` 'static' - `STATIC_ATTENTIONS`)."""
+    if fast == 'static':
+        attention = STATIC_ATTENTIONS[0] if attention is None else attention
+        if attention not in STATIC_ATTENTIONS:
+            raise ValueError(f'static graph: attention {attention!r} (one of {STATIC_ATTENTIONS})')
+    elif fast:
         attention = FAST_ATTENTIONS[0] if attention is None else attention
         if attention not in FAST_ATTENTIONS:
             raise ValueError(f'fast graph: attention {attention!r} (one of {FAST_ATTENTIONS})')
@@ -2014,6 +2159,13 @@ def _export_module(net, packing='packed', attention=None, fast=False):
     attention = fast_attention(attention, fast)
     if onnx_version(net) == 2:
         # (variable-length token sets: zero-onnx/2, docs/az.md 46)
+        if fast == 'static':
+            # (the static graph's input `t_cap` last: only its length is read, the padded rows' T; docs/az.md 67)
+            mod = ZeroOnnx2Static(net, packing, attention).eval()
+            T = int(net.n_tok) + 7                   # (traced with room for every example row's tokens)
+            return (mod, tuple(example_inputs2(net)) + (torch.zeros(T, dtype=torch.int32),), list(INPUTS2) + ['t_cap'],
+                    list(OUTPUTS2), dict(dynamic_shapes2(), t_cap={0: torch.export.Dim('T', min=2, max=1 << 20)}),
+                    lambda extra: metadata2(net, extra, attention=attention, fast=fast))
         if fast:
             # (the fast graph's optional input `t_align` last, traced with 1: docs/az.md 66)
             mod = ZeroOnnx2Fast(net, packing, attention).eval()
@@ -2344,7 +2496,7 @@ def opset17(model):
     return stats
 
 
-def _save(model, meta, path, opset, make_portable, int32=True, attention=None, gelu=False):
+def _save(model, meta, path, opset, make_portable, int32=True, attention=None, gelu=False, instance=True):
     """The exported model with its metadata (`fused_attention`'s, then with `gelu` (the fast graph's) `fuse_gelu`'s and
     `layernorm_instance`'s rewrites, then `portable`'s; the
     exporter's annotations stripped; `int32_slices` then `check_int32`; `opset17` for opset 17), checked, written
@@ -2356,8 +2508,11 @@ def _save(model, meta, path, opset, make_portable, int32=True, attention=None, g
             opset = 23
     if gelu:
         fuse_gelu(model)
-        layernorm_instance(model)
-        _optional_input(model, 't_align', 1)     # (the fast graph's optional input: default 1, docs/az.md 66)
+        if instance:
+            # (the fast graph's: the layer norms as InstanceNormalization, its optional input t_align; not the static
+            # graph's - the GPU's LayerNormalization is the faster there, docs/az.md 67)
+            layernorm_instance(model)
+            _optional_input(model, 't_align', 1)     # (the fast graph's optional input: default 1, docs/az.md 66)
     meta['opset'] = str(opset)
     if make_portable:
         portable(model)
@@ -2383,6 +2538,53 @@ def _write_metadata(model, meta):
         e = model.metadata_props.add()
         e.key, e.value = k, v
     model.producer_name = 'zero-core zero.onnx_export'
+
+
+FP16_KEEP = ('ConstantOfShape',)  # (`to_float16`: kept float32 - the converter leaves its value attribute float32)
+
+
+def _toposort(graph):
+    """The graph's nodes reordered so that each comes after the producers of its inputs (stable: otherwise in their
+    order). In place; ValueError on a cycle or an input nothing produces."""
+    have = {i.name for i in graph.input} | {i.name for i in graph.initializer} | {''}
+    nodes, out = list(graph.node), []
+    while nodes:
+        rest = []
+        for n in nodes:
+            if all(x in have for x in n.input):
+                out.append(n)
+                have.update(n.output)
+            else:
+                rest.append(n)
+        if len(rest) == len(nodes):
+            raise ValueError(f'graph: {len(rest)} node(s) whose inputs nothing produces (first {rest[0].name})')
+        nodes = rest
+    del graph.node[:]
+    graph.node.extend(out)
+
+
+def to_float16(src, dst):
+    """A float16 copy of the zero-onnx graph at `src`, written to `dst` (docs/az.md 67; for GPU workers: the user's
+    decision of 2026-11-19 to accept reduced precision there): its float32 arithmetic in float16, its inputs and outputs
+    float32 (onnxruntime.transformers' convert_float_to_float16 with keep_io_types; float32 kept for the converter's
+    default list and `FP16_KEEP`), its metadata `src`'s plus `precision` 'fp16' - a worker self-tests such a graph at its
+    float16 tolerances (zero_worker `selftest::TOL_FP16` 5e-2, `MEAN_TOL_FP16` 3e-3 per item; measured on a live run's
+    network: priors 4.2e-3, value 8.5e-3, margin 1.0e-2 at most) and still bit for bit the same twice -> the metadata.
+    Deterministic: the same `src` gives the same bytes."""
+    import onnx
+    from onnxruntime.transformers import float16
+    m = onnx.load(src)
+    meta = {p.key: p.value for p in m.metadata_props}
+    if meta.get('precision', 'fp32') != 'fp32':
+        raise ValueError(f'{src}: already precision {meta["precision"]!r}')
+    m16 = float16.convert_float_to_float16(m, keep_io_types=True, disable_shape_infer=True,
+                                           op_block_list=list(float16.DEFAULT_OP_BLOCK_LIST) + list(FP16_KEEP))
+    _toposort(m16.graph)                     # (the converter appends its input casts after their readers)
+    meta['precision'] = 'fp16'
+    _write_metadata(m16, meta)
+    onnx.checker.check_model(m16)
+    _write_model(m16, dst)
+    return meta
 
 
 def _write_model(model, path):
