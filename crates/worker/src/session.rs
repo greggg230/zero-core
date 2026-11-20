@@ -1088,15 +1088,32 @@ pub fn create_session(spec: &SessionSpec) -> Result<InferenceSession, SessionErr
 pub const CATALOG: [ProviderKind; 4] = [ProviderKind::TensorRtRtx, ProviderKind::AmdGpu, ProviderKind::MiGraphX, ProviderKind::OpenVino];
 
 /// Why `p` is refused for a graph with metadata `meta` whatever its self-test says, if it is: DirectML on a zero-onnx/2
-/// graph. Measured 2026-11-13 (onnxruntime-directml 1.24.4 and Windows ML's ORT 1.28.3; RTX 5090, Intel UHD 770): on
-/// batches with pointer overrides, all of a row's overrides intermittently come back as one shared wrong value (the
-/// self-test passed 3-5 of 5-6 runs, with the GPU-safe export and the one before it alike), so a session that passes can
-/// still answer later override batches wrongly - wrong search targets, not a replay mismatch. Lifting it needs a fix of the
-/// override path proven by >= 50 consecutive identical, correct runs on override batches on both adapters
-/// (docs/az.md 46.8). zero-onnx/1 on DirectML stays allowed.
+/// graph other than the fast graph with its attention as MatMuls (metadata `fast` '1', `attention` 'matmul', not
+/// `static`: graph 'fast-matmul', docs/az.md 63). zero-onnx/1 on DirectML stays allowed.
+/// * 2026-11-13 (onnxruntime-directml 1.24.4 and Windows ML's ORT 1.28.3; RTX 5090, Intel UHD 770): on batches with
+///   pointer overrides the default graph intermittently answered all of a row's overrides with one shared wrong value
+///   (the self-test passed 3-5 of 5-6 runs), so a session that passes could still answer later override batches wrongly -
+///   wrong search targets, not a replay mismatch. Every zero-onnx/2 graph was refused (docs/az.md 46.8).
+/// * 2026-11-20 (docs/az.md 46.10): the fast-matmul graph passed the lifting test - >= 50 consecutive identical, correct
+///   runs on override batches on two adapters - so it is allowed. The fast graph's fused attention (`attention` 'mha' /
+///   'attention23') throws in DirectML (E_INVALIDARG on ONNX Runtime's MultiHeadAttention), the static graph runs out of
+///   memory in it, and the default graph is the one that failed: all refused.
 pub fn provider_refusal(p: ProviderKind, meta: &[(String, String)]) -> Option<String> {
-    let v2 = meta.iter().any(|(k, v)| k == "zero_onnx" && v == "2");
-    (p == ProviderKind::DirectMl && v2).then(|| "dml: zero-onnx/2's pointer-override path answers intermittently wrong on DirectML (refused, docs/az.md 46.8)".to_string())
+    if p != ProviderKind::DirectMl {
+        return None;
+    }
+    let get = |k: &str| meta.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    if get("zero_onnx") != Some("2") {
+        return None;
+    }
+    if get("static") == Some("1") {
+        return Some("dml: the static zero-onnx/2 graph doesn't run on DirectML (refused, docs/az.md 46.10)".to_string());
+    }
+    match (get("fast"), get("attention")) {
+        (Some("1"), Some("matmul")) => None,
+        (Some("1"), a) => Some(format!("dml: the fast graph's fused attention ({}) doesn't run on DirectML: its 'fast-matmul' form does (refused, docs/az.md 46.10)", a.unwrap_or("mha"))),
+        _ => Some("dml: zero-onnx/2's default graph answers pointer overrides intermittently wrong on DirectML: only the 'fast-matmul' graph runs there (refused, docs/az.md 46.8, 46.10)".to_string()),
+    }
 }
 
 /// The factory's answer for a refused provider: a skip, never an error - `create_session` goes on to the next provider
@@ -1713,7 +1730,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn directml_is_refused_for_zero_onnx_2_only() {
+    fn directml_runs_only_the_fast_matmul_zero_onnx_2_graph() {
+        let g = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let dml = |kv: &[(&str, &str)]| provider_refusal(ProviderKind::DirectMl, &g(kv));
+        // the one zero-onnx/2 graph DirectML runs (docs/az.md 46.10), float32 or float16
+        assert_eq!(dml(&[("zero_onnx", "2"), ("fast", "1"), ("attention", "matmul")]), None);
+        assert_eq!(dml(&[("zero_onnx", "2"), ("fast", "1"), ("attention", "matmul"), ("precision", "fp16")]), None);
+        // the fused forms, the static graph and the default graph: refused, each with its reason
+        for a in ["mha", "attention23"] {
+            let why = dml(&[("zero_onnx", "2"), ("fast", "1"), ("attention", a)]).expect("fused attention refused");
+            assert!(why.starts_with("dml:") && why.contains(a) && why.contains("46.10"), "{why}");
+        }
+        let why = dml(&[("zero_onnx", "2"), ("fast", "1")]).expect("the fast graph's default attention (mha) refused");
+        assert!(why.contains("mha"), "{why}");
+        let why = dml(&[("zero_onnx", "2"), ("static", "1"), ("attention", "matmul")]).expect("static refused");
+        assert!(why.contains("static"), "{why}");
+        let why = dml(&[("zero_onnx", "2"), ("attention", "matmul")]).expect("not the fast graph");
+        assert!(why.contains("46.8"), "{why}");
+        // every other provider and every zero-onnx/1 graph as before
+        for p in [ProviderKind::Cpu, ProviderKind::Cuda, ProviderKind::TensorRtRtx, ProviderKind::OpenVino] {
+            assert_eq!(provider_refusal(p, &g(&[("zero_onnx", "2"), ("fast", "1"), ("attention", "mha")])), None, "{p:?}");
+        }
+        assert_eq!(dml(&[("zero_onnx", "1")]), None);
+    }
+
+    #[test]
+    fn directml_is_refused_for_zero_onnx_2_default_graphs() {
         let m = |v: &str| vec![("zero_onnx".to_string(), v.to_string()), ("game".to_string(), "mtg".to_string())];
         let why = provider_refusal(ProviderKind::DirectMl, &m("2")).expect("dml refused for zero-onnx/2");
         assert!(why.starts_with("dml:") && why.contains("46.8"), "{why}");

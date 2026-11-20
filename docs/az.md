@@ -151,7 +151,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
 | `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface (plus the optional input `t_align`, 66), metadata (plus `fast`, `attention`, `t_align`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
-| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form,...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming the first (`model`), so CUDA PCs play it and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
+| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul-fp16' - the gen exported as graph 'fast-matmul', then float16: the DirectML variant, 46.10); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so CUDA PCs play the fp16 graph, AMD PCs (DirectML) the 'matmul-fp16' one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: this machine's driver when its inference is CUDA / MPS, and every remote worker on any device (56.1) - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -7325,6 +7325,56 @@ generation reached the farm.
 **What.** The first batch (in the existing order) holding an override, the first holding a belief row and the first
 holding a tail token are taken before the rest. Nothing else changes: the same batches when they already covered every
 kind. Test: `test_the_reference_rows_hold_a_belief_row_when_the_files_do` (belief rows only in the last batch).
+
+### 46.10 DirectML runs the fast graph's MatMul form: the refusal narrowed, the farm's DirectML variant (zero-farm PROTOCOL rev 22, 2026-11-20)
+
+**Why.** The owner's decision of 2026-11-20: the farm's AMD GPUs play through DirectML (AMD's own Windows ML providers
+can't run our graphs, 46.7-46.8 and zero-farm PROTOCOL 9.8). Two things stood in the way: every zero-onnx/2 graph was
+refused on DirectML (46.8: the default graph's pointer overrides answered intermittently wrong), and the fast graph
+(63, 66) DirectML would have to run puts its attention in com.microsoft MultiHeadAttention nodes.
+
+**What was measured** (an NVIDIA GPU of a farm PC and an Intel integrated GPU; Windows ML's ONNX Runtime 1.28.3 and
+DirectML 1.15.4 from a pack without the provider catalog; a release worker with the refusal lifted, never published):
+
+* *Which graphs run.* The fast graph with its fused attention ('mha'): DirectML throws on the MultiHeadAttention node
+  (E_INVALIDARG, "The parameter is incorrect") in every run, float32 and float16. The static graph (67): Range / Expand
+  run out of memory in DirectML. The fast graph with its attention as MatMuls (graph 'fast-matmul', `attention`
+  'matmul', 63): passes (61 nodes on the CPU, the shape arithmetic of its dynamic sizes).
+* *The override path.* `eval-batches` in separate processes (a fresh session and self-test each) on the 42 recorded
+  batches of a layout-v7 Delver network that hold pointer overrides (3,888 rows, 151 overrides in 42 rows of 2-5 each:
+  46.8's file), each run's answers against the CPU's (float32: max abs 1e-4; float16: 5e-2) and bit for bit against
+  the first run's:
+
+  | graph | NVIDIA GPU | Intel integrated GPU |
+  |---|---|---|
+  | fast-matmul, float32 | 50 of 50 (override rows' priors 7.7e-7) | 50 of 50 (8.3e-7) |
+  | fast-matmul, float16 | 50 of 50 | 50 of 50 |
+  | default graph (the control) | DirectML passed its self-test in 7 of 20 runs (the session fell back to the CPU in the other 13); all 7 answered override rows wrongly (priors off by up to 0.88), each run differently | passed its self-test in 5 of 20; 4 of those 5 wrong (up to 0.86) |
+
+  The control reproduces 46.8's failure on today's code - a passing self-test, then wrong overrides - so the check sees
+  it; the MatMul form never showed it in 300 runs (each set one digest, run after run). MTG Zero's live 3-deck network (gen 769, layout v7 with its newer
+  segments) on its own 7 recorded override batches (4,154 rows, 7 overrides; the run's games make few): fast-matmul 50 of 50 in float32 (1.5e-6) and 50 of 50 in float16 (3.3e-3), the NVIDIA GPU.
+* *Speed* (the same NVIDIA GPU, legacy-meta3-r1 gen 769, the farm worker's self-play in 5-minute windows): DirectML on
+  fast-matmul float16, 3 workers x 1,150 games in flight, 2 groups: 12.0k leaves/s against CUDA's 25.3k on the same
+  graph (0.48x) and 28.1k on the fused one (0.43x). A fixed cost per call (~130-140 ms at 450-670 rows, the GPU 33-46 %
+  busy) limits it; more workers past 3, or bigger batches, are slower.
+
+**What changed.**
+
+* `session::provider_refusal`: DirectML on a zero-onnx/2 graph is allowed for the fast-matmul graph only (metadata
+  `fast` '1', `attention` 'matmul', not `static`), float32 or float16; the fused forms, the static graph and the
+  default graph stay refused, each with its reason. zero-onnx/1 and every other provider as before. Tests:
+  `directml_runs_only_the_fast_matmul_zero_onnx_2_graph`, `directml_is_refused_for_zero_onnx_2_default_graphs`.
+* `farm_pool`: the variant form 'matmul-fp16' (each gen's checkpoint exported again as graph 'fast-matmul' through
+  `export_cached` - its own weight-swap template, checked against the gen's reference set - then `to_float16`), and
+  `pool_variants` 'name=form[@vendor]': a variant with `@vendor` goes to the run's GPU alternates of that vendor, the
+  first one without to every other GPU alternate (`variant_of`). E.g. 'gpu=fp16,dml=matmul-fp16@amd': the CUDA
+  alternate plays the float16 fast graph, the DirectML alternate for AMD GPUs (zero-farm PROTOCOL rev 22: a pack
+  requiring an AMD GPU, DirectML only) the float16 MatMul form, every other machine the default. Without '@' the
+  setting means what it did. Test: `test_pool_variants_are_exported_uploaded_signed_registered_and_named` (the syntax,
+  `variant_of`, the refusals).
+
+Not changed: the default graph on DirectML (still wrong), the agents' choice (zero-farm), the static graph.
 
 ## 47. The run loop at its edges: the Fable review's fixes (2026-11-12)
 

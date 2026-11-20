@@ -139,25 +139,40 @@ def alternate_ids(v):
     return [x for x in items if x]
 
 
-VARIANT_FORMS = ('fp16',)                  # (a variant's form: 'fp16' = onnx_export.to_float16 of the gen's graph)
+# a variant's form: 'fp16' = onnx_export.to_float16 of the gen's graph; 'matmul-fp16' = the gen's checkpoint exported as
+# graph 'fast-matmul' (onnx_export.GRAPHS: the fast graph with its attention as MatMuls - the one zero-onnx/2 graph
+# DirectML runs, docs/az.md 46.10), then to_float16 (zero-farm PROTOCOL rev 22: AMD GPUs through DirectML)
+VARIANT_FORMS = ('fp16', 'matmul-fp16')
 
 
 def variant_setting(v):
-    """The run setting `pool_variants` (docs/az.md 67; zero-farm PROTOCOL rev 20, 14) -> [(name, form)]: '' / None ->
-    []; 'name=form[,name=form...]' - each name `farm_def.VARIANT_RE`, distinct, at most `MAX_VARIANTS`; each form one
-    of VARIANT_FORMS. ValueError otherwise."""
+    """The run setting `pool_variants` (docs/az.md 67, 46.10; zero-farm PROTOCOL rev 20, 14) -> [(name, form, vendor)]:
+    '' / None -> []; 'name=form[@vendor][,...]' - each name `farm_def.VARIANT_RE`, distinct, at most `MAX_VARIANTS`; each
+    form one of VARIANT_FORMS; `vendor` (optional, a profile vendor name `farm_def.VENDORS`) - the variant goes to the run's
+    GPU alternates of that vendor; a variant without one to every other GPU alternate (the first such variant), None in
+    the triple. At most one variant per vendor. ValueError otherwise."""
     if v is None or (isinstance(v, str) and not v.strip()):
         return []
     out = []
     for item in str(v).replace(' ', '').split(','):
-        name, _, form = item.partition('=')
-        if not FD.VARIANT_RE.match(name) or form not in VARIANT_FORMS:
-            raise ValueError(f'variant {item!r}: name=form, the name [a-z0-9][a-z0-9-]{{0,31}}, the form one of '
-                             f'{VARIANT_FORMS}')
-        out.append((name, form))
-    if len({n for n, _ in out}) != len(out) or len(out) > FD.MAX_VARIANTS:
+        name, _, rest = item.partition('=')
+        form, _, vendor = rest.partition('@')
+        if not FD.VARIANT_RE.match(name) or form not in VARIANT_FORMS or ('@' in rest and vendor not in FD.VENDORS):
+            raise ValueError(f'variant {item!r}: name=form[@vendor], the name [a-z0-9][a-z0-9-]{{0,31}}, the form one of '
+                             f'{VARIANT_FORMS}, the vendor one of {FD.VENDORS}')
+        out.append((name, form, vendor or None))
+    if len({n for n, _, _ in out}) != len(out) or len(out) > FD.MAX_VARIANTS:
         raise ValueError(f'variants {v!r}: distinct names, at most {FD.MAX_VARIANTS}')
+    vendors = [x for _, _, x in out if x]
+    if len(set(vendors)) != len(vendors):
+        raise ValueError(f'variants {v!r}: at most one variant per vendor')
     return out
+
+
+def variant_of(variants, vendor):
+    """The variant name a GPU alternate of `vendor` plays (`variant_setting`'s list): the one for its vendor, else the
+    first without a vendor, else None (the gen's default model)."""
+    return next((n for n, _, x in variants if x == vendor), None) or next((n for n, _, x in variants if x is None), None)
 
 
 def version_tuple(v):
@@ -385,9 +400,9 @@ class Pool:
             raise SystemExit(f'selfplay_remote {name!r}: pool_alt_vendor {self.alt_vendor!r}: one of {FD.VENDORS}')
         self.alternates = None                    # (PUT form, from run_alternates on the first publish)
         self.builds = None
-        # model variants per gen (docs/az.md 67; zero-farm PROTOCOL rev 20, 14): each gen's graph again in each form,
-        # signed and registered beside the default; the first one named by the run's GPU alternates (`model`). A run
-        # with variants needs agents that read them: its min_agent at least farm_def.VARIANT_AGENT
+        # model variants per gen (docs/az.md 67, 46.10; zero-farm PROTOCOL rev 20, 14): each gen's graph again in each
+        # form, signed and registered beside the default; the run's GPU alternates name theirs (`model`, variant_of: by
+        # vendor). A run with variants needs agents that read them: its min_agent at least farm_def.VARIANT_AGENT
         try:
             self.variants = variant_setting(setting('pool_variants'))
         except ValueError as e:
@@ -572,11 +587,20 @@ class Pool:
                              os.path.join(self.dir, 'export'), f'{self.farm}/{gen}', checkpoint_iter=gen,
                              graph=self.export_graph)
 
-    def _make_variant(self, form, src, dst):
-        """Gen graph `src` in variant form `form` (VARIANT_FORMS) written to `dst`."""
+    def _make_variant(self, form, src, dst, ckpt=None, gen=None):
+        """Gen `gen`'s variant in form `form` (VARIANT_FORMS) written to `dst`: from its graph `src` ('fp16'), or from
+        its checkpoint `ckpt` exported again as another graph ('matmul-fp16': export_cached's graph 'fast-matmul' under
+        <dst's dir>/v-<form>/, its own weight-swap template and check against the reference set, then float16)."""
         from .onnx_export import to_float16
         if form == 'fp16':
             to_float16(src, dst)
+        elif form == 'matmul-fp16':
+            from . import games as G
+            from .farm_h2h import export_cached
+            ex = export_cached(ckpt, gen, os.path.join(os.path.dirname(dst), f'v-{form}'), self.R.cfg['game'],
+                               G.spec_json(self.R.cfg['spec']), os.path.join(self.dir, 'export'), f'{self.farm}/{gen}',
+                               checkpoint_iter=gen, graph='fast-matmul')
+            to_float16(ex['model'], dst)
         else:
             raise ValueError(f'variant form {form!r}')
 
@@ -675,13 +699,17 @@ class Pool:
             for p in sorted({x['when'].get('platform') for x in alternates} - {None}):
                 platform_check(self.worker, self.R.cfg, os.path.join(self.dir, 'template'), p, self.log)
             if self.variants:
-                # (rev 20, 14.3: the GPU alternates name the first variant; every other machine plays the default)
+                # (rev 20, 14.3: each GPU alternate names its variant - its vendor's, else the first without a vendor
+                # (variant_of); every other machine plays the default)
                 gpu = [x for x in alternates if 'vendor' in x['when']]
                 for x in gpu:
-                    x['model'] = self.variants[0][0]
-                if not gpu:
-                    self.log(f'pool_variants {self.variants[0][0]}: no GPU alternate names it (each gen exported '
-                             f'and registered with it, played by no machine)')
+                    n = variant_of(self.variants, x['when']['vendor'])
+                    if n:
+                        x['model'] = n
+                for n, _, _ in self.variants:
+                    if not any(x.get('model') == n for x in gpu):
+                        self.log(f'pool_variants {n}: no GPU alternate names it (each gen exported and registered '
+                                 f'with it, played by no machine)')
             self.alternates, self.builds = alternates, builds
         if self.rolling is not None and not self.rolling_checked:
             self._check_rolling()
@@ -713,10 +741,11 @@ class Pool:
         if self.variants and not g.get('variants'):
             # (rev 20: the gen's variants beside its graph, model-<name>.onnx; the reference serves them all)
             t0 = time.time()
+            ckpt_of_gen = model_path(self.R.run, gen)
             vs = {}
-            for vname, form in self.variants:
+            for vname, form, _ in self.variants:
                 vp = os.path.join(os.path.dirname(g['model']), f'model-{vname}.onnx')
-                self.variant_maker(form, g['model'], vp)
+                self.variant_maker(form, g['model'], vp, ckpt=ckpt_of_gen, gen=gen)
                 vs[vname] = {'model': vp, 'sha256': FD.file_sha256(vp), 'model_size': os.path.getsize(vp)}
             g['variants'] = vs
             self._save()
