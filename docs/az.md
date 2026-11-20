@@ -9128,8 +9128,14 @@ template of its own), not the GPU variant.
 
 **Float16 copies** (`to_float16(src, dst)`): a graph's float32 arithmetic in float16, its inputs and outputs float32
 (onnxruntime.transformers' `convert_float_to_float16`, keep_io_types; ConstantOfShape kept float32 - the converter
-leaves its value attribute float32 under a float16 output -, the nodes re-sorted: the converter appends its input casts
-after their readers), metadata `precision` 'fp16', the same bytes from the same graph. Measured (the fast graph of gen
+leaves its value attribute float32 under a float16 output -, the nodes re-sorted depth first: the converter appends its
+input casts after their readers, and each moves to just before its first reader, nothing else moving), metadata
+`precision` 'fp16', the same bytes from the same graph. The order matters on the CUDA pack: ONNX Runtime 1.24.4 plans
+its buffer reuse from it, and an earlier sort by passes (every ready node, then again) reordered the whole graph into a
+plan that broke on the self-test's six batch sizes ("Shape mismatch attempting to re-use buffer"; the same graph ran
+with memory reuse off - which the C API the worker uses cannot set). With the depth-first order: the worker's CUDA
+self-test passes (the desktop's RTX 5090: max abs 1.6e-2, deterministic) and a 1,024-row call takes 46.5 ms against
+the float32 graph's ~85 ms on the same busy GPU. Measured (the fast graph of gen
 769, the reference set's 256 rows, the CUDA pack) against torch's float32 answers: priors 4.2e-3, value 8.5e-3, margin
 1.0e-2 at most, 3e-4 to 6e-4 on average (float32: 2.8e-6 / 3.7e-6 / 5.1e-6); a 1,024-row call 35.2 ms (float32 41.7):
 still host-bound with one worker.

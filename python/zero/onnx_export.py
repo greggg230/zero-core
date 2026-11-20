@@ -2544,21 +2544,42 @@ FP16_KEEP = ('ConstantOfShape',)  # (`to_float16`: kept float32 - the converter 
 
 
 def _toposort(graph):
-    """The graph's nodes reordered so that each comes after the producers of its inputs (stable: otherwise in their
-    order). In place; ValueError on a cycle or an input nothing produces."""
+    """The graph's nodes reordered so that each comes after the producers of its inputs, otherwise in their order: each
+    node in turn, the producers it still waits for placed just before it (depth first) - a node out of place (the
+    float16 converter's input casts, appended after their readers) moves to before its first reader and nothing else
+    moves. The order matters on the CUDA pack: ONNX Runtime 1.24.4 plans its buffer reuse from it, and a sort by passes
+    (every ready node, then again) reordered the whole graph into a plan that broke on the self-test's batches ("Shape
+    mismatch attempting to re-use buffer" - measured, docs/az.md 67). In place; ValueError for an input nothing produces
+    or a cycle."""
     have = {i.name for i in graph.input} | {i.name for i in graph.initializer} | {''}
-    nodes, out = list(graph.node), []
-    while nodes:
-        rest = []
-        for n in nodes:
-            if all(x in have for x in n.input):
-                out.append(n)
-                have.update(n.output)
+    prod = {o: n for n in graph.node for o in n.output}
+    state, out = {}, []                      # id(node) -> 1 visiting, 2 placed
+
+    def visit(n):
+        stack = [(n, iter(n.input))]
+        state[id(n)] = 1
+        while stack:
+            node, it = stack[-1]
+            for x in it:
+                if x in have:
+                    continue
+                p = prod.get(x)
+                if p is None:
+                    raise ValueError(f'graph: node {node.name} reads {x!r}, which nothing produces')
+                if state.get(id(p)) == 1:
+                    raise ValueError(f'graph: a cycle through {p.name}')
+                if not state.get(id(p)):
+                    state[id(p)] = 1
+                    stack.append((p, iter(p.input)))
+                    break
             else:
-                rest.append(n)
-        if len(rest) == len(nodes):
-            raise ValueError(f'graph: {len(rest)} node(s) whose inputs nothing produces (first {rest[0].name})')
-        nodes = rest
+                stack.pop()
+                state[id(node)] = 2
+                out.append(node)
+                have.update(node.output)
+    for n in list(graph.node):
+        if not state.get(id(n)):
+            visit(n)
     del graph.node[:]
     graph.node.extend(out)
 
