@@ -6,7 +6,8 @@ A definition (`definition/1`, the bytes of `definition.json`, signed as `definit
 
   {"definition": 1, "kind": "run" | "campaign", "id": <slug>, "version": n, "created": t, "expires": t | null,
    "game": "mtg", "builds": [<worker build_id>, ...], "runtime": <runtime build_id> | null,
-   "checkpoints": {"<gen>": {"model_sha256", "model_size", "reference_sha256", "reference_size"}},
+   "checkpoints": {"<gen>": {"model_sha256", "model_size", "reference_sha256", "reference_size",
+                             "variants"?: {"<name>": {"model_sha256", "model_size"}}}},
    "jobs": {"selfplay": {"settings"} | null, "eval": {"settings", "seats", "paired", ...} | null,
             "fuzz": {"mode", "env"} | null}}
 
@@ -56,6 +57,11 @@ JOB_KINDS = ('selfplay', 'eval', 'fuzz')
 MULTIPART = 90 << 20                    # bigger artifacts go up in parts (a Worker request's limit ~100 MB)
 PART = 32 << 20
 MAX_ALTERNATES = 4                      # a run's alternates (PROTOCOL rev 11, 9.4)
+# model variants per generation (zero-farm PROTOCOL rev 20, 14; docs/az.md 67): a name, at most MAX_VARIANTS a gen, and
+# the first agent that reads a definition signing any (a run that registers one sets its min_agent to at least this)
+VARIANT_RE = re.compile(r'^[a-z0-9][a-z0-9-]{0,31}$')
+MAX_VARIANTS = 8
+VARIANT_AGENT = '0.3.5'
 FEATURE_ROLLING = 'rolling'               # a worker build that plays rolling self-play jobs (`info` features, PROTOCOL rev 15, 10.5)
 # a version as the coordinator checks one (zero-farm coordinator util.ts): a run's `min_agent` (PROTOCOL rev 9)
 SEMVER_RE = re.compile(r'^\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.-]{1,64})?$')
@@ -334,9 +340,20 @@ def validate(doc):
     for g, c in cks.items():
         if not GEN_RE.match(g) or not isinstance(c, dict):
             raise ValueError(f'checkpoints[{g!r}]')
-        if set(c) != {'model_sha256', 'model_size', 'reference_sha256', 'reference_size'}:
-            raise ValueError(f'checkpoints[{g}]: model_sha256, model_size, reference_sha256, reference_size')
+        if set(c) - {'variants'} != {'model_sha256', 'model_size', 'reference_sha256', 'reference_size'}:
+            raise ValueError(f'checkpoints[{g}]: model_sha256, model_size, reference_sha256, reference_size (and variants)')
         size_ok = lambda n: not isinstance(n, bool) and isinstance(n, int) and 0 < n <= MAX_CHECKPOINT_FILE_BYTES
+        if 'variants' in c:
+            # (zero-farm PROTOCOL rev 20, 14.1: 1 to 8 named variants, each exactly its model's sha256 and size; the
+            # gen's reference serves them; no empty object - the key is left out for a gen without variants)
+            v = c['variants']
+            if not isinstance(v, dict) or not 1 <= len(v) <= MAX_VARIANTS:
+                raise ValueError(f'checkpoints[{g}]: variants an object of 1 to {MAX_VARIANTS} (left out when none)')
+            for n, x in v.items():
+                if not VARIANT_RE.match(n):
+                    raise ValueError(f'checkpoints[{g}]: variant name {n!r} ([a-z0-9][a-z0-9-]{{0,31}})')
+                if not isinstance(x, dict) or set(x) != {'model_sha256', 'model_size'}                         or not SHA_RE.match(str(x['model_sha256'])) or not size_ok(x['model_size']):
+                    raise ValueError(f'checkpoints[{g}]: variant {n}: exactly model_sha256 and model_size (1 B to 1 GiB)')
         if not SHA_RE.match(str(c['model_sha256'])) or not size_ok(c['model_size']):
             raise ValueError(f'checkpoints[{g}]: the model\'s sha256 and size (1 B to 1 GiB)')
         if (c['reference_sha256'] is None) != (c['reference_size'] is None):

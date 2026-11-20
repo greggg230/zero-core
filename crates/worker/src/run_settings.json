@@ -605,6 +605,10 @@
    "class": "trainer",
    "why": "orchestration (the graph the farm pool exports each generation as, docs/az.md 63)"
   },
+  "pool_variants": {
+   "class": "trainer",
+   "why": "orchestration (the model variants the farm pool exports and registers per generation, docs/az.md 67)"
+  },
   "selfplay_local": {
    "class": "trainer",
    "why": "orchestration"

@@ -151,6 +151,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
 | `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface (plus the optional input `t_align`, 66), metadata (plus `fast`, `attention`, `t_align`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
+| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form,...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming the first (`model`), so CUDA PCs play it and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: this machine's driver when its inference is CUDA / MPS, and every remote worker on any device (56.1) - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -9103,3 +9104,57 @@ fast graph's CumSum over [., 512] at least three times, the default graph's neve
 initializer, the answers fed 1, 2, 5, 16 or 64 within 2e-6 of not fed); `test_fast_graph_interface_and_structure`
 (the one more input and metadata key); the fast and zero-onnx/2 suites (47 passed with test_onnx.py and
 test_worker_settings.py); zero_worker `t_align_is_fed_to_a_gpu_graph_that_names_it`.
+
+## 67. GPU graphs: the static zero-onnx/2 graph, float16 copies, the worker's float16 self-test (no setting yet; zero-farm's GPU PCs, 2026-11-19)
+
+**Why.** After 66 a farm GPU PC's single worker is bound by ONNX Runtime's host side (the fast graph's ~1,400 nodes
+launched one by one, 17 device -> host syncs for its data-dependent shapes): a 1,024-row call 41.8 ms of wall time, 23.2
+ms of GPU time. The user's decisions of 2026-11-19: a GPU-only graph per generation (zero-farm PROTOCOL rev 20's
+checkpoint variants, the agent's side) and reduced precision on GPU sessions with a looser self-test.
+
+**The static graph** (`ZeroOnnx2Static`; `export(..., fast='static')`, graph 'static'): the default graph's arithmetic -
+the rows densified, every head slot embedded, its tails, gates, overrides and refusals - with no data-dependent shape: an
+input `t_cap` [T] whose length is the padded rows' token axis (the feeder's choice, at least each row's head and tail
+tokens), the padded rows built by one scatter of unique places, the blocks on [B T], the pooling masked; the static
+policy and the overrides `ZeroOnnx2`'s on the head positions in full (the same writes in the same order). A row whose
+tokens pass T is refused (`refused` + 1). Metadata `static` 1, `presence` (`TokenNet.present_index`: a feeder counts a
+row's head tokens from it), `t_align`; `onnx_parity` feeds `t_cap` from them (rounded up to `t_align`), as the worker
+does (`session::StaticTokens`; its places B (T + n_tok + 1) + NT + 1 checked below 2^31). Parity with torch within 2e-5
+(4e-7 on the toy's layouts and the rich one). *Measured on a farm PC's NVIDIA GPU (gen 769 of a live run's network, the
+CUDA pack, the fused attention): slower than the fast graph* - 512 rows 29.9 ms wall / 24.3 ms GPU (fast: 24.7 / 12.1),
+1,024 rows 65.0 / 58.4 (fast: 41.8 / 23.2): every row padded to the batch's longest (~15 tokens a row on average, padded
+to 64) multiplies the blocks' work, and the dense input stage adds more; 1,986 nodes. Kept (tests, a weight-swap
+template of its own), not the GPU variant.
+
+**Float16 copies** (`to_float16(src, dst)`): a graph's float32 arithmetic in float16, its inputs and outputs float32
+(onnxruntime.transformers' `convert_float_to_float16`, keep_io_types; ConstantOfShape kept float32 - the converter
+leaves its value attribute float32 under a float16 output -, the nodes re-sorted: the converter appends its input casts
+after their readers), metadata `precision` 'fp16', the same bytes from the same graph. Measured (the fast graph of gen
+769, the reference set's 256 rows, the CUDA pack) against torch's float32 answers: priors 4.2e-3, value 8.5e-3, margin
+1.0e-2 at most, 3e-4 to 6e-4 on average (float32: 2.8e-6 / 3.7e-6 / 5.1e-6); a 1,024-row call 35.2 ms (float32 41.7):
+still host-bound with one worker.
+
+**The worker's float16 self-test** (`selftest::tol_for`): a graph with `precision` 'fp16' passes at max 5e-2
+(`TOL_FP16`) and mean 3e-3 per item (`MEAN_TOL_FP16`); every other graph at 2e-5 as before; any other precision refused.
+The session must still answer bit for bit the same twice (a provider's races - the AMD probe's failure mode - show there
+whatever the tolerance).
+
+**Tests.** `tests/test_onnx_static.py` (8: parity on the toy layouts and the rich one with both attentions, identity
+actions with dup_reduce None and 'max', the structure - no NonZero, LayerNormalization kept, `t_cap` required -, the
+same answers for any long enough T, a short T's refusals, its weight-swap template); `test_onnx_fast.py::
+test_fast_graph_float16` (interface, metadata, deterministic bytes, the float16 tolerances against the float32 graph on
+the CPU, refusals equal).
+
+**The run setting `pool_variants`** ('' by default: no variant, every request the pool sends as before; zero-farm
+PROTOCOL rev 20, 14.5): 'name=form,...' (`farm_pool.variant_setting`; names `farm_def.VARIANT_RE`, at most 8; forms
+'fp16'). Per gen, after its export: each variant made beside the graph (`model-<name>.onnx`), uploaded under
+`ckpt/<run>/<gen>/model-<name>.onnx`, signed in the next definition (`checkpoints[gen].variants`: sha256 and size,
+`farm_def.validate` checks them as 14.1 says) and registered with the gen (`PUT .../checkpoint/<gen>` `variants`). The
+run's GPU alternates (a `when.vendor`) name the first variant (`"model"`): those machines get it, every other machine the
+gen's default graph. The run's `min_agent` is raised to `farm_def.VARIANT_AGENT` (0.3.5; a larger one kept) and put
+with the run (a resumed run's in its next PUT: the coordinator counts a definition that signs a variant as 0.3.5 anyway,
+14.1): **agents before 0.3.5 get none of the run's leases**, so the stable channel needs 0.3.5 before a live run turns it
+on. The worker takes either graph at each checkpoint op (a new session per network, its metadata read again: precision,
+`t_align`) and `probe-providers --model` self-tests a variant at its own tolerance. Tests: test_farm_pool.py::
+test_pool_variants_are_exported_uploaded_signed_registered_and_named (the files, keys, the order of upload / definition /
+registration, the alternate's `model`, min_agent, bad settings).

@@ -350,7 +350,7 @@ DEFAULTS = dict(
     pool_build='', pool_runtime='', pool_worker='', pool_url='', pool_max_stale=1, pool_quota=0, pool_slack=0.1,
     pool_games_per_lease='auto', pool_priority=1.0, pool_needs_ram_mb=0, pool_poll_s=10.0, pool_key='',
     pool_farm_release='', pool_expires_days=30, pool_min_agent='0.2.8', pool_alternates='', pool_alt_vendor='',
-    pool_gpu_games_per_lease='', pool_rolling='auto', pool_export='',
+    pool_gpu_games_per_lease='', pool_rolling='auto', pool_export='', pool_variants='',
     # with selfplay_local 0, the pool counts as a remote taking work while a valid game arrived within this many
     # seconds (this machine then only trains; when the farm goes quiet it plays again: the run never stalls)
     pool_live_s=900.0,

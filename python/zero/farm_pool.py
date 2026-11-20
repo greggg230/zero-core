@@ -139,6 +139,32 @@ def alternate_ids(v):
     return [x for x in items if x]
 
 
+VARIANT_FORMS = ('fp16',)                  # (a variant's form: 'fp16' = onnx_export.to_float16 of the gen's graph)
+
+
+def variant_setting(v):
+    """The run setting `pool_variants` (docs/az.md 67; zero-farm PROTOCOL rev 20, 14) -> [(name, form)]: '' / None ->
+    []; 'name=form[,name=form...]' - each name `farm_def.VARIANT_RE`, distinct, at most `MAX_VARIANTS`; each form one
+    of VARIANT_FORMS. ValueError otherwise."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return []
+    out = []
+    for item in str(v).replace(' ', '').split(','):
+        name, _, form = item.partition('=')
+        if not FD.VARIANT_RE.match(name) or form not in VARIANT_FORMS:
+            raise ValueError(f'variant {item!r}: name=form, the name [a-z0-9][a-z0-9-]{{0,31}}, the form one of '
+                             f'{VARIANT_FORMS}')
+        out.append((name, form))
+    if len({n for n, _ in out}) != len(out) or len(out) > FD.MAX_VARIANTS:
+        raise ValueError(f'variants {v!r}: distinct names, at most {FD.MAX_VARIANTS}')
+    return out
+
+
+def version_tuple(v):
+    """'0.3.5' -> (0, 3, 5) (a pre-release's suffix ignored); None -> ()."""
+    return tuple(int(x) for x in v.split('-')[0].split('.')) if v else ()
+
+
 ROLLING_KEYS = ('inflight', 'gpu_inflight', 'block', 'max_s', 'flush_s')
 _ROLLING_LIMITS = {'inflight': (1, 4096), 'gpu_inflight': (1, 4096), 'block': (1, 1 << 32), 'max_s': (600, 86400),
                    'flush_s': (10, 3600)}
@@ -359,6 +385,16 @@ class Pool:
             raise SystemExit(f'selfplay_remote {name!r}: pool_alt_vendor {self.alt_vendor!r}: one of {FD.VENDORS}')
         self.alternates = None                    # (PUT form, from run_alternates on the first publish)
         self.builds = None
+        # model variants per gen (docs/az.md 67; zero-farm PROTOCOL rev 20, 14): each gen's graph again in each form,
+        # signed and registered beside the default; the first one named by the run's GPU alternates (`model`). A run
+        # with variants needs agents that read them: its min_agent at least farm_def.VARIANT_AGENT
+        try:
+            self.variants = variant_setting(setting('pool_variants'))
+        except ValueError as e:
+            raise SystemExit(f'selfplay_remote {name!r}: pool_variants: {e}') from None
+        if self.variants and version_tuple(self.min_agent) < version_tuple(FD.VARIANT_AGENT):
+            self.min_agent = FD.VARIANT_AGENT
+        self.variant_maker = self._make_variant
         try:                                      # GPU leases' games (PROTOCOL rev 11, 9.4; None: the key left out)
             self.gpu_per_lease = FD.gpu_games_per_lease(setting('pool_gpu_games_per_lease'))
         except ValueError as e:
@@ -536,6 +572,14 @@ class Pool:
                              os.path.join(self.dir, 'export'), f'{self.farm}/{gen}', checkpoint_iter=gen,
                              graph=self.export_graph)
 
+    def _make_variant(self, form, src, dst):
+        """Gen graph `src` in variant form `form` (VARIANT_FORMS) written to `dst`."""
+        from .onnx_export import to_float16
+        if form == 'fp16':
+            to_float16(src, dst)
+        else:
+            raise ValueError(f'variant form {form!r}')
+
     def _define(self, client, info):
         return FD.publish(client, info, key=self.key, farm_release=self.farm_release, log=self.log)
 
@@ -559,6 +603,8 @@ class Pool:
         """The rev 11 fields this pool's PUTs carry beyond the body of before ({} with the defaults): a state's
         `put_extras` is what the last self-play PUT sent (absent: none of them)."""
         out = {}
+        if self.variants:
+            out['min_agent'] = self.min_agent       # (rev 20: at least VARIANT_AGENT, put again on a resumed run)
         if self.alternates:
             out['alternates'] = self.alternates
         if self.gpu_per_lease is not None:
@@ -623,6 +669,14 @@ class Pool:
             alternates, builds = FD.run_alternates(self.client, self.build, self.runtime, self.alt_builds, self.alt_vendor)
             for p in sorted({x['when'].get('platform') for x in alternates} - {None}):
                 platform_check(self.worker, self.R.cfg, os.path.join(self.dir, 'template'), p, self.log)
+            if self.variants:
+                # (rev 20, 14.3: the GPU alternates name the first variant; every other machine plays the default)
+                gpu = [x for x in alternates if 'vendor' in x['when']]
+                for x in gpu:
+                    x['model'] = self.variants[0][0]
+                if not gpu:
+                    self.log(f'pool_variants {self.variants[0][0]}: no GPU alternate names it (each gen exported '
+                             f'and registered with it, played by no machine)')
             self.alternates, self.builds = alternates, builds
         if self.rolling is not None and not self.rolling_checked:
             self._check_rolling()
@@ -651,11 +705,29 @@ class Pool:
                 g['export_steps'] = ex['steps']
             self._save()
             self.log(f'gen {gen} exported ({g["export_s"]} s, {g["sha256"][:12]}){export_breakdown(ex)}')
+        if self.variants and not g.get('variants'):
+            # (rev 20: the gen's variants beside its graph, model-<name>.onnx; the reference serves them all)
+            t0 = time.time()
+            vs = {}
+            for vname, form in self.variants:
+                vp = os.path.join(os.path.dirname(g['model']), f'model-{vname}.onnx')
+                self.variant_maker(form, g['model'], vp)
+                vs[vname] = {'model': vp, 'sha256': FD.file_sha256(vp), 'model_size': os.path.getsize(vp)}
+            g['variants'] = vs
+            self._save()
+            self.log(f'gen {gen} variants {", ".join(f"{k} ({v["sha256"][:12]})" for k, v in vs.items())} '
+                     f'({round(time.time() - t0, 1)} s)')
         keys = {'model': f'ckpt/{self.farm}/{gen}/model.onnx', 'reference': f'ckpt/{self.farm}/{gen}/reference.npz'}
+        vkeys = {k: f'ckpt/{self.farm}/{gen}/model-{k}.onnx' for k in g.get('variants') or {}}
         if not g.get('uploaded'):
             self.client.put_artifact(keys['model'], g['model'], g['sha256'])
             self.client.put_artifact(keys['reference'], g['reference'], g['reference_sha256'])
             g['uploaded'] = True
+            self._save()
+        if vkeys and not g.get('variants_uploaded'):
+            for k, v in g['variants'].items():
+                self.client.put_artifact(vkeys[k], v['model'], v['sha256'])
+            g['variants_uploaded'] = True
             self._save()
         d = g.get('definition')
         if not d or not d.get('published'):
@@ -665,6 +737,11 @@ class Pool:
                 cks = {str(x): {'model_sha256': st['gens'][str(x)]['sha256'], 'model_size': st['gens'][str(x)]['model_size'],
                                 'reference_sha256': st['gens'][str(x)]['reference_sha256'],
                                 'reference_size': st['gens'][str(x)]['reference_size']} for x in keep}
+                for x in keep:                     # (rev 20, 14.1: each gen's variants as uploaded; none: no key)
+                    vs = st['gens'][str(x)].get('variants') if st['gens'][str(x)].get('variants_uploaded') else None
+                    if vs:
+                        cks[str(x)]['variants'] = {k: {'model_sha256': v['sha256'], 'model_size': v['model_size']}
+                                                   for k, v in vs.items()}
                 d = FD.prepare(self.client, 'run', self.farm, game=st['build_game'], builds=self.builds, runtime=self.runtime,
                                checkpoints=cks, jobs={'selfplay': {'settings': st['play']}, 'eval': None, 'fuzz': None},
                                expires_days=self.expires_days, root=os.path.join(self.dir, 'definitions'))
@@ -675,9 +752,11 @@ class Pool:
             st['definition'] = {k: d[k] for k in ('version', 'sha256', 'key')}
             self._save()
             self.log(f'definition version {d["version"]} signs gen {gen}')
-        self.client.call('PUT', f'/v1/admin/run/{self.farm}/checkpoint/{gen}',
-                         body={'model': keys['model'], 'sha256': g['sha256'], 'reference': keys['reference'],
-                               'reference_sha256': g['reference_sha256']})
+        body = {'model': keys['model'], 'sha256': g['sha256'], 'reference': keys['reference'],
+                'reference_sha256': g['reference_sha256']}
+        if vkeys:                                  # (rev 20, 14.2: none - the body of before)
+            body['variants'] = {k: {'model': vkeys[k], 'sha256': v['sha256']} for k, v in g['variants'].items()}
+        self.client.call('PUT', f'/v1/admin/run/{self.farm}/checkpoint/{gen}', body=body)
         g['registered'] = True
         st['current_gen'] = gen
         # (alternates or pool_gpu_games_per_lease changed on a resumed run: PUT again, now that a definition lists the

@@ -417,6 +417,61 @@ def test_pool_alternates_in_the_puts_definitions_and_records(pool):
     assert len(run_puts()) == n and published[-1]['builds'] == [build, alt]
 
 
+def test_pool_variants_are_exported_uploaded_signed_registered_and_named(pool, monkeypatch):
+    """pool_variants (docs/az.md 67; zero-farm PROTOCOL rev 20, 14): each gen's graph again in each form
+    (model-<name>.onnx beside it), uploaded under ckpt/<run>/<gen>/model-<name>.onnx before the definition that signs
+    it (checkpoints[gen].variants: its sha256 and size) and the checkpoint PUT that registers it (`variants`: its key
+    and sha256); the run's GPU alternate names the first variant (`model`), its min_agent raised to VARIANT_AGENT (a
+    larger one kept); bad settings refused; without the setting (the default) none of it."""
+    fake, R, published = pool
+    w = {'manifest': 1, 'kind': 'worker', 'version': 'toy-test', 'game': 'zero-toy', 'entry': 'w.exe', 'files': []}
+    (rt, rt_raw), (cuda, cuda_raw) = _manifests(
+        {'manifest': 1, 'kind': 'runtime', 'version': 'cpu-test', 'files': []},
+        {'manifest': 1, 'kind': 'runtime', 'version': 'cuda-test', 'min_agent': '0.2.10',
+         'gpu': {'vendor': 'nvidia', 'min_driver': '527.41', 'providers': ['cuda']}, 'files': []})
+    (build, build_raw), (alt, alt_raw) = _manifests(dict(w, requires_runtime=rt), dict(w, requires_runtime=cuda))
+    for bid, raw in ((rt, rt_raw), (cuda, cuda_raw), (build, build_raw), (alt, alt_raw)):
+        fake.objects[f'builds/{bid}/manifest.json'] = raw
+    made = []
+
+    def make(self, form, src, dst):
+        made.append((form, os.path.basename(src), os.path.basename(dst)))
+        with open(dst, 'wb') as f:
+            f.write(b'fp16 of ' + open(src, 'rb').read())
+    monkeypatch.setattr(FP.Pool, '_make_variant', make)
+    name = f'pool:{FARM}'
+    for v in ('gpu', 'gpu=fp32', 'GPU=fp16', 'gpu=fp16,gpu=fp16', ','.join(f'v{i}=fp16' for i in range(9))):
+        R.cfg['pool_variants'] = v
+        with pytest.raises(SystemExit, match='pool_variants'):
+            FP.Pool(QuotaRP(R), name)
+    assert FP.variant_setting(' gpu=fp16 , b=fp16') == [('gpu', 'fp16'), ('b', 'fp16')] and FP.variant_setting('') == []
+    R.cfg.update(pool_build=build, pool_runtime=rt, pool_alternates=alt, pool_variants='gpu=fp16')
+    p = FP.Pool(QuotaRP(R), name)
+    try:
+        assert p.min_agent == FD.VARIANT_AGENT
+        p.begin(1)
+        wait(lambda: 0 in fake.ckpts, 'gen 0 registered')
+    finally:
+        p.close()
+        p.th.join(10)
+    assert made == [('fp16', 'model.onnx', 'model-gpu.onnx')]
+    key = f'ckpt/{FARM}/0/model-gpu.onnx'
+    assert fake.objects[key] == b'fp16 of model of gen 0'
+    sha = hashlib.sha256(fake.objects[key]).hexdigest()
+    assert fake.ckpts[0]['variants'] == {'gpu': {'model': key, 'sha256': sha}}
+    doc = published[-1]
+    assert doc['checkpoints']['0']['variants'] == {'gpu': {'model_sha256': sha, 'model_size': len(fake.objects[key])}}
+    FD.validate(doc)
+    order = [pth for m, pth, _ in fake.calls if m == 'PUT']
+    assert order.index(f'/v1/admin/artifact/{key}') < order.index(f'/v1/admin/run/{FARM}/checkpoint/0')
+    puts = [json.loads(d) for m, pth, d in fake.raw if m == 'PUT' and pth == f'/v1/admin/run/{FARM}']
+    assert all(b['min_agent'] == FD.VARIANT_AGENT for b in puts)
+    assert puts[-1]['alternates'] == [{'build_id': alt, 'runtime': cuda, 'when': {'vendor': 'nvidia'}, 'model': 'gpu'}]
+    # a larger min_agent stays
+    R.cfg['pool_min_agent'] = '0.4.0'
+    assert FP.Pool(QuotaRP(R), name).min_agent == '0.4.0'
+
+
 def test_play_settings_of_a_worker_older_than_trainer_settings(tmp_path, monkeypatch):
     """A worker build older than the pool's own settings (pool_alternates, pool_alt_vendor, pool_gpu_games_per_lease)
     calls them "unknown" in check-config: this zero-core's run_settings.json classifies them trainer-only, so each is
