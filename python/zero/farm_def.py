@@ -74,6 +74,18 @@ PLATFORMS = ('windows-x64', 'macos-arm64')
 PLATFORM_DEFAULT = 'windows-x64'
 
 
+def host_platform():
+    """This machine's platform in PLATFORMS' names (a build of another platform cannot run here); None for any other
+    machine (a Linux box: no farm build runs on it)."""
+    import platform
+    m = platform.machine().lower()
+    if sys.platform == 'win32' and m in ('amd64', 'x86_64'):
+        return 'windows-x64'
+    if sys.platform == 'darwin' and m == 'arm64':
+        return 'macos-arm64'
+    return None
+
+
 # ---------------------------------------------------------------- paths and secrets
 
 def config_dir():

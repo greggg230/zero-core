@@ -11,6 +11,7 @@ import json
 import os
 import threading
 import time
+import types
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
@@ -752,6 +753,39 @@ def test_pool_rolling_checks_the_worker_and_puts_rolling(pool, monkeypatch):
     assert f"alternate {other}'s executable is not the default build's" in lines
     assert f"alternate {alt}'s executable" not in lines, "the default build's executable: covered"
     assert 'the worker build plays rolling jobs' in lines
+
+
+def test_rolling_check_never_runs_another_platforms_executable(tmp_path, monkeypatch):
+    """A farm release with --mac-publish keeps the macOS build's executable in the builds directory: the rolling check
+    must not run it (Windows: WinError 193 every poll, no gen ever registered - seen 2026-11-20 on a live run), only log
+    it unchecked; a build of this platform found here is still run and checked."""
+    host = FD.host_platform() or 'windows-x64'
+    other = next(p for p in FD.PLATFORMS if p != host)
+    monkeypatch.setattr(FD, 'host_platform', lambda: host)
+    base, mac, win = 'a' * 24, 'c' * 24, 'd' * 24
+    for b, body in ((base, b'default'), (mac, b'\xcf\xfa\xed\xfe not this platform'), (win, b'win alternate')):
+        os.makedirs(tmp_path / b)
+        (tmp_path / b / 'w.exe').write_bytes(body)
+    sha = {b: FD.file_sha256(str(tmp_path / b / 'w.exe')) for b in (base, mac, win)}
+    mans = {base: {'entry': 'w.exe', 'files': [{'path': 'w.exe', 'sha256': sha[base]}]},
+            mac: {'entry': 'w.exe', 'platform': other, 'files': [{'path': 'w.exe', 'sha256': sha[mac]}]},
+            win: {'entry': 'w.exe', 'platform': host, 'files': [{'path': 'w.exe', 'sha256': sha[win]}]}}
+    monkeypatch.setattr(FD, 'build_manifest', lambda client, b: mans[b])
+    ran = []
+
+    def features(exe):
+        ran.append(os.path.basename(os.path.dirname(exe)))
+        if ran[-1] == mac:
+            raise OSError(193, '%1 is not a valid Win32 application')
+        return [FD.FEATURE_ROLLING], ran[-1]
+    monkeypatch.setattr(FP, 'worker_features', features)
+    lines = []
+    p = types.SimpleNamespace(worker=str(tmp_path / base / 'w.exe'), build=base, alt_builds=[mac, win], client=None,
+                              rolling={'inflight': 'auto'}, log=lines.append)
+    FP.Pool._check_rolling(p)
+    assert ran == [base, win], 'the default and this platform\'s alternate run, never the other platform\'s'
+    assert any(f'alternate {mac} is a {other} build, which this machine cannot run' in x for x in lines)
+    assert any('the worker build plays rolling jobs' in x for x in lines)
 
 
 @pytest.mark.parametrize('setting', ['default', ''])

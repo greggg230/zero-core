@@ -7909,9 +7909,13 @@ chunks. The batch stays full, a new generation costs no restart, and staleness i
   anything else refuses the pool at start).
 * On the first publish of a pool process it checks that the worker build plays rolling jobs: `pool_worker`'s `info`
   must name `pool_build` and list `rolling`; an alternate (45.2) whose signed manifest names the default's executable
-  (the same sha256) is that executable; another one is checked when its executable is in `pool_worker`'s builds
-  directory (`<builds>/<build id>/<entry>`), else logged as unchecked (a worker without the feature plays a rolling
-  lease as a classic one: PROTOCOL 10.5). A refusal is the pool's error, logged and retried every poll; nothing is PUT,
+  (the same sha256) is that executable; another one is checked when it is a build of this machine's platform
+  (`farm_def.host_platform`; its manifest's `platform`, absent: windows-x64) and its executable is in `pool_worker`'s
+  builds directory (`<builds>/<build id>/<entry>`), else logged as unchecked (a worker without the feature plays a
+  rolling lease as a classic one: PROTOCOL 10.5). *Fix of 2026-11-20:* the platform test is new - a farm release with
+  `--mac-publish` keeps the macOS build's executable in the builds directory, and the check ran it (on Windows
+  "WinError 193 ... not a valid Win32 application" every poll: MTG Zero's legacy-meta3-r1 registered no gen, so got
+  no farm self-play, after its relaunches on releases with a macOS build, until the file was renamed). A refusal is the pool's error, logged and retried every poll; nothing is PUT,
   exported or published meanwhile.
 * Every self-play PUT of the farm run carries `selfplay.rolling` (last key); a resumed run whose setting changed is PUT
   again once the next gen is registered (state `put_extras`, as the alternates).
@@ -7946,7 +7950,9 @@ come from several networks (each row's `net` is the one that searched it).
   `features`. The existing worker suites (job, job_tail, evaljob) unchanged and passing.
 * `tests/test_farm_pool.py`: `test_rolling_setting`; `test_pool_rolling_checks_the_worker_and_puts_rolling` (a worker
   without the feature refused with nothing PUT, then gen 0 registered with `rolling` in the PUT; alternates covered /
-  logged unchecked); `test_staleness_per_row_with_rolling` (off: games dropped whole as before; on: a game straddling the
+  logged unchecked); `test_rolling_check_never_runs_another_platforms_executable` (2026-11-20: another platform's
+  executable present is never run, this platform's alternate still checked; fails without the fix with the OSError);
+  `test_staleness_per_row_with_rolling` (off: games dropped whole as before; on: a game straddling the
   window keeps its newer rows - the pool's shard == those rows written directly - the histogram counts the kept rows);
   `test_keep_rows_is_take_rows_for_any_rows` (toy_tail: tails, overrides, sparse features). The PUT bodies with the
   setting off stay those of before (`test_pool_alternates_in_the_puts_definitions_and_records`).

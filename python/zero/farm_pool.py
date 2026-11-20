@@ -632,6 +632,11 @@ class Pool:
                 sha = _entry_sha(m)
                 if sha is not None and sha == base:
                     continue                       # (the same executable, signed for another pack)
+                plat = m.get('platform') or FD.PLATFORM_DEFAULT
+                if plat != FD.host_platform():     # (a farm release keeps a macOS build's executable here too)
+                    self.log(f"pool_rolling: alternate {b} is a {plat} build, which this machine cannot run: its rolling "
+                             f"support is unchecked (a worker without it plays its rolling leases as classic ones)")
+                    continue
                 exe = os.path.join(here, b, m.get('entry') or '')
                 if m.get('entry') and os.path.isfile(exe) and FD.file_sha256(exe) == sha:
                     feats, abid = worker_features(exe)
