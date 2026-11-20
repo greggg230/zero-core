@@ -9164,3 +9164,14 @@ on. The worker takes either graph at each checkpoint op (a new session per netwo
 `t_align`) and `probe-providers --model` self-tests a variant at its own tolerance. Tests: test_farm_pool.py::
 test_pool_variants_are_exported_uploaded_signed_registered_and_named (the files, keys, the order of upload / definition /
 registration, the alternate's `model`, min_agent, bad settings).
+
+**Measured on the farm** (2026-11-20 UTC; a canary farm run publishing gen 812 of MTG Zero's legacy-meta3-r1 through
+this commit's `farm_pool.Pool` with `pool_variants` 'gpu=fp16' and `pool_export` 'fast'; a farm PC with an NVIDIA GPU on
+agent 0.3.6 and this commit's CUDA worker): the coordinator listed the alternate's `model` 'gpu' and the checkpoint's
+variant with no problems; the PC leased the run on the CUDA alternate, downloaded `model-gpu.onnx` and self-tested it on
+CUDA (max abs 9.4e-3 over 256 rows, deterministic). The agent's layout - a crew of 3 workers x 575 games in flight -
+played 20.8k games/h over 15 minutes (the coordinator's accepted counts; ~4,240 leaves a game, from 66's measurement runs
+of the same network: ~24k leaves/s). On the same PC: the farm's CUDA worker before 66, one worker at 1,024 in flight,
+10.5k leaves/s; 66's float32 fast graph, one worker at 2,048 in flight, 16.1k; the trainer's own torch path ~32k (bf16
+and CUDA graphs), 20.0k in float32. The crew ran unmeasured by the agent's tuner (zero-farm's agent 0.3.6 doesn't yet
+measure a running crew in place), so the float16 graph's share of the gain is not separated from the layout's.
