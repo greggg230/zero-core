@@ -2688,8 +2688,8 @@ def check_farm_use(run, cfg, first, log, published=None):
     one: (1) pool_* settings that do nothing (`inert_pool_settings`) - a loud warning; (2) the run's reason to stay on
     this machine (`selfplay_local_reason`, else $ZERO_SELFPLAY_LOCAL_REASON) is logged and that is all; (3) without a
     reason, the game package's published farm build for this commit (`published(run, cfg)`, default
-    `GamePackage.published_farm_build`): none - nothing more; one - a loud warning on a resumed run, FarmUseRefused
-    (exit 78) at a first start (`first`: `first_start`)."""
+    `GamePackage.published_farm_build`; asked with a reason too, which its line then names): none - nothing more; one -
+    a loud warning on a resumed run, FarmUseRefused (exit 78) at a first start (`first`: `first_start`)."""
     if selfplay_pools(run, cfg):
         return
     inert = inert_pool_settings(cfg, run)
@@ -2703,13 +2703,14 @@ def check_farm_use(run, cfg, first, log, published=None):
     reason, src = str(cfg.get('selfplay_local_reason') or '').strip(), 'selfplay_local_reason'
     if not reason:
         reason, src = os.environ.get(LOCAL_REASON_ENV, '').strip(), f'${LOCAL_REASON_ENV}'
-    if reason:
-        log(f'self-play on this machine only ({src}): {reason}')
-        return
     if published is None:
         pub = package.active().published_farm_build(run, cfg, log)
     else:
         pub = published(run, cfg)
+    if reason:
+        log(f'self-play on this machine only ({src}): {reason}'
+            + (f' - beside a published farm build of this commit ({pub})' if pub else ''))
+        return
     if not pub:
         return
     msg = (f'a published farm build exists for this commit ({pub}), but self-play names no farm pool: every self-play '

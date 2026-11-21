@@ -96,9 +96,10 @@ def test_check_farm_use(tmp_path, monkeypatch):
     assert lines[-1].startswith('WARNING: a published farm build') and 'resumed run: not refused' in lines[-1]
     lines.clear()
     R.check_farm_use(run, dict(cfg, selfplay_local_reason='timing A/B'), True, lines.append, pub)
-    assert lines == ['self-play on this machine only (selfplay_local_reason): timing A/B']
+    assert lines == ['self-play on this machine only (selfplay_local_reason): timing A/B - beside a published farm build '
+                     'of this commit (build b0 of commit c0 (a test))']
     monkeypatch.setenv(R.LOCAL_REASON_ENV, 'a test harness')
-    R.check_farm_use(run, cfg, True, lines.append, pub)
+    R.check_farm_use(run, cfg, True, lines.append, lambda run, cfg: None)
     assert lines[-1] == f'self-play on this machine only (${R.LOCAL_REASON_ENV}): a test harness'
     monkeypatch.delenv(R.LOCAL_REASON_ENV)
     lines.clear()
