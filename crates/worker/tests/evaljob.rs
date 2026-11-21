@@ -273,3 +273,57 @@ fn traced_rows_are_the_rows_plus_their_records() {
     let e = run_eval_job(&TOY, &jbad, &ctl, &ev, Arc::new(Mutex::new(Progress::default())), &|_| {}).err().unwrap();
     assert!(e.contains("eval_trace"), "{e}");
 }
+
+/// Per-seat settings (docs/az.md 68): a network seat's `set` plays the job's settings with the set over it. A set that
+/// restates the job's settings plays the same games as no set (the rows then differ only in their seats, which echo the
+/// seat as given); a set that changes a seat's search changes its games; two seats of one network (gen 1 twice) each play
+/// their own settings; the seats keep their sides between a pair's games; a lease of such a match plays those games.
+#[test]
+fn seat_sets_play_their_own_settings() {
+    let seat = |v: Value| EvalSeat::parse(&v).unwrap();
+    let (a, b, c, d, e) = (tmp("set-none"), tmp("set-same"), tmp("set-sims"), tmp("set-tail"), tmp("set-gen1"));
+    let (oa, _) = run(&job(&a, 8, 0, nets()), |_, _, _, _| {});
+    // eval_sims 12 and eval_select 'cq' are the job's own: the same games
+    let same = vec![seat(json!({"net": 1, "set": {"eval_sims": 12, "eval_select": "cq"}})), EvalSeat::Net(2)];
+    let (ob, _) = run(&job(&b, 8, 0, same), |_, _, _, _| {});
+    let (ra, rb) = (rows(&oa).0, rows(&ob).0);
+    let set_text = r#"{"net":1,"set":{"eval_select":"cq","eval_sims":12}}"#;
+    for (g, line) in &rb {
+        assert!(line.contains(set_text), "game {g}: the seat as given (keys sorted): {line}");
+        assert_eq!(&line.replace(set_text, r#"{"net":1}"#), &ra[g], "game {g}: a set restating the job's settings, the same game");
+    }
+    // other simulations for side A (and the 'visits' rule for B, from the 'cq' rule of the job): other games
+    let other = vec![seat(json!({"net": 1, "set": {"eval_sims": 40}})), seat(json!({"net": 2, "set": {"eval_select": "visits", "cq_c_scale": 1.0}}))];
+    let (oc, _) = run(&job(&c, 8, 0, other.clone()), |_, _, _, _| {});
+    let rc = rows(&oc).0;
+    let strip = |s: &str| {
+        let v: Value = serde_json::from_str(s).unwrap();
+        (v["result"].clone(), v["rounds"].clone(), v["margin"].clone())
+    };
+    assert!(rc.iter().any(|(g, l)| strip(l) != strip(&ra[g])), "a set that changes a seat's search plays other games");
+    for (g, line) in &rc {
+        let v: Value = serde_json::from_str(line).unwrap();
+        let (s0, s1) = (json!({"net": 1, "set": {"eval_sims": 40}}), json!({"net": 2, "set": {"cq_c_scale": 1.0, "eval_select": "visits"}}));
+        assert_eq!(v["seats"], if g % 2 == 0 { json!([s0, s1]) } else { json!([s1, s0]) }, "game {g}");
+    }
+    // a lease of games 4..8 of that match: those games, byte for byte
+    let (od, _) = run(&job(&d, 4, 4, other), |_, _, _, _| {});
+    for (g, line) in &rows(&od).0 {
+        assert_eq!(&rc[g], line, "game {g}: a lease's row == the whole match's");
+    }
+    // one network on both seats, each with its own settings
+    let mut j = job(&e, 6, 0, vec![seat(json!({"net": 1, "set": {"eval_sims": 30}})), EvalSeat::Net(1)]);
+    j.models.remove(&2);
+    let (oe, _) = run(&j, |_, _, _, _| {});
+    let re = rows(&oe).0;
+    assert_eq!(re.len(), 6);
+    let v: Value = serde_json::from_str(&re[&1]).unwrap();
+    assert_eq!(v["seats"], json!([{"net": 1}, {"net": 1, "set": {"eval_sims": 30}}]));
+    // a set the seat's checks refuse is the job's refusal, before any game
+    let mut bad = job(&tmp("set-bad"), 4, 0, vec![seat(json!({"net": 1, "set": {"eval_select": "visits", "eval_select_min_visits": 2}})), EvalSeat::Net(2)]);
+    bad.out_dir = tmp("set-bad");
+    let ctl = Control::default();
+    let ev = Events::default();
+    let err = run_eval_job(&TOY, &bad, &ctl, &ev, Arc::new(Mutex::new(Progress::default())), &|_| {}).err().unwrap();
+    assert!(err.contains("seat 0") && err.contains("select_min_visits"), "{err}");
+}

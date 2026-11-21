@@ -8,6 +8,7 @@ the readout zero.h2h gives on this machine, played by the farm's native workers.
       [--key <data key>] [--farm-release <farm-release.exe>] [--expires-days 30] [--defs-dir DIR]
       [--alt <alternate worker build_id> ...] [--alt-vendor nvidia|amd|intel] [--min-agent 0.2.10]
       [--gpu-games-per-lease N|auto] [--gpu any|preferred|required]
+      [zero.h2h's per-side options: --a-sims N, --a-select cq, --a-infoset-merge 1, --b-belief-tilt 0, ...]
   python -m zero.farm_h2h --resume NAME        (re-attach: poll, download, print the readout)
   python -m zero.farm_h2h --cancel NAME        (pause the run: its leases are cancelled at their next beat)
   (python -m <pkg>.az.farm_h2h ...: the game package registered; or --package <pkg>.az [--root <checkout>])
@@ -17,7 +18,12 @@ What it does:
    models/), resolved as a run resolves them; `--sims` sets eval_sims; `eval_spec` resolved (the game
    package's eval spec of the run's spec, `Run.driver`'s rule: a worker cannot run the package's Python hook).
    Both seats play the run's evaluation seat (`Run.nn_seat(key, eval_sims)`), paired games: exactly the
-   games of `Run.play_match` / an Elo match at those settings (zero.farm_eval). The job keeps only the settings
+   games of `Run.play_match` / an Elo match at those settings (zero.farm_eval). zero.h2h's per-side options
+   (zero.seat_settings.add_side_args without its local-only ones: --a-sims / --b-sims, --select / --a-select ...,
+   --a-cq-c-*, --a-leaf-value-view, --a-belief-*, --a-infoset-merge, --a-root-search / --a-gumbel-*; docs/az.md 68)
+   give a side its own settings: the seat `{"net": gen, "set": {...}}` (zero.seat_settings.side_set over the job's
+   settings - the meaning zero.h2h gives them; a side without one plays the job's seat, `{"net": gen}`), played only by
+   a worker build that announces the feature `seat_settings`. The job keeps only the settings
    the worker build's own `check-config --eval --json` calls `play` (`play_settings`: zero-farm PROTOCOL.md 7 -
    a signed template carries no trainer-only key and nothing path-like); `--worker` is that build's executable. A
    worker build older than a setting calls it "unknown": when this zero-core's crates/worker/src/run_settings.json
@@ -49,8 +55,9 @@ What it does:
 4. It polls `GET /v1/admin/run/<run>/results`, downloads each eval file (first copy of a game id wins;
    `dup_ids` skipped), acks what it saved, and prints a progress line; at the end the readout: A's score +- its
    standard error (pair-aware: the se of the pair scores), the Elo difference with its 95% interval, the games,
-   the machines that played them, and the JSON line zero.h2h prints (`zero.h2h.summary`'s fields, plus run,
-   machines, elo_95), so results compare directly with a local zero.h2h.
+   the machines that played them, and the JSON line zero.h2h prints (`zero.h2h.summary`'s fields, `select_a` /
+   `select_b` - each seat's rule, e.g. '-ism' for a merged side -, plus run, machines, elo_95), so results compare
+   directly with a local zero.h2h.
 
 State: `~/.zero-farm/h2h/<run>/` (`--state-dir`): state.json (the run's body, the gens' files and hashes, the
 definition's version and file, the results cursor), ckpt/<gen>/ (the exported graphs and reference sets), results/
@@ -331,11 +338,15 @@ def load_state(d):
         return json.load(f)
 
 
+SEATS = [{'net': 1}, {'net': 2}]
+
+
 def eval_job(st):
     """The eval batch's job object - also, exactly, the signed definition's `jobs.eval` template (PROTOCOL.md 7: an
     agent builds its job line from the template - settings, seats, paired: nothing else - plus only the lease's
-    `gid_base`, `games` and `seed`)."""
-    return {'settings': st['settings'], 'seats': [{'net': 1}, {'net': 2}], 'paired': True}
+    `gid_base`, `games` and `seed`). The seats: gen 1 (A) and gen 2 (B), each with its set when it has one (a state
+    from before per-seat settings: none)."""
+    return {'settings': st['settings'], 'seats': st.get('seats') or SEATS, 'paired': True}
 
 
 def coordinator_seed(run):
@@ -482,28 +493,39 @@ def _stderr_log(m):
     print('# ' + m, file=sys.stderr, flush=True)
 
 
-def play_settings(worker, build_id, cfg, d, log=None):
+# the worker feature of per-seat settings (zero_worker FEATURE_SEAT_SETTINGS, docs/az.md 68): a seat's `set`
+FEATURE_SEAT_SETTINGS = 'seat_settings'
+
+
+def play_settings(worker, build_id, cfg, d, log=None, seats=None):
     """The eval template's settings: only those the worker build's own `check-config --eval` classifies `play` (what
     an evaluation match reads - zero_worker EVAL_READS; never a trainer-only key or a path, which farm-release refuses
     in a template), checked again by the worker on their own, and giving the seats every setting gives
     (`Run.nn_seat`). `worker` must be that build's executable (its `info` names `build_id` and the kind eval). A
     setting the build doesn't know but this zero-core classifies trainer-only is logged and left out
     (`config_refused`). A build announcing `setting_classes` checks the settings with the declared classes and the
-    template carries them (`with_classes`, docs/az.md 61)."""
+    template carries them (`with_classes`, docs/az.md 61). `seats`: the job's seats (default gen 1 vs gen 2), checked by
+    the worker's check-config with the settings; a seat with a set (docs/az.md 68) needs a build announcing
+    `seat_settings` (an older one is refused here, before anything is published)."""
     from . import farm_eval as FE
     log = log or _stderr_log
+    seats = FE.check_seats(seats or SEATS)
     rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
     if rc != 0 or not isinstance(info, dict):
         raise SystemExit(f'{worker} info: {text.strip()[-500:]}')
     if info.get('build_id') != build_id or 'eval' not in (info.get('kinds') or []):
         raise SystemExit(f'{worker} is build {info.get("build_id")} ({info.get("kinds")}), not the eval-capable worker '
                          f'build {build_id}: give --worker the signed build\'s executable')
+    if any('set' in x for x in seats) and FEATURE_SEAT_SETTINGS not in (info.get('features') or []):
+        raise SystemExit(f'worker build {build_id} does not play per-seat settings (it does not announce '
+                         f'{FEATURE_SEAT_SETTINGS!r}, docs/az.md 68): build a worker of a zero-core that has them')
+    sargs = ['--seats', json.dumps(seats)] if seats != SEATS else []
     os.makedirs(d, exist_ok=True)
     full = os.path.join(d, 'settings-run.json')
     run = with_classes(info, cfg)
     with open(full, 'w', encoding='utf-8') as f:
         json.dump(run, f)
-    rc, out, text = worker_json(worker, 'check-config', full, '--eval', '--json')
+    rc, out, text = worker_json(worker, 'check-config', full, '--eval', '--json', *sargs)
     if config_refused(rc, out, build_id, log):
         raise SystemExit(f'the worker refuses the settings for an eval job:\n{text.strip()[-3000:]}')
     log_declared(out, build_id, log)
@@ -517,11 +539,10 @@ def play_settings(worker, build_id, cfg, d, log=None):
     path = os.path.join(d, 'settings.json')
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(play, f)
-    rc, out, text = worker_json(worker, 'check-config', path, '--eval', '--json')
-    if rc != 0 or not isinstance(out, dict) or out.get('failures') or \
+    rc, out, text = worker_json(worker, 'check-config', path, '--eval', '--json', *sargs)
+    if rc != 0 or not isinstance(out, dict) or out.get('failures') or out.get('driver_error') or \
             any(s['status'] != 'play' for s in out.get('settings') or []):
         raise SystemExit(f'the worker refuses the eval job\'s own settings:\n{text.strip()[-3000:]}')
-    seats = [{'net': 1}, {'net': 2}]
     if FE.seat_dicts(play, seats) != FE.seat_dicts(cfg, seats):
         raise SystemExit('the play settings give other seats than the run\'s settings (EVAL_READS is not what '
                          'Run.nn_seat reads: tests/test_worker_settings.py)')
@@ -705,14 +726,19 @@ def readout(cl, d, st):
     rows = rows_of(d)
     if not rows:
         return ['no games yet'], None
-    out = FE.summary(rows, True, {'net': 1})
+    seats = st.get('seats') or SEATS
+    out = FE.summary(rows, True, seats[0])
     machines = machine_names(cl, st)
+    tags = FE.seat_tags(st['settings'], seats)
     full = dict({'a': st['a'], 'b': st['b'], 'game': st['game'], 'sims': st['settings']['eval_sims'],
                  'chance_k': st['settings']['chance_k']}, **out)
-    full.update(select_a=st['select'], select_b=st['select'], paired=True, run=st['run'], machines=machines,
-                farm=True)
+    full.update(select_a=tags[0], select_b=tags[1], paired=True, run=st['run'], machines=machines, farm=True)
+    sims = [FE.seat_cfgs(st['settings'], seats)[k]['eval_sims'] for k in (0, 1)]
+    if sims[0] != sims[1]:
+        full.update(sims_a=sims[0], sims_b=sims[1])          # (zero.h2h's per-side simulations' fields)
+    rule = tags[0] if tags[0] == tags[1] else f'A {tags[0]}, B {tags[1]}'
     lines = [f'{st["run"]}: A = {os.path.basename(st["a"])}, B = {os.path.basename(st["b"])} ({st["game"]}, '
-             f'eval_sims {full["sims"]}, {st["select"]})',
+             f'eval_sims {full["sims"]}, {rule})',
              f'A scores {out["a_score"]:.4f} +- {out["se"]:.4f} (pair se; per-game se {out.get("se_games")}) over '
              f'{out["games"]} games ({out["pairs"]["n"]} pairs: both won {out["pairs"]["both_won"]}, split '
              f'{out["pairs"]["split"]}, both lost {out["pairs"]["both_lost"]}, with a draw {out["pairs"]["with_draw"]})',
@@ -740,7 +766,7 @@ def progress_line(d, st, t0, n0, es=None):
     rate = n / max(1e-9, (time.time() - st.get('created', t0)) / 60)
     if rows and len(rows) >= 2:
         try:
-            s = FE.summary(rows, True, {'net': 1})
+            s = FE.summary(rows, True, (st.get('seats') or SEATS)[0])
             sc = f'A {s["a_score"]:.3f} +- {s["se"]:.3f}, Elo {s["elo_diff"]:+.0f}'
         except (ZeroDivisionError, KeyError):
             sc = ''
@@ -772,7 +798,9 @@ def finish_print(cl, d, st):
 
 # ---------------------------------------------------------------- main
 
-def main(argv=None, client=None):
+def parser():
+    """zero.farm_h2h's command line (zero.h2h's per-side options without the local-only ones: zero.seat_settings)."""
+    from . import seat_settings as SS
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--a')
     ap.add_argument('--b')
@@ -821,6 +849,13 @@ def main(argv=None, client=None):
     ap.add_argument('--gpu', choices=('any', 'preferred', 'required'),
                     help="the eval batch's gpu routing setting (PROTOCOL 8): required = only PCs GPU-eligible for it "
                     '(with a CUDA alternate and a CPU default pack: the PCs that take the alternate); default any')
+    SS.add_side_args(ap, local=False)                  # (zero.h2h's per-side options: each seat's set, docs/az.md 68)
+    return ap
+
+
+def main(argv=None, client=None):
+    from . import seat_settings as SS
+    ap = parser()
     a = ap.parse_args(argv)
     if a.min_agent is not None and not FD.SEMVER_RE.match(a.min_agent):
         ap.error(f'--min-agent {a.min_agent!r}: a version like 0.2.10')
@@ -838,9 +873,9 @@ def main(argv=None, client=None):
     if a.alt_vendor and not a.alt:
         ap.error('--alt-vendor: with --alt (the alternates it applies to)')
     if a.resume or a.cancel:
-        if a.alt or a.min_agent is not None or a.gpu_games_per_lease is not None or a.gpu is not None:
-            ap.error('--alt, --alt-vendor, --min-agent, --gpu-games-per-lease, --gpu: only when a head-to-head starts (--resume '
-                     'and --cancel keep what it started with)')
+        if a.alt or a.min_agent is not None or a.gpu_games_per_lease is not None or a.gpu is not None or SS.given(a):
+            ap.error('--alt, --alt-vendor, --min-agent, --gpu-games-per-lease, --gpu, the per-side options: only when a '
+                     'head-to-head starts (--resume and --cancel keep what it started with)')
         name = a.resume or a.cancel
         run = name if name.startswith('h2h-') else f'h2h-{name}'
         d = state_dir(a, run)
@@ -875,6 +910,13 @@ def main(argv=None, client=None):
     from .h2h import _load_pair, _tag
     ma, mb, game = _load_pair(a.a, a.b, 'cpu', None)
     cfg = settings_of(a, a.a, game)
+    try:
+        # (each side's per-side options over the job's settings: its seat's set; none = the job's seat, as before)
+        sets = SS.sets_of(a, cfg)
+        seats = [SS.net_seat(1, sets[0]), SS.net_seat(2, sets[1])]
+        FE.seat_dicts(cfg, seats)                       # (Run.nn_seat's checks of each seat: refused here, not on a PC)
+    except ValueError as e:
+        ap.error(str(e))
     run = f'h2h-{a.name}' if a.name and not a.name.startswith('h2h-') else (a.name or run_slug(a.a, a.b))
     if not SLUG_RE.match(run):
         ap.error(f'run name {run!r}: [a-z0-9][a-z0-9-]{{0,62}}')
@@ -882,9 +924,11 @@ def main(argv=None, client=None):
     if os.path.exists(os.path.join(d, 'state.json')):
         raise SystemExit(f'{run} exists ({d}): --resume {run}, or another --name')
     run_cfg = cfg
-    cfg = play_settings(a.worker, a.build, run_cfg, d, log)
+    cfg = play_settings(a.worker, a.build, run_cfg, d, log, seats)
     log(f'{run}: {game}, {a.games} paired games, eval_sims {cfg["eval_sims"]}, eval spec {cfg["eval_spec"][:80]}; '
         f'{len(cfg)} of the run\'s {len(run_cfg)} settings are the eval job\'s (the worker\'s check-config: play)')
+    if seats != SEATS:
+        log(f'seats {json.dumps(seats)}: A {FE.seat_tags(cfg, seats)[0]}, B {FE.seat_tags(cfg, seats)[1]}')
     if a.reference_batches:
         from .onnx_parity import Rows
         rows_list = [Rows.load(p) for p in a.reference_batches]
@@ -900,9 +944,11 @@ def main(argv=None, client=None):
     st = {'run': run, 'url': a.url, 'a': os.path.abspath(a.a), 'b': os.path.abspath(a.b), 'game': game,
           'games': a.games, 'seed': coordinator_seed(run), 'build_id': a.build, 'runtime': a.runtime, 'priority': a.priority,
           'games_per_lease': gpl, 'needs': {'threads': a.needs_threads, 'ram_mb': a.needs_ram_mb}, 'batch': 'h2h',
-          'settings': cfg, 'select': _tag(FE.seat_dicts(cfg, [{'net': 1}, {'net': 2}])[0]), 'gens': gens,
+          'settings': cfg, 'select': _tag(FE.seat_dicts(cfg, seats)[0]), 'gens': gens,
           'created': time.time(), 'cursor': 0, 'build_game': build_game, 'alternates': alternates,
           'min_agent': a.min_agent, 'gpu_games_per_lease': gpu_per_lease, 'gpu': a.gpu or 'any'}
+    if seats != SEATS:
+        st['seats'] = seats                             # (else absent: the state of before)
     save_state(d, st)
     setup(cl, d, st, log, opts)
     if a.no_wait:

@@ -53,6 +53,14 @@ merges, aliases and growth leaves, summed over the drivers).
 Per-side simulations (docs/az.md 20.4): --a-sims / --b-sims (default --sims), e.g. `A A --a-sims 128
 --b-sims 32` (the output then names `sims_a`, `sims_b`).
 
+One meaning with the farm (docs/az.md 68): the per-side options above are zero.seat_settings' (`add_side_args`; also
+--a-gumbel-m / --b-gumbel-m over --gumbel-m), and a side's seat is its run's settings with its options as run settings
+over them (`seat_settings.side_set`), `Run.nn_seat` of those (`sides_of`) - the seat a farm eval job's `{"net": gen,
+"set": ...}` plays (zero.farm_h2h, MTG Zero's farm campaigns take the same options). So --select / --a-select replace
+the move rule only (the side keeps its run's root minimum visits, leaf view, merging and value choices), a
+--a-select-min-visits without a rule guards the side's own rule, and every combination Run.nn_seat refuses is refused
+here too. --graphs and --lookahead are local only (no run setting: torch's CUDA graphs, the Python lookahead).
+
 CUDA graphs (docs/az.md 10.6): --graphs 0 | 1 for both sides, --a-graphs / --b-graphs for one (over
 --graphs); default: each side's NetEvaluator default (a conv network's on, a token network's env
 ZERO_TOKEN_GRAPHS=1). Given, the output names `graphs_a` / `graphs_b` (each side's CUDA-graph
@@ -96,7 +104,7 @@ import os
 import sys
 import time
 
-from . import gamerec as GR, games as G, lookahead as LA, package
+from . import gamerec as GR, games as G, lookahead as LA, package, seat_settings as SS
 from .infer import NetEvaluator, drive
 from .mcts import (belief_settings, belief_tag, belief_tilts, check_belief, check_belief_tilts, check_merge,
                    check_root_search, check_select, check_select_transform, forced_tag, gumbel_tag, merge_tag, select_settings, select_tag, select_transform,
@@ -694,7 +702,8 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
     return out
 
 
-def main(argv=None):
+def parser():
+    """zero.h2h's command line (its per-side options: zero.seat_settings.add_side_args, shared with the farm's tools)."""
     ap = argparse.ArgumentParser(description=__doc__.split(chr(10))[0])
     ap.add_argument('a')
     ap.add_argument('b')
@@ -708,67 +717,12 @@ def main(argv=None):
     ap.add_argument('--spec', default=None, help="game spec JSON (default: A's run's evaluation spec - its eval_spec, else "
                                                   "the game package's eval spec of its spec -, without a run config the "
                                                   "game package's spec of the game)")
-    ap.add_argument('--select', default=None, choices=['visits', 'cq'],
-                    help="both sides' move rule (default: each checkpoint's run's eval_select)")
-    ap.add_argument('--select-min-visits', type=int, default=0)
-    for side in ('a', 'b'):
-        ap.add_argument(f'--{side}-select', default=None, choices=['visits', 'cq'], help=f"side {side.upper()}'s move rule")
-        ap.add_argument(f'--{side}-select-min-visits', type=int, default=None)
-    ap.add_argument('--cq-c-visit', type=float, default=None,
-                    help="the 'cq' rule's completed-Q transform, both sides (default: 50 / 1 with --select, else "
-                         "each checkpoint's run's)")
-    ap.add_argument('--cq-c-scale', type=float, default=None)
-    for side in ('a', 'b'):
-        ap.add_argument(f'--{side}-cq-c-visit', type=float, default=None,
-                        help=f"side {side.upper()}'s 'cq' transform (over --cq-c-visit / --cq-c-scale)")
-        ap.add_argument(f'--{side}-cq-c-scale', type=float, default=None)
     ap.add_argument('--move-log', type=int, default=0, help='log the first N moves of every game (with --rows)')
-    for side in ('a', 'b'):
-        ap.add_argument(f'--{side}-leaf-value-view', default=None, choices=['mover', 'root'],
-                        help=f"side {side.upper()}'s leaf values' view (docs/search.md 3.6; default: its checkpoint's "
-                             f"run's eval_leaf_value_view)")
-        ap.add_argument(f'--{side}-belief-tilt', type=float, default=None,
-                        help=f"side {side.upper()}'s root belief tilt (docs/search.md 3.8; 0 = uniform worlds; default: its "
-                             f"checkpoint's run's eval_belief_tilt)")
-        ap.add_argument(f'--{side}-belief-clip', type=float, default=None)
-        ap.add_argument(f'--{side}-belief-mix', type=float, default=None)
-        ap.add_argument(f'--{side}-belief-fast', type=int, default=None, choices=[0, 1])
-        ap.add_argument(f'--{side}-belief-tilts', type=json.loads, default=None,
-                        help=f"side {side.upper()}'s per-target tilts, JSON {{target: alpha}} (docs/search.md 3.8.1; {{}} = "
-                             f"none; default: its checkpoint's run's eval_belief_tilts)")
-    ap.add_argument('--infoset-merge', type=int, default=None, choices=[0, 1],
-                    help="both sides' information-set merging (docs/search.md 3.16; default: each side's run's "
-                         "eval_infoset_merge)")
-    for side in 'ab':
-        ap.add_argument(f'--{side}-infoset-merge', type=int, default=None, choices=[0, 1],
-                        help=f"side {side.upper()}'s information-set merging (over --infoset-merge; needs root-view "
-                             f"leaf values)")
+    SS.add_side_args(ap, local=True)
     ap.add_argument('--torch-threads', type=int, default=1, help='torch intra-op threads (default 1)')
-    for side in ('a', 'b'):
-        ap.add_argument(f'--{side}-root-search', default=None, choices=['puct', 'gumbel'],
-                        help=f"side {side.upper()}'s root search (docs/search.md 3.7; default: its checkpoint's run's "
-                             f"eval_root_search)")
-        ap.add_argument(f'--{side}-gumbel-scale', type=float, default=None,
-                        help=f"side {side.upper()}'s Gumbel noise scale (default: its run's eval_gumbel_scale, 0)")
-    ap.add_argument('--gumbel-m', type=int, default=None,
-                    help="a Gumbel side's considered options (default: its run's gumbel_m, 16)")
-    for side in ('a', 'b'):
-        ap.add_argument(f'--{side}-sims', type=int, default=None, help=f"side {side.upper()}'s simulations (default --sims)")
-    ap.add_argument('--graphs', type=int, default=None, choices=[0, 1],
-                    help="both sides' CUDA graphs (default: the evaluator's: a conv network's on, a token network's "
-                         "env ZERO_TOKEN_GRAPHS=1; docs/az.md 10.6)")
-    for side in ('a', 'b'):
-        ap.add_argument(f'--{side}-graphs', type=int, default=None, choices=[0, 1],
-                        help=f"side {side.upper()}'s CUDA graphs (over --graphs)")
     ap.add_argument('--precision', default=None, choices=['fp32', 'tf32', 'bf16'],
                     help="both sides' network arithmetic on CUDA (the run setting infer_precision, docs/az.md 57; "
                          "default fp32)")
-    ap.add_argument('--lookahead', default=None, metavar='SETTINGS',
-                    help="both sides lookahead seats (docs/search.md 3.9; zero.lookahead.parse, e.g. "
-                         "plies=6,worlds=8,opp=best,mode=infoset,budget=200000)")
-    for side in ('a', 'b'):
-        ap.add_argument(f'--{side}-lookahead', default=None, metavar='SETTINGS',
-                        help=f"side {side.upper()} a lookahead seat (over --lookahead)")
     ap.add_argument('--conc', type=int, default=None,
                     help='games in flight at once (default: every game, at most 1024)')
     ap.add_argument('--sparse', type=int, default=None, choices=[0, 1],
@@ -794,6 +748,47 @@ def main(argv=None):
     ap.add_argument('--records-kind', default='h2h', help="the records' kind (default 'h2h')")
     ap.add_argument('--label-a', default=None, help="side A's name in the records (default: its checkpoint id)")
     ap.add_argument('--label-b', default=None, help="side B's name in the records")
+    return ap
+
+
+def side_settings(ckpt, sims, c_puct=1.0, chance_k=2):
+    """A side's settings: its checkpoint's run's (`run_settings`; without a run config the evaluation seat's own
+    defaults - margin_w 0, redet on, no cache, the 'visits' rule) with the match's eval_sims, c_puct and chance_k."""
+    c = run_settings(ckpt) or {'margin_w': 0.0, 'redet': 1}
+    return dict(c, eval_sims=int(sims), c_puct=c_puct, chance_k=chance_k)
+
+
+def settings_seat(cfg, key='a'):
+    """The evaluation seat of settings `cfg` (`Run.nn_seat(key, cfg['eval_sims'])`), without its key."""
+    from . import run as R
+    from .farm_eval import _Stub
+    s = R.Run.nn_seat(_Stub(cfg), key, cfg['eval_sims'])
+    s.pop('key', None)
+    return s
+
+
+def sides_of(a):
+    """Both sides' seat dicts of a command line (`a`: `parser()`'s arguments): each side's settings (`side_settings`)
+    with its per-side options as run settings over them (zero.seat_settings.side_set - the meaning a farm head-to-head's
+    seat sets have too, docs/az.md 68), that settings' evaluation seat (Run.nn_seat), and its lookahead seat key
+    -> [seat_a, seat_b]; ValueError for a combination refused."""
+    cfgs = [side_settings(ck, a.sims, a.c_puct, a.chance_k) for ck in (a.a, a.b)]
+    sets = SS.sets_of(a, cfgs[0], cfgs[1])
+    out = []
+    for k, side in enumerate('ab'):
+        seat = settings_seat(SS.seat_cfg(cfgs[k], sets[k] or None), side)
+        try:
+            lk = look_keys(getattr(a, f'{side}_lookahead') or a.lookahead)
+        except ValueError as e:
+            raise ValueError(f'side {side.upper()}: {e}') from None
+        if lk is not None:
+            seat['lookahead'] = lk
+        out.append(seat)
+    return out
+
+
+def main(argv=None):
+    ap = parser()
     a = ap.parse_args(argv)
     sprt = None
     if a.sprt is not None:
@@ -821,66 +816,10 @@ def main(argv=None):
         psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if os.name == 'nt' else 10)
     except Exception:                              # noqa: BLE001
         pass
-    sides = []
-    for side, ckpt in (('a', a.a), ('b', a.b)):
-        rule = getattr(a, f'{side}_select') or a.select
-        mv = getattr(a, f'{side}_select_min_visits')
-        mv = a.select_min_visits if mv is None else mv
-        own = getattr(a, f'{side}_cq_c_visit'), getattr(a, f'{side}_cq_c_scale')
-        both = a.cq_c_visit, a.cq_c_scale
-        base = side_keys(ckpt, rule, mv)
-        if base.get('select', 'visits') == 'visits':
-            if own != (None, None):
-                ap.error(f"--{side}-cq-c-*: side {side.upper()} plays 'visits' (no completed-Q transform)")
-            sides.append(base)
-            continue
-        cv, cs = (o if o is not None else b for o, b in zip(own, both))
-        sides.append(side_keys(ckpt, rule, mv, cv, cs))
-    if (a.cq_c_visit, a.cq_c_scale) != (None, None) and not any(s.get('select') == 'cq' for s in sides):
-        ap.error("--cq-c-visit / --cq-c-scale: no side plays 'cq'")
-    for side, keys in zip(('a', 'b'), sides):
-        view = getattr(a, f'{side}_leaf_value_view')
-        if view == 'mover':
-            keys.pop('leaf_value_view', None)
-        elif view == 'root':
-            keys['leaf_value_view'] = 'root'
-    for side, keys in zip(('a', 'b'), sides):
-        # information-set merging (docs/search.md 3.16): as given, else the side's run's
-        on = getattr(a, f'{side}_infoset_merge')
-        on = a.infoset_merge if on is None else on
-        if on == 0:
-            keys.pop('infoset_merge', None)
-        elif on == 1:
-            keys['infoset_merge'] = True
-        try:
-            check_merge(int(bool(keys.get('infoset_merge'))), keys.get('leaf_value_view', 'mover'),
-                        what=f'side {side.upper()} infoset_merge')
-        except ValueError as e:
-            ap.error(f'{e} (--{side}-leaf-value-view root, or its run\'s eval_leaf_value_view)')
     try:
-        # (a side's root belief is its run's eval_belief_tilt even when --select replaced its rule, so an
-        # A/B arm whose config sets it is dealt as it trained; the side's flags override it)
-        sides = [with_belief(dict(k, **{x: v for x, v in run_rule(ckpt).items() if x.startswith('belief_')}),
-                             *(getattr(a, f'{s}_belief_{x}') for x in ('tilt', 'clip', 'mix', 'fast', 'tilts')))
-                 for s, k, ckpt in zip(('a', 'b'), sides, (a.a, a.b))]
+        sides = sides_of(a)
     except ValueError as e:
         ap.error(str(e))
-    for k, (side, ckpt) in enumerate((('a', a.a), ('b', a.b))):
-        try:
-            sides[k] = root_keys(ckpt, sides[k], getattr(a, f'{side}_root_search'), a.gumbel_m,
-                                 getattr(a, f'{side}_gumbel_scale'))
-        except ValueError as e:
-            ap.error(f'side {side.upper()}: {e}')
-        if getattr(a, f'{side}_gumbel_scale') is not None and sides[k].get('root_search') != 'gumbel':
-            ap.error(f"--{side}-gumbel-scale: side {side.upper()} searches with PUCT")
-    for k, side in enumerate(('a', 'b')):
-        spec_l = getattr(a, f'{side}_lookahead') or a.lookahead
-        try:
-            lk = look_keys(spec_l)
-        except ValueError as e:
-            ap.error(f'side {side.upper()}: {e}')
-        if lk is not None:
-            sides[k] = dict(sides[k], lookahead=lk)
     if a.max_rows is not None and a.max_rows < 1:
         ap.error('--max-rows must be >= 1')
     if a.conc is not None and a.conc < 1:

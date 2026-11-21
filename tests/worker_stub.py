@@ -8,7 +8,9 @@ Environment: WORKER_STUB_BUILD (the build id `info` names), WORKER_STUB_LOG (JSO
 WORKER_STUB_FEATURES (comma-separated: `info`'s `features`; unset: none, a build before rolling jobs). With the feature
 `setting_classes` (docs/az.md 61) check-config honours the settings' declared classes as zero_worker classify does for
 a key this build doesn't know: declared `trainer` -> unused (`trainer`), anything else or undeclared -> `unknown`; the
-`setting_classes` key itself gets no verdict."""
+`setting_classes` key itself gets no verdict. `check-config --eval --seats JSON` checks the seats as the worker parses
+them: a network seat's `set` (docs/az.md 68) needs the feature `seat_settings` and keys of zero_worker's SEAT_READS
+(else a driver error, exit 1)."""
 import json
 import os
 import re
@@ -17,10 +19,29 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def eval_reads():
+def _rs_list(name):
     with open(os.path.join(ROOT, 'crates', 'worker', 'src', 'settings.rs'), encoding='utf-8') as f:
-        m = re.search(r'pub const EVAL_READS: &\[&str\] = &\[(.*?)\];', f.read(), re.S)
+        m = re.search(r'pub const ' + name + r': &\[&str\] = &\[(.*?)\];', f.read(), re.S)
     return re.findall(r'"([^"]+)"', m.group(1))
+
+
+def eval_reads():
+    return _rs_list('EVAL_READS')
+
+
+def seat_error(argv):
+    """`--seats JSON` as the worker's EvalSeat::parse reads it -> its refusal, or None."""
+    if '--seats' not in argv:
+        return None
+    for st in json.loads(argv[argv.index('--seats') + 1]):
+        if 'set' not in st:
+            continue
+        if 'seat_settings' not in features():
+            return f'seat {json.dumps(st)}: one key, net or bot'
+        bad = [k for k in st['set'] if k not in _rs_list('SEAT_READS')]
+        if bad or not st['set']:
+            return f'seat {json.dumps(st)}: {bad} is not a seat setting'
+    return None
 
 
 _TABLE = []
@@ -97,15 +118,15 @@ def main(argv):
         if '--eval' in argv:
             reads = eval_reads()
             st = lambda k: 'unknown' if k in old else 'play' if k in reads and k not in took else 'trainer'
-            out = {'job': 'eval', 'game': cfg.get('game'), 'eval_reads': reads, 'driver_error': None,
-                   'failures': [k for k in reads if k not in cfg and k != 'game'] + old}
+            out = {'job': 'eval', 'game': cfg.get('game'), 'eval_reads': reads, 'seat_reads': _rs_list('SEAT_READS'),
+                   'driver_error': seat_error(argv), 'failures': [k for k in reads if k not in cfg and k != 'game'] + old}
         else:
             st = lambda k: 'unknown' if k in old else 'play' if selfplay_play(k) and k not in took else 'trainer'
             out = {'game': cfg.get('game'), 'driver_error': None, 'failures': old}
         out['settings'] = [{'key': k, 'status': st(k), 'value': json.dumps(v),
                             'why': 'unknown to this build; declared trainer-only' if k in took else ''} for k, v in cfg.items()]
         print(json.dumps(out))
-        return 1 if out['failures'] else 0
+        return 1 if out['failures'] or out.get('driver_error') else 0
     if argv[:1] == ['eval']:
         return eval_job(argv[1:])
     if argv[:1] == ['driver-cfg']:

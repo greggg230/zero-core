@@ -6,7 +6,7 @@ same ONNX graphs - at deterministic settings (groups 1): every result row must b
     python tools/worker_eval_gate.py --root <game checkout> --package mtgz.az --settings <job settings.json> \
         --model 1=<a.onnx> --model 2=<b.onnx> --seats '[{"net": 1}, {"net": 2}]' --games 20 --seed 31 \
         --paired --threads 4 --infer-threads 4 --worker <mtgz-worker exe> --ort-dll <onnxruntime.dll> \
-        --out <dir> [--batches 50] [--side both|python|native]
+        --out <dir> [--batches 50] [--side both|python|native] [--seat-cases all|merge,sims,gumbel,belief,select]
 
 `--settings`: the eval job's settings (a run's resolved config with `eval_spec` set: zero.farm_eval.
 resolve_eval_spec), given as they are to both sides (the worker reads the same file); `--threads` is both
@@ -16,6 +16,14 @@ The Python side plays games 0..N in one driver (a fixed table: Run.play_match's 
 eval job of games 0..N (a rolling queue_only driver, docs/search.md 2.16). Compared: each game's row (bytes),
 and the first `--batches` network batches each side sent (every array; diagnostics). Writes
 <out>/python.jsonl, <out>/native/e_*.jsonl, <out>/gate.json; exit 1 on a difference.
+
+`--seat-cases` (per-seat settings, docs/az.md 68): instead of one match, one per case, each side of `--seats` given its
+own settings by zero.h2h's per-side options (zero.seat_settings.side_set over the settings: the seats' sets, as
+zero.farm_h2h and farm campaigns make them) - `merge` (side A merges its trees, root-view values on both; B does not),
+`sims` (A 2x, B 1/2 of eval_sims), `gumbel` (A the Gumbel root search with 4 considered options, B PUCT), `belief` (A
+belief tilt 1, B 0: the networks need the auxiliary head), `select` (A 'cq' with guard 2, B 'visits'). Each case in
+<out>/<case>/ (as above); gate.json holds every case; exit 1 when any case differs. `--seats '[{"net": 1}, {"net": 1}]'`
+plays both sides with one network (the same checkpoint, two settings: an evaluation-only A/B).
 """
 import argparse
 import glob
@@ -77,13 +85,37 @@ def python_side(a, cfg, seats, models):
     return rows, rec, secs
 
 
+SEAT_CASES = {
+    'merge': ['--a-infoset-merge', '1', '--b-infoset-merge', '0', '--a-leaf-value-view', 'root', '--b-leaf-value-view', 'root'],
+    'sims': ['--a-sims', '{2x}', '--b-sims', '{half}'],
+    'gumbel': ['--a-root-search', 'gumbel', '--a-gumbel-m', '4', '--b-root-search', 'puct'],
+    'belief': ['--a-belief-tilt', '1', '--b-belief-tilt', '0'],
+    'select': ['--a-select', 'cq', '--a-select-min-visits', '2', '--b-select', 'visits'],
+}
+
+
+def case_seats(cfg, seats, case):
+    """The seats of a seat case: `seats` (two network seats) with the case's per-side options as their sets
+    (zero.seat_settings: side_set over `cfg`, both sides relative to the one job's settings)."""
+    import argparse
+    from zero import farm_eval as FE, seat_settings as SS
+    sims = int(cfg['eval_sims'])
+    argv = [x.replace('{2x}', str(2 * sims)).replace('{half}', str(max(1, sims // 2))) for x in SEAT_CASES[case]]
+    ap = argparse.ArgumentParser()
+    SS.add_side_args(ap, local=False)
+    sets = SS.sets_of(ap.parse_args(argv), cfg)
+    out = [SS.net_seat(s['net'], st) for s, st in zip(seats, sets)]
+    FE.seat_dicts(cfg, out)                      # (each seat's checks: Run.nn_seat)
+    return out, argv
+
+
 def native_side(a, settings_path, models, refs):
     out = os.path.join(a.out, 'native')
     os.makedirs(out, exist_ok=True)
     for p in glob.glob(os.path.join(out, '*.jsonl')):
         os.remove(p)
     bf = os.path.join(a.out, 'native_batches.npz')
-    cmd = [a.worker, 'eval', '--settings', settings_path, '--seats', a.seats, '--games', str(a.games), '--seed',
+    cmd = [a.worker, 'eval', '--settings', settings_path, '--seats', json.dumps(a.seat_list), '--games', str(a.games), '--seed',
            str(a.seed), '--threads', str(a.threads), '--infer-threads', str(a.infer_threads), '--out', out,
            '--ort-dll', a.ort_dll, '--record-batches', str(a.batches), '--record-file', bf, '--flush-games',
            str(a.flush_games)]
@@ -157,6 +189,8 @@ def main():
     ap.add_argument('--batches', type=int, default=50)
     ap.add_argument('--flush-games', type=int, default=8)
     ap.add_argument('--side', default='both', choices=['both', 'python', 'native'])
+    ap.add_argument('--seat-cases', default=None, help="per-seat settings' cases (module docs): all, or a comma list of "
+                    + ', '.join(SEAT_CASES))
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     models = gen_pairs(a.model, '--model')
@@ -166,6 +200,38 @@ def main():
         cfg = json.load(f)
     # (the job's threads over the settings', as the worker reads them; groups as the settings say)
     cfg = dict(cfg, threads=a.threads)
+    if a.seat_cases:
+        sys.path.insert(0, os.path.abspath(a.root))
+        __import__(a.package)
+        names = list(SEAT_CASES) if a.seat_cases == 'all' else a.seat_cases.split(',')
+        bad = [n for n in names if n not in SEAT_CASES]
+        if bad:
+            raise SystemExit(f'--seat-cases: unknown {bad} (cases: {", ".join(SEAT_CASES)})')
+        out, cases = a.out, {}
+        for n in names:
+            a.out = os.path.join(out, n)
+            os.makedirs(a.out, exist_ok=True)
+            a.seat_list, argv = case_seats(cfg, seats, n)
+            print(f'# case {n}: {" ".join(argv)} -> seats {json.dumps(a.seat_list)}', file=sys.stderr, flush=True)
+            cases[n] = dict(match(a, cfg, models, refs), options=argv)
+        res = {'settings': a.settings, 'seat_cases': cases, 'passed': all(c.get('passed') for c in cases.values())}
+        with open(os.path.join(out, 'gate.json'), 'w', encoding='utf-8') as f:
+            json.dump(res, f, indent=1)
+        print(json.dumps({'seat_cases': {n: {k: c.get(k) for k in ('seats', 'identical', 'different', 'passed', 'batches',
+                                                                    'tags')} for n, c in cases.items()},
+                          'passed': res['passed']}))
+        return 0 if res['passed'] else 1
+    a.seat_list = seats
+    res = match(a, cfg, models, refs)
+    with open(os.path.join(a.out, 'gate.json'), 'w', encoding='utf-8') as f:
+        json.dump(res, f, indent=1)
+    print(json.dumps(res))
+    return 0 if res.get('passed', True) else 1
+
+
+def match(a, cfg, models, refs):
+    """One match (`a.seat_list`) on both sides, compared -> its result dict (also written to <a.out>/gate.json)."""
+    seats = a.seat_list
     res = {'settings': a.settings, 'seats': seats, 'games': a.games, 'seed': a.seed, 'paired': a.paired,
            'threads': a.threads, 'infer_threads': a.infer_threads, 'groups': cfg['groups'], 'conc': min(cfg['conc'], a.games)}
     nat = py = None
@@ -197,11 +263,11 @@ def main():
         rows = [json.loads(py[g]) for g in sorted(py)]
         if all('net' in s for s in seats):
             res['summary'] = FE.summary(rows, a.paired, seats[0])
+            res['tags'] = FE.seat_tags(cfg, seats)
         res['passed'] = not diff and len(same) == a.games
     with open(os.path.join(a.out, 'gate.json'), 'w', encoding='utf-8') as f:
         json.dump(res, f, indent=1)
-    print(json.dumps(res))
-    return 0 if res.get('passed', True) else 1
+    return res
 
 
 if __name__ == '__main__':

@@ -100,11 +100,12 @@ impl Worker {
 
     /// The protocol features `hello` and `info` announce (zero-farm PROTOCOL.md 10.5): `rolling` - rolling self-play
     /// jobs (`job::Rolling`) -, `setting_classes` - check-config honours a run's declared setting classes
-    /// (`classify`, docs/az.md 61) - and `infer_workers` - a self-play job line's `infer_workers` runs that many
-    /// evaluator threads (docs/az.md 62.1), on every platform - in a build with self-play.
+    /// (`classify`, docs/az.md 61) -, `infer_workers` - a self-play job line's `infer_workers` runs that many
+    /// evaluator threads (docs/az.md 62.1), on every platform - and `seat_settings` - an eval job's network seat may
+    /// carry its own settings (`{"net": gen, "set": {...}}`, docs/az.md 68) - in a build with self-play.
     pub fn features(&self) -> Vec<&'static str> {
         if self.selfplay {
-            vec![FEATURE_ROLLING, FEATURE_SETTING_CLASSES, FEATURE_INFER_WORKERS]
+            vec![FEATURE_ROLLING, FEATURE_SETTING_CLASSES, FEATURE_INFER_WORKERS, FEATURE_SEAT_SETTINGS]
         } else {
             Vec::new()
         }
@@ -122,6 +123,12 @@ pub const FEATURE_SETTING_CLASSES: &str = "setting_classes";
 /// network W times on W evaluator threads, on Windows as on macOS. An agent varies W only for a build that announces
 /// it (an older build ignores the field and runs one session; a Mac's build without it splits `infer_threads` itself).
 pub const FEATURE_INFER_WORKERS: &str = "infer_workers";
+
+/// The feature name of per-seat evaluation settings (docs/az.md 68; zero-farm PROTOCOL.md 5.2): an eval job's network
+/// seat `{"net": gen, "set": {<setting>: <value>}}` plays the job's settings with its set over them (`settings::
+/// SEAT_READS` keys only). The desktop sends a seat with a set only to a build that announces it (an older build refuses
+/// the seat: "one key, net or bot").
+pub const FEATURE_SEAT_SETTINGS: &str = "seat_settings";
 
 /// The worker binary's entry point (self-play only): `args` from the command line -> the exit status.
 pub fn main(games: &'static [GameEntry], repo: &'static str) -> i32 {

@@ -667,37 +667,105 @@ fn usize_of(c: &Settings, k: &str) -> Result<usize, String> {
     }
 }
 
-/// A seat of an eval job (zero-farm PROTOCOL.md 5.2): a network, by its generation in the job's `models`,
-/// or a built-in bot of the game.
+/// A seat of an eval job (zero-farm PROTOCOL.md 5.2): a network, by its generation in the job's `models` - playing the
+/// job's evaluation settings, or with a `set` of its own (docs/az.md 68) -, or a built-in bot of the game.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvalSeat {
     Net(u32),
+    /// `{"net": <gen>, "set": {<setting>: <value>, ...}}`: a network seat whose evaluation settings differ from the job's
+    /// by these (keys of [`SEAT_READS`]: what its `Run.nn_seat(key, eval_sims)` reads) - the seat's settings are the job's
+    /// with the set over them (Python's `dict(settings, **set)`). The set as compact JSON with its keys sorted (the job
+    /// line's parser holds objects so; the result rows write it this way).
+    NetSet(u32, String),
     Bot(String),
 }
 
+/// The settings a network seat of an evaluation reads (`Run.nn_seat(key, c['eval_sims'])` and `eval_sims` itself): what
+/// an eval job seat's `set` may carry (docs/az.md 68) - every other key of a set is refused (a setting of the match, an
+/// unknown one, a Python-only feature). zero-core's tests/test_seat_settings.py checks it against what Run.nn_seat reads
+/// and against zero.seat_settings.SEAT_KEYS.
+pub const SEAT_READS: &[&str] = &[
+    "eval_sims", "c_puct", "chance_k", "margin_w", "redet", "cq_c_visit", "cq_c_scale", "eval_select", "eval_select_min_visits",
+    "eval_select_c_visit", "eval_select_c_scale", "eval_root_min_visits", "root_min_visits_max_actions", "eval_leaf_value_view",
+    "eval_root_search", "gumbel_m", "eval_gumbel_scale", "eval_cache", "eval_infoset_merge", "eval_belief_tilt", "belief_clip",
+    "belief_mix", "belief_fast", "eval_belief_tilts", "eval_value_choice_worlds", "eval_value_choice_temp",
+];
+
+fn net_gen(v: &Value, g: &Value) -> Result<u32, String> {
+    match g.as_u64() {
+        Some(g) if g <= u32::MAX as u64 => Ok(g as u32),
+        _ => Err(format!("seat {v}: net is a checkpoint generation (an integer >= 0)")),
+    }
+}
+
 impl EvalSeat {
-    /// `{"net": <gen>}` or `{"bot": "<name>"}` (nothing else in it); an external bot (`ext:<name>`, a
-    /// process on the desktop) is refused.
+    /// `{"net": <gen>}`, `{"net": <gen>, "set": {...}}` or `{"bot": "<name>"}` (nothing else in it); an external bot
+    /// (`ext:<name>`, a process on the desktop) is refused, as is a set that is empty, not an object, on a bot, or names a
+    /// key outside [`SEAT_READS`].
     pub fn parse(v: &Value) -> Result<EvalSeat, String> {
         let o = v.as_object().ok_or_else(|| format!("seat {v}: {{\"net\": <gen>}} or {{\"bot\": <name>}}"))?;
+        if let Some(set) = o.get("set") {
+            if o.len() != 2 || !o.contains_key("net") {
+                return Err(format!("seat {v}: a set goes with a network seat only: {{\"net\": <gen>, \"set\": {{<setting>: <value>}}}}"));
+            }
+            let g = net_gen(v, &o["net"])?;
+            let m = set.as_object().ok_or_else(|| format!("seat {v}: set is an object {{<setting>: <value>}} (docs/az.md 68)"))?;
+            if m.is_empty() {
+                return Err(format!("seat {v}: an empty set (leave it out: the seat plays the job's settings)"));
+            }
+            if let Some(k) = m.keys().find(|k| !SEAT_READS.contains(&k.as_str())) {
+                return Err(format!(
+                    "seat {v}: {k:?} is not a seat setting - a seat's set holds only settings its evaluation seat reads (Run.nn_seat: {}; docs/az.md 68)",
+                    SEAT_READS.join(", ")
+                ));
+            }
+            return Ok(EvalSeat::NetSet(g, set.to_string()));
+        }
         if o.len() != 1 {
-            return Err(format!("seat {v}: one key, net or bot"));
+            return Err(format!("seat {v}: one key, net or bot (and a network seat's set)"));
         }
         match (o.get("net"), o.get("bot")) {
-            (Some(g), None) => match g.as_u64() {
-                Some(g) if g <= u32::MAX as u64 => Ok(EvalSeat::Net(g as u32)),
-                _ => Err(format!("seat {v}: net is a checkpoint generation (an integer >= 0)")),
-            },
+            (Some(g), None) => Ok(EvalSeat::Net(net_gen(v, g)?)),
             (None, Some(Value::String(b))) if b.starts_with("ext:") => Err(format!("seat {v}: an external bot ({b}) runs on the desktop, not in a worker (zero.run's ext: players)")),
             (None, Some(Value::String(b))) if !b.is_empty() => Ok(EvalSeat::Bot(b.clone())),
             _ => Err(format!("seat {v}: {{\"net\": <gen>}} or {{\"bot\": <name>}}")),
         }
     }
 
-    /// The seat as the result rows write it (`json.dumps(seat, separators=(',', ':'))`).
+    /// The network generation of a network seat (with or without a set).
+    pub fn net(&self) -> Option<u32> {
+        match self {
+            EvalSeat::Net(g) | EvalSeat::NetSet(g, _) => Some(*g),
+            EvalSeat::Bot(_) => None,
+        }
+    }
+
+    /// The seat's set as Python values (None: no set).
+    pub fn set_pyjson(&self) -> Option<PyJson> {
+        match self {
+            // (the set's text is serde_json's of a parsed object: it parses)
+            EvalSeat::NetSet(_, s) => Some(PyJson::parse(s).expect("a seat's set is a JSON object")),
+            _ => None,
+        }
+    }
+
+    /// The settings this seat's evaluation seat reads: the job's `c`, with the seat's set over them.
+    pub fn settings(&self, c: &Settings) -> Settings {
+        let mut out = c.clone();
+        if let Some(PyJson::Dict(d)) = self.set_pyjson() {
+            for (k, x) in d {
+                out.set(&k, x);
+            }
+        }
+        out
+    }
+
+    /// The seat as the result rows write it (`json.dumps(seat, separators=(',', ':'))` of the seat with its keys sorted:
+    /// zero.farm_eval.check_seats' canonical form).
     pub fn pyjson(&self) -> PyJson {
         match self {
             EvalSeat::Net(g) => PyJson::Dict(vec![("net".into(), PyJson::Int(*g as i128))]),
+            EvalSeat::NetSet(g, _) => PyJson::Dict(vec![("net".into(), PyJson::Int(*g as i128)), ("set".into(), self.set_pyjson().expect("a set"))]),
             EvalSeat::Bot(b) => PyJson::Dict(vec![("bot".into(), PyJson::Str(b.clone()))]),
         }
     }
@@ -741,7 +809,8 @@ pub fn eval_spec_of(c: &Settings) -> Result<String, String> {
 
 /// The driver Python's `Run.play_match` builds for an evaluation of `games` games between `seats` (game g:
 /// `seats` for even g, reversed for odd g; a network seat is `Run.nn_seat(key, c['eval_sims'])` with key 'm'
-/// in `seats[0]` and 'o' in `seats[1]`, a bot `G.seat_dict(name)`): `Run.driver(table, seed, conc=min(conc,
+/// in `seats[0]` and 'o' in `seats[1]` - a seat with a set the same of the settings with its set over them (docs/az.md
+/// 68) -, a bot `G.seat_dict(name)`): `Run.driver(table, seed, conc=min(conc,
 /// games), paired=paired)` - a fixed table of game ids 0..games, the run's eval spec, threads, groups,
 /// max_steps and sparse (`conc`, `threads`, `groups`: a job's own over the run's). The eval job plays it as
 /// [`eval_lease_cfg`] does.
@@ -758,6 +827,11 @@ pub fn eval_driver_cfg(c: &Settings, info: &GameInfo, seats: &[EvalSeat], games:
     for (k, s) in seats.iter().enumerate() {
         dicts.push(match s {
             EvalSeat::Net(_) => eval_seat(c, ["m", "o"][k], sims)?,
+            // (a seat with its own settings: Run.nn_seat(key, eval_sims) of the job's settings with its set over them)
+            EvalSeat::NetSet(..) => {
+                let cs = s.settings(c);
+                eval_seat(&cs, ["m", "o"][k], cs.req("eval_sims")?).map_err(|e| format!("seat {} ({}): {e}", k, s.pyjson().dumps_compact()))?
+            }
             EvalSeat::Bot(b) => {
                 if !info.bots.contains(&b.as_str()) {
                     return Err(format!("bot {b:?}: {}'s built-in bots are {:?}", info.name, info.bots));
@@ -945,6 +1019,42 @@ mod tests {
         c.set("selfplay_league", PyJson::Float(0.0));
         c.set("selfplay_archive", PyJson::Str(String::new()));
         assert!(selfplay_driver_cfg(&c, &info(), 0, 0).is_ok());
+    }
+
+    #[test]
+    fn seat_sets_parse_and_apply() {
+        // docs/az.md 68: {"net": g, "set": {...}} - SEAT_READS keys only, never empty, never on a bot
+        let s = EvalSeat::parse(&serde_json::json!({"set": {"eval_sims": 8, "eval_infoset_merge": 1}, "net": 3})).unwrap();
+        assert_eq!(s, EvalSeat::NetSet(3, r#"{"eval_infoset_merge":1,"eval_sims":8}"#.into()));
+        assert_eq!((s.net(), s.pyjson().dumps_compact()), (Some(3), r#"{"net":3,"set":{"eval_infoset_merge":1,"eval_sims":8}}"#.into()));
+        assert_eq!(EvalSeat::parse(&serde_json::json!({"net": 3})).unwrap(), EvalSeat::Net(3));
+        for (v, why) in [
+            (serde_json::json!({"net": 1, "set": {}}), "empty set"),
+            (serde_json::json!({"net": 1, "set": {"conc": 4}}), "not a seat setting"),
+            (serde_json::json!({"net": 1, "set": {"lookahead": "plies=2"}}), "not a seat setting"),
+            (serde_json::json!({"net": 1, "set": [1]}), "an object"),
+            (serde_json::json!({"bot": "heuristic", "set": {"eval_sims": 8}}), "network seat only"),
+            (serde_json::json!({"net": 1, "set": {"eval_sims": 8}, "x": 1}), "network seat only"),
+            (serde_json::json!({"net": 1, "x": 1}), "one key"),
+        ] {
+            assert!(EvalSeat::parse(&v).unwrap_err().contains(why), "{v}: {:?}", EvalSeat::parse(&v));
+        }
+        // a seat's settings: the job's with the set over them; its seat dict is Run.nn_seat of those
+        let mut c = base();
+        c.set("eval_sims", PyJson::Int(16));
+        c.set("game", PyJson::Str("t".into()));
+        c.set("eval_spec", PyJson::Str("{}".into()));
+        c.set("eval_leaf_value_view", PyJson::Str("root".into()));
+        let seats = [EvalSeat::parse(&serde_json::json!({"net": 1, "set": {"eval_infoset_merge": 1, "eval_sims": 24}})).unwrap(), EvalSeat::Net(1)];
+        let d = eval_driver_cfg(&c, &info(), &seats, 4, 0, true, None, None, None).unwrap();
+        let mut want = c.clone();
+        want.set("eval_infoset_merge", PyJson::Int(1));
+        let a = zero_search::settings::driver_cfg(&[vec![eval_seat(&want, "m", &PyJson::Int(24)).unwrap(), eval_seat(&c, "o", &PyJson::Int(16)).unwrap()]], None, None, DriverArgs::default()).unwrap();
+        assert_eq!(d.seats, a.seats);
+        // the seat's own checks name it: a merge without root-view values
+        let bad = [EvalSeat::parse(&serde_json::json!({"net": 1, "set": {"eval_infoset_merge": 1, "eval_leaf_value_view": "mover"}})).unwrap(), EvalSeat::Net(1)];
+        let e = eval_driver_cfg(&c, &info(), &bad, 4, 0, true, None, None, None).unwrap_err();
+        assert!(e.contains("seat 0") && e.contains("infoset_merge"), "{e}");
     }
 
     #[test]

@@ -2,24 +2,28 @@
 games are in Python terms, their result rows, and the readout of a head-to-head.
 
 An eval job plays games `gid_base .. gid_base + games` of an evaluation match between two seats, each
-`{"net": <gen>}` or `{"bot": <name>}`, at a run's settings, exactly as `Run.play_match` plays a match (the
-Elo matches', the yardstick's): seats `Run.nn_seat(key, c['eval_sims'])` (key 'm' in seats[0], 'o' in
-seats[1]; a bot `games.seat_dict`), game g with `seats` for even g and the seats swapped for odd g,
+`{"net": <gen>}`, `{"net": <gen>, "set": {<setting>: <value>}}` or `{"bot": <name>}`, at a run's settings, exactly as
+`Run.play_match` plays a match (the Elo matches', the yardstick's): seats `Run.nn_seat(key, c['eval_sims'])` (key 'm'
+in seats[0], 'o' in seats[1]; a seat with a set: of the settings with its set over them - its own evaluation settings,
+docs/az.md 68, zero.seat_settings -; a bot `games.seat_dict`), game g with `seats` for even g and the seats swapped for
+odd g,
 `Run.driver(table, seed, conc=min(conc, games), paired=paired)` - the run's eval spec, threads, groups,
 max_steps, sparse. `match_driver` builds that driver here (the eval gate's Python side,
 tools/worker_eval_gate.py); the native worker (`zero_worker::evaljob`) plays the same games.
 
 A result row (one JSON line per game, `row_json`): `{"gid", "pair", "seats", "result", "margin", "rounds",
 "over"}` - `pair` gid // 2 (None unpaired), `seats` that game's seats in its order, `result` per seat in that
-order, `margin` seat 0's score minus the best other seat's, `json.dumps(row, separators=(',', ':'))`.
+order, `margin` seat 0's score minus the best other seat's, `json.dumps(row, separators=(',', ':'))` - a seat as
+`check_seats` writes it (a set's keys sorted: the worker's form).
 
 Traced rows (the eval setting `eval_trace`, docs/az.md 50; zero-farm analysis campaigns): each row also carries
 `digest` (`trace_digest` of its record) and `rec` (the game's record, zero-core docs/search.md 2.17: seed, every real
 move, result, margins, rounds, setup) - `replay_trace` plays it back through the game's engine (`replay_rows`) and
 checks it against the row. Only the native worker writes them (a Python match refuses the setting).
 
-`h2h_rows` turns rows into zero.h2h's (A in seat gid % 2) so `zero.h2h.summary` reads a farm head-to-head
-exactly as a local one; `elo_interval` is the 95% interval of the Elo difference.
+`h2h_rows` turns rows into zero.h2h's (A in seat gid % 2: A is the job's seats[0] as a whole - with its set, so two
+seats of one network are told apart) so `zero.h2h.summary` reads a farm head-to-head exactly as a local one;
+`elo_interval` is the 95% interval of the Elo difference; `seat_tags` names each seat's move rule as zero.h2h does.
 """
 import json
 import math
@@ -35,27 +39,49 @@ class _Stub:
 
 
 def check_seats(seats):
-    """The job's seats: two of {"net": gen} / {"bot": name}; an external bot (ext:) is refused."""
+    """The job's seats: two of {"net": gen} / {"net": gen, "set": {...}} / {"bot": name} - an external bot (ext:), an
+    empty set, a set on a bot or a set key that is not a seat setting (zero.seat_settings.SEAT_KEYS) refused - in the
+    form the worker writes them back (a set's keys sorted, recursively: the job line's parser sorts objects)."""
+    from .seat_settings import check_set
     if not isinstance(seats, (list, tuple)) or len(seats) != 2:
         raise ValueError(f'seats {seats!r}: two seats')
+    out = []
     for s in seats:
-        if not isinstance(s, dict) or len(s) != 1 or not ({'net', 'bot'} & set(s)):
-            raise ValueError(f'seat {s!r}: {{"net": <gen>}} or {{"bot": <name>}}')
+        keys = set(s) if isinstance(s, dict) else set()
+        if not isinstance(s, dict) or not (keys in ({'net'}, {'bot'}) or keys == {'net', 'set'}):
+            raise ValueError(f'seat {s!r}: {{"net": <gen>}}, {{"net": <gen>, "set": {{...}}}} or {{"bot": <name>}}')
         if 'net' in s and (isinstance(s['net'], bool) or not isinstance(s['net'], int) or s['net'] < 0):
             raise ValueError(f'seat {s!r}: net is a checkpoint generation')
         if 'bot' in s and (not isinstance(s['bot'], str) or not s['bot'] or s['bot'].startswith('ext:')):
             raise ValueError(f'seat {s!r}: a built-in bot (an ext: player runs on the desktop, not in a worker)')
-    return [dict(s) for s in seats]
+        if 'set' in s:
+            check_set(s['set'], what=f'seat {s!r}: set')
+            out.append({'net': s['net'], 'set': json.loads(json.dumps(s['set'], sort_keys=True))})
+        else:
+            out.append(dict(s))
+    return out
+
+
+def seat_cfgs(cfg, seats):
+    """Each seat's settings: `cfg` with the seat's set over it (a seat without one, a bot: `cfg` itself)."""
+    return [dict(cfg, **s['set']) if 'set' in s else cfg for s in check_seats(seats)]
 
 
 def seat_dicts(cfg, seats):
-    """The driver seats of the job's two seats (`Run.nn_seat(key, cfg['eval_sims'])` / `games.seat_dict`)."""
+    """The driver seats of the job's two seats (`Run.nn_seat(key, c['eval_sims'])` of each seat's settings - the job's,
+    with the seat's set over them - / `games.seat_dict`)."""
     from . import games as G, run as R
-    stub = _Stub(cfg)
     out = []
-    for k, s in enumerate(check_seats(seats)):
-        out.append(R.Run.nn_seat(stub, ('m', 'o')[k], cfg['eval_sims']) if 'net' in s else G.seat_dict(s['bot']))
+    for k, (s, c) in enumerate(zip(check_seats(seats), seat_cfgs(cfg, seats))):
+        out.append(R.Run.nn_seat(_Stub(c), ('m', 'o')[k], c['eval_sims']) if 'net' in s else G.seat_dict(s['bot']))
     return out
+
+
+def seat_tags(cfg, seats):
+    """Each seat's move rule as zero.h2h names it (`h2h._tag` of its driver seat: 'cq-n4-v50-s0.3-root-b1m0.25-ism'),
+    a bot's 'bot:<name>'."""
+    from .h2h import _tag
+    return [_tag(d) if 'net' in s else f'bot:{s["bot"]}' for s, d in zip(check_seats(seats), seat_dicts(cfg, seats))]
 
 
 def seats_of(seats, gid):
@@ -98,7 +124,9 @@ def resolve_eval_spec(cfg):
 
 
 def row(r, seats, paired):
-    """A driver result row (`take_results`) -> the job's result row (a dict, the protocol's keys in order)."""
+    """A driver result row (`take_results`) -> the job's result row (a dict, the protocol's keys in order; the seats as
+    `check_seats` writes them)."""
+    seats = check_seats(seats)
     g = int(r['gid'])
     sc = [float(x) for x in r['scores']]
     margin = sc[0] - max(sc[j] for j in range(1, len(sc))) if len(sc) > 1 else 0.0
@@ -184,15 +212,18 @@ def read_rows(text):
 
 
 def a_seat_of(rows, a):
-    """Check that `a` (A's seat, e.g. {"net": 1}) sits in seat gid % 2 of every row (`seats` [A, B] in the job)."""
+    """Check that `a` (A's seat as the job gives it, e.g. {"net": 1} or {"net": 1, "set": {...}}) sits in seat gid % 2 of
+    every row (`seats` [A, B] in the job): the whole seat, so two seats of one network are told apart by their sets."""
+    a = check_seats([a, a])[0]
     for r in rows:
         if r['seats'][r['gid'] % 2] != a:
             raise ValueError(f'game {r["gid"]}: A ({a}) is not in seat {r["gid"] % 2}: {r["seats"]}')
 
 
 def h2h_rows(rows):
-    """Rows of a job whose seats are [A, B] -> zero.h2h's match rows (A in seat gid % 2): `scores` [margin, 0]
-    gives `zero.h2h.summary` the same margin (seat 0's margin, A's sign by its seat)."""
+    """Rows of a job whose seats are [A, B] -> zero.h2h's match rows (A in seat gid % 2 - the job's order, whatever the
+    seats hold: two seats of one network too; `a_seat_of` checks it): `scores` [margin, 0] gives `zero.h2h.summary` the
+    same margin (seat 0's margin, A's sign by its seat)."""
     return [{'gid': r['gid'], 'result': r['result'], 'scores': [r['margin'], 0.0], 'over': r['over']} for r in rows]
 
 

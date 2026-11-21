@@ -44,7 +44,7 @@
 //! ```
 //!
 //! `serve`: `hello` first (aw, build_id, game, kinds, zero_onnx, pid, features - `["rolling", "setting_classes",
-//! "infer_workers"]` in a build with self-play: zero-farm PROTOCOL.md 10.5), then one `job` line (`op` job:
+//! "infer_workers", "seat_settings"]` in a build with self-play: zero-farm PROTOCOL.md 10.5), then one `job` line (`op` job:
 //! lease_id, kind 'selfplay', settings, games, gid_base, seed, model, reference (the self-test's set:
 //! answered before the first batch, `selftest` {provider, max_abs, ok}; a failure is fatal), threads, out_dir;
 //! optional gen - the rows' network id, default the graph's `checkpoint_iter` -, sha256 - the model FILE's,
@@ -61,7 +61,8 @@
 //! unfinished {gids: [[a, b)]}), `error` (message, fatal). The process exits after `end` (or a fatal
 //! error, status 1).
 //!
-//! An eval job (PROTOCOL.md 5.2, `evaljob`): kind 'eval', settings, seats ([{"net": gen} | {"bot": name}] x 2),
+//! An eval job (PROTOCOL.md 5.2, `evaljob`): kind 'eval', settings, seats ([{"net": gen} | {"net": gen, "set": {..}} |
+//! {"bot": name}] x 2: a network seat's `set` - its own evaluation settings over the job's, docs/az.md 68 -),
 //! paired, games, gid_base, seed, models ({"<gen>": {"model", "sha256"?, "reference"?}}: every one loaded and
 //! self-tested - `selftest` with its `gen` -, the file's sha256 checked), threads, out_dir, runtime_dir and
 //! the tuning fields; its settings must pass `check-config --eval` (else a fatal error); `evals` events (as
@@ -911,8 +912,8 @@ fn eval_cli(w: &'static Worker, a: &Args) -> Result<i32, String> {
     let uniform = a.has("--uniform");
     if uniform {
         for s in &seats {
-            if let crate::settings::EvalSeat::Net(g) = s {
-                models.entry(*g).or_insert(ModelSpec { model: PathBuf::from("uniform"), sha256: None, reference: None });
+            if let Some(g) = s.net() {
+                models.entry(g).or_insert(ModelSpec { model: PathBuf::from("uniform"), sha256: None, reference: None });
             }
         }
     }
@@ -985,7 +986,7 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
         let built = crate::settings::eval_driver_cfg(&s, &info, &seats, 2, 0, true, None, None, None).err();
         if a.has("--json") {
             let rows: Vec<Value> = v.iter().map(|x| json!({"key": x.key, "value": x.value, "status": x.status, "why": x.why})).collect();
-            println!("{}", add_platform(json!({"game": info.name, "job": "eval", "settings": rows, "failures": bad.iter().map(|x| &x.key).collect::<Vec<_>>(), "driver_error": built, "eval_reads": crate::settings::EVAL_READS})));
+            println!("{}", add_platform(json!({"game": info.name, "job": "eval", "settings": rows, "failures": bad.iter().map(|x| &x.key).collect::<Vec<_>>(), "driver_error": built, "eval_reads": crate::settings::EVAL_READS, "seat_reads": crate::settings::SEAT_READS})));
         } else {
             for st in ["play", "trainer", "unknown", "unsupported"] {
                 let ks: Vec<&str> = v.iter().filter(|x| x.status == st).map(|x| x.key.as_str()).collect();
@@ -1264,7 +1265,7 @@ mod tests {
     fn a_selfplay_build_announces_rolling() {
         static G: &[GameEntry] = &[];
         let w = Worker { games: G, repo: "toy", selfplay: true, fuzz: None, package_settings: &[] };
-        assert_eq!(w.features(), vec!["rolling", "setting_classes", "infer_workers"]);
+        assert_eq!(w.features(), vec!["rolling", "setting_classes", "infer_workers", "seat_settings"]);
         let f = Worker { selfplay: false, ..w };
         assert!(f.features().is_empty(), "a fuzz-only build plays no self-play jobs");
     }

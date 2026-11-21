@@ -9238,3 +9238,95 @@ of the same network: ~24k leaves/s). On the same PC: the farm's CUDA worker befo
 10.5k leaves/s; 66's float32 fast graph, one worker at 2,048 in flight, 16.1k; the trainer's own torch path ~32k (bf16
 and CUDA graphs), 20.0k in float32. The crew ran unmeasured by the agent's tuner (zero-farm's agent 0.3.6 doesn't yet
 measure a running crew in place), so the float16 graph's share of the gain is not separated from the layout's.
+
+## 68. Per-seat evaluation settings: an eval job seat's `set`, one mapping with zero.h2h's per-side options (no setting; the worker feature `seat_settings`; zero-farm PROTOCOL.md 5.2; MTG Zero's ISMCTS check, 2026-11-21)
+
+**Why.** On 2026-11-20 an evaluation-only check of information-set merging (30, docs/search.md 3.16) - one checkpoint on
+both sides, side A merging its trees and side B not (`zero.h2h CK CK --paired --a-infoset-merge 1 --b-infoset-merge 0`) -
+played 4 x 2,400 games on the desktop beside the live runs, because the farm could not express it: an eval job's seat was
+`{"net": gen}` or `{"bot": name}` and both seats took the job's one settings block. zero.h2h has a per-side option for
+every part of an evaluation seat a head-to-head varies (simulations, the move rule and its guard and transform, the
+leaf-value view, the root belief, the root search, merging), so every such A/B was local only.
+
+**What it does.**
+
+* **The wire** (zero-farm PROTOCOL.md 5.2): a network seat may carry `"set"`, an object of run settings - the settings that
+  seat's evaluation seat plays other than the job's: `[{"net": 1, "set": {"eval_infoset_merge": 1}}, {"net": 1}]`. The
+  seat plays `Run.nn_seat(key, eval_sims)` of the job's settings with its set over them (`dict(settings, **set)`; the
+  native worker `EvalSeat::NetSet`, `EvalSeat::settings`; `zero.farm_eval.seat_dicts`). Its keys are only what that seat
+  reads, `zero_worker::settings::SEAT_READS` = `zero.seat_settings.SEAT_KEYS`: eval_sims, c_puct, chance_k, margin_w,
+  redet, cq_c_visit, cq_c_scale, eval_select, eval_select_min_visits, eval_select_c_visit, eval_select_c_scale,
+  eval_root_min_visits, root_min_visits_max_actions, eval_leaf_value_view, eval_root_search, gumbel_m, eval_gumbel_scale,
+  eval_cache, eval_infoset_merge, eval_belief_tilt, belief_clip, belief_mix, belief_fast, eval_belief_tilts,
+  eval_value_choice_worlds, eval_value_choice_temp. Any other key (a setting of the match such as conc or eval_spec, an
+  unknown key, a Python-only feature such as the lookahead), an empty set, a set on a bot or beside other keys is refused
+  by `EvalSeat::parse` - an eval job's refusal and `check-config --eval --seats JSON`'s (its JSON adds `seat_reads`); a
+  seat whose settings `Run.nn_seat` refuses (a merge without root-view values) is refused naming the seat. A result row's
+  `seats` echo each seat with its set's keys sorted (the job line's parser holds objects sorted; `zero.farm_eval.
+  check_seats` writes the same form), so the Python and native rows are the same bytes. Two seats of one network
+  (`[{"net": 1, "set": {...}}, {"net": 1}]`, `checkpoints [1]`) are told apart by their sets: `farm_eval.a_seat_of` /
+  `summary` compare A's whole seat.
+* **The feature**: `hello` / `info` announce `seat_settings` (`zero_worker::FEATURE_SEAT_SETTINGS`); `zero.farm_h2h.
+  play_settings(..., seats=)` refuses a seat with a set for a build without it before anything is published (an older
+  worker would refuse the seat on the PC: "one key, net or bot"), and runs the build's check-config with the seats.
+* **One mapping** (`python/zero/seat_settings.py`): `add_side_args` defines zero.h2h's per-side options (the both-sides
+  flags `--select`, `--select-min-visits`, `--cq-c-visit / -scale`, `--infoset-merge`, `--gumbel-m`, and per side
+  `--{a,b}-sims`, `-select`, `-select-min-visits`, `-cq-c-visit / -scale`, `-leaf-value-view`, `-belief-tilt / -tilts /
+  -clip / -mix / -fast`, `-infoset-merge`, `-root-search`, `-gumbel-m` (new), `-gumbel-scale`; `--graphs` and
+  `--lookahead` only with `local`); `side_set` turns a side's options into its set over its settings - zero.h2h's
+  documented meaning, written as run settings (`SIDE_OPTIONS` names the settings each option writes; `LOCAL_ONLY` the two
+  with none: CUDA graphs and the lookahead are torch / Python features). zero.h2h builds each side's seat with it
+  (`h2h.sides_of`: the side's run settings - `side_settings` - with its set, `Run.nn_seat`); zero.farm_h2h gives its
+  seats the same sets over the job's settings (`[{"net": 1, "set": A}, {"net": 2, "set": B}]`; the readout names
+  `select_a` / `select_b` and `sims_a` / `sims_b` as zero.h2h does); MTG Zero's farm campaigns too (its docs/ENGINE.md
+  214). tests/test_seat_settings.py fails when zero.h2h gains a per-side option that is in neither `SIDE_OPTIONS` nor
+  `LOCAL_ONLY`, when a mapped option writes a key that is not a seat key, or when `SEAT_KEYS`, `SEAT_READS` and what
+  Run.nn_seat reads for an evaluation seat disagree - as crates/worker/src/run_settings.json does for self-play.
+* **The parity gate** (`tools/worker_eval_gate.py --seat-cases all|merge,sims,gumbel,belief,select`): one match per case,
+  the seats of `--seats` given their sets by `side_set` over the job's settings - `merge` (A merges, root-view values on
+  both, B does not), `sims` (A 2x, B 1/2 of eval_sims), `gumbel` (A the Gumbel root search, 4 options; B PUCT), `belief`
+  (A tilt 1, B 0), `select` (A 'cq' with guard 2, B 'visits') - the native worker's rows against `farm_eval.match_driver`'s,
+  byte for byte, and the first network batches.
+
+**No setting; a seat without a set is the seat of before.** `EvalSeat::Net` and `{"net": gen}` are unchanged: the rows,
+the traced records and the digests of every job without a set are what they were (crates/worker/tests/evaljob.rs: the
+earlier tests unchanged; `seat_sets_play_their_own_settings`: a set restating the job's settings plays the same games,
+the rows differing only in the seat's text). zero.farm_h2h and the campaigns send a set only for an option given, and
+only the keys whose value differs from the settings' (`seat_settings.changed`).
+
+**zero.h2h's meaning, now one** (a deliberate change of the local tool in four corners; `h2h.sides_of` against the old
+main() on 8 run configs x 30 option sets, 420 cases: 364 the same seats, the rest these four):
+
+1. `--select` / `--{a,b}-select` replaces the move rule only (its guard and transform). Before, it also dropped the side's
+   run's `eval_root_min_visits`, `eval_leaf_value_view`, `eval_infoset_merge` and `eval_value_choice_*` - against the
+   docstring, which says each side takes those from its run. A side of a run evaluating with root-view values keeps them.
+2. `--{a,b}-select-min-visits` without a rule was silently ignored; now it is the guard of the side's own rule ('cq'),
+   refused for a 'visits' side; `--select-min-visits` alone guards each side that plays 'cq' (refused when none does), as
+   the both-sides 'cq' transform flags already worked.
+3. `--{a,b}-belief-clip / -mix / -fast` with `--{a,b}-belief-tilt 0` (no belief) was silently ignored; now refused, as
+   it already was for a side without a belief.
+4. A Gumbel root search for a side whose run evaluates with root minimum visits is refused (Run.nn_seat: the two are
+   exclusive, docs/search.md 3.7); before, the side's seat carried both.
+
+A belief turned on for a side whose run evaluates without one takes clip 20, mix 0 and full searches only unless given
+(zero.h2h's with_belief, as before - its run's belief_clip / belief_mix may be self-play's).
+
+**Costs.** None for a job without sets. A seat with a set builds its settings once per job (a copy of the settings).
+
+**Tests and checks.** zero_worker: `settings::tests::seat_sets_parse_and_apply` (parse, refusals, the seat dict of a set,
+a refused seat named), `tests/evaljob.rs::seat_sets_play_their_own_settings` (toy, uniform evaluator: a restating set
+plays the same games, other sims / rule other games, seats keep their sides, a lease of the match plays its games, one
+network on both seats, a refused set), the hello features test; the full `cargo test -p zero_worker --release`.
+Python: tests/test_seat_settings.py (the keys against Run.nn_seat's reads and SEAT_READS, the drift check, side_set per
+option, zero.h2h's seats = the farm's seats of the same sets for 8 option sets, check_seats' form and refusals, Python
+matches playing each seat's settings, A told apart from B on one network); tests/test_farm_h2h.py
+`test_per_side_settings_are_the_seats_sets` (the sets in the job and the signed template, check-config run with the
+seats, the readout's rules and simulations, an old build refused before anything is published, per-side options on
+--resume refused); tests/worker_stub.py checks `--seats` as the worker does.
+
+**Measured** (2026-11-21, the desktop, CPU, beside the live runs). The parity gate on the toy game (`zw_toy`, two toy
+networks with the auxiliary head exported to zero-onnx, 24 paired games per case, eval_sims 16, the 'cq' rule, sparse
+rows, 2 search + 2 ONNX Runtime threads): all five cases, with one network on both seats and with gen 1 vs gen 2, **24 of
+24 rows byte-identical** and the first 60 batches identical in every array; the seats' rules as zero.h2h names them
+('cq-v50-s0.3-rv-ism' / 'cq-v50-s0.3-rv', 'gumbel-m4-v50-s0.3' / 'cq-v50-s0.3', 'cq-v50-s0.3-b1' / 'cq-v50-s0.3',
+'cq-n2' / 'visits'); the match without sets, 24 of 24 as before.

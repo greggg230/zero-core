@@ -96,8 +96,8 @@ impl EvalJob {
             return Err(format!("eval job: 2 seats (got {})", self.seats.len()));
         }
         for s in &self.seats {
-            if let EvalSeat::Net(g) = s {
-                if !self.models.contains_key(g) {
+            if let Some(g) = s.net() {
+                if !self.models.contains_key(&g) {
                     return Err(format!("eval job: seat {{\"net\": {g}}} but models has {:?}", self.models.keys().collect::<Vec<_>>()));
                 }
             }
@@ -417,8 +417,8 @@ fn build_evaluators(game: &GameEntry, job: &EvalJob, keys: &[(String, KeyKind)],
             "o" => &job.seats[1],
             other => return Err(format!("internal: an eval driver key {other:?}")),
         };
-        key_ev.push(match (seat, kind) {
-            (EvalSeat::Net(g), KeyKind::Nn) => Some(evs.iter().position(|e| e.0 == *g).expect("checked: the seat's model")),
+        key_ev.push(match (seat.net(), kind) {
+            (Some(g), KeyKind::Nn) => Some(evs.iter().position(|e| e.0 == g).expect("checked: the seat's model")),
             _ => None,
         });
     }

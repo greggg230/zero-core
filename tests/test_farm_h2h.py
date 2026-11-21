@@ -290,6 +290,49 @@ def test_a_head_to_head_end_to_end(tmp_path, capsys, monkeypatch):
                 client=cl)
 
 
+
+def test_per_side_settings_are_the_seats_sets(tmp_path, capsys, monkeypatch):
+    """docs/az.md 68: zero.h2h's per-side options on a farm head-to-head are its seats' sets (zero.seat_settings over the
+    job's settings), checked by the worker's check-config with the seats, in the definition's template; the farm plays each
+    seat's settings; the readout names each side's rule (select_a / select_b) and simulations as zero.h2h does. A worker
+    build that does not announce `seat_settings` is refused before anything is published; per-side options on --resume are
+    refused."""
+    monkeypatch.setenv('ZEROFARM_ADMIN_TOKEN', TOKEN)
+    stub = STUB.setup(monkeypatch, tmp_path, TOKEN)
+    monkeypatch.setenv('WORKER_STUB_BUILD', BID)
+    log = tmp_path / 'stub.log'
+    monkeypatch.setenv('WORKER_STUB_LOG', str(log))
+    a, b = _ckpts(tmp_path)
+    fake = Fake()
+    cl = FH.Client('http://fake', transport=fake)
+    st_dir = str(tmp_path / 'state')
+    side = ['--a-sims', '9', '--b-select', 'visits']
+    start = ['--a', a, '--b', b, '--games', '10', '--build', BID, '--runtime', RT, '--state-dir', st_dir, '--poll', '0',
+             '--threads', '1', '--worker', WORKER]
+    with pytest.raises(SystemExit, match='seat_settings'):
+        FH.main(start + ['--name', 'old'] + side, client=cl)
+    assert not [c for c in fake.calls if c[0] == 'PUT'] and not STUB.calls(stub['log'])
+    monkeypatch.setenv('WORKER_STUB_FEATURES', 'setting_classes,seat_settings')
+    assert FH.main(start + ['--name', 'sides'] + side, client=cl) == 0
+    run = 'h2h-sides'
+    job = fake.runs[run]['eval']['job']
+    seats = [{'net': 1, 'set': {'eval_sims': 9}}, {'net': 2, 'set': {'eval_select': 'visits'}}]   # (only what differs)
+    assert job['seats'] == seats
+    assert STUB.current(stub['state'], 'run', run)['doc']['jobs']['eval'] == job
+    checks = [json.loads(x)['argv'] for x in open(log, encoding='utf-8') if 'check-config' in x]
+    assert checks and all('--seats' in c and json.loads(c[c.index('--seats') + 1]) == seats for c in checks[-2:])
+    assert fake.played[1]['seats'] == [seats[1], seats[0]]
+    full = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert (full['select_a'], full['select_b']) == ('cq', 'visits') and (full['sims_a'], full['sims_b']) == (9, 6)
+    assert full['a_score'] == FE.summary(list(fake.played.values()), True, seats[0])['a_score']
+    with pytest.raises(SystemExit):
+        FH.main(['--resume', run, '--state-dir', st_dir, '--a-sims', '4'], client=cl)
+    # a refused combination: refused at the start, nothing put
+    n = len(fake.calls)
+    with pytest.raises(SystemExit):
+        FH.main(start + ['--name', 'bad', '--a-select', 'visits', '--a-cq-c-scale', '0.5'], client=cl)
+    assert [c for c in fake.calls[n:] if c[0] == 'PUT'] == []
+
 def _old_run_body(st, eval_on=True):
     """farm_h2h.run_body before run alternates (zero-farm PROTOCOL rev 11): a run without any must PUT these bytes."""
     b = {'game': st['game'], 'build_id': st['build_id'], 'runtime': st['runtime'], 'priority': st['priority'],
