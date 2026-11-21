@@ -11,15 +11,15 @@
 //! evaluator lane), their answers submitted in launch order, a `pump` after every answer: control, finished games into
 //! result rows, status.
 //!
-//! **The layout** (docs/az.md 70): a job line without `groups` plays in one group ([`EVAL_GROUPS`]; the settings'
-//! `groups` is the run's own batching, not the lease's), so a step's batches hold every game's leaf - one batch per
-//! seat key. Each batch goes to its key's **evaluator lane**, an evaluator thread of its own ([`LaneMode`]): on the CPU
-//! one lane per network seat (both seats one network: two sessions of it), on CUDA one per generation, on any other
-//! GPU provider one lane for every network (as before). A job line without `infer_threads` shares the job's inference
-//! threads among the lanes ([`lane_intra_threads`]). Only the batches change - which games' leaves a batch holds and
-//! how many run at once -, never a search: one leaf per game per batch, no virtual loss; a game's moves are the same
-//! when its network answers are (the farm's CPU graphs answer a row the same in any batch and with any thread count -
-//! measured, docs/az.md 70).
+//! **The layout** (docs/az.md 70, [`eval_layout`]): each batch goes to an **evaluator lane** of its key, an evaluator
+//! thread with sessions of its own, so the seats' batches - and on the CPU several groups' - run side by side. On the
+//! CPU a job line without `groups` gets groups from its threads, never the settings' `groups` (the run's own self-play
+//! batching made CPU leases ~2 rows an ONNX Runtime call), each key lanes of its own, each lane's session a few
+//! threads ([`EVAL_SESSION_THREADS`]); on CUDA a lane per generation; on any other GPU provider one lane for every
+//! network (as before); `LaneMode::One` is the layout before. Only the batches change - which games' leaves a batch
+//! holds and how many run at once -, never a search: one leaf per game per batch, no virtual loss; a game's moves are
+//! the same when its network answers are (the farm's CPU graphs answer a row the same in any batch and with any thread
+//! count - measured, docs/az.md 70).
 //!
 //! Results: one JSON line per game, `{"gid", "pair", "seats", "result", "margin", "rounds", "over"}` -
 //! `pair` = gid / 2 (null unpaired), `seats` this game's seats in its order, `result` per seat in that
@@ -77,7 +77,7 @@ pub struct EvalJob {
     /// ONNX Runtime's settings; None: the uniform evaluator answers every network (tests).
     pub ort: Option<OrtCfg>,
     /// The job named its inference threads (the job line's `infer_threads`, the command line's `--infer-threads`):
-    /// every lane's sessions get exactly `ort`'s; false: the lanes share them (`lane_intra_threads`).
+    /// every lane's sessions get exactly `ort`'s; false: the layout's (`eval_layout`).
     pub own_infer_threads: bool,
     /// The evaluator lanes (module docs; `LaneMode::Auto` unless a test or a measurement asks for the layout of before).
     pub lanes: LaneMode,
@@ -85,8 +85,8 @@ pub struct EvalJob {
     pub gid_base: u32,
     pub seed: u64,
     pub paired: bool,
-    /// Search threads (the settings' `threads` when None), and a job's own conc / groups (groups None: `EVAL_GROUPS`,
-    /// not the settings' - module docs).
+    /// Search threads (the settings' `threads` when None), and a job's own conc / groups (groups None on the CPU:
+    /// `eval_layout`'s, not the settings').
     pub search_threads: Option<usize>,
     pub conc: Option<usize>,
     pub groups: Option<usize>,
@@ -167,19 +167,24 @@ pub fn traced_row_json(row: &str, r: &GameResult) -> Result<String, String> {
     Ok(format!("{body},\"digest\":\"{digest}\",\"rec\":{rec}}}"))
 }
 
-/// The driver's groups of an eval job whose job line names none (module docs): one - a step's batch per seat key holds
-/// every game in flight. The settings' `groups` (the run's self-play batching, tuned for the desktop's GPU) made a CPU
-/// lease's batches games / groups / 2 rows: ~2 rows a call at 98% of a lease's time in ONNX Runtime (docs/az.md 70).
-pub const EVAL_GROUPS: usize = 1;
+/// The most intra-op threads of an eval job's CPU session when the job names none (docs/az.md 70): ONNX Runtime runs the
+/// farm's graphs (~1,000 small nodes) poorly on many threads - on an M4 3 threads 2,530 rows/s, 6 threads 2,650, 12
+/// slower than 4 (docs/az.md 62); the desktop's i9 fastest at 3-4 (63) -, so a CPU's threads serve the job as several
+/// sessions side by side, not one wide one.
+pub const EVAL_SESSION_THREADS: usize = 4;
+
+/// The most groups an eval job's CPU layout makes (`eval_layout`): each group's batches have lanes of their own, so the
+/// sessions running at once are about the job's threads / `EVAL_SESSION_THREADS`.
+pub const EVAL_MAX_GROUPS: usize = 4;
 
 /// How an eval job's network batches are spread over evaluator threads (module docs, docs/az.md 70).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneMode {
-    /// The CPU: one lane per network seat key ('m', 'o'; two sessions when both seats are one network); CUDA /
-    /// TensorRT-RTX: one per generation (the sessions of before, each on its own thread); any other GPU provider
-    /// (DirectML, OpenVINO, AMD's): one lane for every network (concurrent sessions there are untested).
+    /// `eval_layout`'s lanes: on the CPU lanes per network seat key, on CUDA / TensorRT-RTX one per generation, on any
+    /// other GPU provider one for every network.
     Auto,
-    /// One evaluator thread for every network (the layout before docs/az.md 70; tests and measurements).
+    /// One evaluator thread for every network and the settings' groups (the layout before docs/az.md 70; tests and
+    /// measurements).
     One,
 }
 
@@ -193,55 +198,93 @@ impl LaneMode {
     }
 }
 
-/// The lanes of an eval job: which lane answers each of the driver's keys (`key_gens`: each key's network generation,
-/// None for a bot's key) -> (each key's lane, each lane's keys). `per_key`: a lane per network key; else a lane per
-/// generation; `one`: a single lane for every network key (over both).
-pub fn lane_plan(key_gens: &[Option<u32>], per_key: bool, one: bool) -> (Vec<Option<usize>>, Vec<Vec<usize>>) {
-    let mut key_lane = vec![None; key_gens.len()];
-    let mut lanes: Vec<Vec<usize>> = Vec::new();
+/// An eval job's layout (module docs, docs/az.md 70): the driver's groups, the lanes (evaluator threads) each of the
+/// driver's keys sends its batches to (in turn), the keys each lane answers, each lane's sessions' intra-op threads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub groups: usize,
+    pub key_lanes: Vec<Vec<usize>>,
+    pub lane_keys: Vec<Vec<usize>>,
+    pub intra: usize,
+}
+
+/// The layout of an eval job. `key_gens`: each driver key's network generation (None: a bot's key); `provider`: the
+/// first the job asks for; `job_groups`: the job line's `groups`; `settings_groups`: the settings'; `intra` /
+/// `workers`: the job's sessions' threads and sessions (`proto::job_ort`: its `infer_threads` or search threads T, one
+/// session; macOS's CPU 3-thread sessions, T / 3 of them); `own`: the job named its `infer_threads`.
+///
+/// * `LaneMode::One`: the layout before - the job's groups or the settings', one lane for every network, `intra`.
+/// * A GPU provider: the job's groups or the settings' (the agent's GPU rule leaves out a `groups` equal to the
+///   template's); CUDA / TensorRT-RTX a lane per generation, any other provider one lane; the job's threads shared by
+///   the lanes unless its own.
+/// * The CPU: sessions of S = min(`intra`, `EVAL_SESSION_THREADS`) threads (`intra` when the job named its threads); n
+///   network keys; the threads `intra` x `workers` = B. Groups: the job's, else B / (n S) within 1..`EVAL_MAX_GROUPS`
+///   (never the settings': the run's own self-play batching made CPU leases ~2 rows a call). Each key gets W = B / (n S)
+///   lanes within 1..groups (its batches go to them in turn: a group's batch runs beside the others'), each lane its own
+///   session (one network on both seats: sessions of it per key), of B / (n W) threads within 1..S (the job's own
+///   `intra` when named). 16 threads, two networks: 2 groups, 4 lanes of 4; 6 threads: 1 group, 2 lanes of 3; a Mac's
+///   3 x 5: 2 groups, 4 lanes of 3.
+#[allow(clippy::too_many_arguments)]
+pub fn eval_layout(key_gens: &[Option<u32>], mode: LaneMode, provider: ProviderKind, job_groups: Option<usize>, settings_groups: usize, intra: usize, workers: usize, own: bool) -> Layout {
+    let intra = intra.max(1);
+    let budget = intra * workers.max(1);
+    let nn: Vec<usize> = (0..key_gens.len()).filter(|&k| key_gens[k].is_some()).collect();
+    let mut key_lanes = vec![Vec::new(); key_gens.len()];
+    let mut lane_keys: Vec<Vec<usize>> = Vec::new();
     let mut lane_gen: Vec<u32> = Vec::new();
-    for (k, g) in key_gens.iter().enumerate() {
-        let Some(g) = *g else { continue };
-        let i = if one && !lanes.is_empty() {
-            0
-        } else if !per_key {
-            match lane_gen.iter().position(|&x| x == g) {
-                Some(i) => i,
-                None => {
-                    lanes.push(Vec::new());
+    // (one lane per generation, or one for all)
+    let mut shared = |all: bool, key_lanes: &mut Vec<Vec<usize>>, lane_keys: &mut Vec<Vec<usize>>| {
+        for &k in &nn {
+            let g = key_gens[k].unwrap();
+            let i = match (all, lane_gen.iter().position(|&x| x == g)) {
+                (true, _) if !lane_keys.is_empty() => 0,
+                (false, Some(i)) => i,
+                _ => {
+                    lane_keys.push(Vec::new());
                     lane_gen.push(g);
-                    lanes.len() - 1
+                    lane_keys.len() - 1
+                }
+            };
+            lane_keys[i].push(k);
+            key_lanes[k].push(i);
+        }
+    };
+    let cpu = provider == ProviderKind::Cpu;
+    let (groups, intra) = match (mode, cpu) {
+        (LaneMode::One, _) => {
+            shared(true, &mut key_lanes, &mut lane_keys);
+            (job_groups.unwrap_or(settings_groups).max(1), intra)
+        }
+        (LaneMode::Auto, false) => {
+            let per_gen = matches!(provider, ProviderKind::Cuda | ProviderKind::TensorRtRtx);
+            shared(!per_gen, &mut key_lanes, &mut lane_keys);
+            let t = if own { intra } else { (budget / lane_keys.len().max(1)).clamp(1, intra) };
+            (job_groups.unwrap_or(settings_groups).max(1), t)
+        }
+        (LaneMode::Auto, true) => {
+            let s = if own { intra } else { intra.min(EVAL_SESSION_THREADS) };
+            let n = nn.len().max(1);
+            let fit = budget / (n * s);
+            let groups = job_groups.unwrap_or(fit.clamp(1, EVAL_MAX_GROUPS)).max(1);
+            let w = fit.clamp(1, groups);
+            for &k in &nn {
+                for _ in 0..w {
+                    lane_keys.push(vec![k]);
+                    key_lanes[k].push(lane_keys.len() - 1);
                 }
             }
-        } else {
-            lanes.push(Vec::new());
-            lane_gen.push(g);
-            lanes.len() - 1
-        };
-        lanes[i].push(k);
-        key_lane[k] = Some(i);
-    }
-    (key_lane, lanes)
+            let t = if own { intra } else { (budget / (n * w)).clamp(1, s) };
+            (groups, t)
+        }
+    };
+    Layout { groups, key_lanes, lane_keys, intra }
 }
 
-/// Intra-op threads of each lane's sessions. `intra` is the job's per session (its `infer_threads`, or its search
-/// threads; macOS's CPU sessions are 3 threads, `proto::default_workers`), `workers` its sessions. When the job named
-/// its threads (`own`): `intra` exactly. Else the job's inference threads (`intra` x `workers`) shared by the `lanes`
-/// that run at once, at most `intra` each: a Windows CPU job of 16 threads with two lanes gets 8 each, a Mac's (3 x 5)
-/// 3 each.
-pub fn lane_intra_threads(intra: usize, workers: usize, lanes: usize, own: bool) -> usize {
-    if own {
-        return intra.max(1);
-    }
-    let budget = intra.max(1) * workers.max(1);
-    (budget / lanes.max(1)).clamp(1, intra.max(1))
-}
-
-/// The lanes' evaluators (`lane_plan`'s lanes): each lane a session of every generation its keys play (`build` makes
+/// The lanes' evaluators (`Layout::lane_keys`): each lane a session of every generation its keys play (`build` makes
 /// one), its keys mapped to them; every other key of the driver None in that lane.
-fn lane_evaluators(key_gens: &[Option<u32>], key_lane: &[Option<usize>], lane_keys: &[Vec<usize>], build: &mut dyn FnMut(u32) -> Result<Box<dyn Evaluator>, String>) -> Result<Vec<ByKey>, String> {
+fn lane_evaluators(key_gens: &[Option<u32>], lane_keys: &[Vec<usize>], build: &mut dyn FnMut(u32) -> Result<Box<dyn Evaluator>, String>) -> Result<Vec<ByKey>, String> {
     let mut lanes = Vec::with_capacity(lane_keys.len());
-    for (i, ks) in lane_keys.iter().enumerate() {
+    for ks in lane_keys {
         let mut evs: Vec<(u32, Box<dyn Evaluator>)> = Vec::new();
         for &k in ks {
             let g = key_gens[k].ok_or("internal: a lane's key without a network")?;
@@ -249,7 +292,7 @@ fn lane_evaluators(key_gens: &[Option<u32>], key_lane: &[Option<usize>], lane_ke
                 evs.push((g, build(g)?));
             }
         }
-        let key_ev = key_gens.iter().enumerate().map(|(k, g)| g.filter(|_| key_lane[k] == Some(i)).and_then(|g| evs.iter().position(|e| e.0 == g))).collect();
+        let key_ev = key_gens.iter().enumerate().map(|(k, g)| g.filter(|_| ks.contains(&k)).and_then(|g| evs.iter().position(|e| e.0 == g))).collect();
         lanes.push(ByKey { evs, key_ev });
     }
     Ok(lanes)
@@ -303,8 +346,9 @@ struct EvalRun<'a> {
     pending: VecDeque<u64>,
     /// Answers of later batches that came before the oldest's (several lanes).
     early: HashMap<u64, (Result<Answer, String>, f64)>,
-    /// Each driver key's lane (its evaluator thread).
-    key_lane: Vec<Option<usize>>,
+    /// Each driver key's lanes (evaluator threads; its batches go to them in turn) and its next one.
+    key_lanes: Vec<Vec<usize>>,
+    rr: Vec<usize>,
     /// Batches in flight at most: INFLIGHT, or one per lane.
     inflight: usize,
     progress: Arc<Mutex<Progress>>,
@@ -445,7 +489,10 @@ impl EvalRun<'_> {
         if let Some(r) = &mut self.recorder {
             r.add(&b);
         }
-        let lane = self.key_lane.get(b.key as usize).copied().flatten().ok_or_else(|| format!("a batch of key {} that no network answers", b.key))?;
+        let k = b.key as usize;
+        let lanes = self.key_lanes.get(k).filter(|l| !l.is_empty()).ok_or_else(|| format!("a batch of key {} that no network answers", b.key))?;
+        let lane = lanes[self.rr[k] % lanes.len()];
+        self.rr[k] += 1;
         let mut s = self.ctl.s.lock().unwrap();
         while s.yielded && !s.quit {
             s = self.ctl.cv.wait(s).unwrap();
@@ -515,14 +562,8 @@ impl EvalRun<'_> {
     }
 }
 
-/// An eval job's evaluator lanes (module docs): every model of `models` loaded and self-tested (the event `selftest`
-/// with its `gen`, once per generation - a generation's further sessions are tested quietly; a failure ends the job
-/// before any game), each lane's sessions on its share of the inference threads, the driver's keys mapped to the lanes.
-/// -> (the lanes, each key's lane, the lanes' intra-op threads).
-#[allow(clippy::type_complexity)]
-fn build_lanes(game: &GameEntry, job: &EvalJob, keys: &[(String, KeyKind)], belief: bool, sink: &dyn Sink, progress: &Mutex<Progress>) -> Result<(Vec<ByKey>, Vec<Option<usize>>, usize), String> {
-    let info = (game.info)();
-    let want = Expect::of(&info, belief);
+/// Each of the driver's keys' network generation (None: a bot's key).
+fn key_gens_of(job: &EvalJob, keys: &[(String, KeyKind)]) -> Result<Vec<Option<u32>>, String> {
     let mut key_gens = Vec::with_capacity(keys.len());
     for (k, kind) in keys {
         let seat = match k.as_str() {
@@ -535,22 +576,21 @@ fn build_lanes(game: &GameEntry, job: &EvalJob, keys: &[(String, KeyKind)], beli
             _ => None,
         });
     }
-    // (the provider the job asks for first decides the lanes; a session that falls back to the CPU keeps its lane)
-    let first = job.ort.as_ref().and_then(|o| o.providers.first().copied()).unwrap_or(ProviderKind::Cpu);
-    let (per_key, one) = match (job.lanes, first) {
-        (LaneMode::One, _) => (false, true),
-        (LaneMode::Auto, ProviderKind::Cpu) => (true, false),
-        (LaneMode::Auto, ProviderKind::Cuda | ProviderKind::TensorRtRtx) => (false, false),
-        (LaneMode::Auto, _) => (false, true),
-    };
-    let (key_lane, lane_keys) = lane_plan(&key_gens, per_key, one);
+    Ok(key_gens)
+}
+
+/// An eval job's evaluator lanes (`layout`; module docs): every model of `models` loaded and self-tested (the event
+/// `selftest` with its `gen`, once per generation - a generation's further sessions are tested quietly; a failure ends
+/// the job before any game), each lane's sessions with the layout's intra-op threads.
+fn build_lanes(game: &GameEntry, job: &EvalJob, key_gens: &[Option<u32>], layout: &Layout, belief: bool, sink: &dyn Sink, progress: &Mutex<Progress>) -> Result<Vec<ByKey>, String> {
+    let info = (game.info)();
+    let want = Expect::of(&info, belief);
     let ort = job.ort.as_ref().map(|o| {
         let mut o = o.clone();
-        o.intra_threads = lane_intra_threads(o.intra_threads, o.workers, lane_keys.len(), job.own_infer_threads);
+        o.intra_threads = layout.intra;
         o.workers = 1;
         o
     });
-    let intra = ort.as_ref().map_or(0, |o| o.intra_threads);
     let mut worst: Option<f64> = None;
     let mut tested: Vec<u32> = Vec::new();
     let mut build = |gen: u32| -> Result<Box<dyn Evaluator>, String> {
@@ -571,7 +611,7 @@ fn build_lanes(game: &GameEntry, job: &EvalJob, keys: &[(String, KeyKind)], beli
             }
         })
     };
-    let lanes = lane_evaluators(&key_gens, &key_lane, &lane_keys, &mut build)?;
+    let lanes = lane_evaluators(key_gens, &layout.lane_keys, &mut build)?;
     // every model of the job checked and self-tested, a network no seat plays too (as before)
     for &g in job.models.keys() {
         if job.ort.is_some() && !key_gens.contains(&Some(g)) {
@@ -580,7 +620,7 @@ fn build_lanes(game: &GameEntry, job: &EvalJob, keys: &[(String, KeyKind)], beli
     }
     drop(build);
     progress.lock().unwrap().selftest_max_abs = worst;
-    Ok((lanes, key_lane, intra))
+    Ok(lanes)
 }
 
 /// Run an eval job to its end (`link_out`: the evaluator link, for the agent's yield / resume).
@@ -588,18 +628,25 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
     let t0 = Instant::now();
     job.check()?;
     let info = (game.info)();
-    // (a job line without groups: one group, EVAL_GROUPS - not the settings' groups; module docs)
-    let m = eval_driver_cfg(&job.settings, &info, &job.seats, job.games, job.seed, job.paired, job.conc, job.search_threads, Some(job.groups.unwrap_or(EVAL_GROUPS)))?;
-    let cfg = eval_lease_cfg(m);
+    let m = eval_driver_cfg(&job.settings, &info, &job.seats, job.games, job.seed, job.paired, job.conc, job.search_threads, job.groups)?;
+    let mut cfg = eval_lease_cfg(m);
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
     let spec = eval_spec_of(&job.settings)?;
     let trace = eval_trace_of(&job.settings)?;
-    let (lanes, key_lane, intra) = build_lanes(game, job, &cfg.keys, belief, sink, &progress)?;
+    // the layout (module docs): the driver's groups (cfg.groups is the job's or the settings'), the lanes, their threads
+    let key_gens = key_gens_of(job, &cfg.keys)?;
+    // (the provider the job asks for first decides; a session that falls back to the CPU keeps its lane)
+    let first = job.ort.as_ref().and_then(|o| o.providers.first().copied()).unwrap_or(ProviderKind::Cpu);
+    let (intra0, workers0) = job.ort.as_ref().map_or((cfg.threads, 1), |o| (o.intra_threads, o.workers));
+    let layout = eval_layout(&key_gens, job.lanes, first, job.groups, cfg.groups, intra0, workers0, job.own_infer_threads);
+    cfg.groups = layout.groups;
+    let lanes = build_lanes(game, job, &key_gens, &layout, belief, sink, &progress)?;
+    let intra = layout.intra;
     let lane_text: Vec<String> = lanes
         .iter()
         .enumerate()
         .map(|(i, l)| {
-            let ks: Vec<&str> = cfg.keys.iter().enumerate().filter(|(k, _)| key_lane[*k] == Some(i)).map(|(_, (n, _))| n.as_str()).collect();
+            let ks: Vec<&str> = layout.lane_keys[i].iter().map(|&k| cfg.keys[k].0.as_str()).collect();
             format!("lane {i} (keys {}): {}", ks.join(", "), l.describe())
         })
         .collect();
@@ -654,7 +701,8 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
         answers,
         pending: VecDeque::new(),
         early: HashMap::new(),
-        key_lane,
+        rr: vec![0; layout.key_lanes.len()],
+        key_lanes: layout.key_lanes,
         inflight: INFLIGHT.max(n_lanes),
         progress: progress.clone(),
         recorder: job.record_batches.as_ref().map(|(p, n)| Recorder::new(p.clone(), *n)),
@@ -712,32 +760,43 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
 mod tests {
     use super::*;
 
-    #[test]
-    fn lanes_per_key_per_generation_or_one() {
-        // keys m (gen 1), o (gen 2)
-        assert_eq!(lane_plan(&[Some(1), Some(2)], true, false), (vec![Some(0), Some(1)], vec![vec![0], vec![1]]));
-        assert_eq!(lane_plan(&[Some(1), Some(2)], false, false), (vec![Some(0), Some(1)], vec![vec![0], vec![1]]));
-        assert_eq!(lane_plan(&[Some(1), Some(2)], false, true), (vec![Some(0), Some(0)], vec![vec![0, 1]]));
-        // both seats one network: a lane per key on the CPU, one per generation on CUDA
-        assert_eq!(lane_plan(&[Some(1), Some(1)], true, false), (vec![Some(0), Some(1)], vec![vec![0], vec![1]]));
-        assert_eq!(lane_plan(&[Some(1), Some(1)], false, false), (vec![Some(0), Some(0)], vec![vec![0, 1]]));
-        // a bot's key has no lane
-        assert_eq!(lane_plan(&[None, Some(2)], true, false), (vec![None, Some(0)], vec![vec![1]]));
-        assert_eq!(lane_plan(&[None, None], true, false), (vec![None, None], vec![]));
+    fn lay(gens: &[Option<u32>], mode: LaneMode, p: ProviderKind, job_groups: Option<usize>, settings_groups: usize, intra: usize, workers: usize, own: bool) -> (usize, Vec<Vec<usize>>, Vec<Vec<usize>>, usize) {
+        let l = eval_layout(gens, mode, p, job_groups, settings_groups, intra, workers, own);
+        (l.groups, l.key_lanes, l.lane_keys, l.intra)
     }
 
     #[test]
-    fn lane_threads_share_the_jobs() {
-        // a Windows CPU job of 16 threads (16 x 1): two lanes of 8; one lane 16; 3 threads, 2 lanes: 1 each
-        assert_eq!(lane_intra_threads(16, 1, 2, false), 8);
-        assert_eq!(lane_intra_threads(16, 1, 1, false), 16);
-        assert_eq!(lane_intra_threads(3, 1, 2, false), 1);
-        assert_eq!(lane_intra_threads(1, 1, 2, false), 1);
-        // macOS's CPU sessions (3 threads x 5): 3 each, never more than a session's
-        assert_eq!(lane_intra_threads(3, 5, 2, false), 3);
-        // the job's own infer_threads: exactly those
-        assert_eq!(lane_intra_threads(4, 1, 2, true), 4);
-        assert_eq!(lane_intra_threads(6, 1, 0, false), 6);
+    fn eval_layouts() {
+        use ProviderKind::{Cpu, Cuda, DirectMl};
+        let two = [Some(1), Some(2)];
+        // the layout before: the settings' groups (or the job's), one lane, the job's threads
+        assert_eq!(lay(&two, LaneMode::One, Cpu, None, 4, 16, 1, false), (4, vec![vec![0], vec![0]], vec![vec![0, 1]], 16));
+        assert_eq!(lay(&two, LaneMode::One, Cpu, Some(2), 4, 16, 1, false), (2, vec![vec![0], vec![0]], vec![vec![0, 1]], 16));
+        // the CPU: 16 threads -> 2 groups (never the settings' 4), two lanes per key of 4 threads
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 16, 1, false), (2, vec![vec![0, 1], vec![2, 3]], vec![vec![0], vec![0], vec![1], vec![1]], 4));
+        // 6 threads: 1 group, a lane per key of 3; 20: 2 groups, 2 lanes per key of 4; 32: 4 groups, 4 lanes of 4
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 6, 1, false), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 3));
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 20, 1, false), (2, vec![vec![0, 1], vec![2, 3]], vec![vec![0], vec![0], vec![1], vec![1]], 4));
+        let l32 = lay(&two, LaneMode::Auto, Cpu, None, 4, 32, 1, false);
+        assert_eq!((l32.0, l32.2.len(), l32.3), (4, 8, 4));
+        // 1 or 2 threads: one group, a lane per key of one thread
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 1, 1, false), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 1));
+        // macOS's 3-thread sessions (16 threads: 3 x 5): 2 groups, 4 lanes of 3
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 3, 5, false), (2, vec![vec![0, 1], vec![2, 3]], vec![vec![0], vec![0], vec![1], vec![1]], 3));
+        // the job's own groups: kept, lanes per key at most that many
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, Some(1), 4, 16, 1, false), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 4));
+        // the job's own threads (a gate's --infer-threads 4): sessions of exactly 4, one lane per key on 4 threads
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 4, 1, true), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 4));
+        // one network on both seats: lanes per key all the same (sessions of it per key)
+        assert_eq!(lay(&[Some(1), Some(1)], LaneMode::Auto, Cpu, None, 4, 6, 1, false), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 3));
+        // a bot's key has no lane; one network key gets the threads: 16 -> 4 groups, 4 lanes of 4
+        assert_eq!(lay(&[None, Some(2)], LaneMode::Auto, Cpu, None, 4, 16, 1, false), (4, vec![vec![], vec![0, 1, 2, 3]], vec![vec![1], vec![1], vec![1], vec![1]], 4));
+        assert_eq!(lay(&[None, None], LaneMode::Auto, Cpu, None, 4, 16, 1, false).2, Vec::<Vec<usize>>::new());
+        // CUDA: the job's or the settings' groups, a lane per generation, the threads shared
+        assert_eq!(lay(&two, LaneMode::Auto, Cuda, None, 2, 16, 1, false), (2, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 8));
+        assert_eq!(lay(&[Some(1), Some(1)], LaneMode::Auto, Cuda, Some(1), 4, 16, 1, false), (1, vec![vec![0], vec![0]], vec![vec![0, 1]], 16));
+        // other GPU providers: one lane, as before
+        assert_eq!(lay(&two, LaneMode::Auto, DirectMl, None, 2, 16, 1, false), (2, vec![vec![0], vec![0]], vec![vec![0, 1]], 16));
     }
 
     /// An evaluator whose answer names its network: the value of every row is the generation.
@@ -753,36 +812,38 @@ mod tests {
 
     #[test]
     fn each_key_reaches_its_network() {
-        for (gens, per_key, one) in [([Some(1), Some(2)], true, false), ([Some(1), Some(2)], false, false), ([Some(1), Some(2)], false, true), ([Some(2), Some(2)], true, false), ([Some(2), Some(2)], false, false), ([None, Some(2)], true, false)] {
-            let (key_lane, lane_keys) = lane_plan(&gens, per_key, one);
+        use ProviderKind::{Cpu, Cuda, DirectMl};
+        for (gens, p, threads) in [([Some(1), Some(2)], Cpu, 16), ([Some(1), Some(2)], Cpu, 6), ([Some(1), Some(2)], Cuda, 16), ([Some(1), Some(2)], DirectMl, 16), ([Some(2), Some(2)], Cpu, 16), ([Some(2), Some(2)], Cuda, 16), ([None, Some(2)], Cpu, 16)] {
+            let l = eval_layout(&gens, LaneMode::Auto, p, None, 2, threads, 1, false);
             let mut built = Vec::new();
-            let mut lanes = lane_evaluators(&gens, &key_lane, &lane_keys, &mut |g| {
+            let mut lanes = lane_evaluators(&gens, &l.lane_keys, &mut |g| {
                 built.push(g);
                 Ok(Box::new(Tagged(g)))
             })
             .unwrap();
             // one session per (lane, generation)
-            let want_sessions: usize = lane_keys.iter().map(|ks| {
+            let want_sessions: usize = l.lane_keys.iter().map(|ks| {
                 let mut g: Vec<u32> = ks.iter().map(|&k| gens[k].unwrap()).collect();
+                g.sort();
                 g.dedup();
                 g.len()
             }).sum();
-            assert_eq!(built.len(), want_sessions, "{gens:?} {per_key} {one}");
+            assert_eq!(built.len(), want_sessions, "{gens:?} {p:?}");
             for (k, g) in gens.iter().enumerate() {
                 let mut b = Batch::default();
                 (b.key, b.b) = (k as u16, 1);
-                match (g, key_lane[k]) {
-                    (Some(g), Some(i)) => {
-                        assert_eq!(lanes[i].evaluate(&b).unwrap().value[0], *g as f32, "key {k} of {gens:?}: its network");
-                        // and no other lane answers it
-                        for (j, l) in lanes.iter_mut().enumerate() {
-                            if j != i {
-                                assert!(l.evaluate(&b).is_err());
+                match g {
+                    Some(g) => {
+                        assert!(!l.key_lanes[k].is_empty());
+                        for (j, lane) in lanes.iter_mut().enumerate() {
+                            if l.key_lanes[k].contains(&j) {
+                                assert_eq!(lane.evaluate(&b).unwrap().value[0], *g as f32, "key {k} of {gens:?}: its network");
+                            } else {
+                                assert!(lane.evaluate(&b).is_err(), "lane {j} answers only its keys");
                             }
                         }
                     }
-                    (None, None) => {}
-                    other => panic!("key {k}: {other:?}"),
+                    None => assert!(l.key_lanes[k].is_empty()),
                 }
             }
         }

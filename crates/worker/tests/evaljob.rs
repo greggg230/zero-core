@@ -373,6 +373,14 @@ fn one_group_and_lanes_play_the_rows_of_before() {
     assert_eq!(ra, rb, "the rows (and their records) of before, byte for byte");
     let (na, nb) = (oa.stats["infer_batches"].as_u64().unwrap(), ob.stats["infer_batches"].as_u64().unwrap());
     assert!(nb * 2 < na, "one group: fewer, larger batches ({nb} against {na})");
+    // 16 threads: 2 groups, two lanes per seat (batches to them in turn): the same rows
+    let mut j16 = jb.clone();
+    j16.out_dir = tmp("lanes-16");
+    j16.search_threads = Some(16);
+    let (o16, _, l16) = run_logged(&j16, |_, _, _, _| {});
+    assert!(line(&l16).contains("groups 2; 4 evaluator lane(s)"), "{}", line(&l16));
+    assert!(line(&l16).contains("lane 1 (keys m)") && line(&l16).contains("lane 3 (keys o)"), "{}", line(&l16));
+    assert_eq!(rows(&o16).0, ra);
     // a lease of games 8..20 in the new layout: those games of the match
     let mut jc = jb.clone();
     jc.out_dir = c;
