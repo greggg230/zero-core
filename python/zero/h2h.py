@@ -96,6 +96,18 @@ Paired games and sequential testing (docs/az.md 20.3):
 Each batch b > 0 is seeded seed + 7919 b (batch 0: --seed, so a one-batch run is the plain match); the
 scores, se and pairs are over every game played; `batches` lists each batch's games, score and llr
 (cumulative), and a progress line per batch goes to stderr ('# batch {...}').
+
+Where the games are played (docs/az.md 69): --backend auto | farm | local (default auto). A game package may name
+another place to play a match (`GamePackage.h2h_backend`; MTG Zero: zero-farm campaigns, its docs/ENGINE.md 217). Under
+'auto' zero.h2h asks it, before any game, whether it can play exactly this match (its conditions: the package's) and
+plays there if so, else here - never a fallback in the middle of a match; one stderr line says which and why
+('h2h: backend local - --lookahead is local-only', 'h2h: backend farm - campaign ...'). 'farm': there, or refused (exit
+2 with the reason). 'local': here, as before. A package without one plays here ('auto': its line says so). The JSON
+line names its backend (`backend` 'local' | 'farm'); a farm match prints the same keys as a local one (the summary,
+`select_a` / `select_b`, `sims_a` / `sims_b`, `batches` / `stop` / `sprt`, `paired`; `merge` null - the local
+driver's counters - and none of the local-only `graphs_*`, `look`, `precision`, `sparse`) plus the backend's own
+(`remote_match`), and --records keeps its games from their traced records in the local records' format. The two
+backends' games are not bit-identical (torch here, ONNX Runtime there): compare series of one backend.
 """
 import argparse
 import json
@@ -618,17 +630,9 @@ def _sides_sims(out, sims_a, sims_b):
         out['sims_b'] = out['sims'] if sims_b is None else int(sims_b)
 
 
-def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, beta=0.05, target_se=None, sims=64,
-               chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None, spec=None, conc=None,
-               seat_a=None, seat_b=None, max_steps=5000, paired=False, sims_a=None, sims_b=None, on_batch=None,
-               rows=False, graphs=None, max_rows=None, sparse=None, precision=None):
-    """`match` in batches of `batch_games` until decided: `sprt` (elo0, elo1) - the log-likelihood ratio
-    (`sprt_llr`) leaves `sprt_bounds(alpha, beta)` - or `se` <= `target_se`, or `max_games` played. Batch k
-    is seeded seed + 7919 k (batch 0: `seed`, the plain match's games). -> `match`'s dict over every game,
-    plus 'batches' (games, a_score, se, llr per batch, cumulative), 'stop' (why it stopped) and with `sprt`
-    'sprt' {elo0, elo1, alpha, beta, llr, lower, upper, decision 'H1' | 'H0' | 'undecided'}. `on_batch(dict)`:
-    called after each batch with the cumulative result (progress lines). The game ids of batch k follow
-    the earlier batches' (pairs stay 2j, 2j + 1)."""
+def seq_bounds(sprt=None, alpha=0.05, beta=0.05, target_se=None, paired=False, batch_games=600, max_games=2400):
+    """A sequential match's arguments checked (`sequential`'s rules) -> (elo0, elo1, lower, upper): the SPRT's
+    hypotheses and LLR bounds (None without `sprt`); ValueError for a combination refused."""
     if sprt is None and target_se is None:
         raise ValueError('sequential: give sprt (elo0, elo1) and / or target_se')
     if paired and batch_games % 2:
@@ -641,17 +645,19 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
         if e1 <= e0:
             raise ValueError(f'sprt: elo1 ({e1}) must be > elo0 ({e0})')
         lo, hi = sprt_bounds(alpha, beta)
-    ma, mb, game = _load_pair(a, b, device, game)
-    spec = match_spec(a, b, game, spec)            # (A's run's evaluation spec unless given: Run.driver's, docs/az.md 44.3)
-    sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
-    mr = _max_rows(sa, sb, max_rows)
-    sp = _sparse(sa, sb, sparse)
-    evs = _evaluators(ma, mb, device, graphs, mr, precision)
-    t0 = time.time()
-    st = []
+    return e0, e1, lo, hi
+
+
+def batch_loop(play, batch_games, max_games, paired, bounds, target_se=None, on_batch=None, t0=None):
+    """zero.h2h's sequential schedule (docs/az.md 20.3) over `play(k, n, gid_offset)` -> batch k's rows (its n games,
+    ids 0..n-1; the caller seeds batch k seed + 7919 k): batches until the SPRT of `bounds` (`seq_bounds`) decides,
+    the score's se <= `target_se`, or `max_games` are played -> (rows over every batch - ids following the earlier
+    batches', pairs kept 2j, 2j + 1 -, batches [{games, a_score, se, llr}], stop, llr). Local matches (`sequential`)
+    and another backend's (docs/az.md 69) run this one loop."""
+    e0, e1, lo, hi = bounds
+    t0 = time.time() if t0 is None else t0
     rs, batches, stop, llr = [], [], None, None
     k = 0
-    rec = _rec(a, b, sa, sb)
     while stop is None:
         n = min(batch_games, max_games - len(rs))
         if paired:
@@ -659,13 +665,12 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
         if n <= 0:
             stop = 'max_games'
             break
-        got = _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired, st, sp,
-                    rec, {'batch': k, 'gid_offset': len(rs)})
+        got = play(k, n, len(rs))
         off = len(rs)
         rs += [dict(r, gid=r['gid'] + off) for r in got]
         cur = summary(rs, paired)
         row = {'games': len(rs), 'a_score': cur['a_score'], 'se': cur['se']}
-        if sprt is not None:
+        if e0 is not None:
             llr = sprt_llr(observations(rs, paired), e0, e1)
             row['llr'] = round(llr, 3)
             if llr >= hi:
@@ -680,6 +685,46 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
         if on_batch is not None:
             on_batch(dict(row, seconds=round(time.time() - t0, 1), stop=stop))
         k += 1
+    return rs, batches, stop, llr
+
+
+def _seq_tail(out, bounds, alpha, beta, llr, stop, target_se):
+    """A sequential match's `sprt` (with an SPRT) and `target_se` fields."""
+    e0, e1, lo, hi = bounds
+    if e0 is not None:
+        out['sprt'] = {'elo0': e0, 'elo1': e1, 'alpha': alpha, 'beta': beta, 'llr': round(llr or 0.0, 3),
+                       'lower': round(lo, 3), 'upper': round(hi, 3),
+                       'decision': 'H1' if stop == 'sprt H1' else 'H0' if stop == 'sprt H0' else 'undecided'}
+    if target_se is not None:
+        out['target_se'] = target_se
+
+
+def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, beta=0.05, target_se=None, sims=64,
+               chance_k=2, c_puct=1.0, seed=0, threads=4, groups=2, device='cpu', game=None, spec=None, conc=None,
+               seat_a=None, seat_b=None, max_steps=5000, paired=False, sims_a=None, sims_b=None, on_batch=None,
+               rows=False, graphs=None, max_rows=None, sparse=None, precision=None):
+    """`match` in batches of `batch_games` until decided: `sprt` (elo0, elo1) - the log-likelihood ratio
+    (`sprt_llr`) leaves `sprt_bounds(alpha, beta)` - or `se` <= `target_se`, or `max_games` played. Batch k
+    is seeded seed + 7919 k (batch 0: `seed`, the plain match's games). -> `match`'s dict over every game,
+    plus 'batches' (games, a_score, se, llr per batch, cumulative), 'stop' (why it stopped) and with `sprt`
+    'sprt' {elo0, elo1, alpha, beta, llr, lower, upper, decision 'H1' | 'H0' | 'undecided'}. `on_batch(dict)`:
+    called after each batch with the cumulative result (progress lines). The game ids of batch k follow
+    the earlier batches' (pairs stay 2j, 2j + 1). The schedule is `batch_loop`'s."""
+    bounds = seq_bounds(sprt, alpha, beta, target_se, paired, batch_games, max_games)
+    ma, mb, game = _load_pair(a, b, device, game)
+    spec = match_spec(a, b, game, spec)            # (A's run's evaluation spec unless given: Run.driver's, docs/az.md 44.3)
+    sa, sb = _seats(a, b, ma, mb, game, sims, c_puct, chance_k, seat_a, seat_b, sims_a, sims_b)
+    mr = _max_rows(sa, sb, max_rows)
+    sp = _sparse(sa, sb, sparse)
+    evs = _evaluators(ma, mb, device, graphs, mr, precision)
+    t0 = time.time()
+    st = []
+    rec = _rec(a, b, sa, sb)
+
+    def play(k, n, off):
+        return _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired, st, sp,
+                     rec, {'batch': k, 'gid_offset': off})
+    rs, batches, stop, llr = batch_loop(play, batch_games, max_games, paired, bounds, target_se, on_batch, t0)
     out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb), batches=batches, stop=stop)
     _sides_sims(out, sims_a, sims_b)
@@ -691,12 +736,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
         out['sparse'] = True
     if paired:
         out['paired'] = True
-    if sprt is not None:
-        out['sprt'] = {'elo0': e0, 'elo1': e1, 'alpha': alpha, 'beta': beta, 'llr': round(llr or 0.0, 3),
-                       'lower': round(lo, 3), 'upper': round(hi, 3),
-                       'decision': 'H1' if stop == 'sprt H1' else 'H0' if stop == 'sprt H0' else 'undecided'}
-    if target_se is not None:
-        out['target_se'] = target_se
+    _seq_tail(out, bounds, alpha, beta, llr, stop, target_se)
     if rows:
         out['rows'] = sorted(rs, key=lambda r: r['gid'])
     return out
@@ -748,6 +788,13 @@ def parser():
     ap.add_argument('--records-kind', default='h2h', help="the records' kind (default 'h2h')")
     ap.add_argument('--label-a', default=None, help="side A's name in the records (default: its checkpoint id)")
     ap.add_argument('--label-b', default=None, help="side B's name in the records")
+    ap.add_argument('--backend', default='auto', choices=BACKENDS,
+                    help="where the games are played (docs/az.md 69): 'auto' (default) - the game package's other "
+                         "backend (MTG Zero: the farm) when it can play exactly this match, else here, decided before "
+                         "any game and said in one line; 'farm' - there or refused; 'local' - here")
+    be = package.active().h2h_backend_of()
+    if be is not None:
+        be.add_args(ap)                            # (the backend's own options, e.g. MTG Zero's --farm-*)
     return ap
 
 
@@ -785,6 +832,43 @@ def sides_of(a):
             seat['lookahead'] = lk
         out.append(seat)
     return out
+
+
+BACKENDS = ('auto', 'farm', 'local')
+
+
+class Refused(ValueError):
+    """--backend farm, and the match cannot be played there (the reason)."""
+
+
+def backend_choice(a, sides, seq):
+    """Where a command line's match is played (docs/az.md 69), decided before any game -> (name, why, runner):
+    ('local', why, None) - here (`why`: asked, or what keeps it off the other backend) - or ('farm', what, runner)
+    (the game package's `h2h_backend` plans it). Refused under --backend farm when it cannot."""
+    if a.backend == 'local':
+        return 'local', 'asked (--backend local)', None
+    pkg = package.active()
+    be = pkg.h2h_backend_of()
+    if be is None or getattr(be, 'name', None) != 'farm':
+        why = f'{pkg.title} has no farm backend (GamePackage.h2h_backend)'
+        if a.backend == 'farm':
+            raise Refused(why)
+        return 'local', why, None
+    ok, why, runner = be.plan(a, a.backend, sides, seq)
+    if ok:
+        return be.name, why, runner
+    if a.backend == 'farm':
+        raise Refused(why)
+    return 'local', why, None
+
+
+def _sink_of(a, ap):
+    if not a.records:
+        return None
+    try:
+        return GR.MatchSink(a.records, a.records_kind, labels={'a': a.label_a, 'b': a.label_b}, meta={'tool': 'h2h'})
+    except ValueError as e:
+        ap.error(str(e))
 
 
 def main(argv=None):
@@ -831,15 +915,18 @@ def main(argv=None):
         graphs = tuple(None if v is None else bool(v)
                        for v in (a.graphs if a.a_graphs is None else a.a_graphs,
                                  a.graphs if a.b_graphs is None else a.b_graphs))
-    sink = None
-    if a.records:
-        try:
-            sink = GR.MatchSink(a.records, a.records_kind, labels={'a': a.label_a, 'b': a.label_b},
-                                meta={'tool': 'h2h'})
-        except ValueError as e:
-            ap.error(str(e))
-    with GR.recording(sink):
-        _main_play(a, seq, sprt, sides, graphs)
+    try:
+        name, why, runner = backend_choice(a, sides, seq)
+    except Refused as e:
+        ap.exit(2, f'h2h: backend {a.backend} refused - {e}\n')
+    print(f'h2h: backend {name} - {why}', file=sys.stderr, flush=True)
+    sink = _sink_of(a, ap)
+    if runner is not None:
+        out = remote_match(runner, a, sides, seq, sprt, sink, name)
+        print(json.dumps(out), flush=True)
+    else:
+        with GR.recording(sink):
+            _main_play(a, seq, sprt, sides, graphs)
     if sink is not None:
         print(f'# game records: {sink.stats["games"]} games in {sink.stats["files"]} file(s) under {sink.dir()}',
               file=sys.stderr, flush=True)
@@ -850,14 +937,77 @@ def _main_play(a, seq, sprt, sides, graphs):
         out = sequential(a.a, a.b, a.batch_games or a.games, a.max_games or 4 * a.games, sprt, a.alpha, a.beta,
                          a.target_se, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device, spec=a.spec,
                          seat_a=sides[0], seat_b=sides[1], paired=a.paired, sims_a=a.a_sims, sims_b=a.b_sims,
-                         on_batch=lambda r: print('# batch ' + json.dumps(r), file=sys.stderr, flush=True), graphs=graphs,
+                         on_batch=_progress, graphs=graphs,
                          max_rows=a.max_rows, conc=a.conc, groups=a.groups, sparse=a.sparse, precision=a.precision)
-        print(json.dumps(out), flush=True)
-        return
-    print(json.dumps(match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
-                           spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log, paired=a.paired,
-                           sims_a=a.a_sims, sims_b=a.b_sims, graphs=graphs, max_rows=a.max_rows, conc=a.conc,
-                           groups=a.groups, sparse=a.sparse, precision=a.precision)), flush=True)
+    else:
+        out = match(a.a, a.b, a.games, a.sims, a.chance_k, a.c_puct, a.seed, a.threads, device=a.device,
+                    spec=a.spec, seat_a=sides[0], seat_b=sides[1], move_log=a.move_log, paired=a.paired,
+                    sims_a=a.a_sims, sims_b=a.b_sims, graphs=graphs, max_rows=a.max_rows, conc=a.conc,
+                    groups=a.groups, sparse=a.sparse, precision=a.precision)
+    out['backend'] = 'local'                       # (docs/az.md 69: the line names where its games were played)
+    print(json.dumps(out), flush=True)
+
+
+def _progress(r):
+    print('# batch ' + json.dumps(r), file=sys.stderr, flush=True)
+
+
+def remote_match(runner, a, sides, seq=False, sprt=None, sink=None, name='farm'):
+    """A command line's match played by another backend (docs/az.md 69): `runner.play(k, n, seed)` plays batch k
+    (the plain match: batch 0, seeded --seed; a sequential match `batch_loop`'s batches, seeded seed + 7919 k), zero.h2h
+    reads its rows as a local match's - the same JSON line (`summary`, the sides' rules, simulations, `batches`,
+    `stop`, `sprt`, `paired`), `merge` null (the drivers' merged-tree counters are the local driver's), no
+    `graphs_*` / `look` / `precision` / `sparse` (local only) - plus `runner.info()`. Both checkpoints are loaded here
+    first (on the CPU: the encoding guard, the belief head of a side with a root belief - the local match's
+    refusals); `sink`: each batch's traced records written as a local match writes its own (`src` the backend's)."""
+    ma, mb, game = _load_pair(a.a, a.b, 'cpu', None)
+    spec = match_spec(a.a, a.b, game, a.spec)
+    sa, sb = _seats(a.a, a.b, ma, mb, game, a.sims, a.c_puct, a.chance_k, sides[0], sides[1], a.a_sims, a.b_sims)
+    del ma, mb
+    pa = pb = None
+    if sink is not None:
+        pa = GR.net_player(a.a, sink.labels.get('a'), sa, _tag(sa))
+        pb = GR.net_player(a.b, sink.labels.get('b'), sb, _tag(sb))
+    t0 = time.time()
+
+    def play(k, n, off):
+        seed = a.seed + 7919 * k
+        got = runner.play(k, n, seed)
+        if sorted(int(r['gid']) for r in got) != list(range(n)):
+            raise RuntimeError(f'backend {name}: batch {k} came back with {len(got)} games, not ids 0..{n - 1}')
+        if sink is not None:
+            items = []
+            for r in sorted(got, key=lambda r: int(r['gid'])):
+                if not isinstance(r.get('rec'), dict):
+                    raise RuntimeError(f'backend {name}: game {r["gid"]} has no record: --records cannot keep it')
+                ps = [pa, pb] if int(r['gid']) % 2 == 0 else [pb, pa]
+                items.append(GR.from_trace(r['rec'], G.spec_json(spec), sink.kind, ps, sink.it, name))
+            meta = {'driver_seed': int(seed), 'paired': bool(a.paired), 'backend': name}
+            if seq:
+                meta.update(batch=k, gid_offset=off)
+            sink.add(items, meta)
+        return [{k2: r[k2] for k2 in ('gid', 'result', 'scores', 'over')} for r in got]
+    if seq:
+        bounds = seq_bounds(sprt, a.alpha, a.beta, a.target_se, a.paired, a.batch_games or a.games,
+                            a.max_games or 4 * a.games)
+        rs, batches, stop, llr = batch_loop(play, a.batch_games or a.games, a.max_games or 4 * a.games, a.paired, bounds,
+                                            a.target_se, _progress, t0)
+    else:
+        rs = play(0, a.games, 0)
+    out = dict({'a': a.a, 'b': a.b, 'game': game, 'sims': a.sims, 'chance_k': a.chance_k}, **summary(rs, a.paired))
+    out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb))
+    if seq:
+        out.update(batches=batches, stop=stop)
+    _sides_sims(out, a.a_sims, a.b_sims)
+    if sa.get('infoset_merge') or sb.get('infoset_merge'):
+        out['merge'] = None                        # (the local driver's counters: not the backend's)
+    if a.paired:
+        out['paired'] = True
+    if seq:
+        _seq_tail(out, bounds, a.alpha, a.beta, llr, stop, a.target_se)
+    out['backend'] = name
+    out.update(runner.info())
+    return out
 
 
 if __name__ == '__main__':

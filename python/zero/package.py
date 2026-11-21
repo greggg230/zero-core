@@ -143,6 +143,15 @@ class GamePackage:
                     `tools/fork_run.py --source` after the fork's files are copied and before its config.json is
                     written (`cfg`: the fork's settings, the --set overrides applied - the hook may change them in
                     place; `overrides`: the --set settings). Default none
+    h2h_backend     zero.h2h's other place to play a match (docs/az.md 69; MTG Zero: zero-farm's campaigns), an object or
+                    'module:attr' (resolved when zero.h2h builds its parser, so its module must import light) with
+                    `name` 'farm', `add_args(ap)` (its own options on zero.h2h's command line) and `plan(a, ask, sides,
+                    seq)` -> (ok, why, runner): can it play exactly this match (`a`: the parsed command line, `ask`
+                    'auto' | 'farm', `sides`: the seat dicts a local match plays, `seq`: a sequential match) - ok False:
+                    `why` is the reason (zero.h2h plays here under 'auto', refuses under 'farm'); ok True: `why` names
+                    where, `runner.play(k, n, seed)` plays batch k's n games (ids 0..n-1, base seed `seed`) and returns
+                    zero.h2h's match rows (gid, result, scores, over, and `rec`: each game's traced record), and
+                    `runner.info()` the output's own keys. Default none: zero.h2h plays here only
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
@@ -151,7 +160,7 @@ class GamePackage:
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
                  remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None, engine_paths=None,
-                 setting_classes=None):
+                 setting_classes=None, h2h_backend=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -192,6 +201,7 @@ class GamePackage:
         self.on_fork = on_fork
         self.engine_paths = tuple(engine_paths) if engine_paths else None
         self.setting_classes = dict(setting_classes or {})
+        self.h2h_backend = h2h_backend
         for k, c in self.setting_classes.items():
             if k not in self.settings:
                 raise ValueError(f'{name}: setting_classes names {k!r}, which is not one of the package\'s settings')
@@ -222,6 +232,13 @@ class GamePackage:
         name = str(spec.get('name') or 'companion')
         return {'name': name, 'cmd': list(cmd), 'log': str(spec.get('log') or f'{name}_console.txt'),
                 'env': {str(k): str(v) for k, v in (spec.get('env') or {}).items()}}
+
+    def h2h_backend_of(self):
+        """`h2h_backend` resolved (docs/az.md 69), or None: zero.h2h plays here only."""
+        b = self.h2h_backend
+        if isinstance(b, str):
+            b = self.h2h_backend = resolve(b)
+        return b
 
     def fork_hook(self):
         """`on_fork` resolved (docs/az.md 49), or None."""

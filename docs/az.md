@@ -9359,3 +9359,76 @@ by a farm PC** (two leases, 20 + 12 games; none local), every row's digest its r
 replayed from seed + moves, 6 of the farm's games replayed by the desktop's worker byte-identical (row and digest), the
 rows' seats echoing the set; the readout named side A 'cq-n4-v50-s0.3-rv-b1m0.25-ism' and side B
 'cq-n4-v50-s0.3-rv-b1m0.25'. (16 simulations and 32 games: a test of the path, not a measurement of the merge.)
+
+## 69. Where zero.h2h plays a match: `--backend auto | farm | local`, the game package's `h2h_backend` (no setting; MTG Zero's farm by default, its docs/ENGINE.md 217, 2026-11-21)
+
+**Why.** The owner wants experiments that play many games to use zero-farm (friends' idle PCs and the owner's Macs) by
+default. After 68 the farm could play every per-side head-to-head, but only through MTG Zero's campaign tool (submit,
+collect, build ids); sessions reach for `zero.h2h` because it is one command, so the 2026-11-20 ISMCTS check (4 x
+2,400 games at 64 simulations) took ~4 h of the desktop's GPU and paused a live run for 72 minutes. This section makes
+the one command use the farm when it can, without changing what a local match is.
+
+**What it does.**
+
+* **`--backend auto | farm | local`** on zero.h2h's command line (default `auto`). `auto`: ask the game package's
+  backend, before any game, whether it can play exactly this match; play there if so, else here. `farm`: there, or
+  refused (exit 2, `h2h: backend farm refused - <reason>`). `local`: here, exactly as before (the backend is not asked).
+  The decision is made once, up front - never as a fallback in the middle of a match - and one stderr line says which
+  and why: `h2h: backend local - asked (--backend local)`, `h2h: backend local - Zero Core has no farm backend
+  (GamePackage.h2h_backend)`, `h2h: backend local - --lookahead is local-only (...)`, `h2h: backend farm - campaign
+  cmp-h2h-..., build 5e4023e2 + CUDA/DML/macOS`. The reasons and the conditions are the package's.
+* **The hook** (`GamePackage(h2h_backend=...)`, an object or 'module:attr' resolved when zero.h2h builds its parser,
+  so its module must import light; `GamePackage.h2h_backend_of()`): `name` 'farm'; `add_args(ap)` - its own options
+  on zero.h2h's parser (MTG Zero's `--farm-*`); `plan(a, ask, sides, seq)` -> `(ok, why, runner)` - `a` the parsed
+  command line, `ask` 'auto' | 'farm', `sides` the two seat dicts a local match plays (`h2h.sides_of`: each side's run
+  settings with zero.h2h's per-side options over them, 68), `seq` a sequential match; ok False: `why` is the reason;
+  ok True: `why` names where, `runner.play(k, n, seed)` plays batch k's `n` games - ids 0..n-1, base seed `seed`, game g
+  of the seats in order for even g and swapped for odd g (A in seat g % 2, as a local match), paired as `a.paired` -
+  and returns zero.h2h's match rows (`gid`, `result`, `scores`, `over`) each with `rec`, the game's traced record
+  (docs/search.md 2.17, 50); `runner.info()` the output's own keys. A package without one: every match local, `auto`
+  says so, `farm` is refused.
+* **One output** (`remote_match`). zero.h2h loads both checkpoints on the CPU first (the encoding guard, the belief head
+  of a side with a root belief: the local match's refusals), builds the seats as `match` does (`_seats`) and reads the
+  backend's rows as a local match's: the same JSON line - `a`, `b`, `game`, `sims`, `chance_k`, `summary`'s fields
+  (`a_score`, `se`, `a_margin`, `elo_diff`, `elo_se`, `unfinished`, `pairs`, `se_games`, `variance_ratio`),
+  `seconds` (the backend's wall time), `select_a` / `select_b`, `sims_a` / `sims_b`, `batches` / `stop` / `sprt` /
+  `target_se`, `paired` - then `backend` (the backend's name) and `runner.info()`. Keys a local driver makes and a
+  backend cannot: `merge` (the drivers' merged-tree counters) is null when a side merges; `graphs_a` / `graphs_b`,
+  `look`, `perf`, `max_rows`, `precision`, `sparse` never appear (their options are local-only or local resources);
+  `per_game` (a chained contest's games, 42) is not produced from the rows. A local match's line gains `backend`
+  'local' (its last key); `match()` and `sequential()` themselves are unchanged.
+* **Sequential matches, one schedule** (`batch_loop`, `seq_bounds`): zero.h2h's batches (batch k seeded seed + 7919 k,
+  ids following the earlier batches', the SPRT / target-se / max-games stops) are one function that `sequential()` and
+  `remote_match` both run - a backend plays batch after batch exactly where a local match would, and stops at the same
+  point on the same rows.
+* **Records** (`--records DIR`): a backend's games are written from their traced records (`gamerec.from_trace`) as a
+  local match writes its own - one file per batch under `DIR/<kind>/misc/`, both players in their seats, `meta` the
+  local match's (`driver_seed`, `paired`, `batch`, `gid_offset`) plus `backend`, `src` the backend's name.
+
+**No setting; local is the match of before.** `--backend local` (and `auto` for a package without a backend) plays the
+same games through the same `match` / `sequential` code: tests/test_h2h_backend.py compares the line with
+`h2h.match`'s key for key and number for number. The refactor of `sequential` into `seq_bounds` / `batch_loop` /
+`_seq_tail` keeps its batches, seeds, stops, record meta and key order (the earlier sequential tests unchanged:
+test_gamerec_all, test_measure, test_gumbel, test_onnx). Two backends' games are not bit-identical (torch here, a native
+ONNX worker there, whose GPU routes may play float16 variants, 67): the line's `backend` names its backend, so a
+series is never mixed by accident.
+
+**Costs.** A local match: one stderr line (and, with a backend, its `plan`: MTG Zero's takes ~0.2 s - git, the release
+index, the worker's check-config). A backend's match: two checkpoint loads on the CPU before its games.
+
+**Tests and checks.** tests/test_h2h_backend.py (a fake backend on the toy that plays its batches through `h2h.match`
+itself, so its line can be compared with the local one): no backend - the line is `match`'s plus `backend` 'local', the
+one log line, `farm` refused (exit 2); a backend's plain match - its options parsed, `plan` asked with `ask` 'auto' and
+the local match's seats (`sides_of`), batch 0 seeded `--seed`, the line's keys and numbers the local match's of the same
+games plus `backend` and its own keys, per-side simulations and pairs included; `--records` - one file of the batch,
+players in their seats with their simulations, `meta` and `src`, every record replaying to its result; a sequential
+match through the backend - batches seeded seed + 7919 k, the line (`batches`, `stop`, `sprt`) equal to the local
+sequential match's; a backend that cannot - `auto` local with its reason, `farm` refused, `local` never asks it;
+`batch_loop` and `seq_bounds` on given rows and refusals. With the h2h tests of test_seat_settings, test_gamerec_all,
+test_farm_h2h, test_select, test_lookahead, test_infoset_merge, test_belief, test_gumbel, test_measure, test_onnx: all
+passed (2026-11-21, the desktop beside the live runs; one unrelated flaky tolerance in test_token_graphs.py
+`test_absent_slots_are_never_read[max]` failed once in the long run and passed three times alone, with and without
+this change).
+
+**Measured.** MTG Zero's farm backend end to end (the scaled-down ISMCTS check through `python -m mtgz.az.h2h` with
+`--backend auto`, the auto -> local cases): its docs/ENGINE.md 217.
