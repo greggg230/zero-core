@@ -143,6 +143,13 @@ class GamePackage:
                     `tools/fork_run.py --source` after the fork's files are copied and before its config.json is
                     written (`cfg`: the fork's settings, the --set overrides applied - the hook may change them in
                     place; `overrides`: the --set settings). Default none
+    row_selectors   game -> fn(select, shard, ctx) -> numpy bool [rows], or 'module:attr' (docs/az.md 71): a
+                    multi-source distillation's row selector (`zero.distill.select_rows`): which rows of shard
+                    `shard` (a path) the selector `select` (a non-empty dict of the game's own keys, e.g. MTG
+                    Zero's {"actor": <deck name>}) takes; ctx {'meta': the shard's meta, 'config': its run's
+                    config.json as a dict (or None), 'config_path', 'source': the source's name}. It must be
+                    exact and loud: an unknown key, a name the run does not have, or a row it cannot decide
+                    raises (ValueError). Default none: a source's `select` must be {} (every row)
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
@@ -151,7 +158,7 @@ class GamePackage:
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
                  remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None, engine_paths=None,
-                 setting_classes=None):
+                 setting_classes=None, row_selectors=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -192,6 +199,7 @@ class GamePackage:
         self.on_fork = on_fork
         self.engine_paths = tuple(engine_paths) if engine_paths else None
         self.setting_classes = dict(setting_classes or {})
+        self.row_selectors = dict(row_selectors or {})
         for k, c in self.setting_classes.items():
             if k not in self.settings:
                 raise ValueError(f'{name}: setting_classes names {k!r}, which is not one of the package\'s settings')
@@ -238,6 +246,13 @@ class GamePackage:
             return True
         n = int(cfg.get(s, self.settings[s]) or 0)
         return n > 0 and int(it) % n == 0
+
+    def row_selector_of(self, game):
+        """`game`'s row selector fn(select, shard, ctx) -> bool [rows] (`row_selectors`, docs/az.md 71), or None."""
+        f = self.row_selectors.get(game)
+        if isinstance(f, str):
+            f = self.row_selectors[game] = resolve(f)
+        return f
 
     def selfplay_spec_fn(self, game):
         """`game`'s self-play spec hook fn(run, it) -> spec JSON or None (`selfplay_specs`), or None."""
