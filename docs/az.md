@@ -9462,5 +9462,10 @@ state.json - and a restart clears it; a coordinator answering 503 three times is
 bef9cc8 (this section's code; what follows it is Python and docs): `games: 3 of 3 checked` (glassroad-zero 44 s,
 caverna-zero 35 s, kingdombuilder-zero 66 s), GREEN. With the rest of the files the change touches (test_farm_pool,
 test_farm_guards, test_worker_settings, test_loop, test_eval_pool, test_multi_remote, test_farm_h2h, test_privacy,
-test_run_infra, test_farm_def): 126 passed, 8 skipped (the live-run fence). The full suite: MTG Zero's optin-core gate
-of the pin (its core pytest step), ENGINE.md 218.
+test_run_infra, test_farm_def): 127 passed, 8 skipped (the live-run fence). The full suite on the desktop beside two
+live runs (2026-11-21, 31 min): 790 passed, 31 skipped (the live-run fence), 3 failed - none this change's:
+`test_dup_reduce.py::test_max_is_deterministic_on_cuda_and_matches_the_cpu` fails alone on this commit and on c850a5d
+(the commit before) alike, with the desktop's GPU busy with a live run; `test_token_graphs.py::
+test_absent_slots_are_never_read[max]` (CUDA graphs) and `test_shard_thread.py::test_rolling_run_quotas_exact` (97 games
+for a quota of 96 in a rolling writer-thread run, a toy run without a farm pool) pass alone. MTG Zero's optin-core gate
+of the pin runs the suite again (its core pytest step), ENGINE.md 218.
