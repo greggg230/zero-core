@@ -173,9 +173,11 @@ pub fn traced_row_json(row: &str, r: &GameResult) -> Result<String, String> {
 /// sessions side by side, not one wide one.
 pub const EVAL_SESSION_THREADS: usize = 4;
 
-/// The most groups an eval job's CPU layout makes (`eval_layout`): each group's batches have lanes of their own, so the
-/// sessions running at once are about the job's threads / `EVAL_SESSION_THREADS`.
-pub const EVAL_MAX_GROUPS: usize = 4;
+/// The driver's groups of a CPU eval job whose job line names none (`eval_layout`): one - a step's batch per seat holds
+/// every game in flight, the two seats' batches on two lanes at once. Measured on the farm (docs/az.md 70, 16-thread
+/// PCs): 32-game leases 645-658 games/h in one group against 524-651 in two (four lanes of half the rows), 64-game
+/// leases 709-838 against 656 - a second group splits a lease's last games into still smaller batches.
+pub const EVAL_GROUPS: usize = 1;
 
 /// How an eval job's network batches are spread over evaluator threads (module docs, docs/az.md 70).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,12 +220,12 @@ pub struct Layout {
 ///   template's); CUDA / TensorRT-RTX a lane per generation, any other provider one lane; the job's threads shared by
 ///   the lanes unless its own.
 /// * The CPU: sessions of S = min(`intra`, `EVAL_SESSION_THREADS`) threads (`intra` when the job named its threads); n
-///   network keys; the threads `intra` x `workers` = B. Groups: the job's, else B / (n S) within 1..`EVAL_MAX_GROUPS`
-///   (never the settings': the run's own self-play batching made CPU leases ~2 rows a call). Each key gets W = B / (n S)
-///   lanes within 1..groups (its batches go to them in turn: a group's batch runs beside the others'), each lane its own
+///   network keys; the threads `intra` x `workers` = B. Groups: the job's, else `EVAL_GROUPS` (never the settings': the
+///   run's own self-play batching made CPU leases ~2 rows a call). Each key gets W = B / (n S) lanes within 1..groups (its
+///   batches go to them in turn: with the job's groups G > 1, a group's batch runs beside the others'), each lane its own
 ///   session (one network on both seats: sessions of it per key), of B / (n W) threads within 1..S (the job's own
-///   `intra` when named). 16 threads, two networks: 2 groups, 4 lanes of 4; 6 threads: 1 group, 2 lanes of 3; a Mac's
-///   3 x 5: 2 groups, 4 lanes of 3.
+///   `intra` when named). Two networks, no job groups: 16 threads 1 group, 2 lanes of 4; 6 threads 2 lanes of 3; a Mac's
+///   3 x 5 2 lanes of 3; a job's groups 2 on 16 threads: 4 lanes of 4.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_layout(key_gens: &[Option<u32>], mode: LaneMode, provider: ProviderKind, job_groups: Option<usize>, settings_groups: usize, intra: usize, workers: usize, own: bool) -> Layout {
     let intra = intra.max(1);
@@ -265,7 +267,7 @@ pub fn eval_layout(key_gens: &[Option<u32>], mode: LaneMode, provider: ProviderK
             let s = if own { intra } else { intra.min(EVAL_SESSION_THREADS) };
             let n = nn.len().max(1);
             let fit = budget / (n * s);
-            let groups = job_groups.unwrap_or(fit.clamp(1, EVAL_MAX_GROUPS)).max(1);
+            let groups = job_groups.unwrap_or(EVAL_GROUPS).max(1);
             let w = fit.clamp(1, groups);
             for &k in &nn {
                 for _ in 0..w {
@@ -618,7 +620,6 @@ fn build_lanes(game: &GameEntry, job: &EvalJob, key_gens: &[Option<u32>], layout
             drop(build(g)?);
         }
     }
-    drop(build);
     progress.lock().unwrap().selftest_max_abs = worst;
     Ok(lanes)
 }
@@ -760,6 +761,7 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn lay(gens: &[Option<u32>], mode: LaneMode, p: ProviderKind, job_groups: Option<usize>, settings_groups: usize, intra: usize, workers: usize, own: bool) -> (usize, Vec<Vec<usize>>, Vec<Vec<usize>>, usize) {
         let l = eval_layout(gens, mode, p, job_groups, settings_groups, intra, workers, own);
         (l.groups, l.key_lanes, l.lane_keys, l.intra)
@@ -772,25 +774,26 @@ mod tests {
         // the layout before: the settings' groups (or the job's), one lane, the job's threads
         assert_eq!(lay(&two, LaneMode::One, Cpu, None, 4, 16, 1, false), (4, vec![vec![0], vec![0]], vec![vec![0, 1]], 16));
         assert_eq!(lay(&two, LaneMode::One, Cpu, Some(2), 4, 16, 1, false), (2, vec![vec![0], vec![0]], vec![vec![0, 1]], 16));
-        // the CPU: 16 threads -> 2 groups (never the settings' 4), two lanes per key of 4 threads
-        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 16, 1, false), (2, vec![vec![0, 1], vec![2, 3]], vec![vec![0], vec![0], vec![1], vec![1]], 4));
-        // 6 threads: 1 group, a lane per key of 3; 20: 2 groups, 2 lanes per key of 4; 32: 4 groups, 4 lanes of 4
+        // the CPU: 16 threads -> one group (never the settings' 4), a lane per key of 4 threads
+        let one = (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 4);
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 16, 1, false), one);
+        // 20 or 32 threads: the same (sessions of 4); 6 threads: 3 each; 1 thread: 1 each
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 20, 1, false), one);
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 32, 1, false), one);
         assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 6, 1, false), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 3));
-        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 20, 1, false), (2, vec![vec![0, 1], vec![2, 3]], vec![vec![0], vec![0], vec![1], vec![1]], 4));
-        let l32 = lay(&two, LaneMode::Auto, Cpu, None, 4, 32, 1, false);
-        assert_eq!((l32.0, l32.2.len(), l32.3), (4, 8, 4));
-        // 1 or 2 threads: one group, a lane per key of one thread
         assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 1, 1, false), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 1));
-        // macOS's 3-thread sessions (16 threads: 3 x 5): 2 groups, 4 lanes of 3
-        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 3, 5, false), (2, vec![vec![0, 1], vec![2, 3]], vec![vec![0], vec![0], vec![1], vec![1]], 3));
-        // the job's own groups: kept, lanes per key at most that many
-        assert_eq!(lay(&two, LaneMode::Auto, Cpu, Some(1), 4, 16, 1, false), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 4));
+        // macOS's 3-thread sessions (16 threads: 3 x 5): a lane per key of 3
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 3, 5, false), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 3));
+        // the job's own groups: kept; its batches over as many lanes per key as the threads hold (16: 2 of 4 each)
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, Some(2), 4, 16, 1, false), (2, vec![vec![0, 1], vec![2, 3]], vec![vec![0], vec![0], vec![1], vec![1]], 4));
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, Some(4), 4, 32, 1, false).2.len(), 8);
+        assert_eq!(lay(&two, LaneMode::Auto, Cpu, Some(1), 4, 16, 1, false), one);
         // the job's own threads (a gate's --infer-threads 4): sessions of exactly 4, one lane per key on 4 threads
         assert_eq!(lay(&two, LaneMode::Auto, Cpu, None, 4, 4, 1, true), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 4));
         // one network on both seats: lanes per key all the same (sessions of it per key)
         assert_eq!(lay(&[Some(1), Some(1)], LaneMode::Auto, Cpu, None, 4, 6, 1, false), (1, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 3));
-        // a bot's key has no lane; one network key gets the threads: 16 -> 4 groups, 4 lanes of 4
-        assert_eq!(lay(&[None, Some(2)], LaneMode::Auto, Cpu, None, 4, 16, 1, false), (4, vec![vec![], vec![0, 1, 2, 3]], vec![vec![1], vec![1], vec![1], vec![1]], 4));
+        // a bot's key has no lane; one network key: one group, its lane of 4
+        assert_eq!(lay(&[None, Some(2)], LaneMode::Auto, Cpu, None, 4, 16, 1, false), (1, vec![vec![], vec![0]], vec![vec![1]], 4));
         assert_eq!(lay(&[None, None], LaneMode::Auto, Cpu, None, 4, 16, 1, false).2, Vec::<Vec<usize>>::new());
         // CUDA: the job's or the settings' groups, a lane per generation, the threads shared
         assert_eq!(lay(&two, LaneMode::Auto, Cuda, None, 2, 16, 1, false), (2, vec![vec![0], vec![1]], vec![vec![0], vec![1]], 8));
@@ -814,7 +817,7 @@ mod tests {
     fn each_key_reaches_its_network() {
         use ProviderKind::{Cpu, Cuda, DirectMl};
         for (gens, p, threads) in [([Some(1), Some(2)], Cpu, 16), ([Some(1), Some(2)], Cpu, 6), ([Some(1), Some(2)], Cuda, 16), ([Some(1), Some(2)], DirectMl, 16), ([Some(2), Some(2)], Cpu, 16), ([Some(2), Some(2)], Cuda, 16), ([None, Some(2)], Cpu, 16)] {
-            let l = eval_layout(&gens, LaneMode::Auto, p, None, 2, threads, 1, false);
+            let l = eval_layout(&gens, LaneMode::Auto, p, Some(2).filter(|_| threads > 8), 2, threads, 1, false);
             let mut built = Vec::new();
             let mut lanes = lane_evaluators(&gens, &l.lane_keys, &mut |g| {
                 built.push(g);

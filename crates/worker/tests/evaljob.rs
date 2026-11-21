@@ -373,13 +373,32 @@ fn one_group_and_lanes_play_the_rows_of_before() {
     assert_eq!(ra, rb, "the rows (and their records) of before, byte for byte");
     let (na, nb) = (oa.stats["infer_batches"].as_u64().unwrap(), ob.stats["infer_batches"].as_u64().unwrap());
     assert!(nb * 2 < na, "one group: fewer, larger batches ({nb} against {na})");
-    // 16 threads: 2 groups, two lanes per seat (batches to them in turn): the same rows
+    // 16 threads and 64 games in flight, the job's groups 2: two lanes per seat (batches to them in turn); no job groups:
+    // one group, a lane per seat - the rows of before either way
+    let wide = |dir: &str, lanes: LaneMode, groups: Option<usize>| {
+        let mut s: Value = serde_json::from_str(&with_groups(3).raw.dumps()).unwrap();
+        s["conc"] = json!(64);
+        let mut j = job(&tmp(dir), 64, 0, nets());
+        j.settings = Settings::from_value(&s).unwrap();
+        (j.lanes, j.groups, j.search_threads) = (lanes, groups, Some(16));
+        j
+    };
+    let (o64a, _, l64a) = run_logged(&wide("lanes-64-before", LaneMode::One, Some(3)), |_, _, _, _| {});
+    let (o64, _, l64) = run_logged(&wide("lanes-64", LaneMode::Auto, Some(2)), |_, _, _, _| {});
+    let (o64b, _, l64b) = run_logged(&wide("lanes-64-g1", LaneMode::Auto, None), |_, _, _, _| {});
+    assert!(line(&l64a).contains("conc 64, threads 16, groups 3; 1 evaluator lane(s)"), "{}", line(&l64a));
+    assert!(line(&l64).contains("groups 2; 4 evaluator lane(s)"), "{}", line(&l64));
+    assert!(line(&l64).contains("lane 1 (keys m)") && line(&l64).contains("lane 3 (keys o)"), "{}", line(&l64));
+    assert!(line(&l64b).contains("groups 1; 2 evaluator lane(s) (Auto, 4 intra-op threads each)"), "{}", line(&l64b));
+    assert_eq!(rows(&o64).0.len(), 64);
+    assert_eq!(rows(&o64).0, rows(&o64a).0);
+    assert_eq!(rows(&o64b).0, rows(&o64a).0);
+    // ... and 16 threads with 12 games in flight: one group, two lanes
     let mut j16 = jb.clone();
     j16.out_dir = tmp("lanes-16");
     j16.search_threads = Some(16);
     let (o16, _, l16) = run_logged(&j16, |_, _, _, _| {});
-    assert!(line(&l16).contains("groups 2; 4 evaluator lane(s)"), "{}", line(&l16));
-    assert!(line(&l16).contains("lane 1 (keys m)") && line(&l16).contains("lane 3 (keys o)"), "{}", line(&l16));
+    assert!(line(&l16).contains("groups 1; 2 evaluator lane(s)"), "{}", line(&l16));
     assert_eq!(rows(&o16).0, ra);
     // a lease of games 8..20 in the new layout: those games of the match
     let mut jc = jb.clone();
