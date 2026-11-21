@@ -450,6 +450,7 @@ def test_pool_variants_are_exported_uploaded_signed_registered_and_named(pool, m
     assert FP.variant_setting('') == []
     vs = FP.variant_setting('gpu=fp16,dml=matmul-fp16@amd')
     assert vs == [('gpu', 'fp16', None), ('dml', 'matmul-fp16', 'amd')]
+    assert FP.variant_setting('gpu=fp16,dml=matmul@amd') == [('gpu', 'fp16', None), ('dml', 'matmul', 'amd')]
     assert (FP.variant_of(vs, 'amd'), FP.variant_of(vs, 'nvidia'), FP.variant_of(vs, 'intel')) == ('dml', 'gpu', 'gpu')
     only = FP.variant_setting('dml=matmul-fp16@amd')
     assert (FP.variant_of(only, 'amd'), FP.variant_of(only, 'nvidia')) == ('dml', None)

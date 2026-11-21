@@ -80,6 +80,7 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
 import threading
 import time
 import traceback
@@ -139,10 +140,12 @@ def alternate_ids(v):
     return [x for x in items if x]
 
 
-# a variant's form: 'fp16' = onnx_export.to_float16 of the gen's graph; 'matmul-fp16' = the gen's checkpoint exported as
+# a variant's form: 'fp16' = onnx_export.to_float16 of the gen's graph; 'matmul' = the gen's checkpoint exported as
 # graph 'fast-matmul' (onnx_export.GRAPHS: the fast graph with its attention as MatMuls - the one zero-onnx/2 graph
-# DirectML runs, docs/az.md 46.10), then to_float16 (zero-farm PROTOCOL rev 22: AMD GPUs through DirectML)
-VARIANT_FORMS = ('fp16', 'matmul-fp16')
+# DirectML runs, docs/az.md 46.10), float32 - the AMD GPUs' form (zero-farm PROTOCOL rev 22: AMD GPUs through DirectML;
+# their DirectML answers the float16 copy non-deterministically, 46.10); 'matmul-fp16' = that graph in float16 (DirectML
+# on NVIDIA and Intel GPUs runs it deterministically)
+VARIANT_FORMS = ('fp16', 'matmul-fp16', 'matmul')
 
 
 def variant_setting(v):
@@ -589,18 +592,22 @@ class Pool:
 
     def _make_variant(self, form, src, dst, ckpt=None, gen=None):
         """Gen `gen`'s variant in form `form` (VARIANT_FORMS) written to `dst`: from its graph `src` ('fp16'), or from
-        its checkpoint `ckpt` exported again as another graph ('matmul-fp16': export_cached's graph 'fast-matmul' under
-        <dst's dir>/v-<form>/, its own weight-swap template and check against the reference set, then float16)."""
+        its checkpoint `ckpt` exported again as another graph ('matmul' / 'matmul-fp16': export_cached's graph
+        'fast-matmul' under <dst's dir>/v-<form>/, its own weight-swap template and check against the reference set;
+        'matmul-fp16' then float16)."""
         from .onnx_export import to_float16
         if form == 'fp16':
             to_float16(src, dst)
-        elif form == 'matmul-fp16':
+        elif form in ('matmul', 'matmul-fp16'):
             from . import games as G
             from .farm_h2h import export_cached
             ex = export_cached(ckpt, gen, os.path.join(os.path.dirname(dst), f'v-{form}'), self.R.cfg['game'],
                                G.spec_json(self.R.cfg['spec']), os.path.join(self.dir, 'export'), f'{self.farm}/{gen}',
                                checkpoint_iter=gen, graph='fast-matmul')
-            to_float16(ex['model'], dst)
+            if form == 'matmul':
+                shutil.copyfile(ex['model'], dst)
+            else:
+                to_float16(ex['model'], dst)
         else:
             raise ValueError(f'variant form {form!r}')
 
