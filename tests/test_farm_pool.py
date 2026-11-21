@@ -721,9 +721,10 @@ def test_rolling_setting():
 
 
 def test_pool_rolling_checks_the_worker_and_puts_rolling(pool, monkeypatch):
-    """pool_rolling: a worker build that does not announce `rolling` is refused loudly (nothing published); one that
-    does: every self-play PUT carries `selfplay.rolling` (and only then: off, test_pool_alternates_... checks the bodies
-    of before byte for byte); an alternate whose executable is the default's is covered, another is logged unchecked."""
+    """pool_rolling: a worker build that does not announce `rolling` is refused loudly (nothing published) and - a
+    definitive answer, docs/az.md 70 - the pool stops instead of retrying; restarted with one that does: every self-play
+    PUT carries `selfplay.rolling` (and only then: off, test_pool_alternates_... checks the bodies of before byte for
+    byte); an alternate whose executable is the default's is covered, another is logged unchecked."""
     fake, R, published = pool
     w = {'manifest': 1, 'kind': 'worker', 'version': 'toy-test', 'game': 'zero-toy', 'entry': 'w.exe'}
     (rt, rt_raw), (cuda, cuda_raw) = _manifests(
@@ -745,10 +746,20 @@ def test_pool_rolling_checks_the_worker_and_puts_rolling(pool, monkeypatch):
     try:
         assert 'rolling {"inflight": 64' in p.describe()
         p.begin(1)
-        wait(lambda: p.error and 'pool_rolling' in p.error, 'a worker without rolling refused')
+        wait(lambda: p.stopped is not None, 'a worker without rolling refused: the pool stops')
+        p.th.join(10)
+        assert not p.th.is_alive(), 'stopped: not retried'
         assert "not 'rolling'" in p.error and not fake.ckpts and not published
+        assert p.progress()['state'] == 'stopped' and "pool_rolling ''" in p.stopped['fix']
         assert not any(m == 'PUT' and pth == f'/v1/admin/run/{FARM}' for m, pth, _ in fake.calls), 'nothing PUT'
-        monkeypatch.setenv('WORKER_STUB_FEATURES', 'rolling')
+    finally:
+        p.close()
+        p.th.join(10)
+    monkeypatch.setenv('WORKER_STUB_FEATURES', 'rolling')    # (the fix: a worker that plays rolling jobs; a restart)
+    p = FP.Pool(QuotaRP(R), f'pool:{FARM}')
+    try:
+        assert p.stopped is None and 'stopped' not in p.st
+        p.begin(1)
         wait(lambda: 0 in fake.ckpts and p.st.get('selfplay_put'), 'gen 0 registered once the worker plays rolling jobs')
     finally:
         p.close()
@@ -928,3 +939,144 @@ def test_keep_rows_is_take_rows_for_any_rows():
         del sp['x']
         got = FP.keep_rows(sp, rows, widths)
         assert got['xs'].dense(np.arange(len(rows))).tobytes() == want['x'].astype(np.float16).tobytes()
+
+
+# ------------------------------------------------------------------ definitive refusals vs transient errors (az.md 70)
+def test_the_settings_check_names_what_the_worker_refuses(tmp_path, monkeypatch):
+    """docs/az.md 70: play_settings' refusals are definitive (farm_pool.Refused, a SystemExit) and name what was refused
+    - each key the build calls unknown, with its status - and the fix; a missing executable or another build is refused
+    the same way (never a SystemExit the pool's thread would retry forever)."""
+    monkeypatch.setenv('WORKER_STUB_BUILD', BUILD)
+    monkeypatch.delenv('WORKER_STUB_FEATURES', raising=False)
+    cfg = dict(DEFAULTS, game='toy', players=[2], spec='')
+    play = FP.play_settings(STUB, BUILD, cfg, str(tmp_path / 'ok'))
+    key = next(k for k in play if k != 'game')
+    monkeypatch.setenv('WORKER_STUB_UNKNOWN', key)
+    with pytest.raises(FP.Refused) as e:
+        FP.play_settings(STUB, BUILD, cfg, str(tmp_path / 'bad'), lambda m: None)
+    assert f'{key} (unknown)' in e.value.reason and 'refuses the run\'s settings' in e.value.reason
+    assert 'farm_release.py release' in e.value.fix and e.value.detail and isinstance(e.value, SystemExit)
+    monkeypatch.delenv('WORKER_STUB_UNKNOWN')
+    for worker, build, what in ((str(tmp_path / 'nowhere.exe'), BUILD, 'not an executable on this machine'),
+                                ('', BUILD, 'not an executable on this machine'),
+                                (STUB, 'c' * 24, f'not the self-play worker build {"c" * 24}')):
+        with pytest.raises(FP.Refused, match=what):
+            FP.play_settings(worker, build, cfg, str(tmp_path / 'w'))
+    assert FP.refusal_summary({'failures': ['a', 'b'], 'settings': [{'key': 'a', 'status': 'unknown'}],
+                               'driver_error': 'boom'}) == 'a (unknown), b (refused), driver error: boom'
+    assert FP.refusal_summary(None, ' some text \n') == 'some text'
+
+
+def test_a_refusing_worker_build_refuses_the_runs_start(pool, monkeypatch):
+    """docs/az.md 70 (the Bauble A/B's pool retried 'refused' forever while the run played desktop-only): a new pool's
+    settings check runs at its construction - the run's start - and a definitive refusal propagates (zero.run: exit 78)
+    with nothing put on the farm; an answer that is not definitive (the check could not run) is left to the thread."""
+    from zero.remoteplay import RemotePlay
+    fake, R, published = pool
+
+    def refuse(worker, build, cfg, d, log=None):
+        raise FP.Refused(f'worker build {build} refuses the run\'s settings for self-play: bauble_memory (unknown)',
+                         detail='the check-config answer')
+    monkeypatch.setattr(FP, 'play_settings', refuse)
+    with pytest.raises(FP.Refused, match='bauble_memory'):
+        RemotePlay(R, R.cfg['selfplay_remote'])
+    assert not fake.calls and not published
+    lines = '\n'.join(R.lines)
+    assert 'REFUSED at the run\'s start' in lines and 'the check-config answer' in lines and 'Fix: ' in lines
+    calls = []
+
+    def flaky(worker, build, cfg, d, log=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('the worker could not start now')
+        return {'game': 'toy', 'spec': '', 'players': [2]}
+    monkeypatch.setattr(FP, 'play_settings', flaky)
+    p = FP.Pool(QuotaRP(R), f'pool:{FARM}')
+    try:
+        assert 'could not run now' in R.lines[-1] and p.st.get('play') is None
+        p.begin(1)
+        wait(lambda: 0 in fake.ckpts, 'gen 0 registered: the thread checked again')
+        assert p.stopped is None and len(calls) == 2
+    finally:
+        p.close()
+        p.th.join(10)
+    # a resumed pool keeps its template: no check at its start (a live run's restart is unchanged)
+    monkeypatch.setattr(FP, 'play_settings', refuse)
+    p = FP.Pool(QuotaRP(R), f'pool:{FARM}')
+    p.close()
+    p.th.join(10)
+
+
+@pytest.mark.parametrize('cause', ['alternates', 'phase'])
+def test_a_definitive_refusal_on_the_thread_stops_the_pool_loudly(pool, monkeypatch, cause):
+    """docs/az.md 70: a definitive refusal met on the pool's thread - a coordinator manifest refusing an alternate
+    (zero.farm_def's SystemExit, made definitive), a phase spec's settings the build refuses - stops the pool: not
+    retried; the log says STOPPED with the fix, again at every iteration's end; the metrics (`stopped`, `error`),
+    progress.json's state and the state file carry it; nothing more is published. A restart clears it."""
+    fake, R, published = pool
+    tries = []
+    if cause == 'alternates':
+        def alts(client, build, runtime, alt_builds, vendor=None):
+            tries.append(1)
+            raise SystemExit(f'alternate {"d" * 24} is a \'runtime\' build, not a worker')
+        monkeypatch.setattr(FD, 'run_alternates', alts)
+    else:
+        def play(worker, build, cfg, d, log=None):
+            if cfg['spec']:
+                tries.append(1)
+                raise FP.Refused('worker build refuses the phase spec\'s settings: food (unknown)')
+            return {'game': 'toy', 'spec': '', 'players': [2]}
+        monkeypatch.setattr(FP, 'play_settings', play)
+    p = FP.Pool(QuotaRP(R), f'pool:{FARM}')
+    try:
+        p.begin(1, spec='{"food": [20, 0]}' if cause == 'phase' else None)
+        wait(lambda: p.stopped is not None, 'the pool stopped')
+        p.th.join(10)
+        assert not p.th.is_alive() and len(tries) == 1, 'never retried'
+        time.sleep(0.2)
+        assert len(tries) == 1 and not fake.ckpts
+        why = 'pool_alternates: alternate' if cause == 'alternates' else 'food (unknown)'
+        assert why in p.stopped['reason'] and p.error.startswith('STOPPED (refused)')
+        pr = p.progress()
+        assert pr['state'] == 'stopped' and why in pr['stopped']['reason'] and pr['stopped']['fix']
+        out = p.end_phase(1)
+        assert why in out['stopped']['reason'] and out['error'].startswith('STOPPED')
+        lines = '\n'.join(R.lines)
+        assert 'STOPPED - a definitive refusal, not retried' in lines and 'WITHOUT the farm' in lines
+        assert 'STOPPED since' in R.lines[-1] and "iteration 1's games all came from this machine" in R.lines[-1]
+        assert 'STOPPED - refused' in p.describe()
+        st = json.load(open(os.path.join(R.run, 'pool', FARM, 'state.json')))
+        assert why in st['stopped']['reason']
+    finally:
+        p.close()
+        p.th.join(10)
+    p = FP.Pool(QuotaRP(R), f'pool:{FARM}')    # (a restart - once fixed - tries the pool again)
+    try:
+        assert p.stopped is None and 'stopped' not in json.load(open(os.path.join(R.run, 'pool', FARM, 'state.json')))
+    finally:
+        p.close()
+        p.th.join(10)
+
+
+def test_transient_errors_keep_retrying(pool, monkeypatch):
+    """docs/az.md 70: a coordinator that answers 503 is a transient error - logged 'error (retried ...)', the pool keeps
+    going and publishes once the coordinator answers; never stopped."""
+    fake, R, published = pool
+    down = {'n': 3}
+    real = Fake.__call__
+
+    def flaky(self, method, url, headers, data):
+        if method == 'PUT' and urlparse(url).path == f'/v1/admin/run/{FARM}' and down['n'] > 0:
+            down['n'] -= 1
+            return 503, b'{"error": "unavailable"}'
+        return real(self, method, url, headers, data)
+    monkeypatch.setattr(Fake, '__call__', flaky)
+    p = FP.Pool(QuotaRP(R), f'pool:{FARM}')
+    try:
+        p.begin(1)
+        wait(lambda: 0 in fake.ckpts, 'gen 0 registered after the coordinator came back')
+        assert p.stopped is None and p.error is None and down['n'] == 0
+        assert sum('error (retried' in x for x in R.lines) == 3, R.lines
+    finally:
+        p.close()
+        p.th.join(10)

@@ -69,6 +69,18 @@ held game's rows searched with a network older than i - 1 - `pool_max_stale` are
 rest of the game is kept, and the game is dropped (`stale_dropped`) only when none is left - a rolling lease lives
 for hours, switching networks in place, so its games straddle generations.
 
+Definitive refusals and transient errors (docs/az.md 70; the Bauble A/B's pool logged "refused (retried ...)" for its
+whole run while the run played desktop-only). A `Refused` is an answer that trying again cannot change: the worker
+build's `check-config` refusing the run's settings (`play_settings`: the keys and their statuses named), no usable
+`pool_worker`, another build, the platform check (`platform_check`), the rolling check, a coordinator manifest refusing
+`pool_build` / `pool_alternates` (zero.farm_def's SystemExit, `_definitive`). A new pool (no template in its state yet)
+runs the settings check in its constructor - the run's start - so a refusal there refuses the run (zero.run: exit 78,
+not restarted); met later on the pool's thread it stops the pool (`_stop`: no more publishing or ingesting, the run's
+log says STOPPED with the reason and the fix, again at every iteration's end; the metrics' `selfplay.pools.<name>`
+carry `stopped` and `error`, progress.json `state` 'stopped', state.json `stopped`) while the run goes on with its own
+games. Everything else - a network error, a coordinator's 5xx or 4xx (FarmError), farm-release failing, a definition
+conflict - stays transient: logged and retried every `pool_poll_s`, never the run's end.
+
 Lock order (docs/az.md 55; the pb3 hang of 2026-11-16): `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu`, outermost first.
 `Pool.mu` is innermost: a Pool never calls into its RemotePlay (`pool_iteration`, `accept_pool`, `add_failures`) while
 it holds `Pool.mu`, and RemotePlay may call the Pool methods that take only `Pool.mu` (`close`, `begin`, `progress`)
@@ -92,6 +104,35 @@ from . import gamerec as GR
 PREFIX = 'pool:'
 SEMVER_RE = FD.SEMVER_RE                    # (as the coordinator checks a version: zero-farm coordinator util.ts)
 PAGE = 200                          # results per GET
+# the usual fix of a worker build that refuses the run (docs/az.md 70)
+FIX_BUILD = ("release a worker build of the run's commit (the game repo's farm release; MTG Zero: tools/farm_release.py "
+             "release <sha>) and point pool_build, pool_runtime, pool_worker and pool_alternates at it, or turn the "
+             "refused setting off, or detach the farm (selfplay_remote without the pool) - then restart the run")
+
+
+class Refused(SystemExit):
+    """A definitive refusal of the farm pool (docs/az.md 70): the worker build (its `check-config`, `info`) or the
+    coordinator's signed manifests say the run's settings or alternates cannot be served as they are, so trying again
+    cannot change the answer - unlike a network error or a coordinator hiccup, which the pool keeps retrying.
+    `reason`: what was refused, `fix`: what to change. Raised at the run's start (the pool's settings check in
+    `Pool.__init__`: the run is refused, exit 78) or on the pool's thread (the pool stops loudly: `Pool.stopped`)."""
+
+    def __init__(self, reason, fix=FIX_BUILD, detail=None):
+        self.reason, self.fix, self.detail = str(reason), str(fix), detail
+        super().__init__(f'{self.reason} - fix: {self.fix}')
+
+
+def refusal_summary(out, text=''):
+    """A worker's `check-config --json` answer -> what it refused in a few words: each failing key with its status
+    ('bauble_memory (unknown)'), a driver error, else the tail of its output."""
+    if isinstance(out, dict):
+        st = {s.get('key'): s.get('status') for s in out.get('settings') or [] if isinstance(s, dict)}
+        bits = [f'{k} ({st.get(k) or "refused"})' for k in out.get('failures') or []]
+        if out.get('driver_error'):
+            bits.append(f'driver error: {str(out["driver_error"])[:300]}')
+        if bits:
+            return ', '.join(bits)
+    return (text or '').strip()[-600:] or 'no answer'
 
 
 def is_pool(name):
@@ -227,9 +268,13 @@ def worker_features(worker):
     """The protocol features a worker executable announces (`<worker> info`'s `features`, zero-farm PROTOCOL 10.5;
     absent: none) and its build id."""
     from .farm_h2h import worker_json
+    if not worker or not os.path.isfile(worker):
+        raise Refused(f'the worker executable {worker!r} is not on this machine', f'pool_worker must name the build\'s '
+                                                                                 f'signed executable here ({FIX_BUILD})')
     rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
     if rc != 0 or not isinstance(info, dict):
-        raise SystemExit(f'{worker} info: {text.strip()[-500:]}')
+        raise Refused(f'{worker} info: {text.strip()[-500:]}', f'pool_worker must be a working worker executable '
+                                                                f'({FIX_BUILD})')
     return list(info.get('features') or []), info.get('build_id')
 
 
@@ -282,12 +327,19 @@ def play_settings(worker, build_id, cfg, d, log=None):
     new worker build."""
     from .farm_h2h import CLASSES_KEY, _stderr_log, config_refused, log_declared, with_classes, worker_json
     log = log or _stderr_log
+    # (every refusal below is definitive - the build's own answer about these settings - so a Refused: the run's start
+    # refused, or the pool stopped, never retried in silence; docs/az.md 70)
+    if not worker or not os.path.isfile(worker):
+        raise Refused(f'pool_worker {worker!r} is not an executable on this machine: the self-play settings of worker '
+                      f'build {build_id} cannot be checked', f'pool_worker must name build {build_id}\'s signed executable '
+                                                             f'here ({FIX_BUILD})')
     rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
     if rc != 0 or not isinstance(info, dict):
-        raise SystemExit(f'{worker} info: {text.strip()[-500:]}')
+        raise Refused(f'pool_worker {worker} does not run (`info`: {text.strip()[-500:]})',
+                      f'pool_worker must be build {build_id}\'s signed executable ({FIX_BUILD})')
     if info.get('build_id') != build_id or 'selfplay' not in (info.get('kinds') or []):
-        raise SystemExit(f'{worker} is build {info.get("build_id")} ({info.get("kinds")}), not the self-play worker build '
-                         f'{build_id}: pool_worker must be that build\'s executable')
+        raise Refused(f'{worker} is build {info.get("build_id")} ({info.get("kinds")}), not the self-play worker build '
+                      f'{build_id}', f'pool_worker must be build {build_id}\'s executable, or pool_build its build id')
     os.makedirs(d, exist_ok=True)
     full = os.path.join(d, 'settings-run.json')
     run = with_classes(info, cfg)
@@ -295,7 +347,8 @@ def play_settings(worker, build_id, cfg, d, log=None):
         json.dump(run, f)
     rc, out, text = worker_json(worker, 'check-config', full, '--json')
     if config_refused(rc, out, build_id, log):
-        raise SystemExit(f'the worker refuses the run\'s settings for self-play:\n{text.strip()[-3000:]}')
+        raise Refused(f'worker build {build_id} refuses the run\'s settings for self-play: {refusal_summary(out, text)}',
+                      detail=text.strip()[-3000:])
     log_declared(out, build_id, log)
     status = {s['key']: s['status'] for s in out.get('settings') or []}
     play = {k: v for k, v in cfg.items() if status.get(k) == 'play' and k != CLASSES_KEY}
@@ -307,12 +360,13 @@ def play_settings(worker, build_id, cfg, d, log=None):
     rc, out, text = worker_json(worker, 'check-config', path, '--json')
     if rc != 0 or not isinstance(out, dict) or out.get('failures') or \
             any(s['status'] != 'play' for s in out.get('settings') or []):
-        raise SystemExit(f'the worker refuses the self-play job\'s own settings:\n{text.strip()[-3000:]}')
+        raise Refused(f'worker build {build_id} refuses the self-play job\'s own settings: {refusal_summary(out, text)}',
+                      detail=text.strip()[-3000:])
     a = worker_json(worker, 'driver-cfg', full, '--seed', '1', '--net', '0')
     b = worker_json(worker, 'driver-cfg', path, '--seed', '1', '--net', '0')
     if a[0] != 0 or b[0] != 0 or a[2] != b[2]:
-        raise SystemExit('the play settings give another self-play driver than the run\'s settings:\n'
-                         f'{a[2][-1500:]}\n---\n{b[2][-1500:]}')
+        raise Refused(f'worker build {build_id}: the template\'s play settings give another self-play driver than the '
+                      f'run\'s settings (driver-cfg differs)', detail=f'{a[2][-1500:]}\n---\n{b[2][-1500:]}')
     return play
 
 
@@ -323,9 +377,10 @@ def platform_check(worker, cfg, d, platform, log=None):
     (its answer names no platform), stops the pool before any PUT names that platform's alternate."""
     from .farm_h2h import _stderr_log, with_classes, worker_json
     log = log or _stderr_log
+    drop = f'leave the {platform} alternate out of pool_alternates'
     if not worker:
-        raise SystemExit(f'a {platform} alternate needs pool_worker (the build\'s executable here) to check the run\'s '
-                         f'settings for {platform}')
+        raise Refused(f'a {platform} alternate needs pool_worker (the build\'s executable here) to check the run\'s '
+                      f'settings for {platform}', f'set pool_worker, or {drop}')
     rc, info, text = worker_json(worker, 'info', '--ort-dll', 'none')
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f'settings-{platform}.json')
@@ -333,12 +388,24 @@ def platform_check(worker, cfg, d, platform, log=None):
         json.dump(with_classes(info if isinstance(info, dict) else {}, cfg), f)
     rc, out, text = worker_json(worker, 'check-config', path, '--json', '--platform', platform)
     if not isinstance(out, dict) or out.get('platform') != platform:
-        raise SystemExit(f'pool_worker {worker} cannot judge the run\'s settings for {platform} (a build before zero-core '
-                         f'docs/az.md 62): no {platform} alternate without that check')
+        raise Refused(f'pool_worker {worker} cannot judge the run\'s settings for {platform} (a build before zero-core '
+                      f'docs/az.md 62): no {platform} alternate without that check', f'{drop}, or {FIX_BUILD}')
     if out.get('libm_refusals'):
-        raise SystemExit(f'the run\'s settings would replay differently on {platform} (the platform\'s libm, docs/az.md '
-                         f'62): {"; ".join(out["libm_refusals"])} - leave its {platform} alternate out')
+        raise Refused(f'the run\'s settings would replay differently on {platform} (the platform\'s libm, docs/az.md '
+                      f'62): {"; ".join(out["libm_refusals"])}', f'{drop} (or change the refused settings)')
     log(f'{platform}: the run\'s settings replay exactly there (check-config --platform {platform})')
+
+
+def _definitive(what, fn, fix):
+    """fn() -> its value; a SystemExit it raises (zero.farm_def's refusals of a signed manifest: the answer of the
+    coordinator's content, not of its availability - a network error is a FarmError and stays transient) as a Refused
+    (docs/az.md 70) naming `what` and `fix`."""
+    try:
+        return fn()
+    except Refused:
+        raise
+    except SystemExit as e:
+        raise Refused(f'{what}: {e}', fix) from None
 
 
 def export_breakdown(ex):
@@ -455,6 +522,11 @@ class Pool:
         self.t_game = None                         # when the last valid game arrived (`live`)
         self.closed = False
         self.error = None
+        self.stopped = None                        # a definitive refusal stopped the pool: {reason, fix, t} (docs/az.md 70)
+        if self.st.pop('stopped', None) is not None:
+            self._save()                           # (a refusal of an earlier process: this one tries again)
+        if self.st.get('play') is None:
+            self._check_settings()
         self.wake = threading.Event()
         self.th = threading.Thread(target=self._loop, name=f'zero-pool-{self.farm}', daemon=True)
         self.th.start()
@@ -490,6 +562,8 @@ class Pool:
         return t is not None and time.time() - t < self.live_s
 
     def describe(self):
+        if self.stopped:
+            return f'{self.name!r} (STOPPED - refused: {self.stopped["reason"][:300]})'
         alts = f', alternates {",".join(self.alt_builds)}' if self.alt_builds else ''
         roll = f', rolling {json.dumps(self.rolling)}' if self.rolling is not None else ''
         return f'{self.name!r} (farm {self.url}, build {self.build}{alts}, max_stale {self.max_stale}{roll})'
@@ -545,13 +619,59 @@ class Pool:
                 out['stale_rows_dropped'] = cur['stale_rows_dropped']
         if self.error:
             out['error'] = self.error
+        if self.stopped:
+            # (every iteration while it is stopped: the metrics row and the log say so, docs/az.md 70)
+            out['stopped'] = {k: self.stopped[k] for k in ('reason', 'fix')}
+            self.log(f'STOPPED since {time.strftime("%H:%M:%S", time.localtime(self.stopped["t"]))} (refused: '
+                     f'{self.stopped["reason"][:500]}): iteration {it}\'s games all came from this machine and its '
+                     f'remote hosts. Fix: {self.stopped["fix"]}')
         return out
 
     def progress(self):
         with self.mu:
-            return {'farm_run': self.farm, 'games': self.cur['games'], 'held': len(self.held),
-                    'refused': self.cur['refused'], 'gen': self.st.get('current_gen'),
-                    'error': self.error}
+            out = {'farm_run': self.farm, 'games': self.cur['games'], 'held': len(self.held),
+                   'refused': self.cur['refused'], 'gen': self.st.get('current_gen'),
+                   'error': self.error}
+        if self.stopped:                           # (progress.json: the dashboard's state, docs/az.md 70)
+            out.update(state='stopped', stopped={k: self.stopped[k] for k in ('reason', 'fix')})
+        return out
+
+    def _check_settings(self):
+        """The pool's settings check at its start (docs/az.md 70): the worker build's own `check-config` of the run's
+        settings (`settings_of`, the template's play settings, kept in the state as before) before the run goes on - a
+        definitive refusal (Refused) propagates: the run's start is refused (zero.run: exit 78), never a pool retrying
+        forever beside a run that plays desktop-only. An answer that is not definitive (the check could not run) is
+        logged and left to the pool's thread, which tries again. Only when the state has no template yet (a new pool,
+        a fork's, or one whose check never passed): a resumed pool keeps its template, as before."""
+        try:
+            self.st['play'] = self.settings_of()
+        except Refused as e:
+            self.log(f'REFUSED at the run\'s start: {e.reason}'
+                     + (f'\n{e.detail}' if e.detail else '') + f'\nFix: {e.fix}')
+            raise
+        except (Exception, SystemExit) as e:  # noqa: BLE001 - not a definitive answer: the thread tries again
+            self.log(f'the settings check could not run now ({type(e).__name__}: {str(e)[-300:]}): the pool\'s '
+                     f'thread tries again')
+            return
+        self._save()
+
+    def _stop(self, e):
+        """A definitive refusal on the pool's thread (`Refused`): the pool stops for good in this process - no more
+        publishing or ingesting, never retried - and says so in the run's log (now and at every iteration's end), the
+        iterations' metrics (`selfplay.pools.<name>.stopped`, `error`), progress.json (`state` 'stopped') and its state
+        file (docs/az.md 70). The run goes on with this machine's games (and its remote hosts'); a restart tries the
+        pool again."""
+        self.stopped = {'reason': e.reason, 'fix': e.fix, 't': time.time()}
+        self.error = f'STOPPED (refused): {e.reason[-500:]}'
+        self.st['stopped'] = dict(self.stopped)
+        try:
+            self._save()
+        except OSError:
+            pass
+        self.log(f'STOPPED - a definitive refusal, not retried: {e.reason}' + (f'\n{e.detail}' if e.detail else '')
+                 + f'\nFix: {e.fix}\nThe run goes on WITHOUT the farm: every self-play game from now on is this '
+                   f'machine\'s (and its remote hosts\'). The farm run {self.farm} keeps any generation registered before '
+                   f'(pause it on the coordinator if it should stop serving it).')
 
     def close(self):
         """(RemotePlay may call it under its mu: takes only mu, never dmu.) A drain that is accepting meanwhile closes
@@ -574,7 +694,10 @@ class Pool:
             except Exception as e:  # noqa: BLE001 - logged; the run never stops for the pool
                 self.error = f'{type(e).__name__}: {str(e)[-300:]}'
                 self.log(f'error (retried in {self.poll_s:g} s): {self.error}\n{traceback.format_exc()[-1500:]}')
-            except SystemExit as e:             # (zero.farm_def's refusals)
+            except Refused as e:                # a definitive answer: the pool stops, loudly (docs/az.md 70)
+                self._stop(e)
+                return
+            except SystemExit as e:             # (zero.farm_def's other refusals: farm-release, a definition conflict)
                 self.error = f'{str(e)[-500:]}'
                 self.log(f'refused (retried in {self.poll_s:g} s): {self.error}')
             self.wake.wait(self.poll_s)
@@ -645,16 +768,17 @@ class Pool:
         return out
 
     def _check_rolling(self):
-        """`pool_rolling` set: the worker build must play rolling jobs (module docstring) - SystemExit otherwise (the
-        pool's thread logs it as refused and tries again; nothing is published meanwhile)."""
+        """`pool_rolling` set: the worker build must play rolling jobs (module docstring) - Refused otherwise, a
+        definitive answer (docs/az.md 70: the pool stops, loudly; nothing is published)."""
+        unset = f"set pool_rolling '' (classic leases), or {FIX_BUILD}"
         if not self.worker:
-            raise SystemExit("pool_rolling is set but pool_worker (the build's executable here) is not: its features "
-                             "cannot be checked")
+            raise Refused("pool_rolling is set but pool_worker (the build's executable here) is not: its features "
+                          "cannot be checked", f'set pool_worker, or {unset}')
         feats, bid = worker_features(self.worker)
         if bid != self.build or FD.FEATURE_ROLLING not in feats:
-            raise SystemExit(f'pool_rolling is set but pool_worker {self.worker} (build {bid}) announces features '
-                             f'{feats}, not {FD.FEATURE_ROLLING!r} of build {self.build}: a worker built before rolling '
-                             f'leases (zero-farm PROTOCOL rev 15) - rebuild it, or unset pool_rolling')
+            raise Refused(f'pool_rolling is set but pool_worker {self.worker} (build {bid}) announces features '
+                          f'{feats}, not {FD.FEATURE_ROLLING!r} of build {self.build}: a worker built before rolling '
+                          f'leases (zero-farm PROTOCOL rev 15)', unset)
         if self.alt_builds:
             base = _entry_sha(FD.build_manifest(self.client, self.build))
             here = os.path.dirname(os.path.dirname(os.path.abspath(self.worker)))
@@ -672,8 +796,8 @@ class Pool:
                 if m.get('entry') and os.path.isfile(exe) and FD.file_sha256(exe) == sha:
                     feats, abid = worker_features(exe)
                     if abid != b or FD.FEATURE_ROLLING not in feats:
-                        raise SystemExit(f'pool_rolling is set but alternate {b} ({exe}) announces features {feats}, '
-                                         f'not {FD.FEATURE_ROLLING!r}')
+                        raise Refused(f'pool_rolling is set but alternate {b} ({exe}) announces features {feats}, '
+                                      f'not {FD.FEATURE_ROLLING!r}', f'leave alternate {b} out of pool_alternates, or {unset}')
                     continue
                 self.log(f"pool_rolling: alternate {b}'s executable is not the default build's and is not here: its "
                          f"rolling support is unchecked (a worker without it plays its rolling leases as classic ones)")
@@ -698,11 +822,18 @@ class Pool:
             self._save()
             self.log(f'gen {gen}: the self-play template plays the game package\'s phase spec {hashlib.sha256(gspec.encode()).hexdigest()[:12]}')
         if not st.get('build_game'):
-            st['build_game'] = FD.worker_game(self.client, self.build, self.runtime) if self.runtime else self.R.cfg['game']
+            st['build_game'] = _definitive(
+                "the worker build's manifest", lambda: FD.worker_game(self.client, self.build, self.runtime),
+                f"pool_build / pool_runtime must name a worker build of the run's game and its runtime pack ({FIX_BUILD})"
+            ) if self.runtime else self.R.cfg['game']
             self._save()
         if self.alternates is None:
-            # (none: [], [pool_build] without a call)
-            alternates, builds = FD.run_alternates(self.client, self.build, self.runtime, self.alt_builds, self.alt_vendor)
+            # (none: [], [pool_build] without a call; a manifest that refuses an alternate is definitive, docs/az.md 70)
+            alternates, builds = _definitive(
+                'pool_alternates', lambda: FD.run_alternates(self.client, self.build, self.runtime, self.alt_builds,
+                                                             self.alt_vendor),
+                "each of pool_alternates must be a worker build of the run's game and engine for its own runtime pack "
+                '(the release index lists them): fix pool_alternates / pool_alt_vendor, then restart the run')
             for p in sorted({x['when'].get('platform') for x in alternates} - {None}):
                 platform_check(self.worker, self.R.cfg, os.path.join(self.dir, 'template'), p, self.log)
             if self.variants:
@@ -719,7 +850,7 @@ class Pool:
                                  f'with it, played by no machine)')
             self.alternates, self.builds = alternates, builds
         if self.rolling is not None and not self.rolling_checked:
-            self._check_rolling()
+            _definitive('pool_rolling', self._check_rolling, f"set pool_rolling '' (classic leases), or {FIX_BUILD}")
             self.rolling_checked = True
         if not st['run_put']:
             body = self._selfplay_body(st['play'])

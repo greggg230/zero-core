@@ -40,6 +40,16 @@
       (`check_heads`, docs/az.md 13.6): with a root belief on (selfplay_ / eval_belief_tilt > 0) the
       head for the game's targets, else net.HeadMissing - the refusal the run would give at its start
       (exit 78) -, given before anything is copied, as the encoding guard's.
+
+  The farm (docs/az.md 70): a continuation never writes into its parent's farm runs. Every `pool:<farm run>` of the
+  source's self-play (selfplay_remote, or its run directory's selfplay_remotes file, which is not copied) becomes the
+  fork's OWN farm run, named after the fork's directory (`--farm own`, the default) or `--farm NAME`, and an evaluation
+  on the source's farm run (eval_remote `pool:...`) its own `<name>-eval`; the source's pool_* settings are kept (the
+  coordinator creates the new farm runs at their first publish). `--farm none`: the fork stays on this machine (the
+  pools dropped from selfplay_remote, a farm evaluation of the source's dropped). A --set naming one of the source's
+  farm runs is refused. Printed loudly (lines 'FARM: ...'). A fork (either kind) also gets `<dest>/fork.json` (source,
+  iteration, the farm decision); zero.run marks it started at the fork's first start - the start that needs a
+  `selfplay_local_reason` when self-play stays local beside a published farm build (docs/az.md 70).
 """
 import argparse
 import glob
@@ -47,6 +57,147 @@ import json
 import os
 import shutil
 import sys
+
+
+FORK_FILE = 'fork.json'                    # <fork>/fork.json: where it came from; `started` set by its first start
+FARM_OWN, FARM_NONE = 'own', 'none'        # --farm (docs/az.md 70)
+SLUG_MAX = 63                              # a farm run's name: zero.farm_def.SLUG_RE ([a-z0-9][a-z0-9-]{0,62})
+
+
+def read_fork(run):
+    """`<run>/fork.json` (tools/fork_run.py writes it into every fork it makes; docs/az.md 70), or None."""
+    try:
+        with open(os.path.join(run, FORK_FILE), encoding='utf-8') as f:
+            out = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return out if isinstance(out, dict) else None
+
+
+def write_fork(run, info):
+    p = os.path.join(run, FORK_FILE)
+    tmp = f'{p}.{os.getpid()}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(info, f, indent=1)
+    os.replace(tmp, p)
+
+
+def mark_started(run):
+    """A fork's first start has passed its start checks (zero.run, docs/az.md 70): fork.json's `started` set (when
+    there is a fork.json without it) -> whether it was marked."""
+    import time
+    f = read_fork(run)
+    if f is None or f.get('started'):
+        return False
+    f['started'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    write_fork(run, f)
+    return True
+
+
+def _names(setting):
+    return [x.strip() for x in (setting.split(',') if isinstance(setting, str) else (setting or [])) if str(x).strip()]
+
+
+def farm_runs(cfg, run=None):
+    """The farm runs a run's settings use -> {'selfplay': [names], 'eval': name or None}: the `pool:<farm run>` entries
+    of `selfplay_remote` (and of `run`'s selfplay_remotes file, which replaces the setting while it exists, docs/az.md
+    34) and `eval_remote`'s when it is a pool (docs/az.md 45, 65)."""
+    sp = _names((cfg or {}).get('selfplay_remote') or '')
+    if run:
+        try:
+            with open(os.path.join(run, 'selfplay_remotes'), encoding='utf-8') as f:
+                sp += [ln.split('#', 1)[0].strip() for ln in f.read().splitlines()]
+        except OSError:
+            pass
+    ev = str((cfg or {}).get('eval_remote') or '').strip()
+    out = []
+    for n in sp:
+        if n.startswith('pool:') and n[5:] not in out:
+            out.append(n[5:])
+    return {'selfplay': out, 'eval': ev[5:] if ev.startswith('pool:') else None}
+
+
+def farm_slug(name, limit=SLUG_MAX):
+    """A run directory's name as a farm run's name ([a-z0-9-], at most `limit`, starting with a letter or digit;
+    '' when nothing is left)."""
+    out = ''.join(ch if ch.isascii() and ch.isalnum() else '-' for ch in str(name).lower())
+    while '--' in out:
+        out = out.replace('--', '-')
+    return out.strip('-')[:limit].rstrip('-')
+
+
+def fork_farm(parent, overrides, dest, farm=FARM_OWN, source=None):
+    """The fork's farm settings (module docstring; docs/az.md 70): `parent` the source's config, `overrides` the --set
+    settings, `dest` the fork's directory, `farm` 'own' (default: its own farm runs, named after `dest`), 'none' (this
+    machine only) or a farm run name; `source` the source's directory (its selfplay_remotes file). -> (changes {setting:
+    value} to apply after the overrides, notes [line]). SystemExit: an override naming a farm run of the source's, a
+    name that is not a farm run slug or is the source's, a name with nothing to name, 'none' against an override that
+    names a pool."""
+    import re
+    over = dict(overrides or {})
+    theirs = farm_runs(parent, source)
+    taken = set(theirs['selfplay']) | ({theirs['eval']} if theirs['eval'] else set())
+    sp_set, ev_set = 'selfplay_remote' in over, 'eval_remote' in over
+    sp = _names(over['selfplay_remote'] if sp_set else parent.get('selfplay_remote') or '')
+    ev = str((over['eval_remote'] if ev_set else parent.get('eval_remote')) or '').strip()
+    named = [n for n in sp if sp_set and n.startswith('pool:') and n[5:] in taken]
+    if ev_set and ev.startswith('pool:') and ev[5:] in taken:
+        named.append(ev)
+    if named:
+        raise SystemExit(f'--set names the source\'s farm run(s) {named}: a fork never writes into its parent\'s farm '
+                         f'run (docs/az.md 70) - leave the setting to --farm (its own farm run by default), or name '
+                         f'another farm run')
+    # the source's self-play pools the fork would inherit: its setting's (unless overridden) and its selfplay_remotes
+    # file's (never copied: the fork would lose them silently)
+    inherited = [] if sp_set else [n[5:] for n in sp if n.startswith('pool:')]
+    if not sp_set:
+        inherited += [x for x in theirs['selfplay'] if x not in inherited]
+    ev_inherited = not ev_set and ev.startswith('pool:')
+    changes, notes = {}, []
+    if farm == FARM_NONE:
+        if sp_set and any(n.startswith('pool:') for n in sp):
+            raise SystemExit(f'--farm none, but --set selfplay_remote names a farm pool ({",".join(sp)})')
+        keep = [n for n in sp if not n.startswith('pool:')]
+        if inherited or keep != sp:
+            changes['selfplay_remote'] = ','.join(keep)
+            notes.append(f'FARM: --farm none - the fork self-plays on this machine{" and " + ",".join(keep) if keep else ""} '
+                         f'only (the source\'s pool:{", pool:".join(inherited)} dropped); its first start needs '
+                         f'selfplay_local_reason when a published farm build exists (docs/az.md 70)')
+        if ev_inherited:
+            changes['eval_remote'] = ''
+            notes.append(f'FARM: --farm none - the fork evaluates on this machine (the source\'s {ev} dropped)')
+        return changes, notes
+    own = farm_slug(os.path.basename(os.path.normpath(dest))) if farm in (None, '', FARM_OWN) else str(farm)
+    if not re.match(r'^[a-z0-9][a-z0-9-]{0,62}$', own or ''):
+        raise SystemExit(f'--farm {farm!r}: the fork\'s farm run {own!r} must be a slug ([a-z0-9-], 1-63); give one with '
+                         f'--farm NAME, or --farm none')
+    own_ev = f'{own[:SLUG_MAX - 5].rstrip("-")}-eval'
+    clash = sorted({own, own_ev} & taken) if (inherited or ev_inherited) else []
+    if clash:
+        raise SystemExit(f'the fork\'s own farm run name(s) {clash} are the source\'s: give another with --farm NAME '
+                         f'(docs/az.md 70)')
+    if farm not in (None, '', FARM_OWN) and not (inherited or ev_inherited):
+        raise SystemExit(f'--farm {farm}: the source names no farm run for the fork to replace (attach a farm with --set '
+                         f'selfplay_remote=pool:{farm} and its pool settings)')
+    if inherited:
+        new, done = [], False
+        for n in sp:
+            if n.startswith('pool:') and n[5:] in inherited:
+                if not done:
+                    new.append(f'pool:{own}')
+                    done = True
+            elif n not in new:
+                new.append(n)
+        if not done:
+            new.append(f'pool:{own}')              # (the source's selfplay_remotes file named it)
+        changes['selfplay_remote'] = ','.join(new)
+        notes.append(f'FARM: the source self-plays on pool:{", pool:".join(inherited)}; the fork self-plays on its OWN farm '
+                     f'run pool:{own} (created at its first publish, the source\'s pool settings kept) and never '
+                     f'writes into the source\'s. --farm none keeps the fork on this machine, --farm NAME names it')
+    if ev_inherited:
+        changes['eval_remote'] = f'pool:{own_ev}'
+        notes.append(f'FARM: the source evaluates on {ev}; the fork on its OWN farm run pool:{own_ev}')
+    return changes, notes
 
 
 def parse_value(v):
@@ -103,6 +254,7 @@ def new_run(src, run, game=None, allow_draft=False, ungated=False):
         if fresh:
             tails += '; new segments ' + ', '.join(f'{n} (gate {gated[n]:g})' if n in gated else f'{n} (ungated)'
                                                    for n in fresh)
+    write_fork(run, {'kind': 'new', 'source': _portable(src), 'iter': 0, 'started': None})
     print(f'{src} ({old.config["features"]} features, {old.config["actions"]} actions) -> {out} '
           f'({new.config["features"]} features, {new.config["actions"]} actions'
           + (', across a token layout change' if moved else '') + tails + ')')
@@ -178,7 +330,12 @@ def install_net(dest, it, net, game, settings=None):
     return net_size(m.config)
 
 
-def continuation(source, dest, it=None, overrides=None, copy=False, net=None, allow_draft=False):
+def _portable(p):
+    from ..local_config import portable_path
+    return portable_path(os.path.abspath(p).replace('\\', '/'))
+
+
+def continuation(source, dest, it=None, overrides=None, copy=False, net=None, allow_draft=False, farm=FARM_OWN):
     from .. import package
     from ..run import DEFAULTS, latest_iter, model_path
     if os.path.exists(os.path.join(dest, 'config.json')):
@@ -201,6 +358,8 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None, al
     if it is None or not os.path.exists(model_path(source, it)):
         raise SystemExit(f'{source}: no checkpoint {it}')
     settings = dict(cfg, **(overrides or {}))
+    # the fork's farm runs (docs/az.md 70): decided - or refused - before anything is copied
+    farm_changes, farm_notes = fork_farm(cfg, overrides, dest, farm, source)
     if net:                                        # (refused before anything is copied: the guard, the heads)
         from ..net import check_encoding, load
         m, _ = load(net, game=cfg.get('game', 'toy'))
@@ -221,16 +380,21 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None, al
     if size:
         cfg.update(size)
     cfg.update(overrides or {})
+    cfg.update(farm_changes)
     hook = package.active().fork_hook()
     if hook is not None:                           # (the game package's: e.g. its companion's settings, az.md 49)
         hook(source, dest, it, cfg, dict(overrides or {}))
     with open(os.path.join(dest, 'config.json'), 'w') as f:
         json.dump(cfg, f, indent=1)
+    write_fork(dest, {'kind': 'continuation', 'source': _portable(source), 'iter': it, 'net': _portable(net) if net else None,
+                      'farm': {'mode': farm or FARM_OWN, 'changes': farm_changes}, 'started': None})
     print(f'{source} @ iter {it} -> {dest}: {len(need)} checkpoints, {len(dirs)} data iterations, {len(rows)} metrics rows'
           + (' (and its resolver network)' if co else ''))
     if size:
         print(f'checkpoint {it} = {net} ({", ".join(f"{k} {v}" for k, v in size.items())}): no optimizer state, '
               f'its Elo results dropped')
+    for ln in farm_notes:
+        print(ln, flush=True)
     print(f'next: python tools/supervise.py {dest}   (resumes after iteration {it})')
 
 
@@ -360,12 +524,15 @@ def main(argv=None):
     ap.add_argument('--copy', action='store_true', help='copy shards instead of hard-linking them')
     ap.add_argument('--net', default=None, help="another network as the fork's checkpoint K (module docstring)")
     ap.add_argument('--allow-draft', action='store_true', help="continue a run of the game's draft token layout (R16)")
+    ap.add_argument('--farm', default=FARM_OWN, metavar='own|none|NAME',
+                    help="the fork's farm runs (docs/az.md 70): 'own' (default: named after --dest), 'none' (this "
+                         "machine only) or a farm run name - never the source's")
     a = ap.parse_args(argv)
     over = {}
     for kv in a.set:
         k, _, v = kv.partition('=')
         over[k.strip().replace('-', '_')] = parse_value(v)
-    continuation(a.source, a.dest, a.iter, over, a.copy, a.net, a.allow_draft)
+    continuation(a.source, a.dest, a.iter, over, a.copy, a.net, a.allow_draft, a.farm)
     return 0
 
 
