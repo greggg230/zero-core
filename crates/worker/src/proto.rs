@@ -11,8 +11,10 @@
 //! <worker> eval --settings F (--model GEN=M ... | --uniform) --seats JSON --games N [--gid-base G] [--seed S]
 //!          [--paired] [--threads T] [--infer-threads I] [--conc C] [--groups G] [--out DIR] [--prefix P]
 //!          [--reference GEN=R ...] [--sha256 GEN=H ...] [--ort-dll PATH] [--spinning 0|1] [--flush-games N]
-//!          [--record-batches N --record-file F] [--status-s X] [--stdin-control]
-//!                                                  one eval job from flags (events on stdout)
+//!          [--record-batches N --record-file F] [--status-s X] [--stdin-control] [--lanes auto|one]
+//!                                                  one eval job from flags (events on stdout; without --groups
+//!                                                  one group, without --infer-threads the lanes share --threads:
+//!                                                  docs/az.md 70)
 //! <worker> check-config <config.json> [--json] [--eval [--seats JSON]] [--platform P]
 //!                                                  classify every setting (for self-play, or for an eval
 //!                                                  job); exit 1 on unknown / unsupported, or (a worker on P,
@@ -409,12 +411,20 @@ fn eval_job_from_value(v: &Value, base: &Path) -> Result<crate::evaljob::EvalJob
         let d = rt.ok_or("job: a network job needs its runtime pack (runtime_dir or ZEROFARM_RUNTIME_DIR)")?;
         Some(job_ort(o, ort_dylib_in(None, Some(&d)), threads)?)
     };
+    // (`eval_lanes`: 'auto' - the default - or 'one', the layout before docs/az.md 70: measurements and tests; an agent
+    // sends none)
+    let lanes = match o.get("eval_lanes") {
+        None | Some(Value::Null) => crate::evaljob::LaneMode::Auto,
+        Some(v) => crate::evaljob::LaneMode::parse(v.as_str().ok_or_else(|| format!("job: eval_lanes {v}: 'auto' or 'one'"))?).map_err(|e| format!("job: {e}"))?,
+    };
     Ok(EvalJob {
         lease_id: o.get("lease_id").and_then(|x| x.as_str()).unwrap_or("job").to_string(),
         settings,
         seats,
         models,
         ort,
+        own_infer_threads: o.get("infer_threads").is_some_and(|v| !v.is_null()),
+        lanes,
         games,
         gid_base: u("gid_base").unwrap_or(0) as u32,
         seed: u("seed").unwrap_or(0),
@@ -929,6 +939,8 @@ fn eval_cli(w: &'static Worker, a: &Args) -> Result<i32, String> {
         seats,
         models,
         ort,
+        own_infer_threads: a.get("--infer-threads").is_some(),
+        lanes: crate::evaljob::LaneMode::parse(a.get("--lanes").unwrap_or("auto")).map_err(|e| format!("--{e}"))?,
         games: a.num("--games")?.ok_or("--games N")?,
         gid_base: a.num("--gid-base")?.unwrap_or(0),
         seed: a.num("--seed")?.unwrap_or(0),

@@ -201,6 +201,11 @@ impl EvalLink {
         let i = self.next.fetch_add(1, Ordering::SeqCst) % self.txs.len();
         self.txs[i].send(Req::Eval(b)).map_err(|_| GONE.to_string())
     }
+    /// A batch to evaluator thread `i` (an eval job's lane: the thread of the batch's key, docs/az.md 70).
+    pub(crate) fn eval_to(&self, i: usize, b: Batch) -> Result<(), String> {
+        let tx = self.txs.get(i).ok_or_else(|| format!("internal: evaluator thread {i} of {}", self.txs.len()))?;
+        tx.send(Req::Eval(b)).map_err(|_| GONE.to_string())
+    }
     /// After the batches sent so far: drop the sessions.
     pub fn release(&self) {
         let rs: Vec<_> = self.txs.iter().filter_map(|tx| {
@@ -252,7 +257,7 @@ impl EvalLink {
 }
 
 /// A sink that drops everything (the second and further sessions of a job: the first's events stand for them).
-struct NoSink;
+pub(crate) struct NoSink;
 impl Sink for NoSink {
     fn event(&self, _: Value) {}
     fn log(&self, _: &str) {}
