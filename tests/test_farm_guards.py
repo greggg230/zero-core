@@ -217,6 +217,8 @@ def test_a_worker_build_that_refuses_refuses_the_runs_start(tmp_path):
     (the coordinator's address is a documentation address that is never called)."""
     from zero import runctl
     run = tmp_path / 'pooled'
+    run.mkdir()
+    FR.write_fork(str(run), {'kind': 'new', 'iter': 0, 'started': None})     # (as a fork's first start)
     p = _run(tmp_path, run, '--iters', '1', '--selfplay-remote', 'pool:toy-pooled', '--pool-build', POOL,
              '--pool-worker', str(tmp_path / 'nowhere.exe'), '--pool-url', 'http://192.0.2.1', hook=False,
              env={'ZEROFARM_ADMIN_TOKEN': 'a-test-token'})
@@ -224,3 +226,4 @@ def test_a_worker_build_that_refuses_refuses_the_runs_start(tmp_path):
     st = runctl.read_state(str(run), 'run')
     assert st['state'] == 'refused' and 'not an executable on this machine' in st['error']
     assert 'REFUSED at the run\'s start' in _log(run)
+    assert FR.read_fork(str(run))['started'] is None, 'a first start refused by any check stays a first start'

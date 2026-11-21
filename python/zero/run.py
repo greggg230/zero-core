@@ -2437,9 +2437,6 @@ class Run:
         # resumed run only warns
         first = first_start(run)
         check_farm_use(run, c, first, self.log)
-        if first:
-            from .tools.fork_run import mark_started
-            mark_started(run)                      # (no-op without fork.json)
         start = latest_iter(run)
         if start is None:
             save(self.new_model(), model_path(run, 0), {'iter': 0})
@@ -2499,6 +2496,11 @@ class Run:
                             'work (selfplay_local 0)'))
             if not self.rsp.local_play and not self.rsp.multi:
                 self.log('self-play here only while no remote worker takes work (selfplay_local 0)')
+        if first:
+            # (a fork's first start has passed every start check - the farm's above, the farm pool's settings check in
+            # RemotePlay - so its next start is a resume: docs/az.md 70; no-op without fork.json)
+            from .tools.fork_run import mark_started
+            mark_started(run)
         try:
             self._iterations(start, done)
         finally:

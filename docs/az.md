@@ -9387,7 +9387,8 @@ them - the run's start is the one layer they all share.
   that is not a slug, and `--farm NAME` with nothing to replace. The decision is printed (`FARM: ...` lines).
 * **`fork.json`.** Both kinds of fork write `<dest>/fork.json`: `kind` (new / continuation), `source` (home as `~`),
   `iter`, `net`, `farm` {mode, changes} and `started` (null). The run marks it started (`mark_started`) at its first
-  start, once that start's checks below have passed.
+  start once every start check has passed - the farm's below and the farm pool's settings check -, just before its
+  first iteration: a first start refused for any reason stays a first start.
 * **Definitive refusals vs transient errors** (`zero.farm_pool.Refused`, a SystemExit with `reason`, `fix` and
   `detail`). Definitive: the worker build's `check-config` refusing the run's settings (`play_settings`: the refused
   keys with their statuses, `refusal_summary`, e.g. `bauble_memory (unknown)`; the whole answer in `detail`), the job's
