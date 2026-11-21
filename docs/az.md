@@ -9330,3 +9330,32 @@ rows, 2 search + 2 ONNX Runtime threads): all five cases, with one network on bo
 24 rows byte-identical** and the first 60 batches identical in every array; the seats' rules as zero.h2h names them
 ('cq-v50-s0.3-rv-ism' / 'cq-v50-s0.3-rv', 'gumbel-m4-v50-s0.3' / 'cq-v50-s0.3', 'cq-v50-s0.3-b1' / 'cq-v50-s0.3',
 'cq-n2' / 'visits'); the match without sets, 24 of 24 as before.
+
+The parity gate on MTG Zero (2026-11-21; its signed release worker of the branch, build 1468c4d9, through the farm's CPU
+runtime pack; legacy-meta3-r1 iter_1040 on both seats - one network, `--seats '[{"net": 1}, {"net": 1}]'` -, the eval
+settings of its ISMCTS campaign: the Doomsday-vs-Delver spec, eval_sims 16, the run's rule 'cq' guard 4 c_scale 0.3,
+root-view values, belief tilt 1 / mix 0.25, eval cache 8,192, groups 1, sparse rows; 8 paired games per case, 4 search +
+4 ONNX Runtime threads): all five cases **8 of 8 rows byte-identical**, the first 60 batches identical in every array -
+merge ('cq-n4-v50-s0.3-rv-b1m0.25-ism' / '...-rv-b1m0.25'), sims (32 / 8), gumbel ('gumbel-m4-v50-s0.3-rv-b1m0.25' /
+the rule), belief (tilt 1 / 0: '...-rv-b1m0.25' / '...-rv'), select ('cq-n2-rv-b1m0.25' / 'visits-rv-b1m0.25'); 62-91 s
+a side per case. zero.h2h's seats on legacy-meta3-r1's own config, old main() against `sides_of` over the 30 option sets:
+19 the same - every merge, belief, view, root-search and sims option -, the 11 others the corners above (on this run,
+whose evaluation uses root-view values, the old `--select` / `--a-select` dropped them: a seat of mover-view values).
+
+The core's checks (ba607c2, the desktop, beside the live runs): `cargo test` (workspace) and `cargo test -p zero_worker`
+pass; the core pytest 856 passed, 19 skipped, 2 failed, neither touching this change - `test_dup_reduce.py::
+test_max_is_deterministic_on_cuda_and_matches_the_cpu` (CUDA, the GPU shared with the live runs; it imports none of the
+changed modules and fails alone too) and
+`test_farm_pool.py::test_the_pool_follows_the_phase_spec_of_the_game_package` (a Windows PermissionError replacing a
+state file; passes alone); glassroad-zero, caverna-zero and kingdombuilder-zero build against this core
+(`smoke_all.sh --with-this-core --build-only`: games 3 of 3).
+
+**End to end on the farm** (2026-11-21, MTG Zero ENGINE.md 214): an analysis campaign `cmp-ismseat-test` -
+legacy-meta3-r1 iter_1040 against itself, seats `[{"net": 1, "set": {"eval_infoset_merge": 1}}, {"net": 1}]`
+(`tools/farm_campaign.py submit --a CK --a-infoset-merge 1 --b-infoset-merge 0`), 32 paired traced games at 16
+simulations, the signed worker build 1468c4d9 (this core) - was signed (its definition's template carries the set),
+accepted by the coordinator and leased by an unchanged agent (0.3.13) with no coordinator deploy: **all 32 games played
+by a farm PC** (two leases, 20 + 12 games; none local), every row's digest its record's, the spot check's 2 games
+replayed from seed + moves, 6 of the farm's games replayed by the desktop's worker byte-identical (row and digest), the
+rows' seats echoing the set; the readout named side A 'cq-n4-v50-s0.3-rv-b1m0.25-ism' and side B
+'cq-n4-v50-s0.3-rv-b1m0.25'. (16 simulations and 32 games: a test of the path, not a measurement of the merge.)
