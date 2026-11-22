@@ -514,6 +514,63 @@ twins without branching, move for move and record for record), `branches_count_i
 entry j's), `a_branch_of_an_archive_start_names_its_entry`, `differ_never_replays_the_games_own_move_first`,
 `branch_and_starts_settings_are_checked`; tests/test_forks.py.
 
+#### 2.11.1 Near-tie branches (`branch={'p', 'rule': 'neartie', 'eps', 'n_min', 'p_min', 'q_lo', 'q_hi'}`; `BranchRule::NearTie`; MTG Zero's B2, 2026-11-21)
+
+A second branch rule (docs/az.md 72 has the why and the run settings). `BranchCfg::rule` = `BranchRule::Uniform` is
+the section above, byte for byte (the default: a `branch` dict without `rule`, or `rule` 'uniform');
+`BranchRule::NearTie(NearTie { eps, n_min, p_min, q_lo, q_hi })` changes three things and adds a fourth:
+
+* **Eligible decisions** - the gate (`NearTie::alt`), at a game's (never a branch's) recording self-play seat's
+  **full** search of a decision that is not minor (two options or more; never a fast or minor search, a teacher
+  decision, a value choice or a lookahead's decision, nor a branch's deviation). `a` = the move the seat chose.
+  The candidates are the other root options with visits >= `n_min`, pre-noise prior P0 >= `p_min` and
+  `SearchGame::branch_alt_ok(a, b)` (asked best Q first, only for options that pass the other tests, until one
+  is ok); `b` = the one with the highest root Q (the first option on equal Qs). The decision is eligible when `a`
+  has a visit, `q_lo <= Q(a) <= q_hi` and `|Q(a) - Q(b)| <= eps`. **Q** is a root option's `W / N` - the root
+  decider's mean backed-up utility through it, over every visit of the option (a reused root's earlier visits, a
+  root floor's forced walks and a Gumbel root's walks included: the 'cq' rule and target read Q the same way) and
+  the same under both leaf-value views (`LeafView::Root` backs up the absolute win vector too, and each edge
+  accumulates its node decider's entry). It is P(win) in [0, 1] only without a margin term, so a recording
+  self-play seat with `margin_w` != 0 is refused, never gated on a mixed quantity. `n_min` >= 1, `p_min` in [0, 1],
+  `eps` >= 0, `0 <= q_lo <= q_hi <= 1`. The gate reads the tree after the move is chosen and changes nothing of the
+  game: every game counts its eligible decisions (`GameResult::neartie`, the stats' `neartie_seen`), whether or
+  not it drew a branch.
+* **The reservoir** of a game that drew a branch (the game's branch stream, as above) runs over its eligible
+  decisions only, and keeps the runner-up `b` with the state (`BranchInfo::alt`, the gap `gap`, the branch point's
+  `SearchGame::decision_tag` `tag`). A game with no eligible decision spawns nothing.
+* **The deviation**: exactly one, `b`, played at the branch's first network decision (its branch point) without a
+  search - no sampling, no root evaluation; recorded nowhere. Then normal self-play. `moves` is 1, `temp` 2 and
+  `differ` off with this rule (other values refused: they are the uniform rule's; the parser refuses those keys
+  with `rule` 'neartie' and the near-tie keys without it).
+* **Merges** (opt-in by the game's `SearchGame::merge_key`; None, the default, never merges). A game holding a
+  branch point keeps (real moves before the state, `merge_key()`) at each of its later network decision states
+  (once per state, where the key is Some); at spawn the branch keeps the keys of the states strictly after its
+  branch point. After its deviation, at each of its own network decision states, a key in that set means the
+  branch has **merged** back into its game: it ends there, before searching that decision; its row's `result`
+  and `scores` and its records' `z` and `sc` are **the game's** (what the game's own records got - a
+  resignation's result included); its `q` stays its own searches'. `BranchInfo::merged` = the branch's searched
+  decisions after the deviation (= its records, every search full); the stats count `merges` and
+  `merge_decisions`. A game cut at `max_steps` or aborted has no outcome to give: its branch never merges and
+  plays to its own end. The game's `merge_key` contract (equal keys = states with the same future in
+  distribution under any policy) is the game's; a false merge labels rows with another line's outcome, a missed
+  one only costs compute.
+
+Rows (the bindings, only with this rule): a branch's `branch` dict gains `alt`, `gap`, `tag`, `merged` (None, or
+its decisions to the merge); a game's row gains `neartie` (its eligible decisions); the stats `neartie_seen`,
+`merges`, `merge_decisions` (only once nonzero). Everything else is the section above: a branch counts as a
+finished game, carries its game's gid, never branches, and is not traceable (`set_trace`, `set_game_log` refuse).
+
+Tests (`driver::tests::neartie`): `the_gate_at_its_boundaries` (the gap exactly eps, visits below n_min, a prior
+below / at p_min, Q(a) at and outside [q_lo, q_hi], `branch_alt_ok` false skips to the next candidate, a better
+runner-up by the absolute gap, equal Qs, no visit for a), `a_neartie_branch_plays_its_runner_up_first_and_leaves_its_game_alone`
+(the games move for move and record for record their twins without branching; each branch's move log is its
+game's up to the branch point, then `alt` where the game played its move; records = its full searches after the
+deviation; reproducible across thread / group layouts), `a_game_without_an_eligible_decision_spawns_nothing`,
+`a_branch_that_reaches_its_games_state_merges_with_the_games_outcome` (a toy with transpositions, `PickGame`:
+merged branches end at a state of their game's, their rows and records carry the game's z and sc, the tallies;
+the same branch points without merge keys play to their end), `neartie_with_gumbel_roots_and_root_floors`,
+`neartie_settings_are_checked`; `settings::tests::branch_starts_and_subsettings`; tests/test_neartie.py.
+
 ### 2.15 Tail rows, their keys and the row limit (opt-in with `SearchGame::TAILS` / `OPTION_POINTERS`; 2026-11-11)
 
 A game with tail segments (1.4) sends every network row with its tail tokens and, with `OPTION_POINTERS`, its pointer

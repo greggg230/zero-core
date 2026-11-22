@@ -179,6 +179,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_league_pool` | '2,4,8,16,32' | the past checkpoints it may play: raw iteration offsets back from the network that self-plays (iteration i self-plays with i-1: offset 2 = checkpoint i-3), those that exist; 'all' = every earlier checkpoint (fictitious self-play) |
 | `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
 | `selfplay_branch`, `selfplay_branch_moves`, `selfplay_branch_temp`, `selfplay_branch_differ` | 0.0, 3, 2.0, 0 | branched self-play games (section 24, docs/search.md 2.11): this share of the games each spawn one branch game from a copy of their state at a uniformly drawn decision of theirs - 1..`moves` deviation moves sampled from the network's priors at temperature `temp` (never recorded; `differ` 1: the first never the game's own move), then normal self-play, its rows' z its own outcome; a branch counts as one of the iteration's games. 0 = off (nothing changes); needs rolling self-play (`rolling` 1 or `selfplay_remote`); single-game runs without the league |
+| `selfplay_branch_rule`, `selfplay_branch_eps`, `selfplay_branch_n_min`, `selfplay_branch_p_min`, `selfplay_branch_q_lo`, `selfplay_branch_q_hi` | 'uniform', 0.02, 4, 0.02, 0.1, 0.9 | near-tie branches (section 72, docs/search.md 2.11.1; with `selfplay_branch` > 0): 'neartie' draws the branch point among decisions where the runner-up (visits >= `n_min`, prior >= `p_min`) has a root Q within `eps` of the played move's, whose Q is in [`q_lo`, `q_hi`]; the branch plays that runner-up (one deviation), and ends with its game's outcome where it reaches one of its game's later states (the game's `merge_key`). 'uniform' = the branched games above (nothing changes) |
 | `selfplay_archive`, `selfplay_archive_p` | '', 0.1 | archive starts (section 24): this share of the games start from a position of the archive file (format 'zero-archive/1', built for the run's spec by the game's own tool: MTG Zero's `tools/delver_archive.py`) instead of a new deal. '' = off |
 | `selfplay_resign_t`, `selfplay_resign_k`, `selfplay_resign_noresign` | 0.0, 5, 0.1 | self-play resignation (section 27, docs/search.md 3.14): t > 0 = a self-play game ends when `k` consecutive full searches (the recorded ones; never fast or minor) found one seat's root win estimate >= 1 - t, the same seat each time, scored as that seat's win, every record kept (z the resignation's); this share of the games (a hash of seed and game) never resigns and reports where it would have (`selfplay.resign`: the live wrong-resignation rate; 1 = a dry run). Evaluations never resign. 0 = off (nothing changes); two-player single-game runs without the league |
 | `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
@@ -3670,6 +3671,10 @@ Kingdom Builder build against this core).
 ## 24. Branched self-play games and archive starts (`zero/forks.py`; MTG Zero's Delver mirror, 2026-11-03)
 
 (Sections 22 and 23 are taken by open branches: `feat/heavy-decisions`, `feat/light-decisions`, `feat/temp-late`.)
+
+Section 72 adds a second branch rule, near-tie branches (`selfplay_branch_rule` 'neartie': the branch point among
+decisions the search could not separate, the runner-up played, merges back into the game); this section is the
+'uniform' rule, the default.
 
 ### 24.1 Why
 
@@ -9646,3 +9651,108 @@ games differ: the float16 CUDA graph answers a row differently in another batch 
 shape), unlike the CPU graph - so a GPU job keeps its groups here, and fewer groups for GPU eval jobs is the agent's
 choice to make (a GPU lease's batches already depend on its size).
 
+
+## 72. Near-tie branches: branch where the search can't separate two moves, play the runner-up, merge back on an equivalent state (`selfplay_branch_rule` 'neartie', `selfplay_branch_eps`, `_n_min`, `_p_min`, `_q_lo`, `_q_hi`; MTG Zero's B2, 2026-11-21)
+
+### 72.1 Why
+
+Section 24's branched games branch at a uniformly drawn decision and sample 1-3 deviation moves from the priors.
+MTG Zero's A/B of them (its ENGINE.md 87, Delver, 40 generations) was null: most branches went where the value head was
+already sure, or into junk moves. The positions the value head lacks are the **near ties**: decisions where the search
+could not separate the move played from a credible runner-up, so one of them gets nearly all the real play and the
+other is never measured (MTG Zero's review 5: a gap of 0.000 at 62 of 71 human-flagged decisions). A census on MTG
+Zero's metagame line (its hub notes, B2 design section 6: 90 games, 64-simulation searches) found ~12 such decisions a
+game in contested positions after excluding non-decisions - fetch timing, Mishra's Bauble targets, cantrip timing,
+counter decisions - and most of them sequencing ties, which often reconverge: Brainstorm in the draw step or in the main
+phase reach the same position when the opponent does nothing in between.
+
+### 72.2 What it does
+
+`selfplay_branch_rule` 'neartie' (with `selfplay_branch` p > 0; driver: docs/search.md 2.11.1):
+
+* **The gate.** At a game's recording self-play full search of a decision that is not minor, with `a` the move played:
+  the candidates are the other root options with >= `selfplay_branch_n_min` visits, prior P0 >= `selfplay_branch_p_min`
+  and the game's `SearchGame::branch_alt_ok(a, b)` (MTG Zero: not a second copy of the same card, not the mana-ability
+  window, a mana colour or a trigger order); `b` = the one with the highest root Q (the decider's win estimate, W / N
+  over every visit). The decision is eligible when `|Q(a) - Q(b)| <= selfplay_branch_eps` and Q(a) is in
+  [`selfplay_branch_q_lo`, `selfplay_branch_q_hi`] (contested positions: a decided game's ties are not interesting).
+* **The branch point** is drawn uniformly among a game's eligible decisions (a share p of the games, as section 24);
+  a game without one spawns nothing.
+* **The branch** plays `b` there - one deviation, no sampling, recorded nowhere - then normal self-play; its rows' z
+  is its own outcome. The rows right after `b` (the opponent's answer, the decider's next decision) are the states
+  whose value the gate says is unmeasured.
+* **Merges.** A branch that reaches a state equivalent to one of its game's after the branch point (the game's
+  `SearchGame::merge_key`: equal keys = the same information states and hidden cards in distribution) ends there,
+  and its rows take **the game's** outcome: an equivalent state has the same future in distribution, and the game's
+  actual continuation is one draw of it. A quiet window then costs a few decisions instead of half a game. A game whose
+  `merge_key` is None (the default; MTG Zero's until its key lands) never merges.
+* Nothing else changes: the game plays and records exactly as without it (its streams, its rows), no row is
+  recorded twice, no target is masked or reshaped; a branch is one of the iteration's games (section 24's quotas).
+
+**Metrics** (`selfplay.forks.neartie`, and the `forks` log line): the games that counted, eligible decisions per game,
+near-tie branches, merges and their share, decisions to merge, the merged branches' samples, the mean Q gap, and the
+branch points by `decision_tag` (tag -> [branches, merged]). Remote self-play (5.3): the workers play the rule
+from the run's config like this machine; their hello's fingerprint names the near-tie settings, so a worker of an
+older checkout (which reports the uniform fingerprint) is refused (section 24); their tallies join the iteration's.
+
+### 72.3 Off by default
+
+`selfplay_branch_rule` 'uniform' (the default) is section 24, byte for byte; the near-tie settings do nothing (and are
+only range-checked) while `selfplay_branch` is 0. Turn it on with `--selfplay-branch 0.2 --selfplay-branch-rule
+neartie` (the defaults: eps 0.02, n_min 4, p_min 0.02, q_lo 0.1, q_hi 0.9). Refused, never ignored: the uniform
+rule's `selfplay_branch_moves` / `_temp` / `_differ` away from their defaults with 'neartie' and the near-tie settings
+away from theirs with 'uniform', out-of-range values, an unknown rule, and (driver) a recording self-play seat with
+`margin_w` != 0 (its Q is no win estimate). Section 24's refusals apply too (rolling self-play, no co-training, no
+league).
+
+### 72.4 Costs
+
+The gate scans the root's statistics once per recording full search (all games, a few options: nothing next to the
+search); a game holding a branch point computes `merge_key()` once per network decision state after it, and a branch
+once per decision state after its deviation (a hash, the game's cost). A game that drew a branch keeps its state copies
+as section 24 (one per reservoir pick) plus one key per later decision. A branch plays no deviation search. Fewer rows
+per branch than section 24's (a merged branch stops early), the same number of games per iteration.
+
+### 72.5 Farm workers
+
+The native worker (section 44) plays branched self-play, both rules, from the run's settings (`settings.rs`
+`branch_of`: the driver's branch dict exactly as `zero.forks.Forks` builds it, the same refusals) in **shards** jobs:
+the driver is the shared Rust one, so its games, branches and merges are the desktop's; `fin` and the unfinished ranges
+count the job's game ids (a branch is its game's second row), and its stats carry `branches`, `merges`, `neartie`.
+The farm pool's jobs write **game records** (section 45), and those cannot hold a branch: 72.7.
+
+### 72.6 Tests and checks
+
+`cargo test` (zero_search 218: the 6 tests of docs/search.md 2.11.1 and the parser's; zero_worker all passing with
+`branched_games_are_the_python_drivers` - the worker's branch dict equals the Python one, refusals - and
+`branched_games_play_into_shards` - both rules, `fin` = the job's ids, every game and branch in the shards, the same job
+twice the same shards, a records job refused, no new stats keys without branches). `tests/test_neartie.py` (10: the
+bindings' rows, stats and refusals; the run settings and their checks; the driver kwargs, the fingerprints - the
+uniform one unchanged - and the description; the tally, its merge with an older remote's and its summary; a rolling
+toy run; remote self-play with the remote 'local'). `test_forks.py` and `test_worker_settings.py` unchanged and
+passing. **Off**: `tools/check_checkpoint_compat.py --package zero --game toy` against the commit before (92568b5)
+identical with `--net random` and `--net uniform`; uniform-rule branched games (three settings, with archive starts in
+one) digested old vs new through the bindings - rows, branch dicts, samples, stats - identical (77f3d48aea53fc01).
+
+### 72.7 Open: game records of branch games (the farm pool)
+
+A game record (`records/1`, docs/search.md 2.17) replays a game from its seed; a branch starts from its game's state at
+the branch point, and a merged branch ends with its game's outcome, which its own final state does not give. So the
+driver refuses to trace a branch (as before), the worker refuses a records job with branches, and `run_settings.json`
+keeps `selfplay_branch` python_only: `check-config` refuses it, so the farm pool refuses such a run at its start
+(section 70) rather than failing every lease. What it needs: a branch record carrying its game's moves to the branch
+point and the merged outcome (a `branch` block: the prefix length, merged or not), replay accepting a merged record's
+outcome as given (or checked against its game's record), the worker keeping a game and its branch in one records file,
+and the pool and the coordinator crediting a branch under its game's id without counting it as another copy of that
+game (zero-farm's crediting rules). Until then a farm-backed run plays branches on the desktop and the Python remote
+hosts only.
+
+### 72.8 Measured
+
+2026-11-21, the desktop's CPU at below-normal priority beside live runs. **The toy** (`--preset toy-smoke`, rolling,
+3 iterations, the rule's defaults, p 0.2): 0.83 / 0.67 / 0.32 eligible decisions a game, 2 / 2 / 5 near-tie branches
+of 46 / 46 / 44 games, mean gap 0.007-0.011, no merges (the toy has no merge key); uniform branches, same seed: 3 / 5 /
+13. **Merges** (`PickGame`, the driver test's toy with transpositions, every decision eligible, p 1, 80 games of 8
+turns): 80 branches, 10 merged (12.5%) after 2.4 decisions on average (24 rows), the other 70 played to the end
+(204 rows). On MTG Zero nothing yet: its `merge_key` / `branch_alt_ok` hooks are its own change, and the A/B is its
+B2 step 2.
