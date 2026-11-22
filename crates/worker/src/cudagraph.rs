@@ -1,4 +1,4 @@
-//! CUDA graphs for a static zero-onnx/2 graph (zero-core docs/az.md 72, WIP): one GPU launch per call.
+//! CUDA graphs for a static zero-onnx/2 graph (zero-core docs/az.md 75, WIP): one GPU launch per call.
 //!
 //! ONNX Runtime launches the fast graph's ~1,200 kernels one by one each call, with 27 device -> host syncs for its
 //! data-dependent shapes: ~20 ms of a CPU thread per call whatever the batch, which leaves a 4-core GPU PC's crew
@@ -19,7 +19,7 @@
 //!
 //! Opt-in while it is measured: `ZERO_WORKER_CUDA_GRAPHS=1` and a static graph on the CUDA provider.
 //!
-//! The fixed graph (zero-core docs/az.md 74: the fast graph's arithmetic at fixed capacities) takes the same buckets
+//! The fixed graph (zero-core docs/az.md 76: the fast graph's arithmetic at fixed capacities) takes the same buckets
 //! with two capacities more: the batch's present head slots (`s`) and a row's non-zeros in a run of features (`mr`).
 //! Its padding rows' non-zeros go to features outside every run (value 0: inert anywhere), so they count in no run;
 //! a padding row's always-present head slots count in `s`.

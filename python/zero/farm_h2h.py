@@ -76,6 +76,7 @@ import time
 
 from .farm_def import (URL, Client, FarmError, file_sha256, read_token, token_path)  # noqa: F401  (the farm tools' client)
 from . import farm_def as FD
+from . import package as _package
 
 SLUG_RE = FD.SLUG_RE
 EXPIRES_DAYS = 30                       # a head-to-head's definition expires after this many days (--expires-days)
@@ -110,9 +111,14 @@ def settings_of(a, ckpt_a, game):
         if not saved:
             raise SystemExit(f'no run config next to {ckpt_a} (runs/<run>/config.json): give --config or --preset')
     saved = dict(saved)
-    if saved.get('game', game) != game:
-        raise SystemExit(f'the settings play {saved.get("game")!r}, the checkpoints {game!r}')
-    saved['game'] = game
+    from . import package
+    try:
+        sg = package.record_game(saved, default=game)   # (a config written before an alias: its old game, docs/az.md 73)
+    except package.GameAliasError as e:
+        raise SystemExit(f'the settings: {e}') from None
+    if sg != game:
+        raise SystemExit(f'the settings play {sg!r}, the checkpoints {game!r}')
+    package.set_game(saved, game)
     cfg = R.resolve_config(ns, saved)
     if a.sims is not None:
         cfg['eval_sims'] = int(a.sims)
@@ -730,7 +736,7 @@ def readout(cl, d, st):
     out = FE.summary(rows, True, seats[0])
     machines = machine_names(cl, st)
     tags = FE.seat_tags(st['settings'], seats)
-    full = dict({'a': st['a'], 'b': st['b'], 'game': st['game'], 'sims': st['settings']['eval_sims'],
+    full = dict({'a': st['a'], 'b': st['b'], 'game': st['game'], **_package.layout_stamp(st['game']), 'sims': st['settings']['eval_sims'],
                  'chance_k': st['settings']['chance_k']}, **out)
     full.update(select_a=tags[0], select_b=tags[1], paired=True, run=st['run'], machines=machines, farm=True)
     sims = [FE.seat_cfgs(st['settings'], seats)[k]['eval_sims'] for k in (0, 1)]

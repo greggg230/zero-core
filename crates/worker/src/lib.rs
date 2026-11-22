@@ -57,11 +57,53 @@ pub struct GameEntry {
     /// Why a game of this spec (JSON) would replay differently off the reference platform (`SearchGame::libm_replay`,
     /// `platform` module docs), else None; an error for a spec the game refuses.
     pub libm_replay: fn(&str) -> Result<Option<String>, String>,
+    /// A game NAME whose meaning changed (zero-core `GamePackage.game_aliases`, docs/az.md 73): this entry is the name's
+    /// layout revision `layout` - settings, graphs and headers naming it carry `game_layout` = that revision. None: a
+    /// name that never changed (no `game_layout` read or written).
+    pub layout: Option<u32>,
+    /// This entry is the game an aliased name meant before its change (`before_of` = that name): settings or a graph
+    /// naming that name without a `game_layout` play this entry. None: no name's old game.
+    pub before_of: Option<&'static str>,
 }
 
 impl GameEntry {
     pub const fn of<G: SearchGame>(name: &'static str) -> GameEntry {
-        GameEntry { name, new_driver: boxed_driver::<G>, info: game_info::<G>, libm_replay: libm_replay_of::<G> }
+        GameEntry { name, new_driver: boxed_driver::<G>, info: game_info::<G>, libm_replay: libm_replay_of::<G>, layout: None, before_of: None }
+    }
+
+    /// This entry as layout revision `rev` of its (aliased) name (docs/az.md 73).
+    pub const fn layout(mut self, rev: u32) -> GameEntry {
+        self.layout = Some(rev);
+        self
+    }
+
+    /// This entry as the game the name `name` meant before its layout revision (docs/az.md 73).
+    pub const fn before_of(mut self, name: &'static str) -> GameEntry {
+        self.before_of = Some(name);
+        self
+    }
+
+    /// The layout record written with this game's name (`game_layout`), or nothing.
+    pub fn stamp(&self, into: &mut serde_json::Map<String, serde_json::Value>) {
+        if let Some(r) = self.layout {
+            into.insert("game_layout".into(), serde_json::json!(r));
+        }
+    }
+}
+
+/// The entry a record naming game `name` with layout record `layout` (`game_layout`; None: none) is (zero-core
+/// `GamePackage.resolve_game`, docs/az.md 73): an aliased name (an entry with a `layout`) without a layout record is the
+/// entry `before_of` it, with its revision the entry itself; another revision, or a layout record of a name that never
+/// changed, is refused - a layout is never guessed.
+pub fn resolve_game<'a>(games: &'a [GameEntry], name: &str, layout: Option<u64>) -> Result<&'a GameEntry, String> {
+    let names = || games.iter().map(|g| match g.layout { Some(r) => format!("{} (layout {r})", g.name), None => g.name.to_string() }).collect::<Vec<_>>();
+    match (games.iter().find(|g| g.name == name), layout) {
+        (Some(g), Some(l)) if g.layout.map(u64::from) == Some(l) => Ok(g),
+        (Some(g), None) if g.layout.is_none() => Ok(g),
+        (Some(g), None) => games.iter().find(|e| e.before_of == Some(name)).ok_or_else(|| format!("game {name:?} without a game_layout: the game {name:?} meant before its layout {} - this worker has none (docs/az.md 73)", g.layout.unwrap_or(0))),
+        (Some(g), Some(l)) => Err(format!("game {name:?} with game_layout {l}: this worker plays {name:?} {} (docs/az.md 73)", g.layout.map_or("with no layout revision".into(), |r| format!("as layout {r}")))),
+        (None, None) if games.iter().any(|e| e.before_of == Some(name)) => Ok(games.iter().find(|e| e.before_of == Some(name)).unwrap()),
+        (None, _) => Err(format!("game {name:?}{}: this worker plays {:?}", layout.map_or(String::new(), |l| format!(" with game_layout {l}")), names())),
     }
 }
 
@@ -165,4 +207,51 @@ pub fn main_with(w: &'static Worker) -> i32 {
         .expect("spawn the worker's main thread")
         .join()
         .unwrap_or(101)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zero_search::toy::ToyGame;
+
+    // (docs/az.md 73: "toy" is the stand-in for an aliased name - revision 2 - whose old game is "toy_old")
+    static GAMES: &[GameEntry] = &[GameEntry::of::<ToyGame>("toy").layout(2), GameEntry::of::<ToyGame>("toy_old").before_of("toy"), GameEntry::of::<ToyGame>("other")];
+
+    #[test]
+    fn an_aliased_name_resolves_by_its_layout_record() {
+        assert_eq!(resolve_game(GAMES, "toy", Some(2)).unwrap().name, "toy");
+        assert_eq!(resolve_game(GAMES, "toy", None).unwrap().name, "toy_old");
+        assert_eq!(resolve_game(GAMES, "toy_old", None).unwrap().name, "toy_old");
+        assert_eq!(resolve_game(GAMES, "other", None).unwrap().name, "other");
+        assert!(resolve_game(GAMES, "toy", Some(3)).err().unwrap().contains("as layout 2"));
+        assert!(resolve_game(GAMES, "toy_old", Some(2)).is_err());
+        assert!(resolve_game(GAMES, "other", Some(1)).is_err());
+        assert!(resolve_game(GAMES, "nope", None).is_err());
+        // a build that registers only the old game still plays the name without a layout record
+        static OLD: &[GameEntry] = &[GameEntry::of::<ToyGame>("toy_old").before_of("toy")];
+        assert_eq!(resolve_game(OLD, "toy", None).unwrap().name, "toy_old");
+        assert!(resolve_game(OLD, "toy", Some(2)).is_err());
+        let mut m = serde_json::Map::new();
+        GAMES[0].stamp(&mut m);
+        assert_eq!(m.get("game_layout"), Some(&serde_json::json!(2)));
+        let mut m = serde_json::Map::new();
+        GAMES[1].stamp(&mut m);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn a_graph_is_the_jobs_game_by_name_and_layout_record() {
+        let new = eval::Expect::of_entry(&GAMES[0], false);
+        let old = eval::Expect::of_entry(&GAMES[1], false);
+        assert!(new.game_problem(Some("toy"), Some("2")).is_none());
+        assert!(new.game_problem(Some("toy"), None).is_some());       // a graph of before the change: the old game's
+        assert!(new.game_problem(Some("toy_old"), None).is_some());
+        assert!(new.game_problem(Some("toy"), Some("x")).is_some());
+        assert!(old.game_problem(Some("toy_old"), None).is_none());
+        assert!(old.game_problem(Some("toy"), None).is_none());       // exported before the change, as "toy"
+        assert!(old.game_problem(Some("toy"), Some("2")).is_some());
+        let plain = eval::Expect::of_entry(&GAMES[2], false);
+        assert!(plain.game_problem(Some("other"), None).is_none());
+        assert!(plain.game_problem(Some("other"), Some("1")).is_some());
+    }
 }

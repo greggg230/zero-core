@@ -16,7 +16,9 @@ control lines come from here; the watchdog is off). Its shards are those of `zer
 (the mirror's shard_writer_thread setting as given). The native side: `<worker> selfplay --settings
 <the same config.json> --uniform --games N --seed <the remote worker's seed> --net <iter - 1>
 --record-batches B`. Compared: every shard's arrays and cut points, the meta keys of the format, and
-the first B batches (every array). Exit 1 on a difference.
+the first B batches (every array). Exit 1 on a difference. With branched games (`selfplay_branch`, docs/az.md 24 / 72)
+both sides play the `--games` game ids and every branch of theirs (the Python side ends once each game flagged
+`branched` has its branch's row).
 
 With `--model <graph.onnx> --ort-dll <onnxruntime.dll> [--infer-threads T]` both sides answer with that zero-onnx/1
 graph instead (Python: zero.onnx_eval.OnnxEvaluator through onnxruntime, T intra-op threads; native: the same graph
@@ -80,12 +82,20 @@ def py_side(a, mirror, it):
                 self.drv.enqueue(f'{self.sid}:{self.enq}', self.spec)
                 self.enq += 1
 
+        def _finished(self, ph, rows, s):
+            # (branched games, docs/az.md 72: a game flagged `branched` has its branch's row still to come)
+            self.flagged = getattr(self, 'flagged', 0) + sum(bool(r.get('branched')) for r in rows)
+            self.branches = getattr(self, 'branches', 0) + sum('branch' in r for r in rows)
+            super()._finished(ph, rows, s)
+
         def emit(self, ev, **kw):
             super().emit(ev, **kw)
             if ev == 'fin':
-                self.fins = getattr(self, 'fins', 0) + kw['n']
                 self.ctl.put({'cmd': 'accept', 'iter': kw['iter'], 'n': kw['n']})
-                if self.fins >= self.budget:
+                # the job's games: its `--games` setups and every branch of theirs (the native job plays them all;
+                # without branches: `--games` rows, as before)
+                if self.taken >= self.budget and getattr(self, 'flagged', 0) == getattr(self, 'branches', 0)                         and not getattr(self, 'end_sent', False):
+                    self.end_sent = True
                     self.ctl.put({'cmd': 'end', 'iter': kw['iter']})
             elif ev == 'end' and kw.get('iter') == it:
                 self.ctl.put({'cmd': 'quit'})
@@ -144,7 +154,7 @@ def compare(py_shards, rs_shards, py_batches, rs_batch_file, nb):
     if len(py_shards) != len(rs_shards):
         bad.append(f'{len(py_shards)} Python shards, {len(rs_shards)} native')
     rows = 0
-    fmt = ('game', 'features', 'actions', 'rows', 'x_format', 'x_version', 'x_cols', 'x_nnz', 't_segs', 'option_pointers',
+    fmt = ('game', 'game_layout', 'features', 'actions', 'rows', 'x_format', 'x_version', 'x_cols', 'x_nnz', 't_segs', 'option_pointers',
            'max_row_tokens')
     for p, r in zip(py_shards, rs_shards):
         with np.load(p) as zp, np.load(r) as zr:

@@ -53,7 +53,8 @@
 //! checked before the file is loaded -, conc, groups, infer_threads, spinning, prefix, output - 'records' (the
 //! default from zero-farm phase 3: game records, `records` events; zero-core docs/search.md 2.17), 'shards'
 //! (sample shards, `shard` events) or 'both'); during it `yield` ->
-//! `yielded` (no batch started, the session dropped), `resume` -> `resumed`, `finish`, `quit`, `checkpoint`
+//! `yielded` (no batch started, the session dropped), `resume` -> `resumed` (sessions that cannot be rebuilt: the
+//! error event, fatal, and exit 1 - never a job left yielded), `finish`, `quit`, `checkpoint`
 //! {gen, model, sha256? (the file's), reference?},
 //! `ping` -> `status`; a rolling job (`rolling: true`, `flush_s` - default 120 -; `job::Rolling`): `extend` {games: the
 //! new total, never lower}, the event `low` {started, games} once per games value when fewer than conc ids are left to
@@ -210,7 +211,30 @@ fn game_of<'a>(games: &'a [GameEntry], s: &Settings) -> Result<&'a GameEntry, St
         Some(crate::pyjson::PyJson::Str(g)) => g.clone(),
         other => return Err(format!("settings: game {:?}", other.map(|g| g.dumps()))),
     };
-    games.iter().find(|g| g.name == name).ok_or_else(|| format!("game {name:?}: this worker plays {:?}", games.iter().map(|g| g.name).collect::<Vec<_>>()))
+    crate::resolve_game(games, &name, settings_layout(s)?).map_err(|e| format!("settings: {e}"))
+}
+
+/// The settings' `game_layout` (docs/az.md 73): None when absent or null, else a positive integer.
+pub fn settings_layout(s: &Settings) -> Result<Option<u64>, String> {
+    match s.get("game_layout") {
+        None | Some(crate::pyjson::PyJson::Null) => Ok(None),
+        Some(crate::pyjson::PyJson::Int(i)) if *i >= 1 && *i <= u32::MAX as i128 => Ok(Some(*i as u64)),
+        Some(other) => Err(format!("settings: game_layout {}: an integer >= 1 or null (docs/az.md 73)", other.dumps())),
+    }
+}
+
+/// `s` naming the game the worker picked for it (`game_of`): its `game` the entry's name, its `game_layout` the entry's
+/// revision (null when the key is there and the entry has none) - what `classify` checks against the game's info
+/// (docs/az.md 73: settings naming an aliased name without a layout record play the name's old game).
+fn resolved_settings(game: &GameEntry, s: &Settings) -> Settings {
+    let mut r = s.clone();
+    r.set("game", crate::pyjson::PyJson::Str(game.name.to_string()));
+    match game.layout {
+        Some(l) => r.set(classify::LAYOUT_KEY, crate::pyjson::PyJson::Int(l as i128)),
+        None if s.get(classify::LAYOUT_KEY).is_some() => r.set(classify::LAYOUT_KEY, crate::pyjson::PyJson::Null),
+        None => {}
+    }
+    r
 }
 
 fn read_settings(path: &str) -> Result<Settings, String> {
@@ -446,7 +470,7 @@ fn eval_job_from_value(v: &Value, base: &Path) -> Result<crate::evaljob::EvalJob
 fn eval_settings_failures(w: &Worker, game: &GameEntry, s: &Settings, seats: &[crate::settings::EvalSeat]) -> Result<Vec<String>, String> {
     let info = (game.info)();
     let others: Vec<_> = w.games.iter().filter(|g| g.name != game.name).map(|g| (g.info)()).collect();
-    let v = classify::classify_eval(s, &info, &others, w.package_settings)?;
+    let v = classify::classify_eval(&resolved_settings(game, s), &info, &others, w.package_settings)?;
     let mut bad: Vec<String> = classify::failures(&v).iter().map(|x| format!("{} = {}: {} ({})", x.key, x.value, x.status, x.why)).collect();
     if let Err(e) = crate::settings::eval_driver_cfg(s, &info, seats, 2, 0, true, None, None, None) {
         bad.push(format!("the evaluation match: {e}"));
@@ -482,7 +506,9 @@ fn end_event(o: &Outcome) -> Value {
 }
 
 /// Control lines during a job (yield / resume / finish / quit / checkpoint / ping; a rolling job's `extend`).
-fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress: &Mutex<Progress>, sink: &dyn Sink, base: &Path, rolling: bool) {
+/// One control line during a network job -> Some(message): a fatal error (nothing emitted yet: the caller quits the
+/// job and ends the process with that error, fatal, like a job's own error).
+fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress: &Mutex<Progress>, sink: &dyn Sink, base: &Path, rolling: bool) -> Option<String> {
     let op = line.get("op").and_then(|x| x.as_str()).unwrap_or("");
     match op {
         // (a classic job: `extend` is an unknown op, as before - the non-fatal error below)
@@ -503,10 +529,13 @@ fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress
             sink.event(json!({"ev": "yielded"}));
         }
         "resume" => {
+            // A failed resume is fatal: the sessions could not be rebuilt (a GPU's CUBLAS_STATUS_ALLOC_FAILED after an
+            // owner-activity pause), and the job would stay yielded for good - a live process doing nothing. The agent
+            // gets the error and the exit code instead of a lease that never ends.
             let l = link.lock().unwrap().clone();
             match do_resume(ctl, l.as_ref()) {
                 Ok(_) => sink.event(json!({"ev": "resumed"})),
-                Err(e) => sink.event(json!({"ev": "error", "message": format!("resume: {e}"), "fatal": false})),
+                Err(e) => return Some(format!("resume: {e}")),
             }
         }
         "finish" => ctl.finish(),
@@ -526,6 +555,7 @@ fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress
         "job" => sink.event(json!({"ev": "error", "message": "a second job line: one job per worker process", "fatal": false})),
         other => sink.event(json!({"ev": "error", "message": format!("unknown op {other:?}"), "fatal": false})),
     }
+    None
 }
 
 /// Run `job` on a thread while this thread reads control lines from `lines` (None: no control) and
@@ -571,10 +601,19 @@ fn with_control(status_s: f64, sink: Arc<Stdout>, lines: Option<std::sync::mpsc:
         .map_err(|e| format!("spawn: {e}"))?;
     let mut t_status = Instant::now();
     let mut eof = false;
+    let mut fatal = None;
     while !worker.is_finished() {
         match &lines {
             Some(rx) if !eof => match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Some(v)) => control(&v, &ctl, &link, &progress, &*sink, &base, rolling),
+                Ok(Some(v)) => {
+                    if let Some(e) = control(&v, &ctl, &link, &progress, &*sink, &base, rolling) {
+                        // (no more control lines: the job is quit and the process ends with this error)
+                        sink.log(&format!("{e}: fatal - quitting the job"));
+                        eof = true;
+                        ctl.quit();
+                        fatal = Some(e);
+                    }
+                }
                 Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     // stdin closed: the agent is gone - stop now
                     eof = true;
@@ -591,7 +630,11 @@ fn with_control(status_s: f64, sink: Arc<Stdout>, lines: Option<std::sync::mpsc:
             sink.event(json!({"ev": "status", "stats": s}));
         }
     }
-    worker.join().map_err(|_| "the job thread panicked".to_string())?
+    let out = worker.join().map_err(|_| "the job thread panicked".to_string())?;
+    match fatal {
+        Some(e) => Err(e),
+        None => out,
+    }
 }
 
 fn stdin_lines(sink: Arc<Stdout>) -> std::sync::mpsc::Receiver<Option<Value>> {
@@ -993,7 +1036,7 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
             Some(t) => seats_of_value(&serde_json::from_str::<Value>(t).map_err(|e| format!("--seats: {e}"))?)?,
             None => vec![crate::settings::EvalSeat::Net(1), crate::settings::EvalSeat::Net(2)],
         };
-        let v = classify::classify_eval(&s, &info, &others, w.package_settings)?;
+        let v = classify::classify_eval(&resolved_settings(game, &s), &info, &others, w.package_settings)?;
         let bad = classify::failures(&v);
         let built = crate::settings::eval_driver_cfg(&s, &info, &seats, 2, 0, true, None, None, None).err();
         if a.has("--json") {
@@ -1016,7 +1059,7 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
         }
         return Ok(if bad.is_empty() && built.is_none() && libm.is_empty() { 0 } else { 1 });
     }
-    let v = classify::classify_with(&s, &info, &others, w.package_settings)?;
+    let v = classify::classify_with(&resolved_settings(game, &s), &info, &others, w.package_settings)?;
     let bad = classify::failures(&v);
     // the settings must also build the driver (the Python remote worker's checks)
     let built = crate::settings::selfplay_driver_cfg(&s, &info, 0, 0).err();
@@ -1056,7 +1099,7 @@ fn driver_cfg_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> 
     Ok(0)
 }
 
-fn eval_batches(a: &Args) -> Result<i32, String> {
+fn eval_batches(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     use crate::eval::Evaluator;
     use crate::npz::read_npz;
     use crate::shard::{write_npz, Npy};
@@ -1069,10 +1112,10 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
     // (the driver's batches as recorded, their tail tokens and overrides included: zero-core docs/az.md 46)
     let rec = crate::selftest::read_batches(&z, &meta, "batches")?;
     let extra: Vec<u8> = rec.batches.iter().flat_map(|b| b.extra.iter().copied()).collect();
-    // the graph's own metadata as the expectation (the gate compares answers, not the game); GPU providers
-    // need the network's reference set (--reference)
+    // the graph's own metadata as the expectation (the gate compares answers, not the game; its game resolved in the
+    // worker's games, docs/az.md 73.1); GPU providers need the network's reference set (--reference)
     let reference = a.get("--reference").map(PathBuf::from);
-    let spec = crate::session::SessionSpec { model: &model, reference: reference.as_deref(), providers: &ort.providers, device: ort.device.clone(), intra_threads: threads, runtime: &ort.dylib, spinning: ort.spinning, expect: None };
+    let spec = crate::session::SessionSpec { model: &model, reference: reference.as_deref(), providers: &ort.providers, device: ort.device.clone(), intra_threads: threads, runtime: &ort.dylib, spinning: ort.spinning, expect: None, games };
     let mut ev = crate::session::create_session(&spec).map_err(|e| e.0)?;
     eprintln!("eval-batches: {}", ev.describe());
     let reps: usize = a.num("--reps")?.unwrap_or(1);
@@ -1100,7 +1143,7 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
-fn probe_cli(a: &Args) -> Result<i32, String> {
+fn probe_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     let providers = match a.get("--providers") {
         Some(s) => s.split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| ProviderKind::parse(n).ok_or_else(|| format!("--providers: unknown provider {n:?}"))).collect::<Result<Vec<_>, _>>()?,
         None => ProviderKind::PROBE_DEFAULT.to_vec(),
@@ -1122,6 +1165,7 @@ fn probe_cli(a: &Args) -> Result<i32, String> {
         // (a diagnostic build's variants name their own providers - the agent's --providers narrows only the probe's
         // own verdict, so a targeted variant can still reach a provider the agent no longer probes by default)
         variant_providers: Some(ProviderKind::ALL.to_vec()),
+        games,
     };
     let v = crate::probe::run(&o)?;
     eprint!("{}", crate::probe::report(&v));
@@ -1184,10 +1228,10 @@ pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
         "eval" => eval_cli(w, &a),
         "check-config" => check_config(w, &a),
         "driver-cfg" => driver_cfg_cli(games, &a),
-        "eval-batches" => eval_batches(&a),
+        "eval-batches" => eval_batches(games, &a),
         "info" => info_cli(games, repo, w.kinds(), w.features(), &a),
         "probe-providers" if !w.selfplay => Err("this worker build runs fuzz jobs only (a fuzz-profile build): no network".into()),
-        "probe-providers" => probe_cli(&a),
+        "probe-providers" => probe_cli(games, &a),
         // (one child of probe-providers' graph variants: probe_variants.rs)
         "probe-variant" if w.selfplay => match (a.get("--spec"), a.get("--out")) {
             (Some(spec), Some(out)) => crate::probe_variants::child_main(&ort_dylib_in(a.get("--ort-dll"), a.get("--runtime-dir")), Path::new(spec), Path::new(out)),
@@ -1271,6 +1315,49 @@ mod tests {
         let e = ev.0.lock().unwrap().clone();
         assert_eq!(e.len(), 2);
         assert_eq!((e[1]["ev"].as_str(), e[1]["fatal"].as_bool()), (Some("error"), Some(false)));
+    }
+
+    #[test]
+    fn a_failed_resume_is_fatal() {
+        // the resume arm: sessions that cannot be rebuilt -> the fatal message, no `resumed`, nothing emitted (the
+        // caller ends the process with it); a link that restores (here: none yet) -> `resumed`, not fatal
+        let (ctl, link, progress, ev) = (Control::default(), Mutex::new(None), Mutex::new(Progress::default()), Events::default());
+        let base = Path::new(".");
+        assert_eq!(control(&json!({"op": "yield"}), &ctl, &link, &progress, &ev, base, false), None);
+        assert_eq!(control(&json!({"op": "resume"}), &ctl, &link, &progress, &ev, base, false), None);
+        assert_eq!(*ev.0.lock().unwrap(), vec![json!({"ev": "yielded"}), json!({"ev": "resumed"})]);
+        *link.lock().unwrap() = Some(EvalLink::gone(2));
+        assert_eq!(control(&json!({"op": "yield"}), &ctl, &link, &progress, &ev, base, false), None);
+        let e = control(&json!({"op": "resume"}), &ctl, &link, &progress, &ev, base, false);
+        assert_eq!(e.as_deref(), Some("resume: the evaluator thread is gone"));
+        assert_eq!(ev.0.lock().unwrap().len(), 3, "nothing emitted for the failed resume");
+        assert!(ctl.is_yielded(), "still yielded: only the caller's quit ends it");
+    }
+
+    #[test]
+    fn with_control_quits_the_job_on_a_failed_resume_and_returns_its_error() {
+        // the job (yielded for good before this fix): quit, joined, and the resume's error is the job's outcome - the
+        // serve loops emit it fatal and exit 1
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let sink = Arc::new(Stdout { mu: Mutex::new(()) });
+        let h = std::thread::spawn(move || {
+            with_control(f64::INFINITY, sink, Some(rx), PathBuf::from("."), false, move |ctl, _sink, _p, link_out| {
+                link_out(EvalLink::gone(1));
+                ready_tx.send(()).unwrap();
+                let mut s = ctl.s.lock().unwrap();
+                while !s.quit {
+                    s = ctl.cv.wait(s).unwrap();
+                }
+                Ok(Outcome { reason: "quit", stats: json!({}), unfinished: vec![], shards: vec![], records: vec![] })
+            })
+        });
+        ready_rx.recv().unwrap();
+        tx.send(Some(json!({"op": "yield"}))).unwrap();
+        tx.send(Some(json!({"op": "resume"}))).unwrap();
+        let r = h.join().unwrap();
+        assert_eq!(r.err().as_deref(), Some("resume: the evaluator thread is gone"));
+        drop(tx);
     }
 
     #[test]

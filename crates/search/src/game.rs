@@ -333,6 +333,23 @@ pub trait SearchGame: Clone + Send + Sync + 'static {
         let _ = (key, viewer);
         KeyObs::Plain
     }
+    /// **Merge key** of the current state for near-tie branches (docs/search.md 2.11; opt-in, default None = never
+    /// merges): two states with equal keys are equivalent - every seat's information state is the same and the hidden
+    /// parts are the same in distribution (MTG Zero: the same cards in each hidden zone as multisets, the same
+    /// knowledge, any unknown library order), so their futures are the same in distribution under any policy. A branch
+    /// whose state's key equals one of its game's (after the branch point) has merged back: it ends there and its rows
+    /// take the game's outcome. A key must never be equal for states that are not equivalent (a false merge labels rows
+    /// with another game's outcome); a missed merge only costs compute, so return None whenever unsure.
+    fn merge_key(&self) -> Option<u128> {
+        None
+    }
+    /// Whether `alt` is a real alternative to `played` at the pending decision for a near-tie branch (docs/search.md
+    /// 2.11; default true): false for options that are equivalent to it (MTG Zero: two copies of a card) or that are not
+    /// decisions worth a branch (MTG Zero: opening the mana-ability window, a mana colour, the order of triggers).
+    fn branch_alt_ok(&self, played: u16, alt: u16) -> bool {
+        let _ = (played, alt);
+        true
+    }
 }
 
 /// How a tree's viewer observes one chance key of a real transition (`SearchGame::key_obs`, docs/search.md 3.18).

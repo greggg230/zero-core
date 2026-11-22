@@ -42,7 +42,7 @@ import time
 import numpy as np
 
 from .data import Window, read_shard, shard_paths, shard_rows, write_shard
-from . import rows as R
+from . import package, rows as R
 from .protocol import MAX_SEATS
 
 
@@ -84,7 +84,7 @@ class HeldOut:
         metas = [shard_meta(p) for p in self.paths]
         F = {m.get('features') for m in metas}
         A = {m.get('actions') for m in metas}
-        games = {m.get('game') for m in metas} - {None}
+        games = {package.record_game(m) for m in metas} - {None}   # (resolved, docs/az.md 73)
         if len(F) != 1 or len(A) != 1 or len(games) > 1:
             raise ValueError(f'held-out shards of different games or encodings: features {sorted(map(str, F))}, '
                              f'actions {sorted(map(str, A))}, games {sorted(games)}')
@@ -210,7 +210,8 @@ def make(src, out, rows=8192, seed=0):
         raise ValueError(f'no shards in {src}')
     metas = [shard_meta(p) for p in paths]
     F, A = metas[0]['features'], metas[0]['actions']
-    if any((m.get('features'), m.get('actions'), m.get('game')) != (F, A, metas[0].get('game')) for m in metas):
+    if any((m.get('features'), m.get('actions'), package.record_game(m)) != (F, A, package.record_game(metas[0]))
+           for m in metas):
         raise ValueError('shards of different games or encodings')
     aw = 0
     with np.load(paths[0]) as z0:

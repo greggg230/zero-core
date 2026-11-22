@@ -5,6 +5,11 @@
    "class": "play",
    "why": "the game the worker plays (one the worker build registers)"
   },
+  "game_layout": {
+   "class": "python_only",
+   "off": null,
+   "why": "an aliased game name's layout revision (docs/az.md 73): a worker build from it reads it with game when it picks its game (classify's LAYOUT_KEY: play); python_only here so that builds before it, by the run's declared classes, refuse a truthy one (a revision they cannot play) and play a null one as before"
+  },
   "spec": {
    "class": "play",
    "why": "the self-play games' spec (zero.games.spec_json: a dict json.dumps'd)"
@@ -699,9 +704,8 @@
    "why": "the self-play league: zero/league.py (its table, slots, past checkpoints) is Python only"
   },
   "selfplay_branch": {
-   "class": "python_only",
-   "off": 0.0,
-   "why": "branched games: set up and tallied by zero/forks.py (Python only)"
+   "class": "play",
+   "why": "branched games (both rules, docs/az.md 24 and 72): the worker's driver plays them (settings.rs branch_of, the shared driver), its records files are records/2 with each branch beside its game (records.rs), the pool replays a branch with its game's record (docs/az.md 72.7)"
   },
   "selfplay_archive": {
    "class": "python_only",
@@ -729,19 +733,40 @@
    "why": "a setting of selfplay_league (unused while it is off)"
   },
   "selfplay_branch_moves": {
-   "class": "param",
-   "of": "selfplay_branch",
-   "why": "a setting of selfplay_branch (unused while it is off)"
+   "class": "play",
+   "why": "a setting of selfplay_branch (settings.rs branch_of; inert while it is off)"
   },
   "selfplay_branch_temp": {
-   "class": "param",
-   "of": "selfplay_branch",
-   "why": "a setting of selfplay_branch (unused while it is off)"
+   "class": "play",
+   "why": "a setting of selfplay_branch (settings.rs branch_of; inert while it is off)"
   },
   "selfplay_branch_differ": {
-   "class": "param",
-   "of": "selfplay_branch",
-   "why": "a setting of selfplay_branch (unused while it is off)"
+   "class": "play",
+   "why": "a setting of selfplay_branch (settings.rs branch_of; inert while it is off)"
+  },
+  "selfplay_branch_rule": {
+   "class": "play",
+   "why": "a setting of selfplay_branch (settings.rs branch_of; inert while it is off)"
+  },
+  "selfplay_branch_eps": {
+   "class": "play",
+   "why": "a setting of selfplay_branch (settings.rs branch_of; inert while it is off)"
+  },
+  "selfplay_branch_n_min": {
+   "class": "play",
+   "why": "a setting of selfplay_branch (settings.rs branch_of; inert while it is off)"
+  },
+  "selfplay_branch_p_min": {
+   "class": "play",
+   "why": "a setting of selfplay_branch (settings.rs branch_of; inert while it is off)"
+  },
+  "selfplay_branch_q_lo": {
+   "class": "play",
+   "why": "a setting of selfplay_branch (settings.rs branch_of; inert while it is off)"
+  },
+  "selfplay_branch_q_hi": {
+   "class": "play",
+   "why": "a setting of selfplay_branch (settings.rs branch_of; inert while it is off)"
   },
   "selfplay_archive_p": {
    "class": "param",

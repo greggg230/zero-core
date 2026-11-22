@@ -83,6 +83,11 @@ pub struct Expect {
     /// slots) and whether its rows carry pointer overrides - a zero-onnx/2 graph must declare the same (docs/az.md 46).
     pub tails: Vec<(u16, String, usize, usize)>,
     pub option_pointers: bool,
+    /// The game's layout revision when its name is aliased (`GameEntry::layout`, docs/az.md 73): a graph of it says
+    /// `game_layout` = that revision; and the aliased name it played under before (`GameEntry::before_of`): a graph
+    /// naming that name without a `game_layout` (exported before the change) is this game's.
+    pub layout: Option<u32>,
+    pub before_of: Option<String>,
 }
 
 impl Expect {
@@ -96,7 +101,28 @@ impl Expect {
             belief,
             tails: info.tails.iter().map(|t| (t.seg, t.name.to_string(), t.width, t.head)).collect(),
             option_pointers: info.option_pointers,
+            layout: None,
+            before_of: None,
         }
+    }
+
+    /// `Expect::of` of a registered game, with its alias (docs/az.md 73).
+    pub fn of_entry(game: &crate::GameEntry, belief: bool) -> Expect {
+        Expect { game: game.name.to_string(), layout: game.layout, before_of: game.before_of.map(String::from), ..Expect::of(&(game.info)(), belief) }
+    }
+
+    /// A graph's or a reference set's game (`game`, its `game_layout`) is this one's: the same name and layout record,
+    /// or this game's name before its alias without a layout record (docs/az.md 73) -> None, else the refusal.
+    pub fn game_problem(&self, game: Option<&str>, layout: Option<&str>) -> Option<String> {
+        let lay = layout.map(|l| l.trim().parse::<u32>().map_err(|_| l.to_string()));
+        let ok = match (game, &lay) {
+            (_, Some(Err(_))) => false,
+            (Some(g), None) if g == self.game => self.layout.is_none(),
+            (Some(g), Some(Ok(l))) if g == self.game => self.layout == Some(*l),
+            (Some(g), None) => self.before_of.as_deref() == Some(g),
+            _ => false,
+        };
+        (!ok).then(|| format!("a network of game {game:?}{}, the job plays {:?}{} (docs/az.md 73)", layout.map_or(String::new(), |l| format!(" layout {l}")), self.game, self.layout.map_or(String::new(), |l| format!(" layout {l}"))))
     }
 }
 

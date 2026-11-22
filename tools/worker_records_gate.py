@@ -16,6 +16,11 @@ z / q / sc, the network ids, the auxiliary targets. A game's setup record (`Sear
 per-seat decks) is compared by the replay itself. `--switch-model` sends a `checkpoint` (a phase change: games in flight
 go on under the new network id) after `--switch-after` finished games, so rows of two networks are checked. The
 records' game seeds must be their game ids' (`game_seed_of`). Exit 0 iff every array of every file is identical.
+
+Branched games (`selfplay_branch`, docs/az.md 72.7: records/2): a branch's record replays with its game's record, which
+the same file holds (the worker never cuts a file between them). A records file may then hold a game the shard of
+its games wrote earlier, so with branches on the gate plays one file of each (`shard_rows` set past the job's rows):
+the records' lines are then in the shard's game order.
 """
 import argparse
 import glob
@@ -138,6 +143,9 @@ def main(argv=None):
     with open(a.settings, encoding='utf-8') as f:
         cfg = json.load(f)
     cfg.update(parse_set(a.set))
+    if float(cfg.get('selfplay_branch', 0) or 0) > 0:
+        cfg['shard_rows'] = 1 << 30            # (branched games: one records file and one shard - module docs)
+        print('# branched games: one records file and one shard (shard_rows past the job)', flush=True)
     out = a.out or os.path.join(os.getcwd(), f'records-gate-{int(time.time())}')
     os.makedirs(out, exist_ok=True)
     sp = os.path.join(out, 'settings.json')
@@ -152,7 +160,8 @@ def main(argv=None):
 
     rc = dict(DEFAULTS)
     rc.update(cfg)
-    game = rc['game']
+    from zero import package
+    game = package.record_game(rc)             # (resolved: a config of an aliased name without its layout record, docs/az.md 73)
     spec = G.spec_json(rc['spec'])
     fmt = shard_format(rc, G.info(game))       # (format v2 for a game with tails / overrides, docs/az.md 43.1)
     recs = sorted(glob.glob(os.path.join(wout, 'g_*.rec.jsonl.gz')))
@@ -171,10 +180,21 @@ def main(argv=None):
         if json.loads(h['spec'] or '{}') != json.loads(spec):
             raise SystemExit(f'{rp}: the records\' spec is not the run\'s')
         ref = os.path.join(out, 'replayed', os.path.basename(shp)[:-4])
-        w = ShardWriter(ref, 'r', rows=1 << 40, meta={'game': game, 'features': h['features'], 'actions': h['actions'], **fmt})
+        w = ShardWriter(ref, 'r', rows=1 << 40, meta={'game': game, **package.layout_stamp(game), 'features': h['features'], 'actions': h['actions'], **fmt})
+        parents = {}
         for ln in lines[1:]:
             t0 = time.time()
-            s, info = E.replay_rows(game, spec, ln, aux)
+            r = json.loads(ln)
+            if 'branch' in r:
+                # (records/2: a branch replays with its game's record, earlier in the same file)
+                if r['gid'] not in parents:
+                    raise SystemExit(f'{rp}: the branch of game {r["gid"]} without its game record before it')
+                s, info = E.replay_rows(game, spec, ln, aux, parent=parents[r['gid']])
+                rep['branches'] = rep.get('branches', 0) + 1
+                rep['merged'] = rep.get('merged', 0) + (info['branch']['merged'] is not None)
+            else:
+                parents[r['gid']] = ln
+                s, info = E.replay_rows(game, spec, ln, aux)
             rep['replay_s'] += time.time() - t0
             if info['seed'] != E.game_seed_of(a.seed, info['gid']):
                 raise SystemExit(f'game {info["gid"]}: its seed is not its game id\'s')

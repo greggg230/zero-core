@@ -226,7 +226,7 @@ fn a_resignation_concedes_the_game_and_the_match_goes_on() {
 #[test]
 fn branched_games_are_refused_with_chained_episodes() {
     let mut c = match_cfg(nn(0, 8, true), 2);
-    c.branch = Some(BranchCfg { p: 1.0, moves: 1, temp: 1.0, differ: false });
+    c.branch = Some(BranchCfg { p: 1.0, moves: 1, temp: 1.0, differ: false, rule: BranchRule::Uniform });
     let mut d = Driver::<ToyMatch>::new(c).unwrap();
     let e = loop {
         match d.next_batch(true) {

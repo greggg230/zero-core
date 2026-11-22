@@ -1232,7 +1232,14 @@ class RemotePlay:
             # the farm pools' share (docs/az.md 45): closed with what they accepted - the run never waits for them
             # (outside mu: end_phase takes Pool.dmu, which a draining pool holds while it calls accept_pool)
             pls = {p.name: p.end_phase(it) for p in list(self.pools.values())}
-            out['pools'] = {n: {k: v for k, v in r.items() if k != 'stale'} for n, r in pls.items()}
+            out['pools'] = {n: {k: v for k, v in r.items() if k not in ('stale', 'forks')} for n, r in pls.items()}
+            if any(r.get('forks') for r in pls.values()):
+                # (branched games the pools accepted: into the iteration's forks tally with the remotes', docs/az.md 72.7)
+                from .forks import merge as fmerge
+                fk = out.get('forks')
+                for r in pls.values():
+                    fk = fmerge(fk, r.get('forks'))
+                out['forks'] = fk
             out['games'] = out.get('games', 0) + sum(r['games'] for r in pls.values())
             out['samples'] = out.get('samples', 0) + sum(r['samples'] for r in pls.values())
             qblock['stale'] = merge_hist(qblock['stale'], *[r['stale'] for r in pls.values()])
@@ -1899,7 +1906,11 @@ class RemotePlay:
         meta = sh['meta']
         info = self.R.info
         want = (self.R.cfg['game'], info['num_features'], info['num_actions'])
-        got = (meta.get('game'), meta.get('features'), meta.get('actions'))
+        try:
+            mg = package.record_game(meta)          # (an aliased name without its layout record: docs/az.md 73)
+        except package.GameAliasError as e:
+            mg = f'{meta.get("game")!r}: {e}'
+        got = (mg, meta.get('features'), meta.get('actions'))
         if got != want:
             h.log(f'shard {name} of iteration {it} REJECTED: game / features / actions {got}, the run\'s {want} '
                   f'(the remote\'s code is not the run\'s?)')
@@ -2535,8 +2546,8 @@ class Worker:
         self._cleanup()
         c = self.cfg
         drv = self.drv
-        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'],
-                'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid, **shard_format(c, self.info),
+        meta = {'game': c['game'], **package.layout_stamp(c['game']), 'features': self.info['num_features'],
+                'actions': self.info['num_actions'], 'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid, **shard_format(c, self.info),
                 **({'remote': self.sp['remote']} if self.sp.get('remote') else {})}   # (a list of hosts: its name)
         box = {}
         writer = ShardWriter(os.path.join(self.rdir, 'data', f'iter_{it:04d}'), self.prefix, rows=int(c['shard_rows']),

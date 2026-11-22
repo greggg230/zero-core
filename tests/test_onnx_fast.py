@@ -233,6 +233,36 @@ def test_fast_graph_cuda_forms(tmp_path):
                 assert np.array_equal(x, y), a
 
 
+def test_fast_graph_pads_the_policy_zeros(tmp_path):
+    """docs/az.md 74: the fast graph appends the policy's blocks of zeros as Pads (`PAD_ZEROS`): fewer scatters read a
+    Concat than in a fast graph exported with the Concats, more Pads; the same answers, bit for bit (the CPU)."""
+    import onnx
+    import onnxruntime as ort
+    net = rich_net(RICH, seed=4, readers=READER)
+    p1, _ = export(net, tmp_path)
+
+    def concat_scatters(path):
+        g = onnx.load(path).graph
+        prod = {o: nd for nd in g.node for o in nd.output}
+        return sum(1 for nd in g.node if nd.op_type in ('ScatterElements', 'ScatterND') and nd.input[0] in prod
+                   and prod[nd.input[0]].op_type == 'Concat')
+    old = OX.ZeroOnnx2Fast.PAD_ZEROS
+    try:
+        OX.ZeroOnnx2Fast.PAD_ZEROS = False
+        p2 = str(tmp_path / 'fast_concat.onnx')
+        OX.export(net, p2, 'packed', {'checkpoint': 'toy'}, fast=True)
+    finally:
+        OX.ZeroOnnx2Fast.PAD_ZEROS = old
+    pads = lambda path: sum(1 for nd in onnx.load(path).graph.node if nd.op_type == 'Pad')  # noqa: E731
+    assert concat_scatters(p1) < concat_scatters(p2) and pads(p1) > pads(p2), (concat_scatters(p1), concat_scatters(p2), pads(p1), pads(p2))
+    rows = gate_rows(net, rich_batch(48, 13), kinds_of(48, 4))
+    f = OP.feeds(rows, v2=True)
+    a = ort.InferenceSession(p1, providers=['CPUExecutionProvider']).run(None, f)
+    b = ort.InferenceSession(p2, providers=['CPUExecutionProvider']).run(None, f)
+    for u, v in zip(a, b):
+        assert np.array_equal(u, v)
+
+
 def test_fast_weight_swap_template(tmp_path):
     """`graph='fast'`: the template (`export_template`) of the fast graph, another checkpoint of the architecture
     swapped in (`swap_export`) - its outputs the fresh fast export's bit for bit; the fingerprint names the graph, so the

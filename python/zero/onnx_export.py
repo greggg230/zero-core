@@ -135,7 +135,7 @@ FUSED_DOMAIN = 'zero.onnx'
 # CUDA kernel of opset 19-23's versions of a dozen operators, which then run on the CPU); 'fast-matmul' the MatMul form
 GRAPHS = {'': (None, False), 'fast': ('mha', True), 'fast-att23': ('attention23', True), 'fast-matmul': ('matmul', True),
           'static': ('mha', 'static'),        # (docs/az.md 67: no data-dependent shape, for the GPU)
-          'fast-fixed': ('mha', 'fixed')}     # (docs/az.md 74: the fast graph at fixed capacities, for CUDA graphs)
+          'fast-fixed': ('mha', 'fixed')}     # (docs/az.md 76: the fast graph at fixed capacities, for CUDA graphs)
 
 
 def graph_options(graph):
@@ -881,11 +881,11 @@ class ZeroOnnx2(ZeroOnnx):
 
     # the override targets' match (0 / 1) is ArgMax'ed in this dtype: int64 here, as every graph before; the static
     # graph's in float32 (the same first index of the largest), which ONNX Runtime's CUDA provider runs - its ArgMax has no
-    # int64 kernel, so an int64 ArgMax is the static graph's only CPU node (docs/az.md 72)
+    # int64 kernel, so an int64 ArgMax is the static graph's only CPU node (docs/az.md 75)
     ARGMAX_DTYPE = torch.int64
     # a block of zeros appended to the policy before a scatter: as a Concat with zeros (every graph before), or as a Pad
     # of the policy (the fast graph: the same tensor; ONNX Runtime's CUDA host time of those two Concats was ~20 % of a
-    # call's, docs/az.md 72)
+    # call's, docs/az.md 74)
     PAD_ZEROS = False
 
     VERSION = 2
@@ -1791,7 +1791,7 @@ FIXED_INPUTS = ('s_cap', 'm_cap', 't_cap')
 
 
 class ZeroOnnx2FastFixed(ZeroOnnx2Fast):
-    """The fast graph at fixed capacities (`export(..., fast='fixed')`, graph 'fast-fixed', docs/az.md 74): the fast
+    """The fast graph at fixed capacities (`export(..., fast='fixed')`, graph 'fast-fixed', docs/az.md 76): the fast
     graph's arithmetic - the per-token layers on the packed token list, the attention on rows padded to T - with every
     size an input's. Three more inputs whose lengths only are read: `s_cap` [S] (the batch's present head slots, the
     global tokens aside, at most), `m_cap` [MR] (a row's non-zeros in one run of features - `run_ranges`, the
@@ -2203,7 +2203,7 @@ def metadata2(net, extra=None, attention=None, fast=False, runs=None):
         meta['presence'] = json.dumps([int(i) for i in net.present_index()])
         meta['t_align'] = str(T_ALIGN)
     elif fast == 'fixed':
-        # (docs/az.md 74: ZeroOnnx2FastFixed's graph - its capacity inputs, and what a feeder computes them from: the
+        # (docs/az.md 76: ZeroOnnx2FastFixed's graph - its capacity inputs, and what a feeder computes them from: the
         # head positions' present flags and the multiple it rounds T up to (the static graph's), the runs of features
         # [lo, hi) a row's non-zeros are read in (MR: a row's most in one of them))
         meta['fixed'] = '1'
@@ -2241,6 +2241,8 @@ def metadata(net, packing, extra=None):
             'outputs': json.dumps(list(OUTPUTS)), 'packing': str(packing or 'none'), 'opset': str(OPSET),
             'unique_scatters': '0' if packing in ('compact', 'host') else '1',
             'exporter': 'torch.onnx.export(dynamo=True)', 'torch': torch.__version__}
+    if c.get('game_layout') is not None:            # (an aliased game's layout record, docs/az.md 73; else absent)
+        meta['game_layout'] = str(int(c['game_layout']))
     if packing == 'host':
         meta['present_index'] = json.dumps(net.present_index())
     if getattr(net, 'dup_reduce', None) is not None:
@@ -2423,7 +2425,7 @@ def _export_module(net, packing='packed', attention=None, fast=False):
                     list(OUTPUTS2), dict(dynamic_shapes2(), t_cap={0: torch.export.Dim('T', min=2, max=1 << 20)}),
                     lambda extra: metadata2(net, extra, attention=attention, fast=fast))
         if fast == 'fixed':
-            # (docs/az.md 74: its capacities as three inputs whose lengths only are read - the present head slots S, a
+            # (docs/az.md 76: its capacities as three inputs whose lengths only are read - the present head slots S, a
             # row's non-zeros in a run MR, the padded rows' tokens T -, traced with room for every example row and
             # every size distinct from the others')
             mod = ZeroOnnx2FastFixed(net, packing, attention).eval()
@@ -3300,6 +3302,8 @@ def write_reference_rows(net, rows, bo, out, info=None, tol=REFERENCE_TOL):
             'actions': int(net.config['actions']), 'aux_width': W, 'rows': int(rows.B), 'belief_rows': n_belief,
             'value_rows': int((rows.extra == ROW_VALUE).sum()), 'batches': int(len(bo) - 1), 'tol': tol,
             'sources': rows.source, 'torch': torch.__version__, 'answers': 'infer.NetEvaluator, eager, CPU'}
+    if net.config.get('game_layout') is not None:  # (docs/az.md 73)
+        meta['game_layout'] = int(net.config['game_layout'])
     if v2:
         meta.update(rows.tail_stats())
         meta['t_segs'] = [[int(j), str(nm), int(w), int(h)] for j, nm, w, h in net.tail_segments()]
