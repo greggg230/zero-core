@@ -9895,6 +9895,44 @@ release's DirectML self-test (`probe-providers --providers dml,cpu` on the re-ex
 the old reference set) fails with the release's worker and passes with this one (cpu and dml); the CUDA self-test's
 pair passes on both.
 
+### 73.2 A saved config read back resolves its games (remote workers, remote evaluations, eval jobs; MTG Zero's farm release, 2026-11-22)
+
+**Why.** A remote self-play worker (`remoteplay.Worker`) read its mirror's config.json as it was and played its `game`
+by name. A mirror the run writes names the game resolved (`resolve_config` before `_prepare_mirror`), but a config
+copied as it is - farm gate 2 (`tools/worker_parity.py`) copies the reference run's config.json into the worker's
+mirror, and that run's config, of before the change, names `mtg` with `game_layout` null - made the worker play `mtg`
+(layout 8) while the checkpoint loaded as `mtg_v7`: `a network of another encoding than this build's (game 'mtg_v7'
+-> 'mtg')`, exit 78, which failed MTG Zero's farm release at its gates for every build after layout v8 (gate 3, the
+native worker on the same config, resolved it and passed).
+
+**What it does.** `package.resolve_saved_games(cfg, where)`: a run's settings read back from a file name their
+resolved games, in place, as `resolve_run_game` resolves a resumed run's saved config - `game` with its
+`game_layout`, a co-training run's `resolver` with `resolver_cfg`'s record. A config written resolved reads back
+unchanged; an aliased name without a layout record is the name's old game. Its readers: `remoteplay.Worker` (its
+mirror's config.json; a layout record this checkout has no game for is refused in `main` as an EncodingMismatch:
+`error` kind `encoding`, exit 78 - this checkout is not the run's encoding), `remote.evaluate_mirror` and
+`evaluate_net_mirror` (`python -m <pkg>.az.remote eval|evalnet`: the mirror's config before the Run / CoRun is made;
+a bad record: EncodingMismatch, REFUSED), and `farm_eval.match_driver` (an eval job's settings, as the native
+worker's `game_of` resolves a job's: `tools/worker_eval_gate.py`'s Python side; a bad record: GameAliasError). The
+gate tools that drive the Python worker (`worker_parity.py`, `worker_bench.py`) go through `Worker` and resolve with
+it. The other readers audited were already resolved: the run's own config (`resolve_config`), network configs
+(`net.build`), h2h's run settings, the farm pool's headers, the held-out set, records and failures, farm_h2h, the
+gates' own config reads (`worker_records_gate.py`, `onnx_worker_gate.py`); a run's `cfg['game']` in a process is the
+resolved one.
+
+**Off by default.** Nothing to turn on: a config of an unaliased game, or one written resolved, reads back exactly as
+before.
+
+**Tests.** `tests/test_game_alias.py`: `resolve_saved_games` (old and new records, a resolver's, written configs read
+back as themselves, bad records refused); a remote Worker in-process on a mirror naming `toy_match` with
+`game_layout` null plays `toy` and loads a `toy` checkpoint (before: refused, the release's message), the record
+`toy_match` 1 plays `toy_match` and refuses a `toy` checkpoint, a record 4 is refused as `encoding`; the remote
+evaluation's mirror (both commands) and an eval job's match driver resolved; `tests/test_worker_settings.py`: the
+settings an eval match reads are now exactly the worker's `EVAL_READS`, `game_layout` included (it was left out:
+Python read the game unresolved). End to end: MTG Zero's farm gates on
+copies of the release's reference config and checkpoint with the release's worker - gate 2 fails before (exit 78,
+`'mtg_v7' -> 'mtg'`) and passes after (8 games, 534 rows, 200 batches identical), gate 3 passes on both (`mtg_v7`).
+
 ## 74. The fast graph's blocks of zeros as Pads (`ZeroOnnx2Fast.PAD_ZEROS`; no setting; zero-farm's CUDA PCs, 2026-11-22)
 
 **Why.** On a farm PC's NVIDIA GPU (the farm's CUDA pack, ONNX Runtime 1.24.4) the fast fp16 graph's call is bound by

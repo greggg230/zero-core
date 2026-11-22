@@ -101,7 +101,8 @@ def test_eval_jobs_read_what_an_evaluation_match_reads(monkeypatch):
         except Captured:
             pass
         seen |= c.read
-    # (game_layout: the worker reads it with game to pick its game, docs/az.md 73; Python's settings hold the resolved game)
-    want = _eval_reads() - {'game_layout'}
+    # (game_layout: both sides read it with game to pick the game, docs/az.md 73 / 73.2 - match_driver resolves the
+    # job's settings as the worker's game_of does)
+    want = _eval_reads()
     assert seen == want, (f'read by Python but not in EVAL_READS: {sorted(seen - want)}; in EVAL_READS but not read: '
                           f'{sorted(want - seen)}')

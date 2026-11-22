@@ -144,3 +144,159 @@ def test_the_worker_table_declares_the_layout_record_python_only():
         t = json.load(f)
     e = t['keys']['game_layout']
     assert e['class'] == 'python_only' and e['off'] is None and R.DEFAULTS['game_layout'] is None
+
+
+# ---- readers of a saved config (docs/az.md 73.2): a remote's mirror, a remote evaluation's mirror, an eval job
+
+def saved_config(**over):
+    """A run's settings as an old run's config.json holds them: the aliased name, no layout record (`game_layout`
+    null: the key of a run of before the change), the remote settings off as a mirror has them."""
+    c = resolve({}, game='toy', preset='toy-smoke')
+    c.update(eval_remote='', selfplay_remote='', resolver='', resolver_cfg={}, resolver_init='', infer_device='cpu',
+             game='toy_match', game_layout=None)
+    c.update(over)
+    return c
+
+
+def test_saved_configs_resolve_as_a_resumed_run_does(aliased):
+    r = package.resolve_saved_games
+    assert r({'game': 'toy_match', 'game_layout': None}) == {'game': 'toy', 'game_layout': None}
+    assert r({'game': 'toy_match'}) == {'game': 'toy'}
+    assert r({'game': 'toy_match', 'game_layout': 1}) == {'game': 'toy_match', 'game_layout': 1}
+    # what the run writes reads back as itself (resolve_run_game's config of a resumed run)
+    for c in (resolve({'game': 'toy_match'}), resolve({}, game='toy_match'), resolve({}, game='toy_team')):
+        assert r(json.loads(json.dumps(c))) == c
+    # a co-training resolver: its record in resolver_cfg
+    c = r({'game': 'toy_team', 'resolver': 'toy_match', 'resolver_cfg': {'conc': 4}})
+    assert (c['resolver'], c['resolver_cfg']) == ('toy', {'conc': 4})
+    c = r({'game': 'toy_team', 'resolver': 'toy_match', 'resolver_cfg': {'game_layout': 1}})
+    assert (c['resolver'], c['resolver_cfg']) == ('toy_match', {'game_layout': 1})
+    with pytest.raises(package.GameAliasError, match='game_layout 2'):
+        r({'game': 'toy_match', 'game_layout': 2}, 'x')
+    with pytest.raises(package.GameAliasError, match='resolver'):
+        r({'game': 'toy', 'resolver': 'toy_match', 'resolver_cfg': {'game_layout': 7}})
+
+
+def play_mirror(rdir, cfg, ckpt_game, games=4):
+    """zero-core's remote self-play worker (`remoteplay.Worker`) in this process on the mirror `rdir` (config.json =
+    `cfg`, a fresh network of `ckpt_game` as iteration 0), as tools/worker_parity.py drives it: a phase of iteration
+    1, every finished game accepted, `games` games -> (exit code, its events, the shards' metas, the worker)."""
+    import threading
+    from zero import remoteplay as RP
+    from zero.data import read_shard
+    os.makedirs(rdir / 'models')
+    os.makedirs(rdir / 'data')
+    m = N.make_net(G.info(ckpt_game), ckpt_game, hidden=16, blocks=1)
+    N.save(m, str(rdir / 'models' / 'iter_0000.pt'))
+    (rdir / 'config.json').write_text(json.dumps(dict(cfg, conc=games, threads=1, groups=1)), encoding='utf-8')
+    (rdir / 'selfplay.json').write_text(json.dumps({'mode': 'selfplay', 'locks': [], 'nice': 0, 'run_id': 't',
+                                                    'mirror': 't', 'watchdog_s': 1e9, 'linger': False, 'test': {}}),
+                                        encoding='utf-8')
+    events = []
+
+    class W(RP.Worker):
+        def _stdin(self):
+            threading.Event().wait()
+
+        def _topup(self, ph):
+            if ph['ending']:
+                return
+            for _ in range(max(0, min(games - self.enq, int(self.cfg['conc']) - self.outstanding()))):
+                self.drv.enqueue(f'{self.sid}:{self.enq}', self.spec)
+                self.enq += 1
+
+        def emit(self, ev, **kw):
+            events.append(dict(kw, ev=ev))
+            if ev == 'fin':
+                self.ctl.put({'cmd': 'accept', 'iter': kw['iter'], 'n': kw['n']})
+                if self.taken >= games and not getattr(self, 'end_sent', False):
+                    self.end_sent = True
+                    self.ctl.put({'cmd': 'end', 'iter': kw['iter']})
+            elif ev == 'end':
+                self.ctl.put({'cmd': 'quit'})
+
+    w = W(str(rdir), 0)
+    w.ctl.put({'cmd': 'phase', 'iter': 1, 'model': 'models/iter_0000.pt'})
+    code = w.main()
+    metas = [read_shard(str(p), head_only=True)['meta'] for p in sorted((rdir / 'data').rglob('*.npz'))]
+    return code, events, metas, w
+
+
+def test_a_remote_worker_on_a_mirror_of_before_the_change_plays_the_old_game(aliased, tmp_path):
+    """MTG Zero's farm release, gate 2 (2026-11-22): a mirror config copied as it is from a run of before the change
+    (the aliased name, `game_layout` null) is the old game - the worker plays it and loads that game's checkpoint (it
+    played the name's revision and refused the checkpoint as a network of another encoding)."""
+    from zero.runctl import EXIT_REFUSED
+    code, events, metas, w = play_mirror(tmp_path / 'old', saved_config(), 'toy')
+    assert code == 0, events
+    assert (w.cfg['game'], w.cfg['game_layout']) == ('toy', None)
+    assert metas and all(m['game'] == 'toy' and 'game_layout' not in m for m in metas)
+    # the name's revision with its record: that game; a checkpoint of the old game refused there
+    code, events, metas, w = play_mirror(tmp_path / 'new', saved_config(game_layout=1), 'toy_match')
+    assert code == 0, events
+    assert metas and all((m['game'], m['game_layout']) == ('toy_match', 1) for m in metas)
+    code, events, _, _ = play_mirror(tmp_path / 'cross', saved_config(game_layout=1), 'toy')
+    assert code == EXIT_REFUSED and [e['kind'] for e in events if e['ev'] == 'error'] == ['encoding']
+    # a layout record this checkout has no game for: refused as another encoding (this is not the run's checkout)
+    code, events, _, _ = play_mirror(tmp_path / 'bad', saved_config(game_layout=4), 'toy')
+    err = [e for e in events if e['ev'] == 'error']
+    assert code == EXIT_REFUSED and err[0]['kind'] == 'encoding' and 'game_layout 4' in err[0]['msg']
+
+
+class _Made(Exception):
+    pass
+
+
+def test_a_remote_evaluation_reads_its_mirror_resolved(aliased, tmp_path, monkeypatch):
+    """`python -m <pkg>.az.remote eval|evalnet MIRROR ITER` (zero/remote.py): the mirror's config resolved before
+    the Run (or the co-training run) that evaluates is made; a bad layout record refused as another encoding."""
+    from zero import cotrain, remote
+    made = []
+
+    def make_run(rdir, cfg):
+        made.append(cfg)
+        raise _Made
+
+    rdir = tmp_path / 'm'
+    os.makedirs(rdir)
+    for cfg, want in ((saved_config(), ('toy', None)), (saved_config(game_layout=1), ('toy_match', 1))):
+        (rdir / 'config.json').write_text(json.dumps(cfg), encoding='utf-8')
+        with pytest.raises(_Made):
+            remote.evaluate_mirror(str(rdir), 1, make_run=make_run)
+        assert (made[-1]['game'], made[-1]['game_layout']) == want
+
+    class CoRun:
+        def __init__(self, run, cfg):
+            made.append(cfg)
+            raise _Made
+
+    monkeypatch.setattr(cotrain, 'CoRun', CoRun)
+    (rdir / 'config.json').write_text(json.dumps(saved_config(game='toy_team', resolver='toy_match',
+                                                              resolver_cfg={'conc': 4})), encoding='utf-8')
+    with pytest.raises(_Made):
+        remote.evaluate_net_mirror(str(rdir), 1)
+    assert made[-1]['resolver'] == 'toy' and 'game_layout' not in made[-1]['resolver_cfg']
+    (rdir / 'config.json').write_text(json.dumps(saved_config(game_layout=4)), encoding='utf-8')
+    with pytest.raises(N.EncodingMismatch, match='game_layout 4'):
+        remote.evaluate_mirror(str(rdir), 1, make_run=make_run)
+
+
+def test_an_eval_jobs_settings_resolve(aliased, monkeypatch):
+    """zero.farm_eval.match_driver (the Python port of the native eval job; tools/worker_eval_gate.py's Python
+    side): the job's settings' game resolved as the native worker resolves it."""
+    from zero import farm_eval as FE
+    played = []
+    real = G.Driver
+
+    def driver(game, *a, **kw):
+        played.append(game)
+        return real(game, *a, **kw)
+
+    monkeypatch.setattr(G, 'Driver', driver)
+    seats = [{'bot': 'random'}, {'bot': 'random'}]
+    for over, want in (({}, 'toy'), ({'game_layout': 1}, 'toy_match')):
+        cfg = saved_config(eval_spec='{}', **over)
+        FE.match_driver(cfg, seats, 2, 7)
+        assert played[-1] == want and cfg['game'] == 'toy_match'      # (the caller's dict as it was)
+    with pytest.raises(package.GameAliasError):
+        FE.match_driver(saved_config(eval_spec='{}', game_layout=3), seats, 2, 7)

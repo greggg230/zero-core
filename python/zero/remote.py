@@ -683,7 +683,7 @@ def evaluate_mirror(rdir, it, make_run=None, src='remote'):
     65); `src`: its game records' source."""
     from .run import Run, append_metrics
     with open(os.path.join(rdir, 'config.json'), encoding='utf-8') as f:
-        cfg = json.load(f)
+        cfg = _resolved(json.load(f), rdir)
     # the remote machine's own settings for every run it evaluates (<workdir>/overrides.json, e.g.
     # {"groups": 1, "elo_games": 50}: fewer, larger inference batches suit a slower GPU)
     cfg.update(_overrides(rdir))
@@ -703,6 +703,17 @@ def evaluate_mirror(rdir, it, make_run=None, src='remote'):
     return m
 
 
+def _resolved(cfg, rdir):
+    """A mirror's config.json naming its resolved games (`package.resolve_saved_games`, docs/az.md 73.2): a mirror the
+    run wrote reads back unchanged, a config of an aliased name without a layout record is the name's old game; a
+    layout record this checkout has no game for: EncodingMismatch (refused: this checkout is not the run's encoding)."""
+    from .net import EncodingMismatch
+    try:
+        return package.resolve_saved_games(cfg, f'the mirror {rdir}: config.json')
+    except package.GameAliasError as e:
+        raise EncodingMismatch(str(e)) from None
+
+
 def _overrides(rdir):
     """The remote machine's own settings for every run it evaluates (<workdir>/overrides.json)."""
     ov = os.path.join(os.path.dirname(os.path.normpath(rdir)), 'overrides.json')
@@ -720,7 +731,7 @@ def evaluate_net_mirror(rdir, it):
     from .cotrain import CO_KEYS, CoRun
     from .run import DEFAULTS, append_metrics
     with open(os.path.join(rdir, 'config.json'), encoding='utf-8') as f:
-        cfg = json.load(f)
+        cfg = _resolved(json.load(f), rdir)
     ov = _overrides(rdir)
     cfg.update(ov)
     cfg['resolver_cfg'] = dict(cfg.get('resolver_cfg') or {},
