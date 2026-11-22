@@ -9719,7 +9719,8 @@ unique places (their running count), the rest invalid (they read the first row's
 places); each head segment's input map runs on all S slots, kept where the slot is the segment's (no NonZero per
 segment); the floats buffer is S x the widest slot; runs pad to MR; the attention's padded rows are T long, a token
 past T or an invalid slot scattered to a spare place. A batch past a capacity is refused: rows past T or MR, every row
-past S. Metadata `fixed` 1, `presence`, `t_align`, `runs`; no optional `t_align` input. The worker computes the
+past S; the overrides' first-match ArgMax over float32 (ONNX Runtime's CUDA provider has no int64 ArgMax, and one CPU
+node stops the capture). Metadata `fixed` 1, `presence`, `t_align`, `runs`; no optional `t_align` input. The worker computes the
 capacities on the host (`StaticTokens::fixed_caps`: per row its present flags and two binary searches per run) and runs
 the graph through section 72's buckets with two capacities more (`S`, `MR`; a padding row's always-present slots count
 in S; padding non-zeros go to features in no run, value 0, so they count in no run). Off: no game exports it.

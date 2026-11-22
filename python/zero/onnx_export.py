@@ -1806,6 +1806,9 @@ class ZeroOnnx2FastFixed(ZeroOnnx2Fast):
     batch's present slots pass S. With the capacities exact (or larger) the answers are the fast graph's."""
 
     PAD_ZEROS = True
+    # (the overrides' first-match ArgMax over float32, as the static graph's: ONNX Runtime's CUDA provider has no int64
+    # ArgMax, and one CPU node stops it capturing the graph)
+    ARGMAX_DTYPE = torch.float32
 
     def __init__(self, net, packing='packed', attention='mha'):
         super().__init__(net, packing, attention)
