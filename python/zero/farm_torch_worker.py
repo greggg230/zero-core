@@ -559,6 +559,11 @@ class Job:
             import torch
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+                # (cuBLAS keeps its workspaces in torch's allocator, outside any Python object: measured 73 MB held, 176 MB
+                # reserved, after the evaluator itself was gone - cleared, then the cache emptied)
+                clear = getattr(torch._C, '_cuda_clearCublasWorkspaces', None)
+                if clear is not None:
+                    clear()
                 torch.cuda.empty_cache()
         except Exception:  # noqa: BLE001
             pass
