@@ -55,9 +55,9 @@ new shards (the Delver line: 54 s -> 6.6 s). The budget still counts dense rows.
 many steps ahead on a background thread (the window's gather, the float32 features and the dense
 targets: ~60 ms a batch for MTG's 33,652 features) while the training step runs on the device. The
 rows are drawn from the same generator in the same order, so the batches are the same. `draw` (a
-multi-source distillation's stratified batches, docs/az.md 72) replaces the uniform draw.
+multi-source distillation's stratified batches, docs/az.md 76) replaces the uniform draw.
 
-Selected rows (`Window(select=...)`, docs/az.md 72: a multi-source distillation's sources, each the rows
+Selected rows (`Window(select=...)`, docs/az.md 76: a multi-source distillation's sources, each the rows
 of its shards a game package's row selector chose): per shard the sorted row numbers to load instead of
 all of them; the RAM budget then subsamples the selected rows at one rate. Without it the window of
 before.
@@ -836,7 +836,7 @@ def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False, f
     """A training's `n` batches: `size` window rows drawn from `rng` (uniform, with replacement),
     one draw per batch in order -> (rows, W.batch(rows, device, tokens)). `draw` (None: that uniform
     draw): fn(rng) -> a batch's window rows, instead (a multi-source distillation's stratified
-    batches, docs/az.md 72). `prefetch` > 0: drawn and
+    batches, docs/az.md 76). `prefetch` > 0: drawn and
     built up to that many batches ahead on a background thread (as CPU tensors, moved to `device` as
     they are taken) while the caller trains on the current one - the same draws, the same
     batches. A failure there is raised here; closing the generator (or dropping it) stops the
@@ -982,7 +982,7 @@ class Window:
     pointer overrides the window loads the shards' tails and overrides (`tail`: `rows.Tail` over the window's rows,
     `ov`: `rows.Overrides`; None without), refusing shards of other tail segments or without them (R9); without, a
     shard with any tail token or override is refused (R11).
-    `select` (docs/az.md 72; None: every row): per path the sorted, distinct row numbers of that shard to load
+    `select` (docs/az.md 76; None: every row): per path the sorted, distinct row numbers of that shard to load
     (non-empty: a shard with none is left out by the caller); the budget subsamples the selected rows at one rate
     (`loaded` = their count). Not with a `cache` or `sparse`."""
 

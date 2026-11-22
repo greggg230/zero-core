@@ -100,6 +100,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | Setting | Default | Meaning |
 |---|---|---|
 | `game`, `spec`, `players` | toy, '', [2] | registered game, its JSON spec, player counts sampled per self-play game |
+| `game_layout` | None | the layout revision of a game whose NAME changed meaning (`GamePackage.game_aliases`): recorded at a run's first start, never from a preset; None for every other game; a config naming an aliased name without it is the name's old game (section 73) |
 | `iters`, `games` | 40, 1000 | iterations; self-play games per iteration (rolling: games FINISHED per iteration; with `selfplay_remote`: finished across every machine, section 5.3) |
 | `rolling` | 0 | 1 = one persistent driver keeps `conc` games in flight across iterations (docs/search.md 2.6) |
 | `conc`, `threads`, `groups`, `torch_threads` | 256, 4, 2, 1 | games in flight, search threads, batches in flight, torch intra-op threads (keep 1, section 7) |
@@ -179,6 +180,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `selfplay_league_pool` | '2,4,8,16,32' | the past checkpoints it may play: raw iteration offsets back from the network that self-plays (iteration i self-plays with i-1: offset 2 = checkpoint i-3), those that exist; 'all' = every earlier checkpoint (fictitious self-play) |
 | `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
 | `selfplay_branch`, `selfplay_branch_moves`, `selfplay_branch_temp`, `selfplay_branch_differ` | 0.0, 3, 2.0, 0 | branched self-play games (section 24, docs/search.md 2.11): this share of the games each spawn one branch game from a copy of their state at a uniformly drawn decision of theirs - 1..`moves` deviation moves sampled from the network's priors at temperature `temp` (never recorded; `differ` 1: the first never the game's own move), then normal self-play, its rows' z its own outcome; a branch counts as one of the iteration's games. 0 = off (nothing changes); needs rolling self-play (`rolling` 1 or `selfplay_remote`); single-game runs without the league |
+| `selfplay_branch_rule`, `selfplay_branch_eps`, `selfplay_branch_n_min`, `selfplay_branch_p_min`, `selfplay_branch_q_lo`, `selfplay_branch_q_hi` | 'uniform', 0.02, 4, 0.02, 0.1, 0.9 | near-tie branches (section 72, docs/search.md 2.11.1; with `selfplay_branch` > 0): 'neartie' draws the branch point among decisions where the runner-up (visits >= `n_min`, prior >= `p_min`) has a root Q within `eps` of the played move's, whose Q is in [`q_lo`, `q_hi`]; the branch plays that runner-up (one deviation), and ends with its game's outcome where it reaches one of its game's later states (the game's `merge_key`). 'uniform' = the branched games above (nothing changes) |
 | `selfplay_archive`, `selfplay_archive_p` | '', 0.1 | archive starts (section 24): this share of the games start from a position of the archive file (format 'zero-archive/1', built for the run's spec by the game's own tool: MTG Zero's `tools/delver_archive.py`) instead of a new deal. '' = off |
 | `selfplay_resign_t`, `selfplay_resign_k`, `selfplay_resign_noresign` | 0.0, 5, 0.1 | self-play resignation (section 27, docs/search.md 3.14): t > 0 = a self-play game ends when `k` consecutive full searches (the recorded ones; never fast or minor) found one seat's root win estimate >= 1 - t, the same seat each time, scored as that seat's win, every record kept (z the resignation's); this share of the games (a hash of seed and game) never resigns and reports where it would have (`selfplay.resign`: the live wrong-resignation rate; 1 = a dry run). Evaluations never resign. 0 = off (nothing changes); two-player single-game runs without the league |
 | `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
@@ -3670,6 +3672,10 @@ Kingdom Builder build against this core).
 ## 24. Branched self-play games and archive starts (`zero/forks.py`; MTG Zero's Delver mirror, 2026-11-03)
 
 (Sections 22 and 23 are taken by open branches: `feat/heavy-decisions`, `feat/light-decisions`, `feat/temp-late`.)
+
+Section 72 adds a second branch rule, near-tie branches (`selfplay_branch_rule` 'neartie': the branch point among
+decisions the search could not separate, the runner-up played, merges back into the game); this section is the
+'uniform' rule, the default.
 
 ### 24.1 Why
 
@@ -8062,6 +8068,26 @@ pool fixture of the other farm-pool tests sets `pool_rolling` '' (they check cla
 MTG Zero's farm-compat gate also checks that the release worker announces `rolling`, so a build that loses the
 feature fails the gate.
 
+### 54.8 Stale rows per machine (no setting; the Fable farm review of 2026-11-21, its recommendation 3)
+
+**Why.** legacy-meta3-r1's trainer dropped 18-25% of its farm rows as stale on 11-20/21 (`stale_rows_dropped`). The
+review's guess is that the agent's tuner raises games in flight until one game takes 10-25 min on the Macs, the laptop
+and the DirectML PC, longer than the staleness window. The run's metrics had only totals, so the guess could not be
+checked per machine.
+
+**What it does.** With rolling on, the pool counts per machine (the record's `machine_id`) in the open iteration:
+`games` and `rows` accepted, `stale_rows` dropped (a straddling game's old rows and a wholly stale game's rows),
+`stale_games` dropped whole, and `lag`, the accepted rows' staleness histogram (the `stale` histogram of 54.2, per
+machine). The iteration's pool metrics gain `by_machine` {machine: those counters}; a machine's stale share is
+`stale_rows / (stale_rows + rows)`. When any machine lost rows, the pool logs one line, worst first:
+`iteration I: stale rows by machine: <machine> <stale>/<stale + kept> (P%, N games whole), ...`. Machines with no
+stale rows are in the metrics only. Counting only: no game, row or shard changes. With `pool_rolling` '' nothing is
+counted and the metrics' keys stay as before (54.3).
+
+**Tests.** `tests/test_farm_pool.py::test_staleness_per_row_with_rolling` checks `by_machine` beside the totals
+(classic: empty); `::test_stale_rows_by_machine_in_metrics_and_log`: two machines, the metrics' counters and lag
+histograms, and a log line naming only the machine that lost rows.
+
 ## 55. The farm pool's lock order: `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu` (no setting; MTG Zero's pb3 hang, 2026-11-16)
 
 (This fix is on both zero-core lines: mtg-zero main's pin and the rolling-leases branch of 54.)
@@ -9646,7 +9672,294 @@ games differ: the float16 CUDA graph answers a row differently in another batch 
 shape), unlike the CPU graph - so a GPU job keeps its groups here, and fewer groups for GPU eval jobs is the agent's
 choice to make (a GPU lease's batches already depend on its size).
 
-## 72. Several teachers, each on its own rows: `tools/distill.py --sources`, the game package's row selector (no setting; `GamePackage.row_selectors`; MTG Zero's stew, its docs/ENGINE.md 222.1, 2026-11-21)
+
+## 72. Near-tie branches: branch where the search can't separate two moves, play the runner-up, merge back on an equivalent state (`selfplay_branch_rule` 'neartie', `selfplay_branch_eps`, `_n_min`, `_p_min`, `_q_lo`, `_q_hi`; MTG Zero's B2, 2026-11-21)
+
+### 72.1 Why
+
+Section 24's branched games branch at a uniformly drawn decision and sample 1-3 deviation moves from the priors.
+MTG Zero's A/B of them (its ENGINE.md 87, Delver, 40 generations) was null: most branches went where the value head was
+already sure, or into junk moves. The positions the value head lacks are the **near ties**: decisions where the search
+could not separate the move played from a credible runner-up, so one of them gets nearly all the real play and the
+other is never measured (MTG Zero's review 5: a gap of 0.000 at 62 of 71 human-flagged decisions). A census on MTG
+Zero's metagame line (its hub notes, B2 design section 6: 90 games, 64-simulation searches) found ~12 such decisions a
+game in contested positions after excluding non-decisions - fetch timing, Mishra's Bauble targets, cantrip timing,
+counter decisions - and most of them sequencing ties, which often reconverge: Brainstorm in the draw step or in the main
+phase reach the same position when the opponent does nothing in between.
+
+### 72.2 What it does
+
+`selfplay_branch_rule` 'neartie' (with `selfplay_branch` p > 0; driver: docs/search.md 2.11.1):
+
+* **The gate.** At a game's recording self-play full search of a decision that is not minor, with `a` the move played:
+  the candidates are the other root options with >= `selfplay_branch_n_min` visits, prior P0 >= `selfplay_branch_p_min`
+  and the game's `SearchGame::branch_alt_ok(a, b)` (MTG Zero: not a second copy of the same card, not the mana-ability
+  window, a mana colour or a trigger order); `b` = the one with the highest root Q (the decider's win estimate, W / N
+  over every visit). The decision is eligible when `|Q(a) - Q(b)| <= selfplay_branch_eps` and Q(a) is in
+  [`selfplay_branch_q_lo`, `selfplay_branch_q_hi`] (contested positions: a decided game's ties are not interesting).
+* **The branch point** is drawn uniformly among a game's eligible decisions (a share p of the games, as section 24);
+  a game without one spawns nothing.
+* **The branch** plays `b` there - one deviation, no sampling, recorded nowhere - then normal self-play; its rows' z
+  is its own outcome. The rows right after `b` (the opponent's answer, the decider's next decision) are the states
+  whose value the gate says is unmeasured.
+* **Merges.** A branch that reaches a state equivalent to one of its game's after the branch point (the game's
+  `SearchGame::merge_key`: equal keys = the same information states and hidden cards in distribution) ends there,
+  and its rows take **the game's** outcome: an equivalent state has the same future in distribution, and the game's
+  actual continuation is one draw of it. A quiet window then costs a few decisions instead of half a game. A game whose
+  `merge_key` is None (the default; MTG Zero's until its key lands) never merges.
+* Nothing else changes: the game plays and records exactly as without it (its streams, its rows), no row is
+  recorded twice, no target is masked or reshaped; a branch is one of the iteration's games (section 24's quotas).
+
+**Metrics** (`selfplay.forks.neartie`, and the `forks` log line): the games that counted, eligible decisions per game,
+near-tie branches, merges and their share, decisions to merge, the merged branches' samples, the mean Q gap, and the
+branch points by `decision_tag` (tag -> [branches, merged]). Remote self-play (5.3): the workers play the rule
+from the run's config like this machine; their hello's fingerprint names the near-tie settings, so a worker of an
+older checkout (which reports the uniform fingerprint) is refused (section 24); their tallies join the iteration's.
+
+### 72.3 Off by default
+
+`selfplay_branch_rule` 'uniform' (the default) is section 24, byte for byte; the near-tie settings do nothing (and are
+only range-checked) while `selfplay_branch` is 0. Turn it on with `--selfplay-branch 0.2 --selfplay-branch-rule
+neartie` (the defaults: eps 0.02, n_min 4, p_min 0.02, q_lo 0.1, q_hi 0.9). Refused, never ignored: the uniform
+rule's `selfplay_branch_moves` / `_temp` / `_differ` away from their defaults with 'neartie' and the near-tie settings
+away from theirs with 'uniform', out-of-range values, an unknown rule, and (driver) a recording self-play seat with
+`margin_w` != 0 (its Q is no win estimate). Section 24's refusals apply too (rolling self-play, no co-training, no
+league).
+
+### 72.4 Costs
+
+The gate scans the root's statistics once per recording full search (all games, a few options: nothing next to the
+search); a game holding a branch point computes `merge_key()` once per network decision state after it, and a branch
+once per decision state after its deviation (a hash, the game's cost). A game that drew a branch keeps its state copies
+as section 24 (one per reservoir pick) plus one key per later decision. A branch plays no deviation search. Fewer rows
+per branch than section 24's (a merged branch stops early), the same number of games per iteration.
+
+### 72.5 Farm workers
+
+The native worker (section 44) plays branched self-play, both rules, from the run's settings (`settings.rs`
+`branch_of`: the driver's branch dict exactly as `zero.forks.Forks` builds it, the same refusals): the driver is the
+shared Rust one, so its games, branches and merges are the desktop's. `fin` and the unfinished ranges count the job's
+game ids (a branch is its game's second row); its stats carry `branches`, `merges`, `neartie`. Its records files are
+`records/2` (72.7) and its shards hold every game and branch; `run_settings.json` classes `selfplay_branch` and its
+nine settings `play`, so `check-config` passes them into the pool's template (`selfplay_archive` stays python_only).
+
+### 72.6 Tests and checks
+
+`cargo test` (zero_search 220: the tests of docs/search.md 2.11.1, `branch_records_replay_to_the_drivers_rows_bit_for_bit`,
+`a_branchs_game_log_starts_with_its_games_moves`, the parser's; zero_worker all passing with
+`branched_games_are_the_python_drivers`, `branched_games_play_into_shards`,
+`branch_records_replay_to_the_shards_rows_bit_for_bit` - both rules, the toy and the pick game, merged near-tie branches,
+a rolling job: every row rebuilt from the records, each branch with its game's record from the same file, equals the
+shard's, array for array - and `a_game_and_its_branch_share_one_records_file`). `tests/test_neartie.py` (17: the
+bindings' rows, stats and refusals; the run settings and their checks; the driver kwargs, the fingerprints - the
+uniform one unchanged - and the description; the tally, its merge with an older remote's and its summary; a rolling
+toy run; remote self-play with the remote 'local'; branch records replayed through the engine to the driver's own
+samples for both rules on the toy and the pick game, merged and not; the farm pool replaying and counting branch
+records, refusing an orphan branch and a records/1 branch; game records holding branch games). `test_forks.py`,
+`test_worker_settings.py`, `test_farm_pool.py`, `test_farm_guards.py`, `test_farm_trace.py` passing. **Off**:
+`tools/check_checkpoint_compat.py --package zero --game toy` against the commit before (92568b5) identical with
+`--net random` and `--net uniform`; uniform-rule branched games (three settings, with archive starts in one) digested
+old vs new through the bindings - rows (but the new `branched` flag), branch dicts, samples, stats - identical
+(77f3d48aea53fc01). **Farm parity** on MTG Zero (a scratch checkout of its HEAD with this core; its legacy-meta3-r1
+settings with the league off, `selfplay_branch` 1, the uniform evaluator, 16 games, groups 1, sims 8, belief tilt off;
+its native worker `mtgz-worker` of the same tree): `tools/worker_parity.py` identical, native shards against the
+Python remote worker's, near-tie (7,063 rows, 16 branches), uniform with differ (6,450 rows) and without branches
+(4,485 rows); `tools/worker_records_gate.py` GATE 3 PASSED near-tie (32 games, 5,772 rows) and uniform (32 games,
+5,484 rows) as records/2, and without branches (records/1 in 3 files, 3,516 rows); `tools/driver_settings_dump.py
+--compare-worker`: 33 cases agree, the branch configs included. No merge on MTG Zero yet: its `merge_key` is its own
+change (the gate counted 2,550 eligible decisions in those 16 games at eps 0.05, n_min 2).
+
+### 72.7 Game records of branch games (`records/2`) and the farm pool
+
+**The record.** A game record (docs/search.md 2.17) replays a game from its seed. A branch's trace and game log now
+start with its game's real moves to the branch point (`BranchInfo::trace_from` of them), so a branch's record is
+replayable from its game's seed: it carries its game's gid and seed, every real move from the game's start, its rows
+(steps counted from the game's start, all after the branch point) and a `branch` block - `from`, where it branched
+(`at`, `of`, `decision`, `step`, `action`), `moves`, `played`, `same_first`, the near-tie rule's `alt`, `gap`, `tag`,
+and `merged`. A merged branch's `result` and `margin` are its game's. `record::replay_branch(spec, rec, parent, aux)`
+replays it with its game's record: the gid, seed and players its game's, its first `from` moves its game's, a near-tie
+branch's next move its runner-up and not its game's, no row at or before the branch point; a branch that played to
+its end is checked like any game; a merged one must end at a decision of a game in progress whose `merge_key` is one
+of its game's decision states' after the branch point, with its game's result and margins bit for bit (its game over),
+and its rows take them. `replay` alone refuses a branch record. The bindings: `replay_rows(..., parent=)`. A file that
+may hold branch games is `records/2` (`RECORDS_VERSION_BRANCH`); a writer without branches writes `records/1`, byte for
+byte as before. The game's own row says `branched` when a branch of it follows.
+
+**The worker** (`records.rs`) holds a game whose row says `branched` until its branch's line follows: no size cut and
+no timed flush (a rolling job's `flush_s`) between them; only the job's end writes a game whose branch never came
+(the phase ended). So a branch's record always finds its game's record in its own file.
+
+**Crediting** (zero-farm PROTOCOL.md 16; no coordinator, agent or wire change): the coordinator credits ids, and a
+game and its branch are one id in one file, so they are credited once, together; a later copy of the id is a
+duplicate whole, branch included. **The pool** (`zero/farm_pool.py`) replays each credited branch with its game's line
+from the same chunk, refuses a chunk with a branch but not its game or with a branch in a records/1 file, and counts
+each accepted game - a branch included - as one of the iteration's games, as this machine does (24.2): its `accept`
+total can exceed the ids the coordinator credited, and the farm quota stops on it. The accepted games' forks tally
+joins the iteration's `selfplay.forks` (`RemotePlay.end`). **Game records** (`game_records`, section 59): a branch's
+record (local, from the game log, or the farm's) carries a `branch` block (`from` and the block above); its actions
+start with its game's first `from` moves.
+
+**A game database** reading these records (MTG Zero's `tools/gamedb.py`): a record with `branch` is not a game from a
+new deal - it shares its gid and seed with its game's record and its first `branch.from` actions; a merged one
+(`branch.merged` not null) ends in a position that is not terminal, with its game's result.
+
+### 72.8 Measured
+
+2026-11-21, the desktop's CPU at below-normal priority beside live runs. **The toy** (`--preset toy-smoke`, rolling,
+3 iterations, the rule's defaults, p 0.2): 0.83 / 0.67 / 0.32 eligible decisions a game, 2 / 2 / 5 near-tie branches
+of 46 / 46 / 44 games, mean gap 0.007-0.011, no merges (the toy has no merge key); uniform branches, same seed: 3 / 5 /
+13. **Merges** (`PickGame`, the driver test's toy with transpositions, every decision eligible, p 1, 80 games of 8
+turns): 80 branches, 10 merged (12.5%) after 2.4 decisions on average (24 rows), the other 70 played to the end
+(204 rows). On MTG Zero nothing measured yet but the farm checks of 72.6: its `merge_key` / `branch_alt_ok` hooks are
+its own change, and the A/B is its B2 step 2.
+
+## 73. Game aliases: a game name whose meaning changed (`GamePackage.game_aliases`, the run setting `game_layout`; MTG Zero's layout v8, 2026-11-22)
+
+**Why.** A game package may want its game's NAME to mean a new layout from now on (MTG Zero: `mtg` = layout v8 for
+every new run) while every run, checkpoint, shard, records file, farm job and evaluation record made before names the
+same game and means the old layout. The core picks token layouts, aux targets, engine games and specs by name, and the
+encoding guard compares a checkpoint's recorded game with the game it is loaded as, so a plain rename would move old
+runs onto the new layout (refused by the guard at best). An alias makes "the name + a layout record" the new game and
+"the name without one" the old game, everywhere the core reads a game name - no old file rewritten.
+
+**What it does.**
+* `GamePackage(game_aliases={'mtg': {'layout': 8, 'before': 'mtg_v7'}})`: the game `mtg` is layout revision 8; a
+  record naming `mtg` without a layout record is the game `mtg_v7` (both registered by the package's engine, keyed by
+  these names in its tables). `resolve_game(name, layout)`: an aliased name without a record -> its `before`, with its
+  revision -> the name, any other record -> refused (`GameAliasError`); a record on a name that never changed ->
+  refused. `layout_stamp(game)` / `set_game(d, game)` write a resolved game with its record (`game_layout`: only for an
+  aliased name - every other game's files exactly as before); `record_game(d)` reads one.
+* **In a process every game name is the resolved one.** Read boundaries resolve: `zero.run.resolve_config`
+  (`resolve_run_game`: the saved config's record when the game is the saved config's - none: the old game, an old run
+  resumes as it was; a first start, or another game given now: the name's current revision; `--game-layout N` moves a
+  run explicitly, then the guard decides on its checkpoints; a co-training resolver's game the same way, its record in
+  `resolver_cfg`), `net.build` / `load` / the encoding guard (`config_game`: a network config's `game` with its
+  `game_layout`), the held-out set's shards, a remote's shards (`RemotePlay`), the farm pool's records headers, an
+  archive (`selfplay_archive`), zero.farm_h2h's settings, zero.h2h's run settings, the distill tool's shards, a
+  failure's replay, `tools/fork_run.py` (a continuation's source config; `new_run --game` stamps the fork).
+* **What is written carries the record**: run configs (the setting `game_layout`, set by `resolve_run_game`), network
+  configs (`net.stamp_game`: `make_net`, `build`, `fork_run`), the ONNX graph's and the reference set's metadata
+  (`game_layout`), shard metas (the run's, a remote's, the pool's), h2h results, failure records; the native worker's
+  shard metas, records headers and failure files (`GameEntry::stamp`).
+* **Presets and package defaults may not set `game_layout`** (`apply_package` refuses): presets fill a resumed run's
+  missing settings, and would move an old run onto the new layout.
+* **The worker** (`zero_worker`): `GameEntry::of::<G>("mtg").layout(8)`, `GameEntry::of::<G7>("mtg_v7").before_of("mtg")`;
+  `resolve_game` picks a job's game from its settings' `game` and `game_layout` (`game_of`; the same rule), `classify`
+  checks the settings resolved onto the picked entry (`LAYOUT_KEY` is play; an eval job reads it too: `EVAL_READS`, so
+  an evaluation template carries it), a graph or a reference set is the job's
+  game by name and record (`Expect::game_problem`: a graph exported before the change, named `mtg` without a record,
+  is `mtg_v7`'s). **Builds before it**: `run_settings.json` classes `game_layout` python_only (off: null), so by a
+  run's declared setting classes (section 61) a build that does not know the key plays a null one as before and
+  refuses a truthy one at `check-config` - a run of the new revision is never played by a build that would play the
+  old game under its name (and its graphs fail that build's tail check anyway).
+
+**Off by default.** No package declares an alias; `game_layout` is None and absent from every network config, graph,
+shard and header of an unaliased game: the toy's and every other game's runs exactly as before (the run config gains
+the key `game_layout: null`, as with any new setting).
+
+**Costs.** None at run time (a dict lookup per read).
+
+**Tests and checks.** `tests/test_game_alias.py` (the stand-in alias `toy_match` rev 1 / before `toy`: the rule, the
+table check, a run's game across first start / resume / an old config / an explicit move / a bad record, presets
+refused, a checkpoint of before the change loading as the old game and refused as the new, a new network's record,
+fork_run's stamp, records); the worker's `resolve_game`, `Expect::game_problem` and `classify` tests (a build before it:
+null off, a revision unsupported). End to end on the toy (scratch, 2026-11-22): a 2-iteration toy-smoke run of the
+aliased `toy_match` writes `game_layout` 1 into its config, shards and checkpoints; a toy run whose files were renamed
+to `toy_match` without records (a run of before) resumes to iteration 3 as `toy` with no record written.
+
+**Measured.** Nothing to measure (no run setting changes play).
+
+### 73.1 A graph-derived expectation resolves the graph's game (the probe, eval-batches; MTG Zero's farm release, 2026-11-22)
+
+**Why.** `probe-providers --model --reference` and `eval-batches` have no job: their expectation is the graph's own
+metadata (`session::expect_of`, `SessionSpec::expect` None), and it knew nothing of the worker's registered games -
+`before_of` None. A reference checkpoint of before the change re-exported now names its game `mtg_v7`, while the
+reference set exported before the change names `mtg` without a record; `Expect::game_problem` refused that pair
+(`reference: a network of game Some("mtg"), the job plays "mtg_v7"`), which failed MTG Zero's farm release at its
+DirectML self-test (`farm_release.py` step 6b) for every build after layout v8 - the CUDA self-test, on the old export
+(`mtg`, no record, against a set of the same), passed.
+
+**What it does.** `SessionSpec::games` (and `probe::Opts::games`; `cli_with` passes `Worker::games`): with
+`expect` None the graph's game and layout record are resolved in the registry (`resolve_game`) and the expectation
+takes that entry's name, `layout` and `before_of` (the graph's features, actions and tails as before) - so the graph
+and its reference set pass exactly when a job of that entry (`Expect::of_entry`) would accept them: a graph `mtg_v7`
+(or `mtg` without a record) takes a set `mtg` without a record or `mtg_v7`, never `mtg` with layout 8; a graph `mtg`
+layout 8 takes only `mtg` layout 8. A game the registry does not resolve (unregistered, a layout record it does not
+know, an empty registry - `build_evaluator`'s, which has the job's expectation) keeps the graph's own name and record:
+strict equality, as before. Nothing else loosens.
+
+**Tests.** `session::tests::a_graph_derived_expectation_resolves_the_graphs_game_in_the_registry` (the stand-in
+alias `toy` layout 2 / before `toy_old`: every pairing above through `expect_of`, the graph's own game check and
+`selftest::check_meta`; a plain game unchanged; no registry: the refusal the release met). End to end: the failed
+release's DirectML self-test (`probe-providers --providers dml,cpu` on the re-exported reference checkpoint against
+the old reference set) fails with the release's worker and passes with this one (cpu and dml); the CUDA self-test's
+pair passes on both.
+
+## 74. The fast graph's blocks of zeros as Pads (`ZeroOnnx2Fast.PAD_ZEROS`; no setting; zero-farm's CUDA PCs, 2026-11-22)
+
+**Why.** On a farm PC's NVIDIA GPU (the farm's CUDA pack, ONNX Runtime 1.24.4) the fast fp16 graph's call is bound by
+ONNX Runtime's host side: the calling thread's CPU equals the call's wall time (~22 ms at 575 rows for ~9 ms of GPU
+work), which leaves a 4-core PC's crew of three workers CPU-bound. ONNX Runtime's node profile of that call put ~20 %
+of its host time in two Concat nodes - the policy's generic logits joined to a block of zeros (the spare places) before
+the policy scatter, and the policy joined to the overrides' spare places - ~1.6-2.4 ms each.
+
+**What.** In the fast graph (`fast`, `pool_export` 'fast' and its variants) those two blocks of zeros are appended as a
+Pad of the same tensor (`F.pad`, constant 0) instead of a Concat with zeros: the same tensor, so the same answers. Every
+other graph (the default zero-onnx/2 graph, the static graph, zero-onnx/1) keeps its Concats, byte for byte.
+
+**Checked.** `tests/test_onnx_fast.py::test_fast_graph_pads_the_policy_zeros` (fewer scatters reading a Concat, more
+Pads than the fast graph exported with the Concats; the same answers bit for bit on the CPU); the fast, static and
+zero-onnx/2 suites. On a live run's network (gen 769) the new export's answers on the CPU are the earlier fast graph's
+bit for bit (64 and 256 rows of its reference set).
+
+**Measured** (a farm PC: 4 cores / 8 threads, an NVIDIA GPU; gen 769 fp16, real rows; first as graph surgery of the
+released export): a call's thread CPU 16.4 -> 14.8 ms at 352 rows, 23.8 -> 18.4 ms at 575; a crew of 3 x 1,150 games
+in flight in two groups 28.2k -> 30.9k / 31.0k leaves/s (two 5-minute windows, the control in the same session; the
+trainer's own path there 32.9k).
+
+## 75. Tests in parallel: `tools/pytest_shards.py`, and `smoke_all.sh` runs its games at once (2026-11-22)
+
+**Why.** The Python suite is ~850 mostly single-threaded tests (torch at one thread, 7): about 35 minutes of test time
+in one process beside live runs (2,096 s summed over one run's junit files; 44 and 52 minutes of wall time in two runs
+of the day), `tests/test_remoteplay.py` a quarter of it and no single test over 35 s - nothing to fix in one place, so
+the suite is split. `tools/smoke_all.sh` ran its games one after the other, each in its own checkout and target dir.
+
+**What it does.** `python tools/pytest_shards.py [--shards 4] [--root <repo>] [--retry-alone <file>] [-- pytest
+args]` (its docstring is the manual): the repo's `tests/**/test_*.py` in N pytest processes at once over disjoint
+parts, balanced by each test's seconds from earlier runs (`~/.config/zero/pytest_durations/<repo>.json`, shared by a
+repo's checkouts; a file without one by its size; a file longer than a shard's share is split by its tests), the plan
+checked to run every test exactly once before anything starts; each shard its own `--basetemp`, junit file and log.
+The result is read from the junit files: exit 0 and "pytest shards: PASSED - N shard(s), X passed, Y skipped in T s"
+only when every shard exited 0, ran a test and at least one test passed; else "FAILED - ..." naming the failed tests.
+`--retry-alone tests/test_remoteplay.py` reruns that file's failures alone once when they are a shard's only ones
+(AGENTS.md: it times real threads) and names them in the last line; an error or any other failure fails the run.
+Standard library only. `--plan` prints the shards.
+
+`tools/smoke_all.sh` runs the core's pytest and each game's through it (`SMOKE_PYTEST_SHARDS`, default 4; 1 = one
+plain `pytest tests` as before; the core's with the retry above) and `SMOKE_JOBS` games at once (default 3; 1 = one
+after the other): each game in a subshell, its output printed whole and its summary lines read back in the games'
+order once all ended; a game whose subshell ended without a result is a FAIL line.
+
+**Costs.** Shards share the machine: a test that times real threads is likelier to fail beside three other shards
+(hence the retry). Tests that share something outside their `tmp_path` would collide between shards; none was found
+(the suite passed in four shards, below). Several games building at once take that many times the build's memory and
+cores.
+
+**Tests and checks.** `tests/test_pytest_shards.py` (the plan: every file once, a measured file split by its tests,
+plans that would skip or repeat tests refused; end to end with real pytest processes on trivial tests: a pass and its
+recorded durations, a failure named and not recorded, a setup error never retried, no test is not a pass, a failure that
+passes alone / fails alone / is in an unnamed file); `tests/test_smoke_all.py` unchanged and passing.
+
+**Measured** (the desktop beside two live runs and other sessions' gates, 2026-11-22). The whole suite in four shards
+with the GPU visible: 904 s (shards of 219 to 220 tests; the longest 793 s of pytest) against 44 and 52 minutes in one
+process the same day - 829 passed, 31 skipped, two `test_remoteplay` tests failed beside the others and passed alone,
+and one failure that is not the shards': `tests/test_dup_reduce.py::test_max_is_deterministic_on_cuda_and_matches_the_cpu`
+fails alone too on this commit with the GPU visible (MTG Zero's gate hides the GPU, so it had not been run there). With
+the GPU hidden, MTG Zero's gate ran the same suite in four shards of its own: 780 passed, 6.2 to 12.7 minutes of test
+time a shard. `SKIP_CORE=1 bash tools/smoke_all.sh --with-this-core --build-only`, three games at once: GREEN, 3 of 3
+checked, the builds 40 / 42 / 89 s (171 s one after the other) in 96 s for the whole command.
+
+## 76. Several teachers, each on its own rows: `tools/distill.py --sources`, the game package's row selector (no setting; `GamePackage.row_selectors`; MTG Zero's stew, its docs/ENGINE.md 222.1, 2026-11-21)
 
 **Why.** MTG Zero's stew (its docs/ENGINE.md 222) distils one network from several others, each the expert of
 some of the rows: a *deck stew* learns deck X from every specialist whose pairing includes X, on the rows where

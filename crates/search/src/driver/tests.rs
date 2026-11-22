@@ -2661,7 +2661,7 @@ fn run_split<G: SearchGame>(d: &mut Driver<G>, skewed: bool) -> Vec<(GameResult,
 fn branch_cfg(games: usize, p: f64) -> DriverCfg {
     let mut c = cfg(vec![nn_full(12)], vec![vec![0, 0]; games], &[("m", KeyKind::Nn)]);
     c.seed = 31;
-    c.branch = Some(BranchCfg { p, moves: 3, temp: 2.0, differ: false });
+    c.branch = Some(BranchCfg { p, moves: 3, temp: 2.0, differ: false, rule: BranchRule::Uniform });
     c
 }
 
@@ -2800,16 +2800,16 @@ fn branch_and_starts_settings_are_checked() {
         c.branch = Some(b);
         Driver::<ToyGame>::new(c).err().unwrap_or_default()
     };
-    assert!(bad_branch(BranchCfg { p: 0.0, moves: 3, temp: 2.0, differ: false }).contains("branch p"));
-    assert!(bad_branch(BranchCfg { p: 1.5, moves: 3, temp: 2.0, differ: false }).contains("branch p"));
-    assert!(bad_branch(BranchCfg { p: 0.5, moves: 0, temp: 2.0, differ: false }).contains("moves 0"));
-    assert!(bad_branch(BranchCfg { p: 0.5, moves: 2, temp: 0.0, differ: false }).contains("temp"));
+    assert!(bad_branch(BranchCfg { p: 0.0, moves: 3, temp: 2.0, differ: false, rule: BranchRule::Uniform }).contains("branch p"));
+    assert!(bad_branch(BranchCfg { p: 1.5, moves: 3, temp: 2.0, differ: false, rule: BranchRule::Uniform }).contains("branch p"));
+    assert!(bad_branch(BranchCfg { p: 0.5, moves: 0, temp: 2.0, differ: false, rule: BranchRule::Uniform }).contains("moves 0"));
+    assert!(bad_branch(BranchCfg { p: 0.5, moves: 2, temp: 0.0, differ: false, rule: BranchRule::Uniform }).contains("temp"));
     // only drivers that record a self-play seat branch or start from an archive
     let mut c = branch_cfg(2, 0.5);
     c.record = false;
     assert!(Driver::<ToyGame>::new(c).err().unwrap_or_default().contains("never branches"));
     let mut c = cfg(vec![nn(0, 8, false)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
-    c.branch = Some(BranchCfg { p: 0.5, moves: 3, temp: 2.0, differ: false });
+    c.branch = Some(BranchCfg { p: 0.5, moves: 3, temp: 2.0, differ: false, rule: BranchRule::Uniform });
     assert!(Driver::<ToyGame>::new(c).is_err());
     let bad_starts = |s: StartsCfg| {
         let mut c = cfg(vec![nn_full(8)], vec![vec![0, 0]; 2], &[("m", KeyKind::Nn)]);
@@ -2827,7 +2827,7 @@ fn branch_and_starts_settings_are_checked() {
 fn differ_never_replays_the_games_own_move_first() {
     let run = |differ: bool| {
         let mut c = branch_cfg(60, 1.0);
-        c.branch = Some(BranchCfg { p: 1.0, moves: 1, temp: 2.0, differ });
+        c.branch = Some(BranchCfg { p: 1.0, moves: 1, temp: 2.0, differ, rule: BranchRule::Uniform });
         run_split(&mut Driver::<ToyGame>::new(c).unwrap(), true)
     };
     let br = |v: &Vec<(GameResult, Vec<Record>)>| v.iter().filter_map(|(r, _)| r.branch.clone()).collect::<Vec<_>>();
@@ -4730,15 +4730,18 @@ fn a_tampered_record_is_refused() {
 }
 
 #[test]
-fn set_trace_before_games_and_never_with_branches() {
+fn set_trace_before_games_and_never_with_archive_starts() {
     let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
     (c.rolling, c.concurrency) = (true, 4);
     let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
     d.resume(2, 0).unwrap();
     assert!(d.set_trace(true).unwrap_err().contains("before the first resume"));
-    c.branch = Some(BranchCfg { p: 0.5, moves: 2, temp: 1.0, differ: false });
+    // (branched games are traced since records/2: their traces start with their game's moves, docs/search.md 2.17)
+    c.branch = Some(BranchCfg { p: 0.5, moves: 2, temp: 1.0, differ: false, rule: BranchRule::Uniform });
+    Driver::<ToyGame>::new(c.clone()).unwrap().set_trace(true).unwrap();
+    c.starts = Some(StartsCfg { p: 0.5, specs: vec![("e".into(), r#"{"food": [5, 5]}"#.into())] });
     let mut d = Driver::<ToyGame>::new(c).unwrap();
-    assert!(d.set_trace(true).unwrap_err().contains("branched"));
+    assert!(d.set_trace(true).unwrap_err().contains("archive starts"));
 }
 // ---- game logs (Driver::set_game_log; docs/search.md 2.20) ----
 
@@ -4823,21 +4826,26 @@ fn a_game_log_is_the_games_trace() {
 }
 
 #[test]
-fn set_game_log_never_with_branches() {
+fn set_game_log_never_with_archive_starts() {
     let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
     (c.rolling, c.concurrency) = (true, 4);
     let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
     d.resume(2, 0).unwrap();
     d.set_game_log(true).unwrap();
     d.set_game_log(false).unwrap();
-    c.branch = Some(BranchCfg { p: 0.5, moves: 2, temp: 1.0, differ: false });
+    // (branched games are logged since records/2: their logs start with their game's moves, docs/search.md 2.20)
+    c.branch = Some(BranchCfg { p: 0.5, moves: 2, temp: 1.0, differ: false, rule: BranchRule::Uniform });
+    Driver::<ToyGame>::new(c.clone()).unwrap().set_game_log(true).unwrap();
+    c.starts = Some(StartsCfg { p: 0.5, specs: vec![("e".into(), r#"{"food": [5, 5]}"#.into())] });
     let mut d = Driver::<ToyGame>::new(c).unwrap();
-    assert!(d.set_game_log(true).unwrap_err().contains("branched"));
+    assert!(d.set_game_log(true).unwrap_err().contains("archive starts"));
 }
 // chained episodes (docs/search.md 2.14): the toy match through the driver
 mod chain;
 // the playout cap's rule by the prior's uncertainty (docs/search.md 3.21)
 mod budget;
+// near-tie branches (docs/search.md 2.11.1)
+mod neartie;
 
 // ---------------------------------------------------------------- reuse by the observation (docs/search.md 3.18)
 

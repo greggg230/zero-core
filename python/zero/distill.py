@@ -56,7 +56,7 @@ rows only, the value and margin terms over every row (`distill` decides from the
 `run.train_model` does); a window without them trains as before, bit for bit. `agreement` then reports
 the value and margin agreement of each kind of row separately ('decision', 'view').
 
-Several teachers (docs/az.md 72: the sources file of `tools/distill.py --sources`): each source its teacher,
+Several teachers (docs/az.md 76: the sources file of `tools/distill.py --sources`): each source its teacher,
 its shards and a game package's row selector (`select_rows`, `GamePackage.row_selectors`: e.g. MTG Zero's rows
 where a given deck acts) - one window of every source's selected rows (`data.Window(select=...)`), each source's
 rows a contiguous range of it, each teacher's answers on its own range only (`outputs(span=, into=)`), and
@@ -122,7 +122,7 @@ def outputs(model, W, device=None, batch=1024, span=None, into=None):
     with an auxiliary head also 'aux': float32 [N, W] (its predictions, `net.aux_predict`, in its
     layout's order: what `NetEvaluator.aux` answers) and 'aux_layout'. The model is moved to `device`
     when one is given; the rows go to the model's device.
-    `span` (lo, hi) (a multi-source distillation, docs/az.md 72: each teacher on its source's rows): only
+    `span` (lo, hi) (a multi-source distillation, docs/az.md 76: each teacher on its source's rows): only
     window rows lo..hi-1, written into `into` (an `outputs` dict of `W` holding other models' answers on
     other rows; zeros when None) and returned; the models must have the same auxiliary head or none."""
     if device is not None:
@@ -309,7 +309,7 @@ def view_rows(W):
 
 
 def shares(weights, batch):
-    """A multi-source distillation's batch split (docs/az.md 72): each source's rows of every batch of
+    """A multi-source distillation's batch split (docs/az.md 76): each source's rows of every batch of
     `batch` rows, proportional to its weight (largest remainders: exact up to one row, the same split
     every step, the sources' order breaking ties). A positive weight that gets no row is refused."""
     w = np.asarray(weights, np.float64)
@@ -329,7 +329,7 @@ def shares(weights, batch):
 
 def stratified_draw(strata):
     """fn(rng) -> a batch's window rows: for each (lo, hi, n) of `strata`, n rows of lo..hi-1 drawn uniformly
-    with replacement, in the strata's order (`data.batches`' `draw`; docs/az.md 72)."""
+    with replacement, in the strata's order (`data.batches`' `draw`; docs/az.md 76)."""
     strata = [(int(lo), int(hi), int(n)) for lo, hi, n in strata]
     for lo, hi, n in strata:
         if hi <= lo or n < 1:
@@ -341,7 +341,7 @@ def stratified_draw(strata):
 
 
 def select_rows(paths, select, game, source=None, config=None):
-    """Rows of shards `paths` a source's selector `select` takes (docs/az.md 72) -> per shard a sorted int64
+    """Rows of shards `paths` a source's selector `select` takes (docs/az.md 76) -> per shard a sorted int64
     array of its row numbers (all of them for an empty selector). The game package's row selector
     (`GamePackage.row_selectors`) decides each shard's rows, given the shard's meta and its run's config
     (`config`: a config.json path for every shard; None: `<run>/config.json` of `<run>/data/iter_NNNN/x.npz`,
@@ -397,7 +397,7 @@ def distill(student, W, T, steps, batch=512, lr=5e-4, lr_min=1e-5, warmup=500, w
     teacher's predictions in `T` ('aux': the same head; the window carries the shards' targets,
     `Window(aux_width=)`), `aux_w` / `aux_teacher_w` its weight and blend; a student with a head and a
     `T` without the teacher's predictions is refused (the head would train on nothing); a student
-    without one ignores them. `strata` (a multi-source distillation, docs/az.md 72; None: rows drawn
+    without one ignores them. `strata` (a multi-source distillation, docs/az.md 76; None: rows drawn
     uniformly from the window, as before): [(lo, hi, n), ...] - every batch n rows of window rows lo..hi-1
     for each (`stratified_draw`; the n sum to `batch`). -> (the AdamW optimizer, the last report)."""
     if getattr(student, 'reader_specs', None):

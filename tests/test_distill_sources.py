@@ -1,4 +1,4 @@
-"""Multi-teacher distillation (docs/az.md 72): `tools/distill.py --sources`, the game package's row selector
+"""Multi-teacher distillation (docs/az.md 76): `tools/distill.py --sources`, the game package's row selector
 (`GamePackage.row_selectors`, `zero.distill.select_rows`), `data.Window(select=...)`, `outputs(span=, into=)`,
 the stratified batches (`shares`, `stratified_draw`, `distill(strata=)`) - on the toy game, whose test selector
 takes the rows of one seat; and the single-teacher tool byte for byte as on the commit before the feature

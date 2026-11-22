@@ -37,7 +37,7 @@ held-out evaluation that improves it; its extra's `distill.step` says when).
 Progress: one JSON line per report on stdout and in OUT.pt.log.jsonl. Below-normal priority.
 
   python tools/distill.py --sources SOURCES.json OUT.pt [--device cuda --torch-threads 4 --keep-best --resume]
-      Several teachers, each on its own rows (docs/az.md 72): SOURCES.json =
+      Several teachers, each on its own rows (docs/az.md 76): SOURCES.json =
         {"student": {"init": "S.pt"},                 (or a fresh one: {"hidden": .., "blocks": .., "heads": ..,
                                                         "ff": .., "arch": .., "ch": ..}, each default the first
                                                         teacher's, as the size flags)
@@ -94,6 +94,15 @@ def shard_list(args):
     return out
 
 
+def _meta_game(meta, game):
+    """A shard meta's game resolved (docs/az.md 73; none recorded: `game`); a bad layout record: its message."""
+    from .. import package
+    try:
+        return package.record_game(meta, default=game)
+    except package.GameAliasError as e:
+        return str(e)
+
+
 def check_shards(paths, features, actions, game=None):
     """Every shard of this build's encoding for `game` (its meta's game, feature and action counts),
     else SystemExit."""
@@ -102,7 +111,7 @@ def check_shards(paths, features, actions, game=None):
     for p in paths:
         with np.load(p) as z:
             meta = json.loads(str(z['meta']))
-        if int(meta.get('features', features)) != features or int(meta.get('actions', actions)) != actions                 or (game and meta.get('game', game) != game):
+        if int(meta.get('features', features)) != features or int(meta.get('actions', actions)) != actions                 or (game and _meta_game(meta, game) != game):
             bad.append(f'{p}: {meta.get("game")!r}, {meta.get("features")} features, {meta.get("actions")} actions')
     if bad:
         raise SystemExit(f'shards of another encoding than this build\'s ({game!r}, {features} features, {actions} actions): '
@@ -177,7 +186,7 @@ def compare(a):
     return 0
 
 
-# ---------------------------------------------------------------- several teachers (docs/az.md 72)
+# ---------------------------------------------------------------- several teachers (docs/az.md 76)
 
 # The flags whose settings a sources file's "train" block gives (refused beside --sources), and its keys.
 SOURCE_TRAIN = ('steps', 'epochs', 'batch', 'lr', 'lr_min', 'warmup', 'wd', 'teacher_w', 'value_q', 'margin_w', 'aux_w',
@@ -334,7 +343,7 @@ def _source_plan(src, game, F, A):
 
 
 def run_sources(a, argv, ap):
-    """`--sources FILE OUT.pt` (module docstring; docs/az.md 72)."""
+    """`--sources FILE OUT.pt` (module docstring; docs/az.md 76)."""
     import types
     import torch
     from .. import distill as D
@@ -630,7 +639,7 @@ def main(argv=None):
     steps = a.steps or max(1, int(round((a.epochs or 1.0) * W.N / a.batch)))
     settings = dict(vars(a), game=game, size=size, steps=steps)
     settings.pop('compare', None)
-    settings.pop('sources', None)                  # (docs/az.md 72's flag: not one of this path's settings)
+    settings.pop('sources', None)                  # (docs/az.md 76's flag: not one of this path's settings)
     part = a.out + '.partial'
     opt, start = None, 0
     if a.resume and os.path.exists(part):

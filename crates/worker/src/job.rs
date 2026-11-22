@@ -216,6 +216,11 @@ impl EvalLink {
             let _ = r.recv();
         }
     }
+    /// A link whose evaluator threads are gone (tests: a resume that fails).
+    #[cfg(test)]
+    pub(crate) fn gone(n: usize) -> EvalLink {
+        EvalLink { txs: (0..n).map(|_| channel::<Req>().0).collect(), next: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
+    }
     pub fn restore(&self) -> Result<(), String> {
         let mut rs = Vec::new();
         for tx in &self.txs {
@@ -290,6 +295,11 @@ pub struct Progress {
     pub wall_s: f64,
     pub provider: String,
     pub finished_gids: Vec<u32>,
+    /// Branched games (zero-core docs/az.md 24, 72; all 0 without): branch rows finished, the near-tie branches among
+    /// them that merged back into their game, the near-tie rule's eligible decisions of the finished games.
+    pub branches: u64,
+    pub merges: u64,
+    pub neartie: u64,
     /// The last self-test's largest difference.
     pub selftest_max_abs: Option<f64>,
 }
@@ -309,6 +319,12 @@ impl Progress {
             "selftest_max_abs": self.selftest_max_abs.map(|m| if m.is_finite() { json!(m) } else { json!("inf") }),
             "leaves_per_s": if self.wall_s > 0.0 { ((self.leaves as f64 / self.wall_s) * 10.0).round() / 10.0 } else { 0.0 },
         });
+        if self.branches > 0 || self.neartie > 0 {
+            // (branched games: only a job that plays them - every other job's stats as before)
+            v["branches"] = json!(self.branches);
+            v["merges"] = json!(self.merges);
+            v["neartie"] = json!(self.neartie);
+        }
         if batch_hist_on() {
             let h: serde_json::Map<String, Value> =
                 self.batch_rows_log2.iter().enumerate().filter(|x| *x.1 > 0).map(|(k, n)| ((1u64 << k).to_string(), json!(n))).collect();
@@ -886,7 +902,9 @@ impl Run<'_> {
             }
         }
         let mut it = recs.into_iter();
-        let n = rows.len() as u64;
+        // (a branch game is its game's second row - zero-core docs/az.md 24: the job's games are its setups, the game
+        // ids it started; a branch is counted in the stats, never as one of them)
+        let n = rows.iter().filter(|r| r.branch.is_none()).count() as u64;
         for r in rows {
             let k = r.samples as usize;
             let records: Vec<_> = it.by_ref().take(k).collect();
@@ -896,7 +914,14 @@ impl Run<'_> {
             {
                 // (Stats: the finished games' searched decisions)
                 let mut p = self.progress.lock().unwrap();
-                p.finished_gids.push(r.gid);
+                match &r.branch {
+                    None => p.finished_gids.push(r.gid),
+                    Some(b) => {
+                        p.branches += 1;
+                        p.merges += b.merged.is_some() as u64;
+                    }
+                }
+                p.neartie += r.neartie.unwrap_or(0) as u64;
                 p.decisions += r.decisions as u64;
             }
             if r.abort_reason == Some("panic") {
@@ -1032,12 +1057,21 @@ impl Run<'_> {
 
 /// Run `job` to its end. `link_out` receives the evaluator link (the agent's yield / resume) once the
 /// evaluator is loaded.
+/// `v` (an object naming `game`) with the game's layout record (docs/az.md 73).
+pub fn stamped(game: &GameEntry, mut v: Value) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        game.stamp(o);
+    }
+    v
+}
+
 pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, progress: Arc<Mutex<Progress>>, link_out: &dyn Fn(EvalLink)) -> Result<Outcome, String> {
     let t0 = Instant::now();
     let info = (game.info)();
     let cfg = job_driver_cfg(game, job)?;
+    let branches = cfg.branch.is_some();
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
-    let want = Expect::of(&info, belief);
+    let want = Expect::of_entry(game, belief);
     let evs = build_evals(&job.eval, &want, sink, &progress, None)?;
     let workers = if evs.len() > 1 { format!(" x {} evaluator threads", evs.len()) } else { String::new() };
     sink.log(&format!("job {}: {} games from gid {}, seed {}, net {}; driver: conc {}, threads {}, groups {}, sparse; evaluator: {}{workers}", job.lease_id, job.games, job.gid_base, job.seed, job.net, cfg.concurrency, cfg.threads, cfg.groups, evs[0].describe()));
@@ -1064,6 +1098,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     drv.resume(BIG, job.net)?;
     let mut meta = Map::new();
     meta.insert("game".into(), json!(info.name));
+    game.stamp(&mut meta);                          // (an aliased name's layout record, docs/az.md 73)
     meta.insert("features".into(), json!(info.num_features));
     meta.insert("actions".into(), json!(info.num_actions));
     meta.extend(job.meta.clone());
@@ -1072,6 +1107,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let rec = if job.output.records() {
         let mut h = Map::new();
         h.insert("game".into(), json!(info.name));
+        game.stamp(&mut h);
         h.insert("spec".into(), json!(spec));
         h.insert("aux".into(), json!(aux));
         h.insert("features".into(), json!(info.num_features));
@@ -1080,7 +1116,12 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         h.insert("seed".into(), json!(job.seed));
         h.insert("lease".into(), json!(job.lease_id));
         h.insert("build_id".into(), job.meta.get("build_id").cloned().unwrap_or(Value::Null));
-        Some(RecordWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, h, 6)?)
+        let mut rw = RecordWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, h, 6)?;
+        if branches {
+            // (branched games: records/2, a game and its branch in one file - records.rs)
+            rw.set_branches();
+        }
+        Some(rw)
     } else {
         None
     };
@@ -1148,7 +1189,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
             r.pump()?;
         }
         r.pump()?;
-        if let Some(w) = r.rec.as_mut().map(|rw| rw.flush()).transpose()?.flatten() {
+        if let Some(w) = r.rec.as_mut().map(|rw| rw.finish()).transpose()?.flatten() {
             r.emit_file("records", w);
         }
         if let Some(n) = r.rec.as_ref().map(|rw| rw.pending_failures()).filter(|&n| n > 0) {
@@ -1161,7 +1202,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         Ok(())
     })();
     let rec_res = match (&r.recorder, &res) {
-        (Some(rc), Ok(())) => rc.write(&json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker"}), &info),
+        (Some(rc), Ok(())) => rc.write(&stamped(game, json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker"})), &info),
         _ => Ok(()),
     };
     r.snapshot();
@@ -1251,7 +1292,7 @@ mod tests {
         assert!(check_file_sha256(&d.join("missing.onnx"), &good, None).is_err());
         // a wrong hash ends the job before ONNX Runtime is touched (there is no runtime here at all; the right hash
         // reaching the loader is the worker's integration tests': MTG Zero tests/test_worker_farm.py)
-        let want = Expect { game: "toy".into(), features: 1, actions: 1, aux_width: 0, belief: false, tails: vec![], option_pointers: false };
+        let want = Expect { game: "toy".into(), features: 1, actions: 1, aux_width: 0, belief: false, tails: vec![], option_pointers: false, layout: None, before_of: None };
         let ort = OrtCfg::cpu(d.join("no-onnxruntime.dll"), 1, false);
         let progress = Mutex::new(Progress::default());
         let kind = EvalKind::Onnx { model: p.clone(), ort, sha256: Some(bad.clone()), reference: None };

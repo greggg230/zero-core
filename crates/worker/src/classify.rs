@@ -36,6 +36,9 @@ pub const TABLE: &str = include_str!("run_settings.json");
 /// The settings key holding the trainer's declared classes (module docs; docs/az.md 61).
 pub const CLASSES_KEY: &str = "setting_classes";
 
+/// The run setting holding an aliased game name's layout revision (zero-core `game_layout`, docs/az.md 73).
+pub const LAYOUT_KEY: &str = "game_layout";
+
 /// A game package's own run settings (zero-core `GamePackage.settings`): (name, class, why), class `play`,
 /// `trainer`, `python_only` or `param:<its switch>` (the table's classes).
 pub type PackageSettings = &'static [(&'static str, &'static str, &'static str)];
@@ -165,6 +168,13 @@ pub fn classify_with(c: &Settings, info: &GameInfo, others: &[GameInfo], package
         if k == CLASSES_KEY {
             continue;
         }
+        if k == LAYOUT_KEY {
+            // (the game's layout record, docs/az.md 73: read with `game` when the worker picks its game - `resolve_game`,
+            // which refuses a revision it does not play; the table classes it python_only so that builds before it
+            // refuse a truthy one by the run's declaration and play a null one as before)
+            out.push(Verdict { key: k.to_string(), value: c.get(k).unwrap_or(&null).dumps(), status: "play", why: "the game's layout record (docs/az.md 73): resolved with the game when the worker picks it".into() });
+            continue;
+        }
         let v = c.get(k).unwrap_or(&null);
         let value = v.dumps();
         let found = keys.iter().find(|e| e.0 == k).map(|e| (e.1.class.clone(), e.1.why.clone())).or_else(|| {
@@ -246,6 +256,26 @@ pub fn failures(v: &[Verdict]) -> Vec<&Verdict> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_layout_record_is_read_with_the_game_and_refused_by_builds_before_it() {
+        let info = zero_search::dynapi::game_info::<zero_search::toy::ToyGame>();
+        let (keys, _) = table().unwrap();
+        assert_eq!(keys.iter().find(|e| e.0 == LAYOUT_KEY).unwrap().1.class, Class::PythonOnly);
+        let d = r#""setting_classes": {"game_layout": "python_only"}"#;
+        for v in ["null", "2"] {
+            let c = Settings::parse(&format!(r#"{{"game": "toy", "game_layout": {v}, {d}}}"#)).unwrap();
+            let r = classify(&c, &info, &[]).unwrap();
+            assert_eq!(r.iter().find(|x| x.key == LAYOUT_KEY).unwrap().status, "play");
+        }
+        // a build before it: the key unknown, declared python_only by the run - null plays as before, a revision is refused
+        let st = |v: &str| {
+            let c = Settings::parse(&format!(r#"{{"game": "toy", "game_layout_stand_in": {v}, "setting_classes": {{"game_layout_stand_in": "python_only"}}}}"#)).unwrap();
+            classify(&c, &info, &[]).unwrap().iter().find(|x| x.key == "game_layout_stand_in").unwrap().status
+        };
+        assert_eq!(st("null"), "off");
+        assert_eq!(st("8"), "unsupported");
+    }
 
     #[test]
     fn the_table_parses_and_is_consistent() {

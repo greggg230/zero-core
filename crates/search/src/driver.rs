@@ -735,6 +735,12 @@ pub fn value_choice_pick(opts: &[(u16, f64)], tau: f64, rng: &mut Rng) -> Result
 /// it (its streams untouched); the branch's records start after its deviation moves, so no state of
 /// the game before the branch point is recorded twice. A branch is a finished game of its own (its
 /// result row, counted by rolling quotas) with the game's gid and `GameResult::branch`.
+///
+/// `rule` picks the branch point and the deviation: `BranchRule::Uniform` (the above, the default) or
+/// `BranchRule::NearTie` (docs/search.md 2.11.1): only decisions where the search could not separate the move
+/// played from a credible runner-up are eligible, the branch plays that runner-up as its one deviation move, and a
+/// branch that reaches a state equivalent to one of its game's after the branch point (`SearchGame::merge_key`)
+/// ends there with the game's outcome.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BranchCfg {
     /// The share of games that spawn a branch, in (0, 1].
@@ -747,6 +753,77 @@ pub struct BranchCfg {
     /// of the sampling): every branch leaves its game's line at once. False: sampled from all options
     /// (the game's own move among them - a branch may then re-play its game's line from there).
     pub differ: bool,
+    /// How the branch point and the deviation are chosen (`BranchRule::Uniform`: as described above).
+    pub rule: BranchRule,
+}
+
+/// A branch rule (`BranchCfg::rule`, docs/search.md 2.11 / 2.11.1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BranchRule {
+    /// A uniformly drawn eligible decision, 1..=moves deviation moves sampled from the priors (2.11).
+    Uniform,
+    /// Near-tie decisions only, exactly one deviation: the runner-up (2.11.1, `NearTie`).
+    NearTie(NearTie),
+}
+
+/// The near-tie gate (`BranchRule::NearTie`, docs/search.md 2.11.1). At a recording self-play seat's full
+/// search of a decision that is not minor, with `a` the move it chose: the candidates are the other root options
+/// with visits >= `n_min`, pre-noise prior P0 >= `p_min` and `SearchGame::branch_alt_ok(a, b)`; `b` is the one with
+/// the highest root Q (the decider's mean backed-up utility through it, `W / N` from every visit of the root
+/// option: P(win) in [0, 1] - the gate refuses seats with a margin term). The decision is eligible when
+/// `|Q(a) - Q(b)| <= eps` and `q_lo <= Q(a) <= q_hi` (and `a` has a visit).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NearTie {
+    pub eps: f64,
+    pub n_min: u32,
+    pub p_min: f64,
+    pub q_lo: f64,
+    pub q_hi: f64,
+}
+
+impl Default for NearTie {
+    /// The run settings' defaults (`selfplay_branch_eps` 0.02, `_n_min` 4, `_p_min` 0.02, `_q_lo` 0.1, `_q_hi` 0.9).
+    fn default() -> NearTie {
+        NearTie { eps: 0.02, n_min: 4, p_min: 0.02, q_lo: 0.1, q_hi: 0.9 }
+    }
+}
+
+impl NearTie {
+    pub fn check(&self) -> Result<(), String> {
+        if !(self.eps.is_finite() && self.eps >= 0.0) {
+            return Err(format!("branch eps {}: a Q gap >= 0", self.eps));
+        }
+        if self.n_min == 0 {
+            return Err("branch n_min 0: a runner-up needs at least 1 visit (its Q is the mean of its visits)".into());
+        }
+        if !(self.p_min.is_finite() && (0.0..=1.0).contains(&self.p_min)) {
+            return Err(format!("branch p_min {}: a prior in [0, 1]", self.p_min));
+        }
+        if !(self.q_lo.is_finite() && self.q_hi.is_finite() && 0.0 <= self.q_lo && self.q_lo <= self.q_hi && self.q_hi <= 1.0) {
+            return Err(format!("branch q_lo {} / q_hi {}: 0 <= q_lo <= q_hi <= 1 (the played move's win estimate)", self.q_lo, self.q_hi));
+        }
+        Ok(())
+    }
+
+    /// The gate at one root (docs/search.md 2.11.1): `acts`, `n` (every visit), `w` (value sums, the decider's
+    /// utility), `p0` per root option, `ia` the chosen move's index; `ok(b)` = `SearchGame::branch_alt_ok(a, b)`,
+    /// asked only for candidates that pass the other tests, best Q first, until one is ok. -> (b, |Q(a) - Q(b)|)
+    /// when the decision is eligible.
+    pub fn alt(&self, acts: &[u16], n: &[u32], w: &[f64], p0: &[f32], ia: usize, mut ok: impl FnMut(u16) -> bool) -> Option<(u16, f64)> {
+        if acts.len() < 2 || n.len() != acts.len() || w.len() != acts.len() || p0.len() != acts.len() || ia >= acts.len() || n[ia] == 0 {
+            return None;
+        }
+        let qa = w[ia] / n[ia] as f64;
+        if !(self.q_lo <= qa && qa <= self.q_hi) {
+            return None;
+        }
+        let mut cand: Vec<(usize, f64)> = (0..acts.len()).filter(|&i| i != ia && n[i] >= self.n_min && p0[i] as f64 >= self.p_min).map(|i| (i, w[i] / n[i] as f64)).collect();
+        // (best Q first; the first option on exact ties)
+        cand.sort_by(|x, y| y.1.total_cmp(&x.1).then(x.0.cmp(&y.0)));
+        let (ib, qb) = cand.into_iter().find(|&(i, _)| ok(acts[i]))?;
+        let gap = (qa - qb).abs();
+        (gap <= self.eps).then_some((acts[ib], gap))
+    }
 }
 
 impl BranchCfg {
@@ -761,7 +838,25 @@ impl BranchCfg {
         if !(self.temp.is_finite() && self.temp > 0.0) {
             return Err(format!("branch temp {}: a temperature > 0", self.temp));
         }
+        if let BranchRule::NearTie(nt) = &self.rule {
+            nt.check()?;
+            // (a near-tie branch plays exactly one deviation, the runner-up: the uniform rule's settings do nothing)
+            if self.moves != 1 || self.temp != 2.0 || self.differ {
+                return Err(format!(
+                    "branch rule neartie: one deviation move, the runner-up (moves {}, temp {}, differ {} - leave moves 1, temp 2, differ off; they are the uniform rule's)",
+                    self.moves, self.temp, self.differ
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The near-tie gate, None for the uniform rule.
+    pub fn neartie(&self) -> Option<&NearTie> {
+        match &self.rule {
+            BranchRule::NearTie(nt) => Some(nt),
+            BranchRule::Uniform => None,
+        }
     }
 }
 
@@ -809,6 +904,17 @@ pub struct BranchInfo {
     pub same_first: bool,
     /// The archive entry the game started from (`StartsCfg`), if any.
     pub start: Option<u32>,
+    /// A near-tie branch (`BranchRule::NearTie`, docs/search.md 2.11.1; all None / 0 for the uniform rule): the
+    /// runner-up it played (`alt`), the Q gap |Q(a) - Q(alt)| at the branch point, the branch point's
+    /// `SearchGame::decision_tag`, and - when it merged back into its game - the branch's searched decisions after
+    /// its deviation before the merge (`merged`; its records then carry the game's outcome).
+    pub alt: Option<u16>,
+    pub gap: f64,
+    pub tag: u16,
+    pub merged: Option<u32>,
+    /// The game's real moves before the branch point, as its trace counts them (`TraceStep`s: a branch's trace and
+    /// game log start with them, docs/search.md 2.17 / 2.20; a record's `branch.from`).
+    pub trace_from: u32,
 }
 
 /// The branch stream's and the start stream's salts (docs/search.md 2.11): their own streams from
@@ -913,6 +1019,12 @@ pub struct GameResult {
     pub branch: Option<BranchInfo>,
     /// A game started from an archive entry (`DriverCfg::starts`): the entry's index; None otherwise.
     pub start: Option<u32>,
+    /// Near-tie branches (`BranchRule::NearTie`, docs/search.md 2.11.1): the game's eligible decisions (whether or
+    /// not it drew a branch); None for a branch and for every game of a driver without the near-tie rule.
+    pub neartie: Option<u32>,
+    /// The game spawned a branch (`DriverCfg::branch`): its branch's row follows from the same slot (a records
+    /// writer keeps the two together, docs/search.md 2.17). False for every other game.
+    pub branched: bool,
     /// Self-play resignation (`NnSeat::resign_t`, docs/search.md 3.14): None unless the game's seats resign.
     /// A chained contest's row: None (each episode's is in `episodes`).
     pub resign: Option<ResignInfo>,
@@ -949,6 +1061,9 @@ pub struct GameLog {
     pub spec: Arc<String>,
     /// The smallest and largest network id of the game's emitted samples (None: it emitted none).
     pub nets: Option<(u32, u32)>,
+    /// A branch game (`DriverCfg::branch`): `steps` start with its game's real moves before the branch point, this
+    /// many (`BranchInfo::trace_from`); None for every other game.
+    pub branch_from: Option<u32>,
 }
 
 /// A game the driver dropped after a panic inside it (docs/search.md 2.18): an engine bug costs that game, not the
@@ -1642,6 +1757,10 @@ struct Fork<G: SearchGame> {
     /// Eligible decisions so far.
     seen: u32,
     point: Option<ForkPoint<G>>,
+    /// Near-tie branches' merge detection (docs/search.md 2.11.1): (real moves before the decision, its
+    /// `SearchGame::merge_key`) at each network decision of the game while it holds a branch point (keys only where
+    /// the game gives one); the branch keeps those after its branch point.
+    keys: Vec<(u64, u128)>,
 }
 
 /// The branch point: the game's state at the decision (before its move), its searched decisions,
@@ -1653,6 +1772,31 @@ struct ForkPoint<G: SearchGame> {
     moves: Vec<(u8, u16, Vec<u16>)>,
     at: u32,
     action: u16,
+    /// The game's real moves before the branch point (its failure log then: what a branch's trace and game log start
+    /// with, docs/search.md 2.17 / 2.20).
+    prefix: Vec<TraceStep>,
+    /// A near-tie branch point (docs/search.md 2.11.1): the runner-up the branch plays, the Q gap, the decision's tag.
+    alt: Option<u16>,
+    gap: f64,
+    tag: u16,
+}
+
+/// A near-tie branch's merge detection (docs/search.md 2.11.1; `Slot::merge`): its game's merge keys after the branch
+/// point, the game's outcome (what the branch's records take at a merge: the game's records' z, sc and its row's
+/// scores) and the branch's searched decisions when its deviation was played.
+struct MergeState {
+    keys: std::collections::HashSet<u128>,
+    out: GameOutcome,
+    dev_decisions: u32,
+}
+
+/// A finished game's outcome as its records got it (`worker::emit`): the result vector (a resignation's, or the
+/// game's), each seat's margin and score.
+#[derive(Clone, Debug)]
+pub(crate) struct GameOutcome {
+    pub(crate) res: [f32; MAX_SEATS],
+    pub(crate) margins: Vec<f32>,
+    pub(crate) scores: Vec<f32>,
 }
 
 enum Eval {
@@ -1848,6 +1992,15 @@ struct Slot<G: SearchGame> {
     in_move: Option<(u16, usize)>,
     /// The JSON of the spec the game started from (its queued setup's, else the driver's): `GameFailure::spec`.
     spec_json: Arc<String>,
+    /// Near-tie branches (docs/search.md 2.11.1): the game's eligible decisions (`GameResult::neartie`); the real-move
+    /// count of the last decision state whose merge key was taken (u64::MAX: none yet); a branch's merge detection
+    /// (None: not a near-tie branch, or nothing to merge with) and, once it merged, its decisions after the deviation.
+    neartie_seen: u32,
+    key_step: u64,
+    merge: Option<Box<MergeState>>,
+    merged: Option<u32>,
+    /// A branch game: its game's real moves before the branch point (`ForkPoint::prefix`; its game log's first steps).
+    prefix: Vec<TraceStep>,
 }
 
 /// A chained game's contest in progress (`Slot::chain`, docs/search.md 2.14): its finished episodes, their samples
@@ -1917,6 +2070,11 @@ impl<G: SearchGame> Slot<G> {
             fail_log: Vec::new(),
             in_move: None,
             spec_json: Arc::new(String::new()),
+            neartie_seen: 0,
+            key_step: u64::MAX,
+            merge: None,
+            merged: None,
+            prefix: Vec::new(),
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -2077,6 +2235,10 @@ struct Counters {
     branches: AtomicU64,
     dev_moves: AtomicU64,
     starts: AtomicU64,
+    /// Near-tie branches (docs/search.md 2.11.1): eligible decisions, branches that merged, their decisions to merge.
+    neartie_seen: AtomicU64,
+    merges: AtomicU64,
+    merge_decisions: AtomicU64,
     /// Games dropped after a panic inside them (docs/search.md 2.18).
     game_panics: AtomicU64,
 }
@@ -2274,6 +2436,12 @@ pub struct DriverStats {
     pub branches: u64,
     pub dev_moves: u64,
     pub starts: u64,
+    /// Near-tie branches (`BranchRule::NearTie`, docs/search.md 2.11.1; all 0 without): eligible decisions seen
+    /// (every game's), branches that merged back into their game, the sum of their searched decisions after the
+    /// deviation before the merge.
+    pub neartie_seen: u64,
+    pub merges: u64,
+    pub merge_decisions: u64,
     /// Value choices made by network seats (`NnSeat::value_choice_worlds`, docs/search.md 3.17) and the
     /// network rows their one-ply lookaheads sent (all 0 without).
     pub value_choices: u64,
@@ -2475,6 +2643,16 @@ impl<G: SearchGame> Driver<G> {
             b.check()?;
             if !cfg.record || !selfplay_seat {
                 return Err("branch: a driver that records no self-play seat never branches (an evaluation, a match)".into());
+            }
+            if b.neartie().is_some() {
+                // (the near-tie gate reads a root option's Q as a win estimate: W / N of the decider's utility, which a
+                // margin term turns into something else - refused, never a silently different gate)
+                if let Some(m) = cfg.seats.iter().find_map(|s| match s {
+                    SeatCfg::Nn(n) if n.selfplay && n.record && n.margin_w != 0.0 => Some(n.margin_w),
+                    _ => None,
+                }) {
+                    return Err(format!("branch rule neartie: a recording self-play seat with margin_w {m} (the gate's Q is P(win) only without a margin term)"));
+                }
             }
         }
         let mut starts = Vec::new();
@@ -2764,8 +2942,10 @@ impl<G: SearchGame> Driver<G> {
         if self.resumed {
             return Err("set_trace: before the first resume (games have started)".into());
         }
-        if on && (self.sh.cfg.branch.is_some() || self.sh.cfg.starts.is_some()) {
-            return Err("set_trace: branched games and archive starts are not replayable from a seed (docs/search.md 2.17)".into());
+        // (a branch game's trace starts with its game's moves to the branch point: replayable from the seed, its
+        // record's `branch` block says where it leaves its game; an archive start's game is not its seed's)
+        if on && self.sh.cfg.starts.is_some() {
+            return Err("set_trace: archive starts are not replayable from a seed (docs/search.md 2.17)".into());
         }
         self.sh.trace.store(on, Ordering::SeqCst);
         Ok(())
@@ -2777,8 +2957,8 @@ impl<G: SearchGame> Driver<G> {
     /// search or their samples changes, and it may be turned on or off at any time. Not with branched games or archive
     /// starts (a branch's moves begin at its branch point). Never called: nothing changes.
     pub fn set_game_log(&mut self, on: bool) -> Result<(), String> {
-        if on && (self.sh.cfg.branch.is_some() || self.sh.cfg.starts.is_some()) {
-            return Err("set_game_log: branched games and archive starts are not replayable from a seed (docs/search.md 2.20)".into());
+        if on && self.sh.cfg.starts.is_some() {
+            return Err("set_game_log: archive starts are not replayable from a seed (docs/search.md 2.20)".into());
         }
         self.sh.game_log.store(on, Ordering::SeqCst);
         Ok(())
@@ -3005,7 +3185,7 @@ impl<G: SearchGame> Driver<G> {
         if p.game.deferred() || p.game.to_move().is_some() {
             return Err(format!("game {gid} (driver seed {seed}): still deferred (or not over) after resolve({})", short(results)));
         }
-        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None, trace: None, abort: None, log: None };
+        let done = worker::Done { gid, tag: p.tag.take(), n: p.n, steps: p.steps, decisions: p.decisions, ext_moves: p.ext_moves, moves: Vec::new(), branch: None, start: p.start, resign: None, trace: None, abort: None, log: None, neartie: None, outcome: None };
         let records: Vec<Held> = p.records.into_iter().map(|r| Held::pack(r.unpark())).collect();
         let cfg = &self.sh.cfg;
         let mut samples = Vec::new();
@@ -3130,6 +3310,9 @@ impl<G: SearchGame> Driver<G> {
             branches: c.branches.load(Ordering::Relaxed),
             dev_moves: c.dev_moves.load(Ordering::Relaxed),
             starts: c.starts.load(Ordering::Relaxed),
+            neartie_seen: c.neartie_seen.load(Ordering::Relaxed),
+            merges: c.merges.load(Ordering::Relaxed),
+            merge_decisions: c.merge_decisions.load(Ordering::Relaxed),
             value_choices: c.value_choices.load(Ordering::Relaxed),
             value_choice_rows: c.value_choice_rows.load(Ordering::Relaxed),
             teacher_decisions: c.teacher_decisions.load(Ordering::Relaxed),

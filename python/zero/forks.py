@@ -11,6 +11,13 @@ played by the self-play driver itself (`DriverCfg::branch`, `DriverCfg::starts`)
   the first one never the game's own move there), then normal self-play
   to the end, its rows' z the branch's own outcome. The game itself is untouched (its rows, its
   streams); none of its rows is recorded twice.
+* **Near-tie branches** (`selfplay_branch_rule` 'neartie', docs/az.md 72, docs/search.md 2.11.1): the branch
+  point is drawn only among decisions where the search could not separate the move played from a credible
+  runner-up (|Q(a) - Q(b)| <= `selfplay_branch_eps`, b with >= `selfplay_branch_n_min` visits and prior >=
+  `selfplay_branch_p_min`, Q(a) in [`selfplay_branch_q_lo`, `selfplay_branch_q_hi`]); the branch plays that
+  runner-up (one deviation, no sampling), then normal self-play; a branch that reaches a state equivalent to one
+  of its game's after the branch point (the game's `merge_key`) ends there with the game's outcome. The uniform
+  rule's `selfplay_branch_moves` / `_temp` / `_differ` must stay at their defaults with it.
 * **Archive starts** (`selfplay_archive` = an archive file, '' = off; `selfplay_archive_p` = the share
   of games): a game starts from an archived position instead of a new deal - an entry's `patch`
   merged into the run's spec (MTG Zero: its `start` block: a source game's seed and action prefix,
@@ -35,11 +42,21 @@ import os
 FORMAT = 'zero-archive/1'
 MIRROR_NAME = 'archive.json'           # the archive's name in a remote self-play mirror (zero/remoteplay.py)
 KEYS = ('selfplay_branch', 'selfplay_branch_moves', 'selfplay_branch_temp', 'selfplay_branch_differ', 'selfplay_archive',
-        'selfplay_archive_p')
+        'selfplay_archive_p', 'selfplay_branch_rule', 'selfplay_branch_eps', 'selfplay_branch_n_min', 'selfplay_branch_p_min',
+        'selfplay_branch_q_lo', 'selfplay_branch_q_hi')
+RULES = ('uniform', 'neartie')
+# the near-tie rule's settings and their defaults (zero.run DEFAULTS; docs/az.md 72), the uniform rule's
+NEARTIE = {'selfplay_branch_eps': 0.02, 'selfplay_branch_n_min': 4, 'selfplay_branch_p_min': 0.02,
+           'selfplay_branch_q_lo': 0.1, 'selfplay_branch_q_hi': 0.9}
+UNIFORM = {'selfplay_branch_moves': 3, 'selfplay_branch_temp': 2.0, 'selfplay_branch_differ': 0}
 
 
 def branch_on(cfg):
     return float(cfg.get('selfplay_branch', 0.0) or 0.0) > 0.0
+
+
+def rule_of(cfg):
+    return str(cfg.get('selfplay_branch_rule', 'uniform') or 'uniform')
 
 
 def archive_on(cfg):
@@ -73,6 +90,32 @@ def check_settings(cfg, where=''):
         raise SystemExit(f'{where}selfplay_archive_p {a!r}: a share in (0, 1] of the games')
     if not isinstance(cfg.get('selfplay_archive', ''), str):
         raise SystemExit(f'{where}selfplay_archive {cfg.get("selfplay_archive")!r}: a path (\'\' = off)')
+    r = cfg.get('selfplay_branch_rule', 'uniform')
+    if r not in RULES:
+        raise SystemExit(f'{where}selfplay_branch_rule {r!r}: one of {", ".join(RULES)}')
+    e = cfg.get('selfplay_branch_eps', 0.02)
+    if not (_num(e) and e >= 0):
+        raise SystemExit(f'{where}selfplay_branch_eps {e!r}: a Q gap >= 0 (win probability)')
+    k = cfg.get('selfplay_branch_n_min', 4)
+    if not (isinstance(k, int) and not isinstance(k, bool) and k >= 1):
+        raise SystemExit(f'{where}selfplay_branch_n_min {k!r}: an integer >= 1 (the runner-up\'s visits)')
+    pm = cfg.get('selfplay_branch_p_min', 0.02)
+    if not (_num(pm) and 0.0 <= pm <= 1.0):
+        raise SystemExit(f'{where}selfplay_branch_p_min {pm!r}: a prior in [0, 1]')
+    lo, hi = cfg.get('selfplay_branch_q_lo', 0.1), cfg.get('selfplay_branch_q_hi', 0.9)
+    if not (_num(lo) and _num(hi) and 0.0 <= lo <= hi <= 1.0):
+        raise SystemExit(f'{where}selfplay_branch_q_lo {lo!r} / selfplay_branch_q_hi {hi!r}: 0 <= q_lo <= q_hi <= 1')
+    if branch_on(cfg):
+        # a setting of the rule not in play does nothing: refused, never silently ignored
+        if r == 'neartie':
+            bad = [k for k, v in UNIFORM.items() if cfg.get(k, v) != v]
+            if bad:
+                raise SystemExit(f'{where}selfplay_branch_rule neartie: {", ".join(bad)} are the uniform rule\'s settings (a '
+                                 f'near-tie branch plays one deviation, the runner-up): leave them at their defaults')
+        else:
+            bad = [k for k, v in NEARTIE.items() if cfg.get(k, v) != v]
+            if bad:
+                raise SystemExit(f'{where}{", ".join(bad)}: settings of selfplay_branch_rule neartie (the rule is {r!r})')
     if not enabled(cfg):
         return
     if cfg.get('resolver'):
@@ -114,8 +157,13 @@ def load_archive(path, game, spec):
         raise SystemExit(f'selfplay_archive {path}: {type(e).__name__}: {e}') from None
     if not isinstance(A, dict) or A.get('format') != FORMAT:
         raise SystemExit(f'selfplay_archive {path}: not a {FORMAT} file')
-    if A.get('game') != game:
-        raise SystemExit(f'selfplay_archive {path}: built for game {A.get("game")!r}, the run plays {game!r}')
+    from . import package
+    try:
+        ag = package.record_game(A)                 # (resolved, docs/az.md 73)
+    except package.GameAliasError as e:
+        raise SystemExit(f'selfplay_archive {path}: {e}') from None
+    if ag != game:
+        raise SystemExit(f'selfplay_archive {path}: built for game {ag!r}, the run plays {game!r}')
     base = json.loads(spec_json(spec))
     built = A.get('base_spec')
     built = json.loads(built) if isinstance(built, str) else built
@@ -147,7 +195,15 @@ class Forks:
     def __init__(self, run_dir, cfg):
         self.cfg = cfg
         self.branch = None
-        if branch_on(cfg):
+        if branch_on(cfg) and rule_of(cfg) == 'neartie':
+            # the near-tie rule (docs/az.md 72): the driver's branch dict without the uniform rule's keys
+            self.branch = {'p': float(cfg['selfplay_branch']), 'rule': 'neartie',
+                           'eps': float(cfg.get('selfplay_branch_eps', 0.02)),
+                           'n_min': int(cfg.get('selfplay_branch_n_min', 4)),
+                           'p_min': float(cfg.get('selfplay_branch_p_min', 0.02)),
+                           'q_lo': float(cfg.get('selfplay_branch_q_lo', 0.1)),
+                           'q_hi': float(cfg.get('selfplay_branch_q_hi', 0.9))}
+        elif branch_on(cfg):
             self.branch = {'p': float(cfg['selfplay_branch']), 'moves': int(cfg.get('selfplay_branch_moves', 3)),
                            'temp': float(cfg.get('selfplay_branch_temp', 2.0)),
                            'differ': bool(int(cfg.get('selfplay_branch_differ', 0) or 0))}
@@ -171,7 +227,12 @@ class Forks:
 
     def describe(self):
         out = []
-        if self.branch:
+        if self.branch and self.branch.get('rule') == 'neartie':
+            b = self.branch
+            out.append(f'branch {b["p"]} of the games at near-tie decisions (|Q gap| <= {b["eps"]}, runner-up visits >= '
+                       f'{b["n_min"]}, prior >= {b["p_min"]}, Q in [{b["q_lo"]}, {b["q_hi"]}]; the runner-up played, '
+                       f'merges back on equal merge keys)')
+        elif self.branch:
             b = self.branch
             out.append(f'branch {b["p"]} of the games ({b["moves"]} deviation moves at most, temperature {b["temp"]}'
                        + (", the first never the game's own move)" if b['differ'] else ')'))
@@ -191,7 +252,12 @@ def fingerprint(fk):
     if fk is None:
         return ''
     parts = []
-    if fk.branch:
+    if fk.branch and fk.branch.get('rule') == 'neartie':
+        # (the near-tie rule: a worker of an older checkout reports the uniform fingerprint and is refused)
+        b = fk.branch
+        parts.append(f'branch p={b["p"]} rule=neartie eps={b["eps"]} n_min={b["n_min"]} p_min={b["p_min"]} '
+                     f'q_lo={b["q_lo"]} q_hi={b["q_hi"]}')
+    elif fk.branch:
         b = fk.branch
         parts.append(f'branch p={b["p"]} moves={b["moves"]} temp={b["temp"]}' + (' differ' if b['differ'] else ''))
     if fk.archive:
@@ -209,7 +275,15 @@ def new_tally():
     return {'games': {'game': 0, 'branch': 0, 'archive': 0}, 'samples': {'game': 0, 'branch': 0, 'archive': 0},
             'decisions': {'game': 0, 'branch': 0, 'archive': 0}, 'branch': {'moves': 0, 'played': 0, 'same_first': 0,
                                                                             'at_frac': 0.0, 'archive': 0},
-            'archive': {}}
+            'archive': {}, 'neartie': new_neartie()}
+
+
+def new_neartie():
+    """The near-tie rule's tally (docs/az.md 72): games that counted eligible decisions and their sum, near-tie
+    branches, the merged ones and their decisions to the merge, the samples of the merged ones, the gap sum, and
+    the branch points' decision tags (tag -> [branches, merged])."""
+    return {'games': 0, 'seen': 0, 'branches': 0, 'merges': 0, 'merge_decisions': 0, 'merge_samples': 0, 'gap': 0.0,
+            'tags': {}}
 
 
 def tally(rows, acc, kinds=()):
@@ -220,6 +294,22 @@ def tally(rows, acc, kinds=()):
         acc['games'][k] += 1
         acc['samples'][k] += int(r.get('samples', 0) or 0)
         acc['decisions'][k] += int(r.get('decisions', 0) or 0)
+        nt = acc.setdefault('neartie', new_neartie())
+        if r.get('neartie') is not None:
+            nt['games'] += 1
+            nt['seen'] += int(r['neartie'])
+        if b and b.get('alt') is not None:
+            # a near-tie branch: merged or not, its decisions to the merge, its branch point's decision tag
+            nt['branches'] += 1
+            nt['gap'] += float(b.get('gap', 0.0) or 0.0)
+            m = b.get('merged')
+            tg = nt['tags'].setdefault(str(b.get('tag', 0)), [0, 0])
+            tg[0] += 1
+            if m is not None:
+                nt['merges'] += 1
+                nt['merge_decisions'] += int(m)
+                nt['merge_samples'] += int(r.get('samples', 0) or 0)
+                tg[1] += 1
         if b:
             t = acc['branch']
             t['moves'] += int(b['moves'])
@@ -247,6 +337,13 @@ def merge(a, b):
     for src in (a, b):
         for k, v in src.get('archive', {}).items():
             out['archive'][k] = out['archive'].get(k, 0) + v
+        nt = src.get('neartie') or {}
+        for k in ('games', 'seen', 'branches', 'merges', 'merge_decisions', 'merge_samples', 'gap'):
+            out['neartie'][k] += nt.get(k, 0)
+        for tg, (nb, nm) in (nt.get('tags') or {}).items():
+            cur = out['neartie']['tags'].setdefault(tg, [0, 0])
+            cur[0] += nb
+            cur[1] += nm
     return out
 
 
@@ -265,6 +362,16 @@ def summary(acc, fk=None):
         out['branch'] = {'moves': round(t['moves'] / nb, 3), 'played': round(t['played'] / nb, 3),
                          'same_first': round(t['same_first'] / nb, 4), 'at_frac': round(t['at_frac'] / nb, 4),
                          'of_archive': t['archive']}
+    nt = acc.get('neartie') or {}
+    if nt.get('games') or nt.get('branches'):
+        # the near-tie rule (docs/az.md 72): eligible decisions per game, merges and their decisions to the merge, the
+        # branch points' decision tags (most branches first)
+        nb, nm = nt['branches'], nt['merges']
+        out['neartie'] = {'games': nt['games'], 'seen': nt['seen'], 'seen_per_game': round(nt['seen'] / max(1, nt['games']), 2),
+                          'branches': nb, 'merges': nm, 'merge_share': round(nm / max(1, nb), 4),
+                          'decisions_to_merge': round(nt['merge_decisions'] / max(1, nm), 2),
+                          'merge_samples': nt['merge_samples'], 'gap': round(nt['gap'] / max(1, nb), 5),
+                          'tags': dict(sorted(nt['tags'].items(), key=lambda kv: (-kv[1][0], kv[0])))}
     if acc['archive']:
         out['archive'] = dict(sorted(acc['archive'].items()))
     if fk is not None and fk.archive:
@@ -281,4 +388,10 @@ def fmt(s):
     if 'branch' in s:
         b = s['branch']
         line += f"; branch moves {b['played']:.2f} played, first = game's {100 * b['same_first']:.0f}%"
+    if 'neartie' in s:
+        n = s['neartie']
+        tags = ', '.join(f'{t}: {v[0]}' for t, v in list(n['tags'].items())[:6])
+        line += (f"; near-tie {n['seen_per_game']} eligible/game, {n['merges']} of {n['branches']} branches merged "
+                 f"({100 * n['merge_share']:.0f}%, {n['decisions_to_merge']} decisions to merge), mean gap {n['gap']}"
+                 + (f", tags {tags}" if tags else ''))
     return line

@@ -100,6 +100,7 @@ from collections import deque
 
 from . import farm_def as FD
 from . import gamerec as GR
+from . import package
 
 PREFIX = 'pool:'
 SEMVER_RE = FD.SEMVER_RE                    # (as the coordinator checks a version: zero-farm coordinator util.ts)
@@ -553,7 +554,15 @@ class Pool:
     @staticmethod
     def _counters(it):
         return {'it': it, 'games': 0, 'rows': 0, 'shards': 0, 'records': 0, 'chunks': 0, 'refused': 0,
-                'stale_dropped': 0, 'stale_rows_dropped': 0, 'machines': {}, 'stale': {}, 'replay_s': 0.0}
+                'stale_dropped': 0, 'stale_rows_dropped': 0, 'machines': {}, 'stale': {}, 'replay_s': 0.0, 'forks': None,
+                'by_machine': {}}
+
+    def _mach(self, m):
+        """(mu held) Machine `m`'s staleness counters in the open iteration (rolling only, docs/az.md 54.8)."""
+        c = self.cur['by_machine'].get(m)
+        if c is None:
+            c = self.cur['by_machine'][m] = {'games': 0, 'rows': 0, 'stale_games': 0, 'stale_rows': 0, 'lag': {}}
+        return c
 
     def live(self):
         """The farm is delivering: a valid game arrived within `pool_live_s` (selfplay_local 0: this machine plays no
@@ -617,8 +626,18 @@ class Pool:
                    'replay_s': round(cur['replay_s'], 2), 'gen': self.st.get('current_gen'), 'stale': dict(cur['stale'])}
             if self.rolling is not None:           # (per-row staleness; off: the metrics of before)
                 out['stale_rows_dropped'] = cur['stale_rows_dropped']
+                out['by_machine'] = {m: dict(c, lag=dict(c['lag'])) for m, c in cur['by_machine'].items()}
+            if cur['forks'] is not None:           # (branched games: the accepted games' zero/forks.py tally)
+                out['forks'] = cur['forks']
         if self.error:
             out['error'] = self.error
+        bad = sorted(((c['stale_rows'], m, c) for m, c in out.get('by_machine', {}).items() if c['stale_rows']),
+                     reverse=True)
+        if bad:                                    # (the machines whose rows went stale, worst first: docs/az.md 54.8)
+            self.log(f'iteration {it}: stale rows by machine: ' + ', '.join(
+                f'{m} {c["stale_rows"]}/{c["stale_rows"] + c["rows"]} '
+                f'({100 * c["stale_rows"] / (c["stale_rows"] + c["rows"]):.0f}%, {c["stale_games"]} games whole)'
+                for _, m, c in bad))
         if self.stopped:
             # (every iteration while it is stopped: the metrics row and the log say so, docs/az.md 70)
             out['stopped'] = {k: self.stopped[k] for k in ('reason', 'fix')}
@@ -1006,9 +1025,15 @@ class Pool:
         except (OSError, ValueError, EOFError) as e:
             return self._refuse(r, f'not a records file: {e}', body)
         info = self.R.info
-        want = {'records': 1, 'game': self.R.cfg['game'], 'features': info['num_features'],
+        # (records/2: records/1 whose files may hold branch games - the run's selfplay_branch, docs/az.md 72.7)
+        version = h.get('records') if h.get('records') in (1, 2) else 1
+        want = {'records': version, 'game': self.R.cfg['game'], 'features': info['num_features'],
                 'actions': info['num_actions'], 'aux': self.aux, 'seed': self.seed, 'build_id': self.build}
         got = {k: h.get(k) for k in want}
+        try:
+            got['game'] = package.record_game(h)    # (resolved: an aliased name without its layout record, docs/az.md 73)
+        except package.GameAliasError as e:
+            return self._refuse(r, f'header game: {e}', body)
         if got['build_id'] in self.alt_builds:
             want['build_id'] = got['build_id']     # an alternate's worker: the same engine for another runtime pack
         if got != want:
@@ -1032,16 +1057,29 @@ class Pool:
         sparse = fmt.get('x_format') == 'sparse'
         machine = r.get('machine_id') or '?'
         keep = []
-        for ln in lines:
-            try:
-                gid = int(json.loads(ln)['gid'])
-            except (ValueError, KeyError, TypeError):
-                return self._refuse(r, 'a game line without its gid', body)
+        try:
+            recs = [json.loads(ln) for ln in lines]
+            gids = [int(x['gid']) for x in recs]
+        except (ValueError, KeyError, TypeError):
+            return self._refuse(r, 'a game line without its gid', body)
+        parent = {}                                # gid -> its game's line (a branch replays with it: records/2)
+        for k, (ln, x, gid) in enumerate(zip(lines, recs, gids)):
             if not _in_ranges(gid, ids):
-                continue                           # (not credited to this chunk: another copy counts)
+                continue                           # (not credited to this chunk: another copy counts - with its branch)
+            br = x.get('branch')
+            if br is not None and version != 2:
+                return self._refuse(r, f'game {gid}: a branch game in a records/{version} file', body, gid)
+            if br is None:
+                parent[gid] = ln
+            elif gid not in parent:
+                # (the worker writes a game and its branch into one file, its game first: records/2)
+                return self._refuse(r, f'game {gid}: a branch game without its game\'s record before it in the file', body, gid)
             t0 = time.time()
             try:
-                s, g = E.replay_rows(self.R.cfg['game'], rspec, ln, self.aux)
+                if br is None:
+                    s, g = E.replay_rows(self.R.cfg['game'], rspec, ln, self.aux)
+                else:
+                    s, g = E.replay_rows(self.R.cfg['game'], rspec, ln, self.aux, parent=parent[gid])
             except ValueError as e:
                 return self._refuse(r, f'replay: {e}', body, gid)
             dt = time.time() - t0
@@ -1068,9 +1106,12 @@ class Pool:
                 net = int(s['net'].min())
             item = {'gid': gid, 'machine': machine, 'net': net if net is not None else r.get('gen'), 's': s,
                     'rows': g['rows'], 'replay_s': dt}
+            if self.R.cfg.get('selfplay_branch'):
+                # branched games (zero/forks.py tally, docs/az.md 24 / 72): the game's origin as a result row has it
+                item['fk'] = {'samples': g['rows'], 'decisions': 0, 'branch': br, 'neartie': x.get('neartie')}
             if gr is not None:
                 # game_records (docs/az.md 59): the record's moves and outcome, written if the quota accepts the game
-                item['rec'] = GR.from_farm(json.loads(ln), rspec, 0, self.name, machine)
+                item['rec'] = GR.from_farm(x, rspec, 0, self.name, machine)
             keep.append(item)
         with self.mu:
             self.held.extend(keep)
@@ -1129,12 +1170,15 @@ class Pool:
                     nets = np.asarray(g['s']['net'])
                     ok = np.flatnonzero(nets >= lim)
                     self.cur['stale_rows_dropped'] += len(nets) - len(ok)
+                    self._mach(g['machine'])['stale_rows'] += len(nets) - len(ok)
                     if len(ok):
                         s = keep_rows(g['s'], ok, self._tail_widths())
                         g = self.held[0] = dict(g, s=s, rows=len(ok), net=int(np.asarray(s['net']).min()))
                 if g['net'] < lim:
                     self.held.popleft()
                     self.cur['stale_dropped'] += 1
+                    if self.rolling is not None:
+                        self._mach(g['machine'])['stale_games'] += 1
                     continue
             return g
         return None
@@ -1148,6 +1192,12 @@ class Pool:
         self.cur['replay_s'] += g['replay_s']
         m = g['machine']
         self.cur['machines'][m] = self.cur['machines'].get(m, 0) + 1
+        if g.get('fk') is not None:
+            # (branched games: a branch counts as one of the iteration's games, as on this machine - docs/az.md 24)
+            from .forks import new_tally, tally
+            if self.cur['forks'] is None:
+                self.cur['forks'] = new_tally()
+            tally([g['fk']], self.cur['forks'])
         if g.get('rec') is not None:
             # (game_records: Records' lock is innermost, below Pool.mu - it calls nothing back)
             # (the engine: this run's, which replayed the game and whose farm compatibility the worker build has -
@@ -1161,7 +1211,8 @@ class Pool:
             d = os.path.join(self.R.run, 'data', f'iter_{it:04d}')
             # (format v2's keys for a game with tails / overrides, docs/az.md 43: `shard_format` with the game's
             # info, as Run.shard_meta)
-            meta = {'game': self.R.cfg['game'], 'features': self.R.info['num_features'],
+            meta = {'game': self.R.cfg['game'], **package.layout_stamp(self.R.cfg['game']),
+                    'features': self.R.info['num_features'],
                     'actions': self.R.info['num_actions'], 'iter': it, 'source': 'pool', 'machine': m,
                     'farm_run': self.farm, **shard_format(self.R.cfg, self.R.info)}
             pre = 'pool-' + ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in m)
@@ -1174,6 +1225,11 @@ class Pool:
         w.add(g['s'])
         self.cur['rows'] += g['rows']
         lag_hist(g['s']['net'], it, self.cur['stale'])
+        if self.rolling is not None:
+            c = self._mach(m)
+            c['games'] += 1
+            c['rows'] += g['rows']
+            lag_hist(g['s']['net'], it, c['lag'])
 
 
 def _sparse_rows(s):

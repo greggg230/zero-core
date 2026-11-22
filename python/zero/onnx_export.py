@@ -878,6 +878,11 @@ class ZeroOnnx2(ZeroOnnx):
     the graph reaches 2^31 (docs/az.md 46.2). Packing 'packed' only (each row's tail tokens follow
     its present head tokens in the packed list)."""
 
+    # a block of zeros appended to the policy before a scatter: as a Concat with zeros (every graph before), or as a Pad
+    # of the policy (the fast graph: the same tensor; ONNX Runtime's CUDA host time of those two Concats was ~20 % of a
+    # call's, docs/az.md 74)
+    PAD_ZEROS = False
+
     VERSION = 2
 
     def __init__(self, net, packing='packed', attention=None):
@@ -1118,7 +1123,7 @@ class ZeroOnnx2(ZeroOnnx):
             later = (okey[None, :] == okey[:, None]) & (ar_o[None, :] > ar_o[:, None])
             obad = obad | later.any(1)
             okey = torch.where(obad, B * A1 + ar_o, orow * A1 + act)
-            pol = torch.cat([pol, pol.new_zeros(NO + 1)]).scatter(0, okey, ovv)
+            pol = (F.pad(pol, (0, NO + 1)) if self.PAD_ZEROS else torch.cat([pol, pol.new_zeros(NO + 1)])).scatter(0, okey, ovv)
             if slice_back:
                 pol = pol[:B * A1]
             else:
@@ -1267,6 +1272,9 @@ class ZeroOnnx2Fast(ZeroOnnx2):
     choices (docs/az.md 63): no data-dependent count is used as a size or an offset beyond the batch's own (its
     allocation planner reused live buffers in graphs that did), and no running sum runs over the non-zeros but
     `_csr_rows`' (its CumSum takes ~45 ns an element)."""
+
+    PAD_ZEROS = True
+
 
     def __init__(self, net, packing='packed', attention='mha'):
         if attention not in FAST_ATTENTIONS:
@@ -1730,8 +1738,8 @@ class ZeroOnnx2Fast(ZeroOnnx2):
             # times the columns, not a running sum over all n_h C writes - ONNX Runtime's CUDA CumSum, docs/az.md 66)
             spare = B * A1 + ar_h[:, None] * cols.shape[1] + torch.arange(cols.shape[1], device=dev)[None, :]
             dest = torch.where(ok, row_h[:, None] * A1 + acts, spare)
-            pol = torch.cat([gen.reshape(-1), torch.zeros_like(lg).reshape(-1)]).scatter(
-                0, dest.reshape(-1), lg.reshape(-1))[:B * A1]
+            base = F.pad(gen.reshape(-1), (0, lg.numel())) if self.PAD_ZEROS else torch.cat([gen.reshape(-1), torch.zeros_like(lg).reshape(-1)])
+            pol = base.scatter(0, dest.reshape(-1), lg.reshape(-1))[:B * A1]
         else:
             if net.n_id:
                 it = torch.cat([torch.full_like(ar_b, net.vocab), ids_s])
@@ -1985,6 +1993,8 @@ def metadata(net, packing, extra=None):
             'outputs': json.dumps(list(OUTPUTS)), 'packing': str(packing or 'none'), 'opset': str(OPSET),
             'unique_scatters': '0' if packing in ('compact', 'host') else '1',
             'exporter': 'torch.onnx.export(dynamo=True)', 'torch': torch.__version__}
+    if c.get('game_layout') is not None:            # (an aliased game's layout record, docs/az.md 73; else absent)
+        meta['game_layout'] = str(int(c['game_layout']))
     if packing == 'host':
         meta['present_index'] = json.dumps(net.present_index())
     if getattr(net, 'dup_reduce', None) is not None:
@@ -3030,6 +3040,8 @@ def write_reference_rows(net, rows, bo, out, info=None, tol=REFERENCE_TOL):
             'actions': int(net.config['actions']), 'aux_width': W, 'rows': int(rows.B), 'belief_rows': n_belief,
             'value_rows': int((rows.extra == ROW_VALUE).sum()), 'batches': int(len(bo) - 1), 'tol': tol,
             'sources': rows.source, 'torch': torch.__version__, 'answers': 'infer.NetEvaluator, eager, CPU'}
+    if net.config.get('game_layout') is not None:  # (docs/az.md 73)
+        meta['game_layout'] = int(net.config['game_layout'])
     if v2:
         meta.update(rows.tail_stats())
         meta['t_segs'] = [[int(j), str(nm), int(w), int(h)] for j, nm, w, h in net.tail_segments()]

@@ -48,6 +48,8 @@ pub struct Opts {
     pub variants_deadline_s: f64,
     /// The providers the variants may use (None: `providers`): a variant also names its own.
     pub variant_providers: Option<Vec<ProviderKind>>,
+    /// The worker's registered games: a real network's game resolves in them (its alias, docs/az.md 73.1).
+    pub games: &'static [crate::GameEntry],
 }
 
 /// A batch of `n` rows cycled from the reference set's rows (timing only).
@@ -156,7 +158,7 @@ pub fn run(o: &Opts) -> Result<Value, String> {
         }
     };
     let set = crate::selftest::load(&reference)?;
-    let spec = SessionSpec { model: &model, reference: Some(&reference), providers: &[], device: None, intra_threads: o.threads, runtime: &o.dylib, spinning: false, expect: None };
+    let spec = SessionSpec { model: &model, reference: Some(&reference), providers: &[], device: None, intra_threads: o.threads, runtime: &o.dylib, spinning: false, expect: None, games: o.games };
     let mut results = Vec::new();
     let mut passed: Vec<ProviderKind> = Vec::new();
     let mut cpu_rate = None;

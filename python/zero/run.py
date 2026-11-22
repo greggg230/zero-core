@@ -97,6 +97,10 @@ DEFAULTS = dict(
     # game: a game registered in the package's compiled module ('toy', 'caverna', 'glassroad'),
     # its JSON spec, player counts to sample per self-play game
     game='toy', spec='', players=[2],
+    # game_layout: the layout revision of a game whose name changed meaning (GamePackage.game_aliases, docs/az.md 73):
+    # set at a run's first start from the package's table (None for every game whose name never changed), kept from
+    # then on; a config that names an aliased game without it (written before the change) is that name's old game
+    game_layout=None,
     # self-play: games per iteration (rolling: games FINISHED per iteration), games in
     # flight, search threads, batches in flight (groups), torch intra-op threads (1: on a
     # saturated CPU every torch op with > 1 thread waits for preempted threads - measured
@@ -409,6 +413,14 @@ DEFAULTS = dict(
     # (selfplay_branch_differ 1: a branch's first deviation never the game's own move there)
     selfplay_branch=0.0, selfplay_branch_moves=3, selfplay_branch_temp=2.0, selfplay_branch_differ=0, selfplay_archive='',
     selfplay_archive_p=0.1,
+    # near-tie branches (docs/az.md 72, docs/search.md 2.11.1; with selfplay_branch > 0 only): selfplay_branch_rule
+    # 'neartie' draws the branch point among decisions where the search could not separate the move played from a
+    # credible runner-up - visits >= selfplay_branch_n_min, prior >= selfplay_branch_p_min, |Q gap| <=
+    # selfplay_branch_eps, the played move's Q in [selfplay_branch_q_lo, selfplay_branch_q_hi] - and the branch plays
+    # that runner-up (one deviation), then normal self-play; a branch that reaches one of its game's later states
+    # (the game's merge_key) ends there with the game's outcome. 'uniform' = the branched games above
+    selfplay_branch_rule='uniform', selfplay_branch_eps=0.02, selfplay_branch_n_min=4, selfplay_branch_p_min=0.02,
+    selfplay_branch_q_lo=0.1, selfplay_branch_q_hi=0.9,
     # ... except a batch-bound machine's (its network batches grow with its games in flight, so a
     # smaller cap only starves it: 'auto' = this machine's driver inferring on CUDA / MPS and every
     # remote worker, whatever its device - docs/az.md 56.1; 'local' | 'remote' | 'all' | 'none'): its
@@ -524,6 +536,12 @@ def apply_package(pkg):
         bad = sorted(set(p) - set(known))
         if bad:
             raise ValueError(f'{pkg.name}: preset {name!r} has unknown settings {bad}')
+        if 'game_layout' in p:
+            raise ValueError(f'{pkg.name}: preset {name!r} sets game_layout: a run records it at its first start '
+                             f'(docs/az.md 73: a preset fills the missing settings and would move an old run '
+                             f'onto a new layout)')
+    if 'game_layout' in pkg.defaults:
+        raise ValueError(f'{pkg.name}: defaults set game_layout (docs/az.md 73: a run records it at its first start)')
     DEFAULTS.clear()
     DEFAULTS.update(known)
     DEFAULTS.update(pkg.defaults)
@@ -1192,7 +1210,7 @@ class Run:
         variable-length rows format v2's `t_segs` / `option_pointers` / `max_row_tokens`, docs/az.md 43) - the meta of
         before, key for key, for a game without them."""
         c = self.cfg
-        return {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
+        return {'game': c['game'], **package.layout_stamp(c['game']), 'features': self.info['num_features'], 'actions': self.info['num_actions'], 'iter': it,
                 **extra, **shard_format(c, self.info)}
 
     def check_rows(self):
@@ -2964,6 +2982,39 @@ def parse(argv=None):
     return ap.parse_args(argv)
 
 
+def resolve_run_game(cfg, saved, given, where='the run'):
+    """cfg's game resolved (docs/az.md 73): its name with the layout record the run made it with - the saved config's
+    `game_layout` when the game is the saved config's (none saved: the name's meaning before it changed, an old run's
+    game), a `game_layout` given now, else (a first start, or another game given now) the name's current revision.
+    Sets cfg's `game` to the resolved game and its `game_layout` to that game's stamp; a mismatch exits (refused)."""
+    name = cfg.get('game')
+    if 'game_layout' in given:
+        layout = given['game_layout']
+        if isinstance(layout, float) and layout.is_integer():
+            layout = int(layout)                    # (--game-layout 8: the flag parses numbers as floats)
+    elif saved.get('game') and ('game' not in given or given['game'] == saved['game']):
+        layout = saved.get('game_layout')
+    else:
+        layout = package.active().layout_of(name)
+    try:
+        package.set_game(cfg, package.resolve_game(name, layout, where))
+        # a co-training run's resolver game (docs/az.md 11): the same rule, its layout record in `resolver_cfg`
+        if cfg.get('resolver'):
+            rname = cfg['resolver']
+            if saved.get('resolver') == rname:
+                rlayout = (saved.get('resolver_cfg') or {}).get('game_layout')
+            else:
+                rlayout = package.active().layout_of(rname)
+            rgame = package.resolve_game(rname, rlayout, f'{where}: resolver')
+            rc = dict(cfg.get('resolver_cfg') or {})
+            rc.pop('game_layout', None)
+            rc.update(package.layout_stamp(rgame))
+            cfg['resolver'], cfg['resolver_cfg'] = rgame, rc
+    except package.GameAliasError as e:
+        raise SystemExit(str(e)) from None
+    return cfg
+
+
 def resolve_config(args, saved):
     """DEFAULTS < preset < saved config < flags given now."""
     given = {k: getattr(args, k) for k in DEFAULTS if getattr(args, k) is not None}
@@ -2976,6 +3027,7 @@ def resolve_config(args, saved):
     cfg.update(saved)
     cfg.update(given)
     cfg['preset'] = preset
+    resolve_run_game(cfg, saved, given)
     if cfg.get('policy_target', 'visits') not in ('visits', 'cq'):
         raise SystemExit(f"policy_target {cfg['policy_target']!r}: 'visits' or 'cq'")
     check_eval_settings(cfg)

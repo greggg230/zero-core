@@ -11,6 +11,11 @@
 #   bash tools/smoke_all.sh --core-only             # the core's own steps, deliberately no game (or SKIP_GAMES=1)
 #   bash tools/smoke_all.sh --dry-run [...]         # print the plan (core steps, each game and where it was found), run nothing
 #
+# Faster (docs/az.md 75): every pytest suite runs through tools/pytest_shards.py in SMOKE_PYTEST_SHARDS processes
+# over disjoint parts of the tests (default 4; 1 = one plain `pytest tests`), the core's with tests/test_remoteplay.py's
+# failures rerun alone once; and SMOKE_JOBS games run at once (default 3; 1 = one after the other), each in its own
+# checkout and target dir, its output printed whole when it ends.
+#
 # Per game (a repo with <pkg>/az/__init__.py registering a GamePackage and third_party/zero-core):
 # tools/build_py.sh, cargo test, python -m pytest tests, then `python -m <pkg>.az.run --preset
 # <game>-smoke` (3 iterations, the JS bot through Node as the yardstick) checked for 4 metrics
@@ -121,7 +126,7 @@ NO_GAMES_MSG="no game repo found and none given (looked for ${KNOWN_GAMES[*]} in
 
 if [ "$DRY_RUN" = 1 ]; then
   echo "smoke_all --dry-run: core $CORE ($CORE_SHA), with-this-core $WITH_CORE, build-only $BUILD_ONLY"
-  [ "${SKIP_CORE:-0}" = 1 ] && echo "  core steps: skipped (SKIP_CORE=1)" || echo "  core steps: cargo test, build zero._engine, pytest"
+  [ "${SKIP_CORE:-0}" = 1 ] && echo "  core steps: skipped (SKIP_CORE=1)" || echo "  core steps: cargo test, build zero._engine, pytest (${SMOKE_PYTEST_SHARDS:-4} shard(s))"
   for G in ${GAMES[@]+"${GAMES[@]}"}; do echo "  game: $G"; done
   for g in ${MISSING[@]+"${MISSING[@]}"}; do echo "  missing: $g (looked in: ${LOOKED:-nowhere})"; done
   if [ "$CORE_ONLY" = 1 ]; then echo "  games: none (--core-only)"; exit 0; fi
@@ -157,6 +162,18 @@ step() {   # step <label> <command...>
   fi
 }
 
+PYTEST_SHARDS="${SMOKE_PYTEST_SHARDS:-4}"
+pytest_step() {   # pytest_step <label> <repo root> <name> [pytest_shards.py options]: the repo's pytest, in shards
+  local label="$1" root="$2" name="$3"; shift 3
+  local base; base="$(winpath "$SMOKE_DIR/$STAMP-pytest-$name")"
+  if [ "$PYTEST_SHARDS" -le 1 ]; then
+    step "$label" bash -c "cd '$root' && '$PY' -m pytest tests -q -p no:cacheprovider -W ignore::pytest.PytestWarning --basetemp='$base'"
+  else
+    step "$label ($PYTEST_SHARDS shards)" "$PY" "$CORE/tools/pytest_shards.py" --root "$(winpath "$root")" \
+      --shards "$PYTEST_SHARDS" --basetemp "$base" "$@" -- -W ignore::pytest.PytestWarning
+  fi
+}
+
 if [ "$WITH_CORE" = 1 ] && [ -n "$(git -C "$CORE" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
   echo "note: $CORE has uncommitted changes - --with-this-core builds the games against its HEAD $CORE_SHA, not them"
   SUMMARY+=("note  uncommitted core changes are not in the games' builds (--with-this-core uses HEAD $CORE_SHA)")
@@ -167,7 +184,7 @@ if [ "${SKIP_CORE:-0}" != 1 ]; then
   [ "${SKIP_CARGO:-0}" != 1 ] && step "core: cargo test" \
     env ${CTGT:+CARGO_TARGET_DIR=$CTGT} cargo test --release --manifest-path "$CORE/Cargo.toml" -q
   step "core: build zero._engine" bash "$CORE/tools/build_py.sh"
-  step "core: pytest" bash -c "cd '$CORE' && '$PY' -m pytest tests -q -p no:cacheprovider -W ignore::pytest.PytestWarning --basetemp='$(winpath "$SMOKE_DIR/$STAMP-pytest-core")'"
+  pytest_step "core: pytest" "$CORE" core --retry-alone tests/test_remoteplay.py
 fi
 
 smoke_run() {   # smoke_run <root> <pkg> <preset>
@@ -185,13 +202,13 @@ assert its == list(range(len(its))) and len(its) >= 2 and last['selfplay']['unfi
 EOF
 }
 
-for G in ${GAMES[@]+"${GAMES[@]}"}; do
-  ROOT="$G"
+game() {   # game <checkout>: one game's steps (its lines go to SUMMARY, FAILED and CHECKED)
+  local G="$1" ROOT="$1" PKG NAME WT TGT GAME want have
   echo "=== game: $G"
   PKG="$(cd "$G" && ls -d */az/__init__.py 2>/dev/null | grep -v '^third_party' | head -1 | cut -d/ -f1)"
   if [ -z "$PKG" ]; then
     echo "$G: no <pkg>/az/__init__.py - not a game repo"
-    SUMMARY+=("FAIL  $G: no <pkg>/az/__init__.py (not a game repo)"); FAILED=$((FAILED + 1)); continue
+    SUMMARY+=("FAIL  $G: no <pkg>/az/__init__.py (not a game repo)"); FAILED=$((FAILED + 1)); return 0
   fi
   # the repo's name (a worktree's too: the main repo's directory)
   NAME="$(basename "$(dirname "$(git -C "$G" rev-parse --path-format=absolute --git-common-dir)")")"
@@ -200,7 +217,7 @@ for G in ${GAMES[@]+"${GAMES[@]}"}; do
     WT="$SMOKE_DIR/$STAMP-$NAME-wt"
     if ! git -C "$G" worktree add --detach "$WT" HEAD >/dev/null 2>&1; then
       echo "$NAME: git worktree add $WT failed"
-      SUMMARY+=("FAIL  $NAME: scratch worktree"); FAILED=$((FAILED + 1)); continue
+      SUMMARY+=("FAIL  $NAME: scratch worktree"); FAILED=$((FAILED + 1)); return 0
     fi
     git -C "$WT" submodule update --init third_party/zero-core >/dev/null 2>&1
     want="$(git -C "$CORE" rev-parse HEAD)"
@@ -211,7 +228,7 @@ for G in ${GAMES[@]+"${GAMES[@]}"}; do
       echo "$NAME: could not move the scratch worktree's zero-core to $want (it is at ${have:-nothing})"
       SUMMARY+=("FAIL  $NAME: zero-core at this core's HEAD"); FAILED=$((FAILED + 1))
       git -C "$G" worktree remove --force "$WT" >/dev/null 2>&1 || echo "note: remove $WT by hand (git worktree remove --force)"
-      continue
+      return 0
     fi
     ROOT="$WT"
     echo "=== $NAME: worktree $WT with zero-core $CORE_SHA"
@@ -225,13 +242,49 @@ for G in ${GAMES[@]+"${GAMES[@]}"}; do
   else
     [ "${SKIP_CARGO:-0}" != 1 ] && step "$NAME: cargo test" \
       env ${TGT:+CARGO_TARGET_DIR=$TGT} cargo test --release --manifest-path "$ROOT/Cargo.toml" -q
-    step "$NAME: pytest" bash -c "cd '$ROOT' && '$PY' -m pytest tests -q -p no:cacheprovider -W ignore::pytest.PytestWarning --basetemp='$(winpath "$SMOKE_DIR/$STAMP-pytest-$NAME")'"
+    pytest_step "$NAME: pytest" "$ROOT" "$NAME"
     [ "${SKIP_SMOKE:-0}" != 1 ] && step "$NAME: smoke run ($GAME-smoke)" smoke_run "$ROOT" "$PKG" "$GAME-smoke"
   fi
   if [ -n "$WT" ]; then
     git -C "$G" worktree remove --force "$WT" >/dev/null 2>&1 || echo "note: remove $WT by hand (git worktree remove --force)"
   fi
-done
+}
+
+JOBS="${SMOKE_JOBS:-3}"
+if [ "$JOBS" -le 1 ] || [ ${#GAMES[@]} -le 1 ]; then
+  for G in ${GAMES[@]+"${GAMES[@]}"}; do game "$G"; done
+else
+  # SMOKE_JOBS games at once: each in a subshell (its own checkout and target dir), its output and its summary lines
+  # in files, read back in the games' order once all ended (bash 3.2: no `wait -n`, no mapfile)
+  echo "=== ${#GAMES[@]} games, $JOBS at once (SMOKE_JOBS); each game's output follows when all ended"
+  N=0
+  for G in "${GAMES[@]}"; do
+    N=$((N + 1))
+    OUT="$SMOKE_DIR/$STAMP-game$N"
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 2; done
+    (
+      SUMMARY=(); FAILED=0; CHECKED=()
+      game "$G" > "$OUT.log" 2>&1
+      for s in ${SUMMARY[@]+"${SUMMARY[@]}"}; do echo "$s"; done > "$OUT.summary"
+      for s in ${CHECKED[@]+"${CHECKED[@]}"}; do echo "$s"; done > "$OUT.checked"
+      echo "$FAILED" > "$OUT.failed"
+    ) &
+  done
+  wait
+  N=0
+  for G in "${GAMES[@]}"; do
+    N=$((N + 1))
+    OUT="$SMOKE_DIR/$STAMP-game$N"
+    cat "$OUT.log" 2>/dev/null
+    if [ ! -f "$OUT.failed" ]; then          # the subshell died before it wrote its result
+      SUMMARY+=("FAIL  $G: its steps ended without a result ($OUT.log)"); FAILED=$((FAILED + 1)); continue
+    fi
+    while IFS= read -r line; do [ -n "$line" ] && SUMMARY+=("$line"); done < "$OUT.summary"
+    while IFS= read -r line; do [ -n "$line" ] && CHECKED+=("$line"); done < "$OUT.checked"
+    FAILED=$((FAILED + $(cat "$OUT.failed")))
+    rm -f "$OUT.log" "$OUT.summary" "$OUT.checked" "$OUT.failed"
+  done
+fi
 
 echo
 echo "=== smoke_all summary (core $CORE_SHA)"
