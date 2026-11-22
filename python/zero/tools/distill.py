@@ -70,6 +70,15 @@ def shard_list(args):
     return out
 
 
+def _meta_game(meta, game):
+    """A shard meta's game resolved (docs/az.md 73; none recorded: `game`); a bad layout record: its message."""
+    from .. import package
+    try:
+        return package.record_game(meta, default=game)
+    except package.GameAliasError as e:
+        return str(e)
+
+
 def check_shards(paths, features, actions, game=None):
     """Every shard of this build's encoding for `game` (its meta's game, feature and action counts),
     else SystemExit."""
@@ -78,7 +87,7 @@ def check_shards(paths, features, actions, game=None):
     for p in paths:
         with np.load(p) as z:
             meta = json.loads(str(z['meta']))
-        if int(meta.get('features', features)) != features or int(meta.get('actions', actions)) != actions                 or (game and meta.get('game', game) != game):
+        if int(meta.get('features', features)) != features or int(meta.get('actions', actions)) != actions                 or (game and _meta_game(meta, game) != game):
             bad.append(f'{p}: {meta.get("game")!r}, {meta.get("features")} features, {meta.get("actions")} actions')
     if bad:
         raise SystemExit(f'shards of another encoding than this build\'s ({game!r}, {features} features, {actions} actions): '

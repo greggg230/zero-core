@@ -236,7 +236,8 @@ def new_run(src, run, game=None, allow_draft=False, ungated=False):
     layout = package.active().tokens_of(target) if old.config.get('arch') == 'tokens' else None
     new = widen(old, info['num_features'], info['num_actions'], grid=grid, layout=layout, ungated=ungated)
     if game and new.config.get('game') != game:
-        new.config['game'] = game                  # (widen keeps the source's game: the fork plays --game)
+        package.set_game(new.config, game)         # (widen keeps the source's game: the fork plays --game, with its
+        #                                            layout record: docs/az.md 73)
     check_encoding(new.config, target, f'fork of {src}')
     os.makedirs(os.path.join(run, 'models'), exist_ok=True)
     out = os.path.join(run, 'models', 'iter_0000.pt')
@@ -345,6 +346,18 @@ def continuation(source, dest, it=None, overrides=None, copy=False, net=None, al
     for k in overrides or {}:
         if k not in DEFAULTS:
             raise SystemExit(f'--set {k}: unknown setting')
+    # the source's game resolved (docs/az.md 73: a config of an aliased name without its layout record - a run of
+    # before the change - plays the name's old game), and so the fork's: a game given now (--set game=) means the name's
+    # current revision unless --set game_layout= says otherwise
+    try:
+        package.set_game(cfg, package.record_game(cfg, 'fork_run --source', default='toy'))
+        if 'game' in (overrides or {}):
+            g = overrides['game']
+            overrides = dict(overrides)
+            lay = overrides.pop('game_layout', package.active().layout_of(g))
+            package.set_game(overrides, package.resolve_game(g, lay, 'fork_run --set game'))
+    except package.GameAliasError as e:
+        raise SystemExit(str(e)) from None
     # (R16: a draft layout's run continues only where its settings allow it, or --allow-draft)
     check_draft(cfg.get('game', 'toy'), allow_draft or bool(dict(cfg, **(overrides or {})).get('allow_draft_layout')),
                 'fork_run --source')

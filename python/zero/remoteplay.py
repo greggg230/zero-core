@@ -1906,7 +1906,11 @@ class RemotePlay:
         meta = sh['meta']
         info = self.R.info
         want = (self.R.cfg['game'], info['num_features'], info['num_actions'])
-        got = (meta.get('game'), meta.get('features'), meta.get('actions'))
+        try:
+            mg = package.record_game(meta)          # (an aliased name without its layout record: docs/az.md 73)
+        except package.GameAliasError as e:
+            mg = f'{meta.get("game")!r}: {e}'
+        got = (mg, meta.get('features'), meta.get('actions'))
         if got != want:
             h.log(f'shard {name} of iteration {it} REJECTED: game / features / actions {got}, the run\'s {want} '
                   f'(the remote\'s code is not the run\'s?)')
@@ -2542,8 +2546,8 @@ class Worker:
         self._cleanup()
         c = self.cfg
         drv = self.drv
-        meta = {'game': c['game'], 'features': self.info['num_features'], 'actions': self.info['num_actions'],
-                'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid, **shard_format(c, self.info),
+        meta = {'game': c['game'], **package.layout_stamp(c['game']), 'features': self.info['num_features'],
+                'actions': self.info['num_actions'], 'iter': it, 'source': 'remote', 'worker': self.k, 'session': self.sid, **shard_format(c, self.info),
                 **({'remote': self.sp['remote']} if self.sp.get('remote') else {})}   # (a list of hosts: its name)
         box = {}
         writer = ShardWriter(os.path.join(self.rdir, 'data', f'iter_{it:04d}'), self.prefix, rows=int(c['shard_rows']),

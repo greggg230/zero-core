@@ -5,6 +5,11 @@
    "class": "play",
    "why": "the game the worker plays (one the worker build registers)"
   },
+  "game_layout": {
+   "class": "python_only",
+   "off": null,
+   "why": "an aliased game name's layout revision (docs/az.md 73): a worker build from it reads it with game when it picks its game (classify's LAYOUT_KEY: play); python_only here so that builds before it, by the run's declared classes, refuse a truthy one (a revision they cannot play) and play a null one as before"
+  },
   "spec": {
    "class": "play",
    "why": "the self-play games' spec (zero.games.spec_json: a dict json.dumps'd)"
