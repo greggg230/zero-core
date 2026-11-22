@@ -135,7 +135,7 @@ FUSED_DOMAIN = 'zero.onnx'
 # CUDA kernel of opset 19-23's versions of a dozen operators, which then run on the CPU); 'fast-matmul' the MatMul form
 GRAPHS = {'': (None, False), 'fast': ('mha', True), 'fast-att23': ('attention23', True), 'fast-matmul': ('matmul', True),
           'static': ('mha', 'static'),        # (docs/az.md 67: no data-dependent shape, for the GPU)
-          'fast-fixed': ('mha', 'fixed')}     # (docs/az.md 77: the fast graph at fixed capacities, for CUDA graphs)
+          'fast-fixed': ('mha', 'fixed')}     # (docs/az.md 79: the fast graph at fixed capacities, for CUDA graphs)
 
 
 def graph_options(graph):
@@ -881,7 +881,7 @@ class ZeroOnnx2(ZeroOnnx):
 
     # the override targets' match (0 / 1) is ArgMax'ed in this dtype: int64 here, as every graph before; the static
     # graph's in float32 (the same first index of the largest), which ONNX Runtime's CUDA provider runs - its ArgMax has no
-    # int64 kernel, so an int64 ArgMax is the static graph's only CPU node (docs/az.md 76)
+    # int64 kernel, so an int64 ArgMax is the static graph's only CPU node (docs/az.md 78)
     ARGMAX_DTYPE = torch.int64
     # a block of zeros appended to the policy before a scatter: as a Concat with zeros (every graph before), or as a Pad
     # of the policy (the fast graph: the same tensor; ONNX Runtime's CUDA host time of those two Concats was ~20 % of a
@@ -1791,7 +1791,7 @@ FIXED_INPUTS = ('s_cap', 'm_cap', 't_cap')
 
 
 class ZeroOnnx2FastFixed(ZeroOnnx2Fast):
-    """The fast graph at fixed capacities (`export(..., fast='fixed')`, graph 'fast-fixed', docs/az.md 77): the fast
+    """The fast graph at fixed capacities (`export(..., fast='fixed')`, graph 'fast-fixed', docs/az.md 79): the fast
     graph's arithmetic - the per-token layers on the packed token list, the attention on rows padded to T - with every
     size an input's. Three more inputs whose lengths only are read: `s_cap` [S] (the batch's present head slots, the
     global tokens aside, at most), `m_cap` [MR] (a row's non-zeros in one run of features - `run_ranges`, the
@@ -2203,7 +2203,7 @@ def metadata2(net, extra=None, attention=None, fast=False, runs=None):
         meta['presence'] = json.dumps([int(i) for i in net.present_index()])
         meta['t_align'] = str(T_ALIGN)
     elif fast == 'fixed':
-        # (docs/az.md 77: ZeroOnnx2FastFixed's graph - its capacity inputs, and what a feeder computes them from: the
+        # (docs/az.md 79: ZeroOnnx2FastFixed's graph - its capacity inputs, and what a feeder computes them from: the
         # head positions' present flags and the multiple it rounds T up to (the static graph's), the runs of features
         # [lo, hi) a row's non-zeros are read in (MR: a row's most in one of them))
         meta['fixed'] = '1'
@@ -2425,7 +2425,7 @@ def _export_module(net, packing='packed', attention=None, fast=False):
                     list(OUTPUTS2), dict(dynamic_shapes2(), t_cap={0: torch.export.Dim('T', min=2, max=1 << 20)}),
                     lambda extra: metadata2(net, extra, attention=attention, fast=fast))
         if fast == 'fixed':
-            # (docs/az.md 77: its capacities as three inputs whose lengths only are read - the present head slots S, a
+            # (docs/az.md 79: its capacities as three inputs whose lengths only are read - the present head slots S, a
             # row's non-zeros in a run MR, the padded rows' tokens T -, traced with room for every example row and
             # every size distinct from the others')
             mod = ZeroOnnx2FastFixed(net, packing, attention).eval()

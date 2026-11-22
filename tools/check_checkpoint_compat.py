@@ -16,6 +16,13 @@ whose engine computes auxiliary targets has them recorded and hashed too (docs/a
 The checkpoint and the checkouts are only read (Python bytecode is not written). The game and
 spec default to the checkpoint's game and the game's 2p spec ('{"intro": false}' Glass Road,
 '{"full": true}' Caverna) - pass --spec to override. Extra arguments go to selfplay_digest.py.
+
+**At once** (docs/az.md 75.1): a side's digests are independent of each other - each policy target's self-play and the
+match is its own driver with its own fixed seed, on an evaluator built the same way in every process - so each is its
+own selfplay_digest.py process (`--targets <one> --match-games 0`, and `--targets '' --match-games N`), and both
+sides' processes run together, --jobs at a time (default: all of them, 6 for the two targets and the match). Each
+digest is the one the one-process-per-side run computes (tests/test_checkpoint_compat.py compares the two ways);
+`--jobs 1` is that run: one process per side, one side after the other.
 """
 import argparse
 import json
@@ -23,6 +30,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPECS = {'glassroad': '{"intro": false}', 'caverna': '{"full": true}'}
@@ -38,6 +46,32 @@ def digest(root, package, args):
         raise SystemExit(f'{root}: selfplay_digest failed ({p.returncode}):\n{p.stdout}\n{p.stderr}')
     out = json.loads(p.stdout.strip().splitlines()[-1])
     out['seconds'] = round(time.time() - t0, 1)
+    return out
+
+
+def phases(targets, match_games):
+    """A side's independent digests as selfplay_digest.py arguments: one per policy target (no match), then the match
+    (no target)."""
+    out = [['--targets', t, '--match-games', '0'] for t in targets]
+    if match_games > 0:
+        out.append(['--targets', '', '--match-games', str(match_games)])
+    return out
+
+
+def merge(parts):
+    """One side's phase outputs (in `phases` order) -> the output of one process that ran them all: the first's
+    fields, every target, the match. The phases must agree on what they ran (game, spec, evaluator, engine)."""
+    out = dict(parts[0])
+    out['targets'] = {}
+    out.pop('match', None)
+    for r in parts:
+        for k in ('game', 'spec', 'evaluator', 'engine', 'root'):
+            if r.get(k) != out.get(k):
+                raise SystemExit(f'{out.get("root")}: its digest processes disagree on {k}: {out.get(k)} != {r.get(k)}')
+        out['targets'].update(r['targets'])
+        if r.get('match'):
+            out['match'] = r['match']
+    out['seconds'] = round(max(r['seconds'] for r in parts), 1)
     return out
 
 
@@ -64,6 +98,10 @@ def main(argv=None):
     ap.add_argument('--net', default='random', choices=('uniform', 'random'))
     ap.add_argument('--game', default=None)
     ap.add_argument('--spec', default=None)
+    ap.add_argument('--targets', default='visits,cq', help='the policy targets to play and digest (selfplay_digest.py\'s)')
+    ap.add_argument('--match-games', type=int, default=16, help='games against the random bot (0: no match)')
+    ap.add_argument('--jobs', type=int, default=0, help='digest processes at once (default 0: all of them - every '
+                    'target and the match of both sides; 1: one process per side, one side after the other)')
     a, extra = ap.parse_known_args(argv)
     args = list(extra)
     game = a.game
@@ -76,9 +114,21 @@ def main(argv=None):
     game = game or 'toy'
     spec = a.spec if a.spec is not None else SPECS.get(game, '')
     args += ['--game', game, '--spec', spec]
+    targets = [t for t in a.targets.split(',') if t]
+    sides = (('old', os.path.abspath(a.old)), ('new', os.path.abspath(a.new)))
+    plan = phases(targets, a.match_games)
     res = {}
-    for side, root in (('old', a.old), ('new', a.new)):
-        res[side] = digest(os.path.abspath(root), a.package, args)
+    if a.jobs == 1 or len(plan) <= 1:
+        for side, root in sides:
+            res[side] = digest(root, a.package, [*args, '--targets', ','.join(targets), '--match-games',
+                                                 str(a.match_games)])
+    else:
+        # every digest of both sides at once (threads only wait on their processes); a failed one ends the run
+        with ThreadPoolExecutor(max_workers=a.jobs if a.jobs > 0 else 2 * len(plan)) as pool:
+            jobs = {side: [pool.submit(digest, root, a.package, [*args, *ph]) for ph in plan] for side, root in sides}
+            for side, _ in sides:
+                res[side] = merge([j.result() for j in jobs[side]])
+    for side, _ in sides:
         r = res[side]
         print(f'{side}: {r["root"]} ({r["seconds"]} s; engine {r["engine"]})', flush=True)
         for t, d in r['targets'].items():

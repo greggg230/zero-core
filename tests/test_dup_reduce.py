@@ -170,6 +170,22 @@ def test_max_is_deterministic_on_cuda_and_matches_the_cpu():
             assert all(np.array_equal(u, v) for u, v in zip(f, fast.evaluate(x, npl, off, act, kind)))
 
 
+@pytest.mark.skipif(not CUDA, reason='CUDA')
+@pytest.mark.parametrize('dup', [None, 'max'])
+def test_the_eager_evaluator_on_cuda_answers_the_same_bits_every_call(dup):
+    """NetEvaluator's eager path on CUDA softmaxes each leaf's options on the device; a leaf's sum of its options
+    used to be an index_add_, which on CUDA adds in whatever order its threads run, so a prior's last bit changed
+    from call to call - in either mode, more often the bigger the batch (docs/az.md 76). 300 calls, one answer."""
+    import copy
+    m = net()
+    set_dup_reduce(m, dup)
+    ev = NetEvaluator(copy.deepcopy(m).cuda(), 'cuda', graphs=False)
+    x, npl, off, act, kind = a_batch(m, 400, 7)
+    first = ev.evaluate(x, npl, off, act, kind)
+    for _ in range(300):
+        assert all(np.array_equal(u, v) for u, v in zip(first, ev.evaluate(x, npl, off, act, kind)))
+
+
 # ------------------------------------------------------------------ the ONNX export (farm workers)
 
 @pytest.mark.parametrize('packing', ['mask', 'packed'])

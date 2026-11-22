@@ -1,4 +1,4 @@
-"""The fast graph at fixed capacities (docs/az.md 77: `zero.onnx_export.ZeroOnnx2FastFixed`, `export(..., fast='fixed')`,
+"""The fast graph at fixed capacities (docs/az.md 79: `zero.onnx_export.ZeroOnnx2FastFixed`, `export(..., fast='fixed')`,
 graph 'fast-fixed'): the fast graph's arithmetic with every size an input's - `s_cap` (the present head slots), `m_cap`
 (a row's non-zeros in a run of features), `t_cap` (a row's tokens) - for ONNX Runtime's CUDA graphs. Its answers are
 torch's (`zero.onnx_parity`, eager and forward_static) within 2e-5 on the toy's layouts and a richer one (fed the

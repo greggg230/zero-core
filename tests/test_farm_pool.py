@@ -1116,7 +1116,7 @@ def test_transient_errors_keep_retrying(pool, monkeypatch):
 
 
 def test_variant_forms_export_their_graph(tmp_path, monkeypatch):
-    """docs/az.md 77: a re-exported variant form exports the gen's checkpoint as its graph (`_REEXPORT`: 'fixed-fp16' /
+    """docs/az.md 79: a re-exported variant form exports the gen's checkpoint as its graph (`_REEXPORT`: 'fixed-fp16' /
     'fixed' graph 'fast-fixed', 'matmul-fp16' / 'matmul' graph 'fast-matmul') and the '-fp16' forms convert it to
     float16; 'fp16' converts the gen's graph."""
     from zero import farm_h2h as FH, onnx_export as OX
