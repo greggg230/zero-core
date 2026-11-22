@@ -9916,3 +9916,36 @@ bit for bit (64 and 256 rows of its reference set).
 released export): a call's thread CPU 16.4 -> 14.8 ms at 352 rows, 23.8 -> 18.4 ms at 575; a crew of 3 x 1,150 games
 in flight in two groups 28.2k -> 30.9k / 31.0k leaves/s (two 5-minute windows, the control in the same session; the
 trainer's own path there 32.9k).
+
+## 74. Tests in parallel: `tools/pytest_shards.py`, and `smoke_all.sh` runs its games at once (2026-11-22)
+
+**Why.** The Python suite is ~850 mostly single-threaded tests (torch at one thread, 7): about 35 minutes of test time
+in one process beside live runs (2,096 s summed over one run's junit files; 44 and 52 minutes of wall time in two runs
+of the day), `tests/test_remoteplay.py` a quarter of it and no single test over 35 s - nothing to fix in one place, so
+the suite is split. `tools/smoke_all.sh` ran its games one after the other, each in its own checkout and target dir.
+
+**What it does.** `python tools/pytest_shards.py [--shards 4] [--root <repo>] [--retry-alone <file>] [-- pytest
+args]` (its docstring is the manual): the repo's `tests/**/test_*.py` in N pytest processes at once over disjoint
+parts, balanced by each test's seconds from earlier runs (`~/.config/zero/pytest_durations/<repo>.json`, shared by a
+repo's checkouts; a file without one by its size; a file longer than a shard's share is split by its tests), the plan
+checked to run every test exactly once before anything starts; each shard its own `--basetemp`, junit file and log.
+The result is read from the junit files: exit 0 and "pytest shards: PASSED - N shard(s), X passed, Y skipped in T s"
+only when every shard exited 0, ran a test and at least one test passed; else "FAILED - ..." naming the failed tests.
+`--retry-alone tests/test_remoteplay.py` reruns that file's failures alone once when they are a shard's only ones
+(AGENTS.md: it times real threads) and names them in the last line; an error or any other failure fails the run.
+Standard library only. `--plan` prints the shards.
+
+`tools/smoke_all.sh` runs the core's pytest and each game's through it (`SMOKE_PYTEST_SHARDS`, default 4; 1 = one
+plain `pytest tests` as before; the core's with the retry above) and `SMOKE_JOBS` games at once (default 3; 1 = one
+after the other): each game in a subshell, its output printed whole and its summary lines read back in the games'
+order once all ended; a game whose subshell ended without a result is a FAIL line.
+
+**Costs.** Shards share the machine: a test that times real threads is likelier to fail beside three other shards
+(hence the retry). Tests that share something outside their `tmp_path` would collide between shards; none was found
+(the suite passed in four shards, below). Several games building at once take that many times the build's memory and
+cores.
+
+**Tests and checks.** `tests/test_pytest_shards.py` (the plan: every file once, a measured file split by its tests,
+plans that would skip or repeat tests refused; end to end with real pytest processes on trivial tests: a pass and its
+recorded durations, a failure named and not recorded, a setup error never retried, no test is not a pass, a failure that
+passes alone / fails alone / is in an unnamed file); `tests/test_smoke_all.py` unchanged and passing.
