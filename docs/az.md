@@ -9677,6 +9677,30 @@ session and provider options changed nothing.
 set); ONNX Runtime captures the fixed static fp16 graph on CUDA once its ArgMax is float32; unit tests of the tail
 padding plan and the padded sizes (`cudagraph::tests`).
 
-**Measured** (to be completed: the PC was shared during the first timing). Contended first timing, fp16, per call at
-352 / 575 rows: fast graph 36.7 / 51.9 ms, static graph (dynamic) 37.2 / 45.1, static fixed 34.3 / 42.5, **static
-fixed + CUDA graph 17.4 / 27.4 ms**.
+**Measured** (a farm PC: 4 cores / 8 threads, an NVIDIA GPU; gen 769 of a live run, fp16, real rows; the trainer's
+own path there 32.9k leaves/s).
+
+| | 352 rows | 575 rows | 1,024 rows |
+|---|---|---|---|
+| fast graph, one call (ms wall / thread CPU) | 16.4 / 16.2 | 21.8 / 21.6 | 33.3 / 33.1 |
+| static graph, fixed bucket, CUDA graph replay (ms, ~ its GPU time) | 14.3 | 27.0 | 56.5 |
+
+The answers are within the fp16 self-test (priors / value / margin / aux at most 5e-3 / 1.1e-2 / 1.5e-2 / 3.4e-3 off
+the fast graph's), deterministic, with no refusal. The worker's buckets pass its CUDA self-test (max abs 6.2e-3) and
+play: one worker of 704 games in flight 12.3k leaves/s at 31 % of the CPU - but a crew of 3 x 1,150 is **GPU-bound at
+9.8k (96 % busy)**, against 28.2k for the fast graph: the static graph's blocks run on every row padded to T tokens.
+So the static graph is not the CUDA-graph route; a packed graph of fixed capacity is (the fast graph's arithmetic with
+the packed token list's length an input-sized capacity - a cumsum and a scatter into N slots instead of NonZero), which
+the buckets here would run as they are.
+
+Pitfalls: pinned host buffers bound directly as a CUDA graph's inputs gave wrong answers (every real row refused) -
+device buffers with staging copies (ort's `Tensor::copy_into`) work; the self-test's small pieces need padding rows
+with tail slots enough (at least 16); bucket capacities grow while games ramp up (32 builds of ~0.55 s in a 2-minute
+single-worker run).
+
+**The fast graph's zeros as Pads** (`ZeroOnnx2Fast.PAD_ZEROS`, the same commit series): its two policy-scatter
+Concats with a block of zeros (the generic logits + the spare places; the overrides' spare places) are Pads of the same
+tensor. ONNX Runtime's node profile put those Concats at ~20 % of a CUDA call's host time. Measured on the PC above:
+a call's thread CPU 16.4 -> 14.8 ms at 352 rows, 23.8 -> 18.4 ms at 575; a crew of 3 x 1,150 in two groups 28.2k ->
+30.9k / 31.0k leaves/s (two 5-minute windows, the control in the same session). CPU answers bit for bit the earlier
+graph's (64 and 256 rows); every other graph keeps its Concats, byte for byte.
