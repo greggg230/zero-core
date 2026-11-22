@@ -11,7 +11,7 @@
 #   bash tools/smoke_all.sh --core-only             # the core's own steps, deliberately no game (or SKIP_GAMES=1)
 #   bash tools/smoke_all.sh --dry-run [...]         # print the plan (core steps, each game and where it was found), run nothing
 #
-# Faster (docs/az.md 74): every pytest suite runs through tools/pytest_shards.py in SMOKE_PYTEST_SHARDS processes
+# Faster (docs/az.md 75): every pytest suite runs through tools/pytest_shards.py in SMOKE_PYTEST_SHARDS processes
 # over disjoint parts of the tests (default 4; 1 = one plain `pytest tests`), the core's with tests/test_remoteplay.py's
 # failures rerun alone once; and SMOKE_JOBS games run at once (default 3; 1 = one after the other), each in its own
 # checkout and target dir, its output printed whole when it ends.

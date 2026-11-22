@@ -1,4 +1,4 @@
-"""pytest in parallel shards (docs/az.md 74): a repo's `python -m pytest tests` as N processes over disjoint parts of
+"""pytest in parallel shards (docs/az.md 75): a repo's `python -m pytest tests` as N processes over disjoint parts of
 the tests, run at once - for this repo and for every game repo (tools/smoke_all.sh runs each suite through it).
 
     python tools/pytest_shards.py                        # this checkout's tests/, 4 shards

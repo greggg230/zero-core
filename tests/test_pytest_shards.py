@@ -1,4 +1,4 @@
-"""tools/pytest_shards.py (docs/az.md 74): the plan runs every test exactly once, the result is read from the shards'
+"""tools/pytest_shards.py (docs/az.md 75): the plan runs every test exactly once, the result is read from the shards'
 junit files, a failure fails the run, a named file's failure is rerun alone, and the durations are recorded. The
 end-to-end cases run real pytest processes on a few trivial tests in a temp directory."""
 import importlib.util

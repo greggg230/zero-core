@@ -9917,7 +9917,7 @@ released export): a call's thread CPU 16.4 -> 14.8 ms at 352 rows, 23.8 -> 18.4 
 in flight in two groups 28.2k -> 30.9k / 31.0k leaves/s (two 5-minute windows, the control in the same session; the
 trainer's own path there 32.9k).
 
-## 74. Tests in parallel: `tools/pytest_shards.py`, and `smoke_all.sh` runs its games at once (2026-11-22)
+## 75. Tests in parallel: `tools/pytest_shards.py`, and `smoke_all.sh` runs its games at once (2026-11-22)
 
 **Why.** The Python suite is ~850 mostly single-threaded tests (torch at one thread, 7): about 35 minutes of test time
 in one process beside live runs (2,096 s summed over one run's junit files; 44 and 52 minutes of wall time in two runs

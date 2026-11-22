@@ -12,7 +12,7 @@ export CARGO_TARGET_DIR="$PWD/target"   # one target dir per checkout (see "Pitf
 export RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup"   # macOS only (no build.rs adds them)
 bash tools/build_py.sh                  # builds python/zero/_engine (the toy games); rerun after any Rust change
 cargo test                              # zero_search + zero_webnet, ~15 s
-python tools/pytest_shards.py --retry-alone tests/test_remoteplay.py   # the whole suite in 4 processes (docs/az.md 74)
+python tools/pytest_shards.py --retry-alone tests/test_remoteplay.py   # the whole suite in 4 processes (docs/az.md 75)
 python -m pytest tests -q -k <name>     # while iterating (the whole suite in one process: ~10 min idle, far more beside a run)
 PYTHONPATH=python python -m zero.run --run runs/toy-smoke --preset toy-smoke    # end-to-end loop, ~5 s
 ```
