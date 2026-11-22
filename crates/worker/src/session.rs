@@ -1125,13 +1125,16 @@ fn self_test(s: &mut InferenceSession, r: &crate::selftest::Reference, fallback:
 }
 
 /// Create the session a job evaluates with (the module docs; PROTOCOL.md 8).
-/// A static graph's CUDA-graph buckets when they are wanted (`cudagraph::wanted`) and possible: a CUDA session of a
-/// static graph whose metadata names its tails.
+/// A static or fixed graph's CUDA-graph buckets when they are wanted (`cudagraph::wanted`: a fixed graph's by default)
+/// and possible: a CUDA session of such a graph whose metadata names its tails.
 fn graph_cache(s: &InferenceSession) -> Option<crate::cudagraph::Cache> {
-    if !crate::cudagraph::wanted() || s.provider != ProviderKind::Cuda {
+    if s.provider != ProviderKind::Cuda {
         return None;
     }
     let st = s.static_tok.as_ref()?;
+    if !crate::cudagraph::wanted(st.fixed(), std::env::var(crate::cudagraph::ENV).ok().as_deref()) {
+        return None;
+    }
     let ord = match &s.binding {
         Binding::Named(ProviderKind::Cuda, o) => *o as i32,
         _ => return None,
@@ -1144,7 +1147,7 @@ fn graph_cache(s: &InferenceSession) -> Option<crate::cudagraph::Cache> {
         }
     };
     let kind = if st.fixed() { "fixed" } else { "static" };
-    eprintln!("[zero-worker] {}=1: the {kind} graph's calls replay CUDA graphs (buckets of fixed shapes)", crate::cudagraph::ENV);
+    eprintln!("[zero-worker] the {kind} graph's calls replay CUDA graphs (buckets of fixed shapes; {}=0 turns them off)", crate::cudagraph::ENV);
     Some(crate::cudagraph::Cache { path: s.path.clone(), ord, tails, actions: s.actions, aux_w: s.aux_w, pad_features: st.pad_features(), always_extra: st.always - 1, buckets: Vec::new(), built: 0, tick: 0 })
 }
 

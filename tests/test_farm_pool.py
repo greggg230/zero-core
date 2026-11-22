@@ -451,6 +451,8 @@ def test_pool_variants_are_exported_uploaded_signed_registered_and_named(pool, m
     vs = FP.variant_setting('gpu=fp16,dml=matmul-fp16@amd')
     assert vs == [('gpu', 'fp16', None), ('dml', 'matmul-fp16', 'amd')]
     assert FP.variant_setting('gpu=fp16,dml=matmul@amd') == [('gpu', 'fp16', None), ('dml', 'matmul', 'amd')]
+    assert FP.variant_setting('gpu=fixed-fp16@nvidia,dml=matmul@amd') == [('gpu', 'fixed-fp16', 'nvidia'),
+                                                                          ('dml', 'matmul', 'amd')]
     assert (FP.variant_of(vs, 'amd'), FP.variant_of(vs, 'nvidia'), FP.variant_of(vs, 'intel')) == ('dml', 'gpu', 'gpu')
     only = FP.variant_setting('dml=matmul-fp16@amd')
     assert (FP.variant_of(only, 'amd'), FP.variant_of(only, 'nvidia')) == ('dml', None)
@@ -1111,3 +1113,42 @@ def test_transient_errors_keep_retrying(pool, monkeypatch):
     finally:
         p.close()
         p.th.join(10)
+
+
+def test_variant_forms_export_their_graph(tmp_path, monkeypatch):
+    """docs/az.md 76: a re-exported variant form exports the gen's checkpoint as its graph (`_REEXPORT`: 'fixed-fp16' /
+    'fixed' graph 'fast-fixed', 'matmul-fp16' / 'matmul' graph 'fast-matmul') and the '-fp16' forms convert it to
+    float16; 'fp16' converts the gen's graph."""
+    from zero import farm_h2h as FH, onnx_export as OX
+    calls = []
+
+    def export_cached(ckpt, gen, out_dir, game, spec, cache_dir, ckpt_id, checkpoint_iter=None, graph=''):
+        os.makedirs(out_dir, exist_ok=True)
+        m = os.path.join(out_dir, 'model.onnx')
+        open(m, 'wb').write(graph.encode())
+        calls.append(('export', graph))
+        return {'model': m}
+
+    def to_float16(src, dst):
+        open(dst, 'wb').write(b'fp16 ' + open(src, 'rb').read())
+        calls.append(('fp16', os.path.basename(src)))
+    monkeypatch.setattr(FH, 'export_cached', export_cached)
+    monkeypatch.setattr(OX, 'to_float16', to_float16)
+    from zero import games as G
+    monkeypatch.setattr(G, 'spec_json', lambda s: s)
+
+    class R:
+        cfg = {'game': 'toy', 'spec': ''}
+    pool = FP.Pool.__new__(FP.Pool)
+    pool.R, pool.dir, pool.farm = R(), str(tmp_path), 'f'
+    src = tmp_path / 'model.onnx'
+    src.write_bytes(b'gen')
+    want = {'fixed-fp16': b'fp16 fast-fixed', 'fixed': b'fast-fixed', 'matmul-fp16': b'fp16 fast-matmul',
+            'matmul': b'fast-matmul', 'fp16': b'fp16 gen'}
+    for form, body in want.items():
+        dst = tmp_path / f'model-{form}.onnx'
+        pool._make_variant(form, str(src), str(dst), ckpt='ck.pt', gen=3)
+        assert dst.read_bytes() == body, form
+    assert set(FP._REEXPORT) | {'fp16'} == set(FP.VARIANT_FORMS)
+    with pytest.raises(ValueError, match='variant form'):
+        pool._make_variant('nope', str(src), str(tmp_path / 'x.onnx'))

@@ -17,7 +17,9 @@
 //! and outputs (IoBinding at fixed addresses: the replay copies from and to them), so a call is: the padded piece
 //! written into the input buffers, one replay, the real rows read from the output buffers.
 //!
-//! Opt-in while it is measured: `ZERO_WORKER_CUDA_GRAPHS=1` and a static graph on the CUDA provider.
+//! When: a fixed graph (below) on the CUDA provider always - the run opts in by sending it (its pool variant 'fixed-fp16',
+//! zero-core docs/az.md 76); a static graph only with `ZERO_WORKER_CUDA_GRAPHS=1` (a measurement's); `ZERO_WORKER_CUDA_GRAPHS=0`
+//! turns them off for either (`wanted`).
 //!
 //! The fixed graph (zero-core docs/az.md 76: the fast graph's arithmetic at fixed capacities) takes the same buckets
 //! with two capacities more: the batch's present head slots (`s`) and a row's non-zeros in a run of features (`mr`).
@@ -30,7 +32,7 @@ use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, Memory
 use ort::session::{IoBinding, Session};
 use ort::value::Tensor;
 
-/// The environment variable that turns the buckets on (`1`).
+/// The environment variable that turns the buckets on for a static graph (`1`) or off for any graph (`0`).
 pub const ENV: &str = "ZERO_WORKER_CUDA_GRAPHS";
 
 /// Buckets a session keeps at most (each holds its own activations on the GPU); the least recently used goes.
@@ -40,8 +42,14 @@ pub const MAX_BUCKETS: usize = 4;
 /// masked: the same answers up to float rounding), so that pieces whose longest row varies reuse buckets.
 pub const T_SLACK: usize = 32;
 
-pub fn wanted() -> bool {
-    std::env::var(ENV).as_deref() == Ok("1")
+/// The buckets for a graph on the CUDA provider: a fixed graph's (`fixed`) unless `ZERO_WORKER_CUDA_GRAPHS` is `0`; a
+/// static graph's only when it is `1` (`env`: the variable's value, if set).
+pub fn wanted(fixed: bool, env: Option<&str>) -> bool {
+    match env {
+        Some("0") => false,
+        Some("1") => true,
+        _ => fixed,
+    }
 }
 
 /// A piece's sizes, or a bucket's capacities.
@@ -619,6 +627,12 @@ mod tests {
     fn tails() -> Tails {
         // the legacy network's: segments 2, 3 (281 floats, 32 slots), 4 (64, 16), 5 (438, 8), 6 (271, 4), 7 (64, 64), 8 (56, 4)
         Tails(vec![(2, 281, 32), (3, 281, 32), (4, 64, 16), (5, 438, 8), (6, 271, 4), (7, 64, 64), (8, 56, 4)])
+    }
+
+    #[test]
+    fn a_fixed_graph_replays_cuda_graphs_unless_turned_off() {
+        assert!(wanted(true, None) && wanted(true, Some("")) && wanted(true, Some("1")) && !wanted(true, Some("0")));
+        assert!(!wanted(false, None) && wanted(false, Some("1")) && !wanted(false, Some("0")));
     }
 
     #[test]
