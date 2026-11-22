@@ -100,6 +100,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | Setting | Default | Meaning |
 |---|---|---|
 | `game`, `spec`, `players` | toy, '', [2] | registered game, its JSON spec, player counts sampled per self-play game |
+| `game_layout` | None | the layout revision of a game whose NAME changed meaning (`GamePackage.game_aliases`): recorded at a run's first start, never from a preset; None for every other game; a config naming an aliased name without it is the name's old game (section 73) |
 | `iters`, `games` | 40, 1000 | iterations; self-play games per iteration (rolling: games FINISHED per iteration; with `selfplay_remote`: finished across every machine, section 5.3) |
 | `rolling` | 0 | 1 = one persistent driver keeps `conc` games in flight across iterations (docs/search.md 2.6) |
 | `conc`, `threads`, `groups`, `torch_threads` | 256, 4, 2, 1 | games in flight, search threads, batches in flight, torch intra-op threads (keep 1, section 7) |
@@ -9811,3 +9812,58 @@ of 46 / 46 / 44 games, mean gap 0.007-0.011, no merges (the toy has no merge key
 turns): 80 branches, 10 merged (12.5%) after 2.4 decisions on average (24 rows), the other 70 played to the end
 (204 rows). On MTG Zero nothing measured yet but the farm checks of 72.6: its `merge_key` / `branch_alt_ok` hooks are
 its own change, and the A/B is its B2 step 2.
+
+## 73. Game aliases: a game name whose meaning changed (`GamePackage.game_aliases`, the run setting `game_layout`; MTG Zero's layout v8, 2026-11-22)
+
+**Why.** A game package may want its game's NAME to mean a new layout from now on (MTG Zero: `mtg` = layout v8 for
+every new run) while every run, checkpoint, shard, records file, farm job and evaluation record made before names the
+same game and means the old layout. The core picks token layouts, aux targets, engine games and specs by name, and the
+encoding guard compares a checkpoint's recorded game with the game it is loaded as, so a plain rename would move old
+runs onto the new layout (refused by the guard at best). An alias makes "the name + a layout record" the new game and
+"the name without one" the old game, everywhere the core reads a game name - no old file rewritten.
+
+**What it does.**
+* `GamePackage(game_aliases={'mtg': {'layout': 8, 'before': 'mtg_v7'}})`: the game `mtg` is layout revision 8; a
+  record naming `mtg` without a layout record is the game `mtg_v7` (both registered by the package's engine, keyed by
+  these names in its tables). `resolve_game(name, layout)`: an aliased name without a record -> its `before`, with its
+  revision -> the name, any other record -> refused (`GameAliasError`); a record on a name that never changed ->
+  refused. `layout_stamp(game)` / `set_game(d, game)` write a resolved game with its record (`game_layout`: only for an
+  aliased name - every other game's files exactly as before); `record_game(d)` reads one.
+* **In a process every game name is the resolved one.** Read boundaries resolve: `zero.run.resolve_config`
+  (`resolve_run_game`: the saved config's record when the game is the saved config's - none: the old game, an old run
+  resumes as it was; a first start, or another game given now: the name's current revision; `--game-layout N` moves a
+  run explicitly, then the guard decides on its checkpoints; a co-training resolver's game the same way, its record in
+  `resolver_cfg`), `net.build` / `load` / the encoding guard (`config_game`: a network config's `game` with its
+  `game_layout`), the held-out set's shards, a remote's shards (`RemotePlay`), the farm pool's records headers, an
+  archive (`selfplay_archive`), zero.farm_h2h's settings, zero.h2h's run settings, the distill tool's shards, a
+  failure's replay, `tools/fork_run.py` (a continuation's source config; `new_run --game` stamps the fork).
+* **What is written carries the record**: run configs (the setting `game_layout`, set by `resolve_run_game`), network
+  configs (`net.stamp_game`: `make_net`, `build`, `fork_run`), the ONNX graph's and the reference set's metadata
+  (`game_layout`), shard metas (the run's, a remote's, the pool's), h2h results, failure records; the native worker's
+  shard metas, records headers and failure files (`GameEntry::stamp`).
+* **Presets and package defaults may not set `game_layout`** (`apply_package` refuses): presets fill a resumed run's
+  missing settings, and would move an old run onto the new layout.
+* **The worker** (`zero_worker`): `GameEntry::of::<G>("mtg").layout(8)`, `GameEntry::of::<G7>("mtg_v7").before_of("mtg")`;
+  `resolve_game` picks a job's game from its settings' `game` and `game_layout` (`game_of`; the same rule), `classify`
+  checks the settings resolved onto the picked entry (`LAYOUT_KEY` is play), a graph or a reference set is the job's
+  game by name and record (`Expect::game_problem`: a graph exported before the change, named `mtg` without a record,
+  is `mtg_v7`'s). **Builds before it**: `run_settings.json` classes `game_layout` python_only (off: null), so by a
+  run's declared setting classes (section 61) a build that does not know the key plays a null one as before and
+  refuses a truthy one at `check-config` - a run of the new revision is never played by a build that would play the
+  old game under its name (and its graphs fail that build's tail check anyway).
+
+**Off by default.** No package declares an alias; `game_layout` is None and absent from every network config, graph,
+shard and header of an unaliased game: the toy's and every other game's runs exactly as before (the run config gains
+the key `game_layout: null`, as with any new setting).
+
+**Costs.** None at run time (a dict lookup per read).
+
+**Tests and checks.** `tests/test_game_alias.py` (the stand-in alias `toy_match` rev 1 / before `toy`: the rule, the
+table check, a run's game across first start / resume / an old config / an explicit move / a bad record, presets
+refused, a checkpoint of before the change loading as the old game and refused as the new, a new network's record,
+fork_run's stamp, records); the worker's `resolve_game`, `Expect::game_problem` and `classify` tests (a build before it:
+null off, a revision unsupported). End to end on the toy (scratch, 2026-11-22): a 2-iteration toy-smoke run of the
+aliased `toy_match` writes `game_layout` 1 into its config, shards and checkpoints; a toy run whose files were renamed
+to `toy_match` without records (a run of before) resumes to iteration 3 as `toy` with no record written.
+
+**Measured.** Nothing to measure (no run setting changes play).
