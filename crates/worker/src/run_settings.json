@@ -701,7 +701,7 @@
   "selfplay_branch": {
    "class": "python_only",
    "off": 0.0,
-   "why": "branched games: set up and tallied by zero/forks.py (Python only)"
+   "why": "branched games (both rules, docs/az.md 24 and 72): the native worker plays them in shards jobs (settings.rs branch_of, the shared driver), but a game record cannot replay a branch game yet (records/1 has no branch prefix nor a merged branch's outcome), and the farm pool ingests records only: docs/az.md 72.7"
   },
   "selfplay_archive": {
    "class": "python_only",
@@ -739,6 +739,36 @@
    "why": "a setting of selfplay_branch (unused while it is off)"
   },
   "selfplay_branch_differ": {
+   "class": "param",
+   "of": "selfplay_branch",
+   "why": "a setting of selfplay_branch (unused while it is off)"
+  },
+  "selfplay_branch_rule": {
+   "class": "param",
+   "of": "selfplay_branch",
+   "why": "a setting of selfplay_branch (unused while it is off)"
+  },
+  "selfplay_branch_eps": {
+   "class": "param",
+   "of": "selfplay_branch",
+   "why": "a setting of selfplay_branch (unused while it is off)"
+  },
+  "selfplay_branch_n_min": {
+   "class": "param",
+   "of": "selfplay_branch",
+   "why": "a setting of selfplay_branch (unused while it is off)"
+  },
+  "selfplay_branch_p_min": {
+   "class": "param",
+   "of": "selfplay_branch",
+   "why": "a setting of selfplay_branch (unused while it is off)"
+  },
+  "selfplay_branch_q_lo": {
+   "class": "param",
+   "of": "selfplay_branch",
+   "why": "a setting of selfplay_branch (unused while it is off)"
+  },
+  "selfplay_branch_q_hi": {
    "class": "param",
    "of": "selfplay_branch",
    "why": "a setting of selfplay_branch (unused while it is off)"

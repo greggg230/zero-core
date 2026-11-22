@@ -409,6 +409,14 @@ DEFAULTS = dict(
     # (selfplay_branch_differ 1: a branch's first deviation never the game's own move there)
     selfplay_branch=0.0, selfplay_branch_moves=3, selfplay_branch_temp=2.0, selfplay_branch_differ=0, selfplay_archive='',
     selfplay_archive_p=0.1,
+    # near-tie branches (docs/az.md 72, docs/search.md 2.11.1; with selfplay_branch > 0 only): selfplay_branch_rule
+    # 'neartie' draws the branch point among decisions where the search could not separate the move played from a
+    # credible runner-up - visits >= selfplay_branch_n_min, prior >= selfplay_branch_p_min, |Q gap| <=
+    # selfplay_branch_eps, the played move's Q in [selfplay_branch_q_lo, selfplay_branch_q_hi] - and the branch plays
+    # that runner-up (one deviation), then normal self-play; a branch that reaches one of its game's later states
+    # (the game's merge_key) ends there with the game's outcome. 'uniform' = the branched games above
+    selfplay_branch_rule='uniform', selfplay_branch_eps=0.02, selfplay_branch_n_min=4, selfplay_branch_p_min=0.02,
+    selfplay_branch_q_lo=0.1, selfplay_branch_q_hi=0.9,
     # ... except a batch-bound machine's (its network batches grow with its games in flight, so a
     # smaller cap only starves it: 'auto' = this machine's driver inferring on CUDA / MPS and every
     # remote worker, whatever its device - docs/az.md 56.1; 'local' | 'remote' | 'all' | 'none'): its
