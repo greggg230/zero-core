@@ -9646,3 +9646,37 @@ games differ: the float16 CUDA graph answers a row differently in another batch 
 shape), unlike the CPU graph - so a GPU job keeps its groups here, and fewer groups for GPU eval jobs is the agent's
 choice to make (a GPU lease's batches already depend on its size).
 
+
+## 72. CUDA graphs for the static graph: fixed-shape buckets (WIP; worker env `ZERO_WORKER_CUDA_GRAPHS=1`; zero-farm's GPU PCs, 2026-11-22)
+
+**Why.** Measured on a farm PC (a 4-core / 8-thread CPU, an NVIDIA GPU, the farm's CUDA pack - ONNX Runtime 1.24.4 -,
+the fast fp16 graph of a live run's gen 769): one call costs the calling thread about its whole wall time - at 575 rows
+22.4 ms of CPU for 9.1 ms of GPU work, ~1,200 kernels launched one by one, 248 host <-> device copies and 27
+device -> host syncs (NonZero's data-dependent shapes) - so a crew of three workers is CPU-bound: its search costs what
+the trainer's does per leaf (133 vs 130 us) but its evaluators cost 96 us a leaf against the trainer's 30 (the trainer
+replays CUDA graphs, 10.6). The best crew reached 0.86x of the trainer's leaves/s; CUDA wait modes and ONNX Runtime's
+session and provider options changed nothing.
+
+**What (so far).**
+* *The static graph's ArgMax in float32* (`ZeroOnnx2Static.ARGMAX_DTYPE`): the override targets' match (0 / 1) is
+  ArgMax'ed in float32 - the same first index of the largest. With every symbolic dimension of the static graph fixed
+  (ONNX Runtime free-dimension overrides: B, nnz, K, NT, L, NO, T) its int64 ArgMax was its only node off the CUDA
+  provider (no int64 kernel), which keeps ONNX Runtime from capturing a CUDA graph. Every other graph keeps int64, byte
+  for byte.
+* *Buckets* (worker `cudagraph.rs`): a static graph on CUDA with `ZERO_WORKER_CUDA_GRAPHS=1` answers each piece through
+  a bucket - a session with those dimensions fixed to the bucket's capacities and CUDA graphs on, pinned host buffers
+  bound as its inputs and outputs (the replay copies from and to them). A piece is padded to its bucket with inert
+  padding rows after its own: non-zeros on global features (below the first head slot's present flag) with value 0,
+  options distinct actions, tail tokens valid ones (a tail segment, a slot below its count, sorted, no duplicate) whose
+  widths sum to exactly the padding floats (the graph refuses every row when the floats don't fit the widths: `lbad`),
+  overrides the generic logit of a padding row's option. A new bucket's capacities: the rows rounded up to 64 with at
+  least one padding row, each per-row quantity a quarter over the piece's mean, the tail floats 120 a padding token, T
+  the piece's; one that doesn't hold a piece of its T grows; at most 4 (least recently used goes). Off by default.
+
+**Checked.** The real rows' answers padded = unpadded, bit for bit (the CPU provider, 200 and 575 rows of the reference
+set); ONNX Runtime captures the fixed static fp16 graph on CUDA once its ArgMax is float32; unit tests of the tail
+padding plan and the padded sizes (`cudagraph::tests`).
+
+**Measured** (to be completed: the PC was shared during the first timing). Contended first timing, fp16, per call at
+352 / 575 rows: fast graph 36.7 / 51.9 ms, static graph (dynamic) 37.2 / 45.1, static fixed 34.3 / 42.5, **static
+fixed + CUDA graph 17.4 / 27.4 ms**.
