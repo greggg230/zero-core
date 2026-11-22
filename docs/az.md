@@ -9845,7 +9845,8 @@ runs onto the new layout (refused by the guard at best). An alias makes "the nam
   missing settings, and would move an old run onto the new layout.
 * **The worker** (`zero_worker`): `GameEntry::of::<G>("mtg").layout(8)`, `GameEntry::of::<G7>("mtg_v7").before_of("mtg")`;
   `resolve_game` picks a job's game from its settings' `game` and `game_layout` (`game_of`; the same rule), `classify`
-  checks the settings resolved onto the picked entry (`LAYOUT_KEY` is play), a graph or a reference set is the job's
+  checks the settings resolved onto the picked entry (`LAYOUT_KEY` is play; an eval job reads it too: `EVAL_READS`, so
+  an evaluation template carries it), a graph or a reference set is the job's
   game by name and record (`Expect::game_problem`: a graph exported before the change, named `mtg` without a record,
   is `mtg_v7`'s). **Builds before it**: `run_settings.json` classes `game_layout` python_only (off: null), so by a
   run's declared setting classes (section 61) a build that does not know the key plays a null one as before and
