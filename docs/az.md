@@ -9927,7 +9927,9 @@ before.
 back as themselves, bad records refused); a remote Worker in-process on a mirror naming `toy_match` with
 `game_layout` null plays `toy` and loads a `toy` checkpoint (before: refused, the release's message), the record
 `toy_match` 1 plays `toy_match` and refuses a `toy` checkpoint, a record 4 is refused as `encoding`; the remote
-evaluation's mirror (both commands) and an eval job's match driver resolved. End to end: MTG Zero's farm gates on
+evaluation's mirror (both commands) and an eval job's match driver resolved; `tests/test_worker_settings.py`: the
+settings an eval match reads are now exactly the worker's `EVAL_READS`, `game_layout` included (it was left out:
+Python read the game unresolved). End to end: MTG Zero's farm gates on
 copies of the release's reference config and checkpoint with the release's worker - gate 2 fails before (exit 78,
 `'mtg_v7' -> 'mtg'`) and passes after (8 games, 534 rows, 200 batches identical), gate 3 passes on both (`mtg_v7`).
 

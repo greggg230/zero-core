@@ -104,7 +104,9 @@ def match_driver(cfg, seats, games, seed, paired=True):
     settings' game is resolved as the native worker resolves a job's (docs/az.md 73.2: an aliased name without a layout
     record is its old game; a record no game of this build has: GameAliasError, a ValueError)."""
     from . import package, run as R
-    cfg = package.resolve_saved_games(dict(cfg), "the eval job's settings")
+    game = package.record_game(cfg, "the eval job's settings")
+    if game != cfg.get('game') or cfg.get('game_layout') != package.active().layout_of(game):
+        cfg = package.set_game(dict(cfg), game)    # (a copy only when it changes: the caller's mapping as it is)
     if cfg.get('eval_trace'):
         raise ValueError('eval_trace: traced rows are the native worker\'s (zero_worker evaljob); a Python match '
                          'plays the same games untraced (tracing changes no game, docs/search.md 2.17)')
