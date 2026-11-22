@@ -45,13 +45,15 @@ pub struct GameEntry {
     pub info: fn() -> GameInfo,
     /// `zero_search::record::replay_json` of the game type (docs/search.md 2.17).
     pub replay: fn(&str, &str, bool) -> Result<Replayed, String>,
+    /// `zero_search::record::replay_branch_json`: a branch game's record with its game's (records/2).
+    pub replay_branch: fn(&str, &str, &str, bool) -> Result<Replayed, String>,
     /// `zero_search::record::replay_failure_json` of the game type (docs/search.md 2.18).
     pub replay_failure: fn(&str, u32, u64, u32) -> Result<String, String>,
 }
 
 impl GameEntry {
     pub const fn of<G: SearchGame>(name: &'static str) -> GameEntry {
-        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G>, replay: zero_search::record::replay_json::<G>, replay_failure: zero_search::record::replay_failure_json::<G> }
+        GameEntry { name, new_game: boxed_game::<G>, new_driver: boxed_driver::<G>, info: game_info::<G>, replay: zero_search::record::replay_json::<G>, replay_branch: zero_search::record::replay_branch_json::<G>, replay_failure: zero_search::record::replay_failure_json::<G> }
     }
 }
 
@@ -1297,14 +1299,21 @@ fn samples_dict(py: Python<'_>, recs: Vec<Record>, f: usize, rows: RowKinds) -> 
 /// `game` with spec `spec` (JSON text), `record` one game's record (JSON text), `aux` its rows carry the
 /// auxiliary targets -> (the rows as `take_samples` gives them - None for a game without samples -, the game's
 /// facts {gid, n, seed, over, aborted, resigned, result, rounds, steps, setup, rows; abort_reason for a game the
-/// driver aborted at its row limit}). A record replay refuses
-/// raises ValueError with the reason (the record is rejected whole).
+/// driver aborted at its row limit; `branch` {from, merged} for a branch game}). A record replay refuses
+/// raises ValueError with the reason (the record is rejected whole). `parent`: a branch game's record (records/2, its
+/// `branch` block) replays with its game's record (JSON text, `record::replay_branch`); a branch record without it is
+/// refused.
 #[pyfunction]
-#[pyo3(signature = (game, spec, record, aux=false))]
-fn replay_rows(py: Python<'_>, game: &str, spec: &str, record: &str, aux: bool) -> PyResult<(Option<PyObject>, PyObject)> {
+#[pyo3(signature = (game, spec, record, aux=false, parent=None))]
+fn replay_rows(py: Python<'_>, game: &str, spec: &str, record: &str, aux: bool, parent: Option<&str>) -> PyResult<(Option<PyObject>, PyObject)> {
     let e = entry(game).map_err(verr)?;
-    let (spec, record) = (spec.to_string(), record.to_string());
-    let rp = py.allow_threads(move || (e.replay)(&spec, &record, aux)).map_err(verr)?;
+    let (spec, record, parent) = (spec.to_string(), record.to_string(), parent.map(str::to_string));
+    let rp = py
+        .allow_threads(move || match &parent {
+            Some(p) => (e.replay_branch)(&spec, &record, p, aux),
+            None => (e.replay)(&spec, &record, aux),
+        })
+        .map_err(verr)?;
     let info = PyDict::new(py);
     info.set_item("gid", rp.gid)?;
     info.set_item("n", rp.n)?;
@@ -1321,6 +1330,13 @@ fn replay_rows(py: Python<'_>, game: &str, spec: &str, record: &str, aux: bool) 
     info.set_item("steps", rp.steps)?;
     info.set_item("setup", rp.setup.clone())?;
     info.set_item("rows", rp.records.len())?;
+    if let Some((from, merged)) = rp.branch {
+        // a branch game (records/2): where it left its game, and - merged - its decisions to the merge
+        let b = PyDict::new(py);
+        b.set_item("from", from)?;
+        b.set_item("merged", merged)?;
+        info.set_item("branch", b)?;
+    }
     let gi = (e.info)();
     let s = samples_dict(py, rp.records, gi.num_features, RowKinds::of(&gi))?;
     Ok((s, info.into_any().unbind()))
@@ -1391,6 +1407,10 @@ fn result_row<'py>(py: Python<'py>, r: &zero_search::driver::GameResult) -> PyRe
         // near-tie branches (docs/search.md 2.11.1): the game's eligible decisions
         d.set_item("neartie", k)?;
     }
+    if r.branched {
+        // (the game spawned a branch: its row follows, docs/search.md 2.17)
+        d.set_item("branched", true)?;
+    }
     if let Some(j) = r.start {
         // a game started from an archive entry (DriverCfg::starts)
         d.set_item("start", j)?;
@@ -1455,6 +1475,10 @@ fn log_dict<'py>(py: Python<'py>, l: &zero_search::driver::GameLog) -> PyResult<
     d.set_item("setup", &l.setup)?;
     d.set_item("spec", l.spec.as_str())?;
     d.set_item("nets", l.nets.map(|(a, b)| vec![a, b]))?;
+    if let Some(k) = l.branch_from {
+        // a branch game's log (docs/search.md 2.20): its first k steps are its game's moves to the branch point
+        d.set_item("branch_from", k)?;
+    }
     Ok(d)
 }
 

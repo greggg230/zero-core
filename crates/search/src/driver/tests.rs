@@ -4730,15 +4730,18 @@ fn a_tampered_record_is_refused() {
 }
 
 #[test]
-fn set_trace_before_games_and_never_with_branches() {
+fn set_trace_before_games_and_never_with_archive_starts() {
     let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
     (c.rolling, c.concurrency) = (true, 4);
     let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
     d.resume(2, 0).unwrap();
     assert!(d.set_trace(true).unwrap_err().contains("before the first resume"));
+    // (branched games are traced since records/2: their traces start with their game's moves, docs/search.md 2.17)
     c.branch = Some(BranchCfg { p: 0.5, moves: 2, temp: 1.0, differ: false, rule: BranchRule::Uniform });
+    Driver::<ToyGame>::new(c.clone()).unwrap().set_trace(true).unwrap();
+    c.starts = Some(StartsCfg { p: 0.5, specs: vec![("e".into(), r#"{"food": [5, 5]}"#.into())] });
     let mut d = Driver::<ToyGame>::new(c).unwrap();
-    assert!(d.set_trace(true).unwrap_err().contains("branched"));
+    assert!(d.set_trace(true).unwrap_err().contains("archive starts"));
 }
 // ---- game logs (Driver::set_game_log; docs/search.md 2.20) ----
 
@@ -4823,16 +4826,19 @@ fn a_game_log_is_the_games_trace() {
 }
 
 #[test]
-fn set_game_log_never_with_branches() {
+fn set_game_log_never_with_archive_starts() {
     let mut c = cfg(vec![nn(0, 8, true)], vec![vec![0, 0]], &[("m", KeyKind::Nn)]);
     (c.rolling, c.concurrency) = (true, 4);
     let mut d = Driver::<ToyGame>::new(c.clone()).unwrap();
     d.resume(2, 0).unwrap();
     d.set_game_log(true).unwrap();
     d.set_game_log(false).unwrap();
+    // (branched games are logged since records/2: their logs start with their game's moves, docs/search.md 2.20)
     c.branch = Some(BranchCfg { p: 0.5, moves: 2, temp: 1.0, differ: false, rule: BranchRule::Uniform });
+    Driver::<ToyGame>::new(c.clone()).unwrap().set_game_log(true).unwrap();
+    c.starts = Some(StartsCfg { p: 0.5, specs: vec![("e".into(), r#"{"food": [5, 5]}"#.into())] });
     let mut d = Driver::<ToyGame>::new(c).unwrap();
-    assert!(d.set_game_log(true).unwrap_err().contains("branched"));
+    assert!(d.set_game_log(true).unwrap_err().contains("archive starts"));
 }
 // chained episodes (docs/search.md 2.14): the toy match through the driver
 mod chain;

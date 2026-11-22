@@ -3,8 +3,7 @@
 //! transpositions (`PickGame`: the branch ends there, its records and row carry the game's outcome, the tallies), no
 //! merge without `merge_key`, nothing spawned without an eligible decision, the settings refused, reproducibility.
 use super::*;
-use crate::game::MAX_SEATS;
-use crate::rng::Rng;
+use crate::pick_game::PickGame;
 
 // ---------------------------------------------------------------- the gate
 
@@ -51,82 +50,7 @@ fn the_gate_at_its_boundaries() {
     assert_eq!(gate().alt(&acts, &[4, 4, 4], &[2.0, 2.0, 1.0], &p0, 1, all), Some((10, 0.0)));
 }
 
-// ---------------------------------------------------------------- a game with transpositions
-
-/// "Pick": two players alternate `turns` turns (seat 0 first); the mover adds 0, 1 or 2 to its own sum; the higher sum
-/// wins (a tie is a draw). Picks commute, so lines transpose: seat 0 picking 1 then 2 reaches the state of 2 then 1
-/// when seat 1 picked the same between. `keys`: `merge_key` = (turn, sums) - the whole state; without it None.
-#[derive(Clone, Debug)]
-struct PickGame {
-    turns: u8,
-    keys: bool,
-    turn: u8,
-    sum: [u8; 2],
-}
-
-impl SearchGame for PickGame {
-    type Spec = (u8, bool);
-    const NAME: &'static str = "pick";
-    const NUM_ACTIONS: usize = 3;
-    const NUM_FEATURES: usize = 4;
-    const MIN_PLAYERS: usize = 2;
-    const MAX_PLAYERS: usize = 2;
-
-    fn parse_spec(json: &str) -> Result<(u8, bool), String> {
-        let v: serde_json::Value = serde_json::from_str(if json.trim().is_empty() { "{}" } else { json }).map_err(|e| e.to_string())?;
-        Ok((v.get("turns").and_then(|x| x.as_u64()).unwrap_or(8) as u8, v.get("keys").and_then(|x| x.as_bool()).unwrap_or(true)))
-    }
-    fn new_game(spec: &(u8, bool), players: usize, _seed: u64) -> Result<PickGame, String> {
-        if players != 2 {
-            return Err("pick: 2 players".into());
-        }
-        Ok(PickGame { turns: spec.0, keys: spec.1, turn: 0, sum: [0, 0] })
-    }
-    fn num_players(&self) -> usize {
-        2
-    }
-    fn to_move(&self) -> Option<usize> {
-        (self.turn < self.turns).then_some(self.turn as usize % 2)
-    }
-    fn legal_actions(&self, out: &mut Vec<u16>) {
-        if self.turn < self.turns {
-            out.extend_from_slice(&[0, 1, 2]);
-        }
-    }
-    fn step(&mut self, a: u16, _chance: &mut Vec<u64>) -> Result<(), String> {
-        if a > 2 || self.turn >= self.turns {
-            return Err(format!("pick: {a} is not legal"));
-        }
-        self.sum[self.turn as usize % 2] += a as u8;
-        self.turn += 1;
-        Ok(())
-    }
-    fn result(&self) -> [f32; MAX_SEATS] {
-        let mut r = [0.0; MAX_SEATS];
-        match self.sum[0].cmp(&self.sum[1]) {
-            std::cmp::Ordering::Greater => r[0] = 1.0,
-            std::cmp::Ordering::Less => r[1] = 1.0,
-            std::cmp::Ordering::Equal => r[..2].fill(0.5),
-        }
-        r
-    }
-    fn margin(&self, seat: usize) -> f32 {
-        (self.sum[seat] as f32 - self.sum[1 - seat] as f32) / 16.0
-    }
-    fn score(&self, seat: usize) -> f32 {
-        self.sum[seat] as f32
-    }
-    fn determinize(&mut self, _viewer: usize, _rng: &mut Rng) {}
-    fn encode(&self, viewer: usize, out: &mut [f32]) {
-        out[0] = self.turn as f32 / 8.0;
-        out[1] = self.sum[viewer] as f32 / 8.0;
-        out[2] = self.sum[1 - viewer] as f32 / 8.0;
-        out[3] = (self.turn as usize % 2 == viewer) as u8 as f32;
-    }
-    fn merge_key(&self) -> Option<u128> {
-        self.keys.then(|| (self.turn as u128) << 16 | (self.sum[0] as u128) << 8 | self.sum[1] as u128)
-    }
-}
+// ---------------------------------------------------------------- a game with transpositions (crate::pick_game)
 
 /// A near-tie rule that admits every decision with a visited runner-up.
 fn loose() -> NearTie {
@@ -320,4 +244,147 @@ fn neartie_settings_are_checked() {
     })
     .contains("margin_w"));
     assert!(bad(&|_: &mut DriverCfg| {}).is_empty(), "the defaults are accepted");
+}
+
+// ---------------------------------------------------------------- branch records (records/2, docs/search.md 2.17)
+
+/// A traced rolling driver of `c` (its spec, seats and branch settings): `quota` games and their branches -> every
+/// (result row, its samples) in the driver's order.
+fn traced<G: SearchGame>(mut c: DriverCfg, quota: u64) -> Rows {
+    (c.rolling, c.concurrency, c.threads, c.groups) = (true, 8, 2, 2);
+    c.games.truncate(1);
+    let mut d = Driver::<G>::new(c).unwrap();
+    d.set_trace(true).unwrap();
+    d.resume(quota, 0).unwrap();
+    let mut out = Vec::new();
+    loop {
+        let b = d.next_batch(true).unwrap();
+        let rows = d.take_results();
+        let mut s = d.take_samples().into_iter();
+        for r in rows {
+            let k = r.samples as usize;
+            out.push((r, s.by_ref().take(k).collect::<Vec<_>>()));
+        }
+        match b {
+            Some(b) => answer_skewed(&mut d, &b),
+            None => break,
+        }
+    }
+    out
+}
+
+/// Every game's record replayed (a branch's with its game's) against the driver's rows, bit for bit -> (branches,
+/// merged branches); the records by gid and kind for the tampering checks.
+fn replay_all<G: SearchGame>(rows: &Rows, spec: &str) -> (usize, usize, Vec<(serde_json::Value, serde_json::Value)>) {
+    use crate::record::{game_json, replay, replay_branch};
+    let sp = G::parse_spec(spec).unwrap();
+    let recs: Vec<serde_json::Value> = rows.iter().map(|(r, s)| game_json(r, s).unwrap()).collect();
+    let (mut nb, mut nm, mut pairs) = (0, 0, Vec::new());
+    for (i, ((r, s), rec)) in rows.iter().zip(&recs).enumerate() {
+        let rp = match &r.branch {
+            None => {
+                assert!(rec.get("branch").is_none());
+                replay::<G>(&sp, rec, false).unwrap_or_else(|e| panic!("game {}: {e}", r.gid))
+            }
+            Some(b) => {
+                nb += 1;
+                nm += b.merged.is_some() as usize;
+                // (its game's record comes before it, from the same slot: the driver flags the game `branched`)
+                let j = rows[..i].iter().rposition(|(q, _)| q.gid == r.gid && q.branch.is_none()).expect("a branch's game row comes first");
+                assert!(rows[j].0.branched);
+                assert!(replay::<G>(&sp, rec, false).unwrap_err().contains("replay_branch"));
+                pairs.push((rec.clone(), recs[j].clone()));
+                let rp = replay_branch::<G>(&sp, rec, &recs[j], false).unwrap_or_else(|e| panic!("branch of game {} ({b:?}): {e}", r.gid));
+                assert_eq!(rp.branch, Some((b.trace_from, b.merged)));
+                rp
+            }
+        };
+        assert_eq!(rp.records.len(), s.len(), "game {}", r.gid);
+        for (k, (a, x)) in rp.records.iter().zip(s).enumerate() {
+            same_row(a, x).unwrap_or_else(|e| panic!("game {} (branch {:?}) row {k}: {e}", r.gid, r.branch));
+        }
+    }
+    // (a game without the flag has no branch; a flagged game's branch may still be in flight when the phase ends)
+    assert!(rows.iter().filter(|(r, _)| r.branch.is_none() && !r.branched).all(|(r, _)| !rows.iter().any(|(q, _)| q.gid == r.gid && q.branch.is_some())));
+    (nb, nm, pairs)
+}
+
+#[test]
+fn branch_records_replay_to_the_drivers_rows_bit_for_bit() {
+    let uniform = |p| BranchCfg { p, moves: 3, temp: 2.0, differ: false, rule: BranchRule::Uniform };
+    // the toy (no merge key): both rules
+    for rule in [uniform(0.5).rule, BranchRule::NearTie(loose())] {
+        let mut c = nt_cfg(1, 0.5, loose(), "{}");
+        c.branch = Some(BranchCfg { rule, ..if rule == BranchRule::Uniform { uniform(0.5) } else { c.branch.clone().unwrap() } });
+        let rows = traced::<ToyGame>(c, 30);
+        let (nb, nm, _) = replay_all::<ToyGame>(&rows, "{}");
+        assert!(nb >= 5 && nm == 0, "{rule:?}: {nb} branches");
+    }
+    // the transposition toy: near-tie branches that merge and that don't, and uniform ones
+    let spec = r#"{"turns": 8, "keys": true}"#;
+    let rows = traced::<PickGame>(nt_cfg(1, 1.0, loose(), spec), 60);
+    let (nb, nm, pairs) = replay_all::<PickGame>(&rows, spec);
+    assert!(nb >= 20 && nm > 0 && nm < nb, "{nm} of {nb} branches merged");
+    let mut c = nt_cfg(1, 1.0, loose(), spec);
+    c.branch = Some(uniform(1.0));
+    let (nbu, nmu, _) = replay_all::<PickGame>(&traced::<PickGame>(c, 30), spec);
+    assert!(nbu >= 10 && nmu == 0, "uniform branches never merge");
+    // tampered branch records are refused
+    use crate::record::replay_branch;
+    let sp = PickGame::parse_spec(spec).unwrap();
+    let (m, mp) = pairs.iter().find(|(r, _)| !r["branch"]["merged"].is_null()).unwrap();
+    let (u, up) = pairs.iter().find(|(r, _)| r["branch"]["merged"].is_null()).unwrap();
+    let bad = |rec: &serde_json::Value, par: &serde_json::Value, f: &dyn Fn(&mut serde_json::Value, &mut serde_json::Value), want: &str| {
+        let (mut r, mut p) = (rec.clone(), par.clone());
+        f(&mut r, &mut p);
+        let e = replay_branch::<PickGame>(&sp, &r, &p, false).unwrap_err();
+        assert!(e.contains(want), "{want}: {e}");
+    };
+    // a merged branch's borrowed outcome must be its game's, and its last state one of its game's
+    bad(m, mp, &|r, _| r["result"] = serde_json::json!([0.25f32.to_bits(), 0.75f32.to_bits()]), "not its game's");
+    bad(m, mp, &|r, _| r["branch"]["from"] = serde_json::json!(0), "");
+    bad(m, mp, &|_, p| p["over"] = serde_json::json!(false), "has none");
+    bad(m, mp, &|r, _| {
+        // (one move short: a state of its game's? not with the sums one pick apart)
+        let s = r["steps"].as_array_mut().unwrap();
+        let last = s.pop().unwrap();
+        s.push(serde_json::json!((last.as_u64().unwrap() + 1) % 3));
+    }, "");
+    // an unmerged branch must play its own end; another game's record is not its game's; the prefix is its game's
+    bad(u, up, &|r, _| r["branch"]["merged"] = serde_json::json!(1), "");
+    bad(u, up, &|_, p| p["seed"] = serde_json::json!(1), "seed");
+    bad(u, up, &|_, p| {
+        let s = p["steps"].as_array_mut().unwrap();
+        s[0] = serde_json::json!((s[0].as_u64().unwrap() + 1) % 3);
+    }, "");
+    bad(u, up, &|r, _| r["branch"]["alt"] = serde_json::json!(r["steps"][r["branch"]["from"].as_u64().unwrap() as usize].as_u64().unwrap() ^ 3), "runner-up");
+    bad(u, up, &|_, p| p["branch"] = serde_json::json!({}), "never branches");
+}
+
+#[test]
+fn a_branchs_game_log_starts_with_its_games_moves() {
+    let mut c = nt_cfg(1, 1.0, loose(), r#"{"turns": 8, "keys": true}"#);
+    (c.rolling, c.concurrency) = (true, 8);
+    let mut d = Driver::<PickGame>::new(c).unwrap();
+    d.set_game_log(true).unwrap();
+    d.resume(40, 0).unwrap();
+    let mut rows = Vec::new();
+    while let Some(b) = d.next_batch(true).unwrap() {
+        answer_skewed(&mut d, &b);
+        rows.extend(d.take_results());
+        d.take_samples();
+    }
+    rows.extend(d.take_results());
+    let mut seen = 0;
+    for r in rows.iter().filter(|r| r.branch.is_some()) {
+        let b = r.branch.as_ref().unwrap();
+        let (lg, g) = (r.log.as_ref().unwrap(), rows.iter().find(|q| q.gid == r.gid && q.branch.is_none()).unwrap().log.as_ref().unwrap());
+        assert_eq!((lg.branch_from, g.branch_from, lg.seed), (Some(b.trace_from), None, g.seed));
+        let k = b.trace_from as usize;
+        assert_eq!(lg.steps[..k], g.steps[..k], "game {}: the branch's log starts with its game's moves", r.gid);
+        assert_eq!(lg.steps[k], TraceStep::Act(b.alt.unwrap()));
+        assert_eq!(lg.steps.len() as u64, r.steps - b.step + k as u64, "its own moves follow");
+        seen += 1;
+    }
+    assert!(seen >= 10, "{seen} branches");
 }

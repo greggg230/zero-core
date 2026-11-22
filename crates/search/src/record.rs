@@ -52,6 +52,11 @@ use crate::game::{Next, SearchGame, MAX_SEATS};
 
 /// The record format's version (`records/1`).
 pub const RECORDS_VERSION: u32 = 1;
+/// `records/2`: `records/1` whose files may also hold **branch games** (`DriverCfg::branch`, docs/search.md 2.11 and
+/// 2.17): a branch's record carries its game's gid and seed, every real move from the game's start (its game's moves
+/// to the branch point, then its own) and a `branch` block; it replays with its game's record (`replay_branch`). A
+/// writer of a driver without branches writes `records/1`, byte for byte as before.
+pub const RECORDS_VERSION_BRANCH: u32 = 2;
 
 /// One real move of a game.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +154,19 @@ pub fn game_json(row: &GameResult, samples: &[Record]) -> Result<Value, String> 
     if !t.setup.is_empty() {
         o.insert("setup".into(), json!(t.setup));
     }
+    if let Some(b) = &row.branch {
+        // a branch game (records/2, docs/search.md 2.17): where it leaves its game - `from` real moves of the game, then
+        // its own - and its origin; a merged near-tie branch's result and margins are its game's
+        o.insert(
+            "branch".into(),
+            json!({"from": b.trace_from, "at": b.at, "of": b.of, "decision": b.decision, "step": b.step, "action": b.action, "moves": b.moves,
+                   "played": b.played, "same_first": b.same_first, "alt": b.alt, "gap": b.gap, "tag": b.tag, "merged": b.merged}),
+        );
+    }
+    if let Some(k) = row.neartie {
+        // (the near-tie rule's eligible decisions of the game, docs/search.md 2.11.1: a tally, not replayed)
+        o.insert("neartie".into(), json!(k));
+    }
     if !row.episodes.is_empty() {
         if t.episode_setups.len() != row.episodes.len() {
             return Err(format!("game {}: {} episodes, {} setup records", row.gid, row.episodes.len(), t.episode_setups.len()));
@@ -190,6 +208,19 @@ pub struct Replayed {
     /// A chained contest's episodes (1 for any other game).
     pub episodes: usize,
     pub records: Vec<Record>,
+    /// A branch game's record (`replay_branch`): its game's real moves it starts with, and - merged - its searched
+    /// decisions after its deviation (its rows then carry its game's outcome). None for any other game.
+    pub branch: Option<(u32, Option<u32>)>,
+}
+
+/// What a branch record is checked against (`replay_branch`): where it leaves its game, and - merged - its game's
+/// outcome and the merge keys of its game's decision states after the branch point.
+struct BranchCtx {
+    from: usize,
+    merged: Option<u32>,
+    result: Vec<f32>,
+    margin: Vec<f32>,
+    keys: std::collections::HashSet<u128>,
 }
 
 fn field<'a>(o: &'a Map<String, Value>, k: &str) -> Result<&'a Value, String> {
@@ -330,6 +361,89 @@ fn label(records: &mut [Record], res: &[f32], margins: &[f32], n: usize) {
 /// replay is not a live game).
 pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<Replayed, String> {
     let o = rec.as_object().ok_or("record: not a JSON object")?;
+    if o.contains_key("branch") {
+        return Err("record: a branch game's record replays with its game's record (record::replay_branch)".into());
+    }
+    replay_core::<G>(spec, o, aux, None)
+}
+
+/// Replay a branch game's record (records/2: its `branch` block) with its game's record `parent` (the record of the
+/// game it branched from: the same gid, seed and players, no `branch` block) -> its rows and facts, as `replay`. On top
+/// of `replay`'s checks: its first `branch.from` real moves are its game's; a near-tie branch's next move is its
+/// runner-up `branch.alt` and not its game's move there; no row at or before the branch point. A branch that played to
+/// its end is checked as any game (its own outcome). A **merged** branch (`branch.merged`, docs/search.md 2.11.1) ends
+/// at a decision of a game in progress: its result and margins must be its game's (its game over), the state's
+/// `SearchGame::merge_key` must be one of its game's decision states' after the branch point, and its rows take that
+/// outcome.
+pub fn replay_branch<G: SearchGame>(spec: &G::Spec, rec: &Value, parent: &Value, aux: bool) -> Result<Replayed, String> {
+    let o = rec.as_object().ok_or("record: not a JSON object")?;
+    let po = parent.as_object().ok_or("record: the game's record is not a JSON object")?;
+    let b = field(o, "branch")?.as_object().ok_or("record: branch is not an object")?;
+    if po.contains_key("branch") {
+        return Err("record: a branch's game record is itself a branch (a branch never branches)".into());
+    }
+    for k in ["gid", "n", "seed"] {
+        if field(o, k)? != field(po, k)? {
+            return Err(format!("record: the branch's {k} {} is not its game's {}", field(o, k)?, field(po, k)?));
+        }
+    }
+    let n = uint(field(o, "n")?, "n", MAX_SEATS as u64)? as usize;
+    let steps = field(o, "steps")?.as_array().ok_or("record: steps is not a list")?;
+    let psteps = field(po, "steps")?.as_array().ok_or("record: the game's steps is not a list")?;
+    let from = uint(field(b, "from")?, "branch.from", u32::MAX as u64)? as usize;
+    if from >= steps.len() || from >= psteps.len() {
+        return Err(format!("record: the branch leaves its game at move {from} of the game's {} and its own {} (it plays at least one move there)", psteps.len(), steps.len()));
+    }
+    if steps[..from] != psteps[..from] {
+        return Err(format!("record: the branch's first {from} moves are not its game's"));
+    }
+    if let Some(a) = b.get("alt").filter(|v| !v.is_null()) {
+        let a = uint(a, "branch.alt", u16::MAX as u64)?;
+        if steps[from].as_u64() != Some(a) || psteps[from].as_u64() == Some(a) {
+            return Err(format!("record: a near-tie branch plays its runner-up {a} where its game played {} (the branch played {})", psteps[from], steps[from]));
+        }
+    }
+    let merged = match b.get("merged") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(uint(v, "branch.merged", u32::MAX as u64)? as u32),
+    };
+    let mut ctx = BranchCtx { from, merged, result: Vec::new(), margin: Vec::new(), keys: Default::default() };
+    if merged.is_some() {
+        let pe = ep_of(po, n)?;
+        if !pe.over || pe.aborted {
+            return Err("record: a merged branch takes its game's outcome, and its game has none (not over, or aborted)".into());
+        }
+        ctx.result = pe.result;
+        ctx.margin = pe.margin;
+        ctx.keys = merge_keys::<G>(spec, n, field(po, "seed")?.as_u64().ok_or("record: seed is not a u64")?, psteps, from)?;
+    }
+    replay_core::<G>(spec, o, aux, Some(&ctx))
+}
+
+/// The merge keys of a game's decision states after move `from` (a seat to move with two options or more), its real
+/// moves `steps` replayed from `seed` (actions only: a merged branch's game is a game of actions).
+fn merge_keys<G: SearchGame>(spec: &G::Spec, n: usize, seed: u64, steps: &[Value], from: usize) -> Result<std::collections::HashSet<u128>, String> {
+    let mut g = G::new_game(spec, n, seed).map_err(|e| format!("record: the game's new_game: {e}"))?.clone();
+    let (mut keys, mut legal, mut chance) = (std::collections::HashSet::new(), Vec::new(), Vec::new());
+    for (k, v) in steps.iter().enumerate() {
+        legal.clear();
+        g.legal_actions(&mut legal);
+        if k > from && g.to_move().is_some() && legal.len() >= 2 {
+            if let Some(key) = g.merge_key() {
+                keys.insert(key);
+            }
+        }
+        let a = v.as_u64().filter(|&a| a <= u16::MAX as u64).ok_or_else(|| format!("record: the game's step {k} ({v}) is not an action"))? as u16;
+        if !legal.contains(&a) {
+            return Err(format!("record: the game's step {k}: action {a} is not legal"));
+        }
+        chance.clear();
+        g.step(a, &mut chance).map_err(|e| format!("record: the game's step {k}: {e}"))?;
+    }
+    Ok(keys)
+}
+
+fn replay_core<G: SearchGame>(spec: &G::Spec, o: &Map<String, Value>, aux: bool, br: Option<&BranchCtx>) -> Result<Replayed, String> {
     let gid = uint(field(o, "gid")?, "gid", u32::MAX as u64)? as u32;
     let n = uint(field(o, "n")?, "n", MAX_SEATS as u64)? as usize;
     if n < G::MIN_PLAYERS || n > G::MAX_PLAYERS.min(MAX_SEATS) {
@@ -371,6 +485,12 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
     }
     if st.windows(2).any(|w| w[0] > w[1]) {
         return Err("record: the samples' steps are not in order".into());
+    }
+    if let Some(b) = br {
+        // (a branch records nothing at or before its deviation: docs/search.md 2.11)
+        if st.first().is_some_and(|&k| k as usize <= b.from) {
+            return Err(format!("record: a branch's row at move {} (it leaves its game at move {})", st[0], b.from));
+        }
     }
     let unit = |h: u64| {
         let x = f16_to_f32(h as u16);
@@ -552,12 +672,35 @@ pub fn replay<G: SearchGame>(spec: &G::Spec, rec: &Value, aux: bool) -> Result<R
             return Err("record: the contest's setup differs from the record's".into());
         }
         r
+    } else if let Some(b) = br.filter(|b| b.merged.is_some()) {
+        // a merged near-tie branch (docs/search.md 2.11.1): ended at a decision of a game in progress, equivalent to one
+        // of its game's after the branch point; its rows take its game's outcome
+        legal.clear();
+        g.legal_actions(&mut legal);
+        if g.to_move().is_none() || legal.len() < 2 {
+            return Err("record: a merged branch ends at a decision (a seat to move with two options or more)".into());
+        }
+        if !top.over || top.aborted || top.resigned.is_some() || row_abort {
+            return Err(format!("record: a merged branch is over (its game's outcome), not aborted nor resigned (over {}, aborted {}, resigned {:?})", top.over, top.aborted, top.resigned));
+        }
+        if !same_bits(&top.result, &b.result) || !same_bits(&top.margin, &b.margin) {
+            return Err(format!("record: a merged branch's result {:?} / margins {:?} are not its game's {:?} / {:?}", top.result, top.margin, b.result, b.margin));
+        }
+        if g.rounds() != top.rounds || g.record_setup() != top.setup {
+            return Err("record: a merged branch's rounds or setup differ from its replay's".into());
+        }
+        if !g.merge_key().is_some_and(|k| b.keys.contains(&k)) {
+            return Err("record: a merged branch's last state is not one of its game's after the branch point (merge_key)".into());
+        }
+        label(&mut records[..], &top.result, &top.margin, n);
+        top.result.clone()
     } else {
         let (res, margins) = end_episode(&g, &top, n, j, false, row_abort, "the game")?;
         label(&mut records[..], &res, &margins, n);
         res
     };
-    Ok(Replayed { gid, n, seed, over: top.over, aborted: top.aborted, resigned: top.resigned, abort_reason, result, rounds: top.rounds, steps: steps.len(), setup: top.setup, episodes: eps.len().max(1), records })
+    let branch = br.map(|b| (b.from as u32, b.merged));
+    Ok(Replayed { gid, n, seed, over: top.over, aborted: top.aborted, resigned: top.resigned, abort_reason, result, rounds: top.rounds, steps: steps.len(), setup: top.setup, episodes: eps.len().max(1), records, branch })
 }
 
 /// The seed of game `gid` of a driver seeded `seed` (`SearchGame::new_game`'s, as the driver starts it:
@@ -573,6 +716,14 @@ pub fn replay_json<G: SearchGame>(spec: &str, rec: &str, aux: bool) -> Result<Re
     let sp = G::parse_spec(spec)?;
     let v: Value = serde_json::from_str(rec).map_err(|e| format!("record: not JSON: {e}"))?;
     replay::<G>(&sp, &v, aux)
+}
+
+/// `replay_branch` from JSON text: the spec, a branch game's record and its game's record.
+pub fn replay_branch_json<G: SearchGame>(spec: &str, rec: &str, parent: &str, aux: bool) -> Result<Replayed, String> {
+    let sp = G::parse_spec(spec)?;
+    let v: Value = serde_json::from_str(rec).map_err(|e| format!("record: not JSON: {e}"))?;
+    let p: Value = serde_json::from_str(parent).map_err(|e| format!("record: the game's record is not JSON: {e}"))?;
+    replay_branch::<G>(&sp, &v, &p, aux)
 }
 
 /// What `replay_failure` did when nothing panicked: the real moves replayed, whether the recorded `"move"` panic's

@@ -912,6 +912,9 @@ pub struct BranchInfo {
     pub gap: f64,
     pub tag: u16,
     pub merged: Option<u32>,
+    /// The game's real moves before the branch point, as its trace counts them (`TraceStep`s: a branch's trace and
+    /// game log start with them, docs/search.md 2.17 / 2.20; a record's `branch.from`).
+    pub trace_from: u32,
 }
 
 /// The branch stream's and the start stream's salts (docs/search.md 2.11): their own streams from
@@ -1019,6 +1022,9 @@ pub struct GameResult {
     /// Near-tie branches (`BranchRule::NearTie`, docs/search.md 2.11.1): the game's eligible decisions (whether or
     /// not it drew a branch); None for a branch and for every game of a driver without the near-tie rule.
     pub neartie: Option<u32>,
+    /// The game spawned a branch (`DriverCfg::branch`): its branch's row follows from the same slot (a records
+    /// writer keeps the two together, docs/search.md 2.17). False for every other game.
+    pub branched: bool,
     /// Self-play resignation (`NnSeat::resign_t`, docs/search.md 3.14): None unless the game's seats resign.
     /// A chained contest's row: None (each episode's is in `episodes`).
     pub resign: Option<ResignInfo>,
@@ -1055,6 +1061,9 @@ pub struct GameLog {
     pub spec: Arc<String>,
     /// The smallest and largest network id of the game's emitted samples (None: it emitted none).
     pub nets: Option<(u32, u32)>,
+    /// A branch game (`DriverCfg::branch`): `steps` start with its game's real moves before the branch point, this
+    /// many (`BranchInfo::trace_from`); None for every other game.
+    pub branch_from: Option<u32>,
 }
 
 /// A game the driver dropped after a panic inside it (docs/search.md 2.18): an engine bug costs that game, not the
@@ -1763,6 +1772,9 @@ struct ForkPoint<G: SearchGame> {
     moves: Vec<(u8, u16, Vec<u16>)>,
     at: u32,
     action: u16,
+    /// The game's real moves before the branch point (its failure log then: what a branch's trace and game log start
+    /// with, docs/search.md 2.17 / 2.20).
+    prefix: Vec<TraceStep>,
     /// A near-tie branch point (docs/search.md 2.11.1): the runner-up the branch plays, the Q gap, the decision's tag.
     alt: Option<u16>,
     gap: f64,
@@ -1987,6 +1999,8 @@ struct Slot<G: SearchGame> {
     key_step: u64,
     merge: Option<Box<MergeState>>,
     merged: Option<u32>,
+    /// A branch game: its game's real moves before the branch point (`ForkPoint::prefix`; its game log's first steps).
+    prefix: Vec<TraceStep>,
 }
 
 /// A chained game's contest in progress (`Slot::chain`, docs/search.md 2.14): its finished episodes, their samples
@@ -2060,6 +2074,7 @@ impl<G: SearchGame> Slot<G> {
             key_step: u64::MAX,
             merge: None,
             merged: None,
+            prefix: Vec::new(),
         }
     }
     fn drop_tree(&mut self, q: usize) {
@@ -2927,8 +2942,10 @@ impl<G: SearchGame> Driver<G> {
         if self.resumed {
             return Err("set_trace: before the first resume (games have started)".into());
         }
-        if on && (self.sh.cfg.branch.is_some() || self.sh.cfg.starts.is_some()) {
-            return Err("set_trace: branched games and archive starts are not replayable from a seed (docs/search.md 2.17)".into());
+        // (a branch game's trace starts with its game's moves to the branch point: replayable from the seed, its
+        // record's `branch` block says where it leaves its game; an archive start's game is not its seed's)
+        if on && self.sh.cfg.starts.is_some() {
+            return Err("set_trace: archive starts are not replayable from a seed (docs/search.md 2.17)".into());
         }
         self.sh.trace.store(on, Ordering::SeqCst);
         Ok(())
@@ -2940,8 +2957,8 @@ impl<G: SearchGame> Driver<G> {
     /// search or their samples changes, and it may be turned on or off at any time. Not with branched games or archive
     /// starts (a branch's moves begin at its branch point). Never called: nothing changes.
     pub fn set_game_log(&mut self, on: bool) -> Result<(), String> {
-        if on && (self.sh.cfg.branch.is_some() || self.sh.cfg.starts.is_some()) {
-            return Err("set_game_log: branched games and archive starts are not replayable from a seed (docs/search.md 2.20)".into());
+        if on && self.sh.cfg.starts.is_some() {
+            return Err("set_game_log: archive starts are not replayable from a seed (docs/search.md 2.20)".into());
         }
         self.sh.game_log.store(on, Ordering::SeqCst);
         Ok(())

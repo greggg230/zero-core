@@ -491,6 +491,7 @@ fn init_slot<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, n_: &m
     slot.key_step = u64::MAX;
     slot.merge = None;
     slot.merged = None;
+    slot.prefix = Vec::new();
     if let Some(bc) = &cfg.branch {
         let mut r = Rng::new(split64(cfg.seed ^ split64(stream as u64 + 1) ^ BRANCH_SALT));
         if r.unit() < bc.p {
@@ -617,6 +618,7 @@ fn drop_game<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, msg: S
         branch: slot.branch.take(),
         start: slot.start_ix.take(),
         neartie: None,
+        branched: false,
         resign: None,
         abort_reason: Some("panic"),
         episodes: Vec::new(),
@@ -1684,7 +1686,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
                     f.seen += 1;
                     if f.rng.unit() * (f.seen as f64) < 1.0 {
                         let tag = g.decision_tag();
-                        f.point = Some(ForkPoint { game: g.clone(), decisions: slot.decisions, steps: slot.steps, moves: slot.moves.clone(), at: f.seen - 1, action: a, alt: Some(alt), gap, tag });
+                        f.point = Some(ForkPoint { game: g.clone(), decisions: slot.decisions, steps: slot.steps, moves: slot.moves.clone(), at: f.seen - 1, action: a, prefix: slot.fail_log.clone(), alt: Some(alt), gap, tag });
                     }
                 }
             }
@@ -1694,7 +1696,7 @@ fn decide<G: SearchGame>(cfg: &DriverCfg, slot: &mut Slot<G>, seat: &NnSeat, p: 
         if cfg.record && seat.selfplay && seat.record && !g.minor_decision() {
             f.seen += 1;
             if f.rng.unit() * (f.seen as f64) < 1.0 {
-                f.point = Some(ForkPoint { game: g.clone(), decisions: slot.decisions, steps: slot.steps, moves: slot.moves.clone(), at: f.seen - 1, action: a, alt: None, gap: 0.0, tag: 0 });
+                f.point = Some(ForkPoint { game: g.clone(), decisions: slot.decisions, steps: slot.steps, moves: slot.moves.clone(), at: f.seen - 1, action: a, prefix: slot.fail_log.clone(), alt: None, gap: 0.0, tag: 0 });
             }
         }
     }
@@ -1834,7 +1836,15 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
     }
     let neartie = (slot.branch.is_none() && cfg.branch.as_ref().is_some_and(|b| b.neartie().is_some())).then_some(slot.neartie_seen);
     // the game's trace (docs/search.md 2.17): its seed, real moves, setup record and - over - its margins
-    let trace = slot.trace.take().map(|steps| Box::new(GameTrace { seed: slot.game_seed, steps, setup: g.record_setup(), margins: if over && !g.deferred() { (0..slot.n).map(|i| g.margin(i)).collect() } else { Vec::new() }, episode_setups: Vec::new() }));
+    // (a merged near-tie branch: its margins are its game's, as its records' sc - docs/search.md 2.11.1)
+    let margins_of = |g: &G| -> Vec<f32> {
+        match &outcome {
+            Some(o) => o.margins.clone(),
+            None if over && !g.deferred() => (0..slot.n).map(|i| g.margin(i)).collect(),
+            None => Vec::new(),
+        }
+    };
+    let trace = slot.trace.take().map(|steps| Box::new(GameTrace { seed: slot.game_seed, steps, setup: g.record_setup(), margins: margins_of(&g), episode_setups: Vec::new() }));
     // the game's log (docs/search.md 2.20): its real moves as the failure log kept them (not a branch's: refused)
     let log = game_log(sh, slot, &g, &slot.records);
     let done = Done { gid, tag: slot.tag.take(), n: slot.n, steps: slot.steps, decisions: slot.decisions, ext_moves: slot.ext_moves, moves: std::mem::take(&mut slot.moves), branch: slot.branch.take(), start, resign: resign.as_ref().map(|r| r.info()), trace, abort: row_abort.then_some("max_row_tokens"), log, neartie, outcome };
@@ -1875,7 +1885,10 @@ fn finish<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &mut Vec<G
     } else {
         None
     };
-    results.push(emit(cfg.record, &g, over, done, records, rq, samples));
+    let mut row = emit(cfg.record, &g, over, done, records, rq, samples);
+    // (its branch's row follows from this slot: a records writer keeps the two in one file, docs/search.md 2.17)
+    row.branched = fork.as_ref().is_some_and(|f| f.point.is_some());
+    results.push(row);
     if let Some(mut f) = fork {
         if let Some(fp) = f.point.take() {
             spawn_branch(sh, slot, gid, f, fp, start, main_out)?;
@@ -1984,6 +1997,7 @@ fn finish_episode<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, results: &m
                 branch: None,
                 start: slot.start_ix.take(),
                 neartie: None,
+                branched: false,
                 resign: None,
                 abort_reason: abort,
                 episodes: std::mem::take(&mut ch.episodes),
@@ -2064,7 +2078,7 @@ fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut
     slot.start_ix = None;
     // (a branch is a game of its own: its evaluation cache starts empty, docs/search.md 3.12)
     slot.cache.clear();
-    slot.branch = Some(BranchInfo { at: fp.at, of: f.seen, decision: fp.decisions, step: fp.steps, action: fp.action, moves, played: 0, same_first: false, start, alt: fp.alt, gap: fp.gap, tag: fp.tag, merged: None });
+    slot.branch = Some(BranchInfo { at: fp.at, of: f.seen, decision: fp.decisions, step: fp.steps, action: fp.action, moves, played: 0, same_first: false, start, alt: fp.alt, gap: fp.gap, tag: fp.tag, merged: None, trace_from: fp.prefix.len() as u32 });
     // near-tie merge detection: the game's keys strictly after the branch point (none, or no outcome: never merges)
     slot.neartie_seen = 0;
     slot.key_step = u64::MAX;
@@ -2080,7 +2094,10 @@ fn spawn_branch<G: SearchGame>(sh: &Shared<G>, slot: &mut Slot<G>, gid: u32, mut
     slot.resign = resign_state(cfg, gid);
     slot.dev_left = moves;
     slot.dev_now = false;
-    slot.trace = None;
+    // (a traced branch's trace: its game's moves to the branch point, then its own - replayable from the game's seed,
+    // its records' steps counted from the game's start; docs/search.md 2.17)
+    slot.trace = sh.trace.load(Ordering::Relaxed).then(|| fp.prefix.clone());
+    slot.prefix = fp.prefix;
     // (a branch's failure log: its moves since its branch point, docs/search.md 2.18)
     slot.fail_log.clear();
     slot.in_move = None;
@@ -2122,7 +2139,12 @@ fn game_log<G: SearchGame>(sh: &Shared<G>, slot: &Slot<G>, g: &G, records: &[Hel
     }
     let spec = if slot.spec_json.is_empty() { lock(&sh.spec_json).clone() } else { slot.spec_json.clone() };
     let nets = records.iter().map(|r| r.rec.net).fold(None, |a: Option<(u32, u32)>, n| Some(a.map_or((n, n), |(lo, hi)| (lo.min(n), hi.max(n)))));
-    Some(Box::new(GameLog { seed: slot.game_seed, steps: slot.fail_log.clone(), setup: g.record_setup(), spec, nets }))
+    // (a branch's: its game's moves to the branch point, then its own - docs/search.md 2.20)
+    let (steps, branch_from) = match &slot.branch {
+        Some(b) => (slot.prefix.iter().chain(&slot.fail_log).cloned().collect(), Some(b.trace_from)),
+        None => (slot.fail_log.clone(), None),
+    };
+    Some(Box::new(GameLog { seed: slot.game_seed, steps, setup: g.record_setup(), spec, nets, branch_from }))
 }
 
 /// A finished (or resolved) game's result row; its records become samples (`record`, the game
@@ -2160,6 +2182,7 @@ pub(super) fn emit<G: SearchGame, S: FromHeld>(record: bool, g: &G, over: bool, 
         branch: d.branch,
         start: d.start,
         neartie: d.neartie,
+        branched: false,
         resign: d.resign,
         trace: d.trace,
         log: d.log,
