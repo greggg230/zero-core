@@ -187,7 +187,7 @@ def alternate_ids(v):
 # DirectML runs, docs/az.md 46.10), float32 - the AMD GPUs' form (zero-farm PROTOCOL rev 22: AMD GPUs through DirectML;
 # their DirectML answers the float16 copy non-deterministically, 46.10); 'matmul-fp16' = that graph in float16 (DirectML
 # on NVIDIA and Intel GPUs runs it deterministically); 'fixed-fp16' = the gen exported as graph 'fast-fixed' (the fast graph
-# at fixed capacities, docs/az.md 76), float16 - the CUDA PCs' form: the worker replays it as CUDA graphs (one launch a call)
+# at fixed capacities, docs/az.md 77), float16 - the CUDA PCs' form: the worker replays it as CUDA graphs (one launch a call)
 # on its own, nothing else to set; 'fixed' = that graph, float32
 VARIANT_FORMS = ('fp16', 'matmul-fp16', 'matmul', 'fixed-fp16', 'fixed')
 # a variant form exported again from the gen's checkpoint -> (its graph, zero.onnx_export.GRAPHS; then float16)

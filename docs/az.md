@@ -152,7 +152,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
 | `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface (plus the optional input `t_align`, 66), metadata (plus `fast`, `attention`, `t_align`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
-| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul' - the gen exported as graph 'fast-matmul', float32: the AMD GPUs' DirectML variant; 'matmul-fp16' - that graph in float16: DirectML on NVIDIA / Intel, 46.10; 'fixed-fp16' - the gen exported as graph 'fast-fixed', float16: CUDA PCs replay it as CUDA graphs, 76; 'fixed' - that graph in float32); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so with 'gpu=fp16,dml=matmul@amd' CUDA PCs play the fp16 graph, AMD PCs (DirectML) the float32 MatMul one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
+| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul' - the gen exported as graph 'fast-matmul', float32: the AMD GPUs' DirectML variant; 'matmul-fp16' - that graph in float16: DirectML on NVIDIA / Intel, 46.10; 'fixed-fp16' - the gen exported as graph 'fast-fixed', float16: CUDA PCs replay it as CUDA graphs, 77; 'fixed' - that graph in float32); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so with 'gpu=fp16,dml=matmul@amd' CUDA PCs play the fp16 graph, AMD PCs (DirectML) the float32 MatMul one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
 | `selfplay_local_reason` | '' | why the run's self-play stays on this machine although the game package has a published farm build for its commit (`GamePackage.farm_build`): free text, logged at every start. Required (else refused, exit 78) at a fresh start and at a fork's first start when there is such a build and self-play names no farm pool; a resumed run only warns. `$ZERO_SELFPLAY_LOCAL_REASON` stands in for it (test harnesses, smokes; not saved). Trainer-only (70) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
@@ -9917,7 +9917,49 @@ released export): a call's thread CPU 16.4 -> 14.8 ms at 352 rows, 23.8 -> 18.4 
 in flight in two groups 28.2k -> 30.9k / 31.0k leaves/s (two 5-minute windows, the control in the same session; the
 trainer's own path there 32.9k).
 
-## 75. CUDA graphs for the static graph: fixed-shape buckets (WIP; worker env `ZERO_WORKER_CUDA_GRAPHS=1`; zero-farm's GPU PCs, 2026-11-22)
+## 75. Tests in parallel: `tools/pytest_shards.py`, and `smoke_all.sh` runs its games at once (2026-11-22)
+
+**Why.** The Python suite is ~850 mostly single-threaded tests (torch at one thread, 7): about 35 minutes of test time
+in one process beside live runs (2,096 s summed over one run's junit files; 44 and 52 minutes of wall time in two runs
+of the day), `tests/test_remoteplay.py` a quarter of it and no single test over 35 s - nothing to fix in one place, so
+the suite is split. `tools/smoke_all.sh` ran its games one after the other, each in its own checkout and target dir.
+
+**What it does.** `python tools/pytest_shards.py [--shards 4] [--root <repo>] [--retry-alone <file>] [-- pytest
+args]` (its docstring is the manual): the repo's `tests/**/test_*.py` in N pytest processes at once over disjoint
+parts, balanced by each test's seconds from earlier runs (`~/.config/zero/pytest_durations/<repo>.json`, shared by a
+repo's checkouts; a file without one by its size; a file longer than a shard's share is split by its tests), the plan
+checked to run every test exactly once before anything starts; each shard its own `--basetemp`, junit file and log.
+The result is read from the junit files: exit 0 and "pytest shards: PASSED - N shard(s), X passed, Y skipped in T s"
+only when every shard exited 0, ran a test and at least one test passed; else "FAILED - ..." naming the failed tests.
+`--retry-alone tests/test_remoteplay.py` reruns that file's failures alone once when they are a shard's only ones
+(AGENTS.md: it times real threads) and names them in the last line; an error or any other failure fails the run.
+Standard library only. `--plan` prints the shards.
+
+`tools/smoke_all.sh` runs the core's pytest and each game's through it (`SMOKE_PYTEST_SHARDS`, default 4; 1 = one
+plain `pytest tests` as before; the core's with the retry above) and `SMOKE_JOBS` games at once (default 3; 1 = one
+after the other): each game in a subshell, its output printed whole and its summary lines read back in the games'
+order once all ended; a game whose subshell ended without a result is a FAIL line.
+
+**Costs.** Shards share the machine: a test that times real threads is likelier to fail beside three other shards
+(hence the retry). Tests that share something outside their `tmp_path` would collide between shards; none was found
+(the suite passed in four shards, below). Several games building at once take that many times the build's memory and
+cores.
+
+**Tests and checks.** `tests/test_pytest_shards.py` (the plan: every file once, a measured file split by its tests,
+plans that would skip or repeat tests refused; end to end with real pytest processes on trivial tests: a pass and its
+recorded durations, a failure named and not recorded, a setup error never retried, no test is not a pass, a failure that
+passes alone / fails alone / is in an unnamed file); `tests/test_smoke_all.py` unchanged and passing.
+
+**Measured** (the desktop beside two live runs and other sessions' gates, 2026-11-22). The whole suite in four shards
+with the GPU visible: 904 s (shards of 219 to 220 tests; the longest 793 s of pytest) against 44 and 52 minutes in one
+process the same day - 829 passed, 31 skipped, two `test_remoteplay` tests failed beside the others and passed alone,
+and one failure that is not the shards': `tests/test_dup_reduce.py::test_max_is_deterministic_on_cuda_and_matches_the_cpu`
+fails alone too on this commit with the GPU visible (MTG Zero's gate hides the GPU, so it had not been run there). With
+the GPU hidden, MTG Zero's gate ran the same suite in four shards of its own: 780 passed, 6.2 to 12.7 minutes of test
+time a shard. `SKIP_CORE=1 bash tools/smoke_all.sh --with-this-core --build-only`, three games at once: GREEN, 3 of 3
+checked, the builds 40 / 42 / 89 s (171 s one after the other) in 96 s for the whole command.
+
+## 76. CUDA graphs for the static graph: fixed-shape buckets (WIP; worker env `ZERO_WORKER_CUDA_GRAPHS=1`; zero-farm's GPU PCs, 2026-11-22)
 
 **Why.** Measured on a farm PC (a 4-core / 8-thread CPU, an NVIDIA GPU, the farm's CUDA pack - ONNX Runtime 1.24.4 -,
 the fast fp16 graph of a live run's gen 769): one call costs the calling thread about its whole wall time - at 575 rows
@@ -9970,9 +10012,9 @@ single-worker run).
 
 **The fast graph's zeros as Pads**: measured in this series, shipped on its own - section 74.
 
-## 76. The fast graph at fixed capacities: graph 'fast-fixed' for CUDA graphs (`export(..., fast='fixed')`; the run setting `pool_variants` form 'fixed-fp16'; zero-farm's CUDA PCs, 2026-11-22)
+## 77. The fast graph at fixed capacities: graph 'fast-fixed' for CUDA graphs (`export(..., fast='fixed')`; the run setting `pool_variants` form 'fixed-fp16'; zero-farm's CUDA PCs, 2026-11-22)
 
-**Why.** Section 75's measurement: the static graph replays as one CUDA graph but is GPU-bound (every block on every
+**Why.** Section 76's measurement: the static graph replays as one CUDA graph but is GPU-bound (every block on every
 row padded to T); the fast graph does the least GPU work but ONNX Runtime cannot capture it (NonZero and values read
 back for its sizes). This graph is the fast graph's arithmetic with every size an input's.
 
@@ -9987,7 +10029,7 @@ past T or an invalid slot scattered to a spare place. A batch past a capacity is
 past S; the overrides' first-match ArgMax over float32 (ONNX Runtime's CUDA provider has no int64 ArgMax, and one CPU
 node stops the capture). Metadata `fixed` 1, `presence`, `t_align`, `runs`; no optional `t_align` input. The worker computes the
 capacities on the host (`StaticTokens::fixed_caps`: per row its present flags and two binary searches per run) and runs
-the graph through section 75's buckets with two capacities more (`S`, `MR`; a padding row's always-present slots count
+the graph through section 76's buckets with two capacities more (`S`, `MR`; a padding row's always-present slots count
 in S; padding non-zeros go to features in no run, value 0, so they count in no run).
 
 **How a run opts in** (off by default: no run exports it): the farm pool's variant form 'fixed-fp16' (`pool_variants`,

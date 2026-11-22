@@ -322,7 +322,7 @@ def varlen_feeds(rows, sizes=None):
         T = static_t(n, sizes.get('t_align', 1))
         f['t_cap'] = np.zeros(T, np.int32)
         if sizes.get('fixed'):
-            # (the fixed graph's other capacities, docs/az.md 76: the batch's present head slots, a row's most
+            # (the fixed graph's other capacities, docs/az.md 77: the batch's present head slots, a row's most
             # non-zeros in one of the metadata's runs of features - exact, as a feeder computes them)
             P = presence_sparse(rows, sizes['presence'])
             f['s_cap'] = np.zeros(max(1, int(P[:, 1:].sum())), np.int32)
@@ -353,7 +353,7 @@ def graph_sizes(sess):
     out = {'actions': int(m['actions']), 'tail_width': int(m.get('tail_width') or 0)}
     if m.get('static') == '1' or m.get('fixed') == '1':
         # (the static graph's: what its t_cap is computed from, docs/az.md 67; the fixed graph's also s_cap and m_cap,
-        # docs/az.md 76)
+        # docs/az.md 77)
         out['presence'] = json.loads(m['presence'])
         out['t_align'] = int(m.get('t_align') or 1)
         if m.get('fixed') == '1':

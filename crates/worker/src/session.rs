@@ -872,7 +872,7 @@ pub struct StaticTokens {
     pub flag: Vec<bool>,
     /// Head positions in all (the global token and every slot).
     pub n_tok: usize,
-    /// The fixed graph's (metadata `fixed` 1, zero-core docs/az.md 76): the runs of features [lo, hi) it reads a row's
+    /// The fixed graph's (metadata `fixed` 1, zero-core docs/az.md 77): the runs of features [lo, hi) it reads a row's
     /// non-zeros in (metadata `runs`); empty for the static graph.
     pub runs: Vec<(usize, usize)>,
 }
@@ -1043,7 +1043,7 @@ pub struct InferenceSession {
     /// A static graph's tokens per row (`static_of`), None for any other graph.
     pub static_tok: Option<StaticTokens>,
     /// A static graph on CUDA with `ZERO_WORKER_CUDA_GRAPHS=1`: its fixed-shape buckets, each a captured CUDA graph
-    /// (`cudagraph`, docs/az.md 75 WIP).
+    /// (`cudagraph`, docs/az.md 76 WIP).
     pub graphs: Option<crate::cudagraph::Cache>,
 }
 
@@ -1475,7 +1475,7 @@ impl InferenceSession {
             }
             _ => None,
         };
-        // (the fixed graph's other capacities, zero-core docs/az.md 76)
+        // (the fixed graph's other capacities, zero-core docs/az.md 77)
         let (s_cap, m_cap) = match &self.static_tok {
             Some(st) if st.fixed() && vr.is_some() => st.fixed_caps(b, idx),
             _ => (0, 0),
@@ -1530,7 +1530,7 @@ impl InferenceSession {
             ]);
             if let Some(t) = t_cap {
                 // (the static graph's input: only its length is read, zero-core docs/az.md 67; the fixed graph's two
-                // more, docs/az.md 76)
+                // more, docs/az.md 77)
                 inputs.extend(ort::inputs!["t_cap" => Tensor::from_array((vec![t as i64], vec![0i32; t])).map_err(oerr)?]);
                 if m_cap > 0 {
                     inputs.extend(ort::inputs![
