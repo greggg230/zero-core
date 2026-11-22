@@ -55,8 +55,17 @@ that has them takes the policy terms (and the teacher's entropy) as means over e
 rows only, the value and margin terms over every row (`distill` decides from the window, as
 `run.train_model` does); a window without them trains as before, bit for bit. `agreement` then reports
 the value and margin agreement of each kind of row separately ('decision', 'view').
+
+Several teachers (docs/az.md 72: the sources file of `tools/distill.py --sources`): each source its teacher,
+its shards and a game package's row selector (`select_rows`, `GamePackage.row_selectors`: e.g. MTG Zero's rows
+where a given deck acts) - one window of every source's selected rows (`data.Window(select=...)`), each source's
+rows a contiguous range of it, each teacher's answers on its own range only (`outputs(span=, into=)`), and
+batches stratified by the sources' weights (`shares`, `distill(strata=)`): a source's share of every batch is
+its weight's, whatever its row count. Without them nothing changes.
 """
+import json
 import math
+import os
 import time
 
 import numpy as np
@@ -106,27 +115,39 @@ def _option_index(W, rows):
 
 
 @torch.inference_mode()
-def outputs(model, W, device=None, batch=1024):
+def outputs(model, W, device=None, batch=1024, span=None, into=None):
     """`model`'s answers on every row of window `W` -> {'pi': float32 [options] (the policy over each
     row's legal actions, softmax of its logits there: aligned with W.opt_action), 'v': float32 [N,
     MAX_SEATS] (P(win) per seat, 0 for absent seats), 'm': float32 [N, MAX_SEATS] (margin)}; a model
     with an auxiliary head also 'aux': float32 [N, W] (its predictions, `net.aux_predict`, in its
     layout's order: what `NetEvaluator.aux` answers) and 'aux_layout'. The model is moved to `device`
-    when one is given; the rows go to the model's device."""
+    when one is given; the rows go to the model's device.
+    `span` (lo, hi) (a multi-source distillation, docs/az.md 72: each teacher on its source's rows): only
+    window rows lo..hi-1, written into `into` (an `outputs` dict of `W` holding other models' answers on
+    other rows; zeros when None) and returned; the models must have the same auxiliary head or none."""
     if device is not None:
         model.to(device)
     device = next(model.parameters()).device
     model.eval()
     N = W.N
-    pi = np.zeros(len(W.opt_action), np.float32)
-    v = np.zeros((N, MAX_SEATS), np.float32)
-    m = np.zeros((N, MAX_SEATS), np.float32)
     S = model.seats
     layout = getattr(model, 'aux_layout', None) or []
-    aux = np.zeros((N, aux_width(model)), np.float32) if layout else None
+    if into is None:
+        pi = np.zeros(len(W.opt_action), np.float32)
+        v = np.zeros((N, MAX_SEATS), np.float32)
+        m = np.zeros((N, MAX_SEATS), np.float32)
+        aux = np.zeros((N, aux_width(model)), np.float32) if layout else None
+    else:
+        if aux_layout(into.get('aux_layout')) != aux_layout(layout):
+            raise ValueError(f"outputs(into=...): the models' auxiliary heads differ ({into.get('aux_layout')} vs "
+                             f"{[list(t) for t in layout]}): a multi-source distillation's teachers need the same one")
+        pi, v, m, aux = into['pi'], into['v'], into['m'], into.get('aux')
+    lo0, hi0 = (0, N) if span is None else (int(span[0]), int(span[1]))
+    if not 0 <= lo0 <= hi0 <= N:
+        raise ValueError(f'outputs: span {span} outside the window\'s {N} rows')
     amp = use_amp(model, device)
-    for lo in range(0, N, batch):
-        rows = np.arange(lo, min(N, lo + batch))
+    for lo in range(lo0, hi0, batch):
+        rows = np.arange(lo, min(hi0, lo + batch))
         xn = W.features(rows).astype(np.float32)
         x = torch.from_numpy(xn).to(device)
         n = torch.from_numpy(W.n_players[rows]).to(device)
@@ -151,7 +172,11 @@ def outputs(model, W, device=None, batch=1024):
         pi[pos] = (e / s[r]).cpu().numpy()
         v[rows, :S] = torch.softmax(vlog.float(), 1).cpu().numpy()
         m[rows, :S] = mar.float().cpu().numpy()
-    v[np.arange(MAX_SEATS)[None, :] >= W.n_players[:, None]] = 0.0
+    if span is None:
+        v[np.arange(MAX_SEATS)[None, :] >= W.n_players[:, None]] = 0.0
+    else:
+        vs = v[lo0:hi0]                            # (a view: the span's absent seats)
+        vs[np.arange(MAX_SEATS)[None, :] >= W.n_players[lo0:hi0, None]] = 0.0
     if layout:
         return {'pi': pi, 'v': v, 'm': m, 'aux': aux, 'aux_layout': [list(t) for t in layout]}
     return {'pi': pi, 'v': v, 'm': m}
@@ -283,9 +308,85 @@ def view_rows(W):
     return int(np.count_nonzero(np.diff(W.opt_off) == 0))
 
 
+def shares(weights, batch):
+    """A multi-source distillation's batch split (docs/az.md 72): each source's rows of every batch of
+    `batch` rows, proportional to its weight (largest remainders: exact up to one row, the same split
+    every step, the sources' order breaking ties). A positive weight that gets no row is refused."""
+    w = np.asarray(weights, np.float64)
+    if not len(w) or not np.isfinite(w).all() or (w <= 0).any():
+        raise ValueError(f'source weights {list(weights)}: each must be a finite number > 0')
+    q = batch * w / w.sum()
+    n = np.floor(q).astype(np.int64)
+    rest = int(batch - n.sum())
+    for k in sorted(range(len(w)), key=lambda k: (-(q[k] - n[k]), k))[:rest]:
+        n[k] += 1
+    if (n == 0).any():
+        k = int(np.flatnonzero(n == 0)[0])
+        raise ValueError(f'source {k}: weight {w[k]:g} of {w.sum():g} gives it no row of a {batch}-row batch '
+                         f'(raise its weight or the batch)')
+    return [int(x) for x in n]
+
+
+def stratified_draw(strata):
+    """fn(rng) -> a batch's window rows: for each (lo, hi, n) of `strata`, n rows of lo..hi-1 drawn uniformly
+    with replacement, in the strata's order (`data.batches`' `draw`; docs/az.md 72)."""
+    strata = [(int(lo), int(hi), int(n)) for lo, hi, n in strata]
+    for lo, hi, n in strata:
+        if hi <= lo or n < 1:
+            raise ValueError(f'stratum {(lo, hi, n)}: an empty row range or no rows a batch')
+
+    def draw(rng):
+        return np.concatenate([lo + rng.integers(hi - lo, size=n) for lo, hi, n in strata])
+    return draw
+
+
+def select_rows(paths, select, game, source=None, config=None):
+    """Rows of shards `paths` a source's selector `select` takes (docs/az.md 72) -> per shard a sorted int64
+    array of its row numbers (all of them for an empty selector). The game package's row selector
+    (`GamePackage.row_selectors`) decides each shard's rows, given the shard's meta and its run's config
+    (`config`: a config.json path for every shard; None: `<run>/config.json` of `<run>/data/iter_NNNN/x.npz`,
+    None when it is not there). No selector in the package and a non-empty `select`: refused (ValueError),
+    as a mask of the wrong length or kind."""
+    from .data import shard_rows
+    from .package import active
+    if not isinstance(select, dict):
+        raise ValueError(f'source {source!r}: select must be a JSON object ({select!r})')
+    if not select:
+        return [np.arange(shard_rows(p), dtype=np.int64) for p in paths]
+    pkg = active()
+    fn = pkg.row_selector_of(game)
+    if fn is None:
+        raise ValueError(f'source {source!r}: select {json.dumps(select)} but the game package {pkg.name!r} has no '
+                         f'row selector for {game!r} (select must be {{}})')
+    configs = {}
+    out = []
+    for p in paths:
+        cpath = config or os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(p)))),
+                                       'config.json')
+        if cpath not in configs:
+            cfg = None
+            if os.path.exists(cpath):
+                with open(cpath, encoding='utf-8') as f:
+                    cfg = json.load(f)
+            elif config:
+                raise ValueError(f'source {source!r}: config {config}: no such file')
+            configs[cpath] = cfg
+        with np.load(p) as z:
+            meta = json.loads(str(z['meta']))
+        N = shard_rows(p)
+        mask = np.asarray(fn(dict(select), p, {'meta': meta, 'config': configs[cpath],
+                                              'config_path': cpath if configs[cpath] is not None else None,
+                                              'source': source}))
+        if mask.dtype != np.bool_ or mask.shape != (N,):
+            raise ValueError(f'source {source!r}: the row selector gave {mask.dtype} {mask.shape} for shard {p} of {N} '
+                             f'rows (a bool array of its rows)')
+        out.append(np.flatnonzero(mask).astype(np.int64))
+    return out
+
+
 def distill(student, W, T, steps, batch=512, lr=5e-4, lr_min=1e-5, warmup=500, wd=1e-4, teacher_w=1.0, value_q=0.5,
             margin_w=0.5, device='cpu', seed=0, prefetch=2, opt=None, start=0, every=100, on_report=None,
-            on_step=None, check=None, aux_w=1.0, aux_teacher_w=None):
+            on_step=None, check=None, aux_w=1.0, aux_teacher_w=None, strata=None):
     """Train `student` (in place) for steps start..steps-1 on window `W` with the teacher's answers `T`
     (`outputs`) by the loss of the module docstring. `opt`: an AdamW state to continue (a resumed
     distillation: `start` its step), else fresh. Every `every` steps `on_report(step, means of the
@@ -296,7 +397,9 @@ def distill(student, W, T, steps, batch=512, lr=5e-4, lr_min=1e-5, warmup=500, w
     teacher's predictions in `T` ('aux': the same head; the window carries the shards' targets,
     `Window(aux_width=)`), `aux_w` / `aux_teacher_w` its weight and blend; a student with a head and a
     `T` without the teacher's predictions is refused (the head would train on nothing); a student
-    without one ignores them. -> (the AdamW optimizer, the last report)."""
+    without one ignores them. `strata` (a multi-source distillation, docs/az.md 72; None: rows drawn
+    uniformly from the window, as before): [(lo, hi, n), ...] - every batch n rows of window rows lo..hi-1
+    for each (`stratified_draw`; the n sum to `batch`). -> (the AdamW optimizer, the last report)."""
     if getattr(student, 'reader_specs', None):
         raise ValueError('distillation into a network with readers is not supported yet (docs/az.md 36)')
     if aux_width(student):
@@ -328,7 +431,12 @@ def distill(student, W, T, steps, batch=512, lr=5e-4, lr_min=1e-5, warmup=500, w
     amp = use_amp(student, device)
     rng = np.random.default_rng(seed * 7919 + start)
     acc, k, last = {}, 0, {}
-    feed = batches(Taught(W, T), rng, steps - start, batch, device, prefetch)
+    if strata is not None:
+        if sum(int(n) for _, _, n in strata) != batch:
+            raise ValueError(f'strata {strata}: their rows a batch do not sum to the batch ({batch})')
+        feed = batches(Taught(W, T), rng, steps - start, batch, device, prefetch, draw=stratified_draw(strata))
+    else:
+        feed = batches(Taught(W, T), rng, steps - start, batch, device, prefetch)
     try:
         for step in range(start, steps):
             if check is not None:
