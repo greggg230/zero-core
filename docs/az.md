@@ -9958,3 +9958,28 @@ fails alone too on this commit with the GPU visible (MTG Zero's gate hides the G
 the GPU hidden, MTG Zero's gate ran the same suite in four shards of its own: 780 passed, 6.2 to 12.7 minutes of test
 time a shard. `SKIP_CORE=1 bash tools/smoke_all.sh --with-this-core --build-only`, three games at once: GREEN, 3 of 3
 checked, the builds 40 / 42 / 89 s (171 s one after the other) in 96 s for the whole command.
+
+### 75.1 `check_checkpoint_compat.py` plays its digests at once (2026-11-22)
+
+**Why.** The old-vs-new comparison ran the old checkout's digests and then the new checkout's, each side one process
+playing the `visits` self-play, the `cq` self-play and the match one after the other: 947 s + 857 s = 1,808 s as a step
+of MTG Zero's core gate, the longest step of the tier once the pytest ran in shards.
+
+**What it does.** A side's digests are independent - each policy target's self-play and the match is its own driver
+with its own fixed seed, on an evaluator built the same way in every process (`--net random`: torch seed 0 at its
+construction; a checkpoint: loaded) - so each is its own `selfplay_digest.py` process (`--targets <one> --match-games
+0`; `--targets '' --match-games N`) and both sides' processes run together, `--jobs` at a time (default 0: all of
+them, six for two targets and a match). A side's outputs are merged into what one process prints (its processes must
+agree on the game, spec, evaluator and engine, else the tool stops); the printed lines and the result line are
+unchanged. `--jobs 1`: one process per side, one side after the other, as before. `--targets` and `--match-games` are
+now the tool's own options (they were passed through). Six processes of two search threads each: the step wants about
+twelve cores for its few minutes.
+
+**Tests and checks.** `tests/test_checkpoint_compat.py`: the phases, the merge (and its refusal of processes that
+disagree), and on the toy game every printed line but the seconds equal between `--jobs 1` and the default, with one
+target and no match too.
+
+**Measured** (the desktop beside two live runs, 2026-11-22; MTG Zero's gate command: `--package mtgz --net random
+--game mtg --spec '{"max_turns": 60}'`, a checkout against itself): 384 s for both sides at once against 1,808 s in the
+gate an hour earlier, and every digest the gate's own - visits records 4c42f1160eca9121, cq records 88ab3306d3beba12
+(3,554 samples each, results e266d43f27caa1e8), the match f2a5103266c05aa6 (10/16).
