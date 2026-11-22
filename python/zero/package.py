@@ -152,6 +152,12 @@ class GamePackage:
                     where, `runner.play(k, n, seed)` plays batch k's n games (ids 0..n-1, base seed `seed`) and returns
                     zero.h2h's match rows (gid, result, scores, over, and `rec`: each game's traced record), and
                     `runner.info()` the output's own keys. Default none: zero.h2h plays here only
+    farm_build      fn(run, cfg) -> str or None, or 'module:attr' (docs/az.md 70): the published farm worker build of
+                    the code this process runs (MTG Zero: its release index's entry for the checkout's commit), a few
+                    words for the log, or None (none, or no index on this machine). zero.run asks it at a run's start
+                    when self-play names no farm pool and no `selfplay_local_reason` is given: with a build, a first
+                    start is refused (exit 78) and a resumed run warns. An exception counts as none (logged).
+                    Default none: never asked
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
@@ -160,7 +166,7 @@ class GamePackage:
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
                  remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None, engine_paths=None,
-                 setting_classes=None, h2h_backend=None):
+                 setting_classes=None, h2h_backend=None, farm_build=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -202,6 +208,7 @@ class GamePackage:
         self.engine_paths = tuple(engine_paths) if engine_paths else None
         self.setting_classes = dict(setting_classes or {})
         self.h2h_backend = h2h_backend
+        self.farm_build = farm_build
         for k, c in self.setting_classes.items():
             if k not in self.settings:
                 raise ValueError(f'{name}: setting_classes names {k!r}, which is not one of the package\'s settings')
@@ -246,6 +253,21 @@ class GamePackage:
         if isinstance(f, str):
             f = self.on_fork = resolve(f)
         return f
+
+    def published_farm_build(self, run, cfg, log=None):
+        """`farm_build` asked (docs/az.md 70) -> its description of the published farm build for this code, or None (no
+        hook, none, or the hook failed: logged with `log`)."""
+        f = self.farm_build
+        if f is None:
+            return None
+        if isinstance(f, str):
+            f = self.farm_build = resolve(f)
+        try:
+            return f(run, cfg) or None
+        except Exception as e:  # noqa: BLE001 - a lookup that fails is no build, never a run that cannot start
+            if log:
+                log(f'the farm build lookup failed ({type(e).__name__}: {str(e)[:300]}): no published farm build assumed')
+            return None
 
     def eval_due(self, name, cfg, it):
         """Whether the extra evaluation `name` runs on the evaluated iteration `it` of a run with settings

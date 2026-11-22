@@ -613,6 +613,10 @@
    "class": "trainer",
    "why": "orchestration"
   },
+  "selfplay_local_reason": {
+   "class": "trainer",
+   "why": "orchestration (why the run's self-play stays on the desktop beside a published farm build: logged at its start, docs/az.md 70)"
+  },
   "selfplay_remote_inflight": {
    "class": "trainer",
    "why": "orchestration"

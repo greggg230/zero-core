@@ -77,6 +77,7 @@ import torch.nn.functional as F
 from . import auxtarget as AUX, budget as BU, elo, forks as FK, gamerec as GR, games as G, league as L, package, precision as PR, resign as RS, runctl
 from .data import BAD, ShardWriter, TargetStats, Window, WindowCache, batches, shard_format, shard_paths, shard_rows
 from .rows import forward_kw
+from .farm_pool import Refused as PoolRefused
 from .finite import NonFinite, check_state, head
 from .infer import T_STEP, NetEvaluator, drive, use_amp
 from .net import (NO_DECAY, EncodingMismatch, add_aux, add_reader, aux_layout, check_belief_head, check_checkpoint, load,
@@ -354,6 +355,11 @@ DEFAULTS = dict(
     # with selfplay_local 0, the pool counts as a remote taking work while a valid game arrived within this many
     # seconds (this machine then only trains; when the farm goes quiet it plays again: the run never stalls)
     pool_live_s=900.0,
+    # why the run's self-play stays on this machine although a published farm build exists for its commit (the game
+    # package's `farm_build`; docs/az.md 70): free text, logged at every start. Required at a fresh start and at a fork's
+    # first start when there is such a build and self-play names no farm pool ('' there: refused, exit 78); a resumed
+    # run only warns. Trainer-only (no worker reads it). '' = none given (a run without a published build needs none)
+    selfplay_local_reason='',
     # selfplay_local 0 = while at least one remote worker takes work, this machine's driver takes no
     # games (the run's machine only trains: an actor / learner split); with none (all offline, backing
     # off, refused, or no host listed) it plays the quota itself, so the run never stalls. 1 = this
@@ -2426,6 +2432,11 @@ class Run:
         # variable-length rows (docs/az.md 43): a draft layout, a stale build, an arch or shard format that cannot
         # carry them - refused before any work (exit 78); nothing for a game without them
         self.check_rows()
+        # the farm (docs/az.md 70): inert pool settings warned of; a first start (fresh, or a fork's first) without a
+        # farm pool and without a reason, while a published farm build exists, refused (exit 78) before any work - a
+        # resumed run only warns
+        first = first_start(run)
+        check_farm_use(run, c, first, self.log)
         start = latest_iter(run)
         if start is None:
             save(self.new_model(), model_path(run, 0), {'iter': 0})
@@ -2485,6 +2496,11 @@ class Run:
                             'work (selfplay_local 0)'))
             if not self.rsp.local_play and not self.rsp.multi:
                 self.log('self-play here only while no remote worker takes work (selfplay_local 0)')
+        if first:
+            # (a fork's first start has passed every start check - the farm's above, the farm pool's settings check in
+            # RemotePlay - so its next start is a resume: docs/az.md 70; no-op without fork.json)
+            from .tools.fork_run import mark_started
+            mark_started(run)
         try:
             self._iterations(start, done)
         finally:
@@ -2619,6 +2635,92 @@ class AnchorRefused(EncodingMismatch):
 class HeldOutRefused(EncodingMismatch):
     """A held-out set the run cannot use (docs/az.md 20.2): missing shards, or another game or encoding.
     Refused like an EncodingMismatch (exit 78)."""
+
+
+class FarmUseRefused(EncodingMismatch):
+    """A fresh start or a fork's first start whose self-play names no farm pool while the game package has a published
+    farm build for this commit, and no `selfplay_local_reason` (docs/az.md 70): refused like an EncodingMismatch (exit
+    78, not restarted) - say why it stays here, or attach the farm."""
+
+
+# the pool_* settings a run's farm evaluation reads too (eval_remote 'pool:<farm run>', zero/eval_pool.py, docs/az.md
+# 65); every other pool_* setting is the self-play pool's alone (docs/az.md 45)
+POOL_EVAL_KEYS = ('pool_build', 'pool_runtime', 'pool_worker', 'pool_url', 'pool_priority', 'pool_needs_ram_mb',
+                  'pool_key', 'pool_farm_release', 'pool_expires_days', 'pool_min_agent', 'pool_alternates',
+                  'pool_alt_vendor', 'pool_export')
+# a reason for test harnesses and smoke runs that start many short runs (docs/az.md 70): the same as the setting,
+# never saved in the run's config.json
+LOCAL_REASON_ENV = 'ZERO_SELFPLAY_LOCAL_REASON'
+
+
+def selfplay_pools(run, cfg):
+    """The farm pools a run's self-play attaches (docs/az.md 45): the 'pool:<farm run>' names of the run directory's
+    `selfplay_remotes` file when it has one (the file replaces the setting, docs/az.md 34), else of `selfplay_remote`."""
+    from .remoteplay import REMOTES_FILE, read_remotes_file, remote_names
+    names = read_remotes_file(os.path.join(run, REMOTES_FILE)) if run else None
+    if names is None:
+        names = remote_names(cfg.get('selfplay_remote') or '')
+    return [n for n in names if str(n).startswith('pool:')]
+
+
+def inert_pool_settings(cfg, run=None):
+    """The pool_* settings a run sets to something other than their default that do nothing (docs/az.md 70): all of
+    them while its self-play attaches no farm pool (`selfplay_pools`), except those its farm evaluation reads when
+    `eval_remote` is a pool (POOL_EVAL_KEYS) -> sorted names ([] with a pool)."""
+    if selfplay_pools(run, cfg):
+        return []
+    ev = str(cfg.get('eval_remote') or '').startswith('pool:')
+    return sorted(k for k in DEFAULTS if k.startswith('pool_') and k in cfg and cfg[k] != DEFAULTS[k]
+                  and not (ev and k in POOL_EVAL_KEYS))
+
+
+def first_start(run):
+    """Whether this start is a run's first (docs/az.md 70): no checkpoint yet (a fresh start), or a fork whose
+    `fork.json` (tools/fork_run.py) has not been marked started. A run that has started once - every run resumed after
+    PAUSE, a crash or a restart, and every fork made before fork.json existed - is not."""
+    from .tools.fork_run import read_fork
+    if latest_iter(run) is None:
+        return True
+    f = read_fork(run)
+    return f is not None and not f.get('started')
+
+
+def check_farm_use(run, cfg, first, log, published=None):
+    """The run's farm use at its start (docs/az.md 70), before any work. With a self-play farm pool: nothing. Without
+    one: (1) pool_* settings that do nothing (`inert_pool_settings`) - a loud warning; (2) the run's reason to stay on
+    this machine (`selfplay_local_reason`, else $ZERO_SELFPLAY_LOCAL_REASON) is logged and that is all; (3) without a
+    reason, the game package's published farm build for this commit (`published(run, cfg)`, default
+    `GamePackage.published_farm_build`; asked with a reason too, which its line then names): none - nothing more; one -
+    a loud warning on a resumed run, FarmUseRefused (exit 78) at a first start (`first`: `first_start`)."""
+    if selfplay_pools(run, cfg):
+        return
+    inert = inert_pool_settings(cfg, run)
+    if inert:
+        ev = str(cfg.get('eval_remote') or '').startswith('pool:')
+        log(f'WARNING: pool settings that do nothing: {", ".join(f"{k}={cfg[k]!r}" for k in inert)} - self-play names no '
+            f'farm pool (selfplay_remote {cfg.get("selfplay_remote") or ""!r}, no selfplay_remotes file with one)'
+            + (', and the farm evaluation reads none of these' if ev else '') + ', so every self-play game is this '
+            f'machine\'s and the game package\'s farm yardsticks are off. Attach the farm with selfplay_remote '
+            f'pool:<farm run>, or drop them (docs/az.md 70)')
+    reason, src = str(cfg.get('selfplay_local_reason') or '').strip(), 'selfplay_local_reason'
+    if not reason:
+        reason, src = os.environ.get(LOCAL_REASON_ENV, '').strip(), f'${LOCAL_REASON_ENV}'
+    if published is None:
+        pub = package.active().published_farm_build(run, cfg, log)
+    else:
+        pub = published(run, cfg)
+    if reason:
+        log(f'self-play on this machine only ({src}): {reason}'
+            + (f' - beside a published farm build of this commit ({pub})' if pub else ''))
+        return
+    if not pub:
+        return
+    msg = (f'a published farm build exists for this commit ({pub}), but self-play names no farm pool: every self-play '
+           f'game would be this machine\'s. Attach the farm (selfplay_remote pool:<farm run> with its pool settings), or '
+           f'say why it stays here: --selfplay-local-reason "<why>" (docs/az.md 70)')
+    if first:
+        raise FarmUseRefused(f'{msg} - required at a fresh start and at a fork\'s first start')
+    log(f'WARNING: {msg} (a resumed run: not refused)')
 
 
 def aux_settings(cfg, info):
@@ -3063,8 +3165,9 @@ def main(argv=None):
         runctl.write_state(run, 'run', state='paused', pause_requested=pw.requested, pause_noticed=pw.seen,
                            workers_stopped=now, exited=now)
         raise SystemExit(EXIT_PAUSED)
-    except EncodingMismatch as e:
-        # a network of another encoding than this build's (docs/az.md 10.4): no restart fixes it
+    except (EncodingMismatch, PoolRefused) as e:
+        # a network of another encoding than this build's (docs/az.md 10.4): no restart fixes it; nor a farm worker
+        # build that refuses the run's settings at its start (docs/az.md 70)
         pw.close()
         log(run, f'run REFUSED (exit status {EXIT_REFUSED}: the supervisor does not restart it): {e}')
         runctl.write_state(run, 'run', state='refused', error=f'{type(e).__name__}: {e}'[:1000])

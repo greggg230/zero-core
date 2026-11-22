@@ -417,6 +417,7 @@ function render(){
   else if(pr&&live&&pr.phase==='remote shards')s.push(`Iteration ${pr.iter}: the remote's last shards`);
   const rp=pr&&live&&pr.phase==='selfplay'?(pr.remote||pr.matches_remote):null;
   if(rp)s.push(`remote ${rp.host}: ${rp.state}, ${rp.workers} worker(s)`+(rp.outstanding!=null?`, ${rp.matches} matches back, ${rp.outstanding} outstanding`:`, ${rp.games} games, ${rp.samples.toLocaleString()} samples back`));
+  for(const [pn,pp] of Object.entries((rp&&rp.pools)||{}))if(pp&&pp.state==='stopped')s.push(`FARM POOL ${pn} STOPPED (refused, docs/az.md 70): ${((pp.stopped||{}).reason||pp.error||'').slice(0,300)}`);
   if(st.log_age_s!=null)s.push(`last log line ${ago(st.log_age_s)} ago`);
   if(DATA.stopping)s.push('STOP file: ending after this iteration');
   $('status').textContent=s.join(' · ');

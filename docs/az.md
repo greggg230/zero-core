@@ -152,6 +152,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
 | `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface (plus the optional input `t_align`, 66), metadata (plus `fast`, `attention`, `t_align`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
 | `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul' - the gen exported as graph 'fast-matmul', float32: the AMD GPUs' DirectML variant; 'matmul-fp16' - that graph in float16: DirectML on NVIDIA / Intel, 46.10); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so with 'gpu=fp16,dml=matmul@amd' CUDA PCs play the fp16 graph, AMD PCs (DirectML) the float32 MatMul one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
+| `selfplay_local_reason` | '' | why the run's self-play stays on this machine although the game package has a published farm build for its commit (`GamePackage.farm_build`): free text, logged at every start. Required (else refused, exit 78) at a fresh start and at a fork's first start when there is such a build and self-play names no farm pool; a resumed run only warns. `$ZERO_SELFPLAY_LOCAL_REASON` stands in for it (test harnesses, smokes; not saved). Trainer-only (70) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
 | `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: this machine's driver when its inference is CUDA / MPS, and every remote worker on any device (56.1) - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
@@ -9432,3 +9433,111 @@ this change).
 
 **Measured.** MTG Zero's farm backend end to end (the scaled-down ISMCTS check through `python -m mtgz.az.h2h` with
 `--backend auto`, the auto -> local cases): its docs/ENGINE.md 217.
+## 70. Farm guards: a fork's own farm runs, definitive pool refusals, pool settings that do nothing, `selfplay_local_reason` (the run setting; `GamePackage.farm_build`; `fork.json`; the Fable farm review of 2026-11-21)
+
+**Why.** A review of how experiments use zero-farm (2026-11-21) found four ways a run ends up desktop-only, or worse,
+without anyone deciding it: (1) `tools/fork_run.py --source` copied `selfplay_remote pool:<parent>` and `eval_remote`
+unchanged, so a fork that did not override them published its generations into its PARENT's farm run (and MTG Zero's
+`tools/ab.py` would then pause the parent's farm run when the arm ended); (2) a farm pool whose worker build refused
+the run's settings logged "refused (retried in 10 s)" for the whole run - with the reason cut to the last 500
+characters - while the run played every game on the desktop (an A/B of MTG Zero's, 11-18); (3) `pool_*` settings with
+`selfplay_remote ''` do nothing (and turn MTG Zero's farm yardsticks off) without a word; (4) the launchers that start
+experiments are scratch scripts that call the run loop or fork_run directly, so a guard in one tool reaches none of
+them - the run's start is the one layer they all share.
+
+**What it does.**
+
+* **A fork never writes into its parent's farm runs** (`zero.tools.fork_run.fork_farm`, applied by `continuation`
+  before anything is copied). Every `pool:<farm run>` of the source's self-play - its `selfplay_remote`, and its
+  `selfplay_remotes` file (34), which replaces the setting and was never copied, so a fork of a file-attached run lost
+  its farm silently - becomes the fork's own farm run: `--farm own` (the default) names it after the fork's directory
+  (`farm_slug`: lower case, `[a-z0-9-]`, at most 63), `--farm NAME` names it. A farm evaluation of the source's
+  (`eval_remote pool:...`, 65) becomes `pool:<name>-eval`. Other hosts in the list are kept, and so are the source's
+  `pool_*` settings (the coordinator creates the new farm runs at their first publish). `--farm none` drops the pools
+  (the fork stays on this machine; a farm evaluation of the source's dropped too). A `--set selfplay_remote` /
+  `eval_remote` naming one of the source's farm runs is refused (SystemExit), as is a name of the source's, a name
+  that is not a slug, and `--farm NAME` with nothing to replace. The decision is printed (`FARM: ...` lines).
+* **`fork.json`.** Both kinds of fork write `<dest>/fork.json`: `kind` (new / continuation), `source` (home as `~`),
+  `iter`, `net`, `farm` {mode, changes} and `started` (null). The run marks it started (`mark_started`) at its first
+  start once every start check has passed - the farm's below and the farm pool's settings check -, just before its
+  first iteration: a first start refused for any reason stays a first start.
+* **Definitive refusals vs transient errors** (`zero.farm_pool.Refused`, a SystemExit with `reason`, `fix` and
+  `detail`). Definitive: the worker build's `check-config` refusing the run's settings (`play_settings`: the refused
+  keys with their statuses, `refusal_summary`, e.g. `bauble_memory (unknown)`; the whole answer in `detail`), the job's
+  own settings, a `driver-cfg` mismatch, no `pool_worker` executable here, another build, the platform check (62), the
+  rolling check (54), and a coordinator manifest that refuses `pool_build` / `pool_runtime` / `pool_alternates`
+  (zero.farm_def's SystemExits wrapped by `_definitive`). Transient - logged and retried every `pool_poll_s` as before:
+  network errors and the coordinator's answers (`FarmError`, any status), farm-release failing, a definition
+  conflict. The fix named by default: release a worker build of the run's commit and point `pool_build`,
+  `pool_runtime`, `pool_worker`, `pool_alternates` at it, or turn the refused setting off, or detach the farm.
+  * **At the run's start.** A new pool (its state has no self-play template yet: a new run, a fork, a pool whose check
+    never passed) runs the settings check in its constructor; a Refused propagates and `zero.run.main` refuses the run
+    (exit 78, `run_state` 'refused' with the reason; the supervisor does not restart it), the log carrying the
+    worker's answer and the fix. A check that cannot run (an OSError, a timeout) is logged and left to the pool's
+    thread. A resumed pool keeps its template, so a live run's restart does nothing new here.
+  * **On the pool's thread** (a resumed run's alternates, platform or rolling check; a phase spec's settings, 52): the
+    pool stops (`Pool._stop`) - no more publishing or ingesting, never retried in this process - and says so: the
+    run's log `farm pool X: STOPPED - a definitive refusal, not retried: ... Fix: ...` (and `STOPPED since ...` at every
+    iteration's end), the metrics row's `selfplay.pools.<name>` `stopped` {reason, fix} and `error`, progress.json's
+    `pools.<name>.state` 'stopped' (the dashboard's status line shows `FARM POOL ... STOPPED`), `describe()`, and
+    state.json `stopped` (cleared by the next process, which tries again). The run goes on with its own games; the farm
+    run keeps any generation registered before (the log says to pause it on the coordinator if it should stop).
+* **The run's start** (`Run.loop`, after the device and rows checks, before iteration 0's checkpoint is written;
+  `check_farm_use`):
+  * With a self-play farm pool (`selfplay_pools`: the setting's or the `selfplay_remotes` file's) - nothing.
+  * **Pool settings that do nothing** (`inert_pool_settings`: every `pool_*` setting not at its default while
+    self-play has no pool, except those a farm evaluation reads when `eval_remote` is a pool - `POOL_EVAL_KEYS`) - a
+    `WARNING: pool settings that do nothing: ...` line at every start.
+  * **The reason to stay here**: the run setting **`selfplay_local_reason`** ('' by default; free text; trainer-only,
+    `crates/worker/src/run_settings.json`, so no worker build needs it) or, when it is empty, the environment variable
+    `ZERO_SELFPLAY_LOCAL_REASON` (for test harnesses and smoke runs; never saved in config.json). Given: logged
+    (`self-play on this machine only (<where>): <reason>`), and that is all.
+  * **Without a reason**, the game package's new hook **`farm_build`** (`GamePackage(farm_build=fn | 'module:attr')`,
+    `published_farm_build(run, cfg, log)`: a description of the published farm build of the code this process runs, or
+    None; an exception counts as none and is logged) is asked. None (no hook - the toy game, the other games today -,
+    no build, no index on this machine): nothing. A build: **a first start is refused** (`FarmUseRefused`, an
+    EncodingMismatch: exit 78) and a resumed run gets a `WARNING: a published farm build exists for this commit ...`
+    line. A first start is a fresh one (`latest_iter` is None: no checkpoint) or a fork's first (`fork.json` without
+    `started`) - `first_start(run)`. Every run that has started before is a resume: all runs made before this change
+    (none has a fork.json), every restart after PAUSE, STOP, a crash or a re-pin.
+
+**Off by default / what changes for existing runs.** A run with a farm pool and an already-written pool template (every
+live and paused farm run on the maintainer's machine, checked read-only on 2026-11-21: each `pool/<farm run>/state.json`
+has `play`) resumes exactly as before: no settings check at its start, no new line. A run without a pool resumes with,
+at most, warning lines (never refused: no fork.json exists anywhere). Defaults are untouched: no search, play,
+encoding, shard or training path changed, and the worker's answers are the same (the settings table gained one
+trainer-only key). **Deliberate behaviour changes:** (a) a definitive pool refusal stops the pool instead of retrying
+forever (`tests/test_farm_pool.py::test_pool_rolling_checks_the_worker_and_puts_rolling` now expects the stop and a
+restart with the fixed worker); (b) a fork of a farm-attached run self-plays on a farm run of its own unless told
+`--farm none` (before: on its parent's); (c) with a game package that has the hook, a fresh start or a fork's first
+start without a farm pool and without a reason, beside a published build, is refused.
+
+**Costs.** At a new pool's start: the worker's `info` + two `check-config` + two `driver-cfg` calls, which the pool's
+thread made anyway (0.23 s with MTG Zero's release worker f22f63bb on legacy-meta3-r1's settings, the desktop,
+2026-11-21; a refusal 0.04 s). At a run's start without a pool: the hook (MTG Zero's index lookup, 0.03 s).
+
+**Tests and checks.** `tests/test_farm_guards.py` (new, 7): `fork_farm` (own names, `--farm NAME`, `none` keeping
+another host, overrides kept as given, the refusals, slugs, a long name's `-eval`), the source's selfplay_remotes file
+as the parent's farm, `inert_pool_settings` / `selfplay_pools`, `check_farm_use` (refused first start, warned resume,
+the setting, the environment variable, no build, a pool, a failing hook), `first_start` / `fork.json`; end to end on
+the toy game with a stand-in hook (a wrapper script setting `package.CORE.farm_build`): a fresh start refused (exit
+78, run_state 'refused', no checkpoint written), the same run started with a reason; a run started before the hook
+resumed with a warning (and the inert `pool_build` warning); its fork's first start refused, then started with
+`$ZERO_SELFPLAY_LOCAL_REASON` and marked; a fork of a farm-attached parent naming its own farm runs in config.json and
+fork.json, and a `--set` naming the parent's refused before anything is copied; a pool whose worker is missing refusing
+the run's start (exit 78). `tests/test_farm_pool.py` (+4): the settings check names the refused key with its status and
+the fix (a missing worker, another build); a refusing build refuses the start with nothing put on the farm, a check
+that cannot run is retried by the thread, a resumed pool is not checked; a definitive refusal on the thread (an
+alternate's manifest, a phase spec's settings) stops the pool - never retried, the log, metrics, progress, describe and
+state.json - and a restart clears it; a coordinator answering 503 three times is retried and the gen registered.
+`tests/test_worker_settings.py` (the new key classified). `bash tools/smoke_all.sh --with-this-core --build-only` on
+bef9cc8 (this section's code; what follows it is Python and docs): `games: 3 of 3 checked` (glassroad-zero 44 s,
+caverna-zero 35 s, kingdombuilder-zero 66 s), GREEN. With the rest of the files the change touches (test_farm_pool,
+test_farm_guards, test_worker_settings, test_loop, test_eval_pool, test_multi_remote, test_farm_h2h, test_privacy,
+test_run_infra, test_farm_def): 127 passed, 8 skipped (the live-run fence). The full suite on the desktop beside two
+live runs (2026-11-21, 31 min): 790 passed, 31 skipped (the live-run fence), 3 failed - none this change's:
+`test_dup_reduce.py::test_max_is_deterministic_on_cuda_and_matches_the_cpu` fails alone on this commit and on c850a5d
+(the commit before) alike, with the desktop's GPU busy with a live run; `test_token_graphs.py::
+test_absent_slots_are_never_read[max]` (CUDA graphs) and `test_shard_thread.py::test_rolling_run_quotas_exact` (97 games
+for a quota of 96 in a rolling writer-thread run, a toy run without a farm pool) pass alone. MTG Zero's optin-core gate
+of the pin runs the suite again (its core pytest step), ENGINE.md 218.
