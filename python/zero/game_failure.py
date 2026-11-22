@@ -105,10 +105,15 @@ def repro_cmd(pkg, path, line):
     return f'python -m {pkg}.az.game_failure replay "{os.path.abspath(path)}" --line {line}'
 
 
+def _stamp(game):
+    from . import package
+    return package.layout_stamp(game)       # (an aliased game's layout record, docs/az.md 73)
+
+
 def record(f, *, it, source, game, engine_commit, build, path, line, pkg, t=None):
     """One game_failures.jsonl line (module docs) of a driver failure `f` (`GameFailure::to_json`'s dict; a remote's
     may carry its own engine_commit / build, which win)."""
-    return {'t': round(time.time() if t is None else t, 3), 'iter': it, 'source': source, 'game': game,
+    return {'t': round(time.time() if t is None else t, 3), 'iter': it, 'source': source, 'game': game, **_stamp(game),
             'game_id': f.get('gid'), 'driver_seed': f.get('driver_seed'), 'game_seed': f.get('game_seed'),
             'players': f.get('players'), 'spec': f.get('spec'), 'moves': f.get('steps') or [],
             'phase': f.get('phase') or 'search', 'panic_move': f.get('panic_move'), 'tag': f.get('tag'),
@@ -149,6 +154,11 @@ def read(path, line=None):
     return json.loads(lines[line - 1])
 
 
+def _record_game(rec):
+    from . import package
+    return package.record_game(rec, default='mtg')   # (resolved, docs/az.md 73; a record of before names none: MTG's)
+
+
 def replay(rec, rollouts=64, seed=0, max_steps=20000, engine=None):
     """Replay a record (module docs) -> (reproduced, text): (True, the panic's message) or (False, the replay's
     facts as JSON). ValueError when it cannot be replayed."""
@@ -157,7 +167,7 @@ def replay(rec, rollouts=64, seed=0, max_steps=20000, engine=None):
         os.environ[name] = value                   # (a test fault: armed as it was when it panicked)
     E = engine or G.engine()
     try:
-        out = E.replay_failure(rec.get('game') or 'mtg', json.dumps(driver_failure(rec)), int(rollouts), int(seed),
+        out = E.replay_failure(_record_game(rec), json.dumps(driver_failure(rec)), int(rollouts), int(seed),
                                int(max_steps))
     except BaseException as e:                     # noqa: BLE001 - pyo3's PanicException is a BaseException
         if type(e).__name__ == 'PanicException':

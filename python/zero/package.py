@@ -158,6 +158,13 @@ class GamePackage:
                     when self-play names no farm pool and no `selfplay_local_reason` is given: with a build, a first
                     start is refused (exit 78) and a resumed run warns. An exception counts as none (logged).
                     Default none: never asked
+    game_aliases    {name: {'layout': rev, 'before': game}} (docs/az.md 73): a game NAME whose meaning changed - the
+                    game `name` is its layout revision `rev` from now on, and a record that names `name` without a
+                    layout record (a run config, a checkpoint's network config, a graph's metadata, a shard's or a
+                    records file's header, a farm job's settings, an evaluation record written before the change) is
+                    the game `before` (MTG Zero: {'mtg': {'layout': 8, 'before': 'mtg_v7'}}). Every game name in a
+                    process is the resolved one (`resolve_game`); what is written names it with its `game_layout`
+                    (`layout_stamp`). Default none: every name means what it always meant
     """
 
     def __init__(self, name, title, root, engine=None, run_module=None, game='toy', specs=None,
@@ -166,7 +173,7 @@ class GamePackage:
                  grids=None, remotes=None, tokens=None, eval_specs=None, deferred=None, evals=None, aux=None,
                  replay_aux=None, readers=None, remote_eval_files=None, settings=None, selfplay_specs=None,
                  remote_eval_inputs=None, evals_every=None, companion=None, on_fork=None, engine_paths=None,
-                 setting_classes=None, h2h_backend=None, farm_build=None):
+                 setting_classes=None, h2h_backend=None, farm_build=None, game_aliases=None):
         self.name = name
         self.title = title
         self.root = os.path.abspath(root)
@@ -209,6 +216,16 @@ class GamePackage:
         self.setting_classes = dict(setting_classes or {})
         self.h2h_backend = h2h_backend
         self.farm_build = farm_build
+        self.game_aliases = {}
+        for g, a in (game_aliases or {}).items():
+            rev, before = (a or {}).get('layout'), (a or {}).get('before')
+            if not isinstance(rev, int) or isinstance(rev, bool) or rev < 1 or set(a) != {'layout', 'before'}:
+                raise ValueError(f'{name}: game_aliases of {g!r}: {a!r} is not {{"layout": <an integer >= 1>, '
+                                 f'"before": <a game>}}')
+            if not isinstance(before, str) or not before or before == g or before in (game_aliases or {}):
+                raise ValueError(f'{name}: game_aliases of {g!r}: before {before!r} is not another game (nor an '
+                                 f'aliased name)')
+            self.game_aliases[g] = {'layout': rev, 'before': before}
         for k, c in self.setting_classes.items():
             if k not in self.settings:
                 raise ValueError(f'{name}: setting_classes names {k!r}, which is not one of the package\'s settings')
@@ -383,6 +400,33 @@ class GamePackage:
         """The default spec of `game` ('' if none)."""
         return self.specs.get(game, '')
 
+    def resolve_game(self, name, layout=None, where=''):
+        """The game a record naming game `name` with layout record `layout` (its `game_layout`; None: none) is
+        (`game_aliases`, docs/az.md 73): an aliased name without a layout record is its `before` game, with its
+        revision the name itself; any other layout record is refused (GameAliasError), as is a layout record of a
+        game whose name never changed. A resolved name resolves to itself (with its own stamp)."""
+        a = self.game_aliases.get(name)
+        at = f'{where}: ' if where else ''
+        if layout is not None and (not isinstance(layout, int) or isinstance(layout, bool)):
+            raise GameAliasError(f'{at}game {name!r}: game_layout {layout!r} is not an integer (docs/az.md 73)')
+        if a is None:
+            if layout is not None:
+                raise GameAliasError(f'{at}game {name!r} with game_layout {layout}: the game package {self.name!r} '
+                                     f'has no layout revisions of {name!r} (docs/az.md 73: a layout is never guessed)')
+            return name
+        if layout is None:
+            return a['before']
+        if layout != a['layout']:
+            raise GameAliasError(f'{at}game {name!r} with game_layout {layout}: this build plays {name!r} as layout '
+                                 f'{a["layout"]} (and {name!r} without a layout record as {a["before"]!r}; docs/az.md 73)')
+        return name
+
+    def layout_of(self, game):
+        """The layout record a resolved game is written with (`game_layout`): its revision for an aliased name, else
+        None (nothing written: every other game's records exactly as before)."""
+        a = self.game_aliases.get(game)
+        return a['layout'] if a else None
+
     def env(self, key, default=None):
         """`<PREFIX>_<key>` from the environment (e.g. GRZ_SUPERVISE_WAIT)."""
         return os.environ.get(f'{self.env_prefix}_{key}', default)
@@ -536,6 +580,44 @@ def register(pkg):
 def active():
     """The registered game package, or the core's own (`CORE`: the toy game)."""
     return _ACTIVE if _ACTIVE is not None else CORE
+
+
+class GameAliasError(ValueError):
+    """A record's game name and layout record that name no game of this build (`GamePackage.resolve_game`,
+    docs/az.md 73): refused, never guessed."""
+
+
+def resolve_game(name, layout=None, where=''):
+    """The active package's `resolve_game`: the game a record naming `name` with layout record `layout` is."""
+    return active().resolve_game(name, layout, where)
+
+
+def record_game(rec, where='', default=None):
+    """The game a record dict (a run config, a network config, a header, a job's settings) names: its `game` (else
+    `default`) with its `game_layout`, resolved (docs/az.md 73). None when it names none and no default is given."""
+    rec = rec or {}
+    name = rec.get('game') or default
+    if name is None:
+        return None
+    return active().resolve_game(name, rec.get('game_layout'), where)
+
+
+def layout_stamp(game):
+    """{'game_layout': rev} for a resolved game written under an aliased name, else {} (docs/az.md 73)."""
+    rev = active().layout_of(game)
+    return {} if rev is None else {'game_layout': rev}
+
+
+def set_game(d, game):
+    """`d` naming the resolved game `game`: its `game`, and its `game_layout` (the revision of an aliased name; None
+    when `d` holds the key - a run's settings - and the game has none; else the key left out). Returns `d`."""
+    d['game'] = game
+    rev = active().layout_of(game)
+    if rev is not None:
+        d['game_layout'] = rev
+    elif 'game_layout' in d:
+        d['game_layout'] = None
+    return d
 
 
 def resolve(obj):

@@ -1057,13 +1057,21 @@ impl Run<'_> {
 
 /// Run `job` to its end. `link_out` receives the evaluator link (the agent's yield / resume) once the
 /// evaluator is loaded.
+/// `v` (an object naming `game`) with the game's layout record (docs/az.md 73).
+pub fn stamped(game: &GameEntry, mut v: Value) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        game.stamp(o);
+    }
+    v
+}
+
 pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, progress: Arc<Mutex<Progress>>, link_out: &dyn Fn(EvalLink)) -> Result<Outcome, String> {
     let t0 = Instant::now();
     let info = (game.info)();
     let cfg = job_driver_cfg(game, job)?;
     let branches = cfg.branch.is_some();
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
-    let want = Expect::of(&info, belief);
+    let want = Expect::of_entry(game, belief);
     let evs = build_evals(&job.eval, &want, sink, &progress, None)?;
     let workers = if evs.len() > 1 { format!(" x {} evaluator threads", evs.len()) } else { String::new() };
     sink.log(&format!("job {}: {} games from gid {}, seed {}, net {}; driver: conc {}, threads {}, groups {}, sparse; evaluator: {}{workers}", job.lease_id, job.games, job.gid_base, job.seed, job.net, cfg.concurrency, cfg.threads, cfg.groups, evs[0].describe()));
@@ -1090,6 +1098,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     drv.resume(BIG, job.net)?;
     let mut meta = Map::new();
     meta.insert("game".into(), json!(info.name));
+    game.stamp(&mut meta);                          // (an aliased name's layout record, docs/az.md 73)
     meta.insert("features".into(), json!(info.num_features));
     meta.insert("actions".into(), json!(info.num_actions));
     meta.extend(job.meta.clone());
@@ -1098,6 +1107,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let rec = if job.output.records() {
         let mut h = Map::new();
         h.insert("game".into(), json!(info.name));
+        game.stamp(&mut h);
         h.insert("spec".into(), json!(spec));
         h.insert("aux".into(), json!(aux));
         h.insert("features".into(), json!(info.num_features));
@@ -1192,7 +1202,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         Ok(())
     })();
     let rec_res = match (&r.recorder, &res) {
-        (Some(rc), Ok(())) => rc.write(&json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker"}), &info),
+        (Some(rc), Ok(())) => rc.write(&stamped(game, json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker"})), &info),
         _ => Ok(()),
     };
     r.snapshot();
@@ -1282,7 +1292,7 @@ mod tests {
         assert!(check_file_sha256(&d.join("missing.onnx"), &good, None).is_err());
         // a wrong hash ends the job before ONNX Runtime is touched (there is no runtime here at all; the right hash
         // reaching the loader is the worker's integration tests': MTG Zero tests/test_worker_farm.py)
-        let want = Expect { game: "toy".into(), features: 1, actions: 1, aux_width: 0, belief: false, tails: vec![], option_pointers: false };
+        let want = Expect { game: "toy".into(), features: 1, actions: 1, aux_width: 0, belief: false, tails: vec![], option_pointers: false, layout: None, before_of: None };
         let ort = OrtCfg::cpu(d.join("no-onnxruntime.dll"), 1, false);
         let progress = Mutex::new(Progress::default());
         let kind = EvalKind::Onnx { model: p.clone(), ort, sha256: Some(bad.clone()), reference: None };

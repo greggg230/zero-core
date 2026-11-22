@@ -157,8 +157,13 @@ def load_archive(path, game, spec):
         raise SystemExit(f'selfplay_archive {path}: {type(e).__name__}: {e}') from None
     if not isinstance(A, dict) or A.get('format') != FORMAT:
         raise SystemExit(f'selfplay_archive {path}: not a {FORMAT} file')
-    if A.get('game') != game:
-        raise SystemExit(f'selfplay_archive {path}: built for game {A.get("game")!r}, the run plays {game!r}')
+    from . import package
+    try:
+        ag = package.record_game(A)                 # (resolved, docs/az.md 73)
+    except package.GameAliasError as e:
+        raise SystemExit(f'selfplay_archive {path}: {e}') from None
+    if ag != game:
+        raise SystemExit(f'selfplay_archive {path}: built for game {ag!r}, the run plays {game!r}')
     base = json.loads(spec_json(spec))
     built = A.get('base_spec')
     built = json.loads(built) if isinstance(built, str) else built

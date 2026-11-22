@@ -585,8 +585,7 @@ fn key_gens_of(job: &EvalJob, keys: &[(String, KeyKind)]) -> Result<Vec<Option<u
 /// `selftest` with its `gen`, once per generation - a generation's further sessions are tested quietly; a failure ends
 /// the job before any game), each lane's sessions with the layout's intra-op threads.
 fn build_lanes(game: &GameEntry, job: &EvalJob, key_gens: &[Option<u32>], layout: &Layout, belief: bool, sink: &dyn Sink, progress: &Mutex<Progress>) -> Result<Vec<ByKey>, String> {
-    let info = (game.info)();
-    let want = Expect::of(&info, belief);
+    let want = Expect::of_entry(game, belief);
     let ort = job.ort.as_ref().map(|o| {
         let mut o = o.clone();
         o.intra_threads = layout.intra;
@@ -729,7 +728,7 @@ pub fn run_eval_job(game: &GameEntry, job: &EvalJob, ctl: &Control, sink: &dyn S
         r.write_file(rest)
     })();
     let rec_res = match (&r.recorder, &res) {
-        (Some(rc), Ok(())) => rc.write(&json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker eval"}), &info),
+        (Some(rc), Ok(())) => rc.write(&crate::job::stamped(game, json!({"game": info.name, "features": info.num_features, "actions": info.num_actions, "seed": job.seed, "worker": "zero_worker eval"})), &info),
         _ => Ok(()),
     };
     r.snapshot();

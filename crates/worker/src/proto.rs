@@ -211,7 +211,30 @@ fn game_of<'a>(games: &'a [GameEntry], s: &Settings) -> Result<&'a GameEntry, St
         Some(crate::pyjson::PyJson::Str(g)) => g.clone(),
         other => return Err(format!("settings: game {:?}", other.map(|g| g.dumps()))),
     };
-    games.iter().find(|g| g.name == name).ok_or_else(|| format!("game {name:?}: this worker plays {:?}", games.iter().map(|g| g.name).collect::<Vec<_>>()))
+    crate::resolve_game(games, &name, settings_layout(s)?).map_err(|e| format!("settings: {e}"))
+}
+
+/// The settings' `game_layout` (docs/az.md 73): None when absent or null, else a positive integer.
+pub fn settings_layout(s: &Settings) -> Result<Option<u64>, String> {
+    match s.get("game_layout") {
+        None | Some(crate::pyjson::PyJson::Null) => Ok(None),
+        Some(crate::pyjson::PyJson::Int(i)) if *i >= 1 && *i <= u32::MAX as i128 => Ok(Some(*i as u64)),
+        Some(other) => Err(format!("settings: game_layout {}: an integer >= 1 or null (docs/az.md 73)", other.dumps())),
+    }
+}
+
+/// `s` naming the game the worker picked for it (`game_of`): its `game` the entry's name, its `game_layout` the entry's
+/// revision (null when the key is there and the entry has none) - what `classify` checks against the game's info
+/// (docs/az.md 73: settings naming an aliased name without a layout record play the name's old game).
+fn resolved_settings(game: &GameEntry, s: &Settings) -> Settings {
+    let mut r = s.clone();
+    r.set("game", crate::pyjson::PyJson::Str(game.name.to_string()));
+    match game.layout {
+        Some(l) => r.set(classify::LAYOUT_KEY, crate::pyjson::PyJson::Int(l as i128)),
+        None if s.get(classify::LAYOUT_KEY).is_some() => r.set(classify::LAYOUT_KEY, crate::pyjson::PyJson::Null),
+        None => {}
+    }
+    r
 }
 
 fn read_settings(path: &str) -> Result<Settings, String> {
@@ -447,7 +470,7 @@ fn eval_job_from_value(v: &Value, base: &Path) -> Result<crate::evaljob::EvalJob
 fn eval_settings_failures(w: &Worker, game: &GameEntry, s: &Settings, seats: &[crate::settings::EvalSeat]) -> Result<Vec<String>, String> {
     let info = (game.info)();
     let others: Vec<_> = w.games.iter().filter(|g| g.name != game.name).map(|g| (g.info)()).collect();
-    let v = classify::classify_eval(s, &info, &others, w.package_settings)?;
+    let v = classify::classify_eval(&resolved_settings(game, s), &info, &others, w.package_settings)?;
     let mut bad: Vec<String> = classify::failures(&v).iter().map(|x| format!("{} = {}: {} ({})", x.key, x.value, x.status, x.why)).collect();
     if let Err(e) = crate::settings::eval_driver_cfg(s, &info, seats, 2, 0, true, None, None, None) {
         bad.push(format!("the evaluation match: {e}"));
@@ -1013,7 +1036,7 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
             Some(t) => seats_of_value(&serde_json::from_str::<Value>(t).map_err(|e| format!("--seats: {e}"))?)?,
             None => vec![crate::settings::EvalSeat::Net(1), crate::settings::EvalSeat::Net(2)],
         };
-        let v = classify::classify_eval(&s, &info, &others, w.package_settings)?;
+        let v = classify::classify_eval(&resolved_settings(game, &s), &info, &others, w.package_settings)?;
         let bad = classify::failures(&v);
         let built = crate::settings::eval_driver_cfg(&s, &info, &seats, 2, 0, true, None, None, None).err();
         if a.has("--json") {
@@ -1036,7 +1059,7 @@ fn check_config(w: &'static Worker, a: &Args) -> Result<i32, String> {
         }
         return Ok(if bad.is_empty() && built.is_none() && libm.is_empty() { 0 } else { 1 });
     }
-    let v = classify::classify_with(&s, &info, &others, w.package_settings)?;
+    let v = classify::classify_with(&resolved_settings(game, &s), &info, &others, w.package_settings)?;
     let bad = classify::failures(&v);
     // the settings must also build the driver (the Python remote worker's checks)
     let built = crate::settings::selfplay_driver_cfg(&s, &info, 0, 0).err();

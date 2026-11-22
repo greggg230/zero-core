@@ -154,7 +154,7 @@ def compare(py_shards, rs_shards, py_batches, rs_batch_file, nb):
     if len(py_shards) != len(rs_shards):
         bad.append(f'{len(py_shards)} Python shards, {len(rs_shards)} native')
     rows = 0
-    fmt = ('game', 'features', 'actions', 'rows', 'x_format', 'x_version', 'x_cols', 'x_nnz', 't_segs', 'option_pointers',
+    fmt = ('game', 'game_layout', 'features', 'actions', 'rows', 'x_format', 'x_version', 'x_cols', 'x_nnz', 't_segs', 'option_pointers',
            'max_row_tokens')
     for p, r in zip(py_shards, rs_shards):
         with np.load(p) as zp, np.load(r) as zr:

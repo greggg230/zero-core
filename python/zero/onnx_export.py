@@ -880,7 +880,7 @@ class ZeroOnnx2(ZeroOnnx):
 
     # a block of zeros appended to the policy before a scatter: as a Concat with zeros (every graph before), or as a Pad
     # of the policy (the fast graph: the same tensor; ONNX Runtime's CUDA host time of those two Concats was ~20 % of a
-    # call's, docs/az.md 73)
+    # call's, docs/az.md 74)
     PAD_ZEROS = False
 
     VERSION = 2
@@ -1993,6 +1993,8 @@ def metadata(net, packing, extra=None):
             'outputs': json.dumps(list(OUTPUTS)), 'packing': str(packing or 'none'), 'opset': str(OPSET),
             'unique_scatters': '0' if packing in ('compact', 'host') else '1',
             'exporter': 'torch.onnx.export(dynamo=True)', 'torch': torch.__version__}
+    if c.get('game_layout') is not None:            # (an aliased game's layout record, docs/az.md 73; else absent)
+        meta['game_layout'] = str(int(c['game_layout']))
     if packing == 'host':
         meta['present_index'] = json.dumps(net.present_index())
     if getattr(net, 'dup_reduce', None) is not None:
@@ -3038,6 +3040,8 @@ def write_reference_rows(net, rows, bo, out, info=None, tol=REFERENCE_TOL):
             'actions': int(net.config['actions']), 'aux_width': W, 'rows': int(rows.B), 'belief_rows': n_belief,
             'value_rows': int((rows.extra == ROW_VALUE).sum()), 'batches': int(len(bo) - 1), 'tol': tol,
             'sources': rows.source, 'torch': torch.__version__, 'answers': 'infer.NetEvaluator, eager, CPU'}
+    if net.config.get('game_layout') is not None:  # (docs/az.md 73)
+        meta['game_layout'] = int(net.config['game_layout'])
     if v2:
         meta.update(rows.tail_stats())
         meta['t_segs'] = [[int(j), str(nm), int(w), int(h)] for j, nm, w, h in net.tail_segments()]

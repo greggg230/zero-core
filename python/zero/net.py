@@ -1856,11 +1856,37 @@ def build(config):
     """A network from its config (a checkpoint's): `GridNet` for arch 'grid', `TokenNet` for
     'tokens', else `Net`."""
     cfg = dict(config)
+    game = config_game(cfg)                        # (the resolved game, docs/az.md 73)
+    cfg.pop('game_layout', None)
+    if cfg.get('game') is not None:
+        cfg['game'] = game
     arch = cfg.get('arch', 'mlp')
     if arch in ARCHS:
-        return ARCHS[arch](**cfg)
+        return stamp_game(ARCHS[arch](**cfg))
     cfg.pop('arch', None)
-    return Net(**cfg)
+    return stamp_game(Net(**cfg))
+
+
+def config_game(config, where=None):
+    """The game a network config records, resolved (`zero.package.record_game`, docs/az.md 73): its `game` with its
+    `game_layout` - a config of an aliased name written before the change is the name's old game. None: a config
+    without a game (older checkpoints). A layout record no game of this build has: EncodingMismatch."""
+    from . import package
+    try:
+        return package.record_game(config, where or '')
+    except package.GameAliasError as e:
+        raise EncodingMismatch(str(e)) from None
+
+
+def stamp_game(model):
+    """`model` whose config names its resolved game with the game's layout record (`zero.package.set_game`: the
+    revision of an aliased name; nothing for every other game - its config exactly as before)."""
+    from . import package
+    g = model.config.get('game')
+    if g is not None:
+        model.config.pop('game_layout', None)
+        model.config.update(package.layout_stamp(g))
+    return model
 
 
 def add_aux(model, aux, seed=0):
@@ -2200,7 +2226,10 @@ def encoding_mismatch(config, game=None):
     network's board grid, if the package has one. A network without layout or grid metadata (arch
     'mlp', older checkpoints) is judged by the game and the counts alone."""
     from . import package
-    mine = config.get('game')
+    try:
+        mine = config_game(config)
+    except EncodingMismatch as e:
+        return [str(e)], {'game': config.get('game'), 'game_layout': config.get('game_layout')}, {'game': game}
     game = game or mine or package.active().game
     enc = build_encoding(game)
     arch = config.get('arch', 'mlp')
@@ -2292,18 +2321,18 @@ def make_net(info, game, arch='mlp', hidden=256, blocks=4, ch=64, heads=4, ff=0,
         grid = package.active().grids.get(game)
         if not grid:
             raise SystemExit(f"arch 'grid': the game package has no grid for {game!r} (GamePackage.grids)")
-        return GridNet(F_, A_, grid, ch, blocks, game=game, **kw).eval()
+        return stamp_game(GridNet(F_, A_, grid, ch, blocks, game=game, **kw).eval())
     if arch == 'tokens':
         layout = package.active().tokens_of(game)
         if not layout:
             raise SystemExit(f"arch 'tokens': the game package has no object layout for {game!r} (GamePackage.tokens)")
         if check_dup_reduce(dup_reduce) is not None:
             kw['dup_reduce'] = check_dup_reduce(dup_reduce)
-        return TokenNet(F_, A_, layout, d=hidden, layers=blocks, heads=heads, ff=ff or 2 * hidden, game=game,
-                        **kw).eval()
+        return stamp_game(TokenNet(F_, A_, layout, d=hidden, layers=blocks, heads=heads, ff=ff or 2 * hidden,
+                                   game=game, **kw).eval())
     if arch != 'mlp':
         raise SystemExit(f"unknown arch {arch!r} ('mlp', 'grid', 'tokens')")
-    return Net(F_, A_, hidden, blocks, game=game, **kw).eval()
+    return stamp_game(Net(F_, A_, hidden, blocks, game=game, **kw).eval())
 
 
 def _global_blocks(lay, features):

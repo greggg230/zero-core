@@ -148,7 +148,9 @@ def run_settings(ckpt):
     except (SystemExit, ValueError) as e:
         print(f'# note: the run config of {ckpt} does not resolve ({e}): its saved values over the defaults',
               file=sys.stderr, flush=True)
-        return dict(R.DEFAULTS, **c)
+        out = dict(R.DEFAULTS, **c)
+        package.set_game(out, package.record_game(c))   # (the resolved game, docs/az.md 73; a bad layout record raises)
+        return out
 
 
 def run_seat_keys(ckpt):
@@ -600,7 +602,7 @@ def match(a, b, games=600, sims=64, chance_k=2, c_puct=1.0, seed=0, threads=4, g
     st = []
     rs = _play(game, sa, sb, evs, games, spec, conc, seed, threads, groups, max_steps, move_log, paired, st, sp,
                _rec(a, b, sa, sb))
-    out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
+    out = dict({'a': a, 'b': b, 'game': game, **package.layout_stamp(game), 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb))
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
@@ -725,7 +727,7 @@ def sequential(a, b, batch_games=600, max_games=2400, sprt=None, alpha=0.05, bet
         return _play(game, sa, sb, evs, n, spec, conc, seed + 7919 * k, threads, groups, max_steps, 0, paired, st, sp,
                      rec, {'batch': k, 'gid_offset': off})
     rs, batches, stop, llr = batch_loop(play, batch_games, max_games, paired, bounds, target_se, on_batch, t0)
-    out = dict({'a': a, 'b': b, 'game': game, 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
+    out = dict({'a': a, 'b': b, 'game': game, **package.layout_stamp(game), 'sims': sims, 'chance_k': chance_k}, **summary(rs, paired))
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb), batches=batches, stop=stop)
     _sides_sims(out, sims_a, sims_b)
     _graphs_used(out, evs, graphs)
@@ -994,7 +996,7 @@ def remote_match(runner, a, sides, seq=False, sprt=None, sink=None, name='farm')
                                             a.target_se, _progress, t0)
     else:
         rs = play(0, a.games, 0)
-    out = dict({'a': a.a, 'b': a.b, 'game': game, 'sims': a.sims, 'chance_k': a.chance_k}, **summary(rs, a.paired))
+    out = dict({'a': a.a, 'b': a.b, 'game': game, **package.layout_stamp(game), 'sims': a.sims, 'chance_k': a.chance_k}, **summary(rs, a.paired))
     out.update(seconds=round(time.time() - t0, 1), select_a=_tag(sa), select_b=_tag(sb))
     if seq:
         out.update(batches=batches, stop=stop)

@@ -234,7 +234,7 @@ def test_fast_graph_cuda_forms(tmp_path):
 
 
 def test_fast_graph_pads_the_policy_zeros(tmp_path):
-    """docs/az.md 73: the fast graph appends the policy's blocks of zeros as Pads (`PAD_ZEROS`): fewer scatters read a
+    """docs/az.md 74: the fast graph appends the policy's blocks of zeros as Pads (`PAD_ZEROS`): fewer scatters read a
     Concat than in a fast graph exported with the Concats, more Pads; the same answers, bit for bit (the CPU)."""
     import onnx
     import onnxruntime as ort

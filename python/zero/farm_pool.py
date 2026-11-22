@@ -100,6 +100,7 @@ from collections import deque
 
 from . import farm_def as FD
 from . import gamerec as GR
+from . import package
 
 PREFIX = 'pool:'
 SEMVER_RE = FD.SEMVER_RE                    # (as the coordinator checks a version: zero-farm coordinator util.ts)
@@ -1029,6 +1030,10 @@ class Pool:
         want = {'records': version, 'game': self.R.cfg['game'], 'features': info['num_features'],
                 'actions': info['num_actions'], 'aux': self.aux, 'seed': self.seed, 'build_id': self.build}
         got = {k: h.get(k) for k in want}
+        try:
+            got['game'] = package.record_game(h)    # (resolved: an aliased name without its layout record, docs/az.md 73)
+        except package.GameAliasError as e:
+            return self._refuse(r, f'header game: {e}', body)
         if got['build_id'] in self.alt_builds:
             want['build_id'] = got['build_id']     # an alternate's worker: the same engine for another runtime pack
         if got != want:
@@ -1206,7 +1211,8 @@ class Pool:
             d = os.path.join(self.R.run, 'data', f'iter_{it:04d}')
             # (format v2's keys for a game with tails / overrides, docs/az.md 43: `shard_format` with the game's
             # info, as Run.shard_meta)
-            meta = {'game': self.R.cfg['game'], 'features': self.R.info['num_features'],
+            meta = {'game': self.R.cfg['game'], **package.layout_stamp(self.R.cfg['game']),
+                    'features': self.R.info['num_features'],
                     'actions': self.R.info['num_actions'], 'iter': it, 'source': 'pool', 'machine': m,
                     'farm_run': self.farm, **shard_format(self.R.cfg, self.R.info)}
             pre = 'pool-' + ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in m)

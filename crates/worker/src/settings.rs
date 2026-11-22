@@ -775,7 +775,7 @@ impl EvalSeat {
 /// conc=..., paired=...)` with the run's `eval_spec`); every other run setting is unused by an eval job.
 /// zero-core's tests/test_worker_settings.py checks the list against what those functions read.
 pub const EVAL_READS: &[&str] = &[
-    "game", "eval_spec", "conc", "threads", "groups", "max_steps", "sparse", "eval_sims", "c_puct", "chance_k", "margin_w",
+    "game", "game_layout", "eval_spec", "conc", "threads", "groups", "max_steps", "sparse", "eval_sims", "c_puct", "chance_k", "margin_w",
     "redet", "cq_c_visit", "cq_c_scale", "eval_select", "eval_select_min_visits", "eval_select_c_visit",
     "eval_select_c_scale", "eval_root_min_visits", "root_min_visits_max_actions", "eval_leaf_value_view",
     "eval_root_search", "gumbel_m", "eval_gumbel_scale", "eval_cache", "eval_infoset_merge", "eval_belief_tilt",

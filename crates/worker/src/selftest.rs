@@ -194,8 +194,8 @@ pub fn check_meta(r: &Reference, want: &Expect, graph_meta: &[(String, String)])
     let m = &r.meta;
     let s = |k: &str| m.get(k).map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
     if let Some(g) = s("game") {
-        if g != want.game {
-            return Err(format!("reference: game {g:?}, the job plays {:?}", want.game));
+        if let Some(e) = want.game_problem(Some(&g), s("game_layout").as_deref()) {
+            return Err(format!("reference: {e}"));
         }
     }
     for (k, n) in [("features", want.features), ("actions", want.actions)] {
@@ -315,7 +315,7 @@ mod tests {
         write(&p, &[0, 1, 2, 3], &[0.25, 0.75]);
         let r = load(&p).unwrap();
         assert_eq!((r.rows, r.batches.len(), r.batches[0].xs_idx.clone()), (3, 1, vec![0, 2, 4]));
-        let want = Expect { game: "toy".into(), features: 5, actions: 4, aux_width: 2, belief: true, tails: vec![], option_pointers: false };
+        let want = Expect { game: "toy".into(), features: 5, actions: 4, aux_width: 2, belief: true, tails: vec![], option_pointers: false, layout: None, before_of: None };
         check_meta(&r, &want, &[("checkpoint_sha256".into(), "ab".into())]).unwrap();
         assert!(check_meta(&r, &want, &[("checkpoint_sha256".into(), "cd".into())]).unwrap_err().contains("made for checkpoint ab"));
         assert!(check_meta(&r, &Expect { game: "mtg".into(), ..want.clone() }, &[]).is_err());

@@ -44,7 +44,9 @@ def main():
     from zero.onnx_parity import Rows, model_tail_kw
     os.makedirs(a.out, exist_ok=True)
     ort_py = OnnxEvaluator(a.onnx, threads=a.threads)
-    model, _ = load(a.checkpoint, 'cpu', game=ort_py.meta['game'])
+    from zero import package
+    gl = ort_py.meta.get('game_layout')             # (an aliased game's layout record, docs/az.md 73)
+    model, _ = load(a.checkpoint, 'cpu', game=package.resolve_game(ort_py.meta['game'], None if gl is None else int(gl)))
     tev = NetEvaluator(model, 'cpu')
     keys = ('priors', 'value', 'margin', 'aux')
     worst = {f'{p}_{k}': 0.0 for p in ('native_vs_py', 'native_vs_torch', 'py_vs_torch') for k in keys}

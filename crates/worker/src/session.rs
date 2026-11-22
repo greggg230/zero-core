@@ -806,7 +806,7 @@ pub fn expect_of(meta: &[(String, String)], path: &Path) -> Result<Expect, Strin
             tails.push((a[0].as_u64().unwrap_or(0) as u16, a[1].as_str().unwrap_or_default().to_string(), a[2].as_u64().unwrap_or(0) as usize, a[3].as_u64().unwrap_or(0) as usize));
         }
     }
-    Ok(Expect { game: get("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false, tails, option_pointers: get("option_pointers").as_deref() == Some("true") })
+    Ok(Expect { game: get("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false, tails, option_pointers: get("option_pointers").as_deref() == Some("true"), layout: get("game_layout").and_then(|l| l.parse().ok()), before_of: None })
 }
 
 /// zero-onnx/2's more inputs (zero-core docs/az.md 46): the driver's options, tail tokens and pointer overrides, every
@@ -899,8 +899,8 @@ fn check_graph(s: &Session, meta: &[(String, String)], path: &Path, want: &Expec
         Some("2") => true,
         v => return Err(format!("{}: zero_onnx {v:?}: this worker reads zero-onnx/1 and zero-onnx/2", path.display())),
     };
-    if get("game") != Some(want.game.as_str()) {
-        return Err(format!("{}: a network of game {:?}, the job plays {:?}", path.display(), get("game"), want.game));
+    if let Some(e) = want.game_problem(get("game"), get("game_layout")) {
+        return Err(format!("{}: {e}", path.display()));
     }
     let (f, a, w) = (num("features")?, num("actions")?, num("aux_width")?);
     if f != want.features {
