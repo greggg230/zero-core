@@ -9811,3 +9811,25 @@ of 46 / 46 / 44 games, mean gap 0.007-0.011, no merges (the toy has no merge key
 turns): 80 branches, 10 merged (12.5%) after 2.4 decisions on average (24 rows), the other 70 played to the end
 (204 rows). On MTG Zero nothing measured yet but the farm checks of 72.6: its `merge_key` / `branch_alt_ok` hooks are
 its own change, and the A/B is its B2 step 2.
+
+## 73. The fast graph's blocks of zeros as Pads (`ZeroOnnx2Fast.PAD_ZEROS`; no setting; zero-farm's CUDA PCs, 2026-11-22)
+
+**Why.** On a farm PC's NVIDIA GPU (the farm's CUDA pack, ONNX Runtime 1.24.4) the fast fp16 graph's call is bound by
+ONNX Runtime's host side: the calling thread's CPU equals the call's wall time (~22 ms at 575 rows for ~9 ms of GPU
+work), which leaves a 4-core PC's crew of three workers CPU-bound. ONNX Runtime's node profile of that call put ~20 %
+of its host time in two Concat nodes - the policy's generic logits joined to a block of zeros (the spare places) before
+the policy scatter, and the policy joined to the overrides' spare places - ~1.6-2.4 ms each.
+
+**What.** In the fast graph (`fast`, `pool_export` 'fast' and its variants) those two blocks of zeros are appended as a
+Pad of the same tensor (`F.pad`, constant 0) instead of a Concat with zeros: the same tensor, so the same answers. Every
+other graph (the default zero-onnx/2 graph, the static graph, zero-onnx/1) keeps its Concats, byte for byte.
+
+**Checked.** `tests/test_onnx_fast.py::test_fast_graph_pads_the_policy_zeros` (fewer scatters reading a Concat, more
+Pads than the fast graph exported with the Concats; the same answers bit for bit on the CPU); the fast, static and
+zero-onnx/2 suites. On a live run's network (gen 769) the new export's answers on the CPU are the earlier fast graph's
+bit for bit (64 and 256 rows of its reference set).
+
+**Measured** (a farm PC: 4 cores / 8 threads, an NVIDIA GPU; gen 769 fp16, real rows; first as graph surgery of the
+released export): a call's thread CPU 16.4 -> 14.8 ms at 352 rows, 23.8 -> 18.4 ms at 575; a crew of 3 x 1,150 games
+in flight in two groups 28.2k -> 30.9k / 31.0k leaves/s (two 5-minute windows, the control in the same session; the
+trainer's own path there 32.9k).

@@ -878,6 +878,11 @@ class ZeroOnnx2(ZeroOnnx):
     the graph reaches 2^31 (docs/az.md 46.2). Packing 'packed' only (each row's tail tokens follow
     its present head tokens in the packed list)."""
 
+    # a block of zeros appended to the policy before a scatter: as a Concat with zeros (every graph before), or as a Pad
+    # of the policy (the fast graph: the same tensor; ONNX Runtime's CUDA host time of those two Concats was ~20 % of a
+    # call's, docs/az.md 73)
+    PAD_ZEROS = False
+
     VERSION = 2
 
     def __init__(self, net, packing='packed', attention=None):
@@ -1118,7 +1123,7 @@ class ZeroOnnx2(ZeroOnnx):
             later = (okey[None, :] == okey[:, None]) & (ar_o[None, :] > ar_o[:, None])
             obad = obad | later.any(1)
             okey = torch.where(obad, B * A1 + ar_o, orow * A1 + act)
-            pol = torch.cat([pol, pol.new_zeros(NO + 1)]).scatter(0, okey, ovv)
+            pol = (F.pad(pol, (0, NO + 1)) if self.PAD_ZEROS else torch.cat([pol, pol.new_zeros(NO + 1)])).scatter(0, okey, ovv)
             if slice_back:
                 pol = pol[:B * A1]
             else:
@@ -1267,6 +1272,9 @@ class ZeroOnnx2Fast(ZeroOnnx2):
     choices (docs/az.md 63): no data-dependent count is used as a size or an offset beyond the batch's own (its
     allocation planner reused live buffers in graphs that did), and no running sum runs over the non-zeros but
     `_csr_rows`' (its CumSum takes ~45 ns an element)."""
+
+    PAD_ZEROS = True
+
 
     def __init__(self, net, packing='packed', attention='mha'):
         if attention not in FAST_ATTENTIONS:
@@ -1730,8 +1738,8 @@ class ZeroOnnx2Fast(ZeroOnnx2):
             # times the columns, not a running sum over all n_h C writes - ONNX Runtime's CUDA CumSum, docs/az.md 66)
             spare = B * A1 + ar_h[:, None] * cols.shape[1] + torch.arange(cols.shape[1], device=dev)[None, :]
             dest = torch.where(ok, row_h[:, None] * A1 + acts, spare)
-            pol = torch.cat([gen.reshape(-1), torch.zeros_like(lg).reshape(-1)]).scatter(
-                0, dest.reshape(-1), lg.reshape(-1))[:B * A1]
+            base = F.pad(gen.reshape(-1), (0, lg.numel())) if self.PAD_ZEROS else torch.cat([gen.reshape(-1), torch.zeros_like(lg).reshape(-1)])
+            pol = base.scatter(0, dest.reshape(-1), lg.reshape(-1))[:B * A1]
         else:
             if net.n_id:
                 it = torch.cat([torch.full_like(ar_b, net.vocab), ids_s])
