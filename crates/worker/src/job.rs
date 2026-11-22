@@ -1056,11 +1056,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let t0 = Instant::now();
     let info = (game.info)();
     let cfg = job_driver_cfg(game, job)?;
-    if cfg.branch.is_some() && job.output.records() {
-        // (a game record replays a game from its seed: records/1 has no branch prefix nor a merged branch's outcome -
-        // zero-core docs/az.md 72.7: the farm pool's records path is the open part; shards jobs play branches)
-        return Err("selfplay_branch: branched games are played into shards only - a game record (output 'records' / 'both') cannot replay a branch game yet (zero-core docs/az.md 72.7)".into());
-    }
+    let branches = cfg.branch.is_some();
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
     let want = Expect::of(&info, belief);
     let evs = build_evals(&job.eval, &want, sink, &progress, None)?;
@@ -1105,7 +1101,12 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
         h.insert("seed".into(), json!(job.seed));
         h.insert("lease".into(), json!(job.lease_id));
         h.insert("build_id".into(), job.meta.get("build_id").cloned().unwrap_or(Value::Null));
-        Some(RecordWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, h, 6)?)
+        let mut rw = RecordWriter::new(&job.out_dir, &job.prefix, shard_rows.max(1) as usize, h, 6)?;
+        if branches {
+            // (branched games: records/2, a game and its branch in one file - records.rs)
+            rw.set_branches();
+        }
+        Some(rw)
     } else {
         None
     };
@@ -1173,7 +1174,7 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
             r.pump()?;
         }
         r.pump()?;
-        if let Some(w) = r.rec.as_mut().map(|rw| rw.flush()).transpose()?.flatten() {
+        if let Some(w) = r.rec.as_mut().map(|rw| rw.finish()).transpose()?.flatten() {
             r.emit_file("records", w);
         }
         if let Some(n) = r.rec.as_ref().map(|rw| rw.pending_failures()).filter(|&n| n > 0) {

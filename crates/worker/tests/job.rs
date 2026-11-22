@@ -281,7 +281,7 @@ fn a_served_job_writes_records_only() {
 
 /// Branched self-play (zero-core docs/az.md 24, 72): the job plays its game ids and their branches - the shared driver,
 /// both rules - into shards; `fin` and the unfinished ranges count the game ids, the stats the branches; the same job
-/// twice writes the same shards; a records job refuses branches (records/1 cannot replay one).
+/// twice writes the same shards.
 #[test]
 fn branched_games_play_into_shards() {
     use zero_worker::pyjson::PyJson;
@@ -317,14 +317,126 @@ fn branched_games_play_into_shards() {
         let (o2, _) = run(&mk(&b_dir), |_, _, _, _| {});
         assert_eq!(o2.stats["branches"], o.stats["branches"]);
         assert_eq!(shards(&a_dir), shards(&b_dir), "{rule}: the same job, the same shards");
-        // a records job refuses them, loudly
-        let mut j = mk(&tmp(&format!("branch-{rule}-rec")));
-        j.output = Output::Records;
-        let ctl = Control::default();
-        let e = run_job(&TOY, &j, &ctl, &Events::default(), Arc::new(Mutex::new(Progress::default())), &|_| {}).unwrap_err();
-        assert!(e.contains("selfplay_branch") && e.contains("records"), "{e}");
     }
     // without branches the stats carry none of the keys (every job's stats as before)
     let (o, _) = run(&job(&tmp("branch-off"), 4, 0, 1, true), |_, _, _, _| {});
     assert!(o.stats.get("branches").is_none());
+}
+
+static PICK: GameEntry = GameEntry::of::<zero_search::pick_game::PickGame>("pick");
+
+/// Branch records (records/2, zero-core docs/az.md 72.7): a job of `game` with branches (rule `rule`) writing records
+/// and shards, one file each (shard_rows large: the records' lines then come in the shard's game order) -> the rows
+/// rebuilt from the records - each branch's with its game's record, which the same file holds - against the shard's,
+/// array for array; (branches, merged branches).
+fn branch_records<G: zero_search::SearchGame>(game: &'static GameEntry, name: &str, spec: &str, rule: &str, rolling: bool) -> (usize, usize) {
+    use zero_worker::pyjson::PyJson;
+    let d = tmp(&format!("brec-{name}-{rule}-{rolling}"));
+    let mut j = job(&d, 40, 0, 1, true);
+    j.settings.set("game", PyJson::Str(name.into()));
+    j.settings.set("spec", PyJson::Str(spec.into()));
+    j.settings.set("shard_rows", PyJson::Int(1_000_000));
+    j.settings.set("selfplay_branch", PyJson::Float(if rule == "neartie" { 1.0 } else { 0.5 }));
+    j.settings.set("selfplay_branch_rule", PyJson::Str(rule.into()));
+    if rule == "neartie" {
+        j.settings.set("selfplay_branch_eps", PyJson::Float(1.0));
+        j.settings.set("selfplay_branch_n_min", PyJson::Int(1));
+        j.settings.set("selfplay_branch_p_min", PyJson::Float(0.0));
+        j.settings.set("selfplay_branch_q_lo", PyJson::Float(0.0));
+        j.settings.set("selfplay_branch_q_hi", PyJson::Float(1.0));
+    }
+    if rolling {
+        j.rolling = Some(zero_worker::job::Rolling::default());
+    }
+    j.output = Output::Both;
+    let ctl = Control::default();
+    let ev = Events::default();
+    let o = std::thread::scope(|s| {
+        let h = s.spawn(|| run_job(game, &j, &ctl, &ev, Arc::new(Mutex::new(Progress::default())), &|_| {}));
+        if rolling {
+            // (a rolling job idles once its ids are played: finish it when every game came back)
+            while ev.0.lock().unwrap().iter().filter(|e| e["ev"] == "fin").map(|e| e["n"].as_u64().unwrap()).sum::<u64>() < 40 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            ctl.finish();
+        }
+        h.join().unwrap()
+    })
+    .unwrap();
+    assert_eq!((o.records.len(), o.shards.len()), (1, 1), "{name} {rule}");
+    let (h, lines) = read_records(&o.records[0].path);
+    assert_eq!(h["records"].as_u64(), Some(2), "a job with branches writes records/2");
+    let recs: Vec<Value> = lines.iter().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let (mut nb, mut nm) = (0, 0);
+    let games: Vec<zero_worker::shard::GameSamples> = recs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let rp = if r.get("branch").is_some() {
+                nb += 1;
+                nm += !r["branch"]["merged"].is_null() as usize;
+                // (its game's record: an earlier line of the same file)
+                let p = recs[..i].iter().rposition(|q| q["gid"] == r["gid"] && q.get("branch").is_none()).expect("a branch's game is in its file");
+                zero_search::record::replay_branch_json::<G>(spec, &lines[i], &lines[p], false).unwrap_or_else(|e| panic!("{e}"))
+            } else {
+                zero_search::record::replay_json::<G>(spec, &lines[i], false).unwrap_or_else(|e| panic!("{e}"))
+            };
+            assert_eq!(rp.seed, zero_search::record::game_seed(99, rp.gid, false), "a branch carries its game's seed");
+            zero_worker::shard::GameSamples { gid: rp.gid, records: rp.records }
+        })
+        .filter(|g| !g.records.is_empty())
+        .collect();
+    let f = <G as zero_search::SearchGame>::NUM_FEATURES;
+    let (arrays, _, probs) = zero_worker::shard::shard_arrays(&games, f, true, None).unwrap();
+    assert!(probs.is_empty());
+    let z = read_npz(&o.shards[0].path).unwrap();
+    for (n, a) in &arrays {
+        assert_eq!(z[*n].data, a.data, "{name} {rule}: {n}: rows rebuilt from the records == the shard's");
+    }
+    assert_eq!(z.len() - 1, arrays.len());
+    (nb, nm)
+}
+
+#[test]
+fn branch_records_replay_to_the_shards_rows_bit_for_bit() {
+    use zero_search::{pick_game::PickGame, toy::ToyGame};
+    for rule in ["uniform", "neartie"] {
+        let (nb, _) = branch_records::<ToyGame>(&TOY, "toy", "{}", rule, false);
+        assert!(nb > 5, "toy {rule}: {nb} branches");
+        let (nb, nm) = branch_records::<PickGame>(&PICK, "pick", r#"{"turns": 8, "keys": true}"#, rule, false);
+        assert!(nb > 5, "pick {rule}: {nb} branches");
+        if rule == "neartie" {
+            assert!(nm > 0 && nm < nb, "pick neartie: {nm} of {nb} branches merged");
+        } else {
+            assert_eq!(nm, 0);
+        }
+    }
+    // a rolling job too (its timed flushes keep a game and its branch together)
+    let (nb, nm) = branch_records::<PickGame>(&PICK, "pick", r#"{"turns": 8, "keys": true}"#, "neartie", true);
+    assert!(nb > 5 && nm > 0, "rolling: {nm} of {nb}");
+}
+
+/// The writer never cuts a file between a game and its branch (records.rs): small files, a timed flush in between.
+#[test]
+fn a_game_and_its_branch_share_one_records_file() {
+    use zero_worker::pyjson::PyJson;
+    let d = tmp("brec-files");
+    let mut j = job(&d, 40, 0, 2, true);
+    for (k, v) in [("selfplay_branch", PyJson::Float(1.0)), ("shard_rows", PyJson::Int(5))] {
+        j.settings.set(k, v);
+    }
+    j.output = Output::Records;
+    let (o, _) = run(&j, |_, _, _, _| {});
+    assert!(o.records.len() >= 5, "{} files", o.records.len());
+    let mut branches = 0;
+    for w in &o.records {
+        let (h, lines) = read_records(&w.path);
+        assert_eq!(h["records"].as_u64(), Some(2));
+        let recs: Vec<Value> = lines.iter().map(|l| serde_json::from_str(l).unwrap()).collect();
+        for (i, r) in recs.iter().enumerate().filter(|(_, r)| r.get("branch").is_some()) {
+            branches += 1;
+            assert!(recs[..i].iter().any(|q| q["gid"] == r["gid"] && q.get("branch").is_none()), "{}: the branch of game {} without its game", w.path.display(), r["gid"]);
+        }
+    }
+    assert!(branches > 10, "{branches} branches");
 }
