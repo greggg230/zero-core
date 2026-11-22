@@ -160,7 +160,8 @@ def main(argv=None):
 
     rc = dict(DEFAULTS)
     rc.update(cfg)
-    game = rc['game']
+    from zero import package
+    game = package.record_game(rc)             # (resolved: a config of an aliased name without its layout record, docs/az.md 73)
     spec = G.spec_json(rc['spec'])
     fmt = shard_format(rc, G.info(game))       # (format v2 for a game with tails / overrides, docs/az.md 43.1)
     recs = sorted(glob.glob(os.path.join(wout, 'g_*.rec.jsonl.gz')))
@@ -179,7 +180,7 @@ def main(argv=None):
         if json.loads(h['spec'] or '{}') != json.loads(spec):
             raise SystemExit(f'{rp}: the records\' spec is not the run\'s')
         ref = os.path.join(out, 'replayed', os.path.basename(shp)[:-4])
-        w = ShardWriter(ref, 'r', rows=1 << 40, meta={'game': game, 'features': h['features'], 'actions': h['actions'], **fmt})
+        w = ShardWriter(ref, 'r', rows=1 << 40, meta={'game': game, **package.layout_stamp(game), 'features': h['features'], 'actions': h['actions'], **fmt})
         parents = {}
         for ln in lines[1:]:
             t0 = time.time()
