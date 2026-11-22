@@ -27,7 +27,7 @@ command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ..
 | `runctl.py` | PAUSE / STOP files, exit status 75, run / supervisor state files, `PauseWatch` |
 | `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
 | `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5; `--graphs`: 10.6) |
-| `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6) |
+| `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6); several teachers, each on the rows a game package's row selector picks, in stratified batches (`select_rows`, `shares`, section 71) |
 | `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B), at a run's evaluation settings (each side's run's margin_w / redet / eval_cache, A's run's eval spec: section 44.3); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
 | `heldout.py` | Held-out losses (section 20.2): a frozen set of sample rows (`make`), a checkpoint's value cross-entropy / accuracy / Brier against z and policy cross-entropy / top-1 against the recorded targets, decision and value-only rows apart (`HeldOut`, `losses`); `python -m <pkg>.az.heldout make | eval` |
 | `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
@@ -10014,3 +10014,109 @@ The whole suite with the GPU visible, in four shards (75), beside two live runs:
 file's CUDA tests among them; one failure, `tests/test_remoteplay.py::test_cotrain_the_local_driver_is_never_starved`
 (the local driver's share of the games 25 of 167 against the 15 % it asserts), which times real threads (AGENTS.md)
 and passed 4 of 5 runs alone afterwards, with the GPU visible and hidden.
+
+## 77. Several teachers, each on its own rows: `tools/distill.py --sources`, the game package's row selector (no setting; `GamePackage.row_selectors`; MTG Zero's stew, its docs/ENGINE.md 222.1, 2026-11-21)
+
+**Why.** MTG Zero's stew (its docs/ENGINE.md 222) distils one network from several others, each the expert of
+some of the rows: a *deck stew* learns deck X from every specialist whose pairing includes X, on the rows where
+X's player acts; the *main stew* learns each row from the deck stew of the row's acting deck, plus a retention
+share from its own previous generation on the rows no specialist covers. Distillation (13) took one teacher and
+every row of its shards. This section takes several sources - each a teacher, its shards, a selection of their
+rows and a weight - in one distillation.
+
+**What it does.**
+
+```
+python tools/distill.py --sources SOURCES.json OUT.pt [--device cuda --torch-threads 4 --keep-best --resume --log L]
+```
+
+```json
+{"student": {"init": "<student start .pt>"},
+ "sources": [{"name": "spec:C|D",
+              "teacher": "<teacher .pt>",
+              "data": ["<run>/data", "<run>/data/iter_0042", "<shard.npz>"],
+              "select": {"actor": "C"},
+              "weight": 1.0,
+              "heldout": "auto",
+              "config": "<run>/config.json"}],
+ "heldout": "auto",
+ "train": {"steps": 20000, "batch": 512, "lr": 5e-4, "lr_min": 1e-5, "warmup": 500, "wd": 1e-4,
+           "teacher_w": 1.0, "value_q": 0.5, "margin_w": 0.5, "eval_every": 1000, "save_every": 2000,
+           "ram_budget_gb": 20, "seed": 1}}
+```
+
+* **The student**: `{"init": S.pt}` warm-starts from a checkpoint (its size; a missing head of the teachers' is
+  added, `net.add_aux`, as `--init`), or a fresh one of the size keys (`hidden`, `blocks`, `heads`, `ff`, `arch`,
+  `ch`; each default the first teacher's, as the size flags). Every teacher passes the encoding guard and the head
+  check (13.6); the teachers must be of one game and have the same auxiliary head or none (the student learns one
+  head), else refused.
+* **A source's rows**: `data` as `--data` (a run's data dir = every `iter_*`, one iteration, a shard file); `select`
+  `{}` = every row, else **the game package's row selector** decides each shard's rows (`zero.distill.select_rows`
+  -> `GamePackage.row_selectors[game]`: `fn(select, shard, ctx) -> numpy bool [rows]`, ctx = the shard's meta, its
+  run's config.json as a dict - `<run>/config.json` of `<run>/data/iter_NNNN/x.npz`, or the source's `config`,
+  None when neither exists -, its path and the source's name). The core knows nothing of a game's keys: the hook
+  must be exact and loud (an unknown key, a name the run does not have, a row it cannot decide: ValueError). A game
+  without the hook refuses a non-empty `select` (`... has no row selector for 'g' (select must be {})`); a mask of
+  the wrong length or dtype is refused. `heldout`: `"auto"` (the default, also the file's top-level key) = the
+  source's last shard (path order) with selected rows, `"none"`, or a list of paths as `--heldout` (their selected
+  rows; none selected: refused). A source left with no training rows is refused (never a silent 0-row source).
+* **One window** of every source's selected training rows (`data.Window(select=...)`: per shard its sorted row
+  numbers; the RAM budget subsamples the selected rows at one rate, as it does all rows), the sources' shards in
+  their order, so each source's rows are a contiguous range of it (a shard two sources take is loaded twice: its
+  selected rows of each).
+* **The teachers' answers**, once per row before training: each teacher on its own source's range only
+  (`outputs(model, W, span=(lo, hi), into=T)` - the answers of 13's `outputs`, written into the shared arrays), and
+  on its source's held-out rows; one teacher in memory at a time.
+* **Stratified batches**: every batch of `batch` rows holds `shares(weights, batch)` rows of each source (largest
+  remainders, the same split every step: exact to a row; a positive weight that gets no row is refused), drawn
+  uniformly with replacement from the source's range (`stratified_draw`, `distill(strata=)`, `data.batches(draw=)`),
+  so a source's share of the loss is its weight's whatever its row count. The loss is 13's (and 13.6's), per row
+  against that row's teacher.
+* **Held out, per source**: 13's `agreement` (KL(teacher || student) over the legal actions, its p90, top-1, P(win)
+  squared and absolute difference, margin, both networks' losses against the shards' targets; per kind of row and
+  per auxiliary target as 13.6) on each source's held-out rows against its own teacher, plus the weight-averaged
+  `policy_kl`, `top1`, `value_mse`, `value_mae`, `margin_mse` (`--keep-best` keeps the lowest averaged KL). In the
+  progress lines (`{"event": "heldout", "step", <averages>, "sources": {name: agreement}}`, stdout and
+  OUT.pt.log.jsonl; the start line lists each source's teacher, sha256, weight, rows a batch, rows of its shards,
+  selected and used, held-out rows) and in OUT.pt's `extra`: `distilled_from` (the sources file), `distill` =
+  {`sources_file`, `sources_sha256`, `sources`: [each source's name, teacher path and sha256, teacher net and
+  iteration, select, weight, rows a batch, config, its shards, rows (its training shards'), selected, used,
+  held-out shards and rows], `student_init` and its sha256, `settings`, `step`, `student_net`, `train_rows`,
+  `heldout` (every evaluation), `seconds`}.
+* **The training settings come from the file** (`train`: the keys above plus `epochs`, `aux_w`, `aux_teacher_w`,
+  `heldout_rows` - per source -, `report_every`; each default the flag's); their flags beside `--sources` are
+  refused, as are `--data`, `--heldout`, `--init` and the size flags. Process flags stay flags (`--device`,
+  `--torch-threads`, `--prefetch`, `--keep-best`, `--resume`, `--log`, `--normal-priority`, `--game`).
+  `OUT.pt.partial` records the sources file's sha256: `--resume` with another file is refused. Unknown keys
+  anywhere in the file are refused.
+
+**Off: nothing changes.** Without `--sources` the tool is the one of before: `Window(select=None)`,
+`batches(draw=None)`, `outputs(span=None)` and `distill(strata=None)` take their code paths of before, and the
+record's settings carry no new key (`--sources` is popped). **Byte for byte**: the single-teacher tool on
+deterministic toy shards (an MLP student; a token student at `teacher_w` 0.5 with `--keep-best`) gives the same
+student tensors, progress log and checkpoint record (paths and seconds aside) on this branch as on c850a5d (the
+commit before it, in a worktree of its own): `tests/test_distill_sources.py`'s goldens were recorded there by a
+script importing the test's generator, and the test compares against them (on the machine and torch they were
+recorded with - the desktop, torch 2.11.0+cu128; elsewhere it skips, naming the digests).
+
+**Costs.** A selection pass reads every shard of a selected source once more before the window (MTG Zero's
+selector: ~10 s a 65,536-row shard on the desktop's CPU, its ENGINE.md 222.1). RAM: the window's budget counts the
+selected rows only; a shard two sources take is held twice. The teachers' answers: one forward pass per row, as 13.
+
+**Tests** (`tests/test_distill_sources.py`, 11): the single-teacher tool byte for byte (2 goldens); `shares` and
+`stratified_draw` (the split, the refusals, each stratum's rows within its range); `Window(select=)` (the selected
+rows' features and targets exactly, the budget subsampling them, unsorted / empty selections refused); `outputs`
+with two teachers' spans = each teacher's answers on its rows; the hook (`select_rows`: a toy selector by seat,
+`{}` without a hook, an unknown key, a mask of the wrong length, no hook with a non-empty select; the run's
+config.json reaches it); the tool with two teachers on the first rounds' rows and the others' (weights 3:1, a
+student warm-started from a third network): the record and log (sha256s, rows selected = the selector's, rows a
+batch 48 / 16, the held-out shard and its rows, the weighted average), each source's KL to its own teacher down by
+more than 3x, and the student closer to each source's teacher than to the other on that source's rows; the
+weights set the shares (teachers that disagree on the same positions: the heavier source ends closer to its
+teacher, either way round); a fresh student, an explicit held-out list, a source without held-out shards and one
+without a selector, `--resume` (and a partial of another sources file refused); the refusals (training flags,
+unknown keys, a duplicate name, a zero weight, `init` with a size, a selector's own errors, a missing teacher, a
+source whose only rows are its held-out shard, a selection of nothing, no hook).
+
+**Measured** (MTG Zero, its ENGINE.md 222.1: its row selector on real metagame shards and a two-source distillation
+of best-of-three smoke runs).

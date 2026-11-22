@@ -54,7 +54,13 @@ new shards (the Delver line: 54 s -> 6.6 s). The budget still counts dense rows.
 `batches` (run setting `train_prefetch`): a training's batches in order; with prefetch, built that
 many steps ahead on a background thread (the window's gather, the float32 features and the dense
 targets: ~60 ms a batch for MTG's 33,652 features) while the training step runs on the device. The
-rows are drawn from the same generator in the same order, so the batches are the same.
+rows are drawn from the same generator in the same order, so the batches are the same. `draw` (a
+multi-source distillation's stratified batches, docs/az.md 77) replaces the uniform draw.
+
+Selected rows (`Window(select=...)`, docs/az.md 77: a multi-source distillation's sources, each the rows
+of its shards a game package's row selector chose): per shard the sorted row numbers to load instead of
+all of them; the RAM budget then subsamples the selected rows at one rate. Without it the window of
+before.
 
 Sparse shards (run setting `shard_sparse`, docs/az.md 32): a shard's features stored as their non-zeros
 instead of `x` - `x_ptr` int64 [N+1], `x_idx` uint16 [nnz] (int32 past 65,536 columns), `x_val` float16
@@ -826,9 +832,11 @@ def _run_all(fn, n, threads):
         return [f.result() for f in futs]
 
 
-def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False, flat_tail=None):
+def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False, flat_tail=None, draw=None):
     """A training's `n` batches: `size` window rows drawn from `rng` (uniform, with replacement),
-    one draw per batch in order -> (rows, W.batch(rows, device, tokens)). `prefetch` > 0: drawn and
+    one draw per batch in order -> (rows, W.batch(rows, device, tokens)). `draw` (None: that uniform
+    draw): fn(rng) -> a batch's window rows, instead (a multi-source distillation's stratified
+    batches, docs/az.md 77). `prefetch` > 0: drawn and
     built up to that many batches ahead on a background thread (as CPU tensors, moved to `device` as
     they are taken) while the caller trains on the current one - the same draws, the same
     batches. A failure there is raised here; closing the generator (or dropping it) stops the
@@ -854,9 +862,12 @@ def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False, f
                  for k, v in b.items()}
         b = dense_coo(b, W.F) if coo else b
         return R.expand_tail(b, wt) if flat_tail else b
+    if draw is None:
+        def draw(g):
+            return g.integers(W.N, size=size)
     if not prefetch:
         for _ in range(n):
-            idx = rng.integers(W.N, size=size)
+            idx = draw(rng)
             if coo:
                 yield idx, to(build(idx, 'cpu'))
             else:
@@ -878,7 +889,7 @@ def batches(W, rng, n, size, device='cpu', prefetch=0, tokens=None, coo=False, f
     def produce():
         try:
             for _ in range(n):
-                idx = rng.integers(W.N, size=size)
+                idx = draw(rng)
                 if not put((idx, build(idx, 'cpu'))):
                     return
         except BaseException as e:             # noqa: BLE001  (re-raised by the consumer)
@@ -920,6 +931,24 @@ def dense_coo(b, F):
     return b
 
 
+def _check_select(select, rows, paths, cache, sparse):
+    """`Window(select=...)` checked against the shards' row counts -> the per-shard int64 row numbers."""
+    if cache is not None or sparse:
+        raise ValueError('Window(select=...): not with a window cache or a sparse window')
+    if len(select) != len(paths):
+        raise ValueError(f'Window(select=...): {len(select)} row selections for {len(paths)} shards')
+    out = []
+    for s, N, p in zip(select, rows, paths):
+        s = np.asarray(s, np.int64)
+        if s.ndim != 1 or not len(s):
+            raise ValueError(f'Window(select=...): shard {p}: no selected rows (leave the shard out)')
+        if (len(s) > 1 and not (np.diff(s) > 0).all()) or s[0] < 0 or s[-1] >= N:
+            raise ValueError(f'Window(select=...): shard {p}: the selected rows must be sorted, distinct and in '
+                             f'0..{N - 1}')
+        out.append(s)
+    return out
+
+
 class WindowCache:
     """Shards kept between a run's windows (module docstring): path -> (its size and mtime, the
     number of features, its part with the features of all its rows)."""
@@ -952,10 +981,13 @@ class Window:
     `layout` (the network's normalised token layout; variable-length rows, docs/az.md 43): with tail segments or
     pointer overrides the window loads the shards' tails and overrides (`tail`: `rows.Tail` over the window's rows,
     `ov`: `rows.Overrides`; None without), refusing shards of other tail segments or without them (R9); without, a
-    shard with any tail token or override is refused (R11)."""
+    shard with any tail token or override is refused (R11).
+    `select` (docs/az.md 77; None: every row): per path the sorted, distinct row numbers of that shard to load
+    (non-empty: a shard with none is left out by the caller); the budget subsamples the selected rows at one rate
+    (`loaded` = their count). Not with a `cache` or `sparse`."""
 
     def __init__(self, paths, num_features, num_actions, budget_rows=None, seed=0, threads=None, cache=None,
-                 aux_width=0, sparse=False, aux_older=None, layout=None):
+                 aux_width=0, sparse=False, aux_older=None, layout=None, select=None):
         self.F, self.A = num_features, num_actions
         self.AW = AW = int(aux_width)
         older = aux_older if AW else None
@@ -971,11 +1003,15 @@ class Window:
         self._x = self._xs = self._csr = self._xsp = None
         rng = np.random.default_rng(seed)
         rows = [shard_rows(p) for p in self.paths]
-        total = sum(rows)
+        sel = None if select is None else _check_select(select, rows, self.paths, cache, sparse)
+        avail = rows if sel is None else [len(s) for s in sel]
+        total = sum(avail)
         keep = 1.0 if not budget_rows or total <= budget_rows else budget_rows / total
         # Each shard's rows, drawn in path order (the random stream of loading one at a time).
         picks = [None if keep >= 1.0 else np.sort(rng.choice(N, size=max(1, int(round(N * keep))), replace=False))
-                 for N in rows]
+                 for N in avail]
+        if sel is not None:                        # (the selected rows' numbers, subsampled as all rows are)
+            picks = [s if idx is None else s[idx] for s, idx in zip(sel, picks)]
         kept = [N if idx is None else len(idx) for N, idx in zip(rows, picks)]
         self.starts = np.concatenate([[0], np.cumsum(kept)]).astype(np.int64)
         self.N = int(self.starts[-1])
