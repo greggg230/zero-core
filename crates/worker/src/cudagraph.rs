@@ -56,7 +56,8 @@ impl Caps {
     /// per-row quantity a quarter over the piece's mean per row, the tail floats 120 a padding token (the padding
     /// tokens' mean width; any mean from 56 to 438 fits), T as the piece's.
     pub fn for_piece(s: &Caps) -> Caps {
-        let b = up(s.b + 1, 64);
+        // (at least 16 padding rows: the tail padding's tokens need slots in them)
+        let b = up(s.b + 16, 64);
         let per = |x: usize, a: usize| up((x as f64 / s.b.max(1) as f64 * 1.25 * b as f64).ceil() as usize + a, a);
         let nt = per(s.nt, 64);
         Caps { b, nnz: per(s.nnz, 256), k: per(s.k, 64), nt, l: s.l + 120 * (nt - s.nt), no: per(s.no, 16).max(16), t: s.t }
@@ -64,7 +65,7 @@ impl Caps {
 
     /// The bucket holds piece `s` (its tail padding found too: [`tail_plan`]).
     pub fn holds(&self, s: &Caps, tails: &Tails) -> bool {
-        self.b > s.b && self.nnz >= s.nnz && self.k >= s.k && self.nt >= s.nt && self.l >= s.l && self.no >= s.no && self.t == s.t && tail_plan(self.nt - s.nt, self.l - s.l, tails).is_some()
+        self.b > s.b && self.nnz >= s.nnz && self.k >= s.k && self.nt >= s.nt && self.l >= s.l && self.no >= s.no && self.t == s.t && tail_plan(self.nt - s.nt, self.l - s.l, tails, self.b - s.b).is_some()
     }
 }
 
@@ -93,53 +94,84 @@ impl Tails {
     }
 }
 
-/// `n` padding tokens' segments whose widths sum to exactly `l` floats: the two narrowest widths fill the bulk, `h`
-/// of the widest and `g` of a middle width fix the total; None if there is no such plan.
-pub fn tail_plan(n: usize, l: usize, tails: &Tails) -> Option<Vec<i32>> {
+/// `n` padding tokens' segments whose widths sum to exactly `l` floats, within `np` padding rows (each segment holds
+/// its slot count per row): two width classes take the bulk, at most two others fix the remainder (small counts) -
+/// every pair and pair of fixers tried, the roomiest first; None if there is no such plan.
+pub fn tail_plan(n: usize, l: usize, tails: &Tails, np: usize) -> Option<Vec<i32>> {
     if n == 0 {
         return (l == 0).then(Vec::new);
     }
-    let mut ws: Vec<usize> = tails.0.iter().map(|t| t.1).collect();
-    ws.sort_unstable();
-    ws.dedup();
-    let seg_of = |w: usize| tails.0.iter().filter(|t| t.1 == w).max_by_key(|t| t.2).map(|t| t.0).expect("a width's segment");
-    let (a, b, hw) = (ws[0], *ws.get(1).unwrap_or(&ws[0]), *ws.last().unwrap());
-    if l < a * n || l > hw * n {
-        return None;
+    // width classes: (width, capacity in all, its segments roomiest first)
+    let mut classes: Vec<(usize, usize, Vec<(i32, usize)>)> = Vec::new();
+    for &(seg, w, count) in &tails.0 {
+        match classes.iter_mut().find(|c| c.0 == w) {
+            Some(c) => {
+                c.1 += count * np;
+                c.2.push((seg, count * np));
+            }
+            None => classes.push((w, count * np, vec![(seg, count * np)])),
+        }
     }
-    let mids: Vec<usize> = if ws.len() > 3 { ws[2..ws.len() - 1].to_vec() } else { vec![hw] };
-    for &gw in &mids {
-        for h in 0..=n {
-            for g in 0..=(n - h).min(2 * b) {
-                let m = n - h - g;
-                let fixed = hw * h + gw * g;
-                if fixed > l {
-                    break;
-                }
-                let r = l - fixed;
-                if r < a * m {
-                    break;
-                }
-                if r > b * m {
-                    continue;
-                }
-                let x = if a == b {
-                    if r != a * m {
+    for c in classes.iter_mut() {
+        c.2.sort_by_key(|x| std::cmp::Reverse(x.1));
+    }
+    let k = classes.len();
+    let mut pairs: Vec<(usize, usize)> = (0..k).flat_map(|a| (0..k).map(move |b| (a, b))).filter(|(a, b)| classes[*a].0 < classes[*b].0).collect();
+    pairs.sort_by_key(|&(a, b)| std::cmp::Reverse(classes[a].1.min(classes[b].1)));
+    const FIX: usize = 48;
+    for &(a, b) in &pairs {
+        let (wa, ca, wb, cb) = (classes[a].0, classes[a].1, classes[b].0, classes[b].1);
+        let others: Vec<usize> = (0..k).filter(|&x| x != a && x != b).collect();
+        let fixers: Vec<(Option<usize>, Option<usize>)> = std::iter::once((None, None))
+            .chain(others.iter().map(|&x| (Some(x), None)))
+            .chain(others.iter().flat_map(|&x| others.iter().filter(move |&&y| y > x).map(move |&y| (Some(x), Some(y)))))
+            .collect();
+        for (f1, f2) in fixers {
+            let lim = |f: Option<usize>| f.map_or(0, |x| classes[x].1.min(FIX));
+            for c1 in 0..=lim(f1) {
+                for c2 in 0..=lim(f2) {
+                    let used = c1 + c2;
+                    if used > n {
                         continue;
                     }
-                    m
-                } else {
-                    let num = b * m - r;
-                    if num % (b - a) != 0 {
+                    let fixed = c1 * f1.map_or(0, |x| classes[x].0) + c2 * f2.map_or(0, |x| classes[x].0);
+                    if fixed > l {
                         continue;
                     }
-                    num / (b - a)
-                };
-                let mut out = vec![seg_of(hw); h];
-                out.extend(std::iter::repeat_n(seg_of(gw), g));
-                out.extend(std::iter::repeat_n(seg_of(a), x));
-                out.extend(std::iter::repeat_n(seg_of(b), m - x));
-                return Some(out);
+                    let (m, r) = (n - used, l - fixed);
+                    // x of wa, m - x of wb: wa x + wb (m - x) = r
+                    if r > wb * m || r < wa * m {
+                        continue;
+                    }
+                    let num = wb * m - r;
+                    if num % (wb - wa) != 0 {
+                        continue;
+                    }
+                    let x = num / (wb - wa);
+                    if x > ca || m - x > cb {
+                        continue;
+                    }
+                    let mut out = Vec::with_capacity(n);
+                    let mut take = |cls: usize, cnt: usize| {
+                        let mut left = cnt;
+                        for &(seg, cap) in &classes[cls].2 {
+                            let t = left.min(cap);
+                            out.extend(std::iter::repeat_n(seg, t));
+                            left -= t;
+                        }
+                    };
+                    take(a, x);
+                    take(b, m - x);
+                    if let Some(f) = f1 {
+                        take(f, c1);
+                    }
+                    if let Some(f) = f2 {
+                        take(f, c2);
+                    }
+                    if out.len() == n {
+                        return Some(out);
+                    }
+                }
             }
         }
     }
@@ -224,7 +256,7 @@ pub fn pad(p: &Piece, caps: &Caps, tails: &Tails, actions: usize, global_feature
         q.opt_action.extend((0..k).map(|i| i as i32));
     }
     // tail tokens: exact widths, valid (a tail segment, a slot below its count, sorted, no duplicate) per padding row
-    let plan = tail_plan(caps.nt - s.nt, caps.l - s.l, tails).ok_or_else(|| format!("no tail padding of {} tokens, {} floats", caps.nt - s.nt, caps.l - s.l))?;
+    let plan = tail_plan(caps.nt - s.nt, caps.l - s.l, tails, np).ok_or_else(|| format!("no tail padding of {} tokens, {} floats", caps.nt - s.nt, caps.l - s.l))?;
     let count = |seg: i32| tails.0.iter().find(|t| t.0 == seg).map(|t| t.2).unwrap_or(0);
     let width = |seg: i32| tails.0.iter().find(|t| t.0 == seg).map(|t| t.1).unwrap_or(0);
     let mut rows: Vec<std::collections::BTreeMap<i32, usize>> = vec![Default::default(); np];
@@ -276,6 +308,10 @@ pub struct Bucket {
     binding: IoBinding,
     inputs: Vec<(&'static str, Buf)>,
     outputs: Vec<(&'static str, Buf)>,
+    /// The device buffers bound when the pinned host buffers are only staging (default; `ZERO_WORKER_CUDA_GRAPHS_PINNED=1`
+    /// binds the pinned buffers themselves): inputs copied in, outputs copied out each call.
+    dev_in: Vec<Buf>,
+    dev_out: Vec<Buf>,
     pub calls: u64,
     pub last: u64,
 }
@@ -288,6 +324,16 @@ enum Buf {
 }
 
 impl Buf {
+    /// This buffer's contents copied into `dst` (another device's buffer of the same type and size).
+    fn copy_to(&self, dst: &mut Buf) -> Result<(), String> {
+        match (self, dst) {
+            (Buf::I64(a), Buf::I64(b)) => a.copy_into(b).map_err(oerr),
+            (Buf::I32(a), Buf::I32(b)) => a.copy_into(b).map_err(oerr),
+            (Buf::F32(a), Buf::F32(b)) => a.copy_into(b).map_err(oerr),
+            (Buf::Bool(a), Buf::Bool(b)) => a.copy_into(b).map_err(oerr),
+            _ => Err("buffer types differ".into()),
+        }
+    }
     fn write_i64(&mut self, v: &[i64]) -> Result<(), String> {
         match self {
             Buf::I64(t) => {
@@ -355,7 +401,7 @@ impl Cache {
         let mut caps = Caps::for_piece(s);
         if let Some(i) = self.buckets.iter().position(|b| b.caps.t == s.t && b.caps.b >= caps.b) {
             let o = self.buckets.remove(i).caps;
-            caps = Caps { b: o.b.max(caps.b), nnz: o.nnz.max(caps.nnz), k: o.k.max(caps.k), nt: o.nt.max(caps.nt), l: 0, no: o.no.max(caps.no), t: s.t };
+            caps = Caps { b: o.b.max(caps.b).max(up(s.b + 16, 64)), nnz: o.nnz.max(caps.nnz), k: o.k.max(caps.k), nt: o.nt.max(caps.nt), l: 0, no: o.no.max(caps.no), t: s.t };
             caps.l = s.l + 120 * (caps.nt - s.nt);
         }
         if !caps.holds(s, &self.tails) {
@@ -410,25 +456,47 @@ impl Cache {
             ("aux", f2(self.aux_w.max(1))?),
             ("refused", i64t(b)?),
         ];
-        for (name, buf) in &inputs {
+        let pinned_only = std::env::var("ZERO_WORKER_CUDA_GRAPHS_PINNED").as_deref() == Ok("1");
+        let cuda = Allocator::new(&session, MemoryInfo::new(AllocationDevice::CUDA, self.ord, AllocatorType::Device, MemoryType::Default).map_err(oerr)?).map_err(oerr)?;
+        let twin = |b: &Buf| -> Result<Buf, String> {
+            Ok(match b {
+                Buf::I64(t) => Buf::I64(Tensor::<i64>::new(&cuda, t.shape().clone()).map_err(oerr)?),
+                Buf::I32(t) => Buf::I32(Tensor::<i32>::new(&cuda, t.shape().clone()).map_err(oerr)?),
+                Buf::F32(t) => Buf::F32(Tensor::<f32>::new(&cuda, t.shape().clone()).map_err(oerr)?),
+                Buf::Bool(t) => Buf::Bool(Tensor::<bool>::new(&cuda, t.shape().clone()).map_err(oerr)?),
+            })
+        };
+        let (mut dev_in, mut dev_out) = (Vec::new(), Vec::new());
+        if !pinned_only {
+            for (_, b) in &inputs {
+                dev_in.push(twin(b)?);
+            }
+            for (_, b) in &outputs {
+                dev_out.push(twin(b)?);
+            }
+        }
+        let bind_in: Vec<(&'static str, &Buf)> = if pinned_only { inputs.iter().map(|(n, b)| (*n, b)).collect() } else { inputs.iter().map(|(n, _)| *n).zip(dev_in.iter()).collect() };
+        for (name, buf) in bind_in {
             match buf {
-                Buf::I64(t) => binding.bind_input(*name, t),
-                Buf::I32(t) => binding.bind_input(*name, t),
-                Buf::F32(t) => binding.bind_input(*name, t),
-                Buf::Bool(t) => binding.bind_input(*name, t),
+                Buf::I64(t) => binding.bind_input(name, t),
+                Buf::I32(t) => binding.bind_input(name, t),
+                Buf::F32(t) => binding.bind_input(name, t),
+                Buf::Bool(t) => binding.bind_input(name, t),
             }
             .map_err(|e| format!("bind {name}: {e}"))?;
         }
         let mut outputs = outputs;
-        for (name, buf) in outputs.iter_mut() {
+        let names: Vec<&'static str> = outputs.iter().map(|(n, _)| *n).collect();
+        let targets: Vec<&mut Buf> = if pinned_only { outputs.iter_mut().map(|(_, b)| b).collect() } else { dev_out.iter_mut().collect() };
+        for (name, buf) in names.into_iter().zip(targets) {
             match buf {
-                Buf::I64(t) => binding.bind_output(*name, t),
-                Buf::F32(t) => binding.bind_output(*name, t),
+                Buf::I64(t) => binding.bind_output(name, t),
+                Buf::F32(t) => binding.bind_output(name, t),
                 _ => unreachable!(),
             }
             .map_err(|e| format!("bind {name}: {e}"))?;
         }
-        Ok(Bucket { caps, session, binding, inputs, outputs, calls: 0, last: 0 })
+        Ok(Bucket { caps, session, binding, inputs, outputs, dev_in, dev_out, calls: 0, last: 0 })
     }
 
     /// The graph's outputs for piece `p` (its own rows only): (policy [n A], value [n 8], margin [n 8], aux [n W],
@@ -439,6 +507,16 @@ impl Cache {
         let i = self.bucket_for(&s, make)?;
         let caps = self.buckets[i].caps;
         let q = pad(p, &caps, &self.tails, self.actions, self.global_features)?;
+        if let Ok(d) = std::env::var("ZERO_WORKER_CUDA_GRAPHS_DUMP") {
+            // (a diagnostic: the first padded piece's inputs as JSON, the unpadded piece beside it)
+            let path = std::path::Path::new(&d);
+            if !path.exists() {
+                let j = |q: &Piece| serde_json::json!({"x_ptr": q.x_ptr, "x_idx": q.x_idx, "x_val": q.x_val, "n_players": q.n_players, "belief": q.belief,
+                    "opt_off": q.opt_off, "opt_action": q.opt_action, "t_off": q.t_off, "t_seg": q.t_seg, "t_slot_hi": q.t_slot_hi, "t_slot_lo": q.t_slot_lo,
+                    "t_val_len": q.t_val.len(), "ov_off": q.ov_off, "ov_opt": q.ov_opt, "ov_seg": q.ov_seg, "ov_col": q.ov_col, "ov_slot_hi": q.ov_slot_hi, "ov_slot_lo": q.ov_slot_lo, "t": q.t});
+                let _ = std::fs::write(path, serde_json::json!({"padded": j(&q), "piece": j(p), "caps": format!("{caps:?}")}).to_string());
+            }
+        }
         let bk = &mut self.buckets[i];
         for (name, buf) in bk.inputs.iter_mut() {
             match *name {
@@ -464,7 +542,13 @@ impl Cache {
                 other => return Err(format!("input {other}")),
             }
         }
+        for ((_, h), d) in bk.inputs.iter().zip(bk.dev_in.iter_mut()) {
+            h.copy_to(d)?;
+        }
         bk.session.run_binding(&bk.binding).map_err(oerr)?;
+        for (d, (_, h)) in bk.dev_out.iter().zip(bk.outputs.iter_mut()) {
+            d.copy_to(h)?;
+        }
         bk.calls += 1;
         let n = s.b;
         let take = |buf: &Buf, w: usize| -> Vec<f32> {
@@ -499,14 +583,16 @@ mod tests {
     fn tail_plans_sum_exactly() {
         let t = tails();
         for (n, l) in [(0usize, 0usize), (1, 56), (313, 37_560), (448 - 330, 120 * 118), (10, 4_380)] {
-            let p = tail_plan(n, l, &t).unwrap_or_else(|| panic!("{n} {l}"));
+            let p = tail_plan(n, l, &t, 64).unwrap_or_else(|| panic!("{n} {l}"));
             let w = |s: i32| t.0.iter().find(|x| x.0 == s).unwrap().1;
             assert_eq!(p.len(), n);
             assert_eq!(p.iter().map(|&s| w(s)).sum::<usize>(), l, "{n} {l}");
         }
-        assert!(tail_plan(1, 55, &t).is_none());
-        assert!(tail_plan(1, 439, &t).is_none());
-        assert!(tail_plan(0, 1, &t).is_none());
+        assert!(tail_plan(1, 55, &t, 64).is_none());
+        assert!(tail_plan(1, 439, &t, 64).is_none());
+        assert!(tail_plan(0, 1, &t, 64).is_none());
+        // few padding rows: the roomy segments carry it (the self-test's small pieces)
+        assert!(tail_plan(300, 36_000, &t, 24).is_some());
     }
 
     #[test]
