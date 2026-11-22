@@ -620,6 +620,24 @@ def set_game(d, game):
     return d
 
 
+def resolve_saved_games(cfg, where=''):
+    """A run's settings read back from a file (a remote's mirror config.json, an eval job's settings) naming their
+    resolved games, in place (docs/az.md 73.2) - as `zero.run.resolve_run_game` resolves a resumed run's saved config:
+    its `game` with its `game_layout` (`set_game`), a co-training run's `resolver` with `resolver_cfg`'s. A config
+    written resolved (the run's own, a mirror the run wrote) reads back unchanged; one naming an aliased game without a
+    layout record (a run's config of before the change, copied as it is) is the name's old game. A record no game of
+    this build has: GameAliasError. Returns `cfg`."""
+    if cfg.get('game'):
+        set_game(cfg, record_game(cfg, where))
+    if cfg.get('resolver'):
+        rc = dict(cfg.get('resolver_cfg') or {})
+        rgame = resolve_game(cfg['resolver'], rc.get('game_layout'), f'{where}: resolver' if where else 'resolver')
+        rc.pop('game_layout', None)
+        rc.update(layout_stamp(rgame))
+        cfg['resolver'], cfg['resolver_cfg'] = rgame, rc
+    return cfg
+
+
 def resolve(obj):
     """'module:attr' -> the object (imported now); anything else as it is."""
     if isinstance(obj, str) and ':' in obj:

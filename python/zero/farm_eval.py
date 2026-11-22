@@ -100,8 +100,11 @@ def job_cfg(cfg, threads=None, groups=None, conc=None):
 
 def match_driver(cfg, seats, games, seed, paired=True):
     """`Run.play_match`'s driver for `games` games (ids 0..games) of the match between `seats` at settings
-    `cfg` (the eval job's: `job_cfg`). The evaluators: one per network seat key ('m' seats[0], 'o' seats[1])."""
-    from . import run as R
+    `cfg` (the eval job's: `job_cfg`). The evaluators: one per network seat key ('m' seats[0], 'o' seats[1]). The
+    settings' game is resolved as the native worker resolves a job's (docs/az.md 73.2: an aliased name without a layout
+    record is its old game; a record no game of this build has: GameAliasError, a ValueError)."""
+    from . import package, run as R
+    cfg = package.resolve_saved_games(dict(cfg), "the eval job's settings")
     if cfg.get('eval_trace'):
         raise ValueError('eval_trace: traced rows are the native worker\'s (zero_worker evaljob); a Python match '
                          'plays the same games untraced (tracing changes no game, docs/search.md 2.17)')
