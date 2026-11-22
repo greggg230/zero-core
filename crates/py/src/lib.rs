@@ -918,7 +918,8 @@ fn driver_settings(seats: &Bound<'_, PyList>, spec: Option<&Bound<'_, PyAny>>, c
 /// the game's auxiliary targets with the samples (`take_samples()['aux']`, docs/search.md 1.2);
 /// `paired`: games 2k and 2k + 1 share every random stream (the deal), `DriverCfg::paired`;
 /// `sparse`: network batches carry each row's non-zero features (`xs_off`, `xs_idx`, `xs_val`,
-/// `n_features`) instead of `x` (`DriverCfg::sparse`, docs/search.md 2.2); `branch` {p, moves, temp}:
+/// `n_features`) instead of `x` (`DriverCfg::sparse`, docs/search.md 2.2); `branch` {p, moves, temp, differ} or
+/// {p, rule 'neartie', eps, n_min, p_min, q_lo, q_hi} (2.11.1):
 /// branched games, `starts` {p, specs}: archive starts (docs/search.md 2.11; None: off).
 #[pyclass(name = "SearchDriver")]
 pub struct PySearchDriver {
@@ -1171,6 +1172,12 @@ impl PySearchDriver {
         d.set_item("branches", s.branches)?;
         d.set_item("dev_moves", s.dev_moves)?;
         d.set_item("starts", s.starts)?;
+        if s.neartie_seen > 0 || s.merges > 0 {
+            // (near-tie branches, docs/search.md 2.11.1: only a driver that saw eligible decisions)
+            d.set_item("neartie_seen", s.neartie_seen)?;
+            d.set_item("merges", s.merges)?;
+            d.set_item("merge_decisions", s.merge_decisions)?;
+        }
         d.set_item("value_choices", s.value_choices)?;
         d.set_item("value_choice_rows", s.value_choice_rows)?;
         if s.teacher_decisions > 0 {
@@ -1370,7 +1377,19 @@ fn result_row<'py>(py: Python<'py>, r: &zero_search::driver::GameResult) -> PyRe
         bd.set_item("played", b.played)?;
         bd.set_item("same_first", b.same_first)?;
         bd.set_item("start", b.start)?;
+        if let Some(alt) = b.alt {
+            // a near-tie branch (docs/search.md 2.11.1): its runner-up, the Q gap, the branch point's decision tag, and
+            // its decisions to the merge (None: it played to its own end)
+            bd.set_item("alt", alt)?;
+            bd.set_item("gap", b.gap)?;
+            bd.set_item("tag", b.tag)?;
+            bd.set_item("merged", b.merged)?;
+        }
         d.set_item("branch", bd)?;
+    }
+    if let Some(k) = r.neartie {
+        // near-tie branches (docs/search.md 2.11.1): the game's eligible decisions
+        d.set_item("neartie", k)?;
     }
     if let Some(j) = r.start {
         // a game started from an archive entry (DriverCfg::starts)

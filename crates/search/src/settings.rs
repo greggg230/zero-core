@@ -16,14 +16,17 @@
 //!   `bot` / `external`), branch's, starts'.
 use serde_json::{Map, Value};
 
-use crate::driver::{BranchCfg, DriverCfg, FullRule, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, StartsCfg, ViewTarget, BELIEF_CLIP};
+use crate::driver::{BranchCfg, BranchRule, DriverCfg, NearTie, FullRule, KeyKind, LeafView, NnSeat, PolicyTarget, RootSearch, SeatCfg, Select, StartsCfg, ViewTarget, BELIEF_CLIP};
 use crate::lookahead::LookCfg;
 
 /// The settings of a network seat (each `NnSeat` field's key; docs/search.md 3).
 pub const SEAT_KEYS: &[&str] = &["key", "sims", "c_puct", "selfplay", "alpha", "eps", "temp_moves", "sims_fast", "sims_minor", "p_full", "chance_k", "margin_w", "redet", "policy_target", "cq_c_visit", "cq_c_scale", "select", "select_min_visits", "select_c_visit", "select_c_scale", "record", "root_min_visits", "root_min_visits_max_actions", "leaf_value_view", "view_samples", "view_sample_target", "belief_tilt", "belief_clip", "belief_mix", "belief_fast", "belief_tilts", "root_search", "gumbel_m", "gumbel_scale", "gumbel_c_visit", "gumbel_c_scale", "lookahead", "eval_cache", "resign_t", "resign_k", "resign_noresign", "cq_prior_w", "infoset_merge", "value_choice_worlds", "value_choice_temp", "p_full_rule", "p_full_floor", "p_full_shape", "p_full_u_mean"];
 
 /// The settings of a branch (docs/search.md 2.11) and of archive starts.
-pub const BRANCH_KEYS: &[&str] = &["p", "moves", "temp", "differ"];
+pub const BRANCH_KEYS: &[&str] = &["p", "moves", "temp", "differ", "rule", "eps", "n_min", "p_min", "q_lo", "q_hi"];
+/// The near-tie rule's settings (docs/search.md 2.11.1), and the uniform rule's (refused with the other rule).
+const NEARTIE_KEYS: &[&str] = &["eps", "n_min", "p_min", "q_lo", "q_hi"];
+const UNIFORM_KEYS: &[&str] = &["moves", "temp", "differ"];
 pub const STARTS_KEYS: &[&str] = &["p", "specs"];
 
 /// The value of `k` in `d`: None when missing or null (the setting's default).
@@ -132,16 +135,37 @@ pub fn key_index(keys: &mut Vec<(String, KeyKind)>, name: &str, kind: KeyKind) -
     }
 }
 
-/// `branch` {p, moves, temp, differ} (docs/search.md 2.11; another key is an error).
+/// `branch` {p, moves, temp, differ} (docs/search.md 2.11; another key is an error), or with `rule` 'neartie'
+/// {p, rule, eps, n_min, p_min, q_lo, q_hi} (2.11.1: the near-tie rule; a uniform rule's setting given with it is an
+/// error, and a near-tie setting without it). `rule` 'uniform' (or missing / null) is the uniform rule.
 pub fn parse_branch(v: &Value) -> Result<BranchCfg, String> {
     let d = object("branch", v)?;
     for k in d.keys() {
         if !BRANCH_KEYS.contains(&k.as_str()) {
-            return Err(format!("branch: unknown key {k:?} (p, moves, temp, differ)"));
+            return Err(format!("branch: unknown key {k:?} (p, moves, temp, differ; rule, eps, n_min, p_min, q_lo, q_hi)"));
         }
     }
     let p = f64_of("branch p", d.get("p").ok_or("branch: p (the share of games that branch) is required")?)?;
-    let b = BranchCfg { p, moves: get_u32(d, "moves", 3)?, temp: get_f64(d, "temp", 2.0)?, differ: flag(d, "differ", false) };
+    let given = |ks: &[&'static str]| -> Vec<&'static str> { ks.iter().copied().filter(|k| opt(d, k).is_some()).collect() };
+    let b = match get_str(d, "rule", "uniform")? {
+        "uniform" => {
+            let bad = given(NEARTIE_KEYS);
+            if !bad.is_empty() {
+                return Err(format!("branch: {bad:?} are settings of the near-tie rule (rule 'neartie'), not of the uniform rule"));
+            }
+            BranchCfg { p, moves: get_u32(d, "moves", 3)?, temp: get_f64(d, "temp", 2.0)?, differ: flag(d, "differ", false), rule: BranchRule::Uniform }
+        }
+        "neartie" => {
+            let bad = given(UNIFORM_KEYS);
+            if !bad.is_empty() {
+                return Err(format!("branch rule neartie: {bad:?} are the uniform rule's settings (a near-tie branch plays one deviation, the runner-up)"));
+            }
+            let z = NearTie::default();
+            let nt = NearTie { eps: get_f64(d, "eps", z.eps)?, n_min: get_u32(d, "n_min", z.n_min)?, p_min: get_f64(d, "p_min", z.p_min)?, q_lo: get_f64(d, "q_lo", z.q_lo)?, q_hi: get_f64(d, "q_hi", z.q_hi)? };
+            BranchCfg { p, moves: 1, temp: 2.0, differ: false, rule: BranchRule::NearTie(nt) }
+        }
+        r => return Err(format!("branch rule {r:?}: 'uniform' or 'neartie'")),
+    };
     b.check()?;
     Ok(b)
 }
@@ -404,8 +428,22 @@ mod tests {
     #[test]
     fn branch_starts_and_subsettings() {
         let b = parse_branch(&json!({"p": 0.25, "differ": 1})).unwrap();
-        assert_eq!(b, BranchCfg { p: 0.25, moves: 3, temp: 2.0, differ: true });
+        assert_eq!(b, BranchCfg { p: 0.25, moves: 3, temp: 2.0, differ: true, rule: BranchRule::Uniform });
         assert!(parse_branch(&json!({"moves": 2})).is_err());
+        // the near-tie rule (docs/search.md 2.11.1): its defaults, its keys only with it, the uniform rule's never with it
+        let b = parse_branch(&json!({"p": 0.2, "rule": "neartie"})).unwrap();
+        assert_eq!(b, BranchCfg { p: 0.2, moves: 1, temp: 2.0, differ: false, rule: BranchRule::NearTie(NearTie { eps: 0.02, n_min: 4, p_min: 0.02, q_lo: 0.1, q_hi: 0.9 }) });
+        let b = parse_branch(&json!({"p": 0.2, "rule": "neartie", "eps": 0.05, "n_min": 8, "p_min": 0, "q_lo": 0, "q_hi": 1})).unwrap();
+        assert_eq!(b.neartie(), Some(&NearTie { eps: 0.05, n_min: 8, p_min: 0.0, q_lo: 0.0, q_hi: 1.0 }));
+        assert_eq!(parse_branch(&json!({"p": 0.2, "rule": "uniform"})).unwrap().rule, BranchRule::Uniform);
+        assert!(parse_branch(&json!({"p": 0.2, "rule": "neartie", "moves": 1})).unwrap_err().contains("uniform rule's settings"));
+        assert!(parse_branch(&json!({"p": 0.2, "rule": "neartie", "differ": 0})).is_err());
+        assert!(parse_branch(&json!({"p": 0.2, "eps": 0.1})).unwrap_err().contains("near-tie rule"));
+        assert!(parse_branch(&json!({"p": 0.2, "rule": "nearest"})).is_err());
+        assert!(parse_branch(&json!({"p": 0.2, "rule": "neartie", "n_min": 0})).unwrap_err().contains("n_min"));
+        assert!(parse_branch(&json!({"p": 0.2, "rule": "neartie", "q_lo": 0.8, "q_hi": 0.2})).unwrap_err().contains("q_lo"));
+        assert!(parse_branch(&json!({"p": 0.2, "rule": "neartie", "eps": -0.1})).unwrap_err().contains("eps"));
+        assert!(parse_branch(&json!({"p": 0.2, "rule": "neartie", "p_min": 1.5})).unwrap_err().contains("p_min"));
         let s = parse_starts(&json!({"p": 1, "specs": [["a", "{\"x\": 1}"], ["b", {"y": 2}]]})).unwrap();
         assert_eq!(s.specs, vec![("a".to_string(), "{\"x\": 1}".to_string()), ("b".into(), "{\"y\":2}".into())]);
         let t = nn(json!({"belief_tilts": {"deck": 1, "belief": 0.5}, "select": "cq", "select_c_scale": 0.3, "cq_c_scale": 2})).unwrap();
