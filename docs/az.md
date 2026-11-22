@@ -9983,3 +9983,30 @@ target and no match too.
 --game mtg --spec '{"max_turns": 60}'`, a checkout against itself): 384 s for both sides at once against 1,808 s in the
 gate an hour earlier, and every digest the gate's own - visits records 4c42f1160eca9121, cq records 88ab3306d3beba12
 (3,554 samples each, results e266d43f27caa1e8), the match f2a5103266c05aa6 (10/16).
+
+## 76. The eager evaluator's priors on CUDA: the same bits every call (no setting; a behaviour change on that path, 2026-11-22)
+
+**What was wrong.** `NetEvaluator.evaluate`'s eager path (no CUDA graphs: `graphs=False`, or a batch the graphs do not
+take) softmaxes each leaf's options on the device, and a leaf's sum of its options was
+`torch.zeros(B).index_add_(0, rows, e)`. On CUDA `index_add_` adds the entries of one index in whatever order its
+threads reach them, so the sum's last bit - and then a prior's - changed from call to call on the same batch: 4
+different answers in 2,000 calls at 130 leaves, 2,000 different answers in 2,000 calls at 2,000 leaves; at most one
+unit in the last place of a float32 prior (6e-8). The network's own outputs were the same bits every call, as were the
+CUDA graphs' priors (softmaxed on the CPU) and the CPU's.
+
+**How it was found.** `tests/test_dup_reduce.py::test_max_is_deterministic_on_cuda_and_matches_the_cpu` (58) asserts
+the eager CUDA answer repeats bit for bit and failed on it, in 'max' and 'legacy' alike - nothing of the duplicate
+claims. The test runs only with a GPU visible, and MTG Zero's gate hides it, so it had not been run; the whole suite
+with the GPU visible (75) showed it.
+
+**The change.** On a CUDA device the sum is `torch.segment_reduce(e, 'sum', lengths=cnt)`: `rows` is sorted, a leaf's
+options are one run, and it adds each run in order - one answer in 2,000 calls at every size tried. Elsewhere the
+`index_add_` stays (on the CPU it adds in order: the same bits as ever, and `segment_reduce` there gives those bits
+too). **This changes behaviour on the eager CUDA path only**: its priors can differ in the last bit from the ones
+before, which already differed from call to call. No setting: there was no stable answer to preserve. The CPU, the
+CUDA graphs and the ONNX export are untouched. `zero.distill`'s loss has the same `index_add_`; a training loss, left
+as it is.
+
+**Tests and checks.** `tests/test_dup_reduce.py`: the test above passes; new
+`test_the_eager_evaluator_on_cuda_answers_the_same_bits_every_call` (both modes, 400 leaves, 300 calls) fails without
+the change (3 of the file's tests fail) and passes with it.
