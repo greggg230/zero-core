@@ -36,6 +36,10 @@ pub const ENV: &str = "ZERO_WORKER_CUDA_GRAPHS";
 /// Buckets a session keeps at most (each holds its own activations on the GPU); the least recently used goes.
 pub const MAX_BUCKETS: usize = 4;
 
+/// The fixed graph's: a bucket of T tokens a row takes pieces of up to this many fewer (its rows' padding keys are
+/// masked: the same answers up to float rounding), so that pieces whose longest row varies reuse buckets.
+pub const T_SLACK: usize = 32;
+
 pub fn wanted() -> bool {
     std::env::var(ENV).as_deref() == Ok("1")
 }
@@ -77,7 +81,8 @@ impl Caps {
 
     /// The bucket holds piece `s` (its tail padding found too: [`tail_plan`]).
     pub fn holds(&self, s: &Caps, tails: &Tails, ax: usize) -> bool {
-        self.b >= s.b + 16 && self.nnz >= s.nnz && self.k >= s.k && self.nt >= s.nt && self.l >= s.l && self.no >= s.no && self.t == s.t
+        let t_ok = if s.mr == 0 { self.t == s.t } else { self.t >= s.t && self.t <= s.t + T_SLACK };
+        self.b >= s.b + 16 && self.nnz >= s.nnz && self.k >= s.k && self.nt >= s.nt && self.l >= s.l && self.no >= s.no && t_ok
             && self.mr >= s.mr && (s.mr == 0 || self.s >= s.s + ax * (self.b - s.b))
             && tail_plan(self.nt - s.nt, self.l - s.l, tails, self.b - s.b).is_some()
     }
@@ -253,7 +258,7 @@ fn extend_off(off: &mut Vec<i64>, counts: &[usize]) {
 /// the first head slot's present flag (no token's); the fixed graph's: those in no run.
 pub fn pad(p: &Piece, caps: &Caps, tails: &Tails, actions: usize, pad_features: &[i32]) -> Result<Piece, String> {
     let s = p.sizes();
-    if caps.b <= s.b || caps.t != s.t {
+    if caps.b <= s.b || caps.t < s.t || (s.mr == 0 && caps.t != s.t) {
         return Err(format!("bucket {caps:?} for a piece of {s:?}"));
     }
     let np = caps.b - s.b;
@@ -317,6 +322,7 @@ pub fn pad(p: &Piece, caps: &Caps, tails: &Tails, actions: usize, pad_features: 
     q.ov_slot_lo.extend(std::iter::repeat_n(0i32, n));
     q.s = caps.s;
     q.mr = caps.mr;
+    q.t = caps.t;
     debug_assert_eq!(q.sizes(), Caps { b: caps.b, ..*caps });
     Ok(q)
 }
@@ -426,11 +432,12 @@ impl Cache {
         }
         // a bucket of this T that holds the rows but not the rest grows (its successor holds both)
         let mut caps = Caps::for_piece(s, ax);
-        if let Some(i) = self.buckets.iter().position(|b| b.caps.t == s.t && b.caps.b >= caps.b) {
+        let near = |t: usize| if s.mr == 0 { t == s.t } else { t >= s.t && t <= s.t + T_SLACK };
+        if let Some(i) = self.buckets.iter().position(|b| near(b.caps.t) && b.caps.b >= caps.b) {
             let o = self.buckets.remove(i).caps;
             let b = o.b.max(caps.b).max(up(s.b + 16, 64));
             let sc = if s.mr == 0 { 0 } else { o.s.max(caps.s).max(s.s + ax * (b - s.b)) };
-            caps = Caps { b, nnz: o.nnz.max(caps.nnz), k: o.k.max(caps.k), nt: o.nt.max(caps.nt), l: 0, no: o.no.max(caps.no), t: s.t, s: sc, mr: o.mr.max(caps.mr) };
+            caps = Caps { b, nnz: o.nnz.max(caps.nnz), k: o.k.max(caps.k), nt: o.nt.max(caps.nt), l: 0, no: o.no.max(caps.no), t: o.t.max(s.t), s: sc, mr: o.mr.max(caps.mr) };
             caps.l = s.l + 120 * (caps.nt - s.nt);
         }
         if !fits(&caps) {
@@ -671,6 +678,11 @@ mod tests {
         assert!(fc.holds(&fs, &t, 2) && fc.s >= 9 + 2 * (fc.b - 2) && fc.mr >= 3, "{fc:?}");
         assert!(!Caps { s: 9 + 2 * (fc.b - 2) - 1, ..fc }.holds(&fs, &t, 2));
         assert!(!Caps { mr: 2, ..fc }.holds(&fs, &t, 2));
+        // a fixed-graph bucket of a larger T (within T_SLACK) takes the piece; the static graph's needs its T
+        assert!(Caps { t: 16 + T_SLACK, ..fc }.holds(&fs, &t, 2) && !Caps { t: 17 + T_SLACK, ..fc }.holds(&fs, &t, 2));
+        assert!(!Caps { t: 32, ..caps }.holds(&s, &t, 0));
+        let wide = Caps { t: 48, ..fc };
+        assert_eq!(pad(&pf, &wide, &t, 1024, &(40_000..40_100).collect::<Vec<i32>>()).unwrap().sizes(), wide);
         let free: Vec<i32> = (40_000..40_100).collect();
         let fq = pad(&pf, &fc, &t, 1024, &free).unwrap();
         assert_eq!(fq.sizes(), fc);
