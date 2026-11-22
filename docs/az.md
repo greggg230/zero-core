@@ -9716,36 +9716,71 @@ per branch than section 24's (a merged branch stops early), the same number of g
 ### 72.5 Farm workers
 
 The native worker (section 44) plays branched self-play, both rules, from the run's settings (`settings.rs`
-`branch_of`: the driver's branch dict exactly as `zero.forks.Forks` builds it, the same refusals) in **shards** jobs:
-the driver is the shared Rust one, so its games, branches and merges are the desktop's; `fin` and the unfinished ranges
-count the job's game ids (a branch is its game's second row), and its stats carry `branches`, `merges`, `neartie`.
-The farm pool's jobs write **game records** (section 45), and those cannot hold a branch: 72.7.
+`branch_of`: the driver's branch dict exactly as `zero.forks.Forks` builds it, the same refusals): the driver is the
+shared Rust one, so its games, branches and merges are the desktop's. `fin` and the unfinished ranges count the job's
+game ids (a branch is its game's second row); its stats carry `branches`, `merges`, `neartie`. Its records files are
+`records/2` (72.7) and its shards hold every game and branch; `run_settings.json` classes `selfplay_branch` and its
+nine settings `play`, so `check-config` passes them into the pool's template (`selfplay_archive` stays python_only).
 
 ### 72.6 Tests and checks
 
-`cargo test` (zero_search 218: the 6 tests of docs/search.md 2.11.1 and the parser's; zero_worker all passing with
-`branched_games_are_the_python_drivers` - the worker's branch dict equals the Python one, refusals - and
-`branched_games_play_into_shards` - both rules, `fin` = the job's ids, every game and branch in the shards, the same job
-twice the same shards, a records job refused, no new stats keys without branches). `tests/test_neartie.py` (10: the
+`cargo test` (zero_search 220: the tests of docs/search.md 2.11.1, `branch_records_replay_to_the_drivers_rows_bit_for_bit`,
+`a_branchs_game_log_starts_with_its_games_moves`, the parser's; zero_worker all passing with
+`branched_games_are_the_python_drivers`, `branched_games_play_into_shards`,
+`branch_records_replay_to_the_shards_rows_bit_for_bit` - both rules, the toy and the pick game, merged near-tie branches,
+a rolling job: every row rebuilt from the records, each branch with its game's record from the same file, equals the
+shard's, array for array - and `a_game_and_its_branch_share_one_records_file`). `tests/test_neartie.py` (17: the
 bindings' rows, stats and refusals; the run settings and their checks; the driver kwargs, the fingerprints - the
 uniform one unchanged - and the description; the tally, its merge with an older remote's and its summary; a rolling
-toy run; remote self-play with the remote 'local'). `test_forks.py` and `test_worker_settings.py` unchanged and
-passing. **Off**: `tools/check_checkpoint_compat.py --package zero --game toy` against the commit before (92568b5)
-identical with `--net random` and `--net uniform`; uniform-rule branched games (three settings, with archive starts in
-one) digested old vs new through the bindings - rows, branch dicts, samples, stats - identical (77f3d48aea53fc01).
+toy run; remote self-play with the remote 'local'; branch records replayed through the engine to the driver's own
+samples for both rules on the toy and the pick game, merged and not; the farm pool replaying and counting branch
+records, refusing an orphan branch and a records/1 branch; game records holding branch games). `test_forks.py`,
+`test_worker_settings.py`, `test_farm_pool.py`, `test_farm_guards.py`, `test_farm_trace.py` passing. **Off**:
+`tools/check_checkpoint_compat.py --package zero --game toy` against the commit before (92568b5) identical with
+`--net random` and `--net uniform`; uniform-rule branched games (three settings, with archive starts in one) digested
+old vs new through the bindings - rows (but the new `branched` flag), branch dicts, samples, stats - identical
+(77f3d48aea53fc01). **Farm parity** on MTG Zero (a scratch checkout of its HEAD with this core; its legacy-meta3-r1
+settings with the league off, `selfplay_branch` 1, the uniform evaluator, 16 games, groups 1, sims 8, belief tilt off;
+its native worker `mtgz-worker` of the same tree): `tools/worker_parity.py` identical, native shards against the
+Python remote worker's, near-tie (7,063 rows, 16 branches), uniform with differ (6,450 rows) and without branches
+(4,485 rows); `tools/worker_records_gate.py` GATE 3 PASSED near-tie (32 games, 5,772 rows) and uniform (32 games,
+5,484 rows) as records/2, and without branches (records/1 in 3 files, 3,516 rows); `tools/driver_settings_dump.py
+--compare-worker`: 33 cases agree, the branch configs included. No merge on MTG Zero yet: its `merge_key` is its own
+change (the gate counted 2,550 eligible decisions in those 16 games at eps 0.05, n_min 2).
 
-### 72.7 Open: game records of branch games (the farm pool)
+### 72.7 Game records of branch games (`records/2`) and the farm pool
 
-A game record (`records/1`, docs/search.md 2.17) replays a game from its seed; a branch starts from its game's state at
-the branch point, and a merged branch ends with its game's outcome, which its own final state does not give. So the
-driver refuses to trace a branch (as before), the worker refuses a records job with branches, and `run_settings.json`
-keeps `selfplay_branch` python_only: `check-config` refuses it, so the farm pool refuses such a run at its start
-(section 70) rather than failing every lease. What it needs: a branch record carrying its game's moves to the branch
-point and the merged outcome (a `branch` block: the prefix length, merged or not), replay accepting a merged record's
-outcome as given (or checked against its game's record), the worker keeping a game and its branch in one records file,
-and the pool and the coordinator crediting a branch under its game's id without counting it as another copy of that
-game (zero-farm's crediting rules). Until then a farm-backed run plays branches on the desktop and the Python remote
-hosts only.
+**The record.** A game record (docs/search.md 2.17) replays a game from its seed. A branch's trace and game log now
+start with its game's real moves to the branch point (`BranchInfo::trace_from` of them), so a branch's record is
+replayable from its game's seed: it carries its game's gid and seed, every real move from the game's start, its rows
+(steps counted from the game's start, all after the branch point) and a `branch` block - `from`, where it branched
+(`at`, `of`, `decision`, `step`, `action`), `moves`, `played`, `same_first`, the near-tie rule's `alt`, `gap`, `tag`,
+and `merged`. A merged branch's `result` and `margin` are its game's. `record::replay_branch(spec, rec, parent, aux)`
+replays it with its game's record: the gid, seed and players its game's, its first `from` moves its game's, a near-tie
+branch's next move its runner-up and not its game's, no row at or before the branch point; a branch that played to
+its end is checked like any game; a merged one must end at a decision of a game in progress whose `merge_key` is one
+of its game's decision states' after the branch point, with its game's result and margins bit for bit (its game over),
+and its rows take them. `replay` alone refuses a branch record. The bindings: `replay_rows(..., parent=)`. A file that
+may hold branch games is `records/2` (`RECORDS_VERSION_BRANCH`); a writer without branches writes `records/1`, byte for
+byte as before. The game's own row says `branched` when a branch of it follows.
+
+**The worker** (`records.rs`) holds a game whose row says `branched` until its branch's line follows: no size cut and
+no timed flush (a rolling job's `flush_s`) between them; only the job's end writes a game whose branch never came
+(the phase ended). So a branch's record always finds its game's record in its own file.
+
+**Crediting** (zero-farm PROTOCOL.md 16; no coordinator, agent or wire change): the coordinator credits ids, and a
+game and its branch are one id in one file, so they are credited once, together; a later copy of the id is a
+duplicate whole, branch included. **The pool** (`zero/farm_pool.py`) replays each credited branch with its game's line
+from the same chunk, refuses a chunk with a branch but not its game or with a branch in a records/1 file, and counts
+each accepted game - a branch included - as one of the iteration's games, as this machine does (24.2): its `accept`
+total can exceed the ids the coordinator credited, and the farm quota stops on it. The accepted games' forks tally
+joins the iteration's `selfplay.forks` (`RemotePlay.end`). **Game records** (`game_records`, section 59): a branch's
+record (local, from the game log, or the farm's) carries a `branch` block (`from` and the block above); its actions
+start with its game's first `from` moves.
+
+**A game database** reading these records (MTG Zero's `tools/gamedb.py`): a record with `branch` is not a game from a
+new deal - it shares its gid and seed with its game's record and its first `branch.from` actions; a merged one
+(`branch.merged` not null) ends in a position that is not terminal, with its game's result.
 
 ### 72.8 Measured
 
@@ -9754,5 +9789,5 @@ hosts only.
 of 46 / 46 / 44 games, mean gap 0.007-0.011, no merges (the toy has no merge key); uniform branches, same seed: 3 / 5 /
 13. **Merges** (`PickGame`, the driver test's toy with transpositions, every decision eligible, p 1, 80 games of 8
 turns): 80 branches, 10 merged (12.5%) after 2.4 decisions on average (24 rows), the other 70 played to the end
-(204 rows). On MTG Zero nothing yet: its `merge_key` / `branch_alt_ok` hooks are its own change, and the A/B is its
-B2 step 2.
+(204 rows). On MTG Zero nothing measured yet but the farm checks of 72.6: its `merge_key` / `branch_alt_ok` hooks are
+its own change, and the A/B is its B2 step 2.

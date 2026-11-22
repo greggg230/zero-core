@@ -558,7 +558,8 @@ the section above, byte for byte (the default: a `branch` dict without `rule`, o
 Rows (the bindings, only with this rule): a branch's `branch` dict gains `alt`, `gap`, `tag`, `merged` (None, or
 its decisions to the merge); a game's row gains `neartie` (its eligible decisions); the stats `neartie_seen`,
 `merges`, `merge_decisions` (only once nonzero). Everything else is the section above: a branch counts as a
-finished game, carries its game's gid, never branches, and is not traceable (`set_trace`, `set_game_log` refuse).
+finished game, carries its game's gid and never branches. Since records/2 a branch is traced and logged: its trace and
+game log start with its game's moves to the branch point (2.17's records/2 paragraph).
 
 Tests (`driver::tests::neartie`): `the_gate_at_its_boundaries` (the gap exactly eps, visits below n_min, a prior
 below / at p_min, Q(a) at and outside [q_lo, q_hi], `branch_alt_ok` false skips to the next candidate, a better
@@ -832,6 +833,18 @@ without tail segments, or an aborted game in progress without it are refused. Te
 `driver::trace_tail_tests` - toy_tail's traced games (dense and sparse batches: rows with tail tokens and overrides)
 replay to their rows bit for bit, head, tail tokens and overrides included; games aborted at the first row, mid-game
 (a driver's lower limit) and a contest's later episode replay as aborted; a wrong or missing reason is refused.
+
+**Branch games: records/2** (docs/az.md 72.7; 2026-11-21). A driver with branched games (2.11) traces and logs its
+branches too (`set_trace`, `set_game_log`; archive starts are still refused): a branch's trace and game log begin with
+its game's real moves to the branch point (`ForkPoint` keeps the game's move log; `BranchInfo::trace_from` = how many,
+the log's `branch_from`), then its own, and its records' steps count from the game's start. `game_json` writes a branch
+block (`from`, its origin, `alt`, `merged`; a merged near-tie branch's result and margins are its game's) and a game's
+`neartie` count; `GameResult::branched` flags a game whose branch row follows. `replay` refuses a branch record;
+`replay_branch(spec, rec, parent, aux)` replays it with its game's record (the checks of docs/az.md 72.7: the shared
+moves, the runner-up, rows after the branch point, a merged branch's borrowed outcome and its last state's merge key
+among its game's later decision states). `RECORDS_VERSION_BRANCH` = 2 names a file that may hold branches. Tests:
+`driver::tests::neartie::branch_records_replay_to_the_drivers_rows_bit_for_bit`,
+`a_branchs_game_log_starts_with_its_games_moves`.
 
 ### 2.18 A panicking game is dropped, not the run (`take_failures`; MTG Zero's fuzz depth decision, 2026-11-15)
 
