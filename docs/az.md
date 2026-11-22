@@ -10010,3 +10010,7 @@ as it is.
 **Tests and checks.** `tests/test_dup_reduce.py`: the test above passes; new
 `test_the_eager_evaluator_on_cuda_answers_the_same_bits_every_call` (both modes, 400 leaves, 300 calls) fails without
 the change (3 of the file's tests fail) and passes with it.
+The whole suite with the GPU visible, in four shards (75), beside two live runs: 834 passed, 31 skipped, the
+file's CUDA tests among them; one failure, `tests/test_remoteplay.py::test_cotrain_the_local_driver_is_never_starved`
+(the local driver's share of the games 25 of 167 against the 15 % it asserts), which times real threads (AGENTS.md)
+and passed 4 of 5 runs alone afterwards, with the GPU visible and hidden.
