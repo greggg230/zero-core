@@ -186,8 +186,11 @@ def alternate_ids(v):
 # graph 'fast-matmul' (onnx_export.GRAPHS: the fast graph with its attention as MatMuls - the one zero-onnx/2 graph
 # DirectML runs, docs/az.md 46.10), float32 - the AMD GPUs' form (zero-farm PROTOCOL rev 22: AMD GPUs through DirectML;
 # their DirectML answers the float16 copy non-deterministically, 46.10); 'matmul-fp16' = that graph in float16 (DirectML
-# on NVIDIA and Intel GPUs runs it deterministically)
-VARIANT_FORMS = ('fp16', 'matmul-fp16', 'matmul')
+# on NVIDIA and Intel GPUs runs it deterministically); 'weights' = the gen's network as torch-weights/1 (zero.torch_weights:
+# the farm's torch worker, docs/az.md 78 - the form of the alternates whose runtime pack is opted in (`when.opt_in`), and
+# of no other machine: it is not a graph)
+VARIANT_FORMS = ('fp16', 'matmul-fp16', 'matmul', 'weights')
+WEIGHTS_FORM = 'weights'
 
 
 def variant_setting(v):
@@ -195,7 +198,8 @@ def variant_setting(v):
     '' / None -> []; 'name=form[@vendor][,...]' - each name `farm_def.VARIANT_RE`, distinct, at most `MAX_VARIANTS`; each
     form one of VARIANT_FORMS; `vendor` (optional, a profile vendor name `farm_def.VENDORS`) - the variant goes to the run's
     GPU alternates of that vendor; a variant without one to every other GPU alternate (the first such variant), None in
-    the triple. At most one variant per vendor. ValueError otherwise."""
+    the triple. At most one variant per vendor. A 'weights' variant (the torch worker's, docs/az.md 78) takes no vendor and
+    counts in neither rule: it goes to the opted-in alternates (`variant_of`); at most one. ValueError otherwise."""
     if v is None or (isinstance(v, str) and not v.strip()):
         return []
     out = []
@@ -205,7 +209,12 @@ def variant_setting(v):
         if not FD.VARIANT_RE.match(name) or form not in VARIANT_FORMS or ('@' in rest and vendor not in FD.VENDORS):
             raise ValueError(f'variant {item!r}: name=form[@vendor], the name [a-z0-9][a-z0-9-]{{0,31}}, the form one of '
                              f'{VARIANT_FORMS}, the vendor one of {FD.VENDORS}')
+        if form == WEIGHTS_FORM and vendor:
+            raise ValueError(f'variant {item!r}: a {WEIGHTS_FORM} variant takes no vendor (it goes to the opted-in '
+                             f'alternates: their pack\'s opt_in, docs/az.md 78)')
         out.append((name, form, vendor or None))
+    if sum(1 for _, f, _ in out if f == WEIGHTS_FORM) > 1:
+        raise ValueError(f'variants {v!r}: at most one {WEIGHTS_FORM} variant')
     if len({n for n, _, _ in out}) != len(out) or len(out) > FD.MAX_VARIANTS:
         raise ValueError(f'variants {v!r}: distinct names, at most {FD.MAX_VARIANTS}')
     vendors = [x for _, _, x in out if x]
@@ -214,10 +223,20 @@ def variant_setting(v):
     return out
 
 
-def variant_of(variants, vendor):
-    """The variant name a GPU alternate of `vendor` plays (`variant_setting`'s list): the one for its vendor, else the
-    first without a vendor, else None (the gen's default model)."""
-    return next((n for n, _, x in variants if x == vendor), None) or next((n for n, _, x in variants if x is None), None)
+def variant_of(variants, vendor, opt_in=None):
+    """The variant name a GPU alternate of `vendor` plays (`variant_setting`'s list): an opted-in alternate (`opt_in`, its
+    pack's: the torch worker, docs/az.md 78) the 'weights' variant, else None; any other the graph variant for its vendor,
+    else the first graph variant without a vendor, else None (the gen's default model)."""
+    if opt_in:
+        return next((n for n, f, _ in variants if f == WEIGHTS_FORM), None)
+    graphs = [(n, x) for n, f, x in variants if f != WEIGHTS_FORM]
+    return next((n for n, x in graphs if x == vendor), None) or next((n for n, x in graphs if x is None), None)
+
+
+def variant_file(name, form):
+    """A gen's variant file name (and its artifact key's last part): model-<name>.onnx, model-<name>.pt for 'weights'
+    (the agent caches every variant as model-<name>.onnx whatever its key: the torch worker reads the file's format)."""
+    return f'model-{name}.pt' if form == WEIGHTS_FORM else f'model-{name}.onnx'
 
 
 def version_tuple(v):
@@ -736,7 +755,12 @@ class Pool:
         """Gen `gen`'s variant in form `form` (VARIANT_FORMS) written to `dst`: from its graph `src` ('fp16'), or from
         its checkpoint `ckpt` exported again as another graph ('matmul' / 'matmul-fp16': export_cached's graph
         'fast-matmul' under <dst's dir>/v-<form>/, its own weight-swap template and check against the reference set;
-        'matmul-fp16' then float16)."""
+        'matmul-fp16' then float16), or its checkpoint as torch-weights/1 ('weights', zero.torch_weights)."""
+        if form == WEIGHTS_FORM:
+            # (the torch worker's: the checkpoint's network and the run's inference settings, docs/az.md 78)
+            from .torch_weights import export
+            export(ckpt, dst, self.R.cfg, gen=gen)
+            return
         from .onnx_export import to_float16
         if form == 'fp16':
             to_float16(src, dst)
@@ -855,12 +879,19 @@ class Pool:
                 '(the release index lists them): fix pool_alternates / pool_alt_vendor, then restart the run')
             for p in sorted({x['when'].get('platform') for x in alternates} - {None}):
                 platform_check(self.worker, self.R.cfg, os.path.join(self.dir, 'template'), p, self.log)
+            opted = [x for x in alternates if x['when'].get('opt_in')]
+            if opted and not any(f == WEIGHTS_FORM for _, f, _ in self.variants):
+                # (an opted-in pack runs the torch worker, docs/az.md 78: it plays nothing but its weights variant - the
+                # gen's default graph would be refused by every such lease)
+                raise Refused(f"alternate {opted[0]['build_id']} is opted in ({opted[0]['when']['opt_in']}: the torch "
+                              f"worker) but pool_variants has no {WEIGHTS_FORM} variant for it",
+                              "add 'torch=weights' to pool_variants, or leave the alternate out of pool_alternates")
             if self.variants:
                 # (rev 20, 14.3: each GPU alternate names its variant - its vendor's, else the first without a vendor
                 # (variant_of); every other machine plays the default)
                 gpu = [x for x in alternates if 'vendor' in x['when']]
                 for x in gpu:
-                    n = variant_of(self.variants, x['when']['vendor'])
+                    n = variant_of(self.variants, x['when']['vendor'], x['when'].get('opt_in'))
                     if n:
                         x['model'] = n
                 for n, _, _ in self.variants:
@@ -901,7 +932,7 @@ class Pool:
             ckpt_of_gen = model_path(self.R.run, gen)
             vs = {}
             for vname, form, _ in self.variants:
-                vp = os.path.join(os.path.dirname(g['model']), f'model-{vname}.onnx')
+                vp = os.path.join(os.path.dirname(g['model']), variant_file(vname, form))
                 self.variant_maker(form, g['model'], vp, ckpt=ckpt_of_gen, gen=gen)
                 vs[vname] = {'model': vp, 'sha256': FD.file_sha256(vp), 'model_size': os.path.getsize(vp)}
             g['variants'] = vs
@@ -909,7 +940,7 @@ class Pool:
             self.log(f'gen {gen} variants {", ".join(f"{k} ({v["sha256"][:12]})" for k, v in vs.items())} '
                      f'({round(time.time() - t0, 1)} s)')
         keys = {'model': f'ckpt/{self.farm}/{gen}/model.onnx', 'reference': f'ckpt/{self.farm}/{gen}/reference.npz'}
-        vkeys = {k: f'ckpt/{self.farm}/{gen}/model-{k}.onnx' for k in g.get('variants') or {}}
+        vkeys = {k: f'ckpt/{self.farm}/{gen}/{os.path.basename(v["model"])}' for k, v in (g.get('variants') or {}).items()}
         if not g.get('uploaded'):
             self.client.put_artifact(keys['model'], g['model'], g['sha256'])
             self.client.put_artifact(keys['reference'], g['reference'], g['reference_sha256'])

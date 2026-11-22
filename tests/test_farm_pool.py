@@ -1111,3 +1111,83 @@ def test_transient_errors_keep_retrying(pool, monkeypatch):
     finally:
         p.close()
         p.th.join(10)
+
+
+def test_a_torch_alternate_plays_the_weights_variant(pool, monkeypatch):
+    """The farm's torch runtime (docs/az.md 78): an alternate whose pack is opted in (`opt_in`: when.opt_in) is named the
+    'weights' variant (model-<name>.pt, uploaded under that key, signed and registered as any variant), every other GPU
+    alternate a graph variant as before; a 'weights' variant takes no vendor and is never a graph alternate's; an opted-in
+    alternate without a 'weights' variant refuses the pool (its worker plays nothing else)."""
+    fake, R, published = pool
+    w = {'manifest': 1, 'kind': 'worker', 'version': 'toy-test', 'game': 'zero-toy', 'entry': 'w.exe', 'files': []}
+    (rt, rt_raw), (cuda, cuda_raw), (tp, tp_raw) = _manifests(
+        {'manifest': 1, 'kind': 'runtime', 'version': 'cpu-test', 'files': []},
+        {'manifest': 1, 'kind': 'runtime', 'version': 'cuda-test', 'min_agent': '0.2.10',
+         'gpu': {'vendor': 'nvidia', 'min_driver': '527.41', 'providers': ['cuda']}, 'files': []},
+        {'manifest': 1, 'kind': 'runtime', 'version': 'torch-test', 'min_agent': '0.2.10', 'opt_in': 'torch',
+         'gpu': {'vendor': 'nvidia', 'min_driver': '528.33', 'providers': ['torch-cuda']}, 'files': []})
+    (build, build_raw), (alt, alt_raw), (talt, talt_raw) = _manifests(
+        dict(w, requires_runtime=rt), dict(w, requires_runtime=cuda), dict(w, requires_runtime=tp, entry='zf-pyshim.exe'))
+    for bid, raw in ((rt, rt_raw), (cuda, cuda_raw), (tp, tp_raw), (build, build_raw), (alt, alt_raw), (talt, talt_raw)):
+        fake.objects[f'builds/{bid}/manifest.json'] = raw
+    made = []
+
+    def make(self, form, src, dst, ckpt=None, gen=None):
+        made.append((form, os.path.basename(dst)))
+        with open(dst, 'wb') as f:
+            f.write(form.encode() + b' of ' + open(src, 'rb').read())
+    monkeypatch.setattr(FP.Pool, '_make_variant', make)
+    for v in ('torch=weights@nvidia', 'a=weights,b=weights'):
+        with pytest.raises(ValueError):
+            FP.variant_setting(v)
+    vs = FP.variant_setting('gpu=fp16,torch=weights')
+    assert vs == [('gpu', 'fp16', None), ('torch', 'weights', None)]
+    assert (FP.variant_of(vs, 'nvidia'), FP.variant_of(vs, 'nvidia', 'torch'), FP.variant_of(vs, 'amd')) == ('gpu', 'torch', 'gpu')
+    assert FP.variant_of(FP.variant_setting('torch=weights'), 'nvidia') is None
+    assert FP.variant_file('torch', 'weights') == 'model-torch.pt' and FP.variant_file('gpu', 'fp16') == 'model-gpu.onnx'
+    name = f'pool:{FARM}'
+    R.cfg.update(pool_build=build, pool_runtime=rt, pool_alternates=f'{talt},{alt}', pool_variants='gpu=fp16,torch=weights')
+    p = FP.Pool(QuotaRP(R), name)
+    try:
+        p.begin(1)
+        wait(lambda: 0 in fake.ckpts, 'gen 0 registered')
+    finally:
+        p.close()
+        p.th.join(10)
+    assert made == [('fp16', 'model-gpu.onnx'), ('weights', 'model-torch.pt')]
+    key = f'ckpt/{FARM}/0/model-torch.pt'
+    sha = hashlib.sha256(fake.objects[key]).hexdigest()
+    assert fake.ckpts[0]['variants']['torch'] == {'model': key, 'sha256': sha}
+    assert published[-1]['checkpoints']['0']['variants']['torch'] == {'model_sha256': sha, 'model_size': len(fake.objects[key])}
+    FD.validate(published[-1])
+    puts = [json.loads(d) for m, pth, d in fake.raw if m == 'PUT' and pth == f'/v1/admin/run/{FARM}']
+    assert puts[-1]['alternates'] == [
+        {'build_id': talt, 'runtime': tp, 'when': {'vendor': 'nvidia', 'opt_in': 'torch'}, 'model': 'torch'},
+        {'build_id': alt, 'runtime': cuda, 'when': {'vendor': 'nvidia'}, 'model': 'gpu'}]
+    # an opted-in alternate without a weights variant: refused (a definitive answer: the pool stops)
+    R.cfg.update(pool_variants='gpu=fp16')
+    p = FP.Pool(QuotaRP(R), name)
+    try:
+        p.begin(2)
+        wait(lambda: p.stopped, 'the pool stopped')
+    finally:
+        p.close()
+        p.th.join(10)
+    assert 'weights' in str(p.stopped)
+
+
+def test_the_weights_variant_is_the_checkpoints_network(tmp_path):
+    """Pool._make_variant('weights'): zero.torch_weights.export of the gen's checkpoint with the run's inference settings."""
+    import torch
+    from zero import torch_weights as TW
+    from zero.net import make_net, save
+    from zero import games as G
+    torch.manual_seed(0)
+    ck = str(tmp_path / 'iter_0007.pt')
+    save(make_net(G.info('toy'), 'toy', 'mlp', 8, 1), ck, {'iter': 7})
+
+    class P:
+        R = type('R', (), {'cfg': {'infer_precision': 'bf16', 'infer_token_chunks': 0}})()
+    FP.Pool._make_variant(P(), 'weights', None, str(tmp_path / 'model-torch.pt'), ckpt=ck, gen=7)
+    d = TW.read(str(tmp_path / 'model-torch.pt'))
+    assert d['gen'] == 7 and d['infer']['precision'] == 'bf16'

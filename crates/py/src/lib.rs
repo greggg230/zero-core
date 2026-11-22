@@ -1070,6 +1070,13 @@ impl PySearchDriver {
         self.d.set_trace(on).map_err(verr)
     }
 
+    /// A rolling driver's first game id (`Driver::set_first_gid`): its games are `gid`, `gid + 1`, ... - before the
+    /// first resume. The farm's torch worker (zero.farm_torch_worker, docs/az.md 78): a job's ids from its
+    /// `gid_base`, as the native worker's driver numbers them.
+    fn set_first_gid(&mut self, gid: u32) -> PyResult<()> {
+        self.d.set_first_gid(gid).map_err(verr)
+    }
+
     /// Log every game that finishes from now on (`Driver::set_game_log`, docs/search.md 2.20): its result row (take_results,
     /// take_game_records) carries `log` = {"seed", "actions": bytes (each real move a little-endian u16; None when a step
     /// is not an action, then "steps": a JSON list as a trace record's), "n_actions", "setup", "spec" (the JSON of the

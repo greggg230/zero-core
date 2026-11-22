@@ -290,3 +290,24 @@ def test_checkpoint_entries(tmp_path):
     assert e == {'model_sha256': FD.file_sha256(str(m)), 'model_size': 50, 'reference_sha256': FD.file_sha256(str(r)),
                  'reference_size': 4}
     assert FD.checkpoint_entry(str(m))['reference_sha256'] is None
+
+
+def test_run_alternates_carry_an_opted_in_pack():
+    """The farm's torch runtime (docs/az.md 78): a runtime pack with `opt_in` makes its alternate's `when.opt_in`; a bad
+    name is refused; every other pack's alternate exactly as before (no key)."""
+    cpu = {'manifest': 1, 'kind': 'runtime', 'version': 'ort-cpu', 'files': []}
+    tp = {'manifest': 1, 'kind': 'runtime', 'version': 'torch-2.11.0-cu128-py313', 'opt_in': 'torch',
+          'gpu': {'vendor': 'nvidia', 'min_driver': '528.33', 'providers': ['torch-cuda']}, 'files': []}
+    cuda = {'manifest': 1, 'kind': 'runtime', 'version': 'cuda', 'gpu': {'vendor': 'nvidia', 'providers': ['cuda']}, 'files': []}
+    bad = dict(tp, version='bad', opt_in='Torch!')
+    packs, (rt_cpu, rt_t, rt_c, rt_bad) = _manifests(cpu, tp, cuda, bad)
+    w = {'manifest': 1, 'kind': 'worker', 'version': 'mtg-1', 'game': 'mtg', 'entry': 'x.exe', 'files': []}
+    builds, (b_cpu, b_t, b_c, b_bad) = _manifests(dict(w, requires_runtime=rt_cpu), dict(w, requires_runtime=rt_t, entry='zf-pyshim.exe'),
+                                                  dict(w, requires_runtime=rt_c), dict(w, requires_runtime=rt_bad, version='b'))
+    objs = {**packs, **builds}
+    cl = FD.Client('http://fake', token=TOKEN, transport=lambda m, url, h, d: (200, objs[url.split('/builds/')[1].split('/')[0]]))
+    alts, bs = FD.run_alternates(cl, b_cpu, rt_cpu, [b_t, b_c])
+    assert alts == [{'build_id': b_t, 'runtime': rt_t, 'when': {'vendor': 'nvidia', 'opt_in': 'torch'}},
+                    {'build_id': b_c, 'runtime': rt_c, 'when': {'vendor': 'nvidia'}}] and bs == [b_cpu, b_t, b_c]
+    with pytest.raises(SystemExit, match='opt_in'):
+        FD.run_alternates(cl, b_cpu, rt_cpu, [b_bad])
