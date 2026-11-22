@@ -103,6 +103,8 @@ def from_row(row, it, src):
                 'rounds': row.get('rounds'), 'nets': lg.get('nets'), 't': round(time.time(), 1)})
     if row.get('abort_reason'):
         rec['abort_reason'] = row['abort_reason']
+    if row.get('branch') is not None:
+        rec['branch'] = branch_block(row['branch'], lg.get('branch_from'))
     return rec, lg['spec']
 
 
@@ -125,7 +127,22 @@ def from_farm(rec, spec, it, src, machine=None):
            'machine': machine_tag(machine), 't': round(time.time(), 1)}
     if rec.get('abort_reason'):
         out['abort_reason'] = rec['abort_reason']
+    if rec.get('branch') is not None:
+        out['branch'] = branch_block(rec['branch'], rec['branch'].get('from'))
     return out, spec
+
+
+def branch_block(b, frm):
+    """A branch game's `branch` block in a game record (docs/az.md 72.7): its actions start with its game's first
+    `from` real moves (the same gid and seed), then its own; `merged` (null, or its decisions after the deviation): a
+    near-tie branch that reached one of its game's later states and ended there - its `result` is its game's and its
+    last state is a game in progress. The other keys: where it branched (`at` of `of` eligible decisions, the game's
+    `decision` / `step` / `action` there), its deviation moves, the near-tie rule's runner-up `alt`, gap and tag."""
+    out = {'from': None if frm is None else int(frm)}
+    for k in ('at', 'of', 'decision', 'step', 'action', 'moves', 'played', 'same_first', 'alt', 'gap', 'tag', 'merged'):
+        if k in b:
+            out[k] = b[k]
+    return out
 
 
 def actions_of(rec):

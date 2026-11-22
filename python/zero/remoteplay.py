@@ -1232,7 +1232,14 @@ class RemotePlay:
             # the farm pools' share (docs/az.md 45): closed with what they accepted - the run never waits for them
             # (outside mu: end_phase takes Pool.dmu, which a draining pool holds while it calls accept_pool)
             pls = {p.name: p.end_phase(it) for p in list(self.pools.values())}
-            out['pools'] = {n: {k: v for k, v in r.items() if k != 'stale'} for n, r in pls.items()}
+            out['pools'] = {n: {k: v for k, v in r.items() if k not in ('stale', 'forks')} for n, r in pls.items()}
+            if any(r.get('forks') for r in pls.values()):
+                # (branched games the pools accepted: into the iteration's forks tally with the remotes', docs/az.md 72.7)
+                from .forks import merge as fmerge
+                fk = out.get('forks')
+                for r in pls.values():
+                    fk = fmerge(fk, r.get('forks'))
+                out['forks'] = fk
             out['games'] = out.get('games', 0) + sum(r['games'] for r in pls.values())
             out['samples'] = out.get('samples', 0) + sum(r['samples'] for r in pls.values())
             qblock['stale'] = merge_hist(qblock['stale'], *[r['stale'] for r in pls.values()])

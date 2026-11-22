@@ -11,6 +11,7 @@ from zero.run import DEFAULTS, read_metrics
 from test_forks import play
 from test_loop import run_loop
 from test_remoteplay import PAIR, check_quota, pair_env
+from test_farm_pool import pool  # noqa: F401 (the farm pool's fixture)
 
 LOOSE = {'eps': 0.5, 'n_min': 1, 'p_min': 0.0, 'q_lo': 0.0, 'q_hi': 1.0}
 
@@ -149,3 +150,129 @@ def test_remote_workers_play_neartie_branches(tmp_path):
     rem = [r['selfplay']['forks'].get('remote') for r in m[1:]]
     assert any(x and x['games']['branch'] > 0 for x in rem), rem
     assert any(r['selfplay']['forks'].get('neartie', {}).get('branches', 0) > 0 for r in m[1:])
+
+
+# ---------------------------------------------------------------- branch records (records/2, docs/az.md 72.7)
+
+PICK = '{"turns": 8, "keys": true}'
+NT = {'p': 1.0, 'rule': 'neartie', 'eps': 1.0, 'n_min': 1, 'p_min': 0.0, 'q_lo': 0.0, 'q_hi': 1.0}
+UNI = {'p': 0.5, 'moves': 3, 'temp': 2.0}
+
+
+def branch_games(game, spec, n, seed, branch, net=0):
+    """A farm worker's games 0..n-1 and their branches (a traced rolling driver seeded as the farm's) -> [(row, record
+    text, samples dict or None)] in the order they finished."""
+    from test_farm_pool import Hashed
+    from zero.infer import drive
+    from zero.workqueue import split_games
+    s = G.nn_seat('m', 8, selfplay=True, sims_fast=2, p_full=0.5)
+    drv = G.Driver(game, [[s, s]], spec=spec, concurrency=6, seed=seed, record=True, threads=2, groups=1, rolling=True,
+                   branch=branch)
+    drv.set_trace(True)
+    drv.resume(n, net)
+    drive(drv, {'m': Hashed()})
+    rows, texts, smp = drv.take_game_records()
+    return [(row, t, sd) for (row, sd), t in zip(split_games(rows, smp), texts)]
+
+
+@pytest.mark.parametrize('game,spec,branch', [('toy', '{}', UNI), ('toy', '{}', NT), ('pick', PICK, UNI), ('pick', PICK, NT)])
+def test_branch_records_replay_to_the_drivers_samples(game, spec, branch):
+    """Every record of a traced driver with branches replays through the engine - a branch with its game's record - to
+    the driver's own samples, array for array (pi and q as float16, the records' and the shards' precision)."""
+    import json
+    import numpy as np
+    E = G.engine()
+    games = branch_games(game, spec, 40, 7, branch)
+    parent, nb, nm = {}, 0, 0
+    for row, text, sd in games:
+        rec = json.loads(text)
+        if 'branch' in row:
+            nb += 1
+            assert rec['branch']['from'] >= 0 and rec['gid'] == row['gid']
+            with pytest.raises(ValueError, match='replay_branch'):
+                E.replay_rows(game, spec, text)
+            s, info = E.replay_rows(game, spec, text, parent=parent[row['gid']])
+            assert info['branch']['merged'] == row['branch'].get('merged')
+            nm += info['branch']['merged'] is not None
+        else:
+            parent[row['gid']] = text
+            s, info = E.replay_rows(game, spec, text)
+            assert 'branch' not in info
+        if sd is None:
+            assert s is None
+            continue
+        for k in sd:
+            a, b = np.asarray(sd[k]), np.asarray(s[k])
+            if k in ('pi', 'q'):
+                a, b = a.astype(np.float16), b.astype(np.float16)
+            assert a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes(), (row['gid'], k)
+    assert nb >= 5, nb
+    if game == 'pick' and branch is NT:
+        assert 0 < nm < nb, (nm, nb)
+    else:
+        assert nm == 0
+
+
+def test_the_pool_replays_branch_records_and_counts_them(pool):
+    """The farm pool (records/2): a branch's record replays with its game's from the same chunk, both credited under
+    the game's id (the coordinator credits ids: a game and its branch ride together), each accepted as one of the
+    iteration's games; the iteration's forks tally gets the pool's branches; a branch without its game's record, or in
+    a records/1 file, refuses the chunk."""
+    import json
+    from test_farm_pool import FARM, header, records_file, wait
+    from zero import farm_pool as FP
+    from zero.remoteplay import RemotePlay
+    fake, R, _ = pool
+    R.cfg.update(games=100, selfplay_branch=1.0, selfplay_branch_rule='neartie', selfplay_branch_eps=1.0, selfplay_branch_n_min=1,
+                 selfplay_branch_p_min=0.0, selfplay_branch_q_lo=0.0, selfplay_branch_q_hi=1.0)
+    seed = FP.coordinator_seed(FARM)
+    games = branch_games('toy', '', 14, seed, NT)
+    texts = [t for _, t, _ in games]
+    nb = sum('branch' in r for r, _, _ in games)
+    assert nb >= 4
+    hi = max(r['gid'] for r, _, _ in games) + 1
+    h2 = dict(header(seed), records=2)
+    rp = RemotePlay(R, R.cfg['selfplay_remote'])
+    try:
+        rp.begin(1)
+        wait(lambda: 0 in fake.ckpts, 'gen 0 registered')
+        # refused: a branch without its game's record; a branch in a records/1 file
+        b = next(t for r, t, _ in games if 'branch' in r)
+        fake.add('m_bad', [[0, hi]], records_file(h2, [b]))
+        fake.add('m_old', [[0, hi]], records_file(header(seed), texts))
+        fake.add('m_a', [[0, hi]], records_file(h2, texts))
+        p = rp.pools[f'pool:{FARM}']
+        wait(lambda: p.cur['games'] == len(texts) and p.cur['refused'] == 2, 'the chunk replayed and accepted')
+        out = rp.end(1)
+        pr = out['pools'][f'pool:{FARM}']
+        assert pr['games'] == len(texts) and pr['refused'] == 2, pr
+        assert out['forks']['games']['branch'] == nb and out['forks']['neartie']['branches'] == nb, out['forks']
+        assert pr['samples'] == sum(len(sd['player']) for _, _, sd in games if sd is not None)
+        st = json.load(open(R.run + f'/pool/{FARM}/state.json'))
+        assert st['refused'] == {'m_bad': 1, 'm_old': 1}
+    finally:
+        rp.close()
+
+
+def test_game_records_hold_branch_games(tmp_path):
+    """game_records (docs/az.md 59) with branched games: a branch's record starts with its game's moves (the same gid
+    and seed; `branch.from` of them), then its own; a merged branch's result is its game's (none here: the toy has no
+    merge key)."""
+    from zero import gamerec as GR
+    run = tmp_path / 'gr'
+    p = run_loop(run, '--iters', '1', '--rolling', '1', '--games', '40', '--conc', '16', '--selfplay-branch', '0.5',
+                 '--selfplay-branch-rule', 'neartie', '--selfplay-branch-eps', '0.5', '--selfplay-branch-n-min', '1',
+                 '--game-records', '1')
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    _, recs = GR.read_iteration(str(run), 1)
+    games = {r['gid']: r for r in recs if 'branch' not in r}
+    br = [r for r in recs if 'branch' in r]
+    assert br and len(games) + len(br) == len(recs)
+    for b in br:
+        g = games.get(b['gid'])
+        if g is None:
+            continue                               # (its game accepted by the iteration before: not in this run)
+        k = b['branch']['from']
+        assert b['seed'] == g['seed'] and GR.actions_of(b)[:k] == GR.actions_of(g)[:k], b['branch']
+        assert GR.actions_of(b)[k] == b['branch']['alt'] != GR.actions_of(g)[k]
+        assert b['branch']['merged'] is None
