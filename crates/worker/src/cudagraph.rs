@@ -77,7 +77,7 @@ impl Caps {
 
     /// The bucket holds piece `s` (its tail padding found too: [`tail_plan`]).
     pub fn holds(&self, s: &Caps, tails: &Tails, ax: usize) -> bool {
-        self.b > s.b && self.nnz >= s.nnz && self.k >= s.k && self.nt >= s.nt && self.l >= s.l && self.no >= s.no && self.t == s.t
+        self.b >= s.b + 16 && self.nnz >= s.nnz && self.k >= s.k && self.nt >= s.nt && self.l >= s.l && self.no >= s.no && self.t == s.t
             && self.mr >= s.mr && (s.mr == 0 || self.s >= s.s + ax * (self.b - s.b))
             && tail_plan(self.nt - s.nt, self.l - s.l, tails, self.b - s.b).is_some()
     }
@@ -417,7 +417,10 @@ impl Cache {
     fn bucket_for(&mut self, s: &Caps, make: &dyn Fn(&Path, &Caps) -> Result<Session, String>) -> Result<usize, String> {
         self.tick += 1;
         let ax = self.always_extra;
-        if let Some(i) = self.buckets.iter().position(|b| b.caps.holds(s, &self.tails, ax)) {
+        // (a bucket fits when it holds the piece and its padding rows have room for the padding non-zeros and options)
+        let (nf, na) = (self.pad_features.len(), self.actions);
+        let fits = |c: &Caps| c.holds(s, &self.tails, ax) && c.nnz - s.nnz <= (c.b - s.b) * nf && c.k - s.k <= (c.b - s.b) * na;
+        if let Some(i) = self.buckets.iter().position(|b| fits(&b.caps)) {
             self.buckets[i].last = self.tick;
             return Ok(i);
         }
@@ -430,7 +433,7 @@ impl Cache {
             caps = Caps { b, nnz: o.nnz.max(caps.nnz), k: o.k.max(caps.k), nt: o.nt.max(caps.nt), l: 0, no: o.no.max(caps.no), t: s.t, s: sc, mr: o.mr.max(caps.mr) };
             caps.l = s.l + 120 * (caps.nt - s.nt);
         }
-        if !caps.holds(s, &self.tails, ax) {
+        if !fits(&caps) {
             return Err(format!("no bucket can hold a piece of {s:?} (made {caps:?})"));
         }
         if self.buckets.len() >= MAX_BUCKETS {
