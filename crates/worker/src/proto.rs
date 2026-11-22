@@ -53,7 +53,8 @@
 //! checked before the file is loaded -, conc, groups, infer_threads, spinning, prefix, output - 'records' (the
 //! default from zero-farm phase 3: game records, `records` events; zero-core docs/search.md 2.17), 'shards'
 //! (sample shards, `shard` events) or 'both'); during it `yield` ->
-//! `yielded` (no batch started, the session dropped), `resume` -> `resumed`, `finish`, `quit`, `checkpoint`
+//! `yielded` (no batch started, the session dropped), `resume` -> `resumed` (sessions that cannot be rebuilt: the
+//! error event, fatal, and exit 1 - never a job left yielded), `finish`, `quit`, `checkpoint`
 //! {gen, model, sha256? (the file's), reference?},
 //! `ping` -> `status`; a rolling job (`rolling: true`, `flush_s` - default 120 -; `job::Rolling`): `extend` {games: the
 //! new total, never lower}, the event `low` {started, games} once per games value when fewer than conc ids are left to
@@ -482,7 +483,9 @@ fn end_event(o: &Outcome) -> Value {
 }
 
 /// Control lines during a job (yield / resume / finish / quit / checkpoint / ping; a rolling job's `extend`).
-fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress: &Mutex<Progress>, sink: &dyn Sink, base: &Path, rolling: bool) {
+/// One control line during a network job -> Some(message): a fatal error (nothing emitted yet: the caller quits the
+/// job and ends the process with that error, fatal, like a job's own error).
+fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress: &Mutex<Progress>, sink: &dyn Sink, base: &Path, rolling: bool) -> Option<String> {
     let op = line.get("op").and_then(|x| x.as_str()).unwrap_or("");
     match op {
         // (a classic job: `extend` is an unknown op, as before - the non-fatal error below)
@@ -503,10 +506,13 @@ fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress
             sink.event(json!({"ev": "yielded"}));
         }
         "resume" => {
+            // A failed resume is fatal: the sessions could not be rebuilt (a GPU's CUBLAS_STATUS_ALLOC_FAILED after an
+            // owner-activity pause), and the job would stay yielded for good - a live process doing nothing. The agent
+            // gets the error and the exit code instead of a lease that never ends.
             let l = link.lock().unwrap().clone();
             match do_resume(ctl, l.as_ref()) {
                 Ok(_) => sink.event(json!({"ev": "resumed"})),
-                Err(e) => sink.event(json!({"ev": "error", "message": format!("resume: {e}"), "fatal": false})),
+                Err(e) => return Some(format!("resume: {e}")),
             }
         }
         "finish" => ctl.finish(),
@@ -526,6 +532,7 @@ fn control(line: &Value, ctl: &Control, link: &Mutex<Option<EvalLink>>, progress
         "job" => sink.event(json!({"ev": "error", "message": "a second job line: one job per worker process", "fatal": false})),
         other => sink.event(json!({"ev": "error", "message": format!("unknown op {other:?}"), "fatal": false})),
     }
+    None
 }
 
 /// Run `job` on a thread while this thread reads control lines from `lines` (None: no control) and
@@ -571,10 +578,19 @@ fn with_control(status_s: f64, sink: Arc<Stdout>, lines: Option<std::sync::mpsc:
         .map_err(|e| format!("spawn: {e}"))?;
     let mut t_status = Instant::now();
     let mut eof = false;
+    let mut fatal = None;
     while !worker.is_finished() {
         match &lines {
             Some(rx) if !eof => match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Some(v)) => control(&v, &ctl, &link, &progress, &*sink, &base, rolling),
+                Ok(Some(v)) => {
+                    if let Some(e) = control(&v, &ctl, &link, &progress, &*sink, &base, rolling) {
+                        // (no more control lines: the job is quit and the process ends with this error)
+                        sink.log(&format!("{e}: fatal - quitting the job"));
+                        eof = true;
+                        ctl.quit();
+                        fatal = Some(e);
+                    }
+                }
                 Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     // stdin closed: the agent is gone - stop now
                     eof = true;
@@ -591,7 +607,11 @@ fn with_control(status_s: f64, sink: Arc<Stdout>, lines: Option<std::sync::mpsc:
             sink.event(json!({"ev": "status", "stats": s}));
         }
     }
-    worker.join().map_err(|_| "the job thread panicked".to_string())?
+    let out = worker.join().map_err(|_| "the job thread panicked".to_string())?;
+    match fatal {
+        Some(e) => Err(e),
+        None => out,
+    }
 }
 
 fn stdin_lines(sink: Arc<Stdout>) -> std::sync::mpsc::Receiver<Option<Value>> {
@@ -1271,6 +1291,49 @@ mod tests {
         let e = ev.0.lock().unwrap().clone();
         assert_eq!(e.len(), 2);
         assert_eq!((e[1]["ev"].as_str(), e[1]["fatal"].as_bool()), (Some("error"), Some(false)));
+    }
+
+    #[test]
+    fn a_failed_resume_is_fatal() {
+        // the resume arm: sessions that cannot be rebuilt -> the fatal message, no `resumed`, nothing emitted (the
+        // caller ends the process with it); a link that restores (here: none yet) -> `resumed`, not fatal
+        let (ctl, link, progress, ev) = (Control::default(), Mutex::new(None), Mutex::new(Progress::default()), Events::default());
+        let base = Path::new(".");
+        assert_eq!(control(&json!({"op": "yield"}), &ctl, &link, &progress, &ev, base, false), None);
+        assert_eq!(control(&json!({"op": "resume"}), &ctl, &link, &progress, &ev, base, false), None);
+        assert_eq!(*ev.0.lock().unwrap(), vec![json!({"ev": "yielded"}), json!({"ev": "resumed"})]);
+        *link.lock().unwrap() = Some(EvalLink::gone(2));
+        assert_eq!(control(&json!({"op": "yield"}), &ctl, &link, &progress, &ev, base, false), None);
+        let e = control(&json!({"op": "resume"}), &ctl, &link, &progress, &ev, base, false);
+        assert_eq!(e.as_deref(), Some("resume: the evaluator thread is gone"));
+        assert_eq!(ev.0.lock().unwrap().len(), 3, "nothing emitted for the failed resume");
+        assert!(ctl.is_yielded(), "still yielded: only the caller's quit ends it");
+    }
+
+    #[test]
+    fn with_control_quits_the_job_on_a_failed_resume_and_returns_its_error() {
+        // the job (yielded for good before this fix): quit, joined, and the resume's error is the job's outcome - the
+        // serve loops emit it fatal and exit 1
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let sink = Arc::new(Stdout { mu: Mutex::new(()) });
+        let h = std::thread::spawn(move || {
+            with_control(f64::INFINITY, sink, Some(rx), PathBuf::from("."), false, move |ctl, _sink, _p, link_out| {
+                link_out(EvalLink::gone(1));
+                ready_tx.send(()).unwrap();
+                let mut s = ctl.s.lock().unwrap();
+                while !s.quit {
+                    s = ctl.cv.wait(s).unwrap();
+                }
+                Ok(Outcome { reason: "quit", stats: json!({}), unfinished: vec![], shards: vec![], records: vec![] })
+            })
+        });
+        ready_rx.recv().unwrap();
+        tx.send(Some(json!({"op": "yield"}))).unwrap();
+        tx.send(Some(json!({"op": "resume"}))).unwrap();
+        let r = h.join().unwrap();
+        assert_eq!(r.err().as_deref(), Some("resume: the evaluator thread is gone"));
+        drop(tx);
     }
 
     #[test]

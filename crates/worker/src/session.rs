@@ -552,7 +552,8 @@ fn bind(rt: &Runtime, p: ProviderKind, a: Option<&Adapter>, adapters: &[Adapter]
     }
     Ok(match p {
         ProviderKind::DirectMl => Binding::Dml(a.dxgi_index),
-        _ => Binding::Named(p, adapters.iter().filter(|x| x.vendor_id == a.vendor_id).position(|x| x.luid == a.luid).unwrap_or(0) as u32),
+        // (an NVIDIA card beside others: its CUDA ordinal by LUID - crate::gpu's module docs)
+        _ => Binding::Named(p, crate::gpu::device_ordinal(a, adapters, crate::gpu::cuda_luids(adapters))),
     })
 }
 
