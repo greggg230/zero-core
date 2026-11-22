@@ -58,8 +58,10 @@ YIELD_WAIT_S = 1.8                   # `yielded` within 2 s of `yield` (PROTOCOL
 PROVIDER = {'cuda': 'torch-cuda', 'cpu': 'torch-cpu'}
 # The self-test's tolerances per precision (largest |difference| on any number, largest mean per item): float32 on the
 # GPU moves torch's CPU answers by float32 rounding; bfloat16 autocast (the trainer's infer_precision 'bf16') by
-# bfloat16's (docs/az.md 78: measured on a live run's network, 256 reference rows); TF32 between the two.
-TOL = {'fp32': (1e-3, None), 'tf32': (2e-2, 2e-3), 'bf16': (8e-2, 6e-3)}
+# bfloat16's - measured on MTG Zero's meta3 network (gen 1334, 256 reference rows, an RTX 5090, CUDA graphs): largest
+# 0.078 (a value), means 1.4e-3 (priors), 9e-4 (value), 2.9e-3 (margin), 6e-6 (aux): the bounds leave ~2.5x / ~3.5x
+# room (docs/az.md 78); TF32 between the two. A broken evaluator misses by far more (a shifted reference: every number).
+TOL = {'fp32': (1e-3, None), 'tf32': (5e-2, 3e-3), 'bf16': (0.2, 1e-2)}
 
 
 class Fatal(Exception):
@@ -769,6 +771,9 @@ class Job:
             ev = self.ev
             h = ev.launch(lb) if hasattr(ev, 'launch') else ('now', ev(lb))
             pending.append((lb, _Now(ev) if not hasattr(ev, 'launch') else ev, h, t0))
+            # (no reference to the evaluator outlives its batches here: a yield must free it - its CUDA graphs, its
+            # weights - and a local of this frame kept the whole evaluator on the GPU through the gate)
+            ev = h = lb = None
             if len(pending) >= self.inflight:
                 self._finish_oldest(pending)
 
