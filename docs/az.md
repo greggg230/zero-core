@@ -8067,6 +8067,26 @@ pool fixture of the other farm-pool tests sets `pool_rolling` '' (they check cla
 MTG Zero's farm-compat gate also checks that the release worker announces `rolling`, so a build that loses the
 feature fails the gate.
 
+### 54.8 Stale rows per machine (no setting; the Fable farm review of 2026-11-21, its recommendation 3)
+
+**Why.** legacy-meta3-r1's trainer dropped 18-25% of its farm rows as stale on 11-20/21 (`stale_rows_dropped`). The
+review's guess is that the agent's tuner raises games in flight until one game takes 10-25 min on the Macs, the laptop
+and the DirectML PC, longer than the staleness window. The run's metrics had only totals, so the guess could not be
+checked per machine.
+
+**What it does.** With rolling on, the pool counts per machine (the record's `machine_id`) in the open iteration:
+`games` and `rows` accepted, `stale_rows` dropped (a straddling game's old rows and a wholly stale game's rows),
+`stale_games` dropped whole, and `lag`, the accepted rows' staleness histogram (the `stale` histogram of 54.2, per
+machine). The iteration's pool metrics gain `by_machine` {machine: those counters}; a machine's stale share is
+`stale_rows / (stale_rows + rows)`. When any machine lost rows, the pool logs one line, worst first:
+`iteration I: stale rows by machine: <machine> <stale>/<stale + kept> (P%, N games whole), ...`. Machines with no
+stale rows are in the metrics only. Counting only: no game, row or shard changes. With `pool_rolling` '' nothing is
+counted and the metrics' keys stay as before (54.3).
+
+**Tests.** `tests/test_farm_pool.py::test_staleness_per_row_with_rolling` checks `by_machine` beside the totals
+(classic: empty); `::test_stale_rows_by_machine_in_metrics_and_log`: two machines, the metrics' counters and lag
+histograms, and a log line naming only the machine that lost rows.
+
 ## 55. The farm pool's lock order: `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu` (no setting; MTG Zero's pb3 hang, 2026-11-16)
 
 (This fix is on both zero-core lines: mtg-zero main's pin and the rolling-leases branch of 54.)

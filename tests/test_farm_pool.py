@@ -908,9 +908,40 @@ def test_staleness_per_row_with_rolling(pool, rolling):
         assert (cur['games'], cur['stale_dropped'], cur['stale_rows_dropped']) == (2, 1, 2 + len(nets_b))
         assert cur['rows'] == na - 2 + nc
         assert cur['stale'] == {'1': na - 3, '0': 1 + nc}, cur['stale']
+        assert cur['by_machine'] == {'m_a': {'games': 2, 'rows': na - 2 + nc, 'stale_games': 1,
+                                             'stale_rows': 2 + len(nets_b), 'lag': cur['stale']}}
     else:
         assert (cur['games'], cur['stale_dropped'], cur['stale_rows_dropped']) == (1, 2, 0)
         assert cur['stale'] == {'0': nc}
+        assert cur['by_machine'] == {}
+
+
+def test_stale_rows_by_machine_in_metrics_and_log(pool):
+    """Rolling (docs/az.md 54.8): the iteration's metrics carry each machine's kept rows, stale rows, wholly stale
+    games and lag histogram, and the log names the machines whose rows went stale, worst first; a machine with no
+    stale rows is in the metrics but not in the log line. Classic: neither (the metrics' keys as before)."""
+    fake, R, _ = pool
+    R.cfg['pool_rolling'] = 'auto'
+    games = [sd for _, _, sd in farm_games(8, FP.coordinator_seed(FARM)) if sd is not None and len(sd['player']) >= 4][:3]
+    na, nb, nc = (len(g['player']) for g in games)
+    p = FP.Pool(StaleRP(R, 3), f'pool:{FARM}')
+    try:
+        with p.mu:
+            p.held.extend([_held(games[0], [0] + [2] * (na - 1), 1, 'm_slow'),
+                           _held(games[1], [0] * nb, 2, 'm_slow'),
+                           _held(games[2], [1] * nc, 3, 'm_fast')])
+        p._drain()
+        out = p.end_phase(3)
+    finally:
+        p.close()
+        p.th.join(10)
+    assert out['stale_rows_dropped'] == 1 + nb and out['stale_dropped'] == 1
+    assert out['by_machine'] == {
+        'm_slow': {'games': 1, 'rows': na - 1, 'stale_games': 1, 'stale_rows': 1 + nb, 'lag': {'0': na - 1}},
+        'm_fast': {'games': 1, 'rows': nc, 'stale_games': 0, 'stale_rows': 0, 'lag': {'1': nc}}}
+    line = [x for x in R.lines if 'stale rows by machine' in x]
+    assert len(line) == 1 and f'm_slow {1 + nb}/{na + nb} (' in line[0] and '1 games whole' in line[0], line
+    assert 'm_fast' not in line[0]
 
 
 def test_keep_rows_is_take_rows_for_any_rows():
