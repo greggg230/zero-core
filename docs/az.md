@@ -6571,7 +6571,8 @@ the rows like a local match.
   run): the desktop resolves it (`farm_eval.resolve_eval_spec`, `Run.driver`'s rule).
 * **The networks**: one ONNX Runtime session per generation of the job's `models`, each file's sha256 checked
   and each self-tested before any game (`selftest` with its `gen`; a failure is fatal); a batch goes to its key's
-  generation (`ByKey`). Stats' `selftest_max_abs` is the largest of them.
+  generation (`ByKey`). Stats' `selftest_max_abs` is the largest of them. (Since 70: sessions per seat key on evaluator
+  lanes of their own, and on the CPU groups from the job's threads, not the settings'.)
 * **The rows**: one JSON line per game, `{"gid", "pair", "seats", "result", "margin", "rounds", "over"}` (`pair`
   gid // 2, null unpaired; `seats` that game's order; `result` per seat in it; `margin` seat 0's score minus the
   best other seat's, `Run.play_match`'s margin from seat 0) exactly as `json.dumps(row, separators=(',', ':'))`
@@ -8708,7 +8709,7 @@ worker 3.4x slower than the Python remote self-play it is meant to replace on th
   batch's answer waits for its turn). Each session has the job's `infer_threads`. A checkpoint switch and a rolling
   job's background build make `W` evaluators; a yield releases them all. Answers do not depend on `W`: the shards of a
   6-game job (the legacy-meta3 network, groups 1, CPU pack) with 3 evaluator threads are byte-identical to 1's. Eval
-  jobs keep one thread (their networks share it). Why: on an M4 one ONNX Runtime session uses its threads poorly (the
+  jobs keep one thread (their networks share it; since 70 they have lanes of their own). Why: on an M4 one ONNX Runtime session uses its threads poorly (the
   graph is ~1,000 small nodes; 1 thread 1,770 rows/s, 3 threads 2,530, 6 threads 2,650, 12 threads in a job slower
   than 4), while several sessions run side by side (below).
 * **Diagnostics** (environment, unset = nothing changes): `ZERO_ORT_CONFIG="key=value;..."` adds ONNX Runtime session
@@ -9541,3 +9542,107 @@ live runs (2026-11-21, 31 min): 790 passed, 31 skipped (the live-run fence), 3 f
 test_absent_slots_are_never_read[max]` (CUDA graphs) and `test_shard_thread.py::test_rolling_run_quotas_exact` (97 games
 for a quota of 96 in a rolling writer-thread run, a toy run without a farm pool) pass alone. MTG Zero's optin-core gate
 of the pin runs the suite again (its core pytest step), ENGINE.md 218.
+## 71. Eval jobs' layout: one group on the CPU, an evaluator lane per seat, sessions of a few threads (no setting; zero-farm's CPU match leases, 2026-11-21)
+
+**Why.** A farm match lease on a PC's CPU spent ~98% of its time in ONNX Runtime at ~2 rows a call (63 campaign leases
+of 2026-11-18..21 on 16-20-thread PCs: 2.03 rows a call, 7.7 ms a call, ~260 leaves/s; 32 games of a cells campaign
+took 45-60 minutes on one PC), while the same CPUs answer ~1,100-2,300 rows/s in 64-row batches. Three causes in the
+worker (44.2): the job played in the settings' `groups` - the run's own self-play batching, 4 for MTG Zero's
+legacy-meta3-r1, tuned for the desktop's GPU -, so a step's batch held games / groups / 2 rows; both networks shared one
+evaluator thread (`ByKey`), so the seats' batches ran one after the other; and the one session had the job's search
+threads as intra-op threads (16-20), which this graph uses poorly (62: on an M4 3 threads 2,530 rows/s, 6 threads 2,650,
+12 slower than 4; 63: the desktop's i9 fastest at 3-4) - on a farm laptop's 20 threads a call took ~60-85 ms. The agent
+sends a CPU eval job neither `groups` nor `infer_threads`, so the worker decides.
+
+**What** (`zero_worker::evaljob::eval_layout`; self-play jobs are unchanged):
+
+* **Evaluator lanes.** A batch goes to a lane of its seat key - an evaluator thread with sessions of its own
+  (`LaneMode::Auto`); a key's batches go to its lanes in turn; at most `max(INFLIGHT, lanes)` batches in flight, their
+  answers submitted in launch order (a later batch's answer waits for its turn), as self-play's `infer_workers` (62). On
+  the CPU every network seat key has lanes of its own (one network on both seats: sessions of it per key, each
+  self-tested, the generation's `selftest` event sent once); on CUDA / TensorRT-RTX one lane per generation (the sessions
+  of before, each on its own thread); on any other GPU provider (DirectML, OpenVINO) one lane for every network, as before
+  (concurrent sessions there are untested on the farm's AMD GPU).
+* **The CPU's groups and threads.** A job line without `groups` plays in `EVAL_GROUPS` = 1 group - never the settings'
+  `groups` -, so a step's batch per seat holds every game in flight. Sessions of S = min(the job's per-session threads,
+  `EVAL_SESSION_THREADS` 4) threads (macOS's CPU sessions stay 3, `proto::default_workers`); B = the job's inference
+  threads; n network keys; each key min(groups, max(1, B / (n S))) lanes of B / (n lanes) threads within 1..S. Two
+  networks: 16 or 20 threads -> 2 lanes of 4; 6 threads -> 2 lanes of 3; a Mac -> 2 lanes of 3. A job line's own
+  `groups` G stays (its batches then spread over up to B / (n S) lanes per seat, `infer_workers` counted in B); its own
+  `infer_threads` gives every session exactly those.
+* **GPU jobs keep their groups** - the job line's, else the settings' (the agent's GPU rule leaves out a `groups` equal to
+  the template's) - and their sessions; CUDA's two generations run on two threads, the job's threads shared.
+* **`eval_lanes` 'one'** (a job line field no agent sends; `eval --lanes one`): the layout before - the settings'
+  groups, one evaluator thread, the job's threads - for measurements. The worker's log line names the layout (`groups G;
+  L evaluator lane(s) (Auto, T intra-op threads each): lane i (keys m): gen ...`).
+
+**Only the batches change** - which games' leaves share a batch and how many batches run at once -, never a search: one
+leaf per game per batch, no virtual loss, every game's own random streams. A game's moves are the same when its network
+answers are, and the farm's CPU graphs answer a row the same in any batch and on any number of threads: measured below,
+on the desktop and across farm PCs.
+
+**Tests and checks.** `cargo test -p zero_worker` (all pass): `eval_layouts` (every case above), `each_key_reaches_its_network`
+(tagged evaluators: each key's batches answered by its own generation, no other lane answering it, on every layout), the
+eval job test `one_group_and_lanes_play_the_rows_of_before` (toy: the layout before - the settings' groups 3, one thread -
+against one group on two lanes, 16 threads with 64 games in one group and with the job's groups 2 on four lanes, traced
+rows byte for byte; a lease of the match; a yield / resume with two lanes; one network on both seats; a bot seat; fewer,
+larger batches).
+
+**Measured: the answers** (2026-11-21; legacy-meta3-r1 iter_1040 against iter_1024, the yardsticks' best-of-one spec, 32
+simulations, paired, traced - MTG Zero ENGINE.md 221; the CPU pack, ONNX Runtime 1.31.1):
+
+* *The worker of before* (MTG Zero main 1e7416c5's release, the desktop's CPU beside the live runs): games 0-7 in the
+  settings' groups 4 with 4 intra-op threads, in groups 1 with 2 threads, and as two leases (0-3, 4-7) in groups 1 with
+  1 thread - every row and trace digest identical.
+* *This worker against it*: games 0-7 in its layout (1 group, 2 lanes of 2 threads), with the job's groups 2 on 4 lanes,
+  and with `--lanes one` on games 2-5 - 8 of 8, 8 of 8 and 4 of 4 rows and digests identical to the old worker's.
+* *The eval gate* (`tools/worker_eval_gate.py`: this worker against `zero.farm_eval.match_driver`, groups 1, sparse rows,
+  4 + 4 threads, untraced): 8 of 8 rows identical, 60 batches identical; both sides' rows the old worker's.
+* *On the farm*: the same 128 games (seed 11) played by test campaigns of the old build and of this layout's builds on
+  four farm PCs (16, 16, 6 and 20 threads, two CPU makes, layouts of before and after, leases of 32 and 64 games):
+  every game's row and trace digest identical across the campaigns, whichever PC and layout played it.
+
+**Measured: the speed** (the same farm test campaigns, `tools/farm_campaign.py submit ... --no-alternates`, CPU leases on
+idle farm PCs, D1's lease stats; games/h and leaves/s per lease's wall time; "leaves a call" = the search's leaves over
+ONNX Runtime calls, ~0.75 of the rows a call - the value-only rows are the rest; "infer" = the calls' time over the
+lease's, summed over the lanes):
+
+| PC (CPU threads) | layout | leases (games) | games/h | leaves/s | leaves a call | ms a call | infer |
+|---|---|---:|---:|---:|---:|---:|---:|
+| PC A (16) | before: the settings' groups 4, one session of 16 threads | 1 (32) | 237 | 392 | 2.4 | 6.1 | 0.98 |
+| PC A (16) | one group, one session of 16 threads (old worker, campaign groups 1) | 3 (96) | 391 | 635 | 6.8 | 10.1 | 0.95 |
+| PC A (16) | two groups, four lanes of 4 (an intermediate build) | 3 (96) | 576 | 920 | 4.3 | 8.0 | 1.73 |
+| PC A (16) | ... with 64-game leases | 1 (64) | 656 | 1,093 | 6.3 | 10.2 | 1.77 |
+| PC A (16) | **this layout: one group, two lanes of 4** | 2 (64) | **645** | **1,055** | 6.6 | 9.7 | 1.56 |
+| PC B (16) | before | 3 (96) | 204 | 335 | 2.5 | 7.2 | 0.98 |
+| PC B (16) | **this layout** | 5 (160) | **655** | **1,047** | 7.3 | 10.6 | 1.52 |
+| PC B (16) | **this layout, 64-game leases** | 2 (128) | **768** | **1,243** | 12.4 | 16.5 | 1.65 |
+| PC C (6) | before | 7 (224) | 226 | 365 | 2.5 | 6.8 | 0.99 |
+| PC D (20, laptop) | one group, one session of 20 threads | 1 (32) | 81 | 129 | 7.4 | 56.1 | 0.97 |
+| PC D (20, laptop) | two groups, four lanes of 4 | 1 (32) | 152 | 256 | 3.6 | 22.7 | 1.62 |
+| PC D (20, laptop) | **this layout** | 1 (32) | **182** | **305** | 6.0 | 30.0 | 1.54 |
+
+So on a 16-thread PC: one group alone (one wide session, the settings' groups set to 1 for the campaign) 1.6x the games
+of before; one group on two lanes of 4 threads 2.7-3.2x the games an hour and leaves a second (32-game leases), 3.8x with
+64-game leases (the coordinator's `eval_games_per_thread` 2 gives a 16-thread PC 32 games). Against the 63 campaign
+leases before (2.03 rows a call, ~260 leaves/s): ~3x the rows a call, ~4x the leaves a second. A session of 4 threads
+answers a ~6-row call as fast as one of 16 (9.7 against 10.1 ms): the 12 threads more bought nothing, the second lane
+nearly doubles the rows a second. A second group (four lanes of half the rows) lost at both lease sizes: the lease's
+last games, in two groups, end in still smaller batches. On the 20-thread laptop the wide session was the worst case
+(56 ms a call, hybrid cores) and the new layout 2.2x it.
+
+**Measured: a CUDA lease** (a farm PC with an NVIDIA GPU, paused on the coordinator for the measurement; the releases'
+CUDA alternates of the worker before and of this layout, the farm's CUDA pack - ONNX Runtime 1.24.4 -, each network's
+float16 variant; 64 paired games of the same match, 6 search threads, the job's groups 2 as the agent sends them):
+
+| worker | evaluator threads | games/h | leaves/s | rows a call | ms a call |
+|---|---|---:|---:|---:|---:|
+| before | one for both networks, 6 intra-op threads | 407 | 637 | 9.9 | 12.3 |
+| **this layout** | **a lane per generation, 3 each** | **436** | **681** | 9.9 | 19.9 (two at once) |
+| this layout, groups 1 (the settings' groups 1, which the agent then leaves out) | a lane per generation | 556 | 899 | 14.7 | 20.4 |
+
+Before against this layout: all 64 rows and trace digests identical, +7%. One group would give +37%, but 59 of the 64
+games differ: the float16 CUDA graph answers a row differently in another batch shape (cuBLAS picks its kernels by
+shape), unlike the CPU graph - so a GPU job keeps its groups here, and fewer groups for GPU eval jobs is the agent's
+choice to make (a GPU lease's batches already depend on its size).
+
