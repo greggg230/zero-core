@@ -9868,3 +9868,29 @@ aliased `toy_match` writes `game_layout` 1 into its config, shards and checkpoin
 to `toy_match` without records (a run of before) resumes to iteration 3 as `toy` with no record written.
 
 **Measured.** Nothing to measure (no run setting changes play).
+
+### 73.1 A graph-derived expectation resolves the graph's game (the probe, eval-batches; MTG Zero's farm release, 2026-11-22)
+
+**Why.** `probe-providers --model --reference` and `eval-batches` have no job: their expectation is the graph's own
+metadata (`session::expect_of`, `SessionSpec::expect` None), and it knew nothing of the worker's registered games -
+`before_of` None. A reference checkpoint of before the change re-exported now names its game `mtg_v7`, while the
+reference set exported before the change names `mtg` without a record; `Expect::game_problem` refused that pair
+(`reference: a network of game Some("mtg"), the job plays "mtg_v7"`), which failed MTG Zero's farm release at its
+DirectML self-test (`farm_release.py` step 6b) for every build after layout v8 - the CUDA self-test, on the old export
+(`mtg`, no record, against a set of the same), passed.
+
+**What it does.** `SessionSpec::games` (and `probe::Opts::games`; `cli_with` passes `Worker::games`): with
+`expect` None the graph's game and layout record are resolved in the registry (`resolve_game`) and the expectation
+takes that entry's name, `layout` and `before_of` (the graph's features, actions and tails as before) - so the graph
+and its reference set pass exactly when a job of that entry (`Expect::of_entry`) would accept them: a graph `mtg_v7`
+(or `mtg` without a record) takes a set `mtg` without a record or `mtg_v7`, never `mtg` with layout 8; a graph `mtg`
+layout 8 takes only `mtg` layout 8. A game the registry does not resolve (unregistered, a layout record it does not
+know, an empty registry - `build_evaluator`'s, which has the job's expectation) keeps the graph's own name and record:
+strict equality, as before. Nothing else loosens.
+
+**Tests.** `session::tests::a_graph_derived_expectation_resolves_the_graphs_game_in_the_registry` (the stand-in
+alias `toy` layout 2 / before `toy_old`: every pairing above through `expect_of`, the graph's own game check and
+`selftest::check_meta`; a plain game unchanged; no registry: the refusal the release met). End to end: the failed
+release's DirectML self-test (`probe-providers --providers dml,cpu` on the re-exported reference checkpoint against
+the old reference set) fails with the release's worker and passes with this one (cpu and dml); the CUDA self-test's
+pair passes on both.
