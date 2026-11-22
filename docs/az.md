@@ -9984,6 +9984,15 @@ target and no match too.
 gate an hour earlier, and every digest the gate's own - visits records 4c42f1160eca9121, cq records 88ab3306d3beba12
 (3,554 samples each, results e266d43f27caa1e8), the match f2a5103266c05aa6 (10/16).
 
+### 75.2 `test_cotrain_the_local_driver_is_never_starved`: its bar from 15 % to 10 % (2026-11-22)
+
+The test starts a remote with four times the local resolver driver's room and asserts the local driver still plays
+at least 15 % of each iteration's matches (the fault it was written for: the desktop played none of 1,812). The share
+follows the two sides' speeds. On the desktop beside two live runs and a gate, 8 runs of the test's own scenario gave
+20.3 % to 23.4 % in the second iteration and 13.7 % to 17.4 % in the third - below the bar in 4 of the 8 - and in a
+sharded run of the suite it failed in its shard and again alone. The bar is now 10 %: a starved driver (0) still
+fails, and a busy machine no longer decides the result. Nothing but the test's number changes.
+
 ## 76. The eager evaluator's priors on CUDA: the same bits every call (no setting; a behaviour change on that path, 2026-11-22)
 
 **What was wrong.** `NetEvaluator.evaluate`'s eager path (no CUDA graphs: `graphs=False`, or a batch the graphs do not
