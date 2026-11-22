@@ -9,7 +9,7 @@ ids and network - row for row, every array bit for bit.
 
 1. The checkpoint is written as the gen's `torch-weights/1` variant (zero.torch_weights.export, the run's settings with
    --precision as infer_precision).
-2. **The worker**: `<python> -I -X utf8 -u <worker> serve` (the build's entry, as zf-pyshim starts it) plays one
+2. **The worker**: `<python> -I -B -X utf8 -u <worker> serve` (the build's entry, as zf-pyshim starts it) plays one
    classic job of `--games` games from `--gid-base` with `--seed` - the job line an agent sends - and writes records.
 3. **The trainer**: in this process, the trainer's local self-play path on the same settings - `Run.driver` (rolling,
    queue_only, recording, the same seed, numbered from the same first gid), `NetEvaluator` at the precision (a token
@@ -55,7 +55,7 @@ def parse_set(kvs):
 
 def run_worker(python, worker, job, cwd, timeout=3600, env=None, isolate=True):
     """The worker's entry, fed one job line; -> (events, stderr tail, exit code)."""
-    p = subprocess.Popen([python, *(['-I'] if isolate else []), '-X', 'utf8', '-u', worker, 'serve'], cwd=cwd, stdin=subprocess.PIPE,
+    p = subprocess.Popen([python, *(['-I'] if isolate else []), '-B', '-X', 'utf8', '-u', worker, 'serve'], cwd=cwd, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', env=env)
     err = []
     threading.Thread(target=lambda: err.extend(p.stderr), daemon=True).start()

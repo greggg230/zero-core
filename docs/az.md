@@ -10021,14 +10021,16 @@ runtime pack's own CPython, `-I`). It speaks aw/1 exactly (zero-farm PROTOCOL 5,
   driver replays them unchanged.
 * **Self-test**: before the first batch (and for each checkpoint) the gen's reference set goes through the very
   evaluator it plays with, the rows as a driver sends them (sparse, the batches as recorded), twice: bit for bit the
-  same both times, and within the precision's tolerance of the stored torch answers (`TOL`: fp32 1e-3; tf32 2e-2, mean
-  2e-3; bf16 8e-2, mean 6e-3); `selftest` {provider 'torch-cuda', max_abs, ok, deterministic, items, means, tol, rows};
-  a failure is fatal.
+  same both times, and within the precision's tolerance of the stored torch answers (`TOL`: fp32 1e-3; tf32 5e-2, mean
+  3e-3; bf16 0.2, mean 1e-2 - measured below: bf16's largest difference 0.078, its means 1.4e-3 at most); `selftest`
+  {provider 'torch-cuda', max_abs, ok, deterministic, items, means, tol, rows}; a failure is fatal.
 * **Control**: `checkpoint` (a rolling job builds and self-tests the new network on a thread while the games go on,
   then the driver's phase change - the games in flight continue, each row keeps the network that searched it; a newer
   checkpoint supersedes one being built; a classic job switches at once), `extend` (never lower), `low`, `yield` (the
-  batches in flight answered, the evaluators and their CUDA graphs dropped, `torch.cuda.empty_cache()`; `yielded`
-  within 1.8 s), `resume` (the evaluator rebuilt; a failure is fatal: never a worker left yielded), `finish`, `quit`
+  batches in flight answered, the evaluators and their CUDA graphs dropped, cuBLAS's workspaces cleared
+  (`torch._C._cuda_clearCublasWorkspaces`: 73 MB held in torch's allocator outside any Python object once the evaluator
+  was gone), `torch.cuda.empty_cache()` - torch then holds no video memory, only the CUDA context stays; `yielded` within
+  1.8 s), `resume` (the evaluator rebuilt; a failure is fatal: never a worker left yielded), `finish`, `quit`
   (the games in flight lost, named in `end`'s `unfinished`), `ping`; `status` every 10 s (the native worker's Stats plus
   `vram_mb`: what torch holds on the GPU, for the agent's memory plan). A model that is not torch-weights/1 (an ONNX
   graph: the gen's torch variant not registered) or not the job's sha256 is refused, fatal.
@@ -10072,3 +10074,19 @@ groups > 1 and several search threads too: the toy at groups 1 and at groups 2 /
 best-of-three dealt preset (6 of 6 games, 2,309 rows, CPU fp32). What it proves: the worker plays the trainer's games -
 seat, seeds, ids, evaluator, records. On a GPU at bf16 the same holds only when the evaluator answers a batch the same
 way in both processes (measured below).
+
+**Measured** (2026-11-22, a PC with an RTX 5090, no run on it; MTG Zero's torch worker build through
+the torch runtime pack's own Python, started by zero-farm's zf-pyshim.exe as the agent starts it). MTG Zero's meta3
+network (meta3-ab-ctrl1234 gen 1334, a token network with layout-v7 tails) at the trainer's settings - conc 1536, groups
+4, 16 search threads, bf16, CUDA graphs: **103.8k leaves/s** over a 221 s steady window (97k games/h, GPU 92% busy, 560 W,
+4.0 GB on the GPU for the whole machine) against **93.4k** for the trainer's own self-play path in the same bench
+(that PC's bench of the trainer's path, the remote worker's driver at bf16: 1.11x; the run's log baseline 101.7k: 1.02x) - the bar was 95%.
+hello 0.07 s after start, the first leaf at 11.8 s (torch's import, the self-test, the first CUDA graphs); the self-test
+on the gen's 256 reference rows max 0.078 (value), means priors 1.4e-3, value 9e-4, margin 2.9e-3, aux 6e-6,
+deterministic; yield 40-120 ms (torch's reserved memory 1.9 GB -> 0), resume 0.1 s. Games against the trainer's path
+(`torch_worker_gate.py`, 48 games, conc 48, groups 2, 8 threads, the same network, the worker through the pack): **fp32
+on the GPU, CUDA graphs: 48 of 48 games identical**; **bf16: 16 of 48** - the rest diverge after a policy target that
+differs in the last bits (bf16 autocast's kernels choose differently between processes), every record replay-valid, the
+same game ids and seeds. So the plumbing is exact (fp32 proves it on the very GPU path); at bf16 the games are the
+trainer's in distribution, not bit for bit - as two trainer processes' own bf16 games would be.
+
