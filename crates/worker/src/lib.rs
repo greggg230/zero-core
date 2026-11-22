@@ -26,6 +26,7 @@
 //!   (the game registers a [`fuzz::FuzzGame`]: `zero_worker::main_with`);
 //! * `selftest`: the per-machine check of a network's answers against torch's (`reference.npz`).
 pub mod classify;
+pub mod cudagraph;
 pub mod eval;
 pub mod evaljob;
 pub mod fuzz;

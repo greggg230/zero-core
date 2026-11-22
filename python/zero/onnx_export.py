@@ -878,6 +878,11 @@ class ZeroOnnx2(ZeroOnnx):
     the graph reaches 2^31 (docs/az.md 46.2). Packing 'packed' only (each row's tail tokens follow
     its present head tokens in the packed list)."""
 
+    # the override targets' match (0 / 1) is ArgMax'ed in this dtype: int64 here, as every graph before; the static
+    # graph's in float32 (the same first index of the largest), which ONNX Runtime's CUDA provider runs - its ArgMax has no
+    # int64 kernel, so an int64 ArgMax is the static graph's only CPU node (docs/az.md 72)
+    ARGMAX_DTYPE = torch.int64
+
     VERSION = 2
 
     def __init__(self, net, packing='packed', attention=None):
@@ -1094,7 +1099,7 @@ class ZeroOnnx2(ZeroOnnx):
             eq = ((tr_[None, :] == orow[:, None]) & (ts_[None, :] == s_[:, None]) & (th_[None, :] == ohi[:, None])
                   & (tl_[None, :] == olo[:, None]))
             found = eq.any(1)
-            tidx = N + eq.long().argmax(1)
+            tidx = N + eq.to(self.ARGMAX_DTYPE).argmax(1)
             obad = obad | (s_ < -1) | (~isgen & ((s_ >= S) | ~pok | (c_ >= self.v_nk.index_select(0, sc_))
                                                   | (head & ~hpres) | (~head & ~found)))
             p = _iclamp(torch.where(head, hidx, tidx), 0, N + NT - 1)
@@ -1789,6 +1794,8 @@ class ZeroOnnx2Static(ZeroOnnx2):
     overrides are `ZeroOnnx2`'s, fed the head positions in full ([B n_tok]: a position's own pointer logits row, absent
     ones a zero row) - the same writes in the same order. A row whose tokens pass T is refused (`refused` + 1: a
     feeder's mistake, never answered)."""
+
+    ARGMAX_DTYPE = torch.float32
 
     def __init__(self, net, packing='packed', attention='mha'):
         if attention not in STATIC_ATTENTIONS:
