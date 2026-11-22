@@ -553,7 +553,15 @@ class Pool:
     @staticmethod
     def _counters(it):
         return {'it': it, 'games': 0, 'rows': 0, 'shards': 0, 'records': 0, 'chunks': 0, 'refused': 0,
-                'stale_dropped': 0, 'stale_rows_dropped': 0, 'machines': {}, 'stale': {}, 'replay_s': 0.0}
+                'stale_dropped': 0, 'stale_rows_dropped': 0, 'machines': {}, 'stale': {}, 'replay_s': 0.0,
+                'by_machine': {}}
+
+    def _mach(self, m):
+        """(mu held) Machine `m`'s staleness counters in the open iteration (rolling only, docs/az.md 54.8)."""
+        c = self.cur['by_machine'].get(m)
+        if c is None:
+            c = self.cur['by_machine'][m] = {'games': 0, 'rows': 0, 'stale_games': 0, 'stale_rows': 0, 'lag': {}}
+        return c
 
     def live(self):
         """The farm is delivering: a valid game arrived within `pool_live_s` (selfplay_local 0: this machine plays no
@@ -617,8 +625,16 @@ class Pool:
                    'replay_s': round(cur['replay_s'], 2), 'gen': self.st.get('current_gen'), 'stale': dict(cur['stale'])}
             if self.rolling is not None:           # (per-row staleness; off: the metrics of before)
                 out['stale_rows_dropped'] = cur['stale_rows_dropped']
+                out['by_machine'] = {m: dict(c, lag=dict(c['lag'])) for m, c in cur['by_machine'].items()}
         if self.error:
             out['error'] = self.error
+        bad = sorted(((c['stale_rows'], m, c) for m, c in out.get('by_machine', {}).items() if c['stale_rows']),
+                     reverse=True)
+        if bad:                                    # (the machines whose rows went stale, worst first: docs/az.md 54.8)
+            self.log(f'iteration {it}: stale rows by machine: ' + ', '.join(
+                f'{m} {c["stale_rows"]}/{c["stale_rows"] + c["rows"]} '
+                f'({100 * c["stale_rows"] / (c["stale_rows"] + c["rows"]):.0f}%, {c["stale_games"]} games whole)'
+                for _, m, c in bad))
         if self.stopped:
             # (every iteration while it is stopped: the metrics row and the log say so, docs/az.md 70)
             out['stopped'] = {k: self.stopped[k] for k in ('reason', 'fix')}
@@ -1129,12 +1145,15 @@ class Pool:
                     nets = np.asarray(g['s']['net'])
                     ok = np.flatnonzero(nets >= lim)
                     self.cur['stale_rows_dropped'] += len(nets) - len(ok)
+                    self._mach(g['machine'])['stale_rows'] += len(nets) - len(ok)
                     if len(ok):
                         s = keep_rows(g['s'], ok, self._tail_widths())
                         g = self.held[0] = dict(g, s=s, rows=len(ok), net=int(np.asarray(s['net']).min()))
                 if g['net'] < lim:
                     self.held.popleft()
                     self.cur['stale_dropped'] += 1
+                    if self.rolling is not None:
+                        self._mach(g['machine'])['stale_games'] += 1
                     continue
             return g
         return None
@@ -1174,6 +1193,11 @@ class Pool:
         w.add(g['s'])
         self.cur['rows'] += g['rows']
         lag_hist(g['s']['net'], it, self.cur['stale'])
+        if self.rolling is not None:
+            c = self._mach(m)
+            c['games'] += 1
+            c['rows'] += g['rows']
+            lag_hist(g['s']['net'], it, c['lag'])
 
 
 def _sparse_rows(s):
