@@ -290,6 +290,11 @@ pub struct Progress {
     pub wall_s: f64,
     pub provider: String,
     pub finished_gids: Vec<u32>,
+    /// Branched games (zero-core docs/az.md 24, 72; all 0 without): branch rows finished, the near-tie branches among
+    /// them that merged back into their game, the near-tie rule's eligible decisions of the finished games.
+    pub branches: u64,
+    pub merges: u64,
+    pub neartie: u64,
     /// The last self-test's largest difference.
     pub selftest_max_abs: Option<f64>,
 }
@@ -309,6 +314,12 @@ impl Progress {
             "selftest_max_abs": self.selftest_max_abs.map(|m| if m.is_finite() { json!(m) } else { json!("inf") }),
             "leaves_per_s": if self.wall_s > 0.0 { ((self.leaves as f64 / self.wall_s) * 10.0).round() / 10.0 } else { 0.0 },
         });
+        if self.branches > 0 || self.neartie > 0 {
+            // (branched games: only a job that plays them - every other job's stats as before)
+            v["branches"] = json!(self.branches);
+            v["merges"] = json!(self.merges);
+            v["neartie"] = json!(self.neartie);
+        }
         if batch_hist_on() {
             let h: serde_json::Map<String, Value> =
                 self.batch_rows_log2.iter().enumerate().filter(|x| *x.1 > 0).map(|(k, n)| ((1u64 << k).to_string(), json!(n))).collect();
@@ -886,7 +897,9 @@ impl Run<'_> {
             }
         }
         let mut it = recs.into_iter();
-        let n = rows.len() as u64;
+        // (a branch game is its game's second row - zero-core docs/az.md 24: the job's games are its setups, the game
+        // ids it started; a branch is counted in the stats, never as one of them)
+        let n = rows.iter().filter(|r| r.branch.is_none()).count() as u64;
         for r in rows {
             let k = r.samples as usize;
             let records: Vec<_> = it.by_ref().take(k).collect();
@@ -896,7 +909,14 @@ impl Run<'_> {
             {
                 // (Stats: the finished games' searched decisions)
                 let mut p = self.progress.lock().unwrap();
-                p.finished_gids.push(r.gid);
+                match &r.branch {
+                    None => p.finished_gids.push(r.gid),
+                    Some(b) => {
+                        p.branches += 1;
+                        p.merges += b.merged.is_some() as u64;
+                    }
+                }
+                p.neartie += r.neartie.unwrap_or(0) as u64;
                 p.decisions += r.decisions as u64;
             }
             if r.abort_reason == Some("panic") {
@@ -1036,6 +1056,11 @@ pub fn run_job(game: &GameEntry, job: &Job, ctl: &Control, sink: &dyn Sink, prog
     let t0 = Instant::now();
     let info = (game.info)();
     let cfg = job_driver_cfg(game, job)?;
+    if cfg.branch.is_some() && job.output.records() {
+        // (a game record replays a game from its seed: records/1 has no branch prefix nor a merged branch's outcome -
+        // zero-core docs/az.md 72.7: the farm pool's records path is the open part; shards jobs play branches)
+        return Err("selfplay_branch: branched games are played into shards only - a game record (output 'records' / 'both') cannot replay a branch game yet (zero-core docs/az.md 72.7)".into());
+    }
     let belief = cfg.seats.iter().any(|s| matches!(s, SeatCfg::Nn(n) if NnSeat::belief_on(n)));
     let want = Expect::of(&info, belief);
     let evs = build_evals(&job.eval, &want, sink, &progress, None)?;

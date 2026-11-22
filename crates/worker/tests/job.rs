@@ -278,3 +278,53 @@ fn a_served_job_writes_records_only() {
         assert_eq!(e["gen"].as_u64(), Some(7), "the rows' network");
     }
 }
+
+/// Branched self-play (zero-core docs/az.md 24, 72): the job plays its game ids and their branches - the shared driver,
+/// both rules - into shards; `fin` and the unfinished ranges count the game ids, the stats the branches; the same job
+/// twice writes the same shards; a records job refuses branches (records/1 cannot replay one).
+#[test]
+fn branched_games_play_into_shards() {
+    use zero_worker::pyjson::PyJson;
+    for rule in ["uniform", "neartie"] {
+        let mk = |d: &Path| {
+            let mut j = job(d, 24, 0, 1, true);
+            j.settings.set("selfplay_branch", PyJson::Float(0.5));
+            j.settings.set("selfplay_branch_rule", PyJson::Str(rule.into()));
+            if rule == "neartie" {
+                // (a loose gate: the toy's uniform evaluator gives near-equal values)
+                j.settings.set("selfplay_branch_eps", PyJson::Float(0.5));
+                j.settings.set("selfplay_branch_n_min", PyJson::Int(1));
+                j.settings.set("selfplay_branch_q_lo", PyJson::Float(0.0));
+                j.settings.set("selfplay_branch_q_hi", PyJson::Float(1.0));
+            }
+            j
+        };
+        let (a_dir, b_dir) = (tmp(&format!("branch-{rule}-a")), tmp(&format!("branch-{rule}-b")));
+        let (o, ev) = run(&mk(&a_dir), |_, _, _, _| {});
+        assert_eq!(o.reason, "done", "{rule}");
+        assert!(o.unfinished.is_empty(), "{rule}");
+        let fins: u64 = ev.iter().filter(|x| x["ev"] == "fin").map(|x| x["n"].as_u64().unwrap()).sum();
+        assert_eq!(fins, 24, "{rule}: fin counts the job's game ids, not their branches");
+        let nb = o.stats["branches"].as_u64().unwrap_or(0);
+        assert!(nb > 0 && nb <= 24, "{rule}: {nb} branches of 24 games at p 0.5");
+        assert_eq!(o.stats["games"].as_u64(), Some(24));
+        let shard_games: u64 = ev.iter().filter(|x| x["ev"] == "shard").map(|x| x["games"].as_u64().unwrap()).sum();
+        assert_eq!(shard_games, 24 + nb, "{rule}: every game and every branch in the shards");
+        if rule == "neartie" {
+            assert!(o.stats["neartie"].as_u64().unwrap() > 0);
+            assert_eq!(o.stats["merges"].as_u64(), Some(0), "the toy has no merge key");
+        }
+        let (o2, _) = run(&mk(&b_dir), |_, _, _, _| {});
+        assert_eq!(o2.stats["branches"], o.stats["branches"]);
+        assert_eq!(shards(&a_dir), shards(&b_dir), "{rule}: the same job, the same shards");
+        // a records job refuses them, loudly
+        let mut j = mk(&tmp(&format!("branch-{rule}-rec")));
+        j.output = Output::Records;
+        let ctl = Control::default();
+        let e = run_job(&TOY, &j, &ctl, &Events::default(), Arc::new(Mutex::new(Progress::default())), &|_| {}).unwrap_err();
+        assert!(e.contains("selfplay_branch") && e.contains("records"), "{e}");
+    }
+    // without branches the stats carry none of the keys (every job's stats as before)
+    let (o, _) = run(&job(&tmp("branch-off"), 4, 0, 1, true), |_, _, _, _| {});
+    assert!(o.stats.get("branches").is_none());
+}

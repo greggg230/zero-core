@@ -886,16 +886,64 @@ pub fn eval_lease_cfg(mut m: DriverCfg) -> DriverCfg {
     m
 }
 
+/// The driver's `branch` setting of a run's settings (zero-core `forks.Forks.branch`, docs/az.md 24 and 72): None
+/// while `selfplay_branch` is 0; the uniform rule's {p, moves, temp, differ} or the near-tie rule's {p, rule, eps,
+/// n_min, p_min, q_lo, q_hi}, each value converted as Python's `float()` / `int()` / `bool(int())` do. A setting of
+/// the rule not in play, away from its default, is refused (`forks.check_settings`).
+pub fn branch_of(c: &Settings) -> Result<Option<Value>, String> {
+    let p = py_float("selfplay_branch", c.get_or_falsy("selfplay_branch", &PyJson::Float(0.0)))?;
+    if p <= 0.0 {
+        return Ok(None);
+    }
+    let f = |k: &str, d: f64| -> Result<f64, String> { py_float(k, c.get_or(k, &PyJson::Float(d))) };
+    let i = |k: &str, d: i64| -> Result<i128, String> { py_int(k, c.get_or(k, &PyJson::Int(d as i128))) };
+    let rule = match c.get_or_falsy("selfplay_branch_rule", &PyJson::Null) {
+        PyJson::Null => "uniform".to_string(),
+        PyJson::Str(r) => r.clone(),
+        v => return Err(format!("selfplay_branch_rule {}: a string ('uniform' or 'neartie')", v.dumps())),
+    };
+    const UNIFORM: [(&str, f64); 3] = [("selfplay_branch_moves", 3.0), ("selfplay_branch_temp", 2.0), ("selfplay_branch_differ", 0.0)];
+    const NEARTIE: [(&str, f64); 5] = [("selfplay_branch_eps", 0.02), ("selfplay_branch_n_min", 4.0), ("selfplay_branch_p_min", 0.02), ("selfplay_branch_q_lo", 0.1), ("selfplay_branch_q_hi", 0.9)];
+    let moved = |ks: &[(&str, f64)]| -> Vec<String> { ks.iter().filter(|(k, d)| c.get(k).is_some_and(|v| !eq_num(v, *d))).map(|(k, _)| k.to_string()).collect() };
+    let mut b = Map::new();
+    b.insert("p".into(), Value::from(p));
+    match rule.as_str() {
+        "neartie" => {
+            let bad = moved(&UNIFORM);
+            if !bad.is_empty() {
+                return Err(format!("selfplay_branch_rule neartie: {} are the uniform rule's settings: leave them at their defaults", bad.join(", ")));
+            }
+            b.insert("rule".into(), Value::from("neartie"));
+            b.insert("eps".into(), Value::from(f("selfplay_branch_eps", 0.02)?));
+            b.insert("n_min".into(), Value::from(i("selfplay_branch_n_min", 4)? as i64));
+            b.insert("p_min".into(), Value::from(f("selfplay_branch_p_min", 0.02)?));
+            b.insert("q_lo".into(), Value::from(f("selfplay_branch_q_lo", 0.1)?));
+            b.insert("q_hi".into(), Value::from(f("selfplay_branch_q_hi", 0.9)?));
+        }
+        "uniform" => {
+            let bad = moved(&NEARTIE);
+            if !bad.is_empty() {
+                return Err(format!("{}: settings of selfplay_branch_rule neartie (the rule is 'uniform')", bad.join(", ")));
+            }
+            b.insert("moves".into(), Value::from(i("selfplay_branch_moves", 3)? as i64));
+            b.insert("temp".into(), Value::from(f("selfplay_branch_temp", 2.0)?));
+            let d = c.get_or_falsy("selfplay_branch_differ", &PyJson::Int(0));
+            b.insert("differ".into(), Value::from(py_int("selfplay_branch_differ", d)? != 0));
+        }
+        r => return Err(format!("selfplay_branch_rule {r:?}: one of uniform, neartie")),
+    }
+    Ok(Some(Value::Object(b)))
+}
+
 /// The self-play driver of a Python remote worker for these settings (`remoteplay.Worker._load` with
-/// `seed`, `net`): rolling, queue_only, recording, the run's player counts. The Python-only features
-/// (the self-play league, branched games, archive starts) refuse: `check-config` lists them.
+/// `seed`, `net`): rolling, queue_only, recording, the run's player counts, branched games (`branch_of`: both rules,
+/// played by the shared driver exactly as on the desktop). The Python-only features (the self-play league, archive
+/// starts) refuse: `check-config` lists them.
 pub fn selfplay_driver_cfg(c: &Settings, info: &GameInfo, seed: u64, net: u32) -> Result<DriverCfg, String> {
     if py_float("selfplay_league", c.get_or_falsy("selfplay_league", &PyJson::Int(0)))? > 0.0 {
         return Err("selfplay_league: the self-play league is Python-only (zero/league.py): unsupported by the native worker".into());
     }
-    if py_float("selfplay_branch", c.get_or_falsy("selfplay_branch", &PyJson::Float(0.0)))? > 0.0 {
-        return Err("selfplay_branch: branched games are set up in Python (zero/forks.py): unsupported by the native worker".into());
-    }
+    let branch = branch_of(c)?;
     if truthy(c.get_or_falsy("selfplay_archive", &PyJson::Str(String::new()))) {
         return Err("selfplay_archive: archive starts are set up in Python (zero/forks.py): unsupported by the native worker".into());
     }
@@ -929,7 +977,7 @@ pub fn selfplay_driver_cfg(c: &Settings, info: &GameInfo, seed: u64, net: u32) -
         // (the game's own row limit, as the Python remote worker's driver: docs/search.md 2.15)
         max_row_tokens: None,
     };
-    driver_cfg(&table, None, None, args)
+    driver_cfg(&table, branch.as_ref(), None, args)
 }
 
 #[cfg(test)]
@@ -1010,7 +1058,7 @@ mod tests {
 
     #[test]
     fn python_only_features_refuse() {
-        for (k, v) in [("selfplay_league", "0.25"), ("selfplay_branch", "0.1"), ("selfplay_archive", "\"a.json\"")] {
+        for (k, v) in [("selfplay_league", "0.25"), ("selfplay_archive", "\"a.json\"")] {
             let mut c = base();
             c.set(k, PyJson::parse(v).unwrap());
             assert!(selfplay_driver_cfg(&c, &info(), 0, 0).unwrap_err().contains(k));
@@ -1019,6 +1067,38 @@ mod tests {
         c.set("selfplay_league", PyJson::Float(0.0));
         c.set("selfplay_archive", PyJson::Str(String::new()));
         assert!(selfplay_driver_cfg(&c, &info(), 0, 0).is_ok());
+    }
+
+    #[test]
+    fn branched_games_are_the_python_drivers() {
+        use zero_search::driver::{BranchCfg, BranchRule, NearTie};
+        // off: no branch; the uniform rule as forks.Forks builds it; the near-tie rule with its settings
+        let mut c = base();
+        assert_eq!(selfplay_driver_cfg(&c, &info(), 0, 0).unwrap().branch, None);
+        c.set("selfplay_branch", PyJson::Float(0.2));
+        c.set("selfplay_branch_differ", PyJson::Int(1));
+        assert_eq!(selfplay_driver_cfg(&c, &info(), 0, 0).unwrap().branch, Some(BranchCfg { p: 0.2, moves: 3, temp: 2.0, differ: true, rule: BranchRule::Uniform }));
+        let want = zero_search::settings::parse_branch(&serde_json::json!({"p": 0.2, "moves": 3, "temp": 2.0, "differ": true})).unwrap();
+        assert_eq!(selfplay_driver_cfg(&c, &info(), 0, 0).unwrap().branch, Some(want));
+        c.set("selfplay_branch_differ", PyJson::Int(0));
+        c.set("selfplay_branch_rule", PyJson::Str("neartie".into()));
+        c.set("selfplay_branch_eps", PyJson::Float(0.05));
+        c.set("selfplay_branch_n_min", PyJson::Int(8));
+        let b = selfplay_driver_cfg(&c, &info(), 0, 0).unwrap().branch.unwrap();
+        assert_eq!(b.rule, BranchRule::NearTie(NearTie { eps: 0.05, n_min: 8, ..NearTie::default() }));
+        assert_eq!((b.p, b.moves), (0.2, 1));
+        // the other rule's settings away from their defaults refuse, as zero.forks.check_settings does
+        let mut d = c.clone();
+        d.set("selfplay_branch_moves", PyJson::Int(2));
+        assert!(selfplay_driver_cfg(&d, &info(), 0, 0).unwrap_err().contains("selfplay_branch_moves"));
+        let mut d = c.clone();
+        d.set("selfplay_branch_rule", PyJson::Str("uniform".into()));
+        assert!(selfplay_driver_cfg(&d, &info(), 0, 0).unwrap_err().contains("selfplay_branch_eps"));
+        d.set("selfplay_branch_rule", PyJson::Str("best".into()));
+        assert!(selfplay_driver_cfg(&d, &info(), 0, 0).unwrap_err().contains("selfplay_branch_rule"));
+        let mut d = c.clone();
+        d.set("selfplay_branch_q_lo", PyJson::Float(0.95));
+        assert!(selfplay_driver_cfg(&d, &info(), 0, 0).unwrap_err().contains("q_lo"));
     }
 
     #[test]
