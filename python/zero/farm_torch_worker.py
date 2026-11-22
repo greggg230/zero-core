@@ -338,22 +338,23 @@ def job_settings(settings, threads=None, conc=None, groups=None):
 
 
 def pick_device(job):
-    """The job's torch device: 'cpu' when the job says `device` 'cpu' (tests) or CUDA is absent and the job allows it;
-    else the CUDA device whose LUID is the job's `gpu.luid` (PROTOCOL 8) when torch reports LUIDs, else cuda:0."""
+    """The job's torch device: 'cpu' when the job (or env ZERO_TORCH_WORKER_DEVICE) says 'cpu' (tests); else the CUDA
+    device of the job's adapter (`gpu` {luid, vendor, name}, PROTOCOL 8): torch reports no LUID, so the one CUDA device of
+    that name when exactly one has it (an owner machine has one NVIDIA GPU), else cuda:0."""
     import torch
     want = job.get('device') or os.environ.get('ZERO_TORCH_WORKER_DEVICE') or 'cuda'
     if want == 'cpu':
         return 'cpu'
     if not torch.cuda.is_available():
         raise Fatal('no CUDA device: torch.cuda.is_available() is False (this torch worker plays on an NVIDIA GPU)')
-    luid = ((job.get('gpu') or {}).get('luid') or '').lower().replace('0x', '')
-    if luid:
-        for i in range(torch.cuda.device_count()):
-            p = torch.cuda.get_device_properties(i)
-            got = getattr(p, 'luid', None)
-            if got is not None and (bytes(got).hex() if not isinstance(got, str) else got).lower() == luid:
-                return f'cuda:{i}'
-    return 'cuda:0' if want == 'cuda' else want
+    if want != 'cuda':
+        return want
+    name = str((job.get('gpu') or {}).get('name') or '').strip().lower()
+    if name:
+        hit = [i for i in range(torch.cuda.device_count()) if torch.cuda.get_device_name(i).strip().lower() == name]
+        if len(hit) == 1:
+            return f'cuda:{hit[0]}'
+    return 'cuda:0'
 
 
 def load_reference(path, tails=None):

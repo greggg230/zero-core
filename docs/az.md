@@ -152,7 +152,7 @@ settings a run has not stored yet; a run directory keeps its settings across cod
 | `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
 | `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
 | `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface (plus the optional input `t_align`, 66), metadata (plus `fast`, `attention`, `t_align`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
-| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul' - the gen exported as graph 'fast-matmul', float32: the AMD GPUs' DirectML variant; 'matmul-fp16' - that graph in float16: DirectML on NVIDIA / Intel, 46.10); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so with 'gpu=fp16,dml=matmul@amd' CUDA PCs play the fp16 graph, AMD PCs (DirectML) the float32 MatMul one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
+| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul' - the gen exported as graph 'fast-matmul', float32: the AMD GPUs' DirectML variant; 'matmul-fp16' - that graph in float16: DirectML on NVIDIA / Intel, 46.10; 'weights' - the gen's network as torch-weights/1 for the alternates whose pack is opted in, the farm's torch worker, 78); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so with 'gpu=fp16,dml=matmul@amd' CUDA PCs play the fp16 graph, AMD PCs (DirectML) the float32 MatMul one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
 | `selfplay_local_reason` | '' | why the run's self-play stays on this machine although the game package has a published farm build for its commit (`GamePackage.farm_build`): free text, logged at every start. Required (else refused, exit 78) at a fresh start and at a fork's first start when there is such a build and self-play names no farm pool; a resumed run only warns. `$ZERO_SELFPLAY_LOCAL_REASON` stands in for it (test harnesses, smokes; not saved). Trainer-only (70) |
 | `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
 | `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
@@ -9983,3 +9983,92 @@ target and no match too.
 --game mtg --spec '{"max_turns": 60}'`, a checkout against itself): 384 s for both sides at once against 1,808 s in the
 gate an hour earlier, and every digest the gate's own - visits records 4c42f1160eca9121, cq records 88ab3306d3beba12
 (3,554 samples each, results e266d43f27caa1e8), the match f2a5103266c05aa6 (10/16).
+
+## 78. The farm's torch worker: aw/1 through the trainer's own inference path (`zero.farm_torch_worker`, `torch-weights/1`, `pool_variants` form 'weights'; zero-farm's per-machine torch runtime, 2026-11-22)
+
+**Why.** On an RTX 5090 the native worker's ONNX graph plateaus at ~0.4x of the trainer's own torch self-play (MTG
+Zero's meta3 network: ~26 us of GPU per leaf for the ORT fp16 graph against ~9 us for torch bf16 with CUDA graphs). The
+owner's decision (2026-11-22): farm machines are configurable per machine, and the owner's own machines do farm
+self-play with torch. The bar is the trainer's local self-play: at least 95% of its leaves/s. So the worker plays through
+the trainer's own path - not a reimplementation.
+
+**What it is.** `zero/farm_torch_worker.py`, started by a game repo's `worker_main.py serve` (MTG Zero's
+tools/torch_worker_main.py, shipped at the root of a torch worker build; zero-farm's zf-pyshim.exe runs it with the torch
+runtime pack's own CPython, `-I`). It speaks aw/1 exactly (zero-farm PROTOCOL 5, 10.5):
+
+* `hello` before torch is imported (aw 1; build_id = sha256(manifest.json next to worker_main.py)[:24], else
+  ZERO_FARM_BUILD_ID, else 'unsigned-dev'; kinds ['selfplay']; zero_onnx []; models ['torch-weights/1']; features
+  ['rolling']; pid). `worker_main.py info` prints the same (zero.farm_pool's rolling check reads it); `selftest --model W
+  --reference R [--device cuda|cpu]` runs the self-test alone (MTG Zero's release step torch-selftest).
+* **The job** is the native worker's (crates/worker job.rs, the Python remote worker's driver): `Run.driver` of the
+  run's self-play seat (`nn_seat('m', sims, selfplay=True)`, a table per `players` entry), rolling, queue_only,
+  recording, seeded with the job's `seed`, its games numbered from `gid_base` (`SearchDriver.set_first_gid`, new in the
+  binding: Driver::set_first_gid), sparse batches, the job's search `threads` and its `conc` / `groups` over the
+  template's (`job_settings`: zero.run.DEFAULTS, then the template's settings - `setting_classes` dropped -, the game
+  resolved with `game_layout` (73); the self-play league and archive starts refused, as the native worker refuses
+  them). A setup of the run's spec is queued after every submitted batch up to `conc` in flight (the native worker's and
+  `Run.selfplay_shared`'s cadence).
+* **The evaluator** is `NetEvaluator` exactly as `Run.evaluator` builds it - `infer_precision`, `infer_token_chunks`,
+  `infer_workers`, and a token network's CUDA graphs on CUDA (`graphs=True`: what ZERO_TOKEN_GRAPHS=1 gives a run) -
+  driven by `infer._drive_pipelined`'s loop (ZERO_INFLIGHT batches launched, submitted in launch order) with one
+  addition: a yield gate before each new batch. The run's inference settings are trainer-class (check-config never puts
+  them in a template), so they travel with the network, in the gen's `torch-weights/1` file; `torch_threads` too.
+* **Records**: every finished game's record (`set_trace`, `take_game_records`: zero_search::record::game_json, the very
+  text the native worker writes) into gzip'd JSON-lines files of the native worker's format (records.rs: a header with
+  sorted keys - records, game (+ game_layout), spec, aux, features, actions, aux_width, seed, lease, build_id, games,
+  rows, gids, gen, failures -, one line per game; a file at `shard_rows` rows, or `flush_s` after its first game in a
+  rolling job; records/2 with a branched game held until its branch's line), announced as `records` events. The pool
+  driver replays them unchanged.
+* **Self-test**: before the first batch (and for each checkpoint) the gen's reference set goes through the very
+  evaluator it plays with, the rows as a driver sends them (sparse, the batches as recorded), twice: bit for bit the
+  same both times, and within the precision's tolerance of the stored torch answers (`TOL`: fp32 1e-3; tf32 2e-2, mean
+  2e-3; bf16 8e-2, mean 6e-3); `selftest` {provider 'torch-cuda', max_abs, ok, deterministic, items, means, tol, rows};
+  a failure is fatal.
+* **Control**: `checkpoint` (a rolling job builds and self-tests the new network on a thread while the games go on,
+  then the driver's phase change - the games in flight continue, each row keeps the network that searched it; a newer
+  checkpoint supersedes one being built; a classic job switches at once), `extend` (never lower), `low`, `yield` (the
+  batches in flight answered, the evaluators and their CUDA graphs dropped, `torch.cuda.empty_cache()`; `yielded`
+  within 1.8 s), `resume` (the evaluator rebuilt; a failure is fatal: never a worker left yielded), `finish`, `quit`
+  (the games in flight lost, named in `end`'s `unfinished`), `ping`; `status` every 10 s (the native worker's Stats plus
+  `vram_mb`: what torch holds on the GPU, for the agent's memory plan). A model that is not torch-weights/1 (an ONNX
+  graph: the gen's torch variant not registered) or not the job's sha256 is refused, fatal.
+* **Windows' stdin**: the agent's lines are read without ever leaving a ReadFile pending (`_pipe_lines`: PeekNamedPipe,
+  then read what is there). A thread blocked in a synchronous read of the pipe serializes every other call on that file
+  object, and a DLL whose C runtime starts up queries the standard handles: importing numpy on the job's thread hung
+  until the next line came. stdout carries the protocol only (fd 1 points at stderr: a library's print goes to the log).
+
+**`torch-weights/1`** (`zero/torch_weights.py`): a `torch.save` dict of plain values and tensors, loadable with
+`torch.load(weights_only=True)` - `{"format": "torch-weights/1", "net_config", "state_dict", "infer": {precision,
+token_chunks, workers, torch_threads}, "gen", "aux_older"?}`; no optimizer state. `load` rebuilds the network as
+`zero.net.load` does a checkpoint (the encoding guard, the weights, the head widened), so the worker's weights are the
+trainer's bit for bit. The agent caches every variant as `model-<name>.onnx` whatever its key (PROTOCOL 14.4): the
+worker reads the file's format, never its name.
+
+**The pool** (`zero.farm_pool`, PROTOCOL 14): `pool_variants` takes the form 'weights' ('torch=weights': the gen's
+checkpoint through `torch_weights.export` with the run's settings, `model-torch.pt`, uploaded under that key, signed and
+registered as any variant). It takes no `@vendor` and counts in neither of the graph variants' rules: it goes to the
+alternates whose runtime pack is opted in (`variant_of(..., opt_in)`), and never to a graph alternate. An opted-in
+alternate without a 'weights' variant refuses the pool (Refused: its worker plays nothing else).
+`zero.farm_def.run_alternates`: a pack's `opt_in` (zero-farm's per-machine opt-in) makes its alternate's `when.opt_in`;
+list the torch alternate before the CUDA one in `pool_alternates` (opted-in machines take it, the others fall through).
+
+**Off by default**: nothing changes for a run, a native worker or the pool without `pool_variants` 'weights' and an
+opted-in alternate; every existing variant's file and key are what they were.
+
+**Tests and checks.** `tests/test_farm_torch_worker.py` (a CPU network on the toy): hello before torch and numpy; quit
+before a job; a job's records replayed by `replay_rows` equal to the trainer's local self-play rows (groups 2, threads
+2); an ONNX file and a wrong sha256 refused; the self-test passing, and failing on a shifted reference; a rolling job's
+checkpoint (rows of both networks), yield (no game finishes while yielded), resume, low, extend, finish; quit (the games
+in flight in `unfinished`); a failed resume fatal; the torch-weights round trip. `tests/test_farm_pool.py::
+test_a_torch_alternate_plays_the_weights_variant`, `::test_the_weights_variant_is_the_checkpoints_network`,
+`tests/test_farm_def.py::test_run_alternates_carry_an_opted_in_pack`.
+
+`tools/torch_worker_gate.py` (MTG Zero's farm-compat check 4 runs it): the worker's entry plays one job; in this process
+the trainer's local self-play path plays the same seed, ids and network (`Run.driver` + `NetEvaluator` +
+`infer.drive`, a setup queued per batch); every record is replayed by the pool driver's path and its rows compared with
+the trainer's rows of the same gid, every array bit for bit (pi and q at the float16 a record and a shard keep). The
+driver's batches are deterministic in composition (its groups are fixed partitions of its games), so this holds with
+groups > 1 and several search threads too: the toy at groups 1 and at groups 2 / 4 threads, MTG Zero's Delver
+best-of-three dealt preset (6 of 6 games, 2,309 rows, CPU fp32). What it proves: the worker plays the trainer's games -
+seat, seeds, ids, evaluator, records. On a GPU at bf16 the same holds only when the evaluator answers a batch the same
+way in both processes (measured below).
