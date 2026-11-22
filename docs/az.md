@@ -1,4 +1,9954 @@
+# The AlphaZero loop (`zero`)
 
+Self-play -> training -> evaluation against a yardstick -> Elo. The search runs in Rust
+(docs/search.md); the Python package `zero` (`python/zero/`) owns the network, inference,
+training, the loop, Elo, the dashboard and the tools. Moved here from Glass Road Zero's
+`grz/az` and Caverna Zero's `cvz/az` (copies of one stack: Caverna Zero had ported it from
+Dominion Zero's `domz/az` and St. Pete Zero's `stpz` and made it game-agnostic); proven end to
+end on the toy game (section 6) and in both games' runs. A game plugs in as a **game package**
+(docs/new_game.md): its compiled module `<pkg>._engine`, its presets, its external players
+(the web apps' JS bots, `ext:jsbot`, are the Elo-1000 yardsticks), its default spec and its
+dashboard port, registered with `zero.package.register(GamePackage(...))` in
+`<pkg>/az/__init__.py`. The game repo's `<pkg>/az/<module>.py` files are shims, so every
+command keeps its name (`python -m grz.az.run`, `python -m cvz.az.dashboard`, ...).
+
+| File (`python/zero/`) | What |
+|---|---|
+| `package.py` | The game package registry: `GamePackage` (name, root, engine module, run module, presets, DEFAULTS overrides, external players, specs, decision kinds, dashboard title / port, env prefix, deferred-result glue), `register`, `active` |
+| `run.py` | The loop: `DEFAULTS`, `PRESETS` (the toy's + the package's), self-play (classic or rolling), training, evaluation, Elo, resume, STOP / PAUSE |
+| `cotrain.py` | Co-training (section 11): a primary game whose deferred terminals the episodes of a resolver game decide, one network each in one run: `CoRun` (the loop), `Coordinator` (parked games -> queued episodes -> results by tag -> `resolve`), `run_pair` (two drivers on two threads), `PrimaryRun` (team events as matches) |
+| `net.py` | `Net`: residual MLP with LayerNorm (arch 'mlp', the default); `GridNet` (arch 'grid'): residual 3x3 conv tower over the game's board planes (`GamePackage.grids`) with globals + pooled-board channel biases, one policy logit per cell from the tower; `TokenNet` (arch 'tokens', section 10): a transformer over the game's objects read through a layout descriptor (`GamePackage.tokens`), pointer logits for the objects' actions, `forward_static` (static shapes for the CUDA graphs, 10.6); all: policy logits over NUM_ACTIONS (masked to the legal actions by the caller), value = P(win) per relative seat (softmax over the seats present), auxiliary margin head; readers (a branch over declared inputs predicting an auxiliary target, fed into the trunk: `add_reader`, section 36); a head widened to more targets, every output of before bit for bit (`widen_aux`; `load` does it for the game's declared targets: section 37); atomic `save`, `load` (by the checkpoint's arch), `widen`, `make_net` |
+| `infer.py` | `NetEvaluator` (CPU / CUDA; gather + segment softmax on the device; `set_weights` in place, `set_network` when a reader came or went or a head was widened (sections 36, 37), `reader`; `workers`: eager batches on threads; `graphs`: the conv network's `GraphRunner`, the token network's opt-in `TokenGraphRunner` - env ZERO_TOKEN_GRAPHS=1, section 10.6 -, `graph_calls`), `UniformEvaluator`, `drive()` (external batches answered on threads; several network batches in flight) |
+| `data.py` | Sample shards (`ShardWriter`, atomic npz, optionally compressed - remote self-play's; the features dense or, with `shard_sparse`, as their non-zeros - section 32; non-finite ones quarantined as `*.bad.npz`), the RAM-bounded training `Window` (each shard subsampled as it is loaded; checks every shard; row provenance; the shards of a widened head's older layouts, section 37), `TargetStats` |
+| `finite.py` | The non-finite guard (section 4.1): vectorised NaN / inf checks, `NonFinite` |
+| `games.py` | `engine()` (the package's compiled module), registered games, seat specs, external players (`EXTERNALS`, `register_external`; a package registers its own, e.g. `ext:jsbot`), the `Driver` wrapper |
+| `toybots.py` | The toy heuristic as an external player (`ext:toyheur`) |
+| `elo.py` | Bradley-Terry Elo over all results, the run's yardstick = 1000; one pool per evaluation move rule (`pool_dir`, `eval_tag`, `active_pool`), the Elo opponents (`opponents`: evaluations back, or raw `elo_offsets`; section 5.4); fixed anchors (`parse_anchors`, `fit_fixed`: the fit with the anchors held at their ratings, `anchored.json`; section 20.1) |
+| `runctl.py` | PAUSE / STOP files, exit status 75, run / supervisor state files, `PauseWatch` |
+| `dashboard.py` | Flask dashboard (title, port and runs directory from the game package) |
+| `bench.py` | Throughput measurements (`infer`: batch sizes, concurrent workers, a checkpoint, the operators and multiply-adds of a forward pass; `train`: seconds per training step; section 10.5; `--graphs`: 10.6) |
+| `distill.py` | Distillation (section 13): a new network of another size or architecture trained on a run's shards to compute what a teacher computes (`new_student`, `outputs`, `distill`, `agreement`); the teacher's auxiliary head and value-only rows (13.6) |
+| `h2h.py` | Checkpoint vs checkpoint, seats alternating (the readout of an A/B), at a run's evaluation settings (each side's run's margin_w / redet / eval_cache, A's run's eval spec: section 44.3); each side's move rule its run's `eval_select` or `--select` / `--a-select` / `--b-select` (section 5.4); `--move-log`; paired games, per-side simulations, the sequential tests (`--paired`, `--a-sims` / `--b-sims`, `--sprt`, `--target-se`: `pair_stats`, `sprt_llr`, `sequential`; section 20.3); each side's CUDA graphs (`--graphs`, `--a-graphs` / `--b-graphs`, section 10.6) |
+| `heldout.py` | Held-out losses (section 20.2): a frozen set of sample rows (`make`), a checkpoint's value cross-entropy / accuracy / Brier against z and policy cross-entropy / top-1 against the recorded targets, decision and value-only rows apart (`HeldOut`, `losses`); `python -m <pkg>.az.heldout make | eval` |
+| `remote.py` | Remote evaluation (section 5.2): `RemoteEval` (the run's thread: queue, ship to the remote's mirror, run, results to `evals.jsonl`, Elo back), `RemoteNetEval` (a co-training run's `eval_yard_net`, 11.7), the remote side (`python -m <pkg>.az.remote eval MIRROR ITER`; `evalnet MIRROR ITER`; `selfplay MIRROR K`: remoteplay's worker), `Transport` (ssh / scp, or `local`) |
+| `remoteplay.py` | Remote self-play (sections 5.3, 11.6): `RemotePlay` (the run's sessions with persistent workers on the remote, checkpoints out, compressed shards back into `data/iter_i/` with the non-finite guard on arrival; the shared queue's caps per consumer; single-game: the shared quota, games accepted by the run; co-training: a share of the resolver's queued episodes, rows back by tag, requeue, give-back on back-off), `Worker` (the remote side: a rolling `queue_only` driver across iterations, held games, back-off while an evaluation holds its lock, busy markers, linger) |
+| `workqueue.py` | The shared work queue (section 5.3): `Shares` (each consumer's in-flight cap from its measured throughput, head start and the iteration's units; a batch-bound consumer's its slots within `batch_inflight` iterations), `split_games` (a driver's sample dict cut into its games), the staleness histogram |
+| `targets.py` | Policy-target sharpness and quality: visits vs completed-Q targets (section 9) |
+| `league.py` | The self-play league (section 14): the league games' kinds and seat tables (classic, rolling), the iteration's picks of past checkpoints (`League.plan`: uniform or pfsp), the slots' evaluators (guarded), the games' attribution and `selfplay.league` |
+| `forks.py` | Branched self-play games and archive starts (section 24): the settings, the archive file (`zero-archive/1`: its entries' patches over the run's spec), the self-play driver's `branch` / `starts`, the remote hello's fingerprint, the tallies and `selfplay.forks` |
+| `mcts.py`, `play.py`, `parity.py`, `protocol.py` | Reference search / driver, parity, the protocol (docs/search.md) |
+| `onnx_export.py`, `onnx_parity.py` | zero-onnx/1 (section 41): any network (`TokenNet`, `GridNet`, `Net`) exported to one self-contained ONNX graph that takes the driver's sparse batch (`export`, `export_checkpoint`; `python -m zero.onnx_export`), and its parity gate against torch on real batches (`python -m zero.onnx_parity`); `tools/onnx_record.py` records a self-play's batches, `tools/onnx_bench.py` times ONNX Runtime against torch. Need onnx / onnxscript / onnxruntime; nothing on a run's path imports them |
+| `farm_def.py`, `farm_eval.py`, `farm_h2h.py`, `farm_report.py` | zero-farm on the desktop (sections 44.2, 44.3): signed definitions (`definition/1` documents, versions, the archive, `farm-release define`) and the coordinator client; eval jobs' games and rows in Python terms; a head-to-head of two checkpoints played on the farm; the own machines' work for the farm's admin page |
+| `tools/` (`supervise`, `kill_run`, `pause_run`, `fork_run`, `launch_hidden`, `distill`) | Unattended runs, control, forks (`fork_run --net`: a continuation with another network, section 13.3), distillation (section 13); each repo's `tools/<name>.py` activates its package and calls `main()` |
+
+Repository tools (`tools/`): `build_engine.sh` (the PyO3 build every repo's `build_py.sh`
+calls), `build_py.sh` (the core's toy module), `smoke_all.sh` (core tests + each game's
+smoke), `selfplay_digest.py` + `check_checkpoint_compat.py` (old vs new checkout: golden
+digests, checkpoint compatibility; docs/pinning.md).
+
+## 1. Running
+
+In a game repo (the core's own toy runs: `python -m zero.run`, `python tools/supervise.py` in
+zero-core with `bash tools/build_py.sh` first):
+
+```
+bash tools/build_py.sh                                        # <pkg>/_engine.pyd for this checkout (inits the pinned core)
+python -m <pkg>.az.run --run runs/toy1 --preset toy-1         # in the foreground
+python -m <pkg>.az.dashboard --host 0.0.0.0                   # reads runs/* (--runs DIR elsewhere); port: the package's
+```
+
+Unattended (live runs from a pinned worktree, never from a checkout being edited; the
+supervisor restarts a crashed run from its newest checkpoint, backs off after 5 crashes in an
+hour, keeps Windows awake, waits while paused; the hidden console never flashes a window):
+
+```
+git -C ~/<game> worktree add --detach ~/<game>-wt/run-<name> <commit>
+cd ~/<game>-wt/run-<name> && CARGO_TARGET_DIR=E:/cargo-target/<game>/run-<name> bash tools/build_py.sh
+python tools/launch_hidden.py runs/toy1/supervisor_console.txt python tools/supervise.py runs/toy1 --preset toy-1
+touch runs/toy1/STOP                     # clean stop after the current iteration (the supervisor exits too)
+python tools/pause_run.py runs/toy1      # pause within seconds (exit 75; the supervisor waits); --resume, --status, --wait
+python tools/kill_run.py runs/toy1       # hard stop: the supervisor, then the run (pids from the state files; --scan)
+python tools/fork_run.py runs/toy1/models/iter_0010.pt runs/toy2          # new run from a checkpoint (widened; across a token layout change: 10.3)
+python tools/fork_run.py --source runs/toy1 --dest runs/toy1b --iter 10 --set reuse=8   # continue at K
+python tools/distill.py runs/toy1/models/iter_0010.pt big.pt --data runs/toy1/data --hidden 256 --blocks 6   # section 13
+python tools/fork_run.py --source runs/toy1 --dest runs/toy1big --iter 10 --net big.pt  # continue at K with it
+```
+
+Settings: `run.DEFAULTS` (+ the game package's overrides) < `--preset` < the run's saved
+`config.json` < flags given on this command line (saved). A preset therefore only fills
+settings a run has not stored yet; a run directory keeps its settings across code versions
+(every key is saved).
+
+### 1.1 Presets
+
+* `toy-smoke`: 2 tiny iterations, the end-to-end check in tests (~15 s).
+* `toy-1`: the toy proof run (section 6): 24 iterations of 600 self-play games, 64 / 16 sims
+  (p_full 0.25), 128 x 3 network, batch 512, reuse 4, window 6 (growing), value_q 0.5 (warm-up
+  5), yardstick `ext:toyheur` (the toy heuristic through the external-seat path, as the JS bots
+  play the games), 400 evaluation games at 32 sims, 100 against random, 100 games per Elo
+  match, 4 search threads.
+* `toy-cotrain-smoke`: co-training on the toys (section 11): 2v2 `toy_team` events (8 resolved
+  per iteration, yardstick `greedy`) whose four matches each are toy games played by the toy
+  network (`resolver` 'toy', its settings the `toy-smoke` preset with the `heuristic` yardstick),
+  2 iterations (~30 s).
+* Game presets come with the game package (`GamePackage.presets`): Caverna Zero
+  `caverna-smoke`, `caverna-2p`, `caverna-2p-cq`; Glass Road Zero `glassroad-smoke`,
+  `glassroad-2p`, `glassroad-2p-cq` (each repo's docs/az.md).
+
+### 1.2 Settings (`python -m <pkg>.az.run --help`)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `game`, `spec`, `players` | toy, '', [2] | registered game, its JSON spec, player counts sampled per self-play game |
+| `game_layout` | None | the layout revision of a game whose NAME changed meaning (`GamePackage.game_aliases`): recorded at a run's first start, never from a preset; None for every other game; a config naming an aliased name without it is the name's old game (section 73) |
+| `iters`, `games` | 40, 1000 | iterations; self-play games per iteration (rolling: games FINISHED per iteration; with `selfplay_remote`: finished across every machine, section 5.3) |
+| `rolling` | 0 | 1 = one persistent driver keeps `conc` games in flight across iterations (docs/search.md 2.6) |
+| `conc`, `threads`, `groups`, `torch_threads` | 256, 4, 2, 1 | games in flight, search threads, batches in flight, torch intra-op threads (keep 1, section 7) |
+| `ext_groups` | 2 (Glass Road Zero: 8) | groups for matches with an external player (section 5) |
+| `sims`, `sims_fast`, `p_full` | 64, 16, 0.25 | playout-cap randomisation (only `p_full` decisions are training samples) |
+| `p_full_rule`, `p_full_floor`, `p_full_shape`, `p_full_u_mean` | 'random', 0.05, 'linear', 0 | how the playout cap picks its full searches (section 60, docs/search.md 3.21): 'random' = the coin of probability `p_full`, as before; 'prior_uncertainty' = full with probability min(1, floor + (p_full - floor) g(u) / u_mean), u = 1 - max of the root's priors, g the shape ('linear' / 'sqrt' / 'square'), u_mean the measured mean of g(u) (required): the same mean simulations per decision, the full searches on the unsure decisions; metrics `selfplay.budget` (either rule) |
+| `sims_minor` | 0 | simulations of the game's minor decisions in self-play (`SearchGame::minor_decision`, MTG: the land to tap), never recorded; 0 = searched like the others (docs/search.md 1, 3) |
+| `c_puct`, `alpha`, `eps`, `temp_moves` | 1.0, 0.3, 0.25, 20 | PUCT constant (values in [0, 1]), root Dirichlet noise, sampled moves per game |
+| `chance_k`, `margin_w`, `redet`, `max_steps` | 0, 0, 1, 100000 | sampled chance outcomes kept per edge (0 = resample every visit), utility margin credit, fresh determinization per simulation, abandon a game after this many moves |
+| `policy_target`, `cq_c_visit`, `cq_c_scale` | visits, 50, 1.0 | training target of the recorded decisions: the root visit distribution, or Gumbel AlphaZero's completed-Q target (docs/search.md 3.1, section 9); the search is the same |
+| `cq_prior_w` | 1.0 | beta in (0, 1]: the prior's exponent in self-play's recorded 'cq' targets, softmax(beta ln P0 + sigma completedQ) (docs/search.md 3.13): < 1 turns the generations' cumulative sum of advantages into a bounded fixed point exp(sigma Q / (1 - beta)), so an option no search visits recovers and is re-measured; the self-play seat only, never its moves (PUCT, temperature, `selfplay_select`, the Gumbel root) or an evaluation; needs `policy_target` 'cq' (26) |
+| `hidden`, `blocks` | 256, 4 | network size (only when the run's first network is created) |
+| `arch`, `ch` | 'mlp', 64 | 'grid': a `GridNet` of `ch` channels x `blocks` over the package's board grid (Kingdom Builder: 16 planes x 20 x 20; bfloat16 autocast on CUDA for inference and training; not in zero.webexport); 'tokens': a `TokenNet` of width `hidden`, `blocks` layers over the package's object layout (section 10; not in zero.webexport) |
+| `heads`, `ff` | 4, 0 | arch 'tokens': attention heads, feed-forward width (0 = 2 x hidden) |
+| `batch`, `reuse`, `lr`, `wd`, `min_steps` | 512, 4, 1e-3, 1e-4, 50 | steps = new samples x reuse / batch (at least min_steps); AdamW, grad-norm clip 5 |
+| `lr_halve_every`, `lr_min`, `lr_warmup_steps` | 30, 1e-4, 100 | step decay; linear warmup while the optimizer state is fresh |
+| `window`, `window_grow`, `min_window_samples` | 8, 1, 20000 | newest iterations trained on (1 + iter // 2 with window_grow), more until min samples |
+| `keep_data`, `ram_budget_gb`, `shard_rows` | 12, 4, 65536 | data retention (iterations), RAM for the window (uniform subsample beyond), samples per shard |
+| `window_cache`, `window_sparse` | 0, 0 | 1 = the window's shards stay in RAM between iterations (zero/data.py WindowCache); 1 = the window keeps each row's features as their non-zeros - the same window and batches in a fraction of the RAM for a sparse encoding, and with `window_cache` every shard cached whole also over budget, so an iteration loads only its new shards (10.8). The budget still counts dense rows |
+| `shard_sparse` | 0 | 1 = self-play writes each shard's features as their non-zeros (`x_ptr` / `x_idx` / `x_val`, meta `x_format` 'sparse'; every other array as before; this machine's shards and a remote's): the dense rows bit for bit in ~1/25 of the disk on MTG Zero's Delver line, written ~4-5x faster with the float32 rows never buffered. Every reader takes both formats, so a window may mix them; an older checkout cannot read a sparse shard (`data.convert_shard` makes it dense again) (32) |
+| `allow_draft_layout` | 0 | 1 = a run may train on a game package's token layout marked `draft` (variable-length rows: MTG Zero's layout v7 while it is built, R16); 0: such a run is refused at start (exit 78). A layout without `draft` - every layout of before - is unaffected (43.4) |
+| `train_static` | 0 | 1 = a token network trains through its static forward (`TokenNet.forward_static`, the inference graphs': each batch one chunk of its longest row's tokens, no host sync) with a fused AdamW on CUDA, and a sparse window's batches travel as their non-zeros (dense on the device): the same batches and losses, the updates up to float32 rounding; ~2.8x a step on MTG Zero's Delver network (10.9). Another network is refused |
+| `value_q`, `value_q_warmup`, `margin_loss_w` | 0.5, 5, 0.5 | value target blend with the root search estimate; margin loss weight |
+| `yardstick` | heuristic | the Elo anchor (1000): a built-in bot or `ext:<name>` (toy: `ext:toyheur`; Caverna, Glass Road: `ext:jsbot`) |
+| `eval_games`, `eval_sims`, `eval_random_games`, `eval_every` | 200, 32, 50, 1 | evaluation vs the yardstick and vs random (`eval_random_games` 0: no random match; the reference games still rate the random bot unless `ref_games` is 0) |
+| `elo_games`, `ref_games` | 100, 400 | games per Elo match (checkpoints 1, 2, 4 ... 32 evaluations back, i.e. x `eval_every` iterations; or `elo_offsets`; 0 = no checkpoint-vs-checkpoint matches, with `elo_anchors` the anchor games only: 56.2); random vs yardstick reference games (once per Elo pool) |
+| `elo_opponents`, `elo_sims`, `elo_together` | 0, 0, 0 | cheaper Elo (CPU runs): play only the first k of the offsets 1, 2, 4 ... 32 (0 = all); Elo matches at elo_sims (0 = eval_sims); 1 = an iteration's Elo matches in one driver (one evaluator key per opponent: the checkpoint's batches hold the leaves of every match; other seeds than separate matches) |
+| `elo_offsets` | '' | raw Elo offsets ('1,2,4,8'): each evaluated checkpoint k plays the checkpoints k-1, k-2, k-4, k-8 (those that exist) whatever `eval_every`, instead of evaluations back; `elo_opponents` is then not used; checkpoints never evaluated are rated through these games only and are never `best.pt` (section 5.4). '' = the default above, unchanged |
+| `eval_select`, `eval_select_min_visits` | visits, 0 | the move rule of every evaluation seat (docs/search.md 3.3): 'visits' = argmax (N, P0) (AlphaZero's; the default: today's moves bit for bit) or 'cq' = the argmax of the completed-Q target's logits (with `cq_c_visit`, `cq_c_scale`) among the options with at least `eval_select_min_visits` visits (0 = all). The yardstick, random and Elo matches (here or on the `eval_remote`), co-training's evaluations (the resolver's: `resolver_cfg`), and by default `zero.h2h` / `zero.replay` of the run's checkpoints. Recorded in the evaluations (`select`, absent = 'visits'); one Elo pool per rule (section 5.4) |
+| `selfplay_select`, `selfplay_select_min_visits` | visits, 0 | the same rule for self-play's moves after its first `temp_moves` searched decisions of a game (remote self-play too); the recorded targets stay `policy_target`'s. For a forked A/B run (section 12.4) |
+| `eval_select_c_visit`, `eval_select_c_scale` | unset (None) | the evaluation 'cq' rule's own completed-Q transform: unset = `cq_c_visit` / `cq_c_scale`, the training target's (one knob for both, the behaviour before these settings, bit for bit); a number >= 0 = the rule's own, so a training A/B of `cq_c_scale` no longer changes how the evaluations choose their moves. The rule's name and Elo pool carry the effective value (`cq-n4-v50-s0.3`, `cq-n4` at 50 / 1), so a run with the scale pinned keeps its pool when only `cq_c_scale` changes. The rule 'cq' only (an error with 'visits', as the guard); `none` on the command line unsets a saved value. Every evaluation path follows it (`Run.nn_seat`: yardstick, random, Elo, the `eval_remote`, co-training's evaluations, `eval_yard_net`), and `zero.h2h` / `zero.replay` of the run's checkpoints (sections 5.4, 12.5) |
+| `selfplay_select_c_visit`, `selfplay_select_c_scale` | unset (None) | the same for `selfplay_select` 'cq' (self-play's moves after `temp_moves`, remote self-play too: its checkout must have the setting); the recorded targets keep `cq_c_visit` / `cq_c_scale` whatever these are |
+| `selfplay_root_min_visits`, `eval_root_min_visits`, `root_min_visits_max_actions` | 0, 0, 4 | root minimum visits ("forced playouts", docs/search.md 3.5, section 9.2): a full search whose root has 2 .. `root_min_visits_max_actions` options gives each at least k visits when its budget allows (2 x options x k <= its simulations): the self-play seat's recorded searches (never its fast or minor ones) / every evaluation seat. The forced walks come out of the same budget and are left out of the visit counts (the 'visits' target, temperature sampling, the 'visits' rule) and of the root value target; Q, the 'cq' target and the 'cq' rule use them. The evaluation's floor names its Elo pool (`visits-f4`, `cq-n4-v50-s0.3-f4`; `-f4a6` with max_actions 6), self-play's does not. 0 = off: today's searches bit for bit |
+| `selfplay_leaf_value_view`, `eval_leaf_value_view` | mover, mover | whose view a search leaf's value comes from (docs/search.md 3.6, section 16): 'mover' = the network on the leaf's decider's view (today's searches bit for bit); 'root' = a leaf of another seat than the root decider also sends a value-only row of the root decider's view of the same sampled state (same batch, flagged `ROW_VALUE`), whose value and margin it takes (the priors stay the decider's). The self-play seat (remote self-play too: its checkout must have this core) / every evaluation seat; the evaluation's names its Elo pool (`-rv`), self-play's does not |
+| `eval_infoset_merge` | 0 | 1 = every evaluation seat's trees merge their nodes by the root decider's observation (single-observer information-set MCTS inside the tree: the other seat's nodes subset-armed over the union of its sampled worlds' options, the root decider's next decision one node whatever the other seat was dealt; docs/search.md 3.16). Needs `eval_leaf_value_view` 'root'; names the Elo pool (`-ism`); h2h `--a-infoset-merge / --b-infoset-merge`. Self-play: `selfplay_infoset_merge`. 0 = off (nothing changes) (30) |
+| `selfplay_infoset_merge` | 0 | 1 = self-play's seat merges its trees' nodes by the root decider's observation, every search of it (full, fast, minor; docs/search.md 3.16). Needs `selfplay_leaf_value_view` 'root'; the records, root values, value-only samples and resignation read the root as before; the leaf's viewer row is taken from the merged tree's encoding; remote self-play refuses a worker whose checkout does not merge; metrics `selfplay.merge`. 0 = off (nothing changes) (30.1) |
+| `selfplay_belief_tilt`, `eval_belief_tilt` | 0.0, 0.0 | the root's belief (docs/search.md 3.8, section 18): a full search of the seat asks the network's auxiliary head once for the root's prediction of the hidden cards (one `ROW_BELIEF` row of the root's features) and deals every simulation's world by it (the game's `determinize_with`, weights clip((belief / uniform)^tilt, 1/belief_clip, belief_clip)). The self-play seat (a league opponent's too; remote self-play: a checkout without it is refused at its hello, 18.5) / every evaluation seat (its Elo pool's name gets `-b<tilt>`). Needs a checkpoint with the auxiliary head: one without is refused (`net.HeadMissing`, exit 78; 18.3). 0 = off |
+| `belief_clip`, `belief_mix`, `belief_fast` | 20.0, 0.0, 0 | the belief's clip R (every weight in [1/R, R]), the share of a belief search's simulations still dealt uniformly ([0, 1)), and whether fast and minor searches take it too (section 18) |
+| `selfplay_belief_tilts`, `eval_belief_tilts` | {}, {} | per-target tilts of the root's belief (docs/search.md 3.8.1, section 38): `{target: alpha}`, an auxiliary target of the game whose deal the game tilts by its own alpha (MTG Zero: `deck`, the opponent's whole unseen deck); a seat with one > 0 takes the belief (one row per full search) even with its `*_belief_tilt` 0, `belief_clip` / `_mix` / `_fast` applying. The evaluation's names its Elo pool (`-t<target><alpha>`); a remote self-play worker without it is refused at its hello. {} = off |
+| `selfplay_value_choice_worlds`, `selfplay_value_choice_temp`, `eval_value_choice_worlds`, `eval_value_choice_temp` | 0, 0.0, 0, 0.0 | value choices (docs/search.md 3.17, section 39): at a decision the game marks (`SearchGame::value_choice`: MTG Zero's sealed deck choice) the seat values each option by a one-ply lookahead over this many worlds (the network's value from its own view of the state one decision on) and takes the best mean, or draws by softmax(mean / temp); never recorded. The evaluation's names its Elo pool (`-vc<worlds>[t<temp>]`); a remote self-play worker without it is refused at its hello. 0 worlds = off |
+| `selfplay_view_samples`, `view_sample_target` | 0.0, next_q | value-only samples (section 16): this share of self-play's recorded decisions also records the real state from each other recording seat's view - its perspective, no options (no policy loss), z its result - with q = that seat's next search's root value ('next_q'; z if none) or z ('z'). 0 = off |
+| `selfplay_root_search`, `eval_root_search` | puct, puct | the root search (docs/search.md 3.7, section 19): 'puct' = today's searches bit for bit; 'gumbel' = Gumbel AlphaZero's root - Gumbel noise per root option, sequential halving over the `gumbel_m` options of highest noise + log-prior, the completed-Q sigma - whose move replaces root Dirichlet noise, temperature sampling and the move rule (`*_select`; PUCT stays below the root). Every search of the seat is one (full, fast, minor). The self-play seat (remote self-play and the league seat too: their checkouts must have this core) needs `policy_target` 'cq' (an error otherwise: sequential halving's counts are no policy), its sigma the target's (`cq_c_visit`, `cq_c_scale`); every evaluation seat: sigma the evaluation rule's transform (`eval_select_c_*`, else `cq_c_*`), and its root search names its Elo pool (`gumbel-m16`, `gumbel-m16-v50-s0.3`, `-g1` with noise, `-rv`), self-play's does not. Exclusive with the same side's `*_root_min_visits` (an error). `zero.h2h` / `zero.replay` follow the run's |
+| `gumbel_m`, `selfplay_gumbel_scale`, `eval_gumbel_scale` | 16, 1.0, 0.0 | the Gumbel search's considered options (the paper's and mctx's 16: every option of a smaller root) and its noise scale: self-play's first `temp_moves` searched decisions of a game are searched with `selfplay_gumbel_scale` (1 = the move a sample of the improved policy, the paper's), later ones without - the role temperature had; the evaluation's on every decision (0 = deterministic, the paper's evaluation) |
+| `eval_spec` | '' | the spec of every match that records nothing (evaluation, Elo, reference games); '' = the game package's evaluation spec of the self-play spec (`GamePackage.eval_specs`; MTG: the fixed evaluation deck set), else the spec itself |
+| `eval_remote` | '' | the run's evaluations (yardstick, random, Elo) on another machine while it trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 5.2); `pool:<farm run>`: on zero-farm, section 65). A co-training run: its resolver's `resolver_cfg['eval_remote']` (section 11.5); its own is refused |
+| `eval_pool_deadline_s`, `eval_pool_threads`, `eval_pool_spot`, `eval_pool_games_per_lease`, `eval_pool_poll_s` | 1800, 4, 0.05, auto, 20 | a run's evaluation on the farm, `eval_remote` = `pool:<farm run>` (a farm run of its own, never the self-play pool's; the pool's settings name the worker build, its executable here, runtime, alternates, priority, min_agent, graph; section 65): the seconds after which the games of a batch the farm has not delivered are played here by `pool_worker` (0 = no deadline: wait for the farm), that worker's threads, the share of the farm's games replayed through the engine (at least one a batch), the batches' games per lease ('auto' or a number) and the seconds between result polls; unused unless `eval_remote` names a pool |
+| `selfplay_remote` | '' | self-play on another machine too, with the same checkpoint: both machines pull the iteration's `games` (the total) from one shared queue (`zero/workqueue.py`), its compressed shards join `data/iter_i/` (a name in the game package's `remotes`; '' = off; section 5.3). A comma-separated list = several hosts, each its own workers, mirror and shards, consumers `<name>/w<k>`, metrics `selfplay.remotes` (one name: exactly as before); a name `<prefix>:<arg>` calls the package's callable remote `<prefix>:`; the run directory's `selfplay_remotes` file (one name per line) replaces the list, is re-read at every phase start (hosts join and leave a live run) and alone turns remote self-play on (section 34). A co-training run: its resolver's `resolver_cfg['selfplay_remote']`, a share of the queued episodes (11.6; a list too, never the file); its own is refused |
+| `selfplay_local` | 1 | 0 = while at least one remote worker takes work this machine's driver takes no games (the run's machine only trains: an actor / learner split); with none (offline, backing off, refused, no host listed) it plays the quota itself, so the run never stalls; the switch is logged. 1 = it always takes its share, as before. Single-game runs (34.4) |
+| `pool_build`, `pool_runtime`, `pool_worker`, `pool_url`, `pool_max_stale`, `pool_quota`, `pool_slack`, `pool_games_per_lease`, `pool_priority`, `pool_needs_ram_mb`, `pool_poll_s`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_live_s`, `pool_min_agent`, `pool_alternates`, `pool_alt_vendor`, `pool_gpu_games_per_lease` | '', '', '', '', 1, 0, 0.1, auto, 1.0, 0, 10, '', '', 30, 900, 0.2.8, '', '', '' | the zero-farm pool, a `selfplay_remote` name `pool:<farm run>` (friends' idle PCs through the farm's coordinator; unused without one; section 45): the worker build (required) and its runtime, that build's executable here (its `check-config` picks the signed template's settings), the coordinator ('' = zero.farm_def's), the generations a farm game may lag (accepted into iteration i while its network >= i - 1 - pool_max_stale, else dropped), the coordinator's quota per generation (0 = `games`) and slack, games per lease, the run's farm priority, a lease's RAM, seconds between result polls, the data key and farm-release ('' = zero.farm_def's), the definitions' expiry in days; with `selfplay_local` 0 the pool takes the games while a valid game arrived within `pool_live_s` s; the farm run's `min_agent` (zero-farm PROTOCOL rev 9: its leases go only to agents at or above it; '' = none); the farm run's alternates (PROTOCOL rev 11: worker builds of the same engine signed for another runtime pack, comma-separated, at most 4; '' = none; a macOS build is a CPU alternate of its platform, rev 17, section 62) and the GPU vendor of those whose pack names none; the games of a GPU lease (`selfplay.gpu_games_per_lease`, rev 11: 'auto' or a number; '' = left out) (45.2) |
+| `pool_rolling` | 'auto' | the farm run's rolling self-play leases (zero-farm PROTOCOL rev 15, section 10: `selfplay.rolling`): a JSON object of `inflight`, `gpu_inflight` (1 to 4,096 or `auto`), `block`, `max_s`, `flush_s`, or `auto` = both in-flight counts `auto`; the worker build must announce the feature `rolling`, and the pool then judges staleness per row (rows of a network older than i - 1 - `pool_max_stale` dropped, the rest of the game kept); '' = off: classic leases, every PUT and judgement as before - and what a worker build without the feature needs (the pool refuses it while this is set); the default 'auto' since 2026-11-17 is a deliberate change (54.7); it matters only with a farm pool (`selfplay_remote` names `pool:`) (54) |
+| `pool_export` | '' | the graph the farm pool exports each generation as (`zero.onnx_export.GRAPHS`): '' the default graph, as before; 'fast' the fast zero-onnx/2 graph - TokenNet's own arithmetic, the same interface (plus the optional input `t_align`, 66), metadata (plus `fast`, `attention`, `t_align`) and answers within the parity gate's 2e-5, about half the CPU time (MultiHeadAttention, opset 17); 'fast-att23' (ONNX's opset-23 Attention: the fastest on the CPU, but the CUDA pack runs a dozen of its operators on the CPU) and 'fast-matmul'; each variant its own weight-swap template (its fingerprint); trainer-only: no worker build needs it; it matters only with a farm pool (63) |
+| `pool_variants` | '' | model variants the farm pool exports and registers beside each generation's graph (zero-farm PROTOCOL rev 20, 14): 'name=form[@vendor],...' (forms: 'fp16' - `onnx_export.to_float16` of the gen's graph; 'matmul' - the gen exported as graph 'fast-matmul', float32: the AMD GPUs' DirectML variant; 'matmul-fp16' - that graph in float16: DirectML on NVIDIA / Intel, 46.10); each signed in the definition (`checkpoints[gen].variants`) and registered (`variants`), the run's GPU alternates naming theirs (`model`: the variant of their vendor, else the first without `@vendor`), so with 'gpu=fp16,dml=matmul@amd' CUDA PCs play the fp16 graph, AMD PCs (DirectML) the float32 MatMul one and every other machine the default; raises the run's min_agent to 0.3.5 (agents before it refuse such a definition: the stable channel must have 0.3.5 first); trainer-only (67) |
+| `selfplay_local_reason` | '' | why the run's self-play stays on this machine although the game package has a published farm build for its commit (`GamePackage.farm_build`): free text, logged at every start. Required (else refused, exit 78) at a fresh start and at a fork's first start when there is such a build and self-play names no farm pool; a resumed run only warns. `$ZERO_SELFPLAY_LOCAL_REASON` stands in for it (test harnesses, smokes; not saved). Trainer-only (70) |
+| `selfplay_remote_procs`, `selfplay_remote_wait` | 0, 30 | worker processes on the remote (0 = the remote's `selfplay.procs`, else 1); once STOP is there, the seconds the end of a phase still waits for the remote's last shards (later ones are dropped, the phase marked `cut`); without STOP it waits for every one (47.4; before 2026-11-12 this bound applied always) |
+| `selfplay_remote_inflight` | 1.0 | each machine's in-flight cap, in iterations of its own measured throughput (its share of the iteration's games or matches x this; 5.3) |
+| `selfplay_remote_batch`, `selfplay_remote_batch_inflight` | auto, 2.0 | the batch-bound consumers (`auto`: this machine's driver when its inference is CUDA / MPS, and every remote worker on any device (56.1) - their network batches grow with their games in flight; `local`, `remote`, `all`, `none`): such a consumer's cap is its slots while its games take at most `selfplay_remote_batch_inflight` iterations (its share x this; 1 = as the others; 5.3) |
+| `selfplay_remote_linger` | 0 | 1 = the workers play on with their checkpoint between phases (while the run trains); those games count for the next iteration, one checkpoint stale (5.3) |
+| `selfplay_local_linger` | 0 | 1 = this machine's self-play plays on too while the run trains (a thread; CUDA batches on their own stream): its finished games count for the next iteration, one checkpoint stale, as the remote's linger (5.3, 10.10). Needs `selfplay_remote`; single-game runs without the league |
+| `shard_writer_thread`, `shard_writer_queue_mb` | 0, 4096 | 1 = self-play's training records are converted and written into shards on a writer thread of their own (`zero/shardthread.py`): the thread that drives the search only takes them (`SearchDriver.take_records`: moved, not copied), splits them per game and queues them, at most `shard_writer_queue_mb` MB (it waits while the queue is full, counted). The same shards byte for byte; the caller's timing changes which games finish when (a rolling or shared quota's). This machine's self-play (plain, rolling, the shared queue), the local linger and the remote's workers (their config's); metrics `selfplay.shard_writer`, `linger.samples_s`, `selfplay.remote.shard_writer`. Single-game runs (co-training refused). 0 = taken, converted and written between batches, as before (31) |
+| `selfplay_remote_giveback`, `selfplay_remote_overdue`, `selfplay_remote_timeout` | 30, 3, 3600 | co-training (11.6): a worker backing off this many seconds gives its outstanding matches back; a match outstanding on a worker longer than this many of its expected latencies (at least 120 s; 0 = the timeout only) is requeued, and at the latest after `selfplay_remote_timeout` s of the worker's running time |
+| `infer_device`, `train_device`, `seed` | cpu, cpu, 0 | inference / training device (`cuda` works; the GPU is shared), run seed. A `cuda` / `mps` device (also `heldout_device`) the machine does not have refuses the run at its start (exit 78, 47.7; before 2026-11-12 training fell back to the CPU in silence) |
+| `infer_workers` | 1 | network batches evaluated concurrently on this many Python threads, with as many in flight (give the driver as many `groups`); CPU inference of a small network (section 10) |
+| `infer_precision` | 'fp32' | 'bf16' / 'tf32' = the run's own CUDA evaluators (self-play, league seats, evaluation and Elo matches; zero.h2h `precision`) compute in bfloat16 autocast / with TF32 matmuls: their answers move by that rounding; a remote worker and a CPU / MPS evaluator stay float32 (57) |
+| `train_tf32` | 0 | 1 = the training step's float32 matmuls as TF32 on CUDA (57) |
+| `game_records` | 0 | 1 = every self-play game an iteration's quota accepts - this machine's, the remote workers', the farm pool's - kept as what replays it (seed, every move, setup, spec, outcome, resignation, networks) in `<run>/records/iter_NNNN/*.jsonl.gz` (`zero/gamerec.py`), outside the training window, for a game database; read from the driver's game log (docs/search.md 2.20): the same games, search, shards and checkpoints byte for byte; metrics `selfplay.records`. With it every other game the run plays is kept too: its evaluations' (`eval`, `elo`, `anchor`, `ref`; a remote evaluation's copied back) in `<run>/records/<kind>/iter_NNNN/`, each record naming both players in their seats (59.3); every records file names the engine that played it (59.4). 0 = none, as before (59) |
+| `dup_action_reduce` | 'legacy' | 'max' = a token network scores an action two of its tokens claim (two equal cards' identity action) by the largest claim - the same answer on every device and in the farm's export; a network property recorded in the checkpoint (a new run's network built with it, a fork's / resumed run's at its next training); 'legacy' = the plain scatter (CUDA keeps an undefined claim) (58) |
+| `sparse` | 0 | 1 = the run's drivers (self-play and matches) send sparse network batches (each row's non-zero features; docs/search.md 2.2): the same rows, games and samples; a token network's CUDA graphs scatter them on the device, other evaluators densify them (10.7) |
+| `eval_cache` | 0 | N > 0 = every network seat (self-play and evaluation) keeps its game's network answers, at most N per game, by a hash of each row's features and options, and answers a repeated row from them instead of sending it (docs/search.md 3.12; the same answers up to float rounding at another batch shape) (25) |
+| `eval_trace` | 0 | 1 = a native eval job's rows carry each game's record and its digest (zero-farm analysis campaigns: every real move, replayed on the desktop); the Python match refuses it; games unchanged (50) |
+| `resolver` | '' | co-training (section 11): the resolver game, whose episodes decide this game's deferred terminals ('' = a single-game run: this loop, line for line) |
+| `resolver_cfg` | {} | the resolver's settings (a JSON object of these same settings: spec, players, network, search, training, evaluation; `preset` names one), saved nested in config.json; resolved into `<run>/resolver/config.json` |
+| `resolver_init` | '' | the checkpoint the resolver's network starts from ('' = fresh); a single-game run's checkpoint works (widened if the game grew) |
+| `resolver_conc`, `pending_max` | 0, 0 | resolver episodes in flight in self-play (0 = its `conc`); the backpressure: resolver episodes queued or playing at which the primary's self-play waits (0 = 2 x in flight) |
+| `draft_eval_net_every` | 4 | the primary's evaluation also plays its episodes with the resolver's network on evaluated iterations that are multiples of it (`eval_yard_net`; 0 = never); the rest of its evaluation plays them with the resolver's yardstick |
+| `draft_eval_net_remote` | '' | those events (`eval_yard_net`) on another machine while the run trains: a name in the game package's `remotes` (`local` = this machine, the tests; '' = here; section 11.7); their results in the run's `evals.jsonl` |
+| `selfplay_league` | 0.0 | the self-play league (section 14): this share of the self-play games (exactly, over each driver's started games) puts a past checkpoint of the run in one seat; only the current network's decisions become samples. 0 = off (every game the current network's mirror, as before). Single-game runs (co-training refuses it) |
+| `selfplay_league_pool` | '2,4,8,16,32' | the past checkpoints it may play: raw iteration offsets back from the network that self-plays (iteration i self-plays with i-1: offset 2 = checkpoint i-3), those that exist; 'all' = every earlier checkpoint (fictitious self-play) |
+| `selfplay_league_slots`, `selfplay_league_pick` | 1, uniform | past checkpoints per iteration (one evaluator key each: 'L0', 'L1', ...), picked from the pool every iteration: 'uniform', or 'pfsp' (weight (1 - x)^2, x = the current networks' recent score against that checkpoint, from the metrics) |
+| `selfplay_branch`, `selfplay_branch_moves`, `selfplay_branch_temp`, `selfplay_branch_differ` | 0.0, 3, 2.0, 0 | branched self-play games (section 24, docs/search.md 2.11): this share of the games each spawn one branch game from a copy of their state at a uniformly drawn decision of theirs - 1..`moves` deviation moves sampled from the network's priors at temperature `temp` (never recorded; `differ` 1: the first never the game's own move), then normal self-play, its rows' z its own outcome; a branch counts as one of the iteration's games. 0 = off (nothing changes); needs rolling self-play (`rolling` 1 or `selfplay_remote`); single-game runs without the league |
+| `selfplay_branch_rule`, `selfplay_branch_eps`, `selfplay_branch_n_min`, `selfplay_branch_p_min`, `selfplay_branch_q_lo`, `selfplay_branch_q_hi` | 'uniform', 0.02, 4, 0.02, 0.1, 0.9 | near-tie branches (section 72, docs/search.md 2.11.1; with `selfplay_branch` > 0): 'neartie' draws the branch point among decisions where the runner-up (visits >= `n_min`, prior >= `p_min`) has a root Q within `eps` of the played move's, whose Q is in [`q_lo`, `q_hi`]; the branch plays that runner-up (one deviation), and ends with its game's outcome where it reaches one of its game's later states (the game's `merge_key`). 'uniform' = the branched games above (nothing changes) |
+| `selfplay_archive`, `selfplay_archive_p` | '', 0.1 | archive starts (section 24): this share of the games start from a position of the archive file (format 'zero-archive/1', built for the run's spec by the game's own tool: MTG Zero's `tools/delver_archive.py`) instead of a new deal. '' = off |
+| `selfplay_resign_t`, `selfplay_resign_k`, `selfplay_resign_noresign` | 0.0, 5, 0.1 | self-play resignation (section 27, docs/search.md 3.14): t > 0 = a self-play game ends when `k` consecutive full searches (the recorded ones; never fast or minor) found one seat's root win estimate >= 1 - t, the same seat each time, scored as that seat's win, every record kept (z the resignation's); this share of the games (a hash of seed and game) never resigns and reports where it would have (`selfplay.resign`: the live wrong-resignation rate; 1 = a dry run). Evaluations never resign. 0 = off (nothing changes); two-player single-game runs without the league |
+| `aux_<name>_w` (one per target the game package declares: the toy's `aux_next_card_w`, MTG Zero's `aux_belief_w`) | 0.0 | an auxiliary training target (section 15): > 0 = self-play records the game's per-decision target with every sample (shard key `aux`), the network gets an auxiliary head (a new run's first network; added to a checkpoint without one at its next training, everything else exactly as it was) and training adds this weight x the target's loss. 0 = off: nothing recorded, built or trained, the run of before bit for bit (section 15.6) |
+| `reader_<target>` (one per reader the game package declares: the toy's `reader_next_card`) | 0 | a reader (section 36): 1 = the network gets the game's reader of that auxiliary target - a small MLP reading declared features (a token network: bags and globals) whose prediction is trained by the target's loss (needs `aux_<target>_w` > 0, its weight) and is also an input of the trunk (a new run's first network; added to a checkpoint without it at its next training, every output unchanged; a checkpoint with another reader, or with one in a run that turns it off, is refused). 0 = off: the network of before bit for bit (section 36.6) |
+| `reader_detach` | 1 | 1 = a reader's prediction enters the trunk detached: only its target's loss trains the reader (section 36.4); 0 = the trunk's losses train it too |
+| the game package's own settings (`GamePackage.settings`; MTG Zero's `real_decks_every`, `real_decks_pools`, `real_decks_games`, `real_decks_builder`, and its deck evaluator's `evaluator_every`, `evaluator_window`, ..., `deckchoice_eval_games`) | the package's | run settings a game package declares for its own features (section 40): a flag each, saved in config.json, shipped to a remote evaluation's mirror; an extra evaluation's cadence (`GamePackage.evals_every`: it runs on the evaluated iterations that are multiples of the setting, never at 0). A package without them: none |
+
+## 2. Run control (`runctl.py`)
+
+* **STOP** (file in the run dir): the run ends after the current iteration; the supervisor
+  exits with it (a stale STOP is moved to STOP.old when a supervisor starts).
+* **PAUSE**: a watch thread notices the file within 0.5 s; the run stops at its next pause
+  point - after every self-play / evaluation batch (`drive(check=...)`) and every training
+  step - writes `run_state.json` (state `paused`) and exits with status **75**. The
+  supervisor then polls PAUSE every second and relaunches the run the moment it is removed
+  (not a crash: no delay, no back-off); a run started while PAUSE exists exits 75 at once.
+  Measured in `tests/test_loop.py`: paused mid self-play and exited in a few seconds.
+* **PAUSE_NEXT** (56.3): pause at the next iteration boundary instead - the current iteration finishes (its
+  self-play phase with every remote shard, training, checkpoint, evaluation, metrics row), nothing of the next one
+  starts (no remote head start, no lingering), then the run creates PAUSE itself and exits 75 as above.
+  `tools/pause_run.py --wait` asks for it and waits; `--now` is the immediate PAUSE. Removing PAUSE resumes; removing
+  PAUSE_NEXT before the boundary cancels it.
+* **Refused** (exit status **78**, `runctl.EXIT_REFUSED`): the run's checkpoint is a network of
+  another encoding than this build's (the encoding guard, section 10.4); state `refused`, and the
+  supervisor ends instead of restarting it.
+* **Resume semantics**: an iteration interrupted before its checkpoint is replayed from the
+  start (its data directory is cleared) - unless its self-play phase had finished: then
+  `data/iter_N/DONE.json` records the phase and its shards, and a resume that finds the directory
+  exactly as recorded trains on it instead of playing the phase again (47.1, 2026-11-12); one
+  interrupted after the checkpoint was written (`models/iter_N.json` holds its self-play / training
+  stats) finishes its evaluation and Elo matches on restart. Self-play games in progress are
+  dropped (the toy: seconds of work).
+* **The supervisor gives up on a deterministic failure**: the same crash (the run's error text in
+  `run_state.json`, decimals masked) `<P>_SUPERVISE_SAME_CRASHES` times in a row (default 3; 0 =
+  never) ends it with state `refused` and the error (47.2).
+* `run_state.json` / `supervisor_state.json` (pid + creation time, state, timings) feed
+  `runctl.run_status` (running / stopping / pausing / paused / resuming / starting /
+  restarting / stopped), shown on the dashboard with Pause / Resume buttons and by
+  `tools/pause_run.py --status`.
+
+## 3. Files in a run directory
+
+| Path | Content |
+|---|---|
+| `config.json` | the resolved settings |
+| `log.txt`, `stdout.txt` | the run's log; console output (UTF-8) under the supervisor |
+| `metrics.jsonl` | one line per iteration: `selfplay` (games, samples, decisions / rounds per game, avg score, leaves/s, games/h, inference time, average batch; `rolling` stats; `target`: kind, mean options, normalised entropy `h_norm` = H(pi) / ln(options) and `max_share` of the recorded policy targets; `remote`: the remote's share with `selfplay_remote`, and `queue`: the shared queue's quota, caps, rates and staleness histograms, section 5.3; `league`: with `selfplay_league`, section 14; `view`: with a root-view setting on, the value-only rows sent and samples recorded, section 16; `belief`: with `selfplay_belief_tilt` on, the root belief rows sent and their share of the searched decisions, section 18), `train` (policy / value / margin loss, entropy, value accuracy, steps, window samples / MB / load time, lr, value_q, samples/s; with an auxiliary target on, `aux_<name>` its loss, `aux_<name>_hit` a multinomial target's top-1 hit rate, and `aux`: rows with targets and their share, per multinomial target its mean total and non-empty share, the weights, `head_added` the iteration that added the head, section 15, `head_widened` {from, added} the iteration that widened it and per target its `rows` while the window holds shards of an older layout, section 37; with a reader on, `reader_<target>` its loss, `reader_<target>_hit`, and `readers`: the targets, `detach`, `added` the iteration that added them, section 36); with value-only samples in the window (section 16): `value_view` / `value_decision` (the value loss on each kind of row) and `window_view_samples`, `eval_yard` / `eval_random` (win, se, margin, games; `select`: the move rule unless 'visits'; with `eval_games` 0 `eval_yard` has 0 games: the iteration is still evaluated, section 20.1), `elo` (`select`: its pool unless 'visits'), `elo_anchored` (with `elo_anchors`: the rating of the fit with the anchors fixed, section 20.1), `heldout` (with `heldout_shards`: the held-out losses, section 20.2), `phases` (seconds per phase), `seconds` |
+| `models/iter_NNNN.pt` | checkpoints (atomic; `extra['aux_older']`: the layouts a widened auxiliary head had, section 37); `best.pt` = highest rated (in the current rule's pool, among the checkpoints evaluated in it: section 5.4); `index.json` = every checkpoint's Elo in that pool (`select` unless 'visits'; `"evaluated": false` for one rated only through Elo matches: raw offsets, or a rule's pool begun mid-run); `opt_latest.pt` = optimizer state (with the iteration it belongs to); `iter_NNNN.json` = stats of an iteration whose evaluation has not finished |
+| `data/iter_NNNN/DONE.json` | the iteration's self-play phase finished: its metrics, seconds and every shard (bytes, rows) of the directory (47.1); a resume before the checkpoint trains on the directory when it matches |
+| `data/iter_NNNN/*.npz` | sample shards (docs: `zero/data.py`; with an auxiliary target on, the key `aux`: section 15; with `shard_sparse` the features as `x_ptr` / `x_idx` / `x_val` instead of `x`: section 32): this machine's `c00_SSS` / `r00_SSS`, a remote's `m<KK>-<sid>_SSS` (compressed; section 5.3); the newest `keep_data` iterations are kept |
+| `debug/` | only after a non-finite failure (section 4.1): `iter_NNNN_<task>_SSS.bad.npz` (a quarantined shard; a remote's: `iter_NNNN_m<KK>-<sid>_SSS.bad.npz`, `remote_*.bad.npz`, section 5.3) and `nonfinite_iter_NNNN_step_SSSS.pt` (a failing training batch); never rotated or cleared by the run |
+| `elo/results.json`, `elo/ratings.json` | pair results (`{"a|b": [score of a, games]}`, anchor, `logged`: the checkpoints whose evaluations are in) and the current fit: the Elo pool of the move rule 'visits' (every run's pool from before `eval_select`) |
+| `elo/<rule>/results.json`, `elo/<rule>/ratings.json` | the pool of another evaluation move rule ('cq', 'cq-n2', ...; section 5.4): the same files, plus `select` (the rule) and `since` (the first iteration it rated) |
+| `elo/[<rule>/]anchored.json` | with `elo_anchors` (section 20.1): the anchors (label, file, sha256, fixed rating and how) and every player's rating in the fit with them fixed; the pool's `results.json` then also holds `anchors` and the anchors' games (`anchor:<label>` players) |
+| `evals.jsonl` | with `eval_remote` (section 5.2): one line per remote evaluation `{iter, eval_yard, eval_random, elo, time, host, seconds}` (+ `elo_anchored` with `elo_anchors`), merged into the iterations' rows by the dashboard; a co-training run's resolver: `resolver/evals.jsonl` (11.5); a co-training run's primary with `draft_eval_net_remote`: `{iter, eval_yard_net, time, host, seconds, remote_s}` (11.7) |
+| `progress.json` | self-play progress of the iteration in flight (dashboard); a co-training run's also has `events_resolved`, `target`, `drafting`, `pending_events`, `matches_queued`, `matches_in_flight`, `matches_done` (section 11); with `selfplay_remote`: `remote` (single-game) or `matches_remote` (co-training), sections 5.3, 11.6 |
+| `resolver/` | a co-training run's resolver network (section 11): the same layout (`config.json`, `metrics.jsonl`, `models/`, `data/`, `elo/`, `debug/`, `progress.json`), iteration numbers shared |
+| `run_state.json`, `supervisor_state.json`, `supervisor.log`, `PAUSE`, `STOP` | run control |
+
+## 4. Training
+
+Each iteration trains the previous checkpoint on the window (newest iterations' shards,
+loaded into RAM; uniformly subsampled per shard beyond `ram_budget_gb` - the rate from the shards'
+row counts, each shard subsampled as it is read, so loading needs the window plus one shard:
+before 2026-10-28 every shard was read first, a peak of the whole window's size) for
+`max(min_steps, new samples x reuse / batch)` minibatch steps (uniform with replacement).
+Loss = policy cross-entropy against the recorded policy target - the visit distribution, or
+the completed-Q target with `policy_target='cq'` (section 9) - (log-softmax over the legal
+actions only; a value-only sample, section 16, has none and is left out of its mean) + value cross-entropy against `(1 - q) z + q q_root` (softmax over the seats
+present) + `margin_loss_w` x 0.5 x squared margin error over the seats present. AdamW, grad
+clip 5, step-decay LR, warmup while the optimizer state is fresh. Feature-width changes are
+handled by prefix reads (an older network reads the first columns) and `widen` (fork_run; a token
+network across a change of its object layout: section 10.3).
+
+### 4.1 The non-finite guard (`zero/finite.py`)
+
+A NaN or inf anywhere between self-play and a checkpoint fails the run instead of poisoning it.
+MTG Zero's run mtg4 (2026-10-27) took one NaN training step at iteration 30 (bfloat16 autocast,
+clip 5; the trigger is unknown: that iteration's shard had been rotated out), saved a checkpoint
+whose 93 float tensors were all NaN (iteration 29's were clean, max |w| 1.23) and ran on for 10
+iterations of turn-capped self-play with NaN targets and all-draw Elo matches: nothing checked.
+
+| Where | What is checked | On failure |
+|---|---|---|
+| `write_shard` (self-play) | `x`, `pi`, `z`, `q`, `sc` after the float16 cast (an encoder value above 65504 becomes inf) | the shard is written to `<run>/debug/iter_NNNN_<task>_SSS.bad.npz` (meta + `nonfinite`), not to `data/`; `NonFinite` names the arrays, rows (pi: the sample rows of its option entries), columns (x; z / q / sc: seats), NaN / +inf / -inf counts and the shard's meta |
+| `Window` (training) | the same arrays of every shard it loads, before subsampling: shards written before the guard too | `NonFinite` naming the shard path and the same details; nothing is moved (move the shard out of `data/`, or rename it `*.bad.npz`, to train without it) |
+| every training step | the policy, value and margin losses and the total gradient norm returned by `clip_grad_norm_`, before `optimizer.step()` | the batch is saved to `<run>/debug/nonfinite_iter_NNNN_step_SSSS.pt` (the tensors fed to the model, window rows, shard paths + rows of every batch row, per-sample losses, the weights before the step, lr, value_q, amp); `NonFinite` names the iteration, the step, the non-finite terms, whether the batch inputs and the weights are finite, and the shard rows of the batch rows whose per-sample loss is non-finite (all of the batch's shards when only the gradient is) |
+| `net.save`, the optimizer state | every float tensor (one sync per device) | `NonFinite` before either file is written (the optimizer state is checked first) |
+
+`NonFinite` is an uncaught exception: the run logs `run aborted: NonFinite: ...` to `log.txt`,
+writes `run_state.json` state `aborted` and exits with status 1 (traceback on stderr). The
+supervisor treats it as a crash: it restarts the run after 60 s (15 minutes once 5 crashes fall
+within an hour), and the restart replays the failed iteration from its self-play (no checkpoint
+was written), so a deterministic cause fails again, once per replayed iteration, until someone
+looks. A quarantined shard and the debug batches stay in `debug/`: `keep_data` rotation and an
+iteration replay never delete `debug/`, and they move a `*.bad.npz` found in a data directory
+there instead of deleting it. The window never loads `*.bad.npz` (`shard_paths` skips it).
+
+Cost (desktop, 2026-10-27): the shard check runs on the float16 bits in 1M-element chunks, about
+6.5 GB/s on one core: 0.70 s for a real-sized MTG shard (65,536 rows x 33,750 features, 4.43 GB;
+about 11 us per sample) on top of a 5.7 s write, and 0.72 s on top of a 3.3 s read (the Window
+loads that shard in 6.5 s). The step check is one device sync: about 12 us on the CPU, about
+0.1-0.2 ms on CUDA (+2.4% of a 9 ms MLP step on the shared GPU; less for larger networks). A
+normal run is bit-identical (toy-smoke, 3 iterations: the same losses, checkpoints and optimizer
+state as before the guard). Tests: `tests/test_nonfinite.py`.
+
+## 5. Evaluation and Elo
+
+Every `eval_every` iterations the checkpoint plays `eval_games` against the yardstick and
+`eval_random_games` against the random bot (seats alternating, network at `eval_sims`); then
+Elo matches against the checkpoints 1, 2, 4, 8, 16, 32 evaluations back (`elo_games` each);
+the random bot is rated once against the yardstick (`ref_games`). All results are refit by
+Bradley-Terry maximum likelihood (weak Gaussian prior) with the yardstick at 1000 after every
+iteration; `models/index.json` and `best.pt` follow the fit. The network seats search with
+`eval_sims`, no noise, no temperature, and choose their moves by `eval_select` (section 5.4).
+
+Matches with an external player (the JS bot) run with `ext_groups` groups, and `infer.drive`
+answers the external batches on worker threads while the driver searches and evaluates the
+other groups (docs/search.md 2), with the same games as answering them inline (tested).
+Measured in Caverna Zero 2026-10-12 with `runs/cvz2p` iteration 167, the run's evaluation settings (200 games
+vs `ext:jsbot`, 64 sims, chance_k 2, CUDA inference on the GPU shared with two training runs),
+3 search threads, 4 JS-bot processes:
+
+| drive loop | groups | seconds | network calls | average batch | inference s |
+|---|---|---|---|---|---|
+| inline (before) | 2 | 129.2 | 20,445 | 57.6 | 53.0 |
+| async | 2 | **110.2** | 20,445 | 57.6 | 57.2 |
+| async | 4 | 127.7 | 38,556 | 30.6 | 105.2 |
+| async | 8 | 186.0 | 67,858 | 17.4 | 178.6 |
+
+Every configuration played the same 200 games (scores, steps and bot moves identical; 197/200
+wins). Caverna's JS bot is fast (~18 ms per decision), and a CUDA call costs ~2.6 ms whatever
+its batch on the shared GPU, so more groups cost more in inference calls than they hide in bot
+latency: `ext_groups` 2, the core default. (Glass Road Zero's bot takes ~0.1 s per decision: there
+8 groups cut 200 games from 12.4 to 3.75 min, so its package sets `ext_groups` 8.)
+
+
+### 5.1 Dashboard (`python -m <pkg>.az.dashboard --host 0.0.0.0 [--port P]`)
+
+One per game (hub projects `caverna_zero` :5260, `glassroad_zero` :5280: the package's
+`dashboard_port`; title from the package; runs from `<repo>/runs` or `--runs`). Run selector; run state with Pause / Resume; status line
+(self-play progress, last log line age, STOP); tiles (iteration, newest / best Elo - the best an
+evaluated checkpoint's -, win rate vs the yardstick and vs random, self-play games, leaves/s);
+charts: Elo by iteration (yardstick and random reference lines; the current evaluation rule's
+pool, and the run's other pools as their own lines: section 5.4), win rate vs yardstick and
+random, each checkpoint vs the previous
+one, losses, self-play average score, leaves/s, minutes per iteration by phase; head-to-head
+table of the newest checkpoint with the Elo prediction; iteration table; log and supervisor
+tails. With no runs it shows how to start one. Endpoints: `GET /api/runs`,
+`GET /api/run/<name>`, `GET /api/run/<name>/control`, `POST /api/run/<name>/pause|resume`
+(JSON body required; only plain names of run directories under `--runs`). A co-training run
+(section 11.3a): a tab per network (`/api/run/<name>` adds `resolver`: its config, metrics, Elo),
+the co-training progress and tiles; a run whose metrics hold `extras` (`GamePackage.evals`):
+an "Other yardsticks" chart. Single-game runs render as before. Remote evaluations (5.2): each
+network's `evals.jsonl` is merged into its rows (`resolver/evals.jsonl` into the resolver's tab).
+
+### 5.2 Remote evaluation (`zero/remote.py`, run setting `eval_remote`)
+
+`eval_remote <name>` (a remote of the game package, `GamePackage.remotes`; `local` = this machine,
+the tests) moves a run's evaluations - the yardstick and random matches, the package's other
+yardsticks, the Elo matches and reference games - to another machine while the run trains
+(Kingdom Builder Zero's and MTG Zero's runs evaluate on the MacBook this way).
+
+* **Local side** (`RemoteEval`, a thread of the run process): `finish_iter` appends the
+  iteration's metrics row without an evaluation and queues each evaluated iteration
+  (`eval_every`); the thread ships what the evaluation needs to the remote's **mirror** of the
+  run, `<workdir>/<run name>` (config.json: the run's settings with `eval_remote` '' and the
+  remote's `overrides`; every checkpoint the Elo matches may play, each copied under a temporary
+  name and renamed; for a new mirror the run's `elo/results.json` and `metrics.jsonl`, so the
+  remote continues a run evaluated here so far), runs `python -m <pkg>.az.remote eval <mirror>
+  <iter>` in the remote's `repo` (ssh, `BatchMode`), appends the result to the run's
+  **`evals.jsonl`** (`{iter, eval_yard, eval_random, elo, time, host, seconds}`) and copies the
+  mirror's `elo/results.json`, `elo/ratings.json` and `models/index.json` back: the remote owns
+  the run's Elo while `eval_remote` is on. `models/best.pt` follows it: the checkpoint the
+  returned index.json names best is copied to best.pt from the run's own `models/` (as
+  `elo.tag_checkpoints` does where the pool is fitted; before 2026-11-11 best.pt was left at the
+  last local evaluation's). The game package's **files of the evaluation**
+  (`GamePackage.remote_eval_files`: per game, mirror-relative paths formatted with `iter`, a `*` in
+  the last component matching any characters; MTG Zero's game log of the evaluation's games,
+  `games/eval-iter_{iter:04d}-*.jsonl`) are copied to the same paths in the run before the result
+  is recorded; a path with no file, or a file that does not arrive, fails the evaluation (logged,
+  retried). The package's remote side writes them; a package without `remote_eval_files` copies
+  what it did before.
+* **The package's other yardsticks** (`GamePackage.evals`, run by `Run.evaluate` on the remote): their
+  `extras` come back in the evals.jsonl row beside eval_yard (and the log names each, `iter N <name> (remote
+  <host>): ...`), as a local evaluation records them in metrics.jsonl; the dashboard merges them (section 40;
+  before 2026-11-11 they were computed on the remote and dropped).
+* **Remote side** (`zero.remote.main`): `Run.evaluate` + `Run.elo_update` on the mirror (the
+  run's own code), with the remote's `<workdir>/overrides.json` (if any) over the mirror's config;
+  **one evaluation at a time per workdir** (the lock directory `<workdir>/.eval.lock`, freed when
+  its owner is dead or after 4 hours); the result printed as one line `ZERO_REMOTE_RESULT {json}`.
+  A checkpoint of another encoding than the remote checkout's is refused there (the encoding
+  guard, 10.4): exit 78 and one line `ZERO_REMOTE_REFUSED {"error": ...}`, logged here in full.
+* **A failure never blocks training**: an evaluation that fails (the remote asleep or
+  unreachable, its checkout refused) is logged (`remote eval <name> iter N: ...; retry in 300s`)
+  and retried every `RETRY_S` (300 s) on the thread; later iterations queue behind it.
+* **Restart**: the evaluated iterations without a result (no `eval_yard` in metrics.jsonl, no row
+  in evals.jsonl) are queued again. A run that has finished its iterations waits for its queue
+  (progress phase `remote evaluations`, rewritten every poll) with no time limit unless STOP exists;
+  STOP during that wait logs the iterations not recorded and ends the run aborted, never `done`
+  (47.3; before 2026-11-12: at most 6 hours, then `done` with the evaluations missing and no line).
+* **On or off at a restart**: `--eval-remote <name>` (the evaluations made here so far are kept:
+  a new mirror starts from them) or `--eval-remote ''` (the run evaluates here again, from its
+  `elo/` as the remote last left it).
+* **A remote**: `{host: 'user@host' | 'local', repo, python, workdir, env: {...}, overrides: {run
+  settings}}`; a package may give a Mapping that resolves when the run starts (MTG Zero's
+  `RunCommitRemote`: the remote's checkout of exactly the run's commit, checked before every
+  evaluation).
+* **The move rule** (section 5.4): the mirror's config.json carries `eval_select`, so the remote
+  plays the run's rule with the run's code; its result's `eval_yard.select` must name the run's
+  rule ('visits' when absent), else it is refused before anything is recorded (an older checkout
+  that ignores the setting; logged and retried like any failure). The copies back are the pool's
+  (`elo/` or `elo/<rule>/`); a rule's new pool on an existing mirror keeps the mirror's
+  metrics.jsonl (only a mirror without one gets the run's). With `elo_offsets` every raw-offset
+  opponent is shipped too.
+* **Co-training runs**: the resolver's evaluation on a remote, section 11.5.
+* **On the farm** (`eval_remote` = `pool:<farm run>`, 2026-11-19): the same mirror, on this machine, its matches played as eval batches of a farm run by friends' PCs and the owner's farm machines; section 65.
+
+Tests: `tests/test_loop.py` (`test_remote_evaluation_local`, `..._continues_a_local_run`),
+`tests/test_select.py` (the rule on a remote, a refused result, raw offsets shipped) and
+`tests/test_cotrain.py` (11.5).
+
+### 5.3 Remote self-play (`zero/remoteplay.py`, `zero/workqueue.py`, run setting `selfplay_remote`)
+
+`selfplay_remote <name>` (a remote of the game package, the same `GamePackage.remotes` entry as
+`eval_remote`; `local` = this machine, the tests; **several hosts** - a comma-separated list, or the run
+directory's `selfplay_remotes` file re-read at every phase start, hosts joining and leaving a live run - and
+`selfplay_local` 0, the run's machine only training: section 34) gives a run a second producer of each
+iteration's samples: this machine and the remote's workers **pull the iteration's work from one
+shared queue**, all searching with checkpoint i-1, and the remote's sample shards come back into
+`data/iter_i/`. MTG Zero's MacBook self-plays 3-6 times as fast as the shared desktop (its
+ENGINE.md 50.3, 52, 56). A co-training run gives its resolver's queued episodes to the remote
+instead (11.6), through the same queue model. A worker whose checkout reads another encoding
+than the run's checkpoints refuses them (the encoding guard, 10.4): the run logs `worker <k>
+REFUSED the run's checkpoint ...` and plays on alone.
+
+* **One pull model** (`zero/workqueue.py`, since zero-core's `feat/shared-queue`; it replaces the
+  first design's "this machine's quota + whatever the remote finished"). An iteration needs `units`
+  of work in total: a single-game run's **`games` - the finished games of the iteration across
+  every machine** - or a co-training run's matches (its `games` events x their matches, 11.6). Each
+  **consumer** - this machine's driver (`local`) and every remote worker (`w0`, `w1`, ...) - takes
+  work as it has room under its **in-flight cap**, what it finishes in one iteration's running time:
+
+  ```
+  cap = clamp(ceil(inflight x rate x (lead + P)), lo, hi)      P = (units - sum(rate x lead)) / total rate
+  ```
+
+  `rate`: the consumer's measured throughput, units per second of its running time (back-offs
+  excluded), an EWMA over its phases (weight 0.5), estimated as its leaves per running second over
+  the iteration's leaves per finished unit - so a consumer whose games outlast a phase is measured
+  too, slow, and capped at its floor - and, when it had less work than its cap (co-training's
+  supply), scaled as if it had kept its cap busy (at most x4); `lead`: its head start (a remote's
+  phase begins when the checkpoint is written, before this machine's: an EWMA of the seconds it
+  played before this machine's phase; this machine's 0; co-training 0); `P`: the phase they all play
+  together; `total rate`: over the consumers taking work now - **a worker backing off, offline or
+  not yet up drops out, its cap is 0 and the others' shares grow at once** (this machine alone: the
+  whole quota, up to its slots); `inflight`: the run setting `selfplay_remote_inflight` (default 1:
+  one iteration of its own throughput, so a game it starts finishes within about one iteration);
+  `lo` = 2 x its driver groups (a few games per group: at least 2), `hi` = its driver's slots
+  (`conc`; a co-training worker: `conc` + `conc` / 4). The caps sum to `inflight x units` when no
+  bound binds. **Bootstrap**: an unmeasured consumer's rate is proportional to its slots (`hi`,
+  scaled by the measured consumers' rate per slot), and an unmeasured remote gets a quarter of that
+  share (`workqueue.BOOT`) until its first measurement: its phase's end, or 10 s of its status lines
+  in its first phase (`PROVISIONAL_S`, env `ZERO_RSP_PROVISIONAL_S`). A restart takes the rates and
+  head starts from the run's last metrics row (`selfplay.queue.rates`; a row of the first design,
+  `selfplay.remote` without `queue`: this machine's games per second and the remote's per worker).
+* **Batch-bound consumers** (`selfplay_remote_batch`: `auto`, the default, = this machine's driver
+  when its inference runs on CUDA / MPS - MTG Zero's desktop driver - and, since 56.1, every remote
+  worker on any device; `local`, `remote`, `all`, `none` choose explicitly): such a consumer's network batches hold its games' leaves and a network call costs
+  about the same whatever its batch, so its leaves per second grow with its games in flight and its
+  games take about as long at any in-flight. The cap above then sets its throughput, not its
+  latency: a cap that starts small measures a small rate, which gives a small cap again, and it
+  settles only where the consumer's games last one phase - a point that moves with the games'
+  length. **MTG Zero's delver1 on 213a9c0** (its ENGINE.md 56): the desktop's cap wandered between 66
+  and 131 of its 192 slots (2 groups: batches of half its in-flight) at 2.0-5.3k leaves/s - ~35
+  leaves/s per game in flight at any in-flight - against 6.1-6.8k with all 192 before the queue; it
+  made 8-17% of the 800 games. Its cap is therefore its **slots** while its games finish within
+  `selfplay_remote_batch_inflight` (default 2) iterations:
+
+  ```
+  cap = clamp(ceil(max(inflight x share, min(slots, batch_inflight x share))), lo, hi)      share = rate x (lead + P)
+  ```
+
+  (by Little's law a consumer's in-flight over its rate is its games' latency, so `batch_inflight x
+  share` is the in-flight at which they last `batch_inflight` horizons). `slots`: its driver's
+  `conc`; a co-training consumer's `hi` adds a queue beyond them (a match waiting there only waits),
+  which the batch rule never fills. A batch-bound consumer whose games outlast `batch_inflight`
+  horizons even so falls to `lo` as any other (a GPU too slow for the run's iterations does not fill
+  the data with stale rows), and a consumer that is not batch-bound keeps the formula above exactly
+  (CPU inference: its rate is its cores', nearly whatever its in-flight; delver1's Mac workers lost
+  ~13% of their leaves per second at 45% of their slots, 29.5k -> 25.5k, so more in flight would buy
+  them little and cost the staleness of 80% of the data). Not a fixed floor (no guard against a
+  consumer too slow for the iterations), nor a curve fitted to each consumer's latency against its
+  in-flight across phases (it needs phases at different caps and is noisy when the games' length
+  changes between iterations): the device says which kind a consumer is, `batch_inflight` bounds its
+  staleness. **The cost**: a batch-bound consumer's rows lag by up to `batch_inflight` checkpoints
+  (delver1's desktop at its 192 slots: games of ~1.15 phases, its rows' mean lag ~0.6 -> ~0.7); with
+  it a small part of the data, the run's mean lag moves by hundredths. **Choosing `games`**: a
+  consumer's latency in phases is its in-flight over its games per phase, so a batch-bound one keeps
+  its slots while it plays at least `slots / batch_inflight` games an iteration: `games >= slots /
+  (batch_inflight x its share of the throughput)` (delver1: 192 / (2 x ~0.2) ~ 480 - its 800 leave a
+  margin of 1.7x; a remote's back-off only raises the desktop's share). Below that the desktop holds
+  fewer than its slots (still `batch_inflight` x its share, not 1x).
+* **Single-game: the shared quota.** Both sides play a rolling `queue_only` driver (docs/search.md
+  2.9) - this machine's whatever `rolling` says - and queue one setup of the run's spec for every
+  game they may still start under their cap. **A finished game counts only once the quota accepts
+  it**: this machine's at once, a worker's in answer to its `fin` line (`accept`); the iteration
+  ends when `games` are accepted, **exactly**. The games finishing beyond the quota (while it filled,
+  or while the end reached a worker) **wait, with their samples, for the next iteration**, whose
+  quota takes them first (the driver hands out each game's rows and samples together, so a game's
+  samples are cut out of a batch with it: `workqueue.split_games`). A worker never holds a share of
+  the quota: one that backs off, sleeps or dies leaves the rest to this machine, whose cap is then
+  the whole quota. The quota met (by anyone, also during a worker's head start), the workers get
+  `end` at once; the games in flight carry over on both machines. A worker that dies with accepted
+  games whose samples are in no announced shard yet gives them back to the quota (`lost`) while
+  this machine still plays; a shard lost after the phase (late, failed) leaves the iteration short
+  by its games (`short`, logged). Training's steps follow the new samples of both (`new samples x
+  reuse / batch`).
+* **Sessions** (local side, `RemotePlay`: a manager thread, a fetch thread per worker, three pipe
+  threads per session; the main thread only calls `begin(it)`, `accept_local` and `end(it)`): `procs`
+  persistent worker processes on the remote, each a session `ssh host 'cd repo && <env> exec python
+  -m <pkg>.az.remote selfplay MIRROR K'` (BatchMode, ConnectTimeout 20, ServerAliveInterval 15 x 4;
+  'local': a subprocess). The worker's stdin is the control channel (JSON lines: `phase`, `end`,
+  `cap`, `accept`, `enqueue`, `fetched`, `ping`, `quit`), its stdout its events (lines `ZERO_SP
+  {json}`: `hello`, `status`, `fin`, `shard`, `row`, `end`, `error`). The mirror `<selfplay
+  workdir>/<run name>` gets `config.json` (the run's settings + the remote's self-play `overrides`;
+  shards of at most 8192 samples unless they set `shard_rows`) and `selfplay.json` (mode, locks,
+  niceness, linger, the run's id) at each session start, and `models/iter_{i-1}.pt` at each phase
+  start (a temporary name, then renamed). The manager recomputes the caps every tick (0.25 s) and
+  sends a single-game worker its own (`cap`) when it changes. A session that fails is started again
+  after `RETRY_S` (60 s) - immediately if it ran for more than 2 minutes - one that is silent for
+  `STALL_S` (300 s) is killed; failures are logged the first three times in a row, then every 10
+  minutes. The workers live as long as the run's process: PAUSE, STOP, an error and the end of the
+  iterations close them (`quit`, stdin closed, killed after 10 s); a run killed hard closes their
+  stdin by dying, and a worker that hears nothing for `watchdog_s` (180 s; the run pings every 20
+  s) exits by itself.
+* **A phase**: `begin(it)` -> each live worker gets `phase it` (after checkpoint i-1 is in the
+  mirror) and, single-game, an `accept` for the games it held: its rolling driver - persistent
+  across iterations, games in flight carry over a phase boundary, a new search epoch per checkpoint,
+  every sample stamped with its search's `net` - resumes with the new weights. **The remote's phase
+  i starts as soon as checkpoint i-1 is written** - right after training, before this machine
+  evaluates it - and this machine's own phase i calls `begin(it)` again (a no-op; `lead_s` records
+  the head start): the remote plays through the evaluation phase with the checkpoint of the next
+  self-play, on-policy, and its games count for iteration i's quota; not after the last iteration,
+  nor with STOP or PAUSE there, and a restart replays the iteration from an empty data directory.
+  `end(it)` (or the quota met) -> `end it`: the worker ends its phase (`end_phase`; games in flight
+  wait for the next phase), flushes its last shard and reports its counters. Shards are written by
+  a background thread of the worker (`data/iter_i/m<KK>-<sid>_SSS.npz`, `sid` the session's id),
+  **compressed** (zlib level 1, `data.savez_level`: MTG's sparse features ~58x), each announced on
+  stdout as soon as it is written with the games whose samples it holds (whole games: a shard is the
+  writer's whole buffer).
+* **Linger** (`selfplay_remote_linger` 1, opt-in): after `end it` a worker closes the phase's
+  accounting (its last shard, its `end` line) and plays on with checkpoint i-1 while the run trains
+  and evaluates; the games it finishes then are held (co-training: their rows go to the coordinator
+  at once, their samples are held) and count for iteration i+1, into whose shards their samples go:
+  those rows are one checkpoint behind the iteration's (lag 1); new games start only while its held
+  and outstanding games stay under its cap. The next `phase` ends the lingering at once.
+* **Local linger** (`selfplay_local_linger` 1, opt-in; 10.10): the run's own driver does the same while
+  the run trains - `Run.linger_start` after the phase (not after the last iteration, nor with STOP or
+  PAUSE there), on a thread whose network batches run on a CUDA stream of their own beside the
+  training's default one: setups queued up to the local cap as in the phase, the games in flight
+  finishing with checkpoint i-1 (the same network id: nothing restarts), the finished ones held with
+  their samples for iteration i+1's quota (which takes held games first: lag 1), never more held than
+  an iteration's quota. `Run.linger_stop` after the training (and on any exception from it) ends the
+  phase, answers its last batches and joins the thread; `linger` in the iteration's metrics row =
+  `{games, seconds, leaves, infer_s, held}` (the lingering's inference is not counted in the next
+  phase's `infer_s`), and a log line `iter i local linger: ...`. The rates and caps of the shared
+  queue measure the phases only.
+* **Arrival**: fetch threads (one per worker) copy each announced shard of the running phase under a
+  temporary name (`*.tmp.npz`: never a loadable shard name), check it - **the non-finite guard**
+  (4.1) and the run's game / features / actions - and rename it into `data/iter_i/` beside the
+  run's own `r00` shards, then tell the worker to delete its copy. Only while phase i accepts:
+  `end(it)` waits for every shard of the phase while the run goes on (47.4) and, once STOP is there,
+  at most `selfplay_remote_wait` s more; a shard announced or still in flight after that is dropped
+  (`late`, or `late_prev` when it was announced after the phase closed; the record says `cut`),
+  never moved into another iteration. **Staleness:
+  same phase only** - a shard of phase i holds the games the run accepted for phase i, searched
+  with checkpoint i-1 and (carried over) earlier ones, exactly what the run's own rolling driver puts
+  into `data/iter_i/`. Every arrived shard's `net` column goes into the iteration's **staleness
+  histogram** (rows by `(i - 1) - net`). A **non-finite shard** is quarantined to
+  `<run>/debug/iter_NNNN_<name>.bad.npz` and the run fails with NonFinite at the end of the phase
+  (before training: the window never sees it), as for a local one; a worker whose own write check
+  fails (its ShardWriter quarantines the shard in the mirror's `debug/`) reports it, the run fetches
+  that copy into `<run>/debug/remote_*.bad.npz` and fails the same way. A shard of another game or
+  encoder width (not the run's code) is rejected and logged.
+* **Remote evaluation comes first**: a worker looks at its locks every 2 s - its remote's own
+  `<workdir>/.eval.lock` (zero.remote's, 5.2) always, and the `locks` of the remote's `selfplay`
+  dict (MTG Zero: the other games' evaluation locks on the Mac) - and while one is held by a live
+  process (or is being created) it asks for no leaf batches, so its search and inference threads
+  idle; control lines are still answered (an `end` ends the phase at once). With the remote's
+  `selfplay.backoff` 'background' (macOS) it plays on instead under the Darwin background policy
+  (`setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`: the lowest CPU band, the efficiency
+  cores; the process sets and clears it itself) and leaves it when the lock is gone (MTG Zero
+  measured both, its ENGINE.md 52.4); elsewhere 'background' is 'stop'. Its running time (`active_s`)
+  stops meanwhile either way; `backoff_s` is reported per phase. **The queue gives its work back**:
+  a worker whose status says it backs off is no consumer meanwhile (cap 0, the others' shares grow
+  at once; single-game it holds no share of the quota anyway; co-training: its matches flow back
+  after `selfplay_remote_giveback` s, 11.6). While a phase runs and it is not backing off, a worker
+  holds a **busy marker** `<workdir>/.busy-<mirror>-w<K>` (an `owner` file "<pid> <time>" like the
+  eval lock's), so that lower-priority jobs on the remote can yield to self-play (MTG Zero's fuzz
+  farm and studies: `tools/mac_backoff.py`).
+* **One worker per slot**: a worker takes `<mirror>/.w<K>.lock` (owner "<pid> <time> <run id>");
+  a live previous worker of the same run (an orphan of a broken session) is stopped first
+  (SIGTERM, then SIGKILL after 10 s), another run's is refused (two runs with the same mirror
+  name). At each phase start a worker deletes its slot's leftover shards (late, dropped, or an
+  earlier session's) and checkpoints older than i-3.
+* **The remote spec** (`GamePackage.remotes[name]`, 5.2) may carry `selfplay`: `{workdir`
+  (default the remote's `workdir`; `$ZERO_SELFPLAY_WORKDIR` on the run's machine overrides it),
+  `procs` (default 1; the run setting `selfplay_remote_procs` overrides it), `nice` (the workers'
+  niceness, default 0), `locks` (lock directories to back off for), `backoff` ('stop', the
+  default, or 'background'), `env` (over the remote's),
+  `overrides` (run settings for the workers: `conc` - their caps' ceiling -, `threads`, `groups`,
+  `infer_workers`, `torch_threads`, `infer_device`, `shard_rows`)`}`. A spec that is a Mapping
+  resolving at run start (MTG Zero's `RunCommitRemote`: the remote's checkout of exactly the run's
+  commit) is read when the run starts, and the remote command checks it again (MTG Zero: `python -m
+  mtgz.az.remote selfplay` refuses other code than the run's, as `eval` does).
+* **Settings** (section 1.2): `selfplay_remote`, `selfplay_remote_procs` (0), `selfplay_remote_wait`
+  (30 s: how long the end of a phase still waits for the last shards once STOP is there; without STOP it waits for
+  all of them, 47.4), `selfplay_remote_inflight` (1.0),
+  `selfplay_remote_batch` ('auto') and `selfplay_remote_batch_inflight` (2.0: a batch-bound
+  consumer's games in iterations; 1 = as the others), `selfplay_remote_linger` (0), and co-training's `selfplay_remote_giveback` (30 s),
+  `selfplay_remote_overdue` (3) and `selfplay_remote_timeout` (3,600 s, the ceiling). **An existing
+  run's `games`** means the total of both machines from its first iteration on this code (the first
+  design's runs played `games` here and the remote's extras on top): a run moving from that design
+  sets `--games` to the total it wants (MTG Zero's delver1: its ENGINE.md 56); a run without a
+  remote is unchanged.
+* **Metrics**: `selfplay.games` stays this machine's (its accepted games), `selfplay.remote` = `{host,
+  procs, workers` (live at the end), `in_phase, ended, games` (single-game: its accepted games whose
+  samples arrived; co-training: rows), `games_played, accepted, held, lost, samples` (arrived),
+  `samples_played, shards, bytes` (compressed, shipped), `leaves, leaves_per_s` (per worker: leaves /
+  its phase's wall time, summed), `leaves_per_running_s` (back-offs excluded), `seconds, running_s,
+  backoff_s, in_flight, late, late_prev, rejected, quarantined, fetch_failed, fetch_s, wait_s`
+  (how long `end` waited), `session_errors, lead_s` (how long the remote's phase ran before this
+  machine's), `caps` (each consumer's mean cap in the phase), `linger` (`{games, seconds}` of the
+  lingering before it)`}` and **`selfplay.queue`** = `{quota, games` (all accepted), `short, held`
+  (`{local, remote}`: waiting for the next iteration), `inflight, units, consumers` (per consumer:
+  `games, share, units` (finished), `run_s, util, rate_measured, rate, cap` (the phase's mean),
+  `cap_max, cap_next`), `batch_inflight`, `rates` (the model's state: each consumer's rate, lead, lo,
+  hi, and `batch` true with its `slots` for a batch-bound one; the leaves per unit),
+  `staleness` (`{local, remote, all}`: rows by checkpoint lag, `summary` = rows, mean, max and the
+  share at lag <= 1)`}`. The log: `iter N remote self-play: 2 worker(s), 812 games, ...; 815 played,
+  3 held for the next iteration` and `iter N shared queue: quota 600: 600 games (local 54, w0 271, w1
+  275); caps local 56.0 -> 55, w0 273.0 -> 274, ...; rates/s local 0.223, w0 1.1, ...; staleness:
+  mean 0.41, max 2, 99.6% <= 1 (52800 rows)`; at the start `self-play also on the remote 'mac' (...):
+  800 games per iteration in total, in flight per machine its throughput share x 1; batch-bound
+  (local): its slots while its games take at most 2 iterations`. progress.json during self-play: `games` (accepted of
+  the quota), `target`, `local`, `remote` = `{host, workers, state` (playing / backing off / idle /
+  connecting / offline), `games, in_flight, samples, shards, caps, quota, held}` (the dashboard's
+  status line shows it); phase `remote shards` while `end` waits.
+* **Measured** (the toy, desktop 2026-10-28, the remote 'local': a worker process on the same CPU,
+  slower than the run's own driver; 192 games an iteration, 768 slots each, 64 / 32 simulations,
+  half of the decisions full; `selfplay_remote_inflight` 1 against 1000, which caps every consumer
+  at its slots - the first design's in-flight):
+
+  | iteration | 2 | 3 | 4 | 5 | 6 |
+  |---|---:|---:|---:|---:|---:|
+  | **shared queue**: mean lag / max / rows at lag <= 1 | 0.29 / 1 / 100% | 0.34 / 2 / 99.2% | 0.37 / 2 / 98.3% | 0.39 / 2 / 99.2% | 0.44 / 2 / 98.6% |
+  | its games here / on the worker; caps | 160 / 32; 164 / 29 | 136 / 56; 156 / 37 | 140 / 52; 149 / 44 | 118 / 74; 142 / 51 | 109 / 83; 131 / 62 |
+  | **every slot full**: mean lag / max / rows at lag <= 1 | 0.84 / 1 / 100% | 1.63 / 2 / 21.8% | 1.92 / 3 / 37.6% | 2.30 / 4 / 32.2% | 2.89 / 5 / 24.5% |
+  | its games here / on the worker | 192 / 0 | 192 / 0 | 56 / 136 | 0 / 192 | 0 / 192 |
+
+  With every slot full the 1,536 games in flight are 8 iterations' worth: the rows drift to a mean
+  of nearly 3 checkpoints behind, and the worker, whose phase starts early, fills the whole quota
+  before this machine's phase begins. With the shared queue 98-100% of the rows are within one
+  checkpoint (the few at lag 2 are games longer than a phase: `inflight` 1 sizes the mean latency
+  to one iteration); the worker started at a quarter of its slot share and grows by its measured
+  throughput (its caps 29 -> 62). A worker 10 ms per batch slower (its games longer than 7 phases)
+  is measured at 3% of this machine's rate and capped at 5-6 games; this machine plays the quota.
+  **Linger** (the same, training made ~70% of the iteration with `--min-steps 1500`): the worker's
+  share grows from 30-70 to 54-95 of the 192 games, the self-play phases are ~25% shorter (0.7-1.0
+  against 1.0-1.3 s), the rows' mean lag 0.54-0.67 against 0.28-0.44 (94-98% at lag <= 1): worth
+  it when training is a large part of the iteration and the remote a large part of the self-play.
+  **Batch-bound** (`tests/test_workqueue.py`'s simulation of delver1's consumers: the desktop's games
+  180-200 s at any in-flight, each of two Mac workers 1.85 games/s at any in-flight, 800 games): the
+  cap of 213a9c0 settles at 111-116 of the desktop's 192 slots whether it starts at 75 or at 181
+  (where its games last one phase), at ~0.6 games/s; batch-bound it is at 192 one phase later and
+  stays, at 0.96 games/s (1.6x), its games 1.14 phases long, the phase 191 -> 175 s, the workers'
+  caps one phase of their throughput either way. The toy pair above at 256 slots each with
+  `--selfplay-remote-batch local` (this machine's CPU driver taken for batch-bound): its cap is its
+  256 slots from iteration 2, the rows' mean lag 0.41-0.65 (max 2, 91-100% within one) against the
+  pair's 0.29-0.44 - what the rule costs a consumer that is not batch-bound (twice its latency for
+  no throughput), which is why `auto` goes by the device.
+* **A remote workdir must be an absolute path there**: a relative one (Git Bash turns
+  `ZERO_SELFPLAY_WORKDIR=/Users/...` into `C:/Program Files/Git/Users/...` for a Windows process;
+  set `MSYS2_ENV_CONV_EXCL=ZERO_SELFPLAY_WORKDIR`) is refused at start, before ssh or scp could
+  create it under the remote's home.
+* **Determinism**: none beyond the run's own. A worker's driver seed is `seed x 7919 + i0 +
+  7,777,777 x (K + 1)` (i0: the iteration its session started in), so its games' setups and
+  search streams are reproducible per session, but what it contributes to an iteration depends
+  on timing (when its session started, its caps, back-offs, which games the quota accepted first),
+  and a remote's arithmetic may differ from this machine's at float rounding. The data of a run with
+  a remote depends on the remote's load; evaluations stay comparable (fixed pools, the same
+  players). A run without a remote plays exactly as before (the shared queue is not in its path;
+  tested byte for byte, 5.3's tests and `tests/test_loop.py`). A replay of a remote game: its sample
+  rows carry `net`, its shard's meta the worker and session; the game itself is not recorded.
+* **On or off at a restart**: `--selfplay-remote <name>` / `--selfplay-remote ''` (saved), with
+  `--games` the total wanted per iteration.
+
+Tests: `tests/test_remoteplay.py` (single-game: the shared quota exact with shards in `data/iter_i/`
+and training's steps, the caps of a slow / fast pair following the model and the rows within one
+checkpoint, a batch-bound driver at its slots (`selfplay_remote_batch` 'local'; a bad value
+refused), a worker slower than a phase capped at its floor, the quota moving here while the worker
+backs off, a dying worker's accepted games played here, linger, late shards dropped, an unreachable
+remote, a non-finite shard quarantined, the back-off while `.eval.lock` is held, PAUSE mid-phase and
+resume with no worker left; co-training 11.6, a batch-bound local resolver driver; the
+coordinator's second consumer, `lock_held`, compressed shards), `tests/test_workqueue.py` (the caps'
+model, a consumer dropping out, the rates' EWMA and utilisation, restore, the batch-bound rule -
+delver1's desktop curve, the spiral of 213a9c0 against it, a batch-bound consumer too slow for the
+iterations at its floor, the formula's bounds and `slots`, a back-off -, `split_games` on a sample
+dict and on the driver, the staleness histogram, the coordinator's reserve and matches per event),
+`tests/test_net_data.py` (the streamed window).
+
+### 5.4 The evaluation move rule and its Elo pools; raw Elo offsets; no random games (2026-10-28)
+
+**The rule** (`eval_select`, `eval_select_min_visits`; docs/search.md 3.3): how every evaluation
+seat chooses its moves - 'visits' (argmax (N, P0), the default) or 'cq' (the completed-Q
+target's argmax, optionally among the options with at least `eval_select_min_visits` visits).
+`Run.nn_seat` builds every evaluation seat (the yardstick and random matches, the Elo matches -
+both seats -, the reference games have none, co-training's primary and resolver evaluations,
+`eval_yard_net`), so they all follow it, here and on an `eval_remote` (its config is the run's;
+section 5.2). `zero.h2h` and `zero.replay` take a checkpoint's run's rule unless told otherwise
+(`--select`, `--a-select` / `--b-select`, the transform `--cq-c-visit` / `--cq-c-scale` and h2h's
+per-side `--a-cq-c-scale` / `--b-cq-c-scale`; replays record it in the seat, `select`).
+`selfplay_select` is the same rule for self-play after `temp_moves` (off by default: a forked
+run's A/B, section 12.4).
+
+**The rule's own completed-Q transform** (`eval_select_c_visit` / `eval_select_c_scale`,
+`selfplay_select_c_visit` / `selfplay_select_c_scale`; 2026-10-29, section 12.5). The 'cq' rule
+ranks options by the 'cq' target's logits, whose transform is `(c_visit + max N) c_scale`. Unset
+(the default), a rule uses the target's `cq_c_visit` / `cq_c_scale` - one knob for training and
+move selection, as before these settings; set, the rule has its own and the targets keep theirs.
+A run's evaluation rule is `mcts.select_settings(cfg, 'eval_select')` (rule, guard, effective
+transform): `Run.nn_seat` builds every evaluation seat from it, `elo.eval_tag` names its pool
+after it (`select_tag`: the effective transform, so `cq-n4-v50-s0.3` whether the 0.3 comes from
+`cq_c_scale` or from `eval_select_c_scale`, and `cq-n4` at 50 / 1), and `zero.h2h` / `zero.replay`
+read a checkpoint's run through it. Consequences: a run whose rule transform is pinned keeps its
+pool when only its training `cq_c_scale` changes; a run with the setting unset changes pool with
+`cq_c_scale` as before; pinning the scale at a restart to the value the run already selects with
+(e.g. `--eval-select-c-scale 0.3` on a run at `cq_c_scale` 0.3) keeps the pool, the evaluations
+and every file byte for byte, and pinning it to another value begins that value's pool (as any
+rule change does: `since`, no replay). The seat keys (docs/search.md 3.3): an evaluation seat
+has no 'cq' target, so it carries the rule's transform as `cq_c_visit` / `cq_c_scale` (the seat
+dict of an equal effective rule is the same dict, key for key); a self-play seat with a 'cq'
+target adds `select_c_visit` / `select_c_scale` where the rule's transform differs from the
+target's. A remote evaluation on an older checkout computes the rule from `cq_c_scale`: when that
+differs from the run's effective rule its result names another rule and is refused (5.2); a
+remote self-play checkout without the setting would select at `cq_c_scale` (nothing to compare
+there: update the remote's checkout with the pin).
+
+**What "unset" should mean long-term.** Today unset follows `cq_c_scale`, and it stays so for
+now (every existing run and config behaves bit for bit as before). Recommended later: unset = a
+fixed transform (50 / 1, the paper's and the 'cq' rule's measured default, or whatever value the
+selection-scale measurement settles on) instead of following the target. The reasons: the two
+knobs answer different questions (how sharp the training target is; how far Q may overrule the
+prior when choosing a move), they act separately (12.5: in MTG Zero's A/B the training scale 0.3 had
+no measurable effect, while selecting at 0.3 instead of 1.0 was worth ~+100 Elo head to head), and following makes every training A/B of `cq_c_scale`
+silently an A/B of the evaluation rule. The switch needs one migration: every run config with a
+'cq' rule and a `cq_c_*` other than the new default gets its current effective transform written
+in (`eval_select_c_scale` = its `cq_c_scale`, likewise `selfplay_*`), so no run changes moves or
+pool; then the default flips. Until then: **pin the selection scale explicitly** on any run whose
+`cq_c_scale` might be changed, and give both arms of a `cq_c_scale` A/B the same
+`eval_select_c_scale`.
+
+**Bookkeeping.** Every evaluation records its rule: `eval_yard`, `eval_random` and `elo` rows
+carry `select` = the rule's name (`mcts.select_tag`: 'cq', 'cq-n2', 'cq-v25-s0.5' with another
+completed-Q transform), absent = 'visits' - so a default run writes exactly what it wrote
+before, and every older row reads as 'visits'. Co-training's `eval_yard_net` records `select`
+(the primary's) and `resolver_select`.
+
+**One Elo pool per rule.** A checkpoint that chooses its moves by another rule is another
+player, so its games never enter another rule's pool: 'visits' keeps `elo/` (results.json,
+ratings.json - every run's pool from before the setting), any other rule gets `elo/<rule>/`
+with the same files plus `select` and `since`. A pool's evaluations are the metrics rows whose
+`eval_yard.select` is its rule; its Elo matches are played with both seats at its rule; its
+reference games (random vs the yardstick: bots only, rule-free) are played once in it. Chosen
+over one file with rule-tagged player names refit per rule because a pool is then a plain run
+pool (the fit, `logged`, the dashboards and the remote's copies work on it unchanged) and the
+other pools' files are never written again - nothing to filter, nothing to migrate.
+
+* **Changing the rule mid-run** (at a restart: `--eval-select cq`): the old pool's files stay
+  byte for byte as they were (tested), the new pool starts at the first iteration it sees
+  (`since`): its Elo matches are those of checkpoints evaluated from then on, against their
+  usual opponents (older checkpoints, rated in the new pool through those games only) - no
+  replay of the history. `models/index.json` and `best.pt` follow the current rule's pool (the
+  best checkpoint *evaluated with the rule the run evaluates with*: the older opponents are listed
+  `"evaluated": false` - in the pool's ratings.json too - and never best), and so do the
+  dashboards (`elo.active_pool`: config.json's rule; zerodash's `runfiles.elo_pool`; both take
+  their "best" among the evaluated checkpoints). zero's dashboard draws the run's other pools
+  (`elo.other_pools`) as their own lines next to the current one, with a legend - one chart, never
+  one fit: the lines share the yardstick's 1000 but are refit apart. The metrics rows' `elo` of
+  the earlier iterations keep their old pool's ratings; Elo is comparable within one pool only.
+  Back to a rule used before: its pool continues (and plays the Elo matches it lacks for the
+  iterations evaluated meanwhile - k >= its `since` -, at the old rule); the checkpoints those
+  matches rate were evaluated with the other rule, so this pool flags them too (`"evaluated":
+  false` whenever the run has another pool) and none of them becomes `best.pt`.
+* **On a remote**: the remote plays the run's rule and owns its pool (`elo/<rule>/` on the
+  mirror, copied back); a result naming another rule is refused (5.2).
+
+**Raw Elo offsets** (`elo_offsets`, e.g. '1,2,4,8'). By default an evaluated checkpoint k plays
+k - off x `eval_every` for off in 1, 2, 4 ... 32 (the first `elo_opponents`), so with
+`eval_every` 8 only k-8 and k-16, and a run whose `eval_every` changed skips the iterations in
+between (MTG Zero's delver1: iteration 12, evaluated at `eval_every` 4, never played again at 8).
+`elo_offsets` makes the offsets raw iterations: k plays k-1, k-2, k-4, k-8 (those that exist;
+every iteration writes a checkpoint) whatever `eval_every`, and `elo_opponents` is not used.
+The opponents that were never evaluated join the pool as players rated only through these games
+(the fit needs no yardstick games for them; `logged` lists the evaluated ones only), are listed
+in the pool's `ratings.json` and in `models/index.json` with `"evaluated": false`, and are never
+`best.pt` (nor either dashboard's "best"); the remote ships them (5.2). '' (the default) keeps
+the evaluations-back offsets exactly, and a default run's pool flags nothing (its ratings.json
+and index.json as before the flag).
+
+**No random games** (`eval_random_games` 0): no match against the random bot (no `eval_random`
+row: the Elo code, the dashboards and the remote work without it). A run that turns it off at a
+restart keeps its older rows: the dashboard's "vs random" tile then names the iteration of its
+newest value. The reference games still rate the random bot against the yardstick (bots only,
+`ref_games` once per pool; 0 = not at all).
+
+Default runs are unchanged: toy-smoke (classic; rolling; margin_w + chance_k + cq targets with
+`eval_every` 2) gives the same metrics (timing aside), checkpoints, optimizer states, shards, Elo
+files and models/index.json byte for byte as zero-core 3c26d9f, with the settings left out or
+given explicitly at their defaults (section 12.3). Tests: `tests/test_select.py`.
+
+**Changing a live run's rule** (MTG Zero's delver1 at its re-pin, its ENGINE.md 57): stop it at
+an iteration boundary, re-pin, restart with `--eval-select cq --eval-select-min-visits N` (and,
+if wanted, `--eval-random-games 0 --elo-offsets 1,2,4,8`). The next evaluation (here or on the
+`eval_remote`, whose checkout must have the rule: a remote without it is refused, 5.2) begins
+the rule's pool `elo/<rule>/` at that iteration: 100-ish reference games once (`ref_games`), the
+checkpoint's yardstick games, its Elo matches against its raw offsets; `elo/` and the metrics'
+older `elo` rows are left as they were. A toy rehearsal of exactly this (a remotely evaluated run
+re-pinned with those flags): section 12.3.
+
+## 6. Learning: the toy proof run (Glass Road Zero 2026-10-11; Caverna Zero 2026-10-10)
+
+### 6.1 The run
+
+`toy1` (`--preset toy-1`, tabula rasa, CPU only: 4 search threads + 1 torch thread at
+below-normal priority while Caverna Zero's, Dominion Zero's and St. Pete Zero's training runs
+used the machine), under the supervisor from Glass Road Zero's `infra` worktree (commit 5187538),
+run dir `~/glassroad-zero-wt/infra/runs/toy1` (gitignored). Yardstick: the toy heuristic
+through the external-seat path (`ext:toyheur`); random vs the heuristic: 15/1000 (1.5%).
+
+| Iteration | Self-play games (cum.) | vs heuristic (400 games) | margin | vs random (100) | Elo (final fit) | policy / value loss | self-play leaves/s |
+|---|---|---|---|---|---|---|---|
+| 0 (random net) | 0 | 3.8% +-1.9 | -16.9 | 57% | 334 +-72 |  |  |
+| 1 | 600 | 41.5% +-4.8 | -3.1 | 99% | 905 +-31 | 1.618 / 0.601 | 62,960 |
+| 2 | 1,200 | 76.9% +-4.1 | +2.4 | 100% | 1224 +-31 | 1.572 / 0.562 | 60,078 |
+| 3 | 1,800 | 81.6% +-3.8 | +3.3 | 100% | 1295 +-33 | 1.560 / 0.564 | 63,511 |
+| 4 | 2,400 | 97.1% +-1.6 | +4.9 | 100% | 1404 +-35 | 1.519 / 0.575 | 72,983 |
+| 5 | 3,000 | 98.0% +-1.4 | +5.0 | 100% | 1552 +-40 | 1.505 / 0.576 | 71,015 |
+| 6 | 3,600 | 97.6% +-1.5 | +4.5 | 100% | 1626 +-41 | 1.486 / 0.557 | 63,894 |
+| 7 | 4,200 | 99.2% +-0.8 | +4.7 | 100% | 1777 +-44 | 1.438 / 0.563 | 65,320 |
+| 8 | 4,800 | 99.8% +-0.5 | +5.0 | 100% | 1786 +-44 | 1.421 / 0.555 | 64,607 |
+| 9 | 5,400 | 99.9% +-0.4 | +5.9 | 100% | 1878 +-46 | 1.383 / 0.549 | 51,865 |
+| 10 | 6,000 | 99.6% +-0.6 | +5.2 | 100% | 1845 +-46 | 1.374 / 0.550 | 64,413 |
+| 11 | 6,600 | 100.0% +-0.0 | +5.8 | 100% | 1904 +-46 | 1.336 / 0.544 | 51,581 |
+| 12 | 7,200 | 99.6% +-0.6 | +5.5 | 100% | 1973 +-47 | 1.313 / 0.547 | 50,130 |
+| 13 | 7,800 | 98.6% +-1.1 | +5.3 | 100% | 2010 +-47 | 1.280 / 0.540 | 53,826 |
+| 14 | 8,400 | 99.0% +-1.0 | +5.3 | 100% | 2015 +-48 | 1.258 / 0.545 | 65,749 |
+| 15 | 9,000 | 97.8% +-1.5 | +4.9 | 100% | 2053 +-48 | 1.239 / 0.540 | 66,292 |
+| 16 | 9,600 | 99.4% +-0.8 | +5.1 | 100% | 2074 +-48 | 1.225 / 0.539 | 70,326 |
+| 17 | 10,200 | 98.5% +-1.2 | +5.7 | 100% | 2102 +-49 | 1.200 / 0.521 | 49,286 |
+| 18 | 10,800 | 99.0% +-1.0 | +5.0 | 100% | 2114 +-50 | 1.184 / 0.532 | 56,959 |
+| 19 | 11,400 | 99.0% +-1.0 | +5.6 | 100% | 2138 +-50 | 1.164 / 0.528 | 59,994 |
+| 20 | 12,000 | 98.0% +-1.4 | +6.2 | 100% | 2178 +-50 | 1.144 / 0.519 | 50,274 |
+| 21 | 12,600 | 99.4% +-0.8 | +6.1 | 100% | 2196 +-52 | 1.133 / 0.524 | 50,566 |
+| 22 | 13,200 | 98.6% +-1.1 | +6.3 | 100% | 2180 +-52 | 1.116 / 0.529 | 56,985 |
+| 23 | 13,800 | 99.0% +-1.0 | +6.4 | 100% | 2189 +-53 | 1.088 / 0.521 | 60,943 |
+| 24 | 14,400 | 99.0% +-1.0 | +6.4 | 100% | 2254 +-56 | 1.078 / 0.530 | 65,159 |
+
+* **Same run as Caverna Zero's** (`~/caverna-zero/docs/az.md` 6, 2026-10-10): every
+  evaluation against the heuristic and every training loss above equals its counterpart there
+  (same code, same seeds: the loop is deterministic). Only games of the random bot differ
+  (random vs the heuristic 15/1000 here, 23/1000 there; 99% vs 98% at iteration 1), because
+  Caverna Zero's run predates its per-seat bot seeds (146d349), hence a slightly different Elo
+  fit (2254 vs 2255 at iteration 24; random 269 vs 321). The carried-over stack is the proven
+  one, not merely a similar one.
+* **Run control, exercised on this run**: PAUSE (`tools/pause_run.py --wait`) during
+  iteration 6's Elo matches - the run noticed it after 0.5 s, exited with status 75, the
+  supervisor waited; `--resume` relaunched it, and it finished iteration 6's evaluation from
+  `models/iter_0006.json` without replaying self-play or training. A hard kill
+  (`tools/kill_run.py`) during iteration 9's self-play, then a new supervisor: iteration 9 was
+  replayed from the start (its data directory cleared). A STOP file during iteration 11: the
+  run ended after it (exit 0, "STOP file found"), the supervisor with it; the next supervisor
+  moved the stale STOP to STOP.old and the run resumed after iteration 11.
+* **Wall clock**: 24 iterations in 12.3 minutes of run time (13.1 minutes including the pause
+  and the restarts; median 29 s per iteration: self-play 7 s, training 1 s, evaluation 4 s,
+  Elo matches 15 s). 14,400 self-play games, ~290k games/h, ~62k leaves/s (median), inference
+  ~91% of the self-play time (one torch thread; average batch ~110 leaves). About twice
+  Caverna Zero's speed on the same machine the day before (less load).
+* **Learning**: the random network loses 96% to the heuristic; one iteration (600 games)
+  takes it to 41.5%, four iterations (2,400 games) past 97%, and from then on it wins 97-100%
+  with a growing score margin (+4.5 to +6.4). Elo keeps rising after the heuristic is
+  saturated (1404 at iteration 4, 1845 at 10, 2254 at 24) while the policy loss falls steadily
+  (1.62 -> 1.08). Random rates 269.
+
+### 6.2 Rust search vs Python search, head to head
+
+`python -m zero.parity h2h --model <toy1 iteration N> --sims 32`: a seat searching with the
+Rust tree (`<pkg>._engine.SearchTree`) against a seat searching with the Python reference tree
+(`zero/mcts.py`), both in the Python driver with the same network and the same settings,
+seats alternating:
+
+| Network | Setting | Games | Rust-search seat's score | 95% interval |
+|---|---|---|---|---|
+| iteration 4 (97% vs the heuristic) | chance_k 0 (seed 1) | 6000 | 49.94% | +-1.04 |
+| iteration 4 | chance_k 2 (seed 2) | 2000 | 50.20% | +-1.82 |
+| iteration 12 (99.6%) | chance_k 0 (seed 7) | 4000 | 49.91% | +-1.32 |
+
+All consistent with 50% (Dominion Zero's gate: 51.1% +-1.3). The first two rows are Caverna
+Zero's measurement reproduced game for game (same network, seeds and code); the third is new.
+Together with the root-statistics check (docs/search.md 6: TV distance at the
+Python-vs-Python noise floor, a 30% c_puct change detected at 10x the floor) the Rust search
+implements the reference semantics.
+
+## 7. Throughput and the shared CPU
+
+See docs/search.md 7 for the measured numbers. On the shared desktop (other projects' jobs
+use every core at below-normal priority) **torch must use one intra-op thread**: a 128 x 3
+forward pass at batch 512 took 7.9 ms with 1 thread, 96 ms with 2 and 879 ms with 4 (each op
+waits for preempted threads); training slowed the same way. `torch_threads` defaults to 1;
+the Rust search threads are independent (no barriers inside a group's work) and scale.
+Toy self-play is inference-bound (~40-65k leaves/s on one torch thread, depending on the
+load); a toy iteration of 600 games takes ~30-60 s including evaluation and Elo matches.
+
+## 8. Not in the core yet (step 2 extension points)
+
+From Dominion Zero (their code is in `~/dominion-zero`, not in the repos the core was extracted
+from): worker processes for self-play / evaluation and resuming a crashed self-play phase from
+its complete shards (`workers.py`; here everything runs in the run process: the Rust driver is
+multi-threaded, a crash costs the iteration in progress, the supervisor restarts it), the
+CUDA-graph evaluator / pinned staging buffers / two batches in flight (`infer.py`; eager CUDA
+inference works here), rented-GPU experiments (Vast),
+exploration games, behaviour cloning. Where they plug in:
+
+* **Evaluator**: anything with `__call__(LeafBatch) -> (priors, value, margin)` and
+  `set_weights(state_dict)` can replace `infer.NetEvaluator`; `Run.evaluator(path)` is the one
+  place the loop builds it (a `zero.infer` factory keyed by a run setting is the natural
+  switch, e.g. `infer_impl='cudagraph'`).
+* **Remote / worker self-play**: in the core since 2026-10-28 (sections 5.3, 11.6: workers on
+  another machine whose shards join `data/iter_NNNN/` under their own prefix). Local worker
+  processes would plug in the same way: `Run.selfplay(it)` produces shards under
+  `data/iter_NNNN/` through `ShardWriter` and returns the metrics dict; the window
+  (`Run.window_shards`) reads every shard of an iteration directory.
+* **Remote evaluation**: `Run.evaluate(it, m)` / `Run.elo_update` fill `m['eval_yard']`,
+  `m['eval_random']` and the Elo results; an asynchronous evaluator can write the same keys
+  later (Dominion's `--remote-eval`).
+* **Cloud experiments**: forks (`zero.tools.fork_run`) + `zero.h2h` are the A/B primitives.
+* New run settings go into `run.DEFAULTS` (saved in every run's config.json: a missing key in an
+  old run's config takes the default, so defaults must keep old behaviour).
+
+Browser players (Caverna Zero's `wasm/` + `web/`, docs/wasm.md and docs/web.md there): the
+game-independent network moved into the core - crate `crates/webnet` (`zero_webnet`: the
+`zero.net` forward pass over float16 `.bin` weights, deterministic, native = wasm32 bit for bit)
+and `zero.webexport` (checkpoint -> `.bin`); Caverna re-exports them (`cvz_wasm::net`,
+`tools/export_web.py`). Still Caverna's, for a later step: the single-game search jobs
+(`wasm/src/search.rs`: choose / analyze / rate in slices over `zero_search::tree::Tree`), the JSON
+command API and the wasm ABI (`api.rs`, `lib.rs`: `cvz_*` exports), the Web Worker / `neural.js`,
+and the ladder tooling (`tools/ladder_calibrate.py`, `export_ladder.py`, `rated_js_check.py`).
+They are coupled to Caverna's `WebAz` (a decision = several AZ picks, JS response -> AZ picks in
+`decompose.rs`) and to the JS state format; generalising them means a `WebGame` trait (JS state
+in, decision boundaries, picks -> JS response) that each game implements, with the jobs, API,
+exports (renamed `zero_*`), worker and ladder calibration in the core.
+
+## 9. Policy targets: visits vs completed Q
+
+`policy_target='cq'` trains the policy head on Gumbel AlphaZero's completed-Q target instead of
+the root visit distribution (docs/search.md 3.1: the formula, why Q is not min-max normalised,
+parity). The search, the moves played, the value targets and every other field of a record are
+the same; with the same seed both settings play the same self-play games.
+
+Why: with values = P(win) in [0, 1] and c_puct 1, PUCT's visit counts at 128 simulations stay
+close to the prior, so a visit-count target barely moves the policy. Both games plateaued with
+nearly flat visit targets (Glass Road `grz2p`: H(pi) / ln(#options) 0.85, max share 0.47, policy
+loss = policy entropy, flat; Caverna `cvz2p` likewise). `python -m <pkg>.az.targets sharpness`
+and `quality` measure the targets of a checkpoint (each game's docs/az.md 9.2-9.3: Glass Road's
+c_scale 1 target removes 73% of the prior's regret against a 16x larger search, visits 32%).
+Results: Glass Road adopted cq after its A/B (56-65% head to head over iterations 36-45, Glass
+Road Zero docs/az.md 9.6); Caverna's A/B (`cvz2p_vis` / `cvz2p_cq`) was running when the core
+was extracted (Caverna Zero docs/az.md 9.4).
+
+### 9.1 Toy proof (`toy-1`, 24 iterations; Glass Road Zero 2026-10-11)
+
+Runs `toy1_cq` (c_scale 1) and `toy1_cq03` (c_scale 0.3) in a Glass Road Zero worktree's `runs/` (gitignored;
+`--preset toy-1 --policy-target cq [--cq-c-scale 0.3] --threads 3|2`, CPU, below normal), against
+the visits baseline `~/glassroad-zero/runs/toy1` (section 6; the visits loop on that branch
+reproduces its iterations 1-2 exactly: same win rates, policy losses and sample counts). The
+heuristic saturates early, so the yardstick is a head-to-head of each cq checkpoint against the
+visits checkpoint of the same iteration (600 games, 32 sims, seats alternating; score of the cq
+checkpoint, +-1 se, and the Elo difference):
+
+| iteration | cq c_scale 1 vs visits | Elo | cq c_scale 0.3 vs visits | Elo | vs heuristic: visits / cq 1 / cq 0.3 |
+|---|---|---|---|---|---|
+| 1 | 41.8% +-2.0 | -57 | 54.3% +-2.0 | +30 | 41.5 / 32.4 / 39.4% |
+| 2 | 10.0% +-1.2 | -382 | 18.3% +-1.6 | -261 | 76.9 / 51.1 / 59.4% |
+| 4 | **87.1% +-1.4** | **+332** | 72.6% +-1.8 | +169 | 97.1 / 89.0 / 80.0% |
+| 8 | 70.7% +-1.9 | +153 | 59.9% +-2.0 | +70 | 99.8 / 97.1 / 97.0% |
+| 12 | 65.1% +-2.0 | +108 | 59.5% +-2.0 | +67 | 99.6 / 97.9 / 99.8% |
+| 16 | 60.7% +-2.0 | +75 | 58.7% +-2.0 | +61 | 99.4 / 100 / 95.3% |
+| 20 | 47.8% +-2.0 | -16 | 39.8% +-2.0 | -72 | 98.0 / 97.5 / 96.6% |
+| 24 | 42.9% +-2.0 | -50 | 31.8% +-1.9 | -133 | 99.0 / 98.8 / 96.8% |
+
+More matches (600 games each): cq-1 iteration 24 vs visits iteration 16 / 20: 68.4% / 55.3%
+(+134 / +37); vs visits 24 at 128 sims 41.4% (-60); cq-1 24 vs cq-1 16: 75.8% (+198; visits 24
+vs 16: 77.2%, +211); cq-1 24 vs cq-0.3 24: 66.4% (+119).
+
+* **c_scale 1 learns much faster through iteration 16** (after a bad iteration 2, when the
+  first informative values made the targets suddenly sharp: H/ln n 0.78 -> 0.27): +332 Elo
+  over visits at iteration 4, still +75 at 16. **From iteration ~18 visits catches up and
+  passes it**: at 24 cq-1 is ~2 iterations behind (between visits 20 and 24), while still
+  improving as fast as visits (+198 vs +211 Elo from 16 to 24). So the gate "at least as fast
+  as the visits baseline" holds for the first two thirds of the run, not at its end.
+* **The policy collapses**: the completed-Q target is the prior times exp(sigma(Q)), so a sharp
+  prior stays sharp; nothing restores entropy. Training policy entropy at iteration 24: visits
+  1.08 nats, cq-1 0.60, cq-0.3 0.52 (recorded targets at the end: H/ln n ~0.15 / 0.21, max share
+  ~0.90 / 0.86; the visit targets at iterations 1-2: 0.92 / 0.37 and 0.85 / 0.46). A near-deterministic prior concentrates PUCT's visits and
+  the self-play data; the likely reason for the late slowdown. The paper avoids this by acting
+  with Gumbel noise + sequential halving at the root, which this branch deliberately does not
+  implement.
+* **c_scale 0.3 is worse than 1** throughout (it collapses as well, only later, with smaller
+  gains early).
+* Cost: none (the target is computed once per recorded decision from the root statistics).
+
+### 9.2 Root minimum visits: Q for every option of a small decision (MTG Zero's Delver mirror, 2026-10-29)
+
+The completed-Q target improves an option's policy only through its Q, and an unvisited option has
+none: it is completed at v_mix, close to the visited options' Q, so its target stays at its prior. A
+prior that has saturated (MTG Zero's Delver mulligan: >= 0.98 on Keep for most hands, 0 visits for
+Mulligan at 64 simulations) can then never move, whatever the option is worth - only root noise
+reaches it, now and then. The **root minimum visits** (docs/search.md 3.5) give every option of a
+small decision (2 .. `root_min_visits_max_actions` options, default 4) at least k visits in each full
+search, when the budget allows (2 x options x k <= the search's simulations): the forced walks are Q
+measurements for the 'cq' target and rule, and are left out of the visit counts (the 'visits' target,
+temperature sampling, the 'visits' rule) and of the root value target.
+
+**Settings** (section 1.2): `selfplay_root_min_visits` (the self-play seat: its recorded searches;
+never the fast or minor ones), `eval_root_min_visits` (every evaluation seat; its Elo pool is named
+after it, `visits-f4`, `cq-n4-v50-s0.3-f4`, `-f4a6` with max_actions 6: the evaluations' moves change),
+`root_min_visits_max_actions`; all at 0 / 0 / 4 by default = the run of before, byte for byte. The
+split follows `selfplay_select` / `eval_select`: a training A/B sets only `selfplay_root_min_visits`
+and keeps both arms' evaluation rule (and pool) the same. Remote self-play and remote evaluation get
+the seat keys like every other: the remote's checkout must have this core (an older one refuses the
+unknown seat key - a visible error, never a silent off).
+
+**Cost.** No extra simulations and no extra network calls: the forced walks are part of the search's
+budget, so leaves per second do not change; what changes is how the budget of a forced search is
+spent - at most (options - 1) x k of its walks (at 64 simulations on a 2-option root: 4 of 63 with k 4,
+8 with k 8), and none where PUCT gives every option k visits anyway. MTG Zero measured the share of
+the full searches' walks on its Delver line (its ENGINE.md 64).
+
+**Measured** (MTG Zero ENGINE.md 64, delver2's iterations 21 and 29, CPU): the floor works as
+designed - every option of the forced roots measured - but on the mulligan the network's own Q put
+Mulligan below Keep in every starved low-land hand, so the keep rates did not move (0 lands 58%, 1
+land 91%, at k 0, 4 and 8, under every move rule): those keeps come from the value head. On general
+small decisions (2-4 options, mana payments aside) 62% of the roots leave an option without a visit at
+k 0, and k 4 moved the cq target by more than 0.1 total variation at 11-13% of them and changed the
+cq4 evaluation move at 3-4%. Whether that trains a better network is an A/B question (MTG Zero
+ENGINE.md 64.6 has the flags).
+
+Tests: section docs/search.md 3.5's, and `tests/test_root_min_visits.py` (settings and names; the
+Python driver's 'py' and 'rs' seats and the Rust driver prune alike; toy runs: the settings at their
+defaults byte for byte, self-play's floor changes the shards and not the pool, the evaluation's floor
+changes the pool and not the training).
+
+Checks (5ce50d4, on main f57ee57; CPU only): `cargo test --release --workspace` 59 + 3 passed (the
+feature's 9 also in a debug build); `pytest tests` 228 passed, the 3 CUDA tests skipped; toy-smoke runs
+byte for byte against f57ee57 (classic; rolling; margin_w 0.2 + chance_k 2 + cq targets + eval_every
+2), the settings left out and given at their defaults (config.json gains the three keys); the golden
+records and match unchanged; `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy
+checkpoint) identical; Glass Road Zero, Caverna Zero (and its wasm crate) and Kingdom Builder Zero
+build against it; MTG Zero: its `az` tests and pytest, and delver2's checkpoint plays identically on
+its main's build and this one (its ENGINE.md 64.7). With feat/league (this branch is rebased on it):
+the seat keys, `NnSeat`'s fields, the Python `NNSeat` and the driver tests met textually, both sides
+kept; a league opponent's unrecorded seat is the self-play seat, so it takes the self-play floor too.
+
+## 10. The token network (arch 'tokens', `net.TokenNet`; MTG Zero M5b, 2026-10-22)
+
+A transformer over the game's objects for games whose state is a variable set of things (MTG:
+permanents, hand cards, stack objects, cards of a searched library), read from the same
+fixed-width features as the MLP: the `SearchGame` trait, the driver, the leaf batches and the
+shards are unchanged. The game package describes where the objects are (`GamePackage.tokens`,
+game -> layout; stored in the checkpoint's config):
+
+```
+{"vocab": V,                                   # identities: V embedding rows + 1 (none / unknown)
+ "segments": [{"name", "offset", "count", "width",   # count object slots of width floats at offset
+               "present": i | null,           # slot float i > 0.5 = the slot holds an object (null: always)
+               "id": {"at": j, "radix": [16, 16]} | null,   # identity as mixed-radix one-hot digits
+               "actions": [[base, stride], ...]}, ...],    # slot s scores actions base + s * stride
+ "bags": [{"name", "offset", "count", "width"}]}  # count multisets of identities (width <= V counts)
+```
+
+Every feature outside the segments and bags is a global. The network:
+
+* **Tokens**: the global token (a linear map of the globals, plus one linear map of the bags:
+  each bag pooled as the count-weighted sum of the identity embeddings and its total), and one
+  token per present slot = its identity's embedding (shared by every segment and the bags) + a
+  linear map of the slot's floats (per segment) + a learned (segment, slot) embedding (slot
+  orders mean something: timestamps, the top of the stack, whose library).
+* **Packing**: only present slots are embedded and attended to. A batch's rows hold their
+  tokens first (layout order, the global token at 0); rows are sorted by token count and run
+  in chunks of 64, each padded to its own longest row (padding masked out of the attention). A
+  row's outputs do not depend on the batch or the chunking (tested). MTG's positions hold 21
+  tokens on average (p99 39, max 53) of the 153 slots.
+* **Trunk**: `blocks` pre-norm blocks of width `hidden` (multi-head attention with `heads`
+  heads, GELU feed-forward of width `ff`), a final LayerNorm.
+* **Heads** read z = [the global token's output, the mean of the row's tokens]: value / margin
+  as `Net`, generic policy logits for every action (`Linear(2 hidden, actions)`); a slot's own
+  actions (`actions` pairs) are scored from its token conditioned on z (pointer logits:
+  `Linear(gelu(W_k t + W_q z))`, one output per action pair of the segment) and replace the
+  generic logits of those ids. An empty slot's actions keep the generic logits (they are not
+  legal anyway). The policy starts uniform (both policy output layers at zero): with random
+  ones the generic logit of a frequent action and a segment's pointer logits are a few random
+  constants, and MTG's first token run (mtg2a) started with 55% of the prior on PASS where 25%
+  is uniform; its self-play games ran into the turn cap (draws, no signal) and its first
+  checkpoint lost 100/100 to the heuristic. The value head keeps its random init: a random value
+  head can still steer the first searches (mtg2b, seed 0: the cq targets of its first games put
+  49% on PASS against 36% uniform; seed 1 33% / 40%; the MLP's seed 0 25% / 40%), but a zero one
+  is worse: every search is then a tie and the search's tie rule (the first maximum) plays the
+  first option, PASS (mtg2n: 3 self-play games finished in 15 minutes). MTG's token run uses
+  seed 1.
+* **Actions by identity** (`id_actions`, 2026-10-27, MTG Zero M6 part 3): a segment with
+  `id_actions: base` (and an identity) also scores the action base + each present slot's
+  identity, one more pointer column per segment: in MTG Zero's team draft a card's pick, or
+  putting it in the deck, is its identity wherever the card sits (layout `draft_v1`: the pack's
+  and the pool's slots, base 0). Its range [base, base + vocab) may hold no slot action of the
+  layout; two segments may share it (their identities are distinct within a row; were one
+  repeated, one of its tokens would score it). Layouts without the key build exactly the
+  network they did (no identity column; the normalised layout stored in a checkpoint keeps no
+  `id_actions` key): MTG Zero's runs/mtg5 checkpoints load and play identically
+  (`check_checkpoint_compat`, its ENGINE.md 45).
+* `widen`: new actions get zero generic weights, new features (after the old ones) are new
+  globals with zero weights; the layout stays. With the game's new layout (`widen(...,
+  layout=)`, fork_run) a token network follows a layout that only adds (wider slots, bag rows,
+  bags, globals; the same tokens) exactly: section 10.3. Not in `zero.webexport`. CUDA: float32 eager
+  (no autocast); CUDA graphs opt-in (`TokenGraphRunner`, ZERO_TOKEN_GRAPHS=1: section 10.6).
+
+Tests: `tests/test_net_data.py` (masking of absent slots, chunking / batch independence, the
+pointer logits land on the slot actions, identity digits, save / load / widen, a training step
+reaches every part, layout validation, the toy's layout `package.TOY_TOKENS` through the
+evaluator, actions by identity: the logits, the validation, save / load / widen),
+`tests/test_loop.py` (the loop with arch 'tokens' on the toy).
+
+### 10.1 CPU cost (MTG, 13,532 features; desktop 2026-10-22, the GPU busy with other runs)
+
+Inference on real MTG positions (runs/mtg1 iteration 9 shards; `python -m <pkg>.az.bench infer
+--arch tokens --shard ...`), leaves per second, one inference thread:
+
+| network | parameters | 2 torch threads, batch 192 / 384 | 6 threads, 192 / 384 |
+|---|---:|---:|---:|
+| MLP 256 x 3 (mtg1's) | 4.19M | 11.9k / 11.8k | 24.0k / 19.5k |
+| tokens 64 x 3 (ff 128) | 0.42M | 4.3k / 4.8k | 3.8k / 6.4k |
+| tokens 96 x 3 (ff 192) | 0.76M | 3.2k / 3.2k | 3.2k / 4.3k |
+| tokens 128 x 3 (ff 256) | 1.17M | 2.0k / 2.3k | 2.6k / 3.4k |
+
+The token network does as much matrix work per leaf as the MLP at 64 x 3 (the MLP's cost is
+its 13,532 x 256 input layer) but spends it in many small ops (attention over ~25 tokens per
+row, layer norms, gathers): it does not scale with intra-op threads. Several batches evaluated
+concurrently on Python threads with few intra-op threads each do (`infer_workers`; tokens 96 x 3,
+batch 384, 8 batches each): 1 x 6 threads 4.7k leaves/s, 2 x 3 6.3k, 3 x 2 7.2k, 4 x 2 7.7k.
+In MTG self-play (rolling, 64 / 16 sims, 8 search threads; another job using 6 cores):
+the MLP 256 x 3 at 1 x 6 threads 9.0k leaves/s, tokens 96 x 3 at 1 x 6 threads 2.8k, at 4
+workers x 2 threads (4 groups, 768 games in flight) 4.6k.
+
+**The 13.5k-float feed is not the bottleneck**: the search threads were busy 14 s of 60 in
+that self-play measurement (encoding included), the rest of the time they waited for the
+network; the feature copy is one memcpy per chunk in the driver. A sparse feed (the present
+slots only, ~5% of the floats) would save memory bandwidth and shard space (27 KB per sample)
+but not inference time; not built.
+
+### 10.2 First result: MTG Zero's run mtg2 against an MLP control (2026-10-22)
+
+MTG Zero docs/ENGINE.md 22.4 has the details. Same settings (64 / 16 sims, cq targets, value_q
+0.9, reuse 2, minor decisions at 4 sims, 600 games per iteration), CPU only on a machine whose
+32 threads other runs kept busy: tokens 96 x 3 (0.76M parameters, `infer_workers` 4 x 2 torch
+threads) against the MLP 256 x 3 (4.19M).
+
+* **Per self-play game the token network is the stronger player**: head to head at 32 sims it
+  scores 65.8% +-6.1 (iteration 3 vs 3, 60 games) and 57.0% +-5.0 (iteration 5 vs 5, 100
+  games); its value head predicts unseen games better (67% vs 62% accuracy on the same held-out
+  games at iteration 3) with the same policy cross-entropy per decision kind.
+* **Per hour it is not**: 3.3-5.4k leaves/s in self-play against the MLP's 8.9-17.6k, and
+  evaluation on tiny batches is slow (12 minutes for one 20-game Elo match between two token
+  networks): 5 iterations in 3 h 35 min against the MLP's 10 in 3 h 4 min, and the MLP's
+  iteration 10 beats the token network's iteration 5 63.5% +-4.8.
+* Against MTG's rule-based yardstick both stay flat in these few iterations (tokens 2-6%, MLP
+  5.5-17%): the yardstick and head to head disagree (non-transitive styles), so a token run
+  needs Elo matches against fixed checkpoints too.
+* Initialisation matters with completed-Q targets and argmax play: random policy output layers
+  made one action dominate (55% PASS), a zero value head made every search a tie (ties play the
+  first option); the policy output layers now start at zero and the value head stays random
+  (section 10).
+
+### 10.3 Widening across a layout change (`net.widen(..., layout=)`; MTG Zero's layout v5, 2026-10-29)
+
+A game that needs more inputs can grow its object layout without a fresh start for its token
+networks, as long as the new layout only **adds**: a checkpoint of the old layout is widened onto
+the new one so that it computes exactly what it did. MTG Zero's layout v4 -> v5 (its ENGINE.md 60:
+wider permanent and stack slots, two more bags, 64 more globals) is the first such change.
+
+**What a new layout may change** (`token_feature_map(old_layout, F0, new_layout, F1)`, both
+normalised; `widen` refuses anything else with a ValueError):
+
+* **Segments**: the same names in the same order, the same slot counts, present flags,
+  identities (`id`), actions and `id_actions` - so the same tokens, (segment, slot) positions and
+  pointer columns. A slot may get **wider at its end**: its old floats are the first ones of the
+  new slot. Segment offsets may move (everything after a wider block moves).
+* **Bags**: every old bag by name, with the same width and its old rows first (new rows after
+  them); new bags anywhere.
+* **Globals**: with declared global blocks in the old layout (layout key `globals`, below), by
+  block name (the old floats first in each block; new blocks anywhere); without them, the old
+  globals are the new layout's first globals in feature order (new globals after the old ones in
+  feature order, e.g. after a trailing block).
+
+**What the widen does**: the new network is built from the new layout (same width, layers,
+heads, vocabulary); every parameter whose shape does not depend on the inputs is copied (the
+identity embedding, the (segment, slot) embeddings, the blocks, the heads, the pointer head);
+`seg_in.k` gets the old columns first and zeros for the new ones; `bag` gets each old row's
+(d + 1) columns at its new row and zeros elsewhere; `g` gets each old global's column at its new
+position and zeros elsewhere; new actions get zero generic weights and bias (as before). So every
+new input column has zero weight in its projection, and on any input of the new layout the network
+computes what the old one computed on the old features of it: a token's input map adds 0 for the
+new floats, a bag row's pool and total go through zero weights, a new global likewise, and the
+attention sees the same tokens (present flags and identities are old floats). Exact up to float
+rounding: a linear map over more (zero-weighted) columns may round its sum differently (measured
+on MTG Zero's main-line checkpoint: max |delta| 5.7e-6 on the policy logits, 3e-7 on the value
+probabilities; 95% of the rows bit for bit), and the new columns have no effect at all (the
+widened network on the same input with the new floats zeroed or random: bit for bit identical).
+
+**`globals`** (optional layout key): `[{"name", "offset", "count"}, ...]`, named blocks of
+globals in feature order that together cover every feature outside the segments and bags
+(validated). The network is the same with or without it (its globals are those features in
+feature order); it is stored in the normalised layout only when set, so the layouts in older
+checkpoints are unchanged. A layout that declares its blocks lets a later layout insert globals
+between them (MTG Zero's v5 declares `globals`, `match`, `globals_v5`).
+
+**Callers**: `tools/fork_run.py <src.pt> <new run>` passes the game package's layout
+(`GamePackage.tokens`) for a token network: the new run's iteration 0 is the widened source (the
+same layout: as before, new features are globals); the co-training `resolver_init` does the same.
+A resumed run never widens: a checkpoint whose layout is not the game's is a fork into a new run
+(the encoding guard refuses to resume it, 10.4; MTG Zero's ENGINE.md 60.5 for the procedure and what restarts: iteration numbers, Elo pool,
+window, optimizer state). The MLP and GridNet keep their widen (appended features; grid planes).
+
+Tests (`tests/test_net_data.py`): a wider synthetic layout (wider slots, a bag row, a new bag, new
+globals, every block after moved) - the map, outputs equal on any input of the new layout
+(random values in the new floats), save / load, gradients reach the new columns, a widen to the
+same layout equals the old widen; declared global blocks (the same network as without them, a
+block grown at its end and a new block between two: mapped by name; the validation); refusals
+(a new segment, more slots, a narrower slot, another present flag or identity, segments
+reordered, a bag gone, another vocabulary); `fork_run` across a layout change (the toy's layout
+replaced). MTG Zero: the real-checkpoint check of its ENGINE.md 60.2 and its pytest
+`test_a_v4_token_network_widens_onto_layout_v5_exactly`.
+
+### 10.4 The encoding guard (`net.check_encoding`; MTG Zero's layout v5, 2026-10-29)
+
+**Why**: a network fed another encoding than the one it was built for misreads it **without an
+error**. A v4 TokenNet (33,652 features) loaded by MTG Zero's v5 build (37,620) takes the first
+33,652 floats of every row (`x[:, :features]`) and reads its slots and globals where v4 had them;
+an MLP does the same; a network wider than the rows fails only somewhere later. The one safe way
+across an encoding change is a widen into a new run (10.3). So every load is checked.
+
+**The check** (`net.encoding_mismatch(config, game)` -> the differences, `check_encoding` raises
+`net.EncodingMismatch`, a ValueError): a checkpoint's `config` against what this build's game
+reports - `games.info(game)` and the game package:
+
+* the **game** (the config's `game` against the game the load site plays: the run's, h2h's);
+  a game this build does not have is a mismatch too;
+* the **feature and action counts** (`num_features`, `num_actions`);
+* arch 'tokens', when the package has a layout for the game (`GamePackage.tokens`): the object
+  layout in the parts the network reads - vocabulary, segments (every key: offsets, slot counts
+  and widths, present flags, identities, actions, `id_actions`), bags - both sides normalised
+  (`tokens_layout`); not the declared global blocks (they change nothing in the network, 10.3).
+  And the layout's **identity** (layout keys `name` / `version`, optional; MTG Zero's files carry
+  `version`): kept in the normalised layout since this change (only when set: the toy's configs
+  are unchanged), compared when the checkpoint and the build both carry one. Checkpoints from
+  before (MTG Zero's v4 runs and delver2's v5) carry none: judged by the structure, which already
+  tells v4 from v5;
+* arch 'grid', when the package has a grid for the game (`GamePackage.grids`): the board grid,
+  both sides in normal form (`net.grid_spec`: an older config without `segments` is the same);
+* a network without layout or grid metadata (arch 'mlp', older checkpoints, a game package
+  without a layout): the game and the counts alone.
+
+The message names both sides and the way out - MTG Zero's v4 main-line checkpoint on its v5
+build: `.../iter_0137.pt: a network of another encoding than this build's (features 33652 ->
+37620; token layout: segment tops: offset 17792 -> 19840; segment my_permanents: offset 18116 ->
+20164, width 148 -> 172; segment opponent_permanents: offset 22852 -> 25668, width 148 -> 172; 8
+more). The network: 'mtg': 33,652 features, 1,024 actions, token layout without a version (11
+segments, 1 bag), arch 'tokens'. This build: 'mtg': 37,620 features, 1,024 actions, token layout
+v5 (11 segments, 1 bag). Fed this build's inputs it would misread them without an error. Move a
+run across an encoding change with python tools/fork_run.py <checkpoint> <new run> (an exact
+widen when the change only adds inputs; docs/az.md 10.4), or use a build of the network's
+encoding.`
+
+**Where it runs** (every load path, for every game - a game package's own tools load through
+`zero.net.load` too):
+
+* `net.load(path, device, game=None, allow_mismatch=False)` checks before it builds the network
+  (`game`: the game the caller plays; default the config's own). Every core load goes through it:
+  the run's evaluators (self-play, the yardstick and random matches, the Elo matches, the
+  reference games), the rolling drivers' new weights, training's checkpoint, co-training's both
+  networks, the remote evaluation's mirror (`zero.remote` runs the run's own `Run.evaluate`),
+  the remote self-play worker, `zero.h2h` (A against the game played, B against its own game,
+  which must be A's), `zero.replay` (both checkpoints), `zero.targets`, `zero.bench`,
+  `zero.parity`, `zero.webexport`, a game package's extra evaluations (MTG Zero's human picks).
+  The dashboards load no networks.
+* **Run resume** (`Run.loop`, `CoRun.loop`: both networks): the newest checkpoint is checked
+  before anything starts. A mismatch ends the run with **exit status 78** (`runctl.EXIT_REFUSED`,
+  sysexits EX_CONFIG): log line `run REFUSED ...`, `run_state.json` state `refused` (the
+  dashboard: stopped, "Refused its checkpoint ..."), the message on stderr; the supervisor does
+  **not** restart it (state `refused`: a restart would refuse again).
+* **The optimizer state** (`opt_latest.pt`): loaded only if its moments have the shapes of the
+  checked network's parameters (`run.opt_state_mismatch`; torch checks the counts only, and another
+  network's state would fail at the first step); else (since 2026-11-12, 43.10) the run is refused
+  (`run.OptimizerStateMismatch`, exit 78) - deleting the file starts a fresh optimizer deliberately; a state
+  of another iteration is logged and replaced by a fresh one.
+* **The evaluator's last line** (`infer.NetEvaluator`): a leaf batch whose rows are not as wide
+  as the network's input raises EncodingMismatch (one comparison per batch), whatever loaded the
+  network.
+* **Remote evaluation** (5.2): the remote's `python -m <pkg>.az.remote eval|evalnet` refuses with
+  exit 78 and one line `ZERO_REMOTE_REFUSED {"error": ...}`; the run logs `remote eval <name> iter
+  <i> REFUSED by the remote's build ...: <the message in full>` and retries every `RETRY_S`
+  (the remote's checkout may be fixed: `mac.sh --eval-checkout`), as for any failure.
+* **Remote self-play** (5.3): the worker refuses the phase's checkpoint (error kind `encoding`,
+  exit 78, its own log `REFUSED the checkpoint`); the run logs `worker <k> REFUSED the run's
+  checkpoint (its checkout <repo> on <host> is not the run's encoding?): <the message>` (the first
+  three times, then every 10 minutes), restarts the worker after the retry delay, and plays on
+  alone (this machine's share grows: no game is lost).
+
+**The opt-outs** (`allow_mismatch=True`), only where a mismatch is the point:
+
+* `tools/fork_run.py <src.pt> <new run> [--game G]`: loads the source past the guard (an older
+  encoding is what it widens), widens it (10.3; a conv network now follows the game's grid too)
+  and **checks the fork** against this build's encoding before writing it (`--game`: recorded in
+  the fork's config; widen keeps the source's game). `fork_run --source` (a continuation) copies
+  files and loads nothing.
+* Co-training's `resolver_init` (11): the same - loaded past the guard, widened, the result
+  checked before it is written.
+* `tools/selfplay_digest.py` (`tools/check_checkpoint_compat.py`): an old-vs-new comparison may
+  play a checkpoint on a build of another encoding on purpose (`net.load` and `NetEvaluator`
+  with `allow_mismatch`, when the checkout has the argument).
+* `net.widen` itself loads nothing; the widen tests load their test networks (of no game of this
+  build) with the opt-out.
+
+**What does not change**: a matching checkpoint loads, builds and plays exactly as before (the
+check only reads the config); toy checkpoints' configs are unchanged; `widen` to the layout a
+network has (up to its identity) is the old widen (it records the new layout's identity).
+
+**Co-training's first start** (found by MTG Zero's td1 migration, its ENGINE.md 60.7): with no
+iteration holding both checkpoints, `CoRun.loop` used to save a fresh primary over an existing
+`models/iter_0000.pt` - a draft network forked into the run, with the play network to come from
+`resolver_init`, became the preset's fresh network without a word. Now (`CoRun.first_checkpoints`)
+an existing checkpoint 0 of either network is kept (logged: `primary iteration 0 = the checkpoint
+already there, kept: ...`), the missing one is created (the primary fresh, the resolver from
+`resolver_init` or fresh), and both are checked by the guard; refused (exit 1, nothing written)
+when the resolver has a checkpoint 0 and `resolver_init` is set too, or when either network has
+checkpoints after 0 but no iteration has both.
+
+Tests (`tests/test_encoding_guard.py`; the "v4" stand-ins: the toy's encoding with the players'
+slots one float narrower, 191 features, and an MLP of 185 features, against the toy build as
+"v5"): the check (both sides named; the game, an unknown game, a moved segment at the same width,
+declared blocks ignored, the version compared when both carry one, the counts alone for an MLP,
+the grid and its older normal form); every load site refusing (`load`, `Run.evaluator`, h2h both
+ways, replay both checkpoints, targets, bench, webexport, the evaluator's rows, also on its worker
+threads); the optimizer state of another network; run resume (exit 78, nothing written, the
+state, the supervisor not restarting a refusing run); fork_run widening a v4 token checkpoint
+exactly (outputs equal on real toy rows at the map) and the fork resuming, an MLP fork, a fork the
+widen cannot bring onto the encoding not written; co-training (resolver_init from a v4 checkpoint,
+widened exactly; a v4 resolver refused at the resume; the first start keeping a forked primary bit
+for bit with resolver_init, keeping a resolver checkpoint 0, refusing the ambiguous directories);
+the remote evaluation's refusal (exit 78, the line, the lock released; the run's log in full, the
+retry); a remote self-play worker refusing while the run plays every game; selfplay_digest playing
+a narrower checkpoint (the opt-out).
+
+**Checks** (7132cb8 on main f3f5535; desktop 2026-10-29, CPU only, MTG Zero's delver2 live on the
+GPU and the Mac). Tier "core behaviour, byte-identical defaults for matching checkpoints":
+
+* `cargo test --release`: zero_search 50 passed, zero_webnet 3; `pytest tests`: **202 passed** (9
+  min 49 s; the 15 above among them).
+* **Byte identity** against f3f5535 (its own worktree and target dir): toy-smoke runs of 3
+  iterations - MLP vs `ext:toyheur`, tokens, and `cq` targets + `eval_select cq` guard 2 + rolling -
+  on both checkouts: every sample shard, `config.json`, `elo/results.json`, `models/index.json`
+  byte for byte, every checkpoint tensor for tensor with the same config and extra (the files
+  differ only in torch's archive root, named after the writing pid), the metrics equal without
+  their timings; `tools/check_checkpoint_compat.py --package zero` with a toy MLP checkpoint, a toy
+  token checkpoint, `random` and `uniform`: identical.
+* **The other games** build against it (build only, at their HEADs with this core in their
+  `third_party/zero-core`; the PyO3 crate, every test compiled, the package imported with this
+  core): Glass Road Zero c1f56dc 36 s, Caverna Zero a6fad73 55 s, Kingdom Builder Zero 4202a4a 85 s.
+* **Every game's existing checkpoints** (each run's newest, read-only): the paused runs of the
+  hub's manifest with the worktree each resumes from (its game code and built engine, this core's
+  Python): Glass Road grz2p_rb (run-c1f56dc), Caverna cvz2p_cq (run-5170335), Kingdom Builder kbz2p
+  (run-001dd88), kbz2p_pin1 (fixed-setup), kbz2p_vq9 (run-5c93167), kbz2p_grid and kbz2p_gridgold
+  (run-8f9ff15), kbz2p_xstbig_aux_rm and _rm_deep (run-99993c0): **all accepted**. Every other run
+  too: Glass Road's 7 and Caverna's 5 with their HEAD builds; Kingdom Builder's 22 with the build of
+  their game (HEAD; the aux-targets line run-2ece130 for kingdombuilder-xs / -xst; `options` for
+  -glso): all accepted - on KB's HEAD build its xs / xst / glso runs are refused as games it does
+  not have, correctly (they were trained on branches). The five `aux` runs' networks do not build
+  on main's core at all (GridNet has no `aux`: that line's core is unmerged), whatever the guard.
+  Dominion Zero and St. Pete Zero are not on zero-core (their own `net.load`): not affected.
+* MTG Zero (its ENGINE.md 61): every v5 run accepted, every v4 and older refused; the main line's
+  v4 `ab2-cqscale03/iter_0137` refused at run resume (exit 78) and by the evaluator, delver2's v5
+  `iter_0000` accepted by both.
+
+### 10.5 What a bigger token network costs (MTG Zero's Delver positions; desktop CPU, 2026-10-29)
+
+`python -m <pkg>.az.bench infer --arch tokens --hidden D --blocks L --heads H --ff FF --shard S ...
+--batches 96,192,384 --workers W --torch-threads T --ops` (the bench's new options: real positions
+from shards, concurrent batches on threads as `infer_workers` runs them, the operators and
+multiply-adds of one forward pass). MTG Zero's layout v5 (37,620 features, 1,024 actions), rows of
+its Delver mirror run's shards (runs/delver2 iterations 19 and 21: 17 tokens a row on average);
+the desktop's i9-13900K at below-normal priority beside other runs, 5 s per cell, the mean of two
+rounds; heads of 32 floats, feed-forward 2 x width:
+
+| network | parameters | multiply-adds / leaf | kernels / forward (batch 96 / 192) | 2 workers x 3 threads, batch 192 | 1 x 3, batch 96 / 192 / 384 | 1 x 1, batch 192 |
+|---|---:|---:|---:|---:|---:|---:|
+| 128 x 4 (MTG Zero's) | 1.55M | 21.9M | 515 / 585 | 4,627 | 3,290 / 3,250 / 4,280 | 1,622 |
+| 128 x 8 | 2.08M | 39.9M | 595 / 705 | 2,918 (1.59x) | 1,954 / 1,960 / 2,742 | 980 (1.66x) |
+| 192 x 6 | 3.59M | 65.5M | 555 / 645 | 1,996 (2.32x) | 1,497 / 1,500 / 1,540 | 642 (2.53x) |
+| 192 x 8 | 4.18M | 85.1M | 595 / 705 | 1,536 (3.01x) | 1,072 / 1,040 / 1,580 | 526 (3.09x) |
+| 256 x 6 | 5.93M | 112.8M | 555 / 645 | 1,114 (4.16x) | 894 / 941 / 1,232 | 379 (4.28x) |
+| 256 x 8 | 6.98M | 147.1M | 595 / 705 | 864 (5.36x) | 670 / 716 / 928 | 314 (5.16x) |
+
+(leaves per second; in brackets the cost per leaf against 128 x 4.)
+
+* **On a CPU the cost follows the arithmetic**: 2.3x per leaf for 192 x 6 (3.0x the multiply-adds),
+  4.2x for 256 x 6 (5.1x), 5.4x for 256 x 8 (6.7x). At width 128 the small operators still take a
+  share (10.1), so the ratios stay below the multiply-adds'; the bigger networks are arithmetic.
+  Concurrent batches (`infer_workers`) help every size alike.
+* **The operators barely change**: a forward pass dispatches 515 kernel-launching operators at
+  128 x 4 (batch 96: two chunks of rows), 555 at 6 layers of any width, 595 at 8, and 14 host syncs
+  (the packing's `nonzero` per segment, the chunks' lengths) in every size. Eager CUDA inference of
+  this network is bound by its operators, its syncs and the per-row work (the 37,620-float rows'
+  upload, the packing) rather than by its arithmetic: MTG Zero's desktop self-plays at 5-6k leaves/s
+  at batches of 96 and of ~384 alike (its ENGINE.md 54.11, 62). So a wider network costs the GPU
+  little and a deeper one a few percent per layer (+8% operators at 6 layers, +16% at 8); not
+  measured on the GPU (busy with the runs). MTG Zero's throughput plan for a bigger network: its
+  ENGINE.md 62. Section 10.6 takes the operators and syncs out with CUDA graphs.
+
+### 10.6 CUDA graphs of the token network (`infer.TokenGraphRunner`; MTG Zero's Delver line, 2026-10-31)
+
+**Why.** The desktop's share of MTG Zero's Delver self-play and, above all, every head-to-head and
+Elo evaluation it runs on the RTX 5090 are eager CUDA inference of the token network, bound by its
+operators and host syncs (10.5): 445 kernels and 13 syncs a forward of 64 rows of the main line's
+128 x 4 network, 585 and 15 at 192 rows; on the GPU shared with a training run every sync waits
+behind the other process's work. A 2,400-game paired head-to-head at 32 simulations took ~80 minutes.
+The conv network has had CUDA graphs since Kingdom Builder (`GraphRunner`, ZERO_CUDA_GRAPHS); the
+token network's eager forward packs each batch by its data (`nonzero` per segment, the rows sorted
+by token count, chunks as long as their longest row), which a graph cannot capture.
+
+**Opt-in, off by default** (every default: the evaluator of before, byte for byte):
+
+* `NetEvaluator(model, 'cuda', graphs=True)` (False: eager; None, the default: the env below);
+* env `ZERO_TOKEN_GRAPHS=1`: every token network's evaluator of the process that has no `graphs`
+  given - the run loop's self-play and evaluations (`Run.evaluator`, co-training's, the league's),
+  `zero.h2h`, `zero.bench`, `zero.replay`, `zero.targets`, on CUDA (distillation and the held-out losses
+  call the network directly: eager). A run gets it from its environment (`ZERO_TOKEN_GRAPHS=1 python
+  tools/launch_hidden.py ... tools/supervise.py ...`: the supervisor passes its environment to the run;
+  a remote's workers do not get it: the Mac runs on its CPU anyway). No run
+  setting: `Run.evaluator` would pass one (`infer_graphs` in DEFAULTS), left for when run.py is not
+  being changed by another branch;
+* `ZERO_CUDA_GRAPHS=0` (the conv network's switch) turns the env off too: no CUDA graphs anywhere,
+  said on stderr. An explicit `graphs=True` wins over both envs, as it always did for the conv
+  network;
+* `zero.h2h --graphs 0 | 1` (both sides), `--a-graphs` / `--b-graphs` (one side, over `--graphs`): given,
+  the output names `graphs_a` / `graphs_b`, each side's share of batches through the graphs;
+  `zero.bench infer | selfplay --graphs 0 | 1` (the output's `graphs`);
+* **never a silent fallback**: asked for by the env on a CPU evaluator, or turned off by
+  ZERO_CUDA_GRAPHS=0, is said on stderr (`zero.infer: ... eager inference`); `graphs=True` on a CPU
+  evaluator, or for an MLP, is a ValueError; when on, each evaluator says `zero.infer: token network
+  CUDA graphs on` (a run's console). Every batch goes through the graphs - root belief rows and
+  value-only rows included -, and `NetEvaluator.graph_calls` counts them (`graph_calls == calls`).
+* **float32** (`use_amp` stays the conv network's). `TokenGraphRunner(model, amp=True)` (bfloat16
+  autocast) exists for the measurement below only; no switch reaches it.
+
+**How** (`zero/infer.py`, `zero/net.py`):
+
+* **The host packs the batch** (numpy, `token_presence`, `token_index`): each slot's present flag read
+  from the features, each row's token count and its tokens' positions in the full token axis (the
+  global token's 0 first, layout order, then padding). The batch is padded to B rows (a multiple of
+  ROW_STEP = 64) x T tokens (the longest row's, a multiple of T_STEP = 16); one graph per (B, T),
+  captured on first use (two warm-up runs on a side stream, then the capture; ~10 shapes in a
+  200-game head-to-head).
+* **`TokenNet.forward_static(x, n, full, ntok, aux)`**, what the graphs capture: every slot embedded,
+  present or not (the per-segment input maps on all slots, every identity decoded by one gather of
+  the digit floats per radix: 156 kernels whatever the batch, no sync), the tokens gathered by `full`,
+  the whole batch one chunk of T tokens (padding masked out of the attention as in a chunk), then the
+  trunk and heads of `forward` (`_trunk`, `_heads`: the chunk body and the heads moved out of `forward`
+  unchanged - the same operations in the same order: `forward`'s outputs and gradients are bit for bit
+  those of c15e3d0 on the Delver rows, CPU and CUDA). With the auxiliary head, the head's predictions
+  of every row (`aux_predict` in the graph); after the replay the batch's root belief rows are
+  gathered on the device and downloaded (no host sync). Value-only rows are rows with no options.
+* **One upload, one download.** Pinned host buffers, a set per batch in flight (any number in flight:
+  a set is reused after its `result`); the host copies the features outside the segments and only the
+  present slots' floats (an absent slot's are never read: its token is not gathered; for the Delver
+  rows 44% fewer bytes); the options' softmax on the CPU (numpy), as GraphRunner. One set of device
+  inputs and one memory pool for every graph (they run in order on one stream). The graphs read the
+  model's own parameters: `set_weights` (load_state_dict, in place) is seen by the next replay.
+
+**Numerics** (graphs against eager on the main line's iteration 328 and 8,192 held-out rows,
+`runs/heldout/r3-2b_iter0197fresh_8192.npz`; batches of 1-1,024 rows, a third value-only, 5% root
+belief rows, 3 batches a size):
+
+| output | max abs. difference | mean abs. difference |
+|---|---:|---:|
+| priors | 2.9e-6 | 8.7e-8 |
+| value (P(win)) | 9.5e-7 | 1.3e-8 |
+| margin | 2.4e-6 | 1.1e-7 |
+| belief (the head's distribution) | 5.1e-7 | 3.9e-10 |
+
+float32 rounding: the matrix products run at other shapes (one chunk of B x T rows against eager's
+chunks of 64 rows each as long as its own longest row, the input maps over all slots) and cuBLAS picks
+its kernels by shape; the same at every batch size (no growth with B or T), replays bit for bit
+deterministic, a row alone and inside a batch within 1.3e-7. A fresh 192 x 6 network (6 heads, feed-
+forward 384, the belief head: MTG Zero's bigger candidate, its ENGINE.md 62.3) on the same rows: priors
+4.8e-7, value 1.8e-7, margin 5.4e-7. Not a concern for the search (a prior or value 1e-6 off moves a
+visit only at a near tie, at 32-64 simulations); but the games are then not exactly the same games,
+which is why the head-to-head below measures the equivalence.
+
+**Throughput** (the desktop's RTX 5090 shared with the main line's training and self-play and another
+session's head-to-head, 67-78% busy before any of these; eager and graphs interleaved so the
+contention hits both alike). Inference alone (real rows as the search sends them - a third
+value-only, 3% belief rows -, drive's pipeline of two batches in flight, 3 s a cell, the median of 3
+rounds), leaves per second (ms a batch):
+
+| rows a batch | eager | graphs | graphs / eager | graphs, bfloat16 |
+|---:|---:|---:|---:|---:|
+| 64 | 3,034 (21.1) | 21,790 (2.9) | 7.2x | 22,488 |
+| 96 | 3,510 (27.4) | 26,008 (3.7) | 7.4x | 23,837 |
+| 144 | 4,291 (33.6) | 27,054 (5.3) | 6.3x | 26,816 |
+| 192 | 5,305 (36.2) | 25,680 (7.5) | 4.8x | 26,605 |
+| 256 | 5,698 (44.9) | 27,071 (9.5) | 4.8x | 25,364 |
+| 384 | 6,897 (55.7) | 27,580 (13.9) | 4.0x | 27,761 |
+| 512 | 6,871 (74.5) | 26,690 (19.2) | 3.9x | 26,491 |
+
+A head-to-head of iteration 328 against itself (`zero.h2h`'s seats: 200 games, 32 simulations,
+`cq-n4-v50-s0.3-rv-b1m0.25` both sides as the A/B driver plays them, 8 search threads, 200 games in
+flight: batches of 36 rows on average, 64.9k of them): **eager 1,753.7 s, graphs 261.3 s - 6.7x**
+(843 against 5,681 leaves/s; an earlier version of the graphs, 443 kernels a replay and the whole
+rows copied, 284.1 s); the same seed's games, A 0.505 in both. With the graphs the evaluators took
+230 s of the 261 (3.5 ms a batch), the search threads were busy 11% of their time. The A/B driver's
+shape, 2,400 paired games (1,024 in flight) with the graphs on both sides: **1,670.6 s (27.8 min)**
+against ~80 minutes for an eager 2,400-game paired head-to-head that day (as reported; not
+interleaved, and this one ran with this branch's gate compiling and testing on the CPU beside it); its
+1,200 pairs all split (two identical, deterministic sides).
+
+Self-play at the main line's settings (its config.json's self-play seat - 'cq' targets, root-view
+leaves with value-only samples 0.5, the belief tilt 1 / mix 0.25, 64 / 16 simulations, minor 4 -, 192
+games in flight, 8 threads, 2 groups, recording; batches of ~145 rows as its desktop share's; 60 s of
+warm-up, then 120 s measured; eager, graphs, eager, graphs): **eager 2,195 and 2,004 leaves/s, graphs
+6,457 and 8,028 - 3.4x** (2.9x and 4.0x a pair; the run's own desktop self-play measured 4.3k eager
+leaves/s that day, its phases not overlapping another head-to-head). With the graphs the evaluator holds 72-76% of the time: the search
+and the host's per-row work are now a quarter of it.
+
+**Bfloat16** (the same graphs under autocast, measured only): the same leaves/s (the table's last
+column: the graphs are not bound by arithmetic) and 10^4 x float32's differences (priors up to 0.036,
+value up to 0.014, margin 0.021, belief 0.007). Not worth it; no switch reaches it.
+
+**Where the graphs' time goes** (one batch, 64 / 192 / 512 rows of T 64; CUDA events and the host's
+clock): the host's packing 0.2 / 0.3 / 1.9 ms, its copy of the rows into the pinned buffer 1.9 / 3.8 /
+12.9 ms, the upload 0.6 / 1.7 / 4.4 ms, the replay 1.2 / 2.4 / 4.3 ms (156 kernels; 1.7 ms at 64
+rows with the first version's 443), the download 0.04-0.13 ms. Pipelined (two batches in flight), a
+batch costs about the larger of the host's part and the device's: **from ~192 rows the host's copy of
+the 37,620-float (150 KB) rows bounds it, at ~27k leaves/s.** Copying only the features outside the
+segments and the present slots (44% of the bytes) saves 10-26% of the copy against whole rows (fresh
+batches: 0.89 against 1.20 ms at 36 rows, 3.07 / 3.38 at 144, 9.86 / 11.58 at 512; the fancy indexing
+costs the rest), and the bags (19,456 of the floats, 0.4% nonzero) are copied whole. The rows are 0.7%
+nonzero (~260 floats): the next step is a sparse feed from the driver (10.1: not built), which would
+take the copy and most of the upload out; pinning the driver's own array in place
+(`cudaHostRegister`, ~1 ms) was no faster (its upload 9-15 ms and the unregister 3-7 ms at 512 rows).
+
+**Memory**: the graphs share one pool; a 200-game head-to-head's two evaluators peaked at 414 MiB of
+the device (10 shapes each), one evaluator with shapes up to 1,024 x 80 at 914 MiB; pinned host
+buffers of at least 256 rows x 150 KB (38 MB) a batch in flight and an evaluator.
+
+**Equivalence** (the same checkpoint, A through the graphs, B eager: `zero.h2h A A --paired --games 400
+--a-graphs 1 --b-graphs 0`, seed 11, the A/B driver's search otherwise: 32 simulations, chance_k 2,
+`cq-n4-v50-s0.3-rv-b1m0.25` both sides; `graphs_a` 1.0, `graphs_b` 0.0): **A 0.4975 +- 0.0043** (the pair
+scores' se; the games' binomial 0.025), Elo -1.7 +- 3.0, margin +0.03, none unfinished. 197 of the 200
+deals were split - each seat won its deal under both inferences, as a mirror's paired games do when
+the two players play the same moves -, 1 won twice by A and 2 by B (variance ratio 0.03): float32
+rounding changed the outcome of 1.5% of the deals and favours neither side. (Unpaired, the same seed's
+200-game matches with the graphs on both sides and eager on both sides scored A 0.505 alike.)
+
+**Limits.** One graph per (B, T) shape: a batch of an unseen shape pays a capture (26-75 ms from 64 x
+32 to 1,024 x 80; the process's first 0.7 s, the libraries' start; ~10 shapes in a match, 13 in the
+numerics' 1-1,024 rows). Batches of fewer rows than ROW_STEP run as 64 (at 36 rows on average a
+200-game match's padding is ~45% of the rows; the GPU does not care, the copy is of the real rows
+only). `GraphRunner` (the conv network's) is unchanged: its two fixed host
+slots would be overwritten by a third batch in flight (ZERO_INFLIGHT > 2), which the token runner's
+per-launch buffers avoid. Eager `NetEvaluator.launch` counts its batch's seconds twice (in `evaluate`
+and again in `launch`): an eager run's `selfplay.infer_s` is about twice the evaluator's time (the
+main line: 408 s of a 240-s phase); not changed here (a metric of every eager run).
+
+Tests (`tests/test_token_graphs.py`): `forward_static` against `forward` (both layouts, the auxiliary
+head, longer rows, padding positions holding other slots, padding rows), the host's packing; off by
+default and the switches (env, ZERO_CUDA_GRAPHS=0, a CPU evaluator said / refused, an MLP, explicit
+False); zero.h2h's flags (given: `graphs_a` / `graphs_b`; not given: the match of before; a CPU side
+refused); CUDA: the graphs against eager on batches of 1-130 rows with value-only and root belief
+rows (2e-5), replays deterministic, new weights in place, an absent slot's NaN floats never read
+(before and after other batches), four launches in flight, toy games with the belief and root-view
+leaves through the graphs (every batch, every answer valid, drive's pipeline too).
+
+Checks (tier "opt-in core feature with byte-identical defaults"; the desktop, 2026-10-31, on 3d5875e,
+the code; this commit adds documentation only):
+
+* **`TokenNet.forward` bit for bit c15e3d0's** (the refactor into `_global` / `_trunk` / `_heads`): its
+  outputs (with the auxiliary head on a subset of rows, and without) at batches of 1-1,500 Delver
+  rows and a training step's gradients (256 rows), CPU and CUDA, compared bit for bit (the CPU gradient
+  of `pos` differs run to run in both checkouts: threaded accumulation).
+* `pytest tests/test_token_graphs.py tests/test_net_data.py tests/test_belief.py tests/test_aux.py
+  tests/test_measure.py` with CUDA: 79 passed, none skipped. The whole suite on the CPU (in MTG Zero's
+  gate): 305 passed, 8 skipped (CUDA), 2 failed - `test_remoteplay.py`'s
+  `test_cotrain_the_local_driver_is_never_starved` and `test_a_dying_worker_gives_its_accepted_games_back`,
+  shares of games between the local driver and a worker; run side by side on c15e3d0 and here under
+  the same load the first fails in both the same way (the local driver's share 23 / 158 and 21 / 158,
+  the bar 15%) and the second passes in both: load, not this change.
+* Toy-smoke token runs byte for byte against c15e3d0 (its own worktree and target, `ZERO_INFLIGHT=1`,
+  the CPU, 4 iterations, seed 3): classic with `ext:toyheur`, and the Delver line's shape (rolling, 'cq'
+  0.3, the cq2 rule, root-view leaves with value-only samples 0.5, the auxiliary head `aux_next_card_w`
+  0.25 with the belief tilt 1 / mix 0.25, value_q 0.6, `elo_offsets` 1,2, no random games, margin_w
+  0.2), each without the env and with `ZERO_TOKEN_GRAPHS=1` on the CPU (said: eager): every shard,
+  checkpoint (zip members), optimizer state, Elo file and the metrics without timings identical. The
+  Delver-shaped run on CUDA with the env: 4 iterations, every evaluator through the graphs (rolling
+  `set_weights` included).
+* `check_checkpoint_compat --package mtgz` against MTG Zero's main 1605436 (zero-core c15e3d0): a random
+  network (the gate) and the main line's iteration 328 (the Delver spec, 8 games a target, 8 against
+  random): identical (records visits 73693aedf6cb0b7f, cq 6dd36ebeb19d9fbf, results 38b68141fc4cff90).
+* MTG Zero (branch `token-graphs`, its ENGINE.md 78): `tools/gate.py optin-core` twice on 23d4fd3 (this
+  core at 3d5875e): core tests 92 passed, checkpoint_compat byte identity identical against main 1605436,
+  `--test az` 39 passed, `--test hidden` 16 passed, Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder
+  4202a4a build against this core - and the last step **FAILED both times** on its smoke_all's core
+  pytest: the first run on the two `test_remoteplay.py` tests above (305 passed), the second on
+  `test_cotrain_the_local_driver_is_never_starved` alone (306 passed), which fails the same way on
+  c15e3d0 under the same load (above). Every other step passed both times.
+
+### 10.7 Sparse batches in a run (run setting `sparse`; MTG Zero's Delver line, 2026-11-01)
+
+**Why.** With the token network's CUDA graphs (10.6) a batch of the Delver line's self-play (~144 rows,
+37,620 floats a row, ~0.7% of them non-zero) spent most of its time moving zeros: the driver assembling
+the dense rows in fresh memory, the graphs' pinned copy (3.8 ms at 192 rows) and the upload (1.7 ms),
+against a 2.4 ms replay. Its self-play process used under half a CPU core and waited on inference 90%
+of the time. The sparse batches built for the lookahead (docs/search.md 2.2, `DriverCfg::sparse`,
+`TokenGraphRunner.launch_sparse`) take both copies out.
+
+**What.** Run setting `sparse` (default 0: the drivers of before, byte for byte): `Run.driver` passes
+`sparse=True` to every driver the run builds - self-play (rolling or not), the yardstick / random / Elo
+matches, co-training's and a remote's (from the mirror's config; a remote's `overrides` can turn it off -
+MTG Zero's Mac does, its CPU evaluators would only densify). The rows, games and samples are the dense
+ones' (the graphs' answers bit for bit at the same batch shape, 10.6 / search.md 2.2); only the batches'
+transport changes.
+
+**Equivalence.** `tests/test_loop.py::test_sparse_setting_plays_the_same_selfplay`: an iteration's
+self-play of the toy run, its shards array for array the dense one's. On MTG Zero's Delver line
+(iteration 489, the run's self-play seat, CUDA graphs, 24 games in flight, 8 threads, the first 24
+finished games' samples and results hashed): dense d31a5acb09179104 twice, sparse d31a5acb09179104.
+
+**Throughput** (the line's local self-play exactly as `Run.selfplay` drives it - its rolling driver,
+seat and evaluator with ZERO_TOKEN_GRAPHS=1, samples taken every 32 batches -, from iteration 489; 90 s
+of warm-up, then 150 s measured; one configuration a process, configurations interleaved, two or four
+rounds; the RTX 5090 shared with another session's live run, so the absolute numbers are a loaded GPU's;
+8 search threads):
+
+| batches | groups | in flight | leaves/s (range) | x dense | rows a batch | CPU cores |
+|---|---:|---:|---:|---:|---:|---:|
+| dense | 2 | 192 | 13,390 (12,792-13,989) | 1.00 | 144 | 0.40 |
+| sparse | 2 | 192 | 24,996 (24,801-25,192) | 1.87 | 144 | 0.62 |
+| sparse | 4 | 192 | 20,037 (19,867-20,207) | 1.50 | 72 | 0.52 |
+| sparse | 2 | 384 | 35,610 (34,723-37,636) | 2.66 | 288 | 0.65 |
+| sparse | 4 | 384 | 31,536 (31,214-31,859) | 2.36 | 144 | 0.58 |
+| sparse | 2 | 768 | 44,278 (43,477-45,078) | 3.31 | 575 | 0.53 |
+| sparse | 2 | 1,536 | 41,694 (40,614-42,775) | 3.11 | 1,143 | 0.55 |
+
+Dense batches grow their host copy with the batch (10.6: flat at ~27k leaves/s from ~192 rows), so more
+games in flight did not pay; sparse ones do, up to ~768 in flight (batches of ~575 rows) on this GPU.
+More groups only split the same games into smaller batches. The process stays under a core: the GPU (and
+its other tenant) is the limit now, not the host.
+
+### 10.8 A sparse training window (run setting `window_sparse`; MTG Zero's Delver line, 2026-11-01)
+
+**Why.** With faster self-play (10.7) the Delver line's training became the larger part of a
+generation: ~100 s, of which 40-54 s was loading the window. The window's shards (iteration 489: 73
+shards, 864k rows - 7 local shards of 29.8 GB stored plain, 66 remote ones of 0.5 GB compressed, 36 GB
+inflated) exceed the 34 GB budget, so the window is a subsample (438k rows) - and a subsampled window
+cannot use the WindowCache (window_cache was on and reused nothing): every iteration read and inflated
+every shard again. The rows are 252 non-zeros of 37,620 floats on average.
+
+**What** (zero/data.py; opt-in, the default the window of before):
+
+* `SparseRows`: features as CSR rows (int64 offsets, uint16 column indexes - int32 past 65,536 features -,
+  float16 values). Non-zero is decided on the float16 bits, so a -0.0 is kept: `dense()` gives the dense
+  rows bit for bit, and float32 rows directly (exact) for a batch.
+* `Window(sparse=True)` (run setting `window_sparse`): each shard's features converted to SparseRows as
+  it loads - in chunks of 1,024 rows on the window's threads (numpy releases the GIL), read in place
+  (np.memmap of the npz member) when the shard is stored uncompressed, since np.load copies a member
+  through a Python loop that holds the GIL (two 4 GB local shards could not load in parallel). The
+  non-finite guard of `x` reads the non-zeros (a NaN / inf is never zero bits); a bad shard is described
+  from its dense rows as before.
+* With a WindowCache every shard is cached whole (as SparseRows), also over budget: the window draws the
+  same picks as loading (the same random stream), cuts the other arrays from the cached parts
+  (`_subset_part`) and reads each row's features from its cached shard by `src_row` when a batch is built.
+  An iteration loads only its new shards. The cache's key includes the representation, so turning the
+  setting on or off mid-run loads afresh.
+* The budget (`ram_budget_gb`) still counts dense rows: the same rows as without the setting. A bigger
+  budget would now cost little RAM - and change the window (more rows kept): a training change, not part
+  of this setting.
+
+**Equivalence.** `tests/test_net_data.py::test_sparse_window_is_the_same_window` (mostly-zero features
+with -0.0s, auxiliary targets, plain and compressed shards, networks narrower and wider than the shards,
+over budget, a cache over sliding windows, several chunks on threads): every array, the features bit for
+bit and the batches. `tests/test_loop.py::test_window_cache_trains_the_same_network`: training with
+window_sparse (with and without the cache and prefetch, and over budget from the cache twice) gives the
+network of the dense window, weight for weight. On the Delver line's shards: the dense and sparse windows
+of iteration 489 at a 40k-row budget, and the cached and uncached sparse windows at the full budget -
+every array equal, 20 batches of 512 bit for bit.
+
+**Measured** (the Delver line's windows, budget 438,636 rows, 8 threads, the desktop shared with a live
+run):
+
+| | dense, cache over budget (before) | sparse + cache |
+|---|---:|---:|
+| a window, cold (the process's first) | 54.1 s (iteration 489) | 29.8 s (iteration 488) |
+| the next iteration's window | the same: nothing reused (the run's log: 32-61 s) | 6.6 s (iteration 489: 8 new shards, 2 of them local) |
+| the process's RAM after it | 34 GB of window + the rest | 4.3 GB in all (the cache 2.8 GB of it) |
+| a batch of 512 rows | - | 19-21 ms |
+
+A warm window is its new shards (3.3 s: a 65k-row local shard read in place and converted on 8
+threads 1.8 s, on one 5.0 s) and the window's assembly from the cache (1.1 s).
+
+### 10.9 The static training step (run setting `train_static`; MTG Zero's Delver line, 2026-11-01)
+
+**Why.** With sparse self-play batches and a sparse window (10.7, 10.8) a Delver generation was ~183 s:
+self-play ~133 s and training ~49 s (542 steps of 512 rows, ~91 ms a step; the window 3 s). The step was
+the eager `TokenNet.forward` (10.5): the batch packed by its data (`nonzero` per segment, its rows sorted
+by token count, chunks of 64 rows each as long as its longest row: ~20 host syncs and ~1,200 kernels a
+forward of 512 rows) and its backward, then a foreach AdamW. A micro-benchmark on the line's iteration
+580 (512 held-out rows, the RTX 5090 shared with the live run; the run's own loss replaced by a simpler
+one of the same outputs):
+
+| the step | ms |
+|---|---:|
+| eager forward, foreach AdamW (the run's) | 88.5 |
+| eager forward, fused AdamW | 71.1 |
+| `forward_static` (10.6), fused AdamW | 29.2 |
+| `forward_static`, fused AdamW, bfloat16 autocast (measured only) | 20.2 |
+
+**What** (opt-in, `train_static` 0 the training of before line for line):
+
+* `Run.train_model` trains a token network through `TokenNet.forward_static` - every slot embedded, each
+  row's tokens gathered by `full`, the whole batch one chunk of its longest row's tokens (rounded up to
+  `infer.T_STEP`), no host sync - and, on CUDA, with `torch.optim.AdamW(..., fused=True)` (the same
+  update, one kernel set for all parameters; its optimizer state loads from a foreach one's and back).
+  Another network (MLP, GridNet) is refused (`SystemExit`: set train_static 0).
+* The batches carry each row's tokens (`Window.batch(..., tokens=(present_index, T_STEP))`: `full` [B, T]
+  and `ntok` [B], `infer.token_presence` / `token_index`'s, built on the prefetch thread).
+* **A sparse window's batches travel as their non-zeros** (`Window.batch(..., coo=True)`,
+  `Window.features_coo`; `data.dense_coo`): ~130k (row, column, float16 value) triples a batch of 512
+  Delver rows (~2.5 MB) instead of 77 MB of float32 rows, scattered into zeroed rows on the device - the
+  dense rows bit for bit (float16 values are exact in float32; a -0.0 is kept) - and the tokens read from
+  the non-zeros (a flag present when its value > 0.5, as on the dense rows). With the dense rows the
+  feed cost the step ~15 ms of densifying and ~10 ms of tokens on the prefetch thread and a ~10 ms
+  pageable upload on the training thread; as non-zeros a batch takes ~10 ms on the prefetch thread and
+  ~1 ms to upload (fed: 6.2-6.9 ms a batch with prefetch 2, the step no longer waits for it).
+
+**Equivalence.** `forward_static`'s outputs are `forward`'s up to float32 rounding (10.6: other matrix
+shapes, cuBLAS picks its kernels by shape). One step's loss and gradients on the toy token run: equal to
+1e-7 of each gradient's scale (`tests/test_loop.py::test_train_static_trains_the_same_network_up_to_rounding`).
+Over a training AdamW's per-parameter normalisation amplifies that rounding where a gradient is tiny: the
+toy's trained networks end within ~2% of the largest weight change (the test's bar 5%), CPU (foreach) and
+CUDA (fused) alike; with a sparse window (cached or not, prefetch on) the same network as the dense
+window's, weight for weight on the CPU. On the Delver line (one generation's training, iteration 585 from
+checkpoint 584 and its optimizer state, the same window, 542 steps, in one process): the training's
+logged losses (means of the last 200 steps)
+
+| | policy | value | margin | entropy | belief |
+|---|---:|---:|---:|---:|---:|
+| eager | 0.22216 | 0.37837 | 0.17771 | 0.22322 | 2.50654 |
+| train_static | 0.22216 | 0.37837 | 0.17770 | 0.22322 | 2.50654 |
+
+and the two networks 0.016 of the update's norm apart (update norms 0.70996 / 0.70983, distance 0.01140).
+
+**Measured** (the Delver line's training on the desktop, the GPU shared with the live run's self-play
+throughout, so absolute numbers vary with its phase; same process, same window):
+
+| the training (542 steps) | ms a step |
+|---|---:|
+| eager (the run's; its log 91-96 ms on an unshared GPU) | 113.9 |
+| train_static, the dense rows fed | 60.6 |
+| train_static, the non-zeros fed | 40.4 (32.8 in a quieter minute) |
+
+A step is now bound by the device's float32 arithmetic (~23 ms of kernels, ~1,200 of them; the matrix
+products are float32 SIMT kernels, no tensor cores): the same batches with their tokens cut to 32 (a
+timing only) take 17.8 ms, so about half of it is padding - a row has 15 tokens on average (90% at most
+20) and every row is run as long as the batch's longest (64-80). Not done here: bucketing a batch's rows
+by token count (two static chunks), bfloat16 (19.4 ms; a numerics change: its own decision), the step as
+one CUDA graph, the non-finite guard's per-step sync made asynchronous.
+
+Tests: `tests/test_loop.py::test_train_static_trains_the_same_network_up_to_rounding` (above; a step's
+gradients, the trained network CPU and CUDA, sparse windows cached or not with prefetch, the batches'
+tokens against `infer`'s, the COO batch against the dense one bit for bit, an MLP refused) and
+`test_window_cache_trains_the_same_network` (the default path, unchanged).
+
+### 10.10 Local linger: this machine's self-play while the run trains (run setting `selfplay_local_linger`; MTG Zero's Delver line, 2026-11-01)
+
+**Why.** With a remote (5.3), the remote's workers play on while the run trains (`selfplay_remote_linger`)
+but this machine's driver stopped for the whole training: on the Delver line the desktop makes ~75% of a
+generation's games (~9 a second) and idled ~49 s a generation (~19 s with `train_static`).
+
+**What** (opt-in, `selfplay_local_linger` 0 the loop of before; 5.3's "Local linger" has the protocol):
+after the phase, `Run.linger_start` resumes the rolling driver with the same network id (the searches in
+flight go on with checkpoint i-1, nothing restarts) on a thread and keeps queueing setups up to the local
+cap; the finished games wait, with their samples, for the next iteration's quota, which takes them first
+(lag 1, as a remote's lingering games). `Run.linger_stop` after the training ends the phase, answers the
+last batches and joins. Needs `selfplay_remote` (the shared queue keeps the held games and the quota) and
+a single-game run without the league (refused otherwise, at the start).
+
+**Two CUDA consequences.** The thread's network batches run on a CUDA stream of its own (`torch.cuda.Stream()`,
+non-blocking with the legacy default stream the training uses): the inference kernels interleave with the
+training's instead of queueing behind a whole step. And **a CUDA graph capture is thread-local now**
+(`infer.CAPTURE_MODE = 'thread_local'`, both graph runners): torch's default ('global') fails any other
+thread's sync or allocation while a stream captures. Measured (`capture_stress.py`, the line's network:
+one thread trains with the static step - a sync and allocator churn every step - while another evaluates
+52 new (rows, tokens) shapes through the graphs on its own stream): 'global' failed at once (the training
+thread `cudaErrorStreamCaptureUnsupported`, the capture `cudaErrorStreamCaptureInvalidated`);
+'thread_local' three times clean (245-286 training steps alongside, every answer within 9.8e-7 of the
+eager forward). One thread: the same as 'global'.
+
+**Evaluators on other threads.** `infer_workers` > 1 evaluates on worker threads whose current stream is
+the default one: correct, but queued behind the training's kernels.
+
+**On the Delver line** (a 3-iteration GPU smoke forked from r3-2b-late550 at 589: 400 games an iteration,
+384 in flight, `train_static` 1, the desktop alone - MTG Zero's 'local' remote refuses an unpinned
+checkout -, the GPU shared with the live run): 80 and 57 games during trainings of 31.3 s (the cold window)
+and 12.9 s, at 18.4k / 31.4k leaves/s against ~38k in the phases; none after the last iteration; quotas
+exact. The training beside it took 68-78 ms a step against 50 ms alone (the GPU shared three ways). The
+desktop's samples one checkpoint behind: 67% and 54% (+6% two behind) at this small quota (400 games with
+384 in flight: most games span phases); the live line without the setting (1,600 games, 768 in flight):
+~35% one behind, from the games in flight carried over.
+
+Tests: `tests/test_remoteplay.py::test_local_linger_plays_while_the_run_trains` (a toy run with the
+remote 'local': linger games every iteration but the last, quotas exact, the held games' samples lag 1
+in the next iteration, refused without a remote) and the remote linger's test (unchanged).
+
+## 11. Deferred results and co-training (`zero/cotrain.py`; MTG Zero M6 part 2, 2026-10-27)
+
+MTG Zero's team cube draft (its DESIGN.md 2.3, 5.1) is a game whose result is decided outside
+it: a `team_draft` event (two teams draft and build decks) ends at a **deferred terminal**, and
+its outcome is that of the event's `mtg` matches, which are themselves the self-play of the
+play network. So one run trains two networks: the **primary** (`team_draft`, the draft network)
+and the **resolver** (`mtg`, the play network). The core knows neither: the trait hook
+(`deferred`, `deferred_payload`, `resolve`, `team_size`; docs/search.md 1.1), the search's
+deferred leaf (docs/search.md 3.2), the driver's parking and queued setups (docs/search.md
+2.8-2.9), and this loop. The toys play both roles in the tests (`toy_team` events whose matches
+are toy games; preset `toy-cotrain-smoke`).
+
+### 11.1 Settings and directories
+
+`--resolver <game>` turns a run into a co-training run; the resolver's settings are
+`resolver_cfg` (a dict of the run settings; `DEFAULTS` + the package's < its `preset` < the dict;
+co-training keys inside it are errors, as are unknown ones), saved nested in `config.json` and
+resolved into `<run>/resolver/config.json`; `resolver_init`, `resolver_conc`, `pending_max`,
+`draft_eval_net_every`, `draft_eval_net_remote` (section 1.2). The primary keeps the run directory as a single-game run
+does (`models/`, `data/`, `elo/`, `metrics.jsonl`, `progress.json`: the dashboard and the tools
+work unchanged); the resolver has `<run>/resolver/` with the same layout. One player count per
+game (`players`). Its `iters`, `games` and `rolling` are not used; its `eval_remote` sends its
+evaluations to a remote (11.5), its `selfplay_remote` a share of its episodes (11.6). The run's
+own `eval_remote` and `selfplay_remote` (the primary's) are refused; `draft_eval_net_remote` sends
+the primary's resolver-network events to a remote (11.7). Each network has its own evaluation
+move rule (section 5.4): the run's `eval_select` for the primary's seats, `resolver_cfg`'s for the
+resolver's (its own evaluations and the episodes of `eval_yard_net`), each with its Elo pool
+(`elo/[<rule>/]`, `resolver/elo/[<rule>/]`); `eval_yard_net` records both (`select`,
+`resolver_select`, absent = 'visits'). `selfplay_select` the same way for each network's self-play.
+
+**The game package's glue** (`GamePackage.deferred`, game -> `{'episodes': fn(payload) ->
+[resolver spec JSON, ...], 'results': fn(payload, rows) -> results JSON}`): the defaults read
+the payload's `"episodes"` list and send `[{"result": [...], "scores": [...]}, ...]` in order
+(an episode cut at `max_steps` arrives as a draw). An empty episode list is an error.
+
+### 11.2 An iteration
+
+* **Self-play** (`CoRun.selfplay`): two rolling drivers in the run process - the primary's
+  (network i - 1, recording) on the main thread and the resolver's (network i - 1, recording,
+  `queue_only`, `resolver_conc` games in flight) on a worker thread (`infer.drive` on each; a
+  driver is only ever called from its own thread: its `next_batch` holds it while it waits), joined
+  by a `Coordinator`. Each game the primary parks becomes queued episodes (tags `<gid>/<k>`);
+  their result rows come back by tag; when all are in, the game is resolved (its samples, with
+  the real outcome, go to `data/iter_i/`; the episodes' samples to `resolver/data/iter_i/`). The
+  phase ends when `games` primary games have been **resolved** in it - exactly: ready ones
+  beyond the quota wait for the next phase - and the resolver's phase ends with it
+  (`end_phase`). Games still playing, parked, queued or ready carry over in memory; the next
+  iteration's networks restart their searches (a new epoch in both drivers).
+  **Backpressure**: while `pending_max` resolver episodes are queued or playing, the primary
+  stops taking batches (its in-flight games wait) and resolves what comes back.
+* **Training** (`CoRun.train`): the primary's network on its window, then the resolver's on its
+  own (`Run.train_model`, each with its own settings), then the non-finite guard on both
+  checkpoints and optimizer states, then both are saved (`Run.save_trained`): a NaN in either
+  network writes neither.
+* **Evaluation** (`CoRun.finish_iter`): the resolver as a single-game run (its yardstick,
+  random, Elo between its checkpoints: `resolver/metrics.jsonl`, `resolver/elo/`; on a remote
+  with `resolver_cfg['eval_remote']`, 11.5), then the
+  primary (`PrimaryRun`): its matches are **events** (`CoRun.event_match`), team seats
+  alternating between the two players (seat s in team s % (n / team_size): game g gives team g %
+  teams to the first player), each event's episodes played by a second, non-recording resolver
+  driver - with the resolver's **yardstick** on every seat (`eval_yard` vs the primary's
+  yardstick, `eval_random`, the Elo matches against earlier primary checkpoints, the reference
+  games random vs the yardstick: the primary's Elo pool in `elo/`, one play agent) and, on
+  evaluated iterations that are multiples of `draft_eval_net_every`, with the resolver's
+  **network** of the same iteration (`eval_yard_net`: in metrics.jsonl, not in the Elo fit, a
+  different play agent). A row's score is its team's outcome, its margin the team's score less
+  the best other team's.
+* **progress.json** during self-play: `{iter, phase, events_resolved, target, drafting,
+  pending_events, matches_queued, matches_in_flight, matches_done, games, time}` (`games` =
+  `events_resolved`, for the dashboard).
+* **metrics.jsonl**: the primary's rows as a single-game run's (`selfplay.games` = games
+  resolved) plus `selfplay.cotrain` (`events`, `episodes` and `episodes_per_h`, `pending_events`,
+  `episodes_queued`, `episodes_waiting`, `parked_mb_max`, `event_latency_s` [mean, max] from park
+  to resolve, `resolve_delay_ms` [mean, max] from the last episode's result to `resolve`,
+  `backpressure_s`, `pending_max`, `resolver_conc`) and `eval_yard_net`;
+  `resolver/metrics.jsonl` as a single-game run's (`selfplay.games` = episodes finished).
+
+### 11.3 Resume, control, tools
+
+* **Resume**: the newest iteration with both checkpoints; an iteration interrupted before both
+  is replayed from its start (both data directories cleared; games in flight are gone, and the
+  episodes already played for them stay only in the replayed iteration's data if it completes);
+  one interrupted after them finishes its evaluations from each network's
+  `models/iter_NNNN.json` (tested: PAUSE mid self-play, then resume; an iteration with both
+  checkpoints and no metrics).
+* **PAUSE / STOP / the supervisor / kill_run** work on the one process (a PAUSE noticed on the
+  main thread stops the resolver thread first). `fork_run --source` copies a co-training run with
+  both networks (at an iteration where both have a checkpoint). **Bootstrap**: iteration 0 = a
+  fresh primary network and a fresh resolver network, or `resolver_init`; a checkpoint 0 of either
+  network already there (e.g. a primary forked into the run) is kept, never overwritten (10.4).
+  Both networks' checkpoints are checked by the encoding guard at every start (10.4).
+* **NonFinite names the network** (`primary net (<game>): ...`, `resolver net (<game>): ...`);
+  quarantined shards and failing batches go to `<run>/debug/` or `<run>/resolver/debug/`.
+
+### 11.3a The pieces MTG Zero's part 3 added (2026-10-27, MTG Zero M6 part 3, its ENGINE.md 45)
+
+* **The game package's glue** in use: `GamePackage.deferred['team_draft']` (mtgz/az/drafted.py)
+  maps an event's payload to `mtg` specs (the drafted decks, the rest of the pools as
+  sideboards, the real first picks, what each player knows is elsewhere, the match seed) and the
+  matches' rows back, refusing a malformed result (ValueError: the coordinator's thread raises
+  it on the main thread, the run aborts).
+* **`SearchGame::sims_divisor`** (docs/search.md 1): `team_draft`'s deckbuilding at half a pick's
+  simulations.
+* **`TokenNet` actions by identity** (layout key `id_actions`, section 10): a segment's slot
+  scores the action base + its identity (the team draft's pick, or putting a card in the deck,
+  is the card's identity wherever it sits); layouts and checkpoints without the key are
+  unchanged (MTG Zero: runs/mtg5's checkpoints play identically, `check_checkpoint_compat`).
+* **`GamePackage.evals`**: a checkpoint's other yardsticks (game -> {name: fn(run, it) -> dict
+  or None}), run on every evaluated iteration after the matches (`Run.extra_evals`, also for a
+  co-training run's primary) and logged under `extras.<name>` in metrics.jsonl; measuring only.
+  MTG Zero: the draft network's top-1 agreement with held-out human picks.
+* **The dashboard** (section 5.1): a co-training run shows a tab per network (the primary's
+  metrics at the run root, the resolver's from `<run>/resolver/`, each with its Elo chart, win
+  rates, head-to-head table, losses and throughput), the co-training progress line (events
+  resolved of the target, drafting, waiting for their matches, matches queued, in flight and
+  done), tiles for the other network's Elo, matches per hour and the event latency, the primary's
+  `eval_yard_net` in its win-rate chart, and an "Other yardsticks" chart of `extras`. A
+  single-game run renders exactly as before (checked: the same page DOM for a copy of MTG
+  Zero's runs/mtg5 with the old and the new dashboard).
+
+### 11.4 Measured (desktop, 2026-10-27, other projects' runs on the machine)
+
+`toy-cotrain-smoke` with `--games 300 --conc 64 --sims 32 --sims-fast 8 --resolver-conc 128`
+and the resolver at 32 / 8 simulations, 2 iterations:
+
+| | CPU (both networks) | CUDA (both networks) |
+|---|---|---|
+| resolver (toy matches) leaves/s, iterations 1 / 2 | 134k / 140k | 30.5k / 27.5k |
+| resolver alone (a single-game rolling run, same settings) | | 27.8k / 31.6k |
+| primary leaves/s; its time waiting for backpressure | 9.5k / 8.6k; 3.2 of 3.9 s | 2.2k / 1.6k; 13.7 of 17.2 s |
+| event latency, park -> resolve (mean / max) | 0.77 / 1.0 s | |
+| coordinator delay, last result -> resolve (mean / max) | 0.11 / 2.4 ms | |
+| parked memory (max) | 32 KB (70 events of 64 features) | |
+
+* **GPU sharing**: the two drivers on two threads, each with its own evaluator on the same GPU,
+  do not slow each other measurably on the toy (the resolver's leaves/s with the primary
+  alongside are within the run-to-run spread of it alone; the toy's tiny network is per-call
+  bound on CUDA, slower than the CPU). The primary is ~7% of the leaves and waits for the
+  episodes most of the time - MTG's budget (its DESIGN.md 2.3.9) expects ~11-13%.
+* **Parking**: records are float16 (2 bytes per feature): MTG's 4v4 event, ~185 records of 14,488
+  features, ~5.4 MB parked. MTG Zero measures `team_draft`'s (its ENGINE.md 43).
+* **The coordinator** costs nothing measurable: the delay between an event's last episode and
+  its `resolve` is a fraction of a millisecond (the primary resolves after every batch).
+* Single-game runs are untouched: toy-smoke (rolling, and classic with margin_w, chance_k and
+  cq targets) gives the same metrics, checkpoints, optimizer states and shards byte for byte as
+  zero-core 681ba8d; the golden digests (`check_checkpoint_compat` against 681ba8d, random and
+  uniform evaluators: the toy, and Glass Road Zero c1f56dc built with each core) are identical;
+  `smoke_all.sh --with-this-core` with Glass Road, Caverna, Kingdom Builder and MTG Zero: green
+  (b890655).
+
+Tests: `tests/test_deferred.py` (the toy team game through the bindings, deferred leaves Rust vs
+Python exactly and statistically, team utilities, empty option segments in the evaluators, the
+driver's parking, `resolve`, queued setups, `queue_only`, tags), `tests/test_cotrain.py` (two
+iterations of `toy-cotrain-smoke`, PAUSE mid self-play and resume, resume after the
+checkpoints, NonFinite in each network, `resolver_init` from a single-game checkpoint,
+`fork_run`, settings checks), the crate's `toy_team`, `tree` and `driver` tests (deferred leaves
+evaluated once and backed up, team utilities, parking and resolving with samples, rolling
+quotas counting resolved games, queued setups, float16 rounding).
+
+### 11.5 The resolver's evaluation on a remote (`resolver_cfg['eval_remote']`; MTG Zero, 2026-10-27)
+
+The resolver's evaluation is a single-game run's (11.2), and so is its remote: `eval_remote` in
+`resolver_cfg` (a remote of the game package, section 5.2; `local` in the tests) sends the
+resolver's yardstick, random and Elo matches there while both networks train. MTG Zero: the
+MacBook plays the `mtg` play network's evaluation of its 4v4 team-draft run (~9 min there against
+~30-70 on the shared desktop; its ENGINE.md 48).
+
+* **The setting** is the resolver's own `eval_remote`, saved in `<run>/resolver/config.json`: it
+  means there what it means for a single-game run (no new run setting). The run's top-level
+  `eval_remote` would be the primary's and is refused: the primary's matches are events whose
+  episodes the resolver's drivers play in the run process. A name the package does not have is
+  refused at start.
+* **The mirror** is `<workdir>/<run name>.resolver`: a sibling of the single-game runs' mirrors
+  in the remote's workdir, so the lock (one evaluation at a time per workdir: a co-training run's
+  resolver and a single-game run on the same remote queue behind each other) and
+  `<workdir>/overrides.json` apply unchanged. Its config.json is the resolver's settings, a
+  single-game run's, so the remote side (`python -m <pkg>.az.remote eval`) is unchanged.
+* **Results**: `resolver/evals.jsonl` (5.2's rows), the mirror's Elo copied back to
+  `resolver/elo/` and `resolver/models/index.json`; `resolver/metrics.jsonl` rows carry no
+  evaluation. Log lines: `[resolver] evaluations on the remote 'mac' (host, mirror ...)`,
+  `[resolver] iter N vs heuristic (remote mac, 560s): ...`, `[resolver] iter N elo ... (remote mac)`.
+* **The primary's evaluation stays here**, unchanged: its yardstick-played events every evaluated
+  iteration and its resolver-network events (`eval_yard_net`) every `draft_eval_net_every`, which
+  load the resolver's checkpoint of the iteration here (or on a remote of their own with
+  `draft_eval_net_remote`, 11.7). They do not wait for the remote.
+* **Resume**: the resolver's evaluated iterations without a result are queued again at start
+  (`RemoteEval.backfill`); nothing else is replayed. **An unreachable remote** is retried every
+  5 minutes on its thread: both networks keep training and the primary keeps being evaluated; at
+  the end of its iterations the run waits for the queue (progress phase `remote evaluations`),
+  where PAUSE stops it (exit 75; the restart queues what is missing again). The co-training wait
+  checks PAUSE; a single-game run's does not (unchanged).
+* **On or off for a run** at a restart: `--resolver-cfg` with the whole dict (a flag replaces the
+  saved dict), e.g. `--resolver-cfg '{"preset": "mtg-4", "eval_every": 2, "eval_remote": ""}'`.
+* **The dashboard** (5.1): the resolver's tab merges `resolver/evals.jsonl` into its rows as a
+  single-game run's view does; its Elo, win rates and head-to-head come from the copied-back
+  `resolver/elo/`.
+* **The primary's resolver-network events** (`eval_yard_net`) are not this setting's: the run
+  setting `draft_eval_net_remote` sends them to a remote (11.7).
+
+Tests (`tests/test_cotrain.py`): two iterations of `toy-cotrain-smoke` with the resolver's
+`eval_remote` 'local' (the resolver's evaluations in `resolver/evals.jsonl` from the mirror
+`<run>.resolver`, its Elo copied back, no evaluation in its metrics rows, the primary evaluated
+here with `eval_yard_net`, the dashboard's merge); a restart with two evaluations pending (both
+queued again and evaluated once, nothing retrained, the primary not evaluated again); an
+unreachable remote (ssh to a host that does not resolve, retried every second: both networks
+train and the primary is evaluated through every iteration, the run waits for the queue at the
+end, PAUSE exits 75 there; restarted with a reachable remote, the three missing evaluations land);
+the run's own `eval_remote` and an unknown remote name refused.
+
+### 11.6 The resolver's episodes on a remote (`resolver_cfg['selfplay_remote']`; MTG Zero, 2026-10-28)
+
+The resolver's self-play is the coordinator's queued episodes (11.2), so its remote self-play is a
+**second consumer of that queue** - the shared queue of 5.3 with matches for units:
+`selfplay_remote` in `resolver_cfg` (5.3's setting, the resolver's own) starts remote workers in
+mode `matches` - each a rolling `queue_only` driver of the resolver's seats, persistent across
+iterations - that play episodes the run hands them with the resolver's checkpoint i-1. MTG Zero:
+the MacBook plays a share of the 4v4 run's drafted matches with the play network (its ENGINE.md 52,
+56).
+
+* **The split** (zero-core's `feat/shared-queue`; the first design capped the local driver's queue
+  at max(16, resolver_conc / 4) and let each worker take conc x 1.25 outstanding, so in MTG Zero's
+  td1 three Mac workers drained the queue and the desktop played none of an iteration's 1,812
+  matches): the local resolver driver and every worker are consumers with **5.3's caps** - units =
+  the iteration's matches (its `games` events x the mean matches per event the coordinator has seen;
+  before any event: the consumers' slots), no head start, a consumer that had less work than its cap
+  measured as if it had kept it busy - and **the coordinator keeps the local driver's share in
+  reserve**: `feed` keeps the local driver's outstanding episodes (queued in it or playing:
+  `Coordinator.local_out`) at its cap (`local_cap`, which the remote's manager keeps up to date),
+  and the remote's manager takes for a worker, up to its cap less its outstanding, only what is
+  queued **beyond** the local driver's room. So the local driver never waits for work a remote holds,
+  and each worker takes its share as it has room, in the queue's order. The local consumer's bounds:
+  2 x the resolver's groups and resolver_conc + max(16, resolver_conc / 4) (its slots and the first
+  design's queue; a batch-bound one - a CUDA resolver driver, 5.3 - is taken up to its slots, never
+  into that queue, by the batch rule); a worker's: 2 x its groups and conc + conc / 4. Without a remote, `feed` takes
+  everything as before. **Backpressure**: `pending_max` 0 means 2 x resolver_conc + the remote's
+  room (procs x (conc + conc / 4)), as before. The remote's phase starts when both checkpoints are
+  written (5.3): while the networks are evaluated here it finishes its outstanding episodes and
+  takes what is queued (the primary drafts nothing then); the events those rows complete wait,
+  ready, for the next phase, and its rows from the head start count for that phase.
+* **Results**: a worker answers each finished episode with its result row (`row` events, by tag);
+  the run puts it into the coordinator (`collect_rows`) as the local driver's rows go in: an event
+  is resolved when all its episodes' rows are in, from either machine. Its samples come back as
+  5.3's compressed shards into `resolver/data/iter_i/`. The quota and the events are untouched:
+  an iteration still ends when exactly `games` primary games are resolved here; the remote's
+  episodes in flight at a phase's end carry over, as the local driver's do.
+* **Requeue - work flows back**: episodes a worker cannot deliver go back to the **front** of the
+  queue, where the local driver (or another worker) takes them: all of a worker's outstanding
+  episodes when its session ends (its stdout closed: every row it sent has been taken) or stalls
+  (killed after `STALL_S`); **all of them once it has backed off (an evaluation's lock, 5.3) for
+  `selfplay_remote_giveback` s** (default 30; meanwhile its cap is 0, so it takes nothing new and
+  the local driver's share is all of it); and any episode outstanding longer than its worker's
+  **overdue limit** - `selfplay_remote_overdue` (default 3) x the worker's expected latency (its cap
+  over its measured rate), at least `OVERDUE_MIN_S` (120 s), at most `selfplay_remote_timeout` s
+  (default 3600: the first design's only limit) - of that worker's **running time** (its `active_s`,
+  which stops between phases and while it backs off, so a long evaluation phase here does not time
+  episodes out). A requeued episode may still finish on the worker: every copy's row after the
+  first is dropped (`Coordinator.dupe_ok` counts a spare per requeue; `duplicates_dropped`), so an
+  episode is counted once and played once per copy (the later copies' samples are kept: valid
+  self-play of the same checkpoint); a requeued episode never goes back to the worker it was taken
+  from, and a worker ignores an `enqueue` of a tag it still holds (47.5; before 2026-11-12 one spare
+  per tag: an episode requeued twice aborted the run or was counted twice). A row of an unknown tag,
+  or a second row of an episode that was never requeued, is still an error.
+* **Linger** (`selfplay_remote_linger` 1 in `resolver_cfg`): the workers play their outstanding
+  episodes on while the run trains; their rows go into the coordinator at once (their events wait,
+  ready, for the next phase), their samples into the next iteration's shards (5.3).
+* **The primary stays here**: the run's top-level `selfplay_remote` (the primary's) is refused:
+  its parked games live in the run process's driver, and their coordinator with them. Offloading
+  the drafting would mean a whole co-training loop on the remote (both networks, both drivers, the
+  coordinator), events resolved there and both kinds of shards shipped back: not a small change,
+  not done.
+* **Metrics**: the resolver's `selfplay.remote` (5.3's keys, plus `matches` (rows taken),
+  `assigned`, `requeued` (lost sessions), `requeued_timeout` (overdue), `requeued_backoff` (given
+  back), `duplicates_dropped`, `outstanding`) and `selfplay.queue` (5.3's `units, inflight,
+  consumers, rates, staleness`, plus `local_cap`); its `selfplay.games` stays the local driver's; the
+  primary's `selfplay.cotrain.episodes` counts both, `episodes_remote` the remote's share,
+  `duplicates_dropped`, `staleness` (the primary's rows by checkpoint lag). progress.json:
+  `matches_remote` = 5.3's `remote` + `outstanding`, `matches`. Log lines `[resolver] episodes also
+  on the remote 'mac' (...)`, `[resolver] iter N remote self-play: ...; matches 412 back, 960
+  assigned, 300 outstanding, 0 + 0 + 0 requeued (lost, overdue, backing off), 0 duplicates dropped`,
+  `[resolver] iter N shared queue: caps local 146.0 -> 150, w0 144.0 -> 141, ...; rates/s ...;
+  staleness: ...`, `remote self-play mac: worker 1: backing off for 31s (...eval.lock): its 140
+  outstanding episodes requeued here (a second result is dropped)`.
+* **On or off at a restart**: `--resolver-cfg` with the whole dict, e.g. `--resolver-cfg
+  '{"preset": "mtg-4", "eval_every": 2, "eval_remote": "mac", "selfplay_remote": "mac"}'`.
+
+Tests (`tests/test_remoteplay.py`): toy-cotrain-smoke with the resolver's `selfplay_remote`
+'local' (exact quotas, the remote's rows and shards counted, the backpressure's room, both
+consumers in the queue's metrics, the local driver playing every iteration), a remote with four
+times the local driver's room (the local driver's share kept for it), a worker that backs off
+mid-phase (its matches given back, quotas exact), a slow worker whose episodes time out and are
+requeued (duplicates dropped, quotas exact), a worker that dies mid-phase every time (its episodes
+requeued, the worker restarted), the settings refused; `tests/test_workqueue.py` (the coordinator's
+reserve, matches per event).
+
+### 11.7 The primary's resolver-network events on a remote (`draft_eval_net_remote`; MTG Zero, 2026-10-28)
+
+`eval_yard_net` (11.2) - the primary's checkpoint against its yardstick with every event's
+episodes played by the resolver's **network** of the same iteration - is the largest single
+evaluation of a co-training run (MTG Zero's 4v4 run: 32 events, 384 play-network matches every 4th
+iteration, 51-88 minutes on the desktop, its ENGINE.md 52.5 and 53), and its matches are played by
+one driver whose last few matches each need tens of thousands of sequential network calls (11.8).
+The run setting **`draft_eval_net_remote`** (a remote of the game package, 5.2; `local` in the
+tests; '' = here, the default) plays it on another machine while both networks train. The rest
+of the primary's evaluation (its yardstick- and random-played events, its Elo, the package's other
+yardsticks) stays here; the resolver's own evaluation has its own setting (11.5).
+
+* **Generic**: nothing game-specific - the remote rebuilds `CoRun` from a mirror of the run and
+  calls `CoRun.eval_net(it)`, the function that plays the events here (`PrimaryRun.evaluate` calls
+  it when the setting is off): the same drivers, coordinator, the package's deferred glue, seeds
+  (`7919 * it + 3`) and settings (the remote's overrides aside).
+* **Local side** (`zero.remote.RemoteNetEval`, a `RemoteEval` - its queue, thread, retries and
+  drain): `CoRun.finish_iter` appends the primary's metrics row without `eval_yard_net` (and
+  without `phases.eval_net_s`) and queues the iteration when its `eval_yard_net` is due
+  (`CoRun.eval_net_due`: an evaluated iteration that is a multiple of `draft_eval_net_every`, with
+  `eval_games`). The thread ships the **mirror** `<workdir>/<run name>`, laid out as the run:
+  `config.json` (the run's settings with every remote setting off - `eval_remote`,
+  `selfplay_remote`, `draft_eval_net_remote`, and the resolver's `eval_remote` and
+  `selfplay_remote` - and the remote's `overrides` on both networks' settings: the top level and
+  `resolver_cfg`), `models/iter_NNNN.pt` and `resolver/models/iter_NNNN.pt` of that iteration
+  only (each under a temporary name, then renamed); runs `python -m <pkg>.az.remote evalnet
+  <mirror> <iter>` in the remote's `repo`; appends `{iter, eval_yard_net, time, host, seconds,
+  remote_s}` (`seconds`: from the queue, shipping included; `remote_s`: the events' own) to the
+  run's **`evals.jsonl`** and logs `iter N vs <yardstick> (episodes by the resolver net; remote
+  mac, 812s): {...}`. Nothing is copied back: `eval_yard_net` is not in the Elo fit.
+* **Remote side** (`zero.remote.evaluate_net_mirror`): `CoRun(mirror, config)` (both networks'
+  directories in the mirror; the remote's `<workdir>/overrides.json` on both networks' settings),
+  `CoRun.eval_net(it)`, the result printed as `ZERO_REMOTE_RESULT {json}` and appended to the
+  mirror's `metrics.jsonl`. **One evaluation at a time per workdir**: the same `.eval.lock` as
+  `eval`, so the resolver's evaluation (11.5) and these events queue behind each other on the
+  remote, and remote self-play there backs off while either runs (5.3). MTG Zero's commit check
+  applies unchanged (`python -m mtgz.az.remote` checks the checkout before any subcommand).
+* **A failure never blocks training**: an attempt that fails (the remote asleep, unreachable, its
+  checkout refused) is logged (`remote eval mac iter 8: ...; retry in 300s`) and retried every
+  `RETRY_S` on its thread; later iterations queue behind it. **Restart**: the due iterations up to
+  the newest finished one without `eval_yard_net` in their metrics row or in `evals.jsonl` are
+  queued again (`RemoteNetEval.backfill`); nothing is replayed. At the end of the iterations the
+  run waits for both remote queues (progress phase `remote evaluations`; PAUSE ends the wait, the
+  restart queues what is missing again).
+* **The dashboard** (5.1) merges `eval_yard_net` from the root's `evals.jsonl` into the primary's
+  rows (the win-rate chart's resolver-network line), as it merges a remote's `eval_yard`.
+* **On or off at a restart**: `--draft-eval-net-remote mac` / `--draft-eval-net-remote ''`
+  (saved in config.json; a top-level co-training setting, so no `--resolver-cfg` is needed; inside
+  `resolver_cfg` it is refused, as is an unknown remote name at start). Turned off, the iterations
+  evaluated remotely keep their `evals.jsonl` rows; nothing is played again here.
+* **`ZERO_EVAL_WORKDIR`** (environment): another evaluation workdir on a named remote - its own
+  mirrors and its own `.eval.lock` (an end-to-end test beside a live run's workdir); an absolute
+  path on the remote (Git Bash rewrites `/Users/...` in a Windows process's environment:
+  `MSYS2_ENV_CONV_EXCL=ZERO_EVAL_WORKDIR`). Remote self-play then backs off for that lock.
+
+Tests (`tests/test_cotrain.py`, the remote 'local'): two iterations of `toy-cotrain-smoke` with
+`draft_eval_net_remote` (iterations 0 and 2's `eval_yard_net` in `evals.jsonl`, none in the metrics
+rows, the mirror holding the run's settings with every remote setting off and both networks'
+checkpoints of those iterations only, the lock released, the dashboard's merge); a restart with
+one missing (played again alone, nothing retrained); an unreachable remote (retried every second,
+both networks trained and evaluated here through every iteration, PAUSE in the final wait; then
+with a reachable remote both land); the setting refused inside `resolver_cfg` and with an unknown
+name; `ZERO_EVAL_WORKDIR`. MTG Zero's `tests/test_mac_remote.py`: its `evalnet` refused at another
+commit before anything is evaluated or locked; a team_draft mirror evaluated by the remote side.
+
+### 11.8 One slow game step held up the whole driver (MTG Zero, 2026-10-28)
+
+**The symptom** (MTG Zero's ENGINE.md 52.8, 53): `team_draft-smoke --iters 3 --games 8` (CPU) sat
+~10 minutes in iteration 2's self-play - 6 of 8 events resolved, 16 matches in flight, the resolver
+thread waiting in the driver's `next_batch`, the primary on backpressure, the process idle - and
+then went on; the same at an older core, at the same point (both runs had played identical games
+up to it). Separately, MTG Zero's 4v4 run td1 spent 51 and 88 minutes on its iterations 0 and 4's
+`eval_yard_net` with its process mostly idle.
+
+**Root cause, the stall.** A group's batch is assembled when every game of the group has made its
+step (its search and moves up to its next leaf; docs/search.md 2.3), and `next_batch` served the
+groups in **strict round-robin order**. So one game whose step takes long - an engine's slow path
+(52.8's runs used engines that still had MTG Zero's exponential payment search, its ENGINE.md 51.3;
+which step it was is not known) - stopped **every game of the driver**: its own group waits for it
+by design, and the other
+group, its batch answered and its next one ready, waited for its turn behind it. In co-training
+the resolver's episode player is that driver: no episode finishes, the episodes outstanding stay
+at `pending_max`, the primary waits on its backpressure, and the process idles (one search
+thread in the slow step) until the step ends. Two things made it worse:
+* `in_flight()` (co-training's progress snapshot, every half second on the resolver's thread)
+  locked every chunk of the driver **holding the GIL** (the binding does not release it), so when
+  it met the chunk of the slow game it blocked every Python thread of the process - the primary's
+  backpressure loop and progress.json included - until the step ended;
+* a `queue_only` driver's first group re-dispatched took the whole queue: an evaluation's matches,
+  queued at once, started 383 / 1 in td1's `eval_yard_net` (768 slots, 384 matches), so its two
+  groups' search and inference no longer overlapped.
+
+What made the step slow in 52.8's runs could not be reproduced: 16 runs of the smoke since (69
+iterations, ~2,400 drafted matches; 27 of the iterations on 692a52c's engine, the 52.8 runs') did
+not idle; the slow-step counters below now say it when it happens.
+
+**The fix** (zero-core 9714be3):
+* A `queue_only` driver (co-training's episode players - the resolver's self-play driver,
+  `event_match`'s, a remote matches worker's - whose results depend on timing anyway) serves the
+  **first of its working groups that is ready**, in round-robin order from the cursor: a slow game
+  holds up its own group only; the others play on (with `groups` 2, half the episodes in flight).
+  Every other driver keeps the strict order (a run reproducible from its seed).
+* `queue_share`: a group dispatched starts its share of everything in flight or queued, never fewer
+  than the other groups' free slots cannot take (no free slot idles while setups wait; a setup's
+  gid is still its place in the queue): the evaluation's 384 matches start 192 / 192.
+* `in_flight()` try-locks each chunk; a chunk being searched counts its games as of its group's
+  last dispatch (exact once the phase is paused).
+* `DriverStats`: `step_max_s`, `step_max_gid` (the longest step of a game so far) and `slow_steps`
+  (steps over 10 s); `CoRun` logs `iter N self-play (resolver driver): K game step(s) took over 10 s
+  (the longest so far S s, game G): an engine slow path?` (and the same after each event match) and
+  counts them in the rolling stats (`slow_steps`).
+* Not changed: the step itself (a game's search is one thread's), and the end of a phase - a group
+  in a slow step pauses when it ends - so a slow step still delays its own group's games and an
+  iteration's end; it no longer stops everything else for its duration.
+
+**Regression tests** (the crate's `driver` tests): `a_slow_step_holds_up_its_own_group_only` - a
+`queue_only` driver of 2 groups x 4 with 8 queued toy games, one of which sleeps 1.5 s in one
+step: the other group plays on to its last batch while it sleeps (in strict order it got one
+batch: the test fails on the old code), the step counted (`step_max_s`, `step_max_gid`), and
+`in_flight()` returns at once while a search thread sleeps; `queued_setups_are_shared_between_the_groups`
+(8 setups for 2 x 8 slots: 4 / 4, was 7 / 1; the same games as with one group);
+`queued_setups_fill_every_free_slot_when_the_queue_is_long`.
+
+**The evaluation's time** (`eval_yard_net`; MTG Zero's ENGINE.md 53.2 measures td1's): its
+events are drafted first (all at once, a few rows per network call), then their matches all start
+in one `queue_only` driver, and the evaluation lasts as long as its **longest match**: one leaf per
+game per call, so the last matches' tens of thousands of calls follow one another with a handful of
+rows each. A call costs about the same whatever its rows on a GPU shared with training (MTG Zero's
+token networks on the desktop's RTX 5090, td1 training beside: ~9-11 ms for 1-32 rows, 14 / 21 /
+49 ms for 96 / 192 / 384; on 2 CPU threads 3.0 / 4.3 / 6.6 ms for 1 / 8 / 32 rows, 15 / 27 / 50 for
+96 / 192 / 384), and the evaluating thread is busy with calls all the time (the search threads
+idle: the process looks idle): the phase is latency-bound, not stalled, and the fixes above do not
+shorten it (the 383 / 1 start cost nothing measurable there: one thread evaluates both groups'
+batches in turn either way). The levers are the remote (11.7: its CPU), CPU inference for the
+evaluation's small batches, and fewer or shorter calls.
+
+## 12. The move rule: visits vs completed Q (MTG Zero's delver1, 2026-10-28)
+
+### 12.1 The experiment
+
+MTG Zero's Legacy Izzet Delver mirror run (runs/delver1; its ENGINE.md 54) evaluates at
+`eval_sims` 32. An experiment (zero-core branch exp/select-rule 945d75e + 4a198cb, MTG Zero
+tools/exp_select.py on branch exp/select-rule 102083d; not merged) measured each checkpoint
+against the heuristic bot (the yardstick) with three rules for the evaluation seat, 200 games a
+cell, paired deals:
+
+| checkpoint | A: visits | B: cq | C: argmax Q, >= 2 visits | C: >= 3 visits |
+|---|---|---|---|---|
+| iter 12 | 42.0% | **57.0%** | 51.0% | 54.5% |
+| iter 14 | 52.0% | **61.0%** | 45.0% | 49.5% |
+
+Head to head (the same checkpoint, B vs A): B 62.5% at iter 12, 58% at iter 14 (+56 to +89 Elo).
+At 32 simulations the prior's favourite collects most visits even where the search found it
+worse, so argmax visits mostly plays the prior; B lets Q overrule it. The user's decision
+(2026-10-28): B as an opt-in setting with today's rule the default everywhere; delver1's
+evaluation switches to B at its next re-pin; self-play later, by a forked A/B run.
+
+Then on the production path (`Run.evaluate` with `eval_select`, MTG Zero's tools/select_eval.py,
+its ENGINE.md 57; 200 games a cell against the heuristic at `eval_sims` 32, paired deals):
+
+| checkpoint | visits | cq | cq, >= 2 visits | cq, >= 4 visits |
+|---|---|---|---|---|
+| iter 12 | 46.0% | **61.5%** | - | - |
+| iter 26 | 71.0% | 77.0% | **77.5%** | 76.5% |
+| iter 27 | 71.0% | 73.0% | 73.5% | **76.5%** |
+
+Paired against visits, iterations 26 + 27 (400 games): cq +4.0 +- 2.6 points, cq-n2 +4.5 +- 2.6,
+cq-n4 +5.5 +- 2.5; between the guards within 1.5 +- 2.0. Head to head at iteration 27 (the same
+checkpoint, cq vs visits, 200 games): 51.0 +- 3.5%. The gain shrinks as the network improves
+(+15.5 points at iteration 12, +2 to +6 at 26-27); the recommended re-pin of delver1 uses the guard 4 (MTG Zero
+ENGINE.md 57.4).
+
+### 12.2 What was built
+
+`driver::Select` (docs/search.md 3.3: 'visits' | 'cq' + the guard), seat keys `select` /
+`select_min_visits`, `SearchTree.root_select`, the Python reference `mcts.select_index`; run
+settings `eval_select`, `selfplay_select` and their guards (1.2); one Elo pool per rule, raw
+Elo offsets, runs without random games (5.4); the rule on the remote (5.2), in co-training (11),
+h2h and replays. The experiment's 'q' rule (C) lost to B and was not kept; its move log is
+(`move_log`, docs/search.md 2.5).
+
+### 12.3 Checks
+
+* Rust: the golden records (`visits_records_unchanged`) and a new evaluation-match golden at
+  the default rule, equal to zero-core 3c26d9f's (12492034373733022939, computed there with the
+  same test code); new goldens for 'cq' (self-play records (329, 8716559848855127382), a cq vs
+  visits match 10451580073337998459, a guarded cq-n2 vs cq-n2 match 2225760264326051811).
+* Parity: docs/search.md 6 (the Python rule on Rust roots = the Rust driver's move on all 192
+  cases checked; Rust-tree vs Python-tree 'cq' seats in games).
+* Toy-smoke byte for byte against 3c26d9f (3 iterations each: classic; rolling; margin_w 0.2 +
+  chance_k 2 + cq targets + eval_every 2), the new settings left out and given at their
+  defaults: metrics.jsonl (timing fields aside), the optimizer state, every shard, elo/results.json,
+  elo/ratings.json (its `updated` aside) and models/index.json identical; every checkpoint's zip
+  members byte for byte (the files themselves differ in the archive's folder name only: torch.save
+  takes it from the temporary file name, which holds the writer's pid). config.json gains the five
+  new keys at their defaults. 85 existing run configs of the game repos (runs/*/config.json and
+  resolvers') pass the new checks and resolve to the rule 'visits'.
+* The same byte-for-byte comparison again after the "evaluated" flags (a167ee2; and on
+  feat/select-rule-on-queue against 9453e18): a default run's ratings.json and index.json carry
+  no flag; `tools/check_checkpoint_compat.py --package zero` (random, uniform and a checkpoint's
+  evaluator: self-play records and results for both targets, the match vs random) identical.
+* A toy rehearsal of delver1's re-pin: a run evaluated by the remote 'local' at the default rule
+  (iterations 0-4, `eval_every` 2), restarted with `--eval-select cq --eval-select-min-visits 4
+  --eval-random-games 0 --elo-offsets 1,2,4,8 --elo-games 25` (iterations 5-8): the run's and
+  the mirror's `elo/` byte for byte as before, `elo/cq-n4/` since 6 with iterations 6 and 8
+  logged and their raw-offset matches (k-1, k-2, k-4, k-8) of 25 games, the reference games once,
+  the other checkpoints flagged, evals.jsonl rows tagged, no random games, both dashboards on
+  the new pool (zero's with the 'visits' line).
+* MTG Zero (its ENGINE.md 57): the production evaluation path (`Run.evaluate`) of delver1's
+  checkpoints reproduces the experiment's direction (12.1); the guard's effect is measured there;
+  its engine tests and pytest at the pin; the other games (Glass Road, Caverna, Kingdom Builder)
+  build against the core.
+
+### 12.4 A self-play A/B (not run)
+
+`selfplay_select cq` changes self-play's moves after `temp_moves` only (the recorded targets
+stay `policy_target`'s, the first `temp_moves` decisions are sampled as before). An A/B: fork a
+run at an iteration (`tools/fork_run.py`), set `--selfplay-select cq` on the fork and keep the
+parent as the control (same seed, same settings otherwise), evaluate both with the same
+`eval_select` (both pools then compare: the same rule), and read it with an h2h between the
+arms' checkpoints of equal iterations (`zero.h2h`, both sides at the same `--select`), as the
+policy-target A/Bs (section 9) were read. Expected effects to watch: games follow Q earlier, so
+self-play's value targets see more search-preferred lines; the visit-count policy targets do
+not change meaning (a cq target is the natural pair, as Gumbel AlphaZero trains it).
+
+### 12.5 The selection scale is its own setting (2026-10-29)
+
+**Why.** MTG Zero's overnight A/B series (its `runs/ab/results.md`) forked the Delver main line
+with one setting changed per experiment and read each with an h2h of the two arms' checkpoints at
+their runs' own rules. Experiment 2, `--cq-c-scale 0.3` (the 'cq' training target's scale), won
+64.2 +- 2.4% - but the 'cq' evaluation rule read the same `cq_c_scale`, so the fork *selected*
+its moves at 0.3 (`cq-n4-v50-s0.3`) while the control selected at 1.0 (`cq-n4`). Re-run with both
+sides at `--select visits` (400 games, the same checkpoints): 49.0 +- 2.5%, no training effect.
+The 64% was the selection scale. One knob controlled both, so a training A/B silently changed the
+evaluation rule; now they are two settings (1.2, 5.4).
+
+**What was built.**
+
+* Run settings `eval_select_c_visit`, `eval_select_c_scale`, `selfplay_select_c_visit`,
+  `selfplay_select_c_scale` (default None = unset = follow `cq_c_visit` / `cq_c_scale`; validated
+  by `check_eval_settings`, for `resolver_cfg` too; `none` on the command line unsets).
+* `mcts.select_settings(cfg, pre)` (rule, guard, effective transform), `mcts.select_transform`,
+  `mcts.check_select_transform`; `elo.eval_tag` and zerodash's `runfiles.elo_pool` name the pool
+  after the effective transform.
+* Seats: `games.nn_seat(..., select_c_visit, select_c_scale)` (the dict depends on the effective
+  rule only, see 5.4), `play.NNSeat` the same (`select_transform`, `select_tag`; 'py' seats'
+  formula and 'rs' seats' `root_select` take it); the bindings' seat keys `select_c_visit` /
+  `select_c_scale` (absent: the seat's `cq_c_*`; an error on a 'visits' seat) feed `Select::Cq`,
+  while `PolicyTarget::CompletedQ` keeps `cq_c_*` (the Rust driver already held the two apart).
+* `zero.h2h`: a run's rule with its effective transform (`run_rule`), `--cq-c-visit` /
+  `--cq-c-scale` for both sides (with `--select`: 50 / 1 when not given, as before; without it now
+  over each 'cq' side's run rule - an error if no side plays 'cq'), per side `--a-cq-c-visit`,
+  `--a-cq-c-scale`, `--b-cq-c-visit`, `--b-cq-c-scale` (over the both-sides flags; an error on a
+  'visits' side). `python -m <pkg>.az.h2h K.pt K.pt --select cq --select-min-visits 4
+  --a-cq-c-scale 0.3 --b-cq-c-scale 1.0` compares two selection scales on one checkpoint
+  (`select_a` 'cq-n4-v50-s0.3', `select_b` 'cq-n4').
+* `zero.replay`: the run's rule with its transform; `--cq-c-visit` / `--cq-c-scale` (with or
+  without `--select`). `zero.parity h2h --select-c-visit / --select-c-scale`; parity's rules include
+  ('cq', 4, 50, 0.3).
+
+**Checks** (zero-core main 45885aa as the base; `tests/test_select_scale.py`, 10 tests):
+
+* Defaults byte for byte against 45885aa: the three toy-smoke runs of 12.3 (classic; rolling;
+  margin_w 0.2 + chance_k 2 + cq targets + `eval_every` 2), each with the settings left out and given
+  explicitly as `none`: shards, checkpoints (by zip member), optimizer state, metrics (timing aside),
+  Elo files and models/index.json identical; config.json gains the four keys (null). The same for
+  a run *at* the 'cq' rule with a non-default scale (cq targets, `cq_c_scale` 0.3, `eval_select cq`
+  guard 2, `selfplay_select cq`, raw Elo offsets, 4 iterations), unset and given equal to 0.3: 11
+  files identical, pool `cq-n2-v50-s0.3` byte for byte (the live Delver line's shape).
+  `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy checkpoint):
+  identical.
+* Unset vs given equal to `cq_c_scale` (0.5, both rules, a toy run): every shard, checkpoint and
+  Elo file identical, the same pool; the seat dicts key for key.
+* The selection scale changes selection only: a toy run with `--eval-select-c-scale 0.3` beside
+  its control has identical shards and checkpoints, its evaluations in pool `cq-v50-s0.3`; a run
+  with `--cq-c-scale 0.3 --eval-select-c-scale 1.0` has other shards (the targets) and the
+  control's pool `cq`; `--selfplay-select-c-scale 0.3` at `cq_c_scale` 1.0 vs `--cq-c-scale 0.3`
+  plays the same first self-play games with other targets. In the drivers (Rust driver through the
+  bindings, the Python driver's 'py' and 'rs' seats, and a Rust unit test
+  `select_transform_moves_only_the_moves_never_the_targets`): a self-play seat with target 1.0 +
+  rule 0.3 plays the games of target 0.3 + rule 0.3 (every record field but pi equal) and its
+  targets are the 1.0 targets of the same roots (checked against a target-0 run: per record,
+  (ln pi_A - ln pi_E) - (ln pi_B - ln pi_E) / 0.3 is constant over the options to < 1e-3); rule
+  1.0 plays other games (the check has power).
+* Rust vs Python at the live rule's shape (cq, guard 4, 0.3 beside a 1.0 target): the Python
+  formula on Rust roots = the Rust driver's choice on all cases (`parity.select_formula`, now 224
+  with the added rule); a Rust-tree seat vs a Python-tree seat ~50% (300 games); an 'rs' seat with
+  select_c_scale 0.3 plays exactly the games of one at `cq_c_scale` 0.3.
+* h2h per side (both flags, the side's over the both-sides', over a run's rule, the errors),
+  replays with the transform, the command line's `none`.
+
+## 13. Distillation: a bigger network that starts where the run is (`zero/distill.py`, `tools/distill.py`; MTG Zero's Delver line, 2026-10-29)
+
+**Why.** A run whose network has plateaued may be bound by the network's capacity (MTG Zero's Delver
+mirror, runs/delver2: a 128 x 4 token network at ~86-90% against its heuristic and about +1 Elo an
+iteration in 400-game head-to-heads; its ENGINE.md 62). A bigger network trained from scratch would
+replay the whole run; a bigger network **distilled** from the run's checkpoint starts where the run is.
+`distill` trains a fresh network of the new size - any width, depth or architecture of this build's
+encoding - on the run's own sample shards to compute what the checkpoint computes, and the run then
+continues from it (13.3).
+
+### 13.1 The method
+
+* **The student** (`new_student(teacher, arch, hidden, blocks, heads, ff, ch, seed, game)`): `make_net`
+  for the teacher's game with this build's encoding (the feature / action counts, the game package's
+  token layout - its version recorded - or board grid), seeded; a token network's policy starts
+  uniform as always (10).
+* **The positions**: a `data.Window` over the shards (RAM-bounded as the run's: each shard
+  subsampled at one rate), every shard checked to be of this build's encoding (its meta's game,
+  feature and action counts: the student reads this build's inputs). Held out: other shards (default
+  the last one given), never trained on.
+* **The teacher's answers** (`outputs(model, W)`): once per window row, as the search sees them - the
+  policy as probabilities over the row's legal actions (one float per option, aligned with the
+  window's `opt_action`; the evaluator's segment softmax: equal to `NetEvaluator`'s answers, tested),
+  P(win) per seat present, the margin. `Taught(W, T)` adds their dense forms to the window's batches,
+  so `data.batches` prefetches them as the run's training does.
+* **The loss** (`losses`; w = `teacher_w`): policy (1 - w) CE(pi, p_s) + w CE(p_t, p_s) over the
+  legal actions; value (1 - w) CE((1 - vq) z + vq q, v_s) + w CE(v_t, v_s) over the seats present;
+  margin `margin_w` ((1 - w) |sc - m_s|^2 + w |m_t - m_s|^2) / 2. **w = 1 (the default) is pure
+  distillation**: the student learns the teacher's function - its whole policy over the legal actions
+  and its value estimate, where a shard's z is one game's 0 / 1 - so the warm start is the teacher,
+  not a sibling trained on the same last few iterations; w = 0 is the run's own supervised loss on
+  the shards (tested equal). AdamW, gradient-norm clip 5, the non-finite check before every step
+  (4.1), a linear warm-up, then a cosine decay to `lr_min`.
+* **Agreement** (`agreement(S, T, W)`, on held-out rows): KL(teacher || student) of the policies over
+  the legal actions (nats; the mean and the 90th percentile over the decisions with at least 2 legal
+  actions), the share of them whose argmax agrees (top-1), the squared and absolute differences of
+  P(win) over the seats present, the margin's squared difference, and each network's losses against
+  the shards' own targets (policy cross-entropy against pi, value cross-entropy against z, value
+  accuracy). A network against itself: 0, 1.0, 0 (tested).
+
+### 13.2 Why not a function-preserving widen
+
+Net2Wider / Net2Deeper growth would give the bigger network the teacher's function exactly, with no
+training at all. **Depth** is clean for this pre-norm transformer: a block whose attention output and
+second feed-forward layer are zero adds nothing (x + 0 + 0), and its other weights can be random, so
+it learns from its first step. **Width** is not: the blocks' LayerNorms average over the width, so new
+residual channels must keep every token's mean and variance - only exact duplicates do ([h, h]: width
+x 2 only, the heads doubled at the same head size, every reader of the stream halved) - and duplicated
+units train in lockstep (with an even split their gradients and AdamW's updates stay identical for
+ever; uneven splits drift apart only slowly, at second order), so the network keeps the old one's
+capacity until noise, which breaks the exactness, separates them. Distillation has neither problem:
+any size (192 is not 2 x 128), any architecture (an MLP into a token network, tested), a fresh network
+that uses all of its capacity, and the same tool for every game. Its costs are a training phase (MTG
+Zero's 192 x 6: an estimated 40-55 minutes on the desktop GPU for its main line's window, its ENGINE.md 62.6) and a fidelity short of
+exact, which the held-out agreement and a head-to-head against the teacher measure before a run uses
+the student.
+
+### 13.3 The tool, and continuing a run from the student
+
+```
+python tools/distill.py TEACHER.pt OUT.pt --data runs/a/data [--heldout runs/a/data/iter_K/r00_000.npz] \
+    --hidden 192 --blocks 6 --heads 6 --ff 384 [--arch tokens] --steps 12000 --batch 512 --lr 1e-3 \
+    --warmup 500 --ram-budget-gb 24 --eval-every 1000 --save-every 2000 --keep-best --device cuda \
+    [--aux-w 1 --aux-teacher-w W] [--resume | --init S.pt]
+python tools/distill.py --compare OUT.pt TEACHER.pt --data runs/a/data/iter_K/r00_000.npz   # agreement only
+python tools/fork_run.py --source runs/a --dest runs/a-big --iter K --net OUT.pt [--set ...]
+```
+
+* `distill.py` (its module docstring): the student's size (default the teacher's: `--hidden`,
+  `--blocks`, `--heads`, `--ff`, `--arch`, `--ch`), the training (`--steps` or `--epochs`, `--batch`,
+  `--lr`, `--lr-min`, `--warmup`, `--wd`, `--teacher-w`, `--value-q`, `--margin-w`), the window
+  (`--ram-budget-gb`, `--heldout-rows`), held-out evaluations every `--eval-every` steps (with
+  `--keep-best` also `OUT.best.pt`, the student at its lowest held-out KL), `OUT.pt.partial` (student,
+  optimizer, step) every `--save-every` and `--resume` from it, `--init S.pt` (a further distillation
+  from a student: its size, its weights), a JSON line
+  per report on stdout and in `OUT.pt.log.jsonl`, below-normal priority. OUT.pt is a normal
+  checkpoint, checked by the encoding guard before it is written; its `extra` records
+  `distilled_from`, `teacher_sha256`, `teacher_extra` and `distill` (the settings, both networks'
+  sizes, the shards, every held-out agreement).
+* **A teacher with an auxiliary head** (15: MTG Zero's belief) gets a student with the same head,
+  distilled too (`--aux-w`, its term's weight, default 1; `--aux-teacher-w`, the blend of the
+  teacher's predictions with the shards' own targets, default `--teacher-w`); **shards with value-only
+  rows** (16) train the policy on their decision rows only, as the run does; the held-out agreement
+  reports both kinds of row and the head. Both in 13.6; a teacher without a head on shards without
+  value-only rows distils as before, bit for bit.
+* **`fork_run --source --net`**: a continuation (2) of the run at K with the student as its
+  checkpoint K (checked by the guard for the run's game, and its auxiliary head against the fork's
+  settings - with a root belief on, the head for the game's targets: `check_heads`, 13.6 - before
+  anything is copied), **without the source's optimizer state**
+  (it belongs to the source's network: the fork's first training starts a fresh AdamW with its
+  warm-up), **K's Elo results dropped** from every pool (they rated the source's network;
+  ratings.json is refit at the fork's next evaluation) and the network's size in the fork's
+  config.json (`arch`, `hidden`, `blocks`, `heads`, `ff` / `ch`); the window's shards, the
+  checkpoints before K and the metrics as in any continuation. Nothing in the run loop changed: a
+  run resumes the student like any checkpoint (its size comes from its config), so an A/B of a
+  bigger network is a fork with `--net` against the plain continuation of the source on one build
+  (MTG Zero's ENGINE.md 62.6). `fork_run OUT.pt <new run>` makes it iteration 0 of a new run instead
+  (no window, a new Elo pool).
+
+### 13.4 Measured
+
+* **Toy** (the tests' setting, CPU): a random 64 x 2 MLP teacher's answers on 3,471 toy positions
+  (120 games), 1,145 positions of 40 other games held out; 300 steps of 128 rows. A 32 x 2 token
+  student (another architecture): KL 0.077 -> 0.0087, top-1 0.12 -> 0.92, P(win) squared error 0.0109
+  -> 0.0003; a 128 x 3 MLP student: KL 0.095 -> 0.0034, top-1 0.18 -> 0.94, 0.0136 -> 0.0002.
+* **MTG Zero's delver2** (its ENGINE.md 62.5; CPU, 23 minutes): its iteration-21 checkpoint (128 x 4,
+  1.55M parameters) into a 192 x 6 student (3.59M) on 79,427 rows of iterations 16-20, 2,500 steps of
+  256 rows; held out 8,192 rows of iteration 21: KL 0.595 -> 0.067 (p90 1.06 -> 0.17), top-1 0.69 ->
+  0.92, the P(win) difference 0.30 -> 0.053 (squared 0.122 -> 0.0075), the student's own policy
+  cross-entropy against the shards 0.946 -> 0.414 (the teacher's 0.352), value cross-entropy 0.70 ->
+  0.40 (0.377). The training KL ended at 0.026: on 79k rows the student fits its rows better than it
+  generalises, so the real distillation takes the whole window and more steps. Head to head on CPU
+  (48 games, 32 simulations, both sides at the line's 'cq' rule): the student **62.5% +- 7.0** against
+  its teacher (parity within 1.8 se: not weaker), the fresh 192 x 6 network 0 / 24.
+
+### 13.5 Tests and checks
+
+`tests/test_distill.py` (8; 7 more for 13.6): `outputs` are the evaluator's answers (several batches, a ragged last
+one); a network's agreement with itself is exact and another network's is not; a token and an MLP
+student converge to an MLP teacher on held-out shards; `teacher_w` 0 is the run's supervised loss
+and 1 the teacher's terms (the dense teacher policy sums to 1 over the legal actions only); the tool
+writes a checkpoint the guard accepts, with its record (the held-out curve at steps 0 / 100 / 200)
+and its log, resumes a partial checkpoint at its step, and `--compare` reproduces the last held-out
+KL; shards of another encoding are refused; a toy run's checkpoint 2 distilled into a bigger student
+on the run's own shards and forked with `--net` (the student bit for bit as checkpoint 2, no
+optimizer state, the size in config.json, K's Elo pairs gone from the fork and kept in the source),
+then one more iteration trains the student; a network of another game is refused by `--net`. MTG
+Zero: `test_a_bigger_network_distilled_on_delver_shards_reads_layout_v5`.
+
+**Checks** (c539d8f + 907bad6 on main edf4b89, and the GPU device fix after them; desktop 2026-10-29, CPU only - MTG Zero's round-2
+A/B held the GPU and the Mac). Tier "opt-in core feature with byte-identical defaults": nothing on the
+run path changed (`run.py`, `net.py`, `data.py`, `infer.py`, `cotrain.py`, the Rust crates untouched;
+the diff is `distill.py`, `tools/distill.py`, `bench.py`, `fork_run.py`'s `--net`, the tests, these
+docs).
+
+* `cargo test --release`: zero_search 50 passed, zero_webnet 3; `pytest tests`: **208 passed** and the
+  2 CUDA tests skipped (12 min 53 s; the 8 above among them). A fix found in review, after these: `outputs` sends
+  the rows to the model's device and the tool moves a fresh (CPU-built) student to `--device` before
+  its first held-out evaluation (on CUDA the step-0 evaluation would have met a CPU network);
+  `tests/test_distill.py` again 8 passed. Run with `CUDA_VISIBLE_DEVICES=` (empty)
+  those 2 fail - torch then sees the driver but no device - and they fail alike on edf4b89; with
+  `CUDA_VISIBLE_DEVICES=-1` they skip.
+* **Byte identity** against edf4b89 (its worktree zero-core-wt/ckpt-guard): `fork_run --source --iter 1
+  --set reuse=8` (no `--net`) of a toy MLP run and of a toy token run: the two continuations identical
+  file for file; `tools/check_checkpoint_compat.py --package zero` with a toy MLP checkpoint, a toy
+  token checkpoint, `random` and `uniform`: identical. MTG Zero: its delver2 iteration-21 checkpoint
+  on its e5483aa build against this core, identical (its ENGINE.md 62.7).
+* **The other games** build against it (build only, at their HEADs with this core in their
+  `third_party/zero-core`: the PyO3 crate, every test compiled, the package imported with this core and
+  its `zero.distill`): Glass Road Zero c1f56dc 67 s, Caverna Zero a6fad73 107 s, Kingdom Builder Zero
+  4202a4a 171 s.
+* MTG Zero (ENGINE.md 62.7): `--test az` 27 passed, pytest 49 (the new distillation test among them),
+  the CPU distillation and head-to-heads of 13.4.
+
+### 13.6 Auxiliary heads and value-only rows (MTG Zero's main line `r3-2b-beliefsearch`, 2026-10-29)
+
+**Why.** The tool predates two things MTG Zero's main line now has (its ENGINE.md 62.9): an
+**auxiliary head** (15: the belief over the opponent's hand, `aux_belief_w` 0.25) that its search
+reads (18: `selfplay_belief_tilt` / `eval_belief_tilt` 1, which refuse a checkpoint without the head,
+exit 78), and **value-only rows** (16: `selfplay_view_samples` 0.5, a third of the window's rows). A
+student distilled before had no head - the main line refuses it - and its policy terms were means over
+every row of a batch, the value-only rows' zeros included (a policy weight two thirds of the value's).
+
+**What it does** (`zero/distill.py`, `tools/distill.py`, `tools/fork_run.py`):
+
+* **The student gets the teacher's head** (`new_student(..., aux='teacher')`, the default; `aux=None`:
+  none): the same targets, so a run trains it and a search reads it as it did the teacher's; built
+  after every other parameter (15.2), so the rest is drawn as for a student without one (tested).
+  The tool checks the teacher's head and the student's against the game's targets (names and widths,
+  `net.check_belief_head`) before it trains and before it writes; `--init` from a student without the
+  head gives it a fresh one (`net.add_aux`), one with another head is refused.
+* **The teacher's answers** include the head's predictions (`outputs`: 'aux' [N, W] by
+  `net.aux_predict` - a multinomial's distribution, a poisson's rates, an mse's values - equal to
+  `NetEvaluator.aux`'s answers, tested; the other answers equal the network's without its head) and the
+  window carries the shards' own targets (`Window(aux_width=W)`); `Taught` batches add `taux`.
+* **The loss** adds per target `aux_w` x ((1 - wa) L(the shards' target) + wa L(the teacher's
+  prediction)), L the target's own loss (`auxtarget.losses`; for a multinomial the cross-entropy to a
+  distribution = the KL to it + its entropy), wa = `aux_teacher_w`. The shards' term counts the rows with
+  a target (the run's rule); the teacher's term every row except those whose shard says a multinomial's
+  segment is empty (an empty hand: n x p = 0 whatever p, so the teacher's p there was never trained and
+  means nothing) - including the rows of shards recorded without targets, where the teacher's prediction
+  is the only label. `teacher_w` 0 with `aux_w` = the run's `aux_<name>_w` is `run.train_model`'s loss
+  line for line (tested). Training reports `aux_<name>_t`, `aux_<name>_d` and a multinomial's
+  `aux_<name>_kl` (to the teacher). A student with a head and no teacher's predictions to learn is
+  refused (a head trained on nothing would be a silent no-op).
+* **The defaults, and why.** `aux_teacher_w` = `teacher_w` (1: pure distillation of every head): the
+  teacher's distribution estimates the hand's composition given the public state - the mean of which
+  the one recorded hand is a sample -, a warm start whose searches deal their worlds as the teacher's
+  do lets the head-to-head gate compare the networks rather than two beliefs, and the continued run
+  trains the head on the true hands anyway (`aux_belief_w`, with its whole window). `aux_w` 1: every
+  output's term is then a KL to the teacher (the policy's over the legal actions, the value's, the
+  head's), equally weighted; AdamW scales the head's own parameters alike whatever the weight, so the
+  weight sets the trunk's balance only. Measured on the main line (the CPU evidence below, 2,000 steps
+  into 64 x 2, held-out rows of another iteration):
+
+  | `aux_w` / `aux_teacher_w` | policy KL (decisions) | P(win) sq. error, decision / view rows | belief KL to the teacher | belief CE vs the true hands (the teacher 2.649) |
+  |---|---:|---|---:|---:|
+  | **1 / 1 (the defaults)** | **0.099** | **0.0106 / 0.0097** | **0.026** | 2.663 |
+  | 0.25 / 1 (the run's weight) | 0.098 | 0.0117 / 0.0113 | 0.036 | 2.672 |
+  | 1 / 0.5 | 0.104 | 0.0115 / 0.0107 | 0.054 | 2.631 |
+  | 1 / 0 (the true hands only) | 0.116 | 0.0131 / 0.0121 | 0.252 | 2.735 |
+
+  The run's weight 0.25 keeps the policy no closer (0.098 vs 0.099) and the value and belief further
+  off; the true hands cost policy and value fidelity (their one-sample noise reaches the trunk) and on
+  73k rows overfit (their CE rose after step 1,000); the 0.5 blend's head reads the true hands slightly
+  better than the teacher's (2.631) at twice the KL - a choice for a student meant to improve on its
+  teacher's belief, not for a warm start.
+* **Value-only rows** (`losses(view=True)`): the policy terms and the teacher's entropy are means over
+  each batch's decision rows (rows with options), the value, margin and auxiliary terms over every row -
+  `run.train_model`'s mask; `distill` decides from the window (`np.diff(W.opt_off) == 0`, `view_rows`),
+  as the run does. Their value and margin distillation is the teacher's answers on the viewer's row.
+* **Agreement**: with value-only rows in the held-out window also 'decision' and 'view' - each kind's
+  rows, P(win) squared and absolute difference, margin squared difference, each network's value
+  cross-entropy and accuracy against z -; with a head 'aux' per target - a multinomial's KL(teacher ||
+  student) over the teacher's rows (mean, p90, per kind of row), top-1 agreement, and each network's
+  cross-entropy and `hit` against the shards' targets (the run's `train.aux_<name>` / `_hit`); another
+  loss: the squared difference and each one's loss. The keys of before are unchanged (the policy over
+  the decisions with 2+ options, P(win) over every row). `--compare` reports the head when both networks
+  have the same one. `--keep-best` still keeps the lowest held-out policy KL.
+* **RAM**: the window's budget counts 6 W + 1 bytes more a row with a head - the targets and their mask
+  as the run's window holds them, the teacher's predictions in float32 (MTG's 1,024: +6.1 KB on a
+  75.5 KB row, 8%).
+* **`fork_run --net`** checks the network's head against the fork's settings (source config + `--set`)
+  before anything is copied (`check_heads`): with a root belief on, the head for the game's targets
+  (`net.HeadMissing`, the run's own refusal at its start); a head for other targets than the run trains,
+  refused (its first training would refuse it); no head where the run only trains targets, accepted
+  (the run adds one, 15.4). The encoding guard's refusal now also comes before the copy.
+* **The start log** gains `train_view_rows`, `heldout_view_rows` (with value-only rows), `aux`,
+  `train_aux_rows`, `heldout_aux_rows`, `aux_w`, `aux_teacher_w` (with a head); the record's settings
+  gain `aux_w` and `aux_teacher_w`.
+
+**Off: the distillation of before.** A teacher without a head on shards without value-only rows: the
+forward pass without `aux`, the policy means `.mean()` as before, no new batch keys, terms or log keys.
+Checked byte for byte (the record's `settings` aside, which gains the two flags): the tool on toy shards
+(a token student with `--keep-best`, an MLP student at `teacher_w` 0.5, `--compare`, a toy run
+distilled and continued with `fork_run --net` one iteration) on main 2f0a2e8 (its own worktree,
+`E:/zero-scratch/distill2/base-2f0a2e8`) and on this branch: 16 checkpoints (configs and tensors), 9 shards and 4 logs
+identical (the teacher's file sha256 aside: torch writes a new serialization id with every save); and
+MTG Zero's delver2 iteration 71 (no head, no value-only rows) into a 32 x 1 token and a 32 x 1 MLP
+student (a 0.3 GB budget: 3,971 of 8,202 rows), `--compare`: identical (its ENGINE.md 62.9).
+
+**Tests** (`tests/test_distill.py`, 7 more, 15 in all): the toy's aux shards (targets, empty targets,
+value-only rows); `outputs` with a head = `NetEvaluator.aux`, the rest = the network without it; the
+student gets the head, built last; value-only rows: the policy terms over the decisions (the old ones
+the diluted mean), the other terms unchanged; `teacher_w` 0 = `run.train_model`'s loss with the head and
+value-only rows, `teacher_w` 1 the teacher's terms on the rows of `teacher_aux_rows`, the blend, the KL;
+a token student converges to an MLP teacher's head and to both kinds of row, a head without the
+teacher's predictions or the window's targets refused; the tool on a toy run with the target, root-view
+leaves, value-only samples and the belief in self-play: the student has the head and passes
+`check_belief_head`, its record and log, `fork_run --net` accepts it, the fork self-plays with the
+belief and trains it (head kept), `--init` from a student without the head adds it, a network without
+the head refused for the belief run (nothing copied) and accepted by a fork without it.
+
+**Measured on MTG Zero** (its ENGINE.md 62.9, CPU): the main line's checkpoint 91 (128 x 4 with the
+belief head) into a 64 x 2 student, 2,000 steps of 256 rows on 73,454 rows of iterations 89-90 (24,411
+of them value-only), held out 4,096 rows of iteration 91 (1,312 value-only): policy KL 0.571 -> 0.099,
+P(win) squared error 0.124 -> 0.0106 (decision rows) and 0.135 -> 0.0097 (value-only rows), the belief's
+KL 4.29 -> 0.026 (its CE against the true hands 6.93 -> 2.663, the teacher's 2.649); `fork_run --net`
+into a copy of the main line, two CPU iterations with the run's settings (belief tilt 1, mix 0.25,
+root-view leaves, value-only samples 0.5, belief weight 0.25): self-play with the belief, the head
+trained; the 192 x 6 student builds with the head (3,766,493 parameters) and passes the guard and the
+belief's check.
+
+**Checks** (tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal; MTG Zero's round-3 Gumbel test live on the GPU and the Mac):
+nothing on the run path changed (`run.py`, `net.py`, `data.py`, `infer.py`, the Rust crates untouched;
+the diff: `distill.py`, `tools/distill.py`, `tools/fork_run.py`, the tests, these docs). `cargo build
+--release --workspace` (26 s, its own target dir); `pytest tests` **291 passed**, 3 skipped (the CUDA
+tests; 12 min 38 s; the 15 of `test_distill.py` among them); the goldens above. MTG Zero (its ENGINE.md
+62.9): `tools/gate.py python` passed (pytest 59, the new Delver distillation test among them; the
+run-loop smoke).
+
+## 14. The self-play league (`zero/league.py`; MTG Zero's Delver mirror, 2026-10-29)
+
+### 14.1 Why
+
+MTG Zero's Legacy Izzet Delver mirror (its main line `runs/delver2`) settled at about +1 Elo per
+iteration (its ENGINE.md 63). In a mirror, pure self-play trains a network against its own current
+habits only: what beats them is learned, the habits it exploited fade, and nothing keeps the policy
+from narrowing or cycling. Fictitious self-play and AlphaStar's league answer it by playing part of
+the games against past versions. `selfplay_league` is that in its simplest form: an opt-in share of
+the self-play games puts a past checkpoint of the run in one seat.
+
+### 14.2 What it does
+
+* **Settings** (1.2): `selfplay_league` (share, 0 = off), `selfplay_league_pool` (raw iteration
+  offsets back from the network that self-plays - iteration i self-plays with checkpoint i-1, so the
+  default '2,4,8,16,32' offers i-3, i-5, i-9, i-17, i-33, those that exist -, or 'all': every
+  earlier checkpoint), `selfplay_league_slots` (past checkpoints per iteration, default 1; each its
+  own evaluator key 'L0', 'L1', ...), `selfplay_league_pick` ('uniform' | 'pfsp'). Validated at
+  start (`league.check_settings`); a co-training run (`resolver`, or `resolver_cfg` holding the
+  setting) is refused. The default offsets skip offset 1: checkpoint i-2 is one training iteration
+  away from the network that self-plays, so its games would be nearly mirror games recorded on one
+  side.
+* **Which games** (`league.kinds`): game g is a league game when floor((g + 1) f) > floor(g f), so a
+  driver's started games hold the share exactly (floor(n f) of n) and evenly spread; league game m
+  plays slot m mod k, the past network in seat (m div k) mod players (seats alternate, so neither
+  side gets the play / draw advantage), the other seats the current network. A classic driver gets
+  one table per iteration; a rolling or `queue_only` driver's cyclic table (`games[gid % len]`, the
+  Rust driver's) is one cycle of `league.cycle` entries (the share's denominator x slots x seats x
+  player counts), built once - its keys stay, the weights behind them follow each iteration's picks.
+  The shared queue (5.3) counts league games as any game: the quota stays exact; the share of the
+  *accepted* games is the started share up to which games finish first (25.0 +- 2% in the toy runs).
+* **The past network's seat** is the run's self-play seat on its key with `record` false (the Rust
+  seat key, docs/search.md 2.1): it searches with the self-play settings (root noise, temperature
+  moves, the playout cap, `selfplay_select`), so a past network plays as it did in its own
+  self-play, and it records nothing.
+* **Training targets: only the current network's decisions.** Its records are the league game's
+  samples: `pi` its search's target, `q` its own root value, `z` the game's result from its seat (the
+  driver's records are per decider). The past network's moves are not the current policy's: its
+  visit / completed-Q targets are an older network's improvement of an older prior (training on them
+  pulls the policy back toward the habits the league is meant to move away from), and its root
+  values estimate the game from an older value head. AlphaStar trains its main agents only on their
+  own decisions in league games, for the same reason. The cost: a league game gives about half the
+  samples of a mirror game, so an iteration's samples fall by about f / 2 (f = 0.25: ~12.5%) and
+  training's steps with them (`new samples x reuse / batch`).
+* **The picks** (`League.plan(it)`, made once per iteration and cached; the same plan whether made
+  for the remote's early phase while checkpoint it - 1 is evaluated or for this machine's phase, and
+  after a restart): the candidates are the pool's checkpoints that exist (newest first); with no
+  more candidates than slots every candidate plays (cycled over the slots), else `slots` are drawn
+  without replacement, seeded by (run seed, it). 'uniform' weighs them equally; 'pfsp' (prioritized
+  fictitious self-play, AlphaStar's f_hard) weighs candidate j by (1 - x_j)^2 (at least 1e-3), x_j =
+  the current networks' score against j from the metrics rows of iterations <= it - 2 (each row
+  weighted 0.7^age, a prior of 4 games at 0.5): checkpoints the network still loses to are played
+  more. **No candidate yet** (a new run's first iterations, a pool reaching further back than the
+  run): the slots hold checkpoint it - 1, i.e. mirror games recorded on one side (`self` in the
+  metrics).
+* **Evaluators**: each slot's checkpoint is loaded through `zero.net.load` with the run's game - the
+  encoding guard (10.4) refuses a past network of another encoding - into the slot's existing
+  evaluator when the network's config is the same (`set_weights`), else a new one.
+* **Metrics** (`selfplay.league` in metrics.jsonl): `share` (league games / the iteration's games),
+  `games`, `score` and `win` (+ `se`): the current network's score against the league (draws 0.5;
+  more than two players: 1 - the past seat's result), `pool` (per checkpoint: games, score, win),
+  `slots` ({key: checkpoint}), `candidates`, `pick` (and pfsp's `weights`), `local` / `remote` (the
+  league games of each machine), `self`, `infer_s` (the slots' inference time). A finished game is
+  attributed to the checkpoint in its slot when it finished (a rolling driver's game carried over a
+  phase boundary searched with both). The log: `iter 4 league: 149 league games (24.8%), slots
+  iter_0001 of 2 candidates (uniform); the current network scores 0.846 +- 0.030 against them
+  (iter_0001 149 games 0.846)`.
+* **Remote self-play** (5.3): the phase line names the slots' checkpoints (`league`: {key:
+  `models/iter_j.pt`}), shipped into the mirror with checkpoint i-1 at every phase start; a worker's
+  clean-up (checkpoints older than i-3) keeps the ones its phase names. The worker builds the run's
+  league table from the mirror's config, points its slot evaluators at the named checkpoints
+  (guarded), annotates its finished games with their slot's checkpoint, tallies the games the run
+  accepts and reports the tallies with its phase's `end` (`selfplay.league.remote`; a lingering
+  worker's games, held for the next phase, keep the checkpoint they played). A worker whose hello
+  does not announce the league (an older checkout: it would play mirror games and record both seats
+  of the league games) is killed and retried every 10 minutes (`worker k REFUSED: its checkout has no
+  self-play league`); this machine plays every game meanwhile. MTG Zero's remote `mac` runs exactly
+  the run's commit anyway (its RunCommitRemote).
+* **fork_run** with `--set selfplay_league=...`: the continuation links every checkpoint its league
+  may play (back to the pool's furthest offset, `league.fork_needs`; 'all': every one), not only the
+  Elo matches'. A fork made without the setting and started with it plays only the candidates it has.
+* **Off** (`selfplay_league` 0, the default): no League object, the seat dicts, tables, evaluators,
+  phase lines and metrics of before (14.5).
+
+### 14.3 Costs
+
+* **Inference calls**: each slot is one more network batch per group and dispatch (its leaves are a
+  share of the group's: f / 2 of the leaves split over the slots). On a CPU the extra call costs its
+  overhead plus its leaves; on CUDA mostly the call. Measured on the desktop's CPU (other runs on the
+  machine; rolling driver, 2 groups, 64 / 16 simulations):
+
+  | | leaves/s | calls per network (current / each slot) | batch (current / slot) |
+  |---|---:|---:|---:|
+  | toy 32 x 1, 256 in flight, 4 threads: off | 179,949 / 208,544 | 7,040 / - | 128 / - |
+  | toy, 0.25, one slot | 135,755 / 134,194 (-30%) | 7,051 / 7,051 | 112 / 16 |
+  | toy, 0.25, two slots | 123,872 / 118,763 (-38%) | 7,048 / 7,048 | 112 / 8 |
+  | toy, 0.5, one slot | 148,288 / 156,655 (-21%) | 7,075 / 7,075 | 95 / 33 |
+  | MTG Delver token network 128 x 4, 96 in flight, 4 search + 2 torch threads: off | 1,824 / 2,034 / 1,757 / 1,330 (mean 1,736) | - | 48 / - |
+  | MTG, 0.25, one slot | 1,642 / 1,344 / 1,770 / 1,296 (mean 1,513: -13%) | equal | 42 / 6 |
+  | MTG, 0.25, two slots | 1,395 / 1,233 (mean 1,314: -24%) | equal | 42 / 3 |
+
+  (Each phase 60-90 s after a warm-up; the toy's networks two checkpoints of a toy run, MTG Zero's
+  delver2 iterations 23 and 11; the desktop shared with MTG Zero's A/B arms, so the MTG phases vary by
+  +-20% between neighbours.) The toy's tiny network is the worst case: a call's overhead is most of
+  its cost (a 16-leaf call ~0.8 ms against ~1.0 ms for 112 leaves), so a slot costs nearly a call.
+  MTG's: a ~6-leaf call ~12 ms against ~46 ms for the current network's ~42 leaves - +26% inference
+  per dispatch with one slot, +38% with two - and inference is not all of the loop: about -13% of the
+  leaves per second with one slot. More slots cost more calls, a larger share does not (the same
+  number of calls, larger league batches). CUDA (a batch-bound consumer): one more graph replay per
+  dispatch, not measured here (CPU only).
+
+* **Memory**: one more network per slot in every self-playing process (this machine's driver and
+  each remote worker), inference only (no optimizer state; on CUDA its graph buffers too): MTG Zero's
+  Delver token network is 6.2 MB on disk. A rolling driver keeps its slots' evaluators.
+* **Transfer** (remote self-play): `slots` more checkpoints per iteration into the mirror - Delver:
+  6.2 MB against the 6.2 MB checkpoint and ~50 MB of compressed shards coming back per iteration.
+* **Samples**: ~f / 2 fewer per iteration (14.2), the same games.
+
+### 14.4 Tests (`tests/test_league.py`, Rust `an_unrecorded_seat_plays_the_same_games_and_records_nothing`)
+
+The kinds (exact, spread, slots and seats in turn) and the rolling cycle; the seat tables; the
+settings' checks (shares, pools, slots, picks, co-training refused, the command line); off by
+default (no League, the seat dict without `record`); through the bindings, half the games against a
+past checkpoint: the league games' samples are the current network's decisions only (decider its
+seat, z its result), and with the league seat recorded instead the same 24 games move for move whose
+current-seat samples are exactly these; the attribution; a past checkpoint of another encoding
+refused; the plans (the pool's candidates newest first, 'all', the `self` case, deterministic across
+League objects, uniform about even over 390 iterations); pfsp's weights from the metrics (decay, the
+prior, rows <= it - 2) and its picks (P 0.02 / 0.57 / 0.40 over 300 seeds); toy runs with the league
+(classic: exactly 12 of 48 games every iteration; rolling with two slots), their metrics, candidates
+and shard samples; a mirror run with no league in its metrics or log; the shared queue with the
+remote 'local' and linger: the quota exact, league games on both machines, the share 18-32%, the
+mirror after the last phase = checkpoints >= 1 and the phase's slot (iter_0000 only because it is
+named); a worker without the league refused while this machine plays every game; fork_run linking
+the league's checkpoints and the fork playing its league. In Rust: the same games with the league
+seat recorded or not, its records exactly the m seat's, z from the m seat, and an unrecorded seat
+alone recording nothing.
+
+### 14.5 Checks
+
+Tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only
+(`CUDA_VISIBLE_DEVICES=`, below-normal priority), MTG Zero's A/B round live on the GPU and the Mac.
+First on main edf4b89 (code 8295152), then again after the rebase onto main 437cef0 (feat/bignet's
+distillation: nothing on the self-play path), code 5099f00 + these docs:
+
+* `cargo test --release`: zero_search **51 passed** (50 + the unrecorded seat), zero_webnet 3 (8295152).
+  On 5099f00 50 passed and `queued_setups_are_shared_between_the_groups` failed once: a test whose
+  first assertion depends on which group's first search finishes first (its own comment), failing 1 of
+  60 runs on this branch and 4 of 60 on 437cef0 interleaved with it (2 of 30 and 0 of 30 before), with
+  pytest and the identity runs on the machine; nothing in it records.
+* `pytest tests`: 8295152 **213 passed, 2 failed** (13 min 47 s), 5099f00 **220 passed, 3 failed** (21
+  min; main's distillation tests among them). Two failures are CUDA-only tests
+  (`test_net_data.py::test_graph_runner_matches_eager_and_follows_new_weights`,
+  `test_nonfinite.py::test_normal_run_has_no_debug_dir[cuda]`) that fail the same way on edf4b89 with
+  `CUDA_VISIBLE_DEVICES=` (they do not skip without a visible device); the third,
+  `test_remoteplay.py::test_cotrain_backoff_gives_matches_back` (a co-training worker backing off in
+  time to give its matches back), failed under the load of 180 concurrent Rust test runs and passed 3
+  of 3 alone (the league is refused in co-training; matches mode never builds it).
+  `tests/test_league.py` 13 passed on both.
+* **Byte identity** against edf4b89 and again against 437cef0 (each its own worktree and target dir),
+  the settings left out and given at their defaults: toy-smoke runs - MLP vs `ext:toyheur` and tokens
+  (classic, 3 iterations), `cq` targets + `eval_select cq` guard 2 (rolling, 3), and the Delver main
+  line's shape (rolling, `cq` targets at scale 0.3, `eval_select cq` guard 4 at 0.3, raw Elo offsets,
+  no random games, value_q 0.6, window_cache, train_prefetch; 4 iterations): every shard,
+  `elo/results.json`, `ratings.json` (`updated` aside), `models/index.json` byte for byte, every
+  checkpoint and the optimizer state tensor for tensor (the files differ in torch's archive root
+  only), the metrics equal without their timings, config.json = the base's + the four keys. The
+  rolling runs needed care: a rolling phase's end depends on timing with two batches in flight
+  (docs/search.md 2.6) - edf4b89 itself reproduced its own reference in 18 of 19 runs of the Delver
+  shape (one differed from iteration 2 on), 8295152 in 10 of 12 (6 of 6 interleaved with the base's);
+  with `ZERO_INFLIGHT=1` (deterministic) both rolling configurations are identical in 2 runs each of
+  the base, unset and the defaults (11 and 13 files, the metrics), and against 437cef0 the rolling
+  ones were compared that way.
+* `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy MLP and a toy token
+  checkpoint): identical, against edf4b89 and against 437cef0.
+* The other games build against it (build only, their HEADs with this core in `third_party/zero-core`;
+  the PyO3 crate, every test compiled, the package imported): Glass Road Zero c1f56dc 45 / 36 s,
+  Caverna Zero a6fad73 70 / 59 s, Kingdom Builder Zero 4202a4a 106 / 94 s (before / after the rebase).
+* MTG Zero (branch `league`, its ENGINE.md 63): `cargo test --release -p engine --test az` 27 passed,
+  `pytest tests` 48 passed; delver-smoke with the league on, classic and with the remote 'local'
+  (rolling, linger).
+
+### 14.6 An A/B of the league
+
+Fork the main line at checkpoint K with the league on (`tools/fork_run.py --source <main> --dest
+<fork> --iter K --set selfplay_league=0.25`, so the fork has the league's checkpoints), run the fork
+and the control K -> K + N with the same build and flags (the fork adding `--selfplay-league 0.25`),
+read it with an h2h of the two K + N checkpoints at the same move rule (as the policy-target and
+selection A/Bs, 9 and 12.5). Watch `selfplay.league.win` (the network's score against its own past:
+a mirror run's policy that drifts in a cycle shows it falling against some checkpoints) and
+`train.entropy`. MTG Zero's flags: its ENGINE.md 63.
+
+## 15. Auxiliary training targets (`zero/auxtarget.py`; MTG Zero's belief head, 2026-10-29)
+
+### 15.1 Why
+
+A network trained on self-play learns what wins; whether its trunk also tracks what it cannot see is
+another question. MTG Zero's Delver mirror (its ENGINE.md 66) wants a head that predicts the
+opponent's hidden hand from public information - "they left blue open and passed: likely Daze or
+Force of Will" - first as a measurement (does the trunk carry it?) and as an auxiliary loss that may
+shape the trunk (KataGo's ownership and score targets are the precedent), later as the prior of the
+search's determinization (stage 2, its ENGINE.md 66.8: designed, not built). The core part is
+generic: a game declares per-decision labels computed from the TRUE state, the driver records them,
+the network predicts them, training adds their loss. An unmerged branch had end-of-game targets
+(`aux-targets`: Kingdom Builder's ownership and score); these are per decision and may be hidden
+information.
+
+### 15.2 What it does
+
+* **The game** (docs/search.md 1.2): `SearchGame::AUX` = segments `(name, width)`,
+  `aux_target(viewer, out)` = the label vector of the pending decision for its decider, from the true
+  state (a label, never an input: `encode` stays blind; each game tests that worlds determinized for
+  the decider encode alike while their targets differ). The toy: `next_card`, the next round's hidden
+  card (one-hot over 6; none in the last round).
+* **The game package** (zero/package.py `aux`): `{game: [{name, width, loss}]}` in the engine's
+  segment order; loss 'multinomial' | 'poisson' | 'mse' (`net.AUX_LOSSES`). A run checks the names and
+  widths against the engine's (`aux_layout` of `game_info_of`). Each target gets the run setting
+  `aux_<name>_w` (DEFAULTS, default 0.0); `replay_aux` renders a checkpoint's head in replays (15.5).
+* **Recording**: a weight > 0 creates every self-play driver with `aux=True` (this machine's, rolling,
+  the shared queue's, remote workers': `Run.driver(record=True)`); each recorded decision gets its
+  decider's target (`Record::aux`, also through parked deferred games), `take_samples()['aux']` f32
+  [N, W], shards `aux` float16 [N, W] (the non-finite guard checks it). A remote shard without targets
+  in a run that wants them is accepted and logged (its checkout predates the run's targets).
+* **Windows**: `Window(aux_width=W)` loads `aux` and `aux_mask` per row; a shard without targets (a
+  fork's older window, a run before the targets) gives zeros with mask 0, so its rows still train the
+  policy / value / margin and the auxiliary losses skip them. The window cache keys its shards by the
+  width too. Budget: 2 W + 1 more bytes per row (MTG Zero's 1,024-wide belief: +2.7% of a Delver row).
+* **The head** (zero/net.py): config key `aux` = `[[name, width, loss], ...]`; ONE MLP from the trunk's
+  pooled state - where value and margin read it: `Net`'s h, `GridNet`'s e, `TokenNet`'s z (the global
+  token and the tokens' mean) - to `head` (128) to W, built after every other parameter (a network
+  with the head initialises the rest exactly as one without), its last layer zero. Only
+  `forward(x, n, aux=True)` returns it (a fourth output: the raw values), so self-play's and the
+  evaluations' inference - eager, CUDA graphs, remote - is the network of before. `aux_predict` turns
+  the raw values into predictions: 'multinomial' a softmax over the segment, 'poisson' exp (rates),
+  'mse' as is.
+* **Losses** (zero/auxtarget.py), per row, averaged over the rows that have a target: 'multinomial' =
+  cross-entropy against the counts normalised to sum 1 (-sum_k t_k / n log p_k): the head learns the
+  composition, and n x p is the expected count given the total - right when the total is public (a
+  hand's size), and what stage 2 needs (an urn's weights). A row whose segment is all zero has no
+  target (an empty hand). 'poisson' = mean_k exp(o_k) - t_k o_k (counts without a known total); 'mse'.
+  The training loss adds `aux_<name>_w` x each; metrics `train.aux_<name>`, `aux_<name>_hit` (a
+  multinomial target's most likely column is in the target), `train.aux` (rows with targets, their
+  share, the mean total and non-empty share, the weights, `head_added`); the non-finite guard checks
+  the auxiliary losses too.
+* **Inference API** (zero/infer.py): `NetEvaluator.aux(x, n_players)` -> `{name: predictions [B, w]}`,
+  one forward pass of the given rows (a decision's root); `{}` without a head. The search's own
+  batches never compute the head (an additive method: `evaluate`, `launch` / `result` and the leaf
+  batch protocol are unchanged). `set_weights` takes a state with or without the head either way (a
+  rolling evaluator built from a checkpoint without the head, a run that turned it on later).
+
+### 15.3 Off by default
+
+Every weight 0 (the default): no driver records, no network has the head, `Window` loads nothing more,
+the optimizer and the losses are the code of before line for line; config.json gains one key per
+declared target (0.0). Checked byte for byte (15.6).
+
+### 15.4 Carry-over: a checkpoint without the head
+
+`net.add_aux(model, layout, seed)` returns a copy with a fresh head (seeded; the global torch RNG
+untouched) and every other parameter and buffer exactly the checkpoint's, so its policy, value and
+margin are unchanged (tested on the three archs: outputs equal, states equal); a network with that
+head is returned as is, one with another head refused (`strip_aux` first). The run does it itself: a
+run with a weight on whose checkpoint has no head - a fork of a run without one, `tools/fork_run.py
+--source <run> --dest <fork> --iter K --set aux_<name>_w=0.5` - adds the head at its first training
+(logged; `train.aux.head_added`), keeps the optimizer's AdamW moments for the trunk (the saved state
+of one parameter group fits the trunk's parameters: it is loaded, and the head joins as a second
+group with fresh moments) and trains on the window whose older shards have no targets (masked). Every
+later checkpoint has the head and two parameter groups. The encoding guard (10.4) ignores the head (it
+reads no input): such a checkpoint loads, resumes and is checked like any. A new run with a weight on
+builds its first network with the head. A checkpoint whose head predicts some of the game's targets is widened to
+all of them, exactly (section 37).
+
+### 15.5 Replays (`zero.replay`, format 'zero-replay/1' extended)
+
+A network seat whose checkpoint has a head lists its targets (`seats[i].aux`) and each of its
+decisions' frames gets the game package's `replay_aux(predictions, state, seat, frame)` fields - the
+head at the decision's root for the decider: one forward pass of the root's features after its search
+(the search's evaluations do not compute the head, and a reused tree's root was evaluated during an
+earlier search, so the root's own pass is the one that exists for every decision) - by default
+`aux: {name: [[column, value], ...]}` (each target's 12 largest). MTG Zero renders `belief: {for, n,
+cards: [[name, expected count], ...]}` (its ENGINE.md 66.5). A checkpoint without a head: the frames of
+before. Readers of the format that do not know the fields ignore them.
+
+### 15.6 Tests and checks
+
+Rust: `aux_target_is_the_hidden_next_card_and_never_an_input` (the toy's target is its hidden card;
+determinized worlds encode alike, their targets their own), `aux_records_the_decider_targets_and_
+changes_nothing_else` (the golden records with aux on and off; each record's target its decision's,
+replayed move for move; a game without targets refuses aux). `tests/test_aux.py` (18): the package's
+declaration and setting, off by default, a negative weight refused; the binding's target and
+determinize; the driver's records (every other array identical); shards and windows (old shards masked,
+the cache, a wrong width refused); the head on the three archs (built last, outputs unchanged, last layer
+zero), `add_aux` / `strip_aux` exact; a checkpoint with the head through the encoding guard; the losses
+and predictions; `NetEvaluator.aux` and `set_weights` either way; a toy run with the target on (shards,
+heads from iteration 0, two parameter groups, the loss below ln 6), a run off (nothing), a fork of it
+with the target on (the head added at its first training, the trunk's optimizer state kept, the window
+partly masked), replays with and without a head.
+
+Checks (tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal; MTG Zero's A/B round live on the GPU and the Mac), on main
+b486d36: `cargo test --release --workspace` 61 + 3 passed; `pytest tests` 246 passed, 2 skipped (the
+CUDA graph-runner test deselected: it fails without a visible device, as on the base); byte identity
+against b486d36 (its own worktree and target dir), the settings left out and given at their default,
+`ZERO_INFLIGHT=1`: toy-smoke MLP vs `ext:toyheur`, tokens (classic, 3 iterations), cq targets +
+`eval_select cq` guard 2 (rolling, 3), the Delver line's shape (rolling, cq 0.3, guard 4 at 0.3, raw Elo
+offsets, no random games, value_q 0.6, window_cache, train_prefetch; 4) - every shard,
+`elo/results.json`, `ratings.json` (`updated` aside), `models/index.json`, every checkpoint and
+optimizer state tensor for tensor, the metrics without timings, config.json = the base's +
+`aux_next_card_w` 0.0; `check_checkpoint_compat --package zero` (random, uniform, a toy MLP and a toy
+token checkpoint) identical; Glass Road Zero c1f56dc, Caverna Zero a6fad73 and Kingdom Builder Zero
+4202a4a build against it (build_py, every test compiled, the package imported). MTG Zero (branch
+`belief`, its ENGINE.md 66.9): its suites, behaviour digests unchanged, `check_checkpoint_compat
+--package mtgz` with delver2's iteration 41 identical.
+
+### 15.7 What it measured on MTG Zero (its ENGINE.md 66.6)
+
+On 80 held-out Delver games (CPU), a head on delver2's FROZEN trunk predicts the opponent's hand at
+2.60 nats per card against 2.81 for the uniform deal the search uses today and 2.71 for a static
+per-card bias (count-matching); over that bias (a residual head) 2.44. After 400 joint training steps
+with the belief loss a fresh head reads 2.28 from the trunk against 2.54 after the same steps without
+it: the auxiliary loss shapes the trunk, at +0.008 nats of held-out policy loss. Stage 2 - dealing the
+search's determinizations from the head's prediction (a `SearchGame::determinize_with` hook, flagged
+belief rows in the leaf batch) - is designed there (66.8), not built.
+
+## 16. Root-view leaf values (MTG Zero's Delver mirror, 2026-10-29)
+
+### 16.1 Why
+
+The search values a leaf with the network on the view of the player to move there (docs/search.md
+3): at a leaf where the opponent decides, the root player's value is read from a view that cannot see
+the root player's hidden cards and that treats the opponent's sampled ones as known. MTG Zero
+measured the bias on its Delver mirror (its ENGINE.md 64.4): a kept landless hand on the draw is
+worth 0.36 to the keeper's own view and 0.51 to the next decider's, and every other leaf of a
+two-player search is the opponent's.
+
+### 16.2 What it does (docs/search.md 3.6)
+
+* **Root-view values** (`selfplay_leaf_value_view` / `eval_leaf_value_view` = 'root'): a leaf of
+  another seat than the tree's root decider takes its priors from its own row, `encode(decider)`, and
+  its value and margin from a second, value-only row `encode(viewer)` in the same batch (flagged
+  `ROW_VALUE` in the batch's `extra`). Evaluators are unchanged.
+* **Value-only samples** (`selfplay_view_samples` = a share of the recorded decisions,
+  `view_sample_target` = 'next_q' | 'z'): the real state from each other recording seat's view, in its
+  perspective, with an empty option segment (no policy target); z its result, q its own next search's
+  root value (or z). They teach the value head the views root-view leaves ask it for: before them it
+  only ever saw `encode(decider)`.
+* **Training** (section 4): a window holding value-only rows takes the policy loss and the policy
+  entropy over the decision rows of each batch only (a mean over the batch's rows with options);
+  the value and margin losses over every row. Metrics `train.value_view` / `value_decision` (the value
+  loss on each kind of row, the last 200 steps) and `window_view_samples`; self-play's `view` (`rows`:
+  value-only rows sent with leaves, `rows_per_leaf`, `samples`: value-only samples recorded). A window
+  without value-only rows trains as before, bit for bit.
+* **Evaluation and tools**: `eval_leaf_value_view` names the Elo pool (`visits-rv`,
+  `cq-n4-v50-s0.3-rv`; after a floor: `-f4-rv`); `zero.h2h` and `zero.replay` follow a run's
+  `eval_leaf_value_view` (`zero.h2h --a-leaf-value-view / --b-leaf-value-view mover | root`
+  override it per side: the same checkpoint with both views is the cheapest test of the search alone).
+
+### 16.3 Off by default
+
+All four settings at their defaults (`mover`, `mover`, 0, `next_q`) are the run of before, byte for
+byte: no seat key is added (`games.nn_seat`), the batches carry `extra` all zero, no row is added, no
+sample recorded, the losses are computed as before. config.json gains the four keys.
+
+### 16.4 Costs
+
+* **Inference**: one extra row per leaf of another seat (about half the leaves of a two-player
+  game). On a CPU (inference-bound) leaves/s drop by a third (MTG Zero's Delver network, 64 games: 1,313
+  -> 887 leaves/s, the same rows/s); a GPU or MPS evaluator, whose cost grows less than its batch, pays
+  less. Not measured on the GPU (A/B round 2 holds it).
+* **Samples**: `selfplay_view_samples` x (players - 1) extra samples per recorded decision - as many
+  more rows in the shards and the window (`ram_budget_gb` holds fewer iterations) and, since the
+  training's steps follow the new samples (`new samples x reuse / batch`), as many more steps.
+* **Remote self-play / evaluation**: the seat keys `leaf_value_view`, `view_samples`,
+  `view_sample_target` go to the remote's driver: its checkout must have this core (an older one
+  refuses an unknown seat key - a visible error, never a silent off).
+
+### 16.5 Tests and checks
+
+Rust: `leaf_view_settings_and_view_pick`, `root_view_off_and_value_samples_leave_the_searches_alone`
+(the golden records and match with the settings at their defaults; value-only samples change nothing
+but add records), `root_view_values_read_the_root_deciders_hand` (`mull_game::HiddenMull`, a
+private-hand keep-or-mulligan: the batch layout, the value from the keeper's own hand in every world),
+`value_only_samples_and_their_targets`, `value_only_samples_carry_the_observers_auxiliary_targets`.
+`tests/test_root_view.py` (12): settings and names (the pool, zerodash, h2h), `view_pick` = the
+Rust hash, Rust vs Python trees at the noise floor with a power check, the binding's 4-tuple, the
+drivers' ('py', 'rs', Rust) samples and targets and flags, toy runs (below).
+
+Checks (tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal; A/B round 2 live on the GPU and the Mac), on main a560448:
+`cargo test --release --workspace` 65 + 3 passed and `queued_setups_are_shared_between_the_groups`
+failed under the machine's load (timing-dependent: it failed 2 of 3 times on the base b486d36 under the
+same load, 14.5; alone it passes 8 of 8); the feature's 5 Rust tests in a debug build too; `pytest tests`
+258 passed, 3 skipped (CUDA); `python -m zero.parity root_view` (docs/search.md 6); toy-smoke runs
+byte for byte against a560448 (its own worktree and target, `ZERO_INFLIGHT=1`), the settings left out
+and given at their defaults - classic, rolling, margin_w 0.2 + chance_k 2 + cq targets + eval_every 2:
+every shard, checkpoint (zip members), optimizer state, Elo file (`updated` aside), models/index.json,
+the metrics without timings; `check_checkpoint_compat --package zero` (random, uniform, a toy
+checkpoint) identical; Glass Road Zero c1f56dc, Caverna Zero a6fad73 and Kingdom Builder Zero 4202a4a
+build against it. MTG Zero (branch `root-view-values`, its ENGINE.md 67): its suites, behaviour
+digests unchanged, `check_checkpoint_compat --package mtgz` with delver2's iteration 41 identical.
+
+### 16.6 What it measured on MTG Zero (its ENGINE.md 67)
+
+On delver2's networks (CPU): the two views of the same real self-play states disagree by 0.077 on
+average (p90 0.21) but neither is biased (the decider's own value minus the other view's: -0.002 over
+13,442 pairs of 192 games), and the value head is about as calibrated on the never-trained other view
+(log loss 0.367, ECE 0.014) as on the decider's (0.358, 0.025): the distribution shift is real but
+small. A 300-step fine-tune with value-only samples improves the other view's held-out log loss
+0.349 -> 0.330, a control without them to 0.334. In searches the views differ more (opponent leaves
+of mulligan searches: 0.11 on average, 73% by more than 0.05); root-view values bring a 0-land keep's
+Q on the draw down to the mulligan's (0.485 -> 0.378 against 0.37 after the fine-tune) but the keep
+rates barely move (the prior holds the visits), and a replay's upkeep Pass the opponent's view valued
+at 0.51 is worth 0.64 with root-view leaves - the move (Brainstorm, prior 0.93) stays.
+
+## 17. Tooling for the tiered verification gates (MTG Zero's `tools/gate.py`, 2026-10-29)
+
+MTG Zero's policy (its ENGINE.md 70, memory `feedback_tiered_gates`) tiers its verification gates
+by change type instead of running the full search smoke before every merge; two zero-core-side
+pieces support it directly:
+
+**`tools/smoke_all.sh --build-only`**: per game, run `tools/build_py.sh` only - no `cargo test`,
+`pytest` or smoke training run. For the tier "an opt-in core feature with byte-identical
+defaults" the question is narrower than the full cross-game smoke answers: does the OTHER games'
+build still compile against this core commit, nothing about their behaviour (the feature is off
+by default there; MTG Zero's own suite already covers whether it changed anything). Combine with
+`--with-this-core` to build the games against THIS checkout's HEAD rather than their own pin.
+Default game discovery (no explicit paths) now also looks for `../kingdombuilder-zero`, alongside
+`../glassroad-zero` and `../caverna-zero` - it was missing from the list before this. (From a worktree or a
+`third_party/zero-core` submodule that discovery found no game and printed GREEN anyway until 29.)
+
+**De-flaked `crates/search/src/driver/tests.rs::queued_setups_are_shared_between_the_groups`**:
+asserted the exact POSITION of each group's dispatch size in the combined `sizes` vector it
+collects across every `next_batch` call (`sizes[..2]`, `sizes[2..4]`). Reproduced reliably under
+real thread contention (ten copies of the test binary running at once, roughly 1 run in 300): the
+two groups' batches are reported in THREAD-SCHEDULING order (which group's worker happens to call
+back first), not in the order `queue_share`'s fairness logic (the thing under test) actually
+assigns work - under load one group can report several batches before the other's first. Fixed by
+asserting each group's OWN sequence of distinct sizes (deduplicated: a size repeats across many
+calls while that wave of games plays out its turns) is `[1, 4]`, which does not depend on how the
+two groups' reports interleave; verified against the original (still reproduced the failure) and
+the fix (480/480 passed) under the same contention. The sibling test
+`queued_setups_fill_every_free_slot_when_the_queue_is_long` and the rest of the module (36 tests)
+were unaffected and still pass.
+
+**De-flaked `tests/test_remoteplay.py::test_pause_mid_phase_then_resume`**: waited for
+`progress.json`'s `remote.games > 50` inside a flat 180 s window, which occasionally saw
+`{'phase': 'idle'}` (a different phase's progress shape, no `remote` key) for long enough under
+load to miss the window - not because anything was stuck, but because a loaded machine is simply
+slower. The new `wait_for_remote_progress` polls with a stall-based deadline instead of a flat
+one (it keeps extending as long as the remote's game count keeps climbing, and gives up only once
+that count has been flat for `stall_s`, or a hard ceiling `max_s` is hit), resets what counts as
+"progress" on an iteration boundary (so a stale high-water mark from an already-finished phase
+cannot short-circuit the wait for a new one), tolerates a torn read of `progress.json` (keeps the
+last good reading instead of resetting to `{}`), and fails immediately with the run's own output
+if the subprocess has already exited, rather than spinning out the rest of the window on a run
+that is never coming back.
+
+## 18. The root's belief: belief-weighted determinization (MTG Zero's Delver mirror, 2026-10-29)
+
+### 18.1 Why
+
+The search deals the hidden information uniformly (docs/search.md 3): every simulation a fresh world,
+every world consistent with what the root decider has seen equally likely. An auxiliary head (section
+15) can know better: MTG Zero's belief head predicts the opponent's hand from public information at 2.28
+nats per card against the uniform deal's 2.81 on held-out Delver positions, and reads "they passed with
+blue open: Force of Will" (its ENGINE.md 66). The root's belief deals the search's worlds from that
+prediction - the design of MTG Zero's ENGINE.md 66.8, built here and in its ENGINE.md 69.
+
+### 18.2 What it does (docs/search.md 3.8)
+
+* **Settings**: `selfplay_belief_tilt` (the self-play seat - a league opponent's too, being the
+  self-play seat), `eval_belief_tilt` (every evaluation seat), `belief_clip` (R, default 20),
+  `belief_mix` (the share of a belief search's simulations still dealt uniformly, in [0, 1)),
+  `belief_fast` (0: full searches only - every evaluation search, self-play's recorded ones; 1: fast and
+  minor searches too). Seat keys `belief_tilt` / `belief_clip` / `belief_mix` / `belief_fast`, only when
+  the tilt is > 0 (`games.nn_seat`, `run.belief_keys`).
+* **One row per search**: a search that takes it sends the root's own features (the decider's view) as a
+  `ROW_BELIEF` row - with the fresh root's first leaf row, or alone for a reused root (its simulations
+  wait one round trip) -, the evaluator answers that row's auxiliary predictions (`aux`, the fourth item
+  of `NetEvaluator`'s answer: the head on those rows only), and every simulation of the search deals its
+  world with the game's `determinize_with` at the seat's tilt and clip. A belief is one decision's: a
+  reused tree's (and a new network's search, a rolling epoch's) asks again.
+* **The game's weights** (its `determinize_with`): MTG Zero, its ENGINE.md 69.2: per card identity of the
+  opponent's hidden pool, the belief's expected count among the hand's unknown cards against the uniform
+  deal's, to the tilt, clipped; the hand's unknown slots drawn one at a time by those weights; every
+  constraint of `determinize` kept. A game without one ignores the belief (the default `determinize_with`);
+  the driver refuses `belief_tilt` for a game without `AUX` (nothing to predict).
+* **Evaluation and tools**: `eval_belief_tilt` names the Elo pool (`mcts.belief_tag`: `visits-b1`,
+  `cq-n4-v50-s0.3-b0.5m0.25`, after a view: `-rv-b1`); `zero.h2h` and `zero.replay` follow a run's
+  evaluation belief (its config.json), `zero.h2h --a-belief-tilt / --b-belief-tilt` (0 = uniform) and
+  `--*-belief-clip / -mix / -fast` override it per side: `A A --a-belief-tilt 1 --b-belief-tilt 0` is
+  the evaluation-only A/B on one checkpoint. Self-play's metrics gain `selfplay.belief` (`rows`: belief
+  rows its driver sent, `per_decision`) when its tilt is on.
+
+### 18.3 Off by default; a network without the head is refused
+
+With every tilt 0 (the default) nothing changes: no seat key, no row, no draw (`Tree::set_belief` is
+never called; the golden records and match, toy runs byte for byte: 18.7). config.json gains the five
+keys.
+
+**A checkpoint without the auxiliary head cannot serve a tilt > 0, and the run refuses it** - it does not
+fall back to the uniform deal with a warning. The choice, against MTG Zero's rule that a step which
+silently does nothing is a bug (memory `feedback_silent_noop_pipelines`): a run (or an A/B arm, or an h2h
+side) asked for belief-weighted searches that quietly dealt uniformly would report a result - "the belief
+does not help" - for an experiment that never happened, the false success the rule exists to prevent, and a
+warning in a log of thousands of lines is no defence (the shards, metrics and Elo would look the same).
+The cost of refusing is small and visible: the run stops at start with the reason. So:
+
+* the run checks its newest checkpoint at start (`Run.check_belief_heads`: `net.check_belief_head`, the
+  head for exactly the game's targets) and refuses with `net.HeadMissing` - an `EncodingMismatch`, so the
+  refusal paths of the encoding guard (section 10.4) apply: exit status 78, state `refused`, the
+  supervisor does not restart it; a fresh run gets the head from `aux_<name>_w` > 0 (an untrained head
+  predicts uniformly over the identities: the clip makes that deal about uniform);
+* a league opponent's checkpoint (`league.load_into`) is checked the same way when the self-play tilt is on;
+* `NetEvaluator` raises `HeadMissing` for a batch with belief rows and no head (every other path: h2h,
+  replays, remote evaluation, a remote worker); `zero.h2h` checks both sides before the first game;
+* the driver refuses an answer without the belief rows' `aux` (`UniformEvaluator`, a custom evaluator).
+
+### 18.4 Interactions
+
+* **Tree reuse**: kept; the belief is recomputed per decision (`Tree::advance` clears it; the reused root
+  sends its row alone and waits). The reused subtree's statistics were dealt by the previous decision's
+  belief - as a reused tree's always came from an earlier information set.
+* **Fast and minor searches**: no belief unless `belief_fast` (they record nothing; one row is 1/16 or 1/4
+  of their leaves).
+* **Root-view leaf values** (section 16): independent; both extra row kinds share the batches.
+* **Root minimum visits, the move rules, cq targets**: untouched (the belief changes the worlds only).
+* **The league** (section 14): the opponent's seat is the self-play seat and takes the belief; its pool's
+  checkpoints need the head (refused otherwise): a `selfplay_league_pool` reaching back before the head
+  was trained must be narrowed.
+* **Rolling self-play**: a new network restarts every search and its belief; a phase's end drops a pending
+  belief row as it drops leaves (asked again next phase).
+* **Remote self-play** (section 5.3): 18.5. **Remote evaluation** (5.2): the mirror's config.json carries
+  `eval_belief_tilt`; the result's rule name must carry the belief tag, so an older checkout (no tag) is
+  refused before anything is recorded, as for the move rule; its checkpoints need the head there too.
+* **Co-training**: the resolver's own settings (`resolver_cfg`) as any.
+
+### 18.5 Remote self-play: an older checkout is refused, not silent
+
+A remote worker builds its seat from the run's config.json with its own checkout's code: an older
+checkout would read no belief setting and deal uniformly, its shards indistinguishable. So the worker's
+hello reports its self-play seat's belief keys (`remoteplay._belief_of`), and the run compares them with
+its own: a worker without them (an older checkout) or reading them otherwise is killed at its hello and
+retried every 10 minutes (log `worker K REFUSED: its checkout plays the root belief as ...`); this machine
+plays every game meanwhile (`tests/test_belief.py::test_remote_selfplay_refuses_a_checkout_without_the_belief`).
+MTG Zero's Mac checkout is the run's commit anyway (its `RunCommitRemote`). (The same gap exists for any
+seat setting a remote worker reads from config.json - root-view values', section 16.4, say an older
+checkout "refuses an unknown seat key", which holds for shipped seat dicts, not for config.json; the
+commit-pinned checkout is what protects them.)
+
+### 18.6 Costs
+
+* **Inference**: one extra row per search that takes the belief (1/sims of its leaves: +3% at 32
+  simulations, +1.6% at 64) and the head on those rows; a reused root's search waits one batch round trip
+  for it. MTG Zero's Delver network on the desktop CPU (64 games, 4 torch + 4 search threads, the arms
+  interleaved over 4 rounds on a shared machine, its ENGINE.md 69.6): evaluation seats at 32 simulations
+  1,402 -> 1,304 leaves/s, the paired ratio 0.929 +- 0.019 (0.032 belief rows per leaf: the rows and the
+  reused roots' waits, ~3% each); the line's self-play seat (64 / 16, p_full 0.25, minor 4) 0.974 +- 0.034
+  (0.0094 rows per leaf - only the full searches take it).
+* **The deal**: the game's (MTG Zero: the weights and weighted draws over <= 64 hidden cards, 6 us a call
+  against `determinize`'s 1 us - every simulation deals, nothing beside its leaf's evaluation).
+* **Training**: unchanged (stage 1's target and head, section 15).
+
+### 18.7 Tests and checks
+
+Rust (`zero_search`, 11 new): `belief_weight_formula`, `a_belief_deals_the_worlds_by_its_weights` (the
+toy's next card: uniform 1/k, a sharp belief, the clip, the uniform share), `no_belief_is_the_tree_of_before_and_advance_clears_it`,
+`without_redet_the_belief_deals_the_decisions_one_world_again`, `belief_off_is_the_search_of_before` (the
+golden records and match with the settings given), `belief_settings_are_checked`,
+`one_belief_row_per_search_that_takes_it` (the layout; rows = full searches; `belief_fast`; evaluation
+seats), `an_evaluator_without_the_belief_stops_the_driver`, `the_belief_deals_the_searches_worlds`
+(HiddenMull: the analytic shift of seat 1's root value, with and without redet),
+`root_view_values_and_the_belief_share_the_batches`, `rolling_phases_ask_the_belief_again_of_a_new_network`.
+`tests/test_belief.py` (11): settings and names (the pool), the toy's deal at its odds, Rust vs Python trees
+at the noise floor with a power check (`parity.belief`), the three drivers' rows answered by the head,
+`HeadMissing` and the drivers' refusal, the Python tree's uniform share, `zero.h2h`'s sides and flags, toy
+runs (off byte for byte, self-play and evaluation on, a run without the head refused with exit 78), remote
+self-play refusing a checkout without it.
+
+Checks (tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal; A/B round 3 live on the GPU and the Mac), on main 3b5134d:
+`cargo test --release --workspace` 77 + 3 passed; `pytest tests` 268 passed, 2 skipped (the CUDA graph-runner
+test deselected: no visible device), and one `test_a_dying_worker_gives_its_accepted_games_back` failed once
+under the shared machine's load (30 games of the dying worker not played again: a timing race of the quota) - it
+passes alone on this branch and on 3b5134d, and `tests/test_remoteplay.py` passes whole (27);
+`python -m zero.parity belief` (docs/search.md 6: Rust-Python at the noise floor, the belief's effect 10x it);
+toy-smoke runs byte for byte against 3b5134d (its own worktree and target, `ZERO_INFLIGHT=1`), the settings left
+out and given at their defaults - classic MLP against `ext:toyheur`, classic tokens, rolling with cq targets and
+`eval_select cq` guard 2, the Delver line's shape (rolling, cq 0.3, guard 4 at 0.3, raw Elo offsets, no random
+games, value_q 0.6, window_cache, train_prefetch, tokens, margin_w 0.2, chance_k 2): every shard, checkpoint (zip
+members), optimizer state, Elo file (`updated` aside), models/index.json, the metrics without timings identical
+(12-14 files a run), config.json = the base's + the five keys; `check_checkpoint_compat --package zero` (random,
+uniform, a toy MLP and a toy token checkpoint): identical; `smoke_all.sh --with-this-core --build-only`: Glass
+Road Zero c1f56dc (47 s), Caverna Zero a6fad73 (54 s) and Kingdom Builder Zero 4202a4a (78 s) build against it.
+MTG Zero (branch `belief-search`, its ENGINE.md 69): its suites, behaviour digests unchanged,
+`check_checkpoint_compat --package mtgz` identical, the weighted-deal fuzz.
+
+### 18.8 What it measured on MTG Zero (its ENGINE.md 69)
+
+On the Delver mirror with stage 1's two networks (desktop CPU, 2026-10-29): jt, delver2's iteration 41
+fine-tuned jointly with the head, and ho, the head fitted on the frozen iteration 41.
+
+* **The deal against the true hand** (2,412 positions of a network's games against itself, 200 worlds each):
+  the cards misplaced by the worlds' mean hand 2.84 uniform -> 2.64 / 2.54 / 2.52 at tilt 0.5 / 1 / 2; the
+  cross-entropy per true card 2.78 -> 2.62 / 2.68 / 3.04 (tilt 2 overconfident: 97 distinct hands of 200
+  instead of 151). Mostly base rates the uniform deal gets wrong: the opponent holds Force of Will in 60% of
+  the positions, the uniform deal gives it one in 30%, tilt 1 in 54%; discrimination within a stratum is
+  modest.
+* **Decisions**: at 64 simulations the move of 40 threat-casting decisions into open mana changed at 1; the
+  threat's Q fell where the head expected a counter (Murktide Regent into an expected Daze 0.58 -> 0.47).
+* **Head to head** (the same checkpoint, A belief-weighted against B uniform, 32 simulations, 300 games an
+  arm, the line's rule): a null arm (both uniform) 0.517 +- 0.029; jt at tilt 1 0.567 under mover-view and
+  under root-view leaf values, tilt 1 with mix 0.25 0.512 / 0.557, tilt 0.5 0.517 - jt's five belief arms
+  pooled 0.544 +- 0.013 (+3.4 se, about +30 Elo), the settings not separable at this size; ho at tilt 1 0.500.
+* **Cost**: 3-7% of an evaluation's leaves per second, 1-3% of self-play's (section 18.6).
+
+The A/B (its ENGINE.md 69.9): evaluation only first (the same checkpoint both sides, the round's h2h), then a
+self-play arm (`selfplay_belief_tilt=1`, `eval_belief_tilt=1`, `belief_mix=0.25`, `aux_belief_w=0.25`) once
+the main line has a trained head.
+
+## 19. The Gumbel root search (MTG Zero's Delver mirror, 2026-10-29)
+
+### 19.1 Why
+
+At 64 simulations PUCT's root follows the prior: MTG Zero's Delver mirror (its ENGINE.md 64, 67) put
+>= 0.98 on Keep in 89 of 100 one-land hands with Mulligan often unvisited, and an upkeep Brainstorm with
+prior 0.934 took 62 of 63 visits - Pass 1, also once root-view leaf values (section 16) had raised
+Pass's Q to within 0.014 of Brainstorm's. The root minimum visits (section 9.2) and root-view values
+measure or correct a starved option's Q but leave the allocation and the move to PUCT and the prior.
+Gumbel AlphaZero (Danihelka et al. 2022) replaces the root itself: candidates sampled by Gumbel-top-k,
+the budget spread by sequential halving, the move the argmax of noise + log-prior + sigma(completed
+Q) - a policy improvement whatever the budget. The completed-Q target (section 9) and the 'cq' move
+rule (section 12) were already its other two pieces.
+
+### 19.2 What it does (docs/search.md 3.7)
+
+* **Settings** (section 1.2): `selfplay_root_search` / `eval_root_search` ('puct' | 'gumbel'),
+  `gumbel_m` (16), `selfplay_gumbel_scale` (1), `eval_gumbel_scale` (0). Seat keys `root_search`,
+  `gumbel_m`, `gumbel_scale`, `gumbel_c_visit`, `gumbel_c_scale` (`games.nn_seat` writes them only for a
+  Gumbel seat, with sigma resolved).
+* **Self-play**: every search of the seat (full, fast, minor) is a Gumbel search. Its noise replaces
+  the root Dirichlet noise and the temperature: the first `temp_moves` searched decisions of a game are
+  searched with noise (`selfplay_gumbel_scale`; the move a sample of the improved policy), later ones
+  without (the argmax). `selfplay_select` is not used. The recorded target must be 'cq'
+  (`policy_target`; checked at the start, `check_eval_settings`) and shares the search's sigma
+  (`cq_c_visit`, `cq_c_scale`). The root value target's search part q is the improved policy's value
+  (`gumbel_q`), not the root's mean backup (docs/search.md 3.7: sequential halving walks every
+  considered option in its first round). Value-only samples' `next_q` is the observer's next
+  search's `gumbel_q`. The league seat (section 14) is the self-play seat: Gumbel too.
+* **Evaluation**: every evaluation seat (yardstick, random, Elo, the `eval_remote`, co-training's) with
+  `eval_root_search` 'gumbel' plays the Gumbel move with noise `eval_gumbel_scale` (0: deterministic,
+  the paper's evaluation; a positive scale samples), sigma the evaluation rule's transform
+  (`eval_select_c_*`, else `cq_c_*`); `eval_select` and its guard are not used. The Elo pool is the
+  search's (`mcts.gumbel_tag`: `gumbel-m16-v50-s0.3` at Delver's 0.3; zerodash's `elo_pool` alike).
+* **Tools**: `zero.h2h` gives each side its run's `eval_root_search` (from config.json, whatever
+  `--select` says, so the A/B driver's fixed `--select cq ...` flags leave a Gumbel-evaluated fork's side
+  Gumbel), `--a-root-search` / `--b-root-search` override it, `--gumbel-m` and `--a-gumbel-scale` /
+  `--b-gumbel-scale` set its parameters; a Gumbel side's sigma is its 'cq' rule's transform (the
+  `--*-cq-c-*` flags or its run's). `zero.replay` seats follow the run's root search.
+* **Exclusive** with the same side's root minimum visits (`*_root_min_visits` > 0: an error).
+* **With the root's belief** (section 18): both on one seat work together - the belief deals the
+  Gumbel search's worlds, a reused root's belief row costs it no simulation (tested: below); a
+  Gumbel-evaluated run's Elo pool carries both (`gumbel-m16-v50-s0.3-b1`).
+
+### 19.3 Off by default
+
+`puct` everywhere (the defaults) is the run of before, byte for byte: no seat key is added, no noise is
+drawn from another stream, the tree's Gumbel state is never set (the golden records and match; toy-smoke
+runs below). config.json gains the five keys.
+
+### 19.4 Costs
+
+* **Search**: none measured. The root's selection computes the completed-Q logits once per walk (O(options)
+  at the root only). MTG Zero's Delver self-play on the desktop CPU (64 games of the line's seat, 4 torch +
+  4 search threads, 120 s each): PUCT 2,042 / 2,065 leaves/s, Gumbel 2,098; on the final build, at another
+  hour's background load, PUCT 1,747, Gumbel 1,794 (its ENGINE.md 68.5; fewer walks end in a terminal, the
+  search's own time per leaf 63 vs 68 us).
+* **Training**: the same rows and steps (the target was 'cq' already).
+* **Remote self-play / evaluation**: the seat keys go to the remote's driver: its checkout must have
+  this core (an older one refuses `root_search` - a visible error, never a silent off): MTG Zero's
+  `mac.sh --eval-checkout` before such a run is pinned.
+
+### 19.5 Tests and checks
+
+Rust (`cargo test`, 88 tests): `tree::tests::gumbel_sequence_is_mctxs`, `gumbel_root_walks_follow_
+sequential_halving` (toy roots of 3-12 options, m 4 / 16: the schedule's counts, the Gumbel-top-k,
+the move and q formulas), `gumbel_off_changes_no_walk_and_reuse_budgets_this_search`,
+`gumbel_measures_the_starved_mulligan`; `driver::tests::gumbel_settings_are_checked`,
+`gumbel_selfplay_is_reproducible_and_its_records_valid`, `gumbel_noise_only_within_temp_moves`,
+`gumbel_mulligan_selfplay_and_evaluation`, `gumbel_with_root_view_leaves_and_rolling_restarts`,
+`gumbel_with_a_root_belief` (the belief on every search, fresh and reused roots: records valid, the same
+across threads, other than without it);
+`noise::tests::gumbel_moments_and_the_max_trick`. `tests/test_gumbel.py` (15): settings, seats and names
+(the pool, zerodash, h2h, replay), the schedule = the Rust tree's, the Python formulas on Rust roots
+exactly, the trees at the noise floor with a power check, the Python tree's halving and reuse, the
+drivers ('py', 'rs', Rust) alike, the 'visits' target refused, noise and temperature, toy runs, the
+Gumbel root with the root's belief in the three drivers (a network with the auxiliary head).
+
+Checks (tier "opt-in core feature with byte-identical defaults"; desktop 2026-10-29, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal; A/B round 3 live on the GPU and the Mac), on main 353335c (rebased
+after the root's belief; first checked on 3b5134d / 2c04cd9 alike): `cargo test --release` 88 passed;
+`pytest tests` 283 passed, 3 skipped (CUDA), and `test_remoteplay.py::test_a_dying_worker_gives_its_accepted_games_back` failed under the CPU's load (a remote-play queue's timing, the Gumbel search off there; the same on 3b5134d's run) - alone it passes on this branch and on 353335c; `python -m zero.parity gumbel` (docs/search.md 6);
+toy-smoke runs byte for byte against 353335c (its own worktree and target, `ZERO_INFLIGHT=1`, 3
+iterations, seed 3) - classic, rolling with 'cq' targets and the cq4 rule, margin_w 0.2 + chance_k 2 + cq
++ eval_every 2, and the new settings given at their defaults: every shard, checkpoint (zip members),
+optimizer state, Elo file (`updated` aside), models/index.json and the metrics without timings;
+`check_checkpoint_compat --package zero` (random, uniform, a toy checkpoint) identical; Glass Road Zero
+c1f56dc, Caverna Zero a6fad73 and Kingdom Builder Zero 4202a4a build against it (`smoke_all.sh
+--with-this-core --build-only`). MTG Zero (branch `gumbel-root`, its ENGINE.md 68): its suites, behaviour
+digests unchanged, `check_checkpoint_compat --package mtgz` with delver2's iteration 51 identical.
+
+### 19.6 What it measured on MTG Zero (its ENGINE.md 68)
+
+On delver2's iteration 51 (CPU): the Gumbel root walks the mulligan's Mulligan 31-32 times per search
+(PUCT: 0-1 on the draw) and the replay's upkeep Pass 31 of 63 times (PUCT: 1) - and neither move
+changes: measured, Mulligan's Q is far below Keep's where the line keeps (one land on the draw: 0.36
+against 0.50) and Pass's 0.03 below Brainstorm's, so the keep rates stay 58% (no land) / 91% (one land)
+under every mode and view, and Brainstorm is cast 16 of 16. A Gumbel search's plain root mean of a
+kept hand is 0.435 against Keep's Q 0.518; `gumbel_q` is 0.518 (PUCT's root value 0.519): the reason q
+is the improved policy's value. Head to head on the same checkpoint (seats alternating, the Delver spec,
+side B PUCT with the line's rule cq4 s0.3): 32 simulations 0.468 +- 0.020 (600 games), 64 simulations
+0.502 +- 0.020 (600), both sides with root-view leaves at 32 0.520 +- 0.029 (300) - no search-only gain
+either way on a network trained on PUCT's searches; whether training on Gumbel's targets and moves helps
+is the A/B's question (its ENGINE.md 68.7). Self-play records are valid and as cheap (1,794 against
+1,747 leaves/s on the final build).
+
+## 20. Strength measurement: fixed anchors, held-out losses, paired and sequential head-to-heads (MTG Zero's Delver mirror, 2026-10-30)
+
+A Fable review of MTG Zero's Delver main line (`runs/r3-2b-beliefsearch`, paused at iteration 196; its
+ENGINE.md 73) found that the line's yardsticks could not see its progress:
+
+* **The Elo pool is too coarse.** Every 8 iterations each checkpoint plays the checkpoints 1, 2, 4, 8
+  iterations back (`elo_offsets`), 25 games each at 32 simulations: +-50-115 Elo per rating, and no
+  fixed reference (each rating is a chain of noisy links to the yardstick). The pooled pairs give 0.481
+  +- 0.015, -1.9 +- 2.3 Elo per iteration: "plateau" and "+1 Elo a generation" look alike.
+* **The yardstick is saturated** (92-98% wins against the heuristic): its games carry almost no
+  information, and the user stopped testing against it.
+* **Head-to-head verdicts are too noisy.** `zero.h2h` (600 games at 32 simulations, se 0.020)
+  alternates the seats but does not pair the games: each game's deal comes from its own gid, so the
+  opening hands' variance of a mirror stays in the score. Two features were adopted at 0.538 and 0.534,
+  just under the 2-se bar (0.541), and a null cannot be told from +10 Elo.
+
+This section adds four opt-in measurements; every one off is the run of before, byte for byte (20.6). What
+they measured on the Delver line: 20.7.
+
+### 20.1 Fixed anchors in the Elo pool (`elo_anchors`)
+
+* **Settings** (run.py DEFAULTS): `elo_anchors` - frozen checkpoints, comma-separated, each `path` or
+  `label=path` (label default: the file's stem); '' = off. `elo_anchor_games` (100): games per anchor
+  for every evaluated checkpoint. `elo_anchor_elo` (1000): the first anchor's fixed rating.
+  `elo_anchor_calib_games` (200): games of a later anchor against each anchor fixed before it.
+  `elo_anchor_from` (0): only checkpoints from this iteration on play the anchors (0: every evaluated
+  checkpoint of the pool, from its `since`). `elo_paired` (0): paired Elo matches (20.3). Single-game
+  runs only (a co-training run plays its matches as events: refused).
+* **Players**: an anchor is the pool's player `anchor:<label>` (never a checkpoint's name, even when it
+  is a copy of one: it is a frozen network, not the run's), played with the run's evaluation seat (the
+  pool's move rule, `elo_sims`), so it must be of the run's encoding and, with a root belief, have the
+  auxiliary head (checked at the start: refused, exit 78).
+* **Fixing them** (`Run.anchor_matches`, in each `elo_update`): the pool's first anchor is fixed at
+  `elo_anchor_elo`; each later anchor plays `elo_anchor_calib_games` against every anchor already fixed
+  and is fixed at the rating of a fit of those games alone with the earlier ones held. The values, the
+  file's sha256, its name, the iteration and how it was fixed are kept in the pool's `results.json`
+  (`anchors`) and never refit: an anchor's games against later checkpoints never move the scale.
+  Another file under a fixed label is refused (`AnchorRefused`, exit 78: a moved scale in silence would
+  be worse than no anchor); a new label is a new anchor, calibrated against the old ones.
+* **Anchor games**: every evaluated checkpoint (`eval_every` multiples, iteration >= the pool's `since`
+  and `elo_anchor_from`) that has not played an anchor plays it, all of its anchors in one driver
+  (`play_matches` with the anchors' paths; seed 53 + 7919 k), so switching anchors on for a running
+  pool first catches its evaluated checkpoints up (the first evaluation after the switch is that much
+  longer). Recorded in `results.json` like any Elo match (`elo match iter_0200 vs anchor:a192:
+  52.0/100` in the log).
+* **The fits**: the pool's own fit (`elo.fit`, the yardstick at 1000, `ratings.json`, `models/index.json`,
+  `best.pt`) is computed as before over all the pool's games, the anchors' included (free players
+  there, listed with the references). The anchored fit, `elo.fit_fixed(res, fixed)`, is the
+  Bradley-Terry maximum likelihood over the pool's WHOLE results file with the anchors held at their
+  values and every other player free (the yardstick too); its weak Gaussian prior is centred on the
+  anchors' mean. -> `anchored.json` (the anchors and every player's rating), `elo_anchored` {elo, se} in
+  the iteration's metrics (and `evals.jsonl` from a remote), a log line `iter 200 elo anchored 1640 +-38`
+  (+- 1.96 se). A checkpoint's anchored se comes from its anchor games (200 games near 50%: ~25 Elo)
+  and shrinks as later checkpoints play it (the offsets); none of it is a chain to a saturated
+  yardstick. With one anchor `fit_fixed` is `fit` (tested to 1e-6).
+* **Remote evaluation** (`eval_remote`, 5.2): `RemoteEval` puts each anchor once a session to
+  `<mirror>/anchors/<label>.pt` and writes the mirror's config with `label=<that path>`, so the players
+  and the sha256 are the same on both machines; the mirror's `anchored.json` and `elo_anchored` come back
+  with the pool's files. The anchors' calibration and games happen on the remote, as the pool's other
+  matches.
+* **Dropping the yardstick's games**: `--eval-games 0` (the run's `eval_random_games` 0 already). The
+  iteration's `eval_yard` then has 0 games - it still marks the checkpoint evaluated (the pool's
+  `logged`, the remote's `done_iters`) and every Elo match (offsets, anchors) is played: tested. A pool
+  whose older iterations played the yardstick keeps its link to it (the ordinary fit); a fresh run
+  without yardstick games has no ordinary rating link (its `elo` se is the prior's), and the anchored fit
+  does not need one.
+* **Trade-offs**: a later anchor's calibration error (~174 / sqrt(calib games / 4) Elo: 200 games ~25)
+  is frozen with it: a constant offset of the ratings that lean on that anchor, never a trend. Anchors
+  near the line's strength give the most information per game (an anchor scored 90% against teaches
+  little); add a stronger one later (a new label), it is calibrated against the others.
+
+### 20.2 Held-out losses (`heldout_shards`, `zero/heldout.py`)
+
+The cheapest learning signal: a checkpoint's losses on a FIXED set of sample rows no checkpoint trains
+on. `python -m <pkg>.az.heldout make --from runs/x/data/iter_0191 --rows 8192 --out set.npz` draws a
+uniform random subset (fixed seed) of an iteration's self-play rows and writes it as one compressed
+shard (its meta: the source, rows, seed). Iteration i's rows train checkpoints i .. i + window - 1:
+they are held out for every other checkpoint, the run's later ones included.
+
+* **Metrics** (`heldout.losses`), per kind of row: **decision** rows (recorded searches) and **view** rows
+  (value-only samples, section 16): `value_ce` (cross-entropy of the value head against the game's
+  outcome z: the training loss with value_q 0), `value_acc` (rows with one winner: the most likely seat
+  won), `value_brier` (squared error of P(win)); the decisions also `policy_ce` (against the recorded
+  target, decisions with >= 2 options) and `policy_top1` (argmax agreement). `set` names the set (a hash
+  of its shards' names, sizes and rows): numbers are compared across checkpoints on one set (paired
+  rows: their own difficulty cancels), never across sets.
+* **Run settings**: `heldout_shards` (files or directories, comma-separated; '' = off) and
+  `heldout_device` ('' = `train_device`): every evaluated iteration gets `heldout` in its metrics row and
+  a log line (`iter 200 heldout (set 463ad8eefa5c): decision value_ce 0.3812 acc 0.8102 policy_ce ...`),
+  computed in the run process right after training (also with `eval_remote`). The set is loaded once at
+  the start (8,192 MTG rows ~0.6 GB of RAM) and must be of the run's game and encoding (refused
+  otherwise, exit 78); a failure later is logged (`HELDOUT FAILED`), never the run's end.
+* **Reading it**: `value_ce` against z is the clean signal (z is the truth). `policy_ce` against a frozen
+  target set measures agreement with the search that recorded it: it falls towards the checkpoint that
+  generated the set and may rise again after it with no loss of strength - read it as drift, not
+  strength. A checkpoint that trained on the set is contaminated (its value loss falls sharply on rows it
+  saw: below).
+* **Cost**: 2.4 s per checkpoint on the desktop CPU for 8,192 MTG rows (128 x 4 tokens net).
+
+### 20.3 Paired games and sequential head-to-heads (`zero.h2h`, `elo_paired`)
+
+* **Paired games** (docs/search.md 2.10): the driver's `paired` gives games 2k and 2k + 1 every random
+  stream of the pair k (the deal, shuffles and chance, the driver's streams); the match tables swap the
+  seats between them, so each deal is played once from each seat by each side. `zero.h2h --paired`
+  (`match(..., paired=True)`): `pairs` {n, both_won, split, both_lost, with_draw, pentanomial (counts of
+  a pair's points 0, 0.5, 1, 1.5, 2), score, se}; `se` is then the se of the pair scores, `se_games` the
+  games' binomial se (the unpaired formula), `variance_ratio` = var(pair score) / (var(game) / 2), the
+  share of the variance the pairing left (1: none removed; below 1: the deal's variance is gone). The
+  A/B driver's rule `score >= 0.5 + 2 se` reads the paired se unchanged. The run setting `elo_paired` 1
+  plays the run's Elo matches (offsets, anchors, calibration) paired (game counts even; a pair never
+  spans two opponents). The Bradley-Terry fit treats paired games as independent: pairing makes a pair's
+  two results negatively correlated, so its se is then conservative.
+* **Sequential tests** (`zero.h2h.sequential`): `--sprt E0,E1` plays batches of `--batch-games` (default
+  `--games`) until the log-likelihood ratio of H1 (A is E1 Elo better) against H0 (E0) leaves Wald's
+  bounds (ln(beta / (1 - alpha)), ln((1 - beta) / alpha)), `--alpha` / `--beta` 0.05, or `--max-games`
+  (default 4 x `--games`) are played: decision 'H1' | 'H0' | 'undecided'. The LLR is the generalized
+  SPRT's normal approximation over the per-pair scores (or per-game scores unpaired): n (s1 - s0)
+  (2 mean - s0 - s1) / (2 var), s the logistic expected scores - Fishtest's pentanomial GSPRT, the
+  standard for paired, seat-swapped games. `--target-se S`: batches until `se` <= S. Batch b is seeded
+  seed + 7919 b (batch 0 is the plain match), gids continue across batches, the output is over every
+  game plus `batches` (cumulative score, se, llr), `stop`, `sprt`; a progress line per batch goes to
+  stderr.
+* **Why an SPRT** rather than "extend by 600 games when within 1 se of the bar": the fixed bar's error
+  rates are known only for one look (a second look inflates the false positives, by an amount nobody
+  states), and 600 games cannot resolve the effects that matter (20.7: a +20 Elo fork passes the
+  600-game bar about a quarter of the time unpaired, half the time paired). The SPRT states its error
+  rates (alpha, beta at E0, E1; checking after batches only makes it slightly conservative), stops early
+  on clear results (a lopsided fork is decided in its first batch) and spends its games where the effect
+  is small. `--target-se` is there for a plain measurement (an Elo with a stated precision), not for a
+  verdict.
+
+### 20.4 Per-side simulations
+
+`zero.h2h --a-sims` / `--b-sims` (default `--sims`), `match(..., sims_a=, sims_b=)` / `sequential(...)`:
+each side searches with its own budget (`A A --a-sims 128 --b-sims 32`: what more search buys one
+checkpoint); the output names `sims_a`, `sims_b` (MTG Zero's quick checks monkeypatched `games.nn_seat`
+for it before).
+
+### 20.5 The A/B driver (MTG Zero's `runs/ab-r3/ab_driver.py`)
+
+Its `h2h()` builds `python -m mtgz.az.h2h A B --games N --sims 32 --spec S --device cuda --threads 8
+--seed 7 --select cq ...` and adopts the fork at `score >= 0.5 + 2 se` with `score = a_score`, `se =
+se`. With `--paired` alone that rule reads the paired se; with `--sprt` the verdict is `sprt.decision ==
+'H1'` (the driver's own rule should then be replaced by it). MTG Zero's ENGINE.md 73.6 gives the exact
+lines. h2h's `--chance-k` defaults to 2 where a run's evaluation plays the run's `chance_k` (MTG Zero's
+Delver line: 0) - pass it to measure what the run plays (and, on MTG Zero, to avoid the engine panics
+of 20.7).
+
+### 20.6 Off by default; tests and checks
+
+Off (`elo_anchors` '', `elo_paired` 0, `heldout_shards` '', the driver's `paired` False, h2h without the
+new flags): the runs of before, byte for byte - no seat, stream or file changes; config.json gains the
+eight keys; zero.h2h's output gains `elo_se` only.
+
+Tests: Rust `driver::tests::paired_games_share_their_streams` (two seats that search alike, swapped:
+each pair one game twice; unpaired no; pair k = the unpaired game k's streams; an odd last game; the
+golden match unchanged). `tests/test_measure.py` (11): the binding's `paired`; h2h's pairs, se and
+`se_games`, the same network's pairs all split with se 0, per-side sims, odd games refused; the SPRT's
+LLR and bounds; `sequential` (decided in the first batch = the plain match; undecided to `max_games`
+with unique gids; `target_se`; the command line and its errors); `fit_fixed` = `fit` with one anchor,
+recovers ratings with two, the calibration's pairs only; `parse_anchors`; a toy run with two anchors,
+paired Elo matches, the yardstick's games dropped and a held-out set (calibration, anchor games of every
+evaluated checkpoint, `anchored.json` = the metrics, every iteration's `heldout`, the log lines) and then
+another file under a fixed label refused (78); missing anchors / sets refused (78), odd paired games and
+duplicate labels refused; anchors on a `local` remote (shipped under their labels, the mirror's config,
+`evals.jsonl`'s `elo_anchored` = `anchored.json`, the dashboard's merge); the defaults add nothing;
+`heldout.make` / `losses` against `distill.outputs` by hand, the encoding and game guards, value-only
+rows apart, the command line.
+
+Checks: see 20.8.
+
+### 20.7 What it measured on MTG Zero's Delver line (its ENGINE.md 73)
+
+* **Held-out losses** (set: 8,192 rows of `runs/r3-2b-beliefsearch/data/iter_0191`, generated by
+  checkpoint 190; 2.4 s a checkpoint on the CPU): the decision rows' value CE falls 0.393
+  (checkpoint 83) -> 0.384 (188), -0.009 per 100 iterations over the checkpoints that never saw the
+  rows, a checkpoint-to-checkpoint scatter of ~0.003; the value-only rows' does not fall at all. The
+  six checkpoints that trained on the rows fall to 0.319 (196): the value head memorizes the outcomes of
+  the games it trained on (0.065 nats in six iterations, against 0.009 of real progress in a hundred) -
+  a set is only valid for checkpoints that never trained on it. Policy CE falls 0.522 -> 0.360 towards
+  checkpoint 190, the search that recorded the targets: agreement, not strength.
+* **Paired games** (checkpoints 196 vs 188, 32 simulations, the line's evaluation search, `chance_k` 0;
+  five paired batches of 200 games, four on the Mac, one on the desktop): 73% of the 500 pairs split
+  (each side won the same seat's deal), and **var(pair score) = 0.53 x var(game) / 2** (95% bootstrap
+  0.46-0.61): a paired h2h of N games is as precise as an unpaired one of 1.9 N; 600 games: se 0.020 ->
+  0.015, the 2-se bar 0.541 -> 0.530. Simulated with the four Mac batches' 0.54 (8,000 tests a row), the
+  old readout (600 unpaired games, the 2-se bar) adopts a real +20 Elo fork 28% of the time and a null
+  2%; paired + SPRT(0, 20) with batches of 600 and at most 2,400 games adopts +20 90% of the time (1,343
+  games on average), a null 2% (1,354 games, 9% undecided), +30 100% (841 games).
+* **Engine panics** (MTG Zero's, not this section's): three of three 600-game h2h runs of the line's
+  checkpoints 196 and 188 at h2h's default `chance_k` 2 died on a game's panic in a search
+  (deterministic: one reproduces on the desktop), six 200-game batches at `chance_k` 0 (the run's
+  evaluation) none. The driver fails a whole match on one game's panic, so a sequential test multiplies
+  the exposure: pass the run's `--chance-k` (its ENGINE.md 73.8).
+* **Fixed anchors** are not live yet: the main line's relaunch with them (and the held-out set, no
+  yardstick games, paired Elo matches) is its ENGINE.md 73.7; checked end to end on the Mac with a
+  smoke run (20.8).
+
+### 20.8 Checks
+
+Tier "opt-in core feature with byte-identical defaults" (desktop 2026-10-30, CPU only,
+`CUDA_VISIBLE_DEVICES=-1`, below normal priority; the orchestrator's checks on the GPU, the Mac at
+nice 19 for the measurements), on ec57c15 (the code; this commit adds documentation only):
+
+* `cargo test --release`: 89 passed (zero_search; webnet 3).
+* `pytest tests`: 302 passed, 3 skipped (CUDA), 13:54 on the loaded CPU.
+* Toy-smoke runs byte for byte against 85459f5 (its own worktree and target, `ZERO_INFLIGHT=1`, 3-4
+  iterations, seed 3), four configurations - classic with `ext:toyheur`, tokens with `elo_together`,
+  rolling with 'cq' targets and the cq2 rule, the Delver line's shape (rolling, 'cq' 0.3, the cq4 rule,
+  `elo_offsets` 1,2, no random games, value_q 0.6, window cache, prefetch, tokens, margin_w 0.2,
+  chance_k 2) - each without the new settings and with all eight given at their defaults: every
+  shard, checkpoint (zip members), optimizer state, Elo file (`updated` aside), models/index.json and
+  the metrics without timings identical; config.json only gains the eight keys.
+* `check_checkpoint_compat --package zero` (random, uniform, a toy checkpoint): identical.
+* MTG Zero (branch `measure`, its ENGINE.md 73.9): `tools/gate.py optin-core` PASSED twice (on main
+  e08bade and after the rebase onto eedbf14: core tests 92, checkpoint_compat byte identity, `--test az`,
+  `--test hidden`, Glass Road c1f56dc / Caverna a6fad73 / Kingdom Builder 4202a4a build against this
+  core: GREEN), `check_checkpoint_compat` with the Delver line's checkpoint 196 identical, pytest 62
+  passed; the anchors end to end on the Mac (`eval_remote mac`).
+
+## 21. A lookahead player: the exhaustive lookahead per information set as a seat (MTG Zero's Delver mirror, 2026-11-01)
+
+The design, the semantics and the API are docs/search.md 3.9; this section is the run-level view: how
+a match fields a lookahead seat, what it costs on the desktop, what it measured.
+
+**A match.** `zero.h2h A B --a-lookahead SETTINGS` (or `--b-lookahead`, `--lookahead` for both) makes a side
+a lookahead seat: its seat dict is its checkpoint's run's evaluation seat (`run_rule`: rule, leaf view,
+root belief) with the key `lookahead` added - the belief deals the lookahead's worlds, the MCTS settings
+play its final fallback. `--conc` (games in flight; default every game, at most 1024) and `--groups`
+(default 2) shape the driver; `--max-rows` (default 1024 with a lookahead side) the evaluators' pieces
+(`NetEvaluator(max_rows=)`: a token network's CUDA graphs answer them two in flight). The output's
+`look` sums the lookahead counters (decisions, nodes, leaf / prior / value rows, the shared values,
+rounds, fallbacks per stage, the most live member games), `perf` where the time went (the drivers'
+search, assembly and wait seconds; each evaluator's seconds, calls, rows, pieces).
+
+**The host's copies.** The lookahead's batches hold up to `rows` per game in flight - thousands of
+37,620-float rows for MTG, ~150 of them non-zero - and the host's copies of the dense rows bound them (the
+CUDA graphs' own limit from ~192 rows, 10.6): the driver assembling a batch into fresh memory (page
+faults: ~70-120 us a row on the loaded desktop, 59% of a 4-ply match's wall time waiting for it) and the
+graphs' pinned copy. Three opt-in remedies: **sparse batches** (`sparse=True`, docs/search.md 2.2: each
+row's non-zeros; `TokenGraphRunner.launch_sparse` builds the rows on the device; h2h `--sparse`, on with a
+lookahead side) - a 32-game 4-ply match 165 s -> 89 s, its batches' assembly 85 s -> 1.5 s, the same
+games; **4 driver groups** (h2h `--groups 4`: 89 s -> 65 s); and for dense token batches of >= 512 rows
+the graphs' host copy split over 4 threads (`COPY_PAR_ROWS`, `COPY_THREADS`; the same bytes, answers bit
+for bit; MCTS batches of tens to a few hundred rows unaffected). MCTS self-play and evaluation could take
+sparse batches too (not measured here).
+
+**Measured** (MTG Zero's Delver mirror, its ENGINE.md 80; the same network both sides, MCTS at 32 simulations
+with the run's evaluation rule, paired games): the pure lookahead player loses - 4 plies 0.315 +- 0.030 (best
+reply) and 0.390 +- 0.034 (policy-weighted) over 100 pairs, 6 plies 0.470 +- 0.046 and 0.370 +- 0.045 over 50 -:
+its max over many noisy leaf values is optimistic (another session's teacher experiment saw the same where
+the lookahead disagreed with MCTS). The guarded player (`guard` 0.05, 16 worlds; docs/search.md 3.9) changes
+~2% of the MCTS moves and is even: 0.515 +- 0.015 over 300 pairs at 4 plies, 0.460 +- 0.035 over 50 at 6.
+Throughput with 64 games in flight on the desktop's RTX 5090: 4 / 5 / 6 plies 104 / 65 / 40 lookahead
+decisions a second (83k / 143k / 242k nodes, 29k / 48k / 79k network rows a second; one game alone 17 / 12.5
+/ 5.6); a 6-ply match ~9 s a game with 64 in flight.
+
+**Checks** (tier "opt-in core feature with byte-identical defaults"): cargo test 102 (13 lookahead tests) +
+webnet 3; pytest 316 passed / 9 skipped (CPU; the CUDA tests separately); check_checkpoint_compat `--package
+zero` identical; toy-smoke runs byte for byte against c6b959b in two configurations (classic; rolling with
+'cq' 0.3 and the cq2 rule); MTG Zero's `tools/gate.py optin-core` PASSED (its ENGINE.md 80.8: digests
+unchanged, check_checkpoint_compat with the Delver line's iteration 475 identical, Glass Road / Caverna /
+Kingdom Builder build against this core).
+
+## 24. Branched self-play games and archive starts (`zero/forks.py`; MTG Zero's Delver mirror, 2026-11-03)
+
+(Sections 22 and 23 are taken by open branches: `feat/heavy-decisions`, `feat/light-decisions`, `feat/temp-late`.)
+
+Section 72 adds a second branch rule, near-tie branches (`selfplay_branch_rule` 'neartie': the branch point among
+decisions the search could not separate, the runner-up played, merges back into the game); this section is the
+'uniform' rule, the default.
+
+### 24.1 Why
+
+MTG Zero's Delver mirror review 5 (its hub notes, `delver_review_5_2026-11-03.md` section 5, step 2): the
+measured bottleneck is **which positions the value head sees** - its own sharp, self-confirming lines, one
+outcome per ~90 rows. At 71 decisions from human games that a strong player calls mistakes, three
+generations re-searched at 1,024 simulations rate the played move as their own with a gap of 0.000 at 62:
+the value head rates the lines it never plays like the lines it plays. Its exploration A/B (section 21 of
+`feat/explore`: gated single deviations, targets unchanged) and late sampling re-weighted options inside
+the games; neither put *new positions with real outcomes* into the data. KataGo's answer is side games
+(a share of games branch at a random move into a game of their own); Go-Exploit's is starting games from
+an archive of states. This section is both, as opt-in run settings.
+
+### 24.2 What it does
+
+* **Branched games** (`selfplay_branch` = p; driver: docs/search.md 2.11). A share p of the games each
+  spawn one branch from a uniformly drawn decision of theirs (a recording seat's searched decision, not
+  minor). When the game ends, its slot plays the branch: 1..`selfplay_branch_moves` (uniform) deviation
+  moves sampled from the network's priors at temperature `selfplay_branch_temp` - the root's evaluation
+  alone, no search: **they are recorded nowhere** (no policy target, no value target) - then normal
+  self-play to the end; every row of the branch gets **the branch's own z**. The game itself is untouched:
+  its moves, its rows, its streams (a branch reads only its own stream), so none of its rows - the branch
+  point's included - is recorded twice. `selfplay_branch_differ` 1: the first deviation is never the
+  game's own move at the branch point (without it, a sharp policy at temperature 2 often samples the
+  game's own move first, and a one-move branch then re-plays its game's line from there: 24.6).
+* **No row needs a masked value target.** The exploration feature (`feat/explore`) masks z := q on the rows
+  before its forced deviation, because there the deviation is inside the game whose outcome those rows
+  get. Here the deviation is in the branch only, and recorded nowhere; the game keeps its own outcome; the
+  branch's rows all come after its deviations, and an archive start's rows after its start. So there is
+  nothing to mask, and the shards carry no new column.
+* **Archive starts** (`selfplay_archive` = a file, `selfplay_archive_p` = the share). A game starts from an
+  archived position instead of a new deal: an entry's `patch` merged into the run's spec (MTG Zero: its
+  `start` block - the source game's seed and root actions, the library orders nobody knows dealt again
+  from the game's own seed: MTG Zero's ENGINE.md 76, 87). The file, `zero-archive/1` = {format, game,
+  base_spec, entries: [{id, kind, patch, ...}], ...}, is the game's own tool's (MTG Zero's
+  `tools/delver_archive.py` replays and checks every position and lists what it skips); `zero/forks.py`
+  refuses another game, a `base_spec` other than the run's, duplicate ids, an empty or malformed entry,
+  and the driver starts every entry once when it is made. Its sha256 (of the entries) is logged at the
+  run's start and in every iteration's `selfplay.forks.archive_sha`.
+
+**Quota and compute.** A branch is a finished game of its own: it counts toward the iteration's `games`
+(local, remote, shared queue alike), so an arm with branching plays the same number of games an iteration
+as one without - but a branch starts mid-game and an archive start at turn 3-15, so the arm plays fewer
+searched decisions and records fewer rows an iteration (24.6: MTG Zero's numbers). An archive start is one
+of the iteration's games. The shared queue (5.3) and the local linger count setups by the games that
+started from one (`forks.setups`: a branch is the second row of its game's setup), else they would queue
+one more setup per branch, every iteration.
+
+**Metrics** (`selfplay.forks`, only when one is on): the iteration's accepted games, samples and searched
+decisions by origin (game / branch / archive), their shares, samples per game, the branches' means
+(deviation moves drawn and played, `same_first`, the branch point's place in its game `at_frac`, of
+archive games), archive starts by kind, the archive's sha, and the remote's own counts (`remote`); one log
+line per iteration (`iter i forks: ...`).
+
+**Remote self-play** (5.3): the workers branch and start from the archive exactly as this machine - their
+config.json is the run's, and the archive file is shipped into the mirror as `archive.json` (the config's
+path rewritten to it) at each session start. A worker's hello reports its `forks.fingerprint` (the branch
+settings, the archive's p, entry count and sha); a worker whose checkout plays them otherwise (an older
+checkout reports none) is refused, retried in 10 minutes, and the run plays on alone - never silently
+without them. Their accepted games' tallies come back in their end lines.
+
+### 24.3 Off by default
+
+`selfplay_branch` 0 and `selfplay_archive` '' (the defaults): the driver gets neither (`DriverCfg::branch`
+and `starts` None), no metric, no new key in a result row or a stats dict but the three zero counters,
+the run of before byte for byte. Refused: a share outside [0, 1] / (0, 1], moves < 1, temperature <= 0,
+`selfplay_branch` without rolling self-play (a classic iteration's list of games would get its branches
+on top of its quota), co-training runs (and a `resolver_cfg` with either), the self-play league.
+
+### 24.4 Costs
+
+A game that drew a branch clones its state at the reservoir's picks (H(n) ~ ln n + 0.58 clones over n
+eligible decisions: ~6 for MTG's ~300) and holds one copy until it ends; a deviation move costs one network
+row. The archive's entries are parsed and started once per driver (MTG Zero's 321 entries: a fraction of a
+second). Nothing else: the games, search and training of before.
+
+### 24.5 Tests and checks
+
+`cargo test` 108 (the driver's 6 tests of docs/search.md 2.11); `tests/test_forks.py` (15: the bindings -
+rows, stats, the settings refused, `differ` -, the run settings, the archive file's checks, a rolling toy
+run with both on: every iteration exactly its quota with branches and archive starts among them, the
+metrics; off has no metrics; remote self-play with the remote 'local': the shipped archive, exact shared
+quotas with branches counted as games, the remote's tally; an older worker refused by its hello). The full
+pytest (CPU, beside the live Delver line): 334 passed, 9 skipped, 1 failed - `test_cotrain_pause_mid_iteration_replays_it`,
+whose run hung on a print: the new settings pushed the co-training run's start-up lines past a Windows
+pipe's 4 KB buffer, which the test read only at the end (the exploration branch met the same: its fix,
+`feat/explore` 7985add - the PAUSE tests' output to a file -, cherry-picked here); the PAUSE tests then pass.
+
+### 24.6 What it measured on MTG Zero's Delver mirror (its ENGINE.md 87)
+
+2026-11-03, the desktop's CPU at below-normal priority beside the live Delver line (MTG Zero's ENGINE.md 87
+has the tables). **The archive** (its `tools/delver_archive.py`): 321 positions - 76 canary-library spots,
+242 Play-tab positions (turns 3-8 of 50 human games), 3 Play reports - every one rebuilt through MTG
+Zero's `start` block equal to its source replay; 4 Play games skipped and listed (played on an older
+engine build). **At the driver** (MTG Zero's `tools/forks_check.py`, its line's self-play seat at 16
+simulations, checkpoint 808): branches 21.1% +- 3.5 of 128 games (p 0.2), deviation moves 1/2/3 drawn
+11/3/13 and all played, every branch row's z its own outcome, none beyond its searched decisions after the
+deviations; archive starts 10.9% +- 2.7 (p 0.1). **Without `differ` the first deviation was the game's own
+move in 79% of the branches** (the network's top move at temperature 2), and those branches' rows re-played
+their games' states; with it 0%. A branch records ~39 rows against a game's ~63, an archive game ~53: at
+p 0.2 / 0.1 the arm records ~8% fewer rows and searches ~8% fewer decisions per iteration at the same games.
+With a batch-invariant evaluator every game equals its twin without branching (44 of 44, 87 of 87); with
+the CPU token network the twins differ (two runs without branching are identical, 32 of 32): its answers
+depend on a batch's other rows (padding), which the branches change. **End to end** (`mtgz.az.run`,
+the Delver preset with a 32 x 1 token network on CPU, the line's flags - sparse batches and window, window
+cache, train_static, local and remote linger -, both features on, remote self-play on the remote 'local'
+with one worker): 4 iterations of 192 games, every one exactly its quota (this machine 115 / 93 / 73 / 58,
+the worker 77 / 99 / 119 / 134), the archive shipped into the mirror byte for byte, no worker refused, the
+iterations' `forks` = their games and samples (local + the remote's tally); 77% games, 15% branches, 8%
+archive starts over the run (branches lag their games by up to a phase: 17.6% per game that can branch).
+
+**Off**: MTG Zero's `check_checkpoint_compat` against main 37d6574 (zero-core cd2f43f) identical - random
+network on the cube spec, and checkpoint 808 on the Delver spec at 16 simulations (1,161 samples, records
+cc72319a5d5ca31d / 5a26e15c983461e8); its engine digest f6543eb2b1b8752f unchanged.
+
+## 25. The game's evaluation cache (`eval_cache`; MTG Zero's Delver mirror, 2026-11-03)
+
+The semantics are docs/search.md 3.12; this section is the run-level view.
+
+**Why.** A third of the network rows of MTG Zero's Delver self-play repeat a row the same game sent earlier
+(measured below), and self-play's time is mostly the network's: the Delver line's gen 960 spent 96 of its
+128 s of self-play in the evaluator. A row the game already sent need not be sent again.
+
+**The setting.** `eval_cache` N (default 0 = off): every network seat of the run - self-play's
+(`Run.nn_seat(selfplay=True)`, also the remote's and the local linger's) and the evaluations' - keeps its
+game's answers, at most N per game in flight, and answers a repeated row from them. Off, the seat dict has
+no key and the run plays, records and trains as before, byte for byte. With it on, the answers are the
+network's answers to the same rows computed in another batch (equal up to its float rounding at another
+batch shape); games finish in another order, so a run's batches, shards and rolling phases differ from the
+run without it at the float-rounding level, never in what the search computes.
+
+**Metrics.** Self-play's `eval_cache` (when on): `hits` (rows answered from a cache by this machine's
+driver), `leaves` (leaves expanded at once), `partial` (leaves that sent one row and took the other from the
+cache), `clears` (caches emptied because full), `share` = hits / (hits + rows sent).
+
+**Costs.** Per row, one 128-bit hash of its features (`obs_hash` skips all-zero blocks of 64 floats) and a
+hash-map lookup, on the driver's search threads. Memory: N answers per game in flight (~100 bytes each plus
+the priors): N 8,192 at 768 games in flight is at most ~0.7 GB.
+
+**Measured.**
+
+* *How many rows repeat* (2026-11-03; MTG Zero's Delver line r3-2b-float550, gen 960, its self-play seat
+  exactly - 64 / 16 simulations, p_full 0.25, 4 minor, root noise, root belief, root-view leaf values,
+  redeterminized worlds - 48 games on the CPU, every leaf batch's rows hashed before the network answered:
+  E:/mtg-zero-scratch/state-dedup/): 520,304 rows; repeats of a row from earlier in the same game 33.8% (one
+  search 25.2%): value-only 62.6%, leaf 19.0%, belief 100%; none across games. By decider: the root decider's
+  own decisions 34.0%, the other seat's 3.8% - hidden information (each simulation deals the other seat a new
+  hand). Equal features always had equal options. The permanents in a canonical order (cross-references
+  relabelled) add 0.6 points.
+* *Throughput* (2026-11-03, the desktop's RTX 5090 alone - the run stopped -, MTG Zero main 37d6574 on this core,
+  E:/mtg-zero-scratch/state-dedup/gpu_timing.py): the Delver line's self-play seat with its gen 1000, a rolling
+  driver as the run's local one (768 games in flight, 8 threads, 2 groups, sparse batches, token CUDA graphs),
+  256 games to warm up, then 640 timed; off / on alternately, each pair on one seed:
+
+  | eval_cache | games/s | simulations/s | rows sent/s | rows cached | leaves at once / in part | avg batch |
+  |---|---:|---:|---:|---:|---:|---:|
+  | 0 | 10.67, 10.44 | 73.7k, 72.6k | 108.7k, 107.1k | - | - | 577 |
+  | 8192 | **14.29, 14.00** | 99.5k, 97.8k | 97.2k, 95.4k | 34.0%, 34.1% | 0.81M / 1.38M per 640 games | 465 |
+
+  +34% games a second (10.55 -> 14.15); the cache was emptied ~0.3 times a game (some games pass 8,192 answers).
+* *The toy* (`driver::tests`): ToyGame self-play at 32 simulations 21,630 rows -> 15,750 sent (27% cached);
+  with root-view values 33,871 -> 27,631 (value-only 11,446 -> 10,657).
+
+**Checks.** cargo test 106 + webnet 3 on the desktop (the four eval-cache tests, docs/search.md 3.12; the
+driver's golden records and matches unchanged with the cache off); on the MacBook the ten golden tests fail
+alike on main 96f1566 and on this branch, with the same digests (the goldens are the desktop's floats);
+pytest `test_loop.py::test_eval_cache_setting`.
+
+## 26. A prior exponent in the 'cq' target (`cq_prior_w`; MTG Zero's Delver mirror, 2026-11-04)
+
+The semantics are docs/search.md 3.13; this section is the run-level view.
+
+### 26.1 Why
+
+With `policy_target` 'cq' the recorded target is `softmax(ln P0 + sigma completedQ)` with P0 the playing
+network's own prior, and the network fits its targets: generation after generation the policy's logits add up
+every advantage a search measured and forget none. On MTG Zero's Delver line the targets have drifted to one-hot
+(gen 859: 54.6% of the recorded decisions with max-share > 0.99, 38.7% > 0.999; the targets' mean normalised
+entropy 0.35 -> 0.20 between gens 40 and 1096) while the habits human players beat it with stayed flat for
+hundreds of generations: an option PUCT stopped visiting is never measured again. A prior exponent beta < 1
+gives the generations' policy a bounded fixed point `exp(sigma Q / (1 - beta))` and lets a dead option's prior
+recover by the factor beta a generation until the search measures it again (Fable's review of 2026-11-04, its
+rank 1: `E:/mtg-zero-scratch/fable-ideas/report.md` 2.1).
+
+### 26.2 The setting
+
+`cq_prior_w` = beta (default 1.0 = off): self-play's recorded 'cq' targets are `softmax(beta ln P0 + sigma
+completedQ)`. It goes to the self-play seat alone (`Run.nn_seat(selfplay=True)`: this machine's, the local
+linger's and the remote workers'), never to an evaluation, and inside the seat to the recorded target alone: the
+moves (PUCT, root noise, temperature, `selfplay_select`, the Gumbel root), q and z are those of beta 1. It needs
+`policy_target` 'cq' and a value in (0, 1] (`resolve_config` / `check_eval_settings` exit otherwise, also for
+`resolver_cfg`). Off, the seat dict has no key and the run records and trains as before, byte for byte.
+
+**What changes with it on.** Only the `pi` of the recorded rows, so a run's first generation with it plays
+exactly the games it would have played; from the next one on its network differs (it trained on softer targets)
+and with it everything the network touches. The evaluation seats' rule and Elo pool are unchanged, so an A/B's
+arms share them. The readouts that show it: self-play's `target` (`h_norm` up, `max_share` down, from the first
+generation) and `train.entropy` (the policy's own entropy, a generation later). A remote worker must run a
+checkout with this core (docs/search.md 3.13: an older one would record beta-1 targets in silence; MTG Zero's Mac
+runs the run's commit).
+
+**Costs.** None measurable: one `ln` per option of each recorded decision.
+
+### 26.3 Measured: the targets at beta 1, 0.8 and 0.6 (MTG Zero's Delver line, CPU, 2026-11-04)
+
+The Delver line's checkpoint 1000 (r3-2b-float550) with its exact self-play seat (config.json: 64 / 16
+simulations, p_full 0.25, 4 minor, root noise, temp_moves 60, cq c_scale 0.3, root belief, root-view leaf values,
+value-only samples 0.5, plus the run's eval_cache 8192), 24 games on the desktop's CPU at idle priority beside the
+live run (2 search + 2 torch threads, ~210 s per beta), recorded (`take_samples`), once per beta with the same
+driver seed; an evaluator wrapper kept every leaf row's priors, so each recorded decision's P0 is known (all
+1,475). Script and data: `E:/mtg-zero-scratch/ideas-1/` (`cq_prior_probe.py`, `probe_24g.json`,
+`probe_24g_beta*.npz`, `analyze.py`).
+
+* **The games are identical** at the three betas: every result and every sample field but `pi` bit for bit
+  (2,235 samples, 1,475 decisions with 2+ options; 167,483 rows sent, 83,569 answered from the cache, each run).
+* **pi_beta = pi_1 P0^(beta - 1), normalised**: rebuilt offline from the beta-1 targets and the captured priors it
+  matches the driver's targets at 0.8 and 0.6 to 5e-8 (only the prior's term differs, as designed).
+
+| recorded targets (1,475 decisions) | P0 (the prior) | beta 1.0 (today) | 0.9 * | 0.8 | 0.7 * | 0.6 | 0.5 * |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| max-share > 0.9 | 75.1% | 76.7% | 74.5% | 71.4% | 69.1% | 65.4% | 59.7% |
+| max-share > 0.99 | 51.9% | **56.9%** | 53.2% | **48.6%** | 43.6% | **38.2%** | 31.3% |
+| max-share > 0.999 | 34.6% | 40.3% | 36.0% | 31.3% | 28.0% | 24.3% | 20.3% |
+| mean max-share | 0.916 | 0.919 | | 0.902 | | 0.876 | |
+| mean normalised entropy | 0.214 | 0.202 | 0.221 | 0.244 | 0.273 | 0.307 | 0.350 |
+| normalised entropy < 0.05 | 49.5% | 54.7% | 50.4% | 45.4% | 40.7% | 34.8% | 29.7% |
+| KL(pi \|\| P0), mean (median) | 0 | 0.021 (0.00004) | 0.025 | 0.033 (0.003) | 0.046 | 0.069 (0.020) | 0.109 |
+| argmax pi = argmax P0 | | 97.8% | | 97.2% | | 96.4% | |
+
+\* rebuilt offline from the beta-1 targets and P0 (exact up to f32 rounding: see the check above).
+
+The beta-1 row reproduces the line's own readouts (gen 859's offline screen: 75.7% / 54.6% / 38.7%, entropy 0.20;
+`metrics.jsonl` max-share 0.92). **At beta 1 the target is sharper than the prior** (56.9% vs 51.9% above 0.99):
+the ratchet, measured within one generation. beta 0.9 still sharpens (53.2%); **0.8 is about where the target
+stops sharpening the prior** (48.6%, mean max-share 0.902 vs the prior's 0.916); 0.6 softens it clearly.
+
+*Projected, not measured* (`analyze.py`, assuming the network fits its targets exactly and every option's
+completed Q stays what this search measured - an option whose prior rises would in fact be visited and its Q
+re-measured, so the projection overstates the softening of options no search visited): the share above 0.99
+after 1 / 5 / 10 generations and at the fixed point is 57 / 65 / 69% at beta 1 (still climbing), 49 / 34 / 30 /
+31% at 0.8, 38 / 20 / 20 / 20% at 0.6; at the fixed point the mean entropy is 0.52 at 0.8 and 0.62 at 0.6. The
+relaxation is fast (most of it within ~5 generations at 0.8), well inside a 40-generation A/B.
+
+### 26.4 The A/B (planned, not run)
+
+Recommended first arm: **beta 0.8** - it passes the review's kill test (a) (fewer than 50% of the targets above
+0.99 at the chosen beta: 48.6%), it is the first beta at which the targets stop out-sharpening the prior, and
+its fixed point keeps a 1-pp systematic Q gap at ~1.5 logits (docs/search.md 3.13) while the self-play policy
+softens least. 0.6 is the second arm if 0.8's lever proves too weak. The fork + control pattern of section 24
+(MTG Zero's `E:/mtg-zero-scratch/forked-games/launch.sh`), arms in turn, both from the line's checkpoint K,
+40 generations each at the line's flags: the fork `--cq-prior-w 0.8` on a build pinning this core, the control
+the line continued on its own pin. Endpoints at equal generations: self-play `target.h_norm` / `max_share`
+and `train.entropy` (the lever), paired GPU h2h fork N vs control N at K+20 and K+40 (1,200 games, 32 sims,
+the evaluation seat), the blunder sidecar's flat fingerprints (`fp_daze_tapout`, `fp_fow_pitch_fow`,
+`fp_fetch_now`, and `tam_flip_clean_pre`), the held-out canary half, fresh-row value CE at K+40. Stop rules:
+the fork's `target.h_norm` at K+5 less than 0.04 above the control's (no compounding beyond the first
+generation's +0.043) = too weak, rerun at 0.6; h2h <= -20 Elo at K+20 = too soft; entropy up and no fingerprint
+moved >= 5 points by K+40 with the h2h within noise = the ratchet was not the freeze (stop); a fingerprint moved
+>= 5 points with the h2h within noise = adopt (a relaunch flag; the evaluation pools are unchanged). The
+plan in full: `E:/mtg-zero-scratch/ideas-1/AB_PLAN.md`.
+
+### 26.5 Checks
+
+cargo test 114 + webnet 3 on the desktop (`tree::tests::completed_q_prior_w_by_hand`,
+`driver::tests::cq_prior_w_changes_only_the_recorded_targets`: prior_w 1.0 reproduces aae4ca2's 'cq' record
+digests; the driver's other golden records and matches unchanged); pytest `tests/test_cq_prior_w.py` (7),
+`test_policy_target.py` + `test_mcts.py` (17), `test_gumbel.py` + `test_bindings.py` (26);
+`tools/check_checkpoint_compat.py --package zero --net random --game toy` against aae4ca2: identical; the toy
+loop (`--preset toy-smoke --policy-target cq --cq-prior-w 0.6` vs 1.0): the first iteration's 385 samples
+alike, target `h_norm` 0.900 vs 0.878, then the networks diverge; MTG Zero main 619f1f2 builds against this
+core and plays the identical games of 26.3, and `check_checkpoint_compat.py --package mtgz` with the Delver
+line's checkpoint 1000 and its spec (8 games, 32 sims, 'visits' and 'cq' records, a match vs random), 619f1f2 on
+aae4ca2 vs 619f1f2 on this core: identical.
+
+## 27. Self-play resignation with a no-resign share (`selfplay_resign_t`; MTG Zero's Delver mirror, 2026-11-04)
+
+The driver's semantics are docs/search.md 3.14; this section is the run-level view.
+
+### 27.1 Why
+
+MTG Zero's Delver line is data-rate-limited (its value head improves with games and with nothing else tried)
+and, since the evaluation cache, its self-play phase is bound by the CPU's searches (Fable's review of
+2026-11-04, `E:/mtg-zero-scratch/fable-ideas/report.md` 1.1, 2.2). A third of those searches come after the
+game is decided: 36.5% of its recorded decision rows have the decider's root win estimate outside
+(0.05, 0.95), and the outcome agrees in 98.9% of them (27.6). Their policy targets come from searches with
+no gradient (utility = P(win) only) and their value targets are the ones the value head already predicts.
+Ending a game once the search has called it decided for a while buys games per hour at the same compute.
+KataGo's form: resign after a run of decided searches, and keep a share of games that never resign - they
+keep the value head seeing decided positions and are the live measurement of how often the rule is wrong.
+
+### 27.2 What it does
+
+* **The settings.** `selfplay_resign_t` t (0 = off), `selfplay_resign_k` k, `selfplay_resign_noresign` (the
+  no-resign share) become the self-play seat's keys `resign_t`, `resign_k`, `resign_noresign`
+  (`Run.nn_seat(selfplay=True)`, `resign.seat_keys`): this machine's rolling or classic driver, the shared
+  queue's driver, the local linger's (the same driver) and every remote worker's (they build the seat from
+  the run's config.json) - one rule everywhere.
+* **The rule** (docs/search.md 3.14): a game ends when k consecutive **full** searches of its self-play seat
+  (the searches that make its records; fast and minor searches neither count nor reset) found **one seat's
+  root win estimate >= 1 - t** - the record's q, by absolute seat; the same favoured seat each time. It is
+  scored as that seat's win before the firing decision's move; every record so far is kept with z = that
+  outcome. A share of the games - `noresign_pick(seed, gid, share)`, a hash, so no game changes - never
+  resigns: each reports where the rule would have fired and whether the favoured seat then won.
+* **Who never resigns**: evaluation seats (the evaluations, Elo matches, anchors, `zero.h2h`, a game's Play
+  tab - `games.nn_seat` refuses `resign_t` on a seat that is not self-play, the driver on one that records
+  nothing), and every tool that builds its own seats (MTG Zero's blunder sidecar plays full games).
+* **Quotas**: a resigned game is one finished game - one result row - for the rolling quota, the shared
+  queue's quota (5.3), the local linger's held games and a remote's `fin` / accept: an iteration plays its
+  `games` games exactly as before, each shorter. Branched games (24) compose: a resigned game spawns its
+  branch, a branch resigns by its own count.
+* **Metrics** (`selfplay.resign`, only when on; the iteration's accepted games, this machine's and the
+  remote's): `games`, `resigned` / `resigned_share`, `noresign`, `would` (no-resign games where the rule
+  fired) / `would_share`, `wrong` (of those, the favoured seat did not win: a loss or a draw) / `wrong_rate` -
+  **the live wrong-resignation rate** -, `rows_saved` and `decisions_saved` (the share of the no-resign games'
+  samples and searched decisions after the point where they would have resigned: what resigning saves per
+  game), `samples_per_game` {resigned, noresign}, `remote` {games, resigned, noresign}. A log line per
+  iteration (`iter i resign: ...`) and the settings at the run's start (`self-play resignation
+  (zero/resign.py): t=... k=... noresign=...`).
+* **Remote self-play** (5.3): the workers resign exactly as this machine. A worker's hello reports its
+  `resign.fingerprint` (t, k, share); one whose checkout plays otherwise - an older checkout reports nothing -
+  is refused, retried in 10 minutes, and the run plays on alone: never a worker playing every game out in
+  silence. Its accepted games' tally comes back in its end line and joins the iteration's metrics.
+
+### 27.3 Off by default
+
+`selfplay_resign_t` 0 (the default): the seat dict has no key, no row a `resign` field, no metric, no log line:
+the run of before byte for byte (27.5). `selfplay_resign_noresign` 1 is a **dry run**: no game resigns, the
+games are those of the run without it (nothing reads a stream) and every row reports where it would have -
+the rule measured on the live run at no cost. Refused at the start (`resolve_config`): t outside [0, 0.5), k < 1, a
+share outside [0, 1]; co-training (`resolver`, and a `resolver_cfg` with it: deferred terminals take their
+outcome from outside), the self-play league (its opponent seat copies the self-play seat; one counter per
+game), `players` other than 2.
+
+### 27.4 Costs, and what changes in the data
+
+* **Compute**: a few comparisons per full search. Memory: none.
+* **The rows**: a resigned game records only its rows up to the firing search, so the window holds fewer
+  decided-position rows - the no-resign games' and the rows before each resignation remain. That is the
+  intent (they are the rows the value head already predicts at 99% and whose policy targets carry no
+  gradient), and the risk: a value head trained on fewer decided positions may drift in them, which shows up
+  first as a rising `wrong_rate`.
+* **A wrong resignation** gives every row of its game the wrong z (the rule's call is not the played-out
+  outcome). In self-play both seats are the network, so a wrong resignation is its own misjudgement of a
+  position it then would have lost; the no-resign games measure the rate every iteration.
+* **The margin and score of a resigned game** are the position's where it resigned: its records' `sc`
+  (`margin()`, the margin head's target at `margin_loss_w`) and its row's `scores` (`avg_score`) are
+  mid-game values, and `rounds`, `steps_per_game`, `decisions_per_game` fall with the resignations.
+* **Throughput**: an iteration of the same `games` searches fewer decisions. `decisions_saved` is the share
+  of a game's searched decisions that resigning saves (averaged over the no-resign games, those that never
+  fired counting 0), so a game costs about 1 - (1 - the no-resign share) x `decisions_saved` of one played out,
+  and its rows fall by about (1 - the share) x `rows_saved` - per iteration in the metrics.
+
+### 27.5 Tests and checks
+
+`cargo test` 118 + webnet 3 (the driver's six resignation tests, docs/search.md 3.14; every golden record and
+match unchanged); `tools/check_checkpoint_compat.py` main (aae4ca2) vs this branch on the toy, random network:
+identical (records, results, the match); `tests/test_resign.py` (10: the bindings - a resigned game is its dry
+twin up to the firing search with the resignation's z, the draw, the settings refused -, the run settings, a
+rolling toy run of 3 x 96 games with exact quotas and the metrics, off has none, remote self-play with the
+remote 'local' and the local linger - exact shared quotas with resigned games counted, the remote's tally in the
+metrics -, an older worker refused by its hello); `test_bindings.py` + `test_forks.py` 27 passed; `-k 'refused
+or older or eval_cache or local_linger'` 16 passed. MTG Zero main 619f1f2 builds against this branch.
+
+### 27.6 What it measured on MTG Zero's Delver mirror
+
+**Offline, the exact rule** (2026-11-04, numpy on the desktop's CPU: `E:/mtg-zero-scratch/ideas-2/offline_resign.py`,
+`offline_grid.py`, on the review-5 offline screens' rows of gens 855 and 859 - 522 + 436 whole games, 90,061 rows,
+60,232 decision rows; the run's seat records its full searches only, so the decision rows are exactly the
+searches the rule counts). Per game, the rule is replayed over its decision rows in order (both seats, the
+row's q by absolute seat, the favoured seat the first maximum); a resignation keeps the firing decision's row
+and its value-only rows; wrong = the favoured seat did not win (no draws occurred).
+
+| t | k | games resigned | rows saved | wrong (of resigned) | 855 / 859 wrong | games per hour at share 0.1 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.01 | 3 | 76.7% | 21.9% | 2 / 735 = 0.27 +- 0.19% | 0.51 / 0.00% | x1.25 |
+| 0.02 | 2 | 87.9% | 28.9% | 7 / 842 = 0.83 +- 0.31% | 0.89 / 0.77% | x1.35 |
+| **0.02** | **3** | **82.6%** | **26.4%** | **7 / 791 = 0.88 +- 0.33%** | 0.95 / 0.81% | **x1.31** |
+| 0.02 | 5 | 73.6% | 22.1% | 2 / 705 = 0.28 +- 0.20% | 0.27 / 0.30% | x1.25 |
+| 0.03 | 3 | 86.1% | 29.8% | 10 / 825 = 1.21 +- 0.38% | 1.13 / 1.31% | x1.37 |
+| 0.05 | 3 | 90.6% | 35.2% | 21 / 868 = 2.42 +- 0.52% | 2.75 / 2.02% | x1.46 |
+| 0.05 | 5 | 80.9% | 29.7% | 13 / 775 = 1.68 +- 0.46% | 2.14 / 1.13% | x1.37 |
+| 0.05 | 8 | 71.2% | 24.3% | 7 / 682 = 1.03 +- 0.39% | 1.09 / 0.95% | x1.28 |
+| 0.10 | 5 | 88.9% | 38.9% | 28 / 852 = 3.29 +- 0.61% | 3.85 / 2.60% | x1.54 |
+
+(Rows saved = decision rows saved within 0.2 points; games per hour = 1 / (1 - 0.9 x decisions saved), if a
+game's time scales with its searched decisions - decided positions are not cheaper than average, Fable's 2.2.)
+**The threshold matters more than the count**: at ~29% saved, t 0.02 / k 2 is wrong half as often as t 0.05 /
+k 5. Fable's numbers for t 0.05 / k 5 (32.2% / 31.4% saved, 8 / 5 wrong) counted any recorded row, value-only
+rows included (their q is the observer's next search); counting searches only, as the driver does, gives
+30.5% / 28.8% saved and 9 / 4 wrong.
+
+**The driver on MTG** (2026-11-04, `E:/mtg-zero-scratch/ideas-2/mtg_smoke.py`: MTG Zero main 619f1f2 built on this
+branch, the Delver line's exact self-play seat from checkpoint 1000's config.json - 64 / 16 simulations, p_full
+0.25, 4 minor, the cq target, root-view values, the root belief, value-only samples 0.5 - plus `eval_cache` 8192
+and resignation; 32 games a run on the desktop's CPU at idle priority beside the live line, CUDA hidden). For
+every game the rule replayed over its own records' decision rows (`offline_resign.fire`) fires exactly where the
+driver resigned - and in a no-resign game where it said it would have, and never where it never fired -; every
+resigned game's z is the favoured seat's win and its samples its `records`; every game's no-resign flag is
+`noresign_pick`'s: **0 mismatches in 96 games**.
+
+| run | resigned | no-resign games that would have / wrongly | never fired | seconds |
+|---|---:|---:|---:|---:|
+| t 0.05, k 5, share 0.25 | 20 | 4 / 0 | 8 | 137 |
+| t 0.02, k 3, share 0.25 | 21 | 5 / 0 | 6 | 107 |
+| t 0.05, k 5, share 1 (dry run: every game played out) | 0 | 24 / 1 | 8 | 163 |
+
+The dry run's 24 firings would have saved 26.5% of its rows and 26.7% of its searched decisions (offline at
+t 0.05, k 5 on gens 855 / 859: 29.7%); its one wrong call favoured seat 1 at decision 122 of 272 and seat 0 won.
+137 s against 163 s for the same 32 games at share 0.25 (-16%; the CPU beside the live line, a run's tail
+its slowest game's: indicative only, not a throughput measurement). Resigned games averaged 13.1 turns and
+62 samples, played-out ones 81 samples.
+
+### 27.7 The recommended A/B and its kill rule
+
+Not launched. **Fork**: the line's checkpoint and settings plus `selfplay_resign_t 0.02 selfplay_resign_k 3
+selfplay_resign_noresign 0.1` and `games 2000` (x1.25: a generation then takes about the control's self-play
+time and records about its rows - offline 26% fewer rows per game x 0.9 resigning -, so the two arms compare at
+equal compute per generation and the fork has seen 1.25x the games); **control**: the line as is (1,600 games).
+Both from the same checkpoint, 40 generations (the `E:/mtg-zero-scratch/forked-games/launch.sh` pattern). The
+fork's remote workers (the Mac) must run this zero-core: an older checkout is refused by its hello, never
+silently playing its games out.
+A cheaper first step, if the line is relaunched on this core anyway: a **dry run** (`selfplay_resign_noresign
+1` with t 0.02, k 3) for a few generations - the line's games unchanged - measures the rule on the live network
+(`selfplay.resign.would_share`, `wrong_rate`, `rows_saved`) before any arm resigns.
+
+Readouts per generation: `selfplay.resign` (wrong_rate, would_share, rows_saved, decisions_saved,
+resigned_share), `selfplay.seconds` and `samples` (fork ~ control), fresh-row value CE, the blunder
+fingerprints, then the paired GPU h2h at +20 / +40 against the control (within noise or better: resignation
+paid for itself; the data-rate argument predicts +).
+
+**Kill rule**: the wrong-resignation rate of the no-resign games (`wrong / would`), pooled over the last 10
+generations (~165 would-have-resigned games a generation at 2,000 games x 0.1 x ~0.83: se ~0.25% at 1%),
+must stay **below 3%**; stop the fork when it reaches 3%, or when a single generation is above 8% (a gross
+failure: ~4 se above 3% at ~165 games), or when the h2h at +40 is -20 or worse. A rate that creeps up generation after generation
+while still under 3% is the value head drifting in the positions it no longer trains on: raise the no-resign
+share to 0.2 or lower t to 0.01 before it reaches the line.
+
+## 28. Sparse rows without the full-row scans (no setting; MTG Zero's Delver mirror, 2026-11-04)
+
+The driver side is docs/search.md 2.12; this section is the why and what it measured.
+
+**Why.** With the evaluation cache (25) on, the Delver line's self-play phase no longer waits on the network
+alone (MTG Zero's r3-2b-float550, gens 1048-1112: the evaluator busy 62-70 s of a 92-102 s phase), and a
+search thread spends most of a simulation on its network rows. Measured on 10k Delver leaf rows (below):
+per row `encode` ~13-22 us, `LeafBuf::seal`'s float-by-float scan ~11-14 us, `obs_hash` (the cache's key)
+~3-4.6 us, a cached row's full zeroing ~2 us - against ~14-22 us for the rest of a simulation (the deal, the
+walk, the engine's steps, the expansion and backup). At the run's mix of 1.48 rows encoded per simulation
+(0.98 sent, 0.50 answered from the cache) the scans, the key and the zeroing were ~17 us of a simulation's
+~50 us of measured work, `encode` ~20 us.
+
+**What changes.** Nothing a run sees: the same batches byte for byte, the same cache keys and hits, so there
+is no setting (it would switch between two ways of computing the same bytes). A sparse driver (run setting
+`sparse`, search.md 2.2) reads its rows with `SearchGame::encode_sparse` (default: `encode` + the
+block-skipping `game::sparse_scan`) and keys its cache by `obs_hash_sparse` of the pairs; a dense driver is
+unchanged. A game may override `encode_sparse` to emit its pairs without the dense row (search.md 2.12 has the
+contract); MTG Zero does not (ENGINE.md 89: what is left of the scan after this, ~3 us a row, does not pay for
+rewriting its encoder).
+
+**Costs.** None: the same memory (a scratch row per chunk buffer, as before), the same work elsewhere.
+
+**Measured** (2026-11-04, the desktop beside the live Delver run - CPU timings inflated by it, so the
+comparisons are within one process or interleaved A / B on one seed):
+
+* *Per row* (`rowcost`, E:/mtg-zero-scratch/ideas-3/rowcost: 15 Delver mirror games searched at the line's
+  64 / 16 simulations with priors 0.85 on the heuristic bot's move, every 16th leaf kept - 10,001 rows, both rows
+  of a root-view leaf, ~252 non-zeros of 37,620 a row in ~82 of 587 blocks of 64; mimalloc, as MTG Zero's module):
+  the old scan 10.7-12.3 us -> `sparse_scan` 3.0-3.9 us; `obs_hash` 3.0-3.5 us -> `obs_hash_sparse` 0.65-0.88 us;
+  a whole row as the driver reads it, old -> new, interleaved per row: **sent 21.0 -> 11.8 us, cached 12.4 -> 11.4
+  us**; pairs and keys equal on every row. At the run's 0.98 sent and 0.50 cached rows per simulation: -9.5 us
+  of thread time a simulation (-23% of the ~41 us measured in the same process).
+* *The driver* (MTG Zero's self-play seat - eval_cache 8192, root-view rows, the root's belief, sparse batches -
+  with the line's gen 1000 on the CPU, 24 games in flight, 2 threads, 2 groups, one seed; the old build (zero-core
+  aae4ca2) and the new one run at the same time, so under the same load; E:/mtg-zero-scratch/ideas-3/ab_conc.sh):
+  the search threads' time per simulation (`busy_s` / sims) **103.4 -> 87.0 us and 93.8 -> 80.8 us (-16%,
+  -14%)**, the same 62,578 rows sent and simulations in the timed window. (Run one after the other: 101.1 /
+  104.6 old, 93.3 / 68.9 new - the load moved between runs.) The absolute numbers are the loaded desktop's.
+* *Byte identity on MTG* (E:/mtg-zero-scratch/ideas-3/digest_ab.py: the same seat, 6 games, answered by a
+  function of each row's non-zeros - no network, whose CPU floats are not reproducible run to run): the old and
+  the new build give the same 29,114 batches (sparse arrays, options, kinds, players, gids), samples and results,
+  digest for digest, and the same counters (25,428 cache hits, 14,533 value-only rows, 536 belief rows).
+
+**Checks.** cargo test 114 (the golden digests unchanged; `lookahead::tests::sparse_scan_and_obs_hash_sparse_
+match_the_dense_row`, `driver::tests::sparse_rows_from_encode_sparse_are_the_dense_rows`), pytest -k "sparse or
+cache" 6 passed / 1 skipped (CUDA); MTG Zero (ENGINE.md 89): its engine test
+`encode_sparse_is_the_rows_non_zeros_with_the_same_key` (cube and Delver mirror states, both viewers) and its re-pin
+gate (the engine digest f6543eb2b1b8752f unchanged, the 1-config Delver search smoke); `tools/smoke_all.sh
+--with-this-core --build-only` with Glass Road, Caverna and Kingdom Builder: all three build (the trait method has
+a default).
+
+## 29. `smoke_all.sh` finds the games from a worktree or a submodule, and no game is a failure (2026-11-04)
+
+**The bug.** With no game arguments `tools/smoke_all.sh` looked for the game repos only beside the checkout
+it ran from (`../glassroad-zero`, `../caverna-zero`, `../kingdombuilder-zero`). From a git worktree
+(`zero-core-wt/<name>`) or a zero-core submodule (a game's or MTG Zero's `third_party/zero-core`, in a
+worktree or not) there is nothing there, so it found no game, ran the core's own steps and printed GREEN:
+"do the other games still build against this core?" was silently never asked. MTG Zero's tiered gate runs it
+exactly that way - `bash third_party/zero-core/tools/smoke_all.sh --with-this-core --build-only` from the
+checkout under gate, always a worktree, as its `optin-core` tier's step "build-only: the other games" - so
+that step built no game whenever it was run without `--other-games` (its GREEN on 619f1f2, 2026-11-03, was
+the core's cargo test, build and pytest alone; MTG Zero's ENGINE.md 90). Found 2026-11-04 when the same
+command with the three repos passed explicitly built all three. A pipeline that processed 0 of N must fail
+loudly.
+
+**What it does now.**
+
+* **Discovery** (no game arguments): `../<game>`; beside the main checkout when this is a worktree (the
+  directory holding `git rev-parse --git-common-dir`); for a submodule, beside the superproject's checkout
+  (`--show-superproject-working-tree`) and beside the superproject's main checkout. The first hit per game
+  wins; `SMOKE_GAMES_ROOT=<dir>` looks in `<dir>` only.
+* **No game is a failure**: found none and given none, it fails before running anything - exit 1, a
+  `FAIL  games: no game repo found ...` summary line naming where it looked, never GREEN. A deliberate
+  core-only run says so: `--core-only` (or `SKIP_GAMES=1`). A game it cannot find is a `missing:` summary
+  line, and the summary counts what it checked (`games: 3 of 3 checked (glassroad-zero caverna-zero
+  kingdombuilder-zero)`).
+* **Explicit game arguments**: unchanged for game checkouts. A path that does not exist exits 2 (it used to
+  become an empty entry that was skipped silently), an unknown option exits 2 (it used to be taken as a
+  path), and a directory that is not a game repo is a FAIL (was a `skip`).
+* **`--with-this-core`**: a scratch worktree whose zero-core cannot be moved to this core's HEAD is a FAIL
+  (it used to build the game's own pin and report it as built against this core); a note says when the core
+  checkout has uncommitted changes, which the games' builds do not contain.
+* **`--dry-run`**: prints the core steps, each game and where it was found, and exits (1 when no game is
+  found).
+
+**Tests and checks.** `tests/test_smoke_all.py` (throwaway git repos, `--dry-run` and the no-game exit only,
+nothing built): the games found beside the main checkout, from a worktree and from a submodule inside a
+worktree of its superproject, the no-game failure and `--core-only`, explicit paths - 5 passed; the worktree,
+submodule, no-game and explicit-path cases fail against the old script. On the desktop: the old script (aa10733) from `zero-core-wt/smoke-fix` and from an MTG Zero worktree's
+`third_party/zero-core`, `SKIP_CORE=1 ... --with-this-core --build-only`, printed an empty summary and GREEN
+(exit 0); the new one (7d3dbd8) finds `C:/Users/<user>/{glassroad,caverna,kingdombuilder}-zero` from
+both, and with `SMOKE_GAMES_ROOT` pointing at a missing directory exits 1 without GREEN (dry run and real
+run). MTG Zero's fixed gate step (its ENGINE.md 90: the three repos passed explicitly, an "ok <game>: build"
+line required for each), run for real against 7d3dbd8 at IDLE priority with 2 build jobs: PASS in 159 s,
+Glass Road 41 s, Caverna 43 s, Kingdom Builder 66 s, `games: 3 of 3 checked`; its summary is the old
+script's explicit-path summary line for line plus that count line.
+
+## 30. Information-set merging (`eval_infoset_merge`, `selfplay_infoset_merge` in 30.1; MTG Zero's Delver mirror, 2026-11-04)
+
+The semantics are docs/search.md 3.16; this section is the run-level view.
+
+**Why.** With hidden cards, the other seat's options differ between the worlds a search deals (Daze in the sampled
+hand or not), and the tree of before keys the other seat's decision by its option list - so the root decider's next
+decision is split into one node per option list above it, each with its own statistics: the search can play one
+information set of the root decider differently depending on what the other seat was dealt (strategy fusion). In the
+Delver line's searches two thirds of the main lines see the other seat with two or more option lists (Step 0 in
+3.16). Merging the tree's nodes by the root decider's observation (single-observer ISMCTS) removes the split. Its gate
+(3.15) failed on depth and fragment counts; the user decided to build it and let an evaluation-only paired match
+decide.
+
+**The setting.** `eval_infoset_merge` 0 | 1 (default 0 = off): every evaluation seat's trees merge their nodes by the
+root decider's observation (`games.nn_seat(infoset_merge=True)`, the seat key `infoset_merge`). Needs
+`eval_leaf_value_view` 'root' (validated: a merged node of the other seat is valued from the root decider's view).
+The evaluation's moves change with it, so its Elo pool's name gets `-ism` (`mcts.merge_tag`, after the view's and
+the belief's suffixes: `cq-n4-v50-s0.3-rv-b1m0.25-ism`). Off, the seat dict has no key and every search is the one
+of before, bit for bit. Self-play: 30.1.
+
+**h2h.** `--a-infoset-merge / --b-infoset-merge 0 | 1` (or `--infoset-merge` for both; default: each side's run's
+`eval_infoset_merge`). A merged side needs root-view leaf values (its run's `eval_leaf_value_view` 'root' or
+`--*-leaf-value-view root`), else the match is refused before any game. The output names the side (`select_a`:
+`...-ism`) and adds `merge`: the merged trees' links, merges, aliases and growth leaves summed over the drivers (a
+merged side whose trees made no link is reported on stderr: a setting that did nothing).
+
+**Costs.** One sparse encode of the viewer's row and a hash per new child signature (about one per walk), a link per
+signature, 16 bytes of side statistics per option of an expanded node; known links cost nothing. Measured below.
+
+**Measured** (MTG, CPU, the desktop beside the live A/B; docs/search.md 3.16 has the tables): the merged tree's walks
+are 14-17% deeper, a search expands 20-33% more distinct information sets (0.86-0.90 per walk against 0.65-0.75),
+the share of leaves re-expanding a held information set falls from 26-35% to 10-13% (the rest: growth leaves), and the
+main line's edge into the other seat holds ~1.4 other-seat nodes instead of 3-8. The evaluation rule's root pick
+changes in ~10% of contested decisions (prior max < 0.7; 8% of all decisions) and in none of 160 searches at
+uniformly drawn positions: an effect on ~1% of the evaluation seat's moves, if any.
+
+**The evaluation-only h2h** (the GPU's, after the A/B; from an MTG Zero checkout whose zero-core has this branch -
+`C:/Users/<user>/mtg-zero-wt/infoset-build` is one, built): the same checkpoint on both sides, the run's
+evaluation seat (32 simulations, cq rule guard 4 c_scale 0.3, root-view values, the root's belief tilt 1 / clip 20 /
+mix 0.25), side A merged:
+
+```
+python -m mtgz.az.h2h CK CK --paired --games 1200 --sims 32 --chance-k 0 --device cuda --seed 0 \
+    --select cq --select-min-visits 4 --cq-c-scale 0.3 \
+    --a-leaf-value-view root --b-leaf-value-view root \
+    --a-belief-tilt 1 --b-belief-tilt 1 --a-belief-mix 0.25 --b-belief-mix 0.25 \
+    --a-infoset-merge 1 --b-infoset-merge 0
+```
+
+(With CK = `E:/mtg-zero/runs/r3-2b-float550/models/iter_NNNN.pt` the explicit rule flags are what the run's
+config.json gives anyway - `--a-infoset-merge 1 --b-infoset-merge 0` alone would do; a checkpoint copied elsewhere
+has no config.json two levels up, hence the flags.) The output must name `select_a` `cq-n4-v50-s0.3-rv-b1m0.25-ism`
+and `select_b` `cq-n4-v50-s0.3-rv-b1m0.25`, and carry `merge` with links > 0. **Stop rule** (Fable's): `elo_diff`
+within +-7 -> stop (the merge is null at play); above +7 -> build self-play support and run a self-play A/B; below -7
+-> drop it. At 1,200 paired games `elo_se` is ~7-8, so a result near the boundary can be extended with the same seed
+schedule (`--sprt -7,7 --batch-games 600 --max-games 2400`, or `--target-se 5`).
+
+**Checks.** cargo test (zero_search 134, webnet 3): the golden records and matches unchanged with the setting off;
+the merge's tree and driver tests (docs/search.md 3.16). pytest `tests/test_infoset_merge.py` (4) and `-k "h2h or
+settings_seats or search_tree_api or tree_bindings or eval_tag or names"` (22). MTG Zero e098aff with this core
+(`ZERO_CORE_UNPINNED=1`): the engine digest f6543eb2b1b8752f unchanged, and the h2h command above end to end (2 paired
+games at 4 simulations on the CPU: the names and `merge` counters as stated).
+
+### 30.1 Self-play (`selfplay_infoset_merge`, 2026-11-04)
+
+**Why.** The evaluation-only h2h of 30 (one checkpoint on both sides, 2,400 paired games at the evaluation seat)
+came out **+9.3 +- 5.3 Elo** for the merged side - above the stop rule's +7, so (Fable's rule) self-play support and a
+self-play A/B. Training on merged searches changes the targets the network learns from: the 'cq' policy target and the
+root value q of a root whose subtrees no longer split the root decider's next information set by what the other seat
+was dealt. Whether the network learns better from them is the A/B's question, not this build's.
+
+**What it does.** `selfplay_infoset_merge` 0 | 1 (default 0): `Run.nn_seat(selfplay=True)` gives the self-play seat
+`infoset_merge=True`, every search of it merged (full, fast, minor). Needs `selfplay_leaf_value_view` 'root'
+(validated: `check_eval_settings`). What it composes with and why (the recorded targets, q, value-only samples and
+resignation read the root only; root noise, the belief, the evaluation cache, the playout cap, minor searches, reuse,
+rolling restarts, branched games and archive starts), the remote guard and what is refused: docs/search.md 3.16
+(Self-play). The leaf's row of the viewer comes from the merged tree's encoding (`Tree::leaf_obs`: one encode fewer
+per leaf, the same bytes). Metrics `selfplay.merge` (this machine's driver, only when on): `links`, `merged`,
+`aliases`, `growths`, `shared`, `merged_per_leaf`; an iteration whose leaves made no link logs a WARNING (a setting
+that did nothing). Remote self-play: a worker whose checkout does not report merging in its hello is REFUSED, killed
+and retried in 10 minutes (as 27's resignation); the remote's own counters are not in `selfplay.merge`.
+
+**Off by default.** 0: `Run.nn_seat` gives the seat dict of before, key for key (pytest), and the driver runs the path
+of before (the golden records and matches; `Tree::leaf_obs` is None).
+
+**Costs** (measured on MTG Zero's Delver mirror, CPU, docs/search.md 3.16 Self-play has the table): a merged
+self-play simulation sends **21.5% more network rows** (1.200 against 0.988: the same rows are needed, 1.49 a
+simulation, but the evaluation cache answers 0.29 instead of 0.50 - its repeats are merged away), so a GPU-bound
+self-play spends ~20% more evaluator time per game; the search threads' time per simulation was +33-42% on the loaded
+desktop (113 / 140 us against 85 / 99 us, min / median of 4). Encodes per simulation +19% with the tree's encoding
+reused for the leaf's viewer row (0.96 of 1.23 tree encodes), +83% without. Simulations per wall second with the
+network on the CPU: 723 against 1,008 (median).
+
+**The self-play A/B** (proposed; the main session's, on the GPU). As the three-arm A/B of 2026-11-04 (MTG Zero
+E:/mtg-zero-scratch/ab-ideas/RESULTS.md): one fork point K of the Delver line, the arms in turn, 40 generations each,
+both on the same checkout (MTG Zero `feat/infoset-selfplay`, which pins this core: off, the line's searches bit for
+bit), every other flag the line's, `eval_infoset_merge` 0 in both (the in-run Elo pools stay comparable).
+
+* *Arms:* control (the line) and ism (`selfplay_infoset_merge 1`; the line already has `selfplay_leaf_value_view`
+  root). The same games per generation (1,600): equal data, the ism arm slower per generation (above). Remote self-play
+  only if the Mac's checkout has this core (else its workers are REFUSED and the arm plays its quota locally); the
+  simplest symmetric choice is the same remote setting in both arms.
+* *Primary endpoint - what the network learned:* paired GPU h2h ism@K+40 vs control@K+40, 1,200 paired games (seed 0),
+  32 simulations, the evaluation seat, both sides UNMERGED (`--a-infoset-merge 0 --b-infoset-merge 0`); a readout at
+  K+20 likewise.
+* *Secondary:* the deployable pair, ism@K+40 merged vs control@K+40 unmerged (`--a-infoset-merge 1 --b-infoset-merge
+  0`; the evaluation-only +9 plus the training effect); both merged; the fresh-row value CE on the control's rows (the
+  neutral set) at K+37; the 'cq' targets' h_norm / max_share and the training entropy; `selfplay.merge` per
+  generation (merged_per_leaf, never the WARNING); min per generation, rows per second, the evaluator's busy share; the
+  blunder suite, fingerprints and canary at the usual generations.
+* *Stop rule:* at K+20 the primary below -14 Elo (~2 SE) -> stop the ism arm. At K+40: primary > +7 -> extend both
+  arms to K+80 and confirm with the same seed schedule (`--sprt -7,7 --batch-games 600 --max-games 2400`), adopt if it
+  holds; within +-7 -> do not adopt self-play merging (it costs ~20% of a generation's evaluator time for no measured
+  gain; the evaluation-only merge is decided on its own, e.g. by extending its h2h); below -7 -> drop it. (The last
+  A/B's lesson: 40 generations resolve only effects of ~+-15 Elo; the line gains ~+23 Elo per 200 generations.)
+
+**Checks.** cargo test 139 + webnet 3 (the golden digests unchanged) with the self-play driver tests of docs/search.md
+3.16; pytest `tests/test_infoset_merge.py` (8: settings, seats, bindings self-play, a rolling toy run with exact
+quotas and the metrics, remote workers merging, an older worker refused) and `tests/test_resign.py`,
+`tests/test_forks.py`, `tests/test_bindings.py` (37); MTG Zero `feat/infoset-selfplay` (its ENGINE.md 92): the engine
+digest f6543eb2b1b8752f, its optin-core and repin gates.
+
+## 31. Self-play's shards written on a thread of their own (`shard_writer_thread`; MTG Zero's Delver mirror, 2026-11-04)
+
+**Why.** One Python thread drives a self-play driver (`zero.infer.drive`: `next_batch` -> the evaluator -> `submit`)
+and, between batches, also handled the training samples: `take_samples` (a copy of every record into one dense
+float32 array - MTG Zero's rows are 37,620 floats, ~9 GB of shards a generation), `split_games`, `TargetStats`, and
+`ShardWriter.add`, whose every `shard_rows`-th add concatenated, cast to float16, checked and wrote an .npz shard
+synchronously. Meanwhile the network and the search threads waited. MTG Zero's thread benchmark on the GPU
+(E:/mtg-zero-scratch/ideas-3/bench_threads_ab.json: the Delver line's self-play seat and driver, 8 threads x 2
+groups, 768 games in flight, 640 games timed) did **13.7 games/s without the sample handling and 10.7 with the
+run's** (-22%); the evaluator's busy share fell 0.92 -> 0.71 (the live run's self-play phases show ~66-71%). Of
+the pump's 15.4 s of the caller's time in that configuration, 11.6 s were the shard writes and ~3 s `take_samples`'
+copy (the same take every 64 batches costs 2.3-3.0 s without any writing: 6-7% of the caller's time).
+
+**What it does** (`zero/shardthread.py`; docs/search.md 2.4 for the binding). With `shard_writer_thread` 1:
+
+* **The caller only takes.** `SearchDriver.take_records()` moves the driver's records out as they are (no copy:
+  a `SampleRecords`), `split_records` cuts them per finished game (the records move, as `split_games` slices a dict:
+  the shared queue's held games keep their records), and `ThreadedShardWriter.add` queues them. What stays on the
+  caller: `take_results` (the finished games' rows: the quota needs them now), the move, the split (moves in Rust),
+  the queueing. Measured below, per 1,000 rows.
+* **The writer thread** ('zero-shard-writer', one per self-play phase) converts each item - `SampleRecords.arrays()`
+  is `take_samples`' conversion (one function for both), built and the records freed off the GIL; the features cast
+  to float16, the dtype a dense shard stores (the same values: the same bytes; half the memory while the writer
+  buffers a shard) - runs the phase's tallies on it (`TargetStats`; the shared queue's staleness histogram), and
+  calls the wrapped `zero.data.ShardWriter`'s `add`, then its `close`, in the order the items came. Same records,
+  same order, same writer: **the shards are the synchronous writer's byte for byte** - rows, order, file names,
+  meta, quarantined `*.bad.npz`. `ShardWriter` itself is unchanged (wrapped, not edited; a writer that keeps its
+  rows' non-zeros - an attribute `sparse` true, as MTG Zero's parallel sparse-shards work proposes - gets the float32
+  rows and casts them itself).
+* **Bounded.** At most `shard_writer_queue_mb` MB of items wait (`SampleRecords.nbytes`: MTG ~150 KB a row; the
+  default 4096 holds ~27k MTG rows, more than the GPU's self-play makes while one 65,536-row shard is written);
+  when full, `add` blocks (counted: `waits`, `wait_s`), and an item larger than the bound passes alone. The writer
+  buffers at most a shard, in float16; the synchronous writer buffered it in float32 and concatenated it in float32
+  (a peak of ~2 float32 shards), so the threaded writer with its default queue stays within what the synchronous one
+  used.
+* **Errors** on the writer thread (`NonFinite` - the shard quarantined exactly as before -, an `OSError`) are
+  re-raised in the caller by its next `add` or by `close`: the exception itself, never lost; the run fails as it
+  did (state `aborted`, "run aborted: NonFinite: ..." in its log).
+* **Every shard on disk before training reads the window.** The phase's `close` waits for the queue, the last shard
+  (`ShardWriter.close`, on the writer thread) and the thread before self-play returns: this machine's phase end, the
+  shared queue's (its `samples` = what was written), so before `linger_start` (the local linger takes records and
+  holds them; the next phase's writer converts them) and before training. **PAUSE or an error mid-phase:**
+  `Run.selfplay` aborts the phase's writer first - it finishes the shard it is writing (completed and renamed: never
+  a half-written shard, nor its temporary file; the test fails without the abort) and drops the rest; the iteration
+  is replayed, as always (its data directory cleared). STOP is read between iterations: the phase closes normally.
+* **Remote workers** (`selfplay_remote`): a worker reads the setting from the run's config; with it, it takes
+  records and writes on a bounded `ThreadedShardWriter` instead of the unbounded `_BgWriter` (its shards were already
+  written on a thread: the take's copy and the bound are what change) and announces each shard with its games as
+  before. A worker on an older checkout ignores the setting: its shards are the same. An engine module built
+  before `take_records` (a checkout updated but not rebuilt) is refused with that reason, here and on a worker.
+
+**Metrics** (only with it on): `selfplay.shard_writer` = `samples_s` (the caller's seconds in its sample handling:
+taking the results and records, splitting, the quota's accounting, queueing, waits included), `waits` / `wait_s`
+(for room), `close_s` (the phase's end waiting for the last shard), `writer_s` (the writer thread's busy seconds),
+`items`, `rows`, `queue_peak_mb`, `queue_mb`, and a log line per iteration; `linger.samples_s` (the linger thread's
+take and split); `selfplay.remote.shard_writer` (the workers', summed).
+
+**Off by default.** 0: `take_samples`, `split_games` and the synchronous `ShardWriter` between batches (the remote's
+`_BgWriter`), exactly the loop of before; no new metrics key. Turn it on with `--shard-writer-thread 1` (and
+`--shard-writer-queue-mb N`). Although the shards stay byte-identical, **the caller's timing changes which games
+finish when** - a rolling driver's quota and the shared queue take the games that finished first - hence opt-in.
+Single-game runs: a co-training run is refused (its writers stay on the driving thread).
+
+**Costs.** One thread per phase: the conversion and the writes still take a core, now beside the search instead of
+between its batches (memory bandwidth, and the GIL in short pieces: numpy's casts, copies and CRCs release it,
+`np.savez`'s chunk copies do not). Memory: the queue's bound (4 GB by default) beside a shard's float16 buffer. The
+binding: `SearchDriver.take_records` and `SampleRecords` (additive; `take_samples` now frees its records off the GIL
+too - the same arrays).
+
+**Measured** (2026-11-04, the desktop's CPU only - the GPU is the live run's -, IDLE priority beside the live
+Delver run and other jobs: relative numbers). MTG Zero's thread bench with the 't' configurations added
+(E:/mtg-zero-scratch/shard-thread/bench_threads.py, bench_cpu.log / .json): gen 1000's self-play seat and driver
+(eval_cache 8192, sparse batches, the belief recorded), the network on the CPU, 48 games in flight, 4 threads x 2
+groups, the same seed in every configuration (the same 32 timed games, 2,849 rows, 3 shards of 1,024 rows), 'p' =
+the run's synchronous pump (take_results + take_samples after every batch, split_games, TargetStats, ShardWriter),
+'t' = this setting's (take_results + take_records, split_records, the queue), interleaved p, t, p, t:
+
+| the caller's seconds | p | t | p | t |
+|---|---|---|---|---|
+| take (take_results + take_samples / take_records) | 0.35 | 0.035 | 0.45 | 0.021 |
+| split per game | 0.002 | 0.002 | 0.004 | 0.002 |
+| add (the writes / the queueing) | 1.16 | 0.001 | 0.80 | 0.001 |
+| in the phase, per 1,000 rows | **529 ms** | **13 ms** | **442 ms** | **8 ms** |
+| close (the phase end: the last shard / the writer's drain) | 0.20 | 0.23 | 0.21 | 0.11 |
+| the writer thread's busy seconds | - | 1.54 | - | 0.94 |
+
+So the caller's share of the sample handling inside the phase fell ~40-55x: take_samples' copy alone was 120-160 us
+a row on this loaded machine (take_records + take_results: 7-12 us), the writes ~0.3-0.4 ms a row; the queue never
+filled (peak 20 MB). The phase end waits for the last shard in both (a training needs it). Games per second are not
+comparable on the CPU: the network there is the bottleneck (the caller's sample handling was < 1% of its time) and
+the load moved 0.14-0.21 games/s between configurations. On the GPU the same per-row costs were the 22% above (the
+caller's 15.4 s of 59.7 in 'p'); the GPU run (`CONFIGS=8x2,8x2p,8x2t,16x3,16x3p,16x3t bash
+E:/mtg-zero-scratch/shard-thread/bench_threads.sh`, the main session's) measures what it gives back.
+
+**Tests and checks** (`tests/test_shard_thread.py`, 17): `take_records` + `split` per game + `arrays()` =
+`take_samples` + `split_games`, array for array and dtype for dtype (and the binding's errors); the threaded writer's
+shards = the synchronous writer's byte for byte, file for file (per-game records and dicts, plain and compressed
+shards, the `on_write` calls, a queue bound smaller than an item so that every add waits); whole takes with
+`TargetStats` on the writer thread (the same summary); a writer keeping its rows' non-zeros gets float32 rows;
+`NonFinite` and an `OSError` re-raised in the caller (the same quarantined shard); a full queue blocks the caller and
+a writer error frees it; `abort` completes the shard being written; an iteration's shards with the setting off and on
+byte for byte (several shards; the same samples, games and target metrics; no writer thread left; no metrics key
+off); a rolling run's quotas exact; the shared queue with the remote 'local' and the local linger (quotas exact, the
+linger's held records counted one checkpoint stale, the workers' writer threads, every shard holding the rows its
+metrics report); PAUSE mid-phase with the writer inside a shard (exit 75, no temporary file - fails without the
+abort -, the resume replays and finishes); the loop's `NonFinite` from the writer thread; co-training refused. Off:
+the full pytest (383 passed, 9 skipped, with 16 of these; the 17th alone), cargo test 139 + webnet 3 (the golden
+records), and MTG Zero's gates (its ENGINE.md 93: `check_checkpoint_compat` byte identity - take_samples now goes
+through the shared conversion -, the engine digest, the other games built against this core).
+
+## 32. Sparse sample shards (`shard_sparse`; MTG Zero's Delver mirror, 2026-11-04)
+
+**Why.** A shard stored each row's features dense as float16: for MTG Zero's Delver line 37,620 floats (75 KB) a
+row, ~9.6 GB per generation (iteration 1289: 124,581 rows in two shards, 9,632 MB - the `bytes` of its self-play
+metrics), though a row has ~242 non-zeros (0.64%). The window has kept only the non-zeros in RAM since 10.8
+(`window_sparse`), so the dense files were overhead everywhere else: disk (E: has run short: a forked A/B arm needs
+~50 GB of shards of its own), the write on the run's caller thread (part of the 22% of self-play throughput lost to
+sample handling, MTG Zero's E:/mtg-zero-scratch/ideas-3/bench_threads_ab.json), RAM (the writer buffers the driver's
+float32 rows until a shard is full - 9.5 GB for a 65k-row MTG shard - then concatenates and casts them at the
+flush: a peak of ~20 GB), and the copies from the remote.
+
+**What** (zero/data.py, zero/finite.py; opt-in, the default the shards of before):
+
+* *The format* (version 1): the features as `x_ptr` int64 [N+1], `x_idx` uint16 [nnz] (int32 past 65,536 columns),
+  `x_val` float16 [nnz] instead of `x` - row r's non-zeros at `x_ptr[r]:x_ptr[r + 1]`, columns ascending, non-zero
+  decided on the float16 bits (a -0.0 is kept, a value whose float16 is +0.0 is not: the dense rows come back bit for
+  bit) - and in the meta `x_format` 'sparse', `x_version` 1, `x_cols` (the dense width), `x_nnz`. Every other array
+  (`player`, `n_players`, `opt_off`, `opt_action`, `pi`, `z`, `q`, `sc`, `net`, `aux`) is the dense shard's, in the
+  same order. A shard is sparse when it has `x_val`; a newer `x_version` is refused by every reader (ValueError
+  naming it). Plain or compressed npz as before (local plain, the remote's zlib 1).
+* *Writing.* `data.shard_format(cfg)` gives the meta keys that ask for it (`{'x_format': 'sparse'}`, `{}` off);
+  `write_shard` writes sparse when its meta asks, and a `ShardWriter` whose meta asks converts each added sample dict
+  as it arrives (`SparseRows.from_dense` of the driver's float32 rows: their non-zero bits, then those values cast)
+  and never holds or builds the dense rows - its buffer is the non-zeros and the other arrays. ShardWriter's
+  interface is unchanged (constructor, `add`, `close` and its `{'samples', 'bytes', 'shards'}`, `on_write`), so a
+  wrapper calling it on another thread works on either format; `bytes` is the files as written. The writers that
+  ask: the run's self-play (one-shot, rolling and the shared queue with a remote), co-training's two networks, and
+  a remote self-play worker (the run's settings reach it through its mirror's config.json; an older remote checkout
+  writes dense shards, accepted as any).
+* *Reading* - every reader takes both formats, and a window mixes them (the generations before the setting beside
+  the ones after):
+  * `read_shard(path)`: the arrays and meta, a sparse shard's features densified as `x` (all its rows - tools,
+    tests); `read_shard(path, dense=False)`: as stored (`x_ptr` / `x_idx` / `x_val`).
+  * `shard_features(path, rows, F)`: some rows of either, cut / zero-padded to F (a dense shard's read in place
+    when stored plain); `stored_rows(p, F)`: a sparse shard's SparseRows at a network width.
+  * `Window`: a dense window scatters a sparse shard's rows into its own (subsampled or whole, the cache too); a
+    sparse window (`window_sparse`, with or without the cache) takes the stored non-zeros as its SparseRows, cut to
+    the network's width, the column dtype `from_dense` would give - the same window either way, so `batch`,
+    `features_coo` (train_static's COO path), `batches` / prefetch, `WindowCache` and the budget (dense rows, from
+    the meta's `rows`) are unchanged.
+  * The non-finite guard (`finite.shard_problems`): a sparse shard's `x_val`, described by the rows and columns of
+    the dense rows (the same message); the writer quarantines a bad sparse shard as `*.bad.npz` in its format.
+  * `heldout` (Window, meta), `distill` / `tools/distill.py` (Window, meta), remote self-play's fetch check (the
+    arrays as stored: no 0.6 GB dense copy per arriving MTG shard) and its test helper `_corrupt` (keeps the
+    format), `bench --shard` (`shard_features`), `run.window_shards` and `shard_rows` (the meta), `fork_run` (hard
+    links / copies the files, never reads them).
+* `data.convert_shard(src, dst, sparse=True | False)`: one shard rewritten in the other format offline, every other
+  array as stored (a dense source read in place in chunks, never its dense rows in RAM): an old generation shrunk for
+  good, or a sparse shard made readable by an older checkout.
+
+**Off by default.** `shard_sparse` 0: the shards of before - the same arrays in the same order and the same meta (no
+`x_*` key; `compact` now builds its dict from `_compact_rest`, the same dict). On: `--shard-sparse 1` (or in a
+preset); it takes effect at the next self-play phase, and the window reads the dense generations already on disk
+beside the new sparse ones. Nothing about the samples, the window, the batches or the training changes.
+
+**Costs.** The conversion of each added sample dict on the writer's thread (~63 us a MTG row: 4.1 s for a 65k-row
+shard, spread over the phase) against the dense flush's concatenation, cast and 5 GB write. An older zero-core
+cannot read a sparse shard (KeyError 'x'): a fork onto an older pin, tools of pinned run worktrees and scripts that
+read the `x` member need `convert_shard(..., sparse=False)` or this reader (MTG Zero's readout scripts: its ENGINE.md
+94). The auxiliary targets stay dense: on MTG they are now 134 MB of the 200 MB shard (zlib 1 makes them 1.4 MB;
+the next candidate, not part of this setting).
+
+**Tests and checks** (pytest; the whole suite below):
+
+* `tests/test_net_data.py::test_sparse_shards_round_trip` - the same driver-format samples (float32, ~5% non-zero,
+  -0.0s, values whose float16 is +0.0 and -0.0, an all-zero row, value-only rows, auxiliary targets) through a dense
+  and a sparse ShardWriter, plain and compressed, two shards each: every array and the features bit for bit, the
+  meta plus the `x_*` keys, the writers' counts; the stored arrays (dtypes, ascending columns, -0.0 kept); the dense
+  shard's members and meta exactly those of before; `shard_rows`, `shard_features` (rows, slices, cut / padded);
+  `convert_shard` both ways equal to the writers' shards; an unknown `x_format` and a newer `x_version` refused by
+  every reader.
+* `test_sparse_shards_are_the_same_window` - windows over sparse shards and over a mix of dense and sparse ones are
+  the windows of the dense shards of the same samples (every array, the features bit for bit, the batches - COO too
+  -, the bytes and reuse): dense and sparse windows, narrower / wider networks, over budget, auxiliary targets with
+  one shard without, and both caches over sliding windows.
+* `tests/test_loop.py::test_shard_sparse_writes_the_same_samples` - a toy run's self-play (one-shot and rolling)
+  with the setting on writes the shards of the setting off, read back array for array, smaller; off, the dense
+  members and meta of before. `test_sparse_shards_train_the_same_network` - the smoke run's shards converted to
+  sparse, and a mix of dense and sparse generations, train the network of the dense shards weight for weight
+  (dense / sparse window, cache, prefetch, over budget). `test_loop_with_sparse_shards` - `--shard-sparse 1` end to
+  end.
+* `tests/test_nonfinite.py::test_sparse_shards_are_guarded_alike` - a float16 overflow quarantined with the dense
+  shard's message, the bad shard sparse; a NaN in a sparse shard refused by both windows, naming its row and column.
+* `tests/test_remoteplay.py::test_sparse_shards_from_both_machines` (the remote 'local' worker writes sparse shards,
+  each checked and counted on arrival; the steps follow both machines' samples) and
+  `test_nonfinite_remote_shard_is_quarantined[0|1]` (a damaged sparse remote shard quarantined).
+* `tests/test_measure.py::test_heldout_on_sparse_shards` (a held-out set made from sparse shards is the dense
+  shards' set; a sparse set gives the same losses) and `tests/test_distill.py::test_the_tool_reads_sparse_shards`
+  (`--compare` on sparse shards = on dense ones).
+* The whole suite on 3f830c5: 377 passed, 9 skipped (once standalone with one known timing flake in
+  `test_remoteplay.py::test_a_dying_worker_gives_its_accepted_games_back` that passed alone; once in MTG Zero's
+  optin-core gate with none). MTG Zero `feat/sparse-shards` (its ENGINE.md 94): its own test on Delver rows, the
+  optin-core gate (checkpoint_compat identical, the three other games built against this core) and the repin gate
+  (engine digest f6543eb2b1b8752f).
+* A test merge with `feat/shard-writer-thread` 57fd981 (the writer thread that wraps ShardWriter, section 31; `git
+  merge-tree`: no conflict): an iteration's toy self-play, one-shot and rolling, writes the same samples with
+  `shard_writer_thread` x `shard_sparse` in all four combinations, and both branches' shard tests pass on it. With
+  both on, the writer thread casts each dict's features to float16 before `add`, which then converts that (the same
+  non-zeros; `from_dense` would take the float32 rows directly).
+
+**Measured** (2026-11-04, the desktop beside the live Delver line, IDLE priority; MTG Zero's r3-2b-float550,
+iteration 1289's shards copied to E:/mtg-zero-scratch/sparse-shards/real, converted there, deleted after;
+measure.py / measure2.py / measure.json):
+
+| | dense | sparse |
+|---|---:|---:|
+| a local 65,566-row shard (the features 4,933 MB, `aux` 134 MB, the rest 2 MB) | 5,069 MB | **200 MB (25.3x)**: the features 63.9 MB (15.85 M non-zeros, 242 a row, 0.64%: 77x), `aux` 134 MB |
+| the same, zlib level 1 | - | 11.0 MB (461x; 3.4 s to convert against 3.1 s plain) |
+| a remote shard (the Mac's, zlib 1; 6,673-7,405 rows) | 6.8-7.6 MB | **1.11-1.25 MB (6.1x)** |
+| a generation (iteration 1289: 124,581 local + 21,450 remote rows) | 9,632 + 22 MB | ~380 + 3.6 MB |
+| writing (ShardWriter, the driver's float32 rows in dicts of 512 rows) | 0.32-0.38 ms a row at the flush (4,096 rows 1.31-1.47 s, 8,192 rows 3.12 s): ~21-25 s for a 65k-row shard | 4.1 s of `add` (the conversion) + 0.5 s at the flush for the 65,566-row shard: ~0.07 ms a row |
+| the writer's buffer before the flush / its peak (tracemalloc; 8,192 rows) | 1,187 / 2,533 MB (~9.5 / ~20 GB for 65k rows) | 39 / 163 MB (~0.3 GB for 65k rows: the float32 `aux` most of it) |
+| a remote shard written at zlib 1 (on the desktop) | 1.77-2.00 s | 0.44-0.56 s |
+| a shard into a sparse window (whole, the cache's way; 8 threads) | 1.77 s (read in place + converted) | 0.36 s (zlib 1: 0.53 s) |
+| 4,096 rows of it into a dense window | - | 0.46 s |
+| a remote shard read (`read_shard`, densified) | 0.79-0.93 s | 0.18-0.21 s |
+
+Every one of the 65,566 rows came back bit for bit (0 mismatched values over 2.47 G) with every other array equal;
+the ShardWriter's own sparse shard of those rows (from float32 dicts) was `convert_shard`'s, array for array; the
+remote shards' round trips too. (The timings are the loaded desktop's: the dense writer's full 65k-row flush could
+not run beside the live run - it needs ~20 GB - so its row is the 4,096- and 8,192-row flushes, linear in rows.)
+
+## 34. Remote self-play on several hosts, and hosts joining a live run (`selfplay_remote` lists, the `selfplay_remotes` file, `selfplay_local`; MTG Zero, 2026-11-05)
+
+### 34.1 Why
+
+Remote self-play (5.3) took one remote: a run's games came from this machine and the workers of ONE other machine
+(MTG Zero's MacBook). MTG Zero now rents GPU boxes (Vast.ai) by the hour to self-play beside it: several at once,
+each started and destroyed while the run trains, sometimes a second GPU of one box as a host of its own. The shared
+queue (`zero/workqueue.py`) already modelled any number of consumers; what was single was `RemotePlay`: one spec,
+one transport, one mirror, one set of `procs` sessions. And a run whose machine trains on its GPU wants the GPU for
+training alone - an actor / learner split - while never stalling when every actor is gone.
+
+### 34.2 What it does (zero/remoteplay.py, zero/remote.py)
+
+* **A list of remotes.** `selfplay_remote` is a comma-separated list of remote names. **One name behaves exactly as
+  before** (5.3: the consumers 'w0'..'w{procs-1}', the metrics, log lines, progress.json and the rates' restore of
+  before - 34.5). With 2+ names every host is a `Host` of `RemotePlay`: its spec, transport, mirror (`<its selfplay
+  workdir>/<run name>` on its machine), env, overrides, locks, niceness and back-off; its own `procs` worker
+  sessions (its spec's `selfplay.procs`, or `selfplay_remote_procs` when > 0, per host); its own checkpoint shipping,
+  failure counting, retries and refusals. Its consumers in the shared queue are `<name>/w<k>` ('mac/w0',
+  'vast:w1/w0'), all in the one quota / `Shares` model exactly as one remote's workers are (each bootstraps as an
+  unmeasured remote, `workqueue.BOOT`). Each host's workers are managed on a thread of its own (their starts over
+  ssh, the mirror, the checkpoint's copy, `phase` / `cap` / pings), so a slow or unreachable host never holds up
+  the others or the caps, which the shared manager thread recomputes every 0.25 s (one remote: the one manager
+  thread does both, as before). The fetch threads serve every host (one per worker of all hosts, at least
+  two; a fetch uses its session's host's transport). `selfplay_remote_wait`, `_inflight`, `_batch`,
+  `_batch_inflight`, `_linger`, `_giveback`, `_overdue`, `_timeout` keep their meaning, applied to every host's
+  workers (a host's workers are batch-bound by its own `overrides.infer_device`).
+* **Each host's shards and seeds.** With a list a host's shards arrive in `data/iter_i/` as
+  `<tag>-m<KK>-<sid>_SSS.npz` (`tag`: its name with every character but letters, digits, '.', '_', '-' as '_':
+  'vast_w1-m00-3fa2_000.npz'), so two hosts' workers K never write one name, and their meta carries `remote` (the
+  host's name). Its mirror's `selfplay.json` carries `remote` and `seed_salt` (crc32 of the name x 104,729): a
+  worker's driver seed is the one of 5.3 plus the salt, so two hosts' workers K started in the same iteration play
+  other games. One remote: neither key, its seeds and shard names as before.
+* **One machine, two hosts.** Several hosts may be one machine - host 'local' twice with a different `env` (a second
+  GPU: `{'host': 'local', 'env': {'CUDA_VISIBLE_DEVICES': '1'}, 'selfplay': {'workdir': '/root/mtgz-gpu1', ...}}`).
+  Each needs a selfplay workdir of its own: the worker slots (`<mirror>/.wKK.lock`) and busy markers
+  (`<workdir>/.busy-<mirror>-wKK`) live there. A host whose (host, selfplay workdir) is another host's is **not
+  added** (logged `remote self-play <name>: not added: its mirror ... is '<other>''s ...; retried at the next
+  phase`): it would take the other's worker slots. Two spellings of one ssh host are not detected. The remote's
+  evaluation lock (`<its workdir>/.eval.lock`, 5.2) is the spec's `workdir`, as before - two hosts of one machine may
+  share it. `$ZERO_SELFPLAY_WORKDIR` (5.3) still overrides every host's workdir: with two local hosts it makes them
+  one mirror (the second refused).
+* **Parametrised names** (`remote.remote_spec`, also `eval_remote`'s): a name that is not in `GamePackage.remotes`
+  and has a ':' is looked up as `remotes[<prefix> + ':']` (the prefix: up to the first ':'); when that entry is
+  callable it is called with the rest of the name, and its result (a dict, or a Mapping that resolves then, like
+  MTG Zero's `RunCommitRemote`) is the spec: `remotes={'vast:': lambda box: RunCommitRemote(..., host=f'mtgz-{box}')}`
+  makes 'vast:w1', 'vast:w2', ... remotes. It is called every time the name is resolved: the run's start, and every
+  phase start while the host is listed but not resolved (34.3). A name with no such entry, or one that is not
+  callable, is the SystemExit of before (`not in the game package remotes`). `remote.known_remote(name)` tells
+  without resolving (co-training's settings check uses it).
+
+### 34.3 Hosts joining and leaving a live run: the `selfplay_remotes` file
+
+* **The file.** `<run>/selfplay_remotes`: plain text, one remote name per line, '#' starts a comment, blank lines and
+  repeats ignored. When it exists it **replaces the setting's list**, and it is re-read at the start of every
+  self-play phase (`RemotePlay.begin`'s first call for an iteration: right after checkpoint i-1 is written - the
+  remotes' early phase, 5.3 - or this machine's phase when there is none), so a change applies from the next
+  iteration whose phase has not begun: written once metrics row k exists, from iteration k + 2. Write it atomically
+  (a temporary file, then rename): a half-written file read at that moment lists fewer hosts for one iteration. A
+  file that cannot be read keeps the hosts as they are (logged). **The file alone turns remote self-play on**: a run
+  whose `selfplay_remote` is '' and whose directory holds the file when it starts (an empty one is enough) plays the
+  shared queue (5.3) with the file's hosts. A run started with neither does not pick up a file written later (its
+  self-play is not the shared queue's: restart it - PAUSE and resume, section 2 - after writing the file). The file
+  removed, the setting decides again ('' = this machine alone, the shared queue still in use). With the file in use
+  the run names its hosts as a list does ('<name>/w<k>', `selfplay.remotes`), whatever their number.
+* **Every change is logged**: `remote self-play: hosts now [mac, vast:w1] (+vast:w1)`, `... hosts now [] (-mac):
+  this machine plays alone`.
+* **A host newly listed** (at a phase start; the hosts listed when the run starts resolve then, on its main
+  thread): its spec resolves on a thread (the main thread never waits for it: a `RunCommitRemote` check over ssh); a failure - an unknown name, a callable that raises, a Mapping whose checks fail - is logged
+  (`remote self-play <name>: not added (<error>); retried at the next phase`) and retried at every phase start while
+  it is listed; the run never stops for it. Once resolved it joins (`remote self-play <name>: added (host, N
+  worker(s), mirror ...)`): its consumers enter the queue (a rate restored at the run's start if its consumers had
+  one, else the bootstrap share), its mirror is prepared and its sessions start with the manager's next tick, and
+  its workers take their part of the phase that is open, if any - from their `phase` line on, as a restarted
+  worker's do.
+* **A host no longer listed** is removed at a phase start, so no phase of it is open (5.3's phases are sent by the
+  manager after `begin` opens them, and the previous one was closed by `end`). Its consumers leave the queue at once
+  (no cap, no share: the others' shares grow at once); the games its workers hold (finished beyond the last quota)
+  or play are **never accepted** - the quota never counted them, so there is nothing to give back and nothing is
+  counted twice; its sessions quit at once (`quit`, stdin closed, killed after 10 s; logged `remote self-play
+  <name>: removed: its N worker(s) quit; the games they hold or play are not counted`). There is nothing left for
+  them to do, so this is the simpler of the two choices (giving their games back as a dying worker's are, 5.3, or
+  letting them finish into an open phase): neither applies to a host that has no open phase. Its shards of the
+  phase before were fetched or dropped by that phase's `end` (today's rules: `late`, `late_prev`). A host listed
+  again later is a new host (its spec resolved again, its mirror prepared again).
+* **An empty list** (an empty file, or every host removed): this machine plays the quota alone, as when every
+  worker is offline (5.3) - not an error; `selfplay.remote` then counts no worker and waits for nothing.
+* **One remote <-> a list** (the file written in a run of one remote, or removed again): the hosts' consumers are
+  renamed in place ('w0' <-> 'mac/w0'), their rates kept. A restart restores the last row's rates the same way: with
+  one remote a row's '<name>/w<k>' are its 'w<k>' (other hosts' are dropped), with a list a row's 'w<k>' are
+  `<the setting's one name>/w<k>`, and a host not resolved yet gets its consumers' rates when it joins.
+
+### 34.4 This machine's share: `selfplay_local`
+
+`selfplay_local` 0 (default 1: every phase this machine takes its share, as before): while at least one remote worker
+takes work (alive, its hello received, not backing off - the shared queue's active consumers), this machine's
+driver is no consumer (its cap 0: it starts no games; the games it has in flight finish and count, and its held
+games count first in the next iteration, as always) - the run's machine only trains, its GPU never shared between
+training and self-play. When no worker takes work (all offline, backing off, refused, not up yet, or no host
+listed) it is a consumer again and plays the quota itself, so the run never stalls. The switch is logged both ways
+(`remote self-play: this machine takes no games now (2 remote worker(s) take the queue; selfplay_local 0)` / `...
+this machine plays again (no remote worker takes work; selfplay_local 0)`). A phase it sat out entirely measures
+nothing (its rate is kept for when it plays again). `selfplay_local_linger` takes its cap, so it plays nothing while
+this machine is off. Single-game runs (co-training: refused, `resolver_cfg`'s too); a run without remote self-play
+plays here whatever it says.
+
+### 34.5 Metrics, progress, log; what stays as before
+
+* **`selfplay.remote`** stays the remotes' aggregate in today's format (5.3): sums over every host's workers, `host`
+  = the list of the hosts' names (one remote: its name, as before), `procs` / `workers` summed, `caps` every
+  consumer's. **`selfplay.remotes`** = `{name: that host's record in the same format}` (`host` its name, `caps` its
+  consumers'; its own `late` / `late_prev`, `lost`, `session_errors`, its tallies of the league / forks /
+  resignation) - only with a list or the file. `selfplay.queue` is unchanged (its consumers named '<name>/w<k>').
+  progress.json: `remote` aggregated as before, and with a list `remotes` = `{name: {host, workers, state, games,
+  in_flight, samples, shards, caps, held}}` (co-training: inside `matches_remote`). The log adds a line per host after
+  the aggregate's: `iter N remote self-play mac: 2 worker(s), 812 games, ...`; at the start `self-play also on the
+  remotes of selfplay_remote 'mac,vast:w1': 'mac' (user@mac, 2 worker(s), mirror ...), 'vast:w1' (...): 800 games
+  per iteration in total, ...` (`of the file <path>` when the file decides).
+* **One name, exactly as before**: the same consumers, metrics keys, log lines (the start line, `iter N remote
+  self-play: ...`, `iter N shared queue: ...`, `remote self-play <name>: worker 0 up ...`), progress.json and rates'
+  restore, shard names and mirror files (no `remote` / `seed_salt`), seeds; an unknown name is the SystemExit of
+  before at the start. Checked against the code before (d499716): the same toy run (test_remoteplay's settings, 3
+  iterations, the remote 'local') - its 163 metrics key paths identical, and its remote / queue / worker log lines
+  identical with the numbers masked; `tests/test_multi_remote.py::test_one_remote_is_exactly_as_before` keeps the
+  record's and the queue's key sets of before and the line formats. A run without remote self-play (no setting, no
+  file) never builds a `RemotePlay`: nothing changes (one `os.path.exists` at its start).
+* **Co-training** (`resolver_cfg['selfplay_remote']`, 11.6): the list works the same way (the resolver's episodes on
+  every host, consumers '<name>/w<k>', `remotes` in the resolver's metrics); the file is refused there at the start
+  (`<run>/selfplay_remotes` or `<run>/resolver/selfplay_remotes`: SystemExit) - a co-training run's hosts are its
+  setting's.
+* **Settings checked at the start** that ask for `selfplay_remote` (`selfplay_local_linger`; `selfplay_branch`
+  without `rolling`) read the setting, not the file: with the file alone, set `selfplay_remote` too (any of its
+  hosts: the file replaces the list).
+
+### 34.6 For the game repos (MTG Zero)
+
+A parametrised entry `remotes['vast:'] = fn` is called with the name's rest at every resolution (the run's start,
+then each phase start while the host is listed and not resolved); its result is read with `dict(**spec)` then (a
+Mapping's checks run then: at the run's start on its main thread, as for one remote - a host that fails there is
+logged and retried, never fatal, with a list -, later on a thread of its own, so a slow check never holds up the
+run). Before a host is listed its machine needs
+what one remote needs (5.2, 5.3): ssh in BatchMode to `host` (its key), `repo` at the run's code with `python`
+able to run `python -m <pkg>.az.remote selfplay MIRROR K`, and an absolute selfplay `workdir` it may create (the run
+makes the mirror, writes its config.json / selfplay.json and ships the checkpoint itself). A host's workers are its
+spec's `selfplay.procs` (or `selfplay_remote_procs`), its overrides its own (a GPU box: `infer_device` 'cuda',
+batch-bound under `selfplay_remote_batch` 'auto'). To add a rented box: write `<run>/selfplay_remotes` with every host
+the run should use (the box's name among them); to drop it before destroying it, rewrite the file without it and
+wait for the log's `removed` line (its workers quit at the next phase start; the run never waits for a dead box
+anyway - its worker's session fails and is retried, 5.3). A worker of an older checkout ignores `seed_salt` (two
+such hosts' workers K started in one iteration would play the same games): every host runs the run's commit.
+
+### 34.7 Costs, tests, measured
+
+**Costs**: none for one remote or none (34.5). With a list, per host one ssh session per worker, one mirror and one
+checkpoint copy per phase, as a remote of its own, and a manager thread; one thread per newly listed host while it
+resolves.
+
+**Tests** (`tests/test_multi_remote.py`, every host a 'local' one with a selfplay workdir of its own): two hosts share
+an iteration's quota exactly (every iteration 600 = this machine's + 'a/w0' + 'b/w0'; their shards in data/iter_i/
+under '<tag>-' names with `remote` in their meta, each host's samples and shards adding up to the aggregate's; each
+host's env in its workers - `ZERO_RSP_TEST`'s `echo_env`, the worker's log; distinct seed salts; no worker left); a
+second name for one machine and workdir refused, the run going on; the file (alone, the setting empty) at [a], b
+added after row 2 (playing from iteration 4-5), a removed after row 4 (none of its games from iteration 6, every
+iteration exactly 600, its worker gone), emptied after row 6 (iteration 8 all this machine's, nothing waited for),
+every change logged, progress.json's `remotes`; parametrised names ('vast:x') and hosts that fail (a callable that
+raises, a Mapping whose checks fail, no such remote: logged at the start and at every phase start, the run going
+on); one remote exactly as before; `selfplay_local` 0 (the file [a, b]: iteration 5's 600 games all the hosts', this
+machine's cap 0; the file emptied, iteration 6's all this machine's; both switches logged) and its check; a
+co-training resolver on two hosts (and the file refused there); the units: `remote_spec`'s parametrised names,
+`known_remote`, the file's format, `Shares.rename` / `drop`. `tests/test_remoteplay.py`, `tests/test_workqueue.py`
+and `tests/test_cotrain.py` unchanged and passing; the whole suite and the checks in 34.8.
+
+**Measured** (the toy, desktop 2026-11-05, every host a worker process on the same CPU; 600 games an iteration,
+64 slots each, test_remoteplay's `TOY`): with [a] the worker took 351-384 of the 600 games (this machine 216-249); b
+added for iteration 4 was up 2 s into it (0 games) and took 184 in iteration 5 beside a's 336 (this machine 80); a
+removed, b took 407 and 434 (this machine 193, 166); the file emptied, this machine played all 600; every iteration
+exact, no shard late. `selfplay_local` 0 with [a, b]: iteration 1 this machine 511 (the workers came up during it),
+iterations 2-5 none - a 296-313, b 287-304 - its rate kept at its iteration-1 measurement; emptied, this machine all
+600 again. Rows within one checkpoint throughout (mean lag 0.05-0.12).
+
+### 34.8 Checks (desktop, 2026-11-05)
+
+* **One remote, against the code before** (d499716, the same toy run - test_remoteplay's settings, 3 iterations,
+  `--selfplay-remote local`): the 163 key paths of its metrics rows identical, and its remote / shared-queue /
+  worker log lines identical with the numbers masked.
+* **No remote**: `tools/check_checkpoint_compat.py --old <d499716> --new <this> --package zero --net random --game toy`
+  identical (visits 169 samples, records b1b86b689ab98313; cq d02691e9e005a5d5; vs random 3.0/16), and a plain
+  `toy-smoke` run (2 iterations, `--threads 1`) gives the same shards and checkpoints bit for bit as d499716's (and as a
+  second run of d499716: the run is deterministic).
+* **The whole suite** (415 tests): 408 passed in one run on a desktop held at 100% of its 32 cores by other projects'
+  jobs; the 7 others - six `eval_remote` tests whose evaluation subprocess took 119-212 s an evaluation (toy: ~2 s)
+  and hit their timeouts, and `test_token_graphs::test_absent_slots_are_never_read` (CUDA eager against eager, 3e-8
+  at tolerance 0, the GPU shared with live runs) - passed rerun alone; none touches what changed. An earlier run of
+  `test_remoteplay.py` + `test_workqueue.py` beside the multi-host tests had two timing failures
+  (`test_caps_follow_...`, `test_a_dying_worker_...`: the worker's death seen after the phase closed, its 30 games
+  short), both passing alone and in the whole suite (AGENTS.md's caveat). `tests/test_multi_remote.py` (12) passed
+  in the loaded whole-suite run as well.
+* **The games build against this core**: `SKIP_CORE=1 SMOKE_TARGET=multi-remote bash tools/smoke_all.sh
+  --with-this-core --build-only` GREEN, games: 3 of 3 checked (glassroad-zero, caverna-zero, kingdombuilder-zero; no
+  Rust change).
+
+## 36. Readers: a branch that reads declared inputs, predicts an auxiliary target and feeds the trunk (`reader_<target>`; MTG Zero's Edge of Eternities sealed, 2026-11-09)
+
+(Sections 33 and 35 are taken by open branches: `feat/explore2`, `feat/amcts-exploiter`, `feat/quiet-value`.)
+
+### 36.1 Why
+
+MTG Zero moves from the Legacy Delver mirror, where the opponent's decklist was known, to Edge of Eternities
+sealed, where it is not: the network has to predict the opponent's unseen deck, "both as a network head and an
+input, similar to how we architected the hand-reading" (the user, 2026-11-09). Hand-reading today is section 15's
+auxiliary head - an MLP on the trunk's pooled state trained against the true hand - used by the search's weighted
+deals (section 18). That head reads the trunk's OUTPUT, so feeding its prediction back as an input would be circular.
+A reader is a separate branch that reads only declared raw inputs (in MTG: the bags of cards the opponent has shown,
+a few globals), predicts the target, trains like an auxiliary head, and is also fed into the trunk - all in one
+forward pass. The core part is generic: any game may declare one per auxiliary target.
+
+### 36.2 What it does
+
+* **The declaration** (the game package's `readers`, zero/package.py): `{game: [{target, inputs, hidden, enter,
+  belief}, ...]}` - `target` one of the game's auxiliary targets (section 15: its width and loss come from there),
+  `inputs` ranges `[[offset, count], ...]` of the flat feature vector (in input order; each feature once), `hidden`
+  the MLP's width (default 64), `enter` 'trunk' (the default: the prediction is an input of the trunk) or 'none' (an
+  auxiliary output only), `belief` (default false; 36.5). `GamePackage.readers_of(game)` completes and checks them
+  (`net.reader_layout`: the normal form stored in the checkpoint config under `readers`). **A token network's reader
+  reads its flat part**: the bags and the globals, every feature outside the segments (a reader on a segment's floats
+  is refused at build: the CUDA graphs' host copy leaves an absent slot's floats stale, 10.6, and the floats of the
+  tokens are the attention's business). MTG's shown cards arrive as bags, its turn and life totals as globals.
+* **The run setting** `reader_<target>` (one per declared reader, default 0; the toy's `reader_next_card`): 1 = the
+  run's networks have the reader. It needs `aux_<target>_w` > 0 - that weight's loss is what trains it, and only
+  then does self-play record the target (refused at start otherwise). `reader_detach` (default 1, 36.4).
+* **The branch** (zero/net.py `Reader`): an MLP inputs -> hidden -> the target's width (ReLU; its last layer zero, so
+  it first predicts what its loss predicts from zeros: uniform for 'multinomial'), its prediction = the target's
+  `aux_predict` (a softmax for 'multinomial', exp for 'poisson', as is for 'mse'), and with enter 'trunk' a
+  projection width -> the trunk's width at its input point, **zero-initialised**, whose output is added there:
+  `Net` - the first layer's input (`inp(x) + proj(p)`, before its ReLU); `GridNet` - the globals' embedding (which
+  biases the stem, every block and the pooled trunk); `TokenNet` - the global token's input (beside the globals' map
+  and the bags' pools, before its position embedding). Built after every other parameter, the auxiliary head
+  included: a network with a reader initialises the rest exactly as one without (the new run's first network).
+* **One forward pass**: every forward computes the readers (they feed the trunk); `forward(x, n, aux=True)` returns as
+  its fourth output the head's raw outputs followed by each reader's (width W + the readers' widths), so the code that
+  reads the head (`aux_predict`, `AUX.losses` by the layout's columns) is unchanged. `forward_static` (the token
+  network's CUDA graphs and static training) computes them the same way.
+* **Training** (`run.train_model`): each reader's target loss on its own outputs (section 15's losses, the rows with
+  targets, the same masks and windows), times `aux_<target>_w`, added to the loss; recording, windows and shards
+  unchanged. Metrics `train.reader_<target>`, `reader_<target>_hit`, `train.readers` {targets, detach, added}; the
+  non-finite guard checks the reader losses. The optimizer has a third parameter group for the readers (trunk, head,
+  readers).
+* **Beside the pooled-state head**: a run with a reader always has section 15's head too (the head covers every
+  target of the game once any weight is on), and both train against the reader's target with the same weight. They
+  are two estimates of one label: the reader's from the declared inputs alone (a "public prior", cheap, an input of
+  the trunk), the head's from the trunk's pooled state, which reads the reader's prediction among everything else (it
+  can refine it: in MTG, play patterns). Another target (MTG's hand) keeps its head as before.
+
+### 36.3 Off by default; refusals
+
+Every `reader_<target>` 0 (the default): no network has a reader (`make_net` / `build` get no `readers`), the
+forward, the optimizer (`AdamW(model.parameters())`, or the two groups of section 15) and the losses are the code of
+before; config.json gains `reader_<target>` and `reader_detach`. Checked byte for byte (36.6). A reader never
+disappears in silence:
+
+* a checkpoint with a reader in a run that turns it off, or with another reader than the declaration's, is refused at
+  the run's first training (SystemExit: a reader is part of the trunk's input; removing it changes the network);
+* `NetEvaluator.set_weights` refuses a state with a reader into a network without one (and the reverse);
+  `NetEvaluator.set_network(model)` - the rolling, remote-worker and co-training evaluators' call - takes the new
+  network itself (its CUDA graphs rebuilt) when its readers differ, so a rolling run whose reader was just added
+  evaluates with it;
+* distillation from or into a network with readers (`distill.new_student`, `distill.distill`) and the browser export
+  (`zero.webexport`) are refused (not built yet);
+* a remote worker on an older checkout cannot build such a checkpoint (its constructors do not know `readers`): it
+  fails loudly at load, as for any config key it does not know.
+
+### 36.4 The gradient: `reader_detach` (default 1)
+
+With 1 the prediction enters the trunk detached: only the target's loss trains the reader, and the trunk's losses
+train the projection (from zero) and the trunk. With 0 the policy / value / margin losses reach the reader through the
+projection as well. Measured on the toy (36.7: four networks from one seed on the same batches): the detached and
+undetached readers' held-out next_card losses agree within 1e-3 at every point (after 3,000 steps 0.4638 both with
+seed 0, 0.4654 both with seed 1; a reader not fed into the trunk at all the same), and policy / value differ by less
+than between the seeds - the trunk's gradient through a projection that starts at zero
+is tiny next to the target's own loss. The default is 1: no evidence for the extra coupling, and a detached reader stays
+an estimate of its target alone (its loss is a calibrated measure, its prediction what a search's belief, 36.5, or a
+determinization may deal from), not a feature the trunk's losses may bend. `reader_detach 0` is the A/B arm should a
+game's evidence differ (MTG's deck: 36.9).
+
+### 36.5 Inference: every path computes it; the search can take its prediction
+
+The reader is part of the network's forward, so every evaluation path computes it with no code of its own: eager
+`NetEvaluator.evaluate` (any `workers`, `max_rows` pieces), the token network's CUDA graphs (`forward_static`; dense,
+sparse and belief-row batches), the conv network's graphs (`_fold` copies the readers), h2h, replays, the league's,
+remote evaluation and remote self-play workers (their checkpoints rebuild it from the config). Where a path cannot,
+it is refused (36.3). `NetEvaluator.reader(x, n)` -> {target: predictions} is the readers' API (as `aux` is the
+head's). **The search's root belief rows** (section 18) and `NetEvaluator.aux` answer the head's prediction by default;
+a reader declared `belief: true` answers its target's columns instead (`net.aux_answer`: the same row of the same
+forward, so a search dealing the opponent's deck by its prediction pays nothing more). With no reader the answer is
+`aux_predict` of the head, as before.
+
+### 36.6 Carry-over and checks
+
+**Carry-over**: `net.add_reader(model, readers, seed)` returns a copy with fresh readers (seeded; the global RNG
+untouched) and every other parameter and buffer exactly the checkpoint's; since a reader's last layer and its
+projection are zero, every output - policy, value, margin, the head's - is unchanged (tested on the three archs,
+equal tensors). The run does it itself: a fork of a run without the reader, `tools/fork_run.py --source <run> --dest
+<fork> --iter K --set reader_next_card=1`, adds it at its first training (logged; `train.readers.added`), keeps the
+AdamW moments of the trunk and the head (the saved groups load, the readers join as a new group) and trains on the
+window as it is (the targets were recorded already). `net.widen` carries a reader across a token layout change (its
+inputs moved to where `token_feature_map` put them: the same floats, the same first-layer columns); a declaration that
+reads MORE inputs after a layout change is refused (36.3), not widened (left for when it is needed). A reader for a
+target that a widened head gained (section 37) is added the same way, at the same first training.
+
+**Tests** (`tests/test_reader.py`, 20; one CUDA): the declarations' checks; built last (every other tensor equal, the
+outputs equal, the readers' columns zero); `add_reader` exact on the three archs, the RNG untouched, `add_aux` before
+or after it the same network and head, `strip_aux` keeps it; the prediction reaches the trunk and reads only its inputs, belief rows'
+rows; `reader_detach` stops only the reader's trunk gradient; the token network's static forward and a widen across
+test_net_data's layout change; a checkpoint through the encoding guard; the package and the settings; the evaluators
+(the trunk reads it, `reader`, `aux` and belief rows with and without `belief`, `set_weights` refusing, `set_network`);
+the refusals (distillation, web export); toy runs with the reader (tokens; static training, undetached), refused
+without its weight; a rolling fork that adds it (exactly; optimizer moments kept; the rolling evaluator takes the new
+network) and a fork that turns it off (refused); the settings at their defaults byte for byte; the CUDA graphs
+(token dense, sparse, belief rows; conv) answering what eager answers.
+
+### 36.7 Measured on the toy (desktop, 2026-11-09, CPU, other projects' jobs on the machine)
+
+The toy's reader: `next_card` from the round (features 0-5) and the revealed round cards (25-30; the token layout's
+bag 'cards'), hidden 32 - the public information that determines the best prediction (uniform over the next round's
+stage's unrevealed cards). `tools/reader_measure.py learn` on a toy run's shards (8 iterations of 600 games, 16
+simulations, `aux_next_card_w` 0.5; 29,885 training rows, the last iteration's 3,967 held out, 3,209 with a target):
+token networks 64 x 2 from seed 0 and 1 on the same batches (256 rows, lr 1e-3, 3,000 steps), held-out next_card loss
+in nats against the uniform prior ln 6 = 1.792 and the best from public information 0.462:
+
+| arm (seed 0 / seed 1) | reader, 500 steps | reader, 1,000 | reader, 3,000 | head, 3,000 | policy, 1,000 | value, 1,000 | policy, 3,000 | value, 3,000 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| head only (no reader) | - | - | - | 0.477 / 0.491 | 1.591 / 1.587 | 0.573 / 0.589 | 1.588 / 1.574 | 0.609 / 0.624 |
+| reader, detached (`reader_detach` 1) | 0.513 / 0.508 | 0.474 / 0.474 | 0.464 / 0.465 | 0.470 / 0.480 | 1.590 / 1.588 | 0.572 / 0.584 | 1.586 / 1.578 | 0.615 / 0.635 |
+| reader, not detached (0) | 0.513 / 0.509 | 0.474 / 0.474 | 0.464 / 0.465 | 0.479 / 0.478 | 1.591 / 1.587 | 0.573 / 0.585 | 1.590 / 1.574 | 0.616 / 0.618 |
+| reader, enter 'none' (not fed) | 0.513 / 0.508 | 0.474 / 0.474 | 0.464 / 0.465 | 0.475 / 0.485 | 1.590 / 1.587 | 0.575 / 0.587 | 1.586 / 1.582 | 0.608 / 0.629 |
+
+The reader learns the target: 1.792 (uniform, its first prediction) -> 0.464 / 0.465, within 0.003 of the best
+any predictor can do from public information (0.462). Detached, not detached and not fed at all, its loss agrees to
+1e-3 at every point: the trunk's losses barely reach it through a projection that starts at zero. The value loss
+rises from 1,000 to 3,000 steps in every arm (the 30k-row window overfits), and policy / value differ between the arms
+by less than between the seeds.
+
+In the run loop (the same settings with `--reader-next-card 1 --arch tokens`, 8 iterations): the reader's training
+loss 1.655, 1.294, 0.966, 0.761, 0.648, 0.583, 0.560, 0.532 (iterations 1-8, ~60 steps each), the head's 1.248 ->
+0.494. On the toy the trunk reads the same features directly, so the head learns as fast and policy / value gain
+nothing measurable from the reader: the toy proves the mechanism (it learns, it carries over exactly, it changes
+nothing when off), not a strength gain - that is MTG's A/B (36.9).
+
+**Byte identity** against e4779b2 (its own worktree and target dir, `ZERO_INFLIGHT=1`, CPU), the reader settings
+left out and given at their defaults: toy-smoke MLP against `ext:toyheur`, tokens (3 iterations), rolling cq targets +
+`eval_select cq` guard 2 (3), tokens + `aux_next_card_w` 0.5 rolling (3), the Delver line's shape (tokens, rolling,
+cq, guard 4, value_q 0.6, window_cache, train_prefetch, margin_w 0.2, chance_k 2, no random games; 4), and a fork that
+adds the auxiliary head (the optimizer groups' code the readers generalised; each checkout's own fork_run) - every
+shard, checkpoint, optimizer state, Elo file and metric (timings aside) identical, config.json = the base's +
+`reader_next_card`, `reader_detach`; `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy MLP,
+a toy token and a toy token-with-head checkpoint) identical.
+
+**Checks** (tier "opt-in core feature with byte-identical defaults"; desktop 2026-11-09): `cargo test --release
+--workspace` 140 + 3 passed (no Rust change); `pytest tests` (CUDA hidden) 423 passed, 10 skipped, 2 failed under the
+load of this section's measurements running beside it (`test_encoding_guard::test_remote_selfplay_worker_refuses_and_
+the_run_plays_on`: the run took 4 min where it takes 20 s, the refusal not yet logged; `test_remoteplay::test_a_dying_
+worker_gives_its_accepted_games_back`: AGENTS.md's timing caveat) - both pass alone, and `test_remoteplay.py` +
+`test_encoding_guard.py` + `test_multi_remote.py` pass whole (57); with the GPU visible, `test_reader`'s CUDA test
+passes and `test_token_graphs` 9 of 10 (`test_graphs_match_eager_and_follow_new_weights`: 3.7e-5 against its 2e-5
+tolerance, the same on e4779b2: the shared GPU's rounding, not this change). `SKIP_CORE=1 bash tools/smoke_all.sh
+--with-this-core --build-only`: Glass Road Zero, Caverna Zero, Kingdom Builder Zero build against it (3 of 3); MTG
+Zero (`eoe-f7-numbers` at 026ebd4, which pins e4779b2) could not be moved by smoke_all (its scratch worktree's
+`submodule update` cannot fetch the unpushed pin), so by hand: a scratch worktree of 026ebd4 with this core (7e54b79)
+in `third_party/zero-core`, `ZERO_CORE_UNPINNED=1 tools/build_py.sh`, its `pytest tests` 206 passed, 1 skipped, and
+`mtgz.az.run --preset mtg-smoke` 4 iterations, every game finished (config.json gains `reader_detach` only: MTG Zero
+declares no reader).
+
+### 36.8 Costs
+
+Per position, measured with `tools/reader_measure.py cost` (desktop, 2026-11-09: i9-13900K, 4 torch threads,
+batch 256; RTX 5090 eager, shared with other projects' runs):
+
+* **The toy's reader** (12 inputs -> 32 -> 6, projected into the global token): 1,344 multiply-adds, 0.02% of the
+  toy's 128 x 4 token network (6.90M in its linear layers) and 0.1% of a 64 x 2 one; wall time within the noise (128 x
+  4: 92.0 -> 90.6 us a position on the CPU, 44.3 -> 43.7 us eager on the GPU).
+* **MTG Zero's planned size** (1,320 bag inputs = 4 x 330 identities -> hidden -> 330, projected into d = 128), against
+  the 128 x 4 token network's 21.9M multiply-adds and its 308 us a leaf on this CPU (3,250 leaves/s at 1 x 3 threads,
+  batch 192: section 10.5):
+
+| hidden | multiply-adds | share of 21.9M | parameters (share of the network's 1.55M) | CPU us / position | GPU eager us / position |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 253,440 | 1.2% | 254,026 (16%) | 4.0 | 0.6 |
+| 256 | 464,640 | 2.1% | 465,354 (30%) | 6.0 | 0.9 |
+| 330 | 586,740 | 2.7% | 587,528 (38%) | 7.9 | 0.6 |
+
+  So hidden 256 meets the ~2% target (CPU 6.0 us against 308 us a leaf: 2.0%). The parameters' share is large because
+  the reader runs once a position while the trunk's weights run once a token (~17 a Delver position): the checkpoint
+  and the optimizer state grow by that share, the arithmetic does not. On the GPU the reader is 5 kernels (a gather,
+  two linear layers, a softmax, the projection) inside the CUDA graph of a forward of hundreds; eager, it is under 1 us
+  a position.
+* **Training**: the reader's forward and backward in each step (the same share of the step's arithmetic) and its
+  target's loss (a softmax over the width); the shards and windows are unchanged (the target is recorded for
+  `aux_<target>_w` anyway).
+* **Off**: nothing (the code of before).
+
+### 36.9 For MTG Zero (its EoE layout comes later)
+
+To use it MTG Zero declares (1) an auxiliary target for the opponent's unseen deck - in `SearchGame::AUX` /
+`aux_target` (the true state's remaining deck by identity, a count vector: loss 'multinomial', whose total is public)
+and in its package's `aux` (e.g. `{name: 'deck', width: <identities>, loss: 'multinomial'}`); (2) the reader in its
+package's `readers`: `{target: 'deck', inputs: [[<offset>, <count>], ...] of the bags of the opponent's shown cards
+(graveyard, exile, battlefield, revealed) and the globals it needs, hidden: 256-330}` - bags and globals only (its
+token layout's segments are refused); (3) runs with `aux_deck_w` > 0 and `reader_deck` 1 (a fork of a run without it
+gets the reader exactly at its first training), `belief: true` if its search should deal the opponent's library and
+hand from the reader's prediction rather than the head's. Open: a softmax over ~330 identities makes inputs of ~1/330
+each - the projection learns its scale (Adam), but a scaled input (p x width) may train faster; `reader_detach` 0 and
+the reader's width are A/B arms; a layout change that widens the reader's inputs needs a reader widen (36.6).
+
+## 37. Widening an auxiliary head: new targets for a trained head (`net.widen_aux`; MTG Zero's Edge of Eternities deck target, 2026-11-09)
+
+### 37.1 Why
+
+MTG Zero's game gains a second auxiliary target. Its head has one today, `belief` (the opponent's hand by identity,
+1,024 wide, multinomial; section 15, its ENGINE.md 66); its Edge of Eternities work adds `deck` (the opponent's unseen
+deck, also 1,024), so the game's layout becomes `[belief, deck]` = 2,048 outputs. Until now a checkpoint whose head's
+layout differed from the run's was refused - at the run's first training (SystemExit) and, with a root belief on, at
+its start (`HeadMissing`, section 18.3) - so MTG Zero's trained Delver networks could not resume or fork onto the new
+code without `strip_aux` and a fresh head: the belief they learned, lost. Section 15.4 (`add_aux`) carries a checkpoint
+without a head over exactly, section 36.6 (`add_reader`) one without readers; this is the missing case - the
+checkpoint's head predicts some of the game's targets - with every output of before kept bit for bit.
+
+### 37.2 What it does
+
+* **The rule** (`net.aux_widen_problem`): the head's targets T, the game's declared targets T' (its package's `aux`):
+  every target of T is in T' by name with the same width and loss, and T' adds at least one. T' may be declared in any
+  order: each target's outputs move to its place in T' (its columns of every raw output, prediction and recorded target
+  vector are T''s). Anything else is refused (37.3).
+* **The head** (`net.widen_aux(model, layout)`): the head's hidden layer (the trunk's pooled state -> `head` (128),
+  ReLU) is kept; its last layer is kept as it is (`aux_head.2`); the new targets get a last layer of their own on the
+  same hidden activations (`aux_more.<k>`: head -> their total width, zero weights and bias). The forward runs the hidden
+  layer once, each part's last layer on it, concatenates them and puts the columns in T''s order (`aux_perm`, a
+  non-persistent index buffer, only when that order differs from the parts'). Config: `aux` = T' - what every consumer
+  reads (the losses, `aux_predict`, the readers' columns after it, the belief rows, replays) -, and `aux_parts` = the
+  split, `[[part 0's targets], [part 1's], ...]`, only on a widened network; a second widen adds a part. Every parameter
+  and buffer of the network of before stays as it was, and every output of before - policy, value, margin, each old
+  target's raw outputs, the readers' - is the same computation on the same inputs: bit for bit, on any device, in any
+  dtype. The new targets start at what zeros predict (uniform for 'multinomial', unit rates for 'poisson', 0 for 'mse').
+* **Why not one wider last layer** (the obvious "same MLP, more rows"): a matrix product's kernel and blocking depend on
+  its output width, so the old rows of a wider layer are not computed bit for bit. Measured on this desktop (CPU,
+  torch's default threads; RTX 5090): `F.linear` of 256 rows through the toy's head (128 -> 6) against the same rows
+  through a 128 -> 9 layer whose first 6 rows are the old ones differs by up to 1.7e-6 on the CPU, and under CUDA bf16
+  autocast (the training's amp) by 0.016; MTG's shape (128 -> 1,024 vs 2,048) happened to agree on both. A wider layer
+  would also need its AdamW moments cut row by row under one step count shared by old and new rows (the new rows'
+  updates without Adam's bias correction: 6.5x a fresh parameter's step at step 10, 3.3x at step 100).
+* **The hidden layer is shared - what that means for training**: the new targets read the head's hidden layer, as a
+  fresh head for both targets would (one MLP). That layer has learned the old targets' features, and the new targets
+  start from them; from the first training on it learns from every target's loss (each `aux_<name>_w`), and so does
+  the trunk below it. The new part starts at zero, so the new loss sends the hidden layer and the trunk no gradient
+  until the part has learned something (15.4's fresh head likewise). The old targets' predictions move only as the
+  shared layers do: on the toy the old target's held-out loss came out 0.015 / 0.012 nats worse than a control's over
+  the next seven checkpoints (two seeds; 37.6), the policy and value no different. A separate hidden layer per part
+  would isolate the old targets (not built: the measured cost is within the checkpoints' noise, and MTG's targets - a
+  hand and a deck of one opponent - should share their features).
+* **Where the run does it**: `net.load(path, game=...)` widens a checkpoint's head when the game's declared targets
+  include its targets and add some (`net.game_aux`; the game is the caller's, else the checkpoint's; nothing happens
+  when the layouts are the same, the head is missing, or the rule refuses). Every consumer therefore sees the widened
+  head: the run's training - where 15.4 adds a head: its first training after a resume or a fork (`tools/fork_run.py
+  --source <run> --dest <fork> --iter K --set aux_<new>_w=0.25`), or a run's first training from an older checkpoint
+  -, the self-play and evaluation evaluators, the league's slots, the Elo pool's older checkpoints, the anchors, the
+  root belief's checks (`check_belief_head`: a widened head serves a belief for the game's targets, its new segments at
+  their zero-row predictions - so a run with `selfplay_belief_tilt` / `eval_belief_tilt` on resumes on the new layout at
+  once, its pre-widen checkpoints still playing its Elo matches), remote workers and evaluation hosts (their own
+  `load`), `zero.h2h`, replays, `fork_run --net`, distillation's teacher. The training logs `iter K: auxiliary head of
+  checkpoint K-1 widened [...] -> [...] (every output of before unchanged)` and its metrics row gets
+  `train.aux.head_widened` = {from, added}; checkpoint K is written with `aux_parts`.
+* **The optimizer**: the AdamW moments of every parameter of before are kept - the trunk, the head (its hidden layer
+  and its old last layer: the same tensors as before), the readers; each new part is a parameter group of its own,
+  after the readers, with fresh moments (step 0, Adam's bias correction as for any new parameter: 15.4, 36.6).
+  `run.match_opt_groups` finds the saved groups among the network's groups by their parameters' shapes, in the saved
+  order, so the moments survive any order of `add_aux`, `widen_aux` and `add_reader` (a reader added after a widen: the
+  saved trunk, head and part load into their groups, the readers start fresh). The first training after a widen has no
+  warm-up (the saved state loaded, as 15.4).
+* **The training window**: the shards recorded before the widen hold the old layout's targets (narrower, in the old
+  order); self-play after it records the game's (the engine's `aux_target`). A widened network remembers the layouts it
+  had (`aux_older`: written to every later checkpoint's `extra['aux_older']` by `net.save`, read back by `load`, carried
+  by `add_reader`, `strip_aux` and `widen`), and the run gives the window `aux_older = auxtarget.older_columns(T',
+  aux_older)`: a shard of an older layout's width has its targets put in their columns of T' (the others zero), and a
+  mask per row and target (`Window.aux_tmask` [N, T], `batch()['aux_tmask']`) keeps each target's loss to the rows that
+  recorded it (`auxtarget.losses(..., tmask=)`, the readers' losses too). So the shards of before keep training the old
+  targets and never teach a new one zeros (a 'poisson' or 'mse' target would learn them; a multinomial's empty row is
+  skipped anyway). `train.aux` gains each target's `rows` (and its multinomial figures on those rows); the window cache
+  keys a shard by the older layouts too; the RAM budget counts T bytes a row more. Each widen adds a target, so each
+  older layout has a width of its own; two older layouts of one width placing their columns differently are refused.
+* **Readers** (36): a reader is tied to a target, and adding one for a new target is `add_reader`'s job. The two compose:
+  the run widens the head when it loads the checkpoint, then adds the reader at the same first training when the fork
+  turns on the new target's weight and its reader (`--set aux_deck_w=0.25 --set reader_deck=1`). Tested: the head
+  widened and then the reader added, or the reader added and then the head widened, give the same network (the
+  reader's fresh draws aside: they depend on what was built before it); a reader of the new target added after the
+  widen changes no output; the readers' columns follow the head's W' in `forward(..., aux=True)`.
+* **Evaluators**: `NetEvaluator.set_network` takes the new network itself (its CUDA graphs rebuilt) when both networks
+  have a head and the heads differ (targets or parts: the state has other shapes) - a rolling evaluator built from a
+  network of before; the same head: `set_weights` as before. The token network's CUDA graphs (`forward_static`) and the
+  conv network's folded copy run the parts with no code of their own (tested against eager on CUDA).
+
+### 37.3 Refusals stay loud; nothing to turn on
+
+* **Refused**: a target removed or renamed (the head would lose what it learned: `strip_aux`, then fork), a width or a
+  loss changed, the same targets in another order (the shards of the two orders could not be told apart by width). For
+  these `load` leaves the head as it is and the run refuses where the head is needed, as before: its first training
+  (SystemExit naming both layouts and section 37), a root belief (`HeadMissing`, exit 78); `widen_aux` itself raises
+  ValueError, and `add_aux` on a head for some of the targets points to `widen_aux`. A network without a head: `add_aux`
+  (15.4).
+* **No setting**: what it changes was refused before. With the game's layout unchanged nothing changes - `load` compares
+  the layouts and returns the network, no checkpoint gets `aux_parts` or `aux_older`, the optimizer's groups and the
+  losses are the code of before, the window gets no `aux_older` (no `aux_tmask`), config.json gains no key. Checked byte
+  for byte (37.6).
+* An older checkout cannot build a widened checkpoint (its constructors do not know `aux_parts`): it fails loudly at
+  load, as for readers (36.3).
+
+### 37.4 Costs
+
+* **Parameters**: a part per widen, head x (the new targets' width) + that width - MTG's deck: 128 x 1,024 + 1,024 =
+  132,096, what a one-layer head of 2,048 has as well (8.5% of MTG's 1.55M-parameter token network; the optimizer state
+  and the checkpoint grow by the same).
+* **Compute**: on the head's rows only (training, `aux`, root belief rows): the parts' matrix products (the arithmetic
+  of one wider layer), a concatenation of B x W' and, when the order differs, a column gather. The search's own batches
+  do not compute the head (15.2).
+* **Load**: a widen at each load of a pre-widen checkpoint: 9.1 ms on a 128 x 4 token network with a 1,024-wide head
+  widened by 1,024 (4 CPU threads; a plain build and state copy of it 4.6 ms); a whole load of a Delver checkpoint (3.3M
+  parameters) widened to `[belief, deck]` 0.10 s (37.8).
+* **Window**: T bytes a row (the mask) while the run has older layouts.
+* **Off**: nothing (the code of before, plus one layout comparison per `load`).
+
+### 37.5 Tests (`tests/test_aux_widen.py`, 13; one CUDA)
+
+The refusals (removed, renamed, width, loss, a pure reorder, no head, `add_aux`'s pointer); `widen_aux` on the three
+archs from the toy's head (next_card) by targets after it, before it and around it, of all three losses: every
+parameter of before equal, policy / value / margin and the old target's raw outputs `torch.equal` on 64 real positions
+(all rows and belief rows' rows), the new columns zero (their predictions uniform / 1 / 0), the global RNG untouched, the
+config rebuilding the same network; a second widen keeping the first part; `save` / `load` (extra `aux_older`, `load`
+widening for the game's targets with the package declaring a second one, leaving a refused head as it is, the
+attributes through `strip_aux`, `add_reader` and `widen`), `check_belief_head` serving the widened head and refusing the
+narrower; widen and readers in either order and a reader of the new target; `set_network`; `older_columns`' checks; the
+window over shards without targets, of the older and of the new layout (placement, `aux_tmask`, the cache, the sparse
+window, subsampling, the refusal without `aux_older`) and the losses counting each target's rows ('mse' over its rows
+only); `match_opt_groups` (the groups of before, a reader after a widen, history's order, parameters never stepped);
+the run: a toy run with next_card, forked with `tests/toy_aux2.py`'s second target `next_parity` (the next card's
+parity, 2 wide; declared on the Python side - package, engine info, shard writer - since the toy's engine has one
+target) - widened at its first training (logged once, `head_widened`), no optimizer state lost (the moments of before
+one step count, the part's newer), the older shard counted for next_card and not next_parity, next_parity learning,
+checkpoints with `aux_parts` and `aux_older`, the run with one target writing neither, checkpoint K widened computing
+K's outputs bit for bit on 256 positions; with the GPU visible, the token graphs (belief rows too) and the conv graphs
+answering what eager answers.
+
+### 37.6 Measured on the toy (desktop, 2026-11-09, CPU, other projects' jobs on the machine)
+
+`next_parity` is the parity of the next round's hidden card - not public: the next round's stage (rounds 1-3: cards 0-2,
+4-6: cards 3-5) has one or two even cards and the revealed ones say which are left (`toy_aux2.best_public`, the best
+loss from public information). A tokens run (toy-smoke, 200 games an iteration, `aux_next_card_w` 0.5,
+`ZERO_INFLIGHT=1`), forked at iteration 4 into a control A (next_card only) and an arm B (`tests/toy_aux2.py`,
+`aux_next_parity_w` 0.5), both run to iteration 12; seeds 0 and 1.
+
+* **Exactness in the run**: iteration 5's self-play - A by checkpoint 4, B by checkpoint 4 widened - is the same array
+  for array (1,296 / 1,341 rows: every key; `aux` B's first 6 columns, B 8 wide). B's log: one `widened` line, no
+  "optimizer state not loaded".
+* **Learning**, held out on B's iteration-12 rows (1,228 / 1,282 rows, 999 / 1,007 with a next_parity target; the best
+  from public information 0.310 / 0.316 nats, uniform ln 2 = 0.693), seed 0 / seed 1:
+
+| checkpoint | B next_parity | B next_card | A next_card | B policy | A policy | B value | A value |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 (B: widened) | 0.693 / 0.693 | 0.526 / 0.546 | 0.526 / 0.546 | 1.669 / 1.749 | 1.669 / 1.749 | 0.601 / 0.636 | 0.601 / 0.636 |
+| 5 | 0.366 / 0.399 | 0.525 / 0.591 | 0.518 / 0.561 | 1.601 / 1.685 | 1.605 / 1.684 | 0.600 / 0.621 | 0.605 / 0.618 |
+| 7 | 0.329 / 0.358 | 0.525 / 0.521 | 0.520 / 0.507 | 1.554 / 1.633 | 1.567 / 1.625 | 0.578 / 0.611 | 0.581 / 0.615 |
+| 9 | 0.331 / 0.332 | 0.516 / 0.511 | 0.526 / 0.514 | 1.539 / 1.567 | 1.545 / 1.571 | 0.566 / 0.599 | 0.573 / 0.600 |
+| 11 | 0.318 / 0.328 | 0.533 / 0.545 | 0.504 / 0.505 | 1.532 / 1.552 | 1.535 / 1.548 | 0.575 / 0.579 | 0.560 / 0.594 |
+| mean 5-11 | - | 0.530 / 0.533 | 0.516 / 0.522 | 1.556 / 1.610 | 1.562 / 1.611 | 0.576 / 0.603 | 0.577 / 0.607 |
+
+  The new target learns from uniform to within 0.008 / 0.012 nats of the best any predictor can do from public
+  information in seven iterations (training loss 0.468 / 0.471 at iteration 5, its first training, 0.30-0.33 from
+  iteration 7). The old target: 0.015 / 0.012 nats worse in B on average (single checkpoints swing by up to 0.06 in
+  both arms); at
+  iteration 5, where A and B train on the same rows in the same batches, B's training next_card loss is 0.536 / 0.507
+  against A's 0.529 / 0.499 - the shared hidden layer's cost (37.2). Policy and value: no difference beyond the noise.
+* **Byte identity** against 0974e50 (its own worktree, the same engine build - no Rust change -, `ZERO_INFLIGHT=1`,
+  CPU), every run in both checkouts: toy-smoke MLP (3 iterations), tokens (3), rolling cq targets + `eval_select cq`
+  `eval_select_min_visits` 2 (3), tokens + rolling + `aux_next_card_w` 0.5 (3), `aux_next_card_w` 0.5 with
+  `window_sparse`, `window_cache` and `shard_sparse` (3), the Delver line's shape with the head and the reader (tokens,
+  rolling, cq, guard 4 at 0.3, value_q 0.6, window_cache, train_prefetch 2, margin_w 0.2, chance_k 2, no random games,
+  `aux_next_card_w` 0.25, `reader_next_card` 1; 4), a fork that adds the head (`--set aux_next_card_w=1.0`, 15.4) and
+  one that adds the reader (`--set reader_next_card=1`, 36.6), each checkout's own fork_run - 14-16 files a run: every
+  shard, checkpoint (config, state, extra), optimizer state, Elo file, `models/index.json`, metrics (timings aside) and
+  config.json identical; `tools/check_checkpoint_compat.py --package zero` (random, uniform, a toy MLP, a toy token, a
+  toy token-with-head and a toy head-and-reader checkpoint) identical.
+
+### 37.7 For MTG Zero
+
+To move a belief-only checkpoint onto the two-target layout MTG Zero (1) declares `deck` - in `SearchGame::AUX` /
+`aux_target` (the true state's unseen deck by identity) and in its package's `aux`, with `belief`'s entry unchanged
+(name, 1,024, 'multinomial'; `deck` before or after it); (2) moves its pin to a core with this section; (3) runs on:
+a resume of a Delver run on the new build, or a fork (`tools/fork_run.py --source <run> --dest <fork> --iter K --set
+aux_deck_w=0.25`, and `--set reader_deck=1` for 36.9's reader), loads checkpoint K with its belief head widened -
+`belief`'s outputs bit for bit, `deck` uniform - so self-play, the root belief (`selfplay_` / `eval_belief_tilt`: the
+engine's belief rows are then 2,048 wide and the widened head answers them; its `determinize_with` reads a uniform deck
+segment until the part has learned), the Elo pool's older checkpoints and remote workers work from the first
+iteration; the first training trains the deck part from zero with fresh moments while everything else keeps its own,
+on a window whose belief-only shards keep training `belief` (masked for `deck`). With `aux_deck_w` 0 and
+`aux_belief_w` > 0 the head is widened too (the game's layout) and the deck part stays at zero. No step by hand:
+`strip_aux` is not needed and nothing is rewritten in the source run. Worth a game-side test: a delver checkpoint
+loaded by the two-target build predicts the same belief, to the bit (as 37.5's).
+
+### 37.8 Checks
+
+Tier "opt-in core feature with byte-identical defaults"; desktop, 2026-11-09, CPU with CUDA hidden unless said:
+
+* **cargo**: no Rust change (the branch's crates are 0974e50's; not rerun).
+* **pytest** `tests`: 435 passed, 11 skipped, 2 failed - `test_remoteplay::test_cotrain_backoff_gives_matches_back` and
+  `test_cotrain_episodes_requeued_on_timeout` (the remote worker not started in time: MTG Zero's suite and smoke run
+  were running beside it; neither touches an auxiliary target). `tests/test_remoteplay.py` rerun whole: 29 passed, 1
+  failed (`test_backoff_moves_the_quota_to_this_machine`, another of AGENTS.md's timing tests); the three alone: passed.
+  `tests/test_aux_widen.py`'s CUDA test with the GPU visible: passed.
+* **The toy and byte identity**: 37.6.
+* **The games build against this core**: `SKIP_CORE=1 SMOKE_TARGET=aux-widen bash tools/smoke_all.sh --with-this-core
+  --build-only` at 47b0900: Glass Road Zero (28 s), Caverna Zero (26 s), Kingdom Builder Zero (50 s) built; games: 3 of
+  3 checked, GREEN.
+* **MTG Zero** (`eoe-net` at 3020b2a, which pins 0974e50 - this branch's base; smoke_all does not look for MTG Zero),
+  by hand: a scratch worktree of 3020b2a with this core (bca121c) in `third_party/zero-core` (the submodule initialised
+  from the local zero-core repository: `git -c submodule.third_party/zero-core.url=<zero-core> -c
+  protocol.file.allow=always submodule update --init`, then the commit checked out), `ZERO_CORE_UNPINNED=1
+  tools/build_py.sh` (built, 2 min), its `pytest tests` 221 passed, 1 skipped, `mtgz.az.run --preset mtg-smoke` 4
+  iterations, every game finished (64 games). And a real Delver checkpoint - r3-deep128x16-2736's iteration 3064, a
+  3.3M-parameter token network with the belief head (1,024, multinomial) -, loaded by that build with its package
+  declaring `deck` (1,024, multinomial) after `belief`: widened at load in 0.10 s (`aux_parts` [[belief], [deck]]),
+  policy, value, margin and belief's raw outputs `torch.equal` to the checkpoint's own on 512 of its self-play rows,
+  `deck` uniform.
+
+## 38. Per-target tilts of the root's belief (`selfplay_belief_tilts`, `eval_belief_tilts`; MTG Zero's Edge of Eternities deck tilt, 2026-11-10)
+
+### 38.1 Why
+
+MTG Zero's network predicts two hidden things: the opponent's hand (target `belief`, section 15) and, in Edge of
+Eternities sealed where decklists are hidden, the opponent's whole unseen deck (target `deck`, its reader of section
+36). Section 18 deals the search's worlds by the root's belief at one tilt, `belief_tilt`, which MTG Zero applies to
+the hand. Its deck tilt (its ENGINE.md 106) needs an alpha of its own: the two deals differ in reach (seven cards of a
+known pool against a whole deck chosen from a format) and are measured apart (an evaluation-only A/B of the deck tilt
+with the hand's off, then both).
+
+### 38.2 What it does (docs/search.md 3.8.1)
+
+* **Run settings** `selfplay_belief_tilts` (the self-play seat, a league opponent's too) and `eval_belief_tilts`
+  (every evaluation seat): `{target: alpha}` (JSON on the command line: `--selfplay-belief-tilts '{"deck": 1}'`),
+  default `{}`. Seat key `belief_tilts`, only when one is > 0 (`run.belief_keys`, `games.nn_seat`, `play.NNSeat`,
+  `replay`'s seats).
+* **The search**: a seat with one > 0 takes the root's belief (one `ROW_BELIEF` row per full search) even with its
+  `*_belief_tilt` 0; the game's `determinize_with` reads them as `Belief::tilts` (in `AUX` order). The answer is
+  section 18's (the head's prediction of every target, or a reader's when declared `belief`, 36.5).
+* **Names**: an evaluation's per-target tilts name its Elo pool after the belief's tag (`mcts.belief_tag`:
+  `-b0-tdeck1`, `-b1-tdeck0.5`); `zero.h2h` follows a side's run (`eval_belief_tilts`) and `--a-belief-tilts` /
+  `--b-belief-tilts` (JSON; `{}` removes them) override it.
+* **The head**: a run with per-target tilts on checks its checkpoint for the auxiliary head as for `*_belief_tilt`
+  (refused without it, 18.3), a league opponent's and h2h's sides too; self-play's `belief` metrics are reported.
+* **Remote self-play**: the worker's hello carries the self-play seat's belief keys (18.5), per-target tilts
+  included: an older checkout is refused.
+
+### 38.3 Off by default
+
+`{}` (the default): no seat key, no row, `Belief::tilts` empty - the searches of before bit for bit (the golden
+records and match, `belief_off_is_the_search_of_before`); config.json gains the two keys. `Belief` gains a field
+(`tilts`): a game constructing one by a struct literal adds `tilts: Vec::new()` (MTG Zero's tests do).
+
+### 38.4 Costs
+
+None of its own: the row, the head and the game's deal are section 18's (the deal's cost is the game's: MTG Zero's
+ENGINE.md 106).
+
+### 38.5 Tests and checks
+
+Rust: `driver::tests::per_target_tilts_take_the_belief_and_deal_by_it` (HiddenMull at `belief_tilt` 0 and `hand` 1:
+a row per full search, seat 1's root value shifted as `belief_tilt` 1 shifts it), `per_target_tilts_are_checked`
+(an unknown target, a target twice, a tilt < 0 or NaN refused). `tests/test_belief_tilts.py` (2): the settings, seats
+and names (none set: the dicts and tags of before), the refusals, h2h's sides; a seat at `belief_tilt` 0 with
+`next_card` 1 sends one row per full search in the three drivers and the toy deals draw for draw as at `belief_tilt`
+1. Byte identity and the gate: MTG Zero's ENGINE.md 106.
+
+## 39. Value choices: a decision valued by a one-ply lookahead (`selfplay_value_choice_worlds`, `eval_value_choice_worlds`; MTG Zero's Edge of Eternities deck choice, 2026-11-10)
+
+**Why and what**: docs/search.md 3.17. A game marks a decision whose options are worth only what they make of the
+decider's own view of what follows (MTG Zero: a sealed player's choice of its deck among builds of its pool); a
+network seat with the setting values each option by the network's value from its own view one decision on, averaged
+over M worlds, and chooses by those values; the decision is never recorded.
+
+### 39.1 Settings
+
+* **Run settings** `selfplay_value_choice_worlds` / `_temp` (the self-play seat; a league opponent's too) and
+  `eval_value_choice_worlds` / `_temp` (every evaluation seat), default 0 / 0.0 (`run.value_choice_keys`); seat keys
+  `value_choice_worlds`, `value_choice_temp`, only when the worlds are > 0 (`games.nn_seat`). Checked
+  (`mcts.check_value_choice`, the Rust driver's `NnSeat::check_value_choice`): worlds an integer in [0, 1024], the
+  temperature finite >= 0; refused on a lookahead seat.
+* **Names**: an evaluation's value choices name its Elo pool (`mcts.value_choice_tag`: `-vc4`, `-vc8t0.03`); `zero.h2h`
+  follows a side's run (`eval_value_choice_worlds` / `_temp`).
+* **Remote self-play**: the worker's hello carries the self-play seat's (`_value_choice_of`): an older checkout, which
+  would search the game's value choices as any decision and record them, is refused.
+* **Stats**: the driver's `value_choices` and `value_choice_rows`.
+
+### 39.2 Off by default
+
+0 worlds (the default): no seat key, the hook never consulted - the searches of before bit for bit (the toy's golden
+self-play records, docs/search.md 3.17); config.json gains the four keys.
+
+### 39.3 Tests and checks
+
+`tests/test_value_choice.py` (2): the settings, seats and names (none set: the dicts and tags of before), the refusals
+in Python and in the Rust driver, h2h's run rule and tag, the hello's fingerprint; a seat with the setting plays the
+toy's games (which mark no value choice) exactly as one without, making none. The search: docs/search.md 3.17's Rust
+tests. Byte identity and the gate: MTG Zero's ENGINE.md 107.2.
+
+## 40. A game package's run settings and hooks: a self-play spec per phase, remote evaluation inputs, an extra evaluation's cadence, a remote evaluation's extras (`GamePackage.settings`, `selfplay_specs`, `remote_eval_inputs`, `evals_every`; MTG Zero's deck evaluator retrained inside a run and its win % against real decks, 2026-11-11)
+
+Two branches wrote this section at the same time, both from f9ca5c3 and both pinned by MTG Zero branches:
+**`feat/selfplay-spec-hook`** (ef63ee1; MTG Zero's ENGINE.md 112: (a) below) and **`feat/extra-evals`** (6ed51d5; its
+ENGINE.md 113: (b) below). `feat/eoe-run2` merges them (a merge commit; both stay published). Each needed run settings of
+a game package's own and each had written them the same way (the same check and update in `apply_package`): one
+`GamePackage.settings` is kept, serving both. The subsections keep both branches' numbers (40.1 to 40.5), so references
+to either branch's 40.x still point at their text.
+
+### 40.1 Why
+
+**(a) The deck evaluator.** MTG Zero's run 2 chooses each self-play seat's sealed deck with a learned deck evaluator
+read from a file named in the game's spec, and retrains that evaluator during the run on the run's own recent games
+(MTG Zero's ENGINE.md 112). Three things the core did not offer: (1) **settings of the package's own** (how often to
+retrain, on how many iterations) as run settings - presets, flags and config.json -, not keys the game's spec parser
+would have to accept; (2) **a self-play spec that changes between iterations** while the rolling driver (2.6 of
+docs/search.md) keeps its games in flight - a new driver per change would drop them; (3) **a remote evaluation that
+reads a file of the run** (the evaluator version its iteration used): the mirror held only checkpoints, the config and
+the Elo state.
+
+**(b) The real-deck yardstick.** MTG Zero's Edge of Eternities runs gain a yardstick of their deckbuilding: the win
+rate of our deck of a 17lands pool against real players' decks, beside the player's own deck of the same pool (its
+docs/ENGINE.md 113). It is an extra evaluation (`GamePackage.evals`, section 5's `extras`), but three things were
+missing: (1) it costs several times a run's other evaluations, so it needs a cadence of its own, set per run - and a
+game package could not declare a run setting (`apply_package` refused any name outside the core's DEFAULTS: (a)'s (1));
+(2) an extra evaluation that has nothing to measure returns None and logs `iter N <name>: skipped` every evaluation -
+for an opt-in yardstick that is off, a line in every run's log; (3) a remote evaluation (5.2) ran the package's extra
+evaluations on the remote and dropped their results: `RemoteEval` copied `eval_yard`, `eval_random`, `elo` and
+`elo_anchored` into evals.jsonl, not `extras`.
+
+### 40.2 What it does
+
+* **`GamePackage(settings={name: default})`**: run settings of the package's own. `apply_package` adds them to
+  `zero.run.DEFAULTS` with the core's, the auxiliary targets' and the readers' (so each gets its flag, `--name`, e.g.
+  `--real-decks-every 20`; presets and the package's `defaults` may set them; `resolve_config` keeps a saved value;
+  config.json carries them, and a remote evaluation's mirror config with them); a name of the core's (or an auxiliary
+  target's or reader's) is refused (`ValueError` at registration). The core never reads them; the package's hooks and
+  evaluations do (`run.cfg`).
+* **`GamePackage(selfplay_specs={game: fn(run, it) -> spec JSON | None})`** (or 'module:attr'): `Run.selfplay_spec(it)`
+  asks it at the start of every local self-play phase (`run`: the `Run`); None (or no hook) is the run's spec. A
+  rolling run's driver is made with the phase's spec, and when a later phase's differs the run calls
+  `Driver.set_spec` between the phases (docs/search.md 2.13: the games it starts from then on; games in flight keep
+  theirs) and logs `iter N self-play: the rolling driver plays the game package's new spec from now on`; a phase's
+  driver (rolling 0) is made with it (`Run.driver(..., spec=)`, self-play's only). An answer that is not a non-empty
+  string is an error. Remote self-play (section 5.3) refuses a changed spec: its workers play the run's spec.
+* **`GamePackage(remote_eval_inputs={game: fn(run, it) -> [path, ...]})`** (or 'module:attr'): `RemoteEval._ship` puts
+  each named file of the run (run-relative, '/'-separated; absolute, '..', backslashes and drive letters refused) at the
+  same path in the mirror before evaluating iteration `it`, again whenever its size or modification time changed since
+  this session put it (a mirror re-shipped after an error: all again). A missing file fails the evaluation (logged,
+  retried), as a missing `remote_eval_files` file does (5.2).
+* **`GamePackage(evals_every={eval name: setting})`**: an extra evaluation with a cadence of its own. `Run.extra_evals`
+  runs it on an evaluated iteration `it` only when the setting's value n > 0 and `it % n == 0` (`GamePackage.eval_due`);
+  otherwise it is passed over silently - no call, no log line, no `extras` key. The setting must be one of the package's
+  `settings` with an integer default >= 0 (else `ValueError` when the package is made). It runs only where the run
+  evaluates at all (`eval_every`): a cadence that is a multiple of `eval_every` runs every n-th iteration. An extra
+  evaluation without an entry runs on every evaluated iteration, as before.
+* **Remote evaluations bring `extras` back**: `RemoteEval._evaluate` copies the result's `extras` into the run's
+  evals.jsonl row (absent: no key, the row of before) and logs each one (`iter N <name> (remote <host>): {...}`, or
+  `EXTRA EVAL FAILED: ...`); `dashboard._metrics` merges `extras` from evals.jsonl into the iteration's row with the
+  other evaluation keys, so the "Other yardsticks" chart shows a remote run's extras too. An extra evaluation that
+  reads a file of the run on the remote names it in `remote_eval_inputs` (MTG Zero's deck-choice evaluation: the
+  evaluator version of the iteration).
+
+### 40.3 Off by default
+
+A package declaring none of the five (the toy, Caverna, Glass Road, Kingdom Builder, St. Petersburg, Dominion Zero
+today) has the DEFAULTS, the flags, the self-play and the extra evaluations of before: nothing is asked or shipped -
+`selfplay_spec` is the run's spec, the drivers are made exactly as before (`spec=None`), `set_spec` is never called, and
+`RemoteEval._ship` reads no more of the run's settings than before (a package with no `remote_eval_inputs` returns
+before reading `game`: `test_select.py`'s `test_remote_ships_raw_offsets` ships with a settings dict that has none).
+With a hook that answers None the same. A package's settings add keys to config.json and nothing else. The driver's
+spec is read through a lock once per game started: the same games (the toy's golden self-play records and MTG Zero's
+checkpoint compatibility check, its ENGINE.md 112). `extras` reach evals.jsonl only when a package's extra evaluation
+produced them on the remote. Nothing in self-play, search, training or the local evaluation's matches changes. MTG Zero
+declares its settings off (its real-deck cadence 0, its evaluator retrain 0): its runs' config.json gain the keys, and
+their self-play, evaluations and logs are as before.
+
+### 40.4 Costs
+
+None without a hook. With one: the hook's own time once per phase; `set_spec` parses one spec between phases. A
+cadence: a dictionary lookup per extra evaluation and evaluated iteration.
+
+### 40.5 Tests and checks
+
+(a) `tests/test_package_hooks.py` (6): no hook, the run's spec; a rolling driver switches between phases (logged once,
+a non-string answer and an invalid spec refused); a phase's driver is made with the hook's spec; remote self-play
+refuses a changed spec; a package setting is a run setting with a flag (a core name refused, the defaults restored);
+a remote evaluation ships the inputs (again only when changed; a missing file and paths outside the run refused). Rust:
+docs/search.md 2.13's test. The gate: MTG Zero's `optin-core` (ENGINE.md 112).
+
+(b) `tests/test_extra_evals.py` (3): a package's settings join DEFAULTS (flags, presets, a saved value) and leave with
+the package, a clash with a core setting and a cadence setting that is not an integer setting of the package refused;
+an extra evaluation with a cadence runs exactly at the multiples (0: never, silently - no log line), one without runs
+every time; a remote evaluation (the 'local' remote, the remote side in process) of iterations 1 and 2 with the cadence
+2 in the shipped config: evals.jsonl's iteration 2 carries both extras, iteration 1 only the one without a cadence, the
+dashboard merges them and the log names them. `tests/test_cotrain.py::test_extra_evals_are_logged_and_skipped`
+unchanged and passing. MTG Zero's end-to-end check (a remote evaluation of an `mtg_eoe` run through its real `python -m
+mtgz.az.remote eval`): its ENGINE.md 113.
+
+The merge (`feat/eoe-run2`): both test files unchanged and passing (the clash message names both readings: "run
+settings of the core already (names of the core's, ...)"); the full suite, and MTG Zero's integration of both
+(`eoe-run2-int`, its ENGINE.md 126).
+
+## 41. zero-onnx/1: a network as one self-contained ONNX graph, and its parity gate (no setting; zero-farm phase 0a, 2026-11-11)
+
+**Why.** zero-farm (friends' idle Windows PCs doing a run's self-play and evaluation games) runs the search in a
+native Rust worker with ONNX Runtime: no Python, no torch. The worker must serve any run, including runs with
+networks not designed yet, without code of its own per network. So the network travels as a graph that takes
+the driver's batch exactly as the driver produces it and returns what every zero-core evaluator returns before
+its generic last step; everything specific to an architecture - TokenNet's packing of its objects, readers,
+heads, the auxiliary targets' transforms - is inside the graph, exported from the `net.py` the run trains.
+
+**What.** `zero.onnx_export` (the interface is in its docstring):
+
+| | name | type | shape | |
+|---|---|---|---|---|
+| in | `x_ptr` | i64 | [B+1] | the sparse batch's row offsets (`xs_off`, a driver with `sparse`) |
+| in | `x_idx` | i32 | [nnz] | feature indexes, ascending per row (`xs_idx`) |
+| in | `x_val` | f32 | [nnz] | (`xs_val`) |
+| in | `n_players` | i64 | [B] | |
+| in | `belief` | bool | [B] | the root belief rows (`extra` == ROW_BELIEF) |
+| out | `policy` | f32 | [B, A] | raw logits |
+| out | `value` | f32 | [B, 8] | softmax over the seats present, 0 beyond n_players |
+| out | `margin` | f32 | [B, 8] | |
+| out | `aux` | f32 | [B, W] | `net.aux_answer` per target in the head's layout, 0 on rows without `belief`; W = 0 without a head |
+
+The worker's generic step (`onnx_parity.answer`, the same for every network): each row's priors are the
+max-subtracted float32 softmax of `policy[row, legal actions]`; value and margin as they are; the auxiliary
+answer is `aux[belief rows]`. Metadata: zero_onnx=1, protocol, game, arch, features, actions, seats, aux_layout,
+aux_width, packing, checkpoint, checkpoint_sha256, opset, exporter, torch. `export(net, path)` takes a loaded
+network (`load_checkpoint` = `net.load`: built from the config - TokenNet's token tables, `gidx` and the reader
+indexes rebuilt, not saved -, the encoding guard, the head widened to the game's targets, section 37). The
+densify is in the graph (a scatter-add of ones at the row ends and a running sum give each non-zero's row: no
+data-dependent shape). An absent slot's floats are never part of the arithmetic (its identity digits zeroed
+before the round-to-integer decode, its token replaced by zero), so NaN or junk there changes nothing.
+
+A token network packs its objects inside the graph in one of four ways (`packing`; the first three need nothing
+but the interface):
+
+* `mask`: every slot is a token (170 for MTG Zero), the absent ones masked out of the attention as keys and of
+  the pooling; static shapes but B.
+* `compact`: the present tokens gathered in layout order (TopK over the presence; T = the batch's longest row, a
+  data-dependent shape), then `forward_static`'s trunk on rows padded to T.
+* `packed` (the default): the batch's N present tokens as one list [N, d] (NonZero) for every per-token layer
+  (the LayerNorms, the projections, the MLPs, the pointer head: 2-D Gemms), only the attention and the pooling on
+  rows padded to T (gathered in and back).
+* `host`: `forward_static`'s signature kept as two more inputs (`tok_full`, `tok_n`, packed by the caller with
+  `token_presence` / `token_index`; metadata `present_index`) - the worker would carry TokenNet's packing, so it
+  is measured, not used.
+
+`GridNet` and `Net` have no packing (their forward on the densified rows). Exporter: torch's dynamo-based
+`torch.onnx.export(dynamo=True)` (onnxscript), opset 18, IR 10, one file (no external data), checked by
+`onnx.checker`.
+
+**The gate** (`python -m zero.onnx_parity <checkpoint> --batches <file> ...`): ONNX Runtime's CPU EP against
+torch on real batches - recorded driver batches (`tools/onnx_record.py`: a short CPU self-play's sparse
+LeafBatches with root-view value rows and root belief rows, under the game checkout's own core) or shard rows.
+Per file: batches of 1, 7, 64, 256 and 1,024 rows, each as it is and with NaN in every absent slot's floats
+(the host packing also with junk in its padding positions), and the first recorded batches as the driver sent
+them; a batch over 64 rows is also answered in pieces of 64 rows grouped by their non-zero count (the worker's
+chunking, `run_chunked`). Each is compared with `forward_static` on the host-packed rows and with the eager
+`NetEvaluator`: priors, value, margin and the belief rows' auxiliary answers within 2e-5 max abs (10.6's
+graphs-vs-eager tolerance), value exactly 0 beyond n_players, one auxiliary row per belief row, and the graph
+deterministic (each case run twice, bit-identical outputs). Exit 1 on a failure.
+
+**Not a setting.** Nothing on a run's path imports these modules (onnx, onnxscript and onnxruntime are not run
+dependencies; `tests/test_onnx.py` skips without them); no existing module changed.
+
+**Measured** (2026-11-11, the desktop's i9-13900K, CPU only, onnxruntime 1.31.1, torch 2.11.0, beside a live
+Delver run and an EoE race: the CPU 33-100% busy, so the numbers are noisy; the methods interleaved; zero-farm
+docs/phase0a-onnx.md has every cell):
+
+* *Gate*: MTG Zero's eoe1 iteration 80 (`mtg_eoe`, layout v6 'eoe', 44,212 features, 4 layers, the deck reader,
+  aux belief + deck, W = 2,048) on 60 recorded driver batches of the main-branch build (every 40th batch of a
+  sims-4 self-play, 7,457 rows: 1,479 value-only, 547 belief), 80 early-game driver batches and 2,048 rows of its
+  iteration-80 shard; the Delver deep8 iteration 3293 (`mtg`, layout v5, 37,620 features, 8 layers, aux belief,
+  W = 1,024) on 4,096 rows of the held-out shard r3-2b_iter0197fresh (value-only rows as stored, a belief copy
+  after every 8th leaf row): **every packing passes**, worst ORT-vs-torch difference 1.5e-5 (eoe1's margin;
+  priors <= 4.6e-6). Against a float64 forward the ORT answers are as close as torch's own (eoe1 margin, 64 rows:
+  ORT 4.6e-6, torch 9.9e-6): the ORT-torch difference is two float32 roundings, not an error of either.
+* *Speed* (leaves/s, from the sparse rows to an evaluator's answer; 1 thread, the least disturbed measurement):
+
+  | net | B | torch eager | ORT mask | ORT compact | ORT packed | ORT packed, 64-row chunks |
+  |---|---|---|---|---|---|---|
+  | eoe1 | 16 | 535 | 92 | 567 | 719 | 683 |
+  | eoe1 | 64 | 515 | 76 | 468 | 716 | 642 |
+  | eoe1 | 256 | 818 | 82 | 419 | 570 | 874 |
+  | Delver deep8 | 16 | 466 | 50 | 485 | 784 | 592 |
+  | Delver deep8 | 64 | 273 | 41 | 180 | 453 | 461 |
+  | Delver deep8 | 256 | 498 | 40 | 143 | 335 | 575 |
+
+  A second run (torch and `packed` only, 12 calls per cell, the CPU 96-100% busy) gave 0.90-1.49x torch eager at
+  1 thread: over both runs `packed` (with the 64-row chunks at 256 rows) is 1.09-1.69x torch eager for 16-64 rows
+  and 0.90-1.26x at 256 rows, where the eager evaluator already sorts rows into 64-row chunks. With 4 and 8
+  intra-op threads ORT scales (eoe1, 64 rows, packed: 716 -> 1,095 -> 1,932) while torch's eager evaluator
+  collapses on the saturated machine (section 7; 515 -> 121 -> 91). `mask` computes all 170 tokens
+  (the rows hold 15-22 on average): 5-10x slower. `compact` and `host` pad every row to the batch's longest and
+  are 1.3-2.5x slower than `packed`; the host's packing itself costs 0.2-1.6 ms per batch (numpy). Session load
+  0.2-0.4 s; the files 13.4 MB (eoe1) and 9.7 MB (Delver), the checkpoints' size.
+
+**Problems met** (each handled in the code; zero-farm docs/phase0a-onnx.md has the details): the data-dependent
+T needs `.item()` + `torch._check` (and T >= 2, or the attention's broadcast check cannot be decided); slicing
+`x_ptr[1:-1]` made the tracer guard B >= 3 (the row ends `x_ptr[1:]` do not); **ONNX Runtime's CPU ScatterND with
+`reduction='add'` races on duplicate indices with several threads** (lost updates: wrong sums at 8 threads,
+measured) - `index_add` / `index_put(accumulate=True)` must not appear in an export (the packed pooling goes
+through the padded rows), which is why the gate runs every case twice; an absolute tolerance only means
+something for outputs of order 1 (a test network with large random weights gets margins of ~170 and Poisson
+rates of 1e6, whose float32 rounding alone exceeds 2e-5 in torch and ORT alike).
+
+**Tests and checks.** `tests/test_onnx.py` (16): the in-graph densify against protocol.densify (torch and ORT,
+empty rows, 4 threads, repeated); a token network in each packing (plain and id_actions layouts) through the gate
+on batches of 1-150 rows with NaN in absent slots; a reader declared `belief` plus a head widened by a Poisson
+target on a token, an MLP and a conv network; a network without the head (aux [B, 0]); the interface's names,
+dtypes, dynamic dimensions and metadata; real toy games driven through the graph (sparse driver batches with
+value-only and belief rows, every answer validated and within 2e-5 of eager).
+
+### 41.1 Graphs every GPU provider runs, with the same answers (no setting; zero-farm phase 4, 2026-11-12)
+
+**Why.** zero-farm's GPU providers met the export: DirectML answered the identity decoding's `digits @ arange` (a
+MatMul with a 1-D constant operand) with zeros and threw on Reshape allowzero=1 (the dynamo exporter's `view`);
+TensorRT's ONNX parser refused the whole graph for densify's ScatterElements reduction='add' ("Unsupported
+reduction type").
+
+**What it does.** `densify` finds each non-zero's row without a scatter-add: in the merged sequence of the non-zeros
+and the B row ends, row b's end sits at x_ptr[b+1] + b (distinct even for empty rows); a scatter of ones there, a
+running sum, and a scatter to unique slots give every non-zero its row (integers: the same rows). `portable(model)`,
+applied by `export` (metadata `portable` 1): MatMul(A, 1-D constant w) -> Squeeze(MatMul(A, w[:, None]), -1) (the
+same GEMM on the CPU); Reshape allowzero=1 -> allowzero=0 on `Where(Equal(S, 0), -1, S)` (equal for every shape with
+at most one zero; two would raise, never answer differently), a constant shape without zeros just flips the flag.
+`python -m zero.onnx_export --rewrite IN OUT` applies it to an exported file; `--no-portable` skips it.
+
+**Off by default.** Not a setting: the answers are the same (below); a run's training never sees the exporter.
+
+**Tests and checks.** The new export of eoe1 iter 80 against phase 2's published one, ONNX Runtime 1.31.1 CPU, 4
+threads: 137 of 137 pieces (7,713 real driver rows) bit-identical on every output. Gate 1 re-run
+(`zero.onnx_parity`): eoe1 `packed` 23 + 11 cases, worst margin 1.22e-5, `mask` 1.39e-5; Delver deep8 `packed`
+4.0e-6; none failed, every case twice bit-identical. DirectML then runs both nets within 9e-6 of torch.
+`tools/onnx_probe_graph.py` writes the worker's built-in probe graph (44.4).
+
+### 41.2 Graphs a GPU provider runs as the CPU does: every scatter unique, opset 17 (no setting; zero-farm's DirectML work, 2026-11-13)
+
+**Why.** zero-farm wants friends' AMD (and Intel, NVIDIA) GPUs through DirectML, the one GPU provider every Windows PC
+has. Two properties of the exported graphs break a GPU provider as soon as their ScatterElements run on the GPU. They
+were hidden: DirectML registers ScatterElements up to version 16 only, so under opset 18 it left every scatter (4 in a
+zero-onnx/1 graph, 10 in Delver's v7 graph) to the CPU, with copies to the CPU and back around each. Measured in a
+DirectML lab (onnxruntime-directml 1.24.4 and Windows ML's ONNX Runtime 1.28.3, an RTX 5090 and an Intel UHD 770) with
+the same graphs at opset 17:
+
+* *More indices than places.* densify's second scatter wrote nnz + B indices into nnz + 1 places (all B row ends to the
+  one spare slot nnz). DirectML refuses an index tensor longer than its data along the axis ("The parameter is
+  incorrect": at run time with dynamic shapes, at session creation with static ones): every batch of two rows or more.
+* *Repeated indices.* The policy scatter writes every token column without an action to the dummy column, and where two
+  tokens score the same action (identity actions of two equal cards; the probe network's units) a real column twice
+  with different logits. ONNX leaves the winner of a repeated index undefined; ONNX Runtime's CPU kernel and torch's CPU
+  scatter write in order (the last write wins: the answers every gate compares with), a GPU in parallel - 64 writes to
+  two places, values 1..64: the CPU kept [32, 64], the RTX 5090 [1, 33], the UHD 770 [17, 49]; the probe graph at one row
+  (the only size densify did not fail at) came out 0.0205 off the CPU's policy.
+* DirectML's static graph fusion also fails on Scatter -> Slice -> Mul in one partition (each piece alone compiles), and
+  it has no int64 Mod (torch's int64 `//` exports Div with a Mod fix-up; `rounding_mode='trunc'` goes through float32 and
+  is wrong past 2^24, measured).
+
+**What it does** (`zero.onnx_export`; the interfaces unchanged):
+
+* *Row ends to places of their own* (`_csr_rows`, densify's and zero-onnx/2's CSRs): the row ends' writes go to spare
+  places n + (the end's index) - data n + B, every index unique - and the first n are read back by a Gather
+  (`index_select`), not a Slice. The same rows.
+* *The policy's last writer made explicit* (`_scatter_last`): per row, the writes sorted by (action, position) - one TopK
+  over the key action L + position (unique keys: no tie to break; no division) -, the last write of each action's run
+  writes its place, every other write its own spare place past the row's end (A + 1 + its sorted position), the first
+  A + 1 places read back by a Gather. The packed graph lays each row's writes out on its full token axis (`_policy_full`:
+  [B, n_tok K], an absent slot writing the dummy column): a row's packed tokens are in layout order, so a write's place on
+  the axis orders the row's writes exactly as the packed list's flat scatter did - the same last writer of every action,
+  bit for bit; the mask packing scatters its own [B, n_tok K] the same way. The keys are per row and stay below
+  (A + 2) n_tok K whatever the batch (`_check_policy_keys` when the module is built; MTG Zero: 1,025 x 850, 0.04 % of
+  2^31 - a key over the whole batch would reach ~10^11 at 1,024 rows).
+* *Every integer in int32, zero-onnx/1 too* (46.7's rule): `int32_slices` and `check_int32` run on every export (a
+  zero-onnx/1 graph held one integer outside int32, the exporter's Slice "to the end" 2^63 - 1).
+* *Opset 17* (`opset17`, `OPSET` 17): torch 2.11's exporter writes opset 18 whatever it is asked (onnx's version
+  converter has no Pad 18 -> 17 adapter), so the export asks for 18 (`EXPORTER_OPSET`) and rewrites the graph: every node
+  whose operator has another version under opset 17 than under 18 (`onnx.defs`) gets its opset-17 form - the Reduce
+  operators' constant axes input back to the attribute (`noop_with_empty_axes` dropped), ScatterElements / ScatterND
+  with reduction none, add or mul as version 16, Pad without its axes input as version 13 - or is refused (Split with
+  num_outputs, Resize-18, a reduction opset 18 added, ...); onnx.checker's full check after. `export(opset=18)` keeps
+  the exporter's graph.
+* Metadata `unique_scatters` '1' (every packing but `compact` and `host`, which call `TokenNet._trunk` and its plain
+  policy scatter: '0'; measured, not used). `scatter_writes(model, feeds)`: what every scatter of a graph writes on real
+  inputs (duplicates, more indices than places) - the runtime check beside `int64_max`.
+* Not changed: what a graph answers on the CPU (below), the interfaces and reference sets, `portable_file` (old files
+  keep their scatters). The packed trunk's int64 floor division (a token's row `sel // n_tok`) stays: DirectML leaves
+  its Mod fix-up to the CPU, exactly (below).
+
+**On by default** (not a setting): an exporter change - nothing on a run's path imports it - whose graphs answer every
+input on the CPU bit for bit as before (below). `export(..., opset=18)` gives the exporter's opset.
+
+**Costs.** The graphs grow a little: MTG Zero's pb1 iteration 82 from 996 to 1,014 nodes and 10,151,753 to 10,183,556
+bytes (+0.3 %), Delver's v7 graph from 1,983 to 2,014 nodes (+33 KB); the export time unchanged (v7: 25-32 s). On the CPU the
+policy's per-row sort (a TopK over n_tok K = 850 keys a row for MTG Zero) and the [B, n_tok K] gathers cost about what
+the batch's noise hides: the native worker's CPU runtime pack (ONNX Runtime 1.31.1, 4 threads, the reference rows cycled
+to batches of 16 / 64 / 256 / 1,024; two runs of each graph, interleaved): pb1 1,247-1,329 / 1,331-1,758 / 2,141-2,436 /
+2,108-2,394 rows/s against the earlier graph's 1,312-1,313 / 1,385-1,387 / 2,024-2,186 / 2,409-2,490; whole reference
+batches 2,173-2,251 against 2,040-2,132.
+
+**Tests.** `tests/test_onnx.py` (19; two new, two extended): `_scatter_last` against the sequential scatter (12 writes
+a row into 9 places) in torch and through ONNX Runtime at opset 17, bit for bit, and `scatter_writes` finding no
+duplicate and no excess index where the plain scatter has both; `opset17` (a ReduceMax's axes input to the attribute,
+the same answer; Split with num_outputs and a ScatterElements reduction of opset 18 refused); every packing's graph at
+opset 17 with its `unique_scatters` and `check_int32` passing, the mask and packed graphs' four scatters unique on
+batches of 1, 7 and 150 rows - with id_actions on rows where two present units score the same action (so the parity gate
+also checks the policy's last writer against torch); the interface test's opset and metadata. The committed probe graph
+regenerated (`tools/onnx_probe_graph.py`; its reference set byte-identical).
+
+**Measured** (2026-11-13, the desktop beside the live run and other sessions' jobs; ONNX Runtime 1.31.1 CPU, Windows
+ML's 1.28.3 for DirectML, torch 2.11.0; the earlier graphs: ec2d1b9's export, the `farm` head before this change):
+
+* *The CPU's answers, bit for bit.* MTG Zero's best-of-three run pb1, iteration 82 (layout v6, 44,212 features,
+  1,024 actions; exported as the pool exports it; two exports byte-identical) against ec2d1b9's graph on the pool's 256
+  gen-82 reference rows - each recorded batch as it is, the 256 rows at once, windows of 2 to 256 rows, the worker's
+  64-row pieces, every row alone: 310 cases - every output bit-identical, at 4 and at 1 intra-op threads, each graph run in
+  two processes (the four hashes equal). Against torch's answers (the reference set): max abs 1.0e-6. The probe graph
+  (`tools/onnx_probe_graph.py`): its reference rows and 12 more seeds' (2,496 rows), 3,016 cases with every row alone,
+  bit-identical the same way - on rows where the earlier graph's policy scatter wrote 7,832 repeated real actions (the
+  units' identity actions), so the explicit last writer is the CPU's; pb1's rows repeat only the dummy column.
+* *The scatters* (`scatter_writes`, the same rows): the earlier pb1 graph wrote 27,384 repeated indices in 32 scatter
+  runs (504 by densify's row ends, 26,880 by the policy into the dummy column) and had 8 runs with more indices than
+  places (every densify of more than one row); the new one 0 and 0 (635,872 writes). The probe graph: 74,349 repeats and
+  78 excess runs before, 0 and 0 now.
+* *int32.* `check_int32`: the new pb1 graph's 80 integer constants all in int32 (the earlier graph held the Slice end
+  2^63 - 1); `int64_max` on the reference rows' batches, pieces and the 256-row piece: 11,318,272 (the densify index,
+  256 x 44,212: 0.53 % of 2^31), the policy's sort keys at most 871,249.
+* *DirectML* (`zw_probe probe-providers`, Windows ML's ONNX Runtime 1.28.3, the self-test on the gen-82 reference set:
+  the RTX 5090 - shared with a live training run - and the Intel UHD 770): the new graph passes in every run (UHD 5 of
+  5, 5090 4 of 4; also on the reference rows regrouped into batches of 96 and 256 rows), max abs 6.0e-7 (5090) and
+  8.6e-7 (UHD), deterministic; ScatterElements gone from the nodes DirectML leaves to the CPU (15 left: Concat 2, Gather 2,
+  Reshape 3, Squeeze 3, Add, Equal, Mod, Mul, Sub - shapes and the packed trunk's int64 `//`), against 17 with 4
+  ScatterElements before. Rows per second by batch size (16 / 64 / 256 / 1,024 rows; the bench rows are not checked
+  against the CPU, the self-test's are): RTX 5090 267 / 890 / 4,307 / 12,706 against the earlier graph's
+  236 / 909 / 2,585 / 4,669 (2.7x at 1,024 rows); UHD 770 203 / 494 / 1,005 / 1,195 against 192 / 499 / 889 / 1,089.
+  The same runtime's CPU EP: 1,103-1,225 / 1,342-1,511 / 2,104-2,105 / 2,127-2,308.
+* *A network without the auxiliary head* (`aux` [B, 0], the probe network without its head and reader): DirectML passes
+  the self-test on both adapters, new and earlier graph alike (2 runs each): the zero-size output is no problem for the
+  worker's DirectML session (46.7's instrumentation, with its zero-size intermediates as outputs, was).
+
+## 42. Chained episodes: one game of a match per episode (`SearchGame::chained`, `next_episode`; MTG Zero's best-of-three Delver mirror, 2026-11-11)
+
+(Section 40 is taken by `feat/extra-evals` and `feat/selfplay-spec-hook`, 41 by `farm`.) **No run setting**: the game
+decides, by its spec, whether its episodes chain (MTG Zero: the `mtg` spec key `"game_episodes": true`, its ENGINE.md
+121). A game that never says so plays and trains exactly as before.
+
+### 42.1 Why (the user's decision, 2026-11-11)
+
+MTG Zero adds best-of-three with sideboarding to its Delver mirror. Until now its best-of-three episode was the whole
+match: the search ran through a game's end into sideboarding and the next game, and every row's value target was the
+match's result. The user decided the label is the **per-game outcome**: without draws a player's match-win chance after
+a game is a fixed amount plus a positive multiple of its chance to win that game, so maximizing each game is
+match-optimal; per-game labels are much less noisy (game 3's luck no longer lands on game 2's rows), and they keep the
+value head's meaning that of the best-of-one line the run is warm-started from (its search settings were tuned on that
+scale). The value target stays `(1 - value_q) z + value_q q_root`; z becomes the row's own game's result, and the search
+treats a game's end as terminal, so `q_root` is on the same scale. Matches, not games, stay the unit a run plays and
+evaluates.
+
+### 42.2 What it does (docs/search.md 1.3, 2.14)
+
+* **The game** (`SearchGame`, all opt-in, defaults = before): `chained()` - this game's episodes are parts of one
+  contest; an episode ends where the game's `to_move()` is None, and the search backs up that state's `result()` and
+  `margin()` as at any terminal (nothing changes in the tree); `next_episode(conceded)` - the state the next episode of
+  the contest starts from (`Next::Continue`), or the contest's result when it is over (`Next::Over`); `conceded` is the
+  seat that resigned the episode (below), None when the episode ended by the rules; `can_concede()` - the self-play
+  resign rule may count the pending decision (default true).
+* **The driver** (Rust, `driver/worker.rs`): at a chained game's episode end, its records are labelled with that
+  episode's outcome (z, q, sc as for any game) and kept in the slot; the slot plays the next episode from
+  `next_episode`'s state with the same gid, seats, bots and random streams, fresh trees and records, its evaluation
+  cache emptied, its searched decisions (`temp_moves`, the view-sample draw) and real moves (`max_steps`) counted from 0
+  again. When the contest ends, its **one result row** goes out with every episode's samples behind it (the contract
+  `workqueue.split_games` and the shard writer read: a row's samples follow it): `result` the contest's, `over` whether
+  it finished, `scores` / `rounds` of its final state, `steps` / `decisions` / `ext_moves` / `samples` summed, and
+  `episodes`, one entry per episode (`over`, `aborted`, `result`, `margins`, `steps`, `decisions`, `ext_moves`,
+  `rounds`, `samples`, `resign`). An episode cut at `max_steps` or aborted ends the contest unfinished (as a game: not
+  over, a draw in the row); the episodes before it keep their samples. Rolling quotas, queued setups, the shared queue,
+  the remote workers, the shard writer and the league count and carry contests.
+* **Resignation** (section 27): a resigning seat concedes the episode: the episode's z is the resignation's, and the
+  contest continues from `next_episode(Some(loser))` (MTG: CR 104.3a, the game conceded, the next game's sideboarding).
+  The resign counter is per episode (the no-resign draw is the contest's); a decision the game marks `can_concede()`
+  false (MTG: sideboarding between games, where no game is in progress) is not counted.
+* **Evaluation**: the yardstick, random, Elo, anchor and h2h games are contests, so their rows, win rates and Elo are
+  the **match** win rates; the run adds per-game numbers (`per_game` in `eval_yard` / `eval_random`, h2h's report).
+* **Refused** (a driver error, never silent): branched games (`selfplay_branch`, section 24) and deferred terminals in a
+  chained game.
+* **Remote**: a self-play worker's hello reports the chaining of the run's spec (`episodes`), and a remote evaluation
+  its result (`episodes`): a checkout that would play whole matches as one episode is refused.
+* **The Python driver** (`play.PyDriver`, the replay recorder) chains the same way: a replay holds the whole match.
+* **The toy** `toy_match`: best of three toy games, chained, for the core's own tests.
+
+### 42.3 Off by default
+
+A game whose `chained()` is false (every game but MTG Zero's `mtg` with `"game_episodes": true`, and the toy
+`toy_match`) never reaches the new code: no hook is called, no row gains a key; `check_checkpoint_compat` and the toy's
+golden digests are unchanged (42.5).
+
+### 42.4 Costs
+
+None for a game that does not chain (one `can_concede()` call per counted resign search: a default `true`). A chained
+game: the samples of a contest's episodes wait in its slot until the contest ends (as a whole-match episode's did:
+the same memory, the rows only labelled earlier); `next_episode` clones the state once per episode; one game is made
+from the run's spec when the run asks whether it chains (`games.chained`, cached), at the first evaluation and at
+each remote worker's hello.
+
+### 42.5 Tests and checks
+
+* Rust `driver::tests::chain` (8, docs/search.md 2.14) and `tests/test_chained.py` (10: the bindings; both drivers'
+  rows and labels; h2h's and the resign tally's games; the loop's contests, per-game metrics and the evaluation's match
+  and per-game numbers; a replay of a whole match; remote self-play with an older worker refused; the remote
+  evaluation's marker; the Delver stack - rolling, sparse batches, the shard writer thread, sparse shards and window,
+  information-set merging with root-view values, value-only samples, the root's belief, resignation, the eval cache,
+  paired Elo - and the league plus a remote evaluation, all on `toy_match`).
+* Off by default: `cargo test` 152 passed (144 + the 8); `check_checkpoint_compat --package zero --net random --game
+  toy` f9ca5c3 -> da86087 identical (visits b1b86b689ab98313, cq d02691e9e005a5d5, vs random dcf8b2b840d45e66). The
+  only Python call that changed shape is guarded: `Run.play_match` / `play_matches` take `games` only when the
+  evaluation spec chains (a subclass overriding them with the old signature - co-training's `PrimaryRun` - is called as
+  before).
+* The full suite (97770ee, the shared desktop, 2026-11-12): **452 passed, 11 skipped, 0 failed** (1,976 s). Earlier
+  runs beside other agents' gates and a live run saw load-dependent failures that pass alone - e.g.
+  `test_forks.py::test_an_older_worker_is_refused`, which fails the same way on f9ca5c3 under that load (the worker's
+  hello came after the run's two short iterations ended). MTG Zero's gates on its branch `bo3-game-episodes` (its
+  ENGINE.md 121.5: checkpoint_compat identical, digests unchanged, the three other games built against this core).
+
+### 42.6 Measured (the toy, desktop CPU, 2026-11-11, heavily shared)
+
+`toy_match` at toy-smoke scale (`--game toy_match`, 24 contests an iteration, 8 sims): 2.5 games per contest (60 games
+of 24 contests, 1-3 drawn), ~6.8 samples per game; the evaluation reports, e.g., iteration 2 vs random: matches 4.0/4,
+games 8.5/9 (`per_game`); the Elo log `iter_0002 vs iter_0001: 2.0/4 (games 4.0/8)`. MTG Zero's best-of-three smoke:
+its ENGINE.md 121.5.
+
+## 43. Variable-length rows: tail tokens and pointer overrides in shards, the window and the run (`allow_draft_layout` in 43.4; MTG Zero's layout v7, 2026-11-11)
+
+**Why.** MTG Zero's rule is that the engine **and the network's input** are exact in every reachable state. Fixed
+slot caps (a hand past 16 cards, a stack past 8, waiting triggers past 4) and new kinds of state (delayed triggers,
+the opponent's triggers, links, exile offers) need a variable-length **tail** of tokens after today's fixed-width row
+(the **head**), and options about objects past a cap need **pointer overrides** (docs/search.md 1.4, 2.15). This
+section is the data path of lane X (shards, window, run, tools, remotes); 43.5-43.8 are the network's (lane Y).
+
+### 43.1 Rows on the host and shard format v2
+
+* `zero.rows`: `Tail` (CSR over rows: `off`, `seg` u16, `slot` u32, `val` float32 / float16, `widths`) and
+  `Overrides` (`off`, `opt` i32, `tok` i64), with `take` / `concat` / `nbytes` / `padded` / `to_torch`; `pack_tok`,
+  `unpack_tok`, `layout_tails`, `resolve` (overrides -> the network's `ov`: each target's extended position - a head
+  slot's place in the full token axis, a tail token's `n_tok` + its index in the batch's tail; refuses an absent head
+  slot, a missing tail token, a column out of range, an option out of its row: R6), `token_full` (a static forward's
+  `full` / `ntok` with each row's tail tokens after its head tokens), `game_row` (a game's `encode_row` and
+  overrides for an evaluator), `shard_layout`.
+* The bindings (docs/search.md 2.15): batch and sample dicts carry `t_off` / `t_seg` / `t_slot` / `t_val` and
+  `ov_off` / `ov_opt` / `ov_tok` for a game with them only; `LeafBatch.tail` / `.ov`; `Game.encode_row`,
+  `Game.option_overrides`; `Game.encode` raises ValueError on a state with a tail (R1); `game_info()` adds `tails`,
+  `option_pointers`, `max_row_tokens`, `head_tokens`. `protocol.concat_samples` and `take_rows` carry the CSRs
+  (re-offset); `validate_rows` checks them.
+* **Shard format v2** (`zero/data.py`): written iff the game declares tails or pointer overrides (`shard_format(cfg,
+  info)` adds the meta `t_segs` [[seg, name, width, head], ...], `option_pointers`, `max_row_tokens`), always sparse
+  (`x_version` 2): version 1's members plus `t_ptr` int64 [N+1], `t_seg` uint16, `t_slot` uint32, `t_val` float16
+  (dense per token), `ov_ptr` int64 [N+1], `ov_opt` int32, `ov_tok` int64. A dense shard with tails is refused at the
+  setting (`shard_format`), at `ShardWriter.add` and at `write_shard` (R8): an older reader would read `x` and ignore
+  the tail. Version 1 readers refuse version 2 (their `x_version` check); this build reads both and refuses a newer
+  one (R7). `read_shard` returns the v2 members with the features (`head_only=True` drops them: an explicit choice);
+  `shard_features` - the features alone - is refused for a shard with any tail token or override unless `head_only`
+  (R10). `convert_shard` keeps v2 (never dense). The non-finite guard reads `t_val` (zero/finite.py).
+
+### 43.2 The window and training
+
+* `Window(..., layout=<the network's normalised layout>)`: with tail segments or pointer overrides it loads every
+  shard's tails and overrides (`Window.tail`, `Window.ov`) through the dense, sparse, cached (`WindowCache`, its key
+  names the tail segments) and subsampled loads, its `nbytes` counting them; a shard of other tail segments, or one
+  without them (v1), is refused (R9: a v7 network trains on v2 shards only - a fork starts a fresh window). Without a
+  layout, a shard with any tail token or override is refused (R11: never a silent drop).
+* `Window.batch(idx, tokens=None, coo=False)` adds `'tail'` (the network's `tail`, unpadded) and `'ov'` (resolved,
+  the head slots' presence read from the features) and with `tokens` builds `full` / `ntok` by `rows.token_full`;
+  `Window.row_inputs` gives the same for any rows (distill's outputs); `use_layout` swaps in the network's layout for
+  a window loaded from its shards' `t_segs` (a held-out set). `data.batches` moves the nested dicts to the device.
+* `run.train_model` passes `tail` / `ov` to `forward` / `forward_static` only when the batch has them
+  (`rows.forward_kw`: the calls of before otherwise); `distill.outputs` / `losses`, `heldout` (sets made from v2
+  shards keep their tails; `HeldOut.evaluate` takes the network's layout, R9), `targets`, `bench --shard` (the rows'
+  tails through `infer` and `train`) and `replay` (the root's `encode_row`) pass them through.
+
+### 43.3 The run: refusals and metrics
+
+* At start (`Run.check_rows`, before any work; `RowsRefused`, an EncodingMismatch: exit 78, not restarted): a layout
+  marked `draft` without `allow_draft_layout` (R16, 43.4); a build whose rows differ from its package's layout -
+  tails, pointers, limit or `HEAD_TOKENS` vs the layout's 1 + Σ count, a stale build with 0 included (R15:
+  `package.check_rows`, also run by `games.Driver` and at `register` when the engine is loaded); a game with tails or
+  overrides with an arch other than 'tokens' (R4) or with `shard_sparse` 0 (R8).
+* The row limit (docs/search.md 2.15): a game whose row passes `max_row_tokens` is aborted (no samples), counted and
+  logged, never truncated.
+* Metrics, only for a game with tail segments: self-play `tail` = {rows sent with a tail, their tokens, the most in
+  one row, `aborted_row_tokens`} (a line in the log when a game was aborted); training `tail` = {the window's rows
+  with a tail, tokens, max, overrides, and when the network has gated segments its `gates` {segment: g}, `gate_steps`
+  {segment: training steps whose batch held its tokens} and `gates_stuck` (43.6)}.
+
+### 43.4 Draft layouts, remotes, the toy
+
+* **`allow_draft_layout`** (run setting, default 0): a package layout with `"draft": true` (MTG Zero's v7 until this
+  project ends) is refused by a run at start (R16; `tools/fork_run.py --allow-draft` is lane Y's). 1 trains on it
+  anyway. Off by default; a layout without `draft` is unaffected either way.
+* **Remote self-play**: a worker's hello carries `caps: ['tails']`; for a game with tails or overrides a worker
+  without it (an older checkout) is refused, logged and retried in 10 minutes (R13), as the other capability checks.
+  The worker's samples are split per game with their tails (`remoteplay.split_games_rows`; its shards are v2).
+  **Remote evaluation**: the result line carries `caps`; an older remote's result for such a game is refused
+  (`RemoteRefused`) and retried.
+* **The toy** `toy_tail` (docs/search.md 5.3) with its layout `package.TOY_TAIL_TOKENS` is registered in the core's
+  package and engine.
+* **Other readers of samples and shards:** `workqueue.split_games(rows, s, widths)` cuts a dict's tail and override
+  CSRs with their games (`protocol.take_rows`; a tail without the game's widths is refused - the run's shared-queue
+  self-play and its local linger pass `games.tail_widths(info)`); co-training's writers take the meta of
+  `Run.shard_meta` (format v2 for a resolver game with tails) and `CoRun.loop` runs both games' `check_rows`;
+  `zero/tools/distill.py` builds its window with the student's layout; `tools/selfplay_digest.py` hashes each
+  record's tail and overrides (a game without them: the digest of before). `tools/reader_measure.py` (the toy's
+  reader study) is the toy's only (`games.info('toy')`, its features by `encode`): no game with tails reaches it, and
+  its window without a layout would refuse one (R1, R11).
+* **The Python search and the lookahead** (2026-11-12; until then refused for a game with tails: P1 of the plan, R12)
+  carry every row's tail and overrides, as the Rust driver's rows (docs/search.md 2.15, "The lookahead and the Python
+  search"): the `SearchTree` binding (`simulate(..., rows=True)`; refused without it for such a game), `mcts.py`'s
+  reference tree (`mcts.leaf_row`), `play.PyDriver` (batches, samples, the row limit aborting a game) - and so
+  `zero.replay` (the AI replays, every game package's replay publisher built on it, lookahead seats included),
+  `zero.parity` (positions, root views, its `h2h` of a Rust and a Python seat: `--game` / `--spec`) and `zero.targets
+  quality`; the lookahead in the driver (lookahead seats, value choices) and the position API `Lookahead`
+  (`next_batch()`'s `t_*` / `ov_*`, `info()`; `zero.lookahead.drive` / `evaluate_position` pass them to the
+  evaluator), its dedup and information-set keys covering them (K3). An evaluator given to the position API or to
+  `drive` must take `tail=` / `ov=` (`NetEvaluator.evaluate` does).
+
+**Off by default / byte identity.** Everything above is keyed on the game declaring tail segments or pointer
+overrides (and `allow_draft_layout` only reads a `draft` key no layout of before has): Glass Road, Caverna, Kingdom
+Builder, the toy and every existing MTG Zero layout produce no new array, key, meta, metric or stats key, and their
+shards are written byte for byte as before (`x_version` 1 or dense). config.json gains `allow_draft_layout`.
+
+**Costs.** For a game without tails: a few constant-false branches. With them: the tail tokens' floats per row (MTG:
+mostly none; a hand past 16 cards is ~4% of Delver states), their key mixing, a CSR per batch assembled serially
+(rows without a tail cost an offset), float16 tail floats in shards.
+
+**Tests and checks.** `tests/test_tail_rows.py` (12: the bindings, R1, a head-only caller of a tree refused, the
+containers, batches / samples / records / take_rows / concat carrying the rows exactly, the cache with sparse batches,
+the limit, games without rows unchanged, R15, R6, the remote split), `tests/test_tail_shards.py` (11: v2 round trip,
+R7-R11, convert, the finite guard, the window's five loads and its batches incl. the static axis and the resolved
+overrides, distill / held-out / bench feeding the rows, v1 shards unchanged), `tests/test_tail_loop.py` (3: toy_tail
+through the run's own self-play phase - synchronous and threaded writer, the same shards - into the window's
+batches, an aborted game, the run's refusals), `tests/test_tail_search.py` (12: the tree binding's leaf rows = the
+game's own and the reference tree's; Rust-Python parity on toy_tail with a stand-in reading every tail token and
+override, and its power check; games without chance identical in both trees, byte for byte, every row and the value-only
+rows; the Python driver's batches and samples - every row's tail its own state's, every pointer in its row -; its
+row limit, at the first row and mid-search; games without rows unchanged; `zero.replay` with a token network, a
+lookahead seat too; the position API's rows and its limit; `targets quality` and `parity h2h` on toy_tail); the Rust
+tests of docs/search.md 2.15.
+
+**Measured** (the desktop, 2026-11-11, other lanes' builds and tests on the CPU). Byte identity: `tools/check_checkpoint_compat.py
+--package zero --game toy` against f9ca5c3 (the base) - `--net random`, `--net uniform` and spec `{"food": [3, 1]}` -
+identical records and results (visits, cq, vs random). toy_tail, 64 self-play games (32 / 8 sims, a row echo
+evaluator, sparse batches): items0 3 - 33,687 rows, 59% with a tail, 2.2 tokens per such row, at most 8, none
+aborted, 0.8 s; items0 12 - 34,288 rows, 64%, 3.0, at most 13, 0.9 s.
+
+**Measured, the Python search and the lookahead** (the desktop, 2026-11-12, other sessions' tests and runs on the
+CPU). Byte identity for games without tails, against f9ca5c3: `check_checkpoint_compat --package zero` with
+`--net random`, `--net uniform`, spec `{"food": [3, 1]}`, a toy MLP and a toy token checkpoint - identical; and 20
+goldens of the consumers this change touches, each the same JSON in both checkouts: `zero.parity` (positions with
+chance_k 0 and 2, toy_team's deferred leaves, root views, Gumbel, the floor, the belief, the select / cq / Gumbel
+formulas, `h2h` with a checkpoint), `PyDriver` self-play with 'py' and 'rs' seats (root views, value-only samples,
+'cq': every batch's and sample's arrays hashed), `zero.replay` (an MLP vs random, a token network vs itself, a
+lookahead seat), the position API (`evaluate_position`, every round's rows) and `targets quality`. Parity on
+toy_tail: docs/search.md 6 (Rust-Python at the Python-Python floor; rows without their tails told apart at TV 0.59;
+games without chance identical byte for byte in both trees; h2h 50.15% +-2.19 and 50.20% +-2.19).
+
+### 43.5 The layout keys and the network's tail tokens (`net.tokens_layout`, `net.TokenNet`; lane Y, 2026-11-11)
+
+(43.1-43.4: the rows, the driver, the shards and the run, lane X; 43.5-43.8: the network, its gates, inference and
+the widen, lane Y.) Everything here is opt-in: a layout without the new keys normalises as before, a network without
+tail segments has no new parameter and runs the code of before line for line, and a tail network's batch with no
+tail token and no override runs that code too.
+
+**Layout keys** (each stored in the normalised layout only when set):
+
+| Key | Where | Meaning |
+|---|---|---|
+| `tail: true` | segment | its slots >= `count` come as tail tokens |
+| `count: 0`, `offset: null` | segment | a tail-only segment (needs `tail`; claims no feature) |
+| `gate: true` | segment | a gated segment (43.6); only with `count` 0 |
+| `columns: k` | segment | k pointer columns after its action pairs (and identity column), no static table; needs `option_pointers` |
+| `option_pointers: true` | layout | rows carry pointer overrides (43.7) |
+| `max_row_tokens: n` | layout | required with a tail segment, >= 1 + sum(count); the driver aborts a game past it |
+| `draft: true` | layout | refused by run launches and fork_run unless allowed (43.8); not part of the encoding |
+
+The action collision check covers head slots only (a tail token never gets a static action).
+
+**Parameters** (all absent without tail segments): `seg_in.{i}` for every segment (tail-only too); `tail_base`
+[n_tail, d] (a head-ful segment's row starts as its last head slot's `pos`, a tail-only one's N(0, 0.02));
+`pos_tail.{k}.weight` [d, 49] (N(0, 0.02), no bias); `gate` [n_gated] (43.6); `ptr` with a row per pointer column.
+
+**A tail token** at slot s of tail segment k (head count c) is embedded as a head slot: the segment's input map of its
+floats + its identity's embedding + its position `tail_base[k] + pos_tail[k](psi(s - c))`, where psi(n) for n in
+[0, 2^32) is its 32 binary digits (computed from the int64 slot on the device: exact for every u32), log2(n + 1) / 32,
+and sin / cos(2 pi (n mod 2^j) / 2^j) for j = 1..8 (interleaved sin_1, cos_1, ...; float64, then float32).
+
+**Inputs** (the API's 2.6): `forward(x, n_players, aux=False, aux_rows=None, tail=None, ov=None)` and
+`forward_static(x, n_players, full, ntok, aux=False, tail=None, ov=None)`. `tail = {'row', 'seg', 'slot': int64 [NT],
+'val': float32 [NT, Wt]}` (rows ascending; Wt the widest tail segment's width, a token's floats first) is required,
+possibly empty, iff the network has a tail segment; `ov` (43.7) iff `option_pointers`. Refused (ValueError, R5): a
+missing or unexpected `tail` / `ov`, a token of a segment without a tail or at a head slot, rows out of order, the
+wrong float width, an override whose target is not a present token of its row with that column - in eager always
+(host syncs), in `forward_static` outside a CUDA graph capture (one host sync; inside a capture the host checked).
+
+**Packing.** Eager: each row's tail tokens follow its head tokens (`n` counts them), the rows sorted by token count
+and chunked as before; a segment's tail tokens are embedded by one product of their own. Static: `full` holds
+extended positions (0 the global token, 1 + ... the head slots, `n_tok + j` the batch's tail token j); the tokens are
+gathered from cat(every head slot [B * n_tok, d], the tail tokens [NT, d]); the tail embedding is a few dozen kernels
+whatever the number of tail segments (`_tail_embed_static`: every tail segment's input map on every token as one
+product - their weights in one zero-padded matrix -, every position map as one, each identity layout's digits decoded
+once, each token's own picked by its segment - one autograd node, 43.9; a loop over the 13 tail segments of a
+v7-like layout cost a training step ~1,250 kernel launches, ~35 ms more on the desktop). Padded tail entries (row 0, the first tail segment, slot
+its count, floats 0) and padded overrides (action `actions`, ref -1) are allowed. `present_index()` stays the head's.
+
+### 43.6 Gates: new kinds of token, exactly inert at a widen (`gate`)
+
+A gated segment s has a gate theta_s, g_s = max(theta_s, 0) with a straight-through gradient (backward the
+identity: a gate pushed below 0 comes back). A token weighs 1 (the global token, every ungated token), g_s (a token of
+gated segment s) or 0 (padding):
+
+* attention: p_ij = exp(s_ij - m_i) w_j, out_i = sum_j p_ij v_j / sum_j p_ij, m_i the max over the non-padding keys;
+* pooling: z_mean = sum_t w_t h_t / sum_t w_t;
+* an override into a gated segment's token: gen[a] + min(g_s, 1) (ptr - gen[a]), as `torch.lerp`: exactly the generic
+  logit at 0, exactly the pointer logit at 1.
+
+At g = 0 a gated token changes no other token, the pooling or any logit, exactly; it still attends as a query.
+**Paths:** without gated segments, today's bool-mask SDPA; with gated tokens present, SDPA with the float mask log w
+(-inf at 0) in inference and in training once every present gate is above the shadow (43.14; > 0 without it), and an
+explicit math attention (`TBlock.forward_weighted`, the same formula, one autograd node with its backward by hand:
+43.9) in training while a present gate is below it (SDPA's mask would give the gate no finite gradient at 0;
+forward_static's flags decide, read without draining the device: 43.9). The static forward weighs every token whenever the
+network has gated segments and the batch has tail tokens (no data-dependent branch; with weights 0 / 1 the float mask
+is the bool mask's computation). At g = 0 the gate is the only parameter of its segment with a gradient (the
+segment's own maps get exactly none until it opens) - unless a shut gate's shadow is on (43.14, the default), which
+back-propagates a shut segment as if its weight were the shadow, the forward unchanged.
+
+**In a run** (2026-11-12, the coordinator's decisions; the API's change log): `TokenNet.gates()` -> {segment: g} is
+logged every iteration as `train.tail.gates`, with `train.tail.gate_steps` (per gated segment, the training steps
+whose batch held its tokens); a gate still exactly 0 after `run.GATE_STUCK_STEPS` = 100 such steps is said loudly - a
+`WARNING gate <segment> still exactly 0 after N training steps ...` line in the run's log and `train.tail.gates_stuck`.
+The gates are **not weight-decayed** (`net.NO_DECAY`, `no_decay_params`): AdamW gets them as a group of their own, last,
+with `weight_decay` 0 (a scalar gate decayed would be biased shut); every other parameter stays in the groups of
+before, so a network without gates has the optimizer of before, its groups and their order (check_checkpoint_compat:
+identical). `zero.distill` does the same for a student with gates.
+
+Built fresh, a gate is 1; a widen sets each new segment's gate to exactly 0 (43.8).
+
+### 43.7 Pointer overrides, the evaluator and the CUDA graphs (`infer.py`)
+
+**Overrides in the network.** `ov = {'row', 'act' (the option's action), 'ref' (the target's extended position;
+-1 = the generic logit), 'col' (the target segment's pointer column)}`, int64 [NO], resolved on the host
+(`rows.resolve`, lane X). After the static scatter of head slots' actions, each override's action gets its target
+token's logit in its column (a gated target's blended, 43.6) or, ref -1, the generic logit saved before the scatter.
+A tail token has no static action: it scores only through overrides. A row that fits the old caps lists none.
+
+**`NetEvaluator`.** `evaluate(x, n_players, opt_off, opt_action, extra=None, tail=None, ov=None)` (`rows.Tail` /
+`rows.Overrides`; `__call__` / `launch` take them from `LeafBatch.tail` / `.ov`; `max_rows` pieces and worker threads
+cut them with the batch; `aux(x, n, tail=)` / `reader(...)` take the rows' tail and give an empty override set).
+Refusals: a network without tails or pointers given either (R5); at construction, a game whose `game_info()['tails']`
+is non-empty with any network but a token network with exactly those tail segments (`TokenNet.tail_segments()`;
+ValueError, R4).
+
+**`TokenGraphRunner`** (`launch(..., tail=None, ov=None)`, `launch_sparse(..., tail=None, ov=None)`): the host packs
+the head presence as before plus each row's tail tokens (`token_index_tail`), checks the tail and the resolved
+overrides (what a graph cannot check: a target a present head slot or a tail token of the same row, its column), pads
+the tail to NTp and the overrides to NOp in {0} U {16 * 2^k} (`tail_bucket`) and uploads only the tail floats and the
+overrides beside the rows; one graph per (rows, tokens, tail tokens, overrides). A batch with no tail token and no
+override runs the graph (rows, tokens, 0, 0): the static forward of before. **Rows of more than `LONG_T` = 128
+tokens** are evaluated eagerly (`_eager_rows`, in groups whose attention matrices stay under `LONG_BYTES` = 512 MB),
+the other rows through the graphs, the answers merged in row order (`_Split`); `long_rows` counts them.
+
+### 43.8 The widen, the encoding guard, fork_run; tests, checks, measured
+
+**Widen** (`net.widen(old, ..., layout=, ungated=False)`, `token_feature_map`, `_widen_tokens`). Allowed beyond 10.3:
+a segment gaining `tail` (its head unchanged; its `tail_base` row starts at the old network's last head slot, its
+`pos_tail` fresh: no old row reads them); tail-only segments appended after the old ones (fresh `seg_in`, positions,
+and a gate exactly 0 - `gate: true` written into the widened layout unless `ungated=True`, which refuses a layout that
+gates them anyway); the layout gaining `option_pointers` / `max_row_tokens`; `draft` changing. New pointer columns get
+zero `ptr` rows. Refused: everything 10.3 refuses, plus a segment losing its tail or changing its gate or columns, a
+new segment with head slots or not at the end, the layout losing `option_pointers`, a limit below the head. A
+tail-only segment's pointer columns are a matrix product of their own (`TokenNet.ptr_parts`: rows of the same `ptr`),
+so a widened network computes the old columns by the products of before (one wider product rounded them differently);
+with gradients on (training) the head is one product (43.9).
+
+**Exactness** (`tests/test_tail_net.py`): a network of the toy's layout without tails widened onto the toy's tail
+layout (tail on items, option_pointers, the gated marks) computes the old outputs bit for bit (policy, value, margin,
+the auxiliary head; CPU and CUDA; also saved and loaded) on rows without tails (eager and static) and on rows whose
+only new tokens are gated marks (static at the same T; eager when a chunk's length is the same; to float rounding
+otherwise, < 1e-5); through the CUDA graphs bit for bit on rows with gated marks. A tail network widened by gated
+segments with pointer columns: bit for bit in eager on rows with tail tokens, overrides into head slots, tail tokens
+and the gated segment; to rounding in static there (the tail embedding is one product over every tail token, and the
+old batch has fewer); the gated segment's overrides exactly the generic logit at g = 0 and exactly the pointer logit
+at g = 1 (as the same network with the segment ungated).
+
+**Exporters (R14)**: `net.varlen_features(model)` names a network's tail segments, pointer overrides and gates;
+`zero.webexport` (the browser players' weights) refuses a network with any of them (ValueError: its fixed-width rows
+would drop them). zero-onnx (`zero/onnx_export.py`) is on the `farm` branch, not in this tree: **whichever of `farm`
+and `feat/varlen` lands second adds the same refusal there** (in the exporter's constructor, beside its
+`isinstance(net, TokenNet)` check: `varlen_features(net)` non-empty -> ValueError).
+
+**Remote self-play (R13)**: `tests/test_tail_remote.py` - a local worker with a token network plays toy_tail, its v2
+shards carry tails (and the run trains on them and their overrides); a worker whose hello reports no capability
+'tails' (the tests' `no_tails`) is refused, and this machine plays every game.
+
+**Encoding guard** (10.4): the segments' `tail` / `gate` / `columns` and the layout's `option_pointers` /
+`max_row_tokens` are compared with the build's layout (absent on both sides for every layout before them);
+`layout_sans_identity` drops `draft` with `name` / `version`.
+
+**fork_run**: `tools/fork_run.py <src.pt> <run> [--ungated] [--allow-draft]`: the widen above onto the game's layout,
+checked by the guard before it is written - so a game's layout must declare `gate: true` on its new segments for the
+gated fork (else the fork is refused, or `--ungated`); a `draft` layout is refused unless `--allow-draft` (R16; a
+continuation `--source` too, unless the run's settings set `allow_draft_layout`).
+
+**Tests.** `tests/test_tail_net.py` (21): layout keys and validation, psi's exactness, both exactness tests above (CPU
+and CUDA), tails changing only their rows, static = eager with every kind of padding, the gates' gradients (eager and
+static; g = 0 explicit, g < 0 straight-through, g > 0 SDPA; inference never explicit), overrides' logits, the R5
+refusals, widen refusals, the ungated widen, the guard, the evaluator (eager, pieces, LeafBatch, aux, R4, R5),
+fork_run. `tests/test_tail_graphs.py` (8): the host packing, graphs = eager (dense and sparse, pieces, value-only and
+belief rows, g = 0 and > 0, deterministic), a batch without tails through the graph of before, the widen through the
+graphs, long rows eager beside the graphs, new weights / gates in place, the host refusals. Both build their rows
+from tensors and the toy's literal layout; `zero.rows` (lane X) is used when present, else a stub of its frozen API.
+
+**Measured** (desktop RTX 5090 shared with another session's run, 8-17% busy; three interleaved rounds, medians).
+A random 128 x 4 network on MTG Zero's layout v6 (44,212 features) against its widen onto a v7-like layout (tails on
+the 7 capped segments, 6 gated tail-only segments of 60-230 floats, option_pointers), synthetic Delver-like rows
+(~15-25 present head tokens; 1-2 gated `delayed` tokens on 23% of the rows; 1-15 ungated hand tail tokens on 4%):
+
+| per batch | v6 | v7, no tail token | v7, gated g = 0 | v7, gated + tails |
+|---|---:|---:|---:|---:|
+| eager inference, 192 rows | 34.8 ms | 30.8 | 40.1 | 43.8 |
+| train_static step, 512 rows, T 48 | 28.5 | 28.1 | 42.7 (g = 0.5: 39.7) | 45.5 |
+| graphs, 144 rows: replay / whole call | 1.66 / 3.63 | 1.71 / 3.80 | 1.87 / 4.68 | 1.90 / 4.98 |
+| graphs, 512 rows: replay / whole call | 2.57 / 7.36 | 2.65 / 7.56 | 2.80 / 9.00 | 3.57 / 10.24 |
+
+So: a tail network's batch without tail tokens costs what v6's does (the code of before); gated tokens cost the
+graphs' replay +6-9% and the host ~1 ms a call (the tail's packing, checks and four more uploads: hidden behind the
+device by drive's two batches in flight when the device is the bound), and a training step +40-50% in this
+synthetic (the tail embedding's and the weighted trunk's ~230 more kernels, at ~27 us a launch on this shared GPU;
+the explicit attention at g = 0 another ~3 ms). The toy's 32 x 2 network: graphs 1.6 -> 2.0 (no tail token) -> 3.0 ms
+(gated) a 144-row call.
+
+**Checks** (tier "opt-in core feature with byte-identical defaults"; the desktop, 2026-11-11, a38fc7f; the machine
+loaded by three other sessions' test suites throughout):
+
+* `pytest tests`: 476 passed, 4 failed, 2 errors (1 h 44 min). The remote and co-training timing tests - two
+  co-training remote-evaluation fixtures timed out, a host of `test_multi_remote` got no game, `test_remoteplay`'s
+  dying worker's share, a co-training run's subprocess exit 0xC0000005 in `test_encoding_guard` - each passed alone
+  afterwards; `test_token_graphs::test_graphs_match_eager_and_follow_new_weights` (graphs against eager: 3.7e-5
+  against its bar 2e-5) fails the same way, the same value, on f9ca5c3 on this shared GPU (4 of 4 runs each; earlier
+  1 of 3 passed on f9ca5c3). The new tests 29 passed; test_net_data / test_token_graphs / test_encoding_guard 57
+  passed in a targeted run.
+* `check_checkpoint_compat --package zero` (roots `<checkout>/python`) against f9ca5c3: a toy token checkpoint with
+  the auxiliary head, a toy MLP checkpoint and `random`: identical (records visits / cq, results, the match).
+* `smoke_all.sh --with-this-core --build-only`: glassroad-zero, caverna-zero, kingdombuilder-zero build (3 of 3,
+  GREEN).
+* With lane X's `feat/varlen-rows` (1c33d53) merged in a scratch worktree: both lanes' tail tests 56 passed, and
+  `toy_tail` runs end to end with a token network (2 iterations, CPU eager; and CUDA graphs + sparse batches +
+  train_static + a sparse window): self-play with tail tokens (up to 21 a row) and overrides through `NetEvaluator`,
+  v2 shards, training on them (the window's overrides resolved: 227), Elo matches.
+
+### 43.9 The static training step with tails and gates: its cost brought down (2026-11-12)
+
+**Why.** With gated tokens on 23% of the rows (a synthetic Delver-like batch: a random 128 x 4 network on MTG Zero's
+layout v6 widened onto a v7-like layout - tails on the 7 capped segments, 6 gated tail-only segments, option_pointers),
+a `train_static` step of 512 rows cost +45% of v6's, in the steady state too (every gate > 0), not just the gated-at-0
+phase (+56%) - against the design's +10-25%. The step is bound by the host's dispatch (~11 ms of kernels in a ~30 ms
+step, the GPU shared), and the tails' path added ~200 launches, ~815 aten operations, two host syncs and ~45 autograd
+nodes a step: per-segment loops (13 tail segments), the per-parameter assembly of the tail embedding and its
+backward, the checks.
+
+**What** (`net.py`; the math unchanged):
+
+* The static tail embedding is **one autograd node** (`_TailEmbed`): its forward runs the ops of before, unrecorded;
+  its backward the same gradients in ~12 operations (the input maps' and the positions' products, one scatter of the
+  gradient shared by both, the per-parameter gradients as views of one buffer by `split` / `unbind`; `tail_base`'s
+  gradient is the biases' - both sum the gradient over a segment's tokens -, the identity embedding's one `index_add`).
+* psi's sin / cos part comes from a table of its 256 values (n mod 256; computed once per device by psi's own ops:
+  the same floats); a tail token's identity digits are decoded by two products for all its digits (the same
+  identities for one-hot or empty digit blocks, what encoders write).
+* forward_static's checks (R5) and the explicit attention's decision are **0-d flags computed before anything else**,
+  read once - copied to pinned memory behind a CUDA event and waited for just before the trunk, when the device is
+  long past them (no drained pipeline; a bad batch is still refused before the trunk, every index clamped until
+  then). The gates' token weights are one gather from the gate vector extended by a 1.
+* With gradients on, the pointer head is one product (its row-slice parts, 43.8, are for the widen's bit-exact
+  evaluation; training does not need them).
+* The explicit weighted attention (a present gate exactly 0) is **one autograd node** (`_WeightedAttention`): the
+  forward the explicit math of before, op for op, on [B heads, T, .] batched products; the backward by hand (dv =
+  a^T dO; R = (dO v^T - D) / Z; dw_j = sum e_ij R_ij; ds = p R; dq, dk from ds).
+
+**Numerics** (the same seeded networks and batches through 391165e and this code, toy layouts with overrides into head
+slots, tail tokens and a gated segment with pointer columns, and the Delver-like network, gates 0 and 0.5, CUDA):
+every inference output - `forward_static`, `forward`, hence the CUDA graphs - **bit for bit** (policy, value, margin,
+the auxiliary head); training outputs and every parameter's gradient within float32 rounding, at most 4.2e-7 of their
+scale (the pointer head's one product, the sums of `tail_base`'s / the embedding's / the gates' gradients in another
+order, the explicit attention's backward by hand).
+
+**Measured** (the training step, 512 rows, T 48, forward + backward; the configurations alternated step by step,
+shuffled, 200 repetitions each, two runs each; the desktop's RTX 5090 shared with other sessions; medians):
+
+| step (vs v6, two runs) | before (391165e) | after |
+|---|---:|---:|
+| v6 (no tails) | 27.5 ms | 27.5 ms |
+| v7, no tail token in the batch (the code of before) | +0% / -2% | -2% / +7% (noise) |
+| v7, gated tokens g = 0.5 (steady state) | +45% / +45% | **+11% / +12%** |
+| v7, gated tokens + ungated tails on 4% of rows | +45% / +48% | +14% / +16% |
+| v7, gated tokens g = 0 (the explicit attention) | +56% / +57% | +22% / +21% |
+
+Per step at g = 0.5: launches 706 -> 643 (v6: 502), aten operations 3,173 -> 2,876 (2,354), host syncs 2 -> 0
+waits on a drained pipeline. Inference (the graphs' replay) is unchanged.
+
+Tests: `tests/test_tail_net.py`'s gradient test forces the explicit attention through `_explicit_flag` (static and
+eager); every tail test passes; the equivalence above is a scratch script (`perf_equiv.py`, not committed).
+
+**Autocast** (2026-11-12, found by MTG Zero's lane Z). `run.py` and `zero.distill` train a token network in float32
+(`infer.use_amp` turns bfloat16 autocast on for the conv network only), but any caller under CUDA autocast - and the
+graphs' measurement mode `TokenGraphRunner(amp=True)` - crashed on a gated network: the pointer blend's `torch.lerp`
+of bfloat16 logits by a float32 gate weight, and `_WeightedAttention`'s backward (float32 gradient, bfloat16 saved
+operands) whenever a present gate is 0. Fixed:
+
+* the blend runs in float32 and is cast back: bfloat16 / float16 logits are exact in float32, so it is still exactly
+  the generic logit at g = 0 and exactly the pointer logit at g = 1 (`tests/test_tail_amp.py` compares them bit for bit
+  under bfloat16, static and eager, training and inference);
+* both autograd nodes (`_TailEmbed`, `_WeightedAttention`) are `torch.amp.custom_fwd(cast_inputs=float32)` /
+  `custom_bwd`: float32 inside under autocast, their backward in the forward's autocast state; the identity digits are
+  decoded with autocast off (exact integers); eager's token weights are in the gates' dtype;
+* the eager forward's per-chunk accumulators take each chunk's outputs in their dtype (`.to`, a no-op without
+  autocast): a token network's eager forward crashed under autocast before this project too (f9ca5c3: `index_copy_`
+  of bfloat16 logits into float32), now it runs.
+
+Without autocast nothing changes (forward outputs and gradients bit for bit; the gates' and the identity embedding's
+gradients sum by atomics: they vary run to run in the last bits, as fd8e246's). The float32 mask log w and the gated
+pooling are float32 (the gates' dtype); SDPA under autocast casts the mask to bfloat16 (-inf and 0 exact). float16
+autocast still fails in `_heads` (its absent seats' -1e9 overflows float16: every network kind, before this project
+too; no caller uses float16) - with that mask made float16-safe the varlen paths run under float16 as well.
+
+Tests: `tests/test_tail_amp.py` (13, CUDA): the blend's exactness; AdamW steps under bfloat16 for eager and static
+at gates 0 and > 0 with tails and overrides into gated and ungated tokens (finite gradients, the gates' non-zero, the
+loss lower, float32's outputs within bfloat16's precision, the explicit attention exactly while a gate is 0); a
+train_static step at shut gates with and without overrides (lane Z's case); the graphs' bfloat16 mode with tails;
+`Run.train_model` on toy_tail on CUDA with autocast forced on, eager and train_static.
+
+### 43.10 The optimizer state of a network with gates (2026-11-12)
+
+**The bug** (391165e - 9ab650f; found by MTG Zero's lane Z on CPU toy_tail runs): the gates' AdamW group comes last
+(43.6: no weight decay), but `train_model` checked a reloaded state's moments against the network's parameters in
+the network's own order - so a network with gates never matched its own state ("exp_avg of parameter 2: (1025,
+32), the parameter (7,)"), and every iteration silently started a fresh optimizer, one log line each: a v7 run
+would have reset its moments every generation.
+
+**The fix** (`run.py`):
+
+* a network with gates loads its state through `match_opt_groups` (as a widened head does, 37): each saved group
+  matched to one of the network's by its parameters' count and shapes, the optimizer built in the saved order (the
+  gates' group last, a head or readers added later after it), the groups it lacks fresh; the same network's state
+  is compared in the optimizer's own group order (`opt_state_mismatch(..., params=)`);
+* **an optimizer state saved with the last checkpoint that does not fit its network refuses the run**
+  (`OptimizerStateMismatch`, an EncodingMismatch: exit 78, not restarted), naming the file: a fresh optimizer is
+  never started in silence. Deleting the file starts one deliberately; a network that changes legitimately keeps or
+  extends its state (a head or readers added, a widened head) or comes with none (`fork_run` writes no state for a
+  fork, `--net` removes it); an unreadable state is refused too; a state of another iteration (a stop between
+  writing a checkpoint and its state) is logged and replaced by a fresh one;
+* `zero.distill`'s resume checks the state it continues the same way (ValueError).
+
+Co-training trains through `train_model` (both networks), a resume after PAUSE or a restart reloads the same file,
+`fork_run --source` copies a state only when it belongs to the forked checkpoint, and the fused AdamW of
+`train_static` has the same groups: all covered by the above.
+
+Tests (`tests/test_tail_train.py`): a gated network's state at iteration 2 is the saved one, groups, weight decay
+and every moment equal, in the same process and through a resume (a new Run of the directory) - failing without the
+fix (no state loaded); a state that does not fit is refused, deleting it starts a fresh one, a state of another
+iteration is said.
+
+### 43.11 Inference speed of variable-length rows, and the transfers beside every graph (2026-11-12)
+
+**Why.** MTG Zero's layout v7 against v6, the same Delver line through its real self-play (MTG Zero's lane Z harness:
+the run's settings, CUDA graphs, 200 games from checkpoint 0 of the widened fork, conc 768, both on this core):
+v6 65.9k leaves/s, v7 56.4k (-14.4%; decisions/s -15.2%), the GPU 87-88% busy in both. Per batch (Nsight Systems,
+300 captured self-play batches of each, 224 rows on average): v6 2,650 us in its graph and 303 us between graphs,
+v7 2,893 and 345 - before the trunk +109 us (the wider head slots and globals of v7's encoding, about 2% on their
+own; the tail's checks and embedding), the trunk +106 us (tail tokens push the batch's longest row over a 16-token
+step in 15% of the batches: +3.3% token slots, +6.4% of the attention's), after it +28 us, between graphs +42 us
+(the tail's and overrides' uploads, wider rows to zero). Not the attention: SDPA runs the same memory-efficient
+kernel for v6's boolean mask and v7's float mask (log w).
+
+**Bit for bit** (every output of 300 captured v6 and v7 self-play batches unchanged, 2.4M values each):
+
+* `TokenGraphRunner` reads the layout tables its override check needs (`seg_nk`, `pos_seg`) once: a batch with
+  overrides (11% of v7's) read them from the device, waiting for the graphs in flight.
+* `forward_static` in inference on CUDA (`TokenNet._static_side`; no gradients): the inputs' checks and maps
+  (`_static_prep`) and the tail's embedding on a second stream while the head slots' input maps run on the first,
+  joined before the gather - the same kernels on the same inputs (a CUDA graph captures the fork as two branches).
+* `_static_ext` gathers from one copy of the token embeddings (each segment's flattened in turn, then the tail; the
+  index `B * before + b * count + slot`), not a copy of the head slots copied again with the tail.
+* A batch's tail integers (rows, segments, slots) are one upload, its overrides' (rows, actions, refs, columns) one.
+* **The transfers beside the graphs** (every token network): a launch's uploads go on a copy stream into device
+  staging of its own buffer set (a set is reused only after its launch's result), overlapping the graph before; the
+  device stream waits for them, copies them into the graph's inputs (a few us), replays, copies its outputs out of
+  the graph's (the next replay of the same graph may overwrite them), and a download stream brings them back. A
+  sparse batch's rows are zeroed again only where the last sparse batch wrote them (its non-zeros' places, kept on
+  the device; wholly after a dense batch), not all [B, F] floats - the same rows `zero_(); index_copy_` built.
+
+**Opt-in: length-sorted chunks** (`infer_token_chunks` N, run setting, default 0; `NetEvaluator(token_chunks=)`;
+`infer.chunk_rows`). A graph pads every row to the batch's longest: Delver's self-play rows hold 14.6 head tokens
+on average (15.5 with v7's tails) and the batch's padded T is 72 (74), so ~80% of the trunk's token slots are
+padding. With N > 1 a batch's rows are sorted by token count and cut into at most N pieces of whole 64 rows (the
+last any size), each through its own graph of its own longest row - where the cut saves by the estimate (slots x (1
++ T / 256) + 4096 a graph). On the captured batches two chunks halve the token slots and cut the attention's to
+36%. A row's outputs depend on the shape of the batch it runs in (10.6), so the answers move by float32 rounding:
+on the 300 captured batches each, priors by at most 6.6e-6, values 6.6e-7, margins 1.1e-6, the belief rows'
+auxiliary predictions 5.1e-7 (the same order as the row's own batch-to-batch spread); hence opt-in. Each chunk's
+answers are those of its rows as a batch of their own, bit for bit; long rows (43.7) and pieces (`max_rows`) work
+within each chunk.
+
+**Not done.** Moving v7's stack source references and evaluation context out of the stack / trigger slots into
+gated tokens (MTG Zero's proposal): the head-only ablation puts the whole width growth at ~2%, the move would take
+~0.6% of it and add tokens (a longer longest row) - not worth it for speed.
+
+**Measured** (the same harness; the GPU and the host otherwise idle unless said):
+
+| self-play, 200 games | leaves/s | vs v6 |
+|---|---:|---:|
+| v6, before | 65.9k | |
+| v7, before | 56.4k | -14.4% |
+| v7, the first four changes above | 58.1k (v6 65.3k) | -11.0% |
+
+The transfers beside the graphs and the chunks are measured when the shared GPU is free (a live run held it).
+
+**Tests** (`tests/test_tail_graphs.py`): five launches in flight, sparse and dense mixed, two of one graph: each
+batch's answers those of the batch alone, bit for bit, and a sparse batch's those of its dense rows; the chunks:
+off by default, `chunk_rows` cuts only where it saves, each chunk's answers its rows' alone bit for bit, the batch
+within rounding of the batch whole (priors, values, margins, belief rows, value-only rows, long rows), dense =
+sparse.
+
+### 43.12 Self-play's host work per batch: what the GPU waited for, and the drive loop's thread (2026-11-12)
+
+**Why.** 43.11's self-play (the Delver line's settings: sparse batches, CUDA graphs, conc 768, 16 threads in 4
+groups, sims 64 / 16, the belief tilt, root-view leaves; 200 games from checkpoint 0, this machine only) kept the
+GPU 88-90% busy, v7 10% behind v6; the suspect was the host's work per batch on the one Python thread that drives
+the search (polling the driver, building and launching a batch, reading its answers back, handing them over).
+
+**The profile** (ec8ecf0; the drive loop's thread timed by phase, every graph replay timed by CUDA events,
+`E:/zero-scratch/varlen-host/prof_sp.py`; 200 games, ~12,700 batches of 186-190 leaves (224 rows); per batch):
+
+| | v6 | v7 |
+|---|---:|---:|
+| the thread: build and launch | 1,913 us | 2,270 us |
+| read the answers back (`result`) | 186 | 162 |
+| hand them to the driver (`submit`) | 79 | 75 |
+| poll the driver (the next batch, its LeafBatch) | 15 | 16 |
+| wait for the GPU | 666 | 780 |
+| the GPU: in the graph | 2,575 | 2,862 |
+| between graphs, median / mean | 150 / 286 | 179 / 443 |
+| between graphs over 1 ms (a new shape's capture: 8 / 30), the run's total | 1.1 s | 3.2 s |
+
+* The search is never the limit: 1 poll in ~12,700 found the next group not ready, the driver waited 0.04 s in all.
+* The thread was not the limit either, at first: it waited for the GPU ~0.7 ms a batch. **The GPU waited for its
+  inputs.** Device events around the work between two graphs (the replay bench of 43.11's 300 captured v7 batches,
+  two in flight): the outputs' copy 7 us, the wait for the next launch's uploads **132 us** (181 in self-play),
+  the scatter of the non-zeros 14, the inputs' copies 12. The uploads had been queued ~1 ms before the graph ended.
+  On this machine (Windows, WDDM) a download queued on the copy engine waits there for its graph, and an upload
+  queued after it waits behind it (a probe: a 1.3 MB upload queued during a 3.2 ms graph ends 75 us after it
+  starts; with the graph's own download queued first, 70-85 us after the graph); every launch had queued its
+  download right after its replay, so the next launch's uploads crossed only once the graph before had ended.
+  Separate small uploads cost the copy engine too: 9 of a 1.3 MB batch 280 us, one 72 us.
+* With that wait gone (below), **the thread became the limit**: the next launch was built only after the graph before
+  had ended in a third or more of the batches (`late launches`), the GPU idle meanwhile - building a v7 launch took
+  1.4-1.5 ms on a quiet host (the replay bench), 2.1-2.6 ms in self-play beside the 16 search threads: numpy's passes
+  over the batch's ~51,000 non-zeros (the presence flags 257 us, the token positions 192, the padded tail 107, the
+  flat indexes, `rows.resolve` 51 even without an override) and ~30 torch calls of 5-20 us each (nine uploads, six
+  copies, the scatter, the downloads, the events).
+
+**What** (`infer.TokenGraphRunner`, `rows.resolve`, the engine module; every answer bit for bit):
+
+* **A launch's download is queued by the next launch** just before its replay - after its upload and its inputs'
+  copy, waiting on an event recorded there - or by its own `result` when no launch came first (`_Down`,
+  `_flush_downs`, `_wait_down`). The download runs during the next graph; nothing is queued on the copy engine
+  ahead of an upload or the inputs' copy any more.
+* **One upload, one copy.** A launch's inputs are one pinned int64 buffer per buffer set: the non-zeros' flat
+  indexes, their values (float32), the root belief rows, then the graph's own inputs at its key's layout
+  (`_layout`: n, ntok, full; with tails / overrides tint, oint, tval - regions of 256 bytes, an allocation's own
+  alignment). One upload on the copy stream into the set's staging; on the device stream one copy into the graph's
+  region of one shared input buffer (`_ibuf`; a graph keeps the views it was captured with), the scatter reading
+  the staging. The same values reach the same kernels.
+* **The sparse batch packed in Rust, off the GIL** (`pack_sparse_tokens`, `pack_tail_tokens` in every engine
+  module: `zero_py`, `crates/py/src/pack.rs`): the presence flags (a bitset per row), each row's token count and
+  positions (`token_index` / `token_index_tail`), the flat indexes and values, and the tail padded with
+  `_check_tail_host`'s checks - written straight into the set's pinned words; a batch with a row of more than
+  LONG_T tokens comes back unlaunched and goes the numpy way (its rows split, 43.7). The dense path is numpy, as
+  before. A build of an older core under this one has no packers: TokenGraphRunner says so (rebuild the engine).
+* `rows.resolve` returns at once for a batch without overrides (89% of v7's); `SearchDriver.submit` releases the
+  GIL while it hands the answers over (the shard writer thread runs meanwhile; only the drive loop's thread calls
+  the driver).
+
+Not changed: the options' softmax stays numpy (`segment_softmax_np`: a Rust exp is not numpy's float32 exp, bit
+for bit), and so does the dense path. A third batch in flight (`ZERO_INFLIGHT=3`, the existing env) gave the same
+games and shards here (below); it stays opt-in - `GraphRunner`'s two fixed host slots (a conv network's) would be
+overwritten by it (10.6).
+
+**Identity.** The answers of the 300 captured v6 and v7 batches (sha256 of every answer in order): ec8ecf0's. Real
+self-play, 200 games each, v6 and v7, the shard writer thread on and off, and with `ZERO_INFLIGHT=3`: every answer
+in submit order and every shard's arrays identical to ec8ecf0's (ec8ecf0 reproduced its own twice).
+`tests/test_pack.py` (CPU): the packers against the numpy path, bit for bit (random batches, presence flags at 0.5
+and just above, float16 tails, the long-row return, the refusals); `tests/test_tail_graphs.py`'s launches in flight
+and dense = sparse, `test_token_graphs.py`, `test_tail_amp.py`; the core's pytest (its timed `test_remoteplay` cases
+failed beside other sessions' builds and pass alone, as ec8ecf0's; `test_graphs_match_eager_and_follow_new_weights`
+fails now and then before and after alike - graphs against eager by 3.7e-5 where it allows 2e-5); toy-smoke (MLP,
+tokens, static tokens) byte for byte and `check_checkpoint_compat --package zero` (random, a toy MLP, a toy token
+network) identical against ec8ecf0; `smoke_all.sh --with-this-core --build-only`: Glass Road, Caverna and Kingdom
+Builder Zero build (MTG Zero's v6 and v7 checkouts were built on it for the measurements).
+
+**Measured** (the same self-play, 200 games, configurations alternated, `sp_table` guard: the GPU otherwise idle, the
+host quiet; the desktop's RTX 5090; two clean rounds - a third ran beside other sessions' builds and is left out):
+
+| self-play, 200 games | leaves/s, the 2 rounds | mean | |
+|---|---:|---:|---|
+| v5 (its own build, fb1d70e) | 63.8k, 63.4k | 63.6k | |
+| v6, before (ec8ecf0) | 65.8k, 66.0k | 65.9k | |
+| v7, before | 54.8k, 56.8k | 55.8k | -15.3% against v6 |
+| v6, after | 68.2k, 69.8k | 69.0k | +4.7% |
+| v7, after | 60.5k, 62.0k | 61.2k | +9.7%; -11.3% against v6 after (-7.1% against v6 before) |
+
+Per batch after (the profile above, quiet; before in brackets): v6 launch 889 us (1,913), result 172 (186), submit
+58 (79), the thread waits for the GPU 1,547 us (666); between graphs median 22 us (150), mean 48 (286); the GPU in a
+graph 98.2% of the time (90.0%); a launch late for its graph in 1.3% of the batches. v7 launch 1,515 us (2,270),
+between graphs median 24 us (179), mean 130 (443: the 30 captures of new shapes are 1.2 s of the 39.5); in a graph
+95.8% of the time (86.6%), launches late in 7%.
+
+**What is left.** v7's distance to v6 is now the GPU's: 11-13% more time in each graph (43.11: the wider head slots,
+the tail's checks and embedding, longer rows) and 22 more shapes to capture (a one-off each: ~1.2 s of a 200-game
+measurement, nothing in a long run). The graphs' matrix products run in float32 on the SIMT cores
+(`cutlass_80_simt_sgemm`, ~40% of a graph's time): TF32 would be a large cut, not bit for bit (opt-in if wanted).
+On the host, a v7 launch still builds a `rows.Tail` and `rows.Overrides` per batch with their checks and makes ~20
+torch calls; the dense path (not self-play's) is numpy as before.
+
+**Tests.** `tests/test_pack.py` (new); `cargo test -p zero_py` (`pack.rs`'s own).
+
+### 43.13 Chained episodes with variable-length rows (the merge of `feat/match-episodes-int` 2aab098, 2026-11-12)
+
+Section 42's chained contests and this section's rows meet in the driver's records: a record carries its own row -
+head, tail tokens (`TailRow`), overrides - so a contest's episodes' records, kept in the slot until the contest ends
+and handed out behind its one row, carry every episode's tails and overrides exactly; the sample arrays' CSRs (v2
+shards, the writer thread, the window) are built from them as from any game's. The row limit (43.5, docs/search.md
+2.15) ends an **episode** as aborted: no samples of its own, the contest unfinished (not over, a draw in its row),
+`aborted` with `abort_reason` `max_row_tokens` on the contest's row, the earlier episodes' samples kept; counted once
+in `tail.aborted_row_tokens` (a contest). The Python driver (`play.PyDriver`, the replay recorder) the same: its
+chained episodes' samples carry the rows' arrays (a merge that dropped them is what `tests/test_tail_search.py`'s
+chained test catches), its row-limit abort ends the contest.
+
+The core's test bed: `toy_tail`'s opt-in spec keys `episodes` (a contest of k games, chained) and `items_step` (game
+e starts from `items0 + e * items_step` items, so a later game can pass the limit); without them the game of before,
+byte for byte. Tests: Rust `driver::tail_tests` - a contest's records each a row the network was sent (head, tail
+tokens and overrides, bit for bit; dense and sparse batches), the arrays' CSRs theirs; a later game over the limit
+ends its contest aborted with game 1's samples kept -, `tests/test_tail_search.py` (the Python driver, both seat
+implementations) and `tests/test_tail_loop.py` (the run's self-play phase: one row a contest, v2 shards synchronous and
+on the writer thread array for array, the window's batches, the aborted contest).
+
+### 43.14 A shut gate's shadow: a widen's new segments learn while their gates are shut (2026-11-12)
+
+**Why.** At g = 0 a gated segment's tokens change nothing (43.6), so its own maps get exactly no gradient and the gate
+is its only learning parameter. Right after a widen those maps are random: the gate's straight-through gradient
+measures opening onto random features - noise around 0 for a trained network - and nothing ever makes the features
+useful. MTG Zero's GPU smokes of the widened Delver 3198 (2 iterations, ~100-160 steps each) pushed some gates below 0
+(links -0.007, library_known -0.018 to -0.023, graveyard_order -0.0012 to -0.0075) and others up (delayed +0.004 to
++0.024), which ones varying by run: a random walk, and a segment whose gate wanders below 0 never learns, so its gate
+never has a reason to open. A fresh network is not affected (its gates start at 1).
+
+**What** (`net.GATE_SHADOW` = 0.1; a model's `gate_shadow` attribute overrides it, 0 = the gradients of before). In
+training, a gated segment whose gate is below the shadow is **back-propagated as if its weight were the shadow**
+while the forward keeps g = max(theta, 0) exactly:
+
+* the attention runs as the explicit math (43.6, 43.9) whenever a present gate is below the shadow (before: exactly
+  0); its node's backward takes the shadow weights - p, Z and the attention output recomputed with them - so the
+  segment's keys and values (its maps, positions, base, identities) get the gradient of weight `GATE_SHADOW`, and the
+  gate's own gradient is taken there (how much more of the segment would help);
+* the pooling adds `(h - h.detach()) * (w_shadow - w)`, the blend of an override into such a segment
+  `(ptr - ptr.detach()) * (shadow - min(g, 1))`: + 0 in the forward, exactly, and the shadow's gradient into the token
+  and the pointer logit.
+
+Every forward is unchanged, bit for bit (inference, and training's at g = 0: the same explicit path as before); the
+widen stays exact at step 0. Between 0 and the shadow, training's forward is the explicit math instead of SDPA (the
+same values up to rounding, 43.6). A network without gates never reaches this code. A deliberate change of the
+gradients of networks with gates (feat/varlen only: no run has trained one).
+
+**The open path's gradients change too** (a correction, the Fable review of 2026-11-12; 47.11). The backward recomputes
+p, Z and the attention output with the shadow weights for the whole batch, so the dq, dk, dv of every *ungated* token
+come from an attention the forward did not run - not only the gated segments' maps and the gate move, as the
+paragraphs above read. The review's probe (the core's toy, a gated segment at theta 0, CPU): forward bit-identical with
+and without the shadow; the gradient of every parameter outside the gated segments' own maps and the gates changes by
+**2.6%** overall without overrides into gated segments (cosine 0.99966) and **4.0%** with them (cosine 0.99922) -
+`blocks.*.ln1` 8-12%, `blocks.*.qkv` 6-9%, and with overrides `pk.weight` **37%**, `pq.weight` 30%, `ptr.weight`
+15%. It lasts as long as any present gate sits below the shadow: for a segment with nothing to read (MTG Zero's
+`graveyard_order` in a Delver mirror without Shallow Grave: tokens in 72% of rows) that is for good. A standing bias of
+the trunk's gradients, small and deliberate-by-construction but not stated before; not changed (it would change
+default training): an opt-in that confines the shadow to the gated tokens' key / value gradients and the gate's own is
+proposed in 47.11.
+
+**Compared** (`tests/test_tail_gates.py`'s toy, a sweep of 5 seeds x 800 steps, CPU, 2026-11-12): toy_tail's layout
+widened by a gated segment whose tokens carry a bit as the parity of a one-hot code's index (no feature of a random
+input map carries it on average; the bit is worth ~0.4 nats a row), and the same segment carrying noise. Held-out loss
+(the old network without the segment: 0.671 on the informative task, 0.525 on the noise one):
+
+| variant | informative: loss | gate at the end | went below 0 | steps to read the bit | noise: loss | gate |
+|---|---:|---:|---:|---:|---:|---:|
+| before (no shadow) | 0.416 (2 of 5 runs never read it: 0.671) | -0.40 .. +0.09 | 3 / 5 | 200-300, or never | 0.525 | -0.003 .. +0.025 |
+| shadow 0.03 | 0.246 (5 / 5) | +0.06 .. +0.11 | 0 / 5 | 200 | 0.525 | -0.002 .. +0.015 |
+| **shadow 0.1** | 0.246 (5 / 5) | +0.05 .. +0.10 | 0 / 5 | 200 | 0.525 | -0.001 .. +0.015 |
+| shadow 0.3 | 0.246 (5 / 5) | +0.03 .. +0.10 | 0 / 5 | 200 | 0.525 | -0.001 .. +0.016 |
+| floor: theta >= 0.05 after each step | 0.246 (5 / 5) | +0.10 .. +0.15 | 0 / 5 | 200 | 0.525 | 0.05 (forced open) |
+| shadow 0.1 + the new segment's maps zero at the widen | 0.246 (5 / 5) | +0.06 .. +0.07 | 0 / 5 | 100-200 | 0.525 | -0.006 .. +0.004 |
+
+The shadow reads the bit every time at any weight from 0.03 to 0.3, and leaves a noise segment's gate at ~0. A floor
+works too but holds every gate open (a noise segment for good) and changes the forward at the first step; zero maps
+at the widen are a little faster on this toy and change the widen's weights (not its outputs) - not taken: the
+shadow alone is enough, and lane Z's existing v7 forks keep their meaning.
+
+**Costs.** While a present gate is below the shadow, training runs the explicit attention (43.9: the g = 0 phase's
+step cost +21-22% of v6's where the steady state's is +11-12%) plus one recomputed product a layer in its backward; a gate that stays shut
+(a segment with nothing to read) keeps that cost. Inference: none.
+
+**Tests.** `tests/test_tail_gates.py` (new): an informative gated segment opens and its widened network beats the old
+one by > 0.2 nats (3 seeds, eager; and train_static), the widen exact at step 0; a noise segment does no harm and its
+gate stays below 0.25. `tests/test_tail_net.py::test_gradients_reach_the_gates`: with the shadow every gated segment's
+maps get a gradient at g = 0; without it (`gate_shadow` 0) exactly none, the forward the same bit for bit.
+
+## 44. The native self-play worker: zero_worker, one settings parser, parity gate 2 (no setting; zero-farm phase 0b, 2026-11-11)
+
+**Why.** zero-farm's worker (section 41) plays a run's self-play games on a friend's PC with no Python and no
+torch, for any run's settings, and its rows must be the rows a Python remote worker (5.3) would have written. So
+every play-affecting rule has one implementation, in Rust, shared by both (zero-farm DESIGN.md 2.1 points 3-4),
+a setting the worker cannot honour is refused loudly, and the worker is proven against the Python remote worker.
+
+**What.**
+* **One settings parser** (`zero_search::settings`, docs/search.md 4.1): the seat dicts, `branch` / `starts` and
+  the `DriverCfg` with its de-duplicated seat table, over serde_json values - moved from `zero_py`, which now
+  converts its dicts to JSON and calls it. Two tightenings for inputs no caller makes: a bot / external seat with
+  another key is refused (it was ignored), a non-finite float is refused. `<engine>.driver_settings(seats, ...)`
+  gives the `DriverCfg` a `SearchDriver` would get, as text (a diagnostic).
+* **`Driver::set_first_gid`** (docs/search.md 2.16): a rolling driver's games numbered from a given id, so a farm job
+  is a block `gid_base..` of one run-wide numbering (each game's streams derive from (seed, gid)).
+* **`crates/worker` (zero_worker)**, a workspace member outside `default-members` (this repo's `cargo test` and the
+  games' builds never compile ONNX Runtime): `settings` (a run's settings -> the remote worker's self-play driver:
+  a port of `Run.nn_seat(selfplay=True)` / `games.nn_seat` with the `mcts` checks and `Run.driver(..., rolling,
+  queue_only)`, Python's value rules, the spec as `json.dumps` writes it; parsed by `zero_search::settings`),
+  `classify` (`check-config`, the explicit table `run_settings.json`), `eval` (`OrtEvaluator`: `ort` 2.0.0-rc.15,
+  `load-dynamic`, ONNX Runtime 1.31; the graph's metadata checked - zero_onnx, game, features, actions, aux_width,
+  checkpoint_sha256 -, batches over 64 rows in pieces grouped by non-zero count, the float32 max-subtracted softmax
+  of each row's options, value / margin as given, the belief rows' aux; session inter-op 1, sequential,
+  optimization ALL, intra-op threads and spinning configurable; `Uniform` = `infer.UniformEvaluator`), `job` (the
+  remote worker's loop - resume, `pump` after every submitted batch, setups capped at `conc` in flight and the
+  job's games in all, `infer._drive_pipelined` with 2 batches in flight submitted in launch order, the evaluator on
+  its own thread; yield / resume / finish / quit / checkpoint), `shard` (zero/data.py's format), `proto` (the CLI and
+  zero-farm's agent<->worker protocol `aw/1`: `serve`). A game's worker binary is `zero_worker::main(GAMES, repo)`.
+* **`check-config`**: every `zero.run.DEFAULTS` key is `play` (49 keys: read and supported), `trainer` (85:
+  training, evaluation, orchestration, Python inference, network shape - the network is the graph), `python_only`
+  (the league, branched games, archive starts, co-training: refused unless off) or `param` (a python_only switch's
+  settings); `aux_<target>_w` play, `reader_<target>` trainer; anything else is unknown and refused.
+  `tests/test_worker_settings.py` fails when DEFAULTS and the table differ, so no setting is ever ignored in silence.
+  (Python's `resolve_config` keeps unknown keys silently: five mtg-zero run configs carry settings of other branches -
+  `selfplay_league_fixed`, `selfplay_explore`, `selfplay_temp_late`, `selfplay_sims_light`, `selfplay_opp_model` -
+  that this core would ignore; the worker refuses them.)
+* **`zero.onnx_eval.OnnxEvaluator`**: the graph through onnxruntime as a NetEvaluator-compatible LeafBatch evaluator
+  (the Python reference of the native one; the desktop's evaluator of a graph). Tools: `driver_settings_dump.py`,
+  `seat_parser_edges.py`, `worker_parity.py` (gate 2 a), `onnx_worker_gate.py` (b), `onnx_h2h.py` (c),
+  `worker_serve_check.py` (aw/1 with a real network), `worker_bench.py` (throughput).
+
+**Off by default.** Nothing changes for a run: the same seats and drivers (below), `set_first_gid` never called.
+
+**Tests and checks** (2026-11-11, the desktop busy with the live Delver run, CPU only).
+* **The parser move changes no seat:** `tools/driver_settings_dump.py` over every mtg-zero preset and every run
+  `config.json` under `C:/.../mtg-zero/runs` and `E:/mtg-zero/runs` (79 cases; the drivers of a remote self-play
+  worker, of this machine's self-play, of the evaluation against the yardstick and random, of the Elo matches,
+  of the bots' reference games): old parser (f60664c) vs new (f508146), **468 drivers identical**, 1 case refused
+  by both (`toy-cotrain-smoke`: its game is not in mtgz's module). `tools/seat_parser_edges.py` (47 edge cases,
+  the toy module of each commit): 45 identical or refused by both, the 2 deliberate changes listed.
+* **The worker's port of the run settings -> driver** (`driver-cfg` vs the Python remote worker's DriverCfg, the
+  same 79 cases): 72 identical (or refused by both), 6 refused by the worker as Python-only (4 league runs, 2 with
+  branched games / archive starts), 0 different.
+* `cargo test -p zero_search` (`first_gid_plays_the_same_games` new; the timing test
+  `a_slow_step_holds_up_its_own_group_only` failed once on the loaded desktop, passes alone 3 of 3), `cargo test -p
+  zero_worker` (11 unit + 4 job tests on the toy game: yield / resume gives the same shards, a gid block plays those
+  games, the shards hold every game, quit / finish), `tests/test_worker_settings.py`; the checkpoint-compat
+  goldens old (f60664c) vs new, toy: identical (visits 169 samples, records b1b86b689ab98313; cq d02691e9e005a5d5;
+  vs random 3.0/16, dcf8b2b840d45e66); toy_team identical (no samples). The full pytest: below.
+* **Parity gate 2** (zero-farm docs/phase0b-worker.md has every number): (a) plumbing, `tools/worker_parity.py` on
+  eoe1's settings with groups 1, the uniform evaluator, 48 games: zero-core's `remoteplay.Worker` and `mtgz-worker
+  selfplay` wrote **byte-identical shards** (2 shards, 14,136 rows) and sent **identical first 300 batches**; (b)
+  evaluator, `tools/onnx_worker_gate.py`, 440 recorded eoe1 batches (33,901 rows, 751 belief rows): native vs
+  `OnnxEvaluator` priors <= 1.8e-7, value / margin / aux bit-identical; vs torch <= 1.34e-5 (margin); (c) behaviour:
+  below. `tools/worker_serve_check.py`: aw/1 with eoe1 iter 80's graph, a yield after the first finished game and a
+  resume 3 s later - the same shards byte for byte as the job left alone, `yielded` 31 ms after `yield`.
+
+**Measured** (2026-11-11, the desktop: i9-13900K, CPU only, 90-100% busy with the live Delver run and other agents'
+work; zero-farm docs/phase0b-worker.md has the tables).
+* **Throughput at 8 threads** (`tools/worker_bench.py`, eoe1's settings with threads 8, groups 2, conc 256,
+  torch_threads 1, infer_workers 1; the native side ONNX Runtime with 8 intra-op threads; 10 minutes per run,
+  interleaved, 2 rounds): native 1,368 / 1,281 leaves/s, Python remote worker (torch eager) 911 / 859 (rounds 0 / 1; the
+  CPU 92-100% busy) - **1.50x**, about 390 vs 260 games/h at 12,250 leaves an eoe1 game; the native worker is
+  inference-bound (its evaluator busy 592 of 599 s); peak working set 1.5 GB at conc 256.
+* **Gate 2 (c), behaviour** (`tools/onnx_h2h.py`: eoe1 iter 80's graph through onnxruntime against the checkpoint
+  through torch, CPU, 32 simulations, the evaluation seats, eoe1's evaluation spec, paired): 100 games in 74.7 min
+  (batches of 20 under a 60-minute budget, the fifth started at 58 min), A = the graph through onnxruntime (4 threads),
+  B = the checkpoint through torch: **0.500 +- 0.000** (paired se), pentanomial [0, 0, 50, 0, 0] - every pair split, no
+  result decided by the evaluator (95% bound on decided pairs 6%, |score - 0.5| < 0.03); mean margin -0.1, so not every
+  pair was played move for move alike, but no difference changed a result.
+* Session load 0.2-0.4 s; `yield` -> `yielded` 31 ms, `resume` 0.4 s; the binary (mtgz-worker.exe) 23.7 MB, ONNX Runtime
+  1.31.1's DLL 19.3 MB (+ the MSVC runtime: MSVCP140, VCRUNTIME140, VCRUNTIME140_1, ~0.9 MB).
+* **zero-core pytest** (venv, CUDA hidden; all 472 tests, in parts - the full run reached 347 of 469 in 117 min on the
+  loaded desktop, the rest and the files with failures ran again at eec96bc): every test passes or fails the same way on
+  the old code (f60664c) - 5 that need a GPU (CPU-only session), `test_a_dying_worker_gives_its_accepted_games_back`
+  (the same quota assertion alone, old and new), `test_graphs_match_eager_and_follow_new_weights` (flaky on both); 13
+  more failed only under the load (timeouts, phase caps) and passed alone or rerun. mtg-zero: pytest 271 passed, 1
+  skipped (`tests/test_worker_shards.py`: the worker's shards pass `RemotePlay._check` and load into `Window`), the
+  digests unchanged (53839c837bbaf034), `--test az` 48 passed.
+
+### 44.1 Fuzz jobs, the per-machine self-test, the runtime pack (no setting; zero-farm phase 1, 2026-11-12)
+
+**Why.** zero-farm phase 1 puts friends' PCs on fuzzing first (zero-farm DESIGN.md 6: fixed seeds of a game's own
+fuzz loops, no network, no training data at stake), and every network job must first prove, on that PC, that its
+evaluator answers as torch does (DESIGN.md 2.1 point 5) and load ONNX Runtime from a verified runtime pack, never from
+whatever is on the PC.
+
+**What.**
+* **Fuzz jobs** (`zero_worker::fuzz`; zero-farm PROTOCOL.md 5 `fuzz` and 5.1). A game binary registers a `FuzzGame`
+  (`zero_worker::main_with(&Worker { games, repo, selfplay, fuzz: Some(&MyFuzz) })`): `plan(mode, env)` - which of its
+  loops a job means, refusing settings the loop would ignore -, `run_chunk(plan, env, first, count, hooks)` - the loop
+  over a range of seeds, seed by seed through `ChunkHooks` (before / passed / side_failure) -, `repro(...)` and
+  `profile()`. The rest is game-agnostic: the lease's seeds are cut into chunks (at least the loop's `min_chunk`, so its
+  checks over a whole chunk keep their meaning; default max(min_chunk, count / 4 threads)) and up to `threads` chunk
+  processes run at a time (`<worker> fuzz-chunk <spec>`, one thread each, no console window, the worker's priority class
+  and EcoQoS state, `SetErrorMode` so a crash shows no dialog), each writing one progress line per seed (start / pass /
+  fail / side) to a file and its stdout + stderr (the loop's report, the panic hook's messages) to a log.
+  * A seed that panics ends its chunk (as the game's own loop stops at a failing seed): a `failure` event {seed, mode,
+    panic (the hook's text of the first panic recorded during that seed), site (that panic's `file:line`, '/'), repro,
+    output_tail (the log's last 200 lines / 32 KB)} and the chunk goes on from the next seed in a new process. A panic
+    outside the loop's per-seed catch while a seed is in play is that seed's failure; after the last seed (the chunk's
+    own checks) it is a chunk failure (repro + ` (the chunk: <count var>=n)`).
+  * A chunk process that dies without unwinding (abort, stack overflow) or plays one seed past `seed_timeout_s` of CPU
+    time (default 300 s; CPU time, so a PC that starves the worker is not a hang) is cut at that seed: the seeds before
+    it passed, the seed runs alone, and only if it crashes or hangs again is it the failure (`crash exit <code>` /
+    `HANG <mode>`, tools/fuzz_farm.py's names); either way the job goes on after it. No seed can take a lease down or be
+    handed out for ever.
+  * `yield` suspends the chunk processes (NtSuspendProcess; their CPU clocks stop) before `yielded`; `resume` resumes
+    them; `finish` lets each finish its seed; `quit` (or stdin closing) kills them. `fin` every second with the seeds
+    done; `end` {reason, stats, unfinished {seeds}} - the agent builds the 5.1 summary and its `x-ids` from the failures
+    and `end` (agent 0.1.3). The worker writes the same summary to `out_dir/fuzz-final.json` and announces it as a
+    `records` file only when the job asks (`announce_result`: announcing it to agent 0.1.3 would credit the seeds twice
+    over in `units_done`). Stats: games = seeds, failures, chunks, cpu_s, children's rss, provider "cpu" (CPU work: an
+    agent takes any other provider for a GPU job and holds it back on a PC without one - found by phase 1's end to end).
+  * Test faults: env `ZERO_FARM_TEST_FAULT=panic:S,abort:S,overflow:S,hang:S` injects them at seeds, taken only by a
+    build with debug assertions whose process has `ZERO_FARM_ALLOW_TEST_FAULTS=1`; anywhere else the key is refused.
+  * CLI: `fuzz` (a job from flags; `--keep-chunks`), `fuzz-check --mode M --env K=V ...` (what a campaign means and
+    its repro), `fuzz-chunk` (the child). A build's engine commit and profile come from its signed `manifest.json`
+    (else `ZERO_FARM_ENGINE_COMMIT` / `ZERO_FARM_PROFILE`); a manifest whose profile is not the compiled one is refused.
+* **Self-test** (`zero_worker::selftest`, PROTOCOL.md 5 `selftest`): a job or `checkpoint` line's `reference` (the
+  checkpoint's `reference.npz`, below) is answered by the job's own evaluator - this PC, this ONNX Runtime, this
+  provider - before its first batch, batch by batch as recorded; event `selftest` {provider, max_abs, ok, rows, items:
+  priors / value / margin / aux}; max_abs past 2e-5 (or not finite) is a fatal error: nothing is played. Stats
+  `selftest_max_abs`. The set's game / features / actions and checkpoint sha256 must be the network's.
+* **The reference set** (`zero.onnx_export --reference N --reference-batches <recorded batches>`, `write_reference`,
+  `check_reference`; section 41): N real rows of recorded driver batches (whole batches spread over the files, the last
+  cut) with torch's eager answers (`NetEvaluator`, CPU, batch by batch), `reference.npz` (meta, the driver's sparse
+  arrays, `batch_off`, priors / value / margin / aux); the export checks the graph through onnxruntime against it and
+  exits 1 past 2e-5, so a checkpoint whose graph fails is never published.
+* **ONNX Runtime from the runtime pack only**: `serve` loads it from the job's `runtime_dir` or `ZEROFARM_RUNTIME_DIR` (a
+  network job without either is refused); on Windows the MSVC runtime next to `onnxruntime.dll` (the pack's app-local
+  copies) is loaded first by full path, so ONNX Runtime binds to it whatever the PC's System32 holds (ONNX Runtime 1.31.1
+  is linked with toolset 14.44 and imports `_Mtx_lock`: an older msvcp140 crashes it). `info --runtime-dir D` says
+  where each DLL came from.
+
+**Tests and checks.** `cargo test -p zero_worker` (14 unit + 4 job tests: the self-test passing, failing on a 1e-3 prior
+and on NaN, a corrupted reference file refused, id ranges, faults refused without the switch); `tests/test_onnx.py` 17
+(`test_reference_set`: the rows are the file's, dtypes, ORT within 2e-5, a corrupted answer caught, too few rows / no
+belief row for an auxiliary head refused). mtg-zero's `tests/test_worker_farm.py` runs it all through `mtgz-worker serve`
+(ENGINE.md 114.2 there): fuzz over aw/1, refusals, yield / resume / quit, injected panic / abort / stack overflow / hang
+isolated to their seeds, the self-test passing with a small random MTG network and a corrupted reference stopping the
+job before any game. zero_search unchanged.
+
+**Measured** (2026-11-12, the desktop, CPU only, busy with the live Delver run): eoe1 iter 80's reference set from
+phase 0a's recorded batches: 256 rows (7 belief, 60 value-only) in 3 batches, 357 KB; onnxruntime vs torch 4.6e-6 (margin;
+priors 4.5e-7, value 1.2e-6, aux 2.7e-7); `mtgz-worker`'s self-test on it 4.59e-6 in 0.16 s; with one prior off by 1e-3 the
+job stops before its first game.
+
+### 44.2 Eval jobs and farm head-to-heads (no setting; zero-farm phase 2, 2026-11-12)
+
+**Why.** An A/B of two checkpoints (zero.h2h) costs hours of a desktop's CPU; zero-farm (PROTOCOL.md 5.2, rev 5)
+lets friends' idle PCs play the games of an evaluation match. Each eval lease is a block of the match's game ids;
+the native worker plays exactly those games of the match a run's own evaluation would play, and the desktop reads
+the rows like a local match.
+
+**What it does** (`zero_worker::evaljob`, `zero.farm_eval`, `zero.farm_h2h`):
+
+* **The games**: an eval job of games `gid_base .. gid_base + games` between two seats (`{"net": <gen>}` - a
+  network of the job's `models` - or `{"bot": <name>}`, a built-in bot; `ext:` refused) is `Run.play_match`'s
+  match: seats `Run.nn_seat(key, c['eval_sims'])` ('m' in seats[0], 'o' in seats[1]; `settings::eval_seat`, the
+  `games.nn_seat` port the self-play seat now shares), game g with `seats` for even g and the seats swapped for
+  odd g, `Run.driver(table, seed, conc=min(conc, games), paired)` - the run's `eval_spec`, threads, groups,
+  max_steps (`settings::eval_driver_cfg`; a job's own threads / conc / groups over the run's, as for self-play).
+  The worker plays the lease as a rolling `queue_only` driver with the lease's setups all queued before its first
+  resume and `set_first_gid(gid_base)` (docs/search.md 2.16): with one group, the fixed table's batches in its
+  order. `eval_spec` must be set (Python falls back to the game package's `eval_specs` hook, which a worker cannot
+  run): the desktop resolves it (`farm_eval.resolve_eval_spec`, `Run.driver`'s rule).
+* **The networks**: one ONNX Runtime session per generation of the job's `models`, each file's sha256 checked
+  and each self-tested before any game (`selftest` with its `gen`; a failure is fatal); a batch goes to its key's
+  generation (`ByKey`). Stats' `selftest_max_abs` is the largest of them. (Since 70: sessions per seat key on evaluator
+  lanes of their own, and on the CPU groups from the job's threads, not the settings'.)
+* **The rows**: one JSON line per game, `{"gid", "pair", "seats", "result", "margin", "rounds", "over"}` (`pair`
+  gid // 2, null unpaired; `seats` that game's order; `result` per seat in it; `margin` seat 0's score minus the
+  best other seat's, `Run.play_match`'s margin from seat 0) exactly as `json.dumps(row, separators=(',', ':'))`
+  writes it (`evaljob::row_json` = `farm_eval.row_json`). Files `e_SSS.jsonl` of whole pairs, every 16 complete
+  games or 120 s and at the end, each announced by `evals` (`shard`'s fields). `finish` drops the queued setups
+  (`Driver::clear_queue`) and the games in flight finish; `quit` ends the driver's phase and flushes what
+  finished (a pair's lone game too); yield / resume as for self-play; `checkpoint` is refused (non-fatal).
+* **check-config --eval** (`classify::classify_eval`): the settings an evaluation match reads
+  (`settings::EVAL_READS`, 33) are `play`, every other known setting unused (`trainer`: a self-play feature that is
+  Python-only does not change an evaluation's games), unknown keys refused; then the match's driver is built (the
+  seats' checks, the eval spec, the bots of the game). `serve` refuses an eval job whose settings fail it.
+  `tests/test_worker_settings.py::test_eval_jobs_read_what_an_evaluation_match_reads` checks EVAL_READS against
+  the keys `Run.nn_seat` and `Run.driver` read (an instrumented dict over the variants that read conditional
+  ones). A game package's own run settings (`GamePackage.settings`, 40) are classified by the worker binary
+  (`Worker::package_settings`; MTG Zero lists its 13).
+* **The softmax** (`eval::softmax_exact` / `onnx_parity.exact_softmax`): the generic step's exp is now computed
+  through a fixed sequence of float64 IEEE operations (Cody-Waite reduction by ln 2, the degree-13 Taylor
+  polynomial by Horner, an exact scaling by 2^n, one rounding to float32; no libm, no FMA) and the sum in float32
+  in order, so the native worker on any machine and numpy compute the same priors bit for bit. numpy's float32
+  `exp` differs from it in the last bit on 32% of 150k points in [-110, 0] (and so did the CRT's `expf` the worker
+  used): one bit of a prior can turn a searched move, and the gate compares games byte for byte. The new exp equals
+  float64 `exp` rounded to float32 on all 150k points. Every evaluator that uses the generic step (the worker's,
+  `OnnxEvaluator`, `check_reference`) uses it; `infer.segment_softmax_np` (torch's evaluators) is unchanged.
+* **`python -m zero.farm_h2h`** (game packages wrap it: `python -m mtgz.az.farm_h2h`): `--a`, `--b`, `--games`,
+  `--build`, `--runtime` [`--config` | `--preset`] [`--sims`] [`--name`] [`--seed`] ...: the settings (default: A's
+  run's config.json, resolved; `--sims` sets eval_sims; eval_spec resolved; the seats checked), both checkpoints
+  exported (`onnx_export`, packed) with reference sets (256 rows of a short recorded self-play of A, or
+  `--reference-batches`; checked through onnxruntime, 2e-5), the run `h2h-<slug>` put with `eval: null`, the
+  graphs and reference sets uploaded, gens 1 (A) and 2 (B) registered, then the eval batch (`checkpoints [1, 2]`,
+  seats [{"net": 1}, {"net": 2}], paired); then it polls the results, reads each chunk as the coordinator credits
+  it (its `ids` rows, plus its `also` entries' rows: a pair counts only when both games come from one lease),
+  acks what it saved and prints a progress line, and at the end A's score +- the pair se, the Elo difference with
+  its 95% interval, the games and the machines, and the JSON line `zero.h2h.summary` gives (plus `elo_95`,
+  `machines`, `run`). `--resume NAME` re-attaches (every step idempotent, state in `~/.zero-farm/h2h/<run>/`),
+  `--cancel NAME` pauses the run. The admin token is read from `~/.config/zero-farm/admin_token` and never printed.
+
+**Not zero.h2h's seats.** zero.h2h builds its seats from `games.nn_seat(key, sims, c_puct, chance_k)` and the
+checkpoint's run's rule keys (`run_rule`), and plays the game package's default spec unless `--spec`: it leaves out
+the run's `margin_w`, `redet` and `eval_cache` and its `eval_spec`. A farm head-to-head plays the run's own
+evaluation (Run.play_match's seats and spec) - the same as zero.h2h for a run whose margin_w is 0, redet on,
+eval_cache 0, when zero.h2h is given `--spec <eval_spec>`. The readout's fields are zero.h2h's, so the numbers
+compare directly. (Since 44.3 zero.h2h plays a run's evaluation itself: its seats and spec are these.)
+
+**Off by default.** Nothing in a run changes: an eval job is a worker's, `zero.farm_h2h` a desktop command.
+The softmax change touches only the ONNX evaluators (the worker's and `OnnxEvaluator`, the farm's), never a run's
+torch inference.
+
+**Tests and checks.** zero_search: `a_queued_rolling_driver_plays_a_fixed_tables_match_batch_for_batch`,
+`clear_queue_starts_no_new_game` (153 pass). `cargo test -p zero_worker`: 17 unit (the exp equals float64's rounded,
+the softmax, check-config's eval classes and package settings, compact JSON) + 5 eval job tests on the toy game
+(the rows, whole pairs per file, a lease of games 6.. equal to the whole match's rows, yield / resume changes
+nothing, quit / finish, network against the bot, the refusals) + the 4 job tests. `tests/test_farm_h2h.py` (a fake
+coordinator that plays the batch with the uploaded graphs and hands it out as the coordinator credits it). MTG
+Zero: `tests/test_worker_farm.py` (an eval job over aw/1 byte-identical to the Python path on small random MTG
+networks, a lease of the second pair, network against the heuristic bot; check-config --eval and the package's
+settings).
+
+**The eval gate** (`tools/worker_eval_gate.py`): the Python path - `farm_eval.match_driver` (Run.play_match's
+driver) driven by `infer.drive` with `OnnxEvaluator` on the same graphs - against `mtgz-worker eval`, the same
+settings (groups 1), seeds, search threads (4) and ONNX Runtime threads (4); every row compared byte for byte, and
+the first 60 batches each side sent in every array.
+
+**Measured** (2026-11-12, the desktop, CPU only, shared with the live runs): the eval gate, eoe1 iter 80 (A) against iter 70 (B), eoe1's settings
+with groups 1 and 4 search + 4 ONNX Runtime threads on both sides, eval_sims 32, the 'cq' rule, paired:
+
+| case | games | rows identical | batches compared | native | Python | readout (zero.h2h.summary) |
+|---|---|---|---|---|---|---|
+| iter 80 vs iter 70, seed 31 | 20 | **20 of 20** | 60, identical | 190 s | 230 s | A 0.500 +- 0.105 (pairs: 2 both won, 6 split, 2 both lost) |
+| iter 80 vs iter 70, seed 1031 | 40 | **40 of 40** | 60, identical | 881 s | 698 s | A 0.550 +- 0.050, Elo +35 (95%: -34 .. +106) |
+| iter 80 vs the heuristic bot, seed 7 | 12 | **12 of 12** | 60, identical | 27 s | 34 s | iter 80 scores 1 of 12 (eoe1's own evaluation: 22 +- 4% of 100) |
+
+(the desktop at 100% CPU during the second; both sides' self-tests 7.0e-6 / 4.6e-6.) **A lease is the match's games**:
+leases of games 0..10 and 10..20 (conc 10 instead of 20: other batches) played the same 20 rows, byte for byte, as the
+20-game match. **Settings, every preset and run config** (`tools/driver_settings_dump.py --compare-worker --eval`): the
+eval driver of 82 of 82 MTG Zero presets and run configs is the same in the worker as in Python (`toy-cotrain-smoke`
+refused by both before); the self-play path after the seat port's refactor: 76 agree, 6 refused as Python-only, 0
+different (as before). **End to end** (MTG Zero ENGINE.md 114.4): a local coordinator (rev 5) and the real agent engine
+(0.2.4) with the published worker build played a farm_h2h batch of 8 games in two leases (groups 3, the runtime
+pack's ONNX Runtime): every per-gen self-test passed, all 8 games credited, and the 8 rows are byte-identical to a local
+Python evaluation of the same 8 games in one driver. The exact exp equals float64 `exp` rounded to float32 on 150,479
+points of [-110, 0]; numpy's float32 `exp` differs from it on 47,643 of them.
+
+### 44.3 Signed definitions, one meaning of a model's sha256, zero.h2h = a run's evaluation, farm_report (no setting; zero-farm phase 2b, 2026-11-12)
+
+**Why.** zero-farm's security review (2026-11-12, findings H2, H3, M2) found that the coordinator - or anyone with its
+admin token - chose everything a friend's PC downloads and runs: the job JSON, the networks (any ONNX file with a
+matching hash it also wrote), the worker build. PROTOCOL.md rev 6 section 7 moves that choice to the desktop: every
+run or campaign the farm works on is described by a **definition** signed with a data key the coordinator never holds;
+agents build their job lines only from its templates. The desktop tools have to produce those definitions.
+
+**What it does.**
+
+* **`zero.farm_def`** (desktop only): `definition/1` documents - kind (`run` | `campaign`), id, version, created,
+  expires, game, builds (the worker builds allowed), runtime, checkpoints (`{"<gen>": {model_sha256, model_size,
+  reference_sha256, reference_size}}`), jobs (`selfplay` / `eval` / `fuzz` templates, exact; null when unused) -
+  checked exactly as zero-farm's `agent/common/src/definition.rs` checks them (`farm-release define` refuses to sign,
+  and an agent to run, anything else; `validate`): a template holds only its kind's keys (self-play `settings`; eval
+  `settings`, `seats`, `paired`; fuzz `mode`, `env`, `announce_result` - never a per-lease field such as `seed`),
+  **no string or key anywhere in a template looks like a path** (`/`, `\`, `..`, a drive `C:`: `looks_like_path`), seats
+  `{"net": gen}` / `{"bot": a built-in name}` whose gens are all signed checkpoints, `game` a slug, 1 to 64 distinct
+  24-hex builds, files of 1 B to 1 GiB, a campaign fuzz-only, a run never fuzz. The **version** is strictly increasing
+  per (kind, id): the coordinator's current one (`GET /v1/admin/run|campaign/{id}` -> `definition`) or the archive's
+  newest, whichever is larger, + 1. The **archive** `~/.zero-farm/definitions/<kind>/<id>/<version>/definition.json`
+  keeps every definition as written (the signed bytes, never re-serialised; a version is never rewritten with other
+  bytes), with farm-release's `definition.json.minisig` and, once published, `published.json` (url, version, sha256:
+  `published_to`). **Publishing** is zero-farm's `farm-release define <definition.json> --key <data key> --publish
+  --url <url>` (`--farm-release` / env ZEROFARM_FARM_RELEASE, default `E:/cargo-target/zero-farm/main/release/
+  farm-release.exe`; the data key `~/.config/zero-farm/data.key`); the admin token (`~/.config/zero-farm/admin_token`)
+  goes to it in its environment (ZEROFARM_ADMIN_TOKEN), never on its command line, and is scrubbed from its output.
+  Its one JSON result line must name this kind, id, version, key and sha256 with `published: true`, the signature must
+  be next to the file, and the coordinator's answer must then name the version as current (an older coordinator names
+  none: a note). The farm tools' HTTP client (`Client`) now lives here.
+* **`zero.farm_h2h`** puts the run, then **its definition** (builds [the worker build], the runtime, gens 1 and 2 with
+  their graphs' and reference sets' sha256 and sizes, `jobs.eval` = {settings, seats, paired}), then the gens, then the
+  eval batch whose job object **is** the template (`eval_job`): the coordinator issues leases only within it.
+  * **Its settings are the eval job's only**: the run's resolved settings minus everything the worker build's own
+    `check-config --eval --json` does not call `play` (`play_settings`: what an evaluation match reads, zero_worker's
+    EVAL_READS, 33 keys; eoe1: 33 of 167), checked again by the worker on their own, and giving the seats every setting
+    gives (`Run.nn_seat`). No trainer-only key (`preset`, `spec`, `resolver_init`, paths) reaches a definition.
+    `--worker` - the worker build's executable, whose `info` must name the build and the kind eval - is now required.
+  * **No `--seed`**: a template carries no seed, so the batch's base seed is the coordinator's, derived from the run's
+    name (32-bit FNV-1a, zero-farm `baseSeed`; `coordinator_seed`, kept in the state): the same name replays the same
+    games.
+  * The definition's `game` is the worker build's (its signed manifest, `GET /v1/admin/artifact/builds/<id>/
+    manifest.json`, checked against the build id: "mtg" for every MTG Zero run, as PROTOCOL.md 7's example has it - a
+    run's settings game "mtg_eoe" is not even a slug), and `--runtime` must be the runtime pack that manifest requires
+    (`worker_game`, checked before the export). Once per head-to-head (state `definition`; `--resume` publishes an
+    unpublished one, never a second version); `--expires-days` (30), `--key`, `--farm-release`, `--defs-dir`.
+* **A model's `sha256` is its file's** (`zero_worker`): the self-play job line's `sha256`, the `checkpoint` line's and
+  an eval job's `models[gen].sha256` all name the model FILE's sha256 (the lease's, the definition's `model_sha256`),
+  checked by `job::check_file_sha256` before ONNX Runtime reads the file (and before a job without `gen` reads the
+  graph's `checkpoint_iter`). Phase 0b's self-play line compared it with the graph's `checkpoint_sha256` metadata
+  instead (the torch checkpoint's hash), an eval job with the file: one meaning now, and the graph's checkpoint hash
+  stays metadata (`Expect.sha256` is gone). The error names the job's hash, never the file's (no hash of a file a job
+  names leaves a PC: H3).
+* **`zero.h2h` plays a run's evaluation.** Each side's seat takes its run's `margin_w`, `redet` and `eval_cache`
+  (`Run.nn_seat`'s; `run_seat_keys`, the run's settings resolved as the run and farm_h2h resolve them,
+  `run_settings`), and the match is played at A's run's evaluation spec (`Run.driver`'s rule: `eval_spec`, else the
+  game package's eval spec of the run's spec; `run_eval_spec`, `match_spec`, a note when B's run evaluates at another)
+  unless `--spec`. 44.2's "Not zero.h2h's seats" no longer holds: an h2h of a run's checkpoints plays the games of its
+  evaluation and of a farm head-to-head at the same settings. **A deliberate change of a tool** (no run plays or trains
+  differently): for a run with margin_w != 0, redet off, an evaluation cache or an eval spec of its own (MTG Zero: every
+  run - its evaluation decks), zero.h2h's games differ from before; without a run config.json nothing changes.
+* **`python -m zero.farm_report`**: the owner's own machines on zero-farm's admin page. The coordinator counts only its
+  agents' work; the desktop playing its runs, the MacBook and rented Vast boxes - all driven through zero-core's SSH
+  remotes - were invisible there. Every 5 minutes (the Task Scheduler task ZeroFarmReport, `--install-task`: the
+  current user, logged on, never SYSTEM; `pythonw -m zero.farm_report`, no window; `--uninstall-task`) it reads the run
+  directories changed in the last 24 h (the config's roots, default `~/<game>/runs` and `E:/<game>/runs` of the zero
+  games; each real directory once) and POSTs `{reporter, t, sources}` to `/v1/admin/external` with the admin token, one
+  source per machine (`id`, `name`, `kind` local | ssh | vast, `hardware`, `online`, `working_on` ["run:<id>"],
+  `selfplay_games`, `eval_games`, `fuzz_seeds` in the last 1 h and 24 h, `busy_h_24h`). Self-play games are each
+  metrics row's `selfplay.games` (this machine) and `selfplay.remotes.<name>.games` / `selfplay.remote.games` (the games
+  the shared quota accepted, each counted once), timed at the end of the self-play phase (`time - seconds +
+  phases.selfplay_s`); eval games each evaluation's `eval_*.games` and `extras.*.games` plus its Elo matches from the
+  pools' results.json, local from the metrics row or remote from the evals.jsonl row under its `host`. A self-play
+  record whose only remotes are pools (`host: []` once the last SSH host is removed, the farm under `pools`) is the
+  farm's games, never an own source (2026-11-19: it was counted as a source named 'remote'). A fork's copied
+  rows count once, for the run that played them (the oldest directory); a run that lived on a Vast box
+  (`ON_VAST*.json`) credits that box; Vast hardware from mtg-zero tools/vast.py's ledger. The Mac's fuzz seeds come
+  from one read-only ssh that parses its fuzz farm's `logs/farm.log` chunk lines; an unreachable Mac is `online: false`
+  with null seeds and never fails the report. `busy_h_24h` is the union of a machine's work intervals (iterations,
+  remote self-play running time and linger, remote evaluations, fuzz chunks), so at most 24. Stdlib only (the task
+  imports nothing heavy); 5xx and network errors retried 3 times, a 4xx never; the token never printed or logged;
+  `--dry-run` prints the report.
+
+**Off by default.** No run setting; nothing in a run changes. The worker's `sha256` change touches only jobs that send
+one (the agent sends it from the definition from rev 6 on); zero.h2h's change is called out above; farm_report only
+reads run directories.
+
+**Costs.** One `farm-release` call (a signature, an upload of a few KB, a registration) per definition version;
+farm_report about 1 s every 5 minutes (one ssh).
+
+**Tests and checks.** `tests/test_farm_def.py` (4: documents and their refusals - every rule of definition.rs above:
+a seed, a path in settings, a drive, `..` in a list, a key with `/`, an external bot, a non-slug game, a 1 GiB + 1
+file, fuzz modes and env; a worker build's game from its manifest (another build's manifest, a runtime build, another
+runtime: refused); versions, the archive and its published marker, publishing through `tests/farm_release_stub.py` - a
+stand-in farm-release that checks a definition with `farm_def.validate`, records its arguments, checks the token
+arrived in its environment, writes a signature, registers the definition in a state file a fake coordinator reads and
+prints the real tool's JSON line -, the coordinator naming another version, a failing farm-release, the token
+scrubbed). `tests/test_farm_h2h.py` (3): the end to end with the stub and `tests/worker_stub.py` (a worker's `info` and
+`check-config --eval --json` by EVAL_READS), a fake coordinator that plays the batch at the name's seed and accepts it
+only when its job is the definition's template and each registered gen the definition's file; the job's settings are
+exactly EVAL_READS and path-free; a runtime the build doesn't require is refused before the export;
+`test_zero_h2h_plays_the_runs_evaluation` - a toy run with margin_w 0.5, redet 0, eval_cache 64, chance_k 1, c_puct
+1.5: zero.h2h's seats equal `Run.nn_seat`'s key for key, its 8 paired games equal `farm_eval.match_driver`'s row for
+row, and the spec rules (with the old seats the same run's games differ: checked by hand). `tests/test_farm_report.py`
+(17: fixture runs in the real formats with local, mac, vast:line, vast:w1, vast, gpu:1 and one-host rows, a
+co-training resolver, a fork, a box-hosted run, rows without `time`, a stale run, a name clash, Elo pools; a fake Mac
+online and offline and the real fuzz-log parser; a fake transport for the body, the bearer, retries and redaction;
+dry run; the exact install / uninstall commands, mocked; a light import). `cargo test -p zero_worker`: 18 unit (new:
+`a_models_sha256_is_its_files_checked_before_it_is_loaded`) + 5 eval job + 4 job. MTG Zero (ENGINE.md 114.5):
+`tests/test_worker_farm.py` sends the file's sha256 on a self-play job (a wrong one - the graph's checkpoint hash,
+which phase 0b accepted - ends the job before the graph is read) and `farm_h2h.play_settings` with the real
+mtgz-worker; `tests/test_farm_campaign.py` (fuzz campaigns with definitions).
+
+**Measured** (2026-11-12, the desktop): the real `farm-release define` (zero-farm `agent` branch, 0.2.5; sign only,
+nothing published) signs eoe1 80 v 70's head-to-head definition and the live fuzz campaign's, both made by these tools
+(MTG Zero ENGINE.md 114.5). farm_report: a real dry run in about 1 s with the Mac's ssh (eoe2e: 4,800 self-play games
+and 1.06 busy h on the desktop, 632 eval games on the Mac, 303,410 fuzz seeds in 24 h); replayed on 11-07's runs with
+mac + vast:line + vast:w1 (6 runs, 0.5 s) it reproduced an independent recount exactly (318,511 / 63,268 / 905,122 /
+962,469 self-play games in 24 h).
+
+### 44.4 One session factory for every execution provider; probe-providers (no setting; zero-farm phase 4, 2026-11-12)
+
+**Why.** zero-farm PROTOCOL.md 8 (rev 7): friends' GPUs of every vendor, each accepted only if it answers as the
+CPU and torch do.
+
+**What it does.** `session::create_session` builds every ONNX Runtime session of the worker (jobs through
+`build_evaluator`, the gate tools, `read_metadata`): the job line's `providers` in order (cpu last), each built on
+the job's adapter (`gpu`, a LUID) and accepted only if the reference set answers within 2e-5 twice, bit-identical
+(a GPU provider never without a reference set, never when ONNX Runtime gives it no node); the nodes it leaves to the
+CPU come from ONNX Runtime's verbose node placement and go into the `selftest` event. DirectML (built into Windows
+ML's ONNX Runtime), CUDA and a standalone TensorRT-RTX by name; Windows ML's catalog providers (TensorRT-RTX, AMD
+GPU, MIGraphX, OpenVINO; `winml.rs`, the flat C API) as plugin libraries bound by LUID. GPU providers take whole
+batches (up to `GPU_CHUNK` 1,024 rows), the CPU keeps 64-row pieces. `release_device` drops the session (yield).
+`probe-providers` runs the factory's steps per provider and adapter on a built-in graph (`crates/worker/probe/`,
+from `tools/onnx_probe_graph.py`: every operator of eoe1's and Delver's graphs) or a real network, and times them.
+
+**Off by default.** A job line without `providers` is `["cpu"]`: the same CPU session as before.
+
+**Tests and checks.** `cargo test -p zero_worker`; measured on an RTX 5090, an Intel UHD 770 and an RTX 4070 Ti
+(Windows 10): zero-farm-notes phase4-gpu.md (DirectML and CUDA pass; TensorRT-RTX 1.2 refuses both packings).
+
+### 44.5 The probe's graph variants: one round trip to a PC we can't reach (no setting; zero-farm AMD GPU work, 2026-11-12)
+
+**Why.** Windows ML's AMD GPU providers (AMDGPUExecutionProvider 1.8.65 and the deprecated MIGraphX one) install on a
+farm PC's AMD GPU and then fail on the probe graph (`hipMemcpyWithStream(output_data, gpu_resource.data(),
+resource_shape.bytes(), DeviceToDevice)`: "invalid argument" - the copy ONNX Runtime's MIGraphX provider makes for the
+partition outputs MIGraphX did not bind as `#output_N` program parameters), and DirectML passes there at a tenth of the
+CPU's speed. That PC is reached only through canary builds and the agent's probe: each question costs a release and a
+friend's day, so one build has to answer many.
+
+**What it does.** A diagnostic worker build embeds a variants archive: `ZERO_PROBE_VARIANTS=<variants.npz>` when it
+is built (`crates/worker/build.rs`); `tools/onnx_probe_variants.py OUT.npz [--net NAME=MODEL,rows=REF[,static=1]...]`
+makes it. It is never committed (it may hold real networks). `probe-providers` then runs, after its own report (logged
+first), every variant on every provider the runtime pack offers (`probe_variants.rs`): each (group, provider) in a
+child process (`probe-variant`; a provider that crashes the process costs one variant and the child is started again),
+one worker-log line per variant as it finishes, the whole set under `--variants-deadline` (780 s of the agent's 900).
+The probe's verdict (`providers`, `results`) is unchanged; the variants go under `variants`. Kinds:
+* `raw`: any graph with its inputs and expected outputs (ONNX Runtime's CPU answers made with the archive): micro graphs
+  each testing one way a provider can mishandle an output (an alias of an input, a constant or Shape output, broadcast /
+  transposed / reshaped views, an empty output or batch, a scalar, int64 / int32 / bool outputs, chained outputs), one
+  operator each as our graphs use them, the probe graph cut after 1/8 ... 8/8 of its nodes (outputs = the tensors
+  crossing the cut) on its 1, 7, 64 and 120-row reference batches, the whole graph at lower graph optimisation levels,
+  and an `ORT_MIGRAPHX_DUMP_MODEL_OPS` run whose partition files are read back (inputs, outputs);
+* `net`: a zero-onnx/1 graph on real rows (a reference set cycled to batches of 4 ... 1,024): a GPU provider's answers
+  against the CPU's on the same graph (max abs per output, twice bit-identical) and rows/s per batch size, the CPU at
+  1/2/4/8 threads; `static` = one session per batch size with free-dimension overrides `B`, `B + 1`, `nnz` and the batch
+  padded by one dummy row carrying the padding non-zeros (feature 0, value 0); the job's own networks are taken from the
+  agent's cache (`<root>\cache\ckpt\<run>\<gen>\`, the newest gen of each run).
+`session::variant_session` binds a provider exactly as the factory does (the same session options; dimension overrides
+and an optimisation level on top).
+
+**Off by default.** Without `ZERO_PROBE_VARIANTS` at build time nothing is embedded and `probe-providers` runs as before.
+
+**Tests and checks.** `cargo test -p zero_worker probe_variants` (npy round trip incl. 0-d / empty / bool, the static
+batch's dummy row, NaN handling, the log line); a local run on the desktop (Windows ML pack, CPU + DirectML on the RTX
+5090 and the UHD 770): 141 results in 47 s, every micro graph and cut passing on DirectML.
+
+## 45. Self-play records and the farm pool (`pool:<farm run>` in `selfplay_remote`, `pool_*`; zero-farm phase 3, 2026-11-12)
+
+### 45.1 Why
+
+zero-farm's friends' PCs (zero-farm DESIGN.md 6.1, 7) play a run's self-play with the native worker (44). A shard of an
+EoE game is ~25 KB of rows a friend's upload would carry and the trainer could not check; the game's record - its seed,
+every real move and only what the search produced - is ~2 KB, and replaying it on the trainer rebuilds every row exactly
+and is its validation. The trainer's side is one more kind of remote: the farm pool.
+
+### 45.2 What it does
+
+* **Records** (docs/search.md 2.17): `Driver::set_trace` and `zero_search::record` (`game_json`, `replay`, `game_seed`):
+  a record replays into the rows the driver emitted, bit for bit (features, options, auxiliary targets, z, sc; pi, q, net
+  from the record as float16 / their ids), a chained contest's episodes included (42); `<pkg>._engine.replay_rows`.
+* **The worker** (`zero_worker::records`): a served self-play job writes records (`records` events; `output: shards` the
+  shards of before, `both` for the gate); the selfplay CLI's default stays shards.
+* **The pool** (`zero/farm_pool.py`): a `selfplay_remote` name `pool:<farm run>` - alone or next to remote hosts, in the
+  setting or the `selfplay_remotes` file (34) - makes a thread of the run that publishes each iteration's checkpoint on
+  zero-farm (exported with its reference set, uploaded, a new signed definition version that adds the gen, and only then
+  the gen registered current: leases switch only to gens a definition names), polls the farm's results, replays every
+  credited game of every records chunk (the header's game, features, actions, spec, auxiliary targets, the farm run's base
+  seed and worker build checked; each game's seed must be its game id's), refuses a chunk whose any game fails (counted per
+  machine, kept in `<run>/debug/pool/`), holds the games and lets the open iteration's quota take them oldest first exactly
+  as a remote worker's (RemotePlay.accept_pool), writing their rows as ordinary shards (`data/iter_i/pool-<machine>_SSS.npz`,
+  meta `source` 'pool', `machine`, `farm_run`), drops a game whose oldest row's network is older than `i - 1 -
+  pool_max_stale`, and posts the generation's running total (accepted + held) before each ack. It never holds a share of
+  the quota and the run never waits for it: RemotePlay.end closes its shards with what it accepted. With `selfplay_local` 0,
+  the pool counts as a remote taking work while a valid game arrived within `pool_live_s` (this machine then only trains;
+  when the farm goes quiet it plays again).
+* **The farm run's `min_agent`** (`pool_min_agent`, default 0.2.8; zero-farm PROTOCOL rev 9): sent with every `PUT` of the
+  farm run, so its leases go only to agents at or above it - 0.2.8 is the first agent that accepts a signed template naming
+  a split or double-faced card ("Rough // Tumble", rev 8), which an older agent refuses; agents of an older stable release
+  keep their other work (fuzz). '' sends none.
+* **Run alternates** (`pool_alternates`, `pool_alt_vendor`, default '' = none; zero-farm PROTOCOL rev 11, 9.4): worker
+  builds that are the same engine signed again for another runtime pack (one signed worker manifest per pack, 9.1) - the
+  CUDA pack, which the coordinator offers only to PCs with an NVIDIA GPU that may run GPU work (agents from 0.2.10), the
+  run's default pack to every other PC. `zero.farm_def.run_alternates` checks each from its manifest and its pack's (a
+  worker of the default build's game that requires a runtime pack) and takes `when.vendor` from the pack's `gpu.vendor`,
+  else `pool_alt_vendor` (a pack without `gpu`; a different vendor than the pack's is refused). They go into every `PUT`
+  of the farm run (`"alternates": [{"build_id", "runtime", "when": {"vendor"}}]`) and their builds into every
+  definition version's `builds` after `pool_build` (definition/1 unchanged: its `runtime` stays the default pack; an
+  agent accepts a listed build with the pack that build requires). Records whose header names an alternate's build
+  are accepted like the default's. Changed on a resumed run, the run is `PUT` again once the next gen's definition
+  (which lists the new builds) is registered. `zero.farm_h2h` takes the same as `--alt BUILD_ID` (repeatable) and
+  `--alt-vendor`, kept in its state for `--resume` / `--cancel`. None (the default): no `alternates` key, builds
+  `[pool_build]` - every `PUT` body and definition byte for byte as before (tests/test_farm_pool.py, test_farm_h2h.py).
+* **GPU lease size** (`pool_gpu_games_per_lease`, default '' = left out; zero-farm PROTOCOL rev 11, 9.4): the farm run's
+  `selfplay.gpu_games_per_lease` - the games of a lease the coordinator sizes for a GPU (`auto`: from the machine's bench
+  of the run's network, capped by the run's staleness window; or a number). Like the alternates it is `PUT` again on a
+  resumed run when it changed (state `put_extras`). `zero.farm_h2h` takes `--gpu-games-per-lease` for its eval batch,
+  and `--min-agent` for its run's `min_agent` (rev 9: a canary-only head-to-head); each is sent only when given.
+* **A worker build older than a setting**: its `check-config` calls a setting it doesn't know "unknown", a failure. When
+  this zero-core's `crates/worker/src/run_settings.json` classifies that setting `trainer` (the pool's own `pool_*`), the
+  pool's and `zero.farm_h2h`'s template check logs it ("worker build X doesn't know trainer-only setting K: ignored") and
+  carries on: a template carries only the keys the worker calls `play`, so the worker never gets it. Any other failure
+  refuses as before, and so does every failure without the table (no source checkout). So an already published worker
+  build keeps working with a trainer that has newer trainer-only settings (`zero.farm_h2h.config_refused`).
+* **Rolling leases** (`pool_rolling`, default 'auto' since 2026-11-17 (54.7), '' = off; zero-farm PROTOCOL rev 15): the farm run's `selfplay.rolling`,
+  the worker's rolling jobs and staleness judged per row: section 54.
+
+### 45.3 Off by default
+
+No `pool:` name: nothing of it runs and nothing changes (`set_trace` is never called; `Record::step` stays 0; the pool_*
+settings are unused, classified `trainer` for check-config).
+
+### 45.4 Tests and checks
+
+* zero_search: `traced_games_replay_to_their_rows_bit_for_bit`, `tracing_changes_no_game_and_no_row`,
+  `a_tampered_record_is_refused`, `set_trace_before_games_and_never_with_branches`,
+  `chain::traced_contests_replay_to_their_rows_bit_for_bit`; zero_worker `records_replay_to_the_shards_rows_bit_for_bit`
+  (sparse and dense), `a_served_job_writes_records_only`; `tests/test_farm_pool.py` (4: a fake coordinator; the publish
+  order, the pool's shards == shards of the same games written directly over two iterations, a tampered record refused,
+  the total before the ack, a stale game dropped, `selfplay_local` 0; run alternates: the farm run's PUT bodies without
+  any byte for byte those of before, with one and a GPU lease size in every PUT and definition after a resume,
+  its records accepted);
+  `tools/worker_records_gate.py` (gate 3: a worker's records replayed by the trainer's path == its own shards of the same
+  games, bit for bit).
+* Gate 3 (MTG Zero, the desktop, 2026-11-12): eoe1's settings with iter 80's graph and a network switch to gen 81 after 8
+  games - 48 games, 5,471 rows with auxiliary targets, nets 80 / 81, 39 of 39 arrays identical in 3 files, 48 games' decks
+  compared; records 97.5 KB vs shards 1.17 MB. MTG Zero's tests (mtg-smoke, delver-smoke, eoe-smoke, eoe-choice-smoke with
+  value-only rows) and the best-of-three run's settings: MTG Zero ENGINE.md 114.6-114.7.
+
+### 45.5 Costs
+
+A traced game keeps its moves (2 bytes an action; an EoE game ~530) and calls `record_setup` once per game (episode). The
+pool's replay: ~19 ms an EoE game here (0.91 s for gate 3's 48), its held games' rows kept compacted (sparse float16).
+
+### 45.6 Records, the pool and variable-length rows (the merge of `feat/varlen` e5e1bb0 into `farm`, 2026-11-12)
+
+**Why.** MTG Zero's layout v7 (section 43) puts tail tokens and pointer overrides in the rows; its best-of-three run moves
+to it with the farm attached, so the farm's records, pool and worker must carry them.
+
+**The merge** (a merge commit, `farm` b0930da + `feat/varlen` e5e1bb0; base 2aab098). Conflicts, each resolved so both
+sides' behaviour survives: the driver's `Record` / its parked copy / the slot / `Done` / `GameResult` carry the farm's
+`step` and `trace` and varlen's `tail`, `ov`, `row_abort` and `abort_reason` (a traced game aborted at the row limit
+ends with its trace; a chained contest's trace and abort as each side had them); the bindings keep the farm's seat
+parser (`zero_search::settings`, 44) and gain varlen's `max_row_tokens` (`DriverArgs::max_row_tokens`, None: the game's
+limit - what every run uses), packers and row kinds, and `take_results`' rows their `abort_reason`; `ShardWriter.add`
+keeps varlen's R8 refusal and the farm's sample dicts that bring their features as `xs`; section 43 before 44 and 45.
+Run settings: `allow_draft_layout` and `infer_token_chunks` classified `trainer` for check-config (44).
+
+**What changed on the farm's side.** Records and `replay_rows` (docs/search.md 2.17): every replayed row is the driver's
+record row - head, tail tokens, overrides - and `replay_rows` / `take_game_records` return the `t_*` / `ov_*` arrays; a
+game aborted at the row limit has a record (`abort_reason`) that replays as aborted. The pool (45.2) checks a game's
+rows as `write_shard` would (the tail floats through the non-finite guard) and writes format v2 shards
+(`shard_format(cfg, info)`: the meta's `t_segs`, `option_pointers`, `max_row_tokens`; R8). A row-limit abort counts as
+a game, as a remote worker's does (its row in `fin`, no samples). zero-onnx/1's exporter refuses a network with tail
+segments, pointer overrides or gates and `OnnxEvaluator` a batch with either (R14, 43.8: zero-onnx/2 is section 46);
+until the native worker reads them (section 46) it refuses a game with tails or pointer overrides at its driver's
+settings (`settings::refuse_varlen`).
+
+**Off by default.** Nothing changes for a game without tail segments or pointer overrides: records are the same text,
+the pool's shards the same files, every replayed row the same bytes (`record_row` is `encode` for such a game).
+
+**Tests.** `driver::trace_tail_tests` (3, docs/search.md 2.17); zero_search's and zero_worker's suites, the farm's
+pytest files (`test_farm_pool`, `test_farm_def`, `test_farm_h2h`, `test_farm_report`, `test_worker_settings`,
+`test_onnx`) and varlen's tail files (`test_tail_rows`, `test_tail_shards`, `test_tail_loop`, `test_tail_remote`,
+`test_pack`) on the merged tree.
+
+## 46. zero-onnx/2: variable-length rows as one ONNX graph, and the native worker that feeds it (no setting; zero-farm, MTG Zero's layout v7, 2026-11-12)
+
+**Why.** MTG Zero's best-of-three run moves to layout v7 (section 43): rows with tail tokens past the fixed-width head,
+gated tail-only segments and pointer overrides. zero-onnx/1 (section 41) takes the head only - its exporter refuses
+such a network (R14, 45.6) -, so the farm needs a graph that takes the whole row, and a worker that feeds it.
+
+### 46.1 The interface
+
+A token network with tail segments, pointer overrides or gates (`net.varlen_features`) exports as **zero-onnx/2**
+(`onnx_export.onnx_version`); every other network exports zero-onnx/1, the same graph as before (46.4). zero-onnx/2's
+inputs are zero-onnx/1's five plus the driver's arrays of docs/search.md 2.15, all always fed (empty CSRs for rows
+without), every slot and override token in int32 pieces (no integer of the graph reaches 2^31: 46.7):
+
+| | name | type | shape | |
+|---|---|---|---|---|
+| in | `opt_off` | i64 | [B+1] | the rows' options (driver i32: widened) |
+| in | `opt_action` | i32 | [K] | each option's action |
+| in | `t_off` | i64 | [B+1] | the rows' tail tokens (B + 1 zeros for a game without tail segments) |
+| in | `t_seg` | i32 | [NT] | each token's segment (driver u16) |
+| in | `t_slot_hi`, `t_slot_lo` | i32 | [NT] | its slot (driver u32) as its high and low 16 bits (`slot_pieces`) |
+| in | `t_val` | f32 | [L] | each token's `width(seg)` floats, consecutive (the driver's) |
+| in | `ov_off` | i64 | [B+1] | the rows' pointer overrides |
+| in | `ov_opt` | i32 | [NO] | the option (its index in its row) |
+| in | `ov_seg`, `ov_col`, `ov_slot_hi`, `ov_slot_lo` | i32 | [NO] | the target (the driver's packed token: segment at bit 40, column at bit 32, slot below) as its segment, column and the slot's halves (`override_pieces`); segment -1: the generic logit (token -1), -2: any other negative token (refused) |
+| out | `policy`, `value`, `margin`, `aux` | | | zero-onnx/1's (the policy with the overrides applied) |
+| out | `refused` | i64 | [B] | per row, its tail tokens and overrides the network refuses (below); 0 everywhere or the batch is refused |
+
+Metadata: zero-onnx/1's, `zero_onnx` '2', `protocol` 'zero-onnx/2', and `tails` (JSON [[segment, name, width, head
+slots], ...]: the game's `game_info()['tails']`), `option_pointers`, `max_row_tokens`, `tail_width`, `gates` ({segment:
+g}). Packing: `packed` only.
+
+### 46.2 What the graph computes (`ZeroOnnx2`)
+
+What the eager evaluator computes (`NetEvaluator`: `rows.resolve` on the host, then `TokenNet.forward`, 43.5-43.7), in
+the `packed` graph of 41, with nothing of a network's own in the worker:
+
+* **The tail tokens.** Each token's row from `t_off` and its floats from `t_val` (each segment's width a table of the
+  graph: a token's `width(seg)` floats at the running sum of the widths before it, zeros up to the widest tail
+  segment), embedded as a head slot is: the segment's input map + its identity's embedding + `tail_base[k] +
+  pos_tail[k](psi(slot - count))` - every tail segment's maps as one product, each token's own picked by its segment
+  (`_TailEmbed`'s matrices); slot - count by 16-bit halves with a borrow, psi's 32 binary digits by integer division
+  of each half (ONNX's BitShift takes unsigned integers only), log2(n + 1) / 32 in float64 (n exact there) and
+  rounded, the sin / cos part from psi's own table (n mod 256 = the low half's).
+* **The packed list.** The N present head tokens (row-major, layout order) then the NT tail tokens; each row's tail
+  tokens follow its head tokens in the padded rows of the attention and the pooling (gathered in and back: no
+  scatter-add, 41's rule). A gated segment's tokens weigh g = max(theta, 0) (inference's gate values, constants of
+  the graph): the attention's float mask log w (-inf at g = 0: such a token changes nothing, exactly) and the pooling's
+  weighted mean; without gated segments the boolean mask and the plain mean of before.
+* **The overrides.** Each override's row from `ov_off`, its action `opt_action[opt_off[row] + opt]`, its target from
+  its pieces (a head slot: its place in the full token axis, `1 + Σ_{s' < s} count(s') + slot`, which must be present in its row; a tail token: the one of its row with
+  that (segment, slot), found by matching every tail token), its pointer logit in its column, a gated target's blended
+  with the generic logit as `torch.lerp` computes it (exactly the generic at g = 0, the pointer at 1); -1: the generic
+  logit of before the static scatter. Written after the static scatter of the head slots' actions (a tail token has no
+  static action), one write per (row, action).
+* **`refused`.** What torch raises on (R5, R6: `TokenNet._check_tail`, `rows.resolve`, `TokenNet._ov_index`) is counted
+  per row instead - a tail token of a segment without a tail or outside the network, a slot at or past 2^32 (a piece
+  outside [0, 2^16)) or inside its segment's head, a row's tokens not sorted by (segment, slot) or repeated; tail floats that do not fit the
+  tokens' widths (every row); an override of an option outside its row, a token below -1 (segment piece -2), a
+  segment or column out of range (a piece outside its field), a target head slot not present, a tail token the row lacks, a second override of the same action (which of
+  two would win is not defined). A refused override writes the dummy column. The worker and `onnx_parity.answer` refuse
+  a batch with any (`Refused`): never an answer torch would not give.
+
+### 46.3 The parity gate, the reference set, the Python evaluator
+
+`zero.onnx_parity` takes rows with tails and overrides (`Rows.tail` / `.ov`: `rows.Tail` / `rows.Overrides`; recorded
+batch files with `t_off` .. `ov_tok` and their meta's `t_segs`, v2 shards) and runs the gate on them: eager
+(`NetEvaluator` with the rows' tails and overrides) and `forward_static` (`rows.token_full`, `rows.resolve`) against
+the graph, every case twice; cases `varlen` (every row of the file with a tail token or an override, at most 1,024)
+and `overrides` (the rows with overrides: far rarer in a real game) besides the sizes, with their counts (rows with
+tails, tokens, overrides, gated tokens) in the result; a graph's nonzero `refused` fails the case (`Refused`). `OnnxEvaluator` takes zero-onnx/2 graphs (the batch's arrays, the graph's `tails`
+metadata for the widths) and refuses tails or overrides for a zero-onnx/1 graph. The reference set of a zero-onnx/2
+network (`write_reference`) holds its rows' tails and overrides (`t_off` i64, `t_seg` u16, `t_slot` u32, `t_val` f32,
+`ov_off` i64, `ov_opt` i32, `ov_tok` i64; meta `t_segs`, `option_pointers`, the counts), the batches holding overrides first,
+then those holding tail tokens; a set without a tail token (a network with tail segments) or an override (with option_pointers) is
+refused - a worker's self-test must answer them. `farm_h2h.record_rows` (the pool's rows) records on until its rows
+hold both (at most 4,096 batches, else it fails); `tools/onnx_record.py` keeps them (`--min-tail-rows`,
+`--min-overrides`).
+
+### 46.4 Off by default; tests and checks; measured (the export)
+
+**Off by default.** A network without tail segments, pointer overrides or gates exports zero-onnx/1 as before: the same
+graph (below; since 46.7 without the exporter's per-node annotations, byte for byte the earlier graph with them removed), its code untouched but for the R14 refusal and `slot_tokens` skipping tail-only segments (none in such a
+network). Nothing on a run's path imports these modules.
+
+**Problems met** (each handled in the code): ONNX Runtime 1.31.1's CPU `Clip` and `Min` on int64 answer wrongly
+outside the int32 range (Clip(4294967295, min 0) = 0; Clip(x, 0, 2^32 - 1) = 2^32 - 1 for every x; zero-onnx/1 only
+clips small values) - the graph clamps integers by Where (`_iclamp`); `torch.div(..., rounding_mode=...)` on int64
+exports through floats (a packed token decoded wrongly, measured), `//` and remainder export as integer ops (`>>` by a tensor does not export);
+ONNX Runtime reduces an empty axis to a wrong shape (ReduceSum over the last axis of a [0, 10] tensor gave [0, 10]) - a
+sentinel tail token and override keep every axis non-empty; a v7 game's override rows are rare (151 overrides in 76,647
+rows of 800 recorded batches, against 55,168 tail tokens), so the gate has a case of them and the reference set takes
+their batches first.
+
+**Tests.** `tests/test_onnx2.py` (9): parity on the toy's layouts - tails on items with identities and overrides into
+tail items, a gated tail-only segment shut and opened, a gated segment with a pointer column (the blend, g in (0, 1)) -
+on batches of 1-150 rows with leaf, value-only and belief rows, NaN in absent slots, the 64-row pieces, every case
+twice; slots up to 2^32 - 1, one row, batches with no tail token or no override; every refusal counted on its own row
+(an option out of its row, an absent head slot, a missing tail token, a column out of range, a second override of an
+action, a token below -1, a tail token outside the network or at a head slot, floats that do not fit); the interface,
+dtypes, metadata, no ScatterND reduction, a network without varlen features still zero-onnx/1; real toy_tail driver
+batches through `OnnxEvaluator` (games to the end within 2e-5 of eager); the reference set with tails and overrides
+and its refusal. `tests/test_onnx.py` (17, zero-onnx/1) unchanged and passing.
+
+**Measured** (2026-11-13, the desktop's CPU beside other sessions' builds and the live run; onnxruntime 1.31.1, torch
+2.11.0):
+
+* *The v6 export (pb1's path).* MTG Zero's best-of-three run pb1, iteration 82 (layout v6), exported as the pool does
+  (packed, its checkpoint id and iteration) with b0930da's code and with this tree's: zero-onnx/1, not byte-identical
+  (10,737,231 vs 10,746,295 bytes) only because the exporter writes each node's source annotations - stack traces with
+  the exporting checkout's file paths and line numbers (`pkg.torch.onnx.stack_trace` etc.); without them the two graphs
+  are byte-identical (every node, attribute, initializer, input and output) and the model metadata identical; their
+  outputs on the pool's own gen-82 reference rows (256, whole batches and 64-row pieces) bit for bit the same. The same
+  holds against the graph the live pool published for gen 82.
+* *The gate on real v7 rows.* pb1 iteration 67 widened onto layout v7 by `fork_run` (gates exactly 0; 56,384 features,
+  belief + deck head, 16 tail segments, option pointers), 800 driver batches recorded by `tools/onnx_record.py` from a
+  CPU self-play of the best-of-three spec (76,647 rows: 50,442 leaf, 24,884 value-only, 1,321 belief; 36,774 rows with
+  tail tokens, 55,168 tokens; 151 overrides in 42 rows): **15 + 8 cases (pieces), 0 failed**, worst ORT vs torch priors
+  5.5e-6, value 6.3e-7, margin 6.0e-7, aux 2.5e-7; run twice, the same results and the graph byte for byte the same
+  (export deterministic); the 42 override rows alone (151 overrides, 579 tail tokens): worst 1.0e-6. The same network
+  with every gate opened to 0.37 (the weighted attention and pooling, the blend): 15 + 8 cases passed, worst priors
+  5.5e-6, margin 7.2e-7; its override rows 1.0e-6. Every output over all 800 batches (whole and in 64-row pieces) hashed
+  in two processes: bit for bit the same. The reference set (256 rows of 3 batches: 189 rows with 386 tail tokens, 2 with
+  8 overrides): ORT within 1.9e-6 of torch. Export 51-55 s; the graph 17.6 MB.
+
+### 46.5 The native worker (`zero_worker`, docs/az.md 44)
+
+* **zero-onnx/1 and /2.** A worker build declares `zero_onnx: [1, 2]` (the manifest, `info`, the hello). A graph's
+  metadata says which (`session::check_graph`: zero-onnx/2's more inputs and the output `refused`), and
+  `session::varlen_of` checks a zero-onnx/2 graph's `tails` / `option_pointers` against the game's (`Expect::tails`,
+  `option_pointers`, from its `GameInfo`); a game with tail segments or pointer overrides refuses a zero-onnx/1 graph.
+* **Feeding it.** Each piece of a batch (the CPU's 64 rows by non-zero count, a GPU's whole batch) gets its rows'
+  options, tail tokens and overrides rebased (`session::varlen_piece`: each token's floats by the graph's widths; a
+  token of a segment the graph has no tail for, or floats that do not fit, is an error), the driver's arrays as they
+  are (u16 / u32 widened). A nonzero `refused` is the batch's error (the job's end, as any evaluator error): never an
+  answer torch would not give.
+* **The self-test and eval-batches** read a file's tail tokens and overrides (`selftest::read_batches`, one reader for
+  both: the meta's `t_segs` for the widths); the recorder (`--record-batches`) keeps them (tools/onnx_record.py's
+  arrays, the meta's `t_segs`, `option_pointers`).
+* **Shards: format v2** for a game with tail segments or pointer overrides (`shard::RowsFmt`, data.py's `rows_meta`):
+  sparse only (a dense shard is refused, R8), `x_version` 2, the meta's `t_segs` / `option_pointers` /
+  `max_row_tokens` after `x_format`, the members `t_ptr` int64, `t_seg` uint16, `t_slot` uint32, `t_val` float16,
+  `ov_ptr` int64, `ov_opt` int32, `ov_tok` int64 after `aux` (empty CSRs for the kind the game lacks), the tail floats
+  through the non-finite check; samples with tails or overrides for a shard of format 1 are refused. Records need no
+  change (the trainer's replay rebuilds the rows, 45.6); a game aborted at the row limit - the driver's own abort,
+  `max_row_tokens` (the game's: a worker never lowers it) - is recorded with its `abort_reason`, as a Python remote
+  worker's driver aborts it.
+* The step-1 guard (`settings::refuse_varlen`) is gone.
+
+### 46.6 Tests and checks; measured (the worker)
+
+**Tests.** `cargo test -p zero_worker`: 24 unit (`a_pieces_tails_and_overrides_are_its_rows_rebased`), 5 eval-job, 6 job
+(`records_replay_to_the_shards_rows_bit_for_bit` unchanged), and `tests/job_tail.rs` (3: toy_tail's shards are format v2
+- x_version 2, the meta's keys, the members' dtypes - and the records replay into exactly those arrays, tail tokens and
+overrides included; games aborted at the row limit are recorded with their `abort_reason` and replay as aborted, no
+shard; a dense shard of tail rows refused). `examples/zw_toy.rs`: the core's toy games as a worker binary.
+
+**Measured** (2026-11-13, the desktop):
+
+* *Gate 2 (a) on toy_tail* (`tools/worker_parity.py --package zero`, the native `zw_toy` against `remoteplay.Worker`,
+  24 games, groups 1): with the uniform evaluator the shards (273 rows) and the first 162 batches identical; with a
+  toy_tail checkpoint's zero-onnx/2 graph on both sides (the native worker through the CPU runtime pack's ONNX Runtime
+  1.31.1, Python through onnxruntime) the format v2 shards (272 rows, 3,353 tail tokens, 826 overrides) byte for byte
+  identical and the first 161 batches (of 3,289 rows with 40,425 tail tokens and 10,054 overrides) identical.
+* *The self-test on real v7 rows* (`zw_probe probe-providers` with the v7 graph and its reference set, Windows ML's
+  ONNX Runtime 1.28.3): the CPU passes, max abs 2.1e-6 against torch, twice bit-identical. **DirectML (the Intel UHD
+  770) is refused by the self-test**: the graph's `refused` is nonzero (63 in the first reference batch) and the
+  answers off by up to 0.29. Placement (onnxruntime-directml 1.24.4's verbose log): 1,866 nodes on DirectML, 53 on the
+  CPU (ScatterElements 10, Reshape 8, Add 8, Mod 7, Squeeze 6, Equal 3, Mul 2, Div 2, Concat 2, Cast 2, Sub, Log, Gather).
+  The cause, measured on the toy's debug graph: DirectML computes int64 in 32 bits - a packed override token (segment
+  at bit 40) and any value past 2^31 come out wrong (Where, Less, Mul on int64), so every override of a v7 row (its
+  segments are 2 and up) is misread. The worker then plays on the CPU (the factory's fallback). Not changed here: a
+  graph DirectML could run would take the override tokens as int32 fields (or keep the integer work off DirectML) - an
+  interface change for the owner to decide (zero-farm's GPU work); CUDA computes int64 natively (not measured: the
+  desktop's GPU belongs to the live run). **Fixed before any zero-onnx/2 graph was published: 46.7** (int32 pieces;
+  DirectML then passes).
+
+### 46.7 int32 integers (DirectML) and the exporter's annotations stripped (2026-11-13)
+
+**Why.** DirectML computes int64 in 32 bits (46.6): the first zero-onnx/2 interface fed the packed override tokens
+(segment at bit 40) and u32 slots as int64, and decoded them in the graph with constants of 2^32 and 2^40, so on
+DirectML every override of a v7 row was misread and the self-test refused the provider. Fixed before any zero-onnx/2
+graph was published, so the format needs no third version for it. Separately, the exporter writes each node's source
+annotations - stack traces with the exporting checkout's file paths and line numbers -, so a graph's bytes depended on
+where it was exported from and every graph carried a local path (the published ones too: the committed probe graph,
+46.5, and the pool's).
+
+**What changed.**
+
+* *The interface* (46.1): every tail slot as `t_slot_hi` / `t_slot_lo` (i32: its high and low 16 bits) and every
+  packed override token as `ov_seg` / `ov_col` / `ov_slot_hi` / `ov_slot_lo` (i32), split on the host:
+  `onnx_export.slot_pieces` / `override_pieces` (Python) and `session::override_pieces` / `varlen_piece` (the worker),
+  the same pieces. Token -1 is segment -1 (the generic logit); any other negative token segment -2 (refused, as the
+  packed token was); a token's segment is `tok >> 40` whole (one past the network's segments refused, not masked); a
+  slot outside u32 a high half of -1 (refused). Records, shards (format v2), the driver's packed `ov` arrays and the
+  reference-set files are unchanged - only the graph's inputs.
+* *The graph* (46.2) never forms an integer of 2^31 or more: slots compared and ordered by halves (a row's (segment,
+  slot) order as (segment 2^16 + high, low)), slot - count by halves with a borrow, psi's 32 digits by integer division
+  of each half (2^0 .. 2^15), log2(n + 1) in float64 from the halves (n exact there), n mod 256 from the low half; a head
+  target's slot formed only where it is below its segment's head; a target's pointer logit by row then column (no flat
+  index row C + column); a refused option replaced by 0 before its sum. Pieces outside their fields are refused, never
+  read wrapped.
+* *Export-time refusal* (`check_int32`, zero-onnx/2 only): any integer constant outside int32 - an initializer, a
+  Constant's value / value_int(s), a ConstantOfShape's value, any tensor attribute, in subgraphs and functions too - or
+  any BitShift refuses the export. The exporter's one such constant, a Slice's "to the end" end of 2^63 - 1, is
+  rewritten first to 2^31 - 1 (`int32_slices`: the same slice for every axis below 2^31 elements); the network's own
+  sizes are checked when the module is built (segments below 2^15, head tokens + pointer columns and actions below 2^30,
+  identity radix products below 2^30).
+* *The sizes that grow with a piece* are bounded on the host: `int32_bound` (Python) / `session::int32_bound` (the
+  worker), an upper bound of every integer the graph computes on a piece of B rows - the densified rows' flat index
+  B (F + 1), the packed token list's and the padded rows' indices B (F + 1 + the most tail tokens of a row), the
+  policy's B (A + 1), the tail floats' (NT + 1) Wt and L + 1, the options' K + 1, the overrides' NO + 1, the merged CSR
+  sequence's nnz + B; a feeder refuses a piece at 2^31 or more (an error, never a silent overflow). MTG Zero v7 in a GPU
+  piece of 1,024 rows: B (F + 1) = 57.7 M, about 2.7 % of 2^31.
+* *Annotations* (`strip_annotations`, every export, zero-onnx/1 and /2, also `portable_file`): each node's
+  `metadata_props` (`pkg.torch.onnx.stack_trace`, name scopes, class hierarchy, fx node, the rewriter's rule names) and
+  every doc string removed; no node, attribute, initializer, name or model metadata changes. The worker and the agent
+  read only the model's own metadata (`session::meta`), never a doc string. The model metadata carries no path
+  (`checkpoint` is the file name or the run's id; the reference set's `sources` file names). The committed probe graph
+  regenerated by `tools/onnx_probe_graph.py` (measured below).
+
+**Tests.** `tests/test_onnx2.py` (11; two new, two extended): the interface's int32 inputs and dtypes; no integer
+constant outside int32 and no BitShift in an exported graph, `check_int32` refusing one added to it (an initializer of
+2^40, a Constant's int beyond -2^31); `int64_max` on toy rows with tails and overrides (every int64 intermediate below
+2^31, the model given unchanged); the host's split (every piece in int32, the packed token and the slot back from them
+exactly; -1, other negatives, a segment past 16 bits) and `int32_bound` (the worker's numbers), a piece over 2^31
+refused by the feeder; pieces outside their fields refused (a slot of 2^32 or -1, a half of 2^16 or -3, a column of 256
+or -1, a segment -5), counted on their own row; zero-onnx/1 and /2 graphs without node annotations or doc strings (no
+`stack_trace`, no source file name in the bytes); toy_tail_wide (below). The other earlier tests unchanged and passing;
+`tests/test_onnx.py` (17). `cargo test -p zero_worker`: the unit test also checks `override_pieces` (the token back from
+its pieces for segments up to 2^16 - 1, columns up to 255, slots up to 2^32 - 1) and `int32_bound`; `tests/job_tail.rs`
+gains toy_tail_wide (below).
+
+**Measured** (2026-11-13, the desktop; onnxruntime 1.31.1 CPU, Windows ML's 1.28.3 for DirectML, torch 2.11.0):
+
+* *The v1 path, stripped.* pb1 iteration 82 exported by this tree: 10,151,753 bytes, two exports byte-identical;
+  b0930da's export of it with its 5,075 annotation entries removed by `strip_annotations`: **byte-identical** (sha256
+  0c37f0c6...), outputs bit for bit on the pool's 256 gen-82 reference rows (whole batches and 64-row pieces); the
+  graph the live pool published for gen 82, stripped: byte-identical too, its metadata identical. The committed probe
+  graph stripped (1,898 entries) is byte for byte the one `tools/onnx_probe_graph.py` now writes, its reference set
+  byte-identical: the probe graph is replaced by the stripped one (an earlier commit's blob keeps the old annotations
+  in history).
+* *The v7 graph* (pb1 iteration 67 widened, 46.4): 1,983 nodes, no integer constant outside int32, no BitShift; its
+  reference set (256 rows: 189 with 386 tail tokens, 8 overrides) within 1.8e-6 of torch. **Every int64 value it
+  computes** on all 800 recorded batches (76,647 rows; 654 int64 tensors, all typed): at most 7,217,152 (a 128-row
+  batch's flat densify index, 128 x 56,384), 0.34 % of 2^31.
+* *The gate on real v7 rows* (the 800 batches): **16 + 8 cases (pieces), 0 failed** - the `overrides` case now in it (42
+  rows, 151 overrides, 579 tail tokens: 6.9e-7) -, worst priors 5.5e-6, value 6.3e-7, margin 6.7e-7, aux 2.5e-7; run
+  twice, every case's result the same and the gate's graphs byte for byte the same; every gate opened to 0.37: 16 + 8
+  passed, worst priors 5.5e-6, margin 7.2e-7, its override rows 6.9e-7. Every output over the 800 batches (whole and in
+  64-row pieces) hashed in two processes: bit for bit the same.
+* *Gate 2 (a) on toy_tail* with a zero-onnx/2 graph on both sides: the shards (272 rows) and the first 161 batches
+  identical, as before the change.
+* *The native self-test on real v7 rows* (`zw_probe probe-providers`, the v7 graph and its reference set): the CPU
+  (the CPU runtime pack, ONNX Runtime 1.31.1) passes, max abs 1.8e-6, deterministic. **DirectML (the Intel UHD 770,
+  Windows ML's ONNX Runtime 1.28.3) passes the self-test: max abs 8.3e-7, deterministic**, 55 nodes left to the CPU
+  (ScatterElements 10, Add 9, Reshape 8, Mod 6, Squeeze 6, Cast 3, Equal 3, Mul 3, Concat 2, Div 2, Gather, Log, Sub),
+  1,949 on DirectML; 326 rows/s against the CPU's 1,057 (an integrated GPU: speed not measured on a real GPU here).
+* *Every int64 intermediate on DirectML* (onnxruntime-directml 1.24.4, each int64 intermediate also a graph output,
+  against the CPU EP on the reference set's batches): all 654 equal on the two batches with overrides; on the third
+  (no override, so 8 intermediates of zero elements) DirectML mishandles the zero-size graph outputs the
+  instrumentation adds - without those 8, all 647 equal; the plain graph answers that batch right (`refused` 0, as the
+  self-test above). So no int64 operation DirectML runs disagrees with the CPU near the old failure (the override
+  tokens' decode) or anywhere else. (A zero-size *output* of a real graph would meet the same DirectML limitation:
+  zero-onnx/1's `aux` [B, 0] of a network without the auxiliary head - unchanged here, for the GPU work.)
+* *New tail segments need no code change* (MTG Zero may add gated tail-only segments to layout v7 before a run starts):
+  no code of the exporter, `onnx_eval`, `onnx_parity`, the worker's session, shards, records or replay names a segment
+  or assumes a count, an index or a width - each comes from the network's layout (the graph's metadata `tails`,
+  `gates`, `tail_width`) or the game's `TAILS` and the driver's arrays; the limits are the format's (a segment index
+  u16, 256 pointer columns a segment, fewer than 2^15 segments in a graph). Proven on `toy_tail_wide` (docs/search.md
+  5.3: toy_tail with 20 more gated tail-only segments, indices 2 .. 21 - more tail segments than v7 and indices past its
+  highest; `toy_tail` the same generic game, its self-play digest of 24 games - both policy targets' records and
+  results, the match - identical before and after): `tests/test_onnx2.py` (its graph's `tails` the game's, 10 traced
+  games through `OnnxEvaluator` within 2e-5 of eager with the gates at 0.15 .. 1.3, tokens of all 22 segments, every
+  game's record replayed to the driver's rows byte for byte), `tests/job_tail.rs` (the native job's format v2 shards
+  with the 22 segments in their meta and tokens of each, the records replayed to exactly the shards' arrays); gate 2 (a)
+  with a 1-iteration toy_tail_wide run's graph (gates opened to 0.5) on both sides: shards (273 rows, 8,877 tail tokens,
+  4,912 of them in the extra segments, 791 overrides) and 166 batches (107,567 tail tokens, 59,402 extra) identical;
+  gate 3 with that graph: the native worker's records rebuild its shards (24 games, 315 rows, 9,163 tail tokens, 5,138
+  extra), all 19 arrays identical.
+
+### 46.8 zero-onnx/2 with every scatter unique, at opset 17 (2026-11-13)
+
+**Why.** 41.2's two problems in the zero-onnx/2 graph, besides densify's and the policy's: its tail and override CSRs
+(`_csr_rows`, the same row-end scatter as densify's), and the check for a second override of one (row, action), which
+scattered each override's index and leaned on the CPU's last writer to find the repeats. With them on the CPU (opset 18),
+DirectML left 10 ScatterElements of Delver's v7 graph to the CPU (46.7).
+
+**What changed** (`ZeroOnnx2`; the interface unchanged):
+
+* The tail and override CSRs through 41.2's `_csr_rows` (row ends to places of their own, a Gather back).
+* The static scatter of the head tokens' actions per row on the full head token axis (41.2's `_policy_full`, `_scatter_last`).
+* A second override of one (row, action) found by comparing every override with every later one ([NO + 1]^2 booleans,
+  as the tail-target match already compares overrides with tail tokens): the same overrides refused (of two with one
+  place, all but the last; a refused one's place is its row's dummy column, as before). Every override then writes its
+  own place - an accepted one its action, a refused one a spare place past the policy (B (A + 1) + its index, read off
+  by a Gather) instead of its row's dummy column, which no output reads. So `int32_bound` (Python) and
+  `session::int32_bound` (the worker) bound the policy with its spares, B (A + 1) + NO + 1, instead of the terms B (A + 1)
+  and NO + 1 apart (the feeders refuse a piece at 2^31 as before).
+* 9 ScatterElements (10 before: the repeat-finding scatter is gone), opset 17, `unique_scatters` '1'.
+
+**Tests.** `tests/test_onnx2.py` (11; three extended): the graph's nine scatters unique (`scatter_writes`) on rows with
+tails and overrides and on every refusal case's rows (the sentinel override, a repeated action, an option out of its
+row, an absent head slot, a missing tail token, a column out of range, a token -2); opset 17 and `unique_scatters`;
+`int32_bound`'s new term (the worker's numbers). `cargo test -p zero_worker`: the unit test's `int32_bound` numbers.
+
+**Measured** (2026-11-13, as 41.2):
+
+* *The CPU's answers, bit for bit.* pb1 iteration 67 widened onto layout v7 (46.4; gates 0) and its copy with every
+  gate at 0.37: the new graphs against ec2d1b9's on the 800 recorded batches (76,647 rows, 55,168 tail tokens, 151
+  overrides) - every batch as it is and in 64-row pieces, windows to 1,000 rows, the whole file in 1,024-row pieces,
+  the first 1,000 (gates 0.37: 300) rows alone: 2,805 (2,105) cases - every output bit-identical (`refused` included),
+  each graph run in two processes. The reference sets the two trees write (256 rows: 189 with 386 tail tokens, 8
+  overrides) are byte-identical; ORT vs torch 1.8e-6.
+* *The gate* (`zero.onnx_parity`, the 800 batches), run twice: 16 + 8 cases (pieces), 0 failed, worst priors 5.5e-6,
+  value 6.3e-7, margin 6.7e-7, aux 2.5e-7 - 46.7's numbers -, the `overrides` case (42 rows, 151 overrides) 6.9e-7; the two
+  runs the same case for case, their exports byte-identical; gates at 0.37: 16 + 8 passed, priors 5.5e-6, margin 7.2e-7.
+  toy_tail_wide (22 tail segments, gates 0.5) on the native worker's recorded batches, twice: 16 + 7 cases passed (worst
+  margin 9.5e-7), the exports byte-identical; toy_tail: 16 + 7 passed; both toy graphs against ec2d1b9's on those batches
+  (3,266 and 3,289 rows, every row alone too): bit-identical, two processes each.
+* *The scatters and int32* (the 800 batches, their 64-row pieces and 1,024-row pieces: 2,471 feeds): ec2d1b9's graph wrote
+  9,675,231 repeated indices (the three CSRs' row ends and the policy's dummy column) and had 7,410 runs with more indices
+  than places; the new graph 0 and 0 over 304,146,057 writes. `check_int32`: 131 constants, all in int32; `int64_max`:
+  57,737,216 (a 1,024-row piece's densify index, 1,024 x 56,384: 2.7 % of 2^31), 671 int64 tensors, all typed. The two toy
+  graphs alike (0 repeats, int64 at most 1,376,256).
+* *The native worker.* The self-test on the new v7 graph and its reference set (the CPU runtime pack, ONNX Runtime
+  1.31.1): passes, max abs 1.8e-6, deterministic. Gate 2 (a) with new graphs on both sides (`tools/worker_parity.py`, the
+  native `zw_toy` against `remoteplay.Worker`, 24 games): toy_tail - shards (272 rows) and the first 161 batches
+  identical -, toy_tail_wide - 273 rows, 166 batches identical; gate 3 with the wide graph: the native worker's records
+  rebuild its shards (24 games, 315 rows), all 19 arrays identical. `cargo test -p zero_worker`: 24 + 5 + 6 + 4 passed.
+* *DirectML* (as 41.2; Delver v7's reference set). Placement: ScatterElements gone from the CPU's nodes (48 left on the
+  UHD 770, 45 on the RTX 5090: the shapes, psi's float64 and int64 `//`; 55 and 52 with 10 ScatterElements before). The
+  self-test is **flaky for the earlier and the new graph alike**: on the UHD 770 the new graph passed 3 of 5 runs and the
+  earlier 4 of 5 (8.3e-7), every failure 0.0078 in the priors, the same for both graphs; on the RTX 5090 the new graph
+  passed 3 of 6 (one failure 0.80, two runs within tolerance but not deterministic), the earlier 5 of 6 (one run not
+  deterministic); the reference rows regrouped into one 256-row batch: the new graph passed, the earlier failed (0.016).
+  When it passes, rows per second (16 / 64 / 256 / 1,024 rows, the reference rows' features cycled - no tail token, no
+  override): RTX 5090 99 / 382 / 1,390 / 4,775 against the earlier graph's 88 / 301 / 818 / 2,197 (2.2x at 1,024 rows);
+  UHD 770 83 / 261 / 536 / 719 against 81 / 236 / 493 / 629; the same runtime's CPU EP 1,439-1,600 / 1,151-1,480 /
+  1,765-1,833 / 1,931-1,945. Only the priors,
+  only batches with overrides (the reference batch without one passes alone): onnxruntime-directml 1.24.4 (the UHD 770)
+  gives a row's overrides one common wrong value - row 67's three overrides (CPU -0.99, -1.59, -2.48) all 7.60 in some
+  runs, -4.73 in others, row 71's five all -3.95 in one run of the earlier graph - while the same graph with its integer
+  intermediates made outputs answers right (a DirectML fusion problem in the override
+  path, not one of its operators: ArgMax, ScatterElements and TopK alone answer as the CPU at these sizes). The worker's
+  self-test refuses DirectML whenever it happens (the factory's fallback to the CPU). Not fixed here: the override path
+  is the same in both graphs. toy_tail_wide's graphs (22 tail segments; gates 0 or 0.5) fail DirectML's self-test in
+  18 of 20 runs on the UHD 770, ec2d1b9's and the new alike (value and margin off by up to 0.7: the trunk with gated
+  segments), toy_tail's pass 12 of 12 - both for the GPU work.
+* *CPU speed* (as 41.2's costs; v7, its reference rows cycled): 1,512-1,593 / 1,378-1,388 / 1,792-1,932 / 2,023-2,039
+  rows/s at 16 / 64 / 256 / 1,024 rows against the earlier graph's 1,628-1,687 / 1,224-1,591 / 1,836-1,870 /
+  2,014-2,127 - the same within the noise of the busy machine.
+
+**DirectML refused for zero-onnx/2 (2026-11-13).** On batches with pointer overrides DirectML intermittently returns all
+of a row's overrides as one shared wrong value (the self-test passed 3-5 of 5-6 runs on the RTX 5090 and the UHD 770,
+with this graph and the one before it alike), so a passing self-test does not make later override batches right: the
+search would get wrong targets, which no replay catches. The worker's session factory therefore refuses DirectML for any
+graph whose metadata says `zero_onnx` 2 (`session::provider_refusal` / `refused`): a skip with the reason, never an error
+- `create_session` goes on to the next provider (CUDA, the CPU), and `probe-providers` reports an ordinary result entry
+(`ok` false, `why` "dml: zero-onnx/2's pointer-override path ..."), which an agent caches as a failed provider.
+zero-onnx/1 on DirectML stays allowed (9 of 9 self-tests passed). Lifting the refusal needs a fix of the override path
+(or a restructure that avoids DirectML's fusion there), proven by at least 50 consecutive identical, correct runs on
+override batches on both adapters. Test: `session::tests::directml_is_refused_for_zero_onnx_2_only` (the refusal, its
+skip form and the probe's result entry).
+
+### 46.9 A reference set holds every kind of row the self-test answers (farm-int, 2026-11-14)
+
+**Why.** `reference_rows` ordered the recorded batches with overrides first, then tail tokens, and cut at `n`. Real
+batches of a layout v7 run hold tail tokens nearly everywhere, so the batches holding overrides and tails could fill the
+256 rows without a single belief row, and `write_reference` refused a network with an auxiliary head ("the 256
+reference rows hold no belief row"). The farm pool of MTG Zero's delver-bo3-pb2 exported gens 36-39 and then failed on
+gen 40, retrying the whole export (a few minutes of CPU self-play in `farm_h2h.record_rows`) every time: no new
+generation reached the farm.
+
+**What.** The first batch (in the existing order) holding an override, the first holding a belief row and the first
+holding a tail token are taken before the rest. Nothing else changes: the same batches when they already covered every
+kind. Test: `test_the_reference_rows_hold_a_belief_row_when_the_files_do` (belief rows only in the last batch).
+
+### 46.10 DirectML runs the fast graph's MatMul form: the refusal narrowed, the farm's DirectML variant (zero-farm PROTOCOL rev 22, 2026-11-20)
+
+**Why.** The owner's decision of 2026-11-20: the farm's AMD GPUs play through DirectML (AMD's own Windows ML providers
+can't run our graphs, 46.7-46.8 and zero-farm PROTOCOL 9.8). Two things stood in the way: every zero-onnx/2 graph was
+refused on DirectML (46.8: the default graph's pointer overrides answered intermittently wrong), and the fast graph
+(63, 66) DirectML would have to run puts its attention in com.microsoft MultiHeadAttention nodes.
+
+**What was measured** (an NVIDIA GPU of a farm PC and an Intel integrated GPU; Windows ML's ONNX Runtime 1.28.3 and
+DirectML 1.15.4 from a pack without the provider catalog; a release worker with the refusal lifted, never published):
+
+* *Which graphs run.* The fast graph with its fused attention ('mha'): DirectML throws on the MultiHeadAttention node
+  (E_INVALIDARG, "The parameter is incorrect") in every run, float32 and float16. The static graph (67): Range / Expand
+  run out of memory in DirectML. The fast graph with its attention as MatMuls (graph 'fast-matmul', `attention`
+  'matmul', 63): passes (61 nodes on the CPU, the shape arithmetic of its dynamic sizes).
+* *The override path.* `eval-batches` in separate processes (a fresh session and self-test each) on the 42 recorded
+  batches of a layout-v7 Delver network that hold pointer overrides (3,888 rows, 151 overrides in 42 rows of 2-5 each:
+  46.8's file), each run's answers against the CPU's (float32: max abs 1e-4; float16: 5e-2) and bit for bit against
+  the first run's:
+
+  | graph | NVIDIA GPU | Intel integrated GPU |
+  |---|---|---|
+  | fast-matmul, float32 | 50 of 50 (override rows' priors 7.7e-7) | 50 of 50 (8.3e-7) |
+  | fast-matmul, float16 | 50 of 50 | 50 of 50 |
+  | default graph (the control) | DirectML passed its self-test in 7 of 20 runs (the session fell back to the CPU in the other 13); all 7 answered override rows wrongly (priors off by up to 0.88), each run differently | passed its self-test in 5 of 20; 4 of those 5 wrong (up to 0.86) |
+
+  The control reproduces 46.8's failure on today's code - a passing self-test, then wrong overrides - so the check sees
+  it; the MatMul form never showed it in 300 runs (each set one digest, run after run). MTG Zero's live 3-deck network (gen 769, layout v7 with its newer
+  segments) on its own 7 recorded override batches (4,154 rows, 7 overrides; the run's games make few): fast-matmul 50 of 50 in float32 (1.5e-6) and 50 of 50 in float16 (3.3e-3), the NVIDIA GPU.
+* *Speed* (the same NVIDIA GPU, legacy-meta3-r1 gen 769, the farm worker's self-play in 5-minute windows): DirectML on
+  fast-matmul float16, 3 workers x 1,150 games in flight, 2 groups: 12.0k leaves/s against CUDA's 25.3k on the same
+  graph (0.48x) and 28.1k on the fused one (0.43x). A fixed cost per call (~130-140 ms at 450-670 rows, the GPU 33-46 %
+  busy) limits it; more workers past 3, or bigger batches, are slower.
+
+**What changed.**
+
+* `session::provider_refusal`: DirectML on a zero-onnx/2 graph is allowed for the fast-matmul graph only (metadata
+  `fast` '1', `attention` 'matmul', not `static`), float32 or float16; the fused forms, the static graph and the
+  default graph stay refused, each with its reason. zero-onnx/1 and every other provider as before. Tests:
+  `directml_runs_only_the_fast_matmul_zero_onnx_2_graph`, `directml_is_refused_for_zero_onnx_2_default_graphs`.
+* `farm_pool`: the variant form 'matmul-fp16' (each gen's checkpoint exported again as graph 'fast-matmul' through
+  `export_cached` - its own weight-swap template, checked against the gen's reference set - then `to_float16`), and
+  `pool_variants` 'name=form[@vendor]': a variant with `@vendor` goes to the run's GPU alternates of that vendor, the
+  first one without to every other GPU alternate (`variant_of`). E.g. 'gpu=fp16,dml=matmul-fp16@amd': the CUDA
+  alternate plays the float16 fast graph, the DirectML alternate for AMD GPUs (zero-farm PROTOCOL rev 22: a pack
+  requiring an AMD GPU, DirectML only) the float16 MatMul form, every other machine the default. Without '@' the
+  setting means what it did. Test: `test_pool_variants_are_exported_uploaded_signed_registered_and_named` (the syntax,
+  `variant_of`, the refusals).
+
+Not changed: the default graph on DirectML (still wrong), the agents' choice (zero-farm), the static graph.
+
+**On an AMD GPU** (a farm PC's, the first one through zero-farm rev 22, 2026-11-20): the DirectML pack loads and the probe
+graph passes; the float16 MatMul form answers within tolerance (max abs 8.1e-3 against 5e-2) but **not deterministically**
+(the self-test's two passes differ: the worker refuses it, the PC plays on the CPU), while the **float32** form passes
+(max abs 4.4e-6, deterministic) at 7,638 rows/s at 1,024 rows (the PC's CPU: 1,609) - about what DirectML gave the
+NVIDIA GPU in float32 (8,074). So the variant form 'matmul' (float32 fast-matmul) was added, and the AMD variant is
+'dml=matmul@amd'; 'matmul-fp16' stays for DirectML on NVIDIA and Intel GPUs, where it is deterministic.
+
+## 47. The run loop at its edges: the Fable review's fixes (2026-11-12)
+
+(Numbered 46 on its branch `fix/core-infra-1112` and in that branch's commit messages; renumbered 47 when it was merged
+into `integrate/fable-1112`, because the AMD branches already use 44-46. Every "46.N" there is 47.N here.)
+
+The Fable review of 2026-11-12 (mtg-zero's slice 5, "Python run loop & infrastructure") found the core's loop sound
+where it runs alone and wrong at its edges: a remote machine, an interrupted iteration, a fork, the supervisor. Every
+fix below is in Python or the tools (no Rust, no search or self-play change: the games, searches and recorded samples
+are the same), several change what the loop does by default - each is said. Tests:
+`tests/test_run_infra.py` (new) and `tests/test_remoteplay.py`. MTG Zero's ENGINE.md 144 has the pin.
+
+### 47.1 A finished self-play phase is never played again: `data/iter_N/DONE.json`
+
+**Why.** A PAUSE or a crash during training threw away the iteration's finished self-play phase: the resume dropped
+`data/iter_N` (no checkpoint N) and played it again - the largest phase of an iteration, on a shared desktop where
+pauses are routine.
+
+**What.** When a phase ends (its writer closed; with a remote, its last shards in) the loop writes
+`data/iter_N/DONE.json` - the phase's metrics, its seconds and every shard of the directory (name -> bytes, rows) -
+atomically, and refuses to write it when the shards' rows do not add up to the phase's samples. A resume of iteration N
+(no checkpoint N) reads it first: when the directory holds exactly the shards it records (the same names, bytes and rows,
+adding up to its samples) the loop logs `iter N: its self-play phase finished before the interruption (DONE.json: ...):
+not played again, training on it` and trains; the metrics row is the phase's, marked `selfplay_resumed`, its seconds
+counted. A marker that does not match (a shard gone or added, another iteration's, unreadable) is logged and the phase is
+played again, as before. A co-training run writes one in `data/` and one in `resolver/data/` and resumes from them only
+when both match. A phase cut by STOP (47.4) gets none. Default: on (it changes nothing but the replay).
+
+### 47.2 The supervisor gives up on the same crash
+
+**Why.** A deterministic failure (a NonFinite training step: the same window, the same seed) was restarted forever -
+five crashes, fifteen minutes' wait, again - each time replaying the iteration's self-play (47.1 makes the replay cheap,
+not the loop finite), on the desktop or on a rented box billing by the hour.
+
+**What.** `tools/supervise.py` keys each crash by the run's own error text (`run_state.json`, written by the run when
+it aborts; decimals masked, so a NonFinite's losses differing in the last digits on a GPU still match; a run killed
+without writing one - the stall watchdog, a segfault - never counts). The same key `<P>_SUPERVISE_SAME_CRASHES` times in
+a row (default **3**; 0 = never give up, the supervisor of before) ends it: logged, `supervisor_state.json` state
+`refused` with `why` and `error` (the dashboard then reads the run's `aborted`). PAUSE, STOP, exit 78 as before.
+
+**A launcher's child is the run (farm-int, 2026-11-14).** The key was read only when `run_state.json`'s pid was the pid
+the supervisor launched. A Windows venv's `python.exe` is a launcher that starts the base interpreter as its child -
+the zero-farm venv runs a farm-attached run's supervisor and run so (docs/az.md 45) - so the run's pid never matched:
+the same crash restarted forever there, and the run's orphaned pool workers (children of the launcher's child) were
+not killed. `supervise.launched_state(run, pid, since)`: the state is the launched run's when its pid is the launched
+one or its process started after the launch (`started` >= the launch time: only the supervisor launches the run);
+`crash_key` reads it, and the orphan sweep also takes that pid's children. Test: `test_the_supervisor_gives_up_on_
+the_same_crash_three_times[True]` (a launcher script in between); both interpreters pass test_run_infra.py (23).
+
+**The orphan sweep spares older processes (farm-int, 2026-11-14).** `kill_orphans(pid)` killed every process whose
+parent pid was the exited run's pid. Windows reuses pids quickly and keeps a dead parent's pid as a process's parent
+pid, so a process tree whose long-dead parent once had that number was killed too: on 2026-11-14 a live run's
+supervisor (its parent, `launch_hidden.py`, long gone) and its run vanished without an exit line while supervisor
+tests on the same machine churned ~1,000 short supervised processes (the venv launcher case above, restarting every
+0.1 s). `kill_orphans(pid, since)` kills only processes created after `since`, the time the supervisor launched the
+run: the run's own orphans are always younger than it. (psutil's `children()`, used by the stall watchdog on a live
+process, already compares creation times.) Test: `test_the_orphan_sweep_spares_processes_older_than_the_launch`
+(the test's own child, spared with a later `since`, swept with an earlier one). The companion (section 49) is asked once the run of this start wrote its state - through
+`launched_state` too, else under a venv launcher it never started (merge of feat/run-companion into farm-int; test:
+`test_one_companion_across_a_crash_and_it_ends_finished[True]`).
+
+### 47.3 Remote evaluation: the end-of-run drain and the transport
+
+* **The drain** (`RemoteEval.drain`, `run.drain_remote_evals`). A finished run waited at most 6 hours for its queued
+  remote evaluations, then ignored the answer: phase `idle`, `done`, exit 0, the last evaluations missing from
+  `evals.jsonl` and the pool, no line. Now it waits with no time limit while the run goes on (a remote asleep for a night
+  is waited for; the rule: a bounded drain only after a stop request), rewriting `progress.json` every poll (the stall
+  watchdog sees the wait; before, a long evaluation wrote nothing and `<P>_SUPERVISE_STALL` could kill the run mid-drain).
+  PAUSE ends the wait (the restart queues the missing ones again). STOP during it: the iterations not recorded are logged
+  (`remote evaluations NOT recorded (STOP during the end-of-run wait): remote <name>: iterations [...]`) and the run
+  ends aborted (`RemoteEvalsMissing`), never `done`; a restart queues and waits for them. Co-training's resolver queue
+  and `draft_eval_net_remote` the same.
+* **The transport** (`Transport.listdir`, `Transport.get`). A failed `ssh ls` read as an empty directory: `_ship` took the
+  mirror for new and put this machine's `results.json` / `metrics.jsonl` over the mirror's, re-shipping every checkpoint;
+  a failed copy read as "no such file", and `_evaluate` ignored the pool files' copy altogether (this machine's pool
+  could stay older than the mirror's, and the next new-mirror ship put it back there). Now a listing that fails raises
+  (`[]` only for a directory that is not there), a copy that fails raises unless the file is checked to be absent (False),
+  and an evaluation whose `results.json`, `ratings.json` (and `anchored.json` with anchors) does not arrive fails - logged
+  and retried like any failure.
+
+### 47.4 Remote self-play: the end of a phase waits for its shards
+
+**Why.** A worker's game counts for the quota when the run answers its `fin` line; its samples travel later, in a shard
+(an scp each). `end(it)` waited `selfplay_remote_wait` (30 s) for the last shards and dropped the rest - in normal
+operation on a slow link (MTG Zero's tools/vast.py logged it), so an iteration trained on fewer games than `games`, shown
+only as `late` / `SHORT`. A bounded drain timeout that fired without a stop request.
+
+**What.** `end(it)` waits until every worker of the phase has sent its end (its shards announced) or is gone, and every
+announced shard is fetched (accepted, rejected, quarantined or failed) - no time limit while the run goes on. PAUSE ends
+the wait at once (Paused: the iteration is replayed, no DONE marker). Once STOP is there, `selfplay_remote_wait` s more
+at most (logged `iteration N: STOP while the phase's last shards travel: waiting at most Ws more`); what is not back is
+dropped as before and the remote record says `cut` (that phase gets no DONE marker, 47.1). A worker that dies is
+waited for no longer; its accepted games not in a shard are lost as before (`lost`, the quota short). A hung worker is
+the session watchdog's (silent for `STALL_S`: killed). **Default changed**: the 30 s bound applies only after STOP.
+
+### 47.5 Co-training: an episode requeued more than once
+
+**Why.** `Coordinator.dupe_ok` was a set: one spare copy per requeued tag. A match overdue on a slow worker was requeued
+and, in the same manager tick, handed straight back to that worker (its room freed, the local driver at its cap); overdue
+again, three copies were in flight. The third row either found its event resolved - `RuntimeError: a resolver result
+row with an unknown tag`, the run aborted and replayed the iteration - or arrived while it was open and was accepted
+again: `outstanding` decremented twice (the backpressure's count drifted, below zero) and the match counted twice.
+
+**What.** `dupe_ok` counts a spare per requeue; the first row fills the episode's slot and every later copy is dropped
+against a spare (`duplicates_dropped`). A row for a filled slot (or a resolved event) with no spare left raises (`a
+second resolver result row for ... which was never requeued`), as an unknown tag does. A session remembers the tags
+requeued away from it (overdue, given back) and `take_for_remote(n, skip)` never hands them back to it - they wait at
+the front for the local driver or another worker. A worker ignores an `enqueue` of a tag it still holds (one row
+answers both).
+
+### 47.6 fork_run --iter K: the Elo pools cut at K, the fork's own window
+
+* **The pools.** `fork_run --source A --dest B --iter K` copied every pool's `results.json` and `ratings.json` whole: the
+  pairs and `logged` names of the source's checkpoints after K came along. The fork's own `iter_K+1`... carry the same
+  names, so `elo.has` found the source's games for them (their Elo matches never played, their ratings another network's)
+  and `logged` kept their evaluations out of the pool: the fork's Elo curve for its first iterations was the source's,
+  and an A/B read off it compared the source with itself. Now every pool is cut at K (`fork_run.cut_pool`: the pairs
+  naming a checkpoint after K and those `logged` names dropped; a rule's pool begun after K loses its `since`; anchors and
+  their calibration games kept), printed when anything was dropped, and `ratings.json` is not copied (refit at the fork's
+  first evaluation).
+* **The window.** The data directories followed the source's `window` only: `--set window=12` or `min_window_samples`
+  were not read, so the fork's first trainings saw a smaller window than the same run would. Now `window_dirs` follows
+  `window_shards`' rule with the fork's settings (window of K + 1, more while the rows are under `min_window_samples`),
+  at least what was copied before, and never a quarantined `*.bad.npz` or a `*.tmp.npz`. An optimizer state of another
+  iteration than K is skipped with a line (before: in silence).
+
+### 47.7 A device the machine does not have refuses the run
+
+`train_device` (and `heldout_device`) `cuda` without a working CUDA silently became `cpu`: a rented box without a driver
+trained every iteration on the CPU at a fraction of the speed, the only sign `"device": "cpu"` in the train metrics.
+Now `run.check_devices` refuses the run at its start - `DeviceRefused` (an EncodingMismatch: exit 78, not restarted) -
+for `train_device`, `heldout_device` or `infer_device` naming `cuda` / `mps` that torch cannot use (a co-training run:
+both networks' settings), and training never falls back.
+
+### 47.8 State files written atomically
+
+`config.json` (and a co-training run's `resolver/config.json`) was rewritten in place at every start: a kill during the
+write left a truncated file every restart then died on. `_write_json` returned silently after 20 `PermissionError`s,
+leaving its temporary file - also for `models/iter_N.json`, the partial metrics a resume needs. Now both configs go
+through `_write_json` (a temporary file, then a rename), `models/iter_N.json` and `DONE.json` are written `strict` (the
+error raised), and `progress.json`'s rare miss is said on stderr, the temporary file removed either way.
+
+### 47.9 Self-play metrics of a rolling phase
+
+A rolling driver's counters (`minor`, `belief_rows`) cover every game in flight during the phase, and the phase's finished
+games include ones begun in an earlier phase: `minor_per_game` (minor / finished games) and `belief.per_decision` (belief
+rows / the finished games' decisions) divided one population by another - unbiased in a steady phase, wrong for a short
+measurement or a first iteration (the 11-10 review's 120-game measurement was off by ~9x). Now the ratios stay where they
+are exact - a fresh, non-rolling driver that started and finished every game of the phase (the default `rolling` 0: the
+metrics of before) - and a rolling or shared phase (and co-training) reports the counts: `selfplay.minor` instead of
+`minor_per_game`, `selfplay.belief` = `{rows}` without `per_decision`. An exact per-game figure there needs per-game
+counters in the driver's result rows (a Rust change; not made).
+
+### 47.10 A worker's accept it cannot fill
+
+A remote worker answered an `accept` of more games than it held by cutting it in silence (`n = min(n, held)`) - the quota
+would count games that never arrive ("should not happen"). Now it notes it and sends `unaccepted` for the difference,
+which the run gives back to the quota.
+
+### 47.11 Not changed here
+
+* **The gate shadow's open-path gradients** (43.14's correction). Proposed opt-in, not built: a setting (say
+  `gate_shadow_scope` 'all' = today, 'gated') under which the attention's backward runs twice while a present gate is
+  below the shadow - once with the true weights (dq for every query, dk / dv of every ungated token) and once with the
+  shadow weights (dk / dv of the gated tokens and the gate's own dw) - so the trunk's gradients are the true ones and only
+  the gated segments learn as if open. Costs: a second attention backward a layer for as long as a gate stays shut (on
+  top of 43.14's explicit-attention cost); the pooling's and the pointer blend's shadow terms reach the trunk through the
+  gated tokens' hidden states and would need the same split. Default training unchanged until a run asks for it.
+* Improvements of the review not taken: a gap in the data window (I3), the optimizer state saved with its checkpoint
+  (I5), a build identity in the remote hello (I6), a remote evaluation retried after it finished (I9), a pausing run's
+  stall limit (I10), a persistent shard-fetch channel and a window row cache (O2, O3).
+
+### 47.12 The compat goldens record and hash the auxiliary targets (`tools/selfplay_digest.py`)
+
+`check_checkpoint_compat` is the byte-identity proof of the core gates ("identical ... samples > 0"), but
+`selfplay_digest.py` built its drivers without `aux=True` and hashed x, player, n_players, z, q, sc, net, opt_action,
+pi and the tails / overrides - not the auxiliary targets (15) that MTG Zero's Delver and EoE runs train on
+(`aux_belief_w`, the deck targets): a change to what self-play records for them passed as identical. Now a game whose
+engine computes auxiliary targets (`aux_layout` not empty) is recorded with them and each row's `aux` is hashed after
+the rest; a game without them hashes exactly the bytes of before (the toy's `toy_tail`: visits `1edf08ce1f646b68`, cq
+`c6fb4902cbac6275` with the old and the new tool). Each target's entry names the arrays hashed (`arrays`), the compat
+check prints them per side (`  arrays hashed: ...`, a line of its own: the gate's parser reads the target lines as
+before) and in its result line (`arrays`). Both sides run the new tool (the one beside the compat check), so the
+comparison stays like for like; the toy's and MTG Zero's digests change (they hash `aux` now). Tests:
+`tests/test_run_infra.py::test_the_records_digest_hashes_auxiliary_targets_and_nothing_else_changes`,
+`::test_check_checkpoint_compat_names_the_arrays_it_compared`.
+
+### 47.13 A detached checkout's default target dir (`tools/build_engine.sh`)
+
+The default `CARGO_TARGET_DIR` was `<default target dir>/<branch>` with the branch from `git rev-parse --abbrev-ref
+HEAD` - `HEAD` in every detached checkout (a game's pinned run worktrees, the `*-base` ones), so all of them built into
+one `<base>/HEAD`: the shared-target hazard (cargo's workspace-relative dep-info, one checkout's build installed as
+another's module) as the default. Now a detached checkout gets `detached-<its directory's name>` (a branch: its name as
+before, `/` -> `_`; not a git checkout: `nogit`), as MTG Zero's own `tools/build_py.sh` now names it.
+
+### 47.14 The compat goldens' random network for a game with tail segments (integration of 2026-11-13)
+
+`selfplay_digest.py --net random` built an MLP (64 x 2) for every game, and `NetEvaluator` refuses any network but a
+token network of the game's tail segments for a game that declares them (43.8, R4): so `check_checkpoint_compat
+--net random` could not run on any MTG Zero commit since layout v7, at either pin - and with it neither the
+`search-core` nor the `optin-core` tier's compat step of MTG Zero's `tools/gate.py` (lanes C2 and D of the Fable
+review both met it and compared with `--net uniform` by hand: 47.12's checks, MTG Zero ENGINE.md 144.4 and 145.5).
+Now `--net random` for a game with tail segments (`games.info(game)['tails']` not empty) is a token network of the
+game package's object layout (`net.make_net(..., arch='tokens', hidden=32, blocks=1, heads=2, ff=64)`, torch seed 0,
+the evaluator `'random tokens'`), small so that a CPU at 1 thread plays MTG's goldens in minutes; every other game
+keeps the MLP of before (the same seed, the same digests). Both sides of a compat check run the tool beside it, so
+the network is the same on both when the two checkouts' layouts are (a layout change differs, as an MLP's width
+change always did). Test: `tests/test_run_infra.py::test_a_random_network_for_a_game_with_tails_is_a_token_network`
+(toy_tail: the token network, samples and tails recorded, a checkout against itself identical; the toy: the MLP).
+
+## 48. Self-play's host costs after layout v7: tail rows scanned at encode, the phase's time split (the 2026-11-12 performance review, MTG Zero lane D; branch `perf/fable-1112`)
+
+(Numbered 44 on its branch `perf/fable-1112` and in that branch's commit messages; renumbered 48 when it was merged
+into `integrate/fable-1112`, because the AMD branches already use 44-46. Every "44.N" there is 48.N here. This pin has
+the branch's head c275a1e: 48.1 and 48.2. The branch's next commit a77cacf (P5, records as their non-zeros, its 44.3 and
+44.4) is not in it: zero-farm's worker reads the dense `Record`.)
+
+The 2026-11-12 review of MTG Zero (its perf slice: `perf.md`, the patches P2 and P5) measured zero-core's driver on
+the live run's spec (the constructed Delver best-of-three, layout v7) with an instantaneous evaluator and found two
+costs this window's work had added - v7's tails had switched MTG's rows off the sparse path of docs/search.md 2.12,
+and every record kept a dense row of 56,384 floats for as long as its contest lasted - and a phase whose metrics could
+not say what it waited for (32k leaves/s in the live run against 61k in 43.12's quiet benchmark of the same network).
+48.1 and 48.2 are behaviour-preserving (the same batches, samples, results and shards).
+
+### 48.1 Tail rows scanned when they are encoded (driver; no setting)
+
+**Why.** For a game with `TAILS` a sparse buffer (`sparse` 1) left an `encode_row` row in its dense scratch until
+`seal`: the evaluation cache's key (3.12) was `obs_state` over all `NUM_FEATURES` floats, a cached row zeroed the whole
+scratch again and a sent row was scanned at `seal`. A game without tails has had its pairs at once since 2.12.
+
+**What.** `LeafBuf::encode_row` (tails, sparse) runs `game::sparse_scan` right after `encode_row` and marks the row open,
+as `encode_sparse` does: the key reads the pairs (`obs_state_sparse`, the same key), `unrow` truncates, `seal` counts.
+docs/search.md 2.15 already said so ("the driver ... calls `encode_row` into its scratch row, then `sparse_scan`").
+
+**Checks.** The same batches, samples and results: the review's driver hash (MTG Zero's `engine/tests/driver_bench.rs`,
+every batch's rows, options, tails, overrides, every sample and result over 40,000 batches) `f8cfeb414c6c3322` before
+and after (MTG Zero ENGINE.md 145). `driver::tail_tests::a_sparse_tail_row_is_scanned_when_encoded` (new): the open row
+is its pairs at once, the scratch zeros again, the key the dense row's, the pairs `sparse_scan`'s of the dense row,
+`unrow` / `seal`. The existing `dense_and_sparse_rows_are_the_same` and
+`the_evaluation_cache_keys_cover_tails_and_overrides` (sparse vs dense: the same rows, games and cache hits) pass.
+
+**Measured** (MTG Zero v7 Delver Bo3, desktop CPU, the review): the row's key 5.46 -> 1.15 us, seal or un-row 4.33 ->
+~0, encode + scan 4.45 -> 9.6 us; rows in all 23.2 -> 17.5 us per simulation. ENGINE.md 145 has this branch's A/B.
+
+### 48.2 Where a self-play phase's seconds went (`selfplay.timing`; metrics only)
+
+**Why.** `infer_s` is the evaluator's whole call time; the driver's counters (`busy_s`, `wait_s`, `assemble_s`) were
+never written, so a phase at half the benchmark's leaves/s could not say whether it waited for the network, for the
+search threads or for neither (the GIL, the writer, the remote threads).
+
+**What.** Each self-play phase (plain, rolling, the shared queue's local driver) writes `selfplay.timing`: `busy_s` (the
+search threads' seconds in their chunks) and `busy_share` (of threads x the phase's seconds), `assemble_s` (batch
+assembly), `wait_s` (the driving thread's seconds blocked in `next_batch` for a group's searches) and `wait_share`,
+`infer_share` (`infer_s` over the phase), `launch_s` / `result_s` (of the evaluator's seconds, those of its CUDA
+graphs' launches - packing, the upload, the replay queued - and of their results - the wait for the device and the
+download; `NetEvaluator.launch_s` / `result_s`, reset per phase), `batches`, `threads`. A search-bound phase shows
+`wait_share` high and `busy_share` near 1; an inference-bound one sits in `result_s` with idle search threads; a phase
+with neither high spends its time in the driving thread itself. The other keys are unchanged.
+
+**A fix in `infer_s`** (2026-11-13): for a batch evaluated at once in drive's pipelined loop (an eager evaluator: CPU,
+or a network without graphs) `NetEvaluator.launch` added the time `evaluate` had already counted, so `infer_s` read
+about twice the truth (the toy smoke's `infer_share` 1.6, the MTG smoke's 1.8). It is counted once now. The CUDA graphs'
+path (MTG Zero's runs) was right and is unchanged. Comparisons of two runs' metrics leave `timing` out with the other
+timing keys (`test_select_scale.py`).
+
+**Tests.** `test_loop.py::test_selfplay_metrics_split_the_phase_time` (the toy smoke's phases: the keys, shares within
+[0, 1] - `infer_share` included, which the double count failed -, CPU: no launches), the shared queue's local driver in
+`test_shard_thread.py`.
+
+**Not measured here**: the live run's split (it needs a run on this commit; the GPU was busy with that run).
+
+## 49. The run's companion process: one per run, started and ended by the supervisor (`GamePackage.companion`, `on_fork`; MTG Zero's delverai publisher, 2026-11-14)
+
+**Why.** MTG Zero publishes each Delver run to its site with a publisher process. It was started by hand per run, ran
+until someone killed it, and on 2026-11-14 a new run had none at all until the user asked why it was missing from the
+site. A process that belongs to a run should start with the run, live through its restarts and pauses, and end with
+it - the supervisor is the one thing that sees all of those.
+
+**What.** A game package may declare `companion`: fn(run, cfg) -> `{name, cmd, log, env}` or None (`'module:attr'`;
+`GamePackage.companion_of` fills the defaults: name 'companion', log '<name>_console.txt', and checks `cmd` is a
+non-empty list of strings). `zero.tools.supervise`:
+
+* asks it at every start of the run, once the run has written its `config.json` (`run_state.json` names the run
+  process just started), with that config: the companion follows the run's own settings of this start;
+* starts it from the game repo's root (the run's checkout: the same code as the run), hidden (`CREATE_NO_WINDOW`) and
+  below normal priority (`nice 10` elsewhere), stdin closed, its console appended to `<run>/<log>`, with
+  `ZERO_SUPERVISOR_PID`, `ZERO_SUPERVISOR_STARTED` (the supervisor's process creation time) and `ZERO_COMPANION_RUN` (the
+  run directory, absolute) in its environment;
+* keeps ONE per run: a restart of the run (a crash, a pause) with the same command keeps the running companion; a
+  changed command stops it and starts the new one; None stops it. One that exits while the run goes on (or is paused)
+  is started again, at most 3 times within an hour, then given up until the run's next start with another command;
+* records it in `supervisor_state.json` (`companion`: name, pid, started, cmd; `companion_error`), so a new supervisor
+  stops a companion an abruptly killed one left, and `tools/kill_run.py` leaves the companion (and its children) out of
+  its tree kill;
+* ends with the run: every terminal state of the supervisor now says how the run ended - `ended` 'finished' (the run
+  exited 0 without a STOP file: its last iteration), 'stopped' (STOP, STOP while paused, the supervisor interrupted or
+  failing), 'refused' (exit 78), 'gave_up' (the same crash again and again, 47.2) - and the supervisor then waits for
+  the companion to exit by itself, `<P>_SUPERVISE_COMPANION_WAIT` seconds after a finished run (3600: its last work, e.g.
+  a final recording) and `<P>_SUPERVISE_COMPANION_STOP_WAIT` (120) otherwise, and kills it after that.
+
+The companion's side is `runctl.supervisor_end()`: None while its supervisor goes on (running, paused, restarting), else
+`ended` once the supervisor wrote a terminal state, and 'stopped' when the supervisor process is gone without one (pid +
+creation time, so a reused pid does not count) or another supervisor now runs the run. A paused run keeps its companion.
+
+**Never a reason to stop training (deliberate).** A companion that cannot start - the hook raises (e.g. MTG Zero's: no
+upload key, a bad setting), its command fails, it keeps exiting - is said loudly (`COMPANION NOT STARTED (<name>): ...`
+in supervisor.log and on stderr, `companion_error` in the state) and the run goes on without it. This is the one place
+where the core prefers a degraded run to a refusal: the companion only reports on the run.
+
+`on_fork`: fn(source, dest, it, cfg, overrides) (`'module:attr'`), called by `tools/fork_run.py --source` after the copy
+and before the fork's config.json is written; it may change the fork's settings in place (MTG Zero: a fork of a
+publishing run publishes as a side run and records its lineage).
+
+**Off by default.** A package without `companion` (every game but MTG Zero today) is supervised exactly as before: no
+poll, the same waits, the same files - plus the `ended` field in the terminal state. `<P>_SUPERVISE_COMPANION` (a JSON
+spec, `{}` = none) overrides the hook (tests); `<P>_SUPERVISE_COMPANION_POLL` (5 s) is how often the supervisor looks
+after it.
+
+**Tests.** `tests/test_companion.py` (fake runs and companions): one companion across a crash and its 'finished' end,
+STOP -> 'stopped', it stays up and sees the run paused then goes on to 'finished' with the same pid, a killed supervisor
+-> the companion ends itself 'stopped', `kill_run` spares it and it ends 'stopped', a command that cannot start is loud
+and the run finishes, a companion exiting 3 is restarted 3 times then given up loudly, `{}` = none, a new supervisor
+stops the companion a killed one left, `supervisor_end`'s states, the hook's validation; `test_loop.py`'s and
+`test_run_infra.py`'s supervisor tests unchanged.
+
+## 50. Traced eval games: an eval job's rows carry their records (`eval_trace`; zero-farm analysis campaigns, 2026-11-15)
+
+**Why.** Analyses of play (how often a sideboard card is cast, what a checkpoint does in a spot, a head-to-head's
+games) need every move of every game, and so far they ran on the desktop beside the live run. zero-farm's eval jobs
+(44.2) already play fixed networks on friends' PCs, but report only one result row per game. With the game's record
+on its row, the desktop gets the moves for the price of a replay (milliseconds a game), and can check the farm's
+games by replaying them.
+
+**What.** The run setting `eval_trace` (default 0) is read by an eval job only (`settings::EVAL_READS`; class
+`trainer` for self-play, so a pool's template never carries it). On, `zero_worker::evaljob` traces its driver's
+games (`Driver::set_trace`, docs/search.md 2.17: the eval lease's driver is rolling, so it can; tracing changes no
+game) and each result row gains two keys after `over`:
+
+* `digest`: the first 16 hex of the SHA-256 of the record's compact JSON with its keys sorted (serde_json's text of the
+  record, which has sorted keys and no floats; Python's `json.dumps(rec, sort_keys=True, separators=(',', ':'),
+  ensure_ascii=False)` is the same text: `zero.farm_eval.trace_digest`);
+* `rec`: the game's record (`zero_search::record::game_json` without samples - gid, players, the game's seed
+  `record::game_seed(seed, gid, paired)`, every real move, over / aborted / resigned, the result and margins as f32
+  bits, rounds, the game's setup record; a chained contest's episodes).
+
+A value that is not a bool or a number is refused (`settings::eval_trace_of`). Off, the rows are byte for byte what
+they were. A Python match (`zero.farm_eval.match_driver`) refuses it: traced rows are the native worker's.
+
+The desktop side (`zero.farm_eval`): `trace_digest(rec)`; `check_digest(row)` (the row is traced, its record is its
+game and hashes to its digest); `replay_trace(row, game, spec, engine, seed, paired)` - the record replayed through
+the game's engine (`replay_rows`: every move legal, the result, margins, rounds and setup the record's), its seed the
+lease's game seed, the replayed result, rounds and `over` the row's, no samples (with `samples=True`, a self-play record: its samples replayed and checked too, `aux` as its file's header says - the farm's play jobs with search samples); `TraceMismatch` on any difference;
+`games_digest(rows)` - SHA-256 over `gid:digest` lines in gid order, first 16 hex: a set of games has one digest
+however it was cut into leases and whoever played it.
+
+**Costs.** None while off. On: a Delver best-of-one record is ~2-3 KB of JSON (250-350 moves and the two decks), so a
+10-game lease file grows from ~2 KB to ~25 KB; tracing itself is a push per real move.
+
+**Tests.** zero_worker `traced_rows_are_the_rows_plus_their_records` (toy, paired: every traced row is the untraced
+row plus `digest` and `rec`, the digest the SHA-256 of the record's text, each record's seed its game's, each record
+replays to its row's result and rounds with no samples, a tampered move refused, a lease's traced rows the whole
+match's, a bad value refused); `tests/test_farm_trace.py` (Python's digest equals serde_json's text hashed, rows replay,
+the games' digest ignores order, tampered digest / move / seed / result refused, a Python match refuses the setting);
+`test_worker_settings.py` (the table classifies it, EVAL_READS = what the match reads).
+
+**Measured** (2026-11-15, the desktop, MTG Zero's mtgz-worker on the Delver run pb2's checkpoints 96 vs 0 at 64
+simulations, 4 threads): 4 traced paired games in 285 s; 252-332 moves each; replay and check of all 4 well under a
+second; a record described move by move (the engine's view, each option in words) in 0.07 s.
+
+## 51. The live-run fence: process-churning tests skip beside a live run (`runctl.live_supervisors`, the `live_run_hazard` mark; MTG Zero's migration phase 0, 2026-11-15)
+
+**Why.** On 2026-11-14 a supervisor-test storm (~1,000 short-lived processes from `tests/test_run_infra.py` and a
+crash-loop repro) recycled a live run's parent pid on the desktop, and a test supervisor's orphan sweep killed the live
+run's whole tree (47.2). The sweep's creation-time check (76c548f) fixed that path; this keeps the whole class of tests
+- the ones that start real supervisors or churn processes - away from a machine with a live run.
+
+**What.** `zero.runctl.live_supervisors()` lists the supervisors running on this machine (one process scan, a few
+seconds on Windows): any Python process whose program is a `tools/supervise.py` (any game's copy) or
+`-m zero.tools.supervise`; a tool that merely passes `--supervised` (a companion) is not one. `live_run_fence_reason()`
+says why the fence is up (None when it is down); `fence_items(config, items)` is the conftest hook's body: every
+collected test marked `@pytest.mark.live_run_hazard` is skipped with that reason, which starts `live-run fence:` (MTG
+Zero's `tools/gate.py` counts those in pytest's `-rs` lines and names them in a gate's final line as skips). The scan
+runs only when a marked test was collected. Overrides: `ZERO_ALLOW_LIVE_RUN_HAZARD=1` runs the marked tests anyway (a
+quiet machine where the only "live" supervisor is your own), `ZERO_LIVE_RUNS=0` / `1` replaces the scan (tests). The fence is
+Windows-only by default (`ZERO_LIVE_RUN_FENCE=1` puts it up on any platform, `0` never): the hazard is Windows's (a
+dead parent's pid kept as the parent pid and recycled), while macOS and Linux re-parent orphans - and the Mac hosts
+other projects' long runs (a St. Pete Zero supervisor 34 days old on 2026-11-15) yet is where MTG Zero's gate runs
+these tests beside a live desktop run.
+
+**Marked.** `tests/test_companion.py`: every test that starts `tools/supervise.py` (9); `test_run_infra.py`: the orphan
+sweep and the same-crash give-up; `test_loop.py`: the supervisor with a fake run, the stall watchdog, `kill_run`;
+`test_encoding_guard.py`: the supervisor that does not restart a refused run. A new test that starts a supervisor or
+spawns processes in a loop gets the mark (`tests/test_live_fence.py` checks the supervisor tests carry it).
+
+**Off by default?** Nothing changes for a run, a game or a machine without a live supervisor: the tests run as before.
+**Tests.** `tests/test_live_fence.py`: which command lines are supervisors, the overrides and the reason, only marked
+items fenced and only beside a live run (no scan without a marked item), the marks present. Checked by hand on the
+desktop beside delver-bo3-pb2: the orphan-sweep test is skipped with the reason naming the two live runs, and passes
+with `ZERO_LIVE_RUNS=0`.
+
+## 52. Remote self-play follows the game package's phase spec (`RemotePlay.spec_of`, the farm pool's per-gen template; MTG Zero's best-of-three pb3, 2026-11-15)
+
+**Why.** 40's `selfplay_specs` hook lets a game package change the self-play spec between iterations (MTG Zero: EoE's
+deck evaluator version; pb3's matchup model's choice table, its ENGINE.md 168), but remote self-play - the remote
+hosts' workers (34) and the farm pool (45) - played the run's spec, so a run with a remote refused a changed spec. pb3
+must have the farm and the Mac, so they follow the phase spec.
+
+**What changed** (every run whose hook answers the run's spec, or has no hook, is byte-identical: no new message key,
+no new definition, the same template):
+
+* `Run._selfplay` with a remote no longer refuses a phase spec; `selfplay_shared` queues the iteration's local setups
+  with `rsp.spec_of(it)`.
+* `RemotePlay.begin(it)` asks the hook once per iteration, on the run's thread (`_phase_spec`: `Run.selfplay_spec`;
+  `specs[it]` None for the run's spec), before any host or pool sees the iteration. A host's `phase` message carries
+  `"spec"` only when the iteration's spec is not the run's; a remote worker's `_phase` takes it (else the run's) for
+  every setup it queues from then on (games in flight, lingering ones included, keep theirs).
+* The farm pool: `Pool.begin(it, spec)` records the iteration's phase spec; `_publish(gen)` (the checkpoint of
+  iteration gen + 1) makes the self-play template's play settings for that spec when it differs from the last
+  definition's (`_play_of`: the run's settings with the spec replaced, checked by the worker build's `check-config`
+  as any template) and stores it in the gen's state (`gens[gen]['spec']`); every later definition carries the template
+  of its gen's spec. Ingest accepts a record whose header names the run's spec or any gen's spec of this pool
+  (`known_spec`) and replays it with that spec; any other spec is refused as before ("played with another spec").
+  A pool whose template has no `spec` key (a game whose worker does not take the spec as a play setting) never
+  changes its template.
+
+**Hazards.** A remote worker of an older zero-core ignores the message key and keeps playing the run's spec: its rows
+are of the run's spec, not the phase's - accepted (they are legal self-play of the run's spec), but not the phase's
+games; update every remote checkout with the run's commit (MTG Zero's tools/mac.sh does). A farm agent plays the
+template its lease's definition names: games of the previous gen's spec in flight across a switch are accepted (their
+spec is known).
+
+**Tests.** `test_farm_pool.py::test_the_pool_follows_the_phase_spec_of_the_game_package` (iteration 1 the run's spec,
+iteration 2 a phase spec: gen 1's definition template plays it, its records accepted and replayed with it, a record of
+an unknown spec refused, the hook asked once per iteration), `::test_a_remote_worker_takes_the_phase_spec` (the
+`phase` message's spec, else the run's), `test_package_hooks.py::test_remote_selfplay_follows_a_changed_spec` (was:
+refused).
+
+## 53. The farm pool's per-generation export by weight swap (`onnx_export.export_template` / `swap_export`, `farm_h2h.export_cached`; MTG Zero's pb3, 2026-11-15)
+
+**Why.** The farm pool (45) exports every new checkpoint of its run: `load_checkpoint`, `farm_h2h.record_rows` (the
+reference positions: a short self-play of the new network, ~1,490 small CPU forwards) and `farm_h2h.export` (the dynamo
+trace, onnxscript's optimizer - its rewriter alone ~50 s, 309k `try_rewrite` calls -, the GPU-safe / portable rewrites,
+the checks, reference.npz). On MTG Zero's delver-bo3-pb3 (layout v7, 8 x 128 TokenNet, zero-onnx/2) that was 96-175 s
+per gen beside the live run, the farm's leases staying on the old gen meanwhile. A run's architecture never changes
+between gens: only the weights do.
+
+**What it does** (`Pool._export` -> `farm_h2h.export_cached`; the h2h CLI's `export` is unchanged):
+
+* **The template, once per architecture** (`export_template`, cached under `<run>/pool/<farm run>/export/<fp[:16]>/`
+  as `template.onnx`, `template.onnx.recipes.npz`, `template.json`). The key is `export_fingerprint`: the network's
+  class and config, the interface module (ZeroOnnx / ZeroOnnx2), the packing, every module tensor's name, shape and
+  dtype, the opset and `portable`, the exporter's versions (torch, onnx, onnxscript, onnx-ir), the sha256 of this
+  zero-core's `zero/*.py` and `TEMPLATE`. The architecture is exported twice with `export` itself - random weights
+  (N(0, 0.5^2): no exact 0 or 1) and coded weights (element i of the network's float state = 2^22 + i) - and the two
+  graphs must be the same graph but for the initializers' data and the model metadata (the metadata's `gates` holds the
+  gates' values; a swap writes its own network's metadata). Each initializer is then classified: the same bytes in both
+  = a constant (shapes, aranges, the layout's tables: `v_width`, `net.tok_cols`, ...); exactly a module tensor of its
+  name in both = a **weight** (the network's parameters, and the buffers ZeroOnnx2 computes from them at construction:
+  `v_tW`, `v_tb`, `v_tP`, `v_g`); a float initializer whose changed elements are codes = a **derived** weight (a slice,
+  transpose or concatenation of weights the optimizer folded: on pb3 the pointer head's parts `slice_158..161` and 11
+  folded `val_*`), kept as an index recipe that must reproduce the random export's values exactly. Anything else (an
+  initializer computed from the weights by arithmetic) raises: no template, the export fails loudly.
+* **Every gen: the swap** (`swap_export`): refused unless the network's fingerprint is the template's and the template
+  files are the ones described (sha256); each weight replaced by the network's module tensor of its name (dtype and
+  shape checked, else refused), each derived one rebuilt by its recipe, every module tensor the template holds constant
+  checked unchanged, the metadata written as `export` writes it (`metadata2` / `metadata` with the checkpoint's
+  `extra`, `opset`, `portable`), then `check_swapped`: `portable` on a copy rewrites nothing (every GPU-safe form in
+  place), `int32_slices` replaces nothing, `check_int32` (zero-onnx/2's int32 rule), the opset, onnx.checker's full
+  check. Then `check_reference` against torch within `REFERENCE_TOL` as before (nothing published otherwise).
+* **Invalidation, not fallback.** A changed fingerprint (another layout - a widen -, network size, export setting,
+  exporter version, a re-pin to another zero-core) names another cache directory: a new template is built there. A
+  swap that fails raises; there is no "full export instead" path.
+* **The reference positions, once per architecture and spec** (`positions-<sha256(spec)[:12]>.npz` + `.json` beside
+  the template: the first gen's reference.npz and its provenance): `record_rows` + `reference_rows` run only when they
+  are missing; every gen writes its own answers on them (`write_reference_rows`: `write_reference` without the row
+  selection - torch's eager answers batch by batch as recorded, what a run's workers answer; 0.4 s on pb3). The
+  reference.npz is the one of before: the same arrays, dtypes and meta keys (`sources` 'farm_h2h'; `checkpoint`,
+  `checkpoint_sha256`, `checkpoint_iter` the new gen's, so the worker's `check_meta` still matches its graph). Positions
+  recorded with an older gen are as valid a self-test: the worker answers the rows through the new graph and compares
+  with the new network's torch answers; the rows only need the kinds the architecture takes (belief rows with an
+  auxiliary head, tail tokens, overrides), which `write_reference_rows` checks every gen as before, and the fingerprint
+  fixes the architecture. No zero-onnx contract, metadata key or reference array changed: agents and workers need no
+  change.
+* **The log line** names each step: `gen 17 exported (2.2 s, ffe2cc54ea77): load 0.11 s, swap 0.39 s, reference 0.43 s,
+  check 1.24 s (graph by weight swap; reference positions of gen 15)` (`farm_pool.export_breakdown`); state.json keeps
+  them as `export_steps`.
+
+**A behaviour change, called out: `record_rows` gives ZERO_INFLIGHT back.** (feat/panic-queue 8ae31f8, docs/search.md 2.19, made the same fix the same day for the same test failure; this branch merges it, the one implementation kept.) `record_rows` drives its recording with
+`ZERO_INFLIGHT=1` (one network batch at a time) and used to leave it set in `os.environ` for the rest of the process.
+In a run with a farm pool that is the run process: from its first export on (gen 0, minutes into iteration 1), the
+run's own `drive` - its local self-play - went one batch at a time instead of the documented two in flight, and every
+subprocess it started inherited it (MTG Zero's pb3 run process holds ZERO_INFLIGHT=1, read from its environment block
+on 2026-11-15). With the positions kept, `record_rows` runs once per architecture, so the leak would have come and gone
+with the cache: it now restores the previous value (unset: removed) when its self-play ends. A run with a farm pool
+therefore drives its self-play two batches in flight again - the default, what every run without a pool does; a run that
+wants the one-at-a-time behaviour it had sets `ZERO_INFLIGHT=1` in its environment. (In the zero-core test session the
+leak, from `test_farm_h2h`'s end-to-end head-to-head, made `test_shard_thread::test_rolling_run_quotas_exact`'s run
+finish 97 games for a quota of 96 - deterministically, as `ZERO_INFLIGHT=1` alone does.)
+
+**What a published graph is now.** The template's graph is the one the exporter writes for a network whose values
+trigger none of its value-dependent rewrites. onnxscript's optimizer has such rewrites: a Gemm whose bias is all zeros
+loses its bias input. pb3's pointer head has a part of one column (a widened pointer column, all zeros in every gen so
+far), so its fresh exports drop that Gemm's bias; its swapped graphs keep it (`slice_161` = [0.0]). Compared on pb3's
+gens 14, 16 and 17 (each against a fresh `export` of the same checkpoint): the same metadata, every common initializer
+byte for byte, the same 2,136 nodes but that Gemm's third input (and 4 node names after it: the exporter's counter), and
+the raw graph outputs bit for bit identical on the gen's 256 published reference rows (x + 0 = x); `check_reference`
+gives the fresh graph's max |diff| (3.0e-6, 2.5e-6, 2.0e-6). Where no such rewrite fires (the tests' random networks),
+the swapped file is the full export's byte for byte. The refactor of `export` (`_export_module`, `_write_metadata`,
+`_write_model`) changes no byte: pb3's gen 17 exports to the same sha256 (838b36da...) before and after. The pb3 release
+worker's own self-test (`probe-providers --model --reference`, CPU) passes the swapped gen 17 (2.9e-6).
+
+**Costs.** The first gen of an architecture: two full exports (~90 s beside the live run) + the positions' self-play
+(~60-90 s) + one swap; ~10 MB per template on disk. Every later gen: ~2.2 s.
+
+**Measured** (pb3 iter_0015..0017, the live run on the same machine, 2026-11-15): before, 96-175 s per gen (a profile of
+gen 17: load 0.1 s, record_rows 58.3 s, export 92.8 s). Now: gen 15 (template built, positions recorded) 179.9 s
+(template 88.7 s, record_rows 86.0 s, swap 0.4 s, reference 0.5 s, check 1.4 s); gens 16 and 17 2.3 s and 2.2 s
+(load 0.1, swap 0.4, reference 0.4, check 1.2-1.3).
+
+**Tests.** `tests/test_farm_export.py`: `test_swap_equals_a_full_export` (a zero-onnx/2 network with tails, gates and
+overrides: the swapped file is `export`'s byte for byte, the same answers), `test_derived_weights_and_a_value_dependent_rewrite`
+(a pointer head in parts: the folded slices rebuilt by recipe; a part with an all-zero bias: the general graph answers
+bit for bit as the full export's, within the reference tolerance), `test_fingerprint_invalidation` (other weights: the
+same fingerprint; another size, opset, exporter version or zero-core Python: another; a swap onto the old template
+refused, nothing written), `test_refusal_on_mismatched_tensors` (a weight without its tensor, other weight sources, a
+wrong template file or format, a constant module tensor changed: refused, nothing written), `test_reference_reuse`
+(toy_tail checkpoints through `export_cached`: the first builds the template and records the positions - ZERO_INFLIGHT given back -, the second
+swaps and answers the same positions without a self-play - the same row arrays, its own checkpoint in the meta, within
+the tolerance -, the kept positions answered by the first network give the first reference set exactly, another
+architecture gets a template of its own).
+
+## 54. Rolling self-play leases: the worker's rolling jobs and the pool's per-row staleness (`pool_rolling`; zero-farm PROTOCOL rev 15, 2026-11-16)
+
+### 54.1 Why
+
+A classic farm self-play lease (45) starts all its games at once and replaces none. Its network batch drains as games
+end: half are done after ~5 min, and the last one or two then run alone at one row per batch for minutes. A lease
+lasts as long as its slowest game whatever its size, so a large GPU lease outlives the staleness window and is refused
+whole. Measured on the farm (MTG Zero's pb3, iterations 83-131, 5.8 h, 2026-11-16; the per-PC data is in the
+maintainer's notes): GPU leases kept **33-34%** of their full-batch rate over a lease and a CPU-only lease **62%**;
+**38-43%** of what the GPU PCs played was thrown away as stale (whole 64-game leases refused by the coordinator, plus
+games the pool dropped); halving a lease's size saved only ~15% of its wall time. Keeping the batch full alone was
+estimated at **3.0x** the GPU PCs' throughput and **1.6x** a CPU PC's.
+
+A *rolling* lease (zero-farm PROTOCOL rev 15, section 10) keeps N games in flight: the worker starts a new game whenever
+one ends, asks for more ids as it goes, switches to each new generation in place, and uploads finished games in small
+chunks. The batch stays full, a new generation costs no restart, and staleness is judged per row instead of per lease.
+
+### 54.2 What it does
+
+**The worker** (`zero_worker`, PROTOCOL 10.5; `job.rs`, `proto.rs`):
+
+* `hello` and `<worker> info` carry `"features": ["rolling"]` in a build with self-play (`Worker::features`; a
+  fuzz-profile build: `[]`).
+* The job line's `"rolling": true` (and `"flush_s"`, default 120 s; `job::Rolling`; the `selfplay` CLI's `--rolling
+  [--flush-s X]`): the job does not end when its `games` are done. It keeps up to `conc` games in flight while ids are
+  left (the loop that already topped up to `conc` - now against the job's current games), then idles - a `pump` every
+  20 ms; the control thread still answers `ping` and sends `status` - until `{"op": "extend", "games": total}` raises the
+  games (ids `[gid_base, gid_base + total)`; a lower or equal total is ignored) or `finish` / `quit` ends it. It sends
+  `{"ev": "low", "started": s, "games": g}` once per games value when fewer than `conc` of its ids are left to start
+  (g - s < conc; not while finishing). `end` is `finish` or `quit`, never `done`; `unfinished` = the released ids not
+  finished.
+* A records file (and with `output` shards / both, a shard: the two stay cut at the same games) is also written
+  `flush_s` seconds after the first game in it finished, checked at every pump, so an idle worker flushes too.
+* `checkpoint` in a rolling job builds the new network's session and runs its self-test (`selftest` with `gen`) on a
+  thread of its own (`Run::start_build`) while the games go on with the old network; its events and log lines are
+  sent when the job collects the build. Then the driver's phase ends and the built evaluator is swapped in exactly as a
+  classic job's switch (games in flight continue, their searches restart on the new network, each row records `net`).
+  A failed self-test (or sha256) is fatal, as at the start. A checkpoint asked while one is built waits for it, and the
+  newest wins (a superseded build is dropped). A `yield` also releases a built evaluator not yet swapped in (no GPU
+  memory held while yielded; it is rebuilt on its first batch). In a uniform-evaluator job the checkpoint switches to
+  the uniform evaluator with the new gen (tests, the plumbing gate); a classic uniform job still refuses one.
+* A job without `rolling` runs exactly as before: the same loop, the same files and rows, `end` `done`, `extend`
+  answered with the non-fatal "unknown op" error of before, the classic checkpoint path (built on the job's thread)
+  unchanged.
+
+**The pool** (`zero/farm_pool.py`; the farm run's side, PROTOCOL 10.1 / 10.7), run setting `pool_rolling`:
+
+* Its value is the farm run's `selfplay.rolling`: a JSON object (or its text) of `inflight` and `gpu_inflight` (1 to
+  4,096 or `auto`), `block` (>= 1), `max_s` (600 to 86,400), `flush_s` (10 to 3,600), missing keys taking the
+  coordinator's defaults; or `auto` = `{"inflight": "auto", "gpu_inflight": "auto"}` (`farm_pool.rolling_setting`;
+  anything else refuses the pool at start).
+* On the first publish of a pool process it checks that the worker build plays rolling jobs: `pool_worker`'s `info`
+  must name `pool_build` and list `rolling`; an alternate (45.2) whose signed manifest names the default's executable
+  (the same sha256) is that executable; another one is checked when it is a build of this machine's platform
+  (`farm_def.host_platform`; its manifest's `platform`, absent: windows-x64) and its executable is in `pool_worker`'s
+  builds directory (`<builds>/<build id>/<entry>`), else logged as unchecked (a worker without the feature plays a
+  rolling lease as a classic one: PROTOCOL 10.5). *Fix of 2026-11-20:* the platform test is new - a farm release with
+  `--mac-publish` keeps the macOS build's executable in the builds directory, and the check ran it (on Windows
+  "WinError 193 ... not a valid Win32 application" every poll: MTG Zero's legacy-meta3-r1 registered no gen, so got
+  no farm self-play, after its relaunches on releases with a macOS build, until the file was renamed). A refusal is the pool's error, logged and retried every poll; nothing is PUT,
+  exported or published meanwhile.
+* Every self-play PUT of the farm run carries `selfplay.rolling` (last key); a resumed run whose setting changed is PUT
+  again once the next gen is registered (state `put_extras`, as the alternates).
+* Staleness per row: a held game whose oldest row's network is older than `i - 1 - pool_max_stale` loses those rows
+  (`farm_pool.keep_rows`: any rows of a held sample dict - options, sparse features, tail and override CSRs) and keeps
+  the rest; the game is dropped only when none is left. Dropped rows count in `stale_rows_dropped`, dropped games in
+  `stale_dropped`; the kept rows go into the iteration's staleness histogram (`stale`) as before. The iteration's
+  pool metrics gain `stale_rows_dropped`.
+
+### 54.3 Off with `pool_rolling` '' (on by default since 2026-11-17: 54.7)
+
+`pool_rolling` '' (the default until 2026-11-17; since then 'auto', 54.7): no check, no `rolling` key in any PUT body (byte for byte the bodies of before), a
+stale game dropped whole as before, the metrics' keys as before. A worker job line without `rolling` is a classic job,
+exactly as before. The coordinator gives rolling leases only for a run with `selfplay.rolling` set and to agents from
+0.2.13 that ask for them (PROTOCOL 10.2).
+
+### 54.4 Costs
+
+A rolling job holds two sessions for a moment at a switch (the new one built while the old one plays). An idle rolling
+worker wakes every 20 ms. Rows train up to `pool_max_stale` generations behind, as before; rows within a game may now
+come from several networks (each row's `net` is the one that searched it).
+
+### 54.5 Tests and checks
+
+* zero_worker `tests/rolling.rs` (7, the toy game, uniform evaluator): idling at the end of the released ids, `extend`
+  (lower / equal ignored), `low` once per games value with g - s < conc, `finish` and `unfinished`; a rolling job's games
+  == the same ids' games of a classic job (one shard per game, byte for byte) with ids released a few at a time; `quit`
+  (released = finished + unfinished); `flush_s` writing held games while idle (and again after an extend); a classic job
+  never flushes by time and ends `done`; two checkpoints while the games go on (rows of nets 7, 9 and 11, a game across a
+  switch, a game's rows' networks never going back); a classic uniform job still refusing a checkpoint. `proto.rs` unit
+  tests: the job line's `rolling` / `flush_s`, `extend` reaching a rolling job only (a classic job's error unchanged),
+  `features`. The existing worker suites (job, job_tail, evaljob) unchanged and passing.
+* `tests/test_farm_pool.py`: `test_rolling_setting`; `test_pool_rolling_checks_the_worker_and_puts_rolling` (a worker
+  without the feature refused with nothing PUT, then gen 0 registered with `rolling` in the PUT; alternates covered /
+  logged unchecked); `test_rolling_check_never_runs_another_platforms_executable` (2026-11-20: another platform's
+  executable present is never run, this platform's alternate still checked; fails without the fix with the OSError);
+  `test_staleness_per_row_with_rolling` (off: games dropped whole as before; on: a game straddling the
+  window keeps its newer rows - the pool's shard == those rows written directly - the histogram counts the kept rows);
+  `test_keep_rows_is_take_rows_for_any_rows` (toy_tail: tails, overrides, sparse features). The PUT bodies with the
+  setting off stay those of before (`test_pool_alternates_in_the_puts_definitions_and_records`).
+* MTG Zero's farm-compat gate (worker vs Python, byte-identical; classic jobs) on the pin, and its farm gates on the
+  live run's config and checkpoint (MTG Zero ENGINE.md).
+
+### 54.6 Measured
+
+Before: see 54.1 (classic leases on the farm, 2026-11-16). After (2026-11-17, one farm PC, the same network, agent
+0.2.14): classic 128-match leases 471 matches/h, rolling leases at 160 in flight 1,550 matches/h over 65 minutes
+(3.3x); the default became 'auto' on this measurement (54.7).
+
+### 54.7 The default 'auto' (2026-11-17): a deliberate behaviour change
+
+**What changed.** `zero.run.DEFAULTS['pool_rolling']` went from '' (off) to `'auto'` (`{"inflight": "auto",
+"gpu_inflight": "auto"}`: the coordinator sizes both in-flight counts). Every farm-attached run (`selfplay_remote` names
+a `pool:` entry) on a core from this commit gets rolling leases unless it says otherwise. This breaks ground rule 1
+(defaults behaviour-preserving) on purpose, approved by the maintainer on 2026-11-17, and is called out here.
+
+**Why.** Measured on 2026-11-17 on one farm PC, same network, agent 0.2.14 (rolling leases with the memory-safe
+in-flight sizing): classic 128-match leases played **471 matches/h**; rolling leases at 160 games in flight played
+**1,550 matches/h** over 65 minutes - 3.3x, in line with 54.1's estimate (3.0x for a GPU PC's batch kept full). And a
+rolling lease's games are judged per row, so the share of farm play thrown away as stale (38-43% for GPU PCs, 54.1)
+falls with it.
+
+**What it changes for a farm run.** (1) Every self-play PUT carries `selfplay.rolling` (54.2), so the coordinator hands
+rolling leases to the agents that ask for them (0.2.13 and later; older agents keep classic leases, PROTOCOL 10.2).
+(2) Staleness is judged per row: a held game whose oldest rows are of a network older than i - 1 - `pool_max_stale`
+loses those rows and keeps the rest, instead of being dropped whole - so **which farm rows are kept changes** (more
+rows of a straddling game train; `stale_rows_dropped` joins the metrics), and rows within a game may come from several
+networks. (3) The pool checks at its first publish that `pool_worker` announces the feature `rolling` and refuses
+loudly otherwise (54.2; the refusal is the pool's error, retried every poll, nothing published meanwhile) - there is
+no silent fallback to classic leases.
+
+**What it does not change.** A run without a farm pool: `pool_rolling` is read only by `zero.farm_pool.Pool`, so
+self-play, training and every record of a non-farm run are byte for byte as before (the golden digests and checkpoint
+compatibility of the game repos' gates on this commit, MTG Zero ENGINE.md). Existing runs keep what their
+`config.json` saved: a run started on a core that knew `pool_rolling` saved '' and stays classic when resumed on this
+one; a run whose `config.json` predates the key takes 'auto' when it moves to this pin.
+
+**How to turn it off.** `pool_rolling=''` in the run's config (or `--pool_rolling ''`). A run whose worker build
+predates rolling jobs (no `rolling` in its `info` features: a zero_worker before feat/rolling-farm) must set
+`pool_rolling=''` explicitly, or rebuild the worker from a core that has them.
+
+**Tests.** `tests/test_farm_pool.py::test_default_pool_rolling_is_auto`: a farm pool with the default PUTs
+`selfplay.rolling` {"inflight": "auto", "gpu_inflight": "auto"}; with `pool_rolling` '' no PUT carries `rolling`. The
+pool fixture of the other farm-pool tests sets `pool_rolling` '' (they check classic leases' bodies byte for byte).
+MTG Zero's farm-compat gate also checks that the release worker announces `rolling`, so a build that loses the
+feature fails the gate.
+
+### 54.8 Stale rows per machine (no setting; the Fable farm review of 2026-11-21, its recommendation 3)
+
+**Why.** legacy-meta3-r1's trainer dropped 18-25% of its farm rows as stale on 11-20/21 (`stale_rows_dropped`). The
+review's guess is that the agent's tuner raises games in flight until one game takes 10-25 min on the Macs, the laptop
+and the DirectML PC, longer than the staleness window. The run's metrics had only totals, so the guess could not be
+checked per machine.
+
+**What it does.** With rolling on, the pool counts per machine (the record's `machine_id`) in the open iteration:
+`games` and `rows` accepted, `stale_rows` dropped (a straddling game's old rows and a wholly stale game's rows),
+`stale_games` dropped whole, and `lag`, the accepted rows' staleness histogram (the `stale` histogram of 54.2, per
+machine). The iteration's pool metrics gain `by_machine` {machine: those counters}; a machine's stale share is
+`stale_rows / (stale_rows + rows)`. When any machine lost rows, the pool logs one line, worst first:
+`iteration I: stale rows by machine: <machine> <stale>/<stale + kept> (P%, N games whole), ...`. Machines with no
+stale rows are in the metrics only. Counting only: no game, row or shard changes. With `pool_rolling` '' nothing is
+counted and the metrics' keys stay as before (54.3).
+
+**Tests.** `tests/test_farm_pool.py::test_staleness_per_row_with_rolling` checks `by_machine` beside the totals
+(classic: empty); `::test_stale_rows_by_machine_in_metrics_and_log`: two machines, the metrics' counters and lag
+histograms, and a log line naming only the machine that lost rows.
+
+## 55. The farm pool's lock order: `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu` (no setting; MTG Zero's pb3 hang, 2026-11-16)
+
+(This fix is on both zero-core lines: mtg-zero main's pin and the rolling-leases branch of 54.)
+
+**Why.** MTG Zero's delver-bo3-pb3 hung for 91 minutes in iteration self-play. A py-spy dump showed an ABBA deadlock
+between two locks:
+
+* the run's thread in `RemotePlay.progress` (the pump's progress.json poll) held `RemotePlay.mu` and called
+  `Pool.progress`, which waited for `Pool.mu`;
+* the pool's thread in `Pool._drain` held `Pool.mu` for its whole loop and called `RemotePlay.accept_pool` once per
+  held game, which waited for `RemotePlay.mu`;
+* every worker reader thread (`_event`) then queued on `RemotePlay.mu` too.
+
+The window had always been there. A 2 h pause made it wide: 736 farm games were held when the run resumed, so one
+`_drain` held `Pool.mu` across 736 `accept_pool` calls while progress was polled.
+
+**The rule** (zero/farm_pool.py's module docstring, outermost first): `Pool.dmu` -> `RemotePlay.mu` -> `Pool.mu`.
+
+* `Pool.mu` is innermost. A Pool never calls into its RemotePlay (`pool_iteration`, `accept_pool`, `add_failures`)
+  while it holds `Pool.mu`.
+* RemotePlay may call the Pool methods that take only `Pool.mu` (`close`, `begin`, `progress`) with or without its own
+  mu. The ones that take no Pool lock are `live` and `describe`. Where it can, it calls them after releasing its mu:
+  `progress` now collects the pools' records after `RemotePlay.mu` is released, so a pool writing a shard under its own
+  mu never stalls the reader threads.
+* `Pool.dmu` (the drain lock) is held across a whole `_drain`. `end_phase` takes it first, so RemotePlay never calls
+  `end_phase` while it holds its mu (`RemotePlay.end` calls it after the wait). `close` never takes `dmu`, because
+  `_membership` calls it while holding `RemotePlay.mu`.
+
+**What `_drain` does now.** For each game it does three steps:
+
+1. under `Pool.mu`, `_head(it)`: the stale games at the front are dropped (counted as before; with `pool_rolling`,
+   judged row by row as in 54, the head replaced by the rows left) and the oldest game the iteration may take is chosen;
+2. without `Pool.mu`, it is offered to the quota (`accept_pool(it, name, 1)`). A refusal ends the drain, as before;
+3. under `Pool.mu` again, `_accepted(it, g)`: the game is taken off `held`, counted and written to its machine's shard
+   writer.
+
+Only the pool's thread takes games out of `held`, so the game offered is still its head when it is written; an assert
+checks this. Because `dmu` is held across all three steps, a game the quota accepted is in its writer before
+`end_phase` closes the iteration's writers. A `close` that lands in the middle is caught: the drain reads `closed`
+under `Pool.mu` before each offer and after each write. If the pool was closed, it closes the writers it opened and
+stops. The games accepted, their order, the stale drops, the shards and the metrics are the same as before. Only the
+locking changed.
+
+**Test.** `test_farm_pool.py::test_progress_polling_never_deadlocks_a_draining_backlog` builds a real RemotePlay with a
+pool and 4,000 held games. One thread polls `progress()` in a loop while another thread drains the backlog (thread
+switch interval 10 us), with one 30 s deadline for both. Before the fix it deadlocked: 66 polls, 3,999 games still
+held. After the fix both threads finish, the quota is met by the pool's 4,000 games, and `end` reports them.
+
+## 56. Iteration speed and run safety: remote workers batch-bound, anchor-only Elo, the boundary pause, the stall alarm (`selfplay_remote_batch` 'auto', `elo_games` 0, `PAUSE_NEXT`, `tools/stall_watch.py`; MTG Zero's speed review of pb3, 2026-11-16)
+
+**Why.** A review of pb3's iteration time (MTG Zero, 2026-11-16) found three losses outside the iteration itself: the
+Mac's share of self-play collapsing (its caps spiralling down), Mac time spent on Elo games that carry no information,
+and a 93-minute hang nobody noticed, after pauses that could only stop mid-phase. Same branch as the lock-order fix
+(55).
+
+### 56.1 Remote workers are batch-bound under 'auto' (a deliberate change of the default)
+
+`selfplay_remote_batch` 'auto' made only CUDA / MPS consumers batch-bound, on the model's assumption that a CPU
+consumer's rate is its cores' whatever its in-flight. A remote worker's driver batches its own games' leaves, so on
+the CPU too its network batches - and its rate - grow with its in-flight until its cores are full. Under the share
+rule (`cap = inflight x rate x horizon`, `inflight` 1) such a worker spirals: a smaller cap, smaller batches, a smaller
+rate, a smaller cap. The iteration converges only where its games last one horizon, and a worker whose games cannot
+finish in one horizon at any in-flight (a minimum game latency above it) is driven to its floor. pb3 (`metrics.jsonl`,
+`selfplay.remote`): when the desktop doubled its speed the horizon halved and the Mac's caps fell from ~100 to 9-11 a
+worker over ~100 iterations, its leaves/s from 5,869 to 1,032 and its accepted matches from 283 to 18 an iteration,
+with 7 of its 16 cores busy (under-fed, not overloaded).
+
+Now 'auto' makes **every remote worker batch-bound, on any device**; this machine's driver stays device-based
+(`RemotePlay.batch_bound`). The batch rule `max(inflight x share, min(slots, batch_inflight x share))` is the same
+fixed point with `batch_inflight` horizons and the slots as its ceiling: the cap settles where the worker's games last
+`batch_inflight` (2) horizons (Little's law). That is the **staleness bound**: a remote worker's rows are at most about
+two checkpoints old (the shared-queue line's staleness histogram shows it), inside the farm pool's `max_stale` (pb3:
+4); a worker too slow even for that still falls to its floor. Cost: a worker that is already core-bound (its rate flat
+in its in-flight; delver1's Mac at 340-768 games) holds two horizons of games instead of one - older rows, no more
+throughput. The old 'auto' is `selfplay_remote_batch` 'local' with a CUDA / MPS driver here (MTG Zero's desktop) and 'none' with a CPU one: the share rule for the workers exactly as before. Runs without a
+remote, or with only CUDA / MPS remotes, are unchanged.
+
+Tests: `test_workqueue.py::test_a_cpu_worker_whose_rate_grows_with_its_inflight_spirals_unless_batch_bound` (pb3's
+curves - the desktop ~300 s a match at any in-flight, a Mac worker 330 s + n / 0.58: the share rule falls
+monotonically from ~100 to the floor of 4 with a >10x lower rate; batch-bound it holds 70-110 with its matches within
+2 horizons, its rate >4x, the phase shorter; a faster desktop moves the fixed point down, one too fast for the worker
+sends it to its floor), `::test_auto_makes_every_remote_worker_batch_bound`,
+`test_remoteplay.py::test_a_batch_bound_lingering_worker_stays_within_two_checkpoints` (a real worker under 'auto',
+lingering: its rows at most 2 checkpoints old). The share-rule tests of before (`test_caps_follow_throughput_...`,
+`test_linger_plays_through_training`, `test_multi_remote.py::test_one_remote_is_exactly_as_before`) run with 'none'.
+
+### 56.2 `elo_games` 0: the anchor games only
+
+`elo_games` 0 skips every checkpoint-against-checkpoint Elo match (the `elo_offsets` / `elo_opponents` games);
+with `elo_anchors` each evaluated checkpoint plays only its anchor games (and the anchors' one-time calibration), and
+the anchored fit is made from those. Before, 0 was not a usable value. pb3's Mac phase was 2 opponents x 24 paired
+contests + 100 anchor games every 16 iterations (1,283-1,961 s, Mac self-play stopped meanwhile); its unanchored Elo
+had a standard error of 220-560 and no decision read it. The unanchored ratings (`ratings.json`, `best.pt`) then rest
+on whatever games the pool has (the anchor games, the yardstick's if `eval_games` > 0). Test:
+`test_measure.py::test_elo_games_0_plays_the_anchor_games_only`.
+
+### 56.3 PAUSE_NEXT: a pause at the iteration boundary
+
+PAUSE stops at the next pause point - in pb3 0.1-0.7 s after the file appears, inside self-play: the partial phase is
+played again and the Mac's shards still travelling are dropped (11-15: three shards; 11-16 14:28 the same).
+`<run>/PAUSE_NEXT` (runctl `request_pause_next`, JSON `{"time", "by"}` as PAUSE) asks for the boundary instead:
+
+* the loop checks it between iterations (`Run.pause_at_boundary`, also co-training's loop): iteration N has its
+  checkpoint, evaluation and metrics row, and `RemotePlay.end` waited for every shard of its phase (a pause point
+  would have cut that wait); PAUSE is created (first, so there is never a moment with neither), PAUSE_NEXT removed,
+  the pause watch triggered, `Paused` raised: exit 75, the supervisor waits for PAUSE's removal as for any pause;
+* while it is there nothing of iteration N + 1 starts: no remote head start (`early_remote`), no local linger, and
+  the workers' `end` carries `"linger": false` so they end their phase instead of lingering (a worker of an older
+  zero-core ignores the key; its lingering games are then dropped at the pause);
+* games unfinished at the boundary are not kept (in flight, or finished beyond the quota and held: their count is in
+  the log line), as at any restart. Nothing of a finished iteration is lost; the resumed run goes on with N + 1.
+* `tools/pause_run.py --wait` asks for PAUSE_NEXT and waits (default timeout 3600 s), `--boundary` asks without
+  waiting, `--now` is the immediate PAUSE (with or without `--wait`), `--resume` removes PAUSE and a pending
+  PAUSE_NEXT. `run_status` says `pausing` while PAUSE_NEXT waits. A run started with PAUSE_NEXT present pauses before
+  any work.
+
+Test: `test_remoteplay.py::test_pause_next_finishes_the_iteration_then_pauses` (asked during iteration 2's self-play
+with a lingering remote worker: metrics [0, 1, 2], exit 75, PAUSE by PAUSE_NEXT, no shard dropped, no iteration 3
+data; resumed, iteration 2 is not played again; the tool's flags).
+
+### 56.4 `tools/stall_watch.py`: an outside stall alarm with stack dumps
+
+pb3 hung 93 minutes on 11-16 (the lock-order deadlock, 55) while its iterations took ~5.5 minutes; MTG Zero's
+watch_run.sh alarms after 75 minutes of no write, and remote status lines kept writing. `zero.tools.stall_watch`
+reads only the run (log.txt's `iter N train:` and `run ... starting after iter N` lines, progress.json, the control
+and state files) and alarms when the time since the newer of the last iteration's end and the last start passes
+`max(3 x median, 1.5 x longest, 600 s)` over the last 32 iteration intervals (an interval across a restart is left
+out; with fewer than 3, 75 minutes). `longest` keeps evaluation iterations from false alarms. No alarm while PAUSE is
+there or once progress.json is 'idle'. On an alarm it dumps the stacks of the run's Python processes (the run process,
+its children, the supervisor) with `py-spy dump` when py-spy is installed (the PATH, or this Python's user scripts),
+plus each process's state, threads, CPU seconds and memory (psutil), into a new directory (default the temp
+directory's `zero-stall/`), prints `STALL ...` with the directory and exits (`--once`: exit 3). Without py-spy it says
+so (`pip install --user py-spy`).
+
+Replayed on pb3's log up to the 16:37 restart: the threshold is 18.9 min (median 332 s, longest 758 s): the alarm at
+16:56, not after 93 minutes. Tests: `test_stall_watch.py` (the 11-16 shape, midnight, restarts, a new run's fallback,
+`--once`'s exit codes, a dump without py-spy). A real dump of a sleeping Python process with py-spy 0.4 on Windows
+named the function it slept in.
+
+## 57. Network arithmetic: bfloat16 / TF32 inference, TF32 training, the feed's flat tails (`infer_precision`, `train_tf32`; MTG Zero's speed review SP2 / T2 / T4, 2026-11-17)
+
+**Why.** MTG Zero's pb3 measurements (2026-11-16, the desktop's RTX 5090, the run's own build and settings) found
+self-play GPU-bound in float32 and training's step dominated by its matmuls and the tail floats' upload. The user
+accepted the arithmetic rounding (2026-11-17): bfloat16 for self-play / evaluation inference, TF32 for training. These
+change the network's arithmetic, not the game or the search. Branch `feat/precision`.
+
+### 57.1 `infer_precision` 'fp32' | 'tf32' | 'bf16' (default 'fp32')
+
+`NetEvaluator(precision=)` (`zero.precision`): 'bf16' = bfloat16 autocast around every forward of the evaluator - a
+token network's CUDA graphs captured under it (`TokenGraphRunner(amp=True)`, the measurement flag of 43.11 made a
+setting), the eager path (`evaluate`, `aux`, `reader`) under it too; 'tf32' = TF32 float32 matmuls while a graph is
+warmed up and captured (a replay keeps the kernels of its capture, whatever the flag is then) and around every eager
+forward. A conv network (`GridNet`) is in bfloat16 already (`use_amp`). On a CPU / MPS evaluator the setting is
+ignored (float32, said on stderr).
+
+Who follows it: `Run.evaluator` - self-play (rolling and not), the league's past checkpoints (`league.evaluator`),
+`Run.play_match` / the Elo matches and anchors; `zero.h2h.match` / `sequential` take `precision` (CLI `--precision`)
+for **both** sides (MTG Zero's yardsticks pass the run's), the output naming it when not 'fp32'. Both sides of every
+evaluation compute at the same precision, so a rating compares networks, not arithmetic. **Not** a remote worker
+(`remoteplay.Worker`: float32 whatever the run says; the Mac's MPS / CPU inference is float32 anyway) and not the
+farm (zero-farm workers run their ONNX graph in float32; `run_settings.json` classifies both keys `trainer`: a worker
+build that does not know them ignores them, 44). Neither of those was bit-identical to the desktop's CUDA graphs
+before (float32 rounding of other kernels), so their rows differ from this machine's as before, by more.
+Checkpoints carry no precision: a run may change the setting at a restart (its later self-play, Elo and yardstick
+games at the new one; the paired h2h of 57.5 measured no strength difference).
+
+**The TF32 flag is process-wide** (`torch.backends.cuda.matmul.allow_tf32`; cuBLAS reads it when a matmul is
+issued, from any thread), unlike autocast (thread-local). A run trains while its local linger self-plays on another
+thread (5.3), so every block that sets it holds one process lock (`precision.matmul_tf32`), restoring the flag
+after; with `infer_precision` 'tf32' or `train_tf32` the training step holds it too, at its own value
+(`precision.train_scope`): a capture on the linger thread waits for the step (and a step for a capture) instead of
+leaking TF32 into it or float32 into it. Without either setting the step takes no lock (the code of before).
+
+### 57.2 `train_tf32` 0 | 1 (default 0)
+
+`Run.train_model`'s step (forward, losses, backward, clipping, the optimizer step) inside `matmul_tf32(True)` on a
+CUDA training device (ignored on the CPU); the iteration's training metrics carry `"tf32": true`. bfloat16 training
+is not offered: slower than TF32 on the 5090 and 6x the drift (below), with MTG Zero's NaN history in bfloat16.
+
+### 57.3 The training feed's tail floats travel flat (no setting: exact)
+
+`data.batches` on a CUDA device with a window holding tails (43.3): each batch's tail floats go up as the window
+stores them (float16, no padding columns: `Window.batch(flat_tail=True)` -> `rows.Tail.to_torch_flat`, 'vflat' and
+each token's first float 'voff') and are padded on the device into the `[NT, Wt]` float32 tensor the network takes
+(`rows.expand_tail`: `searchsorted` + `index_copy_`, no host sync). The same batches bit for bit - a float16 is exact
+in float32, and the scatter puts each float where `Tail.padded` does - so it is not a setting (`batches(flat_tail=)`
+forces it either way; None: auto). Other paths (`Window.batch` alone, `row_inputs`, distill's `Taught` windows, the
+CPU) are unchanged.
+
+### 57.4 Tests and checks
+
+`tests/test_precision.py`: the settings' defaults and refusals; a CPU evaluator stays float32 (bit for bit); the
+flag scoped, restored on an exception, re-entrant, and a second thread's block held off while one runs; the training
+scope (no context without either setting); on CUDA, 'fp32' is the evaluator of before bit for bit, 'tf32' / 'bf16'
+within their rounding of it (graphs deterministic), bf16 visibly different, the flag off after every capture and
+forward, a TF32-captured graph replaying its TF32 answers with the flag off; h2h's sides and output; `expand_tail` =
+`to_torch` bit for bit (float16 and float32 stores, rows without tails, no tail token at all, CPU and CUDA); the feed
+with flat tails = the feed of before bit for bit (dense and coo windows, prefetch 0 / 2, static and plain batches,
+CPU forced and CUDA auto); auto on CUDA only. Defaults byte-identical: MTG Zero's checkpoint_compat gate.
+
+### 57.5 Measured (MTG Zero's pb3, 2026-11-16, the desktop's RTX 5090; `sp2_measurements_2026-11-16`)
+
+* Self-play, pb3 settings, conc 1536: TF32 +12%, bf16 +26% (mixed host load) to +33% (quiet host) leaves/s; at conc
+  2048 +25% / +50-75%. Replayed batches: graph 5.32 ms fp32, 4.40 TF32, 3.28 bf16. bf16 makes self-play host-bound.
+* Rounding against fp32 on 135k real rows: TF32 priors max 6.2e-3 (20 top moves of 114k changed), bf16 7.0e-2
+  (258 changed). Paired h2h against fp32 (1,600 games each, SE 0.009): TF32 +3.5 +- 6.2 Elo, bf16 0.0 +- 6.4: no loss.
+* Training (train_bench, batch 512): flat tails -10% a step (79.4 -> 71.4 ms; the blocking upload 9.4 -> 5.5 ms),
+  batches bit-identical; TF32 GPU step -15 to -20%, end-network drift 4x the run's own GPU nondeterminism, last-200
+  loss +0.005%, no NaN; bfloat16 6x the drift and slower than TF32.
+
+## 58. Duplicate action claims reduced by their largest (`dup_action_reduce` 'max'; MTG Zero's token-graph flake, 2026-11-17)
+
+**Why.** A token network scores an action from the token that claims it: a slot's own actions, and in a segment with
+`id_actions` its identity's action (43). Two tokens can claim the same action - two equal cards in hand both claim
+"cast X" -, and the policy's static scatter (`TokenNet._trunk`, `_trunk_ext`) then writes that action's logit twice.
+Which write survives is up to the device: the CPU (torch's and ONNX Runtime's sequential kernels) keeps the last, CUDA
+an undefined one (41.2's "repeated indices"). So the same network answers such a row differently on a GPU, in a CPU
+worker and through the farm's export, and its CUDA graphs and its eager forward can keep different copies' logits:
+`tests/test_token_graphs.py`'s two graphs-against-eager tests failed in about half the runs (3.66e-5 against their
+2e-5; MTG Zero ENGINE.md 183.4). It needs a layout where two tokens can claim one action: `id_actions` (MTG Zero's team
+draft, the toy fixtures, the farm's probe network) or two slots sharing a static action. MTG Zero's constructed layout
+(v7) has neither - a hand slot's cast action is that slot's own, so two equal cards in hand are two actions - and its
+pointer overrides are one per option: measured, 0 duplicate claims in 186,644 network rows of pb3's best-of-one (58.2).
+The user chose to fix it at the next fork (2026-11-17), opt-in.
+
+**The reduction: the largest claim.** The copies are one action: the network should give it one logit, whatever slots
+the copies sit in. Of the candidates:
+
+* *first / last by token index* - deterministic, and 'last' is what the CPU and the export already answer, but not
+  symmetric in the copies: the action's prior is that of whichever copy the layout puts last, the other copies' logits
+  are thrown away and get no gradient, so the slot order (a nuisance) decides what the network learns.
+* *mean* (or log-sum-exp) - symmetric, every copy trained, but a sum: its float rounding depends on the order of the
+  additions (CUDA's atomic scatter-add is not deterministic from three copies on), and the export would need an
+  accumulate scatter, which a GPU-safe graph cannot have (41.2; ONNX Runtime's CPU ScatterND add races). Log-sum-exp
+  would also give a duplicated card more prior mass than a single copy (two copies are not two moves).
+* *max* - symmetric (any order of the copies, the same answer), exact (the answer is one of the claims: no rounding,
+  so CPU, CUDA, MPS and ONNX Runtime agree bit for bit from the same logits), and a no-op when the copies agree (equal
+  cards in different slots should). Its gradient goes to the largest claim (equal claims share it): the copy the policy
+  actually used.
+
+So 'max'. An action no token claims keeps its generic logit, as before; the dummy column (padding, empty slots) is
+sliced off either way.
+
+**What it does.** A token network's `dup_reduce` (`TokenNet(dup_reduce=)`, `net.check_dup_reduce` /
+`set_dup_reduce`): None - the plain scatter of before - or 'max'. `TokenNet._scatter_policy`, under every forward
+(eager in any chunking, `forward_static` and so the CUDA graphs, the variable-length trunk): with 'max' the claims are
+reduced apart from the generic logits (`scatter_reduce(..., 'amax', include_self=False)` into -inf), the written places
+then taken from that, the rest from the generic logits. (A `scatter_reduce` straight into the generic logits would
+share an action's gradient with a generic logit equal to its largest claim - every one at a new network's zero output
+layers -, where the plain scatter gives an overwritten generic logit none.) The export (`zero.onnx_export`, zero-onnx/1
+'mask' / 'packed' and zero-onnx/2): `_scatter_max` - each row's writes put in ascending order of their values (a sort:
+TopK), then 41.2's `_scatter_last`, whose last writer of each action in that order is its largest. Every scatter stays
+unique, no accumulate scatter, opset 17; metadata `dup_reduce` 'max'. 'compact' and 'host' (`_trunk`'s own scatter, an
+opset-18 reduction there) refuse it.
+
+**A network property, versioned in the checkpoint.** The reduction is part of what the network computes, so it lives in
+the network's config (`config['dup_reduce']`, absent for None): every consumer of a checkpoint - the run's evaluators,
+its Elo and league seats, `zero.h2h`, the farm pool's export and so the farm workers - follows the checkpoint it loads,
+and a 'max' network trained on CUDA is evaluated as it was trained, everywhere. The run setting `dup_action_reduce`
+('legacy' default | 'max') decides it for the run's own networks: a new run's network is built with it
+(`make_net(dup_reduce=)`), and a run resumed or forked with 'max' turns it on in the checkpoint its next training loads
+(`Run.train_model`: the weights untouched; logged "iter N: checkpoint N-1 reduces duplicate action claims by 'max'
+..."), so every checkpoint it trains from then on carries it. The self-play before that first training plays the parent
+checkpoint with its own rule. 'legacy' never strips 'max' from a checkpoint (a network keeps the rule it was trained
+with). Refused for a run whose network is not a token network.
+
+**Off by default.** 'legacy': the network, its config, its checkpoints and its export are those of before, byte for
+byte (the plain scatter; no config key; no metadata key; the traced graph unchanged). Turn it on for a new run or a
+fork: `--dup-action-reduce max` (or `"dup_action_reduce": "max"` in a new run's config; `fork_run.py --source ...
+--set dup_action_reduce=max`). Not in a live run's config: its next training would change the policy of every row with
+duplicate claims - a deliberate change, made at a fork.
+
+**Costs.** The policy scatter becomes a `scatter_reduce`, a boolean scatter and a `where` over [B, actions + 1]: noise
+next to the trunk. The export's graphs gain one TopK per row over the row's writes (MTG Zero: n_tok K = 850), the size
+of the sort 41.2 already measured. Farm workers need no rebuild: the graph carries the reduction in ONNX Runtime's
+ordinary operators (TopK, Gather, ScatterElements without reduction); the pool exports a 'max' checkpoint under a new
+template fingerprint (its config differs: one full export, 53). In check-config's table
+(`crates/worker/src/run_settings.json`) `dup_action_reduce` is `trainer` (the graph carries it): a worker build older
+than the key calls it unknown, and the pool and `farm_h2h` drop a key this core's table calls trainer-only before a job
+reaches it (as `infer_precision`, 57), so the farm's existing builds serve a 'max' run.
+
+### 58.1 Tests and checks
+
+`tests/test_dup_reduce.py`: the setting's default and refusals (an unknown rule, a non-token run); the config entry
+(absent for legacy, recorded for 'max', kept through save / load / build, `set_dup_reduce` on and off with the weights
+untouched); on rows where two units claim the same identity action (>= 15 of 120 rows), 'max' = the largest claim and
+legacy = the CPU's last write, every other logit and every row without a duplicate bit-identical in both modes; 'max'
+in every forward (chunked, `forward_static`) and its gradient (the largest claim only, ties shared, an overwritten
+generic logit none); the CPU evaluator's repeats; on CUDA (skipped without one) eager and the graphs the same bits over
+20 repeats and within 2e-5 of the CPU; the export: `_scatter_max` = torch's amax bit for bit (ties included), in torch
+and through ONNX Runtime at opset 17, every write to its own place; zero-onnx/1 'mask' and 'packed' and zero-onnx/2
+(tails with identity actions on the head items, the gated blend) through `onnx_parity`'s gate within 2e-5 on rows full of
+duplicate claims, every scatter unique, the metadata, 'compact' refused; a token run started with 'max' (both of its
+checkpoints carry it) and a legacy run resumed with it (checkpoint 1 legacy, 2 'max', the log line).
+`tests/test_token_graphs.py`'s two graphs-against-eager tests run per mode: legacy on rows without duplicate claims
+(the plain layout: on duplicates its outcome is undefined on CUDA), 'max' on the identity layout, duplicates included -
+tolerances unchanged.
+
+### 58.2 Measured (2026-11-17)
+
+MTG Zero's pb3, iteration 155 (layout v7), against the same weights with `dup_reduce` 'max', the best-of-one
+yardstick's spec and seats, paired deals, 64 simulations, on the Mac's CPU (h2h.sequential; the desktop's GPU was the
+metagame run's): every one of the 186,644 network rows both sides evaluated was counted for duplicate claims of a real
+action in the policy scatter - **0** (each side). With no duplicate claim 'max' is the plain scatter bit for bit (one
+claim: its own value, its full gradient; the generic logit of a claimed action overwritten, no gradient), so the two
+sides answered every row identically and played the same games: 16 games, 8 pairs, every pair split (score 0.500,
+pentanomial [0, 0, 8, 0, 0]). A longer match could only repeat that: for MTG constructed runs the setting changes
+nothing but the guarantee. It matters where a layout has `id_actions` (team draft) and for the core's own tests.
+
+## 59. Game records: every accepted self-play game kept as what replays it (`game_records`; MTG Zero's game database, 2026-11-17)
+
+**Why.** MTG Zero wants every self-play game of a run in a database (its `tools/gamedb.py`, its ENGINE.md 187):
+"how often does a Doomsday pile hold card X since iteration 120?" should be one query. Before this a run kept no move
+of its games: this machine's and a remote's self-play only wrote shards (rows without a game id, rolling off with the
+window), and the farm's records - which do hold every move - were turned into shards and dropped.
+
+**What it does** (`zero/gamerec.py`). With `game_records` 1 every game an iteration's quota accepts is one JSON line
+of `<run>/records/iter_NNNN/<source>-<pid>.jsonl.gz` (format and fields in the module's docstring): its seed, every
+action (little-endian u16, base64), the spec by key (a spec line before its first game in each file), its setup record
+(MTG Zero: the decks and the metagame's pairing), over / aborted, the resignation's winner, the result, the decisions,
+the networks its samples were searched with, and for a farm game its machine as a short hash (never the id). Per
+executor:
+* **this machine** (`_selfplay`, plain or rolling, and the shared queue's `selfplay_shared`, its local linger
+  included): the driver's game log on (`SearchDriver.set_game_log`, docs/search.md 2.20), each accepted row's log
+  written as it is accepted (source `local`);
+* **a remote's workers** (zero/remoteplay.py): the worker's driver logs its games; when the run accepts some of them
+  (`accept`) the worker sends their records in one `records` event (the specs once) and the run writes them (source:
+  the consumer's name, `w0` or `<host>/w0`). Its `hello` says `records` 1; a worker on an older checkout sends none:
+  the run logs it and plays on (records only observe) and the iteration's DONE.json counts its games as `missing`;
+* **the farm pool** (zero/farm_pool.py): the farm's records already hold every move (docs/search.md 2.17), so no worker
+  change: the pool keeps each replayed game's moves and outcome (not its samples) and writes them when the quota
+  accepts the game (source `pool:<farm run>`); a stale or unaccepted game writes none. Lock order: the records writer's
+  lock is innermost (below `Pool.mu`, docs/az.md 55; it calls nothing back).
+When the phase ends (after the remote's last shards, before the data directory's DONE.json) `records/iter_NNNN/DONE.json`
+lists this process's files of the iteration with each source's records and the games each source's quota accepted
+(`accepted`; a gap is `missing`, logged). A reader takes only the files DONE.json lists: a file of an interrupted attempt
+(another pid) is never read, and a file cut short by a crash yields the lines before the cut (`read_file`). The phase's
+metrics gain `records` {games, bytes, seconds, by_source}. The records are outside `data/` and never rolled off by
+`keep_data`: the database deletes them once ingested (its `prune --delete-raw`). `game_records` is trainer-only in the
+worker's settings table (the farm's builds older than it call it unknown; the pool drops such a key, 57).
+
+**Off by default**: no file, no row log, nothing changes. **Byte identity**: the games' moves come from the failure log
+the driver keeps for every game anyway (docs/search.md 2.18), so the games, search, rows, shards and checkpoints are
+those of a run without records.
+
+**Costs.** Per game: a copy of its moves when it finishes (the driver's `Vec` of real moves), one dict on its result
+row, one JSON line gzip'd when it is accepted (on the thread that accepts it: the run's main thread for this machine's
+games, a remote host's reader thread, the pool's thread). Disk: ~150 bytes a game for MTG Zero's metagame self-play
+(59.2), ~0.3 MB an iteration of 2,000 games; the records stay until the database deletes them.
+
+### 59.1 Tests and checks
+
+`tests/test_gamerec.py`: two toy runs, records off and on - off writes no `records/`, the same shards array for array
+and the same weights; on, every iteration's records = its accepted games (each once), each replays from its seed to its
+result, the networks within the iteration's; a remote 'local' worker's games recorded under `w0` and the iteration's
+DONE.json `accepted` = its records per source; a worker without records (the test hook `no_records`): its games
+`missing`, the log line, the run on; the farm pool's accepted games (20 of 30: the quota's) recorded with their moves,
+seeds, setups, results and networks equal the farm records', the machine hashed and absent from the record; the reader:
+DONE.json's files only, a cut gzip read to the cut. Driver tests: docs/search.md 2.20.
+
+### 59.2 Measured
+
+2026-11-17, the desktop's CPU beside MTG Zero's live metagame run (its ENGINE.md 187.4). The toy runs of the tests: 24
+games an iteration, ~2.6 KB of records. MTG Zero, 64 self-play games of the metagame run's iteration
+156 network (its run settings, 64 simulations, resignation on; CPU, 32 in flight) played twice from the same seed with
+the game log on and off: the same 64 games and the same 2,968 rows byte for byte; wall 797.8 s on vs 812.2 s off (noise:
+the log costs nothing measurable); the records 9,489 bytes (148 bytes a game, 123 actions a game, 48 of 64 resigned),
+written in 0.020 s (0.3 ms a game: ~0.6 s of an iteration of 2,000 games). The legacy-meta3-ddwheel-smoke run (3
+iterations, 16 games each, a fresh net: 727 actions a game) with records on and off: the same shards and checkpoints
+(every weight), records 7.2-7.9 KB an iteration written in 0.002-0.004 s.
+
+### 59.3 Every other game (2026-11-17)
+
+**Why.** A run plays more than its self-play: its evaluation (the yardstick and random games, the Elo matches, the fixed
+anchors' games and calibrations, the reference games), and a game repo's own yardsticks and tools play head-to-heads
+through `zero.h2h`. The user asked for all of them in the game database: "record them all".
+
+**What it does** (`zero/gamerec.py`: `MatchSink`, `recording`, `from_match_row`, `from_trace`). A game that is not
+self-play is a record of the self-play record's format plus `kind` (a lower-case name: 'eval', 'elo', 'anchor', 'ref',
+'h2h', a game's own), `it` (the iteration it belongs to: the evaluation's iteration, the measured checkpoint's; null for a
+standalone tool's), `players` - one per seat, in the game's seat order: `{ckpt, sha, label, sims, rule}` for a network
+(`ckpt` '<run>/iter_NNNN' for a run's checkpoint, else the file's name; `sha` sha256[:12] of the file, the identity across
+machines; `label` the caller's name for it: 'iter_0120', an anchor's 'anchor:<label>', a reference's), `{ckpt: null,
+bot, label}` for a bot - and `meta` (the caller's: the driver seed, paired, a match's pairing, chooser, batch). Files:
+`<records>/<kind>/iter_NNNN/<source>-<pid>-<ms>-<n>.jsonl.gz` (`misc/` without an iteration), one per match or batch,
+written whole (a temp file renamed: every `*.jsonl.gz` there is complete, no DONE.json), a build line (59.4), the spec
+lines, the records.
+* **The run's evaluations** (`Run.play_match`, `play_matches`, `bots_match`; their `rec` argument): with `game_records`
+  1 the driver's game log is on and every game goes to `<run>/records/<kind>/iter_NNNN/` - `eval` (the yardstick and
+  random games of `evaluate(it)`: iteration it), `elo` (the Elo matches of `elo_update(latest)`: iteration latest, the
+  checkpoints in `players`), `anchor` (the anchors' games and an anchor's calibration), `ref` (the reference games).
+* **A remote evaluation** (zero/remote.py): the mirror's `Run` plays them with the run's config (game_records shipped)
+  into the mirror's `records/` (source 'remote'); `RemoteEval._fetch_records` copies the evaluated iteration's files to
+  the same paths in the run before the result is recorded (a file that does not arrive fails the evaluation: retried);
+  evals.jsonl's row says `records` (the files copied).
+* **zero.h2h** (`match`, `sequential`): while the thread records (`with gamerec.recording(MatchSink(...)):`) every game
+  of the match is a record, A in seat gid % 2 (the sink's `labels` name A and B; sequential: a file per batch, its
+  `batch` and `gid_offset` in `meta`). The rows the caller gets are those of a match without records (their logs taken
+  out). `python -m zero.h2h A B ... --records DIR [--records-kind h2h] [--label-a X --label-b Y]` from the command line.
+  A game repo's tools record through the same sink (MTG Zero: its yardsticks, keep_h2h, combo statistics; its farm
+  jobs' traced games by `from_trace`).
+
+**Off by default** (`game_records` 0, no sink): the drivers of before, no log, no file. **Byte identity**: the log is the
+failure log the driver keeps for every game anyway (docs/search.md 2.20): the same games, results and Elo pools.
+
+### 59.4 The engine that played: every records file names it
+
+A record replays only on the engine that played it. Every records file - self-play's (the first line of each file; a
+remote worker sends its own in its `records` event, the farm pool writes the run's with the pool's `worker` build id
+beside it: the run's engine replayed and accepted those games) and every other kind's - starts with a build line `{"v":
+1, "kind": "build", "build": build_info()}`: `pkg`, `commit` (the game repo's HEAD), `core` (zero-core's HEAD), `engine`,
+`module` (sha256[:24] of the engine module file). `engine` = `engine_id(root, engine_paths)`: sha256[:16] over the blob
+ids of every tracked file under the game package's `engine_paths` (a new `GamePackage` field: the game's Rust inputs)
+and zero-core's `crates/`, `Cargo.toml`, `Cargo.lock` at HEAD - a Python or docs commit keeps it, an engine change moves
+it; 'dirty' when one of those files has an uncommitted change; null without git or `engine_paths`. Self-play's DONE.json
+names each file's build too. `read_file(path, builds)` / `read_iteration(run, it, builds)` collect them; a file written
+before (5c2d3f39) has none. A database refuses a record of another engine (MTG Zero's `gamedb.py ingest`, its
+`--engine-checkout`).
+
+### 59.5 Tests and checks (59.3-59.4)
+
+`tests/test_gamerec_all.py` (in-process, no run process): `h2h.match` and `sequential` with a sink - the same summary
+and rows as without, every game a record that replays to its result, A in seat gid % 2 with its label, sha, sims, the
+batches' files and offsets; the run's `evaluate` + `elo_update` with `game_records` 0 and 1 (heuristic yardstick, random
+games, Elo offsets, two anchors - one calibrated against the other -, reference games): the same metrics and Elo pool,
+records eval 6 / elo 4 / ref 2 / anchor 10, all replaying, both players named; a remote 'local' evaluation's records
+copied back (source 'remote', evals.jsonl `records`, a second evaluation copies only its new file); `engine_id` (a commit
+outside the engine paths keeps it, an uncommitted engine change is 'dirty', an engine commit moves it); self-play files'
+build lines (this process's, a remote's) and DONE.json's, a file without one; the sink's checks (kinds, temp files never
+read, rows without a log refused).
+
+## 60. The playout cap's full searches by the prior's uncertainty (`p_full_rule`; MTG Zero's metagame run, 2026-11-17)
+
+**Why.** Playout cap randomisation spends a full search (`sims`) on a coin's `p_full` share of the self-play decisions
+and the fast one (`sims_fast`) on the rest; the full searches are the policy targets. On MTG Zero's metagame network
+(legacy-meta3-r1, iterations 183-188, 160k recorded decisions) the search moved the target's argmax off the prior's in
+4.7% of the decisions, and the prior's own uncertainty u = 1 - max P0 predicts which at AUC 0.90: the quarter of the
+decisions with the largest u holds 87% of those changes (a value-uncertainty head did worse, AUC 0.69). The coin spends
+most full searches where the search agrees with the prior anyway. `p_full_rule` 'prior_uncertainty' spends the same
+simulations on the unsure decisions.
+
+**What it does** (docs/search.md 3.21 for the driver). A capped self-play decision is searched in full with
+probability
+
+    f = min(1, p_full_floor + (p_full - p_full_floor) * g(u) / p_full_u_mean)
+
+g = `p_full_shape` ('linear' u, 'sqrt', 'square'), P0 the root's priors (its own evaluation, before noise). With
+`p_full_u_mean` = the mean of g(u) over the decisions, the mean of f is p_full: the same mean simulations per decision
+and the same records per decision as the coin; every decision keeps at least the floor. The coin is drawn from the
+game's stream where the coin rule draws it; a fresh root's budget is chosen after its own evaluation. Every executor
+(this machine, remote workers, the farm's native worker) draws the same full searches.
+
+| setting | default | meaning |
+|---|---|---|
+| `p_full_rule` | 'random' | 'random' = the coin of before (off); 'prior_uncertainty' = the rule above |
+| `p_full_floor` | 0.05 | the least chance of a full search, in [0, p_full] |
+| `p_full_shape` | 'linear' | g: 'linear' / 'sqrt' / 'square' (correctly rounded operations only: deterministic everywhere) |
+| `p_full_u_mean` | 0 (unset) | the mean of g(u) over the self-play decisions; required with the rule |
+
+**Off by default**: 'random' adds no seat key; the seat dict, the driver's settings, the games, the records, the
+digests and the checkpoints are those of before. With the rule on, a floor equal to p_full is the coin bit for bit
+(the driver test `a_floor_at_p_full_is_the_coin_bit_for_bit`).
+
+### 60.1 The rule and its calibration: why this one
+
+* **Stochastic, not a threshold.** A hard threshold on u would spend every full search on the unsure decisions and none
+  on the confident ones, whose targets (and value rows: only full searches are recorded) would vanish from the window.
+  The floor keeps a fixed share of every kind of decision recorded, and f is known per decision (an importance
+  weight is possible: 60.4).
+* **Linear in u by default.** f is affine in g(u), so the mean of f is p_full exactly when u_mean is g's mean (up to the
+  cap at 1, which only lowers it): no fit, one number. 'square' concentrates harder on the unsure tail (closer to the
+  threshold that maximises the changes captured), 'sqrt' softer (closer to the coin); both are settings.
+* **A fixed mean per run, not a running one.** A running mean of u across games depends on which games finish when
+  (threads, batches, executors): the full searches would differ between this machine, a remote worker and the farm.
+  A mean within one game is reproducible but normalises each game to p_full (a game of hard decisions gets no more)
+  and is noisy early in a game. A run setting is reproducible everywhere and allocates across games; the run reports
+  the measured mean every iteration (`selfplay.budget.g_mean`) and the realised share, so a drift is visible: when the
+  realised share leaves p_full, set `p_full_u_mean` to the reported mean (the next resume uses it). The policy's
+  sharpness moves slowly at a run's learning rate (60.3: the rule's own games read 0.1215 where the coin's read 0.116, on 64 games each).
+* **Measuring it.** With the coin, `selfplay.budget.g_mean` is u's mean (linear g). For another shape, a run (or a
+  smoke) with the rule and `p_full_floor` = `p_full` plays the coin's games exactly and reports that shape's mean.
+
+### 60.2 Metrics (`selfplay.budget`, every self-play phase with a playout cap, either rule)
+
+From this machine's driver counters (docs/search.md 3.21): `decisions` (capped: not minor), `full`, `full_share`,
+`sims_per_decision` (the budgets), `f_mean` (the mean chance: p_full for the coin), `g_mean`, `changed` (the share of
+the recorded targets whose argmax is not the prior's - the search's effect on the targets), `targets`; one log line
+`iter N budget: ...`. A rolling driver's counters span its games in flight (the phase's searches, not exactly its
+accepted games'). Remote workers' and the farm's searches are not in it.
+
+### 60.3 Measured
+
+2026-11-17, the desktop's CPU (fp32, 32 games in flight, 8 search threads, beside other jobs; no GPU), MTG Zero's
+metagame run legacy-meta3-r1 at its checkpoint 207 with its exact self-play seat (64 / 16 simulations, p_full 0.25, 4
+minor, 'cq' targets, root belief, root-view leaf values, resignation 0.02 / 3) and its iteration-208 spec (the wheel
+over), 64 games from one driver seed per rule (MTG Zero's ENGINE.md 189 has the script):
+
+| rule | capped decisions | full share (mean chance) | sims / decision | mean g(u) | targets off the prior's argmax | games / min | decisions / game | records / game | resigned |
+|---|---|---|---|---|---|---|---|---|---|
+| coin | 9,593 | 0.243 (0.250) | 27.68 | u 0.116 | 4.3% | 8.49 | 152.3 | 55.0 | 45 / 64 |
+| floor = p_full, 'sqrt' | 9,593 | 0.243 (0.250) | 27.68 | sqrt 0.259 | 4.3% | 8.56 | 152.3 | 55.0 | 45 / 64 |
+| linear, floor 0.05, u_mean 0.116 | 9,864 | 0.261 (0.258) | 28.53 | u 0.1215 | **13.1%** | 7.66 | 156.2 | 60.9 | 42 / 64 |
+| sqrt, floor 0.05, u_mean 0.259 | 9,151 | 0.254 (0.251) | 28.18 | sqrt 0.261 | 10.9% | 7.62 | 145.1 | 54.7 | 47 / 64 |
+
+* **The coin at floor = p_full**: the same games (decisions, steps, records, resignations, simulations equal); 7 of
+  222,867 leaf rows and one of 2,334 target argmaxes differ - the network's CPU answers move in the last bits with the
+  batch (the full searches' belief rows go in later batches), not the rule.
+* **The search's effect lands in the full searches**: 13.1% of the linear rule's recorded targets leave the prior's
+  argmax against the coin's 4.3% (the 4.7% of the phase-1 study) - 3.1 times as many per full search. Of the target
+  changes a full search everywhere would make (the coin's 4.3% of all capped decisions, its full searches being a
+  uniform sample), the linear rule's full searches catch ~80% (337 of ~422), 'sqrt' ~64%, the coin 24%. Linear is the
+  default.
+* **The budget**: with u_mean measured on the coin's games the linear rule spent a mean chance of 0.258 (3% over
+  p_full; 28.5 sims a decision vs 27.7): its own games' u read 0.1215 (unsure decisions searched in full make
+  slightly different, longer games; 64 games is also noisy - decisions per game 145-156 across the rows). Its fixed
+  point is u_mean ~0.12. The run's `selfplay.budget` and BUDGET DRIFT watch this.
+* **Speed**: 10% fewer games a minute on the CPU (+3% simulations a decision, +5% leaf rows a game, the alone belief
+  rows' extra rounds); on the GPU self-play is leaf-bound (~5%).
+
+### 60.4 Policy targets: the bias, and the weight not built
+
+The full searches - the policy targets and, in this code, the only decision records (value rows too) - concentrate on
+unsure positions: on MTG Zero's network a confident decision (u near 0) is recorded at about the floor's 5% instead of
+25%. Expected effects: the policy keeps learning where the search disagrees with it (the point), confident decisions'
+targets thin out (their policy drifts only through the shared trunk), and the value head sees fewer decided positions.
+Resignation (27) counts full searches only, so games resign later when the decided positions are confident (60.3: the
+games' length).
+
+The unbiased alternative is an importance weight 1 / f on each recorded decision's policy loss (normalised to mean 1),
+which restores the coin's expected gradient at the cost of variance. It is **not built**: f would have to travel with
+every record - a new per-row column in the driver's records, the shards (both formats), the window loaders, the
+trainer's loss, the remote workers' shards and the farm's game records with their replay - which is not cheap; the
+driver already knows f per decision (`Slot::cap_f`), so it is the place to start. An A/B arm 'adapt + weight' waits for
+it; the first A/B compares the coin and the unweighted rule.
+
+### 60.5 Tests and checks
+
+Rust (`driver/tests/budget.rs`, docs/search.md 3.21): the coin bit for bit at floor = p_full (with and without the root
+belief), the share matched with u_mean measured (every shape), more targets off the prior's argmax, the same games at
+any thread layout, minor and light decisions, the checks, the seat parser; the native worker's port
+(`zero_worker::settings::tests::the_playout_cap_rule_as_python`); the worker's settings table
+(`crates/worker/src/run_settings.json`: the four keys 'play' - an older worker build calls them unknown and the pool
+refuses it). pytest `tests/test_budget.py`: the seat dict (off: the seat of before), the refusals in Python and the
+driver, the bindings (the coin at floor = p_full; the share; the stats only with a playout cap), the run settings, a
+rolling toy run's `budget` metrics, remote workers drawing as this machine and an older checkout refused by its hello
+(`budget` fingerprint). MTG Zero: its farm compatibility smoke (tools/farm_compat.py) with the rule on - the native
+worker vs the Python remote worker and its records replayed by the trainer, byte-identical (its ENGINE.md 189).
+
+## 61. Declared setting classes: a trainer-only setting needs no new worker build (`GamePackage.setting_classes`, the settings key `setting_classes`, the worker feature `setting_classes`; MTG Zero's farm-release work, 2026-11-17)
+
+**Why.** A farm run's self-play template holds the settings the worker build's own `check-config` calls `play`
+(`farm_pool.play_settings`, 45). A build refuses a run whose settings hold a key it doesn't know, even a trainer-only
+one: 57's `config_refused` lets the pool drop such a key when *this* zero-core's table (`run_settings.json`) calls it
+trainer, but a game package's own settings (`GamePackage.settings`, 40) are in no zero-core table. MTG Zero's
+`forced_find_schedule` (its ENGINE.md 180.5, 181.5) was a trainer-only package setting, and every farm run on a commit
+with it needed a new worker build, a CUDA re-sign and the farm gates first. The worker could not tell trainer-only from
+play-affecting; the trainer can.
+
+**What.**
+
+* **The declaration.** `zero.farm_h2h.run_setting_classes(cfg)` -> {key: class} for every key of a run's settings that
+  the trainer classifies: the active game package's `GamePackage.setting_classes` first (new: {name: class} for its
+  `settings`, checked at construction - a name that is not one of its settings, or a class that is none, is refused),
+  then this zero-core's table (an entry's class, a `param` as `param:<switch>`, else a pattern's: `aux_<t>_w` play,
+  `reader_<t>` trainer). Classes: `play`, `trainer`, `python_only`, `param:<switch>`. A key neither knows is left out.
+* **Where it goes.** When the worker build's `info` announces the feature `setting_classes` (new; `hello` too, next to
+  `rolling`), `play_settings` (the pool's self-play template and `farm_h2h`'s eval template) gives the worker's
+  `check-config` the run's settings plus `"setting_classes": {...}`, and the template's settings carry the same
+  declaration: the run's definition signs it with the settings (zero-farm PROTOCOL 7). A build without the feature gets
+  exactly what it got before (no key, `config_refused` as in 57).
+* **The worker** (`zero_worker::classify`; `CLASSES_KEY`). `setting_classes` is not a setting (no verdict; the driver
+  never reads it). For a key the build does **not** know, the declared class stands in for its table: `trainer` is
+  unused; `python_only` is off while its value is falsy (else unsupported); `param:<switch>` is off; **`play` stays
+  unknown** - the build cannot play a setting it doesn't implement - and so does a key with no declared class. For a
+  key the build **does** know, a declared class that differs from the build's own is unsupported (the trainer's
+  zero-core reads the setting otherwise: the build is too old or too new for it). A declaration that is not an object of
+  class names is unsupported - also for an eval job, whose other non-reads are trainer (44.2). The verdict's `why` of a
+  key taken on the declaration's word starts "unknown to this build"; the pool logs each ("worker build X doesn't know
+  setting K: trainer by the declared classes").
+* **The protocol is unchanged.** The declaration is a key inside the template's `settings`, which agents and the
+  coordinator keep as an opaque object (PROTOCOL 7: only path-like text is refused, and class names have none), and
+  agents pass it to the worker as it is. No definition field, no agent change, no `min_agent` bump. The template is
+  checked by the default build's executable; a run's alternates (rev 11) are that executable signed for another pack,
+  so they announce the same features.
+
+**What it buys.** Once a worker build has the feature, a new trainer-only setting of zero-core or of the game package -
+classified in `run_settings.json` or `GamePackage.setting_classes` - reaches farm runs without a new build. A new play
+setting still needs one (the build must implement it), as does a changed class.
+
+**Tests.** `cargo test -p zero_worker` (`classify::tests::declared_classes`): an unknown key declared trainer-only
+accepted, the same key undeclared refused (an older trainer), declared play refused, python_only / param off while off
+and unsupported when on, a known key declared otherwise refused, three malformed declarations refused for self-play and
+eval jobs, an eval job's reading, the driver unchanged by the declaration; `proto` tests: the features. pytest
+`tests/test_farm_pool.py::test_play_settings_with_declared_setting_classes` (the worker stub with and without the
+feature: an older build refuses a package's trainer-only key as before; a build with the feature takes it, logs it,
+and the template is a current build's plus the declaration, path-free; an unknown key declared play, or undeclared,
+refused; the eval template the same) and `test_run_setting_classes` (the package first, the table's param and pattern
+classes, unknown keys left out, GamePackage's refusals). The stub (`tests/worker_stub.py`) honours a declaration with
+`WORKER_STUB_FEATURES=setting_classes`. MTG Zero (its ENGINE.md 196): the real worker with and without declarations.
+
+## 62. The worker on macOS (Apple silicon), libm refusals off the reference platform, evaluator threads (`infer_workers`), platform alternates (no setting; zero-farm PROTOCOL rev 17; MTG Zero's macOS farm lane, 2026-11-18)
+
+**Why.** zero-farm rev 17 (its PROTOCOL section 11) lets Macs on Apple silicon take CPU work: their own agent, worker
+builds (`platform: "macos-arm64"`) and runtime packs, and a run's **CPU alternate** `{build_id, runtime, when:
+{platform}}`. The worker built on a Mac unchanged, but five things were wrong or missing there: a CPU session ran on
+CoreML, the fuzz supervisor's hang detection used wall time, the memory and module reports were empty, nothing kept a
+Mac from playing settings whose games replay differently off Windows, and the single evaluator thread made the native
+worker 3.4x slower than the Python remote self-play it is meant to replace on the same Mac.
+
+**What.**
+
+* **`zero_worker::platform`.** `PLATFORM` (`windows-x64`, `macos-arm64`; `info` says it: `"platform"`), `REFERENCE`
+  (`windows-x64`), `ORT_LIB` (`onnxruntime.dll` / `libonnxruntime.dylib` / `.so`: the name in a runtime pack, which
+  `info` and `probe-providers` report the origin of: `ort_modules`). macOS (`platform::darwin`, libSystem through
+  `extern "C"`, no new crate): `usage(pid)` - CPU seconds (`proc_pid_rusage` `RUSAGE_INFO_V4`, whose times are mach
+  absolute ticks: 125/3 ns each on Apple silicon, converted with `mach_timebase_info`), the physical footprint and its
+  peak (what the macOS agent's memory cap reads, PROTOCOL 11.5); `image_path(name)` (dyld's image list).
+* **What changed on macOS only.** The fuzz supervisor's per-seed hang limit counts the chunk process's CPU seconds (it
+  fell back to wall time, so a starved Mac would kill healthy seeds) and its memory the footprint; a chunk's CPU time
+  is the last one read when the process is reaped (macOS and Linux can't read a reaped child's; Windows reads it as
+  before). `rss_mb` / `peak_rss_mb` are the footprint and its peak (they were 0). `module_path` finds a loaded library
+  through dyld (`info --runtime-dir` proves the pack's dylib is the one loaded). **CPU sessions run on the CPU EP**:
+  `ort`'s builders set the EP selection policy MaxEfficiency, under which ONNX Runtime registers the CoreML EP for a
+  session that names no provider - it failed our graphs' empty `where` outputs ("dynamic shape ... zero elements") and
+  is not bit-safe; a `Binding::Cpu` session now asks `PreferCPU` on macOS (Windows unchanged: on the CPU pack the CPU
+  is the only device; whether MaxEfficiency hands a Windows ML pack's "cpu" session to DirectML is not checked here).
+  The worker already loaded `libonnxruntime.dylib` from a job's `runtime_dir`, and already quits a job when its stdin
+  closes (the agent is gone; checked on the Mac: `serve` exits at EOF before a job and quits a running one).
+* **libm refusals.** What the engine alone decides is identical on every platform, except where it calls the C
+  runtime's transcendental functions (`f64::exp`, `powf`, `ln`, ...), whose last bits differ between Windows' and
+  Apple's libm. A game says which settings reach them: `SearchGame::libm_replay(spec) -> Option<String>` (default None:
+  a game whose replay - its setup in `record_setup`, the game itself - would differ; what only steers the search,
+  noise, the prior's softmax, a belief's weights, plays differently but replays exactly, as a network's rounding does)
+  and `FuzzGame::libm_dependence(plan, env)` (default None: a loop whose seeds would play or check differently, so a
+  failure found there would not reproduce on the desktop). `GameEntry::libm_replay` parses a spec and asks the game. A
+  worker off the reference platform refuses them: `check-config` (self-play: `spec`; `--eval`: `eval_spec`; a `REFUSED`
+  line, exit 1), every self-play and eval job (a fatal `error` before anything runs), `fuzz-check` and every fuzz job
+  and chunk (`fuzz::plan_on`). `check-config --platform P` and `fuzz-check --platform P` judge as a worker on `P` would
+  - the desktop's own build tells which runs and campaigns a Mac may take; the JSON of `check-config` then carries
+  `platform` and `libm_refusals` (only with `--platform`, or off the reference: the reference's output is as before).
+* **Evaluator threads: `infer_workers`** (a job line tuning field, PROTOCOL 5's kind, and `selfplay --infer-workers W`;
+  1 to 64, default 1 = as before). The job's network is built `W` times (each session self-tested; only the first's
+  `selftest` event is sent) on `W` evaluator threads; batches go to them in turn, at most `max(INFLIGHT, W)` in flight
+  (`infer._drive_pipelined`'s rule for Python's `infer_workers`), their answers submitted in launch order (a later
+  batch's answer waits for its turn). Each session has the job's `infer_threads`. A checkpoint switch and a rolling
+  job's background build make `W` evaluators; a yield releases them all. Answers do not depend on `W`: the shards of a
+  6-game job (the legacy-meta3 network, groups 1, CPU pack) with 3 evaluator threads are byte-identical to 1's. Eval
+  jobs keep one thread (their networks share it; since 70 they have lanes of their own). Why: on an M4 one ONNX Runtime session uses its threads poorly (the
+  graph is ~1,000 small nodes; 1 thread 1,770 rows/s, 3 threads 2,530, 6 threads 2,650, 12 threads in a job slower
+  than 4), while several sessions run side by side (below).
+* **Diagnostics** (environment, unset = nothing changes): `ZERO_ORT_CONFIG="key=value;..."` adds ONNX Runtime session
+  config entries (e.g. `mlas.disable_kleidiai=1`), `ZERO_ORT_PROFILE=<prefix>` writes ONNX Runtime's per-node profile of
+  every session, `ZERO_WORKER_CPU_CHUNK=n` overrides the CPU's 64-row pieces, `ZERO_WORKER_BATCH_HIST=1` adds
+  `batch_rows_hist` (network batches by rows, powers of two) to a self-play job's stats.
+* **The farm pool's alternates per platform** (`farm_def.run_alternates`): an alternate whose manifest names another
+  platform (`PLATFORMS`) needs a pack of the same platform and becomes a CPU alternate `{"build_id", "runtime", "when":
+  {"platform"}}` (no vendor asked for; one per platform; a GPU pack off Windows refused: rev 17's GPU alternates are
+  Windows only). Windows alternates are as before (no `platform` key: existing runs' PUT bodies unchanged). Before a
+  PUT names a platform, `farm_pool.platform_check` asks the pool's own worker (`pool_worker`, a Windows build) to
+  judge the run's settings for it (`check-config --platform`): a libm refusal, or a build too old to judge, stops the
+  pool. So a run attaches a Mac build by adding its id to `pool_alternates`, with no new setting.
+* **Tools.** `tools/worker_bench.py` runs on macOS (the load from `os.getloadavg`, `--nice`, `--runtime-dir`,
+  `--rolling`, `--native-job key=JSON` for the agent's tuning fields, `--sides`) and reports rows/h, batches (rows per
+  batch and their histogram, ms per batch) for both sides (the Python side's evaluator timed in the child: its
+  `launch` + `result`). `tools/worker_records_gate.py` loads the pack's `ORT_LIB`.
+
+**Off by default.** No run setting; Windows builds behave and answer exactly as before (the refusals apply off the
+reference platform or with `--platform`; `infer_workers` defaults to 1 there - a Mac's CPU job without it splits its
+threads, 62.1; the diagnostics are unset).
+
+**Tests.** `platform::darwin` (macOS: CPU seconds of a 0.5 s spin read as 0.4-0.7 s, not ticks; 64 MB in the
+footprint; libSystem's path); `test_run_alternates_of_another_platform` (the CPU alternate with a CUDA one, refusals:
+a pack of the other platform, an unknown platform, two CPU alternates); the zero_worker suite. MTG Zero (its ENGINE.md
+197): `check-config --platform` on a sealed spec and the metagame, `fuzz-check --platform` on its modes, the farm
+parity on the Mac, the Mac's records replayed on the desktop.
+
+**Measured** (the Mac: an M4 Max laptop, 12 P + 4 E cores, 64 GB, macOS 26.6, CONTENDED: the legacy-meta3-r1 run's
+three Python self-play processes at nice 5 on it throughout, ours at nice 15-20; 2026-11-18): see MTG Zero's ENGINE.md
+197 (the per-process A/B of the native worker against the Python remote worker on the run's own settings and network).
+
+### 62.1 A job line without `infer_workers`, and the `hello` feature `infer_workers` (2026-11-18)
+
+* **The default when a job line has no `infer_workers`** (45c284b; `proto::default_workers`): Windows, and any session
+  with a GPU provider, one evaluator thread with the job's `infer_threads` T, as always. macOS on the CPU: T split into
+  `max(1, T / 3)` sessions of `T / w` threads (16: 5 x 3; 12: 4 x 3; under 6: one session of T), the shape the Mac's
+  measurements above favour. A job line's own `infer_workers` W wins on every platform (W sessions of T threads each).
+* **`hello` and `info` announce `infer_workers`** (`FEATURE_INFER_WORKERS`, beside `rolling` and `setting_classes`, in a
+  build with self-play; a fuzz-only build announces none): the job line's field has worked on every platform since
+  45c284b, so the feature is not platform-gated, and a Windows build from this commit on qualifies too. zero-farm's agent
+  varies a job's evaluator threads (its autotuner) only for a worker that announces it; an older build ignores the
+  field and runs one session, so an agent must not count on it there. Nothing else changes: the job line, the answers
+  (byte-identical for any W, 62 above) and the events are as before. Tests: `proto::tests::
+  hello_announces_infer_workers_on_every_platform` (the `hello` event's features, a fuzz-only build's none, a job line's
+  W honoured), `a_selfplay_build_announces_rolling` (the full list); MTG Zero's `test_worker_farm.py` reads the real
+  build's `info`.
+
+## 63. The fast zero-onnx/2 graph: TokenNet's arithmetic behind the same interface (`pool_export`, `export(..., fast=True)`; zero-farm's Mac and CPU PCs, 2026-11-18)
+
+**Why.** MTG Zero's farm lane on the Mac (its ENGINE.md 197.5-197.8) found the native worker's zero-onnx/2 graph ~2.5x as
+expensive per batch as TokenNet's own eager forward whatever ran it (ONNX Runtime 1.31.1, libtorch AOTInductor): the
+cost was the graph's arithmetic. Per 64-row piece it zero-filled and scattered the rows into [64, 56,384] floats; mapped,
+decoded and zeroed all 170 head slots of a row (5-10 present); pooled the bags through a dense product over 23 x 1,024
+identities (~77 non-zero a row); computed all 21 tail segments' input maps for every tail token; sorted the policy's
+writes; attended through MatMuls and transposes; and its LayerNormalization runs, on Apple silicon, at a fifth of the
+speed of ONNX Runtime's InstanceNormalization for the same normalization (134 against 26 us on a [350, 128] input, the
+Mac's M4 Max; the desktop's i9: 35 against 45 us). The whole Mac reached 12.6k leaves/s through one native worker
+process (16.4k with two) against ~20k of its SSH self-play (three Python remote workers).
+
+**What.** `ZeroOnnx2Fast` (`zero.onnx_export`; `export(net, path, fast=True[, attention=])`, `_export_module(...,
+fast=True)`): the same interface - inputs, outputs, dtypes, every metadata key and value of the default graph but
+`opset`, plus `fast` '1' and `attention` (workers read neither) - and the same answers within float32 rounding:
+
+* *No densify* (`_inputs`): each non-zero's row (`_csr_rows`) and its feature's kind and place from two int32 tables of
+  the features (a head slot's position and column, a global feature's place, a bag's); the presence flags, a reader's
+  inputs and the present head slots' floats are each one scatter of the non-zeros to unique places (every other
+  non-zero to a spare place of its own: 41.2's rule) - absent slots' floats never reach the arithmetic (NaN there
+  changes nothing, as before).
+* *The head slots where present* (`_slots`, `TokenNet._pack`): one NonZero over every head slot gives the slots
+  row-major and their floats one after the other (each slot its own width; its first float the widths before it); each
+  segment's input map runs on its own present slots (a NonZero of its own, their floats by one Gather) and the maps go
+  back in place by one scatter of unique rows; + the position embedding; the identities decoded once per identity
+  layout by two products (`TokenNet._identity_digits`), + their embedding where the segment has one - TokenNet's order
+  of the additions.
+* *The bags and the global features from the non-zeros* (`_below`, `_runs`, `_bag`, `_gmap`): a row's non-zeros in a
+  range of features are a run of its ascending ones; each row's count below every bound by one scatter per bound of
+  the first non-zero at or past it (no running sum over the non-zeros: below); the runs padded to the batch's longest;
+  the bag weights [B, bags, M] times the identities' embeddings [B, M, d] and the global map's columns times their
+  values: the dense products' non-zero terms only, the bags' totals exactly.
+* *The packed list* (the global tokens, the present head slots row-major, the tail tokens): each token's place
+  in its padded row from the presence's running sum (along the rows: short); the padded rows' tokens by one scatter of
+  unique places; padding keys read a real token (masked by the attention's -inf: no zero row concatenated per block).
+* *The attention* one fused node per block from 63's placeholder (`fused_attention`; the mask [B, 1, T, T] expanded once):
+  `attention` 'mha' (ONNX Runtime's com.microsoft MultiHeadAttention, opset 17 - the default), 'attention23' (ONNX's
+  opset-23 Attention, the whole graph at opset 23: `opset_bump`) or 'matmul' (the default graph's MatMul / Softmax). Then
+  `fuse_gelu` (the exporter's x * (0.5 * (1 + Erf(x / sqrt 2))) - five nodes ONNX Runtime's optimizer does not fuse in
+  this order - as one com.microsoft Gelu) and `layernorm_instance` (each LayerNormalization as InstanceNormalization of
+  x viewed [rows, 1, features], scale 1, bias 0, then x scale + bias).
+* *The tail segments' input maps* in up to three groups of similar width (`_groups`, `_grouped`: the split with the
+  least work; each group one product over its widest member's floats - a token's floats are zeros past its own width,
+  the same terms - and the token's own block picked by a Where per group), where the default graph ran all 21 maps on
+  every tail token; the tail identities decoded once per layout (`_tail_ids`).
+* *The static policy* one scatter of the present head tokens' pointer logits into the generic logits when every static
+  write names its own action (checked at construction from the network's tables: `punique`); else `_policy_full`, the
+  default graph's sorted last writer (identity actions; `dup_reduce` 'max' its largest claim). The overrides' scatter
+  read back by a Slice.
+* *float32 only*: psi's log2(n + 1) / 32 in float32 (`_psi2(..., f32=True)`; n + 1 exact below 2^24).
+* The tail tokens' checks, the gates, the overrides, `refused` and the heads are `ZeroOnnx2`'s own code (`_tails`,
+  `_overrides`, `_tail_embed` / `_tail_maps` / `_tail_ids`, factored out of `_trunk2` and `_tail_embed`; the default
+  graph's operations unchanged - its gen-398 export before and after this change is byte-identical, 19,564,836 bytes).
+* Every scatter unique, no accumulate scatter, every integer in int32 (`check_int32`; the policy scatter's spare places
+  below B (actions + 1 + n_tok K), checked against B (features + 1) at construction). `opset17` now takes Split-18 with
+  its sizes input (version 13's form).
+
+**Two choices made for the CUDA pack** (ONNX Runtime 1.24.4, its CUDA provider; checked with onnxruntime-gpu 1.24.4 and
+the worker's self-test on the desktop's RTX 5090): (1) *No data-dependent count is used as a size or an offset* beyond
+the batch's own (the head segments' counts stay the shapes of their own tensors). Graphs that sized ranges, reshapes or
+offsets by those counts - one NonZero per segment with the floats sliced by running offsets, or one NonZero split by the
+counts - ran right on the CPU but failed or answered wrongly on CUDA ("Shape mismatch attempting to re-use buffer",
+wrong sizes downstream); the same graphs passed with the session's memory reuse off, and keeping one count scalar alive
+as an extra output fixed them: its allocation planner reused live buffers. (2) *No running sum over the non-zeros* but
+`_csr_rows`' own: its CUDA CumSum takes ~45 ns an element (8 ms over a 1,024-row batch's 180k non-zeros, 34 ms for one
+over [180k, 6]); with six of them the fast graph ran at 0.43x the default graph on 1,024-row batches.
+
+**Graph variants by name** (`GRAPHS`, `graph_options`): '' the default graph, 'fast' (MultiHeadAttention, opset 17),
+'fast-att23' (fastest on the CPU; on the CUDA pack 101 of its nodes run on the CPU - no CUDA kernel of Attention-23,
+InstanceNormalization-22, Equal-19, ReduceMax-20, ... -: ~10x slower there), 'fast-matmul'. `export_fingerprint` /
+`export_template` / `swap_export` take `graph` (the fingerprint names a variant, so each has its own weight-swap
+template; '' leaves the fingerprint's fields as they were); `farm_h2h.export_cached(..., graph=)`; `zero.onnx_parity
+--graph`.
+
+**The run setting `pool_export`** ('' by default: the default graph, as before): the graph the farm pool exports each
+generation as. Trainer-only (`run_settings.json`: a worker build without the setting classes has the key dropped by the
+pool (57), one with them gets it declared trainer (61)); no worker, agent, protocol or graph-contract change - a worker
+runs the fast graph as any zero-onnx/2 graph and self-tests it against the same reference set.
+
+**Off by default.** `pool_export` '' and `export(..., fast=False)`: every graph as before, byte for byte (above).
+
+**Costs.** One NonZero per head segment more (11 for MTG Zero: a host sync each on a GPU); the tail width groups and the
+runs' padding compute some zeros; more nodes than the default graph for a tiny network (the toy's), ~35% fewer for MTG
+Zero's. An export ~20 s (the default graph ~45 s), the file 16.3 MB (19.6 MB).
+
+**Tests.** `tests/test_onnx_fast.py` (10; with test_onnx.py, test_onnx2.py and test_worker_settings.py 46 passed):
+parity through the gate (eager and forward_static, 2e-5, every case twice bit-identical, NaN in absent slots, 64-row
+chunks) on the toy's four layouts and on a richer one (bags, three head segments - one without an identity, one always
+present -, globals in two ranges, a reader, gated tails, overrides, slots near 2^32, batches without tails or overrides)
+with each attention form; identity actions and dup_reduce 'max' (the `_policy_full` path) on rows whose claims collide;
+the interface, metadata, float32 only, one fused attention / Gelu per block, no LayerNormalization, int32, unique
+scatters on real rows; the weight-swap template with `graph='fast'` (swapped == fresh, bit for bit).
+`tests/test_onnx2.py::test_the_graph_refuses_what_the_network_refuses` runs on both graphs (every refusal on its own
+row).
+
+**Measured** (2026-11-18; MTG Zero's legacy-meta3-r1, layout v7: 56,384 features, 8 x 128 TokenNet, 21 tail segments,
+14 gated; the Mac: M4 Max, 12 P + 4 E cores, quiet - the run paused, the bench lock held, idle, on AC; the desktop: i9-
+13900K beside live runs, its CPU 90%+ busy and its GPU training: those numbers are noisy):
+
+* *The graph* (gen 398): 2,136 nodes -> 1,373 ('fast'; 'fast-att23' the same, 'fast-matmul' 1,467), 19.6 -> 16.3 MB,
+  no float64 tensor or cast (6 before). By operator, default -> fast (selected): Slice 168 -> 23, Squeeze 115 -> 32, Cast
+  111 -> 44, MatMul 109 -> 6, Greater 106 -> 24, And 105 -> 33, Mul 96 -> 38, ReduceSum 86 -> 7, Round 81 -> 2, Add 185
+  -> 94, Erf 9 -> 0 (Gelu 9), LayerNormalization 17 -> 0 (InstanceNormalization 17), Softmax 11 -> 3 (MultiHeadAttention
+  8), TopK 1 -> 0, Transpose 25 -> 1; NonZero 1 -> 12. ONNX Runtime's kernel profile on the Mac (1 thread, an earlier
+  build of the graph): LayerNormalization 29% of the kernels' time (9.5 ms a batch) before `layernorm_instance`,
+  InstanceNormalization 0.85 ms after.
+* *Answers* (`zero.onnx_parity --graph`: ORT 1.31.1 against eager and forward_static, every case twice bit-identical,
+  NaN in absent slots, 64-row chunks): legacy-meta3-r1 gen 398 on 91,540 rows the Mac's native worker recorded (17,619
+  tail tokens) and its reference set (overrides): 43 cases, 0 failed, worst 8.9e-6 (margin; priors 5.0e-6) (the default graph 4.5e-6 / priors
+  3.8e-6); gen 619: 43 cases, worst 6.6e-6 (value; priors 5.4e-6); delver-bo3-pb3 gen 143 on its reference set (1,048 tail tokens, 20
+  overrides): 22 cases, worst 3.9e-6 (priors) (default 3.0e-6). The worker's self-test (`probe-providers --model --reference`):
+  the desktop's CPU pack 6.0e-6, the Mac's 4.9e-6, the CUDA pack 6.6e-6.
+* *The farm's gates with the network on both sides* (MTG Zero tools/farm_gates.py: gate 2, the native worker against the
+  Python remote worker - 8 games, 350 rows, 200 batches -; gate 3, records -> rows across a network switch, 12 games,
+  724 rows): the desktop (release worker 5307720f, the CPU pack) and the Mac (gate 2: the Mac release worker 20807b12,
+  the macOS pack): every shard array and batch identical - as with the default graph, run the same way.
+* *The weight-swap template* (gen 398, `export_template(graph='fast')`: 37 s, 153 weights, 5 derived, 23 constants), gen
+  619 swapped in (0.36 s): its outputs the fresh fast export's bit for bit.
+* *Per batch, one caller* (ms per recorded batch of ~234 rows in the worker's 64-row pieces; TokenNet = the Python remote
+  worker's evaluator, `infer.NetEvaluator` on the densified rows, its densify not counted; "early" = the first 24
+  batches of a recording, game starts without tail tokens, "spread" = 24 batches spread over it, 45 tail tokens a batch):
+
+  | machine, set | threads | default graph | fast | fast-att23 | fast-matmul | TokenNet |
+  |---|---|---|---|---|---|---|
+  | Mac, early | 1 | 52.4 | 27.0 | 24.6 | 25.6 | 20.1 |
+  | Mac, early | 3 | 39.8 | 22.9 | 21.1 | 23.9 | 16.2 |
+  | Mac, early | 4 | 38.6 | 24.6 | 20.4 | 23.5 | 15.3 |
+  | Mac, spread | 1 | 64.9 | 36.2 | 33.5 | 35.2 | 36.8 |
+  | Mac, spread | 3 | 47.0 | 29.4 | 26.3 | 31.1 | 24.7 |
+  | Mac, spread | 4 | 45.5 | 32.7 | 25.6 | 30.5 | 22.9 |
+  | desktop, early | 1 | 133 | 72 | 69 | 76 | 99 |
+  | desktop, early | 3 | 103 | 61 | 55 | 66 | 62 |
+  | desktop, early | 4 | 117 | 65 | 60 | 68 | 59 |
+  | desktop, spread | 1 | 190 | 107 | 100 | 103 | 135 |
+  | desktop, spread | 3 | 132 | 79 | 76 | 96 | 84 |
+  | desktop, spread | 4 | 139 | 89 | 89 | 105 | 96 |
+
+  (The Mac: two repetitions each, interleaved, within 3%; its 1- and 3-thread fast columns this commit's graph, its
+  4-thread row and the desktop's an earlier build whose slots' floats were padded to the widest - the same answers bit
+  for bit, ~5% slower on the Mac -; the desktop's noisy.) On the Mac ONNX Runtime's MultiHeadAttention costs 2-3 ms a
+  batch more than Attention-23; on the desktop it is the fastest at 3-4 threads. A graph that sliced each segment's slots by running offsets ('seg' in the
+  measurements) took 23.0 / 33.1 ms (early / spread, 1 thread; Attention-23): ~10% under 'fast-att23', but wrong on
+  CUDA (above).
+* *The CUDA pack* (ORT 1.24.4 on the desktop's RTX 5090 while it trained a live run - contended; `probe-providers
+  --providers cuda --bench-rows`): 'fast' passes the self-test (6.6e-6; 37 nodes on the CPU, the default graph's 31)
+  and answers 2,901 / 10,502 / 19,479 / 18,536 rows/s at 64 / 256 / 1,024 / 2,048-row batches against the default
+  graph's 2,097 / 7,553 / 16,584 / 16,765 (1.1-1.4x). 'fast-att23' passes but runs 101 nodes on the CPU: ~10x slower.
+* *The whole Mac* (zero-core tools/worker_bench.py: 5-minute windows, interleaved; leaves/s; the run's Mac settings and
+  gen-398 network; the SSH setup = 3 Python remote workers; native = the Mac release worker 20807b12, the macOS pack,
+  rolling jobs; "2 procs" = two native processes of threads 12, conc 1,152, groups 6, 4 evaluator sessions x 3
+  threads each): the Mac slowed between the two sessions (the SSH setup
+  ~19.5k -> ~18.1k, the same graph 25.2k -> 21.1k): compare within a session.
+
+  | session | side | leaves/s (windows) |
+  |---|---|---|
+  | A (19:06-19:46) | SSH setup | 20,595; 18,453 |
+  | A | native, 1 proc (threads 16, 2,304 games, 12 groups, 5 x 3), the per-segment-offset build (Attention-23) | 18,729; 18,732 |
+  | A | native, 2 procs, the per-segment-offset build (Attention-23) | 25,332; 25,037 |
+  | A | native, 2 procs, the default graph with 63's prototype Attention-23 | 16,639; 14,180 |
+  | B (20:11-21:03) | SSH setup | 17,859; 18,366 |
+  | B | native, 2 procs, 'fast' (MultiHeadAttention) | 17,955 |
+  | B | native, 2 procs, 'fast-att23' | 20,891; 19,984 |
+  | B | native, 3 procs (threads 12, 768 games, 4 groups, 4 x 3), 'fast-att23' | 20,325 |
+  | B | native, 2 procs, 'fast-matmul' | 17,487 |
+  | B | native, 2 procs, the per-segment-offset build | 21,100 |
+  | B | native, 3 procs, 'fast' / 2 procs, 6 x 2 sessions, 'fast' | 17,538 / 17,446 |
+
+  So on the whole Mac 'fast' runs at the SSH setup's rate (0.98x) and 'fast-att23' at 1.1-1.17x it; the default graph
+  managed 16.4k with two processes (the coordinator's clean window, 2026-11-18) against ~20.6k. Under eight concurrent
+  sessions ONNX Runtime's CPU MultiHeadAttention and the MatMul form lose more against Attention-23 than one caller shows
+  (81-84 ms a batch against 70-73). The per-segment-offset graph (CUDA-unsafe) was the best measured (1.18x in session
+  B, 1.24x in A).
+
+## 64. The native worker's memory: no ONNX Runtime memory patterns, a game's records sparse (no setting; zero-farm's Mac, 2026-11-19)
+
+**Why.** On the Mac a native worker (`zero_worker` + MTG Zero's engine + ONNX Runtime 1.31.1 on the CPU) needed ~16 MB
+per game in flight at MTG Zero's legacy-meta3-r1 settings and kept growing (one worker with 2,304 games in flight:
+12.8 GB at 3 minutes, 22.2 at 7, 29.1 at 15, still +0.5 GB a minute), and memory capped the farm agent's layouts
+there. Counted by part (a diagnostic build summing what every slot of
+the driver holds; MTG Zero's ENGINE.md 203), two causes:
+
+1. *The games' records* (docs/search.md 2.21): every record a game in flight holds kept its feature row dense (MTG
+   Zero's 56,384 floats, 220 KB, ~200 non-zero) and its auxiliary targets dense (8 KB): at the Mac's ~32 records a game
+   in flight, ~7 MB a game. The Python remote worker runs the same driver and held the same rows: in
+   `tools/worker_bench.py`'s runs on the Mac (5-minute windows, conc 768) each of its processes peaked at 8.1-8.6 GB
+   resident (~11 MB a game), and one process matched a native worker at the same leaves/s (6.3 against 6.2 GB after
+   4 minutes). What the native worker had on top was the growth with time (2.).
+2. *ONNX Runtime's memory patterns.* A session with them on (ONNX Runtime's default) plans each run's buffers once per
+   distinct set of input shapes and keeps every plan; a batch's CSR rows (`x_idx` / `x_val`, its non-zero count long)
+   give nearly every batch shapes of its own. So the plans grew a worker's memory for as long as it ran, and none was
+   ever used twice.
+
+**What.** `session::builder` turns memory patterns off for every provider (DirectML had them off already); where the
+tensors go in memory changes no answer. ZERO_ORT_MEM_PATTERN=1 turns them back on (a diagnostic). The driver holds a
+game's records sparse and its evaluation cache in one buffer (docs/search.md 2.21). No setting: the worker's answers,
+games, records and shards are those of before, byte for byte.
+
+**Measured** (gen 619 of MTG Zero's legacy-meta3-r1, its farm settings, the default graph; the worker's footprint as
+the farm agent reads it - macOS: the physical footprint, Windows: private bytes; MTG Zero's ENGINE.md 203 has the whole
+fix on the Mac at steady state and the memory plan it gives the farm agent):
+
+* *The Mac, before* (the release build of 4d622170; one worker at the farm crew's layout: threads 12, 4 sessions x 3
+  threads, 882 games in flight, 4 groups, a rolling job): 11.5 GB at 11 minutes (13 MB a game), still +0.3 GB a minute.
+  *The records sparse alone* (memory patterns still on): 4.5 GB at 11 minutes, still growing ~0.15 GB a minute - the
+  patterns (4 sessions, ~29 batches a second).
+* *The desktop's CPU pack* (ONNX Runtime 1.31.1; 512 games in flight, 2 sessions x 3 threads, 10 minutes side by side):
+  private bytes +651 MB with the patterns, +311 MB without; the same games (83 finished, 4,460 searched decisions each).
+* *The desktop's CUDA pack* (ONNX Runtime 1.24.4, the RTX 5090, one session, 2,304 games in flight, two workers side by
+  side for 2 minutes): private bytes 4.35 -> 9.35 GB in 100 s with the patterns, 3.30 -> 4.07 GB without; the same
+  leaves/s (9,215 and 9,286 a worker).
+
+**Tests and checks.** The same classic self-play job (24 games of the legacy settings, seed 777, conc 24, the CPU pack,
+output both) with the worker before the change, after it, and after it with ZERO_ORT_MEM_PATTERN=1: the records file
+and the shard byte for byte (1,335 rows, 3,503 searched decisions). `probe-providers` on gen 619 with its reference set,
+before and after: the same max abs on the CPU (6.806e-6) and the CUDA pack (6.258e-6). `cargo test` (zero_search,
+zero_worker); MTG Zero's search-core gate (its digests and farm compat; ENGINE.md 203).
+
+## 65. A run's evaluation on the farm (`eval_remote` = `pool:<farm run>`, `eval_pool_*`; MTG Zero's legacy-meta3-r1, 2026-11-19)
+
+**Why.** A run's checkpoint evaluations (section 5: the anchors' games, the Elo matches, a yardstick against a bot) are
+either played on the run's machine, which trains meanwhile, or on a remote over SSH (5.2: MTG Zero's runs on the
+Mac). The owner's decision (2026-11-19): the Mac is no longer used over SSH; its last SSH use was legacy-meta3-r1's
+anchor evaluation (2 anchors x 100 games at eval_sims 32 every 16 iterations). zero-farm already plays eval batches
+(zero-farm PROTOCOL 5.2) and traced games (5.3, section 50), so the evaluation's games can go to the farm - friends'
+idle PCs and the owner's machines that run the farm agent - instead of one machine.
+
+**What it does.** `eval_remote` = `pool:<farm run>` (`zero/eval_pool.py`):
+
+* **The run's side is RemoteEval's** (5.2): a thread of the run process queues each evaluated iteration (the iteration
+  never waits), ships what the evaluation needs to a mirror, evaluates the mirror with `Run.evaluate` +
+  `Run.elo_update` (the run's own code) and records the result with `RemoteEval._record` - the evals.jsonl row (host
+  `pool:<farm run>`; dashboards and publishers read it unchanged), the Elo pool's files (`elo/<rule>/results.json`,
+  `ratings.json`, `anchored.json`), models/index.json, best.pt, the game records (59.3: `records/<kind>/iter_NNNN/`,
+  kinds `eval` / `elo` / `anchor`, players as a local match names them). The mirror is a directory of this machine
+  (`<run>/eval_pool/<farm run>/mirror/<run name>`; checkpoints and anchors hard-linked where the disk allows) and the
+  evaluation runs in the run process (no torch inference: the export and the engine's replay only). The row has one
+  more key, `eval_pool`: `{farm_run, batches, games, farm, local, local_s, machines, spot}` (how its games were
+  played; machine counts only). `RemoteEval._evaluate` is now `_ship` + `_result` (the remote's command) + `_record`:
+  the same steps, split so FarmEval replaces `_result` alone.
+* **Every match is one eval batch** of the farm run: the evaluation's `Run` is `FarmRun`, whose `play_match` /
+  `play_matches` send each match between two networks, or a network and a built-in bot, to the farm and return the
+  rows a local driver returns ((score, margin, rounds, over) of the evaluated network); a match against an external
+  bot (`ext:`) and the reference games between two bots (no network, once per pool) are played here as before. For a
+  batch: its networks registered as gens of the farm run (a run checkpoint's gen is its iteration; another network, an
+  anchor, gets 900,000,000 + n; exported once with `zero.farm_h2h.export_cached` and the pool's graph `pool_export`,
+  uploaded, `PUT .../checkpoint/<gen>`); a new signed definition (PROTOCOL 7) whose eval template is the batch's job -
+  the worker build's own `check-config --eval` play settings of the run's settings at the match's simulations with
+  `eval_trace` 1 (section 50), seats `[{"net": A}, {"net": B} | {"bot": name}]`, paired as the run's matches are
+  (`elo_paired`); then the batch (`PUT /v1/admin/run/<farm run>` with `eval`: the template plus the match's driver
+  seed as the base seed). The coordinator holds one batch per run, so the evaluation's matches go one after the other.
+* **A farm run of its own** (`selfplay` null), never the run's self-play pool run: the pool PUTs `eval: null` and
+  signs definitions without an eval template every generation (section 45), and a definition's eval template names
+  the batch's seats, so the two would undo each other. The farm run is created on first use with the pool's
+  settings: `pool_build` (the worker build), `pool_runtime`, `pool_worker` (its executable here: check-config, and the
+  deadline's games), `pool_alternates` / `pool_alt_vendor`, `pool_priority`, `pool_min_agent`, `pool_needs_ram_mb`,
+  `pool_url`, `pool_key`, `pool_farm_release`, `pool_expires_days`, `pool_export`. Each platform alternate is checked
+  on the eval settings first (`check-config --eval --platform`, section 62).
+* **Collecting and checking.** Every eval chunk the coordinator lists is downloaded (sha256), its credited rows taken
+  (`ids`, `also`, `dup_ids`: the first copy of a game wins) and each row checked before it counts: its digest is its
+  record's (`farm_eval.check_digest`), its game id is the batch's, its seats are the batch's for that id, its record's
+  seed is its game id's (`game_seed_of(seed, gid, paired)`: a worker cannot choose its games), its result, over and
+  rounds are its record's. When the batch is complete, a **spot check**: `eval_pool_spot` (5%, at least one game) of
+  the farm's games, chosen at random seeded by the batch's name, replayed through the engine from seed + moves
+  (`farm_eval.replay_trace`: every move legal, the result, rounds and setup the record's). Any mismatch refuses the
+  batch: `refused.jsonl`, the batch dropped on the farm, its games played here instead (with no deadline: the
+  evaluation fails, logged, and is retried with a new batch).
+* **Why a rules replay, not a search replay.** The network's arithmetic differs in its last bits across platforms and
+  execution providers (x64 vs arm64, the CPU vs CUDA; PROTOCOL 11.4), so the same game searched on two machines may
+  legitimately choose other moves, and a re-search on the desktop would "refuse" honest games played on a Mac or a
+  GPU. The engine's rules replay exactly on every platform (the farm pool's platform check, made here too), so a
+  replay from seed + moves is valid whoever played the game: it catches bad hardware, transport faults and broken
+  builds, not a network that chose differently (as PROTOCOL 5.3 says of analysis campaigns).
+* **Deadline and fallback.** The games of a batch the farm has not delivered `eval_pool_deadline_s` (1800) seconds
+  after it was put are played here: the batch is dropped on the farm (`eval: null`: its leases are cancelled at their
+  next beat), then the missing game ids, whole pairs, pieces of 64, are played by `pool_worker` (`<worker> eval` with
+  the batch's settings, seats, base seed, game ids and graphs: the same games the farm would have played) with
+  `eval_pool_threads` threads at below-normal priority, its ONNX Runtime the runtime pack next to the worker build
+  (`<builds>/<runtime>/`, refused at the start when it is missing); their rows are checked as the farm's. `0`: no
+  deadline, the evaluation waits for the farm (a stalled farm then stalls the evaluation queue, never training).
+* **Restarts.** The farm state (`<run>/eval_pool/<farm run>/state.json`: the gens and their files, every batch by its
+  match - seats, games, seed, settings) makes every step idempotent: a restarted run's evaluation of the same
+  iteration resumes the batch it was collecting (no second batch), and a finished batch is not played again.
+* **The deals.** A batch's game ids are the farm run's (the coordinator reserves them), so a farm match plays other
+  deals than a local driver of the same seed (game g's seed is `game_seed(seed, gid, paired)`): the same matches,
+  players, game counts, seats and settings, equally random deals, and every record replays from its own seed. A
+  remote's games were never bit-identical to this machine's either (other arithmetic).
+* **The farm report** (`zero.farm_report`): an evals.jsonl row whose host is a pool counts only the games its
+  deadline played here (`eval_pool.local`) as this machine's; the farm PCs' games are the coordinator's to count.
+
+**Off by default.** `eval_remote` '' (here) or a remote name behaves exactly as before: `Run.loop` takes the farm path
+only for a value starting with `pool:`, which no run used; RemoteEval's split into `_result` / `_record` runs the same
+steps in the same order (its tests unchanged), `evaluate_mirror` defaults to `Run` and src 'remote'. The five new
+settings are trainer-only (`crates/worker/src/run_settings.json`), so no worker build needs them and no template
+changes. Turn it on: `--eval-remote pool:<farm run>` (a slug of its own, e.g. `<run>-eval`) with the pool's settings
+set (`pool_build`, `pool_runtime`, `pool_worker` at least); a restart switches either way (a new mirror starts from the
+run's Elo pool, like 5.2's).
+
+**Costs.** On the run's machine: per new network an export by weight swap (1.4-1.7 s on MTG Zero's 128 x 8 net; the
+first of an architecture builds its template and records reference positions, 136 s, unless the run's self-play
+pool has them: its `<run>/pool/<farm run>/export/` is copied once into the farm run's own cache) and its upload
+(~16 MB a network, kept under `ckpt/`); per batch a definition signed by
+farm-release and a few coordinator calls, a poll every `eval_pool_poll_s`, the replay of the spot check (milliseconds a
+game); the deadline's games, when the farm does not deliver, at `eval_pool_threads` threads. On the farm: the games,
+in batches one after the other (a batch waits for its last lease; PROTOCOL 12: CPU PCs take eval first, GPU PCs when
+the CPU PCs can't keep up within `eval_horizon_s`). Disk: the batches' rows and result files (the records with every
+move) under `<run>/eval_pool/`.
+
+**Measured** (2026-11-19, the desktop and the real farm; a test run directory holding copies of MTG Zero's
+legacy-meta3-r1 iteration 736 and its two anchors, the run's evaluation settings - eval_sims 32, cq with min visits 4,
+root view, belief tilt 1, eval cache 8192, paired - with 8 games a match instead of 100 and a fresh Elo pool, so the
+second anchor was calibrated first; the test farm run `fe-test-eval-1119` limited to the owner's canary agents
+(min_agent 0.3.3) and Windows builds (the CPU build and its CUDA alternate; no macOS alternate: min_agent alone could
+not keep a platform's leases to the owner's machines), priority 0.1, deadline 2400 s; paused afterwards):
+
+* three batches, one after the other: the calibration (meta256 vs fork0) 288 s from the batch's PUT to its last row,
+  736 vs fork0 696 s, each one lease on the farm (a farm PC that plays self-play on its GPU takes an eval batch only
+  when the CPU PCs can't keep up, PROTOCOL 12.2: part of the wait); 736 vs meta256 got no lease (the eligible machine
+  was paused meanwhile), was dropped at its deadline (2,403 s) and its 8 games played on the desktop by the run's worker
+  build at 4 threads in 134 s (~395 leaves/s on the CPU);
+* the spot check: 2 of each farm batch's 8 games replayed from seed + moves, all equal (10-20 ms a batch); every row's
+  checks passed; the definitions (one a batch) took 3-4 s each through farm-release; the evaluation 3,675 s in all;
+* the result: 736 vs fork0 6.0/8, vs meta256 5.0/8, anchored Elo 1333 +- 200 (the Mac's evaluation of the same
+  checkpoint with 2 x 100 games: 1346 +- 57); the evals.jsonl row, the pool's results / ratings / anchored files,
+  index.json and 3 records files (the farm's games src 'farm' with their machine tag, the desktop's src 'local'), as a
+  remote's;
+* the same games: two of the farm's games played again on the desktop by the same build (`<worker> eval`, the same
+  ids, seed and graphs): the same digests, game for game;
+* `check-config --eval --platform macos-arm64` on these eval settings: no libm refusal (the run's macOS alternate may
+  play its evaluation's games).
+
+**Tests and checks.** `tests/test_eval_pool.py`, against a fake coordinator that plays each batch as the native
+worker plays it (`tests/farm_play.py`: a traced rolling driver on the uploaded ONNX graphs) and hands it out as two
+machines' leases with a duplicate chunk: two evaluations of a toy run with two anchors (the yardstick vs a bot, Elo
+matches together, a calibration, both anchors; ten batches, each with its own definition) record what RemoteEval
+records - the evals.jsonl rows, the pool's files, index.json, the game records with farm machine tags - and play the
+same matches as a remote evaluation of the same run (the pool's pairs, game counts and `logged`, the rows' keys and the
+records' kinds equal); a restart resumes its batch; a half-delivered batch is dropped at its deadline and the rest
+played by the worker (`tests/worker_stub.py eval`), digest for digest the farm's games; a seat-swapped row and a
+tampered move (its digest recomputed: the spot replay refuses it) refuse the batch and its games are played here;
+without a deadline a refused batch fails the evaluation and the retry plays a new batch; the refusals at the start
+(the self-play pool's farm run, no pool_worker, no ONNX Runtime for the deadline, a bad slug); the export cache
+seeded once from the self-play pool's. The rest of the suite
+(RemoteEval's tests, `test_worker_settings`, `test_farm_report`, `test_gamerec_all`, `test_privacy`) unchanged.
+
+**Refusals raised as SystemExit (2026-11-19, `fix/eval-thread-report`).** zero.eval_pool and zero.farm_def refuse a
+setting with `SystemExit`, which RemoteEval's thread (`except Exception`) didn't catch: the thread ended silently while
+training went on, so the evaluations just stopped. The thread now logs it (`REFUSED (SystemExit): ...`) and retries
+after `RETRY_S` like any failure. Test: test_eval_pool.py `test_a_refusal_raised_as_systemexit_never_ends_the_eval_thread_silently`.
+
+## 66. The fast graph on CUDA: running sums in blocks, its optional input `t_align`, the fused float32 attention (no setting; zero-farm's Windows GPU PCs, 2026-11-19)
+
+**Why.** Measured on a farm PC (an NVIDIA GPU, the farm's CUDA pack; MTG Zero's legacy-meta3-r1 at gen 769, its fast
+graph, the CUDA pack: ONNX Runtime 1.24.4), the native worker played at 0.33x of the trainer's own torch path (bf16 and
+its token CUDA graphs) on the same PC with one worker, 0.43x with three sharing the GPU. A profile of the fast graph's
+kernels (CUPTI through torch.profiler, which sees ONNX Runtime's kernels too) at 1,024 rows: 63 ms a call, 48 ms of GPU
+time, of which ONNX Runtime's CUDA CumSum took 15.5 ms - its cost grows faster than the axis's length (16k elements 0.37
+ms, 64k 1.65 ms, 262k 16.4 ms; [464, 512] along its rows 0.18 ms) and `_csr_rows`' running sum covers a batch's
+non-zeros (237,272 elements) -, the attention ~16 ms through the unfused path (separate products, transposes, softmax),
+cuDNN's InstanceNormalization 2.2 ms (`layernorm_instance`, the Mac's form), 190 host <-> device copies.
+
+**What.** Only the fast graph (`fast`, `pool_export` 'fast') and the worker's CUDA sessions change; the default graph's
+export is as before, byte for byte.
+
+* *Running sums in blocks* (`_cumsum0(v, blocked=True)`, `CUMSUM_BLOCK` 512): within blocks of 512 elements (zero-padded
+  to whole blocks), then over the blocks' totals, added back - the same integers. Only over axes sized by the graph's
+  inputs: `_csr_rows` of the non-zeros, the tail tokens and the overrides (the module's `blocked`, the fast graph's).
+  Over a data-dependent length (a NonZero's count) the exporter dropped the padding (a [-1, 512] Reshape of 33,830
+  elements failed on CUDA): those keep `cumsum`.
+* *The policy scatter's spare places* (the `punique` path): B A1 + token C + column from the head tokens' running count
+  instead of a running sum over all n_h C writes (67,660 elements at 1,024 rows) - the same places.
+* *The optional input `t_align`* (int64 0-d, an initializer of its name holding 1: a feeder may leave it out; metadata
+  `t_align` '16', `T_ALIGN`): the padded rows' token axis rounded up to a multiple of it, at most `T_ALIGN_PAD` (15)
+  past the longest row and never past B (F + 1 + the most tail tokens of a row) - `int32_bound`'s term, unchanged
+  (the cap is min(15, F + 1 - n_tok), F the features). More padding keys, masked: the same answers up to float32
+  rounding (2.4e-7 on the toy's rich layout). Not fed - every CPU worker and every worker of before - the graph is the
+  one of before but for these few integer operations.
+* *The worker* feeds `t_align` (`session::t_align_for`: the graph's metadata value on a GPU provider; never on the
+  CPU; `ZERO_WORKER_T_ALIGN` overrides it for a measurement, 0 or 1 = not fed) and sets ONNX Runtime's
+  ORT_MIN_SEQ_LEN_EFFICIENT_ATTENTION_FP32 to 1 at its start unless set (`lib::ORT_EFFICIENT_ATTENTION_FP32`): ONNX
+  Runtime's default (256) sends tens-of-tokens attention to the unfused path, and its CUDA MultiHeadAttention takes the
+  fused (cutlass) float32 kernel with an attention bias only for a sequence that is a multiple of 16 (a 1,024-row
+  MultiHeadAttention with bias: 64 tokens 1.70 ms unfused, 0.44 ms fused; 61-63, 67, 72 tokens unfused whatever the
+  variable says; 16, 32, 48, 64, 80, ... fused) - hence `t_align`. Both pass the self-test (2e-5) with the CUDA pack:
+  max abs 7.6e-6 on the reference set, as before.
+* *Tried and left out*: q, k and v each from a product and a gather of its own instead of the qkv product's Split (3.6
+  ms of Split copies at 1,024 rows) - right on the CPU, but on CUDA it broke ONNX Runtime 1.24.4's allocation planner (a
+  ScatterElements' sizes 15,404 against 27,064: 63's planner problem); the Split stays.
+
+**Measured** (the farm PC above, paused on the coordinator; gen 769; the farm's CUDA worker build of MTG Zero 85495dc7
+with the env variable set by hand and a measurement copy of the graph whose `t_align` default is 16 - the worker of
+this change feeds it; 5-minute rolling windows, 1,024 games in flight, 1 group, threads 6; three workers: 3 x 384,
+threads 2):
+
+| graph | kernels at 1,024 rows (wall / GPU ms a call) | one worker (leaves/s) | three workers |
+|---|---|---|---|
+| the fast graph of before | 62.9 / 48.0 | 10,842 / 11,176 / 10,838 (three runs) | 14,154 |
+| + blocked running sums | 51.3 / 34.8 | 12,133 | - |
+| + spare places, `t_align` 16, fused attention | 41.3 / 23.4 | 11,975 | 16,935 |
+
+One worker gains ~10%: its calls are now bound by ONNX Runtime's host side (~1,400 nodes launched one by one, 17
+device -> host syncs for the data-dependent shapes: 62.6 ms a call with the GPU ~35% busy). Workers sharing the GPU gain
+~20%. The trainer's torch path on the same PC: 32,665 leaves/s (bf16 + CUDA graphs), 19,977 in float32.
+
+*The CPU*: the old and the new graph's answers on the desktop's CPU pack (ONNX Runtime 1.31.1, 227 rows, 3 threads)
+are identical (max abs 0.0), their times within noise (median 151.5 / 147.5 ms over interleaved windows).
+
+**Tests.** `tests/test_onnx_fast.py::test_fast_graph_cuda_forms` (`_cumsum0` exact at the block edges and empty; the
+fast graph's CumSum over [., 512] at least three times, the default graph's never; `t_align` an overridable
+initializer, the answers fed 1, 2, 5, 16 or 64 within 2e-6 of not fed); `test_fast_graph_interface_and_structure`
+(the one more input and metadata key); the fast and zero-onnx/2 suites (47 passed with test_onnx.py and
+test_worker_settings.py); zero_worker `t_align_is_fed_to_a_gpu_graph_that_names_it`.
+
+## 67. GPU graphs: the static zero-onnx/2 graph, float16 copies, the worker's float16 self-test (no setting yet; zero-farm's GPU PCs, 2026-11-19)
+
+**Why.** After 66 a farm GPU PC's single worker is bound by ONNX Runtime's host side (the fast graph's ~1,400 nodes
+launched one by one, 17 device -> host syncs for its data-dependent shapes): a 1,024-row call 41.8 ms of wall time, 23.2
+ms of GPU time. The user's decisions of 2026-11-19: a GPU-only graph per generation (zero-farm PROTOCOL rev 20's
+checkpoint variants, the agent's side) and reduced precision on GPU sessions with a looser self-test.
+
+**The static graph** (`ZeroOnnx2Static`; `export(..., fast='static')`, graph 'static'): the default graph's arithmetic -
+the rows densified, every head slot embedded, its tails, gates, overrides and refusals - with no data-dependent shape: an
+input `t_cap` [T] whose length is the padded rows' token axis (the feeder's choice, at least each row's head and tail
+tokens), the padded rows built by one scatter of unique places, the blocks on [B T], the pooling masked; the static
+policy and the overrides `ZeroOnnx2`'s on the head positions in full (the same writes in the same order). A row whose
+tokens pass T is refused (`refused` + 1). Metadata `static` 1, `presence` (`TokenNet.present_index`: a feeder counts a
+row's head tokens from it), `t_align`; `onnx_parity` feeds `t_cap` from them (rounded up to `t_align`), as the worker
+does (`session::StaticTokens`; its places B (T + n_tok + 1) + NT + 1 checked below 2^31). Parity with torch within 2e-5
+(4e-7 on the toy's layouts and the rich one). *Measured on a farm PC's NVIDIA GPU (gen 769 of a live run's network, the
+CUDA pack, the fused attention): slower than the fast graph* - 512 rows 29.9 ms wall / 24.3 ms GPU (fast: 24.7 / 12.1),
+1,024 rows 65.0 / 58.4 (fast: 41.8 / 23.2): every row padded to the batch's longest (~15 tokens a row on average, padded
+to 64) multiplies the blocks' work, and the dense input stage adds more; 1,986 nodes. Kept (tests, a weight-swap
+template of its own), not the GPU variant.
+
+**Float16 copies** (`to_float16(src, dst)`): a graph's float32 arithmetic in float16, its inputs and outputs float32
+(onnxruntime.transformers' `convert_float_to_float16`, keep_io_types; ConstantOfShape kept float32 - the converter
+leaves its value attribute float32 under a float16 output -, the nodes re-sorted depth first: the converter appends its
+input casts after their readers, and each moves to just before its first reader, nothing else moving), metadata
+`precision` 'fp16', the same bytes from the same graph. The order matters on the CUDA pack: ONNX Runtime 1.24.4 plans
+its buffer reuse from it, and an earlier sort by passes (every ready node, then again) reordered the whole graph into a
+plan that broke on the self-test's six batch sizes ("Shape mismatch attempting to re-use buffer"; the same graph ran
+with memory reuse off - which the C API the worker uses cannot set). With the depth-first order: the worker's CUDA
+self-test passes (the desktop's RTX 5090: max abs 1.6e-2, deterministic) and a 1,024-row call takes 46.5 ms against
+the float32 graph's ~85 ms on the same busy GPU. Measured (the fast graph of gen
+769, the reference set's 256 rows, the CUDA pack) against torch's float32 answers: priors 4.2e-3, value 8.5e-3, margin
+1.0e-2 at most, 3e-4 to 6e-4 on average (float32: 2.8e-6 / 3.7e-6 / 5.1e-6); a 1,024-row call 35.2 ms (float32 41.7):
+still host-bound with one worker.
+
+**The worker's float16 self-test** (`selftest::tol_for`): a graph with `precision` 'fp16' passes at max 5e-2
+(`TOL_FP16`) and mean 3e-3 per item (`MEAN_TOL_FP16`); every other graph at 2e-5 as before; any other precision refused.
+The session must still answer bit for bit the same twice (a provider's races - the AMD probe's failure mode - show there
+whatever the tolerance).
+
+**Tests.** `tests/test_onnx_static.py` (8: parity on the toy layouts and the rich one with both attentions, identity
+actions with dup_reduce None and 'max', the structure - no NonZero, LayerNormalization kept, `t_cap` required -, the
+same answers for any long enough T, a short T's refusals, its weight-swap template); `test_onnx_fast.py::
+test_fast_graph_float16` (interface, metadata, deterministic bytes, the float16 tolerances against the float32 graph on
+the CPU, refusals equal).
+
+**The run setting `pool_variants`** ('' by default: no variant, every request the pool sends as before; zero-farm
+PROTOCOL rev 20, 14.5): 'name=form,...' (`farm_pool.variant_setting`; names `farm_def.VARIANT_RE`, at most 8; forms
+'fp16'). Per gen, after its export: each variant made beside the graph (`model-<name>.onnx`), uploaded under
+`ckpt/<run>/<gen>/model-<name>.onnx`, signed in the next definition (`checkpoints[gen].variants`: sha256 and size,
+`farm_def.validate` checks them as 14.1 says) and registered with the gen (`PUT .../checkpoint/<gen>` `variants`). The
+run's GPU alternates (a `when.vendor`) name the first variant (`"model"`): those machines get it, every other machine the
+gen's default graph. The run's `min_agent` is raised to `farm_def.VARIANT_AGENT` (0.3.5; a larger one kept) and put
+with the run (a resumed run's in its next PUT: the coordinator counts a definition that signs a variant as 0.3.5 anyway,
+14.1): **agents before 0.3.5 get none of the run's leases**, so the stable channel needs 0.3.5 before a live run turns it
+on. The worker takes either graph at each checkpoint op (a new session per network, its metadata read again: precision,
+`t_align`) and `probe-providers --model` self-tests a variant at its own tolerance. Tests: test_farm_pool.py::
+test_pool_variants_are_exported_uploaded_signed_registered_and_named (the files, keys, the order of upload / definition /
+registration, the alternate's `model`, min_agent, bad settings).
+
+**Measured on the farm** (2026-11-20 UTC; a canary farm run publishing gen 812 of MTG Zero's legacy-meta3-r1 through
+this commit's `farm_pool.Pool` with `pool_variants` 'gpu=fp16' and `pool_export` 'fast'; a farm PC with an NVIDIA GPU on
+agent 0.3.6 and this commit's CUDA worker): the coordinator listed the alternate's `model` 'gpu' and the checkpoint's
+variant with no problems; the PC leased the run on the CUDA alternate, downloaded `model-gpu.onnx` and self-tested it on
+CUDA (max abs 9.4e-3 over 256 rows, deterministic). The agent's layout - a crew of 3 workers x 575 games in flight -
+played 20.8k games/h over 15 minutes (the coordinator's accepted counts; ~4,240 leaves a game, from 66's measurement runs
+of the same network: ~24k leaves/s). On the same PC: the farm's CUDA worker before 66, one worker at 1,024 in flight,
+10.5k leaves/s; 66's float32 fast graph, one worker at 2,048 in flight, 16.1k; the trainer's own torch path ~32k (bf16
+and CUDA graphs), 20.0k in float32. The crew ran unmeasured by the agent's tuner (zero-farm's agent 0.3.6 doesn't yet
+measure a running crew in place), so the float16 graph's share of the gain is not separated from the layout's.
+
+## 68. Per-seat evaluation settings: an eval job seat's `set`, one mapping with zero.h2h's per-side options (no setting; the worker feature `seat_settings`; zero-farm PROTOCOL.md 5.2; MTG Zero's ISMCTS check, 2026-11-21)
+
+**Why.** On 2026-11-20 an evaluation-only check of information-set merging (30, docs/search.md 3.16) - one checkpoint on
+both sides, side A merging its trees and side B not (`zero.h2h CK CK --paired --a-infoset-merge 1 --b-infoset-merge 0`) -
+played 4 x 2,400 games on the desktop beside the live runs, because the farm could not express it: an eval job's seat was
+`{"net": gen}` or `{"bot": name}` and both seats took the job's one settings block. zero.h2h has a per-side option for
+every part of an evaluation seat a head-to-head varies (simulations, the move rule and its guard and transform, the
+leaf-value view, the root belief, the root search, merging), so every such A/B was local only.
+
+**What it does.**
+
+* **The wire** (zero-farm PROTOCOL.md 5.2): a network seat may carry `"set"`, an object of run settings - the settings that
+  seat's evaluation seat plays other than the job's: `[{"net": 1, "set": {"eval_infoset_merge": 1}}, {"net": 1}]`. The
+  seat plays `Run.nn_seat(key, eval_sims)` of the job's settings with its set over them (`dict(settings, **set)`; the
+  native worker `EvalSeat::NetSet`, `EvalSeat::settings`; `zero.farm_eval.seat_dicts`). Its keys are only what that seat
+  reads, `zero_worker::settings::SEAT_READS` = `zero.seat_settings.SEAT_KEYS`: eval_sims, c_puct, chance_k, margin_w,
+  redet, cq_c_visit, cq_c_scale, eval_select, eval_select_min_visits, eval_select_c_visit, eval_select_c_scale,
+  eval_root_min_visits, root_min_visits_max_actions, eval_leaf_value_view, eval_root_search, gumbel_m, eval_gumbel_scale,
+  eval_cache, eval_infoset_merge, eval_belief_tilt, belief_clip, belief_mix, belief_fast, eval_belief_tilts,
+  eval_value_choice_worlds, eval_value_choice_temp. Any other key (a setting of the match such as conc or eval_spec, an
+  unknown key, a Python-only feature such as the lookahead), an empty set, a set on a bot or beside other keys is refused
+  by `EvalSeat::parse` - an eval job's refusal and `check-config --eval --seats JSON`'s (its JSON adds `seat_reads`); a
+  seat whose settings `Run.nn_seat` refuses (a merge without root-view values) is refused naming the seat. A result row's
+  `seats` echo each seat with its set's keys sorted (the job line's parser holds objects sorted; `zero.farm_eval.
+  check_seats` writes the same form), so the Python and native rows are the same bytes. Two seats of one network
+  (`[{"net": 1, "set": {...}}, {"net": 1}]`, `checkpoints [1]`) are told apart by their sets: `farm_eval.a_seat_of` /
+  `summary` compare A's whole seat.
+* **The feature**: `hello` / `info` announce `seat_settings` (`zero_worker::FEATURE_SEAT_SETTINGS`); `zero.farm_h2h.
+  play_settings(..., seats=)` refuses a seat with a set for a build without it before anything is published (an older
+  worker would refuse the seat on the PC: "one key, net or bot"), and runs the build's check-config with the seats.
+* **One mapping** (`python/zero/seat_settings.py`): `add_side_args` defines zero.h2h's per-side options (the both-sides
+  flags `--select`, `--select-min-visits`, `--cq-c-visit / -scale`, `--infoset-merge`, `--gumbel-m`, and per side
+  `--{a,b}-sims`, `-select`, `-select-min-visits`, `-cq-c-visit / -scale`, `-leaf-value-view`, `-belief-tilt / -tilts /
+  -clip / -mix / -fast`, `-infoset-merge`, `-root-search`, `-gumbel-m` (new), `-gumbel-scale`; `--graphs` and
+  `--lookahead` only with `local`); `side_set` turns a side's options into its set over its settings - zero.h2h's
+  documented meaning, written as run settings (`SIDE_OPTIONS` names the settings each option writes; `LOCAL_ONLY` the two
+  with none: CUDA graphs and the lookahead are torch / Python features). zero.h2h builds each side's seat with it
+  (`h2h.sides_of`: the side's run settings - `side_settings` - with its set, `Run.nn_seat`); zero.farm_h2h gives its
+  seats the same sets over the job's settings (`[{"net": 1, "set": A}, {"net": 2, "set": B}]`; the readout names
+  `select_a` / `select_b` and `sims_a` / `sims_b` as zero.h2h does); MTG Zero's farm campaigns too (its docs/ENGINE.md
+  214). tests/test_seat_settings.py fails when zero.h2h gains a per-side option that is in neither `SIDE_OPTIONS` nor
+  `LOCAL_ONLY`, when a mapped option writes a key that is not a seat key, or when `SEAT_KEYS`, `SEAT_READS` and what
+  Run.nn_seat reads for an evaluation seat disagree - as crates/worker/src/run_settings.json does for self-play.
+* **The parity gate** (`tools/worker_eval_gate.py --seat-cases all|merge,sims,gumbel,belief,select`): one match per case,
+  the seats of `--seats` given their sets by `side_set` over the job's settings - `merge` (A merges, root-view values on
+  both, B does not), `sims` (A 2x, B 1/2 of eval_sims), `gumbel` (A the Gumbel root search, 4 options; B PUCT), `belief`
+  (A tilt 1, B 0), `select` (A 'cq' with guard 2, B 'visits') - the native worker's rows against `farm_eval.match_driver`'s,
+  byte for byte, and the first network batches.
+
+**No setting; a seat without a set is the seat of before.** `EvalSeat::Net` and `{"net": gen}` are unchanged: the rows,
+the traced records and the digests of every job without a set are what they were (crates/worker/tests/evaljob.rs: the
+earlier tests unchanged; `seat_sets_play_their_own_settings`: a set restating the job's settings plays the same games,
+the rows differing only in the seat's text). zero.farm_h2h and the campaigns send a set only for an option given, and
+only the keys whose value differs from the settings' (`seat_settings.changed`).
+
+**zero.h2h's meaning, now one** (a deliberate change of the local tool in four corners; `h2h.sides_of` against the old
+main() on 8 run configs x 30 option sets, 420 cases: 364 the same seats, the rest these four):
+
+1. `--select` / `--{a,b}-select` replaces the move rule only (its guard and transform). Before, it also dropped the side's
+   run's `eval_root_min_visits`, `eval_leaf_value_view`, `eval_infoset_merge` and `eval_value_choice_*` - against the
+   docstring, which says each side takes those from its run. A side of a run evaluating with root-view values keeps them.
+2. `--{a,b}-select-min-visits` without a rule was silently ignored; now it is the guard of the side's own rule ('cq'),
+   refused for a 'visits' side; `--select-min-visits` alone guards each side that plays 'cq' (refused when none does), as
+   the both-sides 'cq' transform flags already worked.
+3. `--{a,b}-belief-clip / -mix / -fast` with `--{a,b}-belief-tilt 0` (no belief) was silently ignored; now refused, as
+   it already was for a side without a belief.
+4. A Gumbel root search for a side whose run evaluates with root minimum visits is refused (Run.nn_seat: the two are
+   exclusive, docs/search.md 3.7); before, the side's seat carried both.
+
+A belief turned on for a side whose run evaluates without one takes clip 20, mix 0 and full searches only unless given
+(zero.h2h's with_belief, as before - its run's belief_clip / belief_mix may be self-play's).
+
+**Costs.** None for a job without sets. A seat with a set builds its settings once per job (a copy of the settings).
+
+**Tests and checks.** zero_worker: `settings::tests::seat_sets_parse_and_apply` (parse, refusals, the seat dict of a set,
+a refused seat named), `tests/evaljob.rs::seat_sets_play_their_own_settings` (toy, uniform evaluator: a restating set
+plays the same games, other sims / rule other games, seats keep their sides, a lease of the match plays its games, one
+network on both seats, a refused set), the hello features test; the full `cargo test -p zero_worker --release`.
+Python: tests/test_seat_settings.py (the keys against Run.nn_seat's reads and SEAT_READS, the drift check, side_set per
+option, zero.h2h's seats = the farm's seats of the same sets for 8 option sets, check_seats' form and refusals, Python
+matches playing each seat's settings, A told apart from B on one network); tests/test_farm_h2h.py
+`test_per_side_settings_are_the_seats_sets` (the sets in the job and the signed template, check-config run with the
+seats, the readout's rules and simulations, an old build refused before anything is published, per-side options on
+--resume refused); tests/worker_stub.py checks `--seats` as the worker does.
+
+**Measured** (2026-11-21, the desktop, CPU, beside the live runs). The parity gate on the toy game (`zw_toy`, two toy
+networks with the auxiliary head exported to zero-onnx, 24 paired games per case, eval_sims 16, the 'cq' rule, sparse
+rows, 2 search + 2 ONNX Runtime threads): all five cases, with one network on both seats and with gen 1 vs gen 2, **24 of
+24 rows byte-identical** and the first 60 batches identical in every array; the seats' rules as zero.h2h names them
+('cq-v50-s0.3-rv-ism' / 'cq-v50-s0.3-rv', 'gumbel-m4-v50-s0.3' / 'cq-v50-s0.3', 'cq-v50-s0.3-b1' / 'cq-v50-s0.3',
+'cq-n2' / 'visits'); the match without sets, 24 of 24 as before.
+
+The parity gate on MTG Zero (2026-11-21; its signed release worker of the branch, build 1468c4d9, through the farm's CPU
+runtime pack; legacy-meta3-r1 iter_1040 on both seats - one network, `--seats '[{"net": 1}, {"net": 1}]'` -, the eval
+settings of its ISMCTS campaign: the Doomsday-vs-Delver spec, eval_sims 16, the run's rule 'cq' guard 4 c_scale 0.3,
+root-view values, belief tilt 1 / mix 0.25, eval cache 8,192, groups 1, sparse rows; 8 paired games per case, 4 search +
+4 ONNX Runtime threads): all five cases **8 of 8 rows byte-identical**, the first 60 batches identical in every array -
+merge ('cq-n4-v50-s0.3-rv-b1m0.25-ism' / '...-rv-b1m0.25'), sims (32 / 8), gumbel ('gumbel-m4-v50-s0.3-rv-b1m0.25' /
+the rule), belief (tilt 1 / 0: '...-rv-b1m0.25' / '...-rv'), select ('cq-n2-rv-b1m0.25' / 'visits-rv-b1m0.25'); 62-91 s
+a side per case. zero.h2h's seats on legacy-meta3-r1's own config, old main() against `sides_of` over the 30 option sets:
+19 the same - every merge, belief, view, root-search and sims option -, the 11 others the corners above (on this run,
+whose evaluation uses root-view values, the old `--select` / `--a-select` dropped them: a seat of mover-view values).
+
+The core's checks (ba607c2, the desktop, beside the live runs): `cargo test` (workspace) and `cargo test -p zero_worker`
+pass; the core pytest 856 passed, 19 skipped, 2 failed, neither touching this change - `test_dup_reduce.py::
+test_max_is_deterministic_on_cuda_and_matches_the_cpu` (CUDA, the GPU shared with the live runs; it imports none of the
+changed modules and fails alone too) and
+`test_farm_pool.py::test_the_pool_follows_the_phase_spec_of_the_game_package` (a Windows PermissionError replacing a
+state file; passes alone); glassroad-zero, caverna-zero and kingdombuilder-zero build against this core
+(`smoke_all.sh --with-this-core --build-only`: games 3 of 3).
+
+**End to end on the farm** (2026-11-21, MTG Zero ENGINE.md 214): an analysis campaign `cmp-ismseat-test` -
+legacy-meta3-r1 iter_1040 against itself, seats `[{"net": 1, "set": {"eval_infoset_merge": 1}}, {"net": 1}]`
+(`tools/farm_campaign.py submit --a CK --a-infoset-merge 1 --b-infoset-merge 0`), 32 paired traced games at 16
+simulations, the signed worker build 1468c4d9 (this core) - was signed (its definition's template carries the set),
+accepted by the coordinator and leased by an unchanged agent (0.3.13) with no coordinator deploy: **all 32 games played
+by a farm PC** (two leases, 20 + 12 games; none local), every row's digest its record's, the spot check's 2 games
+replayed from seed + moves, 6 of the farm's games replayed by the desktop's worker byte-identical (row and digest), the
+rows' seats echoing the set; the readout named side A 'cq-n4-v50-s0.3-rv-b1m0.25-ism' and side B
+'cq-n4-v50-s0.3-rv-b1m0.25'. (16 simulations and 32 games: a test of the path, not a measurement of the merge.)
+
+## 69. Where zero.h2h plays a match: `--backend auto | farm | local`, the game package's `h2h_backend` (no setting; MTG Zero's farm by default, its docs/ENGINE.md 217, 2026-11-21)
+
+**Why.** The owner wants experiments that play many games to use zero-farm (friends' idle PCs and the owner's Macs) by
+default. After 68 the farm could play every per-side head-to-head, but only through MTG Zero's campaign tool (submit,
+collect, build ids); sessions reach for `zero.h2h` because it is one command, so the 2026-11-20 ISMCTS check (4 x
+2,400 games at 64 simulations) took ~4 h of the desktop's GPU and paused a live run for 72 minutes. This section makes
+the one command use the farm when it can, without changing what a local match is.
+
+**What it does.**
+
+* **`--backend auto | farm | local`** on zero.h2h's command line (default `auto`). `auto`: ask the game package's
+  backend, before any game, whether it can play exactly this match; play there if so, else here. `farm`: there, or
+  refused (exit 2, `h2h: backend farm refused - <reason>`). `local`: here, exactly as before (the backend is not asked).
+  The decision is made once, up front - never as a fallback in the middle of a match - and one stderr line says which
+  and why: `h2h: backend local - asked (--backend local)`, `h2h: backend local - Zero Core has no farm backend
+  (GamePackage.h2h_backend)`, `h2h: backend local - --lookahead is local-only (...)`, `h2h: backend farm - campaign
+  cmp-h2h-..., build 5e4023e2 + CUDA/DML/macOS`. The reasons and the conditions are the package's.
+* **The hook** (`GamePackage(h2h_backend=...)`, an object or 'module:attr' resolved when zero.h2h builds its parser,
+  so its module must import light; `GamePackage.h2h_backend_of()`): `name` 'farm'; `add_args(ap)` - its own options
+  on zero.h2h's parser (MTG Zero's `--farm-*`); `plan(a, ask, sides, seq)` -> `(ok, why, runner)` - `a` the parsed
+  command line, `ask` 'auto' | 'farm', `sides` the two seat dicts a local match plays (`h2h.sides_of`: each side's run
+  settings with zero.h2h's per-side options over them, 68), `seq` a sequential match; ok False: `why` is the reason;
+  ok True: `why` names where, `runner.play(k, n, seed)` plays batch k's `n` games - ids 0..n-1, base seed `seed`, game g
+  of the seats in order for even g and swapped for odd g (A in seat g % 2, as a local match), paired as `a.paired` -
+  and returns zero.h2h's match rows (`gid`, `result`, `scores`, `over`) each with `rec`, the game's traced record
+  (docs/search.md 2.17, 50); `runner.info()` the output's own keys. A package without one: every match local, `auto`
+  says so, `farm` is refused.
+* **One output** (`remote_match`). zero.h2h loads both checkpoints on the CPU first (the encoding guard, the belief head
+  of a side with a root belief: the local match's refusals), builds the seats as `match` does (`_seats`) and reads the
+  backend's rows as a local match's: the same JSON line - `a`, `b`, `game`, `sims`, `chance_k`, `summary`'s fields
+  (`a_score`, `se`, `a_margin`, `elo_diff`, `elo_se`, `unfinished`, `pairs`, `se_games`, `variance_ratio`),
+  `seconds` (the backend's wall time), `select_a` / `select_b`, `sims_a` / `sims_b`, `batches` / `stop` / `sprt` /
+  `target_se`, `paired` - then `backend` (the backend's name) and `runner.info()`. Keys a local driver makes and a
+  backend cannot: `merge` (the drivers' merged-tree counters) is null when a side merges; `graphs_a` / `graphs_b`,
+  `look`, `perf`, `max_rows`, `precision`, `sparse` never appear (their options are local-only or local resources);
+  `per_game` (a chained contest's games, 42) is not produced from the rows. A local match's line gains `backend`
+  'local' (its last key); `match()` and `sequential()` themselves are unchanged.
+* **Sequential matches, one schedule** (`batch_loop`, `seq_bounds`): zero.h2h's batches (batch k seeded seed + 7919 k,
+  ids following the earlier batches', the SPRT / target-se / max-games stops) are one function that `sequential()` and
+  `remote_match` both run - a backend plays batch after batch exactly where a local match would, and stops at the same
+  point on the same rows.
+* **Records** (`--records DIR`): a backend's games are written from their traced records (`gamerec.from_trace`) as a
+  local match writes its own - one file per batch under `DIR/<kind>/misc/`, both players in their seats, `meta` the
+  local match's (`driver_seed`, `paired`, `batch`, `gid_offset`) plus `backend`, `src` the backend's name.
+
+**No setting; local is the match of before.** `--backend local` (and `auto` for a package without a backend) plays the
+same games through the same `match` / `sequential` code: tests/test_h2h_backend.py compares the line with
+`h2h.match`'s key for key and number for number. The refactor of `sequential` into `seq_bounds` / `batch_loop` /
+`_seq_tail` keeps its batches, seeds, stops, record meta and key order (the earlier sequential tests unchanged:
+test_gamerec_all, test_measure, test_gumbel, test_onnx). Two backends' games are not bit-identical (torch here, a native
+ONNX worker there, whose GPU routes may play float16 variants, 67): the line's `backend` names its backend, so a
+series is never mixed by accident.
+
+**Costs.** A local match: one stderr line (and, with a backend, its `plan`: MTG Zero's takes ~0.2 s - git, the release
+index, the worker's check-config). A backend's match: two checkpoint loads on the CPU before its games.
+
+**Tests and checks.** tests/test_h2h_backend.py (a fake backend on the toy that plays its batches through `h2h.match`
+itself, so its line can be compared with the local one): no backend - the line is `match`'s plus `backend` 'local', the
+one log line, `farm` refused (exit 2); a backend's plain match - its options parsed, `plan` asked with `ask` 'auto' and
+the local match's seats (`sides_of`), batch 0 seeded `--seed`, the line's keys and numbers the local match's of the same
+games plus `backend` and its own keys, per-side simulations and pairs included; `--records` - one file of the batch,
+players in their seats with their simulations, `meta` and `src`, every record replaying to its result; a sequential
+match through the backend - batches seeded seed + 7919 k, the line (`batches`, `stop`, `sprt`) equal to the local
+sequential match's; a backend that cannot - `auto` local with its reason, `farm` refused, `local` never asks it;
+`batch_loop` and `seq_bounds` on given rows and refusals. With the h2h tests of test_seat_settings, test_gamerec_all,
+test_farm_h2h, test_select, test_lookahead, test_infoset_merge, test_belief, test_gumbel, test_measure, test_onnx: all
+passed (2026-11-21, the desktop beside the live runs; one unrelated flaky tolerance in test_token_graphs.py
+`test_absent_slots_are_never_read[max]` failed once in the long run and passed three times alone, with and without
+this change).
+
+**Measured.** MTG Zero's farm backend end to end (the scaled-down ISMCTS check through `python -m mtgz.az.h2h` with
+`--backend auto`, the auto -> local cases): its docs/ENGINE.md 217.
+## 70. Farm guards: a fork's own farm runs, definitive pool refusals, pool settings that do nothing, `selfplay_local_reason` (the run setting; `GamePackage.farm_build`; `fork.json`; the Fable farm review of 2026-11-21)
+
+**Why.** A review of how experiments use zero-farm (2026-11-21) found four ways a run ends up desktop-only, or worse,
+without anyone deciding it: (1) `tools/fork_run.py --source` copied `selfplay_remote pool:<parent>` and `eval_remote`
+unchanged, so a fork that did not override them published its generations into its PARENT's farm run (and MTG Zero's
+`tools/ab.py` would then pause the parent's farm run when the arm ended); (2) a farm pool whose worker build refused
+the run's settings logged "refused (retried in 10 s)" for the whole run - with the reason cut to the last 500
+characters - while the run played every game on the desktop (an A/B of MTG Zero's, 11-18); (3) `pool_*` settings with
+`selfplay_remote ''` do nothing (and turn MTG Zero's farm yardsticks off) without a word; (4) the launchers that start
+experiments are scratch scripts that call the run loop or fork_run directly, so a guard in one tool reaches none of
+them - the run's start is the one layer they all share.
+
+**What it does.**
+
+* **A fork never writes into its parent's farm runs** (`zero.tools.fork_run.fork_farm`, applied by `continuation`
+  before anything is copied). Every `pool:<farm run>` of the source's self-play - its `selfplay_remote`, and its
+  `selfplay_remotes` file (34), which replaces the setting and was never copied, so a fork of a file-attached run lost
+  its farm silently - becomes the fork's own farm run: `--farm own` (the default) names it after the fork's directory
+  (`farm_slug`: lower case, `[a-z0-9-]`, at most 63), `--farm NAME` names it. A farm evaluation of the source's
+  (`eval_remote pool:...`, 65) becomes `pool:<name>-eval`. Other hosts in the list are kept, and so are the source's
+  `pool_*` settings (the coordinator creates the new farm runs at their first publish). `--farm none` drops the pools
+  (the fork stays on this machine; a farm evaluation of the source's dropped too). A `--set selfplay_remote` /
+  `eval_remote` naming one of the source's farm runs is refused (SystemExit), as is a name of the source's, a name
+  that is not a slug, and `--farm NAME` with nothing to replace. The decision is printed (`FARM: ...` lines).
+* **`fork.json`.** Both kinds of fork write `<dest>/fork.json`: `kind` (new / continuation), `source` (home as `~`),
+  `iter`, `net`, `farm` {mode, changes} and `started` (null). The run marks it started (`mark_started`) at its first
+  start once every start check has passed - the farm's below and the farm pool's settings check -, just before its
+  first iteration: a first start refused for any reason stays a first start.
+* **Definitive refusals vs transient errors** (`zero.farm_pool.Refused`, a SystemExit with `reason`, `fix` and
+  `detail`). Definitive: the worker build's `check-config` refusing the run's settings (`play_settings`: the refused
+  keys with their statuses, `refusal_summary`, e.g. `bauble_memory (unknown)`; the whole answer in `detail`), the job's
+  own settings, a `driver-cfg` mismatch, no `pool_worker` executable here, another build, the platform check (62), the
+  rolling check (54), and a coordinator manifest that refuses `pool_build` / `pool_runtime` / `pool_alternates`
+  (zero.farm_def's SystemExits wrapped by `_definitive`). Transient - logged and retried every `pool_poll_s` as before:
+  network errors and the coordinator's answers (`FarmError`, any status), farm-release failing, a definition
+  conflict. The fix named by default: release a worker build of the run's commit and point `pool_build`,
+  `pool_runtime`, `pool_worker`, `pool_alternates` at it, or turn the refused setting off, or detach the farm.
+  * **At the run's start.** A new pool (its state has no self-play template yet: a new run, a fork, a pool whose check
+    never passed) runs the settings check in its constructor; a Refused propagates and `zero.run.main` refuses the run
+    (exit 78, `run_state` 'refused' with the reason; the supervisor does not restart it), the log carrying the
+    worker's answer and the fix. A check that cannot run (an OSError, a timeout) is logged and left to the pool's
+    thread. A resumed pool keeps its template, so a live run's restart does nothing new here.
+  * **On the pool's thread** (a resumed run's alternates, platform or rolling check; a phase spec's settings, 52): the
+    pool stops (`Pool._stop`) - no more publishing or ingesting, never retried in this process - and says so: the
+    run's log `farm pool X: STOPPED - a definitive refusal, not retried: ... Fix: ...` (and `STOPPED since ...` at every
+    iteration's end), the metrics row's `selfplay.pools.<name>` `stopped` {reason, fix} and `error`, progress.json's
+    `pools.<name>.state` 'stopped' (the dashboard's status line shows `FARM POOL ... STOPPED`), `describe()`, and
+    state.json `stopped` (cleared by the next process, which tries again). The run goes on with its own games; the farm
+    run keeps any generation registered before (the log says to pause it on the coordinator if it should stop).
+* **The run's start** (`Run.loop`, after the device and rows checks, before iteration 0's checkpoint is written;
+  `check_farm_use`):
+  * With a self-play farm pool (`selfplay_pools`: the setting's or the `selfplay_remotes` file's) - nothing.
+  * **Pool settings that do nothing** (`inert_pool_settings`: every `pool_*` setting not at its default while
+    self-play has no pool, except those a farm evaluation reads when `eval_remote` is a pool - `POOL_EVAL_KEYS`) - a
+    `WARNING: pool settings that do nothing: ...` line at every start.
+  * **The reason to stay here**: the run setting **`selfplay_local_reason`** ('' by default; free text; trainer-only,
+    `crates/worker/src/run_settings.json`, so no worker build needs it) or, when it is empty, the environment variable
+    `ZERO_SELFPLAY_LOCAL_REASON` (for test harnesses and smoke runs; never saved in config.json). Given: logged
+    (`self-play on this machine only (<where>): <reason>`), and that is all.
+  * **Without a reason**, the game package's new hook **`farm_build`** (`GamePackage(farm_build=fn | 'module:attr')`,
+    `published_farm_build(run, cfg, log)`: a description of the published farm build of the code this process runs, or
+    None; an exception counts as none and is logged) is asked. None (no hook - the toy game, the other games today -,
+    no build, no index on this machine): nothing. A build: **a first start is refused** (`FarmUseRefused`, an
+    EncodingMismatch: exit 78) and a resumed run gets a `WARNING: a published farm build exists for this commit ...`
+    line. A first start is a fresh one (`latest_iter` is None: no checkpoint) or a fork's first (`fork.json` without
+    `started`) - `first_start(run)`. Every run that has started before is a resume: all runs made before this change
+    (none has a fork.json), every restart after PAUSE, STOP, a crash or a re-pin.
+
+**Off by default / what changes for existing runs.** A run with a farm pool and an already-written pool template (every
+live and paused farm run on the maintainer's machine, checked read-only on 2026-11-21: each `pool/<farm run>/state.json`
+has `play`) resumes exactly as before: no settings check at its start, no new line. A run without a pool resumes with,
+at most, warning lines (never refused: no fork.json exists anywhere). Defaults are untouched: no search, play,
+encoding, shard or training path changed, and the worker's answers are the same (the settings table gained one
+trainer-only key). **Deliberate behaviour changes:** (a) a definitive pool refusal stops the pool instead of retrying
+forever (`tests/test_farm_pool.py::test_pool_rolling_checks_the_worker_and_puts_rolling` now expects the stop and a
+restart with the fixed worker); (b) a fork of a farm-attached run self-plays on a farm run of its own unless told
+`--farm none` (before: on its parent's); (c) with a game package that has the hook, a fresh start or a fork's first
+start without a farm pool and without a reason, beside a published build, is refused.
+
+**Costs.** At a new pool's start: the worker's `info` + two `check-config` + two `driver-cfg` calls, which the pool's
+thread made anyway (0.23 s with MTG Zero's release worker f22f63bb on legacy-meta3-r1's settings, the desktop,
+2026-11-21; a refusal 0.04 s). At a run's start without a pool: the hook (MTG Zero's index lookup, 0.03 s).
+
+**Tests and checks.** `tests/test_farm_guards.py` (new, 7): `fork_farm` (own names, `--farm NAME`, `none` keeping
+another host, overrides kept as given, the refusals, slugs, a long name's `-eval`), the source's selfplay_remotes file
+as the parent's farm, `inert_pool_settings` / `selfplay_pools`, `check_farm_use` (refused first start, warned resume,
+the setting, the environment variable, no build, a pool, a failing hook), `first_start` / `fork.json`; end to end on
+the toy game with a stand-in hook (a wrapper script setting `package.CORE.farm_build`): a fresh start refused (exit
+78, run_state 'refused', no checkpoint written), the same run started with a reason; a run started before the hook
+resumed with a warning (and the inert `pool_build` warning); its fork's first start refused, then started with
+`$ZERO_SELFPLAY_LOCAL_REASON` and marked; a fork of a farm-attached parent naming its own farm runs in config.json and
+fork.json, and a `--set` naming the parent's refused before anything is copied; a pool whose worker is missing refusing
+the run's start (exit 78). `tests/test_farm_pool.py` (+4): the settings check names the refused key with its status and
+the fix (a missing worker, another build); a refusing build refuses the start with nothing put on the farm, a check
+that cannot run is retried by the thread, a resumed pool is not checked; a definitive refusal on the thread (an
+alternate's manifest, a phase spec's settings) stops the pool - never retried, the log, metrics, progress, describe and
+state.json - and a restart clears it; a coordinator answering 503 three times is retried and the gen registered.
+`tests/test_worker_settings.py` (the new key classified). `bash tools/smoke_all.sh --with-this-core --build-only` on
+bef9cc8 (this section's code; what follows it is Python and docs): `games: 3 of 3 checked` (glassroad-zero 44 s,
+caverna-zero 35 s, kingdombuilder-zero 66 s), GREEN. With the rest of the files the change touches (test_farm_pool,
+test_farm_guards, test_worker_settings, test_loop, test_eval_pool, test_multi_remote, test_farm_h2h, test_privacy,
+test_run_infra, test_farm_def): 127 passed, 8 skipped (the live-run fence). The full suite on the desktop beside two
+live runs (2026-11-21, 31 min): 790 passed, 31 skipped (the live-run fence), 3 failed - none this change's:
+`test_dup_reduce.py::test_max_is_deterministic_on_cuda_and_matches_the_cpu` fails alone on this commit and on c850a5d
+(the commit before) alike, with the desktop's GPU busy with a live run; `test_token_graphs.py::
+test_absent_slots_are_never_read[max]` (CUDA graphs) and `test_shard_thread.py::test_rolling_run_quotas_exact` (97 games
+for a quota of 96 in a rolling writer-thread run, a toy run without a farm pool) pass alone. MTG Zero's optin-core gate
+of the pin runs the suite again (its core pytest step), ENGINE.md 218.
+## 71. Eval jobs' layout: one group on the CPU, an evaluator lane per seat, sessions of a few threads (no setting; zero-farm's CPU match leases, 2026-11-21)
+
+**Why.** A farm match lease on a PC's CPU spent ~98% of its time in ONNX Runtime at ~2 rows a call (63 campaign leases
+of 2026-11-18..21 on 16-20-thread PCs: 2.03 rows a call, 7.7 ms a call, ~260 leaves/s; 32 games of a cells campaign
+took 45-60 minutes on one PC), while the same CPUs answer ~1,100-2,300 rows/s in 64-row batches. Three causes in the
+worker (44.2): the job played in the settings' `groups` - the run's own self-play batching, 4 for MTG Zero's
+legacy-meta3-r1, tuned for the desktop's GPU -, so a step's batch held games / groups / 2 rows; both networks shared one
+evaluator thread (`ByKey`), so the seats' batches ran one after the other; and the one session had the job's search
+threads as intra-op threads (16-20), which this graph uses poorly (62: on an M4 3 threads 2,530 rows/s, 6 threads 2,650,
+12 slower than 4; 63: the desktop's i9 fastest at 3-4) - on a farm laptop's 20 threads a call took ~60-85 ms. The agent
+sends a CPU eval job neither `groups` nor `infer_threads`, so the worker decides.
+
+**What** (`zero_worker::evaljob::eval_layout`; self-play jobs are unchanged):
+
+* **Evaluator lanes.** A batch goes to a lane of its seat key - an evaluator thread with sessions of its own
+  (`LaneMode::Auto`); a key's batches go to its lanes in turn; at most `max(INFLIGHT, lanes)` batches in flight, their
+  answers submitted in launch order (a later batch's answer waits for its turn), as self-play's `infer_workers` (62). On
+  the CPU every network seat key has lanes of its own (one network on both seats: sessions of it per key, each
+  self-tested, the generation's `selftest` event sent once); on CUDA / TensorRT-RTX one lane per generation (the sessions
+  of before, each on its own thread); on any other GPU provider (DirectML, OpenVINO) one lane for every network, as before
+  (concurrent sessions there are untested on the farm's AMD GPU).
+* **The CPU's groups and threads.** A job line without `groups` plays in `EVAL_GROUPS` = 1 group - never the settings'
+  `groups` -, so a step's batch per seat holds every game in flight. Sessions of S = min(the job's per-session threads,
+  `EVAL_SESSION_THREADS` 4) threads (macOS's CPU sessions stay 3, `proto::default_workers`); B = the job's inference
+  threads; n network keys; each key min(groups, max(1, B / (n S))) lanes of B / (n lanes) threads within 1..S. Two
+  networks: 16 or 20 threads -> 2 lanes of 4; 6 threads -> 2 lanes of 3; a Mac -> 2 lanes of 3. A job line's own
+  `groups` G stays (its batches then spread over up to B / (n S) lanes per seat, `infer_workers` counted in B); its own
+  `infer_threads` gives every session exactly those.
+* **GPU jobs keep their groups** - the job line's, else the settings' (the agent's GPU rule leaves out a `groups` equal to
+  the template's) - and their sessions; CUDA's two generations run on two threads, the job's threads shared.
+* **`eval_lanes` 'one'** (a job line field no agent sends; `eval --lanes one`): the layout before - the settings'
+  groups, one evaluator thread, the job's threads - for measurements. The worker's log line names the layout (`groups G;
+  L evaluator lane(s) (Auto, T intra-op threads each): lane i (keys m): gen ...`).
+
+**Only the batches change** - which games' leaves share a batch and how many batches run at once -, never a search: one
+leaf per game per batch, no virtual loss, every game's own random streams. A game's moves are the same when its network
+answers are, and the farm's CPU graphs answer a row the same in any batch and on any number of threads: measured below,
+on the desktop and across farm PCs.
+
+**Tests and checks.** `cargo test -p zero_worker` (all pass): `eval_layouts` (every case above), `each_key_reaches_its_network`
+(tagged evaluators: each key's batches answered by its own generation, no other lane answering it, on every layout), the
+eval job test `one_group_and_lanes_play_the_rows_of_before` (toy: the layout before - the settings' groups 3, one thread -
+against one group on two lanes, 16 threads with 64 games in one group and with the job's groups 2 on four lanes, traced
+rows byte for byte; a lease of the match; a yield / resume with two lanes; one network on both seats; a bot seat; fewer,
+larger batches).
+
+**Measured: the answers** (2026-11-21; legacy-meta3-r1 iter_1040 against iter_1024, the yardsticks' best-of-one spec, 32
+simulations, paired, traced - MTG Zero ENGINE.md 221; the CPU pack, ONNX Runtime 1.31.1):
+
+* *The worker of before* (MTG Zero main 1e7416c5's release, the desktop's CPU beside the live runs): games 0-7 in the
+  settings' groups 4 with 4 intra-op threads, in groups 1 with 2 threads, and as two leases (0-3, 4-7) in groups 1 with
+  1 thread - every row and trace digest identical.
+* *This worker against it*: games 0-7 in its layout (1 group, 2 lanes of 2 threads), with the job's groups 2 on 4 lanes,
+  and with `--lanes one` on games 2-5 - 8 of 8, 8 of 8 and 4 of 4 rows and digests identical to the old worker's.
+* *The eval gate* (`tools/worker_eval_gate.py`: this worker against `zero.farm_eval.match_driver`, groups 1, sparse rows,
+  4 + 4 threads, untraced): 8 of 8 rows identical, 60 batches identical; both sides' rows the old worker's.
+* *On the farm*: the same 128 games (seed 11) played by test campaigns of the old build and of this layout's builds on
+  four farm PCs (16, 16, 6 and 20 threads, two CPU makes, layouts of before and after, leases of 32 and 64 games):
+  every game's row and trace digest identical across the campaigns, whichever PC and layout played it.
+
+**Measured: the speed** (the same farm test campaigns, `tools/farm_campaign.py submit ... --no-alternates`, CPU leases on
+idle farm PCs, D1's lease stats; games/h and leaves/s per lease's wall time; "leaves a call" = the search's leaves over
+ONNX Runtime calls, ~0.75 of the rows a call - the value-only rows are the rest; "infer" = the calls' time over the
+lease's, summed over the lanes):
+
+| PC (CPU threads) | layout | leases (games) | games/h | leaves/s | leaves a call | ms a call | infer |
+|---|---|---:|---:|---:|---:|---:|---:|
+| PC A (16) | before: the settings' groups 4, one session of 16 threads | 1 (32) | 237 | 392 | 2.4 | 6.1 | 0.98 |
+| PC A (16) | one group, one session of 16 threads (old worker, campaign groups 1) | 3 (96) | 391 | 635 | 6.8 | 10.1 | 0.95 |
+| PC A (16) | two groups, four lanes of 4 (an intermediate build) | 3 (96) | 576 | 920 | 4.3 | 8.0 | 1.73 |
+| PC A (16) | ... with 64-game leases | 1 (64) | 656 | 1,093 | 6.3 | 10.2 | 1.77 |
+| PC A (16) | **this layout: one group, two lanes of 4** | 2 (64) | **645** | **1,055** | 6.6 | 9.7 | 1.56 |
+| PC B (16) | before | 3 (96) | 204 | 335 | 2.5 | 7.2 | 0.98 |
+| PC B (16) | **this layout** | 5 (160) | **655** | **1,047** | 7.3 | 10.6 | 1.52 |
+| PC B (16) | **this layout, 64-game leases** | 2 (128) | **768** | **1,243** | 12.4 | 16.5 | 1.65 |
+| PC C (6) | before | 7 (224) | 226 | 365 | 2.5 | 6.8 | 0.99 |
+| PC D (20, laptop) | one group, one session of 20 threads | 1 (32) | 81 | 129 | 7.4 | 56.1 | 0.97 |
+| PC D (20, laptop) | two groups, four lanes of 4 | 1 (32) | 152 | 256 | 3.6 | 22.7 | 1.62 |
+| PC D (20, laptop) | **this layout** | 1 (32) | **182** | **305** | 6.0 | 30.0 | 1.54 |
+
+So on a 16-thread PC: one group alone (one wide session, the settings' groups set to 1 for the campaign) 1.6x the games
+of before; one group on two lanes of 4 threads 2.7-3.2x the games an hour and leaves a second (32-game leases), 3.8x with
+64-game leases (the coordinator's `eval_games_per_thread` 2 gives a 16-thread PC 32 games). Against the 63 campaign
+leases before (2.03 rows a call, ~260 leaves/s): ~3x the rows a call, ~4x the leaves a second. A session of 4 threads
+answers a ~6-row call as fast as one of 16 (9.7 against 10.1 ms): the 12 threads more bought nothing, the second lane
+nearly doubles the rows a second. A second group (four lanes of half the rows) lost at both lease sizes: the lease's
+last games, in two groups, end in still smaller batches. On the 20-thread laptop the wide session was the worst case
+(56 ms a call, hybrid cores) and the new layout 2.2x it.
+
+**Measured: a CUDA lease** (a farm PC with an NVIDIA GPU, paused on the coordinator for the measurement; the releases'
+CUDA alternates of the worker before and of this layout, the farm's CUDA pack - ONNX Runtime 1.24.4 -, each network's
+float16 variant; 64 paired games of the same match, 6 search threads, the job's groups 2 as the agent sends them):
+
+| worker | evaluator threads | games/h | leaves/s | rows a call | ms a call |
+|---|---|---:|---:|---:|---:|
+| before | one for both networks, 6 intra-op threads | 407 | 637 | 9.9 | 12.3 |
+| **this layout** | **a lane per generation, 3 each** | **436** | **681** | 9.9 | 19.9 (two at once) |
+| this layout, groups 1 (the settings' groups 1, which the agent then leaves out) | a lane per generation | 556 | 899 | 14.7 | 20.4 |
+
+Before against this layout: all 64 rows and trace digests identical, +7%. One group would give +37%, but 59 of the 64
+games differ: the float16 CUDA graph answers a row differently in another batch shape (cuBLAS picks its kernels by
+shape), unlike the CPU graph - so a GPU job keeps its groups here, and fewer groups for GPU eval jobs is the agent's
+choice to make (a GPU lease's batches already depend on its size).
+
+
+## 72. Near-tie branches: branch where the search can't separate two moves, play the runner-up, merge back on an equivalent state (`selfplay_branch_rule` 'neartie', `selfplay_branch_eps`, `_n_min`, `_p_min`, `_q_lo`, `_q_hi`; MTG Zero's B2, 2026-11-21)
+
+### 72.1 Why
+
+Section 24's branched games branch at a uniformly drawn decision and sample 1-3 deviation moves from the priors.
+MTG Zero's A/B of them (its ENGINE.md 87, Delver, 40 generations) was null: most branches went where the value head was
+already sure, or into junk moves. The positions the value head lacks are the **near ties**: decisions where the search
+could not separate the move played from a credible runner-up, so one of them gets nearly all the real play and the
+other is never measured (MTG Zero's review 5: a gap of 0.000 at 62 of 71 human-flagged decisions). A census on MTG
+Zero's metagame line (its hub notes, B2 design section 6: 90 games, 64-simulation searches) found ~12 such decisions a
+game in contested positions after excluding non-decisions - fetch timing, Mishra's Bauble targets, cantrip timing,
+counter decisions - and most of them sequencing ties, which often reconverge: Brainstorm in the draw step or in the main
+phase reach the same position when the opponent does nothing in between.
+
+### 72.2 What it does
+
+`selfplay_branch_rule` 'neartie' (with `selfplay_branch` p > 0; driver: docs/search.md 2.11.1):
+
+* **The gate.** At a game's recording self-play full search of a decision that is not minor, with `a` the move played:
+  the candidates are the other root options with >= `selfplay_branch_n_min` visits, prior P0 >= `selfplay_branch_p_min`
+  and the game's `SearchGame::branch_alt_ok(a, b)` (MTG Zero: not a second copy of the same card, not the mana-ability
+  window, a mana colour or a trigger order); `b` = the one with the highest root Q (the decider's win estimate, W / N
+  over every visit). The decision is eligible when `|Q(a) - Q(b)| <= selfplay_branch_eps` and Q(a) is in
+  [`selfplay_branch_q_lo`, `selfplay_branch_q_hi`] (contested positions: a decided game's ties are not interesting).
+* **The branch point** is drawn uniformly among a game's eligible decisions (a share p of the games, as section 24);
+  a game without one spawns nothing.
+* **The branch** plays `b` there - one deviation, no sampling, recorded nowhere - then normal self-play; its rows' z
+  is its own outcome. The rows right after `b` (the opponent's answer, the decider's next decision) are the states
+  whose value the gate says is unmeasured.
+* **Merges.** A branch that reaches a state equivalent to one of its game's after the branch point (the game's
+  `SearchGame::merge_key`: equal keys = the same information states and hidden cards in distribution) ends there,
+  and its rows take **the game's** outcome: an equivalent state has the same future in distribution, and the game's
+  actual continuation is one draw of it. A quiet window then costs a few decisions instead of half a game. A game whose
+  `merge_key` is None (the default; MTG Zero's until its key lands) never merges.
+* Nothing else changes: the game plays and records exactly as without it (its streams, its rows), no row is
+  recorded twice, no target is masked or reshaped; a branch is one of the iteration's games (section 24's quotas).
+
+**Metrics** (`selfplay.forks.neartie`, and the `forks` log line): the games that counted, eligible decisions per game,
+near-tie branches, merges and their share, decisions to merge, the merged branches' samples, the mean Q gap, and the
+branch points by `decision_tag` (tag -> [branches, merged]). Remote self-play (5.3): the workers play the rule
+from the run's config like this machine; their hello's fingerprint names the near-tie settings, so a worker of an
+older checkout (which reports the uniform fingerprint) is refused (section 24); their tallies join the iteration's.
+
+### 72.3 Off by default
+
+`selfplay_branch_rule` 'uniform' (the default) is section 24, byte for byte; the near-tie settings do nothing (and are
+only range-checked) while `selfplay_branch` is 0. Turn it on with `--selfplay-branch 0.2 --selfplay-branch-rule
+neartie` (the defaults: eps 0.02, n_min 4, p_min 0.02, q_lo 0.1, q_hi 0.9). Refused, never ignored: the uniform
+rule's `selfplay_branch_moves` / `_temp` / `_differ` away from their defaults with 'neartie' and the near-tie settings
+away from theirs with 'uniform', out-of-range values, an unknown rule, and (driver) a recording self-play seat with
+`margin_w` != 0 (its Q is no win estimate). Section 24's refusals apply too (rolling self-play, no co-training, no
+league).
+
+### 72.4 Costs
+
+The gate scans the root's statistics once per recording full search (all games, a few options: nothing next to the
+search); a game holding a branch point computes `merge_key()` once per network decision state after it, and a branch
+once per decision state after its deviation (a hash, the game's cost). A game that drew a branch keeps its state copies
+as section 24 (one per reservoir pick) plus one key per later decision. A branch plays no deviation search. Fewer rows
+per branch than section 24's (a merged branch stops early), the same number of games per iteration.
+
+### 72.5 Farm workers
+
+The native worker (section 44) plays branched self-play, both rules, from the run's settings (`settings.rs`
+`branch_of`: the driver's branch dict exactly as `zero.forks.Forks` builds it, the same refusals): the driver is the
+shared Rust one, so its games, branches and merges are the desktop's. `fin` and the unfinished ranges count the job's
+game ids (a branch is its game's second row); its stats carry `branches`, `merges`, `neartie`. Its records files are
+`records/2` (72.7) and its shards hold every game and branch; `run_settings.json` classes `selfplay_branch` and its
+nine settings `play`, so `check-config` passes them into the pool's template (`selfplay_archive` stays python_only).
+
+### 72.6 Tests and checks
+
+`cargo test` (zero_search 220: the tests of docs/search.md 2.11.1, `branch_records_replay_to_the_drivers_rows_bit_for_bit`,
+`a_branchs_game_log_starts_with_its_games_moves`, the parser's; zero_worker all passing with
+`branched_games_are_the_python_drivers`, `branched_games_play_into_shards`,
+`branch_records_replay_to_the_shards_rows_bit_for_bit` - both rules, the toy and the pick game, merged near-tie branches,
+a rolling job: every row rebuilt from the records, each branch with its game's record from the same file, equals the
+shard's, array for array - and `a_game_and_its_branch_share_one_records_file`). `tests/test_neartie.py` (17: the
+bindings' rows, stats and refusals; the run settings and their checks; the driver kwargs, the fingerprints - the
+uniform one unchanged - and the description; the tally, its merge with an older remote's and its summary; a rolling
+toy run; remote self-play with the remote 'local'; branch records replayed through the engine to the driver's own
+samples for both rules on the toy and the pick game, merged and not; the farm pool replaying and counting branch
+records, refusing an orphan branch and a records/1 branch; game records holding branch games). `test_forks.py`,
+`test_worker_settings.py`, `test_farm_pool.py`, `test_farm_guards.py`, `test_farm_trace.py` passing. **Off**:
+`tools/check_checkpoint_compat.py --package zero --game toy` against the commit before (92568b5) identical with
+`--net random` and `--net uniform`; uniform-rule branched games (three settings, with archive starts in one) digested
+old vs new through the bindings - rows (but the new `branched` flag), branch dicts, samples, stats - identical
+(77f3d48aea53fc01). **Farm parity** on MTG Zero (a scratch checkout of its HEAD with this core; its legacy-meta3-r1
+settings with the league off, `selfplay_branch` 1, the uniform evaluator, 16 games, groups 1, sims 8, belief tilt off;
+its native worker `mtgz-worker` of the same tree): `tools/worker_parity.py` identical, native shards against the
+Python remote worker's, near-tie (7,063 rows, 16 branches), uniform with differ (6,450 rows) and without branches
+(4,485 rows); `tools/worker_records_gate.py` GATE 3 PASSED near-tie (32 games, 5,772 rows) and uniform (32 games,
+5,484 rows) as records/2, and without branches (records/1 in 3 files, 3,516 rows); `tools/driver_settings_dump.py
+--compare-worker`: 33 cases agree, the branch configs included. No merge on MTG Zero yet: its `merge_key` is its own
+change (the gate counted 2,550 eligible decisions in those 16 games at eps 0.05, n_min 2).
+
+### 72.7 Game records of branch games (`records/2`) and the farm pool
+
+**The record.** A game record (docs/search.md 2.17) replays a game from its seed. A branch's trace and game log now
+start with its game's real moves to the branch point (`BranchInfo::trace_from` of them), so a branch's record is
+replayable from its game's seed: it carries its game's gid and seed, every real move from the game's start, its rows
+(steps counted from the game's start, all after the branch point) and a `branch` block - `from`, where it branched
+(`at`, `of`, `decision`, `step`, `action`), `moves`, `played`, `same_first`, the near-tie rule's `alt`, `gap`, `tag`,
+and `merged`. A merged branch's `result` and `margin` are its game's. `record::replay_branch(spec, rec, parent, aux)`
+replays it with its game's record: the gid, seed and players its game's, its first `from` moves its game's, a near-tie
+branch's next move its runner-up and not its game's, no row at or before the branch point; a branch that played to
+its end is checked like any game; a merged one must end at a decision of a game in progress whose `merge_key` is one
+of its game's decision states' after the branch point, with its game's result and margins bit for bit (its game over),
+and its rows take them. `replay` alone refuses a branch record. The bindings: `replay_rows(..., parent=)`. A file that
+may hold branch games is `records/2` (`RECORDS_VERSION_BRANCH`); a writer without branches writes `records/1`, byte for
+byte as before. The game's own row says `branched` when a branch of it follows.
+
+**The worker** (`records.rs`) holds a game whose row says `branched` until its branch's line follows: no size cut and
+no timed flush (a rolling job's `flush_s`) between them; only the job's end writes a game whose branch never came
+(the phase ended). So a branch's record always finds its game's record in its own file.
+
+**Crediting** (zero-farm PROTOCOL.md 16; no coordinator, agent or wire change): the coordinator credits ids, and a
+game and its branch are one id in one file, so they are credited once, together; a later copy of the id is a
+duplicate whole, branch included. **The pool** (`zero/farm_pool.py`) replays each credited branch with its game's line
+from the same chunk, refuses a chunk with a branch but not its game or with a branch in a records/1 file, and counts
+each accepted game - a branch included - as one of the iteration's games, as this machine does (24.2): its `accept`
+total can exceed the ids the coordinator credited, and the farm quota stops on it. The accepted games' forks tally
+joins the iteration's `selfplay.forks` (`RemotePlay.end`). **Game records** (`game_records`, section 59): a branch's
+record (local, from the game log, or the farm's) carries a `branch` block (`from` and the block above); its actions
+start with its game's first `from` moves.
+
+**A game database** reading these records (MTG Zero's `tools/gamedb.py`): a record with `branch` is not a game from a
+new deal - it shares its gid and seed with its game's record and its first `branch.from` actions; a merged one
+(`branch.merged` not null) ends in a position that is not terminal, with its game's result.
+
+### 72.8 Measured
+
+2026-11-21, the desktop's CPU at below-normal priority beside live runs. **The toy** (`--preset toy-smoke`, rolling,
+3 iterations, the rule's defaults, p 0.2): 0.83 / 0.67 / 0.32 eligible decisions a game, 2 / 2 / 5 near-tie branches
+of 46 / 46 / 44 games, mean gap 0.007-0.011, no merges (the toy has no merge key); uniform branches, same seed: 3 / 5 /
+13. **Merges** (`PickGame`, the driver test's toy with transpositions, every decision eligible, p 1, 80 games of 8
+turns): 80 branches, 10 merged (12.5%) after 2.4 decisions on average (24 rows), the other 70 played to the end
+(204 rows). On MTG Zero nothing measured yet but the farm checks of 72.6: its `merge_key` / `branch_alt_ok` hooks are
+its own change, and the A/B is its B2 step 2.
+
+## 73. Game aliases: a game name whose meaning changed (`GamePackage.game_aliases`, the run setting `game_layout`; MTG Zero's layout v8, 2026-11-22)
+
+**Why.** A game package may want its game's NAME to mean a new layout from now on (MTG Zero: `mtg` = layout v8 for
+every new run) while every run, checkpoint, shard, records file, farm job and evaluation record made before names the
+same game and means the old layout. The core picks token layouts, aux targets, engine games and specs by name, and the
+encoding guard compares a checkpoint's recorded game with the game it is loaded as, so a plain rename would move old
+runs onto the new layout (refused by the guard at best). An alias makes "the name + a layout record" the new game and
+"the name without one" the old game, everywhere the core reads a game name - no old file rewritten.
+
+**What it does.**
+* `GamePackage(game_aliases={'mtg': {'layout': 8, 'before': 'mtg_v7'}})`: the game `mtg` is layout revision 8; a
+  record naming `mtg` without a layout record is the game `mtg_v7` (both registered by the package's engine, keyed by
+  these names in its tables). `resolve_game(name, layout)`: an aliased name without a record -> its `before`, with its
+  revision -> the name, any other record -> refused (`GameAliasError`); a record on a name that never changed ->
+  refused. `layout_stamp(game)` / `set_game(d, game)` write a resolved game with its record (`game_layout`: only for an
+  aliased name - every other game's files exactly as before); `record_game(d)` reads one.
+* **In a process every game name is the resolved one.** Read boundaries resolve: `zero.run.resolve_config`
+  (`resolve_run_game`: the saved config's record when the game is the saved config's - none: the old game, an old run
+  resumes as it was; a first start, or another game given now: the name's current revision; `--game-layout N` moves a
+  run explicitly, then the guard decides on its checkpoints; a co-training resolver's game the same way, its record in
+  `resolver_cfg`), `net.build` / `load` / the encoding guard (`config_game`: a network config's `game` with its
+  `game_layout`), the held-out set's shards, a remote's shards (`RemotePlay`), the farm pool's records headers, an
+  archive (`selfplay_archive`), zero.farm_h2h's settings, zero.h2h's run settings, the distill tool's shards, a
+  failure's replay, `tools/fork_run.py` (a continuation's source config; `new_run --game` stamps the fork).
+* **What is written carries the record**: run configs (the setting `game_layout`, set by `resolve_run_game`), network
+  configs (`net.stamp_game`: `make_net`, `build`, `fork_run`), the ONNX graph's and the reference set's metadata
+  (`game_layout`), shard metas (the run's, a remote's, the pool's), h2h results, failure records; the native worker's
+  shard metas, records headers and failure files (`GameEntry::stamp`).
+* **Presets and package defaults may not set `game_layout`** (`apply_package` refuses): presets fill a resumed run's
+  missing settings, and would move an old run onto the new layout.
+* **The worker** (`zero_worker`): `GameEntry::of::<G>("mtg").layout(8)`, `GameEntry::of::<G7>("mtg_v7").before_of("mtg")`;
+  `resolve_game` picks a job's game from its settings' `game` and `game_layout` (`game_of`; the same rule), `classify`
+  checks the settings resolved onto the picked entry (`LAYOUT_KEY` is play; an eval job reads it too: `EVAL_READS`, so
+  an evaluation template carries it), a graph or a reference set is the job's
+  game by name and record (`Expect::game_problem`: a graph exported before the change, named `mtg` without a record,
+  is `mtg_v7`'s). **Builds before it**: `run_settings.json` classes `game_layout` python_only (off: null), so by a
+  run's declared setting classes (section 61) a build that does not know the key plays a null one as before and
+  refuses a truthy one at `check-config` - a run of the new revision is never played by a build that would play the
+  old game under its name (and its graphs fail that build's tail check anyway).
+
+**Off by default.** No package declares an alias; `game_layout` is None and absent from every network config, graph,
+shard and header of an unaliased game: the toy's and every other game's runs exactly as before (the run config gains
+the key `game_layout: null`, as with any new setting).
+
+**Costs.** None at run time (a dict lookup per read).
+
+**Tests and checks.** `tests/test_game_alias.py` (the stand-in alias `toy_match` rev 1 / before `toy`: the rule, the
+table check, a run's game across first start / resume / an old config / an explicit move / a bad record, presets
+refused, a checkpoint of before the change loading as the old game and refused as the new, a new network's record,
+fork_run's stamp, records); the worker's `resolve_game`, `Expect::game_problem` and `classify` tests (a build before it:
+null off, a revision unsupported). End to end on the toy (scratch, 2026-11-22): a 2-iteration toy-smoke run of the
+aliased `toy_match` writes `game_layout` 1 into its config, shards and checkpoints; a toy run whose files were renamed
+to `toy_match` without records (a run of before) resumes to iteration 3 as `toy` with no record written.
+
+**Measured.** Nothing to measure (no run setting changes play).
+
+### 73.1 A graph-derived expectation resolves the graph's game (the probe, eval-batches; MTG Zero's farm release, 2026-11-22)
+
+**Why.** `probe-providers --model --reference` and `eval-batches` have no job: their expectation is the graph's own
+metadata (`session::expect_of`, `SessionSpec::expect` None), and it knew nothing of the worker's registered games -
+`before_of` None. A reference checkpoint of before the change re-exported now names its game `mtg_v7`, while the
+reference set exported before the change names `mtg` without a record; `Expect::game_problem` refused that pair
+(`reference: a network of game Some("mtg"), the job plays "mtg_v7"`), which failed MTG Zero's farm release at its
+DirectML self-test (`farm_release.py` step 6b) for every build after layout v8 - the CUDA self-test, on the old export
+(`mtg`, no record, against a set of the same), passed.
+
+**What it does.** `SessionSpec::games` (and `probe::Opts::games`; `cli_with` passes `Worker::games`): with
+`expect` None the graph's game and layout record are resolved in the registry (`resolve_game`) and the expectation
+takes that entry's name, `layout` and `before_of` (the graph's features, actions and tails as before) - so the graph
+and its reference set pass exactly when a job of that entry (`Expect::of_entry`) would accept them: a graph `mtg_v7`
+(or `mtg` without a record) takes a set `mtg` without a record or `mtg_v7`, never `mtg` with layout 8; a graph `mtg`
+layout 8 takes only `mtg` layout 8. A game the registry does not resolve (unregistered, a layout record it does not
+know, an empty registry - `build_evaluator`'s, which has the job's expectation) keeps the graph's own name and record:
+strict equality, as before. Nothing else loosens.
+
+**Tests.** `session::tests::a_graph_derived_expectation_resolves_the_graphs_game_in_the_registry` (the stand-in
+alias `toy` layout 2 / before `toy_old`: every pairing above through `expect_of`, the graph's own game check and
+`selftest::check_meta`; a plain game unchanged; no registry: the refusal the release met). End to end: the failed
+release's DirectML self-test (`probe-providers --providers dml,cpu` on the re-exported reference checkpoint against
+the old reference set) fails with the release's worker and passes with this one (cpu and dml); the CUDA self-test's
+pair passes on both.
+
+## 74. The fast graph's blocks of zeros as Pads (`ZeroOnnx2Fast.PAD_ZEROS`; no setting; zero-farm's CUDA PCs, 2026-11-22)
+
+**Why.** On a farm PC's NVIDIA GPU (the farm's CUDA pack, ONNX Runtime 1.24.4) the fast fp16 graph's call is bound by
+ONNX Runtime's host side: the calling thread's CPU equals the call's wall time (~22 ms at 575 rows for ~9 ms of GPU
+work), which leaves a 4-core PC's crew of three workers CPU-bound. ONNX Runtime's node profile of that call put ~20 %
+of its host time in two Concat nodes - the policy's generic logits joined to a block of zeros (the spare places) before
+the policy scatter, and the policy joined to the overrides' spare places - ~1.6-2.4 ms each.
+
+**What.** In the fast graph (`fast`, `pool_export` 'fast' and its variants) those two blocks of zeros are appended as a
+Pad of the same tensor (`F.pad`, constant 0) instead of a Concat with zeros: the same tensor, so the same answers. Every
+other graph (the default zero-onnx/2 graph, the static graph, zero-onnx/1) keeps its Concats, byte for byte.
+
+**Checked.** `tests/test_onnx_fast.py::test_fast_graph_pads_the_policy_zeros` (fewer scatters reading a Concat, more
+Pads than the fast graph exported with the Concats; the same answers bit for bit on the CPU); the fast, static and
+zero-onnx/2 suites. On a live run's network (gen 769) the new export's answers on the CPU are the earlier fast graph's
+bit for bit (64 and 256 rows of its reference set).
+
+**Measured** (a farm PC: 4 cores / 8 threads, an NVIDIA GPU; gen 769 fp16, real rows; first as graph surgery of the
+released export): a call's thread CPU 16.4 -> 14.8 ms at 352 rows, 23.8 -> 18.4 ms at 575; a crew of 3 x 1,150 games
+in flight in two groups 28.2k -> 30.9k / 31.0k leaves/s (two 5-minute windows, the control in the same session; the
+trainer's own path there 32.9k).
+
+## 75. Tests in parallel: `tools/pytest_shards.py`, and `smoke_all.sh` runs its games at once (2026-11-22)
+
+**Why.** The Python suite is ~850 mostly single-threaded tests (torch at one thread, 7): about 35 minutes of test time
+in one process beside live runs (2,096 s summed over one run's junit files; 44 and 52 minutes of wall time in two runs
+of the day), `tests/test_remoteplay.py` a quarter of it and no single test over 35 s - nothing to fix in one place, so
+the suite is split. `tools/smoke_all.sh` ran its games one after the other, each in its own checkout and target dir.
+
+**What it does.** `python tools/pytest_shards.py [--shards 4] [--root <repo>] [--retry-alone <file>] [-- pytest
+args]` (its docstring is the manual): the repo's `tests/**/test_*.py` in N pytest processes at once over disjoint
+parts, balanced by each test's seconds from earlier runs (`~/.config/zero/pytest_durations/<repo>.json`, shared by a
+repo's checkouts; a file without one by its size; a file longer than a shard's share is split by its tests), the plan
+checked to run every test exactly once before anything starts; each shard its own `--basetemp`, junit file and log.
+The result is read from the junit files: exit 0 and "pytest shards: PASSED - N shard(s), X passed, Y skipped in T s"
+only when every shard exited 0, ran a test and at least one test passed; else "FAILED - ..." naming the failed tests.
+`--retry-alone tests/test_remoteplay.py` reruns that file's failures alone once when they are a shard's only ones
+(AGENTS.md: it times real threads) and names them in the last line; an error or any other failure fails the run.
+Standard library only. `--plan` prints the shards.
+
+`tools/smoke_all.sh` runs the core's pytest and each game's through it (`SMOKE_PYTEST_SHARDS`, default 4; 1 = one
+plain `pytest tests` as before; the core's with the retry above) and `SMOKE_JOBS` games at once (default 3; 1 = one
+after the other): each game in a subshell, its output printed whole and its summary lines read back in the games'
+order once all ended; a game whose subshell ended without a result is a FAIL line.
+
+**Costs.** Shards share the machine: a test that times real threads is likelier to fail beside three other shards
+(hence the retry). Tests that share something outside their `tmp_path` would collide between shards; none was found
+(the suite passed in four shards, below). Several games building at once take that many times the build's memory and
+cores.
+
+**Tests and checks.** `tests/test_pytest_shards.py` (the plan: every file once, a measured file split by its tests,
+plans that would skip or repeat tests refused; end to end with real pytest processes on trivial tests: a pass and its
+recorded durations, a failure named and not recorded, a setup error never retried, no test is not a pass, a failure that
+passes alone / fails alone / is in an unnamed file); `tests/test_smoke_all.py` unchanged and passing.
 
 **Measured** (the desktop beside two live runs and other sessions' gates, 2026-11-22). The whole suite in four shards
 with the GPU visible: 904 s (shards of 219 to 220 tests; the longest 793 s of pytest) against 44 and 52 minutes in one
