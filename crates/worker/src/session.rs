@@ -438,6 +438,9 @@ pub struct SessionSpec<'a> {
     /// What the job needs of the graph (game, features, actions, aux width); None: the graph's own metadata
     /// (the gate tools and the probe).
     pub expect: Option<&'a Expect>,
+    /// The worker's registered games (`Worker::games`): with `expect` None, the graph's game resolved in them carries
+    /// its alias (`expect_of`, docs/az.md 73.1); empty: the graph's game and layout record as they are.
+    pub games: &'a [crate::GameEntry],
 }
 
 /// One provider's self-test (PROTOCOL.md 8; the worker's `selftest` event).
@@ -793,8 +796,12 @@ fn metadata(s: &Session) -> Result<Vec<(String, String)>, String> {
     Ok(meta)
 }
 
-/// What a graph's metadata says about it (the expectation the gate tools and the probe use).
-pub fn expect_of(meta: &[(String, String)], path: &Path) -> Result<Expect, String> {
+/// What a graph's metadata says about it (the expectation the gate tools and the probe use). Its game and layout
+/// record resolved in the worker's registered `games` (`resolve_game`, docs/az.md 73.1) are that entry's - its name,
+/// layout revision and the name it played under before - so a reference set recorded under the entry's old name
+/// passes exactly as it would for a job of that entry (`Expect::of_entry`); a game the registry doesn't resolve keeps
+/// the graph's own name and layout record (strict equality).
+pub fn expect_of(meta: &[(String, String)], path: &Path, games: &[crate::GameEntry]) -> Result<Expect, String> {
     let get = |k: &str| meta.iter().find(|e| e.0 == k).map(|e| e.1.clone());
     let num = |k: &str| get(k).and_then(|v| v.parse::<usize>().ok()).ok_or_else(|| format!("{}: metadata {k}", path.display()));
     // (zero-onnx/2: its tail segments and overrides as declared - `varlen_of` then checks them against themselves)
@@ -806,7 +813,18 @@ pub fn expect_of(meta: &[(String, String)], path: &Path) -> Result<Expect, Strin
             tails.push((a[0].as_u64().unwrap_or(0) as u16, a[1].as_str().unwrap_or_default().to_string(), a[2].as_u64().unwrap_or(0) as usize, a[3].as_u64().unwrap_or(0) as usize));
         }
     }
-    Ok(Expect { game: get("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false, tails, option_pointers: get("option_pointers").as_deref() == Some("true"), layout: get("game_layout").and_then(|l| l.parse().ok()), before_of: None })
+    let mut want = Expect { game: get("game").unwrap_or_default(), features: num("features")?, actions: num("actions")?, aux_width: num("aux_width")?, belief: false, tails, option_pointers: get("option_pointers").as_deref() == Some("true"), layout: get("game_layout").and_then(|l| l.parse().ok()), before_of: None };
+    // (an unreadable layout record resolves nothing: `check_graph` refuses it)
+    let layout = match get("game_layout") {
+        None => Some(None),
+        Some(l) => l.trim().parse::<u64>().ok().map(Some),
+    };
+    if let Some(e) = layout.and_then(|l| crate::resolve_game(games, &want.game, l).ok()) {
+        want.game = e.name.to_string();
+        want.layout = e.layout;
+        want.before_of = e.before_of.map(String::from);
+    }
+    Ok(want)
 }
 
 /// zero-onnx/2's more inputs (zero-core docs/az.md 46): the driver's options, tail tokens and pointer overrides, every
@@ -1170,7 +1188,7 @@ pub fn try_one(rt: &'static Runtime, spec: &SessionSpec, reference: Option<&crat
     };
     let want_graph = match spec.expect {
         Some(w) => w.clone(),
-        None => match expect_of(&meta, spec.model) {
+        None => match expect_of(&meta, spec.model, spec.games) {
             Ok(w) => w,
             Err(e) => return Tried::Fatal(e),
         },
@@ -1624,7 +1642,7 @@ pub fn build_evaluator(
     if let Some(h) = sha256 {
         crate::job::check_file_sha256(model, h, gen)?;
     }
-    let spec = SessionSpec { model, reference, providers: &ort.providers, device: ort.device.clone(), intra_threads: ort.intra_threads, runtime: &ort.dylib, spinning: ort.spinning, expect: Some(want) };
+    let spec = SessionSpec { model, reference, providers: &ort.providers, device: ort.device.clone(), intra_threads: ort.intra_threads, runtime: &ort.dylib, spinning: ort.spinning, expect: Some(want), games: &[] };
     let s = create_session(&spec).map_err(|e| e.0)?;
     let g = gen.map_or(String::new(), |g| format!(" (gen {g})"));
     for a in s.attempts() {
@@ -1729,6 +1747,72 @@ pub fn variant_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A graph-derived expectation (the probe's, eval-batches': `SessionSpec::expect` None) of a registered game carries
+    /// its alias (docs/az.md 73.1): the graph and its reference set pass exactly as for a job of that entry.
+    #[test]
+    fn a_graph_derived_expectation_resolves_the_graphs_game_in_the_registry() {
+        use crate::GameEntry;
+        use zero_search::toy::ToyGame;
+        // ("toy" stands in for the aliased name - layout 2 - whose old game is "toy_old": mtg 8 / mtg_v7)
+        static GAMES: &[GameEntry] = &[GameEntry::of::<ToyGame>("toy").layout(2), GameEntry::of::<ToyGame>("toy_old").before_of("toy"), GameEntry::of::<ToyGame>("other")];
+        let graph = |game: &str, layout: Option<&str>| {
+            let mut m: Vec<(String, String)> = [("game", game), ("features", "5"), ("actions", "4"), ("aux_width", "0")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            if let Some(l) = layout {
+                m.push(("game_layout".into(), l.into()));
+            }
+            m
+        };
+        let reference = |game: &str, layout: Option<u32>| {
+            let mut m = json!({"game": game, "features": 5, "actions": 4});
+            if let Some(l) = layout {
+                m["game_layout"] = json!(l);
+            }
+            crate::selftest::Reference { meta: m, batches: vec![], want: crate::eval::Answer { priors: vec![], value: vec![], margin: vec![], aux: vec![] }, rows: 0 }
+        };
+        let p = Path::new("model.onnx");
+        // the graph passes `check_graph`'s own game check, and the reference set `check_meta`'s, with this registry
+        let ok = |games: &[GameEntry], g: &[(String, String)], r: &crate::selftest::Reference| -> Result<(), String> {
+            let want = expect_of(g, p, games)?;
+            let get = |k: &str| g.iter().find(|e| e.0 == k).map(|e| e.1.as_str());
+            if let Some(e) = want.game_problem(get("game"), get("game_layout")) {
+                return Err(e);
+            }
+            crate::selftest::check_meta(r, &want, g)
+        };
+        // the old game's graph (re-exported now: "toy_old") with a reference set recorded before the change ("toy",
+        // no layout record) - the farm release's dml-selftest of a v7 reference checkpoint
+        assert_eq!(ok(GAMES, &graph("toy_old", None), &reference("toy", None)), Ok(()));
+        assert_eq!(ok(GAMES, &graph("toy_old", None), &reference("toy_old", None)), Ok(()));
+        // ... but not with a reference set of the new revision
+        assert!(ok(GAMES, &graph("toy_old", None), &reference("toy", Some(2))).unwrap_err().contains("game Some(\"toy\") layout 2"));
+        // a graph exported before the change ("toy", no layout record) is the old game's, both ways
+        assert_eq!(ok(GAMES, &graph("toy", None), &reference("toy", None)), Ok(()));
+        assert_eq!(ok(GAMES, &graph("toy", None), &reference("toy_old", None)), Ok(()));
+        assert!(ok(GAMES, &graph("toy", None), &reference("toy", Some(2))).is_err());
+        // the new revision's graph takes only the new revision's reference set
+        assert_eq!(ok(GAMES, &graph("toy", Some("2")), &reference("toy", Some(2))), Ok(()));
+        assert!(ok(GAMES, &graph("toy", Some("2")), &reference("toy", None)).unwrap_err().contains("the job plays \"toy\" layout 2"));
+        assert!(ok(GAMES, &graph("toy", Some("2")), &reference("toy_old", None)).is_err());
+        // a layout record the registry doesn't know, or can't read: strict (the graph's own name and record)
+        assert_eq!(ok(GAMES, &graph("toy", Some("3")), &reference("toy", Some(3))), Ok(()));
+        assert!(ok(GAMES, &graph("toy", Some("3")), &reference("toy", None)).is_err());
+        assert!(ok(GAMES, &graph("toy", Some("x")), &reference("toy", None)).is_err());
+        // a plain game: unchanged (strict equality, no layout record)
+        assert_eq!(ok(GAMES, &graph("other", None), &reference("other", None)), Ok(()));
+        assert!(ok(GAMES, &graph("other", None), &reference("toy", None)).is_err());
+        assert!(ok(GAMES, &graph("other", None), &reference("other", Some(1))).is_err());
+        // no registry (or a game it doesn't have): today's strict equality, the refusal the release met included
+        assert!(ok(&[], &graph("toy_old", None), &reference("toy", None)).unwrap_err().contains("the job plays \"toy_old\""));
+        assert_eq!(ok(&[], &graph("toy_old", None), &reference("toy_old", None)), Ok(()));
+        assert!(ok(GAMES, &graph("nope", None), &reference("toy", None)).is_err());
+        assert_eq!(ok(GAMES, &graph("nope", None), &reference("nope", None)), Ok(()));
+        // the resolved expectation is the entry's identity, the graph's numbers
+        let w = expect_of(&graph("toy", None), p, GAMES).unwrap();
+        assert_eq!((w.game.as_str(), w.layout, w.before_of.as_deref(), w.features, w.actions), ("toy_old", None, Some("toy"), 5, 4));
+        let w = expect_of(&graph("toy", Some("2")), p, GAMES).unwrap();
+        assert_eq!((w.game.as_str(), w.layout, w.before_of.as_deref()), ("toy", Some(2), None));
+    }
 
     #[test]
     fn directml_runs_only_the_fast_matmul_zero_onnx_2_graph() {

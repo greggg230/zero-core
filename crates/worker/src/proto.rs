@@ -1099,7 +1099,7 @@ fn driver_cfg_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> 
     Ok(0)
 }
 
-fn eval_batches(a: &Args) -> Result<i32, String> {
+fn eval_batches(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     use crate::eval::Evaluator;
     use crate::npz::read_npz;
     use crate::shard::{write_npz, Npy};
@@ -1112,10 +1112,10 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
     // (the driver's batches as recorded, their tail tokens and overrides included: zero-core docs/az.md 46)
     let rec = crate::selftest::read_batches(&z, &meta, "batches")?;
     let extra: Vec<u8> = rec.batches.iter().flat_map(|b| b.extra.iter().copied()).collect();
-    // the graph's own metadata as the expectation (the gate compares answers, not the game); GPU providers
-    // need the network's reference set (--reference)
+    // the graph's own metadata as the expectation (the gate compares answers, not the game; its game resolved in the
+    // worker's games, docs/az.md 73.1); GPU providers need the network's reference set (--reference)
     let reference = a.get("--reference").map(PathBuf::from);
-    let spec = crate::session::SessionSpec { model: &model, reference: reference.as_deref(), providers: &ort.providers, device: ort.device.clone(), intra_threads: threads, runtime: &ort.dylib, spinning: ort.spinning, expect: None };
+    let spec = crate::session::SessionSpec { model: &model, reference: reference.as_deref(), providers: &ort.providers, device: ort.device.clone(), intra_threads: threads, runtime: &ort.dylib, spinning: ort.spinning, expect: None, games };
     let mut ev = crate::session::create_session(&spec).map_err(|e| e.0)?;
     eprintln!("eval-batches: {}", ev.describe());
     let reps: usize = a.num("--reps")?.unwrap_or(1);
@@ -1143,7 +1143,7 @@ fn eval_batches(a: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
-fn probe_cli(a: &Args) -> Result<i32, String> {
+fn probe_cli(games: &'static [GameEntry], a: &Args) -> Result<i32, String> {
     let providers = match a.get("--providers") {
         Some(s) => s.split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| ProviderKind::parse(n).ok_or_else(|| format!("--providers: unknown provider {n:?}"))).collect::<Result<Vec<_>, _>>()?,
         None => ProviderKind::PROBE_DEFAULT.to_vec(),
@@ -1165,6 +1165,7 @@ fn probe_cli(a: &Args) -> Result<i32, String> {
         // (a diagnostic build's variants name their own providers - the agent's --providers narrows only the probe's
         // own verdict, so a targeted variant can still reach a provider the agent no longer probes by default)
         variant_providers: Some(ProviderKind::ALL.to_vec()),
+        games,
     };
     let v = crate::probe::run(&o)?;
     eprint!("{}", crate::probe::report(&v));
@@ -1227,10 +1228,10 @@ pub fn cli_with(w: &'static Worker, args: &[String]) -> i32 {
         "eval" => eval_cli(w, &a),
         "check-config" => check_config(w, &a),
         "driver-cfg" => driver_cfg_cli(games, &a),
-        "eval-batches" => eval_batches(&a),
+        "eval-batches" => eval_batches(games, &a),
         "info" => info_cli(games, repo, w.kinds(), w.features(), &a),
         "probe-providers" if !w.selfplay => Err("this worker build runs fuzz jobs only (a fuzz-profile build): no network".into()),
-        "probe-providers" => probe_cli(&a),
+        "probe-providers" => probe_cli(games, &a),
         // (one child of probe-providers' graph variants: probe_variants.rs)
         "probe-variant" if w.selfplay => match (a.get("--spec"), a.get("--out")) {
             (Some(spec), Some(out)) => crate::probe_variants::child_main(&ort_dylib_in(a.get("--ort-dll"), a.get("--runtime-dir")), Path::new(spec), Path::new(out)),
