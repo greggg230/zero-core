@@ -9704,3 +9704,28 @@ tensor. ONNX Runtime's node profile put those Concats at ~20 % of a CUDA call's 
 a call's thread CPU 16.4 -> 14.8 ms at 352 rows, 23.8 -> 18.4 ms at 575; a crew of 3 x 1,150 in two groups 28.2k ->
 30.9k / 31.0k leaves/s (two 5-minute windows, the control in the same session). CPU answers bit for bit the earlier
 graph's (64 and 256 rows); every other graph keeps its Concats, byte for byte.
+
+## 74. The fast graph at fixed capacities: graph 'fast-fixed' for CUDA graphs (WIP; `export(..., fast='fixed')`; the worker's `ZERO_WORKER_CUDA_GRAPHS=1` buckets; zero-farm's GPU PCs, 2026-11-22)
+
+**Why.** Section 72's measurement: the static graph replays as one CUDA graph but is GPU-bound (every block on every
+row padded to T); the fast graph does the least GPU work but ONNX Runtime cannot capture it (NonZero and values read
+back for its sizes). This graph is the fast graph's arithmetic with every size an input's.
+
+**What.** `ZeroOnnx2FastFixed` (graph 'fast-fixed'): zero-onnx/2's inputs plus three whose lengths only are read -
+`s_cap` [S] (the batch's present head slots, the global tokens aside), `m_cap` [MR] (a row's most non-zeros in one run
+of features: the global ranges and the bag groups, metadata `runs`) and `t_cap` [T] (a row's most tokens, rounded up to
+the metadata's `t_align` as for the static graph). The present head slots go to the first of S slots by one scatter of
+unique places (their running count), the rest invalid (they read the first row's buffers and write only to spare
+places); each head segment's input map runs on all S slots, kept where the slot is the segment's (no NonZero per
+segment); the floats buffer is S x the widest slot; runs pad to MR; the attention's padded rows are T long, a token
+past T or an invalid slot scattered to a spare place. A batch past a capacity is refused: rows past T or MR, every row
+past S. Metadata `fixed` 1, `presence`, `t_align`, `runs`; no optional `t_align` input. The worker computes the
+capacities on the host (`StaticTokens::fixed_caps`: per row its present flags and two binary searches per run) and runs
+the graph through section 72's buckets with two capacities more (`S`, `MR`; a padding row's always-present slots count
+in S; padding non-zeros go to features in no run, value 0, so they count in no run). Off: no game exports it.
+
+**Checked.** `tests/test_onnx_fixed.py`: torch's answers within 2e-5 on the toy layouts and a rich one (both
+attentions, identity actions), the same answers (2e-6) for any capacities at least the batch's, the refusals where a
+capacity is short, no NonZero, its own weight-swap template. Gen 769 of a live run's network (CPU, fp32): within 4.4e-6
+of the fast graph's answers at 64 and 256 rows of the reference set, none refused. Worker unit tests of the padded
+sizes and capacities.

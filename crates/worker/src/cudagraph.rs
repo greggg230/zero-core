@@ -18,6 +18,11 @@
 //! written into the input buffers, one replay, the real rows read from the output buffers.
 //!
 //! Opt-in while it is measured: `ZERO_WORKER_CUDA_GRAPHS=1` and a static graph on the CUDA provider.
+//!
+//! The fixed graph (zero-core docs/az.md 74: the fast graph's arithmetic at fixed capacities) takes the same buckets
+//! with two capacities more: the batch's present head slots (`s`) and a row's non-zeros in a run of features (`mr`).
+//! Its padding rows' non-zeros go to features outside every run (value 0: inert anywhere), so they count in no run;
+//! a padding row's always-present head slots count in `s`.
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +50,10 @@ pub struct Caps {
     pub l: usize,
     pub no: usize,
     pub t: usize,
+    /// The fixed graph's present head slots (the batch's, the global tokens aside) and a row's most non-zeros in a
+    /// run; 0 for the static graph.
+    pub s: usize,
+    pub mr: usize,
 }
 
 fn up(n: usize, a: usize) -> usize {
@@ -55,17 +64,22 @@ impl Caps {
     /// A new bucket's capacities for a piece of `s`: the rows rounded up to 64 with at least one padding row, each
     /// per-row quantity a quarter over the piece's mean per row, the tail floats 120 a padding token (the padding
     /// tokens' mean width; any mean from 56 to 438 fits), T as the piece's.
-    pub fn for_piece(s: &Caps) -> Caps {
+    /// The fixed graph's: `s` as the other per-row quantities plus `ax` (a padding row's always-present head slots)
+    /// a padding row, `mr` 8 over the piece's rounded up to 16.
+    pub fn for_piece(s: &Caps, ax: usize) -> Caps {
         // (at least 16 padding rows: the tail padding's tokens need slots in them)
         let b = up(s.b + 16, 64);
         let per = |x: usize, a: usize| up((x as f64 / s.b.max(1) as f64 * 1.25 * b as f64).ceil() as usize + a, a);
         let nt = per(s.nt, 64);
-        Caps { b, nnz: per(s.nnz, 256), k: per(s.k, 64), nt, l: s.l + 120 * (nt - s.nt), no: per(s.no, 16).max(16), t: s.t }
+        let (sc, mr) = if s.mr == 0 { (0, 0) } else { (per(s.s, 64) + ax * (b - s.b), up(s.mr + 8, 16)) };
+        Caps { b, nnz: per(s.nnz, 256), k: per(s.k, 64), nt, l: s.l + 120 * (nt - s.nt), no: per(s.no, 16).max(16), t: s.t, s: sc, mr }
     }
 
     /// The bucket holds piece `s` (its tail padding found too: [`tail_plan`]).
-    pub fn holds(&self, s: &Caps, tails: &Tails) -> bool {
-        self.b > s.b && self.nnz >= s.nnz && self.k >= s.k && self.nt >= s.nt && self.l >= s.l && self.no >= s.no && self.t == s.t && tail_plan(self.nt - s.nt, self.l - s.l, tails, self.b - s.b).is_some()
+    pub fn holds(&self, s: &Caps, tails: &Tails, ax: usize) -> bool {
+        self.b > s.b && self.nnz >= s.nnz && self.k >= s.k && self.nt >= s.nt && self.l >= s.l && self.no >= s.no && self.t == s.t
+            && self.mr >= s.mr && (s.mr == 0 || self.s >= s.s + ax * (self.b - s.b))
+            && tail_plan(self.nt - s.nt, self.l - s.l, tails, self.b - s.b).is_some()
     }
 }
 
@@ -200,11 +214,14 @@ pub struct Piece {
     pub ov_slot_hi: Vec<i32>,
     pub ov_slot_lo: Vec<i32>,
     pub t: usize,
+    /// The fixed graph's present head slots and a row's most non-zeros in a run (`Caps`); 0 for the static graph.
+    pub s: usize,
+    pub mr: usize,
 }
 
 impl Piece {
     pub fn sizes(&self) -> Caps {
-        Caps { b: self.n_players.len(), nnz: self.x_idx.len(), k: self.opt_action.len(), nt: self.t_seg.len(), l: self.t_val.len(), no: self.ov_opt.len(), t: self.t }
+        Caps { b: self.n_players.len(), nnz: self.x_idx.len(), k: self.opt_action.len(), nt: self.t_seg.len(), l: self.t_val.len(), no: self.ov_opt.len(), t: self.t, s: self.s, mr: self.mr }
     }
 }
 
@@ -232,19 +249,20 @@ fn extend_off(off: &mut Vec<i64>, counts: &[usize]) {
 }
 
 /// `p` padded to `caps` (module docs): `actions` the network's (a padding row's options are distinct actions).
-/// `global_features`: non-zeros on features below it are no token's (the first head slot's present flag).
-pub fn pad(p: &Piece, caps: &Caps, tails: &Tails, actions: usize, global_features: usize) -> Result<Piece, String> {
+/// `pad_features`: the features a padding row's non-zeros (value 0) go to, ascending - the static graph's: those below
+/// the first head slot's present flag (no token's); the fixed graph's: those in no run.
+pub fn pad(p: &Piece, caps: &Caps, tails: &Tails, actions: usize, pad_features: &[i32]) -> Result<Piece, String> {
     let s = p.sizes();
     if caps.b <= s.b || caps.t != s.t {
         return Err(format!("bucket {caps:?} for a piece of {s:?}"));
     }
     let np = caps.b - s.b;
     let mut q = p.clone();
-    // non-zeros: global features 0, 1, ... with value 0 in padding rows
-    let c = spread(caps.nnz - s.nnz, np, global_features.max(1))?;
+    // non-zeros: the padding features with value 0 in padding rows
+    let c = spread(caps.nnz - s.nnz, np, pad_features.len())?;
     extend_off(&mut q.x_ptr, &c);
     for &k in &c {
-        q.x_idx.extend((0..k).map(|i| i as i32));
+        q.x_idx.extend_from_slice(&pad_features[..k]);
         q.x_val.extend(std::iter::repeat_n(0.0f32, k));
     }
     q.n_players.extend(std::iter::repeat_n(2i64, np));
@@ -297,6 +315,8 @@ pub fn pad(p: &Piece, caps: &Caps, tails: &Tails, actions: usize, global_feature
     q.ov_col.extend(std::iter::repeat_n(0i32, n));
     q.ov_slot_hi.extend(std::iter::repeat_n(0i32, n));
     q.ov_slot_lo.extend(std::iter::repeat_n(0i32, n));
+    q.s = caps.s;
+    q.mr = caps.mr;
     debug_assert_eq!(q.sizes(), Caps { b: caps.b, ..*caps });
     Ok(q)
 }
@@ -383,7 +403,10 @@ pub struct Cache {
     pub tails: Tails,
     pub actions: usize,
     pub aux_w: usize,
-    pub global_features: usize,
+    /// The features padding rows' non-zeros go to (`pad`).
+    pub pad_features: Vec<i32>,
+    /// A padding row's always-present head slots (the global token aside): the fixed graph's `s` counts them.
+    pub always_extra: usize,
     pub buckets: Vec<Bucket>,
     pub built: u64,
     pub tick: u64,
@@ -393,18 +416,21 @@ impl Cache {
     /// The bucket for piece `s` (made, or remade larger, when none holds it): its index.
     fn bucket_for(&mut self, s: &Caps, make: &dyn Fn(&Path, &Caps) -> Result<Session, String>) -> Result<usize, String> {
         self.tick += 1;
-        if let Some(i) = self.buckets.iter().position(|b| b.caps.holds(s, &self.tails)) {
+        let ax = self.always_extra;
+        if let Some(i) = self.buckets.iter().position(|b| b.caps.holds(s, &self.tails, ax)) {
             self.buckets[i].last = self.tick;
             return Ok(i);
         }
         // a bucket of this T that holds the rows but not the rest grows (its successor holds both)
-        let mut caps = Caps::for_piece(s);
+        let mut caps = Caps::for_piece(s, ax);
         if let Some(i) = self.buckets.iter().position(|b| b.caps.t == s.t && b.caps.b >= caps.b) {
             let o = self.buckets.remove(i).caps;
-            caps = Caps { b: o.b.max(caps.b).max(up(s.b + 16, 64)), nnz: o.nnz.max(caps.nnz), k: o.k.max(caps.k), nt: o.nt.max(caps.nt), l: 0, no: o.no.max(caps.no), t: s.t };
+            let b = o.b.max(caps.b).max(up(s.b + 16, 64));
+            let sc = if s.mr == 0 { 0 } else { o.s.max(caps.s).max(s.s + ax * (b - s.b)) };
+            caps = Caps { b, nnz: o.nnz.max(caps.nnz), k: o.k.max(caps.k), nt: o.nt.max(caps.nt), l: 0, no: o.no.max(caps.no), t: s.t, s: sc, mr: o.mr.max(caps.mr) };
             caps.l = s.l + 120 * (caps.nt - s.nt);
         }
-        if !caps.holds(s, &self.tails) {
+        if !caps.holds(s, &self.tails, ax) {
             return Err(format!("no bucket can hold a piece of {s:?} (made {caps:?})"));
         }
         if self.buckets.len() >= MAX_BUCKETS {
@@ -448,6 +474,12 @@ impl Cache {
             ("ov_slot_lo", i32t(caps.no)?),
             ("t_cap", i32t(caps.t)?),
         ];
+        let mut inputs = inputs;
+        if caps.mr > 0 {
+            // (the fixed graph's other capacities: only their lengths are read)
+            inputs.push(("s_cap", i32t(caps.s)?));
+            inputs.push(("m_cap", i32t(caps.mr)?));
+        }
         let f2 = |w: usize| Tensor::<f32>::new(&pinned, [b, w]).map(Buf::F32).map_err(oerr);
         let outputs: Vec<(&'static str, Buf)> = vec![
             ("policy", f2(self.actions)?),
@@ -506,7 +538,7 @@ impl Cache {
         let s = p.sizes();
         let i = self.bucket_for(&s, make)?;
         let caps = self.buckets[i].caps;
-        let q = pad(p, &caps, &self.tails, self.actions, self.global_features)?;
+        let q = pad(p, &caps, &self.tails, self.actions, &self.pad_features)?;
         if let Ok(d) = std::env::var("ZERO_WORKER_CUDA_GRAPHS_DUMP") {
             // (a diagnostic: the first padded piece's inputs as JSON, the unpadded piece beside it)
             let path = std::path::Path::new(&d);
@@ -538,7 +570,7 @@ impl Cache {
                 "ov_col" => buf.write_i32(&q.ov_col)?,
                 "ov_slot_hi" => buf.write_i32(&q.ov_slot_hi)?,
                 "ov_slot_lo" => buf.write_i32(&q.ov_slot_lo)?,
-                "t_cap" => {}
+                "t_cap" | "s_cap" | "m_cap" => {}
                 other => return Err(format!("input {other}")),
             }
         }
@@ -616,9 +648,10 @@ mod tests {
             ..Default::default()
         };
         let s = p.sizes();
-        let caps = Caps::for_piece(&s);
-        assert!(caps.holds(&s, &t), "{caps:?}");
-        let q = pad(&p, &caps, &t, 1024, 20_000).unwrap();
+        let caps = Caps::for_piece(&s, 0);
+        assert!(caps.holds(&s, &t, 0), "{caps:?}");
+        let pf: Vec<i32> = (0..20_000).collect();
+        let q = pad(&p, &caps, &t, 1024, &pf).unwrap();
         assert_eq!(q.sizes(), caps);
         assert_eq!(&q.x_ptr[..3], &p.x_ptr[..]);
         assert_eq!(&q.x_idx[..3], &p.x_idx[..]);
@@ -628,6 +661,17 @@ mod tests {
         assert_eq!(*q.opt_off.last().unwrap() as usize, caps.k);
         assert_eq!(*q.t_off.last().unwrap() as usize, caps.nt);
         assert_eq!(*q.ov_off.last().unwrap() as usize, caps.no);
+        // the fixed graph's: room for the padding rows' always-present slots, a row's runs, a grown bucket keeps both
+        let pf = Piece { s: 9, mr: 3, ..p.clone() };
+        let fs = pf.sizes();
+        let fc = Caps::for_piece(&fs, 2);
+        assert!(fc.holds(&fs, &t, 2) && fc.s >= 9 + 2 * (fc.b - 2) && fc.mr >= 3, "{fc:?}");
+        assert!(!Caps { s: 9 + 2 * (fc.b - 2) - 1, ..fc }.holds(&fs, &t, 2));
+        assert!(!Caps { mr: 2, ..fc }.holds(&fs, &t, 2));
+        let free: Vec<i32> = (40_000..40_100).collect();
+        let fq = pad(&pf, &fc, &t, 1024, &free).unwrap();
+        assert_eq!(fq.sizes(), fc);
+        assert!(fq.x_idx[3..].iter().all(|i| free.contains(i)));
         // padding non-zeros on global features only, options distinct within a row
         assert!(q.x_idx[3..].iter().all(|&i| i < 20_000));
         for r in 2..caps.b {

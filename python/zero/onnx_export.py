@@ -134,7 +134,8 @@ FUSED_DOMAIN = 'zero.onnx'
 # pack); 'fast-att23' with ONNX's opset-23 Attention (the fastest on the CPU; the CUDA pack's ONNX Runtime 1.24.4 has no
 # CUDA kernel of opset 19-23's versions of a dozen operators, which then run on the CPU); 'fast-matmul' the MatMul form
 GRAPHS = {'': (None, False), 'fast': ('mha', True), 'fast-att23': ('attention23', True), 'fast-matmul': ('matmul', True),
-          'static': ('mha', 'static')}       # (docs/az.md 67: no data-dependent shape, for the GPU)
+          'static': ('mha', 'static'),        # (docs/az.md 67: no data-dependent shape, for the GPU)
+          'fast-fixed': ('mha', 'fixed')}     # (docs/az.md 74: the fast graph at fixed capacities, for CUDA graphs)
 
 
 def graph_options(graph):
@@ -1786,6 +1787,235 @@ def dynamic_shapes(packing):
     return d
 
 
+FIXED_INPUTS = ('s_cap', 'm_cap', 't_cap')
+
+
+class ZeroOnnx2FastFixed(ZeroOnnx2Fast):
+    """The fast graph at fixed capacities (`export(..., fast='fixed')`, graph 'fast-fixed', docs/az.md 74): the fast
+    graph's arithmetic - the per-token layers on the packed token list, the attention on rows padded to T - with every
+    size an input's. Three more inputs whose lengths only are read: `s_cap` [S] (the batch's present head slots, the
+    global tokens aside, at most), `m_cap` [MR] (a row's non-zeros in one run of features - `run_ranges`, the
+    metadata's `runs` - at most) and `t_cap` [T] (a row's tokens, head and tail, at most). No NonZero and no value read
+    back: with the dimensions fixed (ONNX Runtime's free-dimension overrides) the whole call can be one CUDA graph, at
+    about the fast graph's work on the GPU (no token padded but in the attention's rows, as there).
+
+    The packed list is the fast graph's with S slots for the present head slots: the batch's present slots in its
+    row-major order first, the rest invalid - an invalid slot reads the first row's buffers and writes only to spare
+    places of its own (never into a padded row, the pooling, the policy or an override). A batch past a capacity is
+    refused: `refused` + 1 on every row with more than T tokens or more than MR non-zeros in a run, on every row when the
+    batch's present slots pass S. With the capacities exact (or larger) the answers are the fast graph's."""
+
+    PAD_ZEROS = True
+
+    def __init__(self, net, packing='packed', attention='mha'):
+        super().__init__(net, packing, attention)
+        self.w_max = max(1, int(self.t_w.max()))
+
+    def run_ranges(self):
+        """The runs of features [lo, hi) the graph reads a row's non-zeros in (`_runs`: the global ranges, the bag
+        groups) -> [(lo, hi)]: `m_cap` at least a row's most non-zeros in one of them."""
+        out = [(int(lo), int(hi)) for lo, hi, _base in self.g_ranges]
+        for b in (self.net.bags or []) if self.net.bag is not None else []:
+            o, k, w = int(b['offset']), int(b['count']), int(b['width'])
+            out.append((o, o + k * w))
+        return out
+
+    def _runs(self, lo, hi, below, x_ptr, x_idx, x_val):
+        """`ZeroOnnx2Fast._runs` padded to the capacity `m_cap`'s length (a row with a longer run refused)."""
+        B = x_ptr.shape[0] - 1
+        dev = x_val.device
+        a = below[:, self.r_bound[lo]]
+        n = below[:, self.r_bound[hi]] - a
+        M = self._mcap.shape[0]
+        self._ovf.append(n > M)
+        ar = torch.arange(M, device=dev)
+        inb = ar[None, :] < n[:, None]
+        at = torch.where(inb, (x_ptr[:-1] + a)[:, None] + ar[None, :], 0).reshape(-1)
+        f = torch.where(inb, x_idx.index_select(0, at).view(B, M).long(), 0)
+        v = torch.where(inb, x_val.index_select(0, at).view(B, M), torch.zeros((), dtype=x_val.dtype))
+        return f, v, inb
+
+    def _inputs(self, x_ptr, x_idx, x_val):
+        """`ZeroOnnx2Fast._inputs` at the capacity S: the present head slots (row-major) in S slots by one scatter of
+        unique places (a present slot's place among them; the rest invalid), the slots' floats in a buffer of S x (the
+        widest slot) places -> (presence, readers' inputs, floats, (rows [S], positions [S], valid [S]), each non-zero's
+        row, (ps, cs, off)); the batch past S in `_s_ovf`."""
+        net = self.net
+        B = x_ptr.shape[0] - 1
+        NTOK = net.n_tok
+        nnz = x_idx.shape[0]
+        dev = x_val.device
+        S = self._scap.shape[0]
+        row = _csr_rows(x_ptr, nnz, True)
+        fi = x_idx.long()
+        tok = self.f_tok.index_select(0, fi).long()
+        col = self.f_col.index_select(0, fi).long()
+        rd = []
+        for n_, r in enumerate(net.readers or []):
+            p = getattr(self, f'f_rd{n_}').index_select(0, fi).long()
+            L = r.idx.shape[0]
+            rd.append(self._scatter_rows(B * L, row * L + p, p >= 0, x_val).view(B, L))
+        slot = tok >= 1
+        tokc = _iclamp(tok, 0)
+        fp = row * NTOK + tokc
+        flag = slot & (col == self.t_pcol.index_select(0, tokc))
+        pres = (self._scatter_rows(B * NTOK, fp, flag, x_val).view(B, NTOK) > 0.5) | self.f_always[None, :]
+        ps = torch.cat([torch.zeros_like(pres[:, :1]), pres[:, 1:]], 1)
+        cr = ps.long().cumsum(1)
+        rc = cr[:, -1]
+        cs = ((rc.cumsum(0) - rc)[:, None] + cr - 1).reshape(-1)  # a present slot's place among them (row-major)
+        flatps = ps.reshape(-1)
+        NP = flatps.shape[0]
+        arp = torch.arange(NP, device=dev)
+        at = torch.where(flatps & (cs < S), cs, S + arp)
+        kidx = torch.zeros(S + NP, dtype=torch.long, device=dev).scatter(0, at, arp)
+        kidx = kidx.index_select(0, torch.arange(S, device=dev))
+        total = rc.sum()
+        valid = torch.arange(S, device=dev) < total
+        self._s_ovf = total > S
+        b_s = torch.where(valid, kidx // NTOK, 0)
+        j_s = torch.where(valid, kidx % NTOK, 0)
+        wt = torch.where(valid, self.t_w.index_select(0, j_s), 0)
+        off = torch.cat([wt.cumsum(0) - wt, wt.sum(0, keepdim=True)])     # [S + 1]
+        csn = cs.index_select(0, fp)
+        place = off.index_select(0, _iclamp(csn, 0, S))
+        floats = self._scatter_rows(S * self.w_max, place + col, slot & flatps.index_select(0, fp) & (csn < S), x_val)
+        return pres, rd, floats, (b_s, j_s, valid), row, (ps, cs, off)
+
+    def _slots(self, floats, nzv, psc):
+        """`ZeroOnnx2Fast._slots` on the S slots: each head segment's input map on every slot (the slot's floats at its
+        place), kept where the slot is valid and the segment's - no NonZero per segment -> (tokens [S, d], rows [S],
+        positions [S], identities [S])."""
+        net = self.net
+        b, j, valid = nzv
+        _ps, _cs, off = psc
+        S = j.shape[0]
+        dev = j.device
+        maps = floats.new_zeros(S, net.d)
+        for hs in self.heads:
+            st, k, w = hs['start'], hs['count'], hs['width']
+            ing = valid & (j >= st) & (j < st + k)
+            cols = torch.where(ing[:, None], off[:-1][:, None] + torch.arange(w, device=dev)[None, :], 0)
+            fl = floats.index_select(0, cols.reshape(-1)).view(S, w)
+            maps = torch.where(ing[:, None], net.seg_in[hs['seg']](fl), maps)
+        t = maps + net.pos.index_select(0, j)
+        lay = torch.where(valid, self.t_lay.index_select(0, j), -1)
+        ident = torch.full_like(j, net.vocab)
+        for k in self.h_lays:
+            R = sum(self.radixes[k])
+            cols = (off[:-1] + self.t_at.index_select(0, j))[:, None] + torch.arange(R, device=dev)[None, :]
+            cols = torch.where((lay == k)[:, None], cols, 0)
+            ik = self._ident(floats.index_select(0, cols.reshape(-1)).view(-1, R), k)
+            ident = torch.where(lay == k, ik, ident)
+        if self.h_lays:
+            t = t + torch.where((lay >= 0)[:, None], net.emb(ident), torch.zeros((), dtype=t.dtype))
+        return t, b, j, ident
+
+    def forward(self, x_ptr, x_idx, x_val, n_players, belief, opt_off, opt_action, t_off, t_seg, t_slot_hi, t_slot_lo,
+                t_val, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo, s_cap, m_cap, t_cap):
+        net = self.net
+        B = n_players.shape[0]
+        dev = x_val.device
+        D, NTOK, A1 = net.d, net.n_tok, net.actions + 1
+        aux = bool(self.layout)
+        self._scap, self._mcap, self._ovf = s_cap, m_cap, []
+        pres, rd, floats, nzv, row, psc = self._inputs(x_ptr, x_idx, x_val)
+        rraw = ent = None
+        if net.readers is not None:
+            rraw, ent = self._read(rd)
+        g = self._global(x_ptr, x_idx, x_val, row, ent)
+        ts, bs, js, ids_s = self._slots(floats, nzv, psc)
+        seg, segc, shi, slo, trow, tbad, lbad, te = self._tails(g, t_off, t_seg, t_slot_hi, t_slot_lo, t_val)
+        NT = t_seg.shape[0]
+        # ---- the packed list: the global tokens (row order), the S head slots (the present ones first), the tails
+        ar_b = torch.arange(B, device=dev)
+        row_h = torch.cat([ar_b, bs])
+        j_h = torch.cat([torch.zeros_like(ar_b), js])
+        valid_h = torch.cat([torch.ones(B, dtype=torch.bool, device=dev), nzv[2]])
+        N = row_h.shape[0]
+        hp = torch.cat([g + net.pos[0], ts, te])
+        rk = pres.long().cumsum(1) - 1
+        n_h = pres.sum(1)
+        n = n_h + (t_off[1:] - t_off[:-1])
+        T = t_cap.shape[0]
+        # each token's place in its padded row (the fast graph's); an invalid slot or a token past T to a spare place
+        rkh = rk.reshape(-1).index_select(0, row_h * NTOK + j_h)
+        tloc = n_h.index_select(0, trow) + (torch.arange(NT, device=dev) - t_off.index_select(0, trow))
+        back = torch.cat([row_h * T + rkh, trow * T + tloc])
+        ok = torch.cat([valid_h & (rkh < T), tloc < T])
+        M = N + NT
+        ar_m = torch.arange(M, device=dev)
+        gidx = torch.full((B * T + M,), M, dtype=torch.long, device=dev).scatter(0, torch.where(ok, back, B * T + ar_m),
+                                                                                  ar_m)
+        gidx = gidx.index_select(0, torch.arange(B * T, device=dev))
+        backr = torch.where(ok, back, 0)                          # (a token in no padded row reads place 0: unused)
+        rows = torch.cat([row_h, trow])
+        valid = (gidx < M).view(B, T)
+        gq = torch.where(valid.reshape(-1), gidx, 0)
+        if net.gated:
+            gi = self.v_gi.index_select(0, segc)
+            wt = torch.where(gi >= 0, self.v_g.index_select(0, _iclamp(gi, 0)), torch.ones((), dtype=torch.float32))
+            wpad = torch.cat([torch.ones(N, dtype=torch.float32, device=dev), wt,
+                              torch.zeros(1, dtype=torch.float32, device=dev)]).index_select(0, gidx).view(B, T)
+            bias = torch.log(wpad)[:, None, None, :].to(hp.dtype)
+        else:
+            bias = torch.where(valid, 0.0, float('-inf'))[:, None, None, :].to(hp.dtype)
+        H = net.blocks[0].h
+        hd = D // H
+        if self.attention:
+            bias4 = bias.expand(B, 1, T, T)
+        for blk in net.blocks:
+            qkv = blk.qkv(blk.ln1(hp)).index_select(0, gq)
+            if self.attention:
+                q3, k3, v3 = torch.split(qkv.view(B, T, 3 * D), [D, D, D], dim=2)
+                a = torch.ops.zero_onnx.fused_attention(q3, k3, v3, bias4, H).reshape(B * T, D)
+            else:
+                q, k, v = qkv.view(B, T, 3, H, hd).permute(2, 0, 3, 1, 4)
+                s_ = torch.matmul(q, k.transpose(-2, -1)) * (hd ** -0.5) + bias
+                a = torch.matmul(torch.softmax(s_, -1), v).transpose(1, 2).reshape(B * T, D)
+            hp = hp + blk.out(a.index_select(0, backr))
+            hp = hp + blk.ff2(F.gelu(blk.ff1(blk.ln2(hp))))
+        hp = net.ln(hp)
+        padded = torch.cat([hp, hp.new_zeros(1, D)]).index_select(0, gidx).view(B, T, D)
+        if net.gated:
+            zm = (padded * wpad[..., None]).sum(1) / wpad.sum(1, keepdim=True)
+        else:
+            zm = padded.sum(1) / n[:, None].to(hp.dtype)
+        z = torch.cat([hp[:B], zm], 1)
+        gen = F.pad(net.gen(z), (0, 1))
+        P = _pointer2(net, F.gelu(net.pk(hp) + net.pq(z).index_select(0, rows)))
+        # a present head position's packed index (inside the list in a refused row too: clamped)
+        cposh = _iclamp(gidx.view(B, T).gather(1, _iclamp(rk, 0, T - 1)), 0, M - 1)
+        flat = pres.reshape(-1)
+        cols = net.tok_cols.index_select(0, j_h)
+        acts = net.tok_acts.index_select(0, j_h)
+        ar_h = torch.ones_like(row_h).cumsum(0) - 1
+        lg = P.index_select(0, ar_h).gather(1, _iclamp(cols, 0))
+        if self.punique:
+            okw = (cols >= 0) & (acts < net.actions) & valid_h[:, None]
+            spare = B * A1 + ar_h[:, None] * cols.shape[1] + torch.arange(cols.shape[1], device=dev)[None, :]
+            dest = torch.where(okw, row_h[:, None] * A1 + acts, spare)
+            pol = F.pad(gen.reshape(-1), (0, lg.numel())).scatter(0, dest.reshape(-1), lg.reshape(-1))[:B * A1]
+        else:
+            if net.n_id:
+                it = torch.cat([torch.full_like(ar_b, net.vocab), ids_s])
+                ia = net.tok_idbase.index_select(0, j_h) + it
+                ia = torch.where((it < net.vocab) & (ia < net.actions), ia, net.actions)
+                acts = torch.where(net.tok_isid.index_select(0, j_h), ia[:, None], acts)
+            acts = torch.where((cols >= 0) & valid_h[:, None], acts, net.actions)
+            pol = _policy_full(gen, acts, lg, flat, cposh.reshape(-1), NTOK, net).reshape(-1)
+        pol, oref = self._overrides(pol, gen, P, flat, cposh.reshape(-1), N, NTOK, trow, seg, shi, slo, opt_off,
+                                    opt_action, ov_off, ov_opt, ov_seg, ov_col, ov_slot_hi, ov_slot_lo, slice_back=True)
+        over = (n > T).long() + self._s_ovf.long()
+        for o in self._ovf:
+            over = over + o.long()
+        refused = _row_sum(tbad, t_off) + oref + lbad + over
+        r = net._heads(z, pol.view(B, A1), n_players, aux, None, rraw)
+        policy, value, margin, aux_out = _outputs(net, self.layout, B, r[0], r[1], r[2], r[3] if aux else None, n_players,
+                                                  belief)
+        return policy, value, margin, aux_out, refused
+
+
 class ZeroOnnx2Static(ZeroOnnx2):
     """zero-onnx/2 with no data-dependent shape (`export(..., fast='static')`, graph 'static', docs/az.md 67): the default
     graph's interface plus one input `t_cap` [T] (any dtype; only its length is read) - every row padded to T tokens, a
@@ -1951,7 +2181,7 @@ def dynamic_shapes2():
             'ov_seg': {0: NO}, 'ov_col': {0: NO}, 'ov_slot_hi': {0: NO}, 'ov_slot_lo': {0: NO}}
 
 
-def metadata2(net, extra=None, attention=None, fast=False):
+def metadata2(net, extra=None, attention=None, fast=False, runs=None):
     """zero-onnx/2's metadata: `metadata`'s, version 2, plus what a worker checks against its game (`tails`
     [[segment, name, width, head slots], ...] - the game's `game_info()['tails']` -, `option_pointers`) and what the
     network reads (`max_row_tokens`, `tail_width`, `gates` {segment: g}); `extra` last, as given."""
@@ -1969,6 +2199,15 @@ def metadata2(net, extra=None, attention=None, fast=False):
         meta['inputs'] = json.dumps(list(INPUTS2) + ['t_cap'])
         meta['presence'] = json.dumps([int(i) for i in net.present_index()])
         meta['t_align'] = str(T_ALIGN)
+    elif fast == 'fixed':
+        # (docs/az.md 74: ZeroOnnx2FastFixed's graph - its capacity inputs, and what a feeder computes them from: the
+        # head positions' present flags and the multiple it rounds T up to (the static graph's), the runs of features
+        # [lo, hi) a row's non-zeros are read in (MR: a row's most in one of them))
+        meta['fixed'] = '1'
+        meta['inputs'] = json.dumps(list(INPUTS2) + list(FIXED_INPUTS))
+        meta['presence'] = json.dumps([int(i) for i in net.present_index()])
+        meta['t_align'] = str(T_ALIGN)
+        meta['runs'] = json.dumps([[int(a), int(b)] for a, b in (runs or [])])
     elif fast:
         meta['fast'] = '1'                       # (docs/az.md 63: ZeroOnnx2Fast's graph)
         meta['t_align'] = str(T_ALIGN)           # (docs/az.md 66: its optional input, what a GPU feeder gives it)
@@ -2136,7 +2375,7 @@ def export(net, path, packing='packed', extra=None, opset=OPSET, make_portable=T
                                  **({'custom_translation_table': table} if table else {}))
     meta = meta_of(extra)
     return _save(prog.model_proto, meta, path, opset, make_portable, attention=attention if mod_fused(attention) else None,
-                 gelu=bool(fast), instance=fast is True)
+                 gelu=bool(fast), instance='fixed' if fast == 'fixed' else fast is True)
 
 
 def fast_attention(attention, fast):
@@ -2180,6 +2419,19 @@ def _export_module(net, packing='packed', attention=None, fast=False):
             return (mod, tuple(example_inputs2(net)) + (torch.zeros(T, dtype=torch.int32),), list(INPUTS2) + ['t_cap'],
                     list(OUTPUTS2), dict(dynamic_shapes2(), t_cap={0: torch.export.Dim('T', min=2, max=1 << 20)}),
                     lambda extra: metadata2(net, extra, attention=attention, fast=fast))
+        if fast == 'fixed':
+            # (docs/az.md 74: its capacities as three inputs whose lengths only are read - the present head slots S, a
+            # row's non-zeros in a run MR, the padded rows' tokens T -, traced with room for every example row and
+            # every size distinct from the others')
+            mod = ZeroOnnx2FastFixed(net, packing, attention).eval()
+            n = int(net.n_tok)
+            caps = tuple(torch.zeros(c, dtype=torch.int32) for c in (3 * n + 13, 2 * n + 9, n + 7))
+            dyn = dict(dynamic_shapes2(), s_cap={0: torch.export.Dim('S', min=1, max=1 << 24)},
+                       m_cap={0: torch.export.Dim('MR', min=1, max=1 << 20)},
+                       t_cap={0: torch.export.Dim('T', min=2, max=1 << 20)})
+            runs = mod.run_ranges()
+            return (mod, tuple(example_inputs2(net)) + caps, list(INPUTS2) + list(FIXED_INPUTS), list(OUTPUTS2), dyn,
+                    lambda extra: metadata2(net, extra, attention=attention, fast=fast, runs=runs))
         if fast:
             # (the fast graph's optional input `t_align` last, traced with 1: docs/az.md 66)
             mod = ZeroOnnx2Fast(net, packing, attention).eval()
@@ -2526,7 +2778,8 @@ def _save(model, meta, path, opset, make_portable, int32=True, attention=None, g
             # (the fast graph's: the layer norms as InstanceNormalization, its optional input t_align; not the static
             # graph's - the GPU's LayerNormalization is the faster there, docs/az.md 67)
             layernorm_instance(model)
-            _optional_input(model, 't_align', 1)     # (the fast graph's optional input: default 1, docs/az.md 66)
+            if instance != 'fixed':
+                _optional_input(model, 't_align', 1)     # (the fast graph's optional input: default 1, docs/az.md 66)
     meta['opset'] = str(opset)
     if make_portable:
         portable(model)
