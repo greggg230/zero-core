@@ -216,6 +216,11 @@ impl EvalLink {
             let _ = r.recv();
         }
     }
+    /// A link whose evaluator threads are gone (tests: a resume that fails).
+    #[cfg(test)]
+    pub(crate) fn gone(n: usize) -> EvalLink {
+        EvalLink { txs: (0..n).map(|_| channel::<Req>().0).collect(), next: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
+    }
     pub fn restore(&self) -> Result<(), String> {
         let mut rs = Vec::new();
         for tx in &self.txs {
